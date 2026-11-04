@@ -926,7 +926,7 @@ async fn evaluate_staged_claim_policy(
     let chain_id = context.chain_id.caip2_str();
     let policy_engine =
         build_v1_policy_engine("claim", &profile.policy.engine, profile, profile_name)
-            .map_err(|msg| Envelope::<()>::err_raw("policy.engine_unavailable", msg))?;
+            .map_err(|msg| Envelope::<()>::err_raw(msg.code(), msg.to_string()))?;
 
     let decode_result = stellar_agent_core::envelope_decode::decode_authoritative_args(
         envelope_xdr,
@@ -1543,7 +1543,7 @@ fn evaluate_claim_policy(
 ) -> Result<Option<stellar_agent_core::policy::v1::ValueEffects>, Envelope<()>> {
     let policy_engine =
         build_v1_policy_engine("claim", &profile.policy.engine, profile, profile_name)
-            .map_err(|msg| Envelope::<()>::err_raw("policy.engine_unavailable", msg))?;
+            .map_err(|msg| Envelope::<()>::err_raw(msg.code(), msg.to_string()))?;
     // `derive_value_class` ignores args for `stellar_claim` (a non-debit
     // Claim leg is always emitted); `balance_id` is carried for audit parity
     // with the MCP tool's dispatch args and for any future criterion that

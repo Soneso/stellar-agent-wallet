@@ -238,6 +238,9 @@ pub(crate) fn intent(envelope: &SignedTestEnvelope) -> SubmissionIntent {
     let decoded =
         TransactionEnvelope::from_xdr_base64(envelope.envelope_xdr(), Limits::none()).unwrap();
     SubmissionIntent {
+        chain_scope: crate::policy_state::ChainScope::for_chain(
+            stellar_agent_core::profile::caip2::Caip2::Mainnet,
+        ),
         envelope_hash: envelope_hash_hex(envelope.envelope_xdr()),
         tx_hash: envelope.tx_hash_hex().to_owned(),
         source: envelope.source().to_owned(),

@@ -67,6 +67,41 @@ use stellar_agent_network::policy_engine::{
     BuiltPolicyEngine, PolicyEngineBuildError, ProfileSelection, build_policy_engine,
 };
 
+/// A policy build refusal with its stable business code.
+#[derive(Debug)]
+pub(crate) struct EngineLoadError {
+    code: &'static str,
+    message: String,
+}
+
+impl EngineLoadError {
+    pub(crate) fn code(&self) -> &'static str {
+        self.code
+    }
+    pub(crate) fn code_or(&self, fallback: &'static str) -> &'static str {
+        if self.code == "policy.engine_unavailable" {
+            fallback
+        } else {
+            self.code
+        }
+    }
+}
+
+impl From<String> for EngineLoadError {
+    fn from(message: String) -> Self {
+        Self {
+            code: "policy.engine_unavailable",
+            message,
+        }
+    }
+}
+
+impl std::fmt::Display for EngineLoadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
 /// Constructs the [`PolicyEngine`] for a value-moving CLI verb from the
 /// profile's `policy.engine` kind.
 ///
@@ -94,7 +129,7 @@ pub(crate) fn build_v1_policy_engine(
     kind: &PolicyEngineKind,
     profile: &stellar_agent_core::profile::schema::Profile,
     requested_profile_name: &str,
-) -> Result<Arc<dyn PolicyEngine>, String> {
+) -> Result<Arc<dyn PolicyEngine>, EngineLoadError> {
     match kind {
         PolicyEngineKind::Noop => Ok(Arc::new(NoopPolicyEngine)),
         PolicyEngineKind::V1 => Ok(load_v1_policy_engine(
@@ -102,9 +137,9 @@ pub(crate) fn build_v1_policy_engine(
             profile,
             requested_profile_name,
         )?),
-        _ => Err(format!(
-            "unsupported policy engine kind {kind:?}; {verb} refuses (fail closed)"
-        )),
+        _ => Err(
+            format!("unsupported policy engine kind {kind:?}; {verb} refuses (fail closed)").into(),
+        ),
     }
 }
 
@@ -158,7 +193,8 @@ pub(crate) fn build_v1_policy_engine(
 ///   coordinate still names `a`, so `b` shares `a`'s generation counter while
 ///   reading a `<b>.window` file that does not exist. That is a rollback by
 ///   the store's own definition and every value-moving command fails closed
-///   with `GenerationMismatch` until `profile reset-window-state b` runs.
+///   with `GenerationMismatch`. No verb recovers such state in this release;
+///   create a profile under a new name.
 /// - The copy omits the field: the coordinate is derived as `b`'s, so `b`
 ///   starts a FRESH window with no accumulated history, and `a`'s spend does
 ///   not carry over. Copying a profile file is not a way to inherit a spend
@@ -175,7 +211,7 @@ pub(crate) fn load_v1_policy_engine(
     verb: &str,
     profile: &stellar_agent_core::profile::schema::Profile,
     requested_profile_name: &str,
-) -> Result<Arc<PolicyEngineV1>, String> {
+) -> Result<Arc<PolicyEngineV1>, EngineLoadError> {
     let owner = resolve_owner_key(verb, profile)?;
 
     // The CLI selects no profile for installation verification, so no profile
@@ -190,7 +226,20 @@ pub(crate) fn load_v1_policy_engine(
         owner.public_key,
         owner.source,
     )
-    .map_err(|error| build_error_message(error, verb, &owner.policy_path))?;
+    .map_err(|error| {
+        let code = match &error {
+            PolicyEngineBuildError::WindowState { source, .. }
+                if source.chain_validation_error().is_some() =>
+            {
+                source.submission_code()
+            }
+            _ => "policy.engine_unavailable",
+        };
+        EngineLoadError {
+            code,
+            message: build_error_message(error, verb, &owner.policy_path),
+        }
+    })?;
     built
         .verified
         .map(|verified| verified.engine())
@@ -199,6 +248,7 @@ pub(crate) fn load_v1_policy_engine(
                 "policy.engine is 'v1' but no verified policy was built; {verb} refuses \
                  (fail closed)"
             )
+            .into()
         })
 }
 
@@ -294,12 +344,17 @@ fn build_error_message(
              load/verify ({e}); {verb} refuses (fail closed)",
             policy_path.display()
         ),
-        PolicyEngineBuildError::WindowState { store_name, source } => format!(
-            "policy.engine is 'v1' but the policy-window-state store for profile \
-             '{store_name}' failed to load ({source}); {verb} refuses \
-             (fail closed); run `stellar-agent profile reset-window-state \
-             {store_name} --reason <reason>` to recover"
-        ),
+        PolicyEngineBuildError::WindowState { source, .. }
+            if source.chain_validation_error().is_some() =>
+        {
+            source.to_string()
+        }
+        PolicyEngineBuildError::WindowState { store_name, source } => {
+            source.with_recovery_notice(format!(
+                "policy.engine is 'v1' but the policy-window-state store for profile \
+                 '{store_name}' failed to load ({source}); {verb} refuses (fail closed)"
+            ))
+        }
         PolicyEngineBuildError::UnsupportedEngineKind { kind } => {
             format!("unsupported policy engine kind {kind:?}; {verb} refuses (fail closed)")
         }
@@ -358,6 +413,11 @@ pub(crate) fn load_mainnet_policy_engine(
         owner.source,
     )
     .map_err(|error| match error {
+        PolicyEngineBuildError::WindowState { source, .. }
+            if source.chain_validation_error().is_some() =>
+        {
+            Envelope::<()>::err_raw(source.submission_code(), source.to_string())
+        }
         PolicyEngineBuildError::Enablement(e) => {
             Envelope::<()>::err(&stellar_agent_core::error::WalletError::Validation(e))
         }
@@ -1038,10 +1098,10 @@ mod tests {
     }
 
     // Helper: extract the error string from a Result without requiring T: Debug.
-    fn err_msg<T>(result: Result<T, String>) -> String {
+    fn err_msg<T>(result: Result<T, EngineLoadError>) -> String {
         match result {
             Ok(_) => panic!("expected Err, got Ok"),
-            Err(msg) => msg,
+            Err(msg) => msg.to_string(),
         }
     }
 
@@ -2149,9 +2209,9 @@ decision = "allow"
         let error = build_v1_policy_engine("pay", &profile.policy.engine, &profile, name)
             .err()
             .unwrap();
-        assert!(error.contains("older base64 form"), "{error}");
+        assert!(error.to_string().contains("older base64 form"), "{error}");
         assert!(
-            error.contains(
+            error.to_string().contains(
                 "stellar-agent profile enroll-owner-key --profile engine-rewrite --force"
             ),
             "{error}"
@@ -2186,9 +2246,11 @@ decision = "allow"
         let error = build_v1_policy_engine("pay", &profile.policy.engine, &profile, name)
             .err()
             .unwrap();
-        assert!(error.contains("older base64 form"), "{error}");
+        assert!(error.to_string().contains("older base64 form"), "{error}");
         assert!(
-            error.contains("enroll-owner-key --profile engine-file --force"),
+            error
+                .to_string()
+                .contains("enroll-owner-key --profile engine-file --force"),
             "{error}"
         );
         assert!(
@@ -2537,7 +2599,7 @@ decision = "allow"
     /// generation counter is one per profile, so once the write has advanced
     /// it, a read pointed at a file that does not exist is a rollback and
     /// refuses. The hint that refusal carries is pinned separately by
-    /// [`the_window_state_recovery_hint_names_the_store_that_failed`].
+    /// [`the_window_state_refusal_names_the_store_that_failed`].
     #[test]
     #[serial_test::serial]
     fn window_state_read_and_write_share_one_file_when_the_derived_name_differs() {
@@ -2607,23 +2669,22 @@ decision = "allow"
         );
     }
 
-    /// The hydration-failure hint names the store that actually failed.
+    /// The hydration refusal names the store that actually failed.
     ///
-    /// `profile reset-window-state <name>` resets the store for the REQUESTED
-    /// name (`profile/reset_window_state.rs`). A hint naming the derived
-    /// profile would send the operator to reset a file that is not the one
-    /// they cannot get past, and the refusal would survive the documented
-    /// recovery — an uncompletable flow.
+    /// Window state follows the REQUESTED name. A refusal naming the derived
+    /// profile would point the operator at a file that is not the one they
+    /// cannot get past. Unreadable state has no recovery verb, so the refusal
+    /// never directs the operator to `profile reset-window-state`.
     ///
     /// The fixture writes garbage at the REQUESTED store and mints no
     /// generation counter, so the error branch can only fire if the read
     /// selects that file: a read pointed at the derived name would find no
     /// file and no counter, treat it as a genuine first run, and BUILD
-    /// SUCCESSFULLY. This test therefore pins the selector and the hint text
-    /// together.
+    /// SUCCESSFULLY. This test therefore pins the selector and the refusal
+    /// text together.
     #[test]
     #[serial_test::serial]
-    fn the_window_state_recovery_hint_names_the_store_that_failed() {
+    fn the_window_state_refusal_names_the_store_that_failed() {
         let fixture = divergent_name_fixture();
 
         std::fs::create_dir_all(
@@ -2638,21 +2699,30 @@ decision = "allow"
 
         // `err_msg` rather than `expect_err`: the Ok arm is `Arc<dyn
         // PolicyEngine>`, which is not `Debug`.
-        let hint = err_msg(build_v1_policy_engine(
+        let refusal = err_msg(build_v1_policy_engine(
             "pay",
             &fixture.profile.policy.engine,
             &fixture.profile,
             I114_REQUESTED,
         ));
         assert!(
-            hint.contains(&format!("reset-window-state {I114_REQUESTED}")),
-            "the recovery hint must name the store that failed ({I114_REQUESTED}); \
-             got: {hint}"
+            refusal.contains(&format!("'{I114_REQUESTED}'")),
+            "the refusal must name the store that failed ({I114_REQUESTED}); got: {refusal}"
         );
         assert!(
-            !hint.contains(I114_DERIVED),
-            "the hint must not send the operator to reset the derived profile's store \
-             ({I114_DERIVED}), which is not the one that failed; got: {hint}"
+            refusal.contains(
+                "No verb recovers such state in this release; create a profile under a new name."
+            ),
+            "the refusal must state that no verb recovers the store; got: {refusal}"
+        );
+        assert!(
+            !refusal.contains("reset-window-state"),
+            "reset refuses this state, so the refusal must not offer it; got: {refusal}"
+        );
+        assert!(
+            !refusal.contains(I114_DERIVED),
+            "the refusal must not name the derived profile ({I114_DERIVED}), whose store \
+             is not the one that failed; got: {refusal}"
         );
     }
     #[test]
@@ -2729,7 +2799,7 @@ decision = "allow"
             assert_eq!(result.is_err(), refused);
             if let Err(detail) = result {
                 assert_eq!(
-                    detail,
+                    detail.to_string(),
                     format!(
                         "policy.engine is 'v1' but the policy file at {} failed to load/verify \
                          (policy.engine_unavailable: test_owner_key); pay refuses (fail closed)",

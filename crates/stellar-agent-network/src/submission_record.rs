@@ -120,6 +120,8 @@ use stellar_agent_core::observability::redact::redact_strkey_first5_last5 as red
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SubmissionIntent {
+    /// The network for envelope hashing and validation.
+    pub chain_scope: crate::policy_state::ChainScope,
     /// `SHA-256` over the signed envelope XDR, 64 lowercase hex characters.
     /// Keys the receipt and the window reservation.
     pub envelope_hash: String,
@@ -459,6 +461,7 @@ impl<'a> WalletSubmissionRecorder<'a> {
 
     fn reservation(&self, intent: &SubmissionIntent) -> SubmissionHold {
         SubmissionHold {
+            chain_scope: intent.chain_scope,
             id: intent.envelope_hash.clone(),
             tx_hash: intent.tx_hash.clone(),
             source: intent.source.clone(),
@@ -689,9 +692,10 @@ pub fn repair_approval_consumption(
 #[async_trait::async_trait]
 impl SubmissionRecorder for WalletSubmissionRecorder<'_> {
     async fn pre_send(&self, intent: &SubmissionIntent) -> Result<(), WalletError> {
-        // The audit tip anchor first. A behind anchor that cannot be repaired
-        // refuses here, before the receipt, the row, or the reservation
-        // exists, so the refusal has nothing to undo.
+        self.require_submission_scope(intent)
+            .map_err(|error| reservation_refusal(error, intent))?;
+        // The audit tip anchor precedes the receipt, row, and reservation.
+        // A refusal here has nothing to undo.
         self.require_anchor_before_row()?;
 
         self.claim_receipt(intent)?;
@@ -770,6 +774,11 @@ impl SubmissionRecorder for WalletSubmissionRecorder<'_> {
     }
 
     async fn outcome(&self, intent: &SubmissionIntent, outcome: &SubmissionOutcome) {
+        if let Err(error) = self.require_submission_scope(intent) {
+            tracing::warn!(profile = %self.profile_name, tool = %self.tool, ?error,
+                "submission record: outcome not recorded; the receipt and reservation stand until reconciliation");
+            return;
+        }
         match outcome {
             SubmissionOutcome::Success { ledger, created_at } => {
                 self.finalize_receipt(intent, ReceiptStatus::Success, Some(*ledger));
@@ -834,6 +843,9 @@ impl SubmissionRecorder for WalletSubmissionRecorder<'_> {
 /// not write, which is what `submission.record_unavailable` names. All of
 /// them refuse the send.
 fn reservation_refusal(error: WindowStoreError, intent: &SubmissionIntent) -> WalletError {
+    if let Some(error) = error.chain_validation_error() {
+        return WalletError::Validation(error);
+    }
     match error {
         WindowStoreError::PolicyDenied { reason } => WalletError::PolicyDenied { reason },
         WindowStoreError::DuplicateReservation => already_submitted(intent),
@@ -1003,6 +1015,20 @@ impl WalletSubmissionRecorder<'_> {
         }
     }
 
+    /// Requires the envelope's network to agree with this submission's accounting.
+    ///
+    /// Window entries debit the authenticated store, so the comparison reads
+    /// it. Without entries the submission debits nothing and touches neither
+    /// the store nor the keyring: a profile with no spending window submits
+    /// on a host without either, and its envelope answers to the profile alone.
+    fn require_submission_scope(&self, intent: &SubmissionIntent) -> Result<(), WindowStoreError> {
+        if self.window_entries.is_empty() {
+            return intent.chain_scope.require_profile(self.profile);
+        }
+        self.window
+            .require_chain_scope(self.profile, &intent.chain_scope)
+    }
+
     /// Asks the window whether it already holds these signed bytes, after the
     /// receipt claim and before the pending row. A refusal undoes the receipt
     /// without writing a closing row for the original submission.
@@ -1095,6 +1121,9 @@ impl WalletSubmissionRecorder<'_> {
         };
         let envelope_hash = decode_intent_hash(&intent.envelope_hash)?;
         let tx_hash = decode_intent_hash(&intent.tx_hash)?;
+        self.window
+            .require_chain_scope(self.profile, &intent.chain_scope)
+            .map_err(|error| reservation_refusal(error, intent))?;
         self.require_anchor_before_row()?;
         self.claim_receipt(intent)?;
         self.window_precheck(intent)?;
@@ -1125,6 +1154,7 @@ impl WalletSubmissionRecorder<'_> {
             audit,
         });
         let binding = ConsumptionBinding::Transaction(SubmissionBinding {
+            chain_scope: Some(intent.chain_scope),
             fee_bump: None,
             envelope_hash,
             tx_hash,
@@ -1450,6 +1480,177 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial]
+    async fn scope_refusals_preserve_submission_state_and_warn_for_outcomes() {
+        use stellar_agent_core::profile::caip2::Caip2;
+        use stellar_agent_test_support::log_capture::CaptureWriter;
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut profile =
+            Profile::builder_testnet_named("scope-recorder", "s", "a", "n", "a").build();
+        profile.audit_log_path = dir.path().join("audit.jsonl");
+        let audit = Arc::new(Mutex::new(
+            AuditWriter::open(profile.audit_log_path.clone(), None).unwrap(),
+        ));
+        let window = PersistedWindowStore::at_path(dir.path().join("state.window"));
+        window.record_and_persist(&profile, &[]).unwrap();
+        let receipts = ReceiptStore::open_at(dir.path(), "scope-recorder").unwrap();
+        let recorder = WalletSubmissionRecorder::new(
+            &profile,
+            "scope-recorder",
+            "stellar_pay_commit",
+            Some("stellar:testnet".to_owned()),
+            PolicyDecision::Allow,
+            vec![],
+            vec![],
+            receipts.clone(),
+            window.clone(),
+            Some(audit),
+            None,
+            "request",
+            1_000,
+        );
+        let mut intent = SubmissionIntent {
+            chain_scope: crate::policy_state::ChainScope::for_chain(Caip2::Mainnet),
+            envelope_hash: "a".repeat(64),
+            tx_hash: "b".repeat(64),
+            source: stellar_strkey::ed25519::PublicKey([7; 32])
+                .to_string()
+                .to_string(),
+            sequence: 7,
+            max_time: 0,
+            submission_ledger: 123,
+        };
+        let audit_before = std::fs::read(&profile.audit_log_path).unwrap();
+        let window_before = std::fs::read(dir.path().join("state.window")).unwrap();
+        assert_eq!(
+            recorder.pre_send(&intent).await.unwrap_err().code(),
+            "policy.window_chain_mismatch"
+        );
+        assert!(receipts.get(&intent.envelope_hash).unwrap().is_none());
+        assert_eq!(
+            std::fs::read(&profile.audit_log_path).unwrap(),
+            audit_before
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join("state.window")).unwrap(),
+            window_before
+        );
+        intent.chain_scope = crate::policy_state::ChainScope::for_chain(Caip2::Testnet);
+        recorder.pre_send(&intent).await.unwrap();
+        let receipt_before = std::fs::read(receipts.file_path().unwrap()).unwrap();
+        let audit_before = std::fs::read(&profile.audit_log_path).unwrap();
+        let window_before = std::fs::read(dir.path().join("state.window")).unwrap();
+        intent.chain_scope = crate::policy_state::ChainScope::for_chain(Caip2::Mainnet);
+        let capture = CaptureWriter::new();
+        let _inert = stellar_agent_test_support::log_capture::inert_dispatcher();
+        let _guard = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .without_time()
+                .with_ansi(false)
+                .with_writer(capture.clone())
+                .finish(),
+        );
+        for outcome in [
+            SubmissionOutcome::Success {
+                ledger: 124,
+                created_at: Some(1),
+            },
+            SubmissionOutcome::Rejected {
+                code: "tx.failed".to_owned(),
+                error: "synthetic refusal".to_owned(),
+            },
+        ] {
+            capture.clear();
+            recorder.outcome(&intent, &outcome).await;
+            let log = capture.captured_str();
+            assert!(
+                log.contains(
+                    "outcome not recorded; the receipt and reservation stand until reconciliation"
+                ),
+                "{log}"
+            );
+            assert!(
+                log.contains("scope-recorder")
+                    && log.contains("stellar_pay_commit")
+                    && log.contains("ChainMismatch"),
+                "{log}"
+            );
+            assert_eq!(
+                std::fs::read(receipts.file_path().unwrap()).unwrap(),
+                receipt_before
+            );
+            assert_eq!(
+                std::fs::read(&profile.audit_log_path).unwrap(),
+                audit_before
+            );
+            assert_eq!(
+                std::fs::read(dir.path().join("state.window")).unwrap(),
+                window_before
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn entryless_submission_reads_no_window_state() {
+        use stellar_agent_core::profile::caip2::Caip2;
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut profile =
+            Profile::builder_testnet_named("entryless-recorder", "s", "a", "n", "a").build();
+        profile.audit_log_path = dir.path().join("audit.jsonl");
+        let audit = Arc::new(Mutex::new(
+            AuditWriter::open(profile.audit_log_path.clone(), None).unwrap(),
+        ));
+        // Any read of this file refuses: the keyring holds no key for it.
+        let state = dir.path().join("state.window");
+        std::fs::write(&state, b"unverifiable").unwrap();
+        let receipts = ReceiptStore::open_at(dir.path(), "entryless-recorder").unwrap();
+        let recorder = WalletSubmissionRecorder::new(
+            &profile,
+            "entryless-recorder",
+            "stellar_pay_commit",
+            Some("stellar:testnet".to_owned()),
+            PolicyDecision::Allow,
+            vec![],
+            vec![],
+            receipts.clone(),
+            PersistedWindowStore::at_path(state.clone()),
+            Some(audit),
+            None,
+            "request",
+            1_000,
+        );
+        let intent = SubmissionIntent {
+            chain_scope: crate::policy_state::ChainScope::for_chain(Caip2::Testnet),
+            envelope_hash: "a".repeat(64),
+            tx_hash: "b".repeat(64),
+            source: stellar_strkey::ed25519::PublicKey([7; 32])
+                .to_string()
+                .to_string(),
+            sequence: 7,
+            max_time: 0,
+            submission_ledger: 123,
+        };
+        recorder.pre_send(&intent).await.unwrap();
+        recorder
+            .outcome(
+                &intent,
+                &SubmissionOutcome::Success {
+                    ledger: 124,
+                    created_at: Some(1),
+                },
+            )
+            .await;
+        assert_eq!(
+            receipts.get(&intent.envelope_hash).unwrap().unwrap().status,
+            ReceiptStatus::Success
+        );
+        assert_eq!(std::fs::read(&state).unwrap(), b"unverifiable");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
     async fn pending_and_submitted_rows_carry_the_witness() {
         stellar_agent_test_support::keyring_mock::install().unwrap();
         let dir = tempfile::tempdir().unwrap();
@@ -1481,6 +1682,9 @@ mod tests {
         )
         .with_witness(Some(&witness));
         let intent = SubmissionIntent {
+            chain_scope: crate::policy_state::ChainScope::for_chain(
+                stellar_agent_core::profile::caip2::Caip2::Testnet,
+            ),
             envelope_hash: "a".repeat(64),
             tx_hash: "b".repeat(64),
             source: stellar_strkey::ed25519::PublicKey([7; 32])
@@ -1570,6 +1774,9 @@ mod tests {
             now,
         );
         let intent = SubmissionIntent {
+            chain_scope: crate::policy_state::ChainScope::for_chain(
+                stellar_agent_core::profile::caip2::Caip2::Testnet,
+            ),
             envelope_hash: "7a".repeat(32),
             tx_hash: "8b".repeat(32),
             source: format!("{}", stellar_strkey::ed25519::PublicKey([7; 32])),
@@ -2797,6 +3004,9 @@ mod tests {
                     audit: covered_audit_facts(tip_facts(&fx.writer)).unwrap(),
                 });
                 let mut binding = SubmissionBinding {
+                    chain_scope: Some(crate::policy_state::ChainScope::for_chain(
+                        stellar_agent_core::profile::caip2::Caip2::Mainnet,
+                    )),
                     fee_bump: None,
                     envelope_hash: decode_intent_hash(&sub.intent.envelope_hash).unwrap(),
                     tx_hash,

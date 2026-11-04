@@ -771,7 +771,7 @@ on error.
 | `stellar-agent profile rotate-counterparty-key <name>` | `counterparty_cache_key_id` | Fresh 32-byte HMAC key. Cached `stellar.toml` entries read as absent until a refresh rewrites them. `counterparty refresh <domain>` rewrites the entry for that domain. `counterparty warm-up` refreshes only the `HOME_DOMAIN` entries of the policy allowlist. |
 | `stellar-agent profile rotate-nonce-key <name>` | `mcp_nonce_key_alias` | Fresh 32-byte HMAC key. Outstanding nonces minted with the old key are invalidated. |
 | `stellar-agent profile rotate-policy-state-key <name>` | `policy_window_state_key_id` | Fresh 32-byte HMAC key. Unlike the other rotations, the accumulated window-state store is re-signed under the new key, so `per_period_cap` / `rate_limit` history is preserved, not invalidated. |
-| `stellar-agent profile reset-window-state <name> --reason <reason>` | `policy_window_state_key_id` (mints if absent) | Re-initialises the window-state store to empty. Recovery path for an unreadable, tampered, or unparseable store. The affected criteria fail closed until reset. Discards history only after its audit row is written under the audit writer and store lock. Stop the MCP server first. An enablement nonce requires `--owner-secret-env VAR` matching the pinned owner in every build. The audit row records the owner signature. |
+| `stellar-agent profile reset-window-state <name> --reason <reason>` | `policy_window_state_key_id` (mints if absent) | Clears verified policy-window history. An absent file with no protected generation establishes an empty store. A tampered, unparseable, or rolled-back store refuses, as does missing authenticated network provenance. No verb recovers such state in this release; create a profile under a new name. File I/O failures refuse without changing state; retry after access is restored. Discards history only after its audit row is written under the audit writer and store lock. Stop the MCP server first. An enablement nonce requires `--owner-secret-env VAR` matching the pinned owner in every build. The audit row records the owner signature. |
 
 ### Enroll the MCP signer
 
@@ -1133,7 +1133,9 @@ or `trustline.policy_engine_unavailable`.
 | `profile.reset_window_state_owner_mismatch` | The supplied seed must derive to the pinned owner. |
 | `sign_policy.owner_key_older_form` | Enroll the owner public key again with `profile enroll-owner-key --force`. |
 | `profile.reset_window_state_newer_version` | This build cannot reset an unsupported newer state format. |
-| `policy.window_state_unverifiable` | Enabled-mainnet state cannot be verified. Follow the operator recovery procedure. |
+| `policy.window_state_unverifiable` | Enabled-mainnet state cannot be verified. No verb recovers such state in this release; create a profile under a new name. |
+| `policy.window_chain_mismatch` | The profile network disagrees with authenticated spending state. Restore the profile's network, or create a profile under a new name. |
+| `policy.window_chain_unverifiable` | Spending state lacks complete authenticated network provenance. No verb recovers such state in this release; create a profile under a new name. |
 | `profile.reset_window_state_open_authorizations` | Effective open authorizations prevent reset. |
 | `approval.presence_required` | Mainnet consent requires a verified assertion from an approval credential in the owner-signed policy; use the local passkey approval page. |
 | `approval.presence_policy_unavailable` | The current owner-signed mainnet policy cannot be verified, lists no approval credential, or changed since the consent was recorded. |

@@ -15,6 +15,7 @@ use stellar_agent_core::policy::pin::{self, PinError, PinScope, PinState};
 use stellar_agent_core::policy::v1::criteria::state_store::{
     CLOCK_SKEW_TOLERANCE_MS, PolicyStateStore, StateKey, StateStoreError, WindowEntry,
 };
+use stellar_agent_core::profile::caip2::Caip2;
 use stellar_agent_core::profile::owner_key::{self, OwnerKeyContext};
 use stellar_agent_core::profile::receipt::{
     ReceiptStatus, ReceiptStore, ReceiptStoreError, ReleaseEvidence,
@@ -25,9 +26,9 @@ use stellar_agent_core::profile::schema::{
 use subtle::ConstantTimeEq as _;
 
 use crate::endpoint_identity::MainnetOracle;
-use crate::policy_state::WindowStoreError;
 use crate::policy_state::ledger::{self, WireAuthorization, WireAuthorizationHold};
 use crate::policy_state::lock::WindowStoreLock;
+use crate::policy_state::{NO_RECOVERY_NOTICE, WindowStoreError};
 use crate::transaction_record::TransactionRecord;
 
 type HmacSha256 = Hmac<Sha256>;
@@ -323,15 +324,10 @@ fn network_failure_reason(error: stellar_agent_core::error::NetworkError) -> Str
     }
 }
 
-/// Wire-format version of a snapshot whose authorization history is empty.
-///
-/// Every snapshot this build writes without authorization history uses it,
-/// so a build that reads up to version 3 keeps reading the store until a
-/// mainnet authorization is minted.
+/// Legacy wire version without authorization history.
 pub(super) const WIRE_VERSION_COMPACT: u32 = 3;
 
-/// Wire-format version of a snapshot that carries authorization history,
-/// settled records included, until pruning removes the last of it.
+/// Legacy wire version with authorization history.
 pub(super) const WIRE_VERSION_LEDGER: u32 = 4;
 
 /// Highest wire-format version this build reads.
@@ -339,17 +335,7 @@ pub(super) const WIRE_VERSION_LEDGER: u32 = 4;
 /// A file written by a newer build carries records this one cannot account
 /// for, so it is refused rather than read with the fields it happens to
 /// recognise.
-const WIRE_VERSION_MAX: u32 = WIRE_VERSION_LEDGER;
-
-/// The version a snapshot is written under, chosen from its content: version
-/// 4 when it carries authorization history, version 3 otherwise.
-pub(super) fn select_wire_version(wire: &WireFile) -> u32 {
-    if wire.authorizations.is_empty() {
-        WIRE_VERSION_COMPACT
-    } else {
-        WIRE_VERSION_LEDGER
-    }
-}
+pub(super) const WIRE_VERSION_MAX: u32 = 5;
 
 /// How many reservations one reconciliation pass settles.
 ///
@@ -390,6 +376,66 @@ pub(super) enum RecordStatus {
     Pending,
 }
 
+/// The canonical network and the hash of its signing passphrase.
+///
+/// Both fields identify one accounting authority. Construction accepts only
+/// a supported canonical passphrase; deserialized pairs are checked together.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChainScope {
+    chain: Caip2,
+    network_passphrase_sha256: [u8; 32],
+}
+
+impl ChainScope {
+    /// The scope of a canonical chain.
+    #[must_use]
+    pub fn for_chain(chain: Caip2) -> Self {
+        Self {
+            chain,
+            network_passphrase_sha256: Sha256::digest(chain.network_passphrase().as_bytes()).into(),
+        }
+    }
+
+    /// The scope for envelope hashing and validation.
+    ///
+    /// # Errors
+    /// Refuses a passphrase without a supported canonical chain.
+    pub fn from_passphrase(
+        passphrase: &str,
+    ) -> Result<Self, stellar_agent_core::error::ValidationError> {
+        Caip2::from_passphrase(passphrase)
+            .map(Self::for_chain)
+            .ok_or(stellar_agent_core::error::ValidationError::WindowChainUnverifiable)
+    }
+
+    /// The canonical chain of this scope.
+    #[must_use]
+    pub fn chain(self) -> Caip2 {
+        self.chain
+    }
+
+    fn validate(self) -> Result<(), WindowStoreError> {
+        if self != Self::for_chain(self.chain) {
+            return Err(WindowStoreError::ChainUnverifiable);
+        }
+        Ok(())
+    }
+
+    /// Requires this scope to name the profile's network, from the two values
+    /// alone: this reads neither the window store nor the keyring.
+    ///
+    /// # Errors
+    /// Refuses a non-canonical scope or a different network.
+    pub(crate) fn require_profile(self, profile: &Profile) -> Result<(), WindowStoreError> {
+        self.validate()?;
+        if self != Self::for_chain(profile.chain_id) {
+            return Err(WindowStoreError::ChainMismatch);
+        }
+        Ok(())
+    }
+}
+
 /// One `(timestamp_ms, amount)` record within a bucket, plus the identity of
 /// the submission that reserved it.
 ///
@@ -397,6 +443,8 @@ pub(super) enum RecordStatus {
 /// confirmed record with no reservation to reconcile.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(super) struct WireRecord {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) chain_scope: Option<ChainScope>,
     pub(super) ts_ms: u64,
     #[serde(with = "i128_decimal_str")]
     pub(super) amount: i128,
@@ -440,6 +488,7 @@ impl WireRecord {
     /// timestamp and amount at the call site.
     pub(super) fn confirmed_defaults() -> Self {
         Self {
+            chain_scope: None,
             ts_ms: 0,
             amount: 0,
             id: String::new(),
@@ -461,6 +510,8 @@ impl WireRecord {
 /// reconciliation pass settles them together from one round trip.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SubmissionHold {
+    /// The authenticated network on which the debit is admitted.
+    pub chain_scope: ChainScope,
     /// The submission's envelope hash, 64 lowercase hex characters.
     pub id: String,
     /// The transaction hash to reconcile against, 64 lowercase hex characters.
@@ -645,12 +696,13 @@ pub(super) struct WireBucket {
 /// — see the module docs' "Anti-rollback" section; it MUST equal the
 /// keyring-held generation counter for the file to be accepted.
 ///
-/// Version 4 adds the mainnet authorization ledger: `authorizations`, the
-/// record history, and `holds`, the window entries open authorizations own.
-/// Both are omitted while empty, so a snapshot without authorization history
-/// serializes exactly as version 3 does.
+/// Version 5 binds the accounting network on every snapshot. Optional fields
+/// preserve the serialized shape of legacy snapshots for integrity checks;
+/// missing network provenance refuses at the authenticated read boundary.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub(super) struct WireFile {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) chain_scope: Option<ChainScope>,
     pub(super) version: u32,
     pub(super) generation: u64,
     pub(super) entries: Vec<WireBucket>,
@@ -751,17 +803,13 @@ impl std::fmt::Display for StateDefect {
     }
 }
 
-/// The reset's live accrual, store digest and any mainnet state defect.
+/// The reset's live accrual and store digest.
 /// The recorder can read the policy pin through [`Self::pin`] under the held
 /// store lock. Only the store constructs this record and its scoped guard.
 #[derive(Debug, Clone, Copy)]
 pub struct ResetRecord<'a> {
     /// The live accrual of the store being replaced.
     pub accrual: &'a WipedAccrualRecord,
-    /// The defect the reset recovers from; `None` for verifiable state, a
-    /// genuine first run, a testnet profile, or a build without mainnet
-    /// writes.
-    pub defect: Option<StateDefect>,
     /// SHA-256 of the exact store bytes read, or `None` for a missing file.
     pub store_sha256: Option<[u8; 32]>,
     guard: &'a WindowStoreLock,
@@ -806,13 +854,15 @@ struct ResetSnapshot {
     store_sha256: Option<[u8; 32]>,
     key: Option<zeroize::Zeroizing<[u8; 32]>>,
     accrual: WipedAccrualRecord,
-    defect: Option<StateDefect>,
+    /// The verified snapshot being replaced, absent on a genuine first run.
+    original: Option<WireFile>,
 }
 
 /// Whether the mainnet rules apply to `profile`: a mainnet profile in a build
 /// with mainnet writes.
+#[cfg(feature = "mainnet-write")]
 fn mainnet_rules(profile: &Profile) -> bool {
-    cfg!(feature = "mainnet-write") && profile.chain_id.is_mainnet()
+    profile.chain_id.is_mainnet()
 }
 
 /// The defect a loading error names, when it names one.
@@ -876,16 +926,58 @@ fn key_load_error(
     profile: &Profile,
     error: &stellar_agent_core::error::WalletError,
 ) -> WindowStoreError {
-    mainnet_loading_error(
-        profile,
-        WindowStoreError::Keyring {
-            detail: format!("{error}"),
-        },
-        key_defect_of(error),
-    )
+    let defect = key_defect_of(error);
+    // Only a key that is gone or unusable beside its file is unrecoverable; a
+    // backend failure can clear.
+    let detail = match defect {
+        Some(_) => format!("{error}. {NO_RECOVERY_NOTICE}"),
+        None => format!("{error}"),
+    };
+    mainnet_loading_error(profile, WindowStoreError::Keyring { detail }, defect)
 }
 
 impl PersistedWindowStore {
+    /// Reads the authenticated scope, or establishes a genuinely new authority.
+    ///
+    /// # Errors
+    /// Refuses missing provenance, profile disagreement, and integrity failures.
+    pub fn chain_scope(&self, profile: &Profile) -> Result<ChainScope, WindowStoreError> {
+        match self.read_for_inspection(profile)? {
+            Some(wire) => wire.chain_scope.ok_or(WindowStoreError::ChainUnverifiable),
+            None => Ok(ChainScope::for_chain(profile.chain_id)),
+        }
+    }
+
+    /// Requires the supplied scope, profile and authenticated state to agree.
+    ///
+    /// # Errors
+    /// Refuses a disagreement or missing authenticated network provenance.
+    pub fn require_chain_scope(
+        &self,
+        profile: &Profile,
+        scope: &ChainScope,
+    ) -> Result<(), WindowStoreError> {
+        scope.validate()?;
+        if *scope != self.chain_scope(profile)? {
+            return Err(WindowStoreError::ChainMismatch);
+        }
+        Ok(())
+    }
+
+    fn select_scoped_generation(
+        &self,
+        profile: &Profile,
+        wire: WireFile,
+        counter: Option<GenerationState>,
+    ) -> Result<WireFile, WindowStoreError> {
+        // Check both authenticated sides before selecting or discarding a successor.
+        let scope = authenticated_scope(&wire)?;
+        if scope != ChainScope::for_chain(profile.chain_id) {
+            return Err(WindowStoreError::ChainMismatch);
+        }
+        select_generation(wire, counter)
+    }
+
     /// Constructs a store handle for the OS-conventional path for
     /// `profile_name` (`<state>/stellar-agent/policy/<profile_name>.window`).
     ///
@@ -998,7 +1090,7 @@ impl PersistedWindowStore {
         let counter = load_counter(&gen_entry)?;
         let wire = self
             .verify_with_key(&key, &bytes)
-            .and_then(|wire| select_generation(wire, counter))
+            .and_then(|wire| self.select_scoped_generation(profile, wire, counter))
             .map_err(|e| {
                 let defect = defect_of(&e, false);
                 mainnet_loading_error(profile, e, defect)
@@ -1038,9 +1130,8 @@ impl PersistedWindowStore {
     /// # Errors
     ///
     /// See [`WindowStoreError`]. A tampered, deleted, or rolled-back EXISTING
-    /// file fails closed (`HmacMismatch` / `GenerationMismatch` / `Invalid`)
-    /// rather than silently overwriting history with only the new entries —
-    /// an operator must run `profile reset-window-state` to recover.
+    /// file refuses with `HmacMismatch`, `GenerationMismatch`, or `Invalid`.
+    /// No verb recovers such state in this release; create a profile under a new name.
     pub fn record_and_persist(
         &self,
         profile: &Profile,
@@ -1102,8 +1193,11 @@ impl PersistedWindowStore {
         }
 
         prune_stale(&mut wire, now_ms);
-        wire.version = select_wire_version(&wire);
+        wire.version = WIRE_VERSION_MAX;
 
+        // This debit may already be on chain, so it never goes through the
+        // prepared image: the counter moves first, and a failed file write
+        // refuses later spends instead of reading a total without it.
         wire.generation = next_generation(&gen_entry)?;
         write_generation(&gen_entry, &wire)?;
         self.write_atomic(&key, &wire)?;
@@ -1111,8 +1205,13 @@ impl PersistedWindowStore {
     }
 
     /// Records `new_entries` as a reservation held by `reservation`, under the
-    /// same lock, pruning and generation discipline as
-    /// [`Self::record_and_persist`].
+    /// same lock and pruning as [`Self::record_and_persist`].
+    ///
+    /// The transaction is sent only after this returns successfully. For an
+    /// existing verified store, failures before the generation commit retain
+    /// the old snapshot and refuse the send. Failed compaction returns success
+    /// with the new snapshot readable. First use commits the generation before
+    /// the file and fails closed if that file write fails.
     ///
     /// A reservation counts toward every window criterion exactly as confirmed
     /// spend does: the transaction has been sent and may apply, so the
@@ -1163,6 +1262,10 @@ impl PersistedWindowStore {
         let (key, mint_outcome) = self.load_or_mint_key(profile)?;
         let gen_entry = generation_entry_ref(profile);
         let mut wire = self.read_verified(profile, &key, &gen_entry)?;
+        if wire.chain_scope != Some(reservation.chain_scope) {
+            return Err(WindowStoreError::ChainMismatch);
+        }
+        let original = wire.clone();
         let now_ms = now_ms()?;
 
         if file_holds_id(&wire, &reservation.id) {
@@ -1178,6 +1281,7 @@ impl PersistedWindowStore {
             bucket.records.push(WireRecord {
                 ts_ms: entry.timestamp_ms(),
                 amount: entry.amount(),
+                chain_scope: Some(reservation.chain_scope),
                 id: reservation.id.clone(),
                 status: RecordStatus::Pending,
                 tx_hash: reservation.tx_hash.clone(),
@@ -1191,10 +1295,7 @@ impl PersistedWindowStore {
         }
 
         prune_stale(&mut wire, now_ms);
-        wire.version = select_wire_version(&wire);
-        wire.generation = next_generation(&gen_entry)?;
-        write_generation(&gen_entry, &wire)?;
-        self.write_atomic(&key, &wire)?;
+        self.commit_generation(&key, &gen_entry, original, wire)?;
         Ok(mint_outcome)
     }
 
@@ -1217,6 +1318,7 @@ impl PersistedWindowStore {
         id: &str,
         created_at: Option<i64>,
     ) -> Result<(), WindowStoreError> {
+        self.chain_scope(profile)?;
         let close_ms = created_at
             .and_then(|time| u64::try_from(time).ok())
             .filter(|time| *time > 0)
@@ -1334,7 +1436,7 @@ impl PersistedWindowStore {
             Some(wire) => wire,
             None => return Ok(Vec::new()),
         };
-        Ok(collect_pending(&wire))
+        collect_pending(&wire)
     }
 
     /// Settles up to `budget` reservations that have stood at least
@@ -1410,6 +1512,7 @@ impl PersistedWindowStore {
         now_ms: u64,
         budget: usize,
     ) -> Result<ReconcileReport, WindowStoreError> {
+        self.require_chain_scope(profile, &ChainScope::for_chain(profile.chain_id))?;
         let Some(wire) = self.read_for_inspection(profile)? else {
             return Ok(ReconcileReport::default());
         };
@@ -1446,7 +1549,7 @@ impl PersistedWindowStore {
                 None => HashMap::new(),
             };
 
-        let due: Vec<SubmissionHold> = collect_pending(&wire)
+        let due: Vec<SubmissionHold> = collect_pending(&wire)?
             .into_iter()
             .filter(|r| now_ms.saturating_sub(r.pending_since_ms) >= RECONCILE_MIN_AGE_MS)
             .filter(|r| !r.operator_required && !outcome_already_unknown(&known, &r.id))
@@ -1554,12 +1657,14 @@ impl PersistedWindowStore {
         id: &str,
         mut pass: ReconcilePass<'o>,
     ) -> Result<ReconcileReport, WindowStoreError> {
+        let scope = ChainScope::for_chain(profile.chain_id);
+        self.require_chain_scope(profile, &scope)?;
         let open = match self.read_for_inspection(profile)? {
-            Some(wire) => collect_pending(&wire).into_iter().find(|r| r.id == id),
+            Some(wire) => collect_pending(&wire)?.into_iter().find(|r| r.id == id),
             None => None,
         };
         let reservation =
-            match open.or_else(|| receipts.and_then(|s| reservation_from_receipt(s, id))) {
+            match open.or_else(|| receipts.and_then(|s| reservation_from_receipt(s, id, scope))) {
                 Some(r) => r,
                 None => return Ok(ReconcileReport::default()),
             };
@@ -1581,15 +1686,16 @@ impl PersistedWindowStore {
     /// with an authenticated empty body at the next generation.
     ///
     /// The recorder runs before minting a key or writing either durable state.
-    /// An unverifiable file carries no totals; read and keyring errors refuse.
+    /// Unverifiable state refuses before the recorder and all state writes.
     ///
-    /// For a mainnet profile in a build with mainnet writes, two rules apply.
-    /// Verifiable state that still holds an effective open authorization
-    /// refuses before the recorder, with nothing changed. Unverifiable state
-    /// resets, and the recorder receives the defect it recovers from, so its
-    /// audit row names it. Expired authorizations are released in memory only:
+    /// A mainnet profile in a build with mainnet writes also refuses while an
+    /// effective open authorization remains. Expired authorizations are released in memory only:
     /// nothing persists before the recorder succeeds. A missing file with no
     /// committed generation is a genuine first run and carries no defect.
+    ///
+    /// A verified file is replaced through the generation commit, so a failed
+    /// write leaves the old snapshot or the empty one readable. A first
+    /// run commits the generation before the file.
     ///
     /// # Errors
     ///
@@ -1614,7 +1720,6 @@ impl PersistedWindowStore {
         let snapshot = self.reset_snapshot(profile, now_ms).map_err(before_mint)?;
         record(&ResetRecord {
             accrual: &snapshot.accrual,
-            defect: snapshot.defect,
             store_sha256: snapshot.store_sha256,
             guard: &lock,
             scope: PinScope::for_profile(&self.path, profile),
@@ -1640,12 +1745,11 @@ impl PersistedWindowStore {
                 }
             };
             let empty = WireFile {
-                version: WIRE_VERSION_COMPACT,
-                generation: accrual.generation_after,
+                chain_scope: Some(ChainScope::for_chain(profile.chain_id)),
                 ..WireFile::default()
             };
-            write_generation(&generation_entry_ref(profile), &empty)?;
-            self.write_atomic(&key, &empty)
+            let original = snapshot.original.unwrap_or_default();
+            self.commit_generation(&key, &generation_entry_ref(profile), original, empty)
         })();
         mutation.map_err(|error| ResetError::Store { error, minted })?;
         Ok(ResetOutcome {
@@ -1661,8 +1765,20 @@ impl PersistedWindowStore {
         profile: &Profile,
         now_ms: u64,
     ) -> Result<ResetSnapshot, WindowStoreError> {
-        refuse_owner_coordinate(profile)?;
-        let mut key_defect = None;
+        self.chain_scope(profile)?;
+        let counter = load_counter(&generation_entry_ref(profile))?;
+        let generation_before = counter.as_ref().map(|state| state.generation);
+        let generation_after = increment_generation(generation_before.unwrap_or(0))?;
+        let bytes = match fs::read(&self.path) {
+            Ok(bytes) => Some(bytes),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if counter.is_some() {
+                    return Err(WindowStoreError::GenerationMismatch);
+                }
+                None
+            }
+            Err(error) => return Err(WindowStoreError::Io { kind: error.kind() }),
+        };
         let key = match crate::keyring::load_hmac_key_32(&profile.policy_window_state_key_id) {
             Ok(key) => {
                 refuse_owner_public_key(
@@ -1671,22 +1787,9 @@ impl PersistedWindowStore {
                 )?;
                 Some(key)
             }
-            // An absent key, or a stored value that is not base64 or not 32
-            // bytes, is no usable key: the file is unverifiable and the key is
-            // replaced after the row.
-            Err(e) if key_defect_of(&e).is_some() => {
-                key_defect = key_defect_of(&e);
-                None
-            }
-            Err(e) => {
-                return Err(WindowStoreError::Keyring {
-                    detail: e.to_string(),
-                });
-            }
+            Err(error) if bytes.is_none() && key_defect_of(&error).is_some() => None,
+            Err(error) => return Err(key_load_error(profile, &error)),
         };
-        let counter = load_counter(&generation_entry_ref(profile))?;
-        let generation_before = counter.as_ref().map(|state| state.generation);
-        let generation_after = increment_generation(generation_before.unwrap_or(0))?;
         let mut accrual = WipedAccrualRecord {
             previous: PreviousState::Missing,
             entry_count: 0,
@@ -1695,78 +1798,48 @@ impl PersistedWindowStore {
             generation_before,
             generation_after,
         };
-        let mainnet = mainnet_rules(profile);
-        let bytes = match fs::read(&self.path) {
-            Ok(bytes) => bytes,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                // A committed generation without its file is a deletion; no
-                // committed generation is a genuine first run.
-                let defect = (mainnet && generation_before.is_some())
-                    .then_some(StateDefect::MissingFileWithGeneration);
-                return Ok(ResetSnapshot {
-                    store_sha256: None,
-                    key,
-                    accrual,
-                    defect,
-                });
-            }
-            Err(e) => return Err(WindowStoreError::Io { kind: e.kind() }),
+        let Some(bytes) = bytes else {
+            return Ok(ResetSnapshot {
+                store_sha256: None,
+                key,
+                accrual,
+                original: None,
+            });
         };
-        accrual.previous = PreviousState::Unverifiable;
-        let mut defect = key_defect;
-        if let Some(key) = &key {
-            match self
-                .verify_with_key(key, &bytes)
-                .and_then(|wire| select_generation(wire, counter))
-            {
-                Ok(mut wire) => {
-                    accrual.previous = PreviousState::Verified;
-                    // Authorization lifetimes are measured on the store's own
-                    // clock, as every ledger transition measures them.
-                    let clock = crate::policy_state::store::now_ms()?;
-                    #[cfg(feature = "mainnet-write")]
-                    if mainnet {
-                        let open = ledger::effective_open_count(&wire, clock);
-                        if open > 0 {
-                            return Err(WindowStoreError::OpenAuthorizations { open });
-                        }
-                    }
-                    ledger::sweep_expired(&mut wire, clock);
-                    // The holds of authorizations still open count as the
-                    // pending spend they hold.
-                    for hold in std::mem::take(&mut wire.holds) {
-                        let key = StateKey::new(
-                            "",
-                            hold.scope_specificity,
-                            &hold.bucket,
-                            hold.window_secs,
-                        );
-                        find_or_insert_bucket(&mut wire.entries, &key)
-                            .records
-                            .push(WireRecord {
-                                ts_ms: hold.ts_ms,
-                                amount: hold.amount,
-                                status: RecordStatus::Pending,
-                                ..WireRecord::confirmed_defaults()
-                            });
-                    }
-                    snapshot_accrual(&wire, now_ms, &mut accrual);
-                }
-                Err(
-                    e @ (WindowStoreError::HmacMismatch
-                    | WindowStoreError::Invalid { .. }
-                    | WindowStoreError::GenerationMismatch),
-                ) => {
-                    defect = defect_of(&e, false);
-                }
-                Err(e) => return Err(e),
+        let hmac_key = key.as_ref().ok_or(WindowStoreError::ChainUnverifiable)?;
+        let mut wire = self
+            .verify_with_key(hmac_key, &bytes)
+            .and_then(|wire| self.select_scoped_generation(profile, wire, counter))?;
+        let original = wire.clone();
+        accrual.previous = PreviousState::Verified;
+        // Authorization lifetimes use the store's clock on every transition.
+        let clock = crate::policy_state::store::now_ms()?;
+        #[cfg(feature = "mainnet-write")]
+        if mainnet_rules(profile) {
+            let open = ledger::effective_open_count(&wire, clock);
+            if open > 0 {
+                return Err(WindowStoreError::OpenAuthorizations { open });
             }
         }
+        ledger::sweep_expired(&mut wire, clock);
+        // Open authorization holds count as pending spend in the reset row.
+        for hold in std::mem::take(&mut wire.holds) {
+            let key = StateKey::new("", hold.scope_specificity, &hold.bucket, hold.window_secs);
+            find_or_insert_bucket(&mut wire.entries, &key)
+                .records
+                .push(WireRecord {
+                    ts_ms: hold.ts_ms,
+                    amount: hold.amount,
+                    status: RecordStatus::Pending,
+                    ..WireRecord::confirmed_defaults()
+                });
+        }
+        snapshot_accrual(&wire, now_ms, &mut accrual);
         Ok(ResetSnapshot {
             store_sha256: Some(Sha256::digest(&bytes).into()),
             key,
             accrual,
-            defect: if mainnet { defect } else { None },
+            original: Some(original),
         })
     }
 
@@ -1823,7 +1896,10 @@ impl PersistedWindowStore {
     /// # Errors
     ///
     /// [`WindowStoreError::Io`] / [`WindowStoreError::Invalid`] if the
-    /// existing file cannot be read or is shorter than the tag prefix.
+    /// existing file cannot be read, is shorter than the tag prefix, or has invalid JSON.
+    /// [`WindowStoreError::ChainMismatch`] refuses a different network.
+    /// [`WindowStoreError::ChainUnverifiable`] refuses incomplete authenticated scope.
+    /// Generation, version, and keyring errors also refuse before writing.
     pub fn resign(&self, profile: &Profile, new_key: &[u8; 32]) -> Result<(), WindowStoreError> {
         self.ensure_parent_dir()?;
         let _lock = WindowStoreLock::acquire_for_with_retry(
@@ -1842,6 +1918,15 @@ impl PersistedWindowStore {
             });
         }
         let body = &bytes[HMAC_TAG_LEN..];
+        let wire: WireFile =
+            serde_json::from_slice(body).map_err(|_| WindowStoreError::Invalid {
+                detail: "store body is not valid JSON".to_owned(),
+            })?;
+        self.select_scoped_generation(
+            profile,
+            wire,
+            load_counter(&generation_entry_ref(profile))?,
+        )?;
         let tag = compute_tag(new_key, body)?;
         self.write_atomic_raw(&tag, body)
     }
@@ -1901,7 +1986,7 @@ impl PersistedWindowStore {
         // commitment is hashed. The current snapshot keeps the version it was
         // committed under, so its committed digest stays the same with the
         // successor beside it.
-        next.version = select_wire_version(&next);
+        next.version = WIRE_VERSION_MAX;
         if original.generation == 0 {
             // Initialisation has no prior debit to retain. A missing trusted
             // counter on an existing file must remain a deletion error.
@@ -1977,7 +2062,9 @@ impl PersistedWindowStore {
         // oracle has to confirm, and only an oracle that reports mainnet can
         // confirm them; the primary's SUCCESS confirms as on any chain, which
         // keeps the debit.
-        if profile.chain_id.is_mainnet() && matches!(record.status(), "FAILED" | "NOT_FOUND") {
+        if reservation.chain_scope.chain().is_mainnet()
+            && matches!(record.status(), "FAILED" | "NOT_FOUND")
+        {
             let Some(oracle) = oracle else {
                 tracing::debug!(
                     "window reconcile: the primary endpoint's negative answer has no oracle to \
@@ -2326,18 +2413,39 @@ impl PersistedWindowStore {
         &self,
         profile: &Profile,
     ) -> Result<Option<WireFile>, WindowStoreError> {
+        use stellar_agent_core::policy::state_lock::{LOCK_ATTEMPTS, LOCK_RETRY_DELAY};
+
+        // A writer can advance the commitment between the file and keyring reads.
+        // Retry only that race, with the same bound as the writer lock.
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            match self.read_for_inspection_once(profile) {
+                Err(WindowStoreError::GenerationMismatch) if attempt < LOCK_ATTEMPTS => {
+                    std::thread::sleep(LOCK_RETRY_DELAY);
+                }
+                result => {
+                    return result.map_err(|error| {
+                        let defect = defect_of(&error, !self.path.exists());
+                        mainnet_loading_error(profile, error, defect)
+                    });
+                }
+            }
+        }
+    }
+
+    fn read_for_inspection_once(
+        &self,
+        profile: &Profile,
+    ) -> Result<Option<WireFile>, WindowStoreError> {
         refuse_owner_coordinate(profile)?;
         let gen_entry = generation_entry_ref(profile);
         let bytes = match fs::read(&self.path) {
-            Ok(b) => b,
+            Ok(bytes) => bytes,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 return match load_generation(&gen_entry)? {
                     None => Ok(None),
-                    Some(_) => Err(mainnet_loading_error(
-                        profile,
-                        WindowStoreError::GenerationMismatch,
-                        Some(StateDefect::MissingFileWithGeneration),
-                    )),
+                    Some(_) => Err(WindowStoreError::GenerationMismatch),
                 };
             }
             Err(e) => return Err(WindowStoreError::Io { kind: e.kind() }),
@@ -2345,14 +2453,12 @@ impl PersistedWindowStore {
         let key = crate::keyring::load_hmac_key_32(&profile.policy_window_state_key_id)
             .map_err(|e| key_load_error(profile, &e))?;
         refuse_owner_public_key(key.as_ref(), &OwnerKeyContext::for_loaded_profile(profile))?;
+        #[cfg(test)]
+        tests::after_inspection_file_read();
         let counter = load_counter(&gen_entry)?;
         self.verify_with_key(&key, &bytes)
-            .and_then(|wire| select_generation(wire, counter))
+            .and_then(|wire| self.select_scoped_generation(profile, wire, counter))
             .map(Some)
-            .map_err(|e| {
-                let defect = defect_of(&e, false);
-                mainnet_loading_error(profile, e, defect)
-            })
     }
 
     pub(super) fn ensure_parent_dir(&self) -> Result<(), WindowStoreError> {
@@ -2372,13 +2478,9 @@ impl PersistedWindowStore {
         owner_key::refuse_installation_key_coordinate(entry_ref, POLICY_STATE_KEY_FIELD)
             .map_err(|_| WindowStoreError::InstallationKeyCoordinate)?;
         let loaded = crate::keyring::load_hmac_key_32(entry_ref);
-        // Under the mainnet rules a key is minted only for a store with no
-        // committed history: a file without its key, and a committed
-        // generation without its file, are defects a write must not paper
-        // over with a fresh key.
-        if mainnet_rules(profile)
-            && let Err(error) = &loaded
-        {
+        // A fresh key requires both an absent file and absent protected history.
+        // Changing the profile network cannot make an existing authority new.
+        if let Err(error) = &loaded {
             if self.path.exists() {
                 return Err(key_load_error(profile, error));
             }
@@ -2450,7 +2552,7 @@ impl PersistedWindowStore {
             Ok(bytes) => {
                 let counter = load_counter(gen_entry)?;
                 self.verify_with_key(key, &bytes)
-                    .and_then(|wire| select_generation(wire, counter))
+                    .and_then(|wire| self.select_scoped_generation(profile, wire, counter))
                     .map_err(|e| {
                         let defect = defect_of(&e, false);
                         mainnet_loading_error(profile, e, defect)
@@ -2459,7 +2561,8 @@ impl PersistedWindowStore {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => match load_generation(gen_entry)?
             {
                 None => Ok(WireFile {
-                    version: WIRE_VERSION_COMPACT,
+                    version: WIRE_VERSION_MAX,
+                    chain_scope: Some(ChainScope::for_chain(profile.chain_id)),
                     ..WireFile::default()
                 }),
                 Some(_) => Err(mainnet_loading_error(
@@ -2525,6 +2628,8 @@ impl PersistedWindowStore {
         tag: &[u8; HMAC_TAG_LEN],
         body: &[u8],
     ) -> Result<(), WindowStoreError> {
+        #[cfg(test)]
+        tests::before_store_write()?;
         let mut tmp = self.path.clone();
         let name = tmp
             .file_name()
@@ -2750,10 +2855,41 @@ pub(super) fn now_ms() -> Result<u64, WindowStoreError> {
     })
 }
 
+/// Requires complete provenance for all retained accounting and both commit sides.
+fn authenticated_scope(wire: &WireFile) -> Result<ChainScope, WindowStoreError> {
+    let scope = wire
+        .chain_scope
+        .ok_or(WindowStoreError::ChainUnverifiable)?;
+    scope.validate()?;
+    for record in wire.entries.iter().flat_map(|bucket| &bucket.records) {
+        if (record.status == RecordStatus::Pending && record.chain_scope.is_none())
+            || record
+                .chain_scope
+                .is_some_and(|record_scope| record_scope != scope)
+        {
+            return Err(WindowStoreError::ChainUnverifiable);
+        }
+    }
+    for auth in &wire.authorizations {
+        if auth.chain != scope.chain()
+            || matches!(&auth.consumption, Some(ledger::ConsumptionBinding::Transaction(submission))
+                if submission.chain_scope != Some(scope))
+        {
+            return Err(WindowStoreError::ChainUnverifiable);
+        }
+    }
+    if let Some(prepared) = &wire.prepared
+        && authenticated_scope(prepared)? != scope
+    {
+        return Err(WindowStoreError::ChainUnverifiable);
+    }
+    Ok(scope)
+}
+
 /// Checks one snapshot's version and its authorization history.
 ///
-/// Versions 1 to 4 are read; a snapshot below version 4 carries no
-/// authorization history, and a version 4 snapshot may carry none.
+/// Versions 1 through 5 decode. Snapshots below version 4 carry no authorization
+/// history; usable snapshots also require complete authenticated scope.
 fn check_snapshot(wire: &WireFile) -> Result<(), WindowStoreError> {
     if wire.version > WIRE_VERSION_MAX {
         return Err(WindowStoreError::UnsupportedVersion {
@@ -2844,12 +2980,17 @@ enum Settlement {
 ///
 /// Only a receipt still awaiting an answer is settled this way: one the chain
 /// has already answered for needs no round trip.
-fn reservation_from_receipt(receipts: &ReceiptStore, id: &str) -> Option<SubmissionHold> {
+fn reservation_from_receipt(
+    receipts: &ReceiptStore,
+    id: &str,
+    scope: ChainScope,
+) -> Option<SubmissionHold> {
     let receipt = receipts.get(id).ok().flatten()?;
     if receipt.status.is_terminal() || receipt.tx_hash.is_empty() {
         return None;
     }
     Some(SubmissionHold {
+        chain_scope: scope,
         id: receipt.envelope_hash,
         tx_hash: receipt.tx_hash,
         source: receipt.source,
@@ -3013,10 +3154,9 @@ fn select_generation(
     counter: Option<GenerationState>,
 ) -> Result<WireFile, WindowStoreError> {
     // The current snapshot may carry any version this build reads, a legacy
-    // one included; a successor is always written by a build that writes
-    // version 3 or 4.
+    // one included; a successor carries version 3 through 5.
     if let Some(next) = &wire.prepared
-        && (!(WIRE_VERSION_COMPACT..=WIRE_VERSION_LEDGER).contains(&next.version)
+        && (!(WIRE_VERSION_COMPACT..=WIRE_VERSION_MAX).contains(&next.version)
             || next.prepared.is_some()
             || wire.generation.checked_add(1) != Some(next.generation))
     {
@@ -3053,7 +3193,7 @@ pub(super) fn file_holds_id(wire: &WireFile, id: &str) -> bool {
 
 /// Collects one [`SubmissionHold`] per distinct pending reservation id,
 /// oldest first by the time the reservation was taken.
-fn collect_pending(wire: &WireFile) -> Vec<SubmissionHold> {
+fn collect_pending(wire: &WireFile) -> Result<Vec<SubmissionHold>, WindowStoreError> {
     let mut seen: Vec<SubmissionHold> = Vec::new();
     for bucket in &wire.entries {
         for record in &bucket.records {
@@ -3064,6 +3204,9 @@ fn collect_pending(wire: &WireFile) -> Vec<SubmissionHold> {
                 continue;
             }
             seen.push(SubmissionHold {
+                chain_scope: record
+                    .chain_scope
+                    .ok_or(WindowStoreError::ChainUnverifiable)?,
                 id: record.id.clone(),
                 tx_hash: record.tx_hash.clone(),
                 source: record.source.clone(),
@@ -3080,7 +3223,7 @@ fn collect_pending(wire: &WireFile) -> Vec<SubmissionHold> {
             .cmp(&b.pending_since_ms)
             .then_with(|| a.id.cmp(&b.id))
     });
-    seen
+    Ok(seen)
 }
 
 /// The window `key` holds in `wire` at `now_ms`, as
@@ -3688,11 +3831,10 @@ mod tests {
     /// Simulates a crash between the keyring generation bump and the
     /// following file write completing (the keyring-first ordering
     /// `record_and_persist` documents): the keyring is ahead of the file.
-    /// `load_into` fails closed, and `reset` recovers by re-baselining both
-    /// to a new, consistent generation.
+    /// Both `load_into` and `reset` refuse unverifiable history.
     #[test]
     #[serial]
-    fn crash_ordering_keyring_ahead_of_file_fails_closed_and_reset_recovers() {
+    fn crash_ordering_keyring_ahead_of_file_and_reset_fail_closed() {
         keyring_mock::install().unwrap();
         let dir = TempDir::new().unwrap();
         let profile = test_profile(dir.path(), "crashgen");
@@ -3718,18 +3860,10 @@ mod tests {
             "keyring ahead of the file must fail closed, got {result:?}"
         );
 
-        // reset re-baselines both — recovery succeeds and the store reads
-        // empty (the pre-crash history is unrecoverable, by design: the
-        // store cannot know whether the un-persisted write was legitimate).
-        store.reset(&profile, now, |_| Ok::<(), ()>(())).unwrap();
-        let dest2 = PolicyStateStore::new();
-        store.load_into("crashgen", &profile, &dest2).unwrap();
-        let (sum, count) = dest2.query_window(&k, now + 1_000).unwrap();
-        assert_eq!(
-            (sum, count),
-            (0, 0),
-            "reset must recover to an empty, consistent state"
-        );
+        assert!(matches!(
+            assert_reset_refuses(&store, &profile),
+            WindowStoreError::GenerationMismatch
+        ));
     }
 
     // ── end-to-end persist seam ─────────────────────────────────────────
@@ -3862,6 +3996,9 @@ mod tests {
 
     fn reservation(id: &str, source: &str, sequence: i64, pending_since_ms: u64) -> SubmissionHold {
         SubmissionHold {
+            chain_scope: crate::policy_state::ChainScope::for_chain(
+                stellar_agent_core::profile::caip2::Caip2::Testnet,
+            ),
             id: id.to_owned(),
             tx_hash: "ab".repeat(32),
             source: source.to_owned(),
@@ -4722,6 +4859,18 @@ mod tests {
         }
 
         fn seal(&self, wire: &WireFile) {
+            let mut wire = wire.clone();
+            wire.chain_scope = Some(ChainScope::for_chain(self.profile.chain_id));
+            for record in wire
+                .entries
+                .iter_mut()
+                .flat_map(|bucket| &mut bucket.records)
+            {
+                if record.status == RecordStatus::Pending {
+                    record.chain_scope = wire.chain_scope;
+                }
+            }
+            let wire = &wire;
             let (key, _) = self.store.load_or_mint_key(&self.profile).unwrap();
             self.store.write_atomic(&key, wire).unwrap();
             write_generation(&generation_entry_ref(&self.profile), wire).unwrap();
@@ -4734,9 +4883,32 @@ mod tests {
         }
     }
 
+    fn assert_reset_refuses(store: &PersistedWindowStore, profile: &Profile) -> WindowStoreError {
+        let before = fs::read(&store.path).ok();
+        let key = get_raw(&profile.policy_window_state_key_id);
+        let generation = get_raw(&generation_entry_ref(profile));
+        let mut called = false;
+        let result = store.reset(profile, 100_000, |_| {
+            called = true;
+            Ok::<_, ()>(())
+        });
+        assert!(!called, "a refused reset never calls the recorder");
+        assert_eq!(fs::read(&store.path).ok(), before);
+        assert_eq!(get_raw(&profile.policy_window_state_key_id), key);
+        assert_eq!(get_raw(&generation_entry_ref(profile)), generation);
+        match result {
+            Err(ResetError::Store {
+                error,
+                minted: false,
+            }) => error,
+            other => unreachable!("expected refusal without minting: {other:?}"),
+        }
+    }
+
     fn reset_wire() -> WireFile {
         WireFile {
-            version: WIRE_VERSION_COMPACT,
+            chain_scope: Some(ChainScope::for_chain(Caip2::Testnet)),
+            version: WIRE_VERSION_MAX,
             generation: 1,
             prepared: None,
             entries: vec![WireBucket {
@@ -4770,6 +4942,7 @@ mod tests {
                 ..WireRecord::confirmed_defaults()
             },
             WireRecord {
+                chain_scope: None,
                 ts_ms: 0,
                 amount: 13,
                 status: RecordStatus::Pending,
@@ -4981,30 +5154,33 @@ mod tests {
 
     #[test]
     #[serial]
-    fn reset_tampered_file_is_unverifiable_without_totals() {
+    fn reset_tampered_file_refuses_without_mutation() {
         let f = ResetFixture::new();
         f.seal(&reset_wire());
         let mut bytes = fs::read(&f.store.path).unwrap();
         bytes[0] ^= 1;
         fs::write(&f.store.path, bytes).unwrap();
-        let row = f.reset().accrual;
-        assert_eq!(row.previous, PreviousState::Unverifiable);
-        assert_eq!(row.entry_count, 0);
-        assert!(row.buckets.is_empty());
+        assert!(matches!(
+            assert_reset_refuses(&f.store, &f.profile),
+            WindowStoreError::HmacMismatch
+        ));
     }
 
     #[test]
     #[serial]
-    fn reset_authentic_rollback_is_unverifiable() {
+    fn reset_authentic_rollback_refuses_without_mutation() {
         let f = ResetFixture::new();
         f.seal(&reset_wire());
         put_raw(&generation_entry_ref(&f.profile), "2");
-        assert_eq!(f.reset().accrual.previous, PreviousState::Unverifiable);
+        assert!(matches!(
+            assert_reset_refuses(&f.store, &f.profile),
+            WindowStoreError::GenerationMismatch
+        ));
     }
 
     #[test]
     #[serial]
-    fn reset_malformed_files_are_unverifiable() {
+    fn reset_malformed_file_refuses_without_mutation() {
         let f = ResetFixture::new();
         f.seal(&reset_wire());
         let key = crate::keyring::load_hmac_key_32(&f.profile.policy_window_state_key_id).unwrap();
@@ -5012,67 +5188,45 @@ mod tests {
         f.store
             .write_atomic_raw(&compute_tag(key.as_ref(), body).unwrap(), body)
             .unwrap();
-        assert_eq!(f.reset().accrual.previous, PreviousState::Unverifiable);
+        assert!(matches!(
+            assert_reset_refuses(&f.store, &f.profile),
+            WindowStoreError::Invalid { .. }
+        ));
     }
 
     #[test]
     #[serial]
-    fn reset_file_without_key_is_unverifiable_and_mints_after_recording() {
+    fn reset_file_without_key_refuses_without_mutation() {
         let f = ResetFixture::new();
         fs::write(&f.store.path, b"unverifiable").unwrap();
-        let row = f
-            .store
-            .reset(&f.profile, 100_000, |row| {
-                assert!(get_raw(&f.profile.policy_window_state_key_id).is_none());
-                assert_eq!(row.accrual.previous, PreviousState::Unverifiable);
-                Ok::<_, ()>(())
-            })
-            .unwrap();
-        assert!(row.mint.newly_minted);
+        assert!(matches!(
+            assert_reset_refuses(&f.store, &f.profile),
+            WindowStoreError::Keyring { .. }
+        ));
     }
 
     #[test]
     #[serial]
-    fn reset_short_key_is_replaced_after_the_row() {
+    fn reset_short_key_refuses_without_mutation() {
         let f = ResetFixture::new();
         put_raw(&f.profile.policy_window_state_key_id, "AA");
         fs::write(&f.store.path, b"unverifiable").unwrap();
-        let outcome = f
-            .store
-            .reset(&f.profile, 100_000, |row| {
-                assert_eq!(
-                    get_raw(&f.profile.policy_window_state_key_id).as_deref(),
-                    Some("AA")
-                );
-                assert_eq!(row.accrual.previous, PreviousState::Unverifiable);
-                Ok::<_, ()>(())
-            })
-            .unwrap();
-        assert!(outcome.mint.newly_minted);
-        assert!(crate::keyring::load_hmac_key_32(&f.profile.policy_window_state_key_id).is_ok());
+        assert!(matches!(
+            assert_reset_refuses(&f.store, &f.profile),
+            WindowStoreError::Keyring { .. }
+        ));
     }
 
     #[test]
     #[serial]
-    fn reset_undecodable_key_is_replaced_after_the_row() {
+    fn reset_undecodable_key_refuses_without_mutation() {
         let f = ResetFixture::new();
         f.seal(&reset_wire());
         put_raw(&f.profile.policy_window_state_key_id, "not*base64");
-        let outcome = f
-            .store
-            .reset(&f.profile, 100_000, |row| {
-                assert_eq!(
-                    get_raw(&f.profile.policy_window_state_key_id).as_deref(),
-                    Some("not*base64")
-                );
-                assert_eq!(row.accrual.previous, PreviousState::Unverifiable);
-                assert!(row.accrual.buckets.is_empty());
-                assert_eq!(row.accrual.generation_before, Some(1));
-                Ok::<_, ()>(())
-            })
-            .unwrap();
-        assert!(outcome.mint.newly_minted);
-        assert!(crate::keyring::load_hmac_key_32(&f.profile.policy_window_state_key_id).is_ok());
+        assert!(matches!(
+            assert_reset_refuses(&f.store, &f.profile),
+            WindowStoreError::Keyring { .. }
+        ));
     }
 
     #[test]
@@ -5154,31 +5308,23 @@ mod tests {
         assert_eq!(first.generation_before, None);
         assert_eq!(first.generation_after, 1);
         fs::remove_file(&f.store.path).unwrap();
-        let next = f.reset().accrual;
-        assert_eq!(next.previous, PreviousState::Missing);
-        assert_eq!(next.generation_before, Some(1));
-        assert_eq!(next.generation_after, 2);
+        assert!(matches!(
+            assert_reset_refuses(&f.store, &f.profile),
+            WindowStoreError::GenerationMismatch
+        ));
     }
 
     #[test]
     #[serial]
     fn reset_generation_overflow_refuses_before_recorder() {
         let f = ResetFixture::new();
-        put_raw(&generation_entry_ref(&f.profile), &u64::MAX.to_string());
-        let mut called = false;
-        let result = f.store.reset(&f.profile, 100_000, |_| {
-            called = true;
-            Ok::<_, ()>(())
-        });
+        let mut wire = reset_wire();
+        wire.generation = u64::MAX;
+        f.seal(&wire);
         assert!(matches!(
-            result,
-            Err(ResetError::Store {
-                error: WindowStoreError::Invalid { .. },
-                minted: false,
-            })
+            assert_reset_refuses(&f.store, &f.profile),
+            WindowStoreError::Invalid { .. }
         ));
-        assert!(!called);
-        assert!(get_raw(&f.profile.policy_window_state_key_id).is_none());
     }
 
     #[test]
@@ -5532,7 +5678,7 @@ mod tests {
         bytes
     }
 
-    /// The compact version 3 files read, select version 3, and serialise back
+    /// The compact version 3 files decode and serialize back
     /// to the same bytes, the current and the prepared container alike.
     #[test]
     fn a_compact_version_3_file_round_trips_byte_for_byte() {
@@ -5545,10 +5691,8 @@ mod tests {
             let bytes = fixture_bytes(tag, body);
             let wire = store.verify_with_key(&FIXTURE_KEY, &bytes).unwrap();
             assert_eq!((wire.version, wire.generation), (3, 7));
-            assert_eq!(select_wire_version(&wire), WIRE_VERSION_COMPACT);
             if let Some(prepared) = &wire.prepared {
                 assert_eq!((prepared.version, prepared.generation), (3, 8));
-                assert_eq!(select_wire_version(prepared), WIRE_VERSION_COMPACT);
             }
             store.write_atomic(&FIXTURE_KEY, &wire).unwrap();
             assert_eq!(fs::read(&store.path).unwrap(), bytes);
@@ -5570,37 +5714,6 @@ mod tests {
             body_digest(&current).unwrap(),
             body_digest(&container).unwrap(),
             "a prepared successor leaves the current commitment unchanged"
-        );
-    }
-
-    /// A version 4 file whose history is empty is read; the writer selects
-    /// version 3 for it.
-    #[test]
-    #[serial]
-    fn a_version_4_file_with_an_empty_history_is_read() {
-        keyring_mock::install().unwrap();
-        let dir = TempDir::new().unwrap();
-        let profile = test_profile(dir.path(), "v4-empty");
-        let store = PersistedWindowStore::at_path(dir.path().join("v4-empty.window"));
-        let k = key("v4-empty", "native", 86_400);
-        let now = now_ms().unwrap();
-        store
-            .record_and_persist(&profile, &[entry(k.clone(), now, 3)])
-            .unwrap();
-        rewrite_body_version(&store, &profile, 4);
-        let memory = PolicyStateStore::new();
-        store.load_into("v4-empty", &profile, &memory).unwrap();
-        assert_eq!(memory.query_window(&k, now).unwrap(), (3, 1));
-        store
-            .record_and_persist(&profile, &[entry(k, now, 1)])
-            .unwrap();
-        assert_eq!(
-            store
-                .read_for_inspection(&profile)
-                .unwrap()
-                .unwrap()
-                .version,
-            3
         );
     }
 
@@ -5651,11 +5764,13 @@ mod tests {
             (3, 4),
             (4, 4),
             (4, 3),
+            (5, 5),
         ] {
             let pair = format!("{current_version}->{prepared_version}");
             keyring_mock::install().unwrap();
             let dir = TempDir::new().unwrap();
-            let profile = test_profile(dir.path(), "versions");
+            let mut profile = test_profile(dir.path(), "versions");
+            profile.chain_id = Caip2::Mainnet;
             let store = PersistedWindowStore::at_path(dir.path().join("versions.window"));
             let k = key("versions", "native", 86_400);
             let now = now_ms().unwrap();
@@ -5670,7 +5785,7 @@ mod tests {
                 _ => {
                     let mut wire = store.read_for_inspection(&profile).unwrap().unwrap();
                     wire.version = current_version;
-                    if current_version == 4 {
+                    if current_version >= WIRE_VERSION_LEDGER {
                         wire.authorizations.push(settled_authorization(1));
                     }
                     store.write_atomic(&hmac_key, &wire).unwrap();
@@ -5688,7 +5803,7 @@ mod tests {
                 amount: 5,
                 ..WireRecord::confirmed_defaults()
             });
-            if prepared_version == 4 {
+            if prepared_version >= WIRE_VERSION_LEDGER {
                 next.authorizations.push(settled_authorization(2));
             } else {
                 next.authorizations.clear();
@@ -5710,12 +5825,21 @@ mod tests {
             let mut other = next.clone();
             other.entries[0].records[0].amount = 11;
             write_generation(&gen_entry, &other).unwrap();
+            let error = store.read_for_inspection(&profile).unwrap_err();
+            #[cfg(feature = "mainnet-write")]
             assert!(
                 matches!(
-                    store.read_for_inspection(&profile),
-                    Err(WindowStoreError::GenerationMismatch)
+                    error,
+                    WindowStoreError::MainnetStateUnverifiable {
+                        defect: StateDefect::GenerationMismatch
+                    }
                 ),
-                "{pair}: a commitment of another body refuses"
+                "{pair}: {error}"
+            );
+            #[cfg(not(feature = "mainnet-write"))]
+            assert!(
+                matches!(error, WindowStoreError::GenerationMismatch),
+                "{pair}: {error}"
             );
 
             write_generation(&gen_entry, &next).unwrap();
@@ -5735,8 +5859,7 @@ mod tests {
                 .unwrap();
             let written = store.read_for_inspection(&profile).unwrap().unwrap();
             assert_eq!(
-                written.version,
-                if prepared_version == 4 { 4 } else { 3 },
+                written.version, 5,
                 "{pair}: the next write selects its version from its content"
             );
         }
@@ -5757,7 +5880,7 @@ mod tests {
                 body_sha256: None,
             })
         };
-        for version in [1, 2, 5] {
+        for version in [1, 2, 6] {
             let mut container = current.clone();
             container.prepared = Some(Box::new(WireFile {
                 version,
@@ -5988,29 +6111,30 @@ mod tests {
         assert!(outcome.newly_minted);
     }
 
-    /// The reset of an unverifiable mainnet store hands the recorder the
-    /// defect, before anything changes, and then recovers; under the other
-    /// rules the recorder sees no defect.
+    /// Unverifiable history refuses before the recorder on either network.
     #[test]
     #[serial]
-    fn an_unverifiable_reset_passes_its_defect_to_the_recorder() {
+    fn an_unverifiable_reset_preserves_every_durable_component() {
         for mainnet in [true, false] {
             for defect in DEFECTS {
                 let (_dir, profile, store) = broken("unverifiable", mainnet, defect);
-                let before = fs::read(&store.path).ok();
-                let mut seen = None;
-                store
-                    .reset(&profile, now_ms().unwrap(), |record| {
-                        assert_eq!(fs::read(&store.path).ok(), before);
-                        seen = Some(record.defect);
-                        Ok::<_, ()>(())
-                    })
-                    .unwrap();
-                let expected = (mainnet && cfg!(feature = "mainnet-write")).then_some(defect);
-                assert_eq!(seen, Some(expected), "mainnet={mainnet} {defect}");
-                store
-                    .load_into("unverifiable", &profile, &PolicyStateStore::new())
-                    .unwrap();
+                let error = assert_reset_refuses(&store, &profile);
+                #[cfg(feature = "mainnet-write")]
+                if mainnet {
+                    assert!(
+                        matches!(error, WindowStoreError::MainnetStateUnverifiable { defect: found } if found == defect)
+                    );
+                    continue;
+                }
+                assert!(
+                    match defect {
+                        StateDefect::MissingKey | StateDefect::BadKey => {
+                            matches!(error, WindowStoreError::Keyring { .. })
+                        }
+                        _ => defect_of(&error, !store.path.exists()) == Some(defect),
+                    },
+                    "{defect}"
+                );
             }
         }
     }
@@ -6042,6 +6166,7 @@ mod tests {
             let gen_entry = generation_entry_ref(&profile);
             let mut wire = store.read_for_inspection(&profile).unwrap().unwrap();
             let mut open = settled_authorization(1);
+            open.chain = profile.chain_id;
             open.state = ledger::AuthorizationState::Open;
             open.settled_ms = None;
             open.minted_ms = now;
@@ -6096,7 +6221,7 @@ mod tests {
             f.seal(&reset_wire());
             let key =
                 crate::keyring::load_hmac_key_32(&f.profile.policy_window_state_key_id).unwrap();
-            let body = br#"{"version":5,"future_authorities":[{"open":true}],"prepared":"future representation"}"#;
+            let body = br#"{"version":6,"future_authorities":[{"open":true}],"prepared":"future representation"}"#;
             f.store
                 .write_atomic_raw(&compute_tag(key.as_ref(), body).unwrap(), body)
                 .unwrap();
@@ -6104,13 +6229,13 @@ mod tests {
             assert!(
                 matches!(
                     f.store.verify_with_key(&key, &before),
-                    Err(WindowStoreError::UnsupportedVersion { version: 5, max: 4 })
+                    Err(WindowStoreError::UnsupportedVersion { version: 6, max: 5 })
                 ),
                 "{chain:?}"
             );
             assert_eq!(
                 defect_of(
-                    &WindowStoreError::UnsupportedVersion { version: 5, max: 4 },
+                    &WindowStoreError::UnsupportedVersion { version: 6, max: 5 },
                     false
                 ),
                 None
@@ -6124,7 +6249,7 @@ mod tests {
                 matches!(
                     result,
                     Err(ResetError::Store {
-                        error: WindowStoreError::UnsupportedVersion { version: 5, max: 4 },
+                        error: WindowStoreError::UnsupportedVersion { version: 6, max: 5 },
                         minted: false,
                     })
                 ),
@@ -6197,5 +6322,753 @@ mod tests {
             Err(WindowStoreError::InstallationKeyCoordinate)
         ));
         assert!(get_raw(&entry_ref).is_none());
+    }
+    /// A missing receipt cannot supply the network of retained legacy debits.
+    #[tokio::test]
+    #[serial]
+    async fn missing_receipt_does_not_supply_chain_provenance() {
+        keyring_mock::install().unwrap();
+        let dir = TempDir::new().unwrap();
+        let profile = test_profile(dir.path(), "legacy-receipt");
+        let store = PersistedWindowStore::at_path(dir.path().join("legacy.window"));
+        let now = now_ms().unwrap();
+        let hold = reservation(&"ad".repeat(32), "GSOURCE", 7, now);
+        store
+            .record_pending(
+                &profile,
+                &[entry(key("legacy-receipt", "native", 86_400), now, 75)],
+                &hold,
+            )
+            .unwrap();
+        let receipts = ReceiptStore::open_at(dir.path(), "legacy-receipt").unwrap();
+        receipts
+            .try_begin(&hold.id, &hold.tx_hash, &hold.source, hold.sequence, 0, 100)
+            .unwrap();
+        fs::remove_file(receipts.file_path().unwrap()).unwrap();
+        let mut wire = store.read_for_inspection(&profile).unwrap().unwrap();
+        wire.version = 3;
+        wire.chain_scope = None;
+        for record in wire
+            .entries
+            .iter_mut()
+            .flat_map(|bucket| &mut bucket.records)
+        {
+            record.chain_scope = None;
+        }
+        let hmac_key =
+            crate::keyring::load_hmac_key_32(&profile.policy_window_state_key_id).unwrap();
+        store.write_atomic(&hmac_key, &wire).unwrap();
+        write_generation(&generation_entry_ref(&profile), &wire).unwrap();
+        let before = fs::read(&store.path).unwrap();
+        let counter = get_raw(&generation_entry_ref(&profile));
+        let client = crate::StellarRpcClient::new("http://127.0.0.1:1").unwrap();
+        for chain in [Caip2::Testnet, Caip2::Mainnet] {
+            let mut supplied = profile.clone();
+            supplied.chain_id = chain;
+            assert!(matches!(
+                store.pending_reservations(&supplied),
+                Err(WindowStoreError::ChainUnverifiable)
+            ));
+            assert!(matches!(
+                store
+                    .reconcile_one(&supplied, &client, None, Some(&receipts), &hold.id, now)
+                    .await,
+                Err(WindowStoreError::ChainUnverifiable)
+            ));
+            assert_eq!(fs::read(&store.path).unwrap(), before);
+            assert_eq!(get_raw(&generation_entry_ref(&profile)), counter);
+            assert!(receipts.get(&hold.id).unwrap().is_none());
+        }
+    }
+
+    /// Retained authorization history and committed empty state cannot adopt TOML scope.
+    #[test]
+    #[serial]
+    fn nonempty_legacy_state_is_not_adopted_from_toml() {
+        keyring_mock::install().unwrap();
+        let dir = TempDir::new().unwrap();
+        let profile = test_profile(dir.path(), "legacy-history");
+        let store = PersistedWindowStore::at_path(dir.path().join("legacy.window"));
+        let (hmac_key, _) = store.load_or_mint_key(&profile).unwrap();
+        for version in 1..=4 {
+            let mut wire = WireFile {
+                version,
+                generation: 1,
+                ..WireFile::default()
+            };
+            if version == 4 {
+                wire.authorizations.push(settled_authorization(4));
+            } else {
+                wire.entries.push(WireBucket {
+                    scope_specificity: 1,
+                    bucket: "native".to_owned(),
+                    window_secs: 86_400,
+                    records: vec![WireRecord {
+                        amount: 75,
+                        ts_ms: now_ms().unwrap(),
+                        ..WireRecord::confirmed_defaults()
+                    }],
+                });
+            }
+            for retained in [true, false] {
+                if !retained {
+                    wire.entries.clear();
+                    wire.authorizations.clear();
+                }
+                store.write_atomic(&hmac_key, &wire).unwrap();
+                write_generation(&generation_entry_ref(&profile), &wire).unwrap();
+                let before = fs::read(&store.path).unwrap();
+                let counter = get_raw(&generation_entry_ref(&profile));
+                for chain in [Caip2::Testnet, Caip2::Mainnet] {
+                    let mut supplied = profile.clone();
+                    supplied.chain_id = chain;
+                    for result in [
+                        store.pending_reservations(&supplied).map(|_| ()),
+                        store.record_and_persist(&supplied, &[]).map(|_| ()),
+                        store.release(&supplied, "absent"),
+                        store.load_into("legacy-history", &supplied, &PolicyStateStore::new()),
+                    ] {
+                        assert!(
+                            matches!(result, Err(WindowStoreError::ChainUnverifiable)),
+                            "{version} {retained}: {result:?}"
+                        );
+                    }
+                    assert!(matches!(
+                        store.reset(&supplied, now_ms().unwrap(), |_| Ok::<_, ()>(())),
+                        Err(ResetError::Store {
+                            error: WindowStoreError::ChainUnverifiable,
+                            ..
+                        })
+                    ));
+                    assert_eq!(fs::read(&store.path).unwrap(), before);
+                    assert_eq!(get_raw(&generation_entry_ref(&profile)), counter);
+                }
+            }
+        }
+    }
+    #[test]
+    #[serial]
+    fn reset_refuses_a_rolled_back_file_of_another_network() {
+        let mut f = ResetFixture::new();
+        f.profile.chain_id = Caip2::Mainnet;
+        f.seal(&reset_wire());
+        put_raw(&generation_entry_ref(&f.profile), "2");
+        f.profile.chain_id = Caip2::Testnet;
+        assert!(matches!(
+            assert_reset_refuses(&f.store, &f.profile),
+            WindowStoreError::ChainMismatch
+        ));
+    }
+
+    /// Each authenticated wire has exactly one provenance defect.
+    #[test]
+    #[serial]
+    fn sealed_v5_provenance_defects_refuse_independently() {
+        let mut f = ResetFixture::new();
+        f.profile.chain_id = Caip2::Mainnet;
+        f.seal(&reset_wire());
+        let hmac_key =
+            crate::keyring::load_hmac_key_32(&f.profile.policy_window_state_key_id).unwrap();
+        let scope = ChainScope::for_chain(Caip2::Mainnet);
+        let foreign = ChainScope::for_chain(Caip2::Testnet);
+        let mut valid = reset_wire();
+        valid.chain_scope = Some(scope);
+        valid.entries[0].records[0].status = RecordStatus::Pending;
+        valid.entries[0].records[0].chain_scope = Some(scope);
+        let mut auth = settled_authorization(1);
+        auth.state = ledger::AuthorizationState::Used;
+        auth.binding = ledger::DomainBinding::Transaction {
+            unsigned_envelope_sha256: [2; 32],
+            tx_hash: [3; 32],
+            source: "synthetic-source".to_owned(),
+            sequence: 1,
+        };
+        auth.domain = crate::mainnet::AuthorizationDomain::Transaction;
+        auth.consumer = crate::mainnet::MainnetConsumer::CliPay;
+        auth.content_digest = auth.binding.content_digest();
+        auth.consumption = Some(ledger::ConsumptionBinding::Transaction(
+            ledger::SubmissionBinding {
+                chain_scope: Some(scope),
+                fee_bump: None,
+                envelope_hash: [2; 32],
+                tx_hash: [3; 32],
+                source: "synthetic-source".to_owned(),
+                sequence: 1,
+                max_time: 0,
+                pending_since_ms: 90_000,
+                submission_ledger: 1,
+            },
+        ));
+        valid.authorizations.push(auth);
+        let mut next = valid.clone();
+        next.generation += 1;
+        valid.prepared = Some(Box::new(next));
+        f.store.write_atomic(&hmac_key, &valid).unwrap();
+        let mut committed = valid.clone();
+        committed.prepared = None;
+        write_generation(&generation_entry_ref(&f.profile), &committed).unwrap();
+        f.store.chain_scope(&f.profile).unwrap();
+        for defect in [
+            "hash",
+            "pending_conflict",
+            "pending_missing",
+            "authorization",
+            "consumption_conflict",
+            "consumption_missing",
+            "prepared_conflict",
+            "prepared_missing",
+        ] {
+            let mut wire = valid.clone();
+            match defect {
+                "hash" => {
+                    wire.entries.clear();
+                    wire.authorizations.clear();
+                    wire.prepared = None;
+                    wire.chain_scope.as_mut().unwrap().network_passphrase_sha256[0] ^= 1;
+                }
+                "pending_conflict" => wire.entries[0].records[0].chain_scope = Some(foreign),
+                "pending_missing" => wire.entries[0].records[0].chain_scope = None,
+                "authorization" => wire.authorizations[0].chain = Caip2::Testnet,
+                "consumption_conflict" | "consumption_missing" => {
+                    let Some(ledger::ConsumptionBinding::Transaction(submission)) =
+                        &mut wire.authorizations[0].consumption
+                    else {
+                        unreachable!("transaction fixture")
+                    };
+                    submission.chain_scope = (defect == "consumption_conflict").then_some(foreign);
+                }
+                "prepared_conflict" => {
+                    let next = wire.prepared.as_mut().unwrap();
+                    // An independently valid foreign snapshot isolates the cross-side comparison.
+                    next.chain_scope = Some(foreign);
+                    next.entries.clear();
+                    next.authorizations.clear();
+                }
+                "prepared_missing" => wire.prepared.as_mut().unwrap().chain_scope = None,
+                _ => unreachable!(),
+            }
+            f.store.write_atomic(&hmac_key, &wire).unwrap();
+            write_generation(&generation_entry_ref(&f.profile), &wire).unwrap();
+            assert!(
+                matches!(
+                    f.store.chain_scope(&f.profile),
+                    Err(WindowStoreError::ChainUnverifiable)
+                ),
+                "{defect}"
+            );
+            assert!(
+                matches!(
+                    assert_reset_refuses(&f.store, &f.profile),
+                    WindowStoreError::ChainUnverifiable
+                ),
+                "{defect}"
+            );
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn a_foreign_submission_hold_refuses_before_reserving() {
+        let f = ResetFixture::new();
+        f.seal(&reset_wire());
+        let before = fs::read(&f.store.path).unwrap();
+        let generation = get_raw(&generation_entry_ref(&f.profile));
+        let mut hold = reservation("foreign", "synthetic-source", 1, 100_000);
+        hold.chain_scope = ChainScope::for_chain(Caip2::Mainnet);
+        let result = f.store.record_pending(
+            &f.profile,
+            &[entry(key("reset-snapshot", "native", 10), 100_000, 1)],
+            &hold,
+        );
+        assert!(matches!(result, Err(WindowStoreError::ChainMismatch)));
+        assert_eq!(fs::read(&f.store.path).unwrap(), before);
+        assert_eq!(get_raw(&generation_entry_ref(&f.profile)), generation);
+    }
+
+    thread_local! {
+        static INSPECTION_READ_HOOK: std::cell::RefCell<Option<Box<dyn FnMut()>>> = std::cell::RefCell::new(None);
+    }
+
+    pub(super) fn after_inspection_file_read() {
+        INSPECTION_READ_HOOK.with_borrow_mut(|hook| {
+            if let Some(hook) = hook {
+                hook();
+            }
+        });
+    }
+
+    struct InspectionHook;
+    impl Drop for InspectionHook {
+        fn drop(&mut self) {
+            INSPECTION_READ_HOOK.with_borrow_mut(|hook| *hook = None);
+        }
+    }
+
+    type StoreWriteHook = Box<dyn FnMut() -> Result<(), WindowStoreError>>;
+
+    thread_local! {
+        static STORE_WRITE_HOOK: std::cell::RefCell<Option<StoreWriteHook>> = std::cell::RefCell::new(None);
+    }
+
+    pub(super) fn before_store_write() -> Result<(), WindowStoreError> {
+        STORE_WRITE_HOOK.with_borrow_mut(|hook| hook.as_mut().map_or(Ok(()), |hook| hook()))
+    }
+
+    struct ArmedWrite;
+    impl Drop for ArmedWrite {
+        fn drop(&mut self) {
+            STORE_WRITE_HOOK.with_borrow_mut(|hook| *hook = None);
+        }
+    }
+
+    /// The three durable steps of a commit past the first write.
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum CommitStep {
+        PreparedImage,
+        Keyring,
+        Compaction,
+    }
+
+    const COMMIT_STEPS: [CommitStep; 3] = [
+        CommitStep::PreparedImage,
+        CommitStep::Keyring,
+        CommitStep::Compaction,
+    ];
+
+    /// Fails `step` of the next commit. The keyring error is injected from the
+    /// first file write, after the writer's verified read has spent its
+    /// counter reads, so it lands on the commit write.
+    fn fail_commit_at(step: CommitStep, gen_entry: &KeyringEntryRef) -> ArmedWrite {
+        let gen_entry = gen_entry.clone();
+        let mut writes = 0;
+        STORE_WRITE_HOOK.with_borrow_mut(|hook| {
+            *hook = Some(Box::new(move || {
+                writes += 1;
+                let failed = Err(WindowStoreError::Io {
+                    kind: std::io::ErrorKind::StorageFull,
+                });
+                match (step, writes) {
+                    (CommitStep::PreparedImage, 1) | (CommitStep::Compaction, 2) => failed,
+                    (CommitStep::Keyring, 1) => {
+                        keyring_mock::inject_error(
+                            &gen_entry.service,
+                            &gen_entry.account,
+                            keyring_core::Error::NoStorageAccess(Box::new(std::io::Error::other(
+                                "keyring unavailable",
+                            ))),
+                        )
+                        .unwrap();
+                        Ok(())
+                    }
+                    _ => Ok(()),
+                }
+            }));
+        });
+        ArmedWrite
+    }
+
+    /// Runs `write` against a store holding one committed debit of 40 with
+    /// `step` failing, then requires `load_into` to read the old snapshot, or
+    /// the new one holding `committed` once the keyring has moved. `after_read`
+    /// checks the next operation before an empty write compacts the store.
+    fn assert_a_failed_commit_step_reads(
+        name: &str,
+        step: CommitStep,
+        committed: (i128, u32),
+        write: impl FnOnce(&PersistedWindowStore, &Profile, u64) -> bool,
+        after_read: impl FnOnce(&PersistedWindowStore, &Profile, u64, u64),
+    ) {
+        keyring_mock::install().unwrap();
+        let dir = TempDir::new().unwrap();
+        let profile = test_profile(dir.path(), name);
+        let store = PersistedWindowStore::at_path(dir.path().join("commit.window"));
+        let k = key(name, "native", 86_400);
+        let now = now_ms().unwrap();
+        store
+            .record_and_persist(&profile, &[entry(k.clone(), now, 40)])
+            .unwrap();
+        let gen_entry = generation_entry_ref(&profile);
+        let before = load_generation(&gen_entry).unwrap().unwrap();
+
+        let armed = fail_commit_at(step, &gen_entry);
+        let succeeded = write(&store, &profile, now);
+        drop(armed);
+
+        let is_committed = step == CommitStep::Compaction;
+        assert_eq!(succeeded, is_committed, "{step:?}");
+        assert_eq!(
+            load_generation(&gen_entry).unwrap(),
+            Some(before + u64::from(is_committed)),
+            "{step:?}"
+        );
+        let body: serde_json::Value =
+            serde_json::from_slice(&fs::read(&store.path).unwrap()[HMAC_TAG_LEN..]).unwrap();
+        assert_eq!(body["generation"], before, "{step:?}");
+        assert_eq!(
+            body.get("prepared").is_some(),
+            step != CommitStep::PreparedImage,
+            "{step:?}"
+        );
+        let memory = PolicyStateStore::new();
+        store.load_into(name, &profile, &memory).unwrap();
+        assert_eq!(
+            memory.query_window(&k, now).unwrap(),
+            if is_committed { committed } else { (40, 1) },
+            "{step:?}"
+        );
+
+        after_read(&store, &profile, now, before);
+        store.record_and_persist(&profile, &[]).unwrap();
+        let body: serde_json::Value =
+            serde_json::from_slice(&fs::read(&store.path).unwrap()[HMAC_TAG_LEN..]).unwrap();
+        assert!(body.get("prepared").is_none(), "{step:?}");
+        store
+            .load_into(name, &profile, &PolicyStateStore::new())
+            .unwrap();
+    }
+
+    /// The no-recovery sentence joins an integrity failure only: a backend
+    /// failure can clear, and a generation mismatch carries it already.
+    #[test]
+    fn only_an_integrity_failure_gains_the_recovery_notice() {
+        for error in [
+            WindowStoreError::HmacMismatch,
+            WindowStoreError::Invalid {
+                detail: "malformed".to_owned(),
+            },
+        ] {
+            assert_eq!(
+                error.with_recovery_notice("refused".to_owned()),
+                "refused. No verb recovers such state in this release; create a profile under \
+                 a new name."
+            );
+        }
+        for error in [
+            WindowStoreError::Io {
+                kind: std::io::ErrorKind::PermissionDenied,
+            },
+            WindowStoreError::Keyring {
+                detail: "locked".to_owned(),
+            },
+            WindowStoreError::GenerationMismatch,
+        ] {
+            assert_eq!(error.with_recovery_notice("refused".to_owned()), "refused");
+        }
+    }
+
+    /// A reset of a verified file survives a failure at every commit step: the
+    /// old history stays readable until the keyring moves, and the empty store
+    /// is what reads afterwards.
+    #[test]
+    #[serial]
+    fn a_failed_reset_commit_leaves_a_readable_store() {
+        for step in COMMIT_STEPS {
+            assert_a_failed_commit_step_reads(
+                "reset-commit",
+                step,
+                (0, 0),
+                |store, profile, now| {
+                    let failure = store.reset(profile, now, |_| Ok::<_, ()>(())).err();
+                    assert!(
+                        match &failure {
+                            None => true,
+                            Some(ResetError::Store {
+                                error,
+                                minted: false,
+                            }) => !matches!(error, WindowStoreError::GenerationMismatch),
+                            Some(ResetError::Store { .. } | ResetError::Recorder(_)) => false,
+                        },
+                        "{failure:?}"
+                    );
+                    failure.is_none()
+                },
+                |_, _, _, _| {},
+            );
+        }
+    }
+
+    /// A pending record survives a failure at every commit step: the old total
+    /// stays readable until the keyring moves, and the debit counts afterwards.
+    /// Retrying the same reservation commits one debit at the next generation,
+    /// and a duplicate refuses without changing the store.
+    #[test]
+    #[serial]
+    fn a_failed_debit_commit_leaves_a_readable_store() {
+        for step in COMMIT_STEPS {
+            assert_a_failed_commit_step_reads(
+                "pending-commit",
+                step,
+                (45, 2),
+                |store, profile, now| {
+                    let k = key("pending-commit", "native", 86_400);
+                    let hold = reservation(&"e".repeat(64), "GSOURCE", 7, now);
+                    store
+                        .record_pending(profile, &[entry(k, now, 5)], &hold)
+                        .is_ok()
+                },
+                |store, profile, now, before| {
+                    let k = key("pending-commit", "native", 86_400);
+                    let hold = reservation(&"e".repeat(64), "GSOURCE", 7, now);
+                    let entries = [entry(k.clone(), now, 5)];
+                    if step != CommitStep::Compaction {
+                        assert!(!store.holds_reservation(profile, &hold.id).unwrap());
+                        store.record_pending(profile, &entries, &hold).unwrap();
+                    }
+                    let gen_entry = generation_entry_ref(profile);
+                    assert_eq!(load_generation(&gen_entry).unwrap(), Some(before + 1));
+                    assert!(store.holds_reservation(profile, &hold.id).unwrap());
+                    let memory = PolicyStateStore::new();
+                    store.load_into("pending-commit", profile, &memory).unwrap();
+                    assert_eq!(memory.query_window(&k, now).unwrap(), (45, 2));
+
+                    let file = fs::read(&store.path).unwrap();
+                    assert!(matches!(
+                        store.record_pending(profile, &entries, &hold),
+                        Err(WindowStoreError::DuplicateReservation)
+                    ));
+                    assert_eq!(load_generation(&gen_entry).unwrap(), Some(before + 1));
+                    assert_eq!(fs::read(&store.path).unwrap(), file);
+                },
+            );
+        }
+    }
+
+    /// A settled debit may already be on chain. The counter moves first, so a
+    /// failed file write refuses every later read and the reset, and no total
+    /// without that debit can be read.
+    #[test]
+    #[serial]
+    fn a_failed_settled_debit_write_refuses_load_and_reset() {
+        keyring_mock::install().unwrap();
+        let dir = TempDir::new().unwrap();
+        let profile = test_profile(dir.path(), "settled-write");
+        let store = PersistedWindowStore::at_path(dir.path().join("settled-write.window"));
+        let k = key("settled-write", "native", 86_400);
+        let now = now_ms().unwrap();
+        store
+            .record_and_persist(&profile, &[entry(k.clone(), now, 40)])
+            .unwrap();
+        let gen_entry = generation_entry_ref(&profile);
+        let before = load_generation(&gen_entry).unwrap().unwrap();
+        let file = fs::read(&store.path).unwrap();
+
+        // The first file write of this writer is the store file itself.
+        let armed = fail_commit_at(CommitStep::PreparedImage, &gen_entry);
+        let result = store.record_and_persist(&profile, &[entry(k, now, 5)]);
+        drop(armed);
+
+        assert!(
+            matches!(result, Err(WindowStoreError::Io { .. })),
+            "{result:?}"
+        );
+        assert_eq!(load_generation(&gen_entry).unwrap(), Some(before + 1));
+        assert_eq!(fs::read(&store.path).unwrap(), file);
+        assert!(matches!(
+            store.load_into("settled-write", &profile, &PolicyStateStore::new()),
+            Err(WindowStoreError::GenerationMismatch)
+        ));
+        assert!(matches!(
+            assert_reset_refuses(&store, &profile),
+            WindowStoreError::GenerationMismatch
+        ));
+    }
+
+    /// A reset that failed before the keyring moved completes on its next run
+    /// at the generation its row named.
+    #[test]
+    #[serial]
+    fn a_reset_retry_completes_at_the_recorded_generation() {
+        for step in [CommitStep::PreparedImage, CommitStep::Keyring] {
+            let f = ResetFixture::new();
+            f.seal(&reset_wire());
+            let gen_entry = generation_entry_ref(&f.profile);
+            let mut recorded = None;
+            let armed = fail_commit_at(step, &gen_entry);
+            let result = f.store.reset(&f.profile, 100_000, |record| {
+                recorded = Some(record.accrual.generation_after);
+                Ok::<_, ()>(())
+            });
+            drop(armed);
+            assert!(result.is_err(), "{step:?}");
+            let outcome = f.reset();
+            assert_eq!(Some(outcome.accrual.generation_after), recorded);
+            assert_eq!(load_generation(&gen_entry).unwrap(), recorded);
+            let state = PolicyStateStore::new();
+            f.store
+                .load_into("reset-snapshot", &f.profile, &state)
+                .unwrap();
+        }
+    }
+
+    /// A first reset has no prior debit to retain and commits the generation
+    /// before the file, so a missing counter beside a file stays a deletion.
+    #[test]
+    #[serial]
+    fn a_first_reset_commits_its_generation_before_the_file() {
+        let f = ResetFixture::new();
+        let gen_entry = generation_entry_ref(&f.profile);
+        let armed = fail_commit_at(CommitStep::PreparedImage, &gen_entry);
+        let result = f.store.reset(&f.profile, 100_000, |_| Ok::<_, ()>(()));
+        drop(armed);
+        assert!(matches!(
+            result,
+            Err(ResetError::Store {
+                error: WindowStoreError::Io { .. },
+                minted: true,
+            })
+        ));
+        assert!(!f.store.path.exists());
+        assert_eq!(load_generation(&gen_entry).unwrap(), Some(1));
+        assert!(matches!(
+            f.store
+                .load_into("reset-snapshot", &f.profile, &PolicyStateStore::new()),
+            Err(WindowStoreError::GenerationMismatch)
+        ));
+    }
+
+    /// A committed payment between the two reads causes one bounded retry.
+    #[test]
+    #[serial]
+    fn chain_scope_retries_a_concurrent_payment_commit() {
+        for chain in [Caip2::Testnet, Caip2::Mainnet] {
+            let mut f = ResetFixture::new();
+            f.profile.chain_id = chain;
+            f.seal(&reset_wire());
+            let path = f.store.path.clone();
+            let profile = f.profile.clone();
+            let reads = std::rc::Rc::new(std::cell::Cell::new(0));
+            let count = reads.clone();
+            INSPECTION_READ_HOOK.with_borrow_mut(|hook| {
+                *hook = Some(Box::new(move || {
+                    count.set(count.get() + 1);
+                    if count.get() == 1 {
+                        PersistedWindowStore::at_path(path.clone())
+                            .record_and_persist(&profile, &[])
+                            .unwrap();
+                    }
+                }))
+            });
+            let _hook = InspectionHook;
+            assert_eq!(
+                f.store.chain_scope(&f.profile).unwrap(),
+                ChainScope::for_chain(chain)
+            );
+            assert_eq!(reads.get(), 2);
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn chain_scope_limits_generation_mismatch_to_three_reads() {
+        let f = ResetFixture::new();
+        f.seal(&reset_wire());
+        put_raw(&generation_entry_ref(&f.profile), "2");
+        let reads = std::rc::Rc::new(std::cell::Cell::new(0));
+        let count = reads.clone();
+        INSPECTION_READ_HOOK
+            .with_borrow_mut(|hook| *hook = Some(Box::new(move || count.set(count.get() + 1))));
+        let _hook = InspectionHook;
+        assert!(matches!(
+            f.store.chain_scope(&f.profile),
+            Err(WindowStoreError::GenerationMismatch)
+        ));
+        assert_eq!(reads.get(), 3);
+    }
+    #[tokio::test]
+    #[serial]
+    async fn reconciliation_retries_a_payment_commit_once_per_pass() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::body_partial_json(
+            serde_json::json!({ "method": "getTransaction" }),
+        ))
+        .respond_with(move |request: &wiremock::Request| {
+            let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": body["id"],
+                "result": {
+                    "status": "SUCCESS",
+                    "latestLedger": 2_000,
+                    "oldestLedger": 1,
+                    "ledger": 1_500,
+                    "createdAt": (now_ms().unwrap() / 1_000).to_string(),
+                },
+            }))
+        })
+        .mount(&server)
+        .await;
+        for single in [false, true] {
+            let f = ResetFixture::new();
+            f.seal(&reset_wire());
+            let now = now_ms().unwrap();
+            let hold = reservation(&"d".repeat(64), "GSOURCE", 7, now - RECONCILE_MIN_AGE_MS);
+            f.store
+                .record_pending(
+                    &f.profile,
+                    &[entry(key("reset-snapshot", "native", 3_600), now, 5)],
+                    &hold,
+                )
+                .unwrap();
+            let path = f.store.path.clone();
+            let profile = f.profile.clone();
+            let reads = std::rc::Rc::new(std::cell::Cell::new(0));
+            let count = reads.clone();
+            INSPECTION_READ_HOOK.with_borrow_mut(|hook| {
+                *hook = Some(Box::new(move || {
+                    count.set(count.get() + 1);
+                    if count.get() == 1 {
+                        PersistedWindowStore::at_path(path.clone())
+                            .record_and_persist(
+                                &profile,
+                                &[entry(
+                                    key("reset-snapshot", "native", 86_400),
+                                    now_ms().unwrap(),
+                                    11,
+                                )],
+                            )
+                            .unwrap();
+                    }
+                }));
+            });
+            let hook = InspectionHook;
+            let client = crate::client::StellarRpcClient::new(&server.uri()).unwrap();
+            let report = if single {
+                f.store
+                    .reconcile_one(&f.profile, &client, None, None, &hold.id, now_ms().unwrap())
+                    .await
+            } else {
+                f.store
+                    .reconcile_due(
+                        &f.profile,
+                        &client,
+                        None,
+                        None,
+                        now_ms().unwrap(),
+                        RECONCILE_BUDGET,
+                    )
+                    .await
+            }
+            .unwrap();
+            assert_eq!(report.examined, 1);
+            assert_eq!(report.confirmed, 1);
+            assert_eq!(report.rpc_calls, 1);
+            assert_eq!(
+                reads.get(),
+                4,
+                "one scope check retries, the pass reads its snapshot, and the confirm \
+                 checks scope once"
+            );
+            drop(hook);
+            let state = PolicyStateStore::new();
+            f.store
+                .load_into("reset-snapshot", &f.profile, &state)
+                .unwrap();
+            assert_eq!(
+                state
+                    .query_window(&key("reset-snapshot", "native", 86_400), now_ms().unwrap())
+                    .unwrap(),
+                (11, 1)
+            );
+        }
     }
 }

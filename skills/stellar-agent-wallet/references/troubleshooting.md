@@ -91,8 +91,9 @@ engine is first-match, default-deny over signed, typed criteria.
 `network.mainnet_write_forbidden` identifies a feature-off build, excluded
 operation, or unavailable admitted context. CLI missing engine, verified policy,
 or enablement is an entry refusal with the prerequisite named.
-CLI engine construction preserves enablement errors and wraps other failures
-as `policy.engine_unavailable` or `trustline.policy_engine_unavailable`.
+CLI engine construction preserves `profile.mainnet_enablement_invalid`,
+`policy.window_chain_mismatch` and `policy.window_chain_unverifiable`.
+Other failures use `policy.engine_unavailable` or `trustline.policy_engine_unavailable`.
 Evaluation failure uses `policy.engine_required`; unknown decisions use
 `policy.unexpected_decision`. Policy denials retain `policy.deny.*`.
 
@@ -254,7 +255,8 @@ Setup and policy cannot admit excluded signing surfaces.
 ### Policy and setup diagnostics
 
 These are policy-library and setup codes. CLI engine construction preserves
-enablement errors but wraps other build failures as `policy.engine_unavailable`
+`profile.mainnet_enablement_invalid`, `policy.window_chain_mismatch` and
+`policy.window_chain_unverifiable`. Other build failures use `policy.engine_unavailable`
 or `trustline.policy_engine_unavailable`.
 
 | Code | Meaning or remedy |
@@ -285,7 +287,9 @@ or `trustline.policy_engine_unavailable`.
 | `enroll_signer.identity_conflict` | The stored identity conflicts with the enrolled signer. |
 | `auth.enrolled_identity_unusable` | `missing` means no record beside the seed, as an interrupted enrollment leaves it; `bound_elsewhere` means another profile or chain; `unbound` means no mainnet owner binding; `owner_required` means the mainnet check ran without an established owner; `owner_mismatch` means another owner; `binding_signature_invalid` means the owner signature does not verify. Use the original profile for a foreign binding. Run `stellar-agent profile enroll-signer --profile <NAME> --repair-identity` for a missing or malformed record, or `stellar-agent profile bind-signer --profile <NAME> --owner-secret-env <VAR>` with the established owner for an unbound signer or a rotated owner. Ledger enrollment is unavailable. |
 | `profile.reset_window_state_newer_version` | This build cannot reset an unsupported newer state format. |
-| `policy.window_state_unverifiable` | Enabled-mainnet state cannot be verified. Follow the operator recovery procedure. |
+| `policy.window_state_unverifiable` | Enabled-mainnet state cannot be verified. No verb recovers such state in this release; create a profile under a new name. |
+| `policy.window_chain_mismatch` | The profile network disagrees with authenticated spending state. Restore the profile's network, or create a profile under a new name. |
+| `policy.window_chain_unverifiable` | Spending state lacks complete authenticated network provenance. No verb recovers such state in this release; create a profile under a new name. |
 | `profile.reset_window_state_open_authorizations` | Effective open authorizations prevent reset. |
 | `approval.presence_required` | Mainnet consent requires a verified assertion from an approval credential in the owner-signed policy; use the local passkey approval page. |
 | `approval.presence_policy_unavailable` | The current owner-signed mainnet policy cannot be verified, lists no approval credential, or changed since the consent was recorded. |

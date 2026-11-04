@@ -262,6 +262,15 @@ async fn run_clear(args: &ClearArgs) -> i32 {
         return 1;
     }
 
+    let window = PersistedWindowStore::for_profile(&resolved.name);
+    let scope = stellar_agent_network::policy_state::ChainScope::for_chain(profile.chain_id);
+    if let Err(error) = window.require_chain_scope(&profile, &scope) {
+        render_json(&Envelope::<()>::err_raw(
+            error.submission_code(),
+            error.to_string(),
+        ));
+        return 1;
+    }
     let receipts = match ReceiptStore::open(&resolved.name) {
         Ok(store) => store,
         Err(e) => {
@@ -283,7 +292,6 @@ async fn run_clear(args: &ClearArgs) -> i32 {
             return 1;
         }
     };
-    let window = PersistedWindowStore::for_profile(&resolved.name);
     let held = match open_reservation(&window, &profile, &args.envelope_hash) {
         Ok(held) => held,
         Err(code) => return code,
@@ -352,7 +360,7 @@ async fn run_clear(args: &ClearArgs) -> i32 {
     // On a mainnet profile the primary endpoint's answer is not the only one
     // that counts: the oracle the profile names is asked the same question
     // below. Without an oracle there is no second answer.
-    let oracle = if profile.chain_id.is_mainnet() {
+    let oracle = if scope.chain().is_mainnet() {
         match context.oracle_client(&profile) {
             Ok(oracle) => oracle,
             Err(e) => {
@@ -527,8 +535,8 @@ async fn run_clear(args: &ClearArgs) -> i32 {
         Ok(report) => report,
         Err(e) => {
             render_json(&Envelope::<()>::err_raw(
-                "submission.record_unavailable",
-                format!("the submission could not be reconciled: {e:?}"),
+                e.submission_code(),
+                format!("the submission could not be reconciled: {e}"),
             ));
             return 1;
         }
@@ -580,8 +588,8 @@ async fn run_clear(args: &ClearArgs) -> i32 {
         && let Err(e) = window.release(&profile, &args.envelope_hash)
     {
         render_json(&Envelope::<()>::err_raw(
-            "submission.record_unavailable",
-            format!("the spending-window reservation could not be released: {e:?}"),
+            e.submission_code(),
+            format!("the spending-window reservation could not be released: {e}"),
         ));
         return 1;
     }
@@ -734,8 +742,8 @@ fn open_reservation(
         Ok(open) => Ok(open.into_iter().find(|r| r.id == envelope_hash)),
         Err(e) => {
             render_json(&Envelope::<()>::err_raw(
-                "submission.record_unavailable",
-                format!("the spending-window file could not be read: {e:?}"),
+                e.submission_code(),
+                format!("the spending-window file could not be read: {e}"),
             ));
             Err(1)
         }
@@ -1623,6 +1631,9 @@ mod tests {
     /// The reservation the window holds for `receipt`.
     fn held_for(receipt: &SubmissionReceipt) -> SubmissionHold {
         SubmissionHold {
+            chain_scope: stellar_agent_network::policy_state::ChainScope::for_chain(
+                stellar_agent_core::profile::caip2::Caip2::Testnet,
+            ),
             id: receipt.envelope_hash.clone(),
             tx_hash: receipt.tx_hash.clone(),
             source: receipt.source.clone(),
@@ -2046,6 +2057,9 @@ mod tests {
                         },
                     )],
                     &SubmissionHold {
+                        chain_scope: stellar_agent_network::policy_state::ChainScope::for_chain(
+                            profile.chain_id,
+                        ),
                         id: ENVELOPE_HASH.to_owned(),
                         tx_hash: TX_HASH.to_owned(),
                         source,

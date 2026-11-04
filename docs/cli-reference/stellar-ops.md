@@ -30,7 +30,8 @@ envelope they return. Mainnet fees use the smaller
 signed/profile cap. The resolver independently reevaluates policy, fees, and
 witnesses against the bound action.
 
-CLI engine construction preserves `profile.mainnet_enablement_invalid`.
+CLI engine construction preserves `profile.mainnet_enablement_invalid`,
+`policy.window_chain_mismatch` and `policy.window_chain_unverifiable`.
 Other build errors use `policy.engine_unavailable`, or
 `trustline.policy_engine_unavailable` for trustline. Evaluation failures use
 `policy.engine_required`; unknown decisions use `policy.unexpected_decision`.
@@ -658,6 +659,9 @@ so can the inner transaction of a fee-bump. A confirmation that completes
 after the deadline refuses with `network.mainnet_authorization_refused`
 (`deadline_elapsed`); run the command again for a fresh envelope.
 
+Pending spending records retain their original network. A profile whose network
+differs cannot reconcile or clear them.
+
 The receipt keeps its `release_code` when the reservation is released, so
 later runs can retry any settled row still owed. The code names the evidence
 for that row and releases nothing by itself: a receipt that carries one while
@@ -739,6 +743,9 @@ profile without an oracle nothing confirms the endpoint's `FAILED`, so
 endpoint's `SUCCESS` is still refused. A reservation whose receipt is missing is cleared only when the
 endpoint reports `NOT_FOUND` and its submission ledger is below the endpoint's
 retention floor.
+
+State with no authenticated network history requires recovery; editing the profile
+or receipt does not migrate it.
 
 Without `--acknowledge` nothing is reconciled or written, and the verb exits 1
 with `submission.acknowledgement_required`. The message names the next step,

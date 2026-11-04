@@ -1930,6 +1930,9 @@ async fn split_approval_reconciles_only_one_bounded_pass() {
     for index in 0..6 {
         let id = format!("{index:064x}");
         let reservation = SubmissionHold {
+            chain_scope: stellar_agent_network::policy_state::ChainScope::for_chain(
+                h.profile.chain_id,
+            ),
             id: id.clone(),
             tx_hash: id.clone(),
             source: h.source.clone(),
