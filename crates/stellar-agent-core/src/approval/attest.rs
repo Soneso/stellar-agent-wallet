@@ -248,7 +248,10 @@ pub fn decode_sha256_hex(hex: &str) -> Result<[u8; 32], WalletError> {
         })?;
         out[i] = u8::from_str_radix(byte_str, 16).map_err(|_| {
             WalletError::Approval(ApprovalFailure::Sha256HexError {
-                detail: format!("invalid hex byte '{byte_str}'"),
+                detail: format!(
+                    "SHA-256 must be hexadecimal; invalid byte pair at offset {}",
+                    i * 2
+                ),
             })
         })?;
     }

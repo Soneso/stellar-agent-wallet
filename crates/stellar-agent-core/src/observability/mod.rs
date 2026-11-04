@@ -398,8 +398,8 @@ impl FormatChoice {
 pub enum InitError {
     /// The `STELLAR_AGENT_LOG` (or `RUST_LOG`) value could not be parsed as a
     /// valid `EnvFilter` expression.
-    #[error("failed to parse log-filter expression: {0}")]
-    Filter(#[source] tracing_subscriber::filter::FromEnvError),
+    #[error("STELLAR_AGENT_LOG must be a valid log-filter expression")]
+    Filter,
 
     /// The `log`-crate bridge (`tracing_log::LogTracer`) could not be installed.
     ///
@@ -1785,9 +1785,7 @@ const RAW_TRANSPORT_LOG_TARGET: &str = "jsonrpsee";
 fn raw_transport_logging_off(filter: EnvFilter) -> Result<EnvFilter, InitError> {
     let directive = format!("{RAW_TRANSPORT_LOG_TARGET}=off")
         .parse()
-        .map_err(|error| {
-            InitError::Filter(tracing_subscriber::filter::FromEnvError::from(error))
-        })?;
+        .map_err(|_| InitError::Filter)?;
     Ok(filter.add_directive(directive))
 }
 
@@ -1916,16 +1914,14 @@ fn resolve_operator_filter(
     if let Some(value) = stellar_agent_log {
         match EnvFilter::builder().parse(value) {
             Ok(f) => return Ok(f),
-            Err(primary_err) => {
+            Err(_) => {
                 // (2) STELLAR_AGENT_LOG set but unparseable: try RUST_LOG.
                 if let Some(rust_value) = rust_log
                     && let Ok(f) = EnvFilter::builder().parse(rust_value)
                 {
                     return Ok(f);
                 }
-                return Err(InitError::Filter(
-                    tracing_subscriber::filter::FromEnvError::from(primary_err),
-                ));
+                return Err(InitError::Filter);
             }
         }
     }

@@ -4,6 +4,8 @@
 //! input, then asserts with [`assert_no_marker`] that the resulting error does
 //! not carry it.
 
+use crate::log_capture::RedactionStrictSubscriber;
+
 /// The S-strkey of the secret seed of 32 bytes of 7. A test passes it where
 /// the wallet expects a public value, as an operator who pastes a seed into
 /// the wrong place would.
@@ -57,6 +59,32 @@ pub fn assert_no_marker_in_text(text: &str, marker: &str) {
     );
 }
 
+/// Asserts that `error` renders as exactly `expected` and holds no
+/// [`CREDENTIAL_MARKER`], then logs it for [`capture_refusal`] to inspect.
+///
+/// # Panics
+///
+/// Panics when a rendering holds the marker or the text differs. The marker
+/// check runs first, so a text that repeats rejected input reports the leak.
+pub fn assert_refusal_text(error: &(dyn std::error::Error + 'static), expected: &str) {
+    assert_no_marker(error, CREDENTIAL_MARKER);
+    assert_eq!(error.to_string(), expected);
+    tracing::warn!(error = %error, debug = ?error, "refusal capture probe");
+}
+
+/// Runs `f` under a log capture that forbids [`CREDENTIAL_MARKER`].
+///
+/// # Panics
+///
+/// Panics when `f` reached no [`assert_refusal_text`], so an absence check
+/// cannot pass on a lost event, and when a captured event holds the marker.
+pub fn capture_refusal(f: impl FnOnce()) {
+    let capture = RedactionStrictSubscriber::new([CREDENTIAL_MARKER]);
+    capture.run(f);
+    assert!(capture.captured_str().contains("refusal capture probe"));
+    capture.assert_clean();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -103,6 +131,29 @@ mod tests {
     #[should_panic(expected = "depth 1")]
     fn a_marker_in_the_source_chain_fails() {
         assert_no_marker(&Wrapper(Leaf(CREDENTIAL_MARKER)), CREDENTIAL_MARKER);
+    }
+
+    #[test]
+    fn a_refusal_with_its_fixed_text_passes() {
+        capture_refusal(|| assert_refusal_text(&Leaf("fixed text"), "fixed text"));
+    }
+
+    #[test]
+    #[should_panic(expected = "contains the rejected value")]
+    fn a_refusal_holding_the_marker_fails_on_the_marker() {
+        assert_refusal_text(&Leaf(CREDENTIAL_MARKER), CREDENTIAL_MARKER);
+    }
+
+    #[test]
+    #[should_panic(expected = "left == right")]
+    fn a_refusal_with_another_text_fails() {
+        assert_refusal_text(&Leaf("fixed text"), "other text");
+    }
+
+    #[test]
+    #[should_panic(expected = "refusal capture probe")]
+    fn a_capture_without_a_refusal_fails() {
+        capture_refusal(|| {});
     }
 
     #[cfg(feature = "test-helpers")]

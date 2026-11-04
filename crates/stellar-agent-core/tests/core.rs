@@ -16,5 +16,7 @@ mod policy_v2;
 mod profile_horizon_bound_test;
 #[path = "core/profile_scan_id_bound_test.rs"]
 mod profile_scan_id_bound_test;
+#[path = "core/rejected_input.rs"]
+mod rejected_input;
 #[path = "core/subscriber_install_path.rs"]
 mod subscriber_install_path;

@@ -1821,13 +1821,15 @@ fn validate_soroban_symbol(s: &str) -> Result<&str, String> {
     }
     if s.len() > 32 {
         return Err(format!(
-            "symbol '{}' exceeds 32-byte Soroban limit",
-            &s[..32.min(s.len())]
+            "symbol must contain at most 32 bytes; got {}",
+            s.len()
         ));
     }
-    for c in s.chars() {
+    for (offset, c) in s.char_indices() {
         if !c.is_ascii_alphanumeric() && c != '_' {
-            return Err(format!("symbol contains invalid character '{c}'"));
+            return Err(format!(
+                "symbol contains an invalid character at byte offset {offset}; expected [A-Za-z0-9_]"
+            ));
         }
     }
     Ok(s)

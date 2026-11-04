@@ -3428,9 +3428,7 @@ fn parse_rule_context(s: &str) -> Result<RuleContext, WalletError> {
         return Ok(RuleContext::CreateContract { wasm_hash });
     }
 
-    Err(config_err(format!(
-        "unknown context '{s}'; {CONTEXT_GRAMMAR}"
-    )))
+    Err(config_err(format!("unknown context; {CONTEXT_GRAMMAR}")))
 }
 
 /// Builds a read-only [`ContextRuleManager`] (no signing, no divergence check).
@@ -3563,6 +3561,7 @@ mod tests {
     )]
 
     use super::*;
+    use stellar_agent_test_support::rejected_value::{assert_refusal_text, capture_refusal};
 
     #[test]
     fn valid_until_seed_input_is_not_echoed() {
@@ -6231,5 +6230,18 @@ mod tests {
             no_delegated_fallback_refusal(&[], 0, false).is_none(),
             "a rule without External signers needs no fallback"
         );
+    }
+
+    #[test]
+    fn rejected_input_rule_context_helper() {
+        capture_refusal(|| {
+            let error = parse_rule_context("CREDMARKER7").expect_err("unknown context");
+            assert_eq!(error.code(), "validation.config_invalid");
+            let expected = format!(
+                "configuration invalid for '--context': unknown context; {}",
+                CONTEXT_GRAMMAR
+            );
+            assert_refusal_text(&error, &expected);
+        });
     }
 }

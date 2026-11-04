@@ -125,12 +125,10 @@ pub enum EnvelopeDecodeError {
     /// The `tool` argument is not a tool name supported by this decoder.
     ///
     /// Recognised tool names: `"stellar_pay_commit"`,
-    /// `"stellar_create_account_commit"`, and `"stellar_trustline_commit"`.
-    #[error("unsupported tool name: {tool}")]
-    UnsupportedTool {
-        /// The unrecognised tool name.
-        tool: String,
-    },
+    /// `"stellar_create_account_commit"`, `"stellar_trustline_commit"`, and
+    /// `"stellar_claim_commit"`.
+    #[error("unsupported tool name; expected a registered classic commit tool")]
+    UnsupportedTool,
 
     /// The asset issuer G-strkey could not be encoded.
     ///
@@ -582,9 +580,7 @@ pub fn decode_authoritative_args(
         | "stellar_trustline_commit"
         | "stellar_claim_commit" => {}
         _ => {
-            return Err(EnvelopeDecodeError::UnsupportedTool {
-                tool: tool.to_owned(),
-            });
+            return Err(EnvelopeDecodeError::UnsupportedTool);
         }
     }
 
@@ -1729,7 +1725,7 @@ mod tests {
         let err = decode_authoritative_args("aGVsbG8=", "stellar_balances")
             .expect_err("must return UnsupportedTool");
         assert!(
-            matches!(err, EnvelopeDecodeError::UnsupportedTool { .. }),
+            matches!(err, EnvelopeDecodeError::UnsupportedTool),
             "expected UnsupportedTool, got: {err}"
         );
     }

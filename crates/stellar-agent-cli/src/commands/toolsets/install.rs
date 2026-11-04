@@ -219,8 +219,13 @@ fn run_inner(args: &ToolsetInstallArgs) -> Result<InstallResult, Box<dyn std::er
                 .into());
             }
 
-            let att: ToolsetAttestation = serde_json::from_str(&content)
-                .map_err(|e| format!("invalid attestation JSON: {e}"))?;
+            let att: ToolsetAttestation = serde_json::from_str(&content).map_err(|e| {
+                format!(
+                    "attestation file must be valid attestation JSON; parse failed at line {}, column {}",
+                    e.line(),
+                    e.column()
+                )
+            })?;
             Some(att)
         }
         None => None,
@@ -276,7 +281,7 @@ fn run_inner(args: &ToolsetInstallArgs) -> Result<InstallResult, Box<dyn std::er
 fn parse_pkg_at_version(spec: &str) -> Result<(String, String), String> {
     let (name, version) = spec
         .split_once('@')
-        .ok_or_else(|| format!("invalid package spec '{spec}': expected '<name>@<version>'"))?;
+        .ok_or_else(|| "invalid package spec: expected '<name>@<version>'".to_owned())?;
 
     if name.is_empty() {
         return Err("package name is empty in spec".to_owned());
@@ -296,7 +301,8 @@ fn decode_sig_hex(hex_str: &str) -> Result<[u8; 64], String> {
             hex_str.len()
         ));
     }
-    let bytes = hex::decode(hex_str).map_err(|e| format!("invalid signature hex: {e}"))?;
+    let bytes = hex::decode(hex_str)
+        .map_err(|_| "signature must be 128 hex chars (64 bytes)".to_owned())?;
     let arr: [u8; 64] = bytes
         .try_into()
         .map_err(|_| "signature hex does not decode to 64 bytes".to_owned())?;
@@ -863,7 +869,9 @@ mod tests {
         );
     }
 
-    use stellar_agent_test_support::rejected_value::assert_no_marker;
+    use stellar_agent_test_support::rejected_value::{
+        assert_no_marker, assert_refusal_text, capture_refusal,
+    };
 
     #[test]
     fn install_output_never_carries_a_rejected_trust_line() {
@@ -877,5 +885,61 @@ mod tests {
         assert!(!json.contains(&marker));
         assert!(json.contains("toolsets.install_failed"));
         assert!(json.contains("line 2"));
+    }
+
+    #[test]
+    fn rejected_input_install_helpers() {
+        capture_refusal(|| {
+            for (error, expected) in [
+                (
+                    parse_pkg_at_version("CREDMARKER7").expect_err("invalid spec"),
+                    "invalid package spec: expected '<name>@<version>'",
+                ),
+                (
+                    decode_sig_hex(&format!("CREDMARKER7{}", "0".repeat(117)))
+                        .expect_err("invalid signature"),
+                    "signature must be 128 hex chars (64 bytes)",
+                ),
+            ] {
+                let error: Box<dyn std::error::Error> = error.into();
+                assert_refusal_text(error.as_ref(), expected);
+            }
+            assert!(parse_pkg_at_version("test@1.0.0").is_ok());
+            assert!(decode_sig_hex(&"0".repeat(128)).is_ok());
+            let dir = tempfile::tempdir().expect("attestation directory");
+            let path = dir.path().join("attestation.json");
+            std::fs::write(
+                &path,
+                r#"{"package":"test","version":"1.0.0","capabilities":"CREDMARKER7"}"#,
+            )
+            .expect("invalid attestation fixture");
+            let args = ToolsetInstallArgs {
+                pkg_at_version: "test@1.0.0".to_owned(),
+                file: dir.path().join("unused.tar.gz"),
+                shasum: "0".repeat(64),
+                signature: "0".repeat(128),
+                publisher: stellar_strkey::ed25519::PublicKey([1; 32])
+                    .to_string()
+                    .as_str()
+                    .to_owned(),
+                trust_set: None,
+                toolsets_dir: Some(dir.path().join("toolsets")),
+                force: false,
+                allow_downgrade: false,
+                attestation_file: Some(path),
+                auditor_trust_set: None,
+                override_attestation: false,
+            };
+            let error = run_inner(&args).expect_err("invalid attestation");
+            assert_refusal_text(
+                error.as_ref(),
+                "attestation file must be valid attestation JSON; parse failed at line 1, column 64",
+            );
+            let envelope = install_failure_envelope(error.as_ref());
+            assert_eq!(
+                envelope.error.expect("refusal").code,
+                "toolsets.install_failed"
+            );
+        });
     }
 }

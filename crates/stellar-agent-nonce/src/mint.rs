@@ -536,9 +536,7 @@ impl NonceMint {
     ) -> Result<Nonce, NonceError> {
         // 1. Validate tool BEFORE any key state.
         if !registered_tools.is_registered(tool_name) {
-            return Err(NonceError::InvalidTool {
-                tool: tool_name.to_owned(),
-            });
+            return Err(NonceError::InvalidTool);
         }
 
         // 2. Envelope non-empty check.
@@ -550,7 +548,6 @@ impl NonceMint {
         if chain_id != self.chain_id {
             return Err(NonceError::ChainMismatch {
                 expected: self.chain_id.clone(),
-                got: chain_id.to_owned(),
             });
         }
 
@@ -694,7 +691,6 @@ impl NonceMint {
         if chain_id != self.chain_id {
             return Err(NonceError::ChainMismatch {
                 expected: self.chain_id.clone(),
-                got: chain_id.to_owned(),
             });
         }
 
@@ -815,7 +811,6 @@ impl NonceMint {
         if chain_id != self.chain_id {
             return Err(NonceError::ChainMismatch {
                 expected: self.chain_id.clone(),
-                got: chain_id.to_owned(),
             });
         }
 

@@ -418,11 +418,11 @@ pub fn install_toolset(
             ),
         });
     }
-    for ch in signed_shasum.chars() {
+    for (offset, ch) in signed_shasum.char_indices() {
         if !ch.is_ascii_hexdigit() || ch.is_ascii_uppercase() {
             return Err(ToolsetInstallError::InvalidShasum {
                 detail: format!(
-                    "signed_shasum contains invalid character {ch:?}; \
+                    "signed_shasum contains an invalid character at byte offset {offset}; \
                      must be 64 lowercase hex characters (0-9 a-f)"
                 ),
             });
@@ -915,12 +915,11 @@ pub fn validate_package_name(name: &str) -> Result<(), String> {
     if name.len() > 64 {
         return Err("package name exceeds 64 characters".to_owned());
     }
-    for ch in name.chars() {
+    for (offset, ch) in name.char_indices() {
         if !matches!(ch, 'a'..='z' | '0'..='9' | '-') {
-            // `{ch:?}` debug-escapes control/non-printable chars (e.g. `\n`, ESC) so
-            // an attacker-influenced name cannot inject a raw control byte / newline
-            // into a rendered error or log line.
-            return Err(format!("package name contains invalid character {ch:?}"));
+            return Err(format!(
+                "package name contains an invalid character at byte offset {offset}; expected [a-z0-9-]"
+            ));
         }
     }
     if name.starts_with('-') || name.ends_with('-') {

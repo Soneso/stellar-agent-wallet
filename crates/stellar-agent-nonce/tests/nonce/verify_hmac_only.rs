@@ -265,16 +265,18 @@ fn verify_hmac_only_returns_chain_mismatch() {
             now_unix_ms: now,
         })
         .expect_err("wrong chain_id must return ChainMismatch");
+    assert_eq!(
+        err.to_string(),
+        "chain_id must match the configured profile chain; expected stellar:testnet"
+    );
+    assert_eq!(err.wire_code(), "nonce.chain_mismatch");
 
     assert!(
         matches!(
             err,
-            NonceError::ChainMismatch {
-                ref expected,
-                ref got,
-            } if expected == "stellar:testnet" && got == "stellar:mainnet"
+            NonceError::ChainMismatch { ref expected } if expected == "stellar:testnet"
         ),
-        "expected ChainMismatch(testnet, mainnet), got: {err:?}"
+        "expected ChainMismatch(testnet), got: {err:?}"
     );
 }
 

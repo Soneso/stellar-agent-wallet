@@ -246,10 +246,8 @@ fn validate_credential_invariants(
     }
     if pubkey_bytes[0] != 0x04 {
         return Err(ApprovalError::Invalid {
-            reason: format!(
-                "public_key_sec1_b64[0] must be 0x04 (uncompressed SEC1 P-256 marker), got 0x{:02x}",
-                pubkey_bytes[0]
-            ),
+            reason: "public_key_sec1_b64[0] must be 0x04 (uncompressed SEC1 P-256 marker)"
+                .to_owned(),
         });
     }
 
