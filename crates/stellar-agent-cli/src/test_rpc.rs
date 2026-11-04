@@ -484,19 +484,18 @@ pub(crate) fn audit_rows(profile: &Profile, kind: &str) -> Vec<Value> {
         .collect()
 }
 
-/// Asserts that the pending and submitted rows each carry the witness of
-/// `oracle` at the fixture ledger.
-pub(crate) fn assert_rows_carry_witness(profile: &Profile, oracle: &str) {
+/// Asserts that the pending row carries the witness of `oracle` at the
+/// fixture ledger, and that the reported success wrote no submitted row: the
+/// pending row stays owed until authenticated evidence settles it.
+pub(crate) fn assert_pending_row_carries_witness(profile: &Profile, oracle: &str) {
     let pending = audit_rows(profile, "value_action_pending");
     let submitted = audit_rows(profile, "value_action_submitted");
     assert_eq!(pending.len(), 1, "{pending:?}");
-    assert_eq!(submitted.len(), 1, "{submitted:?}");
-    for row in [&pending[0], &submitted[0]] {
-        assert_eq!(row["witness"]["provider"], oracle, "{row}");
-        assert_eq!(row["witness"]["ledger"], 1001, "{row}");
-        assert_eq!(row["witness"]["inputs_digest"].as_str().unwrap().len(), 64);
-    }
-    assert_eq!(pending[0]["witness"], submitted[0]["witness"]);
+    assert!(submitted.is_empty(), "{submitted:?}");
+    let row = &pending[0];
+    assert_eq!(row["witness"]["provider"], oracle, "{row}");
+    assert_eq!(row["witness"]["ledger"], 1001, "{row}");
+    assert_eq!(row["witness"]["inputs_digest"].as_str().unwrap().len(), 64);
 }
 
 /// The envelope a command printed last on this thread.

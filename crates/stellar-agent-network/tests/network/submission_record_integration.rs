@@ -362,11 +362,10 @@ async fn a_first_submission_reaches_the_send() {
     );
 }
 
-/// Confirmation carries the applying ledger time through the recorder; a
-/// missing close time keeps the debit pending even when the receipt succeeds.
+/// Confirmation carries reported ledger time while retaining untimed exposure.
 #[tokio::test]
 #[serial]
-async fn submission_confirmation_dates_spend_only_from_created_at() {
+async fn submission_confirmation_retains_exposure_regardless_of_created_at() {
     for created_at in [Some((now_ms() / 1000) as i64), None] {
         let fx = fixture("record-close-time");
         let envelope = SignedTestEnvelope::for_source([0x29; 32]);
@@ -394,7 +393,7 @@ async fn submission_confirmation_dates_spend_only_from_created_at() {
         .unwrap();
         assert_eq!(
             fx.window.pending_reservations(&fx.profile).unwrap().len(),
-            usize::from(created_at.is_none())
+            1
         );
         assert!(
             matches!(&calls.lock().unwrap()[1], Call::Outcome(SubmissionOutcome::Success { created_at: received, .. }) if *received == created_at)
@@ -699,12 +698,11 @@ async fn a_transport_failure_after_the_record_returns_the_timeout_shape() {
     );
 }
 
-/// A definitive refusal at the send step moves no value: the reservation goes
-/// back, the receipt records the failure, and the caller gets the refusal
-/// itself rather than a timeout.
+/// A reported refusal after signature exposure retains the reservation and
+/// sequence, while the caller receives the endpoint refusal.
 #[tokio::test]
 #[serial]
-async fn a_refused_send_releases_the_reservation_and_frees_the_sequence() {
+async fn a_refused_send_retains_the_reservation_and_sequence() {
     let fx = fixture("record-rejected");
     let envelope = SignedTestEnvelope::for_source([0x26; 32]);
     let server = MockServer::start().await;
@@ -753,17 +751,16 @@ async fn a_refused_send_releases_the_reservation_and_frees_the_sequence() {
     assert!(
         matches!(
             fx.receipts.get(&hash).unwrap().unwrap().status,
-            ReceiptStatus::Failed { .. }
+            ReceiptStatus::Pending
         ),
-        "the receipt records the refusal"
+        "the receipt retains uncertainty"
     );
     assert!(
-        !fx.reservation_is_open(&hash),
-        "nothing was queued, so the reservation goes back"
+        fx.reservation_is_open(&hash),
+        "signature exposure retains possible spending"
     );
 
-    // A rebuilt envelope at the same sequence is not refused as a duplicate:
-    // the refused one can never apply.
+    // Rebuilding at the same sequence cannot bypass the exposed submission.
     let rebuilt = SignedTestEnvelope::builder([0x26; 32])
         .amount_stroops(7_654_321)
         .build();
@@ -784,9 +781,8 @@ async fn a_refused_send_releases_the_reservation_and_frees_the_sequence() {
     .await;
     assert_eq!(
         retry.as_ref().err().map(WalletError::code),
-        Some("submission.tx_malformed"),
-        "a refused send frees the sequence, so the retry reaches the network again and is \
-         refused on its own terms: {retry:?}"
+        Some("submission.tx_already_submitted"),
+        "the retained receipt refuses the same sequence: {retry:?}"
     );
 }
 
@@ -1685,14 +1681,15 @@ async fn a_pending_row_covered_by_the_repair_after_it_is_sent() {
 
     let hash = envelope_hash(&envelope);
     let kinds = kinds_for(&audit, &hash);
-    assert_eq!(kinds.len(), 2, "{kinds:?}");
+    assert_eq!(kinds.len(), 1, "{kinds:?}");
     assert!(
         matches!(kinds[0], EventKind::ValueActionPending { .. }),
         "{kinds:?}"
     );
     assert!(
-        matches!(kinds[1], EventKind::ValueActionSubmitted { .. }),
-        "no closing row precedes the outcome: {kinds:?}"
+        kinds
+            .iter()
+            .all(|kind| !matches!(kind, EventKind::ValueActionSubmitted { .. }))
     );
 }
 
@@ -1820,7 +1817,7 @@ async fn a_drained_outbox_row_covered_by_the_repair_lets_the_send_proceed() {
     let (result, kinds) =
         submit_after_a_queued_outbox_row("record-anchor-drain-repaired", 0x69, 5).await;
     assert!(result.is_ok(), "the repair covers both rows: {result:?}");
-    assert_eq!(kinds.len(), 4, "{kinds:?}");
+    assert_eq!(kinds.len(), 3, "{kinds:?}");
     assert!(
         matches!(kinds[1], EventKind::ApprovalAttested { .. }),
         "{kinds:?}"
@@ -1830,8 +1827,9 @@ async fn a_drained_outbox_row_covered_by_the_repair_lets_the_send_proceed() {
         "{kinds:?}"
     );
     assert!(
-        matches!(kinds[3], EventKind::ValueActionSubmitted { .. }),
-        "{kinds:?}"
+        kinds
+            .iter()
+            .all(|kind| !matches!(kind, EventKind::ValueActionSubmitted { .. }))
     );
 }
 

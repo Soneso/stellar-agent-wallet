@@ -6,8 +6,8 @@
 //! A value verb records its submission before the transaction is sent, so a
 //! submission whose confirmation never arrived leaves a receipt and a
 //! spending-window reservation behind. Those hold the operator's caps and the
-//! wallet's duplicate check until something settles them. This verb settles
-//! them by asking the endpoint what became of the transaction.
+//! wallet's duplicate check. This verb asks the endpoint what became of the
+//! transaction and records the answer as a report.
 //!
 //! It is also the answer to `submission.tx_timeout`: rebuilding and
 //! re-submitting the same intent is never the answer, because the sequence the
@@ -15,19 +15,19 @@
 //!
 //! # What it changes
 //!
-//! - `SUCCESS` confirms the reservation, so the spend is recorded, finalizes
-//!   the receipt, and writes the `value_action_submitted` row.
-//! - `FAILED` releases the reservation, finalizes the receipt failed, and
-//!   writes the `value_action_failed` row under the failure code.
-//! - `NOT_FOUND` releases the reservation only when the transaction can no
-//!   longer apply: its sequence has been consumed, or an observed ledger close
-//!   time is strictly past its time bound, followed by a fresh `NOT_FOUND`.
-//!   The receipt is marked ambiguous and keeps that evidence as
-//!   `release_code` (`submission.sequence_consumed` or
-//!   `submission.time_bound_passed`), and the `value_action_failed` row is
-//!   written under it. A row that could not be written then is written by a
-//!   later run, from the receipt. An absent receipt is restored from the
-//!   reservation first.
+//! - `SUCCESS` is recorded on the receipt as a report. The reservation keeps
+//!   counting through the transaction's accounting horizon, and no submitted
+//!   row is written: the pending row stays until authenticated evidence
+//!   settles it.
+//! - A reported failure or missing transaction does not release possible
+//!   spending. `FAILED`, and `NOT_FOUND` with a consumed sequence or a ledger
+//!   close time past the time bound, keep the reservation and the receipt
+//!   pending, and owe no `value_action_failed` row.
+//! - Once the accounting horizon, the signed time bound plus each affected
+//!   window's duration, has passed on this host's clock, the reservation ends
+//!   with the outcome unknown: the receipt is marked ambiguous with
+//!   `release_code` `submission.accounting_expired`, and no failed row is
+//!   owed. An absent receipt is restored from the reservation first.
 //! - When the submission ledger predates the endpoint's retention floor,
 //!   `NOT_FOUND` proves nothing, so the reservation stands and the receipt is
 //!   marked ambiguous, without evidence, for `tx receipt clear` to resolve.
@@ -38,13 +38,12 @@
 //!
 //! # Concurrency
 //!
-//! Settling a confirmed submission writes a value-action audit row, which
-//! needs the audit writer's exclusive lock. While an MCP server holds that
-//! profile's writer, this verb refuses with `audit.writer_locked`. Stop that
-//! server, reconcile, and start it again. The server acquires its writer when
-//! needed, including for V1 reservation reconciliation during simulation.
-//! The registry normally retains it until exit. A replaced-file refusal during acquisition marks
-//! it for eviction; a later acquisition drops it once callers release it.
+//! Writing a settled audit row needs the audit writer's exclusive lock. While an MCP server holds
+//! that profile's writer, this verb refuses with `audit.writer_locked`. Stop that server,
+//! reconcile, and start it again. The server acquires its writer when needed, including for V1
+//! reservation reconciliation during simulation. The registry normally retains it until exit. A
+//! replaced-file refusal during acquisition marks it for eviction; a later acquisition drops it
+//! once callers release it.
 //!
 //! # Exit codes
 //!
@@ -346,7 +345,6 @@ pub async fn run(args: &StatusArgs) -> i32 {
                     &settled.tx_hash,
                     &settled.status,
                     settled.release_code,
-                    settled.ledger.or(chain.ledger),
                     stellar_agent_core::audit_log::PolicyDecision::Allow,
                 );
             }

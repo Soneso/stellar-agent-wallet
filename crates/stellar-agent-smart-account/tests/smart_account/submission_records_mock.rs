@@ -612,6 +612,7 @@ async fn a_reservation_refused_at_pre_send_surfaces_as_the_gate_denial() {
                     max_time: 0,
                     pending_since_ms: now,
                     submission_ledger: 1_000,
+                    submission_anchor: None,
                     operator_required: false,
                 },
             )
@@ -701,8 +702,7 @@ async fn timed_out_multicall_reserves_sized_legs_and_denies_a_second_bundle() {
     assert_eq!(sends.load(Ordering::SeqCst), 1);
 }
 
-/// The applying ledger's close time dates each confirmed leg, so a complete
-/// success answer closes the holds and preserves each debit exactly once.
+/// A success report retains exposure and preserves each debit exactly once.
 #[tokio::test]
 #[serial]
 async fn confirmed_multicall_counts_each_leg_once() {
@@ -711,13 +711,13 @@ async fn confirmed_multicall_counts_each_leg_once() {
     fixture.multicall(&server.uri()).await.unwrap();
     assert_eq!(fixture.total(), (60, 2));
     assert!(
-        PersistedWindowStore::for_profile(PROFILE)
+        !PersistedWindowStore::for_profile(PROFILE)
             .pending_reservations(&fixture.profile)
             .unwrap()
             .is_empty()
     );
     assert_eq!(fixture.rows("value_action_pending").len(), 1);
-    assert_eq!(fixture.rows("value_action_submitted").len(), 1);
+    assert!(fixture.rows("value_action_submitted").is_empty());
     assert_eq!(sends.load(Ordering::SeqCst), 1);
 }
 
@@ -733,13 +733,13 @@ async fn confirmed_multicall_submits_the_router_exec_under_wallet_authorization(
     fixture.multicall(&server.uri()).await.unwrap();
     assert_eq!(fixture.total(), (60, 2));
     assert!(
-        PersistedWindowStore::for_profile(PROFILE)
+        !PersistedWindowStore::for_profile(PROFILE)
             .pending_reservations(&fixture.profile)
             .unwrap()
             .is_empty()
     );
     assert_eq!(fixture.rows("value_action_pending").len(), 1);
-    assert_eq!(fixture.rows("value_action_submitted").len(), 1);
+    assert!(fixture.rows("value_action_submitted").is_empty());
     assert_eq!(sends.load(Ordering::SeqCst), 1);
 
     let router = ScAddress::Contract(ContractId(Hash([0x45; 32])));
@@ -843,12 +843,12 @@ async fn profile_chain_multicall_cap_precedes_wildcard_and_persists_accounting()
         .expect("60 fits the exact-chain bundle cap of 100");
     assert_eq!(fixture.total(), (60, 2));
     assert!(
-        PersistedWindowStore::for_profile(PROFILE)
+        !PersistedWindowStore::for_profile(PROFILE)
             .pending_reservations(&fixture.profile)
             .expect("persisted reservations")
             .is_empty()
     );
-    assert_eq!(fixture.rows("value_action_submitted").len(), 1);
+    assert!(fixture.rows("value_action_submitted").is_empty());
     assert_eq!(sends.load(Ordering::SeqCst), 1);
 }
 

@@ -527,14 +527,15 @@ async fn a_muxed_source_reaches_the_send_through_sep43() {
     );
 }
 
-/// A confirmed SEP-43 submission writes one settled row.
+/// A SEP-43 submission the endpoint reports as successful writes no submitted
+/// row and keeps its pending row owed.
 ///
-/// The tool carries its own contract in an opaque-action row naming what it
-/// signed, and that row settles the pending row the recorder wrote. A second
-/// row from the recorder would put one send in the log twice.
+/// A reported success is an endpoint claim, not authenticated evidence, so the
+/// pending row the recorder wrote before the send stays owed, and reconciling
+/// the same transaction through the status tool appends no settled row either.
 #[tokio::test]
 #[serial]
-async fn a_confirmed_sep43_submission_writes_one_settled_row() {
+async fn a_reported_sep43_success_keeps_its_pending_row_owed() {
     let _data_root = crate::common::isolated_data_root();
     keyring_mock::install().expect("mock keyring store init");
     install_test_nonce_key();
@@ -571,36 +572,28 @@ async fn a_confirmed_sep43_submission_writes_one_settled_row() {
     let json = call_result_json(&result);
     assert_eq!(
         json["data"]["status"], "success",
-        "the submission confirms: {json}"
+        "the endpoint reports success: {json}"
     );
 
     let rows = crate::common::audit_rows(&profile);
-    let submitted = crate::common::rows_of_kind(&rows, "value_action_submitted");
-    assert_eq!(
-        submitted.len(),
-        1,
-        "one confirmed send, one settled row: {rows:?}"
+    assert!(
+        crate::common::rows_of_kind(&rows, "value_action_submitted").is_empty(),
+        "a reported success writes no submitted row: {rows:?}"
     );
+    let pending = crate::common::rows_of_kind(&rows, "value_action_pending");
     assert_eq!(
-        submitted[0]["opaque_reason"], "raw_transaction_signature",
-        "the row kept is the one carrying the tool's own contract: {rows:?}"
-    );
-    assert_eq!(
-        crate::common::rows_of_kind(&rows, "value_action_pending").len(),
+        pending.len(),
         1,
         "the pending row is written once: {rows:?}"
     );
 
-    // The row that survives has to close out the pending row. A settled row
-    // that does not name the submission leaves it owed for good, and the
-    // duplicate comes back the moment anyone reconciles the hash.
     let signed_xdr = json["data"]["signedTxXdr"]
         .as_str()
         .unwrap_or_else(|| panic!("the response carries the signed envelope: {json}"));
     let envelope_hash = stellar_agent_network::envelope_hash_hex(signed_xdr);
     assert_eq!(
-        submitted[0]["envelope_hash"], envelope_hash,
-        "the settled row names the submission it settles: {rows:?}"
+        pending[0]["envelope_hash"], envelope_hash,
+        "the pending row names the submission: {rows:?}"
     );
     let profile_name = server.profile_name_for_approval();
     let writer = stellar_agent_core::audit_log::AuditWriterRegistry::get_or_open_keyed(
@@ -614,17 +607,20 @@ async fn a_confirmed_sep43_submission_writes_one_settled_row() {
         .expect("audit access"),
     )
     .expect("the server's cached writer");
-    assert_eq!(
-        stellar_agent_core::audit_log::reader::try_value_action_settlement(
-            &writer.lock().unwrap(),
-            &envelope_hash
-        )
-        .unwrap(),
-        stellar_agent_core::audit_log::reader::ValueActionSettlement::Settled,
-        "the pending row is accounted for: {rows:?}"
+    let settlement = stellar_agent_core::audit_log::reader::try_value_action_settlement(
+        &writer.lock().unwrap(),
+        &envelope_hash,
+    )
+    .unwrap();
+    assert!(
+        matches!(
+            settlement,
+            stellar_agent_core::audit_log::reader::ValueActionSettlement::Owed(_)
+        ),
+        "the pending row stays owed: {settlement:?}"
     );
 
-    // And reconciling the same transaction appends nothing.
+    // Reconciling the same transaction appends no settled row.
     let tx_hash = json["data"]["txHash"]
         .as_str()
         .unwrap_or_else(|| panic!("the response carries the hash: {json}"))
@@ -638,10 +634,16 @@ async fn a_confirmed_sep43_submission_writes_one_settled_row() {
         .expect("the status tool must not error");
     assert_ne!(status.is_error, Some(true), "reconciliation must succeed");
     let rows_after = crate::common::audit_rows(&profile);
+    for kind in ["value_action_submitted", "value_action_failed"] {
+        assert!(
+            crate::common::rows_of_kind(&rows_after, kind).is_empty(),
+            "reconciling a reported success appends no {kind} row: {rows_after:?}"
+        );
+    }
     assert_eq!(
-        crate::common::rows_of_kind(&rows_after, "value_action_submitted").len(),
+        crate::common::rows_of_kind(&rows_after, "value_action_pending").len(),
         1,
-        "reconciling a settled submission appends no second row: {rows_after:?}"
+        "reconciling appends no second pending row: {rows_after:?}"
     );
 }
 
@@ -738,10 +740,15 @@ async fn profile_chain_sep43_accounting_persists_rate_limit() {
             .expect("rate window"),
         (1, 1)
     );
-    assert!(
-        disk.pending_reservations(&profile)
-            .expect("reservations")
-            .is_empty()
+    // The reported success keeps its reservation as possible spending.
+    let held = disk.pending_reservations(&profile).expect("reservations");
+    assert_eq!(held.len(), 1, "{held:?}");
+    let signed_xdr = submitted["data"]["signedTxXdr"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the response carries the signed envelope: {submitted}"));
+    assert_eq!(
+        held[0].id,
+        stellar_agent_network::envelope_hash_hex(signed_xdr)
     );
     let refused = server
         .call_stellar_sep43_sign_and_submit_transaction(args(&second))

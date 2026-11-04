@@ -4405,7 +4405,7 @@ mod tests {
     mod witness_full {
         use super::*;
         use crate::test_rpc::{
-            ClassicRpc, account_key, account_xdr, assert_rows_carry_witness, audit_rows,
+            ClassicRpc, account_key, account_xdr, assert_pending_row_carries_witness, audit_rows,
             fail_read_of, last_rendered, memo_required_xdr, methods, profile_name_for, sent,
             signers_resolved_by, thresholds, trustline_xdr, witness_profile,
         };
@@ -4503,7 +4503,7 @@ mod tests {
             assert_eq!(view["ledger"], 1001);
             assert_eq!(methods(&oracle).await, ["getNetwork", "getLedgerEntries"]);
             assert!(sent(&primary).await);
-            assert_rows_carry_witness(&profile, &oracle.uri());
+            assert_pending_row_carries_witness(&profile, &oracle.uri());
         }
 
         #[tokio::test]
@@ -4873,7 +4873,7 @@ mod tests {
         use super::witness_full::{ISSUER, Run, args, assert_refused, profile_for, run_stage};
         use super::*;
         use crate::test_rpc::{
-            ClassicRpc, account_key, account_xdr, assert_rows_carry_witness, fail_read_of,
+            ClassicRpc, account_key, account_xdr, assert_pending_row_carries_witness, fail_read_of,
             memo_required_xdr, methods, sent, thresholds, trustline_xdr,
         };
         use stellar_xdr::{
@@ -5473,7 +5473,7 @@ mod tests {
                 oracle.uri()
             );
             assert!(sent(&primary).await);
-            assert_rows_carry_witness(&profile, &oracle.uri());
+            assert_pending_row_carries_witness(&profile, &oracle.uri());
         }
 
         #[tokio::test]
@@ -6359,7 +6359,8 @@ mod tests {
         }
 
         /// RequireApproval: the confirmation entry lives the rule's TTL and
-        /// the submission rows carry the decision.
+        /// the pending row carries the decision. The reported success writes
+        /// no submitted row.
         #[tokio::test(flavor = "current_thread")]
         #[serial_test::serial]
         async fn require_approval_confirms_with_the_rule_ttl() {
@@ -6384,11 +6385,11 @@ mod tests {
                 entries[0].expires_at_unix_ms - entries[0].created_at_unix_ms,
                 300_000
             );
-            for kind in ["value_action_pending", "value_action_submitted"] {
-                let rows = fixture.audit_rows(kind);
-                assert_eq!(rows.len(), 1, "{kind}: {rows:?}");
-                assert_eq!(rows[0]["policy_decision"], "require_approval", "{kind}");
-            }
+            let pending = fixture.audit_rows("value_action_pending");
+            assert_eq!(pending.len(), 1, "{pending:?}");
+            assert_eq!(pending[0]["policy_decision"], "require_approval");
+            let submitted = fixture.audit_rows("value_action_submitted");
+            assert!(submitted.is_empty(), "{submitted:?}");
         }
 
         /// A confirmation beyond the envelope deadline refuses before signing.
@@ -7038,11 +7039,11 @@ mod tests {
         }
 
         /// A confirmation the primary and the oracle both answer `FAILED`
-        /// settles as failed under the oracle's failure: the payment exits
-        /// with it and its reservation is released.
+        /// exits with the oracle's failure, and its reservation stands: a
+        /// reported failure does not release possible spending.
         #[tokio::test(flavor = "current_thread")]
         #[serial_test::serial]
-        async fn a_failed_confirmation_the_oracle_confirms_releases() {
+        async fn a_failed_confirmation_the_oracle_confirms_keeps_the_reservation() {
             let fixture = Spec::new("mainnet-pay-failed-witnessed")
                 .primary(accounts().with_script(|method, _, _| {
                     (method == "getTransaction").then(failed_confirmation)
@@ -7064,11 +7065,7 @@ mod tests {
             assert_eq!(run.code, 1, "{}", run.envelope);
             assert_eq!(run.code(), "ledger.op_failed", "{}", run.envelope);
             assert_eq!(fixture.sent_envelopes().await.len(), 1);
-            assert_eq!(
-                fixture.pending_reservations(),
-                0,
-                "the reservation is released"
-            );
+            assert_eq!(fixture.pending_reservations(), 1, "the reservation stands");
         }
 
         /// A confirmation the primary answers `FAILED` and the oracle reports
@@ -7115,8 +7112,9 @@ mod tests {
             assert!(bound[0].contains("window_entry_count: 2"), "{}", bound[0]);
         }
 
-        /// Sizing: the amount cap counts each settled payment once, so the
-        /// third payment under a two-payment cap is denied.
+        /// Sizing: the amount cap counts each reported payment once, so the
+        /// third payment under a two-payment cap is denied. Each reported
+        /// success keeps its reservation as possible spending.
         #[tokio::test(flavor = "current_thread")]
         #[serial_test::serial]
         async fn the_amount_cap_counts_each_payment_once() {
@@ -7129,15 +7127,15 @@ mod tests {
             assert_eq!(first.code, 0, "{}", first.envelope);
             assert_eq!(
                 fixture.pending_reservations(),
-                0,
-                "the first payment settled"
+                1,
+                "the first payment stays reserved"
             );
             let second = run(&fixture, &memo_args(&fixture)).await;
             assert_eq!(second.code, 0, "{}", second.envelope);
             assert_eq!(
                 fixture.pending_reservations(),
-                0,
-                "the second payment settled"
+                2,
+                "both payments stay reserved"
             );
             let third = run(&fixture, &memo_args(&fixture)).await;
 
@@ -7149,8 +7147,9 @@ mod tests {
             );
         }
 
-        /// Sizing: the rate limit counts each settled payment once, so the
-        /// third payment under a two-call limit is denied.
+        /// Sizing: the rate limit counts each reported payment once, so the
+        /// third payment under a two-call limit is denied. Each reported
+        /// success keeps its reservation as possible spending.
         #[tokio::test(flavor = "current_thread")]
         #[serial_test::serial]
         async fn the_rate_limit_counts_each_payment_once() {
@@ -7163,15 +7162,15 @@ mod tests {
             assert_eq!(first.code, 0, "{}", first.envelope);
             assert_eq!(
                 fixture.pending_reservations(),
-                0,
-                "the first payment settled"
+                1,
+                "the first payment stays reserved"
             );
             let second = run(&fixture, &memo_args(&fixture)).await;
             assert_eq!(second.code, 0, "{}", second.envelope);
             assert_eq!(
                 fixture.pending_reservations(),
-                0,
-                "the second payment settled"
+                2,
+                "both payments stay reserved"
             );
             let third = run(&fixture, &memo_args(&fixture)).await;
 

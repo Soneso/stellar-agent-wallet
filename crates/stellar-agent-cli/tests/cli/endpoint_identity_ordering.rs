@@ -398,6 +398,7 @@ fn v1_profile_with_due_reservation(home: &Path, name: &str, rpc_url: &str, sourc
                 max_time: 0,
                 pending_since_ms: since,
                 submission_ledger: 1_500,
+                submission_anchor: None,
                 operator_required: false,
             },
         )

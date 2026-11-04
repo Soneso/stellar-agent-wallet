@@ -186,8 +186,8 @@ fn seed_keyring(profile: &Profile, seed: &Zeroizing<[u8; 32]>, attestation_key: 
         .set_password(&attest_key_b64)
         .expect("set attestation key");
 
-    // Audit-log chain-root HMAC key, so the commit's post-submit
-    // `value_action_submitted` row is signed and lands (the loader reads this
+    // Audit-log chain-root HMAC key, so the commit's pre-send
+    // `value_action_pending` row is signed and lands (the loader reads this
     // coordinate; without it the emission is a non-fatal no-op).
     let audit_ref = &profile.audit_log_hash_chain_key_id;
     let audit_key_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0x33u8; 32]);
@@ -355,7 +355,7 @@ async fn pay_with_approval_commits_and_submits_on_testnet() {
         "commit must report the ledger it was included in: {commit_json}"
     );
 
-    // The confirmed commit must have recorded a `value_action_submitted`
+    // The confirmed commit must have recorded a `value_action_pending`
     // row for `stellar_pay_commit`, signed under the profile's audit chain-root
     // key (verifiable by `audit verify`).
     let audit_path = approval_dir.path().join("audit.jsonl");
@@ -365,10 +365,15 @@ async fn pay_with_approval_commits_and_submits_on_testnet() {
     .map(|line| serde_json::from_str(&line.expect("audit line")).expect("audit JSON row"))
     .collect();
     assert!(
+        audit_rows
+            .iter()
+            .all(|row| row["kind"] != "value_action_submitted")
+    );
+    assert!(
         audit_rows.iter().any(|row| {
-            row["kind"] == "value_action_submitted" && row["tool"] == "stellar_pay_commit"
+            row["kind"] == "value_action_pending" && row["tool"] == "stellar_pay_commit"
         }),
-        "commit must record a value_action_submitted row: {audit_rows:?}"
+        "commit must record a value_action_pending row: {audit_rows:?}"
     );
 }
 
@@ -412,7 +417,7 @@ fn per_tx_cap_document(tools: &[&str]) -> PolicyDocument {
 /// A `stellar_pay` self-payment under a `PolicyEngineV1` `per_tx_cap` rule
 /// (rather than the `Noop` engine the happy-path test above uses) commits and
 /// submits on the live testnet ledger, and the confirmed commit's
-/// `value_action_submitted` audit row carries a `legs` entry whose content —
+/// `value_action_pending` audit row carries a `legs` entry whose content ,
 /// `action`, `amount`, `asset`, and the redacted `destination` — equals
 /// exactly the values submitted on-chain, proving the row is built from the
 /// same `ValueEffects` the V1 engine sized rather than a placeholder or
@@ -506,23 +511,26 @@ async fn pay_v1_engine_commit_records_matching_leg_content_on_testnet() {
         "commit must report an on-chain tx_hash: {commit_json}"
     );
 
-    // ── The value_action_submitted row's leg content matches the submitted
+    // ── The value_action_pending row's leg content matches the submitted
     // values ─────────────────────────────────────────────────────────────────
     let audit_rows: Vec<serde_json::Value> = std::io::BufRead::lines(std::io::BufReader::new(
         std::fs::File::open(audit_dir.path().join("audit.jsonl")).expect("audit log after commit"),
     ))
     .map(|line| serde_json::from_str(&line.expect("audit line")).expect("audit JSON row"))
     .collect();
+    assert!(
+        audit_rows
+            .iter()
+            .all(|row| row["kind"] != "value_action_submitted")
+    );
     let row = audit_rows
         .iter()
-        .find(|row| row["kind"] == "value_action_submitted" && row["tool"] == "stellar_pay_commit")
-        .unwrap_or_else(|| {
-            panic!("commit must record a value_action_submitted row: {audit_rows:?}")
-        });
+        .find(|row| row["kind"] == "value_action_pending" && row["tool"] == "stellar_pay_commit")
+        .unwrap_or_else(|| panic!("commit must record a value_action_pending row: {audit_rows:?}"));
 
     let legs = row["legs"]
         .as_array()
-        .expect("value_action_submitted row must carry a legs array");
+        .expect("value_action_pending row must carry a legs array");
     assert_eq!(
         legs.len(),
         1,

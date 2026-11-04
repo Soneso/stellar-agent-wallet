@@ -98,6 +98,7 @@ fn reservation(id: &str, sequence: i64, now: u64) -> SubmissionHold {
         max_time: 0,
         pending_since_ms: now,
         submission_ledger: 1_000,
+        submission_anchor: None,
         operator_required: false,
     }
 }
@@ -383,13 +384,10 @@ fn a_reservation_older_than_the_window_still_holds_the_cap() {
     );
 }
 
-/// Confirmed spend that has aged out of its window no longer holds the cap.
-///
-/// The recheck reads the file the way the gate reads it, so a window that has
-/// genuinely rolled forward admits the next call.
+/// A backdated success report cannot free untimed exposure at admission.
 #[test]
 #[serial]
-fn spend_that_has_aged_out_of_the_window_admits_the_next_reservation() {
+fn reported_aged_success_keeps_the_next_reservation_over_cap() {
     let fx = fixture("admit-rolled");
     let now = now_ms();
     let first_id = "3".repeat(64);
@@ -403,7 +401,7 @@ fn spend_that_has_aged_out_of_the_window_admits_the_next_reservation() {
             &reservation(&first_id, 7, aged),
         )
         .unwrap();
-    // The chain applied it two days ago, so it is confirmed spend dated then.
+    // The endpoint claims application two days ago.
     fx.first
         .confirm(
             &fx.profile,
@@ -418,13 +416,37 @@ fn spend_that_has_aged_out_of_the_window_admits_the_next_reservation() {
             &[amount_entry(&fx.profile_name, now, HALF_PLUS)],
             &reservation(&second_id, 8, now),
         )
-        .expect("spend older than the window no longer counts against it");
+        .expect_err("reported chain time cannot refund untimed possible spend");
 
     assert_eq!(
         fx.open_reservation_ids(),
-        vec![second_id],
-        "the new reservation stands and the settled one is closed"
+        vec![first_id],
+        "only the exposed reservation stands"
     );
+}
+
+/// Ordinary admitted spend still ages out under its own window semantics.
+#[test]
+#[serial]
+fn ordinary_aged_spend_admits_the_next_reservation() {
+    let fx = fixture("ordinary-rolled");
+    let now = now_ms();
+    let aged = now - 2 * 24 * 60 * 60 * 1000;
+    fx.first
+        .record_and_persist(
+            &fx.profile,
+            &[amount_entry(&fx.profile_name, aged, HALF_PLUS)],
+        )
+        .unwrap();
+    let id = "4".repeat(64);
+    fx.second
+        .record_pending(
+            &fx.profile,
+            &[amount_entry(&fx.profile_name, now, HALF_PLUS)],
+            &reservation(&id, 8, now),
+        )
+        .unwrap();
+    assert_eq!(fx.open_reservation_ids(), vec![id]);
 }
 
 /// A same-key record dated past the clock-skew tolerance is a clock the gate

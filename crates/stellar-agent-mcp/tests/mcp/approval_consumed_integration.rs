@@ -487,14 +487,15 @@ async fn exercise_approval_consumption(fail_once: bool) {
     drop(store);
 }
 
-/// A commit the network refuses outright leaves its approval untouched.
+/// A commit the network refuses outright consumes its approval with an
+/// unknown outcome.
 ///
-/// Nothing was queued and no value moved, so the agent is expected to make a
-/// fresh attempt. Tombstoning the approval would make that attempt refuse at
-/// the gate with nothing to reconcile.
+/// The refusal is an endpoint claim about bytes that left the wallet, so they
+/// may still apply. The approval is spent on them, so it authorizes no second
+/// envelope while the first stays possible spending.
 #[tokio::test]
 #[serial]
-async fn a_refused_commit_leaves_its_approval_untouched() {
+async fn a_refused_commit_consumes_its_approval_with_an_unknown_outcome() {
     let _data_root = crate::common::isolated_data_root();
     keyring_mock::install().expect("mock keyring store init");
 
@@ -625,21 +626,36 @@ async fn a_refused_commit_leaves_its_approval_untouched() {
         "the network refused the bytes, which is not a timeout: {json}"
     );
 
-    // The approval stands: no value moved, and the agent is expected to try
-    // again under it.
     let store = PendingApprovalStore::open(store_path).expect("approval store");
     let entry = store
         .get(&approval_nonce)
         .expect("the approval entry must still be in the store");
-    assert!(
-        matches!(entry.kind, ApprovalKind::PaymentSimulated { .. }),
-        "a refused send leaves the approval as it was; got {:?}",
-        entry.kind
-    );
+    match &entry.kind {
+        ApprovalKind::Consumed {
+            original_kind_name,
+            tx_hash,
+            outcome,
+        } => {
+            assert_eq!(original_kind_name, "PaymentSimulated");
+            assert_eq!(tx_hash.len(), 64, "{tx_hash}");
+            assert!(
+                tx_hash
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+                "{tx_hash}"
+            );
+            assert_eq!(
+                *outcome,
+                ConsumedOutcome::Unknown,
+                "a refusal does not settle the outcome"
+            );
+        }
+        other => panic!("the approval must be a Consumed tombstone; got {other:?}"),
+    }
     assert_eq!(
         entry.attestation_blob_b64.as_deref(),
         Some(attestation_b64.as_str()),
-        "the attestation is unchanged"
+        "the attestation the submission was made under is retained, unchanged"
     );
 }
 

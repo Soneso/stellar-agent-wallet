@@ -194,15 +194,12 @@ impl WalletServer {
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         use std::sync::Arc;
 
-        use stellar_agent_core::audit_log::{AuditEntry, PolicyDecision};
         use stellar_agent_core::policy::v1::OpaqueReason;
         use stellar_agent_network::StellarRpcClient;
         use stellar_agent_network::keyring::enrolled_keyring_signer;
         use stellar_agent_network::submit::submit_transaction_and_wait;
         use stellar_agent_sep43::StellarAgentModule;
         use stellar_agent_sep43::module::ModuleAdapter;
-
-        use crate::tools::value_audit::emit_value_audit_row_with_writer;
 
         // Structural mainnet refusal, keyed on the server's profile context:
         // before the policy gate, any key access, and any RPC request.
@@ -244,8 +241,7 @@ impl WalletServer {
         // surface its own code rather than audit.chain_key_unavailable. The
         // pre-flight still precedes the signer load, the signature, and the
         // submit — the transaction must not exist unless the row recording its
-        // production can be written. Reused (not re-acquired) for the
-        // post-confirm `opaque_action_submitted` row.
+        // production can be written.
         let audit_writer = match crate::tools::value_audit::require_value_audit_writer(
             &self.profile,
             &self.profile_name_for_approval(),
@@ -392,7 +388,7 @@ impl WalletServer {
                 value_class: stellar_agent_core::policy::v1::ValueClass::Opaque(
                     OpaqueReason::RawTransactionSignature,
                 ),
-                audit: std::sync::Arc::clone(&audit_writer),
+                audit: audit_writer,
                 nonce_id: None,
                 approval_nonce: None,
                 approval_dir: None,
@@ -400,10 +396,7 @@ impl WalletServer {
             },
             None,
         ) {
-            // The tool writes the row that carries its own contract, so the
-            // recorder leaves the confirmed arm to it: one settled row per
-            // confirmed send.
-            Ok(r) => r.with_caller_written_confirmed_row(),
+            Ok(r) => r,
             Err(err) => {
                 return Ok(crate::tools::submission_record::submission_error_result(
                     &err,
@@ -439,35 +432,9 @@ impl WalletServer {
                     "sep43_sign_and_submit: transaction confirmed",
                 );
 
-                // Non-fatal allow-path audit row. This is an opaque submit: the
-                // wallet did not decode the caller-supplied envelope's value, so
-                // legs are empty and the opaque reason is the tool's fixed
-                // classification (name-derived, not argument-derived). The on-chain
-                // tx is identified by the redacted hash.
-                //
-                // The row names the submission it settles. It is the only
-                // settled row this send writes, so without the envelope hash
-                // the pending row written before the send stays owed for good
-                // and a later reconciliation of the same transaction appends a
-                // second one.
-                let request_id = uuid::Uuid::new_v4().to_string();
-                let audit_entry = AuditEntry::new_opaque_action_submitted(
-                    "stellar_sep43_sign_and_submit_transaction",
-                    args.chain_id.as_str(),
-                    OpaqueReason::RawTransactionSignature.as_str(),
-                    redacted.as_str(),
-                    result.ledger,
-                    PolicyDecision::Allow,
-                    Some(stellar_agent_network::envelope_hash_hex(&signed_xdr)),
-                    None,
-                    &request_id,
-                );
-                emit_value_audit_row_with_writer(
-                    &audit_writer,
-                    &self.profile_name_for_approval(),
-                    audit_entry,
-                );
-
+                // A reported success is an endpoint claim, not authenticated
+                // evidence: it writes no submitted audit row, and the pending
+                // row stays owed until authenticated evidence settles it.
                 let response = json!({
                     "signedTxXdr": signed_xdr,
                     "txHash": result.tx_hash,

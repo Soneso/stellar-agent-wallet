@@ -431,7 +431,6 @@ pub(crate) async fn reconcile_open_reservations(
             &settled.tx_hash,
             &settled.status,
             settled.release_code,
-            settled.ledger,
             stellar_agent_core::audit_log::PolicyDecision::Allow,
         );
     }
@@ -479,7 +478,6 @@ pub(crate) fn write_settled_row(
     envelope_hash: &str,
     tx_hash: &str,
     status: &ReceiptStatus,
-    ledger: Option<u32>,
     reconciliation_decision: stellar_agent_core::audit_log::PolicyDecision,
 ) {
     write_settled_row_with_evidence(
@@ -490,7 +488,6 @@ pub(crate) fn write_settled_row(
         tx_hash,
         status,
         None,
-        ledger,
         reconciliation_decision,
     );
 }
@@ -499,8 +496,7 @@ pub(crate) fn write_settled_row(
 ///
 /// The row carries the SAME value legs the gate sized, read back from the
 /// pending row this submission wrote before it was sent: they were derived
-/// once, at the gate, and are never re-derived here. `ledger` is the ledger
-/// the chain reports the transaction in.
+/// once, at the gate, and are never re-derived here.
 ///
 /// The writer guard is taken once and held through the settlement lookup and
 /// the append, so the lookup reads the history up to the writer's verified
@@ -526,7 +522,6 @@ pub(crate) fn write_settled_row_with_evidence(
     tx_hash: &str,
     status: &ReceiptStatus,
     release_code: Option<ReleaseEvidence>,
-    ledger: Option<u32>,
     reconciliation_decision: stellar_agent_core::audit_log::PolicyDecision,
 ) {
     let Ok(mut guard) = audit.lock() else {
@@ -543,7 +538,6 @@ pub(crate) fn write_settled_row_with_evidence(
         tx_hash,
         status,
         release_code,
-        ledger,
         reconciliation_decision,
     ) {
         Ok(Some(entry)) => crate::commands::value_audit::emit_value_audit_row_on_guard(
@@ -561,71 +555,14 @@ pub(crate) fn write_settled_row_with_evidence(
     }
 }
 
-/// Appends the value-action row that settles a reconciled submission, and
-/// reports a failed append.
-///
-/// `Ok` means the log carries the settled row: it was found in the retained
-/// history, it was appended now, or the submission owes none. An operator
-/// verb that is about to close the submission's record calls this first, so
-/// the record is closed only once its settlement is in the log. A history
-/// that cannot be read refuses, because it cannot show that the row is
-/// there. The writer guard is taken first and held through the lookup and
-/// the append.
-///
-/// # Errors
-///
-/// The append failure, mapped as every strict audit append maps it, to an
-/// `audit.*` code (`audit.tip_anchor_mismatch` included); a poisoned writer
-/// mutex is `audit.chain_key_unavailable`. A settlement lookup that cannot
-/// read the retained history keeps the verifier's `audit.*` code and message.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "settlement carries submission identity, its evidence and the reconciliation decision"
-)]
-pub(crate) fn append_settled_row(
-    profile: &Profile,
-    profile_name: &str,
-    audit: &Arc<Mutex<AuditWriter>>,
-    envelope_hash: &str,
-    tx_hash: &str,
-    status: &ReceiptStatus,
-    release_code: Option<ReleaseEvidence>,
-    reconciliation_decision: stellar_agent_core::audit_log::PolicyDecision,
-) -> Result<(), Envelope<()>> {
-    let mut guard = audit.lock().map_err(|_| {
-        Envelope::err(&crate::commands::value_audit::audit_writer_open_failed(
-            profile_name,
-        ))
-    })?;
-    let Some(entry) = settled_row(
-        profile,
-        &guard,
-        envelope_hash,
-        tx_hash,
-        status,
-        release_code,
-        None,
-        reconciliation_decision,
-    )
-    .map_err(|error| Envelope::err_raw(error.wire_code(), error.to_string()))?
-    else {
-        return Ok(());
-    };
-    crate::commands::value_audit::append_value_audit_row_strict(&mut guard, profile_name, entry)
-        .map_err(|error| Envelope::err(&error))
-}
-
 /// The value-action row a reconciled submission still owes the log, or
 /// `None` when it owes none.
 ///
-/// A `Success` receipt owes a `value_action_submitted` row and a `Failed` one
-/// a `value_action_failed` row under its failure code. An `Ambiguous` receipt
-/// released on chain evidence owes a `value_action_failed` row under the
-/// evidence's wire code: the reservation is gone, and the log records why.
-/// Every other status leaves the outcome open, which is what the pending row
-/// already records: a pending receipt, and an ambiguous one whose retention
-/// window closed. A receipt an operator cleared owes no row by design; the
-/// `submission_receipt_cleared` row records the clear.
+/// Only a `Failed` receipt owes a row: a `value_action_failed` row under its
+/// failure code. A reported success, an accounting disposition, a pending
+/// receipt and an ambiguous one leave the outcome open, which is what the
+/// pending row already records. A receipt an operator cleared owes no row by
+/// design; the `submission_receipt_cleared` row records the clear.
 ///
 /// The settlement lookup reads the retained history through `writer`, the
 /// guard the caller holds, newest file first and up to the writer's verified
@@ -638,7 +575,7 @@ pub(crate) fn append_settled_row(
 /// The lookup's integrity error when a visited file cannot be read or its
 /// chain does not verify. Whether a row is owed is then unknown, which the
 /// caller handles: [`write_settled_row_with_evidence`] logs it and writes
-/// nothing, and [`append_settled_row`] refuses.
+/// nothing.
 #[allow(
     clippy::too_many_arguments,
     reason = "settlement carries submission identity, its evidence and the reconciliation decision"
@@ -650,7 +587,6 @@ fn settled_row(
     tx_hash: &str,
     status: &ReceiptStatus,
     release_code: Option<ReleaseEvidence>,
-    ledger: Option<u32>,
     reconciliation_decision: stellar_agent_core::audit_log::PolicyDecision,
 ) -> Result<
     Option<stellar_agent_core::audit_log::AuditEntry>,
@@ -662,7 +598,7 @@ fn settled_row(
         return Ok(None);
     };
 
-    let (tool, chain_id, legs, nonce_id, policy_decision, approval_nonce, witness) =
+    let (tool, chain_id, legs, nonce_id, policy_decision, approval_nonce) =
         match stellar_agent_core::audit_log::reader::try_value_action_settlement(
             writer,
             envelope_hash,
@@ -677,7 +613,6 @@ fn settled_row(
                 pending.nonce_id,
                 pending.policy_decision,
                 pending.approval_nonce,
-                pending.witness,
             ),
             // No pending row survives in retained history, so its sizing is
             // unavailable. The outcome still belongs in the log, under the name
@@ -689,39 +624,24 @@ fn settled_row(
                 None,
                 reconciliation_decision,
                 None,
-                None,
             ),
         };
     let chain_id: Option<String> = chain_id;
     let tx_redacted = stellar_agent_network::redact_tx_hash(tx_hash);
     let request_id = uuid::Uuid::new_v4().to_string();
-    Ok(Some(match row {
-        SettledRow::Submitted => AuditEntry::new_value_action_submitted(
-            tool,
-            chain_id,
-            legs,
-            tx_redacted.as_str(),
-            ledger.unwrap_or(0),
-            policy_decision,
-            Some(envelope_hash.to_owned()),
-            nonce_id,
-            approval_nonce,
-            &request_id,
-            witness,
-        ),
-        SettledRow::Failed { code } => AuditEntry::new_value_action_failed(
-            tool,
-            chain_id,
-            legs,
-            tx_redacted.as_str(),
-            code,
-            policy_decision,
-            Some(envelope_hash.to_owned()),
-            nonce_id,
-            approval_nonce,
-            &request_id,
-        ),
-    }))
+    let SettledRow::Failed { code } = row;
+    Ok(Some(AuditEntry::new_value_action_failed(
+        tool,
+        chain_id,
+        legs,
+        tx_redacted.as_str(),
+        code,
+        policy_decision,
+        Some(envelope_hash.to_owned()),
+        nonce_id,
+        approval_nonce,
+        &request_id,
+    )))
 }
 
 /// Renders a submit-path error, attaching the structured detail the three
@@ -1457,7 +1377,6 @@ mod tests {
                     "envelope",
                     "transaction",
                     &status,
-                    Some(9),
                     PolicyDecision::Allow,
                 );
                 let rows: Vec<serde_json::Value> = std::fs::read_to_string(&profile.audit_log_path)
@@ -1465,16 +1384,17 @@ mod tests {
                     .lines()
                     .map(|line| serde_json::from_str(line).unwrap())
                     .collect();
-                assert_eq!(rows.len(), 2);
+                assert_eq!(rows.len(), 1 + usize::from(failed));
+                let row = usize::from(failed);
                 assert_eq!(
-                    rows[1]["policy_decision"],
+                    rows[row]["policy_decision"],
                     serde_json::to_value(decision).unwrap()
                 );
                 assert_eq!(
-                    rows[1]["approval_nonce"],
+                    rows[row]["approval_nonce"],
                     serde_json::to_value(nonce).unwrap()
                 );
-                assert_eq!(rows[1]["tool"], "stellar_pay_commit");
+                assert_eq!(rows[row]["tool"], "stellar_pay_commit");
             }
         }
     }
@@ -1485,11 +1405,7 @@ mod tests {
         use stellar_agent_core::audit_log::PolicyDecision;
 
         for (status, evidence, expected) in [
-            (
-                ReceiptStatus::Success,
-                None,
-                Some(("value_action_submitted", None)),
-            ),
+            (ReceiptStatus::Success, None, None),
             (
                 ReceiptStatus::Failed {
                     code: "ledger.failed".to_owned(),
@@ -1500,12 +1416,12 @@ mod tests {
             (
                 ReceiptStatus::Ambiguous,
                 Some(ReleaseEvidence::TimeBoundPassed),
-                Some(("value_action_failed", Some("submission.time_bound_passed"))),
+                None,
             ),
             (
                 ReceiptStatus::Ambiguous,
                 Some(ReleaseEvidence::SequenceConsumed),
-                Some(("value_action_failed", Some("submission.sequence_consumed"))),
+                None,
             ),
             (ReceiptStatus::Ambiguous, None, None),
             (ReceiptStatus::Pending, None, None),
@@ -1531,7 +1447,6 @@ mod tests {
                 "transaction",
                 &status,
                 evidence,
-                Some(9),
                 PolicyDecision::Allow,
             );
             let rows: Vec<serde_json::Value> = std::fs::read_to_string(&profile.audit_log_path)
@@ -1624,9 +1539,10 @@ mod tests {
                 &audit,
                 "envelope",
                 "transaction",
-                &ReceiptStatus::Success,
+                &ReceiptStatus::Failed {
+                    code: "ledger.failed".to_owned(),
+                },
                 None,
-                Some(9),
                 PolicyDecision::Allow,
             );
         });
@@ -1644,47 +1560,6 @@ mod tests {
                 && line.contains("envelope")
                 && line.contains("audit.chain_broken")),
             "the skipped row is logged with the profile, the hash, and the error: {logs}"
-        );
-    }
-
-    /// The strict settlement refuses when the lookup cannot read the retained
-    /// history, so a clear never proceeds past a settlement it could not see.
-    #[test]
-    fn an_unreadable_history_refuses_the_strict_settlement() {
-        use stellar_agent_core::audit_log::PolicyDecision;
-
-        let dir = tempfile::tempdir().unwrap();
-        let mut profile =
-            Profile::builder_testnet("signer", "strict-unreadable", "nonce", "strict-unreadable")
-                .build();
-        profile.audit_log_path = dir.path().join("audit.jsonl");
-        let audit = history_with_a_broken_archive(&profile.audit_log_path);
-        let active = std::fs::read(&profile.audit_log_path).unwrap();
-        let refused = append_settled_row(
-            &profile,
-            "strict-unreadable",
-            &audit,
-            "envelope",
-            "transaction",
-            &ReceiptStatus::Ambiguous,
-            Some(ReleaseEvidence::SequenceConsumed),
-            PolicyDecision::Allow,
-        )
-        .expect_err("a history that cannot be read refuses the strict settlement");
-        let error = refused.error.as_ref().expect("error");
-        assert_eq!(error.code, "audit.chain_broken", "{refused:?}");
-        assert!(
-            error.message.contains("audit.chain_broken"),
-            "the refusal names the integrity error: {refused:?}"
-        );
-        assert!(
-            !error.message.contains("on open"),
-            "a lookup failure is not a writer-open failure: {refused:?}"
-        );
-        assert_eq!(
-            std::fs::read(&profile.audit_log_path).unwrap(),
-            active,
-            "no settled row is written"
         );
     }
 
@@ -1728,7 +1603,6 @@ mod tests {
             "envelope",
             "transaction",
             &ReceiptStatus::Success,
-            Some(124),
             PolicyDecision::Allow,
         );
         let rows: Vec<serde_json::Value> = std::fs::read_to_string(&profile.audit_log_path)
@@ -1736,9 +1610,8 @@ mod tests {
             .lines()
             .map(|line| serde_json::from_str(line).unwrap())
             .collect();
-        assert_eq!(rows.len(), 2);
-        assert_eq!(rows[1]["kind"], "value_action_submitted");
-        assert_eq!(rows[1]["witness"], serde_json::to_value(&witness).unwrap());
-        assert_eq!(rows[0]["witness"], rows[1]["witness"]);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["kind"], "value_action_pending");
+        assert_eq!(rows[0]["witness"], serde_json::to_value(&witness).unwrap());
     }
 }

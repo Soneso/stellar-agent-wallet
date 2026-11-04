@@ -147,6 +147,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `stellar_agent_approval_ui::shown_view_digest` reads that digest from an
   approve request body, and `consent_changed` is the
   `approval.presence_changed` refusal.
+- `ReconcileReport::unrecorded` lists the endpoint answers a reconciliation
+  pass does not record on the receipt of an untimed hold, as
+  `UnrecordedAnswer` with a `ReportedAnswer` whose wire codes are
+  `REPORTED_SUCCESS_CODE` and `RETENTION_EXPIRED_CODE`. Struct literals must
+  supply `ReconcileReport.unrecorded`.
+  `stellar_agent_core::audit_log::reader::try_unbounded_submission_receipt_cleared_exists`
+  reports a clear row with the unbounded acknowledgement and the release.
 
 ### Changed
 
@@ -734,6 +741,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   its parsing buffer before it signs, and a wallet-backed signer signs without
   building a second key. The documentation states which copies the lock covers
   and which it does not.
+- Uncertain submissions retain spending capacity through their execution bounds
+  and accounting windows. Endpoint failure and absence do not create definitive
+  failure audit records. Clearing untimed pending exposure requires an explicit
+  recorded acknowledgement. A window snapshot carrying an exposure,
+  accounting-expired or operator-cleared row, an accounting field or a
+  submission anchor uses wire version 7, which older builds refuse.
+
+- Clearing an untimed transaction needs both acknowledgement flags on every
+  network and releases its hold whatever the endpoint reported.
+
+- A reported success writes no submitted audit row; the pending record stays
+  until authenticated evidence settles it.
+
+- The receipt of an untimed hold that records a network answer keeps it
+  through reconciliation. The clear row's `evidence` records an endpoint
+  answer reconciliation did not record, `submission.reported_success` or
+  `submission.retention_expired`. A clear stopped after its hold's release
+  finishes on a re-run with both acknowledgement flags and writes no second
+  row.
+
 - Spending state authenticates its original network and refuses reconciliation
   under a different profile network. Legacy state without authenticated network
   history refuses automatic migration.

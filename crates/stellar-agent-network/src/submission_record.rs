@@ -145,6 +145,8 @@ pub struct SubmissionIntent {
     /// The endpoint's latest ledger immediately before the send, read from the
     /// `getLedgerEntries` response the signature-binding check already makes.
     pub submission_ledger: u32,
+    /// Independent provenance bound to this submission.
+    pub submission_anchor: Option<crate::policy_state::SubmissionAnchor>,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -159,7 +161,7 @@ pub struct SubmissionIntent {
 /// accident. The enum carries no `#[non_exhaustive]` for that reason.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SubmissionOutcome {
-    /// The transaction was included in ledger `ledger`.
+    /// The endpoint reports inclusion in ledger `ledger`.
     Success {
         /// The ledger sequence the transaction confirmed in.
         ledger: u32,
@@ -167,19 +169,14 @@ pub enum SubmissionOutcome {
         created_at: Option<i64>,
     },
 
-    /// The transaction applied and failed. The confirmation poll reported
-    /// `FAILED` with a `TransactionResult`; on mainnet the oracle reported
-    /// `FAILED` for the same hash as well, and the code is the oracle's.
+    /// An endpoint reports failure. Possible spending remains reserved.
     OnChainFailed {
         /// Stable wire code for the failure, from the same XDR mapping the
         /// returned error uses.
         code: String,
     },
 
-    /// The send step refused the bytes definitively: `sendTransaction`
-    /// answered `ERROR` with a real `TransactionResult`; no value moved, and the
-    /// refusal is not retried. A mainnet send refusal is not reported this
-    /// way; see [`Self::TransportAfterSend`].
+    /// The endpoint refuses exposed bytes. The observation authorizes no refund.
     Rejected {
         /// Stable wire code for the refusal.
         code: String,
@@ -307,7 +304,6 @@ pub struct WalletSubmissionRecorder<'a> {
     now_ms: u64,
     sequence_floor: Option<&'a dyn SequenceFloorHook>,
     approval: Option<ApprovalTombstone>,
-    caller_writes_confirmed_row: bool,
 }
 
 impl std::fmt::Debug for WalletSubmissionRecorder<'_> {
@@ -378,7 +374,6 @@ impl<'a> WalletSubmissionRecorder<'a> {
             now_ms,
             sequence_floor: None,
             approval: None,
-            caller_writes_confirmed_row: false,
             witness: None,
         }
     }
@@ -420,29 +415,6 @@ impl<'a> WalletSubmissionRecorder<'a> {
         )
     }
 
-    /// States that the caller writes the value-action row for a confirmed
-    /// submission itself.
-    ///
-    /// One settled row per confirmed send. A verb whose own response contract
-    /// is carried by a row of its own — `stellar_sep43_sign_and_submit_transaction`
-    /// writes an opaque-action row naming what it signed — would otherwise
-    /// produce two rows for one send.
-    ///
-    /// The caller's row has to carry the submission's envelope hash on the
-    /// outer entry. That is what closes out the pending row this recorder
-    /// wrote before the send: the settlement lookup matches on it, and a row
-    /// that does not carry it leaves the pending row owed and lets a later
-    /// reconciliation append a second settled row for the same send.
-    ///
-    /// Only the confirmed arm is affected. A submission the chain reports as
-    /// failed still gets its `value_action_failed` row from the recorder, so
-    /// the pending row is settled whatever the outcome.
-    #[must_use]
-    pub fn with_caller_written_confirmed_row(mut self) -> Self {
-        self.caller_writes_confirmed_row = true;
-        self
-    }
-
     /// Attaches the process-local confirmed-sequence floor, which only the
     /// long-lived MCP server holds.
     #[must_use]
@@ -469,6 +441,7 @@ impl<'a> WalletSubmissionRecorder<'a> {
             max_time: intent.max_time,
             pending_since_ms: self.now_ms,
             submission_ledger: intent.submission_ledger,
+            submission_anchor: intent.submission_anchor.clone(),
             operator_required: false,
         }
     }
@@ -782,47 +755,14 @@ impl SubmissionRecorder for WalletSubmissionRecorder<'_> {
         match outcome {
             SubmissionOutcome::Success { ledger, created_at } => {
                 self.finalize_receipt(intent, ReceiptStatus::Success, Some(*ledger));
-                if !self.caller_writes_confirmed_row {
-                    self.write_outcome_row(AuditEntry::new_value_action_submitted(
-                        self.tool,
-                        self.chain_id.clone(),
-                        self.legs.clone(),
-                        redact_tx_hash(&intent.tx_hash),
-                        *ledger,
-                        self.policy_decision.clone(),
-                        Some(intent.envelope_hash.clone()),
-                        self.nonce_id.clone(),
-                        self.approval
-                            .as_ref()
-                            .map(|approval| approval.approval_nonce.clone()),
-                        &self.request_id,
-                        self.witness.clone(),
-                    ));
-                }
                 self.settle_window(intent, WindowSettlement::Confirm(*created_at));
                 self.record_floor(intent).await;
                 self.tombstone_approval(intent);
             }
-            SubmissionOutcome::OnChainFailed { code } => {
-                self.finalize_receipt(intent, ReceiptStatus::Failed { code: code.clone() }, None);
-                self.write_failed_row(intent, code);
-                self.settle_window(intent, WindowSettlement::Release);
-                self.record_floor(intent).await;
-                self.tombstone_approval(intent);
-            }
-            SubmissionOutcome::Rejected { code, .. } => {
-                // A definitive refusal releases the approval hold in the same
-                // receipt write that records the failed send.
-                if let Err(error) = self
-                    .receipts
-                    .finalize_send_refusal(&intent.envelope_hash, code)
-                {
-                    tracing::warn!(error = %error, "submission record: send refusal could not be persisted");
-                }
-                self.write_failed_row(intent, code);
-                self.settle_window(intent, WindowSettlement::Release);
-            }
-            SubmissionOutcome::Timeout { .. } | SubmissionOutcome::TransportAfterSend { .. } => {
+            SubmissionOutcome::OnChainFailed { .. }
+            | SubmissionOutcome::Rejected { .. }
+            | SubmissionOutcome::Timeout { .. }
+            | SubmissionOutcome::TransportAfterSend { .. } => {
                 // The transaction may still apply. The receipt, the pending
                 // audit row and the reservation all stand, and only
                 // reconciliation or an operator clears them.
@@ -1163,6 +1103,7 @@ impl WalletSubmissionRecorder<'_> {
             max_time: intent.max_time,
             pending_since_ms: self.now_ms,
             submission_ledger: intent.submission_ledger,
+            submission_anchor: intent.submission_anchor.clone().map(Box::new),
         });
         let authorization_id = authorization.id();
         if let Err(e) =
@@ -1359,7 +1300,13 @@ impl WalletSubmissionRecorder<'_> {
                 self.window
                     .confirm(self.profile, &intent.envelope_hash, created_at)
             }
-            WindowSettlement::Release => self.window.release(self.profile, &intent.envelope_hash),
+            WindowSettlement::Release => self
+                .window
+                .pre_exposure_cancellation(self.profile, &intent.envelope_hash)
+                .and_then(|decision| {
+                    self.window
+                        .apply_accounting_decision(self.profile, decision)
+                }),
         };
         if let Err(e) = result {
             tracing::warn!(
@@ -1519,6 +1466,7 @@ mod tests {
             sequence: 7,
             max_time: 0,
             submission_ledger: 123,
+            submission_anchor: None,
         };
         let audit_before = std::fs::read(&profile.audit_log_path).unwrap();
         let window_before = std::fs::read(dir.path().join("state.window")).unwrap();
@@ -1631,6 +1579,7 @@ mod tests {
             sequence: 7,
             max_time: 0,
             submission_ledger: 123,
+            submission_anchor: None,
         };
         recorder.pre_send(&intent).await.unwrap();
         recorder
@@ -1651,7 +1600,7 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial]
-    async fn pending_and_submitted_rows_carry_the_witness() {
+    async fn pending_row_carries_the_witness_and_success_writes_no_submitted_row() {
         stellar_agent_test_support::keyring_mock::install().unwrap();
         let dir = tempfile::tempdir().unwrap();
         let mut profile = Profile::builder_testnet("signer", "witness", "nonce", "witness").build();
@@ -1693,6 +1642,7 @@ mod tests {
             sequence: 7,
             max_time: 0,
             submission_ledger: 123,
+            submission_anchor: None,
         };
         recorder.pre_send(&intent).await.unwrap();
         recorder
@@ -1709,9 +1659,8 @@ mod tests {
             .lines()
             .map(|line| serde_json::from_str(line).unwrap())
             .collect();
-        assert_eq!(rows.len(), 2);
+        assert_eq!(rows.len(), 1);
         assert_eq!(rows[0]["kind"], "value_action_pending");
-        assert_eq!(rows[1]["kind"], "value_action_submitted");
         for row in rows {
             assert_eq!(
                 row["witness"],
@@ -1783,6 +1732,7 @@ mod tests {
             sequence: 7,
             max_time: 0,
             submission_ledger: 123,
+            submission_anchor: None,
         };
         recorder.pre_send(&intent).await.unwrap();
         std::fs::remove_file(receipts.file_path().unwrap()).unwrap();
@@ -2338,12 +2288,12 @@ mod tests {
             stateless_duplicate(false, true).await;
         }
 
-        /// A settled original with a lost receipt refuses the resend and closes
-        /// exactly the resend's new row, leaving the envelope settled.
+        /// An endpoint report with a lost receipt refuses resend and preserves
+        /// the original pending audit row.
         #[tokio::test]
         #[serial]
-        async fn a_settled_consumption_closes_only_the_resends_row() {
-            for (label, outcome, settled_kind) in [
+        async fn endpoint_outcomes_keep_stateless_consumption_open() {
+            for (label, outcome, _reported_kind) in [
                 (
                     "rejected",
                     SubmissionOutcome::Rejected {
@@ -2376,7 +2326,7 @@ mod tests {
                     .consume_for_submission(&sub.intent, MainnetSubmitGrant::Tx(authorization))
                     .unwrap();
                 recorder.outcome(&sub.intent, &outcome).await;
-                assert_eq!(fx.audit_kinds(), ["value_action_pending", settled_kind]);
+                assert_eq!(fx.audit_kinds(), ["value_action_pending"]);
                 std::fs::remove_file(fx.receipts.file_path().unwrap()).unwrap();
                 let (second, authorization) = grant(&fx, &sub, &[], "approval-2");
 
@@ -2392,13 +2342,8 @@ mod tests {
                 assert!(receipt(&fx, &sub.intent).is_none());
                 assert_eq!(
                     fx.audit_kinds(),
-                    [
-                        "value_action_pending",
-                        settled_kind,
-                        "value_action_pending",
-                        "value_action_failed",
-                    ],
-                    "the resend adds one pending row and exactly one closing row"
+                    ["value_action_pending"],
+                    "an uncertain original refuses the resend before any new row"
                 );
                 assert!(matches!(
                     try_value_action_settlement(
@@ -2408,7 +2353,7 @@ mod tests {
                         &sub.intent.envelope_hash
                     )
                     .unwrap(),
-                    ValueActionSettlement::Settled
+                    ValueActionSettlement::Owed(_)
                 ));
             }
         }
@@ -2869,7 +2814,7 @@ mod tests {
 
         #[tokio::test]
         #[serial]
-        async fn authorized_recorder_settles_minted_holds() {
+        async fn authorized_recorder_retains_minted_exposure() {
             for success in [true, false] {
                 let fx = LedgerFixture::new("authorized-settle", NOW);
                 let sub = submission();
@@ -2906,22 +2851,18 @@ mod tests {
                     }
                 };
                 recorder.outcome(&sub.intent, &outcome).await;
-                assert_eq!(reservations(&fx), 0);
+                assert_eq!(reservations(&fx), 1);
                 let bytes = std::fs::read(fx.dir.path().join("state.window")).unwrap();
                 let wire: serde_json::Value = serde_json::from_slice(&bytes[32..]).unwrap();
-                assert_eq!(
-                    wire["entries"].as_array().map_or(0, Vec::len),
-                    usize::from(success)
-                );
+                assert_eq!(wire["entries"].as_array().map_or(0, Vec::len), 1);
             }
         }
 
-        /// A definitive refusal of the send releases the converted window
-        /// records, leaves the authorization used, closes the pending row with
-        /// a failed row, and releases the receipt's hold on the approval.
+        /// A reported refusal retains converted exposure, leaves the authorization
+        /// used and the audit row pending, and tombstones the consumed approval.
         #[tokio::test]
         #[serial]
-        async fn a_definitive_rejection_releases_the_converted_rows() {
+        async fn a_reported_rejection_retains_the_converted_rows() {
             let fx = LedgerFixture::new("authorized-rejected", NOW);
             let sub = submission();
             let (id, authorization) = grant(&fx, &sub, &holds(&fx, 100), "approval-1");
@@ -2964,25 +2905,24 @@ mod tests {
                     },
                 )
                 .await;
-            assert_eq!(reservations(&fx), 0);
+            assert_eq!(reservations(&fx), 1);
             let bytes = std::fs::read(fx.dir.path().join("state.window")).unwrap();
             let wire: serde_json::Value = serde_json::from_slice(&bytes[32..]).unwrap();
             assert!(
-                wire["entries"].as_array().is_none_or(Vec::is_empty),
-                "the converted records are released: {wire}"
+                wire["entries"]
+                    .as_array()
+                    .is_some_and(|entries| entries.len() == 1),
+                "exposed records retain capacity: {wire}"
             );
             assert!(!fx.is_open(id), "the used authorization is not reopened");
             assert!(
                 fx.receipts
                     .find_by_approval_nonce("approval-nonce-1")
                     .unwrap()
-                    .is_none(),
-                "the refused send releases the approval"
+                    .is_some(),
+                "the exposed receipt retains its approval binding"
             );
-            assert_eq!(
-                fx.audit_kinds(),
-                ["value_action_pending", "value_action_failed"]
-            );
+            assert_eq!(fx.audit_kinds(), ["value_action_pending"]);
         }
 
         #[tokio::test]
@@ -3015,6 +2955,7 @@ mod tests {
                     max_time: sub.intent.max_time,
                     pending_since_ms: NOW,
                     submission_ledger: sub.intent.submission_ledger,
+                    submission_anchor: None,
                 };
                 let recorder = WalletSubmissionRecorder::new_authorized(
                     &fx.profile,

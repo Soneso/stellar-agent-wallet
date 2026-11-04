@@ -2449,16 +2449,14 @@ impl AuditEntry {
 
     /// Constructs a `SubmissionReceiptCleared` audit entry.
     ///
-    /// Emitted by `tx receipt clear --acknowledge`. `cleared_from` names the
-    /// receipt status the clear replaced, and `reservation_released` records
-    /// whether a spending-window reservation was released with it.
-    /// `evidence` is the wire code of the chain evidence on which
-    /// reconciliation released the reservation, and `None` when the outcome
-    /// is unknown. `unbounded_exposure` records that the operator
-    /// acknowledged untimed bytes that can still apply after their spend
-    /// stops counting. `transaction_hash_redacted` MUST be pre-redacted to
-    /// first-8-last-8 at the call site; `envelope_hash` carries the full
-    /// envelope hash the operator addressed.
+    /// Emitted by `tx receipt clear --acknowledge`. `cleared_from` names the receipt status the
+    /// clear replaced, and `reservation_released` records whether a spending-window reservation
+    /// was released with it. `evidence` is the wire code of the accounting disposition the receipt
+    /// carries, or of the endpoint's current answer where the receipt of an untimed hold keeps its
+    /// recorded network answer, and `None` otherwise. `unbounded_exposure` records that the
+    /// operator acknowledged untimed bytes that can still apply after their spend stops counting.
+    /// `transaction_hash_redacted` MUST be pre-redacted to first-8-last-8 at the call site;
+    /// `envelope_hash` carries the full envelope hash the operator addressed.
     #[must_use]
     #[allow(
         clippy::too_many_arguments,

@@ -19,17 +19,16 @@ use stellar_agent_core::audit_log::test_helpers::{
     break_newest_archive_link, rotated_archives_newest_first,
 };
 use stellar_agent_core::audit_log::{AuditEntry, AuditWriterRegistry, BindingCheck};
+use stellar_agent_core::profile::receipt::{ReceiptStatus, ReceiptStore};
 use stellar_agent_core::profile::schema::Profile;
-use stellar_agent_mcp::server::{
-    Sep43SignAndSubmitTransactionArgs, StellarTransactionStatusArgs, WalletServer,
-};
+use stellar_agent_mcp::server::{StellarTransactionStatusArgs, WalletServer};
 use stellar_agent_test_support::xdr_fixtures::{
     account_entry_xdr_with_seq, account_ledger_key_xdr,
 };
 use stellar_agent_test_support::{keyring_mock, signed_envelope::SignedTestEnvelope};
 use wiremock::{Mock, MockServer, matchers::method};
 
-/// A confirmed submission whose settled row one filler append rotated into an
+/// A failed submission whose settled row one filler append rotated into an
 /// archive.
 struct RotatedSettlement {
     _home: crate::common::IsolatedDataRoot,
@@ -39,9 +38,10 @@ struct RotatedSettlement {
     tx_hash: String,
 }
 
-/// Submits a SEP-43 transaction by the payer `seed` names, which the endpoint
-/// confirms, then rotates the log so the settled row sits in an archive and
-/// the active file holds only a filler row for another submission.
+/// Records a sent submission by the payer `seed` names whose receipt holds an
+/// on-chain failure, lets the status tool write its settled row, then rotates
+/// the log so the settled row sits in an archive and the active file holds
+/// only a filler row for another submission.
 async fn settle_then_rotate(seed: [u8; 32]) -> RotatedSettlement {
     let home = crate::common::isolated_data_root();
     keyring_mock::install().unwrap();
@@ -58,32 +58,51 @@ async fn settle_then_rotate(seed: [u8; 32]) -> RotatedSettlement {
     crate::common::store_signer_identity("svc", source, seed);
     let rpc = MockServer::start().await;
     Mock::given(method("POST"))
-        .respond_with(
-            crate::common::TimeoutRpc::new(vec![(
-                account_ledger_key_xdr(source),
-                account_entry_xdr_with_seq(source, 500_000_000_000, 0, 42),
-            )])
-            .confirming_in(1_001),
-        )
+        .respond_with(crate::common::TimeoutRpc::new(vec![(
+            account_ledger_key_xdr(source),
+            account_entry_xdr_with_seq(source, 500_000_000_000, 0, 42),
+        )]))
         .mount(&rpc)
         .await;
     let profile = crate::common::timeout_profile(&rpc.uri(), source);
     let server = WalletServer::new(profile.clone()).unwrap();
-    let result = server
-        .call_stellar_sep43_sign_and_submit_transaction(Sep43SignAndSubmitTransactionArgs {
-            chain_id: "stellar:testnet".to_owned(),
-            transaction_xdr: envelope.envelope_xdr().to_owned(),
-            network_passphrase: None,
-            address: None,
-        })
-        .await
-        .unwrap();
-    let json: serde_json::Value =
-        serde_json::from_str(&result.content[0].as_text().unwrap().text).unwrap();
-    assert_eq!(json["data"]["status"], "success", "{json}");
     let name = server.profile_name_for_approval();
+    let envelope_hash = stellar_agent_network::envelope_hash_hex(envelope.envelope_xdr());
+    let tx_hash = envelope.tx_hash_hex().to_owned();
+    let receipts = ReceiptStore::open(&name).unwrap();
+    receipts
+        .begin_submission(&envelope_hash, &tx_hash, source, 43, 0, 1_000)
+        .unwrap();
+    receipts.mark_submitted(&envelope_hash).unwrap();
+    receipts
+        .finalize(
+            &envelope_hash,
+            ReceiptStatus::Failed {
+                code: "ledger.op_failed".to_owned(),
+            },
+            Some(1_001),
+        )
+        .unwrap();
+    let settled = RotatedSettlement {
+        _home: home,
+        _rpc: rpc,
+        server,
+        profile,
+        tx_hash,
+    };
+    status(&settled).await;
+    assert_eq!(
+        crate::common::rows_of_kind(
+            &crate::common::audit_rows(&settled.profile),
+            "value_action_failed"
+        )
+        .len(),
+        1,
+        "the status run settles the failed receipt with one row"
+    );
+    let profile = &settled.profile;
     let access =
-        stellar_agent_network::keyring::keyed_audit_access(&profile, &name, BindingCheck::Enforce)
+        stellar_agent_network::keyring::keyed_audit_access(profile, &name, BindingCheck::Enforce)
             .unwrap();
     let writer =
         AuditWriterRegistry::get_or_open_keyed(&name, &profile.audit_log_path, access).unwrap();
@@ -106,17 +125,11 @@ async fn settle_then_rotate(seed: [u8; 32]) -> RotatedSettlement {
         .unwrap();
     drop(threshold);
     assert_eq!(
-        crate::common::rows_of_kind(&archive_rows(&profile), "value_action_submitted").len(),
+        crate::common::rows_of_kind(&archive_rows(profile), "value_action_failed").len(),
         1,
         "the settled row sits in an archive"
     );
-    RotatedSettlement {
-        _home: home,
-        _rpc: rpc,
-        server,
-        profile,
-        tx_hash: json["data"]["txHash"].as_str().unwrap().to_owned(),
-    }
+    settled
 }
 
 /// Every row of every archive of the profile's log, newest archive first.
@@ -134,10 +147,10 @@ fn archive_rows(profile: &Profile) -> Vec<serde_json::Value> {
 }
 
 /// The settled rows across the archives and the active file.
-fn submitted_rows_everywhere(profile: &Profile) -> usize {
+fn settled_rows_everywhere(profile: &Profile) -> usize {
     let mut rows = archive_rows(profile);
     rows.extend(crate::common::audit_rows(profile));
-    crate::common::rows_of_kind(&rows, "value_action_submitted").len()
+    crate::common::rows_of_kind(&rows, "value_action_failed").len()
 }
 
 /// Runs the status tool for the settled submission; it must not refuse.
@@ -158,7 +171,7 @@ async fn status(settled: &RotatedSettlement) {
 async fn a_status_rerun_after_rotation_writes_no_duplicate_settled_row() {
     let settled = settle_then_rotate([0x8a; 32]).await;
     status(&settled).await;
-    assert_eq!(submitted_rows_everywhere(&settled.profile), 1);
+    assert_eq!(settled_rows_everywhere(&settled.profile), 1);
 }
 
 /// A status run over a broken retained history refuses at the keyed
@@ -182,10 +195,10 @@ async fn a_status_run_over_a_broken_archive_writes_no_settled_row() {
     assert!(
         crate::common::rows_of_kind(
             &crate::common::audit_rows(&settled.profile),
-            "value_action_submitted"
+            "value_action_failed"
         )
         .is_empty(),
         "no settled row is appended to the active file"
     );
-    assert_eq!(submitted_rows_everywhere(&settled.profile), 1);
+    assert_eq!(settled_rows_everywhere(&settled.profile), 1);
 }

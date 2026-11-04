@@ -335,7 +335,7 @@ pub(super) const WIRE_VERSION_LEDGER: u32 = 4;
 /// A file written by a newer build carries records this one cannot account
 /// for, so it is refused rather than read with the fields it happens to
 /// recognise.
-pub(super) const WIRE_VERSION_MAX: u32 = 6;
+pub(super) const WIRE_VERSION_MAX: u32 = 7;
 
 /// Wire version binding the accounting network on every snapshot.
 pub(super) const WIRE_VERSION_CHAIN: u32 = 5;
@@ -343,8 +343,33 @@ pub(super) const WIRE_VERSION_CHAIN: u32 = 5;
 /// Wire version carrying durable signing claims.
 pub(super) const WIRE_VERSION_CLAIM: u32 = 6;
 
+/// Wire version carrying conservative exposure accounting.
+pub(super) const WIRE_VERSION_EXPOSURE: u32 = 7;
+
 fn select_wire_version(wire: &WireFile) -> u32 {
     if wire
+        .entries
+        .iter()
+        .flat_map(|bucket| &bucket.records)
+        .any(|record| {
+            !matches!(
+                record.status,
+                RecordStatus::Confirmed | RecordStatus::Pending
+            ) || record.submission_anchor.is_some()
+                || record.execution_bound.is_some()
+                || record.observed_at_ms.is_some()
+                || record.reported_chain_time.is_some()
+                || record.accounting_until_ms.is_some()
+                || record.admitted_window_ms.is_some()
+                || record.acknowledged_unbounded.is_some()
+        })
+        || wire.authorizations.iter().any(|auth| {
+            matches!(&auth.consumption, Some(ledger::ConsumptionBinding::Transaction(binding))
+                if binding.submission_anchor.is_some())
+        })
+    {
+        WIRE_VERSION_EXPOSURE
+    } else if wire
         .authorizations
         .iter()
         .any(|auth| auth.claimed_ms.is_some())
@@ -392,6 +417,12 @@ pub(super) enum RecordStatus {
     Confirmed,
     /// A signed transaction was sent and its outcome is not known yet.
     Pending,
+    /// A reported success retains uncertain exposure through its accounting horizon.
+    Exposure,
+    /// All affected accounting horizons elapsed; the chain outcome stays unknown.
+    AccountingExpired,
+    /// An operator records and accepts indefinite execution and uncounted spend.
+    OperatorCleared,
 }
 
 /// The canonical network and the hash of its signing passphrase.
@@ -454,6 +485,139 @@ impl ChainScope {
     }
 }
 
+/// An independently checked submission observation, bound to its chain and subject.
+///
+/// An anchor is built from a checked cross-check witness, or read back from
+/// the authenticated window file. It serializes for that file, and no public
+/// path deserializes one: forged JSON cannot become witness provenance.
+///
+/// ```compile_fail,E0277
+/// use stellar_agent_network::policy_state::SubmissionAnchor;
+/// fn forge(json: &str) -> SubmissionAnchor {
+///     serde_json::from_str(json).unwrap()
+/// }
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct SubmissionAnchor {
+    chain_scope: ChainScope,
+    ledger: u32,
+    observed_at_ms: u64,
+    witness_authority: String,
+    witness_binding: [u8; 32],
+    subject: [u8; 32],
+}
+
+/// The stored form of a [`SubmissionAnchor`], read only inside the
+/// authenticated window-file load.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoredSubmissionAnchor {
+    chain_scope: ChainScope,
+    ledger: u32,
+    observed_at_ms: u64,
+    witness_authority: String,
+    witness_binding: [u8; 32],
+    subject: [u8; 32],
+}
+
+impl From<StoredSubmissionAnchor> for SubmissionAnchor {
+    fn from(stored: StoredSubmissionAnchor) -> Self {
+        Self {
+            chain_scope: stored.chain_scope,
+            ledger: stored.ledger,
+            observed_at_ms: stored.observed_at_ms,
+            witness_authority: stored.witness_authority,
+            witness_binding: stored.witness_binding,
+            subject: stored.subject,
+        }
+    }
+}
+
+/// Serde readers for anchors inside the authenticated window-file load.
+///
+/// Only the window file's own record and authorization types name these, so
+/// an anchor is deserialized only from bytes whose HMAC tag and generation
+/// the load verifies.
+pub(super) mod stored_anchor {
+    use serde::{Deserialize as _, Deserializer};
+
+    use super::{StoredSubmissionAnchor, SubmissionAnchor};
+
+    /// Reads an optional stored anchor.
+    pub(in crate::policy_state) fn option<'de, D: Deserializer<'de>>(
+        d: D,
+    ) -> Result<Option<SubmissionAnchor>, D::Error> {
+        Ok(Option::<StoredSubmissionAnchor>::deserialize(d)?.map(SubmissionAnchor::from))
+    }
+
+    /// Reads an optional boxed stored anchor.
+    pub(in crate::policy_state) fn boxed_option<'de, D: Deserializer<'de>>(
+        d: D,
+    ) -> Result<Option<Box<SubmissionAnchor>>, D::Error> {
+        Ok(option(d)?.map(Box::new))
+    }
+}
+
+impl SubmissionAnchor {
+    pub(super) fn matches(&self, scope: ChainScope, subject: [u8; 32]) -> bool {
+        self.chain_scope == scope && self.subject == subject && self.ledger > 0
+    }
+
+    #[cfg(feature = "mainnet-write")]
+    pub(crate) fn from_witness(
+        chain_scope: ChainScope,
+        witness: &crate::cross_check::CrossCheckWitness,
+        expected_subject: [u8; 32],
+        observed_at_ms: u64,
+    ) -> Option<Self> {
+        (witness.subject() == Some(expected_subject) && witness.oracle_ledger() > 0).then(|| Self {
+            chain_scope,
+            ledger: witness.oracle_ledger(),
+            observed_at_ms,
+            witness_authority: witness.authority().to_owned(),
+            witness_binding: witness.fact_digest(),
+            subject: expected_subject,
+        })
+    }
+}
+
+/// A checked accounting transition bound to one authenticated generation.
+///
+/// Only the store constructs decisions after checking the evidence and chain.
+/// A reservation identifier alone cannot erase capacity.
+///
+/// ```compile_fail
+/// use stellar_agent_network::policy_state::PersistedWindowStore;
+/// use stellar_agent_core::profile::schema::Profile;
+/// fn erase(store: &PersistedWindowStore, profile: &Profile, id: &str) {
+///     store.release(profile, id).unwrap();
+/// }
+/// ```
+///
+/// Its fields are private, so a caller cannot assemble one, nor point a
+/// checked decision at another reservation:
+///
+/// ```compile_fail,E0451
+/// use stellar_agent_network::policy_state::AccountingDecision;
+/// fn retarget(decision: AccountingDecision, id: String) -> AccountingDecision {
+///     AccountingDecision { id, ..decision }
+/// }
+/// ```
+#[derive(Debug)]
+pub struct AccountingDecision {
+    chain_scope: ChainScope,
+    id: String,
+    generation: u64,
+    evidence: AccountingEvidence,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum AccountingEvidence {
+    PreExposureCancellation,
+    Expired { observed_at_ms: u64 },
+    OperatorOverride { acknowledge_unbounded: bool },
+}
+
 /// One `(timestamp_ms, amount)` record within a bucket, plus the identity of
 /// the submission that reserved it.
 ///
@@ -463,6 +627,24 @@ impl ChainScope {
 pub(super) struct WireRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) chain_scope: Option<ChainScope>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "stored_anchor::option"
+    )]
+    pub(super) submission_anchor: Option<SubmissionAnchor>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) execution_bound: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) observed_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) reported_chain_time: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) accounting_until_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) admitted_window_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) acknowledged_unbounded: Option<bool>,
     pub(super) ts_ms: u64,
     #[serde(with = "i128_decimal_str")]
     pub(super) amount: i128,
@@ -489,9 +671,7 @@ pub(super) struct WireRecord {
     /// When the reservation was taken, in unix milliseconds.
     #[serde(default)]
     pub(super) pending_since_ms: u64,
-    /// The endpoint's latest ledger when the reservation was taken, compared
-    /// against the endpoint's retention floor to tell "the endpoint never saw
-    /// it" apart from "the endpoint no longer remembers it".
+    /// A primary ledger observation with no independent witness authority.
     #[serde(default)]
     pub(super) submission_ledger: u32,
     /// An orphan beyond retention requires an operator decision.
@@ -507,6 +687,13 @@ impl WireRecord {
     pub(super) fn confirmed_defaults() -> Self {
         Self {
             chain_scope: None,
+            submission_anchor: None,
+            execution_bound: None,
+            observed_at_ms: None,
+            reported_chain_time: None,
+            accounting_until_ms: None,
+            admitted_window_ms: None,
+            acknowledged_unbounded: None,
             ts_ms: 0,
             amount: 0,
             id: String::new(),
@@ -530,6 +717,8 @@ impl WireRecord {
 pub struct SubmissionHold {
     /// The authenticated network on which the debit is admitted.
     pub chain_scope: ChainScope,
+    /// Independently checked provenance; absence never inherits a receipt's ledger.
+    pub submission_anchor: Option<SubmissionAnchor>,
     /// The submission's envelope hash, 64 lowercase hex characters.
     pub id: String,
     /// The transaction hash to reconcile against, 64 lowercase hex characters.
@@ -555,29 +744,33 @@ pub struct ReconcileReport {
     pub examined: usize,
     /// RPC calls charged to this pass, including its shared observations.
     pub rpc_calls: usize,
-    /// Reservations confirmed by a `SUCCESS` answer.
+    /// Success reports observed while conservative accounting remains in force.
     pub confirmed: usize,
-    /// Reservations released, either by a `FAILED` answer or on chain
-    /// evidence that the transaction can no longer apply.
+    /// Reservations whose conservative accounting horizons expire.
     pub released: usize,
     /// Reservations left standing because the answers settled nothing, an
     /// endpoint failure included.
     pub kept_pending: usize,
-    /// Receipt writes that failed; their reservations remain pending for a later pass.
+    /// Receipt reads and writes that failed; their reservations remain pending
+    /// for a later pass.
     pub receipt_write_failed: usize,
-    /// The first receipt-store error that prevented an outcome from being recorded.
+    /// The first receipt-store error, of a read or a write, that prevented an
+    /// outcome from being recorded.
     pub receipt_write_error: Option<String>,
     /// Reservations whose transaction the endpoint no longer remembers, so
     /// `NOT_FOUND` proves nothing. Their receipts are marked ambiguous without
-    /// release evidence and the reservations stand until an operator resolves
-    /// them.
+    /// release evidence, except a receipt that keeps its recorded network
+    /// answer (see [`Self::unrecorded`]), and the reservations stand until an
+    /// operator resolves them.
     pub retention_expired: usize,
-    /// The submissions the pass settled, in the order it settled them: one
-    /// per definitive answer, and one per release on chain evidence.
-    ///
-    /// The pass holds no audit writer of its own, so it reports what it
-    /// settled and the caller writes the value-action row each one is owed.
+    /// Accounting dispositions in pass order. Endpoint reports supply no
+    /// authenticated outcome, and accounting expiry owes no failed audit row.
     pub settled: Vec<SettledSubmission>,
+    /// Endpoint answers the pass did not record, in pass order: the receipt
+    /// of an untimed authenticated hold already records a network answer
+    /// (`success`, `failed` or `reorged`), and that answer stands. Each is
+    /// also counted in [`Self::confirmed`] or [`Self::retention_expired`].
+    pub unrecorded: Vec<UnrecordedAnswer>,
     /// The first unusable transaction, health or account read. An absent source
     /// account leaves its sequence unknown without setting this field. A ledger-time
     /// failure counts only when a sent, timed reservation needs that observation.
@@ -678,24 +871,66 @@ impl ReconcileFailure {
     }
 }
 
-/// One submission a reconciliation pass settled.
+/// One accounting disposition recorded by a reconciliation pass.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SettledSubmission {
     /// The envelope hash naming the submission record.
     pub envelope_hash: String,
-    /// The transaction the chain answered for, in full.
+    /// The transaction hash, in full.
     pub tx_hash: String,
-    /// The status the receipt now holds: `Success` or `Failed` for a
-    /// definitive answer, `Ambiguous` for a release on chain evidence.
+    /// The receipt disposition. Accounting expiry remains `Ambiguous`.
     pub status: ReceiptStatus,
-    /// The chain evidence of a release whose outcome is unknown; `None` for a
-    /// definitive answer.
-    ///
-    /// The caller writes the settled `value_action_failed` row under the
-    /// evidence's wire code.
+    /// The accounting disposition or observation. It owes no failed audit row.
     pub release_code: Option<ReleaseEvidence>,
-    /// The ledger the transaction confirmed in, when it did.
+    /// An endpoint-reported ledger, when available.
     pub ledger: Option<u32>,
+}
+
+/// Wire code of [`ReportedAnswer::Success`].
+pub const REPORTED_SUCCESS_CODE: &str = "submission.reported_success";
+
+/// Wire code of [`ReportedAnswer::RetentionExpired`].
+pub const RETENTION_EXPIRED_CODE: &str = "submission.retention_expired";
+
+/// An endpoint answer a reconciliation pass reports without recording it on
+/// the receipt.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReportedAnswer {
+    /// The endpoint, or on mainnet the oracle, reports the transaction
+    /// `SUCCESS`.
+    Success,
+    /// The endpoint reports `NOT_FOUND` and the submission ledger is below its
+    /// retention floor, so the answer does not establish the transaction's outcome.
+    RetentionExpired,
+}
+
+impl ReportedAnswer {
+    /// Returns the stable wire code for this answer:
+    /// [`REPORTED_SUCCESS_CODE`] or [`RETENTION_EXPIRED_CODE`].
+    #[must_use]
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::Success => REPORTED_SUCCESS_CODE,
+            Self::RetentionExpired => RETENTION_EXPIRED_CODE,
+        }
+    }
+}
+
+/// An endpoint answer a reconciliation pass did not record, because the
+/// receipt of an untimed authenticated hold already records a network answer.
+///
+/// Untimed bytes can apply for as long as their sequence stays unconsumed, so
+/// no endpoint report settles their exposure, and the receipt's recorded
+/// answer is not replaced by a later one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnrecordedAnswer {
+    /// The envelope hash naming the submission record.
+    pub envelope_hash: String,
+    /// The status the receipt records and keeps.
+    pub recorded: ReceiptStatus,
+    /// What the endpoint answers now.
+    pub answer: ReportedAnswer,
 }
 
 /// One `StateKey` bucket (everything but the profile name, which is implied
@@ -1123,10 +1358,21 @@ impl PersistedWindowStore {
                 entry.window_secs,
             );
             for record in entry.records {
-                let appended = if record.status == RecordStatus::Pending {
-                    dest.append_pending(&key, record.ts_ms, record.amount)
-                } else {
+                let appended = if is_exposure(&record) {
+                    let accounting_at = execution_bound(&record)
+                        .map(|bound| bound.max(record.observed_at_ms.unwrap_or(0)));
+                    dest.append_exposure(
+                        &key,
+                        record.ts_ms,
+                        record.amount,
+                        &record.id,
+                        accounting_at,
+                        exposure_horizon(&record, entry.window_secs),
+                    )
+                } else if record.status == RecordStatus::Confirmed {
                     dest.append(&key, record.ts_ms, record.amount)
+                } else {
+                    continue;
                 };
                 appended.map_err(|e| WindowStoreError::Invalid {
                     detail: format!("in-memory store append failed: {e}"),
@@ -1235,7 +1481,7 @@ impl PersistedWindowStore {
     /// A reservation counts toward every window criterion exactly as confirmed
     /// spend does: the transaction has been sent and may apply, so the
     /// operator's cap has to hold against it. It is settled by
-    /// [`Self::confirm`], [`Self::release`], or a reconciliation pass.
+    /// [`Self::confirm`], [`Self::apply_accounting_decision`], or a reconciliation pass.
     ///
     /// # Admission
     ///
@@ -1281,6 +1527,13 @@ impl PersistedWindowStore {
         let (key, mint_outcome) = self.load_or_mint_key(profile)?;
         let gen_entry = generation_entry_ref(profile);
         let mut wire = self.read_verified(profile, &key, &gen_entry)?;
+        if let Some(anchor) = &reservation.submission_anchor
+            && (anchor.chain_scope != reservation.chain_scope
+                || stellar_agent_core::hex::decode_hex32(&reservation.tx_hash).ok()
+                    != Some(anchor.subject))
+        {
+            return Err(WindowStoreError::ChainUnverifiable);
+        }
         if wire.chain_scope != Some(reservation.chain_scope) {
             return Err(WindowStoreError::ChainMismatch);
         }
@@ -1309,7 +1562,18 @@ impl PersistedWindowStore {
                 max_time: reservation.max_time,
                 pending_since_ms: reservation.pending_since_ms,
                 submission_ledger: reservation.submission_ledger,
+                submission_anchor: reservation.submission_anchor.clone(),
                 operator_required: false,
+                execution_bound: (reservation.max_time > 0)
+                    .then(|| reservation.max_time.saturating_mul(1000)),
+                admitted_window_ms: Some(entry.key().window_secs().saturating_mul(1000)),
+                accounting_until_ms: (reservation.max_time > 0).then(|| {
+                    reservation
+                        .max_time
+                        .saturating_mul(1000)
+                        .saturating_add(entry.key().window_secs().saturating_mul(1000))
+                }),
+                ..WireRecord::confirmed_defaults()
             });
         }
 
@@ -1318,18 +1582,9 @@ impl PersistedWindowStore {
         Ok(mint_outcome)
     }
 
-    /// Marks every record held by reservation `id` confirmed.
-    ///
-    /// Confirmed spend ages from the applying ledger's close time, and never
-    /// from a time before the record was taken: a transaction applies after
-    /// it was sent, so a reported close time earlier than the record's own
-    /// timestamp is not one the chain can produce, and taking it would date
-    /// the spend out of its window at once. A close time later than the
-    /// record's timestamp is kept as received. A missing or invalid close
-    /// time leaves the hold pending because its age is unknown.
+    /// Records a success report without treating its timestamp as accounting authority.
     ///
     /// # Errors
-    ///
     /// See [`WindowStoreError`].
     pub fn confirm(
         &self,
@@ -1337,24 +1592,32 @@ impl PersistedWindowStore {
         id: &str,
         created_at: Option<i64>,
     ) -> Result<(), WindowStoreError> {
-        self.chain_scope(profile)?;
-        let close_ms = created_at
-            .and_then(|time| u64::try_from(time).ok())
-            .filter(|time| *time > 0)
-            .and_then(|time| time.checked_mul(1_000));
-        let Some(close_ms) = close_ms else {
-            tracing::warn!(
-                "window confirm: applying ledger close time unavailable; reservation stays pending"
-            );
-            return Ok(());
-        };
+        self.observe_success(profile, id, created_at, now_ms()?)
+    }
+
+    fn observe_success(
+        &self,
+        profile: &Profile,
+        id: &str,
+        reported_chain_time: Option<i64>,
+        observed_at_ms: u64,
+    ) -> Result<(), WindowStoreError> {
         self.rewrite_records(profile, |wire| {
             let mut touched = false;
             for bucket in &mut wire.entries {
                 for record in &mut bucket.records {
                     if record.id == id && record.status == RecordStatus::Pending {
-                        record.status = RecordStatus::Confirmed;
-                        record.ts_ms = close_ms.max(record.ts_ms);
+                        record.status = RecordStatus::Exposure;
+                        record.observed_at_ms = Some(observed_at_ms);
+                        record.reported_chain_time = reported_chain_time;
+                        record.execution_bound = execution_bound(record);
+                        record.admitted_window_ms = Some(
+                            record
+                                .admitted_window_ms
+                                .unwrap_or(0)
+                                .max(bucket.window_secs.saturating_mul(1000)),
+                        );
+                        record.accounting_until_ms = exposure_horizon(record, bucket.window_secs);
                         touched = true;
                     }
                 }
@@ -1363,33 +1626,144 @@ impl PersistedWindowStore {
         })
     }
 
-    /// Removes every pending record held by reservation `id`.
+    fn accounting_decision(
+        &self,
+        profile: &Profile,
+        id: &str,
+        evidence: AccountingEvidence,
+    ) -> Result<AccountingDecision, WindowStoreError> {
+        let wire = self
+            .read_for_inspection(profile)?
+            .ok_or(WindowStoreError::GenerationMismatch)?;
+        check_accounting_evidence(&wire, id, evidence)?;
+        Ok(AccountingDecision {
+            chain_scope: wire
+                .chain_scope
+                .ok_or(WindowStoreError::ChainUnverifiable)?,
+            id: id.to_owned(),
+            generation: wire.generation,
+            evidence,
+        })
+    }
+
+    /// The cancellation of a reservation whose signed bytes were never sent.
     ///
-    /// Called where the transaction can no longer apply: the network refused
-    /// it, it failed on-chain, reconciliation established that it cannot
-    /// land, or an operator acknowledged it. The reserved amount stops
-    /// counting against the window.
-    ///
-    /// A confirmed record carrying `id` is kept: it is spend the chain
-    /// applied, and it counts until it ages out of its window. A release for a
-    /// reservation that holds no pending record changes nothing and writes
-    /// nothing.
+    /// Only the pre-send unwind of the submission that took the reservation
+    /// may ask for it: that caller alone knows the bytes never left this
+    /// process. The store checks what it can see, that every record of the
+    /// reservation is still pending with no observed success; it cannot see
+    /// whether anything was sent, so no post-send path may call this.
     ///
     /// # Errors
+    /// Refuses a reservation with an exposure observation or invalid state.
+    pub(crate) fn pre_exposure_cancellation(
+        &self,
+        profile: &Profile,
+        id: &str,
+    ) -> Result<AccountingDecision, WindowStoreError> {
+        self.accounting_decision(profile, id, AccountingEvidence::PreExposureCancellation)
+    }
+
+    /// Checks an explicit operator acknowledgement against authenticated exposure.
     ///
-    /// See [`WindowStoreError`].
-    pub fn release(&self, profile: &Profile, id: &str) -> Result<(), WindowStoreError> {
-        self.rewrite_records(profile, |wire| {
-            let before: usize = wire.entries.iter().map(|b| b.records.len()).sum();
-            for bucket in &mut wire.entries {
+    /// Bounded spending stays charged until its horizon. Untimed exposure, on
+    /// every network and whatever an endpoint reported about it, requires
+    /// `acknowledge_unbounded`: the operator accepts indefinite possible
+    /// execution and uncounted spend. The decision records that acceptance
+    /// with the transition that releases the capacity.
+    ///
+    /// # Errors
+    /// Refuses a missing acknowledgement, an unelapsed execution bound, or
+    /// invalid state.
+    pub fn operator_clear_decision(
+        &self,
+        profile: &Profile,
+        id: &str,
+        acknowledge: bool,
+        acknowledge_unbounded: bool,
+    ) -> Result<AccountingDecision, WindowStoreError> {
+        if !acknowledge {
+            return Err(WindowStoreError::Invalid {
+                detail: "operator acknowledgement required".into(),
+            });
+        }
+        self.accounting_decision(
+            profile,
+            id,
+            AccountingEvidence::OperatorOverride {
+                acknowledge_unbounded,
+            },
+        )
+    }
+
+    /// Applies a checked decision under the store lock and records its disposition.
+    ///
+    /// # Errors
+    /// Refuses a changed chain, generation, or evidence. See [`WindowStoreError`].
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "applying a decision consumes its generation-bound authority"
+    )]
+    pub fn apply_accounting_decision(
+        &self,
+        profile: &Profile,
+        decision: AccountingDecision,
+    ) -> Result<(), WindowStoreError> {
+        self.ensure_parent_dir()?;
+        let _lock = WindowStoreLock::acquire_for_with_retry(
+            &self.path,
+            &profile.policy_window_state_key_id,
+        )?;
+        let (key, _) = self.load_or_mint_key(profile)?;
+        let gen_entry = generation_entry_ref(profile);
+        let mut wire = self.read_verified(profile, &key, &gen_entry)?;
+        if wire.chain_scope != Some(decision.chain_scope) {
+            return Err(WindowStoreError::ChainMismatch);
+        }
+        if wire.generation != decision.generation {
+            return Err(WindowStoreError::GenerationMismatch);
+        }
+        check_accounting_evidence(&wire, &decision.id, decision.evidence)?;
+        let original = wire.clone();
+        for bucket in &mut wire.entries {
+            if matches!(
+                decision.evidence,
+                AccountingEvidence::PreExposureCancellation
+            ) {
                 bucket
                     .records
-                    .retain(|r| r.id != id || r.status != RecordStatus::Pending);
+                    .retain(|r| r.id != decision.id || !is_exposure(r));
+            } else {
+                for record in &mut bucket.records {
+                    if record.id == decision.id && is_exposure(record) {
+                        record.status = match decision.evidence {
+                            AccountingEvidence::OperatorOverride {
+                                acknowledge_unbounded,
+                            } => {
+                                record.acknowledged_unbounded = Some(acknowledge_unbounded);
+                                if execution_bound(record).is_none() {
+                                    RecordStatus::OperatorCleared
+                                } else {
+                                    record.status
+                                }
+                            }
+                            _ => RecordStatus::AccountingExpired,
+                        };
+                    }
+                }
             }
-            wire.entries.retain(|b| !b.records.is_empty());
-            let after: usize = wire.entries.iter().map(|b| b.records.len()).sum();
-            after != before
-        })
+        }
+        self.commit_generation(&key, &gen_entry, original, wire)
+    }
+
+    #[cfg(test)]
+    pub(super) fn release(&self, profile: &Profile, id: &str) -> Result<(), WindowStoreError> {
+        self.chain_scope(profile)?;
+        if !self.holds_reservation(profile, id)? {
+            return Ok(());
+        }
+        let decision = self.pre_exposure_cancellation(profile, id)?;
+        self.apply_accounting_decision(profile, decision)
     }
 
     /// Keeps an orphan's authenticated identity and debit while excluding it
@@ -1458,70 +1832,20 @@ impl PersistedWindowStore {
         collect_pending(&wire)
     }
 
-    /// Settles up to `budget` reservations that have stood at least
-    /// [`RECONCILE_MIN_AGE_MS`], oldest first, on chain answers.
+    /// Reconciles up to `budget` reservations that have stood at least
+    /// [`RECONCILE_MIN_AGE_MS`], oldest first, within the RPC budget.
     ///
-    /// Per reservation, `getTransaction` answers of `client`, the primary
-    /// endpoint:
+    /// Success preserves exposure through the later of first observation and the
+    /// signed deadline, plus every admitted window. Endpoint failure and absence
+    /// retain possible spending. Legacy anchors provide no independent provenance.
+    /// Accounting expiry records an unknown outcome and owes no failed audit row.
+    /// Untimed exposure requires an explicit operator acknowledgement.
     ///
-    /// - `SUCCESS` confirms the reservation and finalizes the receipt.
-    /// - `FAILED` releases the reservation and finalizes the receipt failed.
-    /// - `NOT_FOUND` is only evidence when the endpoint would still remember
-    ///   the transaction. When the reservation's submission ledger predates
-    ///   the endpoint's retention floor it proves nothing, so the reservation
-    ///   stands and the receipt is marked ambiguous, without release evidence,
-    ///   for an operator to resolve. A submission ledger of 0 cannot be
-    ///   compared with the floor, so that reservation stands as well.
-    ///   Otherwise the reservation is released when the source account's
-    ///   sequence has reached the one the transaction needs, or an observed
-    ///   ledger close time is strictly past its nonzero time bound. Both arms
-    ///   require a fresh `NOT_FOUND`; a fresh definitive answer settles the
-    ///   spend. Missing chain time closes only the time arm.
-    /// - A release on that evidence marks the receipt ambiguous and records
-    ///   the evidence on it ([`ReleaseEvidence::SequenceConsumed`] or
-    ///   [`ReleaseEvidence::TimeBoundPassed`]). A missing receipt is restored
-    ///   from the reservation's identity first, the way a definitive answer
-    ///   restores one, and the release is reported in
-    ///   [`ReconcileReport::settled`] so the caller writes its settled row.
-    ///
-    /// The receipt is never evidence. A receipt that already records release
-    /// evidence, from a release whose window write did not complete, is
-    /// settled by the rule above like any other: both release conditions
-    /// stay true once they hold, so the evidence is found again while the
-    /// endpoint holds the submission's ledger range, and the release then
-    /// carries the evidence the receipt recorded.
-    ///
-    /// # Mainnet
-    ///
-    /// On a mainnet profile the primary endpoint's `FAILED` and `NOT_FOUND`
-    /// settle nothing by themselves; `oracle`, the profile's oracle endpoint,
-    /// is asked for the same hash. Before its first answer counts, the pass
-    /// checks once that the oracle reports the mainnet passphrase, with one
-    /// `getNetwork` request charged to the pass's allowance and not retried;
-    /// an oracle that reports another
-    /// network, or whose identity cannot be read, settles nothing in that
-    /// pass. Its `SUCCESS` confirms and its `FAILED` releases, as above. Its
-    /// `NOT_FOUND` runs the `NOT_FOUND` rule above against the oracle alone:
-    /// the oracle's retention floor, its latest ledger close time, its
-    /// account sequence and its fresh answer. With no oracle (`oracle` is
-    /// `None`), an oracle that fails the identity check, or an oracle that
-    /// cannot answer, the reservation stands and the failure is reported in
-    /// [`ReconcileReport::endpoint_failure`], as
-    /// [`ReconcileFailureKind::OracleNotConfigured`] when there is no oracle.
-    /// The primary's `SUCCESS` confirms as on any chain. `oracle` is not read
-    /// for any other profile.
-    ///
-    /// An endpoint that cannot answer leaves the reservation standing and is
-    /// reported in [`ReconcileReport::endpoint_failure`]. Nothing here
-    /// releases a reservation on a transport error.
-    ///
-    /// `now_ms` is the caller's clock, the same seam every other store
-    /// operation takes it through.
+    /// The authenticated chain scope must match the profile before any endpoint
+    /// read or accounting transition. Mainnet oracle identity checks remain required.
     ///
     /// # Errors
-    ///
-    /// See [`WindowStoreError`]. A per-reservation endpoint failure is not an
-    /// error: it leaves that reservation standing and the pass continues.
+    /// See [`WindowStoreError`]. Endpoint failures leave reservations standing.
     pub async fn reconcile_due(
         &self,
         profile: &Profile,
@@ -1568,12 +1892,22 @@ impl PersistedWindowStore {
                 None => HashMap::new(),
             };
 
-        let due: Vec<SubmissionHold> = collect_pending(&wire)?
-            .into_iter()
-            .filter(|r| now_ms.saturating_sub(r.pending_since_ms) >= RECONCILE_MIN_AGE_MS)
-            .filter(|r| !r.operator_required && !outcome_already_unknown(&known, &r.id))
-            .take(budget)
-            .collect();
+        let due: Vec<SubmissionHold> =
+            collect_pending(&wire)?
+                .into_iter()
+                .filter(|r| now_ms.saturating_sub(r.pending_since_ms) >= RECONCILE_MIN_AGE_MS)
+                .filter(|r| {
+                    accounting_expired(&wire, &r.id, now_ms)
+                        || (!r.operator_required
+                            && !outcome_already_unknown(&known, &r.id)
+                            && wire.entries.iter().flat_map(|bucket| &bucket.records).any(
+                                |record| {
+                                    record.id == r.id && record.status == RecordStatus::Pending
+                                },
+                            ))
+                })
+                .take(budget)
+                .collect();
 
         let mut report = ReconcileReport::default();
         let mut pass = ReconcilePass::new(budget, profile.chain_id.is_mainnet());
@@ -1581,7 +1915,15 @@ impl PersistedWindowStore {
         for reservation in due {
             report.examined += 1;
             let settlement = self
-                .settle_reservation(profile, client, oracle, receipts, &reservation, &mut pass)
+                .settle_reservation(
+                    profile,
+                    client,
+                    oracle,
+                    receipts,
+                    &reservation,
+                    &mut pass,
+                    now_ms,
+                )
                 .await?;
             record_settlement(&mut report, &reservation, settlement);
         }
@@ -1617,10 +1959,10 @@ impl PersistedWindowStore {
         oracle: Option<&crate::client::StellarRpcClient>,
         receipts: Option<&ReceiptStore>,
         id: &str,
-        _now_ms: u64,
+        now_ms: u64,
     ) -> Result<ReconcileReport, WindowStoreError> {
         let pass = ReconcilePass::new(1, profile.chain_id.is_mainnet());
-        self.reconcile_one_in(profile, client, oracle, receipts, id, pass)
+        self.reconcile_one_in(profile, client, oracle, receipts, id, pass, now_ms)
             .await
     }
 
@@ -1649,7 +1991,7 @@ impl PersistedWindowStore {
         oracle: Option<MainnetOracle<'_>>,
         receipts: Option<&ReceiptStore>,
         id: &str,
-        _now_ms: u64,
+        now_ms: u64,
         oracle_deadline: tokio::time::Instant,
     ) -> Result<ReconcileReport, WindowStoreError> {
         let pass = ReconcilePass::new(1, profile.chain_id.is_mainnet())
@@ -1661,12 +2003,18 @@ impl PersistedWindowStore {
             receipts,
             id,
             pass,
+            now_ms,
         )
         .await
     }
 
     /// The single-submission pass of [`Self::reconcile_one`] and
-    /// [`Self::reconcile_one_within`], run with `pass`.
+    /// [`Self::reconcile_one_within`], run with `pass` at the caller's
+    /// `now_ms`.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the arguments of reconcile_one plus the pass and the caller's clock"
+    )]
     async fn reconcile_one_in<'o>(
         &self,
         profile: &Profile,
@@ -1675,6 +2023,7 @@ impl PersistedWindowStore {
         receipts: Option<&ReceiptStore>,
         id: &str,
         mut pass: ReconcilePass<'o>,
+        now_ms: u64,
     ) -> Result<ReconcileReport, WindowStoreError> {
         let scope = ChainScope::for_chain(profile.chain_id);
         self.require_chain_scope(profile, &scope)?;
@@ -1693,7 +2042,15 @@ impl PersistedWindowStore {
             ..ReconcileReport::default()
         };
         let settlement = self
-            .settle_reservation(profile, client, oracle, receipts, &reservation, &mut pass)
+            .settle_reservation(
+                profile,
+                client,
+                oracle,
+                receipts,
+                &reservation,
+                &mut pass,
+                now_ms,
+            )
             .await?;
         record_settlement(&mut report, &reservation, settlement);
         report.rpc_calls = pass.spent;
@@ -2029,6 +2386,13 @@ impl PersistedWindowStore {
 
     /// Settles one reservation on chain answers. See [`Self::reconcile_due`]
     /// for the rule this implements.
+    ///
+    /// Accounting expiry is judged at the caller's `now_ms`, the same clock
+    /// the caller's due filter used.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the pass state plus the caller's clock for the expiry check"
+    )]
     async fn settle_reservation<'o>(
         &self,
         profile: &Profile,
@@ -2037,11 +2401,17 @@ impl PersistedWindowStore {
         receipts: Option<&ReceiptStore>,
         reservation: &SubmissionHold,
         pass: &mut ReconcilePass<'o>,
+        now_ms: u64,
     ) -> Result<Settlement, WindowStoreError> {
+        if let Some(settlement) = self.expire_accounting(profile, receipts, reservation, now_ms)? {
+            return Ok(settlement);
+        }
         // The receipt is unauthenticated, so nothing it records releases a
-        // reservation: release evidence it carries is found again on the chain
-        // below. A missing receipt leaves the authenticated reservation as the
-        // submission identity. An unreadable receipt store keeps the hold.
+        // reservation. Endpoint observations below cannot prove failure. A
+        // missing receipt leaves the authenticated reservation as the
+        // submission identity. An unreadable receipt store keeps the hold and
+        // is reported as a receipt failure, so the report refuses the clear
+        // of this submission until a pass reads the store again.
         if let Some(store) = receipts
             && let Err(e) = store.get(&reservation.id)
         {
@@ -2049,7 +2419,9 @@ impl PersistedWindowStore {
                 error = %e,
                 "window reconcile: the receipt store could not be read; the reservation stands"
             );
-            return Ok(Settlement::KeptPending);
+            return Ok(Settlement::ReceiptWriteFailed {
+                error: e.to_string(),
+            });
         }
 
         let Ok(hash_bytes) = stellar_agent_core::hex::decode_hex32(&reservation.tx_hash) else {
@@ -2105,17 +2477,16 @@ impl PersistedWindowStore {
                 .settle_not_found(profile, client, receipts, reservation, pass)
                 .await;
         }
-        self.settle_chain_answer(profile, receipts, reservation, &record)
+        // A success observation is dated on this host's clock, not the caller's.
+        self.settle_chain_answer(profile, receipts, reservation, &record, self::now_ms()?)
     }
 
     /// Settles a mainnet reservation whose primary endpoint answered `FAILED`
     /// or `NOT_FOUND`, on the oracle's answers alone.
     ///
-    /// The oracle's `SUCCESS` and `FAILED` settle as a definitive answer
-    /// does. Its `NOT_FOUND` runs the `NOT_FOUND` rule with the oracle as the
-    /// endpoint, so the retention floor, the chain time, the account sequence
-    /// and the fresh answer are all the oracle's. An oracle read that fails
-    /// keeps the reservation and reports the failure.
+    /// Success records a report and its local observation. Negative answers
+    /// retain capacity. Retention and sequence observations describe uncertainty
+    /// without proving failure. An unavailable oracle leaves the reservation held.
     async fn settle_on_oracle(
         &self,
         profile: &Profile,
@@ -2159,63 +2530,67 @@ impl PersistedWindowStore {
                 .settle_not_found(profile, oracle, receipts, reservation, pass)
                 .await;
         }
-        self.settle_chain_answer(profile, receipts, reservation, &record)
+        self.settle_chain_answer(profile, receipts, reservation, &record, now_ms()?)
     }
 
-    /// Applies a definitive transaction answer to the reservation and receipt.
+    /// Records endpoint success as a report; negative answers retain exposure.
     ///
-    /// A `SUCCESS` answer confirms from its status, ledger and created-at as
-    /// received; only a `FAILED` answer's result XDR is decoded, for its
-    /// failure code.
+    /// The receipt of an untimed hold that records a different network answer
+    /// keeps it, and the success is reported as unrecorded. The window
+    /// records the success observation either way.
     fn settle_chain_answer(
         &self,
         profile: &Profile,
         receipts: Option<&ReceiptStore>,
         reservation: &SubmissionHold,
         record: &TransactionRecord,
+        observed_at_ms: u64,
     ) -> Result<Settlement, WindowStoreError> {
         match record.status() {
             "SUCCESS" => {
-                if let Err(error) = finalize_receipt(
-                    receipts,
-                    reservation,
-                    ReceiptStatus::Success,
-                    record.ledger(),
-                ) {
+                let recorded = match receipts.map(|store| store.get(&reservation.id)).transpose() {
+                    Ok(receipt) => receipt.flatten().map(|receipt| receipt.status),
+                    Err(error) => {
+                        return Ok(Settlement::ReceiptWriteFailed {
+                            error: error.to_string(),
+                        });
+                    }
+                };
+                let standing = recorded.filter(|recorded| {
+                    keeps_network_answer(reservation, recorded, &ReceiptStatus::Success)
+                });
+                if standing.is_none()
+                    && let Err(error) = finalize_receipt(
+                        receipts,
+                        reservation,
+                        ReceiptStatus::Success,
+                        record.ledger(),
+                    )
+                {
                     return Ok(Settlement::ReceiptWriteFailed {
                         error: error.to_string(),
                     });
                 }
-                self.confirm(profile, &reservation.id, record.created_at())?;
-                Ok(Settlement::Confirmed {
-                    ledger: record.ledger(),
+                self.observe_success(
+                    profile,
+                    &reservation.id,
+                    record.created_at(),
+                    observed_at_ms,
+                )?;
+                Ok(match standing {
+                    Some(recorded) => Settlement::AnswerNotRecorded {
+                        recorded,
+                        answer: ReportedAnswer::Success,
+                    },
+                    None => Settlement::Confirmed,
                 })
-            }
-            "FAILED" => {
-                let code = crate::submit::map_failed_record(record).code().to_owned();
-                if let Err(error) = finalize_receipt(
-                    receipts,
-                    reservation,
-                    ReceiptStatus::Failed { code: code.clone() },
-                    None,
-                ) {
-                    return Ok(Settlement::ReceiptWriteFailed {
-                        error: error.to_string(),
-                    });
-                }
-                self.release(profile, &reservation.id)?;
-                Ok(Settlement::Failed { code })
             }
             _ => Ok(Settlement::KeptPending),
         }
     }
 
-    /// The `NOT_FOUND` half of the release rule.
-    ///
-    /// A consumed sequence requires one extra bounded transaction query: the
-    /// reserved transaction can land between the first query and the account
-    /// read. Settling that answer preserves its debit when it consumed its own
-    /// sequence. Only a second `NOT_FOUND` permits sequence-based release.
+    /// Classifies absence and retention observations without refunding spend.
+    /// A fresh success report can follow a sequence or time observation.
     async fn settle_not_found(
         &self,
         profile: &Profile,
@@ -2228,7 +2603,7 @@ impl PersistedWindowStore {
         // retention boundary below cannot be checked against it and a
         // NOT_FOUND carries no information. The reservation stands for the
         // operator.
-        if reservation.submission_ledger == 0 {
+        if reservation.submission_anchor.is_none() && reservation.submission_ledger == 0 {
             return Ok(Settlement::KeptPending);
         }
         // The retention boundary first: an endpoint that no longer holds the
@@ -2239,10 +2614,26 @@ impl PersistedWindowStore {
         let Some(floor) = pass.oldest_ledger else {
             return Ok(Settlement::KeptPending);
         };
-        if reservation.submission_ledger < floor {
+        let anchor_ledger = reservation
+            .submission_anchor
+            .as_ref()
+            .map_or(reservation.submission_ledger, |anchor| anchor.ledger);
+        if anchor_ledger < floor {
             if let Some(receipts) = receipts {
                 match receipts.get(&reservation.id) {
                     Ok(None) => self.mark_operator_required(profile, &reservation.id)?,
+                    Ok(Some(receipt))
+                        if keeps_network_answer(
+                            reservation,
+                            &receipt.status,
+                            &ReceiptStatus::Ambiguous,
+                        ) =>
+                    {
+                        return Ok(Settlement::AnswerNotRecorded {
+                            recorded: receipt.status,
+                            answer: ReportedAnswer::RetentionExpired,
+                        });
+                    }
                     Ok(Some(_)) => {
                         if let Err(error) = finalize_receipt(
                             Some(receipts),
@@ -2255,41 +2646,43 @@ impl PersistedWindowStore {
                             });
                         }
                     }
+                    // An unreadable receipt store leaves the orphan status
+                    // unknown. It is reported as a receipt failure, so the
+                    // report refuses the clear of this submission until a
+                    // pass reads the store again.
                     Err(error) => {
                         tracing::warn!(%error, "window reconcile: receipt read failed; orphan status unknown");
-                        return Ok(Settlement::KeptPending);
+                        return Ok(Settlement::ReceiptWriteFailed {
+                            error: error.to_string(),
+                        });
                     }
                 }
             }
             return Ok(Settlement::RetentionExpired);
         }
 
-        // Only a timed, sent reservation needs the failed ledger observation.
-        // An unsent receipt clears without a ledger time.
-        if reservation.max_time > 0 && pass.chain.is_none() && pass.failure.is_none() {
-            let never_sent = receipts
-                .and_then(|store| store.get(&reservation.id).ok().flatten())
-                .is_some_and(|receipt| !receipt.submitted);
-            if !never_sent {
+        // Only a timed, sent submission needs the failed ledger observation.
+        // An unsent receipt clears without a ledger time. The receipt's own
+        // bound counts here although it is unauthenticated: it can only add an
+        // endpoint failure to report, never release a reservation.
+        if pass.chain.is_none() && pass.failure.is_none() {
+            let receipt = receipts.and_then(|store| store.get(&reservation.id).ok().flatten());
+            let timed = reservation.max_time > 0
+                || receipt.as_ref().is_some_and(|receipt| receipt.max_time > 0);
+            let never_sent = receipt.as_ref().is_some_and(|receipt| !receipt.submitted);
+            if timed && !never_sent {
                 pass.failure = pass.ledger_failure.clone();
             }
         }
         let time_expired = reservation.max_time > 0
-            && reservation.submission_ledger >= floor
-            && reservation.submission_ledger > 0
+            && anchor_ledger >= floor
+            && anchor_ledger > 0
             && pass.chain.is_some_and(|(ledger, close_time)| {
-                reservation.submission_ledger <= ledger && close_time > reservation.max_time
+                anchor_ledger <= ledger && close_time > reservation.max_time
             });
         if time_expired {
             return self
-                .fresh_answer_or_release(
-                    profile,
-                    client,
-                    receipts,
-                    reservation,
-                    pass,
-                    ReleaseEvidence::TimeBoundPassed,
-                )
+                .fresh_answer_after_observation(profile, client, receipts, reservation, pass)
                 .await;
         }
 
@@ -2335,30 +2728,25 @@ impl PersistedWindowStore {
         };
         if account.sequence_number >= reservation.sequence {
             return self
-                .fresh_answer_or_release(
-                    profile,
-                    client,
-                    receipts,
-                    reservation,
-                    pass,
-                    ReleaseEvidence::SequenceConsumed,
-                )
+                .fresh_answer_after_observation(profile, client, receipts, reservation, pass)
                 .await;
         }
 
         Ok(Settlement::KeptPending)
     }
 
-    /// Rechecks the transaction after observing `evidence` that it cannot
-    /// apply.
-    async fn fresh_answer_or_release(
+    /// Rechecks the transaction after a time or sequence observation.
+    ///
+    /// A fresh `NOT_FOUND` keeps the reservation: neither observation proves
+    /// that the transaction cannot apply any more. A fresh `SUCCESS` is
+    /// recorded as a report.
+    async fn fresh_answer_after_observation(
         &self,
         profile: &Profile,
         client: &crate::client::StellarRpcClient,
         receipts: Option<&ReceiptStore>,
         reservation: &SubmissionHold,
         pass: &mut ReconcilePass<'_>,
-        evidence: ReleaseEvidence,
     ) -> Result<Settlement, WindowStoreError> {
         let Ok(hash) = stellar_agent_core::hex::decode_hex32(&reservation.tx_hash) else {
             return Ok(Settlement::KeptPending);
@@ -2393,37 +2781,47 @@ impl PersistedWindowStore {
             }
         };
         if record.status() == "NOT_FOUND" {
-            return self.release_on_evidence(profile, receipts, reservation, evidence);
+            return Ok(Settlement::KeptPending);
         }
-        self.settle_chain_answer(profile, receipts, reservation, &record)
+        self.settle_chain_answer(profile, receipts, reservation, &record, now_ms()?)
     }
 
-    /// Releases a reservation whose transaction can no longer apply, recording
-    /// the receipt as ambiguous with the evidence that released it.
-    ///
-    /// The outcome is ambiguous rather than failed because no
-    /// `TransactionResult` exists for it: what is established is that the
-    /// transaction cannot reach a ledger, which rests on the endpoint's
-    /// answers being honest. The evidence is what the settled audit row
-    /// names, and what lets a later status run write that row when this pass
-    /// could not.
-    fn release_on_evidence(
+    fn expire_accounting(
         &self,
         profile: &Profile,
         receipts: Option<&ReceiptStore>,
         reservation: &SubmissionHold,
-        evidence: ReleaseEvidence,
-    ) -> Result<Settlement, WindowStoreError> {
-        let evidence = match release_receipt(receipts, reservation, evidence) {
-            Ok(evidence) => evidence,
-            Err(error) => {
-                return Ok(Settlement::ReceiptWriteFailed {
-                    error: error.to_string(),
-                });
-            }
+        observed_at_ms: u64,
+    ) -> Result<Option<Settlement>, WindowStoreError> {
+        let Some(wire) = self.read_for_inspection(profile)? else {
+            return Ok(None);
         };
-        self.release(profile, &reservation.id)?;
-        Ok(Settlement::ReleasedOnEvidence { evidence })
+        if !accounting_expired(&wire, &reservation.id, observed_at_ms) {
+            return Ok(None);
+        }
+        let decision = self.accounting_decision(
+            profile,
+            &reservation.id,
+            AccountingEvidence::Expired { observed_at_ms },
+        )?;
+        let needs_receipt = receipts
+            .map(|store| store.get(&reservation.id))
+            .transpose()
+            .map_err(|error| WindowStoreError::Invalid {
+                detail: error.to_string(),
+            })?
+            .flatten()
+            .is_none_or(|receipt| receipt.status.is_operator_clearable());
+        if needs_receipt
+            && let Err(error) =
+                release_receipt(receipts, reservation, ReleaseEvidence::AccountingExpired)
+        {
+            return Ok(Some(Settlement::ReceiptWriteFailed {
+                error: error.to_string(),
+            }));
+        }
+        self.apply_accounting_decision(profile, decision)?;
+        Ok(Some(Settlement::AccountingExpired))
     }
 
     /// Reads and fully verifies the file for inspection, taking no lock.
@@ -2882,10 +3280,17 @@ fn authenticated_scope(wire: &WireFile) -> Result<ChainScope, WindowStoreError> 
         .ok_or(WindowStoreError::ChainUnverifiable)?;
     scope.validate()?;
     for record in wire.entries.iter().flat_map(|bucket| &bucket.records) {
-        if (record.status == RecordStatus::Pending && record.chain_scope.is_none())
+        if (is_exposure(record) && record.chain_scope.is_none())
             || record
                 .chain_scope
                 .is_some_and(|record_scope| record_scope != scope)
+        {
+            return Err(WindowStoreError::ChainUnverifiable);
+        }
+        if let Some(anchor) = &record.submission_anchor
+            && stellar_agent_core::hex::decode_hex32(&record.tx_hash)
+                .ok()
+                .is_none_or(|hash| !anchor.matches(scope, hash))
         {
             return Err(WindowStoreError::ChainUnverifiable);
         }
@@ -2908,7 +3313,7 @@ fn authenticated_scope(wire: &WireFile) -> Result<ChainScope, WindowStoreError> 
 
 /// Checks one snapshot's version and its authorization history.
 ///
-/// Versions 1 through 6 decode. Snapshots below version 4 carry no authorization
+/// Versions 1 through 7 decode. Snapshots below version 4 carry no authorization
 /// history; usable snapshots also require complete authenticated scope.
 fn check_snapshot(wire: &WireFile) -> Result<(), WindowStoreError> {
     if wire.version > WIRE_VERSION_MAX {
@@ -2941,7 +3346,7 @@ pub(super) fn prune_stale(wire: &mut WireFile, now_ms: u64) {
     for bucket in &mut wire.entries {
         bucket
             .records
-            .retain(|r| r.ts_ms >= cutoff || r.status == RecordStatus::Pending);
+            .retain(|r| r.ts_ms >= cutoff || is_exposure(r));
     }
     wire.entries.retain(|b| !b.records.is_empty());
     // Settled authorization history ages out on the same retention; an open
@@ -2965,25 +3370,12 @@ fn outcome_already_unknown(
 /// What one reservation's reconciliation established.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Settlement {
-    /// The transaction reached a ledger; the reservation became real spend.
-    Confirmed {
-        /// The ledger the endpoint reported it in.
-        ledger: Option<u32>,
-    },
-    /// The chain reported the transaction failed; the reservation was
-    /// removed.
-    Failed {
-        /// The wire code of the on-chain failure.
-        code: String,
-    },
-    /// The transaction can no longer apply on chain evidence, and the
-    /// endpoint never reported it; the reservation was removed and the
-    /// outcome is unknown.
-    ReleasedOnEvidence {
-        /// What established that the transaction cannot apply.
-        evidence: ReleaseEvidence,
-    },
-    /// The receipt could not record the outcome; the reservation stands.
+    /// The endpoint reports success; the reservation remains possible spend.
+    Confirmed,
+    /// Accounting ends with the chain outcome unknown.
+    AccountingExpired,
+    /// The receipt store could not be read, or the receipt could not record
+    /// the outcome; the reservation stands.
     ReceiptWriteFailed {
         /// The receipt-store error as displayed to the caller.
         error: String,
@@ -2993,6 +3385,36 @@ enum Settlement {
     /// The endpoint no longer holds the ledger range the submission was made
     /// in, so it cannot answer; the reservation stands for an operator.
     RetentionExpired,
+    /// The receipt of an untimed hold keeps the network answer it records;
+    /// the endpoint's `answer` is reported instead of recorded, and the
+    /// reservation stands.
+    AnswerNotRecorded {
+        /// The status the receipt keeps.
+        recorded: ReceiptStatus,
+        /// What the endpoint answers now.
+        answer: ReportedAnswer,
+    },
+}
+
+/// Whether the receipt of `reservation` keeps its `recorded` status rather
+/// than take the endpoint's `answer`.
+///
+/// An untimed authenticated hold stays the operator's to clear whatever an
+/// endpoint reports, so a pass attempts no status transition on its receipt
+/// once that receipt records a network answer (`Success`, `Failed`,
+/// `Reorged`): the recorded answer stands and the new one is reported. The
+/// same status written again is no transition and is recorded as usual.
+fn keeps_network_answer(
+    reservation: &SubmissionHold,
+    recorded: &ReceiptStatus,
+    answer: &ReceiptStatus,
+) -> bool {
+    reservation.max_time == 0
+        && matches!(
+            recorded,
+            ReceiptStatus::Success | ReceiptStatus::Failed { .. } | ReceiptStatus::Reorged
+        )
+        && recorded != answer
 }
 
 /// Builds the settlement identity of a submission from its receipt, for a
@@ -3015,9 +3437,10 @@ fn reservation_from_receipt(
         tx_hash: receipt.tx_hash,
         source: receipt.source,
         sequence: receipt.sequence,
-        max_time: receipt.max_time,
+        max_time: 0,
         pending_since_ms: 0,
         submission_ledger: receipt.recorded_at_ledger,
+        submission_anchor: None,
         operator_required: false,
     })
 }
@@ -3059,6 +3482,7 @@ fn release_receipt(
             .get(&reservation.id)?
             .filter(|receipt| receipt.status == ReceiptStatus::Ambiguous)
             .and_then(|receipt| receipt.release_code)
+            .filter(|recorded| *recorded == evidence)
     {
         return Ok(recorded);
     }
@@ -3117,12 +3541,8 @@ fn persist_receipt(
 /// Counts one settlement into `report`, and records what the caller owes an
 /// audit row for.
 ///
-/// A definitive answer from the chain settles a submission's value action,
-/// and so does a release on chain evidence: the settled row of an evidence
-/// release is a `value_action_failed` row under the evidence's wire code.
-/// A reservation left standing owes nothing yet, and neither does one whose
-/// retention window closed: its outcome stays unknown, which is what the
-/// pending row already records.
+/// Endpoint reports supply no authenticated outcome. Accounting expiry reports
+/// an unknown chain outcome and never owes a failed value-action row.
 fn record_settlement(
     report: &mut ReconcileReport,
     reservation: &SubmissionHold,
@@ -3136,23 +3556,14 @@ fn record_settlement(
         ledger,
     };
     match settlement {
-        Settlement::Confirmed { ledger } => {
-            report.confirmed += 1;
-            report
-                .settled
-                .push(settled(ReceiptStatus::Success, None, ledger));
-        }
-        Settlement::Failed { code } => {
+        Settlement::Confirmed => report.confirmed += 1,
+        Settlement::AccountingExpired => {
             report.released += 1;
-            report
-                .settled
-                .push(settled(ReceiptStatus::Failed { code }, None, None));
-        }
-        Settlement::ReleasedOnEvidence { evidence } => {
-            report.released += 1;
-            report
-                .settled
-                .push(settled(ReceiptStatus::Ambiguous, Some(evidence), None));
+            report.settled.push(settled(
+                ReceiptStatus::Ambiguous,
+                Some(ReleaseEvidence::AccountingExpired),
+                None,
+            ));
         }
         Settlement::ReceiptWriteFailed { error } => {
             report.receipt_write_failed += 1;
@@ -3160,6 +3571,17 @@ fn record_settlement(
         }
         Settlement::KeptPending => report.kept_pending += 1,
         Settlement::RetentionExpired => report.retention_expired += 1,
+        Settlement::AnswerNotRecorded { recorded, answer } => {
+            match answer {
+                ReportedAnswer::Success => report.confirmed += 1,
+                ReportedAnswer::RetentionExpired => report.retention_expired += 1,
+            }
+            report.unrecorded.push(UnrecordedAnswer {
+                envelope_hash: reservation.id.clone(),
+                recorded,
+                answer,
+            });
+        }
     }
 }
 
@@ -3217,7 +3639,7 @@ fn collect_pending(wire: &WireFile) -> Result<Vec<SubmissionHold>, WindowStoreEr
     let mut seen: Vec<SubmissionHold> = Vec::new();
     for bucket in &wire.entries {
         for record in &bucket.records {
-            if record.status != RecordStatus::Pending || record.id.is_empty() {
+            if !is_exposure(record) || record.id.is_empty() {
                 continue;
             }
             if seen.iter().any(|r| r.id == record.id) {
@@ -3234,6 +3656,7 @@ fn collect_pending(wire: &WireFile) -> Result<Vec<SubmissionHold>, WindowStoreEr
                 max_time: record.max_time,
                 pending_since_ms: record.pending_since_ms,
                 submission_ledger: record.submission_ledger,
+                submission_anchor: record.submission_anchor.clone(),
                 operator_required: record.operator_required,
             });
         }
@@ -3259,17 +3682,27 @@ fn collect_pending(wire: &WireFile) -> Result<Vec<SubmissionHold>, WindowStoreEr
 /// consumed, invalidated, or swept as expired.
 fn window_in_file(wire: &WireFile, key: &StateKey, now_ms: u64) -> Result<(i128, u32), DenyReason> {
     let future_limit = now_ms.saturating_add(CLOCK_SKEW_TOLERANCE_MS);
+    let exact_ids: std::collections::HashSet<&str> = wire
+        .entries
+        .iter()
+        .filter(|bucket| {
+            bucket.scope_specificity == key.scope_specificity()
+                && bucket.bucket == key.bucket()
+                && bucket.window_secs == key.window_secs()
+        })
+        .flat_map(|bucket| &bucket.records)
+        .filter(|record| is_exposure(record))
+        .map(|record| record.id.as_str())
+        .collect();
+    let mut fallback: HashMap<(&str, u64), (i128, u32)> = HashMap::new();
     let mut sum: i128 = 0;
     let mut count: u32 = 0;
     for bucket in &wire.entries {
-        if bucket.scope_specificity != key.scope_specificity()
-            || bucket.bucket != key.bucket()
-            || bucket.window_secs != key.window_secs()
-        {
+        if bucket.scope_specificity != key.scope_specificity() || bucket.bucket != key.bucket() {
             continue;
         }
         for record in &bucket.records {
-            if record.status == RecordStatus::Pending && record.ts_ms > future_limit {
+            if is_exposure(record) && record.ts_ms > future_limit {
                 return Err(DenyReason::EvaluationError {
                     detail: StateStoreError::ClockSkewExceeded {
                         entry_ts_ms: record.ts_ms,
@@ -3278,12 +3711,34 @@ fn window_in_file(wire: &WireFile, key: &StateKey, now_ms: u64) -> Result<(i128,
                     .to_string(),
                 });
             }
-            if !record_is_live(record, now_ms, key.window_secs()) {
+            if (!is_exposure(record) && bucket.window_secs != key.window_secs())
+                || !record_is_live(record, now_ms, bucket.window_secs.max(key.window_secs()))
+            {
                 continue;
             }
-            sum = sum.saturating_add(record.amount);
-            count = count.saturating_add(1);
+            if bucket.window_secs != key.window_secs() {
+                if !exact_ids.contains(record.id.as_str()) {
+                    let total = fallback
+                        .entry((&record.id, bucket.window_secs))
+                        .or_default();
+                    total.0 = total.0.saturating_add(record.amount);
+                    total.1 = total.1.saturating_add(1);
+                }
+            } else {
+                sum = sum.saturating_add(record.amount);
+                count = count.saturating_add(1);
+            }
         }
+    }
+    let mut retained: HashMap<&str, (i128, u32)> = HashMap::new();
+    for ((id, _), total) in fallback {
+        let maximum = retained.entry(id).or_default();
+        maximum.0 = maximum.0.max(total.0);
+        maximum.1 = maximum.1.max(total.1);
+    }
+    for total in retained.values() {
+        sum = sum.saturating_add(total.0);
+        count = count.saturating_add(total.1);
     }
     for hold in &wire.holds {
         if hold.scope_specificity == key.scope_specificity()
@@ -3297,10 +3752,105 @@ fn window_in_file(wire: &WireFile, key: &StateKey, now_ms: u64) -> Result<(i128,
     Ok((sum, count))
 }
 
-/// Pending holds remain live until their outcome is settled.
+fn is_exposure(record: &WireRecord) -> bool {
+    matches!(
+        record.status,
+        RecordStatus::Pending | RecordStatus::Exposure
+    )
+}
+
+fn execution_bound(record: &WireRecord) -> Option<u64> {
+    record
+        .execution_bound
+        .or_else(|| (record.max_time > 0).then(|| record.max_time.saturating_mul(1000)))
+}
+
+fn exposure_horizon(record: &WireRecord, window_secs: u64) -> Option<u64> {
+    let bound = execution_bound(record)?;
+    let accounting_at_ms = bound.max(record.observed_at_ms.unwrap_or(0));
+    let duration = record
+        .admitted_window_ms
+        .unwrap_or(0)
+        .max(window_secs.saturating_mul(1000));
+    Some(
+        accounting_at_ms
+            .saturating_add(duration)
+            .max(record.accounting_until_ms.unwrap_or(0)),
+    )
+}
+
+fn accounting_expired(wire: &WireFile, id: &str, now: u64) -> bool {
+    let mut found = false;
+    for bucket in &wire.entries {
+        for record in &bucket.records {
+            if record.id == id && is_exposure(record) {
+                found = true;
+                if exposure_horizon(record, bucket.window_secs).is_none_or(|until| now <= until) {
+                    return false;
+                }
+            }
+        }
+    }
+    found
+}
+
+fn check_accounting_evidence(
+    wire: &WireFile,
+    id: &str,
+    evidence: AccountingEvidence,
+) -> Result<(), WindowStoreError> {
+    let accepted = match evidence {
+        AccountingEvidence::PreExposureCancellation => {
+            file_holds_id(wire, id)
+                && wire
+                    .entries
+                    .iter()
+                    .flat_map(|b| &b.records)
+                    .filter(|r| r.id == id)
+                    .all(|r| r.status == RecordStatus::Pending && r.observed_at_ms.is_none())
+        }
+        AccountingEvidence::Expired { observed_at_ms } => {
+            accounting_expired(wire, id, observed_at_ms)
+        }
+        AccountingEvidence::OperatorOverride {
+            acknowledge_unbounded,
+        } => {
+            let now = now_ms()?;
+            let records: Vec<_> = wire
+                .entries
+                .iter()
+                .flat_map(|b| &b.records)
+                .filter(|r| r.id == id && is_exposure(r))
+                .collect();
+            // Untimed exposure needs the unbounded acknowledgement on every
+            // network: the bytes can apply for as long as their sequence is
+            // unconsumed, whatever an endpoint has reported about them.
+            !records.is_empty()
+                && records.iter().all(|record| {
+                    execution_bound(record).map_or(acknowledge_unbounded, |bound| now > bound)
+                })
+        }
+    };
+    if accepted {
+        Ok(())
+    } else {
+        Err(WindowStoreError::Invalid {
+            detail: "accounting evidence does not authorize capacity release".into(),
+        })
+    }
+}
+
+/// Exposure counts at equality and expires strictly after its conservative horizon.
 fn record_is_live(record: &WireRecord, now_ms: u64, window_secs: u64) -> bool {
-    record.status == RecordStatus::Pending
-        || record.ts_ms >= now_ms.saturating_sub(window_secs.saturating_mul(1_000))
+    match record.status {
+        RecordStatus::Pending | RecordStatus::Exposure => {
+            exposure_horizon(record, window_secs).is_none_or(|until| now_ms <= until)
+        }
+        RecordStatus::Confirmed => {
+            record.ts_ms >= now_ms.saturating_sub(window_secs.saturating_mul(1000))
+        }
+        RecordStatus::AccountingExpired | RecordStatus::OperatorCleared => false,
+    }
 }
 
 // Bound serialized bytes as well as characters: JSON escapes expand control text.
@@ -3337,12 +3887,13 @@ fn snapshot_accrual(wire: &WireFile, now_ms: u64, accrual: &mut WipedAccrualReco
             }
             accrual.entry_count = accrual.entry_count.saturating_add(1);
             match record.status {
+                RecordStatus::AccountingExpired | RecordStatus::OperatorCleared => continue,
                 RecordStatus::Confirmed => {
                     snapshot.confirmed_count = snapshot.confirmed_count.saturating_add(1);
                     snapshot.confirmed_total =
                         snapshot.confirmed_total.saturating_add(record.amount);
                 }
-                RecordStatus::Pending => {
+                RecordStatus::Pending | RecordStatus::Exposure => {
                     snapshot.pending_count = snapshot.pending_count.saturating_add(1);
                     snapshot.pending_total = snapshot.pending_total.saturating_add(record.amount);
                 }
@@ -4029,6 +4580,7 @@ mod tests {
             max_time: 0,
             pending_since_ms,
             submission_ledger: 1_000,
+            submission_anchor: None,
             operator_required: false,
         }
     }
@@ -4063,11 +4615,11 @@ mod tests {
         );
     }
 
-    /// Confirming a reservation keeps its records and stops them being
-    /// reported as open.
+    /// Recording a success report keeps the reservation's records counting
+    /// and its exposure open.
     #[test]
     #[serial]
-    fn confirm_keeps_the_records_and_closes_the_reservation() {
+    fn confirm_keeps_exposure_open() {
         keyring_mock::install().unwrap();
         let dir = TempDir::new().unwrap();
         let profile = test_profile(dir.path(), "resv-confirm");
@@ -4090,8 +4642,8 @@ mod tests {
             .unwrap();
 
         assert!(
-            store.pending_reservations(&profile).unwrap().is_empty(),
-            "a confirmed reservation is no longer open"
+            !store.pending_reservations(&profile).unwrap().is_empty(),
+            "untimed reported success retains open exposure"
         );
         let dest = PolicyStateStore::new();
         store.load_into("resv-confirm", &profile, &dest).unwrap();
@@ -4099,15 +4651,15 @@ mod tests {
         assert_eq!(
             (sum, count),
             (250, 1),
-            "confirming keeps the spend: the transaction reached a ledger"
+            "a success report keeps the spend counting"
         );
     }
 
-    /// Releasing a reservation removes its records, so the reserved amount
-    /// stops counting against the window.
+    /// Cancelling a reservation whose bytes were never sent removes its
+    /// records, so the reserved amount stops counting against the window.
     #[test]
     #[serial]
-    fn release_removes_the_records() {
+    fn pre_exposure_cancellation_removes_the_records() {
         keyring_mock::install().unwrap();
         let dir = TempDir::new().unwrap();
         let profile = test_profile(dir.path(), "resv-release");
@@ -4132,16 +4684,16 @@ mod tests {
         assert_eq!(
             (sum, count),
             (0, 0),
-            "a released reservation stops counting against the window"
+            "a cancelled reservation stops counting against the window"
         );
     }
 
-    /// A release drops pending records only: spend the chain confirmed under
-    /// the same reservation id keeps counting, and a release that finds
-    /// nothing pending leaves the file as it stands.
+    /// A cancellation is refused once a success was observed under the
+    /// reservation id: the spend keeps counting and the file stays as it
+    /// stands.
     #[test]
     #[serial]
-    fn release_keeps_confirmed_records() {
+    fn pre_exposure_cancellation_refuses_an_observed_success() {
         keyring_mock::install().unwrap();
         let dir = TempDir::new().unwrap();
         let profile = test_profile(dir.path(), "resv-keep-confirmed");
@@ -4163,12 +4715,12 @@ mod tests {
             .unwrap();
         let confirmed_bytes = std::fs::read(&path).unwrap();
 
-        store.release(&profile, &id).unwrap();
+        assert!(store.pre_exposure_cancellation(&profile, &id).is_err());
 
         assert_eq!(
             std::fs::read(&path).unwrap(),
             confirmed_bytes,
-            "a release with nothing pending writes nothing"
+            "a refused cancellation writes nothing"
         );
         let dest = PolicyStateStore::new();
         store
@@ -4177,7 +4729,7 @@ mod tests {
         assert_eq!(
             dest.query_window(&k, now + 1_000).unwrap(),
             (900, 1),
-            "confirmed spend keeps counting after a release of its reservation id"
+            "the reported spend keeps counting after a refused cancellation"
         );
     }
 
@@ -4663,7 +5215,10 @@ mod tests {
             .load_into("v3-read", &profile, &dest)
             .expect_err("a newer wire version must be refused");
         assert!(
-            matches!(err, WindowStoreError::UnsupportedVersion { version, max } if version == max + 1),
+            matches!(
+                err,
+                WindowStoreError::UnsupportedVersion { version: 8, max: 7 }
+            ),
             "the refusal must name the version condition; got {err:?}"
         );
     }
@@ -5471,7 +6026,8 @@ mod tests {
         let store = PersistedWindowStore::at_path(dir.path().join("checkpoint.window"));
         let receipts = ReceiptStore::open_at(dir.path(), "checkpoint").unwrap();
         let now = now_ms().unwrap();
-        let res = reservation(&"7a".repeat(32), "GSOURCE", 7, now);
+        let mut res = reservation(&"7a".repeat(32), "GSOURCE", 7, now);
+        res.max_time = (now / 1000).saturating_sub(86_401);
         store
             .record_pending(
                 &profile,
@@ -5503,16 +6059,19 @@ mod tests {
                     }))
                     .unwrap(),
                 );
-                store.settle_chain_answer(&profile, Some(&receipts), &res, &answer)
+                store.settle_chain_answer(&profile, Some(&receipts), &res, &answer, now)
             } else {
-                store.release_on_evidence(
-                    &profile,
-                    Some(&receipts),
-                    &res,
-                    ReleaseEvidence::SequenceConsumed,
-                )
+                store
+                    .expire_accounting(&profile, Some(&receipts), &res, now)
+                    .map(|settlement| settlement.unwrap())
             }
         };
+        if status == Some("FAILED") {
+            assert_eq!(settle().unwrap(), Settlement::KeptPending);
+            assert_eq!(receipts.get(&res.id).unwrap(), before);
+            assert_eq!(store.pending_reservations(&profile).unwrap(), vec![res]);
+            return;
+        }
         let failed = settle().unwrap();
         let mut report = ReconcileReport::default();
         record_settlement(&mut report, &res, failed);
@@ -5533,51 +6092,58 @@ mod tests {
             settle().unwrap(),
             Settlement::ReceiptWriteFailed { .. }
         ));
-        assert!(store.pending_reservations(&profile).unwrap().is_empty());
+        assert_eq!(
+            store.pending_reservations(&profile).unwrap().is_empty(),
+            status.is_none()
+        );
         let receipt = receipts.get(&res.id).unwrap().unwrap();
         match status {
             Some("SUCCESS") => assert_eq!(receipt.status, ReceiptStatus::Success),
             Some(_) => assert!(matches!(receipt.status, ReceiptStatus::Failed { .. })),
             None => assert_eq!(
                 receipt.release_code,
-                Some(ReleaseEvidence::SequenceConsumed)
+                Some(ReleaseEvidence::AccountingExpired)
             ),
         }
     }
 
-    /// An evidence release persists its receipt before releasing the reservation.
+    /// An accounting expiry persists its receipt before releasing the reservation.
     #[test]
     #[serial]
-    fn evidence_waits_for_receipt_persistence() {
+    fn accounting_expiry_waits_for_receipt_persistence() {
         assert_settlement_waits_for_receipt(None, false);
     }
 
-    /// Both definitive answers persist their receipts before settling the window.
+    /// A reported success persists its receipt before it changes the window,
+    /// and a reported failure changes neither the receipt nor the hold.
     #[test]
     #[serial]
-    fn chain_answers_wait_for_receipt_persistence() {
+    fn a_success_waits_for_receipt_persistence_and_a_failure_keeps_the_hold() {
         assert_settlement_waits_for_receipt(Some("SUCCESS"), false);
         assert_settlement_waits_for_receipt(Some("FAILED"), false);
     }
 
-    /// A missing receipt is restored durably before its reservation is released.
+    /// A missing receipt is restored durably before an accounting expiry
+    /// releases its reservation.
     #[test]
     #[serial]
-    fn evidence_waits_for_a_missing_receipt_restore() {
+    fn accounting_expiry_waits_for_a_missing_receipt_restore() {
         assert_settlement_waits_for_receipt(None, true);
     }
 
-    /// Clearing a receipt preserves evidence but refuses another evidence release.
+    /// An accounting expiry ends the hold of a cleared receipt and leaves the
+    /// cleared receipt and its disposition unchanged.
     #[test]
     #[serial]
-    fn a_cleared_receipt_with_evidence_keeps_its_pending_reservation() {
+    fn accounting_expiry_of_a_cleared_receipt_keeps_the_receipt() {
         keyring_mock::install().unwrap();
         let dir = TempDir::new().unwrap();
         let profile = test_profile(dir.path(), "release-cleared");
         let store = PersistedWindowStore::at_path(dir.path().join("release.window"));
         let receipts = ReceiptStore::open_at(dir.path(), "release-cleared").unwrap();
         let now = now_ms().unwrap();
-        let res = reservation(&"7d".repeat(32), "GSOURCE", 7, now);
+        let mut res = reservation(&"7d".repeat(32), "GSOURCE", 7, now);
+        res.max_time = (now / 1000).saturating_sub(86_401);
         store
             .record_pending(
                 &profile,
@@ -5595,23 +6161,12 @@ mod tests {
         assert_eq!(cleared.release_code, Some(ReleaseEvidence::TimeBoundPassed));
         assert_eq!(
             store
-                .release_on_evidence(
-                    &profile,
-                    Some(&receipts),
-                    &res,
-                    ReleaseEvidence::SequenceConsumed,
-                )
+                .expire_accounting(&profile, Some(&receipts), &res, now)
                 .unwrap(),
-            Settlement::ReceiptWriteFailed {
-                error: ReceiptStoreError::InvalidTransition {
-                    from: "cleared_by_operator",
-                    to: "ambiguous",
-                }
-                .to_string(),
-            }
+            Some(Settlement::AccountingExpired)
         );
         assert_eq!(receipts.get(&res.id).unwrap().unwrap(), cleared);
-        assert_eq!(store.pending_reservations(&profile).unwrap(), vec![res]);
+        assert!(store.pending_reservations(&profile).unwrap().is_empty());
     }
 
     /// A durable evidence checkpoint needs no receipt write when its window retries.
@@ -5624,7 +6179,8 @@ mod tests {
         let store = PersistedWindowStore::at_path(dir.path().join("release.window"));
         let receipts = ReceiptStore::open_at(dir.path(), "release-retry").unwrap();
         let now = now_ms().unwrap();
-        let res = reservation(&"7c".repeat(32), "GSOURCE", 7, now);
+        let mut res = reservation(&"7c".repeat(32), "GSOURCE", 7, now);
+        res.max_time = (now / 1000).saturating_sub(86_401);
         store
             .record_pending(
                 &profile,
@@ -5638,12 +6194,7 @@ mod tests {
         let held =
             WindowStoreLock::acquire_for(&store.path, &profile.policy_window_state_key_id).unwrap();
         assert!(matches!(
-            store.release_on_evidence(
-                &profile,
-                Some(&receipts),
-                &res,
-                ReleaseEvidence::TimeBoundPassed
-            ),
+            store.expire_accounting(&profile, Some(&receipts), &res, now),
             Err(WindowStoreError::WriterLocked)
         ));
         drop(held);
@@ -5662,19 +6213,900 @@ mod tests {
         held_receipt.try_lock().unwrap();
         assert_eq!(
             store
-                .release_on_evidence(
-                    &profile,
-                    Some(&receipts),
-                    &res,
-                    ReleaseEvidence::SequenceConsumed
-                )
+                .expire_accounting(&profile, Some(&receipts), &res, now)
                 .unwrap(),
-            Settlement::ReleasedOnEvidence {
-                evidence: ReleaseEvidence::TimeBoundPassed
-            }
+            Some(Settlement::AccountingExpired)
         );
         assert_eq!(receipts.get(&res.id).unwrap().unwrap(), checkpoint);
         assert!(store.pending_reservations(&profile).unwrap().is_empty());
+    }
+
+    /// An untimed hold whose receipt records a failure keeps that failure
+    /// when the endpoint now reports success: the pass attempts no receipt
+    /// write, so a held receipt writer refuses nothing, and it reports the
+    /// unrecorded answer while the window records the success observation.
+    #[test]
+    #[serial]
+    fn an_untimed_hold_keeps_the_recorded_answer_and_reports_the_new_one() {
+        keyring_mock::install().unwrap();
+        let dir = TempDir::new().unwrap();
+        let profile = test_profile(dir.path(), "untimed-recorded");
+        let store = PersistedWindowStore::at_path(dir.path().join("untimed.window"));
+        let receipts = ReceiptStore::open_at(dir.path(), "untimed-recorded").unwrap();
+        let now = now_ms().unwrap();
+        let res = reservation(&"7e".repeat(32), "GSOURCE", 7, now);
+        store
+            .record_pending(
+                &profile,
+                &[entry(key("untimed-recorded", "native", 86_400), now, 500)],
+                &res,
+            )
+            .unwrap();
+        receipts
+            .try_begin(&res.id, &res.tx_hash, &res.source, 7, 0, 100)
+            .unwrap();
+        receipts.mark_submitted(&res.id).unwrap();
+        let failed = ReceiptStatus::Failed {
+            code: "submission.on_chain_failed".to_owned(),
+        };
+        receipts
+            .finalize(&res.id, failed.clone(), Some(150))
+            .unwrap();
+        let before = receipts.get(&res.id).unwrap();
+        let held = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(receipts.lock_file_path().unwrap())
+            .unwrap();
+        held.try_lock().unwrap();
+        let answer = TransactionRecord::from_raw(
+            serde_json::from_value(serde_json::json!({
+                "status": "SUCCESS", "latestLedger": 200, "oldestLedger": 1,
+                "ledger": 160, "createdAt": (now / 1_000).to_string(),
+            }))
+            .unwrap(),
+        );
+
+        let settlement = store
+            .settle_chain_answer(&profile, Some(&receipts), &res, &answer, now)
+            .unwrap();
+
+        assert_eq!(
+            settlement,
+            Settlement::AnswerNotRecorded {
+                recorded: failed.clone(),
+                answer: ReportedAnswer::Success,
+            }
+        );
+        let mut report = ReconcileReport::default();
+        record_settlement(&mut report, &res, settlement);
+        assert_eq!(report.confirmed, 1);
+        assert_eq!(report.receipt_write_failed, 0);
+        assert_eq!(
+            report.unrecorded,
+            vec![UnrecordedAnswer {
+                envelope_hash: res.id.clone(),
+                recorded: failed,
+                answer: ReportedAnswer::Success,
+            }]
+        );
+        assert_eq!(receipts.get(&res.id).unwrap(), before, "the failure stands");
+        assert_eq!(store.pending_reservations(&profile).unwrap(), vec![res]);
+    }
+
+    /// An endpoint on testnet whose retention floor, ledger 1 500, lies
+    /// above the reservations these tests record, answering `getTransaction`
+    /// with `status` after running `on_transaction`. Any other method is
+    /// answered with a JSON-RPC method-not-found error.
+    async fn retention_floor_endpoint(
+        status: &'static str,
+        on_transaction: impl Fn() + Send + Sync + 'static,
+    ) -> wiremock::MockServer {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(move |request: &wiremock::Request| {
+                let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                let result = match body["method"].as_str() {
+                    Some("getHealth") => Some(serde_json::json!({
+                        "status": "healthy",
+                        "latestLedger": 2_000,
+                        "oldestLedger": 1_500,
+                        "ledgerRetentionWindow": 500,
+                    })),
+                    Some("getLedgers") => Some(serde_json::json!({
+                        "latestLedger": 2_000,
+                        "latestLedgerCloseTime": "1700000000",
+                        "oldestLedger": 1_500,
+                        "oldestLedgerCloseTime": "1699990000",
+                        "cursor": "2000",
+                        "ledgers": [],
+                    })),
+                    Some("getTransaction") => {
+                        on_transaction();
+                        Some(match status {
+                            "SUCCESS" => serde_json::json!({
+                                "status": "SUCCESS",
+                                "latestLedger": 2_000,
+                                "oldestLedger": 1_500,
+                                "ledger": 1_600,
+                                "createdAt": "1700000000",
+                            }),
+                            other => serde_json::json!({
+                                "status": other,
+                                "latestLedger": 2_000,
+                                "oldestLedger": 1_500,
+                            }),
+                        })
+                    }
+                    _ => None,
+                };
+                wiremock::ResponseTemplate::new(200).set_body_json(match result {
+                    Some(result) => serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": body["id"],
+                        "result": result,
+                    }),
+                    None => serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": body["id"],
+                        "error": { "code": -32601, "message": "method not found" },
+                    }),
+                })
+            })
+            .mount(&server)
+            .await;
+        server
+    }
+
+    /// Records an untimed hold and its sent receipt, recorded as failed, on
+    /// a fresh store under `name`.
+    fn untimed_failed_hold(
+        dir: &Path,
+        name: &str,
+        id: &str,
+    ) -> (Profile, PersistedWindowStore, ReceiptStore, SubmissionHold) {
+        let profile = test_profile(dir, name);
+        let store = PersistedWindowStore::at_path(dir.join(format!("{name}.window")));
+        let receipts = ReceiptStore::open_at(dir, name).unwrap();
+        let now = now_ms().unwrap();
+        let res = reservation(id, "GSOURCE", 7, now);
+        store
+            .record_pending(
+                &profile,
+                &[entry(key(name, "native", 86_400), now, 500)],
+                &res,
+            )
+            .unwrap();
+        receipts
+            .try_begin(&res.id, &res.tx_hash, &res.source, 7, 0, 100)
+            .unwrap();
+        receipts.mark_submitted(&res.id).unwrap();
+        receipts
+            .finalize(&res.id, failed_on_chain(), Some(150))
+            .unwrap();
+        (profile, store, receipts, res)
+    }
+
+    fn failed_on_chain() -> ReceiptStatus {
+        ReceiptStatus::Failed {
+            code: "submission.on_chain_failed".to_owned(),
+        }
+    }
+
+    /// The bytes that make a receipt store unreadable.
+    const UNREADABLE_RECEIPTS: &[u8] = b"{ not a receipt store";
+
+    /// A receipt store that cannot be read when the pass asks about an
+    /// untimed hold is reported as a receipt failure carrying the read error,
+    /// and the window file stays as it was. A readable receipt that records
+    /// a network answer keeps it on the same path, and the endpoint's success
+    /// is reported as unrecorded.
+    #[tokio::test]
+    #[serial]
+    async fn an_unreadable_receipt_store_is_reported_on_the_chain_answer_path() {
+        keyring_mock::install().unwrap();
+        let dir = TempDir::new().unwrap();
+        let (profile, store, receipts, res) =
+            untimed_failed_hold(dir.path(), "chain-unreadable", &"7f".repeat(32));
+        let server = retention_floor_endpoint("SUCCESS", || {}).await;
+        let client = crate::client::StellarRpcClient::new(&server.uri()).unwrap();
+        let receipt_file = receipts.file_path().unwrap();
+        let readable = fs::read(&receipt_file).unwrap();
+        fs::write(&receipt_file, UNREADABLE_RECEIPTS).unwrap();
+        let window = fs::read(store.path()).unwrap();
+        let now = now_ms().unwrap();
+
+        let report = store
+            .reconcile_one(&profile, &client, None, Some(&receipts), &res.id, now)
+            .await
+            .unwrap();
+
+        assert_eq!(report.receipt_write_failed, 1, "{report:?}");
+        assert_eq!(report.kept_pending, 0, "{report:?}");
+        let error = report.receipt_write_error.as_deref().unwrap();
+        let read_error = receipts.get(&res.id).unwrap_err().to_string();
+        assert_eq!(error, read_error, "the report carries the read error");
+        assert!(report.unrecorded.is_empty(), "{report:?}");
+        assert_eq!(
+            fs::read(store.path()).unwrap(),
+            window,
+            "the window is unchanged"
+        );
+
+        fs::write(&receipt_file, &readable).unwrap();
+        let report = store
+            .reconcile_one(&profile, &client, None, Some(&receipts), &res.id, now)
+            .await
+            .unwrap();
+
+        assert_eq!(report.receipt_write_failed, 0, "{report:?}");
+        assert_eq!(report.confirmed, 1, "{report:?}");
+        assert_eq!(
+            report.unrecorded,
+            vec![UnrecordedAnswer {
+                envelope_hash: res.id.clone(),
+                recorded: failed_on_chain(),
+                answer: ReportedAnswer::Success,
+            }]
+        );
+        assert_eq!(
+            receipts.get(&res.id).unwrap().unwrap().status,
+            failed_on_chain()
+        );
+        assert_eq!(store.pending_reservations(&profile).unwrap(), vec![res]);
+    }
+
+    /// A receipt store that becomes unreadable after the endpoint's
+    /// `NOT_FOUND`, with the submission ledger below the retention floor, is
+    /// reported as a receipt failure carrying the read error, and the window
+    /// file stays as it was. A readable receipt that records a network answer
+    /// keeps it on the same path, and the retention answer is reported as
+    /// unrecorded.
+    #[tokio::test]
+    #[serial]
+    async fn an_unreadable_receipt_store_is_reported_on_the_retention_branch() {
+        keyring_mock::install().unwrap();
+        let dir = TempDir::new().unwrap();
+        let (profile, store, receipts, res) =
+            untimed_failed_hold(dir.path(), "retention-unreadable", &"7e".repeat(32));
+        let receipt_file = receipts.file_path().unwrap();
+        let readable = fs::read(&receipt_file).unwrap();
+        let corrupt = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let server = retention_floor_endpoint("NOT_FOUND", {
+            let corrupt = std::sync::Arc::clone(&corrupt);
+            let receipt_file = receipt_file.clone();
+            move || {
+                if corrupt.load(std::sync::atomic::Ordering::SeqCst) {
+                    fs::write(&receipt_file, UNREADABLE_RECEIPTS).unwrap();
+                }
+            }
+        })
+        .await;
+        let client = crate::client::StellarRpcClient::new(&server.uri()).unwrap();
+        let window = fs::read(store.path()).unwrap();
+        let now = now_ms().unwrap();
+
+        let report = store
+            .reconcile_one(&profile, &client, None, Some(&receipts), &res.id, now)
+            .await
+            .unwrap();
+
+        assert_eq!(report.receipt_write_failed, 1, "{report:?}");
+        assert_eq!(report.kept_pending, 0, "{report:?}");
+        assert_eq!(report.retention_expired, 0, "{report:?}");
+        let error = report.receipt_write_error.as_deref().unwrap();
+        let read_error = receipts.get(&res.id).unwrap_err().to_string();
+        assert_eq!(error, read_error, "the report carries the read error");
+        assert_eq!(
+            fs::read(store.path()).unwrap(),
+            window,
+            "the window is unchanged"
+        );
+
+        corrupt.store(false, std::sync::atomic::Ordering::SeqCst);
+        fs::write(&receipt_file, &readable).unwrap();
+        let report = store
+            .reconcile_one(&profile, &client, None, Some(&receipts), &res.id, now)
+            .await
+            .unwrap();
+
+        assert_eq!(report.receipt_write_failed, 0, "{report:?}");
+        assert_eq!(report.retention_expired, 1, "{report:?}");
+        assert_eq!(
+            report.unrecorded,
+            vec![UnrecordedAnswer {
+                envelope_hash: res.id.clone(),
+                recorded: failed_on_chain(),
+                answer: ReportedAnswer::RetentionExpired,
+            }]
+        );
+        assert_eq!(
+            receipts.get(&res.id).unwrap().unwrap().status,
+            failed_on_chain()
+        );
+        assert_eq!(fs::read(store.path()).unwrap(), window);
+    }
+
+    /// Reconciliation judges accounting expiry on the caller's clock while
+    /// the store's own clock stands before both horizons: of two reservations
+    /// straddling the caller's time, the one whose horizon it passed expires
+    /// and the one whose horizon it has not reached is retained.
+    #[tokio::test]
+    #[serial]
+    async fn reconciliation_expires_accounting_at_the_callers_horizon() {
+        keyring_mock::install().unwrap();
+        let dir = TempDir::new().unwrap();
+        let profile = test_profile(dir.path(), "caller-horizon");
+        let store = PersistedWindowStore::at_path(dir.path().join("caller-horizon.window"));
+        let now = now_ms().unwrap();
+        let _clock = crate::mainnet::clock::set_now_ms_for_test(now);
+        let k = key("caller-horizon", "native", 86_400);
+        let mut past = reservation(&"b1".repeat(32), "GSOURCE", 7, now);
+        past.max_time = now / 1_000 + 3_600;
+        let mut inside = reservation(&"b2".repeat(32), "GSOURCE", 8, now);
+        inside.max_time = past.max_time + 2;
+        store
+            .record_pending(&profile, &[entry(k.clone(), now, 40)], &past)
+            .unwrap();
+        store
+            .record_pending(&profile, &[entry(k.clone(), now, 60)], &inside)
+            .unwrap();
+        let wire = store.read_for_inspection(&profile).unwrap().unwrap();
+        let horizon = |id: &str| {
+            wire.entries
+                .iter()
+                .flat_map(|bucket| {
+                    bucket
+                        .records
+                        .iter()
+                        .filter(move |record| record.id == id)
+                        .map(move |record| exposure_horizon(record, bucket.window_secs))
+                })
+                .next()
+                .flatten()
+                .unwrap()
+        };
+        let caller_now = horizon(&past.id) + 1;
+        assert!(
+            caller_now <= horizon(&inside.id),
+            "the caller's time straddles"
+        );
+        assert!(
+            now_ms().unwrap() < horizon(&past.id),
+            "the store clock stands before both horizons"
+        );
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(move |request: &wiremock::Request| {
+                let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                let result = match body["method"].as_str() {
+                    Some("getHealth") => serde_json::json!({
+                        "status": "healthy",
+                        "latestLedger": 2_000,
+                        "oldestLedger": 1,
+                        "ledgerRetentionWindow": 1_999,
+                    }),
+                    Some("getLedgers") => serde_json::json!({
+                        "latestLedger": 2_000,
+                        "latestLedgerCloseTime": (now / 1_000).to_string(),
+                        "oldestLedger": 1,
+                        "oldestLedgerCloseTime": 1,
+                        "cursor": "2000",
+                        "ledgers": [],
+                    }),
+                    _ => serde_json::json!({
+                        "status": "NOT_FOUND",
+                        "latestLedger": 2_000,
+                        "oldestLedger": 1,
+                    }),
+                };
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": body["id"],
+                    "result": result,
+                }))
+            })
+            .mount(&server)
+            .await;
+        let client = crate::client::StellarRpcClient::new(&server.uri()).unwrap();
+
+        let expired = store
+            .reconcile_one(&profile, &client, None, None, &past.id, caller_now)
+            .await
+            .unwrap();
+        let retained = store
+            .reconcile_one(&profile, &client, None, None, &inside.id, caller_now)
+            .await
+            .unwrap();
+
+        assert_eq!(expired.released, 1, "{expired:?}");
+        assert_eq!(
+            expired
+                .settled
+                .iter()
+                .map(|settled| (settled.envelope_hash.as_str(), settled.release_code))
+                .collect::<Vec<_>>(),
+            [(past.id.as_str(), Some(ReleaseEvidence::AccountingExpired))]
+        );
+        assert_eq!(retained.released, 0, "{retained:?}");
+        assert_eq!(retained.kept_pending, 1, "{retained:?}");
+        assert!(retained.settled.is_empty(), "{retained:?}");
+        assert_eq!(store.pending_reservations(&profile).unwrap(), vec![inside]);
+    }
+
+    #[test]
+    fn legacy_anchor_has_no_witness_provenance() {
+        let wire: WireFile = serde_json::from_str(V3_CURRENT_BODY).unwrap();
+        let mut wire = wire;
+        let scope = ChainScope::for_chain(Caip2::Testnet);
+        for bucket in &mut wire.entries {
+            for record in &mut bucket.records {
+                record.chain_scope = Some(scope);
+            }
+        }
+        let holds = collect_pending(&wire).unwrap();
+        assert_eq!(holds.len(), 1);
+        assert_eq!(holds[0].submission_ledger, 512);
+        assert!(holds[0].submission_anchor.is_none());
+        assert!(wire.entries[0].records[1].submission_anchor.is_none());
+        assert!(!accounting_expired(&wire, &holds[0].id, 1_700_000_301_000));
+    }
+
+    /// A legacy hold, with a submission ledger and no witnessed anchor, stays
+    /// held when the endpoint reports it missing inside retention after its
+    /// time bound passed, and reconciliation gives it no anchor.
+    #[tokio::test]
+    #[serial]
+    async fn a_legacy_hold_is_retained_by_reconciliation() {
+        keyring_mock::install().unwrap();
+        let dir = TempDir::new().unwrap();
+        let profile = test_profile(dir.path(), "legacy-retained");
+        let store = PersistedWindowStore::at_path(dir.path().join("legacy-retained.window"));
+        let now = now_ms().unwrap();
+        let mut hold = reservation(&"ae".repeat(32), "GSOURCE", 7, now - RECONCILE_MIN_AGE_MS);
+        hold.submission_ledger = 512;
+        hold.max_time = now / 1_000 - 10;
+        let k = key("legacy-retained", "native", 86_400);
+        store
+            .record_pending(&profile, &[entry(k.clone(), now, 75)], &hold)
+            .unwrap();
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(move |request: &wiremock::Request| {
+                let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                let result = match body["method"].as_str() {
+                    Some("getHealth") => serde_json::json!({
+                        "status": "healthy",
+                        "latestLedger": 2_000,
+                        "oldestLedger": 1,
+                        "ledgerRetentionWindow": 1_999,
+                    }),
+                    Some("getLedgers") => serde_json::json!({
+                        "latestLedger": 2_000,
+                        "latestLedgerCloseTime": (now / 1_000).to_string(),
+                        "oldestLedger": 1,
+                        "oldestLedgerCloseTime": 1,
+                        "cursor": "2000",
+                        "ledgers": [],
+                    }),
+                    _ => serde_json::json!({
+                        "status": "NOT_FOUND",
+                        "latestLedger": 2_000,
+                        "oldestLedger": 1,
+                    }),
+                };
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": body["id"],
+                    "result": result,
+                }))
+            })
+            .mount(&server)
+            .await;
+        let client = crate::client::StellarRpcClient::new(&server.uri()).unwrap();
+
+        let report = store
+            .reconcile_one(&profile, &client, None, None, &hold.id, now)
+            .await
+            .unwrap();
+
+        assert_eq!(report.examined, 1, "{report:?}");
+        assert_eq!(report.released, 0, "{report:?}");
+        assert_eq!(report.kept_pending, 1, "{report:?}");
+        assert!(report.settled.is_empty(), "{report:?}");
+        let held = store.pending_reservations(&profile).unwrap();
+        assert_eq!(held.len(), 1);
+        assert_eq!(held[0].submission_ledger, 512);
+        assert!(held[0].submission_anchor.is_none());
+        let dest = PolicyStateStore::new();
+        store.load_into("legacy-retained", &profile, &dest).unwrap();
+        assert_eq!(dest.query_window(&k, now + 1_000).unwrap(), (75, 1));
+    }
+
+    #[test]
+    #[serial]
+    fn accounting_horizon_preserves_multiple_windows_and_unknown_outcome() {
+        keyring_mock::install().unwrap();
+        let dir = TempDir::new().unwrap();
+        let profile = test_profile(dir.path(), "accounting-horizon");
+        let store = PersistedWindowStore::at_path(dir.path().join("horizon.window"));
+        let now = now_ms().unwrap();
+        let mut hold = reservation(&"91".repeat(32), "GSOURCE", 1, now);
+        hold.max_time = now / 1000 + 120;
+        let bound = hold.max_time * 1000;
+        let short = key("accounting-horizon", "native", 60);
+        let long = key("accounting-horizon", "native", 3600);
+        store
+            .record_pending(
+                &profile,
+                &[entry(short.clone(), now, 7), entry(long.clone(), now, 11)],
+                &hold,
+            )
+            .unwrap();
+        let wire = store.read_for_inspection(&profile).unwrap().unwrap();
+        assert_eq!(
+            window_in_file(&wire, &short, bound + 60_000).unwrap(),
+            (7, 1)
+        );
+        assert_eq!(
+            window_in_file(&wire, &short, bound + 60_001).unwrap(),
+            (0, 0)
+        );
+        assert_eq!(
+            window_in_file(&wire, &long, bound + 3_600_000).unwrap(),
+            (11, 1)
+        );
+        assert!(!accounting_expired(&wire, &hold.id, bound + 3_600_000));
+        assert!(accounting_expired(&wire, &hold.id, bound + 3_600_001));
+        let decision = store
+            .accounting_decision(
+                &profile,
+                &hold.id,
+                AccountingEvidence::Expired {
+                    observed_at_ms: bound + 3_600_001,
+                },
+            )
+            .unwrap();
+        store.apply_accounting_decision(&profile, decision).unwrap();
+        let wire = store.read_for_inspection(&profile).unwrap().unwrap();
+        assert!(
+            wire.entries
+                .iter()
+                .flat_map(|b| &b.records)
+                .all(|r| r.status == RecordStatus::AccountingExpired)
+        );
+        assert_eq!(
+            ReceiptStatus::Ambiguous.settled_row(Some(ReleaseEvidence::AccountingExpired)),
+            None
+        );
+        assert_eq!(
+            ReleaseEvidence::AccountingExpired.code(),
+            "submission.accounting_expired"
+        );
+        let overflow = WireRecord {
+            max_time: u64::MAX,
+            status: RecordStatus::Pending,
+            ..WireRecord::confirmed_defaults()
+        };
+        assert!(record_is_live(&overflow, u64::MAX, u64::MAX));
+    }
+
+    /// Two windows on one asset keep each exposure at the duration it was
+    /// admitted under: a later reservation on the same asset does not stretch
+    /// an earlier hourly record to the daily window.
+    #[test]
+    #[serial]
+    fn two_windows_on_one_asset_keep_each_exposure_at_its_own_duration() {
+        keyring_mock::install().unwrap();
+        let dir = TempDir::new().unwrap();
+        let profile = test_profile(dir.path(), "two-window-horizon");
+        let store = PersistedWindowStore::at_path(dir.path().join("two-window.window"));
+        let now = now_ms().unwrap();
+        let hour = key("two-window-horizon", "native", 3_600);
+        let day = key("two-window-horizon", "native", 86_400);
+        let mut first = reservation(&"b1".repeat(32), "GSOURCE", 1, now);
+        first.max_time = now / 1000 + 120;
+        let mut second = first.clone();
+        second.id = "b2".repeat(32);
+        second.sequence = 2;
+        second.max_time = now / 1000 + 240;
+        store
+            .record_pending(
+                &profile,
+                &[entry(hour.clone(), now, 7), entry(day.clone(), now, 7)],
+                &first,
+            )
+            .unwrap();
+        store
+            .record_pending(
+                &profile,
+                &[entry(hour.clone(), now, 11), entry(day.clone(), now, 11)],
+                &second,
+            )
+            .unwrap();
+        let wire = store.read_for_inspection(&profile).unwrap().unwrap();
+        let horizon = |id: &str, window_secs: u64| {
+            wire.entries
+                .iter()
+                .filter(|bucket| bucket.window_secs == window_secs)
+                .flat_map(|bucket| {
+                    bucket
+                        .records
+                        .iter()
+                        .filter(|record| record.id == id)
+                        .map(|record| exposure_horizon(record, bucket.window_secs))
+                })
+                .collect::<Vec<_>>()
+        };
+        let first_bound = first.max_time * 1000;
+        let second_bound = second.max_time * 1000;
+        assert_eq!(horizon(&first.id, 3_600), [Some(first_bound + 3_600_000)]);
+        assert_eq!(horizon(&first.id, 86_400), [Some(first_bound + 86_400_000)]);
+        assert_eq!(horizon(&second.id, 3_600), [Some(second_bound + 3_600_000)]);
+        assert_eq!(
+            horizon(&second.id, 86_400),
+            [Some(second_bound + 86_400_000)]
+        );
+        assert_eq!(
+            window_in_file(&wire, &hour, first_bound + 3_600_000).unwrap(),
+            (18, 2)
+        );
+        assert_eq!(
+            window_in_file(&wire, &hour, first_bound + 3_600_001).unwrap(),
+            (11, 1)
+        );
+        assert_eq!(
+            window_in_file(&wire, &hour, second_bound + 3_600_001).unwrap(),
+            (0, 0)
+        );
+        assert_eq!(
+            window_in_file(&wire, &day, first_bound + 86_400_000).unwrap(),
+            (18, 2)
+        );
+        assert_eq!(
+            window_in_file(&wire, &day, first_bound + 86_400_001).unwrap(),
+            (11, 1)
+        );
+        let state = PolicyStateStore::new();
+        store
+            .load_into("two-window-horizon", &profile, &state)
+            .unwrap();
+        assert_eq!(
+            state.query_window(&hour, first_bound + 3_600_001).unwrap(),
+            (11, 1)
+        );
+        assert_eq!(
+            state.query_window(&day, first_bound + 86_400_000).unwrap(),
+            (18, 2)
+        );
+    }
+
+    /// A policy edit that lengthens a window counts earlier exposure under the
+    /// longer duration at query time. Each record still expires on the duration
+    /// it was admitted under.
+    #[test]
+    #[serial]
+    fn policy_duration_edits_apply_the_longer_window_at_query_time() {
+        keyring_mock::install().unwrap();
+        let dir = TempDir::new().unwrap();
+        let profile = test_profile(dir.path(), "edited-horizon");
+        let store = PersistedWindowStore::at_path(dir.path().join("edited.window"));
+        let now = now_ms().unwrap();
+        let short = key("edited-horizon", "native", 60);
+        let long = key("edited-horizon", "native", 3600);
+        let mut first = reservation(&"a1".repeat(32), "GSOURCE", 1, now);
+        first.max_time = now / 1000 + 120;
+        let mut second = first.clone();
+        second.id = "a2".repeat(32);
+        second.sequence = 2;
+        store
+            .record_pending(&profile, &[entry(short, now, 7)], &first)
+            .unwrap();
+        store
+            .record_pending(&profile, &[entry(long.clone(), now, 11)], &second)
+            .unwrap();
+        let wire = store.read_for_inspection(&profile).unwrap().unwrap();
+        let bound = first.max_time * 1000;
+        assert!(!accounting_expired(&wire, &first.id, bound + 60_000));
+        assert!(accounting_expired(&wire, &first.id, bound + 60_001));
+        let until = bound + 3_600_000;
+        assert_eq!(window_in_file(&wire, &long, until).unwrap(), (18, 2));
+        assert_eq!(window_in_file(&wire, &long, until + 1).unwrap(), (0, 0));
+        let state = PolicyStateStore::new();
+        store.load_into("edited-horizon", &profile, &state).unwrap();
+        assert_eq!(state.query_window(&long, until).unwrap(), (18, 2));
+        assert_eq!(state.query_window(&long, until + 1).unwrap(), (0, 0));
+    }
+
+    fn assert_success_horizon(delayed: bool) {
+        keyring_mock::install().unwrap();
+        let dir = TempDir::new().unwrap();
+        let profile = test_profile(dir.path(), "success-horizon");
+        let store = PersistedWindowStore::at_path(dir.path().join("success.window"));
+        let now = now_ms().unwrap();
+        let mut hold = reservation(&"92".repeat(32), "GSOURCE", 1, now);
+        hold.max_time = now / 1000 + 120;
+        let bound = hold.max_time * 1000;
+        let observed = if delayed { bound + 90_000 } else { now };
+        let bucket = key("success-horizon", "native", 60);
+        store
+            .record_pending(&profile, &[entry(bucket.clone(), now, 9)], &hold)
+            .unwrap();
+        store
+            .observe_success(&profile, &hold.id, Some((now / 1000) as i64), observed)
+            .unwrap();
+        store
+            .observe_success(&profile, &hold.id, Some(1), observed + 999_999)
+            .unwrap();
+        let wire = store.read_for_inspection(&profile).unwrap().unwrap();
+        let record = &wire.entries[0].records[0];
+        let until = observed.max(bound) + 60_000;
+        let mut legacy_horizon = record.clone();
+        legacy_horizon.accounting_until_ms = None;
+        assert_eq!(exposure_horizon(&legacy_horizon, 60), Some(until));
+        assert_eq!(record.observed_at_ms, Some(observed));
+        assert_eq!(record.reported_chain_time, Some((now / 1000) as i64));
+        assert_eq!(record.accounting_until_ms, Some(until));
+        assert_eq!(window_in_file(&wire, &bucket, until).unwrap(), (9, 1));
+        assert_eq!(window_in_file(&wire, &bucket, until + 1).unwrap(), (0, 0));
+        let dest = PolicyStateStore::new();
+        store.load_into("success-horizon", &profile, &dest).unwrap();
+        assert_eq!(dest.query_window(&bucket, until).unwrap(), (9, 1));
+        assert_eq!(dest.query_window(&bucket, until + 1).unwrap(), (0, 0));
+        let shorter = key("success-horizon", "native", 1);
+        assert_eq!(dest.query_window(&shorter, until).unwrap(), (9, 1));
+    }
+
+    #[test]
+    #[serial]
+    fn delayed_success_uses_first_observation() {
+        assert_success_horizon(true);
+    }
+
+    #[test]
+    #[serial]
+    fn early_success_keeps_execution_bound() {
+        assert_success_horizon(false);
+    }
+
+    #[test]
+    #[serial]
+    fn negative_reports_never_construct_failure_or_refund() {
+        keyring_mock::install().unwrap();
+        let dir = TempDir::new().unwrap();
+        let profile = test_profile(dir.path(), "negative-reports");
+        let store = PersistedWindowStore::at_path(dir.path().join("negative.window"));
+        let now = now_ms().unwrap();
+        let hold = reservation(&"93".repeat(32), "GSOURCE", 1, now);
+        store
+            .record_pending(
+                &profile,
+                &[entry(key("negative-reports", "native", 60), now, 9)],
+                &hold,
+            )
+            .unwrap();
+        for status in ["FAILED", "NOT_FOUND"] {
+            let record = TransactionRecord::from_raw(serde_json::from_value(serde_json::json!({
+                "status": status, "latestLedger": 9000, "oldestLedger": 8000, "resultXdr": "malformed",
+            })).unwrap());
+            let settlement = store
+                .settle_chain_answer(&profile, None, &hold, &record, now)
+                .unwrap();
+            let mut report = ReconcileReport::default();
+            record_settlement(&mut report, &hold, settlement);
+            assert_eq!(report.released, 0);
+            assert!(report.settled.is_empty());
+            assert_eq!(
+                store.pending_reservations(&profile).unwrap(),
+                vec![hold.clone()]
+            );
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn decisions_refuse_stale_generation_and_record_unbounded_override() {
+        keyring_mock::install().unwrap();
+        let dir = TempDir::new().unwrap();
+        let mut profile = test_profile(dir.path(), "checked-decisions");
+        profile.chain_id = Caip2::Mainnet;
+        let store = PersistedWindowStore::at_path(dir.path().join("decisions.window"));
+        let now = now_ms().unwrap();
+        let mut hold = reservation(&"94".repeat(32), "GSOURCE", 1, now);
+        hold.chain_scope = ChainScope::for_chain(Caip2::Mainnet);
+        store
+            .record_pending(
+                &profile,
+                &[entry(key("checked-decisions", "native", 60), now, 9)],
+                &hold,
+            )
+            .unwrap();
+        assert!(
+            store
+                .operator_clear_decision(&profile, &hold.id, true, false)
+                .is_err()
+        );
+        assert!(
+            store
+                .operator_clear_decision(&profile, &hold.id, false, true)
+                .is_err()
+        );
+        let stale = store
+            .operator_clear_decision(&profile, &hold.id, true, true)
+            .unwrap();
+        store
+            .observe_success(&profile, &hold.id, Some(1), now)
+            .unwrap();
+        assert!(matches!(
+            store.apply_accounting_decision(&profile, stale),
+            Err(WindowStoreError::GenerationMismatch)
+        ));
+        let fresh = store
+            .operator_clear_decision(&profile, &hold.id, true, true)
+            .unwrap();
+        store.apply_accounting_decision(&profile, fresh).unwrap();
+        let wire = store.read_for_inspection(&profile).unwrap().unwrap();
+        let record = &wire.entries[0].records[0];
+        assert_eq!(record.status, RecordStatus::OperatorCleared);
+        assert_eq!(record.acknowledged_unbounded, Some(true));
+    }
+
+    /// An untimed testnet hold needs the unbounded acknowledgement as a
+    /// mainnet one does, after a reported success included, and the cleared
+    /// records carry the acknowledgement.
+    #[test]
+    #[serial]
+    fn an_untimed_testnet_override_needs_the_unbounded_acknowledgement() {
+        keyring_mock::install().unwrap();
+        let dir = TempDir::new().unwrap();
+        let profile = test_profile(dir.path(), "testnet-unbounded");
+        let store = PersistedWindowStore::at_path(dir.path().join("unbounded.window"));
+        let now = now_ms().unwrap();
+        let hold = reservation(&"95".repeat(32), "GSOURCE", 1, now);
+        store
+            .record_pending(
+                &profile,
+                &[entry(key("testnet-unbounded", "native", 60), now, 9)],
+                &hold,
+            )
+            .unwrap();
+        store
+            .observe_success(&profile, &hold.id, Some(1), now)
+            .unwrap();
+        assert!(matches!(
+            store.operator_clear_decision(&profile, &hold.id, true, false),
+            Err(WindowStoreError::Invalid { .. })
+        ));
+        let decision = store
+            .operator_clear_decision(&profile, &hold.id, true, true)
+            .unwrap();
+        store.apply_accounting_decision(&profile, decision).unwrap();
+        let wire = store.read_for_inspection(&profile).unwrap().unwrap();
+        let record = &wire.entries[0].records[0];
+        assert_eq!(record.status, RecordStatus::OperatorCleared);
+        assert_eq!(record.acknowledged_unbounded, Some(true));
+        assert!(store.pending_reservations(&profile).unwrap().is_empty());
+    }
+
+    #[test]
+    #[cfg(feature = "mainnet-write")]
+    fn submission_anchor_requires_the_checked_subject() {
+        let scope = ChainScope::for_chain(Caip2::Mainnet);
+        let unbound = crate::cross_check::CrossCheckWitness::for_crate_tests(
+            "https://oracle.example",
+            123,
+            [1; 32],
+            vec![],
+        );
+        assert!(SubmissionAnchor::from_witness(scope, &unbound, [2; 32], 77).is_none());
+        let witness = unbound.bound_for_crate_tests([2; 32]);
+        assert!(SubmissionAnchor::from_witness(scope, &witness, [3; 32], 77).is_none());
+        let anchor = SubmissionAnchor::from_witness(scope, &witness, [2; 32], 77).unwrap();
+        assert_eq!(anchor.ledger, 123);
+        assert_eq!(anchor.witness_binding, witness.fact_digest());
+        assert_eq!(anchor.witness_authority, witness.authority());
+        assert_eq!(anchor.observed_at_ms, 77);
     }
 
     // ── wire versions ───────────────────────────────────────────────────
@@ -5771,6 +7203,152 @@ mod tests {
         }
     }
 
+    /// A snapshot with an exposure-era status, accounting field or submission
+    /// anchor is written as version 7; one with only confirmed and pending
+    /// records keeps version 5, or 6 with a claim.
+    #[test]
+    #[serial]
+    fn wire_version_tracks_exposure_content_and_preserves_legacy_records() {
+        let scope = ChainScope::for_chain(Caip2::Mainnet);
+        let base = WireRecord {
+            chain_scope: Some(scope),
+            tx_hash: "02".repeat(32),
+            ..WireRecord::confirmed_defaults()
+        };
+        let pending = WireRecord {
+            status: RecordStatus::Pending,
+            ..base.clone()
+        };
+        let settled = settled_authorization(1);
+        let mut cases = vec![(vec![base.clone(), pending], settled.clone(), 5)];
+        for status in [
+            RecordStatus::Exposure,
+            RecordStatus::AccountingExpired,
+            RecordStatus::OperatorCleared,
+        ] {
+            cases.push((
+                vec![WireRecord {
+                    status,
+                    ..base.clone()
+                }],
+                settled.clone(),
+                7,
+            ));
+        }
+        for status in [RecordStatus::Confirmed, RecordStatus::Pending] {
+            let base = WireRecord {
+                status,
+                ..base.clone()
+            };
+            for record in [
+                WireRecord {
+                    submission_anchor: Some(SubmissionAnchor {
+                        chain_scope: scope,
+                        ledger: 1,
+                        observed_at_ms: 0,
+                        witness_authority: "https://oracle.example".to_owned(),
+                        witness_binding: [1; 32],
+                        subject: [2; 32],
+                    }),
+                    ..base.clone()
+                },
+                WireRecord {
+                    execution_bound: Some(0),
+                    ..base.clone()
+                },
+                WireRecord {
+                    observed_at_ms: Some(0),
+                    ..base.clone()
+                },
+                WireRecord {
+                    reported_chain_time: Some(0),
+                    ..base.clone()
+                },
+                WireRecord {
+                    accounting_until_ms: Some(0),
+                    ..base.clone()
+                },
+                WireRecord {
+                    admitted_window_ms: Some(0),
+                    ..base.clone()
+                },
+                WireRecord {
+                    acknowledged_unbounded: Some(false),
+                    ..base.clone()
+                },
+            ] {
+                cases.push((vec![record], settled.clone(), 7));
+            }
+        }
+        // A used authorization keeps its anchored consumption after the unwind
+        // of a failed submission deleted the pending records it names.
+        let mut anchored = settled_authorization(2);
+        anchored.state = ledger::AuthorizationState::Used;
+        anchored.binding = ledger::DomainBinding::Transaction {
+            unsigned_envelope_sha256: [2; 32],
+            tx_hash: [3; 32],
+            source: "synthetic-source".to_owned(),
+            sequence: 1,
+        };
+        anchored.domain = crate::mainnet::AuthorizationDomain::Transaction;
+        anchored.consumer = crate::mainnet::MainnetConsumer::CliPay;
+        anchored.content_digest = anchored.binding.content_digest();
+        anchored.consumption = Some(ledger::ConsumptionBinding::Transaction(
+            ledger::SubmissionBinding {
+                chain_scope: Some(scope),
+                fee_bump: None,
+                envelope_hash: [2; 32],
+                tx_hash: [3; 32],
+                source: "synthetic-source".to_owned(),
+                sequence: 1,
+                max_time: 0,
+                pending_since_ms: 90_000,
+                submission_ledger: 1,
+                submission_anchor: Some(Box::new(SubmissionAnchor {
+                    chain_scope: scope,
+                    ledger: 1,
+                    observed_at_ms: 0,
+                    witness_authority: "https://oracle.example".to_owned(),
+                    witness_binding: [1; 32],
+                    subject: [3; 32],
+                })),
+            },
+        ));
+        cases.push((Vec::new(), anchored, 7));
+        for (records, authorization, version) in cases {
+            for claimed_ms in [None, Some(1)] {
+                let mut f = ResetFixture::new();
+                f.profile.chain_id = Caip2::Mainnet;
+                let mut wire = reset_wire();
+                wire.chain_scope = Some(scope);
+                wire.entries[0].records = records.clone();
+                let mut auth = authorization.clone();
+                auth.claimed_ms = claimed_ms;
+                wire.authorizations.push(auth);
+                let expected = if version == 5 && claimed_ms.is_some() {
+                    6
+                } else {
+                    version
+                };
+                let (key, _) = f.store.load_or_mint_key(&f.profile).unwrap();
+                f.store
+                    .commit_generation(
+                        &key,
+                        &generation_entry_ref(&f.profile),
+                        WireFile::default(),
+                        wire,
+                    )
+                    .unwrap();
+                let bytes = fs::read(f.store.path()).unwrap();
+                let body: serde_json::Value =
+                    serde_json::from_slice(&bytes[HMAC_TAG_LEN..]).unwrap();
+                assert_eq!(body["version"], expected, "{records:?}, {claimed_ms:?}");
+                let written = f.store.read_for_inspection(&f.profile).unwrap().unwrap();
+                assert_eq!(written.version, expected);
+            }
+        }
+    }
+
     /// Every supported pair of a current and a prepared snapshot version is
     /// read on both sides of the commit point: before the counter commits the
     /// successor, the current snapshot wins; after, the successor does, also
@@ -5789,6 +7367,8 @@ mod tests {
             (4, 4),
             (4, 3),
             (5, 5),
+            (6, 7),
+            (7, 7),
         ] {
             let pair = format!("{current_version}->{prepared_version}");
             keyring_mock::install().unwrap();
@@ -6270,7 +7850,7 @@ mod tests {
             f.seal(&reset_wire());
             let key =
                 crate::keyring::load_hmac_key_32(&f.profile.policy_window_state_key_id).unwrap();
-            let body = br#"{"version":7,"future_authorities":[{"open":true}],"prepared":"future representation"}"#;
+            let body = br#"{"version":8,"future_authorities":[{"open":true}],"prepared":"future representation"}"#;
             f.store
                 .write_atomic_raw(&compute_tag(key.as_ref(), body).unwrap(), body)
                 .unwrap();
@@ -6278,13 +7858,13 @@ mod tests {
             assert!(
                 matches!(
                     f.store.verify_with_key(&key, &before),
-                    Err(WindowStoreError::UnsupportedVersion { version: 7, max: 6 })
+                    Err(WindowStoreError::UnsupportedVersion { version: 8, max: 7 })
                 ),
                 "{chain:?}"
             );
             assert_eq!(
                 defect_of(
-                    &WindowStoreError::UnsupportedVersion { version: 7, max: 6 },
+                    &WindowStoreError::UnsupportedVersion { version: 8, max: 7 },
                     false
                 ),
                 None
@@ -6298,7 +7878,7 @@ mod tests {
                 matches!(
                     result,
                     Err(ResetError::Store {
-                        error: WindowStoreError::UnsupportedVersion { version: 7, max: 6 },
+                        error: WindowStoreError::UnsupportedVersion { version: 8, max: 7 },
                         minted: false,
                     })
                 ),
@@ -6546,6 +8126,7 @@ mod tests {
                 max_time: 0,
                 pending_since_ms: 90_000,
                 submission_ledger: 1,
+                submission_anchor: None,
             },
         ));
         valid.authorizations.push(auth);
@@ -7126,11 +8707,19 @@ mod tests {
             f.store
                 .load_into("reset-snapshot", &f.profile, &state)
                 .unwrap();
+            // The concurrent commit survives the confirm, and the untimed
+            // reported success keeps counting in every window of its bucket.
             assert_eq!(
                 state
                     .query_window(&key("reset-snapshot", "native", 86_400), now_ms().unwrap())
                     .unwrap(),
-                (11, 1)
+                (16, 2)
+            );
+            assert_eq!(
+                state
+                    .query_window(&key("reset-snapshot", "native", 3_600), now_ms().unwrap())
+                    .unwrap(),
+                (5, 1)
             );
         }
     }

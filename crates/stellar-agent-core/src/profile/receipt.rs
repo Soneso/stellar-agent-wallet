@@ -214,11 +214,12 @@ pub enum ReceiptStatus {
     ///
     /// Written by `tx receipt clear --acknowledge` after the command has
     /// reconciled the submission against the chain: for an `Ambiguous`
-    /// receipt released on chain evidence (once its settled audit row is in
-    /// the log), an `Ambiguous` receipt without evidence, a `Pending` receipt
-    /// with no time bound, a `Pending` receipt that was never sent, and an
-    /// orphan recovered from its reservation. A sent `Pending` receipt whose
-    /// time bound is still open and whose sequence is unconsumed is refused.
+    /// receipt with an accounting disposition, an `Ambiguous` receipt without
+    /// one, a `Pending` receipt with no time bound, a `Pending` receipt that
+    /// was never sent, and an orphan recovered from its reservation. A
+    /// receipt in any other state whose authenticated hold has no execution
+    /// bound is cleared too, with `--acknowledge-unbounded`. A sent `Pending`
+    /// receipt whose time bound is still open is refused.
     ///
     /// The receipt is marked, not removed, so the envelope keeps its
     /// idempotency anchor: a byte-identical resubmission still gets
@@ -230,12 +231,11 @@ pub enum ReceiptStatus {
 ///
 /// Deliberately exhaustive: every caller chooses the audit row from this
 /// answer, so a new variant must make each caller fail to compile until it
-/// handles that row.
+/// handles that row. A reported success owes no row, so only a definitive
+/// failure has one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SettledRow<'a> {
-    /// The chain confirmed the submission.
-    Submitted,
-    /// The chain rejected the submission or evidence released its reservation.
+    /// The receipt records a definitive failure.
     Failed {
         /// The failure or release-evidence code recorded on the row.
         code: &'a str,
@@ -280,30 +280,42 @@ impl ReceiptStatus {
     /// refused, because it needs no acknowledgement, and so is one already
     /// cleared.
     ///
-    /// The chain-side half of the rule is the caller's: clearing states that
-    /// the transaction did not move value, and only the endpoint can
-    /// contradict that. `stellar-agent tx receipt clear` evaluates this
-    /// predicate first, so a clear it will refuse releases nothing and writes
-    /// no row, then asks the endpoint, reconciles, and refuses a sent
-    /// transaction whose time bound is still open.
+    /// The chain-side half of the rule is the caller's: clearing records the
+    /// operator's decision and establishes no chain outcome.
+    /// `stellar-agent tx receipt clear` evaluates this predicate before
+    /// reconciliation, after the audit-history lookup, so a clear it refuses
+    /// here releases nothing and writes no row of its own; it then asks the
+    /// endpoint, reconciles, and refuses a sent transaction whose time bound
+    /// is still open.
     #[must_use]
     pub fn is_operator_clearable(&self) -> bool {
         matches!(self, Self::Pending | Self::Ambiguous)
     }
 
+    /// Returns `true` when an operator may clear a receipt in this status
+    /// whose submission holds an authenticated window reservation with no
+    /// execution bound.
+    ///
+    /// Every status but `ClearedByOperator` qualifies, a reported `Success`
+    /// or `Failed` included. Untimed bytes can apply for as long as their
+    /// sequence stays unconsumed, so no endpoint report settles their
+    /// exposure, and the receipt is unauthenticated and cannot narrow the
+    /// operator's acknowledged decision.
+    #[must_use]
+    pub fn is_clearable_with_unbounded_hold(&self) -> bool {
+        !matches!(self, Self::ClearedByOperator)
+    }
+
     /// Returns the settled audit row owed, using the receipt's `release_code`.
     ///
-    /// `Success` owes a submitted row. `Failed` owes a failed row with its code;
-    /// `Ambiguous` with evidence owes a failed row with the evidence's code.
-    /// Other states return `None` because they owe no settled row.
+    /// Reported success and ambiguous accounting dispositions owe no authenticated
+    /// chain fact. A definitive failed status retains its explicit failure code.
     #[must_use]
     pub fn settled_row(&self, release_code: Option<ReleaseEvidence>) -> Option<SettledRow<'_>> {
         match (self, release_code) {
-            (Self::Success, _) => Some(SettledRow::Submitted),
+            (Self::Success, _) => None,
             (Self::Failed { code }, _) => Some(SettledRow::Failed { code }),
-            (Self::Ambiguous, Some(evidence)) => Some(SettledRow::Failed {
-                code: evidence.code(),
-            }),
+            (Self::Ambiguous, Some(_)) => None,
             _ => None,
         }
     }
@@ -335,38 +347,40 @@ pub const SEQUENCE_CONSUMED_CODE: &str = "submission.sequence_consumed";
 /// Wire code of [`ReleaseEvidence::TimeBoundPassed`].
 pub const TIME_BOUND_PASSED_CODE: &str = "submission.time_bound_passed";
 
-/// The chain evidence on which reconciliation released a reservation whose
-/// transaction the endpoint never reported.
+/// The conservative accounting horizon elapsed with the chain outcome unknown.
+pub const ACCOUNTING_EXPIRED_CODE: &str = "submission.accounting_expired";
+
+/// Observations and accounting dispositions attached to an ambiguous receipt.
 ///
-/// Both kinds rest on a fresh `getTransaction` answer of `NOT_FOUND` taken
-/// after the evidence was observed, from an endpoint whose retention window
-/// covers the submission ledger. No `TransactionResult` exists for either, so
-/// the receipt stays [`ReceiptStatus::Ambiguous`] and carries the evidence in
-/// [`SubmissionReceipt::release_code`].
-///
-/// Serialized as its wire code, the same string the settled
-/// `value_action_failed` audit row carries.
+/// Sequence and time claims do not prove failure or authorize capacity release.
+/// Accounting expiry means that the signed deadline and affected windows elapsed.
+/// None of these values creates a definitive failed audit fact.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ReleaseEvidence {
-    /// The source account's sequence reached the one the transaction
-    /// consumes, so another transaction used it.
+    /// The endpoint reports a source sequence at or beyond the transaction's.
+    /// This observation does not identify which transaction consumes it.
     #[serde(rename = "submission.sequence_consumed")]
     SequenceConsumed,
-    /// An observed ledger close time is strictly past the transaction's
-    /// nonzero `maxTime`, so the network can no longer apply it.
+    /// The endpoint reports a ledger close time past the signed `maxTime`.
+    /// This observation does not establish whether value moves before that bound.
     #[serde(rename = "submission.time_bound_passed")]
     TimeBoundPassed,
+    /// All affected accounting windows end after the signed execution deadline.
+    #[serde(rename = "submission.accounting_expired")]
+    AccountingExpired,
 }
 
 impl ReleaseEvidence {
     /// Returns the stable wire code for this evidence:
-    /// [`SEQUENCE_CONSUMED_CODE`] or [`TIME_BOUND_PASSED_CODE`].
+    /// [`SEQUENCE_CONSUMED_CODE`], [`TIME_BOUND_PASSED_CODE`], or
+    /// [`ACCOUNTING_EXPIRED_CODE`].
     #[must_use]
     pub fn code(self) -> &'static str {
         match self {
             Self::SequenceConsumed => SEQUENCE_CONSUMED_CODE,
             Self::TimeBoundPassed => TIME_BOUND_PASSED_CODE,
+            Self::AccountingExpired => ACCOUNTING_EXPIRED_CODE,
         }
     }
 }
@@ -1301,35 +1315,6 @@ impl ReceiptStore {
         self.acknowledge_approval_consumption(envelope_hash)
     }
 
-    /// Records a definitive send refusal and releases its approval atomically.
-    ///
-    /// # Errors
-    ///
-    /// Returns a receipt-store error if the receipt is absent, settled, or cannot be persisted.
-    pub fn finalize_send_refusal(
-        &self,
-        envelope_hash: &str,
-        code: &str,
-    ) -> Result<(), ReceiptStoreError> {
-        let mut session = self.write_session()?;
-        let receipt = session.guard.map.get_mut(envelope_hash).ok_or(
-            ReceiptStoreError::InvalidTransition {
-                from: "absent",
-                to: "failed",
-            },
-        )?;
-        let status = ReceiptStatus::Failed {
-            code: code.to_owned(),
-        };
-        check_transition(&receipt.status, &status)?;
-        receipt.status = status;
-        receipt.ledger = None;
-        receipt.approval_nonce = None;
-        receipt.approval_consumed = false;
-        session.guard.rebuild_indexes();
-        persist_locked(&mut session.guard)
-    }
-
     fn acknowledge_approval_consumption(
         &self,
         envelope_hash: &str,
@@ -1459,7 +1444,9 @@ impl ReceiptStore {
                 r.ledger = ledger;
                 if !keeps_evidence {
                     r.release_code = None;
-                } else if r.release_code.is_none() {
+                } else if r.release_code.is_none()
+                    || evidence == Some(ReleaseEvidence::AccountingExpired)
+                {
                     r.release_code = evidence;
                 }
             })
@@ -1527,6 +1514,44 @@ impl ReceiptStore {
         &self,
         envelope_hash: &str,
     ) -> Result<SubmissionReceipt, ReceiptStoreError> {
+        self.clear_where(envelope_hash, ReceiptStatus::is_operator_clearable)
+    }
+
+    /// Records the operator's clear of a receipt whose submission holds an
+    /// authenticated window reservation with no execution bound.
+    ///
+    /// The accepted states are the ones
+    /// [`ReceiptStatus::is_clearable_with_unbounded_hold`] names: every state
+    /// but `ClearedByOperator`. The caller establishes the untimed hold from
+    /// the authenticated window and holds both operator acknowledgements;
+    /// this method reads the receipt and nothing else.
+    ///
+    /// # Errors
+    ///
+    /// - [`ReceiptStoreError::InvalidTransition`] for an absent receipt or one
+    ///   already cleared.
+    /// - The store errors [`Self::clear_by_operator`] names.
+    ///
+    /// # Panics
+    ///
+    /// Never panics.
+    pub fn clear_unbounded_by_operator(
+        &self,
+        envelope_hash: &str,
+    ) -> Result<SubmissionReceipt, ReceiptStoreError> {
+        self.clear_where(
+            envelope_hash,
+            ReceiptStatus::is_clearable_with_unbounded_hold,
+        )
+    }
+
+    /// Marks the receipt `ClearedByOperator` when `accepts` admits its
+    /// status.
+    fn clear_where(
+        &self,
+        envelope_hash: &str,
+        accepts: fn(&ReceiptStatus) -> bool,
+    ) -> Result<SubmissionReceipt, ReceiptStoreError> {
         let mut session = self.write_session()?;
 
         let Some(existing) = session.guard.map.get(envelope_hash) else {
@@ -1536,7 +1561,7 @@ impl ReceiptStore {
             });
         };
 
-        if !existing.status.is_operator_clearable() {
+        if !accepts(&existing.status) {
             return Err(ReceiptStoreError::InvalidTransition {
                 from: existing.status.label(),
                 to: ReceiptStatus::ClearedByOperator.label(),
@@ -3429,6 +3454,47 @@ mod tests {
         ));
     }
 
+    /// Under an untimed hold a receipt the endpoint reported on is clearable,
+    /// and only an already cleared or absent receipt is refused.
+    #[test]
+    fn an_unbounded_clear_accepts_reported_outcomes() {
+        let (_dir, store) = open_temp_store();
+        for (hash, tx_hash, source, sequence, status) in [
+            (HASH_A, TX_HASH_A, SOURCE_A, SEQ_A, ReceiptStatus::Success),
+            (
+                HASH_B,
+                TX_HASH_B,
+                SOURCE_B,
+                SEQ_B,
+                ReceiptStatus::Failed {
+                    code: "ledger.op_failed".to_owned(),
+                },
+            ),
+        ] {
+            store
+                .try_begin(hash, tx_hash, source, sequence, 0, 100)
+                .unwrap();
+            store.finalize(hash, status.clone(), Some(3)).unwrap();
+            assert!(
+                store.clear_by_operator(hash).is_err(),
+                "the ordinary clear refuses {status:?}"
+            );
+            let cleared = store.clear_unbounded_by_operator(hash).unwrap();
+            assert_eq!(cleared.status, ReceiptStatus::ClearedByOperator);
+            assert!(matches!(
+                store.clear_unbounded_by_operator(hash),
+                Err(ReceiptStoreError::InvalidTransition {
+                    from: "cleared_by_operator",
+                    ..
+                })
+            ));
+        }
+        assert!(matches!(
+            store.clear_unbounded_by_operator(HASH_C),
+            Err(ReceiptStoreError::InvalidTransition { from: "absent", .. })
+        ));
+    }
+
     /// A receipt for a submission that was never sent is clearable, and the
     /// pair it holds is freed.
     ///
@@ -3811,52 +3877,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn definitive_send_refusal_releases_approval_in_the_receipt_write() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = ReceiptStore::open_at(dir.path(), "approval-refusal").unwrap();
-        store
-            .begin_submission_with_approval(
-                "first",
-                &"a".repeat(64),
-                "source",
-                1,
-                0,
-                100,
-                Some("approval"),
-            )
-            .unwrap();
-        store.mark_submitted("first").unwrap();
-        store
-            .finalize_send_refusal("first", "submission.tx_malformed")
-            .unwrap();
-        let reopened = ReceiptStore::open_at(dir.path(), "approval-refusal").unwrap();
-        assert!(
-            reopened
-                .find_by_approval_nonce("approval")
-                .unwrap()
-                .is_none()
-        );
-        assert!(matches!(
-            reopened.get("first").unwrap().unwrap().status,
-            ReceiptStatus::Failed { .. }
-        ));
-        assert!(matches!(
-            reopened
-                .begin_submission_with_approval(
-                    "second",
-                    &"b".repeat(64),
-                    "source",
-                    1,
-                    0,
-                    100,
-                    Some("approval"),
-                )
-                .unwrap(),
-            BeginSubmissionOutcome::Recorded
-        ));
-    }
-
     // ── Release evidence ──────────────────────────────────────────────────────
 
     /// A receipt as a binary without the release evidence writes it reads with
@@ -3907,8 +3927,29 @@ mod tests {
         }
     }
 
-    /// The evidence is written once onto an ambiguous receipt, survives a
-    /// reopen and an operator clear, and is dropped by a definitive answer.
+    /// Accounting expiry is a distinct unknown disposition, never a failed fact.
+    #[test]
+    fn accounting_expiry_is_a_distinct_unknown_disposition() {
+        let evidence = ReleaseEvidence::AccountingExpired;
+        assert_eq!(evidence.code(), "submission.accounting_expired");
+        let encoded = serde_json::to_string(&evidence).unwrap();
+        assert_eq!(
+            serde_json::from_str::<ReleaseEvidence>(&encoded).unwrap(),
+            evidence
+        );
+        for observation in [
+            ReleaseEvidence::SequenceConsumed,
+            ReleaseEvidence::TimeBoundPassed,
+            evidence,
+        ] {
+            assert_eq!(
+                ReceiptStatus::Ambiguous.settled_row(Some(observation)),
+                None
+            );
+        }
+    }
+
+    /// Observations survive reopening and clear and are replaced by a terminal report.
     #[test]
     fn release_evidence_is_set_once_and_follows_the_status() {
         let (dir, store) = open_temp_store();

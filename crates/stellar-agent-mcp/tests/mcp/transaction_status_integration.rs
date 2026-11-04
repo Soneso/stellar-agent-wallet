@@ -1,12 +1,9 @@
 //! `stellar_transaction_status` and the dispatch gate's reconciliation pass
 //! against a mocked endpoint, on records seeded in the isolated data root.
 //!
-//! The status tool settles a submission by its receipt, or by its
-//! authenticated reservation when the receipt is missing, the way
-//! `stellar-agent tx status` does. A reservation released on chain evidence
-//! writes its settled row under the evidence's code, and a reason the gate
-//! pass could not write is written by the next status call. No path sends,
-//! which the responder counts.
+//! The status tool observes a submission by its receipt or authenticated
+//! reservation. Endpoint reports retain exposure without creating definitive
+//! outcome rows. No path sends, which the responder counts.
 
 #![allow(
     clippy::unwrap_used,
@@ -21,7 +18,7 @@ use std::sync::{Arc, Mutex};
 use serde_json::{Value, json};
 use serial_test::serial;
 use stellar_agent_core::policy::v1::criteria::state_store::{StateKey, WindowEntry, WindowLimit};
-use stellar_agent_core::profile::receipt::{ReceiptStatus, ReceiptStore, ReleaseEvidence};
+use stellar_agent_core::profile::receipt::{ReceiptStatus, ReceiptStore};
 use stellar_agent_core::profile::schema::Profile;
 use stellar_agent_mcp::server::{StellarPayArgs, StellarTransactionStatusArgs, WalletServer};
 use stellar_agent_network::policy_state::{PersistedWindowStore, SubmissionHold};
@@ -186,6 +183,7 @@ fn seed_reservation(profile: &Profile, profile_name: &str, sequence: i64) -> Per
                 max_time: 0,
                 pending_since_ms: now - 400_000,
                 submission_ledger: SUBMISSION_LEDGER,
+                submission_anchor: None,
                 operator_required: false,
             },
         )
@@ -305,11 +303,10 @@ fn the_tool_descriptions_carry_the_timeout_recovery() {
 // Release evidence
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// A passed time bound releases the submission, and the status tool writes
-/// the settled row under `submission.time_bound_passed` once.
+/// A passed time bound alone does not prove the possible spend is safe to forget.
 #[tokio::test]
 #[serial]
-async fn transaction_status_writes_the_time_bound_release_code() {
+async fn transaction_status_retains_a_time_bound_observation() {
     let _data_root = crate::common::isolated_data_root();
     keyring_mock::install().expect("mock keyring store init");
     let rpc = StatusRpc::new("NOT_FOUND", 1);
@@ -323,20 +320,16 @@ async fn transaction_status_writes_the_time_bound_release_code() {
 
     let json = status(&server).await;
 
-    assert_eq!(json["data"]["record"]["status"], "ambiguous", "{json}");
-    assert_eq!(
-        json["data"]["record"]["release_code"], "submission.time_bound_passed",
-        "{json}"
-    );
+    assert_eq!(json["data"]["record"]["status"], "pending", "{json}");
+    assert!(json["data"]["record"]["release_code"].is_null(), "{json}");
     let failed = rows_naming(&profile, "value_action_failed");
-    assert_eq!(failed.len(), 1, "{failed:?}");
-    assert_eq!(failed[0]["code"], "submission.time_bound_passed");
+    assert!(failed.is_empty(), "{failed:?}");
 
     status(&server).await;
     assert_eq!(
         rows_naming(&profile, "value_action_failed").len(),
-        1,
-        "a rerun writes no second row"
+        0,
+        "a rerun writes no outcome row"
     );
     assert_eq!(rpc.sends(), 0, "the status tool never sends");
 }
@@ -345,11 +338,11 @@ async fn transaction_status_writes_the_time_bound_release_code() {
 // Orphan recovery
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// A reservation whose receipt is missing is settled by the status tool: a
-/// definitive answer restores the receipt and writes the settled row once.
+/// A success report restores a missing receipt while retaining exposure and
+/// leaving authenticated outcome audit rows absent.
 #[tokio::test]
 #[serial]
-async fn transaction_status_restores_an_orphan_on_a_definitive_answer() {
+async fn transaction_status_restores_an_orphan_on_a_success_report() {
     let _data_root = crate::common::isolated_data_root();
     keyring_mock::install().expect("mock keyring store init");
     let rpc = StatusRpc::new("SUCCESS", 1_200);
@@ -363,22 +356,22 @@ async fn transaction_status_restores_an_orphan_on_a_definitive_answer() {
 
     assert_eq!(json["data"]["chain_status"], "SUCCESS");
     assert_eq!(json["data"]["record"]["status"], "success", "{json}");
-    assert_eq!(json["data"]["record"]["reservation_open"], false);
-    assert!(json["data"]["reservation"].is_null(), "{json}");
-    assert!(window.pending_reservations(&profile).unwrap().is_empty());
+    assert_eq!(json["data"]["record"]["reservation_open"], true);
+    assert_eq!(json["data"]["reservation"]["envelope_hash"], ENVELOPE_HASH);
+    assert_eq!(window.pending_reservations(&profile).unwrap().len(), 1);
     let restored = ReceiptStore::open(&profile_name)
         .unwrap()
         .get(ENVELOPE_HASH)
         .unwrap()
         .expect("the definitive answer restores the receipt");
     assert_eq!(restored.status, ReceiptStatus::Success);
-    assert_eq!(rows_naming(&profile, "value_action_submitted").len(), 1);
+    assert_eq!(rows_naming(&profile, "value_action_submitted").len(), 0);
 
     status(&server).await;
     assert_eq!(
         rows_naming(&profile, "value_action_submitted").len(),
-        1,
-        "a rerun writes no second row"
+        0,
+        "a rerun writes no outcome row"
     );
     assert_eq!(rpc.sends(), 0, "the status tool never sends");
 }
@@ -418,12 +411,10 @@ async fn transaction_status_reports_an_orphan_beyond_retention() {
 // The dispatch gate's reconciliation pass
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// The pass a value-moving dispatch runs releases a due reservation on chain
-/// evidence, writes its settled row under the evidence's code, and never
-/// sends.
+/// The dispatch gate retains exposure on negative observations and never sends.
 #[tokio::test]
 #[serial]
-async fn the_gate_pass_settles_on_evidence_and_never_sends() {
+async fn the_gate_pass_retains_negative_exposure_and_never_sends() {
     let _data_root = crate::common::isolated_data_root();
     keyring_mock::install().expect("mock keyring store init");
     let rpc = StatusRpc::new("NOT_FOUND", 1);
@@ -439,8 +430,8 @@ async fn the_gate_pass_settles_on_evidence_and_never_sends() {
     let _ = server.call_stellar_pay(simulate_args()).await;
 
     assert!(
-        window.pending_reservations(&profile).unwrap().is_empty(),
-        "the pass released the reservation"
+        window.pending_reservations(&profile).unwrap().len() == 1,
+        "the pass retains the reservation"
     );
     assert_eq!(
         ReceiptStore::open(&profile_name)
@@ -449,19 +440,17 @@ async fn the_gate_pass_settles_on_evidence_and_never_sends() {
             .unwrap()
             .unwrap()
             .release_code,
-        Some(ReleaseEvidence::SequenceConsumed)
+        None
     );
     let failed = rows_naming(&profile, "value_action_failed");
-    assert_eq!(failed.len(), 1, "{failed:?}");
-    assert_eq!(failed[0]["code"], "submission.sequence_consumed");
+    assert!(failed.is_empty(), "{failed:?}");
     assert_eq!(rpc.sends(), 0, "the gate pass never sends");
 }
 
-/// A gate pass that cannot acquire the audit writer leaves the reason on the
-/// receipt, and the next status call writes the settled row under it.
+/// An unavailable audit writer does not turn absence into an owed failure row.
 #[tokio::test]
 #[serial]
-async fn a_release_reason_left_by_a_gate_pass_is_written_by_transaction_status() {
+async fn a_negative_gate_observation_does_not_owe_an_audit_failure() {
     let _data_root = crate::common::isolated_data_root();
     keyring_mock::install().expect("mock keyring store init");
     let rpc = StatusRpc::new("NOT_FOUND", 1);
@@ -481,7 +470,7 @@ async fn a_release_reason_left_by_a_gate_pass_is_written_by_transaction_status()
         .unwrap();
     let _ = server.call_stellar_pay(simulate_args()).await;
 
-    assert!(window.pending_reservations(&profile).unwrap().is_empty());
+    assert_eq!(window.pending_reservations(&profile).unwrap().len(), 1);
     assert_eq!(
         ReceiptStore::open(&profile_name)
             .unwrap()
@@ -489,21 +478,17 @@ async fn a_release_reason_left_by_a_gate_pass_is_written_by_transaction_status()
             .unwrap()
             .unwrap()
             .release_code,
-        Some(ReleaseEvidence::SequenceConsumed),
-        "the receipt keeps the reason the row is owed"
+        None,
+        "the receipt has no definitive failure evidence"
     );
     assert!(rows_naming(&profile, "value_action_failed").is_empty());
 
     crate::common::install_test_audit_key(&mut profile);
     let json = status(&server).await;
 
-    assert_eq!(
-        json["data"]["record"]["release_code"], "submission.sequence_consumed",
-        "{json}"
-    );
+    assert!(json["data"]["record"]["release_code"].is_null(), "{json}");
     let failed = rows_naming(&profile, "value_action_failed");
-    assert_eq!(failed.len(), 1, "{failed:?}");
-    assert_eq!(failed[0]["code"], "submission.sequence_consumed");
+    assert!(failed.is_empty(), "{failed:?}");
     assert_eq!(rpc.sends(), 0, "neither call sends");
 }
 

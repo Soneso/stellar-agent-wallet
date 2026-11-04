@@ -2503,7 +2503,7 @@ mod tests {
         use super::*;
         use crate::test_rpc::{
             ACCOUNT_SEQUENCE, ClassicRpc, PRIMARY_CREDENTIAL, PRIMARY_CREDENTIAL_TOKEN,
-            account_key, account_xdr, assert_rows_carry_witness, credential_primary,
+            account_key, account_xdr, assert_pending_row_carries_witness, credential_primary,
             fail_read_of_with_text, methods, sent,
         };
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -2689,7 +2689,7 @@ mod tests {
                     }
                 );
                 if matches!(case, Case::Pass) {
-                    assert_rows_carry_witness(&profile, &oracle.uri());
+                    assert_pending_row_carries_witness(&profile, &oracle.uri());
                 } else {
                     assert!(methods(&oracle).await.is_empty());
                 }

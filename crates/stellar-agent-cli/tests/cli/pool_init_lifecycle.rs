@@ -412,7 +412,7 @@ async fn interrupted_after_seed_write_resumes_with_the_persisted_seed() {
     assert_eq!(rpc.0.lock().unwrap().send_count, 1);
     assert_eq!(event_count(home.path(), "channel_pool_initialised"), 1);
     assert_eq!(event_count(home.path(), "value_action_pending"), 1);
-    assert_eq!(event_count(home.path(), "value_action_submitted"), 1);
+    assert_eq!(event_count(home.path(), "value_action_submitted"), 0);
 }
 
 /// An acknowledged chain success survives interrupted profile persistence;

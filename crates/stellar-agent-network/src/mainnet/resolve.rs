@@ -3844,6 +3844,7 @@ mod tests {
                                 max_time: 0,
                                 pending_since_ms: f.now,
                                 submission_ledger: 100,
+                                submission_anchor: None,
                             }),
                         )
                         .unwrap();

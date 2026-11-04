@@ -3319,22 +3319,26 @@ pub enum EventKind {
     SubmissionReceiptCleared {
         /// Transaction hash of the cleared submission, redacted first-8-last-8.
         transaction_hash_redacted: String,
-        /// The receipt status the clear replaced, as its stable wire tag
-        /// (`"pending"` or `"ambiguous"`).
+        /// The receipt status the clear replaced, as its stable wire tag:
+        /// `"pending"` or `"ambiguous"`, and under an untimed hold also
+        /// `"success"`, `"failed"` or `"reorged"`.
         cleared_from: String,
-        /// True when the command finds a held reservation at its start or
-        /// after its reconciliation, and releases it through reconciliation
-        /// or the clear. False when no reservation is held while it runs.
-        /// An evidence release is recorded in `evidence`.
+        /// True when the clear releases a held reservation: an untimed hold
+        /// the operator's decision releases, or one this run's reconciliation
+        /// ended. False when no reservation is held while it runs, and for a
+        /// bounded hold, which keeps counting until its accounting horizon.
         reservation_released: bool,
         /// True when the operator acknowledges that untimed bytes can still apply
         /// after their spend stops counting against the window.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         unbounded_exposure: bool,
-        /// The wire code of the chain evidence on which reconciliation
-        /// released the reservation (`"submission.sequence_consumed"` or
-        /// `"submission.time_bound_passed"`); absent when the outcome is
-        /// unknown and in older rows.
+        /// The wire code of the accounting disposition the receipt carries
+        /// (`"submission.sequence_consumed"`, `"submission.time_bound_passed"`
+        /// or `"submission.accounting_expired"`), or, under an untimed hold
+        /// whose receipt keeps its recorded network answer, of the endpoint's
+        /// current answer (`"submission.reported_success"` or
+        /// `"submission.retention_expired"`); absent otherwise and in older
+        /// rows. Neither establishes a chain outcome.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         evidence: Option<String>,
     },

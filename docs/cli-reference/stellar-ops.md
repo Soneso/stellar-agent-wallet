@@ -636,72 +636,41 @@ This is the way out of `submission.tx_timeout`.
 
 What it changes:
 
-- `SUCCESS`: the transaction reached a ledger. The reservation becomes recorded spend, the receipt becomes `success`, and the value-action row the submission never got to write is appended. Running the verb again appends no second row.
-- `FAILED`: the transaction applied and failed. The reservation is released and the receipt records the failure.
-- `NOT_FOUND`: the endpoint has no record of it. Within the retention window, two kinds of chain evidence say the transaction can no longer apply: an observed ledger close time strictly past its time bound, or a source account sequence that has reached the transaction's. Either is followed by a second transaction lookup: `SUCCESS` records the spend, `FAILED` releases it, and a second `NOT_FOUND` releases the reservation. The receipt then becomes `ambiguous`, because no transaction result exists, and `record.release_code` names the evidence: `submission.sequence_consumed` or `submission.time_bound_passed`. A `value_action_failed` row is appended under that code. Without such evidence the record stands; run the verb again later.
+- `SUCCESS` reports inclusion. The receipt records the report while conservative accounting continues.
+- `FAILED` reports failure and releases no possible spending.
+- `NOT_FOUND` reports absence. Sequence and ledger-time observations cannot prove a failed outcome or authorize a refund.
 
 On a mainnet profile the primary endpoint's `FAILED` and `NOT_FOUND` settle
 nothing on their own. The verb asks the oracle named by `oracle_provider_url`
-about the same transaction. The oracle's `SUCCESS` records the spend, and its
-`FAILED` releases the reservation under the oracle's failure code. Its
-`NOT_FOUND` runs the rule above with the oracle as the endpoint: the retention
-window, the ledger close time, the account sequence and the second lookup are
-all the oracle's. The oracle's answers count only once it reports the mainnet
-passphrase, which the verb checks first. An oracle that reports another
-network, whose identity cannot be read, or that cannot answer, and a mainnet
-profile without an oracle, leave the record pending.
+about the same transaction and checks the oracle's mainnet identity. Endpoint
+answers are reports about that transaction. Success preserves conservative
+accounting. Failure, consumed sequence, and absence establish no definitive
+failure audit fact.
 
 Classic mainnet envelopes carry a deadline 120 seconds after they are built,
-covered by the operator's consent. `submission.time_bound_passed` settles them
-once the deadline passes on the observed ledger. Testnet envelopes carry no
-bound. An envelope handed to `pay --submit-only` can carry a time bound, and
-so can the inner transaction of a fee-bump. A confirmation that completes
-after the deadline refuses with `network.mainnet_authorization_refused`
-(`deadline_elapsed`); run the command again for a fresh envelope.
+covered by the operator's consent. Deadline expiry ends future execution;
+accounting continues through each affected spending window. Testnet envelopes
+can carry no bound. A confirmation after the deadline refuses with
+`network.mainnet_authorization_refused` (`deadline_elapsed`); run the command
+again for a fresh envelope.
 
-Pending spending records retain their original network. A profile whose network
-differs cannot reconcile or clear them.
+A reported failure or missing transaction does not release possible spending. Bounded uncertainty counts through the signed deadline and each affected spending window.
 
-The receipt keeps its `release_code` when the reservation is released, so
-later runs can retry any settled row still owed. The code names the evidence
-for that row and releases nothing by itself: a receipt that carries one while
-its reservation is still held is settled on the chain like any other, which
-finds the evidence again. A receipt released without
-recorded evidence, for example by an older binary, reads as `ambiguous` with no
-`release_code`, and the verb appends no row for it.
-When the settlement lookup cannot read the retained audit history, the verb
-logs the error and appends no settled row. A later run retries the lookup
-and appends any row still owed.
+A reported success time does not backdate accounting. Untimed pending transactions remain reserved until an explicit acknowledgement clears their unbounded exposure.
 
-Reconciliation writes the receipt before settling the spending window; a failed receipt write keeps the reservation pending for another status pass.
+Pending spending records retain their authenticated network. A profile whose
+network differs cannot reconcile or clear them. A checked independent anchor
+records provenance; a bare primary ledger or editable receipt supplies none.
 
-Automatic reconciliation applies the same chain and retention checks when the
-receipts file is absent. A definitive chain answer or a release on chain
-evidence restores the receipt's transaction identity from its reservation.
-Status also completes any approval-consumption write owed by a sent receipt.
-The receipt holds that approval against reuse until the write succeeds.
+`submission.accounting_expired` records the end of all affected accounting
+horizons with the chain outcome unknown. It does not owe a `value_action_failed`
+row. `submission.sequence_consumed` and `submission.time_bound_passed` describe
+observations and authorize no refund. Reconciliation records its disposition
+before changing capacity; a failed receipt write retains the reservation.
 
-A submission whose ledger has fallen outside the endpoint's retention window can
-never be settled this way. The verb reports it as `ambiguous` with
-`record.reservation_open: true` and no `release_code`, and `tx receipt clear` is
-the way out. A reservation whose receipt is missing is reported as
-`reservation` with `operator_required: true`.
-
-On a testnet profile, a send the endpoint refused outright never reaches this
-verb with an open record. When `sendTransaction` answers `ERROR` with a
-transaction result, the endpoint has reported a validation error for the
-envelope: the receipt records the failure, the reservation is released, and the
-wallet never sends those bytes again. They did leave the wallet, though. A copy
-relayed elsewhere that later becomes valid applies without being counted
-against the window, and its receipt stays `failed`.
-
-On a mainnet profile no second endpoint confirms a refusal at the send, so the
-verb that sent reports `submission.tx_timeout`, and the receipt, the pending
-row and the reservation stand until this verb settles them on the oracle's
-answers. A refused classic mainnet envelope settles with
-`submission.time_bound_passed` once its deadline passes. An untimed envelope
-stays pending until another transaction consumes
-its sequence or the operator clears it with `tx receipt clear`.
+A transaction outside endpoint retention remains reserved through its horizon.
+An untimed transaction requires explicit operator acknowledgement. This rule
+also covers immediate send refusals, malformed failure results, and timeouts.
 
 The JSON output carries `tx_hash`, `chain_status`, `ledger`, `record` and
 `reservation`. `record` is the wallet's receipt: `envelope_hash`, `status`,
@@ -726,34 +695,55 @@ profile, the record, or the endpoint could not be reached.
 
 Closes a submission record after reconciling it against the chain. The verb
 decides on the chain's latest answer, not on the record as it was left.
+`--acknowledge` records the operator's decision; clearing establishes no chain
+outcome. A reported failure or missing transaction does not release possible
+spending.
 
-The record state is evaluated first, before anything is reconciled, released,
-or written: a record recorded as `success`, `failed`, `reorged` or
-`cleared_by_operator` is refused with `submission.not_clearable`, so a clear
-the verb refuses leaves the wallet as it found it. Then the verb asks the
-endpoint what became of the transaction. A `SUCCESS` or `FAILED` answer is
-refused with `submission.not_clearable` and the record is left for `tx status`
-to settle, and an endpoint that cannot answer is refused under the same code:
-a transaction still in flight is exactly the case an operator would be wrong
-about. On a mainnet profile with an oracle, the verb asks the oracle as well,
-and refuses under the same code when the oracle does not report the mainnet
-passphrase, reports `SUCCESS` or `FAILED`, or cannot answer. On a mainnet
-profile without an oracle nothing confirms the endpoint's `FAILED`, so
-`tx status` cannot settle it and the clear proceeds on the acknowledgement; the
-endpoint's `SUCCESS` is still refused. A reservation whose receipt is missing is cleared only when the
-endpoint reports `NOT_FOUND` and its submission ledger is below the endpoint's
-retention floor.
+An authenticated hold without a time bound can apply for as long as its
+sequence stays unconsumed, so no endpoint or oracle report settles it. Such a
+hold is cleared with `--acknowledge` and `--acknowledge-unbounded` on every
+network, whatever its receipt records and whatever the endpoint or the oracle
+reported before or during the clear. With `--acknowledge` alone it is refused
+with `submission.unbounded_exposure`. The clear row records
+`unbounded_exposure: true` before capacity changes, and the clear releases the
+hold: the output and the row carry `reservation_released: true`. An endpoint or
+oracle that cannot answer still refuses the clear, and a receipt already
+`cleared_by_operator` is refused with `submission.not_clearable`. A receipt
+that records `success`, `failed` or `reorged` keeps that record through the
+reconciliation. When the endpoint now reports `SUCCESS` for a receipt that
+records another answer, or `NOT_FOUND` below its retention floor, the clear
+row's `evidence` records that answer: `submission.reported_success` or
+`submission.retention_expired`.
 
-State with no authenticated network history requires recovery; editing the profile
-or receipt does not migrate it.
+For every other submission the record state is evaluated first: a record
+recorded as `success`, `failed`, `reorged` or `cleared_by_operator` is refused
+with `submission.not_clearable`. With `--acknowledge`, a terminal receipt
+without a hold first acquires the audit writer to look for an interrupted
+clear; the acquisition can drain queued rows or return an audit error. Without
+a matching row the receipt is refused without reconciliation, release or
+marking. Then the verb asks the endpoint what became of the transaction. A
+`SUCCESS` or `FAILED` answer is refused with `submission.not_clearable` and the
+record is left for `tx status` to record, and an endpoint that cannot answer is
+refused under the same code: a transaction still in flight is exactly the case
+in which an operator's decision can be wrong. On a mainnet profile with an
+oracle, the verb asks the oracle as well, and refuses under the same code when
+the oracle does not report the mainnet passphrase, reports `SUCCESS` or
+`FAILED`, or cannot answer. On a mainnet profile without an oracle nothing confirms the endpoint's
+`FAILED`, so the clear proceeds on the acknowledgement; the endpoint's
+`SUCCESS` is still refused. A reservation with a time bound whose receipt is
+missing is cleared only when the endpoint reports `NOT_FOUND` and its
+submission ledger is below the endpoint's retention floor.
+
+State with no authenticated network history requires recovery; editing the
+profile or receipt does not migrate it.
 
 Without `--acknowledge` nothing is reconciled or written, and the verb exits 1
 with `submission.acknowledgement_required`. The message names the next step,
 computed from the record: while a sent transaction's time bound is still open,
-wait for it to pass or run `tx status`; otherwise pass `--acknowledge`.
-On mainnet, a sent `pending` or `ambiguous` receipt whose receipt or held
-reservation has no time bound also requires `--acknowledge-unbounded`, and so
-does an orphan whose held reservation has none. This states that the
+wait for it to pass or run `tx status`; otherwise pass `--acknowledge`. An
+authenticated hold without a time bound also requires `--acknowledge-unbounded`
+on every network, and so does, on mainnet, a sent `pending` or `ambiguous`
+receipt without a time bound when no hold exists. This states that the
 transaction can still apply and its spend stops counting against the window;
 the clear row records `unbounded_exposure: true`.
 
@@ -765,14 +755,14 @@ does, and decides:
 |---|---|
 | The reconciled outcome could not be recorded on its receipt | Refused with `submission.record_unavailable`, naming the receipt-store error. Run `stellar-agent tx status` again. |
 | The receipt disagrees with its reconciliation | Refused with `submission.record_unavailable`. Run `stellar-agent tx status` again. |
-| Released on chain evidence: the receipt carries `release_code`, and this run's reconciliation released the reservation under it or the spending window no longer holds the reservation | The `value_action_failed` row is written under that code first; once it is in the log, the receipt is cleared and the clear row records the evidence. A settled row that cannot be written refuses with the audit error and leaves the receipt clearable. |
-| A sent `pending` or `ambiguous` mainnet receipt, a restored orphan included, whose receipt or held reservation has no time bound, without `--acknowledge-unbounded` | Refused with `submission.unbounded_exposure`. Pass both acknowledgement flags to clear and record the exposure. |
-| `ambiguous` without evidence (retention window closed), `ambiguous` with a `release_code` the spending window does not bear out, `pending` with no time bound, `pending` and never sent, or a restored orphan, each with the required acknowledgement flags | The reservation is released and the receipt cleared. The clear row records no evidence: the outcome is unknown. |
-| `pending`, sent, with a time bound that has not passed on the endpoint's latest ledger and a sequence that is unconsumed | Refused with `submission.still_pending`, naming the time bound. Nothing changes. |
-| A mainnet profile without an oracle, and a `pending`, sent receipt whose time bound has not passed on this host's clock | Refused with `submission.still_pending`, naming the time bound. Nothing changes. |
-| A mainnet profile without an oracle, and any other `pending` receipt with the required acknowledgement flags | The reservation is released and the receipt cleared on the acknowledgement. The clear row records no evidence. |
-| A ledger-time read failed for a sent, timed submission, or another reconciliation read of the endpoint or the oracle failed, and the reservation stood | Refused with `network.rpc_unreachable`. Nothing changes. |
+| A reconciliation read of the endpoint or the oracle failed, a ledger-time read failed for a sent submission whose hold or receipt carries a time bound, and the reservation stood | Refused with `network.rpc_unreachable`. Nothing changes. |
 | A reconciliation read of the oracle was still open at the verb's oracle deadline, and the reservation stood | Refused with `network.rpc_unreachable`. Nothing changes. |
+| An authenticated hold without a time bound, whatever its receipt records, without `--acknowledge-unbounded` | Refused with `submission.unbounded_exposure`. Pass both acknowledgement flags to clear and record the exposure. |
+| An authenticated hold without a time bound, with both acknowledgement flags | The receipt is cleared and the hold released, whatever the endpoint or the oracle reported. A receipt that records a network answer keeps it until the clear, and an endpoint answer reconciliation did not record is the row's `evidence`. |
+| An accounting disposition: the receipt carries `release_code`, and this run expires accounting under it or the spending window holds no reservation | The code is an observation. Accounting expiry leaves the chain outcome unknown and owes no failed row. The clear row records the acknowledgement before capacity changes. |
+| On mainnet, a sent `pending` or `ambiguous` receipt without a time bound and with no held reservation, without `--acknowledge-unbounded` | Refused with `submission.unbounded_exposure`. |
+| `pending` or `ambiguous` with a held reservation or a sent receipt, and a time bound that has not passed on this host's clock | Refused with `submission.still_pending`, naming the time bound. Nothing changes. |
+| `ambiguous` without evidence (retention window closed), `ambiguous` with a `release_code` the spending window does not bear out, `pending` with a passed time bound or none, or `pending`, never sent and with no held reservation, each with the required acknowledgement flags | The receipt is cleared. A bounded hold keeps counting through its accounting horizon, so the output and the row carry `reservation_released: false`. |
 
 Every oracle read of the verb ends by one deadline: the profile's
 `submit_timeout_seconds`, counted from the oracle's identity read. A stalled
@@ -781,44 +771,49 @@ oracle the verb already found serving mainnet and does not read its identity
 again, so an oracle identity failure refuses before the acknowledgement, with
 `submission.not_clearable`, and never during reconciliation.
 
-A reconciliation that finds a `SUCCESS` or `FAILED` answer in the meantime is
-refused with `submission.not_clearable`; `tx status` writes its row.
+During reconciliation, `SUCCESS` on a bounded hold prevents operator clear.
+`FAILED` retains exposure; clearing after the execution bound preserves its
+accounting horizon.
 
-Where the profile has an audit writer, the settlement lookup of an evidence
-release and the check for an earlier clear row read the retained audit history.
-A history that cannot be read refuses with the verifier's code, such as
-`audit.chain_broken` for a broken chain, before the clear row is written.
-The receipt stays as it is. A synthesized profile with no audit writer skips
-the history lookups and marks the receipt cleared without writing audit rows.
+Where the profile has an audit writer, the check for an earlier clear row reads
+the retained audit history. A history that cannot be read refuses with the
+verifier's code, such as `audit.chain_broken` for a broken chain, before the
+clear row is written. The receipt stays as it is. A synthesized profile with no
+audit writer skips the history lookup and marks the receipt cleared without
+writing audit rows.
 
 A cleared receipt owes no settlement row: the clear row records the operator's
-decision. Clearing an untimed transaction whose outcome is unknown states that
-it did not move value. If it applies later, its spend is not counted against
-the window.
+decision. An untimed clear records the operator's acknowledgement of indefinite
+possible execution and uncounted spend. It establishes no chain outcome and
+does not revoke signed bytes.
 
-The reservation is released and the audit rows written before the receipt is
-marked, so a failure part-way leaves a record a re-run still accepts. That
-re-run appends no second row: the verb writes each row only where the log does
-not already carry it for the submission.
+The clear row is written before the checked accounting transition and the
+receipt is marked, so a failure part-way leaves a record a re-run still
+accepts. That re-run appends no second row: the verb writes the row only where
+the log does not already carry it for the submission. A clear of an untimed
+hold stopped after the release leaves no hold to reconcile. The re-run, with
+both acknowledgement flags, finds the clear row with `unbounded_exposure: true`
+and `reservation_released: true` in the audit history, marks the receipt and
+reports `reservation_released: true`.
 
 | Flag / arg | Meaning | Required | Default |
 |---|---|---|---|
 | `<ENVELOPE_HASH>` (positional) | Envelope hash of the submission, 64 lowercase hex characters: `tx status` reports it as `record.envelope_hash` | yes | none |
 | `--profile <NAME>` | Profile whose record and spending window are cleared | optional | `STELLAR_AGENT_PROFILE`, else `default` |
-| `--acknowledge` | State that the transaction did not move value, and reconcile before clearing | yes | `false` |
-| `--acknowledge-unbounded` | State that this untimed transaction can still apply and that its spend is then not counted | for sent `pending` or `ambiguous` mainnet receipts and restored orphans whose receipt or held reservation has no time bound | `false` |
+| `--acknowledge` | Record the operator's decision to clear, and reconcile before clearing; clearing establishes no chain outcome | yes | `false` |
+| `--acknowledge-unbounded` | Accept that this untimed transaction can still apply and that its spend is then not counted | for an authenticated hold without a time bound on every network, and on mainnet for a sent `pending` or `ambiguous` receipt without one when no hold exists; both acknowledgement flags are also required to finish a recorded unbounded clear | `false` |
 | `--output <FORMAT>` | `json` or `table` | optional | `json` |
 
-`--acknowledge` is required because clearing a record whose outcome is unknown
-states that the transaction did not move value, and the wallet cannot
-establish that: it is the operator's judgement, made from a block explorer or a
-second endpoint.
+`--acknowledge` is required because the wallet cannot establish what became of
+the transaction: clearing is the operator's judgement, made from a block
+explorer or a second endpoint. `--acknowledge` records the operator's decision;
+clearing establishes no chain outcome.
 
 The receipt is marked `cleared_by_operator`, not removed, so the envelope keeps
 its idempotency anchor: a byte-identical resubmission of those exact bytes is
 still identified. That costs nothing in practice, because a follow-up runs a
 fresh simulate whose fee moves the bytes. An audit row names the state the clear
-replaced and any release evidence.
+replaced and any accounting disposition.
 
 ### After a network outage
 

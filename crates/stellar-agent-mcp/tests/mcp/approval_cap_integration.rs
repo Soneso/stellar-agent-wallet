@@ -425,6 +425,13 @@ decision = "allow"
     }
 
     fn assert_legs(&self, kind: &str, action: &str, amount: Option<i128>) {
+        assert!(
+            crate::common::rows_of_kind(
+                &crate::common::audit_rows(&self.profile),
+                "value_action_submitted"
+            )
+            .is_empty()
+        );
         let rows = crate::common::audit_rows(&self.profile);
         let selected = crate::common::rows_of_kind(&rows, kind);
         assert_eq!(selected.len(), 1, "one row per submission: {rows:?}");
@@ -561,11 +568,10 @@ async fn approved_payment_reserves_before_send_and_settles_with_sized_audit_legs
         WindowSnapshot {
             amount: AMOUNT,
             entries: 1,
-            pending: 0
+            pending: 1
         }
     );
     h.assert_legs("value_action_pending", "payment", Some(AMOUNT));
-    h.assert_legs("value_action_submitted", "payment", Some(AMOUNT));
 }
 
 #[tokio::test]
@@ -628,7 +634,7 @@ async fn approved_timeout_keeps_cap_until_transaction_status_settles() {
         WindowSnapshot {
             amount: AMOUNT,
             entries: 1,
-            pending: 0
+            pending: 1
         }
     );
     let receipt = ReceiptStore::open(&h.name)
@@ -637,9 +643,10 @@ async fn approved_timeout_keeps_cap_until_transaction_status_settles() {
         .unwrap()
         .unwrap();
     assert_eq!(receipt.status, ReceiptStatus::Success);
-    h.assert_legs("value_action_submitted", "payment", Some(AMOUNT));
+    h.assert_legs("value_action_pending", "payment", Some(AMOUNT));
     let rows = crate::common::audit_rows(&h.profile);
-    let submitted = crate::common::rows_of_kind(&rows, "value_action_submitted");
+    assert!(crate::common::rows_of_kind(&rows, "value_action_submitted").is_empty());
+    let submitted = crate::common::rows_of_kind(&rows, "value_action_pending");
     assert_eq!(submitted[0]["policy_decision"], "require_approval");
     assert_eq!(
         submitted[0]["approval_nonce"],
@@ -649,7 +656,7 @@ async fn approved_timeout_keeps_cap_until_transaction_status_settles() {
 
 #[tokio::test]
 #[serial]
-async fn approved_definitive_failure_releases_cap() {
+async fn approved_reported_failure_retains_cap() {
     let h = Harness::new("cap-approved-failed", "require_approval", Outcome::Failed).await;
     let sim = h.simulate_pay(AMOUNT).await;
     let result = h
@@ -660,13 +667,20 @@ async fn approved_definitive_failure_releases_cap() {
     assert_eq!(
         h.window(),
         WindowSnapshot {
-            amount: 0,
-            entries: 0,
-            pending: 0
+            amount: AMOUNT,
+            entries: 1,
+            pending: 1
         }
     );
-    h.assert_legs("value_action_failed", "payment", Some(AMOUNT));
-    assert_eq!(h.simulate_pay(AMOUNT).await["ok"], true);
+    h.assert_legs("value_action_pending", "payment", Some(AMOUNT));
+    assert!(
+        crate::common::rows_of_kind(
+            &crate::common::audit_rows(&h.profile),
+            "value_action_failed"
+        )
+        .is_empty()
+    );
+    assert_eq!(h.simulate_pay(AMOUNT).await["ok"], false);
 }
 
 #[tokio::test]
@@ -791,11 +805,10 @@ async fn approved_sponsored_account_creation_reserves_and_settles() {
         WindowSnapshot {
             amount: AMOUNT,
             entries: 1,
-            pending: 0
+            pending: 1
         }
     );
     h.assert_legs("value_action_pending", "account_creation", Some(AMOUNT));
-    h.assert_legs("value_action_submitted", "account_creation", Some(AMOUNT));
 }
 
 #[tokio::test]
@@ -906,10 +919,10 @@ async fn toolset_forced_approval_keeps_allow_effects_and_reservation() {
         WindowSnapshot {
             amount: AMOUNT,
             entries: 1,
-            pending: 0
+            pending: 1
         }
     );
-    h.assert_legs("value_action_submitted", "payment", Some(AMOUNT));
+    h.assert_legs("value_action_pending", "payment", Some(AMOUNT));
 }
 
 #[tokio::test]
@@ -946,7 +959,6 @@ async fn approved_claim_preserves_non_debit_audit_leg() {
         }]
     );
     h.assert_legs("value_action_pending", "claim", None);
-    h.assert_legs("value_action_submitted", "claim", None);
 }
 
 #[tokio::test]
@@ -1001,9 +1013,12 @@ async fn approved_trustline_preserves_non_debit_audit_leg() {
         }]
     );
     h.assert_legs("value_action_pending", "trustline", None);
-    h.assert_legs("value_action_submitted", "trustline", None);
     let rows = crate::common::audit_rows(&h.profile);
     for kind in ["value_action_pending", "value_action_submitted"] {
+        if kind == "value_action_submitted" {
+            assert!(crate::common::rows_of_kind(&rows, kind).is_empty());
+            continue;
+        }
         let row = crate::common::rows_of_kind(&rows, kind)[0];
         assert_eq!(
             row["legs"][0]["asset"],
@@ -1037,6 +1052,10 @@ async fn submission_rows_preserve_allowed_and_approved_decisions() {
             assert_eq!(result["ok"], suffix == "success", "{result}");
             let rows = crate::common::audit_rows(&h.profile);
             for kind in ["value_action_pending", final_kind] {
+                if kind == final_kind {
+                    assert!(crate::common::rows_of_kind(&rows, kind).is_empty());
+                    continue;
+                }
                 let matching = crate::common::rows_of_kind(&rows, kind);
                 assert_eq!(matching.len(), 1, "{kind}: {rows:?}");
                 let row = &matching[0];
@@ -1125,6 +1144,10 @@ async fn allowed_submission_ignores_an_unverified_approval_nonce() {
     assert_eq!(result["ok"], true, "{result}");
     let rows = crate::common::audit_rows(&h.profile);
     for kind in ["value_action_pending", "value_action_submitted"] {
+        if kind == "value_action_submitted" {
+            assert!(crate::common::rows_of_kind(&rows, kind).is_empty());
+            continue;
+        }
         let matching = crate::common::rows_of_kind(&rows, kind);
         assert_eq!(matching.len(), 1, "{kind}: {rows:?}");
         assert_eq!(matching[0]["policy_decision"], "allow", "{}", matching[0]);
@@ -1298,9 +1321,10 @@ async fn profile_chain_approval_preserves_nonce_and_consumes_attestation() {
     assert_eq!(result["ok"], true, "{result}");
     assert_eq!(h.window().amount, amount);
     assert!(h.signer_reads.load(Ordering::SeqCst) > reads_before_commit);
-    h.assert_legs("value_action_submitted", "payment", Some(amount));
+    h.assert_legs("value_action_pending", "payment", Some(amount));
     let rows = crate::common::audit_rows(&h.profile);
-    let submitted = crate::common::rows_of_kind(&rows, "value_action_submitted");
+    assert!(crate::common::rows_of_kind(&rows, "value_action_submitted").is_empty());
+    let submitted = crate::common::rows_of_kind(&rows, "value_action_pending");
     assert_eq!(submitted.len(), 1);
     assert_eq!(submitted[0]["chain_id"], h.profile.chain_id.caip2_str());
     assert_eq!(submitted[0]["policy_decision"], "require_approval");
@@ -1353,7 +1377,7 @@ async fn profile_chain_payment_accounting_persists_cap() {
         WindowSnapshot {
             amount: AMOUNT,
             entries: 1,
-            pending: 0
+            pending: 1
         }
     );
     let second = h.simulate_pay(AMOUNT).await;
@@ -1743,7 +1767,7 @@ async fn split_approval_round_trip(pair: ClassicPair) {
         ClassicPair::Trustline => ("trustline", None),
         ClassicPair::Claim => ("claim", None),
     };
-    h.assert_legs("value_action_submitted", action, amount);
+    h.assert_legs("value_action_pending", action, amount);
 }
 
 #[tokio::test]
@@ -1791,7 +1815,7 @@ async fn split_pay_approval_commit_cap_reserves_and_settles() {
         WindowSnapshot {
             amount: AMOUNT,
             entries: 1,
-            pending: 0
+            pending: 1
         }
     );
 }
@@ -1948,6 +1972,7 @@ async fn split_approval_reconciles_only_one_bounded_pass() {
             max_time: 0,
             pending_since_ms: old,
             submission_ledger: 1000,
+            submission_anchor: None,
             operator_required: false,
         };
         let entry = WindowEntry::new(
@@ -1980,7 +2005,9 @@ async fn split_approval_reconciles_only_one_bounded_pass() {
         statuses, 5,
         "one simulate dispatch reconciles at most five reservations"
     );
-    assert_eq!(disk.pending_reservations(&h.profile).unwrap().len(), 1);
+    // A missing transaction does not release possible spending, so every
+    // untimed reservation stands.
+    assert_eq!(disk.pending_reservations(&h.profile).unwrap().len(), 6);
 }
 
 #[tokio::test]

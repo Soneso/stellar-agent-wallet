@@ -1051,33 +1051,42 @@ that sequence is refused with `submission.tx_already_submitted` until the first
 is settled. A different fee does not get around it. No recovery path sends a
 transaction again.
 
-`stellar_transaction_status` reports what the chain says and settles the record:
+`stellar_transaction_status` reports what the chain says and records it on the
+wallet's record. A reported failure or missing transaction does not release
+possible spending:
 
-- `SUCCESS`: the payment went through. Report it as done.
-- `FAILED`: the transaction applied and failed. Nothing moved; a fresh
-  simulate-and-commit is the next step.
-- `NOT_FOUND` with `record.status: "pending"`: nothing is settled yet. The
+- `SUCCESS`: the endpoint reports that the payment went through. Report it as
+  done. The spend keeps counting against the window through the transaction's
+  accounting horizon, and no submitted row is written: the pending row stays
+  until authenticated evidence settles it.
+- `FAILED`: the endpoint reports that the transaction applied and failed. The
+  record stays `pending`, the reservation keeps counting until its accounting
+  horizon passes or the operator clears it, and no failed row is written.
+- `NOT_FOUND` with `record.status: "pending"`: nothing is established. The
   transaction can still apply. Wait and call again.
-- On a mainnet profile, `chain_status` is the primary endpoint's answer, and
-  its `FAILED` or `NOT_FOUND` settles nothing until the oracle confirms it. A
-  profile without `oracle_provider_url` keeps such a record `pending` until
-  the operator clears it with `stellar-agent tx receipt clear`.
-- `NOT_FOUND` with `record.status: "ambiguous"` and a `record.release_code`:
-  the transaction can no longer apply. `submission.sequence_consumed` means
-  another transaction used its sequence; `submission.time_bound_passed` means
-  its time bound passed, which needs an envelope that carries one. The
-  reservation is released and a `value_action_failed` row is written under
-  that code. A fresh simulate-and-commit is the next step.
+- On a mainnet profile, `chain_status` is the primary endpoint's answer; its
+  `FAILED` or `NOT_FOUND` decides nothing alone, and the oracle named by
+  `oracle_provider_url` is asked as well.
+- `record.status: "ambiguous"` with `record.release_code:
+  "submission.accounting_expired"`: the accounting horizon, the signed time
+  bound plus each affected window's duration, has passed. The reservation has
+  ended with the outcome unknown, and no failed row is written. A fresh
+  simulate-and-commit is the next step.
 - `NOT_FOUND` with `record.status: "ambiguous"` and no `release_code`: the
   endpoint can no longer answer for it at all, and only the operator resolves
   it, with `stellar-agent tx receipt clear <ENVELOPE_HASH> --acknowledge`.
 - `NOT_FOUND` with `record.status: "failed"`: the endpoint reported a validation
   error for the envelope or previously reported an on-chain `FAILED` that has
-  left its retained history. The wallet releases the reservation and never
-  sends those bytes again. A fresh simulate-and-commit is the next step.
+  left its retained history. The wallet never sends those bytes again. A fresh
+  simulate-and-commit is the next step.
 - No `record` and a `reservation` with `operator_required: true`: the receipt
   is missing and the endpoint can no longer answer for the transaction. Only
   the operator resolves it, with `tx receipt clear`.
+- A transaction without a time bound keeps its reservation until the operator
+  clears it with `stellar-agent tx receipt clear <ENVELOPE_HASH> --acknowledge
+  --acknowledge-unbounded`, on every network and whatever the endpoint
+  reports. `--acknowledge` records the operator's decision; clearing
+  establishes no chain outcome.
 
 When the settlement lookup cannot read the retained audit history, the status
 call still answers; it logs the error and writes no settled row.

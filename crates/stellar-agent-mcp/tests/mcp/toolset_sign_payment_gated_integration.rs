@@ -433,6 +433,10 @@ async fn assert_approved_submission_audit(
     assert_eq!(submitted["ok"], true, "{submitted}");
     let rows = crate::common::audit_rows(&profile);
     for kind in ["value_action_pending", "value_action_submitted"] {
+        if kind == "value_action_submitted" {
+            assert!(rows.iter().all(|row| row["kind"] != kind));
+            continue;
+        }
         let matching = crate::common::rows_of_kind(&rows, kind);
         assert_eq!(matching.len(), 1, "{kind}: {rows:?}");
         assert_eq!(
