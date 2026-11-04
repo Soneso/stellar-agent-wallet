@@ -1,8 +1,9 @@
-//! Region-backed memory-locked seed buffer.
+//! Region-backed memory-locked seed and signing key.
 //!
-//! [`LockedSeed`] allocates an isolated home, locks it before copying the seed,
-//! and keeps that address stable through ownership transfers. Drop zeroizes the
-//! seed before unlocking and freeing its home, including during panic unwind.
+//! [`LockedSeed`] allocates an isolated home, attempts its configured lock before
+//! copying the seed, builds its signing key there, and keeps that address stable
+//! through ownership transfers. Drop zeroizes both before unlocking and freeing
+//! the home, including during panic unwind.
 //!
 //! `region::lock` uses `mlock(2)` on POSIX and `VirtualLock` on Windows.
 //! It rounds the range to whole pages. Locks do not nest, so each seed owns
@@ -20,40 +21,85 @@ use super::{config::MlockRequired, error::WalletLifecycleError};
 const SEED_PAGE_ALIGN: usize = 65536;
 
 #[repr(C, align(65536))]
-struct SeedPage([u8; 32]);
+struct SeedPage {
+    seed: [u8; 32],
+    key: Option<ed25519_dalek::SigningKey>,
+}
+
+const LOCKED_LEN: usize =
+    std::mem::offset_of!(SeedPage, key) + std::mem::size_of::<Option<ed25519_dalek::SigningKey>>();
 
 const _: () = assert!(std::mem::align_of::<SeedPage>() == SEED_PAGE_ALIGN);
 
+// Clearing the key slot relies on dalek zeroizing its secret on drop.
+const _: fn() = || {
+    fn assert_zeroize_on_drop<T: zeroize::ZeroizeOnDrop>() {}
+    assert_zeroize_on_drop::<ed25519_dalek::SigningKey>();
+};
+
 impl Zeroize for SeedPage {
     fn zeroize(&mut self) {
-        self.0.zeroize();
+        self.key = None;
+        self.seed.zeroize();
     }
 }
 
 fn seed_page_isolates(page_size: usize) -> bool {
-    page_size <= SEED_PAGE_ALIGN
+    (LOCKED_LEN..=SEED_PAGE_ALIGN).contains(&page_size)
 }
 
 #[cfg(test)]
 thread_local! {
+    static SEEDS_COPIED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static KEYS_BUILT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     pub(super) static ZEROIZED_BEFORE_UNLOCK: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
-/// A 32-byte signing seed with a stable, isolated, zeroize-on-drop home.
+#[cfg(any(test, feature = "test-helpers"))]
+thread_local! {
+    static LOCK_ATTEMPT: std::cell::Cell<Option<(usize, usize)>> = const { std::cell::Cell::new(None) };
+    static FORCE_LOCK_FAILURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Make the next lock attempt on this thread fail like an OS refusal.
+#[cfg(any(test, feature = "test-helpers"))]
+pub fn force_lock_failure_for_test(on: bool) {
+    FORCE_LOCK_FAILURE.set(on);
+}
+
+fn lock_region(addr: *const u8, len: usize) -> Result<region::LockGuard, region::Error> {
+    #[cfg(any(test, feature = "test-helpers"))]
+    LOCK_ATTEMPT.set(Some((addr as usize, len)));
+    region::lock(addr, len)
+}
+
+fn copy_seed(slot: &mut [u8; 32], seed: &[u8; 32]) {
+    #[cfg(test)]
+    SEEDS_COPIED.set(SEEDS_COPIED.get() + 1);
+    slot.copy_from_slice(seed);
+}
+
+fn build_key(seed: &[u8; 32]) -> ed25519_dalek::SigningKey {
+    #[cfg(test)]
+    KEYS_BUILT.set(KEYS_BUILT.get() + 1);
+    ed25519_dalek::SigningKey::from_bytes(seed)
+}
+
+/// A seed and its signing key in one stable, isolated, zeroize-on-drop home.
 ///
-/// When the configured posture requires or attempts locking, the home is locked
-/// before the seed enters it. A tolerated lock failure is available to callers
-/// through the wallet's degradation accessor.
+/// The configured lock attempt completes before the seed and key enter the home.
+/// A tolerated failure leaves both unlocked and is available through the wallet's
+/// degradation accessor.
 ///
-/// [`Drop`] and [`LockedSeed::dispose`] zeroize the seed, unlock, then free it.
+/// [`Drop`] and [`LockedSeed::dispose`] zeroize the key and seed, unlock, then free.
 pub struct LockedSeed {
     /// Drop zeroizes this home, releases the guard, then frees the box.
     home: Box<Zeroizing<SeedPage>>,
     /// Absent when locking is disabled or a failure is tolerated.
     guard: Option<region::LockGuard>,
     mlock_degradation: Option<MlockDegradation>,
-    #[cfg(test)]
-    lock_target: Option<usize>,
+    #[cfg(any(test, feature = "test-helpers"))]
+    lock_target: Option<(usize, usize)>,
 }
 
 /// Details of an `mlock` failure tolerated under `MlockRequired::Warn`.
@@ -92,20 +138,27 @@ impl LockedSeed {
         profile_name: &str,
         page_size: usize,
     ) -> Result<Self, WalletLifecycleError> {
-        let mut home = Box::new(Zeroizing::new(SeedPage([0u8; 32])));
+        let mut home = Box::new(Zeroizing::new(SeedPage {
+            seed: [0u8; 32],
+            key: None,
+        }));
         let mut mlock_degradation = None;
-        #[cfg(test)]
-        let mut lock_target = None;
+        #[cfg(any(test, feature = "test-helpers"))]
+        LOCK_ATTEMPT.set(None);
         let guard = match required {
             MlockRequired::False => None,
             MlockRequired::True | MlockRequired::Warn => {
-                let addr = home.0.as_ptr();
-                #[cfg(test)]
-                {
-                    lock_target = Some(addr as usize);
-                }
-                let result = if seed_page_isolates(page_size) {
-                    region::lock(addr, 32)
+                let addr = home.seed.as_ptr();
+                #[cfg(any(test, feature = "test-helpers"))]
+                let forced_failure = FORCE_LOCK_FAILURE.replace(false);
+                #[cfg(not(any(test, feature = "test-helpers")))]
+                let forced_failure = false;
+                let result = if forced_failure {
+                    Err(region::Error::SystemCall(std::io::Error::from(
+                        std::io::ErrorKind::PermissionDenied,
+                    )))
+                } else if seed_page_isolates(page_size) {
+                    lock_region(addr, LOCKED_LEN)
                 } else {
                     Err(region::Error::InvalidParameter(
                         "page size exceeds seed alignment",
@@ -134,13 +187,14 @@ impl LockedSeed {
                 }
             }
         };
-        home.0.copy_from_slice(seed);
+        copy_seed(&mut home.seed, seed);
+        home.key = Some(build_key(seed));
         Ok(Self {
             home,
             guard,
             mlock_degradation,
-            #[cfg(test)]
-            lock_target,
+            #[cfg(any(test, feature = "test-helpers"))]
+            lock_target: LOCK_ATTEMPT.get(),
         })
     }
 
@@ -151,23 +205,46 @@ impl LockedSeed {
 
     /// Borrow the seed from its stable home for this owner's lifetime.
     pub fn seed(&self) -> &[u8; 32] {
-        &self.home.0
+        &self.home.seed
     }
 
-    /// Zeroize the seed, unlock its page, and free its home.
+    /// Borrow the signing key from the same stable home as the seed.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the live home's key slot is empty, which construction prevents.
+    #[allow(
+        clippy::expect_used,
+        reason = "construction fills the key before publishing the home"
+    )]
+    pub fn signing_key(&self) -> &ed25519_dalek::SigningKey {
+        self.home
+            .key
+            .as_ref()
+            .expect("the live home holds its signing key")
+    }
+
+    /// Zeroize the key and seed, unlock their page, and free their home.
     pub fn dispose(self) {
         drop(self);
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-helpers"))]
     pub(super) fn lock_target(&self) -> Option<usize> {
-        self.lock_target
+        self.lock_target.map(|(start, _)| start)
+    }
+
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub(super) fn lock_len(&self) -> Option<usize> {
+        self.lock_target.map(|(_, len)| len)
     }
 
     /// Release the memory lock on the home. The caller zeroizes the home first.
     fn release_lock(&mut self) {
         #[cfg(test)]
-        ZEROIZED_BEFORE_UNLOCK.set(Some(self.home.0.iter().all(|byte| *byte == 0)));
+        ZEROIZED_BEFORE_UNLOCK.set(Some(
+            self.home.seed.iter().all(|byte| *byte == 0) && self.home.key.is_none(),
+        ));
         drop(self.guard.take());
     }
 }
@@ -200,6 +277,43 @@ mod tests {
         0x08, 0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff,
         0x11, 0x22,
     ];
+
+    #[test]
+    fn the_signing_key_lives_in_the_locked_home() {
+        use ed25519_dalek::Signer;
+        let locked = LockedSeed::new(&TEST_SEED, MlockRequired::Warn, "test").unwrap();
+        let key = locked.signing_key();
+        let start = locked.lock_target().unwrap();
+        let address = std::ptr::from_ref(key) as usize;
+        assert!(address >= start && address + std::mem::size_of_val(key) <= start + LOCKED_LEN);
+        assert_eq!(
+            key.sign(b"payload"),
+            ed25519_dalek::SigningKey::from_bytes(&TEST_SEED).sign(b"payload")
+        );
+    }
+
+    #[test]
+    fn the_lock_covers_the_key_slot() {
+        let locked = LockedSeed::new(&TEST_SEED, MlockRequired::Warn, "test").unwrap();
+        assert_eq!(locked.lock_len(), Some(LOCKED_LEN));
+    }
+
+    #[test]
+    fn a_required_lock_failure_builds_no_key() {
+        KEYS_BUILT.set(0);
+        SEEDS_COPIED.set(0);
+        force_lock_failure_for_test(true);
+        assert!(matches!(
+            LockedSeed::new(&TEST_SEED, MlockRequired::True, "test"),
+            Err(WalletLifecycleError::MlockUnavailable { .. })
+        ));
+        assert_eq!(KEYS_BUILT.get(), 0);
+        assert_eq!(SEEDS_COPIED.get(), 0);
+        let locked = LockedSeed::new(&TEST_SEED, MlockRequired::Warn, "test").unwrap();
+        assert_eq!(KEYS_BUILT.get(), 1);
+        assert_eq!(SEEDS_COPIED.get(), 1);
+        assert_eq!(locked.signing_key().to_bytes(), TEST_SEED);
+    }
 
     // ── MlockRequired::False ─────────────────────────────────────────────────
 
@@ -436,23 +550,37 @@ mod tests {
         }
         let locked = LockedSeed::new(&TEST_SEED, MlockRequired::Warn, "test").unwrap();
         let address = locked.seed().as_ptr() as usize;
+        let key_address = std::ptr::from_ref(locked.signing_key()) as usize;
         assert_eq!(locked.lock_target(), Some(address));
         let mut values = Vec::new();
         values.push(locked);
         assert_eq!(values[0].seed().as_ptr() as usize, address);
+        assert_eq!(
+            std::ptr::from_ref(values[0].signing_key()) as usize,
+            key_address
+        );
         assert_eq!(values[0].lock_target(), Some(address));
         let boxed = Box::new(values.pop().unwrap());
         assert_eq!(boxed.seed().as_ptr() as usize, address);
+        assert_eq!(
+            std::ptr::from_ref(boxed.signing_key()) as usize,
+            key_address
+        );
         assert_eq!(boxed.lock_target(), Some(address));
         let returned = returned(*boxed);
         assert_eq!(returned.seed().as_ptr() as usize, address);
+        assert_eq!(
+            std::ptr::from_ref(returned.signing_key()) as usize,
+            key_address
+        );
         assert_eq!(returned.lock_target(), Some(address));
     }
 
     #[test]
-    fn drop_zeroizes_before_it_unlocks() {
+    fn drop_clears_the_key_and_the_seed_before_unlock() {
         ZEROIZED_BEFORE_UNLOCK.set(None);
         let locked = LockedSeed::new(&TEST_SEED, MlockRequired::Warn, "test").unwrap();
+        assert!(locked.home.key.is_some());
         drop(locked);
         assert_eq!(ZEROIZED_BEFORE_UNLOCK.get(), Some(true));
     }
@@ -484,6 +612,7 @@ mod tests {
             assert!(seed_page_isolates(size));
         }
         assert!(!seed_page_isolates(131072));
+        assert!(!seed_page_isolates(LOCKED_LEN - 1));
     }
 
     #[test]

@@ -135,17 +135,24 @@ each signature into a zeroize-on-drop buffer without a memory lock. The unlock
 window works as follows:
 
 - The wallet allocates an isolated zeroed home, attempts the configured memory
-  lock, then copies the borrowed seed into it. A successful lock keeps it out of swap.
+  lock, then copies the borrowed seed and builds its signing key in it.
 - The clock bounds wallet seed access and transfer. The default is 30 seconds;
   `wallet.unlock_ttl_seconds` accepts 1 through 600 seconds and refuses other values.
-- The seed stays in a zeroize-on-drop page, locked when the lock succeeds, until
-  its wallet or signer drops it. Drop zeroizes before unlocking and freeing,
+- When the lock succeeds, the seed and the signing key built from it stay in
+  one locked, zeroize-on-drop page while their wallet or signer holds them.
+  That page is not written to swap, but a hibernation image of the whole memory
+  still holds it. Drop zeroizes the key and seed before unlocking and freeing,
   including on panic unwind.
+- The owner ceremony clears its parsing buffer before the signing operation
+  runs. Copies that the strkey parser, signing library, and compiler make while
+  a key is built or read or a signature is computed are not locked and are
+  zeroized where those libraries allow. The wallet does not claim that no copy of a seed
+  reaches swap.
 - Testnet environment signers keep the seed for the command, which can outlast
   the TTL.
 - An exported seed stays in the environment of the process and of every process
   the shell starts, for their whole life; copying and dropping it inside the
-  wallet does not erase it. Mainnet signing refuses `--secret-env` and signs with
+  wallet does not erase it. Mainnet transaction signing refuses `--secret-env` and signs with
   the enrolled seed in the keyring or with a Ledger. On Linux the CLI marks
   itself non-dumpable before it starts any thread, so other processes of the same
   user cannot read its memory or environment or attach to it; the shell that

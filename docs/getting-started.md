@@ -747,14 +747,15 @@ range 1 to 600. The wallet refuses other values. The wallet copies the borrowed
 seed into an isolated home after the configured memory-lock attempt. The
 profile's `mlock_required = true` posture fails closed if locking fails.
 
-The seed stays in a zeroize-on-drop page, locked when the lock succeeds, until
-its wallet or signer drops it. Testnet environment signers keep it for the
-command, which can outlast the TTL. Drop zeroizes before unlocking and
-freeing. The `--sign-with-ledger` path holds no seed in process memory.
+The seed and its signing key stay in one zeroize-on-drop page, locked when the
+lock succeeds, until their wallet or signer drops them.
+[Memory protection limits](concepts.md#key-custody-and-the-unlock-window) apply.
+Testnet environment signers keep them for the command, which can outlast the TTL.
+Drop zeroizes before unlocking and freeing. The `--sign-with-ledger` path holds no seed in process memory.
 
 The window covers the wallet's own copies only. The exported variable stays in
 the environment of the process and of every process the shell starts, for
-their whole life. Mainnet signing therefore refuses `--secret-env` and signs
+their whole life. Mainnet transaction signing therefore refuses `--secret-env` and signs
 with the enrolled seed in the keyring or with a Ledger. On Linux the CLI marks
 itself non-dumpable before it starts any thread, so other processes of the same
 user cannot read its memory or environment; the exporting shell is not
@@ -831,7 +832,7 @@ run `profile enable-mainnet`, complete the policy, then run `profile sign-policy
 Then restart the MCP server. CLI entry checks can refuse missing engine,
 verified policy, or enablement before the resolver runs.
 
-Mainnet signing refuses `--secret-env` with
+Mainnet transaction signing refuses `--secret-env` with
 `validation.mainnet_secret_env_refused`; without a signer flag it signs with the
 enrolled seed in the keyring. A Ledger signer must satisfy the enrolled-identity
 requirement. `profile enroll-signer` accepts `--secret-env` only and cannot

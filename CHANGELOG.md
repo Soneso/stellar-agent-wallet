@@ -145,6 +145,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A log with an archive that carries no chain-root tag refuses keyed use until
   `profile rotate-audit-key` re-signs it after an operator checks the history.
   Each keyed acquisition reads every retained file.
+- `LockedSeed::signing_key` and `Wallet::signing_key` borrow the signing key
+  from the seed's page; wallet access checks disposal, expiry, and the clock.
 
 - On a mainnet profile `--secret-env` is refused by `pay`, `claim` and
   `accounts create` with `validation.mainnet_secret_env_refused`, and these
@@ -666,6 +668,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   A deleted, edited or substituted archive refuses value-moving verbs with
   `audit.history_unverified`. Audit readers refuse a retained history whose
   oldest file does not start at the zero seed or the seed its prune marker records.
+- The memory lock of an environment or owner seed also covers the signing key
+  built from it. The key lives in the same locked page, the owner ceremony clears
+  its parsing buffer before it signs, and a wallet-backed signer signs without
+  building a second key. The documentation states which copies the lock covers
+  and which it does not.
 
 - Crate publication rebuilds every vendored contract Wasm file of the published
   commit from its pinned source with the pinned tools and compares the bytes
