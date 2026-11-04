@@ -264,10 +264,15 @@ fn challenge(round: u8) -> ChallengeInput {
         None,
     )
     .expect("valid request context");
+    let expires_at = stellar_agent_core::timefmt::now_unix_ms().expect("clock") / 1_000 + 300;
+    let expires = stellar_agent_core::timefmt::format_rfc3339_utc(
+        std::time::UNIX_EPOCH + std::time::Duration::from_secs(expires_at),
+    );
     ChallengeInput::Http {
         www_authenticate: vec![format!(
             "Payment id=\"challenge-{round}\", realm=\"merchant.example\", \
-             method=\"stellar\", intent=\"charge\", request={encoded}"
+             method=\"stellar\", intent=\"charge\", request={encoded}, \
+             expires=\"{expires}\""
         )],
         selected_challenge_id: None,
         context,

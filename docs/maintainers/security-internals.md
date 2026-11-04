@@ -1386,10 +1386,14 @@ mutations.
 
 Prune retains the largest expiry removed as `pruned_through`. Without an
 identity match, a challenge expiring at or below that watermark refuses with
-`mpp.challenge_expired`. This protects clock regression after pruning. A
-discarding reset and a stale carry raise the watermark to the reset time plus
-the challenge lifetime cap, which covers every challenge whose record the reset
-lost. A repeated prepare of a challenge whose unclaimed record expired returns
+`mpp.challenge_expired`. Admission requires an `expires` within the challenge
+lifetime cap of the prepare and never defaults or clips it, so a challenge's
+expiry is fixed and a pruned challenge stays refused. Under a correct clock
+admission already refuses an expired challenge, so on the prune route this
+watermark covers a host clock that stepped back. A discarding reset and a
+stale carry raise the watermark to the reset time plus that cap, which covers
+every challenge whose record the reset lost. A repeated prepare of a challenge
+whose unclaimed record expired returns
 `mpp.challenge_expired`.
 
 Keyring compromise is outside the rollback boundary; a filesystem-backed

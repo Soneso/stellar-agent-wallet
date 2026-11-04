@@ -37,7 +37,8 @@ mod tests {
         let selected = select_and_validate(
             &ChallengeInput::Http {
                 www_authenticate: vec![format!(
-                    "Payment id=one, realm=api.example, method=stellar, intent=charge, request={encoded}"
+                    "Payment id=one, realm=api.example, method=stellar, intent=charge, request={encoded}, expires=\"{}\"",
+                    crate::sponsored::tests::rfc3339(1_700_000_060)
                 )],
                 selected_challenge_id: None,
                 context: HttpRequestContext::new(

@@ -837,7 +837,10 @@ pub(crate) mod tests {
     use stellar_xdr::{SorobanAddressCredentials, SorobanAuthorizedInvocation};
 
     use super::*;
-    use crate::{ChallengeInput, HttpRequestContext, select_and_validate};
+    use crate::{
+        ChallengeInput, HttpRequestContext, limits::MAX_CHALLENGE_LIFETIME_SECS,
+        select_and_validate,
+    };
 
     const CONTRACT: &str = "CBIELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEIE3USCIHMXQDAMA";
     const RECIPIENT: &str = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF";
@@ -913,7 +916,21 @@ pub(crate) mod tests {
         selected_challenge_for_resource(now, "https://merchant.example/checkout")
     }
 
-    pub(crate) fn selected_challenge_for_resource(now: i64, resource: &str) -> SelectedChallenge {
+    /// Formats Unix seconds as the RFC 3339 `expires` value of a challenge.
+    pub(crate) fn rfc3339(unix_seconds: i64) -> String {
+        let seconds = u64::try_from(unix_seconds).expect("timestamp in range");
+        stellar_agent_core::timefmt::format_rfc3339_utc(
+            std::time::UNIX_EPOCH + std::time::Duration::from_secs(seconds),
+        )
+    }
+
+    /// The HTTP charge challenge `id` for `resource`, carrying `expires` only
+    /// when `expires_unix` names one.
+    pub(crate) fn challenge_input(
+        id: &str,
+        resource: &str,
+        expires_unix: Option<i64>,
+    ) -> ChallengeInput {
         let request = serde_json::json!({
             "amount": "10000000",
             "currency": CONTRACT,
@@ -925,14 +942,29 @@ pub(crate) mod tests {
         let context =
             HttpRequestContext::new("https://merchant.example", "POST", resource, None, None)
                 .expect("valid request context");
+        let expires = expires_unix.map_or_else(String::new, |unix_seconds| {
+            format!(", expires=\"{}\"", rfc3339(unix_seconds))
+        });
+        ChallengeInput::Http {
+            www_authenticate: vec![format!(
+                "Payment id=\"{id}\", realm=\"merchant.example\", method=\"stellar\", intent=\"charge\", request={encoded}{expires}"
+            )],
+            selected_challenge_id: None,
+            context,
+        }
+    }
+
+    pub(crate) fn selected_challenge_for_resource(now: i64, resource: &str) -> SelectedChallenge {
+        selected_challenge_with_expiry(now, resource, now + MAX_CHALLENGE_LIFETIME_SECS)
+    }
+
+    fn selected_challenge_with_expiry(
+        now: i64,
+        resource: &str,
+        expires_unix: i64,
+    ) -> SelectedChallenge {
         select_and_validate(
-            &ChallengeInput::Http {
-                www_authenticate: vec![format!(
-                    "Payment id=\"challenge-1\", realm=\"merchant.example\", method=\"stellar\", intent=\"charge\", request={encoded}"
-                )],
-                selected_challenge_id: None,
-                context,
-            },
+            &challenge_input("challenge-1", resource, Some(expires_unix)),
             now,
         )
         .expect("valid selected challenge")
@@ -948,9 +980,37 @@ pub(crate) mod tests {
         prepared_fixture_for_resource(now, "https://merchant.example/checkout").await
     }
 
+    /// A prepare at `now` of the one fixture challenge that expires at
+    /// `expires_unix`: repeating it at a later clock repeats the challenge.
+    pub(crate) async fn prepared_fixture_expiring(
+        now: i64,
+        expires_unix: i64,
+    ) -> (
+        PreparedSponsoredCharge,
+        SoftwareSigningKey,
+        DeterministicRpc,
+    ) {
+        prepared_fixture_for_selected(selected_challenge_with_expiry(
+            now,
+            "https://merchant.example/checkout",
+            expires_unix,
+        ))
+        .await
+    }
+
     pub(crate) async fn prepared_fixture_for_resource(
         now: i64,
         resource: &str,
+    ) -> (
+        PreparedSponsoredCharge,
+        SoftwareSigningKey,
+        DeterministicRpc,
+    ) {
+        prepared_fixture_for_selected(selected_challenge_for_resource(now, resource)).await
+    }
+
+    pub(crate) async fn prepared_fixture_for_selected(
+        selected: SelectedChallenge,
     ) -> (
         PreparedSponsoredCharge,
         SoftwareSigningKey,
@@ -962,14 +1022,9 @@ pub(crate) mod tests {
             calls: AtomicUsize::new(0),
             payer: payer_sc_address(&payer).expect("payer"),
         };
-        let prepared = prepare_sponsored(
-            selected_challenge_for_resource(now, resource),
-            &payer,
-            TESTNET_PASSPHRASE,
-            &rpc,
-        )
-        .await
-        .expect("prepare fixture");
+        let prepared = prepare_sponsored(selected, &payer, TESTNET_PASSPHRASE, &rpc)
+            .await
+            .expect("prepare fixture");
         (prepared, signer, rpc)
     }
 

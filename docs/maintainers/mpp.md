@@ -90,13 +90,14 @@ bump reinspects them.
 `authorization_fingerprint` is SHA-256 over the versioned domain plus
 length-prefixed profile name, network-passphrase digest, payer, normalized
 context digest, exact challenge digest, method, intent, sponsored-pull mode,
-canonical amount, token contract, recipient, and effective expiry. The opaque
+canonical amount, token contract, recipient, and stored expiry. The opaque
 authorization ID contains a prefix of this digest; the full digest remains in
 authenticated state.
 
 Replay matching uses SHA-256 over `stellar-agent-mpp-challenge:v1\0` and the
 length-prefixed payer, request-context digest, and exact challenge digest.
-These values come from the stored prepared charge and exclude effective expiry.
+These values come from the stored prepared charge. The challenge digest covers
+the challenge's own `expires`; the expiry a record stores is not an input.
 The store prefers a live `prepared`, `approval_pending`, or `ready` match;
 otherwise it returns the most recently created match. Consumed matches refuse
 insertion. Repeated prepare reuses the stored authorization and pending approval.
@@ -249,10 +250,11 @@ authenticated history again.
 The carried snapshot is the one on disk. No write leaves the file more than one
 generation below the committed counter, so a larger gap proves a rollback. The
 reset still carries that file, reports `stale_carry`, and raises the watermark
-to the reset time plus the 300-second challenge lifetime cap. A record written
-after the carried snapshot belongs to a challenge prepared before the reset,
-whose effective expiry lies within that cap, so the challenge refuses with
-`mpp.challenge_expired` while it can still be live.
+to the reset time plus the 360-second challenge lifetime cap. A record written
+after the carried snapshot belongs to a challenge prepared before the reset.
+Admission holds that challenge's own expiry within the cap of its prepare, so
+the challenge refuses with `mpp.challenge_expired` while it can still be live.
+A challenge with a later expiry is a different challenge.
 
 When no snapshot authenticates, reset rotates the state key and retains every
 valid counter. Guarded atomic replacement publishes an empty snapshot strictly
@@ -323,18 +325,20 @@ Terminal states are `settled`, `failed`, `refused`, `expired_unresolved`,
 signs again. Status derives expiry without mutating state. Explicit audited
 prune persists eligible expiry markers and removes terminal records only after
 30 days; it never removes `indeterminate`. Prune retains the largest removed
-expiry as `pruned_through`. A challenge with no identity match and an effective
-expiry at or below this watermark refuses with `mpp.challenge_expired` and a
-host-clock message. An advanced prune clock alone does not raise the watermark
-past the removed records' own expiries. A reset that discards history or
-carries a stale snapshot raises it to the reset time plus the challenge
-lifetime cap.
+expiry as `pruned_through`. A challenge with no identity match and an expiry at
+or below this watermark refuses with `mpp.challenge_expired`, and the refusal
+names the replay horizon and asks for a fresh challenge. An advanced prune clock
+alone does not raise the watermark past the removed records' own expiries. A
+reset that discards history or carries a stale snapshot raises it to the reset
+time plus the challenge lifetime cap.
 
 The watermark is an additive version 2 field, omitted when zero. Older binaries
-ignore it and drop it on their next write. Once a record is pruned, a challenge
-with a distant or absent expiry can prepare again under a correct clock.
-The watermark protects against clock regression, not indefinite challenge reuse;
-a payee can also issue a fresh challenge at any time.
+ignore it and drop it on their next write. Admission requires an `expires` at
+most six minutes past the prepare and never defaults or clips it, so a
+challenge's expiry is fixed and a pruned challenge stays refused. Under a
+correct clock admission already refuses an expired challenge, so on the prune
+route this watermark covers a host clock that stepped back. A payee can issue
+a fresh challenge at any time.
 
 A failure after signer access begins becomes `indeterminate` unless the
 credential is known to exist, in which case a final-gate failure becomes

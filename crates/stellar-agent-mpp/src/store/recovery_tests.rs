@@ -5,13 +5,17 @@
 )]
 
 use super::*;
-use crate::sponsored::tests::prepared_fixture_for_resource;
+use crate::sponsored::tests::{
+    challenge_input, prepared_fixture_for_resource, prepared_fixture_for_selected,
+};
+use crate::{ChallengeInput, select_and_validate};
 use stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE;
 use stellar_agent_network::keyring::{load_hmac_key_32, rotate_keyring_secret_32};
 use stellar_agent_test_support::keyring_mock;
 use tempfile::TempDir;
 
 const NOW: i64 = 1_700_000_000;
+const HORIZON_REFUSAL: &str = "challenge expires within the replay horizon of a state reset or of pruned authorizations; ask the payee for a fresh challenge";
 
 struct Fixture {
     _directory: TempDir,
@@ -129,11 +133,15 @@ impl Fixture {
     }
 
     fn reset(&self) -> Result<MppStateReset, MppError> {
+        self.reset_on_clock(NOW)
+    }
+
+    fn reset_on_clock(&self, now: i64) -> Result<MppStateReset, MppError> {
         MppAuthorizationStore::reset_at(
             self.path.clone(),
             &self.key_ref,
             &self.name,
-            NOW,
+            now,
             |outcome| {
                 emit_state_audit(
                     &self.profile,
@@ -182,6 +190,34 @@ impl Fixture {
         body.get("pruned_through")
             .and_then(serde_json::Value::as_i64)
             .unwrap_or(0)
+    }
+
+    /// A store anchored at generation 1, ready for prepares.
+    fn anchored(&self) -> MppAuthorizationStore {
+        write_generation(&generation_entry_ref(&self.key_ref), 1).expect("anchor");
+        self.open().expect("anchored store")
+    }
+
+    /// A reset at `now` that finds no state file and discards every marker.
+    fn discard(&self, now: i64) -> MppAuthorizationStore {
+        self.move_state_file_out();
+        let outcome = self.reset_on_clock(now).expect("discarding reset");
+        assert_eq!(outcome.carried_generation, None);
+        assert_eq!(self.watermark(), now + MAX_CHALLENGE_LIFETIME_SECS);
+        self.open().expect("clean state")
+    }
+
+    /// One prepare at `now`: admission, simulation and the store insert.
+    async fn prepare(
+        &self,
+        store: &MppAuthorizationStore,
+        input: &ChallengeInput,
+        now: i64,
+    ) -> Result<AuthorizationRecord, MppError> {
+        let selected = select_and_validate(input, now)?;
+        let (prepared, _, _) = prepared_fixture_for_selected(selected).await;
+        let record = AuthorizationRecord::new(&self.name, TESTNET_PASSPHRASE, &prepared, now)?;
+        store.insert_prepared(record, now)
     }
 
     async fn record_for(&self, resource: &str, now: i64) -> AuthorizationRecord {
@@ -529,16 +565,94 @@ async fn reset_reports_a_stale_carry_and_refuses_challenges_it_may_have_lost() {
     let lost = fx
         .record_for("https://merchant.example/recovery/lost", NOW)
         .await;
+    assert_eq!(lost.expires_at(), NOW + MAX_CHALLENGE_LIFETIME_SECS);
     let refused = carried
         .insert_prepared(lost, NOW)
         .expect_err("a lost marker's challenge is refused");
     assert_eq!(refused.code(), "mpp.challenge_expired");
+    assert_eq!(refused.message(), HORIZON_REFUSAL);
     let fresh = fx
         .record_for("https://merchant.example/recovery/fresh", NOW + 1)
         .await;
+    assert_eq!(fresh.expires_at(), NOW + MAX_CHALLENGE_LIFETIME_SECS + 1);
     carried
         .insert_prepared(fresh, NOW + 1)
-        .expect("a challenge expiring past the cap prepares");
+        .expect("a challenge expiring past the horizon prepares");
+}
+
+/// A challenge cannot move its expiry past a reset's horizon: admission refuses
+/// a missing or distant expiry at every prepare, so no second authorization
+/// exists for a marker the reset lost. The first prepare's result is free
+/// because a discard leaves no record of it either way.
+#[tokio::test]
+#[serial_test::serial]
+async fn a_renewable_expiry_cannot_pass_the_reset_horizon() {
+    keyring_mock::install().expect("keyring");
+    for (label, expires) in [("absent", None), ("far", Some(NOW + 3600))] {
+        let fx = Fixture::new(&format!("mpp-renew-reset-{label}"), STORE_VERSION, 1).await;
+        let input = challenge_input("renewable", "https://merchant.example/renew", expires);
+        let store = fx.anchored();
+        drop(fx.prepare(&store, &input, NOW).await);
+        let clean = fx.discard(NOW + 10);
+        let error = fx
+            .prepare(&clean, &input, NOW + 11)
+            .await
+            .expect_err("no second authorization after the reset");
+        assert_eq!(error.code(), "mpp.challenge_invalid", "{label}");
+    }
+}
+
+/// The prune watermark holds the same way, on a challenge whose distant expiry
+/// still lies ahead of the clock after the retention period.
+#[tokio::test]
+#[serial_test::serial]
+async fn a_renewable_expiry_cannot_pass_the_prune_watermark() {
+    keyring_mock::install().expect("keyring");
+    let prune_at = NOW + MAX_CHALLENGE_LIFETIME_SECS + TERMINAL_RETENTION_SECS + 1;
+    for (label, expires) in [("absent", None), ("far", Some(prune_at + 3600))] {
+        let fx = Fixture::new(&format!("mpp-renew-prune-{label}"), STORE_VERSION, 1).await;
+        let input = challenge_input("renewable", "https://merchant.example/renew", expires);
+        let store = fx.anchored();
+        drop(fx.prepare(&store, &input, NOW).await);
+        store.prune(prune_at).expect("prune");
+        let error = fx
+            .prepare(&store, &input, prune_at + 1)
+            .await
+            .expect_err("no second authorization after the prune");
+        assert_eq!(error.code(), "mpp.challenge_invalid", "{label}");
+    }
+}
+
+/// A challenge's fixed expiry keeps it refused while it can still be live, and
+/// a different challenge past the horizon prepares.
+#[tokio::test]
+#[serial_test::serial]
+async fn a_fixed_expiry_challenge_stays_refused_through_the_horizon() {
+    keyring_mock::install().expect("keyring");
+    let fx = Fixture::new("mpp-fixed-expiry", STORE_VERSION, 1).await;
+    let resource = "https://merchant.example/fixed";
+    let input = challenge_input("fixed", resource, Some(NOW + MAX_CHALLENGE_LIFETIME_SECS));
+    let store = fx.anchored();
+    fx.prepare(&store, &input, NOW)
+        .await
+        .expect("a challenge at the cap prepares");
+    let reset_at = NOW + 10;
+    let clean = fx.discard(reset_at);
+    for now in [NOW + 11, NOW + 150, NOW + 270] {
+        let error = fx
+            .prepare(&clean, &input, now)
+            .await
+            .expect_err("a lost marker's challenge is refused");
+        assert_eq!(error.code(), "mpp.challenge_expired");
+        assert_eq!(error.message(), HORIZON_REFUSAL);
+    }
+    let horizon = reset_at + MAX_CHALLENGE_LIFETIME_SECS;
+    let fresh = challenge_input("fresh", resource, Some(horizon + 1));
+    let record = fx
+        .prepare(&clean, &fresh, NOW + 11)
+        .await
+        .expect("a new challenge past the horizon prepares");
+    assert_eq!(record.expires_at(), horizon + 1);
 }
 
 /// A malformed counter cannot bound the generations the retained key sealed,
@@ -901,13 +1015,11 @@ async fn reset_discards_under_a_malformed_anchor_and_missing_state_key() {
     let lost = fx
         .record_for("https://merchant.example/recovery/0", NOW)
         .await;
-    assert_eq!(
-        clean
-            .insert_prepared(lost, NOW)
-            .expect_err("a discarded marker's challenge is refused")
-            .code(),
-        "mpp.challenge_expired"
-    );
+    let refused = clean
+        .insert_prepared(lost, NOW)
+        .expect_err("a discarded marker's challenge is refused");
+    assert_eq!(refused.code(), "mpp.challenge_expired");
+    assert_eq!(refused.message(), HORIZON_REFUSAL);
 }
 
 /// Every committed-counter state has a recovery at each discard boundary.

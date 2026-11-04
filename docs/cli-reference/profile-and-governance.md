@@ -671,9 +671,10 @@ key, retains every valid generation counter, and atomically replaces the file
 with an empty store strictly above their maximum through the guarded write.
 An absent or malformed counter does not block the discard. A charge settled before that discard loses its
 settled status. A stale carry and a discard both refuse, with
-`mpp.challenge_expired`, every challenge that expires no later than five minutes
+`mpp.challenge_expired`, every challenge that expires no later than six minutes
 after the reset, which covers every charge whose record the reset could not
-keep. A
+keep. A challenge with a later expiry is a new one. A payee's five-minute
+challenge therefore prepares from about one minute after the reset. A
 keyring access error, a file read error, or a state path that is not a regular
 file refuses the reset before its audit row and changes nothing.
 

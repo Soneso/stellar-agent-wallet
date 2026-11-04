@@ -698,7 +698,12 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
-    use crate::{ReceiptInput, parse_receipt, sponsored::tests::prepared_fixture};
+    use crate::{
+        ReceiptInput,
+        limits::MAX_CHALLENGE_LIFETIME_SECS,
+        parse_receipt,
+        sponsored::tests::{prepared_fixture, prepared_fixture_expiring},
+    };
 
     const NOW: i64 = 1_700_000_000;
 
@@ -726,7 +731,8 @@ mod tests {
             Some(&mut approvals),
         )
         .expect("first pending approval");
-        let (prepared, _, _) = prepared_fixture(NOW + 10).await;
+        let (prepared, _, _) =
+            prepared_fixture_expiring(NOW + 10, NOW + MAX_CHALLENGE_LIFETIME_SECS).await;
         let later = persist_prepared_authorization(
             "mpp-profile",
             TESTNET_PASSPHRASE,
@@ -994,7 +1000,8 @@ mod tests {
 
         let mut approvals = PendingApprovalStore::open(directory.path().join("approvals.toml"))
             .expect("approval store");
-        let (prepared, _, _) = prepared_fixture(NOW + 10).await;
+        let (prepared, _, _) =
+            prepared_fixture_expiring(NOW + 10, NOW + MAX_CHALLENGE_LIFETIME_SECS).await;
         let promoted = persist_prepared_authorization(
             "policy-change",
             TESTNET_PASSPHRASE,
@@ -1097,8 +1104,12 @@ mod tests {
             None,
         )
         .expect("persist ready");
-        let view =
-            authorization_status(&state, &preview.authorization_id, NOW + 301).expect("status");
+        let view = authorization_status(
+            &state,
+            &preview.authorization_id,
+            preview.expires_at_unix + 1,
+        )
+        .expect("status");
         assert_eq!(view.status, AuthorizationStatus::ExpiredUnresolved);
         assert_eq!(
             state
