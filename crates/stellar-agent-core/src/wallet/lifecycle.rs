@@ -1,17 +1,17 @@
 //! Wallet lifecycle: clock-checked seed access and RAII disposal.
 //!
 //! The unlock window bounds when a wallet hands out its seed or transfers it
-//! to a signer. Expiry refuses access. The seed stays in a zeroize-on-drop
-//! page, locked when the lock succeeds, until the wallet or the receiving
-//! signer drops it.
-//! Mainnet environment signers unlock once per signature and drop the seed
-//! afterward. Testnet environment signers hold it until the command drops them,
+//! to a signer. Expiry refuses access to the seed and its signing key. Both stay
+//! in one zeroize-on-drop page, locked when the lock succeeds, until the wallet
+//! or the receiving signer drops them. Mainnet refuses environment signers for
+//! transactions; an owner ceremony keeps its page for its operation.
+//! Testnet environment signers hold the page until the command drops them,
 //! which can outlast the unlock TTL.
 //!
 //! ```text
 //! Wallet::unlock(profile, &seed, ttl, mlock_required)
 //!   ↓
-//! zeroed home → lock → copy seed
+//! zeroed home → lock → copy seed → build key in home
 //!   ↓
 //! Wallet { locked_seed, expires_at_unix_ms, … }
 //!   ↓ clock check                    ↓ clock check
@@ -274,6 +274,21 @@ impl Wallet {
         }
     }
 
+    /// Borrow the signing key from the seed's home while the wallet is active.
+    ///
+    /// The clock is checked here; it does not revoke a borrow taken before expiry.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same disposed, expiry, and clock errors as [`Wallet::seed`].
+    pub fn signing_key(&self) -> Result<&ed25519_dalek::SigningKey, WalletLifecycleError> {
+        self.seed()?;
+        self.locked_seed
+            .as_ref()
+            .map(LockedSeed::signing_key)
+            .ok_or(WalletLifecycleError::Disposed)
+    }
+
     /// Transfer the seed's stable home to another owner during the unlock window.
     ///
     /// The receiving owner controls the seed's lifetime, which can exceed the TTL.
@@ -291,9 +306,16 @@ impl Wallet {
         Ok(seed)
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-helpers"))]
     fn lock_target(&self) -> Option<usize> {
         self.locked_seed.as_ref().and_then(LockedSeed::lock_target)
+    }
+
+    /// Return the address and byte length of the attempted memory lock.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn locked_range_for_test(&self) -> Option<(usize, usize)> {
+        self.lock_target()
+            .zip(self.locked_seed.as_ref().and_then(LockedSeed::lock_len))
     }
 
     /// Zeroize the seed, release its memory lock, and close access.
@@ -413,6 +435,33 @@ mod tests {
         .unwrap();
         w.dispose();
         assert!(matches!(w.seed(), Err(WalletLifecycleError::Disposed)));
+    }
+
+    #[test]
+    fn signing_key_refuses_after_dispose_and_expiry() {
+        let mut w = Wallet::unlock("test".to_owned(), &TEST_SEED, 30, MlockRequired::Warn).unwrap();
+        assert_eq!(w.signing_key().unwrap().to_bytes(), TEST_SEED);
+        w.expires_at_unix_ms = 0;
+        assert!(matches!(
+            w.signing_key(),
+            Err(WalletLifecycleError::Disposed)
+        ));
+        w.expires_at_unix_ms = u64::MAX;
+        w.clock = Arc::new(crate::timefmt::MockClock::new(|| {
+            Err(WalletLifecycleError::ClockError {
+                detail: "test clock failure".to_owned(),
+                source: None,
+            })
+        }));
+        assert!(matches!(
+            w.signing_key(),
+            Err(WalletLifecycleError::ClockError { .. })
+        ));
+        w.dispose();
+        assert!(matches!(
+            w.signing_key(),
+            Err(WalletLifecycleError::Disposed)
+        ));
     }
 
     // ── TTL enforcement ───────────────────────────────────────────────────────

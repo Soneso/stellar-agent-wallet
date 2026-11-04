@@ -1,8 +1,9 @@
 //! Software ed25519 signing with a zeroize-on-drop seed home.
 //!
 //! Keyring and fixture constructors use `secrecy::SecretBox`. Wallet signers
-//! take ownership of a `LockedSeed` and read its stable home directly.
-//! Both homes zeroize before freeing; a locked home also unlocks after zeroizing.
+//! take ownership of a `LockedSeed` containing both seed and signing key and
+//! sign with that key in its stable page. Boxed homes build an unlocked key per
+//! call. Both homes zeroize before freeing; a locked home unlocks after zeroizing.
 
 use async_trait::async_trait;
 use secrecy::{ExposeSecret, SecretBox};
@@ -25,10 +26,9 @@ use crate::signing::{
 ///
 /// # Secret-material policy
 ///
-/// The inner bytes are never accessible except through
-/// `expose_secret_for_signing` (a `pub(crate)` method), which is explicitly
-/// named to signal the narrow use case. It is called by
+/// Boxed homes expose their bytes through `expose_secret_for_signing` to
 /// `SoftwareSigningKey::sign_raw` and `SoftwareSigningKey::public_key` only.
+/// Locked homes use their in-page key directly.
 ///
 /// This type deliberately does not implement `Debug`, `Display`, `Clone`, or
 /// `Serialize` — the type system prevents the inner bytes from leaking through
@@ -59,6 +59,16 @@ pub struct SoftwareSigningKey(SeedHome);
 enum SeedHome {
     Boxed(SecretBox<[u8; 32]>),
     Locked(LockedSeed),
+}
+
+#[cfg(test)]
+thread_local! {
+    static KEY_ADDRESSES: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[cfg(test)]
+fn record_key_address(key: &ed25519_dalek::SigningKey) {
+    KEY_ADDRESSES.with_borrow_mut(|addresses| addresses.push(std::ptr::from_ref(key) as usize));
 }
 
 impl SoftwareSigningKey {
@@ -116,10 +126,8 @@ impl SoftwareSigningKey {
         Self(SeedHome::Locked(seed))
     }
 
-    /// Exposes the raw 32-byte secret key seed for the signing implementation.
-    ///
-    /// `pub(crate)`: called by `SoftwareSigningKey::sign_raw` and
-    /// `SoftwareSigningKey::public_key` only.
+    /// Exposes the seed bytes of either home. Production signing calls it for
+    /// a boxed home, to build a temporary key.
     pub(crate) fn expose_secret_for_signing(&self) -> &[u8; 32] {
         match &self.0 {
             SeedHome::Boxed(seed) => seed.expose_secret(),
@@ -130,15 +138,24 @@ impl SoftwareSigningKey {
     /// Signs 32 bytes with the ed25519 secret seed: the primitive under every
     /// typed signing method.
     ///
-    /// Reads the seed in place from its home, boxed or locked, and builds the
-    /// dalek signing key from it; the dalek key zeroizes when it drops at the
-    /// end of the call. Crate-private: outside this crate a signature is made
-    /// only over a typed payload.
+    /// Uses the locked home's key directly. A boxed home builds a temporary
+    /// dalek key, which zeroizes at the end of the call. Crate-private: outside
+    /// this crate a signature is made only over a typed payload.
     pub(crate) fn sign_raw(&self, bytes: &[u8; 32]) -> [u8; 64] {
         use ed25519_dalek::{Signer as DalekSigner, SigningKey};
 
-        let signing_key = SigningKey::from_bytes(self.expose_secret_for_signing());
-        signing_key.sign(bytes).to_bytes()
+        let sign = |key: &SigningKey| {
+            #[cfg(test)]
+            record_key_address(key);
+            key.sign(bytes).to_bytes()
+        };
+        match &self.0 {
+            SeedHome::Locked(seed) => sign(seed.signing_key()),
+            SeedHome::Boxed(_) => {
+                let signing_key = SigningKey::from_bytes(self.expose_secret_for_signing());
+                sign(&signing_key)
+            }
+        }
     }
 }
 
@@ -148,14 +165,6 @@ impl Drop for SoftwareSigningKey {
         // SecretBox zeroizes before freeing; LockedSeed zeroizes before unlocking.
     }
 }
-
-// Compile-time guarantee that `ed25519_dalek::SigningKey` implements
-// `ZeroizeOnDrop`. If a future dep pin strips the `zeroize` feature
-// from `ed25519-dalek` this assertion fails at compile time.
-const _: fn() = || {
-    fn assert_zeroize_on_drop<T: zeroize::ZeroizeOnDrop>() {}
-    assert_zeroize_on_drop::<ed25519_dalek::SigningKey>();
-};
 
 #[async_trait]
 impl Signer for SoftwareSigningKey {
@@ -240,9 +249,18 @@ impl Signer for SoftwareSigningKey {
     async fn public_key(&self) -> Result<stellar_strkey::ed25519::PublicKey, WalletError> {
         use ed25519_dalek::SigningKey;
 
-        let seed = self.expose_secret_for_signing();
-        let signing_key = SigningKey::from_bytes(seed);
-        let vk = signing_key.verifying_key();
+        let verifying_key = |key: &SigningKey| {
+            #[cfg(test)]
+            record_key_address(key);
+            key.verifying_key()
+        };
+        let vk = match &self.0 {
+            SeedHome::Locked(seed) => verifying_key(seed.signing_key()),
+            SeedHome::Boxed(_) => {
+                let signing_key = SigningKey::from_bytes(self.expose_secret_for_signing());
+                verifying_key(&signing_key)
+            }
+        };
         Ok(stellar_strkey::ed25519::PublicKey(vk.to_bytes()))
     }
 }
@@ -261,6 +279,42 @@ impl Signer for SoftwareSigningKey {
 mod tests {
     use super::*;
     use zeroize::Zeroizing;
+
+    #[tokio::test]
+    async fn a_wallet_signer_signs_from_the_locked_key() {
+        use ed25519_dalek::Signer as _;
+        use stellar_agent_core::wallet::{MlockRequired, Wallet};
+        let seed = [42; 32];
+        let reference = ed25519_dalek::SigningKey::from_bytes(&seed);
+        let wallet = Wallet::unlock("test".to_owned(), &seed, 30, MlockRequired::Warn).unwrap();
+        let address = std::ptr::from_ref(wallet.signing_key().unwrap()) as usize;
+        let signer = crate::signing::wallet::signer_from_wallet(wallet).unwrap();
+        KEY_ADDRESSES.with_borrow_mut(Vec::clear);
+        let payload = TxSigningPayload::from_bytes_for_test([7; 32]);
+        assert_eq!(
+            signer.sign_tx_payload(&payload).await.unwrap(),
+            reference.sign(payload.as_bytes()).to_bytes()
+        );
+        assert_eq!(
+            signer.public_key().await.unwrap().0,
+            reference.verifying_key().to_bytes()
+        );
+        KEY_ADDRESSES.with_borrow(|addresses| assert_eq!(addresses, &[address, address]));
+        KEY_ADDRESSES.with_borrow_mut(Vec::clear);
+        let boxed = SoftwareSigningKey::new_from_bytes(seed);
+        assert_eq!(
+            boxed.sign_raw(payload.as_bytes()),
+            reference.sign(payload.as_bytes()).to_bytes()
+        );
+        assert_eq!(
+            boxed.public_key().await.unwrap().0,
+            reference.verifying_key().to_bytes()
+        );
+        KEY_ADDRESSES.with_borrow(|addresses| {
+            assert_eq!(addresses.len(), 2);
+            assert!(addresses.iter().all(|key_address| *key_address != address));
+        });
+    }
 
     #[tokio::test]
     async fn soroban_mainnet_binding_refuses_another_key() {

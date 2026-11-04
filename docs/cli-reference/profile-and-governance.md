@@ -164,8 +164,12 @@ paths fail. The enrolled-signer loader reports `auth.enrolled_identity_unusable`
 (`missing`) when the identity record is absent. After the record passes
 validation, a missing seed reports `auth.keyring_not_found`.
 This command populates the entry and updates the profile TOML on first signer
-enrollment, without network access. It reads the seed from a named environment
-variable through the shared mlock-protected ceremony and stores it verbatim.
+enrollment, without network access. It derives the address from a named environment
+variable through the shared environment-seed ceremony, which keeps the seed and its
+signing key in one memory-locked page when the lock succeeds. It then reads the
+variable again and stores the strkey verbatim from a zeroizing buffer that is not
+locked. The [memory protection limits](../concepts.md#key-custody-and-the-unlock-window)
+apply to the ceremony.
 The seed is never printed, logged, or returned.
 
 - `--secret-env <VAR>` (required unless `--repair-identity`): name of the environment variable holding the signer's `S...` strkey. The flag takes the variable name, never the secret.
@@ -297,7 +301,7 @@ stellar-agent profile enroll-owner-key --profile default --secret-env WALLET_OWN
 unset WALLET_OWNER_SK
 ```
 
-Enrolls the policy-file owner PUBLIC key into the profile's `policy_owner_key_id` keyring entry, the key the V1 policy engine verifies every policy file against. The owner key is the root of trust for policy: whoever can sign a policy file can authorize any action the policy permits. `enroll-owner-key` and `sign-policy` read the owner seed from the environment of the shell that runs them. Supply it with the read line only for those commands, as [Pass a secret seed](../getting-started.md#pass-a-secret-seed) describes, and unset it afterward. Of the policy owner key, the MCP server holds only the enrolled public key. It reads no seed from its environment. State-changing (keyring), no network. The command passes the seed through the shared mlock-protected ceremony, stores only the derived public key, and never prints, logs, or returns the seed.
+Enrolls the policy-file owner PUBLIC key into the profile's `policy_owner_key_id` keyring entry, the key the V1 policy engine verifies every policy file against. The owner key is the root of trust for policy: whoever can sign a policy file can authorize any action the policy permits. `enroll-owner-key` and `sign-policy` read the owner seed from the environment of the shell that runs them. Supply it with the read line only for those commands, as [Pass a secret seed](../getting-started.md#pass-a-secret-seed) describes, and unset it afterward. Of the policy owner key, the MCP server holds only the enrolled public key. It reads no seed from its environment. State-changing (keyring), no network. The command passes the seed through the shared owner-seed ceremony, which keeps the seed and its signing key in one memory-locked page when the lock succeeds. It stores only the derived public key and never prints, logs, or returns the seed.
 
 - `--secret-env <VAR>` (required): name of the environment variable holding the owner `S...` strkey. The flag takes the variable name, never the secret.
 - `--profile <NAME>`: profile whose owner coordinate is written (default: `STELLAR_AGENT_PROFILE`, else `default`). Loading a mainnet profile requires an explicit `--profile <NAME>`.
@@ -339,7 +343,7 @@ unset WALLET_OWNER_SK
 Signs a v1 or v2 policy file so the engine accepts it. The engine loads `<state_dir>/policies/<profile>.toml`, recomputes the canonical form (the `[signature]` table excluded), and verifies the signature against the enrolled owner public key. This command produces that `[signature]` table: it computes the same canonical BLAKE3 digest the loader computes, signs it with the owner seed, and writes `owner_id` (the owner G-strkey) and `sig` (hex) back into the file. State-changing (writes the policy file), no network. The owner seed is read from a named environment variable and held only in zeroizing memory; it is never printed, logged, or written to disk.
 
 - `--secret-env <VAR>` (required): name of the environment variable holding the owner `S...` strkey.
-- `--previous-owner-secret-env <VAR>`: authorize rotation with the previous seed through the same mlock-protected ceremony. `--secret-env` supplies the new owner seed. The previous seed must match the pinned owner, or the enrolled owner when no pin exists.
+- `--previous-owner-secret-env <VAR>`: authorize rotation with the previous seed through the shared owner-seed ceremony, which keeps the seed and its signing key in one memory-locked page when the lock succeeds. `--secret-env` supplies the new owner seed. The previous seed must match the pinned owner, or the enrolled owner when no pin exists.
 - `--profile <NAME>`: profile whose policy file is signed (default: `STELLAR_AGENT_PROFILE`, else `default`). Loading a mainnet profile requires an explicit `--profile <NAME>`.
 - `--file <PATH>`: sign a policy file at a non-default path (default `<state_dir>/policies/<profile>.toml`, the only location the engine loads).
 

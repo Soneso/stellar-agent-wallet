@@ -1,13 +1,15 @@
 //! Wallet-backed signer resolution with a stable seed home.
 //!
 //! [`signer_from_wallet`] consumes an unlocked wallet and transfers its
-//! `LockedSeed` into [`SoftwareSigningKey`]. The signer reads the same bytes
-//! at the same address, retaining the configured memory lock until drop.
+//! `LockedSeed` into [`SoftwareSigningKey`]. The transferred page holds the seed
+//! and its signing key. Signing and public-key reads borrow that key at the same
+//! address, retaining the configured memory lock until drop.
 //! Drop zeroizes before unlocking and freeing, including during panic unwind.
 //!
 //! The wallet's clock checks the TTL at transfer. The signer then owns the
-//! seed for its own lifetime. Mainnet environment signing transfers once per
-//! signature; testnet commands can retain their signer beyond the unlock TTL.
+//! seed and key for its own lifetime. Mainnet refuses environment signers for
+//! transactions; an owner ceremony keeps its page for its operation;
+//! testnet commands can retain their signer beyond the unlock TTL.
 //! The caller verifies the signer's public key against the expected account.
 
 use stellar_agent_core::{
@@ -19,8 +21,8 @@ use super::software::SoftwareSigningKey;
 
 /// Transfer an active wallet's seed home into a signing key.
 ///
-/// The transfer preserves the seed's address and lock. The signer zeroizes
-/// the seed before unlocking its page on drop.
+/// The transfer preserves the seed and key's addresses and lock. The signer
+/// zeroizes both before unlocking their page on drop.
 ///
 /// # Errors
 ///

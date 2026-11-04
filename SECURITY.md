@@ -167,14 +167,20 @@ properties:
 - Unlock window with zeroize and mlock. CLI environment signing copies the
   borrowed seed into an isolated home after the configured lock attempt.
   The clock bounds wallet seed access and transfer, default 30 seconds, cap 600.
-  The seed stays in a zeroize-on-drop page, locked when the lock succeeds, until
-  its wallet or signer drops it. Drop zeroizes before unlocking and freeing,
-  including during unwind.
+  When the lock succeeds, the seed and the signing key built from it stay in
+  one locked, zeroize-on-drop page while their wallet or signer holds them.
+  That page is not written to swap, but a hibernation image of the whole memory
+  still holds it. Drop zeroizes the key and seed before unlocking and freeing,
+  including during unwind. The owner ceremony clears its parsing buffer before
+  the signing operation runs. Copies that the strkey parser, signing library,
+  and compiler make while a key is built or read or a signature is computed are
+  not locked and are zeroized where those libraries allow. The wallet does not
+  claim that no copy of a seed reaches swap.
   Testnet environment signers keep the seed for the command, which can outlast
   the TTL.
   An exported seed stays in the environment of the process and of every process
   the shell starts, for their whole life; copying and dropping it inside the wallet
-  does not erase it. Mainnet signing refuses `--secret-env` and signs with the
+  does not erase it. Mainnet transaction signing refuses `--secret-env` and signs with the
   enrolled seed in the keyring or with a Ledger. On Linux the CLI marks itself
   non-dumpable before it starts any thread, so other processes of the same user
   cannot read its memory or environment or attach to it; the shell that exported

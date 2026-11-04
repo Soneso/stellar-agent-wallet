@@ -4,8 +4,8 @@
 //!
 //! - [`MlockRequired`] — the three-posture config enum (`true` / `"warn"` / `false`)
 //!   controlling how `mlock` failures are handled.
-//! - [`LockedSeed`] — an opaque 32-byte seed holder that pins the seed page in
-//!   RAM via `region::lock` and zeroizes the seed on drop.
+//! - [`LockedSeed`]: a seed and its signing key in one page, pinned in RAM via
+//!   `region::lock` when the lock succeeds, with both zeroized on drop.
 //! - [`Wallet`]: clock-checked seed access, ownership transfer, and RAII disposal.
 //! - [`WalletLifecycleError`] — typed error taxonomy for all lifecycle failure
 //!   modes.
@@ -14,10 +14,11 @@
 //!
 //! CLI environment signers call `Wallet::unlock(profile, &seed, ttl, posture)`.
 //! The wallet allocates a stable zeroed home, attempts the configured memory
-//! lock, then copies the borrowed seed into it. Clock checks refuse seed access
-//! and transfer after the TTL. The seed lives until its wallet or signer drops.
-//! Mainnet environment signers unlock once per signature and drop the seed
-//! afterward. Testnet environment signers keep it for the command, past the TTL
+//! lock, then copies the borrowed seed and builds its signing key in that page.
+//! Clock checks refuse seed and key access and transfer after the TTL. The page
+//! lives until its wallet or signer drops. Mainnet refuses environment signers
+//! for transactions; an owner ceremony keeps its page for its operation.
+//! Testnet environment signers keep it for the command, past the TTL
 //! if needed. Drop zeroizes before unlocking and freeing, including on unwind.
 //!
 //! # `mlock(2)` vs `mlock2(MLOCK_ONFAULT)`
