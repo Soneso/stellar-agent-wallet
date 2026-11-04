@@ -165,6 +165,7 @@ fn write_pin(toolsets_root: &std::path::Path, toolset_name: &str, capabilities: 
         capabilities,
         &[],
         "2026-06-02T00:00:00Z",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         &crate::common::toolset_pin_key(),
     )
     .expect("write toolset");
@@ -463,6 +464,9 @@ async fn dangerous_key_tojson_rejected_gated() {
     let now_ms = now_unix_ms().expect("now_unix_ms");
     let grant = build_attested_grant(
         TOOLSET_SIGN_PAYMENT.to_owned(),
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+        "1.0.0".to_owned(),
+        "0000000000000000000000000000000000000000000000000000000000000000".to_owned(),
         "sign-payment".to_owned(),
         DEST_G.to_owned(),
         "XLM".to_owned(),
@@ -554,6 +558,9 @@ async fn dangerous_key_chain_id_injected_gated_still_caught() {
     let now_ms = now_unix_ms().expect("now_unix_ms");
     let grant = build_attested_grant(
         TOOLSET_SIGN_PAYMENT.to_owned(),
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+        "1.0.0".to_owned(),
+        "0000000000000000000000000000000000000000000000000000000000000000".to_owned(),
         "sign-payment".to_owned(),
         DEST_G.to_owned(),
         "XLM".to_owned(),

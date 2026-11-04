@@ -88,6 +88,7 @@ pub const INBOX_STYLE: &str = r"
 .empty { text-align: center; padding: 28px 0 6px; }
 .empty .buddy { width: 64px; margin: 0 auto; }
 .empty p { font-size: 13px; color: var(--muted-blue); margin-top: 8px; }
+.ap-meta.toolset-gate { overflow: visible; text-overflow: clip; white-space: normal; overflow-wrap: anywhere; }
 ";
 
 /// The approval detail page's own rules: the decision card, its amount
@@ -960,6 +961,9 @@ pub fn render_summary_html(view: &PendingApprovalView) -> String {
         }
         ApprovalSummaryView::ToolsetFirstInvokeGate {
             toolset_name,
+            install_id,
+            package_version,
+            package_shasum_short,
             capability,
             destination_redacted,
             asset,
@@ -968,6 +972,9 @@ pub fn render_summary_html(view: &PendingApprovalView) -> String {
         } => {
             let mut rows = String::new();
             rows.push_str(&row("Toolset", toolset_name));
+            rows.push_str(&row("Version", package_version));
+            rows.push_str(&row("Package SHA-256", package_shasum_short));
+            rows.push_str(&row("Install identity", install_id));
             rows.push_str(&row("Capability", capability));
             rows.push_str(&row("Asset", asset));
             rows.push_str(&row(
@@ -1661,6 +1668,9 @@ mod tests {
         let mut store = PendingApprovalStore::open(dir.path().join("default.toml")).unwrap();
         let entry = PendingApproval::new_toolset_first_invoke_gate_pending(
             "my-toolset".to_owned(),
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+            "1.0.0".to_owned(),
+            "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd".to_owned(),
             "sign-payment".to_owned(),
             "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
             "XLM".to_owned(),
@@ -2199,6 +2209,37 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Toolset gate metadata wraps within the content column so the full install identity remains visible.
+    /// Its selector outranks the base metadata rule regardless of stylesheet order.
+    #[test]
+    fn the_toolset_gate_meta_line_wraps_instead_of_clipping() {
+        let selector = ".ap-meta.toolset-gate {";
+        assert_eq!(
+            INBOX_STYLE.matches(selector).count(),
+            1,
+            "the inbox style must hold exactly one toolset gate meta rule"
+        );
+        let start = INBOX_STYLE.find(selector).unwrap() + selector.len();
+        let body = &INBOX_STYLE[start..];
+        let body = &body[..body.find('}').unwrap()];
+        let mut declarations: Vec<&str> = body
+            .split(';')
+            .map(str::trim)
+            .filter(|declaration| !declaration.is_empty())
+            .collect();
+        declarations.sort_unstable();
+        assert_eq!(
+            declarations,
+            [
+                "overflow-wrap: anywhere",
+                "overflow: visible",
+                "text-overflow: clip",
+                "white-space: normal",
+            ],
+            "the toolset gate meta rule must lift the clipping and wrap long tokens"
+        );
     }
 
     /// An unconfigured deployment serves no project identity. This wallet is
@@ -3096,5 +3137,22 @@ mod tests {
         );
         assert_eq!(json[1]["summary"]["memo"]["value"], "memo\\u{202e}");
         assert!(!json.to_string().contains('\u{202e}'));
+    }
+
+    #[test]
+    fn the_gate_summary_shows_version_shasum_and_install_id() {
+        let dir = TempDir::new().unwrap();
+        let mut view = toolset_first_invoke_gate_view(&dir);
+        if let ApprovalSummaryView::ToolsetFirstInvokeGate {
+            package_version, ..
+        } = &mut view.summary
+        {
+            *package_version = "1.0.0<test>".to_owned();
+        }
+        let html = render_summary_html(&view);
+        assert!(html.contains("1.0.0&lt;test&gt;"));
+        assert!(html.contains(&"d".repeat(12)));
+        assert!(!html.contains(&"d".repeat(13)));
+        assert!(html.contains(&"a".repeat(32)));
     }
 }

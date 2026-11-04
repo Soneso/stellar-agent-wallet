@@ -123,6 +123,12 @@ pub struct ToolsetGrantRequest<'a> {
     pub binding: &'a super::AttestationBinding<'a>,
     /// Name of the toolset requesting signing-adjacent capability access.
     pub toolset_name: &'a str,
+    /// Random installation identity, 32 lowercase hex characters.
+    pub install_id: &'a str,
+    /// Version of the package requesting consent.
+    pub package_version: &'a str,
+    /// SHA-256 of the package bytes, 64 lowercase hex characters.
+    pub package_shasum: &'a str,
     /// The signing-adjacent capability token being requested.
     pub capability: &'a str,
     /// Canonical G-strkey destination address from the authoritative envelope.
@@ -664,12 +670,16 @@ pub fn attest_and_persist(
         )?,
         ApprovalKind::ToolsetFirstInvokeGate {
             toolset_name,
+            install_id,
+            package_version,
+            package_shasum,
             capability,
             destination,
             asset,
             amount_min_stroops,
             amount_max_stroops,
         } => {
+            super::toolset_grant::verify_toolset_gate_entry_terms(&entry.kind)?;
             // A `ToolsetFirstInvokeGate` entry MUST NOT use `record_attestation_on_store`
             // (which calls `store.record_attestation` and returns `WrongKind`
             // for this variant) and MUST NOT set
@@ -686,6 +696,9 @@ pub fn attest_and_persist(
             let request = ToolsetGrantRequest {
                 binding,
                 toolset_name,
+                install_id,
+                package_version,
+                package_shasum,
                 capability,
                 destination,
                 asset,
@@ -1965,6 +1978,9 @@ mod tests {
         let uid = process_uid_for_attestation().unwrap();
         let entry = PendingApproval::new_toolset_first_invoke_gate_pending(
             "my-toolset".to_owned(),
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+            "1.0.0".to_owned(),
+            "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd".to_owned(),
             "sign-payment".to_owned(),
             "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
             "XLM".to_owned(),
@@ -1988,6 +2004,9 @@ mod tests {
             ConsentAuthorization::Standard(&AttestedApprover::Local),
             |req, _key| {
                 assert_eq!(req.toolset_name, "my-toolset");
+                assert_eq!(req.install_id, "a".repeat(32));
+                assert_eq!(req.package_version, "1.0.0");
+                assert_eq!(req.package_shasum, "d".repeat(64));
                 assert_eq!(req.capability, "sign-payment");
                 Ok(())
             },
@@ -2015,6 +2034,9 @@ mod tests {
         let uid = process_uid_for_attestation().unwrap();
         let entry = PendingApproval::new_toolset_first_invoke_gate_pending(
             "my-toolset".to_owned(),
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+            "1.0.0".to_owned(),
+            "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd".to_owned(),
             "sign-payment".to_owned(),
             "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
             "XLM".to_owned(),
@@ -2354,6 +2376,9 @@ mod tests {
                 "ToolsetFirstInvokeGate",
                 PendingApproval::new_toolset_first_invoke_gate_pending(
                     "my-toolset".to_owned(),
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+                    "1.0.0".to_owned(),
+                    "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd".to_owned(),
                     "sign-payment".to_owned(),
                     "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
                     "XLM".to_owned(),
@@ -3559,5 +3584,89 @@ mod tests {
     #[test]
     fn edited_mpp_recipient_is_refused_at_attestation() {
         assert_edited_mpp_refused(false);
+    }
+
+    /// Stores a toolset gate request, removes the lines of the `missing` fields
+    /// from the stored record, and asserts that attestation refuses the loaded
+    /// entry before any grant persists.
+    fn assert_gate_request_without_fields_is_inconsistent(missing: &[&str]) {
+        let dir = TempDir::new().unwrap();
+        let entry = PendingApproval::new_toolset_first_invoke_gate_pending(
+            "my-toolset".to_owned(),
+            "a".repeat(32),
+            "1.0.0".to_owned(),
+            "d".repeat(64),
+            "sign-payment".to_owned(),
+            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+            "XLM".to_owned(),
+            0,
+            1_000_000,
+            process_uid_for_attestation().unwrap(),
+            DEFAULT_TTL_MS,
+        )
+        .unwrap();
+        let nonce = entry.approval_nonce.clone();
+        let path = dir.path().join("legacy.toml");
+        let now = crate::timefmt::now_unix_ms().unwrap();
+        {
+            let mut store = PendingApprovalStore::open(path.clone()).unwrap();
+            store.insert(entry, now).unwrap();
+        }
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let raw = raw
+            .lines()
+            .filter(|line| {
+                !missing
+                    .iter()
+                    .any(|prefix| line.trim_start().starts_with(prefix))
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&path, raw).unwrap();
+        let mut store = PendingApprovalStore::open(path).unwrap();
+        let loaded = store.get(&nonce).unwrap().clone();
+        let mut audit = test_audit_writer(&dir);
+        let mut grant_persisted = false;
+        let error = attest_and_persist(
+            &mut store,
+            &loaded,
+            &[7; 32],
+            &crate::approval::AttestationBinding::new("default", "stellar:testnet"),
+            Surface::Cli,
+            ConsentAudit::Writer(&mut audit),
+            ConsentAuthorization::Standard(&AttestedApprover::Local),
+            |_, _| {
+                grant_persisted = true;
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error.code(), "approval.entry_inconsistent");
+        assert!(!grant_persisted);
+        assert!(store.get(&nonce).unwrap().attestation_blob_b64.is_none());
+    }
+
+    #[test]
+    fn a_gate_request_without_any_installation_term_is_inconsistent() {
+        assert_gate_request_without_fields_is_inconsistent(&[
+            "install_id =",
+            "package_version =",
+            "package_shasum =",
+        ]);
+    }
+
+    #[test]
+    fn a_gate_request_without_an_install_identity_is_inconsistent() {
+        assert_gate_request_without_fields_is_inconsistent(&["install_id ="]);
+    }
+
+    #[test]
+    fn a_gate_request_without_a_package_version_is_inconsistent() {
+        assert_gate_request_without_fields_is_inconsistent(&["package_version ="]);
+    }
+
+    #[test]
+    fn a_gate_request_without_a_package_shasum_is_inconsistent() {
+        assert_gate_request_without_fields_is_inconsistent(&["package_shasum ="]);
     }
 }

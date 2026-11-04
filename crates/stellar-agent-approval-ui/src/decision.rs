@@ -705,6 +705,9 @@ fn apply_approve(ctx: &DecisionContext, nonce: &str, requester: RequestIdentity)
             stellar_agent_toolsets_runtime::record_first_invoke_grant(
                 profile_name,
                 req.toolset_name,
+                req.install_id,
+                req.package_version,
+                req.package_shasum,
                 req.capability,
                 req.destination,
                 req.asset,
@@ -1339,6 +1342,9 @@ mod tests {
         let fx = fixture("toolset");
         let entry = PendingApproval::new_toolset_first_invoke_gate_pending(
             "my-toolset".to_owned(),
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+            "1.0.0".to_owned(),
+            "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd".to_owned(),
             "sign-payment".to_owned(),
             "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
             "XLM".to_owned(),

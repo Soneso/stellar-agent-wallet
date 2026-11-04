@@ -456,8 +456,11 @@ pub enum ApprovalKind {
     ///
     /// ```text
     /// SHA-256(
-    ///   DOMAIN_TAG (b"stellar-agent-toolset-grant:v1")
+    ///   DOMAIN_TAG (b"stellar-agent-toolset-grant:v2")
     ///   || u32_be(len(toolset_name))  || toolset_name
+    ///   || u32_be(len(install_id)) || install_id
+    ///   || u32_be(len(package_version)) || package_version
+    ///   || u32_be(len(package_shasum)) || package_shasum
     ///   || u32_be(len(capability))  || capability
     ///   || u32_be(len(destination)) || destination   (canonical G-strkey)
     ///   || u32_be(len(asset))       || asset          (code:issuer or "XLM")
@@ -477,6 +480,12 @@ pub enum ApprovalKind {
         /// Validated at construction: `[a-z0-9-]` charset, 1–64 bytes, same
         /// constraints as `validate_package_name` in the install crate.
         toolset_name: String,
+        /// Random installation identity, 32 lowercase hex characters.
+        install_id: String,
+        /// Version of the package requesting consent.
+        package_version: String,
+        /// SHA-256 of the package bytes, 64 lowercase hex characters.
+        package_shasum: String,
 
         /// The signing-adjacent capability token being requested (e.g. `"sign-payment"`).
         ///
@@ -1011,6 +1020,9 @@ impl std::fmt::Debug for ApprovalKind {
             }
             Self::ToolsetFirstInvokeGate {
                 toolset_name,
+                install_id,
+                package_version,
+                package_shasum,
                 capability,
                 destination,
                 asset,
@@ -1021,6 +1033,9 @@ impl std::fmt::Debug for ApprovalKind {
                 let dest_redacted = redact_g_strkey(destination);
                 f.debug_struct("ToolsetFirstInvokeGate")
                     .field("toolset_name", toolset_name)
+                    .field("install_id", install_id)
+                    .field("package_version", package_version)
+                    .field("package_shasum", package_shasum)
                     .field("capability", capability)
                     .field("destination_redacted", &dest_redacted)
                     .field("asset", asset)
@@ -1292,6 +1307,12 @@ impl std::fmt::Debug for RegisterPasskeyWire {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ToolsetFirstInvokeGateWire {
     toolset_name: String,
+    #[serde(default)]
+    install_id: String,
+    #[serde(default)]
+    package_version: String,
+    #[serde(default)]
+    package_shasum: String,
     capability: String,
     destination: String,
     asset: String,
@@ -2069,6 +2090,9 @@ impl Serialize for PendingApproval {
             ),
             ApprovalKind::ToolsetFirstInvokeGate {
                 toolset_name,
+                install_id,
+                package_version,
+                package_shasum,
                 capability,
                 destination,
                 asset,
@@ -2087,6 +2111,9 @@ impl Serialize for PendingApproval {
                 None::<RegisterPasskeyWire>,
                 Some(ToolsetFirstInvokeGateWire {
                     toolset_name: toolset_name.clone(),
+                    install_id: install_id.clone(),
+                    package_version: package_version.clone(),
+                    package_shasum: package_shasum.clone(),
                     capability: capability.clone(),
                     destination: destination.clone(),
                     asset: asset.clone(),
@@ -2764,6 +2791,9 @@ impl<'de> Deserialize<'de> for PendingApproval {
 
             ApprovalKind::ToolsetFirstInvokeGate {
                 toolset_name: sfig.toolset_name,
+                install_id: sfig.install_id,
+                package_version: sfig.package_version,
+                package_shasum: sfig.package_shasum,
                 capability: sfig.capability,
                 destination: sfig.destination,
                 asset: sfig.asset,
@@ -3741,13 +3771,16 @@ impl PendingApproval {
     /// Called by the gated resolver when a toolset invokes a `sign-payment`
     /// action and no current, matching grant exists.
     ///
-    /// All fields are validated at construction time; the same validator is
-    /// invoked from the custom `Deserialize` impl so tampered on-disk entries
-    /// are rejected at store load.
+    /// Payment terms are validated at construction and deserialization. The
+    /// installation fields are checked before display and approval, so a store
+    /// containing a request without them still opens.
     ///
     /// # Parameters
     ///
     /// - `toolset_name`: package name of the toolset (must pass `[a-z0-9-]` charset).
+    /// - `install_id`: random identity from the authenticated install record.
+    /// - `package_version`: package version from that record.
+    /// - `package_shasum`: package SHA-256 from that record.
     /// - `capability`: capability token (e.g. `"sign-payment"`).
     /// - `destination`: canonical resolved G-strkey destination from the
     ///   authoritative envelope.
@@ -3772,6 +3805,9 @@ impl PendingApproval {
     /// let uid = process_uid_for_attestation()?;
     /// let entry = PendingApproval::new_toolset_first_invoke_gate_pending(
     ///     "my-toolset".to_owned(),
+    ///     "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+    ///     "1.0.0".to_owned(),
+    ///     "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd".to_owned(),
     ///     "sign-payment".to_owned(),
     ///     "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
     ///     "XLM".to_owned(),
@@ -3790,6 +3826,9 @@ impl PendingApproval {
     #[allow(clippy::too_many_arguments)]
     pub fn new_toolset_first_invoke_gate_pending(
         toolset_name: String,
+        install_id: String,
+        package_version: String,
+        package_shasum: String,
         capability: String,
         destination: String,
         asset: String,
@@ -3826,6 +3865,9 @@ impl PendingApproval {
             reason: None,
             kind: ApprovalKind::ToolsetFirstInvokeGate {
                 toolset_name,
+                install_id,
+                package_version,
+                package_shasum,
                 capability,
                 destination,
                 asset,
@@ -9110,6 +9152,9 @@ user_handle = [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
     fn make_toolset_gate_entry(ttl_ms: u64) -> PendingApproval {
         PendingApproval::new_toolset_first_invoke_gate_pending(
             "my-toolset".to_owned(),
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+            "1.0.0".to_owned(),
+            "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd".to_owned(),
             "sign-payment".to_owned(),
             VALID_SUMMARY_TO.to_owned(),
             "XLM".to_owned(),
@@ -9133,6 +9178,9 @@ user_handle = [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
         assert!(entry.passkey_assertion.is_none());
         if let ApprovalKind::ToolsetFirstInvokeGate {
             ref toolset_name,
+            ref install_id,
+            ref package_version,
+            ref package_shasum,
             ref capability,
             ref destination,
             ref asset,
@@ -9141,6 +9189,9 @@ user_handle = [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
         } = entry.kind
         {
             assert_eq!(toolset_name, "my-toolset");
+            assert_eq!(install_id, &"a".repeat(32));
+            assert_eq!(package_version, "1.0.0");
+            assert_eq!(package_shasum, &"d".repeat(64));
             assert_eq!(capability, "sign-payment");
             assert_eq!(destination, VALID_SUMMARY_TO);
             assert_eq!(asset, "XLM");
@@ -9159,6 +9210,9 @@ user_handle = [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
     fn toolset_gate_rejects_empty_toolset_name() {
         let err = PendingApproval::new_toolset_first_invoke_gate_pending(
             String::new(),
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+            "1.0.0".to_owned(),
+            "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd".to_owned(),
             "sign-payment".to_owned(),
             VALID_SUMMARY_TO.to_owned(),
             "XLM".to_owned(),
@@ -9178,6 +9232,9 @@ user_handle = [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
     fn toolset_gate_rejects_toolset_name_with_uppercase() {
         let err = PendingApproval::new_toolset_first_invoke_gate_pending(
             "My-Toolset".to_owned(),
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+            "1.0.0".to_owned(),
+            "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd".to_owned(),
             "sign-payment".to_owned(),
             VALID_SUMMARY_TO.to_owned(),
             "XLM".to_owned(),
@@ -9198,6 +9255,9 @@ user_handle = [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
         let long_name = "a".repeat(65);
         let err = PendingApproval::new_toolset_first_invoke_gate_pending(
             long_name,
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+            "1.0.0".to_owned(),
+            "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd".to_owned(),
             "sign-payment".to_owned(),
             VALID_SUMMARY_TO.to_owned(),
             "XLM".to_owned(),
@@ -9217,6 +9277,9 @@ user_handle = [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
     fn toolset_gate_rejects_empty_capability() {
         let err = PendingApproval::new_toolset_first_invoke_gate_pending(
             "my-toolset".to_owned(),
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+            "1.0.0".to_owned(),
+            "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd".to_owned(),
             String::new(),
             VALID_SUMMARY_TO.to_owned(),
             "XLM".to_owned(),
@@ -9236,6 +9299,9 @@ user_handle = [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
     fn toolset_gate_rejects_capability_with_space() {
         let err = PendingApproval::new_toolset_first_invoke_gate_pending(
             "my-toolset".to_owned(),
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+            "1.0.0".to_owned(),
+            "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd".to_owned(),
             "sign payment".to_owned(),
             VALID_SUMMARY_TO.to_owned(),
             "XLM".to_owned(),
@@ -9255,6 +9321,9 @@ user_handle = [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
     fn toolset_gate_rejects_invalid_destination() {
         let err = PendingApproval::new_toolset_first_invoke_gate_pending(
             "my-toolset".to_owned(),
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+            "1.0.0".to_owned(),
+            "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd".to_owned(),
             "sign-payment".to_owned(),
             "not-a-strkey".to_owned(),
             "XLM".to_owned(),
@@ -9274,6 +9343,9 @@ user_handle = [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
     fn toolset_gate_rejects_invalid_asset() {
         let err = PendingApproval::new_toolset_first_invoke_gate_pending(
             "my-toolset".to_owned(),
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+            "1.0.0".to_owned(),
+            "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd".to_owned(),
             "sign-payment".to_owned(),
             VALID_SUMMARY_TO.to_owned(),
             "not-valid-asset".to_owned(),
@@ -9293,6 +9365,9 @@ user_handle = [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
     fn toolset_gate_rejects_negative_min_stroops() {
         let err = PendingApproval::new_toolset_first_invoke_gate_pending(
             "my-toolset".to_owned(),
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+            "1.0.0".to_owned(),
+            "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd".to_owned(),
             "sign-payment".to_owned(),
             VALID_SUMMARY_TO.to_owned(),
             "XLM".to_owned(),
@@ -9312,6 +9387,9 @@ user_handle = [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
     fn toolset_gate_rejects_zero_max_stroops() {
         let err = PendingApproval::new_toolset_first_invoke_gate_pending(
             "my-toolset".to_owned(),
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+            "1.0.0".to_owned(),
+            "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd".to_owned(),
             "sign-payment".to_owned(),
             VALID_SUMMARY_TO.to_owned(),
             "XLM".to_owned(),
@@ -9331,6 +9409,9 @@ user_handle = [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
     fn toolset_gate_rejects_min_greater_than_max() {
         let err = PendingApproval::new_toolset_first_invoke_gate_pending(
             "my-toolset".to_owned(),
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+            "1.0.0".to_owned(),
+            "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd".to_owned(),
             "sign-payment".to_owned(),
             VALID_SUMMARY_TO.to_owned(),
             "XLM".to_owned(),
@@ -9350,6 +9431,9 @@ user_handle = [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
     fn toolset_gate_accepts_non_xlm_asset() {
         let result = PendingApproval::new_toolset_first_invoke_gate_pending(
             "my-toolset".to_owned(),
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+            "1.0.0".to_owned(),
+            "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd".to_owned(),
             "sign-payment".to_owned(),
             VALID_SUMMARY_TO.to_owned(),
             format!("USDC:{VALID_SUMMARY_TO}"),
@@ -9378,6 +9462,9 @@ user_handle = [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
         let smart_account = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM";
         let result = PendingApproval::new_toolset_first_invoke_gate_pending(
             "rule-toolset".to_owned(),
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+            "1.0.0".to_owned(),
+            "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd".to_owned(),
             "sign-rule-create".to_owned(),
             smart_account.to_owned(),
             format!("RULECREATE:{VALID_SUMMARY_TO}"),
@@ -9418,6 +9505,9 @@ user_handle = [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
         );
         if let ApprovalKind::ToolsetFirstInvokeGate {
             ref toolset_name,
+            ref install_id,
+            ref package_version,
+            ref package_shasum,
             ref capability,
             ref destination,
             ref asset,
@@ -9426,6 +9516,9 @@ user_handle = [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
         } = loaded.kind
         {
             assert_eq!(toolset_name, "my-toolset");
+            assert_eq!(install_id, &"a".repeat(32));
+            assert_eq!(package_version, "1.0.0");
+            assert_eq!(package_shasum, &"d".repeat(64));
             assert_eq!(capability, "sign-payment");
             assert_eq!(destination, VALID_SUMMARY_TO);
             assert_eq!(asset, "XLM");

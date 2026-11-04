@@ -105,7 +105,7 @@ The attestation tag is keyed by the live `attestation_key_id` entry. Rotating th
 
 Four approval kinds bind extra fields by hashing them into the 32-byte slot that `compute_attestation` treats as `envelope_sha256`. Each uses a versioned domain-separation tag. A layout change bumps the tag, and digests under the previous tag do not verify.
 
-- `ToolsetFirstInvokeGate`: `compute_toolset_gate_digest` hashes `TOOLSET_GATE_DOMAIN_TAG` (`stellar-agent-toolset-grant:v1`) followed by length-prefixed `toolset_name`, `capability`, `destination` (G-strkey), `asset`, then the fixed-width `amount_min_stroops` and `amount_max_stroops` as big-endian `i64`. `verify_toolset_gate_attestation` recomputes this digest and feeds it through `verify_attestation`.
+- `ToolsetFirstInvokeGate`: `compute_toolset_gate_digest` hashes `TOOLSET_GATE_DOMAIN_TAG` (`stellar-agent-toolset-grant:v2`) followed by length-prefixed `toolset_name`, `install_id`, `package_version`, `package_shasum`, `capability`, `destination` (G-strkey), `asset`, then the fixed-width `amount_min_stroops` and `amount_max_stroops` as big-endian `i64`. `verify_toolset_gate_attestation` recomputes this digest and feeds it through `verify_attestation`.
 - `TrustlineClawbackOptIn`: `compute_trustline_clawback_opt_in_digest` hashes `TRUSTLINE_CLAWBACK_OPT_IN_DOMAIN_TAG` (`stellar-agent-trustline-clawback-opt-in:v1`) followed by length-prefixed `network`, `code`, `issuer`.
 
 - `RuleProposalSimulated`: `rule_proposal_digest` hashes `PROPOSAL_DIGEST_TAG` (`stellar-agent-rule-proposal:v2\0`) followed by account, network passphrase, chain id, summary line, snapshot version, context variant and payload, name, optional expiry, signers, policies, authorization rule ids, then override flags.
@@ -117,7 +117,7 @@ Four approval kinds bind extra fields by hashing them into the 32-byte slot that
   The flag byte uses bit 0 for mutable verifiers and bit 1 for unknown verifiers.
 - `MppChargeSimulated`: the shared HMAC binds the prepared artifact hash. The store verifier also compares the stored profile and chain with the binding.
 
-A matching grant requires a version 3 HMAC that verifies under the profile's attestation key and profile/chain binding. It must be unexpired, with a lifetime of at most 30 days, and issued no later than the current time and at or after the second following the current installation. An invalid install time honors no grant. Consent issued in the install second re-prompts once. A forged or edited grant suppresses nothing.
+A matching grant names the current install identity, package version and package shasum. It requires a version 3 HMAC that verifies under the profile's attestation key and profile/chain binding. It must be unexpired, with a lifetime of at most 30 days, and issued no later than the current time and at or after the second following the current installation. An invalid install time honors no grant. Consent issued in the install second re-prompts once. A forged or edited grant suppresses nothing.
 
 The first-invoke grant suppresses only its re-prompt. Per-action `PaymentSimulated` approval fires on every toolset-routed payment and binds the executed envelope through `envelope_sha256`.
 

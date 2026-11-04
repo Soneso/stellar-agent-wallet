@@ -23,7 +23,7 @@
 //!    override (`override_attestation: true`) logs a structured warn and
 //!    proceeds.
 //! 6. **Pin record**: atomic write of `(package, version, shasum, publisher,
-//!    installed_at, capabilities, allowed_tools, toolset_md_shasum)` after
+//!    installed_at, capabilities, allowed_tools, toolset_md_shasum, install_id)` after
 //!    successful extraction, authenticated by an HMAC tag under the
 //!    installation's [`PinKey`].
 //! 7. **Uninstall**: removes the directory named by the validated requested
@@ -680,6 +680,10 @@ pub fn install_toolset(
         AttestationOutcome::NotRequired
     };
 
+    // Every install, a forced reinstall included, mints a fresh identity before
+    // the staged package replaces the installed one.
+    let install_id = mint_install_id();
+
     // ── Step 10: Atomic rename staging → final ────────────────────────────────
     let final_dir = toolsets_root.join(package);
     if final_dir.exists() {
@@ -706,6 +710,7 @@ pub fn install_toolset(
     let installed_at = current_utc_timestamp();
 
     let pin_record = ToolsetPinRecord {
+        install_id,
         package: package.to_owned(),
         version: version.to_owned(),
         shasum: signed_shasum.to_owned(),
@@ -727,6 +732,13 @@ pub fn install_toolset(
 
     info!(package, version, "toolset installed successfully");
     Ok(gate_outcome)
+}
+
+fn mint_install_id() -> String {
+    use rand_core::RngCore as _;
+    let mut bytes = [0u8; 16];
+    rand_core::OsRng.fill_bytes(&mut bytes);
+    hex::encode(bytes)
 }
 
 /// Installs a toolset from a signed `.tar.gz` file at `path`.
@@ -2077,6 +2089,7 @@ mod tests {
             capabilities: stellar_agent_toolsets::CapabilitySet::empty(),
             allowed_tools: vec![],
             toolset_md_shasum: "c".repeat(64),
+            install_id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
         };
         // Write pin via the symlink so read_pin can find it.
         pin::write_pin_atomic(&record, &toolsets_root, &test_pin_key()).unwrap();
@@ -2205,5 +2218,48 @@ mod tests {
         // Must end with Z and have the shape YYYY-MM-DDTHH:MM:SSZ (20 chars).
         assert!(ts.ends_with('Z'), "timestamp must end with Z: {ts}");
         assert_eq!(ts.len(), 20, "timestamp must be 20 chars (no millis): {ts}");
+    }
+
+    #[test]
+    fn every_install_mints_a_fresh_install_id() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().join("toolsets");
+        let package = make_toolset_tar_gz("fresh-toolset", &toolset_md_no_caps("fresh-toolset"));
+        let sk = SigningKey::from_bytes(&[17; 32]);
+        let pk = sk.verifying_key().to_bytes();
+        let (signature, shasum) = sign_package("fresh-toolset", "1.0.0", &package, &sk);
+        let trust = write_publisher_trust(dir.path(), pk);
+        let auditor_trust = write_empty_auditor_trust(dir.path());
+        let mut identities = Vec::new();
+        for force in [false, true] {
+            install_locked(
+                "fresh-toolset",
+                "1.0.0",
+                &package,
+                &shasum,
+                &signature,
+                &pk,
+                &root,
+                &trust,
+                None,
+                &auditor_trust,
+                &InstallOptions {
+                    force,
+                    ..InstallOptions::default()
+                },
+            )
+            .unwrap();
+            let pin = read_pin("fresh-toolset", &root, Some(&test_pin_key()))
+                .unwrap()
+                .unwrap();
+            assert_eq!(pin.install_id.len(), 32);
+            assert!(
+                pin.install_id
+                    .bytes()
+                    .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+            );
+            identities.push(pin.install_id);
+        }
+        assert_ne!(identities[0], identities[1]);
     }
 }

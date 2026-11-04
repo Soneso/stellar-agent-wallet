@@ -217,6 +217,12 @@ pub enum ApprovalSummaryView {
     ToolsetFirstInvokeGate {
         /// Toolset name requesting the capability.
         toolset_name: String,
+        /// Package version requesting consent.
+        package_version: String,
+        /// First 12 hex characters of the package SHA-256.
+        package_shasum_short: String,
+        /// Random identity of this installation.
+        install_id: String,
         /// Signing-adjacent capability token requested.
         capability: String,
         /// First-5-last-5 redacted destination G-strkey.
@@ -500,6 +506,9 @@ impl PendingApprovalView {
                 },
                 ApprovalKind::ToolsetFirstInvokeGate {
                     toolset_name,
+                    install_id,
+                    package_version,
+                    package_shasum,
                     capability,
                     destination,
                     asset,
@@ -507,6 +516,9 @@ impl PendingApprovalView {
                     amount_max_stroops,
                 } => ApprovalSummaryView::ToolsetFirstInvokeGate {
                     toolset_name: toolset_name.clone(),
+                    install_id: install_id.clone(),
+                    package_version: package_version.clone(),
+                    package_shasum_short: package_shasum.chars().take(12).collect(),
                     capability: capability.clone(),
                     destination_redacted: redact_g_strkey(destination),
                     asset: asset.clone(),
@@ -801,6 +813,9 @@ mod tests {
         let mut store = open_store(&dir);
         let entry = PendingApproval::new_toolset_first_invoke_gate_pending(
             "my-toolset".to_owned(),
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+            "1.0.0".to_owned(),
+            "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd".to_owned(),
             "sign-payment".to_owned(),
             "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
             "XLM".to_owned(),
@@ -1034,6 +1049,9 @@ mod tests {
     fn toolset_first_invoke_gate_summary_view_encodes_stroop_fields_as_strings() {
         let gate = ApprovalSummaryView::ToolsetFirstInvokeGate {
             toolset_name: "my-toolset".to_owned(),
+            package_version: "1.0.0".to_owned(),
+            package_shasum_short: "d".repeat(12),
+            install_id: "a".repeat(32),
             capability: "sign-payment".to_owned(),
             destination_redacted: "GAAAA...ZZZZZ".to_owned(),
             asset: "XLM".to_owned(),
@@ -1769,5 +1787,78 @@ mod tests {
                 "{field}"
             );
         }
+    }
+
+    /// Stores a toolset gate request, removes the lines of the `missing` fields
+    /// from the stored record, and asserts that the reloaded entry keeps its
+    /// kind and renders as inconsistent.
+    fn assert_gate_request_without_fields_is_inconsistent(missing: &[&str]) {
+        use crate::approval::process_uid_for_attestation;
+        let dir = TempDir::new().unwrap();
+        let entry = PendingApproval::new_toolset_first_invoke_gate_pending(
+            "my-toolset".to_owned(),
+            "a".repeat(32),
+            "1.0.0".to_owned(),
+            "d".repeat(64),
+            "sign-payment".to_owned(),
+            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+            "XLM".to_owned(),
+            0,
+            1_000_000,
+            process_uid_for_attestation().unwrap(),
+            DEFAULT_TTL_MS,
+        )
+        .unwrap();
+        let nonce = entry.approval_nonce.clone();
+        let path = dir.path().join("legacy.toml");
+        let now = crate::timefmt::now_unix_ms().unwrap();
+        {
+            let mut store = PendingApprovalStore::open(path.clone()).unwrap();
+            store.insert(entry, now).unwrap();
+        }
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let raw = raw
+            .lines()
+            .filter(|line| {
+                !missing
+                    .iter()
+                    .any(|prefix| line.trim_start().starts_with(prefix))
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&path, raw).unwrap();
+        let store = PendingApprovalStore::open(path).unwrap();
+        assert_eq!(
+            store.get(&nonce).unwrap().kind.kind_name(),
+            "ToolsetFirstInvokeGate"
+        );
+        assert!(matches!(
+            store.snapshot(now)[0].summary,
+            ApprovalSummaryView::Inconsistent { .. }
+        ));
+    }
+
+    #[test]
+    fn a_gate_request_without_any_installation_term_is_inconsistent() {
+        assert_gate_request_without_fields_is_inconsistent(&[
+            "install_id =",
+            "package_version =",
+            "package_shasum =",
+        ]);
+    }
+
+    #[test]
+    fn a_gate_request_without_an_install_identity_is_inconsistent() {
+        assert_gate_request_without_fields_is_inconsistent(&["install_id ="]);
+    }
+
+    #[test]
+    fn a_gate_request_without_a_package_version_is_inconsistent() {
+        assert_gate_request_without_fields_is_inconsistent(&["package_version ="]);
+    }
+
+    #[test]
+    fn a_gate_request_without_a_package_shasum_is_inconsistent() {
+        assert_gate_request_without_fields_is_inconsistent(&["package_shasum ="]);
     }
 }

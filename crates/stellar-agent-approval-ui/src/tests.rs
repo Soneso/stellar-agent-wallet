@@ -1405,6 +1405,9 @@ async fn approve_toolset_first_invoke_gate_via_router_returns_grant_active() {
     let cookie = h.bootstrap().await;
     let entry = PendingApproval::new_toolset_first_invoke_gate_pending(
         "my-toolset".to_owned(),
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+        "1.0.0".to_owned(),
+        "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd".to_owned(),
         "sign-payment".to_owned(),
         "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
         "XLM".to_owned(),

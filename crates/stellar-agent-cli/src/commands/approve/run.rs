@@ -502,6 +502,9 @@ fn record_consent(
         stellar_agent_toolsets_runtime::record_first_invoke_grant(
             profile_name,
             req.toolset_name,
+            req.install_id,
+            req.package_version,
+            req.package_shasum,
             req.capability,
             req.destination,
             req.asset,
@@ -956,6 +959,9 @@ fn write_summary(
         (
             ApprovalKind::ToolsetFirstInvokeGate {
                 toolset_name,
+                install_id,
+                package_version,
+                package_shasum,
                 capability,
                 destination,
                 asset,
@@ -979,12 +985,18 @@ fn write_summary(
             format!(
                 "  Kind:              ToolsetFirstInvokeGate\n  \
                  Toolset:           {toolset}\n  \
+                 Version:           {version}\n  \
+                 Package SHA-256:   {shasum_short}\n  \
+                 Install identity:  {install_id}\n  \
                  Capability:        {capability}\n  \
                  Destination:       {dest}\n  \
                  Asset:             {asset_text}\n  \
                  Amount max:        {amount_max}\n  \
                  Amount min:        {amount_min_stroops} stroops",
                 toolset = esc(toolset_name),
+                version = esc(package_version),
+                shasum_short = esc(&package_shasum.chars().take(12).collect::<String>()),
+                install_id = esc(install_id),
                 capability = esc(capability),
                 dest = esc(&dest_redacted),
                 asset_text = esc(asset),

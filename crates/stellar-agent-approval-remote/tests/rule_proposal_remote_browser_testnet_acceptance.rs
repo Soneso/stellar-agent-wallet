@@ -1504,6 +1504,9 @@ async fn toolset_gated_first_invoke_entry_is_consumed() {
     let mut store = PendingApprovalStore::open(store_path.clone()).expect("store re-open");
     let gate_entry = PendingApproval::new_toolset_first_invoke_gate_pending(
         "test-toolset".to_owned(),
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+        "1.0.0".to_owned(),
+        "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd".to_owned(),
         "sign-rule-create".to_owned(),
         smart_account_strkey.clone(),
         "RULECREATE:GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF".to_owned(),
@@ -1548,6 +1551,9 @@ async fn toolset_gated_first_invoke_entry_is_consumed() {
             stellar_agent_toolsets_runtime::record_first_invoke_grant(
                 &profile_name,
                 req.toolset_name,
+                req.install_id,
+                req.package_version,
+                req.package_shasum,
                 req.capability,
                 req.destination,
                 req.asset,

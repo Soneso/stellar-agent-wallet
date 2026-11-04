@@ -235,24 +235,28 @@ the operator's user can add a publisher or an auditor before the next install. K
 the toolsets directory writable by the operator only, or point `--trust-set` and
 `--auditor-trust-set` at files kept elsewhere.
 
-The pin record's tag binds its fields, not the install event. After an uninstall,
-restoring a saved toolset directory with its earlier record verifies again, and its
-earlier `installed_at` sets the first-invoke cutoff. The restored state is one the
+The pin record's tag authenticates its install identity and fields. Restoring a
+saved toolset directory with its authentic v3 record verifies again, and a saved
+grant for that identity can match within its lifetime. Its `installed_at` sets
+the first-invoke cutoff. The restored state is one the
 operator installed, with its publisher signature and attestation, and restoring it
 needs a write to the toolsets directory.
 
 ### The pin record and the capability-source invariant
 
+Every install, a forced reinstall included, mints a random 16-byte `install_id`,
+encoded as 32 lowercase hex characters and covered by the pin tag.
+
 A successful install writes a pin record holding `package`, `version`, `shasum`,
-`publisher`, `installed_at`, the verified `capabilities`, `allowed_tools`, and the
+`publisher`, `installed_at`, `install_id`, the verified `capabilities`, `allowed_tools`, and the
 SHA-256 digest of the installed `TOOLSET.md` (`toolset_md_shasum`, mandatory).
 
-The record is JSON of the form `{"v":2, <fields>, "tag":"<64 hex>"}`. The tag is an
+The record is JSON of the form `{"v":3, <fields>, "tag":"<64 hex>"}`. The tag is an
 HMAC-SHA256 under the installation's pin key, a 32-byte secret in the platform
 keyring (service `stellar-agent-toolsets`, account `pin-key`) that the first install
 mints. It covers a domain tag and every field, each length-prefixed. A record is
 trusted only when its tag verifies, so a record edited after the install, written
-under another key, or written without a tag grants nothing: the runtime refuses it
+under another key, or written by an earlier build grants nothing: the runtime refuses it
 with `toolset.pin_unverifiable`. A record whose verified `package` differs from the
 directory it is stored under is refused as malformed.
 
@@ -303,11 +307,16 @@ The operator approves out of band with `stellar-agent approve --id <nonce> --pro
 which records a time-boxed grant. The agent then re-invokes.
 
 A matching grant requires a version 3 HMAC that verifies under the profile's
-attestation key and profile/chain binding. It must be unexpired, with a lifetime
+attestation key and profile/chain binding. It names the current install identity,
+package version and package shasum. It must be unexpired, with a lifetime
 of at most 30 days, and issued no later than the current time and at or after
 the second following the current installation. An invalid install time honors
 no grant. Consent issued in the install second re-prompts once. A forged or
-edited grant suppresses nothing.
+edited grant suppresses nothing. A request queued before any reinstall, in the
+same second included, yields no grant the new installation honors. Approval
+surfaces show the version, the first 12 shasum characters and the install identity.
+A pending request without these fields cannot be approved; invoke again to request
+fresh consent.
 
 A matching grant suppresses only the first-invoke re-prompt. Per-action payment
 approval fires on every toolset-routed payment: a policy-engine `Allow` becomes
@@ -414,7 +423,8 @@ Removes an installed toolset's directory and pin record. Refuses if the toolset 
 installed. It reads no install record, so it also removes a toolset whose record
 does not verify (`toolset.pin_unverifiable`); that is the first step of reinstalling
 such a toolset. Grants approved for the removed package do not apply to a later install,
-including a forced reinstall or an install after manual removal.
+including a forced reinstall or an install after manual removal. Each install
+needs fresh consent for its new identity.
 
 Positional: `<PACKAGE>`: the package name (`[a-z0-9-]`).
 

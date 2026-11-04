@@ -816,6 +816,7 @@ async fn toolset_forced_approval_keeps_allow_effects_and_reservation() {
         &["sign-payment"],
         &[],
         "2026-06-02T00:00:00Z",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         &crate::common::toolset_pin_key(),
     )
     .unwrap();
@@ -823,6 +824,9 @@ async fn toolset_forced_approval_keeps_allow_effects_and_reservation() {
     let now = now_unix_ms().unwrap();
     let grant = build_attested_grant(
         "payment-toolset".to_owned(),
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+        "1.0.0".to_owned(),
+        "0000000000000000000000000000000000000000000000000000000000000000".to_owned(),
         "sign-payment".to_owned(),
         DEST.to_owned(),
         "XLM".to_owned(),
@@ -1150,6 +1154,7 @@ async fn rule_ttl_bounds_toolset_queued_approval_at_commit() {
         &["sign-payment"],
         &[],
         "2026-06-02T00:00:00Z",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         &crate::common::toolset_pin_key(),
     )
     .unwrap();
@@ -1157,6 +1162,9 @@ async fn rule_ttl_bounds_toolset_queued_approval_at_commit() {
     let now = now_unix_ms().unwrap();
     let grant = build_attested_grant(
         "payment-toolset".to_owned(),
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+        "1.0.0".to_owned(),
+        "0000000000000000000000000000000000000000000000000000000000000000".to_owned(),
         "sign-payment".to_owned(),
         DEST.to_owned(),
         "XLM".to_owned(),

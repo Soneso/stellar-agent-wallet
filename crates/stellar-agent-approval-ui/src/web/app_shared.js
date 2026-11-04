@@ -275,7 +275,7 @@ var stellarAgentApproval = (function () {
     }
   }
 
-  // The row's second line: the identifying detail, truncated by CSS when long.
+  // The row's identifying detail: toolset gates wrap; other kinds truncate.
   function metaText(view) {
     var s = view.summary || {};
     switch (s.kind) {
@@ -303,7 +303,9 @@ var stellarAgentApproval = (function () {
       case "register_passkey":
         return s.smart_account_redacted + " " + MIDDOT + " rp " + s.rp_id;
       case "toolset_first_invoke_gate":
-        return s.toolset_name + " requests " + s.capability;
+        return s.toolset_name + " " + s.package_version + " " + MIDDOT +
+          " sha256 " + s.package_shasum_short + " " + MIDDOT +
+          " install " + s.install_id + " " + MIDDOT + " requests " + s.capability;
       case "trustline_clawback_opt_in":
         return s.code + " " + MIDDOT + " " + s.issuer_redacted;
       case "inconsistent":
@@ -354,7 +356,7 @@ var stellarAgentApproval = (function () {
     title.textContent = headlineText(view);
     main.appendChild(title);
     var meta = document.createElement("div");
-    meta.className = "ap-meta";
+    meta.className = "ap-meta" + (view.summary && view.summary.kind === "toolset_first_invoke_gate" ? " toolset-gate" : "");
     meta.textContent = metaText(view);
     main.appendChild(meta);
     row.appendChild(main);

@@ -203,6 +203,7 @@ fn write_toolset(toolsets_root: &std::path::Path, toolset_name: &str, capabiliti
         capabilities,
         &[],
         "2026-06-02T00:00:00Z",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         &crate::common::toolset_pin_key(),
     )
     .expect("write toolset");
@@ -344,6 +345,9 @@ async fn assert_approved_submission_audit(
     stellar_agent_toolsets_runtime::record_first_invoke_grant(
         name,
         TOOLSET_NAME,
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "1.0.0",
+        "0000000000000000000000000000000000000000000000000000000000000000",
         CAPABILITY,
         DEST_G,
         ASSET_XLM,
@@ -471,6 +475,9 @@ fn insert_valid_grant(
     let now_ms = now_unix_ms().expect("now_unix_ms");
     let grant = build_attested_grant(
         toolset_name.to_owned(),
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+        "1.0.0".to_owned(),
+        "0000000000000000000000000000000000000000000000000000000000000000".to_owned(),
         capability.to_owned(),
         destination.to_owned(),
         asset.to_owned(),

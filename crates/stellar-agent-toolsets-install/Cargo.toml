@@ -11,6 +11,7 @@ keywords = ["stellar", "toolset", "provenance", "ed25519", "wallet"]
 categories = ["cryptography::cryptocurrencies", "cryptography"]
 
 [dependencies]
+rand_core = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 sha2 = { workspace = true }
