@@ -5010,6 +5010,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn default_approval_dir_ends_with_approvals() {
         let dir = default_approval_dir().expect("default_approval_dir must succeed on CI");
         assert_eq!(

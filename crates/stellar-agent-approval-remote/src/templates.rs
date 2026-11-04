@@ -844,7 +844,6 @@ mod tests {
             "Test SDF Network ; September 2015".to_owned(),
             "stellar:testnet".to_owned(),
             definition,
-            [0x11u8; 32],
             "Default rule \"spend-daily\"".to_owned(),
             process_uid_for_attestation().unwrap(),
             DEFAULT_TTL_MS,

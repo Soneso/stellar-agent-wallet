@@ -514,11 +514,6 @@ fn insert_rule_proposal(
     use stellar_agent_core::approval::rule_proposal::{
         ContextRuleProposalSnapshot, RuleProposalContextType, RuleProposalSigner,
     };
-    use stellar_agent_core::smart_account::rule_id::ContextRuleId;
-    use stellar_agent_smart_account::managers::rules::{
-        compute_context_rule_proposal_sha256, context_rule_definition_from_snapshot,
-        parse_c_strkey_to_smart_account,
-    };
 
     let snapshot = ContextRuleProposalSnapshot::new(
         RuleProposalContextType::Default,
@@ -530,28 +525,18 @@ fn insert_rule_proposal(
         false,
         false,
     );
-    let smart_account = parse_c_strkey_to_smart_account(SMART_ACCOUNT).expect("smart account");
-    let rule_definition =
-        context_rule_definition_from_snapshot(&snapshot).expect("reconstruct rule definition");
-    let auth_rule_ids: Vec<ContextRuleId> = snapshot
-        .auth_rule_ids
-        .iter()
-        .map(|id| ContextRuleId::new(*id))
-        .collect();
-    let digest = compute_context_rule_proposal_sha256(
-        &smart_account,
-        &rule_definition,
-        &auth_rule_ids,
-        snapshot.accept_mutable_verifier,
-        snapshot.accept_unknown_verifier,
-    )
-    .expect("rule proposal digest");
+    let digest = stellar_agent_core::approval::rule_proposal_digest(
+        SMART_ACCOUNT,
+        network_passphrase,
+        chain_id,
+        &snapshot,
+        "Default rule \"spend-daily\"",
+    );
     let proposal = PendingApproval::new_rule_proposal_pending(
         SMART_ACCOUNT.to_owned(),
         network_passphrase.to_owned(),
         chain_id.to_owned(),
         snapshot,
-        digest,
         "Default rule \"spend-daily\"".to_owned(),
         process_uid_for_attestation().expect("process uid"),
         TOOLSET_GRANT_DEFAULT_TTL_MS,

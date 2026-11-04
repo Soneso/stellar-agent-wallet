@@ -3822,6 +3822,19 @@ fn build_add_context_rule_args(def: &ContextRuleDefinition) -> Result<Vec<ScVal>
     ])
 }
 
+/// Exposes the install argument encoder for cross-crate fixture checks.
+///
+/// # Errors
+///
+/// Returns the encoder's error when a context, signer, name or policy cannot
+/// be represented in the contract's argument types.
+#[cfg(any(test, feature = "test-helpers"))]
+pub fn build_add_context_rule_args_for_test(
+    definition: &ContextRuleDefinition,
+) -> Result<Vec<ScVal>, SaError> {
+    build_add_context_rule_args(definition)
+}
+
 /// The signer-set state an install of a [`ContextRuleDefinition`]
 /// authorizes, which the confirmed rule must show before it is baselined.
 #[derive(Debug)]
@@ -3926,90 +3939,7 @@ pub(crate) fn expected_install_state(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Rule-proposal digest (Package D, GH issue #8)
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Computes the domain-separated `proposal_sha256` digest for an
-/// agent-proposed `add_context_rule` installation.
-///
-/// Builds the EXACT XDR bytes the on-chain `add_context_rule` invocation
-/// will submit — via `build_add_context_rule_args` wrapped in the same
-/// `InvokeContractArgs` shape `ContextRuleManager::submit_signed_invoke`
-/// constructs — and binds them to `smart_account` and `auth_rule_ids` via
-/// [`stellar_agent_core::approval::compute_rule_proposal_digest`].
-///
-/// `stellar-agent-core` cannot depend on this crate (the dependency runs the
-/// other way), so `stellar-agent-core::approval::compute_rule_proposal_digest`
-/// accepts pre-encoded XDR byte buffers rather than typed
-/// `InvokeContractArgs` / `ScAddress` values; this function is the boundary
-/// that performs the XDR encoding on the smart-account-crate side.
-///
-/// `auth_rule_ids` is encoded via
-/// [`stellar_agent_core::smart_account::rule_id::encode_context_rule_ids`] —
-/// the SAME encoder already used for the on-chain signing auth-digest
-/// preimage (`stellar_agent_core::smart_account::auth_digest`) — rather than
-/// a bespoke encoding, so both digests share one canonical `auth_rule_ids`
-/// XDR representation.
-///
-/// Called at BOTH propose time (to mint `proposal_sha256` for the pending
-/// approval) and commit time (to re-derive the digest from the reconstructed
-/// definition and confirm it still matches what the operator attested, via
-/// `PendingApprovalStore::verify_rule_proposal_gate`).
-///
-/// # Errors
-///
-/// [`SaError::AuthEntryConstructionFailed`] (`stage = "rule_proposal_digest"`)
-/// on any XDR-encoding failure (symbol/arg encoding, `to_xdr`, or
-/// `encode_context_rule_ids`).
-pub fn compute_context_rule_proposal_sha256(
-    smart_account: &ScAddress,
-    rule_definition: &ContextRuleDefinition,
-    auth_rule_ids: &[stellar_agent_core::smart_account::rule_id::ContextRuleId],
-    accept_mutable_verifier: bool,
-    accept_unknown_verifier: bool,
-) -> Result<[u8; 32], SaError> {
-    let digest_err = |reason: String| SaError::AuthEntryConstructionFailed {
-        stage: "rule_proposal_digest",
-        redacted_reason: reason,
-    };
-
-    let args = build_add_context_rule_args(rule_definition)?;
-    let function_name = ScSymbol::try_from("add_context_rule")
-        .map_err(|e| digest_err(format!("encode add_context_rule symbol: {e:?}")))?;
-    let args_vecm: VecM<ScVal> = args
-        .try_into()
-        .map_err(|e| digest_err(format!("encode add_context_rule args VecM: {e:?}")))?;
-    let invoke_args = InvokeContractArgs {
-        contract_address: smart_account.clone(),
-        function_name,
-        args: args_vecm,
-    };
-    let invoke_args_xdr = invoke_args
-        .to_xdr(Limits::none())
-        .map_err(|e| digest_err(format!("InvokeContractArgs to_xdr: {e:?}")))?;
-
-    let smart_account_xdr = smart_account
-        .to_xdr(Limits::none())
-        .map_err(|e| digest_err(format!("smart_account ScAddress to_xdr: {e:?}")))?;
-
-    let auth_rule_ids_xdr =
-        stellar_agent_core::smart_account::rule_id::encode_context_rule_ids(auth_rule_ids)
-            .map_err(|e| digest_err(format!("encode_context_rule_ids: {e}")))?;
-
-    // Bit 0: accept_mutable_verifier. Bit 1: accept_unknown_verifier. All
-    // other bits reserved (zero).
-    let flags_byte = u8::from(accept_mutable_verifier) | (u8::from(accept_unknown_verifier) << 1);
-
-    Ok(stellar_agent_core::approval::compute_rule_proposal_digest(
-        &invoke_args_xdr,
-        &smart_account_xdr,
-        &auth_rule_ids_xdr,
-        flags_byte,
-    ))
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// ContextRuleDefinition <- ContextRuleProposalSnapshot (Package D, GH issue #8)
+// Context-rule reconstruction from the approval snapshot
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Reconstructs a [`ContextRuleDefinition`] from a core
@@ -4017,16 +3947,16 @@ pub fn compute_context_rule_proposal_sha256(
 ///
 /// Called at commit time (`stellar_rule_create_commit`) to rebuild the EXACT
 /// typed definition an operator attested to (via `proposal_sha256`) from the
-/// stored snapshot, so [`compute_context_rule_proposal_sha256`] can recompute
-/// the digest for [`stellar_agent_core::approval::PendingApprovalStore::verify_rule_proposal_gate`]
-/// and so [`ContextRuleManager::install_rule`] can be called with it.
+/// stored snapshot. [`stellar_agent_core::approval::rule_proposal_digest`]
+/// binds that snapshot, and [`ContextRuleManager::install_rule`] consumes
+/// the reconstructed definition.
 ///
 /// A `Delegated` signer's `address` is a G-strkey (an ed25519 account) or a
 /// C-strkey (a contract).
 ///
 /// # Errors
 ///
-/// [`SaError::AuthEntryConstructionFailed`] (`stage = "rule_proposal_digest"`)
+/// [`SaError::AuthEntryConstructionFailed`] (`stage = "rule_definition_snapshot"`)
 /// on any malformed strkey, hex, or base64 field. This should not occur for a
 /// snapshot that already passed `validate_context_rule_proposal_snapshot` at
 /// deserialise time (the pending-approval store validates on load), but this
@@ -4037,7 +3967,7 @@ pub fn context_rule_definition_from_snapshot(
     use stellar_agent_core::approval::{RuleProposalContextType, RuleProposalSignerKind};
 
     let err = |reason: String| SaError::AuthEntryConstructionFailed {
-        stage: "rule_proposal_digest",
+        stage: "rule_definition_snapshot",
         redacted_reason: reason,
     };
 
@@ -5772,7 +5702,7 @@ mod tests {
         else {
             panic!("an M-strkey delegated signer must be refused");
         };
-        assert_eq!(stage, "rule_proposal_digest");
+        assert_eq!(stage, "rule_definition_snapshot");
         assert!(
             redacted_reason.starts_with("signers[1].address: "),
             "{redacted_reason}"
@@ -9920,189 +9850,47 @@ mod tests {
         );
     }
 
-    // ─────────────────────────────────────────────────────────────────────────
-    // compute_context_rule_proposal_sha256 (Package D, GH issue #8)
-    // ─────────────────────────────────────────────────────────────────────────
-
-    fn digest_smart_account() -> ScAddress {
-        ScAddress::Contract(ContractId(stellar_xdr::Hash([0x33_u8; 32])))
-    }
-
-    /// Builds a `Delegated` signer directly from raw ed25519 pubkey bytes
-    /// (bypassing G-strkey parsing, which requires a valid checksum).
-    fn digest_signer_with_pubkey(byte_fill: u8) -> ContextRuleSignerInput {
-        ContextRuleSignerInput::Delegated {
-            address: ScAddress::Account(stellar_xdr::AccountId(
-                stellar_xdr::PublicKey::PublicKeyTypeEd25519(stellar_xdr::Uint256([byte_fill; 32])),
-            )),
-        }
-    }
-
-    fn digest_signer() -> ContextRuleSignerInput {
-        digest_signer_with_pubkey(0x11)
-    }
-
-    fn digest_baseline_def() -> ContextRuleDefinition {
-        ContextRuleDefinition::new(
-            RuleContext::Default,
-            "spend-daily".to_owned(),
-            None,
-            vec![digest_signer()],
-            vec![],
-        )
-    }
-
-    fn digest_baseline_ids() -> Vec<stellar_agent_core::smart_account::rule_id::ContextRuleId> {
-        vec![stellar_agent_core::smart_account::rule_id::ContextRuleId::new(0)]
-    }
-
     #[test]
-    fn compute_context_rule_proposal_sha256_is_deterministic() {
-        let sa = digest_smart_account();
-        let def = digest_baseline_def();
-        let ids = digest_baseline_ids();
-        let d1 = compute_context_rule_proposal_sha256(&sa, &def, &ids, false, false).unwrap();
-        let d2 = compute_context_rule_proposal_sha256(&sa, &def, &ids, false, false).unwrap();
-        assert_eq!(d1, d2);
-        assert_ne!(d1, [0u8; 32]);
-    }
-
-    /// Tamper matrix: flipping ANY snapshot field class must change the
-    /// digest (Package D, GH issue #8 — the integrity invariant that binds
-    /// the operator's attestation to EXACTLY the resolved arguments).
-    #[test]
-    fn compute_context_rule_proposal_sha256_tamper_matrix() {
-        let sa = digest_smart_account();
-        let ids = digest_baseline_ids();
-        let baseline =
-            compute_context_rule_proposal_sha256(&sa, &digest_baseline_def(), &ids, false, false)
-                .unwrap();
-
-        // name
-        let mut def_name = digest_baseline_def();
-        def_name.name = "different-name".to_owned();
-        let d = compute_context_rule_proposal_sha256(&sa, &def_name, &ids, false, false).unwrap();
-        assert_ne!(baseline, d, "changing name must change the digest");
-
-        // valid_until
-        let mut def_valid_until = digest_baseline_def();
-        def_valid_until.valid_until = Some(12345);
-        let d = compute_context_rule_proposal_sha256(&sa, &def_valid_until, &ids, false, false)
-            .unwrap();
-        assert_ne!(baseline, d, "changing valid_until must change the digest");
-
-        // a signer byte (different pubkey bytes ⟹ different address bytes)
-        let mut def_signer = digest_baseline_def();
-        def_signer.signers = vec![digest_signer_with_pubkey(0x22)];
-        let d = compute_context_rule_proposal_sha256(&sa, &def_signer, &ids, false, false).unwrap();
-        assert_ne!(baseline, d, "changing a signer byte must change the digest");
-
-        // a policy param
-        let mut def_policy = digest_baseline_def();
-        def_policy.policies = vec![ContextRulePolicy::new(
-            ScAddress::Contract(ContractId(stellar_xdr::Hash([0x55_u8; 32]))),
-            ScVal::U32(1),
-        )];
-        let d = compute_context_rule_proposal_sha256(&sa, &def_policy, &ids, false, false).unwrap();
-        assert_ne!(
-            baseline, d,
-            "changing a policy param must change the digest"
-        );
-
-        // auth_rule_ids
-        let other_ids = vec![stellar_agent_core::smart_account::rule_id::ContextRuleId::new(1)];
-        let d = compute_context_rule_proposal_sha256(
-            &sa,
-            &digest_baseline_def(),
-            &other_ids,
-            false,
-            false,
-        )
-        .unwrap();
-        assert_ne!(baseline, d, "changing auth_rule_ids must change the digest");
-
-        // accept_mutable_verifier flag
-        let d =
-            compute_context_rule_proposal_sha256(&sa, &digest_baseline_def(), &ids, true, false)
-                .unwrap();
-        assert_ne!(
-            baseline, d,
-            "changing accept_mutable_verifier must change the digest"
-        );
-
-        // accept_unknown_verifier flag
-        let d =
-            compute_context_rule_proposal_sha256(&sa, &digest_baseline_def(), &ids, false, true)
-                .unwrap();
-        assert_ne!(
-            baseline, d,
-            "changing accept_unknown_verifier must change the digest"
-        );
-
-        // smart_account itself
-        let other_sa = ScAddress::Contract(ContractId(stellar_xdr::Hash([0x99_u8; 32])));
-        let d = compute_context_rule_proposal_sha256(
-            &other_sa,
-            &digest_baseline_def(),
-            &ids,
-            false,
-            false,
-        )
-        .unwrap();
-        assert_ne!(baseline, d, "changing smart_account must change the digest");
-
-        // context type: Default → CallContract (a different target contract)
-        let mut def_context = digest_baseline_def();
-        def_context.context_type = RuleContext::CallContract {
-            contract: ScAddress::Contract(ContractId(stellar_xdr::Hash([0x77_u8; 32]))),
+    fn every_change_to_the_install_arguments_changes_the_core_digest() {
+        use stellar_agent_core::approval::{fixtures, rule_proposal_digest};
+        let baseline = fixtures::rule_proposal_snapshot();
+        let arguments = |snapshot: &stellar_agent_core::approval::ContextRuleProposalSnapshot| {
+            context_rule_definition_from_snapshot(snapshot).map(|definition| {
+                (
+                    ScVal::Vec(Some(
+                        build_add_context_rule_args(&definition)
+                            .unwrap()
+                            .try_into()
+                            .unwrap(),
+                    ))
+                    .to_xdr(Limits::none())
+                    .unwrap(),
+                    snapshot.auth_rule_ids.clone(),
+                    snapshot.accept_mutable_verifier,
+                    snapshot.accept_unknown_verifier,
+                )
+            })
         };
-        let d =
-            compute_context_rule_proposal_sha256(&sa, &def_context, &ids, false, false).unwrap();
-        assert_ne!(
-            baseline, d,
-            "changing context type (Default -> CallContract) must change the digest"
-        );
-
-        // signer order: the SAME two signers in a DIFFERENT sequence.
-        let mut def_forward = digest_baseline_def();
-        def_forward.signers = vec![
-            digest_signer_with_pubkey(0x22),
-            digest_signer_with_pubkey(0x33),
-        ];
-        let mut def_reversed = digest_baseline_def();
-        def_reversed.signers = vec![
-            digest_signer_with_pubkey(0x33),
-            digest_signer_with_pubkey(0x22),
-        ];
-        let d_forward =
-            compute_context_rule_proposal_sha256(&sa, &def_forward, &ids, false, false).unwrap();
-        let d_reversed =
-            compute_context_rule_proposal_sha256(&sa, &def_reversed, &ids, false, false).unwrap();
-        assert_ne!(
-            d_forward, d_reversed,
-            "swapping the order of the SAME signer set must change the digest"
-        );
-    }
-
-    #[test]
-    fn compute_context_rule_proposal_sha256_both_flags_distinguishable() {
-        let sa = digest_smart_account();
-        let def = digest_baseline_def();
-        let ids = digest_baseline_ids();
-        let d_none = compute_context_rule_proposal_sha256(&sa, &def, &ids, false, false).unwrap();
-        let d_mutable = compute_context_rule_proposal_sha256(&sa, &def, &ids, true, false).unwrap();
-        let d_unknown = compute_context_rule_proposal_sha256(&sa, &def, &ids, false, true).unwrap();
-        let d_both = compute_context_rule_proposal_sha256(&sa, &def, &ids, true, true).unwrap();
-        // All four flag combinations must be pairwise distinct.
-        let all = [d_none, d_mutable, d_unknown, d_both];
-        for i in 0..all.len() {
-            for j in (i + 1)..all.len() {
-                assert_ne!(
-                    all[i], all[j],
-                    "flag-combination digests at indices {i} and {j} must differ"
-                );
+        let digest = |snapshot: &stellar_agent_core::approval::ContextRuleProposalSnapshot| {
+            rule_proposal_digest("account", "network", "chain", snapshot, "summary")
+        };
+        let mut seen = vec![("baseline", arguments(&baseline).unwrap(), digest(&baseline))];
+        for (name, snapshot) in fixtures::rule_proposal_mutations() {
+            let Ok(args) = arguments(&snapshot) else {
+                continue;
+            };
+            let changed = digest(&snapshot);
+            for (other, prior_args, prior_digest) in &seen {
+                if &args != prior_args {
+                    assert_ne!(&changed, prior_digest, "{name} and {other}");
+                }
             }
+            seen.push((name, args, changed));
         }
+        assert!(
+            seen.len() >= 25,
+            "the matrix exercises reconstructable snapshots"
+        );
     }
 
     #[test]

@@ -23,8 +23,9 @@ use std::str::FromStr as _;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use super::inconsistent;
 use super::store::ApprovalKind;
-use crate::error::{ApprovalFailure, WalletError};
+use crate::error::WalletError;
 use crate::profile::caip2::Caip2;
 
 /// Domain tag of the authorization fingerprint.
@@ -153,12 +154,6 @@ pub fn verify_mpp_entry_terms(kind: &ApprovalKind) -> Result<(), WalletError> {
         ));
     }
     Ok(())
-}
-
-fn inconsistent(reason: &str) -> WalletError {
-    WalletError::Approval(ApprovalFailure::EntryInconsistent {
-        detail: format!("this pending approval cannot be approved: {reason}"),
-    })
 }
 
 /// Binds operator consent to both the authorization fingerprint and the

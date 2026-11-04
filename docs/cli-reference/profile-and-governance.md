@@ -918,6 +918,7 @@ Nothing is removed, so a value that holds such a character shows that it does.
 
 A payment, claim, or trustline request is inconsistent when its stored digest is not the SHA-256 of its stored envelope, or its envelope does not decode as that kind of transaction.
 An MPP charge request is inconsistent when the terms it shows do not match its authorization fingerprint.
+A rule proposal is inconsistent when its chain does not name its network, or its stored digest is not the digest of the account, network, chain, rule and summary it shows.
 The CLI shows such a request as `INCONSISTENT` with the reason and refuses it before the prompt, `--yes` included, with `approval.entry_inconsistent`.
 Both inboxes label it `INCONSISTENT` and offer only Reject.
 Nothing is attested for it on any surface.
@@ -933,7 +934,7 @@ These failures carry `approval.*` codes: `approval.not_found`, `approval.expired
 `approval.presence_browser_required`: The ceremony requires a local browser; no approval is recorded.
 `approval.gc_failed` reports a collection failure from `approve gc`.
 `approval.operator_credential_revoked` reports a remote approval whose operator credential is missing from the profile's `allowed_credentials` list or from the operator-credential store; `approval.remote_authorization_unavailable` reports that the profile's remote-approval authorization or the operator-credential store could not be read, or that the profile does not enable remote approval for that chain.
-`approval.entry_inconsistent` reports a payment, claim, or trustline request whose stored digest is not the digest of its stored envelope, or whose envelope does not decode, and an MPP charge request whose shown terms do not match what it would authorize.
+`approval.entry_inconsistent` reports a payment, claim, or trustline request whose stored digest is not the digest of its stored envelope, or whose envelope does not decode; a rule proposal whose stored digest is not the digest of what it shows; and an MPP charge request whose shown terms do not match what it would authorize.
 Authentication, validation, and audit failures on approval paths carry their own codes.
 
 ### `approve --id <NONCE> --profile <name>`

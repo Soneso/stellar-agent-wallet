@@ -313,21 +313,15 @@ pub fn classic_entry_summary(kind: &ApprovalKind) -> Option<Result<ClassicSummar
     let digest_matches = decode_sha256_hex(envelope_sha256_hex)
         .is_ok_and(|stored| stored == approval_subject_classic(envelope_xdr_b64));
     if !digest_matches {
-        return Some(Err(entry_inconsistent(
+        return Some(Err(super::inconsistent(
             "the stored digest is not the digest of the stored envelope",
         )));
     }
     Some(
         classic_summary(envelope_xdr_b64, classic_kind).map_err(|error| {
-            entry_inconsistent(&format!("the stored envelope does not decode: {error}"))
+            super::inconsistent(&format!("the stored envelope does not decode: {error}"))
         }),
     )
-}
-
-fn entry_inconsistent(reason: &str) -> WalletError {
-    WalletError::Approval(ApprovalFailure::EntryInconsistent {
-        detail: format!("this pending approval cannot be approved: {reason}"),
-    })
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -523,7 +517,8 @@ pub enum ConsentAuthorization<'a> {
 ///   failure (`approval.sha256_hex_error`), a binding mismatch
 ///   (`approval.binding_mismatch`), an unattestable `entry.kind`
 ///   (`approval.wrong_kind`), or a classic entry whose stored digest is not
-///   the digest of its envelope or whose envelope does not decode
+///   the digest of its envelope or whose envelope does not decode,
+///   or a rule proposal whose terms disagree with its digest
 ///   (`approval.entry_inconsistent`).
 ///   `ApprovalKind::Rejected` and `ApprovalKind::Consumed` are tombstones and
 ///   can never be attested.
@@ -781,6 +776,7 @@ pub fn attest_and_persist(
         ApprovalKind::RuleProposalSimulated {
             proposal_sha256, ..
         } => {
+            super::verify_rule_proposal_entry_terms(&entry.kind)?;
             // RuleProposalSimulated shares the digest-HMAC attestation path
             // with PaymentSimulated/ClaimSimulated: the blob binds
             // `proposal_sha256`, the nonce, and the process UID, and is
@@ -2073,12 +2069,73 @@ mod tests {
             "Test SDF Network ; September 2015".to_owned(),
             "stellar:testnet".to_owned(),
             definition,
-            [0x77u8; 32],
             "CallContract rule \"spend-daily\"".to_owned(),
             process_uid_for_attestation().expect("UID available on test host"),
             ttl_ms,
         )
         .unwrap()
+    }
+
+    fn assert_rule_edit_refused(edit: impl FnOnce(&mut ApprovalKind)) {
+        let dir = TempDir::new().unwrap();
+        let mut audit = test_audit_writer(&dir);
+        let mut store = PendingApprovalStore::open(dir.path().join("default.toml")).unwrap();
+        let mut entry = make_rule_proposal_entry(DEFAULT_TTL_MS);
+        edit(&mut entry.kind);
+        store
+            .insert(entry.clone(), timefmt::now_unix_ms().unwrap())
+            .unwrap();
+        let error = attest_and_persist(
+            &mut store,
+            &entry,
+            &[0x55; 32],
+            &crate::approval::AttestationBinding::new("default", "stellar:testnet"),
+            Surface::Cli,
+            ConsentAudit::Writer(&mut audit),
+            ConsentAuthorization::Standard(&AttestedApprover::Local),
+            |_req, _key| Err("rule approval does not create a grant".to_owned()),
+        )
+        .unwrap_err();
+        assert_eq!(error.code(), "approval.entry_inconsistent");
+        assert!(consent_rows(&dir).is_empty());
+        assert!(
+            store
+                .get(&entry.approval_nonce)
+                .unwrap()
+                .attestation_blob_b64
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn attest_refuses_a_rule_entry_whose_definition_was_replaced() {
+        assert_rule_edit_refused(|kind| {
+            if let ApprovalKind::RuleProposalSimulated { definition, .. } = kind {
+                definition.name = "replacement-rule".to_owned();
+            }
+        });
+    }
+
+    #[test]
+    fn attest_refuses_a_rule_entry_with_an_edited_summary_line() {
+        assert_rule_edit_refused(|kind| {
+            if let ApprovalKind::RuleProposalSimulated { summary_line, .. } = kind {
+                summary_line.push('x');
+            }
+        });
+    }
+
+    #[test]
+    fn attest_refuses_a_rule_entry_with_an_edited_redacted_account() {
+        assert_rule_edit_refused(|kind| {
+            if let ApprovalKind::RuleProposalSimulated {
+                smart_account_redacted,
+                ..
+            } = kind
+            {
+                smart_account_redacted.push('x');
+            }
+        });
     }
 
     #[test]

@@ -595,7 +595,6 @@ mod tests {
             "Public Global Stellar Network ; September 2015".to_owned(),
             "stellar:mainnet".to_owned(),
             definition,
-            [1; 32],
             "rule".to_owned(),
             stellar_agent_core::approval::process_uid_for_attestation().unwrap(),
             stellar_agent_core::approval::DEFAULT_TTL_MS,

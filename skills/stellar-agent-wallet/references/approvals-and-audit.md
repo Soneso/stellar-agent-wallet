@@ -346,7 +346,8 @@ and paragraph separators and Unicode format characters (category Cf) shown as
 visible escapes, so the operator reads what is signed and memo text cannot
 rewrite the terminal. An entry whose envelope does not decode or does not match
 its stored digest, or an MPP charge whose shown terms do not match its
-authorization fingerprint, is shown as inconsistent and cannot be approved
+authorization fingerprint, or a rule proposal whose stored digest is not the digest
+of what it shows, is shown as inconsistent and cannot be approved
 (`approval.entry_inconsistent`). The operator confirms at the
 terminal; the command then records the consent. Recording is one-shot: a nonce
 that is expired, of the wrong kind, or already attested is rejected. Approval is
@@ -361,7 +362,7 @@ Per kind:
 | `PaymentSimulated` / `ClaimSimulated` / `TrustlineSimulated` | Refuses with `approval.entry_inconsistent`, before the consent row, unless the stored digest is the SHA-256 of the stored envelope and the envelope decodes. Then computes the HMAC attestation over that digest and persists it; returns `approval_attestation`. Each commit tool accepts its own approval kind. |
 | `TrustlineClawbackOptIn` | Computes a domain-separated HMAC over `(network, code, issuer)` and stores it; the trustline gate recomputes and verifies it. No `approval_attestation` returned. |
 | `ToolsetFirstInvokeGate` | Builds and persists a time-boxed toolset grant, then consumes (removes) the pending entry. Does not set an attestation blob on the entry. No `approval_attestation` returned. |
-| `RuleProposalSimulated` | Computes the HMAC attestation over `proposal_sha256` (the domain-separated digest of the FULL resolved rule definition), not an envelope hash; persists it and returns `approval_attestation`. A DEDICATED gate verifies it at commit. The envelope approval gate rejects this kind. |
+| `RuleProposalSimulated` | The shared HMAC binds the versioned proposal digest over the account, network, chain and the full displayed rule. Approval recomputes it and refuses inconsistent terms; otherwise it persists the attestation and returns `approval_attestation`. The rule commit gate verifies it. The envelope approval gate rejects this kind. |
 | `MppChargeSimulated` | Attests the prepared artifact hash under the profile and chain binding; returns `approval_attestation`. |
 | `Consumed` | Already resolved; cannot be attested again. |
 
@@ -377,7 +378,7 @@ Payment, claim, and trustline summaries are decoded from the envelope the approv
 The effective source is the operation source when the operation has one, otherwise the transaction source.
 A claim names the balance by id only, so its asset and amount read `not part of the signed claim transaction`.
 Every value renders control characters as visible escapes such as `\u{1b}`.
-A request whose stored digest is not the digest of its stored envelope, or whose envelope does not decode, shows as `INCONSISTENT`, offers no approve action, and is refused with `approval.entry_inconsistent`.
+A request whose stored digest is not the digest of its stored envelope, whose envelope does not decode, or whose rule proposal digest does not match what it shows appears as `INCONSISTENT`, offers no approve action, and is refused with `approval.entry_inconsistent`.
 Trustline summaries show the holder account, asset code, issuer, limit,
 fee, and sequence number.
 The CLI names the action `trustline change (ChangeTrust)`.

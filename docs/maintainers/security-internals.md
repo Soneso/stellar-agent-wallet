@@ -108,7 +108,13 @@ Four approval kinds bind extra fields by hashing them into the 32-byte slot that
 - `ToolsetFirstInvokeGate`: `compute_toolset_gate_digest` hashes `TOOLSET_GATE_DOMAIN_TAG` (`stellar-agent-toolset-grant:v1`) followed by length-prefixed `toolset_name`, `capability`, `destination` (G-strkey), `asset`, then the fixed-width `amount_min_stroops` and `amount_max_stroops` as big-endian `i64`. `verify_toolset_gate_attestation` recomputes this digest and feeds it through `verify_attestation`.
 - `TrustlineClawbackOptIn`: `compute_trustline_clawback_opt_in_digest` hashes `TRUSTLINE_CLAWBACK_OPT_IN_DOMAIN_TAG` (`stellar-agent-trustline-clawback-opt-in:v1`) followed by length-prefixed `network`, `code`, `issuer`.
 
-- `RuleProposalSimulated`: the shared HMAC binds the versioned proposal digest over the resolved rule installation arguments.
+- `RuleProposalSimulated`: `rule_proposal_digest` hashes `PROPOSAL_DIGEST_TAG` (`stellar-agent-rule-proposal:v2\0`) followed by account, network passphrase, chain id, summary line, snapshot version, context variant and payload, name, optional expiry, signers, policies, authorization rule ids, then override flags.
+  Strings and byte values carry big-endian `u64` lengths; lists carry big-endian `u64` counts and preserve item order.
+  Integers are big-endian `u32`; variants, optional presence markers, booleans and flags occupy one byte.
+  Context variants are Default (0), CallContract (1), and CreateContract (2), with contract strkey or Wasm hash hex as applicable.
+  Each signer encodes kind (Delegated 0, External 1), optional address, optional verifier, optional public-key bytes, then proposer status.
+  Each policy encodes address, then base64 XDR parameters.
+  The flag byte uses bit 0 for mutable verifiers and bit 1 for unknown verifiers.
 - `MppChargeSimulated`: the shared HMAC binds the prepared artifact hash. The store verifier also compares the stored profile and chain with the binding.
 
 A matching grant requires a version 3 HMAC that verifies under the profile's attestation key and profile/chain binding. It must be unexpired, with a lifetime of at most 30 days, and issued no later than the current time and at or after the second following the current installation. An invalid install time honors no grant. Consent issued in the install second re-prompts once. A forged or edited grant suppresses nothing.

@@ -329,6 +329,27 @@ async fn t1_rule_create_commit_happy_path() {
     .get(&approval_nonce)
     .expect("the approval request is persisted")
     .clone();
+    let stellar_agent_core::approval::ApprovalKind::RuleProposalSimulated {
+        smart_account,
+        network_passphrase,
+        chain_id,
+        definition,
+        summary_line,
+        ..
+    } = &stored.kind
+    else {
+        panic!("expected rule proposal")
+    };
+    assert_eq!(
+        proposal_sha256,
+        stellar_agent_core::approval::rule_proposal_digest(
+            smart_account,
+            network_passphrase,
+            chain_id,
+            definition,
+            summary_line,
+        )
+    );
     let blob = compute_attestation_v4(
         &attestation_key,
         &stellar_agent_core::approval::AttestationBinding::new(

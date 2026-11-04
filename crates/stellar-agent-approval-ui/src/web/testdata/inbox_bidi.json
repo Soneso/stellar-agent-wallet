@@ -111,7 +111,7 @@
       },
       "kind": "rule_proposal",
       "network_passphrase": "Test SDF Network ; September 2015",
-      "proposal_sha256_hex": "1111111111111111111111111111111111111111111111111111111111111111",
+      "proposal_sha256_hex": "bf130d1240676e6614bfdbfe89a094d2bc4d546049eeb13bd24642a1e1b6b859",
       "smart_account_redacted": "CDDDD...DDDDD",
       "summary_line": "café\\u{202e}rule"
     }

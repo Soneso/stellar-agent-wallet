@@ -707,14 +707,9 @@ pub enum ApprovalKind {
         /// exactly what will be installed.
         definition: ContextRuleProposalSnapshot,
 
-        /// Domain-separated SHA-256 digest binding the resolved
-        /// `add_context_rule` arguments
-        /// (see [`super::attestation::compute_rule_proposal_digest`]).
-        ///
-        /// Minted at propose time by
-        /// `stellar-agent-smart-account::managers::rules::compute_context_rule_proposal_sha256`
-        /// (core cannot compute it directly — it has no dependency on the
-        /// smart-account crate's `build_add_context_rule_args` builder).
+        /// Versioned SHA-256 digest of the account, network, chain, full
+        /// displayed definition and summary line.
+        /// See [`super::rule_proposal_digest`].
         /// Bound into the attestation HMAC exactly like `envelope_sha256_hex`
         /// for `PaymentSimulated` / `ClaimSimulated`.
         proposal_sha256: [u8; 32],
@@ -3029,7 +3024,10 @@ impl<'de> Deserialize<'de> for PendingApproval {
         } else if let Some(rps) = raw.rule_proposal_simulated {
             // Cross-kind contamination check: RuleProposalSimulated must not
             // carry PaymentSimulated flat fields, passkey-related fields, or
-            // any other sub-table. `sign_with_passkey`, `register_passkey`,
+            // any other sub-table.
+            // `reason` is displayed and the digest does not bind it, so a rule
+            // entry never carries one.
+            // `sign_with_passkey`, `register_passkey`,
             // `toolset_first_invoke_gate`, `trustline_clawback_opt_in`, and
             // `claim_simulated` are already ruled out by the if-else chain
             // above.
@@ -3044,6 +3042,7 @@ impl<'de> Deserialize<'de> for PendingApproval {
             // RuleProposalSimulated entry fail to reload — exactly the defect
             // `rule_proposal_remote_browser_testnet_acceptance.rs` caught.
             for (field, present) in [
+                ("reason", raw.reason.is_some()),
                 ("envelope_xdr_b64", raw.envelope_xdr_b64.is_some()),
                 ("envelope_sha256_hex", raw.envelope_sha256_hex.is_some()),
                 ("summary_to", raw.summary_to.is_some()),
@@ -4191,7 +4190,8 @@ impl PendingApproval {
     /// (Package D, GH issue #8).
     ///
     /// Generates a random `approval_nonce` from `OsRng`, computes
-    /// `smart_account_redacted` from `smart_account`, and computes
+    /// `smart_account_redacted` from `smart_account`, computes the proposal
+    /// digest with [`super::rule_proposal_digest`], and computes
     /// `created_at_unix_ms` + `expires_at_unix_ms` from the current system
     /// time and `ttl_ms`. `definition` and `smart_account` are validated at
     /// construction time.
@@ -4202,9 +4202,6 @@ impl PendingApproval {
     /// - `network_passphrase`: network the proposal was simulated against.
     /// - `chain_id`: CAIP-2 chain ID (e.g. `"stellar:testnet"`).
     /// - `definition`: the fully-resolved rule definition snapshot.
-    /// - `proposal_sha256`: the domain-separated digest minted by
-    ///   `stellar-agent-smart-account::managers::rules::compute_context_rule_proposal_sha256`
-    ///   over the SAME resolved arguments carried in `definition`.
     /// - `summary_line`: pre-computed, non-secret one-line summary.
     /// - `process_uid`: platform-stable user identity from
     ///   `process_uid_for_attestation()`.
@@ -4218,14 +4215,13 @@ impl PendingApproval {
     #[allow(
         clippy::too_many_arguments,
         reason = "irreducible propose-time field set (smart-account identity + network + \
-                  resolved definition + digest + display summary + platform fields)"
+                  resolved definition + display summary + platform fields)"
     )]
     pub fn new_rule_proposal_pending(
         smart_account: String,
         network_passphrase: String,
         chain_id: String,
         definition: ContextRuleProposalSnapshot,
-        proposal_sha256: [u8; 32],
         summary_line: String,
         process_uid: String,
         ttl_ms: u64,
@@ -4235,6 +4231,13 @@ impl PendingApproval {
         validate_context_rule_proposal_snapshot(&definition)
             .map_err(|reason| ApprovalError::Invalid { reason })?;
 
+        let proposal_sha256 = super::rule_proposal_digest(
+            &smart_account,
+            &network_passphrase,
+            &chain_id,
+            &definition,
+            &summary_line,
+        );
         let smart_account_redacted = redact_g_strkey(&smart_account);
 
         let mut raw = [0u8; 16];
@@ -6287,7 +6290,7 @@ impl PendingApprovalStore {
     /// # Errors
     ///
     /// A live rejection returns [`RuleProposalGateError::Rejected`].
-    /// Missing, expired, wrong-kind, digest, binding and HMAC failures return
+    /// Missing, expired, wrong-kind, inconsistent, digest, binding and HMAC failures return
     /// [`RuleProposalGateError::Refused`].
     pub fn verify_rule_proposal_gate(
         &self,
@@ -6311,6 +6314,9 @@ impl PendingApprovalStore {
         if matches!(entry.kind, ApprovalKind::Rejected { .. }) {
             return Err(RuleProposalGateError::Rejected);
         }
+
+        super::verify_rule_proposal_entry_terms(&entry.kind)
+            .map_err(|_| RuleProposalGateError::Refused)?;
 
         let ApprovalKind::RuleProposalSimulated {
             proposal_sha256,
@@ -10626,7 +10632,6 @@ issuer = "{TESTNET_USDC_ISSUER}"
     fn make_rule_proposal_entry_with(
         smart_account: &str,
         definition: ContextRuleProposalSnapshot,
-        proposal_sha256: [u8; 32],
         ttl_ms: u64,
     ) -> PendingApproval {
         PendingApproval::new_rule_proposal_pending(
@@ -10634,7 +10639,6 @@ issuer = "{TESTNET_USDC_ISSUER}"
             TESTNET_PASSPHRASE.to_owned(),
             "stellar:testnet".to_owned(),
             definition,
-            proposal_sha256,
             "CallContract rule \"spend-daily\"".to_owned(),
             "1000".to_owned(),
             ttl_ms,
@@ -10646,7 +10650,6 @@ issuer = "{TESTNET_USDC_ISSUER}"
         make_rule_proposal_entry_with(
             RULE_PROPOSAL_SMART_ACCOUNT,
             valid_rule_proposal_snapshot(),
-            [0x11u8; 32],
             ttl_ms,
         )
     }
@@ -10684,7 +10687,6 @@ issuer = "{TESTNET_USDC_ISSUER}"
             TESTNET_PASSPHRASE.to_owned(),
             "stellar:testnet".to_owned(),
             valid_rule_proposal_snapshot(),
-            [0x11u8; 32],
             "summary".to_owned(),
             "1000".to_owned(),
             DEFAULT_TTL_MS,
@@ -10702,7 +10704,6 @@ issuer = "{TESTNET_USDC_ISSUER}"
             TESTNET_PASSPHRASE.to_owned(),
             "stellar:testnet".to_owned(),
             snapshot,
-            [0x11u8; 32],
             "summary".to_owned(),
             "1000".to_owned(),
             DEFAULT_TTL_MS,
@@ -10741,7 +10742,13 @@ issuer = "{TESTNET_USDC_ISSUER}"
     fn rule_proposal_toml_round_trip() {
         let dir = TempDir::new().unwrap();
         let mut store = open_store(&dir);
-        let entry = make_rule_proposal_entry(DEFAULT_TTL_MS);
+        let entry = crate::approval::fixtures::rule_proposal_pending();
+        let expected_kind = entry.kind.clone();
+        if let ApprovalKind::RuleProposalSimulated { definition, .. } = &entry.kind {
+            assert!(definition.signers[0].address.is_some());
+            assert!(definition.signers[1].verifier.is_some());
+            assert!(definition.signers[1].pubkey_data.is_some());
+        }
         let nonce = entry.approval_nonce.clone();
         let expected_sha256 = if let ApprovalKind::RuleProposalSimulated {
             proposal_sha256, ..
@@ -10757,6 +10764,8 @@ issuer = "{TESTNET_USDC_ISSUER}"
         let reopened = open_store(&dir);
         let loaded = reopened.get(&nonce).unwrap();
         assert_eq!(loaded.kind.kind_name(), "RuleProposalSimulated");
+        assert_eq!(loaded.kind, expected_kind);
+        crate::approval::verify_rule_proposal_entry_terms(&loaded.kind).unwrap();
         match &loaded.kind {
             ApprovalKind::RuleProposalSimulated {
                 proposal_sha256, ..
@@ -10985,6 +10994,35 @@ is_proposer = true
     }
 
     #[test]
+    fn rule_proposal_with_a_planted_reason_fails_store_open() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("reason.toml");
+        let mut store = PendingApprovalStore::open(path.clone()).unwrap();
+        store
+            .insert(
+                crate::approval::fixtures::rule_proposal_pending(),
+                TEST_NOW_MS,
+            )
+            .unwrap();
+        drop(store);
+        let text = std::fs::read_to_string(&path).unwrap();
+        let contaminated = text.replacen(
+            "[[pending]]",
+            "[[pending]]\nreason = \"planted explanation\"",
+            1,
+        );
+        let parse_error = toml::from_str::<StoreFile>(&contaminated).unwrap_err();
+        assert!(parse_error.message().contains("carry field `reason`"));
+        std::fs::write(&path, contaminated).unwrap();
+        let error = PendingApprovalStore::open(path).unwrap_err();
+        assert!(matches!(error, ApprovalError::Toml { .. }));
+        assert_eq!(
+            error.to_string(),
+            "approval TOML error: TOML parse error at line 1, column 1"
+        );
+    }
+
+    #[test]
     fn record_rule_proposal_attestation_success() {
         let dir = TempDir::new().unwrap();
         let mut store = open_store(&dir);
@@ -11061,15 +11099,84 @@ is_proposer = true
         assert!(matches!(err, ApprovalError::NotFound));
     }
 
+    fn bind_rule_entry(entry: &mut PendingApproval) -> [u8; 32] {
+        let ApprovalKind::RuleProposalSimulated {
+            smart_account,
+            network_passphrase,
+            chain_id,
+            definition,
+            summary_line,
+            proposal_sha256,
+            ..
+        } = &mut entry.kind
+        else {
+            unreachable!()
+        };
+        *proposal_sha256 = super::super::rule_proposal_digest(
+            smart_account,
+            network_passphrase,
+            chain_id,
+            definition,
+            summary_line,
+        );
+        *proposal_sha256
+    }
+
+    #[test]
+    fn the_gate_refuses_an_inconsistent_entry() {
+        let dir = TempDir::new().unwrap();
+        let mut store = open_store(&dir);
+        let mut entry = make_rule_proposal_entry(DEFAULT_TTL_MS);
+        let digest = bind_rule_entry(&mut entry);
+        let nonce = entry.approval_nonce.clone();
+        let binding = crate::approval::AttestationBinding::new("default", "stellar:testnet");
+        let key = [0x55; 32];
+        let blob = super::super::compute_attestation_v4(
+            &key,
+            &binding,
+            &nonce,
+            &digest,
+            &entry.process_uid,
+            &entry.attested_lifetime(),
+            &AttestedApprover::Local,
+        );
+        store.insert(entry, TEST_NOW_MS).unwrap();
+        store
+            .record_rule_proposal_attestation(&nonce, blob, AttestedApprover::Local)
+            .unwrap();
+        assert!(
+            store
+                .verify_rule_proposal_gate(&nonce, &digest, &key, &binding, &blob, TEST_NOW_MS)
+                .is_ok()
+        );
+        let entry = store
+            .entries
+            .iter_mut()
+            .find(|e| e.approval_nonce == nonce)
+            .unwrap();
+        if let ApprovalKind::RuleProposalSimulated { definition, .. } = &mut entry.kind {
+            definition.name = "replacement-rule".to_owned();
+        }
+        assert_eq!(
+            store.verify_rule_proposal_gate(&nonce, &digest, &key, &binding, &blob, TEST_NOW_MS),
+            Err(RuleProposalGateError::Refused)
+        );
+        store.persist().unwrap();
+        drop(store);
+        let reopened = open_store(&dir);
+        assert!(matches!(
+            reopened.snapshot(TEST_NOW_MS)[0].summary,
+            crate::approval::ApprovalSummaryView::Inconsistent { .. }
+        ));
+    }
+
     #[test]
     fn verify_rule_proposal_gate_success() {
         let dir = TempDir::new().unwrap();
         let mut store = open_store(&dir);
-        let digest = [0x44u8; 32];
         let mut entry = make_rule_proposal_entry_with(
             RULE_PROPOSAL_SMART_ACCOUNT,
             valid_rule_proposal_snapshot(),
-            digest,
             DEFAULT_TTL_MS,
         );
         if let ApprovalKind::RuleProposalSimulated {
@@ -11081,6 +11188,7 @@ is_proposer = true
             *chain_id = "stellar:mainnet".to_owned();
             *network_passphrase = "Public Global Stellar Network ; September 2015".to_owned();
         }
+        let digest = bind_rule_entry(&mut entry);
         let nonce = entry.approval_nonce.clone();
         let process_uid = entry.process_uid.clone();
         store.insert(entry, TEST_NOW_MS).unwrap();
@@ -11122,25 +11230,17 @@ is_proposer = true
         );
     }
 
-    /// Stands in for the "tamper matrix" requirement at the gate layer: any
-    /// recomputed digest that differs from what was attested (the shape a
-    /// tampered snapshot field would produce, since
-    /// `compute_context_rule_proposal_sha256` in `stellar-agent-smart-account`
-    /// is sensitive to every field — see that crate's own digest tests) must
-    /// refuse. Core has no dependency on the smart-account crate's builder,
-    /// so this test exercises the gate's digest-comparison mechanics directly
-    /// with two differing 32-byte digests.
+    /// The gate refuses a caller digest that differs from the stored terms.
     #[test]
     fn verify_rule_proposal_gate_digest_mismatch_fails() {
         let dir = TempDir::new().unwrap();
         let mut store = open_store(&dir);
-        let stored_digest = [0x44u8; 32];
-        let entry = make_rule_proposal_entry_with(
+        let mut entry = make_rule_proposal_entry_with(
             RULE_PROPOSAL_SMART_ACCOUNT,
             valid_rule_proposal_snapshot(),
-            stored_digest,
             DEFAULT_TTL_MS,
         );
+        let stored_digest = bind_rule_entry(&mut entry);
         let nonce = entry.approval_nonce.clone();
         let process_uid = entry.process_uid.clone();
         store.insert(entry, TEST_NOW_MS).unwrap();
@@ -11177,13 +11277,12 @@ is_proposer = true
     fn verify_rule_proposal_gate_wrong_hmac_fails() {
         let dir = TempDir::new().unwrap();
         let mut store = open_store(&dir);
-        let digest = [0x44u8; 32];
-        let entry = make_rule_proposal_entry_with(
+        let mut entry = make_rule_proposal_entry_with(
             RULE_PROPOSAL_SMART_ACCOUNT,
             valid_rule_proposal_snapshot(),
-            digest,
             DEFAULT_TTL_MS,
         );
+        let digest = bind_rule_entry(&mut entry);
         let nonce = entry.approval_nonce.clone();
         let process_uid = entry.process_uid.clone();
         store.insert(entry, TEST_NOW_MS).unwrap();
@@ -11218,13 +11317,12 @@ is_proposer = true
     fn verify_rule_proposal_gate_rejected_tombstone_is_distinguishable() {
         let dir = TempDir::new().unwrap();
         let mut store = open_store(&dir);
-        let digest = [0x44u8; 32];
-        let entry = make_rule_proposal_entry_with(
+        let mut entry = make_rule_proposal_entry_with(
             RULE_PROPOSAL_SMART_ACCOUNT,
             valid_rule_proposal_snapshot(),
-            digest,
             DEFAULT_TTL_MS,
         );
+        let digest = bind_rule_entry(&mut entry);
         let nonce = entry.approval_nonce.clone();
         store.insert(entry, TEST_NOW_MS).unwrap();
         store.reject(&nonce, TEST_NOW_MS, 60_000).unwrap();
@@ -11280,13 +11378,12 @@ is_proposer = true
     fn verify_rule_proposal_gate_expired_fails() {
         let dir = TempDir::new().unwrap();
         let mut store = open_store(&dir);
-        let digest = [0x44u8; 32];
-        let entry = make_rule_proposal_entry_with(
+        let mut entry = make_rule_proposal_entry_with(
             RULE_PROPOSAL_SMART_ACCOUNT,
             valid_rule_proposal_snapshot(),
-            digest,
             60_000,
         );
+        let digest = bind_rule_entry(&mut entry);
         let nonce = entry.approval_nonce.clone();
         let expiry = entry.expires_at_unix_ms;
         store.insert(entry, TEST_NOW_MS).unwrap();
@@ -11646,11 +11743,9 @@ is_proposer = true
     fn verify_rule_proposal_gate_refuses_stored_chain_mismatch() {
         let dir = TempDir::new().unwrap();
         let mut store = open_store(&dir);
-        let digest = [0x44u8; 32];
         let mut entry = make_rule_proposal_entry_with(
             RULE_PROPOSAL_SMART_ACCOUNT,
             valid_rule_proposal_snapshot(),
-            digest,
             DEFAULT_TTL_MS,
         );
         if let ApprovalKind::RuleProposalSimulated {
@@ -11662,6 +11757,7 @@ is_proposer = true
             *chain_id = "stellar:mainnet".to_owned();
             *network_passphrase = "Public Global Stellar Network ; September 2015".to_owned();
         }
+        let digest = bind_rule_entry(&mut entry);
         let nonce = entry.approval_nonce.clone();
         let process_uid = entry.process_uid.clone();
         store.insert(entry, TEST_NOW_MS).unwrap();

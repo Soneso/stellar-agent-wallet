@@ -182,9 +182,9 @@ pub enum ApprovalSummaryView {
         memo: ClassicMemo,
     },
 
-    /// A classic or MPP entry
-    /// whose stored digest is not the digest of its stored envelope, or whose
-    /// envelope does not decode, or whose MPP terms fail fingerprint verification.
+    /// A classic, MPP or rule proposal entry whose stored digest is not the
+    /// digest of what it shows, whose envelope does not decode, or whose MPP
+    /// terms fail fingerprint verification.
     /// It cannot be approved; it can be rejected.
     Inconsistent {
         /// `kind_name()` of the entry.
@@ -445,7 +445,7 @@ impl PendingApprovalView {
             | ApprovalKind::Consumed { .. } => false,
         };
 
-        let summary = if let Err(error) = super::mpp::verify_mpp_entry_terms(&entry.kind) {
+        let summary = if let Err(error) = super::verify_entry_terms(&entry.kind) {
             ApprovalSummaryView::Inconsistent {
                 original_kind_name: entry.kind.kind_name().to_owned(),
                 reason: error.message(),
@@ -886,6 +886,18 @@ mod tests {
     }
 
     #[test]
+    fn a_displayed_definition_that_differs_from_the_digest_is_inconsistent() {
+        let mut entry = fixtures::rule_proposal_pending();
+        if let ApprovalKind::RuleProposalSimulated { definition, .. } = &mut entry.kind {
+            definition.name = "replacement-rule".to_owned();
+        }
+        assert!(matches!(
+            PendingApprovalView::from_entry(&entry, TEST_NOW_MS).summary,
+            ApprovalSummaryView::Inconsistent { .. }
+        ));
+    }
+
+    #[test]
     fn snapshot_renders_rule_proposal_simulated() {
         use super::super::rule_proposal::{
             ContextRuleProposalSnapshot, RuleProposalContextType, RuleProposalSigner,
@@ -911,7 +923,6 @@ mod tests {
             TESTNET_PASSPHRASE.to_owned(),
             "stellar:testnet".to_owned(),
             definition,
-            [0x99u8; 32],
             "CallContract rule \"spend-daily\"".to_owned(),
             uid(),
             DEFAULT_TTL_MS,
@@ -1694,6 +1705,7 @@ mod tests {
         };
         assert_eq!((payee, amount, asset), (None, None, None));
     }
+
     #[test]
     fn mpp_view_checks_every_fingerprinted_term_and_the_binding_digests() {
         // Transport, authority and target enter the fingerprint only through

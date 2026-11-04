@@ -1778,7 +1778,6 @@ mod tests {
                 false,
                 false,
             ),
-            [0; 32],
             "rule".to_owned(),
             process_uid_for_attestation().unwrap(),
             60_000,
