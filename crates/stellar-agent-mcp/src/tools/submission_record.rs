@@ -193,6 +193,9 @@ pub(crate) fn prepare_authorized_recorder(
             &stellar_agent_core::policy::v1::PolicyStateStore::new(),
         )
         .map_err(|error| {
+            if let Some(refusal) = error.chain_validation_error() {
+                return WalletError::Validation(refusal);
+            }
             WalletError::Submission(SubmissionError::RecordUnavailable {
                 detail: format!("the submission window store could not be opened: {error}"),
             })
@@ -1142,6 +1145,7 @@ mod tests {
             "registry",
             "receipts",
             "window",
+            "window_chain",
         ] {
             let f = Fixture::new(|raw| raw);
             let profile = f.server.security_profile();
@@ -1159,6 +1163,15 @@ mod tests {
                 std::fs::create_dir_all(f.server.window_store.path().parent().unwrap()).unwrap();
                 std::fs::write(f.server.window_store.path(), "invalid window state").unwrap();
             }
+            if defect == "window_chain" {
+                let mut foreign = profile.clone();
+                foreign.chain_id = stellar_agent_core::profile::caip2::Caip2::Testnet;
+                f.server
+                    .window_store
+                    .record_and_persist(&foreign, &[])
+                    .unwrap();
+            }
+            let window_before = std::fs::read(f.server.window_store.path()).ok();
             let result = prepare_authorized_recorder(
                 CommitRecord {
                     profile,
@@ -1190,7 +1203,16 @@ mod tests {
                     Ok(_) => panic!("accepted {defect}"),
                     Err(error) => error,
                 };
-                assert_eq!(error.code(), "submission.record_unavailable", "{defect}");
+                let code = if defect == "window_chain" {
+                    "policy.window_chain_mismatch"
+                } else {
+                    "submission.record_unavailable"
+                };
+                assert_eq!(error.code(), code, "{defect}");
+                assert_eq!(
+                    std::fs::read(f.server.window_store.path()).ok(),
+                    window_before
+                );
             }
             assert_eq!(f.seed_reads.load(std::sync::atomic::Ordering::SeqCst), 0);
             if defect != "window" && f.server.window_store.exists() {

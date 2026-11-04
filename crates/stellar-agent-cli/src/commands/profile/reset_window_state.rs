@@ -12,13 +12,12 @@
 //!
 //! # When to use
 //!
-//! The window-state store fails closed on an unreadable, tampered
-//! (HMAC-mismatched), or unparseable file: `per_period_cap` / `rate_limit` /
-//! `bundle_per_period_cap` / `bundle_rate_limit` criteria deny every call with
-//! `CriterionEvaluationFailed` until the store is recovered. This command is
-//! that recovery path — it discards accumulated history (the operator loses
-//! period-cap continuity for the reset profile) rather than attempting
-//! partial repair of a file whose integrity cannot be established.
+//! The command clears verified accumulated history and establishes an empty
+//! store only when both the file and protected generation are absent.
+//! A tampered, unparseable, or rolled-back store refuses before
+//! the reset row, as does missing authenticated network provenance.
+//! No verb recovers such state in this release; create a profile under a new name.
+//! File I/O failures refuse without changing state; retry after access is restored.
 //!
 //! # Audit-row ordering
 //!
@@ -46,11 +45,9 @@
 //! The row records the owner's signature over the profile, chain, store digest,
 //! generation pair, reason bounded to 80 Unicode characters and request id.
 //!
-//! In a build with mainnet writes, the store of a mainnet profile refuses to
-//! load when it cannot be verified (`policy.window_state_unverifiable`). This
-//! command resets such a store, and the audit row's `reason` names the defect
-//! it recovers from beside the operator's reason. A verifiable store that
-//! still holds an open mainnet authorization refuses the reset with
+//! In a build with mainnet writes, unverifiable mainnet state refuses with
+//! `policy.window_state_unverifiable`. A verifiable store that still holds
+//! an open mainnet authorization refuses the reset with
 //! `profile.reset_window_state_open_authorizations` and changes nothing.
 //!
 //! # Output (JSON envelope)
@@ -66,7 +63,7 @@
 //!   "data": {
 //!     "profile": "default",
 //!     "reset": true,
-//!     "reason": "corrupt-file recovery",
+//!     "reason": "clear verified window history",
 //!     "wiped": {
 //!       "previous": "missing", "entry_count": 0, "buckets": [],
 //!       "truncated": false, "generation_before": null, "generation_after": 1
@@ -101,7 +98,7 @@ use stellar_agent_core::profile::schema::Profile;
 use stellar_agent_core::profile::{ResolvedProfileName, loader};
 use stellar_agent_network::keyring::init_platform_keyring_store;
 use stellar_agent_network::policy_state::{
-    PersistedWindowStore, ResetError, ResetRecord, StateDefect, WindowStoreError,
+    PersistedWindowStore, ResetError, ResetRecord, WindowStoreError,
 };
 use uuid::Uuid;
 
@@ -138,7 +135,7 @@ pub(crate) struct ResetWindowStateArgs {
     pub(crate) profile: Option<String>,
 
     /// Operator-supplied reason for the reset, recorded in the audit row
-    /// (e.g. `"corrupt-file recovery"`).
+    /// (e.g. `"clear verified window history"`).
     #[arg(long)]
     pub(crate) reason: String,
 
@@ -293,7 +290,7 @@ fn reset_with_owner(
     let store = PersistedWindowStore::for_profile(name);
     let request_id = Uuid::new_v4().to_string();
     let result = store.reset(profile, now_ms, |record| {
-        let reason = bound_window_reset_reason(&recorded_reason(&args.reason, record.defect));
+        let reason = bound_window_reset_reason(&args.reason);
         let owner_authorization =
             authorize_reset(record, key, profile, name, &reason, &request_id)?;
         record_window_reset(
@@ -434,20 +431,14 @@ fn authorize_reset(
     }))
 }
 
-/// The reason the audit row records: the operator's reason and, when the reset
-/// recovers an unverifiable mainnet store, the defect found.
-fn recorded_reason(reason: &str, defect: Option<StateDefect>) -> String {
-    match defect {
-        Some(defect) => format!("{reason} (unverifiable state: {defect})"),
-        None => reason.to_owned(),
-    }
-}
-
 /// Maps a store failure of the reset to its agent-facing error.
 ///
 /// A store written by a newer build and the mainnet refusals carry their own
 /// validation codes; every other store failure is a wallet defect.
 fn store_refusal(name: &str, error: WindowStoreError) -> WalletError {
+    if let Some(refusal) = error.chain_validation_error() {
+        return WalletError::Validation(refusal);
+    }
     match error {
         WindowStoreError::UnsupportedVersion { version, max } => {
             WalletError::Validation(ValidationError::ResetWindowStateNewerVersion {
@@ -750,16 +741,22 @@ mod tests {
     }
 
     #[test]
-    fn the_recorded_reason_names_the_defect_it_recovers_from() {
-        assert_eq!(recorded_reason("repair", None), "repair");
-        assert_eq!(
-            recorded_reason("repair", Some(StateDefect::HmacInvalid)),
-            "repair (unverifiable state: hmac_invalid)"
-        );
-        assert_eq!(
-            recorded_reason("repair", Some(StateDefect::MissingFileWithGeneration)),
-            "repair (unverifiable state: missing_file_with_generation)"
-        );
+    fn reset_store_scope_refusals_keep_their_codes() {
+        for (refusal, code) in [
+            (
+                WindowStoreError::ChainMismatch,
+                "policy.window_chain_mismatch",
+            ),
+            (
+                WindowStoreError::ChainUnverifiable,
+                "policy.window_chain_unverifiable",
+            ),
+        ] {
+            let error = store_refusal("scope-test", refusal);
+            assert_eq!(error.code(), code);
+            assert!(matches!(error, WalletError::Validation(_)));
+            assert!(!error.to_string().contains("reset-window-state"));
+        }
     }
 
     #[test]
@@ -797,14 +794,16 @@ mod tests {
         let unverifiable = store_refusal(
             "acme",
             WindowStoreError::MainnetStateUnverifiable {
-                defect: StateDefect::GenerationMismatch,
+                defect: stellar_agent_network::policy_state::StateDefect::GenerationMismatch,
             },
         );
         assert_eq!(unverifiable.code(), "policy.window_state_unverifiable");
         let text = unverifiable.to_string();
         assert!(text.contains("generation_mismatch"), "{text}");
         assert!(
-            text.contains("stellar-agent profile reset-window-state acme --reason <reason>"),
+            text.contains(
+                "No verb recovers such state in this release; create a profile under a new name."
+            ),
             "{text}"
         );
         let open = store_refusal("acme", WindowStoreError::OpenAuthorizations { open: 2 });

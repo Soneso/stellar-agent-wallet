@@ -55,12 +55,9 @@ pub enum PolicyEngineBuildError {
     #[error("{code}: {0}", code = .0.wire_code())]
     Policy(PolicyError),
     /// The persisted window state could not be hydrated.
-    #[error(
-        "policy-window-state store for profile '{store_name}' failed to load ({source}); run \
-         `stellar-agent profile reset-window-state {store_name} --reason <reason>` to recover"
-    )]
+    #[error("policy-window-state store for profile '{store_name}' failed to load ({source})")]
     WindowState {
-        /// The name selecting the store file, which the recovery command takes.
+        /// The name selecting the store file.
         store_name: String,
         /// The store's error.
         source: WindowStoreError,

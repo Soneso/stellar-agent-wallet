@@ -477,7 +477,10 @@ where
         Err(msg) => {
             return write_envelope(
                 out,
-                &Envelope::<()>::err_raw("trustline.policy_engine_unavailable", msg),
+                &Envelope::<()>::err_raw(
+                    msg.code_or("trustline.policy_engine_unavailable"),
+                    msg.to_string(),
+                ),
                 1,
             );
         }

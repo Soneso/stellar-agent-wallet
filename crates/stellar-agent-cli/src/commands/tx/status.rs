@@ -172,6 +172,19 @@ pub async fn run(args: &StatusArgs) -> i32 {
         return 1;
     }
 
+    let window = PersistedWindowStore::for_profile(&resolved.name);
+
+    let held = match window.pending_reservations(&profile) {
+        Ok(open) => open.into_iter().find(|r| r.tx_hash == args.tx_hash),
+        Err(e) => {
+            render_json(&Envelope::<()>::err_raw(
+                e.submission_code(),
+                format!("the spending-window file could not be read: {e}"),
+            ));
+            return 1;
+        }
+    };
+
     // The audit writer is proved acquirable before anything is settled: a
     // reconciliation that confirms a submission writes the value-action row
     // that submission never got to write. A persisted profile fails closed on
@@ -220,18 +233,6 @@ pub async fn run(args: &StatusArgs) -> i32 {
         }
     };
 
-    let window = PersistedWindowStore::for_profile(&resolved.name);
-
-    let held = match window.pending_reservations(&profile) {
-        Ok(open) => open.into_iter().find(|r| r.tx_hash == args.tx_hash),
-        Err(e) => {
-            render_json(&Envelope::<()>::err_raw(
-                "submission.record_unavailable",
-                format!("the spending-window file could not be read: {e:?}"),
-            ));
-            return 1;
-        }
-    };
     let envelope_hash = receipt
         .as_ref()
         .map(|r| r.envelope_hash.as_str())
@@ -270,10 +271,10 @@ pub async fn run(args: &StatusArgs) -> i32 {
                 "tx status: reconciliation could not record the receipt outcome"
             ),
             Ok(_) => {}
-            Err(e) => tracing::debug!(
-                error = ?e,
-                "tx status: reconciliation pass failed; the record stands"
-            ),
+            Err(e) => {
+                render_json(&Envelope::<()>::err_raw(e.submission_code(), e.to_string()));
+                return 1;
+            }
         }
     }
 
@@ -313,8 +314,8 @@ pub async fn run(args: &StatusArgs) -> i32 {
         Ok(open) => open.into_iter().find(|r| r.tx_hash == args.tx_hash),
         Err(e) => {
             render_json(&Envelope::<()>::err_raw(
-                "submission.record_unavailable",
-                format!("the spending-window file could not be read: {e:?}"),
+                e.submission_code(),
+                format!("the spending-window file could not be read: {e}"),
             ));
             return 1;
         }

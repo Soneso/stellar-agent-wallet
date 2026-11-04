@@ -4383,6 +4383,9 @@ impl CompetingReservationResponder {
                 &self.profile,
                 &[entry],
                 &SubmissionHold {
+                    chain_scope: stellar_agent_network::policy_state::ChainScope::for_chain(
+                        self.profile.chain_id,
+                    ),
                     id: "9".repeat(64),
                     tx_hash: "9".repeat(64),
                     source: DEST_G.to_owned(),

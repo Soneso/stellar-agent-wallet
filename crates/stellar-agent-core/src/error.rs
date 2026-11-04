@@ -1943,8 +1943,7 @@ pub enum ValidationError {
     /// verified, so neither its spend history nor its authorizations are
     /// known.
     ///
-    /// The reset is the remedy: it records the defect in its audit row and
-    /// re-initialises the store.
+    /// No verb recovers such state in this release; create a profile under a new name.
     ///
     /// # Wire code
     ///
@@ -1952,8 +1951,7 @@ pub enum ValidationError {
     #[cfg(feature = "mainnet-write")]
     #[error(
         "policy.window_state_unverifiable: the policy window-state of mainnet profile \
-         '{profile}' cannot be verified ({defect}); run `stellar-agent profile \
-         reset-window-state {profile} --reason <reason>` to reset it"
+         '{profile}' cannot be verified ({defect}). No verb recovers such state in this release; create a profile under a new name."
     )]
     WindowStateUnverifiable {
         /// Selected profile name.
@@ -1961,6 +1959,18 @@ pub enum ValidationError {
         /// Stable label of the defect found.
         defect: &'static str,
     },
+
+    /// The selected network disagrees with authenticated spending state.
+    #[error(
+        "the profile network disagrees with authenticated spending state. Restore the profile's network, or create a profile under a new name."
+    )]
+    WindowChainMismatch,
+
+    /// Retained spending state lacks authenticated network provenance.
+    #[error(
+        "spending state has no complete authenticated network provenance. No verb recovers such state in this release; create a profile under a new name."
+    )]
+    WindowChainUnverifiable,
 
     /// An enabled installation needs its pinned owner's seed for a reset.
     #[error(
@@ -2228,6 +2238,8 @@ impl ValidationError {
             // the subsystem (fees.*) while the category stays Validation.
             Self::FeeAboveCap { .. } => "fees.percentile_exceeds_cap",
             Self::FeeTotalOverflow { .. } => "validation.fee_total_overflow",
+            Self::WindowChainMismatch => "policy.window_chain_mismatch",
+            Self::WindowChainUnverifiable => "policy.window_chain_unverifiable",
             Self::ResetWindowStateOwnerRequired { .. } => {
                 "profile.reset_window_state_owner_required"
             }
@@ -4160,10 +4172,22 @@ mod tests {
                 },
                 "profile.reset_window_state_newer_version",
             ),
+            (
+                ValidationError::WindowChainMismatch,
+                "policy.window_chain_mismatch",
+            ),
+            (
+                ValidationError::WindowChainUnverifiable,
+                "policy.window_chain_unverifiable",
+            ),
         ];
 
         for (variant, expected_code) in cases {
             let wallet_err = WalletError::Validation(match variant {
+                ValidationError::WindowChainMismatch => ValidationError::WindowChainMismatch,
+                ValidationError::WindowChainUnverifiable => {
+                    ValidationError::WindowChainUnverifiable
+                }
                 ValidationError::MainnetEnablementInvalid { binding } => {
                     ValidationError::MainnetEnablementInvalid { binding }
                 }
@@ -6012,7 +6036,7 @@ mod tests {
     }
 
     /// The mainnet window-state refusals name their codes, the defect or the
-    /// open count, and the reset remedy.
+    /// open count, and the available remedy.
     #[cfg(feature = "mainnet-write")]
     #[test]
     fn mainnet_window_state_refusals_carry_codes_and_remedy() {
@@ -6025,7 +6049,9 @@ mod tests {
         let text = unverifiable.to_string();
         assert!(text.contains("hmac_invalid"), "{text}");
         assert!(
-            text.contains("stellar-agent profile reset-window-state main --reason <reason>"),
+            text.contains(
+                "No verb recovers such state in this release; create a profile under a new name."
+            ),
             "{text}"
         );
         let open = WalletError::Validation(ValidationError::ResetWindowStateOpenAuthorizations {

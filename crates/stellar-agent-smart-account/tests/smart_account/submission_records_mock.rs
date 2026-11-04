@@ -582,6 +582,9 @@ async fn a_reservation_refused_at_pre_send_surfaces_as_the_gate_denial() {
                 &profile,
                 &[entry],
                 &SubmissionHold {
+                    chain_scope: stellar_agent_network::policy_state::ChainScope::for_chain(
+                        profile.chain_id,
+                    ),
                     id: "c".repeat(64),
                     tx_hash: "d".repeat(64),
                     source: "GAQAA5L65LSYH7CQ3VTJ7F3HHLGCL3DSLAR2Y47263D56MNNGHSQSTVY".to_owned(),

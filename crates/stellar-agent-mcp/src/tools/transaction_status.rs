@@ -107,6 +107,12 @@ impl WalletServer {
         // value-action row that submission never got to write, so the chain
         // key has to be available before anything is settled.
         let profile_name = self.profile_name_for_approval();
+        let window = PersistedWindowStore::for_profile(&profile_name);
+        let held = match self.open_reservation_for(&window, &args.tx_hash) {
+            Ok(held) => held,
+            Err(result) => return Ok(result),
+        };
+
         let audit_writer = match crate::tools::value_audit::require_value_audit_writer(
             &self.profile,
             &profile_name,
@@ -149,11 +155,6 @@ impl WalletServer {
             }
         };
 
-        let window = PersistedWindowStore::for_profile(&profile_name);
-        let held = match self.open_reservation_for(&window, &args.tx_hash) {
-            Ok(held) => held,
-            Err(result) => return Ok(result),
-        };
         let envelope_hash = receipt
             .as_ref()
             .map(|r| r.envelope_hash.clone())
@@ -189,10 +190,7 @@ impl WalletServer {
                     "stellar_transaction_status: reconciliation could not record the receipt"
                 ),
                 Ok(_) => {}
-                Err(e) => tracing::debug!(
-                    error = ?e,
-                    "stellar_transaction_status: reconciliation pass failed; the record stands"
-                ),
+                Err(e) => return Ok(business_error_result(e.submission_code(), e.to_string())),
             }
         }
 
@@ -297,8 +295,8 @@ impl WalletServer {
         match window.pending_reservations(&self.profile) {
             Ok(open) => Ok(open.into_iter().find(|r| r.tx_hash == tx_hash)),
             Err(e) => Err(business_error_result(
-                "submission.record_unavailable",
-                format!("the spending-window file could not be read: {e:?}"),
+                e.submission_code(),
+                format!("the spending-window file could not be read: {e}"),
             )),
         }
     }

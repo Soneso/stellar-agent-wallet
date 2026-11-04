@@ -870,6 +870,7 @@ fn seed_window(
     let window = PersistedWindowStore::at_path(home.join(format!("policy/{PROFILE}.window")));
     let now = stellar_agent_core::timefmt::now_unix_ms().unwrap();
     let res = SubmissionHold {
+        chain_scope: stellar_agent_network::policy_state::ChainScope::for_chain(profile.chain_id),
         id: id.to_owned(),
         tx_hash: TX_HASH.to_owned(),
         source: SOURCE.to_owned(),
@@ -1808,4 +1809,60 @@ async fn tx_status_repairs_a_post_send_receipt_failure_without_counting_twice() 
         stellar_agent_test_support::rpc_request_count(&server, "sendTransaction").await,
         1
     );
+}
+
+/// Status and acknowledged clear refuse an edited network before any RPC or final row.
+#[tokio::test]
+#[serial_test::serial]
+async fn chain_flip_cannot_clear_original_hold() {
+    let primary = MockServer::start().await;
+    let oracle = MockServer::start().await;
+    let rpc = FixedStatusRpc::new("FAILED");
+    rpc.mount(&primary).await;
+    rpc.mount(&oracle).await;
+    let home = tempfile::tempdir().unwrap();
+    fixture(home.path(), &primary.uri());
+    let path = home.path().join(format!("profiles/{PROFILE}.toml"));
+    let testnet = std::fs::read_to_string(&path).unwrap();
+    let mainnet = testnet
+        .replace("stellar:testnet", "stellar:mainnet")
+        .replace(&primary.uri(), "https://primary.example");
+    std::fs::write(&path, mainnet).unwrap();
+    let (window, original) = seed_window(home.path(), ENVELOPE_HASH, 7, 0);
+    std::fs::write(&path, testnet).unwrap();
+    let window_path = home.path().join(format!("policy/{PROFILE}.window"));
+    let before = std::fs::read(&window_path).unwrap();
+    let receipt_path = home.path().join(format!("receipts/{PROFILE}.json"));
+    let receipt_before = std::fs::read(&receipt_path).unwrap();
+    let audit_before = audit_rows(home.path());
+    for receipt_bytes in [receipt_before.as_slice(), b"unreadable receipt"] {
+        std::fs::write(&receipt_path, receipt_bytes).unwrap();
+        for arguments in [
+            vec!["tx", "status", TX_HASH],
+            vec!["tx", "receipt", "clear", ENVELOPE_HASH, "--acknowledge"],
+            vec![
+                "tx",
+                "receipt",
+                "clear",
+                ENVELOPE_HASH,
+                "--acknowledge",
+                "--acknowledge-unbounded",
+            ],
+        ] {
+            let mut arguments = arguments;
+            arguments.extend(["--profile", PROFILE]);
+            let (code, body) = run_cli(home.path(), &arguments);
+            assert_ne!(code, 0, "{body}");
+            assert_eq!(
+                body["error"]["code"], "policy.window_chain_mismatch",
+                "{body}"
+            );
+            assert_eq!(std::fs::read(&window_path).unwrap(), before);
+            assert_eq!(std::fs::read(&receipt_path).unwrap(), receipt_bytes);
+            assert_eq!(audit_rows(home.path()), audit_before);
+        }
+    }
+    assert_eq!(window.pending_reservations(&original).unwrap().len(), 1);
+    assert!(primary.received_requests().await.unwrap().is_empty());
+    assert!(oracle.received_requests().await.unwrap().is_empty());
 }

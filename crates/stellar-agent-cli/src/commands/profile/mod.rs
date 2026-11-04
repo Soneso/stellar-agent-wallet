@@ -163,12 +163,11 @@ pub enum ProfileSubcommand {
     /// the new key so its history is preserved (not invalidated) by
     /// rotation.
     RotatePolicyStateKey(rotate_policy_state_key::RotatePolicyStateKeyArgs),
-    /// Re-initialise the persisted policy-window-state store to empty.
+    /// Clear verified policy-window history.
     ///
-    /// Recovery path for an unreadable, tampered, or unparseable window-state
-    /// store: the stateful criteria (`per_period_cap`, `rate_limit`,
-    /// `bundle_per_period_cap`, `bundle_rate_limit`) fail closed until reset.
-    /// Discards accumulated history for the profile; the reset is audited.
+    /// An absent file with no protected generation establishes an empty store.
+    /// Unverifiable state refuses. No verb recovers such state in this release;
+    /// create a profile under a new name. The reset is audited.
     ResetWindowState(reset_window_state::ResetWindowStateArgs),
     /// Recover MPP state with an explicit acknowledgement and an audit row.
     ///

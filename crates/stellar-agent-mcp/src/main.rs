@@ -483,8 +483,8 @@ async fn main() {
 /// command here. The loader refuses a policy file without a `[signature]` table
 /// with a message that names `stellar-agent profile sign-policy` with the profile.
 /// A policy file that fails any other check gets no hint.
-/// Variants that carry their own recovery text, such as a policy-window store
-/// that must be reset, are logged as they are.
+/// Variants that carry their own refusal text, such as a policy-window store
+/// that fails its integrity check, are logged as they are.
 fn report_build_failure(err: &stellar_agent_core::policy::BuildRegistryError, profile_name: &str) {
     match build_failure_next_step(err, profile_name) {
         Some(next_step) => tracing::error!(

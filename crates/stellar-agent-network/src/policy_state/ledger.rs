@@ -54,9 +54,9 @@ use stellar_agent_core::profile::schema::Profile;
 
 use super::WindowStoreError;
 use super::store::{
-    PersistedWindowStore, RecordStatus, WireFile, WireRecord, admit, file_holds_id,
-    find_or_insert_bucket, generation_entry_ref, i128_decimal_str, now_ms, prune_stale,
-    select_wire_version,
+    PersistedWindowStore, RecordStatus, WIRE_VERSION_LEDGER, WIRE_VERSION_MAX, WireFile,
+    WireRecord, admit, file_holds_id, find_or_insert_bucket, generation_entry_ref,
+    i128_decimal_str, now_ms, prune_stale,
 };
 use crate::mainnet::digest::{BindingFacts, bindings_digest};
 use crate::mainnet::digest::{content_digest, entries_digest};
@@ -271,6 +271,9 @@ pub struct FeeBumpFacts {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SubmissionBinding {
+    /// The network for hashing and validating the submitted envelope.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chain_scope: Option<super::store::ChainScope>,
     /// Facts from a fee-bump envelope; absent for a transaction envelope.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fee_bump: Option<FeeBumpFacts>,
@@ -430,7 +433,9 @@ pub(super) struct WireAuthorizationHold {
 /// [`WindowStoreError::Invalid`] naming the first broken invariant.
 pub(super) fn validate(wire: &WireFile) -> Result<(), WindowStoreError> {
     let invalid = |detail: String| WindowStoreError::Invalid { detail };
-    if wire.version < 4 && (!wire.authorizations.is_empty() || !wire.holds.is_empty()) {
+    if wire.version < WIRE_VERSION_LEDGER
+        && (!wire.authorizations.is_empty() || !wire.holds.is_empty())
+    {
         return Err(invalid(format!(
             "a version {} snapshot carries authorization history",
             wire.version
@@ -854,10 +859,6 @@ fn check_profile_handle(
     check(
         auth.profile == stellar_agent_core::profile::name::profile_name_for_approval(profile),
         MainnetPrecondition::ProfileMismatch,
-    )?;
-    check(
-        auth.chain == profile.chain_id,
-        MainnetPrecondition::ChainMismatch,
     )
 }
 
@@ -923,6 +924,14 @@ fn check_consumption(
     binding: &ConsumptionBinding,
 ) -> Result<(), WindowStoreError> {
     use MainnetPrecondition as P;
+    if let ConsumptionBinding::Transaction(submission) = binding {
+        let scope = submission
+            .chain_scope
+            .ok_or(WindowStoreError::ChainUnverifiable)?;
+        if scope.chain() != auth.chain || Some(scope) != wire.chain_scope {
+            return Err(WindowStoreError::ChainMismatch);
+        }
+    }
     match (binding, &auth.binding) {
         (
             ConsumptionBinding::Transaction(submission),
@@ -1079,6 +1088,7 @@ fn apply_consumption(
     for hold in holds {
         let record = match binding {
             ConsumptionBinding::Transaction(submission) => WireRecord {
+                chain_scope: submission.chain_scope,
                 ts_ms: hold.ts_ms,
                 amount: hold.amount,
                 id: stellar_agent_core::hex::encode(&submission.envelope_hash),
@@ -1351,7 +1361,7 @@ impl PersistedWindowStore {
             invalidation: None,
         });
         prune_stale(&mut wire, now);
-        wire.version = select_wire_version(&wire);
+        wire.version = WIRE_VERSION_MAX;
         self.commit_generation(&key, &gen_entry, original, wire)?;
         drop(lock);
         Ok(MintedRecord {
@@ -1466,7 +1476,7 @@ impl PersistedWindowStore {
             });
         }
         prune_stale(&mut wire, now);
-        wire.version = select_wire_version(&wire);
+        wire.version = WIRE_VERSION_MAX;
         self.commit_generation(&key, &gen_entry, original, wire)?;
         drop(lock);
         Ok(receipts)
@@ -1482,10 +1492,9 @@ impl PersistedWindowStore {
     ///
     /// - [`WindowStoreError::AuthorizationRefused`] with
     ///   [`MainnetPrecondition::UnknownAuthorization`] for an unknown identity,
-    ///   and with [`MainnetPrecondition::ProfileMismatch`] or
-    ///   [`MainnetPrecondition::ChainMismatch`] when the supplied profile's
-    ///   name or chain is not the record's. On refusal the store file is not
-    ///   written.
+    ///   and with [`MainnetPrecondition::ProfileMismatch`] when the name is not the record's.
+    /// - [`WindowStoreError::ChainMismatch`] when the network is not the store's.
+    ///   On refusal the store file is not written.
     /// - Every integrity, keyring, lock, and I/O error of the store.
     pub fn invalidate_authorization(
         &self,
@@ -1515,7 +1524,7 @@ impl PersistedWindowStore {
         }
         if invalidated || swept {
             prune_stale(&mut wire, now);
-            wire.version = select_wire_version(&wire);
+            wire.version = WIRE_VERSION_MAX;
             self.commit_generation(&key, &gen_entry, original, wire)?;
         }
         drop(lock);
@@ -1851,6 +1860,7 @@ mod tests {
         fee_bump: Option<FeeBumpFacts>,
     ) -> ConsumptionBinding {
         ConsumptionBinding::Transaction(SubmissionBinding {
+            chain_scope: Some(crate::policy_state::ChainScope::for_chain(Caip2::Mainnet)),
             fee_bump,
             envelope_hash: tx_hash.map(|byte| byte ^ 0x5a),
             tx_hash,
@@ -1921,7 +1931,7 @@ mod tests {
         assert_eq!(reservation.profile(), l.name());
 
         let wire = l.wire();
-        assert_eq!(wire.version, 4);
+        assert_eq!(wire.version, 5);
         let record = l.record(minted.id);
         assert_eq!(record.state, AuthorizationState::Open);
         assert_eq!(record.domain, AuthorizationDomain::Transaction);
@@ -2160,6 +2170,9 @@ mod tests {
                 &l.profile,
                 &[hold(200)],
                 &SubmissionHold {
+                    chain_scope: crate::policy_state::ChainScope::for_chain(
+                        stellar_agent_core::profile::caip2::Caip2::Mainnet,
+                    ),
                     id: "a".repeat(64),
                     tx_hash: "b".repeat(64),
                     source: SOURCE.to_owned(),
@@ -3030,6 +3043,9 @@ mod tests {
                 &l.profile,
                 &[hold(1)],
                 &SubmissionHold {
+                    chain_scope: crate::policy_state::ChainScope::for_chain(
+                        stellar_agent_core::profile::caip2::Caip2::Mainnet,
+                    ),
                     id: "db".repeat(32),
                     tx_hash: "b".repeat(64),
                     source: SOURCE.to_owned(),
@@ -3188,7 +3204,7 @@ mod tests {
         let minted = l.mint(&request).unwrap();
         l.consume(&request, &minted, &consumption_of(&request.binding))
             .unwrap();
-        assert_eq!(l.wire().version, 4, "settled history keeps version 4");
+        assert_eq!(l.wire().version, 5, "settled history retains its scope");
 
         l.clock.set(T0 + RETENTION_MS);
         l.store.record_and_persist(&l.profile, &[hold(1)]).unwrap();
@@ -3205,7 +3221,10 @@ mod tests {
         l.store.record_and_persist(&l.profile, &[late]).unwrap();
         let wire = l.wire();
         assert!(wire.authorizations.is_empty());
-        assert_eq!(wire.version, 3, "an empty history is written as version 3");
+        assert_eq!(
+            wire.version, 5,
+            "pruning retains authenticated network scope"
+        );
         let body: serde_json::Value = serde_json::from_slice(&l.bytes()[32..]).unwrap();
         assert!(body.get("authorizations").is_none());
         assert!(body.get("holds").is_none());
@@ -3881,15 +3900,15 @@ mod tests {
         let mut other = l.profile.clone();
         other.chain_id = Caip2::Testnet;
         let before = l.bytes();
-        assert_eq!(
-            refusal(l.store.consume_authorization(
+        assert!(matches!(
+            l.store.consume_authorization(
                 &other,
                 minted.id,
                 &l.expect(&request, &minted),
                 &consumption_of(&request.binding)
-            )),
-            MainnetPrecondition::ChainMismatch
-        );
+            ),
+            Err(WindowStoreError::ChainMismatch)
+        ));
         assert_eq!(l.bytes(), before);
         l.consume(&request, &minted, &consumption_of(&request.binding))
             .unwrap();
@@ -3923,10 +3942,10 @@ mod tests {
         let mut other = l.profile.clone();
         other.chain_id = Caip2::Testnet;
         let before = l.bytes();
-        assert_eq!(
-            refusal(l.store.invalidate_authorization(&other, minted.id, "test")),
-            MainnetPrecondition::ChainMismatch
-        );
+        assert!(matches!(
+            l.store.invalidate_authorization(&other, minted.id, "test"),
+            Err(WindowStoreError::ChainMismatch)
+        ));
         assert_eq!(l.bytes(), before);
         l.consume(&request, &minted, &consumption_of(&request.binding))
             .unwrap();
@@ -4160,6 +4179,9 @@ mod tests {
             pending_since_ms: T0,
             submission_ledger: 1_000,
             operator_required: false,
+            chain_scope: crate::policy_state::ChainScope::for_chain(
+                stellar_agent_core::profile::caip2::Caip2::Mainnet,
+            ),
         };
         let pending = "cd".repeat(32);
         l.store
@@ -4276,7 +4298,8 @@ mod tests {
         parent.binding = soroban(1);
         parent.content_digest = parent.binding.content_digest();
         let wire = WireFile {
-            version: 4,
+            chain_scope: Some(crate::policy_state::ChainScope::for_chain(Caip2::Mainnet)),
+            version: 5,
             authorizations: vec![parent.clone()],
             ..WireFile::default()
         };
@@ -4333,6 +4356,49 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+    #[test]
+    #[serial]
+    fn consumption_requires_the_submission_scope() {
+        for scope in [
+            None,
+            Some(crate::policy_state::ChainScope::for_chain(Caip2::Testnet)),
+        ] {
+            let l = Ledger::new();
+            let request = l.request(tx(1), vec![hold(100)]);
+            let minted = l.mint(&request).unwrap();
+            let mut binding = consumption_of(&request.binding);
+            let ConsumptionBinding::Transaction(submission) = &mut binding else {
+                panic!("transaction fixture")
+            };
+            submission.chain_scope = scope;
+            let before = l.bytes();
+            let generation = keyring_core::Entry::new(
+                &generation_entry_ref(&l.profile).service,
+                &generation_entry_ref(&l.profile).account,
+            )
+            .unwrap()
+            .get_password()
+            .unwrap();
+            let result = l.consume(&request, &minted, &binding);
+            if scope.is_none() {
+                assert!(matches!(result, Err(WindowStoreError::ChainUnverifiable)));
+            } else {
+                assert!(matches!(result, Err(WindowStoreError::ChainMismatch)));
+            }
+            assert_eq!(l.bytes(), before);
+            assert_eq!(
+                keyring_core::Entry::new(
+                    &generation_entry_ref(&l.profile).service,
+                    &generation_entry_ref(&l.profile).account
+                )
+                .unwrap()
+                .get_password()
+                .unwrap(),
+                generation
+            );
+            assert_eq!(l.record(minted.id).state, AuthorizationState::Open);
         }
     }
 }

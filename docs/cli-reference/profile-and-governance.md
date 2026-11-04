@@ -138,6 +138,11 @@ On a no-op it reports `status` `no_op` and the current version; on a migration i
 {"ok":true,"data":{"status":"migrated","from_version":1,"to_version":2,"path":"..."},"request_id":"..."}
 ```
 
+Profile migration updates the TOML schema. It does not migrate authenticated
+spending state or establish a network for its history. State with no authenticated
+network history refuses; editing the profile or receipt does not migrate it.
+No verb recovers such state in this release; create a profile under a new name.
+
 A refused migration exits `1`, writes nothing, and leaves the v1 file unchanged:
 
 - `validation.profile_not_found` if the profile file does not exist.
@@ -541,7 +546,7 @@ Each rotation subcommand generates a fresh 32-byte secret from the OS CSPRNG, en
 | `rotate-attestation-key` | approval-spine attestation HMAC key (`attestation_key_id`) | 32-byte HMAC | All pending approvals are invalidated; the simulate-and-approve round trip must be re-run. |
 | `rotate-audit-key` | audit-log chain-root HMAC key (`audit_log_hash_chain_key_id`) | 32-byte HMAC | Before any key write, rotation checks the log's entry tags under the old key and refuses with that check's code (`audit.entry_tag_invalid` among them). It then persists the new key, switches the held writer to it, and appends `audit_entry_tags_rekeyed` (cause `rotation`) once entry tags are in force, then its `keyring_key_written` row, both tagged under the new key. No log file is rewritten; an interrupted rotation is repaired at the next keyed open with an `open_repair` rekey row. Rotation re-signs every existing per-file chain-root sidecar with the new key. `audit verify` passes under the new key, and the old key stops verifying. Takes the audit writer's exclusive lock, so it refuses while an MCP server holds that writer, and checks the tip anchor before touching the key. Checks the audit binding before it opens the writer: a changed binding refuses with `audit.log_binding_changed` and creates nothing at the path the profile names; an absent one is recorded. Mints a key only where no entry exists: a stored key it cannot read or decode refuses before anything is written, with the read failure's code or `internal.unexpected_state` (`audit.key_decode_failed`, `audit.key_length_error`). Investigate; if the stored audit key is corrupt, restore it from a copy of that keyring entry. A first mint applies only to a log without entry tags: on a log whose entry tags are in force or whose active file holds a tagged row, a rotation without the key refuses with `audit.chain_key_unavailable` and writes no key. A tagged log without a copy of its key is moved aside as evidence before a new key is minted (see [Audit-log recovery](../maintainers/audit-log-recovery.md#10-unreadable-or-undecodable-audit-key)). |
 | `rotate-nonce-key` | HMAC nonce key (`mcp_nonce_key_alias`) | 32-byte HMAC | All outstanding nonces minted with the old key are invalidated. |
-| `rotate-policy-state-key` | policy-window-state HMAC key (`policy_window_state_key_id`) | 32-byte HMAC | The persisted window-state store is re-signed under the new key, so accumulated `per_period_cap` / `rate_limit` history is preserved, not invalidated. Rotation is refused if the store file does not verify under the current key (run `reset-window-state` instead). |
+| `rotate-policy-state-key` | policy-window-state HMAC key (`policy_window_state_key_id`) | 32-byte HMAC | The persisted window-state store is re-signed under the new key, so accumulated `per_period_cap` / `rate_limit` history is preserved, not invalidated. Rotation refuses if the store file does not verify under the current key. Integrity failures and missing authenticated network provenance have no recovery verb in this release; create a profile under a new name. Before rotation, file I/O failures refuse without changing state; retry after access is restored. |
 
 All of the above mint raw 32-byte HMAC keys.
 
@@ -578,9 +583,8 @@ It refuses mainnet conflicts with `profile.key_scope_conflict` and warns on test
 
 ### `reset-window-state <NAME> --reason <REASON>`
 
-`profile reset-window-state` clears persisted policy-window history after
-recovery from corruption or rollback. Stop the MCP server and repair the audit
-log first. The command requires a usable keyed audit writer on every network,
+`profile reset-window-state` clears verifiable persisted policy-window history.
+Stop the MCP server and repair the audit log first. The command requires a usable keyed audit writer on every network,
 including testnet. It acquires that writer before the window-store lock and
 writes the reset row before minting a key, advancing the generation or replacing
 the store. A reset whose row cannot be written does not happen.
@@ -618,12 +622,18 @@ The `policy_window_state_reset` row carries the profile's chain, reason and
 live confirmed and pending counts and totals, scope specificity, bucket and
 window, plus generations before and after. Pending records count regardless of
 age. At most eight buckets appear, with bounded identifiers and a truncation flag;
-the entry count covers all live records. Missing or unverifiable stores report
-no totals. A store is unverifiable when its file fails its HMAC, does not parse,
-breaks the supported format's invariants, or holds an authentic older generation.
-It is also unverifiable without a usable key: an absent key, a key that is not
-valid base64, or a key that is not 32 bytes. The reset replaces such a key after
-the row. A store file that exists but cannot be read refuses before the row.
+the entry count covers all live records. An absent file with no protected
+generation establishes a new empty store and reports no totals.
+
+A missing file with protected history, an unusable key, an integrity failure,
+or a generation mismatch refuses before the recorder and changes no file, key,
+or generation. No verb recovers such state in this release; create a profile
+under a new name. A different authenticated network refuses with
+`policy.window_chain_mismatch`. Restore the profile's network, or create a
+profile under a new name. Incomplete authenticated network provenance
+refuses with `policy.window_chain_unverifiable`, including decoded versions 1 to 4.
+No verb recovers missing provenance in this release; create a profile under a new name.
+File I/O failures refuse without changing state; retry after access is restored.
 An authenticated newer format version refuses on every chain with
 `profile.reset_window_state_newer_version` and changes nothing; use the build
 that wrote it. The reset releases expired authorizations in memory before it
@@ -637,11 +647,13 @@ An append failure also refuses with its audit code, leaving the window file,
 key and generation untouched. A first-use key mint is recorded through the held
 writer after the reset row, including when the later store write fails.
 
-A failure after the row but before the generation write leaves the store
-unchanged; the row's `generation_after` exceeds the keyring generation.
-After the generation write but before the file write, the generation matches
-the row while the old body remains. Its next load refuses a generation mismatch.
-Rerun reset after repairing the audit log and stopping the MCP server.
+A failure after the row but before the generation write leaves the old store
+readable; the row's `generation_after` exceeds the keyring generation. Run reset
+again. Once the generation is written, the empty store is committed, even when
+the file still carries the old body beside it. A first reset, with no store file,
+writes the generation before the file. A failure between those two writes leaves
+a missing file with a committed generation. Reset refuses that state.
+No verb recovers such state in this release; create a profile under a new name.
 The reset is complete when the next command that opens the window store loads
 the empty store at `generation_after`. On a V1 profile, a value-moving command
 and the MCP server's start open it. Generation equality alone does not establish
@@ -656,8 +668,8 @@ An uncovered tail can still be read by that binary with both fields dropped.
 If it then appends a row, this release refuses the extended log at that row.
 
 ```bash
-stellar-agent profile reset-window-state default --reason "store file corrupted after disk failure"
-stellar-agent profile reset-window-state operator --reason "store file corrupted after disk failure" --owner-secret-env WALLET_OWNER_SK
+stellar-agent profile reset-window-state default --reason "clear verified window history"
+stellar-agent profile reset-window-state operator --reason "clear verified window history" --owner-secret-env WALLET_OWNER_SK
 ```
 
 ### `reset-mpp-state <NAME> --acknowledge --reason <REASON>`

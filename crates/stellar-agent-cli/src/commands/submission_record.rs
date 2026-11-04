@@ -331,7 +331,11 @@ pub(crate) fn settlement_oracle_in(
     profile: &Profile,
     context: &NetworkContext,
 ) -> Option<StellarRpcClient> {
-    if !profile.chain_id.is_mainnet() {
+    let name = stellar_agent_core::profile::name::derive_profile_name_from_owner_key(profile)?;
+    let scope = PersistedWindowStore::for_profile(name)
+        .chain_scope(profile)
+        .ok()?;
+    if !scope.chain().is_mainnet() {
         return None;
     }
     match context.oracle_client(profile) {

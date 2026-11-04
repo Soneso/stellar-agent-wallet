@@ -248,6 +248,7 @@ pub async fn submit_transaction_and_wait(
 
     let (source, sequence) = replay_identity(&envelope)?;
     let intent = SubmissionIntent {
+        chain_scope: crate::policy_state::ChainScope::from_passphrase(network_passphrase)?,
         envelope_hash: envelope_hash_hex(envelope_xdr),
         tx_hash: tx_hash_hex,
         source,
@@ -455,6 +456,9 @@ pub(crate) async fn authorized_submission(
 
     let (source, sequence) = replay_identity(&envelope)?;
     let intent = SubmissionIntent {
+        chain_scope: crate::policy_state::ChainScope::for_chain(
+            stellar_agent_core::profile::caip2::Caip2::Mainnet,
+        ),
         envelope_hash: envelope_hash_hex(envelope_xdr),
         tx_hash: tx_hash_hex,
         source,
@@ -2083,6 +2087,9 @@ mod tests {
 
     fn poll_intent() -> SubmissionIntent {
         SubmissionIntent {
+            chain_scope: crate::policy_state::ChainScope::for_chain(
+                stellar_agent_core::profile::caip2::Caip2::Testnet,
+            ),
             envelope_hash: "ab".repeat(32),
             tx_hash: "cd".repeat(32),
             source: "GBPXXOA5N4JYPESHAADMQKBPWZWQDQ64ZV6ZL2S3LAGW4SY7NTCMWIVL".to_owned(),

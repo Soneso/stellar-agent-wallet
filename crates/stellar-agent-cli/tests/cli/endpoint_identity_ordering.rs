@@ -388,6 +388,9 @@ fn v1_profile_with_due_reservation(home: &Path, name: &str, rpc_url: &str, sourc
                 },
             )],
             &SubmissionHold {
+                chain_scope: stellar_agent_network::policy_state::ChainScope::for_chain(
+                    profile.chain_id,
+                ),
                 id: "7".repeat(64),
                 tx_hash: "7".repeat(64),
                 source: source.to_owned(),

@@ -123,6 +123,9 @@ fn entry(profile_name: &str, ts_ms: u64, amount: i128) -> WindowEntry {
 
 fn reservation(id: &str, source: &str, sequence: i64, pending_since_ms: u64) -> SubmissionHold {
     SubmissionHold {
+        chain_scope: stellar_agent_network::policy_state::ChainScope::for_chain(
+            stellar_agent_core::profile::caip2::Caip2::Testnet,
+        ),
         id: id.to_owned(),
         tx_hash: id.to_owned(),
         source: source.to_owned(),
@@ -298,6 +301,12 @@ fn account_at_sequence(source: &str, sequence: i64) -> serde_json::Value {
 
 impl Fixture {
     fn take_reservation(&self, now: u64, reservation: &SubmissionHold, amount: i128) {
+        let reservation = &SubmissionHold {
+            chain_scope: stellar_agent_network::policy_state::ChainScope::for_chain(
+                self.profile.chain_id,
+            ),
+            ..reservation.clone()
+        };
         self.window
             .record_pending(
                 &self.profile,
@@ -3430,4 +3439,70 @@ async fn a_mainnet_oracle_whose_identity_answers_late_settles_nothing() {
         ReconcileFailureKind::OracleIdentityUnavailable
     );
     assert_eq!(endpoints.oracle_counts.count("getTransaction"), 0);
+}
+
+/// An edited profile cannot select weaker settlement trust for an admitted debit.
+#[tokio::test]
+#[serial]
+async fn chain_flip_refuses_before_reconciliation() {
+    let fx = mainnet_fixture("chain-flip");
+    let now = now_ms();
+    let hold = reservation(
+        &"ca".repeat(32),
+        &account_id_for_seed([0x33; 32]),
+        7,
+        due_since(now),
+    );
+    fx.take_reservation(now, &hold, 500);
+    let before = std::fs::read(fx._dir.path().join("chain-flip.window")).unwrap();
+    let receipt = std::fs::read(&fx.receipt_file).unwrap();
+    let primary = MockServer::start().await;
+    let oracle = MockServer::start().await;
+    let counts = MethodCounts::default();
+    mount(
+        &primary,
+        "getTransaction",
+        get_transaction("FAILED"),
+        &counts,
+    )
+    .await;
+    mount(
+        &oracle,
+        "getTransaction",
+        get_transaction("FAILED"),
+        &counts,
+    )
+    .await;
+    let client = StellarRpcClient::new(&primary.uri()).unwrap();
+    let witness = StellarRpcClient::new(&oracle.uri()).unwrap();
+    let mut edited = fx.profile.clone();
+    edited.chain_id = stellar_agent_core::profile::caip2::Caip2::Testnet;
+    for result in [
+        fx.window
+            .reconcile_one(
+                &edited,
+                &client,
+                Some(&witness),
+                Some(&fx.receipts),
+                &hold.id,
+                now,
+            )
+            .await,
+        fx.window
+            .reconcile_due(&edited, &client, Some(&witness), Some(&fx.receipts), now, 5)
+            .await,
+    ] {
+        assert!(matches!(
+            result,
+            Err(stellar_agent_network::policy_state::WindowStoreError::ChainMismatch)
+        ));
+    }
+    assert!(primary.received_requests().await.unwrap().is_empty());
+    assert!(oracle.received_requests().await.unwrap().is_empty());
+    assert_eq!(
+        std::fs::read(fx._dir.path().join("chain-flip.window")).unwrap(),
+        before
+    );
+    assert_eq!(std::fs::read(&fx.receipt_file).unwrap(), receipt);
+    assert_eq!(fx.window_total(now), (500, 1));
 }

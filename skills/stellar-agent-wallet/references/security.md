@@ -49,7 +49,7 @@ seed in every build. With the flag, the row records that owner's signature
 over the profile, chain, store digest, generations, bounded reason and request id.
 Owner and pin refusals write no reset row and change no store state.
 The `profile` section of `./cli-reference.md` describes the row, the refusals,
-the failure windows and the recovery.
+the failure windows.
 
 The reset requires a current tip anchor before and after its row. If repair
 fails, `audit.chain_key_unavailable` carries `audit.tip_anchor_unavailable`,

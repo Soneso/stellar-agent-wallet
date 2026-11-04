@@ -176,6 +176,9 @@ fn seed_reservation(profile: &Profile, profile_name: &str, sequence: i64) -> Per
                 },
             )],
             &SubmissionHold {
+                chain_scope: stellar_agent_network::policy_state::ChainScope::for_chain(
+                    profile.chain_id,
+                ),
                 id: ENVELOPE_HASH.to_owned(),
                 tx_hash: TX_HASH.to_owned(),
                 source: SOURCE.to_owned(),
@@ -502,4 +505,81 @@ async fn a_release_reason_left_by_a_gate_pass_is_written_by_transaction_status()
     assert_eq!(failed.len(), 1, "{failed:?}");
     assert_eq!(failed[0]["code"], "submission.sequence_consumed");
     assert_eq!(rpc.sends(), 0, "neither call sends");
+}
+
+/// Both the status read and the V1 refresh preserve a foreign network's history.
+#[tokio::test]
+#[serial]
+async fn chain_flip_refuses_status_without_rpc_or_state_changes() {
+    let _data_root = crate::common::isolated_data_root();
+    keyring_mock::install().unwrap();
+    let rpc = StatusRpc::new("FAILED", 1);
+    let primary = rpc.endpoint().await;
+    let edited = status_profile(&primary.uri(), "acct-status-chain-scope");
+    let mut server = WalletServer::new(edited.clone()).unwrap();
+    let name = server.profile_name_for_approval();
+    let mut original = edited.clone();
+    original.chain_id = stellar_agent_core::profile::caip2::Caip2::Mainnet;
+    original.rpc_url = "https://primary.example".to_owned();
+    let window = seed_reservation(&original, &name, ACCOUNT_SEQUENCE + 1);
+    seed_receipt(&name, ACCOUNT_SEQUENCE + 1, 0);
+    let receipts = ReceiptStore::open(&name).unwrap();
+    let before = std::fs::read(
+        stellar_agent_core::profile::schema::default_policy_window_state_path_for(&name),
+    )
+    .unwrap();
+    let receipt_before = std::fs::read(receipts.file_path().unwrap()).unwrap();
+    let audit_before = std::fs::read(&edited.audit_log_path).ok();
+    let entry = &edited.policy_window_state_key_id;
+    let key_before = keyring_core::Entry::new(&entry.service, &entry.account)
+        .unwrap()
+        .get_password()
+        .unwrap();
+    let generation =
+        keyring_core::Entry::new(&entry.service, &format!("{}-generation", entry.account)).unwrap();
+    let generation_before = generation.get_password().unwrap();
+    for v1 in [false, true] {
+        if v1 {
+            server.set_policy_engine_for_test(Arc::new(capped_engine(&name)));
+        }
+        for bytes in [receipt_before.as_slice(), b"unreadable receipt"] {
+            std::fs::write(receipts.file_path().unwrap(), bytes).unwrap();
+            let result = server
+                .call_stellar_transaction_status(StellarTransactionStatusArgs {
+                    chain_id: "stellar:testnet".to_owned(),
+                    tx_hash: TX_HASH.to_owned(),
+                })
+                .await
+                .unwrap();
+            assert_eq!(result.is_error, Some(true));
+            let json: Value =
+                serde_json::from_str(&result.content[0].as_text().unwrap().text).unwrap();
+            assert_eq!(
+                json["error"]["code"], "policy.window_chain_mismatch",
+                "{json}"
+            );
+            assert!(!json.to_string().contains("reset-window-state"));
+            assert_eq!(
+                std::fs::read(
+                    stellar_agent_core::profile::schema::default_policy_window_state_path_for(
+                        &name
+                    )
+                )
+                .unwrap(),
+                before
+            );
+            assert_eq!(std::fs::read(receipts.file_path().unwrap()).unwrap(), bytes);
+            assert_eq!(std::fs::read(&edited.audit_log_path).ok(), audit_before);
+            assert_eq!(
+                keyring_core::Entry::new(&entry.service, &entry.account)
+                    .unwrap()
+                    .get_password()
+                    .unwrap(),
+                key_before
+            );
+            assert_eq!(generation.get_password().unwrap(), generation_before);
+        }
+    }
+    assert!(primary.received_requests().await.unwrap().is_empty());
+    assert_eq!(window.pending_reservations(&original).unwrap().len(), 1);
 }

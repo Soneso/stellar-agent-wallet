@@ -675,6 +675,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   its parsing buffer before it signs, and a wallet-backed signer signs without
   building a second key. The documentation states which copies the lock covers
   and which it does not.
+- Spending state authenticates its original network and refuses reconciliation
+  under a different profile network. Legacy state without authenticated network
+  history refuses automatic migration.
 
 - No public function of a build without the `test-helpers` feature writes a
   pin the caller composes. The typed policy pin writer is internal to the core

@@ -1837,13 +1837,17 @@ impl WalletServer {
             let profile_name = self.profile_name_for_approval();
             let window_store = self.window_store.clone();
             if let Err(e) = window_store.load_into(&profile_name, self.security_profile(), store) {
+                if e.chain_validation_error().is_some() {
+                    return Err(ToolError::Business(business_error_result(
+                        e.submission_code(),
+                        e.to_string(),
+                    )));
+                }
                 return Err(ToolError::Business(business_error_result(
                     "policy.engine_required",
-                    format!(
-                        "policy window-state store failed to refresh ({e}); stop the MCP server, \
-                         then run `profile reset-window-state {profile_name} --reason <reason>` \
-                         to recover; the running server holds the audit writer"
-                    ),
+                    e.with_recovery_notice(format!(
+                        "policy window-state store failed to refresh ({e})"
+                    )),
                 )));
             }
         }

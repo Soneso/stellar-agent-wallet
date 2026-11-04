@@ -896,15 +896,14 @@ The policy-file owner key is NOT rotated here — it is an ed25519 key enrolled 
 | `rotate-audit-key` | audit-log chain-root HMAC (`audit_log_hash_chain_key_id`) | Before any key write, checks the log's entry tags under the old key and refuses with that check's code (`audit.entry_tag_invalid` among them). Once entry tags are in force it appends `audit_entry_tags_rekeyed` (cause `rotation`) under the new key before its `keyring_key_written` row; an interrupted rotation is repaired at the next keyed open. Re-signs every existing per-file chain-root sidecar with the new key, so `audit verify <LOG_PATH> --profile <NAME>` stays green and the old key stops verifying. Adds `key_kind:"hmac_32_bytes"` and `sidecars_resigned`. Takes the audit writer's exclusive lock, so it refuses while an MCP server holds the writer. A changed audit binding refuses with `audit.log_binding_changed` before the writer opens. |
 | `rotate-nonce-key` | HMAC nonce key (`mcp_nonce_key_alias`) | Invalidates outstanding nonces. Returns only `profile` + `rotated`. |
 | `rotate-counterparty-key` | `stellar.toml` cache-integrity HMAC (`counterparty_cache_key_id`) | Invalidates cached bindings. `counterparty refresh <domain>` rewrites one binding, and `counterparty warm-up` refreshes only the `HOME_DOMAIN` entries of the policy allowlist. Adds `key_kind:"hmac_32_bytes"` and `cache_invalidated:true`. |
-| `rotate-policy-state-key` | policy-window-state HMAC (`policy_window_state_key_id`) | Re-signs the persisted window-state store under the new key, so accumulated `per_period_cap` / `rate_limit` history is preserved, not invalidated. Refused if the store does not verify under the current key (use `reset-window-state` instead). Adds `key_kind:"hmac_32_bytes"`. |
+| `rotate-policy-state-key` | policy-window-state HMAC (`policy_window_state_key_id`) | Re-signs the persisted window-state store under the new key, so accumulated `per_period_cap` / `rate_limit` history is preserved, not invalidated. Rotation refuses if the store does not verify under the current key. Integrity failures and missing authenticated network provenance have no recovery verb in this release; create a profile under a new name. Before rotation, file I/O failures refuse without changing state; retry after access is restored. Adds `key_kind:"hmac_32_bytes"`. |
 
 ```bash
 stellar-agent profile rotate-attestation-key default
 ```
 
-`profile reset-window-state` clears persisted policy-window history after
-recovery from corruption or rollback. Stop the MCP server and repair the audit
-log first. The command requires a usable keyed audit writer on every network,
+`profile reset-window-state` clears verified persisted policy-window history.
+Stop the MCP server and repair the audit log first. The command requires a usable keyed audit writer on every network,
 including testnet. It acquires that writer before the window-store lock and
 writes the reset row before minting a key, advancing the generation or replacing
 the store. A reset whose row cannot be written does not happen.
@@ -942,12 +941,22 @@ The `policy_window_state_reset` row carries the profile's chain, reason and
 live confirmed and pending counts and totals, scope specificity, bucket and
 window, plus generations before and after. Pending records count regardless of
 age. At most eight buckets appear, with bounded identifiers and a truncation flag;
-the entry count covers all live records. Missing or unverifiable stores report
-no totals. A store is unverifiable when its file fails its HMAC, does not parse,
-uses an unsupported format version, or holds an authentic older generation.
-It is also unverifiable without a usable key: an absent key, a key that is not
-valid base64, or a key that is not 32 bytes. The reset replaces such a key after
-the row. A store file that exists but cannot be read refuses before the row.
+the entry count covers all live records. An absent file with no protected
+generation establishes a new empty store and reports no totals.
+
+A missing file with protected history, an unusable key, an integrity failure,
+or a generation mismatch refuses before the recorder and changes no file, key,
+or generation. No verb recovers such state in this release; create a profile
+under a new name. A different authenticated network refuses with
+`policy.window_chain_mismatch`. Restore the profile's network, or create a
+profile under a new name. Incomplete authenticated network provenance
+refuses with `policy.window_chain_unverifiable`, including decoded versions 1 to 4.
+No verb recovers missing provenance in this release; create a profile under a new name.
+File I/O failures refuse without changing state; retry after access is restored.
+An authenticated newer format version refuses on every chain with
+`profile.reset_window_state_newer_version` and changes nothing; use the build
+that wrote it. The reset releases expired authorizations in memory before it
+writes the row.
 
 An MCP server acquires the profile's audit writer at the first operation that
 needs it, such as a commit preflight. It normally holds the writer until the
@@ -957,11 +966,13 @@ An append failure also refuses with its audit code, leaving the window file,
 key and generation untouched. A first-use key mint is recorded through the held
 writer after the reset row, including when the later store write fails.
 
-A failure after the row but before the generation write leaves the store
-unchanged; the row's `generation_after` exceeds the keyring generation.
-After the generation write but before the file write, the generation matches
-the row while the old body remains. Its next load refuses a generation mismatch.
-Rerun reset after repairing the audit log and stopping the MCP server.
+A failure after the row but before the generation write leaves the old store
+readable; the row's `generation_after` exceeds the keyring generation. Run reset
+again. Once the generation is written, the empty store is committed, even when
+the file still carries the old body beside it. A first reset, with no store file,
+writes the generation before the file. A failure between those two writes leaves
+a missing file with a committed generation. Reset refuses that state.
+No verb recovers such state in this release; create a profile under a new name.
 The reset is complete when the next command that opens the window store loads
 the empty store at `generation_after`. On a V1 profile, a value-moving command
 and the MCP server's start open it. Generation equality alone does not establish

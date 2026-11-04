@@ -1665,7 +1665,8 @@ impl WalletServer {
     /// unknown, as it does when the oracle cannot be reached.
     pub(crate) fn settlement_oracle(&self) -> Option<stellar_agent_network::StellarRpcClient> {
         let profile = self.security_profile();
-        if !profile.chain_id.is_mainnet() {
+        let scope = self.window_store.chain_scope(profile).ok()?;
+        if !scope.chain().is_mainnet() {
             return None;
         }
         match self.context.oracle_client(profile) {

@@ -3826,6 +3826,9 @@ mod tests {
                             auth.id(),
                             &auth.consume_expect(&facts),
                             &ConsumptionBinding::Transaction(SubmissionBinding {
+                                chain_scope: Some(crate::policy_state::ChainScope::for_chain(
+                                    stellar_agent_core::profile::caip2::Caip2::Mainnet,
+                                )),
                                 fee_bump: None,
                                 envelope_hash:
                                     stellar_agent_core::approval::subject::approval_subject_classic(

@@ -476,7 +476,7 @@ where
         match build_v1_policy_engine("vault", &profile.policy.engine, &profile, &profile_name) {
             Ok(pe) => pe,
             Err(msg) => {
-                render_json(&Envelope::<()>::err_raw("policy.engine_unavailable", msg));
+                render_json(&Envelope::<()>::err_raw(msg.code(), msg.to_string()));
                 return 1;
             }
         };
@@ -889,7 +889,7 @@ where
         match build_v1_policy_engine("vault", &profile.policy.engine, &profile, &profile_name) {
             Ok(pe) => pe,
             Err(msg) => {
-                render_json(&Envelope::<()>::err_raw("policy.engine_unavailable", msg));
+                render_json(&Envelope::<()>::err_raw(msg.code(), msg.to_string()));
                 return 1;
             }
         };

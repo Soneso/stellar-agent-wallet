@@ -423,7 +423,7 @@ pub async fn run(args: &MulticallArgs) -> i32 {
     let policy_engine = match load_v1_policy_engine("multicall", &profile, &profile_name) {
         Ok(engine) => engine,
         Err(msg) => {
-            render_json(&Envelope::<()>::err_raw("policy.engine_unavailable", msg));
+            render_json(&Envelope::<()>::err_raw(msg.code(), msg.to_string()));
             return 1;
         }
     };

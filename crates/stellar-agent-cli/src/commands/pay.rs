@@ -980,7 +980,7 @@ async fn evaluate_staged_pay_policy(
             Ok(pe) => pe,
             Err(msg) => {
                 print_error(
-                    &Envelope::<()>::err_raw("policy.engine_unavailable", msg),
+                    &Envelope::<()>::err_raw(msg.code(), msg.to_string()),
                     args.output,
                 );
                 return Err(1);
@@ -1829,7 +1829,7 @@ fn evaluate_pay_policy(
             Ok(pe) => pe,
             Err(msg) => {
                 print_error(
-                    &Envelope::<()>::err_raw("policy.engine_unavailable", msg),
+                    &Envelope::<()>::err_raw(msg.code(), msg.to_string()),
                     args.output,
                 );
                 return Err(1);

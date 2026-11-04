@@ -108,21 +108,18 @@
 //! silently truncated by a JSON-number-as-f64 reader. The body also carries a
 //! `generation: u64` field; see "Anti-rollback" below.
 //!
-//! The version is chosen from each snapshot's content. Version 3 is the
-//! compact form: the buckets with the operator marker and an optional
-//! prepared settlement. Version 4 adds the mainnet authorization ledger of
-//! [`ledger`]: the authorization records and the holds of the open ones, both
-//! omitted when empty. A snapshot is written as version 4 whenever its
-//! authorization history is non-empty, settled records included, and as
-//! version 3 once pruning has emptied that history. A version 4 file with an
-//! empty history is read; no writer produces one.
+//! Version 5 authenticates a [`ChainScope`] on the snapshot, each pending
+//! debit, and each transaction consumption binding. Its canonical chain and
+//! passphrase hash identify one accounting authority, including both sides of
+//! a prepared commit. Pruning retains that authority even with no live debits.
 //!
-//! Versions 1 to 4 are read for the current snapshot, and versions 3 and 4 for
-//! a prepared successor, in every pairing. A snapshot below version 4 that
-//! carries authorization history, or history that breaks a ledger invariant,
-//! refuses the read. A legacy current snapshot keeps its version in the
-//! prepared container. In versions 1 and 2, absent status means confirmed
-//! spend and an absent operator marker means automatic selection.
+//! Versions 1 through 4 decode for integrity checks. An existing snapshot is
+//! usable only with complete authenticated scope for all retained history and
+//! any prepared successor. A missing scope refuses automatic migration,
+//! including an empty snapshot with a committed generation. Profile TOML and
+//! receipts cannot establish provenance. Only an absent file and absent
+//! protected generation establish a new authority.
+//! No verb recovers such state in this release; create a profile under a new name.
 //!
 //! # Integrity
 //!
@@ -150,14 +147,18 @@
 //! suffixing `-generation` onto its `account` field, same `service` — holds a
 //! monotonic generation and a SHA-256 commitment to its canonical body, updated
 //! together. Numeric counters remain readable for version 1 and 2 files.
-//! Appending a debit commits the trusted state before replacing the file, so
-//! failure cannot expose a smaller total. Settlement writes both the current
-//! and candidate snapshots before committing the candidate's generation and
-//! digest; either crash checkpoint retains an authenticated, readable state.
-//! An abandoned candidate cannot substitute for a different committed body
-//! sharing its generation. Readers reject missing, rolled-back, or substituted
-//! state. Initialisation and reset also commit the counter first and fail closed
-//! if their file write fails. Key rotation re-signs the existing body while
+//! A settled debit, recorded by
+//! [`record_and_persist`](PersistedWindowStore::record_and_persist) or
+//! [`record_authorized`](PersistedWindowStore::record_authorized), commits the
+//! trusted state before replacing the file, so a failed write refuses later
+//! spends. A pending record, the settlement of a reservation and a verified
+//! reset commit through the prepared image: they write both the current and
+//! candidate snapshots before committing the candidate's generation and digest,
+//! so a failed write leaves an authenticated, readable store at either crash
+//! checkpoint. An abandoned candidate cannot substitute for a different committed
+//! body sharing its generation. Readers reject missing, rolled-back, or
+//! substituted state. Initialisation also commits the counter first and fails
+//! closed if its file write fails. Key rotation re-signs the existing body while
 //! preserving its trusted commitment.
 //!
 //! # Concurrency
@@ -193,7 +194,7 @@ pub use ledger::{
     WindowReservation,
 };
 pub use store::{
-    MintOutcome, POLICY_STATE_KEY_FIELD, PersistedWindowStore, RECONCILE_BUDGET,
+    ChainScope, MintOutcome, POLICY_STATE_KEY_FIELD, PersistedWindowStore, RECONCILE_BUDGET,
     RECONCILE_MIN_AGE_MS, ReconcileFailure, ReconcileFailureKind, ReconcileReport, ResetError,
     ResetOutcome, ResetRecord, SettledSubmission, StateDefect, SubmissionHold,
 };
@@ -283,6 +284,18 @@ pub fn record_authorized_window_state(
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum WindowStoreError {
+    /// The selected network disagrees with authenticated spending state.
+    #[error(
+        "the profile network disagrees with authenticated spending state. Restore the profile's network, or create a profile under a new name."
+    )]
+    ChainMismatch,
+
+    /// Retained state has no complete authenticated network provenance.
+    #[error(
+        "spending state has no complete authenticated network provenance. No verb recovers such state in this release; create a profile under a new name."
+    )]
+    ChainUnverifiable,
+
     /// Another process or task holds the exclusive write lock.
     #[error("policy window-state store writer is locked by another process")]
     WriterLocked,
@@ -325,12 +338,10 @@ pub enum WindowStoreError {
     ///
     /// For a mainnet profile in a build with mainnet writes, this condition,
     /// like every other unverifiable state, refuses as
-    /// `MainnetStateUnverifiable` naming its defect instead; the reset is the
-    /// remedy there too, and refuses while a verifiable store still holds an
-    /// open mainnet authorization.
+    /// `MainnetStateUnverifiable` naming its defect instead.
     #[error(
-        "policy window-state store generation mismatch — possible deletion or rollback; \
-         run `profile reset-window-state` to recover"
+        "policy window-state store generation mismatch, possible deletion or rollback. \
+         No verb recovers such state in this release; create a profile under a new name."
     )]
     GenerationMismatch,
 
@@ -403,12 +414,11 @@ pub enum WindowStoreError {
     /// spend history nor its authorizations are known.
     ///
     /// Produced in place of the generic integrity errors for a mainnet
-    /// profile in a build with mainnet writes. The reset is the remedy.
+    /// profile in a build with mainnet writes. No verb recovers such state in this release; create a profile under a new name.
     #[cfg(feature = "mainnet-write")]
     #[error(
         "policy.window_state_unverifiable: the policy window-state of this mainnet profile \
-         cannot be verified ({defect}); run `stellar-agent profile reset-window-state <name> \
-         --reason <reason>` to reset it"
+         cannot be verified ({defect}). No verb recovers such state in this release; create a profile under a new name."
     )]
     MainnetStateUnverifiable {
         /// The defect found.
@@ -428,6 +438,10 @@ pub enum WindowStoreError {
     },
 }
 
+/// The sentence that ends a refusal of state no verb recovers.
+const NO_RECOVERY_NOTICE: &str =
+    "No verb recovers such state in this release; create a profile under a new name.";
+
 impl From<StateLockError> for WindowStoreError {
     fn from(error: StateLockError) -> Self {
         match error {
@@ -436,6 +450,38 @@ impl From<StateLockError> for WindowStoreError {
             _ => Self::Io {
                 kind: std::io::ErrorKind::Other,
             },
+        }
+    }
+}
+
+impl WindowStoreError {
+    /// The value-free validation refusal for an authenticated scope failure.
+    #[must_use]
+    pub fn chain_validation_error(&self) -> Option<stellar_agent_core::error::ValidationError> {
+        use stellar_agent_core::error::ValidationError;
+        match self {
+            Self::ChainMismatch => Some(ValidationError::WindowChainMismatch),
+            Self::ChainUnverifiable => Some(ValidationError::WindowChainUnverifiable),
+            _ => None,
+        }
+    }
+
+    /// The business code for a state read or submission reservation refusal.
+    #[must_use]
+    pub fn submission_code(&self) -> &'static str {
+        self.chain_validation_error()
+            .map_or("submission.record_unavailable", |error| error.code())
+    }
+
+    /// Ends `refusal` with the no-recovery sentence when the store failed its
+    /// integrity check. A backend failure can clear, and the other unverifiable
+    /// states carry the sentence in their own text.
+    #[must_use]
+    pub fn with_recovery_notice(&self, refusal: String) -> String {
+        if matches!(self, Self::HmacMismatch | Self::Invalid { .. }) {
+            format!("{refusal}. {NO_RECOVERY_NOTICE}")
+        } else {
+            refusal
         }
     }
 }
