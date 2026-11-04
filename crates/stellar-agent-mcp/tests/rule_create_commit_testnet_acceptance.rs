@@ -269,6 +269,8 @@ async fn t1_rule_create_commit_happy_path() {
             .with_noop_engine()
             .build();
     profile.rpc_url = TESTNET_RPC_URL.to_owned();
+    profile.secondary_rpc_url =
+        Some(stellar_agent_test_support::testnet_secondary_rpc_url().to_owned());
     seed_keyring(&profile, &agent_seed, &attestation_key);
 
     let server = WalletServer::new(profile).expect("WalletServer::new");

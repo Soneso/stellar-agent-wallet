@@ -25,10 +25,12 @@
     reason = "test-helper fixture constructors expose documented panic paths"
 )]
 
+use std::ops::Range;
 use std::sync::{
     Arc, Mutex, PoisonError,
     atomic::{AtomicUsize, Ordering},
 };
+use std::time::Duration;
 
 use serde_json::{Value, json};
 use stellar_xdr::{
@@ -43,7 +45,7 @@ use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate, matchers::m
 use crate::send_transaction_hash_hex;
 use crate::signed_envelope::{get_network_result, ledger_entries_result_for};
 
-/// The ledger sequence the endpoint reports as latest.
+/// The ledger sequence the endpoint reports as latest unless configured.
 const LATEST_LEDGER: u32 = 1000;
 
 /// The nonce of every authorization entry the endpoint hands out.
@@ -64,6 +66,12 @@ pub struct AuthTreeRpc {
     instances: Vec<(ScAddress, ScContractInstance)>,
     tree: Arc<TreeFn>,
     returns: Arc<ReturnFn>,
+    latest_ledger: u32,
+    simulated_ledger: Option<u32>,
+    malformed_latest_ledger: bool,
+    ledger_after_simulation: Option<(usize, u32)>,
+    slow_simulations: Option<(Range<usize>, Duration)>,
+    slow_network_after_signed_simulation: Option<Duration>,
 }
 
 impl AuthTreeRpc {
@@ -79,7 +87,64 @@ impl AuthTreeRpc {
             instances: Vec::new(),
             tree: Arc::new(|_| None),
             returns: Arc::new(|_| ScVal::Void),
+            latest_ledger: LATEST_LEDGER,
+            simulated_ledger: None,
+            malformed_latest_ledger: false,
+            ledger_after_simulation: None,
+            slow_simulations: None,
+            slow_network_after_signed_simulation: None,
         }
+    }
+
+    /// Reports `latest_ledger` as the latest ledger in every answer.
+    #[must_use]
+    pub fn latest_ledger(mut self, latest_ledger: u32) -> Self {
+        self.latest_ledger = latest_ledger;
+        self
+    }
+
+    /// Reports `simulated_ledger` in simulation answers only, apart from the
+    /// height of [`Self::latest_ledger`].
+    #[must_use]
+    pub fn simulated_ledger(mut self, simulated_ledger: u32) -> Self {
+        self.simulated_ledger = Some(simulated_ledger);
+        self
+    }
+
+    /// Reports `latest_ledger` from `getLatestLedger` once `simulations`
+    /// simulations have been requested.
+    #[must_use]
+    pub fn latest_ledger_after_simulation(
+        mut self,
+        simulations: usize,
+        latest_ledger: u32,
+    ) -> Self {
+        self.ledger_after_simulation = Some((simulations, latest_ledger));
+        self
+    }
+
+    /// Delays the answers to the simulations numbered `simulations`, counted
+    /// from 1, by `delay`.
+    #[must_use]
+    pub fn slow_simulations(mut self, simulations: Range<usize>, delay: Duration) -> Self {
+        self.slow_simulations = Some((simulations, delay));
+        self
+    }
+
+    /// Delays the answers to `getNetwork` by `delay` once a signed
+    /// re-simulation was answered: the identity probe of the submission that
+    /// follows it.
+    #[must_use]
+    pub fn slow_network_after_signed_simulation(mut self, delay: Duration) -> Self {
+        self.slow_network_after_signed_simulation = Some(delay);
+        self
+    }
+
+    /// Answers `getLatestLedger` with a `sequence` that is not a number.
+    #[must_use]
+    pub fn malformed_latest_ledger(mut self) -> Self {
+        self.malformed_latest_ledger = true;
+        self
     }
 
     /// Reports the classic account `account_id` (a G-strkey) with its own
@@ -208,9 +273,14 @@ impl Respond for Responder {
         let body: Value = serde_json::from_slice(&request.body).unwrap_or(Value::Null);
         let result = match body["method"].as_str().unwrap_or_default() {
             "getNetwork" => get_network_result(&self.config.passphrase),
+            "getLatestLedger" if self.config.malformed_latest_ledger => json!({
+                "id": "ab".repeat(32),
+                "sequence": "not-a-ledger",
+                "protocolVersion": 27
+            }),
             "getLatestLedger" => json!({
                 "id": "ab".repeat(32),
-                "sequence": LATEST_LEDGER,
+                "sequence": self.reported_latest_ledger(),
                 "protocolVersion": 27
             }),
             "getLedgerEntries" => self.ledger_entries(&body),
@@ -226,14 +296,14 @@ impl Respond for Responder {
                 json!({
                     "status": "PENDING",
                     "hash": send_transaction_hash_hex(&body, &self.config.passphrase),
-                    "latestLedger": LATEST_LEDGER,
+                    "latestLedger": self.config.latest_ledger,
                     "latestLedgerCloseTime": "1234567890"
                 })
             }
             "getTransaction" => json!({
                 "status": "SUCCESS",
-                "ledger": LATEST_LEDGER + 1,
-                "latestLedger": LATEST_LEDGER + 1,
+                "ledger": self.config.latest_ledger + 1,
+                "latestLedger": self.config.latest_ledger + 1,
                 "oldestLedger": 1
             }),
             other => {
@@ -244,12 +314,42 @@ impl Respond for Responder {
                 }));
             }
         };
-        ResponseTemplate::new(200)
-            .set_body_json(json!({"jsonrpc": "2.0", "id": body["id"], "result": result}))
+        let response = ResponseTemplate::new(200)
+            .set_body_json(json!({"jsonrpc": "2.0", "id": body["id"], "result": result}));
+        let simulation = self.record.simulations.load(Ordering::SeqCst);
+        match (
+            &self.config.slow_simulations,
+            self.config.slow_network_after_signed_simulation,
+        ) {
+            (Some((simulations, delay)), _)
+                if body["method"] == "simulateTransaction" && simulations.contains(&simulation) =>
+            {
+                response.set_delay(*delay)
+            }
+            (_, Some(delay))
+                if body["method"] == "getNetwork"
+                    && self.record.signed_simulations.load(Ordering::SeqCst) > 0 =>
+            {
+                response.set_delay(delay)
+            }
+            _ => response,
+        }
     }
 }
 
 impl Responder {
+    /// The height `getLatestLedger` reports at this point of the exchange.
+    fn reported_latest_ledger(&self) -> u32 {
+        match self.config.ledger_after_simulation {
+            Some((simulations, ledger))
+                if self.record.simulations.load(Ordering::SeqCst) >= simulations =>
+            {
+                ledger
+            }
+            _ => self.config.latest_ledger,
+        }
+    }
+
     /// Answers each requested key the configuration knows, in request order.
     fn ledger_entries(&self, body: &Value) -> Value {
         let entries: Vec<Value> = body["params"]["keys"]
@@ -295,16 +395,20 @@ impl Responder {
                 }
             })
             .collect();
-        json!({"entries": entries, "latestLedger": LATEST_LEDGER})
+        json!({"entries": entries, "latestLedger": self.config.latest_ledger})
     }
 
     /// Answers a simulation of the envelope's one `InvokeContract` operation.
     fn simulate(&self, body: &Value) -> Value {
         self.record.simulations.fetch_add(1, Ordering::SeqCst);
+        let latest_ledger = self
+            .config
+            .simulated_ledger
+            .unwrap_or(self.config.latest_ledger);
         let Some((invoke, signed_auth)) =
             body["params"]["transaction"].as_str().and_then(invoke_of)
         else {
-            return json!({"error": "not an InvokeContract envelope", "latestLedger": LATEST_LEDGER});
+            return json!({"error": "not an InvokeContract envelope", "latestLedger": latest_ledger});
         };
         let auth = if signed_auth.is_empty() {
             (self.config.tree)(&invoke)
@@ -338,7 +442,7 @@ impl Responder {
                     .to_xdr_base64(Limits::none())
                     .unwrap_or_default()
             }],
-            "latestLedger": LATEST_LEDGER
+            "latestLedger": latest_ledger
         })
     }
 }

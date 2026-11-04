@@ -112,7 +112,7 @@ fn fresh_manager() -> (ContextRuleManager, TempDir) {
     let timeout = Duration::from_secs(120);
     let signers_manager = signers_manager_for_tests(
         TESTNET_RPC_URL,
-        TESTNET_RPC_URL,
+        stellar_agent_test_support::testnet_secondary_rpc_url(),
         Arc::clone(&audit_writer),
         audit_log_path,
         timeout,
@@ -120,7 +120,7 @@ fn fresh_manager() -> (ContextRuleManager, TempDir) {
     let manager = ContextRuleManager::new(
         rule_manager_config_for_tests(
             TESTNET_RPC_URL,
-            None,
+            Some(stellar_agent_test_support::testnet_secondary_rpc_url()),
             signers_manager,
             audit_writer,
             timeout,

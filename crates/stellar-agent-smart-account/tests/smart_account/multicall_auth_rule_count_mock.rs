@@ -20,6 +20,7 @@ use stellar_agent_smart_account::{
     SaError,
     submit::{DeclaredSubInvocations, MulticallCheck, SubmitInvokeArgs, submit_signed_invoke},
 };
+use stellar_agent_test_support::second_loopback_host;
 use stellar_agent_test_support::signed_envelope::{
     account_id_for_seed, get_network_result, send_transaction_hash_hex,
 };
@@ -56,7 +57,24 @@ impl Respond for Rpc {
                 json!({"id": "ab".repeat(32), "sequence": 1000, "protocolVersion": 27})
             }
             "getLedgerEntries" => {
-                rpc_helpers::build_ledger_entries_account(&account_id_for_seed(SEED))
+                let source = account_id_for_seed(SEED);
+                if body["params"]["keys"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|key| key.as_str() == Some(rpc_helpers::account_key_xdr(&source).as_str()))
+                {
+                    rpc_helpers::build_ledger_entries_account(&source)
+                } else {
+                    let hash: [u8; 32] = hex::decode(MULTICALL_WASM_SHA256)
+                        .unwrap()
+                        .try_into()
+                        .unwrap();
+                    rpc_helpers::build_ledger_entries_contract_instance(
+                        &ScAddress::Contract(ContractId(Hash([0x54; 32]))),
+                        hash,
+                    )
+                }
             }
             "simulateTransaction" => {
                 let TransactionEnvelope::Tx(tx) = TransactionEnvelope::from_xdr_base64(
@@ -147,6 +165,7 @@ async fn submit(
             .sub_invocations(DeclaredSubInvocations::Calls(&declared_calls))
             .signer(&signer)
             .primary_rpc_url(&mock.uri())
+            .secondary_rpc_url(&second_loopback_host(&mock.uri()))
             .network_passphrase(PASSPHRASE)
             .chain_id("stellar:testnet")
             .timeout(Duration::from_secs(2))

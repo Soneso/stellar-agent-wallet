@@ -46,8 +46,9 @@ use stellar_agent_network::signing::Signer;
 use crate::SaError;
 use crate::error::PostSubmitVerificationKind;
 use crate::managers::rules::parse_c_strkey_to_smart_account;
+use crate::signing::ledger_witness::checked_secondary_rpc_url;
 use crate::submit::{
-    DeclaredSubInvocations, MulticallCheck, ResolvedFeePerOp, SubmitInvokeArgs,
+    DeclaredSubInvocations, MulticallCheck, ResolvedFeePerOp, SubmitInvokeArgs, refuse_mainnet_sa,
     submit_signed_invoke,
 };
 
@@ -188,8 +189,8 @@ pub struct MulticallInvocation {
 ///
 /// All fields are required; there are no optional defaults. The non-`Option`
 /// `secondary_rpc_url` field enforces at the type level that the caller has
-/// configured a secondary RPC endpoint — the cross-RPC 4-way trust-anchor
-/// equality check requires it.
+/// configured a secondary RPC endpoint: the ledger witness of the signature
+/// and the cross-RPC 4-way trust-anchor equality check both require it.
 pub struct MulticallSubmitArgs<'a> {
     /// C-strkey of the smart-account contract executing the multicall.
     pub smart_account: &'a str,
@@ -203,10 +204,13 @@ pub struct MulticallSubmitArgs<'a> {
     pub signer: &'a (dyn Signer + Send + Sync),
     /// Primary Soroban RPC URL (simulate + submit).
     pub primary_rpc_url: &'a str,
-    /// Secondary Soroban RPC URL (mandatory for 4-way trust-anchor equality).
+    /// Secondary Soroban RPC URL (mandatory for the ledger witness and 4-way
+    /// trust-anchor equality).
     ///
     /// Non-`Option` by design — a secondary RPC URL is unconditionally required
-    /// for multicall submission (cross-RPC trust-anchor model).
+    /// for multicall submission (cross-RPC trust-anchor model). It must be on
+    /// a host other than the primary's and serve the same network: signing
+    /// refuses otherwise.
     pub secondary_rpc_url: &'a str,
     /// Stellar network passphrase (auth-digest + envelope signing).
     pub network_passphrase: &'a str,
@@ -1349,16 +1353,6 @@ pub async fn submit_multicall_bundle(
 
     let smart_account_redacted = redact_strkey_first5_last5(args.smart_account);
 
-    // Warn when primary and secondary RPC URLs are identical. The trust-anchor
-    // check degrades to single-RPC when both point to the same endpoint.
-    if args.primary_rpc_url == args.secondary_rpc_url {
-        warn!(
-            smart_account = %smart_account_redacted,
-            "submit_multicall_bundle: primary_rpc_url == secondary_rpc_url; \
-             cross-RPC trust-anchor degrades to single-RPC verification"
-        );
-    }
-
     // Helper: emit a denied audit row.
     let chain_id = args.chain_id;
     let request_id = args.request_id;
@@ -1502,6 +1496,29 @@ pub async fn submit_multicall_bundle(
     }
 
     // ── Step 2: policy gate ───────────────────────────────────────────────────
+
+    // The ledger witness and the trust anchor need a second endpoint. A
+    // configuration that cannot supply one refuses here, before the policy
+    // gate spends anything on a bundle that cannot be signed. A mainnet write
+    // keeps its own refusal, which the submit path raises first.
+    if refuse_mainnet_sa(args.network_passphrase, args.primary_rpc_url).is_ok()
+        && let Err(refusal) = checked_secondary_rpc_url(
+            args.primary_rpc_url,
+            Some(args.secondary_rpc_url),
+            args.network_passphrase,
+        )
+    {
+        let _ = emit_denied(
+            &args.audit_writer,
+            None,
+            None,
+            None,
+            format!("multicall.{}", refusal.wire_code()),
+            "policy_gate",
+            inner_count,
+        );
+        return Err(refusal);
+    }
 
     // The gate values the encoded calls the wallet declares and dispatches.
     let caller_scaddr = parse_c_strkey_to_smart_account(args.smart_account)?;
@@ -2129,10 +2146,11 @@ struct SubmitDeniedRow {
 ///
 /// - [`SaError::SubmissionUnresolved`] and [`SaError::PolicyDenied`] pass
 ///   through unwrapped with no row. The recorder's closing row records them.
-/// - [`SaError::MainnetWriteForbidden`] passes through unwrapped and keeps the
-///   canonical code. Its row has phase `policy_gate` and deny code
-///   `multicall.network.mainnet_write_forbidden`: the wallet refused it, and
-///   no transaction was sent.
+/// - [`SaError::MainnetWriteForbidden`], [`SaError::LedgerWitnessUnavailable`]
+///   and [`SaError::LedgerWitnessMismatch`] pass through unwrapped and keep
+///   their codes. Each row has phase `policy_gate` and deny code
+///   `multicall.<wire code>`: the wallet refused, nothing was signed after the
+///   refusal, and no transaction was sent.
 /// - A nested [`SaError::MulticallFailed`] keeps its phase, reason, and
 ///   post-submit kind, and writes a denied row at that phase.
 /// - Every other error writes a row at the phase of
@@ -2145,7 +2163,9 @@ fn classify_submit_failure(sa_err: SaError) -> (Option<SubmitDeniedRow>, SaError
         // gate's own code, the recorder's closing row records it, and nothing
         // was sent, so it passes through unwrapped and writes no second row.
         SaError::PolicyDenied { .. } => (None, sa_err),
-        SaError::MainnetWriteForbidden => (
+        SaError::MainnetWriteForbidden
+        | SaError::LedgerWitnessUnavailable { .. }
+        | SaError::LedgerWitnessMismatch { .. } => (
             Some(SubmitDeniedRow {
                 deny_wire_code: format!("multicall.{}", sa_err.wire_code()),
                 refusal_phase: "policy_gate",
@@ -4000,6 +4020,32 @@ wasm_sha256 = "{drifted_sha}"
             matches!(returned, SaError::MainnetWriteForbidden),
             "the mainnet refusal must return unwrapped, got {returned:?}"
         );
+    }
+
+    /// A witness refusal returns unwrapped with its own code and writes a
+    /// denied row under it.
+    #[test]
+    fn classify_submit_failure_keeps_a_witness_refusal_with_a_denied_row() {
+        for (error, code) in [
+            (
+                SaError::LedgerWitnessUnavailable { reason: "fixed" },
+                "smart_account.ledger_witness_unavailable",
+            ),
+            (
+                SaError::LedgerWitnessMismatch { reason: "fixed" },
+                "simulation.divergence.ledger_skew",
+            ),
+        ] {
+            let (row, returned) = classify_submit_failure(error);
+            assert_eq!(
+                row,
+                Some(SubmitDeniedRow {
+                    deny_wire_code: format!("multicall.{code}"),
+                    refusal_phase: "policy_gate",
+                })
+            );
+            assert_eq!(returned.wire_code(), code, "{returned:?}");
+        }
     }
 
     /// Another submit failure still writes a row at its mapped phase and

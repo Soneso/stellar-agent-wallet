@@ -160,7 +160,7 @@ async fn fund_via_friendbot(g_strkey: &str) {
 fn fresh_rule_manager() -> (ContextRuleManager, Arc<SignersManager>, TempDir) {
     let (manager, signers_manager, _audit_log_path, dir) = managers_for_tests(
         TESTNET_RPC_URL,
-        TESTNET_RPC_URL,
+        stellar_agent_test_support::testnet_secondary_rpc_url(),
         Duration::from_secs(TIMEOUT_SECS),
     );
     (manager, signers_manager, dir)
@@ -705,7 +705,7 @@ async fn q1_and_q3_two_of_three_quorum_invocation_accepted() {
             .maybe_authorization(Some(&authz))
             .signers(quorum_signers.as_slice())
             .primary_rpc_url(TESTNET_RPC_URL)
-            // secondary_rpc_url: omit → defaults to None
+            .secondary_rpc_url(stellar_agent_test_support::testnet_secondary_rpc_url())
             .network_passphrase(TESTNET_PASSPHRASE)
             .chain_id(CHAIN_ID)
             .timeout(Duration::from_secs(TIMEOUT_SECS))

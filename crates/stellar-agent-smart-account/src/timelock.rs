@@ -85,6 +85,7 @@ use crate::managers::credentials::AuditWriterPoisonContext;
 use crate::managers::rules::{
     BASE_FEE_STROOPS, augment_with_oz_error_name, parse_c_strkey_to_smart_account,
 };
+use crate::signing::ledger_witness::checked_secondary_rpc_url;
 use crate::submit::refuse_mainnet_sa;
 
 // ── OZ Timelock error codes ───────────────────────────────────────────────────
@@ -257,10 +258,11 @@ pub struct TimelockScheduleArgs<'a> {
     pub signer: &'a (dyn Signer + Send + Sync),
     /// Primary Soroban RPC URL (simulate + submit).
     pub primary_rpc_url: &'a str,
-    /// Secondary Soroban RPC URL for `cross_confirm_event` dual-RPC defence.
+    /// Secondary Soroban RPC URL: the ledger witness of the signature and the
+    /// second endpoint of `cross_confirm_event`.
     ///
-    /// Use the same URL as `primary_rpc_url` to disable divergence detection.
-    /// A warning is emitted at INFO level when primary and secondary are equal.
+    /// Must be on a host other than the primary's and serve the same
+    /// network; signing refuses otherwise.
     pub secondary_rpc_url: &'a str,
     /// Stellar network passphrase.
     pub network_passphrase: &'a str,
@@ -284,7 +286,11 @@ pub struct TimelockCancelArgs<'a> {
     pub signer: &'a (dyn Signer + Send + Sync),
     /// Primary Soroban RPC URL (simulate + submit).
     pub primary_rpc_url: &'a str,
-    /// Secondary Soroban RPC URL for `cross_confirm_event` dual-RPC defence.
+    /// Secondary Soroban RPC URL: the ledger witness of the signature and the
+    /// second endpoint of `cross_confirm_event`.
+    ///
+    /// Must be on a host other than the primary's and serve the same
+    /// network; signing refuses otherwise.
     pub secondary_rpc_url: &'a str,
     /// Stellar network passphrase.
     pub network_passphrase: &'a str,
@@ -318,7 +324,11 @@ pub struct TimelockExecuteArgs<'a> {
     pub signer: &'a (dyn Signer + Send + Sync),
     /// Primary Soroban RPC URL (simulate + submit).
     pub primary_rpc_url: &'a str,
-    /// Secondary Soroban RPC URL for cross-RPC state pre-check + event confirm.
+    /// Secondary Soroban RPC URL: the ledger witness of the signature, the
+    /// cross-RPC state pre-check and the event confirmation.
+    ///
+    /// Must be on a host other than the primary's and serve the same
+    /// network; signing refuses otherwise.
     pub secondary_rpc_url: &'a str,
     /// Stellar network passphrase.
     pub network_passphrase: &'a str,
@@ -454,13 +464,25 @@ fn classify_execute_error(sim_error: &str) -> TimelockExecuteFailureReason {
 
 // ── Submission error mappers ─────────────────────────────────────────────────
 
+/// Whether a refusal raised before anything was signed keeps its own wire code
+/// through every timelock mapper. Pre-signing refusals retain their wire codes
+/// across timelock verbs so operators receive the same actionable reason.
+fn keeps_its_wire_code(e: &SaError) -> bool {
+    matches!(
+        e,
+        SaError::MainnetWriteForbidden
+            | SaError::LedgerWitnessUnavailable { .. }
+            | SaError::LedgerWitnessMismatch { .. }
+    )
+}
+
 /// Maps a failure of the `schedule` submission into the schedule error surface.
 ///
-/// [`SaError::MainnetWriteForbidden`] passes through unchanged and keeps the
-/// canonical code. Every other error becomes
+/// [`SaError::MainnetWriteForbidden`] and the two ledger witness refusals pass
+/// through unchanged and keep their codes. Every other error becomes
 /// [`SaError::TimelockScheduleFailed`], classified from its text.
 fn schedule_submit_error(e: SaError, request_id: &str) -> SaError {
-    if matches!(e, SaError::MainnetWriteForbidden) {
+    if keeps_its_wire_code(&e) {
         return e;
     }
 
@@ -475,15 +497,15 @@ fn schedule_submit_error(e: SaError, request_id: &str) -> SaError {
 
 /// Maps a failure of the `cancel` submission into the cancel error surface.
 ///
-/// [`SaError::MainnetWriteForbidden`] passes through unchanged and keeps the
-/// canonical code. Every other error becomes [`SaError::TimelockCancelFailed`],
-/// classified from its text.
+/// [`SaError::MainnetWriteForbidden`] and the two ledger witness refusals pass
+/// through unchanged and keep their codes. Every other error becomes
+/// [`SaError::TimelockCancelFailed`], classified from its text.
 fn cancel_submit_error(
     e: SaError,
     operation_id: &TimelockOperationId,
     request_id: &str,
 ) -> SaError {
-    if matches!(e, SaError::MainnetWriteForbidden) {
+    if keeps_its_wire_code(&e) {
         return e;
     }
 
@@ -504,18 +526,16 @@ fn cancel_submit_error(
 
 /// Maps a failure of the `execute` submission into the execute error surface.
 ///
-/// [`SaError::SubmissionUnresolved`] and [`SaError::MainnetWriteForbidden`]
-/// pass through unchanged and keep their codes. Every other error becomes
-/// [`SaError::TimelockExecuteFailed`], classified from its text.
+/// [`SaError::SubmissionUnresolved`], [`SaError::MainnetWriteForbidden`] and
+/// the two ledger witness refusals pass through unchanged and keep their
+/// codes. Every other error becomes [`SaError::TimelockExecuteFailed`],
+/// classified from its text.
 fn execute_submit_error(
     e: SaError,
     operation_id: &TimelockOperationId,
     request_id: &str,
 ) -> SaError {
-    if matches!(
-        e,
-        SaError::SubmissionUnresolved { .. } | SaError::MainnetWriteForbidden
-    ) {
+    if matches!(e, SaError::SubmissionUnresolved { .. }) || keeps_its_wire_code(&e) {
         return e;
     }
 
@@ -1707,6 +1727,7 @@ pub async fn schedule_upgrade(
             host_function,
             signer,
             primary_rpc_url,
+            secondary_rpc_url,
             network_passphrase,
             timeout: std::time::Duration::from_secs(60),
             op_label: "timelock_schedule",
@@ -1939,6 +1960,7 @@ pub async fn cancel(args: TimelockCancelArgs<'_>) -> Result<(), SaError> {
             host_function,
             signer,
             primary_rpc_url,
+            secondary_rpc_url,
             network_passphrase,
             timeout: std::time::Duration::from_secs(60),
             op_label: "timelock_cancel",
@@ -2052,6 +2074,13 @@ pub async fn cancel(args: TimelockCancelArgs<'_>) -> Result<(), SaError> {
 ///   submit-layer refusal of an endpoint that reports mainnet.
 pub async fn execute(args: TimelockExecuteArgs<'_>) -> Result<String, SaError> {
     refuse_mainnet_sa(args.network_passphrase, args.primary_rpc_url)?;
+    // `execute` reads the operation from both endpoints before it reaches the
+    // submit, so an endpoint that cannot be a witness refuses before those reads.
+    checked_secondary_rpc_url(
+        args.primary_rpc_url,
+        Some(args.secondary_rpc_url),
+        args.network_passphrase,
+    )?;
 
     let TimelockExecuteArgs {
         timelock_contract_strkey,
@@ -2397,6 +2426,7 @@ pub async fn execute(args: TimelockExecuteArgs<'_>) -> Result<String, SaError> {
             host_function,
             signer,
             primary_rpc_url,
+            secondary_rpc_url,
             network_passphrase,
             timeout: std::time::Duration::from_secs(60),
             op_label: "timelock_execute",
@@ -2975,6 +3005,31 @@ mod tests {
     #![allow(clippy::panic, reason = "test-only: panics are correct failure mode")]
 
     use super::*;
+
+    /// A witness refusal keeps its code through every timelock mapper.
+    #[test]
+    fn the_submit_error_mappers_keep_a_witness_refusal() {
+        for (error, code) in [
+            (
+                || SaError::LedgerWitnessUnavailable { reason: "fixed" },
+                "smart_account.ledger_witness_unavailable",
+            ),
+            (
+                || SaError::LedgerWitnessMismatch { reason: "fixed" },
+                "simulation.divergence.ledger_skew",
+            ),
+        ] as [(fn() -> SaError, &str); 2]
+        {
+            let operation_id = TimelockOperationId::from_bytes([3u8; 32]);
+            for mapped in [
+                schedule_submit_error(error(), "req"),
+                cancel_submit_error(error(), &operation_id, "req"),
+                execute_submit_error(error(), &operation_id, "req"),
+            ] {
+                assert_eq!(mapped.wire_code(), code, "{mapped:?}");
+            }
+        }
+    }
 
     /// The reason for an unexpected return value names its variant and never
     /// renders the value, so a 10 KiB ledger payload yields a short reason.

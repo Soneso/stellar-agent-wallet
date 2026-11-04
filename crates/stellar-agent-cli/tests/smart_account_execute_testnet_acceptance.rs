@@ -325,6 +325,8 @@ async fn smart_account_execute_full_flow_testnet_acceptance() {
             "testnet",
             "--rpc-url",
             TESTNET_RPC_URL,
+            "--secondary-rpc-url",
+            stellar_agent_test_support::testnet_secondary_rpc_url(),
         ],
         &[(FEE_PAYER_ENV_VAR, &bootstrap_s_strkey)],
     );
@@ -364,6 +366,8 @@ async fn smart_account_execute_full_flow_testnet_acceptance() {
             "testnet",
             "--rpc-url",
             TESTNET_RPC_URL,
+            "--secondary-rpc-url",
+            stellar_agent_test_support::testnet_secondary_rpc_url(),
         ],
         &[(FEE_PAYER_ENV_VAR, &bootstrap_s_strkey)],
     );
@@ -443,6 +447,8 @@ async fn smart_account_execute_full_flow_testnet_acceptance() {
             "testnet",
             "--rpc-url",
             TESTNET_RPC_URL,
+            "--secondary-rpc-url",
+            stellar_agent_test_support::testnet_secondary_rpc_url(),
         ],
         &[
             (RULE_SIGNER_ENV_VAR, &rule_signer_s_strkey),
@@ -500,6 +506,8 @@ async fn smart_account_execute_full_flow_testnet_acceptance() {
             "testnet",
             "--rpc-url",
             TESTNET_RPC_URL,
+            "--secondary-rpc-url",
+            stellar_agent_test_support::testnet_secondary_rpc_url(),
         ],
         &[
             (RULE_SIGNER_ENV_VAR, &rule_signer_s_strkey),
@@ -563,6 +571,8 @@ async fn smart_account_execute_full_flow_testnet_acceptance() {
             "testnet",
             "--rpc-url",
             TESTNET_RPC_URL,
+            "--secondary-rpc-url",
+            stellar_agent_test_support::testnet_secondary_rpc_url(),
         ],
         &[
             (RULE_SIGNER_ENV_VAR, &rule_signer_s_strkey),
@@ -625,6 +635,8 @@ async fn smart_account_execute_full_flow_testnet_acceptance() {
             "testnet",
             "--rpc-url",
             TESTNET_RPC_URL,
+            "--secondary-rpc-url",
+            stellar_agent_test_support::testnet_secondary_rpc_url(),
         ],
         &[
             (RULE_SIGNER_ENV_VAR, &rule_signer_s_strkey),

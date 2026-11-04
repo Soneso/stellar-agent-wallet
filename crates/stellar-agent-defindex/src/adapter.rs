@@ -767,8 +767,9 @@ fn build_invoke_contract_args(
 /// rebuilding and re-submitting. A policy refusal keeps the criterion's own
 /// code, so the caller reads a refused cap rather than an endpoint failure.
 /// A mainnet refusal keeps the canonical `network.mainnet_write_forbidden`
-/// code. Every other failure is reported as a network failure, which moved
-/// nothing.
+/// code. A ledger witness refusal keeps its own code and carries no
+/// transaction, because nothing was signed. Every other failure is reported as
+/// a network failure, which moved nothing.
 fn map_submit_invoke_error(error: &stellar_agent_smart_account::SaError) -> DefiAdapterError {
     match error {
         stellar_agent_smart_account::SaError::MainnetWriteForbidden => {
@@ -792,6 +793,13 @@ fn map_submit_invoke_error(error: &stellar_agent_smart_account::SaError) -> Defi
             envelope_hash: envelope_hash.clone(),
             timeout_seconds: *timeout_seconds,
         },
+        refusal @ (stellar_agent_smart_account::SaError::LedgerWitnessUnavailable { .. }
+        | stellar_agent_smart_account::SaError::LedgerWitnessMismatch { .. }) => {
+            DefiAdapterError::SigningRefusal {
+                wire_code: refusal.wire_code(),
+                message: refusal.to_string(),
+            }
+        }
         other => DefiAdapterError::Network {
             reason: format!("submit_signed_invoke failed: {other}"),
         },
@@ -880,6 +888,29 @@ mod tests {
             ),
             "a failure that moved nothing is a network failure"
         );
+    }
+
+    /// A witness refusal keeps its wire code and reads as no network failure.
+    #[test]
+    fn a_witness_refusal_keeps_its_wire_code_through_the_adapter_mapping() {
+        for (error, code) in [
+            (
+                stellar_agent_smart_account::SaError::LedgerWitnessUnavailable { reason: "fixed" },
+                "smart_account.ledger_witness_unavailable",
+            ),
+            (
+                stellar_agent_smart_account::SaError::LedgerWitnessMismatch { reason: "fixed" },
+                "simulation.divergence.ledger_skew",
+            ),
+        ] {
+            match map_submit_invoke_error(&error) {
+                DefiAdapterError::SigningRefusal { wire_code, message } => {
+                    assert_eq!(wire_code, code);
+                    assert_eq!(message, error.to_string());
+                }
+                other => panic!("expected a signing refusal, got {other:?}"),
+            }
+        }
     }
 
     /// A mainnet refusal keeps its own variant through the adapter mapping.

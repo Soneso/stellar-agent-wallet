@@ -876,7 +876,8 @@ pub(crate) fn unresolved_from_defi(
 /// Renders a DeFi submit failure and returns the process exit code.
 ///
 /// A policy denial renders as this binary's gate denials do, under `verb`. A
-/// mainnet refusal reports `network.mainnet_write_forbidden`. An unresolved
+/// mainnet refusal reports `network.mainnet_write_forbidden`. A signing refusal
+/// keeps its own code, with no transaction to reconcile. An unresolved
 /// submission keeps its `submission.*` code and its `details`; everything else
 /// is reported under `fallback_code`.
 pub(crate) fn render_defi_submit_error(
@@ -891,7 +892,8 @@ pub(crate) fn render_defi_submit_error(
 /// The refusal envelope a DeFi submit failure is reported in.
 ///
 /// A policy denial reads as this binary's gate denials read, under `verb`. A
-/// mainnet refusal reports `network.mainnet_write_forbidden`. An unresolved
+/// mainnet refusal reports `network.mainnet_write_forbidden`. A signing refusal
+/// keeps its own code, with no transaction to reconcile. An unresolved
 /// submission keeps its `submission.*` code and its `details`; everything else
 /// is reported under `fallback_code`.
 fn defi_submit_error_envelope(
@@ -910,6 +912,11 @@ fn defi_submit_error_envelope(
         stellar_agent_defi::adapter::DefiAdapterError::MainnetWriteForbidden
     ) {
         return Envelope::<()>::err(&WalletError::Network(NetworkError::MainnetWriteForbidden));
+    }
+    if let stellar_agent_defi::adapter::DefiAdapterError::SigningRefusal { wire_code, message } =
+        error
+    {
+        return Envelope::<()>::err_raw(*wire_code, message.clone());
     }
     match unresolved_from_defi(error) {
         Some(unresolved) => unresolved.envelope(),
@@ -1326,6 +1333,33 @@ mod tests {
                 "verb {verb}"
             );
             assert!(rendered.details.is_none());
+        }
+    }
+
+    /// A DeFi signing refusal reports its own code on every verb, with no
+    /// transaction to reconcile.
+    #[test]
+    fn a_defi_signing_refusal_reports_its_own_code_without_a_transaction() {
+        for code in [
+            "smart_account.ledger_witness_unavailable",
+            "simulation.divergence.ledger_skew",
+        ] {
+            let error = stellar_agent_defi::adapter::DefiAdapterError::SigningRefusal {
+                wire_code: code,
+                message: "fixed".to_owned(),
+            };
+            for (verb, fallback) in [
+                ("trade", "dex.submit_failed"),
+                ("vault deposit", "vault.submit_failed"),
+            ] {
+                let envelope = defi_submit_error_envelope(&error, verb, fallback);
+                let rendered = envelope.error.as_ref().unwrap();
+                assert_eq!(rendered.code, code, "verb {verb}");
+                assert!(
+                    rendered.details.is_none(),
+                    "a refusal before signing names no transaction"
+                );
+            }
         }
     }
 

@@ -135,14 +135,14 @@ fn fresh_manager_with_audit_writer(
 ) -> ContextRuleManager {
     let signers_manager = signers_manager_for_tests(
         TESTNET_RPC_URL,
-        TESTNET_RPC_URL,
+        stellar_agent_test_support::testnet_secondary_rpc_url(),
         Arc::clone(&audit_writer),
         audit_log_path,
         TIMEOUT,
     );
     rule_manager_for_tests(
         TESTNET_RPC_URL,
-        None,
+        Some(stellar_agent_test_support::testnet_secondary_rpc_url()),
         signers_manager,
         audit_writer,
         TIMEOUT,
@@ -160,7 +160,7 @@ fn fresh_manager_uncapped_with_audit_writer(
 ) -> ContextRuleManager {
     let signers_manager = signers_manager_for_tests(
         TESTNET_RPC_URL,
-        TESTNET_RPC_URL,
+        stellar_agent_test_support::testnet_secondary_rpc_url(),
         Arc::clone(&audit_writer),
         audit_log_path,
         TIMEOUT,
@@ -168,7 +168,7 @@ fn fresh_manager_uncapped_with_audit_writer(
     ContextRuleManager::new(
         rule_manager_config_for_tests(
             TESTNET_RPC_URL,
-            None,
+            Some(stellar_agent_test_support::testnet_secondary_rpc_url()),
             signers_manager,
             audit_writer,
             TIMEOUT,

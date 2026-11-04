@@ -443,6 +443,9 @@ async fn defindex_deposit_submit_and_confirm() {
     );
 
     let primary_rpc_for_deposit = testnet_rpc();
+    let secondary_rpc =
+        StellarRpcClient::new(stellar_agent_test_support::testnet_secondary_rpc_url())
+            .expect("secondary RPC URL must be valid");
     let mut deposit_ctx = DefiAdapterCtx::new_with_submit_ctx(
         "default",
         &vault_pin,
@@ -450,7 +453,7 @@ async fn defindex_deposit_submit_and_confirm() {
         Some(signer.as_ref()),
         Some(TESTNET_PASSPHRASE),
         Some(TESTNET_CHAIN_ID),
-        None,
+        Some(&secondary_rpc),
         Some(Duration::from_secs(120)),
     );
 
@@ -701,6 +704,9 @@ async fn defindex_deposit_then_withdraw_submit_and_confirm() {
     );
 
     let primary_rpc_for_deposit = testnet_rpc();
+    let secondary_rpc =
+        StellarRpcClient::new(stellar_agent_test_support::testnet_secondary_rpc_url())
+            .expect("secondary RPC URL must be valid");
     let deposit_ctx = DefiAdapterCtx::new_with_submit_ctx(
         "default",
         &vault_pin,
@@ -708,7 +714,7 @@ async fn defindex_deposit_then_withdraw_submit_and_confirm() {
         Some(signer.as_ref()),
         Some(TESTNET_PASSPHRASE),
         Some(TESTNET_CHAIN_ID),
-        None,
+        Some(&secondary_rpc),
         Some(Duration::from_secs(120)),
     );
 
@@ -822,6 +828,9 @@ async fn defindex_deposit_then_withdraw_submit_and_confirm() {
     };
 
     let primary_rpc_for_withdraw = testnet_rpc();
+    let secondary_rpc =
+        StellarRpcClient::new(stellar_agent_test_support::testnet_secondary_rpc_url())
+            .expect("secondary RPC URL must be valid");
     let mut withdraw_ctx = DefiAdapterCtx::new_with_submit_ctx(
         "default",
         &vault_pin,
@@ -829,7 +838,7 @@ async fn defindex_deposit_then_withdraw_submit_and_confirm() {
         Some(signer.as_ref()),
         Some(TESTNET_PASSPHRASE),
         Some(TESTNET_CHAIN_ID),
-        None,
+        Some(&secondary_rpc),
         Some(Duration::from_secs(120)),
     );
 

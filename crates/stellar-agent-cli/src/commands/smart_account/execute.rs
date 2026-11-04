@@ -121,7 +121,8 @@ use uuid::Uuid;
 
 use crate::commands::smart_account::common::{
     SignerSourceFlags, construct_signers_manager_from_fields, load_command_profile,
-    map_access_error, open_audit_writer, open_verifier_registry, resolve_signer, wrap_sa_error,
+    map_access_error, open_audit_writer, open_verifier_registry, resolve_signer,
+    signing_secondary_rpc_url, wrap_sa_error,
 };
 use crate::commands::value_audit::write_row_logged;
 use crate::common::network::{
@@ -467,6 +468,11 @@ pub async fn run(args: &ExecuteArgs) -> i32 {
                 return emit_error(&e, args.output, &request_id);
             }
         };
+    // The signature rests on a second endpoint's ledger observation; a command
+    // without one refuses before any key access.
+    if let Err(e) = signing_secondary_rpc_url(&context) {
+        return emit_error_sa(&e, args.output, &request_id);
+    }
 
     // Every non-zero authorizing rule reads its baseline and pin record from
     // this profile's audit log. The signer-set comparison and executable pin

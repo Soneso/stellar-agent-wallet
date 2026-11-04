@@ -72,6 +72,7 @@ use stellar_agent_smart_account::submit::{
     submit_signed_invoke,
 };
 use stellar_agent_smart_account::verifier_allowlist::{VERIFIER_ALLOWLIST, VerifierAuditStatus};
+use stellar_agent_test_support::second_loopback_host;
 use stellar_agent_test_support::signed_envelope::{
     account_id_for_seed, get_network_result, send_transaction_hash_hex,
 };
@@ -101,6 +102,7 @@ const TAG: &[u8] = b"verifier";
 
 /// A URL no test may dial: the refusals below happen before network I/O.
 const UNROUTABLE_RPC: &str = "http://pin-check-must-not-be-dialed.invalid";
+const UNROUTABLE_SECONDARY_RPC: &str = "http://pin-check-secondary-must-not-be-dialed.invalid";
 
 // ── Addresses and hashes ──────────────────────────────────────────────────────
 
@@ -1005,7 +1007,7 @@ struct Harness {
     manager: Arc<SignersManager>,
     timeouts: Timeouts,
     _dir: tempfile::TempDir,
-    _secondary: MockServer,
+    secondary: MockServer,
 }
 
 /// The two timeouts of a [`Harness`].
@@ -1135,7 +1137,7 @@ impl Harness {
         let manager = Arc::new(
             SignersManager::new(SignersManagerConfig::new(
                 primary.uri(),
-                secondary.uri(),
+                second_loopback_host(&secondary.uri()),
                 Arc::clone(&audit),
                 log_path.clone(),
                 PASSPHRASE.to_owned(),
@@ -1161,12 +1163,17 @@ impl Harness {
             manager,
             timeouts,
             _dir: dir,
-            _secondary: secondary,
+            secondary,
         }
     }
 
-    /// A rule manager over the primary endpoint with this harness's signers
-    /// manager and audit writer, the production configuration.
+    /// The secondary endpoint, on a host apart from the primary's.
+    fn secondary_uri(&self) -> String {
+        second_loopback_host(&self.secondary.uri())
+    }
+
+    /// A rule manager over both endpoints with this harness's signers manager
+    /// and audit writer, the production configuration.
     fn rule_manager(&self) -> ContextRuleManager {
         ContextRuleManager::new(
             ContextRuleManagerConfig::new(
@@ -1175,6 +1182,7 @@ impl Harness {
                 self.timeouts.budget,
                 CHAIN_ID.to_owned(),
             )
+            .with_secondary_rpc_url(self.secondary_uri())
             .with_signers_manager(Arc::clone(&self.manager))
             .with_audit_writer(Arc::clone(&self.audit)),
         )
@@ -1563,6 +1571,7 @@ impl Harness {
         let rule_ids = [ContextRuleId::new(rule_id)];
         let smart_account = strkey(&smart_account());
         let uri = self.primary.uri();
+        let secondary_uri = self.secondary_uri();
         submit_signed_invoke(
             SubmitInvokeArgs::builder()
                 .target_contract(&smart_account)
@@ -1570,6 +1579,7 @@ impl Harness {
                 .host_function(noop())
                 .signer(&signer)
                 .primary_rpc_url(&uri)
+                .secondary_rpc_url(&secondary_uri)
                 .network_passphrase(PASSPHRASE)
                 .chain_id(CHAIN_ID)
                 .timeout(self.timeouts.budget)
@@ -1598,6 +1608,7 @@ impl Harness {
             rule_ids.iter().copied().map(ContextRuleId::new).collect();
         let smart_account = strkey(&smart_account());
         let uri = self.primary.uri();
+        let secondary_uri = self.secondary_uri();
         // The submission declares the subtree the mock reports for
         // `function`, so `pair` signs its two-context tree.
         let declared_calls: Vec<InvokeContractArgs> = sub_invocations(function)
@@ -1615,6 +1626,7 @@ impl Harness {
                 .sub_invocations(DeclaredSubInvocations::Calls(&declared_calls))
                 .signer(&signer)
                 .primary_rpc_url(&uri)
+                .secondary_rpc_url(&secondary_uri)
                 .network_passphrase(PASSPHRASE)
                 .chain_id(CHAIN_ID)
                 .timeout(self.timeouts.budget)
@@ -2123,6 +2135,7 @@ fn unroutable_args<'a>(
         .host_function(noop())
         .signer(signer)
         .primary_rpc_url(UNROUTABLE_RPC)
+        .secondary_rpc_url(UNROUTABLE_SECONDARY_RPC)
         .network_passphrase(PASSPHRASE)
         .chain_id(CHAIN_ID)
         .timeout(Duration::from_secs(10))
@@ -6182,12 +6195,15 @@ async fn simulate_install(
 
 /// A rule manager over the harness's endpoints with no signers manager.
 fn rule_manager_without_signers_manager(h: &Harness) -> ContextRuleManager {
-    ContextRuleManager::new(ContextRuleManagerConfig::new(
-        h.primary.uri(),
-        PASSPHRASE.to_owned(),
-        Duration::from_secs(10),
-        CHAIN_ID.to_owned(),
-    ))
+    ContextRuleManager::new(
+        ContextRuleManagerConfig::new(
+            h.primary.uri(),
+            PASSPHRASE.to_owned(),
+            Duration::from_secs(10),
+            CHAIN_ID.to_owned(),
+        )
+        .with_secondary_rpc_url(h.secondary_uri()),
+    )
     .unwrap()
 }
 
@@ -9680,6 +9696,7 @@ async fn an_incomplete_pin_record_refuses_signing_with_no_signature_and_no_send(
     let rule_ids = [ContextRuleId::new(1)];
     let smart_account = strkey(&smart_account());
     let uri = h.primary.uri();
+    let secondary_uri = h.secondary_uri();
     let err = submit_signed_invoke(
         SubmitInvokeArgs::builder()
             .target_contract(&smart_account)
@@ -9687,6 +9704,7 @@ async fn an_incomplete_pin_record_refuses_signing_with_no_signature_and_no_send(
             .host_function(noop())
             .signer(&signer)
             .primary_rpc_url(&uri)
+            .secondary_rpc_url(&secondary_uri)
             .network_passphrase(PASSPHRASE)
             .chain_id(CHAIN_ID)
             .timeout(h.timeouts.budget)

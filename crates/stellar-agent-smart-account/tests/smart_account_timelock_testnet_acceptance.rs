@@ -69,9 +69,8 @@ use stellar_agent_smart_account::timelock::{
     TimelockOperationStateView, cancel, execute, list_pending, query_operation_state,
     schedule_upgrade,
 };
-use stellar_agent_test_support::EchoIdResponder;
 use wiremock::{
-    Mock, MockServer,
+    Mock, MockServer, Request, Respond, ResponseTemplate,
     matchers::{method, path},
 };
 use zeroize::Zeroizing;
@@ -273,7 +272,7 @@ async fn t1_schedule_cancel_lifecycle() {
             .delay_ledgers(10)
             .signer(signer_box.as_ref())
             .primary_rpc_url(TESTNET_RPC_URL)
-            .secondary_rpc_url(TESTNET_RPC_URL)
+            .secondary_rpc_url(stellar_agent_test_support::testnet_secondary_rpc_url())
             .network_passphrase(TESTNET_PASSPHRASE)
             .audit_writer(&audit_writer)
             .request_id(&request_id_schedule)
@@ -315,7 +314,7 @@ async fn t1_schedule_cancel_lifecycle() {
             .operation_id(&operation_id)
             .signer(signer_box.as_ref())
             .primary_rpc_url(TESTNET_RPC_URL)
-            .secondary_rpc_url(TESTNET_RPC_URL)
+            .secondary_rpc_url(stellar_agent_test_support::testnet_secondary_rpc_url())
             .network_passphrase(TESTNET_PASSPHRASE)
             .audit_writer(&audit_writer)
             .request_id(&request_id_cancel)
@@ -438,7 +437,7 @@ async fn t2_schedule_ready_state_min_delay_zero() {
             .delay_ledgers(0) // delay_ledgers = 0 → immediately Ready
             .signer(signer_box.as_ref())
             .primary_rpc_url(TESTNET_RPC_URL)
-            .secondary_rpc_url(TESTNET_RPC_URL)
+            .secondary_rpc_url(stellar_agent_test_support::testnet_secondary_rpc_url())
             .network_passphrase(TESTNET_PASSPHRASE)
             .audit_writer(&audit_writer)
             .request_id(&request_id)
@@ -522,7 +521,7 @@ async fn t3_cancel_unknown_operation_id_rejected() {
             .operation_id(&random_op_id)
             .signer(signer_box.as_ref())
             .primary_rpc_url(TESTNET_RPC_URL)
-            .secondary_rpc_url(TESTNET_RPC_URL)
+            .secondary_rpc_url(stellar_agent_test_support::testnet_secondary_rpc_url())
             .network_passphrase(TESTNET_PASSPHRASE)
             .audit_writer(&audit_writer)
             .request_id(&request_id)
@@ -593,7 +592,7 @@ async fn t4_execute_not_ready_rejected() {
             .salt(random_salt)
             .signer(signer_box.as_ref())
             .primary_rpc_url(TESTNET_RPC_URL)
-            .secondary_rpc_url(TESTNET_RPC_URL)
+            .secondary_rpc_url(stellar_agent_test_support::testnet_secondary_rpc_url())
             .network_passphrase(TESTNET_PASSPHRASE)
             .audit_writer(&audit_writer)
             .request_id(&request_id)
@@ -627,9 +626,9 @@ async fn t4_execute_not_ready_rejected() {
             );
         }
         SaError::NetworkRpcDivergence { .. } => {
-            // Both RPCs returned the same Unset state; divergence not expected on single-RPC
-            // test setup but is an acceptable outcome (both RPCs are the same endpoint).
-            eprintln!("[T-4] PASS (divergence path — same RPC for primary+secondary)");
+            // Two providers can answer one read from different ledgers, and
+            // either refusal leaves the operation unexecuted.
+            eprintln!("[T-4] PASS (divergence path)");
         }
         other => panic!(
             "expected TimelockExecuteFailed {{ OperationNotReady {{ Unset }} }} \
@@ -676,7 +675,7 @@ async fn t5_schedule_emits_audit_row() {
             .delay_ledgers(DELAY_LEDGERS)
             .signer(signer_box.as_ref())
             .primary_rpc_url(TESTNET_RPC_URL)
-            .secondary_rpc_url(TESTNET_RPC_URL)
+            .secondary_rpc_url(stellar_agent_test_support::testnet_secondary_rpc_url())
             .network_passphrase(TESTNET_PASSPHRASE)
             .audit_writer(&audit_writer)
             .request_id(&request_id)
@@ -750,6 +749,81 @@ async fn t5_schedule_emits_audit_row() {
 
 // ── Dual-RPC divergence rejection on cross_confirm_event ────────────────
 
+/// A secondary endpoint that relays every request to the configured testnet
+/// secondary and strips the events from its `getTransaction` answers.
+///
+/// The proxy forwards ledger observations from the configured secondary and
+/// removes transaction events.
+struct EventStrippingSecondary {
+    upstream: &'static str,
+}
+
+impl EventStrippingSecondary {
+    /// A proxy in front of [`stellar_agent_test_support::testnet_secondary_rpc_url`].
+    fn relaying_to_the_testnet_secondary() -> Self {
+        Self {
+            upstream: stellar_agent_test_support::testnet_secondary_rpc_url(),
+        }
+    }
+
+    /// Relays the JSON-RPC request `body` to the upstream and returns its
+    /// answer.
+    ///
+    /// [`Respond::respond`] is synchronous and runs on the mock server's own
+    /// runtime, so the request goes out on a thread with a runtime of its
+    /// own.
+    fn relay(&self, body: &[u8]) -> Result<serde_json::Value, String> {
+        let upstream = self.upstream;
+        let body = body.to_vec();
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| format!("relay runtime: {e}"))?;
+            runtime.block_on(async move {
+                reqwest::Client::new()
+                    .post(upstream)
+                    .header(reqwest::header::CONTENT_TYPE, "application/json")
+                    .body(body)
+                    .timeout(Duration::from_secs(30))
+                    .send()
+                    .await
+                    .map_err(|e| format!("relay request: {e}"))?
+                    .error_for_status()
+                    .map_err(|e| format!("relay status: {e}"))?
+                    .json::<serde_json::Value>()
+                    .await
+                    .map_err(|e| format!("relay body: {e}"))
+            })
+        })
+        .join()
+        .map_err(|_| "the relay thread panicked".to_owned())?
+    }
+}
+
+impl Respond for EventStrippingSecondary {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        let transaction_lookup = serde_json::from_slice::<serde_json::Value>(&request.body)
+            .is_ok_and(|body| body["method"] == "getTransaction");
+        match self.relay(&request.body) {
+            Ok(mut answer) => {
+                if transaction_lookup
+                    && let Some(result) = answer
+                        .get_mut("result")
+                        .and_then(serde_json::Value::as_object_mut)
+                {
+                    result.remove("events");
+                }
+                ResponseTemplate::new(200).set_body_json(answer)
+            }
+            Err(reason) => {
+                eprintln!("[T-6] the relay to the configured secondary failed: {reason}");
+                ResponseTemplate::new(502)
+            }
+        }
+    }
+}
+
 /// Secondary RPC returns no events → `NetworkRpcDivergence` on cancel.
 ///
 /// Demonstrates dual-RPC defence-in-depth: a compromised or divergent secondary
@@ -760,9 +834,10 @@ async fn t5_schedule_emits_audit_row() {
 /// # Test strategy
 ///
 /// 1. Deploy a timelock contract on live testnet and schedule an operation.
-/// 2. Start a wiremock server to act as the secondary RPC.
-///    The wiremock returns a bare `SUCCESS` response with NO `events` field for
-///    any `getTransaction` call — mimicking a compromised RPC that strips event data.
+/// 2. Start a wiremock server to act as the secondary RPC. It relays every
+///    request to the configured testnet secondary and removes the `events`
+///    field from each `getTransaction` answer, mimicking a compromised RPC that
+///    strips event data.
 /// 3. Call `cancel(primary=testnet, secondary=wiremock)`.
 /// 4. The primary RPC confirms the `OperationCancelled` event is present (real
 ///    testnet response). The secondary wiremock returns no events → `secondary_found = false`.
@@ -798,7 +873,7 @@ async fn t6_cross_confirm_event_divergence_rejection() {
             .delay_ledgers(10)
             .signer(signer_box.as_ref())
             .primary_rpc_url(TESTNET_RPC_URL)
-            .secondary_rpc_url(TESTNET_RPC_URL) // secondary = testnet for schedule (no divergence here)
+            .secondary_rpc_url(stellar_agent_test_support::testnet_secondary_rpc_url())
             .network_passphrase(TESTNET_PASSPHRASE)
             .audit_writer(&audit_writer)
             .request_id(&request_id_schedule)
@@ -809,30 +884,14 @@ async fn t6_cross_confirm_event_divergence_rejection() {
     let operation_id = scheduled.operation_id;
     eprintln!("[T-6] scheduled: {}", operation_id.redacted());
 
-    // Start wiremock secondary that returns SUCCESS with NO events field.
-    // This mimics a compromised RPC stripping event data from getTransaction responses.
+    // The secondary mock relays to the configured testnet secondary, so the
+    // ledger witness reads that endpoint's network and height. It removes the
+    // `events` field from every getTransaction answer: `cross_confirm_event`
+    // then finds no contract event on the secondary.
     let secondary_mock = MockServer::start().await;
-
-    // The secondary responds to any POST (getTransaction, simulateTransaction, etc.)
-    // with a bare SUCCESS JSON-RPC response that has no `events` field.
-    // `cross_confirm_event` calls getTransaction on the secondary; `to_events()` on a
-    // response without `events` returns `None`, so `event_present_in_response` → false.
-    //
-    // EchoIdResponder mirrors the incoming JSON-RPC `id` back in the response so that
-    // the RPC client's per-request id validation succeeds regardless of the sequence
-    // counter value.
     Mock::given(method("POST"))
         .and(path("/"))
-        .respond_with(EchoIdResponder::new(serde_json::json!({
-            "status": "SUCCESS",
-            "latestLedger": 1001,
-            "latestLedgerCloseTime": "1234567890",
-            "oldestLedger": 1,
-            "oldestLedgerCloseTime": "1234000000",
-            "createdAt": "1234567890",
-            "ledger": 1000
-            // Note: no "events" field — simulates a compromised RPC stripping event data
-        })))
+        .respond_with(EventStrippingSecondary::relaying_to_the_testnet_secondary())
         .mount(&secondary_mock)
         .await;
 
@@ -954,7 +1013,7 @@ async fn t7_schedule_execute_min_delay_zero() {
             .delay_ledgers(0)
             .signer(signer_box_schedule.as_ref())
             .primary_rpc_url(TESTNET_RPC_URL)
-            .secondary_rpc_url(TESTNET_RPC_URL)
+            .secondary_rpc_url(stellar_agent_test_support::testnet_secondary_rpc_url())
             .network_passphrase(TESTNET_PASSPHRASE)
             .audit_writer(&audit_writer)
             .request_id(&request_id_schedule)
@@ -984,7 +1043,7 @@ async fn t7_schedule_execute_min_delay_zero() {
             .expected_operation_id(&scheduled.operation_id)
             .signer(signer_box_exec.as_ref())
             .primary_rpc_url(TESTNET_RPC_URL)
-            .secondary_rpc_url(TESTNET_RPC_URL)
+            .secondary_rpc_url(stellar_agent_test_support::testnet_secondary_rpc_url())
             .network_passphrase(TESTNET_PASSPHRASE)
             .audit_writer(&audit_writer)
             .request_id(&request_id_execute)

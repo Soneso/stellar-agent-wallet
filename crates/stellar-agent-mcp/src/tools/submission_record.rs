@@ -708,8 +708,9 @@ pub(crate) fn unresolved_from_defi(
 /// Renders a DeFi submit failure as a tool result.
 ///
 /// A policy denial renders as the dispatch gate renders one. A mainnet refusal
-/// reports `network.mainnet_write_forbidden`. An unresolved submission keeps
-/// its `submission.*` code and its `details`; everything else is reported under
+/// reports `network.mainnet_write_forbidden`. A signing refusal keeps its own
+/// code, with no transaction to reconcile. An unresolved submission keeps its
+/// `submission.*` code and its `details`; everything else is reported under
 /// `fallback_code`.
 pub(crate) fn defi_submit_error_result(
     error: &stellar_agent_defi::adapter::DefiAdapterError,
@@ -723,6 +724,11 @@ pub(crate) fn defi_submit_error_result(
         stellar_agent_defi::adapter::DefiAdapterError::MainnetWriteForbidden
     ) {
         return crate::tools::common::mainnet_write_forbidden_result();
+    }
+    if let stellar_agent_defi::adapter::DefiAdapterError::SigningRefusal { wire_code, message } =
+        error
+    {
+        return crate::tools::common::business_error_result(*wire_code, message.clone());
     }
     match unresolved_from_defi(error) {
         Some(unresolved) => unresolved_result(&unresolved),
@@ -887,6 +893,34 @@ mod tests {
                 code, "network.mainnet_write_forbidden",
                 "fallback {fallback}"
             );
+        }
+    }
+
+    /// A DeFi signing refusal reports its own code under every surface
+    /// fallback, with no transaction to reconcile.
+    #[test]
+    fn a_defi_signing_refusal_reports_its_own_code_without_a_transaction() {
+        for expected in [
+            "smart_account.ledger_witness_unavailable",
+            "simulation.divergence.ledger_skew",
+        ] {
+            let error = stellar_agent_defi::adapter::DefiAdapterError::SigningRefusal {
+                wire_code: expected,
+                message: "fixed".to_owned(),
+            };
+            for fallback in ["vault.submit_failed", "dex.submit_failed"] {
+                let result = defi_submit_error_result(&error, fallback);
+                let text = match &result.content[0].raw {
+                    rmcp::model::RawContent::Text(t) => t.text.clone(),
+                    other => panic!("expected text content; got {other:?}"),
+                };
+                let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+                assert_eq!(json["error"]["code"], expected, "fallback {fallback}");
+                assert!(
+                    json["error"]["details"].is_null(),
+                    "a refusal before signing names no transaction"
+                );
+            }
         }
     }
 

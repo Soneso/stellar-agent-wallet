@@ -507,6 +507,8 @@ async fn rules_create_pins_the_reference_and_verify_pins_reports_the_repoint() {
             "testnet",
             "--rpc-url",
             TESTNET_RPC_URL,
+            "--secondary-rpc-url",
+            stellar_agent_test_support::testnet_secondary_rpc_url(),
         ];
         if accept_mutable {
             args.push("--accept-mutable-verifier");
@@ -629,6 +631,8 @@ async fn rules_create_pins_the_reference_and_verify_pins_reports_the_repoint() {
         "testnet",
         "--rpc-url",
         TESTNET_RPC_URL,
+        "--secondary-rpc-url",
+        stellar_agent_test_support::testnet_secondary_rpc_url(),
     ];
     let (code, envelope, stdout, stderr) =
         run_cli(tmp.path(), &keyring_key, &execute_args, &execute_env);
@@ -688,6 +692,8 @@ async fn rules_create_pins_the_reference_and_verify_pins_reports_the_repoint() {
             "testnet",
             "--rpc-url",
             TESTNET_RPC_URL,
+            "--secondary-rpc-url",
+            stellar_agent_test_support::testnet_secondary_rpc_url(),
         ],
         &[],
     );

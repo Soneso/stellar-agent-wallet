@@ -308,7 +308,7 @@ fn fresh_rule_manager(
 ) -> ContextRuleManager {
     rule_manager_for_tests(
         TESTNET_RPC_URL,
-        None,
+        Some(stellar_agent_test_support::testnet_secondary_rpc_url()),
         Arc::clone(signers_manager),
         Arc::clone(audit_writer),
         Duration::from_secs(TIMEOUT_SECS),
@@ -326,7 +326,7 @@ fn fresh_signers_manager(
 ) -> Arc<SignersManager> {
     signers_manager_for_tests(
         TESTNET_RPC_URL,
-        TESTNET_RPC_URL,
+        stellar_agent_test_support::testnet_secondary_rpc_url(),
         audit_writer,
         audit_log_path,
         Duration::from_secs(TIMEOUT_SECS),

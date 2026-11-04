@@ -12,7 +12,7 @@
 //! | `--function <NAME>` | yes | Function name on the target contract. |
 //! | `--delay-ledgers <N>` | yes | Minimum delay in ledgers before execution. |
 //! | `--rpc-url <URL>` | no | Primary Soroban RPC; the profile endpoint when absent; refused on mainnet. |
-//! | `--secondary-rpc-url <URL>` | no | Secondary RPC for cross-RPC validation; the profile value when absent; refused on mainnet. |
+//! | `--secondary-rpc-url <URL>` | yes, unless the profile sets it | Ledger witness and cross-RPC validation, on a host other than the primary's; refused on mainnet. |
 //! | `--network {testnet\|mainnet}` | no | Must equal the profile's chain when given. |
 //! | `--signer-secret-env <VAR>` | no | Env var holding the proposer S-strkey. |
 //! | `--profile <NAME>` | no | Profile name. |
@@ -40,12 +40,11 @@ use serde::{Deserialize, Serialize};
 use stellar_agent_core::envelope::Envelope;
 use stellar_agent_core::observability::redact_strkey_first5_last5;
 use tracing::info;
-use url::Url;
 use uuid::Uuid;
 
 use crate::commands::smart_account::common::{
     SignerSourceFlags, emit_sa_error, load_command_profile, map_access_error, open_audit_writer,
-    resolve_signer,
+    resolve_signer, signing_secondary_rpc_url,
 };
 use crate::common::network::{
     EndpointFlags, EndpointUrlFlag, TargetNetwork, mainnet_write_refusal,
@@ -211,6 +210,13 @@ pub async fn run(args: &ScheduleArgs) -> i32 {
             }
         };
 
+    // The signature rests on a second endpoint's ledger observation; a command
+    // without one refuses before any key access.
+    let secondary_rpc_url = match signing_secondary_rpc_url(&context) {
+        Ok(url) => url.to_owned(),
+        Err(e) => return emit_sa_error(&e),
+    };
+
     let (signer, mlock_degradation) = match resolve_signer(
         &args.signer_source,
         &profile,
@@ -234,30 +240,6 @@ pub async fn run(args: &ScheduleArgs) -> i32 {
         &request_id,
     );
 
-    let secondary_rpc_url = context
-        .secondary_rpc_url
-        .clone()
-        .unwrap_or_else(|| context.rpc_url.clone());
-
-    // Log host-only at INFO; full URL at DEBUG.
-    // Self-hosted RPC at an internal hostname is non-public infrastructure.
-    let rpc_host = Url::parse(&context.rpc_url)
-        .ok()
-        .and_then(|u| u.host_str().map(str::to_owned))
-        .unwrap_or_else(|| "<unparseable>".to_owned());
-
-    // Warn when secondary == primary: the dual-RPC divergence defence is
-    // degraded. A single compromised RPC can satisfy both confirmation checks.
-    // Provide --secondary-rpc-url pointing to an independent endpoint.
-    if secondary_rpc_url == context.rpc_url {
-        info!(
-            request_id = %request_id,
-            rpc_host = %rpc_host,
-            "smart-account timelock schedule: --secondary-rpc-url not set or equals \
-             --rpc-url; cross-RPC divergence defence is degraded — \
-             provide an independent secondary RPC endpoint for production use"
-        );
-    }
     tracing::debug!(
         rpc_url = %stellar_agent_core::redact::redact_url_authority(&context.rpc_url),
         "schedule rpc_url"

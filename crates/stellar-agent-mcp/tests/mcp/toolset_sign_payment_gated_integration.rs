@@ -2011,6 +2011,9 @@ async fn rule_create_retry_after_a_failed_install_is_refused_as_consumed() {
     write_pin_with_capabilities(toolsets_dir.path(), TOOLSET_NAME, &["sign-rule-create"]);
     let mut profile = testnet_profile();
     profile.rpc_url = rpc.https_uri();
+    profile.secondary_rpc_url = Some(stellar_agent_test_support::second_loopback_host(
+        &profile.rpc_url,
+    ));
     crate::common::install_test_audit_key(&mut profile);
     seed_attestation_key(&profile, &key);
     // The signer is seeded from a deterministic test seed, so the commit

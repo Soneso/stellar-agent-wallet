@@ -28,10 +28,10 @@
 //! testnet RPC and Friendbot. Each deploys the vendored router
 //! ([`MULTICALL_WASM`]) from a funded ephemeral deployer with a fresh salt,
 //! unless `STELLAR_AGENT_TESTNET_MULTICALL_ROUTER_ADDRESS` names a deployed
-//! router C-strkey. `STELLAR_AGENT_TESTNET_SECONDARY_RPC_URL` optionally names
-//! a second Soroban RPC endpoint for the cross-RPC trust-anchor check; without
-//! it the primary endpoint stands in as the secondary, so the check compares
-//! one provider with itself. An empty variable counts as unset. An override
+//! router C-strkey. `STELLAR_AGENT_TESTNET_SECONDARY_RPC_URL` names the second
+//! Soroban RPC endpoint of the ledger witness and the cross-RPC trust-anchor
+//! check, on a host other than the primary's; the suite fails without it. An
+//! empty variable counts as unset. An override
 //! that does not parse, and a router deployment that fails, fail the test.
 //! `h2_per_period_cap_deny_at_inner_3` and `h3_bundle_aggregate_cap_deny` are
 //! host-side and require no network access.
@@ -113,9 +113,6 @@ const TIMEOUT_SECS: u64 = 120;
 /// deployment.
 const ROUTER_ADDRESS_ENV: &str = "STELLAR_AGENT_TESTNET_MULTICALL_ROUTER_ADDRESS";
 
-/// Names a second Soroban RPC endpoint for the cross-RPC trust-anchor check.
-const SECONDARY_RPC_URL_ENV: &str = "STELLAR_AGENT_TESTNET_SECONDARY_RPC_URL";
-
 /// The symbol the native asset's SAC returns from `symbol`.
 const NATIVE_ASSET_SYMBOL: &str = "native";
 
@@ -132,6 +129,11 @@ const DUMMY_C_STRKEY: &str = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
 
 /// A different valid all-zero G-strkey used as dummy receiver.
 const DUMMY_G_STRKEY_TO: &str = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF";
+
+/// The secondary endpoint of the host-side cap cases. They refuse before any
+/// request, at the policy gate or the router registry lookup, so the name
+/// never resolves.
+const HOST_SIDE_SECONDARY_RPC_URL: &str = "https://host-side-secondary-never-dialed.invalid";
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -239,29 +241,6 @@ async fn multicall_router() -> String {
     .await
     .unwrap_or_else(|e| panic!("the vendored multicall router must deploy on testnet: {e}"))
     .contract
-}
-
-/// The secondary endpoint of the cross-RPC trust-anchor check: the URL named
-/// by [`SECONDARY_RPC_URL_ENV`], or the primary endpoint. The primary
-/// standing in as the secondary does not demonstrate verification against an
-/// independent provider.
-///
-/// # Panics
-///
-/// Panics when the override is not an `http` or `https` URL.
-fn secondary_rpc_url() -> String {
-    match env_override(SECONDARY_RPC_URL_ENV) {
-        Some(url) => {
-            let parsed = reqwest::Url::parse(&url)
-                .unwrap_or_else(|e| panic!("{SECONDARY_RPC_URL_ENV} must be a URL: {e}"));
-            assert!(
-                matches!(parsed.scheme(), "http" | "https"),
-                "{SECONDARY_RPC_URL_ENV} must be an http or https URL"
-            );
-            url
-        }
-        None => TESTNET_RPC_URL.to_owned(),
-    }
 }
 
 /// [`LIVE_INNER_COUNT`] calls of the native asset SAC's `symbol`.
@@ -398,13 +377,14 @@ fn registry_with_entry(router_address: &str) -> MulticallRegistry {
 /// - Each inner's return value decodes to the native asset's symbol
 ///
 /// The router is [`multicall_router`]'s and the secondary endpoint
-/// [`secondary_rpc_url`]'s; see the module's gating section.
+/// [`stellar_agent_test_support::testnet_secondary_rpc_url`]'s; see the
+/// module's gating section.
 #[tokio::test]
 #[serial_test::serial]
 async fn h1_three_native_sac_symbol_calls_confirm() {
     let data_root = tempfile::tempdir().expect("temporary wallet data root");
     let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(data_root.path());
-    let secondary_rpc_url = secondary_rpc_url();
+    let secondary_rpc_url = stellar_agent_test_support::testnet_secondary_rpc_url();
 
     // ── Step 1: Fresh signer + fund ───────────────────────────────────────────
     let (signer_g, signer_box) = fresh_signer();
@@ -427,7 +407,7 @@ async fn h1_three_native_sac_symbol_calls_confirm() {
     // ── Step 4: Submit the multicall bundle ───────────────────────────────────
     let signers_manager = pin_check_manager::pin_check_manager(
         TESTNET_RPC_URL,
-        &secondary_rpc_url,
+        secondary_rpc_url,
         "multicall-acceptance",
         data_root.path(),
     );
@@ -438,7 +418,7 @@ async fn h1_three_native_sac_symbol_calls_confirm() {
             bundle: native_symbol_bundle(),
             signer: signer_box.as_ref(),
             primary_rpc_url: TESTNET_RPC_URL,
-            secondary_rpc_url: &secondary_rpc_url,
+            secondary_rpc_url,
             network_passphrase: TESTNET_PASSPHRASE,
             policy_engine,
             profile: &profile,
@@ -533,7 +513,7 @@ async fn check_host_cap(
     let (_, signer) = fresh_signer();
     let manager = pin_check_manager::pin_check_manager(
         TESTNET_RPC_URL,
-        TESTNET_RPC_URL,
+        HOST_SIDE_SECONDARY_RPC_URL,
         "multicall-acceptance",
         dir.path(),
     );
@@ -547,7 +527,7 @@ async fn check_host_cap(
                     .collect(),
                 signer: signer.as_ref(),
                 primary_rpc_url: TESTNET_RPC_URL,
-                secondary_rpc_url: TESTNET_RPC_URL,
+                secondary_rpc_url: HOST_SIDE_SECONDARY_RPC_URL,
                 network_passphrase: TESTNET_PASSPHRASE,
                 policy_engine: Arc::clone(&engine),
                 profile: &profile,
@@ -610,14 +590,15 @@ fn audit_writer_in(dir: &std::path::Path) -> (Arc<Mutex<AuditWriter>>, std::path
 /// and the denied-bundle row into the first log.
 ///
 /// Each bundle is three native-SAC `symbol` calls. The router is
-/// [`multicall_router`]'s and the secondary endpoint [`secondary_rpc_url`]'s;
+/// [`multicall_router`]'s and the secondary endpoint
+/// [`stellar_agent_test_support::testnet_secondary_rpc_url`]'s;
 /// see the module's gating section.
 #[tokio::test]
 #[serial_test::serial]
 async fn h5_bundle_under_a_rule_other_than_0_checks_its_signer_set() {
     let data_root = tempfile::tempdir().expect("temporary wallet data root");
     let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(data_root.path());
-    let secondary_rpc_url = secondary_rpc_url();
+    let secondary_rpc_url = stellar_agent_test_support::testnet_secondary_rpc_url();
     let timeout = Duration::from_secs(TIMEOUT_SECS);
     let rid = || uuid::Uuid::new_v4().to_string();
 
@@ -635,14 +616,14 @@ async fn h5_bundle_under_a_rule_other_than_0_checks_its_signer_set() {
     let (writer, log_path) = audit_writer_in(log_dir.path());
     let signers_manager = signers_manager_for_tests(
         TESTNET_RPC_URL,
-        &secondary_rpc_url,
+        secondary_rpc_url,
         Arc::clone(&writer),
         log_path,
         timeout,
     );
     let rule_manager = rule_manager_for_tests(
         TESTNET_RPC_URL,
-        None,
+        Some(stellar_agent_test_support::testnet_secondary_rpc_url()),
         Arc::clone(&signers_manager),
         Arc::clone(&writer),
         timeout,
@@ -687,7 +668,7 @@ async fn h5_bundle_under_a_rule_other_than_0_checks_its_signer_set() {
                 bundle: native_symbol_bundle(),
                 signer: signer_box.as_ref(),
                 primary_rpc_url: TESTNET_RPC_URL,
-                secondary_rpc_url: &secondary_rpc_url,
+                secondary_rpc_url,
                 network_passphrase: TESTNET_PASSPHRASE,
                 policy_engine: policy_engine_allow_all(),
                 profile: &profile,
@@ -724,7 +705,7 @@ async fn h5_bundle_under_a_rule_other_than_0_checks_its_signer_set() {
     let (other_writer, other_log_path) = audit_writer_in(other_dir.path());
     let other_manager = signers_manager_for_tests(
         TESTNET_RPC_URL,
-        &secondary_rpc_url,
+        secondary_rpc_url,
         other_writer,
         other_log_path,
         timeout,

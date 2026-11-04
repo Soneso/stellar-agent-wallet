@@ -24,7 +24,7 @@ serde_json = { workspace = true, optional = true }
 stellar-strkey = { workspace = true, optional = true }
 stellar-xdr = { workspace = true, optional = true }
 tempfile = { workspace = true, optional = true }
-tokio = { workspace = true, features = ["net"], optional = true }
+tokio = { workspace = true, features = ["io-util", "net", "rt-multi-thread", "time"], optional = true }
 wiremock = { workspace = true, optional = true }
 ed25519-dalek = { workspace = true, optional = true }
 p256 = { workspace = true, optional = true }
@@ -37,6 +37,11 @@ zeroize = { workspace = true, optional = true }
 
 # In-memory mock keyring store; full rationale in `src/keyring_mock.rs`.
 keyring-core = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+# The error code of an unsupported address family, which tells the loopback
+# forwarder that the host has no IPv6 loopback.
+libc = { workspace = true, optional = true }
 
 [dev-dependencies]
 # Serialises tests that touch process-global state (the keyring default store
@@ -51,6 +56,7 @@ test-helpers = [
     "dep:async-trait",
     "dep:base64",
     "dep:ed25519-dalek",
+    "dep:libc",
     "dep:p256",
     "dep:serde_json",
     "dep:sha2",

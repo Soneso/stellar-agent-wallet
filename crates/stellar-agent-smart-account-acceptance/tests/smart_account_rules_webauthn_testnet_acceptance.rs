@@ -789,7 +789,11 @@ async fn webauthn_passkey_signing_testnet_acceptance() {
     // rule's baseline, and the passkey path compares the chain with it before
     // the ceremony.
     let (rule_manager, signers_manager, signers_audit_log_path, _signers_audit_dir) =
-        managers_for_tests(TESTNET_RPC_URL, TESTNET_RPC_URL, Duration::from_secs(120));
+        managers_for_tests(
+            TESTNET_RPC_URL,
+            stellar_agent_test_support::testnet_secondary_rpc_url(),
+            Duration::from_secs(120),
+        );
     let signer_addr =
         parse_g_strkey_to_signer_address(&signer_g).expect("signer G-strkey must parse");
 

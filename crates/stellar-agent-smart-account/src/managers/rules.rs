@@ -94,11 +94,12 @@ pub struct ContextRuleManagerConfig {
     /// (for `fetch_account` + `submit_transaction_and_wait`) from this URL.
     pub primary_rpc_url: String,
 
-    /// Secondary Soroban RPC URL for cross-RPC simulation checks.
+    /// Secondary Soroban RPC URL: the ledger witness of every signing verb.
     ///
-    /// When `None`, the cross-RPC step in
-    /// [`crate::submit::submit_signed_invoke`] is a passthrough. When set,
-    /// it is populated from `Profile.secondary_rpc_url` for the multicall path.
+    /// Read verbs run without one. [`crate::submit::submit_signed_invoke`]
+    /// refuses a signing verb when this is `None`, with
+    /// [`SaError::LedgerWitnessUnavailable`]. It is populated from
+    /// `Profile.secondary_rpc_url`.
     pub secondary_rpc_url: Option<String>,
     /// Stellar network passphrase used to compute the network ID hash for the
     /// auth-digest preimage and the SEP-23 source-account signature payload.
@@ -3686,8 +3687,8 @@ pub fn parse_delegated_signer_address(s: &str) -> Result<ScAddress, SaError> {
 /// resource fee is added on top per `min_resource_fee`.
 pub(crate) const BASE_FEE_STROOPS: u32 = 100;
 
-/// Number of ledgers ahead of `latest_ledger` to set as
-/// `signature_expiration_ledger` on prepared smart-account auth entries.
+/// Number of ledgers beyond the lower member of the witnessed ledger pair to
+/// set as `signature_expiration_ledger` on prepared smart-account auth entries.
 ///
 /// At ~5 s per ledger this is ~8 minutes, well above the testnet/mainnet
 /// transaction inclusion window plus simulate-to-submit slack (typically
@@ -3695,10 +3696,19 @@ pub(crate) const BASE_FEE_STROOPS: u32 = 100;
 /// be replayed indefinitely. js-stellar-base's `authorizeEntry` uses 1000
 /// in its example flow; the Python SDK defaults to 100. We pick 100 as
 /// a reasonable replay-window vs. inclusion-headroom tradeoff.
+///
+/// The bound holds against a hostile primary because the height comes from
+/// [`crate::signing::ledger_witness::WitnessedLedgerBound`], which needs a
+/// second endpoint's agreement. It assumes at least one of the two endpoints
+/// reports the chain honestly.
 pub(crate) const AUTH_VALIDITY_LEDGERS: u32 = 100;
 
-/// Validates an RPC-returned `latest_ledger` before it is bound into a
-/// `signature_expiration_ledger` auth-digest preimage.
+/// Validates that an RPC-returned `latest_ledger` is a plausible integer.
+///
+/// This is integer validation and witnesses nothing about the chain: any
+/// height inside the bounds passes, however far from the chain's real height.
+/// The independently witnessed bound is
+/// [`crate::signing::ledger_witness::WitnessedLedgerBound`].
 ///
 /// Two invariants are checked:
 ///
@@ -3708,12 +3718,9 @@ pub(crate) const AUTH_VALIDITY_LEDGERS: u32 = 100;
 ///    RPC response.
 ///
 /// 2. `latest_ledger <= u32::MAX - AUTH_VALIDITY_LEDGERS - 1_000_000` —
-///    ensures that `latest_ledger.saturating_add(AUTH_VALIDITY_LEDGERS)` will
-///    not overflow and that there is at least 1_000_000 ledger headroom
-///    above the operational ceiling.  Values above this bound indicate a
-///    far-future or fabricated ledger number; rejecting them prevents an
-///    RPC-supplied value from producing a signature with an implausibly
-///    distant expiry that could bypass relay-window assumptions.
+///    leaves 1_000_000 ledgers of headroom above the height an expiry is
+///    derived from. Values above this bound indicate a far-future or
+///    fabricated ledger number.
 ///
 /// # Errors
 ///
@@ -5334,6 +5341,10 @@ pub(crate) fn sa_error_to_invocation_result(
         // MainnetWriteForbidden: refused before signing or before the send;
         // nothing reached the network as a transaction.
         SaError::MainnetWriteForbidden => SaInvocationResult::PreSubmissionRefused,
+        // Ledger witness refusals: raised before anything is signed.
+        SaError::LedgerWitnessUnavailable { .. } | SaError::LedgerWitnessMismatch { .. } => {
+            SaInvocationResult::PreSubmissionRefused
+        }
         // AuthEntryBindingMismatch: refused before any signer key access.
         SaError::AuthEntryBindingMismatch { .. } => SaInvocationResult::PreSubmissionRefused,
         // MulticallSha256Drift: fires at registry-lookup time, before any I/O.
@@ -7045,8 +7056,8 @@ mod tests {
         );
     }
 
-    /// `new` leaves `secondary_rpc_url` as `None` (cross-RPC checks bypassed
-    /// when not configured).
+    /// `new` leaves `secondary_rpc_url` as `None`; reads remain available, but
+    /// signing requires a configured witness.
     #[test]
     fn config_new_leaves_secondary_rpc_url_none() {
         let cfg = ContextRuleManagerConfig::new(
@@ -10076,9 +10087,10 @@ mod tests {
         let writer = Arc::new(Mutex::new(
             AuditWriter::open(audit_path.clone(), None).unwrap(),
         ));
+        let secondary = stellar_agent_test_support::second_loopback_host(&server.uri());
         let signers = crate::test_helpers::signers_manager_for_tests(
             &server.uri(),
-            &server.uri(),
+            &secondary,
             Arc::clone(&writer),
             audit_path,
             Duration::from_secs(1),
@@ -10086,11 +10098,185 @@ mod tests {
         crate::managers::signers::tests::write_entry_guard_baselines(&signers, &testnet_target());
         crate::test_helpers::rule_manager_for_tests(
             &server.uri(),
-            None,
+            Some(&secondary),
             signers,
             writer,
             Duration::from_secs(1),
         )
+    }
+
+    /// The wallet the expiry-check submissions below sign for.
+    const EXPIRY_CHECK_WALLET: [u8; 32] = [0x62; 32];
+    /// The seed of the signer of the expiry-check submissions below.
+    const EXPIRY_CHECK_SEED: [u8; 32] = [0x61; 32];
+
+    /// An endpoint at `ledger` whose every simulation returns rule 0 with
+    /// `valid_until`.
+    fn rule_read_rpc(
+        valid_until: u32,
+        ledger: u32,
+    ) -> stellar_agent_test_support::auth_tree_rpc::AuthTreeRpc {
+        use stellar_agent_test_support::auth_tree_rpc::AuthTreeRpc;
+        use stellar_agent_test_support::signed_envelope::account_id_for_seed;
+
+        let wallet = ScAddress::Contract(ContractId(Hash(EXPIRY_CHECK_WALLET)));
+        let rule = synthetic_context_rule_scval(0, "rule", "Default", 1, 0, Some(valid_until));
+        AuthTreeRpc::new(
+            stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE,
+            wallet,
+        )
+        .account(&account_id_for_seed(EXPIRY_CHECK_SEED))
+        .latest_ledger(ledger)
+        .tree(|invoke| {
+            Some(SorobanAuthorizedInvocation {
+                function: stellar_xdr::SorobanAuthorizedFunction::ContractFn(invoke.clone()),
+                sub_invocations: VecM::default(),
+            })
+        })
+        .returns(move |_| rule.clone())
+    }
+
+    /// Submits under an expiry check of rule 0 and returns the result with the
+    /// sent envelopes. A refusal signs nothing and sends nothing.
+    async fn submit_under_expiry_check(
+        primary: stellar_agent_test_support::auth_tree_rpc::AuthTreeRpc,
+        secondary: stellar_agent_test_support::auth_tree_rpc::AuthTreeRpc,
+    ) -> (
+        Result<crate::submit::SubmitInvokeResult, SaError>,
+        Vec<stellar_xdr::TransactionEnvelope>,
+    ) {
+        let primary = primary.start().await;
+        let secondary = secondary.start().await;
+        let signer =
+            stellar_agent_network::signing::test_doubles::CountingSigner::new(EXPIRY_CHECK_SEED);
+        let result = crate::submit::submit_signed_invoke(
+            crate::submit::SubmitInvokeArgs::builder()
+                .target_contract(&stellar_strkey::Contract(EXPIRY_CHECK_WALLET).to_string())
+                .auth_rule_ids(&[ContextRuleId::new(0)])
+                .host_function(HostFunction::InvokeContract(InvokeContractArgs {
+                    contract_address: ScAddress::Contract(ContractId(Hash(EXPIRY_CHECK_WALLET))),
+                    function_name: ScSymbol::try_from("noop").unwrap(),
+                    args: VecM::default(),
+                }))
+                .signer(&signer)
+                .primary_rpc_url(&primary.uri())
+                .secondary_rpc_url(&stellar_agent_test_support::second_loopback_host(
+                    &secondary.uri(),
+                ))
+                .network_passphrase(stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE)
+                .chain_id("stellar:testnet")
+                .timeout(Duration::from_secs(60))
+                .op_label("rule_expiry_test")
+                .expiry_check(ExpiryCheck { rule_id: 0 })
+                .build(),
+        )
+        .await;
+        let sent = primary.sent();
+        if result.is_err() {
+            assert_eq!(signer.sign_calls(), 0, "a refusal signs nothing");
+            assert!(sent.is_empty(), "a refusal sends nothing");
+        }
+        (result, sent)
+    }
+
+    /// The submission under a rule with `valid_until`, the primary at 1000 and
+    /// the secondary at 1002.
+    async fn submit_under_rule_valid_until(
+        valid_until: u32,
+    ) -> Result<crate::submit::SubmitInvokeResult, SaError> {
+        submit_under_expiry_check(
+            rule_read_rpc(valid_until, 1000),
+            rule_read_rpc(valid_until, 1002),
+        )
+        .await
+        .0
+    }
+
+    /// The signature expiration ledger of every address credential in `sent`.
+    fn signature_expirations(sent: &[stellar_xdr::TransactionEnvelope]) -> Vec<u32> {
+        sent.iter()
+            .flat_map(|envelope| {
+                let stellar_xdr::TransactionEnvelope::Tx(tx) = envelope else {
+                    panic!("a v1 envelope");
+                };
+                let OperationBody::InvokeHostFunction(invoke) = &tx.tx.operations[0].body else {
+                    panic!("an invoke operation");
+                };
+                invoke.auth.to_vec()
+            })
+            .filter_map(|entry| match entry.credentials {
+                SorobanCredentials::Address(credentials) => {
+                    Some(credentials.signature_expiration_ledger)
+                }
+                SorobanCredentials::SourceAccount => None,
+                other => panic!("an address credential, got {other:?}"),
+            })
+            .collect()
+    }
+
+    /// Outlasts a ledger observation. The age is wall-clock time: the requests
+    /// travel over real sockets, which a paused clock cannot serve.
+    const RULE_READ_OUTLASTS_OBSERVATION: Duration = Duration::from_millis(10_500);
+
+    /// A pair that goes stale during the rule read is read again as a pair, and
+    /// the signatures rest on the new pair: (1002, 1001), not (1000, 1001).
+    #[tokio::test]
+    async fn a_pair_gone_stale_during_the_rule_read_is_read_again() {
+        let primary = rule_read_rpc(1200, 1000)
+            .slow_simulations(2..3, RULE_READ_OUTLASTS_OBSERVATION)
+            .latest_ledger_after_simulation(2, 1002);
+
+        let (result, sent) = submit_under_expiry_check(primary, rule_read_rpc(1200, 1001)).await;
+
+        assert!(result.is_ok(), "{:?}", result.err());
+        let expirations = signature_expirations(&sent);
+        assert!(!expirations.is_empty());
+        assert!(
+            expirations.iter().all(|expiry| *expiry == 1101),
+            "{expirations:?}"
+        );
+    }
+
+    /// A second pair that also goes stale during its rule read signs nothing.
+    #[tokio::test]
+    async fn a_pair_stale_again_after_the_second_rule_read_refuses() {
+        let primary =
+            rule_read_rpc(1200, 1000).slow_simulations(2..4, RULE_READ_OUTLASTS_OBSERVATION);
+
+        let (result, _) = submit_under_expiry_check(primary, rule_read_rpc(1200, 1001)).await;
+
+        let Err(error) = result else {
+            panic!("a stale pair refuses");
+        };
+        assert_eq!(
+            error.wire_code(),
+            "smart_account.ledger_witness_unavailable",
+            "{error:?}"
+        );
+    }
+
+    /// A rule must still be valid at the higher member of a witnessed pair: the
+    /// primary at 1000 cannot keep alive a rule the secondary at 1002 sees
+    /// expired.
+    #[tokio::test]
+    async fn rule_validity_uses_the_higher_witnessed_ledger() {
+        match submit_under_rule_valid_until(1001).await {
+            Err(SaError::RuleExpired {
+                valid_until,
+                current,
+                ..
+            }) => {
+                assert_eq!(valid_until, 1001);
+                assert_eq!(current, 1002);
+            }
+            other => panic!("expected the expiry refusal, got {:?}", other.err()),
+        }
+        let at_the_higher_ledger = submit_under_rule_valid_until(1002).await;
+        assert!(
+            at_the_higher_ledger.is_ok(),
+            "{:?}",
+            at_the_higher_ledger.err()
+        );
     }
 
     /// The testnet write passes its guard and reaches the first RPC.

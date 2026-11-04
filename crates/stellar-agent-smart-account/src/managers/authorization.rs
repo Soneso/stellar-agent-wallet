@@ -37,8 +37,9 @@ use thiserror::Error;
 
 use crate::SaError;
 use crate::managers::auth_entry::{
-    AuthorizationSimulation, PartialSorobanAuthorizationEntry, build_authorization_entry,
-    complete_authorization_entry_multi_signer, network_id_of,
+    AuthorizationSimulation, PartialSorobanAuthorizationEntry, PreSubmitBudget,
+    SIGN_AUTH_DIGEST_STAGE, build_authorization_entry,
+    complete_authorization_entry_multi_signer_within_budget, network_id_of, sign_within_budget,
 };
 use crate::managers::rules::build_and_sign_delegated_g_key_entry;
 use stellar_agent_core::profile::caip2::MAINNET_PASSPHRASE;
@@ -470,15 +471,108 @@ pub async fn collect_quorum_signatures(
     network_passphrase: &str,
     signature_expiration_ledger: u32,
 ) -> Result<Vec<SorobanAuthorizationEntry>, QuorumError> {
+    collect_quorum_signatures_within_budget(
+        checked_rules,
+        authz,
+        signers,
+        auth_scaddr,
+        function_name,
+        args,
+        auth_rule_ids,
+        simulation,
+        envelope,
+        network_passphrase,
+        signature_expiration_ledger,
+        None,
+    )
+    .await
+    .map_err(QuorumFailure::into_quorum_error)
+}
+
+/// Why [`collect_quorum_signatures_within_budget`] produced no entries.
+#[derive(Debug)]
+pub(crate) enum QuorumFailure {
+    /// The quorum could not be signed, as [`collect_quorum_signatures`]
+    /// reports it.
+    Quorum(QuorumError),
+    /// The pre-submit deadline passed at a signer call: the refusal of
+    /// [`sign_within_budget`], or the error a signer call ended in once the
+    /// deadline had passed. Nothing further was signed.
+    Deadline(SaError),
+}
+
+impl From<QuorumError> for QuorumFailure {
+    fn from(error: QuorumError) -> Self {
+        Self::Quorum(error)
+    }
+}
+
+impl QuorumFailure {
+    /// The failure as [`collect_quorum_signatures`] reports it, where no
+    /// deadline bounds the signer calls.
+    fn into_quorum_error(self) -> QuorumError {
+        match self {
+            Self::Quorum(error) => error,
+            Self::Deadline(error) => QuorumError::SignatureProductionFailed {
+                detail: error.to_string(),
+            },
+        }
+    }
+
+    /// The failure of a signing step that met `error`: once the deadline of
+    /// `budget` has passed, `error` is the deadline's, since every signer
+    /// call that ends at or after it is refused (see [`sign_within_budget`]).
+    /// Before it, `error` is the quorum's signature failure, described by
+    /// `context`.
+    fn of_signing(budget: Option<PreSubmitBudget>, context: &str, error: SaError) -> Self {
+        if budget.is_some_and(|budget| tokio::time::Instant::now() >= budget.deadline) {
+            Self::Deadline(error)
+        } else {
+            Self::Quorum(QuorumError::SignatureProductionFailed {
+                detail: format!("{context}{error}"),
+            })
+        }
+    }
+}
+
+/// [`collect_quorum_signatures`] with every signer call bounded by `budget`
+/// when there is one (see [`sign_within_budget`]): the key reads and the
+/// auth-digest signatures at [`SIGN_AUTH_DIGEST_STAGE`], the delegated G-key
+/// entries at
+/// [`SIGN_DELEGATED_ENTRY_STAGE`](crate::managers::auth_entry::SIGN_DELEGATED_ENTRY_STAGE).
+/// A signature cut at the deadline is followed by no other.
+///
+/// # Errors
+///
+/// [`QuorumFailure::Quorum`] with every error of [`collect_quorum_signatures`],
+/// and [`QuorumFailure::Deadline`] when the deadline passes at a signer call.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the parameters of collect_quorum_signatures plus the pre-submit budget"
+)]
+pub(crate) async fn collect_quorum_signatures_within_budget(
+    checked_rules: CheckedSigningRules,
+    authz: &AuthorizationInfo,
+    signers: &[&(dyn Signer + Send + Sync)],
+    auth_scaddr: ScAddress,
+    function_name: ScSymbol,
+    args: Vec<ScVal>,
+    auth_rule_ids: Vec<ContextRuleId>,
+    simulation: &AuthorizationSimulation,
+    envelope: &crate::signing::divergence::EnvelopeContext,
+    network_passphrase: &str,
+    signature_expiration_ledger: u32,
+    budget: Option<PreSubmitBudget>,
+) -> Result<Vec<SorobanAuthorizationEntry>, QuorumFailure> {
     if network_passphrase == MAINNET_PASSPHRASE {
-        return Err(QuorumError::MainnetWriteForbidden);
+        return Err(QuorumError::MainnetWriteForbidden.into());
     }
     if network_id_of(network_passphrase) != simulation.network_id {
-        return Err(QuorumError::MainnetWriteForbidden);
+        return Err(QuorumError::MainnetWriteForbidden.into());
     }
 
     if authz.groups.is_empty() {
-        return Err(QuorumError::EmptyAuthorizationInfo);
+        return Err(QuorumError::EmptyAuthorizationInfo.into());
     }
 
     checked_rules
@@ -493,9 +587,9 @@ pub async fn collect_quorum_signatures(
     let mut resolved: Vec<([u8; 32], &(dyn Signer + Send + Sync))> =
         Vec::with_capacity(signers.len());
     for &s in signers {
-        let pk = s
-            .public_key()
+        let pk = sign_within_budget(budget, SIGN_AUTH_DIGEST_STAGE, s.public_key())
             .await
+            .map_err(QuorumFailure::Deadline)?
             .map_err(|e| QuorumError::SignatureProductionFailed {
                 detail: format!("public_key fetch failed: {e}"),
             })?;
@@ -516,6 +610,7 @@ pub async fn collect_quorum_signatures(
                 envelope,
                 network_passphrase,
                 signature_expiration_ledger,
+                budget,
             )
             .await
         }
@@ -532,6 +627,7 @@ pub async fn collect_quorum_signatures(
                 envelope,
                 network_passphrase,
                 signature_expiration_ledger,
+                budget,
             )
             .await
         }
@@ -559,7 +655,8 @@ async fn collect_and(
     envelope: &crate::signing::divergence::EnvelopeContext,
     network_passphrase: &str,
     signature_expiration_ledger: u32,
-) -> Result<Vec<SorobanAuthorizationEntry>, QuorumError> {
+    budget: Option<PreSubmitBudget>,
+) -> Result<Vec<SorobanAuthorizationEntry>, QuorumFailure> {
     let mut all_entries: Vec<SorobanAuthorizationEntry> = Vec::new();
     let mut unsatisfied: Vec<String> = Vec::new();
 
@@ -576,11 +673,12 @@ async fn collect_and(
             envelope,
             network_passphrase,
             signature_expiration_ledger,
+            budget,
         )
         .await
         {
             Ok(entries) => all_entries.extend(entries),
-            Err(QuorumError::InsufficientSignersInGroup { .. }) => {
+            Err(QuorumFailure::Quorum(QuorumError::InsufficientSignersInGroup { .. })) => {
                 unsatisfied.push(group.name.clone());
             }
             Err(e) => return Err(e),
@@ -590,7 +688,8 @@ async fn collect_and(
     if !unsatisfied.is_empty() {
         return Err(QuorumError::GroupNotSatisfiedInAndCombinator {
             unsatisfied_groups: unsatisfied,
-        });
+        }
+        .into());
     }
 
     Ok(all_entries)
@@ -613,7 +712,8 @@ async fn collect_or(
     envelope: &crate::signing::divergence::EnvelopeContext,
     network_passphrase: &str,
     signature_expiration_ledger: u32,
-) -> Result<Vec<SorobanAuthorizationEntry>, QuorumError> {
+    budget: Option<PreSubmitBudget>,
+) -> Result<Vec<SorobanAuthorizationEntry>, QuorumFailure> {
     let group_names: Vec<String> = authz.groups.iter().map(|g| g.name.clone()).collect();
 
     for (group, checked) in authz.groups.iter().zip(checked_rules) {
@@ -629,11 +729,12 @@ async fn collect_or(
             envelope,
             network_passphrase,
             signature_expiration_ledger,
+            budget,
         )
         .await
         {
             Ok(entries) => return Ok(entries),
-            Err(QuorumError::InsufficientSignersInGroup { .. }) => {
+            Err(QuorumFailure::Quorum(QuorumError::InsufficientSignersInGroup { .. })) => {
                 // Try next group.
             }
             Err(e) => return Err(e),
@@ -642,7 +743,8 @@ async fn collect_or(
 
     Err(QuorumError::NoGroupSatisfiedInOrCombinator {
         groups: group_names,
-    })
+    }
+    .into())
 }
 
 /// Collects auth entries for the qualifying members of a single group.
@@ -669,7 +771,8 @@ async fn collect_group_entries(
     envelope: &crate::signing::divergence::EnvelopeContext,
     network_passphrase: &str,
     signature_expiration_ledger: u32,
-) -> Result<Vec<SorobanAuthorizationEntry>, QuorumError> {
+    budget: Option<PreSubmitBudget>,
+) -> Result<Vec<SorobanAuthorizationEntry>, QuorumFailure> {
     // Find qualifying signers: public key must be in group.members.
     let mut qualifying: Vec<([u8; 32], &(dyn Signer + Send + Sync))> = resolved
         .iter()
@@ -687,7 +790,8 @@ async fn collect_group_entries(
             group_name: group.name.clone(),
             required: group.threshold,
             provided,
-        });
+        }
+        .into());
     }
 
     // Sort by public-key bytes for deterministic ordering.
@@ -745,12 +849,14 @@ async fn collect_group_entries(
     // authenticated entries.
     // Producing separate entries per signer would have the host process only ONE
     // entry for the smart-account C-address.
-    let smart_account_entry =
-        complete_authorization_entry_multi_signer(checked_rules, partial, &signer_refs)
-            .await
-            .map_err(|e: SaError| QuorumError::SignatureProductionFailed {
-                detail: format!("{e}"),
-            })?;
+    let smart_account_entry = complete_authorization_entry_multi_signer_within_budget(
+        checked_rules,
+        partial,
+        &signer_refs,
+        budget,
+    )
+    .await
+    .map_err(|e| QuorumFailure::of_signing(budget, "", e))?;
 
     // Build one delegated G-key sub-auth entry PER signer (required by __check_auth).
     //
@@ -775,11 +881,10 @@ async fn collect_group_entries(
             signature_expiration_ledger,
             *signer,
             network_passphrase,
+            budget,
         )
         .await
-        .map_err(|e: SaError| QuorumError::SignatureProductionFailed {
-            detail: format!("delegated G-key entry: {e}"),
-        })?;
+        .map_err(|e| QuorumFailure::of_signing(budget, "delegated G-key entry: ", e))?;
         entries.push(delegated);
     }
 

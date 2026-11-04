@@ -411,3 +411,134 @@ async fn an_answer_that_does_not_parse_under_a_mainnet_expectation_is_unavailabl
     expect_unavailable(result, &server);
     assert_eq!(rpc_request_count(&server, "getNetwork").await, 1);
 }
+
+// ── The signing ledger observation ──────────────────────────────────────────
+
+/// A `getLatestLedger` result at `sequence`.
+fn latest_ledger(sequence: u32) -> Value {
+    json!({"id": "ab".repeat(32), "sequence": sequence, "protocolVersion": 29})
+}
+
+/// Mounts a `getLatestLedger` answer on `server`.
+async fn mount_latest_ledger(server: &MockServer, result: Value) {
+    Mock::given(method("POST"))
+        .and(body_partial_json(json!({"method": "getLatestLedger"})))
+        .respond_with(EchoIdResponder::new(result))
+        .mount(server)
+        .await;
+}
+
+async fn observation(
+    client: &StellarRpcClient,
+    deadline: Duration,
+) -> Result<stellar_agent_network::SigningLedgerObservation, WalletError> {
+    client
+        .signing_ledger_observation(TESTNET_PASSPHRASE, tokio::time::Instant::now() + deadline)
+        .await
+}
+
+/// An observation binds the height to the identity of the endpoint that
+/// reported it and to the local time of the answer.
+#[tokio::test]
+async fn an_observation_binds_the_height_to_the_checked_identity() {
+    let server = serve_get_network(network(TESTNET_PASSPHRASE, 29)).await;
+    mount_latest_ledger(&server, latest_ledger(4321)).await;
+    let port = server.address().port();
+    let client = StellarRpcClient::new(&format!(
+        "http://user:SECRET@127.0.0.1:{port}/rpc?token=SECRET"
+    ))
+    .unwrap();
+    let before = tokio::time::Instant::now();
+
+    let found = observation(&client, GENEROUS_DEADLINE).await.unwrap();
+
+    assert_eq!(found.ledger(), 4321);
+    assert_eq!(found.identity().chain_id(), Some(Caip2::Testnet));
+    assert_eq!(found.identity().client_id(), client.id());
+    assert_eq!(
+        found.identity().authority(),
+        format!("http://127.0.0.1:{port}")
+    );
+    assert!(found.observed_at() >= before);
+    assert!(found.observed_at() <= tokio::time::Instant::now());
+    assert_eq!(rpc_request_count(&server, "getNetwork").await, 1);
+    assert_eq!(rpc_request_count(&server, "getLatestLedger").await, 1);
+}
+
+/// The height of an endpoint on another network is never read.
+#[tokio::test]
+async fn an_endpoint_on_another_network_gives_no_observation() {
+    let server = serve_get_network(network(FUTURENET_PASSPHRASE, 29)).await;
+    mount_latest_ledger(&server, latest_ledger(4321)).await;
+    let client = StellarRpcClient::new(&server.uri()).unwrap();
+
+    let error = observation(&client, GENEROUS_DEADLINE).await.unwrap_err();
+
+    assert!(
+        matches!(
+            error,
+            WalletError::Network(NetworkError::EndpointNetworkMismatch { .. })
+        ),
+        "{error:?}"
+    );
+    assert_eq!(rpc_request_count(&server, "getLatestLedger").await, 0);
+}
+
+/// A body that does not name a height gives no observation, and the failure
+/// names the endpoint by its authority alone.
+#[tokio::test]
+async fn a_malformed_height_gives_no_observation() {
+    let server = serve_get_network(network(TESTNET_PASSPHRASE, 29)).await;
+    mount_latest_ledger(
+        &server,
+        json!({"id": "ab".repeat(32), "sequence": "not-a-ledger", "protocolVersion": 29}),
+    )
+    .await;
+    let port = server.address().port();
+    let client =
+        StellarRpcClient::new(&format!("http://127.0.0.1:{port}/rpc?token=SECRET")).unwrap();
+
+    let error = observation(&client, GENEROUS_DEADLINE).await.unwrap_err();
+
+    assert!(
+        matches!(
+            error,
+            WalletError::Network(NetworkError::RpcUnreachable { .. })
+        ),
+        "{error:?}"
+    );
+    assert!(!format!("{error}").contains("SECRET"), "{error}");
+}
+
+/// A height that arrives after the deadline gives no observation.
+#[tokio::test]
+async fn an_answer_past_the_deadline_gives_no_observation() {
+    let server = serve_get_network(network(TESTNET_PASSPHRASE, 29)).await;
+    Mock::given(method("POST"))
+        .and(body_partial_json(json!({"method": "getLatestLedger"})))
+        .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(30)))
+        .mount(&server)
+        .await;
+    let client = StellarRpcClient::new(&server.uri()).unwrap();
+    let started = std::time::Instant::now();
+
+    let error = observation(&client, Duration::from_millis(300))
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(
+            error,
+            WalletError::Network(
+                NetworkError::RpcUnreachable { .. }
+                    | NetworkError::EndpointIdentityUnavailable { .. }
+            )
+        ),
+        "{error:?}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "the deadline ends the read: {:?}",
+        started.elapsed()
+    );
+}

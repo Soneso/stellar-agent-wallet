@@ -167,7 +167,7 @@ async fn smart_account_multicall_cli_confirms_three_native_sac_symbol_calls() {
         "--rule-id",
         "0",
         "--secondary-rpc-url",
-        TESTNET_RPC_URL,
+        stellar_agent_test_support::testnet_secondary_rpc_url(),
         "--signer-secret-env",
         SIGNER_ENV,
         "--timeout-seconds",
