@@ -839,6 +839,13 @@ fn load_or_mint_hmac_key(
     // classification follow-up candidate): `NoEntry` triggers the lazy-mint,
     // every other cause is routed to debug tracing inside
     // `CounterpartyError::KeyringUnavailable`.
+    stellar_agent_core::profile::owner_key::refuse_policy_pin_coordinate(
+        key_ref,
+        "counterparty_cache_key_id",
+    )
+    .map_err(|error| CounterpartyError::KeyringUnavailable {
+        detail: error.to_string(),
+    })?;
     let service = &key_ref.service;
     refuse_owner_coordinate(key_ref)?;
     stellar_agent_core::profile::owner_key::refuse_installation_key_coordinate(
@@ -2269,6 +2276,27 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn keyring_lazy_mint_refuses_policy_pin_coordinate() {
+        let coordinate = KeyringEntryRef::new("custom", "default-PoLiCy-PiN");
+        let existing = base64_encode_key(&[0x5a; HMAC_KEY_LEN]);
+        for initial in [None, Some(existing.as_str())] {
+            stellar_agent_test_support::keyring_mock::install().unwrap();
+            let entry = KeyringEntry::new(&coordinate.service, &coordinate.account).unwrap();
+            if let Some(value) = initial {
+                entry.set_password(value).unwrap();
+            }
+            let error = load_or_mint_hmac_key("pin-refusal", &coordinate).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("a policy pin changes only through a verified policy load")
+            );
+            assert_eq!(entry.get_password().ok().as_deref(), initial);
+        }
     }
 
     #[test]

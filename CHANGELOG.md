@@ -148,6 +148,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `LockedSeed::signing_key` and `Wallet::signing_key` borrow the signing key
   from the seed's page; wallet access checks disposal, expiry, and the clock.
 
+- `stellar_agent_core::policy::pin::write` is internal to the core crate;
+  test fixtures use `pin::write_for_test` under the `test-helpers` feature.
 - On a mainnet profile `--secret-env` is refused by `pay`, `claim` and
   `accounts create` with `validation.mainnet_secret_env_refused`, and these
   verbs sign with the enrolled seed in the keyring when no signer flag is
@@ -674,6 +676,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   building a second key. The documentation states which copies the lock covers
   and which it does not.
 
+- No public function of a build without the `test-helpers` feature writes a
+  pin the caller composes. The typed policy pin writer is internal to the core
+  crate.
 - Crate publication rebuilds every vendored contract Wasm file of the published
   commit from its pinned source with the pinned tools and compares the bytes
   before the registry credential is requested. A failed, cancelled or skipped

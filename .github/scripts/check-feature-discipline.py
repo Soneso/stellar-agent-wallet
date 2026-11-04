@@ -188,7 +188,7 @@ DATA_SCRIPTS = {
 # Each flag's arity is explicit. Compilation and output filters do not
 # select crates.
 DROP_FLAGS = {
-    '--all-targets': 0, '--lib': 0, '--bins': 0, '--tests': 0, '--examples': 0,
+    '--all-targets': 0, '--lib': 0, '--doc': 0, '--bins': 0, '--tests': 0, '--examples': 0,
     '--benches': 0, '--bin': 1, '--test': 1, '--example': 1, '--bench': 1,
     '--no-run': 0, '--release': 0, '--locked': 0, '--offline': 0, '--frozen': 0,
     '--target': 1, '--target-dir': 1, '--no-deps': 0, '--json': 0, '--lcov': 0,
@@ -468,7 +468,7 @@ def translate(command):
             # Integration tests and benchmarks also build package binaries.
             if flag in ('--bins', '--all-targets', '--tests', '--test', '--benches', '--bench'):
                 all_bins = True
-            if flag in ('--lib', '--bin', '--test', '--tests', '--example', '--examples', '--bench', '--benches'):
+            if flag in ('--lib', '--doc', '--bin', '--test', '--tests', '--example', '--examples', '--bench', '--benches'):
                 target_filters = True
             if flag in DEV_TARGET_FLAGS and family in ('build', 'check'):
                 edges = 'normal,build,dev'
@@ -1600,6 +1600,7 @@ INVOCATIONS = [
     {'workflow': 'testnet.yml', 'job': 'acceptance', 'step': 'Run testnet acceptance suites', 'source': '.github/scripts/run-testnet-acceptance.sh', 'command': 'cargo test -p "stellar-agent-x402-identity" --no-default-features --features "testnet-acceptance" --test "sep10_gate_testnet_acceptance"  -- --include-ignored --test-threads=1 --nocapture', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-x402-identity'], 'features': ['--no-default-features', '--features', 'testnet-acceptance'], 'edges': 'normal,build,dev', 'target': 'x86_64-unknown-linux-gnu', 'bins': None, 'runner': 'ubuntu-24.04'},
     {'workflow': 'testnet.yml', 'job': 'acceptance', 'step': 'Run testnet acceptance suites', 'source': '.github/scripts/run-testnet-acceptance.sh', 'command': 'cargo test -p "stellar-agent-x402" --no-default-features --features "testnet-acceptance" --test "x402_exact_testnet_acceptance"  -- --include-ignored --test-threads=1 --nocapture', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-x402'], 'features': ['--no-default-features', '--features', 'testnet-acceptance'], 'edges': 'normal,build,dev', 'target': 'x86_64-unknown-linux-gnu', 'bins': None, 'runner': 'ubuntu-24.04'},
     {'workflow': 'ci.yml', 'job': 'test', 'step': 'Test the vendored Wasm release configuration', 'source': 'ci.yml', 'command': 'cargo test -p stellar-agent-smart-account --test vendored_wasm_release_cfg', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-smart-account'], 'features': [], 'edges': 'normal,build,dev', 'target': 'x86_64-unknown-linux-gnu', 'bins': None, 'runner': 'ubuntu-24.04'},
+    {'workflow': 'ci.yml', 'job': 'test', 'step': 'Test the policy pin release configuration', 'source': 'ci.yml', 'command': 'cargo test -p stellar-agent-core --doc policy::pin', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-core'], 'features': [], 'edges': 'normal,build,dev', 'target': 'x86_64-unknown-linux-gnu', 'bins': [], 'runner': 'ubuntu-24.04'},
     {'workflow': 'publish.yml', 'job': 'publish', 'step': 'Require the pinned toolchain', 'source': 'publish.yml', 'command': 'cargo -V', 'relied_on': 'not relied on', 'selection': [], 'features': [], 'edges': None, 'target': None},
     {'workflow': 'publish.yml', 'job': 'publish', 'step': 'Require the pinned toolchain', 'source': 'publish.yml', 'command': 'cargo -V', 'relied_on': 'not relied on', 'selection': [], 'features': [], 'edges': None, 'target': None},
     {'workflow': 'ci.yml', 'job': 'deny', 'step': 'Check licenses and advisories', 'source': 'ci.yml', 'command': 'cargo deny check', 'relied_on': 'not relied on', 'selection': [], 'features': [], 'edges': None, 'target': None},

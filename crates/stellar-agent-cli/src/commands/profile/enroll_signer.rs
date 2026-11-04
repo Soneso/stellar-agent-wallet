@@ -334,6 +334,12 @@ where
         }
     };
 
+    if let Err(e) = stellar_agent_core::profile::owner_key::refuse_policy_pin_coordinate(
+        &signer_ref,
+        "mcp_signer_default",
+    ) {
+        return render::write_envelope(out, &Envelope::<()>::err(&e), 1);
+    }
     if let Err(e) = stellar_agent_core::profile::owner_key::refuse_installation_key_coordinate(
         &signer_ref,
         "mcp_signer_default",
@@ -2271,6 +2277,60 @@ mod tests {
         assert!(log.contains("signer_identity_enrolled"), "{log}");
         assert!(log.contains("enrolled-identity"));
         assert!(!log.contains(&seed));
+    }
+
+    /// Both signer enrollment forms refuse a raw policy pin before keyring access.
+    #[tokio::test]
+    #[serial]
+    async fn policy_pin_coordinate_refuses_without_writing() {
+        let (_, public_key) = seed_material([0x35; 32]);
+        for coordinate in [
+            KeyringEntryRef::new("custom", "default-PoLiCy-PiN"),
+            KeyringEntryRef::new("custom-policy-pin.alias", &public_key),
+            KeyringEntryRef::new("stellar-agent-toolsets", "default-policy-pin"),
+        ] {
+            for repair in [false, true] {
+                for initial in [None, Some("untouched")] {
+                    keyring_mock::install().unwrap();
+                    let entry =
+                        KeyringEntry::new(&coordinate.service, &coordinate.account).unwrap();
+                    if let Some(value) = initial {
+                        entry.set_password(value).unwrap();
+                    }
+                    let profile = profile_with_signer_account(&public_key);
+                    let mut args = args("UNUSED_PIN_SEED", None, true);
+                    args.repair_identity = repair;
+                    let mut output = Vec::new();
+                    let code = run_with_dependencies(
+                        &args,
+                        |_| Ok(profile.clone()),
+                        |_| Ok(coordinate.clone()),
+                        pin_signer_must_not_be_called,
+                        || panic!("a policy pin refuses before keyring initialization"),
+                        |_| panic!("a policy pin refuses before seed access"),
+                        write_identity_must_not_be_called,
+                        &mut output,
+                    )
+                    .await;
+                    assert_eq!(code, 1);
+                    let output: serde_json::Value = serde_json::from_slice(&output).unwrap();
+                    assert_eq!(output["error"]["code"], "validation.policy_pin_coordinate");
+                    assert!(
+                        output["error"]["message"]
+                            .as_str()
+                            .unwrap()
+                            .contains("mcp_signer_default")
+                    );
+                    match initial {
+                        Some(value) => assert_eq!(entry.get_password().unwrap(), value),
+                        None => assert!(matches!(
+                            entry.get_password(),
+                            Err(keyring_core::Error::NoEntry)
+                        )),
+                    }
+                }
+            }
+        }
     }
 
     /// Both signer enrollment forms refuse a raw installation coordinate.

@@ -16,16 +16,35 @@
 //!
 //! # The guard
 //!
-//! [`read`](crate::policy::pin::read), [`write`](crate::policy::pin::write),
-//! and [`compare`](crate::policy::pin::compare) take a
+//! [`read`](crate::policy::pin::read) and
+//! [`compare`](crate::policy::pin::compare) take a
 //! [`WindowStoreLock`](crate::policy::state_lock::WindowStoreLock) and a
 //! [`PinScope`](crate::policy::pin::PinScope) naming the store and its key
 //! coordinate. The guard is the lock of the window-state keyring entry, shared
 //! by every store handle and pin operation over that entry. Each operation
 //! checks that the guard was acquired for that scope's entry and never takes
-//! the lock itself, so a caller holds one guard across a read, a comparison,
-//! and a write, and the store's authorization transitions read the pin under
-//! the guard they already hold.
+//! the lock itself. The crate-internal `write` runs only inside the verified
+//! advance, under the same guard as the read and comparison. The store's
+//! authorization transitions read the pin under the guard they already hold.
+//!
+//! The raw writer is private to the crate:
+//!
+//! ```compile_fail,E0603
+//! use stellar_agent_core::policy::pin::write;
+//! ```
+//!
+//! The public reader's import resolves:
+//!
+//! ```
+//! use stellar_agent_core::policy::pin::read;
+//! ```
+//!
+//! The fixture writer is public only with `test-helpers`:
+//!
+#![cfg_attr(not(feature = "test-helpers"), doc = "```compile_fail,E0432")]
+#![cfg_attr(feature = "test-helpers", doc = "```")]
+//! use stellar_agent_core::policy::pin::write_for_test;
+//! ```
 //!
 //! # Absent versus malformed
 //!
@@ -279,12 +298,18 @@ pub fn entry_present(window_key: &KeyringEntryRef) -> Result<bool, PinError> {
 
 /// Writes `pin` as the pin of `scope` under `lock`, replacing any value.
 ///
+/// The verified advance in `policy::v1::verified` is its only production caller.
+///
 /// # Errors
 ///
 /// - [`PinError::WrongGuard`] when `lock` does not guard `scope`.
 /// - [`PinError::Keyring`] when the entry cannot be written.
 /// - [`PinError::InstallationKeyCoordinate`] for the reserved installation service.
-pub fn write(lock: &WindowStoreLock, scope: &PinScope<'_>, pin: &Pin) -> Result<(), PinError> {
+pub(crate) fn write(
+    lock: &WindowStoreLock,
+    scope: &PinScope<'_>,
+    pin: &Pin,
+) -> Result<(), PinError> {
     crate::profile::owner_key::refuse_installation_key_coordinate(
         scope.window_key,
         "policy_window_state_key_id",
@@ -299,6 +324,23 @@ pub fn write(lock: &WindowStoreLock, scope: &PinScope<'_>, pin: &Pin) -> Result<
             detail: map_keyring_operation_error(&e, KeyringOperation::Write, &entry_ref.service)
                 .to_string(),
         })
+}
+
+/// Test fixtures only. Production code advances the pin through
+/// `load_verified_policy` with `PinMode::Advance`.
+///
+/// # Errors
+///
+/// - [`PinError::WrongGuard`] when `lock` does not guard `scope`.
+/// - [`PinError::Keyring`] when the entry cannot be written.
+/// - [`PinError::InstallationKeyCoordinate`] for the reserved installation service.
+#[cfg(any(test, feature = "test-helpers"))]
+pub fn write_for_test(
+    lock: &WindowStoreLock,
+    scope: &PinScope<'_>,
+    pin: &Pin,
+) -> Result<(), PinError> {
+    write(lock, scope, pin)
 }
 
 /// Requires the pin of `scope` to be present and to name the policy at
@@ -392,6 +434,31 @@ mod tests {
             scope.pin_entry_ref(),
             KeyringEntryRef::new(key.service.clone(), "default-policy-pin")
         );
+    }
+
+    /// A fixture pin reads back under its guard; another entry's guard refuses.
+    #[test]
+    #[serial]
+    fn a_fixture_pin_reads_back() {
+        keyring_mock::install().unwrap();
+        let dir = TempDir::new().unwrap();
+        let window = dir.path().join("pin.window");
+        let key = window_key();
+        let scope = PinScope::new(&window, &key);
+        let lock = WindowStoreLock::acquire_for(&window, &key).unwrap();
+        let pin = Pin::new(3, [1; 32], OWNER).unwrap();
+        write(&lock, &scope, &pin).unwrap();
+        assert_eq!(read(&lock, &scope).unwrap(), PinState::Present(pin.clone()));
+
+        let other_key = KeyringEntryRef::default_policy_window_state_key("other");
+        let wrong_guard = WindowStoreLock::acquire_for(&window, &other_key).unwrap();
+        let replacement = Pin::new(4, [2; 32], [8; 32]).unwrap();
+        assert_eq!(
+            write(&wrong_guard, &scope, &replacement),
+            Err(PinError::WrongGuard)
+        );
+        assert_eq!(read(&wrong_guard, &scope), Err(PinError::WrongGuard));
+        assert_eq!(read(&lock, &scope).unwrap(), PinState::Present(pin));
     }
 
     /// The comparison refuses each component on its own.

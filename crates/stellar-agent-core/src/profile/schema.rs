@@ -443,7 +443,7 @@ impl KeyringEntryRef {
 const RPC_CREDENTIAL_SERVICE_PREFIX: &str = "stellar-agent-rpc-";
 
 /// The namespace of the wallet's own keyring services.
-const WALLET_SERVICE_NAMESPACE: &str = "stellar-agent-";
+pub(crate) const WALLET_SERVICE_NAMESPACE: &str = "stellar-agent-";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // PolicyEngineKind
@@ -2464,7 +2464,7 @@ pub fn intent_account(generation_account: &str) -> String {
 }
 
 /// The keyring account suffix of the policy pin beside the window-state key.
-const POLICY_PIN_SUFFIX: &str = "-policy-pin";
+pub(crate) const POLICY_PIN_SUFFIX: &str = "-policy-pin";
 
 /// The keyring account suffix of the mainnet enablement nonce beside the
 /// window-state key.

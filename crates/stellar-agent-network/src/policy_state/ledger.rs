@@ -1643,7 +1643,7 @@ mod tests {
                 &self.profile.policy_window_state_key_id,
             )
             .unwrap();
-            pin::write(
+            pin::write_for_test(
                 &lock,
                 &PinScope::for_profile(self.store.path(), &self.profile),
                 &Pin::new(sequence, digest, [1; 32]).unwrap(),

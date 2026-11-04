@@ -374,6 +374,10 @@ where
         .pool_master_key_id
         .clone()
         .unwrap_or_else(|| KeyringEntryRef::default_pool_master_key(name));
+    stellar_agent_core::profile::owner_key::refuse_policy_pin_coordinate(
+        &master,
+        "pool_master_key_id",
+    )?;
     stellar_agent_core::profile::owner_key::refuse_installation_key_coordinate(
         &master,
         "pool_master_key_id",
@@ -1728,6 +1732,44 @@ mod tests {
         #[serial_test::serial]
         async fn present_channels_complete_without_cap_or_witness() {
             exercise(Case::Present).await;
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn policy_pin_coordinate_refuses_without_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(dir.path());
+        let _env = stellar_agent_test_support::ProfileEnvVarGuard::cleared();
+        let name = "pin-refusal";
+        let coordinate = KeyringEntryRef::new("custom", "default-PoLiCy-PiN");
+        for initial in [None, Some("untouched")] {
+            stellar_agent_test_support::keyring_mock::install().unwrap();
+            let entry = KeyringEntry::new(&coordinate.service, &coordinate.account).unwrap();
+            if let Some(value) = initial {
+                entry.set_password(value).unwrap();
+            }
+            let mut profile = Profile::builder_testnet_named(name, "s", "a", "n", "a").build();
+            profile.pool_master_key_id = Some(coordinate.clone());
+            loader::save_to_dir(name, &profile, &dir.path().join("profiles")).unwrap();
+            let args = PoolInitArgs {
+                size: Some(2),
+                profile: Some(name.to_owned()),
+                force: true,
+                resume: false,
+                timeout_seconds: 5,
+                output: OutputFormat::Json,
+            };
+            let calls = std::cell::Cell::new(0);
+            let error = execute(&args, || {
+                calls.set(calls.get() + 1);
+                Ok(())
+            })
+            .await
+            .unwrap_err();
+            assert_eq!(error.code(), "validation.policy_pin_coordinate");
+            assert_eq!(calls.get(), 0);
+            assert_eq!(entry.get_password().ok().as_deref(), initial);
         }
     }
 

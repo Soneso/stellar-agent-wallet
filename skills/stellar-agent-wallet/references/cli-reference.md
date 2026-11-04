@@ -851,6 +851,8 @@ refusals of the verified load that follows.
 
 To change the owner of a profile with a policy pin, follow
 [Rotate the policy owner](profiles-and-keys.md#rotate-the-policy-owner).
+An owner change advances the pin only through the verified load of a policy
+that carries the previous owner's statement.
 `--previous-owner-secret-env` supplies the previous seed, which must match the
 pinned owner, or the enrolled owner when no pin exists.
 

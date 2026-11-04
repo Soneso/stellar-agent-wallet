@@ -111,7 +111,7 @@ fn pinned(dir: &Path, profile: &Profile) -> PinState {
 fn put_pin(dir: &Path, profile: &Profile, sequence: i64, digest: [u8; 32], owner: [u8; 32]) {
     let path = dir.join("state.window");
     let lock = WindowStoreLock::acquire_for(&path, &profile.policy_window_state_key_id).unwrap();
-    pin::write(
+    pin::write_for_test(
         &lock,
         &PinScope::for_profile(&path, profile),
         &Pin::new(sequence, digest, owner).unwrap(),
@@ -668,7 +668,7 @@ fn pin_read_is_guarded_against_interleaving() {
             if let Ok(lock) =
                 WindowStoreLock::acquire_for(&path, &hook_profile.policy_window_state_key_id)
             {
-                pin::write(
+                pin::write_for_test(
                     &lock,
                     &PinScope::for_profile(&path, &hook_profile),
                     &Pin::new(9, [9; 32], [9; 32]).unwrap(),
@@ -745,7 +745,7 @@ fn compare_only_loads_hold_the_lock_against_a_writer() {
         &coordinate.account,
         Arc::new(move || {
             let attempt = acquire_state_lock(&path, &hook_profile).and_then(|lock| {
-                pin::write(
+                pin::write_for_test(
                     &lock,
                     &PinScope::for_profile(&path, &hook_profile),
                     &Pin::new(9, [9; 32], [9; 32]).unwrap(),

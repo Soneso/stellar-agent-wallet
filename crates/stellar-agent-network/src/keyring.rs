@@ -380,6 +380,7 @@ pub fn read_rpc_credential(entry: &KeyringEntryRef) -> Result<Zeroizing<String>,
 ///
 /// # Errors
 ///
+/// - [`ValidationError::PolicyPinCoordinate`] for a policy pin coordinate.
 /// - [`ValidationError::InstallationKeyCoordinate`] for the reserved service.
 /// - [`NetworkError::RpcCredentialInvalid`] when the value breaks the value
 ///   rules; nothing is written.
@@ -388,6 +389,7 @@ pub fn write_rpc_credential(
     entry: &KeyringEntryRef,
     value: &Zeroizing<String>,
 ) -> Result<(), WalletError> {
+    owner_key::refuse_policy_pin_coordinate(entry, "rpc_credential")?;
     owner_key::refuse_installation_key_coordinate(entry, "rpc_credential")?;
     let label = rpc_credential_label(entry);
     check_rpc_credential_value(value).map_err(|reason| {
@@ -473,12 +475,14 @@ fn install_platform_store(
 ///
 /// # Errors
 ///
+/// Returns [`ValidationError::PolicyPinCoordinate`] for a policy pin coordinate.
 /// Returns [`ValidationError::InstallationKeyCoordinate`] for the reserved service.
 /// Returns [`WalletError`] when the keyring entry cannot be opened or updated.
 /// Operator-visible errors are mapped through the same secret-safe keyring
 /// error discipline as signing-key lookups.
 pub fn rotate_keyring_secret_32(service: &str, entry_name: &str) -> Result<(), WalletError> {
     let entry_ref = KeyringEntryRef::new(service, entry_name);
+    owner_key::refuse_policy_pin_coordinate(&entry_ref, "keyring_coordinate")?;
     owner_key::refuse_installation_key_coordinate(&entry_ref, "keyring_coordinate")?;
     let mut raw = Zeroizing::new([0u8; 32]);
     OsRng.fill_bytes(raw.as_mut());
@@ -570,11 +574,13 @@ pub fn read_secret_32(
 ///
 /// # Errors
 ///
+/// - [`ValidationError::PolicyPinCoordinate`] for a policy pin coordinate.
 /// - Any error of [`read_secret_32`].
 /// - [`WalletError`] when the minted secret cannot be written.
 pub fn load_or_mint_secret_32(
     entry_ref: &KeyringEntryRef,
 ) -> Result<Zeroizing<[u8; 32]>, WalletError> {
+    owner_key::refuse_policy_pin_coordinate(entry_ref, "keyring_coordinate")?;
     if let Some(secret) = read_secret_32(entry_ref)? {
         return Ok(secret);
     }
@@ -633,11 +639,13 @@ fn decode_secret_32(secret_b64: &str) -> Result<Zeroizing<[u8; 32]>, WalletError
 ///
 /// # Errors
 ///
+/// Returns [`ValidationError::PolicyPinCoordinate`] for a policy pin coordinate.
 /// Returns [`ValidationError::InstallationKeyCoordinate`] for the reserved service.
 /// Returns [`WalletError`] when the keyring entry cannot be opened or written,
 /// mapped through the same secret-safe keyring error discipline as signing-key
 /// lookups.
 pub fn write_keyring_string(entry_ref: &KeyringEntryRef, value: &str) -> Result<(), WalletError> {
+    owner_key::refuse_policy_pin_coordinate(entry_ref, "keyring_coordinate")?;
     owner_key::refuse_installation_key_coordinate(entry_ref, "keyring_coordinate")?;
     let entry = open_entry(entry_ref)?;
     entry
@@ -4111,6 +4119,95 @@ mod tests {
                 "327807a06a5d845937759fdf5b37e4cda3e5645414d24386163c4705836da4d9"
             );
         }
+    }
+
+    fn assert_policy_pin_write_refused(
+        field: &'static str,
+        write: impl Fn(&KeyringEntryRef) -> Result<(), WalletError>,
+    ) {
+        let window = KeyringEntryRef::default_policy_window_state_key("pin-refusal");
+        let pin = stellar_agent_core::profile::schema::policy_pin_entry_ref(&window);
+        let existing_pin = serde_json::json!({
+            "v": 1,
+            "sequence": 3,
+            "digest": "01".repeat(32),
+            "owner": stellar_strkey::ed25519::PublicKey([7; 32]).to_string().to_string(),
+        })
+        .to_string();
+        let existing_secret = URL_SAFE_NO_PAD.encode([9; 32]);
+        for service in [
+            pin.service.as_str(),
+            "custom.window",
+            "StElLaR-AgEnT-ToOlSeTs",
+        ] {
+            for account in [
+                "default-policy-pin",
+                "DEFAULT-POLICY-PIN",
+                "custom.PoLiCy-PiN-policy-pin",
+            ] {
+                let alias = format!("{account}.{service}");
+                for (split, _) in alias.match_indices('.') {
+                    let coordinate = KeyringEntryRef::new(&alias[split + 1..], &alias[..split]);
+                    for initial in [
+                        None,
+                        Some(existing_pin.as_str()),
+                        Some(existing_secret.as_str()),
+                    ] {
+                        keyring_mock::install().unwrap();
+                        let entry =
+                            keyring_core::Entry::new(&coordinate.service, &coordinate.account)
+                                .unwrap();
+                        if let Some(value) = initial {
+                            entry.set_password(value).unwrap();
+                        }
+                        let error = write(&coordinate).unwrap_err();
+                        assert!(
+                            matches!(
+                                error,
+                                WalletError::Validation(ValidationError::PolicyPinCoordinate { field: found })
+                                    if found == field
+                            ),
+                            "{error:?}"
+                        );
+                        assert_eq!(entry.get_password().ok().as_deref(), initial);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn write_keyring_string_refuses_policy_pin_coordinate() {
+        assert_policy_pin_write_refused("keyring_coordinate", |entry| {
+            write_keyring_string(entry, "replacement")
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn write_rpc_credential_refuses_policy_pin_coordinate() {
+        for value in ["replacement", "", "invalid\ncredential"] {
+            assert_policy_pin_write_refused("rpc_credential", |entry| {
+                write_rpc_credential(entry, &Zeroizing::new(value.to_owned()))
+            });
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn rotate_keyring_secret_32_refuses_policy_pin_coordinate() {
+        assert_policy_pin_write_refused("keyring_coordinate", |entry| {
+            rotate_keyring_secret_32(&entry.service, &entry.account)
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn load_or_mint_secret_32_refuses_policy_pin_coordinate() {
+        assert_policy_pin_write_refused("keyring_coordinate", |entry| {
+            load_or_mint_secret_32(entry).map(drop)
+        });
     }
 
     fn assert_installation_write_refused(

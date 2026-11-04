@@ -1823,6 +1823,19 @@ pub enum ValidationError {
         field: &'static str,
     },
 
+    /// A keyring writer targets a policy pin coordinate.
+    ///
+    /// # Wire code
+    ///
+    /// `"validation.policy_pin_coordinate"`.
+    #[error(
+        "`{field}` names a policy pin; a policy pin changes only through a verified policy load"
+    )]
+    PolicyPinCoordinate {
+        /// The field whose coordinate is refused.
+        field: &'static str,
+    },
+
     /// The secret environment variable named by the argument is not set.
     ///
     /// Wire code: `validation.secret_env_not_set`.
@@ -2200,6 +2213,7 @@ impl ValidationError {
             // `AuditLogNotFound` above for the same rationale.
             Self::AuditLogBindingChanged { .. } => "audit.log_binding_changed",
             Self::InstallationKeyCoordinate { .. } => "validation.installation_key_coordinate",
+            Self::PolicyPinCoordinate { .. } => "validation.policy_pin_coordinate",
             Self::KeyMatchesOwnerPublicKey { .. } => "validation.key_matches_owner_public_key",
             Self::SecretEnvNotSet { .. } => "validation.secret_env_not_set",
             Self::SecretEnvInvalid { .. } => "validation.secret_env_invalid",
@@ -4068,6 +4082,12 @@ mod tests {
                 "validation.acknowledgement_required",
             ),
             (
+                ValidationError::PolicyPinCoordinate {
+                    field: "keyring_coordinate",
+                },
+                "validation.policy_pin_coordinate",
+            ),
+            (
                 ValidationError::InstallationKeyCoordinate {
                     field: "attestation_key_id",
                 },
@@ -4373,6 +4393,9 @@ mod tests {
                         profile: profile.clone(),
                         missing,
                     }
+                }
+                ValidationError::PolicyPinCoordinate { field } => {
+                    ValidationError::PolicyPinCoordinate { field }
                 }
                 ValidationError::InstallationKeyCoordinate { field } => {
                     ValidationError::InstallationKeyCoordinate { field }

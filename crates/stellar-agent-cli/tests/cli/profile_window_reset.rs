@@ -170,7 +170,7 @@ impl Fixture {
         let owner = ed25519_dalek::SigningKey::from_bytes(&seed)
             .verifying_key()
             .to_bytes();
-        pin::write(
+        pin::write_for_test(
             &lock,
             &PinScope::for_profile(&self.path, &self.profile),
             &Pin::new(1, [0x33; 32], owner).unwrap(),

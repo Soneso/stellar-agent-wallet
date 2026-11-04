@@ -1058,7 +1058,7 @@ mod tests {
                 &self.profile.policy_window_state_key_id,
             )
             .unwrap();
-            pin::write(
+            pin::write_for_test(
                 &lock,
                 &PinScope::for_profile(&self.window, &self.profile),
                 &Pin::new(sequence, [1; 32], self.owner.verifying_key().to_bytes()).unwrap(),
