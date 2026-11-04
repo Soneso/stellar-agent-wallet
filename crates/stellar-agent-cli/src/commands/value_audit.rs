@@ -802,6 +802,15 @@ mod tests {
                 "audit.carrier_replaced",
             ),
             (
+                WriterError::RetainedHistoryUnverified(
+                    stellar_agent_core::audit_log::VerifyError::HmacMismatch {
+                        file: "audit.jsonl.pruned".to_owned(),
+                    },
+                ),
+                "audit.chain_key_unavailable",
+                "audit.history_unverified",
+            ),
+            (
                 WriterError::RetiredOutboxChanged { generation: 1 },
                 "audit.chain_key_unavailable",
                 "audit.outbox_rows_missing",
@@ -1067,9 +1076,8 @@ mod tests {
             .expect("append");
     }
 
-    /// A log with enrolled carriers and no anchor adopts its tip on keyed use.
-    /// Nothing shows such a log was anchored: no binding, no chain-root
-    /// sidecar, no `audit_tip_anchored` row.
+    /// A log with enrolled carriers and no anchor records adoption and signs
+    /// its active root on the first keyed use.
     #[test]
     #[serial]
     fn require_value_audit_writer_adopts_an_existing_unanchored_log() {
@@ -1080,7 +1088,7 @@ mod tests {
         seed_unanchored_log(&profile, None);
 
         require_value_audit_writer(&profile, "anchor-adopt")
-            .expect("adoption must need no operator action");
+            .expect("the first keyed open adopts and signs the active root");
 
         let file = std::fs::File::open(&profile.audit_log_path).expect("audit.jsonl exists");
         let adopted = std::io::BufReader::new(file)

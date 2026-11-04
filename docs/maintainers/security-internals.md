@@ -150,6 +150,18 @@ refuses before taking the window lock; stop the MCP server before reset.
 See [Two sessions on one profile](#two-sessions-on-one-profile) for the contention
 codes and the tests that pin each property.
 
+An ordinary keyed writer verifies the whole retained history after open-time
+repairs and at every keyed acquisition, under its mutex. The walk opens archives
+read-only and bounds the active file at the writer's verified tip.
+It checks every chain, bridge, root tag, entry tag and authenticated prune seed.
+Failure refuses value-moving verbs with `audit.history_unverified`.
+The operator key-rotation recovery open checks the anchor.
+With an old key, the command verifies the chains, bridges, retained seed and
+entry tags before replacing the key; a first mint walks nothing.
+It permits root and marker tags to be re-signed and cannot provide mainnet
+readiness facts. Carrier binding and outbox-loss acknowledgement check chains
+and entry tags while root and marker tags await re-signing.
+
 ### Per-file root HMAC sidecar
 
 Each log file gets a `<file>.root_hmac` sidecar holding an HMAC-SHA256 tag (`sha256:<hex>`) over the chain root, keyed by the profile's `audit_log_hash_chain_key_id`. `sign_chain_root` mints it; `verify_chain_root` checks it with a constant-time comparison (`subtle::ConstantTimeEq`) against the supplied key. The sidecar is renamed alongside the log file on rotation.
@@ -229,29 +241,31 @@ next acquisition; an append without that check refuses with
 `audit.tip_anchor_mismatch` and latches. The next append of any row, including
 the adoption row and the repair rows, first renames the file under that
 handoff's archive name and appends no second handoff, so no row follows a
-handoff and retries never grow an archive. A rename never replaces an existing
-file: a rotation whose archive name, or its sidecar's name, is taken refuses
-with `audit.rotation_bridge_unusable`, and so does an open whose active file
-ends on a handoff naming an existing file. A rotation that finds no name after
-the newest archive refuses with the same code and writes nothing. The check
-runs right before the renames; a concurrent writer of the audit directory is
-outside its guarantee.
+handoff and retries never grow an archive. A keyed open or acquisition finishes
+that rename before it verifies the retained history. Until then `audit verify`
+reports reason `rotation_handoff_in_active_file`.
+A rename never replaces an existing file: a rotation whose archive name, or its
+sidecar's name, is taken refuses with `audit.rotation_bridge_unusable`, and so
+does an open whose active file ends on a handoff naming an existing file.
+A rotation that finds no name after the newest archive refuses with the same
+code and writes nothing. The check runs right before the renames; a concurrent
+writer of the audit directory is outside its guarantee.
 
 A keyed writer writes a file's chain-root tag after its first entry is durable
 and replaces the sidecar atomically through a temp file and a rename. A crash
 between the two leaves a file with entries and no tag. A keyed open writes the
-missing tag only after its anchor check proves the file is what the writer's
+missing tag after its anchor check proves the file is what the writer's
 lineage wrote: a replay from byte 0 yields exactly the anchored entry count,
 the last of those entries ends at the anchored offset, and its hash is the
 anchored tip. An anchored file that fails the proof refuses at open with
 `audit.tip_anchor_mismatch`. The tag binds where the file starts, so it is
 written only when the first entry starts at byte 0; the writer writes no blank
-lines or indentation. An open that adopts an unanchored file, or a keyed open
-without an anchor store, writes no tag. `audit reanchor` writes it after its
-anchor move, as the operator's acknowledgement of the file as it stands. Both
-run before any append can rotate the file. A file that an unkeyed writer both
-starts and rotates carries no tag and stalls a keyed prune until `profile
-rotate-audit-key` re-signs it.
+lines or indentation. Adoption signs the active root of an unkeyed file at
+byte 0. A keyed open without an anchor store writes no tag. `audit reanchor`
+writes it after its anchor move, as the operator's acknowledgement of the file
+as it stands. Both run before any append can rotate the file. A file that an
+unkeyed writer both starts and rotates carries no tag and stalls a keyed prune
+until `profile rotate-audit-key` re-signs it.
 
 A planted, edited, split, unreadable, or oversized file in the counted range,
 from the oldest archive to the one just rotated, stalls pruning until it is
@@ -374,7 +388,11 @@ The residual has two shapes, and they are not equally weak. Stated precisely:
 | No anchor has ever been written for this path: a new log, or the first keyed use of a log only unkeyed writers wrote | Anything at the path whose chain verifies. The guard is OFF: adoption takes the file as it finds it, so a rollback performed before that first acquisition becomes the baseline. A repointed `audit_log_path` does not reach this state on its own: the audit binding refuses it until the operator acknowledges it. Nor does a deleted anchor while a recorded binding, a chain-root sidecar, or an `audit_tip_anchored` row remains; see **Missing anchor**. There is no earlier anchored state to compare against, which is why this cannot be closed rather than why it is harmless. A log with keyed history first needs `stellar-agent audit bind-carriers --profile <NAME>` with every wallet process stopped. |
 | A file a rotation created, until its first append's anchor write lands: the anchor still names the archive's handoff | Any prefix of that file, down to empty, provided it chains from the handoff. The guard is OFF for that file: the rotation-completed rule re-derives from whatever is at the path. Normally one append wide, since the first append moves the anchor onto this file; a keyring outage spanning that append holds it open for the outage |
 
-The two OFF states share a shape: the anchor names nothing in the file at the path, so there is no tip to compare a candidate against. Entries in an ARCHIVE stay guarded throughout. A rolled-back prefix of the pre-rotation file cannot chain from the archive's handoff, so it is refused, and `audit verify` walks every file regardless.
+Every keyed open also requires the retained chains, bridges, root tags, entry
+tags and authenticated prune seed to verify. An untagged archive requires an
+operator history check and `profile rotate-audit-key` before keyed use.
+
+The two OFF states share a shape: the anchor names nothing in the file at the path, so there is no tip to compare a candidate against. Entries in an ARCHIVE stay guarded throughout. A rolled-back prefix of the pre-rotation file cannot chain from the archive's handoff, so it is refused, and each keyed open and acquisition verifies every retained file, as `audit verify` does.
 
 A keyring write outage that covers a rotation, failing both the handoff anchor and the first anchor of the new file, leaves the stored anchor on the pre-handoff tip. The live writer still holds the owed value. After a process exit, the next open and `audit verify` report a mismatch on an honest log, and recovery is `audit reanchor`.
 
@@ -388,9 +406,9 @@ Closing all three would need the anchor written BEFORE the entry it covers: an u
 - Zero-config logs carry no tags.
 - Stripping tags inside the anchored prefix fails keyed verify until the next keyed open appends `audit_entry_tags_rekeyed { cause: open_repair }`.
 
-`audit verify --profile` applies the same three-way rule in the same order as the writer: shorter than the anchor, then the anchored entry's intactness, then the tip at the anchored offset. It reads through the writer's own backward scan rather than a second implementation. So the two surfaces cannot disagree about a given file. With tags in force it also requires a valid tag on every entry past the boundary, the anchored prefix included, while the writer checks tags only on the tail past the anchor and on a file a rotation completed.
+`audit verify --profile` applies the same three-way rule in the same order as the writer: shorter than the anchor, then the anchored entry's intactness, then the tip at the anchored offset. It reads through the writer's own backward scan rather than a second implementation. So the two surfaces cannot disagree about a given file. With tags in force it also requires a valid tag on every entry past the boundary, the anchored prefix included, and a checked keyed writer verifies those tags across the retained history after its open-time repairs and at every keyed acquisition.
 
-**Cross-file seed.** Opening the active file needs the hash its first entry chains from: the zero block for the first file of a chain, the outgoing file's handoff entry once the log has rotated. `initial_chain_seed` reads only the newest archive's last line and requires it to BE a rotation handoff naming that archive, refusing with `audit.rotation_bridge_unusable` otherwise, so a file dropped into the audit directory under a later timestamp cannot redirect the bridge. That check is structural, not cryptographic: it does not walk the archive's chain or verify its root signature. The bridge's integrity is established by `audit verify`, which walks every file, threads the tip from one into the next, and requires each file's chain-root signature under the profile's key. Every replay inside the writer seeds through this one function; none names the zero block directly. The seed also carries the handoff's `entry_tags` flag and tag, so tags stay in force across a rotation and a prune.
+**Cross-file seed.** Opening the active file needs the hash its first entry chains from: the zero block for the first file of a chain, the outgoing file's handoff entry once the log has rotated. `initial_chain_seed` reads only the newest archive's last line and requires it to BE a rotation handoff naming that archive, refusing with `audit.rotation_bridge_unusable` otherwise, so a file dropped into the audit directory under a later timestamp cannot redirect the bridge. That seed check is structural. The checked keyed open and every keyed acquisition then verify the whole retained history, as `audit verify --profile` does. Each walk checks every chain, bridge, root tag, entry tag and authenticated prune seed. Every replay inside the writer seeds through this one function; none names the zero block directly. The seed also carries the handoff's `entry_tags` flag and tag, so tags stay in force across a rotation and a prune.
 
 **Repair.** `stellar-agent audit reanchor --profile <name> --acknowledge-rollback` is the only way out of a mismatch or a missing anchor. It replays the whole log first, so a broken chain is refused rather than blessed. It writes the current tip as the anchor, increments a monotonic per-path re-anchor counter in the keyring, and appends an `audit_tip_anchored { reason: rollback_acknowledged, previous_anchor }` row. Without the flag it reports both anchors and exits 1 with `validation.acknowledgement_required`, changing nothing. When tags are in force and the active file ends in entries without a valid tag, the verb also requires `--acknowledge-unauthenticated-tail`; it keeps those entries and appends `audit_entries_quarantined { quarantined_count }` directly after them, in the same file and before its `audit_tip_anchored` rows. A tail that ends on a rotation handoff without a valid tag refuses with `audit.reanchor_failed` and names the line to remove. Readers skip quarantined rows. A changed audit binding needs `--acknowledge-binding-change` instead, and both flags when the current path's anchor also disagrees; see **Audit binding** below. See [Audit-log recovery](audit-log-recovery.md).
 
@@ -473,7 +491,7 @@ Each profile command that writes long-lived key material to the keyring records 
 | `profile rotate-audit-key` | `audit_hash_chain_hmac` | none |
 | `profile rotate-policy-state-key` | `policy_window_state_hmac` | none |
 
-`rotate-audit-key` takes the audit writer's exclusive sidecar lock first and holds it throughout. No other process can append or rotate while the per-file sidecars are being rewritten. The MCP server acquires its audit writer when an operation needs it, such as a commit preflight before signing. MCP balance reads do not acquire it. Under V1, payment simulations can reconcile overdue reservations, acquire the writer, and write settlement audit rows. The registry normally caches the writer and holds its lock until process exit. A replaced-file refusal during acquisition marks the cached writer for eviction. After callers release it, the next acquisition drops it and checks the file at the path against the anchor. While the server holds the writer, rotation refuses with `audit.writer_locked`, even if the operation that acquired it later fails. The envelope carries that code in its detail, as the `approval.*` and `counterparty.*` lock codes do. Acquiring the writer also runs the tip-anchor check before the key is touched, so a rolled-back log is refused with the profile's key left alone. With an old key it then checks the log's entry tags under that key, under the held lock, and refuses with that check's code (`audit.entry_tag_invalid` among them) before any key write. It then (1) persists the new key, (2) loads it and switches the held writer to it, which appends `audit_entry_tags_rekeyed { cause: rotation }` tagged under the new key once tags are in force, (3) appends the `keyring_key_written` row, (4) reconciles the tip anchor and drains the audit outbox, and (5) re-signs every per-file chain-root sidecar with the new key. No file is rewritten. A crash between (1) and (2) leaves entries tagged under the old key past the newest keyed start; the next keyed open appends `audit_entry_tags_rekeyed { cause: open_repair }`, and a rerun converges the same way. A first mint appends no rekey row. Re-signing last is what covers a row that happened to open a new file: its chain root is brought onto the new key by the same pass. A drained consent row that opens a new file is covered by the same pass. The re-sign pass reads the replacement key from the keyring after persistence.
+`rotate-audit-key` takes the audit writer's exclusive sidecar lock first and holds it throughout. No other process can append or rotate while the per-file sidecars are being rewritten. The MCP server acquires its audit writer when an operation needs it, such as a commit preflight before signing. MCP balance reads do not acquire it. Under V1, payment simulations can reconcile overdue reservations, acquire the writer, and write settlement audit rows. The registry normally caches the writer and holds its lock until process exit. A replaced-file refusal during acquisition marks the cached writer for eviction. After callers release it, the next acquisition drops it and checks the file at the path against the anchor. While the server holds the writer, rotation refuses with `audit.writer_locked`, even if the operation that acquired it later fails. The envelope carries that code in its detail, as the `approval.*` and `counterparty.*` lock codes do. Acquiring the writer also runs the tip-anchor check before the key is touched, so a rolled-back log is refused with the profile's key left alone. With an old key it then checks the log's entry tags under that key, under the held lock, and refuses with that check's code (`audit.entry_tag_invalid` among them) before any key write. It then (1) persists the new key, (2) loads it and switches the held writer to it, which appends `audit_entry_tags_rekeyed { cause: rotation }` tagged under the new key once tags are in force, (3) appends the `keyring_key_written` row, (4) reconciles the tip anchor and drains the audit outbox, and (5) re-signs every per-file chain-root sidecar with the new key. No file is rewritten. A crash between (1) and (2) leaves entries tagged under the old key past the newest keyed start; the next keyed open appends `audit_entry_tags_rekeyed { cause: open_repair }` and refuses with `audit.history_unverified` until a rerun of `rotate-audit-key` re-signs every root. A first mint appends no rekey row. Re-signing last is what covers a row that happened to open a new file: its chain root is brought onto the new key by the same pass. A drained consent row that opens a new file is covered by the same pass. The re-sign pass reads the replacement key from the keyring after persistence.
 
 ## Emergency stop
 

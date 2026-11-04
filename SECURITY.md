@@ -236,11 +236,14 @@ properties:
   change refusing keyed acquisition.
   The queue commitment does not authenticate who appended a row.
 - Code running as the same OS user. Such code can write the audit log and the wallet's
-  files. The wallet detects an edited or removed entry inside the log, a log rolled back
-  or truncated behind the tip anchor the keyring holds, a deleted anchor on a log that
-  shows it was anchored (`audit.tip_anchor_missing`), and a changed audit binding.
+  files. The wallet detects an edited or removed entry in the active log or in any
+  retained archive, a removed or substituted archive, a removed or forged prune
+  marker, a log rolled back or truncated behind the tip anchor the keyring holds,
+  a deleted anchor on a log that shows it was anchored (`audit.tip_anchor_missing`),
+  and a changed audit binding.
   For an empty active file, only a surviving sidecar establishes prior anchoring.
-  These conditions refuse value-moving verbs. After investigation, `audit reanchor`
+  A keyed writer checks the whole retained history when it opens and at every
+  keyed acquisition, so these conditions refuse value-moving verbs. After investigation, `audit reanchor`
   accepts an intact prefix and records the acknowledgement; it refuses a broken chain.
   Profile verification checks the chain and HMAC sidecars before anchor agreement,
   unless the missing-anchor rule applies after an unkeyed chain walk. Past the

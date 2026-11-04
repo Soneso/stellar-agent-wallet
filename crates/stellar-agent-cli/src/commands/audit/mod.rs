@@ -100,6 +100,7 @@ pub(crate) fn audit_writer_error(
         | WriterError::CarrierIdentityUnavailable
         | WriterError::CarriersBusy
         | WriterError::CarrierBindingIncomplete
+        | WriterError::RetainedHistoryUnverified(_)
         | WriterError::CarrierRecoveryRequired { .. }
         | WriterError::OutboxBusy
         | WriterError::OutboxUnusable { .. }
@@ -268,6 +269,14 @@ mod tests {
                     found: 1,
                 },
                 "audit.outbox_rows_missing",
+            ),
+            (
+                WriterError::RetainedHistoryUnverified(
+                    stellar_agent_core::audit_log::VerifyError::HmacMismatch {
+                        file: "audit.jsonl.pruned".to_owned(),
+                    },
+                ),
+                "audit.history_unverified",
             ),
             (
                 WriterError::RetiredOutboxChanged { generation: 1 },

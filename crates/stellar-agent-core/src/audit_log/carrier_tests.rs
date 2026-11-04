@@ -182,10 +182,16 @@ fn a_log_without_keyed_evidence_enrolls_at_its_first_keyed_open() {
     drop(unkeyed);
     assert_eq!(rotated_archives_newest_first(&path).len(), 1);
     let store = Arc::new(InMemoryTipAnchorStore::new());
-    drop(AuditWriter::open(path.clone(), Some(access(&store))).unwrap());
+    assert!(matches!(
+        AuditWriter::open(path.clone(), Some(access(&store))),
+        Err(WriterError::RetainedHistoryUnverified(
+            crate::audit_log::VerifyError::HmacSidecarMissing { .. }
+        ))
+    ));
     let record = store.load_carrier_record().unwrap().unwrap();
     assert_eq!((record.generation, record.retired), (1, None));
     assert_eq!(record.writer, identity_at(&lock_sidecar_path(&path)));
+    crate::audit_log::resign_chain_root_sidecars(&path, &[0x42; 32]).unwrap();
     drop(AuditWriter::open(path, Some(access(&store))).unwrap());
 }
 

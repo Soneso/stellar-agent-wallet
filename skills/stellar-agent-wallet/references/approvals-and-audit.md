@@ -633,9 +633,10 @@ the audit writer. Eight outcomes:
 The ahead-of-anchor case is ordinary, not an exception. Writers opened without
 the audit key append without moving the anchor: the CLI startup advisory, and
 the zero-config and read-only smart-account paths of a profile whose audit key
-is not minted. Adoption needs
-no operator action and is what happens on the first keyed use of a log that
-only unkeyed writers wrote. A log with keyed history first needs
+is not minted. Adoption records the active tip on the first keyed use of a
+log that only unkeyed writers write. Keyed use also requires the whole retained
+history to verify. An archive without a root tag needs an operator history
+check and `profile rotate-audit-key` to re-sign it. A log with keyed history first needs
 `stellar-agent audit bind-carriers --profile <NAME>` with every wallet process
 stopped. An adoption writes its row only for a non-empty
 file.
@@ -735,7 +736,14 @@ Retention keeps ten archives plus the active file when pruning succeeds. Before
 each deletion, `<log>.pruned` records the successor's seed, the outgoing file's
 seed, and a count of pruned files. A keyed writer signs that marker.
 `audit verify` uses the marker to walk retained history and reports
-`pruned_prefix`; it still refuses edits and deletions beyond that boundary. An
+`pruned_prefix`; it refuses edits and deletions beyond that boundary.
+A keyed writer verifies every retained chain, bridge, root tag, entry tag and
+prune seed at open and every keyed acquisition. A failed check refuses
+value-moving verbs with `audit.history_unverified`. Readers check the oldest
+file's first link against that same seed, authenticating the marker when keyed.
+Each keyed acquisition reads every retained file. An archive without a
+chain-root tag refuses keyed use until the operator checks the history and
+runs `profile rotate-audit-key` to re-sign every file. An
 interrupted deletion keeps its outgoing seed available for verification. The
 writer prunes after the new active file exists, and a prune never fails the
 rotation. It deletes only archives of one fully validated chain that ends at
@@ -754,9 +762,9 @@ the clock is set back, so a sibling placed under a later name precedes the next
 archive and stalls pruning too. An append whose row exceeds 1 MiB refuses with
 `audit.row_too_large` and never writes the row. A rotation handoff is always
 its file's last entry, keyed or unkeyed, and a rotation never renames over an
-existing file. A keyed open writes a missing chain-root tag only for a file its
-anchor proves from byte 0; an anchored file that fails the proof refuses with
-`audit.tip_anchor_mismatch`.
+existing file. A keyed open writes a missing chain-root tag for a file its
+anchor proves from byte 0 or that it adopts; an anchored file that fails the
+proof refuses with `audit.tip_anchor_mismatch`.
 A marker that does not parse, does not authenticate, or names neither
 boundary, a failed marker write, or a failed removal also stops the prune.
 Every stop logs a warning and keeps excess archives in place. Past 21 rotated

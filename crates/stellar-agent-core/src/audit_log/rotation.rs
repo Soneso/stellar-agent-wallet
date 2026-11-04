@@ -261,8 +261,10 @@ impl std::error::Error for SidecarResignError {}
 /// under the old key stay, and the rekey row's own tag, under the new key,
 /// starts the run the new key checks. A crash after persistence and before
 /// the rekey row leaves entries tagged under the old key past the newest
-/// keyed start, all of them inside the anchored prefix; the next keyed open
-/// appends `audit_entry_tags_rekeyed { cause: open_repair }` for them.
+/// keyed start, all of them inside the anchored prefix. The next keyed open
+/// appends `audit_entry_tags_rekeyed { cause: open_repair }` and refuses with
+/// `audit.history_unverified` until a rerun of `rotate-audit-key` re-signs every
+/// root.
 ///
 /// The optional `<log>.pruned` marker is also re-signed under `new_key`.
 /// Returns the number of sidecars re-signed, including that marker.

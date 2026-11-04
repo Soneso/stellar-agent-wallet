@@ -161,16 +161,24 @@ async fn a_status_rerun_after_rotation_writes_no_duplicate_settled_row() {
     assert_eq!(submitted_rows_everywhere(&settled.profile), 1);
 }
 
-/// A settlement lookup that cannot read the retained history writes no
-/// settled row. The active file holds no row for the submission, so the
-/// lookup visits the archive, whose interior link is broken: whether a row
-/// is owed is unknown, and status writes none rather than guess.
+/// A status run over a broken retained history refuses at the keyed
+/// acquisition and writes no settled row.
 #[tokio::test]
 #[serial]
 async fn a_status_run_over_a_broken_archive_writes_no_settled_row() {
     let settled = settle_then_rotate([0x9d; 32]).await;
     break_newest_archive_link(&settled.profile.audit_log_path);
-    status(&settled).await;
+    let result = settled
+        .server
+        .call_stellar_transaction_status(StellarTransactionStatusArgs {
+            chain_id: "stellar:testnet".to_owned(),
+            tx_hash: settled.tx_hash.clone(),
+        })
+        .await
+        .unwrap();
+    let (code, message, text) = crate::common::assert_business_envelope(&result);
+    assert_eq!(code, "audit.chain_key_unavailable", "{text}");
+    assert!(message.contains("audit.history_unverified"), "{text}");
     assert!(
         crate::common::rows_of_kind(
             &crate::common::audit_rows(&settled.profile),

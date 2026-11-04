@@ -90,11 +90,11 @@
 //! the anchor check proved the file from byte 0 (the anchored prefix is
 //! current, advanced past, or the file a completed rotation created; see
 //! `AnchorOutcome::proved_the_file`), and the replayed chain root starts at
-//! offset 0.  It writes it before its first append.  An adopted or otherwise
-//! unproved file, or one whose first entry does not start at byte 0, keeps no
-//! tag; `audit reanchor`, the operator's acknowledgement of the file as it
-//! stands, writes it for a chain root at offset 0, and `profile
-//! rotate-audit-key` re-signs every file.  Conceptually, a
+//! offset 0. Adoption also signs the active root before the first append.
+//! An otherwise unproved file, or one whose first entry does not start at byte
+//! 0, keeps no tag. `audit reanchor`, the operator's acknowledgement of the
+//! file as it stands, writes it for a chain root at offset 0, and
+//! `profile rotate-audit-key` re-signs every file. Conceptually, a
 //! verifier would treat `chain-root-tag covers a strict superset of log entries`
 //! as the impossible `ChainRootAhead` state.
 //!
@@ -189,6 +189,23 @@ fn take_appends_before_fault_at_open(path: &Path) -> Option<usize> {
         .iter()
         .position(|(armed_path, _)| armed_path == path)?;
     Some(armed.swap_remove(index).1)
+}
+
+/// Paths whose next open fails its chain-root sidecar repair before writing.
+#[cfg(test)]
+static ROOT_SIDECAR_FAULT_AT_OPEN: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+/// Takes the chain-root sidecar fault armed for this path only.
+#[cfg(test)]
+fn take_root_sidecar_fault_at_open(path: &Path) -> bool {
+    let Ok(mut armed) = ROOT_SIDECAR_FAULT_AT_OPEN.lock() else {
+        return false;
+    };
+    let Some(index) = armed.iter().position(|armed_path| armed_path == path) else {
+        return false;
+    };
+    armed.swap_remove(index);
+    true
 }
 
 /// Reason carried by the tip-anchor refusal for a log replaced underneath the
@@ -393,9 +410,10 @@ pub struct AuditWriter {
     /// and after their pre-action row, so they never proceed while an anchor
     /// write is outstanding.
     pending_tip_anchor: Option<TipAnchor>,
-    /// Whether the writer was opened with an anchor store in the checked mode,
-    /// the only shape whose tip facts [`AuditWriter::verified_tip_facts`]
-    /// reports. A writer opened for repair, or with no anchor store, never is.
+    /// Whether the writer opens with an anchor store in a mode that checks
+    /// retained history. Repair, key rotation, and opens without a store do
+    /// not. [`AuditWriter::verified_tip_facts`] also excludes carrier binding
+    /// and unfinished outbox acknowledgement, which check only entry tags.
     checked_open: bool,
     /// Keyring-held tip anchor for the active PATH, when the opener supplied
     /// one.
@@ -778,6 +796,8 @@ enum TipAnchorOpenMode {
     /// Check the anchor, take all three carriers at their paths, and defer the
     /// drain, for [`AuditWriter::bind_carriers`].
     BindCarriers,
+    /// Reconcile the anchor for an operator key rotation that re-signs roots.
+    RotateKey,
     /// Skip the check so a refused file can be opened for repair. Only
     /// [`AuditWriter::open_for_reanchor`] uses this; the caller must follow it
     /// with [`AuditWriter::reanchor`].
@@ -1067,6 +1087,8 @@ impl AuditWriter {
     /// - [`WriterError::TipAnchorMismatch`] / [`WriterError::TipAnchorStore`]
     ///   from the anchor reconciliation when `access` is supplied; see
     ///   [`AuditWriter::open_with_tip_anchor`].
+    /// - [`WriterError::RetainedHistoryUnverified`] when keyed verification
+    ///   of the retained history fails.
     /// - Every error of [`AuditWriter::drain_outbox`], when `access` is
     ///   supplied.
     pub fn open(path: PathBuf, access: Option<KeyedAuditAccess>) -> Result<Self, WriterError> {
@@ -1149,6 +1171,8 @@ impl AuditWriter {
     ///   shows it was anchored before.
     /// - [`WriterError::TipAnchorStore`] when the anchor cannot be read or
     ///   written.
+    /// - [`WriterError::RetainedHistoryUnverified`] when keyed verification
+    ///   of the retained history fails.
     /// - Every error of [`AuditWriter::drain_outbox`].
     pub fn open_with_tip_anchor(
         path: PathBuf,
@@ -1247,6 +1271,33 @@ impl AuditWriter {
         )
     }
 
+    /// Opens for an operator audit-key rotation, which re-signs every root.
+    ///
+    /// Checks the anchor and drains the outbox. The caller must verify entry
+    /// tags with [`super::verify::verify_entry_tags`] before replacing the key,
+    /// then re-sign every root sidecar and prune marker under the new key.
+    /// Root and marker tags may belong to an interrupted rotation's prior key.
+    /// This recovery writer cannot provide [`Self::verified_tip_facts`].
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`Self::open_with_tip_anchor`], except retained-history
+    /// verification, which the caller performs before replacing the key.
+    pub fn open_for_key_rotation(
+        path: PathBuf,
+        hmac_key: Option<Zeroizing<[u8; 32]>>,
+        tip_anchor: Arc<dyn TipAnchorStore>,
+        binding: BindingHistory,
+    ) -> Result<Self, WriterError> {
+        Self::open_inner(
+            path,
+            hmac_key,
+            Some(tip_anchor),
+            binding,
+            TipAnchorOpenMode::RotateKey,
+        )
+    }
+
     /// Opens the log for [`AuditWriter::bind_carriers`] before the profile's
     /// first audit key exists.
     ///
@@ -1271,6 +1322,20 @@ impl AuditWriter {
     }
 
     fn open_inner(
+        path: PathBuf,
+        hmac_key: Option<Zeroizing<[u8; 32]>>,
+        tip_anchor: Option<Arc<dyn TipAnchorStore>>,
+        binding: BindingHistory,
+        anchor_mode: TipAnchorOpenMode,
+    ) -> Result<Self, WriterError> {
+        let mut writer =
+            Self::open_before_history(path, hmac_key, tip_anchor, binding, anchor_mode)?;
+        writer.verify_retained_history()?;
+        Ok(writer)
+    }
+
+    /// Builds the writer privately; callers verify history before publishing it.
+    fn open_before_history(
         path: PathBuf,
         hmac_key: Option<Zeroizing<[u8; 32]>>,
         tip_anchor: Option<Arc<dyn TipAnchorStore>>,
@@ -1314,7 +1379,10 @@ impl AuditWriter {
         // holds it. Writers without an anchor store neither drain nor queue
         // and take the sidecar alone. See `acquire_anchored_carriers` for how
         // the carriers are checked against the carrier record.
-        let recovery = anchor_mode != TipAnchorOpenMode::Check;
+        let recovery = !matches!(
+            anchor_mode,
+            TipAnchorOpenMode::Check | TipAnchorOpenMode::RotateKey
+        );
         let opened = match tip_anchor.as_ref() {
             Some(store) => acquire_anchored_carriers(&path, store, recovery)?,
             None => OpenedCarriers::Held(HeldCarriers::Writer {
@@ -1397,6 +1465,8 @@ impl AuditWriter {
         let needs_rekey = entry_tags_in_force && scan.needs_rekey;
         #[cfg(test)]
         let appends_before_fault = take_appends_before_fault_at_open(&path);
+        #[cfg(test)]
+        let fail_root_sidecar_repair = take_root_sidecar_fault_at_open(&path);
 
         let carriers = match opened {
             OpenedCarriers::Held(carriers) => carriers,
@@ -1442,7 +1512,11 @@ impl AuditWriter {
             log_diverged: None,
             owed_row_anchored: false,
             unsettled_append: None,
-            checked_open: tip_anchor.is_some() && anchor_mode != TipAnchorOpenMode::Repair,
+            checked_open: tip_anchor.is_some()
+                && !matches!(
+                    anchor_mode,
+                    TipAnchorOpenMode::Repair | TipAnchorOpenMode::RotateKey
+                ),
             tip_anchor,
             binding,
             #[cfg(test)]
@@ -1460,7 +1534,7 @@ impl AuditWriter {
             #[cfg(test)]
             skip_prune_removal: false,
             #[cfg(test)]
-            fail_root_sidecar_repair: false,
+            fail_root_sidecar_repair,
             #[cfg(test)]
             fail_replay_sync: false,
             #[cfg(test)]
@@ -1480,10 +1554,14 @@ impl AuditWriter {
 
         if writer.tip_anchor.is_some() && anchor_mode != TipAnchorOpenMode::Repair {
             let reconciled = writer.reconcile_tip_anchor()?;
-            // Only an outcome that proved the file from byte 0 against the
-            // anchor, and before any append, which may rotate it.
-            if reconciled.outcome.proved_the_file() {
-                writer.repair_root_sidecar(root.as_ref())?;
+            // Adoption accepts the unkeyed active file as this lineage's start.
+            // Write its root tag before any append can rotate it.
+            if (reconciled.outcome.proved_the_file()
+                || reconciled.outcome == AnchorOutcome::AdoptedExisting)
+                && let Err(error) = writer.repair_root_sidecar(root.as_ref())
+            {
+                writer.record_adoption(reconciled.outcome, writer.entry_count);
+                return Err(error);
             }
             let anchored_count = writer.entry_count;
             // Drain point: at open, after anchor reconciliation and before
@@ -1553,11 +1631,9 @@ impl AuditWriter {
     ///
     /// A keyed writer writes the tag after the first entry is durable, so a
     /// crash or a failed sidecar write in between leaves a keyed file with no
-    /// tag. A tag binds where a file starts, so it is minted only for content
-    /// this writer's lineage provably wrote: `root` comes from a replay of the
-    /// whole file that the caller accepted, the open's after an anchor check
-    /// that proved the file from byte 0 (see [`AnchorOutcome::proved_the_file`]),
-    /// or a re-anchor's after the operator acknowledged the file. The root
+    /// tag. A tag binds where a file starts. The caller accepts `root` through
+    /// a full replay that proves the anchored file, adopts an unkeyed file,
+    /// or follows the operator's reanchor acknowledgement. The root
     /// entry must also start at byte 0: an honest writer writes no blank line
     /// and no indentation, so any byte before it is foreign and nothing is
     /// written. The tag covers exactly that entry, as the first append would
@@ -2663,17 +2739,15 @@ impl AuditWriter {
         self.retry_tip_anchor_if_behind()
     }
 
-    /// Reconciles the anchor against the active file — the check
+    /// Reconciles the anchor and verifies the retained history, the check
     /// [`AuditWriterRegistry::get_or_open_keyed`] runs on EVERY acquisition of a
     /// keyed writer.
     ///
     /// The writer registry caches writers for the process lifetime, so a check
     /// performed only at open would miss a file replaced underneath a live
-    /// writer. This re-reads the file each time: cheap when the anchor is
-    /// current (one file-identity comparison, one seek and one entry hash), a
-    /// replay of the appended tail when the file has moved forward.
-    ///
-    /// A writer with no anchor store returns `Ok(())` unchanged.
+    /// writer. Each keyed acquisition reads every retained file, checking
+    /// chains, bridges, root tags, entry tags and the authenticated prune seed.
+    /// Anchor reconciliation replays any appended tail before that walk.
     ///
     /// A draining writer then drains the audit outbox, so this is a drain point
     /// of every registry cache hit. When reconciliation adopted the file, the
@@ -2693,13 +2767,43 @@ impl AuditWriter {
     /// - [`WriterError::IntegrityViolation`] when the active file's chain-root
     ///   sidecar is missing and cannot be written over a proved root, or does
     ///   not verify (see [`AuditWriter::require_anchor_current`]).
+    /// - [`WriterError::RetainedHistoryUnverified`] when the retained history
+    ///   fails keyed verification.
     /// - Every error of [`AuditWriter::drain_outbox`], for a draining writer.
     pub fn verify_tip_anchor(&mut self) -> Result<(), WriterError> {
         let reconciled = self.reconcile_tip_anchor()?;
         let anchored_count = self.entry_count;
         self.drain_then_record_adoption(reconciled.outcome, anchored_count)?;
         self.start_entry_tags_if_due(reconciled);
-        Ok(())
+        self.verify_retained_history()
+    }
+
+    /// Verifies every retained file under the audit key, bounded at this tip.
+    fn verify_retained_history(&mut self) -> Result<(), WriterError> {
+        if !self.drains || self.hmac_key.is_none() {
+            return Ok(());
+        }
+        if self.pending_handoff.is_some() {
+            self.rotate()?;
+        }
+        if !self.checked_open {
+            return Ok(());
+        }
+        match self.hmac_key.as_deref() {
+            Some(key) if self.carrier_binding || self.acknowledge_outbox => {
+                self.verify_retained_chain(key)
+            }
+            key => super::verify::verify_log_within(&self.path, key, self.end_offset)
+                .map(|_| ())
+                .map_err(WriterError::RetainedHistoryUnverified),
+        }
+    }
+
+    /// Recovery checks the chain and entry tags while roots await re-signing.
+    fn verify_retained_chain(&self, key: &[u8; 32]) -> Result<(), WriterError> {
+        super::verify::verify_entry_tags(&self.path, key)
+            .map(|_| ())
+            .map_err(WriterError::RetainedHistoryUnverified)
     }
 
     /// The anchor store attached to this writer.
@@ -2713,18 +2817,19 @@ impl AuditWriter {
     ///
     /// Requires a writer opened with an anchor store in the checked mode.
     /// Runs [`AuditWriter::verify_tip_anchor`] (reconciliation, which first
-    /// repairs an owed anchor write, then the drain), re-writes an anchor the
-    /// drain's appends left owed, and only then compares the durable anchor
-    /// with the tip. The facts report a lag only when the anchor still does
-    /// not name the tip after that re-write. `entry_count` is taken after the
-    /// drain. A verified empty log with no anchor written yet is covered at
-    /// count zero, and so is an empty file a rotation created whose anchor
-    /// names the archive's handoff.
+    /// repairs an owed anchor write, the drain, then the retained-history check),
+    /// re-writes an anchor the drain's appends left owed, and only then compares
+    /// the durable anchor with the tip. The facts report a lag only when the
+    /// anchor still does not name the tip after that re-write. `entry_count`
+    /// is taken after the drain. A verified empty log with no anchor written
+    /// yet is covered at count zero, and so is an empty file a rotation
+    /// created whose anchor names the archive's handoff.
     ///
     /// # Errors
     ///
     /// - [`WriterError::TipAnchorUnavailable`] for a writer opened without an
-    ///   anchor store or for repair.
+    ///   anchor store, for repair, for key rotation, for carrier binding, or
+    ///   for an unfinished outbox acknowledgement.
     /// - Every error of [`AuditWriter::verify_tip_anchor`], including an
     ///   anchor that cannot be read or an owed write that cannot be repaired.
     /// - [`WriterError::TipAnchorStore`] when the anchor cannot be read back.
@@ -2734,6 +2839,14 @@ impl AuditWriter {
             return Err(WriterError::TipAnchorUnavailable);
         }
         self.verify_tip_anchor()?;
+        self.tip_facts_after_verification()
+    }
+
+    /// Collects facts while the caller retains exclusive access after verification.
+    fn tip_facts_after_verification(&mut self) -> Result<VerifiedTipFacts, WriterError> {
+        if !self.checked_open || self.carrier_binding || self.acknowledge_outbox {
+            return Err(WriterError::TipAnchorUnavailable);
+        }
         // A drained row whose anchor write failed is owed; one more write is
         // attempted before the lag is reported. Its failure is the lag itself.
         if self.retry_tip_anchor_if_behind().is_err() {
@@ -3886,10 +3999,10 @@ impl AuditWriter {
     ///
     /// `entry_count` is the count the adoption anchored, read before the
     /// drain. The adoption is in force in the keyring once reconciliation
-    /// returns, and the next reconciliation finds the anchor current, so this
-    /// call is the only one that can append the adoption row. When the drain
-    /// refuses, the row is still appended and the refusal is returned; the
-    /// refused rows stay queued behind it.
+    /// returns, and the next reconciliation finds the anchor current. The
+    /// adopting open records the row here or on a failed root repair. When
+    /// the drain refuses, the row is still appended and the refusal is
+    /// returned; the refused rows stay queued behind it.
     ///
     /// # Errors
     ///
@@ -5477,12 +5590,11 @@ fn budget_exceeded(limit: &'static str, bytes: u64) -> WriterError {
 /// seed, so a file dropped into the audit directory under a later timestamp
 /// cannot redirect the bridge by looking vaguely like a log.
 ///
-/// That check is structural, not cryptographic. It does not walk the archive's
-/// chain and does not verify its root signature, so it establishes only that the
-/// seed came from a well-formed handoff for this stem. The bridge's integrity is
-/// established by `audit verify`, which walks every file, threads the tip from
-/// one into the next, and requires each file's chain-root signature under the
-/// profile's key. Open-time failure here is fail-closed: the writer refuses.
+/// This structural check establishes that the seed comes from a well-formed
+/// handoff for this stem. The checked keyed open then verifies the whole
+/// retained history, including every chain, bridge, root tag and entry tag.
+/// Every keyed acquisition repeats that verification. A failed check refuses
+/// the writer.
 ///
 /// An archive with no readable last entry falls back to the zero block, so the
 /// caller's replay reports the bridge failure against the active file's own
@@ -6105,6 +6217,12 @@ pub enum WriterError {
         generation: u64,
     },
 
+    /// The retained history fails verification under the profile's audit key.
+    #[error(
+        "audit.history_unverified: the retained audit history does not verify ({}); see the audit log recovery runbook", .0.wire_code()
+    )]
+    RetainedHistoryUnverified(super::verify::VerifyError),
+
     /// An I/O error occurred.
     #[error("audit log I/O error: {0}")]
     Io(#[from] io::Error),
@@ -6488,6 +6606,7 @@ pub fn audit_log_unusable_detail(e: &WriterError) -> Option<String> {
         | WriterError::CarriersBusy
         | WriterError::CarrierBindingIncomplete
         | WriterError::RetiredOutboxChanged { .. }
+        | WriterError::RetainedHistoryUnverified(_)
         | WriterError::OutboxBusy
         | WriterError::OutboxUnusable { .. }
         | WriterError::RowTooLarge { .. }
@@ -7018,6 +7137,13 @@ impl EvictedWriter {
 /// The process-global backing store.
 static REGISTRY: OnceLock<Mutex<HashMap<String, RegistryEntry>>> = OnceLock::new();
 
+/// A registry lookup and facts collected before a fresh writer is published.
+struct RegistryAcquisition {
+    handle: Arc<Mutex<AuditWriter>>,
+    opened: bool,
+    facts: Option<VerifiedTipFacts>,
+}
+
 impl AuditWriterRegistry {
     /// Removes one registry entry so tests can observe ownership by a proof alone.
     #[cfg(any(test, feature = "test-helpers"))]
@@ -7080,7 +7206,8 @@ impl AuditWriterRegistry {
         profile_name: &str,
         log_path: &Path,
     ) -> Result<Arc<Mutex<AuditWriter>>, WriterError> {
-        Self::get_or_open_inner(profile_name, log_path, None).map(|(handle, _opened)| handle)
+        Self::get_or_open_inner(profile_name, log_path, None, false)
+            .map(|acquisition| acquisition.handle)
     }
 
     /// Returns the shared writer for `profile_name`, opened KEYED and bound to
@@ -7123,31 +7250,64 @@ impl AuditWriterRegistry {
         log_path: &Path,
         access: KeyedAuditAccess,
     ) -> Result<Arc<Mutex<AuditWriter>>, WriterError> {
+        Self::acquire_keyed(profile_name, log_path, access, false).map(|(handle, _)| handle)
+    }
+
+    /// Acquires a keyed writer and collects tip facts under its verification guard.
+    ///
+    /// The writer mutex stays held from history verification through fact collection.
+    /// Both a fresh open and a cache hit walk the retained history once.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`Self::get_or_open_keyed`] and
+    /// [`AuditWriter::verified_tip_facts`].
+    pub fn keyed_tip_facts(
+        profile_name: &str,
+        log_path: &Path,
+        access: KeyedAuditAccess,
+    ) -> Result<(Arc<Mutex<AuditWriter>>, VerifiedTipFacts), WriterError> {
+        let (handle, facts) = Self::acquire_keyed(profile_name, log_path, access, true)?;
+        Ok((handle, facts.ok_or(WriterError::TipAnchorUnavailable)?))
+    }
+
+    fn acquire_keyed(
+        profile_name: &str,
+        log_path: &Path,
+        access: KeyedAuditAccess,
+        collect_facts: bool,
+    ) -> Result<(Arc<Mutex<AuditWriter>>, Option<VerifiedTipFacts>), WriterError> {
         let binding = access.binding_history();
-        let (handle, opened) = Self::get_or_open_inner(profile_name, log_path, Some(access))?;
+        let RegistryAcquisition {
+            handle,
+            opened,
+            facts,
+        } = Self::get_or_open_inner(profile_name, log_path, Some(access), collect_facts)?;
         if opened {
-            return Ok(handle);
+            return Ok((handle, facts));
         }
-        if let Err(e) = reconcile_cached_tip_anchor(&handle, binding) {
-            if let WriterError::TipAnchorMismatch {
-                expected_count,
-                expected_offset,
-                reason,
-                ..
-            } = &e
-                && *reason == LOG_REPLACED_REASON
-            {
-                Self::evict(
-                    profile_name,
-                    EvictedWriter {
-                        expected_count: *expected_count,
-                        expected_offset: *expected_offset,
-                    },
-                );
+        match reconcile_cached_tip_anchor(&handle, binding, collect_facts) {
+            Ok(facts) => Ok((handle, facts)),
+            Err(e) => {
+                if let WriterError::TipAnchorMismatch {
+                    expected_count,
+                    expected_offset,
+                    reason,
+                    ..
+                } = &e
+                    && *reason == LOG_REPLACED_REASON
+                {
+                    Self::evict(
+                        profile_name,
+                        EvictedWriter {
+                            expected_count: *expected_count,
+                            expected_offset: *expected_offset,
+                        },
+                    );
+                }
+                Err(e)
             }
-            return Err(e);
         }
-        Ok(handle)
     }
 
     /// Marks the cached entry for `profile_name` as evicted.
@@ -7185,7 +7345,8 @@ impl AuditWriterRegistry {
         profile_name: &str,
         log_path: &Path,
         access: Option<KeyedAuditAccess>,
-    ) -> Result<(Arc<Mutex<AuditWriter>>, bool), WriterError> {
+        collect_facts: bool,
+    ) -> Result<RegistryAcquisition, WriterError> {
         let incoming_fingerprint = access.as_ref().map(KeyedAuditAccess::key_fingerprint);
 
         // ── Phase 1: cache lookup under lock ────────────────────────────────
@@ -7228,7 +7389,11 @@ impl AuditWriterRegistry {
                     None => {
                         let handle = Arc::clone(&entry.handle);
                         drop(map);
-                        return Ok((handle, false));
+                        return Ok(RegistryAcquisition {
+                            handle,
+                            opened: false,
+                            facts: None,
+                        });
                     }
                 }
             }
@@ -7242,10 +7407,30 @@ impl AuditWriterRegistry {
         // Perform the I/O (directory creation, advisory lock, chain recovery)
         // without holding the registry lock so concurrent opens for different
         // profiles do not serialise behind each other's I/O.
-        let handle = Arc::new(Mutex::new(AuditWriter::open(
+        let (key, store, binding) = match access {
+            Some(access) => {
+                let binding = access.binding_history();
+                let (key, store) = access.into_parts();
+                (Some(key), Some(store), binding)
+            }
+            None => (None, None, BindingHistory::NotRecorded),
+        };
+        let handle = Arc::new(Mutex::new(AuditWriter::open_before_history(
             log_path.to_path_buf(),
-            access,
+            key,
+            store,
+            binding,
+            TipAnchorOpenMode::Check,
         )?));
+        let facts = {
+            let mut writer = lock_for_verification(&handle)?;
+            writer.verify_retained_history()?;
+            if collect_facts {
+                Some(writer.tip_facts_after_verification()?)
+            } else {
+                None
+            }
+        };
 
         // ── Phase 3: re-acquire lock and insert (double-checked) ────────────
         // A concurrent thread may have won the race and inserted while we were
@@ -7282,7 +7467,11 @@ impl AuditWriterRegistry {
                 let winner = Arc::clone(&entry.handle);
                 drop(map);
                 drop(handle);
-                return Ok((winner, false));
+                return Ok(RegistryAcquisition {
+                    handle: winner,
+                    opened: false,
+                    facts: None,
+                });
             }
         }
 
@@ -7296,7 +7485,11 @@ impl AuditWriterRegistry {
                 evicted: None,
             },
         );
-        Ok((handle, true))
+        Ok(RegistryAcquisition {
+            handle,
+            opened: true,
+            facts,
+        })
     }
 }
 
@@ -7315,17 +7508,29 @@ impl AuditWriterRegistry {
 fn reconcile_cached_tip_anchor(
     handle: &Arc<Mutex<AuditWriter>>,
     binding: BindingHistory,
-) -> Result<(), WriterError> {
-    let mut writer = handle.lock().map_err(|_| {
-        WriterError::Io(io::Error::other(
-            "audit writer mutex poisoned; cannot reconcile the tip anchor",
-        ))
-    })?;
+    collect_facts: bool,
+) -> Result<Option<VerifiedTipFacts>, WriterError> {
+    let mut writer = lock_for_verification(handle)?;
     // Evidence learned by any acquisition survives later accesses that lack it.
     if binding == BindingHistory::Recorded {
         writer.binding = BindingHistory::Recorded;
     }
-    writer.verify_tip_anchor()
+    writer.verify_tip_anchor()?;
+    if collect_facts {
+        writer.tip_facts_after_verification().map(Some)
+    } else {
+        Ok(None)
+    }
+}
+
+fn lock_for_verification(
+    handle: &Arc<Mutex<AuditWriter>>,
+) -> Result<std::sync::MutexGuard<'_, AuditWriter>, WriterError> {
+    handle.lock().map_err(|_| {
+        WriterError::Io(io::Error::other(
+            "audit writer mutex poisoned; cannot reconcile the tip anchor",
+        ))
+    })
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -7631,6 +7836,520 @@ mod tests {
             rotate_pruning_fixture(&mut writer);
         }
         (writer, store)
+    }
+
+    fn retained_history_access(store: &Arc<InMemoryTipAnchorStore>) -> KeyedAuditAccess {
+        KeyedAuditAccess::new(
+            Zeroizing::new(PRUNE_TEST_KEY),
+            Arc::clone(store) as Arc<dyn TipAnchorStore>,
+        )
+    }
+
+    fn cached_history_fixture(
+        path: &Path,
+        name: &str,
+        rotations: usize,
+    ) -> (Arc<Mutex<AuditWriter>>, Arc<InMemoryTipAnchorStore>) {
+        let (writer, store) = anchored_pruning_fixture(path, rotations);
+        drop(writer);
+        let handle =
+            AuditWriterRegistry::get_or_open_keyed(name, path, retained_history_access(&store))
+                .unwrap();
+        (handle, store)
+    }
+
+    fn remove_oldest_archive(path: &Path) {
+        let archives = super::super::test_helpers::rotated_archives_newest_first(path);
+        let oldest = archives.last().unwrap();
+        fs::remove_file(oldest).unwrap();
+        fs::remove_file(hmac_sidecar_path(oldest)).unwrap();
+    }
+
+    #[test]
+    fn a_cached_writer_refuses_after_the_oldest_archive_is_deleted() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let name = "history-cached-deletion";
+        let (_writer, store) = cached_history_fixture(&path, name, 3);
+        remove_oldest_archive(&path);
+        assert!(matches!(
+            AuditWriterRegistry::get_or_open_keyed(name, &path, retained_history_access(&store)),
+            Err(WriterError::RetainedHistoryUnverified(_))
+        ));
+    }
+
+    #[test]
+    fn a_keyed_open_refuses_a_history_missing_its_oldest_archive() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let (writer, store) = anchored_pruning_fixture(&path, 3);
+        drop(writer);
+        remove_oldest_archive(&path);
+        assert!(matches!(
+            AuditWriter::open(path, Some(retained_history_access(&store))),
+            Err(WriterError::RetainedHistoryUnverified(_))
+        ));
+    }
+
+    #[test]
+    fn an_edited_middle_archive_refuses_the_next_keyed_acquisition() {
+        use super::super::schema::{ValueActionKind, ValueLegRecord};
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let name = "history-edited-middle";
+        let (writer, store) = cached_history_fixture(&path, name, 1);
+        {
+            let mut writer = writer.lock().unwrap();
+            writer
+                .write_entry(AuditEntry::new_value_action_pending(
+                    "stellar_pay",
+                    Some("stellar:testnet".to_owned()),
+                    vec![ValueLegRecord {
+                        action: ValueActionKind::Payment,
+                        amount: Some(10),
+                        asset: Some("native".to_owned()),
+                        destination_redacted: None,
+                    }],
+                    "aaaaaaaa...aaaaaaaa",
+                    "GAAAA...AAAWHF",
+                    1,
+                    PolicyDecision::Allow,
+                    None,
+                    None,
+                    None,
+                    "history-payment",
+                    None,
+                ))
+                .unwrap();
+            rotate_pruning_fixture(&mut writer);
+            rotate_pruning_fixture(&mut writer);
+        }
+        let archives = super::super::test_helpers::rotated_archives_newest_first(&path);
+        assert_eq!(archives.len(), 3);
+        let contents = fs::read_to_string(&archives[1]).unwrap();
+        assert!(contents.contains("\"amount\":\"10\""));
+        fs::write(
+            &archives[1],
+            contents.replace("\"amount\":\"10\"", "\"amount\":\"20\""),
+        )
+        .unwrap();
+        assert!(matches!(
+            AuditWriterRegistry::get_or_open_keyed(name, &path, retained_history_access(&store)),
+            Err(WriterError::RetainedHistoryUnverified(_))
+        ));
+    }
+
+    #[test]
+    fn keyed_acquisition_refuses_each_archive_discontinuity() {
+        for damage in [
+            "middle removed",
+            "tail truncated",
+            "replaced",
+            "order swapped",
+        ] {
+            let dir = TempDir::new().unwrap();
+            let path = dir.path().join("audit.jsonl");
+            let name = format!("history-discontinuity-{damage}");
+            let (_writer, store) = cached_history_fixture(&path, &name, 3);
+            let archives = rotated_archives_newest_first(&path);
+            let middle = &archives[1];
+            match damage {
+                "middle removed" => {
+                    fs::remove_file(middle).unwrap();
+                    fs::remove_file(hmac_sidecar_path(middle)).unwrap();
+                }
+                "tail truncated" => {
+                    let text = fs::read_to_string(middle).unwrap();
+                    let end = text.trim_end().rfind('\n').unwrap() + 1;
+                    fs::write(middle, &text[..end]).unwrap();
+                }
+                "replaced" => {
+                    fs::copy(&archives[2], middle).unwrap();
+                    fs::copy(hmac_sidecar_path(&archives[2]), hmac_sidecar_path(middle)).unwrap();
+                }
+                "order swapped" => {
+                    for (a, b) in [
+                        (middle.clone(), archives[2].clone()),
+                        (hmac_sidecar_path(middle), hmac_sidecar_path(&archives[2])),
+                    ] {
+                        let bytes = fs::read(&a).unwrap();
+                        fs::copy(&b, &a).unwrap();
+                        fs::write(&b, bytes).unwrap();
+                    }
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                matches!(
+                    AuditWriterRegistry::get_or_open_keyed(
+                        &name,
+                        &path,
+                        retained_history_access(&store)
+                    ),
+                    Err(WriterError::RetainedHistoryUnverified(_))
+                ),
+                "{damage}"
+            );
+        }
+    }
+
+    #[test]
+    fn retained_history_error_withholds_a_tampered_row_value() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let name = "history-error-redaction";
+        let (_writer, store) = cached_history_fixture(&path, name, 3);
+        let archive = rotated_archives_newest_first(&path).remove(1);
+        let text = fs::read_to_string(&archive).unwrap();
+        let mut rows: Vec<serde_json::Value> = text
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        rows[0]["kind"] = serde_json::json!("rejected-row-sentinel");
+        let text = rows
+            .iter()
+            .map(|row| format!("{row}\n"))
+            .collect::<String>();
+        fs::write(&archive, text).unwrap();
+        let error =
+            AuditWriterRegistry::get_or_open_keyed(name, &path, retained_history_access(&store))
+                .unwrap_err();
+        assert!(matches!(
+            &error,
+            WriterError::RetainedHistoryUnverified(super::super::verify::VerifyError::ParseError {
+                line: 1,
+                ..
+            })
+        ));
+        assert!(error.to_string().contains("audit.parse_error"));
+        assert!(!error.to_string().contains("rejected-row-sentinel"));
+    }
+
+    #[test]
+    fn ordinary_reopen_and_acquisition_complete_the_pending_handoff() {
+        for reopen in [false, true] {
+            let dir = TempDir::new().unwrap();
+            let path = dir.path().join("audit.jsonl");
+            let name = format!("history-pending-{reopen}");
+            let store = Arc::new(InMemoryTipAnchorStore::new());
+            let (pending_name, bytes) = if reopen {
+                let mut writer = open_keyed_anchored(&path, &store);
+                writer.set_rotation_renames_to_fail(1);
+                assert!(matches!(
+                    writer.force_rotate_for_test(),
+                    Err(WriterError::Io(_))
+                ));
+                (last_handoff_name(&path), fs::read(&path).unwrap())
+            } else {
+                let handle = AuditWriterRegistry::get_or_open_keyed(
+                    &name,
+                    &path,
+                    retained_history_access(&store),
+                )
+                .unwrap();
+                let mut writer = handle.lock().unwrap();
+                writer.set_rotation_renames_to_fail(1);
+                assert!(matches!(
+                    writer.force_rotate_for_test(),
+                    Err(WriterError::Io(_))
+                ));
+                (last_handoff_name(&path), fs::read(&path).unwrap())
+            };
+            let handle = AuditWriterRegistry::get_or_open_keyed(
+                &name,
+                &path,
+                retained_history_access(&store),
+            )
+            .unwrap();
+            let archive = path.with_file_name(pending_name);
+            assert_eq!(fs::read(&archive).unwrap(), bytes);
+            assert_eq!(handoff_count(&archive), 1);
+            assert!(handle.lock().unwrap().pending_handoff.is_none());
+            super::super::verify::verify_log(&path, Some(&PRUNE_TEST_KEY)).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_key_rotation_open_completes_the_pending_handoff() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let store = Arc::new(InMemoryTipAnchorStore::new());
+        let mut writer = open_keyed_anchored(&path, &store);
+        writer.set_rotation_renames_to_fail(1);
+        assert!(matches!(
+            writer.force_rotate_for_test(),
+            Err(WriterError::Io(_))
+        ));
+        let archive = path.with_file_name(last_handoff_name(&path));
+        let pending_bytes = fs::read(&path).unwrap();
+        drop(writer);
+
+        let writer = AuditWriter::open_for_key_rotation(
+            path.clone(),
+            Some(Zeroizing::new(PRUNE_TEST_KEY)),
+            store.clone(),
+            BindingHistory::NotRecorded,
+        )
+        .unwrap();
+        super::super::verify::verify_entry_tags(&path, &PRUNE_TEST_KEY).unwrap();
+        assert_eq!(fs::read(&archive).unwrap(), pending_bytes);
+        assert_eq!(handoff_count(&archive), 1);
+        assert_eq!(fs::metadata(&path).unwrap().len(), 0);
+        assert!(writer.pending_handoff.is_none());
+        drop(writer);
+        drop(open_keyed_anchored(&path, &store));
+        super::super::verify::verify_log(&path, Some(&PRUNE_TEST_KEY)).unwrap();
+    }
+
+    #[test]
+    fn carrier_binding_then_key_rotation_recovers_prior_key_roots() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let (writer, old_store) = anchored_pruning_fixture(&path, 3);
+        drop(writer);
+        let store = Arc::new(InMemoryTipAnchorStore::new());
+        store.set(old_store.peek());
+        assert!(matches!(
+            AuditWriter::open_for_key_rotation(
+                path.clone(),
+                Some(Zeroizing::new(OTHER_TEST_KEY)),
+                store.clone(),
+                BindingHistory::NotRecorded,
+            ),
+            Err(WriterError::CarriersUnbound)
+        ));
+        assert_recovery_chain_is_checked(&path, || {
+            AuditWriter::open_for_carrier_binding(
+                path.clone(),
+                keyed_access(OTHER_TEST_KEY, &store),
+            )
+        });
+        let mut binding = AuditWriter::open_for_carrier_binding(
+            path.clone(),
+            keyed_access(OTHER_TEST_KEY, &store),
+        )
+        .unwrap();
+        binding.bind_carriers().unwrap();
+        drop(binding);
+        finish_prior_key_recovery(&path, &store);
+    }
+
+    #[test]
+    fn outbox_acknowledgement_then_key_rotation_recovers_prior_key_roots() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let (writer, store) = anchored_pruning_fixture(&path, 3);
+        drop(writer);
+        let outbox = super::super::outbox::AuditOutbox::for_log(&path, store.clone());
+        outbox
+            .append(&AuditEntry::new_approval_attested(
+                "PaymentSimulated",
+                "stellar_pay_commit",
+                None,
+                "ABCDEFGHIJKLMNOPQRSTUV",
+                "cli",
+                "missing-consent",
+            ))
+            .unwrap();
+        fs::write(outbox.path(), []).unwrap();
+        assert!(matches!(
+            AuditWriter::open_for_key_rotation(
+                path.clone(),
+                Some(Zeroizing::new(OTHER_TEST_KEY)),
+                store.clone(),
+                BindingHistory::NotRecorded,
+            ),
+            Err(WriterError::OutboxRowsMissing { .. })
+        ));
+        assert_recovery_chain_is_checked(&path, || {
+            AuditWriter::open_for_outbox_acknowledgement(
+                path.clone(),
+                Some(Zeroizing::new(OTHER_TEST_KEY)),
+                store.clone(),
+                BindingHistory::NotRecorded,
+            )
+        });
+        let mut acknowledgement = AuditWriter::open_for_outbox_acknowledgement(
+            path.clone(),
+            Some(Zeroizing::new(OTHER_TEST_KEY)),
+            store.clone(),
+            BindingHistory::NotRecorded,
+        )
+        .unwrap();
+        acknowledgement
+            .acknowledge_outbox_loss("queue inspection", RevokedCounts::default())
+            .unwrap();
+        drop(acknowledgement);
+        finish_prior_key_recovery(&path, &store);
+    }
+
+    fn assert_recovery_chain_is_checked(
+        path: &Path,
+        open: impl FnOnce() -> Result<AuditWriter, WriterError>,
+    ) {
+        let archives = rotated_archives_newest_first(path);
+        let oldest = archives.last().unwrap();
+        let bytes = fs::read(oldest).unwrap();
+        fs::write(oldest, b"invalid archive\n").unwrap();
+        assert!(matches!(
+            open(),
+            Err(WriterError::RetainedHistoryUnverified(_))
+        ));
+        fs::write(oldest, bytes).unwrap();
+    }
+
+    fn finish_prior_key_recovery(path: &Path, store: &Arc<InMemoryTipAnchorStore>) {
+        let mut rotation = AuditWriter::open_for_key_rotation(
+            path.to_path_buf(),
+            Some(Zeroizing::new(OTHER_TEST_KEY)),
+            store.clone(),
+            BindingHistory::NotRecorded,
+        )
+        .unwrap();
+        rotation.verify_tip_anchor().unwrap();
+        assert!(matches!(
+            rotation.verified_tip_facts(),
+            Err(WriterError::TipAnchorUnavailable)
+        ));
+        super::super::verify::verify_entry_tags(path, &OTHER_TEST_KEY).unwrap();
+        crate::audit_log::resign_chain_root_sidecars(path, &OTHER_TEST_KEY).unwrap();
+        drop(rotation);
+        drop(
+            AuditWriter::open(
+                path.to_path_buf(),
+                Some(keyed_access(OTHER_TEST_KEY, store)),
+            )
+            .unwrap(),
+        );
+    }
+
+    #[test]
+    fn registry_tip_facts_cover_fresh_and_cached_acquisitions() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let name = "history-registry-facts";
+        let store = Arc::new(InMemoryTipAnchorStore::new());
+        let (handle, fresh) =
+            AuditWriterRegistry::keyed_tip_facts(name, &path, retained_history_access(&store))
+                .unwrap();
+        assert!(fresh.anchor_covers_tip && fresh.entry_tags_in_force);
+        {
+            let mut writer = handle.lock().unwrap();
+            writer.write_entry(make_entry("")).unwrap();
+            writer.set_rotation_renames_to_fail(1);
+            writer.force_rotate_for_test().unwrap_err();
+        }
+        let (_, cached) =
+            AuditWriterRegistry::keyed_tip_facts(name, &path, retained_history_access(&store))
+                .unwrap();
+        assert!(cached.anchor_covers_tip && cached.entry_tags_in_force);
+        assert_eq!(cached.entry_count, 0);
+        assert_ne!(fresh.segment_start_hash, cached.segment_start_hash);
+        {
+            let mut writer = handle.lock().unwrap();
+            for _ in 0..2 {
+                writer.write_entry(make_entry("")).unwrap();
+                writer.force_rotate_for_test().unwrap();
+            }
+        }
+        remove_oldest_archive(&path);
+        assert!(
+            AuditWriterRegistry::keyed_tip_facts(name, &path, retained_history_access(&store))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn a_forged_prune_marker_refuses_the_keyed_acquisition() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let name = "history-forged-marker";
+        let (writer, store) = cached_history_fixture(&path, name, 12);
+        let mut marker = read_prune_marker(&path).unwrap().unwrap();
+        marker.tag = Some(ZERO_BLOCK_HASH.to_owned());
+        fs::write(
+            prune_marker_path(&path),
+            serde_json::to_vec(&marker).unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(
+            AuditWriterRegistry::get_or_open_keyed(name, &path, retained_history_access(&store)),
+            Err(WriterError::RetainedHistoryUnverified(
+                super::super::verify::VerifyError::HmacMismatch { file }
+            )) if file == "audit.jsonl.pruned"
+        ));
+        let reader = super::super::reader::AuditReader::new(writer, Some(PRUNE_TEST_KEY));
+        assert!(matches!(reader.find_installed_context_rule_ids("account"),
+            Err(super::super::verify::VerifyError::HmacMismatch { file })
+                if file == "audit.jsonl.pruned"));
+    }
+
+    #[test]
+    fn an_unkeyed_archive_refuses_keyed_use() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        drop(pruning_fixture(&path, false, 3));
+        let store = Arc::new(InMemoryTipAnchorStore::new());
+        assert!(matches!(
+            AuditWriter::open(path.clone(), Some(retained_history_access(&store))),
+            Err(WriterError::RetainedHistoryUnverified(
+                super::super::verify::VerifyError::HmacSidecarMissing { .. }
+            ))
+        ));
+        let mut recovery = AuditWriter::open_for_key_rotation(
+            path.clone(),
+            Some(Zeroizing::new(PRUNE_TEST_KEY)),
+            store.clone(),
+            BindingHistory::NotRecorded,
+        )
+        .unwrap();
+        assert!(matches!(
+            recovery.verified_tip_facts(),
+            Err(WriterError::TipAnchorUnavailable)
+        ));
+        super::super::verify::verify_entry_tags(&path, &PRUNE_TEST_KEY).unwrap();
+        crate::audit_log::resign_chain_root_sidecars(&path, &PRUNE_TEST_KEY).unwrap();
+        drop(recovery);
+        AuditWriter::open(path, Some(retained_history_access(&store))).unwrap();
+    }
+
+    #[test]
+    fn reanchor_opens_a_history_missing_its_oldest_archive() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let (writer, store) = anchored_pruning_fixture(&path, 3);
+        drop(writer);
+        remove_oldest_archive(&path);
+        AuditWriter::open_for_reanchor(path, Some(Zeroizing::new(PRUNE_TEST_KEY)), store).unwrap();
+    }
+
+    #[test]
+    fn an_authenticated_prune_passes_open_acquisition_and_readers() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let name = "history-authenticated-prune";
+        let (writer, store) = cached_history_fixture(&path, name, 12);
+        let marker = read_prune_marker(&path).unwrap().unwrap();
+        assert!(marker.verify_tag(&PRUNE_TEST_KEY));
+        assert_eq!(marker.data.pruned_files, 2);
+        let acquired =
+            AuditWriterRegistry::get_or_open_keyed(name, &path, retained_history_access(&store))
+                .unwrap();
+        assert!(Arc::ptr_eq(&writer, &acquired));
+        for key in [None, Some(PRUNE_TEST_KEY)] {
+            let reader = super::super::reader::AuditReader::new(Arc::clone(&writer), key);
+            assert!(
+                reader
+                    .find_installed_context_rule_ids("account")
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+        assert!(
+            super::super::reader::scan_all_context_rule_pin_records_unanchored(&path)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     /// Rotates once more and asserts that the prune failed without touching
@@ -8384,12 +9103,10 @@ mod tests {
         );
     }
 
-    /// An adopted file had no anchor to be proved against, so the open mints
-    /// no tag for it. Only a zero-config log, which no keyed writer reached,
-    /// is adopted: a keyed writer's rows carry entry tags, which count as
-    /// prior anchoring.
+    /// Adoption accepts an unkeyed active file and signs its root at open.
+    /// Entry tags count as prior anchoring and prevent adoption.
     #[test]
-    fn an_adopted_file_gets_no_root_tag_at_open() {
+    fn an_adopted_file_gets_its_root_tag_at_open() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("audit.jsonl");
         let store = Arc::new(InMemoryTipAnchorStore::new());
@@ -8400,9 +9117,10 @@ mod tests {
             store.peek().is_none(),
             "the unkeyed append anchored nothing"
         );
-        let _writer = open_keyed_anchored(&path, &store);
+        drop(AuditWriter::open(path.clone(), Some(retained_history_access(&store))).unwrap());
         assert!(store.peek().is_some(), "the open adopted the file");
-        assert!(!hmac_sidecar_path(&path).exists());
+        assert!(hmac_sidecar_path(&path).exists());
+        super::super::verify::verify_log(&path, Some(&PRUNE_TEST_KEY)).unwrap();
     }
 
     /// The active file holds handoffs P and Q, the anchor on Q. The writer
@@ -8421,8 +9139,6 @@ mod tests {
         writer.write_entry(make_entry("")).unwrap();
         wait_for_a_later_archive_name();
         writer.write_rotation_handoff_for_test().unwrap();
-        drop(writer);
-        let mut writer = open_keyed_anchored(&path, &store);
         wait_for_a_later_archive_name();
         writer.write_rotation_handoff_for_test().unwrap();
         drop(writer);
@@ -8489,9 +9205,16 @@ mod tests {
             .store_anchor(&TipAnchor::new(1, hash, content.len() as u64))
             .unwrap();
 
-        let writer = open_keyed_anchored(&path, &store);
+        crate::audit_log::test_helpers::enroll_carriers(&path, store.as_ref()).unwrap();
+        assert!(matches!(
+            AuditWriter::open(path.clone(), Some(retained_history_access(&store))),
+            Err(WriterError::RetainedHistoryUnverified(
+                super::super::verify::VerifyError::HmacSidecarMissing { .. }
+            ))
+        ));
         assert_eq!(
-            writer.entry_count, 2,
+            store.peek().unwrap().entry_count,
+            2,
             "the anchor check accepted the file and the boundary row followed it"
         );
         assert!(!hmac_sidecar_path(&path).exists(), "no tag was minted");
@@ -8511,8 +9234,8 @@ mod tests {
             .count()
     }
 
-    /// Three rotation attempts whose renames fail, two in one process and one
-    /// after a reopen, leave one handoff; the rotation that then succeeds
+    /// Three rotation attempts whose renames fail, the third at acquisition,
+    /// leave one handoff; the ordinary reopen that then succeeds
     /// archives the file under that handoff's name within the prune's budget,
     /// and the prunes prove it as the newest archive and as an older one.
     #[test]
@@ -8529,10 +9252,11 @@ mod tests {
         writer.write_entry(make_entry("")).unwrap_err();
         writer.write_entry(make_entry("")).unwrap_err();
         assert_eq!(handoff_count(&path), 1);
-        drop(writer);
-        let mut writer = open_keyed_anchored(&path, &store);
         writer.set_rotation_renames_to_fail(1);
-        writer.write_entry(make_entry("")).unwrap_err();
+        assert!(matches!(
+            writer.verify_tip_anchor(),
+            Err(WriterError::Io(_))
+        ));
         assert_eq!(handoff_count(&path), 1, "every attempt reused the handoff");
         let content = fs::read_to_string(&path).unwrap();
         let last: AuditEntry = serde_json::from_str(content.lines().last().unwrap()).unwrap();
@@ -8544,6 +9268,8 @@ mod tests {
             panic!("the file ends on its handoff");
         };
 
+        drop(writer);
+        let mut writer = open_keyed_anchored(&path, &store);
         writer.write_entry(make_entry("")).unwrap();
         let archive = path.with_file_name(&pending_name);
         assert!(archive.exists(), "the archive carries the pending name");
@@ -8787,9 +9513,9 @@ mod tests {
     }
 
     /// A rotation handoff whose fsync failed after its bytes landed is the
-    /// file's last entry. The next acquisition reconciles the file and holds
-    /// that handoff as pending, so the next append renames the file under it
-    /// and the archive ends on its one handoff.
+    /// file's last entry. The next acquisition reconciles the file and completes
+    /// the rotation under that handoff before verifying the retained history.
+    /// The archive ends on its one handoff.
     #[test]
     fn a_handoff_whose_fsync_failed_is_completed_under_its_one_handoff() {
         use super::super::verify::verify_log;
@@ -8821,7 +9547,7 @@ mod tests {
     }
 
     /// A small unanchored file that ends on a rotation handoff is adopted by a
-    /// keyed open. The adoption row would be the first row after that handoff,
+    /// key-rotation recovery open. The adoption row follows the handoff,
     /// so the open completes the rotation under the handoff's name first and
     /// the row starts the new file; the next rotation archives that file with
     /// its own one handoff.
@@ -8836,7 +9562,14 @@ mod tests {
         let pending_name = last_handoff_name(&path);
 
         let store = Arc::new(InMemoryTipAnchorStore::new());
-        let mut writer = open_keyed_anchored(&path, &store);
+        let mut writer = AuditWriter::open_for_key_rotation(
+            path.clone(),
+            Some(Zeroizing::new(PRUNE_TEST_KEY)),
+            store,
+            BindingHistory::NotRecorded,
+        )
+        .unwrap();
+        crate::audit_log::resign_chain_root_sidecars(&path, &PRUNE_TEST_KEY).unwrap();
         let archives = real_archives(&path);
         assert_eq!(archives, vec![path.with_file_name(&pending_name)]);
         assert_eq!(archive_handoff_hash(&archives[0]).unwrap(), handoff);
@@ -11232,6 +11965,35 @@ mod tests {
         );
     }
 
+    #[test]
+    fn an_open_whose_root_repair_fails_still_records_the_adoption() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        {
+            let mut writer = open_no_key(path.clone());
+            writer.write_entry(make_entry("")).unwrap();
+            writer.write_entry(make_entry("")).unwrap();
+        }
+        let store = Arc::new(InMemoryTipAnchorStore::new());
+        ROOT_SIDECAR_FAULT_AT_OPEN
+            .lock()
+            .unwrap()
+            .push(path.clone());
+        let error =
+            AuditWriter::open(path.clone(), Some(retained_history_access(&store))).unwrap_err();
+        assert!(matches!(&error, WriterError::Io(error)
+            if error.to_string() == "test fault: chain-root sidecar repair failed"));
+        assert!(!hmac_sidecar_path(&path).exists());
+        assert_eq!(count_tip_anchored_rows(&path, "adopted"), 1);
+        assert_eq!(store.peek().unwrap().entry_count, 3);
+        assert_eq!(stored_value(&store), tip_of(&path).to_keyring_value());
+
+        drop(open_keyed_anchored(&path, &store));
+        assert!(hmac_sidecar_path(&path).exists());
+        assert_eq!(count_tip_anchored_rows(&path, "adopted"), 1);
+        super::super::verify::verify_log(&path, Some(&PRUNE_TEST_KEY)).unwrap();
+    }
+
     /// The cache-hit twin: while a keyed writer is cached, the anchor and the
     /// chain-root sidecar both disappear, and the opener records no binding.
     /// The keyed writer's rows carry entry tags, which show the log was
@@ -11769,7 +12531,7 @@ mod tests {
 
     /// Regression guard: a log written only by unkeyed writers, with no
     /// recorded binding, no sidecar and no adoption row, is the quickstart
-    /// state, and the first keyed open adopts it.
+    /// state. The first keyed open records adoption and signs the active root.
     #[test]
     fn a_quickstart_log_adopts_on_its_first_key() {
         let dir = TempDir::new().unwrap();
@@ -11786,10 +12548,8 @@ mod tests {
             "a quickstart log carries no evidence of an earlier anchor"
         );
 
-        drop(
-            open_keyed_with_binding(&path, &store, BindingHistory::NotRecorded)
-                .expect("a quickstart log adopts on its first key"),
-        );
+        drop(open_keyed_with_binding(&path, &store, BindingHistory::NotRecorded).unwrap());
+        assert!(hmac_sidecar_path(&path).exists());
         assert_eq!(count_tip_anchored_rows(&path, "adopted"), 1);
         assert_eq!(stored_value(&store), tip_of(&path).to_keyring_value());
     }
@@ -11800,7 +12560,7 @@ mod tests {
         let path = dir.path().join("test.jsonl");
 
         // A log written entirely by unkeyed writers has no `.root_hmac`
-        // sidecar. Minting an audit key later must not be a one-way door.
+        // sidecar. Adoption anchors the file and signs that root.
         {
             let mut writer = open_no_key(path.clone());
             writer.write_entry(make_entry("")).unwrap();
@@ -11815,8 +12575,10 @@ mod tests {
             Arc::clone(&store) as Arc<dyn TipAnchorStore>,
             crate::audit_log::BindingHistory::NotRecorded,
         )
-        .expect("a sidecar-less log must still adopt");
+        .unwrap();
+        assert!(hmac_sidecar_path(&path).exists());
         drop(writer);
+        super::super::verify::verify_log(&path, Some(&[3u8; 32])).unwrap();
         assert_eq!(count_tip_anchored_rows(&path, "adopted"), 1);
     }
 
@@ -13815,13 +14577,49 @@ mod tests {
         drop(unanchored);
         let store = Arc::new(InMemoryTipAnchorStore::new());
         let mut repair = AuditWriter::open_for_reanchor(
-            path,
+            path.clone(),
             None,
             Arc::clone(&store) as Arc<dyn TipAnchorStore>,
         )
         .unwrap();
         assert!(matches!(
             repair.verified_tip_facts(),
+            Err(WriterError::TipAnchorUnavailable)
+        ));
+        drop(repair);
+        drop(open_keyed_anchored(&path, &store));
+
+        let mut rotation = AuditWriter::open_for_key_rotation(
+            path.clone(),
+            Some(Zeroizing::new(PRUNE_TEST_KEY)),
+            store.clone(),
+            BindingHistory::NotRecorded,
+        )
+        .unwrap();
+        assert!(matches!(
+            rotation.verified_tip_facts(),
+            Err(WriterError::TipAnchorUnavailable)
+        ));
+        drop(rotation);
+
+        let mut binding =
+            AuditWriter::open_for_carrier_binding(path.clone(), retained_history_access(&store))
+                .unwrap();
+        assert!(matches!(
+            binding.verified_tip_facts(),
+            Err(WriterError::TipAnchorUnavailable)
+        ));
+        drop(binding);
+
+        let mut acknowledgement = AuditWriter::open_for_outbox_acknowledgement(
+            path,
+            Some(Zeroizing::new(PRUNE_TEST_KEY)),
+            store,
+            BindingHistory::NotRecorded,
+        )
+        .unwrap();
+        assert!(matches!(
+            acknowledgement.verified_tip_facts(),
             Err(WriterError::TipAnchorUnavailable)
         ));
     }
@@ -14442,10 +15240,8 @@ mod tests {
         assert_eq!(fs::read(&path).unwrap(), bytes, "nothing was written");
     }
 
-    /// Rows tagged under key A, read with the store now holding key B, as a
-    /// key rotation that stopped between persisting B and its rekey row leaves
-    /// them: the next keyed open appends `open_repair`, and the log verifies
-    /// under B.
+    /// An anchored file holds entries and roots signed under key A.
+    /// An open under key B repairs entry tags and refuses until roots use B.
     #[test]
     fn an_interrupted_rotation_is_repaired_at_the_next_keyed_open() {
         let dir = TempDir::new().unwrap();
@@ -14456,6 +15252,13 @@ mod tests {
             writer.write_entry(make_entry("")).unwrap();
             writer.write_entry(make_entry("")).unwrap();
         }
+        assert!(matches!(
+            AuditWriter::open(path.clone(), Some(keyed_access(OTHER_TEST_KEY, &store))),
+            Err(WriterError::RetainedHistoryUnverified(
+                super::super::verify::VerifyError::HmacMismatch { .. }
+            ))
+        ));
+        crate::audit_log::resign_chain_root_sidecars(&path, &OTHER_TEST_KEY).unwrap();
         drop(AuditWriter::open(path.clone(), Some(keyed_access(OTHER_TEST_KEY, &store))).unwrap());
         let rows = hashed_rows(&path);
         let (rekey, hash) = rows.last().unwrap();
@@ -14473,7 +15276,6 @@ mod tests {
             ),
             EntryTagCheck::Valid
         );
-        crate::audit_log::resign_chain_root_sidecars(&path, &OTHER_TEST_KEY).unwrap();
         let ok = super::super::verify::verify_log(&path, Some(&OTHER_TEST_KEY)).unwrap();
         assert!(ok.entry_tags_verified);
         assert!(ok.warnings.contains(

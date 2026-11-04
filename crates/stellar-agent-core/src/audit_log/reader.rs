@@ -25,7 +25,9 @@
 //! `last_entry_hash`. Each archive's in-file chain must verify, and its last
 //! row must hash to the `previous_entry_hash` of the first row of the next
 //! newer file. A broken link is [`AuditLogIntegrityError::ChainBroken`] with
-//! reason `bridge_mismatch` or `tip_mismatch`. Rows that an
+//! reason `bridge_mismatch`, `tip_mismatch` or `oldest_root_mismatch`.
+//! The oldest retained file starts at the zero seed or a prune-marker seed;
+//! a keyed walk also authenticates that marker. Rows that an
 //! `audit_entries_quarantined` row covers are dropped. No key is read.
 //!
 //! A row appended to the file outside the writer therefore never reaches a
@@ -92,12 +94,15 @@ use std::{
 use sha2::{Digest as _, Sha256};
 
 use super::{
-    chain::{ZERO_BLOCK_HASH, compute_entry_hash},
+    chain::compute_entry_hash,
     entry::AuditEntry,
+    rotation::{oldest_retained_seed, read_prune_marker},
     schema::{EventKind, ExecutableRefPin, ExecutableRefPinFirst8, ValueLegRecord, WasmHashPin},
     signer_set::{ObservedSignerSet, SignerSetSnapshotV2, SignerSetView, SignerSetViewPayload},
     verify::VerifyError,
-    writer::{AuditWriter, is_rotated_sibling, wait_out_transient_rotation_window},
+    writer::{
+        AuditWriter, is_rotated_sibling, prune_marker_path, wait_out_transient_rotation_window,
+    },
 };
 
 /// The complete pin record of one rule: every pinned verifier and policy
@@ -1032,6 +1037,9 @@ const BRIDGE_MISMATCH_REASON: &str = "bridge_mismatch";
 /// last entry inside the bound is not the writer's tip.
 const TIP_MISMATCH_REASON: &str = "tip_mismatch";
 
+/// The oldest retained file must start at the zero seed or a prune boundary.
+const OLDEST_ROOT_MISMATCH_REASON: &str = "oldest_root_mismatch";
+
 /// One file of a reader walk, newest file first.
 struct BoundedFile {
     /// The file's basename.
@@ -1079,7 +1087,9 @@ struct BoundedFiles<'k> {
 /// [`AuditLogIntegrityError::ChainBroken`] with reason `bridge_mismatch` or
 /// `tip_mismatch`. Rows an `audit_entries_quarantined` row inside the bound
 /// covers are dropped. No key is read; `hmac_key` checks each file's
-/// chain-root sidecar when given.
+/// chain-root sidecar and prune marker when given. The oldest file must start
+/// at the zero seed or the marker's seed, or the walk refuses with
+/// `oldest_root_mismatch`.
 ///
 /// # Errors
 ///
@@ -1145,6 +1155,36 @@ impl Iterator for BoundedFiles<'_> {
 }
 
 impl BoundedFiles<'_> {
+    /// The last file visited starts at the authenticated retention boundary.
+    fn check_oldest_root(&self, name: &str, read: &FileRows) -> Result<(), AuditLogIntegrityError> {
+        if self.files.len() != 0 {
+            return Ok(());
+        }
+        let marker = read_prune_marker(&self.log_path)?;
+        if let (Some(marker), Some(key)) = (&marker, self.hmac_key)
+            && !marker.verify_tag(key)
+        {
+            return Err(AuditLogIntegrityError::HmacMismatch {
+                file: basename(&prune_marker_path(&self.log_path)),
+            });
+        }
+        let seed = oldest_retained_seed(marker.as_ref(), name)
+            .map_err(|_| chain_broken(name, 1, OLDEST_ROOT_MISMATCH_REASON))?;
+        if read
+            .first_prev
+            .as_deref()
+            .or_else(|| {
+                self.bound
+                    .as_ref()
+                    .map(|bound| bound.segment_start.as_str())
+            })
+            .is_some_and(|first| first != seed)
+        {
+            return Err(chain_broken(name, 1, OLDEST_ROOT_MISMATCH_REASON));
+        }
+        Ok(())
+    }
+
     /// Reads the active file, the first item of every walk.
     fn read_active(&mut self, path: &Path) -> Result<BoundedFile, AuditLogIntegrityError> {
         let name = basename(path);
@@ -1166,12 +1206,9 @@ impl BoundedFiles<'_> {
             });
         }
         let limit = self.bound.as_ref().map(|bound| bound.end_offset);
-        let first_prev = match &self.bound {
-            Some(bound) => Some(bound.segment_start.clone()),
-            None if !self.has_rotated => Some(ZERO_BLOCK_HASH.to_owned()),
-            None => None,
-        };
+        let first_prev = self.bound.as_ref().map(|bound| bound.segment_start.clone());
         let read = read_file_rows(path, limit, first_prev.as_deref(), self.hmac_key)?;
+        self.check_oldest_root(&name, &read)?;
         if let Some(bound) = &self.bound {
             let tip = read.last_hash.as_deref().unwrap_or(&bound.segment_start);
             if tip != bound.last_hash {
@@ -1197,6 +1234,7 @@ impl BoundedFiles<'_> {
             return Err(AuditLogIntegrityError::RotationGap { file: name });
         }
         let read = read_file_rows(path, None, None, self.hmac_key)?;
+        self.check_oldest_root(&name, &read)?;
         if let Some(expected) = &self.expected_tip
             && read.last_hash.as_deref() != Some(expected.as_str())
         {
@@ -1723,6 +1761,7 @@ mod tests {
         reason = "test-only"
     )]
     use super::*;
+    use crate::audit_log::chain::ZERO_BLOCK_HASH;
     use crate::audit_log::{
         entry::{AuditEntry, NewToolInvocation},
         schema::PolicyDecision,
@@ -5368,6 +5407,66 @@ mod tests {
             );
         };
         unchanged();
+    }
+
+    #[test]
+    fn a_not_found_lookup_refuses_history_missing_its_oldest_archive() {
+        let dir = TempDir::new().unwrap();
+        let path = tmp_log(&dir);
+        let store = Arc::new(crate::audit_log::tip_anchor::InMemoryTipAnchorStore::new());
+        let writer = Arc::new(Mutex::new(open_keyed_writer(&path, &store)));
+        {
+            let mut guard = writer.lock().unwrap();
+            write_event(
+                &mut guard,
+                context_rule_created_event(1, "account", vec![], vec![], false, false),
+            );
+            for _ in 0..3 {
+                guard.force_rotate_for_test().unwrap();
+                guard.write_entry(pending_row(SETTLE_ENVELOPE)).unwrap();
+            }
+        }
+        let archives = crate::audit_log::test_helpers::rotated_archives_newest_first(&path);
+        let oldest = archives.last().unwrap();
+        std::fs::remove_file(oldest).unwrap();
+        std::fs::remove_file(crate::audit_log::writer::hmac_sidecar_path(oldest)).unwrap();
+        for key in [None, Some(KEYED_READER_KEY)] {
+            let reader = AuditReader::new(Arc::clone(&writer), key);
+            assert!(matches!(reader.find_installed_context_rule_ids("account"),
+                Err(AuditLogIntegrityError::ChainBroken { line: 1, reason, .. })
+                    if reason == OLDEST_ROOT_MISMATCH_REASON));
+        }
+        assert!(
+            matches!(scan_all_context_rule_pin_records_unanchored(&path),
+            Err(AuditLogIntegrityError::ChainBroken { line: 1, reason, .. })
+                if reason == OLDEST_ROOT_MISMATCH_REASON)
+        );
+    }
+
+    #[test]
+    fn an_empty_active_file_refuses_a_bound_walk_after_all_archives_are_removed() {
+        let dir = TempDir::new().unwrap();
+        let path = tmp_log(&dir);
+        let store = Arc::new(crate::audit_log::tip_anchor::InMemoryTipAnchorStore::new());
+        let writer = Arc::new(Mutex::new(open_keyed_writer(&path, &store)));
+        {
+            let mut guard = writer.lock().unwrap();
+            for _ in 0..2 {
+                guard.write_entry(pending_row(SETTLE_ENVELOPE)).unwrap();
+                guard.force_rotate_for_test().unwrap();
+            }
+        }
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
+        for archive in crate::audit_log::test_helpers::rotated_archives_newest_first(&path) {
+            std::fs::remove_file(&archive).unwrap();
+            std::fs::remove_file(crate::audit_log::writer::hmac_sidecar_path(&archive)).unwrap();
+        }
+        for key in [None, Some(KEYED_READER_KEY)] {
+            let reader = AuditReader::new(Arc::clone(&writer), key);
+            assert!(matches!(reader.find_installed_context_rule_ids("account"),
+                Err(AuditLogIntegrityError::ChainBroken { line: 1, reason, .. })
+                    if reason == OLDEST_ROOT_MISMATCH_REASON));
+        }
     }
 
     /// An archive rewritten with a chain that verifies on its own does not
