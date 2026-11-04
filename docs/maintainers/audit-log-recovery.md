@@ -66,9 +66,10 @@ The MCP server acquires its audit writer when an operation needs it, such as a c
 
 The registry normally caches the writer and holds its lock until process exit. A replaced-file refusal during acquisition marks the cached writer for eviction. After callers release it, the next acquisition drops it and checks the file at the path against the anchor.
 
-A repair against a held writer refuses with `audit.writer_locked` in the
-envelope's error detail. Stop a server holding that profile's writer, repair,
-and start it again. The same applies to `profile rotate-audit-key`.
+Recovery takes all three audit carriers with immediate try-locks and refuses
+with `audit.carriers_busy` when any is held. Stop a server holding that
+profile's writer, repair, and start it again. `profile rotate-audit-key`
+refuses a held writer with `audit.writer_locked`.
 
 **Queued operator rows.** After its `audit_tip_anchored` rows, the acknowledging repair drains the audit outbox (section 8), so rows `stellar-agent approve`, `profile halt`, and `profile resume` queued while the log was refused follow the repair rows. If the drain refuses, the repair still stands: the verb exits 0, omits `outbox_drained`, and lists the refusal under `warnings` (`audit.outbox_unusable`, `audit.outbox_busy`, `audit.outbox_rows_missing`, or the condition an append refused on, such as `audit.io_error`). Every queued row stays queued for the next drain, which appends again any row the refused drain had appended. The reporting form leaves the log, the anchor, and the outbox unchanged.
 
@@ -217,7 +218,7 @@ An anchor agrees when `audit verify` would accept it; a file ahead of its anchor
 
 ## 5. Adoption
 
-A log with no anchor is adopted on first keyed use, with no operator action, when nothing shows an anchor was written: no recorded audit binding, no `.root_hmac` sidecar, and no `audit_tip_anchored` row in the file. A log written entirely by unkeyed writers is the ordinary zero-config state, and minting an audit key later must not be a one-way door. A log with any of the three is refused with `audit.tip_anchor_missing` (section 1.1).
+A log with no anchor is adopted on first keyed use, with no operator action, when nothing shows an anchor was written: no recorded audit binding, no `.root_hmac` sidecar, and no `audit_tip_anchored` row in the file. A log written entirely by unkeyed writers is the ordinary zero-config state, and minting an audit key later must not be a one-way door. A log with any of the three is refused with `audit.tip_anchor_missing` (section 1.1). A log with keyed history first needs `stellar-agent audit bind-carriers --profile <NAME>` with every wallet process stopped (section 8.5).
 
 Adoption replays the whole log first. A broken chain is refused rather than adopted.
 
@@ -270,7 +271,10 @@ Three more rows record the entry tags:
 | `<log>.outbox.lock` | Held by every append and every drain while it touches the outbox. Waited on for up to 2 s, then `audit.outbox_busy`. |
 | `<log>.drain.lock` | Held for its whole life by every writer that drains: the MCP server, `approve serve`, and every keyed CLI verb. `approve --id` reads it once to tell a draining holder from one that does not drain. |
 
-**Keyring commitment.** The audit key's service stores the queue's count and SHA-256 chain head at `<audit-account>-tip-<path-digest>-outbox`.
+**Keyring commitment.** The audit key's service stores the queue's count and SHA-256 chain head for each outbox generation. Below, `<tip-account>` stands for `<audit-account>-tip-<path-digest>`.
+The active commitment uses `<tip-account>-outbox-g<G>`, where G is `generation` in `<tip-account>-carriers`.
+Without a carrier record, generation 0 uses `<tip-account>-outbox`.
+The retired watch reads the account selected by `retired.generation` using the same rule (section 8.4).
 Every append checks the committed prefix, syncs its new line, then stores the updated commitment.
 A failed state write truncates the line back and refuses the append.
 
@@ -348,7 +352,7 @@ It appends `audit_outbox_loss_acknowledged`, appends the committed prefix when i
 The operator approves affected actions again, creating new consent rows.
 
 The result reports `profile`, `expected_rows`, `found_rows`, `drained`, `discarded`, `revoked_approvals`, and `revoked_grants`. `discarded` counts the complete lines the truncation dropped without appending them.
-A held writer refuses with `audit.writer_locked`.
+Recovery takes all three audit carriers with immediate try-locks and refuses with `audit.carriers_busy` when any is held.
 A log rolled back behind its tip anchor refuses with `audit.tip_anchor_mismatch`; follow section 1 first.
 No divergence refuses with `audit.outbox_loss_not_found` and writes no acknowledgement.
 An intact committed line that does not parse, or that is not an operator row, refuses with `audit.outbox_unusable` before anything is revoked or written.
@@ -356,6 +360,114 @@ Follow section 8.1 for that line, then rerun the acknowledgement.
 An append refusal after the acknowledgement row leaves the queue and commitment in place; a rerun records the loss again.
 A crash after revocation leaves the loss in place; rerunning revokes any remaining permissions.
 `audit verify` reports each acknowledgement as an `outbox_loss_acknowledged` warning without changing the chain verdict.
+
+**Retired-watch refusal.** A detail that names a retired audit outbox generation reports a change of the commitment of the generation the last carrier binding retired (section 8.4), not of the active queue.
+A holder of that generation wrote after it was retired, so its rows never reach the active queue.
+The active queue can be intact; `audit verify --profile` reports it as usual.
+Inspect the retired file that the binding's `audit_carriers_bound` row names in `retired_file`, then run the same acknowledgement.
+It reports `expected_rows` from the commitment recorded at retirement and `found_rows` from the commitment the keyring holds now.
+It revokes as above, appends the intact active queue, and resets the retired watch to the commitment it observed.
+When active and retired losses coexist, `expected_rows` and `found_rows` describe the active queue.
+The same acknowledgement also resets the retired watch to the observed commitment; it leaves no second acknowledgement pending.
+
+### 8.4 Carrier identities and generations
+
+The keyring entry `<tip-account>-carriers` records version 1, the generation,
+the writer, drain and outbox lock identities, and the retired watch. Unix
+identities contain the device and inode; Windows identities contain the volume
+serial and file index. Windows carrier handles share reads and writes but do
+not share deletion.
+
+An ordinary writer open, drain probe, or outbox append locks each lock file at
+its path, then compares the identity of the locked handle with this record and
+refuses a different file with `audit.carrier_replaced`. The recovery verbs take
+the carriers differently; see section 8.5. An outbox holder also confirms its
+generation after opening the data handle. A binding that starts a new
+generation before that open makes the holder refuse with
+`audit.carrier_replaced`, and a retry takes the new generation.
+
+A log without keyed evidence enrolls generation 1 at its first keyed open:
+it has no tip anchor, no generation-0 commitment, no outbox file, and no entry
+in the active file or in any rotated archive that carries an entry tag. That
+open takes all three carriers with one try-lock each, refusing with
+`audit.carriers_busy` when any is held, syncs the lock files and their
+directory, and then stores the record. Every other log without a record refuses
+keyed use with `audit.carriers_unbound` until `audit bind-carriers` runs.
+
+Restoring, moving or remounting the audit directory changes the recorded
+identities; run `audit bind-carriers` afterward.
+
+Generation 0 uses `<tip-account>-outbox`; generation G uses
+`<tip-account>-outbox-g<G>`. The retired watch records the generation the last
+binding retired, its commitment at retirement, and the name of the file its
+outbox was retired to. Every bound outbox acquisition compares the recorded
+commitment with the keyring. A changed retired commitment refuses with
+`audit.outbox_rows_missing` (section 8.3, "Retired-watch refusal"), so a holder
+of an earlier file cannot silently change the active generation.
+
+| Detail code | Meaning and action |
+| --- | --- |
+| `audit.carrier_replaced` | A held lock file is not the one the keyring records, or the outbox generation changed while a holder waited. Stop every wallet process and bind the carriers; a generation change needs only a retry. |
+| `audit.carriers_unbound` | A log with keyed history has no carrier record. Stop every wallet process and bind the carriers. |
+| `audit.carrier_identity_unavailable` | The platform cannot identify a held file. Use a supported filesystem and platform. |
+| `audit.carriers_busy` | A recovery verb or an enrollment cannot take all three carriers immediately. Stop every wallet process and retry. |
+| `audit.carrier_binding_incomplete` | A staged generation exists. Rerun carrier binding with every wallet process stopped. |
+
+The queue check in `audit verify --profile` can report `audit.carrier_replaced`, `audit.carriers_unbound`, or `audit.carrier_identity_unavailable` in the detail.
+A held outbox returns `audit.outbox_busy`; a changed retired commitment returns `audit.outbox_rows_missing`.
+
+### 8.5 Bind carriers
+
+Run `stellar-agent audit bind-carriers --profile <NAME>` with every wallet
+process stopped. A recovery open (binding, re-anchor, acknowledgement) takes all
+three carriers at their paths without the record, refusing a held one with
+`audit.carriers_busy`, so it can repair a replaced or unbound carrier; a fresh
+log's first keyed open does the same before it records them. The binding then
+enforces the tip anchor and defers draining. A log with no audit key can enroll
+before its first key rotation; evidence of a keyed log still requires that key.
+From the current generation G, which is 0 without a record, it:
+
+1. Verifies that generation G's outbox holds exactly its committed prefix.
+2. Copies the committed lines to `<log>.outbox.g<G+1>`, syncs the file and
+   directory, and stores generation G+1's commitment.
+3. Appends `audit_carriers_bound`, recording both generations, the row count,
+   and the retired file name.
+4. Stores the three held identities and generation G+1, with generation G's
+   commitment from the verified snapshot as the retired watch.
+5. Renames `<log>.outbox` to `<log>.outbox.retired-g<G>`, then moves the staged
+   file to `<log>.outbox` and syncs the directory. When an earlier binding
+   already retired generation G, as after a lost carrier record, the retired
+   file takes the first free name among at most 1000 candidates,
+   `<log>.outbox.retired-g<G>.<n>`, with an exhaustion error when every
+   candidate is taken, and the earlier file stays.
+
+The result contains `profile`, `generation`, `carried_rows` and `retired_file`.
+`retired_file` is the retired file's name, or `null` when the log had no outbox
+file to retire. When a retired file exists, keep it while investigating stale
+holders.
+
+An interruption leaves a staged file that refuses every other open with
+`audit.carrier_binding_incomplete`. Only names `<log>.outbox.g<N>` with a
+canonical number are stages; a file such as `<log>.outbox.gz` is never removed.
+Before the record names the staged generation, a rerun discards the stage and
+repeats the procedure, so an interruption there can leave an extra
+`audit_carriers_bound` row but cannot publish the new queue. After it, a rerun
+installs a stage that holds exactly the committed rows and finishes the
+renames. A stage that does not is rewritten in place from the rows of the
+retired generation, read from the retired file once the first rename completed
+and from `<log>.outbox` before that, and steps 2 to 5 repeat. Those rows are
+verified before anything changes, and the stage stays throughout, so the
+binding remains marked incomplete until the renames finish. That rerun leaves
+the retired watch to the next ordinary acquisition, which refuses while a
+changed retired commitment is not acknowledged.
+
+`audit reanchor` and `audit acknowledge-outbox-loss` always take all three
+carriers at their paths with try-locks. When the carriers are not the recorded
+ones, reanchor skips its drain and reports the carrier refusal in `warnings`.
+A changed retired commitment also skips the drain and reports
+`audit.outbox_rows_missing`. Acknowledgement also resets the retired watch to
+the value it acknowledges. Neither verb records carrier identities; run
+`audit bind-carriers` afterward.
 
 ## 9. Tip anchor unavailable
 
@@ -387,11 +499,15 @@ generation. Reopening still refuses while the keyring is unavailable. Use
 outage in section 2.5.
 
 **Unusable outbox commitment.** A detail that contains `outbox state is
-unusable` names a different cause: the keyring holds a value at the outbox
-commitment's account, `<audit-account>-tip-<path-digest>-outbox` in the audit
-key's service, that does not parse. The wallet never writes such a value, so
-it was changed outside the wallet. Restoring keyring access does not clear
-it. Every drain, every keyed acquisition, every queued operator row, and
+unusable` names a different cause: the keyring holds a value at an outbox
+commitment's account in the audit key's service that does not parse. The
+active commitment uses `<tip-account>-outbox-g<G>`, where G is `generation`
+in `<tip-account>-carriers`. Without a carrier record, generation 0 uses
+`<tip-account>-outbox`. The retired watch reads the account selected by
+`retired.generation` using the same rule. Identify the malformed generation
+before removing an entry. The wallet never writes such a value, so it was
+changed outside the wallet. Restoring keyring access does not clear it. Every
+drain, every keyed acquisition, every queued operator row, and
 `audit acknowledge-outbox-loss` refuse with this sub-code, and nothing is
 read as "nothing queued".
 
@@ -400,8 +516,12 @@ read as "nothing queued".
 2. Copy `<log>.outbox` out of the audit directory with the incident record.
    Its lines are the evidence of the queued operator rows; nothing appends
    them to the log from here on.
-3. Remove the keyring entry at that account with the platform keyring tool.
-   An absent commitment reads as zero.
+3. Back up and remove the malformed commitment at that generation's account
+   with the platform keyring tool. An absent commitment reads as zero. When
+   the malformed commitment is the retired generation's, the active queue is
+   unaffected: unless the watch recorded no commitment at retirement, the next
+   acquisition refuses as a retired-watch change, which section 8.3 describes;
+   acknowledge it there and skip the steps below.
 4. When the outbox holds complete lines, every one of them now lies past the
    commitment: keyed acquisitions and drains refuse with
    `audit.outbox_rows_missing`, and nothing is drained. Run

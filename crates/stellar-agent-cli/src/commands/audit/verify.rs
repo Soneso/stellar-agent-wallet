@@ -1349,6 +1349,14 @@ mod tests {
             .expect("seed audit key");
         let key = load_audit_hmac_key(&profile, name).expect("load audit key");
         make_writer_and_entries(profile.audit_log_path.clone(), entries, Some(&key));
+        stellar_agent_core::audit_log::test_helpers::enroll_carriers(
+            &profile.audit_log_path,
+            &stellar_agent_network::keyring::KeyringTipAnchorStore::new(
+                &profile.audit_log_hash_chain_key_id,
+                &profile.audit_log_path,
+            ),
+        )
+        .unwrap();
         profile
     }
 
@@ -1663,6 +1671,7 @@ mod tests {
         store: std::sync::Arc<stellar_agent_core::audit_log::tip_anchor::InMemoryTipAnchorStore>,
         request_id: &str,
     ) {
+        stellar_agent_core::audit_log::test_helpers::enroll_carriers(path, store.as_ref()).unwrap();
         stellar_agent_core::audit_log::AuditOutbox::for_log(path, store)
             .append(
                 &stellar_agent_core::audit_log::AuditEntry::new_approval_attested(
@@ -1861,13 +1870,8 @@ mod tests {
         let name = "verify-outbox-busy";
         let profile = keyed_unanchored_profile(name, dir.path(), 0);
         let lock_path = dir.path().join("audit.jsonl.outbox.lock");
-        let held = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(&lock_path)
-            .unwrap();
-        held.lock().unwrap();
+        let held =
+            stellar_agent_core::audit_log::test_helpers::hold_audit_lock(&lock_path).unwrap();
         let error = verify_profile_log(&profile, name).unwrap_err();
         drop(held);
         assert!(

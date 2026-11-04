@@ -3679,6 +3679,19 @@ pub enum EventKind {
         /// repair. `None` for adoption, which does not touch the counter.
         reanchor_count: Option<u64>,
     },
+    /// The operator records the carrier identities and starts a new outbox
+    /// generation with `audit bind-carriers`.
+    AuditCarriersBound {
+        /// The outbox generation the binding starts.
+        generation: u64,
+        /// The outbox generation the binding retires.
+        previous_generation: u64,
+        /// Committed operator rows carried into the new generation.
+        carried_rows: u64,
+        /// File name the previous outbox is retired to, `None` when the log
+        /// had no outbox file.
+        retired_file: Option<String>,
+    },
     /// The operator acknowledges lost queued operator rows and revokes
     /// permissions.
     AuditOutboxLossAcknowledged {

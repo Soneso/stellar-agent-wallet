@@ -643,7 +643,9 @@ appended entry carries a valid entry tag; otherwise the server refuses with
 `audit.tip_anchor_mismatch`, reason `unauthenticated_tail`, and a writer
 without the audit key refuses the log with `audit.chain_key_unavailable`. A log with no anchor at all is
 adopted on first use with no operator action when nothing shows it was anchored
-before, such as a log written only by unkeyed writers. A recorded audit
+before, such as a log written only by unkeyed writers. A log with keyed
+history first needs `stellar-agent audit bind-carriers --profile <NAME>` with
+every wallet process stopped. A recorded audit
 binding, a chain-root sidecar, or an `audit_tip_anchored` row in the file shows
 it was, and the server then refuses with `audit.tip_anchor_missing`. An
 adoption writes its `audit_tip_anchored` row only for a non-empty file.

@@ -403,8 +403,29 @@ fn effective_coordinates(
     entries
 }
 
+/// Whether two coordinates name one keyring entry.
+///
+/// Besides equality and the joined, case-folded alias of the two coordinates,
+/// a generation commitment `<outbox account>-g<G>` belongs to its outbox
+/// entry: a candidate whose joined alias starts with the outbox account and
+/// `-g` and ends with the outbox service is the same entry, in either
+/// argument order and however the candidate splits account and service.
 fn same_entry(a: &KeyringEntryRef, b: &KeyringEntryRef) -> bool {
-    a == b || keyring_entry_alias(a) == keyring_entry_alias(b)
+    let generation_alias = |base: &KeyringEntryRef, candidate: &KeyringEntryRef| {
+        let account = base.account.to_ascii_lowercase();
+        if !account.ends_with("-outbox") {
+            return false;
+        }
+        let prefix = format!("{account}-g");
+        let service_suffix = format!(".{}", base.service.to_ascii_lowercase());
+        keyring_entry_alias(candidate)
+            .strip_prefix(&prefix)
+            .is_some_and(|tail| tail.ends_with(&service_suffix))
+    };
+    a == b
+        || keyring_entry_alias(a) == keyring_entry_alias(b)
+        || generation_alias(a, b)
+        || generation_alias(b, a)
 }
 
 fn provider(label: &str) -> bool {
@@ -739,7 +760,8 @@ mod tests {
     )]
     use super::*;
     use crate::audit_log::tip_anchor::{
-        OUTBOX_STATE, REANCHOR_COUNTER, TIP_ANCHOR, reanchor_count_account, tip_anchor_account,
+        CARRIER_RECORD, OUTBOX_STATE, REANCHOR_COUNTER, TIP_ANCHOR, reanchor_count_account,
+        tip_anchor_account,
     };
     use crate::envelope::Envelope;
     use crate::error::WalletError;
@@ -915,6 +937,30 @@ mod tests {
     }
 
     #[test]
+    fn generation_commitments_share_the_outbox_scope() {
+        let base = KeyringEntryRef::new("my.scope", "key-tip-digest-outbox");
+        let aliases = [
+            KeyringEntryRef::new("my.scope", "key-tip-digest-outbox-g42"),
+            // The case-folded alias the keyring treats as the same entry.
+            KeyringEntryRef::new("MY.SCOPE", "KEY-TIP-DIGEST-OUTBOX-G1"),
+            // The same joined coordinate split at another dot.
+            KeyringEntryRef::new("scope", "key-tip-digest-outbox-g1.my"),
+        ];
+        for alias in &aliases {
+            assert!(same_entry(&base, alias), "{alias:?}");
+            assert!(same_entry(alias, &base), "{alias:?} reversed");
+        }
+        for other in [
+            KeyringEntryRef::new("other", "key-tip-digest-outbox-g42"),
+            KeyringEntryRef::new("my.scope", "key-tip-digest-outboxg1"),
+            KeyringEntryRef::new("my.scope", "key-tip-digest-inbox-g1"),
+        ] {
+            assert!(!same_entry(&base, &other), "{other:?}");
+            assert!(!same_entry(&other, &base), "{other:?} reversed");
+        }
+    }
+
+    #[test]
     #[serial_test::serial]
     fn self_collision_refuses() {
         let f = Fixture::new();
@@ -926,7 +972,7 @@ mod tests {
     }
 
     /// A profile document naming the toolset pin key as its audit key is a
-    /// finding for the field and the three entries derived beside it.
+    /// finding for the field and the four entries derived beside it.
     /// On mainnet it refuses, and a signer under that service refuses message
     /// signing on every chain.
     #[test]
@@ -954,6 +1000,7 @@ mod tests {
                 TIP_ANCHOR,
                 REANCHOR_COUNTER,
                 OUTBOX_STATE,
+                CARRIER_RECORD,
             ]
         );
         let err = enforce_key_scope(&a, "alice").unwrap_err();

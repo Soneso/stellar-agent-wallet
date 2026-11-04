@@ -1540,13 +1540,9 @@ fn attest_with_held_outbox(expire: bool, draining: bool) {
     )
     .unwrap();
     let outbox = AuditOutbox::for_log(&fixture.audit_path(), anchors);
-    let lock_file = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(outbox_lock_path(&fixture.audit_path()))
-        .unwrap();
-    let lock = crate::file_lock::HeldFileLock::try_lock(lock_file).unwrap();
+    let lock =
+        crate::audit_log::test_helpers::hold_audit_lock(&outbox_lock_path(&fixture.audit_path()))
+            .unwrap();
     let mut store = PendingApprovalStore::open(fixture.store_path()).unwrap();
     store.insert(entry.clone(), now_ms()).unwrap();
     let before = std::fs::read(fixture.store_path()).unwrap();

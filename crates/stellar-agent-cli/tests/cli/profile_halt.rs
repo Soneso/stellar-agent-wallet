@@ -1499,13 +1499,8 @@ fn while_the_resume_row_waits_on_the_outbox_lock_the_halt_holds() {
     let marker = std::fs::read(f.marker()).unwrap();
 
     // Another appender holds the outbox lock for the resume's whole wait.
-    let lock = std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(false)
-        .open(f.outbox_lock())
-        .unwrap();
-    lock.try_lock().unwrap();
+    let lock =
+        stellar_agent_core::audit_log::test_helpers::hold_audit_lock(&f.outbox_lock()).unwrap();
 
     let mut resume_command =
         command_in(f.home.path(), &["profile", "resume", "--profile", PROFILE]);
@@ -1546,7 +1541,6 @@ fn while_the_resume_row_waits_on_the_outbox_lock_the_halt_holds() {
     );
 
     let resume = resume.finish();
-    lock.unlock().unwrap();
     drop(lock);
     assert!(
         spawned.elapsed() >= HELD_LOCK_WAIT,

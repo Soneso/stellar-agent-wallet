@@ -309,6 +309,92 @@ impl TipAnchorStoreError {
     }
 }
 
+/// The carrier identities and the outbox generation of a log, kept in the
+/// protected audit state.
+///
+/// Ordinary keyed acquisitions compare the locked handle's identity with the
+/// record. Enrollment and binding store carrier identities while holding all
+/// three carriers. Acknowledgement holds all three while updating only the
+/// retired watch.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CarrierRecord {
+    /// Current outbox generation, at least 1.
+    pub generation: u64,
+    /// Identity of the writer sidecar `<log>.lock`.
+    pub writer: crate::file_lock::FileIdentity,
+    /// Identity of the drain lock `<log>.drain.lock`.
+    pub drain: crate::file_lock::FileIdentity,
+    /// Identity of the outbox lock `<log>.outbox.lock`.
+    pub outbox_lock: crate::file_lock::FileIdentity,
+    /// The generation the last binding retired, watched for writes from its
+    /// holders. `None` for a record from an initial enrollment.
+    pub retired: Option<RetiredOutbox>,
+}
+
+/// A retired generation, its commitment at retirement, and the file its outbox
+/// was retired to.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RetiredOutbox {
+    /// Retired outbox generation.
+    pub generation: u64,
+    /// Canonical keyring value, or the empty string for an absent entry.
+    pub state: String,
+    /// File name beside the log the retired outbox is renamed to, `None` when
+    /// the log had no outbox file. A plain file name, never a path.
+    pub file: Option<String>,
+}
+
+impl CarrierRecord {
+    /// Serializes the versioned protected record.
+    ///
+    /// # Errors
+    /// Returns an error if serialization fails.
+    pub fn to_keyring_value(&self) -> Result<String, TipAnchorStoreError> {
+        let mut value = serde_json::to_value(self)
+            .map_err(|_| TipAnchorStoreError::new("carrier record serialization failed"))?;
+        value["v"] = 1.into();
+        serde_json::to_string(&value)
+            .map_err(|_| TipAnchorStoreError::new("carrier record serialization failed"))
+    }
+
+    /// Parses the versioned record, refusing unknown fields.
+    ///
+    /// # Errors
+    /// Returns an error for invalid records or unsupported versions.
+    pub fn parse(raw: &str) -> Result<Self, TipAnchorStoreError> {
+        let invalid = || TipAnchorStoreError::new("invalid carrier record");
+        let mut value: serde_json::Value = serde_json::from_str(raw).map_err(|_| invalid())?;
+        let version = value.as_object_mut().ok_or_else(invalid)?.remove("v");
+        if version != Some(serde_json::Value::from(1)) {
+            return Err(invalid());
+        }
+        let record: Self = serde_json::from_value(value).map_err(|_| invalid())?;
+        if record.generation == 0
+            || record.retired.as_ref().is_some_and(|r| {
+                r.generation >= record.generation
+                    || r.file
+                        .as_deref()
+                        .is_some_and(|name| !is_plain_file_name(name))
+            })
+        {
+            return Err(invalid());
+        }
+        Ok(record)
+    }
+}
+
+/// Whether `name` names a file in the directory it is joined to: one normal
+/// path component, no separator, no `.` or `..`.
+fn is_plain_file_name(name: &str) -> bool {
+    let mut components = Path::new(name).components();
+    matches!(
+        (components.next(), components.next()),
+        (Some(Component::Normal(component)), None) if component == name
+    )
+}
+
 /// Read/write access to a log's anchor, re-anchor counter, and outbox commitment.
 ///
 /// Implemented over the platform keyring in `stellar-agent-network`; this crate
@@ -321,19 +407,43 @@ impl TipAnchorStoreError {
 /// keyring-backed store at the profile's own coordinate, and an injected store
 /// of any other type never passes that check.
 pub trait TipAnchorStore: std::any::Any + std::fmt::Debug + Send + Sync {
-    /// Reads the outbox commitment under the outbox lock from any process.
-    /// An absent value means zero queued rows.
+    /// Loads the carrier record. `Ok(None)` means the log has no carriers
+    /// recorded.
+    ///
+    /// # Errors
+    /// Returns an error for an unavailable backend or invalid record.
+    fn load_carrier_record(&self) -> Result<Option<CarrierRecord>, TipAnchorStoreError>;
+
+    /// Stores the carrier record. The caller holds all three carriers.
+    ///
+    /// # Errors
+    /// Returns an error when the backend rejects the record.
+    fn store_carrier_record(&self, record: &CarrierRecord) -> Result<(), TipAnchorStoreError>;
+
+    /// Reads the outbox commitment of `generation` under the outbox lock from
+    /// any process. An absent value means zero queued rows.
+    ///
+    /// Each generation's commitment is a separate entry: generation 0 is the
+    /// outbox state account itself, and generation G is that account with
+    /// `-g<G>` appended.
     ///
     /// # Errors
     /// Returns an error for an unavailable backend or an unparseable value.
-    fn load_outbox_state(&self) -> Result<Option<OutboxState>, TipAnchorStoreError>;
+    fn load_outbox_state(
+        &self,
+        generation: u64,
+    ) -> Result<Option<OutboxState>, TipAnchorStoreError>;
 
-    /// Stores the outbox commitment under the outbox lock from any process.
-    /// The writer's sidecar lock need not be held.
+    /// Stores the outbox commitment of `generation` under the outbox lock from
+    /// any process. The writer's sidecar lock need not be held.
     ///
     /// # Errors
     /// Returns an error when the backend rejects the write.
-    fn store_outbox_state(&self, state: &OutboxState) -> Result<(), TipAnchorStoreError>;
+    fn store_outbox_state(
+        &self,
+        generation: u64,
+        state: &OutboxState,
+    ) -> Result<(), TipAnchorStoreError>;
 
     /// Reads the anchor. `Ok(None)` means no anchor has ever been written for
     /// this path — the adoption path.
@@ -677,6 +787,7 @@ pub fn outbox_state_account_for_digest(base_account: &str, path_sha256: &[u8; 32
 pub(crate) const TIP_ANCHOR: &str = "audit_log_hash_chain_key_id (tip anchor)";
 pub(crate) const REANCHOR_COUNTER: &str = "audit_log_hash_chain_key_id (reanchor counter)";
 pub(crate) const OUTBOX_STATE: &str = "audit_log_hash_chain_key_id (outbox state)";
+pub(crate) const CARRIER_RECORD: &str = "audit_log_hash_chain_key_id (carrier record)";
 
 /// The path-scoped keyring entries derived beside an audit chain key.
 ///
@@ -688,6 +799,8 @@ pub struct AuditKeyringEntries {
     pub reanchor_counter: KeyringEntryRef,
     /// The pending outbox commitment.
     pub outbox_state: KeyringEntryRef,
+    /// The protected carrier identities.
+    pub carrier_record: KeyringEntryRef,
 }
 
 impl AuditKeyringEntries {
@@ -695,6 +808,13 @@ impl AuditKeyringEntries {
     #[must_use]
     pub fn for_path_digest(audit_key: &KeyringEntryRef, path_sha256: &[u8; 32]) -> Self {
         Self {
+            carrier_record: KeyringEntryRef::new(
+                &audit_key.service,
+                format!(
+                    "{}-carriers",
+                    tip_anchor_account_for_digest(&audit_key.account, path_sha256)
+                ),
+            ),
             tip_anchor: KeyringEntryRef::new(
                 &audit_key.service,
                 tip_anchor_account_for_digest(&audit_key.account, path_sha256),
@@ -711,17 +831,19 @@ impl AuditKeyringEntries {
     }
 
     /// Enumerates every companion entry in profile scope order.
-    pub(crate) fn into_scope_entries(self) -> [(&'static str, KeyringEntryRef); 3] {
+    pub(crate) fn into_scope_entries(self) -> [(&'static str, KeyringEntryRef); 4] {
         // Exhaustive destructuring requires each added coordinate to enter scope checks.
         let Self {
             tip_anchor,
             reanchor_counter,
             outbox_state,
+            carrier_record,
         } = self;
         [
             (TIP_ANCHOR, tip_anchor),
             (REANCHOR_COUNTER, reanchor_counter),
             (OUTBOX_STATE, outbox_state),
+            (CARRIER_RECORD, carrier_record),
         ]
     }
 }
@@ -742,7 +864,8 @@ pub struct InMemoryTipAnchorStore {
 #[cfg(any(test, feature = "test-helpers"))]
 #[derive(Debug, Default)]
 struct InMemoryAnchorState {
-    outbox: Option<OutboxState>,
+    outbox: std::collections::BTreeMap<u64, OutboxState>,
+    carriers: Option<CarrierRecord>,
     outbox_fail_reads: bool,
     outbox_fail_writes: bool,
     anchor: Option<TipAnchor>,
@@ -860,22 +983,45 @@ impl InMemoryTipAnchorStore {
 
 #[cfg(any(test, feature = "test-helpers"))]
 impl TipAnchorStore for InMemoryTipAnchorStore {
-    fn load_outbox_state(&self) -> Result<Option<OutboxState>, TipAnchorStoreError> {
+    fn load_carrier_record(&self) -> Result<Option<CarrierRecord>, TipAnchorStoreError> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| TipAnchorStoreError::new("store mutex"))?;
+        Ok(state.carriers.clone())
+    }
+    fn store_carrier_record(&self, record: &CarrierRecord) -> Result<(), TipAnchorStoreError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| TipAnchorStoreError::new("store mutex"))?;
+        state.carriers = Some(record.clone());
+        Ok(())
+    }
+
+    fn load_outbox_state(
+        &self,
+        generation: u64,
+    ) -> Result<Option<OutboxState>, TipAnchorStoreError> {
         #[allow(clippy::expect_used, reason = "test seam; poison means a failed test")]
         let state = self.state.lock().expect("in-memory anchor store mutex");
         if state.outbox_fail_reads {
             return Err(TipAnchorStoreError::new("outbox read fault"));
         }
-        Ok(state.outbox.clone())
+        Ok(state.outbox.get(&generation).cloned())
     }
 
-    fn store_outbox_state(&self, outbox: &OutboxState) -> Result<(), TipAnchorStoreError> {
+    fn store_outbox_state(
+        &self,
+        generation: u64,
+        outbox: &OutboxState,
+    ) -> Result<(), TipAnchorStoreError> {
         #[allow(clippy::expect_used, reason = "test seam; poison means a failed test")]
         let mut state = self.state.lock().expect("in-memory anchor store mutex");
         if state.outbox_fail_writes {
             return Err(TipAnchorStoreError::new("outbox write fault"));
         }
-        state.outbox = Some(outbox.clone());
+        state.outbox.insert(generation, outbox.clone());
         Ok(())
     }
 

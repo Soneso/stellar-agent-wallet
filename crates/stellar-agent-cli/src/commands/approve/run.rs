@@ -2515,7 +2515,16 @@ mod tests {
             .unwrap()
         };
         let _server = holder();
-        assert!(drain_lock_is_held(&profile.audit_log_path).unwrap());
+        assert!(
+            drain_lock_is_held(
+                &profile.audit_log_path,
+                &stellar_agent_network::keyring::KeyringTipAnchorStore::new(
+                    &profile.audit_log_hash_chain_key_id,
+                    &profile.audit_log_path
+                )
+            )
+            .unwrap()
+        );
 
         let (mut store, entry) = pending_store(&dir);
         let (attestation, audit) =
@@ -2525,7 +2534,14 @@ mod tests {
         assert_eq!(inspect_outbox(&profile.audit_log_path).unwrap().pending, 1);
         assert!(consent_rows(&profile).is_empty(), "queued, not yet logged");
         assert!(
-            drain_lock_is_held(&profile.audit_log_path).unwrap(),
+            drain_lock_is_held(
+                &profile.audit_log_path,
+                &stellar_agent_network::keyring::KeyringTipAnchorStore::new(
+                    &profile.audit_log_hash_chain_key_id,
+                    &profile.audit_log_path
+                )
+            )
+            .unwrap(),
             "the draining writer still holds the drain lock"
         );
 
@@ -2545,6 +2561,14 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let profile = consent_profile("approve-locked", &dir, true);
         std::fs::create_dir_all(profile.audit_log_path.parent().unwrap()).unwrap();
+        stellar_agent_core::audit_log::test_helpers::enroll_carriers(
+            &profile.audit_log_path,
+            &stellar_agent_network::keyring::KeyringTipAnchorStore::new(
+                &profile.audit_log_hash_chain_key_id,
+                &profile.audit_log_path,
+            ),
+        )
+        .unwrap();
         let _older = AuditWriter::open(profile.audit_log_path.clone(), None).unwrap();
 
         let (mut store, entry) = pending_store(&dir);
@@ -2554,7 +2578,14 @@ mod tests {
         assert_nothing_persisted(&store, &entry.approval_nonce);
         assert_eq!(inspect_outbox(&profile.audit_log_path).unwrap().pending, 0);
         assert!(
-            !drain_lock_is_held(&profile.audit_log_path).unwrap(),
+            !drain_lock_is_held(
+                &profile.audit_log_path,
+                &stellar_agent_network::keyring::KeyringTipAnchorStore::new(
+                    &profile.audit_log_hash_chain_key_id,
+                    &profile.audit_log_path
+                )
+            )
+            .unwrap(),
             "the drain lock is left free: a try_lock on it succeeds"
         );
     }

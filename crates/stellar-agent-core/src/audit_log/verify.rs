@@ -1257,6 +1257,7 @@ fn verify_single_file(
             | EventKind::PolicyWindowStateReset { .. }
             | EventKind::ProfileHalted { .. }
             | EventKind::ProfileResumed { .. }
+            | EventKind::AuditCarriersBound { .. }
             | EventKind::AuditTipAnchored { .. } => {
                 // Value-action, key-write, window-state-reset, halt, and
                 // tip-anchor forensic rows. No rotation-handoff tracking needed; the
@@ -2444,6 +2445,7 @@ mod tests {
             EventKind::ProfileResumed { .. } => "profile_resumed",
             EventKind::AuditTipAnchored { .. } => "audit_tip_anchored",
             EventKind::AuditOutboxLossAcknowledged { .. } => "audit_outbox_loss_acknowledged",
+            EventKind::AuditCarriersBound { .. } => "audit_carriers_bound",
             EventKind::AuditEntryTagsStarted { .. } => "audit_entry_tags_started",
             EventKind::AuditEntryTagsRekeyed { .. } => "audit_entry_tags_rekeyed",
             EventKind::AuditEntriesQuarantined { .. } => "audit_entries_quarantined",
@@ -3688,6 +3690,7 @@ mod tests {
         write_entries(&path, 1);
         let store =
             std::sync::Arc::new(crate::audit_log::tip_anchor::InMemoryTipAnchorStore::new());
+        crate::audit_log::test_helpers::enroll_carriers(&path, store.as_ref()).unwrap();
         {
             let mut writer = AuditWriter::open_with_tip_anchor(
                 path.clone(),

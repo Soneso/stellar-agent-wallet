@@ -87,7 +87,7 @@
 //! # Concurrency
 //!
 //! Repair takes the audit writer's exclusive sidecar lock. While an MCP server
-//! holds that profile's writer, this verb refuses with `audit.writer_locked`.
+//! holds any audit carrier, this verb refuses with `audit.carriers_busy`.
 //! Stop that server, repair, and start it again. The server acquires its writer
 //! when needed, including for V1 reservation reconciliation during simulation.
 //! The registry normally retains it until exit. A replaced-file refusal during acquisition marks
@@ -780,6 +780,19 @@ mod tests {
         profile
     }
 
+    /// Records the current carriers of `profile`'s log in its keyring audit
+    /// state, for a fixture whose subject is not the enrollment.
+    fn enroll(profile: &Profile) {
+        stellar_agent_core::audit_log::test_helpers::enroll_carriers(
+            &profile.audit_log_path,
+            &TestAnchorStore::new(
+                &profile.audit_log_hash_chain_key_id,
+                &profile.audit_log_path,
+            ),
+        )
+        .unwrap();
+    }
+
     fn write_anchored(profile: &Profile, entries: usize) {
         let key = load_audit_hmac_key(profile, "test-profile").expect("load key");
         let store = TestAnchorStore::shared(
@@ -955,6 +968,7 @@ mod tests {
         record_binding("bind-refuse", &old);
         let mut new = old.clone();
         new.audit_log_path = dir.path().join("new.jsonl");
+        enroll(&new);
         AuditOutbox::for_log(
             &new.audit_log_path,
             stellar_agent_network::keyring::KeyringTipAnchorStore::shared(
@@ -964,6 +978,7 @@ mod tests {
         )
         .append(&queued_consent("queued-refused"))
         .expect("queue");
+        std::fs::remove_file(dir.path().join("new.jsonl.lock")).unwrap();
         let before = snapshot("bind-refuse", &old, &new);
 
         let err = run_reanchor(&args_with("bind-refuse", true, false), &new)
@@ -1292,6 +1307,7 @@ mod tests {
         let old_anchor = anchor_coordinates(&old);
         let mut new = old.clone();
         new.audit_log_path = dir.path().join("new.jsonl");
+        enroll(&new);
 
         for id in ["queued-1", "queued-2"] {
             AuditOutbox::for_log(
@@ -1361,6 +1377,7 @@ mod tests {
         record_binding("bind-ignore-rollback", &old);
         let mut new = old.clone();
         new.audit_log_path = dir.path().join("new.jsonl");
+        enroll(&new);
 
         let data = run_reanchor(&args_with("bind-ignore-rollback", true, true), &new)
             .expect("both flags accept the change");
@@ -1389,6 +1406,7 @@ mod tests {
         let old_anchor = anchor_coordinates(&old);
         let mut new = old.clone();
         new.audit_log_path = dir.path().join("new.jsonl");
+        enroll(&new);
         write_anchored(&new, 2);
         roll_back(&new);
         let superseded = anchor_coordinates(&new);
@@ -1446,6 +1464,7 @@ mod tests {
         let old_anchor = anchor_coordinates(&old);
         let mut new = old.clone();
         new.audit_log_path = dir.path().join("new.jsonl");
+        enroll(&new);
         write_anchored(&new, 2);
         roll_back(&new);
         let superseded = anchor_coordinates(&new);
@@ -1511,6 +1530,7 @@ mod tests {
             let old_anchor = anchor_coordinates(&old);
             let mut new = old.clone();
             new.audit_log_path = dir.path().join("new.jsonl");
+            enroll(&new);
             if rollback {
                 write_anchored(&new, 2);
                 roll_back(&new);
@@ -1579,6 +1599,7 @@ mod tests {
         record_binding("bind-unusable", &old);
         let mut new = old.clone();
         new.audit_log_path = dir.path().join("new.jsonl");
+        enroll(&new);
         stellar_agent_network::keyring::write_keyring_string(
             TestAnchorStore::new(&new.audit_log_hash_chain_key_id, &new.audit_log_path)
                 .anchor_entry_ref(),
@@ -1657,6 +1678,7 @@ mod tests {
         write_anchored(&old, 2);
         let mut new = old.clone();
         new.audit_log_path = dir.path().join("new.jsonl");
+        enroll(&new);
 
         AuditOutbox::for_log(
             &new.audit_log_path,

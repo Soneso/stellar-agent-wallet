@@ -118,8 +118,11 @@ fn acknowledge(
             detail: e.to_string(),
         })
     })?;
-    // The approval lock precedes the outbox lock and stays held through
-    // acknowledgement, so concurrent approval persistence cannot escape revocation.
+    // Normal operator-row appends acquire the approval-store lock before the
+    // outbox lock. Recovery holds all three audit carriers and uses nonblocking
+    // acquisition of the permission stores. The approval lock stays held
+    // through the acknowledgement, so concurrent approval persistence cannot
+    // escape revocation.
     let mut approvals = PendingApprovalStore::open(approvals_path.to_path_buf())
         .map_err(|e| approval_store_open_error(&e))?;
     // Load without expiry pruning so every recorded grant is removed.
@@ -190,6 +193,14 @@ mod tests {
         let key = &profile.audit_log_hash_chain_key_id;
         stellar_agent_network::keyring::rotate_keyring_secret_32(&key.service, &key.account)
             .unwrap();
+        stellar_agent_core::audit_log::test_helpers::enroll_carriers(
+            &profile.audit_log_path,
+            &stellar_agent_network::keyring::KeyringTipAnchorStore::new(
+                &profile.audit_log_hash_chain_key_id,
+                &profile.audit_log_path,
+            ),
+        )
+        .unwrap();
         (args, profile)
     }
 
@@ -342,7 +353,7 @@ mod tests {
         assert_eq!(row["revoked_grants"], 1);
         assert_eq!(
             commitment_store(&profile)
-                .load_outbox_state()
+                .load_outbox_state(1)
                 .unwrap()
                 .unwrap()
                 .pending,
@@ -361,7 +372,7 @@ mod tests {
         let permissions = Permissions::seed(dir.path());
         queue(&profile);
         let outbox = std::fs::read(outbox_path(&profile.audit_log_path)).unwrap();
-        let state = commitment_store(&profile).load_outbox_state().unwrap();
+        let state = commitment_store(&profile).load_outbox_state(1).unwrap();
 
         let error = permissions.acknowledge(&args, &profile).unwrap_err();
         assert_eq!(error.code(), "audit.outbox_loss_not_found", "{error}");
@@ -371,7 +382,7 @@ mod tests {
             outbox
         );
         assert_eq!(
-            commitment_store(&profile).load_outbox_state().unwrap(),
+            commitment_store(&profile).load_outbox_state(1).unwrap(),
             state
         );
         assert_eq!(
@@ -398,11 +409,12 @@ mod tests {
         let (args, profile) = fixture(dir.path());
         let permissions = Permissions::seed(dir.path());
         queue(&profile);
-        let commitment = AuditKeyringEntries::for_path_digest(
+        let mut commitment = AuditKeyringEntries::for_path_digest(
             &profile.audit_log_hash_chain_key_id,
             &log_path_sha256(&profile.audit_log_path),
         )
         .outbox_state;
+        commitment.account.push_str("-g1");
         let entry = keyring_core::Entry::new(&commitment.service, &commitment.account).unwrap();
         entry.set_password("not a commitment").unwrap();
 
@@ -477,11 +489,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (args, profile) = fixture(dir.path());
         let permissions = Permissions::seed(dir.path());
-        let commitment = AuditKeyringEntries::for_path_digest(
+        let mut commitment = AuditKeyringEntries::for_path_digest(
             &profile.audit_log_hash_chain_key_id,
             &log_path_sha256(&profile.audit_log_path),
         )
         .outbox_state;
+        commitment.account.push_str("-g1");
         let entry = keyring_core::Entry::new(&commitment.service, &commitment.account).unwrap();
         entry.set_password("not a commitment").unwrap();
         let error = permissions.acknowledge(&args, &profile).unwrap_err();
@@ -571,7 +584,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             commitment_store(&profile)
-                .load_outbox_state()
+                .load_outbox_state(1)
                 .unwrap()
                 .map(|state| state.pending),
             Some(1),
@@ -661,14 +674,14 @@ mod tests {
         std::fs::write(&profile.audit_log_path, &snapshot).unwrap();
         let permissions = Permissions::seed(dir.path());
         queue_and_lose(&profile);
-        let state = commitment_store(&profile).load_outbox_state().unwrap();
+        let state = commitment_store(&profile).load_outbox_state(1).unwrap();
 
         let error = permissions.acknowledge(&args, &profile).unwrap_err();
         assert_eq!(error.code(), "audit.tip_anchor_mismatch", "{error}");
         permissions.assert_untouched();
         assert_eq!(std::fs::read(&profile.audit_log_path).unwrap(), snapshot);
         assert_eq!(
-            commitment_store(&profile).load_outbox_state().unwrap(),
+            commitment_store(&profile).load_outbox_state(1).unwrap(),
             state
         );
     }
@@ -721,7 +734,7 @@ mod tests {
         );
         assert_eq!(
             commitment_store(&profile)
-                .load_outbox_state()
+                .load_outbox_state(1)
                 .unwrap()
                 .map(|state| state.pending),
             Some(1)
@@ -867,7 +880,7 @@ mod tests {
         .unwrap_err();
         assert!(
             matches!(error, WalletError::Internal(InternalError::UnexpectedState { ref detail })
-            if detail.starts_with("audit.writer_locked")),
+            if detail.starts_with("audit.carriers_busy")),
             "{error}"
         );
         assert!(!dir.path().join("approvals.toml").exists());

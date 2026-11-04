@@ -218,6 +218,12 @@ properties:
   another kind refuses keyed acquisition until `audit acknowledge-outbox-loss`
   records the loss and revokes decided approvals and toolset grants. An absent outbox state reads as zero;
   raw deletion or restore of that keyring entry shares the boundary below.
+  Every append, drain and keyed writer locks the lock files whose identities the
+  keyring records for the log, and refuses a lock file that is not the recorded
+  one, so a renamed or replaced lock file cannot admit a second holder.
+  `audit bind-carriers` records them and starts a new outbox generation; a holder
+  of an earlier generation cannot change the new generation's queue without the
+  change refusing keyed acquisition.
   The queue commitment does not authenticate who appended a row.
 - Code running as the same OS user. Such code can write the audit log and the wallet's
   files. The wallet detects an edited or removed entry inside the log, a log rolled back

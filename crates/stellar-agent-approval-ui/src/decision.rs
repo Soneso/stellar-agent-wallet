@@ -1662,27 +1662,46 @@ mod tests {
 
     /// An in-process anchor store, so a test writer refuses an append on a log
     /// rolled back underneath it.
-    #[derive(Debug, Default)]
-    struct MemAnchor(
-        Mutex<(
-            Option<TipAnchor>,
-            u64,
-            Option<stellar_agent_core::audit_log::OutboxState>,
-        )>,
+    type MemAnchorState = (
+        Option<TipAnchor>,
+        u64,
+        std::collections::BTreeMap<u64, stellar_agent_core::audit_log::OutboxState>,
+        Option<stellar_agent_core::audit_log::tip_anchor::CarrierRecord>,
     );
 
+    #[derive(Debug, Default)]
+    struct MemAnchor(Mutex<MemAnchorState>);
+
     impl TipAnchorStore for MemAnchor {
+        fn load_carrier_record(
+            &self,
+        ) -> Result<
+            Option<stellar_agent_core::audit_log::tip_anchor::CarrierRecord>,
+            TipAnchorStoreError,
+        > {
+            Ok(self.0.lock().unwrap().3.clone())
+        }
+        fn store_carrier_record(
+            &self,
+            record: &stellar_agent_core::audit_log::tip_anchor::CarrierRecord,
+        ) -> Result<(), TipAnchorStoreError> {
+            self.0.lock().unwrap().3 = Some(record.clone());
+            Ok(())
+        }
+
         fn load_outbox_state(
             &self,
+            generation: u64,
         ) -> Result<Option<stellar_agent_core::audit_log::OutboxState>, TipAnchorStoreError>
         {
-            Ok(self.0.lock().unwrap().2.clone())
+            Ok(self.0.lock().unwrap().2.get(&generation).cloned())
         }
         fn store_outbox_state(
             &self,
+            generation: u64,
             state: &stellar_agent_core::audit_log::OutboxState,
         ) -> Result<(), TipAnchorStoreError> {
-            self.0.lock().unwrap().2 = Some(state.clone());
+            self.0.lock().unwrap().2.insert(generation, state.clone());
             Ok(())
         }
 

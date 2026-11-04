@@ -3080,6 +3080,41 @@ impl AuditEntry {
         }
     }
 
+    /// Constructs the record of a carrier binding.
+    ///
+    /// Written by `audit bind-carriers` before it records the carriers:
+    /// `carried_rows` committed operator rows move from `previous_generation`
+    /// to `generation`, and the previous outbox is retired to `retired_file`.
+    #[must_use]
+    pub fn new_audit_carriers_bound(
+        generation: u64,
+        previous_generation: u64,
+        carried_rows: u64,
+        retired_file: Option<String>,
+    ) -> Self {
+        Self {
+            ts: current_iso8601_utc(),
+            tool: "audit.bind_carriers".to_owned(),
+            chain_id: None,
+            arg_keys: vec![],
+            arg_keys_truncated: None,
+            truncated: false,
+            envelope_hash: None,
+            nonce_id: None,
+            policy_decision: PolicyDecision::Allow,
+            decision_reason: None,
+            request_id: uuid::Uuid::new_v4().to_string(),
+            event_kind: EventKind::AuditCarriersBound {
+                generation,
+                previous_generation,
+                carried_rows,
+                retired_file,
+            },
+            previous_entry_hash: String::new(),
+            entry_tag: None,
+        }
+    }
+
     /// Constructs the forensic record of an acknowledged outbox loss.
     #[must_use]
     pub fn new_audit_outbox_loss_acknowledged(
