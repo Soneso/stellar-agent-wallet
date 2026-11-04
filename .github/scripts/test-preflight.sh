@@ -121,6 +121,7 @@ feature-on:test	cargo test --workspace --features mainnet-write,test-helpers,tes
 feature-on:network	cargo check -p stellar-agent-network --features mainnet-write
 release-shape	bash .github/scripts/release/check-host.sh
 test-vendored-release-cfg	cargo test -p stellar-agent-smart-account --test vendored_wasm_release_cfg
+test-policy-pin-release-cfg	cargo test -p stellar-agent-core --doc policy::pin
 machete	cargo machete
 deny	cargo deny check
 coverage	cargo llvm-cov --workspace --no-default-features --features test-helpers,test-hooks,test-loopback,verifier-registry --json --output-path cov-feature-off.json
@@ -1158,7 +1159,7 @@ case_target_specific_edge() {
   edit crates/stellar-agent-windows-identity/src/lib.rs
   pin_packages "stellar-agent-windows-identity stellar-agent-cli stellar-agent-core stellar-agent-headless-keyring" test-helpers \
     crates/stellar-agent-windows-identity/src/lib.rs
-  expect_list "${ALWAYS[@]}" "${PACKAGE_GATES[@]}"
+  expect_list "${ALWAYS[@]}" "${PACKAGE_GATES[@]}" test-policy-pin-release-cfg
 }
 
 # Most members reach test-support through a dev-dependency path; the
@@ -1173,7 +1174,7 @@ stellar-agent-network stellar-agent-nonce stellar-agent-pool stellar-agent-sep43
 stellar-agent-sep53 stellar-agent-sep7 stellar-agent-smart-account stellar-agent-smart-account-acceptance \
 stellar-agent-stablecoin stellar-agent-toolsets-install stellar-agent-toolsets-runtime stellar-agent-x402" \
     test-helpers,test-hooks,test-loopback,verifier-registry crates/stellar-agent-test-support/src/lib.rs
-  expect_list "${ALWAYS[@]}" "${PACKAGE_GATES[@]}" test-vendored-release-cfg
+  expect_list "${ALWAYS[@]}" "${PACKAGE_GATES[@]}" test-vendored-release-cfg test-policy-pin-release-cfg
 }
 
 # The acceptance member reaches sep48 only through an optional dependency,
@@ -1191,26 +1192,26 @@ case_root_manifest() {
   start_case
   edit Cargo.toml
   expect_list "${ALWAYS[@]}" self-test:test-check-install-surface.py "${RUST[@]}" test \
-    test-vendored-release-cfg
+    test-vendored-release-cfg test-policy-pin-release-cfg
 }
 
 case_lockfile() {
   start_case
   edit Cargo.lock
-  expect_list "${ALWAYS[@]}" "${RUST[@]}" test test-vendored-release-cfg
+  expect_list "${ALWAYS[@]}" "${RUST[@]}" test test-vendored-release-cfg test-policy-pin-release-cfg
 }
 
 case_toolchain() {
   start_case
   edit rust-toolchain.toml
-  expect_list "${ALWAYS[@]}" "${RUST[@]}" test test-vendored-release-cfg
+  expect_list "${ALWAYS[@]}" "${RUST[@]}" test test-vendored-release-cfg test-policy-pin-release-cfg
 }
 
 case_unowned_rust_path() {
   start_case
   mkdir -p tests
   edit tests/unowned.rs
-  expect_list "${ALWAYS[@]}" "${RUST[@]}" test test-vendored-release-cfg
+  expect_list "${ALWAYS[@]}" "${RUST[@]}" test test-vendored-release-cfg test-policy-pin-release-cfg
 }
 
 # The install-surface check reads the binstall metadata of the wallet crate
@@ -1227,7 +1228,7 @@ case_removed_member() {
   git rm -q -r crates/stellar-agent-sep53
   git commit -q -m "remove sep53"
   assert_changed crates/stellar-agent-sep53/Cargo.toml
-  expect_list "${ALWAYS[@]}" "${RUST[@]}" test test-vendored-release-cfg
+  expect_list "${ALWAYS[@]}" "${RUST[@]}" test test-vendored-release-cfg test-policy-pin-release-cfg
 }
 
 case_untracked_test_file() {
@@ -1305,8 +1306,8 @@ case_full() {
   start_case
   edit CONTRIBUTING.md
   read -r -a ids <<<"$(printf '%s\n' "$EXPECTED_REGISTRY" | awk -F '\t' '{ printf "%s ", $1 }')"
-  if [ "${#ids[@]}" -ne 53 ]; then
-    fail "the expected registry holds ${#ids[@]} rows, expected 53"
+  if [ "${#ids[@]}" -ne 54 ]; then
+    fail "the expected registry holds ${#ids[@]} rows, expected 54"
   fi
   expect_list --full "${ids[@]}"
 }

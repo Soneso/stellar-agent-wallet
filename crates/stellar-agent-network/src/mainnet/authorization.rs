@@ -2074,7 +2074,7 @@ mod tests {
                     &profile.policy_window_state_key_id,
                 )
                 .unwrap();
-                pin::write(
+                pin::write_for_test(
                     &lock,
                     &PinScope::for_profile(&dir.path().join("state.window"), &profile),
                     &Pin::new(policy_sequence, policy_digest, policy_owner).unwrap(),

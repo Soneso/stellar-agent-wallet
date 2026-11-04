@@ -5611,7 +5611,7 @@ mod tests {
         std::fs::create_dir_all(window.parent().unwrap()).unwrap();
         let lock =
             WindowStoreLock::acquire_for(&window, &profile.policy_window_state_key_id).unwrap();
-        pin::write(
+        pin::write_for_test(
             &lock,
             &PinScope::for_profile(&window, &profile),
             &Pin::new(2, [0; 32], key).unwrap(),

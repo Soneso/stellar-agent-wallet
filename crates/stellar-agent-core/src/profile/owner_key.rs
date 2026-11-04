@@ -128,6 +128,36 @@ pub fn refuse_installation_key_coordinate(
     Ok(())
 }
 
+/// Refuses a coordinate reserved for a policy pin.
+///
+/// The account suffix comparison is ASCII case-insensitive. Dotted aliases
+/// also refuse because some stores join the account and service with a dot.
+/// Callers check this before opening the keyring.
+///
+/// # Errors
+///
+/// Returns [`ValidationError::PolicyPinCoordinate`] naming `field`.
+pub fn refuse_policy_pin_coordinate(
+    entry_ref: &KeyringEntryRef,
+    field: &'static str,
+) -> Result<(), WalletError> {
+    let account = entry_ref.account.to_ascii_lowercase();
+    let service = entry_ref.service.to_ascii_lowercase();
+    let names_pin = |part: &str| part.ends_with(super::schema::POLICY_PIN_SUFFIX);
+    // A wallet service ends in a profile id. Its alias reaches only a pin of a
+    // non-default window, which a mainnet profile refuses.
+    let service_alias = !service.starts_with(super::schema::WALLET_SERVICE_NAMESPACE)
+        && service
+            .rsplit_once('.')
+            .is_some_and(|(head, _)| head.split('.').any(names_pin));
+    if account.split('.').any(names_pin) || service_alias {
+        return Err(WalletError::Validation(
+            ValidationError::PolicyPinCoordinate { field },
+        ));
+    }
+    Ok(())
+}
+
 /// The owner coordinates a symmetric-key loader compares a loaded key with.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OwnerKeyContext {
@@ -378,6 +408,62 @@ mod tests {
         .unwrap_err();
         assert_ne!(err.code(), "validation.key_matches_owner_public_key");
         assert_eq!(err.category(), crate::error::ErrorCategory::Auth);
+    }
+
+    #[test]
+    fn policy_pin_coordinate_refusal_covers_aliases_and_names_the_field() {
+        for alias in [
+            "default-policy-pin.stellar-agent-policy-window.test",
+            "default-policy-pin.stellar-agent-policy-window-team-policy-pin.v2",
+            "default-policy-pin.stellar-agent-policy-window-team-policy-pin",
+            "CUSTOM.POLICY-PIN-POLICY-PIN.CUSTOM.SERVICE",
+            "default-PoLiCy-PiN.custom",
+        ] {
+            for (split, _) in alias.match_indices('.') {
+                let entry = KeyringEntryRef::new(&alias[split + 1..], &alias[..split]);
+                let error = refuse_policy_pin_coordinate(&entry, "keyring_coordinate").unwrap_err();
+                assert_eq!(error.code(), "validation.policy_pin_coordinate");
+                assert!(error.to_string().contains("keyring_coordinate"));
+                assert!(
+                    error
+                        .to_string()
+                        .contains("a policy pin changes only through a verified policy load")
+                );
+            }
+        }
+        for entry in [
+            KeyringEntryRef::default_policy_window_state_key("pin-refusal"),
+            KeyringEntryRef::default_policy_window_state_key("team-policy-pin.v2"),
+            KeyringEntryRef::default_policy_window_state_key("team-policy-pin"),
+            KeyringEntryRef::toolset_pin_key(),
+            KeyringEntryRef::new("custom", "default-policy-pin-other"),
+            KeyringEntryRef::new("service-policy-pin", "default"),
+        ] {
+            refuse_policy_pin_coordinate(&entry, "keyring_coordinate").unwrap();
+        }
+    }
+
+    #[test]
+    fn default_profile_coordinates_with_policy_pin_suffixes_stay_allowed() {
+        type Constructor = fn(&str) -> KeyringEntryRef;
+        let constructors: [Constructor; 10] = [
+            KeyringEntryRef::default_signer,
+            KeyringEntryRef::default_nonce,
+            KeyringEntryRef::default_audit_key,
+            KeyringEntryRef::default_owner_key,
+            KeyringEntryRef::default_attestation_key,
+            KeyringEntryRef::default_pool_master_key,
+            KeyringEntryRef::default_counterparty_key,
+            KeyringEntryRef::default_policy_window_state_key,
+            KeyringEntryRef::default_mpp_state_key,
+            KeyringEntryRef::default_audit_binding,
+        ];
+        for name in ["team-policy-pin", "team-policy-pin.v2"] {
+            for constructor in constructors {
+                let entry = constructor(name);
+                refuse_policy_pin_coordinate(&entry, "keyring_coordinate").unwrap();
+            }
+        }
     }
 
     /// The installation namespace is case-insensitive and covers every account.

@@ -103,11 +103,14 @@ misleading local page is a residue. The owner seed admits approval credentials, 
 signing the policy on a host where same-user code runs exposes that seed.
 
 For code running as the same OS user, the owner of an enabled mainnet profile
-changes only with a statement signed by the previous owner. The policy pin and
-the enablement nonce that carry this continuity sit at the profile's default
-window-state entry, and a mainnet profile that names another entry is refused.
-Raw deletion of the pin, enablement, and owner entry outside the wallet rests
-on the platform keyring.
+changes only with a statement signed by the previous owner. A verified policy
+load requires that statement for a new owner; no public function of a build
+without the `test-helpers` feature writes a pin the caller composes. The policy
+pin and the enablement nonce that carry this continuity sit at the profile's
+default window-state entry, and a mainnet profile that names another entry is
+refused.
+Raw deletion or replacement of the pin, enablement, and owner entry outside
+the wallet rests on the platform keyring.
 
 The identity record beside an enrolled signer's seed names the profile, chain
 and owner it serves, signed by that owner. On mainnet the wallet signs only

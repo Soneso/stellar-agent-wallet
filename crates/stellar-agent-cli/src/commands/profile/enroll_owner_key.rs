@@ -1349,7 +1349,8 @@ mod tests {
             profile.policy_window_state_key_id = configured.clone();
             let default = KeyringEntryRef::default_policy_window_state_key("operator");
             let lock = WindowStoreLock::acquire_for(&f.window, &configured).unwrap();
-            pin::write(&lock, &PinScope::for_profile(&f.window, &profile), &pinned).unwrap();
+            pin::write_for_test(&lock, &PinScope::for_profile(&f.window, &profile), &pinned)
+                .unwrap();
             drop(lock);
             let nonce = mainnet_enablement_entry_ref(&configured);
             KeyringEntry::new(&nonce.service, &nonce.account)
@@ -1398,7 +1399,7 @@ mod tests {
         let moved = testnet_operator(Some(moved_key.clone()));
         loader::save_to_dir("operator", &moved, &default_profile_dir().unwrap()).unwrap();
         let lock = WindowStoreLock::acquire_for(&f.window, &moved_key).unwrap();
-        pin::write(&lock, &PinScope::for_profile(&f.window, &moved), &pinned).unwrap();
+        pin::write_for_test(&lock, &PinScope::for_profile(&f.window, &moved), &pinned).unwrap();
         drop(lock);
         f.owner_entry.delete_credential().unwrap();
 

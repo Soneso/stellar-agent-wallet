@@ -288,7 +288,7 @@ impl LedgerFixture {
             let lock =
                 WindowStoreLock::acquire_for(&window_path, &profile.policy_window_state_key_id)
                     .unwrap();
-            pin::write(
+            pin::write_for_test(
                 &lock,
                 &PinScope::for_profile(&window_path, &profile),
                 &Pin::new(POLICY_SEQUENCE, POLICY_DIGEST, POLICY_OWNER).unwrap(),

@@ -388,6 +388,8 @@ with `policy.sequence_rollback`.
 
 To change the owner of a profile with a policy pin, follow
 [Rotate the policy owner](../profiles.md#rotate-the-policy-owner).
+An owner change advances the pin only through the verified load of a policy
+that carries the previous owner's statement.
 
 Additional refusals:
 

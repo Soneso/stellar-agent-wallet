@@ -513,6 +513,14 @@ for _family, _edges in {'build': 'normal,build', 'check': 'normal,build',
     UNITS['translation-' + _family] = translation_case(_family, _edges)
 
 
+@unit('translation-doctests')
+def translation_doctests(m, tmp, checker):
+    assert m.translate('cargo test -p stellar-agent-core --doc policy::pin') == {
+        'selection': ['-p', 'stellar-agent-core'], 'features': [],
+        'edges': 'normal,build,dev', 'target': None, 'bins': [],
+    }
+
+
 @unit('translation-dev-targets')
 def case_translation_dev_targets(m, tmp, checker):
     for family in ('build', 'check'):

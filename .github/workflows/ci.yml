@@ -139,6 +139,8 @@ jobs:
       # Without test-helpers, the integration target also checks that the library excludes the revoked test fixture.
       - name: Test the vendored Wasm release configuration
         run: cargo test -p stellar-agent-smart-account --test vendored_wasm_release_cfg
+      - name: Test the policy pin release configuration
+        run: cargo test -p stellar-agent-core --doc policy::pin
       # stellar-agent-test-support is consumed with a different feature set by
       # each crate; every set must compile on its own.
       - name: Check each test-support feature set

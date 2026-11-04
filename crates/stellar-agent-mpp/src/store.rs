@@ -1420,6 +1420,11 @@ impl MppAuthorizationStore {
         entry_ref: &KeyringEntryRef,
         value: u64,
     ) -> Result<(), MppError> {
+        stellar_agent_core::profile::owner_key::refuse_policy_pin_coordinate(
+            &self.generation_entry,
+            "mpp_generation_entry",
+        )
+        .map_err(|_| state_error())?;
         let intent = *entry_ref == self.generation_intent_entry;
         lock.verify_identity()?;
         #[cfg(test)]
@@ -1792,6 +1797,41 @@ pub(crate) mod tests {
     use stellar_agent_core::profile::schema::KeyringEntryRef;
     use stellar_agent_network::keyring::{load_hmac_key_32, rotate_keyring_secret_32};
     use tempfile::TempDir;
+
+    #[test]
+    #[serial_test::serial]
+    fn keyring_counters_refuse_policy_pin_coordinate() {
+        let coordinate = KeyringEntryRef::new("custom", "default-PoLiCy-PiN");
+        for initial in [None, Some("0")] {
+            stellar_agent_test_support::keyring_mock::install().expect("mock keyring");
+            let entry = keyring_core::Entry::new(&coordinate.service, &coordinate.account)
+                .expect("pin entry");
+            if let Some(value) = initial {
+                entry.set_password(value).expect("seed entry");
+            }
+            let dir = TempDir::new().expect("store directory");
+            let store = MppAuthorizationStore::at_path(
+                dir.path().join("state"),
+                [3; 32],
+                coordinate.clone(),
+            );
+            let lock = store.acquire_lock().expect("store lock");
+            for counter in [&store.generation_entry, &store.generation_intent_entry] {
+                let error = store
+                    .write_counter(&lock, counter, 1)
+                    .expect_err("pin refuses");
+                assert_eq!(error.code(), "mpp.state_unavailable");
+            }
+            assert_eq!(entry.get_password().ok().as_deref(), initial);
+            let intent = &store.generation_intent_entry;
+            assert!(matches!(
+                keyring_core::Entry::new(&intent.service, &intent.account)
+                    .expect("intent entry")
+                    .get_password(),
+                Err(keyring_core::Error::NoEntry)
+            ));
+        }
+    }
 
     type Hook = std::cell::RefCell<Option<Box<dyn FnOnce() -> Result<(), MppError>>>>;
 

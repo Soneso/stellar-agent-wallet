@@ -1649,7 +1649,7 @@ mod tests {
             WindowStoreLock::acquire_for(&window, &profile.policy_window_state_key_id).unwrap();
         let scope = PinScope::for_profile(&window, &profile);
         assert_eq!(pin::read(&lock, &scope).unwrap(), PinState::Absent);
-        pin::write(&lock, &scope, &Pin::new(10, [0; 32], [0; 32]).unwrap()).unwrap();
+        pin::write_for_test(&lock, &scope, &Pin::new(10, [0; 32], [0; 32]).unwrap()).unwrap();
         drop(lock);
         let prepared = prepare_policy(body, &profile, "operator", &policy, &window).unwrap();
         assert_eq!(prepared.sequence, Some(11));
@@ -1723,7 +1723,7 @@ mod tests {
         assert!(prepared.warnings.iter().any(|w| w.contains("v2")));
         let lock =
             WindowStoreLock::acquire_for(&window, &profile.policy_window_state_key_id).unwrap();
-        pin::write(
+        pin::write_for_test(
             &lock,
             &PinScope::for_profile(&window, &profile),
             &Pin::new(1, [0; 32], [0; 32]).unwrap(),
@@ -2067,7 +2067,7 @@ mod tests {
         std::fs::create_dir_all(window.parent().unwrap()).unwrap();
         let lock =
             WindowStoreLock::acquire_for(&window, &profile.policy_window_state_key_id).unwrap();
-        pin::write(
+        pin::write_for_test(
             &lock,
             &PinScope::for_profile(&window, &profile),
             &Pin::new(1, [0; 32], previous_public).unwrap(),
@@ -2162,7 +2162,7 @@ mod tests {
         std::fs::create_dir_all(window.parent().unwrap()).unwrap();
         let lock =
             WindowStoreLock::acquire_for(&window, &profile.policy_window_state_key_id).unwrap();
-        pin::write(
+        pin::write_for_test(
             &lock,
             &PinScope::for_profile(&window, &profile),
             &Pin::new(1, [0; 32], pinned_public).unwrap(),

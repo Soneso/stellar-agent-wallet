@@ -66,6 +66,10 @@ A mainnet profile's `policy_window_state_key_id` must name its default entry,
 `stellar-agent-policy-window-<name>` with account `default`, even when the file
 sets it explicitly. The policy pin and the mainnet enablement nonce sit beside
 that entry, so another entry would start from an empty pin and nonce.
+Profile commands report [`validation.installation_key_coordinate`](toolsets.md)
+with the field and reserved service for an installation key write, or
+`validation.policy_pin_coordinate` with the field for a reserved policy pin
+write.
 
 A copied profile file, including a backup in that directory, counts as a sibling.
 If this profile names a sibling's entry, give this profile its own entry.
