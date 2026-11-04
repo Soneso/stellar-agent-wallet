@@ -164,7 +164,7 @@ async fn run_enroll(args: EnrollApprovalCredentialArgs) -> i32 {
         Ok(profile) if profile.chain_id.is_mainnet() => page_identity_for(&profile),
         Ok(_) => return refuse(PROFILE_REQUIRED),
         Err(error) if error.requires_refusal() => {
-            render_json(&Envelope::<()>::err(&error.to_wallet_error(&args.profile)));
+            render_json(&Envelope::<()>::err(&error.to_wallet_error()));
             return 1;
         }
         Err(_) => return refuse(PROFILE_REQUIRED),

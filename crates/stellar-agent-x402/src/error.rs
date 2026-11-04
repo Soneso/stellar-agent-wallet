@@ -42,44 +42,25 @@ pub enum X402Error {
     /// The `scheme` field was not `"exact"`.
     ///
     /// Only the `exact` scheme is supported by this crate.
-    #[error("unsupported x402 scheme: {scheme}; only \"exact\" is supported")]
-    UnsupportedScheme {
-        /// The rejected scheme value, stored quoted, escaped, and bounded by
-        /// `stellar_agent_network::quote_server_text`.
-        scheme: String,
-    },
+    #[error("unsupported x402 scheme; only \"exact\" is supported")]
+    UnsupportedScheme,
 
     /// The `network` field is not one of the two supported x402 Stellar networks.
     ///
     /// Only `"stellar:pubnet"` and `"stellar:testnet"` are valid x402 Stellar
     /// network identifiers.
     #[error(
-        "unsupported x402 network: {network}; \
-         accepted values are \"stellar:pubnet\" and \"stellar:testnet\""
+        "unsupported x402 network; accepted values are \"stellar:pubnet\" and \"stellar:testnet\""
     )]
-    UnsupportedNetwork {
-        /// The rejected network value, stored quoted, escaped, and bounded by
-        /// `stellar_agent_network::quote_server_text`.
-        network: String,
-    },
+    UnsupportedNetwork,
 
     /// The x402 wire `network` does not match the caller-supplied profile
     /// passphrase.
     ///
     /// Prevents a payment intended for one network from being signed with a
     /// signer bound to a different network.
-    #[error(
-        "x402 network {network:?} resolves to passphrase {expected_passphrase:?}, \
-         but profile passphrase is {profile_passphrase:?}"
-    )]
-    NetworkPassphraseMismatch {
-        /// x402 wire network string (e.g. `"stellar:pubnet"`).
-        network: String,
-        /// Passphrase derived from the x402 network string.
-        expected_passphrase: &'static str,
-        /// Passphrase from the caller's profile / `create_payment` argument.
-        profile_passphrase: String,
-    },
+    #[error("the x402 network must match the profile passphrase")]
+    NetworkPassphraseMismatch,
 
     /// A payment-signing request targeted mainnet.
     ///
@@ -266,9 +247,9 @@ impl X402Error {
             },
             X402Error::MainnetAuthorizationRefused => "network.mainnet_authorization_refused",
             X402Error::InvalidPaymentRequired { .. } => "x402.invalid_payment_required",
-            X402Error::UnsupportedScheme { .. } => "x402.unsupported_scheme",
-            X402Error::UnsupportedNetwork { .. } => "x402.unsupported_network",
-            X402Error::NetworkPassphraseMismatch { .. } => "x402.network_passphrase_mismatch",
+            X402Error::UnsupportedScheme => "x402.unsupported_scheme",
+            X402Error::UnsupportedNetwork => "x402.unsupported_network",
+            X402Error::NetworkPassphraseMismatch => "x402.network_passphrase_mismatch",
             X402Error::MainnetSigningForbidden { .. } => "network.mainnet_write_forbidden",
             X402Error::InvalidAssetAddress { .. } => "x402.invalid_asset_address",
             X402Error::InvalidRecipientAddress { .. } => "x402.invalid_recipient_address",
@@ -314,22 +295,16 @@ pub mod test_helpers {
         }
     }
 
-    /// Constructs [`X402Error::UnsupportedScheme`] with the given scheme,
-    /// stored quoted the way the validation stores it.
+    /// Constructs [`X402Error::UnsupportedScheme`].
     #[must_use]
-    pub fn unsupported_scheme(scheme: impl AsRef<str>) -> X402Error {
-        X402Error::UnsupportedScheme {
-            scheme: stellar_agent_network::quote_server_text(scheme.as_ref()),
-        }
+    pub fn unsupported_scheme() -> X402Error {
+        X402Error::UnsupportedScheme
     }
 
-    /// Constructs [`X402Error::UnsupportedNetwork`] with the given network,
-    /// stored quoted the way the validation stores it.
+    /// Constructs [`X402Error::UnsupportedNetwork`].
     #[must_use]
-    pub fn unsupported_network(network: impl AsRef<str>) -> X402Error {
-        X402Error::UnsupportedNetwork {
-            network: stellar_agent_network::quote_server_text(network.as_ref()),
-        }
+    pub fn unsupported_network() -> X402Error {
+        X402Error::UnsupportedNetwork
     }
 
     /// Constructs [`X402Error::FeesNotSponsored`].
@@ -363,12 +338,10 @@ mod tests {
 
     #[test]
     fn display_unsupported_scheme_does_not_contain_key_material() {
-        let err = X402Error::UnsupportedScheme {
-            scheme: "bad".to_owned(),
-        };
+        let err = X402Error::UnsupportedScheme;
         let display = err.to_string();
-        // Must mention the scheme and say "exact"
-        assert!(display.contains("bad"));
+        // The detail names the accepted scheme.
+        assert!(!display.contains("bad"));
         assert!(display.contains("exact"));
         // Must not contain any S-strkey prefix pattern
         assert!(!display.starts_with('S'));
@@ -382,23 +355,19 @@ mod tests {
     }
 
     #[test]
-    fn display_unsupported_network_includes_network() {
-        let err = X402Error::UnsupportedNetwork {
-            network: "evm:1".to_owned(),
-        };
-        assert!(err.to_string().contains("evm:1"));
+    fn display_unsupported_network_names_accepted_networks() {
+        let err = X402Error::UnsupportedNetwork;
+        assert!(!err.to_string().contains("evm:1"));
     }
 
     #[test]
     fn display_network_passphrase_mismatch() {
-        let err = X402Error::NetworkPassphraseMismatch {
-            network: "stellar:pubnet".to_owned(),
-            expected_passphrase: "Public Global Stellar Network ; September 2015",
-            profile_passphrase: "Test SDF Network ; September 2015".to_owned(),
-        };
+        let err = X402Error::NetworkPassphraseMismatch;
         let display = err.to_string();
-        // Must mention the network
-        assert!(display.contains("stellar:pubnet"));
+        assert_eq!(
+            display,
+            "the x402 network must match the profile passphrase"
+        );
     }
 
     #[test]
@@ -586,11 +555,11 @@ mod tests {
         let e = test_helpers::fees_not_sponsored();
         assert!(matches!(e, X402Error::FeesNotSponsored));
 
-        let e = test_helpers::unsupported_scheme("upto");
-        assert!(matches!(e, X402Error::UnsupportedScheme { scheme } if scheme == "\"upto\""));
+        let e = test_helpers::unsupported_scheme();
+        assert!(matches!(e, X402Error::UnsupportedScheme));
 
-        let e = test_helpers::unsupported_network("evm:1");
-        assert!(matches!(e, X402Error::UnsupportedNetwork { network } if network == "\"evm:1\""));
+        let e = test_helpers::unsupported_network();
+        assert!(matches!(e, X402Error::UnsupportedNetwork));
     }
     #[test]
     fn mainnet_authorization_errors_preserve_codes_without_preconditions() {

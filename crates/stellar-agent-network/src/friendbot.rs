@@ -55,18 +55,16 @@ pub const ALLOWED_FRIENDBOT_HOSTS: &[&str] =
 #[non_exhaustive]
 pub enum FriendbotUrlError {
     /// The URL could not be parsed.
-    #[error("invalid friendbot URL: {0}")]
-    InvalidUrl(String),
+    #[error("the friendbot URL must be an absolute URL with a host")]
+    InvalidUrl,
 
     /// The URL scheme is not HTTPS.
-    #[error("non-HTTPS friendbot URL not allowed: {0}")]
-    NonHttps(String),
+    #[error("the friendbot URL must use HTTPS")]
+    NonHttps,
 
     /// The URL's host is not in the allow-list.
-    #[error("friendbot host '{host}' not in allow-list (allowed: {allowed})")]
+    #[error("the friendbot host is not in the allow-list (allowed: {allowed})")]
     HostNotAllowed {
-        /// The rejected host.
-        host: String,
         /// Human-readable list of allowed hosts.
         allowed: String,
     },
@@ -75,8 +73,8 @@ pub enum FriendbotUrlError {
     ///
     /// Friendbot URLs must not contain a `user:password@host` component.
     /// Embedded credentials can leak into logs and error envelopes.
-    #[error("{0}")]
-    CredentialsInUrl(String),
+    #[error("friendbot URL must not contain userinfo (user:pass@host)")]
+    CredentialsInUrl,
 }
 
 /// Validates a Friendbot endpoint URL against the production allow-list.
@@ -192,8 +190,7 @@ pub fn default_friendbot_url(
 /// When `allow_loopback` is `true`, `127.0.0.1` and `localhost` are accepted
 /// regardless of scheme (wiremock in tests uses plain HTTP on loopback).
 fn validate_friendbot_url_inner(url: &str, allow_loopback: bool) -> Result<(), FriendbotUrlError> {
-    let parsed =
-        url::Url::parse(url).map_err(|e| FriendbotUrlError::InvalidUrl(format!("{url}: {e}")))?;
+    let parsed = url::Url::parse(url).map_err(|_| FriendbotUrlError::InvalidUrl)?;
 
     // Reject URLs with embedded credentials before evaluating anything else.
     // Userinfo in a URL can leak into logs and error envelopes.  The check
@@ -201,16 +198,10 @@ fn validate_friendbot_url_inner(url: &str, allow_loopback: bool) -> Result<(), F
     // defence-in-depth even for the loopback path used in tests; well-formed
     // wiremock URLs never carry credentials.
     if !parsed.username().is_empty() || parsed.password().is_some() {
-        return Err(FriendbotUrlError::CredentialsInUrl(
-            // Do NOT echo the URL itself in the error message — that would
-            // defeat the purpose of rejecting it.
-            "friendbot URL must not contain userinfo (user:pass@host)".to_owned(),
-        ));
+        return Err(FriendbotUrlError::CredentialsInUrl);
     }
 
-    let host = parsed
-        .host_str()
-        .ok_or_else(|| FriendbotUrlError::InvalidUrl(format!("{url}: missing host")))?;
+    let host = parsed.host_str().ok_or(FriendbotUrlError::InvalidUrl)?;
 
     // Allow loopback for test environments (wiremock binds to 127.0.0.1).
     if allow_loopback && (host == "127.0.0.1" || host == "localhost") {
@@ -220,7 +211,7 @@ fn validate_friendbot_url_inner(url: &str, allow_loopback: bool) -> Result<(), F
     // Reject non-HTTPS (except when loopback is requested and the host
     // matched above — but we only reach here for non-loopback hosts).
     if parsed.scheme() != "https" {
-        return Err(FriendbotUrlError::NonHttps(url.to_owned()));
+        return Err(FriendbotUrlError::NonHttps);
     }
 
     // Verify host is allow-listed.  The `url` crate normalises ASCII hostnames
@@ -235,7 +226,6 @@ fn validate_friendbot_url_inner(url: &str, allow_loopback: bool) -> Result<(), F
     if !allowed {
         let allowed_list = ALLOWED_FRIENDBOT_HOSTS.join(", ");
         return Err(FriendbotUrlError::HostNotAllowed {
-            host: host.to_owned(),
             allowed: allowed_list,
         });
     }
@@ -592,6 +582,30 @@ mod tests {
     )]
 
     use super::*;
+
+    #[test]
+    fn friendbot_url_marker_is_not_echoed() {
+        use stellar_agent_test_support::rejected_value::{CREDENTIAL_MARKER, assert_no_marker};
+        for url in [
+            CREDENTIAL_MARKER.to_owned(),
+            format!("http://friendbot.stellar.org/{CREDENTIAL_MARKER}"),
+            format!("https://{CREDENTIAL_MARKER}.example"),
+            format!("https://{CREDENTIAL_MARKER}@friendbot.stellar.org"),
+            format!("data:{CREDENTIAL_MARKER}"),
+        ] {
+            let error = validate_friendbot_url(&url).unwrap_err();
+            assert_no_marker(&error, CREDENTIAL_MARKER);
+            assert_no_marker(&error, &CREDENTIAL_MARKER.to_ascii_lowercase());
+            let wallet = WalletError::Network(NetworkError::RpcUnreachable {
+                url: "the friendbot endpoint".to_owned(),
+                reason: error.to_string(),
+            });
+            let json =
+                serde_json::to_string(&stellar_agent_core::envelope::Envelope::<()>::err(&wallet))
+                    .unwrap();
+            assert!(!json.to_ascii_uppercase().contains(CREDENTIAL_MARKER));
+        }
+    }
 
     /// Accepts one request, answers with `headers`, then stalls forever.
     async fn stalled_friendbot(headers: &'static [u8]) -> (String, tokio::task::JoinHandle<()>) {
@@ -1082,7 +1096,7 @@ mod tests {
     fn http_scheme_rejected() {
         let result = validate_friendbot_url("http://friendbot.stellar.org");
         assert!(
-            matches!(result, Err(FriendbotUrlError::NonHttps(_))),
+            matches!(result, Err(FriendbotUrlError::NonHttps)),
             "non-HTTPS URL must be rejected: {result:?}"
         );
     }
@@ -1091,7 +1105,7 @@ mod tests {
     fn malformed_url_rejected() {
         let result = validate_friendbot_url("not-a-url");
         assert!(
-            matches!(result, Err(FriendbotUrlError::InvalidUrl(_))),
+            matches!(result, Err(FriendbotUrlError::InvalidUrl)),
             "malformed URL must be rejected: {result:?}"
         );
     }
@@ -1145,7 +1159,7 @@ mod tests {
     fn userinfo_username_only_rejected() {
         let result = validate_friendbot_url("https://user@friendbot.stellar.org/");
         assert!(
-            matches!(result, Err(FriendbotUrlError::CredentialsInUrl(_))),
+            matches!(result, Err(FriendbotUrlError::CredentialsInUrl)),
             "username-only userinfo must be rejected: {result:?}"
         );
     }
@@ -1154,7 +1168,7 @@ mod tests {
     fn userinfo_username_password_rejected() {
         let result = validate_friendbot_url("https://user:pass@friendbot.stellar.org/");
         assert!(
-            matches!(result, Err(FriendbotUrlError::CredentialsInUrl(_))),
+            matches!(result, Err(FriendbotUrlError::CredentialsInUrl)),
             "user:password userinfo must be rejected: {result:?}"
         );
     }
@@ -1166,11 +1180,12 @@ mod tests {
         let result =
             validate_friendbot_url("https://attacker:secret@friendbot.stellar.org/?addr=G123");
         assert!(
-            matches!(result, Err(FriendbotUrlError::CredentialsInUrl(_))),
+            matches!(result, Err(FriendbotUrlError::CredentialsInUrl)),
             "allow-listed host with userinfo must be rejected: {result:?}"
         );
         // Error message must not echo the URL.
-        if let Err(FriendbotUrlError::CredentialsInUrl(msg)) = result {
+        if let Err(error @ FriendbotUrlError::CredentialsInUrl) = result {
+            let msg = error.to_string();
             assert!(
                 !msg.contains("attacker"),
                 "error message must not reveal credentials: {msg}"
@@ -1287,7 +1302,7 @@ mod tests {
     fn ftp_scheme_rejected() {
         let result = validate_friendbot_url("ftp://friendbot.stellar.org/");
         assert!(
-            matches!(result, Err(FriendbotUrlError::NonHttps(_))),
+            matches!(result, Err(FriendbotUrlError::NonHttps)),
             "ftp:// scheme must be rejected with NonHttps: {result:?}"
         );
     }

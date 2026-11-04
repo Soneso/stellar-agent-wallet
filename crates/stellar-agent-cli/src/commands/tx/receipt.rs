@@ -252,10 +252,7 @@ async fn run_clear(args: &ClearArgs) -> i32 {
     let (profile, origin) = match load_profile_or_synthesize_testnet(&resolved) {
         Ok(p) => p,
         Err(e) => {
-            render_json(&Envelope::<()>::err_raw(
-                e.code(),
-                e.message(&resolved.name),
-            ));
+            render_json(&Envelope::<()>::err_raw(e.code(), e.message()));
             return 1;
         }
     };

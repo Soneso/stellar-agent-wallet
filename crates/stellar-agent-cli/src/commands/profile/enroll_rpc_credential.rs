@@ -265,7 +265,7 @@ where
     // 1. Load and reconcile; the loader validates every provider record.
     let profile = match reconcile_loaded_profile(load_profile(&name), &resolved) {
         Ok(profile) => profile,
-        Err(e) => return render::write_envelope(out, &profile_access_envelope(&e, &name), 1),
+        Err(e) => return render::write_envelope(out, &profile_access_envelope(&e), 1),
     };
 
     // 2. The role's URL and record.
@@ -329,7 +329,7 @@ where
         }
     };
     if let Err(e) = check_write(&name, &profile, role, &entry, &placement) {
-        let error = WalletError::Validation(e.to_validation_error(&name));
+        let error = WalletError::Validation(e.to_validation_error());
         return render::write_envelope(out, &Envelope::<()>::err(&error), 1);
     }
     let record_patched = record.credential.is_none();

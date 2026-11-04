@@ -164,8 +164,8 @@ where
     let profile = match reconcile_loaded_profile(load_profile(&profile_name), &resolved) {
         Ok(p) => p,
         Err(e) => {
-            tracing::debug!(profile = %profile_name, error = %e, "profile access refused");
-            render::render_json(&profile_access_envelope(&e, &profile_name));
+            tracing::debug!(error = %e, "profile access refused");
+            render::render_json(&profile_access_envelope(&e));
             return 1;
         }
     };
@@ -219,7 +219,7 @@ where
         if stellar_strkey::ed25519::PublicKey::from_string(expected).is_err() {
             render::render_json(&Envelope::<()>::err_raw(
                 "enroll_owner_key.expected_address_invalid",
-                format!("--expected-address is not a valid G-strkey: {expected}"),
+                "--expected-address is not a valid G-strkey",
             ));
             return 1;
         }
@@ -228,7 +228,7 @@ where
                 "enroll_owner_key.expected_address_mismatch",
                 format!(
                     "the seed in '{}' derives to {owner_address}, which does not match \
-                     --expected-address {expected}; no entry was written",
+                     --expected-address; no entry was written",
                     args.secret_env
                 ),
             ));
@@ -539,10 +539,9 @@ fn authorize_at(
 /// requested name, so the key is enrolled under the name the operator
 /// selected — never under another profile's trust anchor.
 fn owner_coordinate(profile: &Profile) -> Result<KeyringEntryRef, String> {
-    let service = &profile.policy_owner_key_id.service;
     let profile_name = derive_profile_name_from_owner_key(profile).ok_or_else(|| {
         format!(
-            "the profile's owner-key service '{service}' does not start with the expected \
+            "the profile's policy_owner_key_id.service does not start with the expected \
              prefix '{OWNER_KEY_SERVICE_PREFIX}'; the profile was not constructed with the \
              standard owner coordinate and cannot be enrolled"
         )
@@ -762,6 +761,108 @@ mod tests {
         assert!(
             entry.get_password().is_err(),
             "no entry must be written on expected-address mismatch"
+        );
+    }
+
+    /// A malformed and a mismatched `--expected-address` refuse by the flag
+    /// and the derived address, and neither refusal repeats the flag value.
+    #[tokio::test]
+    #[serial]
+    async fn expected_address_marker_is_not_echoed() {
+        use stellar_agent_test_support::rejected_value::{
+            CREDENTIAL_MARKER, assert_no_marker_in_text,
+        };
+
+        keyring_mock::install().expect("mock store");
+        let profile_name = "enroll-owner-marker";
+        let (s_strkey, derived_g, _pk) = seed_material([0x23u8; 32]);
+        let var = unique_var("MARKER");
+        let _guard = EnvGuard::set(var.clone(), &s_strkey);
+        let (_other_s, other_g, _other_pk) = seed_material([0x34u8; 32]);
+        let cases = [
+            (
+                CREDENTIAL_MARKER.to_owned(),
+                "enroll_owner_key.expected_address_invalid",
+                "--expected-address is not a valid G-strkey".to_owned(),
+            ),
+            (
+                other_g.clone(),
+                "enroll_owner_key.expected_address_mismatch",
+                format!(
+                    "the seed in '{var}' derives to {derived_g}, which does not match \
+                     --expected-address; no entry was written"
+                ),
+            ),
+        ];
+        for (expected, code, message) in cases {
+            crate::common::render::take_rendered_for_test();
+            let profile = profile_for(profile_name);
+            let status = run_with_dependencies(
+                &args(profile_name, &var, Some(&expected), false),
+                move |_n| Ok(profile.clone()),
+                || Ok(()),
+            )
+            .await;
+            assert_eq!(status, 1);
+            let rendered = crate::common::render::take_rendered_for_test();
+            assert_eq!(rendered.len(), 1, "{rendered:?}");
+            assert_eq!(rendered[0]["error"]["code"], code);
+            assert_eq!(rendered[0]["error"]["message"], message.as_str());
+            assert_no_marker_in_text(&rendered[0].to_string(), &expected);
+        }
+    }
+
+    /// The owner service reaches neither the name-mismatch refusal of the
+    /// command nor the coordinate refusal behind it.
+    #[tokio::test]
+    #[serial]
+    async fn owner_service_marker_is_not_echoed() {
+        let capture = stellar_agent_test_support::log_capture::CaptureWriter::new();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer(capture.clone())
+            .finish();
+        let _inert = stellar_agent_test_support::log_capture::inert_dispatcher();
+        let _subscriber = tracing::subscriber::set_default(subscriber);
+        tracing::callsite::rebuild_interest_cache();
+
+        use stellar_agent_test_support::rejected_value::{
+            CREDENTIAL_MARKER, assert_no_marker_in_text,
+        };
+
+        let mut profile = profile_for("enroll-owner-service-marker");
+        profile.policy_owner_key_id = KeyringEntryRef::new(CREDENTIAL_MARKER, "default");
+        let message = owner_coordinate(&profile).unwrap_err();
+        assert_eq!(
+            message,
+            format!(
+                "the profile's policy_owner_key_id.service does not start with the expected \
+                 prefix '{OWNER_KEY_SERVICE_PREFIX}'; the profile was not constructed with the \
+                 standard owner coordinate and cannot be enrolled"
+            )
+        );
+        assert_no_marker_in_text(&message, CREDENTIAL_MARKER);
+        render::take_rendered_for_test();
+        let status = run_with_dependencies(
+            &args("enroll-owner-service-marker", "UNUSED", None, false),
+            move |_| Ok(profile.clone()),
+            || Ok(()),
+        )
+        .await;
+        assert_eq!(status, 1);
+        let output = render::take_rendered_for_test();
+        assert_eq!(output[0]["error"]["code"], "profile.name_mismatch");
+        let message = output[0]["error"]["message"].as_str().unwrap();
+        assert_no_marker_in_text(&format!("{output:?}"), CREDENTIAL_MARKER);
+        assert!(message.contains(
+            "policy_owner_key_id.service does not carry the 'stellar-agent-owner-' prefix"
+        ));
+        assert_no_marker_in_text(message, CREDENTIAL_MARKER);
+        stellar_agent_test_support::rejected_value::assert_no_marker_in_text(
+            &capture.captured_str(),
+            "CREDMARKER7",
         );
     }
 

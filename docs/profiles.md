@@ -46,8 +46,8 @@ copying `<a>.toml` to `<b>.toml` does not make it profile `b`. Both binaries
 refuse it under the new name. The MCP server refuses it at startup, and the CLI
 refuses it at every command that loads a profile, with the wire code
 `profile.name_mismatch`. The
-refusal names both profiles and quotes the offending
-`policy_owner_key_id.service`. Recover by creating the second profile with
+refusal names the offending `policy_owner_key_id.service` field without its
+value or either profile name. Recover by creating the second profile with
 `profile init --profile <name>`, or by correcting that field to
 `stellar-agent-owner-<name>`.
 

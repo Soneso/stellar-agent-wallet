@@ -877,7 +877,7 @@ async fn grant_present_issued_amount_with_xlm_unit_refuses_without_pending_entry
         &format!("TST:{DEST_G}"),
         "1 XLM",
         "validation.amount_malformed",
-        Some("validation.amount_malformed: amount '1 XLM' has unit 'XLM'; expected unit 'TST'"),
+        Some("validation.amount_malformed: the amount has the wrong unit; expected unit 'TST'"),
     )
     .await;
 }

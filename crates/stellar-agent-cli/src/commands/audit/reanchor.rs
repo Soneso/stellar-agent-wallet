@@ -529,12 +529,8 @@ fn reanchor_data(
 /// envelope model.
 fn load_profile(profile_name: &str) -> Result<Profile, WalletError> {
     load_profile_reconciled(&ResolvedProfileName::from_flag(profile_name)).map_err(|e| {
-        tracing::debug!(
-            profile = %profile_name,
-            error = %e,
-            "profile access refused for audit reanchor"
-        );
-        e.to_wallet_error(profile_name)
+        tracing::debug!(error = %e, "profile access refused for audit reanchor");
+        e.to_wallet_error()
     })
 }
 

@@ -182,8 +182,9 @@ fn write_profile(home: &Path, name: &str) {
     save_new_to_dir(name, &profile, &home.join("profiles")).expect("fixture profile must persist");
 }
 
-/// Asserts a run refused at profile resolution, naming `profile`.
-fn assert_refused_naming(run: &Run, verb: &str, profile: &str) {
+/// Asserts a run refused at profile resolution as an absent profile, without
+/// repeating the requested name `profile`.
+fn assert_refused_without_naming(run: &Run, verb: &str, profile: &str) {
     assert_eq!(
         run.code, 1,
         "`{verb}` must exit 1 for a named-but-missing profile; stdout={} stderr={}",
@@ -196,10 +197,17 @@ fn assert_refused_naming(run: &Run, verb: &str, profile: &str) {
         run.stdout
     );
     assert!(
-        run.message_field().contains(profile),
-        "`{verb}`: the refusal must name the profile the operator asked for \
-         ({profile}); message={}",
         run.message_field()
+            .contains("the requested profile was not found in the wallet configuration"),
+        "`{verb}`: the refusal must state that the requested profile is absent; message={}",
+        run.message_field()
+    );
+    assert!(
+        !run.stdout.contains(profile) && !run.stderr.contains(profile),
+        "`{verb}`: the refusal must not repeat the requested name ({profile}); \
+         stdout={} stderr={}",
+        run.stdout,
+        run.stderr
     );
 }
 
@@ -215,7 +223,7 @@ fn a_profile_named_by_the_flag_that_has_no_file_is_refused() {
         args.extend_from_slice(&["--profile", ABSENT_PROFILE]);
 
         let run = run_cli(home.path(), None, &args);
-        assert_refused_naming(&run, verb, ABSENT_PROFILE);
+        assert_refused_without_naming(&run, verb, ABSENT_PROFILE);
     }
 }
 
@@ -225,7 +233,7 @@ fn a_profile_named_by_the_environment_variable_that_has_no_file_is_refused() {
         let home = tempfile::tempdir().expect("temp home");
 
         let run = run_cli(home.path(), Some(ABSENT_PROFILE), argv);
-        assert_refused_naming(&run, verb, ABSENT_PROFILE);
+        assert_refused_without_naming(&run, verb, ABSENT_PROFILE);
     }
 }
 
@@ -242,7 +250,7 @@ fn an_explicitly_named_default_with_no_file_is_refused() {
         args.extend_from_slice(&["--profile", "default"]);
 
         let run = run_cli(home.path(), None, &args);
-        assert_refused_naming(&run, verb, "default");
+        assert_refused_without_naming(&run, verb, "default");
     }
 }
 
@@ -254,7 +262,7 @@ fn a_default_named_by_the_environment_variable_with_no_file_is_refused() {
         let home = tempfile::tempdir().expect("temp home");
 
         let run = run_cli(home.path(), Some("default"), argv);
-        assert_refused_naming(&run, verb, "default");
+        assert_refused_without_naming(&run, verb, "default");
     }
 }
 
@@ -310,7 +318,7 @@ fn a_stale_environment_variable_refuses_instead_of_synthesizing() {
         write_profile(home.path(), "i112-the-real-profile");
 
         let run = run_cli(home.path(), Some(ABSENT_PROFILE), argv);
-        assert_refused_naming(&run, verb, ABSENT_PROFILE);
+        assert_refused_without_naming(&run, verb, ABSENT_PROFILE);
         assert!(
             !run.stdout.contains("i112-the-real-profile"),
             "`{verb}` must not silently fall back to another profile in the home; \
@@ -343,7 +351,7 @@ fn the_flag_beats_the_variable_at_the_verbs_own_load() {
         args.extend_from_slice(&["--profile", ABSENT_PROFILE]);
 
         let run = run_cli(home.path(), Some("i112-present"), &args);
-        assert_refused_naming(&run, verb, ABSENT_PROFILE);
+        assert_refused_without_naming(&run, verb, ABSENT_PROFILE);
         assert!(
             !run.message_field().contains("i112-present"),
             "`{verb}`: the variable's profile must not be the one loaded when the flag \

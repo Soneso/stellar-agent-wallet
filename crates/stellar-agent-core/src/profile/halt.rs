@@ -134,11 +134,10 @@ impl HaltMarker {
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum HaltError {
-    /// The profile name is not safe as a path component.
-    #[error("profile name `{name}` {reason}")]
+    /// The profile name is not safe as a path component. The refused name is
+    /// not shown.
+    #[error("the profile name is not a valid profile name: {reason}")]
     InvalidName {
-        /// The refused name.
-        name: String,
         /// Why the name was refused.
         reason: &'static str,
     },
@@ -165,7 +164,8 @@ pub enum HaltError {
     Malformed {
         /// The marker path.
         path: PathBuf,
-        /// The parse or validation failure.
+        /// The position of a parse failure or the rule a field breaks; the
+        /// marker content is not shown.
         detail: String,
     },
     /// `halted_at` is not an RFC 3339 UTC timestamp with second precision
@@ -215,10 +215,7 @@ pub fn validate_halt_reason(reason: &str) -> Result<(), HaltError> {
 ///
 /// [`HaltError::InvalidName`] when `name` is not safe as a path component.
 pub fn halt_path(data_root: &Path, name: &str) -> Result<PathBuf, HaltError> {
-    validate_path_component_ascii_safe(name).map_err(|reason| HaltError::InvalidName {
-        name: name.to_owned(),
-        reason,
-    })?;
+    validate_path_component_ascii_safe(name).map_err(|reason| HaltError::InvalidName { reason })?;
     Ok(data_root
         .join("profiles")
         .join(format!("{name}.{HALT_EXTENSION}")))
@@ -259,7 +256,10 @@ pub fn read_halt(data_root: &Path, name: &str) -> Result<Option<HaltMarker>, Hal
     })?;
     let marker: HaltMarker = toml::from_str(&text).map_err(|error| HaltError::Malformed {
         path: path.clone(),
-        detail: error.message().to_owned(),
+        detail: super::toml_diagnostic::toml_error_position(
+            &text,
+            error.span().map(|span| span.start),
+        ),
     })?;
     marker.validate().map_err(|error| HaltError::Malformed {
         path,
@@ -584,6 +584,51 @@ mod tests {
             read_halt(root.path(), "alice").unwrap_err(),
             HaltError::TooLarge { .. }
         ));
+    }
+
+    /// A marker whose content holds a credential, as a key or in an
+    /// unterminated value, is refused by position; the refusal and the
+    /// unreadable halt state never repeat the content.
+    #[test]
+    fn a_malformed_marker_is_reported_by_position_only() {
+        use stellar_agent_test_support::rejected_value::{CREDENTIAL_MARKER, assert_no_marker};
+        let root = tempfile::tempdir().unwrap();
+        let path = halt_path(root.path(), "alice").unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        for (content, position) in [
+            (
+                format!("halted_at = \"2026-10-31T12:00:00Z\"\n{CREDENTIAL_MARKER} = 1\n"),
+                "line 2, column 1",
+            ),
+            (
+                format!("halted_at = \"{CREDENTIAL_MARKER}\n"),
+                "line 1, column 25",
+            ),
+        ] {
+            std::fs::write(&path, &content).unwrap();
+            let error = read_halt(root.path(), "alice").unwrap_err();
+            assert!(matches!(error, HaltError::Malformed { .. }), "{error:?}");
+            assert!(error.to_string().contains(position), "{error}");
+            assert_no_marker(&error, CREDENTIAL_MARKER);
+            let state = format!("{:?}", halt_state_in(root.path(), "alice"));
+            assert!(!state.contains(CREDENTIAL_MARKER), "{state}");
+        }
+    }
+
+    /// A refused profile name is named by the rule it breaks, never repeated.
+    #[test]
+    fn an_invalid_name_is_not_echoed() {
+        use stellar_agent_test_support::rejected_value::{assert_no_marker, seed_marker};
+        let root = tempfile::tempdir().unwrap();
+        let seed = seed_marker();
+        let error = halt_path(root.path(), &format!("{seed}/x")).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .starts_with("the profile name is not a valid profile name: "),
+            "{error}"
+        );
+        assert_no_marker(&error, &seed);
     }
 
     #[test]

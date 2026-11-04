@@ -378,9 +378,7 @@ pub fn resolve_action(
             return Ok((tool, *cap));
         }
     }
-    Err(crate::ToolsetRuntimeError::UnknownToolsetAction {
-        action: stellar_agent_toolsets::sanitise_display(action, 128),
-    })
+    Err(crate::ToolsetRuntimeError::UnknownToolsetAction)
 }
 
 // ── Unit tests (no inventory dependency needed here) ─────────────────────────

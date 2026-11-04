@@ -72,15 +72,15 @@ use crate::{asset_id::CanonicalAsset, cross_check::CrossCheckThresholds};
 
 /// A safe reference to the part of `[cross_check_thresholds]` a refusal
 /// names, without any rejected input.
+///
+/// An entry is named by its position, never by its key: a key the loader
+/// refuses, and a key whose entry the loader refuses, are both refused input.
 #[derive(Debug, Clone)]
 pub enum Entry {
     /// The field itself, when its value is not a table.
     Field,
-    /// One-based position in lexicographic key order, for a key that did not
-    /// parse.
+    /// One-based position in lexicographic key order.
     Position(usize),
-    /// The canonical identity of a key that parsed.
-    Asset(CanonicalAsset),
 }
 
 impl std::fmt::Display for Entry {
@@ -88,7 +88,6 @@ impl std::fmt::Display for Entry {
         match self {
             Self::Field => f.write_str("the field"),
             Self::Position(n) => write!(f, "entry {n} in key order"),
-            Self::Asset(asset) => write!(f, "entry '{asset}'"),
         }
     }
 }
@@ -337,14 +336,10 @@ pub enum ProfileLoadError {
         named_by: crate::profile::ProfileNameSource,
     },
 
-    /// The profile file was not found at the expected path.
-    #[error("profile '{name}' not found at '{path}'")]
-    NotFound {
-        /// The profile name as supplied by the caller.
-        name: String,
-        /// The full path that was checked.
-        path: PathBuf,
-    },
+    /// No profile file exists for the requested name. Neither the name nor
+    /// the path, which ends in the name, is kept.
+    #[error("the requested profile was not found in the wallet configuration")]
+    NotFound,
 
     /// The profile name is not safe to use as a filesystem path component.
     ///
@@ -358,10 +353,8 @@ pub enum ProfileLoadError {
     ///
     /// Use a profile name of at most 64 printable-ASCII characters containing
     /// no `/`, `\`, `:`, or `..`.
-    #[error("profile name '{name}' is not a valid profile name: {reason}")]
+    #[error("the profile name is not a valid profile name: {reason}")]
     InvalidName {
-        /// The rejected profile name as supplied by the caller.
-        name: String,
         /// Why it was rejected.
         reason: &'static str,
     },
@@ -374,15 +367,12 @@ pub enum ProfileLoadError {
     ///
     /// Fail-fast forward-compatibility: a profile written by a newer wallet is
     /// rejected rather than silently applying stale defaults.
+    /// The version found in the file is not shown.
     #[error(
-        "profile '{name}' has unsupported version {found}; \
+        "the profile file has an unsupported version; \
          this wallet supports version {supported}"
     )]
     VersionUnsupported {
-        /// The profile name as supplied by the caller.
-        name: String,
-        /// The `version` value found in the TOML file.
-        found: u32,
         /// The highest version this wallet supports.
         supported: u32,
     },
@@ -461,14 +451,27 @@ pub enum ProfileLoadError {
         detail: String,
     },
 
-    /// figment failed to extract or merge the configuration sources.
-    #[error("profile '{name}' could not be loaded: {source}")]
-    Figment {
-        /// The profile name as supplied by the caller.
-        name: String,
-        /// The underlying figment error (boxed to keep the enum variant small).
-        #[source]
-        source: Box<figment::Error>,
+    /// The profile file contains invalid TOML syntax.
+    #[error("the profile file is not valid TOML: {position}")]
+    TomlSyntax {
+        /// The line and column, without source text.
+        position: String,
+    },
+
+    /// The profile document does not match the schema.
+    ///
+    /// Schema field names may appear; values never appear. Operator key
+    /// segments outside the safe identifier grammar appear as `<key>`.
+    #[error("the profile document is not valid: {class}{}{}",
+        key.as_ref().map(|key| format!(" at `{key}`")).unwrap_or_default(),
+        if *count > 1 { format!(" (and {} more)", count - 1) } else { String::new() })]
+    Extraction {
+        /// A fixed description of the validation class.
+        class: &'static str,
+        /// The sanitized schema key path, if the error identifies one.
+        key: Option<String>,
+        /// The number of extraction errors.
+        count: usize,
     },
 
     /// The `smart_account_max_context_rule_scan_id` field exceeds the
@@ -483,14 +486,10 @@ pub enum ProfileLoadError {
     /// Lower `smart_account_max_context_rule_scan_id` in the profile TOML to a
     /// value ≤ 10,000.
     #[error(
-        "profile '{name}': smart_account_max_context_rule_scan_id value {value} \
-         exceeds upper bound {upper_bound} (DoS-defence cap)"
+        "smart_account_max_context_rule_scan_id exceeds upper bound {upper_bound} \
+         (DoS-defence cap)"
     )]
     InvalidScanIdBound {
-        /// The profile name as supplied by the caller.
-        name: String,
-        /// The value that was rejected.
-        value: u32,
         /// The safety cap (`UPPER_BOUND_MAX_SCAN_ID`).
         upper_bound: u32,
     },
@@ -508,14 +507,10 @@ pub enum ProfileLoadError {
     /// Lower `session_rule_max_horizon_ledgers` in the profile TOML to a
     /// value ≤ 10,000, or remove the field to use the 1000-ledger default.
     #[error(
-        "profile '{name}': session_rule_max_horizon_ledgers value {value} \
-         exceeds upper bound {upper_bound} (DoS-defence cap)"
+        "session_rule_max_horizon_ledgers exceeds upper bound {upper_bound} \
+         (DoS-defence cap)"
     )]
     InvalidHorizonBound {
-        /// The profile name as supplied by the caller.
-        name: String,
-        /// The value that was rejected.
-        value: u32,
         /// The safety cap (`UPPER_BOUND_HORIZON_LEDGERS`).
         upper_bound: u32,
     },
@@ -590,7 +585,7 @@ impl ProfileLoadError {
     /// Maps a loader refusal to its operator-facing validation error.
     /// Absolute paths are redacted once in the generic configuration message.
     #[must_use]
-    pub fn to_validation_error(&self, requested_name: &str) -> crate::error::ValidationError {
+    pub fn to_validation_error(&self) -> crate::error::ValidationError {
         use crate::error::ValidationError;
         match self {
             Self::NonOverlayableField { field } => {
@@ -605,10 +600,8 @@ impl ProfileLoadError {
                     named_by: *named_by,
                 }
             }
-            Self::NotFound { name, .. } => ValidationError::ProfileNotFound { name: name.clone() },
-            Self::MainnetRpcUrlRequired { name } => {
-                ValidationError::MainnetRpcUrlRequired { name: name.clone() }
-            }
+            Self::NotFound => ValidationError::ProfileNotFound,
+            Self::MainnetRpcUrlRequired { .. } => ValidationError::MainnetRpcUrlRequired,
             Self::InvalidProviderAttestation { name, source } => {
                 ValidationError::ProviderAttestationInvalid {
                     name: name.clone(),
@@ -618,7 +611,7 @@ impl ProfileLoadError {
             _ => ValidationError::ConfigInvalid {
                 component: "profile",
                 reason: crate::observability::redact_path_in_message(&format!(
-                    "profile '{requested_name}' failed to load: {self}"
+                    "the requested profile failed to load: {self}"
                 )),
             },
         }
@@ -638,7 +631,7 @@ impl ProfileLoadError {
     #[must_use]
     pub fn disposition(&self) -> ProfileLoadDisposition {
         match self {
-            Self::NotFound { .. } => ProfileLoadDisposition::NotFound,
+            Self::NotFound => ProfileLoadDisposition::NotFound,
             // Operator-authored input: the name, the file's syntax, its
             // version, or a field whose value is out of bounds.
             Self::NonOverlayableField { .. }
@@ -653,7 +646,8 @@ impl ProfileLoadError {
             | Self::MissingPolicySection { .. }
             | Self::SignerRefUnreadable { .. }
             | Self::MainnetViewUnreadable { .. }
-            | Self::Figment { .. }
+            | Self::Extraction { .. }
+            | Self::TomlSyntax { .. }
             | Self::InvalidScanIdBound { .. }
             | Self::InvalidHorizonBound { .. }
             | Self::InvalidServedPageDisplayName { .. }
@@ -678,18 +672,14 @@ impl ProfileLoadError {
 /// the rule hold for all of them: a caller that forgets to validate still
 /// cannot reach outside the profile directory.
 pub(crate) fn guard_name_for_load(name: &str) -> Result<(), ProfileLoadError> {
-    validate_path_component_ascii_safe(name).map_err(|reason| ProfileLoadError::InvalidName {
-        name: name.to_owned(),
-        reason,
-    })
+    validate_path_component_ascii_safe(name)
+        .map_err(|reason| ProfileLoadError::InvalidName { reason })
 }
 
 /// Write-half counterpart of [`guard_name_for_load`].
 fn guard_name_for_save(name: &str) -> Result<(), ProfileSaveError> {
-    validate_path_component_ascii_safe(name).map_err(|reason| ProfileSaveError::InvalidName {
-        name: name.to_owned(),
-        reason,
-    })
+    validate_path_component_ascii_safe(name)
+        .map_err(|reason| ProfileSaveError::InvalidName { reason })
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -773,10 +763,7 @@ fn stored_profile_path(name: &str, profile_dir: &Path) -> Result<PathBuf, Profil
     guard_name_for_load(name)?;
     let path = profile_dir.join(format!("{name}.toml"));
     if !path.exists() {
-        return Err(ProfileLoadError::NotFound {
-            name: name.to_owned(),
-            path,
-        });
+        return Err(ProfileLoadError::NotFound);
     }
     Ok(path)
 }
@@ -823,6 +810,76 @@ pub fn load_from_path(
     load_from_path_with_overlays(name, path, Env::prefixed(ENV_PREFIX), multicall_hook)
 }
 
+/// Converts extraction errors to classes and sanitized schema paths.
+/// Schema field names may appear; rejected values never appear.
+///
+/// A `figment::Error` is its own first error, so the head of the chain is the
+/// first error and [`figment::Error::count`] counts the whole chain. A missing
+/// field is named by its full key path: the path of the table it belongs to
+/// followed by the field.
+pub(crate) fn extraction_error(e: figment::Error) -> ProfileLoadError {
+    use figment::error::Kind;
+    let count = e.count();
+    let (class, path) = match e.kind {
+        Kind::MissingField(field) => {
+            let mut path = e.path;
+            path.push(field.into_owned());
+            ("a required field is missing", path)
+        }
+        Kind::InvalidType(..) => ("a value has the wrong type", e.path),
+        Kind::InvalidValue(..) => ("a value is out of range", e.path),
+        Kind::InvalidLength(..) => ("a value has the wrong length", e.path),
+        Kind::UnknownField(..) => {
+            let mut parent = e.path;
+            parent.pop();
+            ("an unknown field", parent)
+        }
+        _ => ("the profile document does not match the schema", Vec::new()),
+    };
+    let key = (!path.is_empty()).then(|| {
+        path.iter()
+            .map(|segment| {
+                let bytes = segment.as_bytes();
+                if (1..=64).contains(&bytes.len())
+                    && bytes[0].is_ascii_lowercase()
+                    && bytes
+                        .iter()
+                        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'_')
+                {
+                    segment.as_str()
+                } else {
+                    "<key>"
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(".")
+    });
+    ProfileLoadError::Extraction { class, key, count }
+}
+
+/// Reads one profile document and checks syntax without retaining parser errors.
+/// Missing files provide an empty document, as the file provider specifies.
+pub(crate) fn read_profile_toml(path: &Path) -> Result<String, ProfileLoadError> {
+    use figment::Provider;
+    let metadata = Toml::file(path).metadata();
+    let Some(path) = metadata
+        .source
+        .as_ref()
+        .and_then(figment::Source::file_path)
+    else {
+        return Ok(String::new());
+    };
+    let body = std::fs::read_to_string(path).map_err(|_| ProfileLoadError::Extraction {
+        class: "the profile file cannot be read",
+        key: None,
+        count: 1,
+    })?;
+    toml::from_str::<toml::Value>(&body).map_err(|e| ProfileLoadError::TomlSyntax {
+        position: super::toml_diagnostic::toml_error_position(&body, e.span().map(|s| s.start)),
+    })?;
+    Ok(body)
+}
+
 /// Reads identity from the file before applying permitted overlays.
 /// The file is the operator's audited record. An overlay key is checked
 /// against `chain_id` first and then against [`OVERLAY_CLASSES`], after the
@@ -838,34 +895,24 @@ fn load_from_path_with_overlays(
     // figment error when the version is wrong.  figment does not allow us to
     // partially extract a single field without running the full extraction, so
     // we use a serde-based pre-check via a lightweight wrapper.
+    let body = read_profile_toml(path)?;
     let raw: RawVersion = Figment::new()
-        .merge(Toml::file(path))
+        .merge(Toml::string(&body))
         .extract()
-        .map_err(|e| ProfileLoadError::Figment {
-            name: name.to_owned(),
-            source: Box::new(e),
-        })?;
+        .map_err(extraction_error)?;
 
     if raw.version != SUPPORTED_VERSION {
         return Err(ProfileLoadError::VersionUnsupported {
-            name: name.to_owned(),
-            found: raw.version,
             supported: SUPPORTED_VERSION,
         });
     }
 
     // ── Step 2: read the file identity, refuse non-overlayable keys, and extract the profile.
     let on_disk: OnDiskChainId = Figment::new()
-        .merge(Toml::file(path))
+        .merge(Toml::string(&body))
         .extract()
-        .map_err(|e| ProfileLoadError::Figment {
-            name: name.to_owned(),
-            source: Box::new(e),
-        })?;
-    let overlay_data = overlays.data().map_err(|e| ProfileLoadError::Figment {
-        name: name.to_owned(),
-        source: Box::new(e),
-    })?;
+        .map_err(extraction_error)?;
+    let overlay_data = overlays.data().map_err(extraction_error)?;
     check_overlay_keys(&overlay_data, on_disk.chain_id)?;
     let overlaid_fields = OVERLAY_CLASSES
         .iter()
@@ -877,13 +924,10 @@ fn load_from_path_with_overlays(
         })
         .collect();
     let partial: PartialProfile = Figment::new()
-        .merge(Toml::file(path))
+        .merge(Toml::string(&body))
         .merge(&overlays)
         .extract()
-        .map_err(|e| ProfileLoadError::Figment {
-            name: name.to_owned(),
-            source: Box::new(e),
-        })?;
+        .map_err(extraction_error)?;
     let policy = require_policy_section(partial.policy, path)?;
 
     // ── Step 3: resolve derived fields.  Only testnet has a default endpoint;
@@ -917,8 +961,6 @@ fn load_from_path_with_overlays(
         && scan_id > MIRRORED_UPPER_BOUND_MAX_SCAN_ID
     {
         return Err(ProfileLoadError::InvalidScanIdBound {
-            name: name.to_owned(),
-            value: scan_id,
             upper_bound: MIRRORED_UPPER_BOUND_MAX_SCAN_ID,
         });
     }
@@ -929,8 +971,6 @@ fn load_from_path_with_overlays(
         && horizon > MIRRORED_UPPER_BOUND_HORIZON_LEDGERS
     {
         return Err(ProfileLoadError::InvalidHorizonBound {
-            name: name.to_owned(),
-            value: horizon,
             upper_bound: MIRRORED_UPPER_BOUND_HORIZON_LEDGERS,
         });
     }
@@ -974,7 +1014,7 @@ fn load_from_path_with_overlays(
     // The provider credential rules compare against the wallet key references
     // of the merged profile and of the file alone, because a testnet overlay
     // can replace `mcp_signer_default`.
-    let file_key_refs = file_wallet_key_references(name, path)?;
+    let file_key_refs = wallet_key_references_from_toml(&body)?;
     let mut profile = Profile {
         overlaid_fields,
         version: partial.version,
@@ -1281,7 +1321,13 @@ pub fn set_pool_initialization(
     let dest = dir.join(format!("{name}.toml"));
     let raw = std::fs::read_to_string(&dest).map_err(ProfileSaveError::Io)?;
     let mut doc: toml::Value = toml::from_str(&raw).map_err(|e| {
-        ProfileSaveError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+        ProfileSaveError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "the profile file is not valid TOML: {}",
+                super::toml_diagnostic::toml_error_position(&raw, e.span().map(|s| s.start))
+            ),
+        ))
     })?;
     let table = doc.as_table_mut().ok_or_else(|| {
         ProfileSaveError::Io(std::io::Error::new(
@@ -1340,41 +1386,35 @@ pub fn read_signer_ref_on_disk(
     guard_name_for_load(name)?;
     let path = dir.join(format!("{name}.toml"));
     if !path.exists() {
-        return Err(ProfileLoadError::NotFound {
-            name: name.to_owned(),
-            path,
-        });
+        return Err(ProfileLoadError::NotFound);
     }
-    let raw =
-        std::fs::read_to_string(&path).map_err(|e| ProfileLoadError::SignerRefUnreadable {
-            detail: format!("failed to read '{}': {e}", path.display()),
-        })?;
-    let doc: toml::Value =
-        toml::from_str(&raw).map_err(|e| ProfileLoadError::SignerRefUnreadable {
-            detail: format!("failed to parse '{}': {e}", path.display()),
-        })?;
-    let table =
-        doc.get("mcp_signer_default")
-            .ok_or_else(|| ProfileLoadError::SignerRefUnreadable {
-                detail: format!("'{}' has no [mcp_signer_default] table", path.display()),
-            })?;
+    let failure = |detail: String| ProfileLoadError::SignerRefUnreadable { detail };
+    let raw = std::fs::read_to_string(&path)
+        .map_err(|e| failure(format!("failed to read the profile file: {e}")))?;
+    let doc: toml::Value = toml::from_str(&raw).map_err(|e| {
+        failure(format!(
+            "the profile file is not valid TOML: {}",
+            super::toml_diagnostic::toml_error_position(&raw, e.span().map(|s| s.start))
+        ))
+    })?;
+    let table = doc
+        .get("mcp_signer_default")
+        .ok_or_else(|| failure("the profile file has no [mcp_signer_default] table".to_owned()))?;
     let service = table
         .get("service")
         .and_then(toml::Value::as_str)
-        .ok_or_else(|| ProfileLoadError::SignerRefUnreadable {
-            detail: format!(
-                "'{}' [mcp_signer_default] has no string 'service' key",
-                path.display()
-            ),
+        .ok_or_else(|| {
+            failure(
+                "the profile file's [mcp_signer_default] has no string 'service' key".to_owned(),
+            )
         })?;
     let account = table
         .get("account")
         .and_then(toml::Value::as_str)
-        .ok_or_else(|| ProfileLoadError::SignerRefUnreadable {
-            detail: format!(
-                "'{}' [mcp_signer_default] has no string 'account' key",
-                path.display()
-            ),
+        .ok_or_else(|| {
+            failure(
+                "the profile file's [mcp_signer_default] has no string 'account' key".to_owned(),
+            )
         })?;
     Ok(super::schema::KeyringEntryRef::new(service, account))
 }
@@ -1403,27 +1443,25 @@ pub fn read_mainnet_view_on_disk(
     guard_name_for_load(name)?;
     let path = dir.join(format!("{name}.toml"));
     if !path.exists() {
-        return Err(ProfileLoadError::NotFound {
-            name: name.to_owned(),
-            path,
-        });
+        return Err(ProfileLoadError::NotFound);
     }
     let failure = |detail: String| ProfileLoadError::MainnetViewUnreadable { detail };
     let raw = std::fs::read_to_string(&path)
-        .map_err(|e| failure(format!("failed to read '{}': {e}", path.display())))?;
-    let doc: toml::Value = toml::from_str(&raw)
-        .map_err(|e| failure(format!("failed to parse '{}': {e}", path.display())))?;
-    let field = |key: &str| {
-        doc.get(key)
-            .and_then(toml::Value::as_str)
-            .ok_or_else(|| failure(format!("'{}' has no string '{key}' key", path.display())))
-    };
-    let chain_id = field("chain_id")?.parse().map_err(|e| {
+        .map_err(|e| failure(format!("failed to read the profile file: {e}")))?;
+    let doc: toml::Value = toml::from_str(&raw).map_err(|e| {
         failure(format!(
-            "'{}' has an invalid 'chain_id' ({e})",
-            path.display()
+            "the profile file is not valid TOML: {}",
+            super::toml_diagnostic::toml_error_position(&raw, e.span().map(|s| s.start))
         ))
     })?;
+    let field = |key: &'static str| {
+        doc.get(key)
+            .and_then(toml::Value::as_str)
+            .ok_or_else(|| failure(format!("the profile file has no string '{key}' key")))
+    };
+    let chain_id = field("chain_id")?
+        .parse()
+        .map_err(|_| failure("chain_id must be stellar:testnet or stellar:mainnet".to_owned()))?;
     let rpc_url = field("rpc_url")?.to_owned();
     Ok(OnDiskMainnetView { chain_id, rpc_url })
 }
@@ -1456,7 +1494,10 @@ pub fn pin_signer_account_on_disk(
     let mut doc: toml::Value = toml::from_str(&raw).map_err(|e| {
         ProfileSaveError::Io(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            format!("failed to parse '{}': {e}", dest.display()),
+            format!(
+                "the profile file is not valid TOML: {}",
+                super::toml_diagnostic::toml_error_position(&raw, e.span().map(|s| s.start))
+            ),
         ))
     })?;
     let table = doc
@@ -1465,7 +1506,7 @@ pub fn pin_signer_account_on_disk(
         .ok_or_else(|| {
             ProfileSaveError::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                format!("'{}' has no [mcp_signer_default] table", dest.display()),
+                "the profile file has no [mcp_signer_default] table",
             ))
         })?;
     table.insert(
@@ -1515,13 +1556,16 @@ pub fn set_pool_state_on_disk(
     let mut doc: toml::Value = toml::from_str(&raw).map_err(|e| {
         ProfileSaveError::Io(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            format!("failed to parse '{}': {e}", dest.display()),
+            format!(
+                "the profile file is not valid TOML: {}",
+                super::toml_diagnostic::toml_error_position(&raw, e.span().map(|s| s.start))
+            ),
         ))
     })?;
     let table = doc.as_table_mut().ok_or_else(|| {
         ProfileSaveError::Io(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            format!("'{}' is not a TOML table document", dest.display()),
+            "the profile file is not a TOML table document",
         ))
     })?;
     table.insert(
@@ -1603,17 +1647,19 @@ pub fn set_provider_credential_on_disk(
         ProfileSaveError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, detail))
     };
     let raw = std::fs::read_to_string(&dest).map_err(ProfileSaveError::Io)?;
-    let mut doc: toml_edit::DocumentMut = raw
-        .parse()
-        .map_err(|e| invalid(format!("failed to parse '{}': {e}", dest.display())))?;
+    let mut doc: toml_edit::DocumentMut = raw.parse::<toml_edit::DocumentMut>().map_err(|e| {
+        invalid(format!(
+            "the profile file is not valid TOML: {}",
+            super::toml_diagnostic::toml_error_position(&raw, e.span().map(|s| s.start))
+        ))
+    })?;
     let record = doc
         .get_mut("providers")
         .and_then(|providers| providers.get_mut(role.as_str()))
         .filter(|record| record.is_table_like())
         .ok_or_else(|| {
             invalid(format!(
-                "'{}' has no [{}] table",
-                dest.display(),
+                "the profile file has no [{}] table",
                 role.record_field()
             ))
         })?;
@@ -1622,8 +1668,7 @@ pub fn set_provider_credential_on_disk(
         .is_some_and(|table| table.contains_key("credential") || table.contains_key("placement"));
     if names_credential {
         return Err(invalid(format!(
-            "'{}' [{}] already names a credential or a placement",
-            dest.display(),
+            "the profile file's [{}] already names a credential or a placement",
             role.record_field()
         )));
     }
@@ -1734,11 +1779,9 @@ pub enum ProfileSaveError {
     /// ([`ProfileLoadError::InvalidName`]): a name is validated before it is
     /// joined into a destination path, so no file outside the profile
     /// directory can be created or patched.
-    #[error("profile name '{name}' is not a valid profile name: {reason}")]
+    #[error("the profile name is not a valid profile name: {reason}")]
     InvalidName {
-        /// The rejected profile name as supplied by the caller.
-        name: String,
-        /// Why it was rejected.
+        /// Why it was rejected. The rejected name is not kept.
         reason: &'static str,
     },
     /// The OS-conventional state directory could not be determined.
@@ -1812,10 +1855,7 @@ pub fn load_with_overlay_from_dir(
     let path = profile_dir.join(format!("{name}.toml"));
 
     if !path.exists() {
-        return Err(ProfileLoadError::NotFound {
-            name: name.to_owned(),
-            path,
-        });
+        return Err(ProfileLoadError::NotFound);
     }
 
     load_from_path_with_overlays(
@@ -1869,7 +1909,7 @@ pub fn load_default_or_testnet_fallback_from_dir(
     // pre-multicall startup convenience; no registry is available at this point.
     match load_from_dir("default", profile_dir, None) {
         Ok(profile) => Ok((profile, ProfileOrigin::Persisted)),
-        Err(ProfileLoadError::NotFound { .. }) => Ok((
+        Err(ProfileLoadError::NotFound) => Ok((
             synthesise_default_first_run_profile(),
             ProfileOrigin::Synthesized,
         )),
@@ -1958,17 +1998,16 @@ struct OnDiskChainId {
 /// Each field of [`WALLET_KEY_REFERENCE_FIELDS`] is decoded on its own and a
 /// malformed one is skipped, so this read never refuses a file the merged
 /// extraction accepts.
-fn file_wallet_key_references(
-    name: &str,
-    path: &Path,
-) -> Result<Vec<KeyringEntryRef>, ProfileLoadError> {
+fn file_wallet_key_references(path: &Path) -> Result<Vec<KeyringEntryRef>, ProfileLoadError> {
+    let body = read_profile_toml(path)?;
+    wallet_key_references_from_toml(&body)
+}
+
+fn wallet_key_references_from_toml(body: &str) -> Result<Vec<KeyringEntryRef>, ProfileLoadError> {
     let fields: serde_json::Map<String, serde_json::Value> = Figment::new()
-        .merge(Toml::file(path))
+        .merge(Toml::string(body))
         .extract()
-        .map_err(|e| ProfileLoadError::Figment {
-            name: name.to_owned(),
-            source: Box::new(e),
-        })?;
+        .map_err(extraction_error)?;
     Ok(WALLET_KEY_REFERENCE_FIELDS
         .iter()
         .filter_map(|field| fields.get(*field))
@@ -2026,7 +2065,9 @@ pub fn check_provider_credential_for_write(
 ///
 /// - [`ProfileLoadError::InvalidName`] when `name` is not safe as a path
 ///   component.
-/// - [`ProfileLoadError::Figment`] when the file cannot be read.
+/// - [`ProfileLoadError::TomlSyntax`] when the file is not valid TOML.
+/// - [`ProfileLoadError::Extraction`] when the file cannot be read or does not
+///   match the schema.
 /// - [`ProfileLoadError::InvalidProviderAttestation`] with the refused field,
 ///   including [`ProviderAttestationRejection::UrlRequired`] when the role has
 ///   no endpoint URL.
@@ -2039,7 +2080,7 @@ pub fn check_provider_credential_for_write_in_dir(
     placement: &RpcCredentialPlacement,
 ) -> Result<(), ProfileLoadError> {
     guard_name_for_load(name)?;
-    let file_refs = file_wallet_key_references(name, &dir.join(format!("{name}.toml")))?;
+    let file_refs = file_wallet_key_references(&dir.join(format!("{name}.toml")))?;
     let invalid = |source| ProfileLoadError::InvalidProviderAttestation {
         name: name.to_owned(),
         source,
@@ -2541,9 +2582,11 @@ fn parse_cross_check_thresholds(
         ));
     };
     let mut result = std::collections::BTreeMap::new();
-    for (position, (key, raw_value)) in entries.into_iter().enumerate() {
+    let mut positions = std::collections::BTreeMap::new();
+    for (index, (key, raw_value)) in entries.into_iter().enumerate() {
+        let position = index + 1;
         let asset = CanonicalAsset::parse_threshold_key(&key)
-            .map_err(|error| failure(Entry::Position(position + 1), error.to_string()))?;
+            .map_err(|error| failure(Entry::Position(position), error.to_string()))?;
         let value_text = match raw_value {
             Value::String(_, text) => Some(text),
             Value::Num(_, num) => num.to_u128_lossy().map(|n| n.to_string()),
@@ -2555,24 +2598,32 @@ fn parse_cross_check_thresholds(
             .and_then(|text| text.parse::<i128>().ok())
             .ok_or_else(|| {
                 failure(
-                    Entry::Asset(asset.clone()),
+                    Entry::Position(position),
                     "has a threshold that is not a non-negative integer".to_owned(),
                 )
             })?;
+        positions.entry(asset.clone()).or_insert(position);
         result.insert(asset, value);
     }
+    // Every conflicting identity has an entry in positions; the field-level fallback
+    // keeps the refusal free of the key.
+    let entry_of = |asset: &CanonicalAsset| {
+        positions
+            .get(asset)
+            .map_or(Entry::Field, |position| Entry::Position(*position))
+    };
     if let Some(conflict) =
         threshold_identity_conflict(&result.keys().cloned().collect::<Vec<_>>(), passphrase)
     {
         return Err(match conflict {
             ThresholdIdentityConflict::NativeContract { asset } => failure(
-                Entry::Asset(asset),
+                entry_of(&asset),
                 "names the native asset's contract; set cross_check_threshold_stroops instead"
                     .to_owned(),
             ),
             ThresholdIdentityConflict::SameAsset { asset, other } => failure(
-                Entry::Asset(asset),
-                format!("names the same asset as entry '{other}'"),
+                entry_of(&asset),
+                format!("names the same asset as {}", entry_of(&other)),
             ),
         });
     }
@@ -2649,6 +2700,9 @@ mod tests {
     use super::*;
     use crate::profile::schema::sentinel::{self, assert_no_sentinel};
     use crate::profile::schema::{EndpointUrlError, EndpointUrlRejection, MINIMUM_FLOOR};
+    use stellar_agent_test_support::rejected_value::{
+        CREDENTIAL_MARKER, assert_no_marker, seed_marker,
+    };
 
     #[test]
     fn thresholds_refuse_native_key() {
@@ -2723,7 +2777,7 @@ mod tests {
                     )
                 );
             }
-            let mapped = error.to_validation_error(&name);
+            let mapped = error.to_validation_error();
             assert_eq!(mapped.code(), "validation.config_invalid");
             let text = mapped.to_string();
             for forbidden in [
@@ -2779,20 +2833,24 @@ mod tests {
             ));
             assert!(error.to_string().contains("not a non-negative integer"));
         }
-        for (asset, reason) in [
-            (
-                CanonicalAsset::Native,
-                "names the native asset's contract; set cross_check_threshold_stroops instead"
-                    .to_owned(),
-            ),
-            (
-                classic.clone(),
-                format!("names the same asset as entry '{classic}'"),
-            ),
-        ] {
+        // Entries are named by their one-based position in key order, so the
+        // expected text is computed from the sorted keys.
+        let position_of = |key: &str, other: &str| if key < other { 1 } else { 2 };
+        for asset in [CanonicalAsset::Native, classic.clone()] {
             let sac = asset
                 .sac_contract_id(Caip2::Testnet.network_passphrase())
                 .unwrap();
+            let classic_text = classic.to_string();
+            let sac_position = position_of(&sac, &classic_text);
+            let reason = if asset == CanonicalAsset::Native {
+                "names the native asset's contract; set cross_check_threshold_stroops instead"
+                    .to_owned()
+            } else {
+                format!(
+                    "names the same asset as entry {} in key order",
+                    position_of(&classic_text, &sac)
+                )
+            };
             let input = format!(
                 "{}\n[cross_check_thresholds]\n\"{classic}\" = 1\n\
                 \"{sac}\" = 2",
@@ -2802,26 +2860,93 @@ mod tests {
             let error = load_from_dir(&name, dir.path(), None).unwrap_err();
             assert_eq!(
                 error.to_string(),
-                format!("profile '{name}': [cross_check_thresholds] entry '{sac}' {reason}")
+                format!(
+                    "profile '{name}': [cross_check_thresholds] entry {sac_position} in key \
+                     order {reason}"
+                )
             );
+            assert!(!error.to_string().contains(&sac), "{error}");
+            assert!(!error.to_string().contains(&classic_text), "{error}");
+        }
+    }
+
+    /// A threshold entry whose key parses is still refused by its position:
+    /// neither a refused value nor an identity conflict names the key.
+    #[test]
+    fn cross_check_threshold_marker_is_not_echoed() {
+        let issuer = stellar_strkey::ed25519::PublicKey([7; 32]).to_string();
+        let classic = CanonicalAsset::classic(CREDENTIAL_MARKER, &issuer).unwrap();
+        let sac = classic
+            .sac_contract_id(Caip2::Testnet.network_passphrase())
+            .unwrap();
+        let (sac_position, classic_position) = if sac < classic.to_string() {
+            (1, 2)
+        } else {
+            (2, 1)
+        };
+        let cases = [
+            (
+                format!("\"{classic}\" = true"),
+                "entry 1 in key order has a threshold that is not a non-negative integer"
+                    .to_owned(),
+            ),
+            (
+                format!("\"{classic}\" = 1\n\"{sac}\" = 2"),
+                format!(
+                    "entry {sac_position} in key order names the same asset as entry \
+                     {classic_position} in key order"
+                ),
+            ),
+        ];
+        for (table, expected) in cases {
+            let input = format!("{}\n[cross_check_thresholds]\n{table}", minimal_toml());
+            let (dir, name) = write_profile(&input);
+            let error = load_from_dir(&name, dir.path(), None).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                format!("profile '{name}': [cross_check_thresholds] {expected}")
+            );
+            assert_no_marker(&error, CREDENTIAL_MARKER);
+            assert_no_marker(&error, &sac);
         }
     }
 
     /// The on-disk chain and endpoint reader reports its own error kind,
-    /// naming the file and the missing field.
+    /// naming the missing field and not the file path, which embeds the name.
     #[test]
-    fn mainnet_view_failure_names_the_file_and_field() {
+    fn mainnet_view_failure_names_the_field() {
         let (dir, name) = write_profile("chain_id = \"stellar:testnet\"\n");
-        let path = dir.path().join(format!("{name}.toml"));
         let error = read_mainnet_view_on_disk(&name, dir.path()).unwrap_err();
         assert!(
             matches!(
                 &error,
                 ProfileLoadError::MainnetViewUnreadable { detail }
-                    if *detail == format!("'{}' has no string 'rpc_url' key", path.display())
+                    if detail == "the profile file has no string 'rpc_url' key"
             ),
             "{error:?}"
         );
+    }
+
+    /// A stored `chain_id` the reader refuses is named by the accepted values;
+    /// the stored text is absent from the error, its Debug and the wallet
+    /// error it converts to.
+    #[test]
+    fn mainnet_view_refuses_an_unknown_chain_without_echoing_it() {
+        let (dir, name) = write_profile(&format!(
+            "chain_id = \"{CREDENTIAL_MARKER}\"\nrpc_url = \"https://rpc.example\"\n"
+        ));
+        let error = read_mainnet_view_on_disk(&name, dir.path()).unwrap_err();
+        assert!(
+            matches!(
+                &error,
+                ProfileLoadError::MainnetViewUnreadable { detail }
+                    if detail == "chain_id must be stellar:testnet or stellar:mainnet"
+            ),
+            "{error:?}"
+        );
+        assert_no_marker(&error, CREDENTIAL_MARKER);
+        let converted = crate::error::WalletError::Validation(error.to_validation_error());
+        assert_no_marker(&converted, CREDENTIAL_MARKER);
     }
 
     /// One constructed value per [`ProfileLoadError`] variant.
@@ -2852,12 +2977,8 @@ mod tests {
                 name: "p".to_owned(),
                 named_by: crate::profile::ProfileNameSource::Env,
             },
-            ProfileLoadError::NotFound {
-                name: "p".to_owned(),
-                path: PathBuf::from("/tmp/p.toml"),
-            },
+            ProfileLoadError::NotFound,
             ProfileLoadError::InvalidName {
-                name: "..".to_owned(),
                 reason: "must not contain '..'",
             },
             ProfileLoadError::NoStateDir(crate::profile::schema::StateDirError),
@@ -2873,15 +2994,15 @@ mod tests {
                     ),
                 },
             },
-            ProfileLoadError::Figment {
-                name: "p".to_owned(),
-                source: Box::new(figment::Error::from("bad toml".to_owned())),
+            ProfileLoadError::Extraction {
+                class: "the profile document does not match the schema",
+                key: None,
+                count: 1,
             },
-            ProfileLoadError::VersionUnsupported {
-                name: "p".to_owned(),
-                found: 99,
-                supported: 2,
+            ProfileLoadError::TomlSyntax {
+                position: "line 1, column 1".into(),
             },
+            ProfileLoadError::VersionUnsupported { supported: 2 },
             ProfileLoadError::MissingPolicySection {
                 path: PathBuf::from("/tmp/p.toml"),
             },
@@ -2891,16 +3012,8 @@ mod tests {
             ProfileLoadError::MainnetViewUnreadable {
                 detail: "missing chain_id".to_owned(),
             },
-            ProfileLoadError::InvalidScanIdBound {
-                name: "p".to_owned(),
-                value: 1,
-                upper_bound: 0,
-            },
-            ProfileLoadError::InvalidHorizonBound {
-                name: "p".to_owned(),
-                value: 1,
-                upper_bound: 0,
-            },
+            ProfileLoadError::InvalidScanIdBound { upper_bound: 0 },
+            ProfileLoadError::InvalidHorizonBound { upper_bound: 0 },
             ProfileLoadError::InvalidServedPageDisplayName {
                 name: "p".to_owned(),
                 chars: 200,
@@ -2941,7 +3054,7 @@ mod tests {
     fn only_a_missing_file_is_not_found() {
         for err in one_of_every_variant() {
             let expected = match err {
-                ProfileLoadError::NotFound { .. } => ProfileLoadDisposition::NotFound,
+                ProfileLoadError::NotFound => ProfileLoadDisposition::NotFound,
                 _ => ProfileLoadDisposition::OperatorCorrectable,
             };
             assert_eq!(err.disposition(), expected, "wrong disposition for {err:?}");
@@ -3642,7 +3755,7 @@ mod tests {
         assert!(
             matches!(
                 result,
-                Err(ProfileLoadError::VersionUnsupported { found: 99, .. })
+                Err(ProfileLoadError::VersionUnsupported { supported: 2 })
             ),
             "{result:?}"
         );
@@ -3651,14 +3764,14 @@ mod tests {
     #[test]
     fn validation_mapping_preserves_protected_codes_and_redacts_paths() {
         for err in one_of_every_variant() {
-            let validation = err.to_validation_error("p");
+            let validation = err.to_validation_error();
             let expected = match &err {
                 ProfileLoadError::NonOverlayableField { .. }
                 | ProfileLoadError::OverlayMayOnlyTighten { .. } => "profile.non_overlayable_field",
                 ProfileLoadError::MainnetRequiresExplicitProfile { .. } => {
                     "profile.mainnet_requires_explicit_profile"
                 }
-                ProfileLoadError::NotFound { .. } => "validation.profile_not_found",
+                ProfileLoadError::NotFound => "validation.profile_not_found",
                 ProfileLoadError::MainnetRpcUrlRequired { .. } => {
                     "validation.mainnet_rpc_url_required"
                 }
@@ -3673,7 +3786,7 @@ mod tests {
         let error = ProfileLoadError::MissingPolicySection {
             path: PathBuf::from(&home).join("mapping-sentinel.toml"),
         };
-        let message = error.to_validation_error("p").to_string();
+        let message = error.to_validation_error().to_string();
         assert!(message.contains("<HOME>"), "home prefix must be redacted");
         assert!(!message.contains(home.as_str()));
         assert!(message.contains("mapping-sentinel.toml"));
@@ -3843,7 +3956,7 @@ account = "default"
             "unexpected error: {err:?}"
         );
         assert_eq!(
-            err.to_validation_error(&name).code(),
+            err.to_validation_error().code(),
             "validation.mainnet_rpc_url_required"
         );
     }
@@ -3963,7 +4076,7 @@ account = "default"
             }
             assert_no_sentinel(&err.to_string());
             assert_no_sentinel(&format!("{err:?}"));
-            let validation = err.to_validation_error(&name);
+            let validation = err.to_validation_error();
             assert_eq!(validation.code(), "validation.config_invalid");
             let envelope = crate::envelope::Envelope::<()>::err(
                 &crate::error::WalletError::Validation(validation),
@@ -4148,7 +4261,7 @@ account = "a"
         let (dir, name) = write_profile(toml);
         let err = load_from_dir(&name, dir.path(), None).unwrap_err();
         assert!(
-            matches!(err, ProfileLoadError::VersionUnsupported { found: 9, .. }),
+            matches!(err, ProfileLoadError::VersionUnsupported { supported: 2 }),
             "unexpected error: {err}"
         );
     }
@@ -4158,7 +4271,7 @@ account = "a"
         let dir = tempfile::tempdir().unwrap();
         let err = load_from_dir("nonexistent", dir.path(), None).unwrap_err();
         assert!(
-            matches!(err, ProfileLoadError::NotFound { .. }),
+            matches!(err, ProfileLoadError::NotFound),
             "unexpected error: {err}"
         );
     }
@@ -4314,7 +4427,7 @@ account = "a"
         let (dir, name) = write_profile(toml);
         let err = load_from_dir(&name, dir.path(), None).unwrap_err();
         assert!(
-            matches!(err, ProfileLoadError::VersionUnsupported { found: 1, .. }),
+            matches!(err, ProfileLoadError::VersionUnsupported { supported: 2 }),
             "expected VersionUnsupported for v1 profile, got {err}"
         );
     }
@@ -4587,17 +4700,15 @@ engine = "v1"
             matches!(
                 err,
                 ProfileLoadError::InvalidScanIdBound {
-                    value: 10_001,
                     upper_bound: 10_000,
-                    ..
                 }
             ),
-            "expected InvalidScanIdBound(10001), got: {err}"
+            "expected InvalidScanIdBound with the cap 10000, got: {err}"
         );
         let msg = err.to_string();
         assert!(
-            msg.contains("10001"),
-            "error message must include the rejected value; got: {msg}"
+            !msg.contains("10001"),
+            "error message must not repeat the rejected value; got: {msg}"
         );
         assert!(
             msg.contains("10000"),
@@ -4642,12 +4753,15 @@ engine = "v1"
             matches!(
                 err,
                 ProfileLoadError::InvalidHorizonBound {
-                    value: 10_001,
                     upper_bound: 10_000,
-                    ..
                 }
             ),
-            "expected InvalidHorizonBound(10001), got: {err}"
+            "expected InvalidHorizonBound with the cap 10000, got: {err}"
+        );
+        let msg = err.to_string();
+        assert!(
+            !msg.contains("10001"),
+            "error message must not repeat the rejected value; got: {msg}"
         );
     }
 
@@ -5044,7 +5158,7 @@ engine = "v1"
         let overlay: HashMap<&'static str, serde_json::Value> = HashMap::new();
         let err = load_with_overlay_from_dir("ghost", dir.path(), overlay, None).unwrap_err();
         assert!(
-            matches!(err, ProfileLoadError::NotFound { .. }),
+            matches!(err, ProfileLoadError::NotFound),
             "expected NotFound, got: {err}"
         );
     }
@@ -5069,7 +5183,7 @@ account = "a"
         let overlay: HashMap<&'static str, serde_json::Value> = HashMap::new();
         let err = load_with_overlay_from_dir(&name, dir.path(), overlay, None).unwrap_err();
         assert!(
-            matches!(err, ProfileLoadError::VersionUnsupported { found: 9, .. }),
+            matches!(err, ProfileLoadError::VersionUnsupported { supported: 2 }),
             "expected VersionUnsupported, got: {err}"
         );
     }
@@ -5249,7 +5363,7 @@ account = "a"
         let dir = tempfile::tempdir().unwrap();
         let result = read_signer_ref_on_disk("absent", dir.path());
         assert!(
-            matches!(result, Err(ProfileLoadError::NotFound { .. })),
+            matches!(result, Err(ProfileLoadError::NotFound)),
             "missing profile must be NotFound; got: {result:?}"
         );
     }
@@ -5427,15 +5541,8 @@ account = "a"
         let (dir3, name3) = write_profile(&v3_toml);
         let err = load_from_dir(&name3, dir3.path(), None).unwrap_err();
         assert!(
-            matches!(
-                err,
-                ProfileLoadError::VersionUnsupported {
-                    found: 3,
-                    supported: 2,
-                    ..
-                }
-            ),
-            "expected VersionUnsupported found=3 supported=2, got: {err}"
+            matches!(err, ProfileLoadError::VersionUnsupported { supported: 2 }),
+            "expected VersionUnsupported supported=2, got: {err}"
         );
     }
 
@@ -5451,9 +5558,13 @@ account = "a"
     fn load_from_dir_refuses_a_traversal_name_before_touching_the_filesystem() {
         let dir = tempfile::tempdir().unwrap();
         let err = load_from_dir("../foo", dir.path(), None).unwrap_err();
+        assert_no_marker(&err, "../foo");
+        assert!(
+            err.to_string()
+                .starts_with("the profile name is not a valid profile name:")
+        );
         match err {
-            ProfileLoadError::InvalidName { name, reason } => {
-                assert_eq!(name, "../foo");
+            ProfileLoadError::InvalidName { reason } => {
                 assert!(!reason.is_empty(), "the refusal must carry a reason");
             }
             other => panic!("expected InvalidName, got: {other}"),
@@ -5627,7 +5738,7 @@ account = "a"
             err.disposition(),
             ProfileLoadDisposition::OperatorCorrectable
         );
-        let validation = err.to_validation_error("fixture");
+        let validation = err.to_validation_error();
         assert_eq!(validation.code(), "validation.provider_attestation_invalid");
         assert!(validation.to_string().contains(field));
         assert!(validation.to_string().contains("profile file"));
@@ -6129,7 +6240,7 @@ account = "a"
                 name: "fixture".into(),
                 source: source.clone(),
             };
-            let validation = error.to_validation_error("fixture");
+            let validation = error.to_validation_error();
             assert_eq!(validation.code(), "validation.provider_attestation_invalid");
             assert_eq!(validation.to_string(), error.to_string());
             assert!(
@@ -7997,5 +8108,303 @@ account = "a"
         std::fs::write(dir.path().join("message.toml"), forged).unwrap();
         let loaded = load_from_dir_without_overlays("message", dir.path(), None).unwrap();
         assert!(!loaded.is_overlaid("mcp_signer_default"));
+    }
+
+    const MALFORMED_PROFILE: &str = "version = 2\nchain_id = \"stellar:testnet\"\n\nrpc_url = \"https://user:CREDMARKER7@rpc.example";
+
+    #[test]
+    fn an_invalid_profile_name_is_not_echoed() {
+        let marker = seed_marker();
+        let dir = tempfile::tempdir().unwrap();
+        let err = load_from_dir(&format!("{marker}/"), dir.path(), None).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("the profile name is not a valid profile name")
+        );
+        assert_no_marker(&err, &marker);
+    }
+
+    /// A save under a refused name states the rule with the load half's
+    /// message and never the name.
+    #[test]
+    fn a_refused_save_name_is_not_echoed() {
+        let marker = seed_marker();
+        let dir = tempfile::tempdir().unwrap();
+        let profile = Profile::builder_testnet("s", "a", "n", "a").build();
+        let err = save_to_dir(&format!("{marker}/x"), &profile, dir.path()).unwrap_err();
+        assert!(
+            matches!(err, ProfileSaveError::InvalidName { .. }),
+            "{err:?}"
+        );
+        assert!(
+            err.to_string()
+                .starts_with("the profile name is not a valid profile name: "),
+            "{err}"
+        );
+        assert_no_marker(&err, &marker);
+    }
+
+    /// An absent profile is reported without the requested name or the path
+    /// that embeds it, before any conversion to a wallet error.
+    #[test]
+    fn an_absent_profile_names_neither_the_name_nor_the_path() {
+        let marker = seed_marker();
+        let dir = tempfile::tempdir().unwrap();
+        let err = load_from_dir(&marker, dir.path(), None).unwrap_err();
+        assert!(matches!(err, ProfileLoadError::NotFound), "{err:?}");
+        assert_eq!(
+            err.to_string(),
+            "the requested profile was not found in the wallet configuration"
+        );
+        assert_no_marker(&err, &marker);
+        assert_no_marker(&err, &dir.path().display().to_string());
+    }
+
+    /// The version and bound refusals state the supported version or the cap,
+    /// never the profile name or the stored value.
+    #[test]
+    fn version_and_bound_refusals_name_no_profile_or_value() {
+        let marker = seed_marker();
+        let dir = tempfile::tempdir().unwrap();
+        for (body, expected) in [
+            (
+                "version = 31337\n".to_owned(),
+                "the profile file has an unsupported version; this wallet supports version 2",
+            ),
+            (
+                minimal_toml_with_extra("smart_account_max_context_rule_scan_id = 31337"),
+                "",
+            ),
+            (
+                minimal_toml_with_extra("session_rule_max_horizon_ledgers = 31337"),
+                "",
+            ),
+        ] {
+            std::fs::write(dir.path().join(format!("{marker}.toml")), &body).unwrap();
+            let err = load_from_dir(&marker, dir.path(), None).unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    ProfileLoadError::VersionUnsupported { .. }
+                        | ProfileLoadError::InvalidScanIdBound { .. }
+                        | ProfileLoadError::InvalidHorizonBound { .. }
+                ),
+                "{err:?}"
+            );
+            if !expected.is_empty() {
+                assert_eq!(err.to_string(), expected);
+            }
+            assert_no_marker(&err, &marker);
+            assert_no_marker(&err, "31337");
+        }
+    }
+
+    #[test]
+    fn a_syntax_error_reports_line_and_column_only() {
+        let (dir, name) = write_profile(MALFORMED_PROFILE);
+        let err = load_from_dir(&name, dir.path(), None).unwrap_err();
+        assert_no_marker(&err, "CREDMARKER7");
+        assert!(err.to_string().contains("line 4, column"));
+        assert!(std::error::Error::source(&err).is_none());
+    }
+
+    #[test]
+    fn a_type_error_names_the_key_not_the_value() {
+        let (dir, name) = write_profile(&format!(
+            "{}\n[wallet]\nunlock_ttl_seconds = \"CREDMARKER7\"\n",
+            minimal_toml()
+        ));
+        let err = load_from_dir(&name, dir.path(), None).unwrap_err();
+        assert_no_marker(&err, "CREDMARKER7");
+        assert!(
+            err.to_string()
+                .contains("a value has the wrong type at `wallet.unlock_ttl_seconds`"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn an_unknown_field_names_only_its_parent() {
+        let (dir, name) = write_profile(&format!(
+            "{}\n[providers.oracle]\nCREDMARKER7 = 1\n",
+            minimal_toml()
+        ));
+        let err = load_from_dir(&name, dir.path(), None).unwrap_err();
+        assert_no_marker(&err, "CREDMARKER7");
+        assert!(err.to_string().contains("providers.oracle"));
+        #[derive(serde::Deserialize, Debug)]
+        struct ProviderDocument {
+            #[serde(rename = "providers")]
+            _providers: std::collections::BTreeMap<String, super::super::schema::ProviderRecord>,
+        }
+        let raw = Figment::new()
+            .merge(Toml::string("[providers.oracle]\nCREDMARKER7 = 1\n"))
+            .extract::<ProviderDocument>()
+            .unwrap_err();
+        let err = extraction_error(raw);
+        assert_no_marker(&err, "CREDMARKER7");
+        assert!(
+            err.to_string()
+                .contains("an unknown field at `providers.oracle`"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn the_direct_readers_report_position_only() {
+        let home = tempfile::tempdir().unwrap();
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
+        let dir = default_profile_dir().unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("position.toml"), MALFORMED_PROFILE).unwrap();
+        let err = read_signer_ref_on_disk("position", &dir).unwrap_err();
+        assert_no_marker(&err, "CREDMARKER7");
+        assert!(err.to_string().contains("line 4, column"));
+        let key = super::super::schema::KeyringEntryRef {
+            service: "test".into(),
+            account: "test".into(),
+        };
+        let err = set_pool_initialization("position", &key, None).unwrap_err();
+        assert_no_marker(&err, "CREDMARKER7");
+        assert!(err.to_string().contains("line 4, column"));
+    }
+
+    #[test]
+    fn a_valid_profile_still_loads() {
+        let (dir, name) = write_profile(minimal_toml());
+        let profile = load_from_dir(&name, dir.path(), None).unwrap();
+        assert_eq!(profile.version, SUPPORTED_VERSION);
+        assert_eq!(profile.chain_id, super::super::caip2::Caip2::Testnet);
+    }
+
+    #[test]
+    fn extraction_classes_and_keys_contain_no_values() {
+        use figment::error::Kind;
+        let cases = [
+            (
+                Kind::MissingField("version".into()),
+                "a required field is missing",
+                Some("wallet.<key>.limit.version"),
+            ),
+            (
+                Kind::InvalidValue(
+                    figment::error::Actual::Str("CREDMARKER7".into()),
+                    "expected".into(),
+                ),
+                "a value is out of range",
+                Some("wallet.<key>.limit"),
+            ),
+            (
+                Kind::InvalidLength(7, "CREDMARKER7".into()),
+                "a value has the wrong length",
+                Some("wallet.<key>.limit"),
+            ),
+            (
+                Kind::UnknownVariant("CREDMARKER7".into(), &[]),
+                "the profile document does not match the schema",
+                None,
+            ),
+            (
+                Kind::Message("CREDMARKER7".into()),
+                "the profile document does not match the schema",
+                None,
+            ),
+        ];
+        for (kind, expected_class, expected_key) in cases {
+            let err =
+                extraction_error(figment::Error::from(kind).with_path("wallet.CREDMARKER7.limit"));
+            assert_no_marker(&err, "CREDMARKER7");
+            let ProfileLoadError::Extraction { class, key, count } = err else {
+                panic!("expected extraction error")
+            };
+            assert_eq!(class, expected_class);
+            assert_eq!(key.as_deref(), expected_key);
+            assert_eq!(count, 1);
+        }
+        let single = extraction_error(figment::Error::from("CREDMARKER7"));
+        assert_no_marker(&single, "CREDMARKER7");
+    }
+
+    /// A key segment is shown only when it has the form of a schema key: one
+    /// to 64 bytes, a lowercase ASCII letter first, then lowercase letters,
+    /// digits or underscores. Every other segment is shown as `<key>`.
+    #[test]
+    fn extraction_key_segments_follow_the_schema_key_grammar() {
+        use figment::error::Kind;
+        let at_64 = format!("a{}", "b".repeat(63));
+        let at_65 = format!("a{}", "b".repeat(64));
+        let cases: [(&str, &str); 10] = [
+            ("wallet..limit", "wallet.<key>.limit"),
+            ("wallet.9lives.limit", "wallet.<key>.limit"),
+            ("wallet._lead.limit", "wallet.<key>.limit"),
+            ("wallet.a-b.limit", "wallet.<key>.limit"),
+            ("wallet.a b.limit", "wallet.<key>.limit"),
+            ("wallet.Upper.limit", "wallet.<key>.limit"),
+            ("wallet.caf\u{e9}.limit", "wallet.<key>.limit"),
+            ("wallet.a1_b2.limit", "wallet.a1_b2.limit"),
+            (
+                &format!("wallet.{at_64}.limit"),
+                &format!("wallet.{at_64}.limit"),
+            ),
+            (&format!("wallet.{at_65}.limit"), "wallet.<key>.limit"),
+        ];
+        for (path, expected) in cases {
+            let mut raw = figment::Error::from(Kind::InvalidLength(1, "x".into()));
+            raw.path = path.split('.').map(str::to_owned).collect();
+            let err = extraction_error(raw);
+            let ProfileLoadError::Extraction { key, .. } = &err else {
+                panic!("expected extraction error, got {err:?}")
+            };
+            assert_eq!(key.as_deref(), Some(expected), "{path:?}");
+        }
+    }
+
+    /// An empty profile file is reported by its first missing field.
+    #[test]
+    fn an_empty_profile_file_names_the_missing_version() {
+        let (dir, name) = write_profile("");
+        let err = load_from_dir(&name, dir.path(), None).unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                ProfileLoadError::Extraction { class, key, .. }
+                    if *class == "a required field is missing" && key.as_deref() == Some("version")
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn missing_profile_document_keeps_empty_provider_semantics() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("missing.toml");
+        let body = read_profile_toml(&path).unwrap();
+        assert!(body.is_empty());
+        let file_error = Figment::new()
+            .merge(Toml::file(&path))
+            .extract::<RawVersion>()
+            .err()
+            .unwrap();
+        let string_error = Figment::new()
+            .merge(Toml::string(&body))
+            .extract::<RawVersion>()
+            .err()
+            .unwrap();
+        assert_eq!(
+            extraction_error(file_error).to_string(),
+            extraction_error(string_error).to_string()
+        );
+    }
+
+    #[test]
+    fn extraction_reports_the_first_class_and_total_count() {
+        let first = figment::Error::from(figment::error::Kind::MissingField("version".into()));
+        let err = extraction_error(figment::Error::from("CREDMARKER7").chain(first));
+        assert_eq!(
+            err.to_string(),
+            "the profile document is not valid: a required field is missing at `version` (and 1 more)"
+        );
+        assert_no_marker(&err, "CREDMARKER7");
     }
 }

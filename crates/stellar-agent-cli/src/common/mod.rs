@@ -48,6 +48,8 @@ pub(crate) mod mainnet_write_fixture;
 pub mod network;
 pub(crate) mod private_open;
 pub mod profile_access;
+#[cfg(test)]
+pub(crate) mod refusal_log_fixture;
 pub mod render;
 pub mod served_pages;
 pub mod signer_ceremony;

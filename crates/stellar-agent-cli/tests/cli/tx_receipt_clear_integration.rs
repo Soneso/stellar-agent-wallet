@@ -1466,7 +1466,11 @@ fn assert_refused_on_the_fee(code: i32, envelope: &Value) {
         "the run refuses on the fee: {envelope}"
     );
     let message = envelope["error"]["message"].as_str().unwrap();
-    assert!(message.contains("not-a-fee"), "{message}");
+    assert!(message.contains("--fee"), "{message}");
+    assert!(
+        !message.contains("not-a-fee"),
+        "the refusal names the argument, never the rejected value: {message}"
+    );
 }
 
 /// The gate pass a value verb runs releases a due reservation on chain

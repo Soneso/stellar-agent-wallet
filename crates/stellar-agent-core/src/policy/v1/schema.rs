@@ -9,7 +9,9 @@
 //!
 //! The loader runs [`validate_policy_keys`] to refuse keys outside the policy
 //! schema before it decodes and verifies the signature. An unknown key is
-//! reported by name even when the signature also fails.
+//! reported with its location and the keys its container accepts, even when
+//! the signature also fails. The rejected key itself is never part of the
+//! report: a policy key is operator input and may hold a secret.
 
 use toml_edit::{DocumentMut, Item, TableLike, Value};
 
@@ -110,18 +112,20 @@ pub(crate) fn criterion_keys(kind: &str) -> Option<&'static [&'static str]> {
 /// A container of another shape, and a criterion whose `kind` is absent, not
 /// a string, or not a supported kind, is left to the loader's own diagnostics.
 ///
-/// The first unknown key is reported with the loader's location form:
-/// ``rule[2].criteria[0]: unknown key `foo` ``,
-/// `rule[1]`, `rule[0].match`, `mainnet`, `mainnet.cross_check_thresholds`,
-/// `signature`, and no location for a top-level key.
+/// The first container that holds an unknown key is reported with the
+/// loader's location form and the keys that container accepts, for example
+/// `rule[0].match: unknown key; match accepts tool, chain`. The other
+/// locations are `rule[1]`, `rule[2].criteria[0]`, `mainnet`,
+/// `mainnet.cross_check_thresholds`, `signature`, `owner_rotation`, and no
+/// location for a top-level key. The rejected key is never part of the detail.
 ///
 /// [`crate::policy::v1::loader::load_signed_policy`] runs this check before it
 /// verifies the owner signature.
 ///
 /// # Errors
 ///
-/// Returns [`PolicyError::PolicyFileParseFailed`] naming the first unknown key
-/// and its location.
+/// Returns [`PolicyError::PolicyFileParseFailed`] naming the location of the
+/// first unknown key and the keys its container accepts.
 ///
 /// # Examples
 ///
@@ -142,7 +146,7 @@ pub(crate) fn criterion_keys(kind: &str) -> Option<&'static [&'static str]> {
 /// assert!(matches!(
 ///     err,
 ///     PolicyError::PolicyFileParseFailed { ref detail }
-///         if detail.starts_with("rule[0]: unknown key `ttl`")
+///         if detail.starts_with("rule[0]: unknown key; a rule accepts match, criteria")
 /// ));
 /// ```
 pub fn validate_policy_keys(doc: &DocumentMut) -> Result<(), PolicyError> {
@@ -173,11 +177,9 @@ pub fn validate_policy_keys(doc: &DocumentMut) -> Result<(), PolicyError> {
                     && crate::asset_id::CanonicalAsset::parse_threshold_key(key).is_err()
                 {
                     return Err(PolicyError::PolicyFileParseFailed {
-                        detail: format!(
-                            "mainnet.cross_check_thresholds: unknown key `{}`; the \
-                             thresholds table accepts native and asset identities",
-                            key.escape_debug()
-                        ),
+                        detail: "mainnet.cross_check_thresholds: unknown key; the thresholds \
+                                 table accepts native and asset identities"
+                            .to_owned(),
                     });
                 }
             }
@@ -260,25 +262,24 @@ fn validate_rule_keys(rule: &dyn TableLike, idx: usize) -> Result<(), PolicyErro
     Ok(())
 }
 
-/// Refuses the first key of `table` that `accepted` does not list.
+/// Refuses a `table` that holds a key `accepted` does not list.
 ///
 /// `location` prefixes the detail in the loader's form; `owner` names the
-/// container in the list of accepted keys. The key is escaped so a control
-/// character in a quoted key cannot break the diagnostic.
+/// container in the list of accepted keys. The rejected key is not part of the
+/// detail: a policy key is operator input and may hold a secret.
 fn reject_unknown_keys(
     table: &dyn TableLike,
     accepted: &[&str],
     location: Option<&str>,
     owner: &str,
 ) -> Result<(), PolicyError> {
-    let Some((key, _)) = table.iter().find(|(key, _)| !accepted.contains(key)) else {
+    if table.iter().all(|(key, _)| accepted.contains(&key)) {
         return Ok(());
-    };
+    }
     let prefix = location.map(|loc| format!("{loc}: ")).unwrap_or_default();
     Err(PolicyError::PolicyFileParseFailed {
         detail: format!(
-            "{prefix}unknown key `{}`; {owner} accepts {}",
-            key.escape_debug(),
+            "{prefix}unknown key; {owner} accepts {}",
             accepted.join(", ")
         ),
     })
@@ -308,9 +309,10 @@ mod tests {
         assert_eq!(RULE_KEYS, signed.as_slice());
     }
 
-    /// A quoted key with a control character is escaped in the diagnostic.
+    /// A quoted key with a control character leaves the diagnostic to the
+    /// fixed text: the key is not part of it.
     #[test]
-    fn unknown_key_with_a_control_character_is_escaped() {
+    fn unknown_key_with_a_control_character_is_not_echoed() {
         let doc = DocumentMut::from_str("version = 1\nscope = \"profile:alice\"\n\"a\\nb\" = 1\n")
             .unwrap();
         let err = validate_policy_keys(&doc).unwrap_err();
@@ -318,14 +320,15 @@ mod tests {
             matches!(
                 err,
                 PolicyError::PolicyFileParseFailed { ref detail }
-                    if detail.starts_with("unknown key `a\\nb`;") && !detail.contains('\n')
+                    if detail == "unknown key; the policy file accepts version, scope, rules, \
+                                  signature, owner_rotation"
             ),
             "{err:?}"
         );
     }
 
-    /// An unknown key inside `[owner_rotation]` is refused with its location,
-    /// in either version.
+    /// An unknown key inside `[owner_rotation]` is refused with its location
+    /// and the accepted keys, in either version.
     #[test]
     fn unknown_owner_rotation_key_is_refused() {
         for head in [
@@ -342,7 +345,8 @@ mod tests {
                 matches!(
                     err,
                     PolicyError::PolicyFileParseFailed { ref detail }
-                        if detail.starts_with("owner_rotation: unknown key `extra`;")
+                        if detail == "owner_rotation: unknown key; the owner rotation table \
+                                      accepts previous_owner, new_owner, sig"
                 ),
                 "{head}: {err:?}"
             );

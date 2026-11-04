@@ -412,6 +412,25 @@ pub fn payment_memo_shape(
     })
 }
 
+/// Describes a decode failure of a caller-supplied envelope by its class.
+///
+/// `stellar_xdr` reads the base64 text through an I/O reader, and the base64
+/// decoder's error inside that I/O error quotes the offending symbol of the
+/// envelope, so every I/O failure maps to a fixed text. The other variants
+/// render a fixed text or a byte position, never envelope content.
+fn describe_xdr_decode_error(error: &stellar_xdr::Error) -> String {
+    match error {
+        stellar_xdr::Error::Io(io) if io.kind() == std::io::ErrorKind::InvalidData => {
+            "the envelope is not valid standard base64".to_owned()
+        }
+        stellar_xdr::Error::Io(io) if io.kind() == std::io::ErrorKind::UnexpectedEof => {
+            "the envelope ends before the value is complete".to_owned()
+        }
+        stellar_xdr::Error::Io(_) => "the envelope could not be read".to_owned(),
+        other => other.to_string(),
+    }
+}
+
 fn decode_single_operation(
     envelope_xdr_b64: &str,
 ) -> Result<(stellar_xdr::Transaction, stellar_xdr::Operation, String), EnvelopeDecodeError> {
@@ -427,12 +446,8 @@ fn decode_single_operation(
         envelope_xdr_b64,
         stellar_agent_xdr_limits::untrusted_decode_limits(envelope_xdr_b64.len()),
     )
-    .map_err(|e| {
-        // Decode error details exclude raw envelope bytes.
-        // Decode failures must not echo XDR byte content.
-        EnvelopeDecodeError::XdrDecode {
-            detail: e.to_string(),
-        }
+    .map_err(|e| EnvelopeDecodeError::XdrDecode {
+        detail: describe_xdr_decode_error(&e),
     })?;
 
     // 3. Extract the TransactionV1 body.
@@ -1733,6 +1748,42 @@ mod tests {
             matches!(err, EnvelopeDecodeError::XdrDecode { .. }),
             "expected XdrDecode error, got: {err}"
         );
+    }
+
+    /// An envelope that is not base64 is refused by class; the detail names
+    /// neither the envelope text nor the symbol the base64 decoder stopped at.
+    #[test]
+    fn envelope_base64_marker_is_not_echoed() {
+        use stellar_agent_test_support::rejected_value::{CREDENTIAL_MARKER, assert_no_marker};
+
+        // The invalid symbol leads, so the base64 decoder fails on the first
+        // read, before any XDR value is parsed.
+        let envelope = format!("~{CREDENTIAL_MARKER}");
+        let err = decode_authoritative_args(&envelope, "stellar_pay_commit")
+            .expect_err("a non-base64 envelope is refused");
+        assert!(
+            matches!(
+                &err,
+                EnvelopeDecodeError::XdrDecode { detail }
+                    if detail == "the envelope is not valid standard base64"
+            ),
+            "{err:?}"
+        );
+        assert_no_marker(&err, CREDENTIAL_MARKER);
+        // The base64 decoder reports the offending symbol as its byte value.
+        assert_no_marker(&err, "126");
+        assert_no_marker(&err, "symbol");
+        let err = envelope_source_account(&envelope).expect_err("refused through the source path");
+        assert!(
+            matches!(
+                &err,
+                EnvelopeDecodeError::XdrDecode { detail }
+                    if detail == "the envelope is not valid standard base64"
+            ),
+            "{err:?}"
+        );
+        assert_no_marker(&err, CREDENTIAL_MARKER);
+        assert_no_marker(&err, "symbol");
     }
 
     // ─────────────────────────────────────────────────────────────────────────

@@ -42,6 +42,8 @@
 //! - [`source_order`] asserts that one call sits between two others inside a
 //!   production function, for tests that pin the order of a read, an
 //!   acquisition, and a signer load.
+//! - [`rejected_value`] asserts that an error and its source chain never
+//!   repeat a value the wallet rejected.
 //!
 //! This crate is consumed only as a `[dev-dependencies]` entry
 //! (`publish = false`); it is never a runtime dependency, so its `pub` helpers
@@ -63,6 +65,7 @@ pub mod env_guard;
 pub mod keyring_mock;
 pub mod log_capture;
 pub mod profile_fixtures;
+pub mod rejected_value;
 pub mod secret_patterns;
 #[cfg(feature = "test-helpers")]
 pub mod signed_envelope;

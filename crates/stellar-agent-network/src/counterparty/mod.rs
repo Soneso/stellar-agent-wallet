@@ -70,15 +70,13 @@ pub use validation::is_valid_ldh_home_domain;
 ///
 /// Callers can match these variants directly instead of inspecting
 /// free-form parser detail strings.
+/// No variant stores a rejected value read from the stellar.toml document.
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum CounterpartyKindParseError {
     /// The TOML kind field contained an unrecognised discriminator string.
-    #[error("unknown counterparty kind: {kind}")]
-    UnknownKind {
-        /// Unknown kind string from the TOML input.
-        kind: String,
-    },
+    #[error("unknown counterparty kind")]
+    UnknownKind,
 
     /// A recognised kind omitted a field required to interpret that kind.
     #[error("missing required field for kind '{kind}': {field}")]
@@ -90,18 +88,10 @@ pub enum CounterpartyKindParseError {
     },
 
     /// A kind-related TOML field was present but had an invalid value.
-    #[error("invalid field value for {field}: {value}")]
+    #[error("invalid value for {field}")]
     InvalidValue {
         /// TOML field name.
         field: String,
-        /// Sanitised representation of the offending value.  Control characters
-        /// are replaced with `?` and the rendered length is capped at 64 chars
-        /// (with a trailing `...` truncation marker if capped).  Safe to embed
-        /// in `tracing` text-formatter output and other operator-facing sinks
-        /// (prevents terminal-injection / log-spoofing via crafted TOML scalars).
-        /// Sanitisation is applied at the `parser.rs` construction sites via
-        /// `sanitize_invalid_value`.
-        value: String,
     },
 }
 

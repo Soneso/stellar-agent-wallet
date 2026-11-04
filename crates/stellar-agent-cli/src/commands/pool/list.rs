@@ -89,14 +89,13 @@ fn pool_err_to_wallet_err(e: &PoolError) -> WalletError {
 pub async fn run(args: &PoolListArgs) -> i32 {
     // `--profile`, then `STELLAR_AGENT_PROFILE`, then `"default"`.
     let resolved_profile = resolve_profile_name(args.profile.as_deref());
-    let profile_name = resolved_profile.name.clone();
     // Reconciled: a profile file whose owner-key coordinate names a different
     // profile is refused rather than used under this name.
     let profile = match load_profile_reconciled(&resolved_profile) {
         Ok(p) => p,
         Err(e) => {
-            tracing::debug!(profile = %profile_name, error = %e, "profile access refused");
-            render_json(&profile_access_envelope(&e, &profile_name));
+            tracing::debug!(error = %e, "profile access refused");
+            render_json(&profile_access_envelope(&e));
             return 1;
         }
     };
@@ -142,4 +141,26 @@ pub async fn run(args: &PoolListArgs) -> i32 {
 
     render_json(&Envelope::ok(result));
     0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::common::refusal_log_fixture::{
+        ABSENT_PROFILE_MARKER, assert_refusal_omits_requested_profile,
+        capture_absent_profile_refusal,
+    };
+
+    /// The refusal event for an absent profile names the failure class and
+    /// never the requested profile name.
+    #[test]
+    #[serial_test::serial]
+    fn absent_profile_refusal_log_omits_the_requested_name() {
+        let args = PoolListArgs {
+            profile: Some(ABSENT_PROFILE_MARKER.to_owned()),
+            output: OutputFormat::DEFAULT,
+        };
+        let (code, logs) = capture_absent_profile_refusal(|_| run(&args));
+        assert_refusal_omits_requested_profile(code, &logs, "profile access refused");
+    }
 }

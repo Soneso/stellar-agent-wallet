@@ -36,7 +36,7 @@ semver = { workspace = true }
 
 [dev-dependencies]
 stellar-agent-core = { workspace = true, features = ["test-helpers"] }
-stellar-agent-test-support = { path = "../stellar-agent-test-support" }
+stellar-agent-test-support = { path = "../stellar-agent-test-support", features = ["test-helpers"] }
 tempfile = { workspace = true }
 ed25519-dalek = { workspace = true }
 rand_core = { workspace = true }

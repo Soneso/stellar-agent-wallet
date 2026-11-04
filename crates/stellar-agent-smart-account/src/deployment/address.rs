@@ -66,21 +66,13 @@ pub const INTEROP_DEPLOYER_SEED: &[u8] = b"openzeppelin-smart-account-kit";
 
 /// Errors from the deterministic-address derivation functions.
 ///
-/// All variants carry only pre-redacted or non-secret information — see
-/// redaction discipline in `stellar_agent_core::observability`.
+/// Errors name the failed check without storing the rejected argument.
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum AddressError {
     /// The `deployer_pubkey` argument is not a valid G-strkey.
-    ///
-    /// `input` carries the first-5-last-5 characters of the invalid input,
-    /// NOT the raw string, to avoid echoing attacker-controlled content into
-    /// error messages.
-    #[error("invalid deployer G-strkey: {input}")]
-    InvalidDeployer {
-        /// Truncated form of the invalid input (first-5-last-5 or `<too short>`).
-        input: String,
-    },
+    #[error("deployer_pubkey must be a valid Stellar G-strkey")]
+    InvalidDeployer,
 
     /// XDR encoding of the `HashIdPreimage` failed.
     ///
@@ -157,11 +149,8 @@ pub fn derive_smart_account_address(
     network_passphrase: &str,
 ) -> Result<String, AddressError> {
     // Step 2: create deployer SCAddress from public key (parse + validate).
-    let pk = stellar_strkey::ed25519::PublicKey::from_string(deployer_pubkey).map_err(|_| {
-        // Truncate the input to avoid echoing attacker-controlled bytes into error messages.
-        let truncated = truncate_for_error(deployer_pubkey);
-        AddressError::InvalidDeployer { input: truncated }
-    })?;
+    let pk = stellar_strkey::ed25519::PublicKey::from_string(deployer_pubkey)
+        .map_err(|_| AddressError::InvalidDeployer)?;
 
     // Step 3: compute network ID (SHA-256 of network passphrase as UTF-8).
     let network_id: [u8; 32] = Sha256::digest(network_passphrase.as_bytes()).into();
@@ -256,25 +245,6 @@ pub fn interop_deployer_pubkey() -> String {
     )
 }
 
-// ── Private helpers ───────────────────────────────────────────────────────────
-
-/// Truncates a string to a safe form for error messages.
-///
-/// Returns first-5-last-5 characters (with `...` between) for inputs ≥ 11 chars,
-/// or the full string for shorter inputs. This avoids echoing attacker-controlled
-/// bytes into log-aggregated error messages while preserving enough context for
-/// operator triage.
-fn truncate_for_error(s: &str) -> String {
-    let chars: Vec<char> = s.chars().collect();
-    if chars.len() >= 11 {
-        let head: String = chars[..5].iter().collect();
-        let tail: String = chars[chars.len() - 5..].iter().collect();
-        format!("{head}...{tail}")
-    } else {
-        s.to_owned()
-    }
-}
-
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -282,6 +252,25 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, reason = "test-only")]
 
     use super::*;
+
+    #[test]
+    fn deployer_marker_is_not_echoed() {
+        use stellar_agent_test_support::rejected_value::{assert_no_marker, seed_marker};
+        for marker in ["CREDMARKER7".to_owned(), seed_marker()] {
+            let error = derive_smart_account_address(
+                &marker,
+                &[0; 32],
+                "Test SDF Network ; September 2015",
+            )
+            .unwrap_err();
+            assert!(matches!(error, AddressError::InvalidDeployer));
+            assert_eq!(
+                error.to_string(),
+                "deployer_pubkey must be a valid Stellar G-strkey"
+            );
+            assert_no_marker(&error, &marker);
+        }
+    }
 
     /// Asserts `SHA256(INTEROP_DEPLOYER_SEED)` matches the pinned hex string.
     ///
@@ -464,7 +453,7 @@ mod tests {
         let result = derive_smart_account_address("not-a-valid-strkey", &[0u8; 32], "testnet");
 
         assert!(
-            matches!(result, Err(AddressError::InvalidDeployer { .. })),
+            matches!(result, Err(AddressError::InvalidDeployer)),
             "invalid deployer must return AddressError::InvalidDeployer; got: {result:?}"
         );
     }

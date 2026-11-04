@@ -807,6 +807,9 @@ fn testnet_refuses_mainnet_table() {
 #[test]
 #[serial]
 fn unknown_v2_keys_precede_signature_verification() {
+    // A credential-like key: the refusal names the location and the accepted
+    // keys, never the rejected key.
+    const MARKER: &str = "CREDMARKER7";
     let (dir, profile, key) = fixture();
     for place in [
         "root",
@@ -821,19 +824,19 @@ fn unknown_v2_keys_precede_signature_verification() {
             let mut doc = signed(FULL, &key).parse::<DocumentMut>().unwrap();
             match place {
                 "root" => {
-                    doc["unknown"] = value(1);
+                    doc[MARKER] = value(1);
                 }
                 "mainnet" => {
-                    doc["mainnet"]["unknown"] = value(1);
+                    doc["mainnet"][MARKER] = value(1);
                 }
                 "thresholds" => {
-                    doc["mainnet"]["cross_check_thresholds"]["unknown"] = value("1");
+                    doc["mainnet"]["cross_check_thresholds"][MARKER] = value("1");
                 }
                 "rule" => {
-                    rule(&mut doc)["unknown"] = value(1);
+                    rule(&mut doc)[MARKER] = value(1);
                 }
                 "match" => {
-                    rule(&mut doc)["match"]["unknown"] = value(1);
+                    rule(&mut doc)["match"][MARKER] = value(1);
                 }
                 "criterion" => {
                     rule(&mut doc)["criteria"]
@@ -843,10 +846,10 @@ fn unknown_v2_keys_precede_signature_verification() {
                         .unwrap()
                         .as_inline_table_mut()
                         .unwrap()
-                        .insert("unknown", 1.into());
+                        .insert(MARKER, 1.into());
                 }
                 _ => {
-                    doc["signature"]["unknown"] = value(1);
+                    doc["signature"][MARKER] = value(1);
                 }
             }
             let canon = canonical_bytes(&doc.to_string()).unwrap();
@@ -868,7 +871,7 @@ fn unknown_v2_keys_precede_signature_verification() {
                 matches!(
                     &result,
                     Err(PolicyError::PolicyFileParseFailed { detail })
-                        if detail.contains("unknown key `unknown`")
+                        if detail.contains("unknown key; ") && !detail.contains(MARKER)
                 ),
                 "{place}: {result:?}"
             );
@@ -1466,13 +1469,14 @@ fn threshold_aliases_and_duplicate_identities_refuse() {
     };
     let mut doc = FULL.parse::<DocumentMut>().unwrap();
     doc["mainnet"]["cross_check_thresholds"][&sac] = value("100");
+    let error = refusal(&doc);
     assert_eq!(
-        refusal(&doc),
-        format!(
-            "policy file parse failed: mainnet.cross_check_thresholds: key `{sac}` names the \
-             same asset as key `{classic}`"
-        )
+        error,
+        "policy file parse failed: mainnet.cross_check_thresholds: multiple entries name the \
+         same asset; configure one threshold per asset"
     );
+    assert!(!error.contains(&sac));
+    assert!(!error.contains(&classic));
     // Beside a `native` key the native contract also names the same asset, so
     // the native-contract refusal is checked without one.
     let thresholds = doc["mainnet"]["cross_check_thresholds"]
@@ -1485,13 +1489,14 @@ fn threshold_aliases_and_duplicate_identities_refuse() {
         .sac_contract_id(&profile.network_passphrase)
         .unwrap();
     doc["mainnet"]["cross_check_thresholds"][&native_sac] = value("10000000000");
+    let error = refusal(&doc);
     assert_eq!(
-        refusal(&doc),
-        format!(
-            "policy file parse failed: mainnet.cross_check_thresholds: key `{native_sac}` \
-             names the native asset's contract; set the `native` key instead"
-        )
+        error,
+        "policy file parse failed: mainnet.cross_check_thresholds: an entry names the native \
+         asset's contract; set the native key instead"
     );
+    assert!(!error.contains(&native_sac));
+    assert!(!error.contains(&classic));
 }
 #[test]
 fn verified_sequence_is_a_positive_toml_integer() {

@@ -3,25 +3,19 @@
 use stellar_agent_core::wallet::{MlockRequired, Wallet};
 use zeroize::Zeroizing;
 
-/// A seed failure that carries the variable name, never its value.
+/// A seed failure carries neither a variable name nor a secret value.
 #[derive(Debug)]
 pub(super) enum OwnerSeedError {
-    NotSet { var: String },
-    Invalid { var: String },
+    NotSet,
+    Invalid,
     Unlock(String),
 }
 
 /// Reads a zeroizing seed and clears the parser's copied bytes.
 fn seed_from_env(var_name: &str) -> Result<Zeroizing<[u8; 32]>, OwnerSeedError> {
-    let s_strkey = Zeroizing::new(std::env::var(var_name).map_err(|_| OwnerSeedError::NotSet {
-        var: var_name.to_owned(),
-    })?);
-    let mut private_key =
-        stellar_strkey::ed25519::PrivateKey::from_string(&s_strkey).map_err(|_| {
-            OwnerSeedError::Invalid {
-                var: var_name.to_owned(),
-            }
-        })?;
+    let s_strkey = Zeroizing::new(std::env::var(var_name).map_err(|_| OwnerSeedError::NotSet)?);
+    let mut private_key = stellar_strkey::ed25519::PrivateKey::from_string(&s_strkey)
+        .map_err(|_| OwnerSeedError::Invalid)?;
     let seed = Zeroizing::new(private_key.0);
     zeroize::Zeroize::zeroize(&mut private_key.0);
     Ok(seed)

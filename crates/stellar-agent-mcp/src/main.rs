@@ -152,7 +152,7 @@ enum Invocation {
 #[derive(Debug, PartialEq, Eq)]
 enum ArgvError {
     /// A token that is not one of the accepted flags.
-    Unrecognised(String),
+    Unrecognised,
     /// `--profile` was the last token, or was followed by another flag.
     ProfileValueMissing,
     /// `--profile` was given an empty value.
@@ -162,7 +162,7 @@ enum ArgvError {
 impl std::fmt::Display for ArgvError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Unrecognised(token) => write!(f, "unrecognised argument '{token}'"),
+            Self::Unrecognised => f.write_str("unrecognised command-line argument"),
             Self::ProfileValueMissing => f.write_str("--profile requires a profile name"),
             Self::ProfileValueEmpty => f.write_str("--profile requires a non-empty profile name"),
         }
@@ -209,7 +209,7 @@ where
             other => {
                 let value = other
                     .strip_prefix("--profile=")
-                    .ok_or_else(|| ArgvError::Unrecognised(token.clone()))?;
+                    .ok_or(ArgvError::Unrecognised)?;
                 if value.is_empty() {
                     return Err(ArgvError::ProfileValueEmpty);
                 }
@@ -272,9 +272,8 @@ fn resolve_and_validate_profile_name(requested: Option<&str>) -> ResolvedProfile
             ProfileNameSource::Env | ProfileNameSource::Default => PROFILE_ENV_VAR,
         };
         eprintln!(
-            "stellar-agent-mcp: profile name '{}' from {origin} is not a valid \
-             profile name: {reason}",
-            resolved.name
+            "stellar-agent-mcp: the profile name from {origin} is not a valid \
+             profile name: {reason}"
         );
         std::process::exit(EXIT_USAGE);
     }
@@ -356,52 +355,40 @@ async fn main() {
     // `stellar_balances` and `stellar_create_account` (simulate step, which
     // does NOT touch the signer keyring) without requiring a prior setup step.
     let (profile, origin) = match transport::load_selected_profile(&resolved_profile) {
-        Ok((p, origin)) => {
-            // The resolved name and its source are logged together: a report of
-            // a server answering from the wrong profile is diagnosable only if
-            // the log says which name was used and which input supplied it.
-            tracing::info!(
-                profile = %resolved_profile.name,
-                profile_source = resolved_profile.source.as_str(),
-                chain_id = %p.chain_id,
-                "stellar-agent-mcp: profile loaded"
-            );
-            (p, origin)
-        }
-        Err(err @ loader::ProfileLoadError::MainnetRequiresExplicitProfile { .. }) => {
+        Ok(loaded) => loaded,
+        Err(loader::ProfileLoadError::MainnetRequiresExplicitProfile { named_by, .. }) => {
+            let err = loader::ProfileLoadError::MainnetRequiresExplicitProfile {
+                name: "<name>".to_owned(),
+                named_by,
+            };
             tracing::error!(
-                profile = %resolved_profile.name,
                 profile_source = resolved_profile.source.as_str(),
-                code = err.to_validation_error(&resolved_profile.name).code(),
-                "stellar-agent-mcp: {err}; run `stellar-agent-mcp --profile {}`",
-                resolved_profile.name
+                code = err.to_validation_error().code(),
+                "stellar-agent-mcp: {err}; run `stellar-agent-mcp --profile <name>`"
             );
             std::process::exit(1);
         }
-        Err(loader::ProfileLoadError::NotFound { name, path }) => {
+        Err(loader::ProfileLoadError::NotFound) => {
+            // The name may be a value typed into the wrong place, so neither it
+            // nor the path that ends in it is logged.
             let origin = match resolved_profile.source {
                 ProfileNameSource::Flag => "the --profile flag",
                 ProfileNameSource::Env | ProfileNameSource::Default => PROFILE_ENV_VAR,
             };
             tracing::error!(
-                profile = %name,
-                path = %path.display(),
                 profile_source = resolved_profile.source.as_str(),
-                "stellar-agent-mcp: profile '{name}' was named by {origin} but no profile \
-                 file exists at '{}'; create it with `stellar-agent profile init --profile \
-                 {name}`. A named profile is never replaced by the synthesised first-run \
-                 testnet profile: that would serve testnet under the requested name and \
-                 downgrade its policy engine",
-                path.display()
+                "stellar-agent-mcp: the profile named by {origin} has no profile file; create \
+                 it with `stellar-agent profile init --profile <name>`. A named profile is \
+                 never replaced by the synthesised first-run testnet profile: that would serve \
+                 testnet under the requested name and downgrade its policy engine"
             );
             std::process::exit(1);
         }
         Err(err) => {
             tracing::error!(
                 error = %err,
-                profile = %resolved_profile.name,
                 profile_source = resolved_profile.source.as_str(),
-                code = err.to_validation_error(&resolved_profile.name).code(),
+                code = err.to_validation_error().code(),
                 "stellar-agent-mcp: failed to load profile; aborting"
             );
             std::process::exit(1);
@@ -438,18 +425,22 @@ async fn main() {
         // Rendered under this surface's own state layout: every per-profile
         // store here keys on the derived name, which is not the CLI's layout.
         tracing::error!(
-            profile = %resolved_profile.name,
             "stellar-agent-mcp: refusing to start: {}",
             mismatch.message(transport::STARTUP_STATE_LAYOUT)
         );
         std::process::exit(1);
     }
+    tracing::info!(
+        profile = %resolved_profile.name,
+        profile_source = resolved_profile.source.as_str(),
+        chain_id = %profile.chain_id,
+        "stellar-agent-mcp: profile loaded"
+    );
     if let Err(conflict) =
         stellar_agent_core::profile::key_scope::enforce_key_scope(&profile, &resolved_profile.name)
     {
         let error = stellar_agent_core::error::ValidationError::from(conflict);
         tracing::error!(
-            profile = %resolved_profile.name,
             code = error.code(),
             "stellar-agent-mcp: refusing to start: {error}"
         );
@@ -514,8 +505,8 @@ fn report_build_failure(err: &stellar_agent_core::policy::BuildRegistryError, pr
 /// for a failure whose own message is the guidance.
 ///
 /// A V1 policy file that is read but fails a body check, such as an unknown
-/// key, gets no hint: re-signing does not clear it, and the error names the
-/// key.
+/// key, gets no hint: re-signing does not clear it, and the error names the key's
+/// location and the accepted keys.
 fn build_failure_next_step(
     err: &stellar_agent_core::policy::BuildRegistryError,
     profile_name: &str,
@@ -602,7 +593,9 @@ mod tests {
     #[test]
     fn policy_parse_failure_gets_no_signing_hint() {
         let err = policy_load_failure(PolicyError::PolicyFileParseFailed {
-            detail: "rule[0]: unknown key `foo`".to_owned(),
+            detail: "rule[0]: unknown key; a rule accepts match, criteria, decision, reason, \
+                     ttl_secs, allow_opaque_signing"
+                .to_owned(),
         });
         assert_eq!(build_failure_next_step(&err, "alice"), None);
     }
@@ -691,16 +684,13 @@ mod tests {
         // unreviewed MCP client config must not start a server on `default`.
         assert_eq!(
             parse(&["--profil", "mainnet-prod"]),
-            Err(ArgvError::Unrecognised("--profil".to_owned()))
+            Err(ArgvError::Unrecognised)
         );
     }
 
     #[test]
     fn unknown_positional_token_is_rejected() {
-        assert_eq!(
-            parse(&["mainnet-prod"]),
-            Err(ArgvError::Unrecognised("mainnet-prod".to_owned()))
-        );
+        assert_eq!(parse(&["mainnet-prod"]), Err(ArgvError::Unrecognised));
     }
 
     #[test]

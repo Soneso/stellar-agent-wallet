@@ -378,7 +378,7 @@ mod tests {
     }
 
     #[test]
-    fn copied_profile_file_refuses_and_names_both_profiles() {
+    fn copied_profile_file_refuses_without_naming_either_profile() {
         // The realistic path: `default.toml` copied to `alice.toml` without
         // re-deriving its keyring coordinates.
         let profile = named_profile("default");
@@ -386,16 +386,18 @@ mod tests {
             .expect("a profile naming 'default' must not serve as 'alice'");
         let message = refusal.message(STARTUP_STATE_LAYOUT);
         assert!(
-            message.contains("'alice'") && message.contains("'default'"),
-            "refusal must name both profiles: {message}"
+            message.contains("policy_owner_key_id.service names a different profile"),
+            "refusal must name the offending field: {message}"
         );
         assert!(
-            message.contains("stellar-agent-owner-default"),
-            "refusal must quote the offending policy_owner_key_id.service: {message}"
-        );
-        assert!(
-            message.contains("profile init --profile alice"),
+            message.contains("profile init --profile <name>"),
             "refusal must name the recovery command: {message}"
+        );
+        assert!(
+            !message.contains("alice")
+                && !message.contains("'default'")
+                && !message.contains("stellar-agent-owner-default"),
+            "refusal must repeat neither profile name nor the stored service: {message}"
         );
     }
 
@@ -408,7 +410,14 @@ mod tests {
         profile.policy.engine = PolicyEngineKind::Noop;
         let refusal = profile_name_mismatch_refusal(&profile, "alice")
             .expect("a Noop-engine profile must be reconciled exactly like a V1 one");
-        assert!(refusal.message(STARTUP_STATE_LAYOUT).contains("'alice'"));
+        let message = refusal.message(STARTUP_STATE_LAYOUT);
+        for rejected in ["alice", "default", "stellar-agent-owner-default"] {
+            assert!(!message.contains(rejected));
+        }
+        assert!(
+            message.contains("policy_owner_key_id.service names a different profile"),
+            "refusal must name the offending field: {message}"
+        );
     }
 
     #[test]

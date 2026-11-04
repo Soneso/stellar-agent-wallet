@@ -248,7 +248,7 @@ async fn authorize(args: MppAuthorizeArgs) -> i32 {
     let profile_name = resolved.name.clone();
     let (profile, context) = match load_testnet_profile(&resolved) {
         Ok(profile) => profile,
-        Err(error) => return render_profile_error(&error, &profile_name),
+        Err(error) => return render_profile_error(&error),
     };
 
     // Halt check, fresh and resumed authorizations alike: before the keyring
@@ -590,7 +590,7 @@ fn status(args: &MppStatusArgs) -> i32 {
     let profile_name = resolved.name.clone();
     let (profile, _context) = match load_testnet_profile(&resolved) {
         Ok(profile) => profile,
-        Err(error) => return render_profile_error(&error, &profile_name),
+        Err(error) => return render_profile_error(&error),
     };
     if init_platform_keyring_store().is_err() {
         return render_error(&state_error());
@@ -620,7 +620,7 @@ fn record_receipt(args: &MppReceiptArgs) -> i32 {
     let profile_name = resolved.name.clone();
     let (profile, _context) = match load_testnet_profile(&resolved) {
         Ok(profile) => profile,
-        Err(error) => return render_profile_error(&error, &profile_name),
+        Err(error) => return render_profile_error(&error),
     };
     if init_platform_keyring_store().is_err() {
         return render_error(&state_error());
@@ -696,7 +696,7 @@ async fn reconcile(args: MppReconcileArgs) -> i32 {
     let profile_name = resolved.name.clone();
     let (profile, context) = match load_testnet_profile(&resolved) {
         Ok(profile) => profile,
-        Err(error) => return render_profile_error(&error, &profile_name),
+        Err(error) => return render_profile_error(&error),
     };
 
     if init_platform_keyring_store().is_err() {
@@ -753,7 +753,7 @@ fn prune(args: &MppPruneArgs) -> i32 {
     let (profile, context) =
         match load_testnet_profile(&ResolvedProfileName::from_flag(&args.profile)) {
             Ok(profile) => profile,
-            Err(error) => return render_profile_error(&error, &args.profile),
+            Err(error) => return render_profile_error(&error),
         };
 
     let reason = match read_selected_input(
@@ -891,10 +891,10 @@ fn testnet_context(profile: &Profile) -> Result<NetworkContext, MppProfileError>
 /// The access arm keeps the profile subsystem's own wire code — including
 /// `profile.name_mismatch` — so an agent can tell a mistyped or copied profile
 /// apart from an MPP state failure.
-fn render_profile_error(error: &MppProfileError, profile_name: &str) -> i32 {
+fn render_profile_error(error: &MppProfileError) -> i32 {
     match error {
         MppProfileError::Access(e) => {
-            print_json(&profile_access_envelope(e, profile_name));
+            print_json(&profile_access_envelope(e));
             1
         }
         MppProfileError::Network(e) => render_error(e),

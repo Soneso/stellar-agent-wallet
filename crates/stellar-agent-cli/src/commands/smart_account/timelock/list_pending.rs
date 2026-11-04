@@ -208,7 +208,7 @@ where
         match load_profile_or_synthesize_testnet_with(&resolved_profile, load_profile) {
             Ok(loaded) => loaded,
             Err(error) => {
-                let e = map_access_error(&error, &resolved_profile.name);
+                let e = map_access_error(&error);
                 let envelope: Envelope<()> = Envelope::err(&e);
                 render_json(&envelope);
                 return 1;

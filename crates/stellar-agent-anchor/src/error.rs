@@ -34,18 +34,9 @@ pub enum AnchorError {
     /// advertising a `TRANSFER_SERVER*` that points to an unrelated host is
     /// rejected before any fetch to that host is attempted.
     ///
-    /// The mismatched URL is NOT included; only the `anchor_domain` hint and the
-    /// `resolved_host` authority are surfaced.
-    #[error(
-        "transfer server host {resolved_host:?} does not match anchor domain \
-         {anchor_domain:?} (same-domain SSRF bind rejected)"
-    )]
-    TransferServerHostMismatch {
-        /// The operator-supplied anchor domain (e.g. `"testanchor.stellar.org"`).
-        anchor_domain: String,
-        /// The authority (host and optional port) of the resolved `TRANSFER_SERVER*` URL.
-        resolved_host: String,
-    },
+    /// The error carries neither the rejected host nor the domain.
+    #[error("transfer server host does not match anchor domain (same-domain SSRF bind rejected)")]
+    TransferServerHostMismatch,
 
     /// An HTTP request to the anchor endpoint failed.
     ///

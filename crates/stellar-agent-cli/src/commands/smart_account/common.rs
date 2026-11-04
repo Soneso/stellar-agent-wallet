@@ -39,6 +39,7 @@ use stellar_agent_smart_account::managers::rules::{
     parse_c_strkey_to_smart_account,
 };
 use stellar_agent_smart_account::managers::signers::{SignersManager, SignersManagerConfig};
+use stellar_agent_smart_account::verifiers::VerifierRegistry;
 use uuid::Uuid;
 
 use crate::common::ResolvedProfileName;
@@ -176,9 +177,9 @@ pub(crate) fn validate_source_account(source: &str) -> Result<(), WalletError> {
     stellar_strkey::ed25519::PublicKey::from_string(source)
         .map(|_| ())
         .map_err(|e| {
-            WalletError::Validation(ValidationError::AddressInvalid {
-                input: format!("--source-account: invalid G-strkey ({e})"),
-            })
+            WalletError::Validation(ValidationError::address_check(format!(
+                "--source-account: invalid G-strkey ({e})"
+            )))
         })
 }
 
@@ -234,9 +235,7 @@ impl ReadHandlerContext {
         let profile_name = resolved.name;
         let (audit_writer, audit_log_path) = open_audit_writer(&profile, origin, &profile_name)?;
         let smart_account = parse_c_strkey_to_smart_account(args.account()).map_err(|e| {
-            WalletError::Validation(ValidationError::AddressInvalid {
-                input: format!("--account: {e}"),
-            })
+            WalletError::Validation(ValidationError::address_check(format!("--account: {e}")))
         })?;
         Ok(Self {
             smart_account,
@@ -326,9 +325,7 @@ impl CommonHandlerContext {
         )
         .await?;
         let smart_account = parse_c_strkey_to_smart_account(args.account()).map_err(|e| {
-            WalletError::Validation(ValidationError::AddressInvalid {
-                input: format!("--account: {e}"),
-            })
+            WalletError::Validation(ValidationError::address_check(format!("--account: {e}")))
         })?;
         let timeout = Duration::from_secs(args.timeout_seconds());
 
@@ -526,12 +523,38 @@ fn construct_context_rule_manager_from_fields(
     })
 }
 
+/// Opens the verifier registry a command resolves a contract address from.
+///
+/// # Errors
+///
+/// Returns the refusal of [`verifier_registry_refusal`] when the registry file
+/// cannot be read or parsed.
+pub(crate) fn open_verifier_registry() -> Result<VerifierRegistry, WalletError> {
+    verifier_registry_refusal(VerifierRegistry::open())
+}
+
+/// Maps a registry open result onto the command's refusal.
+///
+/// The refusal names the file to check and never the registry error: a read
+/// or parse failure of `networks.toml` describes text an operator wrote, and
+/// that text can hold a credential.
+fn verifier_registry_refusal(
+    opened: Result<VerifierRegistry, SaError>,
+) -> Result<VerifierRegistry, WalletError> {
+    opened.map_err(|_| {
+        WalletError::Validation(ValidationError::address_check(
+            "the verifier registry cannot be read; check networks.toml in the wallet \
+             configuration directory",
+        ))
+    })
+}
+
 /// Builds the `WalletError::SmartAccount` envelope an `emit_sa_error` call
 /// would render, with operator-facing filesystem paths under `$HOME` redacted
 /// to `<HOME>/...`.
 ///
 /// Several `SaError` variants embed `path: PathBuf` in their `Display` (e.g.
-/// `NetworksTomlIo`, `NetworksTomlParse`). Without
+/// `NetworksTomlIo`). Without
 /// redaction the absolute prefix leaks the operator's home directory and
 /// active profile name through the wire envelope (same class as the
 /// `WalletError::Io.message` path leak handled in [`wallet_io_error`]).
@@ -719,7 +742,6 @@ pub(crate) fn open_audit_writer(
 /// Other load failures map to an audit-writer I/O error.
 pub(crate) fn map_access_error(
     err: &crate::common::profile_access::ProfileAccessError,
-    profile_name: &str,
 ) -> WalletError {
     use stellar_agent_core::profile::loader::ProfileLoadError;
 
@@ -733,10 +755,10 @@ pub(crate) fn map_access_error(
             | ProfileLoadError::MainnetRpcUrlRequired { .. }
             | ProfileLoadError::InvalidEndpointUrl { .. }
             | ProfileLoadError::InvalidProviderAttestation { .. },
-        ) => err.to_wallet_error(profile_name),
+        ) => err.to_wallet_error(),
         ProfileAccessError::Load(_) => wallet_io_error(
             IoSource::AuditWriterSetup,
-            format!("profile resolution failed: {}", err.message(profile_name)),
+            format!("profile resolution failed: {}", err.message()),
         ),
     }
 }
@@ -791,11 +813,43 @@ mod tests {
         EnrolledPin, assert_enrolled_outcome, enrolled_mainnet_profile,
     };
 
+    /// A registry file whose malformed line holds a credential is refused by
+    /// the file to check; the line reaches neither the error, its source
+    /// chain, nor the envelope.
+    #[test]
+    fn a_malformed_registry_line_is_not_echoed() {
+        use stellar_agent_test_support::rejected_value::{
+            CREDENTIAL_MARKER, assert_no_marker, assert_no_marker_in_text,
+        };
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("networks.toml");
+        std::fs::write(
+            &path,
+            format!(
+                "[networks.testnet]\nrpc_url = \"https://user:{CREDENTIAL_MARKER}@rpc.example\n"
+            ),
+        )
+        .expect("write");
+
+        let err = verifier_registry_refusal(VerifierRegistry::open_at(path))
+            .expect_err("a malformed registry is refused");
+        assert_no_marker(&err, CREDENTIAL_MARKER);
+        assert_eq!(
+            err.to_string(),
+            "the verifier registry cannot be read; check networks.toml in the wallet \
+             configuration directory"
+        );
+        let envelope = Envelope::<()>::err(&err);
+        let json = serde_json::to_string(&envelope).expect("serialize");
+        assert_no_marker_in_text(&json, CREDENTIAL_MARKER);
+    }
+
     #[test]
     fn audit_writer_mapping_preserves_protected_refusals() {
         for error in crate::common::profile_access::protected_load_errors_for_test() {
             let expected = error.code();
-            let result = Err::<(), _>(map_access_error(&error, "mainnet"));
+            let result = Err::<(), _>(map_access_error(&error));
             let error = match result {
                 Err(error) => error,
                 Ok(_) => panic!("protected refusal was swallowed"),
@@ -900,8 +954,17 @@ mod tests {
         let err = load_command_profile(&named("gate-absent"))
             .expect_err("a named profile with no file must refuse, not synthesize");
         assert!(
-            err.to_string().contains("gate-absent"),
-            "the refusal must name the profile the operator asked for: {err}"
+            matches!(
+                err,
+                ProfileAccessError::Load(
+                    stellar_agent_core::profile::loader::ProfileLoadError::NotFound
+                )
+            ),
+            "a named profile with no file must refuse as absent: {err}"
+        );
+        assert!(
+            !err.message().contains("gate-absent") && !err.to_string().contains("gate-absent"),
+            "the refusal must not repeat the requested name: {err}"
         );
     }
 
@@ -976,12 +1039,12 @@ mod tests {
         }
     }
 
-    /// An unset env var refuses with `validation.secret_env_not_set` naming the
-    /// variable — an input-validation failure, not a keyring condition.
+    /// An unset env var refuses with `validation.secret_env_not_set` without
+    /// retaining the variable name.
     #[tokio::test(flavor = "multi_thread")]
     async fn resolve_signer_unset_env_var_is_refused() {
         let flags = SignerSourceFlags {
-            signer_secret_env: Some("COMMON_RESOLVE_SIGNER_UNSET_VAR_TEST".to_owned()),
+            signer_secret_env: Some("COMMON_RESOLVE_SIGNER_UNSET_CREDMARKER7".to_owned()),
             sign_with_ledger: false,
             account_index: None,
         };
@@ -997,16 +1060,15 @@ mod tests {
             Err(e) => e,
         };
         assert_eq!(err.code(), "validation.secret_env_not_set");
-        assert!(
-            err.to_string()
-                .contains("COMMON_RESOLVE_SIGNER_UNSET_VAR_TEST"),
-            "error must name the variable: {err}"
+        assert_eq!(
+            err.to_string(),
+            "the secret environment variable named by the argument is not set"
         );
+        stellar_agent_test_support::rejected_value::assert_no_marker(&err, "CREDMARKER7");
     }
 
     /// A malformed S-strkey refuses before any unlock with
-    /// `validation.secret_env_invalid`, naming the variable but never echoing
-    /// its value.
+    /// `validation.secret_env_invalid`, without echoing the variable name or value.
     #[tokio::test(flavor = "multi_thread")]
     #[serial_test::serial]
     #[allow(
@@ -1014,9 +1076,9 @@ mod tests {
         reason = "test-only process environment mutation; the variable name is unique to this test"
     )]
     async fn resolve_signer_invalid_s_strkey_is_refused() {
-        let var = "COMMON_RESOLVE_SIGNER_MALFORMED_TEST_SK";
+        let var = "COMMON_RESOLVE_SIGNER_MALFORMED_CREDMARKER7";
         unsafe {
-            std::env::set_var(var, "not-an-s-strkey");
+            std::env::set_var(var, "invalid-CREDMARKER7");
         }
         let flags = SignerSourceFlags {
             signer_secret_env: Some(var.to_owned()),
@@ -1035,14 +1097,11 @@ mod tests {
             Err(e) => e,
         };
         assert_eq!(err.code(), "validation.secret_env_invalid");
-        assert!(
-            err.to_string().contains(var),
-            "error must name the variable: {err}"
+        assert_eq!(
+            err.to_string(),
+            "the secret environment variable named by the argument must contain a valid S-strkey"
         );
-        assert!(
-            !err.to_string().contains("not-an-s-strkey"),
-            "error must not echo the malformed value: {err}"
-        );
+        stellar_agent_test_support::rejected_value::assert_no_marker(&err, "CREDMARKER7");
         unsafe {
             std::env::remove_var(var);
         }
@@ -1125,28 +1184,24 @@ mod tests {
         }
     }
 
-    /// Closes the parallel-leak path opened by
-    /// `SaError::NetworksTomlParse.path` embedding `$HOME` in its
-    /// Display impl. `emit_sa_error` (and therefore
-    /// `build_sa_error_envelope`) must redact the message before it reaches
-    /// the wire envelope, the same way `wallet_io_error` redacts
-    /// `WalletError::Io` paths.
+    /// `SaError::NetworksTomlIo` embeds its path in its Display.
+    /// `emit_sa_error` (and therefore `build_sa_error_envelope`) must redact
+    /// the message before it reaches the wire envelope, the same way
+    /// `wallet_io_error` redacts `WalletError::Io` paths.
     #[test]
     fn build_sa_error_envelope_redacts_home_prefixed_paths_from_smart_account_message() {
         use std::path::PathBuf;
 
         let home = std::env::var("HOME").expect("HOME is set in test environment");
-        let toml_text = "not = valid = toml";
-        let source: toml::de::Error = toml::from_str::<toml::Value>(toml_text)
-            .expect_err("malformed TOML must fail to parse");
+        let source = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
         let path = PathBuf::from(format!("{home}/.local/share/stellar-agent/networks.toml"));
-        let sa_err = SaError::NetworksTomlParse { source, path };
+        let sa_err = SaError::NetworksTomlIo { source, path };
 
         let wallet_err = build_sa_error_envelope(&sa_err);
 
         match wallet_err {
             WalletError::SmartAccount { wire_code, message } => {
-                assert_eq!(wire_code, "sa.networks_toml_parse");
+                assert_eq!(wire_code, "sa.networks_toml_io");
                 assert!(
                     message.contains("<HOME>/.local/share/stellar-agent/networks.toml"),
                     "expected <HOME>-redacted path in message: {message}"

@@ -951,7 +951,7 @@ async fn stellar_toml_syntax_error_reports_line_and_column_only() {
         other => panic!("expected TomlInvalid from the parser, got {other:?}"),
     };
     let column: usize = detail
-        .strip_prefix("TOML parse error at line 2, column ")
+        .strip_prefix("not valid TOML: line 2, column ")
         .and_then(|column| column.parse().ok())
         .unwrap_or_else(|| panic!("expected a line-2 position, got {detail:?}"));
     assert!(
@@ -989,9 +989,10 @@ async fn stellar_toml_syntax_error_reports_line_and_column_only() {
 }
 
 /// An unknown currency kind with control and bidi characters and a thousand
-/// characters reaches the reason escaped, quoted, and cut at the bound.
+/// characters is refused by its class; the kind the server wrote is not part
+/// of the reason.
 #[tokio::test]
-async fn stellar_toml_unknown_currency_kind_is_quoted_and_bounded() {
+async fn stellar_toml_unknown_currency_kind_is_not_echoed() {
     let mock_server = MockServer::start().await;
     let server_key = gen_keypair();
     mount_toml(
@@ -1020,20 +1021,8 @@ async fn stellar_toml_unknown_currency_kind_is_quoted_and_bounded() {
     let IdentityError::TomlFetchFailed { reason, .. } = &err else {
         panic!("expected TomlFetchFailed, got {err:?}");
     };
-    let body = reason
-        .strip_prefix('"')
-        .and_then(|rest| rest.strip_suffix("\"..."))
-        .unwrap_or_else(|| panic!("the reason is quoted and cut: {reason}"));
-    assert_eq!(
-        body.chars().count(),
-        stellar_agent_network::MAX_SERVER_TEXT_CHARS,
-        "{reason}"
-    );
-    assert!(
-        body.starts_with("unknown counterparty kind: K\\u{001b}[2J\\u{202e}evilkkk"),
-        "{reason}"
-    );
-    for raw in ["\u{1b}", "\u{202e}"] {
+    assert_eq!(reason, "\"unknown counterparty kind\"");
+    for raw in ["\u{1b}", "\u{202e}", "evil", "\\u{001b}"] {
         assert!(!rendered.contains(raw), "{raw:?} leaked: {rendered}");
     }
     assert!(!rendered.contains(&"k".repeat(300)), "{rendered}");

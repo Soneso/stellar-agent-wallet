@@ -542,9 +542,9 @@ async fn resolve_web_auth(
 
     // ── Step 2: Parse stellar.toml ────────────────────────────────────────────
     // Every parse error goes through the same quote: a TOML syntax error
-    // carries only its line and column, and the other variants (an unknown
-    // currency kind, an invalid field value) can carry the server's text,
-    // which the quote escapes and bounds.
+    // carries only its line and column, and the other variants name the field
+    // or the rule a value breaks without the value. The quote escapes and
+    // bounds the text all the same, so the reason stays safe to render.
     let sep1 = parse_minimal_sep1(&body).map_err(|e| {
         warn!(authority = %toml_authority, "x402-identity: stellar.toml parse failed");
         IdentityError::TomlFetchFailed {

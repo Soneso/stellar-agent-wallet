@@ -357,8 +357,8 @@ Exits `1` on refusal:
 - `sign_policy.owner_key_mismatch`: the seed does not match the enrolled owner key, or the previous seed does not match the pinned owner (the enrolled owner when no pin exists).
 - `sign_policy.policy_file_unreadable`: the policy file is missing.
 - `sign_policy.canonicalization_failed`: the policy file is malformed, or its
-  body holds a key outside the policy schema. The message names the key and
-  its location.
+  body holds a key outside the policy schema. The message names the key's
+  location and the keys accepted there, never the key itself.
 - `sign_policy.policy_body_invalid`: the engine would refuse the policy body,
   for example an unsupported `version`, a `scope` for another profile, an
   unknown criterion kind or decision, or a `ttl_secs` out of range. The message

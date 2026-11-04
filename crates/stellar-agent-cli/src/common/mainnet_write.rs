@@ -402,9 +402,9 @@ pub(crate) async fn authorize_and_submit(
     // refuses an unenrolled key before any prompt or pending entry.
     let source_key = stellar_strkey::ed25519::PublicKey::from_string(source)
         .map_err(|_| {
-            Envelope::<()>::err(&WalletError::Validation(ValidationError::AddressInvalid {
-                input: source.to_owned(),
-            }))
+            Envelope::<()>::err(&WalletError::Validation(ValidationError::address_argument(
+                "--source",
+            )))
         })?
         .0;
     let enrolled = enrolled_signer(

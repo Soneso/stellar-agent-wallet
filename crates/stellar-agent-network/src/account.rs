@@ -432,10 +432,7 @@ impl BalanceView {
         // balance string).
         if stroops < 0 {
             return Err(WalletError::Validation(ValidationError::AmountOutOfRange {
-                amount: format!(
-                    "BalanceView::balance_stroops: negative stroop value ({stroops}) for '{}'",
-                    self.balance
-                ),
+                field: "the negative account balance the RPC reported".into(),
             }));
         }
         Ok(stroops)
@@ -1309,11 +1306,8 @@ pub async fn fetch_trustline_entry(
     account_id: &str,
     asset: &stellar_xdr::TrustLineAsset,
 ) -> Result<Option<stellar_xdr::TrustLineEntry>, WalletError> {
-    let pk = stellar_strkey::ed25519::PublicKey::from_string(account_id).map_err(|_| {
-        WalletError::Validation(ValidationError::AddressInvalid {
-            input: account_id.to_owned(),
-        })
-    })?;
+    let pk = stellar_strkey::ed25519::PublicKey::from_string(account_id)
+        .map_err(|_| WalletError::Validation(ValidationError::address_argument("account_id")))?;
     let xdr_account_id = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(pk.0)));
     let key = LedgerKey::Trustline(LedgerKeyTrustLine {
         account_id: xdr_account_id.clone(),

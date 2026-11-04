@@ -129,13 +129,8 @@ pub const ENV_KEY_VAR: &str = "STELLAR_AGENT_HEADLESS_KEYRING_KEY";
 pub enum HeadlessKeyringInitError {
     /// `STELLAR_AGENT_KEYRING_BACKEND` was set to a value other than
     /// `"headless-env"` or `"headless-dpapi"`.
-    #[error(
-        "{var} is set to an unrecognised value {value:?}; expected \"headless-env\" or \"headless-dpapi\""
-    , var = BACKEND_ENV_VAR)]
-    UnknownBackend {
-        /// The unrecognised value.
-        value: String,
-    },
+    #[error("STELLAR_AGENT_KEYRING_BACKEND must be \"headless-env\" or \"headless-dpapi\"")]
+    UnknownBackend,
     /// `headless-dpapi` was selected on a non-Windows target.
     #[error("headless-dpapi is only available on Windows")]
     DpapiUnsupportedPlatform,
@@ -219,11 +214,7 @@ pub fn init_headless_store(backend: &str) -> Result<(), HeadlessKeyringInitError
             }
             ProtectionMode::Dpapi
         }
-        other => {
-            return Err(HeadlessKeyringInitError::UnknownBackend {
-                value: other.to_owned(),
-            });
-        }
+        _ => return Err(HeadlessKeyringInitError::UnknownBackend),
     };
 
     let path = headless_keyring_path()?;
@@ -307,6 +298,17 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn unknown_backend_marker_is_not_echoed() {
+        let error = init_headless_store("CREDMARKER7").unwrap_err();
+        assert!(matches!(error, HeadlessKeyringInitError::UnknownBackend));
+        stellar_agent_test_support::rejected_value::assert_no_marker(&error, "CREDMARKER7");
+        assert_eq!(
+            error.to_string(),
+            "STELLAR_AGENT_KEYRING_BACKEND must be \"headless-env\" or \"headless-dpapi\""
+        );
+    }
+
     /// RAII env-var guard; `#[serial]` on every test using it prevents
     /// concurrent env access.
     struct EnvGuard {
@@ -364,10 +366,7 @@ mod tests {
     #[serial]
     fn init_headless_store_rejects_unknown_backend() {
         let err = init_headless_store("not-a-real-backend").unwrap_err();
-        assert!(matches!(
-            err,
-            HeadlessKeyringInitError::UnknownBackend { .. }
-        ));
+        assert!(matches!(err, HeadlessKeyringInitError::UnknownBackend));
     }
 
     #[test]

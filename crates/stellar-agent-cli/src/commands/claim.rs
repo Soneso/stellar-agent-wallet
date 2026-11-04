@@ -479,10 +479,7 @@ where
     let (profile, origin) = match load_profile_or_synthesize_testnet_with(&resolved, load_profile) {
         Ok(loaded) => loaded,
         Err(e) => {
-            return ClaimOutcome::failed(Envelope::<()>::err_raw(
-                e.code(),
-                e.message(&resolved.name),
-            ));
+            return ClaimOutcome::failed(Envelope::<()>::err_raw(e.code(), e.message()));
         }
     };
     claim_outcome_loaded(args, &resolved, &profile, origin, init_keyring).await
@@ -1390,11 +1387,8 @@ struct PreviewedClaim {
 /// when the source is not a G-strkey.
 fn claim_inputs(args: &ClaimArgs) -> Result<BalanceId, ClaimError> {
     let id = BalanceId::parse(&args.balance_id)?;
-    stellar_strkey::ed25519::PublicKey::from_string(&args.source).map_err(|_| {
-        WalletError::Validation(ValidationError::AddressInvalid {
-            input: args.source.clone(),
-        })
-    })?;
+    stellar_strkey::ed25519::PublicKey::from_string(&args.source)
+        .map_err(|_| WalletError::Validation(ValidationError::address_argument("--source")))?;
     Ok(id)
 }
 
@@ -2288,14 +2282,7 @@ mod tests {
         args.rpc_url = Some(guard_rpc.uri());
         let exit = run_with_dependencies(
             &args,
-            |name| {
-                Err(
-                    stellar_agent_core::profile::loader::ProfileLoadError::NotFound {
-                        name: name.into(),
-                        path: std::path::PathBuf::from("absent"),
-                    },
-                )
-            },
+            |_| Err(stellar_agent_core::profile::loader::ProfileLoadError::NotFound),
             crate::test_rpc::counting_initializer(&calls),
             &mut std::io::sink(),
         )
@@ -2612,13 +2599,8 @@ mod tests {
         let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
         let args = minimal_args();
         let resolved = resolve_profile_name(args.profile.as_deref());
-        let (_profile, origin) = load_profile_or_synthesize_testnet_with(&resolved, |name| {
-            Err(
-                stellar_agent_core::profile::loader::ProfileLoadError::NotFound {
-                    name: name.to_owned(),
-                    path: std::path::PathBuf::from("/nonexistent"),
-                },
-            )
+        let (_profile, origin) = load_profile_or_synthesize_testnet_with(&resolved, |_| {
+            Err(stellar_agent_core::profile::loader::ProfileLoadError::NotFound)
         })
         .expect("profile");
         let result = init_keyring_for_origin(&resolved, origin, || {
@@ -2645,14 +2627,7 @@ mod tests {
         let init_invoked = std::cell::Cell::new(false);
         let code = run_with_dependencies(
             &args,
-            |name| {
-                Err(
-                    stellar_agent_core::profile::loader::ProfileLoadError::NotFound {
-                        name: name.to_owned(),
-                        path: std::path::PathBuf::from("/nonexistent"),
-                    },
-                )
-            },
+            |_| Err(stellar_agent_core::profile::loader::ProfileLoadError::NotFound),
             || {
                 init_invoked.set(true);
                 Ok(())

@@ -161,7 +161,7 @@ pub async fn run(args: &ScheduleArgs) -> i32 {
     let (profile, origin) = match load_command_profile(&resolved_profile) {
         Ok(loaded) => loaded,
         Err(error) => {
-            let e = map_access_error(&error, &resolved_profile.name);
+            let e = map_access_error(&error);
             let envelope: Envelope<()> = Envelope::err(&e);
             render_json(&envelope);
             return 1;

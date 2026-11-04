@@ -127,11 +127,8 @@ pub async fn fetch_trustline_state(
     code: &str,
     issuer: &str,
 ) -> Result<(TrustlineState, Option<TrustLineEntry>), ClaimError> {
-    stellar_strkey::ed25519::PublicKey::from_string(account).map_err(|_| {
-        WalletError::Validation(ValidationError::AddressInvalid {
-            input: account.to_owned(),
-        })
-    })?;
+    stellar_strkey::ed25519::PublicKey::from_string(account)
+        .map_err(|_| WalletError::Validation(ValidationError::address_argument("account")))?;
     let asset = code_issuer_to_trust_line_asset(code, issuer)?;
     let entry = stellar_agent_network::fetch_trustline_entry(client, account, &asset).await?;
     let state = entry
@@ -161,18 +158,15 @@ impl TrustlineState {
 /// reusable here, so this crate constructs the XDR asset directly rather
 /// than adding a cross-crate dependency for one small conversion.
 fn code_issuer_to_trust_line_asset(code: &str, issuer: &str) -> Result<TrustLineAsset, ClaimError> {
-    let pk = stellar_strkey::ed25519::PublicKey::from_string(issuer).map_err(|_| {
-        WalletError::Validation(ValidationError::AddressInvalid {
-            input: issuer.to_owned(),
-        })
-    })?;
+    let pk = stellar_strkey::ed25519::PublicKey::from_string(issuer)
+        .map_err(|_| WalletError::Validation(ValidationError::address_argument("issuer")))?;
     let xdr_issuer = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(pk.0)));
 
     let code_bytes = code.as_bytes();
     if code_bytes.is_empty() || code_bytes.len() > 12 {
         return Err(ClaimError::Wallet(WalletError::Validation(
             ValidationError::AssetInvalid {
-                input: code.to_owned(),
+                field: "code".into(),
             },
         )));
     }

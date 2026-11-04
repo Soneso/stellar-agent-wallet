@@ -132,6 +132,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `TOOLSET_PIN_KEY_ACCOUNT` name the toolset pin key's keyring entry. The
   key-scope finding `KeyScopeKind::InstallationEntry` (`installation_entry`)
   reports a profile role naming an entry under that service.
+- `profile::toml_diagnostic::toml_error_position` renders a TOML error position without source text.
+- `ValidationError::address_argument` and `ValidationError::address_check`
+  build an `AddressInvalid` refusal for a named argument or for a fixed check.
+  `stellar_agent_core::policy::toml_syntax_detail` and `PolicyError::toml_syntax`
+  report a policy body that is not valid TOML by position.
 
 ### Changed
 
@@ -155,6 +160,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and `audit acknowledge-outbox-loss` refuse with `audit.carriers_busy` while
   any wallet process holds an audit lock file. `TipAnchorStore` gains the
   carrier record and a generation parameter on the outbox commitment.
+- `ValidationError::AddressInvalid` carries an `AddressField`, and `AssetInvalid`
+  carries `field`; `ProfileNotFound` has no field. The amount variants carry
+  the field without the input, and `OutputFormatInvalid` and
+  `ValidUntilInvalid` carry nothing. `ProfileLoadError::NotFound` carries
+  nothing, `InvalidName` carries only `reason`, `VersionUnsupported` carries
+  only `supported`, `InvalidScanIdBound` and `InvalidHorizonBound` carry only
+  `upper_bound`, `Extraction` replaces `Figment`, and `TomlSyntax` reports
+  syntax positions. `ProfileSaveError::InvalidName` and
+  `HaltError::InvalidName` carry only `reason`. `MigrateError` carries no
+  profile name, and `MigrateError::UnknownVersion` carries only `supported`.
+  `ProfileNameMismatch` exposes `names_another_profile` in place of
+  `requested`, `derived` and `service`. `Caip2ParseError::Unknown` and
+  `CounterpartyKindParseError::UnknownKind` carry nothing, and
+  `CounterpartyKindParseError::InvalidValue` carries only `field`.
+  `RpcUrlError::InvalidUrl` and `NonHttps` carry nothing, and
+  `HostNotAllowed` carries only the allow-list. `SaError::NetworksTomlParse`
+  carries a `position` in place of its parser source. Callers pass argument
+  names or fixed checks instead of values.
+- `stellar-agent approve` without `--id`, and `stellar-agent fees stats` with
+  an `--rpc-url` that breaks the RPC URL rule, refuse with
+  `validation.config_invalid`.
 
 - `MintRequest::chain_deadline_ms` caps authorization expiry at the signed
   envelope's deadline. `MainnetPrecondition` includes `DeadlineMissing`,
@@ -638,6 +664,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the keyring records (`audit.carrier_replaced`), so replacing a lock file cannot
   let a stale drain erase an operator row queued after it. `audit bind-carriers`
   records the lock files and starts a new outbox generation.
+- Errors, guidance, logs, MCP stderr and CLI output name the rejected argument,
+  field, line, position or check without its value. This includes policy
+  semantics, credentials and registries, endpoint URLs, configuration values
+  and CLI usage diagnostics. A profile name that resolves to no profile is
+  absent from the refusal and its log event.
+  `ValidationError::MainnetRpcUrlRequired`, `X402Error::UnsupportedScheme` and
+  `X402Error::UnsupportedNetwork` carry no rejected value. The V1 policy loader and
+  `profile sign-policy` report a key outside the policy schema by its location
+  and the keys accepted there, without the key. A profile, policy, halt-marker
+  or registry syntax error reports its line and column. A seed or credential typed into the wrong
+  place stays out of diagnostics.
 
 - Classic mainnet envelopes built by `pay`, `claim`, `accounts create`,
   `trustline` and their MCP tools carry an on-chain deadline 120 seconds after

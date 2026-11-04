@@ -64,7 +64,7 @@ impl CanonicalAsset {
             Self::Native => StellarAmount::parse_with_unit(input),
             Self::Classic { code, .. } => StellarAmount::parse_with_unit_for(input, code),
             Self::Contract(_) => Err(ValidationError::AssetInvalid {
-                input: self.to_string(),
+                field: "asset".into(),
             }),
         }
     }
@@ -216,8 +216,9 @@ mod tests {
             assert_eq!(error.code(), "validation.amount_malformed");
             assert_eq!(
                 error.to_string(),
-                format!("amount '100 {supplied}' has unit '{supplied}'; expected unit '{code}'")
+                format!("the amount has the wrong unit; expected unit '{code}'")
             );
+            assert!(!format!("{error:?}").contains(&format!("100 {supplied}")));
         }
         let contract = stellar_strkey::Contract([7; 32]).to_string();
         assert!(matches!(

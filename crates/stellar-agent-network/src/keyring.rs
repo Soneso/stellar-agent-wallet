@@ -214,7 +214,7 @@ pub fn init_platform_keyring_store() -> Result<(), WalletError> {
     // code, with the variable or condition at fault, and no keyring entry.
     if let Some(backend) = stellar_agent_headless_keyring::requested_backend() {
         return stellar_agent_headless_keyring::init_headless_store(&backend).map_err(|e| {
-            tracing::debug!(error = %e, backend = %backend, "headless keyring store init failure");
+            tracing::debug!(error = %e, "headless keyring store init failure");
             WalletError::Auth(AuthError::KeyringConfigInvalid {
                 detail: e.to_string(),
             })
@@ -1829,9 +1829,7 @@ pub fn enrolled_signer(
     use stellar_agent_core::profile::loader::{ProfileLoadError, read_signer_ref_on_disk};
 
     let stored = read_signer_ref_on_disk(name, profiles_dir).map_err(|error| match error {
-        ProfileLoadError::NotFound { name, .. } => {
-            WalletError::Validation(ValidationError::ProfileNotFound { name })
-        }
+        ProfileLoadError::NotFound => WalletError::Validation(ValidationError::ProfileNotFound),
         other => WalletError::Validation(ValidationError::ConfigInvalid {
             component: "profile",
             reason: stellar_agent_core::observability::redact_path_in_message(&format!(
@@ -3604,7 +3602,7 @@ mod tests {
     #[serial_test::serial]
     fn key_scope_reserves_the_audit_writer_tip_anchor() {
         use stellar_agent_core::profile::key_scope::{
-            Coordinate, KeyScopeKind, SharedRecovery, key_scope_findings_in_dir,
+            KeyScopeKind, SharedRecovery, key_scope_findings_in_dir,
         };
         use stellar_agent_core::profile::loader::save_to_dir;
         let home = tempfile::tempdir().unwrap();
@@ -3641,10 +3639,10 @@ mod tests {
                 &finding.kind,
                 KeyScopeKind::SharedWithSibling {
                     field: "audit_log_hash_chain_key_id (tip anchor)",
-                    coordinate,
+                    sibling,
+                    sibling_field,
                     recovery: SharedRecovery::CorrectTheSiblingFile,
-                    ..
-                } if *coordinate == Coordinate::from(&anchor)
+                } if sibling == "bob" && sibling_field == "attestation_key_id"
             )),
             "{findings:?}"
         );

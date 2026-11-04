@@ -98,14 +98,18 @@ fn shared_entry_refusal_reaches_typed_and_raw_envelopes() {
             "{value}"
         );
         let message = value["error"]["message"].as_str().unwrap();
-        for part in [
-            "attestation_key_id",
-            "stellar-agent-attestation-alice/default",
-            "bob",
-            "correct that profile's file",
-        ] {
-            assert!(message.contains(part), "{message}");
-        }
+        // The refusal names the field, the sibling and the recovery, never
+        // the shared keyring coordinate.
+        assert_eq!(
+            message,
+            "profile 'alice': its entry for attestation_key_id is also named by profile 'bob' as \
+             attestation_key_id; correct that profile's file, this entry is the default for this \
+             profile's name"
+        );
+        assert!(
+            !message.contains("stellar-agent-attestation-alice"),
+            "{message}"
+        );
     }
 }
 

@@ -42,6 +42,16 @@ wallet never logs secret material or raw argument values, and reports should fol
 discipline; a redacted strkey or a SHA-256 digest is enough to identify an affected
 account or envelope.
 
+Errors, guidance, logs, MCP stderr and CLI output name the rejected argument,
+field, line, position or check and never repeat the rejected value. This rule
+covers policy semantics, credential names and registries, endpoint URLs and
+configuration values as well as validation, profile, migration and trust-set
+errors. A profile name that resolves to no profile and a policy key outside the
+policy schema are rejected values too: the refusal and its log event name the
+failure class, or the key's location and the keys accepted there. A seed or
+credential typed into the wrong place stays out of diagnostics.
+A profile, policy, halt-marker or registry syntax error reports its line and column.
+
 We handle reports under coordinated disclosure and aim to acknowledge and triage valid
 reports in good faith as promptly as we can. We will keep you informed as we
 investigate and work toward a fix. Please give us reasonable time to address an issue

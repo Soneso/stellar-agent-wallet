@@ -93,7 +93,7 @@ pub fn parse_memo_fields(
         let bytes = text.as_bytes();
         if bytes.len() > 28 {
             return Err(WalletError::Validation(ValidationError::MemoInvalidType {
-                memo_type: format!("TEXT (length {} exceeds 28-byte maximum)", bytes.len()),
+                memo_type: format!("TEXT (length {} exceeds 28-byte maximum)", bytes.len()).into(),
             }));
         }
         if let Some(code_point) = stellar_agent_core::amount::first_memo_control_character(text) {
@@ -103,7 +103,7 @@ pub fn parse_memo_fields(
         }
         let string_m: StringM<28> = bytes.to_vec().try_into().map_err(|_| {
             WalletError::Validation(ValidationError::MemoInvalidType {
-                memo_type: "TEXT (XDR StringM<28> conversion failed)".to_owned(),
+                memo_type: "TEXT (XDR StringM<28> conversion failed)".into(),
             })
         })?;
         return Ok(Memo::Text(string_m));
@@ -143,7 +143,7 @@ pub(crate) fn decode_32_hex_bytes(hex_str: &str, memo_type: &str) -> Result<[u8;
     // bytes; the mapped error never echoes attacker-supplied memo bytes.
     stellar_agent_core::hex::decode_hex32(hex_str).map_err(|_| {
         WalletError::Validation(ValidationError::MemoInvalidType {
-            memo_type: format!("{memo_type} (must be exactly 64 hex characters)"),
+            memo_type: format!("{memo_type} (must be exactly 64 hex characters)").into(),
         })
     })
 }
@@ -166,6 +166,27 @@ mod tests {
     use wiremock::{Mock, MockServer};
 
     use super::*;
+
+    #[test]
+    fn memo_seed_inputs_are_not_echoed() {
+        use stellar_agent_test_support::rejected_value::{assert_no_marker, seed_marker};
+        let marker = seed_marker();
+        for args in [
+            (Some(marker.as_str()), None, None),
+            (None, Some(marker.as_str()), None),
+            (None, None, Some(marker.as_str())),
+        ] {
+            let error =
+                parse_memo_fields(args.0, None, args.1, args.2).expect_err("a seed is not a memo");
+            assert_no_marker(&error, &marker);
+            assert_eq!(error.code(), "validation.memo_invalid_type");
+            let json =
+                serde_json::to_string(&stellar_agent_core::envelope::Envelope::<()>::err(&error))
+                    .unwrap();
+            assert!(!json.contains(&marker));
+        }
+    }
+
     use crate::StellarRpcClient;
     use stellar_xdr::{Limits, WriteXdr};
 

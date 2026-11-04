@@ -781,7 +781,7 @@ async fn simulate_issued_amount_refuses_xlm_unit_before_rpc() {
     assert_eq!(error.data.unwrap()["code"], "validation.amount_malformed");
     assert_eq!(
         error.message,
-        "validation.amount_malformed: amount '100 XLM' has unit 'XLM'; expected unit 'TST'"
+        "validation.amount_malformed: the amount has the wrong unit; expected unit 'TST'"
     );
 }
 
@@ -801,13 +801,13 @@ async fn commit_issued_amount_refuses_xlm_unit_before_rpc() {
     assert_eq!(error.data.unwrap()["code"], "validation.amount_malformed");
     assert_eq!(
         error.message,
-        "validation.amount_malformed: amount '100 XLM' has unit 'XLM'; expected unit 'TST'"
+        "validation.amount_malformed: the amount has the wrong unit; expected unit 'TST'"
     );
 }
 
 #[tokio::test]
 #[serial]
-async fn payment_amount_errors_preserve_raw_input_before_rpc() {
+async fn payment_amount_errors_name_the_amount_before_rpc() {
     let _data_root = crate::common::isolated_data_root();
     keyring_mock::install().unwrap();
     let server = WalletServer::new(testnet_profile_with_rpc("http://127.0.0.1:1")).unwrap();
@@ -816,49 +816,49 @@ async fn payment_amount_errors_preserve_raw_input_before_rpc() {
             "1 000 xlm",
             "native".to_owned(),
             "validation.amount_malformed",
-            "amount '1 000 xlm' could not be parsed as a valid amount",
+            "the amount could not be parsed as a valid amount",
         ),
         (
             "+1 xlm",
             "native".to_owned(),
             "validation.amount_malformed",
-            "amount '+1 xlm' could not be parsed as a valid amount",
+            "the amount could not be parsed as a valid amount",
         ),
         (
             "1.2.3 xlm",
             "native".to_owned(),
             "validation.amount_malformed",
-            "amount '1.2.3 xlm' could not be parsed as a valid amount",
+            "the amount could not be parsed as a valid amount",
         ),
         (
             " 1.2.3 xlm ",
             "native".to_owned(),
             "validation.amount_malformed",
-            "amount ' 1.2.3 xlm ' could not be parsed as a valid amount",
+            "the amount could not be parsed as a valid amount",
         ),
         (
             "10 usdc",
             format!("USDC:{DEST_G}"),
             "validation.amount_malformed",
-            "amount '10 usdc' has unit 'usdc'; expected unit 'USDC'",
+            "the amount has the wrong unit; expected unit 'USDC'",
         ),
         (
             " 10 usdc ",
             format!("USDC:{DEST_G}"),
             "validation.amount_malformed",
-            "amount ' 10 usdc ' has unit 'usdc'; expected unit 'USDC'",
+            "the amount has the wrong unit; expected unit 'USDC'",
         ),
         (
             " 0.00000001 xlm ",
             "native".to_owned(),
             "validation.amount_precision_exceeded",
-            "amount ' 0.00000001 xlm ' exceeds the maximum precision of 7 decimal places",
+            "the amount exceeds the maximum precision of 7 decimal places",
         ),
         (
             " 99999999999999999999 xlm ",
             "native".to_owned(),
             "validation.amount_out_of_range",
-            "amount ' 99999999999999999999 xlm ' is outside the representable i64 stroop range",
+            "the amount is outside the representable i64 stroop range",
         ),
     ] {
         let value = serde_json::json!({
@@ -876,6 +876,7 @@ async fn payment_amount_errors_preserve_raw_input_before_rpc() {
             let error = result.unwrap_err();
             assert_eq!(error.data.unwrap()["code"], expected_code);
             assert_eq!(error.message, format!("{expected_code}: {message}"));
+            assert!(!error.message.contains(raw.trim()), "{}", error.message);
         }
     }
 }

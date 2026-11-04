@@ -416,18 +416,65 @@ fn report_parse_error(error: &clap::Error) -> i32 {
     }
 }
 
-/// The error envelope for a parse failure: code `validation.usage_error`,
-/// with clap's unstyled rendering, trimmed and without its leading `error: `,
-/// as the message.
-///
-/// A flag parser that refuses a value never echoes it in its own error text
-/// (see `EndpointUrlFlag`), so a rejected credential does not reach the
-/// message.
+/// Builds a usage refusal from the error class and schema-defined argument names.
+/// Parser renderings and rejected values never enter the envelope.
 fn usage_error_envelope(error: &clap::Error) -> stellar_agent_core::envelope::Envelope<()> {
-    let rendered = error.render().to_string();
-    let trimmed = rendered.trim();
-    let message = trimmed.strip_prefix("error: ").unwrap_or(trimmed);
+    use clap::CommandFactory;
+    use clap::error::{ContextKind, ContextValue, ErrorKind};
+
+    // Match the parser's argument context against the schema before using it.
+    // Unknown flags and subcommands are caller input, even in this context.
+    let reported = match error.get(ContextKind::InvalidArg) {
+        Some(ContextValue::String(name)) => vec![name.as_str()],
+        Some(ContextValue::Strings(names)) => names.iter().map(String::as_str).collect(),
+        _ => Vec::new(),
+    };
+    let mut command = Cli::command();
+    command.build();
+    let names: Vec<String> = reported
+        .into_iter()
+        .filter_map(|name| schema_argument_name(&command, name))
+        .collect();
+    let message = if names.is_empty() {
+        "command-line arguments are not valid; run the command with --help for the accepted arguments".to_owned()
+    } else {
+        let class = match error.kind() {
+            ErrorKind::MissingRequiredArgument => "a required argument is missing",
+            ErrorKind::ArgumentConflict => "arguments conflict",
+            ErrorKind::TooManyValues => "too many values",
+            ErrorKind::TooFewValues | ErrorKind::WrongNumberOfValues => {
+                "the number of values is not valid"
+            }
+            ErrorKind::InvalidValue | ErrorKind::ValueValidation => {
+                "the argument value is not valid"
+            }
+            _ => "command-line arguments are not valid",
+        };
+        format!(
+            "{class}: {}; run the command with --help for the accepted arguments",
+            names.join(", ")
+        )
+    };
     stellar_agent_core::envelope::Envelope::<()>::err_raw("validation.usage_error", message)
+}
+
+/// Returns only a name defined by the command schema, never the supplied text.
+fn schema_argument_name(command: &clap::Command, reported: &str) -> Option<String> {
+    for argument in command.get_arguments() {
+        if reported == argument.to_string()
+            || argument
+                .get_long()
+                .is_some_and(|long| reported == format!("--{long}"))
+        {
+            return Some(argument.get_long().map_or_else(
+                || argument.get_id().as_str().to_owned(),
+                |long| format!("--{long}"),
+            ));
+        }
+    }
+    command
+        .get_subcommands()
+        .find_map(|subcommand| schema_argument_name(subcommand, reported))
 }
 
 /// Loads the selected profile locally before scanning its configured audit log.
@@ -446,7 +493,6 @@ fn run_profile_startup_advisory(
         Ok(profile) => scan(&profile.audit_log_path),
         Err(error) => {
             tracing::debug!(
-                profile = %resolved.name,
                 code = error.code(),
                 "startup advisory: profile not loaded; advisory skipped"
             );
@@ -460,6 +506,32 @@ mod tests {
     #![allow(clippy::expect_used, reason = "test-only")]
 
     use super::*;
+
+    #[test]
+    #[serial_test::serial]
+    fn startup_refusal_log_omits_the_requested_profile() {
+        use stellar_agent_test_support::log_capture::{CaptureWriter, inert_dispatcher};
+        let home = tempfile::tempdir().expect("test home");
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
+        let capture = CaptureWriter::new();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_ansi(false)
+            .with_writer(capture.clone())
+            .finish();
+        let _inert = inert_dispatcher();
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::callsite::rebuild_interest_cache();
+            run_profile_startup_advisory(Some("CREDMARKER7"), |_| {
+                unreachable!("an absent profile cannot be scanned")
+            });
+        });
+        let logs = capture.captured_str();
+        assert!(logs.contains("startup advisory: profile not loaded; advisory skipped"));
+        assert!(logs.contains("code="));
+        assert!(!logs.contains("CREDMARKER7"));
+        assert!(!logs.contains("profile="));
+    }
 
     /// Parses an argument vector the way `main` does and returns the profile
     /// the startup advisory would scan.

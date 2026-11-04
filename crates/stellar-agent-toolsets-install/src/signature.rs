@@ -160,8 +160,8 @@ pub fn verify_signature(
 /// Shared file-read prelude for all trust-set loaders.
 ///
 /// Opens `path`, reads at most `MAX_TRUST_SET_BYTES + 1` bytes through a capped
-/// reader, rejects if the content exceeds the cap, and delegates to
-/// [`parse_trust_set_content`].  Used by both [`load_trust_set`] and
+/// reader, rejects if the content exceeds the cap, and parses the content
+/// with the file kind as its label.  Used by both [`load_trust_set`] and
 /// `attestation::load_auditor_trust_set` so the size-cap and absent-file logic
 /// lives in one place.
 ///
@@ -170,7 +170,7 @@ pub fn verify_signature(
 /// Same contract as [`load_trust_set`].
 pub(crate) fn load_trust_set_file(
     path: &Path,
-    size_cap_label: &str,
+    label: &str,
 ) -> Result<BTreeSet<[u8; 32]>, ToolsetInstallError> {
     // Absent file → TrustSetEmpty (fail-closed).
     let file = match std::fs::File::open(path) {
@@ -190,11 +190,11 @@ pub(crate) fn load_trust_set_file(
 
     if content.len() > MAX_TRUST_SET_BYTES {
         return Err(ToolsetInstallError::TrustSetMalformed {
-            detail: format!("{size_cap_label} trust-set file exceeds size cap"),
+            detail: format!("{label} trust-set file exceeds size cap"),
         });
     }
 
-    parse_trust_set_content(&content)
+    parse_trust_set_content_with_label(&content, label)
 }
 
 /// Loads and parses the publisher trust-set file at `path`.
@@ -222,9 +222,7 @@ pub fn load_trust_set(path: &Path) -> Result<BTreeSet<[u8; 32]>, ToolsetInstallE
     load_trust_set_file(path, "publisher")
 }
 
-/// Parses trust-set content from a string (extracted for testability).
-///
-/// Used by [`load_trust_set`] and directly in tests.
+/// Parses publisher trust-set content from a string.
 ///
 /// # Errors
 ///
@@ -232,10 +230,18 @@ pub fn load_trust_set(path: &Path) -> Result<BTreeSet<[u8; 32]>, ToolsetInstallE
 /// - [`ToolsetInstallError::TrustSetMalformed`] — any entry is malformed,
 ///   duplicated, or the entry count exceeds the cap.
 pub fn parse_trust_set_content(content: &str) -> Result<BTreeSet<[u8; 32]>, ToolsetInstallError> {
+    parse_trust_set_content_with_label(content, "publisher")
+}
+
+fn parse_trust_set_content_with_label(
+    content: &str,
+    label: &str,
+) -> Result<BTreeSet<[u8; 32]>, ToolsetInstallError> {
     let mut keys: BTreeSet<[u8; 32]> = BTreeSet::new();
     let mut count = 0usize;
 
-    for raw_line in content.lines() {
+    for (index, raw_line) in content.lines().enumerate() {
+        let n = index + 1;
         let line = raw_line.trim();
 
         // Skip blank lines and comment lines.
@@ -253,10 +259,7 @@ pub fn parse_trust_set_content(content: &str) -> Result<BTreeSet<[u8; 32]>, Tool
         // Reject non-G-strkey inputs immediately (no panic on decode).
         let pubkey = StrPublicKey::from_string(line).map_err(|_| {
             ToolsetInstallError::TrustSetMalformed {
-                detail: stellar_agent_toolsets::sanitise_display(
-                    &format!("invalid G-strkey entry: '{line}'"),
-                    256,
-                ),
+                detail: format!("{label} trust set line {n}: not a G-strkey"),
             }
         })?;
 
@@ -266,10 +269,7 @@ pub fn parse_trust_set_content(content: &str) -> Result<BTreeSet<[u8; 32]>, Tool
         // 32 bytes are caught because we compare raw bytes, not the strkey string).
         if keys.contains(&raw_bytes) {
             return Err(ToolsetInstallError::TrustSetMalformed {
-                detail: stellar_agent_toolsets::sanitise_display(
-                    &format!("duplicate key: '{line}'"),
-                    256,
-                ),
+                detail: format!("{label} trust set line {n}: duplicate key"),
             });
         }
 
@@ -486,5 +486,32 @@ mod tests {
             matches!(err, ToolsetInstallError::UntrustedPublisher { .. }),
             "expected UntrustedPublisher, got: {err:?}"
         );
+    }
+
+    use stellar_agent_test_support::rejected_value::{assert_no_marker, seed_marker};
+
+    #[test]
+    fn a_rejected_trust_line_is_never_echoed() {
+        let marker = seed_marker();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("trust.txt");
+        std::fs::write(&path, format!("# trusted publishers\n{marker}\n")).unwrap();
+        let err = load_trust_set(&path).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "trust set malformed: publisher trust set line 2: not a G-strkey"
+        );
+        assert_no_marker(&err, &marker);
+    }
+
+    #[test]
+    fn a_duplicate_trust_line_is_reported_by_number() {
+        let key = stellar_strkey::ed25519::PublicKey([7; 32]).to_string();
+        let err = parse_trust_set_content(&format!("{key}\n{key}\n")).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("publisher trust set line 2: duplicate key")
+        );
+        assert_no_marker(&err, &key);
     }
 }

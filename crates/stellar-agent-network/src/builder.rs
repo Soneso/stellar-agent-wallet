@@ -112,7 +112,7 @@ impl Asset {
             Self::Native => Ok(CanonicalAsset::Native),
             Self::Credit { code, issuer } => CanonicalAsset::classic(code, issuer).map_err(|_| {
                 WalletError::Validation(ValidationError::AssetInvalid {
-                    input: format!("{code}:{issuer}"),
+                    field: "asset".into(),
                 })
             }),
         }
@@ -147,21 +147,21 @@ impl Asset {
         // Must be CODE:ISSUER
         let Some((code, issuer)) = input.split_once(':') else {
             return Err(WalletError::Validation(ValidationError::AssetInvalid {
-                input: input.to_owned(),
+                field: "asset".into(),
             }));
         };
 
         let code_len = code.len();
         if code_len == 0 || code_len > 12 || !code.chars().all(|c| c.is_ascii_alphanumeric()) {
             return Err(WalletError::Validation(ValidationError::AssetInvalid {
-                input: input.to_owned(),
+                field: "asset".into(),
             }));
         }
 
         // Validate issuer as a valid G-strkey.
         stellar_strkey::ed25519::PublicKey::from_string(issuer).map_err(|_| {
             WalletError::Validation(ValidationError::AssetInvalid {
-                input: input.to_owned(),
+                field: "asset".into(),
             })
         })?;
 
@@ -198,12 +198,12 @@ impl Asset {
         let code_len = code.len();
         if code_len == 0 || code_len > 12 || !code.chars().all(|c| c.is_ascii_alphanumeric()) {
             return Err(WalletError::Validation(ValidationError::AssetInvalid {
-                input: code.to_owned(),
+                field: "code".into(),
             }));
         }
         stellar_strkey::ed25519::PublicKey::from_string(issuer).map_err(|_| {
             WalletError::Validation(ValidationError::AssetInvalid {
-                input: issuer.to_owned(),
+                field: "issuer".into(),
             })
         })?;
         Ok(Self::Credit {
@@ -452,9 +452,7 @@ impl ClassicOpBuilder {
     ) -> Result<&mut Self, WalletError> {
         // Validate destination is a valid G-strkey.
         stellar_strkey::ed25519::PublicKey::from_string(destination).map_err(|_| {
-            WalletError::Validation(ValidationError::AddressInvalid {
-                input: destination.to_owned(),
-            })
+            WalletError::Validation(ValidationError::address_argument("destination"))
         })?;
 
         let stroops = starting_balance.as_stroops();
@@ -510,9 +508,7 @@ impl ClassicOpBuilder {
     ) -> Result<&mut Self, WalletError> {
         // Validate destination is a valid G-strkey.
         stellar_strkey::ed25519::PublicKey::from_string(destination).map_err(|_| {
-            WalletError::Validation(ValidationError::AddressInvalid {
-                input: destination.to_owned(),
-            })
+            WalletError::Validation(ValidationError::address_argument("destination"))
         })?;
 
         let baselib_asset = asset.to_baselib()?;
@@ -584,15 +580,10 @@ impl ClassicOpBuilder {
         sponsored_id: &str,
     ) -> Result<&mut Self, WalletError> {
         // Validate both addresses as valid G-strkeys.
-        stellar_strkey::ed25519::PublicKey::from_string(op_source).map_err(|_| {
-            WalletError::Validation(ValidationError::AddressInvalid {
-                input: op_source.to_owned(),
-            })
-        })?;
+        stellar_strkey::ed25519::PublicKey::from_string(op_source)
+            .map_err(|_| WalletError::Validation(ValidationError::address_argument("op_source")))?;
         stellar_strkey::ed25519::PublicKey::from_string(sponsored_id).map_err(|_| {
-            WalletError::Validation(ValidationError::AddressInvalid {
-                input: sponsored_id.to_owned(),
-            })
+            WalletError::Validation(ValidationError::address_argument("sponsored_id"))
         })?;
 
         // Build with per-operation source.
@@ -644,15 +635,10 @@ impl ClassicOpBuilder {
         destination: &str,
     ) -> Result<&mut Self, WalletError> {
         // Validate both addresses.
-        stellar_strkey::ed25519::PublicKey::from_string(op_source).map_err(|_| {
-            WalletError::Validation(ValidationError::AddressInvalid {
-                input: op_source.to_owned(),
-            })
-        })?;
+        stellar_strkey::ed25519::PublicKey::from_string(op_source)
+            .map_err(|_| WalletError::Validation(ValidationError::address_argument("op_source")))?;
         stellar_strkey::ed25519::PublicKey::from_string(destination).map_err(|_| {
-            WalletError::Validation(ValidationError::AddressInvalid {
-                input: destination.to_owned(),
-            })
+            WalletError::Validation(ValidationError::address_argument("destination"))
         })?;
 
         // Starting balance is 0 (CAP-33 sponsored creation; base reserve paid by sponsor).
@@ -731,8 +717,7 @@ impl ClassicOpBuilder {
     ) -> Result<&mut Self, WalletError> {
         if matches!(asset, Asset::Native) {
             return Err(WalletError::Validation(ValidationError::AssetInvalid {
-                input: "native (XLM): trustlines can only be created for non-native assets"
-                    .to_owned(),
+                field: "native (XLM): trustlines can only be created for non-native assets".into(),
             }));
         }
 
@@ -924,11 +909,8 @@ impl ClassicOpBuilder {
         &mut self,
         op_source: &str,
     ) -> Result<&mut Self, WalletError> {
-        stellar_strkey::ed25519::PublicKey::from_string(op_source).map_err(|_| {
-            WalletError::Validation(ValidationError::AddressInvalid {
-                input: op_source.to_owned(),
-            })
-        })?;
+        stellar_strkey::ed25519::PublicKey::from_string(op_source)
+            .map_err(|_| WalletError::Validation(ValidationError::address_argument("op_source")))?;
 
         let xdr_op = BaselibOperation::with_source(op_source)
             .map_err(|e| {
@@ -1033,7 +1015,7 @@ impl ClassicOpBuilder {
         if let CurrMemo::Text(text) = memo {
             let text = std::str::from_utf8(text.as_slice()).map_err(|_| {
                 WalletError::Validation(ValidationError::MemoInvalidType {
-                    memo_type: "TEXT (invalid UTF-8)".to_owned(),
+                    memo_type: "TEXT (invalid UTF-8)".into(),
                 })
             })?;
             crate::memo::parse_memo_fields(Some(text), None, None, None)?;
@@ -2788,5 +2770,20 @@ mod tests {
             }
             other => panic!("expected Payment op, got: {other:?}"),
         }
+    }
+
+    use stellar_agent_test_support::rejected_value::assert_no_marker;
+
+    #[test]
+    fn a_seed_as_payment_destination_is_not_echoed() {
+        let marker = stellar_agent_test_support::rejected_value::seed_marker();
+        let mut builder =
+            ClassicOpBuilder::new(TEST_SOURCE, 101, "Test SDF Network ; September 2015", 100);
+        let err = builder
+            .payment(&marker, StellarAmount::from_stroops(100), &Asset::Native)
+            .err()
+            .unwrap();
+        assert_no_marker(&err, &marker);
+        assert!(err.to_string().contains("destination"));
     }
 }

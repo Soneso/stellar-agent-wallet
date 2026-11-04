@@ -47,7 +47,7 @@ A mainnet profile loads only through `--profile <name>`. `STELLAR_AGENT_PROFILE`
 
 Some commands take the profile as a positional argument instead of a flag (the `profile` group itself); those cases are noted on their page.
 
-The selected name must also be the name the profile file carries. Every command that loads a profile compares the selected name against the one derived from the file's `policy_owner_key_id.service`, and refuses with `profile.name_mismatch` when the two disagree — the case a `<name>.toml` copied or renamed from another profile produces. The refusal names both profiles and quotes the offending field; recover with `stellar-agent profile init --profile <name>`, or by correcting that field to `stellar-agent-owner-<name>`. `stellar-agent profile show <name>` is the one command that still displays a mismatched profile, so the field can be read.
+The selected name must also be the name the profile file carries. Every command that loads a profile compares the selected name against the one derived from the file's `policy_owner_key_id.service`, and refuses with `profile.name_mismatch` when the two disagree, as they do for a `<name>.toml` copied or renamed from another profile. The refusal names the offending field without its value or either profile name; recover with `stellar-agent profile init --profile <name>`, or by correcting that field to `stellar-agent-owner-<name>`. `stellar-agent profile show <name>` is the one command that still displays a mismatched profile, so the field can be read.
 
 ### Network
 

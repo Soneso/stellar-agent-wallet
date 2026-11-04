@@ -555,14 +555,9 @@ fn resolve_profile_inputs_with_profile(
 /// another profile" and "the file is malformed" must be distinguishable in the
 /// refusal.
 fn load_profile_for_verify(resolved: &ResolvedProfileName) -> Result<Profile, WalletError> {
-    let profile_name = &resolved.name;
     load_profile_reconciled(resolved).map_err(|e| {
-        tracing::debug!(
-            profile = %profile_name,
-            error = %e,
-            "profile access refused for audit verify"
-        );
-        e.to_wallet_error(profile_name)
+        tracing::debug!(error = %e, "profile access refused for audit verify");
+        e.to_wallet_error()
     })
 }
 
@@ -1917,5 +1912,29 @@ mod tests {
         .unwrap();
         assert_eq!(result.entries_verified, 1);
         assert_eq!(result.outbox_pending, Some(0));
+    }
+
+    /// The refusal event for an absent profile names the failure class and
+    /// never the requested profile name.
+    #[test]
+    #[serial]
+    fn absent_profile_refusal_log_omits_the_requested_name() {
+        use crate::common::refusal_log_fixture::{
+            ABSENT_PROFILE_MARKER, assert_refusal_omits_requested_profile,
+            capture_absent_profile_refusal,
+        };
+        let (code, logs) = capture_absent_profile_refusal(|home| {
+            let args = VerifyArgs {
+                log_path: home.join("audit.jsonl"),
+                profile: Some(ABSENT_PROFILE_MARKER.to_owned()),
+                output: OutputFormat::DEFAULT,
+            };
+            async move { run(&args).await }
+        });
+        assert_refusal_omits_requested_profile(
+            code,
+            &logs,
+            "profile access refused for audit verify",
+        );
     }
 }

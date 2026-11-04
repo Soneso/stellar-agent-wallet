@@ -53,8 +53,15 @@ enum Failure {
 impl From<OwnerSeedError> for Failure {
     fn from(error: OwnerSeedError) -> Self {
         let detail = match error {
-            OwnerSeedError::NotSet { var } => format!("owner seed variable '{var}' is not set"),
-            OwnerSeedError::Invalid { var } => format!("owner seed variable '{var}' is invalid"),
+            // The flag value names no set variable, so the text names the flag.
+            OwnerSeedError::NotSet => {
+                "--owner-secret-env names an environment variable that is not set".to_owned()
+            }
+            OwnerSeedError::Invalid => {
+                "--owner-secret-env names an environment variable that does not hold a valid \
+                 S-strkey"
+                    .to_owned()
+            }
             OwnerSeedError::Unlock(detail) => detail,
         };
         Self::Refused("profile.bind_signer_owner_seed", detail)
@@ -95,7 +102,7 @@ pub(crate) async fn run(args: &BindSignerArgs) -> i32 {
         Err(error) => {
             return render::write_envelope(
                 &mut std::io::stdout(),
-                &profile_access_envelope(&error, &resolved.name),
+                &profile_access_envelope(&error),
                 1,
             );
         }
@@ -235,6 +242,30 @@ mod tests {
     use stellar_agent_core::policy::pin::Pin;
     use stellar_agent_test_support::keyring_mock;
 
+    struct EnvGuard {
+        var: String,
+    }
+    impl EnvGuard {
+        #[allow(
+            unsafe_code,
+            reason = "test-only env mutation; serialised by #[serial]"
+        )]
+        fn set(var: String, value: &str) -> Self {
+            unsafe {
+                std::env::set_var(&var, value);
+            }
+            Self { var }
+        }
+    }
+    impl Drop for EnvGuard {
+        #[allow(unsafe_code, reason = "test-only env cleanup")]
+        fn drop(&mut self) {
+            unsafe {
+                std::env::remove_var(&self.var);
+            }
+        }
+    }
+
     struct Fixture {
         dir: tempfile::TempDir,
         profile: Profile,
@@ -335,6 +366,71 @@ mod tests {
                 "the agent seed is never read"
             );
         }
+    }
+
+    /// An `--owner-secret-env` value that names no set variable, or a variable
+    /// without a valid S-strkey, refuses by the flag, without the variable
+    /// name.
+    #[tokio::test]
+    #[serial]
+    async fn owner_seed_variable_marker_is_not_echoed() {
+        use stellar_agent_test_support::rejected_value::{
+            CREDENTIAL_MARKER, assert_no_marker_in_text,
+        };
+
+        let unset_var = format!("{CREDENTIAL_MARKER}_{}", std::process::id());
+        let failure = with_owner_seed(
+            &unset_var,
+            "profile-bind-signer",
+            stellar_agent_core::wallet::MlockRequired::Warn,
+            60,
+            async |_key| -> Result<bool, Failure> { panic!("an unset variable yields no key") },
+        )
+        .await
+        .unwrap_err();
+        let Failure::Refused(code, detail) = failure else {
+            panic!("an unset variable is a refusal of the verb");
+        };
+        assert_eq!(code, "profile.bind_signer_owner_seed");
+        assert_eq!(
+            detail,
+            "--owner-secret-env names an environment variable that is not set"
+        );
+        assert_no_marker_in_text(&detail, CREDENTIAL_MARKER);
+
+        let invalid_var = format!("{CREDENTIAL_MARKER}_INVALID_{}", std::process::id());
+        let _invalid = EnvGuard::set(invalid_var.clone(), CREDENTIAL_MARKER);
+        let failure = with_owner_seed(
+            &invalid_var,
+            "profile-bind-signer",
+            stellar_agent_core::wallet::MlockRequired::Warn,
+            60,
+            async |_key| -> Result<bool, Failure> { panic!("an invalid seed yields no key") },
+        )
+        .await
+        .unwrap_err();
+        assert_no_marker_in_text(&format!("{failure:?}"), CREDENTIAL_MARKER);
+        let Failure::Refused(code, detail) = failure else {
+            panic!("an invalid seed is a refusal of the verb");
+        };
+        assert_eq!(code, "profile.bind_signer_owner_seed");
+        assert_eq!(
+            detail,
+            "--owner-secret-env names an environment variable that does not hold a valid S-strkey"
+        );
+        assert_no_marker_in_text(&detail, CREDENTIAL_MARKER);
+        let error = with_owner_seed(
+            &invalid_var,
+            "profile-bind-signer",
+            stellar_agent_core::wallet::MlockRequired::Warn,
+            60,
+            async |_key| -> Result<bool, OwnerSeedError> {
+                panic!("an invalid seed yields no key")
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_no_marker_in_text(&format!("{error:?}"), CREDENTIAL_MARKER);
     }
 
     #[test]

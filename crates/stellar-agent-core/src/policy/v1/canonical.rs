@@ -97,9 +97,8 @@ use crate::policy::PolicyError;
 /// assert!(!text.contains("owner_id"));
 /// ```
 pub fn canonical_bytes(toml_text: &str) -> Result<Vec<u8>, PolicyError> {
-    let doc = DocumentMut::from_str(toml_text).map_err(|e| PolicyError::PolicyFileParseFailed {
-        detail: e.to_string(),
-    })?;
+    let doc =
+        DocumentMut::from_str(toml_text).map_err(|e| PolicyError::toml_syntax(toml_text, &e))?;
 
     let output = build_canonical_document(&doc)?;
     Ok(output.into_bytes())
@@ -114,9 +113,7 @@ pub fn canonical_bytes(toml_text: &str) -> Result<Vec<u8>, PolicyError> {
 /// Returns the same parsing errors as [`canonical_bytes`].
 pub fn owner_rotation_bytes(toml_text: &str) -> Result<Vec<u8>, PolicyError> {
     let mut doc =
-        DocumentMut::from_str(toml_text).map_err(|e| PolicyError::PolicyFileParseFailed {
-            detail: e.to_string(),
-        })?;
+        DocumentMut::from_str(toml_text).map_err(|e| PolicyError::toml_syntax(toml_text, &e))?;
     doc.remove("signature");
     doc.remove("owner_rotation");
     Ok(build_canonical_document(&doc)?.into_bytes())

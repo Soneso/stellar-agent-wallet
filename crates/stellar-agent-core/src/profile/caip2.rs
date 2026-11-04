@@ -181,7 +181,7 @@ impl FromStr for Caip2 {
         match s {
             "stellar:testnet" => Ok(Self::Testnet),
             "stellar:mainnet" => Ok(Self::Mainnet),
-            other => Err(Caip2ParseError::Unknown(other.to_owned())),
+            _ => Err(Caip2ParseError::Unknown),
         }
     }
 }
@@ -192,12 +192,11 @@ impl FromStr for Caip2 {
 pub enum Caip2ParseError {
     /// The CAIP-2 string was not recognised.
     ///
-    /// Supported values: `stellar:testnet` and `stellar:mainnet`.
-    #[error(
-        "unknown CAIP-2 chain ID '{0}'; supported values: \
-         stellar:testnet, stellar:mainnet"
-    )]
-    Unknown(String),
+    /// Supported values: `stellar:testnet` and `stellar:mainnet`. The
+    /// refused string is not stored: it can come from a file or a tool
+    /// argument that holds other text.
+    #[error("unknown CAIP-2 chain ID; supported values: stellar:testnet, stellar:mainnet")]
+    Unknown,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -325,8 +324,15 @@ mod tests {
     #[test]
     fn from_str_unknown_is_error() {
         let err = Caip2::from_str("stellar:futurenet").unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("stellar:futurenet"), "error: {msg}");
+        assert_eq!(
+            err.to_string(),
+            "unknown CAIP-2 chain ID; supported values: stellar:testnet, stellar:mainnet"
+        );
+        let rendered = format!("{err} {err:?}");
+        assert!(!rendered.contains("futurenet"), "{rendered}");
+        let wrapped = ChainIdValidationError::from(err);
+        let rendered = format!("{wrapped} {wrapped:?}");
+        assert!(!rendered.contains("futurenet"), "{rendered}");
     }
 
     #[test]

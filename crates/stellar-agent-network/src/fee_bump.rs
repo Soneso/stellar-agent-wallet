@@ -195,12 +195,12 @@ impl From<FeeBumpError> for WalletError {
             }
             // Validation errors (caller-supplied bad input).
             FeeBumpError::InnerNotV1 { found } => {
-                WalletError::Validation(ValidationError::AddressInvalid {
-                    input: format!("inner envelope type {found} (expected Tx/v1)"),
-                })
+                WalletError::Validation(ValidationError::address_check(format!(
+                    "inner envelope type {found} (expected Tx/v1)"
+                )))
             }
-            FeeBumpError::InvalidFeeSource { detail } => {
-                WalletError::Validation(ValidationError::AddressInvalid { input: detail })
+            FeeBumpError::InvalidFeeSource { .. } => {
+                WalletError::Validation(ValidationError::address_argument("fee_source"))
             }
             // Submission errors.
             FeeBumpError::FeeBelowCap15Minimum {
@@ -623,7 +623,7 @@ fn validate_fee(
 fn parse_fee_source(fee_source: &str) -> Result<MuxedAccount, FeeBumpError> {
     let pk = stellar_strkey::ed25519::PublicKey::from_string(fee_source).map_err(|e| {
         FeeBumpError::InvalidFeeSource {
-            detail: format!("invalid fee_source G-strkey '{fee_source}': {e}"),
+            detail: format!("invalid fee_source G-strkey: {e}"),
         }
     })?;
     Ok(MuxedAccount::Ed25519(Uint256(pk.0)))

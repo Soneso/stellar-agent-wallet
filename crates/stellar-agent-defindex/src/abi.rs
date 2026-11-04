@@ -225,11 +225,8 @@ pub enum VaultAbiError {
     DepositAmountsEmpty,
 
     /// `withdraw_shares` is zero or negative.
-    #[error("withdraw: withdraw_shares must be positive (got {shares})")]
-    WithdrawSharesNotPositive {
-        /// The zero or negative share count.
-        shares: i128,
-    },
+    #[error("withdraw: withdraw_shares must be positive")]
+    WithdrawSharesNotPositive,
 
     /// `min_amounts_out` is empty.
     #[error("withdraw: min_amounts_out must not be empty")]
@@ -300,9 +297,7 @@ impl VaultWithdrawArgs {
     /// Returns [`VaultAbiError`] when structural constraints are violated.
     pub fn validate_structure(&self) -> Result<(), VaultAbiError> {
         if self.withdraw_shares <= 0 {
-            return Err(VaultAbiError::WithdrawSharesNotPositive {
-                shares: self.withdraw_shares,
-            });
+            return Err(VaultAbiError::WithdrawSharesNotPositive);
         }
         if self.min_amounts_out.is_empty() {
             return Err(VaultAbiError::WithdrawMinAmountsEmpty);
@@ -473,7 +468,7 @@ mod tests {
         assert!(
             matches!(
                 args.validate_structure(),
-                Err(VaultAbiError::WithdrawSharesNotPositive { shares: 0 })
+                Err(VaultAbiError::WithdrawSharesNotPositive)
             ),
             "zero shares must refuse"
         );
@@ -485,7 +480,7 @@ mod tests {
         assert!(
             matches!(
                 args.validate_structure(),
-                Err(VaultAbiError::WithdrawSharesNotPositive { shares: -1 })
+                Err(VaultAbiError::WithdrawSharesNotPositive)
             ),
             "negative shares must refuse"
         );

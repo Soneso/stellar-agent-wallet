@@ -45,7 +45,7 @@ struct BindingResult {
 pub async fn run(args: &BindCarriersArgs) -> i32 {
     let result = (|| -> Result<BindingResult, WalletError> {
         let profile = load_profile_reconciled(&ResolvedProfileName::from_flag(&args.profile))
-            .map_err(|error| error.to_wallet_error(&args.profile))?;
+            .map_err(|error| error.to_wallet_error())?;
         init_platform_keyring_store()?;
         let report = bind_profile(&profile, &args.profile)?;
         Ok(BindingResult {

@@ -278,7 +278,7 @@ fn resolve_store_profile(flag: Option<&str>) -> Result<ResolvedProfileName, i32>
     if let Err(reason) = validate_path_component_ascii_safe(&resolved.name) {
         let err = WalletError::Validation(ValidationError::ConfigInvalid {
             component: "profile",
-            reason: format!("invalid profile name '{}': {reason}", resolved.name),
+            reason: format!("the profile name is not a valid profile name: {reason}"),
         });
         render_json(&Envelope::<()>::err(&err));
         return Err(1);
@@ -420,7 +420,7 @@ async fn run_enroll_interactive(resolved: ResolvedProfileName, args: EnrollArgs)
     let page_identity = match page_identity_from_profile(load_profile_reconciled(&resolved)) {
         Ok(identity) => identity,
         Err(error) => {
-            render_json(&Envelope::<()>::err(&error.to_wallet_error(&profile_name)));
+            render_json(&Envelope::<()>::err(&error.to_wallet_error()));
             return 1;
         }
     };

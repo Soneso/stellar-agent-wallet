@@ -61,7 +61,7 @@ pub(crate) fn run(args: &ResetMppStateArgs) -> i32 {
     let profile = match load_profile_reconciled(&ResolvedProfileName::from_flag(profile_name)) {
         Ok(profile) => profile,
         Err(error) => {
-            render::render_json(&profile_access_envelope(&error, profile_name));
+            render::render_json(&profile_access_envelope(&error));
             return 1;
         }
     };

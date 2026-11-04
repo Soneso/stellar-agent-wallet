@@ -191,22 +191,21 @@ pub fn ensure_call_contract_context_for_spending_limit(
 /// # Errors
 ///
 /// Returns [`SaError::SpendingLimitInstallRefused`] when `limit <= 0` or
-/// `period == 0`.
+/// `period == 0`. The reason names the violated constraint and never the
+/// refused value, which arrives as caller input.
 pub fn ensure_valid_spending_limit_params(limit: i128, period: u32) -> Result<(), SaError> {
     if limit <= 0 && period == 0 {
         return Err(SaError::SpendingLimitInstallRefused {
-            reason: format!(
-                "--limit must be positive and --period must be non-zero; got limit={limit}, \
-                 period={period} (OZ install rejects both with InvalidLimitOrPeriod)"
-            ),
+            reason: "--limit must be positive and --period must be non-zero (OZ install \
+                     rejects both with InvalidLimitOrPeriod)"
+                .to_owned(),
         });
     }
     if limit <= 0 {
         return Err(SaError::SpendingLimitInstallRefused {
-            reason: format!(
-                "--limit must be positive; got {limit} (OZ install rejects non-positive \
-                 spending_limit with InvalidLimitOrPeriod)"
-            ),
+            reason: "--limit must be positive (OZ install rejects a non-positive \
+                     spending_limit with InvalidLimitOrPeriod)"
+                .to_owned(),
         });
     }
     if period == 0 {

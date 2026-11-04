@@ -36,11 +36,8 @@ pub enum ToolsetRuntimeError {
     ///
     /// This variant fires before any capability check — a toolset cannot probe
     /// whether a signing tool "would be allowed" by its capabilities.
-    #[error("toolset.unknown_action: action '{action}' is not in the capability→tool matrix")]
-    UnknownToolsetAction {
-        /// Sanitised action name from the invocation request.
-        action: String,
-    },
+    #[error("toolset.unknown_action: the requested action is not in the capability-to-tool matrix")]
+    UnknownToolsetAction,
 
     /// Part (c): the action's granting capability is not in the toolset's
     /// declared [`stellar_agent_toolsets::CapabilitySet`].
@@ -77,11 +74,8 @@ pub enum ToolsetRuntimeError {
     ///
     /// The toolset is not installed, or has been uninstalled since the invocation
     /// was queued.
-    #[error("toolset.not_installed: toolset '{name}' is not installed")]
-    ToolsetNotInstalled {
-        /// Sanitised toolset package name.
-        name: String,
-    },
+    #[error("toolset.not_installed: the requested toolset is not installed")]
+    ToolsetNotInstalled,
 
     /// Pre-check: an I/O error occurred while reading the pin record.
     #[error("toolset.io_error: {0}")]
@@ -182,14 +176,8 @@ pub enum ToolsetRuntimeError {
     /// `authoritative_amount_stroops` must be greater than zero. A zero or
     /// negative value from the decoded envelope is rejected here before any
     /// grant-store lookup or approval queuing occurs.
-    #[error(
-        "toolset.invalid_authoritative_amount: authoritative_amount_stroops must be > 0 \
-         (got {amount_stroops})"
-    )]
-    InvalidAuthoritativeAmount {
-        /// The non-positive value that was rejected.
-        amount_stroops: i64,
-    },
+    #[error("toolset.invalid_authoritative_amount: authoritative_amount_stroops must be > 0")]
+    InvalidAuthoritativeAmount,
 }
 
 #[cfg(test)]
@@ -207,9 +195,7 @@ mod tests {
     #[test]
     fn all_variants_have_distinct_display() {
         let variants = [
-            ToolsetRuntimeError::UnknownToolsetAction {
-                action: "test-action".to_owned(),
-            },
+            ToolsetRuntimeError::UnknownToolsetAction,
             ToolsetRuntimeError::CapabilityNotDeclared {
                 action: "test-action".to_owned(),
                 capability: "read-balance".to_owned(),
@@ -218,9 +204,7 @@ mod tests {
                 tool: "stellar_balances".to_owned(),
                 action: "test-action".to_owned(),
             },
-            ToolsetRuntimeError::ToolsetNotInstalled {
-                name: "test-toolset".to_owned(),
-            },
+            ToolsetRuntimeError::ToolsetNotInstalled,
             ToolsetRuntimeError::Io("disk error".to_owned()),
             ToolsetRuntimeError::ContentDigestMismatch {
                 name: "test-toolset".to_owned(),
@@ -236,7 +220,7 @@ mod tests {
             ToolsetRuntimeError::GrantStoreError {
                 detail: "test error".to_owned(),
             },
-            ToolsetRuntimeError::InvalidAuthoritativeAmount { amount_stroops: 0 },
+            ToolsetRuntimeError::InvalidAuthoritativeAmount,
         ];
 
         // Collect display strings and verify they are all distinct.
@@ -253,9 +237,7 @@ mod tests {
 
     #[test]
     fn error_code_prefixes_present() {
-        let e = ToolsetRuntimeError::UnknownToolsetAction {
-            action: "x".to_owned(),
-        };
+        let e = ToolsetRuntimeError::UnknownToolsetAction;
         assert!(e.to_string().contains("toolset.unknown_action"));
 
         let e = ToolsetRuntimeError::CapabilityNotDeclared {
@@ -270,9 +252,7 @@ mod tests {
         };
         assert!(e.to_string().contains("toolset.tool_not_allowed"));
 
-        let e = ToolsetRuntimeError::ToolsetNotInstalled {
-            name: "s".to_owned(),
-        };
+        let e = ToolsetRuntimeError::ToolsetNotInstalled;
         assert!(e.to_string().contains("toolset.not_installed"));
 
         let e = ToolsetRuntimeError::Io("err".to_owned());
@@ -315,14 +295,14 @@ mod tests {
         };
         assert!(e.to_string().contains("toolset.grant_store_error"));
 
-        let e = ToolsetRuntimeError::InvalidAuthoritativeAmount { amount_stroops: -1 };
+        let e = ToolsetRuntimeError::InvalidAuthoritativeAmount;
         assert!(
             e.to_string()
                 .contains("toolset.invalid_authoritative_amount")
         );
         assert!(
-            e.to_string().contains("-1"),
-            "rejected amount must appear in error message"
+            !e.to_string().contains("-1"),
+            "rejected amount must not appear in error message"
         );
     }
 }

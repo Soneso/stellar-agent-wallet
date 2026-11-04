@@ -400,7 +400,7 @@ pub async fn run(args: &MigrateVerifierArgs) -> i32 {
     let (profile, origin) = match load_command_profile(&resolved_profile) {
         Ok(loaded) => loaded,
         Err(error) => {
-            let e = map_access_error(&error, &resolved_profile.name);
+            let e = map_access_error(&error);
             return emit_error(&e, &request_id);
         }
     };
@@ -434,16 +434,9 @@ pub async fn run(args: &MigrateVerifierArgs) -> i32 {
     }
 
     // Parse the `--from` hex hash.
-    let from_hash = match parse_hex_hash(&args.from) {
+    let from_hash = match parse_from_hash(&args.from) {
         Ok(h) => h,
-        Err(detail) => {
-            return emit_error(
-                &WalletError::Validation(ValidationError::AddressInvalid {
-                    input: format!("--from: {detail}"),
-                }),
-                &request_id,
-            );
-        }
+        Err(e) => return emit_error(&e, &request_id),
     };
 
     // Parse the `--to` destination verifier C-strkey.
@@ -451,9 +444,7 @@ pub async fn run(args: &MigrateVerifierArgs) -> i32 {
         Ok(a) => a,
         Err(e) => {
             return emit_error(
-                &WalletError::Validation(ValidationError::AddressInvalid {
-                    input: format!("--to: {e}"),
-                }),
+                &WalletError::Validation(ValidationError::address_check(format!("--to: {e}"))),
                 &request_id,
             );
         }
@@ -463,9 +454,7 @@ pub async fn run(args: &MigrateVerifierArgs) -> i32 {
         Ok(a) => a,
         Err(e) => {
             return emit_error(
-                &WalletError::Validation(ValidationError::AddressInvalid {
-                    input: format!("--account: {e}"),
-                }),
+                &WalletError::Validation(ValidationError::address_check(format!("--account: {e}"))),
                 &request_id,
             );
         }
@@ -640,37 +629,39 @@ fn mainnet_submit_refusal(network: Caip2, dry_run: bool) -> Option<WalletError> 
         .then_some(WalletError::Network(NetworkError::MainnetWriteForbidden))
 }
 
+/// The refusal of a `--from` value that is not a 64-hex-character hash. It
+/// names the argument and the expected form, never the value; the detail of
+/// [`parse_hex_hash`] follows it.
+const FROM_HASH_REFUSAL: &str = "--from must be 64 hex characters (a 32-byte SHA-256 WASM hash)";
+
+/// Parses the `--from` WASM hash, refusing with `validation.address_invalid`
+/// under [`FROM_HASH_REFUSAL`].
+fn parse_from_hash(from: &str) -> Result<[u8; 32], WalletError> {
+    parse_hex_hash(from).map_err(|detail| {
+        WalletError::Validation(ValidationError::address_check(format!(
+            "{FROM_HASH_REFUSAL}: {detail}"
+        )))
+    })
+}
+
 /// Parses a 64-char lowercase hex string into a 32-byte WASM hash.
 ///
 /// # Errors
 ///
-/// Returns a human-readable error string if the input is not exactly 64 hex chars
-/// or contains non-hex characters.
+/// Returns the refused check if the input is not exactly 64 hex chars or
+/// contains a non-hex character. The text names the expected length or the
+/// position of the first non-hex character, never the input.
 fn parse_hex_hash(hex: &str) -> Result<[u8; 32], String> {
     let hex = hex.trim();
     if hex.len() != 64 {
-        return Err(format!(
-            "expected 64 hex chars (32-byte SHA-256), got {} chars: {:?}",
-            hex.len(),
-            hex
-        ));
+        return Err("expected 64 hex characters (32-byte SHA-256)".to_owned());
     }
     let mut out = [0u8; 32];
     for (i, chunk) in hex.as_bytes().chunks(2).enumerate() {
-        let hi = hex_nibble(chunk[0]).ok_or_else(|| {
-            format!(
-                "invalid hex char '{}' at position {}",
-                chunk[0] as char,
-                i * 2
-            )
-        })?;
-        let lo = hex_nibble(chunk[1]).ok_or_else(|| {
-            format!(
-                "invalid hex char '{}' at position {}",
-                chunk[1] as char,
-                i * 2 + 1
-            )
-        })?;
+        let hi = hex_nibble(chunk[0])
+            .ok_or_else(|| format!("invalid hex character at position {}", i * 2))?;
+        let lo = hex_nibble(chunk[1])
+            .ok_or_else(|| format!("invalid hex character at position {}", i * 2 + 1))?;
         out[i] = (hi << 4) | lo;
     }
     Ok(out)
@@ -1717,6 +1708,40 @@ mod tests {
                     .await
                     .expect("requests")
                     .is_empty()
+            );
+        }
+    }
+
+    #[test]
+    fn a_seed_as_the_from_hash_is_not_echoed() {
+        use stellar_agent_test_support::rejected_value::{assert_no_marker, seed_marker};
+        let seed = seed_marker();
+        let mut odd_character = "a".repeat(64);
+        odd_character.replace_range(5..6, "S");
+        for (from, detail) in [
+            (seed.clone(), "expected 64 hex characters (32-byte SHA-256)"),
+            (
+                format!("{seed}{seed}"),
+                "expected 64 hex characters (32-byte SHA-256)",
+            ),
+            (odd_character, "invalid hex character at position 5"),
+        ] {
+            let helper = parse_hex_hash(&from).expect_err("not a hex hash");
+            assert!(!helper.contains(&seed), "the helper repeats the input");
+            assert_eq!(helper, detail);
+            let error = parse_from_hash(&from).expect_err("not a hex hash");
+            assert_no_marker(&error, &seed);
+            assert_eq!(error.code(), "validation.address_invalid");
+            assert_eq!(error.to_string(), format!("{FROM_HASH_REFUSAL}: {detail}"));
+            let envelope = serde_json::to_string(&Envelope::<()>::err_with_request_id(
+                &error,
+                "request".to_owned(),
+            ))
+            .expect("envelope serializes");
+            assert!(!envelope.contains(&seed), "{envelope}");
+            assert!(
+                envelope.contains("--from must be 64 hex characters"),
+                "{envelope}"
             );
         }
     }

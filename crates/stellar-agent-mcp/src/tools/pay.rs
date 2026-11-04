@@ -2120,7 +2120,7 @@ mod tests {
                     assert_eq!(
                         error.message,
                         format!(
-                            "validation.amount_malformed: amount '100 {unit}' has unit '{unit}'; expected unit '{code}'"
+                            "validation.amount_malformed: the amount has the wrong unit; expected unit '{code}'"
                         )
                     );
                 }
@@ -2259,5 +2259,69 @@ mod tests {
         let mut absent = args.clone();
         absent.approval_attestation = None;
         assert!(format!("{absent:?}").contains("approval_attestation: None"));
+    }
+
+    /// A commit envelope that is not base64 is refused as a divergence by
+    /// class, and neither the result nor the debug event of the refusal names
+    /// the symbol the base64 decoder stopped at.
+    #[tokio::test(flavor = "current_thread")]
+    async fn pay_commit_envelope_marker_is_not_echoed() {
+        use stellar_agent_test_support::CaptureWriter;
+        use stellar_agent_test_support::rejected_value::{
+            CREDENTIAL_MARKER, assert_no_marker_in_text,
+        };
+
+        let profile = stellar_agent_core::profile::schema::Profile::builder_testnet(
+            "svc", "acct", "n-svc", "n-acct",
+        )
+        .with_noop_engine()
+        .build();
+        let server = WalletServer::new(profile).unwrap_or_else(|e| panic!("{e}"));
+        let args: StellarPayCommitArgs = match serde_json::from_value(serde_json::json!({
+            "chain_id": "stellar:testnet",
+            "source": "GAQAA5L65LSYH7CQ3VTJ7F3HHLGCL3DSLAR2Y47263D56MNNGHSQSTVY",
+            "destination": "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN",
+            "asset": "native",
+            "amount_in_stroops": "10",
+            "nonce": "commit-nonce",
+            "expires_at_unix_ms": 1,
+            // The invalid symbol leads, so the base64 decoder fails on the
+            // first read, before any XDR value is parsed.
+            "envelope_xdr": format!("~{CREDENTIAL_MARKER}"),
+        })) {
+            Ok(args) => args,
+            Err(error) => panic!("{error}"),
+        };
+        let capture = CaptureWriter::new();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_ansi(false)
+            .with_writer(capture.clone())
+            .finish();
+        let inert = stellar_agent_test_support::log_capture::inert_dispatcher();
+        let guard = tracing::subscriber::set_default(subscriber);
+        tracing::callsite::rebuild_interest_cache();
+        let result = server.call_stellar_pay_commit(args).await;
+        drop(guard);
+        drop(inert);
+
+        let result = result.unwrap_or_else(|e| panic!("{e:?}"));
+        let (code, message, text) = crate::tools::common::assert_business_envelope(&result);
+        assert_eq!(code, "simulation.divergence");
+        assert_eq!(
+            message,
+            "envelope_xdr re-derivation failed: envelope_xdr XDR decode failed: the envelope is \
+             not valid standard base64"
+        );
+        let captured = capture.captured_str();
+        assert!(
+            captured.contains("envelope_xdr re-derivation failed"),
+            "the test must reach the decode refusal; got: {captured}"
+        );
+        for output in [&text, &captured] {
+            assert_no_marker_in_text(output, CREDENTIAL_MARKER);
+            // The base64 decoder names the offending byte as "Invalid symbol".
+            assert_no_marker_in_text(output, "symbol");
+        }
     }
 }

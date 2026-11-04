@@ -354,4 +354,21 @@ mod tests {
         let id = BalanceId::parse(&hex64).expect("whitespace must be trimmed");
         assert_eq!(id.to_hex64(), KNOWN_HASH_HEX);
     }
+
+    #[test]
+    fn balance_id_marker_is_not_echoed() {
+        use stellar_agent_test_support::rejected_value::{CREDENTIAL_MARKER, assert_no_marker};
+        let hash = format!(
+            "{CREDENTIAL_MARKER}{}",
+            "0".repeat(64 - CREDENTIAL_MARKER.len())
+        );
+        for input in [hash.clone(), format!("00000000{hash}")] {
+            let error = BalanceId::parse(&input).unwrap_err();
+            assert!(matches!(error, ClaimError::InvalidBalanceId { .. }));
+            assert_eq!(error.code(), "claim.invalid_balance_id");
+            assert!(error.to_string().ends_with("invalid hex digit at offset 1"));
+            assert_no_marker(&error, CREDENTIAL_MARKER);
+            assert_no_marker(&error, "'R'");
+        }
+    }
 }

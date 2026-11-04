@@ -144,7 +144,7 @@ pub async fn run(args: &UnregisterMulticallArgs) -> i32 {
     let (profile, origin) = match load_command_profile(&resolved_profile) {
         Ok(loaded) => loaded,
         Err(e) => {
-            render_json(&profile_access_envelope(&e, &resolved_profile.name));
+            render_json(&profile_access_envelope(&e));
             return 1;
         }
     };
@@ -254,11 +254,10 @@ async fn run_normal(
                     network_safename = %network_safename,
                     "unregister-multicall: audit emit failed; registry file NOT mutated; retry"
                 );
-                let err = WalletError::Validation(ValidationError::AddressInvalid {
-                    input: "unregister-multicall: audit emit failed; registry file NOT mutated; \
-                            retry after resolving audit writer"
-                        .to_owned(),
-                });
+                let err = WalletError::Validation(ValidationError::address_check(
+                    "unregister-multicall: audit emit failed; registry file NOT mutated; \
+                            retry after resolving audit writer",
+                ));
                 render_json(&Envelope::<()>::err(&err));
                 return 1;
             }
@@ -296,14 +295,13 @@ async fn run_force(
     // On a non-TTY, require --yes-i-have-verified-the-prior-values or refuse.
     let stdin_is_tty = is_stdin_a_tty();
     if !stdin_is_tty && !args.yes_i_have_verified_the_prior_values {
-        let err = WalletError::Validation(ValidationError::AddressInvalid {
-            input: "unregister-multicall --force refused on non-TTY without \
+        let err = WalletError::Validation(ValidationError::address_check(
+            "unregister-multicall --force refused on non-TTY without \
                     --yes-i-have-verified-the-prior-values. \
                     Complete the 4-step pre-force discipline first, \
                     then pass --yes-i-have-verified-the-prior-values when you have confirmed \
-                    the prior values match your out-of-band deploy-time record."
-                .to_owned(),
-        });
+                    the prior values match your out-of-band deploy-time record.",
+        ));
         render_json(&Envelope::<()>::err(&err));
         return 1;
     }
@@ -313,9 +311,9 @@ async fn run_force(
         && !args.yes_i_have_verified_the_prior_values
         && !prompt_force_confirm(network_safename)
     {
-        let err = WalletError::Validation(ValidationError::AddressInvalid {
-            input: "unregister-multicall --force: confirmation refused by operator".to_owned(),
-        });
+        let err = WalletError::Validation(ValidationError::address_check(
+            "unregister-multicall --force: confirmation refused by operator",
+        ));
         render_json(&Envelope::<()>::err(&err));
         return 1;
     }
@@ -371,11 +369,10 @@ async fn run_force(
                     "unregister-multicall --force: audit emit failed; \
                      registry file NOT mutated; retry after resolving audit writer"
                 );
-                let err = WalletError::Validation(ValidationError::AddressInvalid {
-                    input: "unregister-multicall --force: audit emit failed; \
-                            registry file retained; retry after resolving audit writer"
-                        .to_owned(),
-                });
+                let err = WalletError::Validation(ValidationError::address_check(
+                    "unregister-multicall --force: audit emit failed; \
+                            registry file retained; retry after resolving audit writer",
+                ));
                 render_json(&Envelope::<()>::err(&err));
                 return 1;
             }

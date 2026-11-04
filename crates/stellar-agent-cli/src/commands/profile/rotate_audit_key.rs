@@ -339,8 +339,8 @@ where
             0
         }
         Err(RotateRefusal::ProfileAccess(e)) => {
-            tracing::debug!(profile = %args.profile_name(), error = %e, "profile access refused");
-            render::render_json(&profile_access_envelope(&e, args.profile_name()));
+            tracing::debug!(error = %e, "profile access refused");
+            render::render_json(&profile_access_envelope(&e));
             1
         }
         Err(RotateRefusal::Integrity(e)) => {

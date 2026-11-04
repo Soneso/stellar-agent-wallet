@@ -262,7 +262,7 @@ where
     let profile = match reconcile_loaded_profile(load_profile(&profile_name), &resolved) {
         Ok(p) => p,
         Err(e) => {
-            render_json(&Envelope::<()>::err_raw(e.code(), e.message(&profile_name)));
+            render_json(&Envelope::<()>::err_raw(e.code(), e.message()));
             return 1;
         }
     };
@@ -681,7 +681,7 @@ where
     let profile = match reconcile_loaded_profile(load_profile(&profile_name), &resolved) {
         Ok(p) => p,
         Err(e) => {
-            render_json(&Envelope::<()>::err_raw(e.code(), e.message(&profile_name)));
+            render_json(&Envelope::<()>::err_raw(e.code(), e.message()));
             return 1;
         }
     };

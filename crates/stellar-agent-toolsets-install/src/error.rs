@@ -122,7 +122,7 @@ pub enum ToolsetInstallError {
     /// parse contract).
     #[error("trust set malformed: {detail}")]
     TrustSetMalformed {
-        /// Sanitised description of the malformed entry.
+        /// The file kind, line number, and refusal, with no line content.
         detail: String,
     },
 

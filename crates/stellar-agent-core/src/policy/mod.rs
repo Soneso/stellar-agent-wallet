@@ -1177,7 +1177,9 @@ pub enum PolicyError {
 
     /// The policy file could not be deserialized.
     ///
-    /// `detail` contains the parse error message (no secret material).
+    /// `detail` names the rule the body breaks or, for a body that is not
+    /// valid TOML, the position of the failure (see
+    /// [`PolicyError::toml_syntax`]).
     #[error("policy file parse failed: {detail}")]
     PolicyFileParseFailed {
         /// Non-secret parse error description.
@@ -1265,7 +1267,32 @@ impl From<pin::PinError> for PolicyError {
     }
 }
 
+/// The detail of a policy body that is not valid TOML: the line and column of
+/// the failure.
+///
+/// The `Display` of the parser's error prints the offending line, which can
+/// hold a credential, so it is not used.
+#[must_use]
+pub fn toml_syntax_detail(raw: &str, error: &toml_edit::TomlError) -> String {
+    format!(
+        "not valid TOML: {}",
+        crate::profile::toml_diagnostic::toml_error_position(
+            raw,
+            error.span().map(|span| span.start)
+        )
+    )
+}
+
 impl PolicyError {
+    /// The refusal of a policy body that is not valid TOML, carrying
+    /// [`toml_syntax_detail`].
+    #[must_use]
+    pub fn toml_syntax(raw: &str, error: &toml_edit::TomlError) -> Self {
+        Self::PolicyFileParseFailed {
+            detail: toml_syntax_detail(raw, error),
+        }
+    }
+
     /// Returns the semver-stable JSON-RPC wire code for this policy error.
     ///
     /// # Prefix convention

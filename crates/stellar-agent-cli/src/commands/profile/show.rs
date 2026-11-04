@@ -128,7 +128,7 @@ pub async fn run(args: &ShowArgs) -> i32 {
             0
         }
         Err(err) => {
-            let wallet_err = WalletError::Validation(err.to_validation_error(args.profile_name()));
+            let wallet_err = WalletError::Validation(err.to_validation_error());
             render::render_json(&Envelope::err(&wallet_err));
             1
         }

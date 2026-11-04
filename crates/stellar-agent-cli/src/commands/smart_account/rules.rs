@@ -103,7 +103,8 @@ use uuid::Uuid;
 use crate::commands::smart_account::common::{
     CommonArgsView, CommonHandlerContext, ReadArgsView, ReadHandlerContext, SignerSourceFlags,
     construct_signers_manager_from_fields, impl_common_args_view, impl_read_args_view,
-    load_command_profile, map_access_error, open_audit_writer_read_only, validate_source_account,
+    load_command_profile, map_access_error, open_audit_writer_read_only, open_verifier_registry,
+    validate_source_account,
 };
 use crate::commands::smart_account::list_rules as sa_list_rules;
 use crate::common::network::{
@@ -708,7 +709,7 @@ async fn create_run(args: &CreateArgs) -> i32 {
     let (profile, origin) = match load_command_profile(&resolved) {
         Ok(loaded) => loaded,
         Err(error) => {
-            let e = map_access_error(&error, &resolved.name);
+            let e = map_access_error(&error);
             return emit_error(&e, args.common.output, &request_id);
         }
     };
@@ -737,11 +738,10 @@ async fn create_run(args: &CreateArgs) -> i32 {
         && args.signer_ed25519.is_empty()
     {
         return emit_error(
-            &WalletError::Validation(ValidationError::AddressInvalid {
-                input: "at least one of --signer-delegated, --signer-webauthn, or \
-                        --signer-ed25519 is required"
-                    .to_owned(),
-            }),
+            &WalletError::Validation(ValidationError::address_check(
+                "at least one of --signer-delegated, --signer-webauthn, or \
+                        --signer-ed25519 is required",
+            )),
             args.common.output,
             &request_id,
         );
@@ -844,16 +844,10 @@ async fn create_run(args: &CreateArgs) -> i32 {
     if !args.signer_webauthn.is_empty() {
         // Load the VerifierRegistry to get the verifier contract address for
         // this network (written by `smart-account deploy-webauthn-verifier`).
-        let verifier_registry = match VerifierRegistry::open() {
+        let verifier_registry = match open_verifier_registry() {
             Ok(r) => r,
             Err(e) => {
-                return emit_error(
-                    &WalletError::Validation(ValidationError::AddressInvalid {
-                        input: format!("could not open verifier registry: {e}"),
-                    }),
-                    args.common.output,
-                    &request_id,
-                );
+                return emit_error(&e, args.common.output, &request_id);
             }
         };
 
@@ -862,13 +856,9 @@ async fn create_run(args: &CreateArgs) -> i32 {
             Some(e) => e,
             None => {
                 return emit_error(
-                    &WalletError::Validation(ValidationError::AddressInvalid {
-                        input: format!(
-                            "no WebAuthn verifier deployed for network '{}'; \
-                                 run: smart-account deploy-webauthn-verifier",
-                            network_passphrase
-                        ),
-                    }),
+                    &WalletError::Validation(ValidationError::address_check(
+                        "network: no WebAuthn verifier deployed; run: smart-account deploy-webauthn-verifier",
+                    )),
                     args.common.output,
                     &request_id,
                 );
@@ -885,9 +875,9 @@ async fn create_run(args: &CreateArgs) -> i32 {
         let profile = resolved.name.clone();
         if let Err(reason) = validate_path_component_ascii_safe(&profile) {
             return emit_error(
-                &WalletError::Validation(ValidationError::AddressInvalid {
-                    input: format!("invalid profile name '{profile}': {reason}"),
-                }),
+                &WalletError::Validation(ValidationError::address_check(format!(
+                    "the profile name is not a valid profile name: {reason}"
+                ))),
                 args.common.output,
                 &request_id,
             );
@@ -897,9 +887,9 @@ async fn create_run(args: &CreateArgs) -> i32 {
             Ok(m) => m,
             Err(e) => {
                 return emit_error(
-                    &WalletError::Validation(ValidationError::AddressInvalid {
-                        input: format!("could not open passkeys registry: {e}"),
-                    }),
+                    &WalletError::Validation(ValidationError::address_check(format!(
+                        "could not open passkeys registry: {e}"
+                    ))),
                     args.common.output,
                     &request_id,
                 );
@@ -909,11 +899,11 @@ async fn create_run(args: &CreateArgs) -> i32 {
         for credential_name in &args.signer_webauthn {
             let metadata = match creds_mgr.show(credential_name) {
                 Ok(m) => m,
-                Err(e) => {
+                Err(_) => {
                     return emit_error(
-                        &WalletError::Validation(ValidationError::AddressInvalid {
-                            input: format!("--signer-webauthn '{}': {e}", credential_name),
-                        }),
+                        &WalletError::Validation(ValidationError::address_check(
+                            "--signer-webauthn names a passkey credential that cannot be read; `stellar-agent credentials list` shows the registered credentials",
+                        )),
                         args.common.output,
                         &request_id,
                     );
@@ -922,13 +912,9 @@ async fn create_run(args: &CreateArgs) -> i32 {
 
             if metadata.public_key_sec1_b64.is_empty() {
                 return emit_error(
-                    &WalletError::Validation(ValidationError::AddressInvalid {
-                        input: format!(
-                            "--signer-webauthn '{}': credential is missing \
-                             public_key_sec1_b64 (delete and re-register)",
-                            credential_name
-                        ),
-                    }),
+                    &WalletError::Validation(ValidationError::address_check(
+                        "--signer-webauthn: credential is missing public_key_sec1_b64 (delete and re-register)",
+                    )),
                     args.common.output,
                     &request_id,
                 );
@@ -941,13 +927,9 @@ async fn create_run(args: &CreateArgs) -> i32 {
                 Ok(b) => b,
                 Err(_) => {
                     return emit_error(
-                        &WalletError::Validation(ValidationError::AddressInvalid {
-                            input: format!(
-                                "--signer-webauthn '{}': public_key_sec1_b64 \
-                                 is not valid base64url",
-                                credential_name
-                            ),
-                        }),
+                        &WalletError::Validation(ValidationError::address_check(
+                            "--signer-webauthn: public_key_sec1_b64 is not valid base64url",
+                        )),
                         args.common.output,
                         &request_id,
                     );
@@ -955,14 +937,10 @@ async fn create_run(args: &CreateArgs) -> i32 {
             };
             if pubkey_bytes.len() != 65 {
                 return emit_error(
-                    &WalletError::Validation(ValidationError::AddressInvalid {
-                        input: format!(
-                            "--signer-webauthn '{}': public_key_sec1_b64 decodes to \
-                             {} bytes, expected 65",
-                            credential_name,
-                            pubkey_bytes.len()
-                        ),
-                    }),
+                    &WalletError::Validation(ValidationError::address_check(format!(
+                        "--signer-webauthn: public_key_sec1_b64 decodes to {} bytes, expected 65",
+                        pubkey_bytes.len()
+                    ))),
                     args.common.output,
                     &request_id,
                 );
@@ -975,13 +953,9 @@ async fn create_run(args: &CreateArgs) -> i32 {
                 Ok(b) => b,
                 Err(_) => {
                     return emit_error(
-                        &WalletError::Validation(ValidationError::AddressInvalid {
-                            input: format!(
-                                "--signer-webauthn '{}': credential_id_b64url \
-                                 is not valid base64url",
-                                credential_name
-                            ),
-                        }),
+                        &WalletError::Validation(ValidationError::address_check(
+                            "--signer-webauthn: credential_id_b64url is not valid base64url",
+                        )),
                         args.common.output,
                         &request_id,
                     );
@@ -1013,16 +987,10 @@ async fn create_run(args: &CreateArgs) -> i32 {
         let ed25519_verifier_c_strkey = if let Some(explicit) = &args.verifier {
             explicit.clone()
         } else {
-            let verifier_registry = match VerifierRegistry::open() {
+            let verifier_registry = match open_verifier_registry() {
                 Ok(r) => r,
                 Err(e) => {
-                    return emit_error(
-                        &WalletError::Validation(ValidationError::AddressInvalid {
-                            input: format!("could not open verifier registry: {e}"),
-                        }),
-                        args.common.output,
-                        &request_id,
-                    );
+                    return emit_error(&e, args.common.output, &request_id);
                 }
             };
             let network_passphrase = context.network_passphrase();
@@ -1030,13 +998,9 @@ async fn create_run(args: &CreateArgs) -> i32 {
                 Some(entry) => entry.address.clone(),
                 None => {
                     return emit_error(
-                        &WalletError::Validation(ValidationError::AddressInvalid {
-                            input: format!(
-                                "no Ed25519 verifier registered for network \
-                                 '{network_passphrase}'; run: \
-                                 smart-account deploy-ed25519-verifier (or pass --verifier)"
-                            ),
-                        }),
+                        &WalletError::Validation(ValidationError::address_check(
+                            "network: no Ed25519 verifier registered; run: smart-account deploy-ed25519-verifier (or pass --verifier)",
+                        )),
                         args.common.output,
                         &request_id,
                     );
@@ -1051,11 +1015,11 @@ async fn create_run(args: &CreateArgs) -> i32 {
         for hex_pubkey in &args.signer_ed25519 {
             let key_data = match hex::decode(hex_pubkey) {
                 Ok(b) => b,
-                Err(e) => {
+                Err(_) => {
                     return emit_error(
-                        &WalletError::Validation(ValidationError::AddressInvalid {
-                            input: format!("--signer-ed25519 is not valid hex: {e}"),
-                        }),
+                        &WalletError::Validation(ValidationError::address_check(
+                            "--signer-ed25519 is not valid hex",
+                        )),
                         args.common.output,
                         &request_id,
                     );
@@ -1063,13 +1027,11 @@ async fn create_run(args: &CreateArgs) -> i32 {
             };
             if key_data.len() != 32 {
                 return emit_error(
-                    &WalletError::Validation(ValidationError::AddressInvalid {
-                        input: format!(
-                            "--signer-ed25519 must decode to exactly 32 bytes (a raw Ed25519 \
+                    &WalletError::Validation(ValidationError::address_check(format!(
+                        "--signer-ed25519 must decode to exactly 32 bytes (a raw Ed25519 \
                              public key), got {} bytes",
-                            key_data.len()
-                        ),
-                    }),
+                        key_data.len()
+                    ))),
                     args.common.output,
                     &request_id,
                 );
@@ -1219,7 +1181,7 @@ async fn get_run(args: &GetArgs) -> i32 {
     let (profile, _origin) = match load_command_profile(&resolved) {
         Ok(loaded) => loaded,
         Err(error) => {
-            let e = map_access_error(&error, &resolved.name);
+            let e = map_access_error(&error);
             return emit_error(&e, args.common.output, &request_id);
         }
     };
@@ -1332,7 +1294,7 @@ async fn set_name_run(args: &SetNameArgs) -> i32 {
     let (profile, origin) = match load_command_profile(&resolved) {
         Ok(loaded) => loaded,
         Err(error) => {
-            let e = map_access_error(&error, &resolved.name);
+            let e = map_access_error(&error);
             return emit_error(&e, args.common.output, &request_id);
         }
     };
@@ -1458,7 +1420,7 @@ async fn set_valid_until_run(args: &SetValidUntilArgs) -> i32 {
     let (profile, origin) = match load_command_profile(&resolved) {
         Ok(loaded) => loaded,
         Err(error) => {
-            let e = map_access_error(&error, &resolved.name);
+            let e = map_access_error(&error);
             return emit_error(&e, args.common.output, &request_id);
         }
     };
@@ -1579,7 +1541,7 @@ async fn delete_run(args: &DeleteArgs) -> i32 {
     let (profile, origin) = match load_command_profile(&resolved) {
         Ok(loaded) => loaded,
         Err(error) => {
-            let e = map_access_error(&error, &resolved.name);
+            let e = map_access_error(&error);
             return emit_error(&e, args.common.output, &request_id);
         }
     };
@@ -1812,7 +1774,7 @@ async fn verify_pins_run(args: &VerifyPinsArgs) -> i32 {
     let (profile, origin) = match load_command_profile(&resolved) {
         Ok(loaded) => loaded,
         Err(error) => {
-            let e = map_access_error(&error, &resolved.name);
+            let e = map_access_error(&error);
             return emit_error(&e, args.output, &request_id);
         }
     };
@@ -2098,7 +2060,7 @@ async fn add_policy_run(args: &AddPolicyArgs) -> i32 {
     let (profile, origin) = match load_command_profile(&resolved) {
         Ok(loaded) => loaded,
         Err(error) => {
-            let e = map_access_error(&error, &resolved.name);
+            let e = map_access_error(&error);
             return emit_error(&e, args.output, &request_id);
         }
     };
@@ -2138,9 +2100,9 @@ async fn add_policy_run(args: &AddPolicyArgs) -> i32 {
                 Some(a) => a.clone(),
                 None => {
                     return emit_error(
-                        &WalletError::Validation(ValidationError::AddressInvalid {
-                            input: "--kind raw requires --policy-address".to_owned(),
-                        }),
+                        &WalletError::Validation(ValidationError::address_check(
+                            "--kind raw requires --policy-address",
+                        )),
                         args.output,
                         &request_id,
                     );
@@ -2150,9 +2112,9 @@ async fn add_policy_run(args: &AddPolicyArgs) -> i32 {
                 Some(p) => p,
                 None => {
                     return emit_error(
-                        &WalletError::Validation(ValidationError::AddressInvalid {
-                            input: "--kind raw requires --install-param".to_owned(),
-                        }),
+                        &WalletError::Validation(ValidationError::address_check(
+                            "--kind raw requires --install-param",
+                        )),
                         args.output,
                         &request_id,
                     );
@@ -2160,11 +2122,10 @@ async fn add_policy_run(args: &AddPolicyArgs) -> i32 {
             };
             if args.limit.is_some() || args.period.is_some() || args.policy.is_some() {
                 return emit_error(
-                    &WalletError::Validation(ValidationError::AddressInvalid {
-                        input: "--limit / --period / --policy are only valid with \
-                                --kind spending-limit"
-                            .to_owned(),
-                    }),
+                    &WalletError::Validation(ValidationError::address_check(
+                        "--limit / --period / --policy are only valid with \
+                                --kind spending-limit",
+                    )),
                     args.output,
                     &request_id,
                 );
@@ -2174,9 +2135,9 @@ async fn add_policy_run(args: &AddPolicyArgs) -> i32 {
                 Ok(addr) => addr,
                 Err(e) => {
                     return emit_error(
-                        &WalletError::Validation(ValidationError::AddressInvalid {
-                            input: format!("--policy-address: {e}"),
-                        }),
+                        &WalletError::Validation(ValidationError::address_check(format!(
+                            "--policy-address: {e}"
+                        ))),
                         args.output,
                         &request_id,
                     );
@@ -2219,9 +2180,9 @@ async fn add_policy_run(args: &AddPolicyArgs) -> i32 {
                 Some(v) => v,
                 None => {
                     return emit_error(
-                        &WalletError::Validation(ValidationError::AddressInvalid {
-                            input: "--kind spending-limit requires --limit".to_owned(),
-                        }),
+                        &WalletError::Validation(ValidationError::address_check(
+                            "--kind spending-limit requires --limit",
+                        )),
                         args.output,
                         &request_id,
                     );
@@ -2231,9 +2192,9 @@ async fn add_policy_run(args: &AddPolicyArgs) -> i32 {
                 Some(v) => v,
                 None => {
                     return emit_error(
-                        &WalletError::Validation(ValidationError::AddressInvalid {
-                            input: "--kind spending-limit requires --period".to_owned(),
-                        }),
+                        &WalletError::Validation(ValidationError::address_check(
+                            "--kind spending-limit requires --period",
+                        )),
                         args.output,
                         &request_id,
                     );
@@ -2241,11 +2202,10 @@ async fn add_policy_run(args: &AddPolicyArgs) -> i32 {
             };
             if args.policy_address.is_some() || args.install_param.is_some() {
                 return emit_error(
-                    &WalletError::Validation(ValidationError::AddressInvalid {
-                        input: "--policy-address / --install-param are only valid with \
-                                --kind raw (use --policy for the typed override)"
-                            .to_owned(),
-                    }),
+                    &WalletError::Validation(ValidationError::address_check(
+                        "--policy-address / --install-param are only valid with \
+                                --kind raw (use --policy for the typed override)",
+                    )),
                     args.output,
                     &request_id,
                 );
@@ -2270,16 +2230,10 @@ async fn add_policy_run(args: &AddPolicyArgs) -> i32 {
             let policy_address = if let Some(explicit) = &args.policy {
                 explicit.clone()
             } else {
-                let registry = match VerifierRegistry::open() {
+                let registry = match open_verifier_registry() {
                     Ok(r) => r,
                     Err(e) => {
-                        return emit_error(
-                            &WalletError::Validation(ValidationError::AddressInvalid {
-                                input: format!("could not open verifier registry: {e}"),
-                            }),
-                            args.output,
-                            &request_id,
-                        );
+                        return emit_error(&e, args.output, &request_id);
                     }
                 };
                 let passphrase = context.network_passphrase();
@@ -2287,14 +2241,9 @@ async fn add_policy_run(args: &AddPolicyArgs) -> i32 {
                     Some(entry) => entry.address.clone(),
                     None => {
                         return emit_error(
-                            &WalletError::Validation(ValidationError::AddressInvalid {
-                                input: format!(
-                                    "no spending-limit policy deployed for network \
-                                     '{passphrase}'; run: \
-                                     smart-account deploy-spending-limit-policy \
-                                     (or pass --policy)"
-                                ),
-                            }),
+                            &WalletError::Validation(ValidationError::address_check(
+                                "network: no spending-limit policy deployed; run: smart-account deploy-spending-limit-policy (or pass --policy)",
+                            )),
                             args.output,
                             &request_id,
                         );
@@ -2306,9 +2255,9 @@ async fn add_policy_run(args: &AddPolicyArgs) -> i32 {
                 Ok(addr) => addr,
                 Err(e) => {
                     return emit_error(
-                        &WalletError::Validation(ValidationError::AddressInvalid {
-                            input: format!("spending-limit policy address: {e}"),
-                        }),
+                        &WalletError::Validation(ValidationError::address_check(format!(
+                            "spending-limit policy address: {e}"
+                        ))),
                         args.output,
                         &request_id,
                     );
@@ -2337,9 +2286,9 @@ async fn add_policy_run(args: &AddPolicyArgs) -> i32 {
                 Some(v) => v,
                 None => {
                     return emit_error(
-                        &WalletError::Validation(ValidationError::AddressInvalid {
-                            input: "--kind simple-threshold requires --threshold".to_owned(),
-                        }),
+                        &WalletError::Validation(ValidationError::address_check(
+                            "--kind simple-threshold requires --threshold",
+                        )),
                         args.output,
                         &request_id,
                     );
@@ -2353,11 +2302,10 @@ async fn add_policy_run(args: &AddPolicyArgs) -> i32 {
                 || !args.weighted_signer_webauthn.is_empty()
             {
                 return emit_error(
-                    &WalletError::Validation(ValidationError::AddressInvalid {
-                        input: "--policy-address / --install-param / --limit / --period / \
-                                --weighted-signer-* are only valid with the matching --kind"
-                            .to_owned(),
-                    }),
+                    &WalletError::Validation(ValidationError::address_check(
+                        "--policy-address / --install-param / --limit / --period / \
+                                --weighted-signer-* are only valid with the matching --kind",
+                    )),
                     args.output,
                     &request_id,
                 );
@@ -2381,9 +2329,9 @@ async fn add_policy_run(args: &AddPolicyArgs) -> i32 {
                 Ok(addr) => addr,
                 Err(e) => {
                     return emit_error(
-                        &WalletError::Validation(ValidationError::AddressInvalid {
-                            input: format!("simple-threshold policy address: {e}"),
-                        }),
+                        &WalletError::Validation(ValidationError::address_check(format!(
+                            "simple-threshold policy address: {e}"
+                        ))),
                         args.output,
                         &request_id,
                     );
@@ -2411,9 +2359,9 @@ async fn add_policy_run(args: &AddPolicyArgs) -> i32 {
                 Some(v) => v,
                 None => {
                     return emit_error(
-                        &WalletError::Validation(ValidationError::AddressInvalid {
-                            input: "--kind weighted-threshold requires --threshold".to_owned(),
-                        }),
+                        &WalletError::Validation(ValidationError::address_check(
+                            "--kind weighted-threshold requires --threshold",
+                        )),
                         args.output,
                         &request_id,
                     );
@@ -2425,11 +2373,10 @@ async fn add_policy_run(args: &AddPolicyArgs) -> i32 {
                 || args.period.is_some()
             {
                 return emit_error(
-                    &WalletError::Validation(ValidationError::AddressInvalid {
-                        input: "--policy-address / --install-param / --limit / --period are \
-                                only valid with the matching --kind"
-                            .to_owned(),
-                    }),
+                    &WalletError::Validation(ValidationError::address_check(
+                        "--policy-address / --install-param / --limit / --period are \
+                                only valid with the matching --kind",
+                    )),
                     args.output,
                     &request_id,
                 );
@@ -2437,11 +2384,10 @@ async fn add_policy_run(args: &AddPolicyArgs) -> i32 {
             if args.weighted_signer_delegated.is_empty() && args.weighted_signer_webauthn.is_empty()
             {
                 return emit_error(
-                    &WalletError::Validation(ValidationError::AddressInvalid {
-                        input: "--kind weighted-threshold requires at least one \
-                                --weighted-signer-delegated or --weighted-signer-webauthn"
-                            .to_owned(),
-                    }),
+                    &WalletError::Validation(ValidationError::address_check(
+                        "--kind weighted-threshold requires at least one \
+                                --weighted-signer-delegated or --weighted-signer-webauthn",
+                    )),
                     args.output,
                     &request_id,
                 );
@@ -2465,9 +2411,9 @@ async fn add_policy_run(args: &AddPolicyArgs) -> i32 {
                 Ok(addr) => addr,
                 Err(e) => {
                     return emit_error(
-                        &WalletError::Validation(ValidationError::AddressInvalid {
-                            input: format!("weighted-threshold policy address: {e}"),
-                        }),
+                        &WalletError::Validation(ValidationError::address_check(format!(
+                            "weighted-threshold policy address: {e}"
+                        ))),
                         args.output,
                         &request_id,
                     );
@@ -2490,16 +2436,10 @@ async fn add_policy_run(args: &AddPolicyArgs) -> i32 {
             }
 
             if !args.weighted_signer_webauthn.is_empty() {
-                let verifier_registry = match VerifierRegistry::open() {
+                let verifier_registry = match open_verifier_registry() {
                     Ok(r) => r,
                     Err(e) => {
-                        return emit_error(
-                            &WalletError::Validation(ValidationError::AddressInvalid {
-                                input: format!("could not open verifier registry: {e}"),
-                            }),
-                            args.output,
-                            &request_id,
-                        );
+                        return emit_error(&e, args.output, &request_id);
                     }
                 };
                 let network_passphrase = context.network_passphrase();
@@ -2509,12 +2449,9 @@ async fn add_policy_run(args: &AddPolicyArgs) -> i32 {
                     Some(e) => e,
                     None => {
                         return emit_error(
-                            &WalletError::Validation(ValidationError::AddressInvalid {
-                                input: format!(
-                                    "no WebAuthn verifier deployed for network '{network_passphrase}'; \
-                                     run: smart-account deploy-webauthn-verifier"
-                                ),
-                            }),
+                            &WalletError::Validation(ValidationError::address_check(
+                                "network: no WebAuthn verifier deployed; run: smart-account deploy-webauthn-verifier",
+                            )),
                             args.output,
                             &request_id,
                         );
@@ -2528,9 +2465,9 @@ async fn add_policy_run(args: &AddPolicyArgs) -> i32 {
                 let profile = resolved.name.clone();
                 if let Err(reason) = validate_path_component_ascii_safe(&profile) {
                     return emit_error(
-                        &WalletError::Validation(ValidationError::AddressInvalid {
-                            input: format!("invalid profile name '{profile}': {reason}"),
-                        }),
+                        &WalletError::Validation(ValidationError::address_check(format!(
+                            "the profile name is not a valid profile name: {reason}"
+                        ))),
                         args.output,
                         &request_id,
                     );
@@ -2540,9 +2477,9 @@ async fn add_policy_run(args: &AddPolicyArgs) -> i32 {
                         Ok(m) => m,
                         Err(e) => {
                             return emit_error(
-                                &WalletError::Validation(ValidationError::AddressInvalid {
-                                    input: format!("could not open passkeys registry: {e}"),
-                                }),
+                                &WalletError::Validation(ValidationError::address_check(format!(
+                                    "could not open passkeys registry: {e}"
+                                ))),
                                 args.output,
                                 &request_id,
                             );
@@ -2599,9 +2536,9 @@ async fn add_policy_run(args: &AddPolicyArgs) -> i32 {
         Ok(pk) => pk.to_string(),
         Err(e) => {
             return emit_error(
-                &WalletError::Validation(ValidationError::AddressInvalid {
-                    input: format!("signer.public_key(): {e}"),
-                }),
+                &WalletError::Validation(ValidationError::address_check(format!(
+                    "signer.public_key(): {e}"
+                ))),
                 args.output,
                 &request_id,
             );
@@ -2629,12 +2566,10 @@ async fn add_policy_run(args: &AddPolicyArgs) -> i32 {
         Ok(Some(scval)) => scval,
         Ok(None) => {
             return emit_error(
-                &WalletError::Validation(ValidationError::AddressInvalid {
-                    input: format!(
-                        "rule_id {} not found on smart account {account_redacted}",
-                        args.rule_id
-                    ),
-                }),
+                &WalletError::Validation(ValidationError::address_check(format!(
+                    "--rule-id {} names no rule on the smart account",
+                    args.rule_id
+                ))),
                 args.output,
                 &request_id,
             );
@@ -2807,7 +2742,7 @@ async fn remove_policy_run(args: &RemovePolicyArgs) -> i32 {
     let (profile, origin) = match load_command_profile(&resolved) {
         Ok(loaded) => loaded,
         Err(error) => {
-            let e = map_access_error(&error, &resolved.name);
+            let e = map_access_error(&error);
             return emit_error(&e, args.output, &request_id);
         }
     };
@@ -2970,7 +2905,7 @@ async fn get_spending_limit_run(args: &GetSpendingLimitArgs) -> i32 {
     let (profile, origin) = match load_command_profile(&resolved) {
         Ok(loaded) => loaded,
         Err(error) => {
-            let e = map_access_error(&error, &resolved.name);
+            let e = map_access_error(&error);
             return emit_error(&e, args.common.output, &request_id);
         }
     };
@@ -3170,7 +3105,7 @@ async fn set_spending_limit_run(args: &SetSpendingLimitArgs) -> i32 {
     let (profile, origin) = match load_command_profile(&resolved) {
         Ok(loaded) => loaded,
         Err(error) => {
-            let e = map_access_error(&error, &resolved.name);
+            let e = map_access_error(&error);
             return emit_error(&e, args.output, &request_id);
         }
     };
@@ -3262,9 +3197,7 @@ async fn set_spending_limit_run(args: &SetSpendingLimitArgs) -> i32 {
 /// to a `WalletError::Validation` envelope-friendly error.
 fn parse_c_strkey(s: &str) -> Result<SmartAccountAddress, WalletError> {
     parse_c_strkey_to_smart_account(s).map_err(|e| {
-        WalletError::Validation(ValidationError::AddressInvalid {
-            input: format!("--account: {e}"),
-        })
+        WalletError::Validation(ValidationError::address_check(format!("--account: {e}")))
     })
 }
 
@@ -3285,12 +3218,9 @@ fn contract_scaddress_to_strkey(addr: &stellar_xdr::ScAddress) -> Result<String,
                 .as_str()
                 .to_owned())
         }
-        other => Err(WalletError::Validation(ValidationError::AddressInvalid {
-            input: format!(
-                "policy address is not a contract address; expected a spending-limit-policy \
-                 contract, got {other:?}"
-            ),
-        })),
+        _other => Err(WalletError::Validation(ValidationError::address_check(
+            "the identified spending-limit policy is not a contract address",
+        ))),
     }
 }
 
@@ -3298,9 +3228,9 @@ fn contract_scaddress_to_strkey(addr: &stellar_xdr::ScAddress) -> Result<String,
 /// `--weighted-signer-delegated` args, which take an account only.
 fn parse_g_strkey_for_signer(s: &str) -> Result<SmartAccountAddress, WalletError> {
     parse_g_strkey_to_signer_address(s).map_err(|e| {
-        WalletError::Validation(ValidationError::AddressInvalid {
-            input: format!("--signer-delegated: {e}"),
-        })
+        WalletError::Validation(ValidationError::address_check(format!(
+            "--signer-delegated: {e}"
+        )))
     })
 }
 
@@ -3309,9 +3239,9 @@ fn parse_g_strkey_for_signer(s: &str) -> Result<SmartAccountAddress, WalletError
 /// parser's reason, since the value is typed by the operator.
 fn parse_delegated_signer_for_rule(s: &str) -> Result<SmartAccountAddress, WalletError> {
     parse_delegated_signer_address(s).map_err(|_| {
-        WalletError::Validation(ValidationError::AddressInvalid {
-            input: format!("--signer-delegated: {DELEGATED_SIGNER_ADDRESS_REASON}"),
-        })
+        WalletError::Validation(ValidationError::address_check(format!(
+            "--signer-delegated: {DELEGATED_SIGNER_ADDRESS_REASON}"
+        )))
     })
 }
 
@@ -3351,18 +3281,11 @@ fn resolve_policy_address_override_or_registry(
     if let Some(explicit) = policy_override {
         return Ok(explicit.clone());
     }
-    let registry = VerifierRegistry::open().map_err(|e| {
-        WalletError::Validation(ValidationError::AddressInvalid {
-            input: format!("could not open verifier registry: {e}"),
-        })
-    })?;
+    let registry = open_verifier_registry()?;
     getter(&registry, network_passphrase).ok_or_else(|| {
-        WalletError::Validation(ValidationError::AddressInvalid {
-            input: format!(
-                "no {kind} policy deployed for network '{network_passphrase}'; \
-                 run: {deploy_verb} (or pass --policy)"
-            ),
-        })
+        WalletError::Validation(ValidationError::address_check(format!(
+            "network: no {kind} policy deployed; run: {deploy_verb} (or pass --policy)"
+        )))
     })
 }
 
@@ -3375,19 +3298,19 @@ fn resolve_policy_address_override_or_registry(
 /// unambiguously.
 fn parse_weighted_signer_flag(spec: &str) -> Result<(String, u32), WalletError> {
     let (identity, weight_str) = spec.rsplit_once('=').ok_or_else(|| {
-        WalletError::Validation(ValidationError::AddressInvalid {
-            input: format!("'{spec}': expected '<identity>=<weight>'"),
-        })
+        WalletError::Validation(ValidationError::address_check(
+            "a --weighted-signer-* value must have the form <identity>=<weight>",
+        ))
     })?;
     let weight = weight_str.parse::<u32>().map_err(|_| {
-        WalletError::Validation(ValidationError::AddressInvalid {
-            input: format!("'{spec}': weight '{weight_str}' is not a valid u32"),
-        })
+        WalletError::Validation(ValidationError::address_check(
+            "a --weighted-signer-* weight must be a u32",
+        ))
     })?;
     if identity.is_empty() {
-        return Err(WalletError::Validation(ValidationError::AddressInvalid {
-            input: format!("'{spec}': identity must not be empty"),
-        }));
+        return Err(WalletError::Validation(ValidationError::address_check(
+            "a --weighted-signer-* identity must not be empty",
+        )));
     }
     Ok((identity.to_owned(), weight))
 }
@@ -3399,50 +3322,38 @@ fn resolve_weighted_webauthn_key_data(
     creds_mgr: &CredentialsManager,
     credential_name: &str,
 ) -> Result<Vec<u8>, WalletError> {
-    let metadata = creds_mgr.show(credential_name).map_err(|e| {
-        WalletError::Validation(ValidationError::AddressInvalid {
-            input: format!("--weighted-signer-webauthn '{credential_name}': {e}"),
-        })
+    let metadata = creds_mgr.show(credential_name).map_err(|_| {
+        WalletError::Validation(ValidationError::address_check("--weighted-signer-webauthn names a passkey credential that cannot be read; `stellar-agent credentials list` shows the registered credentials"))
     })?;
 
     if metadata.public_key_sec1_b64.is_empty() {
-        return Err(WalletError::Validation(ValidationError::AddressInvalid {
-            input: format!(
-                "--weighted-signer-webauthn '{credential_name}': credential is missing \
-                 public_key_sec1_b64 (delete and re-register)"
-            ),
-        }));
+        return Err(WalletError::Validation(ValidationError::address_check(
+            "--weighted-signer-webauthn: credential is missing public_key_sec1_b64 (delete and re-register)",
+        )));
     }
 
     let pubkey_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(&metadata.public_key_sec1_b64)
         .map_err(|_| {
-            WalletError::Validation(ValidationError::AddressInvalid {
-                input: format!(
-                    "--weighted-signer-webauthn '{credential_name}': public_key_sec1_b64 \
-                     is not valid base64url"
-                ),
-            })
+            WalletError::Validation(ValidationError::address_check(
+                "--weighted-signer-webauthn: public_key_sec1_b64 is not valid base64url",
+            ))
         })?;
     if pubkey_bytes.len() != 65 {
-        return Err(WalletError::Validation(ValidationError::AddressInvalid {
-            input: format!(
-                "--weighted-signer-webauthn '{credential_name}': public_key_sec1_b64 decodes \
-                 to {} bytes, expected 65",
+        return Err(WalletError::Validation(ValidationError::address_check(
+            format!(
+                "--weighted-signer-webauthn: public_key_sec1_b64 decodes to {} bytes, expected 65",
                 pubkey_bytes.len()
             ),
-        }));
+        )));
     }
 
     let credential_id_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(&metadata.credential_id_b64url)
         .map_err(|_| {
-            WalletError::Validation(ValidationError::AddressInvalid {
-                input: format!(
-                    "--weighted-signer-webauthn '{credential_name}': credential_id_b64url \
-                     is not valid base64url"
-                ),
-            })
+            WalletError::Validation(ValidationError::address_check(
+                "--weighted-signer-webauthn: credential_id_b64url is not valid base64url",
+            ))
         })?;
 
     // pubkey_data = pubkey_65_bytes || credential_id_bytes, per the OZ
@@ -3458,11 +3369,9 @@ fn parse_valid_until(s: &str) -> Result<Option<u32>, WalletError> {
     if s.eq_ignore_ascii_case("none") {
         return Ok(None);
     }
-    s.parse::<u32>().map(Some).map_err(|_| {
-        WalletError::Validation(ValidationError::ValidUntilInvalid {
-            input: s.to_owned(),
-        })
-    })
+    s.parse::<u32>()
+        .map(Some)
+        .map_err(|_| WalletError::Validation(ValidationError::ValidUntilInvalid))
 }
 
 /// Accepted `--context` grammar, embedded verbatim in every parse error so the
@@ -3654,6 +3563,21 @@ mod tests {
     )]
 
     use super::*;
+
+    #[test]
+    fn valid_until_seed_input_is_not_echoed() {
+        use stellar_agent_test_support::rejected_value::{assert_no_marker, seed_marker};
+        let marker = seed_marker();
+        let error = parse_valid_until(&marker).expect_err("a seed is not a ledger sequence");
+        assert_no_marker(&error, &marker);
+        assert_eq!(error.code(), "validation.valid_until_invalid");
+        let json =
+            serde_json::to_string(&stellar_agent_core::envelope::Envelope::<()>::err(&error))
+                .unwrap();
+        assert!(!json.contains(&marker));
+        assert!(json.contains("--valid-until"));
+    }
+
     use clap::Parser;
     use serial_test::serial;
     use stellar_agent_core::constants::SIMULATE_SENTINEL_G;
@@ -6249,9 +6173,9 @@ mod tests {
             Ok(SmartAccountAddress::Contract(_))
         ));
         match parse_delegated_signer_for_rule(&muxed_strkey()) {
-            Err(WalletError::Validation(ValidationError::AddressInvalid { input })) => {
+            Err(WalletError::Validation(ValidationError::AddressInvalid { field })) => {
                 assert_eq!(
-                    input,
+                    field.as_str(),
                     "--signer-delegated: invalid delegated signer address: expected a G-strkey \
                      or a C-strkey"
                 );

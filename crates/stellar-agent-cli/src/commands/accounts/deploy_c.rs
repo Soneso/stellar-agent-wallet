@@ -57,10 +57,10 @@ use stellar_agent_smart_account::deployment::{
 use stellar_agent_smart_account::managers::credentials::CredentialsManager;
 use stellar_agent_smart_account::managers::rules::parse_c_strkey_to_smart_account;
 use stellar_agent_smart_account::managers::signers::build_external_signer_scval;
-use stellar_agent_smart_account::verifiers::VerifierRegistry;
 use tracing::info;
 use uuid::Uuid;
 
+use crate::commands::smart_account::common::open_verifier_registry;
 use crate::common::network::{
     EndpointFlags, EndpointUrlFlag, TargetNetwork, network_context_for_command,
 };
@@ -314,10 +314,7 @@ where
     {
         Ok(loaded) => loaded,
         Err(e) => {
-            print_error(
-                &Envelope::<()>::err_raw(e.code(), e.message(&resolved.name)),
-                args.output,
-            );
+            print_error(&Envelope::<()>::err_raw(e.code(), e.message()), args.output);
             return 1;
         }
     };
@@ -630,29 +627,20 @@ async fn resolve_genesis_signer_source(
 ) -> Result<(String, Option<stellar_xdr::ScVal>), WalletError> {
     if let Some(g_strkey) = &args.initial_signer {
         if let Err(e) = stellar_strkey::ed25519::PublicKey::from_string(g_strkey) {
-            return Err(WalletError::Validation(ValidationError::AddressInvalid {
-                input: format!("--initial-signer: {e}"),
-            }));
+            return Err(WalletError::Validation(ValidationError::address_check(
+                format!("--initial-signer: {e}"),
+            )));
         }
         return Ok((g_strkey.clone(), None));
     }
 
     if let Some(credential_name) = &args.signer_webauthn {
-        let verifier_registry = VerifierRegistry::open().map_err(|e| {
-            WalletError::Validation(ValidationError::AddressInvalid {
-                input: format!("could not open verifier registry: {e}"),
-            })
-        })?;
+        let verifier_registry = open_verifier_registry()?;
         let network_passphrase = context.network_passphrase();
         let verifier_entry = verifier_registry
             .webauthn_verifier_for(network_passphrase)
             .ok_or_else(|| {
-                WalletError::Validation(ValidationError::AddressInvalid {
-                    input: format!(
-                        "no WebAuthn verifier deployed for network '{network_passphrase}'; \
-                         run: smart-account deploy-webauthn-verifier"
-                    ),
-                })
+                WalletError::Validation(ValidationError::address_check("network: no WebAuthn verifier deployed; run: smart-account deploy-webauthn-verifier"))
             })?;
         let verifier_sc_addr =
             parse_c_strkey_to_smart_account(&verifier_entry.address).map_err(|e| {
@@ -667,57 +655,45 @@ async fn resolve_genesis_signer_source(
 
         let profile = profile_name;
         validate_path_component_ascii_safe(profile).map_err(|reason| {
-            WalletError::Validation(ValidationError::AddressInvalid {
-                input: format!("invalid profile name '{profile}': {reason}"),
-            })
+            WalletError::Validation(ValidationError::address_check(format!(
+                "the profile name is not a valid profile name: {reason}"
+            )))
         })?;
         let creds_mgr =
             CredentialsManager::from_defaults_readonly(profile, "localhost").map_err(|e| {
-                WalletError::Validation(ValidationError::AddressInvalid {
-                    input: format!("could not open passkeys registry: {e}"),
-                })
+                WalletError::Validation(ValidationError::address_check(format!(
+                    "could not open passkeys registry: {e}"
+                )))
             })?;
-        let metadata = creds_mgr.show(credential_name).map_err(|e| {
-            WalletError::Validation(ValidationError::AddressInvalid {
-                input: format!("--signer-webauthn '{credential_name}': {e}"),
-            })
+        let metadata = creds_mgr.show(credential_name).map_err(|_| {
+            WalletError::Validation(ValidationError::address_check("--signer-webauthn names a passkey credential that cannot be read; `stellar-agent credentials list` shows the registered credentials"))
         })?;
         if metadata.public_key_sec1_b64.is_empty() {
-            return Err(WalletError::Validation(ValidationError::AddressInvalid {
-                input: format!(
-                    "--signer-webauthn '{credential_name}': credential is missing \
-                     public_key_sec1_b64 (delete and re-register)"
-                ),
-            }));
+            return Err(WalletError::Validation(ValidationError::address_check(
+                "--signer-webauthn: credential is missing public_key_sec1_b64 (delete and re-register)",
+            )));
         }
         let pubkey_bytes = URL_SAFE_NO_PAD
             .decode(&metadata.public_key_sec1_b64)
             .map_err(|_| {
-                WalletError::Validation(ValidationError::AddressInvalid {
-                    input: format!(
-                        "--signer-webauthn '{credential_name}': public_key_sec1_b64 is not \
-                         valid base64url"
-                    ),
-                })
+                WalletError::Validation(ValidationError::address_check(
+                    "--signer-webauthn: public_key_sec1_b64 is not valid base64url",
+                ))
             })?;
         if pubkey_bytes.len() != 65 {
-            return Err(WalletError::Validation(ValidationError::AddressInvalid {
-                input: format!(
-                    "--signer-webauthn '{credential_name}': public_key_sec1_b64 decodes to \
-                     {} bytes, expected 65",
+            return Err(WalletError::Validation(ValidationError::address_check(
+                format!(
+                    "--signer-webauthn: public_key_sec1_b64 decodes to {} bytes, expected 65",
                     pubkey_bytes.len()
                 ),
-            }));
+            )));
         }
         let credential_id_bytes = URL_SAFE_NO_PAD
             .decode(&metadata.credential_id_b64url)
             .map_err(|_| {
-                WalletError::Validation(ValidationError::AddressInvalid {
-                    input: format!(
-                        "--signer-webauthn '{credential_name}': credential_id_b64url is not \
-                         valid base64url"
-                    ),
-                })
+                WalletError::Validation(ValidationError::address_check(
+                    "--signer-webauthn: credential_id_b64url is not valid base64url",
+                ))
             })?;
         let mut key_data = Vec::with_capacity(65 + credential_id_bytes.len());
         key_data.extend_from_slice(&pubkey_bytes);
@@ -733,41 +709,31 @@ async fn resolve_genesis_signer_source(
     }
 
     if let Some(hex_pubkey) = &args.signer_ed25519 {
-        let key_data = hex::decode(hex_pubkey).map_err(|e| {
-            WalletError::Validation(ValidationError::AddressInvalid {
-                input: format!("--signer-ed25519 is not valid hex: {e}"),
-            })
+        let key_data = hex::decode(hex_pubkey).map_err(|_| {
+            WalletError::Validation(ValidationError::address_check(
+                "--signer-ed25519 is not valid hex",
+            ))
         })?;
         if key_data.len() != 32 {
-            return Err(WalletError::Validation(ValidationError::AddressInvalid {
-                input: format!(
+            return Err(WalletError::Validation(ValidationError::address_check(
+                format!(
                     "--signer-ed25519 must decode to exactly 32 bytes (a raw Ed25519 public \
                      key), got {} bytes",
                     key_data.len()
                 ),
-            }));
+            )));
         }
 
         let verifier_c_strkey = if let Some(explicit) = &args.verifier {
             explicit.clone()
         } else {
-            let verifier_registry = VerifierRegistry::open().map_err(|e| {
-                WalletError::Validation(ValidationError::AddressInvalid {
-                    input: format!("could not open verifier registry: {e}"),
-                })
-            })?;
+            let verifier_registry = open_verifier_registry()?;
             let network_passphrase = context.network_passphrase();
             verifier_registry
                 .ed25519_verifier_for(network_passphrase)
                 .map(|entry| entry.address.clone())
                 .ok_or_else(|| {
-                    WalletError::Validation(ValidationError::AddressInvalid {
-                        input: format!(
-                            "no Ed25519 verifier registered for network \
-                             '{network_passphrase}'; run: smart-account \
-                             deploy-ed25519-verifier (or pass --verifier)"
-                        ),
-                    })
+                    WalletError::Validation(ValidationError::address_check("network: no Ed25519 verifier registered; run: smart-account deploy-ed25519-verifier (or pass --verifier)"))
                 })?
         };
         let verifier_sc_addr =
@@ -788,15 +754,15 @@ async fn resolve_genesis_signer_source(
 
     if let Some(verifier_c_strkey) = &args.signer_external {
         let key_data_hex = args.signer_key_data.as_deref().unwrap_or("");
-        let key_data = hex::decode(key_data_hex).map_err(|e| {
-            WalletError::Validation(ValidationError::AddressInvalid {
-                input: format!("--signer-key-data is not valid hex: {e}"),
-            })
+        let key_data = hex::decode(key_data_hex).map_err(|_| {
+            WalletError::Validation(ValidationError::address_check(
+                "--signer-key-data is not valid hex",
+            ))
         })?;
         if key_data.is_empty() {
-            return Err(WalletError::Validation(ValidationError::AddressInvalid {
-                input: "--signer-key-data must be non-empty".to_owned(),
-            }));
+            return Err(WalletError::Validation(ValidationError::address_check(
+                "--signer-key-data must be non-empty",
+            )));
         }
         let verifier_sc_addr = parse_c_strkey_to_smart_account(verifier_c_strkey).map_err(|e| {
             WalletError::SmartAccount {
@@ -815,9 +781,9 @@ async fn resolve_genesis_signer_source(
 
     // Unreachable: the `genesis_signer_source` ArgGroup requires exactly one
     // of the four flags above.
-    Err(WalletError::Validation(ValidationError::AddressInvalid {
-        input: "no genesis signer source supplied".to_owned(),
-    }))
+    Err(WalletError::Validation(ValidationError::address_check(
+        "no genesis signer source supplied",
+    )))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

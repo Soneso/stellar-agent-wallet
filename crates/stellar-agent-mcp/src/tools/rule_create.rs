@@ -307,7 +307,7 @@ fn parse_rule_context_arg(s: &str) -> Result<RuleContext, String> {
         })?;
         return Ok(RuleContext::CreateContract { wasm_hash });
     }
-    Err(format!("unknown context '{s}'; {CONTEXT_GRAMMAR}"))
+    Err(format!("unknown context; {CONTEXT_GRAMMAR}"))
 }
 
 /// Renders a [`RuleContext`] back into its core-side
@@ -451,9 +451,14 @@ fn resolve_signers(
                         None,
                     )
                 })?;
-                let pubkey_data = hex::decode(pubkey_data_hex).map_err(|e| {
+                // The hex decoder's error quotes the offending character, so
+                // the refusal names the field and the expected form only.
+                let pubkey_data = hex::decode(pubkey_data_hex).map_err(|_| {
                     rmcp::ErrorData::invalid_params(
-                        format!("signers[{idx}].pubkey_data_hex: invalid hex: {e}"),
+                        format!(
+                            "signers[{idx}].pubkey_data_hex: must be an even-length string of \
+                             hex digits"
+                        ),
                         None,
                     )
                 })?;
@@ -514,11 +519,10 @@ fn resolve_webauthn_signer(
     server: &WalletServer,
     idx: usize,
 ) -> Result<(String, stellar_xdr::ScAddress, Vec<u8>), rmcp::ErrorData> {
+    // The refusal names the field by its position; the credential name stays
+    // out, because a name the passkey store does not hold is refused input.
     let bad = |detail: String| {
-        rmcp::ErrorData::invalid_params(
-            format!("signers[{idx}].credential_name '{credential_name}': {detail}"),
-            None,
-        )
+        rmcp::ErrorData::invalid_params(format!("signers[{idx}].credential_name: {detail}"), None)
     };
 
     let registry = VerifierRegistry::open()
@@ -615,10 +619,11 @@ fn resolve_policies(
                 // the CLI `rules add-policy --kind raw --install-param` path.
                 let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
                     .decode(install_param_xdr_b64)
-                    .map_err(|e| {
+                    .map_err(|_| {
                         rmcp::ErrorData::invalid_params(
                             format!(
-                                "policies[{idx}].install_param_xdr_b64: not valid base64url: {e}"
+                                "policies[{idx}].install_param_xdr_b64: must be unpadded \
+                                 base64url"
                             ),
                             None,
                         )
@@ -645,10 +650,7 @@ fn resolve_policies(
             } => {
                 let limit_stroops: i128 = limit_stroops.parse().map_err(|_| {
                     rmcp::ErrorData::invalid_params(
-                        format!(
-                            "policies[{idx}].limit_stroops: not a valid decimal i128: \
-                             {limit_stroops:?}"
-                        ),
+                        format!("policies[{idx}].limit_stroops: not a valid decimal i128"),
                         None,
                     )
                 })?;
@@ -2176,7 +2178,10 @@ mod tests {
             pubkey_data_hex: "not-hex!!".to_owned(),
         }];
         let err = resolve_signers(&signers, &server).unwrap_err();
-        assert!(err.message.contains("invalid hex"));
+        assert!(
+            err.message
+                .contains("must be an even-length string of hex digits")
+        );
     }
 
     #[test]
@@ -2225,7 +2230,7 @@ mod tests {
         }];
         let err =
             resolve_policies(&policies, &RuleContext::Default, NETWORK_PASSPHRASE).unwrap_err();
-        assert!(err.message.contains("not valid base64url"));
+        assert!(err.message.contains("must be unpadded base64url"));
     }
 
     #[test]
@@ -3146,5 +3151,97 @@ mod tests {
             stored_kind(&store_path, &nonce).kind_name(),
             "RuleProposalSimulated"
         );
+    }
+
+    /// The propose tool refuses a malformed context, external signer key,
+    /// credential name, install parameter and spending limit by the field and
+    /// the expected form or constraint, and no refusal repeats the argument.
+    #[tokio::test]
+    #[serial_test::serial(keyring)]
+    async fn rule_create_marker_is_not_echoed() {
+        use stellar_agent_test_support::rejected_value::{
+            CREDENTIAL_MARKER, assert_no_marker_in_text,
+        };
+
+        let (server, _dir) = test_server();
+        let delegated = serde_json::json!([{ "kind": "delegated", "address": TEST_G }]);
+        let call_contract = format!("call-contract:{TEST_SMART_ACCOUNT}");
+        let cases: Vec<(serde_json::Value, &str, Option<String>)> = vec![
+            (
+                serde_json::json!({ "context": CREDENTIAL_MARKER, "signers": delegated }),
+                CREDENTIAL_MARKER,
+                Some(format!("unknown context; {CONTEXT_GRAMMAR}")),
+            ),
+            (
+                serde_json::json!({ "signers": [{
+                    "kind": "external", "verifier": TEST_C, "pubkey_data_hex": CREDENTIAL_MARKER
+                }] }),
+                CREDENTIAL_MARKER,
+                Some(
+                    "signers[0].pubkey_data_hex: must be an even-length string of hex digits"
+                        .to_owned(),
+                ),
+            ),
+            (
+                serde_json::json!({ "signers": [{
+                    "kind": "webauthn", "credential_name": CREDENTIAL_MARKER
+                }] }),
+                CREDENTIAL_MARKER,
+                None,
+            ),
+            (
+                serde_json::json!({ "signers": delegated, "policies": [{
+                    "kind": "raw", "policy_address": TEST_C,
+                    "install_param_xdr_b64": format!("{CREDENTIAL_MARKER}*")
+                }] }),
+                CREDENTIAL_MARKER,
+                Some("policies[0].install_param_xdr_b64: must be unpadded base64url".to_owned()),
+            ),
+            (
+                serde_json::json!({ "context": call_contract, "signers": delegated, "policies": [{
+                    "kind": "spending_limit", "limit_stroops": CREDENTIAL_MARKER,
+                    "period_ledgers": 17_280, "policy_address": TEST_C
+                }] }),
+                CREDENTIAL_MARKER,
+                Some("policies[0].limit_stroops: not a valid decimal i128".to_owned()),
+            ),
+            (
+                serde_json::json!({ "context": call_contract, "signers": delegated, "policies": [{
+                    "kind": "spending_limit", "limit_stroops": "-7777777",
+                    "period_ledgers": 17_280, "policy_address": TEST_C
+                }] }),
+                "7777777",
+                Some(
+                    "policies[0]: spending-limit policy install refused: --limit must be \
+                     positive (OZ install rejects a non-positive spending_limit with \
+                     InvalidLimitOrPeriod)"
+                        .to_owned(),
+                ),
+            ),
+        ];
+        for (overrides, marker, expected) in cases {
+            let mut args = serde_json::json!({
+                "chain_id": "stellar:testnet",
+                "smart_account": TEST_SMART_ACCOUNT,
+                "name": "spend-daily",
+            });
+            for (key, value) in overrides.as_object().unwrap() {
+                args[key] = value.clone();
+            }
+            let args: StellarRuleCreateArgs = serde_json::from_value(args).unwrap();
+            let err = server
+                .call_stellar_rule_create(args)
+                .await
+                .expect_err("the argument is refused");
+            match expected {
+                Some(expected) => assert_eq!(err.message, expected),
+                None => assert!(
+                    err.message.starts_with("signers[0].credential_name: "),
+                    "{}",
+                    err.message
+                ),
+            }
+            assert_no_marker_in_text(&format!("{err:?}"), marker);
+        }
     }
 }

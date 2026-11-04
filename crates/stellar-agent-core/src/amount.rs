@@ -21,6 +21,10 @@ use std::fmt;
 use crate::error::ValidationError;
 use crate::observability::redact::is_untrusted_format_character;
 
+/// The field an amount-parse refusal names. The parsers do not know the
+/// argument the amount came from, and a refusal never repeats the amount.
+const AMOUNT_FIELD: &str = "the amount";
+
 // ──────────────────────────────────────────────────────────────────────────────
 // Protocol constants
 // ──────────────────────────────────────────────────────────────────────────────
@@ -236,7 +240,7 @@ impl StellarAmount {
             }
             _ => {
                 return Err(ValidationError::AmountMalformed {
-                    input: input.to_owned(),
+                    field: AMOUNT_FIELD.into(),
                 });
             }
         };
@@ -247,12 +251,11 @@ impl StellarAmount {
         };
         if !unit_matches {
             return Err(ValidationError::AmountUnitMismatch {
-                input: input.to_owned(),
+                field: AMOUNT_FIELD.into(),
                 expected: expected_unit.to_owned(),
-                supplied: unit_str.to_owned(),
             });
         }
-        parse_decimal_to_stroops(numeric_str, input)
+        parse_decimal_to_stroops(numeric_str)
     }
 
     /// Parses a bare stroop integer string (for `--amount-base <stroops>`).
@@ -282,7 +285,7 @@ impl StellarAmount {
 
         if s.is_empty() {
             return Err(ValidationError::AmountMalformed {
-                input: s.to_owned(),
+                field: AMOUNT_FIELD.into(),
             });
         }
 
@@ -294,13 +297,13 @@ impl StellarAmount {
 
         if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
             return Err(ValidationError::AmountMalformed {
-                input: s.to_owned(),
+                field: AMOUNT_FIELD.into(),
             });
         }
 
         // Parse the absolute value using u64 to accommodate i64::MIN whose
         // absolute value (9223372036854775808) exceeds i64::MAX.
-        let abs_val: u64 = parse_digits_to_u64(digits, s)?;
+        let abs_val: u64 = parse_digits_to_u64(digits)?;
 
         if negative {
             // The valid range for a negative i64 stroop is
@@ -308,7 +311,7 @@ impl StellarAmount {
             let min_abs = (i64::MAX as u64) + 1; // |i64::MIN| = 2^63
             if abs_val > min_abs {
                 return Err(ValidationError::AmountOutOfRange {
-                    amount: s.to_owned(),
+                    field: AMOUNT_FIELD.into(),
                 });
             }
             // Safe: abs_val fits in the negative i64 range.
@@ -321,7 +324,7 @@ impl StellarAmount {
             // Positive: abs_val must fit in i64::MAX.
             if abs_val > i64::MAX as u64 {
                 return Err(ValidationError::AmountOutOfRange {
-                    amount: s.to_owned(),
+                    field: AMOUNT_FIELD.into(),
                 });
             }
             Ok(Self::from_stroops(abs_val as i64))
@@ -1156,15 +1159,10 @@ fn format_stroops_as_xlm(stroops: i64) -> String {
 }
 
 /// Parses a signed decimal string into stroops, validating precision and range.
-///
-/// `original` is the full original input string used in error messages.
-fn parse_decimal_to_stroops(
-    numeric_str: &str,
-    original: &str,
-) -> Result<StellarAmount, ValidationError> {
+fn parse_decimal_to_stroops(numeric_str: &str) -> Result<StellarAmount, ValidationError> {
     if numeric_str.is_empty() {
         return Err(ValidationError::AmountMalformed {
-            input: original.to_owned(),
+            field: AMOUNT_FIELD.into(),
         });
     }
 
@@ -1173,7 +1171,7 @@ fn parse_decimal_to_stroops(
         (true, rest)
     } else if numeric_str.starts_with('+') {
         return Err(ValidationError::AmountMalformed {
-            input: original.to_owned(),
+            field: AMOUNT_FIELD.into(),
         });
     } else {
         (false, numeric_str)
@@ -1181,7 +1179,7 @@ fn parse_decimal_to_stroops(
 
     if unsigned_str.is_empty() {
         return Err(ValidationError::AmountMalformed {
-            input: original.to_owned(),
+            field: AMOUNT_FIELD.into(),
         });
     }
 
@@ -1193,7 +1191,7 @@ fn parse_decimal_to_stroops(
             // Reject a second `.` anywhere in the remaining string.
             if after_dot.contains('.') {
                 return Err(ValidationError::AmountMalformed {
-                    input: original.to_owned(),
+                    field: AMOUNT_FIELD.into(),
                 });
             }
             (&unsigned_str[..pos], after_dot)
@@ -1205,21 +1203,21 @@ fn parse_decimal_to_stroops(
         || !frac_part_raw.bytes().all(|b| b.is_ascii_digit())
     {
         return Err(ValidationError::AmountMalformed {
-            input: original.to_owned(),
+            field: AMOUNT_FIELD.into(),
         });
     }
 
     // Reject if integer part is empty (e.g. `".5 XLM"` has no integer part).
     if integer_part.is_empty() {
         return Err(ValidationError::AmountMalformed {
-            input: original.to_owned(),
+            field: AMOUNT_FIELD.into(),
         });
     }
 
     // Check fractional precision.
     if frac_part_raw.len() > STELLAR_DECIMALS as usize {
         return Err(ValidationError::AmountPrecisionExceeded {
-            amount: original.to_owned(),
+            field: AMOUNT_FIELD.into(),
         });
     }
 
@@ -1236,24 +1234,24 @@ fn parse_decimal_to_stroops(
     // Use checked arithmetic throughout.
 
     // Parse integer part.
-    let int_val: i64 = parse_digits_to_i64(integer_part, original)?;
+    let int_val: i64 = parse_digits_to_i64(integer_part)?;
 
     // Parse fractional part (already padded to 7 digits).
-    let frac_val: i64 = parse_digits_to_i64(&frac_padded, original)?;
+    let frac_val: i64 = parse_digits_to_i64(&frac_padded)?;
 
     // Combine: int_val * STROOPS_PER_XLM + frac_val.
     let abs_stroops = int_val
         .checked_mul(STROOPS_PER_XLM)
         .and_then(|v| v.checked_add(frac_val))
         .ok_or_else(|| ValidationError::AmountOutOfRange {
-            amount: original.to_owned(),
+            field: AMOUNT_FIELD.into(),
         })?;
 
     if negative {
         abs_stroops
             .checked_neg()
             .ok_or_else(|| ValidationError::AmountOutOfRange {
-                amount: original.to_owned(),
+                field: AMOUNT_FIELD.into(),
             })
             .map(StellarAmount::from_stroops)
     } else {
@@ -1265,16 +1263,15 @@ fn parse_decimal_to_stroops(
 ///
 /// Returns [`ValidationError::AmountOutOfRange`] if the value exceeds
 /// `i64::MAX` and [`ValidationError::AmountMalformed`] if any non-digit
-/// character is encountered.  `original` is the full original input used
-/// in error messages.
+/// character is encountered.
 ///
 /// Note: does not accept values for `i64::MIN` (whose absolute value exceeds
 /// `i64::MAX`).  For `parse_stroops` which must handle `i64::MIN`, use
 /// [`parse_digits_to_u64`] instead.
-fn parse_digits_to_i64(digits: &str, original: &str) -> Result<i64, ValidationError> {
+fn parse_digits_to_i64(digits: &str) -> Result<i64, ValidationError> {
     if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
         return Err(ValidationError::AmountMalformed {
-            input: original.to_owned(),
+            field: AMOUNT_FIELD.into(),
         });
     }
 
@@ -1286,13 +1283,13 @@ fn parse_digits_to_i64(digits: &str, original: &str) -> Result<i64, ValidationEr
             .checked_mul(10)
             .and_then(|v| v.checked_add(digit))
             .ok_or_else(|| ValidationError::AmountOutOfRange {
-                amount: original.to_owned(),
+                field: AMOUNT_FIELD.into(),
             })?;
         // Reject once we exceed i64::MAX to give a good error before
         // converting back to i64 at the end.
         if acc > i128::from(i64::MAX) {
             return Err(ValidationError::AmountOutOfRange {
-                amount: original.to_owned(),
+                field: AMOUNT_FIELD.into(),
             });
         }
     }
@@ -1305,15 +1302,14 @@ fn parse_digits_to_i64(digits: &str, original: &str) -> Result<i64, ValidationEr
 ///
 /// Returns [`ValidationError::AmountOutOfRange`] if the value exceeds
 /// `u64::MAX` and [`ValidationError::AmountMalformed`] if any non-digit
-/// character is encountered.  `original` is the full original input used
-/// in error messages.
+/// character is encountered.
 ///
 /// Used by [`StellarAmount::parse_stroops`] to handle `i64::MIN` whose
 /// absolute value (2^63) exceeds `i64::MAX` (2^63 - 1) but fits in `u64`.
-fn parse_digits_to_u64(digits: &str, original: &str) -> Result<u64, ValidationError> {
+fn parse_digits_to_u64(digits: &str) -> Result<u64, ValidationError> {
     if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
         return Err(ValidationError::AmountMalformed {
-            input: original.to_owned(),
+            field: AMOUNT_FIELD.into(),
         });
     }
 
@@ -1325,11 +1321,11 @@ fn parse_digits_to_u64(digits: &str, original: &str) -> Result<u64, ValidationEr
             .checked_mul(10)
             .and_then(|v| v.checked_add(digit))
             .ok_or_else(|| ValidationError::AmountOutOfRange {
-                amount: original.to_owned(),
+                field: AMOUNT_FIELD.into(),
             })?;
         if acc > u128::from(u64::MAX) {
             return Err(ValidationError::AmountOutOfRange {
-                amount: original.to_owned(),
+                field: AMOUNT_FIELD.into(),
             });
         }
     }
@@ -1438,18 +1434,19 @@ mod tests {
 
     #[test]
     fn asset_unit_parser_refuses_mismatched_units() {
-        for (input, expected, supplied) in [
-            ("100 XLM", "TST", "XLM"),
-            ("100 USDC", "XLM", "USDC"),
-            ("100 tst", "TST", "tst"),
-            ("100 xlm", "XLM", "xlm"),
+        for (input, expected) in [
+            ("100 XLM", "TST"),
+            ("100 USDC", "XLM"),
+            ("100 tst", "TST"),
+            ("100 xlm", "XLM"),
         ] {
             let error = StellarAmount::parse_with_unit_for(input, expected).unwrap_err();
             assert_eq!(error.code(), "validation.amount_malformed");
             assert_eq!(
                 error.to_string(),
-                format!("amount '{input}' has unit '{supplied}'; expected unit '{expected}'")
+                format!("the amount has the wrong unit; expected unit '{expected}'")
             );
+            assert!(!error.to_string().contains(input), "{error}");
         }
     }
 
@@ -1662,12 +1659,12 @@ mod tests {
         use crate::error::WalletError;
 
         let malformed = WalletError::Validation(ValidationError::AmountMalformed {
-            input: "abc".to_owned(),
+            field: "--amount".into(),
         });
         assert_eq!(malformed.code(), "validation.amount_malformed");
 
         let out_of_range = WalletError::Validation(ValidationError::AmountOutOfRange {
-            amount: "99999999999999999999".to_owned(),
+            field: "--amount".into(),
         });
         assert_eq!(out_of_range.code(), "validation.amount_out_of_range");
     }
@@ -1752,7 +1749,7 @@ mod tests {
     }
 
     #[test]
-    fn amount_malformed_input_field_holds_the_raw_input() {
+    fn amount_malformed_names_the_field_not_the_input() {
         for raw in [
             "abc XLM",
             "1 000 xlm",
@@ -1765,21 +1762,25 @@ mod tests {
             " abc ",
         ] {
             let error = StellarAmount::parse_with_unit(raw).unwrap_err();
-            assert!(matches!(&error, ValidationError::AmountMalformed { input } if input == raw));
+            assert!(
+                matches!(&error, ValidationError::AmountMalformed { field } if field == "the amount")
+            );
             assert_eq!(
                 error.to_string(),
-                format!("amount '{raw}' could not be parsed as a valid amount")
+                "the amount could not be parsed as a valid amount"
             );
             let error =
                 serde_json::from_value::<McpAmountArgument>(serde_json::json!(raw)).unwrap_err();
-            assert!(error.to_string().contains(&format!(
-                "amount '{raw}' could not be parsed as a valid amount"
-            )));
+            assert!(
+                error
+                    .to_string()
+                    .contains("the amount could not be parsed as a valid amount")
+            );
         }
     }
 
     #[test]
-    fn amount_errors_preserve_untrimmed_input() {
+    fn amount_errors_classify_untrimmed_input() {
         for (raw, expected_code) in [
             (" 0.00000001 xlm ", "validation.amount_precision_exceeded"),
             (
@@ -1790,28 +1791,78 @@ mod tests {
         ] {
             let error = StellarAmount::parse_with_unit(raw).unwrap_err();
             assert_eq!(error.code(), expected_code);
-            assert!(error.to_string().contains(&format!("'{raw}'")));
+            assert!(!error.to_string().contains(raw.trim()), "{error}");
             match &error {
-                ValidationError::AmountPrecisionExceeded { amount }
-                | ValidationError::AmountOutOfRange { amount } => assert_eq!(amount, raw),
-                ValidationError::AmountUnitMismatch { input, .. } => assert_eq!(input, raw),
+                ValidationError::AmountPrecisionExceeded { field }
+                | ValidationError::AmountOutOfRange { field }
+                | ValidationError::AmountUnitMismatch { field, .. } => {
+                    assert_eq!(field, "the amount");
+                }
                 other => panic!("unexpected error: {other}"),
             }
-            let error =
-                serde_json::from_value::<McpAmountArgument>(serde_json::json!(raw)).unwrap_err();
-            assert!(error.to_string().contains(&format!("'{raw}'")));
         }
         for raw in ["10 usdc", " 10 usdc "] {
             let error = StellarAmount::parse_with_unit_for(raw, "USDC").unwrap_err();
             assert!(
-                matches!(&error, ValidationError::AmountUnitMismatch { input, supplied, expected }
-                if input == raw && supplied == "usdc" && expected == "USDC")
+                matches!(&error, ValidationError::AmountUnitMismatch { field, expected }
+                if field == "the amount" && expected == "USDC")
             );
+            assert!(!error.to_string().contains("usdc"), "{error}");
         }
         for raw in [" 1 000 USDC ", " +1 USDC ", " 1.2.3 USDC "] {
             let error = StellarAmount::parse_with_unit_for(raw, "USDC").unwrap_err();
-            assert!(matches!(&error, ValidationError::AmountMalformed { input } if input == raw));
+            assert!(matches!(&error, ValidationError::AmountMalformed { .. }));
         }
+    }
+
+    /// A seed typed where an amount belongs never reaches an error, whichever
+    /// amount check refuses it, and neither do the number or the unit of an
+    /// amount refused for its precision, range, or unit.
+    #[test]
+    fn a_seed_as_an_amount_is_not_echoed() {
+        use stellar_agent_test_support::rejected_value::{assert_no_marker, seed_marker};
+        let seed = seed_marker();
+        let cases = [
+            (seed.clone(), seed.clone(), "validation.amount_malformed"),
+            (
+                format!("{seed} XLM"),
+                seed.clone(),
+                "validation.amount_malformed",
+            ),
+            (
+                format!("1 {seed}"),
+                seed.clone(),
+                "validation.amount_malformed",
+            ),
+            (
+                "1.123456789 XLM".to_owned(),
+                "1.123456789".to_owned(),
+                "validation.amount_precision_exceeded",
+            ),
+            (
+                "92233720368547758079 XLM".to_owned(),
+                "92233720368547758079".to_owned(),
+                "validation.amount_out_of_range",
+            ),
+        ];
+        for (raw, marker, code) in cases {
+            let error = StellarAmount::parse_with_unit(&raw).unwrap_err();
+            assert_eq!(error.code(), code, "{raw}");
+            assert_no_marker(&error, &marker);
+            let error = StellarAmount::parse_with_unit_for(&raw, "XLM").unwrap_err();
+            assert_no_marker(&error, &marker);
+            let error =
+                serde_json::from_value::<McpAmountArgument>(serde_json::json!(raw)).unwrap_err();
+            assert!(!error.to_string().contains(&marker), "{error}");
+        }
+        for raw in [seed.clone(), format!("-{seed}")] {
+            let error = StellarAmount::parse_stroops(&raw).unwrap_err();
+            assert_eq!(error.code(), "validation.amount_malformed");
+            assert_no_marker(&error, &seed);
+        }
+        let error = StellarAmount::parse_stroops("99999999999999999999").unwrap_err();
+        assert_eq!(error.code(), "validation.amount_out_of_range");
+        assert_no_marker(&error, "99999999999999999999");
     }
 
     #[test]
@@ -1847,11 +1898,12 @@ mod tests {
             assert!(
                 matches!(
                     &error,
-                    ValidationError::AmountUnitMismatch { input, expected, supplied }
-                        if input == &format!("100 {unit}") && expected == "XLM" && supplied == unit
+                    ValidationError::AmountUnitMismatch { field, expected }
+                        if field == "the amount" && expected == "XLM"
                 ),
                 "{error}"
             );
+            assert!(!error.to_string().contains(unit), "{error}");
         }
     }
 

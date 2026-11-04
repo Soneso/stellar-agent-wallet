@@ -754,7 +754,7 @@ fn usdt_refusal() {
 /// A bare code with no pin row is refused as `UnpinnedBareCode` before any RPC call.
 ///
 /// Acceptance criteria:
-/// 1. `resolve_denomination("FOO", testnet)` → `UnpinnedBareCode { code="FOO" }`.
+/// 1. `resolve_denomination("FOO", testnet)` → `UnpinnedBareCode { network: Testnet }`.
 /// 2. `resolve_denomination("EURAU", testnet)` → `UnpinnedBareCode`.
 ///    EURAU is not pinnable — its live on-chain assets are lookalikes — so it
 ///    is refused as an unpinned bare code.
@@ -766,7 +766,7 @@ fn bare_unknown_code_refusal() {
     let err = resolve_denomination(DenominationInput::BareCode("FOO".to_owned()), passphrase)
         .expect_err("bare unknown code FOO must be refused");
     assert!(
-        matches!(&err, ResolveError::UnpinnedBareCode { code, .. } if code == "FOO"),
+        matches!(err, ResolveError::UnpinnedBareCode { .. }),
         "expected UnpinnedBareCode for FOO, got: {err:?}"
     );
 

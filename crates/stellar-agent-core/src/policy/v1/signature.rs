@@ -315,10 +315,10 @@ pub fn parse_owner_rotation(
         .as_table_like()
         .ok_or_else(|| malformed("`owner_rotation` must be a table".into()))?;
     let keys = super::schema::OWNER_ROTATION_KEYS;
-    if let Some((key, _)) = table.iter().find(|(key, _)| !keys.contains(key)) {
+    // The rejected key is operator input and is not part of the detail.
+    if table.iter().any(|(key, _)| !keys.contains(&key)) {
         return Err(malformed(format!(
-            "owner_rotation: unknown key `{}`; the owner rotation table accepts {}",
-            key.escape_debug(),
+            "owner_rotation: unknown key; the owner rotation table accepts {}",
             keys.join(", ")
         )));
     }
@@ -371,11 +371,9 @@ pub fn verify_owner_rotation(
     new_owner: &[u8; 32],
 ) -> Result<(), PolicyError> {
     let invalid = || PolicyError::OwnerRotationInvalid;
-    let doc =
-        raw.parse::<toml_edit::DocumentMut>()
-            .map_err(|e| PolicyError::PolicyFileParseFailed {
-                detail: e.to_string(),
-            })?;
+    let doc = raw
+        .parse::<toml_edit::DocumentMut>()
+        .map_err(|e| PolicyError::toml_syntax(raw, &e))?;
     let rotation = parse_owner_rotation(&doc)?.ok_or(PolicyError::OwnerRotationRequired)?;
     if rotation.previous_owner != *previous_owner || rotation.new_owner != *new_owner {
         return Err(invalid());
@@ -682,7 +680,11 @@ mod tests {
         for (defect, expected) in [
             ("non_table", "`owner_rotation` must be a table"),
             ("missing", "`[owner_rotation].sig` is missing"),
-            ("unknown", "owner_rotation: unknown key `extra`"),
+            (
+                "unknown",
+                "owner_rotation: unknown key; the owner rotation table accepts previous_owner, \
+                 new_owner, sig",
+            ),
             (
                 "non_string",
                 "`[owner_rotation].new_owner` must be a string",

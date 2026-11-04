@@ -59,6 +59,17 @@ use stellar_agent_network::{StellarRpcClient, enrolled_keyring_signer};
 use crate::server::WalletServer;
 use crate::tools::common::DispatchOutcome;
 
+/// The refusal of a `chain_id` with no pinned Soroswap router. It names the
+/// accepted values and never the refused argument.
+const UNRECOGNISED_NETWORK_TEXT: &str = "dex.unrecognised_network: chain_id must name a network \
+                                         with a pinned Soroswap router (stellar:testnet or \
+                                         stellar:pubnet)";
+
+/// The quote tool's form of [`UNRECOGNISED_NETWORK_TEXT`].
+const QUOTE_UNRECOGNISED_NETWORK_TEXT: &str = "dex.quote.unrecognised_network: chain_id must name \
+                                               a network with a pinned Soroswap router \
+                                               (stellar:testnet or stellar:pubnet)";
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Argument types
 // ─────────────────────────────────────────────────────────────────────────────
@@ -197,6 +208,16 @@ impl WalletServer {
         let qty_out_min =
             crate::tools::amount_wire::parse_i128_field("qty_out_min", &args.qty_out_min)?;
 
+        // ── Validate the smart-account address ───────────────────────────────
+        // Every later event names `from_address` by its first and last five
+        // characters, which is a safe rendering of a contract strkey only.
+        if stellar_strkey::Contract::from_string(&args.from_address).is_err() {
+            return Ok(crate::tools::common::business_error_result(
+                "dex.submit_failed",
+                "from_address must be a C-strkey (contract)",
+            ));
+        }
+
         // ── Resolve network settings ──────────────────────────────────────────
         let network_passphrase = self.context.network_passphrase();
         let rpc_url = self.context.rpc_url.as_str();
@@ -204,9 +225,7 @@ impl WalletServer {
         // ── Resolve pinned router address and WASM hash for network ──────────
         // Table lookup only (no RPC); safe to resolve ahead of the policy gate.
         let (router_address, router_wasm_hash) = pinned_router_for_network(&args.chain_id)
-            .map_err(|e| {
-                rmcp::ErrorData::invalid_params(format!("dex.unrecognised_network: {e}"), None)
-            })?;
+            .map_err(|_| rmcp::ErrorData::invalid_params(UNRECOGNISED_NETWORK_TEXT, None))?;
 
         // ── Canonicalise path for display and TradeArgs ───────────────────────
         // Surface canonicalisation errors (not swallowed): an unresolvable token
@@ -531,9 +550,8 @@ impl WalletServer {
         let rpc_url = self.context.rpc_url.as_str();
 
         // ── Resolve pinned router address ─────────────────────────────────────
-        let (router_address, _) = pinned_router_for_network(&args.chain_id).map_err(|e| {
-            rmcp::ErrorData::invalid_params(format!("dex.quote.unrecognised_network: {e}"), None)
-        })?;
+        let (router_address, _) = pinned_router_for_network(&args.chain_id)
+            .map_err(|_| rmcp::ErrorData::invalid_params(QUOTE_UNRECOGNISED_NETWORK_TEXT, None))?;
 
         // ── Canonicalise path ─────────────────────────────────────────────────
         let canonical_path = canonicalise_path(&args.path, network_passphrase).map_err(|e| {
@@ -917,6 +935,85 @@ mod secondary_rule_tests {
                 .contains(stellar_agent_core::redact::CREDENTIALED_URL_INPUT_REFUSAL),
             "{err:?}"
         );
+        assert!(rpc.received_requests().await.unwrap().is_empty());
+    }
+
+    /// The trade tool refuses a malformed amount, a non-contract
+    /// `from_address` and a `chain_id` without a pinned router by the field
+    /// and the expected form, and none of the three refusals repeats the
+    /// argument.
+    #[tokio::test]
+    async fn dex_trade_marker_is_not_echoed() {
+        use stellar_agent_test_support::rejected_value::{
+            CREDENTIAL_MARKER, assert_no_marker_in_text,
+        };
+
+        let rpc = wiremock::MockServer::start().await;
+        let server = testnet_server(&rpc.uri());
+        let capture = stellar_agent_test_support::log_capture::CaptureWriter::new();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer(capture.clone())
+            .finish();
+        let _inert = stellar_agent_test_support::log_capture::inert_dispatcher();
+        let _subscriber = tracing::subscriber::set_default(subscriber);
+        tracing::callsite::rebuild_interest_cache();
+        let cases: [(&str, &str); 3] = [
+            ("qty_in", "qty_in: not a valid decimal i128"),
+            ("from_address", "from_address must be a C-strkey (contract)"),
+            ("chain_id", UNRECOGNISED_NETWORK_TEXT),
+        ];
+        for (field, expected) in cases {
+            let mut args = serde_json::json!({
+                "chain_id": "stellar:testnet",
+                "from_address": "CAJJZSGMMM3PD7N33TAPHGBUGTB43OC73HVIK2L2G6BNGGGYOSSYBXBD",
+                "qty_in": "1",
+                "qty_out_min": "0",
+                "path": ["native", "native"],
+                "deadline": 9_999_999_999_i64,
+            });
+            args[field] = serde_json::Value::String(CREDENTIAL_MARKER.to_owned());
+            let args: DexTradeArgs = serde_json::from_value(args).unwrap();
+            let result = server.call_stellar_dex_trade(args).await;
+            assert_no_marker_in_text(&format!("{result:?}"), CREDENTIAL_MARKER);
+            if field == "from_address" {
+                let result = result.expect("the address refusal is a business envelope");
+                let (code, message, text) = crate::tools::common::assert_business_envelope(&result);
+                assert_eq!(code, "dex.submit_failed");
+                assert_eq!(message, expected);
+                assert_no_marker_in_text(&text, CREDENTIAL_MARKER);
+            } else {
+                let err = result.expect_err("the argument is refused");
+                assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+                assert_eq!(err.message, expected, "{field}");
+            }
+        }
+        assert_no_marker_in_text(&capture.captured_str(), CREDENTIAL_MARKER);
+        assert!(rpc.received_requests().await.unwrap().is_empty());
+    }
+
+    /// The quote tool refuses a `chain_id` without a pinned router by the
+    /// accepted values, without the argument.
+    #[tokio::test]
+    async fn dex_quote_chain_marker_is_not_echoed() {
+        use stellar_agent_test_support::rejected_value::{
+            CREDENTIAL_MARKER, assert_no_marker_in_text,
+        };
+
+        let rpc = wiremock::MockServer::start().await;
+        let server = testnet_server(&rpc.uri());
+        let args: DexQuoteArgs = serde_json::from_value(serde_json::json!({
+            "chain_id": CREDENTIAL_MARKER, "qty_in": "1", "path": ["native", "native"]
+        }))
+        .unwrap();
+        let err = server
+            .call_stellar_dex_quote(args)
+            .await
+            .expect_err("the chain is refused");
+        assert_eq!(err.message, QUOTE_UNRECOGNISED_NETWORK_TEXT);
+        assert_no_marker_in_text(&format!("{err:?}"), CREDENTIAL_MARKER);
         assert!(rpc.received_requests().await.unwrap().is_empty());
     }
 }

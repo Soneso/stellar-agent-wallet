@@ -492,21 +492,21 @@ pub enum ProfileStateLayout {
 
 impl ProfileStateLayout {
     /// Renders the clause describing what a mismatch does to per-profile state
-    /// under this layout, for `requested`.
-    fn consequence_clause(self, requested: &str) -> String {
+    /// under this layout.
+    fn consequence_clause(self) -> &'static str {
         match self {
-            Self::DerivedThroughout => format!(
+            Self::DerivedThroughout => {
                 "the signed policy file, pending-approval store, and policy-window \
-                 state would be read and written under the derived name, not \
-                 '{requested}'"
-            ),
-            Self::PolicyDerivedStateRequested => format!(
+                 state would be read and written under the name that field derives, \
+                 not the selected one"
+            }
+            Self::PolicyDerivedStateRequested => {
                 "the signed policy file and the owner-key keyring entry would be \
-                 read under the derived name while the pending-approval store \
-                 and the policy-window state file stay keyed on '{requested}', \
-                 so the run would be governed by one profile's policy and \
+                 read under the name that field derives while the pending-approval \
+                 store and the policy-window state file stay keyed on the selected \
+                 name, so the run would be governed by one profile's policy and \
                  accounted against another's state"
-            ),
+            }
         }
     }
 }
@@ -514,102 +514,63 @@ impl ProfileStateLayout {
 /// A loaded profile whose owner-key coordinate names a different profile than
 /// the one the operator selected.
 ///
-/// Carries both names and the offending field so the refusal can be acted on
-/// without opening the TOML. Render it with [`Self::message`] to state the
+/// The refusal names the field the operator edits and the recovery, never the
+/// selected name, the derived name, or the stored `service` value: the field
+/// is operator-edited text that can hold anything, and the selected name is
+/// the operator's own input. Render it with [`Self::message`] to state the
 /// calling surface's own state layout; the [`std::fmt::Display`] rendering is
 /// layout-independent and omits that clause.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProfileNameMismatch {
-    /// The profile name the operator selected.
-    requested: String,
-    /// The name derived from `policy_owner_key_id.service`, or `None` when the
-    /// field does not carry the expected prefix at all.
-    derived: Option<String>,
-    /// The `policy_owner_key_id.service` value as stored in the profile.
-    service: String,
+    /// Whether `policy_owner_key_id.service` carries
+    /// [`OWNER_KEY_SERVICE_PREFIX`], so that it names some other profile.
+    names_another_profile: bool,
 }
 
 impl ProfileNameMismatch {
-    /// The profile name the operator selected.
-    ///
-    /// Callers that build a structured refusal envelope report this as the
-    /// name the operation was asked for.
+    /// Whether the loaded file's owner-key coordinate carries
+    /// [`OWNER_KEY_SERVICE_PREFIX`] and so names another profile; `false`
+    /// when no profile name can be derived from it.
     #[must_use]
-    pub fn requested(&self) -> &str {
-        &self.requested
-    }
-
-    /// The profile name the loaded file's owner-key coordinate carries, or
-    /// `None` when the coordinate does not carry [`OWNER_KEY_SERVICE_PREFIX`]
-    /// and no name can be recovered from it.
-    #[must_use]
-    pub fn derived(&self) -> Option<&str> {
-        self.derived.as_deref()
-    }
-
-    /// The offending `policy_owner_key_id.service` value, verbatim.
-    ///
-    /// This is the field the operator edits to repair the profile, so it is
-    /// reported unmodified rather than summarised.
-    #[must_use]
-    pub fn service(&self) -> &str {
-        &self.service
+    pub fn names_another_profile(&self) -> bool {
+        self.names_another_profile
     }
 
     /// Renders the operator-facing refusal for a surface with the given state
     /// layout.
     ///
-    /// The text names both profiles, quotes the offending field, states what
-    /// the mismatch does to per-profile state under `layout`, and names the
-    /// two recovery paths.
+    /// The text names the offending field, states what the mismatch does to
+    /// per-profile state under `layout`, and names the two recovery paths.
     #[must_use]
     pub fn message(&self, layout: ProfileStateLayout) -> String {
-        let requested = &self.requested;
         format!(
-            "{self}; {}. {}",
-            layout.consequence_clause(requested),
-            self.recovery_clause()
-        )
-    }
-
-    /// The layout-independent recovery sentence, shared by every surface.
-    fn recovery_clause(&self) -> String {
-        let requested = &self.requested;
-        format!(
-            "A profile file renamed or copied from another profile must be \
-             re-created with `stellar-agent profile init --profile {requested}`, \
-             or its policy_owner_key_id.service corrected to \
-             '{OWNER_KEY_SERVICE_PREFIX}{requested}'"
+            "{self}; {}. A profile file renamed or copied from another profile must \
+             be re-created with `stellar-agent profile init --profile <name>`, or its \
+             policy_owner_key_id.service corrected to '{OWNER_KEY_SERVICE_PREFIX}<name>', \
+             where <name> is the selected profile name",
+            layout.consequence_clause()
         )
     }
 }
 
 impl std::fmt::Display for ProfileNameMismatch {
-    /// Renders the layout-independent half of the refusal: which profile was
-    /// selected, what its owner coordinate says, and which profile that names.
+    /// Renders the layout-independent half of the refusal: what the selected
+    /// profile's owner coordinate says about the profile it belongs to.
     ///
     /// The consequence clause is layout-dependent and therefore omitted here;
     /// use [`ProfileNameMismatch::message`] to render it.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let Self {
-            requested,
-            derived,
-            service,
-        } = self;
-        match derived {
-            Some(derived) => write!(
+        if self.names_another_profile {
+            f.write_str(
+                "the selected profile's policy_owner_key_id.service names a different \
+                 profile",
+            )
+        } else {
+            write!(
                 f,
-                "profile '{requested}' was selected, but its \
-                 policy_owner_key_id.service is '{service}', which names profile \
-                 '{derived}'"
-            ),
-            None => write!(
-                f,
-                "profile '{requested}' was selected, but its \
-                 policy_owner_key_id.service is '{service}', which does not carry \
-                 the '{OWNER_KEY_SERVICE_PREFIX}' prefix a profile name is derived \
-                 from"
-            ),
+                "the selected profile's policy_owner_key_id.service does not carry the \
+                 '{OWNER_KEY_SERVICE_PREFIX}' prefix a profile name is derived from"
+            )
         }
     }
 }
@@ -650,12 +611,11 @@ impl std::fmt::Display for ProfileNameMismatch {
 ///
 /// let refusal = profile_name_mismatch_refusal(&copied, "alice")
 ///     .expect("a profile naming 'default' must not serve as 'alice'");
-/// assert_eq!(refusal.requested(), "alice");
-/// assert_eq!(refusal.derived(), Some("default"));
+/// assert!(refusal.names_another_profile());
 /// assert!(
 ///     refusal
 ///         .message(ProfileStateLayout::DerivedThroughout)
-///         .contains("profile init --profile alice")
+///         .contains("profile init --profile <name>")
 /// );
 /// ```
 #[must_use]
@@ -668,9 +628,7 @@ pub fn profile_name_mismatch_refusal(
         return None;
     }
     Some(ProfileNameMismatch {
-        requested: requested_name.to_owned(),
-        derived: derived.map(ToOwned::to_owned),
-        service: profile.policy_owner_key_id.service.clone(),
+        names_another_profile: derived.is_some(),
     })
 }
 
@@ -1135,40 +1093,68 @@ mod tests {
     }
 
     #[test]
-    fn copied_profile_file_refuses_and_names_both_profiles() {
+    fn copied_profile_file_refuses_and_names_the_field() {
         // The realistic path: `default.toml` copied to `alice.toml` without
         // re-deriving its keyring coordinates.
         let profile = named_profile("default");
         let refusal = profile_name_mismatch_refusal(&profile, "alice")
             .expect("a profile naming 'default' must not serve as 'alice'");
 
-        assert_eq!(refusal.requested(), "alice");
-        assert_eq!(refusal.derived(), Some("default"));
-        assert_eq!(refusal.service(), "stellar-agent-owner-default");
+        assert!(refusal.names_another_profile());
 
         for message in [
             refusal.message(ProfileStateLayout::DerivedThroughout),
             refusal.message(ProfileStateLayout::PolicyDerivedStateRequested),
         ] {
             assert!(
-                message.contains("'alice'") && message.contains("'default'"),
-                "refusal must name both profiles: {message}"
+                message.contains("policy_owner_key_id.service names a different profile"),
+                "refusal must name the offending field: {message}"
             );
             assert!(
-                message.contains("stellar-agent-owner-default"),
-                "refusal must quote the offending policy_owner_key_id.service: {message}"
-            );
-            assert!(
-                message.contains("profile init --profile alice"),
+                message.contains("profile init --profile <name>"),
                 "refusal must name the recovery command: {message}"
             );
             assert!(
                 message.contains(
-                    "policy_owner_key_id.service corrected to \
-                                  'stellar-agent-owner-alice'"
+                    "policy_owner_key_id.service corrected to 'stellar-agent-owner-<name>'"
                 ),
                 "refusal must name the field-edit recovery path: {message}"
             );
+            for value in ["'alice'", "'default'", "stellar-agent-owner-default"] {
+                assert!(
+                    !message.contains(value),
+                    "refusal must not repeat a name or the stored service: {message}"
+                );
+            }
+        }
+    }
+
+    /// A seed pasted into the owner-key coordinate or typed as the profile
+    /// name never reaches the refusal, its `Debug`, or either layout's text.
+    #[test]
+    fn a_mismatch_never_repeats_the_service_or_the_name() {
+        use stellar_agent_test_support::rejected_value::{assert_no_marker_in_text, seed_marker};
+        let seed = seed_marker();
+        let mut profile = named_profile("alice");
+        let named_by_seed = format!("{OWNER_KEY_SERVICE_PREFIX}{seed}");
+        let named_alice = format!("{OWNER_KEY_SERVICE_PREFIX}alice");
+        for (service, requested) in [
+            (named_by_seed.as_str(), "alice"),
+            (seed.as_str(), "alice"),
+            (seed.as_str(), seed.as_str()),
+            (named_alice.as_str(), seed.as_str()),
+        ] {
+            profile.policy_owner_key_id =
+                crate::profile::schema::KeyringEntryRef::new(service, "default");
+            let refusal = profile_name_mismatch_refusal(&profile, requested)
+                .expect("the coordinate names another profile or none");
+            assert_no_marker_in_text(&format!("{refusal} {refusal:?}"), &seed);
+            for layout in [
+                ProfileStateLayout::DerivedThroughout,
+                ProfileStateLayout::PolicyDerivedStateRequested,
+            ] {
+                assert_no_marker_in_text(&refusal.message(layout), &seed);
+            }
         }
     }
 
@@ -1176,16 +1162,16 @@ mod tests {
     fn each_layout_states_its_own_state_placement() {
         // The two surfaces do not key their per-profile state the same way, so
         // one message cannot be truthful for both. The MCP reads and writes all
-        // of it under the derived name; the CLI keys the approval store, audit
-        // log, and window state on the REQUESTED name while the signed policy
-        // and owner key follow the derived one.
+        // of it under the derived name; the CLI keys the approval store and
+        // window state on the SELECTED name while the signed policy and owner
+        // key follow the derived one.
         let profile = named_profile("default");
         let refusal =
             profile_name_mismatch_refusal(&profile, "alice").expect("mismatch must be reported");
 
         let derived_throughout = refusal.message(ProfileStateLayout::DerivedThroughout);
         assert!(
-            derived_throughout.contains("read and written under the derived name"),
+            derived_throughout.contains("read and written under the name that field derives"),
             "the derived-throughout layout must say all state moves: {derived_throughout}"
         );
         assert!(
@@ -1195,11 +1181,11 @@ mod tests {
 
         let split = refusal.message(ProfileStateLayout::PolicyDerivedStateRequested);
         assert!(
-            split.contains("stay keyed on 'alice'"),
-            "the split layout must name the state that follows the requested name: {split}"
+            split.contains("stay keyed on the selected name"),
+            "the split layout must name the state that follows the selected name: {split}"
         );
         assert!(
-            !split.contains("read and written under the derived name"),
+            !split.contains("read and written under the name that field derives"),
             "the split layout must not repeat the derived-throughout claim: {split}"
         );
     }
@@ -1216,7 +1202,7 @@ mod tests {
         assert!(
             refusal
                 .message(ProfileStateLayout::PolicyDerivedStateRequested)
-                .contains("'alice'")
+                .contains("policy_owner_key_id.service names a different profile")
         );
     }
 
@@ -1234,7 +1220,7 @@ mod tests {
 
         let refusal = profile_name_mismatch_refusal(&profile, "alice")
             .expect("a service field without the owner-key prefix must refuse");
-        assert_eq!(refusal.derived(), None);
+        assert!(!refusal.names_another_profile());
 
         let message = refusal.message(ProfileStateLayout::DerivedThroughout);
         assert!(
@@ -1242,8 +1228,8 @@ mod tests {
             "refusal must explain the absent prefix: {message}"
         );
         assert!(
-            !message.contains("names profile"),
-            "no profile name can be derived, so none may be reported: {message}"
+            !message.contains("names a different profile"),
+            "no profile name can be derived, so none may be claimed: {message}"
         );
     }
 
@@ -1278,7 +1264,7 @@ mod tests {
         let refusal =
             profile_name_mismatch_refusal(&profile, "alice").expect("mismatch must be reported");
         let display = refusal.to_string();
-        assert!(display.contains("which names profile 'default'"));
+        assert!(display.contains("policy_owner_key_id.service names a different profile"));
         assert!(!display.contains("policy-window state"));
     }
 

@@ -182,6 +182,14 @@ struct PresenceData {
     request_id: String,
 }
 
+/// The refusal of `stellar-agent approve` without a nonce.
+fn missing_id_refusal() -> WalletError {
+    WalletError::Validation(ValidationError::ConfigInvalid {
+        component: "approve",
+        reason: "--id <NONCE> is required for `stellar-agent approve`".to_owned(),
+    })
+}
+
 /// Runs `stellar-agent approve --id <nonce> --profile <name>`.
 ///
 /// Returns `0` on approval and attestation, `1` on any error or denial.
@@ -199,10 +207,7 @@ pub async fn run(args: RunArgs) -> i32 {
     let nonce = match &args.id {
         Some(n) if !n.is_empty() => n.clone(),
         _ => {
-            let err = WalletError::Validation(ValidationError::ProfileNotFound {
-                name: "--id <NONCE> is required for `stellar-agent approve`".to_owned(),
-            });
-            render::render_json(&Envelope::<()>::err(&err));
+            render::render_json(&Envelope::<()>::err(&missing_id_refusal()));
             return 1;
         }
     };
@@ -218,8 +223,8 @@ pub async fn run(args: RunArgs) -> i32 {
     let profile = match load_profile_reconciled(&resolved_profile) {
         Ok(p) => p,
         Err(e) => {
-            tracing::debug!(profile = %profile_name, error = %e, "profile access refused");
-            render::render_json(&profile_access_envelope(&e, &profile_name));
+            tracing::debug!(error = %e, "profile access refused");
+            render::render_json(&profile_access_envelope(&e));
             return 1;
         }
     };
@@ -3187,5 +3192,35 @@ mod tests {
     #[test]
     fn edited_mpp_recipient_renders_inconsistent() {
         assert_edited_mpp_inconsistent(false);
+    }
+
+    #[test]
+    fn a_missing_nonce_is_refused_as_a_config_error() {
+        let err = missing_id_refusal();
+        assert_eq!(err.code(), "validation.config_invalid");
+        assert!(
+            err.to_string()
+                .contains("--id <NONCE> is required for `stellar-agent approve`"),
+            "{err}"
+        );
+    }
+
+    /// The refusal event for an absent profile names the failure class and
+    /// never the requested profile name.
+    #[test]
+    #[serial]
+    fn absent_profile_refusal_log_omits_the_requested_name() {
+        use crate::common::refusal_log_fixture::{
+            ABSENT_PROFILE_MARKER, assert_refusal_omits_requested_profile,
+            capture_absent_profile_refusal,
+        };
+        let (code, logs) = capture_absent_profile_refusal(|_| {
+            run(RunArgs {
+                id: Some("approval-nonce".to_owned()),
+                profile: Some(ABSENT_PROFILE_MARKER.to_owned()),
+                yes: false,
+            })
+        });
+        assert_refusal_omits_requested_profile(code, &logs, "profile access refused");
     }
 }

@@ -19,7 +19,8 @@
 //!
 //! The command signs only a body the V1 loader accepts. Before canonicalising,
 //! it refuses a key outside the policy schema
-//! (`sign_policy.canonicalization_failed`, naming the key and its location).
+//! (`sign_policy.canonicalization_failed`, naming the key's location and the
+//! accepted keys).
 //! It reads the installation's policy pin, without creating any state file,
 //! and assigns a version 2 body the next sequence. Before signing, it runs the
 //! loader's body checks for the engine's profile name and refuses a body the
@@ -208,8 +209,8 @@ where
     let profile = match reconcile_loaded_profile(load_profile(&profile_name), &resolved) {
         Ok(p) => p,
         Err(e) => {
-            tracing::debug!(profile = %profile_name, error = %e, "profile access refused");
-            render::render_json(&profile_access_envelope(&e, &profile_name));
+            tracing::debug!(error = %e, "profile access refused");
+            render::render_json(&profile_access_envelope(&e));
             return 1;
         }
     };
@@ -277,7 +278,7 @@ where
         Err(e) => {
             render::render_json(&Envelope::<()>::err_raw(
                 "sign_policy.policy_file_unreadable",
-                format!("could not read policy file {}: {e}", policy_path.display()),
+                format!("could not read the policy file --file names: {e}"),
             ));
             return 1;
         }
@@ -508,11 +509,9 @@ fn prepare_policy(
             ),
         )
     };
-    let mut body = raw.parse::<toml_edit::DocumentMut>().map_err(|e| {
-        not_canonical(PolicyError::PolicyFileParseFailed {
-            detail: e.to_string(),
-        })
-    })?;
+    let mut body = raw
+        .parse::<toml_edit::DocumentMut>()
+        .map_err(|e| not_canonical(PolicyError::toml_syntax(raw, &e)))?;
 
     // The loader refuses a key outside the schema before it verifies the
     // signature, so a file signed with one is never accepted.
@@ -625,12 +624,11 @@ fn prepare_policy(
 /// The profile reaching this point has already been reconciled against the
 /// requested name, so the derived name equals the name the operator selected.
 fn engine_profile_name(profile: &Profile) -> Result<String, String> {
-    let service = &profile.policy_owner_key_id.service;
     derive_profile_name_from_owner_key(profile)
         .map(ToOwned::to_owned)
         .ok_or_else(|| {
             format!(
-                "the profile's owner-key service '{service}' does not start with the expected \
+                "the profile's policy_owner_key_id.service does not start with the expected \
                  prefix '{OWNER_KEY_SERVICE_PREFIX}'; the profile was not constructed with the \
                  standard owner coordinate"
             )
@@ -737,12 +735,18 @@ enum OwnerSignError {
 impl From<OwnerSeedError> for OwnerSignError {
     fn from(error: OwnerSeedError) -> Self {
         match error {
-            OwnerSeedError::NotSet { var } => {
-                Self::Env(format!("environment variable '{var}' not set"))
-            }
-            OwnerSeedError::Invalid { var } => Self::Env(format!(
-                "environment variable '{var}' contains an invalid S-strkey"
-            )),
+            // The flag value names no set variable, so the text names the
+            // flags.
+            OwnerSeedError::NotSet => Self::Env(
+                "--secret-env or --previous-owner-secret-env names an environment variable \
+                 that is not set"
+                    .to_owned(),
+            ),
+            OwnerSeedError::Invalid => Self::Env(
+                "--secret-env or --previous-owner-secret-env names an environment variable \
+                 that does not hold a valid S-strkey"
+                    .to_owned(),
+            ),
             OwnerSeedError::Unlock(message) => Self::Unlock(message),
         }
     }
@@ -806,9 +810,7 @@ async fn sign_policy_with_owner_seeds(
                     .await?;
                     let mut doc = raw.parse::<toml_edit::DocumentMut>().map_err(|e| {
                         OwnerSignError::Policy(
-                            stellar_agent_core::policy::PolicyError::PolicyFileParseFailed {
-                                detail: e.to_string(),
-                            },
+                            stellar_agent_core::policy::PolicyError::toml_syntax(&raw, &e),
                         )
                     })?;
                     doc["owner_rotation"] = toml_edit::Item::Table(table);
@@ -857,9 +859,12 @@ fn render_with_signature(
     owner_id: &str,
     sig_hex: &str,
 ) -> Result<(String, bool, Option<String>), String> {
-    let mut doc = raw
-        .parse::<toml_edit::DocumentMut>()
-        .map_err(|e| format!("policy file is not valid TOML ({e})"))?;
+    let mut doc = raw.parse::<toml_edit::DocumentMut>().map_err(|e| {
+        format!(
+            "policy file is {}",
+            stellar_agent_core::policy::toml_syntax_detail(raw, &e)
+        )
+    })?;
 
     let previous_owner_id = doc
         .get("signature")
@@ -1022,6 +1027,82 @@ mod tests {
             !err.contains("no owner key is enrolled"),
             "an environmental failure must not be misreported as not-enrolled, got: {err}"
         );
+    }
+
+    /// An unset seed variable, a seed variable without a valid S-strkey, an
+    /// unreadable `--file` path and an owner-key service without the owner
+    /// prefix refuse by the flag or the field, and no refusal repeats the
+    /// refused value.
+    #[tokio::test]
+    #[serial]
+    async fn sign_policy_marker_is_not_echoed() {
+        use stellar_agent_test_support::rejected_value::{
+            CREDENTIAL_MARKER, assert_no_marker_in_text,
+        };
+
+        keyring_mock::install().expect("mock store");
+        let (_s_strkey, pk, _owner_g) = seed_material([0x12u8; 32]);
+        enroll_owner_pubkey(PROFILE_NAME, &pk);
+        let dir = TempDir::new().unwrap();
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(dir.path());
+        let path = dir.path().join("policy.toml");
+        std::fs::write(&path, policy_body(PROFILE_NAME)).unwrap();
+        let unset_var = format!("{CREDENTIAL_MARKER}_{}", std::process::id());
+        let invalid_var = format!("{CREDENTIAL_MARKER}_INVALID_{}", std::process::id());
+        let _invalid = EnvGuard::set(invalid_var.clone(), CREDENTIAL_MARKER);
+        let missing = dir.path().join(format!("{CREDENTIAL_MARKER}.toml"));
+        let cases = [
+            (
+                args(&path, &unset_var),
+                "sign_policy.invalid_owner_seed",
+                "--secret-env or --previous-owner-secret-env names an environment variable \
+                 that is not set",
+            ),
+            (
+                args(&path, &invalid_var),
+                "sign_policy.invalid_owner_seed",
+                "--secret-env or --previous-owner-secret-env names an environment variable \
+                 that does not hold a valid S-strkey",
+            ),
+            (
+                args(&missing, &unset_var),
+                "sign_policy.policy_file_unreadable",
+                "",
+            ),
+        ];
+        for (arguments, code, message) in cases {
+            crate::common::render::take_rendered_for_test();
+            let profile = profile_for(PROFILE_NAME);
+            let status =
+                run_with_dependencies(&arguments, move |_n| Ok(profile.clone()), || Ok(())).await;
+            assert_eq!(status, 1, "{code}");
+            let rendered = crate::common::render::take_rendered_for_test();
+            assert_eq!(rendered.len(), 1, "{rendered:?}");
+            assert_eq!(rendered[0]["error"]["code"], code, "{rendered:?}");
+            let text = rendered[0]["error"]["message"].as_str().unwrap();
+            if message.is_empty() {
+                assert!(
+                    text.starts_with("could not read the policy file --file names: "),
+                    "{text}"
+                );
+            } else {
+                assert_eq!(text, message);
+            }
+            assert_no_marker_in_text(&rendered[0].to_string(), CREDENTIAL_MARKER);
+        }
+
+        let mut profile = profile_for(PROFILE_NAME);
+        profile.policy_owner_key_id = KeyringEntryRef::new(CREDENTIAL_MARKER, "default");
+        let message = engine_profile_name(&profile).unwrap_err();
+        assert_eq!(
+            message,
+            format!(
+                "the profile's policy_owner_key_id.service does not start with the expected \
+                 prefix '{OWNER_KEY_SERVICE_PREFIX}'; the profile was not constructed with the \
+                 standard owner coordinate"
+            )
+        );
+        assert_no_marker_in_text(&message, CREDENTIAL_MARKER);
     }
 
     /// The acceptance law: real sign-policy → the REAL v1 loader accepts the
@@ -1291,9 +1372,9 @@ mod tests {
     }
 
     /// A key outside the policy schema is refused before signing with the
-    /// canonicalisation code, naming the key and its location, and the file is
-    /// left byte-identical. The canonical form drops an unknown rule key, so
-    /// this check is what refuses it.
+    /// canonicalisation code, naming the key's location and the accepted keys,
+    /// and the file is left byte-identical. The canonical form drops an unknown
+    /// rule key, so this check is what refuses it.
     #[tokio::test]
     #[serial]
     async fn unknown_policy_key_is_refused_and_the_file_is_unchanged() {
@@ -1312,12 +1393,13 @@ mod tests {
             envelope["error"]["message"],
             format!(
                 "policy file {} holds a key outside the V1 policy schema (policy file parse \
-                 failed: rule[0]: unknown key `decision_override`; a rule accepts match, \
-                 criteria, decision, reason, ttl_secs, allow_opaque_signing); correct the key, \
-                 then sign again. No file was written.",
+                 failed: rule[0]: unknown key; a rule accepts match, criteria, decision, \
+                 reason, ttl_secs, allow_opaque_signing); correct the key, then sign again. No \
+                 file was written.",
                 path.display()
             ),
-            "the refusal must name the file, the key, and its location"
+            "the refusal must name the file, the key's location and the accepted keys, never \
+             the key"
         );
         assert_eq!(after, body, "a refused file must be left byte-identical");
     }
@@ -1342,7 +1424,7 @@ mod tests {
             ),
             (
                 other_scope.as_str(),
-                "policy scope does not match profile `sign-policy-test`",
+                "policy scope does not match the selected profile",
             ),
         ] {
             canonical_bytes(body).expect("the body must canonicalise");
@@ -1452,6 +1534,39 @@ mod tests {
     }
 
     // ── render_with_signature (the replaced / previous_owner_id reporting) ─────
+
+    /// A policy body whose malformed line holds a credential is refused by the
+    /// position of the failure, before signing and after it; the line is not
+    /// repeated.
+    #[test]
+    fn a_malformed_policy_line_is_reported_by_position_only() {
+        use stellar_agent_test_support::rejected_value::{
+            CREDENTIAL_MARKER, assert_no_marker_in_text,
+        };
+        let body = format!(
+            "version = 2\nscope = \"profile:operator\"\nsecret = {CREDENTIAL_MARKER} here\n"
+        );
+        let directory = TempDir::new().unwrap();
+        let window = directory.path().join("state.window");
+        let policy = directory.path().join("policy.toml");
+        let profile = profile_for("operator");
+        let (code, message) = prepare_policy(&body, &profile, "operator", &policy, &window)
+            .err()
+            .unwrap();
+        assert_eq!(code, "sign_policy.canonicalization_failed");
+        assert!(
+            message.contains("(policy file parse failed: not valid TOML: line 3, column "),
+            "{message}"
+        );
+        assert_no_marker_in_text(&message, CREDENTIAL_MARKER);
+
+        let refusal = render_with_signature(&body, "GNEW", "aa").unwrap_err();
+        assert!(
+            refusal.starts_with("policy file is not valid TOML: line 3, column "),
+            "{refusal}"
+        );
+        assert_no_marker_in_text(&refusal, CREDENTIAL_MARKER);
+    }
 
     /// An unsigned body reports `replaced = false` and no previous owner, and
     /// the emitted TOML carries the new `[signature]` table.
@@ -2117,5 +2232,24 @@ mod tests {
             },
         )
         .await;
+    }
+
+    /// The refusal event for an absent profile names the failure class and
+    /// never the requested profile name.
+    #[test]
+    #[serial]
+    fn absent_profile_refusal_log_omits_the_requested_name() {
+        use crate::common::refusal_log_fixture::{
+            ABSENT_PROFILE_MARKER, assert_refusal_omits_requested_profile,
+            capture_absent_profile_refusal,
+        };
+        let args = SignPolicyArgs {
+            profile: Some(ABSENT_PROFILE_MARKER.to_owned()),
+            secret_env: unique_var("ABSENT"),
+            previous_owner_secret_env: None,
+            file: None,
+        };
+        let (code, logs) = capture_absent_profile_refusal(|_| run(&args));
+        assert_refusal_omits_requested_profile(code, &logs, "profile access refused");
     }
 }

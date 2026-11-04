@@ -707,10 +707,7 @@ pub(crate) fn x402_canonical_asset(
 ) -> Result<stellar_agent_core::asset_id::CanonicalAsset, rmcp::model::CallToolResult> {
     stellar_agent_core::asset_id::CanonicalAsset::contract(&requirements.asset).map_err(|_| {
         x402_error_to_tool_result(&stellar_agent_x402::X402Error::InvalidAssetAddress {
-            detail: format!(
-                "expected a canonical C-strkey (contract), got {}",
-                stellar_agent_network::quote_server_text(&requirements.asset)
-            ),
+            detail: "the asset must be a canonical C-strkey (contract)".to_owned(),
         })
     })
 }
@@ -2276,15 +2273,12 @@ pub(crate) async fn verify_attestation_subject_gate(
             approval_required_indistinguishable(&profile_name)
         })?;
 
-    // 4. Entry must exist.
+    // 4. Entry must exist. A nonce that names no entry is refused input, so
+    // the event carries the tool only.
     let entry = match store.get(approval_nonce_str) {
         Some(e) => e.clone(),
         None => {
-            tracing::debug!(
-                nonce = %approval_nonce_str,
-                tool = tool_name,
-                "approval entry not found"
-            );
+            tracing::debug!(tool = tool_name, "approval entry not found");
             return Err(approval_required_indistinguishable(&profile_name));
         }
     };
@@ -3753,6 +3747,65 @@ pub(crate) mod tests {
                 "the {label} refusal must expose no data field; got: {v}"
             );
         }
+    }
+
+    /// An approval nonce that names no stored entry is refused with the
+    /// indistinguishable approval-required result, and the debug event of the
+    /// refusal does not carry the nonce.
+    #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial(keyring)]
+    async fn approval_nonce_marker_is_not_logged() {
+        use base64::Engine as _;
+        use stellar_agent_test_support::CaptureWriter;
+        use stellar_agent_test_support::rejected_value::{
+            CREDENTIAL_MARKER, assert_no_marker_in_text,
+        };
+
+        stellar_agent_test_support::keyring_mock::install().ok();
+        let dir = tempfile::tempdir().unwrap();
+        let profile = Profile::builder_testnet("svc", "acct", "n-svc", "n-acct")
+            .with_profile_name(
+                stellar_agent_test_support::profile_fixtures::unique_profile_name("nonce-marker"),
+            )
+            .with_noop_engine()
+            .build();
+        let mut server =
+            crate::server::WalletServer::new(profile).expect("WalletServer::new must not fail");
+        server.set_approval_dir_for_test(dir.path().to_path_buf());
+        let dispatch_outcome = DispatchOutcome::RequireApproval(
+            ApprovalRequest::new("approval-nonce".into(), 120).into(),
+        );
+        let attestation_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0_u8; 32]);
+        let capture = CaptureWriter::new();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_ansi(false)
+            .with_writer(capture.clone())
+            .finish();
+        let inert = stellar_agent_test_support::log_capture::inert_dispatcher();
+        let guard = tracing::subscriber::set_default(subscriber);
+        tracing::callsite::rebuild_interest_cache();
+        let result = verify_attestation_gate(
+            &server,
+            &dispatch_outcome,
+            GatedApprovalKind::Payment,
+            "AAAA",
+            Some(CREDENTIAL_MARKER),
+            Some(&attestation_b64),
+            "stellar_pay_commit",
+        )
+        .await;
+        drop(guard);
+        drop(inert);
+
+        let refusal = result.expect_err("an unknown nonce is refused");
+        let captured = capture.captured_str();
+        assert!(
+            captured.contains("approval entry not found"),
+            "the test must reach the missing-entry arm; got: {captured}"
+        );
+        assert_no_marker_in_text(&captured, CREDENTIAL_MARKER);
+        assert_no_marker_in_text(&format!("{refusal:?}"), CREDENTIAL_MARKER);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -7465,7 +7518,7 @@ pub(crate) mod tests {
             assert_eq!(error.data.unwrap()["code"], "validation.amount_malformed");
             assert_eq!(
                 error.message,
-                "validation.amount_malformed: amount '1 USD' has unit 'USD'; expected unit 'XLM'"
+                "validation.amount_malformed: the amount has the wrong unit; expected unit 'XLM'"
             );
             assert_eq!(run.seed_reads(), 0);
             assert!(run.control.methods().is_empty());
