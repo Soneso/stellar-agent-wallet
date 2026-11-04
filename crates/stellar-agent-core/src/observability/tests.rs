@@ -768,7 +768,7 @@ fn resolve_env_filter_from_invalid_stellar_agent_log_and_rust_log_errors() {
     // Both invalid: surface the primary error.
     let err = resolve_env_filter_from(Some(INVALID_FILTER), Some(INVALID_FILTER));
     assert!(
-        matches!(err, Err(InitError::Filter(_))),
+        matches!(err, Err(InitError::Filter)),
         "expected InitError::Filter, got {err:?}"
     );
 }
@@ -2146,7 +2146,7 @@ fn subscriber_config_with_filter_override_none_clears_it() {
 fn resolve_env_filter_from_invalid_stellar_agent_log_no_rust_log_errors() {
     let err = resolve_env_filter_from(Some("=INFO"), None);
     assert!(
-        matches!(err, Err(InitError::Filter(_))),
+        matches!(err, Err(InitError::Filter)),
         "must return InitError::Filter when primary is invalid and rust_log is None: {err:?}"
     );
 }
@@ -2326,4 +2326,16 @@ fn resolved_filter_keeps_raw_transport_logging_off() {
             );
         }
     }
+}
+
+#[test]
+fn rejected_input_filter_helper_has_fixed_diagnostics() {
+    let error = resolve_env_filter_from(Some("=CREDMARKER7"), None).unwrap_err();
+    assert!(matches!(error, InitError::Filter));
+    assert_eq!(
+        error.to_string(),
+        "STELLAR_AGENT_LOG must be a valid log-filter expression"
+    );
+    assert_eq!(format!("{error:?}"), "Filter");
+    assert!(std::error::Error::source(&error).is_none());
 }

@@ -1,6 +1,6 @@
 # Security internals
 
-Errors, guidance, logs, MCP stderr and CLI output never repeat a rejected value. Diagnostics name the argument, field, position or check and the accepted form. The rule covers policy semantics, policy keys outside the schema, credential registries and names, URLs, configuration values, profile names that resolve to no profile and CLI usage errors. File syntax errors report line and column.
+Errors, guidance, logs, MCP stderr and CLI output never repeat a rejected value. Diagnostics name the argument, field, position or check and the accepted form. The rule covers policy semantics, policy keys outside the schema, credential registries and names, URLs, configuration values, profile names that resolve to no profile and CLI usage errors. File syntax errors report line and column. Foreign errors that can carry rejected input are reduced to a fixed error class at the wallet boundary, including their Debug forms and source chains.
 
 
 See [Mainnet configurations and scope](../getting-started.md#mainnet-configurations-and-scope)

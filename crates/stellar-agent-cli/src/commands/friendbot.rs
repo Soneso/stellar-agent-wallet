@@ -78,9 +78,7 @@ impl FromStr for FriendbotNetwork {
             "testnet" => Ok(Self::Testnet),
             "futurenet" => Ok(Self::Futurenet),
             "mainnet" => Ok(Self::Mainnet),
-            other => Err(format!(
-                "unknown network '{other}'; expected one of: testnet, futurenet, mainnet"
-            )),
+            _ => Err("unknown network; expected one of: testnet, futurenet, mainnet".to_owned()),
         }
     }
 }
@@ -385,6 +383,7 @@ mod tests {
     )]
 
     use super::*;
+    use stellar_agent_test_support::rejected_value::{assert_refusal_text, capture_refusal};
 
     /// Mainnet structural rejection fires at the `run` boundary.
     ///
@@ -500,5 +499,19 @@ mod tests {
         let hash = "abcd1234";
         let redacted = redact_tx_hash(hash);
         assert_eq!(redacted, "abcd1234");
+    }
+
+    #[test]
+    fn rejected_input_friendbot_network() {
+        capture_refusal(|| {
+            let error: Box<dyn std::error::Error> = FriendbotNetwork::from_str("CREDMARKER7")
+                .expect_err("unknown network")
+                .into();
+            assert_refusal_text(
+                error.as_ref(),
+                "unknown network; expected one of: testnet, futurenet, mainnet",
+            );
+            assert!(FriendbotNetwork::from_str("testnet").is_ok());
+        });
     }
 }

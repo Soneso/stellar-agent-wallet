@@ -75,7 +75,8 @@ fn serialize_bytes32<S: Serializer>(bytes: &[u8; 32], s: S) -> Result<S::Ok, S::
 /// Deserialises a lowercase hex string into a 32-byte array.
 fn deserialize_bytes32<'de, D: Deserializer<'de>>(d: D) -> Result<[u8; 32], D::Error> {
     let hex_str = String::deserialize(d)?;
-    let bytes = hex::decode(&hex_str).map_err(|e| D::Error::custom(format!("invalid hex: {e}")))?;
+    let bytes = hex::decode(&hex_str)
+        .map_err(|_| D::Error::custom("auditor_pubkey must be a 32-byte hex string"))?;
     bytes
         .try_into()
         .map_err(|_| D::Error::custom("expected 32-byte hex string for auditor_pubkey"))
@@ -89,7 +90,8 @@ fn serialize_bytes64<S: Serializer>(bytes: &[u8; 64], s: S) -> Result<S::Ok, S::
 /// Deserialises a lowercase hex string into a 64-byte array.
 fn deserialize_bytes64<'de, D: Deserializer<'de>>(d: D) -> Result<[u8; 64], D::Error> {
     let hex_str = String::deserialize(d)?;
-    let bytes = hex::decode(&hex_str).map_err(|e| D::Error::custom(format!("invalid hex: {e}")))?;
+    let bytes = hex::decode(&hex_str)
+        .map_err(|_| D::Error::custom("signature must be a 64-byte hex string"))?;
     bytes
         .try_into()
         .map_err(|_| D::Error::custom("expected 64-byte hex string for signature"))

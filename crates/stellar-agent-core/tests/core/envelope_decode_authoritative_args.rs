@@ -367,7 +367,7 @@ fn it_returns_unsupported_tool_for_unknown_tool() {
     let err = decode_authoritative_args("AAAAAAAAAA==", "stellar_balances")
         .expect_err("must return UnsupportedTool");
     assert!(
-        matches!(err, EnvelopeDecodeError::UnsupportedTool { .. }),
+        matches!(err, EnvelopeDecodeError::UnsupportedTool),
         "expected UnsupportedTool, got: {err}"
     );
 }

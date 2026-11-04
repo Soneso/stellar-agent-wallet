@@ -125,7 +125,7 @@ fn classify_result(
 ) -> &'static str {
     match result {
         Ok(()) => "ok",
-        Err(stellar_agent_core::observability::InitError::Filter(_)) => "filter",
+        Err(stellar_agent_core::observability::InitError::Filter) => "filter",
         Err(stellar_agent_core::observability::InitError::LogBridge(_)) => "log_bridge",
         Err(stellar_agent_core::observability::InitError::Init(_)) => "init",
         Err(_) => "other",

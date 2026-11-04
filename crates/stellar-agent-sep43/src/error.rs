@@ -12,6 +12,10 @@
 
 use serde_json::json;
 
+/// The fixed text of a passphrase refusal.
+const NETWORK_PASSPHRASE_MISMATCH: &str =
+    "network_passphrase must match the configured profile network";
+
 /// Errors produced by SEP-43 v1.2.1 `ModuleInterface` method dispatch.
 ///
 /// The enum is `#[non_exhaustive]`; downstream crates must match with a
@@ -301,6 +305,14 @@ pub enum Sep43Error {
 }
 
 impl Sep43Error {
+    /// A passphrase refusal that names the accepted `expected` passphrase and
+    /// never the rejected one.
+    pub(crate) fn network_passphrase_mismatch(expected: &str) -> Self {
+        Self::InvalidNetworkPassphrase {
+            detail: format!("{NETWORK_PASSPHRASE_MISMATCH}; expected {expected:?}"),
+        }
+    }
+
     /// Returns the canonical wire error code string for this variant.
     ///
     /// The returned `&'static str` is the typed code emitted in audit-log

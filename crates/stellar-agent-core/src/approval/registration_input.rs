@@ -297,11 +297,10 @@ pub(crate) fn validate_registration_input_invariants(
 
     // First byte must be 0x04 (uncompressed SEC1 marker).
     if public_key_uncompressed_sec1[0] != 0x04 {
-        return Err(format!(
-            "public_key_uncompressed_sec1[0] must be 0x04 (uncompressed SEC1 P-256 marker), \
-             got 0x{:02x}",
-            public_key_uncompressed_sec1[0]
-        ));
+        return Err(
+            "public_key_uncompressed_sec1[0] must be 0x04 (uncompressed SEC1 P-256 marker)"
+                .to_owned(),
+        );
     }
 
     // transports: at most TRANSPORTS_MAX_COUNT entries, each a known string.
@@ -312,10 +311,10 @@ pub(crate) fn validate_registration_input_invariants(
             transports.len()
         ));
     }
-    for t in transports {
+    for (position, t) in transports.iter().enumerate() {
         if !VALID_TRANSPORTS.contains(&t.as_str()) {
             return Err(format!(
-                "transport {t:?} is not a valid CTAP2 transport \
+                "transports[{position}] is not a valid CTAP2 transport \
                  (must be one of {VALID_TRANSPORTS:?})"
             ));
         }

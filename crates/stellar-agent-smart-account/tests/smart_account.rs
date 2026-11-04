@@ -39,6 +39,8 @@ mod multicall_auth_rule_count_mock;
 mod oz_caps_parity_test;
 #[path = "smart_account/oz_panic_discriminant_mapping_mock.rs"]
 mod oz_panic_discriminant_mapping_mock;
+#[path = "smart_account/rejected_input.rs"]
+mod rejected_input;
 #[path = "smart_account/simulate_install_rule_mock.rs"]
 mod simulate_install_rule_mock;
 #[path = "smart_account/submission_records_mock.rs"]

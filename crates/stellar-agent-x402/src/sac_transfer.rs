@@ -19,9 +19,11 @@ use stellar_strkey::Strkey;
 use stellar_xdr::ScVal;
 use stellar_xdr::{ContractId, InvokeContractArgs, ScAddress};
 
-use stellar_agent_network::quote_server_text;
-
 use crate::X402Error;
+
+const ASSET_ADDRESS_FORM: &str = "sac_contract must be a C-strkey";
+const RECIPIENT_ADDRESS_FORM: &str = "pay_to must be a G-, C-, or M-strkey";
+const PAYER_ADDRESS_FORM: &str = "payer must be a G-strkey";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // ScVal helpers
@@ -41,8 +43,8 @@ use crate::X402Error;
 fn strkey_to_sc_address(strkey: &str) -> Result<ScAddress, X402Error> {
     use stellar_xdr::{AccountId, Hash, PublicKey, Uint256};
 
-    let parsed = Strkey::from_string(strkey).map_err(|e| X402Error::InvalidAssetAddress {
-        detail: format!("strkey parse failed for {}: {e}", quote_server_text(strkey)),
+    let parsed = Strkey::from_string(strkey).map_err(|_| X402Error::InvalidAssetAddress {
+        detail: ASSET_ADDRESS_FORM.to_owned(),
     })?;
     match parsed {
         Strkey::PublicKeyEd25519(pk) => {
@@ -55,10 +57,7 @@ fn strkey_to_sc_address(strkey: &str) -> Result<ScAddress, X402Error> {
             Ok(ScAddress::Contract(ContractId(Hash(c.0))))
         }
         _ => Err(X402Error::InvalidAssetAddress {
-            detail: format!(
-                "strkey {} is not a G- or C-strkey",
-                quote_server_text(strkey)
-            ),
+            detail: ASSET_ADDRESS_FORM.to_owned(),
         }),
     }
 }
@@ -76,11 +75,8 @@ fn strkey_to_sc_address(strkey: &str) -> Result<ScAddress, X402Error> {
 pub(crate) fn strkey_to_recipient_sc_address(strkey: &str) -> Result<ScAddress, X402Error> {
     use stellar_xdr::{AccountId, ContractId, Hash, MuxedEd25519Account, PublicKey, Uint256};
 
-    let parsed = Strkey::from_string(strkey).map_err(|e| X402Error::InvalidRecipientAddress {
-        detail: format!(
-            "recipient strkey parse failed for {}: {e}",
-            quote_server_text(strkey)
-        ),
+    let parsed = Strkey::from_string(strkey).map_err(|_| X402Error::InvalidRecipientAddress {
+        detail: RECIPIENT_ADDRESS_FORM.to_owned(),
     })?;
     match parsed {
         Strkey::PublicKeyEd25519(pk) => Ok(ScAddress::Account(AccountId(
@@ -92,10 +88,7 @@ pub(crate) fn strkey_to_recipient_sc_address(strkey: &str) -> Result<ScAddress, 
             ed25519: Uint256(m.ed25519),
         })),
         _ => Err(X402Error::InvalidRecipientAddress {
-            detail: format!(
-                "recipient strkey {} is not a G-, C-, or M-strkey",
-                quote_server_text(strkey)
-            ),
+            detail: RECIPIENT_ADDRESS_FORM.to_owned(),
         }),
     }
 }
@@ -115,11 +108,8 @@ pub(crate) fn g_strkey_to_account_address(g_strkey: &str) -> Result<ScAddress, X
         Ok(Strkey::PublicKeyEd25519(pk)) => Ok(ScAddress::Account(AccountId(
             PublicKey::PublicKeyTypeEd25519(Uint256(pk.0)),
         ))),
-        Ok(_other) => Err(X402Error::InvalidPayerAddress {
-            detail: format!("payer strkey {g_strkey:?} is not a G-strkey"),
-        }),
-        Err(e) => Err(X402Error::InvalidPayerAddress {
-            detail: format!("payer strkey parse failed for {g_strkey:?}: {e}"),
+        _ => Err(X402Error::InvalidPayerAddress {
+            detail: PAYER_ADDRESS_FORM.to_owned(),
         }),
     }
 }
@@ -142,8 +132,10 @@ pub(crate) fn g_strkey_to_account_address(g_strkey: &str) -> Result<ScAddress, X
 ///
 /// # Errors
 ///
-/// - [`X402Error::InvalidAssetAddress`] if `sac_contract` or `to` fails to parse.
+/// - [`X402Error::InvalidAssetAddress`] if `sac_contract` fails to parse.
 /// - [`X402Error::InvalidPayerAddress`] if `from` is not a valid G-strkey.
+/// - [`X402Error::InvalidRecipientAddress`] if `to` is not a valid G-, C-, or
+///   M-strkey.
 /// - [`X402Error::TransactionBuildFailed`] if the arg-list `VecM` construction
 ///   fails (only if arg count exceeds `VecM` capacity, which cannot occur here).
 ///
@@ -171,10 +163,7 @@ pub fn build_sac_transfer_invoke(
 
     let ScAddress::Contract(contract) = contract_address else {
         return Err(X402Error::InvalidAssetAddress {
-            detail: format!(
-                "asset {} is not a contract address",
-                quote_server_text(sac_contract)
-            ),
+            detail: ASSET_ADDRESS_FORM.to_owned(),
         });
     };
 

@@ -772,10 +772,12 @@ pub enum AnchorAmountError {
     ScientificNotation,
 
     /// The input contains a character that is neither an ASCII digit nor `.`.
-    #[error("anchor amount contains an invalid character {ch:?}; only digits and '.' are allowed")]
+    #[error(
+        "anchor amount contains an invalid character at byte offset {offset}; only digits and '.' are allowed"
+    )]
     InvalidChar {
-        /// The first offending character.
-        ch: char,
+        /// Byte offset of the first invalid character.
+        offset: usize,
     },
 
     /// The input contains more than one `.`.
@@ -945,7 +947,7 @@ impl AnchorAmount {
         // Track dot count and position for rules 5, 6, 7.
         let mut dot_count: usize = 0;
         let mut last_is_dot = false;
-        for ch in s.chars() {
+        for (offset, ch) in s.char_indices() {
             match ch {
                 'e' | 'E' => return Err(AnchorAmountError::ScientificNotation),
                 '.' => {
@@ -958,8 +960,8 @@ impl AnchorAmount {
                 '0'..='9' => {
                     last_is_dot = false;
                 }
-                other => {
-                    return Err(AnchorAmountError::InvalidChar { ch: other });
+                _ => {
+                    return Err(AnchorAmountError::InvalidChar { offset });
                 }
             }
         }

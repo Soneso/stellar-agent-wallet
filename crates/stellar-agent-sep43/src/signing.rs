@@ -108,12 +108,9 @@ pub async fn sign_classic_transaction(
     if let Some(provided) = network_passphrase_override
         && provided != expected_network_passphrase
     {
-        return Err(Sep43Error::InvalidNetworkPassphrase {
-            detail: format!(
-                "provided passphrase does not match profile: \
-                 expected {expected_network_passphrase:?}, got {provided:?}"
-            ),
-        });
+        return Err(Sep43Error::network_passphrase_mismatch(
+            expected_network_passphrase,
+        ));
     }
 
     stellar_agent_network::signing::envelope_signing::attach_signature(
@@ -313,19 +310,16 @@ fn decode_preimage(
     if let Some(provided) = network_passphrase_override
         && provided != expected_network_passphrase
     {
-        return Err(Sep43Error::InvalidNetworkPassphrase {
-            detail: format!(
-                "provided passphrase does not match profile: \
-                 expected {expected_network_passphrase:?}, got {provided:?}"
-            ),
-        });
+        return Err(Sep43Error::network_passphrase_mismatch(
+            expected_network_passphrase,
+        ));
     }
 
     // Decode the base64 preimage XDR.
     let preimage_bytes = base64::engine::general_purpose::STANDARD
         .decode(preimage_xdr)
-        .map_err(|e| Sep43Error::InvalidXdr {
-            detail: format!("authorization entry preimage is not valid base64: {e}"),
+        .map_err(|_| Sep43Error::InvalidXdr {
+            detail: "authorization entry preimage must be base64-encoded XDR".to_owned(),
         })?;
 
     // The preimage is caller-supplied and untrusted; bounded limits prevent a

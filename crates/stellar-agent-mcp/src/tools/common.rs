@@ -1926,7 +1926,7 @@ fn envelope_decode_error_kind(
         EnvelopeDecodeError::NotTransactionV1 => "not_transaction_v1",
         EnvelopeDecodeError::UnexpectedOperationCount { .. } => "unexpected_operation_count",
         EnvelopeDecodeError::OperationKindMismatch { .. } => "operation_kind_mismatch",
-        EnvelopeDecodeError::UnsupportedTool { .. } => "unsupported_tool",
+        EnvelopeDecodeError::UnsupportedTool => "unsupported_tool",
         EnvelopeDecodeError::IssuerEncodeFailed { .. } => "issuer_encode_failed",
         _ => "unrecognised",
     }
@@ -3277,13 +3277,10 @@ pub(crate) mod tests {
     fn nonce_non_collapsed_errors_do_not_double_wire_code_prefix() {
         let cases = [
             NonceError::Replayed,
-            NonceError::InvalidTool {
-                tool: "unknown_tool".to_owned(),
-            },
+            NonceError::InvalidTool,
             NonceError::InvalidEnvelope,
             NonceError::ChainMismatch {
                 expected: "stellar:testnet".to_owned(),
-                got: "stellar:mainnet".to_owned(),
             },
             NonceError::TtlExceeded {
                 max_ms: 300_000,

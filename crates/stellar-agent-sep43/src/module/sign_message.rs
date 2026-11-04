@@ -67,13 +67,9 @@ pub async fn dispatch(
     if let Some(provided) = network_passphrase
         && provided != profile.network_passphrase
     {
-        return Err(Sep43Error::InvalidNetworkPassphrase {
-            detail: format!(
-                "provided passphrase does not match profile: \
-                 expected {:?}, got {provided:?}",
-                profile.network_passphrase
-            ),
-        });
+        return Err(Sep43Error::network_passphrase_mismatch(
+            &profile.network_passphrase,
+        ));
     }
 
     // The optional address must name the key that will actually sign. This
