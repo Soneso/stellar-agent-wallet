@@ -27,7 +27,7 @@ use subtle::ConstantTimeEq as _;
 use crate::endpoint_identity::MainnetOracle;
 use crate::policy_state::WindowStoreError;
 use crate::policy_state::ledger::{self, WireAuthorization, WireAuthorizationHold};
-use crate::policy_state::lock::{WindowStoreLock, window_lock_path};
+use crate::policy_state::lock::WindowStoreLock;
 use crate::transaction_record::TransactionRecord;
 
 type HmacSha256 = Hmac<Sha256>;
@@ -888,6 +888,9 @@ fn key_load_error(
 impl PersistedWindowStore {
     /// Constructs a store handle for the OS-conventional path for
     /// `profile_name` (`<state>/stellar-agent/policy/<profile_name>.window`).
+    ///
+    /// Every production store lives in that policy-state directory, so every
+    /// store over one window-state keyring entry takes one lock file.
     #[must_use]
     pub fn for_profile(profile_name: &str) -> Self {
         Self {
@@ -895,8 +898,10 @@ impl PersistedWindowStore {
         }
     }
 
-    /// Constructs a store handle at an explicit path — used by tests and by
-    /// callers that override the OS-conventional state directory.
+    /// Constructs a store handle at an explicit path.
+    ///
+    /// Test fixtures only; production code uses [`Self::for_profile`].
+    #[cfg(any(test, feature = "test-helpers"))]
     #[must_use]
     pub fn at_path(path: PathBuf) -> Self {
         Self { path }
@@ -914,12 +919,9 @@ impl PersistedWindowStore {
         self.path.exists()
     }
 
-    fn lock_path(&self) -> PathBuf {
-        window_lock_path(&self.path)
-    }
-
     /// The store file's path.
-    pub(super) fn path(&self) -> &Path {
+    #[must_use]
+    pub fn path(&self) -> &Path {
         &self.path
     }
 
@@ -1073,7 +1075,10 @@ impl PersistedWindowStore {
         require_admission: bool,
     ) -> Result<MintOutcome, WindowStoreError> {
         self.ensure_parent_dir()?;
-        let _lock = WindowStoreLock::acquire_with_retry(&self.lock_path())?;
+        let _lock = WindowStoreLock::acquire_for_with_retry(
+            &self.path,
+            &profile.policy_window_state_key_id,
+        )?;
 
         let (key, mint_outcome) = self.load_or_mint_key(profile)?;
         let gen_entry = generation_entry_ref(profile);
@@ -1150,7 +1155,10 @@ impl PersistedWindowStore {
         reservation: &SubmissionHold,
     ) -> Result<MintOutcome, WindowStoreError> {
         self.ensure_parent_dir()?;
-        let _lock = WindowStoreLock::acquire_with_retry(&self.lock_path())?;
+        let _lock = WindowStoreLock::acquire_for_with_retry(
+            &self.path,
+            &profile.policy_window_state_key_id,
+        )?;
 
         let (key, mint_outcome) = self.load_or_mint_key(profile)?;
         let gen_entry = generation_entry_ref(profile);
@@ -1816,9 +1824,12 @@ impl PersistedWindowStore {
     ///
     /// [`WindowStoreError::Io`] / [`WindowStoreError::Invalid`] if the
     /// existing file cannot be read or is shorter than the tag prefix.
-    pub fn resign(&self, new_key: &[u8; 32]) -> Result<(), WindowStoreError> {
+    pub fn resign(&self, profile: &Profile, new_key: &[u8; 32]) -> Result<(), WindowStoreError> {
         self.ensure_parent_dir()?;
-        let _lock = WindowStoreLock::acquire_with_retry(&self.lock_path())?;
+        let _lock = WindowStoreLock::acquire_for_with_retry(
+            &self.path,
+            &profile.policy_window_state_key_id,
+        )?;
 
         let bytes = match fs::read(&self.path) {
             Ok(b) => b,
@@ -1850,7 +1861,10 @@ impl PersistedWindowStore {
         mutate: impl FnOnce(&mut WireFile) -> bool,
     ) -> Result<(), WindowStoreError> {
         self.ensure_parent_dir()?;
-        let _lock = WindowStoreLock::acquire_with_retry(&self.lock_path())?;
+        let _lock = WindowStoreLock::acquire_for_with_retry(
+            &self.path,
+            &profile.policy_window_state_key_id,
+        )?;
 
         let (key, _mint) = self.load_or_mint_key(profile)?;
         let gen_entry = generation_entry_ref(profile);
@@ -3556,7 +3570,7 @@ mod tests {
         let entry_ref = &profile.policy_window_state_key_id;
         crate::keyring::rotate_keyring_secret_32(&entry_ref.service, &entry_ref.account).unwrap();
         let new_key = crate::keyring::load_hmac_key_32(entry_ref).unwrap();
-        store.resign(&new_key).unwrap();
+        store.resign(&profile, &new_key).unwrap();
 
         // load_into re-reads the (now-current) keyring key internally.
         let dest = PolicyStateStore::new();
@@ -5452,7 +5466,8 @@ mod tests {
         receipts
             .try_begin(&res.id, &res.tx_hash, &res.source, 7, 0, 100)
             .unwrap();
-        let held = WindowStoreLock::acquire(&store.lock_path()).unwrap();
+        let held =
+            WindowStoreLock::acquire_for(&store.path, &profile.policy_window_state_key_id).unwrap();
         assert!(matches!(
             store.release_on_evidence(
                 &profile,

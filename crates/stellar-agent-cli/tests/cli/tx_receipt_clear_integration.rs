@@ -996,7 +996,10 @@ async fn clear_resumes_after_recovered_receipt_write_before_release() {
         let (window, profile) = orphan_fixture(home.path(), &server.uri());
         let lock = std::fs::OpenOptions::new()
             .write(true)
-            .open(home.path().join(format!("policy/{PROFILE}.window.lock")))
+            .open(stellar_agent_core::policy::state_lock::window_lock_path(
+                &home.path().join(format!("policy/{PROFILE}.window")),
+                &profile.policy_window_state_key_id,
+            ))
             .unwrap();
         lock.try_lock().unwrap();
         let (interrupted, error) = orphan_clear(home.path());

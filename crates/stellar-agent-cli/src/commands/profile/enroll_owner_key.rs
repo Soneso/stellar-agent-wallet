@@ -52,8 +52,11 @@ use stellar_agent_core::audit_log::KeyPurpose;
 use stellar_agent_core::envelope::Envelope;
 use stellar_agent_core::error::WalletError;
 use stellar_agent_core::observability::RedactedStrkey;
+use stellar_agent_core::policy::state_lock::{WindowStoreLock, window_lock_path};
 use stellar_agent_core::profile::loader;
-use stellar_agent_core::profile::schema::{KeyringEntryRef, Profile};
+use stellar_agent_core::profile::schema::{
+    KeyringEntryRef, Profile, default_policy_window_state_path_for,
+};
 use stellar_agent_network::Signer as _;
 use stellar_agent_network::keyring::{KeyringOperation, init_platform_keyring_store};
 use uuid::Uuid;
@@ -121,6 +124,14 @@ struct EnrollOwnerKeyData {
     /// base64 encoding, so rendering the stored bytes as an address could print
     /// the private key. `replaced` alone conveys that a prior entry existed.
     replaced: bool,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's observation, run once on this thread right before the owner
+    /// entry write, while the enrollment holds its authorization locks.
+    static BEFORE_OWNER_WRITE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 /// Runs `stellar-agent profile enroll-owner-key`.
@@ -287,10 +298,10 @@ where
         return 1;
     }
 
-    // Hold the pin lock through the owner write so a concurrent load cannot
+    // Hold every pin lock through the owner write so a concurrent load cannot
     // change the owner that authorizes this enrollment.
-    let rotation_lock = match authorize_owner_write(&profile, &profile_name, &owner_pubkey.0) {
-        Ok(lock) => lock,
+    let rotation_locks = match authorize_owner_write(&profile, &profile_name, &owner_pubkey.0) {
+        Ok(locks) => locks,
         Err(refusal) => {
             render::render_json(&refusal);
             return 1;
@@ -304,6 +315,10 @@ where
     let encoded: Zeroizing<String> = Zeroizing::new(
         stellar_agent_core::profile::owner_key::encode_owner_public_key(&owner_pubkey.0),
     );
+    #[cfg(test)]
+    if let Some(hook) = BEFORE_OWNER_WRITE.with_borrow_mut(Option::take) {
+        hook();
+    }
     if let Err(e) = entry.set_password(&encoded) {
         tracing::debug!("enroll-owner-key: set_password failed");
         // Classify the write failure: a non-interactive Windows session must
@@ -319,7 +334,7 @@ where
         return 1;
     }
 
-    drop(rotation_lock);
+    drop(rotation_locks);
 
     let request_id = Uuid::new_v4().to_string();
     emit_keyring_key_written(
@@ -347,8 +362,8 @@ where
 }
 
 /// Authorizes the owner entry write of an installation that holds owner
-/// continuity records and returns the pin lock to hold across it; `None` when
-/// it holds none.
+/// continuity records and returns every pin lock to hold across it. An
+/// installation without continuity records returns an empty vector.
 ///
 /// The records are the mainnet enablement nonce and the policy pin. The
 /// profile's configured window-state entry is checked when it holds either
@@ -376,7 +391,7 @@ fn authorize_owner_write(
     profile: &Profile,
     profile_name: &str,
     new_owner: &[u8; 32],
-) -> Result<Option<stellar_agent_core::policy::state_lock::WindowStoreLock>, Envelope<()>> {
+) -> Result<Vec<WindowStoreLock>, Envelope<()>> {
     use stellar_agent_core::{
         mainnet::enablement::has_enablement_nonce,
         policy::{PolicyError, pin},
@@ -387,7 +402,8 @@ fn authorize_owner_write(
     if coordinates[0].0 != default {
         coordinates.push((default, false));
     }
-    let mut held = None;
+    let window = default_policy_window_state_path_for(profile_name);
+    let mut held = Vec::new();
     for (coordinate, is_configured) in coordinates {
         let mut scoped = profile.clone();
         scoped.policy_window_state_key_id = coordinate;
@@ -403,10 +419,12 @@ fn authorize_owner_write(
             false
         };
         if nonce || pin {
-            // Every coordinate shares the store's one lock file: release the
-            // previous guard before taking the next.
-            drop(held.take());
-            held = Some(authorize_at(&scoped, profile_name, new_owner, nonce, pin)?);
+            // Each entry has its own lock and the owner write runs under every guard.
+            // Two spellings of one entry answer one lock file, and the guard is not
+            // reentrant, so the later acquisition replaces the earlier guard.
+            let lock = window_lock_path(&window, &scoped.policy_window_state_key_id);
+            held.retain(|guard: &WindowStoreLock| guard.path() != lock);
+            held.push(authorize_at(&scoped, profile_name, new_owner, nonce, pin)?);
         }
     }
     Ok(held)
@@ -444,7 +462,7 @@ fn authorize_at(
     new_owner: &[u8; 32],
     nonce: bool,
     pin: bool,
-) -> Result<stellar_agent_core::policy::state_lock::WindowStoreLock, Envelope<()>> {
+) -> Result<WindowStoreLock, Envelope<()>> {
     use stellar_agent_core::{
         policy::{
             PolicyError,
@@ -453,10 +471,7 @@ fn authorize_at(
                 OwnerKeySource, PolicyLoad, acquire_existing_state_lock, check_owner_enrollment,
             },
         },
-        profile::schema::{
-            default_policy_dir, default_policy_window_state_path_for, mainnet_enablement_entry_ref,
-            policy_pin_entry_ref,
-        },
+        profile::schema::{default_policy_dir, mainnet_enablement_entry_ref, policy_pin_entry_ref},
     };
     let window_key = &scoped.policy_window_state_key_id;
     let pin_absent = || {
@@ -492,7 +507,8 @@ fn authorize_at(
             format!(
                 "the policy-state lock file of profile '{profile_name}' is missing, so its \
                  policy pin cannot be read; a command that builds the V1 policy engine \
-                 recreates the lock file; no entry was written"
+                 recreates the lock file of the configured window key; a pin under another \
+                 window key needs that key configured again; no entry was written"
             ),
         ));
     };
@@ -1304,6 +1320,117 @@ mod tests {
         assert_eq!(f.nonce_entry.get_password().unwrap(), NONCE);
     }
 
+    #[test]
+    #[serial]
+    fn owner_authorization_holds_every_selected_entry_lock() {
+        use stellar_agent_core::{
+            policy::{
+                pin::{self, PinScope, PinState},
+                state_lock::StateLockError,
+            },
+            profile::schema::mainnet_enablement_entry_ref,
+        };
+        for (configured, expected_guards) in [
+            (KeyringEntryRef::new("moved-window", "default"), 2),
+            (
+                KeyringEntryRef::default_policy_window_state_key("operator"),
+                1,
+            ),
+            (
+                KeyringEntryRef::new("STELLAR-AGENT-POLICY-WINDOW-OPERATOR", "DEFAULT"),
+                1,
+            ),
+        ] {
+            let f = Enabled::new();
+            let PinState::Present(pinned) = f.pin() else {
+                panic!("the enabled fixture holds a pin");
+            };
+            let mut profile = f.profile.clone();
+            profile.policy_window_state_key_id = configured.clone();
+            let default = KeyringEntryRef::default_policy_window_state_key("operator");
+            let lock = WindowStoreLock::acquire_for(&f.window, &configured).unwrap();
+            pin::write(&lock, &PinScope::for_profile(&f.window, &profile), &pinned).unwrap();
+            drop(lock);
+            let nonce = mainnet_enablement_entry_ref(&configured);
+            KeyringEntry::new(&nonce.service, &nonce.account)
+                .unwrap()
+                .set_password(NONCE)
+                .unwrap();
+
+            let held =
+                authorize_owner_write(&profile, "operator", &f.old.verifying_key().to_bytes())
+                    .unwrap();
+            for coordinate in [&configured, &default] {
+                assert!(
+                    matches!(
+                        WindowStoreLock::acquire_for(&f.window, coordinate),
+                        Err(StateLockError::WriterLocked)
+                    ),
+                    "every selected coordinate stays locked: {coordinate:?}"
+                );
+            }
+            assert_eq!(held.len(), expected_guards);
+            drop(held);
+            for coordinate in [&configured, &default] {
+                drop(WindowStoreLock::acquire_for(&f.window, coordinate).unwrap());
+            }
+        }
+    }
+
+    /// An enrollment whose two selected window-state entries both hold
+    /// records keeps both entry locks through the owner entry write and
+    /// releases them after it.
+    #[tokio::test]
+    #[serial]
+    async fn enrollment_holds_every_selected_entry_lock_across_the_owner_write() {
+        use stellar_agent_core::{
+            policy::{
+                pin::{self, PinScope, PinState},
+                state_lock::StateLockError,
+            },
+            profile::schema::default_profile_dir,
+        };
+        let f = Enabled::new();
+        let PinState::Present(pinned) = f.pin() else {
+            panic!("the enabled fixture holds a pin");
+        };
+        let moved_key = KeyringEntryRef::new("stellar-agent-policy-window-operator", "moved");
+        let moved = testnet_operator(Some(moved_key.clone()));
+        loader::save_to_dir("operator", &moved, &default_profile_dir().unwrap()).unwrap();
+        let lock = WindowStoreLock::acquire_for(&f.window, &moved_key).unwrap();
+        pin::write(&lock, &PinScope::for_profile(&f.window, &moved), &pinned).unwrap();
+        drop(lock);
+        f.owner_entry.delete_credential().unwrap();
+
+        let coordinates = [moved_key, f.profile.policy_window_state_key_id.clone()];
+        let observed = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let sink = observed.clone();
+        let window = f.window.clone();
+        let probed = coordinates.clone();
+        BEFORE_OWNER_WRITE.with_borrow_mut(|hook| {
+            *hook = Some(Box::new(move || {
+                *sink.borrow_mut() = Some(probed.map(|coordinate| {
+                    matches!(
+                        WindowStoreLock::acquire_for(&window, &coordinate),
+                        Err(StateLockError::WriterLocked)
+                    )
+                }));
+            }));
+        });
+
+        let (code, output) = f.enroll(&f.previous_var, false).await;
+        assert_eq!(code, 0, "{output:?}");
+        assert_eq!(f.owner_entry.get_password().unwrap(), f.old_value);
+        assert_eq!(
+            observed.borrow_mut().take(),
+            Some([true, true]),
+            "both entry locks are held at the owner entry write"
+        );
+        for coordinate in &coordinates {
+            drop(WindowStoreLock::acquire_for(&f.window, coordinate).unwrap());
+        }
+    }
+
     /// Each cause other than the statement keeps its own code, and none
     /// writes the owner entry.
     #[tokio::test]
@@ -1312,7 +1439,7 @@ mod tests {
         use stellar_agent_core::policy::state_lock::{WindowStoreLock, window_lock_path};
         let f = Enabled::new();
         std::fs::write(&f.path, signed(&f.rotation(8), &f.new)).unwrap();
-        let lock_path = window_lock_path(&f.window);
+        let lock_path = window_lock_path(&f.window, &f.profile.policy_window_state_key_id);
         let pin_coord = stellar_agent_core::profile::schema::policy_pin_entry_ref(
             &f.profile.policy_window_state_key_id,
         );
@@ -1385,6 +1512,15 @@ mod tests {
             assert_eq!(output[0]["error"]["code"], code, "{cause}: {output:?}");
             let message = output[0]["error"]["message"].as_str().unwrap();
             assert!(message.contains(text), "{cause}: {message}");
+            if cause == "lock_missing" {
+                assert_eq!(
+                    message,
+                    "the policy-state lock file of profile 'operator' is missing, so its \
+                     policy pin cannot be read; a command that builds the V1 policy engine \
+                     recreates the lock file of the configured window key; a pin under another \
+                     window key needs that key configured again; no entry was written"
+                );
+            }
             assert_eq!(
                 f.owner_entry.get_password().unwrap(),
                 f.old_value,
@@ -1478,7 +1614,9 @@ mod tests {
                 &loaded,
                 &profiles,
                 &f.path,
-                &f.window,
+                &stellar_agent_network::policy_state::PersistedWindowStore::at_path(
+                    f.window.clone(),
+                ),
                 |_| {
                     audited = true;
                     Ok(())

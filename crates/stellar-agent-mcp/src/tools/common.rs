@@ -1444,9 +1444,7 @@ impl WalletServer {
         let oracle = self.settlement_oracle();
         let profile_name = self.profile_name_for_approval();
         let receipts = stellar_agent_core::profile::receipt::ReceiptStore::open(&profile_name).ok();
-        let window = stellar_agent_network::policy_state::PersistedWindowStore::at_path(
-            self.window_path.clone(),
-        );
+        let window = self.window_store.clone();
         let report = match window
             .reconcile_due(
                 self.security_profile(),
@@ -1837,9 +1835,7 @@ impl WalletServer {
                 ))
             })?;
             let profile_name = self.profile_name_for_approval();
-            let window_store = stellar_agent_network::policy_state::PersistedWindowStore::at_path(
-                self.window_path.clone(),
-            );
+            let window_store = self.window_store.clone();
             if let Err(e) = window_store.load_into(&profile_name, self.security_profile(), store) {
                 return Err(ToolError::Business(business_error_result(
                     "policy.engine_required",
@@ -5537,7 +5533,7 @@ pub(crate) mod tests {
                 .unwrap();
             let entry = &f.server.profile.policy_window_state_key_id;
             let pin_ref =
-                stellar_agent_core::policy::pin::PinScope::new(&f.server.window_path, entry)
+                stellar_agent_core::policy::pin::PinScope::new(f.server.window_store.path(), entry)
                     .pin_entry_ref();
             let pin = keyring_core::Entry::new(&pin_ref.service, &pin_ref.account).unwrap();
             let before = pin.get_password().unwrap();
@@ -5558,8 +5554,10 @@ pub(crate) mod tests {
                 .server
                 .mainnet_write_admission(stellar_agent_network::mainnet::MainnetConsumer::McpPay)
                 .unwrap();
-            let lock =
-                stellar_agent_core::policy::state_lock::window_lock_path(&f.server.window_path);
+            let lock = stellar_agent_core::policy::state_lock::window_lock_path(
+                f.server.window_store.path(),
+                &f.server.security_profile().policy_window_state_key_id,
+            );
             if lock.exists() {
                 std::fs::remove_file(&lock).unwrap();
             }
@@ -5582,7 +5580,7 @@ pub(crate) mod tests {
                         .verifying_key()
                         .to_bytes(),
                     owner_source: OwnerKeySource::Keyring,
-                    window_path: &f.server.window_path,
+                    window_path: f.server.window_store.path(),
                 },
                 PolicyStateStore::new(),
                 PinMode::CompareOnly,
@@ -6118,7 +6116,7 @@ pub(crate) mod tests {
 
         /// The authorization ledger, or `None` before its first write.
         pub(crate) fn ledger(f: &Fixture) -> Option<serde_json::Value> {
-            let bytes = std::fs::read(&f.server.window_path).ok()?;
+            let bytes = std::fs::read(f.server.window_store.path()).ok()?;
             Some(serde_json::from_slice(&bytes[32..]).unwrap())
         }
 
@@ -6584,7 +6582,7 @@ pub(crate) mod tests {
             wiremock::Mock::given(wiremock::matchers::method("POST"))
                 .respond_with(MainnetRpc {
                     entries: fixture_entries(f),
-                    state_path: f.server.window_path.clone(),
+                    state_path: f.server.window_store.path().to_path_buf(),
                     audit_path: f.server.security_profile().audit_log_path.clone(),
                     control: Arc::clone(&control),
                     seed_reads: Arc::clone(&f.seed_reads),
@@ -7642,7 +7640,7 @@ pub(crate) mod tests {
                 assert_eq!(run.control.count("sendTransaction"), 0, "{tool:?}");
 
                 let run = ClassicRun::new(tool).await;
-                std::fs::write(&run.f.server.window_path, b"not a window file").unwrap();
+                std::fs::write(run.f.server.window_store.path(), b"not a window file").unwrap();
                 let result = run.commit().await;
                 assert_eq!(result["ok"], false, "{tool:?}: {result}");
                 assert_eq!(
@@ -7976,7 +7974,7 @@ pub(crate) mod tests {
                 assert_refused_before_mint(&run, &result, "submission.record_unavailable");
 
                 let run = ClassicRun::new(tool).await;
-                let window = run.f.server.window_path.clone();
+                let window = run.f.server.window_store.path().to_path_buf();
                 let original = std::fs::read(&window).ok();
                 let corrupt = window.clone();
                 observe(&run.f.on_identity_read, move || {
@@ -8325,7 +8323,14 @@ pub(crate) mod tests {
                 let run = ClassicRun::new(tool).await;
                 let guard = HookGuard::default();
                 let hold = Arc::clone(&guard);
-                let directory = run.f.server.window_path.parent().unwrap().to_owned();
+                let directory = run
+                    .f
+                    .server
+                    .window_store
+                    .path()
+                    .parent()
+                    .unwrap()
+                    .to_owned();
                 let seed_reads = Arc::clone(&run.f.seed_reads);
                 run.control
                     .passphrase_after_seed
@@ -8616,7 +8621,7 @@ pub(crate) mod tests {
             let run = X402Run::new().await;
             let at_signing = Arc::new(std::sync::Mutex::new(Vec::new()));
             let seen = Arc::clone(&at_signing);
-            let window = run.f.server.window_path.clone();
+            let window = run.f.server.window_store.path().to_path_buf();
             observe(&run.f.on_seed_read, move || {
                 let state: serde_json::Value = std::fs::read(&window)
                     .map(|bytes| serde_json::from_slice(&bytes[32..]).unwrap())
@@ -9005,9 +9010,7 @@ pub(crate) mod tests {
                     f.envelope.source(),
                 )
                 .unwrap();
-                let store = stellar_agent_network::policy_state::PersistedWindowStore::at_path(
-                    f.server.window_path.clone(),
-                );
+                let store = f.server.window_store.clone();
                 Self {
                     guard,
                     approval,
@@ -9715,9 +9718,7 @@ pub(crate) mod tests {
                 .unwrap();
             let signer = f.server.mainnet_enrolled_signer(&guard).unwrap();
             let client = guard.context.primary_client().unwrap();
-            let store = stellar_agent_network::policy_state::PersistedWindowStore::at_path(
-                f.server.window_path.clone(),
-            );
+            let store = f.server.window_store.clone();
             let audit = stellar_agent_network::mainnet::audit_readiness::audit_readiness(
                 guard.context.profile(),
                 "operator",

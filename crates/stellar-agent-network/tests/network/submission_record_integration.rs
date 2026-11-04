@@ -129,8 +129,8 @@ struct Fixture {
     profile_name: String,
     receipts: ReceiptStore,
     window: PersistedWindowStore,
-    /// The window store's sidecar lock file, which a test holds to make the
-    /// reservation write fail.
+    /// The lock file of the window store's keyring entry, which a test holds
+    /// to make the reservation write fail.
     window_lock_path: std::path::PathBuf,
 }
 
@@ -139,9 +139,13 @@ fn fixture(name: &str) -> Fixture {
     let dir = TempDir::new().unwrap();
     let receipt_dir = TempDir::new().unwrap();
     let window_path = dir.path().join(format!("{name}.window"));
-    let window_lock_path = dir.path().join(format!("{name}.window.lock"));
+    let profile = test_profile(name);
+    let window_lock_path = stellar_agent_core::policy::state_lock::window_lock_path(
+        &window_path,
+        &profile.policy_window_state_key_id,
+    );
     Fixture {
-        profile: test_profile(name),
+        profile,
         profile_name: name.to_owned(),
         receipts: ReceiptStore::open_at(receipt_dir.path(), name).unwrap(),
         window: PersistedWindowStore::at_path(window_path),
@@ -151,7 +155,7 @@ fn fixture(name: &str) -> Fixture {
     }
 }
 
-/// Holds the window store's sidecar lock for as long as it is alive, which is
+/// Holds the lock of the window store's keyring entry for as long as it is alive, which is
 /// what makes `record_pending` refuse.
 fn hold_window_lock(path: &std::path::Path) -> std::fs::File {
     let file = std::fs::OpenOptions::new()
@@ -159,7 +163,7 @@ fn hold_window_lock(path: &std::path::Path) -> std::fs::File {
         .truncate(false)
         .write(true)
         .open(path)
-        .expect("the sidecar lock file must open");
+        .expect("the lock file must open");
     file.try_lock().expect("the lock must be free");
     file
 }

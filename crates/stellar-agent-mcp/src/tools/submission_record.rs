@@ -359,12 +359,9 @@ pub(crate) async fn sign_and_submit_classic(
             &stellar_strkey::ed25519::PublicKey(signer.public_key()).to_string(),
         )
         .map_err(render)?;
-        let store = PersistedWindowStore::at_path(server.window_path.clone());
-        let prepared = prepare_authorized_recorder(
-            record,
-            PersistedWindowStore::at_path(server.window_path.clone()),
-        )
-        .map_err(render)?;
+        let store = server.window_store.clone();
+        let prepared =
+            prepare_authorized_recorder(record, server.window_store.clone()).map_err(render)?;
         let authorization = stellar_agent_network::mainnet::resolve::resolve_tx_sign(
             stellar_agent_network::mainnet::resolve::TxSignRequest {
                 context: guard.context,
@@ -1159,8 +1156,8 @@ mod tests {
                 std::fs::write(directory.join("operator.json"), "invalid receipt state").unwrap();
             }
             if defect == "window" {
-                std::fs::create_dir_all(f.server.window_path.parent().unwrap()).unwrap();
-                std::fs::write(&f.server.window_path, "invalid window state").unwrap();
+                std::fs::create_dir_all(f.server.window_store.path().parent().unwrap()).unwrap();
+                std::fs::write(f.server.window_store.path(), "invalid window state").unwrap();
             }
             let result = prepare_authorized_recorder(
                 CommitRecord {
@@ -1184,7 +1181,7 @@ mod tests {
                         .then(|| f.server.resolve_approval_dir().unwrap()),
                     now_ms: stellar_agent_core::timefmt::now_unix_ms().unwrap(),
                 },
-                PersistedWindowStore::at_path(f.server.window_path.clone()),
+                f.server.window_store.clone(),
             );
             if defect == "none" {
                 assert!(result.is_ok());
@@ -1196,8 +1193,8 @@ mod tests {
                 assert_eq!(error.code(), "submission.record_unavailable", "{defect}");
             }
             assert_eq!(f.seed_reads.load(std::sync::atomic::Ordering::SeqCst), 0);
-            if defect != "window" && f.server.window_path.exists() {
-                let bytes = std::fs::read(&f.server.window_path).unwrap();
+            if defect != "window" && f.server.window_store.exists() {
+                let bytes = std::fs::read(f.server.window_store.path()).unwrap();
                 let state: serde_json::Value = serde_json::from_slice(&bytes[32..]).unwrap();
                 assert!(state["authorizations"].as_array().is_none_or(Vec::is_empty));
             }

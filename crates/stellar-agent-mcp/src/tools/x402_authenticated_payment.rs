@@ -1030,9 +1030,7 @@ impl WalletServer {
         ) {
             return Ok(business_error_result(err.code(), err.to_string()));
         }
-        let store = stellar_agent_network::policy_state::PersistedWindowStore::at_path(
-            self.window_path.clone(),
-        );
+        let store = self.window_store.clone();
         let intent = stellar_agent_network::mainnet::resolve::SorobanIntent {
             consumer: MainnetConsumer::X402Authenticated,
             root_invocation: &root,

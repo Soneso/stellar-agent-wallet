@@ -36,6 +36,7 @@ use std::sync::{Arc, Mutex};
 
 use serde_json::json;
 use serial_test::serial;
+use stellar_agent_core::policy::state_lock::window_lock_path;
 use stellar_agent_core::policy::v1::criteria::state_store::{
     PolicyStateStore, StateKey, WindowEntry, WindowLimit,
 };
@@ -1195,11 +1196,10 @@ async fn the_automatic_pass_finishes_a_checkpointed_evidence_release() {
         .create(true)
         .truncate(false)
         .write(true)
-        .open(
-            fx._dir
-                .path()
-                .join(format!("{}.window.lock", fx.profile_name)),
-        )
+        .open(window_lock_path(
+            &fx._dir.path().join(format!("{}.window", fx.profile_name)),
+            &fx.profile.policy_window_state_key_id,
+        ))
         .unwrap();
     held.try_lock().unwrap();
 
@@ -2098,7 +2098,10 @@ async fn failed_orphan_marker_write_keeps_the_reservation_selectable() {
         .unwrap();
     let lock = std::fs::OpenOptions::new()
         .write(true)
-        .open(fx._dir.path().join("orphan-marker-failure.window.lock"))
+        .open(window_lock_path(
+            &fx._dir.path().join("orphan-marker-failure.window"),
+            &fx.profile.policy_window_state_key_id,
+        ))
         .unwrap();
     lock.try_lock().unwrap();
     let counts = MethodCounts::default();

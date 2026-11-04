@@ -1186,9 +1186,7 @@ impl Boundary {
     }
 
     fn store(&self) -> stellar_agent_network::policy_state::PersistedWindowStore {
-        stellar_agent_network::policy_state::PersistedWindowStore::at_path(
-            self.f.server.window_path.clone(),
-        )
+        self.f.server.window_store.clone()
     }
 
     /// Mints and consumes the message authorization of `facts` under

@@ -545,7 +545,7 @@ async fn mainnet_commit_rechecks_consent_after_policy_change() {
             }
             "absent pin" => {
                 let pin = stellar_agent_core::policy::pin::PinScope::new(
-                    &run.f.server.window_path,
+                    run.f.server.window_store.path(),
                     &run.f.server.profile.policy_window_state_key_id,
                 )
                 .pin_entry_ref();
