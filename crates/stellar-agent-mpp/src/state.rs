@@ -190,7 +190,8 @@ impl AuthorizationRecord {
     }
 
     /// Computes the replay identity from payer, request context, and exact challenge.
-    /// The identity is independent of the preparation time and effective expiry.
+    /// The identity is independent of the preparation time; the challenge's
+    /// own expiry is part of the exact challenge.
     ///
     /// # Errors
     ///
@@ -489,7 +490,8 @@ mod tests {
     use stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE;
 
     use super::*;
-    use crate::sponsored::tests::prepared_fixture;
+    use crate::limits::MAX_CHALLENGE_LIFETIME_SECS;
+    use crate::sponsored::tests::{prepared_fixture, prepared_fixture_expiring};
 
     fn status(index: u8) -> AuthorizationStatus {
         match index % 13 {
@@ -563,7 +565,7 @@ mod tests {
 
         assert!(record.authorization_id().starts_with("mpp_"));
         assert_eq!(record.status(), AuthorizationStatus::Prepared);
-        assert_eq!(record.expires_at(), now + 300);
+        assert_eq!(record.expires_at(), now + MAX_CHALLENGE_LIFETIME_SECS);
         assert_eq!(record.updated_at(), now);
         assert_eq!(record.approval_nonce(), None);
         assert!(!record.credential_constructed());
@@ -733,7 +735,8 @@ mod tests {
     /// pinned: the same vector as the core known-answer test.
     #[tokio::test]
     async fn authorization_fingerprint_known_answer() {
-        let (prepared, _signer, _rpc) = prepared_fixture(1_700_000_000).await;
+        let (prepared, _signer, _rpc) =
+            prepared_fixture_expiring(1_700_000_000, 1_700_000_300).await;
         let fingerprint = authorization_fingerprint(
             "default",
             TESTNET_PASSPHRASE,
@@ -743,7 +746,7 @@ mod tests {
         .expect("fingerprint");
         assert_eq!(
             hex::encode(fingerprint),
-            "79d368c1aeb6b1f89a1bf84a56bea75bb7ca6e138c252cafa18e24c013fd1768"
+            "d189c555768dbc6c25ef5feed2212b7a7bf34b93fbc58aa7b5a64a7765d57818"
         );
     }
 
@@ -777,7 +780,7 @@ mod tests {
 
         // The remaining preimage dimensions flow through the selected
         // challenge: transport context, exact challenge echo, amount,
-        // currency, recipient, and effective expiry. Each perturbation must
+        // currency, recipient, and challenge expiry. Each perturbation must
         // change the fingerprint.
         const OTHER_CONTRACT: &str = "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC";
         const OTHER_ACCOUNT: &str = "GAJZR5RMNUNEK7CRXJVEWXZ5XUXWT7FJGILCDDOITF7EC26RPWJ4UVOE";
@@ -798,6 +801,7 @@ mod tests {
                     "realm": "server",
                     "method": "stellar",
                     "intent": "charge",
+                    "expires": crate::sponsored::tests::rfc3339(now + 60),
                     "request": request
                 });
                 challenge_mutate(&mut challenge);
@@ -868,7 +872,7 @@ mod tests {
                 ),
             ),
             (
-                "effective expiry",
+                "challenge expiry",
                 selected_with(
                     request_with(&|_| {}),
                     &|challenge| {

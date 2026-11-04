@@ -189,7 +189,8 @@ mod tests {
 
     /// The known-answer vector of the MPP store's fingerprint: the inputs of
     /// the MPP crate's prepared-charge test fixture at Unix time
-    /// 1_700_000_000, under profile `default` on testnet.
+    /// 1_700_000_000 with an expiry of 1_700_000_300, under profile `default` on
+    /// testnet.
     #[test]
     fn authorization_fingerprint_known_answer() {
         let context = MppAuthorizationContext {
@@ -198,7 +199,7 @@ mod tests {
             ),
             network_passphrase_hash: Sha256::digest(TESTNET_PASSPHRASE.as_bytes()).into(),
             challenge_digest: hex32(
-                "dd476260bd5e92b6f66f1fa14076dba13a99ef9ae71016498c079273a9829b2e",
+                "3ffdc0540bea20fd33e5444f5970c1c39ca413b402571a8ab6aac5c6ef101a01",
             ),
         };
         let terms = MppChargeTerms {
@@ -211,7 +212,7 @@ mod tests {
         };
         assert_eq!(
             crate::hex::encode(&authorization_fingerprint(&terms, &context)),
-            "79d368c1aeb6b1f89a1bf84a56bea75bb7ca6e138c252cafa18e24c013fd1768"
+            "d189c555768dbc6c25ef5feed2212b7a7bf34b93fbc58aa7b5a64a7765d57818"
         );
     }
 

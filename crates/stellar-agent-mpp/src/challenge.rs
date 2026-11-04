@@ -125,6 +125,9 @@ pub struct SelectedChallenge {
     echo: ChallengeEcho,
     request: StellarChargeRequest,
     context: RequestContext,
+    /// Expiry of this selection as a Unix timestamp. Admission sets it to the
+    /// challenge's own `expires`; a stored record keeps the value written with it.
+    /// The name is part of the stored authorization record.
     effective_expires_at: i64,
     challenge_digest: [u8; 32],
 }
@@ -148,7 +151,7 @@ impl SelectedChallenge {
         &self.context
     }
 
-    /// Returns the effective expiry as a Unix timestamp.
+    /// Returns the expiry of this selection as a Unix timestamp.
     #[must_use]
     pub const fn effective_expires_at(&self) -> i64 {
         self.effective_expires_at
@@ -206,7 +209,9 @@ struct Candidate {
 /// # Errors
 ///
 /// Returns a stable `mpp.*` error for malformed, unsupported, ambiguous,
-/// expired, or context-mismatched input.
+/// expired, or context-mismatched input. A challenge without an `expires`
+/// member and a challenge expiring more than
+/// [`MAX_CHALLENGE_LIFETIME_SECS`] ahead of `now_unix` are refused as invalid.
 pub fn select_and_validate(
     input: &ChallengeInput,
     now_unix: i64,
@@ -288,7 +293,7 @@ fn validate_candidate(candidate: Candidate, now_unix: i64) -> Result<SelectedCha
         })?;
     let terms = validate_request(request)?;
     validate_digest_binding(object, &candidate.context)?;
-    let effective_expires_at = effective_expiry(object, now_unix)?;
+    let effective_expires_at = challenge_expiry(object, now_unix)?;
     let challenge_digest = Sha256::digest(canonical_json(&candidate.echo.0)?).into();
     Ok(SelectedChallenge {
         echo: candidate.echo,
@@ -665,17 +670,34 @@ fn validate_digest_binding(
     }
 }
 
-fn effective_expiry(object: &Map<String, Value>, now_unix: i64) -> Result<i64, MppError> {
+/// Returns the challenge's own expiry after admitting it.
+///
+/// The expiry belongs to the exact challenge behind the replay identity, so
+/// it is the same at every prepare of that challenge. Nothing defaults or
+/// clips it: an admitted challenge expires within
+/// [`MAX_CHALLENGE_LIFETIME_SECS`] of its prepare, which is the bound the
+/// store's replay horizon relies on after it loses a record.
+fn challenge_expiry(object: &Map<String, Value>, now_unix: i64) -> Result<i64, MppError> {
     let maximum = now_unix
         .checked_add(MAX_CHALLENGE_LIFETIME_SECS)
         .ok_or_else(invalid_challenge)?;
-    let expiry = object.get("expires").map_or(Ok(maximum), |value| {
-        let text = value.as_str().ok_or_else(invalid_challenge)?;
-        validate_short_field(text)?;
-        OffsetDateTime::parse(text, &Rfc3339)
-            .map(|timestamp| timestamp.unix_timestamp().min(maximum))
-            .map_err(|_error| invalid_challenge())
+    let value = object.get("expires").ok_or_else(|| {
+        MppError::new(
+            MppErrorCode::ChallengeInvalid,
+            "challenge carries no expiry; ask the payee for a challenge with an expires parameter",
+        )
     })?;
+    let text = value.as_str().ok_or_else(invalid_challenge)?;
+    validate_short_field(text)?;
+    let expiry = OffsetDateTime::parse(text, &Rfc3339)
+        .map_err(|_error| invalid_challenge())?
+        .unix_timestamp();
+    if expiry > maximum {
+        return Err(MppError::new(
+            MppErrorCode::ChallengeInvalid,
+            "challenge expires more than six minutes ahead",
+        ));
+    }
     if expiry.saturating_sub(now_unix) < MIN_CHALLENGE_LIFETIME_SECS {
         return Err(MppError::new(
             MppErrorCode::ChallengeExpired,
@@ -762,6 +784,8 @@ mod tests {
 
     const CONTRACT: &str = "CBIELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEIE3USCIHMXQDAMA";
     const ACCOUNT: &str = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF";
+    /// RFC 3339 form of the Unix timestamp 1_700_000_300.
+    const EXPIRES: &str = "2023-11-14T22:18:20Z";
 
     fn http_context() -> HttpRequestContext {
         HttpRequestContext::new(
@@ -791,7 +815,7 @@ mod tests {
             URL_SAFE_NO_PAD.encode(canonical_json(&request()).expect("canonical request"));
         ChallengeInput::Http {
             www_authenticate: vec![format!(
-                "Payment id=\"challenge-1\", realm=\"api.example.com\", method=\"stellar\", intent=\"charge\", request={encoded}"
+                "Payment id=\"challenge-1\", realm=\"api.example.com\", method=\"stellar\", intent=\"charge\", request={encoded}, expires=\"{EXPIRES}\""
             )],
             selected_challenge_id: None,
             context: http_context(),
@@ -814,6 +838,7 @@ mod tests {
             "realm": "server",
             "method": "stellar",
             "intent": "charge",
+            "expires": EXPIRES,
             "request": request
         })
     }
@@ -894,6 +919,7 @@ mod tests {
                 "realm": "server",
                 "method": "stellar",
                 "intent": "charge",
+                "expires": EXPIRES,
                 "request": invalid
             })],
             selected_challenge_id: None,
@@ -917,6 +943,7 @@ mod tests {
                 "realm": "server",
                 "method": "stellar",
                 "intent": "charge",
+                "expires": EXPIRES,
                 "request": request()
             })
         };
@@ -1037,7 +1064,7 @@ mod tests {
         let encoded = URL_SAFE_NO_PAD.encode(canonical_json(&request()).expect("request"));
         let http = |challenge_digest: &str| ChallengeInput::Http {
             www_authenticate: vec![format!(
-                "Payment id=one, realm=server, method=stellar, intent=charge, digest=\"{challenge_digest}\", request={encoded}"
+                "Payment id=one, realm=server, method=stellar, intent=charge, digest=\"{challenge_digest}\", request={encoded}, expires=\"{EXPIRES}\""
             )],
             selected_challenge_id: None,
             context: context.clone(),
@@ -1064,7 +1091,82 @@ mod tests {
     }
 
     #[test]
-    fn validates_expiry_and_caps_long_lived_challenges() {
+    fn a_challenge_without_expires_is_refused() {
+        let encoded =
+            URL_SAFE_NO_PAD.encode(canonical_json(&request()).expect("canonical request"));
+        let http = ChallengeInput::Http {
+            www_authenticate: vec![format!(
+                "Payment id=one, realm=server, method=stellar, intent=charge, request={encoded}"
+            )],
+            selected_challenge_id: None,
+            context: http_context(),
+        };
+        let mut challenge = mcp_challenge(request());
+        challenge
+            .as_object_mut()
+            .expect("challenge object")
+            .remove("expires");
+        for input in [http, mcp_input(vec![challenge], None)] {
+            let error = select_and_validate(&input, 1_700_000_000).expect_err("no expiry");
+            assert_eq!(error.code(), "mpp.challenge_invalid");
+            assert_eq!(
+                error.message(),
+                "challenge carries no expiry; ask the payee for a challenge with an expires parameter"
+            );
+        }
+    }
+
+    fn expiring_at(expires_unix: i64) -> ChallengeInput {
+        let mut challenge = mcp_challenge(request());
+        challenge["expires"] = Value::String(crate::sponsored::tests::rfc3339(expires_unix));
+        mcp_input(vec![challenge], None)
+    }
+
+    #[test]
+    fn a_challenge_expiring_past_the_lifetime_cap_is_refused() {
+        assert_eq!(MAX_CHALLENGE_LIFETIME_SECS, 6 * 60);
+        let now = 1_700_000_000;
+        for expires in [now + MAX_CHALLENGE_LIFETIME_SECS + 1, now + 3600] {
+            let error = select_and_validate(&expiring_at(expires), now).expect_err("late expiry");
+            assert_eq!(error.code(), "mpp.challenge_invalid");
+            assert_eq!(
+                error.message(),
+                "challenge expires more than six minutes ahead"
+            );
+        }
+    }
+
+    #[test]
+    fn a_challenge_at_the_lifetime_cap_keeps_its_own_expiry() {
+        let now = 1_700_000_000;
+        for expires in [
+            now + MAX_CHALLENGE_LIFETIME_SECS,
+            now + MIN_CHALLENGE_LIFETIME_SECS,
+        ] {
+            let selected =
+                select_and_validate(&expiring_at(expires), now).expect("expiry in the window");
+            assert_eq!(selected.effective_expires_at(), expires);
+        }
+    }
+
+    #[test]
+    fn a_reference_default_expiry_survives_a_fast_payee_clock() {
+        let now = 1_700_000_000;
+        let expires = now + 300 + 59;
+        let selected = select_and_validate(&expiring_at(expires), now).expect("reference default");
+        assert_eq!(selected.effective_expires_at(), expires);
+    }
+
+    #[test]
+    fn a_challenge_below_the_minimum_lifetime_is_expired() {
+        let now = 1_700_000_000;
+        let error = select_and_validate(&expiring_at(now + MIN_CHALLENGE_LIFETIME_SECS - 1), now)
+            .expect_err("too close to expiry");
+        assert_eq!(error.code(), "mpp.challenge_expired");
+    }
+
+    #[test]
+    fn refuses_malformed_and_elapsed_expiries() {
         let challenge_with_expiry = |expires: Value| {
             let mut challenge = mcp_challenge(request());
             challenge["expires"] = expires;
@@ -1077,12 +1179,6 @@ mod tests {
         ] {
             assert!(select_and_validate(&challenge_with_expiry(expires), 1_700_000_000).is_err());
         }
-        let selected = select_and_validate(
-            &challenge_with_expiry(Value::String("2099-01-01T00:00:00Z".to_owned())),
-            1_700_000_000,
-        )
-        .expect("long expiry is capped");
-        assert_eq!(selected.effective_expires_at(), 1_700_000_300);
         assert!(
             select_and_validate(&mcp_input(vec![mcp_challenge(request())], None), i64::MAX)
                 .is_err()
@@ -1199,7 +1295,7 @@ mod tests {
     fn rejects_noncanonical_and_oversized_http_request_payloads() {
         let input_for = |encoded: String| ChallengeInput::Http {
             www_authenticate: vec![format!(
-                "Payment id=one, realm=server, method=stellar, intent=charge, request={encoded}"
+                "Payment id=one, realm=server, method=stellar, intent=charge, request={encoded}, expires=\"{EXPIRES}\""
             )],
             selected_challenge_id: None,
             context: http_context(),
@@ -1255,7 +1351,7 @@ mod tests {
         assert!(encoded.len() > 2 * MAX_FIELD_BYTES);
         let input = ChallengeInput::Http {
             www_authenticate: vec![format!(
-                "Payment id=one, realm=server, method=stellar, intent=charge, request={encoded}"
+                "Payment id=one, realm=server, method=stellar, intent=charge, request={encoded}, expires=\"{EXPIRES}\""
             )],
             selected_challenge_id: None,
             context: http_context(),

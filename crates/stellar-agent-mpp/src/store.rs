@@ -484,9 +484,11 @@ impl MppAuthorizationStore {
     /// file rolled back before the reset loses the records written after it;
     /// [`MppStateReset::stale_carry`] reports a rollback the committed counter
     /// proves. A stale carry and a discard both raise the pruned-expiry
-    /// watermark to the challenge lifetime cap past `now_unix`, so a challenge
-    /// whose marker is lost is refused while it can still be live. The audit
-    /// row precedes every mutation.
+    /// watermark to the challenge lifetime cap past `now_unix`. Every admitted
+    /// challenge expires within that cap of its prepare and keeps its own
+    /// expiry, so the horizon covers every lost record and a challenge whose
+    /// marker is lost is refused while it can still be live. The audit row
+    /// precedes every mutation.
     ///
     /// # Errors
     ///
@@ -567,8 +569,9 @@ impl MppAuthorizationStore {
         };
         audit(&outcome)?;
         // A record the reset cannot carry belongs to a challenge prepared
-        // before the reset, and its effective expiry lies at most the
-        // challenge lifetime cap past its preparation.
+        // before the reset. Admission holds that challenge's own expiry within
+        // the lifetime cap of its prepare, so this horizon covers every lost
+        // record, and a challenge with a later expiry is a different one.
         let lost_marker_horizon = now_unix.saturating_add(MAX_CHALLENGE_LIFETIME_SECS);
         if let Some(mut wire) = carried {
             if outcome.stale_carry {
@@ -1520,7 +1523,7 @@ fn find_prepare_match<'a>(
     if selected.is_none() && record.expires_at() <= wire.pruned_through {
         return Err(MppError::new(
             MppErrorCode::ChallengeExpired,
-            "challenge expires no later than an authorization this store has pruned; check the host clock",
+            "challenge expires within the replay horizon of a state reset or of pruned authorizations; ask the payee for a fresh challenge",
         ));
     }
     Ok(selected)
@@ -1780,7 +1783,9 @@ pub(crate) mod tests {
     mod generation;
 
     use super::*;
-    use crate::sponsored::tests::{prepared_fixture, prepared_fixture_for_resource};
+    use crate::sponsored::tests::{
+        prepared_fixture, prepared_fixture_expiring, prepared_fixture_for_resource,
+    };
     use crate::{ReceiptInput, parse_receipt};
     use serde_json::Value;
     use stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE;
@@ -2562,10 +2567,11 @@ pub(crate) mod tests {
             .mark_delivery_pending(id, [3; 32], now)
             .expect("delivery");
         store.mark_authorized(id, now).expect("authorized");
-        let (prepared, _, _) = prepared_fixture(now + 10).await;
+        let (prepared, _, _) =
+            prepared_fixture_expiring(now + 10, now + MAX_CHALLENGE_LIFETIME_SECS).await;
         let later = AuthorizationRecord::new("replay", TESTNET_PASSPHRASE, &prepared, now + 10)
             .expect("later");
-        assert_ne!(first.fingerprint(), later.fingerprint());
+        assert_eq!(first.fingerprint(), later.fingerprint());
         assert_eq!(
             store
                 .insert_prepared(later, now + 10)
@@ -2587,7 +2593,49 @@ pub(crate) mod tests {
         let first =
             AuthorizationRecord::new("replay", TESTNET_PASSPHRASE, &prepared, now).expect("first");
         store.insert_prepared(first.clone(), now).expect("insert");
-        let (prepared, _, _) = prepared_fixture(now + 10).await;
+        let (prepared, _, _) =
+            prepared_fixture_expiring(now + 10, now + MAX_CHALLENGE_LIFETIME_SECS).await;
+        let later = AuthorizationRecord::new("replay", TESTNET_PASSPHRASE, &prepared, now + 10)
+            .expect("later");
+        assert_eq!(first.fingerprint(), later.fingerprint());
+        assert_eq!(
+            store
+                .insert_prepared(later, now + 10)
+                .expect("reuse")
+                .authorization_id(),
+            first.authorization_id()
+        );
+        assert_eq!(store.read_for_test().expect("store").records.len(), 1);
+    }
+
+    /// `prepared` with `expires_at` as the expiry its record stores.
+    fn with_stored_expiry(
+        prepared: &crate::sponsored::PreparedSponsoredCharge,
+        expires_at: i64,
+    ) -> crate::sponsored::PreparedSponsoredCharge {
+        let mut stored = serde_json::to_value(prepared.to_stored().expect("stored")).expect("json");
+        stored["selected"]["effective_expires_at"] = Value::from(expires_at);
+        crate::sponsored::PreparedSponsoredCharge::from_stored(
+            serde_json::from_value(stored).expect("stored shape"),
+        )
+        .expect("prepared")
+    }
+
+    /// The replay identity covers the exact challenge and not the expiry a
+    /// record stores, so a stored expiry that differs from the challenge's own
+    /// still matches.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_stored_expiry_does_not_split_the_challenge_identity() {
+        stellar_agent_test_support::keyring_mock::install().expect("mock keyring store");
+        let directory = TempDir::new().expect("tempdir");
+        let store = test_store(directory.path().join("state"), [7; 32]);
+        let now = 1_700_000_000;
+        let (prepared, _, _) = prepared_fixture_expiring(now, now + 330).await;
+        let stored = with_stored_expiry(&prepared, now + 300);
+        let first =
+            AuthorizationRecord::new("replay", TESTNET_PASSPHRASE, &stored, now).expect("first");
+        store.insert_prepared(first.clone(), now).expect("insert");
         let later = AuthorizationRecord::new("replay", TESTNET_PASSPHRASE, &prepared, now + 10)
             .expect("later");
         assert_ne!(first.fingerprint(), later.fingerprint());
@@ -2608,9 +2656,11 @@ pub(crate) mod tests {
         let directory = TempDir::new().expect("tempdir");
         let store = test_store(directory.path().join("state"), [7; 32]);
         let now = 1_700_000_000;
+        let (prepared, _, _) = prepared_fixture(now).await;
         let mut records = Vec::new();
         for offset in [0, 10, 20] {
-            let (prepared, _, _) = prepared_fixture(now + offset).await;
+            let prepared =
+                with_stored_expiry(&prepared, now + offset + MAX_CHALLENGE_LIFETIME_SECS);
             let mut record =
                 AuthorizationRecord::new("legacy", TESTNET_PASSPHRASE, &prepared, now + offset)
                     .expect("record");
@@ -2639,14 +2689,15 @@ pub(crate) mod tests {
                 .authorization_id(),
             records[1].authorization_id()
         );
+        let past_every_expiry = now + 20 + MAX_CHALLENGE_LIFETIME_SECS + 1;
         let latest = store
-            .find_for_prepare(&records[0], now + 400)
+            .find_for_prepare(&records[0], past_every_expiry)
             .expect("matching records")
             .expect("newest match");
         assert_eq!(latest.authorization_id(), records[2].authorization_id());
         assert_eq!(
             store
-                .insert_prepared(records[0].clone(), now + 400)
+                .insert_prepared(records[0].clone(), past_every_expiry)
                 .expect_err("all consumed or expired")
                 .code(),
             "mpp.authorization_replayed"
@@ -2701,7 +2752,7 @@ pub(crate) mod tests {
         store.insert_prepared(record.clone(), now).expect("insert");
         assert_eq!(
             store
-                .prune(now + 301 + TERMINAL_RETENTION_SECS)
+                .prune(now + MAX_CHALLENGE_LIFETIME_SECS + 1 + TERMINAL_RETENTION_SECS)
                 .expect("prune"),
             1
         );
@@ -2717,10 +2768,34 @@ pub(crate) mod tests {
             assert_eq!(error.code(), "mpp.challenge_expired");
             assert_eq!(
                 error.message(),
-                "challenge expires no later than an authorization this store has pruned; check the host clock"
+                "challenge expires within the replay horizon of a state reset or of pruned authorizations; ask the payee for a fresh challenge"
             );
         }
         assert!(reopened.read_for_test().expect("store").records.is_empty());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn the_horizon_refusal_names_no_clock_fault() {
+        stellar_agent_test_support::keyring_mock::install().expect("mock keyring store");
+        let directory = TempDir::new().expect("tempdir");
+        let store = test_store(directory.path().join("state"), [7; 32]);
+        let now = 1_700_000_000;
+        let (prepared, _, _) = prepared_fixture(now).await;
+        let record =
+            AuthorizationRecord::new("clock", TESTNET_PASSPHRASE, &prepared, now).expect("record");
+        store.insert_prepared(record.clone(), now).expect("insert");
+        store
+            .prune(now + MAX_CHALLENGE_LIFETIME_SECS + 1 + TERMINAL_RETENTION_SECS)
+            .expect("prune");
+        let error = store
+            .find_for_prepare(&record, now)
+            .expect_err("a pruned challenge is refused");
+        assert_eq!(
+            error.message(),
+            "challenge expires within the replay horizon of a state reset or of pruned authorizations; ask the payee for a fresh challenge"
+        );
+        assert!(!error.message().contains("clock"));
     }
 
     #[tokio::test]
@@ -2783,7 +2858,6 @@ pub(crate) mod tests {
             AuthorizationRecord::new("expired", TESTNET_PASSPHRASE, &prepared, now).expect("first");
         store.insert_prepared(first.clone(), now).expect("insert");
         let later_at = first.expires_at() + 1;
-        let (prepared, _, _) = prepared_fixture(later_at).await;
         let later = AuthorizationRecord::new("expired", TESTNET_PASSPHRASE, &prepared, later_at)
             .expect("later");
         let error = store
@@ -3321,14 +3395,19 @@ pub(crate) mod tests {
         let id = record.authorization_id().to_owned();
         store.insert_prepared(record, now).expect("insert");
 
-        assert_eq!(store.prune(now + 301).expect("retain marker"), 0);
+        assert_eq!(
+            store
+                .prune(now + MAX_CHALLENGE_LIFETIME_SECS + 1)
+                .expect("retain marker"),
+            0
+        );
         assert_eq!(
             store.load(&id).expect("terminal marker").status(),
             AuthorizationStatus::ExpiredUnresolved
         );
         assert_eq!(
             store
-                .prune(now + 301 + TERMINAL_RETENTION_SECS)
+                .prune(now + MAX_CHALLENGE_LIFETIME_SECS + 1 + TERMINAL_RETENTION_SECS)
                 .expect("remove old terminal marker"),
             1
         );
@@ -3536,7 +3615,11 @@ pub(crate) mod tests {
         let expiring = insert_ready("expiring").await;
         assert_eq!(
             store
-                .claim_ready(&expiring, now + 271)
+                .claim_ready(
+                    &expiring,
+                    now + MAX_CHALLENGE_LIFETIME_SECS - crate::limits::MIN_CHALLENGE_LIFETIME_SECS
+                        + 1
+                )
                 .expect_err("too close to expiry")
                 .code(),
             "mpp.challenge_expired"

@@ -1508,10 +1508,15 @@ mod tests {
         });
         let encoded = URL_SAFE_NO_PAD
             .encode(stellar_agent_mpp::json::canonical_json(&request).expect("canonical request"));
+        let expires_unix = u64::try_from(now_unix() + 300).expect("positive clock");
+        let expires = stellar_agent_core::timefmt::format_rfc3339_utc(
+            std::time::UNIX_EPOCH + std::time::Duration::from_secs(expires_unix),
+        );
         ChallengeInput::Http {
             www_authenticate: vec![format!(
                 "Payment id=\"cli-challenge-{round}\", realm=\"merchant.example\", \
-                 method=\"stellar\", intent=\"charge\", request={encoded}"
+                 method=\"stellar\", intent=\"charge\", request={encoded}, \
+                 expires=\"{expires}\""
             )],
             selected_challenge_id: None,
             context: stellar_agent_mpp::HttpRequestContext::new(

@@ -960,7 +960,7 @@ toolset-routable.
 
 | Tool | Required arguments | Result |
 |---|---|---|
-| `stellar_mpp_charge_prepare` | `profile`, tagged `challenge` | Redacted exact-term preview, authorization ID, process nonce and expiry. Never signs. |
+| `stellar_mpp_charge_prepare` | `profile`, tagged `challenge` | Redacted exact-term preview, authorization ID, process nonce and expiry. Never signs. The challenge needs an `expires` at most six minutes ahead. |
 | `stellar_mpp_charge_commit` | `authorization_id`, `nonce`, `expires_at_unix_ms` | One sensitive HTTP/native-MCP credential. Accepts no replacement terms. |
 | `stellar_mpp_record_receipt` | `authorization_id`, tagged `receipt` | Host-observation state only, not settlement proof. |
 | `stellar_mpp_reconcile_transaction` | `authorization_id`, lowercase 64-hex `transaction_hash` | Verified `settled`/`failed` outcome and ledger. |

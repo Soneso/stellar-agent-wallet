@@ -9868,7 +9868,7 @@ pub(crate) mod tests {
             let selected = select_and_validate(
             &ChallengeInput::Http {
                 www_authenticate: vec![format!(
-                    "Payment id=one, realm=merchant, method=stellar, intent=charge, request={encoded}"
+                    "Payment id=one, realm=merchant, method=stellar, intent=charge, request={encoded}, expires=\"2023-11-14T22:14:20Z\""
                 )],
                 selected_challenge_id: None,
                 context: HttpRequestContext::new(

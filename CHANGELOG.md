@@ -581,6 +581,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   for a native key in `[cross_check_thresholds]` and for a failed read or send
   at the primary endpoint. It also names the commands that read
   `classic_fee_per_op_stroops`.
+- A payee that omits `expires` from an MPP challenge or sets it more than six
+  minutes ahead is not supported. `stellar_agent_mpp::limits::MAX_CHALLENGE_LIFETIME_SECS`
+  is 360 seconds.
 
 ### Removed
 
@@ -741,7 +744,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   its record is retained. A pruned-expiry watermark refuses challenges at or below
   removed expiries after a host-clock regression. An MPP state reset that
   discards history, or carries a snapshot the generation counter proves rolled
-  back, raises the watermark to five minutes past the reset, so a challenge
+  back, raises the watermark to six minutes past the reset, so a challenge
   whose record it lost is refused while it can still be live.
 - Operator registration validates a server-issued challenge, the exact
   origin, the relying-party hash, user presence and verification, and the
@@ -956,6 +959,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   GHSA-mrwp-f3q8-3g9p affects `follow-redirects` before 1.16.2. The
   harnesses compare the wallet's fixtures with the released JavaScript SDKs
   in CI, and no wallet crate depends on them.
+- An MPP challenge needs an `expires` parameter at most six minutes ahead; a
+  challenge without one, or with a later one, is refused with
+  `mpp.challenge_invalid` instead of receiving a default or a shortened expiry.
+  A state reset or a prune therefore refuses every challenge whose replay record
+  it may have lost for as long as an authorization for it can be live. The
+  refusal names the replay horizon and asks for a fresh challenge.
 
 ## [0.1.0-alpha.13] - 2026-10-31
 

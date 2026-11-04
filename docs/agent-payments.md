@@ -46,7 +46,7 @@ An HTTP CLI input has this shape:
 {
   "transport": "http",
   "www_authenticate": [
-    "Payment id=\"order-7\", realm=\"merchant.example\", method=\"stellar\", intent=\"charge\", request=<base64url-json>"
+    "Payment id=\"order-7\", realm=\"merchant.example\", method=\"stellar\", intent=\"charge\", request=<base64url-json>, expires=\"<rfc3339-time>\""
   ],
   "selected_challenge_id": "order-7",
   "context": {
@@ -61,9 +61,10 @@ An HTTP CLI input has this shape:
 
 Input is strict and bounded. Unknown members, duplicate JSON members or auth
 parameters, ambiguous supported challenges, non-canonical amounts, invalid
-addresses, cross-origin resources, unsupported modes, and expired or near-expiry
-challenges fail before signing. Examples use synthetic account values; obtain
-real testnet terms from the server challenge.
+addresses, cross-origin resources, unsupported modes, challenges without an
+`expires`, challenges that expire more than six minutes ahead, and expired or
+near-expiry challenges fail before signing. Examples use synthetic account
+values; obtain real testnet terms from the server challenge.
 
 ## CLI workflow
 
@@ -255,12 +256,16 @@ The carried snapshot is the one on disk. If the state file was rolled back to
 an older copy before the reset, the records written after that copy are lost.
 When the generation counter proves such a rollback, the result sets
 `stale_carry` and names it in `warnings`. Challenges those lost records answered
-are refused while they can still be live: for five minutes after the reset, a
-challenge expiring within that window returns `mpp.challenge_expired`.
+are refused while they can still be live: for six minutes after the reset, a
+challenge expiring within that window returns `mpp.challenge_expired`. The
+window holds for every challenge, because every admitted challenge expires
+within six minutes of its prepare. A fresh challenge prepares once its expiry
+lies past the window, so a payee's five-minute challenge prepares from about one
+minute after the reset.
 
 When no snapshot authenticates, reset discards every replay marker, rotates the
 state key, and starts an empty store above both trusted generation counters,
-with the same five-minute refusal window.
+with the same six-minute refusal window.
 A charge settled before that reset loses its settled status. A keyring or file
 access error refuses the reset and changes nothing; retry once the error
 clears. A state file that authenticates while the committed counter is missing
@@ -284,11 +289,11 @@ Discarding resets and resumed adoptions have these recovery cases:
   state file out of the MPP state directory and run the reset to discard.
 
 Repeated prepare matches the exact challenge, payer, and request context,
-independently of preparation time. Prune retains the largest expiry it removes
-and refuses new challenges expiring at or below that watermark with a host-clock
-message. Once a record is pruned, a challenge with a distant or absent expiry
-can prepare again under a correct clock. Replay protection is bounded by record
-retention; a payee can also issue a fresh challenge at any time.
+independently of preparation time. Prune keeps the largest expiry it removes and
+refuses a challenge expiring at or below it with `mpp.challenge_expired`. The
+refusal names the replay horizon and asks for a fresh challenge. A challenge's
+expiry never moves, so a pruned challenge stays refused; a payee can issue a
+fresh challenge at any time.
 
 `mpp state prune` on a profile with no MPP history succeeds with `pruned: 0`
 and records the maintenance request in the audit log, the same as pruning a
