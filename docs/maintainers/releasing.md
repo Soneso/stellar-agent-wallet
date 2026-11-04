@@ -76,6 +76,7 @@ No job that holds a credential compiles code or runs dependency code.
 | `release.yml` | `provenance` | OIDC token, `contents: write` | no |
 | `release.yml` | `publish` | `contents: write` | no |
 | `publish.yml` | `verify` | none | yes |
+| `publish.yml` | `vendored-wasm` | none | yes |
 | `publish.yml` | `publish` | OIDC token for crates.io, in `crates-io` | no |
 | `publish.yml` | `verify-install` | none | yes |
 | `notarize-smoke.yml` | `build` | none | yes |
@@ -231,7 +232,12 @@ gh workflow run publish.yml --ref main -f tag=v<version>
   which builds and packages every workspace member, the unpublished
   acceptance member included. It uploads the archive checksums as
   `SHA256SUMS` and holds no credential.
-- `publish` starts after the `crates-io` approval. It regenerates the archives
+- `vendored-wasm` rebuilds every vendored contract Wasm file of the tag's
+  verified commit from its pinned source with the pinned tools and compares
+  the bytes. It holds no credential and builds both stellar-cli binaries
+  from source.
+- `publish` starts only after that rebuild passes and the `crates-io` approval.
+  It refuses a tag that moves after verification. It regenerates the archives
   without building and requires them to equal `SHA256SUMS`. It then mints a
   short-lived token through Trusted Publishing and uploads each crate with
   `cargo publish --no-verify`.
@@ -244,12 +250,14 @@ gh workflow run publish.yml --ref main -f tag=v<version>
 `-f verify_only=true` runs only `verify`, for example to rehearse a tag before
 the approval.
 
-Both jobs package the tag's tree and run the scripts of the commit the
-dispatch runs on, which is `main` for a publish. The tier lists in
-`publish-crates.sh` must match the tag's publishable workspace members, so a
-tag with another member set stops before any upload. Every tag up to
-`v0.1.0-alpha.9` has another member set, so none of them can be published
-again through this workflow.
+The `verify` and `publish` jobs package the tag's tree and run the scripts of
+the commit the dispatch runs on, which is `main` for a publish. The
+`vendored-wasm` job runs the rebuild script of the tagged commit, so a tag
+whose script does not accept the `publication` ref type stops at that gate.
+The tier lists in `publish-crates.sh` must match the tag's publishable
+workspace members, so a tag with another member set stops before any upload.
+Every tag up to `v0.1.0-alpha.9` has another member set, so none of them can be
+published again through this workflow.
 
 ## Publish a new crate for the first time
 
@@ -356,6 +364,10 @@ markers. Archive and host checks also refuse either test-override literal,
 verification and on the vendored Wasm rebuild of the tagged commit, so
 signing and provenance wait for that rebuild. Publication depends on the
 provenance content check, the source discipline check, and the rebuild.
+Crate publication also requires a rebuild of every vendored Wasm file of the
+verified tag's commit from its pinned source with pinned tools and matching
+bytes. A failed, cancelled or skipped rebuild stops it before the registry
+credential is requested.
 
 The generic SLSA generator records source identity and checksum subjects.
 It records the `vars` context, which holds the repository, organization, and

@@ -364,8 +364,8 @@ SUMS_STEP = (
     "      - name: Verify the publication archives\n"
     '        run: bash .github/scripts/release/verify-sums.sh "$RUNNER_TEMP/release"\n'
 )
-TAG_GUARD = "        if: github.ref_type != 'tag'\n"
-SAVE_GUARD = "        if: github.ref_type != 'tag' && steps.restore.outputs.cache-hit != 'true'\n"
+TAG_GUARD = "        if: github.ref_type != 'tag' && !inputs.publication\n"
+SAVE_GUARD = "        if: github.ref_type != 'tag' && !inputs.publication && steps.restore.outputs.cache-hit != 'true'\n"
 BUILD_TOOLCHAIN = "          toolchain: ${{ env.RELEASE_TOOLCHAIN }}\n          targets: ${{ matrix.target }}\n"
 RELEASE_LAST_LINE = "            release-provenance/*.intoto.jsonl\n"
 BUILD_PYTHON = (
@@ -387,6 +387,17 @@ WASM_GATE_RUN = ('        run: bash .github/scripts/rebuild-vendored-wasm.sh --g
                  '"$REBUILD_JOB" "$REF_TYPE"\n')
 WASM_DECIDE_RUN = '          echo "rebuild=$rebuild" >>"$GITHUB_OUTPUT"\n'
 
+PUBLISH_WASM_CALL = live_text(PUBLISH, re.compile(r"  vendored-wasm:\n.*?(?=  publish:)", re.DOTALL),
+                              "publication Wasm call")
+PUBLISH_SOURCE_STEP = live_text(PUBLISH, re.compile(
+    r"      - name: Require the verified source commit\n.*?\n\n", re.DOTALL), "verified source step")
+WASM_REBUILD_CHECKOUT = live_text(WASM, re.compile(
+    r"  rebuild:\n.*?          ref: \$\{\{ inputs.source_sha \}\}\n", re.DOTALL), "rebuild source checkout")
+SOURCE_REF = "          ref: ${{ inputs.source_sha }}\n"
+PUBLICATION_WITH = "      source_sha: ${{ needs.verify.outputs.sha }}\n      publication: true\n"
+PUBLICATION_HEAD = '            if [ "$(git rev-parse HEAD)" != "$SOURCE_SHA" ]; then\n'
+PUBLICATION_REF_TYPE = "          REF_TYPE: ${{ inputs.publication && 'publication' || github.ref_type }}\n"
+
 
 # Insertion points for a vars reference in release.yml, the workflow it
 # calls and the signing action it uses, and the vendored-wasm tree check
@@ -406,8 +417,10 @@ VARS_LOCATIONS = (
 # label, [(file, old, new, expected occurrences)];
 # the edited copy must pass.
 PASSING = [
+    ("publication call inputs in another order pass", [
+        (PUBLISH, PUBLICATION_WITH, "      publication: true\n      source_sha: ${{ needs.verify.outputs.sha }}\n", 1)]),
     ("wrapped tag cache guard passes", [
-        (WASM, TAG_GUARD, "        if: ${{ github.ref_type != 'tag' }}\n", 2)]),
+        (WASM, TAG_GUARD, "        if: ${{ github.ref_type != 'tag' && !inputs.publication }}\n", 2)]),
     ("wrapped Wasm rebuild and gate conditions pass", [
         (WASM, WASM_REBUILD_IF,
          "    needs: [check, stellar-cli-25, stellar-cli-28]\n    if: ${{ needs.check.outputs.rebuild == 'true' }}\n", 1),
@@ -443,6 +456,53 @@ PASSING = [
 # replaces only the first occurrence. A case that expects several lines gives
 # tuples of rules and fragments of the same length, in output order.
 CASES = [
+    ("crate publish without Wasm dependency", "publish-wasm-gate", "publish must need verify and vendored-wasm", [
+        (PUBLISH, "needs: [verify, vendored-wasm]", "needs: verify", 1)]),
+    ("crate Wasm call uses another workflow", "publish-wasm-gate", "must call the local workflow", [
+        (PUBLISH, "uses: ./.github/workflows/vendored-wasm.yml", "uses: ./.github/workflows/ci.yml", 1)]),
+    ("crate Wasm call needs another job", "publish-wasm-gate", "must need exactly verify", [
+        (PUBLISH, PUBLISH_WASM_CALL, PUBLISH_WASM_CALL.replace("needs: verify", "needs: [verify, verify-install]"), 1)]),
+    ("crate Wasm call uses event SHA", "publish-wasm-gate", "must pass exactly the verified source SHA", [
+        (PUBLISH, PUBLICATION_WITH, PUBLICATION_WITH.replace("needs.verify.outputs.sha", "github.sha"), 1)]),
+    ("crate Wasm call without publication", "publish-wasm-gate", "must pass exactly the verified source SHA", [
+        (PUBLISH, "      publication: true\n", "", 1)]),
+    ("crate Wasm call continues on error", "publish-wasm-gate", "must set no secrets or continue-on-error", [
+        (PUBLISH, PUBLISH_WASM_CALL, PUBLISH_WASM_CALL + "    continue-on-error: true\n", 1)]),
+    ("crate Wasm call inherits secrets", "publish-wasm-gate", "must set no secrets or continue-on-error", [
+        (PUBLISH, PUBLISH_WASM_CALL, PUBLISH_WASM_CALL + "    secrets: inherit\n", 1)]),
+    ("crate publish on always", "publish-wasm-gate", "publish must run exactly on !inputs.verify_only", [
+        (PUBLISH, "needs: [verify, vendored-wasm]\n    if: ${{ !inputs.verify_only }}",
+         "needs: [verify, vendored-wasm]\n    if: ${{ always() && !inputs.verify_only }}", 1)]),
+    ("crate Wasm call on always", ("publish-wasm-gate", "release-check-unconditional"),
+     ("vendored-wasm must run exactly on !inputs.verify_only", "vendored-wasm can be bypassed"), [
+        (PUBLISH, PUBLISH_WASM_CALL,
+         PUBLISH_WASM_CALL.replace("${{ !inputs.verify_only }}", "${{ always() && !inputs.verify_only }}"), 1)]),
+    ("Wasm source input wrong default", "publish-wasm-gate", "must declare optional source_sha", [
+        (WASM, "        default: ''\n", "        default: main\n", 1)]),
+    ("Wasm publication input wrong type", "publish-wasm-gate", "must declare optional publication", [
+        (WASM, "        type: boolean\n", "        type: string\n", 1)]),
+    ("Wasm rebuild checkout without source", "publish-wasm-gate", "rebuild checkout must use inputs.source_sha", [
+        (WASM, WASM_REBUILD_CHECKOUT, WASM_REBUILD_CHECKOUT.replace(SOURCE_REF, ""), 1)]),
+    ("Wasm check checkout without source", "publish-wasm-gate", "check checkout must use inputs.source_sha", [
+        (WASM, SOURCE_REF, "", 3)]),
+    ("Wasm gate checkout without source", "publish-wasm-gate", "vendored-wasm checkout must use inputs.source_sha", [
+        (WASM, SOURCE_REF + "          persist-credentials: false\n" + WASM_GATE_STEP,
+         "          persist-credentials: false\n" + WASM_GATE_STEP, 1)]),
+    ("Wasm cache without publication guard", ("publish-wasm-gate", "release-wasm-gate"),
+     ("cache guard must lead", "cache guard must lead"), [
+        (WASM, TAG_GUARD, "        if: github.ref_type != 'tag'\n", 2)]),
+    ("Wasm gate uses event ref type", "release-wasm-gate", "gate step must read each job result and the ref type", [
+        (WASM, PUBLICATION_REF_TYPE, "          REF_TYPE: ${{ github.ref_type }}\n", 1)]),
+    ("Wasm decide without publication env", "publish-wasm-gate", "decide must read PUBLICATION and SOURCE_SHA", [
+        (WASM, "          PUBLICATION: ${{ inputs.publication }}\n", "", 1)]),
+    ("Wasm decide without source env", "publish-wasm-gate", "decide must read PUBLICATION and SOURCE_SHA", [
+        (WASM, "          SOURCE_SHA: ${{ inputs.source_sha }}\n", "", 1)]),
+    ("Wasm decide without HEAD comparison", "publish-wasm-gate", "decide must compare HEAD with SOURCE_SHA", [
+        (WASM, PUBLICATION_HEAD, "            if false; then\n", 1)]),
+    ("crate publish without verified source guard", "credential-order", "no step before rust-lang/crates-io-auth-action runs [ \"$(git -C src", [
+        (PUBLISH, PUBLISH_SOURCE_STEP, "", 1)]),
+    ("crate publish echoes verified source", "credential-order", "no step before rust-lang/crates-io-auth-action runs [ \"$(git -C src", [
+        (PUBLISH, '[ "$(git -C src rev-parse HEAD)" = "$VERIFIED_SHA" ]', 'echo "$VERIFIED_SHA"', 1)]),
     ("release build cache", "release-cache", "uses Swatinem/rust-cache", [
         (RELEASE, RELEASE_BUILD_STEP, CACHE_STEP + RELEASE_BUILD_STEP, 1)]),
     ("rehearsal build cache", "release-cache", "uses Swatinem/rust-cache", [
@@ -515,7 +575,8 @@ CASES = [
     ("publication without Wasm dependency", "release-wasm-gate", "publish must need vendored-wasm", [
         (RELEASE, "needs: [preflight, vendored-wasm, build, sign-macos, sign,", "needs: [preflight, build, sign-macos, sign,", 1)]),
     ("Wasm workflow not callable", "release-wasm-gate", "workflow_call is absent", [
-        (WASM, "  workflow_call:\n", "", 1)]),
+        (WASM, live_text(WASM, re.compile(r"  workflow_call:\n.*?(?=  pull_request:)", re.DOTALL),
+                          "workflow call inputs"), "", 1)]),
     ("Wasm restore without tag guard", "release-wasm-gate", "cache guard must lead", [
         (WASM, TAG_GUARD, "", 2)]),
     ("Wasm save with trailing tag guard", "release-wasm-gate", "cache guard must lead", [
@@ -652,7 +713,7 @@ CASES = [
      'notarize-smoke.yml:build step 1: checkout-credentials: actions/checkout without persist-credentials: false', [
         (SMOKE, "        with:\n          persist-credentials: false\n", "", 2)]),
     ("input interpolated into a run block", "run-inputs",
-     'publish.yml:verify step 10 (Build and package every crate): run-inputs: run: reads ${{ inputs.tag }}', [
+     'publish.yml:verify step 11 (Build and package every crate): run-inputs: run: reads ${{ inputs.tag }}', [
         (PUBLISH, "          cargo package --workspace --locked\n",
          "        run: echo \"${{ inputs.tag }}\" && cargo package --workspace --locked\n", 1)]),
     ("job output interpolated into a credentialed run block", "cred-run-outputs",
@@ -660,7 +721,7 @@ CASES = [
         (RELEASE, 'if [[ "$VERSION" == *-* ]]; then',
          'if [[ "${{ needs.preflight.outputs.version }}" == *-* ]]; then', 1)]),
     ("step output interpolated into a credentialed run block", "cred-run-outputs",
-     "publish.yml:publish step 11 (Require the archives to equal the verify job's checksums): cred-run-outputs: run: reads ${{ steps.tag.outputs.version }}", [
+     "publish.yml:publish step 12 (Require the archives to equal the verify job's checksums): cred-run-outputs: run: reads ${{ steps.tag.outputs.version }}", [
         (PUBLISH, '"$RUNNER_TEMP/publish-target/package" "$VERSION"',
          '"$RUNNER_TEMP/publish-target/package" "${{ steps.tag.outputs.version }}"', 1)]),
     ("job output passed to an action in a credentialed job", "cred-with-needs",
@@ -696,15 +757,15 @@ CASES = [
         (RELEASE, "          path: ${{ runner.temp }}/artifacts\n",
          "          path: ${{ runner.temp }}/../work/artifacts\n", 1)]),
     ("credentialed download without a path", "cred-download-path",
-     'publish.yml:publish step 8: cred-download-path: downloads to the workspace', [
+     'publish.yml:publish step 9: cred-download-path: downloads to the workspace', [
         (PUBLISH, "          name: verify-sums\n          path: ${{ runner.temp }}/verify\n",
          "          name: verify-sums\n", 1)]),
     ("publish job downloads verify-crates", "verify-crates-download",
-     'publish.yml:publish step 8: verify-crates-download: can download verify-crates', [
+     'publish.yml:publish step 9: verify-crates-download: can download verify-crates', [
         (PUBLISH, "          name: verify-sums\n          path: ${{ runner.temp }}/verify\n",
          "          name: verify-crates\n          path: ${{ runner.temp }}/verify\n", 1)]),
     ("publish job downloads by a pattern that matches verify-crates", "verify-crates-download",
-     'publish.yml:publish step 8: verify-crates-download: can download verify-crates', [
+     'publish.yml:publish step 9: verify-crates-download: can download verify-crates', [
         (PUBLISH, "          name: verify-sums\n          path: ${{ runner.temp }}/verify\n",
          "          pattern: verify-*\n          path: ${{ runner.temp }}/verify\n", 1)]),
     ("publish job mints the token without the checksum comparison", "credential-order",
@@ -859,6 +920,8 @@ CASES = [
     ("publish checkout without a ref", "publish-tag-ref",
      "publish.yml:verify step 3: publish-tag-ref: checkout ref '' is neither refs/tags/... nor github.workflow_sha", [
         (PUBLISH, "          ref: ${{ github.workflow_sha }}\n", "", 3)]),
+    ("another local workflow call in publish.yml", "publish-tag-ref", "no checkout of refs/tags/...", [
+        (PUBLISH, PUBLISH_WASM_CALL, PUBLISH_WASM_CALL + "  extra:\n    needs: verify\n    uses: ./.github/workflows/ci.yml\n\n", 1)]),
     ("release preflight without the ancestry check", "ancestry-check",
      'release.yml:preflight: ancestry-check: no line runs check-ref-on-main.sh as its command', [
         (RELEASE, '      - name: Refuse a tag whose commit is not on main\n'
@@ -898,7 +961,7 @@ CASES = [
         (PUBLISH, '"$GITHUB_WORKSPACE/wf/.github/scripts/check-ref-on-main.sh" "$(git rev-parse HEAD)"',
          'true', 2)]),
     ("publish job checks the dispatch commit", "ancestry-check",
-     "publish.yml:publish step 6 (Refuse a tag whose commit is not on main): ancestry-check: passes the dispatch commit, not the tag's HEAD", [
+     "publish.yml:publish step 7 (Refuse a tag whose commit is not on main): ancestry-check: passes the dispatch commit, not the tag's HEAD", [
         (PUBLISH, '"$GITHUB_WORKSPACE/wf/.github/scripts/check-ref-on-main.sh" "$(git rev-parse HEAD)"\n'
                   '\n      - name: Verify every workspace member carries the tag\'s version\n'
                   '        working-directory: src\n        env:\n          TAG_VERSION: ${{ steps.tag.outputs.version }}\n'
@@ -1337,6 +1400,62 @@ CASES = [
 # replacement, and the CASES or PASSING labels that must fail against the
 # mutated copy and pass against the restored one.
 MUTATIONS = {
+    "publish-wasm-call-check": (
+        '        self.check_publish_wasm_gate()\n', '',
+        ['crate publish without Wasm dependency']),
+    "publish-wasm-needs": (
+        'if not {"verify", "vendored-wasm"}.issubset(publish.get("needs", [])):', 'if False:',
+        ['crate publish without Wasm dependency']),
+    "publish-wasm-local-call": (
+        'if call.get("uses") != "./.github/workflows/vendored-wasm.yml":', 'if False:',
+        ['crate Wasm call uses another workflow']),
+    "publish-wasm-call-needs": (
+        'if call.get("needs") not in ("verify", ["verify"]):', 'if False:',
+        ['crate Wasm call needs another job']),
+    "publish-wasm-condition": (
+        'if job.get("if") != "${{ !inputs.verify_only }}":', 'if False:',
+        ['crate publish on always', 'crate Wasm call on always']),
+    "publish-wasm-with": (
+        'if call.get("with") != {"source_sha": "${{ needs.verify.outputs.sha }}", "publication": True}:', 'if False:',
+        ['crate Wasm call uses event SHA', 'crate Wasm call without publication']),
+    "publish-wasm-no-secrets-or-continue": (
+        'if any(key in call for key in ("secrets", "continue-on-error")):', 'if False:',
+        ['crate Wasm call continues on error', 'crate Wasm call inherits secrets']),
+    "publish-wasm-inputs": (
+        'if inputs.get(name) != {"type": kind, "required": False, "default": default}:', 'if False:',
+        ['Wasm source input wrong default', 'Wasm publication input wrong type']),
+    "publish-wasm-checkouts": (
+        'if not checkouts or any((step.get("with") or {}).get("ref") != "${{ inputs.source_sha }}" for step in checkouts):', 'if False:',
+        ['Wasm rebuild checkout without source', 'Wasm check checkout without source', 'Wasm gate checkout without source']),
+    "publish-wasm-decide-env": (
+        'if env.get("PUBLICATION") != "${{ inputs.publication }}" or env.get("SOURCE_SHA") != "${{ inputs.source_sha }}":', 'if False:',
+        ['Wasm decide without publication env', 'Wasm decide without source env']),
+    "publish-wasm-decide-head": (
+        'if \'[ "$(git rev-parse HEAD)" != "$SOURCE_SHA" ]\' not in self.run_text(decide):', 'if False:',
+        ['Wasm decide without HEAD comparison']),
+    "publish-wasm-cache": (
+        '                        self.report(f"{workflow}:{name}", rule, f"cache guard must lead with {guard}")', '                        pass',
+        ['Wasm cache without publication guard']),
+    "release-wasm-publication-cache": (
+        '\n                guard = "github.ref_type != \'tag\' && !inputs.publication"\n',
+        '\n                guard = "github.ref_type != \'tag\'"\n',
+        ['Wasm cache without publication guard']),
+    "publish-wasm-gate-ref": (
+        '"REF_TYPE": "${{ inputs.publication && \'publication\' || github.ref_type }}",', '"REF_TYPE": "${{ github.ref_type }}",',
+        ['Wasm gate uses event ref type']),
+    "publish-verified-source-order": (
+        ', VERIFIED_SOURCE_CHECK), "compare-crate-sums.py"),', '), "compare-crate-sums.py"),',
+        ['crate publish without verified source guard', 'crate publish echoes verified source']),
+    "publish-local-call-exemption": (
+        'and tag_checkouts == 0 and job_id != "vendored-wasm":', 'and tag_checkouts == 0:',
+        ['publication call inputs in another order pass']),
+    "publish-local-call-scope": (
+        'and tag_checkouts == 0 and job_id != "vendored-wasm":',
+        'and tag_checkouts == 0 and not (not steps and str(job.get("uses", "")).startswith("./.github/workflows/")):',
+        ['another local workflow call in publish.yml']),
+    "publish-call-unconditional": (
+        '"publish.yml": ("verify", "vendored-wasm", "publish", "verify-install"),', '"publish.yml": ("verify", "publish", "verify-install"),',
+        ['crate Wasm call on always']),
     "release-vars-context": (
         "if VARS_CONTEXT.search(EXPRESSION_STRING.sub(\"''\", expression)):", "if False:",
         [f"vars context in {where}" for where, *_ in VARS_LOCATIONS]),
