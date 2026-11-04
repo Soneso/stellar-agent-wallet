@@ -399,7 +399,7 @@ async fn approve_mainnet(
     profile: &Profile,
 ) -> Result<MainnetApproved, WalletError> {
     render_summary(entry, context);
-    stellar_agent_core::approval::mpp::verify_mpp_entry_terms(&entry.kind)?;
+    stellar_agent_core::approval::verify_entry_terms(&entry.kind)?;
     if let Some(Err(error)) = classic_entry_summary(&entry.kind) {
         return Err(error);
     }
@@ -588,7 +588,7 @@ fn prompt_approval(
     auto_approve: bool,
 ) -> Result<bool, WalletError> {
     render_summary(entry, context);
-    stellar_agent_core::approval::mpp::verify_mpp_entry_terms(&entry.kind)?;
+    stellar_agent_core::approval::verify_entry_terms(&entry.kind)?;
     if let Some(Err(error)) = classic_entry_summary(&entry.kind) {
         return Err(error);
     }
@@ -778,7 +778,7 @@ fn write_summary(
             .as_deref()
             .unwrap_or("(not enrolled)"))
     )?;
-    let classic = match stellar_agent_core::approval::mpp::verify_mpp_entry_terms(&entry.kind) {
+    let classic = match stellar_agent_core::approval::verify_entry_terms(&entry.kind) {
         Ok(()) => classic_entry_summary(&entry.kind),
         Err(error) => Some(Err(error)),
     };
@@ -2044,7 +2044,6 @@ mod tests {
             "Test SDF Network ; September 2015".to_owned(),
             "stellar:testnet".to_owned(),
             definition,
-            [0x99u8; 32],
             "CallContract rule \"spend-daily\"".to_owned(),
             process_uid_for_attestation().expect("UID available on test host"),
             DEFAULT_TTL_MS,
@@ -2919,6 +2918,27 @@ mod tests {
             amount_lines,
             ["  Amount:            500.0000000 XLM (5000000000 stroops)"],
             "{text}"
+        );
+    }
+
+    /// An edited rule proposal renders as inconsistent, shows no edited term,
+    /// and is refused before any prompt, `--yes` included.
+    #[test]
+    fn an_edited_rule_proposal_renders_as_inconsistent_and_is_never_prompted() {
+        let mut entry = fixtures::rule_proposal_pending();
+        if let ApprovalKind::RuleProposalSimulated { definition, .. } = &mut entry.kind {
+            definition.name = "replacement-rule".to_owned();
+        }
+        let mut sink = Vec::new();
+        write_summary(&entry, &test_context(), &mut sink).unwrap();
+        let text = String::from_utf8(sink).unwrap();
+        assert!(text.contains("INCONSISTENT"), "{text}");
+        assert!(!text.contains("replacement-rule"), "{text}");
+        assert_eq!(
+            prompt_approval(&entry, &test_context(), true)
+                .unwrap_err()
+                .code(),
+            "approval.entry_inconsistent"
         );
     }
 

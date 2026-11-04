@@ -163,6 +163,8 @@ zeroize = { workspace = true }
 async-trait = { workspace = true }
 
 [dev-dependencies]
+# test-helpers exposes the install encoder for snapshot reconstruction checks.
+stellar-agent-smart-account = { path = "../stellar-agent-smart-account", features = ["test-helpers"] }
 toml_edit = { workspace = true }
 stellar-agent-toolsets-runtime = { path = "../stellar-agent-toolsets-runtime", features = ["test-helpers"] }
 # write_toolset_for_test writes the tagged install records the toolset suites

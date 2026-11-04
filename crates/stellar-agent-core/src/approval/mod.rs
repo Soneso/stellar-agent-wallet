@@ -101,9 +101,8 @@ pub use attestation::AttestationBinding;
 pub use attestation::{
     ATTESTATION_VERSION, ATTESTATION_VERSION_V2, AttestationScope, AttestedApprover,
     AttestedLifetime, MAINNET_ATTESTATION_VERSION, PENDING_ATTESTATION_VERSION,
-    RULE_PROPOSAL_DOMAIN_TAG, TOOLSET_GATE_DOMAIN_TAG, TRUSTLINE_CLAWBACK_OPT_IN_DOMAIN_TAG,
-    compute_attestation, compute_attestation_v4, compute_attestation_v5,
-    compute_rule_proposal_digest, compute_toolset_gate_digest,
+    TOOLSET_GATE_DOMAIN_TAG, TRUSTLINE_CLAWBACK_OPT_IN_DOMAIN_TAG, compute_attestation,
+    compute_attestation_v4, compute_attestation_v5, compute_toolset_gate_digest,
     compute_trustline_clawback_opt_in_digest, envelope_sha256, verify_attestation,
     verify_toolset_gate_attestation,
 };
@@ -126,7 +125,8 @@ pub use retry::{DEFAULT_RETRY_ATTEMPTS, DEFAULT_RETRY_BACKOFF, open_with_retry};
 pub use rule_proposal::{
     CONTEXT_RULE_PROPOSAL_SNAPSHOT_VERSION, ContextRuleProposalSnapshot,
     DecodedSpendingLimitParams, RuleProposalContextType, RuleProposalPolicy, RuleProposalSigner,
-    RuleProposalSignerKind, try_decode_spending_limit_params,
+    RuleProposalSignerKind, rule_proposal_digest, try_decode_spending_limit_params,
+    verify_rule_proposal_entry_terms,
 };
 pub use store::{
     ApprovalKind, ConsumedOutcome, DEFAULT_TTL_MS, EXPECTED_NONCE_LEN,
@@ -139,3 +139,19 @@ pub use toolset_grant::{
 };
 pub use user_id::{ApproverIdentity, VerifiedPasskeyAssertion, process_uid_for_attestation};
 pub use view::{ApprovalSummaryView, PendingApprovalView};
+
+/// Checks that displayed approval terms agree with their authorization binding.
+///
+/// # Errors
+///
+/// Returns `approval.entry_inconsistent` when a stored binding disagrees.
+pub fn verify_entry_terms(kind: &ApprovalKind) -> Result<(), crate::error::WalletError> {
+    mpp::verify_mpp_entry_terms(kind)?;
+    verify_rule_proposal_entry_terms(kind)
+}
+
+pub(crate) fn inconsistent(reason: &str) -> crate::error::WalletError {
+    crate::error::WalletError::Approval(crate::error::ApprovalFailure::EntryInconsistent {
+        detail: format!("this pending approval cannot be approved: {reason}"),
+    })
+}

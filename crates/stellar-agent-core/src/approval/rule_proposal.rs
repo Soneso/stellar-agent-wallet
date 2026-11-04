@@ -16,10 +16,157 @@
 //! strkeys, wasm hashes are hex, and policy params are base64-encoded XDR
 //! bytes rather than typed values. The `stellar-agent-smart-account` crate
 //! converts between this snapshot and its own `ContextRuleDefinition` /
-//! `ContextRuleSignerInput` / `ContextRulePolicy` types, and computes the
-//! `proposal_sha256` digest (see [`super::attestation::compute_rule_proposal_digest`]).
+//! `ContextRuleSignerInput` / `ContextRulePolicy` types.
+//! [`rule_proposal_digest`] binds the full displayed snapshot.
 
+use std::str::FromStr as _;
+
+use crate::{error::WalletError, profile::caip2::Caip2};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+
+/// Domain tag of the rule proposal digest.
+const PROPOSAL_DIGEST_TAG: &[u8] = b"stellar-agent-rule-proposal:v2\0";
+
+/// Computes the versioned digest of every displayed rule proposal field.
+///
+/// The domain is `stellar-agent-rule-proposal:v2\0`. Strings and byte values
+/// carry big-endian u64 lengths; counts are u64, integers are big-endian u32,
+/// and variants, presence markers, booleans and flags occupy one byte.
+/// Field order is account, network passphrase, chain id, summary line, snapshot
+/// version, context variant and its payload, name, optional expiry, signers,
+/// policies, authorization rule ids, then override flags.
+/// Each signer encodes kind, optional address, optional verifier, optional
+/// public-key bytes, then proposer status. Each policy encodes address, then
+/// base64 XDR parameters. Lists encode their count before their ordered items.
+/// Context variants are Default (0), CallContract (1), and CreateContract (2).
+/// Signer kinds are Delegated (0) and External (1). The flag byte uses bit 0
+/// for mutable verifiers and bit 1 for unknown verifiers.
+#[must_use]
+pub fn rule_proposal_digest(
+    smart_account: &str,
+    network_passphrase: &str,
+    chain_id: &str,
+    definition: &ContextRuleProposalSnapshot,
+    summary_line: &str,
+) -> [u8; 32] {
+    fn bytes(hash: &mut Sha256, value: &[u8]) {
+        hash.update(u64::try_from(value.len()).unwrap_or(u64::MAX).to_be_bytes());
+        hash.update(value);
+    }
+    let mut hash = Sha256::new();
+    hash.update(PROPOSAL_DIGEST_TAG);
+    for value in [smart_account, network_passphrase, chain_id, summary_line] {
+        bytes(&mut hash, value.as_bytes());
+    }
+    hash.update(definition.snapshot_version.to_be_bytes());
+    match &definition.context_type {
+        RuleProposalContextType::Default => hash.update([0]),
+        RuleProposalContextType::CallContract { contract } => {
+            hash.update([1]);
+            bytes(&mut hash, contract.as_bytes());
+        }
+        RuleProposalContextType::CreateContract { wasm_hash_hex } => {
+            hash.update([2]);
+            bytes(&mut hash, wasm_hash_hex.as_bytes());
+        }
+    }
+    bytes(&mut hash, definition.name.as_bytes());
+    hash.update([u8::from(definition.valid_until.is_some())]);
+    if let Some(value) = definition.valid_until {
+        hash.update(value.to_be_bytes());
+    }
+    hash.update(
+        u64::try_from(definition.signers.len())
+            .unwrap_or(u64::MAX)
+            .to_be_bytes(),
+    );
+    for signer in &definition.signers {
+        hash.update([match signer.kind {
+            RuleProposalSignerKind::Delegated => 0,
+            RuleProposalSignerKind::External => 1,
+        }]);
+        for value in [
+            signer.address.as_deref().map(str::as_bytes),
+            signer.verifier.as_deref().map(str::as_bytes),
+            signer.pubkey_data.as_deref(),
+        ] {
+            hash.update([u8::from(value.is_some())]);
+            if let Some(value) = value {
+                bytes(&mut hash, value);
+            }
+        }
+        hash.update([u8::from(signer.is_proposer)]);
+    }
+    hash.update(
+        u64::try_from(definition.policies.len())
+            .unwrap_or(u64::MAX)
+            .to_be_bytes(),
+    );
+    for policy in &definition.policies {
+        bytes(&mut hash, policy.policy_address.as_bytes());
+        bytes(&mut hash, policy.params_xdr_b64.as_bytes());
+    }
+    hash.update(
+        u64::try_from(definition.auth_rule_ids.len())
+            .unwrap_or(u64::MAX)
+            .to_be_bytes(),
+    );
+    for id in &definition.auth_rule_ids {
+        hash.update(id.to_be_bytes());
+    }
+    hash.update([u8::from(definition.accept_mutable_verifier)
+        | (u8::from(definition.accept_unknown_verifier) << 1)]);
+    hash.finalize().into()
+}
+
+/// Checks that a rule proposal displays the terms its digest binds.
+/// Other approval kinds pass unchecked.
+///
+/// # Errors
+///
+/// Returns `approval.entry_inconsistent` when the network, account redaction
+/// or digest disagrees with the stored proposal.
+pub fn verify_rule_proposal_entry_terms(kind: &super::ApprovalKind) -> Result<(), WalletError> {
+    let super::ApprovalKind::RuleProposalSimulated {
+        smart_account,
+        smart_account_redacted,
+        network_passphrase,
+        chain_id,
+        definition,
+        proposal_sha256,
+        summary_line,
+    } = kind
+    else {
+        return Ok(());
+    };
+    if !Caip2::from_str(chain_id)
+        .is_ok_and(|chain| chain.network_passphrase() == network_passphrase)
+    {
+        return Err(super::inconsistent(
+            "the network it shows is not the network it would install on",
+        ));
+    }
+    if *smart_account_redacted != super::store::redact_g_strkey(smart_account) {
+        return Err(super::inconsistent(
+            "what it shows does not match what it would install",
+        ));
+    }
+    if *proposal_sha256
+        != rule_proposal_digest(
+            smart_account,
+            network_passphrase,
+            chain_id,
+            definition,
+            summary_line,
+        )
+    {
+        return Err(super::inconsistent(
+            "what it shows does not match what it would install",
+        ));
+    }
+    Ok(())
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Bounds — mirrored from OZ on-chain caps
@@ -155,12 +302,8 @@ pub struct RuleProposalSigner {
     /// signing identity at propose time. Rendered as an explicit tag on
     /// every approval surface (Leg 3).
     ///
-    /// Wallet-computed DISPLAY metadata only: it is NOT an input to
-    /// `proposal_sha256` (see `compute_context_rule_proposal_sha256`) and is
-    /// NOT itself an authorization input, so it cannot be used to forge or
-    /// influence what gets authorized. It exists purely to help the
-    /// operator visually identify their own key in the rendered signer
-    /// table.
+    /// The proposal digest binds this display metadata so the operator
+    /// consents to the signer identity tag that the surface shows.
     pub is_proposer: bool,
 }
 
@@ -558,6 +701,112 @@ mod tests {
     }
 
     #[test]
+    fn the_digest_covers_every_field() {
+        use crate::approval::fixtures::{rule_proposal_mutations, rule_proposal_snapshot};
+        let snapshot = rule_proposal_snapshot();
+        let digest =
+            |account, passphrase, chain, definition: &ContextRuleProposalSnapshot, summary| {
+                rule_proposal_digest(account, passphrase, chain, definition, summary)
+            };
+        let baseline = digest("account", "network", "chain", &snapshot, "summary");
+        assert_eq!(
+            crate::hex::encode(&baseline),
+            "c847531c60237207bb56cdee354cf9a78f9cf9be956786819f2cd3cd9b3abc12"
+        );
+        let mut seen = vec![("baseline", baseline)];
+        for (name, snapshot) in rule_proposal_mutations() {
+            let changed = digest("account", "network", "chain", &snapshot, "summary");
+            for (other, value) in &seen {
+                assert_ne!(&changed, value, "{name} and {other}");
+            }
+            seen.push((name, changed));
+        }
+        for (account, passphrase, chain, summary) in [
+            ("other", "network", "chain", "summary"),
+            ("account", "other", "chain", "summary"),
+            ("account", "network", "other", "summary"),
+            ("account", "network", "chain", "other"),
+        ] {
+            assert_ne!(
+                baseline,
+                digest(account, passphrase, chain, &snapshot, summary)
+            );
+        }
+        assert_eq!(
+            baseline,
+            digest("account", "network", "chain", &snapshot, "summary")
+        );
+        assert_ne!(
+            digest("ab", "c", "chain", &snapshot, "summary"),
+            digest("a", "bc", "chain", &snapshot, "summary")
+        );
+    }
+
+    #[test]
+    fn rule_entry_network_and_binding_must_agree() {
+        use crate::approval::{ApprovalKind, fixtures};
+        let entry = fixtures::rule_proposal_pending();
+        verify_rule_proposal_entry_terms(&entry.kind).unwrap();
+        for chain in ["stellar:mainnet", "invalid"] {
+            let mut changed = entry.clone();
+            if let ApprovalKind::RuleProposalSimulated {
+                smart_account,
+                network_passphrase,
+                chain_id,
+                definition,
+                summary_line,
+                proposal_sha256,
+                ..
+            } = &mut changed.kind
+            {
+                *chain_id = chain.to_owned();
+                *proposal_sha256 = rule_proposal_digest(
+                    smart_account,
+                    network_passphrase,
+                    chain_id,
+                    definition,
+                    summary_line,
+                );
+            }
+            let error = verify_rule_proposal_entry_terms(&changed.kind).unwrap_err();
+            assert_eq!(error.code(), "approval.entry_inconsistent");
+            assert!(
+                error
+                    .message()
+                    .contains("the network it shows is not the network it would install on")
+            );
+        }
+        let mut changed = entry;
+        if let ApprovalKind::RuleProposalSimulated {
+            smart_account,
+            network_passphrase,
+            chain_id,
+            definition,
+            summary_line,
+            proposal_sha256,
+            ..
+        } = &mut changed.kind
+        {
+            network_passphrase.push('x');
+            *proposal_sha256 = rule_proposal_digest(
+                smart_account,
+                network_passphrase,
+                chain_id,
+                definition,
+                summary_line,
+            );
+        }
+        let error = verify_rule_proposal_entry_terms(&changed.kind).unwrap_err();
+        assert_eq!(error.code(), "approval.entry_inconsistent");
+        assert!(
+            error
+                .message()
+                .contains("the network it shows is not the network it would install on")
+        );
+        verify_rule_proposal_entry_terms(&fixtures::mpp_pending().kind).unwrap();
+    }
+
+    #[test]
     fn context_type_variant_name_names_each_variant_without_field_values() {
         assert_eq!(RuleProposalContextType::Default.variant_name(), "Default");
         let call = RuleProposalContextType::CallContract {
@@ -738,12 +987,19 @@ mod tests {
 
     #[test]
     fn context_type_serializes_with_type_tag() {
+        let json = serde_json::to_value(RuleProposalContextType::Default).unwrap();
+        assert_eq!(json["type"], "default");
         let json = serde_json::to_value(RuleProposalContextType::CallContract {
             contract: C_ADDR.to_owned(),
         })
         .unwrap();
         assert_eq!(json["type"], "call_contract");
         assert_eq!(json["contract"], C_ADDR);
+        let json = serde_json::to_value(RuleProposalContextType::CreateContract {
+            wasm_hash_hex: "ab".repeat(32),
+        })
+        .unwrap();
+        assert_eq!(json["type"], "create_contract");
     }
 
     #[test]

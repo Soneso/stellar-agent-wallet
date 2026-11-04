@@ -129,7 +129,6 @@ use stellar_agent_core::policy::{
     ApprovalRequest, Decision as PolicyDecision, PolicyEngine, PolicyError, ToolDescriptor,
 };
 use stellar_agent_core::profile::schema::{Profile, default_passkeys_dir};
-use stellar_agent_core::smart_account::rule_id::ContextRuleId;
 use stellar_agent_core::timefmt;
 use stellar_agent_mcp::server::{
     RuleCreatePolicyArg, RuleCreateSignerArg, StellarRuleCreateArgs, StellarRuleCreateCommitArgs,
@@ -141,10 +140,6 @@ use stellar_agent_smart_account::deployment::{
     deploy_smart_account, deploy_webauthn_verifier,
 };
 use stellar_agent_smart_account::managers::credentials::{AddPasskeyOutcome, CredentialsManager};
-use stellar_agent_smart_account::managers::rules::{
-    compute_context_rule_proposal_sha256, context_rule_definition_from_snapshot,
-    parse_c_strkey_to_smart_account,
-};
 use stellar_agent_test_support::keyring_mock;
 use tempfile::TempDir;
 use tokio::sync::Mutex as TokioMutex;
@@ -1160,32 +1155,27 @@ async fn rule_proposal_remote_browser_drives_real_rule_install() {
         .get(&full_nonce)
         .cloned()
         .expect("the full-rule pending entry must still be present before commit");
-    let (smart_account_str, definition_snapshot, stored_digest) = match &entry.kind {
+    let (recomputed_digest, stored_digest) = match &entry.kind {
         ApprovalKind::RuleProposalSimulated {
             smart_account,
+            network_passphrase,
+            chain_id,
             definition,
             proposal_sha256,
+            summary_line,
             ..
-        } => (smart_account.clone(), definition.clone(), *proposal_sha256),
+        } => (
+            stellar_agent_core::approval::rule_proposal_digest(
+                smart_account,
+                network_passphrase,
+                chain_id,
+                definition,
+                summary_line,
+            ),
+            *proposal_sha256,
+        ),
         other => panic!("expected RuleProposalSimulated, got {other:?}"),
     };
-    let smart_account_addr = parse_c_strkey_to_smart_account(&smart_account_str)
-        .expect("stored smart_account must parse");
-    let rule_definition = context_rule_definition_from_snapshot(&definition_snapshot)
-        .expect("definition must reconstruct from the stored snapshot");
-    let auth_rule_ids: Vec<ContextRuleId> = definition_snapshot
-        .auth_rule_ids
-        .iter()
-        .map(|id| ContextRuleId::new(*id))
-        .collect();
-    let recomputed_digest = compute_context_rule_proposal_sha256(
-        &smart_account_addr,
-        &rule_definition,
-        &auth_rule_ids,
-        definition_snapshot.accept_mutable_verifier,
-        definition_snapshot.accept_unknown_verifier,
-    )
-    .expect("digest must recompute from the stored snapshot");
     assert_eq!(
         recomputed_digest, stored_digest,
         "the digest recomputed from the snapshot must equal the entry's own proposal_sha256"

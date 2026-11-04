@@ -2700,7 +2700,7 @@ pub(crate) const ALL_AUTH_ENTRY_STAGES: &[&str] = &[
     "quorum_external_contract_guard",
     "quorum_signatures",
     "ed25519_rule_signer_quorum_guard",
-    "rule_proposal_digest",
+    "rule_definition_snapshot",
     "pin_check_required",
     "migrating_rule_mismatch",
     "multicall_check_undeclared",

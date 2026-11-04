@@ -140,6 +140,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `PendingApproval::new_rule_proposal_pending` computes the proposal digest
+  from the stored account, network, chain, definition and summary line.
+
 - On a mainnet profile `--secret-env` is refused by `pay`, `claim` and
   `accounts create` with `validation.mainnet_secret_env_refused`, and these
   verbs sign with the enrolled seed in the keyring when no signer flag is
@@ -620,6 +623,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Removed
 
+- `compute_context_rule_proposal_sha256`, `compute_rule_proposal_digest` and
+  `RULE_PROPOSAL_DOMAIN_TAG`; `rule_proposal_digest` replaces them.
+
 - `ValidationError` loses the unused `ConfirmTtyRequired`, `ConfirmProfileNameMismatch` and `ConfirmInputUnavailable` variants and their `confirm.*` codes.
 - The JSON bundle decomposer `decompose_bundle` and `parse_i128_arg`.
 - The wallet TTL background task. Clock checks bound seed access and transfer;
@@ -645,6 +651,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   form `"100 TST"` with `TST:<issuer>` works.
 
 ### Security
+
+- A rule proposal's digest covers the smart account, the network, the chain,
+  every displayed field of the rule and its summary. The CLI, the local inbox
+  and the remote inbox recompute it and show the proposal as inconsistent when
+  it differs, and approval refuses with `approval.entry_inconsistent`. Rule
+  proposals created by an earlier build show as inconsistent; propose them again.
 
 - Crate publication rebuilds every vendored contract Wasm file of the published
   commit from its pinned source with the pinned tools and compares the bytes

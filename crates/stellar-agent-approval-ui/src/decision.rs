@@ -236,9 +236,9 @@ pub enum Outcome {
     /// The entry's kind is not one the attest path supports (for example a
     /// passkey kind, whose interactive flow lives in the WebAuthn bridge).
     WrongKind,
-    /// The entry's stored digest is not the digest of its stored envelope, or
-    /// that envelope does not decode, so no surface can show what an
-    /// attestation would approve. Nothing was attested and no row written.
+    /// The entry's stored digest is not the digest of what it shows, or its
+    /// envelope does not decode, so no surface can show what an attestation
+    /// would approve. Nothing is attested and no row is written.
     Inconsistent,
     /// A remote requester the profile's current authorization does not
     /// admit: its credential is absent from `allowed_credentials` or from the
@@ -1635,7 +1635,6 @@ mod tests {
             "Public Global Stellar Network ; September 2015".to_owned(),
             "stellar:mainnet".to_owned(),
             definition,
-            [1; 32],
             "rule".to_owned(),
             uid(),
             DEFAULT_TTL_MS,

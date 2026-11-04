@@ -80,9 +80,8 @@ use stellar_agent_smart_account::managers::credentials::CredentialsManager;
 use stellar_agent_smart_account::managers::rules::{
     ContextRuleDefinition, ContextRuleManager, ContextRulePolicy, ContextRuleSignerInput,
     DELEGATED_SIGNER_ADDRESS_REASON, OZ_MAX_EXTERNAL_KEY_SIZE, OZ_MAX_NAME_SIZE, OZ_MAX_POLICIES,
-    OZ_MAX_SIGNERS, RuleContext, compute_context_rule_proposal_sha256,
-    context_rule_definition_from_snapshot, parse_c_strkey_to_smart_account,
-    parse_delegated_signer_address,
+    OZ_MAX_SIGNERS, RuleContext, context_rule_definition_from_snapshot,
+    parse_c_strkey_to_smart_account, parse_delegated_signer_address,
 };
 use stellar_agent_smart_account::managers::signers::SignersManager;
 use stellar_agent_smart_account::spending_limit_policy::{
@@ -794,7 +793,6 @@ impl WalletServer {
         network_passphrase: &str,
         chain_id: &str,
         definition: ContextRuleProposalSnapshot,
-        proposal_sha256: [u8; 32],
         summary_line: String,
         profile_name: &str,
     ) -> Result<PendingApproval, String> {
@@ -814,7 +812,6 @@ impl WalletServer {
             network_passphrase.to_owned(),
             chain_id.to_owned(),
             definition,
-            proposal_sha256,
             summary_line,
             uid,
             crate::tools::common::APPROVAL_TTL_MS,
@@ -929,11 +926,6 @@ impl WalletServer {
                 None,
             ));
         }
-        let auth_rule_ids: Vec<stellar_agent_core::smart_account::rule_id::ContextRuleId> = args
-            .auth_rule_ids
-            .iter()
-            .map(|id| stellar_agent_core::smart_account::rule_id::ContextRuleId::new(*id))
-            .collect();
 
         let rule_definition = ContextRuleDefinition::new(
             context,
@@ -998,23 +990,6 @@ impl WalletServer {
             Err(err) => return Ok(sa_error_result(&err)),
         };
 
-        // ── Compute the domain-separated proposal digest ──────────────────────
-        let proposal_sha256 = match compute_context_rule_proposal_sha256(
-            &smart_account,
-            &rule_definition,
-            &auth_rule_ids,
-            args.accept_mutable_verifier,
-            args.accept_unknown_verifier,
-        ) {
-            Ok(d) => d,
-            Err(err) => {
-                return Err(rmcp::ErrorData::internal_error(
-                    format!("rule_proposal_digest_error: {err}"),
-                    None,
-                ));
-            }
-        };
-
         // ── Build the snapshot ─────────────────────────────────────────────────
         let context_label = rule_definition.context_type_label();
         let summary_line = format!(
@@ -1056,19 +1031,33 @@ impl WalletServer {
                 self.context.network_passphrase(),
                 &args.chain_id,
                 snapshot,
-                proposal_sha256,
-                summary_line.clone(),
+                summary_line,
                 &profile_name,
             )
             .map_err(|e| {
                 rmcp::ErrorData::internal_error(format!("approval.store_error: {e}"), None)
             })?;
 
+        let stellar_agent_core::approval::ApprovalKind::RuleProposalSimulated {
+            proposal_sha256,
+            smart_account,
+            chain_id,
+            definition,
+            summary_line,
+            ..
+        } = &entry.kind
+        else {
+            return Err(rmcp::ErrorData::internal_error(
+                "approval.store_error: wrong proposal kind",
+                None,
+            ));
+        };
+
         // ── Build response ─────────────────────────────────────────────────────
         let mut view = json!({
             "approval_nonce": entry.approval_nonce,
             "profile": &profile_name,
-            "chain_id": self.context.chain_id.caip2_str(),
+            "chain_id": chain_id,
             "expires_at_unix_ms": entry.expires_at_unix_ms,
             "requires_operator_approval": requires_operator_approval,
             "proposal_sha256_hex": proposal_sha256.iter().map(|b| format!("{b:02x}")).collect::<String>(),
@@ -1076,14 +1065,14 @@ impl WalletServer {
             "mutable_override": simulate_output.pin_result.mutable_override,
             "unknown_override": simulate_output.pin_result.unknown_override,
             "summary": {
-                "smart_account": &args.smart_account,
-                "context_type_label": context_label,
-                "name": &args.name,
-                "valid_until": args.valid_until,
-                "signer_count": args.signers.len(),
-                "policy_count": args.policies.len(),
-                "auth_rule_ids": &args.auth_rule_ids,
-                "summary_line": &summary_line,
+                "smart_account": smart_account,
+                "context_type_label": json!(definition.context_type)["type"],
+                "name": &definition.name,
+                "valid_until": definition.valid_until,
+                "signer_count": definition.signers.len(),
+                "policy_count": definition.policies.len(),
+                "auth_rule_ids": &definition.auth_rule_ids,
+                "summary_line": summary_line,
             },
         });
         insert_pin_fields(
@@ -1115,7 +1104,7 @@ impl WalletServer {
     ///    verifies the HMAC attestation over `proposal_sha256` — the shared
     ///    pay/claim `verify_attestation_gate` is NOT used.
     /// 3. The digest is recomputed from the stored snapshot through the SAME
-    ///    builder (`compute_context_rule_proposal_sha256`) used at propose
+    ///    core snapshot digest (`rule_proposal_digest`) used at propose
     ///    time, UNCONDITIONALLY (even on a policy-engine `Allow` outcome) —
     ///    a mismatch against the entry's own recorded digest is
     ///    `simulation.divergence` (store self-consistency, independent of
@@ -1334,36 +1323,44 @@ impl WalletServer {
             ));
         }
 
-        let (smart_account_str, entry_chain_id, definition_snapshot, stored_proposal_sha256) =
-            match &entry.kind {
-                stellar_agent_core::approval::ApprovalKind::Rejected { .. } => {
-                    return Ok(approval_rejected_error());
-                }
-                // A spent approval is named as spent rather than as absent:
-                // the agent needs to know this approval was already used, and
-                // that its install may have landed, instead of being told to
-                // ask again.
-                stellar_agent_core::approval::ApprovalKind::Consumed { .. } => {
-                    return Ok(crate::tools::common::rule_proposal_consumed_error());
-                }
-                stellar_agent_core::approval::ApprovalKind::RuleProposalSimulated {
-                    smart_account,
-                    chain_id,
-                    definition,
-                    proposal_sha256,
-                    ..
-                } => (
-                    smart_account.clone(),
-                    chain_id.clone(),
-                    definition.clone(),
-                    *proposal_sha256,
-                ),
-                _ => {
-                    return Ok(approval_required_indistinguishable(
-                        &self.profile_name_for_approval(),
-                    ));
-                }
-            };
+        let (
+            smart_account_str,
+            entry_chain_id,
+            definition_snapshot,
+            stored_proposal_sha256,
+            entry_passphrase,
+            entry_summary,
+        ) = match &entry.kind {
+            stellar_agent_core::approval::ApprovalKind::Rejected { .. } => {
+                return Ok(approval_rejected_error());
+            }
+            // A consumed approval carries its spent state so the caller
+            // knows the install may have reached the network.
+            stellar_agent_core::approval::ApprovalKind::Consumed { .. } => {
+                return Ok(crate::tools::common::rule_proposal_consumed_error());
+            }
+            stellar_agent_core::approval::ApprovalKind::RuleProposalSimulated {
+                smart_account,
+                chain_id,
+                definition,
+                proposal_sha256,
+                network_passphrase,
+                summary_line,
+                ..
+            } => (
+                smart_account.clone(),
+                chain_id.clone(),
+                definition.clone(),
+                *proposal_sha256,
+                network_passphrase.clone(),
+                summary_line.clone(),
+            ),
+            _ => {
+                return Ok(approval_required_indistinguishable(
+                    &self.profile_name_for_approval(),
+                ));
+            }
+        };
 
         if entry_chain_id != args.chain_id {
             return Err(rmcp::ErrorData::internal_error(
@@ -1395,16 +1392,13 @@ impl WalletServer {
                 .map(|id| stellar_agent_core::smart_account::rule_id::ContextRuleId::new(*id))
                 .collect();
 
-        let recomputed_digest = compute_context_rule_proposal_sha256(
-            &smart_account,
-            &rule_definition,
-            &auth_rule_ids,
-            definition_snapshot.accept_mutable_verifier,
-            definition_snapshot.accept_unknown_verifier,
-        )
-        .map_err(|e| {
-            rmcp::ErrorData::internal_error(format!("rule_proposal_digest_error: {e}"), None)
-        })?;
+        let recomputed_digest = stellar_agent_core::approval::rule_proposal_digest(
+            &smart_account_str,
+            &entry_passphrase,
+            &entry_chain_id,
+            &definition_snapshot,
+            &entry_summary,
+        );
 
         if recomputed_digest != stored_proposal_sha256 {
             return Err(rmcp::ErrorData::internal_error(
@@ -2329,6 +2323,103 @@ mod tests {
         assert_eq!(snapshot[0].policy_address, TEST_C);
     }
 
+    #[test]
+    #[serial_test::serial(keyring)]
+    fn propose_time_and_snapshot_definitions_encode_the_same_install_arguments() {
+        use stellar_agent_smart_account::managers::rules::build_add_context_rule_args_for_test;
+
+        let (server, _dir) = test_server();
+        let signer_sets = [
+            vec![RuleCreateSignerArg::Delegated {
+                address: TEST_G.to_owned(),
+            }],
+            vec![
+                RuleCreateSignerArg::Delegated {
+                    address: TEST_G_2.to_owned(),
+                },
+                RuleCreateSignerArg::Delegated {
+                    address: TEST_SMART_ACCOUNT.to_owned(),
+                },
+            ],
+            vec![RuleCreateSignerArg::External {
+                verifier: TEST_C.to_owned(),
+                pubkey_data_hex: "ab".repeat(65),
+            }],
+            vec![
+                RuleCreateSignerArg::Delegated {
+                    address: TEST_G.to_owned(),
+                },
+                RuleCreateSignerArg::External {
+                    verifier: TEST_C.to_owned(),
+                    pubkey_data_hex: "ab".repeat(65),
+                },
+            ],
+        ];
+        let raw_policy = |address: String, value| RuleCreatePolicyArg::Raw {
+            policy_address: address,
+            install_param_xdr_b64: base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .encode(ScVal::U32(value).to_xdr(Limits::none()).unwrap()),
+        };
+        let mut cases = 0;
+        for context_arg in [
+            "default".to_owned(),
+            format!("call-contract:{TEST_SMART_ACCOUNT}"),
+            format!("create-contract:{}", "ab".repeat(32)),
+        ] {
+            let context = parse_rule_context_arg(&context_arg).unwrap();
+            let mut policy_sets = vec![
+                vec![],
+                vec![raw_policy(TEST_C.to_owned(), 7)],
+                vec![
+                    raw_policy(TEST_C.to_owned(), 7),
+                    raw_policy(stellar_strkey::Contract([2; 32]).to_string().to_string(), 8),
+                ],
+            ];
+            if matches!(context, RuleContext::CallContract { .. }) {
+                policy_sets.push(vec![RuleCreatePolicyArg::SpendingLimit {
+                    limit_stroops: "10000000".to_owned(),
+                    period_ledgers: 17_280,
+                    policy_address: Some(TEST_C.to_owned()),
+                }]);
+            }
+            for signers in &signer_sets {
+                for policies in &policy_sets {
+                    for valid_until in [None, Some(100)] {
+                        let resolved = resolve_signers(signers, &server).unwrap();
+                        let (typed_policies, snapshot_policies) =
+                            resolve_policies(policies, &context, NETWORK_PASSPHRASE).unwrap();
+                        let proposed = ContextRuleDefinition::new(
+                            context.clone(),
+                            "fixture-rule".to_owned(),
+                            valid_until,
+                            resolved.typed,
+                            typed_policies,
+                        );
+                        let snapshot = ContextRuleProposalSnapshot::new(
+                            context_type_to_snapshot(&context).unwrap(),
+                            "fixture-rule".to_owned(),
+                            valid_until,
+                            resolved.snapshot,
+                            snapshot_policies,
+                            vec![1, 2],
+                            false,
+                            false,
+                        );
+                        let reconstructed =
+                            context_rule_definition_from_snapshot(&snapshot).unwrap();
+                        assert_eq!(
+                            build_add_context_rule_args_for_test(&proposed).unwrap(),
+                            build_add_context_rule_args_for_test(&reconstructed).unwrap(),
+                            "{context_arg}: {snapshot:?}"
+                        );
+                        cases += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(cases, 80);
+    }
+
     // ── stellar_rule_create_commit_impl: gate-refusal paths ───────────────────
     //
     // Every scenario below fires before `signer_from_keyring` / `install_rule`
@@ -2352,18 +2443,13 @@ mod tests {
     /// tests that must pass the digest-consistency check can use a value that
     /// genuinely matches (rather than an arbitrary placeholder).
     fn matching_digest_for(smart_account: &stellar_xdr::ScAddress) -> [u8; 32] {
-        let rule_definition =
-            context_rule_definition_from_snapshot(&valid_rule_definition_snapshot())
-                .expect("reconstruct");
-        let auth_rule_ids = vec![stellar_agent_core::smart_account::rule_id::ContextRuleId::new(0)];
-        compute_context_rule_proposal_sha256(
-            smart_account,
-            &rule_definition,
-            &auth_rule_ids,
-            false,
-            false,
+        stellar_agent_core::approval::rule_proposal_digest(
+            &smart_account.to_string(),
+            NETWORK_PASSPHRASE,
+            "stellar:testnet",
+            &valid_rule_definition_snapshot(),
+            "Default rule \"spend-daily\"",
         )
-        .expect("digest compute")
     }
 
     /// Inserts a `RuleProposalSimulated` entry (with a genuinely-matching
@@ -2375,22 +2461,27 @@ mod tests {
         digest_override: Option<[u8; 32]>,
         ttl_ms: u64,
     ) -> String {
-        let smart_account = parse_c_strkey_to_smart_account(TEST_SMART_ACCOUNT).unwrap();
-        let digest = digest_override.unwrap_or_else(|| matching_digest_for(&smart_account));
         let approvals_dir = server.resolve_approval_dir().unwrap();
         let store_path = approvals_dir.join(format!("{}.toml", server.profile_name_for_approval()));
         let mut store = PendingApprovalStore::open(store_path).unwrap();
-        let entry = PendingApproval::new_rule_proposal_pending(
+        let mut entry = PendingApproval::new_rule_proposal_pending(
             TEST_SMART_ACCOUNT.to_owned(),
             NETWORK_PASSPHRASE.to_owned(),
             chain_id.to_owned(),
             valid_rule_definition_snapshot(),
-            digest,
             "Default rule \"spend-daily\"".to_owned(),
             process_uid_for_attestation().unwrap(),
             ttl_ms,
         )
         .unwrap();
+        if let Some(digest) = digest_override
+            && let stellar_agent_core::approval::ApprovalKind::RuleProposalSimulated {
+                proposal_sha256,
+                ..
+            } = &mut entry.kind
+        {
+            *proposal_sha256 = digest;
+        }
         let nonce = entry.approval_nonce.clone();
         let now_ms = now_unix_ms().unwrap();
         store.insert(entry, now_ms).unwrap();
@@ -2951,12 +3042,11 @@ mod tests {
         }
     }
 
-    /// A server whose profile signs as an enrolled signer seeded from a
-    /// deterministic test seed and reaches its RPC at `rpc_url`, with an
-    /// attested rule proposal in its approval store under `approvals_dir`.
-    /// Returns the server, the commit arguments that pass the gate, and the
-    /// store path.
-    async fn attested_commit_with_enrolled_signer(
+    const RULE_ATTESTATION_KEY: [u8; 32] = [0x3b; 32];
+
+    /// Builds an enrolled signer, a pending proposal, and matching commit
+    /// arguments. Returns the server, arguments, store path, and HMAC blob.
+    async fn pending_commit_setup(
         dir: &std::path::Path,
         approvals_dir: std::path::PathBuf,
         rpc_url: String,
@@ -2964,6 +3054,7 @@ mod tests {
         WalletServer,
         StellarRuleCreateCommitArgs,
         std::path::PathBuf,
+        [u8; 32],
     ) {
         use stellar_agent_core::approval::attestation::compute_attestation_v4;
         use stellar_agent_network::Signer as _;
@@ -2997,7 +3088,7 @@ mod tests {
                 )
                 .unwrap();
         }
-        let attestation_key = [0x3b_u8; 32];
+        let attestation_key = RULE_ATTESTATION_KEY;
         keyring_core::Entry::new(
             &profile.attestation_key_id.service,
             &profile.attestation_key_id.account,
@@ -3012,7 +3103,7 @@ mod tests {
         let nonce = insert_rule_proposal_entry(&server, "stellar:testnet", None, DEFAULT_TTL_MS);
         let store_path = approvals_dir.join(format!("{}.toml", server.profile_name_for_approval()));
         let smart_account = parse_c_strkey_to_smart_account(TEST_SMART_ACCOUNT).unwrap();
-        let mut store = PendingApprovalStore::open(store_path.clone()).unwrap();
+        let store = PendingApprovalStore::open(store_path.clone()).unwrap();
         let lifetime = store.get(&nonce).unwrap().attested_lifetime();
         let blob = compute_attestation_v4(
             &attestation_key,
@@ -3026,18 +3117,35 @@ mod tests {
             &lifetime,
             &stellar_agent_core::approval::AttestedApprover::Local,
         );
-        store
-            .record_rule_proposal_attestation(
-                &nonce,
-                blob,
-                stellar_agent_core::approval::AttestedApprover::Local,
-            )
-            .unwrap();
         drop(store);
 
         let mut args = commit_args("stellar:testnet", nonce);
         args.approval_attestation =
             Some(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(blob));
+        (server, args, store_path, blob)
+    }
+
+    /// Builds an enrolled signer with an attested proposal and matching
+    /// commit arguments. Returns the server, arguments, and store path.
+    async fn attested_commit_with_enrolled_signer(
+        dir: &std::path::Path,
+        approvals_dir: std::path::PathBuf,
+        rpc_url: String,
+    ) -> (
+        WalletServer,
+        StellarRuleCreateCommitArgs,
+        std::path::PathBuf,
+    ) {
+        let (server, args, store_path, blob) =
+            pending_commit_setup(dir, approvals_dir, rpc_url).await;
+        let mut store = PendingApprovalStore::open(store_path.clone()).unwrap();
+        store
+            .record_rule_proposal_attestation(
+                &args.approval_nonce,
+                blob,
+                stellar_agent_core::approval::AttestedApprover::Local,
+            )
+            .unwrap();
         (server, args, store_path)
     }
 
@@ -3046,12 +3154,70 @@ mod tests {
         store_path: &std::path::Path,
         nonce: &str,
     ) -> stellar_agent_core::approval::ApprovalKind {
-        PendingApprovalStore::open(store_path.to_path_buf())
+        let kind = PendingApprovalStore::open(store_path.to_path_buf())
             .unwrap()
             .get(nonce)
             .unwrap()
             .kind
-            .clone()
+            .clone();
+        stellar_agent_core::approval::verify_rule_proposal_entry_terms(&kind).unwrap();
+        kind
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(keyring)]
+    async fn a_definition_swapped_after_approval_does_not_install() {
+        use stellar_agent_core::approval::{
+            ApprovalKind, AttestedApprover, ConsentAudit, ConsentAuthorization, Surface,
+            attest_and_persist,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let rpc = FirstContactRpc::start();
+        let (server, args, store_path, _) =
+            pending_commit_setup(dir.path(), dir.path().join("approvals"), rpc.uri()).await;
+        let nonce = args.approval_nonce.clone();
+        let mut store = PendingApprovalStore::open(store_path.clone()).unwrap();
+        let mut entry = store.get(&nonce).unwrap().clone();
+        let original = entry.kind.clone();
+        if let ApprovalKind::RuleProposalSimulated { definition, .. } = &mut entry.kind {
+            definition.name = "replacement-rule".to_owned();
+        }
+        store.remove(&nonce).unwrap();
+        store.insert(entry.clone(), now_unix_ms().unwrap()).unwrap();
+        let mut audit = stellar_agent_core::audit_log::writer::AuditWriter::open(
+            dir.path().join("consent.jsonl"),
+            None,
+        )
+        .unwrap();
+        let error = attest_and_persist(
+            &mut store,
+            &entry,
+            &RULE_ATTESTATION_KEY,
+            &stellar_agent_core::approval::AttestationBinding::new(
+                &server.profile_name_for_approval(),
+                "stellar:testnet",
+            ),
+            Surface::Cli,
+            ConsentAudit::Writer(&mut audit),
+            ConsentAuthorization::Standard(&AttestedApprover::Local),
+            |_req, _key| Err("rule approval does not create a grant".to_owned()),
+        )
+        .unwrap_err();
+        assert_eq!(error.code(), "approval.entry_inconsistent");
+        assert!(store.get(&nonce).unwrap().attestation_blob_b64.is_none());
+        entry.kind = original;
+        store.remove(&nonce).unwrap();
+        store.insert(entry, now_unix_ms().unwrap()).unwrap();
+        drop(store);
+        let result = server.call_stellar_rule_create_commit(args).await.unwrap();
+        let (code, _, _) = crate::tools::common::assert_business_envelope(&result);
+        assert_eq!(code, "policy.approval_required");
+        assert_eq!(rpc.accepted(), 0);
+        assert_eq!(
+            stored_kind(&store_path, &nonce).kind_name(),
+            "RuleProposalSimulated"
+        );
     }
 
     /// The approval is spent before the install reaches the network, and an

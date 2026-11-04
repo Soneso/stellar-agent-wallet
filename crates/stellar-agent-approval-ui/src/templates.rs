@@ -1694,6 +1694,14 @@ mod tests {
     /// recognized spending-limit policy, and both override flags set — this
     /// single fixture exercises every renderer branch at once.
     fn rule_proposal_view(dir: &TempDir) -> PendingApprovalView {
+        rule_proposal_view_with_text(dir, "spend-daily", "Default rule \"spend-daily\"")
+    }
+
+    fn rule_proposal_view_with_text(
+        dir: &TempDir,
+        name: &str,
+        summary_line: &str,
+    ) -> PendingApprovalView {
         use base64::Engine as _;
         use stellar_agent_core::approval::{
             ContextRuleProposalSnapshot, RuleProposalContextType, RuleProposalPolicy,
@@ -1720,7 +1728,7 @@ mod tests {
 
         let definition = ContextRuleProposalSnapshot::new(
             RuleProposalContextType::Default,
-            "spend-daily".to_owned(),
+            name.to_owned(),
             None,
             vec![
                 RuleProposalSigner::delegated(
@@ -1748,8 +1756,7 @@ mod tests {
             "Test SDF Network ; September 2015".to_owned(),
             "stellar:testnet".to_owned(),
             definition,
-            [0x11u8; 32],
-            "Default rule \"spend-daily\"".to_owned(),
+            summary_line.to_owned(),
             process_uid_for_attestation().unwrap(),
             DEFAULT_TTL_MS,
         )
@@ -3046,9 +3053,9 @@ mod tests {
         assert_edited_mpp_inconsistent(false);
     }
 
-    /// Inbox JSON for a rule proposal whose name and summary line hold U+202E
-    /// and a payment whose text memo holds it, checked in so the JavaScript
-    /// test renders exactly what Rust emits.
+    /// Rule name and summary the bidi fixture binds through the constructor.
+    const INBOX_BIDI_RULE_TEXT: &str = "caf\u{e9}\u{202e}rule";
+    /// Fixed vector from `inbox_json_bidi_fixture`, the JSON the JavaScript test renders.
     const INBOX_BIDI_FIXTURE: &str = include_str!("web/testdata/inbox_bidi.json");
 
     /// The inbox JSON of a rule name, a summary line and a memo holding
@@ -3057,16 +3064,7 @@ mod tests {
     #[test]
     fn inbox_json_bidi_fixture() {
         let dir = TempDir::new().unwrap();
-        let mut rule = rule_proposal_view(&dir);
-        if let ApprovalSummaryView::RuleProposal {
-            definition,
-            summary_line,
-            ..
-        } = &mut rule.summary
-        {
-            definition.name = "caf\u{e9}\u{202e}rule".to_owned();
-            *summary_line = "caf\u{e9}\u{202e}rule".to_owned();
-        }
+        let rule = rule_proposal_view_with_text(&dir, INBOX_BIDI_RULE_TEXT, INBOX_BIDI_RULE_TEXT);
         let payment = view_of(fixtures::payment_pending(
             SOURCE_G,
             DEST_G,

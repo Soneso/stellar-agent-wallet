@@ -424,3 +424,152 @@ pub const MEMO_CONTROL_RANGES: &[(u32, u32)] = &[
     (0xe0001, 0xe0001),
     (0xe0020, 0xe007f),
 ];
+
+/// A resolved rule with distinct ordered signers, policies and authorization ids.
+#[must_use]
+pub fn rule_proposal_snapshot() -> super::ContextRuleProposalSnapshot {
+    use super::{
+        ContextRuleProposalSnapshot, RuleProposalContextType, RuleProposalPolicy,
+        RuleProposalSigner,
+    };
+    let contract = stellar_strkey::Contract([0; 32]).to_string().to_string();
+    ContextRuleProposalSnapshot::new(
+        RuleProposalContextType::CallContract {
+            contract: contract.clone(),
+        },
+        "fixture-rule".to_owned(),
+        Some(100),
+        vec![
+            RuleProposalSigner::delegated(
+                stellar_strkey::ed25519::PublicKey([1; 32])
+                    .to_string()
+                    .to_string(),
+                true,
+            ),
+            RuleProposalSigner::external(contract.clone(), vec![1, 2, 3], false),
+        ],
+        vec![
+            RuleProposalPolicy::new(contract, "AAAAAwAAAAE".to_owned()),
+            RuleProposalPolicy::new(
+                stellar_strkey::Contract([2; 32]).to_string().to_string(),
+                "AAAAAwAAAAI".to_owned(),
+            ),
+        ],
+        vec![1, 2],
+        false,
+        false,
+    )
+}
+
+/// Independent mutations of every snapshot field, including optional values and order.
+#[must_use]
+pub fn rule_proposal_mutations() -> Vec<(&'static str, super::ContextRuleProposalSnapshot)> {
+    use super::{ContextRuleProposalSnapshot, RuleProposalContextType, RuleProposalSignerKind};
+    type Mutation = (&'static str, fn(&mut ContextRuleProposalSnapshot));
+    let mutations: &[Mutation] = &[
+        ("version", |s| s.snapshot_version += 1),
+        ("default context", |s| {
+            s.context_type = RuleProposalContextType::Default
+        }),
+        ("call contract", |s| {
+            s.context_type = RuleProposalContextType::CallContract {
+                contract: stellar_strkey::Contract([3; 32]).to_string().to_string(),
+            }
+        }),
+        ("create contract", |s| {
+            s.context_type = RuleProposalContextType::CreateContract {
+                wasm_hash_hex: "00".repeat(32),
+            }
+        }),
+        ("wasm hash", |s| {
+            s.context_type = RuleProposalContextType::CreateContract {
+                wasm_hash_hex: "01".repeat(32),
+            }
+        }),
+        ("name", |s| s.name.push('x')),
+        ("expiry absent", |s| s.valid_until = None),
+        ("expiry value", |s| s.valid_until = Some(101)),
+        ("signer kind", |s| {
+            s.signers[0].kind = RuleProposalSignerKind::External
+        }),
+        ("address", |s| {
+            s.signers[0].address = Some(
+                stellar_strkey::ed25519::PublicKey([3; 32])
+                    .to_string()
+                    .to_string(),
+            )
+        }),
+        ("address absent", |s| s.signers[0].address = None),
+        ("address empty", |s| {
+            s.signers[1].address = Some(String::new())
+        }),
+        ("verifier", |s| {
+            s.signers[1].verifier = Some(stellar_strkey::Contract([3; 32]).to_string().to_string())
+        }),
+        ("verifier absent", |s| s.signers[1].verifier = None),
+        ("verifier empty", |s| {
+            s.signers[0].verifier = Some(String::new())
+        }),
+        ("public key", |s| {
+            s.signers[1].pubkey_data = Some(vec![4, 5, 6])
+        }),
+        ("public key absent", |s| s.signers[1].pubkey_data = None),
+        ("public key empty", |s| {
+            s.signers[0].pubkey_data = Some(vec![])
+        }),
+        ("proposer", |s| s.signers[0].is_proposer = false),
+        ("signer order", |s| s.signers.swap(0, 1)),
+        ("signer count", |s| {
+            s.signers.pop();
+        }),
+        ("policy address", |s| {
+            s.policies[0].policy_address = stellar_strkey::Contract([3; 32]).to_string().to_string()
+        }),
+        ("policy params", |s| {
+            s.policies[0].params_xdr_b64 = "AAAAAwAAAAM".to_owned()
+        }),
+        ("policy order", |s| s.policies.swap(0, 1)),
+        ("policy count", |s| {
+            s.policies.pop();
+        }),
+        ("first id", |s| s.auth_rule_ids[0] = 3),
+        ("second id", |s| s.auth_rule_ids[1] = 3),
+        ("id order", |s| s.auth_rule_ids.swap(0, 1)),
+        ("id count", |s| {
+            s.auth_rule_ids.pop();
+        }),
+        ("mutable verifier", |s| s.accept_mutable_verifier = true),
+        ("unknown verifier", |s| s.accept_unknown_verifier = true),
+        ("both flags", |s| {
+            s.accept_mutable_verifier = true;
+            s.accept_unknown_verifier = true;
+        }),
+    ];
+    mutations
+        .iter()
+        .map(|(name, mutate)| {
+            let mut snapshot = rule_proposal_snapshot();
+            mutate(&mut snapshot);
+            (*name, snapshot)
+        })
+        .collect()
+}
+
+/// A pending rule whose digest agrees with its displayed terms.
+///
+/// # Panics
+///
+/// Panics if the fixture is invalid or the clock is unavailable.
+#[must_use]
+pub fn rule_proposal_pending() -> PendingApproval {
+    PendingApproval::new_rule_proposal_pending(
+        stellar_strkey::Contract([0; 32]).to_string().to_string(),
+        crate::profile::caip2::TESTNET_PASSPHRASE.to_owned(),
+        "stellar:testnet".to_owned(),
+        rule_proposal_snapshot(),
+        "fixture summary".to_owned(),
+        "1000".to_owned(),
+        60_000,
+    )
+    .expect("valid rule fixture")
+}

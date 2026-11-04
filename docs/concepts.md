@@ -334,8 +334,10 @@ What an attacker who can write to the store file can and cannot do: deleting a p
 `stellar_rule_create` resolves and stores every signer, policy, context, expiry and `auth_rule_ids` in the pending proposal.
 The commit gate verifies the operator's attestation and compares the stored chain with the binding.
 The commit also compares that chain with the presented `args.chain_id`.
-It recomputes the proposal digest from the stored definition and refuses `simulation.divergence` on a mismatch.
-The CLI and both inboxes render the resolved definition, including account-wide authority and override warnings.
+The digest covers the account, network, chain, full resolved definition and summary line.
+Every approval surface recomputes it and shows an inconsistent entry instead of the rule when it differs.
+Approval refuses with `approval.entry_inconsistent`; the commit recomputes the digest and refuses `simulation.divergence` on a mismatch.
+The CLI and both inboxes render consistent proposals in full, including account-wide authority and override warnings.
 
 ## First-invoke gate vs. per-action payment approval
 

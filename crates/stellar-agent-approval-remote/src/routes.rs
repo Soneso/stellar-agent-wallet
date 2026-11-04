@@ -1405,7 +1405,6 @@ mod tests {
                 "Public Global Stellar Network ; September 2015".to_owned(),
                 "stellar:mainnet".to_owned(),
                 definition,
-                [1; 32],
                 "rule".to_owned(),
                 stellar_agent_core::approval::process_uid_for_attestation().unwrap(),
                 stellar_agent_core::approval::DEFAULT_TTL_MS,
@@ -2818,16 +2817,22 @@ mod tests {
                 "Test SDF Network ; September 2015".to_owned(),
                 "stellar:testnet".to_owned(),
                 definition,
-                [0x11u8; 32],
                 "Default rule \"spend-daily\"".to_owned(),
                 "424242".to_owned(),
                 DEFAULT_TTL_MS,
             )
             .unwrap();
+        let ApprovalKind::RuleProposalSimulated {
+            proposal_sha256, ..
+        } = &rule_proposal.kind
+        else {
+            unreachable!()
+        };
+        assert_ne!(*proposal_sha256, [0; 32]);
         assert_eq!(
             entry_envelope_sha256(&rule_proposal),
-            [0x11u8; 32],
-            "RuleProposalSimulated must bind to proposal_sha256, not the zero placeholder"
+            *proposal_sha256,
+            "RuleProposalSimulated binds the complete proposal digest"
         );
 
         let mpp = stellar_agent_core::approval::fixtures::bind_mpp_entry(
