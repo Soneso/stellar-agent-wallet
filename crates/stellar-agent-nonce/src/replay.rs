@@ -5,6 +5,11 @@
 //! wipes it, which is the fail-closed-on-restart property (combined with
 //! the `boot_nonce` HMAC input in [`crate::NonceMint`]).
 //!
+//! Every byte of the 48-byte key is covered by the HMAC tag: the tag is
+//! computed over the salt and the request.  A nonce with a changed byte
+//! therefore fails verification before it is recorded in the window, so one
+//! minted nonce yields exactly one key the window can accept.
+//!
 //! # Thread safety
 //!
 //! `ReplayWindow` is `Send + Sync` (no internal mutability), but its mutating
@@ -20,14 +25,14 @@
 //! entries (~38 MiB).  Operators sustaining higher rates should call
 //! [`evict_expired`][ReplayWindow::evict_expired] more frequently.
 //!
-//! ## Defence-in-depth: full 48-byte key
+//! ## Full 48-byte key
 //!
 //! The HashMap key is the full 48-byte nonce (16-byte salt + 32-byte HMAC tag)
-//! rather than the salt alone.  Keying on the salt alone would suffice for
-//! replay prevention (salts are unique with overwhelming probability), but the
-//! full-nonce key provides defence-in-depth: an attacker who manages to predict
-//! or collide a salt must also forge the HMAC tag to construct a key that
-//! matches an existing window entry.
+//! rather than the salt alone.  The tag authenticates the salt, so neither half
+//! of the key can be changed without failing verification: a holder of a
+//! consumed nonce cannot derive a second key that verifies, and two genuine
+//! nonces that share a salt but bind different requests still occupy distinct
+//! entries because their tags differ.
 
 use std::collections::HashMap;
 

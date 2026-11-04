@@ -940,6 +940,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   dispatcher routes, not the native tools the server registers; the caller
   chooses the `toolset` argument, and the operator policy and approvals bound
   native and routed calls alike.
+- The approval nonce's HMAC covers its 16-byte salt under a versioned
+  preimage. A nonce whose salt was changed after minting fails verification
+  with `nonce.expired`, so a consumed nonce cannot pass the replay window a
+  second time. A nonce minted before the upgrade does not verify; the boot
+  value changes at every process start, so no outstanding nonce survives the
+  upgrade anyway.
 - `follow-redirects` 1.16.1 to 1.16.2 in the MPP and `@stellar/stellar-sdk`
   17 interoperability harnesses, which resolves one advisory.
   GHSA-mrwp-f3q8-3g9p affects `follow-redirects` before 1.16.2. The

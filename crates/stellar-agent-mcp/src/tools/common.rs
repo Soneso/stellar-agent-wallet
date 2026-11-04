@@ -1980,8 +1980,9 @@ fn envelope_decode_error_kind(
 /// The TOCTOU gap (a concurrent request could have committed the same nonce
 /// between the HMAC check and the window lock) is bounded by the keyring
 /// round-trip latency and is acceptable because the nonce's remaining replay
-/// protection still holds (the second call also goes through HMAC verify before
-/// the window check).
+/// protection still holds: the second call verifies the tag over the salt and
+/// the request before the window records the nonce, so it either fails that
+/// check or presents the same 48 bytes and fails the window with `Replayed`.
 #[expect(
     clippy::too_many_arguments,
     reason = "minimal decomposition of the nonce-commit protocol: nonce authority \

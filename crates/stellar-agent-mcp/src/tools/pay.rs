@@ -170,8 +170,8 @@ pub struct StellarPayArgs {
 /// 2. **Envelope divergence check:** the envelope is re-built from the
 ///    presented args + current source account state.  Divergence returns
 ///    `simulation.divergence`.
-/// 3. **Replay prevention:** the nonce salt is recorded in the in-memory
-///    `ReplayWindow` after verification.
+/// 3. **Replay prevention:** the full 48-byte nonce (salt and tag) is
+///    recorded in the in-memory `ReplayWindow` after verification.
 /// 4. **Mainnet refusal:** `destructive_hint = true`.
 ///
 /// # SEP-29 re-check at commit time
@@ -1113,8 +1113,8 @@ impl WalletServer {
     /// 3. **Envelope divergence check:** the envelope is re-built from the
     ///    presented args + current source account state.  Divergence returns
     ///    `simulation.divergence`.
-    /// 4. **Replay prevention:** the nonce salt is recorded in the in-memory
-    ///    `ReplayWindow` after verification.
+    /// 4. **Replay prevention:** the full 48-byte nonce (salt and tag) is
+    ///    recorded in the in-memory `ReplayWindow` after verification.
     /// 5. **Mainnet refusal:** `destructive_hint = true`.
     ///
     /// # Policy-evaluation order

@@ -692,9 +692,10 @@ impl WalletServer {
     ///    presented args + current source account state.  If the re-built
     ///    envelope differs from `envelope_xdr`, the call returns
     ///    `simulation.divergence` without signing.
-    /// 3. **Replay prevention:** the nonce salt is recorded in the in-memory
-    ///    `ReplayWindow` after successful verification; a second call with the
-    ///    same nonce returns `nonce.replayed`.
+    /// 3. **Replay prevention:** the full 48-byte nonce (salt and tag) is
+    ///    recorded in the in-memory `ReplayWindow` after successful
+    ///    verification; a second call with the same nonce returns
+    ///    `nonce.replayed`.
     /// 4. **Mainnet refusal:** `destructive_hint = true` causes
     ///    `NoopPolicyEngine` to return `Err(NotImplemented)` for mainnet
     ///    profiles.
