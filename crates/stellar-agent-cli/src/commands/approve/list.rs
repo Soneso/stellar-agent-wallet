@@ -303,10 +303,15 @@ fn render_summary_line(view: &PendingApprovalView) -> String {
         } => format!("register passkey for {smart_account_redacted} (rp_id={rp_id})"),
         ApprovalSummaryView::ToolsetFirstInvokeGate {
             toolset_name,
+            install_id,
+            package_version,
+            package_shasum_short,
             capability,
             destination_redacted,
             ..
-        } => format!("toolset '{toolset_name}' requests {capability} to {destination_redacted}"),
+        } => format!(
+            "toolset '{toolset_name}' {package_version} ({package_shasum_short}, install {install_id}) requests {capability} to {destination_redacted}"
+        ),
         ApprovalSummaryView::TrustlineClawbackOptIn {
             code,
             issuer_redacted,
@@ -875,5 +880,37 @@ mod tests {
             assert!(row.contains(&format!("{shown} on")), "{row}");
             assert!(!row.contains('\u{202e}'));
         }
+    }
+
+    #[test]
+    fn the_gate_summary_shows_version_shasum_and_install_id() {
+        let entry = PendingApproval::new_toolset_first_invoke_gate_pending(
+            "my-toolset".to_owned(),
+            "a".repeat(32),
+            "1.2.3".to_owned(),
+            "d".repeat(64),
+            "sign-payment".to_owned(),
+            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+            "XLM".to_owned(),
+            0,
+            10,
+            stellar_agent_core::approval::process_uid_for_attestation().unwrap(),
+            60_000,
+        )
+        .unwrap();
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut store =
+            stellar_agent_core::approval::PendingApprovalStore::open(dir.path().join("test.toml"))
+                .unwrap();
+        let now = entry.created_at_unix_ms;
+        store.insert(entry, now).unwrap();
+        let view = store.snapshot(now).remove(0);
+        let line = render_summary_line(&view);
+        assert!(line.contains(&format!(
+            "toolset 'my-toolset' 1.2.3 ({}, install {}) requests sign-payment",
+            "d".repeat(12),
+            "a".repeat(32)
+        )));
+        assert!(!line.contains(&"d".repeat(13)));
     }
 }

@@ -144,6 +144,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `compute_toolset_gate_digest`, `verify_toolset_gate_attestation`,
+  `build_attested_grant`, `record_first_invoke_grant`,
+  `new_toolset_first_invoke_gate_pending` and `ToolsetGrantRequest` take an install
+  identity, package version and package shasum. `ToolsetPinRecord::install_id`
+  holds the random identity minted at each install. `ToolsetGrant::matches` and
+  `GrantQuery` take the same three values. `ToolsetGrant`,
+  `ApprovalKind::ToolsetFirstInvokeGate` and
+  `ApprovalSummaryView::ToolsetFirstInvokeGate` gain the fields.
+  `verify_toolset_gate_entry_terms` is new.
+
 - `PendingApproval::new_rule_proposal_pending` computes the proposal digest
   from the stored account, network, chain, definition and summary line.
 - A log with an archive that carries no chain-root tag refuses keyed use until
@@ -662,6 +672,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   form `"100 TST"` with `TST:<issuer>` works.
 
 ### Security
+
+- A toolset install record carries a random install identity that its tag covers,
+  and every first-invoke approval request and grant is bound to that identity,
+  the package version and the package shasum. A request queued before a reinstall
+  yields no grant the new installation honors, and the approval surfaces show the
+  version, the shasum and the install identity. Install records and pending
+  first-invoke requests of an earlier build need a reinstall and a new request.
+  The gated resolver and `record_first_invoke_grant` refuse an attestation binding
+  of another profile with `toolset.binding_mismatch`.
 
 - A committed rule approval is recorded as spent in the platform keyring before
   the install starts. Restoring an earlier copy of the pending approval store

@@ -17,6 +17,7 @@
 //!
 //! A grant matches a payment envelope iff:
 //! - `toolset_name` == toolset name from the invoke call.
+//! - Its install identity, package version and package shasum equal the current pin.
 //! - `capability` == capability token (e.g. `"sign-payment"`).
 //! - `destination` == canonical G-strkey of the envelope destination.
 //! - `asset` == canonical `code:issuer` or `"XLM"` of the envelope asset.
@@ -32,6 +33,9 @@
 //! - **Install epoch**: grants must be issued at or after the start of the
 //!   second following the current pin's install time. A reinstall requires
 //!   fresh consent, including a forced install or an install after manual removal.
+//!   Each install mints a random identity. A grant names the install identity,
+//!   version and shasum it is approved for; a queued request for another identity
+//!   yields no grant the current installation honors.
 //! - An invalid install time honors no grant. Consent issued in the install
 //!   second re-prompts once.
 //!
@@ -93,6 +97,16 @@ pub struct ToolsetGrant {
     /// Name of the toolset the grant was issued to.
     pub toolset_name: String,
 
+    /// Random installation identity, 32 lowercase hex characters.
+    #[serde(default)]
+    pub install_id: String,
+    /// Package version the grant was approved for.
+    #[serde(default)]
+    pub package_version: String,
+    /// SHA-256 of the package the grant was approved for, 64 lowercase hex characters.
+    #[serde(default)]
+    pub package_shasum: String,
+
     /// Capability token (e.g. `"sign-payment"`).
     pub capability: String,
 
@@ -140,14 +154,18 @@ impl ToolsetGrant {
         self.expires_at_unix_ms <= now_unix_ms
     }
 
-    /// Compares the payment fields and clock against this grant's bucket and expiry.
+    /// Compares the installation, payment fields and clock against this grant's bucket and expiry.
     ///
     /// This is a field and clock comparison only. Use
     /// [`ToolsetGrantStore::find_matching`] for a verified lookup.
     #[must_use]
+    #[allow(clippy::too_many_arguments)]
     pub fn matches(
         &self,
         toolset_name: &str,
+        install_id: &str,
+        package_version: &str,
+        package_shasum: &str,
         capability: &str,
         destination: &str,
         asset: &str,
@@ -158,6 +176,9 @@ impl ToolsetGrant {
             return false;
         }
         self.toolset_name == toolset_name
+            && self.install_id == install_id
+            && self.package_version == package_version
+            && self.package_shasum == package_shasum
             && self.capability == capability
             && self.destination == destination
             && self.asset == asset
@@ -199,6 +220,9 @@ impl ToolsetGrant {
             binding,
             &self.grant_id,
             &self.toolset_name,
+            &self.install_id,
+            &self.package_version,
+            &self.package_shasum,
             &self.capability,
             &self.destination,
             &self.asset,
@@ -240,6 +264,12 @@ struct GrantStoreFile {
 pub struct GrantQuery<'a> {
     /// Installed toolset name from the invocation.
     pub toolset_name: &'a str,
+    /// Random installation identity, 32 lowercase hex characters.
+    pub install_id: &'a str,
+    /// Package version from the current verified pin.
+    pub package_version: &'a str,
+    /// SHA-256 of the package from the current verified pin, 64 lowercase hex characters.
+    pub package_shasum: &'a str,
     /// Signing-adjacent capability required by the action.
     pub capability: &'a str,
     /// Canonical destination from the authoritative invocation data.
@@ -342,6 +372,9 @@ impl ToolsetGrantStore {
         self.grants.iter().find(|g| {
             g.matches(
                 query.toolset_name,
+                query.install_id,
+                query.package_version,
+                query.package_shasum,
                 query.capability,
                 query.destination,
                 query.asset,
@@ -465,6 +498,41 @@ impl ToolsetGrantStore {
 // Grant construction helper
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Checks that a first-invoke request names a complete installation.
+///
+/// # Errors
+///
+/// Returns `approval.entry_inconsistent` when the installation fields are absent
+/// or malformed. Other approval kinds pass unchanged.
+pub fn verify_toolset_gate_entry_terms(
+    kind: &super::ApprovalKind,
+) -> Result<(), crate::error::WalletError> {
+    let super::ApprovalKind::ToolsetFirstInvokeGate {
+        install_id,
+        package_version,
+        package_shasum,
+        ..
+    } = kind
+    else {
+        return Ok(());
+    };
+    let lower_hex = |value: &str, len: usize| {
+        value.len() == len
+            && value
+                .bytes()
+                .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    };
+    if !lower_hex(install_id, 32)
+        || !(1..=64).contains(&package_version.len())
+        || !lower_hex(package_shasum, 64)
+    {
+        return Err(super::inconsistent(
+            "it names no installation; invoke the toolset again to request approval",
+        ));
+    }
+    Ok(())
+}
+
 /// Constructs and HMAC-attests a new [`ToolsetGrant`] from a confirmed
 /// `ToolsetFirstInvokeGate` approval.
 ///
@@ -475,6 +543,9 @@ impl ToolsetGrantStore {
 /// # Parameters
 ///
 /// - `toolset_name`: package name of the toolset.
+/// - `install_id`: random identity of the approved installation.
+/// - `package_version`: approved package version.
+/// - `package_shasum`: approved package SHA-256.
 /// - `capability`: capability token (e.g. `"sign-payment"`).
 /// - `destination`: canonical G-strkey destination.
 /// - `asset`: canonical asset identifier.
@@ -491,6 +562,9 @@ impl ToolsetGrantStore {
 #[allow(clippy::too_many_arguments)]
 pub fn build_attested_grant(
     toolset_name: String,
+    install_id: String,
+    package_version: String,
+    package_shasum: String,
     capability: String,
     destination: String,
     asset: String,
@@ -512,6 +586,9 @@ pub fn build_attested_grant(
     // Compute the digest for this grant shape.
     let digest = compute_toolset_gate_digest(
         &toolset_name,
+        &install_id,
+        &package_version,
+        &package_shasum,
         &capability,
         &destination,
         &asset,
@@ -533,6 +610,9 @@ pub fn build_attested_grant(
     Ok(ToolsetGrant {
         grant_id,
         toolset_name,
+        install_id,
+        package_version,
+        package_shasum,
         capability,
         destination,
         asset,
@@ -592,6 +672,9 @@ mod tests {
     ) -> ToolsetGrant {
         build_attested_grant(
             toolset.to_owned(),
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+            "1.0.0".to_owned(),
+            "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd".to_owned(),
             cap.to_owned(),
             DEST_G.to_owned(),
             "XLM".to_owned(),
@@ -609,6 +692,9 @@ mod tests {
     fn test_query() -> GrantQuery<'static> {
         GrantQuery {
             toolset_name: "my-toolset",
+            install_id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            package_version: "1.0.0",
+            package_shasum: "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
             capability: "sign-payment",
             destination: DEST_G,
             asset: "XLM",
@@ -636,6 +722,9 @@ mod tests {
         use hmac::{Hmac, KeyInit as _, Mac as _};
         let digest = compute_toolset_gate_digest(
             &grant.toolset_name,
+            &grant.install_id,
+            &grant.package_version,
+            &grant.package_shasum,
             &grant.capability,
             &grant.destination,
             &grant.asset,
@@ -838,6 +927,9 @@ mod tests {
         );
         assert!(grant.matches(
             "my-toolset",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "1.0.0",
+            "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
             "sign-payment",
             DEST_G,
             "XLM",
@@ -858,10 +950,23 @@ mod tests {
             &key,
         );
         // At min.
-        assert!(grant.matches("my-toolset", "sign-payment", DEST_G, "XLM", 0, NOW_MS));
+        assert!(grant.matches(
+            "my-toolset",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "1.0.0",
+            "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "sign-payment",
+            DEST_G,
+            "XLM",
+            0,
+            NOW_MS
+        ));
         // At max.
         assert!(grant.matches(
             "my-toolset",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "1.0.0",
+            "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
             "sign-payment",
             DEST_G,
             "XLM",
@@ -883,6 +988,9 @@ mod tests {
         );
         assert!(!grant.matches(
             "my-toolset",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "1.0.0",
+            "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
             "sign-payment",
             DEST_G,
             "XLM",
@@ -904,6 +1012,9 @@ mod tests {
         );
         assert!(!grant.matches(
             "other-toolset",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "1.0.0",
+            "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
             "sign-payment",
             DEST_G,
             "XLM",
@@ -928,6 +1039,9 @@ mod tests {
         // does exact string compare so any mismatch returns false.
         assert!(!grant.matches(
             "my-toolset",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "1.0.0",
+            "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
             "sign-payment",
             other_dest,
             "XLM",
@@ -949,12 +1063,45 @@ mod tests {
         );
         assert!(!grant.matches(
             "my-toolset",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "1.0.0",
+            "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
             "sign-payment",
             DEST_G,
             "USDC:Gxxxx",
             1_000,
             NOW_MS
         ));
+    }
+
+    /// Asserts that a grant found by `test_query()` is not found by `query`,
+    /// which differs from `test_query()` in one field.
+    fn assert_grant_misses(query: &GrantQuery<'_>) {
+        let key = [0x42; 32];
+        let binding = crate::approval::AttestationBinding::new("default", "stellar:testnet");
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = store_with_grant(
+            &dir,
+            make_grant("my-toolset", "sign-payment", 0, 10, 86_400_000, &key),
+        );
+        assert!(store.find_matching(&test_query(), &key, &binding).is_some());
+        assert!(store.find_matching(query, &key, &binding).is_none());
+    }
+
+    #[test]
+    fn grant_does_not_match_other_package_version() {
+        assert_grant_misses(&GrantQuery {
+            package_version: "1.0.1",
+            ..test_query()
+        });
+    }
+
+    #[test]
+    fn grant_does_not_match_other_package_shasum() {
+        assert_grant_misses(&GrantQuery {
+            package_shasum: "eddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            ..test_query()
+        });
     }
 
     // ── ToolsetGrant::is_expired ───────────────────────────────────────────────
@@ -1191,7 +1338,17 @@ mod tests {
             &key,
         );
         // Amount below min does NOT match.
-        assert!(!grant.matches("my-toolset", "sign-payment", DEST_G, "XLM", 999_999, NOW_MS));
+        assert!(!grant.matches(
+            "my-toolset",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "1.0.0",
+            "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "sign-payment",
+            DEST_G,
+            "XLM",
+            999_999,
+            NOW_MS
+        ));
     }
 
     // ── build_attested_grant KAT: same key+params → deterministic attestation ─
@@ -1201,6 +1358,9 @@ mod tests {
         let key = [0x99u8; 32];
         let grant = build_attested_grant(
             "my-toolset".to_owned(),
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+            "1.0.0".to_owned(),
+            "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd".to_owned(),
             "sign-payment".to_owned(),
             DEST_G.to_owned(),
             "XLM".to_owned(),
@@ -1242,6 +1402,9 @@ mod tests {
         let key = [0xabu8; 32];
         let grant = build_attested_grant(
             "verified-toolset".to_owned(),
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+            "1.0.0".to_owned(),
+            "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd".to_owned(),
             "sign-payment".to_owned(),
             DEST_G.to_owned(),
             "XLM".to_owned(),
@@ -1258,6 +1421,9 @@ mod tests {
         // Independently compute the expected digest.
         let expected_digest = compute_toolset_gate_digest(
             "verified-toolset",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "1.0.0",
+            "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
             "sign-payment",
             DEST_G,
             "XLM",
@@ -1320,5 +1486,40 @@ mod tests {
         assert!(reread.verify_attestation(&key, &binding));
         legacy.attestation_version = ATTESTATION_VERSION;
         assert!(!legacy.verify_attestation(&key, &binding));
+    }
+
+    #[test]
+    fn a_grant_without_an_install_identity_never_matches() {
+        let grant = make_grant("my-toolset", "sign-payment", 0, 10, 60_000, &[7; 32]);
+        let mut stored = toml::Value::try_from(&grant).unwrap();
+        for field in ["install_id", "package_version", "package_shasum"] {
+            stored.as_table_mut().unwrap().remove(field);
+        }
+        let mut legacy: ToolsetGrant = stored.try_into().unwrap();
+        // Retain package terms to isolate the install identity comparison.
+        legacy.package_version.clone_from(&grant.package_version);
+        legacy.package_shasum.clone_from(&grant.package_shasum);
+        assert!(!legacy.matches(
+            &grant.toolset_name,
+            &grant.install_id,
+            &grant.package_version,
+            &grant.package_shasum,
+            &grant.capability,
+            &grant.destination,
+            &grant.asset,
+            5,
+            NOW_MS
+        ));
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = store_with_grant(&dir, legacy);
+        assert!(
+            store
+                .find_matching(
+                    &test_query(),
+                    &[7; 32],
+                    &crate::approval::AttestationBinding::new("default", "stellar:testnet")
+                )
+                .is_none()
+        );
     }
 }

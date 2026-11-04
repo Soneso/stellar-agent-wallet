@@ -154,7 +154,8 @@ pub use view::{ApprovalSummaryView, PendingApprovalView};
 /// Returns `approval.entry_inconsistent` when a stored binding disagrees.
 pub fn verify_entry_terms(kind: &ApprovalKind) -> Result<(), crate::error::WalletError> {
     mpp::verify_mpp_entry_terms(kind)?;
-    verify_rule_proposal_entry_terms(kind)
+    verify_rule_proposal_entry_terms(kind)?;
+    toolset_grant::verify_toolset_gate_entry_terms(kind)
 }
 
 pub(crate) fn inconsistent(reason: &str) -> crate::error::WalletError {

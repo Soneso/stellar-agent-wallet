@@ -366,8 +366,8 @@ impl<'a> AttestationScope<'a> {
 ///
 /// A layout change bumps the tag; digests under the previous tag do not verify.
 ///
-/// Current version: `v1`.
-pub const TOOLSET_GATE_DOMAIN_TAG: &[u8] = b"stellar-agent-toolset-grant:v1";
+/// Current version: `v2`.
+pub const TOOLSET_GATE_DOMAIN_TAG: &[u8] = b"stellar-agent-toolset-grant:v2";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Public helpers
@@ -402,6 +402,9 @@ pub fn envelope_sha256(envelope_xdr_bytes: &[u8]) -> [u8; 32] {
 /// SHA-256(
 ///   TOOLSET_GATE_DOMAIN_TAG
 ///   || u32_be(len(toolset_name))  || toolset_name
+///   || u32_be(len(install_id)) || install_id
+///   || u32_be(len(package_version)) || package_version
+///   || u32_be(len(package_shasum)) || package_shasum
 ///   || u32_be(len(capability))  || capability
 ///   || u32_be(len(destination)) || destination   (canonical G-strkey)
 ///   || u32_be(len(asset))       || asset          (code:issuer or "XLM")
@@ -427,6 +430,9 @@ pub fn envelope_sha256(envelope_xdr_bytes: &[u8]) -> [u8; 32] {
 ///
 /// let digest = compute_toolset_gate_digest(
 ///     "my-toolset",
+///     "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+///     "1.0.0",
+///     "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
 ///     "sign-payment",
 ///     "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
 ///     "XLM",
@@ -436,8 +442,12 @@ pub fn envelope_sha256(envelope_xdr_bytes: &[u8]) -> [u8; 32] {
 /// assert_eq!(digest.len(), 32);
 /// ```
 #[must_use]
+#[allow(clippy::too_many_arguments)]
 pub fn compute_toolset_gate_digest(
     toolset_name: &str,
+    install_id: &str,
+    package_version: &str,
+    package_shasum: &str,
     capability: &str,
     destination: &str,
     asset: &str,
@@ -453,6 +463,18 @@ pub fn compute_toolset_gate_digest(
     let toolset_len = u32::try_from(toolset_name.len()).unwrap_or(u32::MAX);
     hasher.update(toolset_len.to_be_bytes());
     hasher.update(toolset_name.as_bytes());
+
+    let install_id_len = u32::try_from(install_id.len()).unwrap_or(u32::MAX);
+    hasher.update(install_id_len.to_be_bytes());
+    hasher.update(install_id.as_bytes());
+
+    let package_version_len = u32::try_from(package_version.len()).unwrap_or(u32::MAX);
+    hasher.update(package_version_len.to_be_bytes());
+    hasher.update(package_version.as_bytes());
+
+    let package_shasum_len = u32::try_from(package_shasum.len()).unwrap_or(u32::MAX);
+    hasher.update(package_shasum_len.to_be_bytes());
+    hasher.update(package_shasum.as_bytes());
 
     let cap_len = u32::try_from(capability.len()).unwrap_or(u32::MAX);
     hasher.update(cap_len.to_be_bytes());
@@ -479,7 +501,8 @@ pub fn compute_toolset_gate_digest(
 /// Verifies whether `attestation_blob` was produced by the HMAC-SHA256
 /// attestation of a `ToolsetFirstInvokeGate` approval with the given fields.
 ///
-/// Recomputes the toolset-gate digest from `toolset_name`, `capability`,
+/// Recomputes the toolset-gate digest from `toolset_name`, `install_id`,
+/// `package_version`, `package_shasum`, `capability`,
 /// `destination`, `asset`, `amount_min_stroops`, `amount_max_stroops` via
 /// [`compute_toolset_gate_digest`], then feeds the result as the
 /// `envelope_sha256` slot of [`verify_attestation`].
@@ -503,7 +526,10 @@ pub fn compute_toolset_gate_digest(
 ///
 /// let key = [0x42u8; 32];
 /// let digest = compute_toolset_gate_digest(
-///     "my-toolset", "sign-payment",
+///     "my-toolset",
+///     "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+///     "1.0.0",
+///     "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd", "sign-payment",
 ///     "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
 ///     "XLM", 0, 10_000_000,
 /// );
@@ -515,6 +541,9 @@ pub fn compute_toolset_gate_digest(
 ///     &key, &stellar_agent_core::approval::AttestationBinding::new("default", "stellar:testnet"),
 ///     "test-nonce",
 ///     "my-toolset",
+///     "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+///     "1.0.0",
+///     "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
 ///     "sign-payment",
 ///     "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
 ///     "XLM",
@@ -532,6 +561,9 @@ pub fn verify_toolset_gate_attestation(
     binding: &AttestationBinding<'_>,
     approval_nonce: &str,
     toolset_name: &str,
+    install_id: &str,
+    package_version: &str,
+    package_shasum: &str,
     capability: &str,
     destination: &str,
     asset: &str,
@@ -543,6 +575,9 @@ pub fn verify_toolset_gate_attestation(
 ) -> bool {
     let digest = compute_toolset_gate_digest(
         toolset_name,
+        install_id,
+        package_version,
+        package_shasum,
         capability,
         destination,
         asset,
@@ -1381,73 +1416,45 @@ mod tests {
         ));
     }
 
-    // ── Toolset-gate digest KAT ─────────────────────────────────────────────────
-    //
-    // Known-answer test vector for `compute_toolset_gate_digest`.  Any accidental
-    // change to the preimage layout is detected immediately.
-    // The expected bytes are computed by the reference Python below:
-    //
-    // ```python
-    // import hashlib, struct
-    // DOMAIN_TAG = b"stellar-agent-toolset-grant:v1"
-    // toolset_name = b"test-toolset"
-    // capability = b"sign-payment"
-    // destination = b"GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-    // asset = b"XLM"
-    // amount_min = 0
-    // amount_max = 10_000_000
-    //
-    // msg = (
-    //     DOMAIN_TAG
-    //     + struct.pack(">I", len(toolset_name)) + toolset_name
-    //     + struct.pack(">I", len(capability)) + capability
-    //     + struct.pack(">I", len(destination)) + destination
-    //     + struct.pack(">I", len(asset)) + asset
-    //     + struct.pack(">q", amount_min)
-    //     + struct.pack(">q", amount_max)
-    // )
-    // print(hashlib.sha256(msg).hexdigest())
-    // ```
-    //
-    // Run to regenerate if preimage layout changes (REQUIRES domain tag bump).
-
     #[test]
     fn compute_toolset_gate_digest_known_answer() {
-        const DEST_G: &str = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
-
-        let result = compute_toolset_gate_digest(
+        let digest = compute_toolset_gate_digest(
             "test-toolset",
+            &"a".repeat(32),
+            "1.0.0",
+            &"d".repeat(64),
             "sign-payment",
-            DEST_G,
+            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
             "XLM",
-            0_i64,
-            10_000_000_i64,
+            0,
+            10_000_000,
         );
-
-        // Reference Python gives the expected 32-byte hex digest.
-        // Recompute here using the same algorithm as the function under test.
-        let mut hasher = Sha256::new();
-        hasher.update(TOOLSET_GATE_DOMAIN_TAG);
-        let fields: &[&[u8]] = &[b"test-toolset", b"sign-payment", DEST_G.as_bytes(), b"XLM"];
-        for field in fields {
-            let len = u32::try_from(field.len()).unwrap().to_be_bytes();
-            hasher.update(len);
-            hasher.update(field);
-        }
-        hasher.update(0_i64.to_be_bytes());
-        hasher.update(10_000_000_i64.to_be_bytes());
-        let mut expected = [0u8; 32];
-        expected.copy_from_slice(&hasher.finalize());
-
+        // SHA-256 of the v2 domain, seven u32-length-prefixed strings and two i64 bounds.
         assert_eq!(
-            result, expected,
-            "KAT: compute_toolset_gate_digest output mismatch — domain tag or \
-             preimage layout changed; bump TOOLSET_GATE_DOMAIN_TAG version"
+            crate::hex::encode(&digest),
+            "dccd9eda4dc17ccc1f28dd15165fa04ff5931d9ece9b35ec5bd65688ead35010"
         );
-        assert_ne!(
-            result, [0u8; 32],
-            "KAT: toolset gate digest must not be all-zero"
-        );
+    }
+
+    #[test]
+    fn the_gate_digest_covers_the_install_identity() {
+        let digest = |identity: &str, version: &str, shasum: &str| {
+            compute_toolset_gate_digest(
+                "test-toolset",
+                identity,
+                version,
+                shasum,
+                "sign-payment",
+                "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+                "XLM",
+                0,
+                10_000_000,
+            )
+        };
+        let base = digest(&"a".repeat(32), "1.0.0", &"d".repeat(64));
+        assert_ne!(base, digest(&"b".repeat(32), "1.0.0", &"d".repeat(64)));
+        assert_ne!(base, digest(&"a".repeat(32), "1.0.1", &"d".repeat(64)));
+        assert_ne!(base, digest(&"a".repeat(32), "1.0.0", &"e".repeat(64)));
     }
 
     // ── Toolset-gate boundary-collision defence ─────────────────────────────────
@@ -1456,8 +1463,28 @@ mod tests {
     fn toolset_gate_digest_no_boundary_collision_toolset_cap() {
         // toolset="ab" cap="cd" must differ from toolset="a" cap="bcd" (length prefixes).
         const DEST_G: &str = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
-        let d1 = compute_toolset_gate_digest("ab", "cd", DEST_G, "XLM", 0, 1_000_000);
-        let d2 = compute_toolset_gate_digest("a", "bcd", DEST_G, "XLM", 0, 1_000_000);
+        let d1 = compute_toolset_gate_digest(
+            "ab",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "1.0.0",
+            "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "cd",
+            DEST_G,
+            "XLM",
+            0,
+            1_000_000,
+        );
+        let d2 = compute_toolset_gate_digest(
+            "a",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "1.0.0",
+            "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "bcd",
+            DEST_G,
+            "XLM",
+            0,
+            1_000_000,
+        );
         assert_ne!(
             d1, d2,
             "boundary collision detected in toolset_name/capability fields"
@@ -1470,8 +1497,17 @@ mod tests {
     fn verify_toolset_gate_attestation_round_trip() {
         const DEST_G: &str = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
         let key = [0x77u8; 32];
-        let digest =
-            compute_toolset_gate_digest("my-toolset", "sign-payment", DEST_G, "XLM", 0, 5_000_000);
+        let digest = compute_toolset_gate_digest(
+            "my-toolset",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "1.0.0",
+            "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "sign-payment",
+            DEST_G,
+            "XLM",
+            0,
+            5_000_000,
+        );
         let blob = v3(
             &key,
             &crate::approval::AttestationBinding::new("default", "stellar:testnet"),
@@ -1486,6 +1522,9 @@ mod tests {
                 &crate::approval::AttestationBinding::new("default", "stellar:testnet"),
                 "gate-nonce",
                 "my-toolset",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "1.0.0",
+                "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
                 "sign-payment",
                 DEST_G,
                 "XLM",
@@ -1503,8 +1542,17 @@ mod tests {
     fn verify_toolset_gate_attestation_wrong_toolset_fails() {
         const DEST_G: &str = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
         let key = [0x77u8; 32];
-        let digest =
-            compute_toolset_gate_digest("my-toolset", "sign-payment", DEST_G, "XLM", 0, 5_000_000);
+        let digest = compute_toolset_gate_digest(
+            "my-toolset",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "1.0.0",
+            "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "sign-payment",
+            DEST_G,
+            "XLM",
+            0,
+            5_000_000,
+        );
         let blob = v3(
             &key,
             &crate::approval::AttestationBinding::new("default", "stellar:testnet"),
@@ -1519,6 +1567,9 @@ mod tests {
                 &crate::approval::AttestationBinding::new("default", "stellar:testnet"),
                 "gate-nonce",
                 "other-toolset", // tampered
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "1.0.0",
+                "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
                 "sign-payment",
                 DEST_G,
                 "XLM",
@@ -1536,8 +1587,17 @@ mod tests {
     fn verify_toolset_gate_attestation_wrong_amount_fails() {
         const DEST_G: &str = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
         let key = [0x77u8; 32];
-        let digest =
-            compute_toolset_gate_digest("my-toolset", "sign-payment", DEST_G, "XLM", 0, 5_000_000);
+        let digest = compute_toolset_gate_digest(
+            "my-toolset",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "1.0.0",
+            "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "sign-payment",
+            DEST_G,
+            "XLM",
+            0,
+            5_000_000,
+        );
         let blob = v3(
             &key,
             &crate::approval::AttestationBinding::new("default", "stellar:testnet"),
@@ -1552,6 +1612,9 @@ mod tests {
                 &crate::approval::AttestationBinding::new("default", "stellar:testnet"),
                 "gate-nonce",
                 "my-toolset",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "1.0.0",
+                "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
                 "sign-payment",
                 DEST_G,
                 "XLM",

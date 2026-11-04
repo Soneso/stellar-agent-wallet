@@ -602,6 +602,7 @@ fn write_read_rules_toolset_pin(toolsets_root: &Path, toolset_name: &str) {
         &["read-rules"],
         &[],
         "2026-07-05T00:00:00Z",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         &toolset_pin_key(),
     )
     .expect("write toolset");

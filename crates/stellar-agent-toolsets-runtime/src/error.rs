@@ -114,8 +114,8 @@ pub enum ToolsetRuntimeError {
 
     /// Pre-check: the install record exists but does not verify.
     ///
-    /// Fires when no pin key is available, when the record was written in an
-    /// earlier format without an authentication tag, or when its tag does not
+    /// Fires when no pin key is available, when the record does not use the
+    /// current format, or when its tag does not
     /// verify under the installation's pin key (the record was edited or
     /// written under another key). Nothing the record states is trusted.
     ///
@@ -163,6 +163,12 @@ pub enum ToolsetRuntimeError {
         /// Capability token (e.g. `"sign-payment"`).
         capability: String,
     },
+
+    /// The binding and the call must name the same profile before any store opens.
+    #[error(
+        "toolset.binding_mismatch: the attestation binding and the toolset call name different profiles; the call was refused"
+    )]
+    BindingMismatch,
 
     /// Gated path: an I/O error occurred accessing the toolset grant store.
     #[error("toolset.grant_store_error: {detail}")]
@@ -221,6 +227,7 @@ mod tests {
                 detail: "test error".to_owned(),
             },
             ToolsetRuntimeError::InvalidAuthoritativeAmount,
+            ToolsetRuntimeError::BindingMismatch,
         ];
 
         // Collect display strings and verify they are all distinct.

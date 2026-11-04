@@ -725,6 +725,13 @@ impl WalletServer {
                             None,
                         )
                     }
+                    ToolsetRuntimeError::BindingMismatch
+                    | ToolsetRuntimeError::GrantStoreError { .. } => {
+                        rmcp::ErrorData::internal_error(
+                            format!("toolset.enforcement_error: {e}"),
+                            None,
+                        )
+                    }
                     _ => rmcp::ErrorData::internal_error(
                         format!("toolset.enforcement_error: {e}"),
                         None,
@@ -1005,6 +1012,13 @@ impl WalletServer {
                     | ToolsetRuntimeError::CapabilityNotDeclared { .. }
                     | ToolsetRuntimeError::ToolNotAllowed { .. } => {
                         rmcp::ErrorData::invalid_params(e.to_string(), None)
+                    }
+                    ToolsetRuntimeError::BindingMismatch
+                    | ToolsetRuntimeError::GrantStoreError { .. } => {
+                        rmcp::ErrorData::internal_error(
+                            format!("toolset.enforcement_error: {e}"),
+                            None,
+                        )
                     }
                     _ => rmcp::ErrorData::internal_error(
                         format!("toolset.enforcement_error: {e}"),
@@ -1391,6 +1405,7 @@ mod tests {
             &["read-balance"],
             &[],
             "2026-06-02T00:00:00Z",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             &pin_key(0x5a),
         )
         .unwrap();
@@ -1493,6 +1508,7 @@ mod tests {
             ],
             &[],
             "2026-06-02T00:00:00Z",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             &pin_key(0x5a),
         )
         .unwrap();
@@ -1609,6 +1625,7 @@ mod tests {
             &["read-balance"],
             &[],
             "2026-06-02T00:00:00Z",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             &pin_key(0x5a),
         )
         .unwrap();
@@ -1705,6 +1722,7 @@ mod tests {
             &["sign-payment", "sign-rule-create"],
             &[],
             "2026-06-02T00:00:00Z",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             &pin_key(0x5a),
         )
         .unwrap();
@@ -1724,6 +1742,9 @@ mod tests {
         ] {
             let grant = build_attested_grant(
                 "marker-tools".to_owned(),
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+                "1.0.0".to_owned(),
+                "0000000000000000000000000000000000000000000000000000000000000000".to_owned(),
                 capability.to_owned(),
                 destination.to_owned(),
                 asset.to_owned(),

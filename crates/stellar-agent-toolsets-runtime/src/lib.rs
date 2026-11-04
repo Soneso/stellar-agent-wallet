@@ -552,14 +552,16 @@ pub enum GatedResolveOutcome {
 ///   `RequireApproval` by the caller for toolset-routed payments. This function
 ///   returns `GatedResolveOutcome::Resolved` to signal the path is open; the
 ///   unconditional per-action approval enforcement is the caller's responsibility.
-/// - Only a verified version 3 grant within the default TTL and issued after
-///   the current installation suppresses the first-invoke prompt. A forged or
-///   edited grant suppresses nothing. Per-action payment approval always fires.
+/// - Only a verified version 3 grant for the current install identity, version
+///   and shasum, within the default TTL and issued after the current
+///   installation suppresses the first-invoke prompt. A forged or edited grant
+///   suppresses nothing. Per-action payment approval always fires.
 ///
 /// # Errors
 ///
 /// - [`ToolsetRuntimeError::ToolsetNotInstalled`]: toolset not installed or
 ///   name fails charset validation.
+/// - [`ToolsetRuntimeError::BindingMismatch`]: the binding names another profile.
 /// - [`ToolsetRuntimeError::PinUnverifiable`]: the pin record does not verify
 ///   under `params.pin_key`, or no key is available.
 /// - [`ToolsetRuntimeError::ContentDigestMismatch`]: the on-disk `TOOLSET.md`
@@ -579,6 +581,9 @@ pub enum GatedResolveOutcome {
 pub fn resolve_toolset_sign_payment_gated(
     params: &GatedInvokeParams<'_>,
 ) -> Result<GatedResolveOutcome, ToolsetRuntimeError> {
+    if params.attestation_binding.profile_name != params.profile_name {
+        return Err(ToolsetRuntimeError::BindingMismatch);
+    }
     let toolset_name = params.toolset_name;
     let action = params.action;
 
@@ -675,6 +680,9 @@ pub fn resolve_toolset_sign_payment_gated(
     let matching_grant = grant_store.find_matching(
         &GrantQuery {
             toolset_name,
+            install_id: &pin.install_id,
+            package_version: &pin.version,
+            package_shasum: &pin.shasum,
             capability: &capability_str,
             destination: params.authoritative_destination,
             asset: params.authoritative_asset,
@@ -723,6 +731,9 @@ pub fn resolve_toolset_sign_payment_gated(
     // Queue the ToolsetFirstInvokeGate pending approval.
     let pending = PendingApproval::new_toolset_first_invoke_gate_pending(
         toolset_name.to_owned(),
+        pin.install_id.clone(),
+        pin.version.clone(),
+        pin.shasum.clone(),
         capability_str.clone(),
         destination.to_owned(),
         asset.to_owned(),
@@ -798,11 +809,15 @@ pub type GrantStorePathOverride = Option<std::path::PathBuf>;
 ///
 /// # Errors
 ///
+/// - [`ToolsetRuntimeError::BindingMismatch`] when the binding names another profile.
 /// - [`ToolsetRuntimeError::GrantStoreError`] on grant store I/O failure.
 #[allow(clippy::too_many_arguments)]
 pub fn record_first_invoke_grant(
     profile_name: &str,
     toolset_name: &str,
+    install_id: &str,
+    package_version: &str,
+    package_shasum: &str,
     capability: &str,
     destination: &str,
     asset: &str,
@@ -816,8 +831,14 @@ pub fn record_first_invoke_grant(
     // Pass `None` in production; `Some(path)` in integration tests.
     grant_store_path_override: GrantStorePathOverride,
 ) -> Result<ToolsetGrant, ToolsetRuntimeError> {
+    if binding.profile_name != profile_name {
+        return Err(ToolsetRuntimeError::BindingMismatch);
+    }
     let grant = build_attested_grant(
         toolset_name.to_owned(),
+        install_id.to_owned(),
+        package_version.to_owned(),
+        package_shasum.to_owned(),
         capability.to_owned(),
         destination.to_owned(),
         asset.to_owned(),
@@ -1299,6 +1320,7 @@ mod tests {
             stellar_agent_toolsets::parse_capability_value_pub(caps).unwrap(),
             allowed_tools,
             stellar_agent_toolsets_install::sha256_hex_of(content.as_bytes()),
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         );
         write_pin(toolsets_root, &pin);
         pin
@@ -1362,6 +1384,7 @@ mod tests {
             caps,
             vec![],
             expected_digest,
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         );
         write_pin(toolsets_root, &pin);
 
@@ -1401,6 +1424,7 @@ mod tests {
             caps,
             vec![],
             original_digest,
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         );
         write_pin(toolsets_root, &pin);
 
@@ -1452,6 +1476,7 @@ mod tests {
             caps,
             vec![],
             "a".repeat(64),
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         );
         write_pin(toolsets_root, &pin);
 
@@ -1617,6 +1642,7 @@ mod tests {
                 caps,
                 vec![],
                 "e".repeat(64),
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             );
             write_pin(toolsets_root, &pin);
         }
@@ -1658,6 +1684,7 @@ mod tests {
             caps,
             vec![],
             "e".repeat(64),
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         );
         write_pin(toolsets_root, &pin);
 
@@ -1686,6 +1713,7 @@ mod tests {
             caps,
             vec!["stellar_balances".to_owned()],
             "e".repeat(64),
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         );
         write_pin(toolsets_root, &pin);
 
@@ -1817,6 +1845,9 @@ mod tests {
             record_first_invoke_grant(
                 "test",
                 "pay-toolset",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "1.0.0",
+                "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
                 "sign-payment",
                 Self::DESTINATION,
                 "XLM",
@@ -2018,7 +2049,7 @@ attestation_version = 3
             profile_name: "test",
             attestation_key: &[0u8; 32],
             attestation_binding: &stellar_agent_core::approval::AttestationBinding::new(
-                "default",
+                "test",
                 "stellar:testnet",
             ),
             authoritative_destination: "GBPXXOA5N4JYPESHAADMQKBPWZWQDQ64ZV6ZL2S3LAGW4SY7NTCMWIVL",
@@ -2054,7 +2085,7 @@ attestation_version = 3
             profile_name: "test",
             attestation_key: &[0u8; 32],
             attestation_binding: &stellar_agent_core::approval::AttestationBinding::new(
-                "default",
+                "test",
                 "stellar:testnet",
             ),
             authoritative_destination: "GBPXXOA5N4JYPESHAADMQKBPWZWQDQ64ZV6ZL2S3LAGW4SY7NTCMWIVL",
@@ -2093,7 +2124,7 @@ attestation_version = 3
             profile_name: "test",
             attestation_key: &[0u8; 32],
             attestation_binding: &stellar_agent_core::approval::AttestationBinding::new(
-                "default",
+                "test",
                 "stellar:testnet",
             ),
             authoritative_destination: "GBPXXOA5N4JYPESHAADMQKBPWZWQDQ64ZV6ZL2S3LAGW4SY7NTCMWIVL",
@@ -2138,7 +2169,7 @@ attestation_version = 3
             profile_name: "test",
             attestation_key: &[0u8; 32],
             attestation_binding: &stellar_agent_core::approval::AttestationBinding::new(
-                "default",
+                "test",
                 "stellar:testnet",
             ),
             authoritative_destination: "GBPXXOA5N4JYPESHAADMQKBPWZWQDQ64ZV6ZL2S3LAGW4SY7NTCMWIVL",
@@ -2183,7 +2214,7 @@ attestation_version = 3
             profile_name: "test",
             attestation_key: &[0u8; 32],
             attestation_binding: &stellar_agent_core::approval::AttestationBinding::new(
-                "default",
+                "test",
                 "stellar:testnet",
             ),
             authoritative_destination: "GBPXXOA5N4JYPESHAADMQKBPWZWQDQ64ZV6ZL2S3LAGW4SY7NTCMWIVL",
@@ -2221,7 +2252,7 @@ attestation_version = 3
             profile_name: "test",
             attestation_key: &[0u8; 32],
             attestation_binding: &stellar_agent_core::approval::AttestationBinding::new(
-                "default",
+                "test",
                 "stellar:testnet",
             ),
             authoritative_destination: "GBPXXOA5N4JYPESHAADMQKBPWZWQDQ64ZV6ZL2S3LAGW4SY7NTCMWIVL",
@@ -2279,6 +2310,9 @@ attestation_version = 3
         record_first_invoke_grant(
             "test",
             "pay-toolset",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "1.0.0",
+            "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
             "sign-payment",
             destination,
             asset,
@@ -2287,7 +2321,7 @@ attestation_version = 3
             &uid,
             now_unix_ms,
             &attestation_key,
-            &stellar_agent_core::approval::AttestationBinding::new("default", "stellar:testnet"),
+            &stellar_agent_core::approval::AttestationBinding::new("test", "stellar:testnet"),
             Some(grant_path.clone()),
         )
         .unwrap();
@@ -2299,7 +2333,7 @@ attestation_version = 3
             profile_name: "test",
             attestation_key: &attestation_key,
             attestation_binding: &stellar_agent_core::approval::AttestationBinding::new(
-                "default",
+                "test",
                 "stellar:testnet",
             ),
             authoritative_destination: destination,
@@ -2368,7 +2402,7 @@ attestation_version = 3
             profile_name: "test",
             attestation_key: &[0u8; 32],
             attestation_binding: &stellar_agent_core::approval::AttestationBinding::new(
-                "default",
+                "test",
                 "stellar:testnet",
             ),
             authoritative_destination: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
@@ -2421,6 +2455,9 @@ attestation_version = 3
         record_first_invoke_grant(
             "test",
             "rule-toolset",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "1.0.0",
+            "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
             "sign-rule-create",
             smart_account,
             SIGN_RULE_CREATE_ASSET_SENTINEL,
@@ -2429,7 +2466,7 @@ attestation_version = 3
             &uid,
             now_unix_ms,
             &attestation_key,
-            &stellar_agent_core::approval::AttestationBinding::new("default", "stellar:testnet"),
+            &stellar_agent_core::approval::AttestationBinding::new("test", "stellar:testnet"),
             Some(grant_path.clone()),
         )
         .unwrap();
@@ -2441,7 +2478,7 @@ attestation_version = 3
             profile_name: "test",
             attestation_key: &attestation_key,
             attestation_binding: &stellar_agent_core::approval::AttestationBinding::new(
-                "default",
+                "test",
                 "stellar:testnet",
             ),
             authoritative_destination: smart_account,
@@ -2508,6 +2545,9 @@ attestation_version = 3
         record_first_invoke_grant(
             "test",
             "pay-toolset",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "1.0.0",
+            "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
             "sign-payment",
             destination,
             asset,
@@ -2516,7 +2556,7 @@ attestation_version = 3
             &uid,
             now_unix_ms,
             &attestation_key,
-            &stellar_agent_core::approval::AttestationBinding::new("default", "stellar:testnet"),
+            &stellar_agent_core::approval::AttestationBinding::new("test", "stellar:testnet"),
             Some(grant_path.clone()),
         )
         .unwrap();
@@ -2528,7 +2568,7 @@ attestation_version = 3
             profile_name: "test",
             attestation_key: &attestation_key,
             attestation_binding: &stellar_agent_core::approval::AttestationBinding::new(
-                "default",
+                "test",
                 "stellar:testnet",
             ),
             authoritative_destination: destination,
@@ -2566,7 +2606,7 @@ attestation_version = 3
             profile_name: "test",
             attestation_key: &[0u8; 32],
             attestation_binding: &stellar_agent_core::approval::AttestationBinding::new(
-                "default",
+                "test",
                 "stellar:testnet",
             ),
             authoritative_destination: "GBPXXOA5N4JYPESHAADMQKBPWZWQDQ64ZV6ZL2S3LAGW4SY7NTCMWIVL",
@@ -2602,7 +2642,7 @@ attestation_version = 3
             profile_name: "test",
             attestation_key: &[0u8; 32],
             attestation_binding: &stellar_agent_core::approval::AttestationBinding::new(
-                "default",
+                "test",
                 "stellar:testnet",
             ),
             authoritative_destination: "GBPXXOA5N4JYPESHAADMQKBPWZWQDQ64ZV6ZL2S3LAGW4SY7NTCMWIVL",
@@ -2655,7 +2695,7 @@ attestation_version = 3
             profile_name: "test",
             attestation_key: &[0u8; 32],
             attestation_binding: &stellar_agent_core::approval::AttestationBinding::new(
-                "default",
+                "test",
                 "stellar:testnet",
             ),
             authoritative_destination: "GBPXXOA5N4JYPESHAADMQKBPWZWQDQ64ZV6ZL2S3LAGW4SY7NTCMWIVL",
@@ -2725,6 +2765,9 @@ attestation_version = 3
         record_first_invoke_grant(
             "test",
             "pay-toolset",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "1.0.0",
+            "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
             "sign-payment",
             destination,
             asset,
@@ -2733,7 +2776,7 @@ attestation_version = 3
             &uid,
             now_unix_ms,
             &attestation_key,
-            &stellar_agent_core::approval::AttestationBinding::new("default", "stellar:testnet"),
+            &stellar_agent_core::approval::AttestationBinding::new("test", "stellar:testnet"),
             Some(grant_path.clone()),
         )
         .unwrap();
@@ -2748,7 +2791,7 @@ attestation_version = 3
             profile_name: "test",
             attestation_key: &attestation_key,
             attestation_binding: &stellar_agent_core::approval::AttestationBinding::new(
-                "default",
+                "test",
                 "stellar:testnet",
             ),
             authoritative_destination: destination,
@@ -2800,8 +2843,11 @@ attestation_version = 3
         let attestation_key = [1u8; 32];
 
         let grant = record_first_invoke_grant(
-            "prod",
+            "test",
             "my-toolset",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "1.0.0",
+            "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
             "sign-payment",
             "GBPXXOA5N4JYPESHAADMQKBPWZWQDQ64ZV6ZL2S3LAGW4SY7NTCMWIVL",
             "XLM",
@@ -2810,7 +2856,7 @@ attestation_version = 3
             &uid,
             now_unix_ms,
             &attestation_key,
-            &stellar_agent_core::approval::AttestationBinding::new("default", "stellar:testnet"),
+            &stellar_agent_core::approval::AttestationBinding::new("test", "stellar:testnet"),
             Some(grant_path.clone()),
         )
         .unwrap();
@@ -2822,20 +2868,14 @@ attestation_version = 3
         assert!(
             grant.verify_attestation(
                 &attestation_key,
-                &stellar_agent_core::approval::AttestationBinding::new(
-                    "default",
-                    "stellar:testnet"
-                )
+                &stellar_agent_core::approval::AttestationBinding::new("test", "stellar:testnet")
             ),
             "grant must verify against the attestation key it was built with"
         );
         assert!(
             !grant.verify_attestation(
                 &[0xff; 32],
-                &stellar_agent_core::approval::AttestationBinding::new(
-                    "default",
-                    "stellar:testnet"
-                )
+                &stellar_agent_core::approval::AttestationBinding::new("test", "stellar:testnet")
             ),
             "grant must NOT verify against a wrong attestation key"
         );
@@ -2846,6 +2886,9 @@ attestation_version = 3
         let found = store.find_matching(
             &GrantQuery {
                 toolset_name: "my-toolset",
+                install_id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                package_version: "1.0.0",
+                package_shasum: "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
                 capability: "sign-payment",
                 destination: "GBPXXOA5N4JYPESHAADMQKBPWZWQDQ64ZV6ZL2S3LAGW4SY7NTCMWIVL",
                 asset: "XLM",
@@ -2854,8 +2897,191 @@ attestation_version = 3
                 not_before_unix_ms: 0,
             },
             &attestation_key,
-            &stellar_agent_core::approval::AttestationBinding::new("default", "stellar:testnet"),
+            &stellar_agent_core::approval::AttestationBinding::new("test", "stellar:testnet"),
         );
         assert!(found.is_some(), "persisted grant must be findable in store");
+    }
+
+    #[test]
+    #[cfg(feature = "test-helpers")]
+    fn a_grant_approved_for_an_earlier_install_is_not_honored() {
+        use ed25519_dalek::{Signer as _, SigningKey};
+        use std::io::Write as _;
+        use stellar_agent_core::approval::{ApprovalKind, PendingApprovalStore};
+        use stellar_agent_toolsets_install::{
+            InstallOptions, install_toolset, lock_toolsets, read_pin, sha256_hex_of,
+        };
+
+        let fixture = GatedGrantFixture::new();
+        let manifest = b"---\nname: pay-toolset\ndescription: test payment toolset\nmetadata:\n  stellar-agent-capabilities: sign-payment\n---\nBody.\n";
+        let mut archive = tar::Builder::new(Vec::new());
+        let mut header = tar::Header::new_gnu();
+        header.set_size(u64::try_from(manifest.len()).unwrap());
+        header.set_mode(0o644);
+        header.set_cksum();
+        archive
+            .append_data(&mut header, "pay-toolset/TOOLSET.md", &manifest[..])
+            .unwrap();
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(&archive.into_inner().unwrap()).unwrap();
+        let package = encoder.finish().unwrap();
+        let shasum = sha256_hex_of(&package);
+        let signer = SigningKey::from_bytes(&[17; 32]);
+        let publisher = signer.verifying_key().to_bytes();
+        let signature = signer
+            .sign(&stellar_agent_toolsets_install::signature::build_preimage(
+                "pay-toolset",
+                "1.0.0",
+                &shasum,
+            ))
+            .to_bytes();
+        let trust = fixture.dir.path().join("trust.txt");
+        std::fs::write(
+            &trust,
+            stellar_strkey::ed25519::PublicKey(publisher).to_string(),
+        )
+        .unwrap();
+        let auditor_trust = fixture.dir.path().join("auditor-trust.txt");
+        std::fs::write(&auditor_trust, "").unwrap();
+        let install = || {
+            let lock = lock_toolsets(fixture.dir.path()).unwrap();
+            install_toolset(
+                "pay-toolset",
+                "1.0.0",
+                &package,
+                &shasum,
+                &signature,
+                &publisher,
+                fixture.dir.path(),
+                &trust,
+                None,
+                &auditor_trust,
+                &InstallOptions {
+                    force: true,
+                    override_attestation: true,
+                    ..InstallOptions::default()
+                },
+                &lock,
+                test_pin_key(),
+            )
+            .unwrap();
+            // Both authentic pins carry the same second, independent of test duration.
+            fixture.set_install_time("2026-01-01T00:00:00Z");
+            read_pin("pay-toolset", fixture.dir.path(), Some(test_pin_key()))
+                .unwrap()
+                .unwrap()
+        };
+        let pin_a = install();
+        let GatedResolveOutcome::FirstInvokeApprovalRequired { approval_nonce, .. } =
+            resolve_toolset_sign_payment_gated(&fixture.params()).unwrap()
+        else {
+            panic!("installation A needs consent")
+        };
+        let approval_path = fixture.dir.path().join("approvals/test.toml");
+        let queued = {
+            let store = PendingApprovalStore::open(approval_path.clone()).unwrap();
+            store.get(&approval_nonce).unwrap().clone()
+        };
+        let pin_b = install();
+        assert_eq!(pin_a.installed_at, pin_b.installed_at);
+        let ApprovalKind::ToolsetFirstInvokeGate {
+            toolset_name,
+            install_id,
+            package_version,
+            package_shasum,
+            capability,
+            destination,
+            asset,
+            amount_min_stroops,
+            amount_max_stroops,
+        } = queued.kind
+        else {
+            panic!("expected a gate request")
+        };
+        assert_eq!(install_id, pin_a.install_id);
+        record_first_invoke_grant(
+            "test",
+            &toolset_name,
+            &install_id,
+            &package_version,
+            &package_shasum,
+            &capability,
+            &destination,
+            &asset,
+            amount_min_stroops,
+            amount_max_stroops,
+            "1000",
+            GatedGrantFixture::NOW_MS,
+            &GatedGrantFixture::KEY,
+            &fixture.binding,
+            fixture.params().grant_store_path_override,
+        )
+        .unwrap();
+        let GatedResolveOutcome::FirstInvokeApprovalRequired {
+            approval_nonce: fresh_nonce,
+            ..
+        } = resolve_toolset_sign_payment_gated(&fixture.params()).unwrap()
+        else {
+            panic!("installation B must request fresh consent")
+        };
+        assert_ne!(approval_nonce, fresh_nonce);
+        let store = PendingApprovalStore::open(approval_path).unwrap();
+        let ApprovalKind::ToolsetFirstInvokeGate {
+            install_id,
+            package_version,
+            package_shasum,
+            ..
+        } = &store.get(&fresh_nonce).unwrap().kind
+        else {
+            panic!("expected a new gate request")
+        };
+        assert_eq!(install_id, &pin_b.install_id);
+        assert_eq!(package_version, &pin_b.version);
+        assert_eq!(package_shasum, &pin_b.shasum);
+    }
+
+    #[test]
+    #[cfg(feature = "test-helpers")]
+    fn a_binding_for_another_profile_is_refused() {
+        let fixture = GatedGrantFixture::new();
+        let binding = stellar_agent_core::approval::AttestationBinding::new(
+            "binding-marker",
+            "stellar:testnet",
+        );
+        let untouched = fixture.dir.path().join("untouched");
+        let mut params = fixture.params();
+        params.profile_name = "store-marker";
+        params.attestation_binding = &binding;
+        params.grant_store_path_override = Some(untouched.join("grants.toml"));
+        params.approval_dir_override = Some(untouched.join("approvals"));
+        let error = resolve_toolset_sign_payment_gated(&params).unwrap_err();
+        let grant_error = record_first_invoke_grant(
+            "store-marker",
+            "pay-toolset",
+            &"a".repeat(32),
+            "1.0.0",
+            &"d".repeat(64),
+            "sign-payment",
+            GatedGrantFixture::DESTINATION,
+            "XLM",
+            0,
+            10,
+            "1000",
+            GatedGrantFixture::NOW_MS,
+            &GatedGrantFixture::KEY,
+            &binding,
+            params.grant_store_path_override.clone(),
+        )
+        .unwrap_err();
+        for error in [error, grant_error] {
+            assert!(matches!(error, ToolsetRuntimeError::BindingMismatch));
+            assert!(error.to_string().contains("toolset.binding_mismatch"));
+            for rendered in [error.to_string(), format!("{error:?}")] {
+                assert!(!rendered.contains("binding-marker"));
+                assert!(!rendered.contains("store-marker"));
+            }
+            assert!(std::error::Error::source(&error).is_none());
+        }
+        assert!(!untouched.exists(), "neither entry point opens a store");
     }
 }

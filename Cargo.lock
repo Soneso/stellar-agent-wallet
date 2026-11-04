@@ -5359,12 +5359,16 @@ dependencies = [
 name = "stellar-agent-toolsets-runtime"
 version = "0.1.0-alpha.13"
 dependencies = [
+ "ed25519-dalek",
+ "flate2",
  "serde",
  "serde_json",
  "stellar-agent-core",
  "stellar-agent-test-support",
  "stellar-agent-toolsets",
  "stellar-agent-toolsets-install",
+ "stellar-strkey 0.0.18",
+ "tar",
  "tempfile",
  "thiserror 2.0.21",
  "tracing",

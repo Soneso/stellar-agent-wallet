@@ -334,6 +334,9 @@ fn consent_subject_covers_supported_kinds_only() {
     );
     let gate = PendingApproval::new_toolset_first_invoke_gate_pending(
         "toolset".to_owned(),
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+        "1.0.0".to_owned(),
+        "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd".to_owned(),
         "sign-payment".to_owned(),
         "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
         "XLM".to_owned(),

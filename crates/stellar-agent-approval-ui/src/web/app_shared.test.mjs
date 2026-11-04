@@ -44,7 +44,8 @@ function renderedRow(view) {
   const container = element();
   renderers.renderInbox(container, [view]);
   const main = container.children[0].children[1];
-  return { headline: main.children[0].textContent, meta: main.children[1].textContent };
+  return { headline: main.children[0].textContent, meta: main.children[1].textContent,
+    metaClasses: main.children[1].className.split(" ") };
 }
 
 test("claim row renders signed fields and the ledger-value qualification", () => {
@@ -53,6 +54,7 @@ test("claim row renders signed fields and the ledger-value qualification", () =>
   const row = renderedRow(view);
   assert.equal(row.headline, "Claim balance B123");
   assert.equal(row.meta, "source G123 · fee 100 stroops · sequence 42 · asset and amount: not part of the signed claim transaction · memo none");
+  assert.deepEqual(row.metaClasses, ["ap-meta"]);
 });
 
 test("path payment row labels the ceiling and destination terms", () => {
@@ -63,6 +65,20 @@ test("path payment row labels the ceiling and destination terms", () => {
   assert.match(row.headline, /1.*XLM/);
   assert.match(row.meta, /destination receives at least 2.*USD/);
   assert.match(row.meta, /to G123/);
+});
+
+test("toolset gate row names the version, the shasum prefix and the install identity", () => {
+  const view = { kind_name: "ToolsetFirstInvokeGate", summary: {
+    kind: "toolset_first_invoke_gate", toolset_name: "pay-toolset", package_version: "1.2.0",
+    package_shasum_short: "0123456789ab", install_id: "fedcba9876543210fedcba9876543210",
+    capability: "sign-payment", destination_redacted: "GAAAA...AAAAA", asset: "XLM",
+    amount_min_stroops: "1", amount_max_stroops: "10000000",
+  }};
+  const row = renderedRow(view);
+  assert.equal(row.headline, "Toolset capability request");
+  assert.equal(row.meta, "pay-toolset 1.2.0 · sha256 0123456789ab · " +
+    "install fedcba9876543210fedcba9876543210 · requests sign-payment");
+  assert.deepEqual(row.metaClasses, ["ap-meta", "toolset-gate"]);
 });
 
 // testdata/inbox_bidi.json is the inbox JSON the Rust test

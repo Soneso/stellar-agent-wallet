@@ -196,9 +196,9 @@ is defence-in-depth layered before them.
 
 The publisher and auditor trust sets (`trust.txt`, `auditor-trust.txt`) default to
 plain operator-held files in the toolsets directory, read at install time only and
-not authenticated. A restored toolset directory with an earlier record of the same
-package verifies again after an uninstall: the record's tag binds its fields, not
-the install event, and the restored state is one the operator installed.
+not authenticated. A restored toolset directory with its authentic v3 record
+verifies again, and a saved grant for that install identity can match within its
+lifetime. The restored state is one the operator installed.
 
 ### The attestation gate
 
@@ -225,12 +225,15 @@ set: `--override-attestation` on a non-key-touching toolset reports `not-require
 
 ### The pin record and the capability-source invariant
 
+Every install, a forced reinstall included, mints a random 16-byte `install_id`,
+encoded as 32 lowercase hex characters and covered by the pin tag.
+
 A successful install writes a pin record holding `package`, `version`, `shasum`,
-`publisher`, `installed_at`, the verified `capabilities`, `allowed_tools`, and the
+`publisher`, `installed_at`, `install_id`, the verified `capabilities`, `allowed_tools`, and the
 mandatory SHA-256 digest of the installed `TOOLSET.md`. The record is
-`{"v":2, <fields>, "tag":"<64 hex>"}`, the tag an HMAC-SHA256 over every field under
+`{"v":3, <fields>, "tag":"<64 hex>"}`, the tag an HMAC-SHA256 over every field under
 the installation's pin key. A record that does not verify (edited, written under
-another key, or written by an earlier build without a tag) grants nothing and
+another key, or written by an earlier build) grants nothing and
 refuses with `toolset.pin_unverifiable`; the operator uninstalls the toolset and
 installs it again.
 
@@ -269,11 +272,16 @@ nonce. The operator approves out of band with
 agent then re-invokes.
 
 A matching grant requires a version 3 HMAC that verifies under the profile's
-attestation key and profile/chain binding. It must be unexpired, with a lifetime
+attestation key and profile/chain binding. It names the current install identity,
+package version and package shasum. It must be unexpired, with a lifetime
 of at most 30 days, and issued no later than the current time and at or after
 the second following the current installation. An invalid install time honors
 no grant. Consent issued in the install second re-prompts once. A forged or
-edited grant suppresses nothing.
+edited grant suppresses nothing. A request queued before any reinstall, in the
+same second included, yields no grant the new installation honors. Approval
+surfaces show the version, the first 12 shasum characters and the install identity.
+A pending request without these fields cannot be approved; invoke again to request
+fresh consent.
 
 A matching grant suppresses only the first-invoke re-prompt. Per-action payment
 approval fires on every toolset-routed payment: a policy-engine `Allow` becomes
@@ -440,7 +448,8 @@ requested package name (never a name or path read from the record). It refuses a
 symlinked leaf and removes the directory and pin, so a toolset whose record does
 not verify can be removed and installed again. Grants
 approved for the removed package do not apply to a later install, including a
-forced reinstall or an install after manual removal.
+forced reinstall or an install after manual removal. Each install needs fresh
+consent for its new identity.
 
 Positional: `<PACKAGE>`: the package name (`[a-z0-9-]`).
 
