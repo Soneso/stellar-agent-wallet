@@ -206,17 +206,8 @@ impl Wallet {
         clock: Arc<dyn Clock>,
     ) -> Result<Self, WalletLifecycleError> {
         // ── Validate TTL ─────────────────────────────────────────────────────
-        if ttl_seconds == 0 {
-            return Err(WalletLifecycleError::TtlInvalid {
-                ttl_seconds,
-                reason: "TTL must be > 0 seconds".to_owned(),
-            });
-        }
-        if ttl_seconds > MAX_TTL_SECONDS {
-            return Err(WalletLifecycleError::TtlInvalid {
-                ttl_seconds,
-                reason: format!("TTL must be ≤ {MAX_TTL_SECONDS} seconds (10 minutes)"),
-            });
+        if ttl_seconds == 0 || ttl_seconds > MAX_TTL_SECONDS {
+            return Err(WalletLifecycleError::TtlInvalid);
         }
 
         // ── Construct the locked seed ────────────────────────────────────────
@@ -499,7 +490,7 @@ mod tests {
         )
         .unwrap_err();
         assert!(
-            matches!(err, WalletLifecycleError::TtlInvalid { ttl_seconds: 0, .. }),
+            matches!(err, WalletLifecycleError::TtlInvalid),
             "got: {err:?}"
         );
     }
@@ -514,15 +505,37 @@ mod tests {
         )
         .unwrap_err();
         assert!(
-            matches!(
-                err,
-                WalletLifecycleError::TtlInvalid {
-                    ttl_seconds,
-                    ..
-                } if ttl_seconds == MAX_TTL_SECONDS + 1
-            ),
+            matches!(err, WalletLifecycleError::TtlInvalid),
             "got: {err:?}"
         );
+    }
+
+    /// A refused TTL reaches neither the lifecycle error nor the wallet-state
+    /// error that forwards it.
+    #[test]
+    fn refused_ttl_stays_out_of_both_errors() {
+        use stellar_agent_test_support::rejected_value::assert_no_marker;
+        let expected = "wallet.unlock_ttl_seconds must be an integer from 1 through 600; update \
+                        the profile and retry unlocking.";
+        for ttl in [0, 424_242] {
+            let err = Wallet::unlock(
+                "test-profile".to_owned(),
+                &Zeroizing::new(TEST_SEED),
+                ttl,
+                MlockRequired::False,
+            )
+            .unwrap_err();
+            assert_eq!(err.to_string(), expected);
+            assert_no_marker(&err, "424242");
+            let forwarded = crate::error::WalletStateError::UnlockFailed {
+                detail: err.to_string(),
+            };
+            assert_eq!(
+                forwarded.to_string(),
+                format!("wallet unlock failed: {expected}")
+            );
+            assert_no_marker(&forwarded, "424242");
+        }
     }
 
     #[test]

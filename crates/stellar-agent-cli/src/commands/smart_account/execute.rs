@@ -339,11 +339,11 @@ fn validate_execute_inputs(
             },
         ) {
             Ok(v) => sc_args.push(v),
-            Err(e) => {
+            Err(_) => {
                 return Err(WalletError::Validation(
                     ValidationError::XdrArgumentMalformed {
                         arg: format!("arg[{idx}]"),
-                        reason: format!("{e}"),
+                        reason: stellar_agent_core::envelope_decode::SCVAL_XDR_FORM.to_owned(),
                     },
                 ));
             }

@@ -42,7 +42,7 @@
 ///
 /// `sanitise_display` is `pub`.  Its behaviour is observable through the
 /// `Display` impl of [`crate::ToolsetFormatError`] variants that carry
-/// attacker-controlled strings (`token`, `key`, `detail`, `name`, `dir`),
+/// attacker-controlled strings (`detail`),
 /// and is intended for reuse by the install layer for redacting I/O error
 /// paths and other attacker-influenced strings.
 ///
@@ -51,10 +51,10 @@
 /// ```
 /// use stellar_agent_toolsets::ToolsetFormatError;
 ///
-/// // A token with ANSI escape codes and a newline — the rendered error must
+/// // A detail with ANSI escape codes and a newline: the rendered error must
 /// // not contain raw escape bytes or newlines.
-/// let err = ToolsetFormatError::UnknownCapability {
-///     token: "\x1b[31mbad\ntoken\x1b[0m".to_owned(),
+/// let err = ToolsetFormatError::MalformedFrontmatter {
+///     detail: "\x1b[31mbad\ndetail\x1b[0m".to_owned(),
 /// };
 /// let rendered = err.to_string();
 /// assert!(!rendered.contains('\x1b'), "ANSI escape must be stripped");

@@ -204,8 +204,6 @@ where
     let public_key = lease.public_key().to_owned();
 
     tracing::debug!(
-        channel = %redact_strkey_first5_last5(&public_key),
-        index = channel_index,
         seq = lease.sequence_number(),
         "submit_pooled: channel acquired"
     );
@@ -228,8 +226,7 @@ where
             pool.release(lease, TerminalOutcome::Failed, None);
             tracing::warn!(
                 channel = %redact_strkey_first5_last5(&public_key),
-                index = channel_index,
-                error = %e,
+                error_class = "channel_key_derivation",
                 "submit_pooled: channel key derivation failed; released with Failed"
             );
             return Err(e);
@@ -258,7 +255,6 @@ where
             // Transaction never reached the network; sequence slot not consumed.
             pool.release(lease, TerminalOutcome::Failed, None);
             tracing::warn!(
-                channel = %redact_strkey_first5_last5(&public_key),
                 index = channel_index,
                 "submit_pooled: build_and_sign failed; released with Failed"
             );

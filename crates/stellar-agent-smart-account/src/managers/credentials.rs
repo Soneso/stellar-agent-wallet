@@ -1366,10 +1366,7 @@ impl CredentialsManager {
         // with SecurityError (WebAuthn-2 §5.1.2 requires rpId ≡ origin hostname).
         if bridge_addr.ip().is_loopback() && self.rp_id != "localhost" {
             warn!(
-                rp_id = %self.rp_id,
-                "bridge binds loopback but rp_id is not \"localhost\"; \
-                 WebAuthn ceremony will fail in a standards-conforming browser \
-                 (WebAuthn-2 §5.1.2)"
+                "rp_id must be localhost for the loopback registration bridge; use --rp-id localhost."
             );
         }
 
@@ -1485,8 +1482,7 @@ impl CredentialsManager {
             // Nonce not found — may have been cleaned up (TTL-expired) or the
             // entry was never persisted by the bridge. This is distinct from a
             // user-driven cancellation — the entry simply does not exist.
-            let nonce_redacted = redact_first5_last5(nonce);
-            warn!(nonce = %nonce_redacted, "registration nonce not found in store");
+            warn!("registration nonce not found in store");
             self.emit_audit_best_effort(audit_writer, credential_name, "", "entry_missing");
             return Ok(Some(AddPasskeyOutcome::EntryMissing));
         };
@@ -1540,8 +1536,7 @@ impl CredentialsManager {
             }
             _ => {
                 // Kind mismatch — unexpected; treat as user-cancelled.
-                let nonce_redacted = redact_first5_last5(nonce);
-                warn!(nonce = %nonce_redacted, "approval store entry has unexpected kind");
+                warn!("approval store entry has unexpected kind");
                 self.emit_audit_best_effort(audit_writer, credential_name, "", "user_canceled");
                 Ok(Some(AddPasskeyOutcome::UserCanceled))
             }
@@ -2186,7 +2181,6 @@ impl CredentialsManager {
                     }
                     Ok(None) => {
                         tracing::info!(
-                            rule_id = %rule_id,
                             "no baseline row found; fail closed via empty pinned-hashes"
                         );
                         // No baseline row → treat as no pinned hashes (fail closed).
@@ -2250,7 +2244,6 @@ impl CredentialsManager {
                                 Ok(mut writer) => {
                                     if let Err(e) = writer.write_entry(entry) {
                                         warn!(
-                                            rule_id = req_rule_id,
                                             error = %e,
                                             "sign_with_passkey_rule: failed to write \
                                              SaVerifierDiversificationOverride audit row \
@@ -2464,10 +2457,8 @@ impl CredentialsManager {
         // loopback-bound bridge — real Chromium rejects with SecurityError.
         if bridge_local_addr.ip().is_loopback() && metadata.rp_id != "localhost" {
             warn!(
-                rp_id = %metadata.rp_id,
-                "bridge binds loopback but credential rp_id is not \"localhost\"; \
-                 WebAuthn signing ceremony will fail in a standards-conforming browser \
-                 (WebAuthn-2 §5.1.2)"
+                "rp_id must be localhost for the loopback signing bridge; delete and re-register \
+                 the credential with --rp-id localhost."
             );
         }
 
@@ -2671,7 +2662,6 @@ impl CredentialsManager {
                 // dropped; the failure stays non-fatal for the signing call.
                 signers_manager.mark_audit_writer_degraded();
                 warn!(
-                    credential_name = %credential_name,
                     error = %e,
                     "audit_writer mutex poisoned; PasskeyAssertion entry not written"
                 );
@@ -2700,7 +2690,6 @@ impl CredentialsManager {
         if let Err(e) = writer.write_entry(entry) {
             warn!(
                 error = %e,
-                credential_name = %credential_name,
                 "failed to write passkey_assertion audit entry"
             );
         }
@@ -2789,7 +2778,6 @@ async fn check_passkey_rules(
         .and_then(|addresses| addresses)
         .map_err(|sa_err| {
             warn!(
-                rule_id,
                 error = %sa_err,
                 "sign_with_passkey_rule: the drift check could not read the rule; aborting \
                  signing (fail closed)"
@@ -3606,6 +3594,15 @@ registered_at_unix_ms = 1700000000000
     fn test_signers_manager_with_writer(
         dir: &TempDir,
     ) -> (Arc<std::sync::Mutex<AuditWriter>>, Arc<SignersManager>) {
+        test_signers_manager_at(dir, TEST_RPC_URL)
+    }
+
+    /// [`test_signers_manager_with_writer`] with both RPC endpoints at
+    /// `rpc_url`.
+    fn test_signers_manager_at(
+        dir: &TempDir,
+        rpc_url: &str,
+    ) -> (Arc<std::sync::Mutex<AuditWriter>>, Arc<SignersManager>) {
         use crate::managers::signers::SignersManagerConfig;
 
         let audit_path = dir.path().join("audit.jsonl");
@@ -3614,8 +3611,8 @@ registered_at_unix_ms = 1700000000000
         let arc_writer = Arc::new(std::sync::Mutex::new(writer));
 
         let sm = SignersManager::new(SignersManagerConfig::new(
-            TEST_RPC_URL.to_owned(),
-            TEST_RPC_URL.to_owned(),
+            rpc_url.to_owned(),
+            rpc_url.to_owned(),
             Arc::clone(&arc_writer),
             audit_path,
             "Test SDF Network ; September 2015".to_owned(),
@@ -3680,6 +3677,81 @@ registered_at_unix_ms = 1700000000000
             .lines()
             .filter(|l| !l.trim().is_empty())
             .count()
+    }
+
+    /// A loopback registration bridge with another RP ID warns with the
+    /// check and holds the RP ID in no field.
+    #[tokio::test]
+    async fn registration_warning_holds_no_rp_id() {
+        let dir = TempDir::new().unwrap();
+        let approval_path = dir.path().join("approvals").join("default.toml");
+        std::fs::create_dir_all(approval_path.parent().unwrap()).unwrap();
+        let store = PendingApprovalStore::open(approval_path).unwrap();
+        let manager = CredentialsManager::new(
+            dir.path().join("passkeys"),
+            "default",
+            "credmarker7.example",
+            Some(Arc::new(Mutex::new(store))),
+        );
+        let (capture, _guard) =
+            stellar_agent_test_support::log_capture::WarningCapture::capture(None);
+
+        manager
+            .prepare_registration("laptop", "127.0.0.1:1".parse().unwrap(), None)
+            .await
+            .unwrap();
+
+        let events = capture.seen();
+        assert!(
+            events.iter().any(|event| {
+                event["message"]
+                    == "rp_id must be localhost for the loopback registration bridge; use \
+                        --rp-id localhost."
+            }),
+            "{events:?}"
+        );
+        assert!(!format!("{events:?}").contains("credmarker7"), "{events:?}");
+    }
+
+    /// A loopback signing bridge for a credential with another RP ID warns
+    /// with the check and holds the RP ID in no field.
+    #[tokio::test]
+    async fn signing_warning_holds_no_rp_id() {
+        let dir = TempDir::new().unwrap();
+        let mgr = test_manager(&dir);
+        let mut metadata = make_metadata("entry-check");
+        metadata.rp_id = "credmarker7.example".to_owned();
+        write_metadata(&mgr, &metadata);
+        let (_arc_writer, sm) = test_signers_manager_with_writer(&dir);
+        let (capture, _guard) =
+            stellar_agent_test_support::log_capture::WarningCapture::capture(None);
+
+        let result = mgr
+            .sign_with_passkey_rule(
+                "entry-check",
+                &testnet_partial(&[0]),
+                sm,
+                "127.0.0.1:1".parse().unwrap(),
+                Duration::from_millis(10),
+                |_| {},
+                false,
+            )
+            .await;
+
+        assert!(
+            matches!(result, Ok(SignWithPasskeyOutcome::Timeout)),
+            "the ceremony has no browser: {result:?}"
+        );
+        let events = capture.seen();
+        assert!(
+            events.iter().any(|event| {
+                event["message"]
+                    == "rp_id must be localhost for the loopback signing bridge; delete and \
+                        re-register the credential with --rp-id localhost."
+            }),
+            "{events:?}"
+        );
+        assert!(!format!("{events:?}").contains("credmarker7"), "{events:?}");
     }
 
     /// Runs `sign_with_passkey_rule` for a registered credential with a valid
@@ -4140,6 +4212,355 @@ registered_at_unix_ms = 1700000000000
         );
     }
 
+    /// A rule with no pin record, admitted past the diversification gate by
+    /// the single-verifier override, is refused for its missing baseline. No
+    /// event of the call carries the rule id.
+    #[test]
+    fn missing_baseline_refusal_logs_no_rule_id() {
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+        const REFUSED_RULE_ID: u32 = 424_242;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let dir = TempDir::new().unwrap();
+        let mgr = test_manager_readonly(&dir);
+        let (_arc_writer, sm) = test_signers_manager_with_writer(&dir);
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 19913);
+        let mut result = None;
+        let logs = stellar_agent_test_support::log_capture::with_captured_trace_logs(|| {
+            result = Some(runtime.block_on(mgr.sign_with_passkey_rule(
+                "irrelevant",
+                &testnet_partial(&[REFUSED_RULE_ID]),
+                sm,
+                addr,
+                Duration::from_millis(100),
+                |_| {},
+                true,
+            )));
+        });
+        match result.expect("the signing ran") {
+            Err(CredentialsError::SignerSetDivergence { source })
+                if matches!(*source, crate::SaError::SignerSetMissingBaseline { .. }) => {}
+            other => panic!("a rule without a baseline must be refused: {other:?}"),
+        }
+        assert!(
+            logs.contains("no baseline row found; fail closed via empty pinned-hashes"),
+            "{logs}"
+        );
+        assert!(!logs.contains(&REFUSED_RULE_ID.to_string()), "{logs}");
+    }
+
+    /// Runs `sign_with_passkey_rule` on a current-thread runtime under a
+    /// TRACE log capture; returns the result and the captured logs.
+    fn sign_capturing_logs(
+        mgr: &CredentialsManager,
+        credential_name: &str,
+        rule_ids: &[u32],
+        sm: Arc<SignersManager>,
+        accept_single_verifier: bool,
+    ) -> (Result<SignWithPasskeyOutcome, CredentialsError>, String) {
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 19914);
+        let mut result = None;
+        let logs = stellar_agent_test_support::log_capture::with_captured_trace_logs(|| {
+            result = Some(runtime.block_on(mgr.sign_with_passkey_rule(
+                credential_name,
+                &testnet_partial(rule_ids),
+                sm,
+                addr,
+                Duration::from_millis(100),
+                |_| {},
+                accept_single_verifier,
+            )));
+        });
+        (result.expect("the signing ran"), logs)
+    }
+
+    /// Runs `sign_with_passkey_rule` on a current-thread runtime under the
+    /// wallet's own subscriber stack at the most verbose filter; returns the
+    /// result and the text the stack wrote.
+    fn sign_capturing_wallet_logs(
+        mgr: &CredentialsManager,
+        credential_name: &str,
+        rule_ids: &[u32],
+        sm: Arc<SignersManager>,
+        accept_single_verifier: bool,
+    ) -> (Result<SignWithPasskeyOutcome, CredentialsError>, String) {
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+        use stellar_agent_core::observability::{
+            FormatChoice, SubscriberConfig, subscriber_for_tests,
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 19914);
+        let capture = stellar_agent_test_support::CaptureWriter::new();
+        let writer = capture.clone();
+        let subscriber = subscriber_for_tests(
+            SubscriberConfig::default()
+                .with_filter_override(Some(tracing_subscriber::EnvFilter::new("trace")))
+                .with_format_override(Some(FormatChoice::Pretty))
+                .with_writer_factory(Some(Box::new(move || Box::new(writer.clone())))),
+        )
+        .unwrap();
+        // An inert dispatcher kept alive for the capture makes `tracing`
+        // compute every callsite's interest from the registered dispatchers,
+        // and the rebuild refreshes callsites cached before this capture.
+        let inert = stellar_agent_test_support::inert_dispatcher();
+        let dispatch = tracing::Dispatch::new(subscriber);
+        let mut result = None;
+        tracing::dispatcher::with_default(&dispatch, || {
+            tracing::callsite::rebuild_interest_cache();
+            result = Some(runtime.block_on(mgr.sign_with_passkey_rule(
+                credential_name,
+                &testnet_partial(rule_ids),
+                sm,
+                addr,
+                Duration::from_millis(100),
+                |_| {},
+                accept_single_verifier,
+            )));
+        });
+        drop(inert);
+        (result.expect("the signing ran"), capture.captured_str())
+    }
+
+    /// A missing credential whose assertion row meets a poisoned writer is
+    /// warned about without its name.
+    #[test]
+    fn poisoned_writer_warning_holds_no_missing_credential_name() {
+        use stellar_agent_test_support::rejected_value::{
+            CREDENTIAL_MARKER, assert_no_marker, assert_no_marker_in_text,
+        };
+        let dir = TempDir::new().unwrap();
+        let mgr = test_manager(&dir);
+        let (arc_writer, sm) = test_signers_manager_with_writer(&dir);
+        let _ = std::panic::catch_unwind({
+            let arc_writer = Arc::clone(&arc_writer);
+            move || {
+                let _guard = arc_writer.lock().unwrap();
+                panic!("poison audit writer");
+            }
+        });
+
+        let name = format!("missing-{CREDENTIAL_MARKER}");
+        let (result, logs) = sign_capturing_logs(&mgr, &name, &[0], sm, false);
+
+        let err = match result {
+            Err(err @ CredentialsError::NotFound) => err,
+            other => panic!("a missing credential must be refused: {other:?}"),
+        };
+        assert_no_marker(&err, CREDENTIAL_MARKER);
+        assert!(
+            logs.contains("audit_writer mutex poisoned; PasskeyAssertion entry not written"),
+            "{logs}"
+        );
+        assert_no_marker_in_text(&logs, CREDENTIAL_MARKER);
+    }
+
+    /// A missing credential whose assertion row cannot be written is warned
+    /// about without its name. The name is longer than an audit row may be,
+    /// so the write refuses the row.
+    #[test]
+    fn audit_write_failure_warning_holds_no_missing_credential_name() {
+        use stellar_agent_core::audit_log::writer::MAX_ROW_BYTES;
+        use stellar_agent_test_support::rejected_value::{
+            CREDENTIAL_MARKER, assert_no_marker, assert_no_marker_in_text,
+        };
+        let dir = TempDir::new().unwrap();
+        let mgr = test_manager(&dir);
+        let (_arc_writer, sm) = test_signers_manager_with_writer(&dir);
+        let padding = usize::try_from(MAX_ROW_BYTES).unwrap();
+        let name = format!("{CREDENTIAL_MARKER}{}", "x".repeat(padding));
+
+        let (result, logs) = sign_capturing_logs(&mgr, &name, &[0], sm, false);
+
+        let err = match result {
+            Err(err @ CredentialsError::NotFound) => err,
+            other => panic!("a missing credential must be refused: {other:?}"),
+        };
+        assert_no_marker(&err, CREDENTIAL_MARKER);
+        assert!(
+            logs.contains("failed to write passkey_assertion audit entry"),
+            "{logs}"
+        );
+        assert_no_marker_in_text(&logs, CREDENTIAL_MARKER);
+        assert_eq!(audit_line_count(&dir), 0, "the oversized row is refused");
+    }
+
+    /// An override row that cannot be written is warned about without the
+    /// rule id; signing goes on to the rule's baseline refusal, whose text
+    /// holds no rule id either. The audit directory is read-only and every
+    /// append rotates, so the rotation's rename fails the append.
+    #[cfg(unix)]
+    #[test]
+    fn override_write_failure_warning_holds_no_rule_id() {
+        use std::os::unix::fs::PermissionsExt as _;
+        use stellar_agent_test_support::rejected_value::{
+            assert_no_marker, assert_no_marker_in_text,
+        };
+
+        /// Gives the owner full access to the directory it holds again when
+        /// dropped, so the temporary directory can be removed.
+        struct ReadOnlyDir(std::path::PathBuf);
+        impl Drop for ReadOnlyDir {
+            fn drop(&mut self) {
+                std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o700)).unwrap();
+            }
+        }
+
+        const RULE_ID: u32 = 3_735_928_559;
+        let dir = TempDir::new().unwrap();
+        let mgr = test_manager_readonly(&dir);
+        let (_arc_writer, sm) = test_signers_manager_with_writer(&dir);
+        let _rotation = stellar_agent_core::audit_log::rotation::test_seam::set_rotation_threshold(
+            &dir.path().join("audit.jsonl"),
+            0,
+        );
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
+        let read_only = ReadOnlyDir(dir.path().to_path_buf());
+
+        let (result, logs) = sign_capturing_logs(&mgr, "irrelevant", &[RULE_ID], sm, true);
+        drop(read_only);
+
+        let err = match result {
+            Err(CredentialsError::SignerSetDivergence { source })
+                if matches!(*source, crate::SaError::SignerSetMissingBaseline { .. }) =>
+            {
+                CredentialsError::SignerSetDivergence { source }
+            }
+            other => panic!("a rule without a baseline must be refused: {other:?}"),
+        };
+        assert!(
+            logs.contains("failed to write SaVerifierDiversificationOverride audit row"),
+            "{logs}"
+        );
+        let marker = RULE_ID.to_string();
+        assert_no_marker(&err, &marker);
+        assert_no_marker_in_text(&logs, &marker);
+    }
+
+    /// A saved baseline for a rule absent on chain: the drift check's
+    /// `get_context_rule` simulation refuses the rule with a diagnostic event
+    /// log whose `fn_call` data renders the rule id, and neither the warning
+    /// nor the error holds the rule id. The one simulation request reaches
+    /// the endpoint and its refusal is the fixed `ContextRuleNotFound` class.
+    /// The logs are the wallet's own subscriber stack at the most verbose
+    /// filter, which keeps the RPC transport's raw response logging out.
+    #[test]
+    fn missing_on_chain_rule_warning_holds_no_rule_id() {
+        use stellar_agent_core::audit_log::signer_set::{
+            BaselineReason, SignerEntryV2, SignerIdentityV2, SignerSetSnapshotV2, account_digest,
+        };
+        use stellar_agent_test_support::rejected_value::{
+            assert_no_marker, assert_no_marker_in_text,
+        };
+        use wiremock::{
+            Mock, MockServer,
+            matchers::{method, path},
+        };
+
+        const RULE_ID: u32 = 2_718_281_828;
+        // The host's rendering of a contract panic: the error, then the
+        // diagnostic event log, newest first, whose `fn_call` event carries
+        // the invocation's arguments.
+        let host_error = format!(
+            "HostError: Error(Contract, #3000)\n\nEvent log (newest first):\n   \
+             0: [Diagnostic Event] contract:{ZERO_SA_STRKEY}, topics:[error, \
+             Error(Contract, #3000)], data:\"escalating Ok(ScErrorType::Contract) \
+             frame-exit to Err\"\n   \
+             1: [Diagnostic Event] topics:[fn_call, {ZERO_SA_STRKEY}, get_context_rule], \
+             data:{RULE_ID}\n"
+        );
+        let server_runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let server = server_runtime.block_on(async {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/"))
+                .respond_with(stellar_agent_test_support::EchoIdResponder::new(
+                    serde_json::json!({
+                        "error": host_error,
+                        "latestLedger": 1000
+                    }),
+                ))
+                .mount(&server)
+                .await;
+            server
+        });
+        let dir = TempDir::new().unwrap();
+        let mgr = test_manager_readonly(&dir);
+        let (arc_writer, sm) = test_signers_manager_at(&dir, &server.uri());
+        let snapshot = SignerSetSnapshotV2 {
+            signers: vec![SignerEntryV2 {
+                id: 0,
+                identity: SignerIdentityV2::Ed25519 { pubkey: [0x11; 32] },
+            }],
+            threshold: None,
+        };
+        arc_writer
+            .lock()
+            .unwrap()
+            .write_built(|writer| {
+                AuditEntry::new_sa_signer_set_baselined_v2(
+                    RULE_ID,
+                    &snapshot,
+                    1000,
+                    0,
+                    BaselineReason::first_observation(),
+                    writer.current_chain_tip(),
+                    account_digest("Test SDF Network ; September 2015", ZERO_SA_STRKEY),
+                    RedactedStrkey::from_already_redacted(redact_first5_last5(ZERO_SA_STRKEY)),
+                    "stellar:testnet",
+                    "req-baseline",
+                )
+            })
+            .unwrap();
+
+        let (result, logs) = sign_capturing_wallet_logs(&mgr, "irrelevant", &[RULE_ID], sm, true);
+
+        let err = match result {
+            Err(CredentialsError::DriftCheckUnavailable { source }) => {
+                match source.as_ref() {
+                    crate::SaError::DeploymentFailed {
+                        phase,
+                        redacted_reason,
+                    } => {
+                        assert_eq!(*phase, "simulate");
+                        assert_eq!(
+                            redacted_reason,
+                            crate::managers::rules::GET_CONTEXT_RULE_NOT_FOUND
+                        );
+                    }
+                    other => panic!("the simulation must refuse the rule: {other:?}"),
+                }
+                CredentialsError::DriftCheckUnavailable { source }
+            }
+            other => panic!("a rule missing on chain must be refused: {other:?}"),
+        };
+        assert!(
+            logs.contains("the drift check could not read the rule"),
+            "{logs}"
+        );
+        let marker = RULE_ID.to_string();
+        assert!(host_error.contains(&marker), "the mock renders the rule id");
+        assert_no_marker(&err, &marker);
+        assert_no_marker_in_text(&logs, &marker);
+        let requests = server_runtime
+            .block_on(server.received_requests())
+            .expect("request recording is on");
+        assert_eq!(requests.len(), 1, "one simulation request");
+        drop(server);
+    }
+
     #[tokio::test]
     async fn diversification_override_returns_error_when_audit_writer_poisoned() {
         use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -4510,10 +4931,6 @@ registered_at_unix_ms = 1700000000000
             smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...AAAAA"),
             deploy_address_redacted: RedactedStrkey::from_already_redacted("CVERIF...ADDR1"),
             pinned_hash: stellar_agent_core::audit_log::schema::WasmHashPin::new([0xab; 32]),
-            observed_hash: Some(stellar_agent_core::audit_log::schema::WasmHashPin::new(
-                [0x12; 32],
-            )),
-            observed_executable: None,
             request_id: "req-id-1".to_owned(),
         };
         let result = drift_err_route(sa_err);
@@ -4540,10 +4957,6 @@ registered_at_unix_ms = 1700000000000
             smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...AAAAA"),
             deploy_address_redacted: RedactedStrkey::from_already_redacted("CPOLI...ADDR1"),
             pinned_hash: stellar_agent_core::audit_log::schema::WasmHashPin::new([0xde; 32]),
-            observed_hash: Some(stellar_agent_core::audit_log::schema::WasmHashPin::new(
-                [0xca; 32],
-            )),
-            observed_executable: None,
             request_id: "req-id-2".to_owned(),
         };
         let result = drift_err_route(sa_err);
@@ -4894,6 +5307,101 @@ registered_at_unix_ms = 1700000000000
             matches!(outcome, AddPasskeyOutcome::EntryMissing),
             "absent nonce must produce EntryMissing; got {outcome:?}"
         );
+    }
+
+    /// Polls `nonce` on a current-thread runtime under a TRACE log capture;
+    /// returns the outcome and the captured logs.
+    fn poll_capturing_logs(
+        mgr: &CredentialsManager,
+        dir: &TempDir,
+        nonce: &str,
+    ) -> (Result<AddPasskeyOutcome, CredentialsError>, String) {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut writer = AuditWriter::open(dir.path().join("audit.jsonl"), None).unwrap();
+        let mut outcome = None;
+        let logs = stellar_agent_test_support::log_capture::with_captured_trace_logs(|| {
+            outcome = Some(runtime.block_on(mgr.poll_registration(
+                "some-name",
+                nonce,
+                deadline,
+                &mut writer,
+            )));
+        });
+        (outcome.expect("the poll ran"), logs)
+    }
+
+    /// An absent nonce is warned about by the rule alone: neither end of the
+    /// nonce reaches the logs or the outcome.
+    #[test]
+    fn absent_registration_nonce_warning_holds_neither_end() {
+        let dir = TempDir::new().unwrap();
+        let mgr = test_manager(&dir);
+
+        let (outcome, logs) = poll_capturing_logs(&mgr, &dir, "HEADQnever-insertedTAILZ");
+
+        assert!(
+            matches!(outcome, Ok(AddPasskeyOutcome::EntryMissing)),
+            "{outcome:?}"
+        );
+        assert!(
+            logs.contains("registration nonce not found in store"),
+            "{logs}"
+        );
+        let rendered = format!("{outcome:?}");
+        for end in ["HEADQ", "TAILZ"] {
+            assert!(!logs.contains(end), "{logs}");
+            assert!(!rendered.contains(end), "{rendered}");
+        }
+    }
+
+    /// A nonce that names an entry of another kind is warned about by the
+    /// rule alone: neither end of the nonce reaches the logs or the outcome.
+    #[test]
+    fn wrong_kind_registration_nonce_warning_holds_neither_end() {
+        use stellar_agent_core::approval::store::PendingApproval;
+
+        let dir = TempDir::new().unwrap();
+        let mgr = test_manager(&dir);
+        let payment_entry = PendingApproval::new_payment_pending(
+            "AAAAAQAAAA==".to_owned(),
+            b"dummy-xdr-bytes",
+            "GBH...DEST".to_owned(),
+            10_000_000,
+            "XLM".to_owned(),
+            None,
+            100,
+            1000,
+            "test-uid".to_owned(),
+            300_000,
+        )
+        .expect("PaymentSimulated fixture must construct");
+        let nonce = payment_entry.approval_nonce.clone();
+        mgr.approval_store
+            .as_ref()
+            .unwrap()
+            .blocking_lock()
+            .insert(payment_entry, unix_now_ms())
+            .expect("insert must succeed");
+
+        let (outcome, logs) = poll_capturing_logs(&mgr, &dir, &nonce);
+
+        assert!(
+            matches!(outcome, Ok(AddPasskeyOutcome::UserCanceled)),
+            "{outcome:?}"
+        );
+        assert!(
+            logs.contains("approval store entry has unexpected kind"),
+            "{logs}"
+        );
+        let rendered = format!("{outcome:?}");
+        for end in [&nonce[..5], &nonce[nonce.len() - 5..]] {
+            assert!(!logs.contains(end), "{logs}");
+            assert!(!rendered.contains(end), "{rendered}");
+        }
     }
 
     // ── poll_registration: ApprovalStoreUnavailable on readonly manager ───────

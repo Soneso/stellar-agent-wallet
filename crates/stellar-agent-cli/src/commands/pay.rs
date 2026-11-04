@@ -3502,7 +3502,7 @@ mod tests {
                 );
                 init_writer.store(true, Ordering::SeqCst);
                 Err(WalletError::Auth(AuthError::KeyringNotFound {
-                    name: "keyring-order-test-sentinel".to_owned(),
+                    cause: stellar_agent_core::error::KeyringMissingCause::MissingEntry,
                 }))
             },
         )
@@ -3709,7 +3709,7 @@ mod tests {
 
         let code = run_with_dependencies(&args, absent_profile_file, || {
             Err(WalletError::Auth(AuthError::KeyringNotFound {
-                name: "zero-config-keyring-init-failure-sentinel".to_owned(),
+                cause: stellar_agent_core::error::KeyringMissingCause::MissingEntry,
             }))
         })
         .await;
@@ -3756,7 +3756,7 @@ mod tests {
             },
             || {
                 Err(WalletError::Auth(AuthError::KeyringNotFound {
-                    name: "persisted-profile-keyring-init-failure".to_owned(),
+                    cause: stellar_agent_core::error::KeyringMissingCause::MissingEntry,
                 }))
             },
         )
@@ -4781,10 +4781,10 @@ mod tests {
             );
         }
 
-        /// An explicit fee above the cap names the explicit fee.
+        /// An explicit fee above the cap states the fee check.
         #[tokio::test]
         #[serial_test::serial]
-        async fn full_explicit_fee_above_cap_names_the_explicit_fee() {
+        async fn full_explicit_fee_above_cap_states_the_fee_check() {
             let _isolation = zero_config();
             let audit = tempfile::tempdir().unwrap();
             let signer = EnvSigner::new([0x7d; 32], "PAY_WITNESS_FULL_CAP_EXPLICIT_SK");
@@ -4797,13 +4797,11 @@ mod tests {
             let run = run_stage(&args, &profile).await;
 
             assert_refused(&run, "fees.percentile_exceeds_cap", &primary).await;
-            assert!(
-                run.envelope["error"]["message"]
-                    .as_str()
-                    .unwrap()
-                    .starts_with("the explicit per-operation fee 200 stroops"),
-                "{}",
-                run.envelope
+            assert_eq!(
+                run.envelope["error"]["message"],
+                "--fee must be a per-operation stroop amount within \
+                 classic_max_fee_per_op_stroops; lower --fee or raise \
+                 classic_max_fee_per_op_stroops."
             );
         }
 
@@ -6448,7 +6446,12 @@ mod tests {
             let run = run(&fixture, &args).await;
 
             assert_refused_before_confirmation(&fixture, &run, "fees.percentile_exceeds_cap").await;
-            assert!(run.message().contains("200"), "{}", run.message());
+            assert_eq!(
+                run.message(),
+                "--fee must be a per-operation stroop amount within \
+                 classic_max_fee_per_op_stroops; lower --fee or raise \
+                 classic_max_fee_per_op_stroops."
+            );
         }
 
         /// Initializer failure: its code, before any request.

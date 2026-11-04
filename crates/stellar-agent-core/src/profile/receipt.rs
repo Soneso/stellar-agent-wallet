@@ -678,13 +678,12 @@ pub enum ReceiptStoreError {
     },
 
     /// The JSON serialisation or deserialisation step failed.
-    #[error("receipt store JSON error at '{path}': {source}")]
+    #[error("receipt store JSON error at '{path}': the store {detail}")]
     Json {
         /// The file system path involved.
         path: PathBuf,
-        /// The underlying serde_json error.
-        #[source]
-        source: serde_json::Error,
+        /// Category and position of the failure.
+        detail: String,
     },
 
     /// The in-memory Mutex was poisoned by a previous panic.
@@ -913,7 +912,7 @@ fn read_map(file_path: &Path) -> Result<HashMap<String, SubmissionReceipt>, Rece
     match std::fs::read_to_string(file_path) {
         Ok(raw) => serde_json::from_str(&raw).map_err(|e| ReceiptStoreError::Json {
             path: file_path.to_path_buf(),
-            source: e,
+            detail: crate::redact::describe_json_error(&e),
         }),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(HashMap::new()),
         Err(e) => Err(ReceiptStoreError::Io {
@@ -1990,9 +1989,9 @@ fn check_transition(from: &ReceiptStatus, to: &ReceiptStatus) -> Result<(), Rece
 ///
 /// Must be called with the guard already held.
 fn persist_locked(guard: &mut MutexGuard<'_, StoreState>) -> Result<(), ReceiptStoreError> {
-    let json = serde_json::to_string_pretty(&guard.map).map_err(|e| ReceiptStoreError::Json {
+    let json = serde_json::to_string_pretty(&guard.map).map_err(|_| ReceiptStoreError::Json {
         path: guard.file_path.clone(),
-        source: e,
+        detail: "could not be serialised".to_owned(),
     })?;
 
     let dir = guard
@@ -2090,6 +2089,24 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = ReceiptStore::open_at(dir.path(), "test").unwrap();
         (dir, store)
+    }
+
+    /// A store file that fails its schema reports the category and position
+    /// and keeps no parse source.
+    #[test]
+    fn unparsable_store_reports_category_and_position_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("receipts.json");
+        std::fs::write(&file, r#"{"entry":{"status":"credmarker7"}}"#).unwrap();
+        let error = read_map(&file).unwrap_err();
+        stellar_agent_test_support::rejected_value::assert_no_marker(&error, "credmarker7");
+        assert!(std::error::Error::source(&error).is_none());
+        assert!(
+            error
+                .to_string()
+                .contains("the store has a missing field or a field of the wrong type or value"),
+            "{error}"
+        );
     }
 
     #[cfg(unix)]

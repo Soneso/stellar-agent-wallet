@@ -17,13 +17,14 @@
 use futures::{SinkExt, StreamExt};
 use rmcp::{
     RoleServer, ServiceExt,
-    service::{RxJsonRpcMessage, TxJsonRpcMessage},
+    service::{RxJsonRpcMessage, ServerInitializeError, TxJsonRpcMessage},
     transport::{
         Transport,
         async_rw::{JsonRpcMessageCodec, JsonRpcMessageCodecError},
     },
 };
 use std::sync::Arc;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::Mutex as TokioMutex;
 use tokio_util::codec::{FramedRead, FramedWrite};
 
@@ -92,25 +93,23 @@ pub fn load_selected_profile(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Type aliases for BoundedStdioTransport internals
+// Type aliases for BoundedTransport internals
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Codec-framed writer for the bounded stdio transport.
-type BoundedWriter =
-    FramedWrite<tokio::io::Stdout, JsonRpcMessageCodec<TxJsonRpcMessage<RoleServer>>>;
+/// Codec-framed writer of the bounded transport.
+type BoundedWriter<W> = FramedWrite<W, JsonRpcMessageCodec<TxJsonRpcMessage<RoleServer>>>;
 
-/// Codec-framed reader for the bounded stdio transport.
-type BoundedReader =
-    FramedRead<tokio::io::Stdin, JsonRpcMessageCodec<RxJsonRpcMessage<RoleServer>>>;
+/// Codec-framed reader of the bounded transport.
+type BoundedReader<R> = FramedRead<R, JsonRpcMessageCodec<RxJsonRpcMessage<RoleServer>>>;
 
 // ─────────────────────────────────────────────────────────────────────────────
-// BoundedStdioTransport — max-line mitigation
+// BoundedTransport: max-line mitigation
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// A custom `Transport` implementation that enforces the 1 MiB max-line bound.
 ///
-/// This type wraps `FramedRead<Stdin, JsonRpcMessageCodec>` and
-/// `FramedWrite<Stdout, JsonRpcMessageCodec>` constructed with
+/// This type wraps `FramedRead<R, JsonRpcMessageCodec>` and
+/// `FramedWrite<W, JsonRpcMessageCodec>` constructed with
 /// `JsonRpcMessageCodec::new_with_max_length(STELLAR_AGENT_MCP_MAX_LINE_BYTES)`,
 /// bypassing the default `usize::MAX` codec that `AsyncRwTransport::new` uses.
 ///
@@ -118,10 +117,13 @@ type BoundedReader =
 ///
 /// `rmcp::transport::Transport<RoleServer>` — the trait required by
 /// `ServiceExt::serve` to drive the MCP JSON-RPC loop.
-pub struct BoundedStdioTransport {
-    read: BoundedReader,
-    write: Arc<TokioMutex<Option<BoundedWriter>>>,
+pub struct BoundedTransport<R, W> {
+    read: BoundedReader<R>,
+    write: Arc<TokioMutex<Option<BoundedWriter<W>>>>,
 }
+
+/// The bounded transport over the process's standard streams.
+pub type BoundedStdioTransport = BoundedTransport<tokio::io::Stdin, tokio::io::Stdout>;
 
 impl Default for BoundedStdioTransport {
     fn default() -> Self {
@@ -138,6 +140,15 @@ impl BoundedStdioTransport {
     /// infallible on all supported platforms.
     #[must_use]
     pub fn new() -> Self {
+        Self::over(tokio::io::stdin(), tokio::io::stdout())
+    }
+}
+
+impl<R: AsyncRead, W: AsyncWrite> BoundedTransport<R, W> {
+    /// Constructs the transport over `read` and `write` with the 1 MiB
+    /// max-line codec on both directions.
+    #[must_use]
+    pub fn over(read: R, write: W) -> Self {
         let codec_rx = JsonRpcMessageCodec::<RxJsonRpcMessage<RoleServer>>::new_with_max_length(
             STELLAR_AGENT_MCP_MAX_LINE_BYTES,
         );
@@ -145,16 +156,40 @@ impl BoundedStdioTransport {
             STELLAR_AGENT_MCP_MAX_LINE_BYTES,
         );
         Self {
-            read: FramedRead::new(tokio::io::stdin(), codec_rx),
-            write: Arc::new(TokioMutex::new(Some(FramedWrite::new(
-                tokio::io::stdout(),
-                codec_tx,
-            )))),
+            read: FramedRead::new(read, codec_rx),
+            write: Arc::new(TokioMutex::new(Some(FramedWrite::new(write, codec_tx)))),
         }
     }
 }
 
-impl Transport<RoleServer> for BoundedStdioTransport {
+/// Logs a refused client frame.
+///
+/// The codec's own error text quotes the frame, so the event states the
+/// refusal with its position or I/O kind and holds no text of the frame.
+fn log_frame_error(err: &JsonRpcMessageCodecError) {
+    match err {
+        JsonRpcMessageCodecError::MaxLineLengthExceeded => {
+            tracing::error!("the frame exceeds the line limit");
+        }
+        JsonRpcMessageCodecError::Serde(parse) => {
+            tracing::error!(
+                line = parse.line(),
+                column = parse.column(),
+                "the frame is not a valid JSON-RPC message"
+            );
+        }
+        JsonRpcMessageCodecError::Io(io) => {
+            tracing::error!(kind = %io.kind(), "the frame could not be read");
+        }
+        _ => tracing::error!("the frame could not be read"),
+    }
+}
+
+impl<R, W> Transport<RoleServer> for BoundedTransport<R, W>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
     type Error = std::io::Error;
 
     fn send(
@@ -182,15 +217,7 @@ impl Transport<RoleServer> for BoundedStdioTransport {
         async move {
             next.await.and_then(
                 |result: Result<RxJsonRpcMessage<RoleServer>, JsonRpcMessageCodecError>| {
-                    result
-                        .inspect_err(|err| {
-                            tracing::error!(
-                                error = %err,
-                                "stellar-agent-mcp: JSON-RPC frame error \
-                                 (max-line bound or parse failure)"
-                            );
-                        })
-                        .ok()
+                    result.inspect_err(log_frame_error).ok()
                 },
             )
         }
@@ -288,22 +315,80 @@ pub async fn serve(server: WalletServer) -> Result<(), Box<dyn std::error::Error
     // — those paths call `AsyncRwTransport::new` which internally uses
     // `JsonRpcMessageCodec::default()` (max_length = usize::MAX, a DoS surface).
     //
-    // `BoundedStdioTransport` is a wallet-owned `Transport<RoleServer>` impl
+    // `BoundedTransport` is a wallet-owned `Transport<RoleServer>` impl
     // that constructs both codec instances with explicit
     // `JsonRpcMessageCodec::new_with_max_length(STELLAR_AGENT_MCP_MAX_LINE_BYTES)`.
     // It is passed directly to `.serve()`, which accepts any `T: IntoTransport`
     // and the blanket impl `T: Transport<Role> => T: IntoTransport` applies.
     //
     // Verification point: the codec construction is in
-    // `BoundedStdioTransport::new()` above in this file; the `default()`
+    // `BoundedTransport::over()` above in this file; the `default()`
     // constructor is never called.
-    let transport = BoundedStdioTransport::new();
+    serve_on(server, BoundedStdioTransport::new()).await
+}
 
-    let service = server.serve(transport).await?;
+/// Runs `server` on `transport` until the client disconnects.
+///
+/// # Errors
+///
+/// [`SessionStartError`] when the session does not start, or the join error of
+/// the running service.
+pub async fn serve_on<R, W>(
+    server: WalletServer,
+    transport: BoundedTransport<R, W>,
+) -> Result<(), Box<dyn std::error::Error>>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    let service = server
+        .serve(transport)
+        .await
+        .map_err(SessionStartError::from)?;
 
     tracing::info!("stellar-agent-mcp: MCP server ready");
     service.waiting().await?;
     Ok(())
+}
+
+/// Why an MCP session did not start.
+///
+/// rmcp's own error holds the client's rejected message and renders it in
+/// `Display` and `Debug`, so the conversion keeps the condition and drops the
+/// error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SessionStartError {
+    /// The client's first message is not an initialize request.
+    ExpectedInitializeRequest,
+    /// The connection ended during the initialization handshake.
+    ConnectionClosed,
+    /// The initialization handshake failed for another reason.
+    HandshakeFailed,
+}
+
+impl std::fmt::Display for SessionStartError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::ExpectedInitializeRequest => {
+                "the MCP client must open the session with an initialize request"
+            }
+            Self::ConnectionClosed => "the MCP client must stay connected until the session starts",
+            Self::HandshakeFailed => "the MCP session must complete the initialization handshake",
+        })
+    }
+}
+
+impl std::error::Error for SessionStartError {}
+
+impl From<ServerInitializeError> for SessionStartError {
+    fn from(err: ServerInitializeError) -> Self {
+        match err {
+            ServerInitializeError::ExpectedInitializeRequest(_) => Self::ExpectedInitializeRequest,
+            ServerInitializeError::ConnectionClosed(_) => Self::ConnectionClosed,
+            _ => Self::HandshakeFailed,
+        }
+    }
 }
 
 /// Returns the startup-refusal wire code when the active profile disables the

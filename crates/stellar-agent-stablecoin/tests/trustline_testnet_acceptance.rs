@@ -718,7 +718,7 @@ fn usdt_refusal() {
     let err = resolve_denomination(DenominationInput::BareCode("USDT".to_owned()), passphrase)
         .expect_err("USDT bare code must be refused");
     assert!(
-        matches!(&err, ResolveError::UsdtRefused { code } if code == "USDT"),
+        matches!(&err, ResolveError::UsdtRefused),
         "expected UsdtRefused for USDT, got: {err:?}"
     );
 
@@ -726,7 +726,7 @@ fn usdt_refusal() {
     let err = resolve_denomination(DenominationInput::BareCode("usdt".to_owned()), passphrase)
         .expect_err("USDT (lowercase) must be refused");
     assert!(
-        matches!(err, ResolveError::UsdtRefused { .. }),
+        matches!(err, ResolveError::UsdtRefused),
         "expected UsdtRefused for usdt, got: {err:?}"
     );
 
@@ -740,7 +740,7 @@ fn usdt_refusal() {
     )
     .expect_err("USDT with explicit issuer must be refused");
     assert!(
-        matches!(err, ResolveError::UsdtRefused { .. }),
+        matches!(err, ResolveError::UsdtRefused),
         "expected UsdtRefused for USDT+issuer, got: {err:?}"
     );
 

@@ -73,6 +73,7 @@ use super::chain::{ZERO_BLOCK_HASH, sign_chain_root, verify_chain_root};
 use super::entry::AuditEntry;
 use super::verify::{SIDECAR_READ_CAP, VerifyError, collect_file_chain, read_small_regular_file};
 use super::writer::{hmac_sidecar_path, prune_marker_path};
+use crate::redact::describe_json_error;
 
 /// A retained boundary and the hash its first entry chains from.
 #[derive(Debug, Serialize, Deserialize)]
@@ -185,8 +186,8 @@ pub(super) fn read_prune_marker(log_path: &Path) -> Result<Option<PruneMarker>, 
         Err(VerifyError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e),
     };
-    let marker: PruneMarker =
-        serde_json::from_slice(&bytes).map_err(|e| malformed(e.to_string()))?;
+    let marker: PruneMarker = serde_json::from_slice(&bytes)
+        .map_err(|e| malformed(format!("the marker {}", describe_json_error(&e))))?;
     if marker.data.version != 1 {
         return Err(malformed("unsupported prune marker version".to_owned()));
     }
@@ -338,7 +339,8 @@ fn read_first_entry(file: &Path) -> Result<AuditEntry, String> {
         .lines()
         .next()
         .ok_or_else(|| "log file is empty".to_owned())?;
-    serde_json::from_str::<AuditEntry>(first_line).map_err(|e| format!("parse first entry: {e}"))
+    serde_json::from_str::<AuditEntry>(first_line)
+        .map_err(|e| format!("parse first entry: the entry {}", describe_json_error(&e)))
 }
 
 /// Atomically writes `bytes` to the sidecar via a sibling temp file plus rename,
@@ -494,6 +496,46 @@ mod tests {
         writer.write_entry(sample_entry("new_row")).unwrap();
         drop(writer);
         path
+    }
+
+    /// The prune marker and the first entry of a file report the category and
+    /// position of a parse failure, never the refused value.
+    #[test]
+    fn unparsable_rotation_files_report_category_and_position_only() {
+        use stellar_agent_test_support::rejected_value::{
+            assert_no_marker, assert_no_marker_in_text,
+        };
+        let dir = TempDir::new().unwrap();
+        let log = dir.path().join("audit.jsonl");
+        fs::write(
+            prune_marker_path(&log),
+            br#"{"data":{"version":"credmarker7"}}"#,
+        )
+        .unwrap();
+        let error = read_prune_marker(&log).unwrap_err();
+        assert_no_marker(&error, "credmarker7");
+        assert!(
+            error
+                .to_string()
+                .contains("the marker has a missing field or a field of the wrong type or value"),
+            "{error}"
+        );
+
+        let file = dir.path().join("first.jsonl");
+        fs::write(
+            &file,
+            crate::audit_log::test_helpers::line_refused_by_the_schema("credmarker7"),
+        )
+        .unwrap();
+        let reason = read_first_entry(&file).unwrap_err();
+        assert_no_marker_in_text(&reason, "credmarker7");
+        assert!(
+            reason.starts_with(
+                "parse first entry: the entry has a missing field or a field of the wrong type \
+                 or value (line 1, column "
+            ),
+            "{reason}"
+        );
     }
 
     #[test]

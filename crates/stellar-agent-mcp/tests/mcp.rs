@@ -61,6 +61,8 @@ mod preflight_integration;
 mod profile_selection_integration;
 #[path = "mcp/registry_walk.rs"]
 mod registry_walk;
+#[path = "mcp/rejected_client_input.rs"]
+mod rejected_client_input;
 #[path = "mcp/resource_no_secrets.rs"]
 mod resource_no_secrets;
 #[path = "mcp/rpc_credential_integration.rs"]

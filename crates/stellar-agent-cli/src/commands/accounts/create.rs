@@ -2632,7 +2632,7 @@ mod tests {
                 );
                 init_writer.store(true, Ordering::SeqCst);
                 Err(WalletError::Auth(AuthError::KeyringNotFound {
-                    name: "keyring-order-test-sentinel".to_owned(),
+                    cause: stellar_agent_core::error::KeyringMissingCause::MissingEntry,
                 }))
             },
         )
@@ -2691,7 +2691,7 @@ mod tests {
             move || {
                 init_writer.store(true, Ordering::SeqCst);
                 Err(WalletError::Auth(AuthError::KeyringNotFound {
-                    name: "keyring-order-test-noop-sentinel".to_owned(),
+                    cause: stellar_agent_core::error::KeyringMissingCause::MissingEntry,
                 }))
             },
         )
@@ -2749,7 +2749,7 @@ mod tests {
             |_| Err(stellar_agent_core::profile::loader::ProfileLoadError::NotFound),
             || {
                 Err(WalletError::Auth(AuthError::KeyringNotFound {
-                    name: "create-zero-config-keyring-init-failure-sentinel".to_owned(),
+                    cause: stellar_agent_core::error::KeyringMissingCause::MissingEntry,
                 }))
             },
         )
@@ -3131,7 +3131,9 @@ mod tests {
                         text.contains(if matches!(case, Case::DefaultCap) {
                             "default per-operation fee"
                         } else {
-                            "explicit per-operation fee"
+                            "--fee must be a per-operation stroop amount within \
+                             classic_max_fee_per_op_stroops; lower --fee or raise \
+                             classic_max_fee_per_op_stroops."
                         }),
                         "{text}"
                     );

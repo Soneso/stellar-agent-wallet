@@ -900,6 +900,170 @@ impl Respond for SorobanRpcDispatcher {
     }
 }
 
+// ── Log capture ───────────────────────────────────────────────────────────────
+
+/// Runs `test` on a current-thread runtime under the wallet's own subscriber
+/// stack at the most verbose filter, in JSON form, and returns its value with
+/// the captured events, each without the subscriber's timestamp.
+///
+/// The stack keeps the RPC transport's raw response logging out, as every
+/// wallet binary does. The timestamp is the subscriber's clock reading, not
+/// event content, and is dropped so a numeric marker check reads only what
+/// the wallet logged.
+pub fn wallet_traced<T>(test: impl std::future::Future<Output = T>) -> (T, String) {
+    use stellar_agent_core::observability::{FormatChoice, SubscriberConfig, subscriber_for_tests};
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let capture = stellar_agent_test_support::CaptureWriter::new();
+    let writer = capture.clone();
+    let subscriber = subscriber_for_tests(
+        SubscriberConfig::default()
+            .with_filter_override(Some(tracing_subscriber::EnvFilter::new("trace")))
+            .with_format_override(Some(FormatChoice::Json))
+            .with_writer_factory(Some(Box::new(move || Box::new(writer.clone())))),
+    )
+    .expect("the wallet subscriber builds");
+    // An inert dispatcher kept alive for the capture makes `tracing` compute
+    // every callsite's interest from the registered dispatchers, and the
+    // rebuild refreshes callsites cached before this capture.
+    let inert = stellar_agent_test_support::inert_dispatcher();
+    let dispatch = tracing::Dispatch::new(subscriber);
+    let mut value = None;
+    tracing::dispatcher::with_default(&dispatch, || {
+        tracing::callsite::rebuild_interest_cache();
+        value = Some(runtime.block_on(test));
+    });
+    drop(inert);
+    let logs = capture
+        .captured_str()
+        .lines()
+        .map(|line| {
+            let mut event: serde_json::Value =
+                serde_json::from_str(line).expect("each captured event is one JSON object");
+            event
+                .as_object_mut()
+                .expect("an event is a JSON object")
+                .remove("timestamp");
+            event.to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    (value.expect("the test ran"), logs)
+}
+
+/// The MCP error envelope a tool returns for `err`: the production
+/// `Envelope::err_raw` form with the error's wire code and Display.
+pub fn mcp_error_envelope(err: &stellar_agent_smart_account::error::SaError) -> String {
+    stellar_agent_core::Envelope::<()>::err_raw(err.wire_code(), err.to_string())
+        .to_json_pretty()
+        .expect("the MCP error envelope serializes")
+}
+
+/// Asserts that a refusal holds nothing of the observation it refused.
+///
+/// The channels are `err`'s Display and Debug and those of every error in its
+/// source chain, its serialized form, the MCP error envelope built from it,
+/// and `logs`, the output of [`wallet_traced`]. No marker, such as a hash or
+/// its first eight bytes, appears anywhere in a channel. No summary, the
+/// bounded executable summary of a refused observation, appears anywhere in
+/// a channel once the fixed texts of [`FIXED_TEXTS_WITH_A_SUMMARY_WORD`] are
+/// removed from it. The JSON channels are also read decoded, so a summary
+/// holding a quoted tag is found in its escaped form.
+///
+/// # Panics
+///
+/// Panics naming the channel that holds a marker or a summary, without
+/// printing either.
+pub fn assert_refusal_holds_no_marker(
+    err: &stellar_agent_smart_account::error::SaError,
+    logs: &str,
+    markers: &[&str],
+    summaries: &[&str],
+) {
+    let mut channels: Vec<(String, Vec<String>)> = Vec::new();
+    let mut current: Option<&(dyn std::error::Error + 'static)> = Some(err);
+    let mut depth = 0_usize;
+    while let Some(error) = current {
+        channels.push((format!("Display at depth {depth}"), vec![error.to_string()]));
+        let debug = format!("{error:?}");
+        let unescaped = debug.replace("\\\"", "\"");
+        channels.push((format!("Debug at depth {depth}"), vec![debug, unescaped]));
+        current = error.source();
+        depth += 1;
+    }
+    let serialized = serde_json::to_string(err).expect("the refusal serializes");
+    channels.push(("serialized form".to_owned(), json_texts(&serialized)));
+    channels.push((
+        "MCP error envelope".to_owned(),
+        json_texts(&mcp_error_envelope(err)),
+    ));
+    for (line_number, line) in logs.lines().enumerate() {
+        channels.push((format!("log event {line_number}"), json_texts(line)));
+    }
+    for (channel, texts) in &channels {
+        for text in texts {
+            for marker in markers {
+                assert!(
+                    !text.contains(marker),
+                    "the {channel} holds a marker of the refused observation"
+                );
+            }
+            for summary in summaries {
+                assert!(
+                    !holds_summary(text, summary),
+                    "the {channel} holds the summary of the refused observation"
+                );
+            }
+        }
+    }
+}
+
+/// The raw JSON `text` followed by every string, key or value, it holds,
+/// decoded.
+fn json_texts(text: &str) -> Vec<String> {
+    fn collect(value: &serde_json::Value, out: &mut Vec<String>) {
+        match value {
+            serde_json::Value::String(text) => out.push(text.clone()),
+            serde_json::Value::Array(items) => items.iter().for_each(|item| collect(item, out)),
+            serde_json::Value::Object(fields) => {
+                for (key, item) in fields {
+                    out.push(key.clone());
+                    collect(item, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    let value: serde_json::Value = serde_json::from_str(text).expect("the channel is JSON");
+    let mut texts = vec![text.to_owned()];
+    collect(&value, &mut texts);
+    texts
+}
+
+/// The wallet's fixed texts that hold a summary word by design: the wire
+/// codes and error details naming the verifier Wasm hash as a kind of value.
+/// None of them renders an observation.
+const FIXED_TEXTS_WITH_A_SUMMARY_WORD: &[&str] = &[
+    "sa.verifier_wasm_not_in_allowlist",
+    "sa.verifier_wasm_revoked",
+    "verifier wasm hash must be in VERIFIER_ALLOWLIST",
+    "verifier wasm hash flagged as revoked",
+];
+
+/// Whether `summary` occurs in `text` once every fixed text of
+/// [`FIXED_TEXTS_WITH_A_SUMMARY_WORD`] is removed. Each removed text leaves a
+/// NUL character, which no summary holds, so the text around it never joins
+/// into a summary.
+fn holds_summary(text: &str, summary: &str) -> bool {
+    FIXED_TEXTS_WITH_A_SUMMARY_WORD
+        .iter()
+        .fold(text.to_owned(), |rest, fixed| rest.replace(fixed, "\0"))
+        .contains(summary)
+}
+
 // ── Manager factory helpers ───────────────────────────────────────────────────
 
 /// Builds a `SignersManager` pointing at `primary_url` and `secondary_url`.

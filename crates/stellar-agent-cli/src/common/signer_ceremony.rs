@@ -1097,7 +1097,7 @@ mod tests {
 
     fn counting_signer_error() -> WalletError {
         WalletError::Auth(AuthError::KeyringNotFound {
-            name: "counting-key-fetch-sentinel".to_owned(),
+            cause: stellar_agent_core::error::KeyringMissingCause::InvalidSecret,
         })
     }
 
@@ -1177,8 +1177,9 @@ mod tests {
             .await
             .expect_err("the failing key fetch must surface on mainnet");
         assert_eq!(error.code(), counting_signer_error().code());
-        assert!(
-            error.message().contains("counting-key-fetch-sentinel"),
+        assert_eq!(
+            error.message(),
+            counting_signer_error().message(),
             "the signer's own error must surface: {error}"
         );
         assert_eq!(signer.key_fetches.load(Ordering::SeqCst), 1);

@@ -86,7 +86,9 @@ use stellar_agent_core::profile::caip2::MAINNET_PASSPHRASE;
 #[cfg(feature = "mainnet-write")]
 use stellar_agent_network::MainnetWriteContext;
 use stellar_agent_network::counterparty::{
-    CounterpartyError, fetch::fetch_stellar_toml, parser::parse_minimal_sep1,
+    CounterpartyError,
+    fetch::{fetch_stellar_toml, validate_home_domain},
+    parser::parse_minimal_sep1,
     validation::is_valid_ldh_home_domain,
 };
 #[cfg(feature = "mainnet-write")]
@@ -509,7 +511,17 @@ async fn resolve_web_auth(
         (text, auth)
     } else {
         // Production path: validate home_domain as LDH FQDN, then use
-        // fetch_stellar_toml (which enforces HTTPS + no-redirect + cap).
+        // fetch_stellar_toml (which enforces HTTPS + no-redirect + cap). The
+        // validation runs before the authority exists, so no event below
+        // holds a refused domain.
+        validate_home_domain(home_domain).map_err(|e| match e {
+            CounterpartyError::HomeDomainInvalid { detail } => {
+                IdentityError::HomeDomainInvalid { detail }
+            }
+            _ => IdentityError::HomeDomainInvalid {
+                detail: "home_domain must be a valid domain name".to_owned(),
+            },
+        })?;
         let toml_url = format!("https://{home_domain}/.well-known/stellar.toml");
         let auth = authority_hint(&toml_url);
 

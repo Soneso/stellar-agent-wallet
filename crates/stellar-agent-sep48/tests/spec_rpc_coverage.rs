@@ -317,8 +317,31 @@ async fn fetch_contract_spec_wasm_without_spec_section_returns_spec_missing() {
     );
 }
 
-/// An invalid address keeps `InvalidContractAddress`, redacted, before any
-/// RPC request.
+/// A marker and a value whose fifth byte falls inside a multibyte character both
+/// reach the same fixed text, with no panic.
+#[tokio::test]
+async fn refused_contract_ids_stay_out_of_the_error() {
+    let server = serve([]).await;
+    for contract in ["credmarker7", "abcd\u{e9}credmarker7\u{e9}\u{e9}\u{e9}"] {
+        let Err(err) = fetch_contract_spec(&server.uri(), contract).await else {
+            panic!("the contract id must be refused");
+        };
+        assert_eq!(
+            err.to_string(),
+            "invalid contract address: contract_id must be a C-strkey"
+        );
+        assert_eq!(format!("{err:?}"), "InvalidContractAddress");
+    }
+    assert!(
+        server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .is_empty()
+    );
+}
+
+/// An invalid address keeps `InvalidContractAddress` before any RPC request.
 #[tokio::test]
 async fn fetch_contract_spec_invalid_contract_strkey_returns_error() {
     let server = serve([]).await;
@@ -326,7 +349,7 @@ async fn fetch_contract_spec_invalid_contract_strkey_returns_error() {
     let result = fetch_contract_spec(&server.uri(), "not-a-strkey").await;
 
     match result {
-        Err(Sep48Error::InvalidContractAddress { addr }) => assert_eq!(addr, "not-a...trkey"),
+        Err(Sep48Error::InvalidContractAddress) => {}
         other => panic!("invalid strkey must return InvalidContractAddress, got: {other:?}"),
     }
     assert!(

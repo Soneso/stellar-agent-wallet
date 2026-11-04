@@ -250,7 +250,6 @@ where
     let timelock_redacted = redact_strkey_first5_last5(&args.timelock);
 
     info!(
-        timelock = %timelock_redacted,
         network = %context.chain_id,
         request_id = %request_id,
         "smart-account timelock list-pending: querying pending operations"

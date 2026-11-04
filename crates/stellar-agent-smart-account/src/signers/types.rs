@@ -1,7 +1,7 @@
 //! Value types for the signer-set substrate.
 //!
-//! Defines [`FrozenChainStateTuple`], [`WasmHashSummary`], and
-//! [`ThresholdAffectingOp`] — the value types consumed by the
+//! Defines [`FrozenChainStateTuple`] and [`ThresholdAffectingOp`], the
+//! value types consumed by the
 //! `SignersManager` implementation (`managers/signers.rs`).
 //!
 //! # Comparison record
@@ -16,7 +16,7 @@
 
 use std::fmt;
 
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Serialize};
 
 use stellar_agent_core::audit_log::signer_set::SignerSetView;
 
@@ -158,161 +158,12 @@ impl fmt::Debug for FrozenChainStateTuple {
     }
 }
 
-// ── WasmHashSummary ───────────────────────────────────────────────────────────
-
-/// Error returned by [`WasmHashSummary::new`] when the count-presence invariant
-/// is violated.
-///
-/// `count == 0 ⟺ first_first8.is_none()` must hold for every valid
-/// [`WasmHashSummary`].  Any other combination indicates a programming error.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-pub enum WasmHashSummaryError {
-    /// `count == 0` but `first_first8` is `Some(...)`.
-    ///
-    /// A zero-policy count implies no hash bytes exist; presence of bytes is
-    /// inconsistent.
-    #[error("WasmHashSummary: count == 0 but first_first8 is Some")]
-    CountZeroWithBytes,
-
-    /// `count > 0` but `first_first8` is `None`.
-    ///
-    /// A positive policy count implies at least one hash was observed; absence
-    /// of bytes is inconsistent.
-    #[error("WasmHashSummary: count > 0 but first_first8 is None")]
-    CountNonZeroWithoutBytes,
-}
-
-/// Summary of wasm-hash observations for threshold-policy identification.
-///
-/// Used by [`crate::SaError::ThresholdPolicyIdentificationFailed`] to carry
-/// forensic correlation data when zero or multiple policies match the
-/// `THRESHOLD_POLICY_WASM_HASHES` allowlist.
-///
-/// `first_first8` carries the raw first 8 bytes of the first observed policy
-/// wasm hash (typed `[u8; 8]`, NOT `Option<String>`).  The `Display` impl
-/// renders the bytes as lowercase hex for operator-facing error messages.
-///
-/// # Invariant
-///
-/// `count == 0` if and only if `first_first8.is_none()`.  Enforced by both
-/// [`WasmHashSummary::new`] and the custom [`Deserialize`] implementation.
-/// Callers that construct by hand should use `new`.  The `Deserialize` impl
-/// rejects any wire payload that violates the invariant with a descriptive
-/// error, preventing a deserialization-side invariant bypass.
-///
-/// # Examples
-///
-/// ```
-/// use stellar_agent_smart_account::signers::types::WasmHashSummary;
-///
-/// let s = WasmHashSummary::new(2, Some([0xab; 8])).expect("valid: count>0 and first_first8 is Some");
-/// let disp = format!("{s}");
-/// assert!(disp.contains("count=2"));
-/// // Assert the full hex content — protects against silent format regression.
-/// assert!(disp.contains("first_first8=abababababababab"), "got: {disp}");
-///
-/// // count == 0 requires first_first8 == None.
-/// assert!(WasmHashSummary::new(0, Some([0xab; 8])).is_err());
-/// assert!(WasmHashSummary::new(1, None).is_err());
-/// assert!(WasmHashSummary::new(0, None).is_ok());
-/// ```
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct WasmHashSummary {
-    /// Number of policies observed in the context rule's `policies` list.
-    pub count: u32,
-
-    /// First 8 bytes of the first observed policy's wasm hash, if any.
-    ///
-    /// Raw bytes. The `Display` impl renders as 16 lowercase hex chars
-    /// (e.g. `"abababababababab"` for `[0xab; 8]`).
-    ///
-    /// `None` when `count == 0` (no policies observed). `Some([u8; 8])` when
-    /// at least one policy wasm hash was observed.
-    pub first_first8: Option<[u8; 8]>,
-}
-
-impl WasmHashSummary {
-    /// Constructs a [`WasmHashSummary`], enforcing the count-presence invariant.
-    ///
-    /// Returns `Err(WasmHashSummaryError::CountZeroWithBytes)` if `count == 0`
-    /// but `first_first8.is_some()`, or
-    /// `Err(WasmHashSummaryError::CountNonZeroWithoutBytes)` if `count > 0`
-    /// but `first_first8.is_none()`.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`WasmHashSummaryError`] when the `count == 0 ⟺ first_first8.is_none()`
-    /// invariant is violated.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use stellar_agent_smart_account::signers::types::WasmHashSummary;
-    ///
-    /// assert!(WasmHashSummary::new(0, None).is_ok());
-    /// assert!(WasmHashSummary::new(3, Some([0x11; 8])).is_ok());
-    /// assert!(WasmHashSummary::new(0, Some([0x11; 8])).is_err());
-    /// assert!(WasmHashSummary::new(1, None).is_err());
-    /// ```
-    pub fn new(count: u32, first_first8: Option<[u8; 8]>) -> Result<Self, WasmHashSummaryError> {
-        match (count, first_first8) {
-            (0, None) | (1.., Some(_)) => Ok(Self {
-                count,
-                first_first8,
-            }),
-            (0, Some(_)) => Err(WasmHashSummaryError::CountZeroWithBytes),
-            (_, None) => Err(WasmHashSummaryError::CountNonZeroWithoutBytes),
-        }
-    }
-}
-
-/// Custom `Deserialize` for `WasmHashSummary` that enforces the count-presence
-/// invariant on the wire.
-///
-/// Deserialises via the derived serde helper `WasmHashSummaryWire` and then
-/// validates `count == 0 ⟺ first_first8.is_none()`.  Any payload that violates
-/// the invariant returns a serde error rather than silently producing an
-/// inconsistent value.
-///
-/// # Wire format
-///
-/// `{"count": 2, "first_first8": [171, 171, 171, 171, 171, 171, 171, 171]}`
-/// for `Some([0xab; 8])`, and `{"count": 0}` (or `{"count": 0, "first_first8":
-/// null}`) for `None`.  The `#[serde(skip_serializing_if)]` on `Serialize`
-/// omits `null` when `first_first8` is `None`.
-impl<'de> Deserialize<'de> for WasmHashSummary {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        /// Wire helper that derives `Deserialize` without the invariant check.
-        /// The invariant is applied after raw deserialization completes.
-        #[derive(Deserialize)]
-        struct Wire {
-            count: u32,
-            #[serde(default)]
-            first_first8: Option<[u8; 8]>,
-        }
-
-        let raw = Wire::deserialize(deserializer)?;
-        WasmHashSummary::new(raw.count, raw.first_first8).map_err(serde::de::Error::custom)
-    }
-}
-
-impl fmt::Display for WasmHashSummary {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let hex = match self.first_first8 {
-            None => "none".to_owned(),
-            Some(bytes) => bytes.iter().map(|b| format!("{b:02x}")).collect::<String>(),
-        };
-        write!(f, "count={} first_first8={}", self.count, hex)
-    }
-}
-
 // ── ThresholdAffectingOp ──────────────────────────────────────────────────────
 
 /// Identifies which operation would produce an unreachable threshold.
 ///
-/// Carried by [`crate::SaError::ThresholdUnreachable::requested_op`] to give
-/// operators a structured, machine-readable description of the refused
-/// operation.
+/// The post-operation invariant check selects the recovery hint of
+/// [`crate::SaError::ThresholdUnreachable`] from it.
 ///
 /// `#[non_exhaustive]` so future signer-operation variants (e.g. a
 /// `SetSignerWeight` for a future weighted-threshold policy) can be added
@@ -499,116 +350,6 @@ mod tests {
         assert!(rendered.contains("signer_count: 1"), "{rendered}");
         assert!(rendered.contains("threshold: None"), "{rendered}");
         assert!(!rendered.contains("5a5a"), "no identity bytes: {rendered}");
-    }
-
-    // ── WasmHashSummary ───────────────────────────────────────────────────────
-
-    #[test]
-    fn wasm_hash_summary_typed_error_variants() {
-        assert!(matches!(
-            WasmHashSummary::new(0, Some([0xab; 8])),
-            Err(crate::signers::types::WasmHashSummaryError::CountZeroWithBytes)
-        ));
-        assert!(matches!(
-            WasmHashSummary::new(1, None),
-            Err(crate::signers::types::WasmHashSummaryError::CountNonZeroWithoutBytes)
-        ));
-    }
-
-    #[test]
-    fn wasm_hash_summary_deserialize_rejects_count_zero_with_bytes() {
-        // Wire payload that violates count==0 ⟺ first_first8.is_none(): count=0 but bytes present.
-        let bad = r#"{"count":0,"first_first8":[171,171,171,171,171,171,171,171]}"#;
-        let result: Result<WasmHashSummary, _> = serde_json::from_str(bad);
-        assert!(
-            result.is_err(),
-            "deserializer must reject invariant violation"
-        );
-    }
-
-    #[test]
-    fn wasm_hash_summary_deserialize_rejects_count_nonzero_without_bytes() {
-        // Wire payload that violates count==0 ⟺ first_first8.is_none(): count=2 but no bytes.
-        let bad = r#"{"count":2}"#;
-        let result: Result<WasmHashSummary, _> = serde_json::from_str(bad);
-        assert!(
-            result.is_err(),
-            "deserializer must reject invariant violation"
-        );
-    }
-
-    #[test]
-    fn wasm_hash_summary_serde_roundtrip() {
-        let s = WasmHashSummary {
-            count: 3,
-            first_first8: Some([0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88]),
-        };
-        let json = serde_json::to_string(&s).unwrap();
-        let back: WasmHashSummary = serde_json::from_str(&json).unwrap();
-        assert_eq!(s, back);
-    }
-
-    #[test]
-    fn wasm_hash_summary_serde_roundtrip_none() {
-        let s = WasmHashSummary {
-            count: 0,
-            first_first8: None,
-        };
-        let json = serde_json::to_string(&s).unwrap();
-        let back: WasmHashSummary = serde_json::from_str(&json).unwrap();
-        assert_eq!(s, back);
-    }
-
-    #[test]
-    fn wasm_hash_summary_display_renders_hex() {
-        let s = WasmHashSummary {
-            count: 1,
-            first_first8: Some([0xaa, 0xbb, 0xcc, 0xdd, 0x11, 0x22, 0x33, 0x44]),
-        };
-        let disp = format!("{s}");
-        assert!(disp.contains("count=1"), "must contain count: {disp}");
-        assert!(
-            disp.contains("first_first8=aabbccdd11223344"),
-            "must render hex: {disp}"
-        );
-    }
-
-    #[test]
-    fn wasm_hash_summary_display_none_renders_none() {
-        let s = WasmHashSummary {
-            count: 0,
-            first_first8: None,
-        };
-        let disp = format!("{s}");
-        assert!(
-            disp.contains("first_first8=none"),
-            "must render none: {disp}"
-        );
-    }
-
-    /// Verifies the `WasmHashSummary::new` constructor enforces the
-    /// count==0 ⟺ first_first8.is_none() invariant.
-    #[test]
-    fn wasm_hash_summary_new_enforces_count_presence_invariant() {
-        // Valid: count == 0 and first_first8 == None.
-        assert!(WasmHashSummary::new(0, None).is_ok(), "0/None must be ok");
-        // Valid: count > 0 and first_first8 == Some.
-        assert!(
-            WasmHashSummary::new(1, Some([0x00; 8])).is_ok(),
-            "1/Some must be ok"
-        );
-        assert!(
-            WasmHashSummary::new(5, Some([0xff; 8])).is_ok(),
-            "5/Some must be ok"
-        );
-        // Invalid: count == 0 with first_first8 == Some.
-        assert!(
-            WasmHashSummary::new(0, Some([0x11; 8])).is_err(),
-            "0/Some must be err"
-        );
-        // Invalid: count > 0 with first_first8 == None.
-        assert!(WasmHashSummary::new(1, None).is_err(), "1/None must be err");
-        assert!(WasmHashSummary::new(3, None).is_err(), "3/None must be err");
     }
 
     // ── ThresholdAffectingOp ──────────────────────────────────────────────────

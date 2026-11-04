@@ -918,9 +918,8 @@ async fn trustline_prepare_fee_above_cap_refuses() {
     assert_eq!(code, "fees.percentile_exceeds_cap");
     assert_eq!(
         message,
-        "the profile's per-operation fee 500 stroops (classic_fee_per_op_stroops) exceeds the \
-         profile cap of 400 stroops; lower classic_fee_per_op_stroops or raise \
-         classic_max_fee_per_op_stroops"
+        "classic_fee_per_op_stroops must not exceed classic_max_fee_per_op_stroops; lower \
+         classic_fee_per_op_stroops or raise classic_max_fee_per_op_stroops."
     );
 }
 

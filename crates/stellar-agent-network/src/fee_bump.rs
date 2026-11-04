@@ -36,6 +36,7 @@
 //! Source: stellar-core `FeeBumpTransactionFrame::commonValid` +
 //! CAP-0015 §"Validity of FeeBumpTransactions".
 
+use stellar_agent_core::envelope_decode::TRANSACTION_ENVELOPE_XDR_FORM;
 use stellar_agent_core::error::{
     NetworkError, ProtocolError, SubmissionError, ValidationError, WalletError,
 };
@@ -98,12 +99,10 @@ pub enum FeeBumpError {
     /// The minimum outer fee is `(inner_op_count + 1) * max(MIN_BASE_FEE_STROOPS,
     /// ceil(inner_fee / inner_op_count))`.
     #[error(
-        "outer_fee_stroops ({supplied}) is below the CAP-15 minimum ({minimum}); \
+        "outer_fee_stroops must meet the CAP-15 minimum ({minimum}); \
          inner_op_count={inner_op_count}, inner_fee={inner_fee}"
     )]
     FeeBelowCap15Minimum {
-        /// The fee supplied by the caller.
-        supplied: i64,
         /// The computed CAP-15 minimum.
         minimum: i64,
         /// The number of operations in the inner transaction.
@@ -113,10 +112,8 @@ pub enum FeeBumpError {
     },
 
     /// `outer_fee_stroops` exceeds the caller-supplied policy cap.
-    #[error("outer_fee_stroops ({supplied}) exceeds the policy cap ({cap})")]
+    #[error("outer_fee_stroops must not exceed the policy cap ({cap})")]
     FeeExceedsPolicyCap {
-        /// The fee supplied by the caller.
-        supplied: i64,
         /// The policy cap supplied by the caller.
         cap: i64,
     },
@@ -203,18 +200,16 @@ impl From<FeeBumpError> for WalletError {
                 WalletError::Validation(ValidationError::address_argument("fee_source"))
             }
             // Submission errors.
-            FeeBumpError::FeeBelowCap15Minimum {
-                supplied, minimum, ..
-            } => WalletError::Submission(SubmissionError::TxMalformed {
-                detail: format!(
-                    "fee_bump: outer_fee_stroops {supplied} below CAP-15 minimum {minimum}"
-                ),
-            }),
-            FeeBumpError::FeeExceedsPolicyCap { supplied, cap } => {
+            FeeBumpError::FeeBelowCap15Minimum { .. } => {
                 WalletError::Submission(SubmissionError::TxMalformed {
-                    detail: format!(
-                        "fee_bump: outer_fee_stroops {supplied} exceeds policy cap {cap}"
-                    ),
+                    detail: "fee_bump: outer_fee_stroops must meet the CAP-15 minimum of the \
+                             inner transaction"
+                        .to_owned(),
+                })
+            }
+            FeeBumpError::FeeExceedsPolicyCap { .. } => {
+                WalletError::Submission(SubmissionError::TxMalformed {
+                    detail: "fee_bump: outer_fee_stroops must not exceed the policy cap".to_owned(),
                 })
             }
             FeeBumpError::FeeSourceSignerMismatch => {
@@ -530,8 +525,10 @@ pub(crate) fn decode_inner_v1(
         inner_envelope_xdr,
         stellar_agent_xdr_limits::untrusted_decode_limits(inner_envelope_xdr.len()),
     )
-    .map_err(|e| FeeBumpError::InnerDecodeFailed {
-        detail: format!("failed to decode TransactionEnvelope from base64 XDR: {e}"),
+    .map_err(|_| FeeBumpError::InnerDecodeFailed {
+        detail: format!(
+            "failed to decode TransactionEnvelope from base64 XDR: {TRANSACTION_ENVELOPE_XDR_FORM}"
+        ),
     })?;
 
     match envelope {
@@ -597,7 +594,6 @@ fn validate_fee(
 
     if outer_fee_stroops < cap15_minimum_i64 {
         return Err(FeeBumpError::FeeBelowCap15Minimum {
-            supplied: outer_fee_stroops,
             minimum: cap15_minimum_i64,
             inner_op_count,
             inner_fee,
@@ -606,7 +602,6 @@ fn validate_fee(
 
     if outer_fee_stroops > policy_fee_cap_stroops {
         return Err(FeeBumpError::FeeExceedsPolicyCap {
-            supplied: outer_fee_stroops,
             cap: policy_fee_cap_stroops,
         });
     }
@@ -675,6 +670,31 @@ mod tests {
 
     use super::*;
     use crate::signing::software::SoftwareSigningKey;
+
+    /// A refused outer fee stays out of the refusal and its wallet form.
+    #[test]
+    fn refused_fee_stays_out_of_both_errors() {
+        use stellar_agent_test_support::rejected_value::assert_no_marker;
+        let inner_xdr = make_inner_v1_xdr(1, 100);
+        let below = build_fee_bump(&inner_xdr, FEE_PAYER_GSTRKEY, 199, 100_000).unwrap_err();
+        assert_no_marker(&below, "199");
+        let wallet = WalletError::from(below);
+        assert_eq!(
+            wallet.to_string(),
+            "the transaction is malformed: fee_bump: outer_fee_stroops must meet the CAP-15 \
+             minimum of the inner transaction"
+        );
+        assert_no_marker(&wallet, "199");
+        let above = build_fee_bump(&inner_xdr, FEE_PAYER_GSTRKEY, 424_242, 1_000).unwrap_err();
+        assert_no_marker(&above, "424242");
+        let wallet = WalletError::from(above);
+        assert_eq!(
+            wallet.to_string(),
+            "the transaction is malformed: fee_bump: outer_fee_stroops must not exceed the \
+             policy cap"
+        );
+        assert_no_marker(&wallet, "424242");
+    }
 
     // ── Test constants ────────────────────────────────────────────────────────
 
@@ -929,13 +949,9 @@ mod tests {
         assert!(
             matches!(
                 result,
-                Err(FeeBumpError::FeeBelowCap15Minimum {
-                    supplied: 199,
-                    minimum: 200,
-                    ..
-                })
+                Err(FeeBumpError::FeeBelowCap15Minimum { minimum: 200, .. })
             ),
-            "expected FeeBelowCap15Minimum(supplied=199, minimum=200), got {result:?}"
+            "expected FeeBelowCap15Minimum(minimum=200), got {result:?}"
         );
     }
 
@@ -950,13 +966,7 @@ mod tests {
             /* policy_fee_cap_stroops */ 1000,
         );
         assert!(
-            matches!(
-                result,
-                Err(FeeBumpError::FeeExceedsPolicyCap {
-                    supplied: 5000,
-                    cap: 1000,
-                })
-            ),
+            matches!(result, Err(FeeBumpError::FeeExceedsPolicyCap { cap: 1000 })),
             "expected FeeExceedsPolicyCap, got {result:?}"
         );
     }
@@ -997,13 +1007,9 @@ mod tests {
         assert!(
             matches!(
                 result,
-                Err(FeeBumpError::FeeBelowCap15Minimum {
-                    supplied: 1499,
-                    minimum: 1500,
-                    ..
-                })
+                Err(FeeBumpError::FeeBelowCap15Minimum { minimum: 1500, .. })
             ),
-            "expected FeeBelowCap15Minimum(1499, 1500), got {result:?}"
+            "expected FeeBelowCap15Minimum(1500), got {result:?}"
         );
 
         // Supply 1500: should succeed.

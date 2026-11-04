@@ -28,7 +28,6 @@
 //! Handlers MUST NOT log request bodies, CSRF tokens, or credential bytes.
 
 use axum::{
-    Json,
     extract::{Path, State},
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
@@ -45,6 +44,7 @@ use stellar_agent_core::approval::webauthn_registration::{
 };
 use stellar_agent_core::approval::{ApprovalKind, RegistrationInput};
 
+use super::JsonBody;
 use crate::{BridgeState, CsrfToken, templates, wire::RegistrationResponseJSON};
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -209,6 +209,8 @@ pub(crate) async fn register_get(
 ///
 /// # Errors
 ///
+/// - `{"error":"invalid_body"}` with the status of the JSON extractor's refusal:
+///   the body is not the expected JSON.
 /// - `403 Forbidden` — CSRF header absent, non-hex, or mismatch.
 /// - `400 Bad Request`: nonce not found / expired / wrong kind / no
 ///   registration challenge; or the response failed decoding or
@@ -218,7 +220,7 @@ pub(crate) async fn register_post(
     Path(nonce): Path<String>,
     State(state): State<BridgeState>,
     headers: HeaderMap,
-    Json(payload): Json<RegistrationResponseJSON>,
+    JsonBody(payload): JsonBody<RegistrationResponseJSON>,
 ) -> impl IntoResponse {
     // ── CSRF header read + decode ─────────────────────────────────────────
     let csrf_header = match headers.get("x-stellar-approval-csrf") {

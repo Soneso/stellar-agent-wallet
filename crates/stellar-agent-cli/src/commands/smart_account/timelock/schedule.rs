@@ -248,11 +248,8 @@ pub async fn run(args: &ScheduleArgs) -> i32 {
     let timelock_redacted = redact_strkey_first5_last5(&args.timelock);
     let target_redacted = redact_strkey_first5_last5(&args.target);
 
+    // The contract checks the delay after this event, so the event omits it.
     info!(
-        timelock = %timelock_redacted,
-        target = %target_redacted,
-        function = %args.function,
-        delay_ledgers = args.delay_ledgers,
         network = %context.chain_id,
         request_id = %request_id,
         "smart-account timelock schedule: submitting"

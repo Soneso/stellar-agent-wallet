@@ -530,7 +530,7 @@ The cross-check witness sends the oracle credential.
 `balances` takes `--rpc-url` without a profile and sends none.
 The Friendbot path of `accounts create`, `stellar_friendbot`, `stellar_sep43_sign_and_submit_transaction`, and the smart-account, DeFi, and MPP commands and tools send none either.
 
-A missing entry reports `auth.keyring_not_found` naming `service/account`.
+A missing entry reports `auth.keyring_not_found`.
 A stored value that is empty, longer than 1024 bytes, or holds a control character reports `network.rpc_credential_refused`.
 An endpoint that answers a request with HTTP 401 or 403 reports the same code.
 That request is not retried.

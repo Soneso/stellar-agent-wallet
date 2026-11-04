@@ -72,7 +72,7 @@ use crate::managers::auth_entry::{
 };
 use crate::managers::authorization::{QuorumFailure, collect_quorum_signatures_within_budget};
 use crate::managers::rules::{
-    BASE_FEE_STROOPS, ExpiryCheck, HorizonCheck, augment_with_oz_error_name,
+    BASE_FEE_STROOPS, ExpiryCheck, HorizonCheck, SimulationErrorClass,
     build_and_sign_delegated_g_key_entry, build_signed_invoke_envelope, chain_id_fingerprint,
     check_rule_not_expired_standalone, fingerprint_invocation, fingerprint_invocation_nodes,
     locate_smart_account_auth_entry, parse_c_strkey_to_smart_account, parse_min_resource_fee,
@@ -1351,7 +1351,7 @@ pub async fn submit_signed_invoke(
             redacted_reason: format!(
                 "{} simulation returned error: {}",
                 args.op_label,
-                augment_with_oz_error_name(sim_error)
+                SimulationErrorClass::of(sim_error)
             ),
         });
     }

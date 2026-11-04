@@ -14,6 +14,7 @@
 //! | [`source_scan_plans_signer_whose_verifier_reference_resolves_to_from_hash`] | wiremock planner invocation | source scan reads a reference's resolved hash |
 //! | [`destination_changing_executable_between_identification_and_probe_is_refused`] | wiremock planner invocation | `sa.contract_instance_unsupported` (`ExecutableChanged`) |
 //! | [`a_rule_with_an_undecodable_signer_refuses_the_plan`] | wiremock planner invocation | `VerifierMigrationFailed { phase: "plan_build" }` naming the rule and the undecodable signer |
+//! | [`a_rule_deleted_between_the_listing_and_the_read_refuses_without_its_id`] | wiremock planner invocation, wallet log capture | `VerifierMigrationFailed { phase: "plan_build" }` with the fixed not-found class and no rule id |
 //!
 //! All tests are end-to-end [`MigrationPlanner::build`] invocations against a
 //! wiremock HTTP server.
@@ -56,9 +57,10 @@ use wiremock::{
 
 use super::rpc_mock_helpers::{
     SOURCE_G, SorobanRpcDispatcher, account_entry_xdr, account_key_xdr, append_signer_to_rule_xdr,
-    build_context_rule_external_signers_xdr, build_ledger_entries_account_and_contract,
-    build_simulate_response, contract_instance_key_xdr, entries_for_requested_keys,
-    manager_two_url, tmp_audit_writer, unknown_tag_signer_scval,
+    assert_refusal_holds_no_marker, build_context_rule_external_signers_xdr,
+    build_ledger_entries_account_and_contract, build_simulate_response, contract_instance_key_xdr,
+    entries_for_requested_keys, manager_two_url, tmp_audit_writer, unknown_tag_signer_scval,
+    wallet_traced,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -75,9 +77,6 @@ const OZ_VERIFIER_HASH: [u8; 32] = [
     0x0d, 0x83, 0x96, 0xa2, 0xc6, 0x8e, 0x92, 0x81, 0x32, 0x7a, 0x2e, 0xd7, 0xdb, 0xf4, 0xb2, 0x7a,
 ];
 
-/// Unknown hash — not in `VERIFIER_ALLOWLIST`.
-const UNKNOWN_HASH: [u8; 32] = [0xffu8; 32];
-
 /// Test-only revoked verifier hash included in `VERIFIER_ALLOWLIST` under
 /// `--features test-helpers`.
 const TEST_REVOKED_HASH: [u8; 32] = [0xeeu8; 32];
@@ -85,6 +84,42 @@ const TEST_REVOKED_HASH: [u8; 32] = [0xeeu8; 32];
 // ─────────────────────────────────────────────────────────────────────────────
 // Shared helpers
 // ─────────────────────────────────────────────────────────────────────────────
+
+/// The contract strkey of `address`.
+fn scaddress_strkey(address: &ScAddress) -> String {
+    stellar_agent_core::sc_address::scaddress_to_strkey(address).expect("contract strkey")
+}
+
+/// Runs `test` on a current-thread runtime under a TRACE capture, and returns
+/// its value with the captured events.
+fn traced<T>(test: impl std::future::Future<Output = T>) -> (T, String) {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let mut value = None;
+    let logs = stellar_agent_test_support::log_capture::with_captured_trace_logs(|| {
+        value = Some(runtime.block_on(test));
+    });
+    (value.expect("the test ran"), logs)
+}
+
+/// Asserts that the pre-flight event fired, and that neither `logs` nor
+/// `error` in its Display, Debug and serialized forms holds the destination
+/// `strkey`, whole or abbreviated.
+fn assert_destination_absent(error: &SaError, logs: &str, strkey: &str) {
+    assert!(
+        logs.contains("MigrationPlanner::build: starting pre-flight"),
+        "{logs}"
+    );
+    let redacted = stellar_agent_core::observability::redact_strkey_first5_last5(strkey);
+    let forms = format!(
+        "{error}\n{error:?}\n{}\n{logs}",
+        serde_json::to_string(error).unwrap()
+    );
+    assert!(!forms.contains(strkey), "{forms}");
+    assert!(!forms.contains(&redacted), "{forms}");
+}
 
 /// A contract address with the given byte fill.
 fn addr(byte: u8) -> ScAddress {
@@ -180,48 +215,67 @@ async fn manager_with_server(server: &MockServer) -> (SignersManager, tempfile::
 ///
 /// # Mock sequence
 ///
-/// `getLedgerEntries` → contract instance with `UNKNOWN_HASH` (32 × `0xff`).
-/// Pre-flight 1 checks the hash against `VERIFIER_ALLOWLIST` and finds no match.
-/// The planner returns `VerifierMigrationFailed { phase: "preflight_destination_unknown" }`.
+/// `getLedgerEntries` returns a contract instance with a requested hash outside the
+/// allowlist. Pre-flight 1 checks the hash against `VERIFIER_ALLOWLIST` and
+/// finds no match. The planner returns
+/// `VerifierMigrationFailed { phase: "preflight_destination_unknown" }`.
 ///
 /// No `simulateTransaction` call is issued (pre-flight fails before rule enumeration).
+///
+/// The refused hash is named by no channel of the refusal, whole or as its
+/// first eight bytes, nor is its executable summary: not the Display, Debug
+/// and source chain, the serialized form, the MCP error envelope, or the
+/// wallet's logs, which hold the destination's observation.
 ///
 /// # Implements
 ///
 /// Verifier diversification pre-flight gate 1: destination hash must be in the allowlist.
-#[tokio::test]
-async fn preflight_unknown_destination_via_planner() {
-    let server = MockServer::start().await;
+#[test]
+fn preflight_unknown_destination_via_planner() {
+    let requested: [u8; 32] = std::array::from_fn(|i| 0xb7 ^ u8::try_from(i).unwrap());
+    assert!(
+        VERIFIER_ALLOWLIST
+            .iter()
+            .all(|entry| entry.wasm_hash != requested),
+        "the requested hash is outside the allowlist"
+    );
+    let requested_full = hex::encode(requested);
+    let requested_first8 = hex::encode(&requested[..8]);
 
-    // The mock destination verifier address.
-    let dest_addr = addr(0xAB);
+    let (result, logs) = wallet_traced(async move {
+        let server = MockServer::start().await;
 
-    // getLedgerEntries → contract instance with UNKNOWN_HASH (not in VERIFIER_ALLOWLIST) +
-    // account entry for SOURCE_G (required by ContextRuleManager::simulate_read_only which
-    // calls fetch_account before every simulateTransaction — including the pre-flight
-    // fetch_observed_executable call).
-    let ledger_resp = build_ledger_entries_account_and_contract(SOURCE_G, &dest_addr, UNKNOWN_HASH);
-    let simulate_resp = build_simulate_response(&u32_xdr(0)); // would be get_context_rules_count
+        // The mock destination verifier address.
+        let dest_addr = addr(0xAB);
 
-    Mock::given(method("POST"))
-        .and(path("/"))
-        .respond_with(SorobanRpcDispatcher::new(ledger_resp, simulate_resp))
-        .mount(&server)
-        .await;
+        // getLedgerEntries returns a contract instance with the requested hash + account entry
+        // for SOURCE_G (required by ContextRuleManager::simulate_read_only which calls
+        // fetch_account before every simulateTransaction, including the pre-flight
+        // fetch_observed_executable call).
+        let ledger_resp =
+            build_ledger_entries_account_and_contract(SOURCE_G, &dest_addr, requested);
+        let simulate_resp = build_simulate_response(&u32_xdr(0));
 
-    let (manager, _tmp_dir) = manager_with_server(&server).await;
-    let planner = MigrationPlanner::new(&manager);
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .respond_with(SorobanRpcDispatcher::new(ledger_resp, simulate_resp))
+            .mount(&server)
+            .await;
 
-    let request_id = Uuid::new_v4().to_string();
-    let smart_account = addr(0x01);
-    // from_hash may be anything; only the dest hash matters for pre-flight 1.
-    let from_hash = [0xABu8; 32];
+        let (manager, _tmp_dir) = manager_with_server(&server).await;
+        let planner = MigrationPlanner::new(&manager);
 
-    let result = planner
-        .build(smart_account, from_hash, dest_addr, &request_id)
-        .await;
+        let request_id = Uuid::new_v4().to_string();
+        let smart_account = addr(0x01);
+        // from_hash may be anything; only the dest hash matters for pre-flight 1.
+        let from_hash = [0xABu8; 32];
 
-    let err = result.expect_err("pre-flight 1 must reject UNKNOWN_HASH destination");
+        planner
+            .build(smart_account, from_hash, dest_addr, &request_id)
+            .await
+    });
+
+    let err = result.expect_err("pre-flight 1 must reject the requested destination");
 
     // Wire code must be "sa.verifier_migration_failed".
     assert_eq!(
@@ -231,15 +285,23 @@ async fn preflight_unknown_destination_via_planner() {
         err.wire_code()
     );
 
-    // Phase must be "preflight_destination_unknown".
-    let msg = err.to_string();
-    assert!(
-        msg.contains("preflight_destination_unknown"),
-        "Display must contain 'preflight_destination_unknown'; got: {msg}"
+    let SaError::VerifierMigrationFailed { phase, detail, .. } = &err else {
+        panic!("expected VerifierMigrationFailed; got {err:?}");
+    };
+    assert_eq!(*phase, "preflight_destination_unknown");
+    assert_eq!(
+        detail,
+        "destination verifier wasm hash must be in VERIFIER_ALLOWLIST"
     );
     assert!(
-        msg.contains("VERIFIER_ALLOWLIST"),
-        "Display must reference VERIFIER_ALLOWLIST; got: {msg}"
+        logs.contains("observe_contract: observed contract executable"),
+        "the destination's observation event is captured: {logs}"
+    );
+    assert_refusal_holds_no_marker(
+        &err,
+        &logs,
+        &[&requested_full, &requested_first8],
+        &["wasm"],
     );
 }
 
@@ -332,10 +394,15 @@ async fn revoked_destination_error_shape() {
         "wire_code must be 'sa.verifier_wasm_revoked'"
     );
 
+    // The revoked hash is refused, so the Display names the reason alone.
     let msg = err.to_string();
+    assert_eq!(
+        msg,
+        "verifier wasm hash flagged as revoked: reason='test-only revoked verifier fixture'"
+    );
     assert!(
-        msg.contains("eeeeeeee"),
-        "Display must contain the hash projection; got: {msg}"
+        !msg.contains("eeeeeeee"),
+        "Display holds no part of the revoked hash; got: {msg}"
     );
     assert!(
         matches!(err, SaError::VerifierWasmRevoked { .. }),
@@ -760,7 +827,7 @@ async fn a_rule_with_an_undecodable_signer_refuses_the_plan() {
         detail,
         "rule-signer inventory failed: smart-account deployment failed at phase simulate: \
          parse ContextRule id=1: get_context_rule: signer at index 1 (id 21) is not a \
-         recognised Signer: unknown signer tag \"Future\""
+         recognised Signer: signer tag must be Delegated or External"
     );
     assert_eq!(err.wire_code(), "sa.verifier_migration_failed");
 }
@@ -914,9 +981,120 @@ async fn a_rule_that_gains_an_undecodable_signer_after_the_listing_refuses_the_p
     assert_eq!(
         detail,
         "get_context_rule(1): signer at index 1 (id 21) is not a recognised Signer: \
-         unknown signer tag \"Future\""
+         signer tag must be Delegated or External"
     );
     assert_eq!(err.wire_code(), "sa.verifier_migration_failed");
+}
+
+/// `MigrationPlanner::build` refuses the plan when a rule the enumeration
+/// listed is gone at the planner's own read, and neither the error nor the
+/// logs hold the rule's id.
+///
+/// # Mock sequence
+///
+/// `simulateTransaction`: `get_context_rules_count` returns `2`. The
+/// enumeration reads rule 0 (no signers), gaps at ids 1 to 188, and rule
+/// 189. The planner's read of rule 0 returns it again; its read of rule 189
+/// answers `Error(Contract, #3000)` (`ContextRuleNotFound`) with a diagnostic
+/// event log whose `fn_call` data renders the id. Rule 0 keeps the gap count
+/// apart from the id.
+#[test]
+fn a_rule_deleted_between_the_listing_and_the_read_refuses_without_its_id() {
+    use stellar_agent_test_support::rejected_value::{assert_no_marker, assert_no_marker_in_text};
+
+    const RULE_ID: u32 = 189;
+    let smart_account = addr(0x01);
+    let dest_addr = addr(0xCD);
+    let key_data = [0xABu8; 32];
+    let smart_account_strkey = scaddress_strkey(&smart_account);
+
+    let rule_0_xdr = build_context_rule_external_signers_xdr(0, &[], &dest_addr, &key_data);
+    let listed_rule_xdr =
+        build_context_rule_external_signers_xdr(RULE_ID, &[10], &dest_addr, &key_data);
+    let gap = serde_json::json!({
+        "error": "Error(Contract, #3000)",
+        "latestLedger": 1000
+    });
+    // The host's rendering of a contract panic: the error, then the
+    // diagnostic event log, newest first, whose `fn_call` event carries the
+    // invocation's arguments.
+    let deleted = serde_json::json!({
+        "error": format!(
+            "HostError: Error(Contract, #3000)\n\nEvent log (newest first):\n   \
+             0: [Diagnostic Event] contract:{smart_account_strkey}, topics:[error, \
+             Error(Contract, #3000)], data:\"escalating Ok(ScErrorType::Contract) \
+             frame-exit to Err\"\n   \
+             1: [Diagnostic Event] topics:[fn_call, {smart_account_strkey}, \
+             get_context_rule], data:{RULE_ID}\n"
+        ),
+        "latestLedger": 1000
+    });
+    let marker = RULE_ID.to_string();
+    assert!(
+        deleted["error"].as_str().unwrap().contains(&marker),
+        "the mock renders the rule id"
+    );
+    let mut sim_responses = vec![
+        build_simulate_response(&u32_xdr(2)),
+        build_simulate_response(&rule_0_xdr),
+    ];
+    sim_responses.extend((1..RULE_ID).map(|_| gap.clone()));
+    sim_responses.extend([
+        build_simulate_response(&listed_rule_xdr),
+        build_simulate_response(&rule_0_xdr),
+        deleted,
+    ]);
+    let ledger_resp =
+        build_ledger_entries_account_and_contract(SOURCE_G, &dest_addr, OZ_VERIFIER_HASH);
+
+    let (result, logs) = wallet_traced(async {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .respond_with(SorobanRpcDispatcher::new_multi_simulate(
+                ledger_resp,
+                sim_responses,
+            ))
+            .mount(&server)
+            .await;
+        let (manager, _tmp_dir) = manager_with_server(&server).await;
+        MigrationPlanner::new(&manager)
+            .with_max_scan_id(RULE_ID + 1)
+            .build(
+                smart_account,
+                OZ_VERIFIER_HASH,
+                dest_addr,
+                "req-deleted-between-reads",
+            )
+            .await
+    });
+
+    let err = match result {
+        Err(err) => err,
+        Ok(plan) => panic!(
+            "the plan must be refused; got {} affected rules and rules_skipped_count {}",
+            plan.affected_rules.len(),
+            plan.rules_skipped_count
+        ),
+    };
+    let SaError::VerifierMigrationFailed { phase, detail, .. } = &err else {
+        panic!("expected VerifierMigrationFailed, got {err:?}");
+    };
+    assert_eq!(*phase, "plan_build");
+    assert_eq!(
+        detail,
+        "get_context_rule simulation failed: smart-account deployment failed at phase \
+         simulate: get_context_rule: rule_id must identify an existing on-chain rule \
+         [OZ:ContextRuleNotFound]"
+    );
+    assert_eq!(err.wire_code(), "sa.verifier_migration_failed");
+    assert!(
+        logs.contains("MigrationPlanner: list_active_context_rules returned 2 active rules"),
+        "{logs}"
+    );
+    assert_no_marker(&err, &marker);
+    assert_no_marker_in_text(&serde_json::to_string(&err).unwrap(), &marker);
+    assert_no_marker_in_text(&logs, &marker);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -960,45 +1138,98 @@ fn with_external_ref(
 
 /// A destination whose executable is an external reference resolving to an
 /// allowlisted hash passes identification and fails the mutability preflight
-/// with a detail naming the owner and the tag.
-#[tokio::test]
-async fn external_ref_destination_fails_preflight_destination_mutable() {
-    let server = MockServer::start().await;
+/// with a detail stating the check.
+#[test]
+fn external_ref_destination_fails_preflight_destination_mutable() {
     let dest_addr = addr(0xA1);
-    // The account entry comes from the helper; the destination instance is
-    // the external reference appended below.
-    let ledger_resp = with_external_ref(
-        build_ledger_entries_account_and_contract(SOURCE_G, &addr(0xA2), OZ_VERIFIER_HASH),
-        &dest_addr,
-        b"dest-v1",
-        Some(OZ_VERIFIER_HASH),
-    );
-    Mock::given(method("POST"))
-        .and(path("/"))
-        .respond_with(SorobanRpcDispatcher::new(
-            ledger_resp,
-            build_simulate_response(&u32_xdr(0)),
-        ))
-        .mount(&server)
-        .await;
+    let dest_strkey = scaddress_strkey(&dest_addr);
+    let (err, logs) = traced(async {
+        let server = MockServer::start().await;
+        // The account entry comes from the helper; the destination instance is
+        // the external reference appended below.
+        let ledger_resp = with_external_ref(
+            build_ledger_entries_account_and_contract(SOURCE_G, &addr(0xA2), OZ_VERIFIER_HASH),
+            &dest_addr,
+            b"dest-v1",
+            Some(OZ_VERIFIER_HASH),
+        );
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .respond_with(SorobanRpcDispatcher::new(
+                ledger_resp,
+                build_simulate_response(&u32_xdr(0)),
+            ))
+            .mount(&server)
+            .await;
 
-    let (manager, _tmp_dir) = manager_with_server(&server).await;
-    let err = MigrationPlanner::new(&manager)
-        .build(
-            addr(0x01),
-            [0xABu8; 32],
-            dest_addr,
-            &Uuid::new_v4().to_string(),
-        )
-        .await
-        .expect_err("an external-reference destination must be refused");
+        let (manager, _tmp_dir) = manager_with_server(&server).await;
+        MigrationPlanner::new(&manager)
+            .build(
+                addr(0x01),
+                [0xABu8; 32],
+                dest_addr,
+                &Uuid::new_v4().to_string(),
+            )
+            .await
+            .expect_err("an external-reference destination must be refused")
+    });
 
     assert_eq!(err.wire_code(), "sa.verifier_migration_failed");
     let msg = err.to_string();
     assert!(msg.contains("preflight_destination_mutable"), "{msg}");
-    assert!(msg.contains("owner-managed external reference"), "{msg}");
-    assert!(msg.contains("owner GAAAA...AAWHF"), "{msg}");
-    assert!(msg.contains("tag \"dest-v1\""), "{msg}");
+    assert!(
+        msg.ends_with(
+            ": to_verifier must identify an immutable verifier contract; deploy or select an \
+             immutable verifier."
+        ),
+        "{msg}"
+    );
+    assert_destination_absent(&err, &logs, &dest_strkey);
+}
+
+/// A destination with no contract instance is refused at the
+/// destination-unknown phase with the check, and the error holds the
+/// destination in no form.
+#[test]
+fn destination_without_wasm_code_reports_the_check() {
+    let dest_addr = addr(0xA5);
+    let dest_strkey = scaddress_strkey(&dest_addr);
+    let (err, logs) = traced(async {
+        let server = MockServer::start().await;
+        let ledger_resp =
+            build_ledger_entries_account_and_contract(SOURCE_G, &addr(0xA6), OZ_VERIFIER_HASH);
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .respond_with(SorobanRpcDispatcher::new(
+                ledger_resp,
+                build_simulate_response(&u32_xdr(0)),
+            ))
+            .mount(&server)
+            .await;
+
+        let (manager, _tmp_dir) = manager_with_server(&server).await;
+        MigrationPlanner::new(&manager)
+            .build(
+                addr(0x01),
+                [0xABu8; 32],
+                dest_addr,
+                &Uuid::new_v4().to_string(),
+            )
+            .await
+            .expect_err("a destination without Wasm code must be refused")
+    });
+
+    assert_eq!(err.wire_code(), "sa.verifier_migration_failed");
+    let msg = err.to_string();
+    assert!(msg.contains("preflight_destination_unknown"), "{msg}");
+    assert!(
+        msg.ends_with(
+            ": to_verifier must identify a deployed verifier contract with Wasm code; deploy an \
+             allowlisted immutable verifier."
+        ),
+        "{msg}"
+    );
+    assert_destination_absent(&err, &logs, &dest_strkey);
 }
 
 /// A destination whose external reference has no live tag entry is refused
@@ -1046,7 +1277,11 @@ async fn unresolved_external_ref_destination_is_refused_as_unsupported() {
         ),
         "{err:?}"
     );
-    assert!(!err.to_string().contains("no deployed WASM"), "{err}");
+    assert!(
+        !err.to_string()
+            .contains("deployed verifier contract with Wasm code"),
+        "{err}"
+    );
 }
 
 /// The source scan plans a signer whose verifier is an external reference

@@ -670,10 +670,16 @@ async fn rules_create_pins_the_reference_and_verify_pins_reports_the_repoint() {
         "execute must refuse with sa.verifier_hash_drift after the repoint: {envelope}"
     );
     let message = envelope["error"]["message"].as_str().unwrap_or_default();
+    assert_eq!(
+        message,
+        format!(
+            "verifier executable must match the pinned executable for rule {rule_id}: pinned={}",
+            hex::encode(ed25519_hash)
+        )
+    );
     assert!(
-        message.contains(&format!("pinned={}", hex::encode(&ed25519_hash[..8])))
-            && message.contains(&format!("observed={}", hex::encode(&webauthn_hash[..8]))),
-        "the drift refusal must name the pinned and observed hashes: {message}"
+        !message.contains(&hex::encode(&webauthn_hash[..8])),
+        "the drift refusal must hold no part of the observed hash: {message}"
     );
     record("execute-after-repoint-code", "sa.verifier_hash_drift");
 

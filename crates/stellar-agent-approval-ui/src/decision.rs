@@ -1329,6 +1329,61 @@ mod tests {
         assert!(entry.attestation_blob_b64.is_none(), "nothing is attested");
     }
 
+    /// An attestation key read refusal logs the closed missing cause, never
+    /// the keyring service, for a missing entry and for an absent store.
+    #[test]
+    #[serial]
+    fn attestation_key_refusals_hold_no_coordinate() {
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        let fx = fixture("credmarker7");
+        let coordinate = fx.ctx.attestation_key_entry_ref.clone();
+        let entry = KeyringEntry::new(&coordinate.service, &coordinate.account).unwrap();
+        entry.delete_credential().unwrap();
+        let approve = |nonce: &str| {
+            let mut outcome = None;
+            let logs = stellar_agent_test_support::with_captured_logs(|| {
+                outcome = Some(apply_decision(
+                    &fx.ctx,
+                    approve_shown(&fx.ctx, nonce),
+                    RequestIdentity::Local,
+                ));
+            });
+            assert!(
+                matches!(outcome, Some(Outcome::Unavailable)),
+                "expected Unavailable, got {outcome:?}"
+            );
+            logs
+        };
+
+        let logs = approve(&insert(&fx.ctx, payment_entry(DEFAULT_TTL_MS)));
+        assert!(
+            logs.contains("approve: attestation key load failed"),
+            "{logs}"
+        );
+        assert!(
+            logs.contains("the configured keyring entry must exist"),
+            "{logs}"
+        );
+        assert!(!logs.contains("credmarker7"), "{logs}");
+
+        entry.set_password("placeholder").unwrap();
+        entry
+            .as_any()
+            .downcast_ref::<keyring_core::mock::Cred>()
+            .expect("mock credential")
+            .set_error(keyring_core::Error::NoDefaultStore);
+        let logs = approve(&insert(&fx.ctx, payment_entry(DEFAULT_TTL_MS)));
+        assert!(
+            logs.contains("approve: attestation key load failed"),
+            "{logs}"
+        );
+        assert!(
+            logs.contains("a platform keychain must be available for this session"),
+            "{logs}"
+        );
+        assert!(!logs.contains("credmarker7"), "{logs}");
+    }
+
     /// Every presence code maps to its own code and the exact core message,
     /// and no other approval failure is a presence refusal.
     #[test]

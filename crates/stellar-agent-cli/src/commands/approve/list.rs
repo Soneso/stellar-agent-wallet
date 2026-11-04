@@ -82,8 +82,10 @@ pub struct ListArgs {
 /// Success payload for the `approve list` JSON envelope.
 #[derive(Debug, Serialize)]
 struct ListData {
-    /// Profile the snapshot was taken from.
-    profile: String,
+    /// Saved profile the snapshot was taken from; absent when the name
+    /// resolves to no saved profile.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    profile: Option<String>,
     /// Pending entries, filtered per `--include-expired`.
     pending: Vec<PendingApprovalView>,
     /// Count of expired entries in the snapshot, independent of the filter.
@@ -154,14 +156,13 @@ pub async fn run(args: ListArgs) -> i32 {
     };
 
     tracing::debug!(
-        profile = %profile_name,
         pending_count = pending.len(),
         expired_count,
         "approval list completed"
     );
 
     let envelope = Envelope::ok(ListData {
-        profile: profile_name,
+        profile: super::common::saved_profile_name(profile_name),
         pending,
         expired_count,
     });
@@ -180,7 +181,10 @@ fn print_success(envelope: &Envelope<ListData>, format: OutputFormat, now_ms: u6
             #[allow(clippy::print_stdout, reason = "CLI binary intentional user output")]
             if let Some(data) = &envelope.data {
                 if data.pending.is_empty() {
-                    println!("No pending approvals for profile '{}'.", data.profile);
+                    match &data.profile {
+                        Some(profile) => println!("No pending approvals for profile '{profile}'."),
+                        None => println!("No pending approvals."),
+                    }
                 } else {
                     for view in &data.pending {
                         println!("{}", render_pending_row(view, now_ms));

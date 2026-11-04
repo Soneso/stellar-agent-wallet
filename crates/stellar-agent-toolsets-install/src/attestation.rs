@@ -358,17 +358,7 @@ pub fn check_auditor_trusted(
         return Ok(());
     }
 
-    // `redact_strkey_first5_last5` already returns "G...?" for invalid inputs,
-    // so no second fallback is needed here.
-    let key_str = stellar_agent_core::observability::redact::redact_strkey_first5_last5(
-        &StrPublicKey::from_payload(auditor_pubkey_bytes)
-            .map(|pk| pk.to_string())
-            .unwrap_or_default(),
-    );
-
-    Err(ToolsetInstallError::AuditorUntrusted {
-        auditor_key_redacted: key_str,
-    })
+    Err(ToolsetInstallError::AuditorUntrusted)
 }
 
 /// Loads the auditor trust set from `path`.
@@ -676,7 +666,7 @@ mod tests {
         set.insert(pk);
         let err = check_auditor_trusted(&pk2, &set).unwrap_err();
         assert!(
-            matches!(err, ToolsetInstallError::AuditorUntrusted { .. }),
+            matches!(err, ToolsetInstallError::AuditorUntrusted),
             "expected AuditorUntrusted, got: {err:?}"
         );
     }

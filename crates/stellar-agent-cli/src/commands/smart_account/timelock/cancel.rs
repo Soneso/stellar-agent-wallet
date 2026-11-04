@@ -238,8 +238,6 @@ pub async fn run(args: &CancelArgs) -> i32 {
     let timelock_redacted = redact_strkey_first5_last5(&args.timelock);
 
     info!(
-        timelock = %timelock_redacted,
-        operation_id = %operation_id.redacted(),
         network = %context.chain_id,
         request_id = %request_id,
         "smart-account timelock cancel: submitting"

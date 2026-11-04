@@ -156,9 +156,9 @@ async fn missing_primary_credential_reports_keyring_not_found() {
     for result in [pay, balances] {
         let (code, message, _text) = crate::common::assert_business_envelope(&result);
         assert_eq!(code, "auth.keyring_not_found");
-        assert!(
-            message.contains("stellar-agent-rpc-mcp-test/primary"),
-            "{message}"
+        assert_eq!(
+            message,
+            "the configured keyring entry must exist; provision or select the required entry."
         );
     }
     assert!(crate::common::received_methods(&endpoint).await.is_empty());

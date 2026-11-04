@@ -444,12 +444,10 @@ async fn deploy_wasm_policy_body(
         return Err(match spec.kind {
             PolicyDeployKind::SimpleThreshold => SaError::SimpleThresholdPolicySha256Drift {
                 network: args.network_passphrase,
-                recorded: existing_sha256,
                 attempted: spec.wasm_sha256.clone(),
             },
             PolicyDeployKind::WeightedThreshold => SaError::WeightedThresholdPolicySha256Drift {
                 network: args.network_passphrase,
-                recorded: existing_sha256,
                 attempted: spec.wasm_sha256.clone(),
             },
             PolicyDeployKind::SpendingLimit => unreachable!(
@@ -583,7 +581,10 @@ async fn deploy_wasm_policy_body(
         if let Some(sim_error) = &upload_sim.error {
             return Err(SaError::DeploymentFailed {
                 phase: "simulate",
-                redacted_reason: format!("upload simulation returned error: {sim_error}"),
+                redacted_reason: format!(
+                    "upload simulation returned error: {}",
+                    crate::managers::rules::SimulationErrorClass::of(sim_error)
+                ),
             });
         }
         if upload_sim.min_resource_fee == 0 || upload_sim.transaction_data.is_empty() {
@@ -753,7 +754,10 @@ async fn deploy_wasm_policy_body(
     if let Some(sim_error) = &sim_response.error {
         return Err(SaError::DeploymentFailed {
             phase: "simulate",
-            redacted_reason: format!("deploy simulation returned error: {sim_error}"),
+            redacted_reason: format!(
+                "deploy simulation returned error: {}",
+                crate::managers::rules::SimulationErrorClass::of(sim_error)
+            ),
         });
     }
     if sim_response.min_resource_fee == 0 || sim_response.transaction_data.is_empty() {

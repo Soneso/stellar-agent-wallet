@@ -721,6 +721,35 @@ async fn confirmed_multicall_counts_each_leg_once() {
     assert_eq!(sends.load(Ordering::SeqCst), 1);
 }
 
+/// An invalid bundle function name is refused with the check before any
+/// request, in the character and the length case alike, and holds the name
+/// in no rendered form.
+#[tokio::test]
+#[serial]
+async fn an_invalid_function_name_stays_out_of_the_bundle_refusal() {
+    let fixture = Fixture::new();
+    let (server, sends, _) = rpc("SUCCESS").await;
+    for fn_name in ["credmarker7!".to_owned(), "credmarker7".repeat(3)] {
+        let mut bundle = fixture.bundle();
+        bundle[0].fn_name = fn_name;
+        let error = fixture
+            .multicall_with_policy(&server.uri(), bundle, fixture.engine())
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "multicall bundle failed at phase 'build': fn_name must be a non-empty Soroban \
+             symbol of at most 32 bytes using only [A-Za-z0-9_]; correct the bundle function \
+             name."
+        );
+        stellar_agent_test_support::rejected_value::assert_no_marker(&error, "credmarker7");
+        let json = serde_json::to_string(&error).unwrap();
+        assert!(!json.contains("credmarker7"), "{json}");
+    }
+    assert_eq!(sends.load(Ordering::SeqCst), 0);
+}
+
 /// A confirmed bundle's transaction invokes the registered router's `exec`
 /// with the wallet as its caller, and carries the wallet's authorization over
 /// the simulated tree, sub-invocations included, through the signed

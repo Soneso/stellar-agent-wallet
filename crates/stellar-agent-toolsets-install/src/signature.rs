@@ -299,16 +299,7 @@ pub fn check_signer_trusted(
         return Ok(());
     }
 
-    // Produce a redacted representation of the signer key.
-    let key_str = if let Ok(pk) = StrPublicKey::from_payload(signer_pubkey_bytes) {
-        stellar_agent_core::observability::redact::redact_strkey_first5_last5(&pk.to_string())
-    } else {
-        "G...?".to_owned()
-    };
-
-    Err(ToolsetInstallError::UntrustedPublisher {
-        publisher_key_redacted: key_str,
-    })
+    Err(ToolsetInstallError::UntrustedPublisher)
 }
 
 #[cfg(test)]
@@ -483,7 +474,7 @@ mod tests {
         set.insert(pk); // pk but NOT pk2
         let err = check_signer_trusted(&pk2, &set).unwrap_err();
         assert!(
-            matches!(err, ToolsetInstallError::UntrustedPublisher { .. }),
+            matches!(err, ToolsetInstallError::UntrustedPublisher),
             "expected UntrustedPublisher, got: {err:?}"
         );
     }

@@ -319,7 +319,7 @@ mod tests {
         use stellar_agent_core::error::AuthError;
         assert_eq!(
             NonceError::KeyringError(AuthError::KeyringNotFound {
-                name: "nonce-key".to_owned()
+                cause: stellar_agent_core::error::KeyringMissingCause::MissingEntry
             })
             .wire_code(),
             "keyring.error"
@@ -392,7 +392,7 @@ mod tests {
                 requested_ms: 1_000,
             },
             NonceError::KeyringError(AuthError::KeyringNotFound {
-                name: "stellar-agent-nonce-test".to_owned(),
+                cause: stellar_agent_core::error::KeyringMissingCause::MissingEntry,
             }),
             NonceError::KeyTooShort { actual: 10 },
             NonceError::InputTooLong {

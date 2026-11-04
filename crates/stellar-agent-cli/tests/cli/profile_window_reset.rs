@@ -7,7 +7,9 @@
 )]
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use hmac::{Hmac, KeyInit as _, Mac as _};
 use serial_test::serial;
+use sha2::Sha256;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
@@ -17,6 +19,7 @@ use stellar_agent_core::policy::v1::criteria::state_store::{StateKey, WindowEntr
 use stellar_agent_core::profile::schema::{KeyringEntryRef, Profile, generation_account};
 use stellar_agent_network::policy_state::PersistedWindowStore;
 use stellar_agent_test_support::StellarAgentHomeGuard;
+use stellar_agent_test_support::rejected_value::assert_no_marker_in_text;
 
 const HEADLESS_KEY: [u8; 32] = [0x4b; 32];
 const NAME: &str = "reset-ceremony";
@@ -440,6 +443,51 @@ fn mint_is_recorded_even_when_the_store_write_fails() {
         }
     ));
     assert!(get(&f.profile.policy_window_state_key_id).is_some());
+}
+
+/// An authenticated store whose version this build does not read keeps its
+/// stable code, and the version stays out of the envelope and every event.
+#[test]
+#[serial]
+fn an_unsupported_version_stays_out_of_the_reset_refusal() {
+    const REFUSED_VERSION: &str = "3141592653";
+    let f = Fixture::new(true);
+    let key =
+        stellar_agent_network::keyring::load_hmac_key_32(&f.profile.policy_window_state_key_id)
+            .unwrap();
+    let body = format!(r#"{{"version":{REFUSED_VERSION}}}"#);
+    // The store authenticates its body under its context label.
+    let tag = Hmac::<Sha256>::new_from_slice(key.as_ref())
+        .unwrap()
+        .chain_update(b"stellar-agent-policy-window/v1/body\x00")
+        .chain_update(&body)
+        .finalize()
+        .into_bytes();
+    std::fs::write(&f.path, [tag.as_slice(), body.as_bytes()].concat()).unwrap();
+    let before = f.state();
+
+    let mut command = f.command("repair");
+    let output = command.env("STELLAR_AGENT_LOG", "trace").output().unwrap();
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let envelope: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(envelope["ok"], false, "{envelope}");
+    assert_eq!(
+        envelope["error"]["code"], "profile.reset_window_state_newer_version",
+        "{envelope}"
+    );
+    let message = envelope["error"]["message"].as_str().unwrap();
+    assert!(
+        message.ends_with(
+            "policy window-state version must be supported by this build; use the build that \
+             wrote the file"
+        ),
+        "{message}"
+    );
+    assert_no_marker_in_text(&stdout, REFUSED_VERSION);
+    assert_no_marker_in_text(&stderr, REFUSED_VERSION);
+    assert_eq!(f.state(), before);
 }
 
 #[test]

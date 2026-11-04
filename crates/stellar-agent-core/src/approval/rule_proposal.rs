@@ -542,8 +542,7 @@ pub(crate) fn validate_context_rule_proposal_snapshot(
 ) -> Result<(), String> {
     if snapshot.snapshot_version != CONTEXT_RULE_PROPOSAL_SNAPSHOT_VERSION {
         return Err(format!(
-            "snapshot_version must be {CONTEXT_RULE_PROPOSAL_SNAPSHOT_VERSION}, got {}",
-            snapshot.snapshot_version
+            "snapshot_version must be {CONTEXT_RULE_PROPOSAL_SNAPSHOT_VERSION}"
         ));
     }
 
@@ -664,7 +663,7 @@ fn validate_rule_proposal_policy(policy: &RuleProposalPolicy) -> Result<(), Stri
     use base64::Engine as _;
     let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(&policy.params_xdr_b64)
-        .map_err(|e| format!("params_xdr_b64 is not valid URL-safe base64: {e}"))?;
+        .map_err(|_| "params_xdr_b64 must be URL-safe base64 without padding".to_owned())?;
     if decoded.len() > RULE_PROPOSAL_MAX_POLICY_PARAMS_BYTES {
         return Err(format!(
             "params_xdr_b64 decodes to at most {RULE_PROPOSAL_MAX_POLICY_PARAMS_BYTES} bytes, \
@@ -686,6 +685,16 @@ mod tests {
 
     const C_ADDR: &str = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
     const G_ADDR: &str = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+
+    #[test]
+    fn invalid_policy_params_report_the_form_without_the_byte() {
+        let policy = RuleProposalPolicy::new(C_ADDR.to_owned(), "~".to_owned());
+        let reason = validate_rule_proposal_policy(&policy).unwrap_err();
+        assert_eq!(
+            reason,
+            "params_xdr_b64 must be URL-safe base64 without padding"
+        );
+    }
 
     fn valid_snapshot() -> ContextRuleProposalSnapshot {
         ContextRuleProposalSnapshot::new(
@@ -827,9 +836,12 @@ mod tests {
     #[test]
     fn rejects_wrong_snapshot_version() {
         let mut s = valid_snapshot();
-        s.snapshot_version = 999;
-        let err = validate_context_rule_proposal_snapshot(&s).unwrap_err();
-        assert!(err.contains("snapshot_version"));
+        s.snapshot_version = 3_141_592_653;
+        let reason = format!("snapshot_version must be {CONTEXT_RULE_PROPOSAL_SNAPSHOT_VERSION}");
+        assert_eq!(
+            validate_context_rule_proposal_snapshot(&s).unwrap_err(),
+            reason
+        );
     }
 
     #[test]

@@ -317,14 +317,10 @@ pub enum WindowStoreError {
 
     /// The authenticated file was written by a newer build.
     #[error(
-        "policy window-state version {version} exceeds {max}; written by a newer build; use that build"
+        "policy window-state version must be supported by this build; use the build that wrote \
+         the file"
     )]
-    UnsupportedVersion {
-        /// The authenticated file's version.
-        version: u32,
-        /// The highest version this build reads.
-        max: u32,
-    },
+    UnsupportedVersion,
 
     /// The store file's HMAC tag does not match the recomputed value —
     /// tampering, corruption, or a stale key.

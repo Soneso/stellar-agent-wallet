@@ -440,11 +440,9 @@ fn store_refusal(name: &str, error: WindowStoreError) -> WalletError {
         return WalletError::Validation(refusal);
     }
     match error {
-        WindowStoreError::UnsupportedVersion { version, max } => {
+        WindowStoreError::UnsupportedVersion => {
             WalletError::Validation(ValidationError::ResetWindowStateNewerVersion {
                 profile: name.to_owned(),
-                version,
-                max,
             })
         }
         #[cfg(feature = "mainnet-write")]
@@ -772,20 +770,17 @@ mod tests {
 
     #[test]
     fn a_store_from_a_newer_build_is_a_validation_refusal() {
-        let error = store_refusal(
-            "acme",
-            WindowStoreError::UnsupportedVersion { version: 5, max: 4 },
-        );
+        let error = store_refusal("acme", WindowStoreError::UnsupportedVersion);
         assert_eq!(error.code(), "profile.reset_window_state_newer_version");
         assert_eq!(
             error.category(),
             stellar_agent_core::error::ErrorCategory::Validation
         );
-        let text = error.to_string();
-        assert!(text.contains("profile 'acme'"), "{text}");
-        assert!(text.contains("format version 5"), "{text}");
-        assert!(text.contains("version 4 this build reads"), "{text}");
-        assert!(text.contains("Use the build that wrote it"), "{text}");
+        assert_eq!(
+            error.to_string(),
+            "the policy window-state of profile 'acme' cannot be reset: policy window-state \
+             version must be supported by this build; use the build that wrote the file"
+        );
     }
 
     #[cfg(feature = "mainnet-write")]

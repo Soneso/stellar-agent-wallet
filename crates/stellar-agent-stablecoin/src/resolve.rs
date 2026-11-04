@@ -60,43 +60,35 @@ pub enum ResolveError {
     /// The named warning [`USDT_REFUSAL_WARNING`] is included in the message.
     /// No override path exists at v1.
     #[error(
-        "USDT-on-Stellar-lookalike-risk — USDT trustlines are refused on this wallet (code: {code:?})"
+        "USDT-on-Stellar-lookalike-risk: asset must name a permitted denomination; use a \
+         supported bare code or an explicit CODE:ISSUER."
     )]
-    UsdtRefused {
-        /// The supplied asset code (may be mixed-case, e.g. `"usdt"`).
-        code: String,
-    },
+    UsdtRefused,
 
     /// The `(code, issuer)` pair is in the known-lookalike denylist (refusal rule 2).
     ///
-    /// Issuer is redacted to first-5-last-5 in the error message.
+    /// The refused code and issuer stay out of the error.
     #[error(
-        "counterparty-lookalike — (code={code:?}, issuer={issuer_redacted}) \
-         is a known lookalike in the denylist (home_domain={home_domain:?})"
+        "counterparty-lookalike: asset must name an issuer outside the known-lookalike denylist; \
+         use a supported denomination and its trusted CODE:ISSUER."
     )]
     LookalikeRefused {
-        /// Asset code.
-        code: String,
-        /// Issuer G-strkey, first-5-last-5 redacted.
-        issuer_redacted: String,
         /// On-chain `home_domain` of the lookalike issuer.
         home_domain: &'static str,
     },
 
     /// Code matches a pinned code but the supplied issuer differs (refusal rule 3).
     ///
-    /// Both the supplied and pinned issuers are redacted to first-5-last-5.
+    /// The supplied issuer stays out of the error.
     #[error(
-        "issuer mismatch for pinned code — code {code:?} is pinned to \
-         issuer {pinned_issuer_redacted} but supplied issuer is {supplied_issuer_redacted}"
+        "asset issuer must match the wallet pin for that code; use the supported bare code or \
+         its pinned CODE:ISSUER."
     )]
     PinnedCodeIssuerMismatch {
         /// Asset code (e.g. `"USDC"`).
         code: String,
         /// Pinned canonical issuer, first-5-last-5 redacted.
         pinned_issuer_redacted: String,
-        /// Caller-supplied issuer, first-5-last-5 redacted.
-        supplied_issuer_redacted: String,
     },
 
     /// Bare code supplied with no pin row for the active network (refusal rule 4).
@@ -120,13 +112,10 @@ pub enum ResolveError {
     /// A SEP-41 C-strkey SAC address was supplied but SAC resolution is not
     /// yet implemented (requires an on-chain RPC call).
     #[error(
-        "SAC address resolution not yet available — supply code+issuer instead of \
-         C-strkey {address_redacted}"
+        "asset must use CODE:ISSUER because SAC-address resolution is unavailable; supply the \
+         asset code and its G-strkey issuer."
     )]
-    UnresolvableSacAddress {
-        /// C-strkey, first-5-last-5 redacted.
-        address_redacted: String,
-    },
+    UnresolvableSacAddress,
 
     /// The supplied asset code is structurally invalid (not 1 to 12 ASCII
     /// alphanumeric characters), or a supplied contract address is not a valid
@@ -255,10 +244,7 @@ pub fn resolve_denomination(
                 Ok(_) => {
                     // SAC-to-asset resolution requires an on-chain RPC call.
                     // Not yet implemented; return a typed error.
-                    let redacted = redact_strkey_first5_last5(&addr);
-                    Err(ResolveError::UnresolvableSacAddress {
-                        address_redacted: redacted,
-                    })
+                    Err(ResolveError::UnresolvableSacAddress)
                 }
                 Err(_) => {
                     // Not a valid C-strkey; treat as invalid.
@@ -281,12 +267,8 @@ pub fn resolve_denomination(
 
             // Rule 1: USDT hard-deny.
             if is_usdt(&code_upper) {
-                info!(
-                    code = %code_upper,
-                    warning = USDT_REFUSAL_WARNING,
-                    "USDT trustline refused"
-                );
-                return Err(ResolveError::UsdtRefused { code: code_upper });
+                info!(warning = USDT_REFUSAL_WARNING, "USDT trustline refused");
+                return Err(ResolveError::UsdtRefused);
             }
 
             // Bare code: must resolve through the pin table.
@@ -346,12 +328,8 @@ fn resolve_with_code_and_issuer(
 ) -> Result<ResolvedAsset, ResolveError> {
     // Rule 1: USDT hard-deny — checked before issuer lookup.
     if is_usdt(&code_upper) {
-        info!(
-            code = %code_upper,
-            warning = USDT_REFUSAL_WARNING,
-            "USDT trustline refused"
-        );
-        return Err(ResolveError::UsdtRefused { code: code_upper });
+        info!(warning = USDT_REFUSAL_WARNING, "USDT trustline refused");
+        return Err(ResolveError::UsdtRefused);
     }
 
     // Rule 2: known-lookalike denylist check.
@@ -361,35 +339,25 @@ fn resolve_with_code_and_issuer(
             .find(|e| e.code == code_upper && e.issuer == issuer)
             .map(|e| e.home_domain)
             .unwrap_or("<unknown>");
-        let issuer_redacted = redact_strkey_first5_last5(&issuer);
         info!(
-            code = %code_upper,
-            issuer = %issuer_redacted,
             home_domain = %home_domain,
-            "lookalike denylist match — refusing trustline"
+            "lookalike denylist match; refusing trustline"
         );
-        return Err(ResolveError::LookalikeRefused {
-            code: code_upper,
-            issuer_redacted,
-            home_domain,
-        });
+        return Err(ResolveError::LookalikeRefused { home_domain });
     }
 
     // Rule 3: code matches a pinned code but issuer differs (issuer mismatch).
     if let Some(canonical) = pinned_issuer(&code_upper, network) {
         if issuer != canonical {
             let pinned_redacted = redact_strkey_first5_last5(canonical);
-            let supplied_redacted = redact_strkey_first5_last5(&issuer);
             info!(
                 code = %code_upper,
                 pinned_issuer = %pinned_redacted,
-                supplied_issuer = %supplied_redacted,
-                "pinned-code issuer mismatch — refusing trustline"
+                "pinned-code issuer mismatch; refusing trustline"
             );
             return Err(ResolveError::PinnedCodeIssuerMismatch {
                 code: code_upper,
                 pinned_issuer_redacted: pinned_redacted,
-                supplied_issuer_redacted: supplied_redacted,
             });
         }
         // Issuer matches the pin — allowed.
@@ -449,6 +417,93 @@ mod tests {
     // EURAU lookalike #2.
     const EURAU_LOOKALIKE_2: &str = "GCPW5C27VOZ4T74ERBEAUW2O7TXRZ5CNMRN7CCDVI477FXRWULBACBSC";
 
+    // ── Refusals hold no dynamic value ───────────────────────────────────────
+
+    /// Resolves `input`, returning the refusal and the captured events.
+    fn refusal_and_logs(input: DenominationInput) -> (ResolveError, String) {
+        let mut refusal = None;
+        let logs = stellar_agent_test_support::log_capture::with_captured_logs(|| {
+            refusal = resolve_denomination(input, TESTNET).err();
+        });
+        (refusal.expect("the input must be refused"), logs)
+    }
+
+    #[test]
+    fn usdt_refusals_hold_no_dynamic_code() {
+        let explicit = DenominationInput::CodeAndIssuer {
+            code: "uSdT".to_owned(),
+            issuer: USDC_TESTNET.to_owned(),
+        };
+        for input in [DenominationInput::BareCode("uSdT".to_owned()), explicit] {
+            let (err, logs) = refusal_and_logs(input);
+            assert_eq!(
+                err.to_string(),
+                "USDT-on-Stellar-lookalike-risk: asset must name a permitted denomination; use a \
+                 supported bare code or an explicit CODE:ISSUER."
+            );
+            assert_eq!(format!("{err:?}"), "UsdtRefused");
+            assert!(logs.contains("USDT trustline refused"), "{logs}");
+            assert!(logs.contains(USDT_REFUSAL_WARNING), "{logs}");
+            assert!(!logs.contains("code="), "{logs}");
+            assert!(!logs.contains("uSdT"), "{logs}");
+        }
+    }
+
+    #[test]
+    fn lookalike_refusals_hold_no_code_or_issuer() {
+        for entry in crate::pins::KNOWN_LOOKALIKES {
+            let (err, logs) = refusal_and_logs(DenominationInput::CodeAndIssuer {
+                code: entry.code.to_owned(),
+                issuer: entry.issuer.to_owned(),
+            });
+            assert_eq!(
+                err.to_string(),
+                "counterparty-lookalike: asset must name an issuer outside the known-lookalike \
+                 denylist; use a supported denomination and its trusted CODE:ISSUER."
+            );
+            let abbreviated = redact_strkey_first5_last5(entry.issuer);
+            assert!(logs.contains("lookalike denylist match"), "{logs}");
+            for rendered in [format!("{err:?}"), logs] {
+                assert!(!rendered.contains(entry.issuer), "{rendered}");
+                assert!(!rendered.contains(&abbreviated), "{rendered}");
+                assert!(!rendered.contains(entry.code), "{rendered}");
+            }
+        }
+    }
+
+    #[test]
+    fn pinned_code_refusal_holds_no_supplied_issuer() {
+        let supplied = "GBPXXOA5N4JYPESHAADMQKBPWZWQDQ64ZV6ZL2S3LAGW4SY7NTCMWIVL";
+        let (err, logs) = refusal_and_logs(DenominationInput::CodeAndIssuer {
+            code: "USDC".to_owned(),
+            issuer: supplied.to_owned(),
+        });
+        assert_eq!(
+            err.to_string(),
+            "asset issuer must match the wallet pin for that code; use the supported bare code \
+             or its pinned CODE:ISSUER."
+        );
+        assert!(logs.contains("pinned-code issuer mismatch"), "{logs}");
+        let abbreviated = redact_strkey_first5_last5(supplied);
+        for rendered in [format!("{err:?}"), logs] {
+            assert!(!rendered.contains(supplied), "{rendered}");
+            assert!(!rendered.contains(&abbreviated), "{rendered}");
+        }
+    }
+
+    #[test]
+    fn sac_refusal_holds_no_address() {
+        let sac = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM";
+        let err = resolve_denomination(DenominationInput::SacAddress(sac.to_owned()), TESTNET)
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "asset must use CODE:ISSUER because SAC-address resolution is unavailable; supply \
+             the asset code and its G-strkey issuer."
+        );
+        assert_eq!(format!("{err:?}"), "UnresolvableSacAddress");
+    }
+
     // ── Rule 1: USDT hard-deny ────────────────────────────────────────────────
 
     #[test]
@@ -456,7 +511,7 @@ mod tests {
         let err = resolve_denomination(DenominationInput::BareCode("USDT".to_owned()), TESTNET)
             .unwrap_err();
         assert!(
-            matches!(err, ResolveError::UsdtRefused { ref code } if code == "USDT"),
+            matches!(err, ResolveError::UsdtRefused),
             "expected UsdtRefused, got: {err:?}"
         );
     }
@@ -465,7 +520,7 @@ mod tests {
     fn kat_usdt_lowercase_refused() {
         let err = resolve_denomination(DenominationInput::BareCode("usdt".to_owned()), TESTNET)
             .unwrap_err();
-        assert!(matches!(err, ResolveError::UsdtRefused { .. }));
+        assert!(matches!(err, ResolveError::UsdtRefused));
     }
 
     #[test]
@@ -478,7 +533,7 @@ mod tests {
             TESTNET,
         )
         .unwrap_err();
-        assert!(matches!(err, ResolveError::UsdtRefused { .. }));
+        assert!(matches!(err, ResolveError::UsdtRefused));
     }
 
     // ── Rule 2: Lookalike denylist ────────────────────────────────────────────
@@ -666,7 +721,7 @@ mod tests {
         let err = resolve_denomination(DenominationInput::SacAddress(sac.to_owned()), TESTNET)
             .unwrap_err();
         assert!(
-            matches!(err, ResolveError::UnresolvableSacAddress { .. }),
+            matches!(err, ResolveError::UnresolvableSacAddress),
             "expected UnresolvableSacAddress, got: {err:?}"
         );
     }

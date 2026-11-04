@@ -699,12 +699,10 @@ async fn install_pins_the_reference_and_signing_detects_the_repoint() {
     let refused_rule_id = match refusal {
         SaError::VerifierMutable {
             rule_id,
-            ref contract_address_redacted,
             admin_or_owner_key: AdminOrOwnerKey::ExternalRefExecutable,
             detail: Some(ref detail),
             ..
         } => {
-            assert_eq!(contract_address_redacted.as_str(), proxy_redacted);
             assert_eq!(
                 detail,
                 &format!("owner {beacon_redacted}, tag \"{TAG}\""),
@@ -990,28 +988,26 @@ async fn install_pins_the_reference_and_signing_detects_the_repoint() {
     )
     .await
     .expect_err("a transfer through the repointed reference must be refused before signing");
-    match execute_refusal {
+    match &execute_refusal {
         SaError::VerifierHashDrift {
             rule_id: drift_rule_id,
-            ref deploy_address_redacted,
+            deploy_address_redacted,
             pinned_hash,
-            observed_hash,
-            observed_executable: Some(ref observed_executable),
-            ref request_id,
+            request_id,
             ..
         } => {
-            assert_eq!(drift_rule_id, rule_id);
+            assert_eq!(*drift_rule_id, rule_id);
             assert_eq!(deploy_address_redacted.as_str(), proxy_redacted);
-            assert_eq!(pinned_hash, WasmHashPin::new(fixture.ed25519_hash));
-            assert_eq!(observed_hash, Some(WasmHashPin::new(fixture.webauthn_hash)));
-            assert_eq!(observed_executable, &expected_observed);
+            assert_eq!(*pinned_hash, WasmHashPin::new(fixture.ed25519_hash));
             assert_eq!(request_id, &drift_request_id);
         }
-        other => panic!(
-            "expected VerifierHashDrift {{ observed_executable: Some(..) }} from the execute \
-             path; got {other:?}"
-        ),
+        other => panic!("expected VerifierHashDrift from the execute path; got {other:?}"),
     }
+    let rendered = format!("{execute_refusal}\n{execute_refusal:?}");
+    assert!(
+        !rendered.contains(&first8_hex(&fixture.webauthn_hash)),
+        "the execute refusal holds no part of the observed hash: {rendered}"
+    );
     let execute_drift_rows: Vec<AuditEntry> = read_audit_entries(&audit_log_path)
         .into_iter()
         .filter(|entry| {
@@ -1027,6 +1023,20 @@ async fn install_pins_the_reference_and_signing_detects_the_repoint() {
         1,
         "exactly one SaVerifierHashDrift row carries the execute path's request id"
     );
+    match &execute_drift_rows[0].event_kind {
+        EventKind::SaVerifierHashDrift {
+            observed_hash_first8,
+            observed_executable,
+            ..
+        } => {
+            assert_eq!(observed_hash_first8, &first8_hex(&fixture.webauthn_hash));
+            assert_eq!(
+                observed_executable.as_deref(),
+                Some(expected_observed.as_str())
+            );
+        }
+        other => panic!("filtered to SaVerifierHashDrift; got {other:?}"),
+    }
     record(TEST, "execute-drift-request-id", &drift_request_id);
     let recipient_after_refusal = xlm_stroops_balance(&recipient_g).await;
     assert_eq!(
@@ -1061,26 +1071,22 @@ async fn install_pins_the_reference_and_signing_detects_the_repoint() {
         .await;
     match outcome {
         Err(CredentialsError::WasmHashDrift { ref source }) => match source.as_ref() {
-            SaError::VerifierHashDrift {
+            inner @ SaError::VerifierHashDrift {
                 rule_id: drift_rule_id,
                 deploy_address_redacted,
                 pinned_hash,
-                observed_hash,
-                observed_executable: Some(observed_executable),
                 ..
             } => {
                 assert_eq!(*drift_rule_id, rule_id);
                 assert_eq!(deploy_address_redacted.as_str(), proxy_redacted);
                 assert_eq!(*pinned_hash, WasmHashPin::new(fixture.ed25519_hash));
-                assert_eq!(
-                    *observed_hash,
-                    Some(WasmHashPin::new(fixture.webauthn_hash))
+                let rendered = format!("{inner}\n{inner:?}");
+                assert!(
+                    !rendered.contains(&first8_hex(&fixture.webauthn_hash)),
+                    "the passkey refusal holds no part of the observed hash: {rendered}"
                 );
-                assert_eq!(observed_executable, &expected_observed);
             }
-            other => panic!(
-                "expected VerifierHashDrift {{ observed_executable: Some(..) }}; got {other:?}"
-            ),
+            other => panic!("expected VerifierHashDrift; got {other:?}"),
         },
         other => panic!("expected CredentialsError::WasmHashDrift; got {other:?}"),
     }
@@ -1188,11 +1194,9 @@ async fn assert_defi_gates_refuse(fixture: &Cap85Fixture, resolved: &[u8; 32]) {
 
     match verify_defindex_vault_wasm(&fixture.proxy, &rpc, None).await {
         Err(DefindexPinError::ExternalRef {
-            vault_redacted,
             owner_redacted,
             tag,
         }) => {
-            assert_eq!(vault_redacted, proxy_redacted);
             assert_eq!(owner_redacted, beacon_redacted);
             assert_eq!(tag, TAG);
         }

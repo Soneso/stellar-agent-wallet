@@ -669,7 +669,9 @@ async fn signer_load_auth_error(tool: Tool, profile_name: &str, seed: u8, fault:
             entry.delete_credential().expect("remove only the signer");
             (
                 "auth.keyring_not_found",
-                format!("keyring entry '{SIGNER_SERVICE}' was not found"),
+                "the configured keyring entry must exist; provision or select the required \
+                 entry."
+                    .to_owned(),
             )
         }
         SignerFault::OtherKey => {

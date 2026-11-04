@@ -408,7 +408,9 @@ async fn exercise(tool: Tool, initially_confirmed: bool, fault: Option<SignerFau
         let (expected_code, expected_message) = match fault {
             SignerFault::Missing => (
                 "auth.keyring_not_found",
-                "keyring entry 'svc' was not found".to_owned(),
+                "the configured keyring entry must exist; provision or select the required \
+                 entry."
+                    .to_owned(),
             ),
             SignerFault::OtherKey => (
                 "auth.signer_key_mismatch",

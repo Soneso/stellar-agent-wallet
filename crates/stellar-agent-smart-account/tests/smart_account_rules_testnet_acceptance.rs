@@ -1119,15 +1119,18 @@ async fn e3_self_authorized_rename_through_the_production_manager_shape() {
         SaError::PolicyHashDrift {
             rule_id: drift_rule_id,
             pinned_hash,
-            observed_hash,
             ..
         } => {
             assert_eq!(*drift_rule_id, rule_id);
             assert_eq!(pinned_hash, &wrong_policy_hash);
-            assert_eq!(observed_hash.as_ref(), Some(&deployed_policy_hash));
         }
         other => panic!("expected PolicyHashDrift for rule {rule_id}; got {other:?}"),
     }
+    let rendered = format!("{err}\n{err:?}");
+    assert!(
+        !rendered.contains(&deployed_policy_hash.to_hex()),
+        "the refusal holds no observed hash: {rendered}"
+    );
     eprintln!("e3: rename {drift_request_id} under rule {rule_id} refused: {err}");
 
     drop(manager);
@@ -1150,10 +1153,16 @@ async fn e3_self_authorized_rename_through_the_production_manager_shape() {
         EventKind::SaPolicyHashDrift {
             rule_id: row_rule_id,
             pinned_hash_first8,
+            observed_hash_first8,
             ..
         } => {
             assert_eq!(*row_rule_id, rule_id);
             assert_eq!(*pinned_hash_first8, wrong_policy_hash.first8_display());
+            assert_eq!(
+                *observed_hash_first8,
+                deployed_policy_hash.first8_display(),
+                "the drift row keeps the observed hash"
+            );
         }
         other => panic!("expected SaPolicyHashDrift; got {other:?}"),
     }

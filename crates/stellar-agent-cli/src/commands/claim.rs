@@ -1447,7 +1447,7 @@ async fn guard_and_build(
     } = previewed;
 
     // ── Claim guards, in order ────────────────────────────────────────────────
-    require_claimant(preview, &args.source)?;
+    require_claimant(preview)?;
     require_predicate_satisfied(preview)?;
     let mut trustline = None;
     if preview.asset_code.is_some() {
@@ -2496,7 +2496,7 @@ mod tests {
                 );
                 init_writer.store(true, Ordering::SeqCst);
                 Err(WalletError::Auth(AuthError::KeyringNotFound {
-                    name: "keyring-order-test-sentinel".to_owned(),
+                    cause: stellar_agent_core::error::KeyringMissingCause::MissingEntry,
                 }))
             },
             &mut std::io::sink(),
@@ -2605,7 +2605,7 @@ mod tests {
         .expect("profile");
         let result = init_keyring_for_origin(&resolved, origin, || {
             Err(WalletError::Auth(AuthError::KeyringNotFound {
-                name: "init-keyring-for-origin-synthesized-sentinel".to_owned(),
+                cause: stellar_agent_core::error::KeyringMissingCause::MissingEntry,
             }))
         });
         result.expect("a synthesized zero-config profile must tolerate a keyring-init failure");
@@ -2672,7 +2672,7 @@ mod tests {
         .expect("profile");
         let result = init_keyring_for_origin(&resolved, origin, || {
             Err(WalletError::Auth(AuthError::KeyringNotFound {
-                name: "init-keyring-for-origin-persisted-sentinel".to_owned(),
+                cause: stellar_agent_core::error::KeyringMissingCause::MissingEntry,
             }))
         });
         match result {

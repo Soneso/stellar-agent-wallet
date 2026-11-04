@@ -600,6 +600,13 @@ pub async fn fetch_account(
     account_id: &str,
     trustline_assets: &[Asset],
 ) -> Result<AccountView, WalletError> {
+    // Parse the account_id into the XDR AccountId for key construction. The
+    // event below names only an account that passed this parse.
+    let pk_bytes = stellar_strkey::ed25519::PublicKey::from_string(account_id).map_err(|e| {
+        WalletError::Protocol(ProtocolError::XdrCodecFailed {
+            detail: format!("invalid account_id for fetch_account: {e}"),
+        })
+    })?;
     // Redact account ID at the log boundary.
     let redacted = redact_account_id(account_id);
     tracing::debug!(
@@ -607,13 +614,6 @@ pub async fn fetch_account(
         trustline_count = trustline_assets.len(),
         "fetch_account: querying RPC"
     );
-
-    // Parse the account_id into the XDR AccountId for key construction.
-    let pk_bytes = stellar_strkey::ed25519::PublicKey::from_string(account_id).map_err(|e| {
-        WalletError::Protocol(ProtocolError::XdrCodecFailed {
-            detail: format!("invalid account_id for fetch_account: {e}"),
-        })
-    })?;
     let xdr_account_id = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(pk_bytes.0)));
 
     // Build the ledger keys: 1 account key + N trustline keys.
@@ -1215,14 +1215,8 @@ pub async fn fetch_data_entry(
 ) -> Result<Option<Vec<u8>>, WalletError> {
     use stellar_xdr::{AccountId, PublicKey, Uint256};
 
-    let redacted = redact_account_id(account_id);
-    tracing::debug!(
-        account_id = %redacted,
-        data_key = %data_key,
-        "fetch_data_entry: querying RPC"
-    );
-
-    // Parse the account_id into the XDR AccountId.
+    // Parse the account_id into the XDR AccountId. The event below names only
+    // an account and a key that passed their checks.
     let pk_bytes = stellar_strkey::ed25519::PublicKey::from_string(account_id).map_err(|e| {
         WalletError::Protocol(ProtocolError::XdrCodecFailed {
             detail: format!("invalid account_id for data-entry lookup: {e}"),
@@ -1235,10 +1229,16 @@ pub async fn fetch_data_entry(
     let key_bytes = data_key.as_bytes().to_vec();
     let string_m: stellar_xdr::StringM<64> = key_bytes.try_into().map_err(|_| {
         WalletError::Protocol(ProtocolError::XdrCodecFailed {
-            detail: format!("data_key '{data_key}' exceeds 64-byte limit for String64"),
+            detail: "data_key must contain at most 64 bytes".to_owned(),
         })
     })?;
     let data_name = stellar_xdr::String64::from(string_m);
+    let redacted = redact_account_id(account_id);
+    tracing::debug!(
+        account_id = %redacted,
+        data_key = %data_key,
+        "fetch_data_entry: querying RPC"
+    );
 
     let ledger_key = LedgerKey::Data(LedgerKeyData {
         account_id: xdr_account_id,
@@ -1402,6 +1402,55 @@ mod tests {
     use crate::redact::rpc_error_fixtures::{
         ENDPOINT, ENDPOINT_AUTHORITY, ERROR_OBJECTS, assert_scrubbed, call_error, xdr_error,
     };
+
+    /// A refused account or data key reaches no query event and no request;
+    /// a pair that passed its checks still gets the event.
+    #[test]
+    fn refused_accounts_stay_out_of_the_query_events() {
+        use stellar_agent_test_support::log_capture::with_captured_trace_logs;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let client = StellarRpcClient::new("http://127.0.0.1:9").unwrap();
+        for account in ["credmarker7", "credmarker7\u{e9}\u{e9}\u{e9}"] {
+            let logs = with_captured_trace_logs(|| {
+                runtime.block_on(async {
+                    for error in [
+                        fetch_account(&client, account, &[]).await.unwrap_err(),
+                        fetch_data_entry(&client, account, "key").await.unwrap_err(),
+                    ] {
+                        assert_eq!(error.code(), "protocol.xdr_codec_failed");
+                    }
+                });
+            });
+            assert!(!logs.contains("credmarker7"), "{logs}");
+            assert!(!logs.contains("querying RPC"), "{logs}");
+        }
+        let valid = "GAQAA5L65LSYH7CQ3VTJ7F3HHLGCL3DSLAR2Y47263D56MNNGHSQSTVY";
+        let long_key = format!("credmarker7{}", "k".repeat(65));
+        let logs = with_captured_trace_logs(|| {
+            let error = runtime
+                .block_on(fetch_data_entry(&client, valid, &long_key))
+                .unwrap_err();
+            assert_eq!(error.code(), "protocol.xdr_codec_failed");
+            assert!(
+                error
+                    .message()
+                    .ends_with("data_key must contain at most 64 bytes"),
+                "{error}"
+            );
+            stellar_agent_test_support::rejected_value::assert_no_marker(&error, "credmarker7");
+        });
+        assert!(!logs.contains("credmarker7"), "{logs}");
+        assert!(!logs.contains("querying RPC"), "{logs}");
+        let logs = with_captured_trace_logs(|| {
+            runtime
+                .block_on(fetch_data_entry(&client, valid, "key"))
+                .unwrap_err();
+        });
+        assert!(logs.contains("fetch_data_entry: querying RPC"), "{logs}");
+    }
 
     /// A JSON-RPC error object whose text holds a credential-bearing URL maps
     /// to a reason that keeps only that URL's host and port.

@@ -25,7 +25,7 @@
 
 use keyring_core::mock;
 use serial_test::serial;
-use stellar_agent_nonce::{NonceError, NonceMint, NonceVerifyHmacOnlyRequest, ReplayWindow};
+use stellar_agent_nonce::{Nonce, NonceError, NonceMint, NonceVerifyHmacOnlyRequest, ReplayWindow};
 
 use crate::helpers::{
     StaticCatalogue, far_future_expiry, init_mock, make_profile, now_before_expiry, seed_key,
@@ -484,4 +484,34 @@ fn verify_hmac_only_propagates_keyring_error_on_get_password_failure() {
         matches!(err, NonceError::KeyringError(_)),
         "expected KeyringError, got: {err:?}"
     );
+}
+
+/// A supplied nonce the HMAC check refuses shows only the redaction in its
+/// `Debug` form; the leading bytes spell a marker in hex.
+#[test]
+#[serial]
+fn refused_nonce_debug_holds_no_byte() {
+    init_mock();
+    let profile = make_profile("vho-refused-debug");
+    seed_key(&profile, &[0xA7; 32]);
+    let mint = NonceMint::from_profile(&profile, "nonce-test").expect("from_profile");
+    let mut bytes = [0u8; 48];
+    bytes[..4].copy_from_slice(&[0x63, 0x72, 0x65, 0x64]);
+    let nonce = Nonce::from_raw(bytes);
+
+    let err = mint
+        .verify_hmac_only(NonceVerifyHmacOnlyRequest {
+            nonce: &nonce,
+            envelope_xdr: b"xdr",
+            expiry_unix_ms: far_future_expiry(),
+            tool_name: "stellar_pay",
+            chain_id: "stellar:testnet",
+            now_unix_ms: now_before_expiry(),
+        })
+        .expect_err("a forged tag is refused");
+
+    assert!(matches!(err, NonceError::HmacMismatch), "{err:?}");
+    let debug = format!("{nonce:?}");
+    assert_eq!(debug, "Nonce([REDACTED])");
+    assert!(!debug.contains("63726564"), "{debug}");
 }

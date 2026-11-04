@@ -196,6 +196,10 @@ pub fn list_pinned_toolsets(
                 );
                 continue;
             }
+            Err(ToolsetInstallError::InvalidPackageName { .. }) => {
+                tracing::warn!("toolsets root entry must name a valid package; skipping");
+                continue;
+            }
             Err(e) => {
                 tracing::warn!(package = %pkg_name, error = %e, "malformed pin; skipping");
                 continue;
@@ -1659,6 +1663,25 @@ mod tests {
             list[0].description.is_empty(),
             "description is always empty"
         );
+    }
+
+    /// A directory whose name fails the package rule gets its own warning,
+    /// which names neither the entry nor the validation detail.
+    #[test]
+    fn list_warns_about_an_invalid_entry_without_naming_it() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("credmarker7!")).unwrap();
+        let mut listed = None;
+        let logs = stellar_agent_test_support::log_capture::with_captured_logs(|| {
+            listed = Some(list_pinned_toolsets(tmp.path(), Some(test_pin_key())).unwrap());
+        });
+        assert_eq!(listed.map(|entries| entries.len()), Some(0));
+        assert!(
+            logs.contains("toolsets root entry must name a valid package; skipping"),
+            "{logs}"
+        );
+        assert!(!logs.contains("credmarker7"), "{logs}");
+        assert!(!logs.contains("package="), "{logs}");
     }
 
     #[test]

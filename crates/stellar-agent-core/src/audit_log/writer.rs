@@ -2356,7 +2356,8 @@ impl AuditWriter {
             if line.iter().all(u8::is_ascii_whitespace) {
                 continue;
             }
-            let entry: AuditEntry = serde_json::from_slice(line).map_err(WriterError::Serialise)?;
+            let entry: AuditEntry =
+                serde_json::from_slice(line).map_err(|e| entry_parse_error(&e))?;
             if last.len() == expected.len() {
                 last.pop_front();
             }
@@ -5454,7 +5455,7 @@ fn scan_entry_reader(
         }
 
         entry_idx += 1;
-        let entry: AuditEntry = serde_json::from_slice(line).map_err(WriterError::Serialise)?;
+        let entry: AuditEntry = serde_json::from_slice(line).map_err(|e| entry_parse_error(&e))?;
         let expected =
             expected_previous_hash.get_or_insert_with(|| entry.previous_entry_hash.clone());
         if entry.previous_entry_hash != *expected {
@@ -6252,6 +6253,14 @@ pub enum WriterError {
     #[error("audit log serialisation error: {0}")]
     Serialise(#[from] serde_json::Error),
 
+    /// A stored line did not parse as an audit entry. `detail` holds the
+    /// failure's category and position only.
+    #[error("audit log parse error: the entry {detail}")]
+    EntryParse {
+        /// Category and position of the parse failure.
+        detail: String,
+    },
+
     /// The hash chain computation failed.
     #[error("audit log hash chain error: {0}")]
     Hash(#[source] super::chain::HashError),
@@ -6298,7 +6307,7 @@ pub enum WriterError {
     /// profile name supply the same `log_path`.
     #[error(
         "audit writer registry path mismatch for profile '{profile_name}': \
-         cached path {cached_path:?} does not match requested path {requested_path:?} \
+         the requested path must match cached path {cached_path:?} \
          (audit.registry_path_mismatch)"
     )]
     PathMismatch {
@@ -6306,8 +6315,6 @@ pub enum WriterError {
         profile_name: String,
         /// Path held in the registry (first-open wins).
         cached_path: PathBuf,
-        /// Path supplied by the second caller.
-        requested_path: PathBuf,
     },
 
     /// A second caller passed a different HMAC key for the same profile name.
@@ -6631,7 +6638,7 @@ pub fn audit_log_unusable_detail(e: &WriterError) -> Option<String> {
             "audit.io_error: the audit log could not be read or written ({})",
             err.kind()
         )),
-        WriterError::Serialise(_) | WriterError::Hash(_) => Some(
+        WriterError::Serialise(_) | WriterError::EntryParse { .. } | WriterError::Hash(_) => Some(
             "audit.parse_error: the audit log could not be parsed or hashed; the file was \
              modified outside the writer"
                 .to_owned(),
@@ -6698,6 +6705,13 @@ pub fn audit_writer_refusal(profile: &str, e: &WriterError) -> crate::error::Wal
 }
 
 // ── Partial-rotation detection ────────────────────────────────────────────────
+
+/// Maps a failed parse of a stored line to its category and position.
+fn entry_parse_error(error: &serde_json::Error) -> WriterError {
+    WriterError::EntryParse {
+        detail: crate::redact::describe_json_error(error),
+    }
+}
 
 /// Returns the basename (file-name component) of `path` as a `String`.
 ///
@@ -7365,7 +7379,6 @@ impl AuditWriterRegistry {
                     return Err(WriterError::PathMismatch {
                         profile_name: profile_name.to_owned(),
                         cached_path: entry.log_path.clone(),
-                        requested_path: log_path.to_path_buf(),
                     });
                 }
                 // Validate HMAC key fingerprint matches the cached entry.
@@ -7450,7 +7463,6 @@ impl AuditWriterRegistry {
                 return Err(WriterError::PathMismatch {
                     profile_name: profile_name.to_owned(),
                     cached_path: entry.log_path.clone(),
-                    requested_path: log_path.to_path_buf(),
                 });
             }
             if entry.hmac_key_fingerprint != incoming_fingerprint {
@@ -11190,6 +11202,51 @@ mod tests {
             matches!(result, Err(WriterError::FileLocked)),
             "registry must propagate FileLocked when file is held by another opener, got: {result:?}"
         );
+    }
+
+    /// The chain scan reports the category and position of a stored line that
+    /// fails its schema, and the opened writer's error keeps no parse source.
+    #[test]
+    fn unparsable_stored_line_reports_category_and_position_only() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        fs::write(
+            &path,
+            format!(
+                "{}\n",
+                crate::audit_log::test_helpers::line_refused_by_the_schema("credmarker7")
+            ),
+        )
+        .unwrap();
+        let file = File::open(&path).unwrap();
+        let error = scan_entry_chain(&file, 0, None, None, None).err().unwrap();
+        assert!(matches!(error, WriterError::EntryParse { .. }), "{error:?}");
+        stellar_agent_test_support::rejected_value::assert_no_marker(&error, "credmarker7");
+        assert!(
+            error.to_string().starts_with(
+                "audit log parse error: the entry has a missing field or a field of the wrong \
+                 type or value (line 1, column "
+            ),
+            "{error}"
+        );
+    }
+
+    /// The path a second caller supplied is refused without being repeated.
+    #[test]
+    fn registry_path_mismatch_holds_only_the_cached_path() {
+        let dir = TempDir::new().unwrap();
+        let profile = format!("reg-pathmm-{}", uuid::Uuid::new_v4().simple());
+        let path1 = dir.path().join(format!("{profile}.jsonl"));
+        let refused = dir.path().join("credmarker7.jsonl");
+        let _a = AuditWriterRegistry::get_or_open_unkeyed(&profile, &path1).unwrap();
+        let error = AuditWriterRegistry::get_or_open_unkeyed(&profile, &refused)
+            .err()
+            .unwrap();
+        assert!(
+            matches!(error, WriterError::PathMismatch { .. }),
+            "{error:?}"
+        );
+        stellar_agent_test_support::rejected_value::assert_no_marker(&error, "credmarker7");
     }
 
     /// A second `get_or_open` call for the same profile with a different path

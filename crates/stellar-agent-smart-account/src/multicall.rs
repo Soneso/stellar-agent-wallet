@@ -514,11 +514,8 @@ impl MulticallRegistry {
             return Ok(registry);
         }
 
-        let contents =
-            std::fs::read_to_string(actual_path).map_err(|e| SaError::NetworksTomlIo {
-                source: e,
-                path: actual_path.to_path_buf(),
-            })?;
+        let contents = std::fs::read_to_string(actual_path)
+            .map_err(|e| SaError::NetworksTomlIo { source: e })?;
 
         let file: MulticallRegistryFile =
             toml::from_str(&contents).map_err(|e| SaError::NetworksTomlParse {
@@ -612,9 +609,7 @@ impl MulticallRegistry {
 
         if entry.wasm_sha256 != MULTICALL_WASM_SHA256 {
             return Err(SaError::MulticallSha256Drift {
-                attempted: entry.wasm_sha256.clone(),
                 expected: MULTICALL_WASM_SHA256.to_owned(),
-                existing: Some(entry.wasm_sha256.clone()),
             });
         }
 
@@ -637,9 +632,7 @@ impl MulticallRegistry {
         // Binary-const trust-anchor enforcement at register-time.
         if entry.wasm_sha256 != MULTICALL_WASM_SHA256 {
             return Err(SaError::MulticallSha256Drift {
-                attempted: entry.wasm_sha256.clone(),
                 expected: MULTICALL_WASM_SHA256.to_owned(),
-                existing: None,
             });
         }
 
@@ -651,9 +644,7 @@ impl MulticallRegistry {
         {
             if existing.wasm_sha256 != entry.wasm_sha256 {
                 return Err(SaError::MulticallSha256Drift {
-                    attempted: entry.wasm_sha256.clone(),
                     expected: MULTICALL_WASM_SHA256.to_owned(),
-                    existing: Some(existing.wasm_sha256.clone()),
                 });
             }
             // Same SHA → idempotent; no mutation.
@@ -749,13 +740,9 @@ impl MulticallRegistry {
                 std::io::ErrorKind::InvalidInput,
                 "registry path has no parent directory",
             ),
-            path: path.clone(),
         })?;
 
-        create_dir_0700(parent).map_err(|e| SaError::NetworksTomlIo {
-            source: e,
-            path: parent.to_path_buf(),
-        })?;
+        create_dir_0700(parent).map_err(|e| SaError::NetworksTomlIo { source: e })?;
 
         // Build the multicall section of the TOML file.
         let mut multicall_map = std::collections::HashMap::new();
@@ -769,13 +756,10 @@ impl MulticallRegistry {
 
         let toml_str = toml::to_string_pretty(&file).map_err(|e| SaError::NetworksTomlIo {
             source: std::io::Error::other(e.to_string()),
-            path: path.clone(),
         })?;
 
-        atomic_write_0600(path, toml_str.as_bytes()).map_err(|e| SaError::NetworksTomlIo {
-            source: e,
-            path: path.clone(),
-        })?;
+        atomic_write_0600(path, toml_str.as_bytes())
+            .map_err(|e| SaError::NetworksTomlIo { source: e })?;
 
         Ok(())
     }
@@ -820,8 +804,9 @@ impl stellar_agent_core::profile::loader::MulticallRegistryHook for MulticallReg
 /// All four must agree byte-exact.
 ///
 /// Returns `Err(SaError::MulticallFailed { phase: "rpc_divergence", .. })` if
-/// any pair disagrees. The error message identifies which leg diverged with
-/// first-8-hex prefix of the observed hash (no full URL, no full hash).
+/// any pair disagrees. The error message names the leg that diverged and the
+/// first eight hex characters of [`MULTICALL_WASM_SHA256`]; the refused hash
+/// is named in no part.
 pub(crate) fn cross_rpc_compare_wasm_hashes(
     registry_sha256: &str,
     primary_on_chain_hex: &str,
@@ -833,8 +818,7 @@ pub(crate) fn cross_rpc_compare_wasm_hashes(
         return Err(SaError::MulticallFailed {
             phase: "rpc_divergence",
             redacted_reason: format!(
-                "registry leg reported {}; expected {}",
-                &registry_sha256[..8.min(registry_sha256.len())],
+                "registry leg must report the multicall router hash {}",
                 &expected[..8],
             ),
             post_submit_kind: None,
@@ -845,8 +829,7 @@ pub(crate) fn cross_rpc_compare_wasm_hashes(
         return Err(SaError::MulticallFailed {
             phase: "rpc_divergence",
             redacted_reason: format!(
-                "primary-RPC leg reported {}; expected {}",
-                &primary_on_chain_hex[..8.min(primary_on_chain_hex.len())],
+                "primary-RPC leg must report the multicall router hash {}",
                 &expected[..8],
             ),
             post_submit_kind: None,
@@ -857,8 +840,7 @@ pub(crate) fn cross_rpc_compare_wasm_hashes(
         return Err(SaError::MulticallFailed {
             phase: "rpc_divergence",
             redacted_reason: format!(
-                "secondary-RPC leg reported {}; expected {}",
-                &secondary_on_chain_hex[..8.min(secondary_on_chain_hex.len())],
+                "secondary-RPC leg must report the multicall router hash {}",
                 &expected[..8],
             ),
             post_submit_kind: None,
@@ -1455,10 +1437,9 @@ pub async fn submit_multicall_bundle(
             );
             return Err(SaError::MulticallFailed {
                 phase: "build",
-                redacted_reason: format!(
-                    "inner[{idx}]: fn_name '{}' is not a valid Soroban symbol",
-                    inv.fn_name
-                ),
+                redacted_reason: "fn_name must be a non-empty Soroban symbol of at most 32 bytes \
+                                  using only [A-Za-z0-9_]; correct the bundle function name."
+                    .to_owned(),
                 post_submit_kind: None,
             });
         }
@@ -1937,8 +1918,8 @@ fn json_args_to_scval_vec(
                     encoded,
                     stellar_agent_xdr_limits::untrusted_decode_limits(encoded.len()),
                 )
-                .map_err(|error| {
-                    format!("inner[{idx}] arg[{elem_idx}]: invalid ScVal XDR: {error}")
+                .map_err(|_| {
+                    format!("inner[{idx}] arg[{elem_idx}]: scval must be a base64 XDR string")
                 })?;
                 if matches!(
                     value,
@@ -2558,14 +2539,12 @@ mod tests {
             SaError::VerifierWasmRevoked {
                 rule_id: None,
                 smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...AAAAA"),
-                verifier_hash_first8: "eeeeeeee".to_owned(),
                 revoked_reason: "problem".to_owned(),
                 request_id: "status".to_owned(),
             },
             SaError::VerifierWasmRetired {
                 rule_id: Some(1),
                 smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...AAAAA"),
-                verifier_hash_first8: "eeeeeeee".to_owned(),
                 request_id: "status".to_owned(),
             },
         ];
@@ -2638,6 +2617,17 @@ mod tests {
     }
 
     // ── A denied-path row that is not written is logged ──────────────────────
+
+    /// An `scval` value that is neither base64 nor XDR is refused with one
+    /// text at the computed position, holding no decoder diagnostic.
+    #[test]
+    fn invalid_scval_stays_out_of_the_refusal() {
+        for encoded in ["~", "AAAA"] {
+            let error = json_args_to_scval_vec(&serde_json::json!([null, { "scval": encoded }]), 3)
+                .unwrap_err();
+            assert_eq!(error, "inner[3] arg[1]: scval must be a base64 XDR string");
+        }
+    }
 
     /// The denied-path callers discard the emitter's result, so a row that is
     /// not written is logged at `error` with its event kind, and the emitter
@@ -3524,6 +3514,64 @@ wasm_sha256 = "{MULTICALL_WASM_SHA256}"
         assert_eq!(raw.wasm_sha256, entry.wasm_sha256);
     }
 
+    /// An unreadable registry path is refused with the check; the refusal
+    /// keeps the I/O source and holds the path in no rendered form.
+    #[test]
+    fn registry_io_refusal_holds_no_path() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("credmarker7");
+        std::fs::create_dir(&path).expect("directory");
+
+        let Err(error) = MulticallRegistry::load(&path) else {
+            panic!("a directory must be refused");
+        };
+
+        assert_eq!(
+            error.to_string(),
+            "networks.toml must be a readable file with a writable parent directory; correct \
+             the registry path and retry."
+        );
+        assert!(
+            std::error::Error::source(&error).is_some(),
+            "the I/O source stays attached"
+        );
+        stellar_agent_test_support::rejected_value::assert_no_marker(&error, "credmarker7");
+        let json = serde_json::to_string(&error).unwrap();
+        assert!(!json.contains("credmarker7"), "{json}");
+    }
+
+    /// A registry hash other than the binary pin is refused at lookup and at
+    /// registration with the check, holding the hash in no rendered form.
+    #[test]
+    fn multicall_pin_refusals_hold_no_registry_hash() {
+        const REFUSED: &str = "6372656463726564637265646372656463726564637265646372656463726564";
+        const NETWORK: &str = "Test SDF Network ; September 2015";
+        const ADDRESS: &str = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM";
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("networks.toml");
+        let entry = || MulticallRegistryEntry {
+            network_passphrase: NETWORK.to_owned(),
+            address: ADDRESS.to_owned(),
+            wasm_sha256: REFUSED.to_owned(),
+        };
+
+        let mut lookup_registry = MulticallRegistry::load(&path).expect("load");
+        lookup_registry.entries.push(entry());
+        let lookup_error = lookup_registry.lookup(NETWORK).unwrap_err();
+        let mut register_registry = MulticallRegistry::load(&path).expect("load");
+        let register_error = register_registry.register(entry()).unwrap_err();
+
+        for error in [lookup_error, register_error] {
+            assert_eq!(
+                error.to_string(),
+                "wasm_sha256 must match MULTICALL_WASM_SHA256; verify the router deployment and \
+                 correct the registry hash."
+            );
+            let forms = format!("{error:?}\n{}", serde_json::to_string(&error).unwrap());
+            assert!(!forms.contains(REFUSED), "{forms}");
+        }
+    }
+
     // ── load — TOML parse error ───────────────────────────────────────────────
 
     /// A file that is not valid TOML returns `SaError::NetworksTomlParse`.
@@ -3812,6 +3860,68 @@ wasm_sha256 = "{drifted_sha}"
                 );
             }
             other => panic!("expected MulticallFailed, got {other:?}"),
+        }
+    }
+
+    /// Each leg's refusal names the leg and the pinned hash's first eight hex
+    /// characters, and no channel holds the refused hash, whole, as its first
+    /// eight bytes or as its first eight hex characters: not the Display,
+    /// Debug and source chain, the serialized form, or the MCP error envelope.
+    /// The comparison emits no event.
+    #[test]
+    fn cross_rpc_compare_wasm_hashes_refusals_hold_no_refused_hash() {
+        let refused: [u8; 32] = std::array::from_fn(|i| 0x3c ^ u8::try_from(i).unwrap());
+        let refused = hex::encode(refused);
+        let expected8 = &MULTICALL_WASM_SHA256[..8];
+        for (leg, registry, primary, secondary) in [
+            (
+                "registry",
+                refused.as_str(),
+                MULTICALL_WASM_SHA256,
+                MULTICALL_WASM_SHA256,
+            ),
+            (
+                "primary-RPC",
+                MULTICALL_WASM_SHA256,
+                refused.as_str(),
+                MULTICALL_WASM_SHA256,
+            ),
+            (
+                "secondary-RPC",
+                MULTICALL_WASM_SHA256,
+                MULTICALL_WASM_SHA256,
+                refused.as_str(),
+            ),
+        ] {
+            let error = cross_rpc_compare_wasm_hashes(registry, primary, secondary).unwrap_err();
+            let SaError::MulticallFailed {
+                phase,
+                redacted_reason,
+                post_submit_kind: None,
+            } = &error
+            else {
+                panic!("{leg}: expected MulticallFailed, got {error:?}");
+            };
+            assert_eq!(*phase, "rpc_divergence", "{leg}");
+            assert_eq!(
+                redacted_reason,
+                &format!("{leg} leg must report the multicall router hash {expected8}")
+            );
+            let serialized = serde_json::to_string(&error).expect("the refusal serializes");
+            let envelope =
+                stellar_agent_core::Envelope::<()>::err_raw(error.wire_code(), error.to_string())
+                    .to_json_pretty()
+                    .expect("the MCP error envelope serializes");
+            for marker in [&refused[..], &refused[..16], &refused[..8]] {
+                stellar_agent_test_support::rejected_value::assert_no_marker(&error, marker);
+                stellar_agent_test_support::rejected_value::assert_no_marker_in_text(
+                    &serialized,
+                    marker,
+                );
+                stellar_agent_test_support::rejected_value::assert_no_marker_in_text(
+                    &envelope, marker,
+                );
+            }
         }
     }
 
@@ -4156,10 +4266,6 @@ wasm_sha256 = "{drifted_sha}"
                 smart_account_redacted: redacted(),
                 deploy_address_redacted: redacted(),
                 pinned_hash: stellar_agent_core::audit_log::schema::WasmHashPin::new([0xaa; 32]),
-                observed_hash: Some(stellar_agent_core::audit_log::schema::WasmHashPin::new(
-                    [0x11; 32],
-                )),
-                observed_executable: None,
                 request_id: "req".to_owned(),
             },
             SaError::PolicyHashDrift {
@@ -4167,10 +4273,6 @@ wasm_sha256 = "{drifted_sha}"
                 smart_account_redacted: redacted(),
                 deploy_address_redacted: redacted(),
                 pinned_hash: stellar_agent_core::audit_log::schema::WasmHashPin::new([0xaa; 32]),
-                observed_hash: Some(stellar_agent_core::audit_log::schema::WasmHashPin::new(
-                    [0x11; 32],
-                )),
-                observed_executable: None,
                 request_id: "req".to_owned(),
             },
             SaError::PinnedPolicyAbsent {
@@ -4215,8 +4317,6 @@ wasm_sha256 = "{drifted_sha}"
         use stellar_agent_core::audit_log::signer_set::{SignerSetSnapshotV2, SignerSetView};
         use stellar_agent_core::observability::RedactedStrkey;
 
-        use crate::signers::types::WasmHashSummary;
-
         let redacted = || RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ");
         let view = || {
             SignerSetView::V2(SignerSetSnapshotV2 {
@@ -4226,7 +4326,6 @@ wasm_sha256 = "{drifted_sha}"
         };
         let refusals = [
             SaError::SignerSetMissingBaseline {
-                rule_id: 2,
                 smart_account_redacted: redacted(),
                 request_id: "req".to_owned(),
             },
@@ -4262,7 +4361,7 @@ wasm_sha256 = "{drifted_sha}"
             SaError::ThresholdPolicyIdentificationFailed {
                 rule_id: 2,
                 smart_account_redacted: redacted(),
-                observed_wasm_hashes_summary: WasmHashSummary::new(0, None).unwrap(),
+                observed_policy_count: 0,
                 request_id: "req".to_owned(),
             },
             SaError::ThresholdReadFailed {

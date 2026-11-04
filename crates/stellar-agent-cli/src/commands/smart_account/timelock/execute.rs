@@ -283,9 +283,6 @@ pub async fn run(args: &ExecuteArgs) -> i32 {
     let timelock_redacted = redact_strkey_first5_last5(&args.timelock);
 
     info!(
-        timelock = %timelock_redacted,
-        operation_id = %&args.operation_id[..8],
-        function = %args.function,
         network = %context.chain_id,
         request_id = %request_id,
         "smart-account timelock execute: submitting"

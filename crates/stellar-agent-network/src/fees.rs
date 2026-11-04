@@ -4,7 +4,9 @@
 //! resolution for transaction construction.
 
 use serde::{Deserialize, Serialize};
-use stellar_agent_core::error::{FeeSource, NetworkError, ValidationError, WalletError};
+use stellar_agent_core::error::{
+    DerivedFee, FeeSource, NetworkError, ValidationError, WalletError,
+};
 use stellar_agent_core::profile::schema::Profile;
 use stellar_rpc_client::{FeeStat, GetFeeStatsResponse};
 
@@ -373,7 +375,7 @@ pub fn check_classic_fee_cap(
             ValidationError::MainnetFeeCapRequired,
         )),
         Some(cap) if per_op > cap => Err(WalletError::Validation(ValidationError::FeeAboveCap {
-            per_op,
+            per_op: DerivedFee::new(per_op, &fee_source),
             cap,
             fee_source,
         })),
@@ -413,7 +415,7 @@ pub fn check_classic_fee_cap_signed(
             ValidationError::MainnetFeeCapRequired,
         )),
         Some(cap) if per_op > cap => Err(WalletError::Validation(ValidationError::FeeAboveCap {
-            per_op,
+            per_op: DerivedFee::new(per_op, &fee_source),
             cap,
             fee_source,
         })),
@@ -529,11 +531,9 @@ mod tests {
 
     fn above_cap_text(result: Result<(), WalletError>) -> String {
         match result {
-            Err(WalletError::Validation(ValidationError::FeeAboveCap {
-                per_op: 501,
-                cap: 500,
-                ..
-            })) => result.unwrap_err().to_string(),
+            Err(WalletError::Validation(ValidationError::FeeAboveCap { cap: 500, .. })) => {
+                result.unwrap_err().to_string()
+            }
             other => panic!("expected FeeAboveCap for 501 over 500, got {other:?}"),
         }
     }
@@ -572,14 +572,22 @@ mod tests {
             "fees.percentile_exceeds_cap"
         );
         assert!(above_cap_text(check(selected)).starts_with("auto-selected per-operation fee 501"));
-        assert!(above_cap_text(check(FeeSource::Explicit)).starts_with("the explicit"));
-        assert!(above_cap_text(check(FeeSource::ProfileDefault)).starts_with("the profile's"));
+        assert_eq!(
+            above_cap_text(check(FeeSource::Explicit)),
+            "--fee must be a per-operation stroop amount within classic_max_fee_per_op_stroops; \
+             lower --fee or raise classic_max_fee_per_op_stroops."
+        );
+        assert_eq!(
+            above_cap_text(check(FeeSource::ProfileDefault)),
+            "classic_fee_per_op_stroops must not exceed classic_max_fee_per_op_stroops; lower \
+             classic_fee_per_op_stroops or raise classic_max_fee_per_op_stroops."
+        );
         assert!(above_cap_text(check(FeeSource::CommandDefault)).starts_with("the default"));
         assert!(above_cap_text(check(FeeSource::Envelope)).starts_with("the envelope's"));
         let mainnet = mainnet(Some(500));
         assert!(
             above_cap_text(check_classic_fee_cap(501, FeeSource::Explicit, &mainnet))
-                .starts_with("the explicit")
+                .starts_with("--fee must be")
         );
     }
 

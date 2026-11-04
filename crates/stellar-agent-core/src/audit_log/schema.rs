@@ -44,7 +44,7 @@ mod i128_decimal_str {
     {
         let s = String::deserialize(deserializer)?;
         s.parse::<i128>()
-            .map_err(|e| serde::de::Error::custom(format!("invalid decimal i128 '{s}': {e}")))
+            .map_err(|_| serde::de::Error::custom("invalid decimal i128"))
     }
 }
 
@@ -77,7 +77,7 @@ mod i128_decimal_str_opt {
             Some(s) => s
                 .parse::<i128>()
                 .map(Some)
-                .map_err(|e| serde::de::Error::custom(format!("invalid decimal i128 '{s}': {e}"))),
+                .map_err(|_| serde::de::Error::custom("invalid decimal i128")),
             None => Ok(None),
         }
     }
@@ -3817,6 +3817,24 @@ impl std::fmt::Display for TipAnchorReason {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::panic, reason = "test-only")]
     use super::*;
+
+    /// A stored decimal that fails its parse is named by the rule alone.
+    #[test]
+    fn invalid_decimals_stay_out_of_the_error() {
+        let value = serde_json::Value::String("credmarker7".to_owned());
+        assert_eq!(
+            i128_decimal_str::deserialize(value.clone())
+                .unwrap_err()
+                .to_string(),
+            "invalid decimal i128"
+        );
+        assert_eq!(
+            i128_decimal_str_opt::deserialize(value)
+                .unwrap_err()
+                .to_string(),
+            "invalid decimal i128"
+        );
+    }
 
     // ── TipAnchorReason ──────────────────────────────────────────────────────
 

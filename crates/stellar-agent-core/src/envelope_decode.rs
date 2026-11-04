@@ -410,6 +410,16 @@ pub fn payment_memo_shape(
     })
 }
 
+/// The accepted form of a caller-supplied transaction envelope.
+///
+/// A decoder error quotes a byte of the input, so a refusal states this form
+/// in its place.
+pub const TRANSACTION_ENVELOPE_XDR_FORM: &str = "must be base64-encoded TransactionEnvelope XDR";
+
+/// The accepted form of a caller-supplied `ScVal`, in the place of a decoder
+/// error that quotes a byte of the input.
+pub const SCVAL_XDR_FORM: &str = "must be base64-encoded ScVal XDR";
+
 /// Describes a decode failure of a caller-supplied envelope by its class.
 ///
 /// `stellar_xdr` reads the base64 text through an I/O reader, and the base64

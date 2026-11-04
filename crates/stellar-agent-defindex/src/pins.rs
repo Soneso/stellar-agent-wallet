@@ -45,7 +45,6 @@
 //! This crate binds the interface only (no source vendored), which keeps the
 //! GPL boundary clear.
 
-use stellar_agent_core::observability::redact_strkey_first5_last5;
 use stellar_agent_core::profile::caip2::MAINNET_PASSPHRASE;
 use stellar_agent_network::{StellarRpcClient, WasmHashFetch, fetch_contract_wasm_hash};
 
@@ -136,22 +135,16 @@ pub async fn verify_defindex_vault_wasm(
                 Ok(())
             } else {
                 Err(DefindexPinError::HashMismatch {
-                    vault_redacted: redact_strkey_first5_last5(vault_address),
                     on_chain_first8: stellar_agent_core::hex::wasm_hash_first8_hex(&on_chain_hash),
                 })
             }
         }
-        WasmHashFetch::Sac => Err(DefindexPinError::SacNotVault {
-            vault_redacted: redact_strkey_first5_last5(vault_address),
-        }),
+        WasmHashFetch::Sac => Err(DefindexPinError::SacNotVault),
         WasmHashFetch::ExternalRef(external) => Err(DefindexPinError::ExternalRef {
-            vault_redacted: redact_strkey_first5_last5(vault_address),
             owner_redacted: external.owner_redacted(),
             tag: external.tag_display(),
         }),
-        WasmHashFetch::Absent => Err(DefindexPinError::Absent {
-            vault_redacted: redact_strkey_first5_last5(vault_address),
-        }),
+        WasmHashFetch::Absent => Err(DefindexPinError::Absent),
         // #[non_exhaustive]: any future WasmHashFetch variants are also refused.
         _ => Err(DefindexPinError::FetchFailed {
             reason: "unexpected WasmHashFetch variant (future extension)".to_owned(),
@@ -183,26 +176,27 @@ pub fn is_blend_strategy(strategy_wasm_hash: &[u8; 32], network: &str) -> bool {
 
 /// Error returned by [`verify_defindex_vault_wasm`].
 ///
-/// All `Display` outputs carry only first-5-last-5 redacted addresses and
-/// first-8-hex hashes; full hashes and addresses NEVER appear.
+/// `Display` states the rule a refused vault failed and holds no address or
+/// hash; `FetchFailed` carries the classified fetch reason.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum DefindexPinError {
     /// The on-chain WASM hash does not match the pinned DeFindex vault hash.
-    #[error("DeFindex vault WASM hash mismatch for {vault_redacted}: on-chain={on_chain_first8}")]
+    #[error(
+        "vault_address must identify a DeFindex vault with the supported WASM hash; choose a \
+         supported vault on the selected network."
+    )]
     HashMismatch {
-        /// First-5-last-5 redacted vault address.
-        vault_redacted: String,
         /// First-8 hex of the on-chain hash.
         on_chain_first8: String,
     },
 
     /// The contract is a Stellar Asset Contract, not a DeFindex vault.
-    #[error("address {vault_redacted} is a SAC, not a DeFindex vault")]
-    SacNotVault {
-        /// First-5-last-5 redacted address.
-        vault_redacted: String,
-    },
+    #[error(
+        "vault_address must identify a DeFindex vault contract; choose a vault rather than a \
+         Stellar Asset Contract."
+    )]
+    SacNotVault,
 
     /// The vault's executable is a CAP-85 external reference: the owner named
     /// in the instance decides, and can change at any time, which Wasm runs.
@@ -210,13 +204,10 @@ pub enum DefindexPinError {
     /// `owner_redacted` is first-5-last-5 (or `<unsupported address>`); `tag`
     /// is the owner-chosen tag rendered escaped and bounded.
     #[error(
-        "DeFindex vault {vault_redacted} executable is an external reference managed by \
-         {owner_redacted} under tag \"{tag}\"; the wallet does not sign against \
-         owner-managed code"
+        "vault_address must identify a DeFindex vault with immutable supported code; choose a \
+         vault without an external executable reference."
     )]
     ExternalRef {
-        /// First-5-last-5 redacted vault address.
-        vault_redacted: String,
         /// First-5-last-5 redacted executable owner.
         owner_redacted: String,
         /// Escaped, bounded rendering of the owner-chosen tag.
@@ -224,11 +215,8 @@ pub enum DefindexPinError {
     },
 
     /// The contract address is absent from the ledger.
-    #[error("DeFindex vault {vault_redacted} is absent from the ledger")]
-    Absent {
-        /// First-5-last-5 redacted address.
-        vault_redacted: String,
-    },
+    #[error("vault_address must identify a deployed DeFindex vault on the selected network.")]
+    Absent,
 
     /// The WASM-hash fetch failed (RPC unavailable, malformed ledger entry, or
     /// divergent).
@@ -278,6 +266,8 @@ mod tests {
         clippy::panic,
         reason = "test-only fixture construction"
     )]
+
+    use stellar_agent_core::observability::redact_strkey_first5_last5;
 
     use super::*;
 
@@ -357,6 +347,62 @@ mod tests {
         assert!(!is_blend_strategy(&random_hash, "pubnet"));
     }
 
+    // ── Pin refusals (mocked getLedgerEntries) ───────────────────────────────
+
+    /// Each refusal of a well-formed vault address states the rule, with no
+    /// form of the address, in the pin error and in the adapter error that
+    /// wraps it.
+    #[tokio::test]
+    async fn pin_refusals_hold_no_form_of_the_vault_address() {
+        use stellar_agent_test_support::{KeyedLedgerEntriesResponder, xdr_fixtures};
+
+        const VAULT: &str = "CBMVK2JK6NTOT2O4HNQAIQFJY232BHKGLIMXDVQVHIIZKDACXDFZDWHN";
+        let cases = [
+            (
+                KeyedLedgerEntriesResponder::new().with_entry(
+                    xdr_fixtures::ledger_entry_from_response_json(
+                        &xdr_fixtures::contract_instance_ledger_entries_json(VAULT, [9; 32]),
+                    ),
+                ),
+                "vault_address must identify a DeFindex vault with the supported WASM hash; \
+                 choose a supported vault on the selected network.",
+            ),
+            (
+                KeyedLedgerEntriesResponder::new().with_entry(
+                    xdr_fixtures::ledger_entry_from_response_json(
+                        &xdr_fixtures::sac_instance_ledger_entries_json(VAULT),
+                    ),
+                ),
+                "vault_address must identify a DeFindex vault contract; choose a vault rather \
+                 than a Stellar Asset Contract.",
+            ),
+            (
+                KeyedLedgerEntriesResponder::new(),
+                "vault_address must identify a deployed DeFindex vault on the selected network.",
+            ),
+        ];
+        for (responder, expected) in cases {
+            let server = responder.serve().await;
+            let rpc = StellarRpcClient::new(&server.uri()).expect("client constructs");
+            let Err(err) = verify_defindex_vault_wasm(VAULT, &rpc, None).await else {
+                panic!("the vault must be refused");
+            };
+            assert_eq!(err.to_string(), expected);
+            let debug = format!("{err:?}");
+            let wrapped = stellar_agent_defi::adapter::DefiAdapterError::PinFailed {
+                reason: format!("vault WASM pin-verify failed: {err}"),
+            };
+            let wrapped = format!("{wrapped} {wrapped:?}");
+            for rendered in [debug, wrapped] {
+                assert!(
+                    !rendered.contains(VAULT)
+                        && !rendered.contains(&redact_strkey_first5_last5(VAULT)),
+                    "{rendered}"
+                );
+            }
+        }
+    }
+
     // ── External-reference vault (mocked getLedgerEntries) ────────────────────
 
     /// The vault's executable is an external reference whose owner tag entry
@@ -388,44 +434,32 @@ mod tests {
         };
         let display = err.to_string();
         let DefindexPinError::ExternalRef {
-            vault_redacted,
             owner_redacted,
             tag,
         } = err
         else {
             panic!("expected DefindexPinError::ExternalRef; got {err:?}");
         };
-        assert_eq!(vault_redacted, "CBMVK...ZDWHN");
         assert_eq!(owner_redacted, "GAAAA...AAWHF");
         assert_eq!(tag, "vault");
-        assert!(
-            display.contains("external reference managed by GAAAA...AAWHF under tag \"vault\""),
-            "{display}"
-        );
-        assert!(
-            !display.contains(VAULT) && !display.contains(OWNER),
-            "{display}"
+        assert_eq!(
+            display,
+            "vault_address must identify a DeFindex vault with immutable supported code; choose \
+             a vault without an external executable reference."
         );
     }
 
-    // ── DefindexPinError Display redacts addresses ────────────────────────────
+    // ── DefindexPinError Display states the rule ──────────────────────────────
 
     #[test]
-    fn hash_mismatch_display_shows_only_first8() {
+    fn hash_mismatch_display_states_the_rule() {
         let err = DefindexPinError::HashMismatch {
-            vault_redacted: "CBMVK…ZDWHN".to_owned(),
             on_chain_first8: "f345228dca59c660".to_owned(),
         };
-        let display = err.to_string();
-        // Must show first-8 hash
-        assert!(
-            display.contains("f345228dca59c660"),
-            "must show first-8 hash"
-        );
-        // Must NOT show full hash
-        assert!(
-            !display.contains("f345228dca59c6605789620e9ec62ff4847a0927c33dac7581a955fe746016be"),
-            "must not show full hash"
+        assert_eq!(
+            err.to_string(),
+            "vault_address must identify a DeFindex vault with the supported WASM hash; choose a \
+             supported vault on the selected network."
         );
     }
 }

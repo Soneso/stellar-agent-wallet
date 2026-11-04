@@ -167,6 +167,7 @@ tempfile = { workspace = true }
 proptest = { workspace = true }
 uuid = { workspace = true, features = ["v4"] }
 serial_test = { workspace = true }
+tracing-subscriber = { workspace = true }
 
 [lints]
 workspace = true

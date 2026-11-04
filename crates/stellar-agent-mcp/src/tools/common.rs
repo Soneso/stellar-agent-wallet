@@ -1248,8 +1248,8 @@ pub(crate) fn load_attestation_key(
     let bytes = zeroize::Zeroizing::new(
         base64::engine::general_purpose::URL_SAFE_NO_PAD
             .decode(raw.trim())
-            .map_err(|e| {
-                tracing::debug!(error = %e, "attestation key base64 decode failed");
+            .map_err(|_| {
+                tracing::debug!("attestation key base64 decode failed");
                 approval_required_indistinguishable(&profile_name)
             })?,
     );
@@ -3294,7 +3294,7 @@ pub(crate) mod tests {
                 requested_ms: 999,
             },
             NonceError::KeyringError(AuthError::KeyringNotFound {
-                name: "nonce-key".to_owned(),
+                cause: stellar_agent_core::error::KeyringMissingCause::MissingEntry,
             }),
             NonceError::KeyTooShort { actual: 16 },
             NonceError::KeyTooLong { actual: 42 },
@@ -3653,6 +3653,37 @@ pub(crate) mod tests {
     }
 
     // ── dispatch_gate: approval_required_indistinguishable wire code ──────────
+
+    #[test]
+    #[serial_test::serial(keyring)]
+    fn load_attestation_key_decode_failure_holds_no_diagnostic() {
+        stellar_agent_test_support::keyring_mock::install().ok();
+        let mut profile =
+            Profile::builder_testnet("svc-attest-decode", "acct-attest-decode", "n-svc", "n-acct")
+                .with_noop_engine()
+                .build();
+        profile.attestation_key_id = stellar_agent_core::profile::schema::KeyringEntryRef::new(
+            "stellar-agent-attest-decode",
+            "default",
+        );
+        let coordinate = &profile.attestation_key_id;
+        keyring_core::Entry::new(&coordinate.service, &coordinate.account)
+            .unwrap()
+            .set_password("~")
+            .unwrap();
+
+        let mut result = None;
+        let logs = stellar_agent_test_support::log_capture::with_captured_trace_logs(|| {
+            result = Some(load_attestation_key(&profile));
+        });
+
+        assert!(
+            logs.contains("attestation key base64 decode failed"),
+            "{logs}"
+        );
+        assert!(!logs.contains("Invalid symbol"), "{logs}");
+        assert!(result.expect("the load ran").is_err());
+    }
 
     #[test]
     #[serial_test::serial(keyring)]

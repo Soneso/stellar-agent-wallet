@@ -372,7 +372,7 @@ async fn approval_detail_get(
         .find(|v| v.approval_nonce == nonce);
 
     let Some(view) = view else {
-        return Html(render_not_found_page(&nonce, &state.identity)).into_response();
+        return Html(render_not_found_page(&state.identity)).into_response();
     };
 
     // For an already-attested payment-style entry, surface the stored blob so a

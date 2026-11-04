@@ -622,7 +622,7 @@ fn render_detail(
         drop(store);
         return Ok((
             StatusCode::NOT_FOUND,
-            Html(render_not_found_page(nonce, &state.identity)),
+            Html(render_not_found_page(&state.identity)),
         )
             .into_response());
     };

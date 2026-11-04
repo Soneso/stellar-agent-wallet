@@ -79,9 +79,9 @@ async fn init_pool_n0_returns_size_out_of_range() {
     };
 
     match init_pool(&client, params).await {
-        Err(PoolError::SizeOutOfRange { requested: 0 }) => {}
-        Err(e) => panic!("expected SizeOutOfRange(0), got Err: {e}"),
-        Ok(_) => panic!("expected SizeOutOfRange(0), got Ok"),
+        Err(PoolError::SizeOutOfRange) => {}
+        Err(e) => panic!("expected SizeOutOfRange, got Err: {e}"),
+        Ok(_) => panic!("expected SizeOutOfRange, got Ok"),
     }
 }
 
@@ -120,9 +120,9 @@ async fn init_pool_n_exceeds_max_returns_size_out_of_range() {
     };
 
     match init_pool(&client, params).await {
-        Err(PoolError::SizeOutOfRange { requested }) if requested == n => {}
-        Err(e) => panic!("expected SizeOutOfRange({n}), got Err: {e}"),
-        Ok(_) => panic!("expected SizeOutOfRange({n}), got Ok"),
+        Err(PoolError::SizeOutOfRange) => {}
+        Err(e) => panic!("expected SizeOutOfRange, got Err: {e}"),
+        Ok(_) => panic!("expected SizeOutOfRange, got Ok"),
     }
 }
 
@@ -820,12 +820,8 @@ async fn init_pool_fee_overflow_refuses_before_any_request() {
     );
     let result = completed.unwrap().map(|_| ());
     assert!(
-        matches!(result, Err(PoolError::FeeOverflow {
-            fee_per_op: reported,
-            op_count: 3,
-        }) if reported == fee_per_op),
-        "init_pool must return FeeOverflow with the selected fee and \
-         operation count; got {result:?}"
+        matches!(result, Err(PoolError::FeeOverflow { op_count: 3 })),
+        "init_pool must return FeeOverflow with the operation count; got {result:?}"
     );
     assert!(server.received_requests().await.unwrap().is_empty());
     assert!(recording.receipts.all().unwrap().is_empty());

@@ -414,7 +414,7 @@ impl WalletServer {
             Err(err) => return Ok(claim_error_result(&err)),
         };
 
-        if let Err(err) = require_claimant(&preview, &source) {
+        if let Err(err) = require_claimant(&preview) {
             return Ok(claim_error_result(&err));
         }
         if let Err(err) = require_predicate_satisfied(&preview) {
@@ -888,7 +888,7 @@ impl WalletServer {
             Ok(p) => p,
             Err(err) => return Ok(claim_error_result(&err)),
         };
-        if let Err(err) = require_claimant(&preview, &source) {
+        if let Err(err) = require_claimant(&preview) {
             return Ok(claim_error_result(&err));
         }
         if let Err(err) = require_predicate_satisfied(&preview) {

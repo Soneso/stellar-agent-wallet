@@ -182,7 +182,6 @@ pub async fn run(args: &RefreshArgs) -> i32 {
         }
         Err(e) => {
             tracing::warn!(
-                home_domain = %args.home_domain,
                 profile = %profile_name,
                 error = %e,
                 "counterparty refresh failed"

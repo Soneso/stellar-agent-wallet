@@ -459,9 +459,11 @@ impl ClassicOpBuilder {
 
         let xdr_op = BaselibOperation::new()
             .create_account(destination, stroops)
-            .map_err(|e| {
+            .map_err(|_| {
                 WalletError::Protocol(ProtocolError::XdrCodecFailed {
-                    detail: format!("create_account op construction failed: {e:?}"),
+                    detail: "create_account op construction failed: starting_balance must be \
+                             nonnegative"
+                        .to_owned(),
                 })
             })?;
 
@@ -516,9 +518,9 @@ impl ClassicOpBuilder {
 
         let xdr_op = BaselibOperation::new()
             .payment(destination, &baselib_asset, stroops)
-            .map_err(|e| {
+            .map_err(|_| {
                 WalletError::Protocol(ProtocolError::XdrCodecFailed {
-                    detail: format!("payment op construction failed: {e:?}"),
+                    detail: "payment op construction failed: amount must be nonnegative".to_owned(),
                 })
             })?;
 
@@ -1349,6 +1351,35 @@ mod tests {
         let xdr = builder.build().unwrap();
         TransactionEnvelope::from_xdr_base64(&xdr, Limits::none())
             .expect("must decode as a valid TransactionEnvelope");
+    }
+
+    /// A negative amount is refused by the rule, without the amount or the
+    /// baselib error that holds it.
+    #[test]
+    fn negative_amounts_stay_out_of_the_error() {
+        use stellar_agent_test_support::rejected_value::assert_no_marker;
+        let mut builder =
+            ClassicOpBuilder::new(TEST_SOURCE, 101, "Test SDF Network ; September 2015", 100);
+        let negative = StellarAmount::from_stroops(-424_242);
+        let error = builder
+            .create_account(TEST_DEST, negative)
+            .err()
+            .expect("a negative starting balance must refuse");
+        assert_eq!(
+            error.to_string(),
+            "XDR codec operation failed: create_account op construction failed: starting_balance must be \
+             nonnegative"
+        );
+        assert_no_marker(&error, "424242");
+        let error = builder
+            .payment(TEST_DEST, negative, &Asset::Native)
+            .err()
+            .expect("a negative payment amount must refuse");
+        assert_eq!(
+            error.to_string(),
+            "XDR codec operation failed: payment op construction failed: amount must be nonnegative"
+        );
+        assert_no_marker(&error, "424242");
     }
 
     #[test]

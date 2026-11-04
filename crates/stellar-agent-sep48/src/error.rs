@@ -22,15 +22,8 @@ use thiserror::Error;
 #[non_exhaustive]
 pub enum Sep48Error {
     /// The supplied contract address is not a valid C-strkey.
-    ///
-    /// # Arguments
-    ///
-    /// `addr` — the invalid address string, first-5-last-5 redacted.
-    #[error("invalid contract address: {addr}")]
-    InvalidContractAddress {
-        /// First-5-last-5 redacted representation of the invalid address.
-        addr: String,
-    },
+    #[error("invalid contract address: contract_id must be a C-strkey")]
+    InvalidContractAddress,
 
     /// An RPC request to fetch the contract WASM or ledger entries failed.
     ///
@@ -64,15 +57,8 @@ pub enum Sep48Error {
     SpecSectionMissing,
 
     /// The requested function was not found in the contract spec.
-    ///
-    /// # Arguments
-    ///
-    /// `function_name` — the name of the missing function.
-    #[error("function '{function_name}' not found in contract spec")]
-    FunctionNotFound {
-        /// Name of the function requested but absent in the spec.
-        function_name: String,
-    },
+    #[error("function must name a function declared in the contract spec")]
+    FunctionNotFound,
 
     /// Decoding the `InvokeHostFunction` operation from the supplied XDR failed.
     ///
@@ -135,8 +121,8 @@ pub mod test_helpers {
 
     /// Constructs a [`Sep48Error::InvalidContractAddress`] for tests.
     #[must_use]
-    pub fn invalid_contract_address(addr: impl Into<String>) -> Sep48Error {
-        Sep48Error::InvalidContractAddress { addr: addr.into() }
+    pub fn invalid_contract_address() -> Sep48Error {
+        Sep48Error::InvalidContractAddress
     }
 
     /// Constructs a [`Sep48Error::RpcFetchFailure`] for tests.
@@ -173,8 +159,8 @@ mod tests {
     #[test]
     fn test_helpers_construct_correct_variants() {
         assert!(matches!(
-            test_helpers::invalid_contract_address("bad"),
-            Sep48Error::InvalidContractAddress { addr } if addr == "bad"
+            test_helpers::invalid_contract_address(),
+            Sep48Error::InvalidContractAddress
         ));
         assert!(matches!(
             test_helpers::rpc_fetch_failure("rpc down"),
@@ -192,10 +178,10 @@ mod tests {
 
     #[test]
     fn error_display_messages_are_correct() {
-        let e = Sep48Error::InvalidContractAddress {
-            addr: "CBAD".to_owned(),
-        };
-        assert!(e.to_string().contains("CBAD"), "display must include addr");
+        assert_eq!(
+            Sep48Error::InvalidContractAddress.to_string(),
+            "invalid contract address: contract_id must be a C-strkey"
+        );
 
         let e = Sep48Error::ArgCountMismatch {
             expected: 2,

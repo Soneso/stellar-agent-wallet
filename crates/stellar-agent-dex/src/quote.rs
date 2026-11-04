@@ -94,14 +94,12 @@ pub enum QuoteError {
     ///
     /// Fail-closed on slippage.
     #[error(
-        "slippage exceeded: expected output {expected_out} < minimum {amount_out_min}; \
-         refuse sign"
+        "qty_out_min (amount_out_min) must not exceed the current quoted output; refresh the \
+         quote and choose a satisfiable minimum."
     )]
     SlippageExceeded {
         /// Expected output from the on-chain quote.
         expected_out: i128,
-        /// Caller-supplied minimum.
-        amount_out_min: i128,
     },
 
     /// The quote path returned fewer amounts than expected (should be path.len()).
@@ -271,10 +269,7 @@ pub async fn reverify_slippage(
 /// Returns [`QuoteError::SlippageExceeded`] when `expected_out < amount_out_min`.
 fn check_slippage(expected_out: i128, amount_out_min: i128) -> Result<(), QuoteError> {
     if expected_out < amount_out_min {
-        return Err(QuoteError::SlippageExceeded {
-            expected_out,
-            amount_out_min,
-        });
+        return Err(QuoteError::SlippageExceeded { expected_out });
     }
     Ok(())
 }
@@ -399,20 +394,13 @@ mod tests {
 
     #[test]
     fn slippage_exceeded_display_no_sensitive_leak() {
-        let err = QuoteError::SlippageExceeded {
-            expected_out: 900_000_000,
-            amount_out_min: 950_000_000,
-        };
-        let display = err.to_string();
-        // Must contain amounts but not any address.
-        assert!(
-            display.contains("900000000"),
-            "display must mention expected_out"
+        let err = check_slippage(1_000, 424_242).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "qty_out_min (amount_out_min) must not exceed the current quoted output; refresh \
+             the quote and choose a satisfiable minimum."
         );
-        assert!(
-            display.contains("950000000"),
-            "display must mention amount_out_min"
-        );
+        assert!(!format!("{err:?}").contains("424242"), "{err:?}");
     }
 
     // ── check_slippage boundary cases ────────────────────────────────────────
@@ -438,10 +426,7 @@ mod tests {
         assert!(
             matches!(
                 check_slippage(999, 1_000),
-                Err(QuoteError::SlippageExceeded {
-                    expected_out: 999,
-                    amount_out_min: 1_000,
-                })
+                Err(QuoteError::SlippageExceeded { expected_out: 999 })
             ),
             "expected < min must return SlippageExceeded"
         );

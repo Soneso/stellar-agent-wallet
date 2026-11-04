@@ -1180,7 +1180,7 @@ mod tests {
         assert!(
             message.contains(
                 "get_context_rule: signer at index 1 (id 1) is not a recognised Signer: \
-                 unknown signer tag \"Future\""
+                 signer tag must be Delegated or External"
             ),
             "{message}"
         );

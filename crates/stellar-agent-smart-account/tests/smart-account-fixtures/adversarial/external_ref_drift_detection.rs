@@ -7,8 +7,9 @@
 //! without one, a live external reference is drift whatever it resolves to.
 //!
 //! Every drift case MUST return `sa.verifier_hash_drift` /
-//! `sa.policy_hash_drift` with `observed_executable` describing the live
-//! executable, and write the matching drift row.
+//! `sa.policy_hash_drift` naming the pinned hash and holding no part of the
+//! live executable, and write the matching drift row, whose
+//! `observed_executable` describes the live executable.
 
 #![cfg(feature = "test-helpers")]
 
@@ -208,12 +209,15 @@ async fn check(
     }
 }
 
-/// Asserts that `outcome` is drift for `kind` with the given full pinned and
-/// observed hashes and observed-executable summary, and that exactly one
-/// matching drift row, carrying the labeled first-8 projections, was
-/// written. An expected observed hash of `None` is absent Wasm code or an
-/// unresolved reference: the error carries no observed hash and the row
-/// carries `none`.
+/// Asserts that `outcome` is drift for `kind` with the given full pinned
+/// hash, that the error's Display, Debug and serialized forms hold neither
+/// the observed hash nor the observed-executable summary, and that exactly
+/// one matching drift row, carrying the labeled first-8 projections and the
+/// summary, was written. An expected observed hash of `None` is absent Wasm
+/// code or an unresolved reference: the row carries `none`. An observed hash
+/// equal to the pin is the pin the error names, so the hash checks cover an
+/// observed hash that differs from it, and its first eight bytes when they
+/// differ from the pin's.
 fn assert_drift(
     kind: Kind,
     case: &str,
@@ -222,50 +226,38 @@ fn assert_drift(
     expected_observed: Option<&WasmHashPin>,
     observed_executable: &str,
 ) {
-    let (pinned, observed, executable, wire_code) = match (&outcome.result, kind) {
-        (
-            Err(SaError::VerifierHashDrift {
-                pinned_hash,
-                observed_hash,
-                observed_executable,
-                ..
-            }),
-            Kind::Verifier,
-        ) => (
-            pinned_hash,
-            observed_hash,
-            observed_executable,
-            "sa.verifier_hash_drift",
-        ),
-        (
-            Err(SaError::PolicyHashDrift {
-                pinned_hash,
-                observed_hash,
-                observed_executable,
-                ..
-            }),
-            Kind::Policy,
-        ) => (
-            pinned_hash,
-            observed_hash,
-            observed_executable,
-            "sa.policy_hash_drift",
-        ),
+    let (pinned, wire_code) = match (&outcome.result, kind) {
+        (Err(SaError::VerifierHashDrift { pinned_hash, .. }), Kind::Verifier) => {
+            (pinned_hash, "sa.verifier_hash_drift")
+        }
+        (Err(SaError::PolicyHashDrift { pinned_hash, .. }), Kind::Policy) => {
+            (pinned_hash, "sa.policy_hash_drift")
+        }
         (other, _) => panic!("{kind:?}, {case}: expected drift; got {other:?}"),
     };
     let error = outcome.result.as_ref().expect_err("drift");
     assert_eq!(error.wire_code(), wire_code, "{kind:?}, {case}");
     assert_eq!(pinned, expected_pinned, "{kind:?}, {case}");
-    assert_eq!(observed.as_ref(), expected_observed, "{kind:?}, {case}");
-    assert_eq!(
-        executable.as_deref(),
-        Some(observed_executable),
-        "{kind:?}, {case}"
+    let rendered = format!(
+        "{error}\n{error:?}\n{}",
+        serde_json::to_string(error).unwrap()
     );
     assert!(
-        error.to_string().contains(observed_executable),
-        "{kind:?}, {case}: Display names the observed executable: {error}"
+        !rendered.contains(observed_executable),
+        "{kind:?}, {case}: the error holds no observed executable: {rendered}"
     );
+    if let Some(observed) = expected_observed.filter(|observed| *observed != expected_pinned) {
+        assert!(
+            !rendered.contains(&observed.to_hex()),
+            "{kind:?}, {case}: the error holds no observed hash: {rendered}"
+        );
+        if observed.first8_display() != expected_pinned.first8_display() {
+            assert!(
+                !rendered.contains(&observed.first8_display()),
+                "{kind:?}, {case}: the error holds no observed hash prefix: {rendered}"
+            );
+        }
+    }
     assert_eq!(
         outcome.drift_rows,
         vec![(
@@ -342,8 +334,8 @@ async fn owner_repointing_the_tag_is_drift() {
 }
 
 /// The owner repointing the tag to a hash that shares the pinned hash's
-/// first eight bytes is drift naming both full hashes; the summary shows the
-/// full resolved hash.
+/// first eight bytes is drift. The error names the full pin; the drift audit
+/// row keeps the observed hash and executable.
 #[tokio::test]
 async fn owner_repointing_the_tag_to_an_equal_prefix_twin_is_drift() {
     for kind in [Kind::Verifier, Kind::Policy] {

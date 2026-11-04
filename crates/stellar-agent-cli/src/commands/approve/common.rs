@@ -4,6 +4,7 @@ use std::path::PathBuf;
 
 use stellar_agent_core::approval::error::ApprovalError;
 use stellar_agent_core::error::{ApprovalFailure, WalletError};
+use stellar_agent_core::profile::loader::list_profiles;
 use stellar_agent_core::profile::schema::default_approval_dir;
 
 /// Resolves the approval directory or returns its approval-specific refusal.
@@ -13,6 +14,14 @@ pub(crate) fn approval_store_dir() -> Result<PathBuf, WalletError> {
             detail: "could not determine approval store directory".to_owned(),
         })
     })
+}
+
+/// Reports include a profile name only when it appears in the saved-profile
+/// directory. If that directory cannot be read, the name is omitted.
+pub(crate) fn saved_profile_name(name: String) -> Option<String> {
+    list_profiles()
+        .is_ok_and(|saved| saved.contains(&name))
+        .then_some(name)
 }
 
 /// Maps an [`ApprovalError`] from opening the pending-approval store onto a

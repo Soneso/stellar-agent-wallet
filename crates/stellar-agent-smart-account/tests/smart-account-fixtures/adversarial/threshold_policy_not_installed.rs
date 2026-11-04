@@ -103,7 +103,6 @@ async fn not_installed_requires_baseline_step_to_pass_first() {
         request_id: Uuid::new_v4().to_string(),
     };
     let missing_baseline = SaError::SignerSetMissingBaseline {
-        rule_id: 1,
         smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...AD2KM"),
         request_id: Uuid::new_v4().to_string(),
     };

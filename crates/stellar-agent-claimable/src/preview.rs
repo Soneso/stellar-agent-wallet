@@ -191,13 +191,11 @@ impl ClaimPreview {
 ///
 /// Returns [`ClaimError::NotClaimant`] when the account is not a claimant on
 /// the entry.
-pub fn require_claimant(preview: &ClaimPreview, account: &str) -> Result<(), ClaimError> {
+pub fn require_claimant(preview: &ClaimPreview) -> Result<(), ClaimError> {
     if preview.is_claimant {
         Ok(())
     } else {
-        Err(ClaimError::NotClaimant {
-            account: account.to_owned(),
-        })
+        Err(ClaimError::NotClaimant)
     }
 }
 
@@ -559,7 +557,7 @@ mod tests {
             ClaimableBalanceEntryExt::V0,
         );
         let preview = ClaimPreview::build(&entry, CLAIMANT_G, 1_000).unwrap();
-        assert!(require_claimant(&preview, CLAIMANT_G).is_ok());
+        assert!(require_claimant(&preview).is_ok());
     }
 
     #[test]
@@ -571,8 +569,19 @@ mod tests {
             ClaimableBalanceEntryExt::V0,
         );
         let preview = ClaimPreview::build(&entry, CLAIMANT_G, 1_000).unwrap();
-        let err = require_claimant(&preview, CLAIMANT_G).expect_err("must refuse");
+        let err = require_claimant(&preview).expect_err("must refuse");
         assert_eq!(err.code(), "claim.not_claimant");
+        assert_eq!(
+            err.to_string(),
+            "claim.not_claimant: the source account must appear as a claimant on this balance"
+        );
+        let rendered = format!("{err:?}");
+        for form in [
+            CLAIMANT_G.to_owned(),
+            stellar_agent_core::observability::redact_strkey_first5_last5(CLAIMANT_G),
+        ] {
+            assert!(!rendered.contains(&form), "{rendered}");
+        }
     }
 
     // ─── require_predicate_satisfied ────────────────────────────────────────

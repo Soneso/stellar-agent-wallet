@@ -791,7 +791,6 @@ async fn pin_contract(
     // consulted, as an unresolved external reference is.
     let Some(effective_hash) = observation.effective_hash else {
         warn!(
-            contract_redacted = %contract_redacted,
             contract_kind = %contract_kind,
             rule_id,
             "pin_referenced_contracts: the contract has no Wasm code; refusing"
@@ -800,7 +799,6 @@ async fn pin_contract(
             contract_kind,
             rule_id,
             smart_account_redacted,
-            &contract_redacted,
             AdminOrOwnerKey::NoWasmCode,
             request_id,
         ));
@@ -818,20 +816,17 @@ async fn pin_contract(
     let mut pending_overrides = Vec::new();
     let mut unknown_override = false;
     if !observation.allowlisted {
-        let observed_hash_first8 = observation.observed_hash_first8();
         if !context.accept_unknown_verifier {
-            return Err(kind.not_in_allowlist_error(
-                rule_id,
-                smart_account_redacted,
-                observed_hash_first8,
-                request_id,
-            ));
+            return Err(kind.not_in_allowlist_error(rule_id, smart_account_redacted, request_id));
         }
+        // The override row, written once the install confirms, names the
+        // admitted hash. The warning fires before the mutability check, which
+        // can still refuse the contract, so it names no part of the hash.
+        let observed_hash_first8 = observation.observed_hash_first8();
         unknown_override = true;
         warn!(
             contract_redacted = %contract_redacted,
             contract_kind = %contract_kind,
-            observed_hash_first8 = %observed_hash_first8,
             rule_id,
             "pin_referenced_contracts: unknown {contract_kind} wasm hash; \
              proceeding with --accept-unknown-verifier override"
@@ -856,7 +851,6 @@ async fn pin_contract(
                     contract_kind,
                     rule_id,
                     smart_account_redacted,
-                    &contract_redacted,
                     AdminOrOwnerKey::ExternalRefUnresolved,
                     request_id,
                 )
@@ -896,17 +890,15 @@ async fn pin_contract(
             contract_kind,
             rule_id,
             smart_account_redacted,
-            &contract_redacted,
             *admin_or_owner_key,
             request_id,
         ));
     }
 
     if !same_executable_reference(&observation.observed, &mutability)? {
+        // Both executables are refused, so the warning names neither.
         warn!(
-            contract_redacted = %contract_redacted,
             contract_kind = %contract_kind,
-            identified = %observation.observed.summary(),
             rule_id,
             "pin_referenced_contracts: the mutability probe observed a different \
              executable than identification; refusing"
@@ -915,7 +907,6 @@ async fn pin_contract(
             contract_kind,
             rule_id,
             smart_account_redacted,
-            &contract_redacted,
             AdminOrOwnerKey::ExecutableChanged,
             request_id,
         ));
@@ -935,7 +926,6 @@ async fn pin_contract(
             return Err(kind.mutable_error(
                 rule_id,
                 smart_account_redacted,
-                &contract_redacted,
                 *admin_or_owner_key,
                 detail,
                 request_id,
@@ -1037,7 +1027,6 @@ impl PinnedKind {
         self,
         rule_id: Option<u32>,
         smart_account_redacted: &str,
-        observed_hash_first8: String,
         request_id: &str,
     ) -> SaError {
         let smart_account_redacted = RedactedStrkey::from_already_redacted(smart_account_redacted);
@@ -1046,13 +1035,11 @@ impl PinnedKind {
             Self::Verifier => SaError::VerifierWasmNotInAllowlist {
                 rule_id,
                 smart_account_redacted,
-                observed_hash_first8,
                 request_id,
             },
             Self::Policy => SaError::PolicyWasmNotInAllowlist {
                 rule_id,
                 smart_account_redacted,
-                observed_hash_first8,
                 request_id,
             },
         }
@@ -1062,19 +1049,16 @@ impl PinnedKind {
         self,
         rule_id: Option<u32>,
         smart_account_redacted: &str,
-        contract_redacted: &str,
         admin_or_owner_key: AdminOrOwnerKey,
         detail: String,
         request_id: &str,
     ) -> SaError {
         let smart_account_redacted = RedactedStrkey::from_already_redacted(smart_account_redacted);
-        let contract_address_redacted = RedactedStrkey::from_already_redacted(contract_redacted);
         let request_id = request_id.to_owned();
         match self {
             Self::Verifier => SaError::VerifierMutable {
                 rule_id,
                 smart_account_redacted,
-                contract_address_redacted,
                 admin_or_owner_key,
                 detail: Some(detail),
                 request_id,
@@ -1082,7 +1066,6 @@ impl PinnedKind {
             Self::Policy => SaError::PolicyMutable {
                 rule_id,
                 smart_account_redacted,
-                contract_address_redacted,
                 admin_or_owner_key,
                 detail: Some(detail),
                 request_id,
@@ -1095,7 +1078,6 @@ fn unsupported_instance(
     contract_kind: ContractKind,
     rule_id: Option<u32>,
     smart_account_redacted: &str,
-    contract_redacted: &str,
     reason: AdminOrOwnerKey,
     request_id: &str,
 ) -> SaError {
@@ -1103,7 +1085,6 @@ fn unsupported_instance(
         rule_id,
         contract_kind,
         smart_account_redacted: RedactedStrkey::from_already_redacted(smart_account_redacted),
-        contract_address_redacted: RedactedStrkey::from_already_redacted(contract_redacted),
         reason,
         request_id: request_id.to_owned(),
     }
@@ -1245,15 +1226,8 @@ fn compare_against_pin(
     })
 }
 
-/// Renders an observed hash in full for a log line, or `none` for absent
-/// code.
-fn observed_hash_display(hash: Option<&WasmHashPin>) -> String {
-    hash.map_or_else(|| "none".to_owned(), WasmHashPin::to_hex)
-}
-
-/// Renders the labeled first-8 display of an observed hash for a drift row,
-/// or `none` for absent Wasm code, the sentinel the allowlist-miss errors and
-/// override rows carry.
+/// Renders an observed hash's first eight bytes for a drift audit row, or
+/// `none` for absent Wasm code.
 fn observed_hash_first8_display(hash: Option<&WasmHashPin>) -> String {
     hash.map_or_else(|| "none".to_owned(), WasmHashPin::first8_display)
 }
@@ -1433,13 +1407,10 @@ pub(crate) async fn verify_pinned_verifier_against_chain(
         compare_against_pin(&pinned_hash, record.verifier_executable_ref(0), &observed)?;
 
     if comparison.matches {
-        debug!(
-            rule_id,
-            verifier_redacted = %verifier_redacted,
-            observed_hash = %observed_hash_display(comparison.observed_hash.as_ref()),
-            observed_executable = %comparison.observed_executable,
-            "verify_pinned_verifier_against_chain: executable matches pin (no drift)"
-        );
+        // A later signing rule of the same operation checks this observation
+        // against its own pin and can still refuse it, so the match event
+        // names no part of the observed executable. The status gate runs
+        // before the event, so a revoked or retired executable logs no match.
         if status_gate == VerifierStatusGate::Refuse
             && let Some(hash) = observed.effective_hash()
         {
@@ -1450,22 +1421,29 @@ pub(crate) async fn verify_pinned_verifier_against_chain(
                 request_id,
             )?;
         }
+        debug!(
+            rule_id,
+            verifier_redacted = %verifier_redacted,
+            "verify_pinned_verifier_against_chain: executable matches pin (no drift)"
+        );
         return Ok(());
     }
 
     // Drift detected: emit SaVerifierHashDrift audit row and return typed error.
+    // The observed executable failed to match the pin, so the warning and the
+    // error hold no part of it; the drift row, written here before the error
+    // returns, records it for the drift investigation.
     warn!(
         rule_id,
         smart_account_redacted,
         verifier_redacted = %verifier_redacted,
         pinned_hash = %pinned_hash,
-        observed_hash = %observed_hash_display(comparison.observed_hash.as_ref()),
-        observed_executable = %comparison.observed_executable,
-        "verify_pinned_verifier_against_chain: executable DRIFT detected; aborting signing"
+        "verify_pinned_verifier_against_chain: verifier executable must match the pinned \
+         executable; aborting signing"
     );
 
     // The drift row keeps its labeled first-8 display fields, `none` for
-    // absent Wasm code; the summary and the returned error carry the full hashes.
+    // absent Wasm code, and the bounded executable summary.
     let drift_entry = AuditEntry::new_sa_verifier_hash_drift(
         rule_id,
         RedactedStrkey::from_already_redacted(smart_account_redacted),
@@ -1483,8 +1461,6 @@ pub(crate) async fn verify_pinned_verifier_against_chain(
         smart_account_redacted: RedactedStrkey::from_already_redacted(smart_account_redacted),
         deploy_address_redacted: RedactedStrkey::from_already_redacted(verifier_redacted),
         pinned_hash,
-        observed_hash: comparison.observed_hash,
-        observed_executable: Some(comparison.observed_executable),
         request_id: request_id.to_owned(),
     })
 }
@@ -1574,40 +1550,41 @@ pub(crate) async fn verify_pinned_policy_against_chain(
     .await?;
 
     // Informational: the pin, not the allowlist, decides at signing time.
+    // The hash is not logged: a hash outside the allowlist that also misses
+    // the pin is refused below.
     if let Some(hash) = observed.effective_hash()
         && !policy_hash_allowlisted(&hash)
     {
         warn!(
             rule_id,
             policy_redacted = %policy_redacted,
-            observed_hash = %hex::encode(hash),
-            "verify_pinned_policy_against_chain: observed policy wasm hash not in allowlist \
-             (will still check against pinned value)"
+            "verify_pinned_policy_against_chain: observed policy wasm hash not in allowlist; \
+             the pin comparison decides"
         );
     }
 
     let comparison = compare_against_pin(&pinned_hash, record.policy_executable_ref(0), &observed)?;
 
     if comparison.matches {
+        // As on the verifier path, a later signing rule can still refuse this
+        // observation, so the match event names no part of it.
         debug!(
             rule_id,
             policy_redacted = %policy_redacted,
-            observed_hash = %observed_hash_display(comparison.observed_hash.as_ref()),
-            observed_executable = %comparison.observed_executable,
             "verify_pinned_policy_against_chain: executable matches pin (no drift)"
         );
         return Ok(());
     }
 
-    // Drift detected.
+    // Drift detected. As on the verifier path, the warning and the error
+    // hold no part of the observed executable; the drift row records it.
     warn!(
         rule_id,
         smart_account_redacted,
         policy_redacted = %policy_redacted,
         pinned_hash = %pinned_hash,
-        observed_hash = %observed_hash_display(comparison.observed_hash.as_ref()),
-        observed_executable = %comparison.observed_executable,
-        "verify_pinned_policy_against_chain: executable DRIFT detected; aborting signing"
+        "verify_pinned_policy_against_chain: policy executable must match the pinned \
+         executable; aborting signing"
     );
 
     let drift_entry = AuditEntry::new_sa_policy_hash_drift(
@@ -1627,8 +1604,6 @@ pub(crate) async fn verify_pinned_policy_against_chain(
         smart_account_redacted: RedactedStrkey::from_already_redacted(smart_account_redacted),
         deploy_address_redacted: RedactedStrkey::from_already_redacted(policy_redacted),
         pinned_hash,
-        observed_hash: comparison.observed_hash,
-        observed_executable: Some(comparison.observed_executable),
         request_id: request_id.to_owned(),
     })
 }
@@ -4026,8 +4001,10 @@ mod tests {
     /// audit row.
     async fn assert_unpinnable_instance_refused(contract_kind: ContractKind) {
         let contract = ScAddress::Contract(ContractId(Hash([0x0b; 32])));
-        let contract_redacted =
-            redact_strkey_first5_last5(&xdr_scaddress_to_strkey_or_sentinel(&contract));
+        let contract_strkey = xdr_scaddress_to_strkey_or_sentinel(&contract);
+        let contract_redacted = redact_strkey_first5_last5(&contract_strkey);
+        let (capture, _guard) =
+            stellar_agent_test_support::log_capture::WarningCapture::capture(None);
         for (entry_xdr, reason) in [
             (
                 "bm90dmFsaWR4ZHI=".to_owned(),
@@ -4056,7 +4033,6 @@ mod tests {
                     rule_id,
                     contract_kind: actual_kind,
                     smart_account_redacted,
-                    contract_address_redacted,
                     reason: actual_reason,
                     request_id,
                 } = &error
@@ -4067,19 +4043,30 @@ mod tests {
                 assert_eq!(*actual_kind, contract_kind);
                 assert_eq!(*actual_reason, reason);
                 assert_eq!(smart_account_redacted.as_str(), "CAAAA...ABSC4");
-                assert_eq!(contract_address_redacted.as_str(), contract_redacted);
                 assert_eq!(request_id, "probe");
 
-                let message = error.to_string();
-                assert!(message.contains(&reason.to_string()), "{message}");
-                assert!(
-                    message.contains("cannot pin this contract's code"),
-                    "{message}"
+                assert_eq!(
+                    error.to_string(),
+                    "verifier or policy address must identify a deployed contract with a \
+                     supported, resolvable Wasm executable; repair the deployment or select \
+                     another contract."
                 );
+                let expected_event = match reason {
+                    AdminOrOwnerKey::UndecodableInstance => {
+                        "fetch_observed_executable: malformed ledger entry; refusing"
+                    }
+                    _ => "pin_referenced_contracts: the contract has no Wasm code; refusing",
+                };
+                let events = capture.seen();
                 assert!(
-                    !message.contains("--accept-mutable-verifier"),
-                    "the refusal has no override: {message}"
+                    events
+                        .iter()
+                        .any(|event| event.get("message").is_some_and(|m| m == expected_event)),
+                    "{events:?}"
                 );
+                let forms = format!("{error:?}\n{events:?}");
+                assert!(!forms.contains(&contract_strkey), "{forms}");
+                assert!(!forms.contains(&contract_redacted), "{forms}");
                 let json = serde_json::to_value(&error).unwrap();
                 assert_eq!(
                     json["context"]["reason"],

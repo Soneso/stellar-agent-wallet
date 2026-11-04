@@ -275,9 +275,10 @@ pub(crate) fn render_inbox_page(
 
 /// Renders a clean "not found in queue" page (HTTP 200, authenticated UX
 /// case).
+///
+/// The page holds no form of the requested nonce: the lookup refused it.
 #[must_use]
-pub(crate) fn render_not_found_page(nonce: &str, identity: &PageIdentity) -> String {
-    let nonce = html_escape(nonce);
+pub(crate) fn render_not_found_page(identity: &PageIdentity) -> String {
     let title = identity.page_title("Approval not found");
     let card_header = identity.card_header_html();
     format!(
@@ -294,9 +295,8 @@ pub(crate) fn render_not_found_page(nonce: &str, identity: &PageIdentity) -> Str
     <div class="card">
 {card_header}
       <h1>Approval not found</h1>
-      <p class="lead">No pending approval with nonce <code class="chip">{nonce}</code>
-         is in the queue. It may have been approved, rejected, or expired
-         already.</p>
+      <p class="lead">Approval nonce must identify a pending approval; return to the inbox and
+         select an available request.</p>
       <p class="help"><a class="back" href="/inbox">&larr; Back to inbox</a></p>
 {TRUST_LINE_SELF_HOSTED}
     </div>
@@ -974,10 +974,12 @@ mod tests {
     }
 
     #[test]
-    fn render_not_found_page_escapes_nonce_and_links_inbox() {
-        let html = render_not_found_page("<script>x</script>", &neutral());
-        assert!(!html.contains("<script>x</script>"));
-        assert!(html.contains("&lt;script&gt;"));
+    fn render_not_found_page_states_the_check_and_links_inbox() {
+        let html = render_not_found_page(&neutral());
+        assert!(html.contains(
+            "Approval nonce must identify a pending approval; return to the inbox and\n         \
+             select an available request."
+        ));
         assert!(html.contains(r#"href="/inbox""#));
         assert!(html.contains("Approval not found"));
     }
@@ -1035,7 +1037,7 @@ mod tests {
                     identity,
                 ),
             ),
-            ("not found", render_not_found_page("nonce", identity)),
+            ("not found", render_not_found_page(identity)),
         ]
     }
 
@@ -1199,7 +1201,7 @@ mod tests {
             render_login_page("wallet.internal", &neutral()),
             render_enroll_page("wallet.internal", &neutral()),
             render_message_page("Too many requests", "Wait and retry.", &neutral()),
-            render_not_found_page("nonce", &neutral()),
+            render_not_found_page(&neutral()),
         ] {
             assert!(
                 html.contains(

@@ -590,7 +590,7 @@ async fn approval_detail_get(
 
     let Some(view) = view else {
         drop(store);
-        return Html(render_not_found_page(&nonce, &state.identity)).into_response();
+        return Html(render_not_found_page(&state.identity)).into_response();
     };
 
     // For an already-attested payment-style entry, surface the stored blob
@@ -1239,6 +1239,37 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// An unknown approval nonce renders the fixed page with the inbox link
+    /// and without the requested value.
+    #[tokio::test]
+    #[serial]
+    async fn unknown_approval_page_holds_no_nonce() {
+        let f = fixture("unknown-nonce");
+        let router = build_router();
+        let cookie = login(&router, &f.state, &f.authenticator).await;
+        let resp = router
+            .clone()
+            .with_state(f.state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/approval/credmarker7AAAAAAAAAAA")
+                    .header(header::COOKIE, cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(
+            body.contains("Approval nonce must identify a pending approval"),
+            "{body}"
+        );
+        assert!(body.contains(r#"href="/inbox""#), "{body}");
+        assert!(!body.contains("credmarker7"), "{body}");
     }
 
     /// Extracts a named string field out of a `<script type="application/json"

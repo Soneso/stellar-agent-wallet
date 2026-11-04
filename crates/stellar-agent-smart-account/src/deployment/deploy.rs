@@ -407,8 +407,8 @@ fn redact_salt(salt_hex: &str) -> String {
 
 /// Redacts a WASM hash hex string to first-8-last-8 for tracing/table output.
 ///
-/// Exception: the `post_deploy_verification` mismatch error carries
-/// first-8 of both observed and expected for operator triage.
+/// The `post_deploy_verification` mismatch error names only the expected
+/// hash's first eight bytes and the redacted contract address.
 ///
 /// Delegates to `stellar_agent_core::hex::redact_hex_first8_last8`.
 pub(crate) fn redact_wasm_hash(wasm_hash_hex: &str) -> String {
@@ -471,7 +471,8 @@ fn build_signer_delegated_scval(g_strkey: &str) -> Result<ScVal, SaError> {
 ///   executable, not the uploaded Wasm);
 /// - `expected_hash_hex` not parseable as 32-byte hex (programmer error);
 /// - hash mismatch (the substantive substitution check; `redacted_reason` carries
-///   redacted C-strkey + first-8 hex of observed AND expected for operator triage).
+///   the redacted C-strkey and the expected hash's first-8 hex, and no part of
+///   the observed hash, which failed the comparison).
 ///
 /// # Errors
 ///
@@ -542,18 +543,17 @@ pub(crate) fn verify_post_deploy_wasm_hash(
         })?;
 
     if observed_wasm_hash != expected_wasm_hash {
-        // First-8 hex of both observed and expected are included in `redacted_reason`
-        // for operator triage (distinguishes RPC-substitution from salt-collision
-        // deployment scenarios). The C-strkey is redacted first-5-last-5.
-        let observed_first8 = stellar_agent_core::hex::wasm_hash_first8_hex(&observed_wasm_hash);
+        // The observed hash failed the comparison, so the reason names only the
+        // expected hash, as first-8 hex, and the C-strkey, redacted
+        // first-5-last-5.
         let expected_first8 = stellar_agent_core::hex::wasm_hash_first8_hex(&expected_wasm_hash);
         let sa_redacted =
             stellar_agent_core::observability::redact_strkey_first5_last5(derived_smart_account);
         return Err(SaError::DeploymentFailed {
             phase: "post_deploy_verification",
             redacted_reason: format!(
-                "post-deploy WASM-hash mismatch on {sa_redacted}: \
-                 observed first-8 hex {observed_first8}, expected first-8 hex {expected_first8}"
+                "post-deploy WASM-hash mismatch on {sa_redacted}: the deployed executable must \
+                 be the uploaded Wasm, expected first-8 hex {expected_first8}"
             ),
         });
     }
@@ -978,7 +978,10 @@ async fn deploy_smart_account_body(
         if let Some(sim_error) = &upload_sim.error {
             return Err(SaError::DeploymentFailed {
                 phase: "simulate",
-                redacted_reason: format!("upload simulation returned error: {sim_error}"),
+                redacted_reason: format!(
+                    "upload simulation returned error: {}",
+                    crate::managers::rules::SimulationErrorClass::of(sim_error)
+                ),
             });
         }
         if upload_sim.min_resource_fee == 0 || upload_sim.transaction_data.is_empty() {
@@ -1201,7 +1204,10 @@ async fn deploy_smart_account_body(
     if let Some(sim_error) = &sim_response.error {
         return Err(SaError::DeploymentFailed {
             phase: "simulate",
-            redacted_reason: format!("deploy simulation returned error: {sim_error}"),
+            redacted_reason: format!(
+                "deploy simulation returned error: {}",
+                crate::managers::rules::SimulationErrorClass::of(sim_error)
+            ),
         });
     }
     if sim_response.min_resource_fee == 0 || sim_response.transaction_data.is_empty() {
@@ -1647,8 +1653,8 @@ mod tests {
     }
 
     /// Regression gate: a `LedgerEntryResult` with a valid XDR field but a non-matching WASM hash
-    /// causes `verify_post_deploy_wasm_hash` to return a typed mismatch error carrying first-8 hex
-    /// prefixes of both observed and expected.
+    /// causes `verify_post_deploy_wasm_hash` to return a typed mismatch error. The mismatch error
+    /// names only the expected hash's first eight bytes and the redacted contract address.
     #[test]
     fn post_deploy_verification_aborts_on_wasm_hash_mismatch() {
         // Build a synthetic ContractData entry with a non-matching wasm hash.
@@ -1699,27 +1705,19 @@ mod tests {
             panic!("expected mismatch error; got: {result:?}");
         };
         assert_eq!(phase, "post_deploy_verification");
-        assert!(
-            redacted_reason.starts_with("post-deploy WASM-hash mismatch on "),
-            "redacted_reason should start with mismatch literal: {redacted_reason}"
-        );
-        // The redacted C-strkey should be present.
+        // The reason names the redacted C-strkey and the expected hash's
+        // first-8 hex; the observed all-zeros hash failed the comparison and
+        // appears in no form.
         let redacted_sa =
             stellar_agent_core::observability::redact_strkey_first5_last5(test_c_strkey);
-        assert!(
-            redacted_reason.contains(&redacted_sa),
-            "redacted_reason should carry redacted C-strkey '{redacted_sa}': {redacted_reason}"
+        assert_eq!(
+            redacted_reason,
+            format!(
+                "post-deploy WASM-hash mismatch on {redacted_sa}: the deployed executable must \
+                 be the uploaded Wasm, expected first-8 hex 1234567890abcdef"
+            )
         );
-        // first-8 hex of [0u8; 32]
-        assert!(
-            redacted_reason.contains("0000000000000000"),
-            "redacted_reason should carry observed first-8 hex: {redacted_reason}"
-        );
-        // first-8 hex of the expected hash (1234567890abcdef...)
-        assert!(
-            redacted_reason.contains("1234567890abcdef"),
-            "redacted_reason should carry expected first-8 hex: {redacted_reason}"
-        );
+        assert!(!redacted_reason.contains("00000000"), "{redacted_reason}");
     }
 
     /// A deployed instance whose executable is a CAP-85 external reference is

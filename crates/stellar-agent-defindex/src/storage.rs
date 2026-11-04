@@ -898,10 +898,7 @@ fn parse_holder_address_to_scval(
     }
 
     Err(VaultShareBalanceFetchError::InvalidAddress {
-        reason: format!(
-            "address is neither a C-strkey (contract) nor a G-strkey (account): starts with '{}'",
-            address.chars().next().unwrap_or('?')
-        ),
+        reason: "the address must be a C-strkey or a G-strkey".to_owned(),
     })
 }
 
@@ -1091,6 +1088,20 @@ pub(crate) mod tests {
             result,
             Err(VaultStorageFetchError::InvalidAddress { .. })
         ));
+    }
+
+    /// A refused holder address is named by the accepted forms, with no
+    /// character of it.
+    #[test]
+    fn refused_holder_address_stays_out_of_the_error() {
+        let Err(err) = parse_holder_address_to_scval("Xcredmarker7") else {
+            panic!("the holder address must be refused");
+        };
+        assert_eq!(
+            err.to_string(),
+            "invalid address: the address must be a C-strkey or a G-strkey"
+        );
+        assert!(!format!("{err:?}").contains('X'), "{err:?}");
     }
 
     #[test]

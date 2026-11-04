@@ -992,6 +992,7 @@ State-changing (removes expired entries). Opens the pending-approval store and e
 - `--profile <NAME>`: the profile whose store to garbage-collect. Optional; same resolution as above.
 
 When the `gc` subcommand is present, any `--id` is ignored. Evicting zero entries is a success.
+The report names `profile` only when the name resolves to a saved profile.
 
 ```json
 {"ok":true,"data":{"profile":"default","evicted_count":3},"request_id":"..."}
@@ -1011,6 +1012,8 @@ agent relaying a nonce.
   counted in `expired_count` either way).
 - `--output json|table`: envelope JSON (default) or one sanitized row per
   entry with an expires-in countdown.
+
+The report names `profile` only when the name resolves to a saved profile.
 
 ```json
 {"ok":true,"data":{"profile":"default","pending":[{"approval_nonce":"ABCxyzNonce","kind_name":"PaymentSimulated","created_at_unix_ms":1717000000000,"expires_at_unix_ms":1717086400000,"expired":false,"attested":false,"summary":{"kind":"payment","source":"GAQAA5L65LSYH7CQ3VTJ7F3HHLGCL3DSLAR2Y47263D56MNNGHSQSTVY","to":"GDEST...","amount_stroops":"100000000","asset":"XLM","memo":null,"fee_stroops":"100","seq_num":12345}}],"expired_count":0},"request_id":"..."}

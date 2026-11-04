@@ -149,22 +149,6 @@ use crate::common::resolve_profile_name;
 use crate::common::signer_ceremony::MainnetSignerChoice;
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Private helpers
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Redacts the issuer half of an asset string for logging.
-///
-/// For `CODE:ISSUER` form, the issuer is replaced by `redact_strkey_first5_last5`;
-/// bare codes (no colon) and C-strkey SAC addresses are returned as-is.
-fn redact_asset_for_log(asset: &str) -> String {
-    if let Some((code, issuer)) = asset.split_once(':') {
-        format!("{}:{}", code, redact_strkey_first5_last5(issuer))
-    } else {
-        asset.to_owned()
-    }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
 // Argument types
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -343,7 +327,6 @@ where
             tracing::info!(
                 subcommand = "trustline",
                 chain = %chain_id,
-                asset = %redact_asset_for_log(&args.asset),
                 error = %e,
                 "denomination resolver refused trustline"
             );
@@ -1600,7 +1583,7 @@ mod tests {
         assert!(
             matches!(
                 err,
-                stellar_agent_stablecoin::resolve::ResolveError::UsdtRefused { .. }
+                stellar_agent_stablecoin::resolve::ResolveError::UsdtRefused
             ),
             "expected UsdtRefused, got: {err:?}"
         );
@@ -1797,7 +1780,7 @@ mod tests {
                 );
                 init_writer.store(true, Ordering::SeqCst);
                 Err(WalletError::Auth(AuthError::KeyringNotFound {
-                    name: "keyring-order-test-sentinel".to_owned(),
+                    cause: stellar_agent_core::error::KeyringMissingCause::MissingEntry,
                 }))
             },
             &mut std::io::sink(),
@@ -2307,7 +2290,7 @@ mod tests {
                 ),
                 (
                     WalletError::Auth(AuthError::KeyringNotFound {
-                        name: "missing".into(),
+                        cause: stellar_agent_core::error::KeyringMissingCause::MissingEntry,
                     }),
                     "auth.keyring_not_found",
                 ),
@@ -2664,7 +2647,7 @@ mod tests {
                         value["error"]["message"]
                             .as_str()
                             .unwrap()
-                            .contains("profile's per-operation fee")
+                            .contains("classic_fee_per_op_stroops must not exceed")
                     );
                 }
                 if matches!(case, Case::Transport) {

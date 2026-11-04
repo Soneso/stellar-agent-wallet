@@ -104,7 +104,9 @@ use stellar_agent_core::{
     audit_log::tip_anchor::{
         AuditKeyringEntries, KeyedAuditAccess, TipAnchor, TipAnchorStore, TipAnchorStoreError,
     },
-    error::{AuthError, InternalError, NetworkError, ValidationError, WalletError},
+    error::{
+        AuthError, InternalError, KeyringMissingCause, NetworkError, ValidationError, WalletError,
+    },
     observability::redact_strkey_first5_last5,
     profile::schema::{KeyringEntryRef, Profile, check_rpc_credential_value},
 };
@@ -351,8 +353,8 @@ fn open_rpc_credential_entry(entry: &KeyringEntryRef) -> Result<KeyringEntry, Wa
 ///
 /// # Errors
 ///
-/// - [`AuthError::KeyringNotFound`] naming `service/account` when the entry
-///   does not exist; the other keyring codes for store failures.
+/// - [`AuthError::KeyringNotFound`] when the entry does not exist; the other
+///   keyring codes for store failures.
 /// - [`NetworkError::RpcCredentialInvalid`] when the stored value is empty,
 ///   longer than 1024 bytes, or holds a control character.
 pub fn read_rpc_credential(entry: &KeyringEntryRef) -> Result<Zeroizing<String>, WalletError> {
@@ -595,9 +597,8 @@ pub fn load_or_mint_secret_32(
 
 /// Decodes a `URL_SAFE_NO_PAD` secret and checks its 32-byte length.
 fn decode_secret_32(secret_b64: &str) -> Result<Zeroizing<[u8; 32]>, WalletError> {
-    let decoded = Zeroizing::new(URL_SAFE_NO_PAD.decode(secret_b64.as_bytes()).map_err(|e| {
-        // Upstream Display strings are not forwarded to typed errors; debug only.
-        tracing::debug!(error = %e, "chain-root HMAC key base64 decode failed");
+    let decoded = Zeroizing::new(URL_SAFE_NO_PAD.decode(secret_b64.as_bytes()).map_err(|_| {
+        tracing::debug!("chain-root HMAC key base64 decode failed");
         WalletError::Internal(InternalError::UnexpectedState {
             detail: "audit.key_decode_failed: keyring HMAC key is not valid base64".to_owned(),
         })
@@ -1305,13 +1306,7 @@ impl KeyringSignHandle {
         // public key against the cached bytes before signing. The panic-injection
         // hook (test-hooks feature) is placed there to verify that Zeroizing::Drop
         // fires during unwind.
-        sign_payload_verifying_pubkey(
-            s_strkey,
-            payload,
-            &self.cached_pubkey_bytes,
-            &self.entry_ref.service,
-        )
-        .await
+        sign_payload_verifying_pubkey(s_strkey, payload, &self.cached_pubkey_bytes).await
     }
 
     /// Signs a smart-account auth digest using the keyring-stored seed.
@@ -1444,7 +1439,7 @@ pub fn lazy_signer_from_keyring(
     let public_key =
         stellar_strkey::ed25519::PublicKey::from_string(expected_source_g).map_err(|_error| {
             WalletError::Auth(AuthError::SignerKeyMismatch {
-                expected: redact_strkey_first5_last5(expected_source_g),
+                expected: "a G-strkey".to_owned(),
                 got: "invalid public account".to_owned(),
             })
         })?;
@@ -1519,7 +1514,7 @@ pub async fn signer_from_keyring(
     let signer = signer_from_s_strkey(
         s_strkey,
         expected_source_g,
-        SecretStrkeySource::KeyringEntry(&entry_ref.service),
+        SecretStrkeySource::KeyringEntry,
     )
     .await?;
 
@@ -1977,15 +1972,12 @@ async fn sign_payload_verifying_pubkey(
     s_strkey: Zeroizing<String>,
     payload: &[u8; 32],
     expected_pubkey_bytes: &[u8; 32],
-    service: &str,
 ) -> Result<[u8; 64], WalletError> {
-    // Step 2: parse the S-strkey.  Parse-error message names the keyring
-    // service for operator diagnosis (service name is a non-secret alias, not
-    // the secret material).
+    // Step 2: parse the S-strkey.
     let mut private_key =
         stellar_strkey::ed25519::PrivateKey::from_string(&s_strkey).map_err(|_| {
             WalletError::Auth(AuthError::KeyringNotFound {
-                name: format!("keyring entry '{service}' contains an invalid S-strkey"),
+                cause: KeyringMissingCause::InvalidSecret,
             })
         })?;
     // Step 3: copy seed bytes into Zeroizing.
@@ -2933,6 +2925,38 @@ mod tests {
         assert!(lazy_signer_from_keyring(&entry_ref, "not-a-g-strkey").is_err());
     }
 
+    /// A malformed source account gets the fixed text, with no fragment of it.
+    #[test]
+    fn refused_source_account_stays_out_of_the_mismatch() {
+        let entry_ref = KeyringEntryRef::new("stellar-agent-lazy-signer-test", "default");
+        let refused = "credm-the-rest-of-a-malformed-account-mark7";
+        let error = lazy_signer_from_keyring(&entry_ref, refused)
+            .err()
+            .expect("a malformed source account must refuse");
+        assert_eq!(error.code(), "auth.signer_key_mismatch");
+        for fragment in ["credm", "mark7"] {
+            stellar_agent_test_support::rejected_value::assert_no_marker(&error, fragment);
+        }
+    }
+
+    /// A corrupt secret reaches the decode event in no form, and the event
+    /// fires.
+    #[test]
+    fn corrupt_hmac_secret_stays_out_of_the_decode_event() {
+        let logs = stellar_agent_test_support::log_capture::with_captured_trace_logs(|| {
+            assert_eq!(
+                decode_secret_32("~").err().unwrap().code(),
+                "internal.unexpected_state"
+            );
+        });
+        assert!(
+            logs.contains("chain-root HMAC key base64 decode failed"),
+            "{logs}"
+        );
+        assert!(!logs.contains("Invalid symbol"), "{logs}");
+        assert!(!logs.contains("126"), "{logs}");
+    }
+
     // ── Audit-log tip anchor ─────────────────────────────────────────────────
 
     fn audit_ref() -> KeyringEntryRef {
@@ -3539,22 +3563,20 @@ mod tests {
         }
     }
 
-    /// A missing entry reports `auth.keyring_not_found` naming both the
-    /// service and the account, which tell the three roles apart.
+    /// A missing entry reports `auth.keyring_not_found` with the fixed text
+    /// and neither keyring coordinate.
     #[test]
     #[serial_test::serial]
-    fn missing_rpc_credential_names_service_and_account() {
+    fn missing_rpc_credential_holds_no_coordinate() {
         let _restore = RestoreStore::new();
         keyring_mock::install().unwrap();
         let error = read_rpc_credential(&KeyringEntryRef::new("stellar-agent-rpc-unit", "oracle"))
             .err()
             .unwrap();
         assert_eq!(error.code(), "auth.keyring_not_found");
-        assert!(
-            error
-                .to_string()
-                .contains("'stellar-agent-rpc-unit/oracle'"),
-            "{error}"
+        assert_eq!(
+            error.to_string(),
+            "the configured keyring entry must exist; provision or select the required entry."
         );
     }
 

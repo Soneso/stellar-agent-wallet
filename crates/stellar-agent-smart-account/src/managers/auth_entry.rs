@@ -1714,7 +1714,7 @@ pub(crate) async fn resimulate_with_signed_auth(
             phase: "simulate",
             redacted_reason: format!(
                 "re-simulate returned error: {}",
-                crate::managers::rules::augment_with_oz_error_name(sim_error)
+                crate::managers::rules::SimulationErrorClass::of(sim_error)
             ),
         });
     }

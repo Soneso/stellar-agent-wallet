@@ -578,12 +578,22 @@ fn verifier_registry_refusal(
     })
 }
 
+/// Refusal of a verifier registry entry whose address fails the C-strkey
+/// parse. The address stays out because the refusal is for it.
+pub(crate) const VERIFIER_REGISTRY_ADDRESS_INVALID: &str = "verifier registry address must be a \
+     valid Stellar C-strkey; repair the verifier entry in networks.toml";
+
+/// Refusal of an Ed25519 verifier override or registry entry that fails the
+/// C-strkey parse. The address stays out because the refusal is for it.
+pub(crate) const ED25519_VERIFIER_ADDRESS_INVALID: &str = "--signer-ed25519 verifier must be a \
+     valid Stellar C-strkey; supply --verifier or configure the verifier entry in networks.toml";
+
 /// Builds the `WalletError::SmartAccount` envelope an `emit_sa_error` call
 /// would render, with operator-facing filesystem paths under `$HOME` redacted
 /// to `<HOME>/...`.
 ///
 /// Several `SaError` variants embed `path: PathBuf` in their `Display` (e.g.
-/// `NetworksTomlIo`). Without
+/// `AuditWriterIo`). Without
 /// redaction the absolute prefix leaks the operator's home directory and
 /// active profile name through the wire envelope (same class as the
 /// `WalletError::Io.message` path leak handled in [`wallet_io_error`]).
@@ -1222,15 +1232,17 @@ mod tests {
         use std::path::PathBuf;
 
         let home = std::env::var("HOME").expect("HOME is set in test environment");
-        let source = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
         let path = PathBuf::from(format!("{home}/.local/share/stellar-agent/networks.toml"));
-        let sa_err = SaError::NetworksTomlIo { source, path };
+        let sa_err = SaError::AuditWriterIo {
+            detail: "permission denied".to_owned(),
+            path,
+        };
 
         let wallet_err = build_sa_error_envelope(&sa_err);
 
         match wallet_err {
             WalletError::SmartAccount { wire_code, message } => {
-                assert_eq!(wire_code, "sa.networks_toml_io");
+                assert_eq!(wire_code, "sa.audit_writer_io");
                 assert!(
                     message.contains("<HOME>/.local/share/stellar-agent/networks.toml"),
                     "expected <HOME>-redacted path in message: {message}"

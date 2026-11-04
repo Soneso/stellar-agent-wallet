@@ -234,14 +234,7 @@ pub fn decode_payment_response(header: &str) -> Result<SettleResponse, X402Error
 /// ```
 #[must_use]
 pub fn describe_json_error(error: &serde_json::Error) -> String {
-    use serde_json::error::Category;
-    let what = match error.classify() {
-        Category::Syntax => "is not valid JSON",
-        Category::Eof => "ends before the value is complete",
-        Category::Data => "has a missing field or a field of the wrong type or value",
-        Category::Io => "could not be read",
-    };
-    format!("{what} (line {}, column {})", error.line(), error.column())
+    stellar_agent_core::redact::describe_json_error(error)
 }
 
 #[cfg(test)]

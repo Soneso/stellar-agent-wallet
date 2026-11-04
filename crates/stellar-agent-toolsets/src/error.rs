@@ -12,6 +12,12 @@ use crate::sanitise::sanitise_display;
 /// attacker-controlled content.  Strings longer than this are truncated.
 const ECHO_CAP: usize = 256;
 
+/// The rule a capability token fails on a character outside `[a-z0-9-]`.
+///
+/// The manifest parser and the stored-record deserialiser state one text.
+pub(crate) const CAPABILITY_TOKEN_CHARSET_RULE: &str =
+    "capability token must contain only characters from [a-z0-9-]";
+
 /// All distinct reasons a toolset directory can be refused by [`crate::parse_toolset`].
 ///
 /// The set is closed: a match on `ToolsetFormatError` that is exhaustive today will
@@ -77,11 +83,8 @@ pub enum ToolsetFormatError {
     /// Duplicate keys are a common confusion vector: a human reviewer sees one
     /// value while a parser resolves another.  We refuse rather than silently
     /// resolving to first-wins or last-wins.
-    #[error("TOOLSET.md frontmatter has a duplicate mapping key: {}", sanitise_display(.key, ECHO_CAP))]
-    DuplicateKey {
-        /// The key that appeared more than once.
-        key: String,
-    },
+    #[error("TOOLSET.md frontmatter must contain each mapping key only once")]
+    DuplicateKey,
 
     /// A `metadata` key begins with the reserved prefix `stellar-agent-` but is
     /// not a recognised wallet key.
@@ -90,13 +93,9 @@ pub enum ToolsetFormatError {
     /// `stellar-agent-capabilities`.  Any other `stellar-agent-`-prefixed key is
     /// refused to prevent future collision with wallet-defined extensions.
     #[error(
-        "TOOLSET.md metadata key '{}' uses the reserved 'stellar-agent-' prefix",
-        sanitise_display(.key, ECHO_CAP)
+        "TOOLSET.md metadata keys using the 'stellar-agent-' prefix must be recognized wallet keys"
     )]
-    ReservedMetadataKey {
-        /// The offending metadata key.
-        key: String,
-    },
+    ReservedMetadataKey,
 
     /// The `name` field is absent from the frontmatter.
     #[error("TOOLSET.md frontmatter is missing the required 'name' field")]
@@ -132,17 +131,8 @@ pub enum ToolsetFormatError {
     /// Because `name` is constrained to ASCII `[a-z0-9-]` and the comparison is
     /// byte-exact, a unicode-homoglyph directory name (e.g. containing Cyrillic
     /// look-alikes) always fails here rather than matching by visual equivalence.
-    #[error(
-        "TOOLSET.md 'name' ('{}') does not match the toolset directory name ('{}')",
-        sanitise_display(.name, ECHO_CAP),
-        sanitise_display(.dir, ECHO_CAP),
-    )]
-    NameDirMismatch {
-        /// The `name` value from the frontmatter.
-        name: String,
-        /// The actual directory name the toolset was loaded from.
-        dir: String,
-    },
+    #[error("TOOLSET.md 'name' must match the toolset directory name")]
+    NameDirMismatch,
 
     /// The `description` field is absent from the frontmatter.
     #[error("TOOLSET.md frontmatter is missing the required 'description' field")]
@@ -166,14 +156,8 @@ pub enum ToolsetFormatError {
     /// of a recognised or forbidden token can reach the matching step.
     /// `Sign-Transaction`, `SIGN-TRANSACTION`, `sign_transaction`, a tab-padded
     /// token, or a unicode-homoglyph are each refused here.
-    #[error(
-        "capability token '{}' contains a character outside [a-z0-9-]",
-        sanitise_display(.token, ECHO_CAP)
-    )]
-    CapabilityTokenInvalidChar {
-        /// The offending token (sanitised, length-capped).
-        token: String,
-    },
+    #[error("{CAPABILITY_TOKEN_CHARSET_RULE}")]
+    CapabilityTokenInvalidChar,
 
     /// A capability token passed the charset gate but is not in the recognised
     /// taxonomy.
@@ -181,14 +165,8 @@ pub enum ToolsetFormatError {
     /// Unknown tokens are refused rather than silently ignored so that a toolset
     /// author's typo (`reed-balance`) does not silently produce an empty
     /// capability set.
-    #[error(
-        "capability token '{}' is not in the recognised taxonomy",
-        sanitise_display(.token, ECHO_CAP)
-    )]
-    UnknownCapability {
-        /// The unrecognised token (sanitised, length-capped).
-        token: String,
-    },
+    #[error("capability token must name a capability in the recognized taxonomy")]
+    UnknownCapability,
 
     /// The token `sign-transaction` was found in the capability manifest.
     ///
@@ -247,21 +225,21 @@ mod tests {
                 ToolsetFormatError::MalformedFrontmatter { .. } => 5,
                 ToolsetFormatError::YamlAnchorsForbidden => 6,
                 ToolsetFormatError::FrontmatterTooDeep => 7,
-                ToolsetFormatError::DuplicateKey { .. } => 8,
-                ToolsetFormatError::ReservedMetadataKey { .. } => 9,
+                ToolsetFormatError::DuplicateKey => 8,
+                ToolsetFormatError::ReservedMetadataKey => 9,
                 ToolsetFormatError::MissingName => 10,
                 ToolsetFormatError::NameEmpty => 11,
                 ToolsetFormatError::NameTooLong => 12,
                 ToolsetFormatError::NameInvalidChar => 13,
                 ToolsetFormatError::NameLeadingTrailingHyphen => 14,
                 ToolsetFormatError::NameConsecutiveHyphens => 15,
-                ToolsetFormatError::NameDirMismatch { .. } => 16,
+                ToolsetFormatError::NameDirMismatch => 16,
                 ToolsetFormatError::MissingDescription => 17,
                 ToolsetFormatError::DescriptionEmpty => 18,
                 ToolsetFormatError::DescriptionTooLong => 19,
                 ToolsetFormatError::CompatibilityTooLong => 20,
-                ToolsetFormatError::CapabilityTokenInvalidChar { .. } => 21,
-                ToolsetFormatError::UnknownCapability { .. } => 22,
+                ToolsetFormatError::CapabilityTokenInvalidChar => 21,
+                ToolsetFormatError::UnknownCapability => 22,
                 ToolsetFormatError::BareSignTransactionForbidden => 23,
                 ToolsetFormatError::CapabilityManifestMalformed { .. } => 24,
             }
@@ -280,28 +258,21 @@ mod tests {
             },
             ToolsetFormatError::YamlAnchorsForbidden,
             ToolsetFormatError::FrontmatterTooDeep,
-            ToolsetFormatError::DuplicateKey { key: String::new() },
-            ToolsetFormatError::ReservedMetadataKey { key: String::new() },
+            ToolsetFormatError::DuplicateKey,
+            ToolsetFormatError::ReservedMetadataKey,
             ToolsetFormatError::MissingName,
             ToolsetFormatError::NameEmpty,
             ToolsetFormatError::NameTooLong,
             ToolsetFormatError::NameInvalidChar,
             ToolsetFormatError::NameLeadingTrailingHyphen,
             ToolsetFormatError::NameConsecutiveHyphens,
-            ToolsetFormatError::NameDirMismatch {
-                name: String::new(),
-                dir: String::new(),
-            },
+            ToolsetFormatError::NameDirMismatch,
             ToolsetFormatError::MissingDescription,
             ToolsetFormatError::DescriptionEmpty,
             ToolsetFormatError::DescriptionTooLong,
             ToolsetFormatError::CompatibilityTooLong,
-            ToolsetFormatError::CapabilityTokenInvalidChar {
-                token: String::new(),
-            },
-            ToolsetFormatError::UnknownCapability {
-                token: String::new(),
-            },
+            ToolsetFormatError::CapabilityTokenInvalidChar,
+            ToolsetFormatError::UnknownCapability,
             ToolsetFormatError::BareSignTransactionForbidden,
             ToolsetFormatError::CapabilityManifestMalformed {
                 detail: String::new(),

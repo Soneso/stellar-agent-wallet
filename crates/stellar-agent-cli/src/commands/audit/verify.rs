@@ -582,23 +582,17 @@ fn load_audit_hmac_key(
         stellar_agent_network::keyring::AUDIT_KEY_FIELD,
     )?;
     let entry = KeyringEntry::new(&entry_ref.service, &entry_ref.account).map_err(|e| {
-        tracing::debug!(
-            service = %entry_ref.service,
-            "keyring Entry::new failed for audit verify HMAC key"
-        );
+        tracing::debug!("keyring Entry::new failed for audit verify HMAC key");
         map_keyring_operation_error(&e, KeyringOperation::Construct, &entry_ref.service)
     })?;
 
     let secret_b64 = Zeroizing::new(entry.get_password().map_err(|e| {
-        tracing::debug!(
-            service = %entry_ref.service,
-            "get_password failed for audit verify HMAC key"
-        );
+        tracing::debug!("get_password failed for audit verify HMAC key");
         map_keyring_operation_error(&e, KeyringOperation::Read, &entry_ref.service)
     })?);
 
-    let decoded = Zeroizing::new(URL_SAFE_NO_PAD.decode(secret_b64.as_bytes()).map_err(|e| {
-        tracing::debug!(error = %e, "audit verify HMAC key base64 decode failed");
+    let decoded = Zeroizing::new(URL_SAFE_NO_PAD.decode(secret_b64.as_bytes()).map_err(|_| {
+        tracing::debug!("audit verify HMAC key base64 decode failed");
         WalletError::Internal(InternalError::UnexpectedState {
             detail: "audit.key_decode_failed: audit HMAC key is not valid base64".to_owned(),
         })
@@ -688,8 +682,8 @@ fn check_parent_owner(path: &std::path::Path) -> Result<(), String> {
 /// A missing log carries the validation message with its remediation.
 fn verify_failure(err: &VerifyError) -> VerifyFailure {
     match err {
-        VerifyError::LogNotFound { path } => VerifyFailure::Wallet(WalletError::Validation(
-            stellar_agent_core::ValidationError::AuditLogNotFound { path: path.clone() },
+        VerifyError::LogNotFound => VerifyFailure::Wallet(WalletError::Validation(
+            stellar_agent_core::ValidationError::AuditLogNotFound,
         )),
         _ => VerifyFailure::Raw {
             code: err.wire_code(),
@@ -959,6 +953,78 @@ mod tests {
         assert_eq!(err.code(), "auth.keyring_interactive_session_required");
     }
 
+    /// The profile whose audit key sits at a coordinate holding the marker.
+    fn marker_coordinate_profile() -> Profile {
+        let mut profile = Profile::builder_testnet_named(
+            "audit-verify-marker-test",
+            "stellar-agent-signer",
+            "audit-verify-marker-test",
+            "stellar-agent-nonce",
+            "audit-verify-marker-test",
+        )
+        .build();
+        profile.audit_log_hash_chain_key_id =
+            stellar_agent_core::profile::schema::KeyringEntryRef::new("credmarker7", "default");
+        profile
+    }
+
+    /// A failed entry construction emits its event without the keyring
+    /// service, and the refusal holds no service.
+    #[test]
+    #[serial]
+    fn entry_construction_failure_holds_no_service() {
+        let profile = marker_coordinate_profile();
+        keyring_core::unset_default_store();
+        let mut result = None;
+        let logs = stellar_agent_test_support::log_capture::with_captured_trace_logs(|| {
+            result = Some(load_audit_hmac_key(&profile, "test-profile"));
+        });
+        stellar_agent_test_support::keyring_mock::install().ok();
+
+        assert!(
+            logs.contains("keyring Entry::new failed for audit verify HMAC key"),
+            "{logs}"
+        );
+        assert!(!logs.contains("credmarker7"), "{logs}");
+        let Some(Err(err)) = result else {
+            panic!("the load refuses");
+        };
+        assert!(!err.to_string().contains("credmarker7"), "{err}");
+        assert!(!format!("{err:?}").contains("credmarker7"), "{err:?}");
+    }
+
+    /// A stored audit key that is not base64 emits its event without the
+    /// decoder's diagnostic, which quotes the offending byte.
+    #[test]
+    #[serial]
+    fn stored_key_decode_failure_holds_no_decoder_diagnostic() {
+        stellar_agent_test_support::keyring_mock::install().ok();
+        let profile = marker_coordinate_profile();
+        let entry_ref = &profile.audit_log_hash_chain_key_id;
+        KeyringEntry::new(&entry_ref.service, &entry_ref.account)
+            .unwrap()
+            .set_password("~")
+            .unwrap();
+        let mut result = None;
+        let logs = stellar_agent_test_support::log_capture::with_captured_trace_logs(|| {
+            result = Some(load_audit_hmac_key(&profile, "test-profile"));
+        });
+
+        assert!(
+            logs.contains("audit verify HMAC key base64 decode failed"),
+            "{logs}"
+        );
+        assert!(!logs.contains("Invalid symbol"), "{logs}");
+        let Some(Err(err)) = result else {
+            panic!("the load refuses");
+        };
+        assert_eq!(
+            err.to_string(),
+            "unexpected internal state: audit.key_decode_failed: audit HMAC key is not valid \
+             base64"
+        );
+    }
+
     /// A platform-store failure at the audit-key coordinates must surface as
     /// `auth.keyring_platform_error`, not `auth.keyring_not_found`.
     #[test]
@@ -1054,9 +1120,7 @@ mod tests {
                 "audit.too_many_rotated_files",
             ),
             (
-                VerifyError::NonRegularFileLogPath {
-                    path: "f.jsonl".into(),
-                },
+                VerifyError::NonRegularFileLogPath,
                 "audit.non_regular_file_log_path",
             ),
             (
@@ -1072,12 +1136,7 @@ mod tests {
                 },
                 "audit.path_contract",
             ),
-            (
-                VerifyError::LogNotFound {
-                    path: "/tmp/audit.jsonl".to_owned(),
-                },
-                "audit.log_not_found",
-            ),
+            (VerifyError::LogNotFound, "audit.log_not_found"),
             (
                 VerifyError::Io(std::io::Error::other("read failed")),
                 "audit.io_error",
@@ -1135,7 +1194,7 @@ mod tests {
                     );
                     assert_eq!(
                         error.message(),
-                        "audit log not found at /tmp/audit.jsonl; nothing has been written to the audit log yet, or the log path is incorrect"
+                        "log_path must name an existing audit log file; choose an existing file and retry audit verify."
                     );
                 }
             }
@@ -1178,9 +1237,7 @@ mod tests {
     /// `audit.log_not_found` code and an actionable, single-prefix message.
     #[test]
     fn verify_failure_log_not_found_is_validation_class() {
-        let err = VerifyError::LogNotFound {
-            path: "/tmp/audit.jsonl".to_owned(),
-        };
+        let err = VerifyError::LogNotFound;
         let VerifyFailure::Wallet(we) = verify_failure(&err) else {
             panic!("missing log has a validation error");
         };
@@ -1193,14 +1250,11 @@ mod tests {
             "audit.log_not_found",
             "envelope code must be audit.log_not_found"
         );
-        let message = we.message();
-        assert!(
-            message.contains("/tmp/audit.jsonl"),
-            "message must name the missing path: {message}"
-        );
-        assert!(
-            !message.contains("audit.log_not_found:"),
-            "the code is the envelope code field, not a message prefix: {message}"
+        assert_eq!(
+            we.message(),
+            "log_path must name an existing audit log file; choose an existing file and retry \
+             audit verify.",
+            "the code is the envelope code field, not a message prefix"
         );
     }
 

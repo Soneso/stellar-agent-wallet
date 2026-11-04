@@ -60,7 +60,9 @@ use stellar_agent_smart_account::managers::signers::build_external_signer_scval;
 use tracing::info;
 use uuid::Uuid;
 
-use crate::commands::smart_account::common::open_verifier_registry;
+use crate::commands::smart_account::common::{
+    ED25519_VERIFIER_ADDRESS_INVALID, VERIFIER_REGISTRY_ADDRESS_INVALID, open_verifier_registry,
+};
 use crate::common::network::{
     EndpointFlags, EndpointUrlFlag, TargetNetwork, network_context_for_command,
 };
@@ -589,11 +591,7 @@ fn open_profile_audit_writer_via_registry(
     )?;
     AuditWriterRegistry::get_or_open_keyed(profile_name, &profile.audit_log_path, access).map_err(
         |e| {
-            tracing::debug!(
-                error = %e,
-                path = %profile.audit_log_path.display(),
-                "deploy-c audit writer open failed"
-            );
+            tracing::debug!(error = %e, "deploy-c audit writer open failed");
             WalletError::Internal(InternalError::UnexpectedState {
                 detail: format!("audit.writer_open_failed: {e}"),
             })
@@ -646,10 +644,7 @@ async fn resolve_genesis_signer_source(
             parse_c_strkey_to_smart_account(&verifier_entry.address).map_err(|e| {
                 WalletError::SmartAccount {
                     wire_code: e.wire_code(),
-                    message: format!(
-                        "verifier registry address '{}' is not a valid C-strkey: {e}",
-                        verifier_entry.address
-                    ),
+                    message: VERIFIER_REGISTRY_ADDRESS_INVALID.to_owned(),
                 }
             })?;
 
@@ -740,7 +735,7 @@ async fn resolve_genesis_signer_source(
             parse_c_strkey_to_smart_account(&verifier_c_strkey).map_err(|e| {
                 WalletError::SmartAccount {
                     wire_code: e.wire_code(),
-                    message: format!("--signer-ed25519 verifier '{verifier_c_strkey}': {e}"),
+                    message: ED25519_VERIFIER_ADDRESS_INVALID.to_owned(),
                 }
             })?;
         let scval = build_external_signer_scval(verifier_sc_addr, &key_data).map_err(|e| {
