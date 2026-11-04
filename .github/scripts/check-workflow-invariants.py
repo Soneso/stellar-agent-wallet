@@ -71,7 +71,8 @@ and comment lines skipped. The check fails when any of these holds:
   expression other than ``github.action_path``.
 - ``publish-tag-ref``: a ``publish.yml`` checkout uses a ref other than
   ``refs/tags/...`` or ``github.workflow_sha``, or a ``publish.yml`` job has
-  no ``refs/tags/`` checkout.
+  no ``refs/tags/`` checkout. The step-less ``vendored-wasm`` workflow call
+  is exempt; ``publish-wasm-gate`` governs it.
 - ``ancestry-check``: the ``release.yml`` preflight or a ``publish.yml`` job
   has no line whose first word is the path of ``check-ref-on-main.sh`` and
   that holds no shell operator. The step of that line sets ``if`` or
@@ -154,7 +155,8 @@ runs the function.
   ``vendored-wasm`` workflow call without inputs or secrets, or ``hashes``
   or ``publish`` does not need it, so signing, provenance, and publication
   wait for the rebuild. The called workflow must declare ``workflow_call``.
-  Its cache guards must lead with ``github.ref_type != 'tag'``; its rebuild
+  Its cache guards must lead with
+  ``github.ref_type != 'tag' && !inputs.publication``; its rebuild
   must read both stellar-cli artifacts of its own run and use no cache. No
   job or step of it sets ``continue-on-error``, and no step of ``check``,
   ``rebuild``, or ``vendored-wasm`` suppresses a failure as for
@@ -163,6 +165,13 @@ runs the function.
   unconditionally. The ``vendored-wasm`` job runs on ``always()``, needs
   exactly ``WASM_GATE_NEEDS``, and has one unconditional gate step that runs
   ``WASM_GATE_CALL`` with ``WASM_GATE_ENV``.
+- ``publish-wasm-gate``: crate publication must need verification and a local
+  Wasm workflow call for the verified source SHA with publication enabled.
+  The call needs only verification, holds no secrets, and cannot continue on
+  error. Both jobs run exactly on ``${{ !inputs.verify_only }}``. The reusable
+  workflow declares the source and publication inputs, checks out that source
+  in each repository job, validates the publication checkout in its decide
+  step, and excludes publication runs from every cache.
 - ``release-vars``: an expression reads the ``vars`` context in
   ``release.yml``, in a local reusable workflow it calls, or in the
   ``action.yml`` of a local action it uses, followed through every local
@@ -217,7 +226,7 @@ WASM_GATE_ENV = {
     "CLI25": "${{ needs.stellar-cli-25.result }}",
     "CLI28": "${{ needs.stellar-cli-28.result }}",
     "REBUILD_JOB": "${{ needs.rebuild.result }}",
-    "REF_TYPE": "${{ github.ref_type }}",
+    "REF_TYPE": "${{ inputs.publication && 'publication' || github.ref_type }}",
 }
 WASM_REBUILD_CONDITION = "needs.check.outputs.rebuild == 'true'"
 WASM_FULL_MODE = "rebuild-vendored-wasm.sh --repo-root"
@@ -289,9 +298,10 @@ PACKAGE_CHECKS = {
 INSTALL_CHECK = ('bash "$GITHUB_WORKSPACE/wf/.github/scripts/release/verify-install.sh" "$TAG" '
                  '"$EXPECTED_MAINNET_WRITE"')
 TOOLCHAIN_PIN = 'echo "RUSTUP_TOOLCHAIN=$RELEASE_TOOLCHAIN" >> "$GITHUB_ENV"'
+VERIFIED_SOURCE_CHECK = '[ "$(git -C src rev-parse HEAD)" = "$VERIFIED_SHA" ]'
 # The release checks, which no condition may skip and no command may ignore.
 GUARDED_JOBS = {"release.yml": ("verify-packaged", "verify-provenance", "hashes", "publish"),
-                "publish.yml": ("verify", "publish", "verify-install"),
+                "publish.yml": ("verify", "vendored-wasm", "publish", "verify-install"),
                 "release-rehearsal.yml": ("verify-packaged", "verify-crates")}
 # The verification jobs, which hold no credential.
 VERIFY_JOBS = (("release.yml", "verify-packaged"), ("release.yml", "verify-provenance"),
@@ -355,7 +365,7 @@ CREDENTIAL_GUARDS = {
     ("release.yml", "sign-macos"): (SIGNING_ACTION, ("validate-input.sh", CLEAN_CHECK), "validate-input.sh"),
     ("notarize-smoke.yml", "sign"): (SIGNING_ACTION, ("validate-input.sh", CLEAN_CHECK), "validate-input.sh"),
     ("publish.yml", "publish"): ("rust-lang/crates-io-auth-action", (
-        "check-ref-on-main.sh", "compare-crate-sums.py", CLEAN_CHECK, "rustc -V"), "compare-crate-sums.py"),
+        "check-ref-on-main.sh", "compare-crate-sums.py", CLEAN_CHECK, "rustc -V", VERIFIED_SOURCE_CHECK), "compare-crate-sums.py"),
 }
 
 RUNNER_TEMP_PATH = re.compile(r"^\$\{\{\s*runner\.temp\s*\}\}(/|$)")
@@ -712,7 +722,7 @@ class Checker:
 
         if (workflow, job_id) in CREDENTIAL_GUARDS:
             self.check_credential_order(where, job, steps, *CREDENTIAL_GUARDS[(workflow, job_id)])
-        if workflow == "publish.yml" and tag_checkouts == 0:
+        if workflow == "publish.yml" and tag_checkouts == 0 and job_id != "vendored-wasm":
             self.report(where, "publish-tag-ref", "no checkout of refs/tags/...")
         if (workflow, job_id) in ANCESTRY_JOBS:
             if not ancestry_calls:
@@ -976,6 +986,7 @@ class Checker:
             self.report(str(BUILD_SCRIPT), "release-shared-scripts", "environment guard is not the first build action")
 
     def check_release_gates(self):
+        self.check_publish_wasm_gate()
         self.needs("release.yml", "hashes", "verify-packaged", "release-packaged-gate")
         for dependency in ("preflight", "build", "sign-macos"):
             self.needs("release.yml", "verify-packaged", dependency, "release-packaged-gate")
@@ -1012,7 +1023,7 @@ class Checker:
                 if job is None:
                     self.report(workflow, "release-check-unconditional", f"missing {name}")
                     continue
-                allowed = workflow == "publish.yml" and name == "publish"
+                allowed = workflow == "publish.yml" and name in ("publish", "vendored-wasm")
                 condition = str(job.get("if", "")).strip()
                 if "continue-on-error" in job or ("if" in job and not (allowed and condition == "${{ !inputs.verify_only }}")):
                     self.report(workflow, "release-check-unconditional", f"{name} can be bypassed")
@@ -1074,6 +1085,51 @@ class Checker:
                     if SETUP_ACTION.match(uses) and any(str(key).lower() == "cache" for key in inputs):
                         self.report(f"{workflow}:{name}", "release-cache", f"passes a cache input to {uses}")
 
+    def check_publish_wasm_gate(self):
+        rule = "publish-wasm-gate"
+        workflow = "publish.yml"
+        publish = self.job(workflow, "publish") or {}
+        if not {"verify", "vendored-wasm"}.issubset(publish.get("needs", [])):
+            self.report(workflow, rule, "publish must need verify and vendored-wasm")
+        call = self.job(workflow, "vendored-wasm") or {}
+        if call.get("uses") != "./.github/workflows/vendored-wasm.yml":
+            self.report(workflow, rule, "vendored-wasm must call the local workflow")
+        if call.get("needs") not in ("verify", ["verify"]):
+            self.report(workflow, rule, "vendored-wasm must need exactly verify")
+        for name, job in (("publish", publish), ("vendored-wasm", call)):
+            if job.get("if") != "${{ !inputs.verify_only }}":
+                self.report(workflow, rule, f"{name} must run exactly on !inputs.verify_only")
+        if call.get("with") != {"source_sha": "${{ needs.verify.outputs.sha }}", "publication": True}:
+            self.report(workflow, rule, "vendored-wasm must pass exactly the verified source SHA and publication: true")
+        if any(key in call for key in ("secrets", "continue-on-error")):
+            self.report(workflow, rule, "vendored-wasm must set no secrets or continue-on-error")
+        workflow = "vendored-wasm.yml"
+        doc = self.docs.get(workflow, {})
+        triggers = doc.get("on", doc.get(True)) or {}
+        inputs = ((triggers.get("workflow_call") or {}).get("inputs") or {}) if isinstance(triggers, dict) else {}
+        for name, kind, default in (("source_sha", "string", ""), ("publication", "boolean", False)):
+            if inputs.get(name) != {"type": kind, "required": False, "default": default}:
+                self.report(workflow, rule, f"workflow_call must declare optional {name} with its type and default")
+        for name in ("check", "rebuild", "vendored-wasm"):
+            steps = (self.job(workflow, name) or {}).get("steps", [])
+            checkouts = [step for step in steps if str(step.get("uses", "")).startswith("actions/checkout@")]
+            if not checkouts or any((step.get("with") or {}).get("ref") != "${{ inputs.source_sha }}" for step in checkouts):
+                self.report(workflow, rule, f"{name} checkout must use inputs.source_sha")
+        steps = (self.job(workflow, "check") or {}).get("steps", [])
+        decide = next((step for step in steps if step.get("id") == "decide"), {})
+        env = decide.get("env") or {}
+        if env.get("PUBLICATION") != "${{ inputs.publication }}" or env.get("SOURCE_SHA") != "${{ inputs.source_sha }}":
+            self.report(workflow, rule, "decide must read PUBLICATION and SOURCE_SHA from inputs")
+        if '[ "$(git rev-parse HEAD)" != "$SOURCE_SHA" ]' not in self.run_text(decide):
+            self.report(workflow, rule, "decide must compare HEAD with SOURCE_SHA")
+        for name, job in (doc.get("jobs") or {}).items():
+            for step in job.get("steps", []):
+                if CACHE_ACTION.match(step.get("uses") or ""):
+                    guard = "github.ref_type != 'tag' && !inputs.publication"
+                    condition = self.unwrap_expression(step.get("if", ""))
+                    if condition != guard and not condition.startswith(guard + " && "):
+                        self.report(f"{workflow}:{name}", rule, f"cache guard must lead with {guard}")
+
     def check_release_wasm_gate(self):
         rule = "release-wasm-gate"
         job = self.job("release.yml", "vendored-wasm") or {}
@@ -1101,9 +1157,9 @@ class Checker:
                 if name == "rebuild":
                     self.report(where, rule, "rebuild uses a cache")
                 condition = self.unwrap_expression(step.get("if", ""))
-                guard = "github.ref_type != 'tag'"
+                guard = "github.ref_type != 'tag' && !inputs.publication"
                 if condition != guard and not condition.startswith(guard + " && "):
-                    self.report(where, rule, "cache guard must lead with github.ref_type != 'tag'")
+                    self.report(where, rule, f"cache guard must lead with {guard}")
         self.check_wasm_rebuild(workflow, rule)
         self.check_wasm_gate_job(workflow, rule)
 

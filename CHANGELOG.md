@@ -610,6 +610,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- Crate publication rebuilds every vendored contract Wasm file of the published
+  commit from its pinned source with the pinned tools and compares the bytes
+  before the registry credential is requested. A failed, cancelled or skipped
+  rebuild stops the publication, and the publish job refuses a tag that moved
+  after verification.
 - Mainnet `pay`, `claim` and `accounts create` refuse `--secret-env` with
   `validation.mainnet_secret_env_refused` before the write context, any
   keyring read or any request, and sign with the enrolled seed in the keyring
