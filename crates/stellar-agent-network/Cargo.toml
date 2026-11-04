@@ -118,6 +118,10 @@ dbus-secret-service-keyring-store = { workspace = true, features = ["crypto-rust
 windows-native-keyring-store = { workspace = true }
 
 [dev-dependencies]
+# Path-only self-reference: enables this crate's own test helpers for its
+# integration tests, which build window-store fixtures at explicit paths.
+# Naming no version, it is stripped from the published manifest.
+stellar-agent-network = { path = ".", features = ["test-helpers"] }
 stellar-agent-core = { path = "../stellar-agent-core", features = ["test-helpers"] }
 syn = { workspace = true, features = ["visit"] }
 proc-macro2 = { workspace = true, features = ["span-locations"] }

@@ -40,7 +40,7 @@ stellar-agent-sep5  = { workspace = true }
 tokio                      = { workspace = true, features = ["rt-multi-thread", "macros", "time", "test-util"] }
 stellar-agent-test-support = { path = "../stellar-agent-test-support", features = ["test-helpers"] }
 stellar-xdr                = { workspace = true }
-stellar-agent-network = { path = "../stellar-agent-network" }
+stellar-agent-network = { path = "../stellar-agent-network", features = ["test-helpers"] }
 wiremock                   = { workspace = true }
 tempfile                   = { workspace = true }
 serial_test                = { workspace = true }

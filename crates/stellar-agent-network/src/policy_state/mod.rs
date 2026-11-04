@@ -162,10 +162,12 @@
 //!
 //! # Concurrency
 //!
-//! [`lock::WindowStoreLock`] — an OFD-advisory exclusive flock at
-//! `<store-file>.lock`, mirroring [`crate::counterparty::lock::CacheLock`] —
-//! serialises every read-modify-write against the file (record, reset,
-//! resign, and every authorization transition). It lives in
+//! [`lock::WindowStoreLock`] is an OFD-advisory exclusive lock on a file in the
+//! policy-state directory named by the window-state keyring entry, because the
+//! HMAC key, the generation commitment, and the policy pin are named by that
+//! entry. It serialises every read-modify-write (record, reset, resign, and
+//! every authorization transition) across every store handle over the entry,
+//! whatever store path a handle names. It lives in
 //! [`stellar_agent_core::policy::state_lock`] and is re-exported here, so the
 //! policy pin of [`stellar_agent_core::policy::pin`] is read, written, and
 //! compared under the same guard. [`load_into`](PersistedWindowStore::load_into) does not take the

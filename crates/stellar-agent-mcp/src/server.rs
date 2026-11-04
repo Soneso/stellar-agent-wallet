@@ -648,7 +648,7 @@ pub struct WalletServer {
     pub(crate) selection: Option<stellar_agent_core::profile::name::ResolvedProfileName>,
     pub(crate) profiles_dir: Option<PathBuf>,
     pub(crate) policy_path: Option<PathBuf>,
-    pub(crate) window_path: PathBuf,
+    pub(crate) window_store: stellar_agent_network::policy_state::PersistedWindowStore,
     pub(crate) owner_source: stellar_agent_core::policy::v1::verified::OwnerKeySource,
     /// Tool registry built from `#[mcp_tool_item]` attributes at startup.
     ///
@@ -937,7 +937,7 @@ impl WalletServer {
         .map_err(|e| BuildRegistryError::NonceMintInit {
             detail: e.to_string(),
         })?;
-        let window_path = stellar_agent_core::profile::schema::default_policy_window_state_path_for(
+        let window_store = stellar_agent_network::policy_state::PersistedWindowStore::for_profile(
             &stellar_agent_core::profile::name::profile_name_for_approval(&profile),
         );
 
@@ -956,7 +956,7 @@ impl WalletServer {
             selection: resolved,
             profiles_dir: selection.map(|(_, dir)| dir.to_path_buf()),
             policy_path,
-            window_path,
+            window_store,
             owner_source: stellar_agent_core::policy::v1::verified::OwnerKeySource::Keyring,
             tool_registry,
             tool_catalogue,
@@ -1761,7 +1761,7 @@ impl WalletServer {
                 profile_name: &selection.name,
                 owner_pubkey: &owner,
                 owner_source: self.owner_source,
-                window_path: &self.window_path,
+                window_path: self.window_store.path(),
             },
             PolicyStateStore::new(),
             PinMode::CompareOnly,

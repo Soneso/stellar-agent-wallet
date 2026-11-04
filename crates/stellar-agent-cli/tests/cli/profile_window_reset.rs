@@ -151,6 +151,13 @@ impl Fixture {
         );
     }
 
+    fn window_lock(&self) -> PathBuf {
+        stellar_agent_core::policy::state_lock::window_lock_path(
+            &self.path,
+            &self.profile.policy_window_state_key_id,
+        )
+    }
+
     fn pin(&self, seed: [u8; 32]) {
         use stellar_agent_core::policy::{
             pin::{self, Pin, PinScope},
@@ -189,7 +196,7 @@ impl Fixture {
         for (audit, window) in [(false, false), (true, false), (false, true), (true, true)] {
             let before = self.state();
             let _audit = audit.then(|| lock(&sidecar(&self.profile.audit_log_path, ".lock")));
-            let _window = window.then(|| lock(&sidecar(&self.path, ".lock")));
+            let _window = window.then(|| lock(&self.window_lock()));
             let mut command = self.command("repair");
             command
                 .args(["--owner-secret-env", "RESET_OWNER_SEED"])
@@ -317,7 +324,7 @@ fn both_locks_refuse_with_the_audit_code_first() {
     let f = Fixture::new(true);
     let before = f.state();
     let _audit = lock(&sidecar(&f.profile.audit_log_path, ".lock"));
-    let _window = lock(&sidecar(&f.path, ".lock"));
+    let _window = lock(&f.window_lock());
     let output = f.run();
     assert_eq!(
         output["error"]["code"], "audit.chain_key_unavailable",

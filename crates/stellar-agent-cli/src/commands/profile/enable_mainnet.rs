@@ -58,8 +58,7 @@ use stellar_agent_core::{
         name::ProfileNameSource,
         owner_key::decode_owner_public_key,
         schema::{
-            KeyringEntryRef, PolicyEngineKind, Profile, default_policy_dir,
-            default_policy_window_state_path_for, default_profile_dir,
+            KeyringEntryRef, PolicyEngineKind, Profile, default_policy_dir, default_profile_dir,
             mainnet_enablement_entry_ref,
         },
         signer_identity::enrolled_signer_pin,
@@ -220,7 +219,7 @@ fn run_with_keyring(
             &profile,
             &profile_dir,
             &policy_path,
-            &default_policy_window_state_path_for(name),
+            &PersistedWindowStore::for_profile(name),
             |entry| {
                 emit_value_audit_row_strict(&profile, name, BindingCheck::Enforce, entry)
                     .map_err(|e| (e.code(), e.to_string()))
@@ -261,7 +260,7 @@ pub(super) fn execute(
     profile: &Profile,
     profile_dir: &Path,
     policy_path: &Path,
-    window_path: &Path,
+    window: &PersistedWindowStore,
     emit: impl FnOnce(AuditEntry) -> Result<(), Failure>,
     write_policy: impl FnOnce(&Path, &str) -> std::io::Result<()>,
 ) -> Result<serde_json::Value, Failure> {
@@ -363,7 +362,7 @@ pub(super) fn execute(
     );
     if args.check {
         let state = PolicyStateStore::new();
-        let inspection = PersistedWindowStore::at_path(window_path.to_path_buf())
+        let inspection = window
             .load_into(name, profile, &state)
             .map_err(|e| e.to_string())
             .and_then(|()| owner.clone())
@@ -375,7 +374,7 @@ pub(super) fn execute(
                         profile_name: name,
                         owner_pubkey: &owner,
                         owner_source: OwnerKeySource::Keyring,
-                        window_path,
+                        window_path: window.path(),
                     },
                     state,
                 )
@@ -404,7 +403,7 @@ pub(super) fn execute(
         .map_err(|_| precondition("nonce"))?;
     let exists = has_enablement_nonce(profile).map_err(|_| precondition("nonce unreadable"))?;
     if exists {
-        refuse_absent_pin(name, profile, window_path, &coordinate)?;
+        refuse_absent_pin(name, profile, window.path(), &coordinate)?;
     }
     if exists && !args.rotate {
         return Err((
@@ -423,7 +422,7 @@ pub(super) fn execute(
     let nonce = zeroize::Zeroizing::new(stellar_agent_core::hex::encode(random.as_ref()));
     let digest = stellar_agent_core::hex::encode(&sha2::Sha256::digest(nonce.as_bytes()));
     let rewritten = rewrite_policy(&body, name, &host, &digest, args.rotate)?;
-    ensure_policy_pin(name, profile, policy_path, window_path)?;
+    ensure_policy_pin(name, profile, policy_path, window.path())?;
     let mut audit = AuditEntry::new_tool_invocation(NewToolInvocation::new(
         "mainnet_enablement_minted",
         "stellar:mainnet",
@@ -500,11 +499,7 @@ fn refuse_absent_pin(
     if pin_entry {
         return Err((
             PolicyError::PinAbsent.wire_code(),
-            format!(
-                "the policy-state lock file of profile '{name}' is missing, so its policy pin \
-                 cannot be read; a command that builds the V1 policy engine recreates the lock \
-                 file, and this command can run after it; nothing was written"
-            ),
+            missing_pin_lock_detail(name),
         ));
     }
     Err((
@@ -518,6 +513,15 @@ fn refuse_absent_pin(
             nonce.service, nonce.account
         ),
     ))
+}
+
+/// The cause and recovery when a pin entry exists without its lock file.
+fn missing_pin_lock_detail(name: &str) -> String {
+    format!(
+        "the policy-state lock file of profile '{name}' is missing, so its policy pin \
+         cannot be read; a command that builds the V1 policy engine recreates the lock \
+         file, and this command can run after it; nothing was written"
+    )
 }
 
 /// Preserves an existing pin, or establishes one from the installed signed
@@ -617,10 +621,31 @@ fn inspection_checks(
             Status::Failed,
             Some(format!("{failure}; pinned sequence {}", pin.sequence())),
         ),
-        (_, Some(failure)) => check("pin", Status::Failed, Some(failure)),
-        (Some(PinState::Absent), None) => {
-            check("pin", Status::Passed, Some("absent (first use)".into()))
+        (Some(PinState::Absent), failure) => {
+            match stellar_agent_core::policy::pin::entry_present(
+                &profile.policy_window_state_key_id,
+            ) {
+                Ok(true) => check(
+                    "pin",
+                    Status::Failed,
+                    Some(format!(
+                        "{}: {}",
+                        PolicyError::PinAbsent.wire_code(),
+                        missing_pin_lock_detail(name)
+                    )),
+                ),
+                Ok(false) => match failure {
+                    Some(failure) => check("pin", Status::Failed, Some(failure)),
+                    None => check("pin", Status::Passed, Some("absent (first use)".into())),
+                },
+                Err(error) => check(
+                    "pin",
+                    Status::Failed,
+                    Some(policy_failure(&PolicyError::from(error))),
+                ),
+            }
         }
+        (None, Some(failure)) => check("pin", Status::Failed, Some(failure)),
         (Some(PinState::Present(pin)), None) => check(
             "pin",
             Status::Passed,
@@ -918,7 +943,7 @@ mod tests {
                 &self.profile,
                 &self.dir.path().join("profiles"),
                 &self.path(),
-                &self.window,
+                &PersistedWindowStore::at_path(self.window.clone()),
                 emit,
                 write_policy,
             )
@@ -1292,6 +1317,104 @@ mod tests {
             assert_eq!(fixture.listing(), listing, "{window}");
         }
     }
+
+    #[test]
+    #[serial]
+    fn check_reports_a_missing_lock_for_a_present_pin_with_or_without_a_nonce() {
+        use stellar_agent_core::policy::state_lock::window_lock_path;
+        for nonce_present in [true, false] {
+            let mut fixture = Fixture::new();
+            fixture.run().unwrap();
+            fixture.sign_rewritten_and_verify(2);
+            let pin = stellar_agent_core::profile::schema::policy_pin_entry_ref(
+                &fixture.profile.policy_window_state_key_id,
+            );
+            let stored_pin = get(&pin).unwrap();
+            std::fs::remove_file(window_lock_path(
+                &fixture.window,
+                &fixture.profile.policy_window_state_key_id,
+            ))
+            .unwrap();
+            let (code, remedy) = refuse_absent_pin(
+                "operator",
+                &fixture.profile,
+                &fixture.window,
+                &fixture.nonce_ref(),
+            )
+            .unwrap_err();
+            if !nonce_present {
+                let nonce = fixture.nonce_ref();
+                keyring_core::Entry::new(&nonce.service, &nonce.account)
+                    .unwrap()
+                    .delete_credential()
+                    .unwrap();
+            }
+            let nonce = get(&fixture.nonce_ref());
+            let policy = std::fs::read(fixture.path()).unwrap();
+            let audit = std::fs::read(fixture.dir.path().join("audit.jsonl")).unwrap();
+            let listing = fixture.listing();
+            fixture.args.check = true;
+            let output = fixture.run().unwrap();
+            assert_eq!(output["valid"], false);
+            let (status, detail) = check_of(&output, "pin");
+            assert_eq!(status, "failed", "nonce present: {nonce_present}");
+            let detail = detail.unwrap();
+            assert_eq!(detail, format!("{code}: {remedy}"));
+            assert!(detail.contains("policy-state lock file of profile 'operator' is missing"));
+            assert!(!detail.contains("remove"));
+            assert!(!detail.contains("nonce"));
+            assert_ne!(detail, "absent (first use)");
+            assert_eq!(get(&fixture.nonce_ref()), nonce);
+            assert_eq!(get(&pin), Some(stored_pin));
+            assert_eq!(std::fs::read(fixture.path()).unwrap(), policy);
+            assert_eq!(
+                std::fs::read(fixture.dir.path().join("audit.jsonl")).unwrap(),
+                audit
+            );
+            assert_eq!(fixture.listing(), listing);
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn check_reports_an_unreadable_pin_when_its_lock_is_missing() {
+        use stellar_agent_core::policy::state_lock::window_lock_path;
+        for nonce_present in [true, false] {
+            let mut fixture = Fixture::new();
+            fixture.run().unwrap();
+            fixture.sign_rewritten_and_verify(2);
+            std::fs::remove_file(window_lock_path(
+                &fixture.window,
+                &fixture.profile.policy_window_state_key_id,
+            ))
+            .unwrap();
+            if !nonce_present {
+                let nonce = fixture.nonce_ref();
+                keyring_core::Entry::new(&nonce.service, &nonce.account)
+                    .unwrap()
+                    .delete_credential()
+                    .unwrap();
+            }
+            let pin = stellar_agent_core::profile::schema::policy_pin_entry_ref(
+                &fixture.profile.policy_window_state_key_id,
+            );
+            keyring_mock::inject_error(
+                &pin.service,
+                &pin.account,
+                keyring_core::Error::BadStoreFormat("injected read failure".into()),
+            )
+            .unwrap();
+            fixture.args.check = true;
+            let output = fixture.run().unwrap();
+            assert_eq!(output["valid"], false);
+            let (status, detail) = check_of(&output, "pin");
+            assert_eq!(status, "failed", "nonce present: {nonce_present}");
+            let detail = detail.unwrap();
+            assert!(detail.starts_with("policy.pin_unusable:"), "{detail}");
+            assert!(!detail.contains("absent (first use)"));
+        }
+    }
+
     #[test]
     #[serial]
     fn first_enablement_refuses_a_v1_or_unsigned_policy_and_writes_nothing() {
@@ -1362,7 +1485,11 @@ mod tests {
                 .delete_credential()
                 .unwrap();
             if missing == "pin_and_lock" {
-                std::fs::remove_file(window_lock_path(&fixture.window)).unwrap();
+                std::fs::remove_file(window_lock_path(
+                    &fixture.window,
+                    &fixture.profile.policy_window_state_key_id,
+                ))
+                .unwrap();
             }
             let nonce = get(&fixture.nonce_ref()).unwrap();
             let policy = std::fs::read(fixture.path()).unwrap();
@@ -1404,7 +1531,11 @@ mod tests {
             &fixture.profile.policy_window_state_key_id,
         );
         let stored_pin = get(&pin).unwrap();
-        std::fs::remove_file(window_lock_path(&fixture.window)).unwrap();
+        std::fs::remove_file(window_lock_path(
+            &fixture.window,
+            &fixture.profile.policy_window_state_key_id,
+        ))
+        .unwrap();
         let nonce = get(&fixture.nonce_ref()).unwrap();
         let policy = std::fs::read(fixture.path()).unwrap();
         let audit = std::fs::read(fixture.dir.path().join("audit.jsonl")).unwrap();
@@ -1443,7 +1574,10 @@ mod tests {
             PinMode::Advance,
         )
         .unwrap();
-        assert!(window_lock_path(&fixture.window).exists());
+        assert!(
+            window_lock_path(&fixture.window, &fixture.profile.policy_window_state_key_id,)
+                .exists()
+        );
         assert_eq!(fixture.pin(), pinned);
         assert_eq!(get(&fixture.nonce_ref()), Some(nonce));
     }
@@ -2193,7 +2327,7 @@ mod tests {
                 &fixture.profile,
                 fixture.dir.path(),
                 &fixture.path(),
-                &fixture.window,
+                &PersistedWindowStore::at_path(fixture.window.clone()),
                 |_| Ok(()),
                 atomic_write_string,
             )

@@ -610,6 +610,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A payee that omits `expires` from an MPP challenge or sets it more than six
   minutes ahead is not supported. `stellar_agent_mpp::limits::MAX_CHALLENGE_LIFETIME_SECS`
   is 360 seconds.
+- The policy window-state lock file is `policy-state-<digest>.lock` in the
+  policy-state directory; stop every wallet process before upgrading, so no
+  process of an earlier build holds the earlier lock file. `window_lock_path`
+  takes the keyring entry; `PersistedWindowStore::at_path` and
+  `WindowStoreLock::acquire` require the `test-helpers` feature;
+  `PersistedWindowStore::resign` takes the profile; `PersistedWindowStore::path`
+  is public.
 
 ### Removed
 
@@ -1002,6 +1009,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   A state reset or a prune therefore refuses every challenge whose replay record
   it may have lost for as long as an authorization for it can be live. The
   refusal names the replay horizon and asks for a fresh challenge.
+- Every change to a profile's policy window state and policy pin takes one
+  lock named by the window-state keyring entry, so store handles that share an
+  entry serialize and one approval cannot mint two authorizations through two
+  store paths.
 
 ## [0.1.0-alpha.13] - 2026-10-31
 

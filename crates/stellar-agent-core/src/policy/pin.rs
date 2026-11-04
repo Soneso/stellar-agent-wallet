@@ -17,13 +17,15 @@
 //! # The guard
 //!
 //! [`read`](crate::policy::pin::read), [`write`](crate::policy::pin::write),
-//! and [`compare`](crate::policy::pin::compare) take the window-state store's
+//! and [`compare`](crate::policy::pin::compare) take a
 //! [`WindowStoreLock`](crate::policy::state_lock::WindowStoreLock) and a
 //! [`PinScope`](crate::policy::pin::PinScope) naming the store and its key
-//! coordinate. Each checks that the guard was acquired for exactly that
-//! scope and never takes the lock itself, so a caller holds one guard across
-//! a read, a comparison, and a write, and the store's authorization
-//! transitions read the pin under the guard they already hold.
+//! coordinate. The guard is the lock of the window-state keyring entry, shared
+//! by every store handle and pin operation over that entry. Each operation
+//! checks that the guard was acquired for that scope's entry and never takes
+//! the lock itself, so a caller holds one guard across a read, a comparison,
+//! and a write, and the store's authorization transitions read the pin under
+//! the guard they already hold.
 //!
 //! # Absent versus malformed
 //!
@@ -463,7 +465,8 @@ mod tests {
         keyring_mock::install().unwrap();
         let dir = TempDir::new().unwrap();
         let window = dir.path().join("pin.window");
-        let other = dir.path().join("other.window");
+        let elsewhere = TempDir::new().unwrap();
+        let other = elsewhere.path().join("other.window");
         let key = window_key();
         let other_key = KeyringEntryRef::default_policy_window_state_key("other");
         let scope = PinScope::new(&window, &key);
@@ -474,8 +477,9 @@ mod tests {
         let wrong_key = WindowStoreLock::acquire_for(&window, &other_key).unwrap();
         assert_eq!(write(&wrong_key, &scope, &pin), Err(PinError::WrongGuard));
         drop(wrong_key);
-        let bare = WindowStoreLock::acquire(&crate::policy::state_lock::window_lock_path(&window))
-            .unwrap();
+        let bare =
+            WindowStoreLock::acquire(&crate::policy::state_lock::window_lock_path(&window, &key))
+                .unwrap();
         assert_eq!(
             compare(&bare, &scope, 1, &[1; 32]),
             Err(PinError::WrongGuard)

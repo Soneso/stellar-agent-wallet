@@ -669,9 +669,7 @@ impl WalletServer {
             Ok(handle) => handle,
             Err(result) => return Ok(result),
         };
-        let store = stellar_agent_network::policy_state::PersistedWindowStore::at_path(
-            self.window_path.clone(),
-        );
+        let store = self.window_store.clone();
         let asset = match x402_canonical_asset(&requirements) {
             Ok(asset) => asset,
             Err(result) => return Ok(result),
@@ -2133,7 +2131,7 @@ mod tests {
         );
         assert_eq!(f.seed_reads.load(Ordering::SeqCst), 0);
         assert!(
-            !f.server.window_path.exists()
+            !f.server.window_store.exists()
                 || crate::tools::common::tests::mainnet::authorizations(&f).is_empty(),
             "nothing is authorized, so nothing can be signed"
         );

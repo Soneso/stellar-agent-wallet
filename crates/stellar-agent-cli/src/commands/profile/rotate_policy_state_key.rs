@@ -269,7 +269,7 @@ async fn run_with_dependencies(
         }
     };
     let store = PersistedWindowStore::for_profile(args.profile_name());
-    if let Err(e) = store.resign(&new_key) {
+    if let Err(e) = store.resign(&profile, &new_key) {
         tracing::error!(
             error = ?e,
             "policy-state key rotated but store re-sign failed; \

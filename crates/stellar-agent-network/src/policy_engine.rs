@@ -16,9 +16,7 @@ use stellar_agent_core::{
     },
     profile::{
         name::{ProfileNameSource, derive_profile_name_from_owner_key},
-        schema::{
-            PolicyEngineKind, Profile, default_policy_dir, default_policy_window_state_path_for,
-        },
+        schema::{PolicyEngineKind, Profile, default_policy_dir},
     },
 };
 
@@ -125,9 +123,10 @@ pub fn build_policy_engine(
         |path| Ok(path.to_path_buf()),
     )?;
     let path = directory.join(format!("{namespace}.toml"));
-    let window_path = default_policy_window_state_path_for(store_name);
+    let window_store = PersistedWindowStore::for_profile(store_name);
+    let window_path = window_store.path();
     let window_state = PolicyStateStore::new();
-    PersistedWindowStore::at_path(window_path.clone())
+    window_store
         .load_into(namespace, profile, &window_state)
         .map_err(|source| PolicyEngineBuildError::WindowState {
             store_name: store_name.to_owned(),
@@ -145,7 +144,7 @@ pub fn build_policy_engine(
             profile_name: namespace,
             owner_pubkey: &owner_key,
             owner_source,
-            window_path: &window_path,
+            window_path,
         },
         window_state,
         PinMode::Advance,

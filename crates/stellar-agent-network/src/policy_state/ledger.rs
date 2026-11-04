@@ -1116,6 +1116,14 @@ fn apply_consumption(
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// A test's interleaving, run once in the mint on this thread right after
+    /// it reads the verified snapshot, while it holds the lock.
+    static MINT_AFTER_READ: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 impl PersistedWindowStore {
     fn ledger_lock(&self, profile: &Profile) -> Result<WindowStoreLock, WindowStoreError> {
         self.ensure_parent_dir()?;
@@ -1222,6 +1230,10 @@ impl PersistedWindowStore {
         let (key, _mint) = self.load_or_mint_key(profile)?;
         let gen_entry = generation_entry_ref(profile);
         let original = self.read_verified(profile, &key, &gen_entry)?;
+        #[cfg(test)]
+        if let Some(hook) = MINT_AFTER_READ.with_borrow_mut(Option::take) {
+            hook();
+        }
         let mut wire = original.clone();
         sweep_expired(&mut wire, now);
 
@@ -1564,7 +1576,7 @@ mod tests {
     use stellar_agent_test_support::keyring_mock;
     use tempfile::TempDir;
 
-    use super::super::store::{RETENTION_MS, SubmissionHold};
+    use super::super::store::{RETENTION_MS, ResetError, SubmissionHold};
     use super::*;
     use crate::mainnet::clock::{TestClockGuard, set_now_ms_for_test};
     use crate::mainnet::types::RecomputedFacts;
@@ -4047,6 +4059,193 @@ mod tests {
                 matches!(l.mint(&second), Err(WindowStoreError::WriterLocked)),
                 "a mint while another holder keeps the lock refuses without waiting"
             );
+        }
+    }
+
+    /// A second handle over the ledger's keyring entry, at a byte copy of its
+    /// committed file in the same directory.
+    fn second_path(l: &Ledger) -> PersistedWindowStore {
+        let path = l._dir.path().join("second.window");
+        fs::copy(l.store.path(), &path).unwrap();
+        PersistedWindowStore::at_path(path)
+    }
+
+    /// The generation commitment both handles of [`second_path`] share.
+    fn commitment(l: &Ledger) -> String {
+        let entry = generation_entry_ref(&l.profile);
+        keyring_core::Entry::new(&entry.service, &entry.account)
+            .unwrap()
+            .get_password()
+            .unwrap()
+    }
+
+    #[test]
+    #[serial]
+    fn a_second_path_over_one_entry_cannot_mint_while_the_first_holds_the_lock() {
+        let l = Ledger::new();
+        l.mint(&l.request(tx(1), vec![hold(1)])).unwrap();
+        let second = second_path(&l);
+        let request = l.request(tx(2), vec![hold(1)]);
+        let committed = commitment(&l);
+        let held =
+            WindowStoreLock::acquire_for(l.store.path(), &l.profile.policy_window_state_key_id)
+                .unwrap();
+        assert!(matches!(
+            second.mint_authorization(&l.profile, &request),
+            Err(WindowStoreError::WriterLocked)
+        ));
+        drop(held);
+        assert_eq!(commitment(&l), committed);
+    }
+
+    /// Two handles at two paths over one entry both start from one committed
+    /// snapshot, and one approval names two different contents, so neither
+    /// the nonce check nor the duplicate content check of the other's file
+    /// can stop the second mint. The lock of the entry is what stops it.
+    #[test]
+    #[serial]
+    fn two_paths_mint_one_approval_once() {
+        let l = Ledger::new();
+        l.mint(&l.request(tx(1), vec![hold(1)])).unwrap();
+        let second = second_path(&l);
+        let request = l.request(tx(2), vec![hold(1)]);
+        let mut rival = l.request(tx(3), vec![hold(1)]);
+        rival.approval_nonce.clone_from(&request.approval_nonce);
+
+        let outcome = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let observed = outcome.clone();
+        let profile = l.profile.clone();
+        MINT_AFTER_READ.with_borrow_mut(|hook| {
+            *hook = Some(Box::new(move || {
+                *observed.borrow_mut() = Some(second.mint_authorization(&profile, &rival));
+            }));
+        });
+
+        l.mint(&request).unwrap();
+        assert!(
+            matches!(
+                outcome.borrow_mut().take(),
+                Some(Err(WindowStoreError::WriterLocked))
+            ),
+            "the rival mint ran under the first mint's lock and refused"
+        );
+        let wire = l.wire();
+        assert_eq!(
+            wire.authorizations
+                .iter()
+                .filter(|auth| auth.approval_nonce == request.approval_nonce)
+                .count(),
+            1
+        );
+    }
+
+    /// Each transition through a second path refuses while the entry's lock is
+    /// held through the first, and neither file nor the commitment moves.
+    #[test]
+    #[serial]
+    fn every_store_transition_takes_the_entry_lock() {
+        type Transition<'a> = (
+            &'static str,
+            Box<dyn Fn() -> Result<(), WindowStoreError> + 'a>,
+        );
+
+        let l = Ledger::new();
+        let profile = &l.profile;
+        let reservation = |id: &str| SubmissionHold {
+            id: id.to_owned(),
+            tx_hash: "ab".repeat(32),
+            source: SOURCE.to_owned(),
+            sequence: 9,
+            max_time: 0,
+            pending_since_ms: T0,
+            submission_ledger: 1_000,
+            operator_required: false,
+        };
+        let pending = "cd".repeat(32);
+        l.store
+            .record_pending(profile, &[hold(1)], &reservation(&pending))
+            .unwrap();
+        let open = l.request(tx(1), vec![hold(1)]);
+        let minted = l.mint(&open).unwrap();
+        let next = l.request(tx(2), vec![hold(1)]);
+        let expect = l.expect(&open, &minted);
+        let binding = consumption_of(&open.binding);
+        let second = second_path(&l);
+        let second = &second;
+
+        let transitions: Vec<Transition<'_>> = vec![
+            (
+                "record_and_persist",
+                Box::new(|| second.record_and_persist(profile, &[hold(1)]).map(drop)),
+            ),
+            (
+                "record_authorized",
+                Box::new(|| second.record_authorized(profile, &[hold(1)]).map(drop)),
+            ),
+            (
+                "record_pending",
+                Box::new(|| {
+                    second
+                        .record_pending(profile, &[hold(1)], &reservation(&"ef".repeat(32)))
+                        .map(drop)
+                }),
+            ),
+            (
+                "confirm",
+                Box::new(|| second.confirm(profile, &pending, Some(1_800_000_000))),
+            ),
+            ("release", Box::new(|| second.release(profile, &pending))),
+            (
+                "reset",
+                Box::new(
+                    || match second.reset(profile, T0, |_| Ok::<(), WindowStoreError>(())) {
+                        Ok(_) => Ok(()),
+                        Err(ResetError::Store { error, .. } | ResetError::Recorder(error)) => {
+                            Err(error)
+                        }
+                    },
+                ),
+            ),
+            ("resign", Box::new(|| second.resign(profile, &[9; 32]))),
+            (
+                "mint_authorization",
+                Box::new(|| second.mint_authorization(profile, &next).map(drop)),
+            ),
+            (
+                "consume_authorizations",
+                Box::new(|| {
+                    second
+                        .consume_authorizations(
+                            profile,
+                            &[(minted.id, expect.clone(), binding.clone())],
+                        )
+                        .map(drop)
+                }),
+            ),
+            (
+                "invalidate_authorization",
+                Box::new(|| {
+                    second
+                        .invalidate_authorization(profile, minted.id, "held")
+                        .map(drop)
+                }),
+            ),
+        ];
+
+        let first_bytes = l.bytes();
+        let second_bytes = fs::read(second.path()).unwrap();
+        let committed = commitment(&l);
+        let _held =
+            WindowStoreLock::acquire_for(l.store.path(), &profile.policy_window_state_key_id)
+                .unwrap();
+        for (name, transition) in &transitions {
+            assert!(
+                matches!(transition(), Err(WindowStoreError::WriterLocked)),
+                "{name}"
+            );
+            assert_eq!(l.bytes(), first_bytes, "{name}");
+            assert_eq!(fs::read(second.path()).unwrap(), second_bytes, "{name}");
+            assert_eq!(commitment(&l), committed, "{name}");
         }
     }
 

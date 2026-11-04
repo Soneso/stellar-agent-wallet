@@ -316,7 +316,7 @@ Exits `1` on refusal:
 - `enroll_owner_key.expected_address_mismatch`: `--expected-address` does not match.
 - `enroll_owner_key.entry_exists`: an owner key exists without `--force`.
 - `enroll_owner_key.rotation_statement_required`: the installed policy lacks a valid previous-owner statement or a signature from the key being enrolled. The message names the cause (`policy.owner_rotation_required`, `policy.owner_rotation_invalid`, or `policy.owner_signature_invalid`).
-- `policy.pin_absent`: the installation holds a mainnet enablement nonce or a policy pin, but its policy-state lock file or its pin is missing. The message names which one. A command that builds the V1 policy engine recreates a missing lock file. For a missing pin, follow the recovery under [`profile enable-mainnet`](#profile-enable-mainnet).
+- `policy.pin_absent`: the installation holds a mainnet enablement nonce or a policy pin, but its policy-state lock file or its pin is missing. The message names which one. A command that builds the V1 policy engine recreates the lock file of the configured window key; a pin under another window key needs that key configured again. For a missing pin, follow the recovery under [`profile enable-mainnet`](#profile-enable-mainnet).
 - `profile.mainnet_enablement_invalid`: the enablement nonce cannot be read.
 - `policy.state_lock_busy`, `policy.state_lock_io`, `policy.pin_unusable`, and the verified-load codes such as `policy.sequence_rollback` or `policy.policy_file_load_failed` keep their own codes.
 - A keyring error: the platform keyring is unavailable.
@@ -497,8 +497,10 @@ every table restriction fail. When the policy does not verify, the
 restrictions and `enablement` are `not_evaluated`. The `enablement` check
 fails with `profile.mainnet_enablement_invalid` and the name of the binding
 that does not match, such as `on_disk_host` or `nonce_digest`. The `pin`
-check passes with the pinned sequence, or with `absent (first use)` when no
-pin or window-state lock file exists and no enablement nonce exists.
+check passes with the pinned sequence, or with `absent (first use)` when
+neither a pin entry nor an enablement nonce exists. A pin entry without its
+policy-state lock file fails with `policy.pin_absent` and names the lock file;
+a command that builds the V1 policy engine recreates it.
 An enablement nonce with no pin refuses with `policy.pin_absent`.
 It fails when the pin cannot be read or
 the comparison refuses, with `policy.sequence_rollback`,

@@ -4972,6 +4972,7 @@ dependencies = [
  "sha2 0.11.0",
  "stellar-agent-core",
  "stellar-agent-headless-keyring",
+ "stellar-agent-network",
  "stellar-agent-soroban-auth",
  "stellar-agent-test-support",
  "stellar-agent-xdr-limits",
