@@ -82,6 +82,7 @@ pub mod registration_input;
 pub mod remote_authorization;
 pub mod retry;
 pub mod rule_proposal;
+pub mod spent;
 pub mod store;
 pub mod subject;
 pub mod toolset_grant;
@@ -127,6 +128,12 @@ pub use rule_proposal::{
     DecodedSpendingLimitParams, RuleProposalContextType, RuleProposalPolicy, RuleProposalSigner,
     RuleProposalSignerKind, rule_proposal_digest, try_decode_spending_limit_params,
     verify_rule_proposal_entry_terms,
+};
+#[cfg(any(test, feature = "test-helpers"))]
+pub use spent::InMemoryRuleApprovalSpentStore;
+pub use spent::{
+    MAX_SPENT_RULE_APPROVALS, RuleApprovalSpentStore, SpentSet, SpentSetError,
+    rule_approval_spent_marker,
 };
 pub use store::{
     ApprovalKind, ConsumedOutcome, DEFAULT_TTL_MS, EXPECTED_NONCE_LEN,

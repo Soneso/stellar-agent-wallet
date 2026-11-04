@@ -952,6 +952,7 @@ These failures carry `approval.*` codes: `approval.not_found`, `approval.expired
 `approval.presence_browser_required`: The ceremony requires a local browser; no approval is recorded.
 `approval.gc_failed` reports a collection failure from `approve gc`.
 `approval.operator_credential_revoked` reports a remote approval whose operator credential is missing from the profile's `allowed_credentials` list or from the operator-credential store; `approval.remote_authorization_unavailable` reports that the profile's remote-approval authorization or the operator-credential store could not be read, or that the profile does not enable remote approval for that chain.
+`approval.spent_record_unavailable` reports, from `stellar_rule_create_commit`, that the platform keyring record of spent rule approvals cannot be read or written, does not parse, is busy, holds 16 live approvals, or is past this approval's expiry. The commit installs nothing.
 `approval.entry_inconsistent` reports a payment, claim, or trustline request whose stored digest is not the digest of its stored envelope, or whose envelope does not decode; a rule proposal whose stored digest is not the digest of what it shows; and an MPP charge request whose shown terms do not match what it would authorize.
 Authentication, validation, and audit failures on approval paths carry their own codes.
 

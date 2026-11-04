@@ -659,6 +659,14 @@ pub enum ApprovalFailure {
         /// Non-secret operator-facing diagnostic.
         detail: String,
     },
+    /// The protected record of spent rule approvals cannot be used.
+    #[error(
+        "the record of spent rule approvals is unavailable ({reason}); the rule was not installed"
+    )]
+    SpentRecordUnavailable {
+        /// A fixed description of the failed operation, without the stored value.
+        reason: &'static str,
+    },
     /// The operator credential behind a remote approval or a remote-approval
     /// request is not authorized at this check: its ID is absent from the
     /// profile's current `[remote_approval] allowed_credentials` list, or the
@@ -806,6 +814,7 @@ impl ApprovalFailure {
             Self::GcFailed { .. } => "approval.gc_failed",
             Self::AttestationInvalid { .. } => "approval.attestation_invalid",
             Self::EntryInconsistent { .. } => "approval.entry_inconsistent",
+            Self::SpentRecordUnavailable { .. } => "approval.spent_record_unavailable",
             Self::OperatorCredentialRevoked { .. } => "approval.operator_credential_revoked",
             Self::RemoteAuthorizationUnavailable { .. } => {
                 "approval.remote_authorization_unavailable"
@@ -5803,6 +5812,19 @@ mod tests {
             assert_eq!(error.to_string(), "operator diagnostic");
             assert_eq!(error.message(), "operator diagnostic");
         }
+    }
+
+    #[test]
+    fn spent_record_failure_wire_code_and_message() {
+        let error = WalletError::Approval(ApprovalFailure::SpentRecordUnavailable {
+            reason: "it cannot be read",
+        });
+        assert_eq!(error.code(), "approval.spent_record_unavailable");
+        assert_eq!(error.category(), ErrorCategory::Approval);
+        assert_eq!(
+            error.to_string(),
+            "the record of spent rule approvals is unavailable (it cannot be read); the rule was not installed"
+        );
     }
 
     #[test]

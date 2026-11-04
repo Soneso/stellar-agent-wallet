@@ -703,6 +703,14 @@ pub struct WalletServer {
     /// Gated on `test-helpers` feature or `#[cfg(test)]`.
     #[cfg(any(test, feature = "test-helpers"))]
     pub(crate) approval_dir_override: Option<std::path::PathBuf>,
+    /// Test-only protected spent record backend.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub(crate) rule_approval_spent_store_override:
+        Option<Arc<dyn stellar_agent_core::approval::RuleApprovalSpentStore>>,
+    /// Test-only window-state path that places the spent-record lock in a
+    /// per-test directory, away from the operator's real policy-state directory.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub(crate) policy_window_state_path_override: Option<std::path::PathBuf>,
 
     /// Test-only override for the toolset-grant store path.
     ///
@@ -971,6 +979,10 @@ impl WalletServer {
             #[cfg(any(test, feature = "test-helpers"))]
             approval_dir_override: None,
             #[cfg(any(test, feature = "test-helpers"))]
+            rule_approval_spent_store_override: None,
+            #[cfg(any(test, feature = "test-helpers"))]
+            policy_window_state_path_override: None,
+            #[cfg(any(test, feature = "test-helpers"))]
             grant_store_path_override: None,
             #[cfg(any(test, feature = "test-helpers"))]
             toolsets_root_override: None,
@@ -1194,6 +1206,18 @@ impl WalletServer {
             return Ok(override_dir.clone());
         }
         stellar_agent_core::profile::schema::default_approval_dir()
+    }
+
+    /// Resolves this profile's window-state path, whose directory holds the
+    /// lock of the spent rule approval record, honoring the test-only override.
+    pub(crate) fn resolve_policy_window_state_path(&self) -> std::path::PathBuf {
+        #[cfg(any(test, feature = "test-helpers"))]
+        if let Some(ref override_path) = self.policy_window_state_path_override {
+            return override_path.clone();
+        }
+        stellar_agent_core::profile::schema::default_policy_window_state_path_for(
+            &self.profile_name_for_approval(),
+        )
     }
 }
 
