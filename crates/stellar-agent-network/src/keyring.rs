@@ -675,6 +675,38 @@ pub fn read_keyring_string(entry_ref: &KeyringEntryRef) -> Result<Option<String>
     }
 }
 
+/// Platform-keyring record of spent rule approvals beside the attestation key.
+#[derive(Debug, Clone)]
+pub struct KeyringRuleApprovalSpentStore {
+    entry: KeyringEntryRef,
+}
+
+impl KeyringRuleApprovalSpentStore {
+    /// Derives the spent coordinate from the profile's attestation key.
+    #[must_use]
+    pub fn new(attestation_key: &KeyringEntryRef) -> Self {
+        Self {
+            entry: stellar_agent_core::profile::schema::rule_approval_spent_entry_ref(
+                attestation_key,
+            ),
+        }
+    }
+}
+
+impl stellar_agent_core::approval::RuleApprovalSpentStore for KeyringRuleApprovalSpentStore {
+    fn load(&self) -> Result<Option<String>, stellar_agent_core::approval::SpentSetError> {
+        read_keyring_string(&self.entry).map_err(|e| {
+            stellar_agent_core::approval::SpentSetError::Unavailable { code: e.code() }
+        })
+    }
+
+    fn store(&self, value: &str) -> Result<(), stellar_agent_core::approval::SpentSetError> {
+        write_keyring_string(&self.entry, value).map_err(|e| {
+            stellar_agent_core::approval::SpentSetError::Unavailable { code: e.code() }
+        })
+    }
+}
+
 /// Checks the profile's audit binding, then loads its audit chain-root key and
 /// pairs it with the anchor store for that profile's log path.
 ///
@@ -3524,6 +3556,42 @@ mod tests {
                 .contains("'stellar-agent-rpc-unit/oracle'"),
             "{error}"
         );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn the_keyring_spent_store_reports_absence_as_none_and_errors_as_unavailable() {
+        use stellar_agent_core::approval::{RuleApprovalSpentStore, SpentSetError};
+        let _restore = RestoreStore::new();
+        keyring_mock::install().unwrap();
+        let key = KeyringEntryRef::default_attestation_key("unit");
+        let store = KeyringRuleApprovalSpentStore::new(&key);
+        let entry = stellar_agent_core::profile::schema::rule_approval_spent_entry_ref(&key);
+        assert_eq!(store.load().unwrap(), None);
+        store.store("v1.").unwrap();
+        assert_eq!(store.load().unwrap().as_deref(), Some("v1."));
+        for read in [true, false] {
+            keyring_mock::inject_error(
+                &entry.service,
+                &entry.account,
+                keyring_core::Error::PlatformFailure(Box::new(std::io::Error::other(
+                    "rejected-value",
+                ))),
+            )
+            .unwrap();
+            let error = if read {
+                store.load().unwrap_err()
+            } else {
+                store.store("rejected-value").unwrap_err()
+            };
+            assert_eq!(
+                error,
+                SpentSetError::Unavailable {
+                    code: "auth.keyring_platform_error"
+                }
+            );
+            assert!(!format!("{error:?}: {error}").contains("rejected-value"));
+        }
     }
 
     #[test]

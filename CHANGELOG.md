@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `rule_approval_spent_entry_ref`, `RuleApprovalSpentStore`, and
+  `KeyringRuleApprovalSpentStore` provide the protected record of spent rule
+  approvals. `approval.spent_record_unavailable` reports an unusable record.
+
 - `ValidationError::MainnetSecretEnvRefused`, wire code
   `validation.mainnet_secret_env_refused`, refuses an environment seed for
   mainnet signing; its message names no variable.
@@ -658,6 +662,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   form `"100 TST"` with `TST:<issuer>` works.
 
 ### Security
+
+- A committed rule approval is recorded as spent in the platform keyring before
+  the install starts. Restoring an earlier copy of the pending approval store
+  does not re-arm it: the commit refuses with `policy.approval_consumed`.
+  Moving the clock back does not re-arm it either, and profiles that share the
+  attestation coordinate serialize on one lock. When the spent record cannot be
+  read or written, does not parse, is busy, holds 16 live approvals, or is past
+  this approval's expiry, the commit refuses with
+  `approval.spent_record_unavailable` and installs nothing.
 
 - A rule proposal's digest covers the smart account, the network, the chain,
   every displayed field of the rule and its summary. The CLI, the local inbox

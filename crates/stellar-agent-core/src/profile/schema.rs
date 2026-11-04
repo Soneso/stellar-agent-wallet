@@ -2498,6 +2498,28 @@ pub fn policy_pin_entry_ref(window_key: &KeyringEntryRef) -> KeyringEntryRef {
     )
 }
 
+/// The spent rule approval coordinate beside the attestation key.
+///
+/// The service matches the attestation key and the account has the suffix
+/// `-rule-approvals-spent`, including for operator-overridden coordinates.
+///
+/// # Examples
+///
+/// ```
+/// use stellar_agent_core::profile::schema::{KeyringEntryRef, rule_approval_spent_entry_ref};
+/// let key = KeyringEntryRef::default_attestation_key("unit");
+/// let spent = rule_approval_spent_entry_ref(&key);
+/// assert_eq!(spent.service, "stellar-agent-attestation-unit");
+/// assert_eq!(spent.account, "default-rule-approvals-spent");
+/// ```
+#[must_use]
+pub fn rule_approval_spent_entry_ref(attestation_key: &KeyringEntryRef) -> KeyringEntryRef {
+    KeyringEntryRef::new(
+        attestation_key.service.clone(),
+        format!("{}-rule-approvals-spent", attestation_key.account),
+    )
+}
+
 /// The keyring coordinate of the mainnet enablement nonce: the window-state
 /// key's service and its account suffixed `-mainnet-enablement`.
 ///

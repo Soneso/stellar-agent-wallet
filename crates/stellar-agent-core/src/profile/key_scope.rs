@@ -14,7 +14,7 @@ use super::schema::{
     KeyringEntryRef, Profile, ProviderRole, TOOLSET_PIN_KEY_SERVICE, WALLET_KEY_REFERENCE_FIELDS,
     default_audit_log_path_for, default_profile_dir, generation_account, generation_intent_account,
     keyring_entry_alias, mainnet_enablement_entry_ref, policy_pin_entry_ref,
-    signer_identity_entry_ref,
+    rule_approval_spent_entry_ref, signer_identity_entry_ref,
 };
 
 /// A bounded, path-redacted keyring coordinate carried by a finding.
@@ -248,6 +248,7 @@ const ROLES: [(ProviderRole, &str); 3] = [
 const SIGNER_FIELD: usize = 0;
 const AUDIT_FIELD: usize = 2;
 const OWNER_FIELD: usize = 3;
+const ATTESTATION_FIELD: usize = 4;
 const POOL_FIELD: usize = 6;
 const WINDOW_FIELD: usize = 7;
 
@@ -257,6 +258,7 @@ const OWNER_CANONICAL: &str = "policy_owner_key_id (canonical)";
 const WINDOW_GENERATION: &str = "policy_window_state_key_id (generation)";
 const WINDOW_POLICY_PIN: &str = "policy_window_state_key_id (policy pin)";
 const WINDOW_ENABLEMENT: &str = "policy_window_state_key_id (mainnet enablement)";
+const RULE_APPROVALS_SPENT: &str = "attestation_key_id (spent rule approvals)";
 const SIGNER_IDENTITY: &str = "mcp_signer_default (enrolled identity)";
 const AUDIT_BINDING: &str = "audit binding (derived)";
 const MPP_STATE: &str = "mpp state (derived)";
@@ -363,6 +365,10 @@ fn effective_coordinates(
     entries.push((WINDOW_POLICY_PIN, window_pin));
     entries.push((WINDOW_ENABLEMENT, window_enablement));
     entries.push((SIGNER_IDENTITY, signer_identity));
+    entries.push((
+        RULE_APPROVALS_SPENT,
+        rule_approval_spent_entry_ref(&entries[ATTESTATION_FIELD].1),
+    ));
     let path = merged
         .map(|p| &p.audit_log_path)
         .or_else(|| document.and_then(|d| d.audit_log_path.as_ref()))
@@ -1391,11 +1397,42 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
+    fn the_spent_record_coordinate_is_in_the_key_scope() {
+        let f = Fixture::new();
+        let a = profile("unit");
+        let expected = KeyringEntryRef::new(
+            "stellar-agent-attestation-unit",
+            "default-rule-approvals-spent",
+        );
+        assert!(
+            effective_coordinates("unit", None, Some(&a))
+                .iter()
+                .any(|(label, entry)| *label == RULE_APPROVALS_SPENT && *entry == expected)
+        );
+        let mut b = profile("peer");
+        b.audit_log_hash_chain_key_id = expected;
+        f.save("unit", &a);
+        f.save("peer", &b);
+        assert_eq!(
+            shared(&f.findings("unit", &a), RULE_APPROVALS_SPENT),
+            &KeyScopeKind::SharedWithSibling {
+                field: RULE_APPROVALS_SPENT,
+                sibling: "peer".to_owned(),
+                sibling_field: "audit_log_hash_chain_key_id".to_owned(),
+                recovery: SharedRecovery::CorrectTheSiblingFile,
+            }
+        );
+        shared(&f.findings("peer", &b), "audit_log_hash_chain_key_id");
+    }
+
+    #[test]
     fn named_field_indices_match_the_reference_fields() {
         for (index, field) in [
             (SIGNER_FIELD, "mcp_signer_default"),
             (AUDIT_FIELD, "audit_log_hash_chain_key_id"),
             (OWNER_FIELD, "policy_owner_key_id"),
+            (ATTESTATION_FIELD, "attestation_key_id"),
             (POOL_FIELD, "pool_master_key_id"),
             (WINDOW_FIELD, "policy_window_state_key_id"),
         ] {
@@ -1574,9 +1611,9 @@ mod tests {
         f.save("alice", &a);
         a.mcp_signer_default.service = "overlay".to_owned();
         std::fs::write(f.dir.join("bob.toml"), "invalid text").unwrap();
-        // Carol names two of alice's coordinates in the reverse of alice's
-        // enumeration order; the second is the entry alice's nonce and
-        // attestation fields share, reported once.
+        // The sibling names two explicit coordinates in reverse enumeration
+        // order. The shared nonce and attestation entry appears once, followed
+        // by the spent record derived from the shared attestation coordinate.
         let mut c = profile("carol");
         c.attestation_key_id = a.mcp_nonce_key_alias.clone();
         c.counterparty_cache_key_id = a.mcp_signer_default.clone();
@@ -1591,6 +1628,7 @@ mod tests {
                 "self_collision",
                 "sibling_unreadable",
                 "shared_with_sibling",
+                "shared_with_sibling",
                 "shared_with_sibling"
             ]
         );
@@ -1601,7 +1639,14 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(shared_fields, ["mcp_signer_default", "mcp_nonce_key_alias"]);
+        assert_eq!(
+            shared_fields,
+            [
+                "mcp_signer_default",
+                "mcp_nonce_key_alias",
+                RULE_APPROVALS_SPENT
+            ]
+        );
         std::fs::write(f.dir.join("alice.toml"), "invalid text").unwrap();
         let findings = f.findings("alice", &a);
         assert_eq!(findings[0].kind, KeyScopeKind::SelectedDocumentUnreadable);
