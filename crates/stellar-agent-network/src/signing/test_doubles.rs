@@ -23,6 +23,10 @@ pub struct CountingSigner {
     #[cfg(feature = "mainnet-write")]
     key_bytes: [u8; 32],
     corrupt: bool,
+    #[cfg(all(feature = "mainnet-write", any(test, feature = "test-hooks")))]
+    advance_clock: Option<Arc<crate::mainnet::clock::TestClockGuard>>,
+    #[cfg(all(feature = "mainnet-write", any(test, feature = "test-hooks")))]
+    advance_to: u64,
     public_keys: Arc<AtomicUsize>,
     signs: Arc<AtomicUsize>,
 }
@@ -37,6 +41,10 @@ impl CountingSigner {
                 .verifying_key()
                 .to_bytes(),
             corrupt: false,
+            #[cfg(all(feature = "mainnet-write", any(test, feature = "test-hooks")))]
+            advance_clock: None,
+            #[cfg(all(feature = "mainnet-write", any(test, feature = "test-hooks")))]
+            advance_to: 0,
             public_keys: Arc::new(AtomicUsize::new(0)),
             signs: Arc::new(AtomicUsize::new(0)),
         }
@@ -48,6 +56,26 @@ impl CountingSigner {
     pub fn corrupting(seed: [u8; 32]) -> Self {
         Self {
             corrupt: true,
+            ..Self::new(seed)
+        }
+    }
+
+    /// A signer that advances the shared test clock before returning a signature.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the test clock is unavailable.
+    #[cfg(all(feature = "mainnet-write", any(test, feature = "test-hooks")))]
+    #[allow(
+        clippy::unwrap_used,
+        reason = "test helper requires an available test clock"
+    )]
+    pub fn advancing_clock_to(seed: [u8; 32], ms: u64) -> Self {
+        Self {
+            advance_clock: Some(Arc::new(crate::mainnet::clock::set_now_ms_for_test(
+                crate::mainnet::clock::now_ms().unwrap(),
+            ))),
+            advance_to: ms,
             ..Self::new(seed)
         }
     }
@@ -75,6 +103,10 @@ impl CountingSigner {
 
     fn finish(&self, signature: Result<[u8; 64], WalletError>) -> Result<[u8; 64], WalletError> {
         self.signs.fetch_add(1, Ordering::SeqCst);
+        #[cfg(all(feature = "mainnet-write", any(test, feature = "test-hooks")))]
+        if let Some(clock) = &self.advance_clock {
+            clock.set(self.advance_to);
+        }
         signature.map(|mut bytes| {
             if self.corrupt {
                 bytes[0] ^= 0x01;

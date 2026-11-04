@@ -561,7 +561,9 @@ impl MainnetSorobanAuthPayload {
     /// signer before it is asked to sign; that is the first call on `signer`,
     /// and the signature is the second. The signature must verify under that
     /// key over the payload before it is returned. The authorization must
-    /// also be fresh on the trusted clock immediately before signing.
+    /// also be fresh on the trusted clock immediately before signing. The store
+    /// durably claims it after these checks and before the signing call. A signature
+    /// returned after its lifetime is discarded; the claim keeps its spend counted.
     ///
     /// # Errors
     ///
@@ -571,6 +573,8 @@ impl MainnetSorobanAuthPayload {
     ///   [`MainnetPrecondition::SignatureInvalid`].
     /// - [`AuthorizedPayloadError::Refused`] when the authorization is expired,
     ///   not yet valid, or has inconsistent expiry bounds.
+    /// - [`AuthorizedPayloadError::Refused`] when the window store refuses the claim:
+    ///   `NotOpen`, `UnknownAuthorization`, a mismatched header fact, or `StoreUnavailable`.
     /// - [`AuthorizedPayloadError::Wallet`] with the signer's or clock's error.
     ///
     /// [`MainnetPrecondition::SignerKeyMismatch`]: crate::mainnet::MainnetPrecondition::SignerKeyMismatch
@@ -585,9 +589,12 @@ impl MainnetSorobanAuthPayload {
             .check_signer(&public_key.0, SignerRole::AgentSigner)?;
         self.authorization
             .check_not_expired(crate::mainnet::clock::now_ms()?)?;
+        self.authorization.claim()?;
         let signature = signer
             .sign_soroban_address_auth_payload(&self.payload)
             .await?;
+        self.authorization
+            .check_not_expired(crate::mainnet::clock::now_ms()?)?;
         require(
             signature_verifies(&public_key.0, self.payload.as_bytes(), &signature),
             P::SignatureInvalid,

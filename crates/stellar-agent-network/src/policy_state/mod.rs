@@ -189,7 +189,7 @@ pub mod store;
 use lock::StateLockError;
 
 pub use ledger::{
-    ConsumeExpect, ConsumeReceipt, ConsumptionBinding, DomainBinding, FeeBumpFacts,
+    ClaimExpect, ConsumeExpect, ConsumeReceipt, ConsumptionBinding, DomainBinding, FeeBumpFacts,
     MAX_OPEN_AUTHORIZATIONS, MintRequest, MintedRecord, OpenAuthorization, SubmissionBinding,
     WindowReservation,
 };

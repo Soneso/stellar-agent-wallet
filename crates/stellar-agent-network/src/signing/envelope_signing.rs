@@ -99,8 +99,11 @@ pub async fn attach_signature(
 /// the unsigned envelope text. Finally, checks compare the transaction hash under
 /// the passphrase, the source account, and the sequence. Only a `Tx` is signed.
 /// The signer's reported public key must be the bound agent signer's; that is the
-/// first call on `signer`. After signing, the signature must verify under the
-/// transaction's mainnet payload against that key before it is attached.
+/// first call on `signer`. The window store durably claims the authorization
+/// after that key check and before the signing call. A late signature is
+/// discarded; a refusal after the claim keeps its spend counted. After signing,
+/// the signature must verify under the transaction's mainnet payload against
+/// that key before it is attached.
 ///
 /// Compiled in every build; without mainnet writes no authorization value
 /// exists, so the function cannot be called.
@@ -170,7 +173,9 @@ pub(crate) async fn authorized_signature(
 
     let public_key = signer.public_key().await?;
     authorization.check_signer(&public_key.0, SignerRole::AgentSigner)?;
+    authorization.claim()?;
     let sig_bytes = signer.sign_tx_payload(&payload).await?;
+    authorization.check_not_expired(crate::mainnet::clock::now_ms()?)?;
     require(
         signature_verifies(&public_key.0, payload.as_bytes(), &sig_bytes),
         MainnetPrecondition::SignatureInvalid,
@@ -948,6 +953,13 @@ mod tests {
                 self.authorization_over(&self.unsigned, edit)
             }
 
+            fn minted_authorization(&self) -> MainnetTxSignAuthorization {
+                stellar_agent_test_support::keyring_mock::install().unwrap();
+                let mut auth = self.authorization(|_, _| {});
+                fixtures::mint_header(&mut auth.0.header, &auth.0.binding, &[]);
+                auth
+            }
+
             fn authorization_over(
                 &self,
                 envelope: &SignedTestEnvelope,
@@ -961,7 +973,14 @@ mod tests {
                     anchor_covers_tip: true,
                     entry_tags_in_force: true,
                 };
-                let mut header = fixtures::header("fixture", None, &self.writer, facts, NOW);
+                let mut header = fixtures::header(
+                    fixtures::claim_target(self._dir.path(), "fixture"),
+                    "fixture",
+                    None,
+                    &self.writer,
+                    facts,
+                    NOW,
+                );
                 let mut binding =
                     fixtures::tx_binding(envelope.envelope_xdr(), envelope.tx_hash_hex());
                 edit(&mut header, &mut binding);
@@ -988,6 +1007,163 @@ mod tests {
             }
         }
 
+        fn ledger_authorization(
+            f: &fixtures::LedgerFixture,
+        ) -> (SignedTestEnvelope, MainnetTxSignAuthorization) {
+            let envelope = fixtures::unsigned_envelope();
+            let auth = f.mint(
+                fixtures::tx_binding(envelope.envelope_xdr(), envelope.tx_hash_hex()),
+                &[fixtures::hold(&f.name, f.now, 70)],
+                None,
+                "signing-claim",
+            );
+            (envelope, auth)
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn an_invalidated_classic_authorization_never_reaches_the_signer() {
+            let f = fixtures::LedgerFixture::new("invalidated-classic", NOW);
+            let (envelope, auth) = ledger_authorization(&f);
+            crate::mainnet::resolve::invalidate_unconsumed(
+                &f.window,
+                &f.context(),
+                auth.id(),
+                crate::mainnet::resolve::InvalidationStage::SignRefused,
+            )
+            .unwrap();
+            let signer = CountingSigner::new(SIGNER_SEED);
+            assert_eq!(
+                refusal(
+                    envelope.envelope_xdr(),
+                    &signer,
+                    MAINNET,
+                    MainnetConsumer::CliPay,
+                    &auth
+                )
+                .await,
+                P::NotOpen
+            );
+            assert_eq!(signer.sign_calls(), 0);
+            assert!(
+                attach_signature_authorized(
+                    envelope.envelope_xdr(),
+                    &signer,
+                    MAINNET,
+                    MainnetConsumer::CliPay,
+                    &auth
+                )
+                .await
+                .is_err()
+            );
+            assert_eq!(signer.sign_calls(), 0);
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn a_classic_claim_that_fails_to_persist_never_reaches_the_signer() {
+            let f = fixtures::LedgerFixture::new("unpersisted-classic", NOW);
+            let (envelope, auth) = ledger_authorization(&f);
+            let signer = CountingSigner::new(SIGNER_SEED);
+            let armed = crate::policy_state::store::fail_store_writes();
+            assert_eq!(
+                refusal(
+                    envelope.envelope_xdr(),
+                    &signer,
+                    MAINNET,
+                    MainnetConsumer::CliPay,
+                    &auth
+                )
+                .await,
+                P::StoreUnavailable
+            );
+            drop(armed);
+            assert!(f.is_open(auth.id()));
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn a_changed_policy_pin_at_the_classic_claim_never_reaches_the_signer() {
+            let f = fixtures::LedgerFixture::new("repinned-classic", NOW);
+            let (envelope, auth) = ledger_authorization(&f);
+            f.repin([0x5a; 32]);
+            let signer = CountingSigner::new(SIGNER_SEED);
+            assert_eq!(
+                refusal(
+                    envelope.envelope_xdr(),
+                    &signer,
+                    MAINNET,
+                    MainnetConsumer::CliPay,
+                    &auth
+                )
+                .await,
+                P::PolicyPinMismatch
+            );
+            assert!(f.is_open(auth.id()));
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn a_classic_authorization_signs_once() {
+            let f = fixtures::LedgerFixture::new("classic-once", NOW);
+            let (envelope, auth) = ledger_authorization(&f);
+            let signer = CountingSigner::new(SIGNER_SEED);
+            attach_signature_authorized(
+                envelope.envelope_xdr(),
+                &signer,
+                MAINNET,
+                MainnetConsumer::CliPay,
+                &auth,
+            )
+            .await
+            .unwrap();
+            assert!(matches!(
+                authorized_signature(
+                    envelope.envelope_xdr(),
+                    &signer,
+                    MAINNET,
+                    MainnetConsumer::CliPay,
+                    &auth
+                )
+                .await,
+                Err(AuthorizedPathError::Refused(P::NotOpen))
+            ));
+            assert!(
+                attach_signature_authorized(
+                    envelope.envelope_xdr(),
+                    &signer,
+                    MAINNET,
+                    MainnetConsumer::CliPay,
+                    &auth
+                )
+                .await
+                .is_err()
+            );
+            assert_eq!(signer.sign_calls(), 1);
+            f.assert_claimed_holds(auth.id(), 70);
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn a_late_classic_signature_is_discarded() {
+            let f = fixtures::LedgerFixture::new("late-classic", NOW);
+            let (envelope, auth) = ledger_authorization(&f);
+            let signer = CountingSigner::advancing_clock_to(SIGNER_SEED, auth.expires_at_ms());
+            assert!(matches!(
+                authorized_signature(
+                    envelope.envelope_xdr(),
+                    &signer,
+                    MAINNET,
+                    MainnetConsumer::CliPay,
+                    &auth
+                )
+                .await,
+                Err(AuthorizedPathError::Refused(P::Expired))
+            ));
+            assert_eq!(signer.sign_calls(), 1);
+            f.assert_claimed_holds(auth.id(), 70);
+        }
+
         /// The valid case signs once, and the attached signature verifies
         /// under the transaction's mainnet payload.
         #[tokio::test]
@@ -1002,7 +1178,7 @@ mod tests {
                 &signer,
                 MAINNET,
                 MainnetConsumer::CliPay,
-                &case.authorization(|_, _| {}),
+                &case.minted_authorization(),
             )
             .await
             .expect("a valid authorization signs");
@@ -1272,14 +1448,15 @@ mod tests {
         }
 
         /// A signer that returns a signature that does not verify is refused
-        /// after it signed, and nothing is attached.
+        /// after it signed, and nothing is attached. Each path signs under
+        /// its own freshly claimed authorization.
         #[tokio::test]
         #[serial]
         async fn a_bad_signature_is_refused_after_signing() {
             let _clock = set_now_ms_for_test(NOW);
             let case = Case::new();
             let signer = CountingSigner::corrupting(SIGNER_SEED);
-            let authorization = case.authorization(|_, _| {});
+            let authorization = case.minted_authorization();
 
             let result = authorized_signature(
                 case.unsigned.envelope_xdr(),
@@ -1295,16 +1472,19 @@ mod tests {
             ));
             assert_eq!(signer.sign_calls(), 1);
 
+            let public = Case::new();
+            let public_authorization = public.minted_authorization();
             let err = attach_signature_authorized(
-                case.unsigned.envelope_xdr(),
+                public.unsigned.envelope_xdr(),
                 &signer,
                 MAINNET,
                 MainnetConsumer::CliPay,
-                &authorization,
+                &public_authorization,
             )
             .await
             .expect_err("a bad signature is refused");
             assert_eq!(err.code(), "network.mainnet_authorization_refused");
+            assert_eq!(signer.sign_calls(), 2);
         }
     }
 }

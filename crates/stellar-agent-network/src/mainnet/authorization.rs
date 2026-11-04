@@ -452,6 +452,13 @@ pub(crate) struct ApprovalBinding {
     pub(crate) expires_at_ms: u64,
 }
 
+/// The store and profile whose ledger grants this signing authority.
+#[cfg(feature = "mainnet-write")]
+pub(crate) struct ClaimTarget {
+    pub(crate) store: crate::policy_state::PersistedWindowStore,
+    pub(crate) profile: stellar_agent_core::profile::schema::Profile,
+}
+
 /// The facts every mainnet authorization binds.
 ///
 /// Assembled only by this crate's resolvers. `expires_at_ms` is the earlier
@@ -462,6 +469,7 @@ pub(crate) struct ApprovalBinding {
 /// authorization lives.
 #[cfg(feature = "mainnet-write")]
 pub(crate) struct Header {
+    pub(crate) claim: ClaimTarget,
     pub(crate) id: AuthorizationId,
     pub(crate) profile: String,
     pub(crate) chain: Caip2,
@@ -482,6 +490,25 @@ pub(crate) struct Header {
 
 #[cfg(feature = "mainnet-write")]
 impl Header {
+    pub(crate) fn claim(&self) -> Result<(), MainnetAuthorizationError> {
+        self.claim
+            .store
+            .claim_authorization(
+                &self.claim.profile,
+                self.id,
+                &crate::policy_state::ClaimExpect {
+                    domain: self.domain,
+                    consumer: self.consumer,
+                    bindings_digest: self.bindings_digest,
+                    policy_sequence: self.policy.sequence,
+                    policy_digest: self.policy.digest,
+                    approval_nonce: self.approval.nonce.clone(),
+                },
+            )
+            .map(|_| ())
+            .map_err(super::mint::store_error)
+    }
+
     fn check_profile(&self, profile: &str) -> Result<(), MainnetAuthorizationError> {
         require(self.profile == profile, P::ProfileMismatch)
     }
@@ -993,6 +1020,17 @@ debug_impl!(
 );
 
 impl MainnetTxSignAuthorization {
+    pub(crate) fn claim(&self) -> Result<(), MainnetAuthorizationError> {
+        #[cfg(feature = "mainnet-write")]
+        {
+            self.0.header.claim()
+        }
+        #[cfg(not(feature = "mainnet-write"))]
+        {
+            match self.0.never {}
+        }
+    }
+
     pub(crate) fn entries(
         &self,
     ) -> &[stellar_agent_core::policy::v1::criteria::state_store::WindowEntry] {
@@ -1065,6 +1103,17 @@ impl MainnetTxSignAuthorization {
 }
 
 impl MainnetSorobanIntentAuthorization {
+    pub(crate) fn claim(&self) -> Result<(), MainnetAuthorizationError> {
+        #[cfg(feature = "mainnet-write")]
+        {
+            self.0.header.claim()
+        }
+        #[cfg(not(feature = "mainnet-write"))]
+        {
+            match self.0.never {}
+        }
+    }
+
     #[cfg_attr(
         not(feature = "mainnet-write"),
         expect(dead_code, reason = "uninhabited without mainnet writes")
@@ -1406,6 +1455,21 @@ mod tests {
             fn header(&self, domain: AuthorizationDomain, endpoint: bool) -> Header {
                 let id = AuthorizationId::from_bytes(ID);
                 Header {
+                    claim: ClaimTarget {
+                        store: crate::policy_state::PersistedWindowStore::at_path(
+                            self._dir.path().join("state.window"),
+                        ),
+                        profile:
+                            stellar_agent_core::profile::schema::Profile::builder_mainnet_named(
+                                "mainnet-profile",
+                                "https://rpc.example",
+                                "signer",
+                                "account",
+                                "nonce",
+                                "nonce",
+                            )
+                            .build(),
+                    },
                     id,
                     profile: "mainnet-profile".to_owned(),
                     chain: Caip2::Mainnet,
@@ -2108,6 +2172,10 @@ mod tests {
                 .map(WindowReservation::fact_digest);
             assert_eq!(minted.bindings_digest, bindings_digest(&facts));
             let header = Header {
+                claim: ClaimTarget {
+                    store: store.clone(),
+                    profile: profile.clone(),
+                },
                 id: minted.id,
                 profile: name,
                 chain: Caip2::Mainnet,

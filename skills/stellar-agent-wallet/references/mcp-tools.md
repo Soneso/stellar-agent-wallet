@@ -956,7 +956,10 @@ the mainnet authorization for this payment was refused; the payment payload was 
 A withheld payment payload does not establish that no signature exists. The
 configured RPC can already have received the signed authorization during
 re-simulation. A consumed payment intent retains its debit after a later
-failure. An open intent can be invalidated before consumption.
+failure. An intent can be invalidated before it is signed. Once signed, it stays
+charged until it is consumed or leaves the spending windows. A signer that
+refuses or fails after the claim leaves the spend counted, and an identical
+retry waits for the record's expiry.
 
 After `profile enable-mainnet` or `profile sign-policy`, restart the MCP server.
 A changed startup binding returns `network.mainnet_write_forbidden`:

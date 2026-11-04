@@ -1,8 +1,8 @@
 //! Sealed composition of checked proofs and durable authorization records.
 
 use super::authorization::{
-    ApprovalBinding, EndpointBinding, Header, MainnetMessageSignAuthorization, MessageSignInner,
-    PolicyBinding, SignerBinding,
+    ApprovalBinding, ClaimTarget, EndpointBinding, Header, MainnetMessageSignAuthorization,
+    MessageSignInner, PolicyBinding, SignerBinding,
 };
 use super::{MainnetAuthorizationError, MainnetPrecondition, SignerRole};
 use crate::policy_state::{MintRequest, MintedRecord, WindowStoreError};
@@ -29,6 +29,7 @@ pub(crate) fn store_error(error: WindowStoreError) -> MainnetAuthorizationError 
 )]
 pub(crate) fn header(
     context: &crate::MainnetWriteContext,
+    store: &crate::policy_state::PersistedWindowStore,
     request: &MintRequest,
     minted: MintedRecord,
     endpoint: &crate::endpoint_identity::EndpointIdentity,
@@ -40,6 +41,7 @@ pub(crate) fn header(
 ) -> Header {
     assemble(
         context,
+        store,
         request,
         minted,
         Some(EndpointBinding {
@@ -64,8 +66,13 @@ pub(crate) fn header(
 /// [`SignerRole::Sep10Ephemeral`] role, not an enrolled signer. It binds no
 /// witness subject. The binding moves out of `request` into the
 /// authorization.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the header binds every independently checked proof"
+)]
 pub(crate) fn message(
     context: &crate::MainnetWriteContext,
+    store: &crate::policy_state::PersistedWindowStore,
     request: MintRequest,
     minted: MintedRecord,
     ephemeral_public_key: [u8; 32],
@@ -75,6 +82,7 @@ pub(crate) fn message(
 ) -> MainnetMessageSignAuthorization {
     let header = assemble(
         context,
+        store,
         &request,
         minted,
         None,
@@ -104,6 +112,7 @@ pub(crate) fn message(
 )]
 fn assemble(
     context: &crate::MainnetWriteContext,
+    store: &crate::policy_state::PersistedWindowStore,
     request: &MintRequest,
     minted: MintedRecord,
     endpoint: Option<EndpointBinding>,
@@ -114,6 +123,10 @@ fn assemble(
     audit: super::audit_readiness::AuditReadiness,
 ) -> Header {
     Header {
+        claim: ClaimTarget {
+            store: store.clone(),
+            profile: context.profile().clone(),
+        },
         id: minted.id,
         profile: context.profile_name().to_owned(),
         chain: context.chain(),

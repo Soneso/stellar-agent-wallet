@@ -218,7 +218,9 @@ The `x402_authorization_withheld` stages are `anchor_unavailable`,
 `terminal_approval`. The transmit gate checks the anchor before and after its
 authorization row. At `anchor_unavailable`, the signature stays in the wallet.
 On testnet, the spend that policy admitted earlier in the call remains. Mainnet retains the debit
-after intent consumption. Refusal before consumption invalidates the open intent.
+after intent consumption. Refusal before signing invalidates the open intent.
+After signing, the intent stays charged until it is consumed or leaves the
+spending windows.
 
 ### `stellar_x402_authenticated_payment`
 
