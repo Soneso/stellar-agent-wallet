@@ -30,6 +30,7 @@ const SIGNER_CONSTRUCTORS: &[&str] = &[
     "lazy_signer_from_keyring(",
     "resolve_signer(",
     "CommonHandlerContext::new(",
+    "CommonHandlerContext::new_admitted(",
     "resolve_deployer_keypair(",
     "require_enrolled_signer(",
 ];
