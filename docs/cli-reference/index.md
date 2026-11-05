@@ -97,10 +97,10 @@ unset WALLET_SK
 
 A signing command refuses before any signature or send when its signer source fails:
 
-- no signer-source flag is passed: `validation.signer_source_required`, which names the flags the command accepts;
+- no signer-source flag is passed: `validation.signer_source_required`, which names the flags the command accepts, or `validation.usage_error` on a command that requires a signer-source flag, such as `accounts deploy-c` and `smart-account multicall`;
 - the named environment variable is not set: `validation.secret_env_not_set`, which names the variable and never its value;
 - the named variable holds no valid S-strkey: `validation.secret_env_invalid`, which names the variable and never its value;
-- the key's public key is not the `--source` account: `auth.signer_key_mismatch`, which reports the derived public key beside the `--source` account.
+- the key's public key is not the account or key the command expects: `auth.signer_key_mismatch`, which reports the derived public key beside the expected value.
 
 `profile.key_scope_conflict` reports shared, self-colliding or out-of-scope
 keyring entries, a non-default owner account, or an unreadable comparison input.
