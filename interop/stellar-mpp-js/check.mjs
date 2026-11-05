@@ -118,6 +118,9 @@ const rejected = await gate(
     headers: { Authorization: alteredAuthorization },
   }),
 )
-assert.notEqual(rejected.status, 200, 'the released server accepted an altered challenge')
+assert.equal(rejected.status, 402, 'the released server accepted an altered challenge')
+const reissued = Challenge.fromResponse(rejected.challenge, { methods: [serverMethod] })
+assert.equal(reissued.method, 'stellar')
+assert.equal(reissued.intent, 'charge')
 
 console.log('Stellar MPP released-SDK interoperability checks passed')
