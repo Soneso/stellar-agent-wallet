@@ -2378,22 +2378,26 @@ pub enum AuthError {
     },
 
     /// The signing key's derived public key does not match the identity the
-    /// command expected.
+    /// command expects.
     ///
     /// `what` names that identity: a flag such as `--source`, `--sponsor`, or
     /// `--expect-rule-signer`, or a description such as `the expected signing
     /// account`, `the cached signing public key`, or `the keyring entry's
-    /// account`. `expected` holds a G-strkey, a lowercase hex public key, or a
-    /// redacted account with `got` set to `invalid public account`. `got`
-    /// holds the public key derived from the signing key (software) or fetched
-    /// from the device (hardware). None carries secret material.
+    /// account`. `expected` holds a G-strkey, the caller's original hex public
+    /// key, or a redacted account. `got` holds the public key derived from
+    /// the signing key (software) or fetched from the device (hardware).
+    /// When the lazy keyring construction rejects an invalid G-strkey,
+    /// `expected` holds the redacted input and `got` holds `invalid public
+    /// account`.
+    /// None carries secret material.
     #[error("signing key public key '{got}' does not match {what} '{expected}'")]
     SignerKeyMismatch {
         /// The identity `expected` stands for, rendered in the message.
         what: &'static str,
         /// The caller-supplied, profile, or cached public identity.
         expected: String,
-        /// The public key derived from or fetched via the signing key.
+        /// The public key derived from or fetched via the signing key, or the
+        /// invalid public account sentinel.
         got: String,
     },
 
@@ -4149,8 +4153,7 @@ mod tests {
         assert_eq!(e.code(), "network.mainnet_write_forbidden");
     }
 
-    /// `SignerKeyMismatch` names the identity the signing key failed to match,
-    /// so a `--sponsor` or cached-key mismatch no longer reads as `--source`.
+    /// The mismatch message names each comparison context.
     #[test]
     fn signer_key_mismatch_message_names_each_context() {
         let cases: [(&'static str, &str, &str, &str); 6] = [

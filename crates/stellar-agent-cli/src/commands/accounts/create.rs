@@ -2472,7 +2472,7 @@ mod tests {
     }
 
     /// A `--secret-env` seed for another account than the sponsor is refused
-    /// before signing, and the message names `--sponsor`, not `--source`.
+    /// before signing, and the message names `--sponsor`.
     #[allow(unsafe_code, reason = "serialized test seed variable")]
     #[tokio::test]
     #[serial_test::serial]

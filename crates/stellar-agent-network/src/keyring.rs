@@ -1943,6 +1943,13 @@ mod tests {
         drop(_guard);
 
         assert_eq!(err.code(), "auth.signer_key_mismatch");
+        assert_eq!(
+            err.message(),
+            format!(
+                "signing key public key '{}' does not match the cached signing public key '{expected_g}'",
+                gstrkey_for_seed([0xDD_u8; 32])
+            )
+        );
         let logs = writer.captured_str();
         assert!(logs.contains("keyring.sign.failure"), "{logs}");
         assert!(logs.contains("\"target\":\"keyring\""), "{logs}");
@@ -2042,7 +2049,14 @@ mod tests {
             .await
             .expect_err("first signature call must open the missing keyring");
         assert_eq!(error.code(), "auth.keyring_platform_error");
-        assert!(lazy_signer_from_keyring(&entry_ref, "not-a-g-strkey").is_err());
+        let error = lazy_signer_from_keyring(&entry_ref, "not-a-g-strkey")
+            .err()
+            .expect("an invalid account refuses");
+        assert_eq!(error.code(), "auth.signer_key_mismatch");
+        assert_eq!(
+            error.message(),
+            "signing key public key 'invalid public account' does not match the keyring entry's account 'not-a...trkey'"
+        );
     }
 
     // ── Audit-log tip anchor ─────────────────────────────────────────────────
