@@ -974,7 +974,8 @@ struct FriendbotRetryPolicy {
     attempts: u32,
     /// The longest one attempt may take, from connection through the body.
     attempt_timeout: Duration,
-    /// The pause before the second attempt and before every later one.
+    /// The pause before the second attempt, then the pause before every later
+    /// one.
     backoffs: [Duration; 2],
     /// The total time of one invocation, attempts and pauses included.
     deadline: Duration,
@@ -1007,7 +1008,7 @@ const FRIENDBOT_FAILURE_BODY_LIMIT: usize = 512;
 /// that is shorter, from connection through the response body. The pauses
 /// before the second and the third attempt are 250 and 500 milliseconds, and
 /// they count against the same deadline. No attempt starts once the deadline
-/// has passed.
+/// has passed, the first attempt included.
 ///
 /// A response that receives no further retry returns with its body unread.
 /// That covers every status below 500, and a 5xx response the attempt count
@@ -1020,12 +1021,14 @@ const FRIENDBOT_FAILURE_BODY_LIMIT: usize = 512;
 ///
 /// # Errors
 ///
-/// Returns the HTTP client's error when the URL does not parse or the client
-/// cannot be built, and the last attempt's error when every attempt failed to
-/// send, a timeout included.
+/// [`FriendbotRequestError::Request`] with the HTTP client's error when the
+/// URL does not parse or the client cannot be built, and with the last
+/// attempt's error when every attempt failed to send, a timeout included.
+/// [`FriendbotRequestError::DeadlineElapsed`] when the deadline passed before
+/// the first attempt could start.
 pub async fn friendbot_funding_request(
     url: impl reqwest::IntoUrl,
-) -> Result<reqwest::Response, reqwest::Error> {
+) -> Result<reqwest::Response, FriendbotRequestError> {
     friendbot_request_with_policy(url, &FRIENDBOT_RETRY).await.0
 }
 
@@ -1044,8 +1047,8 @@ pub async fn friendbot_funding_request(
 /// # Errors
 ///
 /// [`FriendbotFundingError`] when the URL or the client cannot be built,
-/// every attempt failed to send, or the final response is neither successful
-/// nor an already funded 400.
+/// every attempt failed to send, the deadline passed before the first attempt,
+/// or the final response is neither successful nor an already funded 400.
 pub async fn friendbot_fund(url: &str) -> Result<(), FriendbotFundingError> {
     friendbot_fund_with_policy(url, &FRIENDBOT_RETRY).await
 }
@@ -1059,9 +1062,13 @@ async fn friendbot_fund_with_policy(
     let mut response = match outcome {
         Ok(response) => response,
         Err(error) => {
+            let cause = match error {
+                FriendbotRequestError::Request(error) => FundingCause::Transport(error),
+                FriendbotRequestError::DeadlineElapsed => FundingCause::DeadlineElapsed,
+            };
             return Err(FriendbotFundingError {
                 attempts,
-                cause: FundingCause::Transport(error),
+                cause,
                 body: FailureBody::Unavailable,
             });
         }
@@ -1099,6 +1106,9 @@ async fn read_failure_body_prefix(response: &mut reqwest::Response) -> Vec<u8> {
 
 /// Whether a Friendbot failure body reports that the account is already
 /// funded, compared without regard to ASCII case.
+///
+/// Its twin is `reports_already_funded` in `stellar-agent-network`'s
+/// Friendbot module, which production funding uses; both keep one rule.
 fn reports_already_funded(body: &[u8]) -> bool {
     String::from_utf8_lossy(body)
         .to_ascii_lowercase()
@@ -1111,30 +1121,40 @@ fn reports_already_funded(body: &[u8]) -> bool {
 /// The client is built once, without idle connections, so every attempt
 /// connects anew. A send error and a 5xx status permit another attempt while
 /// the attempt count and the deadline allow one; every other response ends
-/// the run unread. An earlier response is dropped unread once the next
+/// the run unread. The deadline is checked before every attempt, the first
+/// included, and before the count rises. A deadline that has passed returns
+/// the latest outcome, or [`FriendbotRequestError::DeadlineElapsed`] when no
+/// attempt started. An earlier response is dropped unread before the next
 /// attempt starts.
 async fn friendbot_request_with_policy(
     url: impl reqwest::IntoUrl,
     policy: &FriendbotRetryPolicy,
-) -> (Result<reqwest::Response, reqwest::Error>, u32) {
+) -> (Result<reqwest::Response, FriendbotRequestError>, u32) {
     let deadline = tokio::time::Instant::now() + policy.deadline;
     let client = match reqwest::Client::builder().pool_max_idle_per_host(0).build() {
         Ok(client) => client,
-        Err(error) => return (Err(error), 0),
+        Err(error) => return (Err(FriendbotRequestError::Request(error)), 0),
     };
     let url = match client.get(url).build() {
         Ok(request) => request.url().clone(),
-        Err(error) => return (Err(error), 0),
+        Err(error) => return (Err(FriendbotRequestError::Request(error)), 0),
     };
     let mut attempts = 0;
+    let mut latest = None;
     loop {
         let budget = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if budget.is_zero() {
+            let outcome = latest.unwrap_or(Err(FriendbotRequestError::DeadlineElapsed));
+            return (outcome, attempts);
+        }
+        drop(latest.take());
         attempts += 1;
         let outcome = client
             .get(url.clone())
             .timeout(policy.attempt_timeout.min(budget))
             .send()
-            .await;
+            .await
+            .map_err(FriendbotRequestError::Request);
         let retryable = match &outcome {
             Ok(response) => response.status().is_server_error(),
             Err(_) => true,
@@ -1142,23 +1162,55 @@ async fn friendbot_request_with_policy(
         if !retryable || attempts >= policy.attempts {
             return (outcome, attempts);
         }
-        // The pause counts against the deadline, and the deadline is checked
-        // again before the next attempt starts.
+        // The pause counts against the deadline: a pause that would end at or
+        // after it returns this outcome without sleeping.
         let resume = tokio::time::Instant::now() + policy.backoff_after(attempts);
         if resume >= deadline {
             return (outcome, attempts);
         }
         tokio::time::sleep_until(resume).await;
-        if tokio::time::Instant::now() >= deadline {
-            return (outcome, attempts);
+        latest = Some(outcome);
+    }
+}
+
+/// Why [`friendbot_funding_request`] returned no response.
+#[derive(Debug)]
+pub enum FriendbotRequestError {
+    /// The HTTP client's error: the URL did not parse, the client could not
+    /// be built, or the last attempt failed to send.
+    Request(reqwest::Error),
+    /// The deadline passed before the first attempt could start, so no
+    /// request was sent.
+    DeadlineElapsed,
+}
+
+impl fmt::Display for FriendbotRequestError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Request(error) => fmt::Display::fmt(error, f),
+            Self::DeadlineElapsed => f.write_str(DEADLINE_ELAPSED_BEFORE_FIRST_ATTEMPT),
         }
     }
 }
 
+impl Error for FriendbotRequestError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Request(error) => error.source(),
+            Self::DeadlineElapsed => None,
+        }
+    }
+}
+
+/// The text of a deadline that passed before the first Friendbot attempt.
+const DEADLINE_ELAPSED_BEFORE_FIRST_ATTEMPT: &str =
+    "the Friendbot request deadline elapsed before the first attempt started";
+
 /// Why [`friendbot_fund`] did not fund the account.
 ///
 /// It carries the number of attempts that started, the final status or
-/// transport cause, and at most 512 bytes of the final response body. Its
+/// transport cause or the deadline that passed before the first attempt, and
+/// at most 512 bytes of the final response body. Its
 /// `Display` and `Debug` forms show all three.
 pub struct FriendbotFundingError {
     attempts: u32,
@@ -1173,6 +1225,8 @@ enum FundingCause {
     Status(reqwest::StatusCode),
     /// The final error of the request, or of the URL or client construction.
     Transport(reqwest::Error),
+    /// The deadline passed before the first attempt could start.
+    DeadlineElapsed,
 }
 
 /// The retained part of the final response body.
@@ -1200,6 +1254,7 @@ impl fmt::Display for FundingCause {
         match self {
             Self::Status(status) => write!(f, "HTTP status {status}"),
             Self::Transport(error) => f.write_str(&error_chain(error)),
+            Self::DeadlineElapsed => f.write_str(DEADLINE_ELAPSED_BEFORE_FIRST_ATTEMPT),
         }
     }
 }
@@ -1209,6 +1264,10 @@ impl fmt::Debug for FundingCause {
         match self {
             Self::Status(status) => write!(f, "Status({status})"),
             Self::Transport(error) => write!(f, "Transport({:?})", error_chain(error)),
+            Self::DeadlineElapsed => write!(
+                f,
+                "DeadlineElapsed({DEADLINE_ELAPSED_BEFORE_FIRST_ATTEMPT:?})"
+            ),
         }
     }
 }
@@ -1259,7 +1318,7 @@ impl fmt::Debug for FriendbotFundingError {
 impl Error for FriendbotFundingError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match &self.cause {
-            FundingCause::Status(_) => None,
+            FundingCause::Status(_) | FundingCause::DeadlineElapsed => None,
             FundingCause::Transport(error) => Some(error),
         }
     }
@@ -1506,7 +1565,7 @@ mod tests {
         }
     }
 
-    /// The fixture every earlier test used: each request receives `response`.
+    /// Each request receives `response`.
     async fn friendbot_response(response: &'static [u8]) -> (String, Friendbot) {
         let friendbot = friendbot_serving(vec![bytes(response)]).await;
         (friendbot.url.clone(), friendbot)
@@ -1531,8 +1590,22 @@ mod tests {
         policy(3, 2_000, [50, 50], 10_000)
     }
 
-    fn status_of(outcome: Result<reqwest::Response, reqwest::Error>) -> reqwest::StatusCode {
+    fn status_of(outcome: Result<reqwest::Response, FriendbotRequestError>) -> reqwest::StatusCode {
         outcome.expect("HTTP response").status()
+    }
+
+    /// The HTTP client's error of an outcome that holds no response.
+    fn request_error(
+        outcome: Result<reqwest::Response, FriendbotRequestError>,
+        context: &str,
+    ) -> reqwest::Error {
+        match outcome {
+            Err(FriendbotRequestError::Request(error)) => error,
+            Err(FriendbotRequestError::DeadlineElapsed) => {
+                panic!("{context}: the deadline elapsed before the first attempt")
+            }
+            Ok(response) => panic!("{context}: {response:?}"),
+        }
     }
 
     #[tokio::test]
@@ -1557,11 +1630,11 @@ mod tests {
         ] {
             let (url, server) = friendbot_response(headers).await;
             let error = tokio::time::timeout(Duration::from_secs(5), async {
-                let response = friendbot_request_with_policy(&url, &policy(1, 200, [0, 0], 200))
+                let response = friendbot_request_with_policy(&url, &policy(1, 200, [0, 0], 65_000))
                     .await
                     .0;
                 if headers.is_empty() {
-                    response.expect_err("stalled headers must time out")
+                    request_error(response, "stalled headers must time out")
                 } else {
                     response
                         .expect("headers must arrive before the deadline")
@@ -1667,6 +1740,10 @@ mod tests {
                 404,
                 b"HTTP/1.1 404 Not Found\r\nContent-Length: 5\r\n\r\nfirst".as_slice(),
             ),
+            (
+                429,
+                b"HTTP/1.1 429 Too Many Requests\r\nContent-Length: 5\r\n\r\nfirst".as_slice(),
+            ),
         ] {
             let friendbot = friendbot_serving(vec![bytes(response), bytes(OK)]).await;
 
@@ -1684,7 +1761,7 @@ mod tests {
     async fn friendbot_unbuildable_url_sends_nothing() {
         for url in ["not a url", "http://", "mailto:account@example.invalid"] {
             let (outcome, attempts) = friendbot_request_with_policy(url, &quick()).await;
-            let error = outcome.expect_err("the URL cannot be built");
+            let error = request_error(outcome, "the URL cannot be built");
             assert!(error.is_builder(), "{url}: {error}");
             assert_eq!(attempts, 0, "{url}");
 
@@ -1731,18 +1808,57 @@ mod tests {
     }
 
     /// A pause that would end past the deadline starts no further attempt and
-    /// keeps the failure before it.
+    /// keeps the failure before it, and the call returns without that pause.
     #[tokio::test]
     async fn friendbot_total_deadline_includes_backoff() {
         let friendbot = friendbot_serving(vec![stall(), bytes(OK)]).await;
+        let started = Instant::now();
 
         let (outcome, attempts) =
             friendbot_request_with_policy(&friendbot.url, &policy(3, 100, [400, 400], 300)).await;
 
-        let error = outcome.expect_err("the stalled attempt is the outcome");
+        let elapsed = started.elapsed();
+        let error = request_error(outcome, "the stalled attempt is the outcome");
         assert!(error.is_timeout(), "{error}");
         assert_eq!(attempts, 1, "no attempt starts after the deadline");
         assert_eq!(friendbot.requests(), [0]);
+        assert!(
+            elapsed < Duration::from_millis(400),
+            "the pause never runs past the deadline: {elapsed:?}"
+        );
+    }
+
+    /// A deadline that has passed before the first attempt starts no attempt,
+    /// and the error names the elapsed deadline.
+    #[tokio::test]
+    async fn friendbot_expired_deadline_starts_no_attempt() {
+        let friendbot = friendbot_serving(vec![bytes(OK)]).await;
+        let expired = policy(3, 2_000, [50, 50], 0);
+
+        let (outcome, attempts) = friendbot_request_with_policy(&friendbot.url, &expired).await;
+        assert!(
+            matches!(outcome, Err(FriendbotRequestError::DeadlineElapsed)),
+            "{outcome:?}"
+        );
+        assert_eq!(attempts, 0);
+
+        let error = friendbot_fund_with_policy(&friendbot.url, &expired)
+            .await
+            .expect_err("no attempt funds the account");
+        assert_eq!(error.attempts, 0);
+        assert!(
+            matches!(error.cause, FundingCause::DeadlineElapsed),
+            "{error:?}"
+        );
+        assert!(matches!(error.body, FailureBody::Unavailable), "{error:?}");
+        let display = error.to_string();
+        assert!(display.contains("after 0 attempts"), "{display}");
+        assert!(
+            display.contains("deadline elapsed before the first attempt started"),
+            "{display}"
+        );
+        assert!(friendbot.connections().is_empty(), "no connection opens");
+        assert!(friendbot.requests().is_empty(), "no request is sent");
     }
 
     /// The last attempt receives only the time the deadline leaves.
@@ -1759,7 +1875,7 @@ mod tests {
         .expect("the run ends");
 
         let elapsed = started.elapsed();
-        let error = outcome.expect_err("the stalled attempt is the outcome");
+        let error = request_error(outcome, "the stalled attempt is the outcome");
         assert!(error.is_timeout(), "{error}");
         assert_eq!(attempts, 3);
         assert_eq!(friendbot.requests(), [0, 1, 2]);
@@ -1812,6 +1928,19 @@ mod tests {
             error.to_string().contains("the address is not a valid key"),
             "{error}"
         );
+
+        let friendbot = friendbot_serving(vec![bytes(
+            b"HTTP/1.1 404 Not Found\r\nContent-Length: 14\r\n\r\nalready funded",
+        )])
+        .await;
+        let error = friendbot_fund_with_policy(&friendbot.url, &quick())
+            .await
+            .expect_err("only a 400 reports an already funded account");
+        assert!(
+            matches!(error.cause, FundingCause::Status(status) if status == reqwest::StatusCode::NOT_FOUND),
+            "{error:?}"
+        );
+        assert_eq!(error.attempts, 1);
     }
 
     #[tokio::test]
@@ -1855,6 +1984,33 @@ mod tests {
         friendbot_fund_with_policy(&friendbot.url, &quick())
             .await
             .expect("the prefix reports an already funded account");
+
+        // The body declares more bytes than it sends and stalls after the
+        // prefix: the read ends at the prefix, well inside the attempt timeout.
+        let mut stalled = format!(
+            "HTTP/1.1 400 Bad Request\r\nContent-Length: {}\r\n\r\n",
+            4 * FRIENDBOT_FAILURE_BODY_LIMIT
+        )
+        .into_bytes();
+        stalled.extend_from_slice(&filler);
+        let friendbot = friendbot_serving(vec![Answer::Bytes(stalled)]).await;
+        let attempt_timeout_ms = 4_000;
+        let started = Instant::now();
+        let error = friendbot_fund_with_policy(
+            &friendbot.url,
+            &policy(1, attempt_timeout_ms, [0, 0], 10_000),
+        )
+        .await
+        .expect_err("a 400 of another kind refuses");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(attempt_timeout_ms / 4),
+            "the read stops at the prefix: {elapsed:?}"
+        );
+        match &error.body {
+            FailureBody::Prefix(prefix) => assert_eq!(prefix, &filler),
+            FailureBody::Unavailable => panic!("a body arrived: {error:?}"),
+        }
     }
 
     /// The error reports the final answer: its status, its body, and the

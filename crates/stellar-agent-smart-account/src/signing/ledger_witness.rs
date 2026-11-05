@@ -156,8 +156,19 @@ enum PairRefusal {
     Terminal(SaError),
 }
 
+impl PairRefusal {
+    /// The refusal a caller receives for this pair: the skew mismatch for a
+    /// skewed pair, and the terminal refusal itself otherwise.
+    fn into_error(self) -> SaError {
+        match self {
+            Self::Skew { .. } => mismatch(reason::SKEW),
+            Self::Terminal(error) => error,
+        }
+    }
+}
+
 /// What made the acquisition loop discard a pair.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy)]
 enum Trigger {
     /// The older observation of an otherwise valid pair passed
     /// [`MAX_OBSERVATION_AGE`].
@@ -188,7 +199,11 @@ impl RejectedPair {
     /// refusal for a skewed pair and the stale refusal for a stale one.
     fn into_refusal(self) -> SaError {
         match self.trigger {
-            Trigger::Skew => mismatch(reason::SKEW),
+            Trigger::Skew => PairRefusal::Skew {
+                primary: self.primary,
+                secondary: self.secondary,
+            }
+            .into_error(),
             Trigger::Stale => unavailable(reason::STALE),
         }
     }
@@ -200,10 +215,7 @@ impl WitnessedLedgerBound {
     /// witness binds through [`Self::bind_classified`].
     #[cfg(test)]
     fn bind(primary: ObservedLedger, secondary: ObservedLedger) -> Result<Self, SaError> {
-        Self::bind_classified(primary, secondary).map_err(|refusal| match refusal {
-            PairRefusal::Skew { .. } => mismatch(reason::SKEW),
-            PairRefusal::Terminal(error) => error,
-        })
+        Self::bind_classified(primary, secondary).map_err(PairRefusal::into_error)
     }
 
     /// Binds a pair of observations, or refuses it with the kind of refusal
@@ -361,11 +373,11 @@ pub fn checked_secondary_rpc_url<'a>(
 /// Both endpoint identities complete before either height request starts.
 /// The two height requests run concurrently under the same deadline, that of
 /// `request.budget`. Each witness call checks both identities once. Each
-/// repeated acquisition replaces both heights and their receipt times: a
-/// pair that is stale or skewed is read again as a pair, at most
-/// [`MAX_PAIR_ACQUISITIONS`] pairs in all and only while the deadline has not
-/// passed, and a fresh height is never combined with a retained one. The
-/// accepted pair passes every identity, height, skew, and freshness check.
+/// repeated acquisition replaces both heights and their receipt times. A
+/// stale or skewed pair permits another acquisition while the count and
+/// deadline allow it. [`MAX_PAIR_ACQUISITIONS`] bounds the total number of
+/// pairs. The accepted pair passes every identity, height, skew, and
+/// freshness check.
 ///
 /// Signing refuses when it cannot obtain fresh, agreeing ledger observations
 /// within the pre submit deadline. Persistent disagreement keeps the skew
@@ -452,9 +464,9 @@ where
                 trigger = previous.trigger.as_str(),
                 primary_ledger = previous.primary.ledger,
                 secondary_ledger = previous.secondary.ledger,
-                primary_age_ms = age_ms(previous.primary.observed_at, now),
-                secondary_age_ms = age_ms(previous.secondary.observed_at, now),
-                remaining_ms = age_ms(now, budget.deadline),
+                primary_age_ms = millis_between(previous.primary.observed_at, now),
+                secondary_age_ms = millis_between(previous.secondary.observed_at, now),
+                remaining_ms = millis_between(now, budget.deadline),
                 primary = %previous.primary.authority,
                 secondary = %previous.secondary.authority,
                 "ledger witness reads the pair again",
@@ -482,9 +494,8 @@ where
     ))
 }
 
-/// Milliseconds from `earlier` to `later`, zero when `later` is not after
-/// it, saturated at `u64::MAX`.
-fn age_ms(earlier: Instant, later: Instant) -> u64 {
+/// Milliseconds from `earlier` to `later`, zero when `later` is not after it.
+fn millis_between(earlier: Instant, later: Instant) -> u64 {
     u64::try_from(later.saturating_duration_since(earlier).as_millis()).unwrap_or(u64::MAX)
 }
 
@@ -1152,25 +1163,63 @@ mod tests {
         assert_eq!(bound.signature_expiration_ledger().unwrap(), 1103);
     }
 
+    /// A pair whose observations arrived `primary_age` and `secondary_age`
+    /// before now.
+    fn classified_aged(
+        primary: u32,
+        secondary: u32,
+        primary_age: Duration,
+        secondary_age: Duration,
+    ) -> Result<WitnessedLedgerBound, PairRefusal> {
+        let now = Instant::now();
+        WitnessedLedgerBound::bind_classified(
+            observed_at(primary, PRIMARY, now.checked_sub(primary_age).unwrap()),
+            observed_at(
+                secondary,
+                SECONDARY,
+                now.checked_sub(secondary_age).unwrap(),
+            ),
+        )
+    }
+
     /// Each pair read again announces itself once, after the pair it
-    /// replaces, with the trigger, the discarded heights, and the redacted
-    /// authorities.
+    /// replaces, with the trigger, the discarded heights, their ages, the
+    /// remaining budget, and the redacted authorities.
     #[test]
     fn every_reread_has_a_debug_event() {
-        let runtime = tokio::runtime::Builder::new_current_thread()
+        // The paused clock moves only when an acquisition advances it, so
+        // every age and the remaining budget are exact.
+        let paused = tokio::runtime::Builder::new_current_thread()
             .enable_all()
+            .start_paused(true)
             .build()
             .unwrap();
         let logs = stellar_agent_test_support::log_capture::with_captured_trace_logs(|| {
-            runtime.block_on(async {
+            paused.block_on(async {
                 let calls = Cell::new(0);
                 acquire_fresh_pair(ample(), || {
                     calls.set(calls.get() + 1);
                     let attempt = calls.get();
                     async move {
                         match attempt {
-                            1 => stale(),
-                            2 => classified(1000, 1003),
+                            1 => {
+                                tokio::time::advance(Duration::from_millis(200)).await;
+                                classified_aged(
+                                    1000,
+                                    1000,
+                                    Duration::from_millis(11_000),
+                                    Duration::from_millis(10_500),
+                                )
+                            }
+                            2 => {
+                                tokio::time::advance(Duration::from_millis(300)).await;
+                                classified_aged(
+                                    1000,
+                                    1003,
+                                    Duration::from_millis(40),
+                                    Duration::from_millis(70),
+                                )
+                            }
                             _ => classified(1003, 1004),
                         }
                     }
@@ -1184,24 +1233,29 @@ mod tests {
             .filter(|line| line.contains("ledger witness reads the pair again"))
             .collect();
         assert_eq!(events.len(), 2, "{logs}");
-        for (event, attempt, trigger, primary, secondary) in [
-            (events[0], 2, "stale", 1000, 1000),
-            (events[1], 3, "skew", 1000, 1003),
+        for (event, attempt, trigger, primary, secondary, ages, remaining) in [
+            (events[0], 2, "stale", 1000, 1000, (11_000, 10_500), 29_800),
+            (events[1], 3, "skew", 1000, 1003, (40, 70), 29_500),
         ] {
             for field in [
-                format!("attempt={attempt}"),
-                format!("trigger=\"{trigger}\""),
-                format!("primary_ledger={primary}"),
-                format!("secondary_ledger={secondary}"),
-                format!("primary={PRIMARY}"),
+                format!("attempt={attempt} "),
+                format!("trigger=\"{trigger}\" "),
+                format!("primary_ledger={primary} "),
+                format!("secondary_ledger={secondary} "),
+                format!("primary_age_ms={} ", ages.0),
+                format!("secondary_age_ms={} ", ages.1),
+                format!("remaining_ms={remaining} "),
+                format!("primary={PRIMARY} "),
                 format!("secondary={SECONDARY}"),
             ] {
                 assert!(event.contains(&field), "{field} in {event}");
             }
-            for field in ["primary_age_ms=", "secondary_age_ms=", "remaining_ms="] {
-                assert!(event.contains(field), "{field} in {event}");
-            }
         }
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
 
         let logs = stellar_agent_test_support::log_capture::with_captured_trace_logs(|| {
             runtime.block_on(async {

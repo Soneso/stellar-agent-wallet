@@ -2639,17 +2639,19 @@ mod tests {
             const PAST_OBSERVATION_AGE: Duration = Duration::from_secs(11);
 
             /// Without an entry to sign, the envelope signature follows two
-            /// re-fetches and a re-simulation, which can outlast the pair. The
-            /// pair is read again before it: a fresh pair signs, a pair whose
-            /// second reading disagrees refuses with nothing signed, and a
-            /// re-read pair that has gone stale by the final check before the
-            /// signature, and at no check before it, refuses with nothing
+            /// re-fetches and a re-simulation, which can outlast the pair. A
+            /// stale pair receives a refresh before the first signature.
+            /// Persistent disagreement during that refresh refuses with
+            /// nothing signed or sent: the refresh reads the pair three times
+            /// and every reading disagrees. A fresh refreshed pair signs, and
+            /// a refreshed pair that has gone stale by the final check before
+            /// the signature, and at no check before it, refuses with nothing
             /// signed or sent. The cases run side by side.
             #[tokio::test]
             async fn a_stale_pair_is_read_again_before_a_first_envelope_signature() {
                 let (
                     (fresh, primary, secondary),
-                    (refused, refused_primary, _),
+                    (refused, refused_primary, refused_secondary),
                     (stale, stale_primary, stale_secondary),
                 ) = tokio::join!(
                     submit_source_account_only(Chain::at(LEDGER)),
@@ -2671,8 +2673,18 @@ mod tests {
 
                 match &refused.result {
                     Err(error) => assert_eq!(error.wire_code(), SKEW_CODE, "{error:?}"),
-                    Ok(_) => panic!("a disagreeing second reading went through"),
+                    Ok(_) => panic!("a disagreeing refresh went through"),
                 }
+                assert_eq!(
+                    refused_primary.ledger_reads(),
+                    4,
+                    "one fresh pair, then three disagreeing pairs"
+                );
+                assert_eq!(
+                    refused_secondary.ledger_reads(),
+                    4,
+                    "one fresh pair, then three disagreeing pairs"
+                );
                 assert_eq!(refused.signs, 0, "nothing is signed");
                 assert_eq!(refused_primary.sends().await, 0, "nothing is sent");
 

@@ -170,8 +170,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `PreparedSigningLedgerRead` checks an endpoint's identity once and reads
   its latest ledger through the same client under the same deadline.
-- `friendbot_fund` and `FriendbotFundingError` in the test-support testnet
-  helpers.
+- `friendbot_fund`, `FriendbotFundingError` and `FriendbotRequestError` in the
+  test-support testnet helpers.
 
 ### Changed
 
@@ -769,6 +769,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `WindowStoreLock::acquire` require the `test-helpers` feature;
   `PersistedWindowStore::resign` takes the profile; `PersistedWindowStore::path`
   is public.
+- `friendbot_funding_request` in the test-support testnet helpers returns
+  `FriendbotRequestError`. Its `DeadlineElapsed` variant reports a deadline
+  that expires before the first attempt, so no request starts.
 
 ### Removed
 
