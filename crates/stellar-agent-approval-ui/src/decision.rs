@@ -44,6 +44,17 @@
 //! authorization on a mainnet binding with `approval.presence_required`
 //! before any row or attestation. Both answer [`Outcome::PresenceRefused`]
 //! with the store unchanged. A reject needs no presence and is unchanged.
+//!
+//! # What the page showed
+//!
+//! An approve attests only the terms its page rendered. Every approval page
+//! carries the [`approval_view_digest`] of the entry it renders, and
+//! [`Decision::Approve`] carries the digest the request returned. After the
+//! entry is validated, the approve compares that digest with the digest of
+//! the entry it holds and refuses with `approval.presence_changed`
+//! ([`consent_changed`]) when the request named none or another one. The
+//! attester then refuses an entry that changed between that comparison and
+//! the persist. A reject attests nothing and carries no digest.
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -53,8 +64,8 @@ use stellar_agent_core::approval::presence::MAINNET_CHAIN_ID;
 use stellar_agent_core::approval::{
     ApprovalKind, ApproverIdentity, AttestedApprover, ConsentAudit, ConsentAuthorization,
     DEFAULT_RETRY_ATTEMPTS, DEFAULT_RETRY_BACKOFF, PendingApprovalStore, RemoteApprovalAuthority,
-    Surface, attest_and_persist, load_and_validate_entry, load_attestation_key, open_with_retry,
-    process_uid_for_attestation,
+    Surface, approval_view_digest, attest_and_persist, decode_sha256_hex, load_and_validate_entry,
+    load_attestation_key, open_with_retry, process_uid_for_attestation,
 };
 use stellar_agent_core::audit_log::entry::AuditEntry;
 use stellar_agent_core::audit_log::writer::AuditWriter;
@@ -120,6 +131,11 @@ pub enum Decision {
     Approve {
         /// The approval nonce from the URL path.
         nonce: String,
+        /// The [`approval_view_digest`] the approving page rendered, as its
+        /// request returned it; `None` when the request carried none or a
+        /// malformed one (see [`shown_view_digest`]). The approve refuses
+        /// unless it is the digest of the entry being attested.
+        shown_view_digest: Option<[u8; 32]>,
     },
     /// Reject the approval with this nonce (write a tombstone).
     Reject {
@@ -245,9 +261,11 @@ pub enum Outcome {
     /// operator-credential store, remote approval is disabled, or the
     /// authorization cannot be read. Nothing was attested and no row written.
     Unauthorized,
-    /// A mainnet consent this surface cannot record. `code` is the stable
-    /// `approval.*` code and `message` its fixed text, both from the fixed
-    /// presence refusal table. Nothing was attested and no row written.
+    /// A mainnet consent this surface cannot record, or an approve on any
+    /// chain whose page showed other terms than the current entry holds
+    /// (`approval.presence_changed`, see [`consent_changed`]). `code` is the
+    /// stable `approval.*` code and `message` its fixed text, both from the
+    /// fixed presence refusal table. Nothing was attested and no row written.
     PresenceRefused {
         /// The stable `approval.*` code.
         code: &'static str,
@@ -307,6 +325,45 @@ pub(crate) fn presence_refusal(error: &WalletError) -> Option<Outcome> {
         code: failure.code(),
         message,
     })
+}
+
+/// The refusal of an approve whose page showed other terms than the entry
+/// it would attest: `approval.presence_changed`, with its fixed text.
+///
+/// Both inboxes answer it, before any keyring read, row or store write, for
+/// a view digest that is absent, malformed, or not the digest of the
+/// current entry. Reloading the page renders the current entry and its
+/// digest.
+#[must_use]
+pub fn consent_changed() -> Outcome {
+    tracing::warn!("approve: the page showed other terms than the pending entry holds");
+    presence_refusal(&WalletError::Approval(
+        stellar_agent_core::ApprovalFailure::PresenceChanged,
+    ))
+    .unwrap_or(Outcome::Unavailable)
+}
+
+/// The body of an approve request: the digest its page rendered.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ShownViewDigest {
+    view_digest: String,
+}
+
+/// The view digest an approve request body names: the JSON object
+/// `{"view_digest":"<64 hex>"}`.
+///
+/// Any other body, including an empty one, a `null` digest, an unknown
+/// member or a digest that is not 64 hex characters, is `None`, which the
+/// approve refuses.
+#[must_use]
+pub fn shown_view_digest(body: &[u8]) -> Option<[u8; 32]> {
+    let value: serde_json::Value = serde_json::from_slice(body).ok()?;
+    if !value.is_object() {
+        return None;
+    }
+    let request: ShownViewDigest = serde_json::from_value(value).ok()?;
+    decode_sha256_hex(&request.view_digest).ok()
 }
 
 /// The mainnet presence refusals, each with the stable code
@@ -381,7 +438,10 @@ pub fn apply_decision(
     requester: RequestIdentity,
 ) -> Outcome {
     match decision {
-        Decision::Approve { nonce } => apply_approve(ctx, &nonce, requester),
+        Decision::Approve {
+            nonce,
+            shown_view_digest,
+        } => apply_approve(ctx, &nonce, shown_view_digest, requester),
         Decision::Reject { nonce } => apply_reject(ctx, &nonce, &requester),
     }
 }
@@ -550,7 +610,12 @@ fn approval_code_is(err: &WalletError, code: &str) -> bool {
     err.code() == code
 }
 
-fn apply_approve(ctx: &DecisionContext, nonce: &str, requester: RequestIdentity) -> Outcome {
+fn apply_approve(
+    ctx: &DecisionContext,
+    nonce: &str,
+    shown_view_digest: Option<[u8; 32]>,
+    requester: RequestIdentity,
+) -> Outcome {
     if ctx.context.chain_id == MAINNET_CHAIN_ID
         && matches!(requester, RequestIdentity::Remote { .. })
     {
@@ -612,15 +677,24 @@ fn apply_approve(ctx: &DecisionContext, nonce: &str, requester: RequestIdentity)
         }
     };
 
+    // The approve attests only what the page rendered: the digest the request
+    // returned must be the digest of the entry validated above. No digest
+    // refuses as a stale one does.
+    match approval_view_digest(&entry, &ctx.context.binding()) {
+        Ok(current) if shown_view_digest == Some(current) => {}
+        Ok(_) => return consent_changed(),
+        Err(error) => return entry_outcome(&error),
+    }
+
     // Release the store lock BEFORE the keyring read: `load_attestation_key`
     // can block on an interactive platform-keychain prompt, and holding the
     // advisory file lock across that wait would starve the agent's own
     // simulate/insert calls on this profile's store for the prompt's
-    // duration. The entry is already validated and cloned above; a
-    // concurrent mutation of this exact nonce between here and the re-open
-    // below (attest, reject, or removal by another process) is caught by
-    // `attest_and_persist`'s own store-level re-check, never silently
-    // overwritten.
+    // duration. The entry is already validated, compared with the page and
+    // cloned above; a concurrent mutation of this exact nonce between here
+    // and the re-open below (attest, reject, replacement or removal by
+    // another process) is caught by `attest_and_persist`'s own store-level
+    // re-check, never silently overwritten.
     drop(store);
 
     let key = match load_attestation_key(&ctx.attestation_key_entry_ref, &ctx.owner) {
@@ -995,6 +1069,24 @@ mod tests {
         nonce
     }
 
+    /// The approve a freshly loaded page sends: the view digest of the entry
+    /// the store holds for `nonce` now, or none when no digest exists (an
+    /// absent, unreadable or inconsistent entry).
+    fn approve_shown(ctx: &DecisionContext, nonce: impl Into<String>) -> Decision {
+        let nonce = nonce.into();
+        let shown_view_digest = PendingApprovalStore::open(ctx.store_path.clone())
+            .ok()
+            .and_then(|store| {
+                store
+                    .get(&nonce)
+                    .and_then(|entry| approval_view_digest(entry, &ctx.context.binding()).ok())
+            });
+        Decision::Approve {
+            nonce,
+            shown_view_digest,
+        }
+    }
+
     fn payment_entry(ttl_ms: u64) -> PendingApproval {
         fixtures::payment_pending(
             SOURCE_G,
@@ -1131,9 +1223,7 @@ mod tests {
         let nonce = insert(&fx.ctx, entry);
         let outcome = apply_decision(
             &fx.ctx,
-            Decision::Approve {
-                nonce: nonce.clone(),
-            },
+            approve_shown(&fx.ctx, nonce.clone()),
             RequestIdentity::Local,
         );
         assert_eq!(outcome, Outcome::Inconsistent);
@@ -1160,9 +1250,7 @@ mod tests {
 
         let outcome = apply_decision(
             &fx.ctx,
-            Decision::Approve {
-                nonce: nonce.clone(),
-            },
+            approve_shown(&fx.ctx, nonce.clone()),
             RequestIdentity::Local,
         );
         let attestation = match outcome {
@@ -1222,9 +1310,7 @@ mod tests {
         let logs = stellar_agent_test_support::with_captured_logs(|| {
             outcome = Some(apply_decision(
                 &fx.ctx,
-                Decision::Approve {
-                    nonce: nonce.clone(),
-                },
+                approve_shown(&fx.ctx, nonce.clone()),
                 RequestIdentity::Local,
             ));
         });
@@ -1290,9 +1376,7 @@ mod tests {
 
         let outcome = apply_decision(
             &fx.ctx,
-            Decision::Approve {
-                nonce: nonce.clone(),
-            },
+            approve_shown(&fx.ctx, nonce.clone()),
             RequestIdentity::Local,
         );
         assert_eq!(
@@ -1325,7 +1409,11 @@ mod tests {
             DEFAULT_TTL_MS,
         );
         let nonce = insert(&fx.ctx, entry);
-        let outcome = apply_decision(&fx.ctx, Decision::Approve { nonce }, RequestIdentity::Local);
+        let outcome = apply_decision(
+            &fx.ctx,
+            approve_shown(&fx.ctx, nonce),
+            RequestIdentity::Local,
+        );
         assert!(matches!(
             outcome,
             Outcome::Attested {
@@ -1357,9 +1445,7 @@ mod tests {
         let nonce = insert(&fx.ctx, entry);
         let outcome = apply_decision(
             &fx.ctx,
-            Decision::Approve {
-                nonce: nonce.clone(),
-            },
+            approve_shown(&fx.ctx, nonce.clone()),
             RequestIdentity::Local,
         );
         assert!(matches!(
@@ -1387,7 +1473,11 @@ mod tests {
         )
         .unwrap();
         let nonce = insert(&fx.ctx, entry);
-        let outcome = apply_decision(&fx.ctx, Decision::Approve { nonce }, RequestIdentity::Local);
+        let outcome = apply_decision(
+            &fx.ctx,
+            approve_shown(&fx.ctx, nonce),
+            RequestIdentity::Local,
+        );
         assert!(matches!(
             outcome,
             Outcome::Attested {
@@ -1414,7 +1504,11 @@ mod tests {
         )
         .unwrap();
         let nonce = insert(&fx.ctx, entry);
-        let outcome = apply_decision(&fx.ctx, Decision::Approve { nonce }, RequestIdentity::Local);
+        let outcome = apply_decision(
+            &fx.ctx,
+            approve_shown(&fx.ctx, nonce),
+            RequestIdentity::Local,
+        );
         assert_eq!(outcome, Outcome::WrongKind);
     }
 
@@ -1426,7 +1520,11 @@ mod tests {
         let entry = payment_entry(1);
         let nonce = insert(&fx.ctx, entry);
         std::thread::sleep(std::time::Duration::from_millis(5));
-        let outcome = apply_decision(&fx.ctx, Decision::Approve { nonce }, RequestIdentity::Local);
+        let outcome = apply_decision(
+            &fx.ctx,
+            approve_shown(&fx.ctx, nonce),
+            RequestIdentity::Local,
+        );
         assert_eq!(outcome, Outcome::Expired);
     }
 
@@ -1439,9 +1537,7 @@ mod tests {
         let _ = PendingApprovalStore::open(fx.ctx.store_path.clone()).unwrap();
         let outcome = apply_decision(
             &fx.ctx,
-            Decision::Approve {
-                nonce: "AAAAAAAAAAAAAAAAAAAAAA".to_owned(),
-            },
+            approve_shown(&fx.ctx, "AAAAAAAAAAAAAAAAAAAAAA".to_owned()),
             RequestIdentity::Local,
         );
         assert_eq!(outcome, Outcome::NotFound);
@@ -1455,9 +1551,7 @@ mod tests {
         let nonce = insert(&fx.ctx, payment_entry(DEFAULT_TTL_MS));
         let first = apply_decision(
             &fx.ctx,
-            Decision::Approve {
-                nonce: nonce.clone(),
-            },
+            approve_shown(&fx.ctx, nonce.clone()),
             RequestIdentity::Local,
         );
         let first_blob = match first {
@@ -1467,7 +1561,11 @@ mod tests {
             } => b,
             other => panic!("expected Attested, got {other:?}"),
         };
-        let second = apply_decision(&fx.ctx, Decision::Approve { nonce }, RequestIdentity::Local);
+        let second = apply_decision(
+            &fx.ctx,
+            approve_shown(&fx.ctx, nonce),
+            RequestIdentity::Local,
+        );
         match second {
             Outcome::AlreadyResolved {
                 attestation: Some(b),
@@ -1517,7 +1615,11 @@ mod tests {
             ),
             Outcome::Rejected
         );
-        let outcome = apply_decision(&fx.ctx, Decision::Approve { nonce }, RequestIdentity::Local);
+        let outcome = apply_decision(
+            &fx.ctx,
+            approve_shown(&fx.ctx, nonce),
+            RequestIdentity::Local,
+        );
         assert_eq!(outcome, Outcome::AlreadyResolved { attestation: None });
     }
 
@@ -1545,9 +1647,7 @@ mod tests {
         let nonce = insert(&fx.ctx, foreign_payment_entry(DEFAULT_TTL_MS));
         let outcome = apply_decision(
             &fx.ctx,
-            Decision::Approve {
-                nonce: nonce.clone(),
-            },
+            approve_shown(&fx.ctx, nonce.clone()),
             RequestIdentity::Local,
         );
         assert_eq!(outcome, Outcome::UserMismatch);
@@ -1595,9 +1695,7 @@ mod tests {
         std::fs::write(&fx.ctx.store_path, b"this is not valid toml {{{").unwrap();
         let outcome = apply_decision(
             &fx.ctx,
-            Decision::Approve {
-                nonce: "AAAAAAAAAAAAAAAAAAAAAA".to_owned(),
-            },
+            approve_shown(&fx.ctx, "AAAAAAAAAAAAAAAAAAAAAA".to_owned()),
             RequestIdentity::Local,
         );
         assert_eq!(outcome, Outcome::Unavailable);
@@ -1650,9 +1748,7 @@ mod tests {
         assert_eq!(
             apply_decision(
                 &fx.ctx,
-                Decision::Approve {
-                    nonce: nonce.clone()
-                },
+                approve_shown(&fx.ctx, nonce.clone()),
                 RequestIdentity::Local
             ),
             Outcome::BindingMismatch
@@ -1838,7 +1934,11 @@ mod tests {
         *store_path.lock().unwrap() = Some(fx.ctx.store_path.clone());
         *nonce_slot.lock().unwrap() = Some(nonce.clone());
 
-        let outcome = apply_decision(&fx.ctx, Decision::Approve { nonce }, RequestIdentity::Local);
+        let outcome = apply_decision(
+            &fx.ctx,
+            approve_shown(&fx.ctx, nonce),
+            RequestIdentity::Local,
+        );
         assert!(
             fired.load(std::sync::atomic::Ordering::SeqCst),
             "the other handle attested between validation and the attest"
@@ -1888,7 +1988,11 @@ mod tests {
         let nonce = insert(&fx.ctx, payment_entry(DEFAULT_TTL_MS));
         *target.lock().unwrap() = Some((fx.ctx.store_path.clone(), nonce.clone()));
 
-        let outcome = apply_decision(&fx.ctx, Decision::Approve { nonce }, RequestIdentity::Local);
+        let outcome = apply_decision(
+            &fx.ctx,
+            approve_shown(&fx.ctx, nonce),
+            RequestIdentity::Local,
+        );
         assert!(
             fired.load(std::sync::atomic::Ordering::SeqCst),
             "the other handle resolved the entry between validation and the attest"
@@ -1942,9 +2046,7 @@ mod tests {
         poison(&fx.ctx.audit_writer);
         let outcome = apply_decision(
             &fx.ctx,
-            Decision::Approve {
-                nonce: nonce.clone(),
-            },
+            approve_shown(&fx.ctx, nonce.clone()),
             RequestIdentity::Local,
         );
         assert_eq!(outcome, Outcome::Unavailable);
@@ -1952,9 +2054,7 @@ mod tests {
         // A poisoned mutex keeps refusing until the inbox restarts.
         let again = apply_decision(
             &fx.ctx,
-            Decision::Approve {
-                nonce: nonce.clone(),
-            },
+            approve_shown(&fx.ctx, nonce.clone()),
             RequestIdentity::Local,
         );
         assert_eq!(again, Outcome::Unavailable);
@@ -2009,9 +2109,7 @@ mod tests {
         let nonce = insert(&fx.ctx, payment_entry(DEFAULT_TTL_MS));
         let outcome = apply_decision(
             &fx.ctx,
-            Decision::Approve {
-                nonce: nonce.clone(),
-            },
+            approve_shown(&fx.ctx, nonce.clone()),
             RequestIdentity::Local,
         );
         assert_eq!(outcome, Outcome::Unavailable);
@@ -2031,7 +2129,7 @@ mod tests {
         assert!(matches!(
             apply_decision(
                 &fx.ctx,
-                Decision::Approve { nonce: approved },
+                approve_shown(&fx.ctx, approved),
                 RequestIdentity::Local
             ),
             Outcome::Attested { .. }
@@ -2137,9 +2235,7 @@ mod tests {
         let nonce = insert(&fx.ctx, entry);
         let outcome = apply_decision(
             &fx.ctx,
-            Decision::Approve {
-                nonce: nonce.clone(),
-            },
+            approve_shown(&fx.ctx, nonce.clone()),
             remote_requester(&fx, &credential_id(1), &nonce),
         );
         assert!(matches!(outcome, Outcome::Attested { .. }), "{outcome:?}");
@@ -2172,9 +2268,7 @@ mod tests {
         let nonce = insert(&fx.ctx, payment_entry(DEFAULT_TTL_MS));
         let outcome = apply_decision(
             &fx.ctx,
-            Decision::Approve {
-                nonce: nonce.clone(),
-            },
+            approve_shown(&fx.ctx, nonce.clone()),
             remote_requester(&fx, &credential_id(1), &nonce),
         );
         assert_eq!(
@@ -2227,9 +2321,7 @@ mod tests {
             });
             let outcome = apply_decision(
                 &fx.ctx,
-                Decision::Approve {
-                    nonce: nonce.clone(),
-                },
+                approve_shown(&fx.ctx, nonce.clone()),
                 remote_requester(&fx, &credential_id(1), &nonce),
             );
             assert!(fired.get());
@@ -2243,9 +2335,7 @@ mod tests {
             // The credential the edit left authorized still approves.
             let outcome = apply_decision(
                 &fx.ctx,
-                Decision::Approve {
-                    nonce: nonce.clone(),
-                },
+                approve_shown(&fx.ctx, nonce.clone()),
                 remote_requester(&fx, &credential_id(2), &nonce),
             );
             assert!(matches!(outcome, Outcome::Attested { .. }), "{outcome:?}");
@@ -2351,9 +2441,7 @@ mod tests {
         enroll(&fx, &credential_id(2));
         let nonce = insert(&fx.ctx, payment_entry(DEFAULT_TTL_MS));
         for decision in [
-            Decision::Approve {
-                nonce: nonce.clone(),
-            },
+            approve_shown(&fx.ctx, nonce.clone()),
             Decision::Reject {
                 nonce: nonce.clone(),
             },
@@ -2383,9 +2471,7 @@ mod tests {
             rp_id: rp_id.clone(),
         };
         for decision in [
-            Decision::Approve {
-                nonce: nonce.clone(),
-            },
+            approve_shown(&fx.ctx, nonce.clone()),
             Decision::Reject {
                 nonce: nonce.clone(),
             },
@@ -2398,5 +2484,243 @@ mod tests {
         assert!(still_pending(&fx, &nonce));
         let log = std::fs::read_to_string(audit_path(&fx)).unwrap_or_default();
         assert!(!log.contains("approval_"), "{log}");
+    }
+
+    // ── What the page showed ───────────────────────────────────────────────
+
+    /// One approvable entry of every kind an inbox approves, requested by
+    /// this user on the fixture's network.
+    fn every_inbox_kind() -> Vec<(&'static str, PendingApproval)> {
+        let own = |mut entry: PendingApproval| {
+            entry.process_uid = uid();
+            entry
+        };
+        vec![
+            ("PaymentSimulated", payment_entry(DEFAULT_TTL_MS)),
+            (
+                "TrustlineSimulated",
+                fixtures::trustline_pending(
+                    SOURCE_G,
+                    "USDC",
+                    "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5",
+                    None,
+                    100,
+                    42,
+                    uid(),
+                    DEFAULT_TTL_MS,
+                ),
+            ),
+            (
+                "ClaimSimulated",
+                fixtures::claim_pending(
+                    SOURCE_G,
+                    [0x0a; 32],
+                    Some(("XLM", 500)),
+                    100,
+                    1,
+                    uid(),
+                    DEFAULT_TTL_MS,
+                ),
+            ),
+            (
+                "RuleProposalSimulated",
+                own(fixtures::rule_proposal_pending()),
+            ),
+            ("MppChargeSimulated", own(fixtures::mpp_pending())),
+            (
+                "ToolsetFirstInvokeGate",
+                PendingApproval::new_toolset_first_invoke_gate_pending(
+                    "my-toolset".to_owned(),
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+                    "1.0.0".to_owned(),
+                    "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd".to_owned(),
+                    "sign-payment".to_owned(),
+                    "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+                    "XLM".to_owned(),
+                    0,
+                    1_000_000,
+                    uid(),
+                    DEFAULT_TTL_MS,
+                )
+                .unwrap(),
+            ),
+            (
+                "TrustlineClawbackOptIn",
+                PendingApproval::new_trustline_clawback_opt_in_pending(
+                    "stellar:testnet".to_owned(),
+                    "USDC".to_owned(),
+                    "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5".to_owned(),
+                    uid(),
+                    DEFAULT_TTL_MS,
+                )
+                .unwrap(),
+            ),
+        ]
+    }
+
+    /// Approves every inbox kind with `shown` as the page's digest and
+    /// asserts the refusal: `approval.presence_changed`, the entry pending
+    /// and unattested, no row and no grant.
+    fn assert_every_kind_refuses_with(tag: &str, shown: Option<[u8; 32]>) {
+        for (kind, entry) in every_inbox_kind() {
+            stellar_agent_test_support::keyring_mock::install().unwrap();
+            let fx = fixture(&format!("{tag}-{kind}"));
+            let current = approval_view_digest(&entry, &fx.ctx.context.binding())
+                .unwrap_or_else(|e| panic!("{kind}: {e}"));
+            assert_ne!(shown, Some(current), "{kind}");
+            let nonce = insert(&fx.ctx, entry.clone());
+            let outcome = apply_decision(
+                &fx.ctx,
+                Decision::Approve {
+                    nonce: nonce.clone(),
+                    shown_view_digest: shown,
+                },
+                RequestIdentity::Local,
+            );
+            assert_eq!(
+                outcome,
+                Outcome::PresenceRefused {
+                    code: "approval.presence_changed",
+                    message: "The consent details have changed; reload the approval page and \
+                              review them again.",
+                },
+                "{kind}"
+            );
+            let store = PendingApprovalStore::open(fx.ctx.store_path.clone()).unwrap();
+            let stored = store.get(&nonce).expect("the entry stays");
+            assert_eq!(stored.kind, entry.kind, "{kind}");
+            assert!(stored.attestation_blob_b64.is_none(), "{kind}: unattested");
+            drop(store);
+            assert_eq!(
+                rows_of_kind(&audit_path(&fx), "approval_attested"),
+                0,
+                "{kind}: no row"
+            );
+            assert!(
+                !fx.ctx.grant_store_path_override.as_ref().unwrap().exists(),
+                "{kind}: no grant"
+            );
+        }
+    }
+
+    /// An approve whose page rendered other terms than the entry holds now
+    /// attests nothing, for every kind an inbox approves.
+    #[test]
+    #[serial]
+    fn a_stale_view_digest_refuses_and_attests_nothing() {
+        assert_every_kind_refuses_with("stale", Some([0x11; 32]));
+    }
+
+    /// An approve that names no view digest refuses as a stale one does.
+    #[test]
+    #[serial]
+    fn an_approve_that_names_no_view_digest_refuses() {
+        assert_every_kind_refuses_with("no-digest", None);
+    }
+
+    /// The entry is replaced while the approve waits for the attestation key,
+    /// after the page's digest matched: the attest compares the replacement
+    /// with the copy it compared, and attests nothing.
+    #[test]
+    #[serial]
+    fn a_swap_during_the_key_wait_attests_nothing() {
+        let rule_d1 = {
+            let (_, definition) = fixtures::rule_proposal_mutations()
+                .into_iter()
+                .find(|(label, _)| *label == "name")
+                .unwrap();
+            PendingApproval::new_rule_proposal_pending(
+                "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+                stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE.to_owned(),
+                "stellar:testnet".to_owned(),
+                definition,
+                "fixture summary".to_owned(),
+                uid(),
+                DEFAULT_TTL_MS,
+            )
+            .unwrap()
+        };
+        let mut rule_d2 = fixtures::rule_proposal_pending();
+        rule_d2.process_uid = uid();
+        let payment_d1 = fixtures::payment_pending(
+            SOURCE_G,
+            DEST_G,
+            "XLM",
+            90_000_000,
+            None,
+            100,
+            1_234_567,
+            uid(),
+            DEFAULT_TTL_MS,
+        );
+        for (kind, shown_entry, swapped_in) in [
+            (
+                "PaymentSimulated",
+                payment_entry(DEFAULT_TTL_MS),
+                payment_d1,
+            ),
+            ("RuleProposalSimulated", rule_d2, rule_d1),
+        ] {
+            stellar_agent_test_support::keyring_mock::install().unwrap();
+            let fx = fixture(&format!("key-wait-swap-{kind}"));
+            let nonce = insert(&fx.ctx, shown_entry.clone());
+            let mut swapped_in = swapped_in;
+            swapped_in.approval_nonce.clone_from(&nonce);
+            swapped_in.created_at_unix_ms = shown_entry.created_at_unix_ms;
+            swapped_in.expires_at_unix_ms = shown_entry.expires_at_unix_ms;
+            assert!(
+                approval_view_digest(&swapped_in, &fx.ctx.context.binding()).is_ok(),
+                "{kind}: the swapped-in entry holds a valid digest"
+            );
+            let store_path = fx.ctx.store_path.clone();
+            let swap = swapped_in.clone();
+            let fired = std::rc::Rc::new(std::cell::Cell::new(false));
+            let hook_fired = std::rc::Rc::clone(&fired);
+            let hook_nonce = nonce.clone();
+            wait_hook::install(move || {
+                hook_fired.set(true);
+                let mut store = PendingApprovalStore::open(store_path).unwrap();
+                assert!(store.remove(&hook_nonce).unwrap());
+                store.insert(swap, timefmt::now_unix_ms().unwrap()).unwrap();
+            });
+            let outcome = apply_decision(
+                &fx.ctx,
+                approve_shown(&fx.ctx, nonce.clone()),
+                RequestIdentity::Local,
+            );
+            assert!(fired.get(), "{kind}: the swap ran after the comparison");
+            assert_eq!(outcome, Outcome::WrongKind, "{kind}");
+            let store = PendingApprovalStore::open(fx.ctx.store_path.clone()).unwrap();
+            let stored = store.get(&nonce).unwrap();
+            assert_eq!(stored.kind, swapped_in.kind, "{kind}");
+            assert!(stored.attestation_blob_b64.is_none(), "{kind}: unattested");
+            drop(store);
+            assert_eq!(
+                rows_of_kind(&audit_path(&fx), "approval_attested"),
+                0,
+                "{kind}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_page_digest_is_read_only_from_its_exact_body() {
+        let hex = "ab".repeat(32);
+        let digest = decode_sha256_hex(&hex).unwrap();
+        assert_eq!(
+            shown_view_digest(format!(r#"{{"view_digest":"{hex}"}}"#).as_bytes()),
+            Some(digest)
+        );
+        for body in [
+            String::new(),
+            "{}".to_owned(),
+            r#"{"view_digest":null}"#.to_owned(),
+            format!(r#"{{"view_digest":"{}"}}"#, "zz".repeat(32)),
+            format!(r#"{{"view_digest":"{}"}}"#, &hex[..63]),
+            format!(r#"{{"view_digest":"{hex}","nonce":"x"}}"#),
+            format!(r#"["{hex}"]"#),
+        ] {
+            assert_eq!(shown_view_digest(body.as_bytes()), None, "{body}");
+        }
     }
 }

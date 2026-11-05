@@ -887,7 +887,7 @@ pub fn attest_and_persist(
     Ok(surfaced_attestation)
 }
 
-fn rejected_error() -> WalletError {
+pub(super) fn rejected_error() -> WalletError {
     WalletError::Approval(ApprovalFailure::Rejected {
         detail: "this pending approval was rejected by the operator \
                  and cannot be attested"
@@ -895,7 +895,7 @@ fn rejected_error() -> WalletError {
     })
 }
 
-fn consumed_error() -> WalletError {
+pub(super) fn consumed_error() -> WalletError {
     WalletError::Approval(ApprovalFailure::Consumed {
         detail: "this pending approval was already spent on a \
                  submission and cannot be attested"
@@ -3668,5 +3668,361 @@ mod tests {
     #[test]
     fn a_gate_request_without_a_package_shasum_is_inconsistent() {
         assert_gate_request_without_fields_is_inconsistent(&["package_shasum ="]);
+    }
+
+    // ── The view subject and view digest ───────────────────────────────────
+
+    /// An entry of the same kind as `entry` whose terms differ, so its
+    /// subject differs; nonce, requester and lifetime are copied from
+    /// `entry`.
+    fn with_other_terms(kind: &str, entry: &PendingApproval) -> PendingApproval {
+        let uid = process_uid_for_attestation().unwrap();
+        let mut other = match kind {
+            "PaymentSimulated" => fixtures::payment_pending(
+                SOURCE,
+                DEST,
+                "XLM",
+                9_000_000,
+                None,
+                100,
+                1_234_567,
+                uid,
+                DEFAULT_TTL_MS,
+            ),
+            "X402Payment" => x402_entry(Some("pay.example.com")),
+            "TrustlineSimulated" => fixtures::trustline_pending(
+                SOURCE,
+                "USDC",
+                USDC_ISSUER,
+                Some(5_000),
+                100,
+                42,
+                uid,
+                DEFAULT_TTL_MS,
+            ),
+            "ClaimSimulated" => fixtures::claim_pending(
+                SOURCE,
+                [0x0b; 32],
+                Some(("XLM", 500)),
+                100,
+                1,
+                uid,
+                DEFAULT_TTL_MS,
+            ),
+            "ToolsetFirstInvokeGate" | "TrustlineClawbackOptIn" | "MppChargeSimulated" => {
+                let mut other = entry.clone();
+                match &mut other.kind {
+                    ApprovalKind::ToolsetFirstInvokeGate {
+                        amount_max_stroops, ..
+                    } => *amount_max_stroops += 1,
+                    ApprovalKind::TrustlineClawbackOptIn { code, .. } => *code = "EURC".to_owned(),
+                    ApprovalKind::MppChargeSimulated {
+                        prepared_artifact_hash,
+                        ..
+                    } => *prepared_artifact_hash = [0x33; 32],
+                    _ => unreachable!(),
+                }
+                other
+            }
+            "RuleProposalSimulated" => {
+                let (_, definition) = fixtures::rule_proposal_mutations()
+                    .into_iter()
+                    .find(|(label, _)| *label == "name")
+                    .unwrap();
+                PendingApproval::new_rule_proposal_pending(
+                    "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+                    "Test SDF Network ; September 2015".to_owned(),
+                    "stellar:testnet".to_owned(),
+                    definition,
+                    "spend-daily".to_owned(),
+                    process_uid_for_attestation().unwrap(),
+                    DEFAULT_TTL_MS,
+                )
+                .unwrap()
+            }
+            other => panic!("no other-terms entry for {other}"),
+        };
+        other.approval_nonce.clone_from(&entry.approval_nonce);
+        other.process_uid.clone_from(&entry.process_uid);
+        other.created_at_unix_ms = entry.created_at_unix_ms;
+        other.expires_at_unix_ms = entry.expires_at_unix_ms;
+        other
+    }
+
+    /// The subject an approval surface binds its page to is the subject the
+    /// attestation, grant or consent of every kind binds: a page digest
+    /// over it commits to exactly what the approve then attests.
+    #[test]
+    fn the_view_subject_is_what_the_attestation_binds() {
+        let key = [0x42; 32];
+        for (kind, entry) in every_attestable_kind() {
+            let subject = super::super::approval_view_subject(&entry, &binding())
+                .unwrap_or_else(|e| panic!("{kind}: {e}"));
+            let dir = TempDir::new().unwrap();
+            let mut store = PendingApprovalStore::open(dir.path().join("a.toml")).unwrap();
+            store
+                .insert(entry.clone(), timefmt::now_unix_ms().unwrap())
+                .unwrap();
+            let mut writer = test_audit_writer(&dir);
+            let mut gate_digest = None;
+            attest_and_persist(
+                &mut store,
+                &entry,
+                &key,
+                &binding(),
+                Surface::Cli,
+                ConsentAudit::Writer(&mut writer),
+                ConsentAuthorization::Standard(&AttestedApprover::Local),
+                |request, _| {
+                    gate_digest = Some(super::super::attestation::compute_toolset_gate_digest(
+                        request.toolset_name,
+                        request.install_id,
+                        request.package_version,
+                        request.package_shasum,
+                        request.capability,
+                        request.destination,
+                        request.asset,
+                        request.amount_min_stroops,
+                        request.amount_max_stroops,
+                    ));
+                    Ok(())
+                },
+            )
+            .unwrap_or_else(|e| panic!("{kind}: {e}"));
+            if kind == "ToolsetFirstInvokeGate" {
+                assert_eq!(
+                    gate_digest,
+                    Some(subject),
+                    "{kind}: the grant binds the subject"
+                );
+                continue;
+            }
+            let stored = store.get(&entry.approval_nonce).unwrap();
+            let blob = URL_SAFE_NO_PAD
+                .decode(stored.attestation_blob_b64.as_deref().unwrap())
+                .unwrap();
+            let expected = compute_attestation_v4(
+                &key,
+                &binding(),
+                &entry.approval_nonce,
+                &subject,
+                &entry.process_uid,
+                &entry.attested_lifetime(),
+                &AttestedApprover::Local,
+            );
+            assert_eq!(blob, expected, "{kind}: the attestation binds the subject");
+        }
+    }
+
+    /// Every input of the view digest changes it, for every kind: the
+    /// nonce, the kind and its subject, the requester, both lifetime fields,
+    /// and the profile and chain of the binding.
+    #[test]
+    fn the_view_digest_covers_nonce_kind_subject_uid_lifetime_and_binding() {
+        use super::super::approval_view_digest as digest;
+        let entries = every_attestable_kind();
+        let base_of = |entry: &PendingApproval| digest(entry, &binding()).unwrap();
+        let (_, first) = &entries[0];
+        let mut across_kinds = std::collections::HashSet::new();
+        for (kind, entry) in &entries {
+            let base = base_of(entry);
+            let mut renonced = entry.clone();
+            renonced.approval_nonce = "AAAAAAAAAAAAAAAAAAAAAA".to_owned();
+            let mut requester = entry.clone();
+            requester.process_uid = format!("{}9", entry.process_uid);
+            let mut created = entry.clone();
+            created.created_at_unix_ms -= 1;
+            let mut expires = entry.clone();
+            expires.expires_at_unix_ms += 1;
+            for (input, mutated) in [
+                ("nonce", base_of(&renonced)),
+                ("subject", base_of(&with_other_terms(kind, entry))),
+                ("process uid", base_of(&requester)),
+                ("created", base_of(&created)),
+                ("expires", base_of(&expires)),
+                (
+                    "profile",
+                    digest(
+                        entry,
+                        &crate::approval::AttestationBinding::new("b", "stellar:testnet"),
+                    )
+                    .unwrap(),
+                ),
+            ] {
+                assert_ne!(base, mutated, "{kind}: the {input} changes the digest");
+            }
+            // An x402 subject exists only on the network its intent names, so
+            // on another chain the digest is absent rather than different.
+            let other_chain = digest(
+                entry,
+                &crate::approval::AttestationBinding::new(BINDING_PROFILE, "stellar:mainnet"),
+            );
+            match (*kind, other_chain) {
+                ("X402Payment", Err(err)) => {
+                    assert_eq!(err.code(), "approval.attestation_invalid", "{kind}");
+                }
+                (_, Ok(mutated)) => {
+                    assert_ne!(base, mutated, "{kind}: the chain changes the digest");
+                }
+                (_, Err(err)) => panic!("{kind}: {err}"),
+            }
+            let mut same_frame = entry.clone();
+            same_frame.approval_nonce.clone_from(&first.approval_nonce);
+            same_frame.process_uid.clone_from(&first.process_uid);
+            same_frame.created_at_unix_ms = first.created_at_unix_ms;
+            same_frame.expires_at_unix_ms = first.expires_at_unix_ms;
+            assert!(
+                across_kinds.insert(base_of(&same_frame)),
+                "{kind}: the kind changes the digest"
+            );
+        }
+    }
+
+    /// The view digest is SHA-256 over the documented preimage, built field by
+    /// field without the encoder it checks.
+    #[test]
+    fn the_view_digest_is_the_documented_preimage() {
+        use super::super::{approval_view_digest, approval_view_subject};
+        use sha2::{Digest as _, Sha256};
+
+        let entry = make_entry(DEFAULT_TTL_MS);
+        let binding = binding();
+        let subject = approval_view_subject(&entry, &binding).unwrap();
+        let mut preimage = b"stellar-agent-approval-view:v1".to_vec();
+        for field in [
+            entry.approval_nonce.as_bytes(),
+            binding.profile_name.as_bytes(),
+            binding.chain_id.as_bytes(),
+            entry.kind.kind_name().as_bytes(),
+        ] {
+            preimage.extend_from_slice(&u32::try_from(field.len()).unwrap().to_be_bytes());
+            preimage.extend_from_slice(field);
+        }
+        preimage.extend_from_slice(&subject);
+        let uid = entry.process_uid.as_bytes();
+        preimage.extend_from_slice(&u32::try_from(uid.len()).unwrap().to_be_bytes());
+        preimage.extend_from_slice(uid);
+        preimage.extend_from_slice(&entry.created_at_unix_ms.to_be_bytes());
+        preimage.extend_from_slice(&entry.expires_at_unix_ms.to_be_bytes());
+        let expected: [u8; 32] = Sha256::digest(&preimage).into();
+
+        assert_eq!(approval_view_digest(&entry, &binding).unwrap(), expected);
+    }
+
+    /// A kind no approval surface approves, and an entry whose stored terms
+    /// do not check, has no view subject and refuses with its own code.
+    #[test]
+    fn a_kind_without_a_view_subject_refuses_with_its_code() {
+        use super::super::{approval_view_digest, approval_view_subject};
+        let uid = process_uid_for_attestation().unwrap();
+        let sign = PendingApproval::new_passkey_pending(
+            [0x01; 32],
+            vec![0; 32],
+            "CAAAA...BBBBB".to_owned(),
+            vec![0],
+            [0x02; 32],
+            "localhost".to_owned(),
+            uid.clone(),
+            DEFAULT_TTL_MS,
+        )
+        .unwrap();
+        let register = PendingApproval::new_register_passkey_pending(
+            "CAAAA...BBBBB".to_owned(),
+            vec![1, 2],
+            [0x03; 32],
+            "localhost".to_owned(),
+            [0x04; 32],
+            uid,
+            DEFAULT_TTL_MS,
+        )
+        .unwrap();
+        let mut rejected = make_entry(DEFAULT_TTL_MS);
+        rejected.kind = ApprovalKind::Rejected {
+            original_kind_name: "PaymentSimulated".to_owned(),
+        };
+        let mut consumed = make_entry(DEFAULT_TTL_MS);
+        consumed.kind = ApprovalKind::Consumed {
+            original_kind_name: "PaymentSimulated".to_owned(),
+            tx_hash: "ab".repeat(32),
+            outcome: crate::approval::ConsumedOutcome::Confirmed,
+        };
+        let mut edited_rule = make_rule_proposal_entry(DEFAULT_TTL_MS);
+        let ApprovalKind::RuleProposalSimulated {
+            proposal_sha256, ..
+        } = &mut edited_rule.kind
+        else {
+            unreachable!()
+        };
+        proposal_sha256[0] ^= 1;
+        let mut edited_mpp = every_attestable_kind()
+            .into_iter()
+            .find(|(kind, _)| *kind == "MppChargeSimulated")
+            .unwrap()
+            .1;
+        let ApprovalKind::MppChargeSimulated { amount, .. } = &mut edited_mpp.kind else {
+            unreachable!()
+        };
+        *amount = "2000000".to_owned();
+        let mut edited_envelope = make_entry(DEFAULT_TTL_MS);
+        let ApprovalKind::PaymentSimulated {
+            envelope_xdr_b64, ..
+        } = &mut edited_envelope.kind
+        else {
+            unreachable!()
+        };
+        *envelope_xdr_b64 = fixtures::payment_envelope(SOURCE, SOURCE, "XLM", 9, None, 100, 1);
+        for (label, entry, code) in [
+            ("SignWithPasskey", sign, "approval.wrong_kind"),
+            ("RegisterPasskey", register, "approval.wrong_kind"),
+            ("Rejected", rejected, "approval.rejected"),
+            ("Consumed", consumed, "approval.consumed"),
+            ("edited rule", edited_rule, "approval.entry_inconsistent"),
+            ("edited MPP", edited_mpp, "approval.entry_inconsistent"),
+            (
+                "edited envelope",
+                edited_envelope,
+                "approval.entry_inconsistent",
+            ),
+        ] {
+            let err = approval_view_subject(&entry, &binding()).unwrap_err();
+            assert_eq!(err.code(), code, "{label}: {err}");
+            let err = approval_view_digest(&entry, &binding()).unwrap_err();
+            assert_eq!(err.code(), code, "{label}: {err}");
+        }
+    }
+
+    /// The store holds another valid entry under the validated nonce, with
+    /// the same requester and lifetime: the attest refuses before the row,
+    /// so a surface that compared the validated copy never attests terms it
+    /// did not compare.
+    #[test]
+    fn an_entry_replaced_since_validation_refuses_with_no_row() {
+        let payment = make_entry(DEFAULT_TTL_MS);
+        let rule = make_rule_proposal_entry(DEFAULT_TTL_MS);
+        for (kind, stored) in [
+            ("PaymentSimulated", payment),
+            ("RuleProposalSimulated", rule),
+        ] {
+            let validated = with_other_terms(kind, &stored);
+            assert!(
+                super::super::approval_view_subject(&validated, &binding()).is_ok(),
+                "{kind}: the validated copy holds a valid digest"
+            );
+            assert_ne!(validated.kind, stored.kind);
+            let dir = TempDir::new().unwrap();
+            let store_path = dir.path().join("a.toml");
+            let mut store = PendingApprovalStore::open(store_path.clone()).unwrap();
+            store
+                .insert(stored.clone(), stored.created_at_unix_ms)
+                .unwrap();
+            let err = attest_validated_copy(&dir, &mut store, &validated);
+            assert_eq!(err.code(), "approval.wrong_kind", "{kind}: {err}");
+            assert!(consent_rows(&dir).is_empty(), "{kind}: no row is written");
+            drop(store);
+            assert!(
+                still_pending(&store_path, &stored.approval_nonce),
+                "{kind}: the stored entry stays pending"
+            );
+        }
     }
 }

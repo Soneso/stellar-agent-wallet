@@ -12,12 +12,13 @@
 // link to /approval/<nonce>), then re-fetches /pending.json every two
 // seconds to keep the rows and the document-title badge current.
 //
-// Detail: reads #approval-data (nonce + CSRF value) and wires the Approve /
-// Reject buttons to the full per-action ceremony: mint a challenge bound to
-// THIS approval (POST /approval/<nonce>/challenge), run
-// navigator.credentials.get over it, then POST the resulting assertion to
-// /approval/<nonce>/decision. A fresh passkey assertion is required for
-// every approve or reject, not just for login.
+// Detail: reads #approval-data (nonce, CSRF value and view digest) and wires
+// the Approve / Reject buttons to the full per-action ceremony: mint a
+// challenge bound to THIS approval (POST /approval/<nonce>/challenge; an
+// approve sends the view digest the page rendered, so the challenge binds the
+// terms shown here), run navigator.credentials.get over it, then POST the
+// resulting assertion to /approval/<nonce>/decision. A fresh passkey assertion
+// is required for every approve or reject, not just for login.
 //
 // # DOM discipline
 //
@@ -104,71 +105,78 @@
 
   // ── Detail / per-action ceremony ──────────────────────────────────────
 
+  function replyOf(resp) {
+    return resp
+      .json()
+      .catch(function () {
+        return {};
+      })
+      .then(function (data) {
+        return { ok: resp.ok, status: resp.status, data: data };
+      });
+  }
+
   // Mints a challenge bound to THIS approval, signs it with the operator's
   // passkey, then posts the decision. Both POSTs are status-checked: a refused
+  // mint (the request changed since this page rendered it) or a refused
   // decision (rejected assertion, stale CSRF value, entry already resolved)
   // means nothing was signed, and renders in the refusal treatment rather than
-  // as a status line the operator could read as success.
-  function decide(nonce, csrf, decision, result) {
+  // as a status line the operator could read as success. A refused mint asks
+  // for no passkey.
+  function decide(nonce, csrf, decision, viewDigest, result) {
     result.className = "result";
     result.textContent = "Requesting challenge…";
     shared.setPageState("busy");
     var encodedNonce = encodeURIComponent(nonce);
-    return fetch("/approval/" + encodedNonce + "/challenge", {
-      method: "POST",
-      headers: (function () {
-        var h = {};
-        h[CSRF_HEADER] = csrf;
-        return h;
-      })(),
-    })
-      .then(function (resp) {
-        if (!resp.ok) {
-          throw new Error("challenge_failed");
-        }
-        return resp.json();
-      })
-      .then(function (body) {
-        result.textContent = "Waiting for passkey…";
-        return navigator.credentials.get({
-          publicKey: {
-            challenge: b64urlToBytes(body.challenge),
-            userVerification: "required",
-            timeout: 60000,
-          },
-        });
-      })
-      .then(function (assertion) {
-        result.textContent = "Working…";
-        var headers = { "content-type": "application/json" };
-        headers[CSRF_HEADER] = csrf;
-        return fetch("/approval/" + encodedNonce + "/decision", {
-          method: "POST",
-          headers: headers,
-          body: JSON.stringify({
-            decision: decision,
-            assertion: assertionToWire(assertion),
-          }),
-        });
-      })
-      .then(function (resp) {
-        return resp
-          .json()
-          .catch(function () {
-            return {};
-          })
-          .then(function (data) {
-            return { ok: resp.ok, status: resp.status, data: data };
-          });
-      })
-      .then(function (res) {
-        if (res.ok) {
-          shared.renderResult(result, res.data);
-          shared.setPageState("ok");
+    var mintHeaders = {};
+    mintHeaders[CSRF_HEADER] = csrf;
+    var mint = { method: "POST", headers: mintHeaders };
+    if (decision === "approve") {
+      mintHeaders["content-type"] = "application/json";
+      mint.body = JSON.stringify({ view_digest: viewDigest });
+    }
+    function refuse(res) {
+      shared.renderRefusal(result, res.data, "HTTP " + res.status);
+      shared.setPageState("error");
+    }
+    return fetch("/approval/" + encodedNonce + "/challenge", mint)
+      .then(replyOf)
+      .then(function (minted) {
+        if (!minted.ok) {
+          refuse(minted);
           return;
         }
-        shared.renderRefusal(result, res.data, "HTTP " + res.status);
-        shared.setPageState("error");
+        result.textContent = "Waiting for passkey…";
+        return navigator.credentials
+          .get({
+            publicKey: {
+              challenge: b64urlToBytes(minted.data.challenge),
+              userVerification: "required",
+              timeout: 60000,
+            },
+          })
+          .then(function (assertion) {
+            result.textContent = "Working…";
+            var headers = { "content-type": "application/json" };
+            headers[CSRF_HEADER] = csrf;
+            return fetch("/approval/" + encodedNonce + "/decision", {
+              method: "POST",
+              headers: headers,
+              body: JSON.stringify({
+                decision: decision,
+                assertion: assertionToWire(assertion),
+              }),
+            });
+          })
+          .then(replyOf)
+          .then(function (res) {
+            if (res.ok) {
+              shared.renderResult(result, res.data);
+              shared.setPageState("ok");
+              return;
+            }
+            refuse(res);
+          });
       })
       .catch(function (e) {
         console.error("stellar-agent approval: decision ceremony failed", e);
@@ -182,6 +190,7 @@
     var result = document.getElementById("result");
     var nonce = island.nonce;
     var csrf = island.csrf;
+    var viewDigest = island.view_digest;
 
     shared.refreshTimestamps();
     setInterval(shared.refreshTimestamps, 1000);
@@ -189,13 +198,13 @@
     var approveBtn = document.getElementById("approve-btn");
     if (approveBtn) {
       approveBtn.addEventListener("click", function () {
-        decide(nonce, csrf, "approve", result);
+        decide(nonce, csrf, "approve", viewDigest, result);
       });
     }
     var rejectBtn = document.getElementById("reject-btn");
     if (rejectBtn) {
       rejectBtn.addEventListener("click", function () {
-        decide(nonce, csrf, "reject", result);
+        decide(nonce, csrf, "reject", null, result);
       });
     }
   }

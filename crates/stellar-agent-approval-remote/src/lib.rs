@@ -39,11 +39,13 @@
 //!   credential removed from either stops logging in, its session stops
 //!   being served, and its decisions refuse, without a restart. A read that
 //!   fails refuses.
-//! - **What-you-see-is-what-you-sign.** The per-action challenge binds
-//!   `SHA-256(rand32 || envelope_sha256 || approval_nonce)`, where
-//!   `envelope_sha256` is derived from the PARKED pending-approval entry on
-//!   the server, never from the request body — an assertion verified for
-//!   one entry can never authorize a different entry.
+//! - **What-you-see-is-what-you-sign.** The detail page carries the view
+//!   digest of the entry it renders, and an approve posts it to the challenge
+//!   route. The listener mints only while it is the digest of the current
+//!   entry, binds `SHA-256(rand32 || view_digest || approval_nonce)` and stores
+//!   the digest with the challenge. The decision compares the stored digest
+//!   with the entry it attests, so an assertion verified for one entry or one
+//!   set of terms never authorizes another.
 //! - **Enrollment stays loopback-only.** This crate never accepts or
 //!   persists a new operator credential over the network. `GET /enroll`
 //!   serves a helper page that runs `navigator.credentials.create()`

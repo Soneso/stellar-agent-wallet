@@ -358,9 +358,10 @@ impl ApproverIdentity {
 /// [`Self::new_verified`] at construction. The caller MUST have verified the
 /// assertion over a challenge that is itself cryptographically bound to that
 /// nonce (the remote-approval per-action challenge is
-/// `SHA-256(rand32 || envelope_sha256 || approval_nonce)`, server-derived
-/// from the parked entry) — never a caller-chosen or request-supplied nonce
-/// independent of what was actually verified.
+/// `SHA-256(rand32 || view_digest || approval_nonce)`, where the view digest
+/// names the request the page rendered and the listener checks it against the
+/// current entry before it mints), never a caller-chosen or request-supplied
+/// nonce independent of what was actually verified.
 ///
 /// [`ApproverIdentity::is_authorized_for_entry`] enforces this invariant
 /// structurally: it compares the witness's bound nonce against the nonce of

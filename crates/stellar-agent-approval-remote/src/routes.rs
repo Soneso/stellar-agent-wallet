@@ -55,11 +55,12 @@ use axum::{
 };
 use serde_json::json;
 
-use stellar_agent_approval_ui::{Decision, RequestIdentity, apply_decision};
-use stellar_agent_core::approval::attest::decode_sha256_hex;
+use stellar_agent_approval_ui::{
+    Decision, RequestIdentity, apply_decision, consent_changed, shown_view_digest,
+};
 use stellar_agent_core::approval::error::ApprovalError;
 use stellar_agent_core::approval::user_id::{ApproverIdentity, VerifiedPasskeyAssertion};
-use stellar_agent_core::approval::{ApprovalKind, PendingApproval, PendingApprovalView};
+use stellar_agent_core::approval::{ApprovalKind, PendingApprovalView, approval_view_digest};
 use stellar_agent_core::timefmt;
 
 use crate::RemoteServeState;
@@ -226,52 +227,6 @@ fn require_csrf(session: &SessionState, headers: &HeaderMap, nonce: &str) -> Res
         Ok(())
     } else {
         Err(csrf_rejected())
-    }
-}
-
-/// Derives the server-side envelope-hash input to the per-action challenge
-/// for `entry`, per [`ApprovalKind`].
-///
-/// `PaymentSimulated`, `ClaimSimulated`, and `TrustlineSimulated` entries carry
-/// a real envelope SHA-256. MPP and rule-proposal entries carry their own content digests.
-/// `RuleProposalSimulated` has no envelope but carries its own
-/// domain-separated `proposal_sha256` digest over the resolved rule
-/// definition — using it here (rather than falling back to the zero
-/// placeholder) binds the per-action challenge to the EXACT rule the
-/// operator reviewed, the same strengthening `envelope_sha256_hex` gives
-/// payments, claims, and trustlines. Other attestable kinds
-/// (`ToolsetFirstInvokeGate`, `TrustlineClawbackOptIn`) have no such digest,
-/// and use a fixed all-zero 32-byte placeholder — the challenge's binding for
-/// those kinds rests on `approval_nonce` (unique per entry) rather than a
-/// content digest, which is the same binding the HMAC attestation preimage
-/// itself uses for those kinds (`compute_attestation` with a domain-specific
-/// digest, not an envelope hash).
-fn entry_envelope_sha256(entry: &PendingApproval) -> [u8; 32] {
-    match &entry.kind {
-        ApprovalKind::PaymentSimulated {
-            envelope_sha256_hex,
-            ..
-        }
-        | ApprovalKind::TrustlineSimulated {
-            envelope_sha256_hex,
-            ..
-        }
-        | ApprovalKind::ClaimSimulated {
-            envelope_sha256_hex,
-            ..
-        } => decode_sha256_hex(envelope_sha256_hex).unwrap_or([0u8; 32]),
-        ApprovalKind::RuleProposalSimulated {
-            proposal_sha256, ..
-        } => *proposal_sha256,
-        ApprovalKind::MppChargeSimulated {
-            prepared_artifact_hash,
-            authorization_fingerprint,
-            ..
-        } => stellar_agent_core::approval::mpp::approval_subject(
-            authorization_fingerprint,
-            prepared_artifact_hash,
-        ),
-        _ => [0u8; 32],
     }
 }
 
@@ -605,10 +560,11 @@ async fn pending_json(State(state): State<RemoteServeState>, headers: HeaderMap)
 
 /// `GET /approval/{nonce}` — the per-approval detail page.
 ///
-/// Renders the same entry fields (`PendingApprovalView`) that
-/// `entry_envelope_sha256` reads to derive the per-action challenge's
-/// envelope hash, so what the operator reads here is what the challenge
-/// minted by [`action_challenge_post`] is over.
+/// The view and the [`approval_view_digest`] the page carries come from one
+/// store handle. An approve sends that digest to [`action_challenge_post`],
+/// which mints a challenge only while it is the digest of the current entry
+/// and binds the challenge to it, so what the operator reads here is what
+/// the passkey assertion and the attestation are over.
 async fn approval_detail_get(
     State(state): State<RemoteServeState>,
     headers: HeaderMap,
@@ -646,6 +602,10 @@ async fn approval_detail_get(
     } else {
         None
     };
+    let view_digest = store
+        .get(&nonce)
+        .and_then(|entry| approval_view_digest(entry, &state.ctx.context.binding()).ok())
+        .map(|digest| stellar_agent_core::hex::encode(&digest));
     drop(store);
 
     let csrf = compute_csrf(&session.csrf_key, &nonce);
@@ -654,6 +614,7 @@ async fn approval_detail_get(
         &state.ctx.context,
         &csrf,
         attestation_blob.as_deref(),
+        view_digest.as_deref(),
         &state.identity,
     ))
     .into_response()
@@ -700,12 +661,20 @@ async fn app_js_get(State(state): State<RemoteServeState>, headers: HeaderMap) -
 // Handlers — per-action ceremony
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// `POST /approval/{nonce}/challenge` — mints the per-action challenge,
-/// server-deriving the envelope hash from the parked entry.
+/// `POST /approval/{nonce}/challenge`: mints the per-action challenge.
+///
+/// An approve posts `{"view_digest":"<hex>"}`, the digest its page rendered.
+/// The mint refuses with `409` `approval.presence_changed` unless that is
+/// the digest of the current entry, so a stale page never reaches a passkey
+/// prompt; otherwise the challenge is derived over the digest and stores
+/// it. A request without a well-formed digest, as a reject sends, mints a
+/// challenge over 32 zero bytes that stores none: it can reject, and an
+/// approve over it refuses.
 async fn action_challenge_post(
     State(state): State<RemoteServeState>,
     headers: HeaderMap,
     Path(nonce): Path<String>,
+    body: axum::body::Bytes,
 ) -> Response {
     let session = match require_session(&state, &headers) {
         Ok(s) => s,
@@ -729,16 +698,22 @@ async fn action_challenge_post(
         return json_response(StatusCode::BAD_REQUEST, &json!({"error": "wrong_kind"}));
     }
 
-    let envelope_sha256 = entry_envelope_sha256(&entry);
+    let shown = shown_view_digest(&body);
+    if let Some(shown) = shown
+        && approval_view_digest(&entry, &state.ctx.context.binding()).ok() != Some(shown)
+    {
+        return outcome_to_response(consent_changed());
+    }
     let rand32 = crate::challenge_store::random_32();
-    let challenge = derive_action_challenge(&rand32, &envelope_sha256, &entry.approval_nonce);
+    let challenge =
+        derive_action_challenge(&rand32, &shown.unwrap_or([0u8; 32]), &entry.approval_nonce);
 
     {
         let mut store = match state.action_challenges.lock() {
             Ok(g) => g,
             Err(poison) => poison.into_inner(),
         };
-        store.mint(challenge, entry.approval_nonce.clone());
+        store.mint(challenge, entry.approval_nonce.clone(), shown);
     }
 
     json_response(
@@ -813,9 +788,9 @@ async fn action_decision_post(
         };
         store.consume(&challenge, &nonce)
     };
-    if !consumed {
+    let Some(consumed) = consumed else {
         return assertion_invalid();
-    }
+    };
 
     let verify_result = verify_wire_assertion(
         &request.assertion,
@@ -858,9 +833,14 @@ async fn action_decision_post(
     };
 
     // `request.decision` was already validated to be exactly "approve" or
-    // "reject" immediately after body parsing, above.
+    // "reject" immediately after body parsing, above. An approve compares the
+    // view digest the signed challenge was minted over, never one from this
+    // body, so the assertion fixes the terms the decision attests.
     let decision = if request.decision == "approve" {
-        Decision::Approve { nonce }
+        Decision::Approve {
+            nonce,
+            shown_view_digest: consumed.shown_view_digest,
+        }
     } else {
         Decision::Reject { nonce }
     };
@@ -939,13 +919,6 @@ mod tests {
         reason = "test-only; panics acceptable in unit tests"
     )]
 
-    // ChangeTrust with transaction source [1; 32] and operation source [2; 32].
-    const CHANGE_TRUST_ENVELOPE: &str = concat!(
-        "AAAAAgAAAAABAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQAAAGQAAAAAAAAAAQAAAAAA",
-        "AAAAAAAAAQAAAAEAAAAAAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIAAAAGAAAAAVVT",
-        "REMAAAAABAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAR//////////wAAAAAAAAAA",
-    );
-
     use std::sync::{Arc, Mutex as StdMutex};
 
     use super::*;
@@ -962,7 +935,7 @@ mod tests {
     use stellar_agent_core::approval::operator_credentials::{
         OperatorApprovalCredential, OperatorApprovalCredentialStore,
     };
-    use stellar_agent_core::approval::{DEFAULT_TTL_MS, PendingApprovalStore};
+    use stellar_agent_core::approval::{DEFAULT_TTL_MS, PendingApproval, PendingApprovalStore};
     use stellar_agent_core::audit_log::writer::AuditWriter;
     use stellar_agent_core::profile::schema::KeyringEntryRef;
 
@@ -1273,13 +1246,19 @@ mod tests {
     /// HTML — the same island `/static/app.js` reads via `readIsland` in a
     /// real browser.
     fn extract_data_island_field(html: &str, island_id: &str, field: &str) -> String {
+        data_island(html, island_id)[field]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    }
+
+    /// The JSON value of the data island `island_id` in rendered page HTML.
+    fn data_island(html: &str, island_id: &str) -> serde_json::Value {
         let marker = format!(r#"id="{island_id}""#);
         let tag_start = html.find(&marker).expect("data island tag present");
         let content_start = html[tag_start..].find('>').unwrap() + tag_start + 1;
         let content_end = html[content_start..].find("</script>").unwrap() + content_start;
-        let json_text = &html[content_start..content_end];
-        let value: serde_json::Value = serde_json::from_str(json_text).unwrap();
-        value[field].as_str().unwrap().to_owned()
+        serde_json::from_str(&html[content_start..content_end]).unwrap()
     }
 
     async fn html_body(resp: axum::response::Response) -> String {
@@ -1332,14 +1311,49 @@ mod tests {
         );
     }
 
-    async fn mint_action_challenge(
+    /// Fetches the detail page and extracts the view digest its
+    /// `#approval-data` island carries, the value `/static/app.js` posts with
+    /// an approve; `None` when the page offers no approve.
+    async fn get_view_digest(
+        router: &Router<RemoteServeState>,
+        state: &RemoteServeState,
+        cookie: &str,
+        nonce: &str,
+    ) -> Option<String> {
+        let resp = router
+            .clone()
+            .with_state(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(format!("/approval/{nonce}"))
+                    .header(header::COOKIE, cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let html = html_body(resp).await;
+        data_island(&html, "approval-data")["view_digest"]
+            .as_str()
+            .map(str::to_owned)
+    }
+
+    /// Posts a challenge request with `view_digest` as its body, as an
+    /// approve sends it, or with no body, as a reject sends it.
+    async fn post_challenge(
         router: &Router<RemoteServeState>,
         state: &RemoteServeState,
         cookie: &str,
         csrf: &str,
         nonce: &str,
-    ) -> [u8; 32] {
-        let resp = router
+        view_digest: Option<&str>,
+    ) -> Response {
+        let body = view_digest.map_or_else(Body::empty, |digest| {
+            Body::from(serde_json::json!({ "view_digest": digest }).to_string())
+        });
+        router
             .clone()
             .with_state(state.clone())
             .oneshot(
@@ -1348,22 +1362,252 @@ mod tests {
                     .uri(format!("/approval/{nonce}/challenge"))
                     .header(header::COOKIE, cookie)
                     .header(CSRF_HEADER_NAME, csrf)
-                    .body(Body::empty())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(body)
                     .unwrap(),
             )
             .await
-            .unwrap();
-        assert_eq!(
-            resp.status(),
-            StatusCode::OK,
-            "action challenge mint must succeed"
-        );
-        let body = body_json(resp).await;
+            .unwrap()
+    }
+
+    fn challenge_of(body: &serde_json::Value) -> [u8; 32] {
         URL_SAFE_NO_PAD
             .decode(body["challenge"].as_str().unwrap())
             .unwrap()
             .try_into()
             .unwrap()
+    }
+
+    /// Mints an action challenge the way the detail page does: over the
+    /// view digest its island carries.
+    async fn mint_action_challenge(
+        router: &Router<RemoteServeState>,
+        state: &RemoteServeState,
+        cookie: &str,
+        csrf: &str,
+        nonce: &str,
+    ) -> [u8; 32] {
+        let view_digest = get_view_digest(router, state, cookie, nonce).await;
+        let resp = post_challenge(router, state, cookie, csrf, nonce, view_digest.as_deref()).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "action challenge mint must succeed"
+        );
+        challenge_of(&body_json(resp).await)
+    }
+
+    /// Replaces the entry under `nonce` with `entry`, which takes the same
+    /// nonce, the way a same-user writer of the pending store swaps it.
+    fn swap_entry(store_path: &std::path::Path, nonce: &str, mut entry: PendingApproval) {
+        entry.approval_nonce = nonce.to_owned();
+        let mut store = PendingApprovalStore::open(store_path.to_path_buf()).unwrap();
+        assert!(store.remove(nonce).unwrap());
+        store
+            .insert(entry, stellar_agent_core::timefmt::now_unix_ms().unwrap())
+            .unwrap();
+    }
+
+    /// A payment of `amount_stroops` with its own valid digest.
+    fn payment_entry(amount_stroops: i64) -> PendingApproval {
+        stellar_agent_core::approval::fixtures::payment_pending(
+            "GAQAA5L65LSYH7CQ3VTJ7F3HHLGCL3DSLAR2Y47263D56MNNGHSQSTVY",
+            "GBPXXOA5N4JYPESHAADMQKBPWZWQDQ64ZV6ZL2S3LAGW4SY7NTCMWIVL",
+            "XLM",
+            amount_stroops,
+            None,
+            100,
+            1_234_567,
+            "424242".to_owned(),
+            DEFAULT_TTL_MS,
+        )
+    }
+
+    /// Asserts the refusal body of a page whose request changed.
+    async fn assert_presence_changed(resp: Response) {
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        let body = body_json(resp).await;
+        assert_eq!(body["error"], "approval.presence_changed");
+        assert_eq!(
+            body["message"],
+            "The consent details have changed; reload the approval page and review them again."
+        );
+    }
+
+    async fn post_decision(
+        router: &Router<RemoteServeState>,
+        state: &RemoteServeState,
+        cookie: &str,
+        csrf: &str,
+        nonce: &str,
+        body: Vec<u8>,
+    ) -> Response {
+        router
+            .clone()
+            .with_state(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/approval/{nonce}/decision"))
+                    .header(header::COOKIE, cookie)
+                    .header(CSRF_HEADER_NAME, csrf)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    /// A page rendered for one request, whose entry is replaced before the
+    /// approve asks for a challenge, gets no challenge and so no passkey
+    /// prompt; nothing is attested.
+    #[test]
+    #[serial]
+    fn an_entry_swapped_before_the_challenge_mints_no_challenge() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let fx = fixture("swap-before-challenge");
+            let store_path = fx.state.ctx.store_path.clone();
+            let nonce = insert_payment_entry(&store_path);
+            let router = build_router();
+            let cookie = login(&router, &fx.state, &fx.authenticator).await;
+            let csrf = get_csrf(&router, &fx.state, &cookie, &nonce).await;
+            let shown = get_view_digest(&router, &fx.state, &cookie, &nonce)
+                .await
+                .expect("an approvable page carries its digest");
+
+            let swapped = stellar_agent_core::approval::fixtures::trustline_pending(
+                "GAQAA5L65LSYH7CQ3VTJ7F3HHLGCL3DSLAR2Y47263D56MNNGHSQSTVY",
+                "USDC",
+                "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5",
+                None,
+                100,
+                42,
+                "424242".to_owned(),
+                DEFAULT_TTL_MS,
+            );
+            swap_entry(&store_path, &nonce, swapped);
+            let current = get_view_digest(&router, &fx.state, &cookie, &nonce)
+                .await
+                .expect("the swapped-in entry holds a valid digest of its own");
+            assert_ne!(current, shown);
+
+            let resp =
+                post_challenge(&router, &fx.state, &cookie, &csrf, &nonce, Some(&shown)).await;
+            assert_presence_changed(resp).await;
+            assert!(fx.state.action_challenges.lock().unwrap().is_empty());
+            assert_entry_untouched(&store_path, &nonce);
+            assert_eq!(fx.audit_rows("approval_attested_remote"), 0);
+        });
+    }
+
+    /// A challenge minted over the page's digest, whose entry is replaced
+    /// before the signed decision arrives, approves nothing: the decision
+    /// compares the digest the signed challenge fixed with the entry it
+    /// would attest. A reload shows the current entry, and its approve
+    /// attests that entry.
+    #[test]
+    #[serial]
+    fn an_entry_swapped_after_the_challenge_is_not_attested() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let fx = fixture("swap-after-challenge");
+            let store_path = fx.state.ctx.store_path.clone();
+            let nonce = insert_payment_entry(&store_path);
+            let router = build_router();
+            let cookie = login(&router, &fx.state, &fx.authenticator).await;
+            let csrf = get_csrf(&router, &fx.state, &cookie, &nonce).await;
+            let challenge = mint_action_challenge(&router, &fx.state, &cookie, &csrf, &nonce).await;
+
+            let swapped = payment_entry(90_000_000);
+            swap_entry(&store_path, &nonce, swapped.clone());
+            let assertion = fx.authenticator.sign_valid(&challenge, RP_ID, ORIGIN, 2);
+            let resp = post_decision(
+                &router,
+                &fx.state,
+                &cookie,
+                &csrf,
+                &nonce,
+                decision_body("approve", &assertion),
+            )
+            .await;
+            assert_presence_changed(resp).await;
+            assert_entry_untouched(&store_path, &nonce);
+            assert_eq!(fx.audit_rows("approval_attested_remote"), 0);
+
+            let challenge = mint_action_challenge(&router, &fx.state, &cookie, &csrf, &nonce).await;
+            let assertion = fx.authenticator.sign_valid(&challenge, RP_ID, ORIGIN, 3);
+            let resp = post_decision(
+                &router,
+                &fx.state,
+                &cookie,
+                &csrf,
+                &nonce,
+                decision_body("approve", &assertion),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert_eq!(body_json(resp).await["status"], "attested");
+            let store = PendingApprovalStore::open(store_path.clone()).unwrap();
+            let entry = store.get(&nonce).unwrap();
+            assert_eq!(
+                entry.kind, swapped.kind,
+                "the reloaded page's entry is attested"
+            );
+            assert!(entry.attestation_blob_b64.is_some());
+            drop(store);
+            assert_eq!(fx.audit_rows("approval_attested_remote"), 1);
+        });
+    }
+
+    /// A challenge minted without a view digest, as a reject asks for one,
+    /// signs a reject but not an approve.
+    #[test]
+    #[serial]
+    fn a_challenge_without_a_digest_rejects_but_cannot_approve() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let fx = fixture("digest-less-challenge");
+            let store_path = fx.state.ctx.store_path.clone();
+            let nonce = insert_payment_entry(&store_path);
+            let router = build_router();
+            let cookie = login(&router, &fx.state, &fx.authenticator).await;
+            let csrf = get_csrf(&router, &fx.state, &cookie, &nonce).await;
+
+            let resp = post_challenge(&router, &fx.state, &cookie, &csrf, &nonce, None).await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            let challenge = challenge_of(&body_json(resp).await);
+            let assertion = fx.authenticator.sign_valid(&challenge, RP_ID, ORIGIN, 2);
+            let resp = post_decision(
+                &router,
+                &fx.state,
+                &cookie,
+                &csrf,
+                &nonce,
+                decision_body("approve", &assertion),
+            )
+            .await;
+            assert_presence_changed(resp).await;
+            assert_entry_untouched(&store_path, &nonce);
+            assert_eq!(fx.audit_rows("approval_attested_remote"), 0);
+
+            let resp = post_challenge(&router, &fx.state, &cookie, &csrf, &nonce, None).await;
+            let challenge = challenge_of(&body_json(resp).await);
+            let assertion = fx.authenticator.sign_valid(&challenge, RP_ID, ORIGIN, 3);
+            let resp = post_decision(
+                &router,
+                &fx.state,
+                &cookie,
+                &csrf,
+                &nonce,
+                decision_body("reject", &assertion),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert_eq!(body_json(resp).await["status"], "rejected");
+            assert_eq!(fx.audit_rows("approval_rejected_remote"), 1);
+        });
     }
 
     fn decision_body(decision: &str, assertion: &crate::wire::AssertionWire) -> Vec<u8> {
@@ -2751,166 +2995,6 @@ mod tests {
         });
     }
 
-    // ── entry_envelope_sha256: non-zero binding for every digest-carrying kind ─
-    //
-    // Package D, GH issue #8, Leg 3: `RuleProposalSimulated` must bind the
-    // per-action challenge to its `proposal_sha256`, exactly as
-    // `PaymentSimulated` / `ClaimSimulated` bind to their envelope digest.
-    // Regression guard: if the `RuleProposalSimulated` arm were ever removed
-    // or fell through to the wildcard, this test catches it immediately
-    // (the fallback zero placeholder is the WRONG behaviour for a kind that
-    // has a real content digest to bind to).
-
-    #[test]
-    fn entry_envelope_sha256_is_non_zero_for_every_digest_carrying_kind() {
-        let payment = stellar_agent_core::approval::PendingApproval::new_payment_pending(
-            "b64xdr".to_owned(),
-            b"fake-xdr-bytes",
-            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
-            2_500_000,
-            "XLM".to_owned(),
-            None,
-            100,
-            1_234_567,
-            "424242".to_owned(),
-            DEFAULT_TTL_MS,
-        )
-        .unwrap();
-        assert_ne!(
-            entry_envelope_sha256(&payment),
-            [0u8; 32],
-            "PaymentSimulated"
-        );
-
-        let claim = stellar_agent_core::approval::PendingApproval::new_claim_pending(
-            "b64xdr".to_owned(),
-            b"fake-xdr-bytes",
-            "a".repeat(72),
-            "B".to_owned() + &"A".repeat(57),
-            "XLM".to_owned(),
-            500,
-            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
-            100,
-            1,
-            "424242".to_owned(),
-            DEFAULT_TTL_MS,
-        )
-        .unwrap();
-        assert_ne!(entry_envelope_sha256(&claim), [0u8; 32], "ClaimSimulated");
-
-        let definition = stellar_agent_core::approval::ContextRuleProposalSnapshot::new(
-            stellar_agent_core::approval::RuleProposalContextType::Default,
-            "spend-daily".to_owned(),
-            None,
-            vec![stellar_agent_core::approval::RuleProposalSigner::delegated(
-                "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
-                true,
-            )],
-            vec![],
-            vec![0],
-            false,
-            false,
-        );
-        let rule_proposal =
-            stellar_agent_core::approval::PendingApproval::new_rule_proposal_pending(
-                "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM".to_owned(),
-                "Test SDF Network ; September 2015".to_owned(),
-                "stellar:testnet".to_owned(),
-                definition,
-                "Default rule \"spend-daily\"".to_owned(),
-                "424242".to_owned(),
-                DEFAULT_TTL_MS,
-            )
-            .unwrap();
-        let ApprovalKind::RuleProposalSimulated {
-            proposal_sha256, ..
-        } = &rule_proposal.kind
-        else {
-            unreachable!()
-        };
-        assert_ne!(*proposal_sha256, [0; 32]);
-        assert_eq!(
-            entry_envelope_sha256(&rule_proposal),
-            *proposal_sha256,
-            "RuleProposalSimulated binds the complete proposal digest"
-        );
-
-        let mpp = stellar_agent_core::approval::fixtures::bind_mpp_entry(
-            PendingApproval::new_mpp_charge_pending(
-                [0x22; 32],
-                [0x33; 32],
-                "default".to_owned(),
-                "stellar:testnet".to_owned(),
-                "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
-                "http".to_owned(),
-                "merchant.example".to_owned(),
-                "/checkout".to_owned(),
-                "1000".to_owned(),
-                "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM".to_owned(),
-                "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
-                u64::MAX / 1_000,
-                1_000,
-                "424242".to_owned(),
-                DEFAULT_TTL_MS,
-            )
-            .unwrap(),
-        );
-        let ApprovalKind::MppChargeSimulated {
-            authorization_fingerprint,
-            ..
-        } = &mpp.kind
-        else {
-            unreachable!()
-        };
-        assert_eq!(
-            entry_envelope_sha256(&mpp),
-            stellar_agent_core::approval::mpp::approval_subject(
-                authorization_fingerprint,
-                &[0x33; 32]
-            ),
-            "MPP consent binds its terms and prepared artifact"
-        );
-
-        // Kinds with no content digest of their own correctly fall back to
-        // the zero placeholder — binding for these rests on approval_nonce
-        // alone, by design (see the fn's doc comment).
-        let toolset_gate =
-            stellar_agent_core::approval::PendingApproval::new_toolset_first_invoke_gate_pending(
-                "my-toolset".to_owned(),
-                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
-                "1.0.0".to_owned(),
-                "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd".to_owned(),
-                "sign-payment".to_owned(),
-                "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
-                "XLM".to_owned(),
-                0,
-                1_000_000,
-                "424242".to_owned(),
-                DEFAULT_TTL_MS,
-            )
-            .unwrap();
-        assert_eq!(
-            entry_envelope_sha256(&toolset_gate),
-            [0u8; 32],
-            "ToolsetFirstInvokeGate has no content digest; must use the placeholder"
-        );
-
-        let clawback =
-            stellar_agent_core::approval::PendingApproval::new_trustline_clawback_opt_in_pending(
-                "Test SDF Network ; September 2015".to_owned(),
-                "USDC".to_owned(),
-                "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5".to_owned(),
-                "424242".to_owned(),
-                DEFAULT_TTL_MS,
-            )
-            .unwrap();
-        assert_eq!(
-            entry_envelope_sha256(&clawback),
-            [0u8; 32],
-            "TrustlineClawbackOptIn has no content digest; must use the placeholder"
-        );
-    }
-
     /// Asserts `resp` carries the hardened CSP (`script-src 'self'`, no
     /// `unsafe-inline`/`unsafe-eval` on it) and that its HTML body contains
     /// no `<script>` tag lacking a `src` attribute, UNLESS that tag is a
@@ -2995,27 +3079,6 @@ mod tests {
         });
     }
 
-    #[test]
-    fn remote_trustline_challenge_uses_envelope_digest() {
-        let limit = None;
-        let entry = PendingApproval::new_trustline_pending(
-            CHANGE_TRUST_ENVELOPE.to_owned(),
-            CHANGE_TRUST_ENVELOPE.as_bytes(),
-            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
-            "USDC".to_owned(),
-            "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5".to_owned(),
-            limit,
-            100,
-            42,
-            "1000".to_owned(),
-            stellar_agent_core::approval::DEFAULT_TTL_MS,
-        )
-        .unwrap();
-        let expected =
-            stellar_agent_core::approval::envelope_sha256(CHANGE_TRUST_ENVELOPE.as_bytes());
-        assert_ne!(expected, [0; 32]);
-        assert_eq!(entry_envelope_sha256(&entry), expected);
-    }
     /// A `transfer` invocation of contract `[3; 32]` with no arguments.
     const X402_ROOT_XDR: &str =
         "AAAAAAAAAAEDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwAAAAh0cmFuc2ZlcgAAAAAAAAAA";

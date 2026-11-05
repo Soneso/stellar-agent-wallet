@@ -431,7 +431,7 @@ async fn t1_serve_approve_then_commit_on_testnet() {
         "the served pending.json carries amounts as decimal strings"
     );
 
-    // ── 5. Detail page → extract the per-nonce CSRF token ────────────────────
+    // ── 5. Detail page → extract the CSRF token and the view digest ─────────
     let detail_resp = client
         .get(format!("{base}/approval/{approval_nonce}"))
         .header(reqwest::header::COOKIE, &cookie)
@@ -446,6 +446,10 @@ async fn t1_serve_approve_then_commit_on_testnet() {
         .as_str()
         .expect("detail page surfaces the CSRF token")
         .to_owned();
+    let view_digest = data_island["view_digest"]
+        .as_str()
+        .expect("an approvable detail page carries its view digest")
+        .to_owned();
 
     // ── 6. Approve over HTTP: mints the attestation via the real attest path ─
     let origin = base.clone();
@@ -455,6 +459,8 @@ async fn t1_serve_approve_then_commit_on_testnet() {
         .header(reqwest::header::ORIGIN, &origin)
         .header("X-Stellar-Approval-CSRF", &csrf)
         .header("X-Session-Proof", &proof)
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(serde_json::json!({ "view_digest": view_digest }).to_string())
         .send()
         .await
         .expect("approve POST must succeed");

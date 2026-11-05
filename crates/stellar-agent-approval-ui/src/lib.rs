@@ -91,6 +91,7 @@ mod trace_capture;
 
 pub use decision::{
     Decision, DecisionContext, Outcome, REJECT_TOMBSTONE_TTL_MS, RequestIdentity, apply_decision,
+    consent_changed, shown_view_digest,
 };
 pub use error::{PresenceStartRefusal, ServeShutdownError, ServeStartError};
 pub use stellar_agent_loopback_http::brand::PageIdentity;

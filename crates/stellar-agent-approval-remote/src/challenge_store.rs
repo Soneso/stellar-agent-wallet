@@ -120,23 +120,37 @@ impl LoginChallengeStore {
 
 /// One outstanding per-action challenge: the full derived 32-byte challenge,
 /// the approval nonce it is bound to (for a defence-in-depth cross-check at
-/// consume time), and its mint time.
+/// consume time), the view digest it was minted over, and its mint time.
 struct ActionChallengeEntry {
     challenge: [u8; 32],
     approval_nonce: String,
+    shown_view_digest: Option<[u8; 32]>,
     minted_at: Instant,
+}
+
+/// What consuming a per-action challenge yields: the view digest of the
+/// page that requested it, which an approve compares with the entry it
+/// attests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConsumedActionChallenge {
+    /// The view digest the challenge was minted over; `None` for a challenge
+    /// minted without one, which can reject but not approve.
+    pub shown_view_digest: Option<[u8; 32]>,
 }
 
 /// Memory-only, single-use, capped store of outstanding per-action approve/
 /// reject challenges.
 ///
-/// Each entry binds `challenge = SHA-256(rand32 || envelope_sha256 ||
-/// approval_nonce)` (computed by the caller; this store only holds the
-/// result plus its own bookkeeping) to the specific approval nonce it was
-/// minted for. [`Self::consume`] requires the caller to also pass the
-/// nonce it expects, so a challenge minted for entry A can never be
-/// consumed as if it were valid for entry B even if the raw challenge bytes
-/// were somehow replayed against the wrong nonce parameter.
+/// Each entry binds `challenge = SHA-256(rand32 || view_digest ||
+/// approval_nonce)` (computed by the caller with
+/// [`derive_action_challenge`]; this store only holds the result plus its
+/// own bookkeeping) to the specific approval nonce it was minted for and to
+/// the view digest it was derived from. [`Self::consume`] requires the
+/// caller to also pass the nonce it expects, so a challenge minted for
+/// entry A can never be consumed as if it were valid for entry B even if
+/// the raw challenge bytes were somehow replayed against the wrong nonce
+/// parameter, and returns the view digest, so the passkey assertion over
+/// the challenge fixes the digest the decision compares.
 ///
 /// # Bounded capacity
 ///
@@ -157,12 +171,24 @@ impl ActionChallengeStore {
     }
 
     /// Prunes expired entries, evicts the oldest if at capacity, then stores
-    /// `challenge` bound to `approval_nonce`.
-    pub fn mint(&mut self, challenge: [u8; 32], approval_nonce: impl Into<String>) {
-        self.mint_at(challenge, approval_nonce, Instant::now());
+    /// `challenge` bound to `approval_nonce` and to the view digest it was
+    /// derived from (`None` for a challenge derived without one).
+    pub fn mint(
+        &mut self,
+        challenge: [u8; 32],
+        approval_nonce: impl Into<String>,
+        shown_view_digest: Option<[u8; 32]>,
+    ) {
+        self.mint_at(challenge, approval_nonce, shown_view_digest, Instant::now());
     }
 
-    fn mint_at(&mut self, challenge: [u8; 32], approval_nonce: impl Into<String>, now: Instant) {
+    fn mint_at(
+        &mut self,
+        challenge: [u8; 32],
+        approval_nonce: impl Into<String>,
+        shown_view_digest: Option<[u8; 32]>,
+        now: Instant,
+    ) {
         self.prune_at(now);
         if self.entries.len() >= ACTION_CHALLENGE_STORE_CAP {
             self.entries.pop_front();
@@ -170,34 +196,44 @@ impl ActionChallengeStore {
         self.entries.push_back(ActionChallengeEntry {
             challenge,
             approval_nonce: approval_nonce.into(),
+            shown_view_digest,
             minted_at: now,
         });
     }
 
     /// Consumes (removes) the entry matching BOTH `challenge` and
-    /// `approval_nonce`, if present and unexpired.
+    /// `approval_nonce`, if present and unexpired, and returns the view
+    /// digest it was minted over.
     ///
-    /// Returns `true` iff such an entry existed. A challenge minted for a
+    /// Returns `None` iff no such entry existed. A challenge minted for a
     /// different nonce than the one presented here never matches, even if
     /// the raw 32 bytes happened to collide (astronomically unlikely, but
     /// the nonce check makes the store's cross-entry binding independent of
     /// that assumption).
-    pub fn consume(&mut self, challenge: &[u8; 32], approval_nonce: &str) -> bool {
+    pub fn consume(
+        &mut self,
+        challenge: &[u8; 32],
+        approval_nonce: &str,
+    ) -> Option<ConsumedActionChallenge> {
         self.consume_at(challenge, approval_nonce, Instant::now())
     }
 
-    fn consume_at(&mut self, challenge: &[u8; 32], approval_nonce: &str, now: Instant) -> bool {
+    fn consume_at(
+        &mut self,
+        challenge: &[u8; 32],
+        approval_nonce: &str,
+        now: Instant,
+    ) -> Option<ConsumedActionChallenge> {
         self.prune_at(now);
-        if let Some(pos) = self
+        let pos = self
             .entries
             .iter()
-            .position(|e| &e.challenge == challenge && e.approval_nonce == approval_nonce)
-        {
-            self.entries.remove(pos);
-            true
-        } else {
-            false
-        }
+            .position(|e| &e.challenge == challenge && e.approval_nonce == approval_nonce)?;
+        self.entries
+            .remove(pos)
+            .map(|entry| ConsumedActionChallenge {
+                shown_view_digest: entry.shown_view_digest,
+            })
     }
 
     /// Removes entries older than [`CHALLENGE_TTL`].
@@ -219,22 +255,23 @@ impl ActionChallengeStore {
     }
 }
 
-/// Derives the per-action challenge: `SHA-256(rand32 || envelope_sha256 ||
+/// Derives the per-action challenge: `SHA-256(rand32 || view_digest ||
 /// approval_nonce)`.
 ///
-/// `envelope_sha256` MUST be server-derived from the parked
-/// `PendingApproval` entry, never taken from request input — see the
-/// module docs on the per-action ceremony design.
+/// `view_digest` is the view digest the requesting page rendered, after the
+/// caller checked that it is the digest of the current entry, or 32 zero
+/// bytes for a challenge minted without one. A passkey assertion over the
+/// challenge therefore commits to the terms the page showed.
 #[must_use]
 pub fn derive_action_challenge(
     rand32: &[u8; 32],
-    envelope_sha256: &[u8; 32],
+    view_digest: &[u8; 32],
     approval_nonce: &str,
 ) -> [u8; 32] {
     use sha2::{Digest as _, Sha256};
     let mut hasher = Sha256::new();
     hasher.update(rand32);
-    hasher.update(envelope_sha256);
+    hasher.update(view_digest);
     hasher.update(approval_nonce.as_bytes());
     hasher.finalize().into()
 }
@@ -311,13 +348,13 @@ mod tests {
         let now = Instant::now();
         let mut store = ActionChallengeStore::new();
         let challenge = derive_action_challenge(&random_32(), &[0x11; 32], "nonce-a");
-        store.mint_at(challenge, "nonce-a", now);
+        store.mint_at(challenge, "nonce-a", None, now);
         assert!(
-            !store.consume_at(&challenge, "nonce-b", now),
+            store.consume_at(&challenge, "nonce-b", now).is_none(),
             "a challenge minted for nonce-a must not consume as nonce-b"
         );
         assert!(
-            store.consume_at(&challenge, "nonce-a", now),
+            store.consume_at(&challenge, "nonce-a", now).is_some(),
             "consuming with the correct nonce must succeed"
         );
         assert!(store.is_empty());
@@ -328,38 +365,46 @@ mod tests {
         let now = Instant::now();
         let mut store = ActionChallengeStore::new();
         let challenge = derive_action_challenge(&random_32(), &[0x22; 32], "nonce-x");
-        store.mint_at(challenge, "nonce-x", now);
-        assert!(store.consume_at(&challenge, "nonce-x", now));
-        assert!(!store.consume_at(&challenge, "nonce-x", now));
+        store.mint_at(challenge, "nonce-x", None, now);
+        assert!(store.consume_at(&challenge, "nonce-x", now).is_some());
+        assert!(store.consume_at(&challenge, "nonce-x", now).is_none());
     }
 
     #[test]
     fn action_challenge_expires_at_ttl() {
         let now = Instant::now();
         let mut store = ActionChallengeStore::new();
-        store.mint_at([0x11; 32], "nonce-a", now);
-        store.mint_at([0x22; 32], "nonce-b", now);
-        assert!(store.consume_at(
-            &[0x11; 32],
-            "nonce-a",
-            now + CHALLENGE_TTL - Duration::from_nanos(1)
-        ));
-        assert!(!store.consume_at(&[0x22; 32], "nonce-b", now + CHALLENGE_TTL));
+        store.mint_at([0x11; 32], "nonce-a", None, now);
+        store.mint_at([0x22; 32], "nonce-b", None, now);
+        assert!(
+            store
+                .consume_at(
+                    &[0x11; 32],
+                    "nonce-a",
+                    now + CHALLENGE_TTL - Duration::from_nanos(1)
+                )
+                .is_some()
+        );
+        assert!(
+            store
+                .consume_at(&[0x22; 32], "nonce-b", now + CHALLENGE_TTL)
+                .is_none()
+        );
         assert!(store.is_empty());
     }
 
-    /// WYSIWYS: a challenge derived from entry A's envelope hash differs from
-    /// one derived from entry B's, even with the same nonce and rand32 —
-    /// proving the challenge is not solely nonce-bound but genuinely
-    /// envelope-bound.
+    /// WYSIWYS: a challenge derived from one view digest differs from one
+    /// derived from another, even with the same nonce and rand32, so the
+    /// challenge is bound to the terms the page showed and not only to the
+    /// nonce.
     #[test]
-    fn wysiwys_challenge_differs_by_envelope_hash() {
+    fn wysiwys_challenge_differs_by_view_digest() {
         let rand32 = random_32();
         let challenge_a = derive_action_challenge(&rand32, &[0xAA; 32], "same-nonce");
         let challenge_b = derive_action_challenge(&rand32, &[0xBB; 32], "same-nonce");
         assert_ne!(
             challenge_a, challenge_b,
-            "distinct envelope hashes must produce distinct challenges"
+            "distinct view digests must produce distinct challenges"
         );
     }
 
@@ -368,20 +413,46 @@ mod tests {
         let now = Instant::now();
         let mut store = ActionChallengeStore::new();
         let first = derive_action_challenge(&random_32(), &[0x01; 32], "nonce-0");
-        store.mint_at(first, "nonce-0", now);
+        store.mint_at(first, "nonce-0", None, now);
         for i in 1..ACTION_CHALLENGE_STORE_CAP {
             let c = derive_action_challenge(&random_32(), &[i as u8; 32], &format!("nonce-{i}"));
-            store.mint_at(c, format!("nonce-{i}"), now);
+            store.mint_at(c, format!("nonce-{i}"), None, now);
         }
         assert_eq!(store.len(), ACTION_CHALLENGE_STORE_CAP);
         // Minting one more evicts the oldest (`first` / "nonce-0").
         let extra = derive_action_challenge(&random_32(), &[0xFF; 32], "nonce-extra");
-        store.mint_at(extra, "nonce-extra", now);
+        store.mint_at(extra, "nonce-extra", None, now);
         assert_eq!(store.len(), ACTION_CHALLENGE_STORE_CAP);
         assert!(
-            !store.consume_at(&first, "nonce-0", now),
+            store.consume_at(&first, "nonce-0", now).is_none(),
             "the oldest entry must have been evicted"
         );
+    }
+
+    #[test]
+    fn consuming_a_challenge_returns_its_shown_digest() {
+        let now = Instant::now();
+        let mut store = ActionChallengeStore::new();
+        let shown = [0x5A; 32];
+        let approve = derive_action_challenge(&random_32(), &shown, "nonce-a");
+        let reject = derive_action_challenge(&random_32(), &[0; 32], "nonce-a");
+        store.mint_at(approve, "nonce-a", Some(shown), now);
+        store.mint_at(reject, "nonce-a", None, now);
+        assert_eq!(
+            store.consume_at(&reject, "nonce-a", now),
+            Some(ConsumedActionChallenge {
+                shown_view_digest: None
+            }),
+            "a challenge minted without a digest yields none"
+        );
+        assert_eq!(
+            store.consume_at(&approve, "nonce-a", now),
+            Some(ConsumedActionChallenge {
+                shown_view_digest: Some(shown)
+            }),
+            "a challenge yields the digest it was minted over"
+        );
+        assert!(store.is_empty());
     }
 
     #[test]

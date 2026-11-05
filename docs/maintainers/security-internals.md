@@ -740,6 +740,25 @@ verifies nothing. Toolset grants keep their own versions.
 `approval.attestation_invalid` covers missing coverage or a mismatched
 subject. MCP reports failed approval proofs as `policy.approval_required`.
 
+An inbox approve is bound to the page that rendered it. `approval_view_digest`
+hashes, under `stellar-agent-approval-view:v1`, the nonce, the profile and
+chain, the kind name, the kind's `approval_view_subject` (the subject its
+attestation, grant or consent binds, after the stored terms are checked), the
+process UID, and both lifetime fields. The detail pages of both inboxes carry
+it. The local approve posts it with the request. The remote approve posts it to
+the challenge route, which mints only for the digest of the current entry,
+derives the challenge over it, and stores it with the challenge, so the
+decision compares the digest the signed assertion commits to; a challenge
+minted without a digest can reject but not approve. The decision seam refuses
+an absent or different digest with `approval.presence_changed` before the
+keyring read, the row and any store write, and the attester's still-pending
+check refuses an entry replaced after that comparison with
+`approval.wrong_kind`. A same-user process that can write the pending store can
+therefore replace an entry while a page is open, but the approve from that page
+attests nothing, and a reload renders the replacement for review. The CLI
+prompts for and attests one copy of the entry, and the mainnet ceremonies bind
+their own consent view digest.
+
 #### Mainnet presence consent
 
 A mainnet consent is a version 5 attestation with a mainnet passkey approver

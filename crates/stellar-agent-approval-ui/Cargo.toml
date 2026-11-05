@@ -59,7 +59,8 @@ p256 = { workspace = true }
 # crate only needs the `serde_json` value/serialiser surface.
 serde_json = { workspace = true }
 
-# Deserialises the operator-enroll POST /enroll/credential wire payload.
+# Deserialises the operator-enroll POST /enroll/credential wire payload and
+# the view digest an approve request returns.
 serde = { workspace = true, features = ["derive"] }
 
 # Decodes the base64url credential id / SEC1 public key on the

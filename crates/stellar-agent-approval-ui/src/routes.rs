@@ -22,6 +22,7 @@
 
 use axum::{
     Router,
+    body::Bytes,
     extract::{Path, RawQuery, State},
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{Html, IntoResponse, Response},
@@ -31,13 +32,14 @@ use serde_json::json;
 
 use stellar_agent_core::approval::error::ApprovalError;
 use stellar_agent_core::approval::{
-    DEFAULT_RETRY_ATTEMPTS, DEFAULT_RETRY_BACKOFF, PendingApprovalView, open_with_retry,
+    DEFAULT_RETRY_ATTEMPTS, DEFAULT_RETRY_BACKOFF, PendingApprovalView, approval_view_digest,
+    open_with_retry,
 };
 use stellar_agent_core::timefmt;
 
 use crate::ServeState;
 use crate::auth::{CSRF_HEADER_NAME, SessionState, require_session_proof, verify_csrf};
-use crate::decision::{Decision, Outcome, RequestIdentity, apply_decision};
+use crate::decision::{Decision, Outcome, RequestIdentity, apply_decision, shown_view_digest};
 use crate::templates::{
     render_detail_page, render_inbox_page, render_not_found_page, render_session_bootstrap_page,
 };
@@ -330,6 +332,10 @@ async fn pending_json(
 }
 
 /// `GET /approval/{nonce}` — the per-approval detail page.
+///
+/// The view and the [`approval_view_digest`] the page carries come from one
+/// store handle, so the digest an approve returns is the digest of the
+/// entry the page rendered.
 async fn approval_detail_get(
     State(state): State<ServeState>,
     headers: HeaderMap,
@@ -378,6 +384,10 @@ async fn approval_detail_get(
     } else {
         None
     };
+    let view_digest = store
+        .get(&nonce)
+        .and_then(|entry| approval_view_digest(entry, &state.ctx.context.binding()).ok())
+        .map(|digest| stellar_agent_core::hex::encode(&digest));
     drop(store);
 
     let csrf = crate::auth::compute_csrf(&session.csrf_key, &nonce);
@@ -388,23 +398,32 @@ async fn approval_detail_get(
         &csrf,
         &activity_csrf,
         attestation_blob.as_deref(),
+        view_digest.as_deref(),
         &state.identity,
     ))
     .into_response()
 }
 
 /// `POST /approval/{nonce}/approve` — attest / record consent for the approval.
+///
+/// The body is `{"view_digest":"<hex>"}`, the digest the detail page
+/// rendered. A missing, malformed or stale digest refuses with `409`
+/// `approval.presence_changed` and attests nothing.
 async fn approve_post(
     State(state): State<ServeState>,
     headers: HeaderMap,
     Path(nonce): Path<String>,
+    body: Bytes,
 ) -> Response {
     if let Err(resp) = authorize_mutation(&state.auth, &headers, &nonce) {
         return resp;
     }
     let outcome = apply_decision(
         &state.ctx,
-        Decision::Approve { nonce },
+        Decision::Approve {
+            nonce,
+            shown_view_digest: shown_view_digest(&body),
+        },
         RequestIdentity::Local,
     );
     outcome_to_response(outcome)
@@ -567,7 +586,7 @@ pub(crate) fn outcome_to_response(outcome: Outcome) -> Response {
 mod tests {
     #![allow(clippy::unwrap_used, reason = "route test fixture assertions")]
     use axum::{
-        body::{Body, to_bytes},
+        body::to_bytes,
         http::{Request, StatusCode, header},
     };
     use stellar_agent_core::approval::PendingApprovalStore;
@@ -610,7 +629,7 @@ mod tests {
             .header(header::COOKIE, cookie)
             .header("x-stellar-approval-csrf", h.csrf_for(&nonce))
             .header("x-session-proof", h.proof())
-            .body(Body::empty())
+            .body(h.view_digest_body(&nonce))
             .unwrap();
         let response = h.router().oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);

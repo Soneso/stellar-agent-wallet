@@ -489,6 +489,11 @@ with it. Three surfaces exist for the operator side of that handshake:
   reject additionally requires a fresh passkey assertion bound to the exact
   entry.
 
+Both inboxes approve only the request their page shows. When the pending
+request changed after the page loaded, the approve is refused with
+`approval.presence_changed` (HTTP 409) and nothing is attested; the operator
+reloads the page and reviews the request again.
+
 None of this changes what the agent does. The attestation also records which
 surface approved: the local operator, or the remote operator credential. When
 the operator revokes that credential before the commit, a mainnet commit
