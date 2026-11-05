@@ -261,6 +261,10 @@ pub const WINDOWS_NO_LOGON_SESSION_TEXT: &str = "Windows ERROR_NO_SUCH_LOGON_SES
 /// an injection placed here reaches entries constructed later by production
 /// code under test.
 ///
+/// Under [`install_with_read_hooks`] the injection reaches the mock
+/// credential behind a hooked coordinate too; a read there runs its hooks
+/// and then returns the injected error.
+///
 /// # Errors
 ///
 /// - Any error from `keyring_core::Entry::new`.
@@ -272,7 +276,12 @@ pub fn inject_error(
     err: keyring_core::Error,
 ) -> Result<(), keyring_core::Error> {
     let entry = keyring_core::Entry::new(service, account)?;
-    let Some(cred) = entry.as_any().downcast_ref::<keyring_core::mock::Cred>() else {
+    let hooked = entry.as_any().downcast_ref::<HookedCred>();
+    let credential = hooked.map_or(&entry, |hooked| &hooked.entry);
+    let Some(cred) = credential
+        .as_any()
+        .downcast_ref::<keyring_core::mock::Cred>()
+    else {
         return Err(keyring_core::Error::NotSupportedByStore(
             "keyring_mock::inject_error requires the keyring-core mock store; \
              call keyring_mock::install() first"
@@ -495,5 +504,40 @@ mod tests {
         entry
             .set_password("value")
             .expect("the injection is single-shot; the retry must succeed");
+    }
+
+    /// An injection at a hooked coordinate fails the next read after its
+    /// hook runs, once.
+    #[test]
+    #[serial]
+    fn injected_error_reaches_a_hooked_coordinate() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let reads = Arc::new(AtomicU32::new(0));
+        let counted = Arc::clone(&reads);
+        super::install_with_read_hooks(vec![super::ReadHook::new(
+            "hooked-svc",
+            "hooked-user",
+            Arc::new(move || {
+                counted.fetch_add(1, Ordering::SeqCst);
+            }),
+        )])
+        .expect("hooked store install");
+        let entry = keyring_core::Entry::new("hooked-svc", "hooked-user").expect("entry");
+        entry.set_password("value").expect("set");
+        super::inject_no_logon_session("hooked-svc", "hooked-user").expect("inject");
+
+        let err = keyring_core::Entry::new("hooked-svc", "hooked-user")
+            .expect("entry")
+            .get_password()
+            .expect_err("injected failure");
+        assert!(
+            matches!(err, keyring_core::Error::NoStorageAccess(ref inner)
+                if inner.to_string().contains(super::WINDOWS_NO_LOGON_SESSION_TEXT)),
+            "expected the injected no-logon-session shape, got {err:?}"
+        );
+        assert_eq!(reads.load(Ordering::SeqCst), 1, "the hook runs first");
+        assert_eq!(entry.get_password().expect("single-shot"), "value");
+        assert_eq!(reads.load(Ordering::SeqCst), 2);
     }
 }

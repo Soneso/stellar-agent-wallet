@@ -335,7 +335,25 @@ pub(super) const WIRE_VERSION_LEDGER: u32 = 4;
 /// A file written by a newer build carries records this one cannot account
 /// for, so it is refused rather than read with the fields it happens to
 /// recognise.
-pub(super) const WIRE_VERSION_MAX: u32 = 5;
+pub(super) const WIRE_VERSION_MAX: u32 = 6;
+
+/// Wire version binding the accounting network on every snapshot.
+pub(super) const WIRE_VERSION_CHAIN: u32 = 5;
+
+/// Wire version carrying durable signing claims.
+pub(super) const WIRE_VERSION_CLAIM: u32 = 6;
+
+fn select_wire_version(wire: &WireFile) -> u32 {
+    if wire
+        .authorizations
+        .iter()
+        .any(|auth| auth.claimed_ms.is_some())
+    {
+        WIRE_VERSION_CLAIM
+    } else {
+        WIRE_VERSION_CHAIN
+    }
+}
 
 /// How many reservations one reconciliation pass settles.
 ///
@@ -696,7 +714,8 @@ pub(super) struct WireBucket {
 /// — see the module docs' "Anti-rollback" section; it MUST equal the
 /// keyring-held generation counter for the file to be accepted.
 ///
-/// Version 5 binds the accounting network on every snapshot. Optional fields
+/// Version 5 binds the accounting network on every snapshot. Version 6 carries
+/// durable signing claims. Optional fields
 /// preserve the serialized shape of legacy snapshots for integrity checks;
 /// missing network provenance refuses at the authenticated read boundary.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
@@ -1176,8 +1195,8 @@ impl PersistedWindowStore {
 
         let mut wire = self.read_verified(profile, &key, &gen_entry)?;
         let now_ms = now_ms()?;
-        // Expired authorizations release their holds before the window is
-        // counted; the holds that remain count against it.
+        // Expiry retains claimed spend and releases unclaimed holds before
+        // the window is counted; remaining holds count against it.
         ledger::sweep_expired(&mut wire, now_ms);
         if require_admission {
             admit(&wire, new_entries)?;
@@ -1193,7 +1212,7 @@ impl PersistedWindowStore {
         }
 
         prune_stale(&mut wire, now_ms);
-        wire.version = WIRE_VERSION_MAX;
+        wire.version = select_wire_version(&wire);
 
         // This debit may already be on chain, so it never goes through the
         // prepared image: the counter moves first, and a failed file write
@@ -1271,8 +1290,8 @@ impl PersistedWindowStore {
         if file_holds_id(&wire, &reservation.id) {
             return Err(WindowStoreError::DuplicateReservation);
         }
-        // Expired authorizations release their holds before the window is
-        // counted; the holds that remain count against it.
+        // Expiry retains claimed spend and releases unclaimed holds before
+        // the window is counted; remaining holds count against it.
         ledger::sweep_expired(&mut wire, now_ms);
         admit(&wire, new_entries)?;
 
@@ -1689,7 +1708,8 @@ impl PersistedWindowStore {
     /// Unverifiable state refuses before the recorder and all state writes.
     ///
     /// A mainnet profile in a build with mainnet writes also refuses while an
-    /// effective open authorization remains. Expired authorizations are released in memory only:
+    /// effective open or claimed authorization remains. Expiry releases
+    /// unclaimed holds and converts claimed holds to confirmed spend in memory;
     /// nothing persists before the recorder succeeds. A missing file with no
     /// committed generation is a genuine first run and carries no defect.
     ///
@@ -1986,7 +2006,7 @@ impl PersistedWindowStore {
         // commitment is hashed. The current snapshot keeps the version it was
         // committed under, so its committed digest stays the same with the
         // successor beside it.
-        next.version = WIRE_VERSION_MAX;
+        next.version = select_wire_version(&next);
         if original.generation == 0 {
             // Initialisation has no prior debit to retain. A missing trusted
             // counter on an existing file must remain a deletion error.
@@ -2888,7 +2908,7 @@ fn authenticated_scope(wire: &WireFile) -> Result<ChainScope, WindowStoreError> 
 
 /// Checks one snapshot's version and its authorization history.
 ///
-/// Versions 1 through 5 decode. Snapshots below version 4 carry no authorization
+/// Versions 1 through 6 decode. Snapshots below version 4 carry no authorization
 /// history; usable snapshots also require complete authenticated scope.
 fn check_snapshot(wire: &WireFile) -> Result<(), WindowStoreError> {
     if wire.version > WIRE_VERSION_MAX {
@@ -3154,7 +3174,7 @@ fn select_generation(
     counter: Option<GenerationState>,
 ) -> Result<WireFile, WindowStoreError> {
     // The current snapshot may carry any version this build reads, a legacy
-    // one included; a successor carries version 3 through 5.
+    // one included; a successor carries version 3 through [`WIRE_VERSION_MAX`].
     if let Some(next) = &wire.prepared
         && (!(WIRE_VERSION_COMPACT..=WIRE_VERSION_MAX).contains(&next.version)
             || next.prepared.is_some()
@@ -3391,6 +3411,9 @@ pub(super) fn find_or_insert_bucket<'a>(
 // ─────────────────────────────────────────────────────────────────────────────
 // Tests
 // ─────────────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+pub(crate) use tests::fail_store_writes;
 
 #[cfg(test)]
 mod tests {
@@ -5733,6 +5756,7 @@ mod tests {
             state: ledger::AuthorizationState::Expired,
             minted_ms: 1,
             expires_ms: 2,
+            claimed_ms: None,
             settled_ms: Some(now_ms().unwrap()),
             policy_sequence: 1,
             policy_digest: [1; 32],
@@ -5880,7 +5904,7 @@ mod tests {
                 body_sha256: None,
             })
         };
-        for version in [1, 2, 6] {
+        for version in [1, 2, WIRE_VERSION_MAX + 1] {
             let mut container = current.clone();
             container.prepared = Some(Box::new(WireFile {
                 version,
@@ -6139,6 +6163,31 @@ mod tests {
         }
     }
 
+    #[test]
+    #[serial]
+    #[cfg(feature = "mainnet-write")]
+    fn a_claimed_record_blocks_the_mainnet_reset() {
+        use crate::mainnet::fixtures::{self, LedgerFixture};
+        let f = LedgerFixture::new("claimed-reset", 1_800_000_000_000);
+        let envelope = fixtures::unsigned_envelope();
+        let auth = f.mint(
+            fixtures::tx_binding(envelope.envelope_xdr(), envelope.tx_hash_hex()),
+            &[fixtures::hold(&f.name, f.now, 70)],
+            None,
+            "claim-reset",
+        );
+        auth.claim().unwrap();
+        let before = fs::read(f.window.path()).unwrap();
+        assert!(matches!(
+            f.window.reset(&f.profile, f.now, |_| Ok::<_, ()>(())),
+            Err(ResetError::Store {
+                error: WindowStoreError::OpenAuthorizations { open: 1 },
+                minted: false
+            })
+        ));
+        assert_eq!(fs::read(f.window.path()).unwrap(), before);
+    }
+
     /// A verifiable mainnet store with an effective open authorization
     /// refuses the reset with nothing changed; once it expires, the reset
     /// proceeds. Without the mainnet rules the open record does not block.
@@ -6221,7 +6270,7 @@ mod tests {
             f.seal(&reset_wire());
             let key =
                 crate::keyring::load_hmac_key_32(&f.profile.policy_window_state_key_id).unwrap();
-            let body = br#"{"version":6,"future_authorities":[{"open":true}],"prepared":"future representation"}"#;
+            let body = br#"{"version":7,"future_authorities":[{"open":true}],"prepared":"future representation"}"#;
             f.store
                 .write_atomic_raw(&compute_tag(key.as_ref(), body).unwrap(), body)
                 .unwrap();
@@ -6229,13 +6278,13 @@ mod tests {
             assert!(
                 matches!(
                     f.store.verify_with_key(&key, &before),
-                    Err(WindowStoreError::UnsupportedVersion { version: 6, max: 5 })
+                    Err(WindowStoreError::UnsupportedVersion { version: 7, max: 6 })
                 ),
                 "{chain:?}"
             );
             assert_eq!(
                 defect_of(
-                    &WindowStoreError::UnsupportedVersion { version: 6, max: 5 },
+                    &WindowStoreError::UnsupportedVersion { version: 7, max: 6 },
                     false
                 ),
                 None
@@ -6249,7 +6298,7 @@ mod tests {
                 matches!(
                     result,
                     Err(ResetError::Store {
-                        error: WindowStoreError::UnsupportedVersion { version: 6, max: 5 },
+                        error: WindowStoreError::UnsupportedVersion { version: 7, max: 6 },
                         minted: false,
                     })
                 ),
@@ -6614,11 +6663,25 @@ mod tests {
         STORE_WRITE_HOOK.with_borrow_mut(|hook| hook.as_mut().map_or(Ok(()), |hook| hook()))
     }
 
-    struct ArmedWrite;
+    /// Disarms the store write hook on this thread when dropped.
+    pub(crate) struct ArmedWrite;
     impl Drop for ArmedWrite {
         fn drop(&mut self) {
             STORE_WRITE_HOOK.with_borrow_mut(|hook| *hook = None);
         }
+    }
+
+    /// Fails every store file write on this thread with a full-storage I/O
+    /// error until the returned guard drops.
+    pub(crate) fn fail_store_writes() -> ArmedWrite {
+        STORE_WRITE_HOOK.with_borrow_mut(|hook| {
+            *hook = Some(Box::new(|| {
+                Err(WindowStoreError::Io {
+                    kind: std::io::ErrorKind::StorageFull,
+                })
+            }));
+        });
+        ArmedWrite
     }
 
     /// The three durable steps of a commit past the first write.

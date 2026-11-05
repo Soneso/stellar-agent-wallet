@@ -153,6 +153,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ApprovalKind::ToolsetFirstInvokeGate` and
   `ApprovalSummaryView::ToolsetFirstInvokeGate` gain the fields.
   `verify_toolset_gate_entry_terms` is new.
+- Mainnet authorization records include a `Claimed` state and `claimed_ms`.
+  Snapshots carrying a claim use wire version 6.
+  `PersistedWindowStore::claim_authorization` durably claims signing authority.
+  `invalidate_unconsumed` refuses a claimed authorization with `NotOpen`;
+  `OpenAuthorization::claimed_at_ms` exposes its claim time.
 
 - `PendingApproval::new_rule_proposal_pending` computes the proposal digest
   from the stored account, network, chain, definition and summary line.
@@ -681,6 +686,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   first-invoke requests of an earlier build need a reinstall and a new request.
   The gated resolver and `record_first_invoke_grant` refuse an attestation binding
   of another profile with `toolset.binding_mismatch`.
+- Mainnet signing records a durable claim on its authorization before the signer
+  runs. An authorization invalidated or expired before the claim is never signed.
+  A claimed authorization keeps its spend counted until it is consumed or ages
+  out of the spending windows. A signature returned after the authorization's
+  lifetime is discarded.
 
 - A committed rule approval is recorded as spent in the platform keyring before
   the install starts. Restoring an earlier copy of the pending approval store

@@ -36,7 +36,7 @@ use stellar_xdr::{Limits, ReadXdr, TransactionEnvelope};
 
 use super::audit_readiness::AuditReadiness;
 use super::authorization::{
-    ApprovalBinding, EndpointBinding, Header, MainnetSorobanIntentAuthorization,
+    ApprovalBinding, ClaimTarget, EndpointBinding, Header, MainnetSorobanIntentAuthorization,
     MainnetTxSignAuthorization, PolicyBinding, SignerBinding, SorobanIntentInner, TxSignInner,
 };
 use super::clock::{TestClockGuard, set_now_ms_for_test};
@@ -100,10 +100,78 @@ pub(crate) fn tx_binding(unsigned_xdr: &str, tx_hash_hex: &str) -> DomainBinding
     }
 }
 
+/// A store target for fixtures that check in-memory header facts.
+pub(crate) fn claim_target(dir: &std::path::Path, name: &str) -> ClaimTarget {
+    ClaimTarget {
+        store: PersistedWindowStore::at_path(dir.join("state.window")),
+        profile: Profile::builder_mainnet_named(
+            name,
+            "https://rpc.example",
+            "signer",
+            "account",
+            "nonce",
+            "nonce",
+        )
+        .build(),
+    }
+}
+
+/// Mints a fixture header's bound record in its own ledger.
+pub(crate) fn mint_header(header: &mut Header, binding: &DomainBinding, holds: &[WindowEntry]) {
+    let target = &header.claim;
+    let lock = WindowStoreLock::acquire_for(
+        target.store.path(),
+        &target.profile.policy_window_state_key_id,
+    )
+    .unwrap();
+    pin::write_for_test(
+        &lock,
+        &PinScope::for_profile(target.store.path(), &target.profile),
+        &Pin::new(header.policy.sequence, header.policy.digest, POLICY_OWNER).unwrap(),
+    )
+    .unwrap();
+    drop(lock);
+    let minted = target
+        .store
+        .mint_authorization(
+            &target.profile,
+            &MintRequest {
+                chain: header.chain,
+                binding: binding.clone(),
+                consumer: header.consumer,
+                policy_sequence: header.policy.sequence,
+                policy_digest: header.policy.digest,
+                approval_nonce: header.approval.nonce.clone(),
+                approval_expires_at_ms: header.approval.expires_at_ms,
+                chain_deadline_ms: None,
+                authorization_ttl_ms: TTL_MS,
+                bindings: BindingFacts {
+                    endpoint: None,
+                    signer: [2; 32],
+                    policy: [3; 32],
+                    enablement: [4; 32],
+                    witness: None,
+                    reservation: None,
+                    approval: [5; 32],
+                    audit: [6; 32],
+                },
+                holds: holds.to_vec(),
+                parent: None,
+            },
+        )
+        .unwrap();
+    header.id = minted.id;
+    header.reservation = minted.reservation;
+    header.issued_at_ms = minted.issued_at_ms;
+    header.expires_at_ms = minted.expires_at_ms;
+    header.bindings_digest = minted.bindings_digest;
+}
+
 /// A header with every fact valid at `now`: the mainnet chain, the
 /// `CliPay` consumer, `endpoint`, the fixture's agent signer, an audit proof
 /// over `facts` of `writer`, issued at `now` and expiring after [`TTL_MS`].
 pub(crate) fn header(
+    claim: ClaimTarget,
     profile: &str,
     endpoint: Option<(String, u64)>,
     writer: &AuditWriterHandle,
@@ -111,6 +179,7 @@ pub(crate) fn header(
     now: u64,
 ) -> Header {
     Header {
+        claim,
         id: AuthorizationId::from_bytes([0xab; 32]),
         profile: profile.to_owned(),
         chain: Caip2::Mainnet,
@@ -159,6 +228,7 @@ pub(crate) fn tx_authorization(
 /// fixture's agent signer and an audit proof of `writer`, valid at `now` for
 /// [`TTL_MS`].
 pub(crate) fn soroban_authorization(
+    claim: ClaimTarget,
     writer: &AuditWriterHandle,
     invocation: &stellar_xdr::SorobanAuthorizedInvocation,
     nonce: i64,
@@ -175,7 +245,7 @@ pub(crate) fn soroban_authorization(
         anchor_covers_tip: true,
         entry_tags_in_force: true,
     };
-    let mut header = header("fixture", None, writer, facts, now);
+    let mut header = header(claim, "fixture", None, writer, facts, now);
     header.domain = AuthorizationDomain::Soroban;
     header.consumer = MainnetConsumer::X402Create;
     let mainnet: [u8; 32] = Sha256::digest(MAINNET_PASSPHRASE.as_bytes()).into();
@@ -270,6 +340,85 @@ pub(crate) struct LedgerFixture {
 }
 
 impl LedgerFixture {
+    pub(crate) fn context(&self) -> crate::MainnetWriteContext {
+        let profiles = self.dir.path().join("profiles");
+        stellar_agent_core::profile::loader::save_to_dir(&self.name, &self.profile, &profiles)
+            .unwrap();
+        crate::NetworkContext::mainnet_write(
+            &self.profile,
+            &stellar_agent_core::profile::name::ResolvedProfileName::from_flag(&self.name),
+            &profiles,
+            crate::MainnetEndpointFlags::default(),
+        )
+        .unwrap()
+    }
+
+    pub(crate) fn assert_claimed_holds(&self, id: AuthorizationId, amount: i128) {
+        let bytes = std::fs::read(self.window.path()).unwrap();
+        let wire: serde_json::Value = serde_json::from_slice(&bytes[32..]).unwrap();
+        let id = serde_json::to_value(id).unwrap();
+        let auth = wire["authorizations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|auth| auth["id"] == id)
+            .unwrap();
+        assert_eq!(auth["state"], "claimed");
+        assert_eq!(auth["claimed_ms"], self.now);
+        let total: i128 = wire["holds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|hold| hold["authorization_id"] == id)
+            .map(|hold| hold["amount"].as_str().unwrap().parse::<i128>().unwrap())
+            .sum();
+        assert_eq!(total, amount);
+    }
+
+    /// Replaces the policy pin of the fixture's window store with one naming
+    /// `digest`.
+    pub(crate) fn repin(&self, digest: [u8; 32]) {
+        let lock = WindowStoreLock::acquire_for(
+            self.window.path(),
+            &self.profile.policy_window_state_key_id,
+        )
+        .unwrap();
+        pin::write_for_test(
+            &lock,
+            &PinScope::for_profile(self.window.path(), &self.profile),
+            &Pin::new(POLICY_SEQUENCE, digest, POLICY_OWNER).unwrap(),
+        )
+        .unwrap();
+    }
+
+    pub(crate) fn claim_target(&self) -> ClaimTarget {
+        ClaimTarget {
+            store: self.window.clone(),
+            profile: self.profile.clone(),
+        }
+    }
+
+    pub(crate) fn mint_soroban(
+        &self,
+        invocation: &stellar_xdr::SorobanAuthorizedInvocation,
+        nonce: i64,
+        expiration: u32,
+        amount: i128,
+    ) -> MainnetSorobanIntentAuthorization {
+        let mut auth = soroban_authorization(
+            self.claim_target(),
+            &self.writer,
+            invocation,
+            nonce,
+            expiration,
+            self.now,
+        );
+        auth.0.header.profile = self.name.clone();
+        auth.0.entries = vec![hold(&self.name, self.now, amount)];
+        mint_header(&mut auth.0.header, &auth.0.binding, &auth.0.entries);
+        auth
+    }
+
     /// A fixture whose stores are fresh at `now`.
     pub(crate) fn new(label: &str, now: u64) -> Self {
         let clock = set_now_ms_for_test(now);
@@ -337,7 +486,14 @@ impl LedgerFixture {
         nonce: &str,
         facts: VerifiedTipFacts,
     ) -> MainnetTxSignAuthorization {
-        let mut header = header(&self.name, endpoint, &self.writer, facts, self.now);
+        let mut header = header(
+            self.claim_target(),
+            &self.name,
+            endpoint,
+            &self.writer,
+            facts,
+            self.now,
+        );
         let minted = self
             .window
             .mint_authorization(

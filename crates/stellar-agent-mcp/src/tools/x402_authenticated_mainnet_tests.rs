@@ -47,9 +47,9 @@ use stellar_xdr::{
 
 use crate::server::{WalletServer, X402AuthenticatedPaymentArgs};
 use crate::tools::common::tests::mainnet::{
-    Fixture, HookGuard, ReadOnlyDir, RpcControl, assert_names_the_transmitted_ledger,
-    authorizations, mount_rpc, observe, put, refusals, routed_fixture_with, stored_approval, wire,
-    x402_authorized_rows,
+    Fixture, HookGuard, ReadOnlyDir, RpcControl, assert_cleanup_found_the_claim,
+    assert_names_the_transmitted_ledger, authorizations, ledger, mount_rpc, observe, put, refusals,
+    routed_fixture_with, stored_approval, wire, x402_authorized_rows,
 };
 use crate::tools::common::{GatedApprovalKind, verify_attestation_subject_gate, x402_value_leg};
 
@@ -1041,8 +1041,8 @@ async fn the_session_seam_refuses_on_a_server_with_a_context() {
 }
 
 /// An anchor that fails from the transmit row on refuses with the audit code
-/// at the transmit gate: the intent is invalidated before the signed
-/// simulation, the Message record stays used, and nothing is released.
+/// at the transmit gate. The intent remains claimed with its holds, the
+/// Message record stays used, and no payment payload is released.
 #[tokio::test]
 #[serial_test::serial(keyring)]
 async fn an_unavailable_anchor_at_the_transmit_gate_withholds_the_payment() {
@@ -1064,6 +1064,8 @@ async fn an_unavailable_anchor_at_the_transmit_gate_withholds_the_payment() {
         )
         .unwrap();
     });
+    let (capture, _subscriber) =
+        stellar_agent_test_support::WarningCapture::capture(Some("stellar_agent"));
     let result = run.pay(HOME, &approval).await;
     *run.f.on_seed_read.lock().unwrap() = None;
     assert_eq!(
@@ -1074,8 +1076,19 @@ async fn an_unavailable_anchor_at_the_transmit_gate_withholds_the_payment() {
     used_message_record(&run.f);
     let intents = records(&run.f, "soroban");
     assert_eq!(intents.len(), 1, "{intents:?}");
-    assert_eq!(intents[0]["state"], "invalidated");
-    assert_eq!(intents[0]["invalidation"], "intent_pre_transmit_refused");
+    assert_eq!(intents[0]["state"], "claimed");
+    assert!(intents[0]["claimed_ms"].is_u64());
+    assert!(intents[0]["invalidation"].is_null());
+    let state = ledger(&run.f).unwrap();
+    assert!(
+        state["holds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|hold| hold["authorization_id"] == intents[0]["id"]),
+        "{state}"
+    );
+    assert_cleanup_found_the_claim(&capture, "IntentPreTransmitRefused");
     assert!(records(&run.f, "x402_submit").is_empty());
     assert_eq!(run.simulations(), 1, "no signed simulation");
     assert_eq!(run.f.seed_reads.load(Ordering::SeqCst), 1);

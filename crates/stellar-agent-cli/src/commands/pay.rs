@@ -5782,6 +5782,34 @@ mod tests {
             assert_eq!(invalidations_on_this_thread(), vec![(stage, result)]);
         }
 
+        fn assert_claim_keeps_spend(fixture: &MainnetFixture, state: &str) {
+            let body = fixture.window_body();
+            let auths = records(fixture);
+            let amount = AMOUNT.to_string();
+            assert_eq!(auths.len(), 1);
+            let auth = &auths[0];
+            assert_eq!(auth["state"], state);
+            assert!(auth["claimed_ms"].is_u64());
+            if state == "claimed" {
+                let holds = body["holds"].as_array().unwrap();
+                assert!(
+                    holds
+                        .iter()
+                        .any(|hold| hold["authorization_id"] == auth["id"]
+                            && hold["amount"].as_str() == Some(amount.as_str()))
+                );
+            } else {
+                let entries = body["entries"].as_array().unwrap();
+                assert!(
+                    entries
+                        .iter()
+                        .flat_map(|bucket| bucket["records"].as_array().unwrap())
+                        .any(|record| record["amount"].as_str() == Some(amount.as_str())
+                            && record["ts_ms"] == auth["claimed_ms"])
+                );
+            }
+        }
+
         /// The `precondition` field of each warning whose message is the
         /// refusal log line and whose `path` is `path`.
         fn refusal_warnings(capture: &WarningCapture, path: &str) -> Vec<String> {
@@ -6631,7 +6659,10 @@ mod tests {
         #[tokio::test(flavor = "current_thread")]
         #[serial_test::serial]
         async fn a_ledger_user_refusal_is_sign_refused() {
-            let fixture = Spec::new("mainnet-pay-ledger-refused").build().await;
+            let fixture = Spec::new("mainnet-pay-ledger-refused")
+                .rules(vec![pay_rule_capped(AMOUNT, 100)])
+                .build()
+                .await;
             let (_ledger, _calls) = install_ledger_double(
                 || Ok(()),
                 || Err(WalletError::Auth(AuthError::HardwareUserRefused)),
@@ -6640,7 +6671,13 @@ mod tests {
             let run = run(&fixture, &ledger_args(&fixture)).await;
 
             assert_eq!(run.code(), "auth.hardware_user_refused", "{}", run.envelope);
-            assert_invalidated("sign_refused", Ok(()));
+            assert_invalidated(
+                "sign_refused",
+                Err(MainnetAuthorizationError::Refused(
+                    MainnetPrecondition::NotOpen,
+                )),
+            );
+            assert_claim_keeps_spend(&fixture, "claimed");
             assert!(fixture.sent_envelopes().await.is_empty());
         }
 
@@ -6712,12 +6749,14 @@ mod tests {
             drop(clock);
         }
 
-        /// Same-code submit stages: an expiry after the attach is the submit
-        /// gate's refusal.
+        /// An expiry inside the signer discards its late signature at the attach.
         #[tokio::test(flavor = "current_thread")]
         #[serial_test::serial]
-        async fn an_expiry_after_the_attach_is_the_submit_gate_refusal() {
-            let fixture = Spec::new("mainnet-pay-gate-expiry").build().await;
+        async fn an_expiry_inside_the_signer_is_the_attach_refusal() {
+            let fixture = Spec::new("mainnet-pay-gate-expiry")
+                .rules(vec![pay_rule_capped(AMOUNT, 100)])
+                .build()
+                .await;
             let clock = Arc::new(stellar_agent_network::mainnet::clock::set_now_ms_for_test(
                 now() + CLOCK_LEAD_MS,
             ));
@@ -6742,11 +6781,15 @@ mod tests {
             );
             assert_eq!(
                 run.message(),
-                "the mainnet write was refused; the submission was refused after signing and \
-                 nothing was sent"
+                "the mainnet write was refused; the signature was withheld and nothing was sent"
             );
-            assert_eq!(invalidations_on_this_thread().len(), 1);
-            assert_eq!(invalidations_on_this_thread()[0].0, "submit_gate_refused");
+            assert_invalidated(
+                "sign_refused",
+                Err(MainnetAuthorizationError::Refused(
+                    MainnetPrecondition::NotOpen,
+                )),
+            );
+            assert_claim_keeps_spend(&fixture, "expired");
             assert!(fixture.sent_envelopes().await.is_empty());
             drop(clock);
         }
@@ -6763,6 +6806,7 @@ mod tests {
             // so it holds the clock weakly: the override ends with `clock`.
             let advance = Arc::downgrade(&clock);
             let fixture = Spec::new("mainnet-pay-hook-expiry")
+                .rules(vec![pay_rule_capped(AMOUNT, 100)])
                 .primary(accounts().with_script(move |method, index, _| {
                     if method == "getNetwork"
                         && index == 2
@@ -6788,8 +6832,13 @@ mod tests {
                 "the mainnet write was refused; the submission was refused after signing and \
                  nothing was sent"
             );
-            assert_eq!(invalidations_on_this_thread().len(), 1);
-            assert_eq!(invalidations_on_this_thread()[0].0, "pre_send_refused");
+            assert_invalidated(
+                "pre_send_refused",
+                Err(MainnetAuthorizationError::Refused(
+                    MainnetPrecondition::NotOpen,
+                )),
+            );
+            assert_claim_keeps_spend(&fixture, "expired");
             assert!(fixture.sent_envelopes().await.is_empty());
             drop(clock);
         }
@@ -6800,6 +6849,7 @@ mod tests {
         #[serial_test::serial]
         async fn another_network_at_the_submit_probe_is_the_gate_refusal() {
             let fixture = Spec::new("mainnet-pay-submit-probe")
+                .rules(vec![pay_rule_capped(AMOUNT, 100)])
                 .primary(accounts().with_script(|method, index, _| {
                     (method == "getNetwork" && index == 2)
                         .then(|| get_network_result(TESTNET_PASSPHRASE))
@@ -6815,8 +6865,13 @@ mod tests {
                 "{}",
                 run.envelope
             );
-            assert_eq!(invalidations_on_this_thread().len(), 1);
-            assert_eq!(invalidations_on_this_thread()[0].0, "submit_gate_refused");
+            assert_invalidated(
+                "submit_gate_refused",
+                Err(MainnetAuthorizationError::Refused(
+                    MainnetPrecondition::NotOpen,
+                )),
+            );
+            assert_claim_keeps_spend(&fixture, "claimed");
             assert!(fixture.sent_envelopes().await.is_empty());
         }
 
@@ -6825,7 +6880,10 @@ mod tests {
         #[tokio::test(flavor = "current_thread")]
         #[serial_test::serial]
         async fn a_claimed_receipt_is_the_pre_send_refusal() {
-            let fixture = Spec::new("mainnet-pay-claimed-receipt").build().await;
+            let fixture = Spec::new("mainnet-pay-claimed-receipt")
+                .rules(vec![pay_rule_capped(AMOUNT, 100)])
+                .build()
+                .await;
             let receipts =
                 stellar_agent_core::profile::receipt::ReceiptStore::open(fixture.name).unwrap();
             receipts
@@ -6847,8 +6905,13 @@ mod tests {
                 "{}",
                 run.envelope
             );
-            assert_eq!(invalidations_on_this_thread().len(), 1);
-            assert_eq!(invalidations_on_this_thread()[0].0, "pre_send_refused");
+            assert_invalidated(
+                "pre_send_refused",
+                Err(MainnetAuthorizationError::Refused(
+                    MainnetPrecondition::NotOpen,
+                )),
+            );
+            assert_claim_keeps_spend(&fixture, "claimed");
             assert!(fixture.sent_envelopes().await.is_empty());
         }
 

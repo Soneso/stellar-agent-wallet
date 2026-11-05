@@ -7019,29 +7019,88 @@ pub(crate) mod tests {
             );
         }
 
+        /// The authorization ledger's holds at each read of the signing
+        /// seed. Signing reads the seed only once the claim is recorded, so a
+        /// snapshot is the claim's holds before any later refusal.
+        struct HoldsAtSigning(Arc<std::sync::Mutex<Vec<serde_json::Value>>>);
+
+        impl HoldsAtSigning {
+            /// Takes a snapshot at every seed read of `f` until
+            /// [`assert_claimed`] removes the observer.
+            fn install(f: &Fixture) -> Self {
+                let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+                let sink = Arc::clone(&seen);
+                let window = f.server.window_store.path().to_path_buf();
+                observe(&f.on_seed_read, move || {
+                    let bytes = std::fs::read(&window).unwrap();
+                    let state: serde_json::Value = serde_json::from_slice(&bytes[32..]).unwrap();
+                    sink.lock().unwrap().push(state["holds"].clone());
+                });
+                Self(seen)
+            }
+        }
+
         /// Asserts that `result` refused with `code` after the authorization
-        /// was minted, which is now invalidated at `stage` with nothing sent.
-        fn assert_invalidated(
+        /// was claimed: the claim keeps every hold `holds` saw at signing,
+        /// with its identity, bucket and amount, and nothing is sent.
+        fn assert_claimed(
             run: &ClassicRun,
             result: &serde_json::Value,
             code: &str,
-            stage: &str,
+            holds: &HoldsAtSigning,
         ) {
             let tool = run.tool;
+            *run.f.on_seed_read.lock().unwrap() = None;
             assert_eq!(result["ok"], false, "{tool:?}: {result}");
             assert_eq!(result["error"]["code"], code, "{tool:?}: {result}");
             let records = authorizations(&run.f);
             assert_eq!(records.len(), 1, "{tool:?}");
-            assert_eq!(records[0]["state"], "invalidated", "{tool:?}");
-            assert_eq!(records[0]["invalidation"], stage, "{tool:?}");
+            assert_eq!(records[0]["state"], "claimed", "{tool:?}");
+            assert!(records[0]["claimed_ms"].is_u64(), "{tool:?}");
+            assert!(records[0]["invalidation"].is_null(), "{tool:?}");
+            let snapshots = holds.0.lock().unwrap().clone();
+            let [at_signing] = snapshots.as_slice() else {
+                panic!("{tool:?}: one seed read: {snapshots:?}")
+            };
             assert!(
-                ledger_state(&run.f)["holds"]
-                    .as_array()
-                    .is_none_or(Vec::is_empty),
-                "{tool:?}"
+                !at_signing.as_array().unwrap().is_empty(),
+                "{tool:?}: the claim holds entries"
+            );
+            assert_eq!(
+                ledger_state(&run.f)["holds"],
+                *at_signing,
+                "{tool:?}: the refusal keeps every claimed hold"
             );
             assert_eq!(run.control.count("sendTransaction"), 0, "{tool:?}");
             assert_no_pre_send_entry(run);
+        }
+
+        /// The authorization cleanup warnings `capture` saw.
+        fn cleanup_warnings(
+            capture: &stellar_agent_test_support::WarningCapture,
+        ) -> Vec<std::collections::BTreeMap<String, String>> {
+            capture
+                .seen()
+                .into_iter()
+                .filter(|fields| {
+                    fields
+                        .get("message")
+                        .is_some_and(|message| message.contains("authorization cleanup refused"))
+                })
+                .collect()
+        }
+
+        /// Asserts that the one authorization cleanup `capture` saw ran at
+        /// `stage` and found the record settled: the invalidation of a
+        /// claimed record refuses `NotOpen`.
+        pub(crate) fn assert_cleanup_found_the_claim(
+            capture: &stellar_agent_test_support::WarningCapture,
+            stage: &str,
+        ) {
+            let cleanup = cleanup_warnings(capture);
+            assert_eq!(cleanup.len(), 1, "{cleanup:?}");
+            assert_eq!(cleanup[0]["settled"], "true", "{cleanup:?}");
+            assert_eq!(cleanup[0]["stage"], stage, "{cleanup:?}");
         }
 
         /// Asserts that `sent` carries exactly the approved transaction of
@@ -8085,7 +8144,7 @@ pub(crate) mod tests {
 
         #[tokio::test]
         #[serial_test::serial(keyring)]
-        async fn mainnet_lazy_signer_failure_invalidates_without_send() {
+        async fn mainnet_lazy_signer_failure_keeps_the_claimed_spend() {
             for tool in Tool::ALL {
                 let run = ClassicRun::new(tool).await;
                 let key = &run.f.server.security_profile().mcp_signer_default;
@@ -8093,6 +8152,9 @@ pub(crate) mod tests {
                     .unwrap()
                     .delete_credential()
                     .unwrap();
+                let (capture, _subscriber) =
+                    stellar_agent_test_support::WarningCapture::capture(Some("stellar_agent"));
+                let holds = HoldsAtSigning::install(&run.f);
                 let result = run.commit().await;
                 assert!(
                     result["error"]["code"]
@@ -8102,7 +8164,8 @@ pub(crate) mod tests {
                     "{tool:?}: {result}"
                 );
                 let code = result["error"]["code"].as_str().unwrap().to_owned();
-                assert_invalidated(&run, &result, &code, "signer_unavailable");
+                assert_claimed(&run, &result, &code, &holds);
+                assert_cleanup_found_the_claim(&capture, "SignerUnavailable");
                 assert_eq!(run.seed_reads(), 1, "{tool:?}");
                 assert!(
                     !is_consumed(&stored_approval(&run.f, &run.entry.approval_nonce).unwrap()),
@@ -8113,26 +8176,25 @@ pub(crate) mod tests {
 
         #[tokio::test]
         #[serial_test::serial(keyring)]
-        async fn mainnet_classic_pre_send_failure_invalidates_with_the_primary_error() {
+        async fn mainnet_classic_pre_send_failure_keeps_the_primary_error_and_the_claim() {
             for tool in Tool::ALL {
                 let run = ClassicRun::new(tool).await;
                 let armed =
                     Armed::new(&stellar_agent_network::submission_record::FAIL_PENDING_ROW_APPEND);
+                let (capture, _subscriber) =
+                    stellar_agent_test_support::WarningCapture::capture(Some("stellar_agent"));
+                let holds = HoldsAtSigning::install(&run.f);
                 let result = run.commit().await;
                 drop(armed);
-                assert_invalidated(
-                    &run,
-                    &result,
-                    "submission.record_unavailable",
-                    "pre_send_refused",
-                );
+                assert_claimed(&run, &result, "submission.record_unavailable", &holds);
+                assert_cleanup_found_the_claim(&capture, "PreSendRefused");
                 assert_eq!(run.seed_reads(), 1, "{tool:?}");
             }
         }
 
-        /// An authorization whose expiry passes between signing and the
-        /// submit gate is swept to expired by the cleanup's ledger operation;
-        /// the cleanup then finds it settled and invalidates nothing.
+        /// An authorization whose expiry passes inside the signer is refused
+        /// at signing; its claimed holds become confirmed spend dated at the
+        /// claim.
         #[tokio::test]
         #[serial_test::serial(keyring)]
         async fn mainnet_submit_expiry_refuses_before_pre_send() {
@@ -8156,10 +8218,26 @@ pub(crate) mod tests {
                         .get("invalidation")
                         .is_none_or(serde_json::Value::is_null)
                 );
+                let claimed_ms = records[0]["claimed_ms"].as_u64().unwrap();
                 assert!(
                     ledger_state(&run.f)["holds"]
                         .as_array()
                         .is_none_or(Vec::is_empty),
+                    "{tool:?}"
+                );
+                let rows = window_records(&run.f);
+                let (count, sum) = settled_rows(tool);
+                assert_eq!(rows.len(), count, "{tool:?}: {rows:?}");
+                assert!(
+                    rows.iter()
+                        .all(|row| row["status"] == "confirmed" && row["ts_ms"] == claimed_ms),
+                    "{tool:?}: {rows:?}"
+                );
+                assert_eq!(
+                    rows.iter()
+                        .map(|row| row["amount"].as_str().unwrap().parse::<u64>().unwrap())
+                        .sum::<u64>(),
+                    sum,
                     "{tool:?}"
                 );
                 assert_no_pre_send_entry(&run);
@@ -8175,13 +8253,12 @@ pub(crate) mod tests {
                 run.control
                     .passphrase_after_seed
                     .store(true, Ordering::SeqCst);
+                let (capture, _subscriber) =
+                    stellar_agent_test_support::WarningCapture::capture(Some("stellar_agent"));
+                let holds = HoldsAtSigning::install(&run.f);
                 let result = run.commit().await;
-                assert_invalidated(
-                    &run,
-                    &result,
-                    "network.endpoint_network_mismatch",
-                    "submit_gate_refused",
-                );
+                assert_claimed(&run, &result, "network.endpoint_network_mismatch", &holds);
+                assert_cleanup_found_the_claim(&capture, "SubmitGateRefused");
             }
         }
 
@@ -8316,54 +8393,63 @@ pub(crate) mod tests {
             }
         }
 
+        /// A cleanup whose window-key read fails reports an unsettled
+        /// refusal; the submit gate's primary error stands and the claim
+        /// keeps its holds.
         #[tokio::test]
         #[serial_test::serial(keyring)]
         async fn mainnet_classic_cleanup_failure_keeps_the_primary_error() {
             for tool in Tool::ALL {
                 let run = ClassicRun::new(tool).await;
-                let guard = HookGuard::default();
-                let hold = Arc::clone(&guard);
-                let directory = run
+                let window_key = run
                     .f
                     .server
-                    .window_store
-                    .path()
-                    .parent()
-                    .unwrap()
-                    .to_owned();
+                    .security_profile()
+                    .policy_window_state_key_id
+                    .clone();
+                let injected = Arc::new(AtomicBool::new(false));
+                let once = Arc::clone(&injected);
                 let seed_reads = Arc::clone(&run.f.seed_reads);
                 run.control
                     .passphrase_after_seed
                     .store(true, Ordering::SeqCst);
                 run.control.on_request(move |method| {
-                    if method == "getNetwork" && seed_reads.load(Ordering::SeqCst) != 0 {
-                        hold.lock()
-                            .unwrap()
-                            .get_or_insert_with(|| ReadOnlyDir::new(&directory));
+                    if method == "getNetwork"
+                        && seed_reads.load(Ordering::SeqCst) != 0
+                        && !once.swap(true, Ordering::SeqCst)
+                    {
+                        keyring_mock::inject_error(
+                            &window_key.service,
+                            &window_key.account,
+                            keyring_core::Error::NoStorageAccess(
+                                std::io::Error::other("locked").into(),
+                            ),
+                        )
+                        .unwrap();
                     }
                 });
                 let (capture, _guard) =
                     stellar_agent_test_support::WarningCapture::capture(Some("stellar_agent"));
                 let result = run.commit().await;
-                drop(guard.lock().unwrap().take());
+                *run.control.on_request.lock().unwrap() = None;
+                assert!(injected.load(Ordering::SeqCst), "{tool:?}");
                 assert_eq!(result["ok"], false, "{tool:?}: {result}");
                 assert_eq!(
                     result["error"]["code"], "network.endpoint_network_mismatch",
                     "{tool:?}: {result}"
                 );
-                let cleanup: Vec<_> = capture
-                    .seen()
-                    .into_iter()
-                    .filter(|fields| {
-                        fields.get("message").is_some_and(|message| {
-                            message.contains("authorization cleanup refused")
-                        })
-                    })
-                    .collect();
+                let cleanup = cleanup_warnings(&capture);
                 assert_eq!(cleanup.len(), 1, "{tool:?}: {cleanup:?}");
                 assert_eq!(cleanup[0]["settled"], "false", "{tool:?}");
                 assert_eq!(cleanup[0]["stage"], "SubmitGateRefused", "{tool:?}");
-                assert_eq!(authorizations(&run.f)[0]["state"], "open", "{tool:?}");
+                let records = authorizations(&run.f);
+                assert_eq!(records.len(), 1, "{tool:?}");
+                assert_eq!(records[0]["state"], "claimed", "{tool:?}");
+                assert!(records[0]["claimed_ms"].is_u64(), "{tool:?}");
+                assert!(
+                    !ledger_state(&run.f)["holds"].as_array().unwrap().is_empty(),
+                    "{tool:?}"
+                );
                 assert_eq!(run.control.count("sendTransaction"), 0, "{tool:?}");
             }
         }
@@ -8658,7 +8744,8 @@ pub(crate) mod tests {
                 1,
                 "the intent is minted before signing"
             );
-            assert_eq!(at_signing[0]["authorizations"][0]["state"], "open");
+            assert_eq!(at_signing[0]["authorizations"][0]["state"], "claimed");
+            assert!(at_signing[0]["authorizations"][0]["claimed_ms"].is_u64());
             let at_simulation = run
                 .control
                 .state_at_signed_simulation
@@ -8735,20 +8822,29 @@ pub(crate) mod tests {
 
         #[tokio::test]
         #[serial_test::serial(keyring)]
-        async fn mainnet_x402_signer_failure_invalidates_before_transmission() {
+        async fn mainnet_x402_signer_failure_keeps_the_claimed_spend_before_transmission() {
             let run = X402Run::new().await;
             let key = &run.f.server.security_profile().mcp_signer_default;
             keyring_core::Entry::new(&key.service, &key.account)
                 .unwrap()
                 .delete_credential()
                 .unwrap();
+            let (capture, _subscriber) =
+                stellar_agent_test_support::WarningCapture::capture(Some("stellar_agent"));
             let result = run.pay().await;
             assert_eq!(result["ok"], false, "{result}");
+            assert_eq!(
+                result["error"]["code"], "x402.auth_entry_sign_failed",
+                "{result}"
+            );
             assert!(result["data"].get("paymentSignature").is_none());
             let records = authorizations(&run.f);
             assert_eq!(records.len(), 1);
-            assert_eq!(records[0]["state"], "invalidated");
-            assert_eq!(records[0]["invalidation"], "signer_unavailable");
+            assert_eq!(records[0]["state"], "claimed");
+            assert!(records[0]["claimed_ms"].is_u64());
+            assert!(records[0]["invalidation"].is_null());
+            assert!(!ledger_state(&run.f)["holds"].as_array().unwrap().is_empty());
+            assert_cleanup_found_the_claim(&capture, "SignerUnavailable");
             assert_eq!(run.f.seed_reads.load(Ordering::SeqCst), 1);
             assert_eq!(run.simulations(), 1, "no signed simulation");
         }
@@ -8857,7 +8953,7 @@ pub(crate) mod tests {
 
         #[tokio::test]
         #[serial_test::serial(keyring)]
-        async fn mainnet_x402_unavailable_anchor_at_the_transmit_gate_invalidates_the_intent() {
+        async fn mainnet_x402_unavailable_anchor_at_the_transmit_gate_keeps_the_claimed_intent() {
             let run = X402Run::new().await;
             let profile = run.f.server.security_profile();
             let anchor = stellar_agent_network::keyring::KeyringTipAnchorStore::new(
@@ -8874,6 +8970,8 @@ pub(crate) mod tests {
                 )
                 .unwrap();
             });
+            let (capture, _subscriber) =
+                stellar_agent_test_support::WarningCapture::capture(Some("stellar_agent"));
             let result = run.pay().await;
             *run.f.on_seed_read.lock().unwrap() = None;
             assert_eq!(result["ok"], false, "{result}");
@@ -8884,13 +8982,11 @@ pub(crate) mod tests {
             assert!(result["data"].get("paymentSignature").is_none());
             let records = authorizations(&run.f);
             assert_eq!(records.len(), 1);
-            assert_eq!(records[0]["state"], "invalidated");
-            assert_eq!(records[0]["invalidation"], "intent_pre_transmit_refused");
-            assert!(
-                ledger_state(&run.f)["holds"]
-                    .as_array()
-                    .is_none_or(Vec::is_empty)
-            );
+            assert_eq!(records[0]["state"], "claimed");
+            assert!(records[0]["claimed_ms"].is_u64());
+            assert!(records[0]["invalidation"].is_null());
+            assert!(!ledger_state(&run.f)["holds"].as_array().unwrap().is_empty());
+            assert_cleanup_found_the_claim(&capture, "IntentPreTransmitRefused");
             assert_eq!(run.simulations(), 1, "no signed simulation");
         }
 
@@ -9387,7 +9483,7 @@ pub(crate) mod tests {
 
         #[tokio::test]
         #[serial_test::serial(keyring)]
-        async fn mainnet_x402_transmit_gate_invalidates_the_open_intent() {
+        async fn mainnet_x402_transmit_gate_keeps_the_claimed_intent() {
             use stellar_agent_network::mainnet::MainnetConsumer;
             use stellar_agent_x402::exact::{X402MainnetProofs, create_payment_authorized};
             let rpc = wiremock::MockServer::start().await;
@@ -9396,6 +9492,8 @@ pub(crate) mod tests {
             let requirements = f.requirements();
             let approved = X402Approval::new(&f).await;
             let asset = x402_canonical_asset(&requirements).unwrap();
+            let (capture, _subscriber) =
+                stellar_agent_test_support::WarningCapture::capture(Some("stellar_agent"));
             let result = create_payment_authorized(
                 &requirements,
                 MainnetConsumer::X402Create,
@@ -9431,9 +9529,11 @@ pub(crate) mod tests {
             ));
             let state = ledger_state(&f);
             assert_eq!(state["authorizations"].as_array().unwrap().len(), 1);
-            assert_eq!(state["authorizations"][0]["state"], "invalidated");
-            assert!(state.to_string().contains("intent_pre_transmit_refused"));
-            assert!(state["holds"].as_array().is_none_or(Vec::is_empty));
+            assert_eq!(state["authorizations"][0]["state"], "claimed");
+            assert!(state["authorizations"][0]["claimed_ms"].is_u64());
+            assert!(state["authorizations"][0]["invalidation"].is_null());
+            assert!(!state["holds"].as_array().unwrap().is_empty());
+            assert_cleanup_found_the_claim(&capture, "IntentPreTransmitRefused");
             assert_eq!(f.seed_reads.load(Ordering::SeqCst), 1);
             assert_eq!(control.count("simulateTransaction"), 1);
         }

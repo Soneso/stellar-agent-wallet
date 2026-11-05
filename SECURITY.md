@@ -70,6 +70,13 @@ Keep the following properties of the current alpha in mind when assessing impact
   Feature-enabled builds admit only configured operations with per-action approval.
   Policy evaluation alone grants no signing authority. Signing, submission, and
   x402 payload release independently check sealed authorization.
+  Signing first claims the authorization in the window state. An authorization
+  invalidated or expired before its claim never reaches a signer. After the claim
+  its spend stays counted until it is consumed or leaves the spending windows,
+  because changing a local record cannot withdraw a produced signature.
+  A signature that returns after the authorization's lifetime is discarded.
+  A signer that refuses or fails after the claim leaves the spend counted, and
+  an identical retry waits for the record's expiry.
   The wallet's own signing paths sign mainnet payloads only under mainnet
   authorization. The library signers enforce it too: every `Signer`, the
   public keyring handle included, signs a mainnet transaction or Soroban

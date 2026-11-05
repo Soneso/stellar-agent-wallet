@@ -175,6 +175,7 @@ mod tests {
                 AuditWriter::open(dir.path().join("audit.jsonl"), None).unwrap(),
             ));
             let authorization = fixtures::soroban_authorization(
+                fixtures::claim_target(dir.path(), "fixture"),
                 &writer,
                 &approved_invocation(),
                 NONCE,

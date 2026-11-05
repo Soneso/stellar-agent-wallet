@@ -493,10 +493,11 @@ impl InvalidationStage {
     }
 }
 
-/// Invalidates an open authorization, releasing its unused holds.
+/// Invalidates an open authorization before its signing claim and releases its holds.
+/// A claimed authorization keeps them, and the call refuses with `NotOpen`.
 ///
 /// # Errors
-/// Returns `NotOpen` for a settled record, or the store's refusal.
+/// Returns `NotOpen` for a claimed or settled record, or the store's refusal.
 pub fn invalidate_unconsumed(
     store: &PersistedWindowStore,
     context: &MainnetWriteContext,
@@ -518,7 +519,7 @@ pub fn invalidate_unconsumed(
 }
 
 /// The invalidation [`invalidate_unconsumed`] reports: `NotOpen` for a
-/// settled record, the store's refusal otherwise. Logs nothing.
+/// claimed or settled record, the store's refusal otherwise. Logs nothing.
 #[cfg(feature = "mainnet-write")]
 fn invalidate(
     store: &PersistedWindowStore,
@@ -1040,6 +1041,7 @@ mod enabled {
             .map_err(mint::store_error)?;
         let header = mint::header(
             req.context,
+            req.store,
             &request,
             minted,
             &endpoint,
@@ -1209,6 +1211,7 @@ mod enabled {
             .map_err(mint::store_error)?;
         let header = mint::header(
             req.context,
+            req.store,
             &request,
             minted,
             &endpoint,
@@ -1313,6 +1316,7 @@ mod enabled {
             .map_err(mint::store_error)?;
         Ok(mint::message(
             req.context,
+            req.store,
             request,
             minted,
             message.ephemeral_public_key,

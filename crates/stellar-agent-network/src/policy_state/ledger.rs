@@ -14,9 +14,10 @@
 //! An open authorization of a holding domain owns one hold per window entry,
 //! keyed by `(authorization id, ordinal)` and kept outside the window's
 //! bucket records. A hold counts against the window from the mint until the
-//! authorization is consumed, invalidated, or expires.
+//! authorization is consumed or expires. Invalidation releases only unclaimed holds.
+//! An expired claim retains its spend as confirmed records dated at the claim.
 //!
-//! Every hold belongs to exactly one open authorization; a hold of a settled
+//! Every hold belongs to exactly one open or claimed authorization; a hold of a settled
 //! or unknown authorization, a duplicate identity or ordinal, a reservation
 //! other than the authorization's own, a hold kind other than the domain's,
 //! or authorization history in a snapshot below version 4 refuses the read.
@@ -26,7 +27,8 @@
 //! Every transition reads the mainnet clock, [`crate::mainnet::clock::now_ms`],
 //! itself; no caller supplies the time a transition is checked against. Under
 //! the lock, a transition first marks every open authorization whose expiry
-//! has passed as expired, sets its settlement time, and drops only its holds.
+//! has passed as expired and sets its settlement time. Claimed holds become
+//! confirmed spend; unclaimed holds are released.
 //! The spend admission of the window's own writers does the same before it
 //! counts. One transaction is one lock and one generation commit.
 //!
@@ -54,9 +56,9 @@ use stellar_agent_core::profile::schema::Profile;
 
 use super::WindowStoreError;
 use super::store::{
-    PersistedWindowStore, RecordStatus, WIRE_VERSION_LEDGER, WIRE_VERSION_MAX, WireFile,
-    WireRecord, admit, file_holds_id, find_or_insert_bucket, generation_entry_ref,
-    i128_decimal_str, now_ms, prune_stale,
+    PersistedWindowStore, RecordStatus, WIRE_VERSION_LEDGER, WireBucket, WireFile, WireRecord,
+    admit, file_holds_id, find_or_insert_bucket, generation_entry_ref, i128_decimal_str, now_ms,
+    prune_stale,
 };
 use crate::mainnet::digest::{BindingFacts, bindings_digest};
 use crate::mainnet::digest::{content_digest, entries_digest};
@@ -347,12 +349,20 @@ pub enum ConsumptionBinding {
 pub(super) enum AuthorizationState {
     /// Minted and neither used, invalidated, nor expired.
     Open,
+    /// Its signature is being or was produced; its holds stay until settlement.
+    Claimed,
     /// Consumed once.
     Used,
     /// Its expiry passed before it was used.
     Expired,
     /// Abandoned by its holder before use.
     Invalidated,
+}
+
+impl AuthorizationState {
+    fn holds(self) -> bool {
+        matches!(self, Self::Open | Self::Claimed)
+    }
 }
 
 /// Which entries a hold carries.
@@ -392,6 +402,8 @@ pub(super) struct WireAuthorization {
     pub(super) expires_ms: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) settled_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) claimed_ms: Option<u64>,
     pub(super) policy_sequence: i64,
     #[serde(with = "hex32")]
     pub(super) policy_digest: [u8; 32],
@@ -453,9 +465,24 @@ pub(super) fn validate(wire: &WireFile) -> Result<(), WindowStoreError> {
                 "an authorization's content does not match its domain facts".to_owned(),
             ));
         }
-        if (auth.state == AuthorizationState::Open) == auth.settled_ms.is_some() {
+        if auth.state.holds() == auth.settled_ms.is_some() {
             return Err(invalid(
                 "an authorization's settlement time disagrees with its state".to_owned(),
+            ));
+        }
+        if (auth.state == AuthorizationState::Claimed && auth.claimed_ms.is_none())
+            || (matches!(
+                auth.state,
+                AuthorizationState::Open | AuthorizationState::Invalidated
+            ) && auth.claimed_ms.is_some())
+            || auth.claimed_ms.is_some_and(|claimed| {
+                wire.version < super::store::WIRE_VERSION_CLAIM
+                    || claimed < auth.minted_ms
+                    || claimed >= auth.expires_ms
+            })
+        {
+            return Err(invalid(
+                "an authorization's claim time disagrees with its state or lifetime".to_owned(),
             ));
         }
         if (auth.state == AuthorizationState::Used) != auth.consumption.is_some() {
@@ -489,7 +516,7 @@ pub(super) fn validate(wire: &WireFile) -> Result<(), WindowStoreError> {
         else {
             return Err(invalid("a hold names no authorization".to_owned()));
         };
-        if owner.state != AuthorizationState::Open {
+        if !owner.state.holds() {
             return Err(invalid("a hold belongs to settled history".to_owned()));
         }
         if HoldKind::of(owner.domain) != Some(hold.kind) || owner.reservation != Some(owner.id) {
@@ -500,9 +527,7 @@ pub(super) fn validate(wire: &WireFile) -> Result<(), WindowStoreError> {
         holding.insert(hold.authorization_id);
     }
     for auth in &wire.authorizations {
-        if auth.state == AuthorizationState::Open
-            && auth.reservation.is_some() != holding.contains(&auth.id)
-        {
+        if auth.state.holds() && auth.reservation.is_some() != holding.contains(&auth.id) {
             return Err(invalid(
                 "an open authorization's reservation disagrees with its holds".to_owned(),
             ));
@@ -511,13 +536,30 @@ pub(super) fn validate(wire: &WireFile) -> Result<(), WindowStoreError> {
     Ok(())
 }
 
-/// Marks every open authorization whose expiry is at or before `now_ms`
-/// expired, sets its settlement time, and drops only its holds. Returns
-/// whether anything changed.
+/// Expires open and claimed authorizations. A claim's holds become confirmed
+/// spend dated at the claim, so only window aging releases that spend.
 pub(super) fn sweep_expired(wire: &mut WireFile, now_ms: u64) -> bool {
     let mut swept = Vec::new();
     for auth in &mut wire.authorizations {
-        if auth.state == AuthorizationState::Open && auth.expires_ms <= now_ms {
+        if auth.state.holds() && auth.expires_ms <= now_ms {
+            if let Some(claimed_ms) = auth.claimed_ms {
+                for hold in wire
+                    .holds
+                    .iter()
+                    .filter(|hold| hold.authorization_id == auth.id)
+                {
+                    retain_hold(
+                        &mut wire.entries,
+                        hold,
+                        WireRecord {
+                            chain_scope: Some(super::store::ChainScope::for_chain(auth.chain)),
+                            ts_ms: claimed_ms,
+                            amount: hold.amount,
+                            ..WireRecord::confirmed_defaults()
+                        },
+                    );
+                }
+            }
             auth.state = AuthorizationState::Expired;
             auth.settled_ms = Some(now_ms);
             swept.push(auth.id);
@@ -528,17 +570,27 @@ pub(super) fn sweep_expired(wire: &mut WireFile, now_ms: u64) -> bool {
     !swept.is_empty()
 }
 
-/// Drops settled authorization history older than `cutoff`; open records
-/// stay whatever their age.
-pub(super) fn prune_history(wire: &mut WireFile, cutoff: u64) {
-    wire.authorizations.retain(|auth| {
-        auth.state == AuthorizationState::Open || auth.settled_ms.is_some_and(|t| t >= cutoff)
-    });
+/// Records `record` as retained spend in the window bucket `hold` reserved.
+fn retain_hold(entries: &mut Vec<WireBucket>, hold: &WireAuthorizationHold, record: WireRecord) {
+    let key = stellar_agent_core::policy::v1::criteria::state_store::StateKey::new(
+        "",
+        hold.scope_specificity,
+        &hold.bucket,
+        hold.window_secs,
+    );
+    find_or_insert_bucket(entries, &key).records.push(record);
 }
 
-/// Whether `auth` is effective at `now_ms`: open and inside its lifetime.
+/// Drops settled authorization history older than `cutoff`; open and claimed
+/// records stay whatever their age.
+pub(super) fn prune_history(wire: &mut WireFile, cutoff: u64) {
+    wire.authorizations
+        .retain(|auth| auth.state.holds() || auth.settled_ms.is_some_and(|t| t >= cutoff));
+}
+
+/// Whether `auth` is open or claimed and inside its lifetime at `now_ms`.
 fn effective(auth: &WireAuthorization, now_ms: u64) -> bool {
-    auth.state == AuthorizationState::Open && auth.minted_ms <= now_ms && now_ms < auth.expires_ms
+    auth.state.holds() && auth.minted_ms <= now_ms && now_ms < auth.expires_ms
 }
 
 /// The number of effective open authorizations in `wire` at `now_ms`.
@@ -742,6 +794,18 @@ pub struct MintedRecord {
     pub reservation: Option<WindowReservation>,
 }
 
+/// The sealed header facts a signing claim must match.
+/// Only the authorization header assembles this expectation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClaimExpect {
+    pub(crate) domain: AuthorizationDomain,
+    pub(crate) consumer: MainnetConsumer,
+    pub(crate) bindings_digest: [u8; 32],
+    pub(crate) policy_sequence: i64,
+    pub(crate) policy_digest: [u8; 32],
+    pub(crate) approval_nonce: String,
+}
+
 /// The expectation a consumption is compared against: an authorization's
 /// bound facts with the consumer's recomputed digests and fresh audit facts.
 ///
@@ -831,6 +895,8 @@ pub struct OpenAuthorization {
     pub consumer: MainnetConsumer,
     /// When it was minted, in Unix milliseconds.
     pub minted_at_ms: u64,
+    /// When signing is claimed, in Unix milliseconds, if claimed.
+    pub claimed_at_ms: Option<u64>,
     /// When it expires, in Unix milliseconds.
     pub expires_at_ms: u64,
 }
@@ -1109,15 +1175,7 @@ fn apply_consumption(
                 ..WireRecord::confirmed_defaults()
             },
         };
-        let key = stellar_agent_core::policy::v1::criteria::state_store::StateKey::new(
-            "",
-            hold.scope_specificity,
-            &hold.bucket,
-            hold.window_secs,
-        );
-        find_or_insert_bucket(&mut wire.entries, &key)
-            .records
-            .push(record);
+        retain_hold(&mut wire.entries, &hold, record);
     }
     if let Some(auth) = wire.authorizations.iter_mut().find(|auth| auth.id == id) {
         auth.state = AuthorizationState::Used;
@@ -1250,9 +1308,7 @@ impl PersistedWindowStore {
         let content = request.binding.content_digest();
         check(
             !wire.authorizations.iter().any(|auth| {
-                auth.state == AuthorizationState::Open
-                    && auth.domain == domain
-                    && auth.content_digest == content
+                auth.state.holds() && auth.domain == domain && auth.content_digest == content
             }),
             P::DuplicateOpen,
         )?;
@@ -1295,7 +1351,7 @@ impl PersistedWindowStore {
         check(
             wire.authorizations
                 .iter()
-                .filter(|auth| auth.state == AuthorizationState::Open)
+                .filter(|auth| auth.state.holds())
                 .count()
                 < MAX_OPEN_AUTHORIZATIONS,
             P::TooManyOpen,
@@ -1349,6 +1405,7 @@ impl PersistedWindowStore {
             minted_ms: now,
             expires_ms: expires,
             settled_ms: None,
+            claimed_ms: None,
             policy_sequence: request.policy_sequence,
             policy_digest: request.policy_digest,
             approval_nonce: request.approval_nonce.clone(),
@@ -1361,7 +1418,6 @@ impl PersistedWindowStore {
             invalidation: None,
         });
         prune_stale(&mut wire, now);
-        wire.version = WIRE_VERSION_MAX;
         self.commit_generation(&key, &gen_entry, original, wire)?;
         drop(lock);
         Ok(MintedRecord {
@@ -1374,6 +1430,77 @@ impl PersistedWindowStore {
                 profile: profile_name,
             }),
         })
+    }
+
+    /// Durably claims an open authorization before its signature is requested.
+    /// The claim retains its holds and commits under the window-state lock.
+    /// The lock is released before this method returns.
+    ///
+    /// # Errors
+    ///
+    /// Refuses a missing, non-open, or stale record, mismatched header facts,
+    /// or a changed policy pin. Store integrity, keyring, lock, and I/O errors
+    /// also refuse the claim.
+    pub fn claim_authorization(
+        &self,
+        profile: &Profile,
+        id: AuthorizationId,
+        expect: &ClaimExpect,
+    ) -> Result<u64, WindowStoreError> {
+        use MainnetPrecondition as P;
+        let lock = self.ledger_lock(profile)?;
+        let now = now_ms()?;
+        let (key, _mint) = self.load_or_mint_key(profile)?;
+        let gen_entry = generation_entry_ref(profile);
+        let original = self.read_verified(profile, &key, &gen_entry)?;
+        // State and lifetime are checked on the record as read, before the
+        // sweep marks an expired record `Expired`, so an expired record
+        // reports `Expired`.
+        let as_read = original
+            .authorizations
+            .iter()
+            .find(|auth| auth.id == id)
+            .ok_or_else(|| refused(P::UnknownAuthorization))?;
+        check(as_read.state == AuthorizationState::Open, P::NotOpen)?;
+        check(as_read.minted_ms <= now, P::NotYetValid)?;
+        check(now < as_read.expires_ms, P::Expired)?;
+        let mut wire = original.clone();
+        sweep_expired(&mut wire, now);
+        let auth = wire
+            .authorizations
+            .iter_mut()
+            .find(|auth| auth.id == id)
+            .ok_or_else(|| refused(P::UnknownAuthorization))?;
+        check_profile_handle(auth, profile)?;
+        check(auth.chain == profile.chain_id, P::ChainMismatch)?;
+        check(auth.chain.is_mainnet(), P::ChainNotMainnet)?;
+        check(auth.domain == expect.domain, P::DomainMismatch)?;
+        check(auth.consumer == expect.consumer, P::ConsumerMismatch)?;
+        check(
+            auth.bindings_digest == expect.bindings_digest,
+            P::BindingsDigest,
+        )?;
+        check(
+            auth.policy_sequence == expect.policy_sequence,
+            P::PolicySequence,
+        )?;
+        check(auth.policy_digest == expect.policy_digest, P::PolicyDigest)?;
+        check(
+            auth.approval_nonce == expect.approval_nonce,
+            P::ApprovalNonce,
+        )?;
+        pin::compare(
+            &lock,
+            &PinScope::for_profile(self.path(), profile),
+            auth.policy_sequence,
+            &auth.policy_digest,
+        )
+        .map_err(pin_refusal)?;
+        auth.state = AuthorizationState::Claimed;
+        auth.claimed_ms = Some(now);
+        self.commit_generation(&key, &gen_entry, original, wire)?;
+        drop(lock);
+        Ok(now)
     }
 
     /// Consumes one authorization; see [`Self::consume_authorizations`].
@@ -1403,7 +1530,7 @@ impl PersistedWindowStore {
     /// or named by an earlier consumption refuses with a distinct cause, so the
     /// caller can preserve a reserved submission's row or close a settled resend.
     ///
-    /// Each record must exist, be open, and be inside its lifetime. The supplied
+    /// Each record must exist, be open or claimed, and be inside its lifetime. The supplied
     /// profile's name and chain must be the record's. Every expectation must equal
     /// the record. The policy pin, read under the same lock, must still equal the
     /// record's policy. The binding must match the domain's consumption and facts.
@@ -1460,7 +1587,7 @@ impl PersistedWindowStore {
                 .iter()
                 .find(|auth| auth.id == *id)
                 .ok_or_else(|| refused(P::UnknownAuthorization))?;
-            check(auth.state == AuthorizationState::Open, P::NotOpen)?;
+            check(auth.state.holds(), P::NotOpen)?;
             check(auth.minted_ms <= now, P::NotYetValid)?;
             check_profile_handle(auth, profile)?;
             compare_expectation(auth, expect)?;
@@ -1476,16 +1603,15 @@ impl PersistedWindowStore {
             });
         }
         prune_stale(&mut wire, now);
-        wire.version = WIRE_VERSION_MAX;
         self.commit_generation(&key, &gen_entry, original, wire)?;
         drop(lock);
         Ok(receipts)
     }
 
-    /// Abandons an open authorization before use: marks it invalidated with a
+    /// Abandons an open authorization before its signing claim: marks it invalidated with a
     /// bounded `reason`, sets its settlement time, and drops its holds.
     ///
-    /// Returns `Ok(false)` for a settled record; this may still commit the
+    /// Returns `Ok(false)` for a claimed or settled record; this may still commit the
     /// expiry sweep. A used record is never reopened.
     ///
     /// # Errors
@@ -1524,14 +1650,13 @@ impl PersistedWindowStore {
         }
         if invalidated || swept {
             prune_stale(&mut wire, now);
-            wire.version = WIRE_VERSION_MAX;
             self.commit_generation(&key, &gen_entry, original, wire)?;
         }
         drop(lock);
         Ok(invalidated)
     }
 
-    /// Lists the authorizations effective at `now_ms`: open and inside their
+    /// Lists the authorizations effective at `now_ms`: open or claimed and inside their
     /// lifetime. Reads and verifies the file and writes nothing.
     ///
     /// # Errors
@@ -1554,6 +1679,7 @@ impl PersistedWindowStore {
                 domain: auth.domain,
                 consumer: auth.consumer,
                 minted_at_ms: auth.minted_ms,
+                claimed_at_ms: auth.claimed_ms,
                 expires_at_ms: auth.expires_ms,
             })
             .collect())
@@ -1595,6 +1721,9 @@ mod tests {
 
     /// A change to a valid snapshot that breaks one ledger invariant.
     type Breakage = fn(&mut WireFile);
+
+    /// A [`Breakage`] that captures the positions of the records it edits.
+    type RecordBreakage = Box<dyn Fn(&mut WireFile)>;
 
     /// A change to a submission that breaks one fact its consumption compares.
     type SubmissionChange = fn(&mut SubmissionBinding);
@@ -1702,6 +1831,29 @@ mod tests {
             self.store.mint_authorization(&self.profile, request)
         }
 
+        fn claim_expect(&self, request: &MintRequest, minted: &MintedRecord) -> ClaimExpect {
+            ClaimExpect {
+                domain: request.binding.domain(),
+                consumer: request.consumer,
+                bindings_digest: minted.bindings_digest,
+                policy_sequence: request.policy_sequence,
+                policy_digest: request.policy_digest,
+                approval_nonce: request.approval_nonce.clone(),
+            }
+        }
+
+        fn claim(
+            &self,
+            request: &MintRequest,
+            minted: &MintedRecord,
+        ) -> Result<u64, WindowStoreError> {
+            self.store.claim_authorization(
+                &self.profile,
+                minted.id,
+                &self.claim_expect(request, minted),
+            )
+        }
+
         fn expect(&self, request: &MintRequest, minted: &MintedRecord) -> ConsumeExpect {
             ConsumeExpect::new(
                 self.name(),
@@ -1762,6 +1914,378 @@ mod tests {
             Err(WindowStoreError::AuthorizationRefused { precondition }) => precondition,
             other => panic!("expected an authorization refusal, got {other:?}"),
         }
+    }
+
+    #[test]
+    #[serial]
+    fn a_claim_moves_an_open_record_and_keeps_its_holds() {
+        let l = Ledger::new();
+        let request = l.request(tx(1), vec![hold(70)]);
+        let minted = l.mint(&request).unwrap();
+        let before = l.wire();
+        l.clock.set(T0 + 7);
+        assert_eq!(l.claim(&request, &minted).unwrap(), T0 + 7);
+        let wire = l.wire();
+        assert_eq!(wire.generation, before.generation + 1);
+        assert_eq!(wire.holds, before.holds);
+        assert_eq!(l.record(minted.id).state, AuthorizationState::Claimed);
+        assert_eq!(l.record(minted.id).claimed_ms, Some(T0 + 7));
+        assert_eq!(
+            l.store.open_authorizations(&l.profile, T0 + 7).unwrap()[0].claimed_at_ms,
+            Some(T0 + 7)
+        );
+        assert!(admit(&wire, &[hold(CAP - 70)]).is_ok());
+        assert!(matches!(
+            admit(&wire, &[hold(CAP - 69)]),
+            Err(WindowStoreError::PolicyDenied { .. })
+        ));
+        l.consume(&request, &minted, &consumption_of(&request.binding))
+            .unwrap();
+        assert_eq!(l.record(minted.id).state, AuthorizationState::Used);
+    }
+
+    #[test]
+    #[serial]
+    fn an_invalidation_after_the_claim_keeps_the_holds() {
+        let l = Ledger::new();
+        let request = l.request(tx(1), vec![hold(70)]);
+        let minted = l.mint(&request).unwrap();
+        l.claim(&request, &minted).unwrap();
+        let before = l.bytes();
+        assert!(
+            !l.store
+                .invalidate_authorization(&l.profile, minted.id, "cancel")
+                .unwrap()
+        );
+        assert_eq!(l.bytes(), before);
+        assert_eq!(l.wire().holds[0].amount, 70);
+        assert!(matches!(
+            admit(&l.wire(), &[hold(CAP - 69)]),
+            Err(WindowStoreError::PolicyDenied { .. })
+        ));
+    }
+
+    #[test]
+    #[serial]
+    fn a_claim_after_the_invalidation_refuses() {
+        let l = Ledger::new();
+        let request = l.request(tx(1), vec![hold(70)]);
+        let minted = l.mint(&request).unwrap();
+        assert!(
+            l.store
+                .invalidate_authorization(&l.profile, minted.id, "cancel")
+                .unwrap()
+        );
+        assert_eq!(
+            refusal(l.claim(&request, &minted)),
+            MainnetPrecondition::NotOpen
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn an_expired_claim_keeps_its_spend_counted() {
+        let l = Ledger::new();
+        let request = l.request(tx(1), vec![hold(700), hold_in("fee", 30)]);
+        let minted = l.mint(&request).unwrap();
+        l.clock.set(T0 + 7);
+        l.claim(&request, &minted).unwrap();
+        l.clock.set(minted.expires_at_ms);
+        assert!(
+            !l.store
+                .invalidate_authorization(&l.profile, minted.id, "expire")
+                .unwrap()
+        );
+        let wire = l.wire();
+        let auth = l.record(minted.id);
+        assert_eq!(auth.state, AuthorizationState::Expired);
+        assert_eq!(auth.claimed_ms, Some(T0 + 7));
+        assert_eq!(auth.settled_ms, Some(minted.expires_at_ms));
+        assert!(wire.holds.is_empty());
+        let records: Vec<_> = wire
+            .entries
+            .iter()
+            .flat_map(|bucket| &bucket.records)
+            .collect();
+        assert_eq!(records.len(), 2);
+        for record in &records {
+            assert_eq!(record.ts_ms, T0 + 7);
+            assert_eq!(record.status, RecordStatus::Confirmed);
+            assert_eq!(
+                record.chain_scope,
+                Some(super::super::store::ChainScope::for_chain(Caip2::Mainnet))
+            );
+        }
+        let memory = PolicyStateStore::new();
+        l.store.load_into("ledger", &l.profile, &memory).unwrap();
+        assert_eq!(
+            memory
+                .query_window(&state_key("native"), minted.expires_at_ms)
+                .unwrap(),
+            (700, 1)
+        );
+        assert_eq!(
+            memory
+                .query_window(&state_key("fee"), minted.expires_at_ms)
+                .unwrap(),
+            (30, 1)
+        );
+        assert!(matches!(
+            l.mint(&l.request(tx(2), vec![hold(301)])),
+            Err(WindowStoreError::PolicyDenied { .. })
+        ));
+        l.mint(&l.request(tx(2), vec![hold(300)])).unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn a_reopened_store_cannot_claim_twice_or_mint_the_approval_again() {
+        let l = Ledger::new();
+        let mut request = l.request(tx(1), vec![hold(70)]);
+        let minted = l.mint(&request).unwrap();
+        l.claim(&request, &minted).unwrap();
+        let reopened = PersistedWindowStore::at_path(l.store.path().to_path_buf());
+        assert_eq!(
+            refusal(reopened.claim_authorization(
+                &l.profile,
+                minted.id,
+                &l.claim_expect(&request, &minted)
+            )),
+            MainnetPrecondition::NotOpen
+        );
+        request.binding = tx(2);
+        assert_eq!(
+            refusal(reopened.mint_authorization(&l.profile, &request)),
+            MainnetPrecondition::ApprovalNonceReused
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn a_claim_round_trips_under_the_claim_version() {
+        let l = Ledger::new();
+        let request = l.request(tx(1), vec![hold(70)]);
+        let minted = l.mint(&request).unwrap();
+        assert_eq!(l.wire().version, super::super::store::WIRE_VERSION_CHAIN);
+        l.claim(&request, &minted).unwrap();
+        let wire = l.wire();
+        assert_eq!(wire.version, super::super::store::WIRE_VERSION_CLAIM);
+        let reopened = PersistedWindowStore::at_path(l.store.path().to_path_buf());
+        let read = reopened.read_for_inspection(&l.profile).unwrap().unwrap();
+        assert_eq!(read.authorizations, wire.authorizations);
+        assert_eq!(read.holds, wire.holds);
+        let mut wrong_version = wire;
+        wrong_version.version = super::super::store::WIRE_VERSION_CHAIN;
+        assert!(validate(&wrong_version).is_err());
+    }
+
+    #[test]
+    #[serial]
+    fn a_claim_time_on_an_open_record_is_refused() {
+        let l = Ledger::new();
+        let request = l.request(tx(1), vec![]);
+        l.mint(&request).unwrap();
+        let mut wire = l.wire();
+        wire.version = super::super::store::WIRE_VERSION_CLAIM;
+        wire.authorizations[0].claimed_ms = Some(T0);
+        assert!(validate(&wire).is_err());
+    }
+
+    /// A claim time belongs to a claimed record or to the used or expired
+    /// record a claim settles into, and lies inside the record's lifetime.
+    #[test]
+    #[serial]
+    fn claim_times_follow_the_record_state_and_lifetime() {
+        let l = Ledger::new();
+        let claimed_request = l.request(tx(1), vec![hold(70)]);
+        let claimed = l.mint(&claimed_request).unwrap();
+        let dropped = l.mint(&l.request(tx(2), vec![])).unwrap();
+        assert!(
+            l.store
+                .invalidate_authorization(&l.profile, dropped.id, "cancel")
+                .unwrap()
+        );
+        l.clock.set(T0 + 7);
+        l.claim(&claimed_request, &claimed).unwrap();
+        let valid = l.wire();
+        validate(&valid).unwrap();
+        let at = |id: AuthorizationId| {
+            valid
+                .authorizations
+                .iter()
+                .position(|auth| auth.id == id)
+                .unwrap()
+        };
+        let (c, d) = (at(claimed.id), at(dropped.id));
+        let (minted_ms, expires_ms) = (
+            valid.authorizations[c].minted_ms,
+            valid.authorizations[c].expires_ms,
+        );
+        let broken: Vec<(&str, RecordBreakage)> = vec![
+            (
+                "a claimed record without its claim time",
+                Box::new(move |w| w.authorizations[c].claimed_ms = None),
+            ),
+            (
+                "an invalidated record with a claim time",
+                Box::new(move |w| w.authorizations[d].claimed_ms = Some(T0 + 7)),
+            ),
+            (
+                "a claim time before the mint",
+                Box::new(move |w| w.authorizations[c].claimed_ms = Some(minted_ms - 1)),
+            ),
+            (
+                "a claim time at the expiry",
+                Box::new(move |w| w.authorizations[c].claimed_ms = Some(expires_ms)),
+            ),
+        ];
+        for (name, mutate) in broken {
+            let mut wire = valid.clone();
+            mutate(&mut wire);
+            assert!(
+                matches!(validate(&wire), Err(WindowStoreError::Invalid { .. })),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn a_claimed_content_refuses_a_duplicate_mint() {
+        let l = Ledger::new();
+        let first = l.request(tx(1), vec![]);
+        let minted = l.mint(&first).unwrap();
+        l.claim(&first, &minted).unwrap();
+        let before = l.bytes();
+        assert_eq!(
+            refusal(l.mint(&l.request(tx(1), vec![]))),
+            MainnetPrecondition::DuplicateOpen
+        );
+        assert_eq!(l.bytes(), before);
+    }
+
+    #[test]
+    #[serial]
+    fn claimed_records_count_toward_the_open_limit() {
+        let l = Ledger::new();
+        for n in 0..16u8 {
+            let request = l.request(message(n), vec![]);
+            let minted = l.mint(&request).unwrap();
+            l.claim(&request, &minted).unwrap();
+        }
+        assert_eq!(
+            refusal(l.mint(&l.request(message(16), vec![]))),
+            MainnetPrecondition::TooManyOpen
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn a_claim_holds_to_the_lifetime_on_the_store_clock() {
+        let l = Ledger::new();
+        let request = l.request(tx(1), vec![hold(70)]);
+        let minted = l.mint(&request).unwrap();
+        let before = l.bytes();
+        l.clock.set(T0 - 1);
+        assert_eq!(
+            refusal(l.claim(&request, &minted)),
+            MainnetPrecondition::NotYetValid
+        );
+        l.clock.set(minted.expires_at_ms);
+        assert_eq!(
+            refusal(l.claim(&request, &minted)),
+            MainnetPrecondition::Expired
+        );
+        assert_eq!(l.bytes(), before);
+        l.clock.set(minted.expires_at_ms - 1);
+        assert_eq!(
+            l.claim(&request, &minted).unwrap(),
+            minted.expires_at_ms - 1
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn a_claim_refuses_a_mismatched_expectation() {
+        type ExpectChange = fn(&mut ClaimExpect);
+        let l = Ledger::new();
+        let request = l.request(tx(1), vec![hold(70)]);
+        let minted = l.mint(&request).unwrap();
+        let before = l.bytes();
+        let cases: [(ExpectChange, MainnetPrecondition); 6] = [
+            (
+                |e| e.domain = AuthorizationDomain::Soroban,
+                MainnetPrecondition::DomainMismatch,
+            ),
+            (
+                |e| e.consumer = MainnetConsumer::X402Create,
+                MainnetPrecondition::ConsumerMismatch,
+            ),
+            (
+                |e| e.bindings_digest = [0; 32],
+                MainnetPrecondition::BindingsDigest,
+            ),
+            (
+                |e| e.policy_sequence = 8,
+                MainnetPrecondition::PolicySequence,
+            ),
+            (
+                |e| e.policy_digest = [8; 32],
+                MainnetPrecondition::PolicyDigest,
+            ),
+            (
+                |e| e.approval_nonce = "another".to_owned(),
+                MainnetPrecondition::ApprovalNonce,
+            ),
+        ];
+        for (change, expected) in cases {
+            let mut expect = l.claim_expect(&request, &minted);
+            change(&mut expect);
+            assert_eq!(
+                refusal(l.store.claim_authorization(&l.profile, minted.id, &expect)),
+                expected
+            );
+            assert_eq!(l.bytes(), before, "{expected:?}");
+        }
+        l.claim(&request, &minted).unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn a_claim_refuses_a_changed_policy_pin() {
+        let l = Ledger::new();
+        let request = l.request(tx(1), vec![hold(70)]);
+        let minted = l.mint(&request).unwrap();
+        let before = l.bytes();
+        l.pin(7, [8; 32]);
+        assert_eq!(
+            refusal(l.claim(&request, &minted)),
+            MainnetPrecondition::PolicyPinMismatch
+        );
+        assert_eq!(l.bytes(), before);
+        l.pin(7, [7; 32]);
+        l.claim(&request, &minted).unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn a_claim_that_fails_to_persist_leaves_the_record_open() {
+        let l = Ledger::new();
+        let request = l.request(tx(1), vec![hold(70)]);
+        let minted = l.mint(&request).unwrap();
+        let before = l.bytes();
+        let armed = super::super::store::fail_store_writes();
+        assert!(matches!(
+            l.claim(&request, &minted),
+            Err(WindowStoreError::Io { .. })
+        ));
+        drop(armed);
+        assert_eq!(l.bytes(), before);
+        let record = l.record(minted.id);
+        assert_eq!(record.state, AuthorizationState::Open);
+        assert_eq!(record.claimed_ms, None);
+        l.claim(&request, &minted).unwrap();
+        assert_eq!(l.record(minted.id).state, AuthorizationState::Claimed);
     }
 
     fn state_key(bucket: &str) -> StateKey {
@@ -3281,6 +3805,7 @@ mod tests {
             minted_ms: 0,
             expires_ms: 1_000,
             settled_ms,
+            claimed_ms: None,
             policy_sequence: 7,
             policy_digest: [7; 32],
             approval_nonce: format!("n{n}"),
@@ -4191,6 +4716,7 @@ mod tests {
         let minted = l.mint(&open).unwrap();
         let next = l.request(tx(2), vec![hold(1)]);
         let expect = l.expect(&open, &minted);
+        let claim_expect = l.claim_expect(&open, &minted);
         let binding = consumption_of(&open.binding);
         let second = second_path(&l);
         let second = &second;
@@ -4232,6 +4758,14 @@ mod tests {
             (
                 "mint_authorization",
                 Box::new(|| second.mint_authorization(profile, &next).map(drop)),
+            ),
+            (
+                "claim_authorization",
+                Box::new(|| {
+                    second
+                        .claim_authorization(profile, minted.id, &claim_expect)
+                        .map(drop)
+                }),
             ),
             (
                 "consume_authorizations",

@@ -295,12 +295,20 @@ mod authorized {
         /// under [`NONCE`] and [`EXPIRATION_LEDGER`], valid at [`NOW`].
         fn soroban(&self) -> MainnetSorobanIntentAuthorization {
             fixtures::soroban_authorization(
+                fixtures::claim_target(self._dir.path(), "fixture"),
                 &self.writer,
                 &invocation("transfer"),
                 NONCE,
                 EXPIRATION_LEDGER,
                 NOW,
             )
+        }
+
+        fn minted_soroban(&self) -> MainnetSorobanIntentAuthorization {
+            stellar_agent_test_support::keyring_mock::install().unwrap();
+            let mut auth = self.soroban();
+            fixtures::mint_header(&mut auth.0.header, &auth.0.binding, &[]);
+            auth
         }
 
         /// A transaction authorization over the fixture's unsigned
@@ -318,7 +326,14 @@ mod authorized {
                 anchor_covers_tip: true,
                 entry_tags_in_force: true,
             };
-            let mut header = fixtures::header("fixture", None, &self.writer, facts, NOW);
+            let mut header = fixtures::header(
+                fixtures::claim_target(self._dir.path(), "fixture"),
+                "fixture",
+                None,
+                &self.writer,
+                facts,
+                NOW,
+            );
             let mut binding = fixtures::tx_binding(envelope.envelope_xdr(), envelope.tx_hash_hex());
             edit(&mut header, &mut binding);
             fixtures::tx_authorization(header, binding)
@@ -448,9 +463,9 @@ mod authorized {
     #[serial]
     async fn the_approved_preimage_signs_once_and_yields_the_signed_intent() {
         let _clock = set_now_ms_for_test(NOW);
-        let case = Case::new();
         for version in [AuthCredentialsVersion::V1, AuthCredentialsVersion::V2] {
-            let authorization = case.soroban();
+            let case = Case::new();
+            let authorization = case.minted_soroban();
             let id = authorization.id();
             let preimage = approved(version);
             let payload = SorobanAuthPayload::authorized(
@@ -716,8 +731,11 @@ mod authorized {
     #[serial]
     async fn forwarding_a_mainnet_transaction_checks_the_software_key() {
         let _clock = set_now_ms_for_test(NOW);
-        let case = Case::new();
         for seed in [OTHER_SEED, SIGNER_SEED] {
+            let case = Case::new();
+            stellar_agent_test_support::keyring_mock::install().unwrap();
+            let mut auth = case.transaction(|_, _| {});
+            fixtures::mint_header(&mut auth.0.header, &auth.0.binding, &[]);
             let signer = ForwardingSigner {
                 target: crate::signing::SoftwareSigningKey::new_from_bytes(seed),
                 signature: Mutex::new(None),
@@ -727,7 +745,7 @@ mod authorized {
                 &signer,
                 MAINNET_PASSPHRASE,
                 MainnetConsumer::CliPay,
-                &case.transaction(|_, _| {}),
+                &auth,
             )
             .await;
             if seed == OTHER_SEED {
@@ -754,13 +772,13 @@ mod authorized {
     #[serial]
     async fn forwarding_a_mainnet_payload_to_another_software_key_is_refused() {
         let _clock = set_now_ms_for_test(NOW);
-        let case = Case::new();
         for version in [AuthCredentialsVersion::V1, AuthCredentialsVersion::V2] {
+            let case = Case::new();
             let payload = SorobanAuthPayload::authorized(
                 &approved(version),
                 MainnetConsumer::X402Create,
                 &agent(),
-                case.soroban(),
+                case.minted_soroban(),
             )
             .unwrap();
             let signer = ForwardingSigner {
@@ -783,14 +801,14 @@ mod authorized {
     #[serial]
     async fn forwarding_a_mainnet_payload_to_the_same_software_key_matches() {
         let _clock = set_now_ms_for_test(NOW);
-        let case = Case::new();
         for version in [AuthCredentialsVersion::V1, AuthCredentialsVersion::V2] {
+            let case = Case::new();
             let preimage = approved(version);
             let payload = SorobanAuthPayload::authorized(
                 &preimage,
                 MainnetConsumer::X402Create,
                 &agent(),
-                case.soroban(),
+                case.minted_soroban(),
             )
             .unwrap();
             let signer = ForwardingSigner {
@@ -834,6 +852,86 @@ mod authorized {
         assert_eq!(signer.sign_calls(), 0);
     }
 
+    #[tokio::test]
+    #[serial]
+    async fn an_invalidated_soroban_payload_never_reaches_the_signer() {
+        let f = fixtures::LedgerFixture::new("invalidated-soroban", NOW);
+        let auth = f.mint_soroban(&invocation("transfer"), NONCE, EXPIRATION_LEDGER, 70);
+        let id = auth.id();
+        let payload = SorobanAuthPayload::authorized(
+            &approved(AuthCredentialsVersion::V1),
+            MainnetConsumer::X402Create,
+            &agent(),
+            auth,
+        )
+        .unwrap();
+        crate::mainnet::resolve::invalidate_unconsumed(
+            &f.window,
+            &f.context(),
+            id,
+            crate::mainnet::resolve::InvalidationStage::SignRefused,
+        )
+        .unwrap();
+        let signer = CountingSigner::new(SIGNER_SEED);
+        assert!(matches!(
+            payload.sign(&signer).await,
+            Err(AuthorizedPayloadError::Refused(
+                MainnetAuthorizationError::Refused(P::NotOpen)
+            ))
+        ));
+        assert_eq!(signer.sign_calls(), 0);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn a_soroban_claim_that_fails_to_persist_never_reaches_the_signer() {
+        let f = fixtures::LedgerFixture::new("unpersisted-soroban", NOW);
+        let auth = f.mint_soroban(&invocation("transfer"), NONCE, EXPIRATION_LEDGER, 70);
+        let id = auth.id();
+        let payload = SorobanAuthPayload::authorized(
+            &approved(AuthCredentialsVersion::V1),
+            MainnetConsumer::X402Create,
+            &agent(),
+            auth,
+        )
+        .unwrap();
+        let signer = CountingSigner::new(SIGNER_SEED);
+        let armed = crate::policy_state::store::fail_store_writes();
+        assert!(matches!(
+            payload.sign(&signer).await,
+            Err(AuthorizedPayloadError::Refused(
+                MainnetAuthorizationError::Refused(P::StoreUnavailable)
+            ))
+        ));
+        drop(armed);
+        assert_eq!(signer.sign_calls(), 0);
+        assert!(f.is_open(id));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn a_late_soroban_signature_is_discarded() {
+        let f = fixtures::LedgerFixture::new("late-soroban", NOW);
+        let auth = f.mint_soroban(&invocation("transfer"), NONCE, EXPIRATION_LEDGER, 70);
+        let id = auth.id();
+        let signer = CountingSigner::advancing_clock_to(SIGNER_SEED, auth.expires_at_ms());
+        let payload = SorobanAuthPayload::authorized(
+            &approved(AuthCredentialsVersion::V1),
+            MainnetConsumer::X402Create,
+            &agent(),
+            auth,
+        )
+        .unwrap();
+        assert!(matches!(
+            payload.sign(&signer).await,
+            Err(AuthorizedPayloadError::Refused(
+                MainnetAuthorizationError::Refused(P::Expired)
+            ))
+        ));
+        assert_eq!(signer.sign_calls(), 1);
+        f.assert_claimed_holds(id, 70);
+    }
+
     /// A signature that does not verify under the authorization's signer
     /// is refused after the one signing call.
     #[tokio::test]
@@ -845,7 +943,7 @@ mod authorized {
             &approved(AuthCredentialsVersion::V1),
             MainnetConsumer::X402Create,
             &agent(),
-            case.soroban(),
+            case.minted_soroban(),
         )
         .unwrap();
         let signer = CountingSigner::corrupting(SIGNER_SEED);

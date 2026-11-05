@@ -3076,11 +3076,19 @@ mod tests {
 
         /// Trustline keyring seed: the enrolled proof reads only the identity
         /// record, so a deleted seed entry surfaces at the signing call as
-        /// the keyring's refusal, after the mint.
+        /// the keyring's refusal, after the claim. The claimed record keeps
+        /// its holds, and its invalidation refuses `NotOpen`.
         #[tokio::test(flavor = "current_thread")]
         #[serial_test::serial]
         async fn a_deleted_seed_entry_is_signer_unavailable() {
-            let fixture = spec("mainnet-trustline-seed-deleted").build().await;
+            use stellar_agent_network::mainnet::{MainnetAuthorizationError, MainnetPrecondition};
+            // The rate limit makes the authorization hold one call.
+            let fixture = spec("mainnet-trustline-seed-deleted")
+                .rules(vec![trustline_rule(
+                    "{ kind = \"rate_limit\", window = \"1d\", max_calls = 10 },\n",
+                )])
+                .build()
+                .await;
             fixture.delete_keyring_entry(&fixture.profile().mcp_signer_default);
 
             let run = run(&fixture, &mainnet_args(&fixture)).await;
@@ -3095,7 +3103,27 @@ mod tests {
             );
             assert_eq!(
                 invalidations_on_this_thread(),
-                vec![("signer_unavailable", Ok(()))]
+                vec![(
+                    "signer_unavailable",
+                    Err(MainnetAuthorizationError::Refused(
+                        MainnetPrecondition::NotOpen
+                    ))
+                )]
+            );
+            let auths = records(&fixture);
+            assert_eq!(auths.len(), 1, "{auths:?}");
+            assert_eq!(auths[0]["state"], "claimed");
+            assert!(auths[0]["claimed_ms"].is_u64());
+            assert!(auths[0]["invalidation"].is_null());
+            let body = fixture.window_body();
+            assert!(
+                body["holds"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|hold| hold["authorization_id"] == auths[0]["id"]
+                        && hold["amount"] == "1"),
+                "{body}"
             );
             assert!(fixture.sent_envelopes().await.is_empty());
         }

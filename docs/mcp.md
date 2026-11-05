@@ -1084,8 +1084,10 @@ audit row of step 10:
 
 The authorization can still settle until ledger `L`, so a new payment for the
 same resource before then can pay twice. A consumed payment intent retains its
-debit after a later failure. An open intent can be invalidated before
-consumption.
+debit after a later failure. An intent can be invalidated before it is
+signed. Once signed, it stays charged until it is consumed or leaves the
+spending windows. A signer that refuses or fails after the claim leaves the
+spend counted, and an identical retry waits for the record's expiry.
 
 After `profile enable-mainnet` or `profile sign-policy`, restart the MCP server.
 A live consumed approval returns `policy.approval_consumed`. Without its

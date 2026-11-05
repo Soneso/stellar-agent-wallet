@@ -693,8 +693,10 @@ the receipt, each best-effort and logged. A resend that the reservation's
 duplicate check refuses after its row leaves that row open for the original
 submission's settlement. MPP's charge row keeps its existing flow. On testnet,
 an x402 refusal keeps the admitted spend. On mainnet, a consumed payment intent
-retains its debit after a later failure. A refusal before consumption
-invalidates the open intent and releases its holds.
+retains its debit after a later failure. A refusal before the signature
+invalidates the open intent and releases its holds. After the signature, the
+claimed intent stays charged until it is consumed or leaves the spending
+windows.
 
 `resolve_message_sign` checks the consumer, verified policy and enablement,
 intent network, approval binding and lifetime, and audit readiness before

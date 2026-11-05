@@ -493,8 +493,10 @@ the pending row, and the removal of the receipt, each best-effort and logged.
 A resend that the reservation's duplicate check refuses after its row leaves
 that row open for the original submission's settlement. Nothing is sent.
 On testnet, an x402 refusal keeps the admitted spend. On mainnet, an anchor
-refusal precedes intent consumption, and the open intent releases its holds. A
-refusal after the authorized row also records `x402_authorization_withheld` with stage `anchor_unavailable`.
+refusal follows the signature and precedes intent consumption, so the claimed
+intent keeps its spend counted until it is consumed or leaves the spending
+windows. A refusal after the authorized row also records
+`x402_authorization_withheld` with stage `anchor_unavailable`.
 MPP's charge row keeps its existing flow.
 
 **Recovery.** Restore keyring access and retry. A live writer retries the
