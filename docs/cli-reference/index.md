@@ -95,6 +95,13 @@ stellar-agent pay GDEST...WXYZ "10 XLM" --source GSRC...WXYZ --secret-env WALLET
 unset WALLET_SK
 ```
 
+A signing command refuses before any signature or send when its signer source fails:
+
+- no signer-source flag is passed: `validation.signer_source_required`, which names the flags the command accepts;
+- the named environment variable is not set: `validation.secret_env_not_set`, which names the variable and never its value;
+- the named variable holds no valid S-strkey: `validation.secret_env_invalid`, which names the variable and never its value;
+- the key's public key is not the `--source` account: `auth.signer_key_mismatch`, which reports the derived public key beside the `--source` account.
+
 `profile.key_scope_conflict` reports shared, self-colliding or out-of-scope
 keyring entries, a non-default owner account, or an unreadable comparison input.
 It refuses mainnet reconciliation and warns on testnet. An unreadable sibling
