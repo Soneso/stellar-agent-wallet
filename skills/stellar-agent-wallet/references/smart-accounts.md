@@ -169,7 +169,7 @@ Mainnet seed, Ledger, and keyring signers must match the enrolled account. `rule
 
 ### Verifier deploy and migration
 
-`smart-account deploy-webauthn-verifier` deploys the OZ WebAuthn-verifier WASM and records its address in the verifier registry (`<canonical_data_root>/networks.toml`). Idempotent — if the registry already holds a same-WASM-hash entry for the network it returns `status: "already_deployed"` with no RPC traffic. Testnet only.
+`smart-account deploy-webauthn-verifier` deploys the OZ WebAuthn-verifier WASM and records its address in the verifier registry (`<canonical_data_root>/networks.toml`). Idempotent: if the registry already holds a same-WASM-hash entry for the network it returns `status: "already_deployed"` with no RPC traffic. Testnet only.
 
 - Deployer source (exactly one): `--deployer-secret-env <VAR>` or `--sign-with-ledger`; `--account-index <INDEX>` default `0`.
 - `--profile` selects the chain and endpoints. `--rpc-url` overrides testnet only and defaults to the profile endpoint. `--fee <STROOPS|auto[:pNN]>` (`auto` = p95; also `auto:p50`/`auto:p75`/`auto:p95`/`auto:p99`; absent uses the profile default 100-stroop base plus simulated Soroban resource fees). `--timeout-seconds` default `60`.
@@ -181,7 +181,7 @@ This example reads the deployer seed from `DEPLOYER_SK`; the operator sets it as
 stellar-agent smart-account deploy-webauthn-verifier --deployer-secret-env DEPLOYER_SK
 ```
 
-`smart-account deploy-ed25519-verifier` and `smart-account deploy-spending-limit-policy` deploy the OZ Ed25519-verifier and spending-limit-policy WASMs respectively, with the same idempotency, signer modes, and flags as `deploy-webauthn-verifier` above. Both are per-network singletons — deploy once per network. The Ed25519 verifier backs `--signer-ed25519`; the spending-limit policy backs `rules add-policy --kind spending-limit`.
+`smart-account deploy-ed25519-verifier` and `smart-account deploy-spending-limit-policy` deploy the OZ Ed25519-verifier and spending-limit-policy WASMs respectively, with the same idempotency, signer modes, and flags as `deploy-webauthn-verifier` above. Both are per-network singletons. Deploy once per network. The Ed25519 verifier backs `--signer-ed25519`; the spending-limit policy backs `rules add-policy --kind spending-limit`.
 
 These examples read the deployer seed from `DEPLOYER_SK`; the operator sets it as [Pass a secret seed](https://github.com/Soneso/stellar-agent-wallet/blob/main/docs/getting-started.md#pass-a-secret-seed) shows and unsets it after the commands.
 
@@ -237,7 +237,7 @@ Rule reads refuse `sa.deployment_failed` for a `Delegated` signer with more than
 
 `smart-account multicall` submits an atomic multicall bundle (1 to 50 invocations) through the registered router for the target network. Signs and submits. The router address is resolved from the local registry. On a mainnet profile the command refuses with `network.mainnet_write_forbidden` before any registry, writer, or signer access. Signer source required.
 
-Each `--invocation` is `<target>:<fn>:<json-args>` where `<target>` is the C-strkey of the contract to call, `<fn>` is the function name, and `<json-args>` is a JSON array of **scalar** arguments encoded directly: a JSON number becomes an `i128`, a JSON string becomes a Soroban `String` (raw UTF-8), and `null` becomes `Void`. Booleans, objects, and nested arrays are rejected. There is no automatic typed encoding — a string is not turned into an `Address`, so functions that take addresses or other non-scalar types cannot be driven through this JSON form.
+Each `--invocation` is `<target>:<fn>:<json-args>` where `<target>` is the C-strkey of the contract to call, `<fn>` is the function name, and `<json-args>` is a JSON array of **scalar** arguments encoded directly: a JSON number becomes an `i128`, a JSON string becomes a Soroban `String` (raw UTF-8), and `null` becomes `Void`. Booleans, objects, and nested arrays are rejected. There is no automatic typed encoding. A string is not turned into an `Address`, so functions that take addresses or other non-scalar types cannot be driven through this JSON form.
 
 | Flag | Meaning |
 |------|---------|
@@ -274,7 +274,7 @@ Schedule, cancel, execute, and list pending operations on an OpenZeppelin timelo
 | `schedule` | PROPOSER | `--target <C>` (req), `--function <NAME>` (req), `--delay-ledgers <N>` (req) | Salt is derived non-deterministically and returned as the `salt` field (64-char lowercase hex). The envelope also carries `operation_id_full_hex`. Record the salt immediately. `execute` requires it with the operation id, and it cannot be recomputed. `cancel` takes the returned `operation_id_full_hex`. |
 | `cancel` | CANCELLER | `--operation-id <HEX>` (req, 64-char hex from schedule) | Cross-confirms the on-chain cancellation event. |
 | `execute` | EXECUTOR (or open-execution) | `--target <C>` (req), `--function <NAME>` (req), `--operation-id <HEX>` (req), `--salt <HEX>` (req) | Dual-RPC ready-window check, fails closed if not ready. `--target`, `--function`, `--operation-id`, `--salt` must exactly match the scheduled operation, since OZ re-derives the operation id from them. |
-| `list-pending` | — | — | Read-only, mainnet OK. Cross-references the local audit log with a dual-RPC `get_operation_state` query. |
+| `list-pending` | none | none | Read-only, mainnet OK. Cross-references the local audit log with a dual-RPC `get_operation_state` query. |
 
 The schedule-then-execute flow centers on the returned `{operation_id, salt}`. The schedule step reads the proposer seed from `PROPOSER_SK`, and the execute step reads the executor seed from `EXECUTOR_SK`. The operator sets each as [Pass a secret seed](https://github.com/Soneso/stellar-agent-wallet/blob/main/docs/getting-started.md#pass-a-secret-seed) shows and unsets it after its command.
 
@@ -318,7 +318,7 @@ Two distinct signers: `--rule-signer-ed25519-secret-env <VAR>` (req) is the agen
 | `--contract <C>` | yes | External target contract (`target_contract`); usually different from `--account`. |
 | `--function <NAME>` | yes | Contract function to invoke. |
 | `--arg <SCVAL_BASE64>` | no, repeatable | One standard-base64 XDR `ScVal` per argument, in order. Bounded-decoded to validate only; never re-encoded. A malformed value names the failing index. |
-| `--auth-rule-id <U32>` | yes, repeatable | NO default (deviation from every other write verb) — the delegation use case always names a specific scoped rule. |
+| `--auth-rule-id <U32>` | yes, repeatable | NO default (deviation from every other write verb). The delegation use case always names a specific scoped rule. |
 | `--rule-signer-ed25519-secret-env <VAR>` | yes | The agent's S-strkey seed env var. |
 | `--expect-rule-signer <64_HEX>` | no | Fail closed before signing if the derived pubkey differs. |
 | `--verifier <C>` | no | Ed25519-verifier override; else resolves from the registry (`smart-account deploy-ed25519-verifier`). |
@@ -350,7 +350,7 @@ unset AGENT_SK
 When a smart-account authorizes a call into an external contract (a DeFi adapter, a router, a token), the auth-entry locator distinguishes the contract being invoked from the wallet credential providing the authorization:
 
 - The invoked contract is the target.
-- The wallet credential address is the auth address (defaults to the target when not overridden; pass it explicitly for entrypoints that require a different C-strkey credential address — G-strkey addresses are rejected at strkey parse).
+- The wallet credential address is the auth address (defaults to the target when not overridden; pass it explicitly for entrypoints that require a different C-strkey credential address; G-strkey addresses are rejected at strkey parse).
 - One or more authorizing context-rule ids bind the auth digest; a single rule id is auto-expanded to match the number of invocation contexts.
 
 This is the same convention the higher-level value-transfer and DeFi verbs use under the hood when the source is a smart-account.
