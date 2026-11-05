@@ -1,5 +1,6 @@
-//! `stellar-agent profile reset-window-state <name> --reason <reason>` —
-//! re-initialise the persisted policy-window-state store to empty.
+//! `stellar-agent profile reset-window-state <name> --reason <reason>` clears
+//! the window history; the successor keeps every authorization record whose
+//! approval can still be presented.
 //!
 //! # Command-group placement
 //!
@@ -14,6 +15,8 @@
 //!
 //! The command clears verified accumulated history and establishes an empty
 //! store only when both the file and protected generation are absent.
+//! The successor keeps every authorization record whose approval can still be
+//! presented on the store clock.
 //! A tampered, unparseable, or rolled-back store refuses before
 //! the reset row, as does missing authenticated network provenance.
 //! No verb recovers such state in this release; create a profile under a new name.
@@ -27,14 +30,14 @@
 //! audit writer, so the operator stops it before resetting.
 //!
 //! The row records intent and the generation pair. Completion requires loading
-//! the empty store at the recorded generation after the mutation.
+//! the successor at the recorded generation after the mutation.
 //!
 //! # Owed accounting events
 //!
 //! Before the reset, the command delivers every owed
 //! `submission_accounting_expired` event under the writer it holds. A reset
 //! refuses with `submission.record_unavailable` while any such event stays
-//! unacknowledged, and the empty store keeps each acknowledged record whose
+//! unacknowledged, and the successor keeps each acknowledged record whose
 //! receipt projection is incomplete.
 //!
 //! # Newer formats
@@ -47,11 +50,13 @@
 //! # Mainnet profiles
 //!
 //! An enablement nonce requires `--owner-secret-env VAR` holding the pinned
-//! owner's seed in every build. The nonce and pin are read under the scoped
-//! store lock. With the flag, the seed must match the pin even without a nonce.
-//! Owner and pin refusals write no row and change no store, generation or key.
-//! The row records the owner's signature over the profile, chain, store digest,
-//! generation pair, reason bounded to 80 Unicode characters and request id.
+//! owner's seed in every build. The store reads the nonce and pin under its lock
+//! and verifies the owner's signature over the reset statement before the row.
+//! With the flag, the seed must match the pin even without a nonce.
+//! Owner, pin and signature refusals write no row and change no store,
+//! generation or key. The row records the owner's signature over the profile,
+//! chain, store digest, generation pair, reason bounded to 50 Unicode
+//! characters, request id and the store's challenge.
 //!
 //! In a build with mainnet writes, unverifiable mainnet state refuses with
 //! `policy.window_state_unverifiable`. A verifiable store that still holds
@@ -83,33 +88,32 @@
 //!
 //! # Errors
 //!
-//! Returns exit code `1` when the profile cannot be loaded or the store
-//! reset fails, an enabled profile lacks the owner seed, the seed is invalid,
-//! the pin is absent or unreadable, or the supplied seed does not match it.
+//! Returns exit code `1` when the profile cannot be loaded or the store reset
+//! fails. It also returns `1` when an enabled profile lacks the owner seed, the
+//! seed is invalid or names another owner, the pin is absent or unreadable, or
+//! the signature does not verify.
 
 use super::owner_seed::{OwnerSeedError, with_owner_seed};
 use clap::{ArgGroup, Args};
 use serde::Serialize;
 use stellar_agent_core::audit_log::BindingCheck;
 use stellar_agent_core::audit_log::KeyPurpose;
-use stellar_agent_core::audit_log::schema::{
-    WindowResetAuthorization, WipedAccrualRecord, bound_window_reset_reason,
-};
+use stellar_agent_core::audit_log::schema::{WindowResetAuthorization, WipedAccrualRecord};
 use stellar_agent_core::audit_log::{AuditEntry, AuditWriter, WriterError, audit_writer_refusal};
 use stellar_agent_core::envelope::Envelope;
 use stellar_agent_core::error::{
     InternalError, SubmissionError, ValidationError, WalletError, WalletStateError,
 };
 use stellar_agent_core::policy::PolicyError;
-use stellar_agent_core::policy::pin::PinState;
-use stellar_agent_core::policy::v1::signature::{WindowResetStatement, sign, window_reset_digest};
+use stellar_agent_core::policy::v1::signature::sign;
 use stellar_agent_core::profile::owner_key::encode_owner_public_key;
 use stellar_agent_core::profile::receipt::ReceiptStore;
 use stellar_agent_core::profile::schema::Profile;
 use stellar_agent_core::profile::{ResolvedProfileName, loader};
 use stellar_agent_network::keyring::init_platform_keyring_store;
 use stellar_agent_network::policy_state::{
-    PersistedWindowStore, ResetError, ResetRecord, WindowStoreError, deliver_accounting_expiries,
+    OwnerResetSignature, PersistedWindowStore, ResetConsent, ResetError, ResetRecord,
+    WindowStoreError, deliver_accounting_expiries,
 };
 use uuid::Uuid;
 
@@ -315,21 +319,26 @@ fn reset_with_owner(
         }
     }
     let request_id = Uuid::new_v4().to_string();
-    let result = store.reset(profile, now_ms, |record| {
-        let reason = bound_window_reset_reason(&args.reason);
-        let owner_authorization =
-            authorize_reset(record, key, profile, name, &reason, &request_id)?;
-        record_window_reset(
-            &mut writer,
-            name,
-            &reason,
-            &request_id,
-            profile.chain_id.caip2_str(),
-            record.accrual,
-            owner_authorization,
-        )
-        .map_err(ResetRefusal::Wallet)
-    });
+    let result = store.reset(
+        profile,
+        name,
+        now_ms,
+        &args.reason,
+        &request_id,
+        |record| Ok(sign_reset(record, key)),
+        |record, consent| {
+            record_window_reset(
+                &mut writer,
+                name,
+                record.reason,
+                record.request_id,
+                record.chain_id,
+                record.accrual,
+                owner_authorization(record, consent),
+            )
+            .map_err(ResetRefusal::Wallet)
+        },
+    );
     let minted = match &result {
         Ok(outcome) => outcome.mint.newly_minted,
         Err(ResetError::Store { minted, .. }) => *minted,
@@ -351,7 +360,7 @@ fn reset_with_owner(
         Err(error) => {
             let error = match error {
                 ResetError::Recorder(error) => error,
-                ResetError::Store { error, .. } => ResetRefusal::Wallet(store_refusal(name, error)),
+                ResetError::Store { error, .. } => reset_refusal(name, error),
             };
             render::render_json(&Envelope::<()>::err_raw(error.code(), error.message()));
             return 1;
@@ -398,63 +407,63 @@ impl ResetRefusal {
     }
 }
 
-/// Checks the live nonce and pin under the store lock and signs the reset.
-fn authorize_reset(
+/// Signs the reset statement with the owner seed, when one is supplied.
+///
+/// The store verifies the returned consent under its lock; the command reads
+/// neither the enablement nonce nor the pin.
+fn sign_reset(record: &ResetRecord<'_>, key: Option<&ed25519_dalek::SigningKey>) -> ResetConsent {
+    ResetConsent {
+        owner_signature: key.map(|key| OwnerResetSignature {
+            owner: key.verifying_key().to_bytes(),
+            signature: sign(&record.statement_digest(), key),
+        }),
+    }
+}
+
+/// The audit row's record of the verified owner signature, when presented.
+fn owner_authorization(
     record: &ResetRecord<'_>,
-    key: Option<&ed25519_dalek::SigningKey>,
-    profile: &Profile,
-    name: &str,
-    reason: &str,
-    request_id: &str,
-) -> Result<Option<WindowResetAuthorization>, ResetRefusal> {
-    let enabled = stellar_agent_core::mainnet::enablement::has_enablement_nonce(profile)
-        .map_err(ResetRefusal::Validation)?;
-    if enabled && key.is_none() {
-        return Err(ResetRefusal::Validation(
-            ValidationError::ResetWindowStateOwnerRequired {
-                profile: name.to_owned(),
-            },
-        ));
+    consent: &ResetConsent,
+) -> Option<WindowResetAuthorization> {
+    consent
+        .owner_signature
+        .map(|signed| WindowResetAuthorization {
+            owner_redacted: stellar_agent_core::observability::RedactedStrkey::from_full(
+                &encode_owner_public_key(&signed.owner),
+            ),
+            store_sha256: record
+                .store_sha256
+                .map(|hash| stellar_agent_core::hex::encode(&hash)),
+            challenge: stellar_agent_core::hex::encode(&record.challenge),
+            signature: stellar_agent_core::hex::encode(&signed.signature),
+        })
+}
+
+/// Maps a store failure of the reset, including a consent refusal, to its
+/// rendered refusal.
+fn reset_refusal(name: &str, error: WindowStoreError) -> ResetRefusal {
+    let profile = name.to_owned();
+    match error {
+        WindowStoreError::ResetOwnerRequired => {
+            ResetRefusal::Validation(ValidationError::ResetWindowStateOwnerRequired { profile })
+        }
+        WindowStoreError::ResetOwnerMismatch { presented, pinned } => {
+            ResetRefusal::Validation(ValidationError::ResetWindowStateOwnerMismatch {
+                profile,
+                derived: encode_owner_public_key(&presented),
+                pinned: encode_owner_public_key(&pinned),
+            })
+        }
+        WindowStoreError::ResetPinAbsent => ResetRefusal::PinAbsent { profile },
+        WindowStoreError::ResetPinUnreadable(error) => {
+            ResetRefusal::Policy(PolicyError::from(error))
+        }
+        WindowStoreError::ResetEnablementUnreadable(error) => ResetRefusal::Validation(error),
+        WindowStoreError::ResetSignatureInvalid => {
+            ResetRefusal::Validation(ValidationError::ResetWindowStateSignatureInvalid { profile })
+        }
+        error => ResetRefusal::Wallet(store_refusal(name, error)),
     }
-    let Some(key) = key else {
-        return Ok(None);
-    };
-    let pin = record
-        .pin()
-        .map_err(|error| ResetRefusal::Policy(PolicyError::from(error)))?;
-    let PinState::Present(pin) = pin else {
-        return Err(ResetRefusal::PinAbsent {
-            profile: name.to_owned(),
-        });
-    };
-    let derived = key.verifying_key().to_bytes();
-    if derived != pin.owner() {
-        return Err(ResetRefusal::Validation(
-            ValidationError::ResetWindowStateOwnerMismatch {
-                profile: name.to_owned(),
-                derived: encode_owner_public_key(&derived),
-                pinned: encode_owner_public_key(&pin.owner()),
-            },
-        ));
-    }
-    let digest = window_reset_digest(&WindowResetStatement {
-        profile: name,
-        chain_id: profile.chain_id.caip2_str(),
-        store_sha256: record.store_sha256,
-        generation_before: record.accrual.generation_before,
-        generation_after: record.accrual.generation_after,
-        reason,
-        request_id,
-    });
-    Ok(Some(WindowResetAuthorization {
-        owner_redacted: stellar_agent_core::observability::RedactedStrkey::from_full(
-            &encode_owner_public_key(&derived),
-        ),
-        store_sha256: record
-            .store_sha256
-            .map(|hash| stellar_agent_core::hex::encode(&hash)),
-        signature: stellar_agent_core::hex::encode(&sign(&digest, key)),
-    }))
 }
 
 /// Maps a store failure of the reset to its agent-facing error.
@@ -679,17 +688,25 @@ mod tests {
         )
         .unwrap();
         anchor.set_failing(true);
-        let result = store.reset(&profile, 100_000, |record| {
-            record_window_reset(
-                &mut writer,
-                "reset-anchor",
-                "repair",
-                "reset-request",
-                "stellar:testnet",
-                record.accrual,
-                None,
-            )
-        });
+        let result = store.reset(
+            &profile,
+            "reset-anchor",
+            100_000,
+            "repair",
+            "reset-request",
+            |_| Ok(ResetConsent::default()),
+            |record, _| {
+                record_window_reset(
+                    &mut writer,
+                    "reset-anchor",
+                    record.reason,
+                    record.request_id,
+                    record.chain_id,
+                    record.accrual,
+                    None,
+                )
+            },
+        );
         let Err(ResetError::Recorder(error)) = result else {
             panic!("an unanchored reset row must refuse the wipe");
         };
@@ -702,15 +719,23 @@ mod tests {
         assert_eq!(String::from_utf8_lossy(&rows).lines().count(), 2);
         assert!(
             store
-                .reset(&profile, 100_000, |record| record_window_reset(
-                    &mut writer,
+                .reset(
+                    &profile,
                     "reset-anchor",
+                    100_000,
                     "repair",
                     "reset-request",
-                    "stellar:testnet",
-                    record.accrual,
-                    None,
-                ))
+                    |_| Ok(ResetConsent::default()),
+                    |record, _| record_window_reset(
+                        &mut writer,
+                        "reset-anchor",
+                        record.reason,
+                        record.request_id,
+                        record.chain_id,
+                        record.accrual,
+                        None,
+                    ),
+                )
                 .is_err()
         );
         assert_eq!(std::fs::read(&profile.audit_log_path).unwrap(), rows);
@@ -721,8 +746,8 @@ mod tests {
     #[test]
     #[serial]
     fn the_enablement_nonce_is_read_under_the_store_lock() {
-        use std::sync::Arc;
         use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex};
         use stellar_agent_core::policy::state_lock::{StateLockError, WindowStoreLock};
         use stellar_agent_core::profile::schema::{
             default_policy_window_state_path_for, mainnet_enablement_entry_ref,
@@ -739,19 +764,50 @@ mod tests {
         let path = default_policy_window_state_path_for(name);
         let coordinate = profile.policy_window_state_key_id.clone();
         let nonce = mainnet_enablement_entry_ref(&coordinate);
-        let reads = Arc::new(AtomicUsize::new(0));
-        let observed = Arc::clone(&reads);
-        install_with_read_hooks(vec![ReadHook::new(
-            &nonce.service,
-            &nonce.account,
+        let order = Arc::new(Mutex::new(Vec::<&'static str>::new()));
+        let nonce_reads = Arc::new(AtomicUsize::new(0));
+        let handle_slot: Arc<Mutex<Option<std::sync::Arc<std::sync::Mutex<AuditWriter>>>>> =
+            Arc::new(Mutex::new(None));
+        let writer_held = {
+            let handle_slot = Arc::clone(&handle_slot);
+            move || {
+                let slot = handle_slot.lock().unwrap();
+                let handle = slot
+                    .as_ref()
+                    .expect("the test takes the writer handle first");
+                assert!(matches!(
+                    handle.try_lock(),
+                    Err(std::sync::TryLockError::WouldBlock)
+                ));
+            }
+        };
+        let nonce_hook = {
+            let order = Arc::clone(&order);
+            let nonce_reads = Arc::clone(&nonce_reads);
+            let writer_held = writer_held.clone();
+            let path = path.clone();
+            let coordinate = coordinate.clone();
             Arc::new(move || {
                 assert!(matches!(
                     WindowStoreLock::acquire_for(&path, &coordinate),
                     Err(StateLockError::WriterLocked)
                 ));
-                observed.fetch_add(1, Ordering::SeqCst);
-            }),
-        )])
+                writer_held();
+                order.lock().unwrap().push("nonce");
+                nonce_reads.fetch_add(1, Ordering::SeqCst);
+            })
+        };
+        let key_hook = {
+            let order = Arc::clone(&order);
+            Arc::new(move || {
+                writer_held();
+                order.lock().unwrap().push("key");
+            })
+        };
+        install_with_read_hooks(vec![
+            ReadHook::new(&nonce.service, &nonce.account, nonce_hook),
+            ReadHook::new(&coordinate.service, &coordinate.account, key_hook),
+        ])
         .unwrap();
         let audit_key = &profile.audit_log_hash_chain_key_id;
         use base64::Engine as _;
@@ -759,6 +815,9 @@ mod tests {
             .unwrap()
             .set_password(&base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0x2c; 32]))
             .unwrap();
+        let handle = acquire_keyed_audit_writer(&profile, name, BindingCheck::Enforce)
+            .unwrap_or_else(|_| panic!("the profile's audit writer opens"));
+        *handle_slot.lock().unwrap() = Some(handle);
         let args = ResetWindowStateArgs {
             name: Some(name.to_owned()),
             profile: None,
@@ -766,7 +825,69 @@ mod tests {
             owner_secret_env: None,
         };
         assert_eq!(reset_with_owner(&args, &profile, None), 0);
-        assert_eq!(reads.load(Ordering::SeqCst), 1);
+        assert_eq!(nonce_reads.load(Ordering::SeqCst), 1);
+        let order = order.lock().unwrap();
+        let first_key = order.iter().position(|read| *read == "key");
+        let first_nonce = order.iter().position(|read| *read == "nonce");
+        assert!(
+            matches!((first_key, first_nonce), (Some(key), Some(nonce)) if key < nonce),
+            "{order:?}"
+        );
+    }
+
+    #[test]
+    fn reset_consent_refusals_keep_their_codes() {
+        let pinned = [0x11; 32];
+        let presented = [0x22; 32];
+        let cases = [
+            (
+                WindowStoreError::ResetOwnerRequired,
+                "profile.reset_window_state_owner_required",
+            ),
+            (
+                WindowStoreError::ResetOwnerMismatch { presented, pinned },
+                "profile.reset_window_state_owner_mismatch",
+            ),
+            (WindowStoreError::ResetPinAbsent, "policy.pin_absent"),
+            (
+                WindowStoreError::ResetPinUnreadable(
+                    stellar_agent_core::policy::pin::PinError::Malformed {
+                        detail: "not a pin".to_owned(),
+                    },
+                ),
+                "policy.pin_unusable",
+            ),
+            (
+                WindowStoreError::ResetEnablementUnreadable(
+                    ValidationError::MainnetEnablementInvalid { binding: "nonce" },
+                ),
+                "profile.mainnet_enablement_invalid",
+            ),
+            (
+                WindowStoreError::ResetSignatureInvalid,
+                "profile.reset_window_state_signature_invalid",
+            ),
+            (
+                WindowStoreError::ResetProfileMismatch,
+                "internal.unexpected_state",
+            ),
+        ];
+        for (error, code) in cases {
+            let label = format!("{error:?}");
+            let refusal = reset_refusal("acme", error);
+            assert_eq!(refusal.code(), code, "{label}");
+            if code == "profile.reset_window_state_owner_mismatch" {
+                let message = refusal.message();
+                assert!(
+                    message.contains(&encode_owner_public_key(&presented)),
+                    "{message}"
+                );
+                assert!(
+                    message.contains(&encode_owner_public_key(&pinned)),
+                    "{message}"
+                );
+            }
+        }
     }
 
     #[test]

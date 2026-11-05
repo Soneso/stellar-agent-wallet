@@ -661,11 +661,33 @@ fn retain_hold(entries: &mut Vec<WireBucket>, hold: &WireAuthorizationHold, reco
     find_or_insert_bucket(entries, &key).records.push(record);
 }
 
-/// Drops settled authorization history older than `cutoff`; open and claimed
-/// records stay whatever their age.
-pub(super) fn prune_history(wire: &mut WireFile, cutoff: u64) {
+/// Drops settled authorization history older than `cutoff` whose approval
+/// ends at or before `now_ms`; open and claimed records stay whatever their
+/// age.
+pub(super) fn prune_history(wire: &mut WireFile, cutoff: u64, now_ms: u64) {
+    wire.authorizations.retain(|auth| {
+        auth.state.holds()
+            || auth.approval_expires_ms > now_ms
+            || auth.settled_ms.is_some_and(|t| t >= cutoff)
+    });
+}
+
+/// The authorization records a window state reset keeps: every record whose
+/// approval can still be presented at `now_ms`. The successor holds no holds,
+/// so a record that holds capacity becomes expired at `now_ms`.
+pub(super) fn reset_survivors(wire: &WireFile, now_ms: u64) -> Vec<WireAuthorization> {
     wire.authorizations
-        .retain(|auth| auth.state.holds() || auth.settled_ms.is_some_and(|t| t >= cutoff));
+        .iter()
+        .filter(|auth| auth.approval_expires_ms > now_ms)
+        .map(|auth| {
+            let mut kept = auth.clone();
+            if kept.state.holds() {
+                kept.state = AuthorizationState::Expired;
+                kept.settled_ms = Some(now_ms);
+            }
+            kept
+        })
+        .collect()
 }
 
 /// Whether `auth` is open or claimed and inside its lifetime at `now_ms`.
@@ -1809,7 +1831,10 @@ mod tests {
     use stellar_agent_test_support::keyring_mock;
     use tempfile::TempDir;
 
-    use super::super::store::{RETENTION_MS, ResetError, SubmissionHold};
+    use super::super::store::{
+        RETENTION_MS, ResetConsent, ResetError, ResetOutcome, Settlement, SubmissionHold,
+        deliver_accounting_expiries,
+    };
     use super::*;
     use crate::mainnet::clock::{TestClockGuard, set_now_ms_for_test};
     use crate::mainnet::types::RecomputedFacts;
@@ -2004,6 +2029,86 @@ mod tests {
 
         fn bytes(&self) -> Vec<u8> {
             fs::read(self.store.path()).unwrap()
+        }
+
+        /// Resets under the fixture's name without an owner signature; the
+        /// pin names an owner and no enablement nonce exists.
+        fn reset(&self, now_ms: u64) -> Result<ResetOutcome, ResetError<()>> {
+            self.store.reset(
+                &self.profile,
+                &self.name(),
+                now_ms,
+                "repair",
+                "reset-request",
+                |_| Ok(ResetConsent::default()),
+                |_, _| Ok(()),
+            )
+        }
+
+        /// Records a pending reservation on a 60-second window and commits its
+        /// accounting expiry, which owes an undelivered audit event.
+        fn owe_expiry(&self) -> SubmissionHold {
+            let mut reservation = SubmissionHold {
+                id: "cd".repeat(32),
+                tx_hash: "ab".repeat(32),
+                source: SOURCE.to_owned(),
+                sequence: 9,
+                max_time: 0,
+                pending_since_ms: T0,
+                submission_ledger: 1_000,
+                submission_anchor: None,
+                operator_required: false,
+                chain_scope: crate::policy_state::ChainScope::for_chain(Caip2::Mainnet),
+            };
+            reservation.max_time = T0 / 1000 + 60;
+            let entry = WindowEntry::new(
+                StateKey::new("ledger", 1, "native", 60),
+                T0,
+                300,
+                WindowLimit::Amount {
+                    asset: "native".to_owned(),
+                    window: "1d".to_owned(),
+                    max_stroops: CAP,
+                },
+            );
+            self.store
+                .record_pending(&self.profile, &[entry], &reservation)
+                .unwrap();
+            let expire_at = reservation.max_time * 1000 + 60_001;
+            let settled = self
+                .store
+                .expire_accounting(&self.profile, None, &reservation, expire_at)
+                .unwrap();
+            assert!(
+                matches!(settled, Some(Settlement::AccountingExpired { .. })),
+                "{settled:?}"
+            );
+            reservation
+        }
+
+        /// A bound keyed writer over the fixture's audit log.
+        fn delivery_writer(&self) -> stellar_agent_core::audit_log::AuditWriter {
+            use base64::Engine as _;
+            let coordinate = &self.profile.audit_log_hash_chain_key_id;
+            let entry = keyring_core::Entry::new(&coordinate.service, &coordinate.account).unwrap();
+            if entry.get_password().is_err() {
+                entry
+                    .set_password(
+                        &base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([4_u8; 32]),
+                    )
+                    .unwrap();
+            }
+            let access = crate::keyring::keyed_audit_access(
+                &self.profile,
+                &self.name(),
+                stellar_agent_core::audit_log::BindingCheck::Enforce,
+            )
+            .unwrap();
+            stellar_agent_core::audit_log::AuditWriter::open(
+                self.profile.audit_log_path.clone(),
+                Some(access),
+            )
+            .unwrap()
         }
     }
 
@@ -3865,8 +3970,361 @@ mod tests {
         let old_settled = sample(AuthorizationState::Expired, 0, Some(5));
         let recent_settled = sample(AuthorizationState::Expired, 0, Some(100));
         wire.authorizations = vec![open.clone(), old_settled, recent_settled.clone()];
-        prune_history(&mut wire, 100);
-        assert_eq!(wire.authorizations, vec![open, recent_settled]);
+        prune_history(&mut wire, 100, 1_000);
+        assert_eq!(
+            wire.authorizations,
+            vec![open.clone(), recent_settled.clone()]
+        );
+
+        // An old settlement stays while its approval can still be presented,
+        // and goes once the approval ends at the pruning time.
+        let mut presentable = sample(AuthorizationState::Expired, 3, Some(5));
+        presentable.approval_expires_ms = 1_001;
+        let mut ended = presentable.clone();
+        ended.approval_expires_ms = 1_000;
+        for (old, kept) in [(presentable.clone(), true), (ended, false)] {
+            wire.authorizations = vec![open.clone(), old.clone(), recent_settled.clone()];
+            prune_history(&mut wire, 100, 1_000);
+            let expected = if kept {
+                vec![open.clone(), old, recent_settled.clone()]
+            } else {
+                vec![open.clone(), recent_settled.clone()]
+            };
+            assert_eq!(wire.authorizations, expected);
+        }
+    }
+
+    // ── window state reset retention ────────────────────────────────────
+
+    /// How a reset keeps a record.
+    #[derive(Debug, Clone, Copy)]
+    enum Kept {
+        /// Equal to the record before the reset.
+        Unchanged,
+        /// Expired and settled at the store clock.
+        Settled,
+    }
+
+    /// A mint of another binding that copies `request`'s approval nonce.
+    fn nonce_copy(l: &Ledger, request: &MintRequest) -> MintRequest {
+        let mut reuse = l.request(tx(2), vec![hold(1)]);
+        reuse.approval_nonce = request.approval_nonce.clone();
+        reuse
+    }
+
+    /// A reset keeps every record whose approval can still be presented on
+    /// the store clock, so its nonce stays single use. A record that holds
+    /// capacity becomes expired; the mainnet rules refuse while it is open.
+    #[test]
+    #[serial]
+    fn a_reset_keeps_every_record_whose_approval_can_be_presented() {
+        type Setup = fn(&Ledger) -> (MintRequest, AuthorizationId);
+        let used: Setup = |l| {
+            let request = l.request(soroban(1), vec![hold(70)]);
+            let minted = l.mint(&request).unwrap();
+            l.clock.set(T0 + 5);
+            l.claim(&request, &minted).unwrap();
+            l.consume(&request, &minted, &consumption_of(&request.binding))
+                .unwrap();
+            (request, minted.id)
+        };
+        let invalidated: Setup = |l| {
+            let request = l.request(tx(1), vec![hold(70)]);
+            let minted = l.mint(&request).unwrap();
+            l.store
+                .invalidate_authorization(&l.profile, minted.id, "cancel")
+                .unwrap();
+            (request, minted.id)
+        };
+        let open: Setup = |l| {
+            let request = l.request(tx(1), vec![hold(70)]);
+            let minted = l.mint(&request).unwrap();
+            (request, minted.id)
+        };
+        let claimed: Setup = |l| {
+            let request = l.request(tx(1), vec![hold(70)]);
+            let minted = l.mint(&request).unwrap();
+            l.clock.set(T0 + 7);
+            l.claim(&request, &minted).unwrap();
+            (request, minted.id)
+        };
+        let cases: [(&str, Setup, u64, Kept, bool); 5] = [
+            ("used", used, T0 + 10_000, Kept::Unchanged, false),
+            (
+                "invalidated",
+                invalidated,
+                T0 + 10_000,
+                Kept::Unchanged,
+                false,
+            ),
+            ("expired", open, T0 + TTL_MS, Kept::Settled, false),
+            ("open", open, T0 + 10_000, Kept::Settled, true),
+            ("claimed", claimed, T0 + 10_000, Kept::Settled, true),
+        ];
+        for (name, setup, clock, kept, holds_capacity) in cases {
+            let l = Ledger::new();
+            let (request, id) = setup(&l);
+            l.clock.set(clock);
+            let before = l.record(id);
+            let bytes = l.bytes();
+            let result = l.reset(T0 + APPROVAL_MS + 1);
+            if holds_capacity && cfg!(feature = "mainnet-write") {
+                #[cfg(feature = "mainnet-write")]
+                assert!(
+                    matches!(
+                        result,
+                        Err(ResetError::Store {
+                            error: WindowStoreError::OpenAuthorizations { open: 1 },
+                            minted: false,
+                        })
+                    ),
+                    "{name}: {result:?}"
+                );
+                assert_eq!(l.bytes(), bytes, "{name}");
+                continue;
+            }
+            let outcome = result.unwrap();
+            assert_eq!(outcome.accrual.retained_authorizations, 1, "{name}");
+            let wire = l.wire();
+            assert!(wire.entries.is_empty(), "{name}");
+            assert!(wire.holds.is_empty(), "{name}");
+            let expected = match kept {
+                Kept::Unchanged => before,
+                Kept::Settled => WireAuthorization {
+                    state: AuthorizationState::Expired,
+                    settled_ms: Some(clock),
+                    ..before
+                },
+            };
+            assert_eq!(wire.authorizations, vec![expected], "{name}");
+            assert_eq!(
+                refusal(l.mint(&nonce_copy(&l, &request))),
+                MainnetPrecondition::ApprovalNonceReused,
+                "{name}"
+            );
+        }
+    }
+
+    /// A record whose approval ends at or before the store clock does not
+    /// survive the reset, and the store clock, not the caller's, decides.
+    #[test]
+    #[serial]
+    fn a_reset_drops_records_whose_approval_expired() {
+        for (clock, kept) in [(T0 + APPROVAL_MS, 0), (T0 + APPROVAL_MS - 1, 1)] {
+            let l = Ledger::new();
+            let request = l.request(soroban(1), vec![hold(70)]);
+            let minted = l.mint(&request).unwrap();
+            l.clock.set(T0 + 5);
+            l.claim(&request, &minted).unwrap();
+            l.consume(&request, &minted, &consumption_of(&request.binding))
+                .unwrap();
+            l.clock.set(clock);
+            let outcome = l.reset(T0).unwrap();
+            assert_eq!(outcome.accrual.retained_authorizations, kept, "{clock}");
+            let wire = l.wire();
+            assert_eq!(wire.authorizations.len(), kept as usize, "{clock}");
+            if kept == 0 {
+                let mut again = l.request(soroban(2), vec![]);
+                again.approval_nonce = request.approval_nonce.clone();
+                assert_eq!(
+                    refusal(l.mint(&again)),
+                    MainnetPrecondition::LifetimeInvalid
+                );
+            } else {
+                assert_eq!(wire.authorizations[0].id, minted.id);
+            }
+        }
+    }
+
+    /// A record minted ahead of the store clock is settled at the reset, and
+    /// pruning keeps it while its approval can still be presented, even when
+    /// the settlement lies before its retention window.
+    #[test]
+    #[serial]
+    fn a_reset_settles_a_record_minted_ahead_of_the_store_clock() {
+        let l = Ledger::new();
+        let mut request = l.request(tx(1), vec![hold(70)]);
+        request.approval_expires_at_ms = T0 + RETENTION_MS;
+        let minted = l.mint(&request).unwrap();
+        l.clock.set(T0 - 1_000);
+        let outcome = l.reset(T0 - 1_000).unwrap();
+        assert_eq!(outcome.accrual.retained_authorizations, 1);
+        let wire = l.wire();
+        assert!(wire.holds.is_empty());
+        let [kept] = wire.authorizations.as_slice() else {
+            panic!("one kept record: {:?}", wire.authorizations);
+        };
+        assert_eq!(kept.id, minted.id);
+        assert_eq!(kept.state, AuthorizationState::Expired);
+        assert_eq!(kept.settled_ms, Some(T0 - 1_000));
+
+        let late_ms = T0 + RETENTION_MS - 500;
+        l.clock.set(late_ms);
+        let late = hold(1);
+        let late = WindowEntry::new(late.key().clone(), late_ms, 1, late.limit().clone());
+        l.store.record_and_persist(&l.profile, &[late]).unwrap();
+        assert_eq!(
+            l.wire()
+                .authorizations
+                .iter()
+                .map(|auth| auth.id)
+                .collect::<Vec<_>>(),
+            vec![minted.id],
+            "pruning keeps a record whose approval can still be presented"
+        );
+        let mut reuse = nonce_copy(&l, &request);
+        reuse.approval_expires_at_ms = request.approval_expires_at_ms;
+        assert_eq!(
+            refusal(l.mint(&reuse)),
+            MainnetPrecondition::ApprovalNonceReused
+        );
+    }
+
+    /// A reset keeps a used intent and its child, so the intent continues
+    /// once.
+    #[test]
+    #[serial]
+    fn a_reset_keeps_a_continued_intent_and_its_child() {
+        let l = Ledger::new();
+        let (_intent, parent, child) = used_intent(&l);
+        let minted = l.mint(&child).unwrap();
+        let release = ConsumptionBinding::PayloadRelease {
+            intent_record: Some(parent.id),
+            final_envelope_sha256: [1; 32],
+            root_invocation_digest: Some([1 ^ 0x40; 32]),
+        };
+        l.consume(&child, &minted, &release).unwrap();
+        let parent_before = l.record(parent.id);
+        let child_before = l.record(minted.id);
+        l.clock.set(T0 + 10_000);
+        l.reset(T0 + 10_000).unwrap();
+        let find = |id: AuthorizationId| {
+            l.wire()
+                .authorizations
+                .into_iter()
+                .find(|auth| auth.id == id)
+        };
+        assert_eq!(find(parent.id), Some(parent_before));
+        let mut second = l.request(x402(2), vec![]);
+        second.approval_nonce = child.approval_nonce.clone();
+        second.parent = Some(parent.id);
+        assert_eq!(
+            refusal(l.mint(&second)),
+            MainnetPrecondition::IntentRecordMismatch,
+            "a parent has one child across the reset"
+        );
+        assert_eq!(find(minted.id), Some(child_before));
+    }
+
+    /// A reset keeps the acknowledged, unprojected expiry records and the
+    /// presentable authorization records together.
+    #[test]
+    #[serial]
+    fn a_reset_keeps_both_retained_collections() {
+        let l = Ledger::new();
+        l.owe_expiry();
+        let mut writer = l.delivery_writer();
+        deliver_accounting_expiries(&mut writer, &l.store, &l.profile, &l.name(), None).unwrap();
+        let request = l.request(message(1), vec![]);
+        let minted = l.mint(&request).unwrap();
+        l.consume(&request, &minted, &consumption_of(&request.binding))
+            .unwrap();
+        let before = l.wire();
+        let [expiry] = before.accounting_expiries.as_slice() else {
+            panic!("one expiry record: {:?}", before.accounting_expiries);
+        };
+        let flags = serde_json::to_value(expiry).unwrap();
+        assert_eq!(flags["audit_acknowledged"], true, "{flags}");
+        assert_eq!(flags["receipt_projected"], false, "{flags}");
+        let used = l.record(minted.id);
+        l.clock.set(T0 + 10_000);
+        let outcome = l.reset(T0 + 10_000).unwrap();
+        assert_eq!(outcome.accrual.retained_authorizations, 1);
+        let wire = l.wire();
+        assert_eq!(wire.accounting_expiries, before.accounting_expiries);
+        assert_eq!(wire.authorizations, vec![used]);
+        assert_eq!(
+            refusal(l.mint(&nonce_copy(&l, &request))),
+            MainnetPrecondition::ApprovalNonceReused
+        );
+    }
+
+    /// The owed expiry refuses first, the open authorization second, and the
+    /// owner consent only after both: `authorize` runs only in the third
+    /// reset and `record` never runs.
+    #[cfg(feature = "mainnet-write")]
+    #[test]
+    #[serial]
+    fn the_snapshot_refusals_precede_the_owner_consent() {
+        let l = Ledger::new();
+        let nonce = stellar_agent_core::profile::schema::mainnet_enablement_entry_ref(
+            &l.profile.policy_window_state_key_id,
+        );
+        keyring_core::Entry::new(&nonce.service, &nonce.account)
+            .unwrap()
+            .set_password("enablement-nonce")
+            .unwrap();
+        l.owe_expiry();
+        let request = l.request(tx(1), vec![hold(70)]);
+        let minted = l.mint(&request).unwrap();
+        l.clock.set(T0 + 7);
+        l.claim(&request, &minted).unwrap();
+        let authorized = Cell::new(0);
+        let recorded = Cell::new(0);
+        let attempt = || match l.store.reset(
+            &l.profile,
+            &l.name(),
+            T0 + 7,
+            "repair",
+            "reset-request",
+            |_| {
+                authorized.set(authorized.get() + 1);
+                Ok::<_, ()>(ResetConsent::default())
+            },
+            |_, _| {
+                recorded.set(recorded.get() + 1);
+                Ok(())
+            },
+        ) {
+            Err(ResetError::Store {
+                error,
+                minted: false,
+            }) => error,
+            other => panic!("expected a refusal without minting: {other:?}"),
+        };
+
+        let first = attempt();
+        assert!(
+            matches!(first, WindowStoreError::AccountingAuditOwed),
+            "{first:?}"
+        );
+        let mut writer = l.delivery_writer();
+        deliver_accounting_expiries(&mut writer, &l.store, &l.profile, &l.name(), None).unwrap();
+        let delivered = l.bytes();
+        let expiries = l.wire().accounting_expiries;
+        assert!(
+            expiries.iter().all(|record| {
+                serde_json::to_value(record).unwrap()["audit_acknowledged"] == true
+            })
+        );
+
+        let second = attempt();
+        assert!(
+            matches!(second, WindowStoreError::OpenAuthorizations { open: 1 }),
+            "{second:?}"
+        );
+        assert_eq!(authorized.get(), 0);
+
+        l.clock.set(T0 + TTL_MS);
+        let third = attempt();
+        assert!(
+            matches!(third, WindowStoreError::ResetOwnerRequired),
+            "{third:?}"
+        );
+        assert_eq!(authorized.get(), 1);
+        assert_eq!(recorded.get(), 0);
+        assert_eq!(l.bytes(), delivered);
+        assert_eq!(l.wire().accounting_expiries, expiries);
     }
 
     #[test]
@@ -4847,14 +5305,22 @@ mod tests {
             ("release", Box::new(|| second.release(profile, &pending))),
             (
                 "reset",
-                Box::new(
-                    || match second.reset(profile, T0, |_| Ok::<(), WindowStoreError>(())) {
+                Box::new(|| {
+                    match second.reset(
+                        profile,
+                        "ledger",
+                        T0,
+                        "repair",
+                        "reset-request",
+                        |_| Ok::<_, WindowStoreError>(ResetConsent::default()),
+                        |_, _| Ok(()),
+                    ) {
                         Ok(_) => Ok(()),
                         Err(ResetError::Store { error, .. } | ResetError::Recorder(error)) => {
                             Err(error)
                         }
-                    },
-                ),
+                    }
+                }),
             ),
             ("resign", Box::new(|| second.resign(profile, &[9; 32]))),
             (

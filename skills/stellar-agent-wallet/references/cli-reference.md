@@ -911,24 +911,32 @@ the store. A reset whose row cannot be written does not happen.
 An installation with a mainnet enablement nonce requires `--owner-secret-env <VAR>`
 in every build, whatever chain the profile file names. The variable holds the
 pinned policy owner's `S...` strkey; the flag takes its name, never the secret.
-The seed is unlocked before audit acquisition. The nonce and pin are checked
-under the window-store lock. A pin alone does not require the flag.
+The seed is unlocked before audit acquisition. The store reads the nonce and pin
+under its lock and verifies the owner's signature over the reset statement, so
+the requirement holds for every caller of the store. A pin alone does not
+require the flag.
 When supplied, the seed must match the pin even without an enablement nonce.
 
 Missing owner authorization refuses with `profile.reset_window_state_owner_required`.
 A different seed refuses with `profile.reset_window_state_owner_mismatch`.
 A supplied seed without a pin refuses with `policy.pin_absent`; an unreadable
-pin refuses with `policy.pin_unusable`. These refusals write no reset row and
-change no store, generation or key. Seed input errors report
+pin refuses with `policy.pin_unusable`. A signature that does not verify over
+the reset statement refuses with `profile.reset_window_state_signature_invalid`.
+These refusals write no reset row and change no store, generation or key.
+Owed accounting events the command delivers before the reset keep their rows
+and acknowledgements when the reset refuses. Seed input errors report
 `validation.secret_env_not_set`, `validation.secret_env_invalid` or
 `wallet_state.unlock_failed` before acquiring either writer or store lock.
 
 With the flag, the row adds `owner_authorization`: a redacted owner,
-`store_sha256` (lowercase hex, or null for a missing file), and a 128-character
-lowercase hex signature. The pinned owner signs `window_reset_digest` over the
-profile, chain, store digest, generation pair, bounded recorded reason and
-request id. The recorded reason is bounded to 80 Unicode characters before
-signing, and the signed and recorded bytes are identical.
+`store_sha256` (lowercase hex, or null for a missing file), `challenge` (64
+lowercase hex characters) and a signature of 128 lowercase hex characters. The
+pinned owner signs `window_reset_digest` over the profile, chain, store digest,
+generation pair, bounded recorded reason, request id and challenge. The store
+draws a new challenge of 32 bytes under its lock for every reset, so a
+signature authorizes one reset of one store. The recorded reason is bounded to
+50 Unicode characters before signing, and the signed and recorded bytes are
+identical.
 A reset without the nonce or flag omits this field.
 
 The reset requires a current tip anchor before and after its row. If repair
@@ -944,8 +952,15 @@ age. At most eight buckets appear, with bounded identifiers and a truncation fla
 the entry count covers all live records. An absent file with no protected
 generation establishes a new empty store and reports no totals.
 
+The successor keeps every authorization record whose approval can still be
+presented on the store clock. A reset preserves nonce reuse checks and prevents
+a completed continuation from being repeated. A kept record holds no window
+capacity, and a record that holds capacity becomes expired.
+`wiped.retained_authorizations` counts the kept records and is absent when the
+reset keeps none.
+
 A missing file with protected history, an unusable key, an integrity failure,
-or a generation mismatch refuses before the recorder and changes no file, key,
+or a generation mismatch refuses before the reset row and changes no file, key,
 or generation. No verb recovers such state in this release; create a profile
 under a new name. A different authenticated network refuses with
 `policy.window_chain_mismatch`. Restore the profile's network, or create a
@@ -968,13 +983,13 @@ writer after the reset row, including when the later store write fails.
 
 A failure after the row but before the generation write leaves the old store
 readable; the row's `generation_after` exceeds the keyring generation. Run reset
-again. Once the generation is written, the empty store is committed, even when
+again. Once the generation is written, the successor is committed, even when
 the file still carries the old body beside it. A first reset, with no store file,
 writes the generation before the file. A failure between those two writes leaves
 a missing file with a committed generation. Reset refuses that state.
 No verb recovers such state in this release; create a profile under a new name.
 The reset is complete when the next command that opens the window store loads
-the empty store at `generation_after`. On a V1 profile, a value-moving command
+the successor at `generation_after`. On a V1 profile, a value-moving command
 and the MCP server's start open it. Generation equality alone does not establish
 completion.
 A blank `--reason` refuses with `validation.reason_empty` before anything changes.
@@ -985,6 +1000,9 @@ later. An older binary drops both fields when computing the row hash. It refuses
 a log once a checked root HMAC, successor row or tip anchor covers the new row.
 An uncovered tail can still be read by that binary with both fields dropped.
 If it then appends a row, this release refuses the extended log at that row.
+A `wiped` record without `retained_authorizations` keeps its serialized form.
+An older binary drops that field when computing the row hash, with the same
+consequences.
 
 The counterparty cache reads and mints its HMAC key at
 `counterparty_cache_key_id`, the entry `profile rotate-counterparty-key` writes.

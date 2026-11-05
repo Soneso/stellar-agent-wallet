@@ -291,6 +291,7 @@ or `trustline.policy_engine_unavailable`.
 | `policy.window_chain_mismatch` | The profile network disagrees with authenticated spending state. Restore the profile's network, or create a profile under a new name. |
 | `policy.window_chain_unverifiable` | Spending state lacks complete authenticated network provenance. No verb recovers such state in this release; create a profile under a new name. |
 | `profile.reset_window_state_open_authorizations` | Effective open authorizations prevent reset. |
+| `profile.reset_window_state_signature_invalid` | The owner's signature does not verify over this reset. Run the reset again with the pinned owner's seed in `--owner-secret-env`. |
 | `approval.presence_required` | Mainnet consent requires a verified assertion from an approval credential in the owner-signed policy; use the local passkey approval page. |
 | `approval.presence_policy_unavailable` | The current owner-signed mainnet policy cannot be verified, lists no approval credential, or changed since the consent was recorded. |
 | `approval.mainnet_remote_unsupported` | The remote approval listener does not approve mainnet requests. |

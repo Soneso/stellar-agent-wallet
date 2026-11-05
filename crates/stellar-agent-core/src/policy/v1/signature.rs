@@ -213,12 +213,14 @@ pub struct WindowResetStatement<'a> {
     pub store_sha256: Option<[u8; 32]>,
     /// The generation observed before reset, or `None` when absent.
     pub generation_before: Option<u64>,
-    /// The empty store's new generation.
+    /// The successor's new generation.
     pub generation_after: u64,
     /// The bounded reason recorded in the audit row.
     pub reason: &'a str,
     /// The audit row's request identifier.
     pub request_id: &'a str,
+    /// The store's challenge for this reset.
+    pub challenge: [u8; 32],
 }
 
 /// Computes the domain-separated BLAKE3 digest for an owner-authorized reset.
@@ -226,6 +228,7 @@ pub struct WindowResetStatement<'a> {
 /// Strings carry a u32 big-endian byte length. Optional fields carry a zero
 /// byte when absent, or a one byte followed by their value. Generations are
 /// u64 big-endian. Callers supply the bounded reason recorded in the row.
+/// The challenge follows the request id as 32 bytes.
 #[must_use]
 pub fn window_reset_digest(statement: &WindowResetStatement<'_>) -> [u8; 32] {
     fn string(message: &mut Vec<u8>, value: &str) {
@@ -252,6 +255,7 @@ pub fn window_reset_digest(statement: &WindowResetStatement<'_>) -> [u8; 32] {
     message.extend_from_slice(&statement.generation_after.to_be_bytes());
     string(&mut message, statement.reason);
     string(&mut message, statement.request_id);
+    message.extend_from_slice(&statement.challenge);
     digest(&message)
 }
 
@@ -420,6 +424,7 @@ mod tests {
             generation_after: 8,
             reason: "repair",
             request_id: "request",
+            challenge: [0x33; 32],
         };
         let expected = window_reset_digest(&statement);
         for changed in [
@@ -459,13 +464,53 @@ mod tests {
                 request_id: "another-request",
                 ..statement
             },
+            WindowResetStatement {
+                challenge: [0x44; 32],
+                ..statement
+            },
         ] {
             assert_ne!(expected, window_reset_digest(&changed), "{changed:?}");
         }
+        let mut message = b"stellar-agent-window-reset-v1".to_vec();
+        message.extend_from_slice(&5u32.to_be_bytes());
+        message.extend_from_slice(b"reset");
+        message.extend_from_slice(&15u32.to_be_bytes());
+        message.extend_from_slice(b"stellar:mainnet");
+        message.push(1);
+        message.extend_from_slice(&[0x11; 32]);
+        message.push(1);
+        message.extend_from_slice(&7u64.to_be_bytes());
+        message.extend_from_slice(&8u64.to_be_bytes());
+        message.extend_from_slice(&6u32.to_be_bytes());
+        message.extend_from_slice(b"repair");
+        message.extend_from_slice(&7u32.to_be_bytes());
+        message.extend_from_slice(b"request");
+        message.extend_from_slice(&[0x33; 32]);
+        assert_eq!(expected, digest(&message));
         assert_eq!(
             crate::hex::encode(&expected),
-            "51a71d3f135698b598e0d7da26cf428ed6aedefff9c88fb16e8ba8571387e220"
+            "4ad77789fe3d9671ee323cd4e4b8fc896e157c3841dd33076edda655fbc31f35"
         );
+    }
+
+    /// The identity point as owner and the identity commitment with a zero
+    /// scalar as signature: ordinary verification accepts it for every
+    /// message, and strict verification refuses the small-order key.
+    #[test]
+    fn strict_verification_refuses_a_weak_key_vector() {
+        use ed25519_dalek::Verifier as _;
+        let mut owner = [0u8; 32];
+        owner[0] = 0x01;
+        let mut signature = [0u8; 64];
+        signature[0] = 0x01;
+        let d = digest(b"weak key vector");
+        let key = VerifyingKey::from_bytes(&owner).expect("the identity point decodes");
+        key.verify(&d, &Signature::from_bytes(&signature))
+            .expect("ordinary verification accepts the weak key vector");
+        assert!(matches!(
+            verify(&d, &signature, &owner, "weak"),
+            Err(PolicyError::OwnerSignatureInvalid { .. })
+        ));
     }
 
     // ── digest_deterministic ─────────────────────────────────────────────────
