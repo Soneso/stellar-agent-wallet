@@ -87,6 +87,7 @@ async fn ledger_path_does_not_invoke_keyring_get_password() {
     let result = signer_from_ledger(
         0,
         "GAQAA5L65LSYH7CQ3VTJ7F3HHLGCL3DSLAR2Y47263D56MNNGHSQSTVY",
+        "--source",
     )
     .await;
 
