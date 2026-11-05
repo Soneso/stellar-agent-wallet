@@ -527,8 +527,7 @@ pub async fn run(args: &ExecuteArgs) -> i32 {
         return emit_error(&e, args.output, &request_id);
     }
     // Fail closed BEFORE signing if --expect-rule-signer is set and differs.
-    if let Err(e) =
-        check_expected_rule_signer(args.expect_rule_signer.as_deref(), &rule_pubkey_hex)
+    if let Err(e) = check_expected_rule_signer(args.expect_rule_signer.as_deref(), &rule_pubkey_hex)
     {
         drop(rule_signer);
         return emit_error(&e, args.output, &request_id);
