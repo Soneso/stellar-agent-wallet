@@ -85,9 +85,10 @@ const RULES_OBSERVABILITY_PROFILE: &str = "mcp-rules-observability";
 /// The signers-manager configuration for `context`.
 ///
 /// The primary endpoint is the context's primary. The secondary is the
-/// context's secondary, or the primary again when the context has none, which
-/// is the manager's degraded single-endpoint mode. Every signers manager the
-/// MCP server builds takes its configuration from this function.
+/// context's secondary, or the primary again when the context has none. Reads
+/// then compare one endpoint with itself, and a signing verb refuses for want
+/// of a ledger witness on another host. Every signers manager the MCP server
+/// builds takes its configuration from this function.
 pub(super) fn signers_manager_config(
     context: &NetworkContext,
     audit_writer: Arc<Mutex<AuditWriter>>,

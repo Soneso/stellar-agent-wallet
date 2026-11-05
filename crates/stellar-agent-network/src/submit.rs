@@ -30,6 +30,11 @@
 //! at it, each sleep between polls ends at it at the latest, and an answer
 //! that completes after it is not accepted.
 //!
+//! `submit_transaction_and_wait_sent_by` adds a send-by instant to the steps
+//! before the send: a caller whose signature rests on a deadline sends
+//! nothing after it, while the confirmation poll keeps the submission's own
+//! timeout.
+//!
 //! Retry-After limitation: `stellar-rpc-client` surfaces no typed `Retry-After`
 //! header; blind backoff is used instead.  Retry-After / transport-429-on-send
 //! is not currently honoured.
@@ -57,7 +62,8 @@ use crate::mainnet::consumed::AuthorizationConsumed;
 use crate::mainnet::refusal::AuthorizedPathError;
 use crate::mainnet::{AuthorizationDomain, MainnetConsumer, MainnetPrecondition};
 use crate::retry::{
-    RetryPolicy, is_retryable_poll_error, is_retryable_send_error, retry_with_backoff,
+    RetryPolicy, StartedByError, is_retryable_poll_error, is_retryable_send_error,
+    retry_with_backoff_started_by,
 };
 use crate::signing::verify_binding::{
     grant_signer_signed, reject_v0_envelope, verify_signature_network_binding,
@@ -195,6 +201,191 @@ pub async fn submit_transaction_and_wait(
     signer_kind: Option<SubmissionSignerKind>,
     recorder: Option<&dyn SubmissionRecorder>,
 ) -> Result<SubmissionResult, WalletError> {
+    submit_unauthorized(
+        client,
+        envelope_xdr,
+        None,
+        timeout,
+        network_passphrase,
+        signer_kind,
+        recorder,
+    )
+    .await
+    .map_err(|error| error.into_wallet_error(client, timeout))
+}
+
+/// The step of a submission at which its send-by instant passed.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreSendStage {
+    /// The probe that asks the endpoint which network it serves.
+    EndpointIdentity,
+    /// The signer-set read that binds the envelope's signatures to that
+    /// network.
+    SignatureBinding,
+    /// The instant immediately before a `sendTransaction` attempt, after the
+    /// pre-send record: the first send and every resend of the same bytes.
+    Send,
+}
+
+impl PreSendStage {
+    /// A stable label for the stage.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::EndpointIdentity => "send_endpoint_identity",
+            Self::SignatureBinding => "send_signature_binding",
+            Self::Send => "send_transaction",
+        }
+    }
+}
+
+/// Why [`submit_transaction_and_wait_sent_by`] returned without a result.
+#[derive(Debug)]
+pub enum SentByError {
+    /// The send-by instant passed at `stage`, before a `sendTransaction`
+    /// attempt, and no attempt starts after it.
+    ///
+    /// Before the first attempt nothing was sent, `sent_tx_hash` is `None`,
+    /// and a record written before the send is settled as rejected. Before a
+    /// resend the earlier send may have reached the network: `sent_tx_hash`
+    /// names the transaction, and its record stands unresolved until
+    /// reconciliation settles it.
+    Elapsed {
+        /// The step the instant passed at.
+        stage: PreSendStage,
+        /// The hash of the transaction an earlier attempt sent, whose outcome
+        /// is unknown; `None` when nothing was sent.
+        sent_tx_hash: Option<String>,
+    },
+    /// Every other failure, as [`submit_transaction_and_wait`] reports it.
+    Failed(WalletError),
+}
+
+impl From<WalletError> for SentByError {
+    fn from(error: WalletError) -> Self {
+        Self::Failed(error)
+    }
+}
+
+impl SentByError {
+    /// The wallet error for this failure. A send-by instant that passed
+    /// before anything was sent reads as the submission's timeout at
+    /// `client`; one that passed after a send reads as the unresolved
+    /// [`SubmissionError::TxTimeout`] of the transaction sent.
+    fn into_wallet_error(self, client: &StellarRpcClient, timeout: Duration) -> WalletError {
+        match self {
+            Self::Elapsed {
+                sent_tx_hash: None, ..
+            } => send_by_elapsed(client, timeout),
+            Self::Elapsed {
+                sent_tx_hash: Some(tx_hash),
+                ..
+            } => WalletError::Submission(SubmissionError::TxTimeout {
+                tx_hash,
+                seconds: timeout.as_secs(),
+            }),
+            Self::Failed(error) => error,
+        }
+    }
+}
+
+/// The timeout error of a submission whose send-by instant passed.
+fn send_by_elapsed(client: &StellarRpcClient, timeout: Duration) -> WalletError {
+    WalletError::Network(NetworkError::RpcTimeout {
+        url: client.url.authority(),
+        timeout_secs: timeout.as_secs(),
+    })
+}
+
+/// Submits a signed `TransactionEnvelope` only while `send_by` has not
+/// passed, and polls until confirmed.
+///
+/// [`submit_transaction_and_wait`] with one more bound: the endpoint
+/// identity probe and the signer-set fetch end at `send_by` at the latest,
+/// an answer that completes at or after it is not read, and the instant is
+/// checked again immediately before every `sendTransaction` attempt, after
+/// the pre-send record: the first send and every resend of the same bytes
+/// after a transport failure. A sleep between attempts ends at `send_by` at
+/// the latest. A caller whose signature rests on a deadline passes that
+/// deadline, so nothing it signed is sent after it. An attempt that started
+/// before the instant, and the confirmation poll, run under `timeout`, armed
+/// when the call starts, as in [`submit_transaction_and_wait`].
+///
+/// # Errors
+///
+/// - [`SentByError::Elapsed`] when `send_by` passes before a
+///   `sendTransaction` attempt. Before the first attempt nothing was sent,
+///   and a record the recorder wrote is settled as
+///   [`SubmissionOutcome::Rejected`] with the code of
+///   [`NetworkError::RpcTimeout`]. Before a resend the record is settled as
+///   [`SubmissionOutcome::TransportAfterSend`]: the earlier send's outcome is
+///   unknown, and the error names its transaction hash.
+/// - [`SentByError::Failed`] with every error of
+///   [`submit_transaction_and_wait`].
+///
+/// # Panics
+///
+/// Never panics.
+pub async fn submit_transaction_and_wait_sent_by(
+    client: &StellarRpcClient,
+    envelope_xdr: &str,
+    send_by: tokio::time::Instant,
+    timeout: Duration,
+    network_passphrase: &str,
+    signer_kind: Option<SubmissionSignerKind>,
+    recorder: Option<&dyn SubmissionRecorder>,
+) -> Result<SubmissionResult, SentByError> {
+    submit_unauthorized(
+        client,
+        envelope_xdr,
+        Some(send_by),
+        timeout,
+        network_passphrase,
+        signer_kind,
+        recorder,
+    )
+    .await
+}
+
+/// Runs one pre-send `step` under `send_by`, when there is one: the step is
+/// cut at the instant, and an answer that completes at or after it is not
+/// read.
+async fn before_send_by<T>(
+    send_by: Option<tokio::time::Instant>,
+    stage: PreSendStage,
+    step: impl std::future::Future<Output = Result<T, WalletError>>,
+) -> Result<T, SentByError> {
+    let Some(send_by) = send_by else {
+        return Ok(step.await?);
+    };
+    let answer =
+        tokio::time::timeout_at(send_by, step)
+            .await
+            .map_err(|_| SentByError::Elapsed {
+                stage,
+                sent_tx_hash: None,
+            })?;
+    if tokio::time::Instant::now() >= send_by {
+        return Err(SentByError::Elapsed {
+            stage,
+            sent_tx_hash: None,
+        });
+    }
+    Ok(answer?)
+}
+
+/// The unauthorized submission, with the pre-send steps bounded by
+/// `send_by` when there is one.
+async fn submit_unauthorized(
+    client: &StellarRpcClient,
+    envelope_xdr: &str,
+    send_by: Option<tokio::time::Instant>,
+    timeout: Duration,
+    network_passphrase: &str,
+    signer_kind: Option<SubmissionSignerKind>,
+    recorder: Option<&dyn SubmissionRecorder>,
+) -> Result<SubmissionResult, SentByError> {
     // Mainnet write is structurally forbidden at the submit layer: the
     // passphrase comparison is the primary check and the URL heuristic the
     // defence-in-depth layer, both before any decode or RPC call.
@@ -225,9 +416,12 @@ pub async fn submit_transaction_and_wait(
     // the endpoint; the caller's declaration is only a claim about it, and the
     // two must be shown to agree before anything is sent. Bounded by the
     // caller's own deadline.
-    client
-        .endpoint_identity(network_passphrase, send_deadline)
-        .await?;
+    before_send_by(
+        send_by,
+        PreSendStage::EndpointIdentity,
+        client.endpoint_identity(network_passphrase, send_deadline),
+    )
+    .await?;
 
     // With the endpoint's network established, verify that the envelope's
     // signatures were produced for that network. This is what stops an
@@ -235,9 +429,12 @@ pub async fn submit_transaction_and_wait(
     // response's ledger is the endpoint's view of the chain immediately before
     // the send, which is what a later reconciliation compares against the
     // endpoint's retention floor.
-    let submission_ledger =
-        verify_signature_network_binding(client, &envelope, network_passphrase, send_deadline)
-            .await?;
+    let submission_ledger = before_send_by(
+        send_by,
+        PreSendStage::SignatureBinding,
+        verify_signature_network_binding(client, &envelope, network_passphrase, send_deadline),
+    )
+    .await?;
 
     // The transaction hash is a property of the envelope, not of the endpoint:
     // it is computable from the bytes about to be sent. Computing it here
@@ -248,7 +445,8 @@ pub async fn submit_transaction_and_wait(
 
     let (source, sequence) = replay_identity(&envelope)?;
     let intent = SubmissionIntent {
-        chain_scope: crate::policy_state::ChainScope::from_passphrase(network_passphrase)?,
+        chain_scope: crate::policy_state::ChainScope::from_passphrase(network_passphrase)
+            .map_err(WalletError::from)?,
         envelope_hash: envelope_hash_hex(envelope_xdr),
         tx_hash: tx_hash_hex,
         source,
@@ -263,11 +461,14 @@ pub async fn submit_transaction_and_wait(
         rec.pre_send(&intent).await?;
     }
 
+    // The send-by instant is checked immediately before every send attempt,
+    // the first one right after the record.
     send_and_confirm(
         client,
         &envelope,
         &intent,
         local_hash_bytes,
+        send_by,
         send_deadline,
         timeout,
         recorder,
@@ -494,13 +695,15 @@ pub(crate) async fn authorized_submission(
         &envelope,
         &intent,
         local_hash_bytes,
+        None,
         send_deadline,
         timeout,
         Some(recorder),
         signer_kind,
         FailureWitness::Oracle(oracle),
     )
-    .await?)
+    .await
+    .map_err(|error| error.into_wallet_error(client, timeout))?)
 }
 
 /// What settles a negative answer of the endpoint a submission was sent to.
@@ -571,6 +774,9 @@ fn proof_matches(
 /// that resends the same bytes, compares the endpoint's hash with the local
 /// one, and polls for the confirmation. `witness` decides what settles a
 /// negative answer.
+///
+/// With `send_by`, no attempt starts at or after it, the first included;
+/// [`refuse_past_send_by`] settles the record of a refused attempt.
 #[allow(
     clippy::too_many_arguments,
     reason = "the facts both submit paths established before the send"
@@ -580,12 +786,13 @@ async fn send_and_confirm(
     envelope: &TransactionEnvelope,
     intent: &SubmissionIntent,
     local_hash_bytes: [u8; 32],
+    send_by: Option<tokio::time::Instant>,
     send_deadline: tokio::time::Instant,
     timeout: Duration,
     recorder: Option<&dyn SubmissionRecorder>,
     signer_kind: Option<SubmissionSignerKind>,
     witness: FailureWitness<'_>,
-) -> Result<SubmissionResult, WalletError> {
+) -> Result<SubmissionResult, SentByError> {
     let retry_policy = RetryPolicy::default();
     let redacted = redact_tx_hash(&intent.tx_hash);
 
@@ -608,9 +815,10 @@ async fn send_and_confirm(
         let inner = &client.inner;
         // `envelope` is borrowed (not moved) across each retry attempt so the
         // closure can be called multiple times (FnMut requirement).
-        retry_with_backoff(
+        retry_with_backoff_started_by(
             &retry_policy,
             send_deadline,
+            send_by,
             is_retryable_send_error,
             || async { lose_send_answer(inner.send_transaction(envelope).await) },
         )
@@ -619,16 +827,21 @@ async fn send_and_confirm(
 
     let server_tx_hash = match server_tx_hash {
         Ok(h) => h,
-        Err(e) => {
-            return Err(handle_send_failure(
-                recorder,
-                intent,
-                &e,
-                &client.url,
-                timeout.as_secs(),
-                witness,
-            )
-            .await);
+        Err(StartedByError::StartByPassed { attempts }) => {
+            return Err(refuse_past_send_by(client, intent, attempts, timeout, recorder).await);
+        }
+        Err(StartedByError::Failed(e)) => {
+            return Err(SentByError::Failed(
+                handle_send_failure(
+                    recorder,
+                    intent,
+                    &e,
+                    &client.url,
+                    timeout.as_secs(),
+                    witness,
+                )
+                .await,
+            ));
         }
     };
 
@@ -654,13 +867,13 @@ async fn send_and_confirm(
             )
             .await;
         }
-        return Err(err);
+        return Err(SentByError::Failed(err));
     }
 
     let tx_hash = stellar_xdr::Hash(local_hash_bytes);
     tracing::info!(tx_hash = %redacted, "submit_transaction_and_wait: transaction submitted");
 
-    poll_for_confirmation(
+    Ok(poll_for_confirmation(
         || client.get_transaction_record(&tx_hash),
         &client.url,
         send_deadline,
@@ -670,27 +883,81 @@ async fn send_and_confirm(
         signer_kind,
         witness,
     )
-    .await
+    .await?)
 }
 
-/// Discards the endpoint's answer to this many accepted sends and reports a
-/// transport timeout in its place, so the resend of the same envelope after a
-/// lost answer is reachable from a test.
+/// Settles the record of a submission whose send-by instant passed before a
+/// `sendTransaction` attempt, after `attempts` earlier attempts, and returns
+/// the refusal.
+///
+/// Before the first attempt nothing was sent: the record settles as
+/// rejected under the timeout code. After an attempt the earlier send may
+/// have reached the network, so the record settles as an unknown outcome
+/// and the refusal names the transaction hash a reconciliation settles.
+async fn refuse_past_send_by(
+    client: &StellarRpcClient,
+    intent: &SubmissionIntent,
+    attempts: u32,
+    timeout: Duration,
+    recorder: Option<&dyn SubmissionRecorder>,
+) -> SentByError {
+    let (outcome, sent_tx_hash) = if attempts == 0 {
+        (
+            SubmissionOutcome::Rejected {
+                code: send_by_elapsed(client, timeout).code().to_owned(),
+                error: "the send-by deadline passed before sendTransaction; nothing was sent"
+                    .to_owned(),
+            },
+            None,
+        )
+    } else {
+        (
+            SubmissionOutcome::TransportAfterSend {
+                error: "the send-by deadline passed before a resend; the answer to the \
+                        earlier send is unknown"
+                    .to_owned(),
+            },
+            Some(intent.tx_hash.clone()),
+        )
+    };
+    if let Some(rec) = recorder {
+        rec.outcome(intent, &outcome).await;
+    }
+    SentByError::Elapsed {
+        stage: PreSendStage::Send,
+        sent_tx_hash,
+    }
+}
+
+#[cfg(feature = "test-hooks")]
+thread_local! {
+    /// The accepted sends on this thread whose answer is still to be lost.
+    static LOST_SEND_ANSWERS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Discards the endpoint's answer to the next `count` accepted sends on the
+/// calling thread and reports a transport timeout in its place, so the resend
+/// of the same envelope after a lost answer is reachable from a test.
 ///
 /// No endpoint answer makes the RPC client report a retryable send error: it
 /// reports every failed request as a submission failure. The toggle stands in
 /// for a transport that lost the answer after the endpoint took the bytes;
 /// the retry that follows it is the production one.
 ///
+/// A test sets it on a current-thread runtime, where its own submission
+/// sends. The count is per thread, so tests running in parallel do not
+/// disturb each other.
+///
 /// Only compiled when the `test-hooks` Cargo feature is enabled. Never include
 /// `test-hooks` in production or release builds.
 #[cfg(feature = "test-hooks")]
 #[doc(hidden)]
-pub static LOSE_SEND_ANSWERS: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
+pub fn lose_send_answers_on_this_thread(count: usize) {
+    LOST_SEND_ANSWERS.with(|lost| lost.set(count));
+}
 
-/// The send's answer, or a transport timeout in its place while
-/// [`LOSE_SEND_ANSWERS`] is above zero under `test-hooks`.
+/// The send's answer, or a transport timeout in its place while answers on
+/// this thread are to be lost under `test-hooks`.
 #[allow(
     clippy::result_large_err,
     reason = "passes the RPC client's own send result through to its retry classification"
@@ -700,13 +967,13 @@ fn lose_send_answer(
 ) -> Result<stellar_xdr::Hash, stellar_rpc_client::Error> {
     #[cfg(feature = "test-hooks")]
     if answer.is_ok()
-        && LOSE_SEND_ANSWERS
-            .try_update(
-                std::sync::atomic::Ordering::AcqRel,
-                std::sync::atomic::Ordering::Acquire,
-                |lost| lost.checked_sub(1),
-            )
-            .is_ok()
+        && LOST_SEND_ANSWERS.with(|lost| match lost.get().checked_sub(1) {
+            Some(left) => {
+                lost.set(left);
+                true
+            }
+            None => false,
+        })
     {
         return Err(stellar_rpc_client::Error::TransactionSubmissionTimeout);
     }
@@ -2751,7 +3018,7 @@ mod tests {
             struct Lost;
             impl Drop for Lost {
                 fn drop(&mut self) {
-                    LOSE_SEND_ANSWERS.store(0, Ordering::SeqCst);
+                    lose_send_answers_on_this_thread(0);
                 }
             }
 
@@ -2761,7 +3028,7 @@ mod tests {
             let authorization = case.grant();
 
             let _lost = Lost;
-            LOSE_SEND_ANSWERS.store(1, Ordering::SeqCst);
+            lose_send_answers_on_this_thread(1);
             case.submit(&recorder, authorization)
                 .await
                 .expect("the resend confirms");

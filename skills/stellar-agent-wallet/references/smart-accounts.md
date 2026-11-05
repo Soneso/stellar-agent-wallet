@@ -170,6 +170,8 @@ The chain and endpoints come from the resolved profile. Optional `--network` mus
 Optional RPC flags override testnet endpoints; a mainnet profile refuses either RPC flag, including equal values.
 Without a secondary flag, the profile's `secondary_rpc_url` applies. RPC flags refuse URLs containing credentials.
 
+Smart-account writes require a secondary RPC on the same network and on a host other than the primary's. The check compares normalized host names. Distinct names can resolve to the same machine; choose independently operated endpoints. Signing refuses unavailable or disagreeing ledger observations. The expiry bound assumes at least one independently operated endpoint reports the chain honestly. Ledger observations may differ by at most two in either order. Signature expiry is 100 ledgers beyond the lower observation.
+
 `rules get`, `rules get-spending-limit`, and all four deployment verbs accept `--profile`. Explicitly named missing profiles refuse.
 Mainnet seed, Ledger, and keyring signers must match the enrolled account. `rules verify-pins` reads both endpoints from the profile.
 
@@ -254,7 +256,7 @@ For a wallet transfer, pass `[{"scval": "<wallet Address XDR>"}, {"scval": "<rec
 | `--smart-account <C>` (req) | Smart-account executing the bundle |
 | `--rule-id <U32>` (req) | Context rule authorizing the bundle |
 | `--invocation <TARGET:FN:JSON_ARGS>` (req, repeatable, 1–50) | One invocation descriptor |
-| `--secondary-rpc-url <URL>` | Secondary RPC for cross-verification: the flag, else the profile's `secondary_rpc_url`, else a typed error. |
+| `--secondary-rpc-url <URL>` | Secondary RPC for cross-verification and the ledger observation of signing: the flag, else the profile's `secondary_rpc_url`, else `smart_account.ledger_witness_unavailable`. |
 | `--fee <STROOPS>` | Per-op base fee, default `100`; `auto[:pNN]` is rejected here (unlike the deploy verbs) |
 
 The policy gate values the encoded calls the transaction carries. A `transfer(Address from, Address to, i128 amount)` with the smart account as `from` counts against value criteria and bundle caps in the called contract's token. The destination is `to`, which can be an account or contract.
@@ -283,7 +285,7 @@ stellar-agent smart-account multicall \
 
 ## Upgrade timelock (`smart-account timelock`)
 
-Schedule, cancel, execute, and list pending operations on an OpenZeppelin timelock contract. The signer must hold the appropriate role for each write verb. All four share `--timelock <C>` (req), `--rpc-url`, `--secondary-rpc-url`, `--network`, `--profile`; the write verbs add the signer-source group. Write verbs (`schedule`, `cancel`, `execute`) refuse `mainnet`; `list-pending` is read-only and accepts `mainnet`. Without the secondary flag, the profile secondary applies. A configured mainnet secondary requires its provider attestation and a host distinct from the primary. Timelock uses the primary if no secondary is configured.
+Schedule, cancel, execute, and list pending operations on an OpenZeppelin timelock contract. The signer must hold the appropriate role for each write verb. All four share `--timelock <C>` (req), `--rpc-url`, `--secondary-rpc-url`, `--network`, `--profile`; the write verbs add the signer-source group. Write verbs (`schedule`, `cancel`, `execute`) refuse `mainnet`; `list-pending` is read-only and accepts `mainnet`. Without the secondary flag, the profile secondary applies. A configured mainnet secondary requires its provider attestation and a host distinct from the primary. If neither source supplies a secondary, `list-pending` reads through the primary alone. Timelock write verbs refuse with `smart_account.ledger_witness_unavailable`.
 
 | Verb | Role | Extra flags | Notes |
 |------|------|-------------|-------|

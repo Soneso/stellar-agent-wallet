@@ -878,6 +878,15 @@ impl Respond for SorobanRpcDispatcher {
                     .min(self.simulate_responses.len().saturating_sub(1));
                 self.simulate_responses[idx].clone()
             }
+            "getNetwork" => serde_json::json!({
+                "passphrase": "Test SDF Network ; September 2015",
+                "protocolVersion": 29
+            }),
+            "getLatestLedger" => serde_json::json!({
+                "id": "ab".repeat(32),
+                "sequence": 1000,
+                "protocolVersion": 29
+            }),
             _ => serde_json::json!({}),
         };
 

@@ -38,14 +38,15 @@
 # in this list it has NO testnet/RPC dependency at all (the interactive
 # enrollment server is purely loopback HTTP).
 #
-# The multicall suites deploy the vendored router themselves and need no
-# extra configuration. The library suite
-# (smart_account_multicall_testnet_acceptance) also reads two optional
-# overrides: STELLAR_AGENT_TESTNET_MULTICALL_ROUTER_ADDRESS names a deployed
-# router to use instead. STELLAR_AGENT_TESTNET_SECONDARY_RPC_URL names an
-# independent secondary endpoint for the cross-RPC check, which otherwise
-# compares the primary endpoint with itself. An override that does not parse
-# fails the suite.
+# Every suite that signs a smart-account authorization needs
+# STELLAR_AGENT_TESTNET_SECONDARY_RPC_URL: a testnet Soroban RPC endpoint on
+# a host other than the primary's, for the ledger witness and the cross-RPC
+# check. Such a suite fails when it is unset or does not parse.
+#
+# The multicall suites deploy the vendored router themselves. The library
+# suite (smart_account_multicall_testnet_acceptance) also reads an optional
+# override: STELLAR_AGENT_TESTNET_MULTICALL_ROUTER_ADDRESS names a deployed
+# router to use instead. An override that does not parse fails the suite.
 
 set -u -o pipefail
 

@@ -65,8 +65,8 @@ RPC URL flags refuse credentials. Configure credentialed endpoints in the profil
 An overriding URL gets the keyring credential only when it equals the profile's `rpc_url`.
 Store a provider key with `profile enroll-rpc-credential` (see [Provider credentials](../profiles.md#provider-credentials)).
 
-Smart-account rule commands use the effective secondary for cross-RPC checks. `smart-account multicall` requires a secondary endpoint.
-The signers manager and timelock commands use the primary when no secondary is configured.
+Smart-account writes require a secondary endpoint on the same network and on a host other than the primary's; see [Pre-submission checks](smart-account.md#pre-submission-checks).
+Read-only smart-account commands use the primary when no secondary is configured.
 A configured mainnet secondary requires `providers.secondary`, a host distinct from the primary, and a `[providers.primary]` record; the fallback provides no independent provider.
 `balances` keeps its testnet endpoint default. Standalone `friendbot` derives its endpoint from its network selector.
 `fees stats --profile` applies the endpoint rules above and keeps its flag allowlist. Without `--profile`, it uses `--rpc-url`, else the testnet endpoint.

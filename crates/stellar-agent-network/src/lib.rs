@@ -94,7 +94,8 @@ pub use builder::{Asset, ClassicOpBuilder};
 pub use client::{StellarRpcClient, TransactionStatusView};
 pub use context::{MainnetEndpointFlags, MainnetWriteContext, NetworkContext};
 pub use endpoint_identity::{
-    EndpointIdentity, MainnetOracle, SUPPORTED_PROTOCOL_VERSIONS, check_protocol_version,
+    EndpointIdentity, MainnetOracle, SUPPORTED_PROTOCOL_VERSIONS, SigningLedgerObservation,
+    check_protocol_version,
 };
 pub use fee_bump::{FeeBumpError, build_and_sign_fee_bump};
 pub use fee_bump_retry::submit_fee_bump_idempotent;
@@ -137,8 +138,10 @@ pub use submission_record::{
     WalletSubmissionRecorder,
 };
 pub use submit::{
-    MainnetSubmitGrant, SubmissionResult, SubmissionSignerKind, envelope_hash_hex, redact_tx_hash,
-    refuse_mainnet_write, submit_authorized_transaction_and_wait, submit_transaction_and_wait,
+    MainnetSubmitGrant, PreSendStage, SentByError, SubmissionResult, SubmissionSignerKind,
+    envelope_hash_hex, redact_tx_hash, refuse_mainnet_write,
+    submit_authorized_transaction_and_wait, submit_transaction_and_wait,
+    submit_transaction_and_wait_sent_by,
 };
 pub use transaction_record::TransactionRecord;
 pub use wasm_hash::{

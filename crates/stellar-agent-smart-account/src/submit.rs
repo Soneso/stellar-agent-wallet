@@ -19,7 +19,8 @@
 //!
 //! # Step ordering
 //!
-//! 1. Pre-flight: argument guards, then, for every distinct non-zero rule in
+//! 1. Pre-flight: argument guards, the witness configuration check, then, for
+//!    every distinct non-zero rule in
 //!    `auth_rule_ids` in ascending order, the rule locks, the signer-set
 //!    baseline read, the pinned-hash drift check and the signer-set
 //!    comparison (see [`PinCheck`]), then the source-account fetch. Each
@@ -27,11 +28,13 @@
 //!    bootstrap rule, is exempt from the rule lock, the signer-set check and
 //!    the pin check; it has no pins, and the submit path never reads a
 //!    baseline for it. A submission under rule 0 only may omit the check.
-//! 2. Simulate: primary RPC; harvest `latestLedger`; check the shape of the
-//!    simulated return value when the caller set one.
-//! 3. Required-check enforcement + `Option<*Check>` dispatch.
-//! 4. Cross-RPC simulate check (passthrough when `secondary_rpc_url` is `None`
-//!    or `multicall_check` is `None`).
+//! 2. Simulate: primary RPC; check the shape of the simulated return value
+//!    when the caller set one.
+//! 3. Ledger witness, mandatory on every submission: the primary and the
+//!    secondary observe the latest ledger, and the pair must agree within
+//!    [`MAX_SIGNING_LEDGER_SKEW`](crate::signing::ledger_witness::MAX_SIGNING_LEDGER_SKEW).
+//!    Required-check enforcement + `Option<*Check>` dispatch against that pair.
+//! 4. Cross-RPC simulate check (`multicall_check` is `Some`).
 //! 5. Sign: the simulated root invocation must be the caller's host function
 //!    and its sub-invocations must match the caller's
 //!    [`DeclaredSubInvocations`]; the wallet then signs its own root with the
@@ -46,7 +49,9 @@ use stellar_agent_core::observability::{RedactedStrkey, redact_strkey_first5_las
 use stellar_agent_core::smart_account::rule_id::ContextRuleId;
 use stellar_agent_network::signing::Signer;
 use stellar_agent_network::signing::envelope_signing::attach_signature;
-use stellar_agent_network::{StellarRpcClient, refuse_mainnet_write, submit_transaction_and_wait};
+use stellar_agent_network::{
+    SentByError, StellarRpcClient, refuse_mainnet_write, submit_transaction_and_wait_sent_by,
+};
 use stellar_baselib::account::{Account as BaselibAccount, AccountBehavior};
 use stellar_baselib::transaction::TransactionBehavior;
 use stellar_baselib::transaction_builder::{TransactionBuilder, TransactionBuilderBehavior};
@@ -63,11 +68,11 @@ use crate::error::{SimulationDivergenceSubCode, pin_check_reason};
 use crate::managers::auth_entry::{
     AuthorizationSimulation, PartialSorobanAuthorizationEntry, PreSubmitBudget,
     bound_pre_submit_stage, build_authorization_entry_with_sub_invocations,
-    complete_authorization_entry,
+    collect_mixed_signer_entries_within_budget, complete_authorization_entry_within_budget,
 };
-use crate::managers::authorization::collect_quorum_signatures;
+use crate::managers::authorization::{QuorumFailure, collect_quorum_signatures_within_budget};
 use crate::managers::rules::{
-    AUTH_VALIDITY_LEDGERS, BASE_FEE_STROOPS, ExpiryCheck, HorizonCheck, augment_with_oz_error_name,
+    BASE_FEE_STROOPS, ExpiryCheck, HorizonCheck, augment_with_oz_error_name,
     build_and_sign_delegated_g_key_entry, build_signed_invoke_envelope, chain_id_fingerprint,
     check_rule_not_expired_standalone, fingerprint_invocation, fingerprint_invocation_nodes,
     locate_smart_account_auth_entry, parse_c_strkey_to_smart_account, parse_min_resource_fee,
@@ -85,6 +90,10 @@ use crate::managers::verifiers::{
 use crate::signing::divergence::{
     AuthContextFingerprint, EnvelopeContext, FeeEnvelopeContext, NetworkContext, SequenceContext,
     SimulationContext,
+};
+use crate::signing::ledger_witness::{
+    ResolvedKeySigner, WitnessRequest, WitnessedLedgerBound, checked_secondary_rpc_url,
+    witness_signing_ledger,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -705,10 +714,13 @@ pub struct SubmitInvokeArgs<'a> {
     /// Primary Soroban RPC URL (simulate + submit).
     pub primary_rpc_url: &'a str,
 
-    /// Secondary Soroban RPC URL for the cross-RPC simulate check.
+    /// Secondary Soroban RPC URL: the ledger witness of every submission and
+    /// the second endpoint of the multicall cross-RPC check.
     ///
-    /// Step 4 is a passthrough when this is `None` or when `multicall_check`
-    /// is `None`.
+    /// The field stays optional so a caller passes its resolved configuration
+    /// through unchanged, but signing requires it: `None`, a malformed URL, or
+    /// a URL on the primary's host refuses with
+    /// [`SaError::LedgerWitnessUnavailable`] before the first request.
     pub secondary_rpc_url: Option<&'a str>,
 
     /// Stellar network passphrase for auth-digest + network-ID + envelope
@@ -720,8 +732,10 @@ pub struct SubmitInvokeArgs<'a> {
     pub chain_id: &'a str,
 
     /// RPC budget, spent as two independent per-phase budgets. All pre-submit
-    /// RPC stages (the pinned-hash drift check of each checked rule, initial
-    /// fetch, initial simulate, re-fetch, re-simulate) share ONE collective
+    /// stages (the pinned-hash drift check of each checked rule, initial
+    /// fetch, initial simulate, ledger witness, re-fetch, re-simulate, the
+    /// envelope signature, and the submission's steps before
+    /// `sendTransaction`) share ONE collective
     /// deadline of this duration, armed once before the first of them; the
     /// submit-and-confirm poll then spends its own separate budget of this
     /// same duration, so the base rule-install path worst case is ~2x this
@@ -768,7 +782,8 @@ pub struct SubmitInvokeArgs<'a> {
 
     /// Session-rule horizon check.
     ///
-    /// Fires after simulate (so `latestLedger` is known), before signing.
+    /// Fires after the ledger witness, before signing, against the lower
+    /// member of the witnessed pair.
     /// `rules.rs` install + update callers supply this; all others pass `None`.
     ///
     /// Field and setter are `pub(crate)` because [`HorizonCheck`] is an
@@ -778,8 +793,9 @@ pub struct SubmitInvokeArgs<'a> {
 
     /// Pre-submission rule expiry check.
     ///
-    /// Fires after simulate, before signing. Signing-path methods that consume
-    /// a `rule_id` supply this; install path passes `None`.
+    /// Fires after the ledger witness, before signing, against the higher
+    /// member of the witnessed pair. Signing-path methods that consume a
+    /// `rule_id` supply this; install path passes `None`.
     ///
     /// Field and setter are `pub(crate)` because [`ExpiryCheck`] is an
     /// internal orchestration type.  External callers leave this `None`.
@@ -792,7 +808,7 @@ pub struct SubmitInvokeArgs<'a> {
     /// Quorum authorization declaration (`None` for single-signer callers).
     ///
     /// When `Some`, `submit_signed_invoke` uses
-    /// [`collect_quorum_signatures`]
+    /// [`collect_quorum_signatures`](crate::managers::authorization::collect_quorum_signatures)
     /// to produce the full `SorobanAuthorizationEntry` set from the multi-signer
     /// group declaration and ignores [`Self::signer`] for auth-entry signing.
     /// When `None`, the original single-signer path via [`Self::signer`] is
@@ -914,12 +930,15 @@ pub struct SubmitInvokeArgs<'a> {
 ///
 /// A mainnet `network_passphrase` or a mainnet-pattern `primary_rpc_url` is
 /// refused with [`SaError::MainnetWriteForbidden`] before any signing call and
-/// any request.
+/// any request. A submission without a usable `secondary_rpc_url` is refused
+/// with [`SaError::LedgerWitnessUnavailable`] right after that check: every
+/// signature rests on an independent ledger observation.
 ///
 /// # Step ordering
 ///
 /// 1. **Pre-flight**: argument guards, the mainnet refusal of
-///    [`stellar_agent_network::refuse_mainnet_write`], then, for every
+///    [`stellar_agent_network::refuse_mainnet_write`], the local check of the
+///    witness configuration, then, for every
 ///    distinct non-zero rule in `auth_rule_ids` in ascending order and under
 ///    one pre-submit deadline (see [`PinCheck`]):
 ///    1. the rule locks: acquired here when the caller holds none, or found
@@ -934,22 +953,36 @@ pub struct SubmitInvokeArgs<'a> {
 ///    under rule 0 only may pass `pin_check: None`; any other submission
 ///    without a check is refused before network I/O. The locks acquired here
 ///    are released immediately before the send.
-/// 2. **Simulate**: primary RPC; harvest `latestLedger`. With
-///    `expected_return` set, the first simulated result must have the shape
-///    the caller reads an id from; another shape refuses before signing.
-/// 3. **Required-check enforcement + `Option<*Check>` dispatch**: for each
+/// 2. **Simulate**: primary RPC. With `expected_return` set, the first
+///    simulated result must have the shape the caller reads an id from;
+///    another shape refuses before signing.
+/// 3. **Ledger witness**: mandatory on every submission. Both endpoints
+///    observe the latest ledger under the pre-submit deadline, and the pair
+///    must agree within
+///    [`MAX_SIGNING_LEDGER_SKEW`](crate::signing::ledger_witness::MAX_SIGNING_LEDGER_SKEW).
+///    The bound rests on at least one endpoint reporting the chain honestly.
+///    **Required-check enforcement + `Option<*Check>` dispatch**: for each
 ///    name in `args.required_checks`, the corresponding `Option<*Check>` MUST
 ///    be `Some`. Refuses with [`SaError::SubmitCheckMissing`] if `None`.
 ///    Then dispatches each present `Some(_)` check; first `Deny` → return
-///    typed error.
-/// 4. **Cross-RPC simulate check** (`secondary_rpc_url.is_some()`): passthrough
-///    for single-invocation callers (who pass `multicall_check: None`). The
-///    multicall path activates this.
+///    typed error. The horizon limit is measured from the lower member of the
+///    witnessed pair, and a rule must still be valid at the higher one.
+/// 4. **Cross-RPC simulate check**: the multicall path compares both
+///    endpoints' contract hash and simulation here, beside the ledger
+///    witness. A single invocation passes `multicall_check: None` and has no
+///    such step.
 /// 5. **Sign**: the signed-tree binding first: the simulated root invocation
 ///    must equal `host_function` in contract, function name and every
 ///    argument, and its sub-invocations must match `sub_invocations` (see
-///    [`DeclaredSubInvocations`]). Then the auth entry over the wallet's own
-///    root and the accepted subtree via
+///    [`DeclaredSubInvocations`]). Every signer key the signing needs is read
+///    next; a witness pair gone stale by then is read again as a pair and the
+///    rule checks repeat against it. The pair must be fresh and the deadline
+///    open at the signing boundary, with no key lookup after that check; the
+///    signature expiry is 100 ledgers beyond the lower member. Every signer
+///    call from there on runs under the pre-submit deadline, so a signature
+///    that finishes after it is cut and nothing further is signed or sent.
+///    Then the auth entry over the wallet's
+///    own root and the accepted subtree via
 ///    `build_authorization_entry_with_sub_invocations` +
 ///    `complete_authorization_entry` + delegated G-key entry.
 /// 6. **Submit**: `resimulate_with_signed_auth` + `build_signed_invoke_envelope`
@@ -986,9 +1019,18 @@ pub struct SubmitInvokeArgs<'a> {
 ///   run to a verdict.
 /// - [`SaError::SubmitCheckMissing`] — a name in `required_checks` maps to a
 ///   `None` `Option<*Check>` field.
-/// - [`SaError::HorizonExceeded`] — `valid_until - latest_ledger > max_horizon`.
-/// - [`SaError::RuleExpired`] — `valid_until < latest_ledger` for the expiry
-///   check rule_id.
+/// - [`SaError::LedgerWitnessUnavailable`]: the secondary endpoint is absent,
+///   malformed, on the primary's host, on another network or unreachable, the
+///   primary gives no observation, the pair stays stale, or the deadline
+///   elapsed. Nothing was signed.
+/// - [`SaError::LedgerWitnessMismatch`] (wire code
+///   `simulation.divergence.ledger_skew`): the pair differs by more than the
+///   skew tolerance, a height is out of bounds, or the simulation height
+///   contradicts the pair. Nothing was signed.
+/// - [`SaError::HorizonExceeded`]: `valid_until` minus the lower witnessed
+///   ledger exceeds `max_horizon`.
+/// - [`SaError::RuleExpired`]: `valid_until` is below the higher witnessed
+///   ledger for the expiry check rule_id.
 /// - [`SaError::AuthEntryConstructionFailed`]: an argument guard refused
 ///   (stages `"pin_check_required"`, `"migrating_rule_mismatch"`,
 ///   `"rule_locks_without_pin_check"`, `"multicall_check_undeclared"`,
@@ -1061,6 +1103,14 @@ pub async fn submit_signed_invoke(
     // signer, the simulation, or the signed re-simulation.
     refuse_mainnet_sa(args.network_passphrase, args.primary_rpc_url)?;
 
+    // ── Witness configuration: before the first signer call and request ──────
+    // Every signature below rests on a second endpoint's ledger observation.
+    let secondary_rpc_url = checked_secondary_rpc_url(
+        args.primary_rpc_url,
+        args.secondary_rpc_url,
+        args.network_passphrase,
+    )?;
+
     // ── Derive source-account pubkey from the signer (four-axis migration #3) ──
     // Computed inline; signers.rs callers no longer pre-compute.
     let source_pubkey = args
@@ -1119,17 +1169,21 @@ pub async fn submit_signed_invoke(
     // the collective wall-clock budget of the pre-submit stages: for the
     // checked rules, the rule-lock wait (stage "rule_lock"), each baseline
     // read ("baseline_read"), each pinned-hash drift check ("pin_check") and
-    // each signer-set comparison ("signer_set_compare"); then the FOUR
+    // each signer-set comparison ("signer_set_compare"); then the FIVE
     // unconditional stages this path always runs: the initial account fetch,
-    // the initial simulate, and the re-fetch + re-simulate inside
-    // `resimulate_with_signed_auth` (see `PreSubmitBudget` /
+    // the initial simulate, the ledger witness, and the re-fetch + re-simulate
+    // inside `resimulate_with_signed_auth` (see `PreSubmitBudget` /
     // `bound_pre_submit_stage`). They share this SAME deadline rather than
-    // each re-arming a fresh `args.timeout` window. The optional intervening
+    // each re-arming a fresh `args.timeout` window, so the witness a signature
+    // rests on and the signed re-simulation answer to one freshness rule. The
+    // optional intervening
     // checks (the rule-expiry check and the multicall cross-RPC verification,
     // including its secondary-RPC simulate) are NOT bounded by this deadline:
-    // they run after it is armed and carry their own budgets. The final
-    // submit+poll stage (`submit_transaction_and_wait`) likewise keeps its
-    // own, separate `args.timeout` budget.
+    // they run after it is armed and carry their own budgets. Every
+    // authorization signature, the envelope signature, the submission's steps
+    // before `sendTransaction` and the start of every send attempt, a resend
+    // included, answer to this deadline; an attempt in flight and the
+    // confirmation poll keep their own, separate `args.timeout` budget.
     let pre_submit_budget = PreSubmitBudget {
         deadline: tokio::time::Instant::now() + args.timeout,
         total: args.timeout,
@@ -1205,49 +1259,29 @@ pub async fn submit_signed_invoke(
     .await?
     .map_err(|e| auth_payload_err(format!("simulate_transaction_envelope failed: {e}")))?;
 
-    // ── Step 3 continued: Option<*Check> dispatch ─────────────────────────────
+    // ── Step 3 continued: ledger witness + Option<*Check> dispatch ────────────
     //
-    // Horizon check: fires AFTER simulate (latestLedger known) BEFORE signing.
-    // OZ storage.rs:649-652 (install) and :786-787 (update), SHA `a9c4216`,
-    // reject only `valid_until < current_ledger` (PastValidUntil = 3005).
-    // The wallet-side horizon cap is an operator-configurable safety discipline.
-    if let Some(HorizonCheck {
-        valid_until,
-        max_horizon,
-        rule_id_or_pending,
-    }) = args.horizon_check
-    {
-        let latest_ledger = sim_response.latest_ledger;
-        let horizon = valid_until.saturating_sub(latest_ledger);
-        if horizon > max_horizon {
-            return Err(SaError::HorizonExceeded {
-                rule_id_or_pending,
-                requested_horizon: horizon,
-                max_horizon,
-            });
-        }
-    }
-
-    // Expiry check: fires AFTER simulate (latestLedger known) BEFORE signing.
-    // OZ storage.rs:280-285 (SHA `a9c4216`): strict-< check on valid_until.
-    // UnvalidatedContext = 3002 per OZ mod.rs:542 SHA `a9c4216`.
-    if let Some(ExpiryCheck { rule_id }) = args.expiry_check {
-        let latest_ledger = sim_response.latest_ledger;
-        check_rule_not_expired_standalone(
-            args.primary_rpc_url,
-            args.network_passphrase,
-            args.timeout,
-            target_contract_scaddr.clone(),
-            rule_id,
-            &source_pubkey_strkey,
-            latest_ledger,
-        )
-        .await?;
-    }
+    // The primary answered the simulation, so its height decides nothing on
+    // its own: both endpoints observe the latest ledger before any check that
+    // reads a height, on every submission.
+    let witness_request = WitnessRequest {
+        primary: &primary_rpc_client,
+        secondary_rpc_url,
+        network_passphrase: args.network_passphrase,
+        budget: pre_submit_budget,
+    };
+    let simulation_witness = witness_signing_ledger(&witness_request).await?;
+    enforce_rule_ledger_checks(
+        &args,
+        &target_contract_scaddr,
+        &source_pubkey_strkey,
+        &simulation_witness,
+    )
+    .await?;
 
     // ── Step 4: Cross-RPC trust-anchor check ─────────────────────────────────
-    // When secondary_rpc_url.is_some() AND multicall_check.is_some(), dispatch
-    // to the cross-RPC WASM-hash + simulate comparators (4-way equality):
+    // When multicall_check.is_some(), dispatch to the cross-RPC WASM-hash +
+    // simulate comparators (4-way equality):
     //   (a) cross_rpc_compare_wasm_hashes — verifies registry SHA, primary RPC
     //       on-chain hash, secondary RPC on-chain hash, and MULTICALL_WASM_SHA256
     //       binary const are byte-exactly equal.
@@ -1255,10 +1289,11 @@ pub async fn submit_signed_invoke(
     //       identical simulation results for the multicall invocation by
     //       re-simulating on the secondary RPC and comparing responses.
     //
-    // Single-invocation callers always pass multicall_check: None → this branch
-    // is a no-op for them (passthrough).
-    if let (Some(secondary_url), Some(mc)) = (args.secondary_rpc_url, args.multicall_check.as_ref())
-    {
+    // The comparators exclude ledger heights; the witness above supplies those
+    // for this path as for every other. Single-invocation callers pass
+    // multicall_check: None and have no contract hash or simulation to compare
+    // here.
+    if let Some(mc) = args.multicall_check.as_ref() {
         // Defence-in-depth: verify the MulticallCheck was built for the same
         // network passphrase as this submission context. A mismatch here
         // indicates a programming error (wrong check passed to wrong network).
@@ -1283,7 +1318,7 @@ pub async fn submit_signed_invoke(
         )
         .await?;
         let secondary_hash = crate::multicall::fetch_wasm_hash_via_rpc(
-            secondary_url,
+            secondary_rpc_url,
             &mc.registry_entry_address,
             args.timeout,
         )
@@ -1297,7 +1332,7 @@ pub async fn submit_signed_invoke(
         // (b) Cross-RPC simulate comparison: re-simulate on secondary RPC and
         // compare normalized response against primary result (including
         // sub_invocations byte-exact; see cross_rpc_compare_simulate_responses).
-        let secondary_server = stellar_rpc_client::Client::new(secondary_url).map_err(|e| {
+        let secondary_server = stellar_rpc_client::Client::new(secondary_rpc_url).map_err(|e| {
             auth_payload_err(format!("secondary RPC Client construction failed: {e}"))
         })?;
         let secondary_sim = secondary_server
@@ -1424,15 +1459,65 @@ pub async fn submit_signed_invoke(
     }
 
     // Soroban-RPC's simulateTransaction returns signature_expiration_ledger = 0
-    // (placeholder). Overwrite with latest_ledger + AUTH_VALIDITY_LEDGERS before
-    // signing. Cross-reference: js-stellar-base auth.js:132.
+    // (placeholder). Overwrite with the witnessed bound before signing.
+    // Cross-reference: js-stellar-base auth.js:132.
     //
-    // Validate the RPC-supplied latest_ledger before binding it into the
-    // auth-digest preimage.
+    // The simulation's own height never reaches the preimage, and it must not
+    // contradict the observations taken right after it.
     validate_latest_ledger(sim_response.latest_ledger)?;
-    let signature_expiration_ledger = sim_response
-        .latest_ledger
-        .saturating_add(AUTH_VALIDITY_LEDGERS);
+    simulation_witness.check_simulation_height(sim_response.latest_ledger)?;
+
+    // ── Signer keys: read before the last witness check ──────────────────────
+    // A key lookup can reach a hardware device or a keyring and take any time.
+    // Every key the signing below reads is resolved here, so the freshness
+    // check at the signing boundary is not followed by a lookup. The envelope
+    // signer's key is the source key read above.
+    let envelope_signer = ResolvedKeySigner::with_key(args.signer, source_pubkey);
+    let rule_signer = match &args.ed25519_rule_signer {
+        Some(rule_signer) => Some((
+            ResolvedKeySigner::resolve(rule_signer.signer)
+                .await
+                .map_err(|e| auth_payload_err(format!("signer public_key fetch failed: {e}")))?,
+            &rule_signer.verifier,
+        )),
+        None => None,
+    };
+    let mut quorum_signers: Vec<ResolvedKeySigner<'_>> = Vec::new();
+    if args.authorization.is_some() {
+        for &signer in args.signers {
+            quorum_signers.push(ResolvedKeySigner::resolve(signer).await.map_err(|e| {
+                SaError::AuthEntryConstructionFailed {
+                    stage: "quorum_signatures",
+                    redacted_reason: format!(
+                        "{}: quorum collection failed: public_key fetch failed: {e}",
+                        args.op_label
+                    ),
+                }
+            })?);
+        }
+    }
+    let quorum_signer_refs: Vec<&(dyn Signer + Send + Sync)> = quorum_signers
+        .iter()
+        .map(|signer| signer as &(dyn Signer + Send + Sync))
+        .collect();
+
+    // The steps since the witness can outlast an observation. A stale pair is
+    // read again as a pair, and every check that read a height runs against
+    // the new one; a signature never rests on a pair past the deadline.
+    let ledger_bound = if simulation_witness.is_stale(tokio::time::Instant::now()) {
+        let refreshed = witness_signing_ledger(&witness_request).await?;
+        enforce_rule_ledger_checks(
+            &args,
+            &target_contract_scaddr,
+            &source_pubkey_strkey,
+            &refreshed,
+        )
+        .await?;
+        refreshed
+    } else {
+        simulation_witness
+    };
+    let signature_expiration_ledger = ledger_bound.signature_expiration_ledger()?;
 
     // Network ID (sha256 of passphrase) for the auth-digest preimage.
     let network_id: [u8; 32] = Sha256::digest(args.network_passphrase.as_bytes()).into();
@@ -1496,6 +1581,15 @@ pub async fn submit_signed_invoke(
     //   Build the partial auth entry over `signed_root` (refusal-path checks
     //   fire here), then sign it with the Delegated G-key or the
     //   External-Ed25519 rule signer.
+    //
+    // The signing boundary: the last await before the first signature lies
+    // above. The signers answer from keys resolved before this freshness
+    // check. The pair must still be fresh and the deadline open here.
+    //
+    // Every signer call below, on each arm, runs under the same deadline
+    // (`sign_within_budget`): a signature that finishes after it is cut, and
+    // nothing further is signed or sent.
+    ledger_bound.ensure_fresh(pre_submit_budget)?;
 
     let auth_entries: Vec<SorobanAuthorizationEntry> = if let Some(authz) = args.authorization {
         // ── Quorum path ───────────────────────────────────────────────────────
@@ -1520,10 +1614,10 @@ pub async fn submit_signed_invoke(
                 ),
             });
         }
-        collect_quorum_signatures(
+        collect_quorum_signatures_within_budget(
             checked_rules,
             authz,
-            args.signers,
+            &quorum_signer_refs,
             auth_scaddr.clone(),
             function_name.clone(),
             invoke.args.to_vec(),
@@ -1532,11 +1626,15 @@ pub async fn submit_signed_invoke(
             &envelope,
             args.network_passphrase,
             signature_expiration_ledger,
+            Some(pre_submit_budget),
         )
         .await
-        .map_err(|e| SaError::AuthEntryConstructionFailed {
-            stage: "quorum_signatures",
-            redacted_reason: format!("{}: quorum collection failed: {}", args.op_label, e),
+        .map_err(|failure| match failure {
+            QuorumFailure::Deadline(error) => error,
+            QuorumFailure::Quorum(e) => SaError::AuthEntryConstructionFailed {
+                stage: "quorum_signatures",
+                redacted_reason: format!("{}: quorum collection failed: {}", args.op_label, e),
+            },
         })?
     } else {
         // ── Single-signer path ────────────────────────────────────────────────
@@ -1577,7 +1675,7 @@ pub async fn submit_signed_invoke(
         // default Delegated G-key path (nested `require_auth_for_args`
         // satisfied by a separate G-key entry).  See `Ed25519RuleSigner`'s
         // rustdoc for the on-chain rationale.
-        if let Some(rule_signer) = &args.ed25519_rule_signer {
+        if let Some((resolved, verifier)) = &rule_signer {
             // External-Ed25519 arm: sign via the crate-internal mixed-signer
             // collector with a single descriptor.  Reuses the SAME
             // `collect_mixed_signer_entries` substrate the quorum path uses
@@ -1585,32 +1683,39 @@ pub async fn submit_signed_invoke(
             // `AuthPayload` ScVal shape and the "no G-key for External"
             // omission are covered by that function's own offline tests.
             let mixed_signers = [crate::managers::auth_entry::MixedSigner {
-                signer: rule_signer.signer,
+                signer: resolved,
                 kind: crate::managers::auth_entry::MixedSignerKind::ExternalEd25519 {
-                    verifier: rule_signer.verifier.clone(),
+                    verifier: (*verifier).clone(),
                 },
             }];
-            crate::managers::auth_entry::collect_mixed_signer_entries(
+            collect_mixed_signer_entries_within_budget(
                 checked_rules,
                 partial,
                 &mixed_signers,
                 signature_expiration_ledger,
                 args.network_passphrase,
+                Some(pre_submit_budget),
             )
             .await?
         } else {
-            // Delegated arm (unchanged): sign the auth-digest, then build the
+            // Delegated arm: sign the auth-digest, then build the
             // secondary G-key sub-auth entry `__check_auth` requires for
             // `Signer::Delegated(addr)`.
-            let signed_entry =
-                complete_authorization_entry(checked_rules, partial.clone(), args.signer).await?;
+            let signed_entry = complete_authorization_entry_within_budget(
+                checked_rules,
+                partial.clone(),
+                &envelope_signer,
+                Some(pre_submit_budget),
+            )
+            .await?;
 
             let delegated_entry: SorobanAuthorizationEntry = build_and_sign_delegated_g_key_entry(
                 &auth_scaddr,
                 &partial.auth_digest,
                 signature_expiration_ledger,
-                args.signer,
+                &envelope_signer,
                 args.network_passphrase,
+                Some(pre_submit_budget),
             )
             .await?;
 
@@ -1678,13 +1783,26 @@ pub async fn submit_signed_invoke(
         &resim_response,
     )?;
 
-    let final_signed_xdr =
-        attach_signature(&prepared_envelope_xdr, args.signer, args.network_passphrase)
-            .await
-            .map_err(|e| SaError::DeploymentFailed {
-                phase: "submit",
-                redacted_reason: format!("{} envelope signing failed: {e}", args.op_label),
-            })?;
+    // The envelope is signed only while the deadline the witness rests on is
+    // open, through the key resolved before the signing boundary. A software
+    // key signs without yielding, so the deadline is checked before the
+    // bounded signature as well.
+    pre_submit_budget.check_at("sign_envelope", "auth_payload")?;
+    let final_signed_xdr = bound_pre_submit_stage(
+        pre_submit_budget,
+        "sign_envelope",
+        "auth_payload",
+        attach_signature(
+            &prepared_envelope_xdr,
+            &envelope_signer,
+            args.network_passphrase,
+        ),
+    )
+    .await?
+    .map_err(|e| SaError::DeploymentFailed {
+        phase: "submit",
+        redacted_reason: format!("{} envelope signing failed: {e}", args.op_label),
+    })?;
 
     // ── Byte-identity invariant tripwire ─────────────────────────────────────
     // Verify that the just-built final_signed_xdr carries exactly the auth
@@ -1756,23 +1874,36 @@ pub async fn submit_signed_invoke(
     // envelope is final.
     drop(owned_rule_locks);
 
+    // Nothing is sent after the pre-submit deadline: the steps before
+    // `sendTransaction` end at it, and no send attempt, a resend of the same
+    // bytes included, starts after it. The confirmation poll keeps its own
+    // `args.timeout` budget.
     let sa_submit_timing_t_submit = std::time::Instant::now();
-    let submission = submit_transaction_and_wait(
+    let submission = submit_transaction_and_wait_sent_by(
         &primary_rpc_client,
         &final_signed_xdr,
+        pre_submit_budget.deadline,
         args.timeout,
         args.network_passphrase,
         None,
         args.submission_recorder,
     )
     .await
-    .map_err(|e| map_submit_error(&e, args.op_label, &final_signed_xdr))?;
+    .map_err(|e| {
+        map_sent_by_error(
+            e,
+            pre_submit_budget,
+            args.timeout,
+            args.op_label,
+            &final_signed_xdr,
+        )
+    })?;
     tracing::debug!(
         target: "sa_submit_timing",
         stage = "submit_and_wait",
         elapsed_ms = u64::try_from(sa_submit_timing_t_submit.elapsed().as_millis())
             .unwrap_or(u64::MAX),
-        "sa_submit_timing: submit+poll stage elapsed (separate args.timeout budget)"
+        "sa_submit_timing: submit+poll stage elapsed (poll under the separate args.timeout budget)"
     );
 
     if args.emit_observability_logs {
@@ -1807,6 +1938,54 @@ pub async fn submit_signed_invoke(
     })
 }
 
+/// Runs the checks of a submission that read a ledger height, against the
+/// witnessed pair.
+///
+/// The session-rule horizon is measured from the lower member, so a higher
+/// claim cannot shorten a requested horizon below the cap. A rule must be
+/// valid at the higher member, so a lower claim cannot revive an expired rule.
+async fn enforce_rule_ledger_checks(
+    args: &SubmitInvokeArgs<'_>,
+    target_contract: &ScAddress,
+    source_pubkey_strkey: &str,
+    bound: &WitnessedLedgerBound,
+) -> Result<(), SaError> {
+    // OZ storage.rs:649-652 (install) and :786-787 (update), SHA `a9c4216`,
+    // reject only `valid_until < current_ledger` (PastValidUntil = 3005).
+    // The wallet-side horizon cap is an operator-configurable safety discipline.
+    if let Some(HorizonCheck {
+        valid_until,
+        max_horizon,
+        rule_id_or_pending,
+    }) = args.horizon_check
+    {
+        let horizon = valid_until.saturating_sub(bound.lower());
+        if horizon > max_horizon {
+            return Err(SaError::HorizonExceeded {
+                rule_id_or_pending,
+                requested_horizon: horizon,
+                max_horizon,
+            });
+        }
+    }
+
+    // OZ storage.rs:280-285 (SHA `a9c4216`): strict-< check on valid_until.
+    // UnvalidatedContext = 3002 per OZ mod.rs:542 SHA `a9c4216`.
+    if let Some(ExpiryCheck { rule_id }) = args.expiry_check {
+        check_rule_not_expired_standalone(
+            args.primary_rpc_url,
+            args.network_passphrase,
+            args.timeout,
+            target_contract.clone(),
+            rule_id,
+            source_pubkey_strkey,
+            bound.higher(),
+        )
+        .await?;
+    }
+    Ok(())
+}
+
 /// Refuses a write declared for mainnet or aimed at a mainnet-pattern endpoint
 /// with [`SaError::MainnetWriteForbidden`].
 ///
@@ -1815,6 +1994,44 @@ pub async fn submit_signed_invoke(
 /// functions call it before any signing call and any request.
 pub(crate) fn refuse_mainnet_sa(network_passphrase: &str, rpc_url: &str) -> Result<(), SaError> {
     refuse_mainnet_write(network_passphrase, rpc_url).map_err(|_| SaError::MainnetWriteForbidden)
+}
+
+/// Maps a failed submission sent by the pre-submit deadline `budget` into the
+/// smart-account error surface.
+///
+/// A deadline that passed before anything was sent is the pre-submit refusal
+/// of the stage it passed at. A deadline that passed before a resend, after a
+/// send whose answer was lost, leaves that send's outcome unknown: it maps as
+/// the unresolved timeout of the transaction sent, so the caller reconciles
+/// its hash instead of rebuilding. `timeout` is the submission's own budget.
+/// Every other failure maps as [`map_submit_error`] maps it.
+pub(crate) fn map_sent_by_error(
+    error: SentByError,
+    budget: PreSubmitBudget,
+    timeout: std::time::Duration,
+    op_label: &'static str,
+    signed_xdr: &str,
+) -> SaError {
+    match error {
+        SentByError::Elapsed {
+            stage,
+            sent_tx_hash: None,
+        } => budget.send_refusal(stage),
+        SentByError::Elapsed {
+            sent_tx_hash: Some(tx_hash),
+            ..
+        } => map_submit_error(
+            &stellar_agent_core::error::WalletError::Submission(
+                stellar_agent_core::error::SubmissionError::TxTimeout {
+                    tx_hash,
+                    seconds: timeout.as_secs(),
+                },
+            ),
+            op_label,
+            signed_xdr,
+        ),
+        SentByError::Failed(error) => map_submit_error(&error, op_label, signed_xdr),
+    }
 }
 
 /// Maps a submit-layer failure into the smart-account error surface.
@@ -2613,6 +2830,62 @@ mod tests {
             "expected the mainnet refusal, got {mapped:?}"
         );
         assert_eq!(mapped.wire_code(), "network.mainnet_write_forbidden");
+    }
+
+    /// A send-by deadline that passes before a resend, after a send whose
+    /// answer was lost, maps as the unresolved timeout of the transaction
+    /// sent, so the caller reconciles its hash. One that passes before
+    /// anything was sent maps as the pre-submit refusal of its stage.
+    #[tokio::test]
+    async fn a_resend_refused_at_the_deadline_is_an_unresolved_submission() {
+        let budget = PreSubmitBudget {
+            deadline: tokio::time::Instant::now(),
+            total: std::time::Duration::from_secs(5),
+        };
+        let tx_hash = "ab".repeat(32);
+
+        let mapped = map_sent_by_error(
+            SentByError::Elapsed {
+                stage: stellar_agent_network::PreSendStage::Send,
+                sent_tx_hash: Some(tx_hash.clone()),
+            },
+            budget,
+            std::time::Duration::from_secs(30),
+            "multicall",
+            "AAAAAgAAAAA=",
+        );
+        assert_eq!(mapped.wire_code(), "submission.tx_timeout");
+        match &mapped {
+            SaError::SubmissionUnresolved {
+                tx_hash: Some(reported),
+                timeout_seconds: Some(30),
+                envelope_hash: Some(_),
+                ..
+            } => assert_eq!(reported, &tx_hash),
+            other => panic!("expected the unresolved submission, got {other:?}"),
+        }
+
+        let refused = map_sent_by_error(
+            SentByError::Elapsed {
+                stage: stellar_agent_network::PreSendStage::Send,
+                sent_tx_hash: None,
+            },
+            budget,
+            std::time::Duration::from_secs(30),
+            "multicall",
+            "AAAAAgAAAAA=",
+        );
+        match &refused {
+            SaError::AuthEntryConstructionFailed {
+                stage: "auth_payload",
+                redacted_reason,
+            } => assert!(
+                redacted_reason
+                    .starts_with("send_transaction exceeded collective pre-submit budget"),
+                "{redacted_reason}"
+            ),
+            other => panic!("expected the pre-submit refusal, got {other:?}"),
+        }
     }
 
     // ── host_function_kind_str closed-set ──────────────────────────────────────
@@ -3608,6 +3881,1108 @@ mod tests {
             assert!(
                 refusal(check(&[nested], &declaration))
                     .contains("sub-invocation 0 carries nested sub-invocations")
+            );
+        }
+    }
+
+    // ── The ledger witness ──────────────────────────────────────────────────
+
+    mod witness {
+        use std::sync::Mutex;
+        use std::time::Duration;
+
+        use async_trait::async_trait;
+        use sha2::{Digest, Sha256};
+        use stellar_agent_core::error::WalletError;
+        use stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE;
+        use stellar_agent_core::smart_account::rule_id::{ContextRuleId, encode_context_rule_ids};
+        use stellar_agent_network::WebAuthnAssertion;
+        use stellar_agent_network::signing::test_doubles::CountingSigner;
+        use stellar_agent_network::signing::{
+            MessagePayload, Signer, SmartAccountAuthDigest, SorobanAuthPayload, TxSigningPayload,
+        };
+        use stellar_agent_test_support::auth_tree_rpc::{AuthTreeEndpoint, AuthTreeRpc};
+        use stellar_agent_test_support::second_loopback_host;
+        use stellar_agent_test_support::signed_envelope::{
+            account_id_for_seed, public_key_for_seed,
+        };
+        use stellar_xdr::{
+            ContractExecutable, ContractId, Hash, HostFunction, InvokeContractArgs, Limits,
+            OperationBody, ScAddress, ScContractInstance, ScSymbol, SorobanAuthorizationEntry,
+            SorobanAuthorizedFunction, SorobanAuthorizedInvocation, SorobanCredentials,
+            TransactionEnvelope, WriteXdr,
+        };
+
+        use super::super::{
+            DeclaredSubInvocations, Ed25519RuleSigner, HorizonCheck, MulticallCheck,
+            SubmitInvokeArgs, SubmitInvokeResult, submit_signed_invoke,
+        };
+        use crate::SaError;
+        use crate::managers::auth_entry::{network_id_of, soroban_authorization_preimage};
+        use crate::managers::authorization::{AuthorizationInfo, Combinator, SignerGroup};
+        use crate::multicall::MULTICALL_WASM_SHA256;
+
+        const SEED: [u8; 32] = [0x61; 32];
+        const WALLET: [u8; 32] = [0x62; 32];
+        const LEDGER: u32 = 1000;
+        const SKEW_CODE: &str = "simulation.divergence.ledger_skew";
+        const UNAVAILABLE_CODE: &str = "smart_account.ledger_witness_unavailable";
+
+        fn wallet() -> ScAddress {
+            ScAddress::Contract(ContractId(Hash(WALLET)))
+        }
+
+        fn wallet_strkey() -> String {
+            stellar_strkey::Contract(WALLET).to_string().to_string()
+        }
+
+        /// The call the simulated tree places under a multicall's `exec`.
+        fn nested_call() -> InvokeContractArgs {
+            InvokeContractArgs {
+                contract_address: ScAddress::Contract(ContractId(Hash([0x63; 32]))),
+                function_name: ScSymbol("nested".try_into().unwrap()),
+                args: Default::default(),
+            }
+        }
+
+        fn leaf(call: InvokeContractArgs) -> SorobanAuthorizedInvocation {
+            SorobanAuthorizedInvocation {
+                function: SorobanAuthorizedFunction::ContractFn(call),
+                sub_invocations: Default::default(),
+            }
+        }
+
+        /// The honest tree of `invoke`: a multicall's `exec` carries the nested
+        /// call, every other call stands alone.
+        fn tree_of(invoke: &InvokeContractArgs) -> SorobanAuthorizedInvocation {
+            let subs = if invoke.function_name.0.as_slice() == b"exec" {
+                vec![leaf(nested_call())]
+            } else {
+                Vec::new()
+            };
+            SorobanAuthorizedInvocation {
+                function: SorobanAuthorizedFunction::ContractFn(invoke.clone()),
+                sub_invocations: subs.try_into().unwrap(),
+            }
+        }
+
+        /// An endpoint for `passphrase` at `ledger` that serves the wallet as
+        /// the registered multicall router.
+        fn endpoint_on(passphrase: &str, ledger: u32) -> AuthTreeRpc {
+            let wasm_hash: [u8; 32] = hex::decode(MULTICALL_WASM_SHA256)
+                .unwrap()
+                .try_into()
+                .unwrap();
+            AuthTreeRpc::new(passphrase, wallet())
+                .account(&account_id_for_seed(SEED))
+                .instance(
+                    wallet(),
+                    ScContractInstance {
+                        executable: ContractExecutable::Wasm(Hash(wasm_hash)),
+                        storage: None,
+                    },
+                )
+                .latest_ledger(ledger)
+                .tree(|invoke| Some(tree_of(invoke)))
+        }
+
+        fn endpoint(ledger: u32) -> AuthTreeRpc {
+            endpoint_on(TESTNET_PASSPHRASE, ledger)
+        }
+
+        /// A counting signer that keeps every authorization digest it signs,
+        /// smart-account and classic, and whose envelope signature takes
+        /// `envelope_delay` when one is set, as a hardware device's can.
+        struct RecordingSigner {
+            inner: CountingSigner,
+            auth_digests: Mutex<Vec<[u8; 32]>>,
+            envelope_delay: Option<Duration>,
+        }
+
+        impl RecordingSigner {
+            fn new() -> Self {
+                Self {
+                    inner: CountingSigner::new(SEED),
+                    auth_digests: Mutex::new(Vec::new()),
+                    envelope_delay: None,
+                }
+            }
+
+            fn with_envelope_delay(delay: Duration) -> Self {
+                Self {
+                    envelope_delay: Some(delay),
+                    ..Self::new()
+                }
+            }
+        }
+
+        #[async_trait]
+        impl Signer for RecordingSigner {
+            async fn sign_tx_payload(
+                &self,
+                payload: &TxSigningPayload,
+            ) -> Result<[u8; 64], WalletError> {
+                if let Some(delay) = self.envelope_delay {
+                    tokio::time::sleep(delay).await;
+                }
+                self.inner.sign_tx_payload(payload).await
+            }
+
+            async fn sign_auth_digest(
+                &self,
+                digest: &SmartAccountAuthDigest,
+            ) -> Result<[u8; 64], WalletError> {
+                self.auth_digests.lock().unwrap().push(*digest.as_bytes());
+                self.inner.sign_auth_digest(digest).await
+            }
+
+            async fn sign_soroban_address_auth_payload(
+                &self,
+                payload: &SorobanAuthPayload,
+            ) -> Result<[u8; 64], WalletError> {
+                self.auth_digests.lock().unwrap().push(*payload.as_bytes());
+                self.inner.sign_soroban_address_auth_payload(payload).await
+            }
+
+            async fn sign_message(
+                &self,
+                payload: &MessagePayload,
+            ) -> Result<[u8; 64], WalletError> {
+                self.inner.sign_message(payload).await
+            }
+
+            async fn sign_webauthn_assertion(
+                &self,
+                digest: &SmartAccountAuthDigest,
+                credential_id: &[u8],
+            ) -> Result<WebAuthnAssertion, WalletError> {
+                self.inner
+                    .sign_webauthn_assertion(digest, credential_id)
+                    .await
+            }
+
+            async fn public_key(&self) -> Result<stellar_strkey::ed25519::PublicKey, WalletError> {
+                self.inner.public_key().await
+            }
+        }
+
+        #[derive(Clone, Copy, Debug)]
+        enum SigningPath {
+            Single,
+            Multicall,
+        }
+
+        const PATHS: [SigningPath; 2] = [SigningPath::Single, SigningPath::Multicall];
+
+        impl SigningPath {
+            fn rule_ids(self) -> Vec<ContextRuleId> {
+                match self {
+                    Self::Single => vec![ContextRuleId::new(0)],
+                    Self::Multicall => vec![ContextRuleId::new(0), ContextRuleId::new(0)],
+                }
+            }
+
+            fn host_function(self) -> HostFunction {
+                let function = match self {
+                    Self::Single => "noop",
+                    Self::Multicall => "exec",
+                };
+                HostFunction::InvokeContract(InvokeContractArgs {
+                    contract_address: wallet(),
+                    function_name: ScSymbol(function.try_into().unwrap()),
+                    args: Default::default(),
+                })
+            }
+        }
+
+        struct Outcome {
+            result: Result<SubmitInvokeResult, SaError>,
+            signs: usize,
+            /// Public-key reads of the envelope signer.
+            key_reads: usize,
+            auth_digests: Vec<[u8; 32]>,
+            signed_simulations: usize,
+            sent: Vec<TransactionEnvelope>,
+        }
+
+        impl Outcome {
+            /// Asserts the refusal `code` before any signing primitive, any
+            /// signed re-simulation and any send.
+            fn assert_refused(&self, code: &str, case: &str) {
+                match &self.result {
+                    Err(error) => assert_eq!(error.wire_code(), code, "{case}: {error:?}"),
+                    Ok(_) => panic!("{case}: the submission went through"),
+                }
+                assert_eq!(self.signs, 0, "{case}: nothing is signed");
+                assert_eq!(self.signed_simulations, 0, "{case}: nothing re-simulated");
+                assert!(self.sent.is_empty(), "{case}: nothing is sent");
+            }
+
+            /// Asserts that every signed entry of the sent envelope carries
+            /// `expiry` and that the digest signed for it commits to `expiry`:
+            /// the smart account's own entry over its rule ids, a delegated
+            /// signer's entry over its preimage alone.
+            fn assert_every_signature_expires_at(
+                &self,
+                expiry: u32,
+                rule_ids: &[ContextRuleId],
+                case: &str,
+            ) {
+                assert!(
+                    self.result.is_ok(),
+                    "{case}: {:?}",
+                    self.result.as_ref().err()
+                );
+                let [TransactionEnvelope::Tx(envelope)] = self.sent.as_slice() else {
+                    panic!("{case}: one sent v1 envelope")
+                };
+                let OperationBody::InvokeHostFunction(op) = &envelope.tx.operations[0].body else {
+                    panic!("{case}: an invoke operation")
+                };
+                assert!(!op.auth.is_empty(), "{case}: a signed entry");
+                let rule_ids_xdr = encode_context_rule_ids(rule_ids).unwrap();
+                for entry in op.auth.iter() {
+                    let SorobanAuthorizationEntry {
+                        credentials: SorobanCredentials::Address(credentials),
+                        root_invocation,
+                    } = entry
+                    else {
+                        panic!("{case}: address credentials")
+                    };
+                    assert_eq!(credentials.signature_expiration_ledger, expiry, "{case}");
+                    let preimage = soroban_authorization_preimage(
+                        network_id_of(TESTNET_PASSPHRASE),
+                        credentials.nonce,
+                        expiry,
+                        root_invocation.clone(),
+                    );
+                    let digest = if credentials.address == wallet() {
+                        *SmartAccountAuthDigest::new(&preimage, &rule_ids_xdr)
+                            .unwrap()
+                            .as_bytes()
+                    } else {
+                        let preimage_xdr = preimage.to_xdr(Limits::none()).unwrap();
+                        Sha256::digest(preimage_xdr).into()
+                    };
+                    assert!(
+                        self.auth_digests.contains(&digest),
+                        "{case}: the signed digest commits to expiry {expiry}"
+                    );
+                }
+            }
+        }
+
+        /// Submits on `path` through `primary` with `secondary` as the witness.
+        async fn submit_with(
+            path: SigningPath,
+            primary: &AuthTreeEndpoint,
+            secondary: Option<&str>,
+            horizon: Option<HorizonCheck>,
+        ) -> Outcome {
+            let signer = RecordingSigner::new();
+            let target = wallet_strkey();
+            let rule_ids = path.rule_ids();
+            let declared = [nested_call()];
+            let (sub_invocations, required_checks, multicall_check): (
+                _,
+                &[&'static str],
+                Option<MulticallCheck>,
+            ) = match path {
+                SigningPath::Single => (DeclaredSubInvocations::None, &[], None),
+                SigningPath::Multicall => (
+                    DeclaredSubInvocations::Calls(&declared),
+                    &["multicall"],
+                    Some(MulticallCheck {
+                        registry_entry_address: target.clone(),
+                        registry_entry_wasm_sha256: MULTICALL_WASM_SHA256.to_owned(),
+                        network_passphrase: TESTNET_PASSPHRASE.to_owned(),
+                    }),
+                ),
+            };
+            let result = submit_signed_invoke(
+                SubmitInvokeArgs::builder()
+                    .target_contract(&target)
+                    .auth_rule_ids(&rule_ids)
+                    .host_function(path.host_function())
+                    .sub_invocations(sub_invocations)
+                    .signer(&signer)
+                    .primary_rpc_url(&primary.uri())
+                    .maybe_secondary_rpc_url(secondary)
+                    .network_passphrase(TESTNET_PASSPHRASE)
+                    .chain_id("stellar:testnet")
+                    .timeout(Duration::from_secs(5))
+                    .op_label("witness_test")
+                    .required_checks(required_checks)
+                    .maybe_multicall_check(multicall_check)
+                    .maybe_horizon_check(horizon)
+                    .build(),
+            )
+            .await;
+            let auth_digests = signer.auth_digests.lock().unwrap().clone();
+            Outcome {
+                result,
+                signs: signer.inner.sign_calls(),
+                key_reads: signer.inner.public_key_calls(),
+                auth_digests,
+                signed_simulations: primary.signed_simulations(),
+                sent: primary.sent(),
+            }
+        }
+
+        /// Submits on `path` through `primary` with `secondary` as the witness
+        /// on a host apart from the primary's.
+        async fn submit_pair(
+            path: SigningPath,
+            primary: AuthTreeRpc,
+            secondary: AuthTreeRpc,
+            horizon: Option<HorizonCheck>,
+        ) -> Outcome {
+            let primary = primary.start().await;
+            let secondary = secondary.start().await;
+            let secondary_uri = second_loopback_host(&secondary.uri());
+            submit_with(path, &primary, Some(&secondary_uri), horizon).await
+        }
+
+        /// Submits on `path` through endpoints at the two heights.
+        async fn submit_at(path: SigningPath, primary: u32, secondary: u32) -> Outcome {
+            submit_pair(path, endpoint(primary), endpoint(secondary), None).await
+        }
+
+        #[tokio::test]
+        async fn single_invoke_refuses_plausible_inflated_height() {
+            let outcome = submit_at(SigningPath::Single, 1_000_000, LEDGER).await;
+            outcome.assert_refused(SKEW_CODE, "an inflated primary");
+        }
+
+        #[tokio::test]
+        async fn allowed_skew_has_exact_bounded_expiry() {
+            for path in PATHS {
+                for (primary, secondary) in [
+                    (LEDGER, LEDGER),
+                    (LEDGER, LEDGER + 1),
+                    (LEDGER + 1, LEDGER),
+                    (LEDGER, LEDGER + 2),
+                    (LEDGER + 2, LEDGER),
+                ] {
+                    let case = format!("{path:?} ({primary}, {secondary})");
+                    let outcome = submit_at(path, primary, secondary).await;
+                    outcome.assert_every_signature_expires_at(
+                        primary.min(secondary) + 100,
+                        &path.rule_ids(),
+                        &case,
+                    );
+                }
+                for (primary, secondary) in [(LEDGER, LEDGER + 3), (LEDGER + 3, LEDGER)] {
+                    let case = format!("{path:?} ({primary}, {secondary})");
+                    submit_at(path, primary, secondary)
+                        .await
+                        .assert_refused(SKEW_CODE, &case);
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn a_skew_of_three_with_the_primary_behind_refuses() {
+            for path in PATHS {
+                submit_at(path, LEDGER, LEDGER + 3)
+                    .await
+                    .assert_refused(SKEW_CODE, &format!("{path:?}"));
+            }
+        }
+
+        #[tokio::test]
+        async fn a_skew_of_three_with_the_primary_ahead_refuses() {
+            for path in PATHS {
+                submit_at(path, LEDGER + 3, LEDGER)
+                    .await
+                    .assert_refused(SKEW_CODE, &format!("{path:?}"));
+            }
+        }
+
+        /// Heights no ledger can have refuse as a pair that cannot bound an
+        /// expiry, whichever endpoint reports them.
+        #[tokio::test]
+        async fn out_of_bounds_heights_refuse_before_signing() {
+            for path in PATHS {
+                for (primary, secondary) in [(0, 1), (1, 0), (0, 0), (u32::MAX - 1, u32::MAX - 1)] {
+                    let case = format!("{path:?} ({primary}, {secondary})");
+                    submit_at(path, primary, secondary)
+                        .await
+                        .assert_refused(SKEW_CODE, &case);
+                }
+            }
+        }
+
+        /// A simulation that answers from a height the primary's own
+        /// observation contradicts is not a base for a signature.
+        #[tokio::test]
+        async fn a_simulated_height_outside_the_pair_refuses_before_signing() {
+            for (simulated, case) in [(1_000_000, "above"), (LEDGER - 3, "below")] {
+                let primary = endpoint(LEDGER).simulated_ledger(simulated);
+                submit_pair(SigningPath::Single, primary, endpoint(LEDGER), None)
+                    .await
+                    .assert_refused(SKEW_CODE, case);
+            }
+        }
+
+        #[tokio::test]
+        async fn a_simulated_height_within_the_tolerance_of_the_pair_signs() {
+            for simulated in [LEDGER - 2, LEDGER + 2] {
+                let path = SigningPath::Single;
+                let primary = endpoint(LEDGER).simulated_ledger(simulated);
+                submit_pair(path, primary, endpoint(LEDGER), None)
+                    .await
+                    .assert_every_signature_expires_at(
+                        LEDGER + 100,
+                        &path.rule_ids(),
+                        "a simulation within the tolerance",
+                    );
+            }
+        }
+
+        #[tokio::test]
+        async fn absent_unavailable_or_wrong_chain_witness_refuses() {
+            for path in PATHS {
+                let case = |name: &str| format!("{path:?}: {name}");
+
+                let primary = endpoint(LEDGER).start().await;
+                submit_with(path, &primary, None, None)
+                    .await
+                    .assert_refused(UNAVAILABLE_CODE, &case("no secondary"));
+
+                // Transport failure: the endpoint answers 503 to every request.
+                let down = wiremock::MockServer::start().await;
+                wiremock::Mock::given(wiremock::matchers::method("POST"))
+                    .respond_with(wiremock::ResponseTemplate::new(503))
+                    .mount(&down)
+                    .await;
+                let primary = endpoint(LEDGER).start().await;
+                submit_with(
+                    path,
+                    &primary,
+                    Some(&second_loopback_host(&down.uri())),
+                    None,
+                )
+                .await
+                .assert_refused(UNAVAILABLE_CODE, &case("secondary transport failure"));
+
+                let malformed = endpoint(LEDGER).malformed_latest_ledger().start().await;
+                let primary = endpoint(LEDGER).start().await;
+                submit_with(
+                    path,
+                    &primary,
+                    Some(&second_loopback_host(&malformed.uri())),
+                    None,
+                )
+                .await
+                .assert_refused(UNAVAILABLE_CODE, &case("malformed secondary height"));
+
+                let healthy = endpoint(LEDGER).start().await;
+                let primary = endpoint(LEDGER).malformed_latest_ledger().start().await;
+                submit_with(
+                    path,
+                    &primary,
+                    Some(&second_loopback_host(&healthy.uri())),
+                    None,
+                )
+                .await
+                .assert_refused(UNAVAILABLE_CODE, &case("malformed primary height"));
+
+                let elsewhere = endpoint_on("Another Test Network ; 2026", LEDGER)
+                    .start()
+                    .await;
+                let primary = endpoint(LEDGER).start().await;
+                submit_with(
+                    path,
+                    &primary,
+                    Some(&second_loopback_host(&elsewhere.uri())),
+                    None,
+                )
+                .await
+                .assert_refused(UNAVAILABLE_CODE, &case("secondary on another network"));
+
+                let mainnet = endpoint_on(
+                    stellar_agent_core::profile::caip2::MAINNET_PASSPHRASE,
+                    LEDGER,
+                )
+                .start()
+                .await;
+                let primary = endpoint(LEDGER).start().await;
+                submit_with(
+                    path,
+                    &primary,
+                    Some(&second_loopback_host(&mainnet.uri())),
+                    None,
+                )
+                .await
+                .assert_refused(
+                    "network.mainnet_write_forbidden",
+                    &case("secondary on mainnet"),
+                );
+
+                let other_port = endpoint(LEDGER).start().await;
+                let primary = endpoint(LEDGER).start().await;
+                for (name, secondary) in [
+                    ("the same URL", primary.uri()),
+                    (
+                        "the same host on a path",
+                        format!("{}/witness", primary.uri()),
+                    ),
+                    ("the same host on a port", other_port.uri()),
+                    (
+                        "the same host in another spelling",
+                        primary
+                            .uri()
+                            .replace("http://127.0.0.1", "HTTP://127.0.0.1"),
+                    ),
+                    ("no URL", "not a url".to_owned()),
+                ] {
+                    submit_with(path, &primary, Some(&secondary), None)
+                        .await
+                        .assert_refused(UNAVAILABLE_CODE, &case(name));
+                }
+            }
+        }
+
+        /// A refused configuration sends nothing: the reason is local.
+        #[tokio::test]
+        async fn a_refused_witness_configuration_reaches_no_endpoint() {
+            let primary = endpoint(LEDGER).start().await;
+            let outcome = submit_with(
+                SigningPath::Single,
+                &primary,
+                Some(&format!("{}/witness", primary.uri())),
+                None,
+            )
+            .await;
+            outcome.assert_refused(UNAVAILABLE_CODE, "the same host");
+            assert_eq!(
+                primary.simulations(),
+                0,
+                "the refusal precedes the simulation"
+            );
+        }
+
+        #[tokio::test]
+        async fn rule_horizon_uses_witnessed_ledger() {
+            let horizon = HorizonCheck {
+                valid_until: 1101,
+                max_horizon: 100,
+                rule_id_or_pending: None,
+            };
+            let outcome = submit_pair(
+                SigningPath::Single,
+                endpoint(1002),
+                endpoint(1000),
+                Some(horizon),
+            )
+            .await;
+            match &outcome.result {
+                Err(SaError::HorizonExceeded {
+                    requested_horizon,
+                    max_horizon,
+                    ..
+                }) => {
+                    assert_eq!(*requested_horizon, 101);
+                    assert_eq!(*max_horizon, 100);
+                }
+                other => panic!(
+                    "expected the horizon refusal, got {:?}",
+                    other.as_ref().err()
+                ),
+            }
+            assert_eq!(outcome.signs, 0);
+            assert_eq!(outcome.signed_simulations, 0);
+            assert!(outcome.sent.is_empty());
+        }
+
+        /// The same pair admits a horizon of exactly the maximum from the
+        /// lower height.
+        #[tokio::test]
+        async fn a_rule_horizon_at_the_maximum_from_the_lower_ledger_signs() {
+            let path = SigningPath::Single;
+            let horizon = HorizonCheck {
+                valid_until: 1100,
+                max_horizon: 100,
+                rule_id_or_pending: None,
+            };
+            submit_pair(path, endpoint(1002), endpoint(1000), Some(horizon))
+                .await
+                .assert_every_signature_expires_at(1100, &path.rule_ids(), "the maximum horizon");
+        }
+
+        // ── Signer key lookups and the signing boundary ─────────────────────
+
+        /// The deadline of [`submit_with_slow_key`].
+        const SLOW_KEY_DEADLINE: Duration = Duration::from_secs(5);
+
+        /// Outlasts a ledger observation, and the deadline with it.
+        const LOOKUP_OUTLASTS_OBSERVATION: Duration = Duration::from_millis(10_500);
+
+        /// Outlasts the deadline, but not a ledger observation.
+        const LOOKUP_OUTLASTS_DEADLINE: Duration = Duration::from_millis(5_500);
+
+        /// A signer whose key lookup takes `delay`, as a hardware device's
+        /// can, and that counts its signatures.
+        struct SlowKeySigner {
+            inner: CountingSigner,
+            delay: Duration,
+        }
+
+        #[async_trait]
+        impl Signer for SlowKeySigner {
+            async fn sign_tx_payload(
+                &self,
+                payload: &TxSigningPayload,
+            ) -> Result<[u8; 64], WalletError> {
+                self.inner.sign_tx_payload(payload).await
+            }
+
+            async fn sign_auth_digest(
+                &self,
+                digest: &SmartAccountAuthDigest,
+            ) -> Result<[u8; 64], WalletError> {
+                self.inner.sign_auth_digest(digest).await
+            }
+
+            async fn sign_soroban_address_auth_payload(
+                &self,
+                payload: &SorobanAuthPayload,
+            ) -> Result<[u8; 64], WalletError> {
+                self.inner.sign_soroban_address_auth_payload(payload).await
+            }
+
+            async fn sign_message(
+                &self,
+                payload: &MessagePayload,
+            ) -> Result<[u8; 64], WalletError> {
+                self.inner.sign_message(payload).await
+            }
+
+            async fn sign_webauthn_assertion(
+                &self,
+                digest: &SmartAccountAuthDigest,
+                credential_id: &[u8],
+            ) -> Result<WebAuthnAssertion, WalletError> {
+                self.inner
+                    .sign_webauthn_assertion(digest, credential_id)
+                    .await
+            }
+
+            async fn public_key(&self) -> Result<stellar_strkey::ed25519::PublicKey, WalletError> {
+                tokio::time::sleep(self.delay).await;
+                self.inner.public_key().await
+            }
+        }
+
+        /// The signing paths that read a signer key of their own after the
+        /// simulation.
+        #[derive(Clone, Copy, Debug)]
+        enum LookupPath {
+            Quorum,
+            RuleSigner,
+        }
+
+        /// Submits a single invocation on `path`, whose own signer takes
+        /// `delay` to report its key. The outcome counts the signatures of
+        /// both signers.
+        async fn submit_with_slow_key(path: LookupPath, delay: Duration) -> Outcome {
+            let primary = endpoint(LEDGER).start().await;
+            let secondary = endpoint(LEDGER).start().await;
+            let primary_uri = primary.uri();
+            let secondary_uri = second_loopback_host(&secondary.uri());
+            let signer = RecordingSigner::new();
+            let slow = SlowKeySigner {
+                inner: CountingSigner::new(SEED),
+                delay,
+            };
+            let quorum_signers: [&(dyn Signer + Send + Sync); 1] = [&slow];
+            let authorization = AuthorizationInfo::new(
+                vec![
+                    SignerGroup::new("slow".to_owned(), vec![public_key_for_seed(SEED)], 1)
+                        .unwrap(),
+                ],
+                Combinator::And,
+            );
+            let target = wallet_strkey();
+            let rule_ids = SigningPath::Single.rule_ids();
+            let builder = SubmitInvokeArgs::builder()
+                .target_contract(&target)
+                .auth_rule_ids(&rule_ids)
+                .host_function(SigningPath::Single.host_function())
+                .sub_invocations(DeclaredSubInvocations::None)
+                .signer(&signer)
+                .primary_rpc_url(&primary_uri)
+                .secondary_rpc_url(&secondary_uri)
+                .network_passphrase(TESTNET_PASSPHRASE)
+                .chain_id("stellar:testnet")
+                .timeout(SLOW_KEY_DEADLINE)
+                .op_label("witness_test");
+            let args = match path {
+                LookupPath::Quorum => builder
+                    .authorization(&authorization)
+                    .signers(&quorum_signers)
+                    .build(),
+                LookupPath::RuleSigner => builder
+                    .ed25519_rule_signer(Ed25519RuleSigner {
+                        signer: &slow,
+                        verifier: ScAddress::Contract(ContractId(Hash([0x64; 32]))),
+                    })
+                    .build(),
+            };
+            let result = submit_signed_invoke(args).await;
+            let auth_digests = signer.auth_digests.lock().unwrap().clone();
+            Outcome {
+                result,
+                signs: signer.inner.sign_calls() + slow.inner.sign_calls(),
+                key_reads: signer.inner.public_key_calls(),
+                auth_digests,
+                signed_simulations: primary.signed_simulations(),
+                sent: primary.sent(),
+            }
+        }
+
+        /// A signer key that arrives after the pair went stale, or after the
+        /// deadline, never reaches a signature: the lookups precede the last
+        /// witness check, which refuses. The cases run side by side.
+        #[tokio::test]
+        async fn a_key_lookup_delayed_past_the_freshness_limit_refuses_before_signing() {
+            let (quorum_stale, rule_signer_stale, quorum_late, rule_signer_late) = tokio::join!(
+                submit_with_slow_key(LookupPath::Quorum, LOOKUP_OUTLASTS_OBSERVATION),
+                submit_with_slow_key(LookupPath::RuleSigner, LOOKUP_OUTLASTS_OBSERVATION),
+                submit_with_slow_key(LookupPath::Quorum, LOOKUP_OUTLASTS_DEADLINE),
+                submit_with_slow_key(LookupPath::RuleSigner, LOOKUP_OUTLASTS_DEADLINE),
+            );
+            quorum_stale.assert_refused(UNAVAILABLE_CODE, "quorum, past the observation age");
+            rule_signer_stale
+                .assert_refused(UNAVAILABLE_CODE, "rule signer, past the observation age");
+            for (outcome, case) in [
+                (&quorum_late, "quorum, past the deadline"),
+                (&rule_signer_late, "rule signer, past the deadline"),
+            ] {
+                outcome.assert_refused(UNAVAILABLE_CODE, case);
+                assert!(
+                    matches!(
+                        outcome.result,
+                        Err(SaError::LedgerWitnessUnavailable {
+                            reason: "the pre-submit deadline elapsed"
+                        })
+                    ),
+                    "{case}: the signing boundary refuses: {:?}",
+                    outcome.result.as_ref().err()
+                );
+            }
+        }
+
+        // ── Authorization signatures under the deadline ─────────────────────
+
+        /// The deadline of [`submit_with_slow_signature`].
+        const SLOW_SIGNATURE_DEADLINE: Duration = Duration::from_secs(5);
+
+        /// Outlasts [`SLOW_SIGNATURE_DEADLINE`].
+        const SIGNATURE_OUTLASTS_DEADLINE: Duration = Duration::from_secs(6);
+
+        /// The signer call [`SlowSignatureSigner`] delays.
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        enum SlowCall {
+            /// The signature over a smart account's auth digest.
+            AuthDigest,
+            /// The signature over a delegated G-key entry's payload.
+            DelegatedEntry,
+        }
+
+        /// A signer whose call `slow` names answers only after `delay`, as a
+        /// hardware device's can, and that counts its signatures. Its other
+        /// calls answer at once.
+        struct SlowSignatureSigner {
+            inner: CountingSigner,
+            slow: SlowCall,
+            delay: Duration,
+        }
+
+        impl SlowSignatureSigner {
+            /// Waits out `delay` when `call` is the delayed one.
+            async fn wait_for(&self, call: SlowCall) {
+                if self.slow == call {
+                    tokio::time::sleep(self.delay).await;
+                }
+            }
+        }
+
+        #[async_trait]
+        impl Signer for SlowSignatureSigner {
+            async fn sign_tx_payload(
+                &self,
+                payload: &TxSigningPayload,
+            ) -> Result<[u8; 64], WalletError> {
+                self.inner.sign_tx_payload(payload).await
+            }
+
+            async fn sign_auth_digest(
+                &self,
+                digest: &SmartAccountAuthDigest,
+            ) -> Result<[u8; 64], WalletError> {
+                self.wait_for(SlowCall::AuthDigest).await;
+                self.inner.sign_auth_digest(digest).await
+            }
+
+            async fn sign_soroban_address_auth_payload(
+                &self,
+                payload: &SorobanAuthPayload,
+            ) -> Result<[u8; 64], WalletError> {
+                self.wait_for(SlowCall::DelegatedEntry).await;
+                self.inner.sign_soroban_address_auth_payload(payload).await
+            }
+
+            async fn sign_message(
+                &self,
+                payload: &MessagePayload,
+            ) -> Result<[u8; 64], WalletError> {
+                self.inner.sign_message(payload).await
+            }
+
+            async fn sign_webauthn_assertion(
+                &self,
+                digest: &SmartAccountAuthDigest,
+                credential_id: &[u8],
+            ) -> Result<WebAuthnAssertion, WalletError> {
+                self.inner
+                    .sign_webauthn_assertion(digest, credential_id)
+                    .await
+            }
+
+            async fn public_key(&self) -> Result<stellar_strkey::ed25519::PublicKey, WalletError> {
+                self.inner.public_key().await
+            }
+        }
+
+        /// The arms that sign a single invocation's authorization.
+        #[derive(Clone, Copy, Debug)]
+        enum SigningArm {
+            /// A quorum signer signs the smart account's entry.
+            Quorum,
+            /// An External-Ed25519 rule signer signs the smart account's entry.
+            RuleSigner,
+            /// The envelope signer signs the smart account's entry and its
+            /// delegated G-key entry.
+            Delegated,
+        }
+
+        /// Submits a single invocation on `arm`, whose signer answers the call
+        /// `slow` names only after [`SIGNATURE_OUTLASTS_DEADLINE`]. The
+        /// outcome counts the signatures of every signer.
+        async fn submit_with_slow_signature(arm: SigningArm, slow: SlowCall) -> Outcome {
+            let primary = endpoint(LEDGER).start().await;
+            let secondary = endpoint(LEDGER).start().await;
+            let primary_uri = primary.uri();
+            let secondary_uri = second_loopback_host(&secondary.uri());
+            let signer = RecordingSigner::new();
+            let slow = SlowSignatureSigner {
+                inner: CountingSigner::new(SEED),
+                slow,
+                delay: SIGNATURE_OUTLASTS_DEADLINE,
+            };
+            let quorum_signers: [&(dyn Signer + Send + Sync); 1] = [&slow];
+            let authorization = AuthorizationInfo::new(
+                vec![
+                    SignerGroup::new("slow".to_owned(), vec![public_key_for_seed(SEED)], 1)
+                        .unwrap(),
+                ],
+                Combinator::And,
+            );
+            let target = wallet_strkey();
+            let rule_ids = SigningPath::Single.rule_ids();
+            let builder = SubmitInvokeArgs::builder()
+                .target_contract(&target)
+                .auth_rule_ids(&rule_ids)
+                .host_function(SigningPath::Single.host_function())
+                .sub_invocations(DeclaredSubInvocations::None)
+                .primary_rpc_url(&primary_uri)
+                .secondary_rpc_url(&secondary_uri)
+                .network_passphrase(TESTNET_PASSPHRASE)
+                .chain_id("stellar:testnet")
+                .timeout(SLOW_SIGNATURE_DEADLINE)
+                .op_label("witness_test");
+            let args = match arm {
+                SigningArm::Quorum => builder
+                    .signer(&signer)
+                    .authorization(&authorization)
+                    .signers(&quorum_signers)
+                    .build(),
+                SigningArm::RuleSigner => builder
+                    .signer(&signer)
+                    .ed25519_rule_signer(Ed25519RuleSigner {
+                        signer: &slow,
+                        verifier: ScAddress::Contract(ContractId(Hash([0x64; 32]))),
+                    })
+                    .build(),
+                SigningArm::Delegated => builder.signer(&slow).build(),
+            };
+            let result = submit_signed_invoke(args).await;
+            let auth_digests = signer.auth_digests.lock().unwrap().clone();
+            Outcome {
+                result,
+                signs: signer.inner.sign_calls() + slow.inner.sign_calls(),
+                key_reads: signer.inner.public_key_calls(),
+                auth_digests,
+                signed_simulations: primary.signed_simulations(),
+                sent: primary.sent(),
+            }
+        }
+
+        /// Asserts that the auth-digest signature of `arm` was cut at the
+        /// deadline: the refusal names its stage, no signature was made, the
+        /// cut one included, and nothing was re-simulated or sent.
+        async fn assert_auth_signature_cut(arm: SigningArm) {
+            let outcome = submit_with_slow_signature(arm, SlowCall::AuthDigest).await;
+
+            assert_deadline_refusal(&outcome, "sign_auth_digest");
+            assert_eq!(outcome.signs, 0, "{arm:?}: nothing is signed");
+            assert_eq!(
+                outcome.signed_simulations, 0,
+                "{arm:?}: nothing is re-simulated"
+            );
+        }
+
+        /// A quorum signer's signature that outlasts the deadline is cut at
+        /// it: no further signature, nothing sent.
+        #[tokio::test]
+        async fn a_quorum_signature_past_the_deadline_is_cut_and_nothing_is_sent() {
+            assert_auth_signature_cut(SigningArm::Quorum).await;
+        }
+
+        /// A rule signer's signature that outlasts the deadline is cut at it:
+        /// no further signature, nothing sent.
+        #[tokio::test]
+        async fn a_rule_signer_signature_past_the_deadline_is_cut_and_nothing_is_sent() {
+            assert_auth_signature_cut(SigningArm::RuleSigner).await;
+        }
+
+        /// The smart account's own entry signature that outlasts the deadline
+        /// is cut at it: its delegated entry and the envelope are not signed,
+        /// and nothing is sent.
+        #[tokio::test]
+        async fn a_delegated_signature_past_the_deadline_is_cut_and_nothing_is_sent() {
+            assert_auth_signature_cut(SigningArm::Delegated).await;
+        }
+
+        /// The delegated G-key entry's signature that outlasts the deadline is
+        /// cut at it after the smart account's own entry is signed: the
+        /// envelope is not signed, nothing is re-simulated, and nothing is
+        /// sent.
+        #[tokio::test]
+        async fn a_delegated_entry_signature_past_the_deadline_is_cut_and_nothing_is_sent() {
+            let outcome =
+                submit_with_slow_signature(SigningArm::Delegated, SlowCall::DelegatedEntry).await;
+
+            assert_deadline_refusal(&outcome, "sign_delegated_entry");
+            assert_eq!(
+                outcome.signs, 1,
+                "the smart account's own entry alone is signed"
+            );
+            assert_eq!(outcome.signed_simulations, 0, "nothing is re-simulated");
+        }
+
+        /// The deadline of [`submit_with_late_send`].
+        const LATE_SEND_DEADLINE: Duration = Duration::from_secs(5);
+
+        /// Outlasts [`LATE_SEND_DEADLINE`].
+        const PAST_THE_DEADLINE: Duration = Duration::from_secs(6);
+
+        /// Submits a single invocation whose envelope signature takes
+        /// `envelope_delay`, through a primary whose identity probe after the
+        /// signed re-simulation takes `pre_send_delay`.
+        async fn submit_with_late_send(
+            envelope_delay: Option<Duration>,
+            pre_send_delay: Option<Duration>,
+        ) -> Outcome {
+            let primary = match pre_send_delay {
+                Some(delay) => endpoint(LEDGER).slow_network_after_signed_simulation(delay),
+                None => endpoint(LEDGER),
+            }
+            .start()
+            .await;
+            let secondary = endpoint(LEDGER).start().await;
+            let primary_uri = primary.uri();
+            let secondary_uri = second_loopback_host(&secondary.uri());
+            let signer = match envelope_delay {
+                Some(delay) => RecordingSigner::with_envelope_delay(delay),
+                None => RecordingSigner::new(),
+            };
+            let target = wallet_strkey();
+            let rule_ids = SigningPath::Single.rule_ids();
+            let result = submit_signed_invoke(
+                SubmitInvokeArgs::builder()
+                    .target_contract(&target)
+                    .auth_rule_ids(&rule_ids)
+                    .host_function(SigningPath::Single.host_function())
+                    .sub_invocations(DeclaredSubInvocations::None)
+                    .signer(&signer)
+                    .primary_rpc_url(&primary_uri)
+                    .secondary_rpc_url(&secondary_uri)
+                    .network_passphrase(TESTNET_PASSPHRASE)
+                    .chain_id("stellar:testnet")
+                    .timeout(LATE_SEND_DEADLINE)
+                    .op_label("witness_test")
+                    .build(),
+            )
+            .await;
+            let auth_digests = signer.auth_digests.lock().unwrap().clone();
+            Outcome {
+                result,
+                signs: signer.inner.sign_calls(),
+                key_reads: signer.inner.public_key_calls(),
+                auth_digests,
+                signed_simulations: primary.signed_simulations(),
+                sent: primary.sent(),
+            }
+        }
+
+        /// Asserts the pre-submit deadline refusal of `stage` with nothing
+        /// sent.
+        fn assert_deadline_refusal(outcome: &Outcome, stage: &str) {
+            match &outcome.result {
+                Err(SaError::AuthEntryConstructionFailed {
+                    stage: "auth_payload",
+                    redacted_reason,
+                }) => assert!(
+                    redacted_reason
+                        .starts_with(&format!("{stage} exceeded collective pre-submit budget")),
+                    "{stage}: {redacted_reason}"
+                ),
+                other => panic!("expected the deadline refusal of {stage}, got {other:?}"),
+            }
+            assert!(outcome.sent.is_empty(), "{stage}: nothing is sent");
+        }
+
+        /// An envelope signature that outlasts the deadline is cut at it: the
+        /// envelope is neither signed nor sent. The smart account's entry and
+        /// its delegated entry are signed before.
+        #[tokio::test]
+        async fn an_envelope_signature_past_the_deadline_is_cut_and_nothing_is_sent() {
+            let outcome = submit_with_late_send(Some(PAST_THE_DEADLINE), None).await;
+
+            assert_deadline_refusal(&outcome, "sign_envelope");
+            assert_eq!(
+                outcome.signs, 2,
+                "the two authorization entries alone are signed"
+            );
+            assert_eq!(outcome.signed_simulations, 1);
+        }
+
+        /// The submission's steps before `sendTransaction` end at the
+        /// pre-submit deadline: an identity probe that outlasts it sends
+        /// nothing. Every signature is made, and the envelope signer's key is
+        /// the one read before the signing boundary.
+        #[tokio::test]
+        async fn a_pre_send_step_past_the_deadline_sends_nothing() {
+            let outcome = submit_with_late_send(None, Some(PAST_THE_DEADLINE)).await;
+
+            assert_deadline_refusal(&outcome, "send_endpoint_identity");
+            assert_eq!(outcome.signs, 3, "both entries and the envelope are signed");
+            assert_eq!(
+                outcome.key_reads, 1,
+                "the envelope signer's key is read once"
             );
         }
     }

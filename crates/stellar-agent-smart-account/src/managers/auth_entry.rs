@@ -566,6 +566,23 @@ pub async fn complete_authorization_entry(
     partial: PartialSorobanAuthorizationEntry,
     signer: &(dyn Signer + Send + Sync),
 ) -> Result<SorobanAuthorizationEntry, SaError> {
+    complete_authorization_entry_within_budget(checked_rules, partial, signer, None).await
+}
+
+/// [`complete_authorization_entry`] with each signer call bounded by `budget`
+/// when there is one, at [`SIGN_AUTH_DIGEST_STAGE`] (see
+/// [`sign_within_budget`]).
+///
+/// # Errors
+///
+/// The errors of [`complete_authorization_entry`], and the deadline refusal
+/// of [`sign_within_budget`].
+pub(crate) async fn complete_authorization_entry_within_budget(
+    checked_rules: CheckedSigningRules,
+    partial: PartialSorobanAuthorizationEntry,
+    signer: &(dyn Signer + Send + Sync),
+    budget: Option<PreSubmitBudget>,
+) -> Result<SorobanAuthorizationEntry, SaError> {
     checked_rules.check_binding(
         &partial.smart_account,
         partial.network_id,
@@ -573,19 +590,22 @@ pub async fn complete_authorization_entry(
     )?;
     let digest = partial.signing_digest()?;
 
-    let pubkey = signer
-        .public_key()
-        .await
+    let pubkey = sign_within_budget(budget, SIGN_AUTH_DIGEST_STAGE, signer.public_key())
+        .await?
         .map_err(|e| SaError::AuthEntryConstructionFailed {
             stage: "auth_payload",
             redacted_reason: format!("signer public_key fetch failed before signing: {e}"),
         })?;
 
-    let signature_bytes = signer.sign_auth_digest(&digest).await.map_err(|e| {
-        SaError::AuthEntryConstructionFailed {
-            stage: "auth_payload",
-            redacted_reason: format!("auth-digest signing failed: {e}"),
-        }
+    let signature_bytes = sign_within_budget(
+        budget,
+        SIGN_AUTH_DIGEST_STAGE,
+        signer.sign_auth_digest(&digest),
+    )
+    .await?
+    .map_err(|e| SaError::AuthEntryConstructionFailed {
+        stage: "auth_payload",
+        redacted_reason: format!("auth-digest signing failed: {e}"),
     })?;
 
     let auth_payload =
@@ -872,6 +892,25 @@ pub async fn complete_authorization_entry_multi_signer(
     partial: PartialSorobanAuthorizationEntry,
     signers: &[&(dyn Signer + Send + Sync)],
 ) -> Result<SorobanAuthorizationEntry, SaError> {
+    complete_authorization_entry_multi_signer_within_budget(checked_rules, partial, signers, None)
+        .await
+}
+
+/// [`complete_authorization_entry_multi_signer`] with each signer call
+/// bounded by `budget` when there is one, at [`SIGN_AUTH_DIGEST_STAGE`] (see
+/// [`sign_within_budget`]): a signature cut at the deadline is followed by no
+/// other signer's.
+///
+/// # Errors
+///
+/// The errors of [`complete_authorization_entry_multi_signer`], and the
+/// deadline refusal of [`sign_within_budget`].
+pub(crate) async fn complete_authorization_entry_multi_signer_within_budget(
+    checked_rules: CheckedSigningRules,
+    partial: PartialSorobanAuthorizationEntry,
+    signers: &[&(dyn Signer + Send + Sync)],
+    budget: Option<PreSubmitBudget>,
+) -> Result<SorobanAuthorizationEntry, SaError> {
     checked_rules.check_binding(
         &partial.smart_account,
         partial.network_id,
@@ -893,20 +932,22 @@ pub async fn complete_authorization_entry_multi_signer(
     // `complete_authorization_entry_mixed`.
     let mut descriptors: Vec<AuthPayloadSigner> = Vec::with_capacity(signers.len());
     for signer in signers {
-        let pubkey =
-            signer
-                .public_key()
-                .await
-                .map_err(|e| SaError::AuthEntryConstructionFailed {
-                    stage: "auth_payload",
-                    redacted_reason: format!("signer public_key fetch failed: {e}"),
-                })?;
-
-        let signature_bytes = signer.sign_auth_digest(&digest).await.map_err(|e| {
-            SaError::AuthEntryConstructionFailed {
+        let pubkey = sign_within_budget(budget, SIGN_AUTH_DIGEST_STAGE, signer.public_key())
+            .await?
+            .map_err(|e| SaError::AuthEntryConstructionFailed {
                 stage: "auth_payload",
-                redacted_reason: format!("auth-digest signing failed: {e}"),
-            }
+                redacted_reason: format!("signer public_key fetch failed: {e}"),
+            })?;
+
+        let signature_bytes = sign_within_budget(
+            budget,
+            SIGN_AUTH_DIGEST_STAGE,
+            signer.sign_auth_digest(&digest),
+        )
+        .await?
+        .map_err(|e| SaError::AuthEntryConstructionFailed {
+            stage: "auth_payload",
+            redacted_reason: format!("auth-digest signing failed: {e}"),
         })?;
 
         descriptors.push(AuthPayloadSigner::Delegated {
@@ -1040,6 +1081,35 @@ pub(crate) async fn collect_mixed_signer_entries(
     signature_expiration_ledger: u32,
     network_passphrase: &str,
 ) -> Result<Vec<SorobanAuthorizationEntry>, SaError> {
+    collect_mixed_signer_entries_within_budget(
+        checked_rules,
+        partial,
+        signers,
+        signature_expiration_ledger,
+        network_passphrase,
+        None,
+    )
+    .await
+}
+
+/// [`collect_mixed_signer_entries`] with each signer call bounded by `budget`
+/// when there is one (see [`sign_within_budget`]): the auth-digest
+/// signatures at [`SIGN_AUTH_DIGEST_STAGE`], the delegated G-key entries at
+/// [`SIGN_DELEGATED_ENTRY_STAGE`]. A signature cut at the deadline is
+/// followed by no other.
+///
+/// # Errors
+///
+/// The errors of [`collect_mixed_signer_entries`], and the deadline refusal
+/// of [`sign_within_budget`].
+pub(crate) async fn collect_mixed_signer_entries_within_budget(
+    checked_rules: CheckedSigningRules,
+    partial: PartialSorobanAuthorizationEntry,
+    signers: &[MixedSigner<'_>],
+    signature_expiration_ledger: u32,
+    network_passphrase: &str,
+    budget: Option<PreSubmitBudget>,
+) -> Result<Vec<SorobanAuthorizationEntry>, SaError> {
     checked_rules.check_binding(
         &partial.smart_account,
         partial.network_id,
@@ -1061,20 +1131,21 @@ pub(crate) async fn collect_mixed_signer_entries(
     // signer's raw ed25519 key and route by kind.
     let mut descriptors: Vec<AuthPayloadSigner> = Vec::with_capacity(signers.len());
     for entry in signers {
-        let pubkey =
-            entry
-                .signer
-                .public_key()
-                .await
-                .map_err(|e| SaError::AuthEntryConstructionFailed {
-                    stage: "auth_payload",
-                    redacted_reason: format!("signer public_key fetch failed: {e}"),
-                })?;
-        let signature_bytes = entry.signer.sign_auth_digest(&digest).await.map_err(|e| {
-            SaError::AuthEntryConstructionFailed {
+        let pubkey = sign_within_budget(budget, SIGN_AUTH_DIGEST_STAGE, entry.signer.public_key())
+            .await?
+            .map_err(|e| SaError::AuthEntryConstructionFailed {
                 stage: "auth_payload",
-                redacted_reason: format!("auth-digest signing failed: {e}"),
-            }
+                redacted_reason: format!("signer public_key fetch failed: {e}"),
+            })?;
+        let signature_bytes = sign_within_budget(
+            budget,
+            SIGN_AUTH_DIGEST_STAGE,
+            entry.signer.sign_auth_digest(&digest),
+        )
+        .await?
+        .map_err(|e| SaError::AuthEntryConstructionFailed {
+            stage: "auth_payload",
+            redacted_reason: format!("auth-digest signing failed: {e}"),
         })?;
 
         let descriptor = match &entry.kind {
@@ -1119,6 +1190,7 @@ pub(crate) async fn collect_mixed_signer_entries(
             signature_expiration_ledger,
             entry.signer,
             network_passphrase,
+            budget,
         )
         .await?;
         entries.push(delegated);
@@ -1253,18 +1325,25 @@ pub async fn sign_with_ed25519_rule(
 /// comes from, with [`PartialSorobanAuthorizationEntry::validate`] and
 /// against `network_passphrase`, before calling this function.
 ///
+/// # Deadline
+///
+/// With `budget`, each signer call runs under [`sign_within_budget`] at
+/// [`SIGN_DELEGATED_ENTRY_STAGE`]. `None` bounds nothing.
+///
 /// # Errors
 ///
 /// - [`SaError::MainnetWriteForbidden`] if `network_passphrase` is the
 ///   mainnet passphrase.
 /// - [`SaError::AuthEntryConstructionFailed`] (`stage = "auth_payload"`)
-///   if XDR encoding, ScVal construction, or `Signer` operations fail.
+///   if XDR encoding, ScVal construction, or `Signer` operations fail, and
+///   the deadline refusal of [`sign_within_budget`].
 pub(crate) async fn build_and_sign_delegated_g_key_entry(
     smart_account: &ScAddress,
     auth_digest: &[u8; 32],
     signature_expiration_ledger: u32,
     signer: &(dyn Signer + Send + Sync),
     network_passphrase: &str,
+    budget: Option<PreSubmitBudget>,
 ) -> Result<SorobanAuthorizationEntry, SaError> {
     use stellar_xdr::{
         AccountId, BytesM, Hash, HashIdPreimage, HashIdPreimageSorobanAuthorization, PublicKey,
@@ -1284,11 +1363,13 @@ pub(crate) async fn build_and_sign_delegated_g_key_entry(
     // The G-key whose require_auth_for_args call must be authorised.
     // In the single-signer flow the manager's signer doubles as both the
     // smart-account-rule signer AND the Delegated G-key.
-    let pubkey = signer.public_key().await.map_err(|e| {
-        auth_payload_err(format!(
-            "delegated entry: signer public_key fetch failed: {e}"
-        ))
-    })?;
+    let pubkey = sign_within_budget(budget, SIGN_DELEGATED_ENTRY_STAGE, signer.public_key())
+        .await?
+        .map_err(|e| {
+            auth_payload_err(format!(
+                "delegated entry: signer public_key fetch failed: {e}"
+            ))
+        })?;
     let g_key_address = ScAddress::Account(AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(
         pubkey.0,
     ))));
@@ -1352,10 +1433,13 @@ pub(crate) async fn build_and_sign_delegated_g_key_entry(
         .map_err(|e| auth_payload_err(format!("delegated entry: signature_payload: {e}")))?;
 
     // Sign with the Soroban-address-auth primitive.
-    let signature_bytes = signer
-        .sign_soroban_address_auth_payload(&signature_payload)
-        .await
-        .map_err(|e| auth_payload_err(format!("delegated entry: signing failed: {e}")))?;
+    let signature_bytes = sign_within_budget(
+        budget,
+        SIGN_DELEGATED_ENTRY_STAGE,
+        signer.sign_soroban_address_auth_payload(&signature_payload),
+    )
+    .await?
+    .map_err(|e| auth_payload_err(format!("delegated entry: signing failed: {e}")))?;
 
     // Stellar source-account auth signature shape:
     // ScVal::Vec([ScVal::Map([{public_key: BytesN<32>, signature: BytesN<64>}])])
@@ -1429,6 +1513,13 @@ impl PreSubmitBudget {
         Ok(())
     }
 
+    /// The refusal of a submission bounded by this deadline whose send-by
+    /// instant passed at `stage`, before anything was sent; reported at
+    /// `"auth_payload"`, as the RPC stages are.
+    pub(crate) fn send_refusal(self, stage: stellar_agent_network::PreSendStage) -> SaError {
+        self.elapsed(stage.label(), "auth_payload")
+    }
+
     /// The refusal of a pre-submit stage `stage` that met the deadline,
     /// reported at `elapse_stage`.
     fn elapsed(self, stage: &'static str, elapse_stage: &'static str) -> SaError {
@@ -1450,9 +1541,9 @@ impl PreSubmitBudget {
 /// the rule-lock acquisition, the signer-set baseline read of each checked
 /// rule, the pinned-hash drift check of each checked rule, the signer-set
 /// comparison of each checked rule, the initial fetch, the initial simulate,
-/// the re-fetch and the re-simulate. Time spent in an earlier stage
-/// (including the off-chain auth-entry signing step between simulate and
-/// re-simulate) shrinks the budget left for a later one. A stage can
+/// each authorization signature (see [`sign_within_budget`]), the re-fetch,
+/// the re-simulate and the envelope signature. Time spent in an earlier
+/// stage shrinks the budget left for a later one. A stage can
 /// therefore elapse because earlier stages consumed the collective budget,
 /// not because that stage itself ran long; the timeout message says
 /// "collective" for that reason.
@@ -1481,6 +1572,42 @@ pub(crate) async fn bound_pre_submit_stage<T>(
         "sa_submit_timing: pre-submit stage elapsed"
     );
     outcome
+}
+
+/// The stage of an authorization signature over a smart account's auth
+/// digest, and of the key read that precedes it.
+pub(crate) const SIGN_AUTH_DIGEST_STAGE: &str = "sign_auth_digest";
+
+/// The stage of a delegated G-key entry's signature, and of the key read
+/// that precedes it.
+pub(crate) const SIGN_DELEGATED_ENTRY_STAGE: &str = "sign_delegated_entry";
+
+/// Runs one signer call under `budget` when there is one, as pre-submit
+/// stage `stage` reported at `"auth_payload"`; `None` runs it unbounded.
+///
+/// A software key signs without yielding, so the deadline is checked before
+/// the call; the call is cut at the deadline; and a call that completes at or
+/// after it is refused as well. A signature that finishes after the deadline
+/// is therefore never used, and the refusal ends the signing: no further
+/// signer call and no send follows it.
+///
+/// # Errors
+///
+/// [`SaError::AuthEntryConstructionFailed`] with stage `"auth_payload"` and
+/// `stage` named in the reason when the deadline has passed before the call
+/// returns.
+pub(crate) async fn sign_within_budget<T>(
+    budget: Option<PreSubmitBudget>,
+    stage: &'static str,
+    call: impl std::future::Future<Output = T>,
+) -> Result<T, SaError> {
+    let Some(budget) = budget else {
+        return Ok(call.await);
+    };
+    budget.check_at(stage, "auth_payload")?;
+    let answer = bound_pre_submit_stage(budget, stage, "auth_payload", call).await?;
+    budget.check_at(stage, "auth_payload")?;
+    Ok(answer)
 }
 
 /// Re-simulates the InvokeHostFunction op with the signed smart-account
@@ -2317,6 +2444,7 @@ mod tests {
             expiry,
             &signer,
             network_passphrase,
+            None,
         )
         .await
         .unwrap();
@@ -2896,6 +3024,65 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ── sign_within_budget ────────────────────────────────────────────────────
+
+    /// Asserts the deadline refusal of `stage`.
+    fn assert_signing_refusal(outcome: Result<u32, SaError>, stage: &str) {
+        match outcome {
+            Err(SaError::AuthEntryConstructionFailed {
+                stage: "auth_payload",
+                redacted_reason,
+            }) => assert!(
+                redacted_reason
+                    .starts_with(&format!("{stage} exceeded collective pre-submit budget")),
+                "{redacted_reason}"
+            ),
+            other => panic!("expected the deadline refusal of {stage}, got {other:?}"),
+        }
+    }
+
+    /// A signer call that signs without yielding and completes only after
+    /// the deadline, on the one poll the deadline timer cannot cut, is
+    /// refused: its signature is not used.
+    #[tokio::test]
+    async fn a_signer_call_completing_past_the_deadline_is_refused() {
+        let budget = PreSubmitBudget {
+            deadline: tokio::time::Instant::now() + std::time::Duration::from_millis(100),
+            total: std::time::Duration::from_secs(1),
+        };
+
+        let outcome = sign_within_budget(Some(budget), SIGN_AUTH_DIGEST_STAGE, async {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            7_u32
+        })
+        .await;
+
+        assert_signing_refusal(outcome, SIGN_AUTH_DIGEST_STAGE);
+    }
+
+    /// A deadline already passed refuses before the signer call runs.
+    #[tokio::test]
+    async fn a_passed_deadline_refuses_before_the_signer_call_runs() {
+        let budget = PreSubmitBudget {
+            deadline: tokio::time::Instant::now(),
+            total: std::time::Duration::from_secs(1),
+        };
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+
+        let outcome = sign_within_budget(Some(budget), SIGN_DELEGATED_ENTRY_STAGE, async {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            7_u32
+        })
+        .await;
+
+        assert_signing_refusal(outcome, SIGN_DELEGATED_ENTRY_STAGE);
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the signer is not called"
+        );
     }
 
     // ── bound_pre_submit_stage ────────────────────────────────────────────────
@@ -3549,6 +3736,7 @@ mod tests {
             9999,
             &signer,
             TESTNET_PASSPHRASE,
+            None,
         )
         .await
         .unwrap();
@@ -3568,6 +3756,7 @@ mod tests {
             9999,
             &signer,
             MAINNET_PASSPHRASE,
+            None,
         )
         .await
         .unwrap_err();

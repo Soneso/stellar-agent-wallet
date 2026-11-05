@@ -48,6 +48,8 @@ After the last of those examples, run `unset WALLET_SK` to remove the seed from 
 
 ## Pre-submission checks
 
+Smart-account writes require a secondary RPC on the same network and on a host other than the primary's. The check compares normalized host names. Distinct names can resolve to the same machine; choose independently operated endpoints. Signing refuses unavailable or disagreeing ledger observations. The expiry bound assumes at least one independently operated endpoint reports the chain honestly. Ledger observations may differ by at most two in either order. Signature expiry is 100 ledgers beyond the lower observation.
+
 Every verb that signs a transaction authorized by a rule other than rule `0` checks each such rule before anything is simulated or signed: `smart-account execute`, `smart-account multicall`, the `smart-account rules` and `smart-account signers` write verbs, and `smart-account migrate-verifier` (see that verb). For each authorizing rule other than `0`, in ascending order, the wallet:
 
 1. Holds the rule's lock. A verb holds the lock of each rule it signs under while it signs, and a concurrent verb on the same rule waits for it. A lock not acquired before the pre-submit budget (`--timeout-seconds`) ends refuses with `sa.auth_entry_construction_failed` at stage `rule_lock`.
@@ -690,7 +692,7 @@ Flags:
 - `--smart-account <C_STRKEY>` (required): the smart-account executing the bundle.
 - `--rule-id <U32>` (required): the context rule authorizing the bundle.
 - `--invocation <TARGET:FN:JSON_ARGS>` (required, repeatable, 1 to 50): one invocation descriptor.
-- `--secondary-rpc-url <URL>`: secondary RPC for cross-verification. Resolved from the flag, else the profile's `secondary_rpc_url`, else a typed error.
+- `--secondary-rpc-url <URL>`: secondary RPC for cross-verification and the ledger witness. Resolved from the flag, else the profile's `secondary_rpc_url`, else `smart_account.ledger_witness_unavailable`. Ledger observations may differ by at most two in either order. Signature expiry is 100 ledgers beyond the lower observation.
 - `--fee <STROOPS>`: per-op base fee in stroops (default 100). Unlike the deploy verb, `auto[:pNN]` is rejected here.
 - Signer-source flags are required (one of `--signer-secret-env` or `--sign-with-ledger`); `--account-index <INDEX>` defaults to `0`.
 - Shared: `--profile`, `--network`, `--rpc-url`, `--timeout-seconds`.
@@ -945,7 +947,9 @@ stellar-agent smart-account unregister-multicall --network testnet
 
 Schedule, cancel, execute, and list pending operations on an OpenZeppelin timelock contract. The signer must hold the appropriate timelock role for each write verb. All four share `--timelock <C_STRKEY>` (required), `--rpc-url`, `--secondary-rpc-url`, `--network`, and `--profile`; the write verbs add the signer-source group. The write verbs (`schedule`, `cancel`, `execute`) structurally refuse `mainnet`; `list-pending` is read-only and accepts `mainnet`.
 
-Without `--secondary-rpc-url`, the profile secondary applies. A configured mainnet secondary requires its provider attestation and a host distinct from the primary. If neither source supplies a secondary, timelock uses the primary.
+Without `--secondary-rpc-url`, the profile secondary applies. A configured mainnet secondary requires its provider attestation and a host distinct from the primary. If neither source supplies a secondary, `list-pending` reads through the primary alone.
+
+Smart-account writes require a secondary RPC on the same network. Signing refuses unavailable or disagreeing ledger observations. The expiry bound assumes at least one independently operated endpoint reports the chain honestly. Ledger observations may differ by at most two in either order. Signature expiry is 100 ledgers beyond the lower observation.
 
 #### `smart-account timelock schedule`
 

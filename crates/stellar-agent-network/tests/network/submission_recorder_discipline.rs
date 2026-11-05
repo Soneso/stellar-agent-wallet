@@ -74,6 +74,10 @@ const SEAM_CALLEES: &[&str] = &["submit_transaction_and_wait", "submit_and_wait"
 /// Its recorder parameter is a reference, so a call always names one.
 const AUTHORIZED_SEAM: (&str, usize, usize) = ("submit_authorized_transaction_and_wait", 9, 6);
 
+/// The submission seam bounded by a send-by instant: seven arguments, the
+/// recorder last.
+const SENT_BY_SEAM: (&str, usize, usize) = ("submit_transaction_and_wait_sent_by", 7, 6);
+
 /// Files that submit through a shared helper instead of calling the seam,
 /// with the helper's callee name and the number of production calls each
 /// file owes it. The helper's own file is listed in [`REQUIRED_FILES`].
@@ -205,19 +209,19 @@ impl<'ast> Visit<'ast> for RecorderSites {
                     call.span().start().line
                 );
                 self.record(call.span(), call.args.last().expect("recorder argument"));
-            } else if name.ident == AUTHORIZED_SEAM.0 {
+            } else if let Some((_, arity, recorder)) = [AUTHORIZED_SEAM, SENT_BY_SEAM]
+                .into_iter()
+                .find(|(seam, _, _)| name.ident == seam)
+            {
                 assert_eq!(
                     call.args.len(),
-                    AUTHORIZED_SEAM.1,
-                    "authorized submission seam argument shape at line {}",
+                    arity,
+                    "submission seam argument shape at line {}",
                     call.span().start().line
                 );
                 self.record(
                     call.span(),
-                    call.args
-                        .iter()
-                        .nth(AUTHORIZED_SEAM.2)
-                        .expect("recorder argument"),
+                    call.args.iter().nth(recorder).expect("recorder argument"),
                 );
             } else if name.ident == "new_with_submit_ctx" {
                 self.submit_contexts += 1;

@@ -663,14 +663,14 @@ async fn install_pins_the_reference_and_signing_detects_the_repoint() {
     let (audit_writer, audit_log_path, _audit_dir) = tmp_audit_writer();
     let signers_manager = signers_manager_for_tests(
         TESTNET_RPC_URL,
-        TESTNET_RPC_URL,
+        stellar_agent_test_support::testnet_secondary_rpc_url(),
         Arc::clone(&audit_writer),
         audit_log_path.clone(),
         TIMEOUT,
     );
     let manager = rule_manager_for_tests(
         TESTNET_RPC_URL,
-        None,
+        Some(stellar_agent_test_support::testnet_secondary_rpc_url()),
         Arc::clone(&signers_manager),
         Arc::clone(&audit_writer),
         TIMEOUT,
@@ -921,6 +921,7 @@ async fn install_pins_the_reference_and_signing_detects_the_repoint() {
                 verifier: fixture.proxy_sc.clone(),
             })
             .primary_rpc_url(TESTNET_RPC_URL)
+            .secondary_rpc_url(stellar_agent_test_support::testnet_secondary_rpc_url())
             .network_passphrase(TESTNET_PASSPHRASE)
             .chain_id(CHAIN_ID)
             .timeout(TIMEOUT)
@@ -974,6 +975,7 @@ async fn install_pins_the_reference_and_signing_detects_the_repoint() {
                 verifier: fixture.proxy_sc.clone(),
             })
             .primary_rpc_url(TESTNET_RPC_URL)
+            .secondary_rpc_url(stellar_agent_test_support::testnet_secondary_rpc_url())
             .network_passphrase(TESTNET_PASSPHRASE)
             .chain_id(CHAIN_ID)
             .timeout(TIMEOUT)

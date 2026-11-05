@@ -190,9 +190,10 @@ pub struct DefiAdapterCtx<'a> {
     pub chain_id: Option<&'a str>,
     /// Optional secondary Stellar RPC for the two-RPC cross-check.
     ///
-    /// When `None`, the primary RPC is used for both sides of any two-RPC
-    /// check (degraded security).  Configuring a distinct secondary is
-    /// strongly recommended for mainnet operations.
+    /// A read with `None` uses the primary RPC for both sides of a two-RPC
+    /// check. A smart-account submit requires a secondary on a host other than
+    /// the primary's and refuses with [`DefiAdapterError::SigningRefusal`]
+    /// otherwise.
     pub secondary_rpc: Option<&'a StellarRpcClient>,
     /// Submit polling timeout.
     ///
@@ -541,6 +542,19 @@ pub enum DefiAdapterError {
     PolicyDenied {
         /// The typed denial, as the governing criterion produced it.
         reason: Box<stellar_agent_core::policy::DenyReason>,
+    },
+    /// The signing path refused before any signature was made, and nothing was
+    /// sent.
+    ///
+    /// Distinct from [`Self::Network`] and [`Self::SubmissionUnresolved`]: the
+    /// refusal has its own stable `wire_code`, which the surface reports
+    /// unchanged, and no transaction exists to reconcile.
+    #[error("{message}")]
+    SigningRefusal {
+        /// The stable wire code of the refusal.
+        wire_code: &'static str,
+        /// Operator-facing message; it carries no endpoint input.
+        message: String,
     },
     /// A write declared for mainnet, aimed at a mainnet-pattern endpoint, or
     /// sent to an endpoint that reports the mainnet passphrase was refused. No

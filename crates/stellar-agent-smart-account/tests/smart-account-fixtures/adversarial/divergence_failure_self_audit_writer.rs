@@ -36,6 +36,7 @@ use stellar_agent_smart_account::managers::rules::{
     ContextRuleDefinition, ContextRuleManager, ContextRuleManagerConfig, ContextRuleSignerInput,
     parse_g_strkey_to_signer_address,
 };
+use stellar_agent_test_support::second_loopback_host;
 use stellar_xdr::ScAddress;
 use uuid::Uuid;
 use wiremock::{
@@ -138,7 +139,7 @@ async fn build_fixture() -> DivergenceFixture {
 
     let signers_manager = Arc::new(manager_two_url(
         &primary_server.uri(),
-        &secondary_server.uri(),
+        &second_loopback_host(&secondary_server.uri()),
         Arc::clone(&audit_writer),
         audit_log_path,
     ));
@@ -149,6 +150,7 @@ async fn build_fixture() -> DivergenceFixture {
             Duration::from_secs(5),
             CHAIN_ID.to_owned(),
         )
+        .with_secondary_rpc_url(second_loopback_host(&secondary_server.uri()))
         .with_signers_manager(signers_manager)
         .with_audit_writer(Arc::clone(&audit_writer)),
     )

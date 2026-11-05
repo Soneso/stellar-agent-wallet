@@ -849,6 +849,9 @@ async fn acceptance_submit_and_confirm() {
     let primary_rpc = testnet_rpc();
 
     // Build DefiAdapterCtx with full submit context.
+    let secondary_rpc =
+        StellarRpcClient::new(stellar_agent_test_support::testnet_secondary_rpc_url())
+            .expect("secondary RPC URL must be valid");
     let mut ctx = DefiAdapterCtx::new_with_submit_ctx(
         "default",
         &pin,
@@ -856,7 +859,7 @@ async fn acceptance_submit_and_confirm() {
         Some(signer.as_ref()),
         Some(TESTNET_PASSPHRASE),
         Some(TESTNET_CHAIN_ID),
-        None, // single-RPC for testnet acceptance
+        Some(&secondary_rpc),
         Some(Duration::from_secs(120)),
     );
 

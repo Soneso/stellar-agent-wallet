@@ -37,7 +37,7 @@ use stellar_agent_smart_account::submit::ResolvedFeePerOp;
 use stellar_agent_test_support::signed_envelope::{
     account_id_for_seed, get_network_result, send_transaction_hash_hex,
 };
-use stellar_agent_test_support::{StellarAgentHomeGuard, keyring_mock};
+use stellar_agent_test_support::{StellarAgentHomeGuard, keyring_mock, second_loopback_host};
 use stellar_xdr::{
     ContractId, Hash, HostFunction, InvokeContractArgs, Limits, OperationBody, ReadXdr, ScAddress,
     ScVal, SorobanAddressCredentials, SorobanAuthorizationEntry, SorobanAuthorizedFunction,
@@ -435,11 +435,31 @@ impl Fixture {
         engine: Arc<PolicyEngineV1>,
         chain_id: &str,
     ) -> Result<stellar_agent_smart_account::multicall::MulticallResult, SaError> {
+        self.multicall_with_secondary(url, &second_loopback_host(url), bundle, engine, chain_id)
+            .await
+    }
+
+    #[allow(
+        clippy::result_large_err,
+        reason = "preserve the submission API's typed error for assertions"
+    )]
+    #[allow(
+        clippy::significant_drop_tightening,
+        reason = "the signer and manager live for the whole submission"
+    )]
+    async fn multicall_with_secondary(
+        &self,
+        url: &str,
+        secondary_url: &str,
+        bundle: Vec<MulticallInvocation>,
+        engine: Arc<PolicyEngineV1>,
+        chain_id: &str,
+    ) -> Result<stellar_agent_smart_account::multicall::MulticallResult, SaError> {
         let signer = SoftwareSigningKey::new_from_bytes(SEED);
         // The bundle signs under rule 0, which the pinned-hash drift check
         // never fetches or reads.
         let signers_manager =
-            pin_check_manager::pin_check_manager(url, url, PROFILE, self._root.path());
+            pin_check_manager::pin_check_manager(url, secondary_url, PROFILE, self._root.path());
         submit_multicall_bundle(
             MulticallSubmitArgs {
                 smart_account: &contract(0x44),
@@ -447,7 +467,7 @@ impl Fixture {
                 bundle,
                 signer: &signer,
                 primary_rpc_url: url,
-                secondary_rpc_url: url,
+                secondary_rpc_url: secondary_url,
                 network_passphrase: PASSPHRASE,
                 policy_engine: engine,
                 profile: &self.profile,
@@ -863,7 +883,7 @@ async fn timed_out_timelock_execute_keeps_receipt_and_pending_row() {
             .salt([0x50; 32])
             .signer(&signer)
             .primary_rpc_url(&server.uri())
-            .secondary_rpc_url(&server.uri())
+            .secondary_rpc_url(&second_loopback_host(&server.uri()))
             .network_passphrase(PASSPHRASE)
             .audit_writer(&fixture.audit)
             .request_id("timelock-record")
@@ -926,6 +946,113 @@ fn assert_multicall_chain_mismatch(error: &SaError) {
     );
 }
 
+/// A bundle whose witness is on the primary's host refuses with the witness
+/// code, writes its denied row and reserves nothing.
+#[tokio::test]
+#[serial]
+async fn multicall_on_one_host_refuses_with_the_witness_code() {
+    let fixture = Fixture::new();
+    let (server, sends, _) = rpc("SUCCESS").await;
+    let error = fixture
+        .multicall_with_secondary(
+            &server.uri(),
+            &server.uri(),
+            fixture.bundle(),
+            fixture.engine(),
+            fixture.profile.chain_id.caip2_str(),
+        )
+        .await
+        .expect_err("one host is no witness");
+    assert_eq!(
+        error.wire_code(),
+        "smart_account.ledger_witness_unavailable"
+    );
+    assert_eq!(sends.load(Ordering::SeqCst), 0);
+    assert_eq!(fixture.total(), (0, 0));
+    let denied = fixture.rows("sa_multicall_bundle_denied");
+    assert_eq!(denied.len(), 1, "{denied:?}");
+    assert_eq!(
+        denied[0]["deny_wire_code"],
+        "multicall.smart_account.ledger_witness_unavailable"
+    );
+}
+
+/// A bundle on one host refuses before the policy gate weighs it: four
+/// 30-unit transfers exceed the bundle cap of 100, yet the one denied row
+/// carries the witness code, not the cap's.
+#[tokio::test]
+#[serial]
+async fn multicall_on_one_host_refuses_before_the_policy_gate() {
+    let fixture = Fixture::new();
+    let (server, sends, _) = rpc("SUCCESS").await;
+    let mut over_cap = fixture.bundle();
+    over_cap.extend(fixture.bundle());
+    assert_eq!(over_cap.len(), 4);
+    let error = fixture
+        .multicall_with_secondary(
+            &server.uri(),
+            &server.uri(),
+            over_cap,
+            fixture.engine(),
+            fixture.profile.chain_id.caip2_str(),
+        )
+        .await
+        .expect_err("one host is no witness");
+    assert_eq!(
+        error.wire_code(),
+        "smart_account.ledger_witness_unavailable",
+        "{error:?}"
+    );
+    let denied = fixture.rows("sa_multicall_bundle_denied");
+    assert_eq!(denied.len(), 1, "{denied:?}");
+    assert_eq!(
+        denied[0]["deny_wire_code"],
+        "multicall.smart_account.ledger_witness_unavailable"
+    );
+    assert_eq!(sends.load(Ordering::SeqCst), 0);
+    assert_eq!(fixture.total(), (0, 0));
+}
+
+/// A bundle whose endpoints disagree on the ledger keeps the skew code through
+/// the multicall surface and sends nothing.
+#[tokio::test]
+#[serial]
+async fn multicall_with_skewed_endpoints_refuses_with_the_skew_code() {
+    let fixture = Fixture::new();
+    let (server, sends, _) = rpc("SUCCESS").await;
+    let witness = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(wiremock::matchers::body_partial_json(
+            json!({"method": "getNetwork"}),
+        ))
+        .respond_with(stellar_agent_test_support::EchoIdResponder::new(
+            get_network_result(PASSPHRASE),
+        ))
+        .mount(&witness)
+        .await;
+    Mock::given(method("POST"))
+        .and(wiremock::matchers::body_partial_json(
+            json!({"method": "getLatestLedger"}),
+        ))
+        .respond_with(stellar_agent_test_support::EchoIdResponder::new(
+            json!({"id": "ab".repeat(32), "sequence": 1003, "protocolVersion": 27}),
+        ))
+        .mount(&witness)
+        .await;
+    let error = fixture
+        .multicall_with_secondary(
+            &server.uri(),
+            &second_loopback_host(&witness.uri()),
+            fixture.bundle(),
+            fixture.engine(),
+            fixture.profile.chain_id.caip2_str(),
+        )
+        .await
+        .expect_err("a three-ledger skew refuses");
+    assert_eq!(error.wire_code(), "simulation.divergence.ledger_skew");
+    assert_eq!(sends.load(Ordering::SeqCst), 0);
+}
+
 #[tokio::test]
 #[serial]
 async fn multicall_chain_mismatch_has_no_side_effects() -> Result<(), Box<dyn std::error::Error>> {
@@ -934,7 +1061,7 @@ async fn multicall_chain_mismatch_has_no_side_effects() -> Result<(), Box<dyn st
     // The manager creates fixture files so the snapshot isolates the submission's effects.
     drop(pin_check_manager::pin_check_manager(
         &server.uri(),
-        &server.uri(),
+        &second_loopback_host(&server.uri()),
         PROFILE,
         fixture._root.path(),
     ));

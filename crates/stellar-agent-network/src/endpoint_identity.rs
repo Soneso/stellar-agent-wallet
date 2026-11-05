@@ -165,6 +165,82 @@ impl EndpointIdentity {
     }
 }
 
+/// One endpoint's latest ledger, read through the client whose checked
+/// identity the observation carries.
+///
+/// [`StellarRpcClient::signing_ledger_observation`](crate::StellarRpcClient::signing_ledger_observation)
+/// is the only constructor outside this crate's tests: it runs
+/// [`StellarRpcClient::endpoint_identity`](crate::StellarRpcClient::endpoint_identity)
+/// and reads `getLatestLedger` through the same client under the same
+/// deadline. Holding a value means the height came from an endpoint that
+/// passed the identity checks. The height itself is the endpoint's claim; a
+/// signing path compares it with another endpoint's observation before it
+/// relies on it.
+///
+/// ```compile_fail,E0639
+/// use stellar_agent_network::SigningLedgerObservation;
+/// fn forge(p: SigningLedgerObservation) -> SigningLedgerObservation {
+///     SigningLedgerObservation { ..p }
+/// }
+/// ```
+///
+/// ```compile_fail,E0616
+/// use stellar_agent_network::SigningLedgerObservation;
+/// fn inspect(p: &SigningLedgerObservation) { let _ = &p.ledger; }
+/// ```
+///
+/// The import and the getters resolve, so the snippets above fail on the
+/// barrier they name and not on the path:
+///
+/// ```
+/// use stellar_agent_network::SigningLedgerObservation;
+/// fn inspect(p: &SigningLedgerObservation) -> (u32, &str) {
+///     (p.ledger(), p.identity().authority())
+/// }
+/// let _ = inspect;
+/// ```
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SigningLedgerObservation {
+    identity: EndpointIdentity,
+    ledger: u32,
+    observed_at: tokio::time::Instant,
+}
+
+impl SigningLedgerObservation {
+    /// Builds the observation of a height read through the client `identity`
+    /// names, at `observed_at`.
+    pub(crate) fn checked(
+        identity: EndpointIdentity,
+        ledger: u32,
+        observed_at: tokio::time::Instant,
+    ) -> Self {
+        Self {
+            identity,
+            ledger,
+            observed_at,
+        }
+    }
+
+    /// The checked identity of the endpoint that reported the height.
+    #[must_use]
+    pub fn identity(&self) -> &EndpointIdentity {
+        &self.identity
+    }
+
+    /// The latest ledger the endpoint reported, as received.
+    #[must_use]
+    pub fn ledger(&self) -> u32 {
+        self.ledger
+    }
+
+    /// The local instant the answer arrived.
+    #[must_use]
+    pub fn observed_at(&self) -> tokio::time::Instant {
+        self.observed_at
+    }
+}
+
 /// An oracle client whose endpoint reported the mainnet passphrase and a
 /// protocol version the protocol rule accepts for mainnet.
 ///

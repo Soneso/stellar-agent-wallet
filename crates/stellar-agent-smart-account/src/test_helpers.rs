@@ -92,9 +92,8 @@ pub fn rule_manager_config_for_tests(
 /// Builds a [`ContextRuleManager`] and its [`SignersManager`] over one new
 /// audit log in a temporary directory, as production wires them.
 ///
-/// The signers manager reads through `primary_rpc_url` and
-/// `secondary_rpc_url`; the rule manager submits through `primary_rpc_url`
-/// with no secondary simulation check. Returns the two managers, the audit
+/// Both managers use `primary_rpc_url` and `secondary_rpc_url`, the second as
+/// the ledger witness of a signing verb. Returns the two managers, the audit
 /// log's path and the directory that holds it, which the caller keeps for as
 /// long as it uses the managers.
 ///
@@ -127,7 +126,7 @@ pub fn managers_for_tests(
     );
     let rule_manager = rule_manager_for_tests(
         primary_rpc_url,
-        None,
+        Some(secondary_rpc_url),
         Arc::clone(&signers_manager),
         audit_writer,
         timeout,

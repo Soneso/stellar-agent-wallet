@@ -5299,6 +5299,7 @@ dependencies = [
  "base64 0.22.1",
  "ed25519-dalek",
  "keyring-core",
+ "libc",
  "memchr",
  "p256",
  "rand_core 0.6.4",

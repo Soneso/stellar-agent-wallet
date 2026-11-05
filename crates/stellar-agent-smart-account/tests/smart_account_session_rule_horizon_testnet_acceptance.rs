@@ -142,7 +142,7 @@ async fn fund_via_friendbot(g_strkey: &str) {
 fn fresh_rule_manager() -> (ContextRuleManager, TempDir) {
     let (manager, _signers_manager, _audit_log_path, dir) = managers_for_tests(
         TESTNET_RPC_URL,
-        TESTNET_RPC_URL,
+        stellar_agent_test_support::testnet_secondary_rpc_url(),
         Duration::from_secs(TIMEOUT_SECS),
     );
     (manager, dir)

@@ -31,6 +31,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use stellar_agent_core::smart_account::rule_id::ContextRuleId;
 use stellar_agent_smart_account::error::SaError;
 use stellar_agent_smart_account::submit::{SubmitInvokeArgs, submit_signed_invoke};
+use stellar_agent_test_support::second_loopback_host;
 use stellar_xdr::{ContractId, Hash, HostFunction, InvokeContractArgs, ScAddress, ScSymbol, VecM};
 use wiremock::{
     Mock, MockServer,
@@ -156,6 +157,7 @@ async fn initial_fetch_consults_the_sequence_floor_hook() {
             .host_function(dummy_host_function())
             .signer(&signer)
             .primary_rpc_url(server.uri().as_str())
+            .secondary_rpc_url(second_loopback_host(&server.uri()).as_str())
             .network_passphrase(NETWORK_PASSPHRASE)
             .chain_id(CHAIN_ID)
             .timeout(std::time::Duration::from_secs(10))
@@ -213,6 +215,7 @@ async fn no_hook_reproduces_plain_fetch_behaviour() {
             .host_function(dummy_host_function())
             .signer(&signer)
             .primary_rpc_url(server.uri().as_str())
+            .secondary_rpc_url(second_loopback_host(&server.uri()).as_str())
             .network_passphrase(NETWORK_PASSPHRASE)
             .chain_id(CHAIN_ID)
             .timeout(std::time::Duration::from_secs(10))

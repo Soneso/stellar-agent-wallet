@@ -724,6 +724,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - No public function of a build without the `test-helpers` feature writes a
   pin the caller composes. The typed policy pin writer is internal to the core
   crate.
+- Smart-account, timelock and multicall signing require an independent ledger
+  observation before creating signatures. Missing or inconsistent evidence
+  refuses the operation.
 - Crate publication rebuilds every vendored contract Wasm file of the published
   commit from its pinned source with the pinned tools and compares the bytes
   before the registry credential is requested. A failed, cancelled or skipped

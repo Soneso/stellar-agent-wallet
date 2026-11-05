@@ -32,6 +32,7 @@ use stellar_agent_smart_account::{
         submit_signed_invoke,
     },
 };
+use stellar_agent_test_support::second_loopback_host;
 use stellar_agent_test_support::signed_envelope::{
     account_id_for_seed, get_network_result, public_key_for_seed, send_transaction_hash_hex,
 };
@@ -351,6 +352,7 @@ async fn submit_on(
                 SigningPath::Quorum => &quorum_signers,
             })
             .primary_rpc_url(&mock.uri())
+            .secondary_rpc_url(&second_loopback_host(&mock.uri()))
             .network_passphrase(PASSPHRASE)
             .chain_id("stellar:testnet")
             .timeout(Duration::from_secs(5))

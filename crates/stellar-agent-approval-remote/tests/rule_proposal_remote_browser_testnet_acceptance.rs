@@ -879,6 +879,8 @@ async fn rule_proposal_remote_browser_drives_real_rule_install() {
     .with_noop_engine()
     .build();
     profile.rpc_url = TESTNET_RPC_URL.to_owned();
+    profile.secondary_rpc_url =
+        Some(stellar_agent_test_support::testnet_secondary_rpc_url().to_owned());
     seed_keyring(&profile, &proposer_seed, &attestation_key);
 
     let mut server = WalletServer::new(profile.clone()).expect("WalletServer::new");
@@ -1301,6 +1303,8 @@ async fn negative_test_fixture() -> (WalletServer, TempDir, String, String, [u8;
     .with_noop_engine()
     .build();
     profile.rpc_url = TESTNET_RPC_URL.to_owned();
+    profile.secondary_rpc_url =
+        Some(stellar_agent_test_support::testnet_secondary_rpc_url().to_owned());
     seed_keyring(&profile, &proposer_seed, &attestation_key);
 
     let mut server = WalletServer::new(profile).expect("WalletServer::new");

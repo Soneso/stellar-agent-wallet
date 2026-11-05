@@ -25,6 +25,7 @@ use stellar_agent_dex::pins::{SOROSWAP_ROUTER_ADDRESS_TESTNET, SOROSWAP_ROUTER_W
 use stellar_agent_network::StellarRpcClient;
 use stellar_agent_network::signing::test_doubles::CountingSigner;
 use stellar_agent_test_support::auth_tree_rpc::{AuthTreeEndpoint, AuthTreeRpc};
+use stellar_agent_test_support::second_loopback_host;
 use stellar_agent_test_support::signed_envelope::{TESTNET_PASSPHRASE, account_id_for_seed};
 use stellar_xdr::{
     ContractExecutable, ContractId, Hash, HostFunction, Int128Parts, InvokeContractArgs,
@@ -183,6 +184,7 @@ async fn swap(
         .await;
 
     let rpc = StellarRpcClient::new(&endpoint.uri()).unwrap();
+    let secondary_rpc = StellarRpcClient::new(&second_loopback_host(&endpoint.uri())).unwrap();
     let pin = DefiContractPin::new(
         "soroswap",
         "router-direct",
@@ -200,7 +202,7 @@ async fn swap(
         Some(&signer),
         Some(TESTNET_PASSPHRASE),
         Some("stellar:testnet"),
-        None,
+        Some(&secondary_rpc),
         Some(Duration::from_secs(5)),
     );
     let now = SystemTime::now()

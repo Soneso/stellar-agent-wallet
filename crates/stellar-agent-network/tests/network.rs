@@ -74,6 +74,8 @@ mod submit_binding_integration;
 mod submit_integration;
 #[path = "network/submit_result_mapping.rs"]
 mod submit_result_mapping;
+#[path = "network/submit_send_by.rs"]
+mod submit_send_by;
 #[path = "network/transaction_status_reads.rs"]
 mod transaction_status_reads;
 #[path = "network/window_admission.rs"]

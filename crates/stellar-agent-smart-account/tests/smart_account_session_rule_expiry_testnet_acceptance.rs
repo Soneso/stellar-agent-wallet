@@ -237,7 +237,7 @@ fn fresh_rule_manager_uncapped(
 ) -> ContextRuleManager {
     let signers_manager = signers_manager_for_tests(
         TESTNET_RPC_URL,
-        TESTNET_RPC_URL,
+        stellar_agent_test_support::testnet_secondary_rpc_url(),
         Arc::clone(&audit_writer),
         audit_log_path,
         Duration::from_secs(TIMEOUT_SECS),
@@ -258,7 +258,7 @@ fn rule_manager_uncapped_over(
     ContextRuleManager::new(
         rule_manager_config_for_tests(
             TESTNET_RPC_URL,
-            None,
+            Some(stellar_agent_test_support::testnet_secondary_rpc_url()),
             signers_manager,
             audit_writer,
             Duration::from_secs(TIMEOUT_SECS),
@@ -571,7 +571,7 @@ async fn h_2_post_revocation_new_sign_refused() {
     let (attach_audit_writer, attach_audit_log_path, _attach_tmpdir) = tmp_audit_writer();
     let attach_signers_manager = signers_manager_for_tests(
         TESTNET_RPC_URL,
-        TESTNET_RPC_URL,
+        stellar_agent_test_support::testnet_secondary_rpc_url(),
         Arc::clone(&attach_audit_writer),
         attach_audit_log_path,
         Duration::from_secs(TIMEOUT_SECS),

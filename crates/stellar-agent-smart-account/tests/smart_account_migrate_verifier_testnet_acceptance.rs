@@ -247,7 +247,7 @@ fn fresh_signers_manager(
 ) -> Arc<SignersManager> {
     signers_manager_for_tests(
         TESTNET_RPC_URL,
-        TESTNET_RPC_URL,
+        stellar_agent_test_support::testnet_secondary_rpc_url(),
         audit_writer,
         audit_log_path,
         Duration::from_secs(TIMEOUT_SECS),
@@ -263,7 +263,7 @@ fn fresh_rule_manager(
 ) -> ContextRuleManager {
     rule_manager_for_tests(
         TESTNET_RPC_URL,
-        None,
+        Some(stellar_agent_test_support::testnet_secondary_rpc_url()),
         Arc::clone(signers_manager),
         Arc::clone(audit_writer),
         Duration::from_secs(TIMEOUT_SECS),
@@ -2206,6 +2206,7 @@ async fn d3_migrate_verifier_on_chain_submit() {
             ))
             .signer(signer_box.as_ref())
             .primary_rpc_url(TESTNET_RPC_URL)
+            .secondary_rpc_url(stellar_agent_test_support::testnet_secondary_rpc_url())
             .network_passphrase(TESTNET_PASSPHRASE)
             .chain_id(CHAIN_ID)
             .timeout(Duration::from_secs(TIMEOUT_SECS))

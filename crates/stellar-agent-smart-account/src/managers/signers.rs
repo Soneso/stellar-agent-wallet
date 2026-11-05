@@ -492,9 +492,12 @@ pub struct SignersManagerConfig {
     /// Primary Soroban RPC URL.
     pub primary_rpc_url: String,
 
-    /// Secondary Soroban RPC URL for two-RPC consultation.
+    /// Secondary Soroban RPC URL for two-RPC consultation and the ledger
+    /// witness of every signing verb.
     ///
-    /// May equal `primary_rpc_url` (degrades to single-RPC; warning is logged).
+    /// May equal `primary_rpc_url` for read verbs, whose consultation then
+    /// degrades to single-RPC with a logged warning. Signing refuses that
+    /// configuration with [`SaError::LedgerWitnessUnavailable`].
     pub secondary_rpc_url: String,
 
     /// Shared audit-log writer handle.
@@ -555,7 +558,8 @@ impl SignersManagerConfig {
     /// Constructs a new `SignersManagerConfig`.
     ///
     /// Logs a warning if `primary_rpc_url == secondary_rpc_url`, because the
-    /// two-RPC consultation degrades to a single RPC in that case.
+    /// two-RPC consultation degrades to a single RPC in that case and signing
+    /// verbs refuse.
     ///
     /// # Arguments
     ///
@@ -640,6 +644,7 @@ impl SignersManagerConfig {
 ///   exceeds the number of available signers.
 pub struct SignersManager {
     primary_rpc_url: String,
+    secondary_rpc_url: String,
     audit_writer: Arc<Mutex<AuditWriter>>,
     audit_log_path: PathBuf,
     network_passphrase: String,
@@ -692,6 +697,7 @@ impl SignersManager {
             .map_err(|e| mk_err(&config.secondary_rpc_url, &e))?;
         Ok(Self {
             primary_rpc_url: config.primary_rpc_url,
+            secondary_rpc_url: config.secondary_rpc_url,
             audit_writer: config.audit_writer,
             audit_log_path: config.audit_log_path,
             network_passphrase: config.network_passphrase,
@@ -7629,6 +7635,7 @@ impl SignersManager {
                 .host_function(host_function)
                 .signer(signer)
                 .primary_rpc_url(&self.primary_rpc_url)
+                .secondary_rpc_url(&self.secondary_rpc_url)
                 .network_passphrase(&self.network_passphrase)
                 .chain_id(&self.chain_id)
                 .timeout(self.timeout)
@@ -10976,6 +10983,7 @@ pub(crate) mod tests {
     /// A URL the submit path never dials: every refusal below lands before
     /// network I/O.
     const LOCK_TEST_RPC: &str = "http://rule-locks-must-not-be-dialed.invalid";
+    const LOCK_TEST_SECONDARY_RPC: &str = "http://rule-locks-secondary-must-not-be-dialed.invalid";
 
     /// A signers manager over a fresh audit log, with the directory that
     /// holds the log.
@@ -10987,7 +10995,7 @@ pub(crate) mod tests {
         ));
         let manager = crate::test_helpers::signers_manager_for_tests(
             LOCK_TEST_RPC,
-            LOCK_TEST_RPC,
+            LOCK_TEST_SECONDARY_RPC,
             writer,
             log_path,
             std::time::Duration::from_secs(5),
@@ -11021,6 +11029,7 @@ pub(crate) mod tests {
                 .host_function(host_function)
                 .signer(&signer)
                 .primary_rpc_url(LOCK_TEST_RPC)
+                .secondary_rpc_url(LOCK_TEST_SECONDARY_RPC)
                 .network_passphrase(stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE)
                 .chain_id("stellar:testnet")
                 .timeout(std::time::Duration::from_secs(5))

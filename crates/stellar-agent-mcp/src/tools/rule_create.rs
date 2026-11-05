@@ -3161,6 +3161,8 @@ mod tests {
             .to_string()
             .to_string();
         let mut profile = test_profile(dir);
+        profile.secondary_rpc_url =
+            Some(stellar_agent_test_support::second_loopback_host(&rpc_url));
         profile.rpc_url = rpc_url;
         profile.mcp_signer_default.account.clone_from(&account);
         configure_keyring(&mut profile);

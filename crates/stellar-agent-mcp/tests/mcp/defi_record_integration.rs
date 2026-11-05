@@ -373,7 +373,10 @@ async fn exercise(tool: Tool, initially_confirmed: bool, fault: Option<SignerFau
         })
         .mount(&mock)
         .await;
-    let profile = crate::common::timeout_profile(&mock.uri(), &source);
+    let mut profile = crate::common::timeout_profile(&mock.uri(), &source);
+    profile.secondary_rpc_url = Some(stellar_agent_test_support::second_loopback_host(
+        &mock.uri(),
+    ));
     let mut server = WalletServer::new(profile.clone()).unwrap();
     let profile_name = server.profile_name_for_approval();
     server.set_policy_engine_for_test(Arc::new(PolicyEngineV1::new(

@@ -26,7 +26,8 @@
 //!
 //! 1. `profile.secondary_rpc_url` from the loaded profile TOML.
 //! 2. `--secondary-rpc-url` CLI flag (overrides the profile field).
-//! 3. If neither is set: error with `WalletError::Auth` typed error.
+//! 3. If neither is set, or the URL is on the primary's host: the command
+//!    refuses with `smart_account.ledger_witness_unavailable`.
 //!
 //! # Invocation format
 //!
@@ -102,6 +103,7 @@ use crate::commands::policy_engine::load_v1_policy_engine;
 use crate::commands::smart_account::common::{
     SignerSourceFlags, construct_signers_manager_from_fields, emit_multicall_registry_error,
     emit_sa_error, load_command_profile, map_access_error, open_audit_writer, resolve_signer,
+    signing_secondary_rpc_url,
 };
 use crate::common::network::{
     EndpointFlags, EndpointUrlFlag, TargetNetwork, network_context_for_command,
@@ -323,13 +325,6 @@ pub async fn run(args: &MulticallArgs) -> i32 {
         render_json(&Envelope::<()>::err(&e));
         return 1;
     }
-    if context.secondary_rpc_url.is_none() {
-        let e = WalletError::Validation(ValidationError::address_check(
-            "secondary_rpc_url is required for multicall: set it in the profile TOML (secondary_rpc_url = \"https://...\") or pass --secondary-rpc-url",
-        ));
-        render_json(&Envelope::<()>::err(&e));
-        return 1;
-    }
 
     // Load the multicall registry.
     let networks_toml_path = match default_networks_toml_path() {
@@ -391,6 +386,13 @@ pub async fn run(args: &MulticallArgs) -> i32 {
             }
         };
     let audit_writer = Some(Arc::clone(&profile_audit_writer));
+
+    // The signature rests on a second endpoint's ledger observation, and the
+    // trust anchor compares the same two endpoints.
+    let secondary_rpc_url = match signing_secondary_rpc_url(&context) {
+        Ok(url) => url.to_owned(),
+        Err(e) => return emit_sa_error(&e),
+    };
 
     let now_ms = match stellar_agent_core::timefmt::now_unix_ms() {
         Ok(v) => v,
@@ -478,10 +480,7 @@ pub async fn run(args: &MulticallArgs) -> i32 {
         bundle,
         signer: signer.as_ref(),
         primary_rpc_url: &context.rpc_url,
-        secondary_rpc_url: context
-            .secondary_rpc_url
-            .as_deref()
-            .unwrap_or(&context.rpc_url),
+        secondary_rpc_url: &secondary_rpc_url,
         network_passphrase: &network_passphrase,
         policy_engine,
         profile: &profile,

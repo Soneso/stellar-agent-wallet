@@ -24,7 +24,9 @@ use tokio::time::Instant;
 use url::Url;
 use zeroize::Zeroizing;
 
-use crate::endpoint_identity::{EndpointIdentity, check_protocol_version};
+use crate::endpoint_identity::{
+    EndpointIdentity, SigningLedgerObservation, check_protocol_version,
+};
 use crate::fees::FeeStatsView;
 use crate::redact::{quote_server_text, redact_url_authority};
 use crate::retry::{RetryPolicy, is_retryable_identity_error, rejected_status, retry_with_backoff};
@@ -705,6 +707,46 @@ impl StellarRpcClient {
         self.checked_identity(&network)
     }
 
+    /// Reads the endpoint's latest ledger for a signing path, bound to the
+    /// endpoint's checked identity and the local time of the answer.
+    ///
+    /// [`Self::endpoint_identity`] runs first, then `getLatestLedger`, both
+    /// through this client and under `deadline`, so the height comes from the
+    /// endpoint the identity names. The height is the endpoint's claim: the
+    /// caller compares it with an observation from another endpoint.
+    ///
+    /// # Errors
+    ///
+    /// - The errors of [`Self::endpoint_identity`].
+    /// - [`NetworkError::RpcUnreachable`] if the `getLatestLedger` request
+    ///   does not complete within `deadline`, fails, or returns a body that
+    ///   does not deserialize. The `url` field is authority-only.
+    pub async fn signing_ledger_observation(
+        &self,
+        expected_passphrase: &str,
+        deadline: Instant,
+    ) -> Result<SigningLedgerObservation, WalletError> {
+        let identity = self
+            .endpoint_identity(expected_passphrase, deadline)
+            .await?;
+        let latest = tokio::time::timeout_at(deadline, self.witness_latest_ledger())
+            .await
+            .map_err(|_| {
+                WalletError::Network(NetworkError::RpcUnreachable {
+                    url: self.redacted_url(),
+                    reason: LATEST_LEDGER_DEADLINE_ELAPSED.to_owned(),
+                })
+            })?
+            .map_err(|e| {
+                WalletError::Network(rpc_unreachable(&self.url, GET_LATEST_LEDGER_FAILED, &e))
+            })?;
+        Ok(SigningLedgerObservation::checked(
+            identity,
+            latest.sequence,
+            Instant::now(),
+        ))
+    }
+
     /// Asks the endpoint which network it serves for a submission under a
     /// mainnet grant, and returns that identity once the endpoint reports the
     /// mainnet passphrase and passes the protocol rule.
@@ -880,6 +922,12 @@ pub(crate) const GET_LEDGER_ENTRIES_FAILED: &str = "getLedgerEntries failed: ";
 /// The reason prefix of a failed `getHealth` call.
 const GET_HEALTH_FAILED: &str = "getHealth failed: ";
 
+/// The reason prefix of a failed `getLatestLedger` call.
+const GET_LATEST_LEDGER_FAILED: &str = "getLatestLedger failed: ";
+
+/// The reason of a `getLatestLedger` call its deadline cut off.
+const LATEST_LEDGER_DEADLINE_ELAPSED: &str = "getLatestLedger exceeded its deadline";
+
 /// The reason prefix of a failed `getTransaction` call.
 const GET_TRANSACTION_FAILED: &str = "getTransaction failed: ";
 
@@ -956,6 +1004,7 @@ mod tests {
             "",
             GET_LEDGER_ENTRIES_FAILED,
             GET_HEALTH_FAILED,
+            GET_LATEST_LEDGER_FAILED,
             GET_TRANSACTION_FAILED,
             SIMULATE_TRANSACTION_FAILED,
         ];

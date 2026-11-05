@@ -1173,6 +1173,45 @@ pub enum SaError {
     #[serde(rename = "network.mainnet_write_forbidden")]
     MainnetWriteForbidden,
 
+    /// A signing path found no usable independent ledger observation, and
+    /// nothing was signed.
+    ///
+    /// Raised when the secondary endpoint is absent, malformed, on the
+    /// primary's host, on another network or unreachable, when the primary
+    /// gives no observation, and when the observations are stale or the
+    /// pre-submit deadline elapsed. The fix is an operator's: configure a
+    /// reachable secondary RPC on the same network.
+    ///
+    /// # Redaction
+    ///
+    /// `reason` is a fixed string. It never carries endpoint input, which can
+    /// hold a credential.
+    #[error("ledger witness unavailable: {reason}")]
+    #[serde(rename = "smart_account.ledger_witness_unavailable")]
+    LedgerWitnessUnavailable {
+        /// Fixed description of what is missing.
+        reason: &'static str,
+    },
+
+    /// The ledger observations of a signing path disagree, and nothing was
+    /// signed.
+    ///
+    /// Raised when the two endpoints differ by more than the skew tolerance
+    /// in either order, when a height is out of bounds, when the simulation
+    /// height contradicts the observations, and when the signature
+    /// expiration ledger overflows.
+    ///
+    /// # Redaction
+    ///
+    /// `reason` is a fixed string. It carries neither endpoint input nor a
+    /// reported height.
+    #[error("ledger witness mismatch: {reason}")]
+    #[serde(rename = "simulation.divergence.ledger_skew")]
+    LedgerWitnessMismatch {
+        /// Fixed description of the disagreement.
+        reason: &'static str,
+    },
+
     /// Local `ScAddress` XDR encoding failed while building an injective cache key.
     ///
     /// This is a local encoding failure, not a deployment or simulation failure.
@@ -3122,6 +3161,8 @@ impl SaError {
             Self::SubmissionUnresolved { kind, .. } => kind.wire_code(),
             Self::PolicyDenied { reason } => reason.wire_code(),
             Self::MainnetWriteForbidden => "network.mainnet_write_forbidden",
+            Self::LedgerWitnessUnavailable { .. } => "smart_account.ledger_witness_unavailable",
+            Self::LedgerWitnessMismatch { .. } => "simulation.divergence.ledger_skew",
             Self::ScAddressEncodingFailed { .. } => "sa.scaddress_encoding_failed",
             Self::AuthEntryConstructionFailed { .. } => "sa.auth_entry_construction_failed",
             Self::AuthEntryBindingMismatch { .. } => "sa.auth_entry_binding_mismatch",
@@ -3898,6 +3939,15 @@ mod tests {
                 "network.mainnet_write_forbidden",
                 SaError::MainnetWriteForbidden,
             ),
+            // Ledger witness refusals.
+            (
+                "smart_account.ledger_witness_unavailable",
+                SaError::LedgerWitnessUnavailable { reason: "fixed" },
+            ),
+            (
+                "simulation.divergence.ledger_skew",
+                SaError::LedgerWitnessMismatch { reason: "fixed" },
+            ),
         ];
 
         for (expected_code, err) in cases {
@@ -3906,6 +3956,25 @@ mod tests {
                 *expected_code,
                 "wire_code mismatch for variant: {err:?}"
             );
+        }
+    }
+
+    /// A witness refusal serialises under its code with its fixed reason.
+    #[test]
+    fn a_witness_refusal_serialises_under_its_wire_code() {
+        for (error, code) in [
+            (
+                SaError::LedgerWitnessUnavailable { reason: "fixed" },
+                "smart_account.ledger_witness_unavailable",
+            ),
+            (
+                SaError::LedgerWitnessMismatch { reason: "fixed" },
+                "simulation.divergence.ledger_skew",
+            ),
+        ] {
+            let value = serde_json::to_value(&error).unwrap();
+            assert_eq!(value["wire_code"], code, "{value}");
+            assert!(error.to_string().contains("fixed"), "{error}");
         }
     }
 
@@ -5588,6 +5657,8 @@ mod tests {
             },
             // Canonical mainnet refusal.
             SaError::MainnetWriteForbidden,
+            SaError::LedgerWitnessUnavailable { reason: "fixed" },
+            SaError::LedgerWitnessMismatch { reason: "fixed" },
         ];
 
         // Verify each variant's wire_code matches the exhaustive closed set.
@@ -5682,6 +5753,9 @@ mod tests {
             "sa.auth_mismatch",
             // Canonical mainnet refusal.
             "network.mainnet_write_forbidden",
+            // Ledger witness refusals.
+            "smart_account.ledger_witness_unavailable",
+            "simulation.divergence.ledger_skew",
         ];
 
         assert_eq!(
@@ -5703,7 +5777,7 @@ mod tests {
             );
         }
 
-        assert_eq!(seen.len(), 82, "closed set must have exactly 82 wire codes");
+        assert_eq!(seen.len(), 84, "closed set must have exactly 84 wire codes");
     }
 
     /// Verifies the sub-code closed set is exhaustively matched by tests.

@@ -3731,6 +3731,7 @@ mod tests {
         let verifier = stellar_strkey::Contract([0x42; 32]).to_string();
         let pubkey = "ab".repeat(32);
         let rpc_url = server.uri();
+        let secondary_rpc_url = stellar_agent_test_support::second_loopback_host(&rpc_url);
         let base = [
             "test",
             "--account",
@@ -3741,6 +3742,8 @@ mod tests {
             &profile_name,
             "--rpc-url",
             &rpc_url,
+            "--secondary-rpc-url",
+            &secondary_rpc_url,
             "--signer-secret-env",
             OverrideSecretGuard::NAME,
             "--signer-ed25519",

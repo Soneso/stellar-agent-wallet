@@ -39,6 +39,7 @@ use stellar_agent_smart_account::managers::rules::{
     parse_c_strkey_to_smart_account,
 };
 use stellar_agent_smart_account::managers::signers::{SignersManager, SignersManagerConfig};
+use stellar_agent_smart_account::signing::ledger_witness::checked_secondary_rpc_url;
 use stellar_agent_smart_account::verifiers::VerifierRegistry;
 use uuid::Uuid;
 
@@ -281,6 +282,30 @@ impl ReadHandlerContext {
     }
 }
 
+/// The secondary endpoint a signing verb's ledger witness reads.
+///
+/// Read-only verbs take the context's secondary or the primary and never call
+/// this. A signing verb calls it before the keyring and the signer, so an
+/// endpoint set that cannot witness a ledger refuses without touching a key.
+///
+/// # Errors
+///
+/// [`SaError::LedgerWitnessUnavailable`] when the secondary is absent,
+/// malformed, or on the primary's host.
+#[allow(
+    clippy::result_large_err,
+    reason = "SaError::SignerSetDiverged carries full diagnostic state by design \
+              (see stellar-agent-smart-account's crate-level allow); this fn simply \
+              propagates it"
+)]
+pub(crate) fn signing_secondary_rpc_url(context: &NetworkContext) -> Result<&str, SaError> {
+    checked_secondary_rpc_url(
+        &context.rpc_url,
+        context.secondary_rpc_url.as_deref(),
+        context.network_passphrase(),
+    )
+}
+
 /// Common wallet handler context shared by rules and signers handlers.
 pub struct CommonHandlerContext {
     /// Resolved signing implementation.
@@ -306,8 +331,9 @@ impl CommonHandlerContext {
     ///
     /// # Errors
     ///
-    /// Returns a wallet error when signer resolution, smart-account parsing,
-    /// audit-log opening, or path setup fails.
+    /// Returns a wallet error when audit-log opening fails, the endpoints
+    /// cannot witness a ledger, or signer resolution, smart-account parsing or
+    /// path setup fails. A mainnet context keeps the refusal its verb raises.
     pub async fn new(
         args: &impl CommonArgsView,
         resolved: ResolvedProfileName,
@@ -317,6 +343,9 @@ impl CommonHandlerContext {
     ) -> Result<Self, WalletError> {
         let profile_name = resolved.name.clone();
         let (audit_writer, audit_log_path) = open_audit_writer(&profile, origin, &profile_name)?;
+        if !context.chain_id.is_mainnet() {
+            signing_secondary_rpc_url(context).map_err(|e| wrap_sa_error(&e))?;
+        }
         let (signer, mlock_degradation) = resolve_signer(
             args.signer_source(),
             &profile,

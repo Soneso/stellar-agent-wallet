@@ -119,7 +119,7 @@ protection on that asset, opted into explicitly.
 | `--amounts-min <i128>...` | Minimum accepted amount per asset (same length as `--amounts-desired`); `0` disables slippage protection on that asset | Required | none |
 | `--invest` | Auto-invest immediately after deposit | Optional | `false` |
 | `--override-upgradable` | Proceed on an `upgradable:true` vault; emits a `vault.upgradable_override` audit event | Optional | `false` |
-| `--secondary-rpc-url <URL>` | Second RPC endpoint for the two-RPC WASM-hash cross-check | Optional | profile `secondary_rpc_url`, else none |
+| `--secondary-rpc-url <URL>` | Second RPC endpoint for the two-RPC WASM-hash cross-check and the ledger observation of signing | Required to sign | profile `secondary_rpc_url`, else signing refuses |
 
 ```bash
 stellar-agent vault deposit \
@@ -144,7 +144,7 @@ pre-sign refusal.
 | `--shares <i128>` | Number of vault shares to redeem (raw on-chain value) | Required | none |
 | `--min-amounts-out <i128>...` | Minimum amount to receive per asset (one or more) | Required | none |
 | `--override-upgradable` | Proceed on an `upgradable:true` vault | Optional | `false` |
-| `--secondary-rpc-url <URL>` | Second RPC endpoint for the two-RPC WASM-hash cross-check | Optional | profile `secondary_rpc_url`, else none |
+| `--secondary-rpc-url <URL>` | Second RPC endpoint for the two-RPC WASM-hash cross-check and the ledger observation of signing | Required to sign | profile `secondary_rpc_url`, else signing refuses |
 
 ```bash
 stellar-agent vault withdraw \
@@ -184,7 +184,7 @@ explicit address vector and is never auto-routed.
 | `--amount-out-min <i128>` | Minimum output amount, as an absolute floor (not a percent) | Required | none |
 | `--path <ASSET>` | One swap-path element; repeat the flag to build the path. First element is the input token, last is the output token. Validated to have at least two elements before signing. Each value is a C-strkey, `native`, or `CODE:ISSUER` | Required | none |
 | `--deadline <UNIX_SECS>` | Swap deadline as a Unix timestamp in seconds. An omitted deadline defaults to the current time plus 300 seconds; one at or before the current time, or over 3600 seconds ahead, is refused | Optional | `now + 300s` |
-| `--secondary-rpc-url <URL>` | Second RPC endpoint for the two-RPC router WASM-hash cross-check | Optional | profile `secondary_rpc_url`, else none |
+| `--secondary-rpc-url <URL>` | Second RPC endpoint for the two-RPC router WASM-hash cross-check and the ledger observation of signing | Required to sign | profile `secondary_rpc_url`, else signing refuses |
 
 ```bash
 stellar-agent trade \

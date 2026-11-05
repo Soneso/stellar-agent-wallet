@@ -172,7 +172,7 @@ fn contract_id(address: &ScAddress) -> [u8; 32] {
 fn fresh_managers() -> (ContextRuleManager, Arc<SignersManager>, PathBuf, TempDir) {
     managers_for_tests(
         TESTNET_RPC_URL,
-        TESTNET_RPC_URL,
+        stellar_agent_test_support::testnet_secondary_rpc_url(),
         Duration::from_secs(TIMEOUT_SECS),
     )
 }

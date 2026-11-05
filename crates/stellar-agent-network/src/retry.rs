@@ -564,26 +564,98 @@ where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Result<T, stellar_rpc_client::Error>>,
 {
-    retry_with_delay(policy, overall_deadline, is_retryable, jitter_delay, op).await
+    retry_with_delay(
+        policy,
+        overall_deadline,
+        None,
+        is_retryable,
+        jitter_delay,
+        op,
+    )
+    .await
+    .map_err(StartedByError::into_rpc_error)
 }
 
-/// [`retry_with_backoff`] with the delay before each retry drawn from
-/// `delay_for(attempt, base_delay, max_delay)`.
+/// Why [`retry_with_backoff_started_by`] returned without a value.
+#[derive(Debug)]
+pub(crate) enum StartedByError {
+    /// The start-by instant passed before the next attempt could start.
+    StartByPassed {
+        /// The attempts that started before the instant.
+        attempts: u32,
+    },
+    /// Every error of [`retry_with_backoff`], boxed so that the start-by
+    /// variant stays small.
+    Failed(Box<stellar_rpc_client::Error>),
+}
+
+impl StartedByError {
+    /// The error of a retry without a start-by instant, where only
+    /// [`StartedByError::Failed`] arises. A passed instant reads as the
+    /// deadline cut-off of an attempt.
+    fn into_rpc_error(self) -> stellar_rpc_client::Error {
+        match self {
+            Self::StartByPassed { .. } => stellar_rpc_client::Error::TransactionSubmissionTimeout,
+            Self::Failed(error) => *error,
+        }
+    }
+}
+
+/// [`retry_with_backoff`] with a second instant, `start_by`, that bounds when
+/// an attempt may start.
+///
+/// Every attempt, the first included, starts only while `start_by` has not
+/// passed, and a sleep between attempts ends at `start_by` at the latest. An
+/// attempt that started before the instant runs under `overall_deadline`, as
+/// in [`retry_with_backoff`]: the answer to a request already made is still
+/// awaited. A caller whose request rests on a deadline passes it as
+/// `start_by`, so no request starts after it. `None` bounds nothing beyond
+/// [`retry_with_backoff`].
+///
+/// # Errors
+///
+/// - [`StartedByError::StartByPassed`] when `start_by` has passed before an
+///   attempt, with the number of attempts that started before it.
+/// - [`StartedByError::Failed`] with every error of [`retry_with_backoff`].
+///
+/// # Panics
+///
+/// Never panics.
+pub(crate) async fn retry_with_backoff_started_by<F, Fut, T>(
+    policy: &RetryPolicy,
+    overall_deadline: Instant,
+    start_by: Option<Instant>,
+    is_retryable: fn(&stellar_rpc_client::Error) -> bool,
+    op: F,
+) -> Result<T, StartedByError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, stellar_rpc_client::Error>>,
+{
+    retry_with_delay(
+        policy,
+        overall_deadline,
+        start_by,
+        is_retryable,
+        jitter_delay,
+        op,
+    )
+    .await
+}
+
+/// [`retry_with_backoff_started_by`] with the delay before each retry drawn
+/// from `delay_for(attempt, base_delay, max_delay)`.
 ///
 /// Production passes [`jitter_delay`]. A test passes a fixed delay, which is
 /// how a delay longer than the remaining budget is produced on demand.
-#[expect(
-    clippy::result_large_err,
-    reason = "the error type is stellar_rpc_client's own, passed through unchanged \
-              as in retry_with_backoff"
-)]
 async fn retry_with_delay<F, Fut, T>(
     policy: &RetryPolicy,
     overall_deadline: Instant,
+    start_by: Option<Instant>,
     is_retryable: fn(&stellar_rpc_client::Error) -> bool,
     delay_for: fn(u32, Duration, Duration) -> Duration,
     mut op: F,
-) -> Result<T, stellar_rpc_client::Error>
+) -> Result<T, StartedByError>
 where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Result<T, stellar_rpc_client::Error>>,
@@ -591,12 +663,17 @@ where
     let mut last_err: Option<stellar_rpc_client::Error> = None;
 
     for attempt in 0..policy.max_attempts.max(1) {
+        // No attempt starts once the start-by instant has passed, the first
+        // included.
+        if start_by.is_some_and(|start_by| Instant::now() >= start_by) {
+            return Err(StartedByError::StartByPassed { attempts: attempt });
+        }
         match tokio::time::timeout_at(overall_deadline, op()).await {
             Ok(Ok(val)) => return Ok(val),
             Ok(Err(e)) => {
                 if !is_retryable(&e) {
                     // Non-retryable: surface immediately without sleeping.
-                    return Err(e);
+                    return Err(StartedByError::Failed(Box::new(e)));
                 }
 
                 last_err = Some(e);
@@ -611,9 +688,13 @@ where
 
                 // The sleep never outlasts the deadline, and a sleep that
                 // reaches it ends the retries with the last error, so no
-                // attempt starts past the caller's budget.
+                // attempt starts past the caller's budget. It ends at the
+                // start-by instant at the latest as well, where the check
+                // above refuses the next attempt.
+                let wake_by =
+                    start_by.map_or(overall_deadline, |start_by| start_by.min(overall_deadline));
                 let delay = delay_for(attempt, policy.base_delay, policy.max_delay)
-                    .min(overall_deadline.saturating_duration_since(now));
+                    .min(wake_by.saturating_duration_since(now));
                 tokio::time::sleep(delay).await;
                 if Instant::now() >= overall_deadline {
                     break;
@@ -626,7 +707,9 @@ where
             // `submit_transaction_and_wait`'s own timeout path returns, so
             // this maps through existing caller error-handling unchanged.
             Err(_elapsed) => {
-                return Err(stellar_rpc_client::Error::TransactionSubmissionTimeout);
+                return Err(StartedByError::Failed(Box::new(
+                    stellar_rpc_client::Error::TransactionSubmissionTimeout,
+                )));
             }
         }
     }
@@ -642,7 +725,9 @@ where
         clippy::unreachable,
         reason = "last_err is guaranteed Some here; see SAFETY comment above"
     )]
-    Err(last_err.unwrap_or_else(|| unreachable!("retry_with_backoff: last_err must be Some")))
+    Err(StartedByError::Failed(Box::new(last_err.unwrap_or_else(
+        || unreachable!("retry_with_backoff: last_err must be Some"),
+    ))))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1106,6 +1191,7 @@ mod tests {
         let result = retry_with_delay(
             &policy,
             deadline,
+            None,
             is_retryable_poll_error,
             |_, _, _| Duration::from_secs(10),
             || {
@@ -1134,11 +1220,86 @@ mod tests {
             "no attempt may start after a sleep that reached the deadline"
         );
         match result {
-            Err(stellar_rpc_client::Error::JsonRpc(jsonrpsee_core::ClientError::Custom(m))) => {
-                assert_eq!(m, "first attempt", "the first attempt's error is returned");
-            }
+            Err(StartedByError::Failed(error)) => match *error {
+                stellar_rpc_client::Error::JsonRpc(jsonrpsee_core::ClientError::Custom(m)) => {
+                    assert_eq!(m, "first attempt", "the first attempt's error is returned");
+                }
+                other => panic!("expected the first attempt's error; got {other:?}"),
+            },
             other => panic!("expected the first attempt's error; got {other:?}"),
         }
+    }
+
+    /// An attempt that fails before the start-by instant is not followed by
+    /// another once a backoff crosses the instant: the sleep ends at the
+    /// instant, and the attempt it scheduled is refused. The operation
+    /// succeeds on its second call, so an attempt past the instant shows as
+    /// a success and a second invocation.
+    #[tokio::test(start_paused = true)]
+    async fn a_backoff_past_the_start_by_instant_starts_no_further_attempt() {
+        let calls = Arc::new(AtomicU32::new(0));
+        let policy = RetryPolicy {
+            max_attempts: 5,
+            base_delay: Duration::from_millis(10),
+            max_delay: Duration::from_millis(100),
+        };
+        let start = Instant::now();
+        let start_by = start + Duration::from_secs(1);
+
+        let result = retry_with_delay(
+            &policy,
+            start + Duration::from_secs(30),
+            Some(start_by),
+            is_retryable_send_error,
+            |_, _, _| Duration::from_secs(2),
+            || {
+                let calls = Arc::clone(&calls);
+                async move {
+                    if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                        Err(stellar_rpc_client::Error::TransactionSubmissionTimeout)
+                    } else {
+                        Ok(7u32)
+                    }
+                }
+            },
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(StartedByError::StartByPassed { attempts: 1 })),
+            "the attempt after the instant is refused: {result:?}"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "one attempt started");
+        assert_eq!(
+            start.elapsed(),
+            Duration::from_secs(1),
+            "the backoff ends at the instant"
+        );
+    }
+
+    /// A start-by instant already passed on entry starts no attempt at all.
+    #[tokio::test(start_paused = true)]
+    async fn a_passed_start_by_instant_starts_no_attempt() {
+        let calls = AtomicU32::new(0);
+        let start = Instant::now();
+
+        let result = retry_with_backoff_started_by(
+            &RetryPolicy::default(),
+            start + Duration::from_secs(30),
+            Some(start),
+            is_retryable_send_error,
+            || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                async { Ok::<u32, stellar_rpc_client::Error>(7) }
+            },
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(StartedByError::StartByPassed { attempts: 0 })),
+            "{result:?}"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "nothing is attempted");
     }
 
     /// The default policy is five attempts, a 500 ms base delay, and an 8 s
