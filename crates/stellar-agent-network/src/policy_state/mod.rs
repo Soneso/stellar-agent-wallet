@@ -184,7 +184,8 @@
 //! Entries older than the largest supported criterion window (`1w` =
 //! 604,800 s) are pruned on every write once confirmed. Pending records are retained.
 //! Accounting-expiry records are retained until audit acknowledgement and
-//! receipt projection both complete.
+//! receipt projection both complete. Settled authorization records stay while
+//! their approval can still be presented, and a window state reset keeps them.
 
 pub mod ledger;
 pub mod lock;
@@ -199,11 +200,12 @@ pub use ledger::{
 };
 pub use store::{
     AccountingDecision, ChainScope, DeliveryReport, MintOutcome, OwedAccountingExpiries,
-    POLICY_STATE_KEY_FIELD, PersistedWindowStore, RECONCILE_BUDGET, RECONCILE_MIN_AGE_MS,
-    REPORTED_SUCCESS_CODE, RETENTION_EXPIRED_CODE, ReconcileFailure, ReconcileFailureKind,
-    ReconcileReport, ReportedAnswer, ResetError, ResetOutcome, ResetRecord, SettledSubmission,
-    StateDefect, SubmissionAnchor, SubmissionHold, UnrecordedAnswer, deliver_accounting_expiries,
-    deliver_accounting_expiry, drain_accounting_obligations, project_accounting_expiries,
+    OwnerResetSignature, POLICY_STATE_KEY_FIELD, PersistedWindowStore, RECONCILE_BUDGET,
+    RECONCILE_MIN_AGE_MS, REPORTED_SUCCESS_CODE, RETENTION_EXPIRED_CODE, ReconcileFailure,
+    ReconcileFailureKind, ReconcileReport, ReportedAnswer, ResetConsent, ResetError, ResetOutcome,
+    ResetRecord, SettledSubmission, StateDefect, SubmissionAnchor, SubmissionHold,
+    UnrecordedAnswer, deliver_accounting_expiries, deliver_accounting_expiry,
+    drain_accounting_obligations, project_accounting_expiries,
 };
 
 /// Records a confirmed call's contribution into `engine`'s window state and
@@ -389,15 +391,64 @@ pub enum WindowStoreError {
     /// The window state holds an accounting-expiry audit obligation that
     /// delivery has not acknowledged.
     ///
-    /// Produced by [`PersistedWindowStore::reset`] before its recorder runs.
-    /// An empty successor would erase the obligation, so the reset refuses
-    /// until the owed `submission_accounting_expired` event is delivered.
-    /// Nothing changed.
+    /// Produced by [`PersistedWindowStore::reset`] before either callback
+    /// runs. The successor would erase the obligation, so the reset refuses
+    /// until the owed `submission_accounting_expired` event is delivered. The
+    /// reset changes no window state.
     #[error(
         "the spending window owes an accounting audit event that is not delivered yet; the \
          reset refuses until it is"
     )]
     AccountingAuditOwed,
+
+    /// The reset names a profile other than the one the profile's owner
+    /// coordinate names. The reset changes no window state.
+    #[error("the window state reset names a profile other than the one the profile file names")]
+    ResetProfileMismatch,
+
+    /// The installation holds a mainnet enablement nonce and the reset presents
+    /// no owner signature. The reset changes no window state.
+    #[error(
+        "the installation has mainnet enabled; the window state reset requires the pinned \
+         policy owner's signature"
+    )]
+    ResetOwnerRequired,
+
+    /// The reset is signed by a key other than the pinned policy owner. The
+    /// reset changes no window state.
+    #[error("the window state reset signature names an owner other than the pinned policy owner")]
+    ResetOwnerMismatch {
+        /// The owner public key the presented signature names.
+        presented: [u8; 32],
+        /// The owner public key the policy pin names.
+        pinned: [u8; 32],
+    },
+
+    /// The reset presents an owner signature and no policy pin names an owner.
+    /// The reset changes no window state.
+    #[error("no policy pin names an owner for this window state store")]
+    ResetPinAbsent,
+
+    /// The policy pin cannot be read under the reset's lock. The reset changes
+    /// no window state.
+    #[error("the policy pin cannot be read for the window state reset: {0}")]
+    ResetPinUnreadable(
+        /// The pin read failure.
+        stellar_agent_core::policy::pin::PinError,
+    ),
+
+    /// The mainnet enablement nonce cannot be read. The reset changes no
+    /// window state.
+    #[error("the mainnet enablement nonce cannot be read for the window state reset: {0}")]
+    ResetEnablementUnreadable(
+        /// The nonce read failure.
+        stellar_agent_core::error::ValidationError,
+    ),
+
+    /// The owner signature does not verify over this reset's statement. The
+    /// reset changes no window state.
+    #[error("the owner's signature does not verify over this window state reset")]
+    ResetSignatureInvalid,
 
     /// The file already holds a record under the reservation's id.
     ///
@@ -441,8 +492,8 @@ pub enum WindowStoreError {
         defect: StateDefect,
     },
 
-    /// The reset of a mainnet profile's verifiable store refused because a
-    /// mainnet authorization is still open. Nothing changed.
+    /// The reset of a mainnet profile's verifiable store refuses because a
+    /// mainnet authorization is still open. The reset changes no window state.
     #[cfg(feature = "mainnet-write")]
     #[error(
         "the policy window-state holds {open} open mainnet authorization(s); the reset refuses \

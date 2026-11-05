@@ -1981,7 +1981,7 @@ pub enum ValidationError {
 
     /// An enabled installation needs its pinned owner's seed for a reset.
     #[error(
-        "profile '{profile}' has mainnet enabled; reset-window-state requires the pinned owner's seed in --owner-secret-env; nothing was changed"
+        "profile '{profile}' has mainnet enabled; reset-window-state requires the pinned owner's seed in --owner-secret-env; the reset changes no window state"
     )]
     ResetWindowStateOwnerRequired {
         /// Selected profile name.
@@ -1990,7 +1990,7 @@ pub enum ValidationError {
 
     /// The supplied seed does not derive to the pinned policy owner.
     #[error(
-        "profile '{profile}' reset-window-state owner {derived} does not match pinned owner {pinned}; nothing was changed"
+        "profile '{profile}' reset-window-state owner {derived} does not match pinned owner {pinned}; the reset changes no window state"
     )]
     ResetWindowStateOwnerMismatch {
         /// Selected profile name.
@@ -1999,6 +1999,15 @@ pub enum ValidationError {
         derived: String,
         /// The public key named by the verified policy pin.
         pinned: String,
+    },
+
+    /// The owner's signature does not verify over the reset statement.
+    #[error(
+        "profile '{profile}' reset-window-state owner signature does not verify over this reset; the reset changes no window state"
+    )]
+    ResetWindowStateSignatureInvalid {
+        /// Selected profile name.
+        profile: String,
     },
 
     /// The window-state reset of a mainnet profile refused because a mainnet
@@ -2275,6 +2284,9 @@ impl ValidationError {
             }
             Self::ResetWindowStateOwnerMismatch { .. } => {
                 "profile.reset_window_state_owner_mismatch"
+            }
+            Self::ResetWindowStateSignatureInvalid { .. } => {
+                "profile.reset_window_state_signature_invalid"
             }
             Self::ResetWindowStateNewerVersion { .. } => "profile.reset_window_state_newer_version",
             #[cfg(feature = "mainnet-write")]
@@ -4226,6 +4238,12 @@ mod tests {
                 "profile.reset_window_state_owner_mismatch",
             ),
             (
+                ValidationError::ResetWindowStateSignatureInvalid {
+                    profile: "default".to_owned(),
+                },
+                "profile.reset_window_state_signature_invalid",
+            ),
+            (
                 ValidationError::ResetWindowStateNewerVersion {
                     profile: "default".to_owned(),
                 },
@@ -4523,6 +4541,11 @@ mod tests {
                     derived: derived.clone(),
                     pinned: pinned.clone(),
                 },
+                ValidationError::ResetWindowStateSignatureInvalid { profile } => {
+                    ValidationError::ResetWindowStateSignatureInvalid {
+                        profile: profile.clone(),
+                    }
+                }
                 ValidationError::ResetWindowStateNewerVersion { profile } => {
                     ValidationError::ResetWindowStateNewerVersion {
                         profile: profile.clone(),

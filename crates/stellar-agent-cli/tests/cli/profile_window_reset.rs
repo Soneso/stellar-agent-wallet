@@ -583,6 +583,7 @@ fn an_enabled_reset_by_the_pinned_owner_records_the_signature() {
     use stellar_agent_core::policy::v1::signature::{
         WindowResetStatement, verify, window_reset_digest,
     };
+    let mut challenges = Vec::new();
     for existing in [false, true] {
         let f = Fixture::new(existing);
         f.enable();
@@ -605,7 +606,7 @@ fn an_enabled_reset_by_the_pinned_owner_records_the_signature() {
         else {
             panic!("missing authorization")
         };
-        assert_eq!(recorded, &"réparation".repeat(8));
+        assert_eq!(recorded, &"réparation".repeat(5));
         assert_eq!(
             auth.store_sha256,
             hash.map(|hash| stellar_agent_core::hex::encode(&hash))
@@ -624,6 +625,23 @@ fn an_enabled_reset_by_the_pinned_owner_records_the_signature() {
             .iter()
             .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
             .collect();
+        assert_eq!(auth.challenge.len(), 64);
+        assert!(
+            auth.challenge
+                .bytes()
+                .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+        );
+        let challenge: [u8; 32] = auth
+            .challenge
+            .as_bytes()
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
+            .collect::<Vec<u8>>()
+            .try_into()
+            .unwrap();
+        challenges.push(challenge);
         let owner = ed25519_dalek::SigningKey::from_bytes(&[0x51; 32])
             .verifying_key()
             .to_bytes();
@@ -641,6 +659,7 @@ fn an_enabled_reset_by_the_pinned_owner_records_the_signature() {
             generation_after: wiped.generation_after,
             reason: recorded,
             request_id: &row.request_id,
+            challenge,
         });
         verify(&digest, &signature.try_into().unwrap(), &owner, NAME).unwrap();
         let state = stellar_agent_core::policy::v1::PolicyStateStore::new();
@@ -659,4 +678,8 @@ fn an_enabled_reset_by_the_pinned_owner_records_the_signature() {
         let generation: serde_json::Value = serde_json::from_str(&f.state().2.unwrap()).unwrap();
         assert_eq!(generation["generation"], wiped.generation_after);
     }
+    assert_ne!(
+        challenges[0], challenges[1],
+        "each reset draws its own challenge"
+    );
 }

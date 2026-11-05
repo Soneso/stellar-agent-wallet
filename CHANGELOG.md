@@ -12,6 +12,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `submission_accounting_expired` audit event and the
   `submission.settlement_unverifiable` code.
 
+- `ResetConsent` and `OwnerResetSignature`, the `WindowStoreError` variants
+  `ResetProfileMismatch`, `ResetOwnerRequired`, `ResetOwnerMismatch`,
+  `ResetPinAbsent`, `ResetPinUnreadable`, `ResetEnablementUnreadable` and
+  `ResetSignatureInvalid`, and the `profile.reset_window_state_signature_invalid`
+  code.
+
 - `audit_log::reader::audit_history_refusal` reports an unreadable retained
   history as `audit.chain_key_unavailable`, with the integrity code at the
   head of the detail.
@@ -174,6 +180,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - A window snapshot carrying an accounting expiry record uses wire version 8,
   which older builds refuse.
+
+- `PersistedWindowStore::reset` takes the profile name, reason and request id,
+  an authorizer returning `ResetConsent`, and a recorder that receives the
+  verified consent. `ResetRecord` carries the profile name, chain, bounded
+  reason, request id and the store's challenge, and
+  `ResetRecord::statement_digest` returns the digest the owner signs.
+
+- The `wiped` record of the `policy_window_state_reset` row gains
+  `retained_authorizations`, present only when the reset keeps authorization
+  records.
 
 - `tx status` and `stellar_transaction_status` acquire the audit writer only
   to deliver an unacknowledged accounting event. An unavailable writer leaves
@@ -460,10 +476,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `owner_key_fingerprint` identifies stored bytes without rendering their value.
 - `ResetRecord` exposes the store SHA-256 and guarded pin reading, and its
   private fields restrict construction to its crate.
-  `WindowResetStatement` and `window_reset_digest` define reset authorization.
+  `WindowResetStatement` and `window_reset_digest` define reset authorization,
+  including the store's challenge, which `WindowResetAuthorization` records.
   `EventKind::PolicyWindowStateReset` adds optional `owner_authorization`, and
   `AuditEntry::new_policy_window_state_reset` takes that authorization.
-  `bound_window_reset_reason` bounds the signed and recorded reason to 80 Unicode
+  `bound_window_reset_reason` bounds the signed and recorded reason to 50 Unicode
   characters; `WINDOW_RESET_REASON_MAX` names the bound.
   `bound_recorded_str` exposes the general audit string bound.
 - `Wallet::unlock` and `Wallet::unlock_with_clock` take `&[u8; 32]` and run
@@ -1002,6 +1019,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A window-state reset on an installation with mainnet enabled requires the
   pinned owner's seed in every build. Its audit row records the owner's
   signature over the reset, including the store digest and generation pair.
+- The window state reset verifies the pinned owner's signature inside the store
+  under its lock, so no caller of the store resets an installation with mainnet
+  enabled without the owner. The signed statement binds a challenge the store
+  draws for each reset, so a signature authorizes one reset of one store.
+  A reset preserves nonce reuse checks and prevents a completed continuation
+  from being repeated. Pruning keeps a settled authorization record while its
+  approval can still be presented.
 - Environment signing locks the seed's stable home before copying into it.
   Signing reads that home; disposal zeroizes before unlocking and freeing it.
   Mainnet environment signing records tolerated lock failures in the audit log.

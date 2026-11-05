@@ -699,8 +699,9 @@ pub fn bound_recorded_str(s: &str) -> String {
 }
 
 /// Maximum reset-reason length in Unicode characters. Even JSON-escaped
-/// control characters fit the audit row alongside the largest authorization.
-pub const WINDOW_RESET_REASON_MAX: usize = 80;
+/// control characters fit the audit row alongside the largest authorization,
+/// the retained count and the entry tag.
+pub const WINDOW_RESET_REASON_MAX: usize = 50;
 
 /// Bounds a reset reason before both signing and recording it.
 pub fn bound_window_reset_reason(reason: &str) -> String {
@@ -714,6 +715,9 @@ pub struct WindowResetAuthorization {
     pub owner_redacted: RedactedStrkey,
     /// SHA-256 of the store bytes read, in lowercase hex; `None` when absent.
     pub store_sha256: Option<String>,
+    /// The store's challenge in the signed statement, as 64 lowercase hex
+    /// characters.
+    pub challenge: String,
     /// Ed25519 signature over the reset digest, as 128 lowercase hex characters.
     pub signature: String,
 }
@@ -743,8 +747,17 @@ pub struct WipedAccrualRecord {
     pub truncated: bool,
     /// Trusted generation observed before recording.
     pub generation_before: Option<u64>,
-    /// Generation assigned to the empty replacement.
+    /// Generation assigned to the successor.
     pub generation_after: u64,
+    /// Authorization records the successor keeps because their approval can
+    /// still be presented. Absent from the row when zero.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub retained_authorizations: u32,
+}
+
+/// Whether a retained count is zero, so the row omits it.
+const fn is_zero(value: &u32) -> bool {
+    *value == 0
 }
 
 /// Confirmed and pending live accrual for one window bucket.
@@ -6814,10 +6827,15 @@ mod tests {
                     &stellar_strkey::ed25519::PublicKey([0x55; 32]).to_string(),
                 ),
                 store_sha256: Some("11".repeat(32)),
+                challenge: "33".repeat(32),
                 signature: "22".repeat(64),
             }),
         };
         let encoded = serde_json::to_value(&authorized).unwrap();
+        assert_eq!(
+            encoded["owner_authorization"]["challenge"],
+            serde_json::Value::String("33".repeat(32))
+        );
         assert_eq!(
             serde_json::from_value::<EventKind>(encoded).unwrap(),
             authorized
@@ -7243,19 +7261,32 @@ mod tests {
             truncated: false,
             generation_before: Some(4),
             generation_after: 5,
+            retained_authorizations: 0,
         };
-        let expected = "{\"previous\":\"verified\",\"entry_count\":3,\"buckets\":[{\
+        let golden = "{\"previous\":\"verified\",\"entry_count\":3,\"buckets\":[{\
             \"scope_specificity\":2,\"bucket\":\"native\",\"window_secs\":86400,\
             \"confirmed_count\":2,\
             \"confirmed_total\":\"-170141183460469231731687303715884105728\",\
             \"pending_count\":1,\
             \"pending_total\":\"170141183460469231731687303715884105727\"}],\
-            \"truncated\":false,\"generation_before\":4,\"generation_after\":5}";
+            \"truncated\":false,\"generation_before\":4,\"generation_after\":5";
+        let expected = format!("{golden}}}");
         let json = serde_json::to_string(&record).unwrap();
         assert_eq!(json, expected);
         assert_eq!(
             serde_json::from_str::<WipedAccrualRecord>(&json).unwrap(),
             record
+        );
+        let retained = WipedAccrualRecord {
+            retained_authorizations: 3,
+            ..record
+        };
+        let expected = format!("{golden},\"retained_authorizations\":3}}");
+        let json = serde_json::to_string(&retained).unwrap();
+        assert_eq!(json, expected);
+        assert_eq!(
+            serde_json::from_str::<WipedAccrualRecord>(&json).unwrap(),
+            retained
         );
     }
 
@@ -7273,6 +7304,7 @@ mod tests {
                 truncated: false,
                 generation_before: None,
                 generation_after: 1,
+                retained_authorizations: 0,
             };
             let expected = format!(
                 "{{\"previous\":\"{name}\",\"entry_count\":0,\"buckets\":[],\"truncated\":false,\

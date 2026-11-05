@@ -46,8 +46,10 @@ with the wiped accrual, before it mints a key, advances the generation or
 replaces the store. A reset whose row cannot be written does not happen.
 An enablement nonce requires `--owner-secret-env VAR` with the pinned owner's
 seed in every build. With the flag, the row records that owner's signature
-over the profile, chain, store digest, generations, bounded reason and request id.
-Owner and pin refusals write no reset row and change no store state.
+over the profile, chain, store digest, generations, bounded reason, request id
+and the store's challenge. The store verifies that signature under its lock
+before the row. Owner, pin and signature refusals write no reset row and change
+no store state.
 The `profile` section of `./cli-reference.md` describes the row, the refusals,
 the failure windows.
 

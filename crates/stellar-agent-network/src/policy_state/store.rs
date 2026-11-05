@@ -8,15 +8,19 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use hmac::{Hmac, KeyInit as _, Mac as _};
+use rand_core::{OsRng, RngCore as _};
 use sha2::{Digest as _, Sha256};
 use stellar_agent_core::audit_log::AuditWriter;
-use stellar_agent_core::audit_log::schema::{PreviousState, WipedAccrualRecord, WipedBucket};
+use stellar_agent_core::audit_log::schema::{
+    PreviousState, WipedAccrualRecord, WipedBucket, bound_window_reset_reason,
+};
 use stellar_agent_core::error::WalletError;
 use stellar_agent_core::policy::DenyReason;
 use stellar_agent_core::policy::pin::{self, PinError, PinScope, PinState};
 use stellar_agent_core::policy::v1::criteria::state_store::{
     CLOCK_SKEW_TOLERANCE_MS, PolicyStateStore, StateKey, StateStoreError, WindowEntry,
 };
+use stellar_agent_core::policy::v1::signature::{WindowResetStatement, window_reset_digest};
 use stellar_agent_core::profile::caip2::Caip2;
 use stellar_agent_core::profile::owner_key::{self, OwnerKeyContext};
 use stellar_agent_core::profile::receipt::{
@@ -1207,8 +1211,24 @@ impl std::fmt::Display for StateDefect {
     }
 }
 
-/// The reset's live accrual and store digest.
-/// The recorder can read the policy pin through [`Self::pin`] under the held
+/// The consent a reset presents to the store.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ResetConsent {
+    /// The pinned owner's signature over the reset statement, when presented.
+    pub owner_signature: Option<OwnerResetSignature>,
+}
+
+/// An Ed25519 signature over [`ResetRecord::statement_digest`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OwnerResetSignature {
+    /// The signing owner's public key.
+    pub owner: [u8; 32],
+    /// The signature over the statement digest.
+    pub signature: [u8; 64],
+}
+
+/// The reset statement and the live accrual it replaces.
+/// Both callbacks can read the policy pin through [`Self::pin`] under the held
 /// store lock. Only the store constructs this record and its scoped guard.
 #[derive(Debug, Clone, Copy)]
 pub struct ResetRecord<'a> {
@@ -1216,6 +1236,19 @@ pub struct ResetRecord<'a> {
     pub accrual: &'a WipedAccrualRecord,
     /// SHA-256 of the exact store bytes read, or `None` for a missing file.
     pub store_sha256: Option<[u8; 32]>,
+    /// The caller's profile name, which the store has checked against the
+    /// profile.
+    pub profile_name: &'a str,
+    /// The profile's CAIP-2 chain identifier.
+    pub chain_id: &'a str,
+    /// The reset reason, bounded by the store to
+    /// [`WINDOW_RESET_REASON_MAX`](stellar_agent_core::audit_log::schema::WINDOW_RESET_REASON_MAX)
+    /// characters.
+    pub reason: &'a str,
+    /// The caller's request identifier.
+    pub request_id: &'a str,
+    /// The store's challenge for this reset, drawn under the held lock.
+    pub challenge: [u8; 32],
     guard: &'a WindowStoreLock,
     scope: PinScope<'a>,
 }
@@ -1228,6 +1261,61 @@ impl ResetRecord<'_> {
     pub fn pin(&self) -> Result<PinState, PinError> {
         pin::read(self.guard, &self.scope)
     }
+
+    /// The digest the pinned owner signs to authorize this reset.
+    #[must_use]
+    pub fn statement_digest(&self) -> [u8; 32] {
+        window_reset_digest(&WindowResetStatement {
+            profile: self.profile_name,
+            chain_id: self.chain_id,
+            store_sha256: self.store_sha256,
+            generation_before: self.accrual.generation_before,
+            generation_after: self.accrual.generation_after,
+            reason: self.reason,
+            request_id: self.request_id,
+            challenge: self.challenge,
+        })
+    }
+}
+
+/// Verifies the consent a reset presents, under the reset's held lock.
+///
+/// The enablement nonce is read once. Without a signature, a nonce refuses
+/// and its absence admits the reset. A presented signature is verified with
+/// or without a nonce: the pin must name the signing owner, and strict
+/// Ed25519 verification must accept the signature over the statement digest.
+fn verify_reset_consent(
+    profile: &Profile,
+    record: &ResetRecord<'_>,
+    consent: &ResetConsent,
+) -> Result<(), WindowStoreError> {
+    let enabled = stellar_agent_core::mainnet::enablement::has_enablement_nonce(profile)
+        .map_err(WindowStoreError::ResetEnablementUnreadable)?;
+    let Some(owner_signature) = consent.owner_signature else {
+        return if enabled {
+            Err(WindowStoreError::ResetOwnerRequired)
+        } else {
+            Ok(())
+        };
+    };
+    let pin = match record.pin().map_err(WindowStoreError::ResetPinUnreadable)? {
+        PinState::Present(pin) => pin,
+        PinState::Absent => return Err(WindowStoreError::ResetPinAbsent),
+    };
+    let pinned = pin.owner();
+    if pinned != owner_signature.owner {
+        return Err(WindowStoreError::ResetOwnerMismatch {
+            presented: owner_signature.owner,
+            pinned,
+        });
+    }
+    stellar_agent_core::policy::v1::signature::verify(
+        &record.statement_digest(),
+        &owner_signature.signature,
+        &owner_signature.owner,
+        record.profile_name,
+    )
+    .map_err(|_| WindowStoreError::ResetSignatureInvalid)
 }
 
 /// Failure of the recorded reset ceremony.
@@ -1241,7 +1329,8 @@ pub enum ResetError<E> {
         /// Whether this reset minted a key before failing.
         minted: bool,
     },
-    /// The recorder refused; durable store state is unchanged.
+    /// The authorizer or the recorder refuses; the reset changes no window
+    /// state.
     #[error("{0}")]
     Recorder(E),
 }
@@ -1253,7 +1342,7 @@ pub struct PersistedWindowStore {
     path: PathBuf,
 }
 
-/// What the reset established before its recorder runs.
+/// What the reset established before either callback runs.
 struct ResetSnapshot {
     store_sha256: Option<[u8; 32]>,
     key: Option<zeroize::Zeroizing<[u8; 32]>>,
@@ -1261,8 +1350,11 @@ struct ResetSnapshot {
     /// The verified snapshot being replaced, absent on a genuine first run.
     original: Option<WireFile>,
     /// Acknowledged accounting-expiry records whose receipt projection is
-    /// incomplete; the empty successor keeps them.
+    /// incomplete; the successor keeps them.
     retained_expiries: Vec<AccountingExpiryRecord>,
+    /// Authorization records whose approval can still be presented on the
+    /// store clock; the successor keeps them.
+    retained_authorizations: Vec<WireAuthorization>,
 }
 
 /// Whether the mainnet rules apply to `profile`: a mainnet profile in a build
@@ -2235,42 +2327,75 @@ impl PersistedWindowStore {
         Ok(report)
     }
 
-    /// Records the live accrual under the window lock, then replaces the store
-    /// with an authenticated empty body at the next generation.
+    /// Verifies the owner's consent and records the live accrual under the
+    /// window lock, then replaces the store with an authenticated successor at
+    /// the next generation.
     ///
-    /// The recorder runs before minting a key or writing either durable state.
-    /// Unverifiable state refuses before the recorder and all state writes.
+    /// `profile_name` must be the name the profile's owner coordinate names.
+    /// `authorize` receives the reset statement, which binds a challenge the
+    /// store draws for this reset, and returns the consent. The store verifies
+    /// that consent under the same lock.
+    ///
+    /// An installation with a mainnet enablement nonce requires the pinned
+    /// owner's signature over [`ResetRecord::statement_digest`]. A presented
+    /// signature is verified with or without a nonce: the pin must name the
+    /// signing owner and accept the signature under strict verification.
+    /// `record` runs only after verification and receives the verified consent.
+    ///
+    /// Both callbacks run under the store lock. A caller that appends an audit
+    /// row acquires its writer before calling, because the writer lock precedes
+    /// the store lock.
+    ///
+    /// The successor keeps every authorization record whose approval can still
+    /// be presented on the store clock. A kept record holds no window capacity.
+    ///
+    /// Both callbacks run before minting a key or writing either durable state.
+    /// Unverifiable state refuses before either callback and all state writes.
     ///
     /// An undelivered accounting-expiry audit obligation refuses with
-    /// [`WindowStoreError::AccountingAuditOwed`] before the recorder runs; the
-    /// caller delivers it first. Acknowledged expiry records whose receipt
-    /// projection is incomplete carry into the empty successor; they hold no
+    /// [`WindowStoreError::AccountingAuditOwed`] before either callback runs;
+    /// the caller delivers it first. Acknowledged expiry records whose receipt
+    /// projection is incomplete carry into the successor; they hold no
     /// exposure.
     ///
     /// A mainnet profile in a build with mainnet writes also refuses while an
     /// effective open or claimed authorization remains. Expiry releases
     /// unclaimed holds and converts claimed holds to confirmed spend in memory;
-    /// nothing persists before the recorder succeeds. A missing file with no
+    /// nothing persists before both callbacks succeed. A missing file with no
     /// committed generation is a genuine first run and carries no defect.
     ///
     /// A verified file is replaced through the generation commit, so a failed
-    /// write leaves the old snapshot or the empty one readable. A first
+    /// write leaves the old snapshot or the successor readable. A first
     /// run commits the generation before the file.
     ///
     /// # Errors
     ///
-    /// Returns a store failure or the recorder's refusal. A store failure reports
-    /// whether this operation minted a key before it failed.
+    /// Returns a store failure, including a consent refusal, or the refusal of
+    /// either callback. A store failure reports whether this operation minted
+    /// a key before it failed.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the reset statement's fields and the two ceremony callbacks"
+    )]
     pub fn reset<E>(
         &self,
         profile: &Profile,
+        profile_name: &str,
         now_ms: u64,
-        record: impl FnOnce(&ResetRecord<'_>) -> Result<(), E>,
+        reason: &str,
+        request_id: &str,
+        authorize: impl FnOnce(&ResetRecord<'_>) -> Result<ResetConsent, E>,
+        record: impl FnOnce(&ResetRecord<'_>, &ResetConsent) -> Result<(), E>,
     ) -> Result<ResetOutcome, ResetError<E>> {
         let before_mint = |error| ResetError::Store {
             error,
             minted: false,
         };
+        if stellar_agent_core::profile::name::profile_name_mismatch_refusal(profile, profile_name)
+            .is_some()
+        {
+            return Err(before_mint(WindowStoreError::ResetProfileMismatch));
+        }
         self.ensure_parent_dir().map_err(before_mint)?;
         let lock = WindowStoreLock::acquire_for_with_retry(
             &self.path,
@@ -2278,13 +2403,23 @@ impl PersistedWindowStore {
         )
         .map_err(|e| before_mint(e.into()))?;
         let snapshot = self.reset_snapshot(profile, now_ms).map_err(before_mint)?;
-        record(&ResetRecord {
+        let reason = bound_window_reset_reason(reason);
+        let mut challenge = [0u8; 32];
+        OsRng.fill_bytes(&mut challenge);
+        let statement = ResetRecord {
             accrual: &snapshot.accrual,
             store_sha256: snapshot.store_sha256,
+            profile_name,
+            chain_id: profile.chain_id.caip2_str(),
+            reason: &reason,
+            request_id,
+            challenge,
             guard: &lock,
             scope: PinScope::for_profile(&self.path, profile),
-        })
-        .map_err(ResetError::Recorder)?;
+        };
+        let consent = authorize(&statement).map_err(ResetError::Recorder)?;
+        verify_reset_consent(profile, &statement, &consent).map_err(before_mint)?;
+        record(&statement, &consent).map_err(ResetError::Recorder)?;
         let accrual = snapshot.accrual;
         let mut minted = false;
         let mutation = (|| {
@@ -2304,13 +2439,14 @@ impl PersistedWindowStore {
                     })?
                 }
             };
-            let empty = WireFile {
+            let successor = WireFile {
                 chain_scope: Some(ChainScope::for_chain(profile.chain_id)),
                 accounting_expiries: snapshot.retained_expiries,
+                authorizations: snapshot.retained_authorizations,
                 ..WireFile::default()
             };
             let original = snapshot.original.unwrap_or_default();
-            self.commit_generation(&key, &generation_entry_ref(profile), original, empty)
+            self.commit_generation(&key, &generation_entry_ref(profile), original, successor)
         })();
         mutation.map_err(|error| ResetError::Store { error, minted })?;
         Ok(ResetOutcome {
@@ -2358,6 +2494,7 @@ impl PersistedWindowStore {
             truncated: false,
             generation_before,
             generation_after,
+            retained_authorizations: 0,
         };
         let Some(bytes) = bytes else {
             return Ok(ResetSnapshot {
@@ -2366,6 +2503,7 @@ impl PersistedWindowStore {
                 accrual,
                 original: None,
                 retained_expiries: Vec::new(),
+                retained_authorizations: Vec::new(),
             });
         };
         let hmac_key = key.as_ref().ok_or(WindowStoreError::ChainUnverifiable)?;
@@ -2373,7 +2511,7 @@ impl PersistedWindowStore {
             .verify_with_key(hmac_key, &bytes)
             .and_then(|wire| self.select_scoped_generation(profile, wire, counter))?;
         // An undelivered accounting-expiry event is an audit obligation the
-        // empty successor would erase, so the reset refuses before its row.
+        // successor would erase, so the reset refuses before its row.
         if wire
             .accounting_expiries
             .iter()
@@ -2399,6 +2537,7 @@ impl PersistedWindowStore {
             }
         }
         ledger::sweep_expired(&mut wire, clock);
+        let retained_authorizations = ledger::reset_survivors(&wire, clock);
         // Open authorization holds count as pending spend in the reset row.
         for hold in std::mem::take(&mut wire.holds) {
             let key = StateKey::new("", hold.scope_specificity, &hold.bucket, hold.window_secs);
@@ -2412,12 +2551,15 @@ impl PersistedWindowStore {
                 });
         }
         snapshot_accrual(&wire, now_ms, &mut accrual);
+        accrual.retained_authorizations =
+            u32::try_from(retained_authorizations.len()).unwrap_or(u32::MAX);
         Ok(ResetSnapshot {
             store_sha256: Some(Sha256::digest(&bytes).into()),
             key,
             accrual,
             original: Some(original),
             retained_expiries,
+            retained_authorizations,
         })
     }
 
@@ -2997,7 +3139,7 @@ impl PersistedWindowStore {
     /// A receipt that cannot be written leaves the committed expiry and its
     /// obligation in place, reported beside the release, and a later pass
     /// projects it again from authenticated state.
-    fn expire_accounting(
+    pub(super) fn expire_accounting(
         &self,
         profile: &Profile,
         receipts: Option<&ReceiptStore>,
@@ -3747,10 +3889,10 @@ pub(super) fn prune_stale(wire: &mut WireFile, now_ms: u64) {
     wire.accounting_expiries.retain(|record| {
         !(record.audit_acknowledged && record.receipt_projected) || record.observed_at_ms >= cutoff
     });
-    // Settled authorization history ages out on the same retention; an open
-    // authorization stays whatever its age, until a transaction's sweep
-    // settles it.
-    ledger::prune_history(wire, cutoff);
+    // Settled authorization history ages out on the same retention after its
+    // approval expires; an open authorization stays whatever its age, until a
+    // transaction's sweep settles it.
+    ledger::prune_history(wire, cutoff, now_ms);
 }
 
 /// Whether the receipt for `envelope_hash` already records an outcome the
@@ -3767,7 +3909,7 @@ fn outcome_already_unknown(
 
 /// What one reservation's reconciliation established.
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum Settlement {
+pub(super) enum Settlement {
     /// The endpoint reports success; the reservation remains possible spend.
     Confirmed,
     /// Accounting ends with the chain outcome unknown. The disposition and its
@@ -5068,7 +5210,7 @@ mod tests {
             .record_and_persist(&profile, &[entry(k.clone(), now, 999)])
             .unwrap();
 
-        let outcome = store.reset(&profile, now, |_| Ok::<(), ()>(())).unwrap();
+        let outcome = reset_unsigned(&store, &profile, now, |_| Ok::<(), ()>(())).unwrap();
         assert!(
             !outcome.mint.newly_minted,
             "the key was already minted by record_and_persist"
@@ -6271,32 +6413,475 @@ mod tests {
         }
 
         fn reset(&self) -> ResetOutcome {
-            self.store
-                .reset(&self.profile, 100_000, |_| Ok::<_, ()>(()))
-                .unwrap()
+            reset_unsigned(&self.store, &self.profile, 100_000, |_| Ok::<_, ()>(())).unwrap()
+        }
+
+        /// A fixture over a mainnet profile with the same name.
+        fn mainnet() -> Self {
+            keyring_mock::install().unwrap();
+            let dir = TempDir::new().unwrap();
+            let profile = mainnet_test_profile(dir.path(), "reset-snapshot");
+            let store = PersistedWindowStore::at_path(dir.path().join("state.window"));
+            Self {
+                _dir: dir,
+                profile,
+                store,
+            }
+        }
+
+        /// Records a mainnet enablement nonce for the installation.
+        fn enable(&self) {
+            put_raw(
+                &stellar_agent_core::profile::schema::mainnet_enablement_entry_ref(
+                    &self.profile.policy_window_state_key_id,
+                ),
+                "enablement-nonce",
+            );
+        }
+
+        /// Pins a policy signed by `owner` for this store.
+        fn pin_owner(&self, owner: [u8; 32]) {
+            let lock = WindowStoreLock::acquire_for(
+                &self.store.path,
+                &self.profile.policy_window_state_key_id,
+            )
+            .unwrap();
+            pin::write_for_test(
+                &lock,
+                &PinScope::for_profile(&self.store.path, &self.profile),
+                &pin::Pin::new(1, [0x7a; 32], owner).unwrap(),
+            )
+            .unwrap();
         }
     }
 
-    fn assert_reset_refuses(store: &PersistedWindowStore, profile: &Profile) -> WindowStoreError {
+    /// The owner signing key for `seed`.
+    fn owner_key(seed: u8) -> ed25519_dalek::SigningKey {
+        ed25519_dalek::SigningKey::from_bytes(&[seed; 32])
+    }
+
+    /// The owner public key for `seed`.
+    fn owner_of(seed: u8) -> [u8; 32] {
+        owner_key(seed).verifying_key().to_bytes()
+    }
+
+    /// A consent signed by the owner of `seed` over `row`'s statement.
+    fn signed_by(seed: u8, row: &ResetRecord<'_>) -> ResetConsent {
+        let key = owner_key(seed);
+        ResetConsent {
+            owner_signature: Some(OwnerResetSignature {
+                owner: key.verifying_key().to_bytes(),
+                signature: stellar_agent_core::policy::v1::signature::sign(
+                    &row.statement_digest(),
+                    &key,
+                ),
+            }),
+        }
+    }
+
+    /// The statement fields a reset presents to its callbacks.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct Statement {
+        profile_name: String,
+        chain_id: String,
+        store_sha256: Option<[u8; 32]>,
+        generation_before: Option<u64>,
+        generation_after: u64,
+        reason: String,
+        request_id: String,
+        challenge: [u8; 32],
+    }
+
+    impl Statement {
+        fn of(row: &ResetRecord<'_>) -> Self {
+            Self {
+                profile_name: row.profile_name.to_owned(),
+                chain_id: row.chain_id.to_owned(),
+                store_sha256: row.store_sha256,
+                generation_before: row.accrual.generation_before,
+                generation_after: row.accrual.generation_after,
+                reason: row.reason.to_owned(),
+                request_id: row.request_id.to_owned(),
+                challenge: row.challenge,
+            }
+        }
+    }
+
+    /// The profile name the profile's owner coordinate names.
+    fn owner_name(profile: &Profile) -> &str {
+        stellar_agent_core::profile::name::derive_profile_name_from_owner_key(profile)
+            .expect("the test profile names its owner coordinate")
+    }
+
+    /// An authorizer that presents no owner signature.
+    fn unsigned(_: &ResetRecord<'_>) -> ResetConsent {
+        ResetConsent::default()
+    }
+
+    /// Resets under the profile's own name without an owner signature.
+    fn reset_unsigned<E>(
+        store: &PersistedWindowStore,
+        profile: &Profile,
+        now_ms: u64,
+        record: impl FnOnce(&ResetRecord<'_>) -> Result<(), E>,
+    ) -> Result<ResetOutcome, ResetError<E>> {
+        store.reset(
+            profile,
+            owner_name(profile),
+            now_ms,
+            "repair",
+            "reset-request",
+            |_| Ok(ResetConsent::default()),
+            |row, _| record(row),
+        )
+    }
+
+    /// Resets with counting callbacks and returns the result with the number
+    /// of `authorize` and `record` calls.
+    fn counted_reset(
+        store: &PersistedWindowStore,
+        profile: &Profile,
+        name: &str,
+        authorize: impl FnOnce(&ResetRecord<'_>) -> ResetConsent,
+    ) -> (Result<ResetOutcome, ResetError<()>>, usize, usize) {
+        let mut authorized = 0;
+        let mut recorded = 0;
+        let result = store.reset(
+            profile,
+            name,
+            100_000,
+            "repair",
+            "reset-request",
+            |row| {
+                authorized += 1;
+                Ok(authorize(row))
+            },
+            |_, _| {
+                recorded += 1;
+                Ok(())
+            },
+        );
+        (result, authorized, recorded)
+    }
+
+    /// Resets expecting a store refusal before any mint, and asserts that the
+    /// store file, its key and its generation are unchanged and that `record`
+    /// never ran. Returns the refusal and the number of `authorize` calls.
+    fn refused_reset(
+        store: &PersistedWindowStore,
+        profile: &Profile,
+        name: &str,
+        authorize: impl FnOnce(&ResetRecord<'_>) -> ResetConsent,
+    ) -> (WindowStoreError, usize) {
         let before = fs::read(&store.path).ok();
         let key = get_raw(&profile.policy_window_state_key_id);
         let generation = get_raw(&generation_entry_ref(profile));
-        let mut called = false;
-        let result = store.reset(profile, 100_000, |_| {
-            called = true;
-            Ok::<_, ()>(())
-        });
-        assert!(!called, "a refused reset never calls the recorder");
-        assert_eq!(fs::read(&store.path).ok(), before);
-        assert_eq!(get_raw(&profile.policy_window_state_key_id), key);
-        assert_eq!(get_raw(&generation_entry_ref(profile)), generation);
-        match result {
+        let (result, authorized, recorded) = counted_reset(store, profile, name, authorize);
+        let error = match result {
             Err(ResetError::Store {
                 error,
                 minted: false,
             }) => error,
             other => unreachable!("expected refusal without minting: {other:?}"),
+        };
+        assert_eq!(recorded, 0, "a refused reset never calls the recorder");
+        assert_eq!(fs::read(&store.path).ok(), before);
+        assert_eq!(get_raw(&profile.policy_window_state_key_id), key);
+        assert_eq!(get_raw(&generation_entry_ref(profile)), generation);
+        (error, authorized)
+    }
+
+    /// A snapshot refusal: neither callback runs and nothing changes.
+    fn assert_reset_refuses(store: &PersistedWindowStore, profile: &Profile) -> WindowStoreError {
+        let (error, authorized) = refused_reset(store, profile, owner_name(profile), unsigned);
+        assert_eq!(
+            authorized, 0,
+            "a snapshot refusal never calls the authorizer"
+        );
+        error
+    }
+
+    /// Every consent refusal returns before a key mint, a file write or a
+    /// generation write, and before `record` runs.
+    #[test]
+    #[serial]
+    fn reset_consent_refusals_change_nothing() {
+        type Setup = fn(&ResetFixture);
+        type Consent = fn(&ResetRecord<'_>) -> ResetConsent;
+        let sealed: Setup = |f| f.seal(&reset_wire());
+        let missing: Setup = |_| {};
+
+        // a: a nonce without a signature, for both chains and both store states.
+        for mainnet in [false, true] {
+            for store_state in [missing, sealed] {
+                let f = if mainnet {
+                    ResetFixture::mainnet()
+                } else {
+                    ResetFixture::new()
+                };
+                store_state(&f);
+                f.enable();
+                let (error, authorized) =
+                    refused_reset(&f.store, &f.profile, owner_name(&f.profile), unsigned);
+                assert!(
+                    matches!(error, WindowStoreError::ResetOwnerRequired),
+                    "a mainnet {mainnet}: {error:?}"
+                );
+                assert_eq!(authorized, 1);
+            }
         }
+
+        // b: a signature by another owner, with and without a nonce.
+        for enabled in [false, true] {
+            let f = ResetFixture::new();
+            f.pin_owner(owner_of(0xa1));
+            if enabled {
+                f.enable();
+            }
+            let (error, authorized) = refused_reset(
+                &f.store,
+                &f.profile,
+                owner_name(&f.profile),
+                |row: &ResetRecord<'_>| signed_by(0xb2, row),
+            );
+            assert!(
+                matches!(
+                    error,
+                    WindowStoreError::ResetOwnerMismatch { presented, pinned }
+                        if presented == owner_of(0xb2) && pinned == owner_of(0xa1)
+                ),
+                "b enabled {enabled}: {error:?}"
+            );
+            assert_eq!(authorized, 1);
+        }
+
+        // c: the consent of a completed reset presented again.
+        {
+            let f = ResetFixture::new();
+            f.pin_owner(owner_of(0xa1));
+            let mut kept = None;
+            let (result, _, recorded) =
+                counted_reset(&f.store, &f.profile, owner_name(&f.profile), |row| {
+                    let consent = signed_by(0xa1, row);
+                    kept = Some(consent);
+                    consent
+                });
+            result.unwrap();
+            assert_eq!(recorded, 1);
+            let kept = kept.unwrap();
+            let (error, authorized) =
+                refused_reset(&f.store, &f.profile, owner_name(&f.profile), |_| kept);
+            assert!(
+                matches!(error, WindowStoreError::ResetSignatureInvalid),
+                "c: {error:?}"
+            );
+            assert_eq!(authorized, 1);
+        }
+
+        // d: a fresh signature with one flipped bit; e: the identity point
+        // with the identity commitment and a zero scalar.
+        let flipped: Consent = |row| {
+            let mut consent = signed_by(0xa1, row);
+            if let Some(signed) = consent.owner_signature.as_mut() {
+                signed.signature[17] ^= 0x04;
+            }
+            consent
+        };
+        let mut weak_owner = [0u8; 32];
+        weak_owner[0] = 0x01;
+        let weak: Consent = |_| {
+            let mut owner = [0u8; 32];
+            owner[0] = 0x01;
+            let mut signature = [0u8; 64];
+            signature[0] = 0x01;
+            ResetConsent {
+                owner_signature: Some(OwnerResetSignature { owner, signature }),
+            }
+        };
+        for (case, pinned, consent) in [("d", owner_of(0xa1), flipped), ("e", weak_owner, weak)] {
+            let f = ResetFixture::new();
+            f.pin_owner(pinned);
+            let (error, authorized) =
+                refused_reset(&f.store, &f.profile, owner_name(&f.profile), consent);
+            assert!(
+                matches!(error, WindowStoreError::ResetSignatureInvalid),
+                "{case}: {error:?}"
+            );
+            assert_eq!(authorized, 1, "{case}");
+        }
+
+        // f: no pin; g: a malformed pin.
+        for malformed in [false, true] {
+            let f = ResetFixture::new();
+            if malformed {
+                put_raw(
+                    &PinScope::for_profile(&f.store.path, &f.profile).pin_entry_ref(),
+                    "not a policy pin",
+                );
+            }
+            let (error, authorized) = refused_reset(
+                &f.store,
+                &f.profile,
+                owner_name(&f.profile),
+                |row: &ResetRecord<'_>| signed_by(0xa1, row),
+            );
+            if malformed {
+                assert!(
+                    matches!(error, WindowStoreError::ResetPinUnreadable(_)),
+                    "g: {error:?}"
+                );
+            } else {
+                assert!(
+                    matches!(error, WindowStoreError::ResetPinAbsent),
+                    "f: {error:?}"
+                );
+            }
+            assert_eq!(authorized, 1);
+        }
+
+        // h: the nonce coordinate cannot be read.
+        {
+            let f = ResetFixture::new();
+            let nonce = stellar_agent_core::profile::schema::mainnet_enablement_entry_ref(
+                &f.profile.policy_window_state_key_id,
+            );
+            keyring_mock::inject_error(
+                &nonce.service,
+                &nonce.account,
+                keyring_core::Error::NoStorageAccess(Box::new(std::io::Error::other("locked"))),
+            )
+            .unwrap();
+            let (error, authorized) =
+                refused_reset(&f.store, &f.profile, owner_name(&f.profile), unsigned);
+            let WindowStoreError::ResetEnablementUnreadable(cause) = &error else {
+                panic!("h: {error:?}");
+            };
+            assert_eq!(cause.code(), "profile.mainnet_enablement_invalid");
+            assert_eq!(authorized, 1);
+        }
+
+        // i: a name other than the one the owner coordinate names.
+        {
+            let f = ResetFixture::new();
+            let (error, authorized) = refused_reset(&f.store, &f.profile, "other", unsigned);
+            assert!(
+                matches!(error, WindowStoreError::ResetProfileMismatch),
+                "i: {error:?}"
+            );
+            assert_eq!(authorized, 0);
+        }
+    }
+
+    /// The statement binds the store's challenge, so a consent for one first
+    /// use store does not reset another with identical arguments.
+    #[test]
+    #[serial]
+    fn a_consent_does_not_transfer_between_first_use_stores() {
+        let first = ResetFixture::new();
+        first.pin_owner(owner_of(0xa1));
+        let mut kept = None;
+        let (result, _, recorded) = counted_reset(
+            &first.store,
+            &first.profile,
+            owner_name(&first.profile),
+            |row| {
+                let consent = signed_by(0xa1, row);
+                kept = Some((consent, Statement::of(row)));
+                consent
+            },
+        );
+        result.unwrap();
+        assert_eq!(recorded, 1);
+        let (consent, signed) = kept.unwrap();
+
+        let second = ResetFixture::new();
+        second.pin_owner(owner_of(0xa1));
+        assert!(!second.store.path.exists());
+        let mut presented = None;
+        let (error, authorized) = refused_reset(
+            &second.store,
+            &second.profile,
+            owner_name(&second.profile),
+            |row| {
+                presented = Some(Statement::of(row));
+                consent
+            },
+        );
+        assert!(
+            matches!(error, WindowStoreError::ResetSignatureInvalid),
+            "{error:?}"
+        );
+        assert_eq!(authorized, 1);
+        assert!(!second.store.path.exists());
+        assert!(get_raw(&second.profile.policy_window_state_key_id).is_none());
+        assert!(get_raw(&generation_entry_ref(&second.profile)).is_none());
+        let presented = presented.unwrap();
+        assert_eq!(signed.store_sha256, None);
+        assert_eq!(
+            (signed.generation_before, signed.generation_after),
+            (None, 1)
+        );
+        assert_ne!(signed.challenge, presented.challenge);
+        assert_eq!(
+            Statement {
+                challenge: signed.challenge,
+                ..presented
+            },
+            signed
+        );
+    }
+
+    /// A reset signed by the pinned owner runs `record` once with the consent
+    /// `authorize` returned, and each reset draws its own challenge.
+    #[test]
+    #[serial]
+    fn a_reset_signed_by_the_pinned_owner_proceeds() {
+        let f = ResetFixture::new();
+        f.enable();
+        f.pin_owner(owner_of(0xa1));
+        f.seal(&reset_wire());
+        let mut challenges = Vec::new();
+        for _ in 0..2 {
+            let mut returned = None;
+            let mut received = Vec::new();
+            let outcome = f
+                .store
+                .reset(
+                    &f.profile,
+                    owner_name(&f.profile),
+                    100_000,
+                    "repair",
+                    "reset-request",
+                    |row| {
+                        let consent = signed_by(0xa1, row);
+                        returned = Some(consent);
+                        Ok::<_, ()>(consent)
+                    },
+                    |row, consent| {
+                        received.push((*consent, row.statement_digest(), row.challenge));
+                        Ok(())
+                    },
+                )
+                .unwrap();
+            let [(consent, digest, challenge)] = received.as_slice() else {
+                panic!("record runs once: {received:?}");
+            };
+            assert_eq!(Some(*consent), returned);
+            let signed = consent.owner_signature.unwrap();
+            assert_eq!(signed.owner, owner_of(0xa1));
+            stellar_agent_core::policy::v1::signature::verify(
+                digest,
+                &signed.signature,
+                &signed.owner,
+                "reset-snapshot",
+            )
+            .unwrap();
+            let wire = f.store.read_for_inspection(&f.profile).unwrap().unwrap();
+            assert!(wire.entries.is_empty());
+            assert_eq!(wire.generation, outcome.accrual.generation_after);
+            challenges.push(*challenge);
+        }
+        assert_ne!(challenges[0], challenges[1]);
     }
 
     fn reset_wire() -> WireFile {
@@ -6437,6 +7022,7 @@ mod tests {
                 &stellar_agent_core::profile::owner_key::encode_owner_public_key(&[0x51; 32]),
             ),
             store_sha256: Some("f".repeat(64)),
+            challenge: "f".repeat(64),
             signature: "f".repeat(128),
         }
     }
@@ -6464,6 +7050,7 @@ mod tests {
         row.entry_count = usize::MAX;
         row.generation_before = Some(u64::MAX - 1);
         row.generation_after = u64::MAX;
+        row.retained_authorizations = u32::MAX;
         let mut entry = AuditEntry::new_policy_window_state_reset(
             "profile_reset_window_state",
             "p".repeat(64),
@@ -6482,6 +7069,15 @@ mod tests {
         assert!(!entry.truncated);
         let json = serde_json::to_vec(&entry).unwrap();
         assert!(json.len() < MAX_ENTRY_BYTES, "row is {} bytes", json.len());
+        // The writer tags the row and ends the line with a newline.
+        entry.entry_tag = Some(format!("sha256:{}", "f".repeat(64)));
+        let mut line = serde_json::to_vec(&entry).unwrap();
+        line.push(b'\n');
+        assert!(
+            line.len() <= MAX_ENTRY_BYTES,
+            "tagged line is {} bytes",
+            line.len()
+        );
     }
 
     #[test]
@@ -6508,6 +7104,7 @@ mod tests {
             row.entry_count = usize::MAX;
             row.generation_before = Some(u64::MAX - 1);
             row.generation_after = u64::MAX;
+            row.retained_authorizations = u32::MAX;
             let mut entry = AuditEntry::new_policy_window_state_reset(
                 "profile_reset_window_state",
                 "\\".repeat(64),
@@ -6526,6 +7123,15 @@ mod tests {
             assert!(!entry.truncated);
             let json = serde_json::to_vec(&entry).unwrap();
             assert!(json.len() < MAX_ENTRY_BYTES, "row is {} bytes", json.len());
+            // The writer tags the row and ends the line with a newline.
+            entry.entry_tag = Some(format!("sha256:{}", "f".repeat(64)));
+            let mut line = serde_json::to_vec(&entry).unwrap();
+            line.push(b'\n');
+            assert!(
+                line.len() <= MAX_ENTRY_BYTES,
+                "{id:?}: tagged line is {} bytes",
+                line.len()
+            );
         }
     }
 
@@ -6635,11 +7241,8 @@ mod tests {
             keyring_core::Error::NoStorageAccess(Box::new(std::io::Error::other("locked"))),
         )
         .unwrap();
-        let mut called = false;
-        let result = f.store.reset(&f.profile, 100_000, |_| {
-            called = true;
-            Ok::<_, ()>(())
-        });
+        let (result, authorized, recorded) =
+            counted_reset(&f.store, &f.profile, owner_name(&f.profile), unsigned);
         assert!(matches!(
             result,
             Err(ResetError::Store {
@@ -6647,7 +7250,7 @@ mod tests {
                 minted: false,
             })
         ));
-        assert!(!called);
+        assert_eq!((authorized, recorded), (0, 0));
         assert_eq!(get_raw(&f.profile.policy_window_state_key_id), old);
     }
 
@@ -6656,11 +7259,8 @@ mod tests {
     fn reset_invalid_counter_refuses_before_recorder() {
         let f = ResetFixture::new();
         put_raw(&generation_entry_ref(&f.profile), "invalid commitment");
-        let mut called = false;
-        let result = f.store.reset(&f.profile, 100_000, |_| {
-            called = true;
-            Ok::<_, ()>(())
-        });
+        let (result, authorized, recorded) =
+            counted_reset(&f.store, &f.profile, owner_name(&f.profile), unsigned);
         assert!(matches!(
             result,
             Err(ResetError::Store {
@@ -6668,7 +7268,7 @@ mod tests {
                 minted: false,
             })
         ));
-        assert!(!called);
+        assert_eq!((authorized, recorded), (0, 0));
         assert!(get_raw(&f.profile.policy_window_state_key_id).is_none());
     }
 
@@ -6677,11 +7277,8 @@ mod tests {
     fn reset_read_error_refuses_before_recorder() {
         let f = ResetFixture::new();
         fs::create_dir(&f.store.path).unwrap();
-        let mut called = false;
-        let result = f.store.reset(&f.profile, 100_000, |_| {
-            called = true;
-            Ok::<_, ()>(())
-        });
+        let (result, authorized, recorded) =
+            counted_reset(&f.store, &f.profile, owner_name(&f.profile), unsigned);
         assert!(matches!(
             result,
             Err(ResetError::Store {
@@ -6689,7 +7286,7 @@ mod tests {
                 minted: false,
             })
         ));
-        assert!(!called);
+        assert_eq!((authorized, recorded), (0, 0));
         assert!(get_raw(&f.profile.policy_window_state_key_id).is_none());
     }
 
@@ -6726,11 +7323,8 @@ mod tests {
     fn reset_owner_namespace_refuses_before_recorder() {
         let mut f = ResetFixture::new();
         f.profile.policy_window_state_key_id = KeyringEntryRef::default_owner_key("another");
-        let mut called = false;
-        let result = f.store.reset(&f.profile, 100_000, |_| {
-            called = true;
-            Ok::<_, ()>(())
-        });
+        let (result, authorized, recorded) =
+            counted_reset(&f.store, &f.profile, owner_name(&f.profile), unsigned);
         assert!(matches!(
             result,
             Err(ResetError::Store {
@@ -6738,7 +7332,7 @@ mod tests {
                 minted: false,
             })
         ));
-        assert!(!called);
+        assert_eq!((authorized, recorded), (0, 0));
         assert!(get_raw(&f.profile.policy_window_state_key_id).is_none());
     }
 
@@ -6750,11 +7344,8 @@ mod tests {
         let value = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(OWNER_KEY);
         put_raw(&f.profile.policy_window_state_key_id, &value);
         put_raw(&f.profile.policy_owner_key_id, &value);
-        let mut called = false;
-        let result = f.store.reset(&f.profile, 100_000, |_| {
-            called = true;
-            Ok::<_, ()>(())
-        });
+        let (result, authorized, recorded) =
+            counted_reset(&f.store, &f.profile, owner_name(&f.profile), unsigned);
         assert!(matches!(
             result,
             Err(ResetError::Store {
@@ -6762,7 +7353,7 @@ mod tests {
                 minted: false,
             })
         ));
-        assert!(!called);
+        assert_eq!((authorized, recorded), (0, 0));
         assert_eq!(get_raw(&f.profile.policy_window_state_key_id), Some(value));
     }
 
@@ -6777,7 +7368,7 @@ mod tests {
             let before = fs::read(&f.store.path).ok();
             let key = get_raw(&f.profile.policy_window_state_key_id);
             let counter = get_raw(&generation_entry_ref(&f.profile));
-            let result = f.store.reset(&f.profile, 100_000, |row| {
+            let unchanged = |row: &ResetRecord<'_>| {
                 assert_eq!(fs::read(&f.store.path).ok(), before);
                 assert_eq!(get_raw(&f.profile.policy_window_state_key_id), key);
                 assert_eq!(get_raw(&generation_entry_ref(&f.profile)), counter);
@@ -6785,12 +7376,54 @@ mod tests {
                     row.accrual.generation_before,
                     load_generation(&generation_entry_ref(&f.profile)).unwrap()
                 );
-                Err("recorder refused")
-            });
+            };
+            let mut authorized = 0;
+            let result = f.store.reset(
+                &f.profile,
+                owner_name(&f.profile),
+                100_000,
+                "repair",
+                "reset-request",
+                |row| {
+                    authorized += 1;
+                    unchanged(row);
+                    Ok(ResetConsent::default())
+                },
+                |row, _| {
+                    unchanged(row);
+                    Err("recorder refused")
+                },
+            );
             assert!(matches!(
                 result,
                 Err(ResetError::Recorder("recorder refused"))
             ));
+            assert_eq!(authorized, 1);
+            assert_eq!(fs::read(&f.store.path).ok(), before);
+            assert_eq!(get_raw(&f.profile.policy_window_state_key_id), key);
+            assert_eq!(get_raw(&generation_entry_ref(&f.profile)), counter);
+
+            let mut recorded = 0;
+            let result = f.store.reset(
+                &f.profile,
+                owner_name(&f.profile),
+                100_000,
+                "repair",
+                "reset-request",
+                |row| {
+                    unchanged(row);
+                    Err("authorizer refused")
+                },
+                |_, _| {
+                    recorded += 1;
+                    Ok(())
+                },
+            );
+            assert!(matches!(
+                result,
+                Err(ResetError::Recorder("authorizer refused"))
+            ));
+            assert_eq!(recorded, 0);
             assert_eq!(fs::read(&f.store.path).ok(), before);
             assert_eq!(get_raw(&f.profile.policy_window_state_key_id), key);
             assert_eq!(get_raw(&generation_entry_ref(&f.profile)), counter);
@@ -6802,20 +7435,38 @@ mod tests {
     fn reset_holds_window_lock_during_recorder() {
         let f = ResetFixture::new();
         let other = f.store.clone();
-        let mut observed = None;
+        let mut during_authorize = None;
+        let mut during_record = None;
         f.store
-            .reset(&f.profile, 100_000, |_| {
-                observed = Some(other.reset(&f.profile, 100_000, |_| Ok::<_, ()>(())));
-                Ok::<_, ()>(())
-            })
+            .reset(
+                &f.profile,
+                owner_name(&f.profile),
+                100_000,
+                "repair",
+                "reset-request",
+                |_| {
+                    during_authorize = Some(reset_unsigned(&other, &f.profile, 100_000, |_| {
+                        Ok::<_, ()>(())
+                    }));
+                    Ok::<_, ()>(ResetConsent::default())
+                },
+                |_, _| {
+                    during_record = Some(reset_unsigned(&other, &f.profile, 100_000, |_| {
+                        Ok::<_, ()>(())
+                    }));
+                    Ok(())
+                },
+            )
             .unwrap();
-        assert!(matches!(
-            observed,
-            Some(Err(ResetError::Store {
-                error: WindowStoreError::WriterLocked,
-                minted: false,
-            }))
-        ));
+        for observed in [during_authorize, during_record] {
+            assert!(matches!(
+                observed,
+                Some(Err(ResetError::Store {
+                    error: WindowStoreError::WriterLocked,
+                    minted: false,
+                }))
+            ));
+        }
     }
 
     #[test]
@@ -6823,7 +7474,7 @@ mod tests {
     fn reset_write_failure_after_mint_reports_minted() {
         let f = ResetFixture::new();
         fs::create_dir(f.store.path.with_file_name("state.window.tmp")).unwrap();
-        let result = f.store.reset(&f.profile, 100_000, |_| Ok::<_, ()>(()));
+        let result = reset_unsigned(&f.store, &f.profile, 100_000, |_| Ok::<_, ()>(()));
         assert!(matches!(
             result,
             Err(ResetError::Store {
@@ -7984,11 +8635,8 @@ mod tests {
         else {
             panic!("the expiry commits");
         };
-        let mut recorded = false;
-        let refused = fx.store.reset(&fx.profile, now, |_| {
-            recorded = true;
-            Ok::<_, ()>(())
-        });
+        let (refused, authorized, recorded) =
+            counted_reset(&fx.store, &fx.profile, owner_name(&fx.profile), unsigned);
         assert!(matches!(
             refused,
             Err(ResetError::Store {
@@ -7996,17 +8644,19 @@ mod tests {
                 minted: false,
             })
         ));
-        assert!(!recorded, "the refusal precedes the recorder");
+        assert_eq!(
+            (authorized, recorded),
+            (0, 0),
+            "the refusal precedes both callbacks"
+        );
         let mut writer = delivery_writer(&fx.profile);
         deliver_accounting_expiries(&mut writer, &fx.store, &fx.profile, "reset-expiry", None)
             .unwrap();
-        fx.store
-            .reset(&fx.profile, now, |_| Ok::<_, ()>(()))
-            .unwrap();
+        reset_unsigned(&fx.store, &fx.profile, now, |_| Ok::<_, ()>(())).unwrap();
         let wire = fx.store.read_for_inspection(&fx.profile).unwrap().unwrap();
         assert!(wire.entries.is_empty());
         let [kept] = wire.accounting_expiries.as_slice() else {
-            panic!("the unprojected record carries into the empty successor");
+            panic!("the unprojected record carries into the successor");
         };
         assert_eq!(kept.decision_id, decision_id);
         assert!(kept.audit_acknowledged && !kept.receipt_projected);
@@ -9597,7 +10247,15 @@ mod tests {
         auth.claim().unwrap();
         let before = fs::read(f.window.path()).unwrap();
         assert!(matches!(
-            f.window.reset(&f.profile, f.now, |_| Ok::<_, ()>(())),
+            f.window.reset(
+                &f.profile,
+                &f.name,
+                f.now,
+                "repair",
+                "reset-request",
+                |_| Ok(ResetConsent::default()),
+                |_, _| Ok::<_, ()>(())
+            ),
             Err(ResetError::Store {
                 error: WindowStoreError::OpenAuthorizations { open: 1 },
                 minted: false
@@ -9646,7 +10304,7 @@ mod tests {
             let counter = get_raw(&gen_entry);
 
             let _clock = crate::mainnet::clock::set_now_ms_for_test(now);
-            let result = store.reset(&profile, now, |_| Ok::<_, ()>(()));
+            let result = reset_unsigned(&store, &profile, now, |_| Ok::<_, ()>(()));
             if mainnet && cfg!(feature = "mainnet-write") {
                 #[cfg(feature = "mainnet-write")]
                 assert!(matches!(
@@ -9659,9 +10317,7 @@ mod tests {
                 assert_eq!(fs::read(&store.path).unwrap(), bytes);
                 assert_eq!(get_raw(&gen_entry), counter);
                 _clock.set(now + 60_000);
-                store
-                    .reset(&profile, now + 60_000, |_| Ok::<_, ()>(()))
-                    .unwrap();
+                reset_unsigned(&store, &profile, now + 60_000, |_| Ok::<_, ()>(())).unwrap();
             } else {
                 result.unwrap();
             }
@@ -9704,11 +10360,8 @@ mod tests {
                 defect_of(&WindowStoreError::UnsupportedVersion, false),
                 None
             );
-            let called = std::cell::Cell::new(false);
-            let result = f.store.reset(&f.profile, 100_000, |_| -> Result<(), ()> {
-                called.set(true);
-                Ok(())
-            });
+            let (result, authorized, recorded) =
+                counted_reset(&f.store, &f.profile, owner_name(&f.profile), unsigned);
             assert!(
                 matches!(
                     result,
@@ -9719,7 +10372,7 @@ mod tests {
                 ),
                 "{chain:?}: {result:?}"
             );
-            assert!(!called.get(), "{chain:?}");
+            assert_eq!((authorized, recorded), (0, 0), "{chain:?}");
             assert_eq!(fs::read(f.store.path()).unwrap(), before, "{chain:?}");
         }
     }
@@ -9898,7 +10551,7 @@ mod tests {
                         );
                     }
                     assert!(matches!(
-                        store.reset(&supplied, now_ms().unwrap(), |_| Ok::<_, ()>(())),
+                        reset_unsigned(&store, &supplied, now_ms().unwrap(), |_| Ok::<_, ()>(())),
                         Err(ResetError::Store {
                             error: WindowStoreError::ChainUnverifiable,
                             ..
@@ -10286,7 +10939,7 @@ mod tests {
                 step,
                 (0, 0),
                 |store, profile, now| {
-                    let failure = store.reset(profile, now, |_| Ok::<_, ()>(())).err();
+                    let failure = reset_unsigned(store, profile, now, |_| Ok::<_, ()>(())).err();
                     assert!(
                         match &failure {
                             None => true,
@@ -10402,7 +11055,7 @@ mod tests {
             let gen_entry = generation_entry_ref(&f.profile);
             let mut recorded = None;
             let armed = fail_commit_at(step, &gen_entry);
-            let result = f.store.reset(&f.profile, 100_000, |record| {
+            let result = reset_unsigned(&f.store, &f.profile, 100_000, |record| {
                 recorded = Some(record.accrual.generation_after);
                 Ok::<_, ()>(())
             });
@@ -10426,7 +11079,7 @@ mod tests {
         let f = ResetFixture::new();
         let gen_entry = generation_entry_ref(&f.profile);
         let armed = fail_commit_at(CommitStep::PreparedImage, &gen_entry);
-        let result = f.store.reset(&f.profile, 100_000, |_| Ok::<_, ()>(()));
+        let result = reset_unsigned(&f.store, &f.profile, 100_000, |_| Ok::<_, ()>(()));
         drop(armed);
         assert!(matches!(
             result,
