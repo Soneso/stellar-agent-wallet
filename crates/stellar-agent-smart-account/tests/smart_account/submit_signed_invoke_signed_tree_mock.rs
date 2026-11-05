@@ -340,6 +340,9 @@ async fn submit_on(
     };
     let result = submit_signed_invoke(
         SubmitInvokeArgs::builder()
+            .admission(stellar_agent_network::SigningAdmission::NoValue(
+                stellar_agent_smart_account::signing::intent_test_helpers::no_value_admission(),
+            ))
             .target_contract(&target)
             .auth_address(&auth_address)
             .auth_rule_ids(&[ContextRuleId::new(0)])

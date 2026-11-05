@@ -111,6 +111,11 @@ pub trait Criterion: Send + Sync + std::fmt::Debug + std::any::Any {
     /// type.
     fn kind(&self) -> &'static str;
 
+    /// Returns whether this criterion holds windowed accounting state.
+    fn windowed(&self) -> bool {
+        false
+    }
+
     /// Checks the criterion using the deny-only interface.
     ///
     /// An unmet threshold fails closed here. Rule evaluation uses

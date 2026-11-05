@@ -107,6 +107,10 @@ impl BundleRateLimitCriterion {
 }
 
 impl Criterion for BundleRateLimitCriterion {
+    fn windowed(&self) -> bool {
+        true
+    }
+
     fn kind(&self) -> &'static str {
         "bundle_rate_limit"
     }

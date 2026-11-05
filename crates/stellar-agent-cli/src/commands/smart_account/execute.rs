@@ -483,6 +483,7 @@ pub async fn run(args: &ExecuteArgs) -> i32 {
         Duration::from_secs(args.timeout_seconds),
         Arc::clone(&audit_writer),
         &audit_log_path,
+        None,
     ) {
         Ok(manager) => manager,
         Err(e) => return emit_error(&e, args.output, &request_id),
@@ -563,10 +564,9 @@ pub async fn run(args: &ExecuteArgs) -> i32 {
         .map(|id| ContextRuleId::new(*id))
         .collect();
 
-    // Record the submission before the bytes leave. The invocation is an
-    // arbitrary contract call the policy engine cannot size, so the record is
-    // the receipt and the audit rows: no spending-window reservation is taken
-    // for a value nothing measured.
+    // Record the submission before the bytes leave.
+    // The call is sized as an unvalued contract call: a matching value rule without
+    // `allow_opaque_signing` refuses it before signing, and count limits charge it as one intent.
     let now_ms = match stellar_agent_core::timefmt::now_unix_ms() {
         Ok(v) => v,
         Err(e) => {
@@ -596,6 +596,7 @@ pub async fn run(args: &ExecuteArgs) -> i32 {
 
     let recorder = match crate::commands::submission_record::build_recorder(
         crate::commands::submission_record::SubmitRecord {
+            unvalued: Some(stellar_agent_core::policy::v1::OpaqueReason::UnvaluedContractCall),
             policy_decision: stellar_agent_core::audit_log::PolicyDecision::Allow,
             profile: &profile,
             profile_name: profile_name.clone(),
@@ -632,7 +633,7 @@ pub async fn run(args: &ExecuteArgs) -> i32 {
             .timeout(Duration::from_secs(args.timeout_seconds))
             .op_label("execute")
             .emit_observability_logs(true)
-            .submission_recorder(&recorder)
+            .admission(stellar_agent_network::SigningAdmission::Recorded(&recorder))
             .pin_check(PinCheck {
                 signers_manager: &signers_manager,
                 request_id: &request_id,

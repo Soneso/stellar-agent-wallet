@@ -298,6 +298,24 @@ pub enum PostSubmitVerificationKind {
               variant size is intentional diagnostic richness"
 )]
 pub enum SaError {
+    /// Intent accounting cannot establish a durable charge.
+    #[error(
+        "Smart-account intent recording is unavailable ({class}). Existing exposed charges remain."
+    )]
+    #[serde(rename = "submission.intent_record_unavailable")]
+    IntentRecordUnavailable {
+        /// The fixed failure class.
+        class: &'static str,
+    },
+    /// A signing request or final envelope differs from the admitted authority.
+    #[error(
+        "The signing request or final transaction does not match its admitted intent ({field}). Existing exposed charges remain."
+    )]
+    #[serde(rename = "submission.intent_binding_mismatch")]
+    IntentBindingMismatch {
+        /// The fixed mismatching field.
+        field: &'static str,
+    },
     /// Removing or adding a signer would produce an unreachable threshold.
     ///
     /// Fired when the requested `requested_op` would leave the rule with fewer
@@ -2999,6 +3017,8 @@ impl SaError {
     #[must_use]
     pub fn wire_code(&self) -> &'static str {
         match self {
+            Self::IntentRecordUnavailable { .. } => "submission.intent_record_unavailable",
+            Self::IntentBindingMismatch { .. } => "submission.intent_binding_mismatch",
             Self::ThresholdUnreachable { .. } => "sa.threshold_unreachable",
             Self::VerifierHashDrift { .. } => "sa.verifier_hash_drift",
             Self::PolicyHashDrift { .. } => "sa.policy_hash_drift",

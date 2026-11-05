@@ -44,6 +44,7 @@ testnet-acceptance = [
 ]
 
 [dev-dependencies]
+stellar-agent-smart-account = { workspace = true, features = ["test-helpers"] }
 stellar-agent-test-support = { path = "../stellar-agent-test-support", features = ["test-helpers"] }
 stellar-agent-defi = { path = "../stellar-agent-defi", features = ["test-helpers"] }
 # CountingSigner for the adapter submit tests.

@@ -81,6 +81,9 @@ async fn manager_with_rule(
             Duration::from_secs(5),
             CHAIN_ID.to_owned(),
         )
+        .with_intent_admission(std::sync::Arc::new(
+            stellar_agent_smart_account::signing::intent_test_helpers::no_value_admission_owned(),
+        ))
         .with_signers_manager(signers_manager)
         .with_audit_writer(audit_writer),
     )
@@ -371,6 +374,10 @@ async fn verify_pins_mixed_drift_and_unavailable_preserves_both_statuses_and_cod
                 Duration::from_secs(5),
                 CHAIN_ID.to_owned(),
             )
+            .with_intent_admission(std::sync::Arc::new(
+                stellar_agent_smart_account::signing::intent_test_helpers::no_value_admission_owned(
+                ),
+            ))
             .with_signers_manager(signers)
             .with_audit_writer(audit),
         )
@@ -508,6 +515,9 @@ async fn single_verifier_report(
             Duration::from_secs(5),
             CHAIN_ID.to_owned(),
         )
+        .with_intent_admission(std::sync::Arc::new(
+            stellar_agent_smart_account::signing::intent_test_helpers::no_value_admission_owned(),
+        ))
         .with_signers_manager(signers)
         .with_audit_writer(audit),
     )

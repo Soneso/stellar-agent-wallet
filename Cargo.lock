@@ -5207,6 +5207,7 @@ dependencies = [
  "stellar-accounts",
  "stellar-agent-core",
  "stellar-agent-network",
+ "stellar-agent-soroban-auth",
  "stellar-agent-test-support",
  "stellar-agent-xdr-limits",
  "stellar-baselib",

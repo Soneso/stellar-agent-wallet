@@ -85,6 +85,8 @@ use crate::submit::{ExpectedReturn, refuse_mainnet_sa};
 #[derive(Clone)]
 #[non_exhaustive]
 pub struct ContextRuleManagerConfig {
+    /// Count admission required by signing operations.
+    pub intent_admission: Option<Arc<stellar_agent_network::NoValueAdmission>>,
     /// Primary Soroban RPC URL.
     ///
     /// The manager constructs both the [`stellar_rpc_client::Client`] (for
@@ -151,6 +153,7 @@ pub struct ContextRuleManagerConfig {
 impl std::fmt::Debug for ContextRuleManagerConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let Self {
+            intent_admission: _,
             primary_rpc_url,
             secondary_rpc_url,
             network_passphrase,
@@ -185,6 +188,16 @@ impl std::fmt::Debug for ContextRuleManagerConfig {
 }
 
 impl ContextRuleManagerConfig {
+    /// Supplies the checked count admission for signing operations.
+    #[must_use]
+    pub fn with_intent_admission(
+        mut self,
+        admission: Arc<stellar_agent_network::NoValueAdmission>,
+    ) -> Self {
+        self.intent_admission = Some(admission);
+        self
+    }
+
     /// Public constructor (the struct is `#[non_exhaustive]` so external
     /// crates cannot use struct-expression syntax).
     ///
@@ -201,6 +214,7 @@ impl ContextRuleManagerConfig {
         chain_id: String,
     ) -> Self {
         Self {
+            intent_admission: None,
             primary_rpc_url,
             secondary_rpc_url: None,
             network_passphrase,
@@ -321,6 +335,7 @@ impl ContextRuleManagerConfig {
 /// - Soroban auth-entry assembly with the `Signer::sign_auth_digest`
 ///   single-call-site invariant.
 pub struct ContextRuleManager {
+    intent_admission: Option<Arc<stellar_agent_network::NoValueAdmission>>,
     primary_rpc_url: String,
     /// Secondary RPC URL for cross-RPC simulation checks; `None` disables.
     secondary_rpc_url: Option<String>,
@@ -576,6 +591,7 @@ impl ContextRuleManager {
             }
         })?;
         Ok(Self {
+            intent_admission: config.intent_admission,
             primary_rpc_url: config.primary_rpc_url,
             secondary_rpc_url: config.secondary_rpc_url,
             network_passphrase: config.network_passphrase,
@@ -2952,6 +2968,13 @@ impl ContextRuleManager {
             });
         }
 
+        let admission = self
+            .intent_admission
+            .as_ref()
+            .ok_or(SaError::IntentRecordUnavailable {
+                class: "missing_admission",
+            })?;
+
         // Build the pre-form HostFunction from the entrypoint + args.
         // The free function accepts a pre-built HostFunction so callers that
         // Callers that already hold a secondary client can skip this step.
@@ -2976,6 +2999,7 @@ impl ContextRuleManager {
 
         crate::submit::submit_signed_invoke(
             crate::submit::SubmitInvokeArgs::builder()
+                .admission(stellar_agent_network::SigningAdmission::NoValue(admission))
                 .target_contract(&smart_account_strkey)
                 .auth_rule_ids(auth_rule_ids)
                 .host_function(host_function)
@@ -5597,7 +5621,7 @@ pub(crate) fn sa_error_to_invocation_result(
         SaError::TimelockListPendingFailed { .. } => SaInvocationResult::PreSubmissionRefused,
         // Simulation-audit mismatch fires immediately before
         // submit_transaction_and_wait; the transaction was never sent.
-        SaError::AuthMismatch { .. } => SaInvocationResult::PreSubmissionRefused,
+        SaError::AuthMismatch { .. } | SaError::IntentRecordUnavailable { .. } | SaError::IntentBindingMismatch { .. } => SaInvocationResult::PreSubmissionRefused,
     }
 }
 
@@ -6155,6 +6179,7 @@ mod tests {
 
     fn manager_for_test() -> ContextRuleManager {
         ContextRuleManager::new(ContextRuleManagerConfig {
+            intent_admission: None,
             primary_rpc_url: "http://127.0.0.1:65535".to_owned(),
             secondary_rpc_url: None,
             network_passphrase: "Test SDF Network ; September 2015".to_owned(),
@@ -10531,6 +10556,9 @@ mod tests {
             stellar_agent_network::signing::test_doubles::CountingSigner::new(EXPIRY_CHECK_SEED);
         let result = crate::submit::submit_signed_invoke(
             crate::submit::SubmitInvokeArgs::builder()
+                .admission(stellar_agent_network::SigningAdmission::NoValue(
+                    crate::signing::intent_test_helpers::no_value_admission(),
+                ))
                 .target_contract(&stellar_strkey::Contract(EXPIRY_CHECK_WALLET).to_string())
                 .auth_rule_ids(&[ContextRuleId::new(0)])
                 .host_function(HostFunction::InvokeContract(InvokeContractArgs {

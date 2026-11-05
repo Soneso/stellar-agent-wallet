@@ -494,9 +494,10 @@ fn store_refusal(name: &str, error: WindowStoreError) -> WalletError {
                 open,
             })
         }
-        WindowStoreError::AccountingAuditOwed => {
+        error @ (WindowStoreError::AccountingAuditOwed
+        | WindowStoreError::SignedIntentLive { .. }) => {
             WalletError::Submission(SubmissionError::RecordUnavailable {
-                detail: WindowStoreError::AccountingAuditOwed.to_string(),
+                detail: error.to_string(),
             })
         }
         error => WalletError::Internal(InternalError::UnexpectedState {

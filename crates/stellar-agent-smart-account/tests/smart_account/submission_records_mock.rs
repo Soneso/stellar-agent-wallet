@@ -82,6 +82,7 @@ type SimulateHook = Box<dyn FnOnce() + Send>;
 
 struct Rpc {
     poll_status: &'static str,
+    nonce: i64,
     sends: Arc<AtomicUsize>,
     sent_hash: Arc<Mutex<String>>,
     /// Runs once, on the first simulation: the point after the bundle gate
@@ -91,6 +92,9 @@ struct Rpc {
     /// per inner call beneath the router's root invocation.
     exec_subtree: bool,
     extra_transfer: bool,
+    fail_signed: bool,
+    source_only: bool,
+    on_signed_or_send: Option<Arc<dyn Fn() + Send + Sync>>,
     /// The envelopes this endpoint saw, in order.
     seen: Arc<Mutex<SeenEnvelopes>>,
 }
@@ -194,11 +198,17 @@ impl Respond for Rpc {
                     &value.to_xdr_base64(Limits::none()).unwrap(),
                 );
                 let auth = if !op.auth.is_empty() {
+                    if let Some(hook) = &self.on_signed_or_send {
+                        hook();
+                    }
                     self.seen
                         .lock()
                         .unwrap()
                         .signed_simulations
                         .push(TransactionEnvelope::Tx(tx.clone()));
+                    if self.fail_signed {
+                        return ResponseTemplate::new(200).set_body_json(json!({"jsonrpc": "2.0", "id": body["id"], "result": {"error": "signed simulation refuses"}}));
+                    }
                     op.auth.to_vec()
                 } else if function == "exec" {
                     let sub_invocations = if self.exec_subtree {
@@ -237,13 +247,21 @@ impl Respond for Rpc {
                     vec![SorobanAuthorizationEntry {
                         credentials: SorobanCredentials::Address(SorobanAddressCredentials {
                             address: ScAddress::Contract(ContractId(Hash([0x44; 32]))),
-                            nonce: 7,
+                            nonce: self.nonce,
                             signature_expiration_ledger: 0,
                             signature: ScVal::Void,
                         }),
                         root_invocation: SorobanAuthorizedInvocation {
                             function: SorobanAuthorizedFunction::ContractFn(invoke.clone()),
                             sub_invocations,
+                        },
+                    }]
+                } else if self.source_only && value == ScVal::Void {
+                    vec![SorobanAuthorizationEntry {
+                        credentials: SorobanCredentials::SourceAccount,
+                        root_invocation: SorobanAuthorizedInvocation {
+                            function: SorobanAuthorizedFunction::ContractFn(invoke.clone()),
+                            sub_invocations: VecM::default(),
                         },
                     }]
                 } else {
@@ -257,6 +275,9 @@ impl Respond for Rpc {
                 result
             }
             "sendTransaction" => {
+                if let Some(hook) = &self.on_signed_or_send {
+                    hook();
+                }
                 self.sends.fetch_add(1, Ordering::SeqCst);
                 self.seen.lock().unwrap().sent.push(
                     TransactionEnvelope::from_xdr_base64(
@@ -283,12 +304,73 @@ impl Respond for Rpc {
     }
 }
 
+struct SpySigner {
+    inner: stellar_agent_network::signing::test_doubles::CountingSigner,
+    hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+}
+
+impl SpySigner {
+    fn sign_calls(&self) -> usize {
+        self.inner.sign_calls()
+    }
+    fn observe(&self) {
+        if let Some(hook) = self.hook.lock().unwrap().as_ref() {
+            hook();
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl stellar_agent_network::Signer for SpySigner {
+    async fn public_key(
+        &self,
+    ) -> Result<stellar_strkey::ed25519::PublicKey, stellar_agent_core::WalletError> {
+        self.inner.public_key().await
+    }
+    async fn sign_auth_digest(
+        &self,
+        payload: &stellar_agent_network::SmartAccountAuthDigest,
+    ) -> Result<[u8; 64], stellar_agent_core::WalletError> {
+        self.observe();
+        self.inner.sign_auth_digest(payload).await
+    }
+    async fn sign_tx_payload(
+        &self,
+        payload: &stellar_agent_network::TxSigningPayload,
+    ) -> Result<[u8; 64], stellar_agent_core::WalletError> {
+        self.observe();
+        self.inner.sign_tx_payload(payload).await
+    }
+    async fn sign_soroban_address_auth_payload(
+        &self,
+        payload: &stellar_agent_network::SorobanAuthPayload,
+    ) -> Result<[u8; 64], stellar_agent_core::WalletError> {
+        self.observe();
+        self.inner.sign_soroban_address_auth_payload(payload).await
+    }
+    async fn sign_message(
+        &self,
+        payload: &stellar_agent_network::MessagePayload,
+    ) -> Result<[u8; 64], stellar_agent_core::WalletError> {
+        self.inner.sign_message(payload).await
+    }
+    async fn sign_webauthn_assertion(
+        &self,
+        payload: &stellar_agent_network::SmartAccountAuthDigest,
+        id: &[u8],
+    ) -> Result<stellar_agent_network::WebAuthnAssertion, stellar_agent_core::WalletError> {
+        self.observe();
+        self.inner.sign_webauthn_assertion(payload, id).await
+    }
+}
+
 struct Fixture {
     _root: TempDir,
     _home: StellarAgentHomeGuard,
     profile: Profile,
     audit: Arc<Mutex<AuditWriter>>,
     registry: MulticallRegistry,
+    signer: SpySigner,
 }
 
 impl Fixture {
@@ -317,6 +399,44 @@ impl Fixture {
             profile,
             audit,
             registry,
+            signer: SpySigner {
+                inner: stellar_agent_network::signing::test_doubles::CountingSigner::new(SEED),
+                hook: Mutex::new(None),
+            },
+        }
+    }
+
+    fn restart(self) -> Self {
+        let Self {
+            _root: root,
+            _home: home,
+            profile,
+            audit,
+            registry,
+            signer,
+        } = self;
+        drop((audit, registry, signer));
+        let audit = Arc::new(Mutex::new(
+            AuditWriter::open(profile.audit_log_path.clone(), None).unwrap(),
+        ));
+        let mut registry = MulticallRegistry::load(&root.path().join("networks.toml")).unwrap();
+        registry
+            .register(MulticallRegistryEntry {
+                network_passphrase: PASSPHRASE.into(),
+                address: contract(0x45),
+                wasm_sha256: MULTICALL_WASM_SHA256.into(),
+            })
+            .unwrap();
+        Self {
+            _root: root,
+            _home: home,
+            profile,
+            audit,
+            registry,
+            signer: SpySigner {
+                inner: stellar_agent_network::signing::test_doubles::CountingSigner::new(SEED),
+                hook: Mutex::new(None),
+            },
         }
     }
 
@@ -455,7 +575,7 @@ impl Fixture {
         engine: Arc<PolicyEngineV1>,
         chain_id: &str,
     ) -> Result<stellar_agent_smart_account::multicall::MulticallResult, SaError> {
-        let signer = SoftwareSigningKey::new_from_bytes(SEED);
+        let signer = &self.signer;
         // The bundle signs under rule 0, which the pinned-hash drift check
         // never fetches or reads.
         let signers_manager =
@@ -465,7 +585,7 @@ impl Fixture {
                 smart_account: &contract(0x44),
                 rule_id: 0,
                 bundle,
-                signer: &signer,
+                signer,
                 primary_rpc_url: url,
                 secondary_rpc_url: secondary_url,
                 network_passphrase: PASSPHRASE,
@@ -519,11 +639,15 @@ async fn rpc_with_hook(
     Mock::given(method("POST"))
         .respond_with(Rpc {
             poll_status: status,
+            nonce: 7,
             sends: Arc::clone(&sends),
             sent_hash: Arc::clone(&sent_hash),
             before_simulate: Arc::new(Mutex::new(before_simulate)),
             exec_subtree: false,
             extra_transfer: false,
+            fail_signed: false,
+            source_only: false,
+            on_signed_or_send: None,
             seen: Arc::default(),
         })
         .mount(&server)
@@ -540,17 +664,36 @@ async fn rpc_with_exec_subtree() -> (MockServer, Arc<AtomicUsize>, Arc<Mutex<See
 async fn rpc_with_tree(
     extra_transfer: bool,
 ) -> (MockServer, Arc<AtomicUsize>, Arc<Mutex<SeenEnvelopes>>) {
+    rpc_with_tree_failure(extra_transfer, false).await
+}
+
+async fn rpc_with_tree_failure(
+    extra_transfer: bool,
+    fail_signed: bool,
+) -> (MockServer, Arc<AtomicUsize>, Arc<Mutex<SeenEnvelopes>>) {
+    rpc_with_tree_failure_nonce(extra_transfer, fail_signed, 7).await
+}
+
+async fn rpc_with_tree_failure_nonce(
+    extra_transfer: bool,
+    fail_signed: bool,
+    nonce: i64,
+) -> (MockServer, Arc<AtomicUsize>, Arc<Mutex<SeenEnvelopes>>) {
     let server = MockServer::start().await;
     let sends = Arc::new(AtomicUsize::new(0));
     let seen = Arc::new(Mutex::new(SeenEnvelopes::default()));
     Mock::given(method("POST"))
         .respond_with(Rpc {
             poll_status: "SUCCESS",
+            nonce,
             sends: Arc::clone(&sends),
             sent_hash: Arc::default(),
             before_simulate: Arc::default(),
             exec_subtree: true,
             extra_transfer,
+            fail_signed,
+            source_only: false,
+            on_signed_or_send: None,
             seen: Arc::clone(&seen),
         })
         .mount(&server)
@@ -578,10 +721,10 @@ fn invocation_of(
 /// A bundle the gate admits against an empty window is refused at its
 /// reservation when a competing reservation lands in between, and the
 /// refusal reaches the caller as the gate's own denial: no multicall wrapper,
-/// no send, and the recorder's closing row carries the policy code.
+/// no send, and the policy-gate row carries the policy code.
 #[tokio::test]
 #[serial]
-async fn a_reservation_refused_at_pre_send_surfaces_as_the_gate_denial() {
+async fn a_reservation_refused_at_admission_surfaces_as_the_gate_denial() {
     let fixture = Fixture::new();
     let profile = fixture.profile.clone();
     let competing = Box::new(move || {
@@ -619,7 +762,18 @@ async fn a_reservation_refused_at_pre_send_surfaces_as_the_gate_denial() {
             .unwrap();
     });
     let (server, sends, _) = rpc_with_hook("SUCCESS", Some(competing)).await;
-    let err = fixture.multicall(&server.uri()).await.unwrap_err();
+    let (witness, _, _) = rpc("SUCCESS").await;
+    let result = fixture
+        .multicall_with_secondary(
+            &server.uri(),
+            &second_loopback_host(&witness.uri()),
+            fixture.bundle(),
+            fixture.engine(),
+            "stellar:testnet",
+        )
+        .await;
+    assert_eq!(fixture.signer.sign_calls(), 0);
+    let err = result.unwrap_err();
     assert_eq!(
         err.wire_code(),
         "policy.deny.per_period_cap_exceeded",
@@ -642,10 +796,35 @@ async fn a_reservation_refused_at_pre_send_surfaces_as_the_gate_denial() {
         1,
         "only the competing reservation stands"
     );
+    assert_eq!(fixture.signer.sign_calls(), 0);
+    assert!(
+        PersistedWindowStore::for_profile(PROFILE)
+            .signed_intents(PROFILE, &fixture.profile)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(fixture.rows("value_action_pending").is_empty());
+    assert!(fixture.rows("value_action_failed").is_empty());
+    let denied = fixture.rows("sa_multicall_bundle_denied");
+    assert_eq!(denied.len(), 1);
+    assert_eq!(denied[0]["refusal_phase"], "policy_gate");
+    assert_eq!(
+        denied[0]["deny_wire_code"],
+        "multicall.policy.deny.per_period_cap_exceeded"
+    );
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(
+        requests
+            .iter()
+            .filter(
+                |request| serde_json::from_slice::<Value>(&request.body).unwrap()["method"]
+                    == "simulateTransaction"
+            )
+            .count(),
+        1
+    );
+
     assert!(fixture.rows("value_action_submitted").is_empty());
-    let closing = fixture.rows("value_action_failed");
-    assert_eq!(closing.len(), 1, "the pending row is closed out once");
-    assert_eq!(closing[0]["code"], "policy.deny.per_period_cap_exceeded");
 }
 
 #[tokio::test]
@@ -901,6 +1080,13 @@ async fn timed_out_timelock_execute_keeps_receipt_and_pending_row() {
         None,
         "timelock-record",
         stellar_agent_core::timefmt::now_unix_ms().unwrap(),
+    )
+    .with_signing_sizing(
+        stellar_agent_core::policy::v1::CheckedSizing::for_test(
+            stellar_agent_core::policy::v1::SizingBasis::NoApplicableLimit,
+            Vec::new(),
+        )
+        .unwrap(),
     );
     let operation =
         stellar_agent_smart_account::timelock::TimelockOperationId::from_bytes([0x46; 32]);
@@ -1292,4 +1478,330 @@ async fn a_simulated_transfer_outside_the_bundle_is_refused() {
     assert_eq!(rows[0]["refusal_phase"], "sign");
     assert_eq!(sends.load(Ordering::SeqCst), 0);
     assert!(seen.lock().unwrap().signed_simulations.is_empty());
+}
+
+#[tokio::test]
+#[serial]
+async fn repeated_signed_resimulation_failure_cannot_exceed_cap() {
+    let fixture = Fixture::new();
+    let (server, sends, seen) = rpc_with_tree_failure_nonce(false, true, 7).await;
+    let first = fixture.multicall(&server.uri()).await.unwrap_err();
+    assert_eq!(first.wire_code(), "sa.multicall_failed", "{first:?}");
+    assert_eq!(seen.lock().unwrap().signed_simulations.len(), 1);
+    assert!(fixture.signer.sign_calls() > 0);
+    let intents = PersistedWindowStore::for_profile(PROFILE)
+        .signed_intents(PROFILE, &fixture.profile)
+        .unwrap();
+    let retained_total = fixture.total();
+    let fixture = fixture.restart();
+    let (second_server, second_sends, second_seen) =
+        rpc_with_tree_failure_nonce(false, true, 8).await;
+    let second = fixture
+        .multicall_with_policy(&second_server.uri(), fixture.bundle(), fixture.engine())
+        .await;
+    assert_eq!(
+        fixture.signer.sign_calls(),
+        0,
+        "the retained charge refuses the fresh nonce before signing"
+    );
+    let second = second.unwrap_err();
+    assert_eq!(second.wire_code(), "sa.multicall_failed", "{second:?}");
+    assert_eq!(intents.len(), 1);
+    assert_eq!(
+        intents[0].status,
+        "authorization exposed, submission unknown"
+    );
+    assert_eq!(intents[0].legs.len(), 2);
+    assert_eq!(retained_total, (60, 2));
+    assert_eq!(
+        seen.lock().unwrap().signed_simulations.len()
+            + second_seen.lock().unwrap().signed_simulations.len(),
+        1
+    );
+    assert_eq!(
+        sends.load(Ordering::SeqCst) + second_sends.load(Ordering::SeqCst),
+        0
+    );
+    assert_eq!(fixture.total(), (60, 2));
+}
+
+#[cfg(feature = "test-hooks")]
+#[tokio::test]
+#[serial]
+async fn the_entry_guard_is_free_at_every_signer_rpc_and_writer_call() {
+    use stellar_agent_core::policy::state_lock::WindowStoreLock;
+    let fixture = Fixture::new();
+    let path = PersistedWindowStore::for_profile(PROFILE).path().to_owned();
+    let key = fixture.profile.policy_window_state_key_id.clone();
+    let signer_calls = Arc::new(AtomicUsize::new(0));
+    let rpc_calls = Arc::new(AtomicUsize::new(0));
+    let writer_calls = Arc::new(AtomicUsize::new(0));
+    let observer = |count: Arc<AtomicUsize>| {
+        let path = path.clone();
+        let key = key.clone();
+        Arc::new(move || {
+            let _guard = WindowStoreLock::acquire_for(&path, &key).unwrap();
+            count.fetch_add(1, Ordering::SeqCst);
+        }) as Arc<dyn Fn() + Send + Sync>
+    };
+    *fixture.signer.hook.lock().unwrap() = Some(observer(Arc::clone(&signer_calls)));
+    let seen = Arc::new(Mutex::new(SeenEnvelopes::default()));
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(Rpc {
+            poll_status: "SUCCESS",
+            nonce: 7,
+            sends: Arc::default(),
+            sent_hash: Arc::default(),
+            before_simulate: Arc::default(),
+            exec_subtree: true,
+            extra_transfer: false,
+            fail_signed: false,
+            source_only: false,
+            on_signed_or_send: Some(observer(Arc::clone(&rpc_calls))),
+            seen,
+        })
+        .mount(&server)
+        .await;
+    let observed = Arc::clone(&writer_calls);
+    let _hook = stellar_agent_network::submission_record::observe_pending_writer_for_test(
+        Arc::new(move |profile, store| {
+            let _guard =
+                WindowStoreLock::acquire_for(store.path(), &profile.policy_window_state_key_id)
+                    .unwrap();
+            observed.fetch_add(1, Ordering::SeqCst);
+        }),
+    );
+    fixture.multicall(&server.uri()).await.unwrap();
+    assert_eq!(signer_calls.load(Ordering::SeqCst), 3);
+    assert_eq!(rpc_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(writer_calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+#[serial]
+async fn cap_refusal_precedes_any_signed_authorization() {
+    use stellar_agent_core::policy::v1::criteria::rate_limit::RateLimitCriterion;
+    use stellar_agent_core::policy::{
+        McpToolRegistration, PolicyEngine, ToolDescriptor, ToolValueKind,
+    };
+    for case in [
+        "schedule",
+        "execute",
+        "cancel",
+        "missing_sizing",
+        "value_schedule",
+    ] {
+        let fixture = Fixture::new();
+        let server = MockServer::start().await;
+        let sends = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::new(Mutex::new(SeenEnvelopes::default()));
+        Mock::given(method("POST"))
+            .respond_with(Rpc {
+                poll_status: "SUCCESS",
+                nonce: 7,
+                sends: Arc::clone(&sends),
+                sent_hash: Arc::default(),
+                before_simulate: Arc::default(),
+                exec_subtree: false,
+                extra_transfer: false,
+                fail_signed: false,
+                source_only: true,
+                on_signed_or_send: None,
+                seen: Arc::clone(&seen),
+            })
+            .mount(&server)
+            .await;
+        let tool = if case == "cancel" {
+            "stellar_smart_account_timelock_cancel"
+        } else if case == "execute" {
+            "stellar_smart_account_timelock_execute"
+        } else {
+            "stellar_smart_account_timelock_schedule"
+        };
+        let criterion: Box<dyn stellar_agent_core::policy::v1::criteria::Criterion> = if case
+            == "value_schedule"
+        {
+            Box::new(stellar_agent_core::policy::v1::criteria::per_period_cap::PerPeriodCapCriterion::new("native".into(), Window::parse("1m").unwrap(), 1))
+        } else {
+            Box::new(RateLimitCriterion::new(Window::parse("1m").unwrap(), 1))
+        };
+        let engine = PolicyEngineV1::new(
+            PolicyDocument {
+                version: 1,
+                scope: ScopeId::AllProfiles,
+                rules: vec![PolicyRule {
+                    r#match: RuleMatch {
+                        tool: tool.into(),
+                        chain: "*".into(),
+                    },
+                    criteria: vec![criterion],
+                    decision: Decision::Allow,
+                    allow_opaque_signing: false,
+                }],
+                signature: None,
+            },
+            PROFILE.into(),
+        );
+        let descriptor = ToolDescriptor::from_registration(&McpToolRegistration {
+            name: tool,
+            destructive_hint: true,
+            read_only_hint: false,
+            chain_id_required: true,
+            value_kind: ToolValueKind::ReadOnly,
+        });
+        let now = stellar_agent_core::timefmt::now_unix_ms().unwrap();
+        let window = PersistedWindowStore::for_profile(PROFILE);
+        let count = engine
+            .size_no_value(&descriptor, &fixture.profile, now)
+            .unwrap();
+        if case != "value_schedule" {
+            window
+                .record_and_persist(&fixture.profile, count.entries())
+                .unwrap();
+        }
+        let before = std::fs::read(window.path()).ok();
+        let result = if case == "value_schedule" {
+            match engine
+                .size_unvalued_call(
+                    &descriptor,
+                    &fixture.profile,
+                    stellar_agent_core::policy::v1::OpaqueReason::UnvaluedContractCall,
+                    now,
+                )
+                .unwrap()
+            {
+                stellar_agent_core::policy::v1::SizingOutcome::Refused(reason) => {
+                    Err(SaError::PolicyDenied {
+                        reason: Box::new(reason),
+                    })
+                }
+                _ => panic!("a value rule must refuse scheduling without value evidence"),
+            }
+        } else if case == "cancel" {
+            let admission = stellar_agent_network::NoValueAdmission::new(
+                fixture.profile.clone(),
+                PROFILE,
+                count,
+            )
+            .unwrap();
+            stellar_agent_smart_account::timelock::cancel(
+                stellar_agent_smart_account::timelock::TimelockCancelArgs::builder()
+                    .timelock_contract_strkey(&contract(0x49))
+                    .operation_id(
+                        &stellar_agent_smart_account::timelock::TimelockOperationId::from_bytes(
+                            [0x46; 32],
+                        ),
+                    )
+                    .signer(&fixture.signer)
+                    .primary_rpc_url(&server.uri())
+                    .secondary_rpc_url(&second_loopback_host(&server.uri()))
+                    .network_passphrase(PASSPHRASE)
+                    .audit_writer(&fixture.audit)
+                    .request_id("cap-cancel")
+                    .intent_admission(&admission)
+                    .build(),
+            )
+            .await
+            .map(|_| ())
+        } else {
+            let entries = if case == "missing_sizing" {
+                vec![]
+            } else {
+                count.entries().to_vec()
+            };
+            let recorder = WalletSubmissionRecorder::new(
+                &fixture.profile,
+                PROFILE,
+                tool,
+                Some("stellar:testnet".into()),
+                stellar_agent_core::audit_log::PolicyDecision::Allow,
+                vec![],
+                entries,
+                ReceiptStore::open(PROFILE).unwrap(),
+                window.clone(),
+                Some(Arc::clone(&fixture.audit)),
+                None,
+                "cap-schedule",
+                now,
+            );
+            let recorder = if case == "missing_sizing" {
+                recorder
+            } else {
+                recorder.with_signing_sizing(count)
+            };
+            if case == "execute" {
+                stellar_agent_smart_account::timelock::execute(
+                    stellar_agent_smart_account::timelock::TimelockExecuteArgs::builder()
+                        .timelock_contract_strkey(&contract(0x49))
+                        .target_strkey(&contract(0x47))
+                        .function("transfer")
+                        .salt([0x50; 32])
+                        .signer(&fixture.signer)
+                        .primary_rpc_url(&server.uri())
+                        .secondary_rpc_url(&second_loopback_host(&server.uri()))
+                        .network_passphrase(PASSPHRASE)
+                        .audit_writer(&fixture.audit)
+                        .request_id("cap-execute")
+                        .expected_operation_id(
+                            &stellar_agent_smart_account::timelock::TimelockOperationId::from_bytes(
+                                [0x46; 32],
+                            ),
+                        )
+                        .submission_recorder(&recorder)
+                        .build(),
+                )
+                .await
+                .map(|_| ())
+            } else {
+                stellar_agent_smart_account::timelock::schedule_upgrade(
+                    stellar_agent_smart_account::timelock::TimelockScheduleArgs::builder()
+                        .timelock_contract_strkey(&contract(0x49))
+                        .target_strkey(&contract(0x47))
+                        .function("transfer")
+                        .delay_ledgers(10)
+                        .signer(&fixture.signer)
+                        .primary_rpc_url(&server.uri())
+                        .secondary_rpc_url(&second_loopback_host(&server.uri()))
+                        .network_passphrase(PASSPHRASE)
+                        .audit_writer(&fixture.audit)
+                        .request_id("cap-schedule")
+                        .submission_recorder(&recorder)
+                        .build(),
+                )
+                .await
+                .map(|_| ())
+            }
+        };
+        let error = result.unwrap_err();
+        assert_eq!(
+            error.wire_code(),
+            match case {
+                "missing_sizing" => "submission.intent_record_unavailable",
+                "value_schedule" => "policy.deny.unsizable_value_effect",
+                _ => "policy.deny.rate_limit_exceeded",
+            },
+            "{case}: {error:?}"
+        );
+        assert_eq!(fixture.signer.sign_calls(), 0, "{case}");
+        assert_eq!(sends.load(Ordering::SeqCst), 0, "{case}");
+        assert!(
+            seen.lock()
+                .unwrap()
+                .signed_simulations
+                .iter()
+                .all(|envelope| invocation_of(envelope)
+                    .1
+                    .iter()
+                    .all(|entry| matches!(entry.credentials, SorobanCredentials::SourceAccount))),
+            "{case}"
+        );
+        assert_eq!(std::fs::read(window.path()).ok(), before, "{case}");
+        assert!(
+            window
+                .signed_intents(PROFILE, &fixture.profile)
+                .unwrap()
+                .is_empty()
+        );
+    }
 }

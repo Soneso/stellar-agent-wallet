@@ -226,7 +226,7 @@ async fn deposit(
         "defindex",
     );
     let signer = CountingSigner::new(SEED);
-    let ctx = DefiAdapterCtx::new_with_submit_ctx(
+    let mut ctx = DefiAdapterCtx::new_with_submit_ctx(
         "default",
         &pin,
         &rpc,
@@ -236,6 +236,8 @@ async fn deposit(
         Some(&secondary_rpc),
         Some(Duration::from_secs(5)),
     );
+    ctx.submission_recorder =
+        Some(&stellar_agent_smart_account::signing::intent_test_helpers::NoLimitRecorder);
     let args = VaultDepositArgs {
         vault_address: strkey(&vault()),
         amounts_desired: vec![DESIRED],

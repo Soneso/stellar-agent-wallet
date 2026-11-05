@@ -1761,6 +1761,7 @@ async fn b6_audit_log_request_id_pairing_across_divergence_emit() {
 
     let outcome = creds_mgr
         .sign_with_passkey_rule(
+            &stellar_agent_smart_account::signing::intent_test_helpers::gate(vec![]),
             "does-not-matter", // credential lookup never reached
             &entry,
             Arc::clone(&sm),

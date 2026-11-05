@@ -285,6 +285,8 @@ impl ValueLeg {
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OpaqueReason {
+    /// A contract call whose value effect cannot be measured.
+    UnvaluedContractCall,
     /// A wallet-authorized multicall call whose value effect cannot be sized.
     UnvaluedBundleCall,
     /// The tool signs a caller-supplied transaction envelope whose value
@@ -308,6 +310,7 @@ impl OpaqueReason {
     #[must_use]
     pub fn as_str(&self) -> &'static str {
         match self {
+            Self::UnvaluedContractCall => "unvalued_contract_call",
             Self::UnvaluedBundleCall => "unvalued_bundle_call",
             Self::RawTransactionSignature => "raw_transaction_signature",
             Self::RawAuthEntrySignature => "raw_auth_entry_signature",

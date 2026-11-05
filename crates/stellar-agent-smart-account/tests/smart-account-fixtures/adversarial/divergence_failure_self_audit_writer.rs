@@ -150,6 +150,9 @@ async fn build_fixture() -> DivergenceFixture {
             Duration::from_secs(5),
             CHAIN_ID.to_owned(),
         )
+        .with_intent_admission(std::sync::Arc::new(
+            stellar_agent_smart_account::signing::intent_test_helpers::no_value_admission_owned(),
+        ))
         .with_secondary_rpc_url(second_loopback_host(&secondary_server.uri()))
         .with_signers_manager(signers_manager)
         .with_audit_writer(Arc::clone(&audit_writer)),

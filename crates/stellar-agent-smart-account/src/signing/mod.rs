@@ -6,3 +6,9 @@
 
 pub mod divergence;
 pub mod ledger_witness;
+
+pub mod gate;
+
+/// Checked admission fixtures for signing tests.
+#[cfg(any(test, feature = "test-helpers"))]
+pub mod intent_test_helpers;

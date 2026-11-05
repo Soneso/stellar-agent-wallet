@@ -279,12 +279,12 @@ fn instructions_string_names_every_registered_tool() {
 /// The count assertion guards against a tool being accidentally added or dropped.
 /// When the tool set changes, update the expected count and the name list below.
 #[test]
-fn registry_contains_forty_three_tools() {
+fn registry_contains_forty_four_tools() {
     let registry = collect_registry_names();
     assert_eq!(
         registry.len(),
-        43,
-        "registry must contain exactly 43 tools \
+        44,
+        "registry must contain exactly 44 tools \
          (stellar_balances + stellar_friendbot + stellar_create_account \
          + stellar_create_account_commit + stellar_pay + stellar_pay_commit \
          + stellar_fee_stats + stellar_sep43_get_address + stellar_sep43_get_network \
@@ -1928,4 +1928,13 @@ fn every_approval_consumer_acquires_the_writer_between_the_approval_read_and_the
             &["lazy_signer_from_keyring(", "enrolled_keyring_signer("],
         );
     }
+}
+
+/// The intent inspection tool has no state-changing annotation.
+#[test]
+fn stellar_signed_intents_list_annotations_correct() {
+    let registration = find_registration("stellar_signed_intents_list").unwrap();
+    assert!(registration.read_only_hint);
+    assert!(!registration.destructive_hint);
+    assert!(!registration.chain_id_required);
 }

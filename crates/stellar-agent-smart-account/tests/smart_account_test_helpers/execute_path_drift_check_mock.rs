@@ -1144,7 +1144,7 @@ impl Harness {
                 "pin-check-mock".to_owned(),
                 timeouts.client,
                 CHAIN_ID.to_owned(),
-            ))
+            ).with_intent_admission(std::sync::Arc::new(stellar_agent_smart_account::signing::intent_test_helpers::no_value_admission_owned())))
             .unwrap(),
         );
         Self {
@@ -1182,6 +1182,10 @@ impl Harness {
                 self.timeouts.budget,
                 CHAIN_ID.to_owned(),
             )
+            .with_intent_admission(std::sync::Arc::new(
+                stellar_agent_smart_account::signing::intent_test_helpers::no_value_admission_owned(
+                ),
+            ))
             .with_secondary_rpc_url(self.secondary_uri())
             .with_signers_manager(Arc::clone(&self.manager))
             .with_audit_writer(Arc::clone(&self.audit)),
@@ -1574,6 +1578,9 @@ impl Harness {
         let secondary_uri = self.secondary_uri();
         submit_signed_invoke(
             SubmitInvokeArgs::builder()
+                .admission(stellar_agent_network::SigningAdmission::NoValue(
+                    stellar_agent_smart_account::signing::intent_test_helpers::no_value_admission(),
+                ))
                 .target_contract(&smart_account)
                 .auth_rule_ids(&rule_ids)
                 .host_function(noop())
@@ -1603,7 +1610,35 @@ impl Harness {
         request_id: Option<&str>,
         recorder: Option<&dyn SubmissionRecorder>,
     ) -> Result<SubmitInvokeResult, SaError> {
-        let signer = SoftwareSigningKey::new_from_bytes(SEED);
+        let signer = stellar_agent_network::signing::test_doubles::CountingSigner::new(SEED);
+        self.submit_invocation_with_signing(function, rule_ids, request_id, recorder, &signer, 0)
+            .await
+    }
+
+    async fn submit_invocation_with_signing(
+        &self,
+        function: &str,
+        rule_ids: &[u32],
+        request_id: Option<&str>,
+        recorder: Option<&dyn SubmissionRecorder>,
+        signer: &stellar_agent_network::signing::test_doubles::CountingSigner,
+        arm: u8,
+    ) -> Result<SubmitInvokeResult, SaError> {
+        use stellar_agent_smart_account::managers::authorization::{
+            AuthorizationInfo, Combinator, SignerGroup,
+        };
+        let key = stellar_agent_network::Signer::public_key(signer)
+            .await
+            .unwrap()
+            .0;
+        let authorization = AuthorizationInfo::new(
+            vec![
+                SignerGroup::new("first".into(), vec![key], 1).unwrap(),
+                SignerGroup::new("second".into(), vec![key], 1).unwrap(),
+            ],
+            Combinator::And,
+        );
+        let signers: [&(dyn stellar_agent_network::Signer + Send + Sync); 1] = [signer];
         let rule_ids: Vec<ContextRuleId> =
             rule_ids.iter().copied().map(ContextRuleId::new).collect();
         let smart_account = strkey(&smart_account());
@@ -1624,14 +1659,17 @@ impl Harness {
                 .auth_rule_ids(&rule_ids)
                 .host_function(invocation(function))
                 .sub_invocations(DeclaredSubInvocations::Calls(&declared_calls))
-                .signer(&signer)
+                .signer(signer)
+                .maybe_authorization((arm == 2).then_some(&authorization))
+                .signers(&signers)
+                .maybe_ed25519_rule_signer((arm == 1).then_some(stellar_agent_smart_account::submit::Ed25519RuleSigner { signer, verifier: verifier_v() }))
                 .primary_rpc_url(&uri)
                 .secondary_rpc_url(&secondary_uri)
                 .network_passphrase(PASSPHRASE)
                 .chain_id(CHAIN_ID)
                 .timeout(self.timeouts.budget)
                 .op_label("pin_check_mock")
-                .maybe_submission_recorder(recorder)
+                .admission(recorder.map_or(stellar_agent_network::SigningAdmission::NoValue(stellar_agent_smart_account::signing::intent_test_helpers::no_value_admission()), stellar_agent_network::SigningAdmission::Recorded))
                 .maybe_pin_check(request_id.map(|request_id| PinCheck {
                     signers_manager: &self.manager,
                     request_id,
@@ -2337,6 +2375,9 @@ fn unroutable_args<'a>(
     pin_check: Option<PinCheck<'a>>,
 ) -> SubmitInvokeArgs<'a> {
     SubmitInvokeArgs::builder()
+        .admission(stellar_agent_network::SigningAdmission::NoValue(
+            stellar_agent_smart_account::signing::intent_test_helpers::no_value_admission(),
+        ))
         .target_contract("CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM")
         .auth_rule_ids(rule_ids)
         .host_function(noop())
@@ -4067,12 +4108,17 @@ async fn a_rule_manager_without_a_signers_manager_refuses_a_non_zero_rule() {
         ContextRuleManager, ContextRuleManagerConfig,
     };
 
-    let manager = ContextRuleManager::new(ContextRuleManagerConfig::new(
-        UNROUTABLE_RPC.to_owned(),
-        PASSPHRASE.to_owned(),
-        Duration::from_secs(10),
-        CHAIN_ID.to_owned(),
-    ))
+    let manager = ContextRuleManager::new(
+        ContextRuleManagerConfig::new(
+            UNROUTABLE_RPC.to_owned(),
+            PASSPHRASE.to_owned(),
+            Duration::from_secs(10),
+            CHAIN_ID.to_owned(),
+        )
+        .with_intent_admission(std::sync::Arc::new(
+            stellar_agent_smart_account::signing::intent_test_helpers::no_value_admission_owned(),
+        )),
+    )
     .unwrap();
     let signer = SoftwareSigningKey::new_from_bytes(SEED);
     let err = manager
@@ -6460,6 +6506,9 @@ fn rule_manager_without_signers_manager(h: &Harness) -> ContextRuleManager {
             Duration::from_secs(10),
             CHAIN_ID.to_owned(),
         )
+        .with_intent_admission(std::sync::Arc::new(
+            stellar_agent_smart_account::signing::intent_test_helpers::no_value_admission_owned(),
+        ))
         .with_secondary_rpc_url(h.secondary_uri()),
     )
     .unwrap()
@@ -8207,12 +8256,52 @@ async fn a_rule_verbs_slow_comparison_elapses_at_signer_set_compare() {
 /// Counts the submissions recorded as sent and settled.
 #[derive(Default)]
 struct CountingRecorder {
+    refuse_admission: bool,
+    admissions: AtomicUsize,
+    cancellations: AtomicUsize,
+    bound_pre_sends: AtomicUsize,
     pre_sends: AtomicUsize,
     outcomes: AtomicUsize,
 }
 
 #[async_trait::async_trait]
 impl SubmissionRecorder for CountingRecorder {
+    async fn admit_signed_intent(
+        &self,
+        plan: &stellar_agent_network::SignedIntentPlan,
+    ) -> Result<stellar_agent_network::IntentProof, stellar_agent_core::WalletError> {
+        self.admissions.fetch_add(1, Ordering::SeqCst);
+        if self.refuse_admission {
+            return Err(stellar_agent_core::WalletError::PolicyDenied {
+                reason: Box::new(stellar_agent_core::policy::DenyReason::RateLimitExceeded {
+                    window: "1m".into(),
+                    max_calls: 1,
+                    calls_in_window: 1,
+                }),
+            });
+        }
+        stellar_agent_smart_account::signing::intent_test_helpers::no_value_admission()
+            .admit(plan)
+            .await
+    }
+    async fn cancel_unexposed(
+        &self,
+        proof: stellar_agent_network::IntentProof,
+    ) -> Result<(), stellar_agent_core::WalletError> {
+        self.cancellations.fetch_add(1, Ordering::SeqCst);
+        stellar_agent_smart_account::signing::intent_test_helpers::no_value_admission()
+            .cancel_unexposed(proof)
+            .await
+    }
+    async fn pre_send_bound(
+        &self,
+        intent: &stellar_agent_network::SubmissionIntent,
+        _: &stellar_agent_network::IntentBinding<'_>,
+    ) -> Result<(), stellar_agent_core::WalletError> {
+        self.bound_pre_sends.fetch_add(1, Ordering::SeqCst);
+        self.pre_send(intent).await
+    }
+
     async fn pre_send(
         &self,
         _intent: &stellar_agent_network::SubmissionIntent,
@@ -8227,6 +8316,41 @@ impl SubmissionRecorder for CountingRecorder {
         _outcome: &stellar_agent_network::SubmissionOutcome,
     ) {
         self.outcomes.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+#[tokio::test]
+async fn cap_refusal_precedes_any_signed_authorization() {
+    for arm in [1, 2] {
+        let h = Harness::new(two_rule_chain()).await;
+        h.baseline_v2(1);
+        let recorder = CountingRecorder {
+            refuse_admission: true,
+            ..CountingRecorder::default()
+        };
+        let signer = stellar_agent_network::signing::test_doubles::CountingSigner::new(SEED);
+        let result = h
+            .submit_invocation_with_signing(
+                "noop",
+                &[1],
+                Some("cap-refusal"),
+                Some(&recorder),
+                &signer,
+                arm,
+            )
+            .await;
+        assert_eq!(signer.sign_calls(), 0);
+        let error = result.unwrap_err();
+        assert_eq!(
+            error.wire_code(),
+            "policy.deny.rate_limit_exceeded",
+            "arm {arm}: {error:?}"
+        );
+        assert_eq!(signer.sign_calls(), 0);
+        assert_eq!(h.sends(), 0);
+        assert_eq!(recorder.admissions.load(Ordering::SeqCst), 1);
+        assert_eq!(recorder.bound_pre_sends.load(Ordering::SeqCst), 0);
+        assert_eq!(recorder.cancellations.load(Ordering::SeqCst), 0);
     }
 }
 
@@ -8259,6 +8383,9 @@ async fn a_refused_submission_leaves_no_record_and_a_sent_one_does() {
         .await
         .unwrap_err();
     assert_eq!(drift.wire_code(), "sa.verifier_hash_drift");
+    assert_eq!(recorder.admissions.load(Ordering::SeqCst), 0);
+    assert_eq!(recorder.cancellations.load(Ordering::SeqCst), 0);
+    assert_eq!(recorder.bound_pre_sends.load(Ordering::SeqCst), 0);
     assert_eq!(recorder.pre_sends.load(Ordering::SeqCst), 0);
     assert_eq!(recorder.outcomes.load(Ordering::SeqCst), 0);
 
@@ -8267,6 +8394,9 @@ async fn a_refused_submission_leaves_no_record_and_a_sent_one_does() {
     h.submit_invocation("noop", &[1], Some("req-record-sent"), Some(&recorder))
         .await
         .unwrap();
+    assert_eq!(recorder.admissions.load(Ordering::SeqCst), 1);
+    assert_eq!(recorder.cancellations.load(Ordering::SeqCst), 0);
+    assert_eq!(recorder.bound_pre_sends.load(Ordering::SeqCst), 1);
     assert_eq!(recorder.pre_sends.load(Ordering::SeqCst), 1);
     assert_eq!(recorder.outcomes.load(Ordering::SeqCst), 1);
 }
@@ -9617,7 +9747,7 @@ async fn quorum_collection_refuses_a_revoked_signing_rule() {
         baseline_authorization_simulation, matching_envelope_context,
     };
     use stellar_agent_smart_account::managers::authorization::{
-        AuthorizationInfo, Combinator, SignerGroup, collect_quorum_signatures,
+        AuthorizationInfo, Combinator, SignerGroup, plan_quorum_signatures,
     };
     let h = Harness::new(chain_with_rule_one([0xee; 32])).await;
     h.pin_created(
@@ -9641,7 +9771,7 @@ async fn quorum_collection_refuses_a_revoked_signing_rule() {
             vec![SignerGroup::new("one".to_owned(), vec![SEED], 1).unwrap()],
             Combinator::And,
         );
-        collect_quorum_signatures(
+        plan_quorum_signatures(
             checked,
             &authz,
             &[&signer],
@@ -9949,6 +10079,9 @@ async fn an_incomplete_pin_record_refuses_signing_with_no_signature_and_no_send(
     let secondary_uri = h.secondary_uri();
     let err = submit_signed_invoke(
         SubmitInvokeArgs::builder()
+            .admission(stellar_agent_network::SigningAdmission::NoValue(
+                stellar_agent_smart_account::signing::intent_test_helpers::no_value_admission(),
+            ))
             .target_contract(&smart_account)
             .auth_rule_ids(&rule_ids)
             .host_function(noop())
@@ -10288,6 +10421,9 @@ fn a_mismatched_operation_id_stays_out_of_the_refusal() {
     let signer = SoftwareSigningKey::new_from_bytes(SEED);
     let contract = strkey(&policy_p());
     let args = TimelockExecuteArgs::builder()
+        .submission_recorder(
+            &stellar_agent_smart_account::signing::intent_test_helpers::NoLimitRecorder,
+        )
         .timelock_contract_strkey(&contract)
         .target_strkey(&contract)
         .function("upgrade")

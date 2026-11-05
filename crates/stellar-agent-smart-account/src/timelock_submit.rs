@@ -18,28 +18,22 @@
 //! the OZ TimelockController.
 //!
 //! This module provides [`submit_timelock_invoke_with_g_key_auth`], which:
-//! 1. Builds a source-account transaction for the `InvokeHostFunction`.
-//! 2. Simulates (empty auth) to discover the required auth entries, then
-//!    obtains the mandatory ledger witness: the primary and the secondary
-//!    endpoint observe the latest ledger, and the pair must agree within
-//!    [`MAX_SIGNING_LEDGER_SKEW`](crate::signing::ledger_witness::MAX_SIGNING_LEDGER_SKEW).
-//! 3. Validates every authorization entry before any signature. SourceAccount
-//!    and signer Address credentials name the wallet's exact invocation with
-//!    no sub-invocations. Other credential variants are refused. Only then
-//!    does it compute, per Address entry, the canonical
-//!    `HashIdPreimageSorobanAuthorization` preimage over that call and sign it
-//!    via `Signer::sign_soroban_address_auth_payload`.
-//! 4. Re-simulates with signed auth entries to obtain the accurate Soroban
-//!    resource footprint (which includes storage reads triggered by the G-key
-//!    `require_auth` validation path).
-//! 5. Builds the final transaction envelope (soroban_data + auth injected).
-//! 6. Attaches the source-account Ed25519 signature.
-//! 7. Submits via `stellar_agent_network::submit_transaction_and_wait_sent_by`.
+//! 1. Builds and simulates the wallet's timelock invocation.
+//! 2. Obtains the ledger witness and validates every authorization credential
+//!    against that invocation, without sub-invocations.
+//! 3. Freezes and admits signed entry subjects before constructing their gate.
+//!    A fresh witness is required after admission and before entry signing.
+//! 4. Simulates the signed authorization and fetches the final source sequence.
+//!    A signed entry plan refuses any change to its frozen sequence.
+//! 5. Builds the final envelope. Empty and SourceAccount-only plans admit here,
+//!    after readying their witness pair, then check freshness without rereading.
+//! 6. Authorizes and signs the envelope through the gate, binds recorded
+//!    exposure, links the reservation, and submits before the deadline.
 //!
-//! The first signature, an entry's or else the envelope's, rests on a pair no
-//! older than the observation age: a stale pair is read again first. Every
-//! signature and the send fall before the one pre-submit deadline the witness
-//! answers to; the confirmation poll keeps the submission's own timeout.
+//! A stale witness can refresh before admission. Staleness after admission
+//! refuses and cancels an unexposed admission. Every failure after the first
+//! successful gate authorization retains the charge. Confirmation polling
+//! uses the submission timeout.
 //!
 //! # Auth preimage shape
 //!
@@ -92,6 +86,7 @@ use crate::managers::rules::{
     BASE_FEE_STROOPS, SimulationErrorClass, fingerprint_invocation, parse_min_resource_fee,
     validate_latest_ledger,
 };
+use crate::signing::gate::{SignerMatch, SigningGate, SigningRequest};
 use crate::signing::ledger_witness::{
     ResolvedKeySigner, WitnessRequest, WitnessedLedgerBound, checked_secondary_rpc_url,
     witness_signing_ledger,
@@ -99,6 +94,10 @@ use crate::signing::ledger_witness::{
 use crate::submit::{
     DeclaredSubInvocations, attribute_signed_tree_refusal, check_declared_sub_invocations,
     check_simulated_root, map_sent_by_error, refuse_mainnet_sa,
+};
+use stellar_agent_network::{
+    AuthSubject, IntentSubject, SignedIntentPlan, SignerDescriptor, SigningAdmission,
+    SigningPayload,
 };
 
 // ── Public result type ────────────────────────────────────────────────────────
@@ -149,8 +148,8 @@ pub(crate) struct TimelockSubmitArgs<'a> {
     pub(crate) timeout: std::time::Duration,
     /// Human-readable operation label for error messages and logs.
     pub(crate) op_label: &'static str,
-    /// Records the signed execution before sending and settles its outcome.
-    pub(crate) submission_recorder: Option<&'a dyn stellar_agent_network::SubmissionRecorder>,
+    /// Charges the intent before its first signature.
+    pub(crate) admission: SigningAdmission<'a>,
 }
 
 // ── Main submit function ──────────────────────────────────────────────────────
@@ -216,74 +215,52 @@ fn validate_timelock_auth_entries(
     Ok(validated)
 }
 
-/// Submits a timelock `InvokeHostFunction` with direct G-key authorization.
+/// Submits a timelock invocation through checked G-key signing admission.
 ///
-/// The OZ `TimelockController` is not a smart-account; its entrypoints call
-/// `proposer.require_auth()` / `canceller.require_auth()` / `executor.require_auth()`
-/// with the caller's G-key passed as a function argument. This requires a
-/// `SorobanCredentials::Address` auth entry signed by the G-key — NOT a
-/// smart-account auth-entry or a `__check_auth` delegation entry.
+/// The timelock contract requires the caller's account authority. Address
+/// credentials use the canonical Soroban authorization preimage over the
+/// wallet's invocation. SourceAccount credentials need only the envelope.
 ///
 /// # Steps
 ///
-/// 1. Fetch signer G-key and source account sequence, after the local check
-///    of the witness configuration.
-/// 2. Build `InvokeHostFunction` tx (empty auth) for simulation.
-/// 3. Simulate on primary RPC; extract the auth entry template. Acquire the
-///    mandatory ledger witness before any credential is processed: the
-///    primary and the secondary observe the latest ledger under one deadline,
-///    and the signature expiry is 100 ledgers beyond the lower observation.
-/// 4. Validate every entry before any signature. SourceAccount and signer
-///    Address credentials must name the wallet's exact invocation with no
-///    sub-invocations. Other credential variants are refused. Then compute
-///    each Address preimage over the wallet's invocation and sign under the
-///    deadline. The first signature rests on a fresh pair: a stale pair is
-///    read again before it.
-/// 5. Re-simulate with signed auth entries to get the full storage footprint.
-/// 6. Build final envelope: inject signed auth entries + soroban_data, after
-///    a source-account re-fetch under the same deadline.
-/// 7. Attach source-account signature under that deadline, through the key
-///    read in step 1. When no entry was signed, this is the first signature,
-///    and the pair is readied for it as in step 4.
-/// 8. Submit via `submit_transaction_and_wait_sent_by`: nothing is sent
-///    after the deadline, and the confirmation poll runs under `timeout`.
+/// 1. Check the network and witness configuration, then fetch the signer key
+///    and source account sequence.
+/// 2. Simulate the invocation and obtain independent ledger observations.
+///    Validate every credential against the exact invocation without subcalls.
+/// 3. For signed entries, ready the witness pair and freeze subjects, nonces,
+///    expiration, and source sequence. Admit the plan, immediately build its
+///    gate, and recheck freshness before authorizing each entry signature.
+/// 4. Simulate signed authorization to obtain its resource footprint. Fetch
+///    the source account again and refuse a changed frozen sequence.
+/// 5. Build the final envelope. For empty or SourceAccount-only authorization,
+///    ready the witness pair, build and admit the plan, and construct its gate.
+///    Check freshness without another ledger read after admission.
+/// 6. Check and authorize the envelope through its gate, then attach its
+///    signature. Bind recorded exposure, link the reservation, and send before
+///    the deadline. Poll confirmation under the submission timeout.
+///
+/// Any failure before the first successful gate authorization cancels the
+/// unexposed admission. Later failures retain its charge, including a failed
+/// signer call. A no-value admission keeps its count charge without binding.
 ///
 /// # Errors
 ///
-/// - [`SaError::MainnetWriteForbidden`]: `network_passphrase` names mainnet
-///   or `primary_rpc_url` is a mainnet-pattern endpoint; refused before the
-///   signer's public key is read and before any request.
-/// - [`SaError::LedgerWitnessUnavailable`]: the secondary endpoint is
-///   malformed, on the primary's host, on another network or unreachable, the
-///   primary gives no observation, the pair stays stale, or the deadline
-///   elapses before the first signature. Nothing was signed.
-/// - [`SaError::LedgerWitnessMismatch`] (wire code
-///   `simulation.divergence.ledger_skew`): the pair differs by more than the
-///   skew tolerance, a height is out of bounds, or the simulation height
-///   contradicts the pair. Nothing was signed.
-/// - [`SaError::AuthEntryConstructionFailed`]: unsupported credential variant,
-///   pubkey fetch, XDR encoding, simulate, or signing failure, or the deadline
-///   elapsing before a signature completes or before `sendTransaction`;
-///   nothing is sent. Timelock signing supports SourceAccount and signer
-///   Address credentials only. Use a simulation result containing supported
-///   credentials.
-/// - [`SaError::SimulationDivergence`] with sub-code `AuthContexts` (wire code
-///   `simulation.divergence.auth_contexts`): a SourceAccount or signer Address
-///   entry whose root invocation differs from the host function or carries
-///   sub-invocations; refused before any signature. The public
-///   [`crate::timelock::schedule_upgrade`], [`crate::timelock::execute`], and
-///   [`crate::timelock::cancel`] map it, like every other error here except
-///   [`SaError::MainnetWriteForbidden`], the two ledger witness refusals (and,
-///   for `execute`, [`SaError::SubmissionUnresolved`]), to their typed variant
-///   below, with the refusal text in the reason.
-/// - [`SaError::DeploymentFailed`] — re-simulate error or envelope construction.
-/// - [`SaError::TimelockScheduleFailed`] / `CancelFailed` / `ExecuteFailed`
-///   — NOT emitted here; the caller maps `SaError` to the typed variant.
+/// - [`SaError::MainnetWriteForbidden`] refuses mainnet before key access or RPC.
+/// - [`SaError::LedgerWitnessUnavailable`] refuses missing or stale observations
+///   and an elapsed deadline before signing.
+/// - [`SaError::LedgerWitnessMismatch`] refuses inconsistent ledger observations.
+/// - [`SaError::PolicyDenied`] preserves the admission criterion's denial.
+/// - [`SaError::IntentRecordUnavailable`] refuses unavailable checked admission.
+/// - [`SaError::IntentBindingMismatch`] refuses a changed plan or envelope.
+/// - [`SaError::AuthEntryConstructionFailed`] reports unsupported credentials,
+///   key access, encoding, signing, and deadline failures.
+/// - [`SaError::SimulationDivergence`] refuses an invocation outside the wallet's
+///   exact call. [`SaError::DeploymentFailed`] reports simulation and envelope
+///   construction failures.
 ///
-/// Auth preimage shape: canonical `HashIdPreimageSorobanAuthorization` (same as
-/// `managers/auth_entry.rs::compute_signature_payload`).
-/// Signature shape: `ScVal::Vec([ScVal::Map([{public_key, signature}])])` per
-/// js-stellar-base auth.js:171-184.
+/// Schedule, cancel, and execute preserve mainnet, policy, intent, and witness
+/// refusals. Execute also preserves unresolved submissions. The wrappers map
+/// other errors to their operation-specific variants.
 #[allow(
     clippy::too_many_lines,
     reason = "seven-stage direct G-key auth flow; collapsing would obscure the sequential \
@@ -503,283 +480,392 @@ pub(crate) async fn submit_timelock_invoke_with_g_key_auth(
     };
     let signature_expiration_ledger = ledger_bound.signature_expiration_ledger()?;
 
-    let mut signed_entries: Vec<SorobanAuthorizationEntry> =
-        Vec::with_capacity(checked_entries.len());
-    for checked in checked_entries {
-        let creds = match checked {
+    let subjects: Vec<_> = checked_entries
+        .iter()
+        .map(|checked| match checked {
+            ValidatedTimelockAuth::SignerKey(creds) => IntentSubject::account_key(
+                &signer_address,
+                creds.nonce,
+                signature_expiration_ledger,
+                &wallet_root,
+            ),
             ValidatedTimelockAuth::SourceAccount => {
-                signed_entries.push(SorobanAuthorizationEntry {
-                    credentials: SorobanCredentials::SourceAccount,
-                    root_invocation: wallet_root.clone(),
-                });
-                continue;
+                IntentSubject::source_account(&source_pubkey_strkey, &wallet_root)
             }
-            ValidatedTimelockAuth::SignerKey(creds) => creds,
+        })
+        .collect::<Result<_, _>>()
+        .map_err(|field| SaError::IntentBindingMismatch { field })?;
+    let host_hash: [u8; 32] = Sha256::digest(
+        args.host_function
+            .to_xdr(Limits::none())
+            .map_err(|_| SaError::IntentBindingMismatch { field: "plan" })?,
+    )
+    .into();
+    let auth_address = crate::managers::rules::scaddress_to_strkey(&invoke.contract_address)?;
+    let make_plan = |sequence: i64| {
+        SignedIntentPlan::new(
+            args.network_passphrase,
+            &auth_address,
+            &source_pubkey_strkey,
+            sequence,
+            host_hash,
+            subjects.clone(),
+            signs_entries.then_some(signature_expiration_ledger),
+        )
+        .map_err(|error| crate::submit::map_admission_error(&error, args.op_label))
+    };
+    let frozen_sequence = source_view
+        .sequence_number
+        .checked_add(1)
+        .ok_or(SaError::IntentBindingMismatch { field: "plan" })?;
+    let mut gate = None;
+    if signs_entries {
+        let plan = make_plan(frozen_sequence)?;
+        let proof = args
+            .admission
+            .admit(&plan)
+            .await
+            .map_err(|error| crate::submit::map_admission_error(&error, args.op_label))?;
+        gate = Some(SigningGate::new(proof));
+    }
+    let signing_result = async {
+        if signs_entries {
+            ledger_bound.ensure_fresh(pre_submit_budget)?;
+        }
+        let mut signed_entries: Vec<SorobanAuthorizationEntry> =
+            Vec::with_capacity(checked_entries.len());
+        for checked in checked_entries {
+            let creds = match checked {
+                ValidatedTimelockAuth::SourceAccount => {
+                    signed_entries.push(SorobanAuthorizationEntry {
+                        credentials: SorobanCredentials::SourceAccount,
+                        root_invocation: wallet_root.clone(),
+                    });
+                    continue;
+                }
+                ValidatedTimelockAuth::SignerKey(creds) => creds,
+            };
+
+            // Compute the auth preimage over the wallet's own invocation.
+            // `signature_expiration_ledger` is the witnessed bound (overrides the
+            // `0` placeholder the RPC returns).
+            let preimage =
+                HashIdPreimage::SorobanAuthorization(HashIdPreimageSorobanAuthorization {
+                    network_id: Hash(network_id),
+                    nonce: creds.nonce,
+                    signature_expiration_ledger,
+                    invocation: wallet_root.clone(),
+                });
+            let signature_payload = SorobanAuthPayload::from_preimage(&preimage).map_err(|e| {
+                auth_err(
+                    "auth_payload",
+                    format!("{}: auth preimage payload refused: {e}", args.op_label),
+                )
+            })?;
+
+            // Sign with the Soroban-address-auth primitive, under the deadline.
+            // A software key signs without yielding, so the deadline is checked
+            // before the bounded signature as well.
+            pre_submit_budget.check_at("sign_auth_entry", "auth_payload")?;
+            gate.as_ref()
+                .ok_or(SaError::IntentBindingMismatch {
+                    field: "intent_state",
+                })?
+                .authorize(SigningRequest {
+                    subject: AuthSubject::account_key(&signer_address)
+                        .map_err(|field| SaError::IntentBindingMismatch { field })?,
+                    signer: SignerMatch::Exact(SignerDescriptor::AccountKey {
+                        public_key: pubkey.0,
+                    }),
+                    payload: SigningPayload::AddressPayload(*signature_payload.as_bytes()),
+                })?;
+            let signature_bytes = bound_pre_submit_stage(
+                pre_submit_budget,
+                "sign_auth_entry",
+                "auth_payload",
+                args.signer
+                    .sign_soroban_address_auth_payload(&signature_payload),
+            )
+            .await?
+            .map_err(|e| {
+                auth_err(
+                    "auth_payload",
+                    format!("{}: G-key auth signing failed: {e}", args.op_label),
+                )
+            })?;
+
+            // Build the single-Ed25519 standard Stellar signature ScVal:
+            // `ScVal::Vec([ScVal::Map([{public_key: Bytes<32>, signature: Bytes<64>}])])`
+            let signature_scval = crate::managers::auth_entry::build_classic_signature_scval(
+                &pubkey.0,
+                &signature_bytes,
+            )
+            .map_err(|e| auth_err("auth_payload", format!("{}: {e}", args.op_label)))?;
+
+            signed_entries.push(SorobanAuthorizationEntry {
+                credentials: SorobanCredentials::Address(SorobanAddressCredentials {
+                    address: creds.address,
+                    nonce: creds.nonce,
+                    signature_expiration_ledger,
+                    signature: signature_scval,
+                }),
+                root_invocation: wallet_root.clone(),
+            });
+        }
+
+        // ── Step 5: Re-simulate with signed auth entries ──────────────────────────
+        //
+        // The first simulate ran with empty auth; its footprint omits the G-key
+        // `require_auth` validation storage reads (the host skips that path when
+        // auth is empty). Re-simulating with the signed auth entries causes the
+        // host to execute the full `require_auth` validation path, producing a
+        // footprint that includes all storage keys accessed. Without this,
+        // submission would trap with "access contract data key outside footprint".
+        //
+        // This mirrors the `resimulate_with_signed_auth` pattern in `managers/auth_entry.rs`.
+        let auth_vecm: VecM<SorobanAuthorizationEntry> =
+            signed_entries.clone().try_into().map_err(|e| {
+                auth_err(
+                    "auth_payload",
+                    format!("{}: encode signed auth VecM: {e:?}", args.op_label),
+                )
+            })?;
+
+        let op_resim = Operation {
+            source_account: None,
+            body: OperationBody::InvokeHostFunction(InvokeHostFunctionOp {
+                host_function: HostFunction::InvokeContract(invoke.clone()),
+                auth: auth_vecm,
+            }),
         };
 
-        // Compute the auth preimage over the wallet's own invocation.
-        // `signature_expiration_ledger` is the witnessed bound (overrides the
-        // `0` placeholder the RPC returns).
-        let preimage = HashIdPreimage::SorobanAuthorization(HashIdPreimageSorobanAuthorization {
-            network_id: Hash(network_id),
-            nonce: creds.nonce,
-            signature_expiration_ledger,
-            invocation: wallet_root.clone(),
-        });
-        let signature_payload = SorobanAuthPayload::from_preimage(&preimage).map_err(|e| {
-            auth_err(
-                "auth_payload",
-                format!("{}: auth preimage payload refused: {e}", args.op_label),
-            )
-        })?;
-
-        // Sign with the Soroban-address-auth primitive, under the deadline.
-        // A software key signs without yielding, so the deadline is checked
-        // before the bounded signature as well.
-        pre_submit_budget.check_at("sign_auth_entry", "auth_payload")?;
-        let signature_bytes = bound_pre_submit_stage(
+        // Re-fetch source account for accurate sequence number.
+        let source_view2 = bound_pre_submit_stage(
             pre_submit_budget,
-            "sign_auth_entry",
+            "fetch_account_resim",
             "auth_payload",
-            args.signer
-                .sign_soroban_address_auth_payload(&signature_payload),
+            fetch_account(&primary_rpc_client, &source_pubkey_strkey, &[]),
         )
         .await?
         .map_err(|e| {
             auth_err(
                 "auth_payload",
-                format!("{}: G-key auth signing failed: {e}", args.op_label),
+                format!(
+                    "{}: source-account re-fetch for resimulate failed: {e}",
+                    args.op_label
+                ),
+            )
+        })?;
+        let mut source_account2 = BaselibAccount::new(
+            &source_pubkey_strkey,
+            &source_view2.sequence_number.to_string(),
+        )
+        .map_err(|e| {
+            auth_err(
+                "auth_payload",
+                format!(
+                    "{}: BaselibAccount::new (resimulate) failed: {e:?}",
+                    args.op_label
+                ),
             )
         })?;
 
-        // Build the single-Ed25519 standard Stellar signature ScVal:
-        // `ScVal::Vec([ScVal::Map([{public_key: Bytes<32>, signature: Bytes<64>}])])`
-        let signature_scval =
-            crate::managers::auth_entry::build_classic_signature_scval(&pubkey.0, &signature_bytes)
-                .map_err(|e| auth_err("auth_payload", format!("{}: {e}", args.op_label)))?;
+        let mut tx_builder2 =
+            TransactionBuilder::new(&mut source_account2, args.network_passphrase, None);
+        tx_builder2.fee(BASE_FEE_STROOPS);
+        tx_builder2.add_operation(op_resim);
+        let tx_resim = tx_builder2.build_for_simulation();
 
-        signed_entries.push(SorobanAuthorizationEntry {
-            credentials: SorobanCredentials::Address(SorobanAddressCredentials {
-                address: creds.address,
-                nonce: creds.nonce,
-                signature_expiration_ledger,
-                signature: signature_scval,
+        let resim_envelope = tx_resim.to_envelope().map_err(|e| {
+            auth_err(
+                "auth_payload",
+                format!("{}: to_envelope (resim) failed: {e:?}", args.op_label),
+            )
+        })?;
+        let resim_response = bound_pre_submit_stage(
+            pre_submit_budget,
+            "simulate_resim",
+            "auth_payload",
+            server.simulate_transaction_envelope(&resim_envelope, None),
+        )
+        .await?
+        .map_err(|e| {
+            auth_err(
+                "auth_payload",
+                format!(
+                    "{}: re-simulate simulate_transaction_envelope failed: {e}",
+                    args.op_label
+                ),
+            )
+        })?;
+
+        if let Some(err) = &resim_response.error {
+            return Err(SaError::DeploymentFailed {
+                phase: "simulate",
+                redacted_reason: format!(
+                    "{} re-simulate returned error: {}",
+                    args.op_label,
+                    SimulationErrorClass::of(err)
+                ),
+            });
+        }
+        if resim_response.min_resource_fee == 0 || resim_response.transaction_data.is_empty() {
+            return Err(SaError::DeploymentFailed {
+                phase: "simulate",
+                redacted_reason: format!(
+                    "{}: re-simulate returned no min_resource_fee / transaction_data",
+                    args.op_label
+                ),
+            });
+        }
+
+        // ── Step 6: Build final transaction envelope ──────────────────────────────
+        //
+        // Build the envelope with signed auth entries + soroban_data from the
+        // re-simulate response.  Re-fetch the sequence number once more: the
+        // `BaselibAccount` sequence advances with each `build_for_simulation()`
+        // call so we must use the live on-chain state (not an incremented in-memory
+        // counter) to get the correct sequence number for the final submission.
+        let source_view3 = bound_pre_submit_stage(
+            pre_submit_budget,
+            "fetch_account_submit",
+            "auth_payload",
+            fetch_account(&primary_rpc_client, &source_pubkey_strkey, &[]),
+        )
+        .await?
+        .map_err(|e| {
+            auth_err(
+                "auth_payload",
+                format!(
+                    "{}: source-account re-fetch for submission tx failed: {e}",
+                    args.op_label
+                ),
+            )
+        })?;
+        if signs_entries && source_view3.sequence_number.checked_add(1) != Some(frozen_sequence) {
+            return Err(SaError::IntentBindingMismatch {
+                field: "envelope_sequence",
+            });
+        }
+        let mut source_account3 = BaselibAccount::new(
+            &source_pubkey_strkey,
+            &source_view3.sequence_number.to_string(),
+        )
+        .map_err(|e| {
+            auth_err(
+                "auth_payload",
+                format!(
+                    "{}: BaselibAccount::new (submit) failed: {e:?}",
+                    args.op_label
+                ),
+            )
+        })?;
+
+        let resource_fee = parse_min_resource_fee(&resim_response)?;
+        let auth_vecm_final: VecM<SorobanAuthorizationEntry> =
+            signed_entries.try_into().map_err(|e| {
+                auth_err(
+                    "auth_payload",
+                    format!("{}: encode final auth VecM: {e:?}", args.op_label),
+                )
+            })?;
+
+        let op_final = Operation {
+            source_account: None,
+            body: OperationBody::InvokeHostFunction(InvokeHostFunctionOp {
+                host_function: HostFunction::InvokeContract(invoke),
+                auth: auth_vecm_final,
             }),
-            root_invocation: wallet_root.clone(),
-        });
-    }
+        };
 
-    // ── Step 5: Re-simulate with signed auth entries ──────────────────────────
-    //
-    // The first simulate ran with empty auth; its footprint omits the G-key
-    // `require_auth` validation storage reads (the host skips that path when
-    // auth is empty). Re-simulating with the signed auth entries causes the
-    // host to execute the full `require_auth` validation path, producing a
-    // footprint that includes all storage keys accessed. Without this,
-    // submission would trap with "access contract data key outside footprint".
-    //
-    // This mirrors the `resimulate_with_signed_auth` pattern in `managers/auth_entry.rs`.
-    let auth_vecm: VecM<SorobanAuthorizationEntry> =
-        signed_entries.clone().try_into().map_err(|e| {
+        let mut tx_builder3 =
+            TransactionBuilder::new(&mut source_account3, args.network_passphrase, None);
+        tx_builder3.fee(BASE_FEE_STROOPS.saturating_add(resource_fee));
+        tx_builder3.add_operation(op_final);
+        let mut tx_final = tx_builder3.build_for_simulation();
+
+        // Inject the soroban_data (resource footprint + refundable fee) from the
+        // re-simulate response.  Transaction::soroban_data is serialised into
+        // TransactionExt::V1(data) by `to_envelope()`.
+        if let Ok(data) = resim_response.transaction_data() {
+            tx_final.soroban_data = Some(data);
+        }
+
+        let envelope = tx_final.to_envelope().map_err(|e| {
             auth_err(
                 "auth_payload",
-                format!("{}: encode signed auth VecM: {e:?}", args.op_label),
+                format!("{}: Transaction::to_envelope failed: {e:?}", args.op_label),
+            )
+        })?;
+        let envelope_xdr = envelope.to_xdr_base64(Limits::none()).map_err(|e| {
+            auth_err(
+                "auth_payload",
+                format!("{}: envelope to_xdr_base64 failed: {e:?}", args.op_label),
             )
         })?;
 
-    let op_resim = Operation {
-        source_account: None,
-        body: OperationBody::InvokeHostFunction(InvokeHostFunctionOp {
-            host_function: HostFunction::InvokeContract(invoke.clone()),
-            auth: auth_vecm,
-        }),
-    };
-
-    // Re-fetch source account for accurate sequence number.
-    let source_view2 = bound_pre_submit_stage(
-        pre_submit_budget,
-        "fetch_account_resim",
-        "auth_payload",
-        fetch_account(&primary_rpc_client, &source_pubkey_strkey, &[]),
-    )
-    .await?
-    .map_err(|e| {
-        auth_err(
+        // ── Step 7: Attach source-account signature ───────────────────────────────
+        // Without a signed entry the envelope's is the first signature, and the
+        // two re-fetches and the re-simulation since the witness can outlast an
+        // observation: the pair is readied here.
+        if !signs_entries {
+            let ready =
+                pair_for_first_signature(ledger_bound, &witness_request, pre_submit_budget).await?;
+            let sequence = source_view3
+                .sequence_number
+                .checked_add(1)
+                .ok_or(SaError::IntentBindingMismatch { field: "plan" })?;
+            let plan = make_plan(sequence)?;
+            let proof = args
+                .admission
+                .admit(&plan)
+                .await
+                .map_err(|error| crate::submit::map_admission_error(&error, args.op_label))?;
+            gate = Some(SigningGate::new(proof));
+            ready.ensure_fresh_at(pre_submit_budget, final_check_instant())?;
+        }
+        // The envelope is signed only while the deadline the witness rests on is
+        // open, through the key read in step 1. A software key signs without
+        // yielding, so the deadline is checked before the bounded signature as
+        // well.
+        pre_submit_budget.check_at("sign_envelope", "auth_payload")?;
+        let envelope_signer = ResolvedKeySigner::with_key(args.signer, pubkey);
+        gate.as_ref()
+            .ok_or(SaError::IntentBindingMismatch {
+                field: "intent_state",
+            })?
+            .authorize(SigningRequest {
+                subject: AuthSubject::source(&source_pubkey_strkey)
+                    .map_err(|field| SaError::IntentBindingMismatch { field })?,
+                signer: SignerMatch::Exact(SignerDescriptor::AccountKey {
+                    public_key: pubkey.0,
+                }),
+                payload: SigningPayload::Envelope(&envelope),
+            })?;
+        let final_signed_xdr = bound_pre_submit_stage(
+            pre_submit_budget,
+            "sign_envelope",
             "auth_payload",
-            format!(
-                "{}: source-account re-fetch for resimulate failed: {e}",
-                args.op_label
-            ),
+            attach_signature(&envelope_xdr, &envelope_signer, args.network_passphrase),
         )
-    })?;
-    let mut source_account2 = BaselibAccount::new(
-        &source_pubkey_strkey,
-        &source_view2.sequence_number.to_string(),
-    )
-    .map_err(|e| {
-        auth_err(
-            "auth_payload",
-            format!(
-                "{}: BaselibAccount::new (resimulate) failed: {e:?}",
-                args.op_label
-            ),
-        )
-    })?;
-
-    let mut tx_builder2 =
-        TransactionBuilder::new(&mut source_account2, args.network_passphrase, None);
-    tx_builder2.fee(BASE_FEE_STROOPS);
-    tx_builder2.add_operation(op_resim);
-    let tx_resim = tx_builder2.build_for_simulation();
-
-    let resim_envelope = tx_resim.to_envelope().map_err(|e| {
-        auth_err(
-            "auth_payload",
-            format!("{}: to_envelope (resim) failed: {e:?}", args.op_label),
-        )
-    })?;
-    let resim_response = bound_pre_submit_stage(
-        pre_submit_budget,
-        "simulate_resim",
-        "auth_payload",
-        server.simulate_transaction_envelope(&resim_envelope, None),
-    )
-    .await?
-    .map_err(|e| {
-        auth_err(
-            "auth_payload",
-            format!(
-                "{}: re-simulate simulate_transaction_envelope failed: {e}",
-                args.op_label
-            ),
-        )
-    })?;
-
-    if let Some(err) = &resim_response.error {
-        return Err(SaError::DeploymentFailed {
-            phase: "simulate",
-            redacted_reason: format!(
-                "{} re-simulate returned error: {}",
-                args.op_label,
-                SimulationErrorClass::of(err)
-            ),
-        });
-    }
-    if resim_response.min_resource_fee == 0 || resim_response.transaction_data.is_empty() {
-        return Err(SaError::DeploymentFailed {
-            phase: "simulate",
-            redacted_reason: format!(
-                "{}: re-simulate returned no min_resource_fee / transaction_data",
-                args.op_label
-            ),
-        });
-    }
-
-    // ── Step 6: Build final transaction envelope ──────────────────────────────
-    //
-    // Build the envelope with signed auth entries + soroban_data from the
-    // re-simulate response.  Re-fetch the sequence number once more: the
-    // `BaselibAccount` sequence advances with each `build_for_simulation()`
-    // call so we must use the live on-chain state (not an incremented in-memory
-    // counter) to get the correct sequence number for the final submission.
-    let source_view3 = bound_pre_submit_stage(
-        pre_submit_budget,
-        "fetch_account_submit",
-        "auth_payload",
-        fetch_account(&primary_rpc_client, &source_pubkey_strkey, &[]),
-    )
-    .await?
-    .map_err(|e| {
-        auth_err(
-            "auth_payload",
-            format!(
-                "{}: source-account re-fetch for submission tx failed: {e}",
-                args.op_label
-            ),
-        )
-    })?;
-    let mut source_account3 = BaselibAccount::new(
-        &source_pubkey_strkey,
-        &source_view3.sequence_number.to_string(),
-    )
-    .map_err(|e| {
-        auth_err(
-            "auth_payload",
-            format!(
-                "{}: BaselibAccount::new (submit) failed: {e:?}",
-                args.op_label
-            ),
-        )
-    })?;
-
-    let resource_fee = parse_min_resource_fee(&resim_response)?;
-    let auth_vecm_final: VecM<SorobanAuthorizationEntry> =
-        signed_entries.try_into().map_err(|e| {
-            auth_err(
-                "auth_payload",
-                format!("{}: encode final auth VecM: {e:?}", args.op_label),
-            )
+        .await?
+        .map_err(|e| SaError::DeploymentFailed {
+            phase: "submit",
+            redacted_reason: format!("{} envelope signing failed: {e}", args.op_label),
         })?;
 
-    let op_final = Operation {
-        source_account: None,
-        body: OperationBody::InvokeHostFunction(InvokeHostFunctionOp {
-            host_function: HostFunction::InvokeContract(invoke),
-            auth: auth_vecm_final,
-        }),
+        Ok::<_, SaError>(final_signed_xdr)
+    }
+    .await;
+    let final_signed_xdr = match signing_result {
+        Ok(signed) => signed,
+        Err(error) => {
+            if let Some(gate) = &gate {
+                crate::submit::cancel_unexposed_admission(&args.admission, gate).await;
+            }
+            return Err(error);
+        }
     };
-
-    let mut tx_builder3 =
-        TransactionBuilder::new(&mut source_account3, args.network_passphrase, None);
-    tx_builder3.fee(BASE_FEE_STROOPS.saturating_add(resource_fee));
-    tx_builder3.add_operation(op_final);
-    let mut tx_final = tx_builder3.build_for_simulation();
-
-    // Inject the soroban_data (resource footprint + refundable fee) from the
-    // re-simulate response.  Transaction::soroban_data is serialised into
-    // TransactionExt::V1(data) by `to_envelope()`.
-    if let Ok(data) = resim_response.transaction_data() {
-        tx_final.soroban_data = Some(data);
-    }
-
-    let envelope = tx_final.to_envelope().map_err(|e| {
-        auth_err(
-            "auth_payload",
-            format!("{}: Transaction::to_envelope failed: {e:?}", args.op_label),
-        )
-    })?;
-    let envelope_xdr = envelope.to_xdr_base64(Limits::none()).map_err(|e| {
-        auth_err(
-            "auth_payload",
-            format!("{}: envelope to_xdr_base64 failed: {e:?}", args.op_label),
-        )
-    })?;
-
-    // ── Step 7: Attach source-account signature ───────────────────────────────
-    // Without a signed entry the envelope's is the first signature, and the
-    // two re-fetches and the re-simulation since the witness can outlast an
-    // observation: the pair is readied here.
-    if !signs_entries {
-        pair_for_first_signature(ledger_bound, &witness_request, pre_submit_budget).await?;
-    }
-    // The envelope is signed only while the deadline the witness rests on is
-    // open, through the key read in step 1. A software key signs without
-    // yielding, so the deadline is checked before the bounded signature as
-    // well.
-    pre_submit_budget.check_at("sign_envelope", "auth_payload")?;
-    let envelope_signer = ResolvedKeySigner::with_key(args.signer, pubkey);
-    let final_signed_xdr = bound_pre_submit_stage(
-        pre_submit_budget,
-        "sign_envelope",
-        "auth_payload",
-        attach_signature(&envelope_xdr, &envelope_signer, args.network_passphrase),
-    )
-    .await?
-    .map_err(|e| SaError::DeploymentFailed {
-        phase: "submit",
-        redacted_reason: format!("{} envelope signing failed: {e}", args.op_label),
-    })?;
-
     // ── Step 8: Submit ────────────────────────────────────────────────────────
     // Nothing is sent after the deadline: the steps before `sendTransaction`
     // end at it, and no send attempt, a resend of the same bytes included,
@@ -792,7 +878,10 @@ pub(crate) async fn submit_timelock_invoke_with_g_key_auth(
         args.timeout,
         args.network_passphrase,
         None,
-        args.submission_recorder,
+        args.admission.recorder(),
+        args.admission
+            .recorder()
+            .and_then(|_| gate.as_ref().and_then(SigningGate::exposure)),
     )
     .await
     .map_err(|e| {
@@ -935,7 +1024,9 @@ mod tests {
             network_passphrase,
             timeout: std::time::Duration::from_secs(1),
             op_label: "schedule",
-            submission_recorder: None,
+            admission: stellar_agent_network::SigningAdmission::NoValue(
+                crate::signing::intent_test_helpers::no_value_admission(),
+            ),
         })
         .await;
         let requests = server.received_requests().await.unwrap().len();
@@ -1095,6 +1186,8 @@ mod tests {
             /// The first simulation hands out source-account credentials,
             /// which need no signature of their own.
             source_account_auth: bool,
+            final_sequence_bump: bool,
+            overflowing_final_fee: bool,
             /// The height `getLatestLedger` reports once this many reads
             /// were answered.
             ledger_after_reads: Option<(usize, u32)>,
@@ -1111,6 +1204,8 @@ mod tests {
                     resimulation_delay: None,
                     pre_send_delay: None,
                     source_account_auth: false,
+                    final_sequence_bump: false,
+                    overflowing_final_fee: false,
                     ledger_after_reads: None,
                 }
             }
@@ -1148,7 +1243,22 @@ mod tests {
                         if self.simulations.load(Ordering::SeqCst) >= 2 {
                             delay = self.chain.final_fetch_delay;
                         }
-                        ledger_entries_result_for(&[account_id_for_seed(SEED).as_str()])
+                        let mut result =
+                            ledger_entries_result_for(&[account_id_for_seed(SEED).as_str()]);
+                        if self.chain.final_sequence_bump
+                            && self.simulations.load(Ordering::SeqCst) >= 2
+                        {
+                            let xdr = result["entries"][0]["xdr"].as_str().unwrap();
+                            let mut entry =
+                                stellar_xdr::LedgerEntryData::from_xdr_base64(xdr, Limits::none())
+                                    .unwrap();
+                            if let stellar_xdr::LedgerEntryData::Account(account) = &mut entry {
+                                account.seq_num.0 += 1;
+                            }
+                            result["entries"][0]["xdr"] =
+                                json!(entry.to_xdr_base64(Limits::none()).unwrap());
+                        }
+                        result
                     }
                     "simulateTransaction" => {
                         self.simulations.fetch_add(1, Ordering::SeqCst);
@@ -1203,7 +1313,7 @@ mod tests {
                         };
                         json!({
                             "latestLedger": self.chain.simulated_ledger.unwrap_or(ledger),
-                            "minResourceFee": "1000",
+                            "minResourceFee": if self.chain.overflowing_final_fee && self.simulations.load(Ordering::SeqCst) >= 2 { "4294967296" } else { "1000" },
                             "transactionData": SorobanTransactionData::default()
                                 .to_xdr_base64(Limits::none())
                                 .unwrap(),
@@ -1439,7 +1549,9 @@ mod tests {
                 network_passphrase: stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE,
                 timeout: std::time::Duration::from_secs(5),
                 op_label: "schedule",
-                submission_recorder: None,
+                admission: stellar_agent_network::SigningAdmission::NoValue(
+                    crate::signing::intent_test_helpers::no_value_admission(),
+                ),
             })
             .await;
             let resimulated = resimulated.lock().unwrap().clone();
@@ -1788,13 +1900,20 @@ mod tests {
 
             impl Endpoint {
                 async fn start(chain: Chain) -> Self {
+                    Self::start_entries(chain, None).await
+                }
+
+                async fn start_entries(
+                    chain: Chain,
+                    entries: Option<Vec<stellar_xdr::SorobanAuthorizationEntry>>,
+                ) -> Self {
                     let server = MockServer::start().await;
                     let ledger_reads = Arc::new(AtomicUsize::new(0));
                     let resimulated = Arc::new(Mutex::new(Vec::new()));
                     Mock::given(method("POST"))
                         .respond_with(Rpc {
                             trees: Arc::new(|invoke| vec![leaf(invoke.clone())]),
-                            entries: None,
+                            entries,
                             simulations: Arc::default(),
                             ledger_reads: Arc::clone(&ledger_reads),
                             resimulated: Arc::clone(&resimulated),
@@ -1886,7 +2005,9 @@ mod tests {
                     network_passphrase: TESTNET_PASSPHRASE,
                     timeout,
                     op_label: "schedule",
-                    submission_recorder: None,
+                    admission: stellar_agent_network::SigningAdmission::NoValue(
+                        crate::signing::intent_test_helpers::no_value_admission(),
+                    ),
                 })
                 .await;
                 Outcome {
@@ -1991,6 +2112,266 @@ mod tests {
                 submit(&primary, &secondary.witness_uri()).await
             }
 
+            struct AdmissionRecorder<'a> {
+                inner: stellar_agent_network::submission_record::WalletSubmissionRecorder<'a>,
+                stale: bool,
+                signer: &'a super::AuthAndSourceSigner,
+                endpoint: &'a Endpoint,
+                admissions: AtomicUsize,
+                cancellations: AtomicUsize,
+                binds: AtomicUsize,
+                ledger_reads_at_admission: AtomicUsize,
+                subjects: Mutex<Vec<stellar_agent_network::SubjectKind>>,
+            }
+
+            #[async_trait]
+            impl stellar_agent_network::SubmissionRecorder for AdmissionRecorder<'_> {
+                async fn admit_signed_intent(
+                    &self,
+                    plan: &stellar_agent_network::SignedIntentPlan,
+                ) -> Result<stellar_agent_network::IntentProof, WalletError> {
+                    assert_eq!(self.signer.auth.sign_calls(), 0);
+                    assert_eq!(self.signer.source.sign_calls(), 0);
+                    self.admissions.fetch_add(1, Ordering::SeqCst);
+                    *self.subjects.lock().unwrap() = plan
+                        .subjects()
+                        .iter()
+                        .map(|s| s.auth_subject().kind())
+                        .collect();
+                    let proof = self.inner.admit_signed_intent(plan).await?;
+                    self.ledger_reads_at_admission
+                        .store(self.endpoint.ledger_reads(), Ordering::SeqCst);
+                    if self.stale {
+                        tokio::time::pause();
+                        tokio::time::advance(
+                            crate::signing::ledger_witness::MAX_OBSERVATION_AGE
+                                + Duration::from_secs(1),
+                        )
+                        .await;
+                        tokio::time::resume();
+                    }
+                    Ok(proof)
+                }
+                async fn cancel_unexposed(
+                    &self,
+                    proof: stellar_agent_network::IntentProof,
+                ) -> Result<(), WalletError> {
+                    self.cancellations.fetch_add(1, Ordering::SeqCst);
+                    self.inner.cancel_unexposed(proof).await
+                }
+                async fn pre_send_bound(
+                    &self,
+                    intent: &stellar_agent_network::SubmissionIntent,
+                    binding: &stellar_agent_network::IntentBinding<'_>,
+                ) -> Result<(), WalletError> {
+                    self.binds.fetch_add(1, Ordering::SeqCst);
+                    self.inner.pre_send_bound(intent, binding).await
+                }
+                async fn pre_send(
+                    &self,
+                    intent: &stellar_agent_network::SubmissionIntent,
+                ) -> Result<(), WalletError> {
+                    self.inner.pre_send(intent).await
+                }
+                async fn outcome(
+                    &self,
+                    intent: &stellar_agent_network::SubmissionIntent,
+                    outcome: &stellar_agent_network::SubmissionOutcome,
+                ) {
+                    self.inner.outcome(intent, outcome).await;
+                }
+            }
+
+            #[tokio::test]
+            #[serial_test::serial]
+            async fn timelock_admission_follows_its_first_signature() {
+                use stellar_agent_core::policy::v1::criteria::state_store::{
+                    PolicyStateStore, StateKey, WindowEntry, WindowLimit,
+                };
+                use stellar_agent_core::policy::v1::{CheckedSizing, SizingBasis};
+                use stellar_agent_network::policy_state::PersistedWindowStore;
+                use stellar_agent_network::{SigningAdmission, SubjectKind};
+                use stellar_xdr::{
+                    SorobanAddressCredentials, SorobanAuthorizationEntry, SorobanCredentials,
+                };
+                for case in [
+                    "empty",
+                    "mixed",
+                    "sequence",
+                    "sequence_fee",
+                    "stale_source",
+                    "stale_signed",
+                ] {
+                    stellar_agent_test_support::keyring_mock::install().unwrap();
+                    let dir = tempfile::tempdir().unwrap();
+                    let profile =
+                        stellar_agent_core::profile::schema::Profile::builder_testnet_named(
+                            "intent",
+                            "timelock-test",
+                            "account",
+                            "timelock-nonce",
+                            "account",
+                        )
+                        .build();
+                    let store = PersistedWindowStore::at_path(dir.path().join("intent.window"));
+                    let source = SorobanAuthorizationEntry {
+                        credentials: SorobanCredentials::SourceAccount,
+                        root_invocation: leaf(schedule()),
+                    };
+                    let signed = SorobanAuthorizationEntry {
+                        credentials: SorobanCredentials::Address(SorobanAddressCredentials {
+                            address: super::operator(),
+                            nonce: 9,
+                            signature_expiration_ledger: 0,
+                            signature: ScVal::Void,
+                        }),
+                        root_invocation: leaf(schedule()),
+                    };
+                    let entries = match case {
+                        "empty" => vec![],
+                        "mixed" => vec![signed, source],
+                        "stale_source" => vec![source],
+                        _ => vec![signed],
+                    };
+                    let primary = Endpoint::start_entries(
+                        Chain {
+                            final_sequence_bump: case.starts_with("sequence"),
+                            overflowing_final_fee: case == "sequence_fee",
+                            ..Chain::at(LEDGER)
+                        },
+                        Some(entries),
+                    )
+                    .await;
+                    let secondary = Endpoint::start(Chain::at(LEDGER)).await;
+                    let signer = super::AuthAndSourceSigner {
+                        auth: CountingSigner::new(SEED),
+                        source: CountingSigner::new(SEED),
+                    };
+                    let now = stellar_agent_core::timefmt::now_unix_ms().unwrap();
+                    let key = StateKey::new("intent", 1, "rate_limit", 60);
+                    let entries = vec![WindowEntry::new(
+                        key.clone(),
+                        now,
+                        1,
+                        WindowLimit::Count {
+                            window: "1m".into(),
+                            max_calls: 1,
+                        },
+                    )];
+                    let sizing =
+                        CheckedSizing::for_test(SizingBasis::NoValue, entries.clone()).unwrap();
+                    let inner =
+                        stellar_agent_network::submission_record::WalletSubmissionRecorder::new(
+                            &profile,
+                            "intent",
+                            "timelock_test",
+                            Some("stellar:testnet".into()),
+                            stellar_agent_core::audit_log::PolicyDecision::Allow,
+                            vec![],
+                            entries,
+                            stellar_agent_core::profile::receipt::ReceiptStore::open_at(
+                                dir.path(),
+                                "intent",
+                            )
+                            .unwrap(),
+                            store.clone(),
+                            None,
+                            None,
+                            "fixture",
+                            now,
+                        )
+                        .with_signing_sizing(sizing);
+                    let stale = case.starts_with("stale");
+                    let recorder = AdmissionRecorder {
+                        inner,
+                        stale,
+                        signer: &signer,
+                        endpoint: &primary,
+                        admissions: 0.into(),
+                        cancellations: 0.into(),
+                        binds: 0.into(),
+                        ledger_reads_at_admission: 0.into(),
+                        subjects: Mutex::new(vec![]),
+                    };
+                    let result = submit_timelock_invoke_with_g_key_auth(TimelockSubmitArgs {
+                        host_function: HostFunction::InvokeContract(schedule()),
+                        signer: &signer,
+                        primary_rpc_url: &primary.uri(),
+                        secondary_rpc_url: &secondary.witness_uri(),
+                        network_passphrase: TESTNET_PASSPHRASE,
+                        timeout: Duration::from_secs(30),
+                        op_label: "schedule",
+                        admission: SigningAdmission::Recorded(&recorder),
+                    })
+                    .await;
+                    assert_eq!(
+                        recorder.admissions.load(Ordering::SeqCst),
+                        1,
+                        "{case}: {result:?}"
+                    );
+                    assert_eq!(
+                        recorder.cancellations.load(Ordering::SeqCst),
+                        usize::from(stale),
+                        "{case}"
+                    );
+                    if stale {
+                        assert_eq!(result.unwrap_err().wire_code(), UNAVAILABLE_CODE, "{case}");
+                        assert_eq!(signer.auth.sign_calls() + signer.source.sign_calls(), 0);
+                        assert_eq!(
+                            primary.ledger_reads(),
+                            recorder.ledger_reads_at_admission.load(Ordering::SeqCst)
+                        );
+                    } else if case.starts_with("sequence") {
+                        assert!(
+                            matches!(
+                                result,
+                                Err(SaError::IntentBindingMismatch {
+                                    field: "envelope_sequence"
+                                })
+                            ),
+                            "{result:?}"
+                        );
+                        assert_eq!(signer.source.sign_calls(), 0);
+                        assert_eq!(signer.auth.sign_calls(), 1);
+                    } else {
+                        assert!(result.is_ok(), "{case}: {result:?}");
+                        assert_eq!(recorder.binds.load(Ordering::SeqCst), 1);
+                        assert_eq!(signer.source.sign_calls(), 1);
+                        if case == "empty" {
+                            assert!(recorder.subjects.lock().unwrap().is_empty());
+                            assert_eq!(signer.auth.sign_calls(), 0);
+                        } else {
+                            assert_eq!(
+                                *recorder.subjects.lock().unwrap(),
+                                [SubjectKind::AccountKey, SubjectKind::SourceAccount]
+                            );
+                            assert_eq!(signer.auth.sign_calls(), 1);
+                        }
+                    }
+                    assert_eq!(
+                        primary.sends().await,
+                        usize::from(!stale && !case.starts_with("sequence"))
+                    );
+                    drop(recorder);
+                    drop(store);
+                    let reopened = PersistedWindowStore::at_path(dir.path().join("intent.window"));
+                    let intents = reopened.signed_intents("intent", &profile).unwrap();
+                    assert_eq!(intents.len(), usize::from(!stale));
+                    if case.starts_with("sequence") {
+                        assert_eq!(
+                            intents[0].status,
+                            "authorization exposed, submission unknown"
+                        );
+                    }
+                    let loaded = PolicyStateStore::new();
+                    reopened.load_into("intent", &profile, &loaded).unwrap();
+                    assert_eq!(
+                        loaded.query_window(&key, now).unwrap(),
+                        if stale { (0, 0) } else { (1, 1) }
+                    );
+                }
+            }
+
             #[derive(Clone, Copy, Debug)]
             enum Verb {
                 Schedule,
@@ -2012,6 +2393,9 @@ mod tests {
                 let error = match verb {
                     Verb::Schedule => schedule_upgrade(
                         TimelockScheduleArgs::builder()
+                            .submission_recorder(
+                                &crate::signing::intent_test_helpers::NoLimitRecorder,
+                            )
                             .timelock_contract_strkey(CONTRACT)
                             .target_strkey(CONTRACT)
                             .function("upgrade")
@@ -2029,6 +2413,9 @@ mod tests {
                     .err(),
                     Verb::Cancel => cancel(
                         TimelockCancelArgs::builder()
+                            .intent_admission(
+                                crate::signing::intent_test_helpers::no_value_admission(),
+                            )
                             .timelock_contract_strkey(CONTRACT)
                             .operation_id(&operation_id)
                             .signer(&signer)
@@ -2043,6 +2430,9 @@ mod tests {
                     .err(),
                     Verb::Execute => execute(
                         TimelockExecuteArgs::builder()
+                            .submission_recorder(
+                                &crate::signing::intent_test_helpers::NoLimitRecorder,
+                            )
                             .timelock_contract_strkey(CONTRACT)
                             .target_strkey(CONTRACT)
                             .function("upgrade")

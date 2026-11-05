@@ -81,16 +81,22 @@ fn signers_manager(
     timeout: Duration,
 ) -> Arc<SignersManager> {
     Arc::new(
-        SignersManager::new(SignersManagerConfig::new(
-            rpc_url.to_owned(),
-            rpc_url.to_owned(),
-            audit_writer,
-            audit_log_path,
-            "Test SDF Network ; September 2015".to_owned(),
-            "test-profile".to_owned(),
-            timeout,
-            "stellar:testnet".to_owned(),
-        ))
+        SignersManager::new(
+            SignersManagerConfig::new(
+                rpc_url.to_owned(),
+                rpc_url.to_owned(),
+                audit_writer,
+                audit_log_path,
+                "Test SDF Network ; September 2015".to_owned(),
+                "test-profile".to_owned(),
+                timeout,
+                "stellar:testnet".to_owned(),
+            )
+            .with_intent_admission(std::sync::Arc::new(
+                stellar_agent_smart_account::signing::intent_test_helpers::no_value_admission_owned(
+                ),
+            )),
+        )
         .expect("SignersManager::new must succeed"),
     )
 }
@@ -147,6 +153,7 @@ async fn a_missing_baseline_refuses_before_the_drift_check_reads_the_chain() {
 
     let result = credentials
         .sign_with_passkey_rule(
+            &stellar_agent_smart_account::signing::intent_test_helpers::gate(vec![]),
             "laptop-passkey",
             &testnet_entry(),
             manager,
@@ -217,6 +224,7 @@ async fn a_spent_deadline_refuses_at_the_baseline_read() {
 
     let result = credentials
         .sign_with_passkey_rule(
+            &stellar_agent_smart_account::signing::intent_test_helpers::gate(vec![]),
             "laptop-passkey",
             &testnet_entry(),
             manager,
@@ -299,6 +307,7 @@ async fn a_changed_signer_set_refuses_at_the_comparison() {
 
     let result = credentials
         .sign_with_passkey_rule(
+            &stellar_agent_smart_account::signing::intent_test_helpers::gate(vec![]),
             "laptop-passkey",
             &testnet_entry(),
             manager,

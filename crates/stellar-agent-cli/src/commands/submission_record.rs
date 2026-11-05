@@ -52,9 +52,11 @@ pub(crate) struct SubmitRecord<'a> {
     pub policy_decision: stellar_agent_core::audit_log::PolicyDecision,
     /// CAIP-2 chain identifier for the audit rows.
     pub chain_id: &'a str,
-    /// The value effects the policy gate sized. `None` records no window
-    /// entries and no legs.
+    /// The authenticated value effects the policy gate sizes.
+    /// Without effects, `unvalued` supplies checked count sizing when present.
     pub effects: Option<&'a ValueEffects>,
+    /// The reason a contract call has no measurable value effects.
+    pub unvalued: Option<stellar_agent_core::policy::v1::OpaqueReason>,
     /// The audit writer the origin-aware pre-flight acquired. `None` only on a
     /// synthesized zero-configuration profile, which has no audit log to write
     /// to.
@@ -89,33 +91,56 @@ pub(crate) fn build_recorder(
         .map(|e| e.legs().iter().map(Into::into).collect())
         .unwrap_or_default();
 
-    let window_entries = match record.effects {
-        Some(effects) => {
-            let engine = crate::commands::policy_engine::build_v1_policy_engine(
-                record.verb,
-                &record.profile.policy.engine,
+    let sizing = if record.effects.is_some() || record.unvalued.is_some() {
+        let engine = crate::commands::policy_engine::build_v1_policy_engine(
+            record.verb,
+            &record.profile.policy.engine,
+            record.profile,
+            &record.profile_name,
+        )
+        .map_err(|error| {
+            record_unavailable(format!("the policy engine could not be rebuilt: {error}"))
+        })?;
+        let outcome = if let Some(effects) = record.effects {
+            engine.record_confirmed_checked(
+                &descriptor_for(record.tool, record.chain_id, ToolValueKind::MovesValue),
                 record.profile,
-                &record.profile_name,
+                &ValueClass::Value(effects.clone()),
             )
-            .map_err(|e| {
-                record_unavailable(format!("the policy engine could not be rebuilt: {e}"))
-            })?;
-            engine
-                .record_confirmed(
-                    &descriptor_for(record.tool, record.chain_id),
-                    record.profile,
-                    &ValueClass::Value(effects.clone()),
-                )
-                .map_err(|e| {
-                    record_unavailable(format!(
-                        "the policy engine could not account for this action: {e}"
-                    ))
-                })?
-        }
-        None => Vec::new(),
+        } else if let Some(reason) = record.unvalued {
+            engine.size_unvalued_call(
+                &descriptor_for(record.tool, record.chain_id, ToolValueKind::OpaqueSign),
+                record.profile,
+                reason,
+                record.now_ms,
+            )
+        } else {
+            return Err(record_unavailable("missing sizing input".to_owned()));
+        };
+        Some(
+            match outcome.map_err(|error| {
+                record_unavailable(format!(
+                    "the policy engine could not account for this action: {error}"
+                ))
+            })? {
+                stellar_agent_core::policy::v1::SizingOutcome::Sized(sizing) => sizing,
+                stellar_agent_core::policy::v1::SizingOutcome::Refused(reason) => {
+                    return Err(WalletError::PolicyDenied {
+                        reason: Box::new(reason),
+                    });
+                }
+                _ => return Err(record_unavailable("unsupported sizing outcome".to_owned())),
+            },
+        )
+    } else {
+        None
     };
+    let window_entries = sizing
+        .as_ref()
+        .map(|sizing| sizing.entries().to_vec())
+        .unwrap_or_default();
 
-    Ok(WalletSubmissionRecorder::new(
+    let recorder = WalletSubmissionRecorder::new(
         record.profile,
         record.profile_name.clone(),
         record.tool,
@@ -129,7 +154,46 @@ pub(crate) fn build_recorder(
         None,
         uuid::Uuid::new_v4().to_string(),
         record.now_ms,
-    ))
+    );
+    Ok(match sizing {
+        Some(sizing) => recorder.with_signing_sizing(sizing),
+        None => recorder,
+    })
+}
+
+/// Builds checked count admission from the profile's policy engine.
+pub(crate) fn no_value_admission(
+    profile: &Profile,
+    profile_name: &str,
+    tool: &'static str,
+    chain_id: &str,
+    now_ms: u64,
+) -> Result<Arc<stellar_agent_network::NoValueAdmission>, WalletError> {
+    let unavailable = |_| {
+        WalletError::Submission(SubmissionError::IntentRecordUnavailable {
+            class: "policy_unavailable",
+        })
+    };
+    let engine = crate::commands::policy_engine::build_v1_policy_engine(
+        tool,
+        &profile.policy.engine,
+        profile,
+        profile_name,
+    )
+    .map_err(|_| {
+        WalletError::Submission(SubmissionError::IntentRecordUnavailable {
+            class: "policy_unavailable",
+        })
+    })?;
+    let sizing = engine
+        .size_no_value(
+            &descriptor_for(tool, chain_id, ToolValueKind::ReadOnly),
+            profile,
+            now_ms,
+        )
+        .map_err(unavailable)?;
+    stellar_agent_network::NoValueAdmission::new(profile.clone(), profile_name, sizing)
+        .map(Arc::new)
 }
 
 /// What a mainnet write's recorder records, prepared before the
@@ -275,6 +339,26 @@ impl std::fmt::Debug for StageMarkedRecorder<'_> {
 
 #[async_trait::async_trait]
 impl SubmissionRecorder for StageMarkedRecorder<'_> {
+    async fn admit_signed_intent(
+        &self,
+        plan: &stellar_agent_network::SignedIntentPlan,
+    ) -> Result<stellar_agent_network::IntentProof, WalletError> {
+        self.inner.admit_signed_intent(plan).await
+    }
+    async fn cancel_unexposed(
+        &self,
+        proof: stellar_agent_network::IntentProof,
+    ) -> Result<(), WalletError> {
+        self.inner.cancel_unexposed(proof).await
+    }
+    async fn pre_send_bound(
+        &self,
+        intent: &stellar_agent_network::SubmissionIntent,
+        binding: &stellar_agent_network::IntentBinding<'_>,
+    ) -> Result<(), WalletError> {
+        self.inner.pre_send_bound(intent, binding).await
+    }
+
     async fn pre_send(&self, intent: &SubmissionIntent) -> Result<(), WalletError> {
         self.inner.pre_send(intent).await
     }
@@ -294,13 +378,13 @@ impl SubmissionRecorder for StageMarkedRecorder<'_> {
 }
 
 /// Reconstructs the [`ToolDescriptor`] the gate evaluated against.
-fn descriptor_for(tool: &'static str, chain_id: &str) -> ToolDescriptor {
+fn descriptor_for(tool: &'static str, chain_id: &str, value_kind: ToolValueKind) -> ToolDescriptor {
     let reg = McpToolRegistration {
         name: tool,
         destructive_hint: true,
         read_only_hint: false,
         chain_id_required: true,
-        value_kind: ToolValueKind::MovesValue,
+        value_kind,
     };
     let mut descriptor = ToolDescriptor::from_registration(&reg);
     descriptor.chain_id = chain_id.to_owned();
@@ -1065,6 +1149,8 @@ mod tests {
         for code in [
             "smart_account.ledger_witness_unavailable",
             "simulation.divergence.ledger_skew",
+            "submission.intent_record_unavailable",
+            "submission.intent_binding_mismatch",
         ] {
             let error = stellar_agent_defi::adapter::DefiAdapterError::SigningRefusal {
                 wire_code: code,
@@ -1077,6 +1163,7 @@ mod tests {
                 let envelope = defi_submit_error_envelope(&error, verb, fallback);
                 let rendered = envelope.error.as_ref().unwrap();
                 assert_eq!(rendered.code, code, "verb {verb}");
+                assert_eq!(rendered.message, "fixed", "verb {verb}");
                 assert!(
                     rendered.details.is_none(),
                     "a refusal before signing names no transaction"

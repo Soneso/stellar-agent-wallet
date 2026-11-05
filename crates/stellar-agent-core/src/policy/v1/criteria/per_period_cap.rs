@@ -222,6 +222,10 @@ impl PerPeriodCapCriterion {
 }
 
 impl Criterion for PerPeriodCapCriterion {
+    fn windowed(&self) -> bool {
+        true
+    }
+
     fn kind(&self) -> &'static str {
         "per_period_cap"
     }

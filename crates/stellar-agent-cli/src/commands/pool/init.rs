@@ -535,6 +535,7 @@ where
         ));
     }
     let inner = build_recorder(SubmitRecord {
+        unvalued: None,
         policy_decision: stellar_agent_core::audit_log::PolicyDecision::Allow,
         profile: &profile,
         profile_name: name.clone(),

@@ -106,6 +106,38 @@ use crate::sequence_floor::SequenceFloorHook;
 use crate::submit::{MainnetSubmitGrant, redact_tx_hash};
 use stellar_agent_core::observability::redact::redact_strkey_first5_last5 as redact_account;
 
+/// A pending-writer boundary observer for lock-discipline tests.
+#[cfg(feature = "test-hooks")]
+pub type PendingWriterHook = Arc<dyn Fn(&Profile, &PersistedWindowStore) + Send + Sync>;
+
+#[cfg(feature = "test-hooks")]
+static PENDING_WRITER_HOOK: Mutex<Option<PendingWriterHook>> = Mutex::new(None);
+
+/// Restores the pending-writer observer when the fixture ends.
+#[cfg(feature = "test-hooks")]
+#[must_use]
+pub struct PendingWriterHookGuard(Option<PendingWriterHook>);
+
+#[cfg(feature = "test-hooks")]
+impl Drop for PendingWriterHookGuard {
+    fn drop(&mut self) {
+        *PENDING_WRITER_HOOK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = self.0.take();
+    }
+}
+
+/// Installs an observer immediately before pending-row writer acquisition.
+#[cfg(feature = "test-hooks")]
+pub fn observe_pending_writer_for_test(hook: PendingWriterHook) -> PendingWriterHookGuard {
+    PendingWriterHookGuard(
+        PENDING_WRITER_HOOK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .replace(hook),
+    )
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // SubmissionIntent
 // ─────────────────────────────────────────────────────────────────────────────
@@ -214,11 +246,43 @@ pub enum SubmissionOutcome {
 
 /// The seam through which the submit layer records a submission.
 ///
-/// Object-safe: call sites hold `Option<&dyn SubmissionRecorder>`, and a call
-/// site with nothing to record passes `None` and keeps the plain submit
-/// behaviour.
+/// Object-safe. A smart-account signing flow admits its intent through
+/// [`Self::admit_signed_intent`] before its first signature and binds its final
+/// envelope through [`Self::pre_send_bound`]. Another call site with nothing
+/// to record passes `None`.
 #[async_trait::async_trait]
 pub trait SubmissionRecorder: Send + Sync {
+    /// Admits all authority before its first signature.
+    ///
+    /// # Errors
+    /// Refuses when this recorder does not support intent admission.
+    async fn admit_signed_intent(
+        &self,
+        _plan: &crate::SignedIntentPlan,
+    ) -> Result<crate::IntentProof, WalletError> {
+        Err(crate::signed_intent::unavailable("unsupported_recorder"))
+    }
+
+    /// Cancels an admission whose proof remains unconsumed.
+    ///
+    /// # Errors
+    /// Refuses when this recorder does not support intent cancellation.
+    async fn cancel_unexposed(&self, _proof: crate::IntentProof) -> Result<(), WalletError> {
+        Err(crate::signed_intent::unavailable("unsupported_recorder"))
+    }
+
+    /// Binds the final envelope before recording its submission.
+    ///
+    /// # Errors
+    /// Refuses when this recorder does not support intent binding.
+    async fn pre_send_bound(
+        &self,
+        _intent: &SubmissionIntent,
+        _binding: &crate::IntentBinding<'_>,
+    ) -> Result<(), WalletError> {
+        Err(crate::signed_intent::unavailable("unsupported_recorder"))
+    }
+
     /// Records the submission as sent with an unknown outcome, immediately
     /// before `sendTransaction`.
     ///
@@ -288,6 +352,7 @@ pub struct ApprovalTombstone {
 /// MCP server owns, and the approval entry exists only on a commit path that
 /// presented one.
 pub struct WalletSubmissionRecorder<'a> {
+    signing_sizing: Option<stellar_agent_core::policy::v1::CheckedSizing>,
     witness: Option<stellar_agent_core::audit_log::CrossCheckRecord>,
     profile: &'a Profile,
     profile_name: String,
@@ -321,6 +386,16 @@ impl std::fmt::Debug for WalletSubmissionRecorder<'_> {
 }
 
 impl<'a> WalletSubmissionRecorder<'a> {
+    /// Attaches the policy engine's checked sizing for signing admission.
+    #[must_use]
+    pub fn with_signing_sizing(
+        mut self,
+        sizing: stellar_agent_core::policy::v1::CheckedSizing,
+    ) -> Self {
+        self.signing_sizing = Some(sizing);
+        self
+    }
+
     /// Carries a completed oracle comparison into the pending and submitted audit rows.
     #[must_use]
     pub fn with_witness(mut self, witness: Option<&crate::cross_check::CrossCheckWitness>) -> Self {
@@ -359,6 +434,7 @@ impl<'a> WalletSubmissionRecorder<'a> {
         now_ms: u64,
     ) -> Self {
         Self {
+            signing_sizing: None,
             profile,
             profile_name: profile_name.into(),
             tool,
@@ -485,6 +561,16 @@ impl<'a> WalletSubmissionRecorder<'a> {
         let Some(writer) = self.audit.as_ref() else {
             return Ok(AnchorAfterRow::Current);
         };
+        #[cfg(feature = "test-hooks")]
+        {
+            let hook = PENDING_WRITER_HOOK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            if let Some(hook) = hook {
+                hook(self.profile, &self.window);
+            }
+        }
         let mut guard = lock_audit(writer)?;
         guard
             .write_entry(self.pending_entry(intent))
@@ -664,76 +750,54 @@ pub fn repair_approval_consumption(
 
 #[async_trait::async_trait]
 impl SubmissionRecorder for WalletSubmissionRecorder<'_> {
-    async fn pre_send(&self, intent: &SubmissionIntent) -> Result<(), WalletError> {
-        self.require_submission_scope(intent)
-            .map_err(|error| reservation_refusal(error, intent))?;
-        // The audit tip anchor precedes the receipt, row, and reservation.
-        // A refusal here has nothing to undo.
-        self.require_anchor_before_row()?;
+    async fn admit_signed_intent(
+        &self,
+        plan: &crate::SignedIntentPlan,
+    ) -> Result<crate::IntentProof, WalletError> {
+        let sizing = self
+            .signing_sizing
+            .as_ref()
+            .filter(|sizing| sizing.entries() == self.window_entries)
+            .ok_or_else(|| crate::signed_intent::unavailable("sizing_unverified"))?;
+        crate::signed_intent::admit_checked(self.profile, &self.window, sizing, plan)
+    }
 
-        self.claim_receipt(intent)?;
-        // The unauthorized path checks reservations only when it sizes entries.
-        if !self.window_entries.is_empty() {
-            self.window_precheck(intent)?;
+    async fn cancel_unexposed(&self, proof: crate::IntentProof) -> Result<(), WalletError> {
+        if proof.intent_id.is_none() {
+            return Ok(());
         }
+        self.window
+            .cancel_signed_intent(self.profile, proof)
+            .map_err(crate::signed_intent::store_refusal)
+    }
 
-        let anchor = match self.write_pending_row(intent) {
-            Ok(anchor) => anchor,
-            Err(e) => {
-                self.unwind(intent, UnwoundAfter::Receipt, e.code());
-                return Err(e);
-            }
+    async fn pre_send_bound(
+        &self,
+        intent: &SubmissionIntent,
+        binding: &crate::IntentBinding<'_>,
+    ) -> Result<(), WalletError> {
+        let Some(id) = binding.exposure.intent_id() else {
+            return self.pre_send(intent).await;
         };
-
-        if self.window_entries.is_empty() {
-            // The receipt gate recorded a new receipt, so no other receipt
-            // carries this hash. An older stateful policy can still have a
-            // reservation for it. Cleanup attempts to close an uncovered row here.
-            if let AnchorAfterRow::Behind(refusal) = anchor {
-                self.unwind(intent, UnwoundAfter::PendingRow, refusal.code());
-                return Err(refusal);
-            }
-        } else {
-            if let Err(e) = self.window.record_pending(
-                self.profile,
-                &self.window_entries,
-                &self.reservation(intent),
-            ) {
-                // A duplicate found under the lock is a resend of bytes another
-                // process reserved between the check above and this write. The
-                // pending row just written names the same envelope hash as that
-                // submission's and stays open with it. Every other refusal
-                // attempts to close the row, even if the duplicate check did
-                // not run, whatever the anchor check found.
-                let reached = match e {
-                    WindowStoreError::DuplicateReservation => UnwoundAfter::Receipt,
-                    _ => UnwoundAfter::PendingRow,
-                };
-                let refusal = reservation_refusal(e, intent);
-                self.unwind(intent, reached, refusal.code());
-                return Err(refusal);
-            }
-            // The reservation's duplicate check under the window lock found
-            // no record carrying this hash, so the reservation and the row are
-            // this submission's, and a pending row the anchor does not cover is
-            // closed out with them.
-            if let AnchorAfterRow::Behind(refusal) = anchor {
-                self.unwind(intent, UnwoundAfter::Reservation, refusal.code());
-                return Err(refusal);
-            }
+        self.require_submission_scope(intent)
+            .map_err(crate::signed_intent::store_refusal)?;
+        self.require_anchor_before_row()?;
+        let facts = crate::BindFacts::from_envelope(
+            binding.envelope,
+            intent.chain_scope.chain().network_passphrase(),
+        )
+        .map_err(crate::signed_intent::mismatch)?;
+        if facts.envelope_hash != intent.envelope_hash || facts.tx_hash != intent.tx_hash {
+            return Err(crate::signed_intent::mismatch("envelope"));
         }
+        self.window
+            .bind_signed_intent(self.profile, id, &facts, &self.window_entries)
+            .map_err(crate::signed_intent::store_refusal)?;
+        self.pre_send_inner(intent, Some(id))
+    }
 
-        // Last, and immediately before the send: `submitted` is what says the
-        // bytes left, and it is the flag that makes the receipt un-abandonable.
-        // Setting it earlier would strand a receipt for a submission a later
-        // failure stopped.
-        if let Err(e) = self.mark_submitted(&intent.envelope_hash) {
-            let refusal = receipt_store_refusal(&e);
-            self.unwind(intent, UnwoundAfter::Reservation, refusal.code());
-            return Err(refusal);
-        }
-
-        Ok(())
+    async fn pre_send(&self, intent: &SubmissionIntent) -> Result<(), WalletError> {
+        self.pre_send_inner(intent, None)
     }
 
     async fn pre_send_authorized(
@@ -772,6 +836,93 @@ impl SubmissionRecorder for WalletSubmissionRecorder<'_> {
     }
 }
 
+impl WalletSubmissionRecorder<'_> {
+    fn pre_send_inner(
+        &self,
+        intent: &SubmissionIntent,
+        linked: Option<&str>,
+    ) -> Result<(), WalletError> {
+        self.require_submission_scope(intent)
+            .map_err(|error| reservation_refusal(error, intent))?;
+        // The audit tip anchor precedes the receipt, row, and reservation.
+        // A refusal here has nothing to undo.
+        self.require_anchor_before_row()?;
+
+        self.claim_receipt(intent)?;
+        // The unauthorized path checks reservations only when it sizes entries.
+        if !self.window_entries.is_empty() {
+            self.window_precheck(intent, linked.is_some())?;
+        }
+
+        let anchor = match self.write_pending_row(intent) {
+            Ok(anchor) => anchor,
+            Err(e) => {
+                self.unwind(intent, UnwoundAfter::Receipt, e.code());
+                return Err(e);
+            }
+        };
+
+        if self.window_entries.is_empty() {
+            // The receipt gate recorded a new receipt, so no other receipt
+            // carries this hash. An older stateful policy can still have a
+            // reservation for it. Cleanup attempts to close an uncovered row here.
+            if let AnchorAfterRow::Behind(refusal) = anchor {
+                self.unwind(intent, UnwoundAfter::PendingRow, refusal.code());
+                return Err(refusal);
+            }
+        } else {
+            let recorded = match linked {
+                Some(id) => self.window.record_pending_linked(
+                    self.profile,
+                    &self.window_entries,
+                    &self.reservation(intent),
+                    id,
+                ),
+                None => self.window.record_pending(
+                    self.profile,
+                    &self.window_entries,
+                    &self.reservation(intent),
+                ),
+            };
+            if let Err(e) = recorded {
+                // A duplicate found under the lock is a resend of bytes another
+                // process reserved between the check above and this write. The
+                // pending row just written names the same envelope hash as that
+                // submission's and stays open with it. Every other refusal
+                // attempts to close the row, even if the duplicate check did
+                // not run, whatever the anchor check found.
+                let reached = match e {
+                    WindowStoreError::DuplicateReservation => UnwoundAfter::Receipt,
+                    _ => UnwoundAfter::PendingRow,
+                };
+                let refusal = signing_reservation_refusal(e, intent, linked.is_some());
+                self.unwind(intent, reached, refusal.code());
+                return Err(refusal);
+            }
+            // The reservation's duplicate check under the window lock found
+            // no record carrying this hash, so the reservation and the row are
+            // this submission's, and a pending row the anchor does not cover is
+            // closed out with them.
+            if let AnchorAfterRow::Behind(refusal) = anchor {
+                self.unwind(intent, UnwoundAfter::Reservation, refusal.code());
+                return Err(refusal);
+            }
+        }
+
+        // Last, and immediately before the send: `submitted` is what says the
+        // bytes left, and it is the flag that makes the receipt un-abandonable.
+        // Setting it earlier would strand a receipt for a submission a later
+        // failure stopped.
+        if let Err(e) = self.mark_submitted(&intent.envelope_hash) {
+            let refusal = receipt_store_refusal(&e);
+            self.unwind(intent, UnwoundAfter::Reservation, refusal.code());
+            return Err(refusal);
+        }
+
+        Ok(())
+    }
+}
+
 /// Turns a refused reservation write into the error the caller reports.
 ///
 /// A bucket that can no longer admit the spend is a policy denial, reported
@@ -781,6 +932,18 @@ impl SubmissionRecorder for WalletSubmissionRecorder<'_> {
 /// transaction to reconcile. Every other refusal is a record the wallet could
 /// not write, which is what `submission.record_unavailable` names. All of
 /// them refuse the send.
+fn signing_reservation_refusal(
+    error: WindowStoreError,
+    intent: &SubmissionIntent,
+    signed_intent: bool,
+) -> WalletError {
+    if signed_intent && !matches!(error, WindowStoreError::DuplicateReservation) {
+        crate::signed_intent::store_refusal(error)
+    } else {
+        reservation_refusal(error, intent)
+    }
+}
+
 fn reservation_refusal(error: WindowStoreError, intent: &SubmissionIntent) -> WalletError {
     if let Some(error) = error.chain_validation_error() {
         return WalletError::Validation(error);
@@ -980,7 +1143,11 @@ impl WalletSubmissionRecorder<'_> {
     ///
     /// `submission.tx_already_submitted` for held bytes, and the refusal of
     /// an unreadable window.
-    fn window_precheck(&self, intent: &SubmissionIntent) -> Result<(), WalletError> {
+    fn window_precheck(
+        &self,
+        intent: &SubmissionIntent,
+        signed_intent: bool,
+    ) -> Result<(), WalletError> {
         if !window_precheck_enabled() {
             return Ok(());
         }
@@ -990,7 +1157,7 @@ impl WalletSubmissionRecorder<'_> {
         {
             Ok(false) => return Ok(()),
             Ok(true) => already_submitted(intent),
-            Err(e) => reservation_refusal(e, intent),
+            Err(e) => signing_reservation_refusal(e, intent, signed_intent),
         };
         self.unwind(intent, UnwoundAfter::Receipt, refusal.code());
         Err(refusal)
@@ -1065,7 +1232,7 @@ impl WalletSubmissionRecorder<'_> {
             .map_err(|error| reservation_refusal(error, intent))?;
         self.require_anchor_before_row()?;
         self.claim_receipt(intent)?;
-        self.window_precheck(intent)?;
+        self.window_precheck(intent, false)?;
 
         let audit = match self.write_pending_row_with_facts(writer, intent) {
             Ok(Some(audit)) => audit,
@@ -1418,6 +1585,410 @@ mod tests {
     )]
 
     use super::*;
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn final_submission_links_and_charges_once() {
+        use crate::signed_intent::test_helpers::intent_fixture_plan;
+        use stellar_agent_core::policy::v1::criteria::{
+            WindowLimit,
+            state_store::{PolicyStateStore, StateKey, WindowEntry},
+        };
+        use stellar_agent_core::policy::v1::{CheckedSizing, SizingBasis};
+        use stellar_agent_core::profile::caip2::Caip2;
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let profile = Profile::builder_testnet_named(
+            "intent",
+            "bind-once",
+            "account",
+            "bind-once-nonce",
+            "account",
+        )
+        .build();
+        let window = PersistedWindowStore::at_path(dir.path().join("intent.window"));
+        let receipts = ReceiptStore::open_at(dir.path(), "intent").unwrap();
+        let (plan, envelope) = intent_fixture_plan(1, 60);
+        let sizing =
+            CheckedSizing::for_test(SizingBasis::MeasuredValue, plan.legs().to_vec()).unwrap();
+        let mut recorder = WalletSubmissionRecorder::new(
+            &profile,
+            "intent",
+            "test",
+            Some("stellar:testnet".into()),
+            PolicyDecision::Allow,
+            vec![],
+            plan.legs().to_vec(),
+            receipts,
+            window.clone(),
+            None,
+            None,
+            "request",
+            1000,
+        )
+        .with_signing_sizing(sizing);
+        let exposure = recorder.admit_signed_intent(&plan).await.unwrap().expose();
+        let make_intent = |envelope: &stellar_xdr::TransactionEnvelope| {
+            let facts =
+                crate::BindFacts::from_envelope(envelope, Caip2::Testnet.network_passphrase())
+                    .unwrap();
+            let (source, sequence) = crate::submit::replay_identity(envelope).unwrap();
+            SubmissionIntent {
+                chain_scope: crate::policy_state::ChainScope::for_chain(Caip2::Testnet),
+                envelope_hash: facts.envelope_hash,
+                tx_hash: facts.tx_hash,
+                source,
+                sequence,
+                max_time: 0,
+                submission_ledger: 1,
+                submission_anchor: None,
+            }
+        };
+        let intent = make_intent(&envelope);
+        let binding = crate::IntentBinding::new(&exposure, &envelope);
+        recorder.pre_send_bound(&intent, &binding).await.unwrap();
+        assert_eq!(
+            recorder
+                .pre_send_bound(&intent, &binding)
+                .await
+                .unwrap_err()
+                .code(),
+            "submission.tx_already_submitted"
+        );
+        let assert_totals = |amount, calls| {
+            let state = PolicyStateStore::new();
+            PersistedWindowStore::at_path(window.path().to_path_buf())
+                .load_into("intent", &profile, &state)
+                .unwrap();
+            for duration in [60, 120] {
+                assert_eq!(
+                    state
+                        .query_window(
+                            &StateKey::new("intent", 1, "native", duration),
+                            stellar_agent_core::timefmt::now_unix_ms().unwrap()
+                        )
+                        .unwrap(),
+                    (amount, calls)
+                );
+                assert_eq!(
+                    state
+                        .query_window(
+                            &StateKey::new("intent", 1, "rate_limit", duration),
+                            stellar_agent_core::timefmt::now_unix_ms().unwrap()
+                        )
+                        .unwrap(),
+                    (i128::from(calls), calls)
+                );
+            }
+        };
+        assert_totals(60, 1);
+        recorder.settle_window(&intent, WindowSettlement::Release);
+        assert!(window.pending_reservations(&profile).unwrap().is_empty());
+        assert_eq!(
+            window.signed_intents("intent", &profile).unwrap()[0].status,
+            "authorization exposed, submission bound"
+        );
+        assert_totals(60, 1);
+        recorder
+            .outcome(
+                &intent,
+                &SubmissionOutcome::Success {
+                    ledger: 2,
+                    created_at: None,
+                },
+            )
+            .await;
+        assert_totals(60, 1);
+        let (plan_b, envelope_b) = intent_fixture_plan(2, 60);
+        let legs: Vec<_> = plan_b
+            .legs()
+            .iter()
+            .map(|entry| {
+                let limit = match entry.limit() {
+                    WindowLimit::Amount { asset, window, .. } => WindowLimit::Amount {
+                        asset: asset.clone(),
+                        window: window.clone(),
+                        max_stroops: 120,
+                    },
+                    WindowLimit::Count { window, .. } => WindowLimit::Count {
+                        window: window.clone(),
+                        max_calls: 2,
+                    },
+                };
+                WindowEntry::new(
+                    entry.key().clone(),
+                    entry.timestamp_ms(),
+                    entry.amount(),
+                    limit,
+                )
+            })
+            .collect();
+        recorder.window_entries = legs.clone();
+        recorder.signing_sizing =
+            Some(CheckedSizing::for_test(SizingBasis::MeasuredValue, legs).unwrap());
+        let exposure_b = recorder
+            .admit_signed_intent(&plan_b)
+            .await
+            .unwrap()
+            .expose();
+        recorder.window_entries.pop();
+        let error = recorder
+            .pre_send_bound(
+                &make_intent(&envelope_b),
+                &crate::IntentBinding::new(&exposure_b, &envelope_b),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            WalletError::Submission(SubmissionError::IntentBindingMismatch { field: "legs" })
+        ));
+        assert_totals(120, 2);
+        assert!(
+            window
+                .signed_intents("intent", &profile)
+                .unwrap()
+                .iter()
+                .any(|i| i.intent_id == exposure_b.intent_id().unwrap()
+                    && i.status == "authorization exposed, submission unknown")
+        );
+        assert!(window.pending_reservations(&profile).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn different_final_intent_cannot_consume_reservation() {
+        use crate::signed_intent::test_helpers::intent_fixture_kind;
+        use stellar_agent_core::policy::v1::criteria::state_store::{PolicyStateStore, StateKey};
+        use stellar_agent_core::policy::v1::{CheckedSizing, SizingBasis};
+        use stellar_xdr::*;
+        let cases = [
+            "credential",
+            "nonce",
+            "expiration",
+            "invocation",
+            "context_rule_ids",
+            "external_verifier",
+            "external_key",
+            "delegated",
+            "host_invocation",
+            "envelope_source",
+            "envelope_sequence",
+            "duplicate",
+            "added",
+            "removed",
+            "legs",
+            "chain",
+            "operation_source",
+        ];
+        let mut mismatches = Vec::new();
+        for case in cases {
+            stellar_agent_test_support::keyring_mock::install().unwrap();
+            let dir = tempfile::tempdir().unwrap();
+            let profile = Profile::builder_testnet_named(
+                "intent",
+                "binding",
+                "account",
+                "binding-nonce",
+                "account",
+            )
+            .build();
+            let window = PersistedWindowStore::at_path(dir.path().join("intent.window"));
+            let receipts = ReceiptStore::open_at(dir.path(), "intent").unwrap();
+            let (plan, mut envelope) = intent_fixture_kind(2);
+            let entries = plan.legs().to_vec();
+            let sizing =
+                CheckedSizing::for_test(SizingBasis::MeasuredValue, entries.clone()).unwrap();
+            let mut recorder = WalletSubmissionRecorder::new(
+                &profile,
+                "intent",
+                "test",
+                Some("stellar:testnet".into()),
+                PolicyDecision::Allow,
+                vec![],
+                entries,
+                receipts,
+                window.clone(),
+                None,
+                None,
+                "request",
+                1000,
+            )
+            .with_signing_sizing(sizing);
+            let exposure = recorder.admit_signed_intent(&plan).await.unwrap().expose();
+            let TransactionEnvelope::Tx(tx) = &mut envelope else {
+                unreachable!()
+            };
+            if case == "envelope_source" {
+                tx.tx.source_account = MuxedAccount::Ed25519(Uint256([9; 32]));
+            }
+            if case == "envelope_sequence" {
+                tx.tx.seq_num.0 += 1;
+            }
+            let mut operations = tx.tx.operations.to_vec();
+            if case == "operation_source" {
+                operations[0].source_account = Some(MuxedAccount::Ed25519(Uint256([9; 32])));
+            }
+            let OperationBody::InvokeHostFunction(op) = &mut operations[0].body else {
+                unreachable!()
+            };
+            if case == "host_invocation" {
+                let HostFunction::InvokeContract(call) = &mut op.host_function else {
+                    unreachable!()
+                };
+                call.function_name = ScSymbol::try_from("other").unwrap();
+            }
+            let mut auth = op.auth.to_vec();
+            if case == "duplicate" {
+                auth.push(auth[0].clone());
+            }
+            if case == "added" {
+                let mut added = auth[0].clone();
+                if let SorobanCredentials::Address(credentials) = &mut added.credentials {
+                    credentials.nonce += 1;
+                }
+                auth.push(added);
+            }
+            if case == "removed" {
+                auth.clear();
+            }
+            if let Some(entry) = auth.first_mut() {
+                if case == "invocation" {
+                    entry.root_invocation.sub_invocations =
+                        vec![entry.root_invocation.clone()].try_into().unwrap();
+                }
+                let SorobanCredentials::Address(credentials) = &mut entry.credentials else {
+                    unreachable!()
+                };
+                match case {
+                    "credential" => {
+                        credentials.address = ScAddress::Contract(ContractId(Hash([9; 32])))
+                    }
+                    "nonce" => credentials.nonce += 1,
+                    "expiration" => credentials.signature_expiration_ledger += 1,
+                    "context_rule_ids" | "external_verifier" | "external_key" | "delegated" => {
+                        let ScVal::Map(Some(fields)) = &credentials.signature else {
+                            unreachable!()
+                        };
+                        let mut fields = fields.to_vec();
+                        if case == "context_rule_ids" {
+                            fields[0].val =
+                                ScVal::Vec(Some(vec![ScVal::U32(4)].try_into().unwrap()));
+                        } else {
+                            let ScVal::Map(Some(signers)) = &fields[1].val else {
+                                unreachable!()
+                            };
+                            let mut signers = signers.to_vec();
+                            for signer in &mut signers {
+                                let ScVal::Vec(Some(key)) = &signer.key else {
+                                    unreachable!()
+                                };
+                                let mut key = key.to_vec();
+                                let ScVal::Symbol(tag) = &key[0] else {
+                                    unreachable!()
+                                };
+                                let delegated = tag.0.as_slice() == b"Delegated";
+                                if case == "delegated" && delegated {
+                                    key[1] = ScVal::Address(ScAddress::Account(AccountId(
+                                        PublicKey::PublicKeyTypeEd25519(Uint256([8; 32])),
+                                    )));
+                                }
+                                if case == "external_verifier" && !delegated {
+                                    key[1] = ScVal::Address(ScAddress::Contract(ContractId(Hash(
+                                        [8; 32],
+                                    ))));
+                                }
+                                if case == "external_key" && !delegated {
+                                    key[2] = ScVal::Bytes(ScBytes(vec![8; 32].try_into().unwrap()));
+                                }
+                                signer.key = ScVal::Vec(Some(key.try_into().unwrap()));
+                            }
+                            signers.sort_by(|a, b| a.key.cmp(&b.key));
+                            fields[1].val = ScVal::Map(Some(signers.try_into().unwrap()));
+                        }
+                        credentials.signature = ScVal::Map(Some(fields.try_into().unwrap()));
+                    }
+                    _ => {}
+                }
+            }
+            op.auth = auth.try_into().unwrap();
+            tx.tx.operations = operations.try_into().unwrap();
+            if case == "legs" {
+                let entry = &recorder.window_entries[0];
+                recorder.window_entries[0] =
+                    stellar_agent_core::policy::v1::criteria::state_store::WindowEntry::new(
+                        entry.key().clone(),
+                        entry.timestamp_ms(),
+                        entry.amount() + 1,
+                        entry.limit().clone(),
+                    );
+            }
+            let chain = if case == "chain" {
+                stellar_agent_core::profile::caip2::Caip2::Mainnet
+            } else {
+                stellar_agent_core::profile::caip2::Caip2::Testnet
+            };
+            let encoded = envelope.to_xdr_base64(Limits::none()).unwrap();
+            let (source, sequence) = crate::submit::replay_identity(&envelope).unwrap();
+            let intent = SubmissionIntent {
+                chain_scope: crate::policy_state::ChainScope::for_chain(chain),
+                envelope_hash: crate::submit::envelope_hash_hex(&encoded),
+                tx_hash: crate::submit::compute_local_tx_hash_hex(
+                    &envelope,
+                    chain.network_passphrase(),
+                )
+                .unwrap(),
+                source,
+                sequence,
+                max_time: 0,
+                submission_ledger: 1,
+                submission_anchor: None,
+            };
+            let result = recorder
+                .pre_send_bound(&intent, &crate::IntentBinding::new(&exposure, &envelope))
+                .await;
+            let expected = match case {
+                "credential" | "duplicate" | "added" | "removed" => "auth_subjects",
+                "external_verifier" | "external_key" | "delegated" => "signers",
+                "operation_source" => "envelope_source",
+                other => other,
+            };
+            let refused = if case == "chain" {
+                result
+                    .as_ref()
+                    .is_err_and(|error| error.code() == "policy.window_chain_mismatch")
+            } else {
+                matches!(&result, Err(WalletError::Submission(SubmissionError::IntentBindingMismatch { field })) if *field == expected)
+            };
+            if !refused {
+                mismatches.push(format!("{case}: expected {expected}, got {result:?}"));
+                continue;
+            }
+            assert!(window.pending_reservations(&profile).unwrap().is_empty());
+            let intents = window.signed_intents("intent", &profile).unwrap();
+            assert_eq!(intents.len(), 1, "{case}");
+            assert_eq!(
+                intents[0].status, "authorization exposed, submission unknown",
+                "{case}"
+            );
+            let state = PolicyStateStore::new();
+            window.load_into("intent", &profile, &state).unwrap();
+            assert_eq!(
+                state
+                    .query_window(
+                        &StateKey::new("intent", 1, "native", 60),
+                        stellar_agent_core::timefmt::now_unix_ms().unwrap()
+                    )
+                    .unwrap(),
+                (60, 1),
+                "{case}"
+            );
+        }
+        assert!(
+            mismatches.is_empty(),
+            "final facts lack their required refusal: {mismatches:?}"
+        );
+    }
 
     #[test]
     fn record_unavailable_carries_the_wire_code() {

@@ -36,15 +36,20 @@ pub fn pin_check_manager(
     let audit_log_path = dir.join("pin-check-audit.jsonl");
     let writer = AuditWriter::open(audit_log_path.clone(), None)
         .unwrap_or_else(|e| panic!("temporary audit writer must open: {e}"));
-    SignersManager::new(SignersManagerConfig::new(
-        primary_rpc_url.to_owned(),
-        secondary_rpc_url.to_owned(),
-        Arc::new(Mutex::new(writer)),
-        audit_log_path,
-        TESTNET_PASSPHRASE.to_owned(),
-        profile.to_owned(),
-        TIMEOUT,
-        CHAIN_ID.to_owned(),
-    ))
+    SignersManager::new(
+        SignersManagerConfig::new(
+            primary_rpc_url.to_owned(),
+            secondary_rpc_url.to_owned(),
+            Arc::new(Mutex::new(writer)),
+            audit_log_path,
+            TESTNET_PASSPHRASE.to_owned(),
+            profile.to_owned(),
+            TIMEOUT,
+            CHAIN_ID.to_owned(),
+        )
+        .with_intent_admission(std::sync::Arc::new(
+            stellar_agent_smart_account::signing::intent_test_helpers::no_value_admission_owned(),
+        )),
+    )
     .unwrap_or_else(|e| panic!("SignersManager construction must succeed: {e}"))
 }

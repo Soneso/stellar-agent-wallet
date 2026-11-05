@@ -5200,6 +5200,50 @@ mod tests {
         assert_eq!(commitment(&l), committed);
     }
 
+    #[test]
+    #[serial]
+    fn a_second_path_over_one_entry_cannot_admit_cancel_or_bind_while_the_first_holds_the_lock() {
+        let l = Ledger::new();
+        let plan = crate::SignedIntentPlan::new(
+            l.profile.chain_id.network_passphrase(),
+            "fixture",
+            stellar_strkey::ed25519::PublicKey([0; 32])
+                .to_string()
+                .as_str(),
+            1,
+            [7; 32],
+            vec![],
+            None,
+        )
+        .unwrap()
+        .with_legs(&[hold(1)]);
+        let proof = l.store.admit_signed_intent(&l.profile, &plan).unwrap();
+        let id = proof.intent_id.clone().unwrap();
+        let second = second_path(&l);
+        let facts = crate::BindFacts {
+            facts: plan.facts.clone(),
+            envelope_hash: "ab".repeat(32),
+            tx_hash: "cd".repeat(32),
+        };
+        let committed = commitment(&l);
+        let _guard =
+            WindowStoreLock::acquire_for(l.store.path(), &l.profile.policy_window_state_key_id)
+                .unwrap();
+        assert!(matches!(
+            second.admit_signed_intent(&l.profile, &plan),
+            Err(WindowStoreError::WriterLocked)
+        ));
+        assert!(matches!(
+            second.cancel_signed_intent(&l.profile, proof),
+            Err(WindowStoreError::WriterLocked)
+        ));
+        assert!(matches!(
+            second.bind_signed_intent(&l.profile, &id, &facts, plan.legs()),
+            Err(WindowStoreError::WriterLocked)
+        ));
+        assert_eq!(commitment(&l), committed);
+    }
+
     /// Two handles at two paths over one entry both start from one committed
     /// snapshot, and one approval names two different contents, so neither
     /// the nonce check nor the duplicate content check of the other's file
@@ -5280,7 +5324,74 @@ mod tests {
         let second = second_path(&l);
         let second = &second;
 
+        let plan = crate::SignedIntentPlan::new(
+            profile.chain_id.network_passphrase(),
+            "fixture",
+            stellar_strkey::ed25519::PublicKey([0; 32])
+                .to_string()
+                .as_str(),
+            1,
+            [7; 32],
+            vec![],
+            None,
+        )
+        .unwrap()
+        .with_legs(&[hold(1)]);
+        let proof = std::cell::RefCell::new(Some(crate::IntentProof::new(
+            Some(plan.facts.intent_id()),
+            plan.clone(),
+        )));
+        let facts = crate::BindFacts {
+            facts: plan.facts.clone(),
+            envelope_hash: "ab".repeat(32),
+            tx_hash: "cd".repeat(32),
+        };
         let transitions: Vec<Transition<'_>> = vec![
+            (
+                "acknowledge_accounting_expiry",
+                Box::new(|| {
+                    second.mark_accounting_expiry(profile, "fixture", |record| {
+                        &mut record.audit_acknowledged
+                    })
+                }),
+            ),
+            (
+                "mark_accounting_projection",
+                Box::new(|| {
+                    second.mark_accounting_expiry(profile, "fixture", |record| {
+                        &mut record.receipt_projected
+                    })
+                }),
+            ),
+            (
+                "admit_signed_intent",
+                Box::new(|| second.admit_signed_intent(profile, &plan).map(drop)),
+            ),
+            (
+                "cancel_signed_intent",
+                Box::new(|| {
+                    second.cancel_signed_intent(profile, proof.borrow_mut().take().unwrap())
+                }),
+            ),
+            (
+                "bind_signed_intent",
+                Box::new(|| {
+                    second.bind_signed_intent(profile, &plan.facts.intent_id(), &facts, plan.legs())
+                }),
+            ),
+            (
+                "record_pending_linked",
+                Box::new(|| {
+                    second
+                        .record_pending_linked(
+                            profile,
+                            plan.legs(),
+                            &reservation(&facts.envelope_hash),
+                            &plan.facts.intent_id(),
+                        )
+                        .map(drop)
+                }),
+            ),
             (
                 "record_and_persist",
                 Box::new(|| second.record_and_persist(profile, &[hold(1)]).map(drop)),

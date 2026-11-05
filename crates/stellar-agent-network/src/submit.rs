@@ -210,6 +210,7 @@ pub async fn submit_transaction_and_wait(
         network_passphrase,
         signer_kind,
         recorder,
+        None,
     )
     .await
     .map_err(|error| error.into_wallet_error(client, timeout))
@@ -299,6 +300,9 @@ fn send_by_elapsed(client: &StellarRpcClient, timeout: Duration) -> WalletError 
     })
 }
 
+/// A supplied exposure requires a recorder and binds before the pending row and send.
+/// Binding and envelope cancellation retain the admitted intent's charge.
+///
 /// Submits a signed `TransactionEnvelope` only while `send_by` has not
 /// passed, and polls until confirmed.
 ///
@@ -315,6 +319,9 @@ fn send_by_elapsed(client: &StellarRpcClient, timeout: Duration) -> WalletError 
 ///
 /// # Errors
 ///
+/// - [`SentByError::Failed`] with `submission.intent_record_unavailable` and
+///   class `missing_recorder` when exposure has no recorder. This refusal
+///   precedes envelope decoding and network access.
 /// - [`SentByError::Elapsed`] when `send_by` passes before a
 ///   `sendTransaction` attempt. Before the first attempt nothing was sent,
 ///   and a record the recorder wrote is settled as
@@ -328,6 +335,10 @@ fn send_by_elapsed(client: &StellarRpcClient, timeout: Duration) -> WalletError 
 /// # Panics
 ///
 /// Never panics.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the submission seam carries its exposure and recorder together"
+)]
 pub async fn submit_transaction_and_wait_sent_by(
     client: &StellarRpcClient,
     envelope_xdr: &str,
@@ -336,6 +347,7 @@ pub async fn submit_transaction_and_wait_sent_by(
     network_passphrase: &str,
     signer_kind: Option<SubmissionSignerKind>,
     recorder: Option<&dyn SubmissionRecorder>,
+    exposure: Option<&crate::ExposedIntent>,
 ) -> Result<SubmissionResult, SentByError> {
     submit_unauthorized(
         client,
@@ -345,6 +357,7 @@ pub async fn submit_transaction_and_wait_sent_by(
         network_passphrase,
         signer_kind,
         recorder,
+        exposure,
     )
     .await
 }
@@ -378,6 +391,10 @@ async fn before_send_by<T>(
 
 /// The unauthorized submission, with the pre-send steps bounded by
 /// `send_by` when there is one.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the submission seam carries its exposure and recorder together"
+)]
 async fn submit_unauthorized(
     client: &StellarRpcClient,
     envelope_xdr: &str,
@@ -386,7 +403,11 @@ async fn submit_unauthorized(
     network_passphrase: &str,
     signer_kind: Option<SubmissionSignerKind>,
     recorder: Option<&dyn SubmissionRecorder>,
+    exposure: Option<&crate::ExposedIntent>,
 ) -> Result<SubmissionResult, SentByError> {
+    if exposure.is_some() && recorder.is_none() {
+        return Err(crate::signed_intent::unavailable("missing_recorder").into());
+    }
     // Mainnet write is structurally forbidden at the submit layer: the
     // passphrase comparison is the primary check and the URL heuristic the
     // defence-in-depth layer, both before any decode or RPC call.
@@ -463,7 +484,12 @@ async fn submit_unauthorized(
     // The record is written before the send, so a submission whose outcome
     // never comes back is still one the wallet remembers.
     if let Some(rec) = recorder {
-        rec.pre_send(&intent).await?;
+        if let Some(exposure) = exposure {
+            rec.pre_send_bound(&intent, &crate::IntentBinding::new(exposure, &envelope))
+                .await?;
+        } else {
+            rec.pre_send(&intent).await?;
+        }
     }
 
     // The send-by instant is checked immediately before every send attempt,

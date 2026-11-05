@@ -863,6 +863,17 @@ async fn webauthn_passkey_signing_testnet_acceptance() {
     // install ran through, so its divergence check compares the chain with
     // the baseline the install recorded, and its PasskeyAssertion row lands in
     // the same log.
+    let signing_gate = {
+        use sha2::Digest as _;
+        stellar_agent_smart_account::signing::intent_test_helpers::partial_gate(
+            &entry,
+            vec![stellar_agent_network::SignerDescriptor::External {
+                verifier: verifier_address.clone(),
+                key_data_sha256: sha2::Sha256::digest(&pubkey_data).into(),
+            }],
+            false,
+        )
+    };
     let signing_task = {
         let creds_manager = creds_manager.clone();
         let signers_manager = Arc::clone(&signers_manager);
@@ -873,6 +884,7 @@ async fn webauthn_passkey_signing_testnet_acceptance() {
         tokio::spawn(async move {
             creds_manager
                 .sign_with_passkey_rule(
+                    &signing_gate,
                     credential_name,
                     &entry,
                     signers_manager,

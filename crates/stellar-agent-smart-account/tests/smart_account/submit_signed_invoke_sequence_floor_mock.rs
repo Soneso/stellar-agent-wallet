@@ -152,6 +152,9 @@ async fn initial_fetch_consults_the_sequence_floor_hook() {
 
     let result = submit_signed_invoke(
         SubmitInvokeArgs::builder()
+            .admission(stellar_agent_network::SigningAdmission::NoValue(
+                stellar_agent_smart_account::signing::intent_test_helpers::no_value_admission(),
+            ))
             .target_contract(DUMMY_C_STRKEY)
             .auth_rule_ids(&auth_rule_ids)
             .host_function(dummy_host_function())
@@ -210,6 +213,9 @@ async fn no_hook_reproduces_plain_fetch_behaviour() {
 
     let result = submit_signed_invoke(
         SubmitInvokeArgs::builder()
+            .admission(stellar_agent_network::SigningAdmission::NoValue(
+                stellar_agent_smart_account::signing::intent_test_helpers::no_value_admission(),
+            ))
             .target_contract(DUMMY_C_STRKEY)
             .auth_rule_ids(&auth_rule_ids)
             .host_function(dummy_host_function())

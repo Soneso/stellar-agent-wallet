@@ -261,6 +261,7 @@ impl ReadHandlerContext {
             self.timeout,
             Arc::clone(&self.audit_writer),
             &self.audit_log_path,
+            None,
         )
     }
 
@@ -278,6 +279,7 @@ impl ReadHandlerContext {
             self.timeout,
             Arc::clone(&self.audit_writer),
             &self.audit_log_path,
+            None,
         )
     }
 }
@@ -285,8 +287,8 @@ impl ReadHandlerContext {
 /// The secondary endpoint a signing verb's ledger witness reads.
 ///
 /// Read-only verbs take the context's secondary or the primary and never call
-/// this. A signing verb calls it before the keyring and the signer, so an
-/// endpoint set that cannot witness a ledger refuses without touching a key.
+/// this. A signing verb calls it before signing key access, so an endpoint
+/// set that cannot witness a ledger refuses without loading the signer.
 ///
 /// # Errors
 ///
@@ -308,6 +310,8 @@ pub(crate) fn signing_secondary_rpc_url(context: &NetworkContext) -> Result<&str
 
 /// Common wallet handler context shared by rules and signers handlers.
 pub struct CommonHandlerContext {
+    /// Count admission passed to each signing manager.
+    pub intent_admission: Option<Arc<stellar_agent_network::NoValueAdmission>>,
     /// Resolved signing implementation.
     pub signer: Box<dyn Signer + Send + Sync>,
     /// Parsed smart-account address.
@@ -340,6 +344,7 @@ impl CommonHandlerContext {
         profile: Profile,
         origin: ProfileOrigin,
         context: &NetworkContext,
+        admission: Option<Arc<stellar_agent_network::NoValueAdmission>>,
     ) -> Result<Self, WalletError> {
         let profile_name = resolved.name.clone();
         let (audit_writer, audit_log_path) = open_audit_writer(&profile, origin, &profile_name)?;
@@ -366,6 +371,7 @@ impl CommonHandlerContext {
         );
 
         Ok(Self {
+            intent_admission: admission,
             signer,
             smart_account,
             profile_name,
@@ -392,6 +398,7 @@ impl CommonHandlerContext {
             self.timeout,
             Arc::clone(&self.audit_writer),
             &self.audit_log_path,
+            self.intent_admission.clone(),
         )
     }
 
@@ -410,6 +417,7 @@ impl CommonHandlerContext {
             self.timeout,
             Arc::clone(&self.audit_writer),
             &self.audit_log_path,
+            self.intent_admission.clone(),
         )
     }
 }
@@ -469,8 +477,9 @@ pub(crate) fn construct_signers_manager_from_fields(
     timeout: Duration,
     audit_writer: Arc<Mutex<AuditWriter>>,
     audit_log_path: &std::path::Path,
+    admission: Option<Arc<stellar_agent_network::NoValueAdmission>>,
 ) -> Result<SignersManager, WalletError> {
-    let config = SignersManagerConfig::new(
+    let mut config = SignersManagerConfig::new(
         context.rpc_url.clone(),
         context
             .secondary_rpc_url
@@ -484,6 +493,9 @@ pub(crate) fn construct_signers_manager_from_fields(
         timeout,
         context.chain_id.caip2_str().to_owned(),
     );
+    if let Some(admission) = admission {
+        config = config.with_intent_admission(admission);
+    }
     SignersManager::new(config).map_err(|e| {
         WalletError::Validation(ValidationError::ConfigInvalid {
             component: "SignersManager",
@@ -513,6 +525,7 @@ fn construct_context_rule_manager_from_fields(
     timeout: Duration,
     audit_writer: Arc<Mutex<AuditWriter>>,
     audit_log_path: &std::path::Path,
+    admission: Option<Arc<stellar_agent_network::NoValueAdmission>>,
 ) -> Result<ContextRuleManager, WalletError> {
     let signers_manager = construct_signers_manager_from_fields(
         profile_name,
@@ -520,6 +533,7 @@ fn construct_context_rule_manager_from_fields(
         timeout,
         Arc::clone(&audit_writer),
         audit_log_path,
+        admission.clone(),
     )
     .map_err(|e| {
         WalletError::Validation(ValidationError::ConfigInvalid {
@@ -544,6 +558,9 @@ fn construct_context_rule_manager_from_fields(
         config = config.with_session_rule_max_horizon_ledgers(ledgers);
     }
 
+    if let Some(admission) = admission {
+        config = config.with_intent_admission(admission);
+    }
     ContextRuleManager::new(config).map_err(|e| {
         WalletError::Validation(ValidationError::ConfigInvalid {
             component: "ContextRuleManager",
@@ -839,6 +856,34 @@ pub(crate) fn open_audit_writer_read_only(
         origin,
     )?;
     Ok((writer, log_path))
+}
+
+/// Checks the audit binding and witness configuration before sizing a signing command.
+pub(crate) fn submission_admission(
+    profile: &Profile,
+    origin: ProfileOrigin,
+    profile_name: &str,
+    tool: &'static str,
+    context: &NetworkContext,
+) -> Result<Arc<stellar_agent_network::NoValueAdmission>, WalletError> {
+    open_audit_writer(profile, origin, profile_name)?;
+    if !context.chain_id.is_mainnet() {
+        signing_secondary_rpc_url(context).map_err(|error| wrap_sa_error(&error))?;
+    }
+    let now_ms = stellar_agent_core::timefmt::now_unix_ms().map_err(|_| {
+        WalletError::Submission(
+            stellar_agent_core::SubmissionError::IntentRecordUnavailable {
+                class: "policy_unavailable",
+            },
+        )
+    })?;
+    crate::commands::submission_record::no_value_admission(
+        profile,
+        profile_name,
+        tool,
+        context.chain_id.caip2_str(),
+        now_ms,
+    )
 }
 
 #[cfg(test)]

@@ -928,6 +928,7 @@ async fn p3_policy_hash_drift_detection_at_signing_time() {
 
     let outcome = creds_mgr
         .sign_with_passkey_rule(
+            &stellar_agent_smart_account::signing::intent_test_helpers::gate(vec![]),
             "does-not-matter", // credential lookup never reached (drift fires first)
             &entry,
             Arc::clone(&sm),
@@ -1209,6 +1210,7 @@ async fn p4_unknown_verifier_override_real_hash_stored_drift_regression() {
     // that means drift did NOT fire (drift fires first, before store check).
     let outcome_real_hash = creds_mgr
         .sign_with_passkey_rule(
+            &stellar_agent_smart_account::signing::intent_test_helpers::gate(vec![]),
             "does-not-matter",
             &entry,
             Arc::clone(&sm),
@@ -1263,6 +1265,7 @@ async fn p4_unknown_verifier_override_real_hash_stored_drift_regression() {
     // Signing attempt 2: zero-sentinel pin row → drift check MUST fire.
     let outcome_zero_pin = creds_mgr
         .sign_with_passkey_rule(
+            &stellar_agent_smart_account::signing::intent_test_helpers::gate(vec![]),
             "does-not-matter",
             &entry,
             Arc::clone(&sm),
@@ -1493,6 +1496,7 @@ async fn p5_drift_check_infra_failure_routes_to_drift_check_unavailable_not_drif
 
     let outcome = creds_mgr
         .sign_with_passkey_rule(
+            &stellar_agent_smart_account::signing::intent_test_helpers::gate(vec![]),
             "does-not-matter",
             &entry,
             Arc::clone(&sm),

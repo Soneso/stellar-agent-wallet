@@ -200,6 +200,7 @@ async fn policy_rpc_divergence_routes_to_drift_check_unavailable() {
 
     let result = manager
         .sign_with_passkey_rule(
+            &stellar_agent_smart_account::signing::intent_test_helpers::gate(vec![]),
             "missing-before-show",
             &testnet_entry(),
             signers_manager,

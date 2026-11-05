@@ -586,6 +586,9 @@ async fn verify_pins_report(
             std::time::Duration::from_secs(5),
             "stellar:testnet".to_owned(),
         )
+        .with_intent_admission(std::sync::Arc::new(
+            stellar_agent_smart_account::signing::intent_test_helpers::no_value_admission_owned(),
+        ))
         .with_signers_manager(signers_manager)
         .with_audit_writer(audit_writer),
     )

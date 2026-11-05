@@ -40,6 +40,7 @@ async-trait           = { workspace = true }
 tokio                 = { workspace = true, features = ["rt", "time"] }
 
 [dev-dependencies]
+stellar-agent-smart-account = { workspace = true, features = ["test-helpers"] }
 stellar-agent-test-support = { path = "../stellar-agent-test-support", features = ["test-helpers"] }
 # CountingSigner for the adapter submit tests.
 stellar-agent-network       = { workspace = true, features = ["test-helpers"] }

@@ -411,6 +411,9 @@ async fn agent_delegation_full_flow_testnet_acceptance() {
     let rule_ids_ok = vec![ContextRuleId::new(rule_id)];
     let ok_result = submit_signed_invoke(
         SubmitInvokeArgs::builder()
+            .admission(stellar_agent_network::SigningAdmission::NoValue(
+                stellar_agent_smart_account::signing::intent_test_helpers::no_value_admission(),
+            ))
             .target_contract(XLM_SAC_TESTNET)
             .auth_address(smart_account_strkey.as_str())
             .auth_rule_ids(&rule_ids_ok)
@@ -459,6 +462,9 @@ async fn agent_delegation_full_flow_testnet_acceptance() {
     let rule_ids_over = vec![ContextRuleId::new(rule_id)];
     let over_err = submit_signed_invoke(
         SubmitInvokeArgs::builder()
+            .admission(stellar_agent_network::SigningAdmission::NoValue(
+                stellar_agent_smart_account::signing::intent_test_helpers::no_value_admission(),
+            ))
             .target_contract(XLM_SAC_TESTNET)
             .auth_address(smart_account_strkey.as_str())
             .auth_rule_ids(&rule_ids_over)
@@ -532,6 +538,9 @@ async fn agent_delegation_full_flow_testnet_acceptance() {
     let rule_ids_scope = vec![ContextRuleId::new(rule_id)];
     let scope_err = submit_signed_invoke(
         SubmitInvokeArgs::builder()
+            .admission(stellar_agent_network::SigningAdmission::NoValue(
+                stellar_agent_smart_account::signing::intent_test_helpers::no_value_admission(),
+            ))
             .target_contract(smart_account_strkey.as_str())
             .auth_rule_ids(&rule_ids_scope)
             .host_function(self_call_host_function)

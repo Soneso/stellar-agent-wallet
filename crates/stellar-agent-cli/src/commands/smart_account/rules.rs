@@ -266,9 +266,18 @@ async fn prepare_write_context<A>(
 where
     A: CommonArgsView + Sync,
 {
-    let ctx = CommonHandlerContext::new(args, resolved, profile, origin, context)
-        .await
-        .map_err(|e| emit_error(&e, output, request_id))?;
+    let ctx = async {
+        let admission = crate::commands::smart_account::common::submission_admission(
+            &profile,
+            origin,
+            &resolved.name,
+            "stellar_smart_account_rules",
+            context,
+        )?;
+        CommonHandlerContext::new(args, resolved, profile, origin, context, Some(admission)).await
+    }
+    .await
+    .map_err(|e| emit_error(&e, output, request_id))?;
     let manager = ctx
         .context_rule_manager()
         .map_err(|e| emit_error(&e, output, request_id))?;
@@ -1057,7 +1066,18 @@ async fn create_run(args: &CreateArgs) -> i32 {
     // `prepare_write_context` because it has substantial pre-validation above.
     // The explicit `context_rule_manager()` call is required to wire the
     // `SignersManager` for wasm-hash pin enforcement.
-    let ctx = match CommonHandlerContext::new(args, resolved, profile, origin, &context).await {
+    let ctx = match async {
+        let admission = crate::commands::smart_account::common::submission_admission(
+            &profile,
+            origin,
+            &resolved.name,
+            "stellar_smart_account_rules",
+            &context,
+        )?;
+        CommonHandlerContext::new(args, resolved, profile, origin, &context, Some(admission)).await
+    }
+    .await
+    {
         Ok(ctx) => ctx,
         Err(e) => return emit_error(&e, args.common.output, &request_id),
     };
@@ -2523,7 +2543,18 @@ async fn add_policy_run(args: &AddPolicyArgs) -> i32 {
     };
 
     // Build CommonHandlerContext (signer + manager + audit writer).
-    let ctx = match CommonHandlerContext::new(args, resolved, profile, origin, &context).await {
+    let ctx = match async {
+        let admission = crate::commands::smart_account::common::submission_admission(
+            &profile,
+            origin,
+            &resolved.name,
+            "stellar_smart_account_rules",
+            &context,
+        )?;
+        CommonHandlerContext::new(args, resolved, profile, origin, &context, Some(admission)).await
+    }
+    .await
+    {
         Ok(ctx) => ctx,
         Err(e) => return emit_error(&e, args.output, &request_id),
     };
@@ -2770,7 +2801,18 @@ async fn remove_policy_run(args: &RemovePolicyArgs) -> i32 {
     };
 
     // Build CommonHandlerContext.
-    let ctx = match CommonHandlerContext::new(args, resolved, profile, origin, &context).await {
+    let ctx = match async {
+        let admission = crate::commands::smart_account::common::submission_admission(
+            &profile,
+            origin,
+            &resolved.name,
+            "stellar_smart_account_rules",
+            &context,
+        )?;
+        CommonHandlerContext::new(args, resolved, profile, origin, &context, Some(admission)).await
+    }
+    .await
+    {
         Ok(ctx) => ctx,
         Err(e) => return emit_error(&e, args.output, &request_id),
     };
@@ -2942,6 +2984,7 @@ async fn get_spending_limit_run(args: &GetSpendingLimitArgs) -> i32 {
         Duration::from_secs(args.common.timeout_seconds),
         audit_writer,
         &audit_log_path,
+        None,
     ) {
         Ok(m) => m,
         Err(e) => return emit_error(&e, args.common.output, &request_id),
@@ -3140,7 +3183,18 @@ async fn set_spending_limit_run(args: &SetSpendingLimitArgs) -> i32 {
         );
     }
 
-    let ctx = match CommonHandlerContext::new(args, resolved, profile, origin, &context).await {
+    let ctx = match async {
+        let admission = crate::commands::smart_account::common::submission_admission(
+            &profile,
+            origin,
+            &resolved.name,
+            "stellar_smart_account_rules",
+            &context,
+        )?;
+        CommonHandlerContext::new(args, resolved, profile, origin, &context, Some(admission)).await
+    }
+    .await
+    {
         Ok(ctx) => ctx,
         Err(e) => return emit_error(&e, args.output, &request_id),
     };

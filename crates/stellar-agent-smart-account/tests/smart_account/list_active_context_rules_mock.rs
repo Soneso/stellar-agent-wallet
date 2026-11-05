@@ -112,7 +112,10 @@ fn manager_for_server(server: &MockServer) -> ContextRuleManager {
         NETWORK_PASSPHRASE.to_owned(),
         std::time::Duration::from_secs(5),
         CHAIN_ID.to_owned(),
-    );
+    )
+    .with_intent_admission(std::sync::Arc::new(
+        stellar_agent_smart_account::signing::intent_test_helpers::no_value_admission_owned(),
+    ));
     ContextRuleManager::new(config).expect("ContextRuleManager::new must succeed")
 }
 
@@ -816,7 +819,10 @@ async fn t8_collective_scan_budget_fires_before_max_scan_id_exhaustion() {
         NETWORK_PASSPHRASE.to_owned(),
         std::time::Duration::from_millis(100),
         CHAIN_ID.to_owned(),
-    );
+    )
+    .with_intent_admission(std::sync::Arc::new(
+        stellar_agent_smart_account::signing::intent_test_helpers::no_value_admission_owned(),
+    ));
     let manager = ContextRuleManager::new(config).expect("ContextRuleManager::new must succeed");
 
     let result = manager
@@ -904,6 +910,9 @@ async fn t9_baseline_column_reports_each_rules_state_row() {
             std::time::Duration::from_secs(5),
             CHAIN_ID.to_owned(),
         )
+        .with_intent_admission(std::sync::Arc::new(
+            stellar_agent_smart_account::signing::intent_test_helpers::no_value_admission_owned(),
+        ))
         .with_audit_writer(writer),
     )
     .expect("ContextRuleManager::new must succeed");
@@ -1019,6 +1028,9 @@ async fn t10_a_malformed_state_row_reports_unreadable_and_the_listing_answers() 
             std::time::Duration::from_secs(5),
             CHAIN_ID.to_owned(),
         )
+        .with_intent_admission(std::sync::Arc::new(
+            stellar_agent_smart_account::signing::intent_test_helpers::no_value_admission_owned(),
+        ))
         .with_audit_writer(writer),
     )
     .expect("ContextRuleManager::new must succeed");

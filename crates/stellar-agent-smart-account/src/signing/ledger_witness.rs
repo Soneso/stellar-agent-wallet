@@ -54,7 +54,7 @@ pub const MAX_SIGNING_LEDGER_SKEW: u32 = 2;
 
 /// Longest age of an observation a signature may rest on: two ledger closes
 /// at the network's five-second cadence, the span the skew tolerance admits.
-const MAX_OBSERVATION_AGE: Duration = Duration::from_secs(10);
+pub(crate) const MAX_OBSERVATION_AGE: Duration = Duration::from_secs(10);
 
 /// The fixed reason of a refusal: `LedgerWitnessUnavailable` or
 /// `LedgerWitnessMismatch` never echoes endpoint input, which can hold a

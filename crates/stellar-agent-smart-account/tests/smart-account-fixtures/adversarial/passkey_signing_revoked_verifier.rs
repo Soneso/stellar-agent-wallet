@@ -178,6 +178,7 @@ async fn passkey_signing_refuses_a_revoked_verifier_before_bridge_io() {
         CredentialsManager::new(dir.path().join("passkeys"), "default", "localhost", None);
     let result = manager
         .sign_with_passkey_rule(
+            &stellar_agent_smart_account::signing::intent_test_helpers::gate(vec![]),
             "missing-before-show",
             &testnet_entry(),
             signers,

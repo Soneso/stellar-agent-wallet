@@ -63,7 +63,7 @@ approval attestations) see `./approvals-and-audit.md` and `./security.md`.
   `stellar_transaction_status`, `stellar_friendbot`, and
   `stellar_sep24_interactive_url`. `stellar_toolset_invoke` refuses a signing
   action and answers a read-only one. The read-only tools (`stellar_balances`,
-  `stellar_fee_stats`, `stellar_dex_quote`, `stellar_rules_list`,
+  `stellar_fee_stats`, `stellar_dex_quote`, `stellar_signed_intents_list`, `stellar_rules_list`,
   `stellar_rules_get`, `stellar_sep43_get_address`, `stellar_sep43_get_network`,
   `stellar_sep47_discover`, `stellar_sep48_preview_invocation`,
   `stellar_sep53_verify_message`, `stellar_sep6_deposit_info`,
@@ -579,6 +579,7 @@ Arguments: `chain_id`, and an optional allowlisted `rpc_url` override.
 | Tool | Purpose | Gating |
 | --- | --- | --- |
 | `stellar_rules_list` | Enumerate active context rules on a smart account: `rule_id`, `name`, `context_type_label`, `valid_until`, `signer_count`, `policy_count`, `baseline`, plus `as_of_ledger`. `baseline` is the rule's signer-set baseline in the profile's audit log (`none`, `v1`, `v2`, `unreadable`, or `unknown` when the log cannot be opened); a rule reporting `none` refuses signing until its baseline is recorded. An integrity error in the log refuses the listing with `sa.audit_log`. A rule the shared context-rule decoder refuses fails the listing, and so `stellar_rules_get` for every rule of the account, with `sa.deployment_failed` naming the rule id. | Read-only. |
+| `stellar_signed_intents_list` | List the profile's signed smart-account intents from the verified window state, with status, legs and accounting horizon. | Read-only. |
 | `stellar_rules_get` | Read one context rule's metadata and signer-set `baseline`, its policies (`address`, `identified_kind`), and, when exactly one policy identifies as `spending-limit`, the budget snapshot. A rule holding a signer the wallet cannot decode is refused with `sa.deployment_failed`. An integrity error in the log refuses the call with `sa.audit_log`. | Read-only. |
 
 Both tools are grantable to a toolset via the `read-rules` capability token,

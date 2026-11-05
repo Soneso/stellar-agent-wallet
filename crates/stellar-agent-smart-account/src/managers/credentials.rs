@@ -1851,8 +1851,11 @@ impl CredentialsManager {
                   bridge, timeout, URL callback, and accept_single_verifier opt-in; \
                   accept_single_verifier bypasses the diversification enforce-default trigger"
     )]
+    /// The gate checks the credential and key data before inserting an approval request.
+    /// Once the request is authorized, the admitted charge remains.
     pub async fn sign_with_passkey_rule(
         &self,
+        gate: &crate::signing::gate::SigningGate,
         credential_name: &str,
         partial: &crate::managers::auth_entry::PartialSorobanAuthorizationEntry,
         // `signers_manager`: runs the per-signing divergence and drift checks
@@ -1923,6 +1926,7 @@ impl CredentialsManager {
         // on the opt-in path before proceeding.
         let (inner_result, credential_id_b64url_for_audit, rp_id_for_audit, divergence_request_id) =
             self.sign_with_passkey_rule_inner(
+                gate,
                 credential_name,
                 smart_account,
                 &digest,
@@ -2039,6 +2043,7 @@ impl CredentialsManager {
     )]
     async fn sign_with_passkey_rule_inner(
         &self,
+        gate: &crate::signing::gate::SigningGate,
         credential_name: &str,
         smart_account: &str,
         auth_digest: &SmartAccountAuthDigest,
@@ -2424,6 +2429,30 @@ impl CredentialsManager {
 
         let nonce = entry.approval_nonce.clone();
 
+        let subject = match crate::managers::rules::parse_c_strkey_to_smart_account(smart_account)
+            .and_then(|address| {
+                stellar_agent_network::AuthSubject::smart_account(&address)
+                    .map_err(|field| crate::SaError::IntentBindingMismatch { field })
+            }) {
+            Ok(subject) => subject,
+            Err(error) => early_err!(CredentialsError::AuthEntryInvalid {
+                source: Box::new(error)
+            }),
+        };
+        let mut key_data = pubkey_arr.to_vec();
+        key_data.extend_from_slice(&credential_id_bytes);
+        use sha2::Digest as _;
+        if let Err(error) = gate.authorize(crate::signing::gate::SigningRequest {
+            subject,
+            signer: crate::signing::gate::SignerMatch::ExternalKeyData(
+                sha2::Sha256::digest(key_data).into(),
+            ),
+            payload: stellar_agent_network::SigningPayload::AuthDigest(*auth_digest.as_bytes()),
+        }) {
+            early_err!(CredentialsError::AuthEntryInvalid {
+                source: Box::new(error)
+            });
+        }
         {
             let mut guard = approval_store.lock().await;
             if let Err(e) = guard.insert(entry, unix_now_ms()) {
@@ -3728,6 +3757,7 @@ registered_at_unix_ms = 1700000000000
 
         let result = mgr
             .sign_with_passkey_rule(
+                &passkey_gate(&testnet_partial(&[0]), &metadata),
                 "entry-check",
                 &testnet_partial(&[0]),
                 sm,
@@ -3759,6 +3789,35 @@ registered_at_unix_ms = 1700000000000
     /// reaches the ceremony and times out. Returns the result, the number of
     /// `on_url` calls (the ceremony starts exactly when it is called) and the
     /// number of audit lines written.
+    fn passkey_gate(
+        partial: &crate::managers::auth_entry::PartialSorobanAuthorizationEntry,
+        metadata: &CredentialMetadata,
+    ) -> crate::signing::gate::SigningGate {
+        if partial.validate().is_err() {
+            return crate::signing::intent_test_helpers::gate(vec![]);
+        }
+        use sha2::Digest as _;
+        let mut key_data = decode_validated_sec1("entry-check", &metadata.public_key_sec1_b64)
+            .unwrap()
+            .to_vec();
+        key_data.extend(
+            URL_SAFE_NO_PAD
+                .decode(&metadata.credential_id_b64url)
+                .unwrap(),
+        );
+        crate::signing::intent_test_helpers::partial_gate(
+            partial,
+            vec![stellar_agent_network::SignerDescriptor::External {
+                verifier: stellar_strkey::Contract([99; 32])
+                    .to_string()
+                    .as_str()
+                    .to_owned(),
+                key_data_sha256: sha2::Sha256::digest(key_data).into(),
+            }],
+            false,
+        )
+    }
+
     async fn sign_entry(
         partial: &crate::managers::auth_entry::PartialSorobanAuthorizationEntry,
     ) -> (
@@ -3776,6 +3835,7 @@ registered_at_unix_ms = 1700000000000
         let url_calls = AtomicUsize::new(0);
         let result = mgr
             .sign_with_passkey_rule(
+                &passkey_gate(partial, &make_metadata("entry-check")),
                 "entry-check",
                 partial,
                 sm,
@@ -3792,6 +3852,53 @@ registered_at_unix_ms = 1700000000000
             url_calls.load(Ordering::SeqCst),
             audit_line_count(&dir),
         )
+    }
+
+    #[tokio::test]
+    async fn the_gate_refuses_what_the_plan_does_not_name() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        for wrong_credential in [false, true] {
+            let dir = TempDir::new().unwrap();
+            let mgr = test_manager(&dir);
+            let metadata = make_metadata("entry-check");
+            write_metadata(&mgr, &metadata);
+            let (_writer, sm) = test_signers_manager_with_writer(&dir);
+            let mut partial = testnet_partial(&[0]);
+            let gate = if wrong_credential {
+                passkey_gate(&partial, &metadata)
+            } else {
+                crate::signing::intent_test_helpers::gate(vec![])
+            };
+            if wrong_credential {
+                partial.smart_account = stellar_xdr::ScAddress::Contract(stellar_xdr::ContractId(
+                    stellar_xdr::Hash([9; 32]),
+                ));
+            }
+            partial.validate().unwrap();
+            let url_calls = AtomicUsize::new(0);
+            let error = mgr
+                .sign_with_passkey_rule(
+                    &gate,
+                    "entry-check",
+                    &partial,
+                    sm,
+                    "127.0.0.1:19911".parse().unwrap(),
+                    Duration::from_millis(100),
+                    |_| {
+                        url_calls.fetch_add(1, Ordering::SeqCst);
+                    },
+                    false,
+                )
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(error, CredentialsError::AuthEntryInvalid { source } if matches!(*source, crate::SaError::IntentBindingMismatch { field: "signing_request" }))
+            );
+            assert_eq!(url_calls.load(Ordering::SeqCst), 0);
+            assert!(mgr.approval_store.as_ref().unwrap().lock().await.is_empty());
+            assert!(gate.take_unexposed().is_some());
+            assert!(gate.exposure().is_none());
+        }
     }
 
     #[tokio::test]
@@ -3867,6 +3974,7 @@ registered_at_unix_ms = 1700000000000
 
         let result = mgr
             .sign_with_passkey_rule(
+                &crate::signing::intent_test_helpers::gate(vec![]),
                 "does-not-matter",
                 &testnet_partial(&[0]), // rule_id=0: bootstrap-skip fires, no network call made
                 sm,
@@ -3907,6 +4015,7 @@ registered_at_unix_ms = 1700000000000
         // "nonexistent" has no entry in the empty registry → NotFound.
         let result = mgr
             .sign_with_passkey_rule(
+                &crate::signing::intent_test_helpers::gate(vec![]),
                 "nonexistent",
                 &testnet_partial(&[0]), // rule_id=0: bootstrap-skip, no network call
                 sm,
@@ -3962,6 +4071,7 @@ registered_at_unix_ms = 1700000000000
 
         let result = mgr
             .sign_with_passkey_rule(
+                &crate::signing::intent_test_helpers::gate(vec![]),
                 "no-pubkey",
                 &testnet_partial(&[0]), // bootstrap-skip, no network call
                 sm,
@@ -4007,6 +4117,7 @@ registered_at_unix_ms = 1700000000000
 
         let result = mgr
             .sign_with_passkey_rule(
+                &crate::signing::intent_test_helpers::gate(vec![]),
                 "empty-rule-ids",
                 &testnet_partial(&[]),
                 sm,
@@ -4044,6 +4155,7 @@ registered_at_unix_ms = 1700000000000
 
         let _ = mgr
             .sign_with_passkey_rule(
+                &crate::signing::intent_test_helpers::gate(vec![]),
                 "nonexistent",
                 &testnet_partial(&[0]), // bootstrap-skip, no network call; NotFound fires after
                 sm,
@@ -4163,6 +4275,7 @@ registered_at_unix_ms = 1700000000000
         // Required.  accept_single_verifier=true → override path.
         let _result = mgr
             .sign_with_passkey_rule(
+                &crate::signing::intent_test_helpers::gate(vec![]),
                 "irrelevant",
                 &testnet_partial(&[1]), // non-zero: diversification check runs
                 sm,
@@ -4230,6 +4343,7 @@ registered_at_unix_ms = 1700000000000
         let mut result = None;
         let logs = stellar_agent_test_support::log_capture::with_captured_trace_logs(|| {
             result = Some(runtime.block_on(mgr.sign_with_passkey_rule(
+                &crate::signing::intent_test_helpers::gate(vec![]),
                 "irrelevant",
                 &testnet_partial(&[REFUSED_RULE_ID]),
                 sm,
@@ -4269,6 +4383,7 @@ registered_at_unix_ms = 1700000000000
         let mut result = None;
         let logs = stellar_agent_test_support::log_capture::with_captured_trace_logs(|| {
             result = Some(runtime.block_on(mgr.sign_with_passkey_rule(
+                &crate::signing::intent_test_helpers::gate(vec![]),
                 credential_name,
                 &testnet_partial(rule_ids),
                 sm,
@@ -4318,6 +4433,7 @@ registered_at_unix_ms = 1700000000000
         tracing::dispatcher::with_default(&dispatch, || {
             tracing::callsite::rebuild_interest_cache();
             result = Some(runtime.block_on(mgr.sign_with_passkey_rule(
+                &crate::signing::intent_test_helpers::gate(vec![]),
                 credential_name,
                 &testnet_partial(rule_ids),
                 sm,
@@ -4579,6 +4695,7 @@ registered_at_unix_ms = 1700000000000
 
         let result = mgr
             .sign_with_passkey_rule(
+                &crate::signing::intent_test_helpers::gate(vec![]),
                 "irrelevant",
                 &testnet_partial(&[1]),
                 sm,
@@ -4622,6 +4739,7 @@ registered_at_unix_ms = 1700000000000
         // rule_id=1: diversification check runs; empty log → Required fires.
         let result = mgr
             .sign_with_passkey_rule(
+                &crate::signing::intent_test_helpers::gate(vec![]),
                 "irrelevant",
                 &testnet_partial(&[1]), // non-zero: diversification check runs
                 sm,
@@ -5093,6 +5211,7 @@ registered_at_unix_ms = 1700000000000
 
         let result = mgr
             .sign_with_passkey_rule(
+                &crate::signing::intent_test_helpers::gate(vec![]),
                 "does-not-matter",
                 &testnet_partial(&[]), // empty rule_ids → InvalidRuleIds
                 sm,

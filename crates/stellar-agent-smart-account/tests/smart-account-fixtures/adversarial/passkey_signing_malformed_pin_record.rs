@@ -128,6 +128,7 @@ async fn malformed_pin_record_routes_to_drift_check_unavailable() {
 
             let result = manager
                 .sign_with_passkey_rule(
+                    &stellar_agent_smart_account::signing::intent_test_helpers::gate(vec![]),
                     "laptop-passkey",
                     &testnet_entry(),
                     signers_manager,
@@ -222,6 +223,7 @@ async fn an_incomplete_pin_record_refuses_passkey_signing_before_any_ceremony() 
         let ceremony_started = AtomicBool::new(false);
         let result = manager
             .sign_with_passkey_rule(
+                &stellar_agent_smart_account::signing::intent_test_helpers::gate(vec![]),
                 "laptop-passkey",
                 &testnet_entry(),
                 signers_manager,

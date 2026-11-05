@@ -63,7 +63,10 @@ fn manager_with_url(
         "test-profile".to_owned(),
         Duration::from_secs(5),
         "stellar:testnet".to_owned(),
-    );
+    )
+    .with_intent_admission(std::sync::Arc::new(
+        stellar_agent_smart_account::signing::intent_test_helpers::no_value_admission_owned(),
+    ));
     SignersManager::new(config).expect("SignersManager::new must succeed with valid URL")
 }
 

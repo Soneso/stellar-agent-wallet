@@ -1071,6 +1071,7 @@ impl WalletServer {
         let mut router = Self::balances_tool_router();
         router.merge(Self::fee_stats_tool_router());
         router.merge(Self::transaction_status_tool_router());
+        router.merge(Self::signed_intents_tool_router());
         router.merge(Self::friendbot_tool_router());
         router.merge(Self::create_account_tool_router());
         router.merge(Self::pay_tool_router());
@@ -1533,6 +1534,7 @@ impl ServerHandler for WalletServer {
              accounting, and ledger-outcome state); \
              stellar_fee_stats (fetch network fee statistics for fee estimation, \
              read-only); \
+             stellar_signed_intents_list (read authenticated smart-account intent charges without writing state); \
              stellar_transaction_status (reconcile one submitted transaction against \
              the chain and settle the wallet's record of it; the way out of \
              submission.tx_timeout, never re-simulate); \

@@ -798,6 +798,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- Smart-account signing durably charges spending and count limits before the first signature. A failed re-simulation or send keeps the charge, and final submission binds to it without a second charge.
+- A signing flow without a checked admission refuses with `submission.intent_record_unavailable`. A signing request or final transaction that differs from its admitted intent refuses with `submission.intent_binding_mismatch`.
+- `smart-account execute`, timelock `schedule` and timelock `execute` refuse an unvalued call under a matching value rule without `allow_opaque_signing`, with `policy.deny.unsizable_value_effect`. Administration verbs and timelock `cancel` count against V1 rate limits.
+- A window snapshot carrying a signed intent uses wire version 9, which older builds refuse. `profile reset-window-state` refuses while a signed intent stands.
+- `smart-account list-intents` and the MCP tool `stellar_signed_intents_list` list signed intents without writing.
+- `SubmitInvokeArgs::admission`, `TimelockScheduleArgs::submission_recorder` and `TimelockCancelArgs::intent_admission` are required. The public signing primitives and `sign_with_passkey_rule` take a `SigningGate`.
+- Quorum signing runs as `plan_quorum_signatures` and then `sign_quorum_plan`, which signs exactly the admitted plan.
+- The checked sizing methods of `PolicyEngine` refuse by default, and `NoopPolicyEngine` reports no applicable limit.
+
 - Timelock signing validates SourceAccount invocation trees and refuses unsupported
   credential variants before any auth or envelope signature is produced.
 

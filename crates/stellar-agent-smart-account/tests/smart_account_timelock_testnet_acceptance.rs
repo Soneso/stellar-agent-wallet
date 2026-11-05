@@ -266,6 +266,9 @@ async fn t1_schedule_cancel_lifecycle() {
     // Step 1: Schedule.
     let scheduled = schedule_upgrade(
         stellar_agent_smart_account::timelock::TimelockScheduleArgs::builder()
+            .submission_recorder(
+                &stellar_agent_smart_account::signing::intent_test_helpers::NoLimitRecorder,
+            )
             .timelock_contract_strkey(&timelock_strkey)
             .target_strkey(&target_strkey)
             .function("update_delay")
@@ -310,6 +313,9 @@ async fn t1_schedule_cancel_lifecycle() {
     // Step 2: Cancel.
     cancel(
         stellar_agent_smart_account::timelock::TimelockCancelArgs::builder()
+            .intent_admission(
+                stellar_agent_smart_account::signing::intent_test_helpers::no_value_admission(),
+            )
             .timelock_contract_strkey(&timelock_strkey)
             .operation_id(&operation_id)
             .signer(signer_box.as_ref())
@@ -431,6 +437,9 @@ async fn t2_schedule_ready_state_min_delay_zero() {
     // Schedule: target=timelock itself, function="get_min_delay" (harmless view fn).
     let scheduled = schedule_upgrade(
         stellar_agent_smart_account::timelock::TimelockScheduleArgs::builder()
+            .submission_recorder(
+                &stellar_agent_smart_account::signing::intent_test_helpers::NoLimitRecorder,
+            )
             .timelock_contract_strkey(&timelock_strkey)
             .target_strkey(&timelock_strkey)
             .function("get_min_delay")
@@ -517,6 +526,9 @@ async fn t3_cancel_unknown_operation_id_rejected() {
 
     let result = cancel(
         stellar_agent_smart_account::timelock::TimelockCancelArgs::builder()
+            .intent_admission(
+                stellar_agent_smart_account::signing::intent_test_helpers::no_value_admission(),
+            )
             .timelock_contract_strkey(&timelock_strkey)
             .operation_id(&random_op_id)
             .signer(signer_box.as_ref())
@@ -586,6 +598,9 @@ async fn t4_execute_not_ready_rejected() {
     // the state pre-check runs after simulate_hash_operation (fallback path).
     let result = execute(
         stellar_agent_smart_account::timelock::TimelockExecuteArgs::builder()
+            .submission_recorder(
+                &stellar_agent_smart_account::signing::intent_test_helpers::NoLimitRecorder,
+            )
             .timelock_contract_strkey(&timelock_strkey)
             .target_strkey(&timelock_strkey)
             .function("get_min_delay")
@@ -669,6 +684,9 @@ async fn t5_schedule_emits_audit_row() {
 
     let scheduled = schedule_upgrade(
         stellar_agent_smart_account::timelock::TimelockScheduleArgs::builder()
+            .submission_recorder(
+                &stellar_agent_smart_account::signing::intent_test_helpers::NoLimitRecorder,
+            )
             .timelock_contract_strkey(&timelock_strkey)
             .target_strkey(&timelock_strkey)
             .function(FUNCTION_NAME)
@@ -867,6 +885,9 @@ async fn t6_cross_confirm_event_divergence_rejection() {
     // Schedule an operation on live testnet (primary RPC only at this point).
     let scheduled = schedule_upgrade(
         stellar_agent_smart_account::timelock::TimelockScheduleArgs::builder()
+            .submission_recorder(
+                &stellar_agent_smart_account::signing::intent_test_helpers::NoLimitRecorder,
+            )
             .timelock_contract_strkey(&timelock_strkey)
             .target_strkey(&timelock_strkey)
             .function("update_delay")
@@ -904,6 +925,9 @@ async fn t6_cross_confirm_event_divergence_rejection() {
     let signer_box2 = signer_from_seed(seed_bytes);
     let cancel_result = cancel(
         stellar_agent_smart_account::timelock::TimelockCancelArgs::builder()
+            .intent_admission(
+                stellar_agent_smart_account::signing::intent_test_helpers::no_value_admission(),
+            )
             .timelock_contract_strkey(&timelock_strkey)
             .operation_id(&operation_id)
             .signer(signer_box2.as_ref())
@@ -1007,6 +1031,9 @@ async fn t7_schedule_execute_min_delay_zero() {
     let signer_box_schedule = signer_from_seed(seed_bytes);
     let scheduled: ScheduledTimelockOperation = schedule_upgrade(
         stellar_agent_smart_account::timelock::TimelockScheduleArgs::builder()
+            .submission_recorder(
+                &stellar_agent_smart_account::signing::intent_test_helpers::NoLimitRecorder,
+            )
             .timelock_contract_strkey(&timelock_strkey)
             .target_strkey(target_strkey)
             .function("symbol")
@@ -1036,6 +1063,9 @@ async fn t7_schedule_execute_min_delay_zero() {
     let signer_box_exec = signer_from_seed(seed_bytes);
     let execute_result = execute(
         stellar_agent_smart_account::timelock::TimelockExecuteArgs::builder()
+            .submission_recorder(
+                &stellar_agent_smart_account::signing::intent_test_helpers::NoLimitRecorder,
+            )
             .timelock_contract_strkey(&timelock_strkey)
             .target_strkey(target_strkey)
             .function("symbol")

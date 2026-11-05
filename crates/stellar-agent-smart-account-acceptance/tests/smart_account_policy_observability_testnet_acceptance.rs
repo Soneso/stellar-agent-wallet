@@ -796,6 +796,9 @@ async fn policy_observability_full_flow_testnet_acceptance() {
     let rule_ids = vec![ContextRuleId::new(rule_id)];
     let transfer_a_result = submit_signed_invoke(
         SubmitInvokeArgs::builder()
+            .admission(stellar_agent_network::SigningAdmission::NoValue(
+                stellar_agent_smart_account::signing::intent_test_helpers::no_value_admission(),
+            ))
             .target_contract(XLM_SAC_TESTNET)
             .auth_address(smart_account_strkey.as_str())
             .auth_rule_ids(&rule_ids)
@@ -935,6 +938,9 @@ async fn policy_observability_full_flow_testnet_acceptance() {
     let rule_ids_squeeze = vec![ContextRuleId::new(rule_id)];
     let squeeze_err = submit_signed_invoke(
         SubmitInvokeArgs::builder()
+            .admission(stellar_agent_network::SigningAdmission::NoValue(
+                stellar_agent_smart_account::signing::intent_test_helpers::no_value_admission(),
+            ))
             .target_contract(XLM_SAC_TESTNET)
             .auth_address(smart_account_strkey.as_str())
             .auth_rule_ids(&rule_ids_squeeze)

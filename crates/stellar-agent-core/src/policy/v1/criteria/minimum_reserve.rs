@@ -140,6 +140,9 @@ impl Criterion for MinimumReserveCriterion {
     ///   of the value descriptor carries no resolvable amount — an unresolvable
     ///   native debit refuses rather than passing as a zero debit.
     fn evaluate(&self, ctx: &EvalContext<'_>) -> Result<Option<DenyReason>, PolicyError> {
+        if let ValueGate::Deny(reason) = classify_value(ctx) {
+            return Ok(Some(reason));
+        }
         // Fail-closed: account_view = None means the dispatch site has not
         // wired up the account state.  Silently passing would allow every
         // call to bypass the reserve guard when the wiring is absent.

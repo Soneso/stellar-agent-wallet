@@ -92,6 +92,10 @@ impl RateLimitCriterion {
 }
 
 impl Criterion for RateLimitCriterion {
+    fn windowed(&self) -> bool {
+        true
+    }
+
     fn kind(&self) -> &'static str {
         "rate_limit"
     }

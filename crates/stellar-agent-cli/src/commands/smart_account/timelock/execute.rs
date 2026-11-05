@@ -317,6 +317,7 @@ pub async fn run(args: &ExecuteArgs) -> i32 {
     let chain_id = profile.chain_id.caip2_str();
     let recorder = match crate::commands::submission_record::build_recorder(
         crate::commands::submission_record::SubmitRecord {
+            unvalued: Some(stellar_agent_core::policy::v1::OpaqueReason::UnvaluedContractCall),
             policy_decision: stellar_agent_core::audit_log::PolicyDecision::Allow,
             profile: &profile,
             profile_name: profile_name.clone(),

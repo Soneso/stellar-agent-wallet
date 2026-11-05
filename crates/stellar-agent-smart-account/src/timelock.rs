@@ -241,6 +241,8 @@ pub struct PendingTimelockOperation {
 #[derive(bon::Builder)]
 #[non_exhaustive]
 pub struct TimelockScheduleArgs<'a> {
+    /// Charges the intent before its first signature.
+    pub submission_recorder: &'a dyn stellar_agent_network::SubmissionRecorder,
     /// C-strkey of the timelock controller contract.
     pub timelock_contract_strkey: &'a str,
     /// C-strkey of the target contract to invoke when the operation executes.
@@ -279,6 +281,8 @@ pub struct TimelockScheduleArgs<'a> {
 #[derive(bon::Builder)]
 #[non_exhaustive]
 pub struct TimelockCancelArgs<'a> {
+    /// Charges the intent before its first signature.
+    pub intent_admission: &'a stellar_agent_network::NoValueAdmission,
     /// C-strkey of the timelock controller contract.
     pub timelock_contract_strkey: &'a str,
     /// The operation identifier to cancel (must be in `Pending` state).
@@ -345,7 +349,7 @@ pub struct TimelockExecuteArgs<'a> {
     /// ID is available; state check is deferred to after hash derivation.
     pub expected_operation_id: Option<&'a TimelockOperationId>,
     /// Records an execution's signed transaction and settles its outcome.
-    pub submission_recorder: Option<&'a dyn stellar_agent_network::SubmissionRecorder>,
+    pub submission_recorder: &'a dyn stellar_agent_network::SubmissionRecorder,
 }
 
 // ── Salt derivation ───────────────────────────────────────────────────────────
@@ -472,6 +476,9 @@ fn keeps_its_wire_code(e: &SaError) -> bool {
     matches!(
         e,
         SaError::MainnetWriteForbidden
+            | SaError::PolicyDenied { .. }
+            | SaError::IntentRecordUnavailable { .. }
+            | SaError::IntentBindingMismatch { .. }
             | SaError::LedgerWitnessUnavailable { .. }
             | SaError::LedgerWitnessMismatch { .. }
     )
@@ -479,8 +486,8 @@ fn keeps_its_wire_code(e: &SaError) -> bool {
 
 /// Maps a failure of the `schedule` submission into the schedule error surface.
 ///
-/// [`SaError::MainnetWriteForbidden`] and the two ledger witness refusals pass
-/// through unchanged and keep their codes. Every other error becomes
+/// Mainnet, policy, intent, and ledger witness refusals keep their codes.
+/// Every other error becomes
 /// [`SaError::TimelockScheduleFailed`], classified from its text.
 fn schedule_submit_error(e: SaError, request_id: &str) -> SaError {
     if keeps_its_wire_code(&e) {
@@ -498,8 +505,8 @@ fn schedule_submit_error(e: SaError, request_id: &str) -> SaError {
 
 /// Maps a failure of the `cancel` submission into the cancel error surface.
 ///
-/// [`SaError::MainnetWriteForbidden`] and the two ledger witness refusals pass
-/// through unchanged and keep their codes. Every other error becomes
+/// Mainnet, policy, intent, and ledger witness refusals keep their codes.
+/// Every other error becomes
 /// [`SaError::TimelockCancelFailed`], classified from its text.
 fn cancel_submit_error(e: SaError, request_id: &str) -> SaError {
     if keeps_its_wire_code(&e) {
@@ -522,9 +529,8 @@ fn cancel_submit_error(e: SaError, request_id: &str) -> SaError {
 
 /// Maps a failure of the `execute` submission into the execute error surface.
 ///
-/// [`SaError::SubmissionUnresolved`], [`SaError::MainnetWriteForbidden`] and
-/// the two ledger witness refusals pass through unchanged and keep their
-/// codes. Every other error becomes [`SaError::TimelockExecuteFailed`],
+/// Unresolved submissions, mainnet, policy, intent, and ledger witness refusals
+/// keep their codes. Every other error becomes [`SaError::TimelockExecuteFailed`],
 /// classified from its text.
 fn execute_submit_error(e: SaError, request_id: &str) -> SaError {
     if matches!(e, SaError::SubmissionUnresolved { .. }) || keeps_its_wire_code(&e) {
@@ -1543,6 +1549,7 @@ pub async fn schedule_upgrade(
     refuse_mainnet_sa(args.network_passphrase, args.primary_rpc_url)?;
 
     let TimelockScheduleArgs {
+        submission_recorder,
         timelock_contract_strkey,
         target_strkey,
         function,
@@ -1723,7 +1730,7 @@ pub async fn schedule_upgrade(
             network_passphrase,
             timeout: std::time::Duration::from_secs(60),
             op_label: "timelock_schedule",
-            submission_recorder: None,
+            admission: stellar_agent_network::SigningAdmission::Recorded(submission_recorder),
         },
     )
     .await
@@ -1848,6 +1855,7 @@ pub async fn cancel(args: TimelockCancelArgs<'_>) -> Result<(), SaError> {
     refuse_mainnet_sa(args.network_passphrase, args.primary_rpc_url)?;
 
     let TimelockCancelArgs {
+        intent_admission,
         timelock_contract_strkey,
         operation_id,
         signer,
@@ -1949,7 +1957,7 @@ pub async fn cancel(args: TimelockCancelArgs<'_>) -> Result<(), SaError> {
             network_passphrase,
             timeout: std::time::Duration::from_secs(60),
             op_label: "timelock_cancel",
-            submission_recorder: None,
+            admission: stellar_agent_network::SigningAdmission::NoValue(intent_admission),
         },
     )
     .await
@@ -2390,7 +2398,7 @@ pub async fn execute(args: TimelockExecuteArgs<'_>) -> Result<String, SaError> {
             network_passphrase,
             timeout: std::time::Duration::from_secs(60),
             op_label: "timelock_execute",
-            submission_recorder,
+            admission: stellar_agent_network::SigningAdmission::Recorded(submission_recorder),
         },
     )
     .await
@@ -2951,7 +2959,7 @@ mod tests {
 
     use super::*;
 
-    /// A witness refusal keeps its code through every timelock mapper.
+    /// Witness and intent refusals keep their codes through every timelock mapper.
     #[test]
     fn the_submit_error_mappers_keep_a_witness_refusal() {
         for (error, code) in [
@@ -2963,7 +2971,19 @@ mod tests {
                 || SaError::LedgerWitnessMismatch { reason: "fixed" },
                 "simulation.divergence.ledger_skew",
             ),
-        ] as [(fn() -> SaError, &str); 2]
+            (
+                || SaError::IntentRecordUnavailable {
+                    class: "window_unavailable",
+                },
+                "submission.intent_record_unavailable",
+            ),
+            (
+                || SaError::IntentBindingMismatch {
+                    field: "signing_request",
+                },
+                "submission.intent_binding_mismatch",
+            ),
+        ] as [(fn() -> SaError, &str); 4]
         {
             for mapped in [
                 schedule_submit_error(error(), "req"),
@@ -3484,6 +3504,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let writer = audit_writer(&dir);
         let args = TimelockScheduleArgs::builder()
+            .submission_recorder(&crate::signing::intent_test_helpers::NoLimitRecorder)
             .timelock_contract_strkey(ZERO_CONTRACT)
             .target_strkey(ZERO_CONTRACT)
             .function("upgrade")
@@ -3512,6 +3533,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let writer = audit_writer(&dir);
         let args = TimelockCancelArgs::builder()
+            .intent_admission(crate::signing::intent_test_helpers::no_value_admission())
             .timelock_contract_strkey(ZERO_CONTRACT)
             .operation_id(&operation_id)
             .signer(&PanickingSigner)
@@ -3537,6 +3559,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let writer = audit_writer(&dir);
         let args = TimelockExecuteArgs::builder()
+            .submission_recorder(&crate::signing::intent_test_helpers::NoLimitRecorder)
             .timelock_contract_strkey(ZERO_CONTRACT)
             .target_strkey(ZERO_CONTRACT)
             .function("upgrade")
@@ -3657,6 +3680,7 @@ mod tests {
                 let secondary = stellar_agent_test_support::second_loopback_host(&uri);
                 cancel(
                     TimelockCancelArgs::builder()
+                        .intent_admission(crate::signing::intent_test_helpers::no_value_admission())
                         .timelock_contract_strkey(ZERO_CONTRACT)
                         .operation_id(&operation_id)
                         .signer(&signer)
