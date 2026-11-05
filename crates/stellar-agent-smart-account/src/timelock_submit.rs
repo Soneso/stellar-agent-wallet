@@ -23,12 +23,12 @@
 //!    obtains the mandatory ledger witness: the primary and the secondary
 //!    endpoint observe the latest ledger, and the pair must agree within
 //!    [`MAX_SIGNING_LEDGER_SKEW`](crate::signing::ledger_witness::MAX_SIGNING_LEDGER_SKEW).
-//! 3. Checks every returned `SorobanCredentials::Address` entry before signing
-//!    any: its address is the signer's G-key, and its root invocation is the
-//!    timelock call the wallet built, with no sub-invocations. Only then does it
-//!    compute, per entry, the canonical `HashIdPreimageSorobanAuthorization`
-//!    preimage over that call and sign it via
-//!    `Signer::sign_soroban_address_auth_payload`.
+//! 3. Validates every authorization entry before any signature. SourceAccount
+//!    and signer Address credentials name the wallet's exact invocation with
+//!    no sub-invocations. Other credential variants are refused. Only then
+//!    does it compute, per Address entry, the canonical
+//!    `HashIdPreimageSorobanAuthorization` preimage over that call and sign it
+//!    via `Signer::sign_soroban_address_auth_payload`.
 //! 4. Re-simulates with signed auth entries to obtain the accurate Soroban
 //!    resource footprint (which includes storage reads triggered by the G-key
 //!    `require_auth` validation path).
@@ -50,11 +50,12 @@
 //! `  invocation: <the wallet's own timelock call, no sub-invocations>,`
 //! `}`
 //!
-//! The G-key signature is a classic-account Address authorization: no
-//! context rule narrows it, and it is not bound to a transaction. The wallet
-//! therefore signs only the invocation it built itself; a simulated root on
-//! another contract, with another function or arguments, or with
-//! sub-invocations is refused before the preimage is computed.
+//! Every timelock authorization entry is validated before any signature.
+//! SourceAccount and signer Address credentials must name the wallet's exact
+//! invocation with no sub-invocations. Other credential variants are refused.
+//! The G-key signature is a classic-account Address authorization: no context
+//! rule narrows it, and it is not bound to a transaction, so the wallet signs
+//! only the invocation it built.
 //! Canonical source: `stellar_xdr::HashIdPreimageSorobanAuthorization`
 //! (mirroring the preimage used in `managers/auth_entry.rs::compute_signature_payload`
 //! and `managers/auth_entry.rs::build_and_sign_delegated_g_key_entry`).
@@ -79,9 +80,10 @@ use stellar_baselib::transaction_builder::{TransactionBuilder, TransactionBuilde
 use stellar_rpc_client::Client;
 use stellar_xdr::{
     AccountId, Hash, HashIdPreimage, HashIdPreimageSorobanAuthorization, HostFunction,
-    InvokeHostFunctionOp, Limits, Operation, OperationBody, PublicKey as XdrPublicKey, ScAddress,
-    ScVal, SorobanAddressCredentials, SorobanAuthorizationEntry, SorobanAuthorizedFunction,
-    SorobanAuthorizedInvocation, SorobanCredentials, Uint256, VecM, WriteXdr,
+    InvokeContractArgs, InvokeHostFunctionOp, Limits, Operation, OperationBody,
+    PublicKey as XdrPublicKey, ScAddress, ScVal, SorobanAddressCredentials,
+    SorobanAuthorizationEntry, SorobanAuthorizedFunction, SorobanAuthorizedInvocation,
+    SorobanCredentials, Uint256, VecM, WriteXdr,
 };
 
 use crate::SaError;
@@ -153,15 +155,65 @@ pub(crate) struct TimelockSubmitArgs<'a> {
 
 // ── Main submit function ──────────────────────────────────────────────────────
 
-/// A simulated authorization entry after the check pass of step 4.
-enum CheckedEntry {
-    /// An entry this path does not sign (source-account credentials, or a
-    /// credential variant the OZ timelock does not use), passed through as is.
-    PassThrough(Box<SorobanAuthorizationEntry>),
-    /// An Address entry for the signer's G-key whose root is the wallet's own
-    /// call; the sign pass signs the wallet's invocation with these
-    /// credentials.
+/// An authorization entry whose credential kind and invocation pass validation.
+enum ValidatedTimelockAuth {
+    /// The transaction source authorizes the wallet's own invocation.
+    SourceAccount,
+    /// The signer's G-key authorizes the wallet's own invocation.
     SignerKey(SorobanAddressCredentials),
+}
+
+/// Validates the entire simulated vector before any signing primitive runs.
+fn validate_timelock_auth_entries(
+    entries: Vec<SorobanAuthorizationEntry>,
+    invoke: &InvokeContractArgs,
+    signer_address: &ScAddress,
+    op_label: &str,
+) -> Result<Vec<ValidatedTimelockAuth>, SaError> {
+    let mut validated = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let credentials = match &entry.credentials {
+            SorobanCredentials::SourceAccount => None,
+            SorobanCredentials::Address(creds) => {
+                if &creds.address != signer_address {
+                    return Err(SaError::AuthEntryConstructionFailed {
+                        stage: "auth_payload",
+                        redacted_reason: format!(
+                            "{op_label}: simulate returned auth entry for an unexpected address \
+                             (not the signer G-key); cannot sign"
+                        ),
+                    });
+                }
+                Some(creds.clone())
+            }
+            SorobanCredentials::AddressV2(_) | SorobanCredentials::AddressWithDelegates(_) => {
+                return Err(SaError::AuthEntryConstructionFailed {
+                    stage: "credential_variant",
+                    redacted_reason: "timelock signing supports SourceAccount and signer Address credentials only"
+                        .to_owned(),
+                });
+            }
+        };
+        // The OZ timelock calls the role's require_auth() in its own schedule,
+        // execute or cancel frame, so the honest root is the host function
+        // itself, with nothing under it.
+        check_simulated_root(&entry.root_invocation.function, invoke)
+            .and_then(|()| {
+                check_declared_sub_invocations(
+                    &entry.root_invocation.sub_invocations,
+                    &DeclaredSubInvocations::None,
+                    signer_address,
+                )
+            })
+            .map_err(|err| {
+                attribute_signed_tree_refusal(err, op_label, &fingerprint_invocation(&entry))
+            })?;
+        validated.push(match credentials {
+            None => ValidatedTimelockAuth::SourceAccount,
+            Some(creds) => ValidatedTimelockAuth::SignerKey(creds),
+        });
+    }
+    Ok(validated)
 }
 
 /// Submits a timelock `InvokeHostFunction` with direct G-key authorization.
@@ -181,12 +233,12 @@ enum CheckedEntry {
 ///    mandatory ledger witness before any credential is processed: the
 ///    primary and the secondary observe the latest ledger under one deadline,
 ///    and the signature expiry is 100 ledgers beyond the lower observation.
-/// 4. Check every `SorobanCredentials::Address` entry: its address is the
-///    signer G-key, and its root invocation equals the host function with no
-///    sub-invocations. Only after every entry passes, compute the auth
-///    preimage over the wallet's own invocation for each and sign it, each
-///    signature under the deadline. The first signature rests on a fresh
-///    pair: a stale pair is read again before it.
+/// 4. Validate every entry before any signature. SourceAccount and signer
+///    Address credentials must name the wallet's exact invocation with no
+///    sub-invocations. Other credential variants are refused. Then compute
+///    each Address preimage over the wallet's invocation and sign under the
+///    deadline. The first signature rests on a fresh pair: a stale pair is
+///    read again before it.
 /// 5. Re-simulate with signed auth entries to get the full storage footprint.
 /// 6. Build final envelope: inject signed auth entries + soroban_data, after
 ///    a source-account re-fetch under the same deadline.
@@ -209,13 +261,16 @@ enum CheckedEntry {
 ///   `simulation.divergence.ledger_skew`): the pair differs by more than the
 ///   skew tolerance, a height is out of bounds, or the simulation height
 ///   contradicts the pair. Nothing was signed.
-/// - [`SaError::AuthEntryConstructionFailed`] — pubkey fetch, XDR encoding,
-///   simulate, or signing failure, or the deadline elapsing before a
-///   signature completes or before `sendTransaction`; nothing was sent.
+/// - [`SaError::AuthEntryConstructionFailed`]: unsupported credential variant,
+///   pubkey fetch, XDR encoding, simulate, or signing failure, or the deadline
+///   elapsing before a signature completes or before `sendTransaction`;
+///   nothing is sent. Timelock signing supports SourceAccount and signer
+///   Address credentials only. Use a simulation result containing supported
+///   credentials.
 /// - [`SaError::SimulationDivergence`] with sub-code `AuthContexts` (wire code
-///   `simulation.divergence.auth_contexts`): an entry for the signer's G-key
-///   whose root invocation differs from the host function or carries
-///   sub-invocations; refused before any entry is signed. The public
+///   `simulation.divergence.auth_contexts`): a SourceAccount or signer Address
+///   entry whose root invocation differs from the host function or carries
+///   sub-invocations; refused before any signature. The public
 ///   [`crate::timelock::schedule_upgrade`], [`crate::timelock::execute`], and
 ///   [`crate::timelock::cancel`] map it, like every other error here except
 ///   [`SaError::MainnetWriteForbidden`], the two ledger witness refusals (and,
@@ -428,64 +483,19 @@ pub(crate) async fn submit_timelock_invoke_with_g_key_auth(
     //
     // Every entry is checked before any is signed: a response whose first
     // entry is honest and whose second is not produces no signature at all.
-    let mut checked_entries: Vec<CheckedEntry> = Vec::with_capacity(auth_entries.len());
-    for entry in auth_entries {
-        let creds = match &entry.credentials {
-            SorobanCredentials::Address(c) => c.clone(),
-            SorobanCredentials::SourceAccount
-            | SorobanCredentials::AddressV2(_)
-            | SorobanCredentials::AddressWithDelegates(_) => {
-                // SourceAccount entries need no explicit signing — the
-                // source-account envelope signature covers them.
-                // AddressV2 / AddressWithDelegates are credential variants not
-                // used by the OZ TimelockController; pass through unchanged.
-                checked_entries.push(CheckedEntry::PassThrough(Box::new(entry)));
-                continue;
-            }
-        };
-
-        // Only sign entries whose credential address is the signer G-key.
-        // Other entries (e.g. for other role addresses) cannot be signed
-        // here; the caller must ensure the signer holds the required role.
-        let is_our_g_key = matches!(&creds.address, ScAddress::Account(AccountId(
-            XdrPublicKey::PublicKeyTypeEd25519(Uint256(bytes))
-        )) if *bytes == pubkey.0);
-
-        if !is_our_g_key {
-            return Err(auth_err(
-                "auth_payload",
-                format!(
-                    "{}: simulate returned auth entry for an unexpected address \
-                     (not the signer G-key); cannot sign",
-                    args.op_label
-                ),
-            ));
-        }
-
-        // The OZ timelock calls the role's `require_auth()` in its own
-        // `schedule` / `execute` / `cancel` frame, so the honest root is the
-        // host function itself, with nothing under it. Any other root is an
-        // authorization the wallet did not build.
-        check_simulated_root(&entry.root_invocation.function, &invoke)
-            .and_then(|()| {
-                check_declared_sub_invocations(
-                    &entry.root_invocation.sub_invocations,
-                    &DeclaredSubInvocations::None,
-                    &creds.address,
-                )
-            })
-            .map_err(|err| {
-                attribute_signed_tree_refusal(err, args.op_label, &fingerprint_invocation(&entry))
-            })?;
-        checked_entries.push(CheckedEntry::SignerKey(creds));
-    }
+    // The source account and this address derive from the same resolved key.
+    let signer_address = ScAddress::Account(AccountId(XdrPublicKey::PublicKeyTypeEd25519(
+        Uint256(pubkey.0),
+    )));
+    let checked_entries =
+        validate_timelock_auth_entries(auth_entries, &invoke, &signer_address, args.op_label)?;
 
     // The first signature is an entry's when the simulation asks the
     // signer's key for one, and the envelope's otherwise. The pair is readied
     // where that signature falls.
     let signs_entries = checked_entries
         .iter()
-        .any(|checked| matches!(checked, CheckedEntry::SignerKey(_)));
+        .any(|checked| matches!(checked, ValidatedTimelockAuth::SignerKey(_)));
     let ledger_bound = if signs_entries {
         pair_for_first_signature(simulation_witness, &witness_request, pre_submit_budget).await?
     } else {
@@ -497,11 +507,14 @@ pub(crate) async fn submit_timelock_invoke_with_g_key_auth(
         Vec::with_capacity(checked_entries.len());
     for checked in checked_entries {
         let creds = match checked {
-            CheckedEntry::PassThrough(entry) => {
-                signed_entries.push(*entry);
+            ValidatedTimelockAuth::SourceAccount => {
+                signed_entries.push(SorobanAuthorizationEntry {
+                    credentials: SorobanCredentials::SourceAccount,
+                    root_invocation: wallet_root.clone(),
+                });
                 continue;
             }
-            CheckedEntry::SignerKey(creds) => creds,
+            ValidatedTimelockAuth::SignerKey(creds) => creds,
         };
 
         // Compute the auth preimage over the wallet's own invocation.
@@ -963,7 +976,12 @@ mod tests {
 
         use serde_json::{Value, json};
         use sha2::{Digest, Sha256};
+        use stellar_agent_core::error::WalletError;
         use stellar_agent_network::signing::test_doubles::CountingSigner;
+        use stellar_agent_network::signing::{
+            MessagePayload, Signer, SmartAccountAuthDigest, SorobanAuthPayload, TxSigningPayload,
+            WebAuthnAssertion,
+        };
         use stellar_agent_test_support::second_loopback_host;
         use stellar_agent_test_support::signed_envelope::{
             account_id_for_seed, get_network_result, ledger_entries_result_for,
@@ -973,9 +991,10 @@ mod tests {
             AccountId, ContractId, Hash, HashIdPreimage, HashIdPreimageSorobanAuthorization,
             HostFunction, Int128Parts, InvokeContractArgs, Limits, OperationBody,
             PublicKey as XdrPublicKey, ReadXdr, ScAddress, ScSymbol, ScVal,
-            SorobanAddressCredentials, SorobanAuthorizationEntry, SorobanAuthorizedFunction,
-            SorobanAuthorizedInvocation, SorobanCredentials, SorobanTransactionData,
-            TransactionEnvelope, Uint256, VecM, WriteXdr,
+            SorobanAddressCredentials, SorobanAddressCredentialsWithDelegates,
+            SorobanAuthorizationEntry, SorobanAuthorizedFunction, SorobanAuthorizedInvocation,
+            SorobanCredentials, SorobanTransactionData, TransactionEnvelope, Uint256, VecM,
+            WriteXdr,
         };
         use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate, matchers::method};
 
@@ -1044,10 +1063,13 @@ mod tests {
             dyn Fn(&InvokeContractArgs) -> Vec<SorobanAuthorizedInvocation> + Send + Sync;
 
         /// Answers the first simulation with one entry for the operator's key
-        /// per root `trees` builds from the request, echoes the signed
-        /// entries on the re-simulation and records them.
+        /// per root `trees` builds from the request, or `entries` when set.
+        /// Echoes the signed entries on the re-simulation and records them.
         struct Rpc {
             trees: Arc<TreesFn>,
+            /// Entries the first simulation returns as given, in place of the
+            /// ones built from trees.
+            entries: Option<Vec<SorobanAuthorizationEntry>>,
             simulations: Arc<AtomicUsize>,
             /// `getLatestLedger` requests answered.
             ledger_reads: Arc<AtomicUsize>,
@@ -1152,23 +1174,25 @@ mod tests {
                         let auth = if value != ScVal::Void {
                             Vec::new()
                         } else if op.auth.is_empty() {
-                            (self.trees)(invoke)
-                                .into_iter()
-                                .zip(NONCE..)
-                                .map(|(root_invocation, nonce)| SorobanAuthorizationEntry {
-                                    credentials: if self.chain.source_account_auth {
-                                        SorobanCredentials::SourceAccount
-                                    } else {
-                                        SorobanCredentials::Address(SorobanAddressCredentials {
-                                            address: operator(),
-                                            nonce,
-                                            signature_expiration_ledger: 0,
-                                            signature: ScVal::Void,
-                                        })
-                                    },
-                                    root_invocation,
-                                })
-                                .collect()
+                            self.entries.clone().unwrap_or_else(|| {
+                                (self.trees)(invoke)
+                                    .into_iter()
+                                    .zip(NONCE..)
+                                    .map(|(root_invocation, nonce)| SorobanAuthorizationEntry {
+                                        credentials: if self.chain.source_account_auth {
+                                            SorobanCredentials::SourceAccount
+                                        } else {
+                                            SorobanCredentials::Address(SorobanAddressCredentials {
+                                                address: operator(),
+                                                nonce,
+                                                signature_expiration_ledger: 0,
+                                                signature: ScVal::Void,
+                                            })
+                                        },
+                                        root_invocation,
+                                    })
+                                    .collect()
+                            })
                         } else {
                             delay = self.chain.resimulation_delay;
                             self.resimulated
@@ -1193,6 +1217,25 @@ mod tests {
                         })
                     }
                     "sendTransaction" => {
+                        let TransactionEnvelope::Tx(tx) = TransactionEnvelope::from_xdr_base64(
+                            body["params"]["transaction"].as_str().unwrap(),
+                            Limits::none(),
+                        )
+                        .unwrap() else {
+                            panic!("v1 envelope")
+                        };
+                        assert_eq!(
+                            tx.tx.source_account,
+                            stellar_xdr::MuxedAccount::Ed25519(Uint256(public_key_for_seed(SEED)))
+                        );
+                        let OperationBody::InvokeHostFunction(op) = &tx.tx.operations[0].body
+                        else {
+                            panic!("invoke operation")
+                        };
+                        assert_eq!(
+                            op.auth.as_slice(),
+                            self.resimulated.lock().unwrap().as_slice()
+                        );
                         json!({"status": "PENDING", "hash": send_transaction_hash_hex(&body, passphrase), "latestLedger": ledger, "latestLedgerCloseTime": "1234567890"})
                     }
                     "getTransaction" => {
@@ -1209,20 +1252,126 @@ mod tests {
             }
         }
 
+        /// Counts authorization and source signatures independently over one key.
+        struct AuthAndSourceSigner {
+            auth: CountingSigner,
+            source: CountingSigner,
+        }
+
+        #[async_trait::async_trait]
+        impl Signer for AuthAndSourceSigner {
+            async fn sign_tx_payload(
+                &self,
+                payload: &TxSigningPayload,
+            ) -> Result<[u8; 64], WalletError> {
+                self.source.sign_tx_payload(payload).await
+            }
+
+            async fn sign_auth_digest(
+                &self,
+                digest: &SmartAccountAuthDigest,
+            ) -> Result<[u8; 64], WalletError> {
+                self.auth.sign_auth_digest(digest).await
+            }
+
+            async fn sign_soroban_address_auth_payload(
+                &self,
+                payload: &SorobanAuthPayload,
+            ) -> Result<[u8; 64], WalletError> {
+                self.auth.sign_soroban_address_auth_payload(payload).await
+            }
+
+            async fn sign_message(
+                &self,
+                payload: &MessagePayload,
+            ) -> Result<[u8; 64], WalletError> {
+                self.auth.sign_message(payload).await
+            }
+
+            async fn sign_webauthn_assertion(
+                &self,
+                digest: &SmartAccountAuthDigest,
+                credential_id: &[u8],
+            ) -> Result<WebAuthnAssertion, WalletError> {
+                self.auth
+                    .sign_webauthn_assertion(digest, credential_id)
+                    .await
+            }
+
+            async fn public_key(&self) -> Result<stellar_strkey::ed25519::PublicKey, WalletError> {
+                self.source.public_key().await
+            }
+        }
+
         struct Outcome {
             result: Result<super::super::TimelockSubmitResult, SaError>,
             signs: usize,
+            auth_signs: usize,
+            source_signs: usize,
+            ledger_reads: usize,
             key_reads: usize,
             simulations: usize,
             resimulated: Vec<SorobanAuthorizationEntry>,
         }
 
         impl Outcome {
+            fn assert_no_signatures(&self) {
+                assert_eq!(self.auth_signs, 0, "auth signatures: {:?}", self.result);
+                assert_eq!(self.source_signs, 0, "source signatures: {:?}", self.result);
+                assert_eq!(self.simulations, 1, "no signed re-simulation");
+                assert!(self.resimulated.is_empty());
+                assert_eq!(self.ledger_reads, 2, "both witness observations succeed");
+            }
+
+            fn assert_credential_refusal(&self) {
+                self.assert_no_signatures();
+                let Err(SaError::AuthEntryConstructionFailed {
+                    stage,
+                    redacted_reason,
+                }) = &self.result
+                else {
+                    panic!("expected unsupported credentials: {:?}", self.result)
+                };
+                assert_eq!(*stage, "credential_variant");
+                assert_eq!(
+                    redacted_reason,
+                    "timelock signing supports SourceAccount and signer Address credentials only"
+                );
+                assert_eq!(
+                    self.result.as_ref().unwrap_err().wire_code(),
+                    "sa.auth_entry_construction_failed"
+                );
+            }
+
+            fn assert_signer_refusal(&self) {
+                self.assert_no_signatures();
+                let Err(SaError::AuthEntryConstructionFailed {
+                    stage,
+                    redacted_reason,
+                }) = &self.result
+                else {
+                    panic!("expected signer refusal: {:?}", self.result)
+                };
+                assert_eq!(*stage, "auth_payload");
+                assert_eq!(
+                    redacted_reason,
+                    "schedule: simulate returned auth entry for an unexpected address \
+                     (not the signer G-key); cannot sign"
+                );
+                assert_eq!(
+                    self.result.as_ref().unwrap_err().wire_code(),
+                    "sa.auth_entry_construction_failed"
+                );
+            }
+
             /// Asserts the refusal before any signing primitive and any
             /// second simulation, and returns its reason.
             fn refused_before_signing(&self) -> String {
-                assert_eq!(self.signs, 0, "nothing is signed: {:?}", self.result);
-                assert_eq!(self.simulations, 1, "no re-simulation: {:?}", self.result);
+                self.assert_no_signatures();
+                assert_eq!(
+                    self.result.as_ref().unwrap_err().wire_code(),
+                    "simulation.divergence.auth_contexts"
+                );
                 match &self.result {
                     Err(SaError::SimulationDivergence {
                         sub_code: SimulationDivergenceSubCode::AuthContexts,
@@ -1249,20 +1398,39 @@ mod tests {
             + Sync
             + 'static,
         ) -> Outcome {
+            submit_fixture(trees, None).await
+        }
+
+        async fn submit_auth_entries(entries: Vec<SorobanAuthorizationEntry>) -> Outcome {
+            submit_fixture(|_| Vec::new(), Some(entries)).await
+        }
+
+        async fn submit_fixture(
+            trees: impl Fn(&InvokeContractArgs) -> Vec<SorobanAuthorizedInvocation>
+            + Send
+            + Sync
+            + 'static,
+            entries: Option<Vec<SorobanAuthorizationEntry>>,
+        ) -> Outcome {
             let server = MockServer::start().await;
             let simulations = Arc::new(AtomicUsize::new(0));
+            let ledger_reads = Arc::new(AtomicUsize::new(0));
             let resimulated = Arc::new(Mutex::new(Vec::new()));
             Mock::given(method("POST"))
                 .respond_with(Rpc {
                     trees: Arc::new(trees),
+                    entries,
                     simulations: Arc::clone(&simulations),
-                    ledger_reads: Arc::default(),
+                    ledger_reads: Arc::clone(&ledger_reads),
                     resimulated: Arc::clone(&resimulated),
                     chain: Chain::at(1000),
                 })
                 .mount(&server)
                 .await;
-            let signer = CountingSigner::new(SEED);
+            let signer = AuthAndSourceSigner {
+                auth: CountingSigner::new(SEED),
+                source: CountingSigner::new(SEED),
+            };
             let result = submit_timelock_invoke_with_g_key_auth(TimelockSubmitArgs {
                 host_function: HostFunction::InvokeContract(schedule()),
                 signer: &signer,
@@ -1277,8 +1445,11 @@ mod tests {
             let resimulated = resimulated.lock().unwrap().clone();
             Outcome {
                 result,
-                signs: signer.sign_calls(),
-                key_reads: signer.public_key_calls(),
+                signs: signer.auth.sign_calls() + signer.source.sign_calls(),
+                auth_signs: signer.auth.sign_calls(),
+                source_signs: signer.source.sign_calls(),
+                ledger_reads: ledger_reads.load(Ordering::SeqCst),
+                key_reads: signer.source.public_key_calls(),
                 simulations: simulations.load(Ordering::SeqCst),
                 resimulated,
             }
@@ -1288,6 +1459,7 @@ mod tests {
         async fn a_timelock_root_on_another_contract_is_refused_before_signing() {
             let outcome = submit(|_| leaf(drain())).await;
             let reason = outcome.refused_before_signing();
+            assert!(reason.starts_with("schedule:"), "{reason}");
             assert!(reason.contains("in its contract"), "{reason}");
         }
 
@@ -1329,6 +1501,7 @@ mod tests {
         async fn the_timelock_signs_its_own_call() {
             let outcome = submit(|invoke| leaf(invoke.clone())).await;
             assert!(outcome.result.is_ok(), "{:?}", outcome.result);
+            assert_eq!((outcome.auth_signs, outcome.source_signs), (1, 1));
             assert_eq!(
                 outcome.signs, 2,
                 "one authorization signature and one envelope signature"
@@ -1352,6 +1525,170 @@ mod tests {
                 schedule(),
                 1000 + crate::managers::rules::AUTH_VALIDITY_LEDGERS,
             );
+        }
+
+        fn address_credentials() -> SorobanAddressCredentials {
+            SorobanAddressCredentials {
+                address: operator(),
+                nonce: NONCE,
+                signature_expiration_ledger: 0,
+                signature: ScVal::Void,
+            }
+        }
+
+        fn foreign_source_roots() -> Vec<(SorobanAuthorizationEntry, &'static str)> {
+            let mut contract_call = schedule();
+            contract_call.contract_address = contract(0xAA);
+            let mut function_call = schedule();
+            function_call.function_name = ScSymbol::try_from("foreign_function").unwrap();
+            let mut argument_call = schedule();
+            argument_call.args = vec![ScVal::Address(operator()), ScVal::U32(99)]
+                .try_into()
+                .unwrap();
+            [
+                (leaf(contract_call), "in its contract"),
+                (leaf(function_call), "in its function"),
+                (leaf(argument_call), "in argument 1"),
+            ]
+            .into_iter()
+            .map(|(root_invocation, reason)| {
+                (
+                    SorobanAuthorizationEntry {
+                        credentials: SorobanCredentials::SourceAccount,
+                        root_invocation,
+                    },
+                    reason,
+                )
+            })
+            .collect()
+        }
+
+        fn nested_source_root() -> (SorobanAuthorizationEntry, &'static str) {
+            let mut nested = leaf(schedule());
+            nested.sub_invocations = vec![leaf(drain())].try_into().unwrap();
+            (
+                SorobanAuthorizationEntry {
+                    credentials: SorobanCredentials::SourceAccount,
+                    root_invocation: nested,
+                },
+                "1 undeclared sub-invocations",
+            )
+        }
+
+        fn foreign_address_entry() -> SorobanAuthorizationEntry {
+            SorobanAuthorizationEntry {
+                credentials: SorobanCredentials::Address(SorobanAddressCredentials {
+                    address: ScAddress::Account(AccountId(XdrPublicKey::PublicKeyTypeEd25519(
+                        Uint256(public_key_for_seed([0xAA; 32])),
+                    ))),
+                    ..address_credentials()
+                }),
+                root_invocation: leaf(schedule()),
+            }
+        }
+
+        fn unsupported_entries() -> Vec<SorobanAuthorizationEntry> {
+            [
+                SorobanCredentials::AddressV2(address_credentials()),
+                SorobanCredentials::AddressWithDelegates(SorobanAddressCredentialsWithDelegates {
+                    address_credentials: address_credentials(),
+                    delegates: VecM::default(),
+                }),
+            ]
+            .into_iter()
+            .map(|credentials| SorobanAuthorizationEntry {
+                credentials,
+                root_invocation: leaf(schedule()),
+            })
+            .collect()
+        }
+
+        #[tokio::test]
+        async fn source_account_foreign_root_refuses_before_envelope_signing() {
+            for (entry, reason) in foreign_source_roots() {
+                let outcome = submit_auth_entries(vec![entry]).await;
+                assert!(
+                    outcome.refused_before_signing().contains(reason),
+                    "{reason}"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn source_account_nested_invocation_refuses_before_signing() {
+            let (entry, reason) = nested_source_root();
+            let outcome = submit_auth_entries(vec![entry]).await;
+            assert!(
+                outcome.refused_before_signing().contains(reason),
+                "{reason}"
+            );
+        }
+
+        #[tokio::test]
+        async fn unsupported_credentials_produce_zero_signatures() {
+            for entry in unsupported_entries() {
+                submit_auth_entries(vec![entry])
+                    .await
+                    .assert_credential_refusal();
+            }
+        }
+
+        #[tokio::test]
+        async fn foreign_address_credentials_refuse_before_signing() {
+            submit_auth_entries(vec![foreign_address_entry()])
+                .await
+                .assert_signer_refusal();
+        }
+
+        enum InvalidCase {
+            SourceRoot(&'static str),
+            UnsupportedCredential,
+            ForeignSigner,
+        }
+
+        #[tokio::test]
+        async fn valid_first_invalid_second_never_partially_signs() {
+            let invalid_cases = foreign_source_roots()
+                .into_iter()
+                .chain([nested_source_root()])
+                .map(|(entry, reason)| (entry, InvalidCase::SourceRoot(reason)))
+                .chain(
+                    unsupported_entries()
+                        .into_iter()
+                        .map(|entry| (entry, InvalidCase::UnsupportedCredential)),
+                )
+                .chain([(foreign_address_entry(), InvalidCase::ForeignSigner)]);
+            for (entry, case) in invalid_cases {
+                let outcome = submit_auth_entries(vec![
+                    SorobanAuthorizationEntry {
+                        credentials: SorobanCredentials::Address(address_credentials()),
+                        root_invocation: leaf(schedule()),
+                    },
+                    entry,
+                ])
+                .await;
+                match case {
+                    InvalidCase::SourceRoot(reason) => {
+                        assert!(outcome.refused_before_signing().contains(reason));
+                    }
+                    InvalidCase::UnsupportedCredential => outcome.assert_credential_refusal(),
+                    InvalidCase::ForeignSigner => outcome.assert_signer_refusal(),
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn exact_source_account_root_reaches_envelope_signing() {
+            let entry = SorobanAuthorizationEntry {
+                credentials: SorobanCredentials::SourceAccount,
+                root_invocation: leaf(schedule()),
+            };
+            let outcome = submit_auth_entries(vec![entry.clone()]).await;
+            assert!(outcome.result.is_ok(), "{:?}", outcome.result);
+            assert_eq!((outcome.auth_signs, outcome.source_signs), (0, 1));
+            assert_eq!(outcome.key_reads, 1);
+            assert_eq!(outcome.simulations, 2);
+            assert_eq!(outcome.resimulated, vec![entry]);
         }
 
         /// Asserts that `signed` expires at `expiration` and that its signature
@@ -1457,6 +1794,7 @@ mod tests {
                     Mock::given(method("POST"))
                         .respond_with(Rpc {
                             trees: Arc::new(|invoke| vec![leaf(invoke.clone())]),
+                            entries: None,
                             simulations: Arc::default(),
                             ledger_reads: Arc::clone(&ledger_reads),
                             resimulated: Arc::clone(&resimulated),

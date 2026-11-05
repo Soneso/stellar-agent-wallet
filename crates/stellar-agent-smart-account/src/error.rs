@@ -1708,6 +1708,9 @@ pub enum SaError {
     /// - `"signer_set_compare"`: the pre-submit deadline elapsed during a
     ///   rule's signer-set comparison. Surfaces from `submit.rs` and
     ///   `managers/credentials.rs`.
+    /// - `"credential_variant"`: a timelock simulation returns AddressV2 or
+    ///   AddressWithDelegates credentials. Surfaces from `timelock_submit.rs`
+    ///   before any signature.
     ///
     /// # Security
     ///
@@ -2624,6 +2627,7 @@ pub(crate) const ALL_AUTH_ENTRY_STAGES: &[&str] = &[
     "rule_lock_missing",
     "baseline_read",
     "signer_set_compare",
+    "credential_variant",
 ];
 
 /// Which unresolved-submission condition [`SaError::SubmissionUnresolved`]
@@ -5690,12 +5694,12 @@ mod tests {
             stray_literals.join("\n")
         );
 
-        // Also assert that ALL_AUTH_ENTRY_STAGES has the expected 17 entries
+        // Also assert that ALL_AUTH_ENTRY_STAGES has the expected 18 entries
         // so a silent truncation of the const is caught.
         assert_eq!(
             ALL_AUTH_ENTRY_STAGES.len(),
-            17,
-            "ALL_AUTH_ENTRY_STAGES must contain exactly 17 entries"
+            18,
+            "ALL_AUTH_ENTRY_STAGES must contain exactly 18 entries"
         );
     }
 

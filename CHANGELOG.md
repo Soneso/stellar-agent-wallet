@@ -754,6 +754,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- Timelock signing validates SourceAccount invocation trees and refuses unsupported
+  credential variants before any auth or envelope signature is produced.
+
 - An approval on the local or remote inbox attests the request its page showed.
   The page carries a digest of the request, and approval refuses with
   `approval.presence_changed` when the pending request differs. Reload the page
