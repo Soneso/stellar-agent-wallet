@@ -68,7 +68,7 @@ impl PolicyEngine for RequireApprovalEngine {
     ) -> Result<Decision, PolicyError> {
         Ok(Decision::RequireApproval(ApprovalRequest::new(
             "test-nonce".into(),
-            120,
+            (DEFAULT_TTL_MS / 1_000) as u32,
         )))
     }
 }
@@ -332,8 +332,8 @@ async fn exercise_approval_consumption(fail_once: bool) {
 
     let nonce_mint =
         NonceMint::from_profile(&profile, "nonce-test").expect("NonceMint::from_profile");
-    let now_ms = stellar_agent_core::timefmt::now_unix_ms().expect("clock");
-    let expiry = now_ms + 60_000;
+    let expiry = u64::MAX;
+    let now_ms = expiry - 60_000;
     let nonce = nonce_mint
         .mint(
             &PayCommitCatalogue,
@@ -568,8 +568,8 @@ async fn a_refused_commit_leaves_its_approval_untouched() {
 
     let nonce_mint =
         NonceMint::from_profile(&profile, "nonce-test").expect("NonceMint::from_profile");
-    let now_ms = stellar_agent_core::timefmt::now_unix_ms().expect("clock");
-    let expiry = now_ms + 60_000;
+    let expiry = u64::MAX;
+    let now_ms = expiry - 60_000;
     let nonce = nonce_mint
         .mint(
             &PayCommitCatalogue,
@@ -764,8 +764,8 @@ async fn pay_commit_logs_a_queued_consent_row_before_the_signer_loads() {
         .await;
 
     let nonce_mint = NonceMint::from_profile(&profile, ACCOUNT).expect("NonceMint::from_profile");
-    let now_ms = stellar_agent_core::timefmt::now_unix_ms().expect("clock");
-    let expiry = now_ms + 60_000;
+    let expiry = u64::MAX;
+    let now_ms = expiry - 60_000;
     let nonce = nonce_mint
         .mint(
             &PayCommitCatalogue,
