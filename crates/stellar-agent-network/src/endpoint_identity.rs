@@ -168,14 +168,16 @@ impl EndpointIdentity {
 /// One endpoint's latest ledger, read through the client whose checked
 /// identity the observation carries.
 ///
-/// [`StellarRpcClient::signing_ledger_observation`](crate::StellarRpcClient::signing_ledger_observation)
-/// is the only constructor outside this crate's tests: it runs
+/// [`PreparedSigningLedgerRead::read`](crate::PreparedSigningLedgerRead::read)
+/// is the only constructor outside this crate's tests.
+/// [`StellarRpcClient::prepare_signing_ledger_observation`](crate::StellarRpcClient::prepare_signing_ledger_observation)
+/// runs
 /// [`StellarRpcClient::endpoint_identity`](crate::StellarRpcClient::endpoint_identity)
-/// and reads `getLatestLedger` through the same client under the same
-/// deadline. Holding a value means the height came from an endpoint that
-/// passed the identity checks. The height itself is the endpoint's claim; a
-/// signing path compares it with another endpoint's observation before it
-/// relies on it.
+/// once, and each read asks `getLatestLedger` through the same client under
+/// the same deadline. Holding a value means the height came from an endpoint
+/// that passed the identity checks. The height itself is the endpoint's
+/// claim; a signing path compares it with another endpoint's observation
+/// before it relies on it.
 ///
 /// ```compile_fail,E0639
 /// use stellar_agent_network::SigningLedgerObservation;

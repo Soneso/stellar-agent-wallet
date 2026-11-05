@@ -56,7 +56,6 @@ tracing-subscriber = { workspace = true }
 rand_core = { workspace = true }
 ed25519-dalek = { workspace = true }
 serial_test = { workspace = true }
-reqwest = { workspace = true }
 zeroize = { workspace = true }
 wiremock = { workspace = true }
 async-trait = { workspace = true }

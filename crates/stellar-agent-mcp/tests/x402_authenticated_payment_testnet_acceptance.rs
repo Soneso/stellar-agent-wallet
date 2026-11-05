@@ -121,24 +121,13 @@ fn fresh_keypair() -> (String, Zeroizing<[u8; 32]>) {
     (g_strkey, seed)
 }
 
-/// Funds a testnet account via Friendbot.
-///
-/// Returns `Ok(())` if funding succeeded (2xx from Friendbot).
-/// Returns `Err(reason)` if the HTTP request failed or returned non-2xx.
-/// Does NOT panic — callers decide whether to skip or fail.
-async fn try_fund_via_friendbot(g_strkey: &str) -> Result<(), String> {
+/// Funds a testnet account via Friendbot and fails the test when Friendbot
+/// does not fund it.
+async fn fund_via_friendbot(g_strkey: &str) {
     let url = format!("{TESTNET_FRIENDBOT_URL}?addr={g_strkey}");
-    let resp = stellar_agent_test_support::testnet_helpers::friendbot_funding_request(&url)
+    stellar_agent_test_support::testnet_helpers::friendbot_fund(&url)
         .await
-        .map_err(|e| format!("Friendbot GET failed: {e}"))?;
-    if resp.status().is_success() {
-        Ok(())
-    } else {
-        Err(format!(
-            "Friendbot returned {} for {g_strkey}",
-            resp.status()
-        ))
-    }
+        .expect("Friendbot funds the account");
 }
 
 /// Builds a `PaymentRequirements` JSON string for the given `pay_to` address.
@@ -670,12 +659,8 @@ async fn a6f_neg2_invalid_home_domain_aborts_before_payment() {
 async fn a6f_positive_testanchor_sep10_authenticated_payment() {
     let (g_strkey, seed) = fresh_keypair();
     let (recipient, _recipient_seed) = fresh_keypair();
-    try_fund_via_friendbot(&g_strkey)
-        .await
-        .unwrap_or_else(|reason| panic!("[UNAVAILABLE] payer funding: {reason}"));
-    try_fund_via_friendbot(&recipient)
-        .await
-        .unwrap_or_else(|reason| panic!("[UNAVAILABLE] recipient funding: {reason}"));
+    fund_via_friendbot(&g_strkey).await;
+    fund_via_friendbot(&recipient).await;
     wait_until_visible(&g_strkey).await;
     wait_until_visible(&recipient).await;
 

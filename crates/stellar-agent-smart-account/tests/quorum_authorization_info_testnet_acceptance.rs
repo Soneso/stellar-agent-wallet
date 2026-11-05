@@ -138,18 +138,13 @@ fn fresh_deployer() -> (String, DeployerKeypair) {
 
 /// Funds a G-strkey via testnet Friendbot.
 ///
-/// Checks reachability only (the Friendbot 200 response); no balance threshold
+/// Panics when Friendbot does not fund the account; no balance threshold
 /// gates are applied.
 async fn fund_via_friendbot(g_strkey: &str) {
     let url = format!("{TESTNET_FRIENDBOT_URL}?addr={g_strkey}");
-    let resp = stellar_agent_test_support::testnet_helpers::friendbot_funding_request(&url)
+    stellar_agent_test_support::testnet_helpers::friendbot_fund(&url)
         .await
-        .expect("Friendbot HTTP must succeed");
-    assert!(
-        resp.status().is_success(),
-        "Friendbot must return 200 for {g_strkey}; got {}",
-        resp.status()
-    );
+        .expect("Friendbot funds the account");
 }
 
 /// A testnet rule manager and its signers manager, both writing to one audit

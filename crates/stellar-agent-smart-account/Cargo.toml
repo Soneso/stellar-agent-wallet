@@ -164,7 +164,7 @@ sha2 = { workspace = true }
 wiremock = { workspace = true }
 ed25519-dalek = { workspace = true }
 rand_core = { workspace = true }
-# reqwest: Friendbot HTTP calls in testnet acceptance tests.
+# reqwest: the RPC relay of the timelock testnet acceptance test.
 reqwest = { workspace = true }
 tempfile = { workspace = true }
 proptest = { workspace = true }

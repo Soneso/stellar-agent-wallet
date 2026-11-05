@@ -140,14 +140,9 @@ fn random_bytes() -> [u8; 32] {
 
 async fn fund_via_friendbot(g_strkey: &str) {
     let url = format!("{TESTNET_FRIENDBOT_URL}?addr={g_strkey}");
-    let resp = stellar_agent_test_support::testnet_helpers::friendbot_funding_request(&url)
+    stellar_agent_test_support::testnet_helpers::friendbot_fund(&url)
         .await
-        .expect("Friendbot HTTP request must succeed");
-    assert!(
-        resp.status().is_success(),
-        "Friendbot must return 2xx for {g_strkey}; got {}",
-        resp.status()
-    );
+        .expect("Friendbot funds the account");
     let client = StellarRpcClient::new(TESTNET_RPC_URL).expect("RPC client");
     for _ in 0..30 {
         if fetch_account(&client, g_strkey, &[]).await.is_ok() {

@@ -8,6 +8,11 @@
 //! [`StellarRpcClient`]'s checked identity, and refuses unless the two agree
 //! within [`MAX_SIGNING_LEDGER_SKEW`].
 //!
+//! Both endpoint identities complete before either height request starts.
+//! The two height requests run concurrently under the same deadline. Each
+//! witness call checks both identities once. Each repeated acquisition
+//! replaces both heights and their receipt times.
+//!
 //! # Trust assumption
 //!
 //! The bound holds when at least one of the two endpoints reports the chain
@@ -34,7 +39,9 @@ use stellar_agent_core::profile::schema::{check_endpoint_url, same_provider_host
 use stellar_agent_network::signing::{
     MessagePayload, Signer, SmartAccountAuthDigest, SorobanAuthPayload, TxSigningPayload,
 };
-use stellar_agent_network::{SigningLedgerObservation, StellarRpcClient, WebAuthnAssertion};
+use stellar_agent_network::{
+    PreparedSigningLedgerRead, SigningLedgerObservation, StellarRpcClient, WebAuthnAssertion,
+};
 use tokio::time::Instant;
 use tracing::debug;
 
@@ -55,6 +62,10 @@ pub const MAX_SIGNING_LEDGER_SKEW: u32 = 2;
 /// Longest age of an observation a signature may rest on: two ledger closes
 /// at the network's five-second cadence, the span the skew tolerance admits.
 pub(crate) const MAX_OBSERVATION_AGE: Duration = Duration::from_secs(10);
+
+/// The most height pairs one witness call reads: the first pair and at most
+/// two more, each read only while the deadline has not passed.
+const MAX_PAIR_ACQUISITIONS: u32 = 3;
 
 /// The fixed reason of a refusal: `LedgerWitnessUnavailable` or
 /// `LedgerWitnessMismatch` never echoes endpoint input, which can hold a
@@ -132,24 +143,95 @@ pub(crate) struct WitnessedLedgerBound {
     chain_id: Option<Caip2>,
 }
 
+/// Why a pair of observations was not bound.
+#[derive(Debug)]
+enum PairRefusal {
+    /// The heights differ by more than [`MAX_SIGNING_LEDGER_SKEW`]; a later
+    /// pair can agree.
+    Skew {
+        primary: ObservedLedger,
+        secondary: ObservedLedger,
+    },
+    /// A refusal no later pair changes.
+    Terminal(SaError),
+}
+
+/// What made the acquisition loop discard a pair.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Trigger {
+    /// The older observation of an otherwise valid pair passed
+    /// [`MAX_OBSERVATION_AGE`].
+    Stale,
+    /// The heights differ by more than [`MAX_SIGNING_LEDGER_SKEW`].
+    Skew,
+}
+
+impl Trigger {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Stale => "stale",
+            Self::Skew => "skew",
+        }
+    }
+}
+
+/// A pair the acquisition loop discarded, kept for its refusal and for the
+/// event that announces the next pair.
+struct RejectedPair {
+    trigger: Trigger,
+    primary: ObservedLedger,
+    secondary: ObservedLedger,
+}
+
+impl RejectedPair {
+    /// The refusal the pair receives when no further pair is read: the skew
+    /// refusal for a skewed pair and the stale refusal for a stale one.
+    fn into_refusal(self) -> SaError {
+        match self.trigger {
+            Trigger::Skew => mismatch(reason::SKEW),
+            Trigger::Stale => unavailable(reason::STALE),
+        }
+    }
+}
+
 impl WitnessedLedgerBound {
-    /// Binds a pair of observations, or refuses it.
+    /// Binds a pair of observations, or refuses it with the refusal a caller
+    /// receives. The validation tests bind pairs directly through it; the
+    /// witness binds through [`Self::bind_classified`].
+    #[cfg(test)]
     fn bind(primary: ObservedLedger, secondary: ObservedLedger) -> Result<Self, SaError> {
+        Self::bind_classified(primary, secondary).map_err(|refusal| match refusal {
+            PairRefusal::Skew { .. } => mismatch(reason::SKEW),
+            PairRefusal::Terminal(error) => error,
+        })
+    }
+
+    /// Binds a pair of observations, or refuses it with the kind of refusal
+    /// another pair could change.
+    ///
+    /// The checks run in this order: height bounds, chain equality, host
+    /// distinctness, then the symmetric skew. Only the skew can differ in a
+    /// later pair; every earlier refusal is terminal.
+    fn bind_classified(
+        primary: ObservedLedger,
+        secondary: ObservedLedger,
+    ) -> Result<Self, PairRefusal> {
         for observation in [&primary, &secondary] {
             validate_latest_ledger(observation.ledger)
-                .map_err(|_| mismatch(reason::HEIGHT_OUT_OF_BOUNDS))?;
+                .map_err(|_| PairRefusal::Terminal(mismatch(reason::HEIGHT_OUT_OF_BOUNDS)))?;
         }
         // Both observations pass `endpoint_identity(expected_passphrase)` with
-        // the passphrase of one request, and `bind` is the one constructor of
-        // a bound. The check refuses a mixed pair whichever caller binds it.
+        // the passphrase of one request, and `bind_classified` is the one
+        // constructor of a bound. The check refuses a mixed pair whichever
+        // caller binds it.
         if primary.chain_id != secondary.chain_id {
-            return Err(mismatch(reason::CHAIN));
+            return Err(PairRefusal::Terminal(mismatch(reason::CHAIN)));
         }
         if same_provider_host(&primary.authority, &secondary.authority) {
-            return Err(unavailable(reason::SAME_HOST));
+            return Err(PairRefusal::Terminal(unavailable(reason::SAME_HOST)));
         }
         if primary.ledger.abs_diff(secondary.ledger) > MAX_SIGNING_LEDGER_SKEW {
-            return Err(mismatch(reason::SKEW));
+            return Err(PairRefusal::Skew { primary, secondary });
         }
         let chain_id = primary.chain_id;
         Ok(Self {
@@ -276,24 +358,60 @@ pub fn checked_secondary_rpc_url<'a>(
 
 /// Observes the latest ledger on both endpoints and binds the pair.
 ///
-/// Both endpoints are asked at the same time and under the one deadline of
-/// `request.budget`. A pair that comes back already stale is read again as a
-/// pair: a fresh height is never combined with a retained one.
+/// Both endpoint identities complete before either height request starts.
+/// The two height requests run concurrently under the same deadline, that of
+/// `request.budget`. Each witness call checks both identities once. Each
+/// repeated acquisition replaces both heights and their receipt times: a
+/// pair that is stale or skewed is read again as a pair, at most
+/// [`MAX_PAIR_ACQUISITIONS`] pairs in all and only while the deadline has not
+/// passed, and a fresh height is never combined with a retained one. The
+/// accepted pair passes every identity, height, skew, and freshness check.
+///
+/// Signing refuses when it cannot obtain fresh, agreeing ledger observations
+/// within the pre submit deadline. Persistent disagreement keeps the skew
+/// refusal. Persistent staleness keeps the unavailable refusal. Nothing is
+/// signed. A deadline that prevents another acquisition preserves the
+/// rejected pair's refusal. Every other refusal ends the call without
+/// another pair.
 ///
 /// # Errors
 ///
 /// - [`SaError::MainnetWriteForbidden`] when an endpoint reports the mainnet
 ///   passphrase.
 /// - [`SaError::LedgerWitnessUnavailable`] when an endpoint cannot be read in
-///   time, serves another network, or stays stale.
-/// - [`SaError::LedgerWitnessMismatch`] when a height is out of bounds or the
-///   pair differs by more than [`MAX_SIGNING_LEDGER_SKEW`].
+///   time, serves another network, or shares the primary's host, when the
+///   last pair read is stale, or when the deadline elapses before a pair is
+///   read.
+/// - [`SaError::LedgerWitnessMismatch`] when a height is out of bounds, the
+///   endpoints identify different chains, or the last pair read differs by
+///   more than [`MAX_SIGNING_LEDGER_SKEW`].
 pub(crate) async fn witness_signing_ledger(
     request: &WitnessRequest<'_>,
 ) -> Result<WitnessedLedgerBound, SaError> {
     let secondary = StellarRpcClient::new(request.secondary_rpc_url)
         .map_err(|_| unavailable(reason::SECONDARY_CLIENT))?;
-    let bound = acquire_fresh_pair(|| observe_pair(request, &secondary)).await?;
+    let deadline = request.budget.deadline;
+    let (primary_prepared, secondary_prepared) = tokio::join!(
+        request
+            .primary
+            .prepare_signing_ledger_observation(request.network_passphrase, deadline),
+        secondary.prepare_signing_ledger_observation(request.network_passphrase, deadline),
+    );
+    let primary = primary_prepared.map_err(|error| {
+        observation_refusal(
+            &error,
+            reason::PRIMARY_WRONG_NETWORK,
+            reason::PRIMARY_UNREADABLE,
+        )
+    })?;
+    let secondary = secondary_prepared.map_err(|error| {
+        observation_refusal(
+            &error,
+            reason::SECONDARY_WRONG_NETWORK,
+            reason::SECONDARY_UNREADABLE,
+        )
+    })?;
+    let bound = acquire_fresh_pair(request.budget, || read_pair(&primary, &secondary)).await?;
     debug!(
         primary_ledger = bound.primary.ledger,
         secondary_ledger = bound.secondary.ledger,
@@ -305,50 +423,94 @@ pub(crate) async fn witness_signing_ledger(
     Ok(bound)
 }
 
-/// Runs `acquire`, and once more when its pair is stale on arrival.
-async fn acquire_fresh_pair<F, Fut>(mut acquire: F) -> Result<WitnessedLedgerBound, SaError>
+/// Runs `acquire` until it returns a fresh pair, at most
+/// [`MAX_PAIR_ACQUISITIONS`] times, and only while `budget`'s deadline has
+/// not passed.
+///
+/// A stale or skewed pair permits another acquisition; every other refusal
+/// returns at once. When the count or the deadline stops the loop after a
+/// rejected pair, that pair's own refusal returns: the skew mismatch or the
+/// stale unavailable refusal. The deadline is checked only before an
+/// acquisition starts; a fresh pair that arrives is accepted.
+async fn acquire_fresh_pair<F, Fut>(
+    budget: PreSubmitBudget,
+    mut acquire: F,
+) -> Result<WitnessedLedgerBound, SaError>
 where
     F: FnMut() -> Fut,
-    Fut: Future<Output = Result<WitnessedLedgerBound, SaError>>,
+    Fut: Future<Output = Result<WitnessedLedgerBound, PairRefusal>>,
 {
-    let bound = acquire().await?;
-    if !bound.is_stale(Instant::now()) {
-        return Ok(bound);
+    let mut rejected: Option<RejectedPair> = None;
+    for attempt in 1..=MAX_PAIR_ACQUISITIONS {
+        let now = Instant::now();
+        if now >= budget.deadline {
+            break;
+        }
+        if let Some(previous) = &rejected {
+            debug!(
+                attempt,
+                trigger = previous.trigger.as_str(),
+                primary_ledger = previous.primary.ledger,
+                secondary_ledger = previous.secondary.ledger,
+                primary_age_ms = age_ms(previous.primary.observed_at, now),
+                secondary_age_ms = age_ms(previous.secondary.observed_at, now),
+                remaining_ms = age_ms(now, budget.deadline),
+                primary = %previous.primary.authority,
+                secondary = %previous.secondary.authority,
+                "ledger witness reads the pair again",
+            );
+        }
+        let pair = match acquire().await {
+            Ok(bound) if !bound.is_stale(Instant::now()) => return Ok(bound),
+            Ok(bound) => RejectedPair {
+                trigger: Trigger::Stale,
+                primary: bound.primary,
+                secondary: bound.secondary,
+            },
+            Err(PairRefusal::Skew { primary, secondary }) => RejectedPair {
+                trigger: Trigger::Skew,
+                primary,
+                secondary,
+            },
+            Err(PairRefusal::Terminal(error)) => return Err(error),
+        };
+        rejected = Some(pair);
     }
-    let bound = acquire().await?;
-    if bound.is_stale(Instant::now()) {
-        return Err(unavailable(reason::STALE));
-    }
-    Ok(bound)
+    Err(rejected.map_or_else(
+        || unavailable(reason::DEADLINE_ELAPSED),
+        RejectedPair::into_refusal,
+    ))
 }
 
-/// Reads both endpoints once and binds the answers.
-async fn observe_pair(
-    request: &WitnessRequest<'_>,
-    secondary: &StellarRpcClient,
-) -> Result<WitnessedLedgerBound, SaError> {
-    let deadline = request.budget.deadline;
-    let (primary_observation, secondary_observation) = tokio::join!(
-        request
-            .primary
-            .signing_ledger_observation(request.network_passphrase, deadline),
-        secondary.signing_ledger_observation(request.network_passphrase, deadline),
-    );
+/// Milliseconds from `earlier` to `later`, zero when `later` is not after
+/// it, saturated at `u64::MAX`.
+fn age_ms(earlier: Instant, later: Instant) -> u64 {
+    u64::try_from(later.saturating_duration_since(earlier).as_millis()).unwrap_or(u64::MAX)
+}
+
+/// Reads both heights through the prepared reads at the same time and binds
+/// the answers.
+async fn read_pair(
+    primary: &PreparedSigningLedgerRead<'_>,
+    secondary: &PreparedSigningLedgerRead<'_>,
+) -> Result<WitnessedLedgerBound, PairRefusal> {
+    let (primary_observation, secondary_observation) =
+        tokio::join!(primary.read(), secondary.read());
     let primary = primary_observation.map_err(|error| {
-        observation_refusal(
+        PairRefusal::Terminal(observation_refusal(
             &error,
             reason::PRIMARY_WRONG_NETWORK,
             reason::PRIMARY_UNREADABLE,
-        )
+        ))
     })?;
     let secondary = secondary_observation.map_err(|error| {
-        observation_refusal(
+        PairRefusal::Terminal(observation_refusal(
             &error,
             reason::SECONDARY_WRONG_NETWORK,
             reason::SECONDARY_UNREADABLE,
-        )
+        ))
     })?;
-    WitnessedLedgerBound::bind(primary.into(), secondary.into())
+    WitnessedLedgerBound::bind_classified(primary.into(), secondary.into())
 }
 
 /// Maps a failed observation to its refusal. A mainnet endpoint keeps the one
@@ -463,11 +625,18 @@ mod tests {
     #![allow(clippy::panic, reason = "test-only: panics are the failure mode")]
 
     use std::cell::Cell;
+    use std::sync::{Arc, Mutex};
 
     use stellar_agent_core::error::ReportedPassphrase;
     use stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE;
+    use stellar_agent_test_support::second_loopback_host;
+    use stellar_agent_test_support::signed_envelope::get_network_result;
+    use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
     use super::*;
+
+    /// A network whose passphrase names neither testnet nor mainnet.
+    const FUTURENET_PASSPHRASE: &str = "Test SDF Future Network ; October 2022";
 
     /// The highest height `validate_latest_ledger` admits.
     const LEDGER_CEILING: u32 = u32::MAX - AUTH_VALIDITY_LEDGERS - 1_000_000;
@@ -672,12 +841,31 @@ mod tests {
         assert_eq!(reason_of(&error), reason::STALE);
     }
 
+    /// A pair as the acquisition loop receives it.
+    fn classified(primary: u32, secondary: u32) -> Result<WitnessedLedgerBound, PairRefusal> {
+        let now = Instant::now();
+        WitnessedLedgerBound::bind_classified(
+            observed_at(primary, PRIMARY, now),
+            observed_at(secondary, SECONDARY, now),
+        )
+    }
+
+    /// An otherwise valid pair that is stale on arrival.
+    fn stale() -> Result<WitnessedLedgerBound, PairRefusal> {
+        Ok(aged_pair(MAX_OBSERVATION_AGE + Duration::from_secs(1)))
+    }
+
+    /// A budget no acquisition test exhausts.
+    fn ample() -> PreSubmitBudget {
+        budget(Duration::from_secs(30))
+    }
+
     #[tokio::test]
     async fn a_fresh_pair_is_acquired_once() {
         let calls = Cell::new(0);
-        acquire_fresh_pair(|| {
+        acquire_fresh_pair(ample(), || {
             calls.set(calls.get() + 1);
-            async { pair(1000, 1000) }
+            async { classified(1000, 1000) }
         })
         .await
         .unwrap();
@@ -687,14 +875,14 @@ mod tests {
     #[tokio::test]
     async fn a_stale_pair_is_reacquired_as_a_pair() {
         let calls = Cell::new(0);
-        let bound = acquire_fresh_pair(|| {
+        let bound = acquire_fresh_pair(ample(), || {
             calls.set(calls.get() + 1);
             let attempt = calls.get();
             async move {
                 if attempt == 1 {
-                    Ok(aged_pair(MAX_OBSERVATION_AGE + Duration::from_secs(1)))
+                    stale()
                 } else {
-                    pair(1004, 1005)
+                    classified(1004, 1005)
                 }
             }
         })
@@ -709,35 +897,627 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_pair_stale_twice_refuses() {
+    async fn a_pair_stale_three_times_refuses() {
         let calls = Cell::new(0);
-        let error = acquire_fresh_pair(|| {
+        let error = acquire_fresh_pair(ample(), || {
             calls.set(calls.get() + 1);
-            async { Ok(aged_pair(MAX_OBSERVATION_AGE + Duration::from_secs(1))) }
+            async { stale() }
         })
         .await
         .unwrap_err();
-        assert_eq!(calls.get(), 2);
+        assert_eq!(calls.get(), MAX_PAIR_ACQUISITIONS);
+        assert_eq!(
+            error.wire_code(),
+            "smart_account.ledger_witness_unavailable"
+        );
         assert_eq!(reason_of(&error), reason::STALE);
     }
 
+    /// A stale pair followed by two skewed ones refuses with the skew of the
+    /// last, and no fourth pair is read.
     #[tokio::test]
     async fn a_failed_reacquisition_keeps_its_refusal() {
         let calls = Cell::new(0);
-        let error = acquire_fresh_pair(|| {
+        let error = acquire_fresh_pair(ample(), || {
             calls.set(calls.get() + 1);
             let attempt = calls.get();
             async move {
                 if attempt == 1 {
-                    Ok(aged_pair(MAX_OBSERVATION_AGE + Duration::from_secs(1)))
+                    stale()
                 } else {
-                    pair(1000, 1003)
+                    classified(1000, 1003)
                 }
             }
         })
         .await
         .unwrap_err();
+        assert_eq!(calls.get(), 3, "no fourth pair");
+        assert_eq!(error.wire_code(), "simulation.divergence.ledger_skew");
         assert_eq!(reason_of(&error), reason::SKEW);
+    }
+
+    /// A skewed pair is read again, in either endpoint order, and the second
+    /// pair's agreement binds.
+    #[tokio::test]
+    async fn skewed_pair_retries_to_agreement() {
+        for (first, second) in [((1000, 1003), (1002, 1003)), ((1003, 1000), (1003, 1002))] {
+            let calls = Cell::new(0);
+            let bound = acquire_fresh_pair(ample(), || {
+                calls.set(calls.get() + 1);
+                let (primary, secondary) = if calls.get() == 1 { first } else { second };
+                async move { classified(primary, secondary) }
+            })
+            .await
+            .unwrap();
+            assert_eq!(calls.get(), 2, "{first:?}");
+            assert_eq!((bound.lower(), bound.higher()), (1002, 1003), "{first:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn stale_pair_can_succeed_on_the_last_attempt() {
+        let calls = Cell::new(0);
+        let bound = acquire_fresh_pair(ample(), || {
+            calls.set(calls.get() + 1);
+            let attempt = calls.get();
+            async move {
+                if attempt < 3 {
+                    stale()
+                } else {
+                    classified(1010, 1011)
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(calls.get(), 3);
+        assert_eq!((bound.lower(), bound.higher()), (1010, 1011));
+    }
+
+    /// Each refusal other than skew and staleness ends the acquisition on the
+    /// pair that produced it, with its own reason and code.
+    #[tokio::test]
+    async fn terminal_pair_failures_do_not_retry() {
+        let now = Instant::now();
+        let mut other_chain = observed_at(1000, SECONDARY, now);
+        other_chain.chain_id = None;
+        let cases = [
+            (
+                "invalid height",
+                WitnessedLedgerBound::bind_classified(
+                    observed_at(0, PRIMARY, now),
+                    observed_at(1000, SECONDARY, now),
+                ),
+                reason::HEIGHT_OUT_OF_BOUNDS,
+                "simulation.divergence.ledger_skew",
+            ),
+            (
+                "chain mismatch",
+                WitnessedLedgerBound::bind_classified(observed_at(1000, PRIMARY, now), other_chain),
+                reason::CHAIN,
+                "simulation.divergence.ledger_skew",
+            ),
+            (
+                "same host",
+                WitnessedLedgerBound::bind_classified(
+                    observed_at(1000, PRIMARY, now),
+                    observed_at(1000, "https://primary.example:8443", now),
+                ),
+                reason::SAME_HOST,
+                "smart_account.ledger_witness_unavailable",
+            ),
+        ];
+        // Every case is judged before the test fails, so a failure names each
+        // case that broke.
+        let mut broken = Vec::new();
+        let mut judge = |case: &str,
+                         result: Result<WitnessedLedgerBound, SaError>,
+                         expected,
+                         code,
+                         pairs: Vec<usize>| {
+            match result {
+                Ok(_) => broken.push(format!("{case}: a pair bound")),
+                Err(error) => {
+                    if reason_of(&error) != expected || error.wire_code() != code {
+                        broken.push(format!("{case}: {error:?}"));
+                    }
+                }
+            }
+            if pairs.iter().any(|&count| count != 1) {
+                broken.push(format!("{case}: {pairs:?} pairs read"));
+            }
+        };
+        for (case, outcome, expected, code) in cases {
+            let outcome = Cell::new(Some(outcome));
+            let calls = Cell::new(0);
+            let result = acquire_fresh_pair(ample(), || {
+                calls.set(calls.get() + 1);
+                let outcome = outcome.take().unwrap_or_else(|| classified(1000, 1000));
+                async move { outcome }
+            })
+            .await;
+            judge(case, result, expected, code, vec![calls.get()]);
+        }
+
+        // A height that fails on the wire ends the call on its first read of
+        // each endpoint.
+        for (case, primary_heights, secondary_heights, expected) in [
+            (
+                "height transport failure",
+                vec![Height::At(1000)],
+                vec![Height::Refused, Height::At(1000)],
+                reason::SECONDARY_UNREADABLE,
+            ),
+            (
+                "malformed height",
+                vec![Height::Malformed, Height::At(1000)],
+                vec![Height::At(1000)],
+                reason::PRIMARY_UNREADABLE,
+            ),
+        ] {
+            let primary = Endpoint::start(Script::heights(primary_heights)).await;
+            let secondary = Endpoint::start(Script::heights(secondary_heights)).await;
+
+            let result = witness(&primary, &secondary).await;
+
+            judge(
+                case,
+                result,
+                expected,
+                "smart_account.ledger_witness_unavailable",
+                vec![
+                    primary.count("getLatestLedger"),
+                    secondary.count("getLatestLedger"),
+                ],
+            );
+        }
+        assert!(broken.is_empty(), "{broken:#?}");
+    }
+
+    /// No pair is read once the deadline has passed, and a pair rejected when
+    /// the deadline then passes keeps its own refusal.
+    #[tokio::test]
+    async fn deadline_prevents_another_pair() {
+        let calls = Cell::new(0);
+        let error = acquire_fresh_pair(budget(Duration::ZERO), || {
+            calls.set(calls.get() + 1);
+            async { classified(1000, 1000) }
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(calls.get(), 0, "no pair is read");
+        assert_eq!(
+            error.wire_code(),
+            "smart_account.ledger_witness_unavailable"
+        );
+        assert_eq!(reason_of(&error), reason::DEADLINE_ELAPSED);
+
+        let calls = Cell::new(0);
+        let error = acquire_fresh_pair(budget(Duration::from_millis(100)), || {
+            calls.set(calls.get() + 1);
+            async {
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                stale()
+            }
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(calls.get(), 1, "the deadline stops the loop");
+        assert_eq!(
+            error.wire_code(),
+            "smart_account.ledger_witness_unavailable"
+        );
+        assert_eq!(reason_of(&error), reason::STALE);
+    }
+
+    #[tokio::test]
+    async fn a_skewed_pair_at_the_deadline_keeps_the_skew_code() {
+        let calls = Cell::new(0);
+        let error = acquire_fresh_pair(budget(Duration::from_millis(100)), || {
+            calls.set(calls.get() + 1);
+            async {
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                classified(1000, 1003)
+            }
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(calls.get(), 1, "the deadline stops the loop");
+        assert!(
+            matches!(error, SaError::LedgerWitnessMismatch { .. }),
+            "{error:?}"
+        );
+        assert_eq!(error.wire_code(), "simulation.divergence.ledger_skew");
+        assert_eq!(reason_of(&error), reason::SKEW);
+    }
+
+    /// The pair that binds after a skew holds both heights of its own
+    /// reading, and the expiry derives from its lower member.
+    #[tokio::test]
+    async fn skew_retry_never_combines_attempts() {
+        let calls = Cell::new(0);
+        let bound = acquire_fresh_pair(ample(), || {
+            calls.set(calls.get() + 1);
+            let (primary, secondary) = if calls.get() == 1 {
+                (1000, 1003)
+            } else {
+                (1003, 1004)
+            };
+            async move { classified(primary, secondary) }
+        })
+        .await
+        .unwrap();
+        assert_eq!(calls.get(), 2);
+        assert_eq!((bound.primary.ledger, bound.secondary.ledger), (1003, 1004));
+        assert_eq!(bound.signature_expiration_ledger().unwrap(), 1103);
+    }
+
+    /// Each pair read again announces itself once, after the pair it
+    /// replaces, with the trigger, the discarded heights, and the redacted
+    /// authorities.
+    #[test]
+    fn every_reread_has_a_debug_event() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let logs = stellar_agent_test_support::log_capture::with_captured_trace_logs(|| {
+            runtime.block_on(async {
+                let calls = Cell::new(0);
+                acquire_fresh_pair(ample(), || {
+                    calls.set(calls.get() + 1);
+                    let attempt = calls.get();
+                    async move {
+                        match attempt {
+                            1 => stale(),
+                            2 => classified(1000, 1003),
+                            _ => classified(1003, 1004),
+                        }
+                    }
+                })
+                .await
+                .unwrap();
+            });
+        });
+        let events: Vec<&str> = logs
+            .lines()
+            .filter(|line| line.contains("ledger witness reads the pair again"))
+            .collect();
+        assert_eq!(events.len(), 2, "{logs}");
+        for (event, attempt, trigger, primary, secondary) in [
+            (events[0], 2, "stale", 1000, 1000),
+            (events[1], 3, "skew", 1000, 1003),
+        ] {
+            for field in [
+                format!("attempt={attempt}"),
+                format!("trigger=\"{trigger}\""),
+                format!("primary_ledger={primary}"),
+                format!("secondary_ledger={secondary}"),
+                format!("primary={PRIMARY}"),
+                format!("secondary={SECONDARY}"),
+            ] {
+                assert!(event.contains(&field), "{field} in {event}");
+            }
+            for field in ["primary_age_ms=", "secondary_age_ms=", "remaining_ms="] {
+                assert!(event.contains(field), "{field} in {event}");
+            }
+        }
+
+        let logs = stellar_agent_test_support::log_capture::with_captured_trace_logs(|| {
+            runtime.block_on(async {
+                let primary = Endpoint::start(Script::heights(vec![Height::At(1000)])).await;
+                let secondary =
+                    Endpoint::start(Script::heights(vec![Height::At(1003), Height::At(1001)]))
+                        .await;
+                let client = StellarRpcClient::new(&format!(
+                    "{}/rpc?token={CREDENTIAL}",
+                    primary.server.uri()
+                ))
+                .unwrap();
+                let secondary_url = second_loopback_host(&format!(
+                    "{}/rpc?token={CREDENTIAL}",
+                    secondary.server.uri()
+                ));
+                witness_through(&client, &secondary_url).await.unwrap();
+            });
+        });
+        let events: Vec<&str> = logs
+            .lines()
+            .filter(|line| line.contains("ledger witness reads the pair again"))
+            .collect();
+        assert_eq!(events.len(), 1, "{logs}");
+        assert!(events[0].contains("trigger=\"skew\""), "{}", events[0]);
+        assert!(
+            events[0].contains("primary=http://127.0.0.1:"),
+            "{}",
+            events[0]
+        );
+        assert!(
+            events[0].contains("secondary=http://localhost:"),
+            "{}",
+            events[0]
+        );
+        assert!(!logs.contains(CREDENTIAL), "{logs}");
+    }
+
+    // ── Witness calls against mocked endpoints ─────────────────────────────
+
+    /// A credential the endpoint URLs carry, which no log line may hold.
+    const CREDENTIAL: &str = "SENTINEL-CREDENTIAL";
+
+    /// One `getLatestLedger` answer.
+    #[derive(Clone, Copy)]
+    enum Height {
+        At(u32),
+        Malformed,
+        Refused,
+    }
+
+    /// What one mocked endpoint answers.
+    #[derive(Clone)]
+    struct Script {
+        identity: serde_json::Value,
+        identity_delay: Duration,
+        /// The answer to each `getLatestLedger` read in turn; the last one
+        /// repeats.
+        heights: Vec<Height>,
+        height_delay: Duration,
+    }
+
+    impl Script {
+        fn heights(heights: Vec<Height>) -> Self {
+            Self {
+                identity: get_network_result(TESTNET_PASSPHRASE),
+                identity_delay: Duration::ZERO,
+                heights,
+                height_delay: Duration::ZERO,
+            }
+        }
+    }
+
+    /// Answers by `script` and records each request's method and arrival.
+    struct ScriptedRpc {
+        script: Script,
+        log: Arc<Mutex<Vec<(String, Instant)>>>,
+    }
+
+    impl Respond for ScriptedRpc {
+        fn respond(&self, request: &Request) -> ResponseTemplate {
+            let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            let method = body["method"].as_str().unwrap().to_owned();
+            let index = {
+                let mut log = self.log.lock().unwrap();
+                let index = log.iter().filter(|(seen, _)| *seen == method).count();
+                log.push((method.clone(), Instant::now()));
+                index
+            };
+            let answer = |result: serde_json::Value| {
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": body["id"],
+                    "result": result,
+                }))
+            };
+            match method.as_str() {
+                "getNetwork" => {
+                    answer(self.script.identity.clone()).set_delay(self.script.identity_delay)
+                }
+                "getLatestLedger" => {
+                    let height = self
+                        .script
+                        .heights
+                        .get(index)
+                        .or(self.script.heights.last())
+                        .copied()
+                        .unwrap();
+                    match height {
+                        Height::At(ledger) => answer(serde_json::json!({
+                            "id": "ab".repeat(32),
+                            "sequence": ledger,
+                            "protocolVersion": 29,
+                        }))
+                        .set_delay(self.script.height_delay),
+                        Height::Malformed => answer(serde_json::json!({
+                            "id": "ab".repeat(32),
+                            "sequence": "not-a-ledger",
+                            "protocolVersion": 29,
+                        })),
+                        Height::Refused => ResponseTemplate::new(503),
+                    }
+                }
+                other => panic!("unexpected request: {other}"),
+            }
+        }
+    }
+
+    /// A mocked endpoint and the requests it received.
+    struct Endpoint {
+        server: MockServer,
+        log: Arc<Mutex<Vec<(String, Instant)>>>,
+    }
+
+    impl Endpoint {
+        async fn start(script: Script) -> Self {
+            let server = MockServer::start().await;
+            let log = Arc::new(Mutex::new(Vec::new()));
+            Mock::given(wiremock::matchers::method("POST"))
+                .respond_with(ScriptedRpc {
+                    script,
+                    log: Arc::clone(&log),
+                })
+                .mount(&server)
+                .await;
+            Self { server, log }
+        }
+
+        /// The arrival of each `method` request, in order.
+        fn arrivals(&self, method: &str) -> Vec<Instant> {
+            self.log
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(seen, _)| seen == method)
+                .map(|(_, at)| *at)
+                .collect()
+        }
+
+        fn count(&self, method: &str) -> usize {
+            self.arrivals(method).len()
+        }
+    }
+
+    /// The deadline of every witness call against mocked endpoints.
+    const WITNESS_DEADLINE: Duration = Duration::from_secs(20);
+
+    async fn witness_through(
+        primary: &StellarRpcClient,
+        secondary_rpc_url: &str,
+    ) -> Result<WitnessedLedgerBound, SaError> {
+        witness_signing_ledger(&WitnessRequest {
+            primary,
+            secondary_rpc_url,
+            network_passphrase: TESTNET_PASSPHRASE,
+            budget: budget(WITNESS_DEADLINE),
+        })
+        .await
+    }
+
+    /// One witness call with `primary` as the primary and `secondary` on a
+    /// host apart from it.
+    async fn witness(
+        primary: &Endpoint,
+        secondary: &Endpoint,
+    ) -> Result<WitnessedLedgerBound, SaError> {
+        let client = StellarRpcClient::new(&primary.server.uri()).unwrap();
+        witness_through(&client, &second_loopback_host(&secondary.server.uri())).await
+    }
+
+    /// No height request starts before both identities have been answered,
+    /// whichever identity is slow, and the two heights are in flight at the
+    /// same time.
+    #[tokio::test]
+    async fn both_identities_finish_before_either_height_starts() {
+        let slow = Duration::from_millis(400);
+        let height_delay = Duration::from_millis(300);
+        for slow_primary in [false, true] {
+            let script = |identity_delay| Script {
+                identity_delay,
+                height_delay,
+                ..Script::heights(vec![Height::At(1000)])
+            };
+            let (primary_delay, secondary_delay) = if slow_primary {
+                (slow, Duration::ZERO)
+            } else {
+                (Duration::ZERO, slow)
+            };
+            let primary = Endpoint::start(script(primary_delay)).await;
+            let secondary = Endpoint::start(script(secondary_delay)).await;
+
+            witness(&primary, &secondary).await.unwrap();
+
+            let identities_answered = (primary.arrivals("getNetwork")[0] + primary_delay)
+                .max(secondary.arrivals("getNetwork")[0] + secondary_delay);
+            let primary_height = primary.arrivals("getLatestLedger")[0];
+            let secondary_height = secondary.arrivals("getLatestLedger")[0];
+            for (side, height) in [("primary", primary_height), ("secondary", secondary_height)] {
+                assert!(
+                    height >= identities_answered,
+                    "slow primary {slow_primary}: the {side} height waits for both identities"
+                );
+            }
+            let gap = if primary_height > secondary_height {
+                primary_height - secondary_height
+            } else {
+                secondary_height - primary_height
+            };
+            assert!(
+                gap < height_delay,
+                "slow primary {slow_primary}: both heights start before either answers: {gap:?}"
+            );
+        }
+    }
+
+    /// One witness call checks each identity once, and every further pair
+    /// reads both heights again.
+    #[tokio::test]
+    async fn every_reread_replaces_both_heights() {
+        let primary = Endpoint::start(Script::heights(vec![Height::At(1000)])).await;
+        let secondary = Endpoint::start(Script::heights(vec![
+            Height::At(1003),
+            Height::At(1003),
+            Height::At(1002),
+        ]))
+        .await;
+
+        let bound = witness(&primary, &secondary).await.unwrap();
+
+        assert_eq!((bound.lower(), bound.higher()), (1000, 1002));
+        assert_eq!(primary.count("getNetwork"), 1);
+        assert_eq!(secondary.count("getNetwork"), 1);
+        assert_eq!(primary.count("getLatestLedger"), 3);
+        assert_eq!(secondary.count("getLatestLedger"), 3);
+    }
+
+    /// A second witness call checks both identities again. A refused
+    /// identity, of another network or unreadable, is asked once and starts
+    /// no height on either endpoint.
+    #[tokio::test]
+    async fn a_new_witness_call_checks_both_identities() {
+        let primary = Endpoint::start(Script::heights(vec![Height::At(1000)])).await;
+        let secondary = Endpoint::start(Script::heights(vec![Height::At(1001)])).await;
+        let client = StellarRpcClient::new(&primary.server.uri()).unwrap();
+        let secondary_url = second_loopback_host(&secondary.server.uri());
+
+        witness_through(&client, &secondary_url).await.unwrap();
+        witness_through(&client, &secondary_url).await.unwrap();
+
+        assert_eq!(primary.count("getNetwork"), 2);
+        assert_eq!(secondary.count("getNetwork"), 2);
+        assert_eq!(primary.count("getLatestLedger"), 2);
+        assert_eq!(secondary.count("getLatestLedger"), 2);
+
+        let unreadable = Script {
+            identity: serde_json::json!({"passphrase": TESTNET_PASSPHRASE}),
+            ..Script::heights(vec![Height::At(1000)])
+        };
+        let other_network = Script {
+            identity: get_network_result(FUTURENET_PASSPHRASE),
+            ..Script::heights(vec![Height::At(1000)])
+        };
+        for (case, primary_script, secondary_script, expected) in [
+            (
+                "secondary on another network",
+                Script::heights(vec![Height::At(1000)]),
+                other_network,
+                reason::SECONDARY_WRONG_NETWORK,
+            ),
+            (
+                "unreadable primary identity",
+                unreadable,
+                Script::heights(vec![Height::At(1000)]),
+                reason::PRIMARY_UNREADABLE,
+            ),
+        ] {
+            let primary = Endpoint::start(primary_script).await;
+            let secondary = Endpoint::start(secondary_script).await;
+
+            let error = witness(&primary, &secondary).await.unwrap_err();
+
+            assert_eq!(reason_of(&error), expected, "{case}");
+            assert_eq!(
+                error.wire_code(),
+                "smart_account.ledger_witness_unavailable",
+                "{case}"
+            );
+            for (side, endpoint) in [("primary", &primary), ("secondary", &secondary)] {
+                assert_eq!(endpoint.count("getNetwork"), 1, "{case}: {side} identity");
+                assert_eq!(
+                    endpoint.count("getLatestLedger"),
+                    0,
+                    "{case}: {side} height"
+                );
+            }
+        }
     }
 
     #[test]

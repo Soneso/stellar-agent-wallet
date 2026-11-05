@@ -966,30 +966,303 @@ const FRIENDBOT_CONFIRM_POLLS: u32 = 30;
 /// confirm-wait (30 polls × 500ms ≈ 15s per round).
 const FRIENDBOT_CONFIRM_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
-/// Issues a Friendbot funding GET with a 20-second deadline covering connection,
-/// response headers, and response body. Callers decide how to handle HTTP status
-/// codes and request failures; this helper performs no retries or RPC polling.
+/// The bounds of one Friendbot funding request: how many attempts start, how
+/// long each may take, the pauses before the second and the third, and the
+/// total time every attempt and pause share.
+struct FriendbotRetryPolicy {
+    /// Attempts that may start, the first included.
+    attempts: u32,
+    /// The longest one attempt may take, from connection through the body.
+    attempt_timeout: Duration,
+    /// The pause before the second attempt and before every later one.
+    backoffs: [Duration; 2],
+    /// The total time of one invocation, attempts and pauses included.
+    deadline: Duration,
+}
+
+impl FriendbotRetryPolicy {
+    /// The pause before the attempt that follows `started` attempts.
+    fn backoff_after(&self, started: u32) -> Duration {
+        let [first, later] = self.backoffs;
+        if started <= 1 { first } else { later }
+    }
+}
+
+/// The bounds of every live Friendbot funding request.
+const FRIENDBOT_RETRY: FriendbotRetryPolicy = FriendbotRetryPolicy {
+    attempts: 3,
+    attempt_timeout: Duration::from_secs(20),
+    backoffs: [Duration::from_millis(250), Duration::from_millis(500)],
+    deadline: Duration::from_secs(65),
+};
+
+/// The bytes of a failure body [`friendbot_fund`] retains and inspects.
+const FRIENDBOT_FAILURE_BODY_LIMIT: usize = 512;
+
+/// Issues a Friendbot funding GET and returns the last response or error.
+///
+/// The funding request retries send failures and server errors within three
+/// attempts and one total deadline. Each attempt opens a new connection and
+/// takes at most 20 seconds, or the time left of the 65 second deadline when
+/// that is shorter, from connection through the response body. The pauses
+/// before the second and the third attempt are 250 and 500 milliseconds, and
+/// they count against the same deadline. No attempt starts once the deadline
+/// has passed.
+///
+/// A response that receives no further retry returns with its body unread.
+/// That covers every status below 500, and a 5xx response the attempt count
+/// or the deadline leaves without a further attempt. The response keeps the
+/// attempt's timeout while the caller reads its body. A caller that cannot
+/// read the body gets no new request.
+///
+/// URL parsing and client construction failures return before any request
+/// starts.
 ///
 /// # Errors
 ///
-/// Returns the HTTP client's error if client construction or the request fails,
-/// including when the request deadline expires.
+/// Returns the HTTP client's error when the URL does not parse or the client
+/// cannot be built, and the last attempt's error when every attempt failed to
+/// send, a timeout included.
 pub async fn friendbot_funding_request(
     url: impl reqwest::IntoUrl,
 ) -> Result<reqwest::Response, reqwest::Error> {
-    friendbot_request_with_timeout(url, Duration::from_secs(20)).await
+    friendbot_request_with_policy(url, &FRIENDBOT_RETRY).await.0
 }
 
-async fn friendbot_request_with_timeout(
+/// Funds an account through the Friendbot request at `url`, a URL that
+/// carries the account as its `addr` query parameter.
+///
+/// Funding succeeds on a successful HTTP status or a 400 response whose
+/// bounded body reports that the account is already funded. The request
+/// follows the retry policy of [`friendbot_funding_request`].
+///
+/// Failure diagnostics include the attempt count, the final status or
+/// transport cause, and at most 512 bytes of the final body. The helper reads
+/// failure bodies within the response timeout, and keeps the bytes it read
+/// when the body ends in an error.
+///
+/// # Errors
+///
+/// [`FriendbotFundingError`] when the URL or the client cannot be built,
+/// every attempt failed to send, or the final response is neither successful
+/// nor an already funded 400.
+pub async fn friendbot_fund(url: &str) -> Result<(), FriendbotFundingError> {
+    friendbot_fund_with_policy(url, &FRIENDBOT_RETRY).await
+}
+
+/// [`friendbot_fund`] under `policy`.
+async fn friendbot_fund_with_policy(
+    url: &str,
+    policy: &FriendbotRetryPolicy,
+) -> Result<(), FriendbotFundingError> {
+    let (outcome, attempts) = friendbot_request_with_policy(url, policy).await;
+    let mut response = match outcome {
+        Ok(response) => response,
+        Err(error) => {
+            return Err(FriendbotFundingError {
+                attempts,
+                cause: FundingCause::Transport(error),
+                body: FailureBody::Unavailable,
+            });
+        }
+    };
+    let status = response.status();
+    if status.is_success() {
+        return Ok(());
+    }
+    let prefix = read_failure_body_prefix(&mut response).await;
+    if status == reqwest::StatusCode::BAD_REQUEST && reports_already_funded(&prefix) {
+        return Ok(());
+    }
+    Err(FriendbotFundingError {
+        attempts,
+        cause: FundingCause::Status(status),
+        body: FailureBody::Prefix(prefix),
+    })
+}
+
+/// Reads at most [`FRIENDBOT_FAILURE_BODY_LIMIT`] bytes of `response`'s body,
+/// chunk by chunk, and keeps what arrived when the body ends in an error.
+async fn read_failure_body_prefix(response: &mut reqwest::Response) -> Vec<u8> {
+    let mut prefix = Vec::new();
+    while prefix.len() < FRIENDBOT_FAILURE_BODY_LIMIT {
+        match response.chunk().await {
+            Ok(Some(chunk)) => {
+                let room = FRIENDBOT_FAILURE_BODY_LIMIT - prefix.len();
+                prefix.extend_from_slice(&chunk[..chunk.len().min(room)]);
+            }
+            Ok(None) | Err(_) => break,
+        }
+    }
+    prefix
+}
+
+/// Whether a Friendbot failure body reports that the account is already
+/// funded, compared without regard to ASCII case.
+fn reports_already_funded(body: &[u8]) -> bool {
+    String::from_utf8_lossy(body)
+        .to_ascii_lowercase()
+        .contains("already funded")
+}
+
+/// Runs the Friendbot request at `url` under `policy` and returns the last
+/// outcome with the number of attempts that started.
+///
+/// The client is built once, without idle connections, so every attempt
+/// connects anew. A send error and a 5xx status permit another attempt while
+/// the attempt count and the deadline allow one; every other response ends
+/// the run unread. An earlier response is dropped unread once the next
+/// attempt starts.
+async fn friendbot_request_with_policy(
     url: impl reqwest::IntoUrl,
-    timeout: Duration,
-) -> Result<reqwest::Response, reqwest::Error> {
-    reqwest::Client::builder()
-        .timeout(timeout)
-        .build()?
-        .get(url)
-        .send()
-        .await
+    policy: &FriendbotRetryPolicy,
+) -> (Result<reqwest::Response, reqwest::Error>, u32) {
+    let deadline = tokio::time::Instant::now() + policy.deadline;
+    let client = match reqwest::Client::builder().pool_max_idle_per_host(0).build() {
+        Ok(client) => client,
+        Err(error) => return (Err(error), 0),
+    };
+    let url = match client.get(url).build() {
+        Ok(request) => request.url().clone(),
+        Err(error) => return (Err(error), 0),
+    };
+    let mut attempts = 0;
+    loop {
+        let budget = deadline.saturating_duration_since(tokio::time::Instant::now());
+        attempts += 1;
+        let outcome = client
+            .get(url.clone())
+            .timeout(policy.attempt_timeout.min(budget))
+            .send()
+            .await;
+        let retryable = match &outcome {
+            Ok(response) => response.status().is_server_error(),
+            Err(_) => true,
+        };
+        if !retryable || attempts >= policy.attempts {
+            return (outcome, attempts);
+        }
+        // The pause counts against the deadline, and the deadline is checked
+        // again before the next attempt starts.
+        let resume = tokio::time::Instant::now() + policy.backoff_after(attempts);
+        if resume >= deadline {
+            return (outcome, attempts);
+        }
+        tokio::time::sleep_until(resume).await;
+        if tokio::time::Instant::now() >= deadline {
+            return (outcome, attempts);
+        }
+    }
+}
+
+/// Why [`friendbot_fund`] did not fund the account.
+///
+/// It carries the number of attempts that started, the final status or
+/// transport cause, and at most 512 bytes of the final response body. Its
+/// `Display` and `Debug` forms show all three.
+pub struct FriendbotFundingError {
+    attempts: u32,
+    cause: FundingCause,
+    body: FailureBody,
+}
+
+/// The final outcome of a failed funding request.
+enum FundingCause {
+    /// The final response's status, neither successful nor an already funded
+    /// 400.
+    Status(reqwest::StatusCode),
+    /// The final error of the request, or of the URL or client construction.
+    Transport(reqwest::Error),
+}
+
+/// The retained part of the final response body.
+enum FailureBody {
+    /// No response arrived, so no body exists.
+    Unavailable,
+    /// At most [`FRIENDBOT_FAILURE_BODY_LIMIT`] bytes of the body.
+    Prefix(Vec<u8>),
+}
+
+/// The error and every source beneath it, joined by `": "`.
+fn error_chain(error: &reqwest::Error) -> String {
+    let mut text = error.to_string();
+    let mut source = Error::source(error);
+    while let Some(cause) = source {
+        text.push_str(": ");
+        text.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    text
+}
+
+impl fmt::Display for FundingCause {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Status(status) => write!(f, "HTTP status {status}"),
+            Self::Transport(error) => f.write_str(&error_chain(error)),
+        }
+    }
+}
+
+impl fmt::Debug for FundingCause {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Status(status) => write!(f, "Status({status})"),
+            Self::Transport(error) => write!(f, "Transport({:?})", error_chain(error)),
+        }
+    }
+}
+
+impl fmt::Display for FailureBody {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unavailable => f.write_str("no response body is available"),
+            Self::Prefix(bytes) => write!(f, "body {:?}", String::from_utf8_lossy(bytes)),
+        }
+    }
+}
+
+impl fmt::Debug for FailureBody {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unavailable => f.write_str("Unavailable"),
+            Self::Prefix(bytes) => write!(f, "Prefix({:?})", String::from_utf8_lossy(bytes)),
+        }
+    }
+}
+
+impl fmt::Display for FriendbotFundingError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let noun = if self.attempts == 1 {
+            "attempt"
+        } else {
+            "attempts"
+        };
+        write!(
+            f,
+            "Friendbot did not fund the account after {} {noun}: {}; {}",
+            self.attempts, self.cause, self.body
+        )
+    }
+}
+
+impl fmt::Debug for FriendbotFundingError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FriendbotFundingError")
+            .field("attempts", &self.attempts)
+            .field("cause", &self.cause)
+            .field("body", &self.body)
+            .finish()
+    }
+}
+
+impl Error for FriendbotFundingError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match &self.cause {
+            FundingCause::Status(_) => None,
+            FundingCause::Transport(error) => Some(error),
+        }
+    }
 }
 
 /// Requests Friendbot funding for `account_id`, then confirms the account
@@ -1072,29 +1345,194 @@ async fn wait_for_account_visible(client: &stellar_rpc_client::Client, account_i
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::expect_used, reason = "test fixtures and assertions")]
+    #![allow(
+        clippy::expect_used,
+        clippy::panic,
+        reason = "test fixtures and assertions"
+    )]
+
+    use std::net::SocketAddr;
+    use std::sync::{Arc, Mutex};
 
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::TcpListener;
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio::task::{JoinHandle, JoinSet};
+    use tokio::time::Instant;
 
-    async fn friendbot_response(response: &'static [u8]) -> (String, tokio::task::JoinHandle<()>) {
+    const OK: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+    const BUSY: &[u8] = b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n";
+    const ALREADY_FUNDED: &[u8] = b"HTTP/1.1 400 Bad Request\r\nContent-Length: 63\r\n\r\n\
+        {\"detail\": \"createAccountAlreadyExist: Account Already Funded\"}";
+
+    /// What the fixture does with one request, chosen by the request's
+    /// position among all requests the fixture received.
+    #[derive(Clone)]
+    enum Answer {
+        /// Writes these bytes and keeps the connection open; no bytes leave
+        /// the request unanswered.
+        Bytes(Vec<u8>),
+        /// Closes the connection without an answer.
+        Close,
+        /// Resets the connection without an answer.
+        Reset,
+    }
+
+    fn bytes(response: &[u8]) -> Answer {
+        Answer::Bytes(response.to_vec())
+    }
+
+    fn stall() -> Answer {
+        Answer::Bytes(Vec::new())
+    }
+
+    /// Accepted connections and the connection of every request, in arrival
+    /// order.
+    #[derive(Default)]
+    struct Record {
+        connections: Vec<Instant>,
+        requests: Vec<usize>,
+    }
+
+    /// A loopback Friendbot that answers each request from a script and keeps
+    /// every accepted connection open until the client closes it.
+    struct Friendbot {
+        url: String,
+        record: Arc<Mutex<Record>>,
+        server: JoinHandle<()>,
+    }
+
+    impl Friendbot {
+        fn connections(&self) -> Vec<Instant> {
+            self.record.lock().expect("record").connections.clone()
+        }
+
+        fn requests(&self) -> Vec<usize> {
+            self.record.lock().expect("record").requests.clone()
+        }
+    }
+
+    impl Drop for Friendbot {
+        fn drop(&mut self) {
+            self.server.abort();
+        }
+    }
+
+    fn friendbot_url(address: SocketAddr) -> String {
+        format!("http://{address}/?addr=test-account")
+    }
+
+    /// Serves `answers` on a new loopback listener. A request beyond the
+    /// script receives the last answer.
+    async fn friendbot_serving(answers: Vec<Answer>) -> Friendbot {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind loopback");
-        let url = format!(
-            "http://{}/?addr=test-account",
-            listener.local_addr().expect("address")
-        );
+        serve(listener, answers)
+    }
+
+    fn serve(listener: TcpListener, answers: Vec<Answer>) -> Friendbot {
+        let url = friendbot_url(listener.local_addr().expect("address"));
+        let record = Arc::new(Mutex::new(Record::default()));
+        let answers = Arc::new(answers);
+        let shared = Arc::clone(&record);
         let server = tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.expect("accept request");
-            let mut request = [0; 1024];
-            let count = socket.read(&mut request).await.expect("read request");
-            assert!(request[..count].starts_with(b"GET /?addr=test-account "));
-            socket.write_all(response).await.expect("write response");
-            std::future::pending::<()>().await;
+            let mut connections = JoinSet::new();
+            loop {
+                let (socket, _) = listener.accept().await.expect("accept request");
+                let connection = {
+                    let mut record = shared.lock().expect("record");
+                    record.connections.push(Instant::now());
+                    record.connections.len() - 1
+                };
+                connections.spawn(answer_connection(
+                    socket,
+                    connection,
+                    Arc::clone(&shared),
+                    Arc::clone(&answers),
+                ));
+            }
         });
-        (url, server)
+        Friendbot {
+            url,
+            record,
+            server,
+        }
+    }
+
+    /// Answers every request on `socket` until the client closes it or an
+    /// answer ends the connection.
+    async fn answer_connection(
+        mut socket: TcpStream,
+        connection: usize,
+        record: Arc<Mutex<Record>>,
+        answers: Arc<Vec<Answer>>,
+    ) {
+        let mut pending = Vec::new();
+        loop {
+            let end = loop {
+                if let Some(end) = pending.windows(4).position(|w| w == b"\r\n\r\n") {
+                    break end + 4;
+                }
+                let mut chunk = [0; 1024];
+                let count = socket.read(&mut chunk).await.unwrap_or(0);
+                if count == 0 {
+                    return;
+                }
+                pending.extend_from_slice(&chunk[..count]);
+            };
+            let request: Vec<u8> = pending.drain(..end).collect();
+            assert!(request.starts_with(b"GET /?addr=test-account "));
+            let ordinal = {
+                let mut record = record.lock().expect("record");
+                record.requests.push(connection);
+                record.requests.len() - 1
+            };
+            let answer = answers
+                .get(ordinal)
+                .or(answers.last())
+                .cloned()
+                .expect("a scripted answer");
+            match answer {
+                Answer::Bytes(response) => {
+                    socket.write_all(&response).await.expect("write response");
+                }
+                Answer::Close => return,
+                Answer::Reset => {
+                    socket.set_zero_linger().expect("zero linger");
+                    return;
+                }
+            }
+        }
+    }
+
+    /// The fixture every earlier test used: each request receives `response`.
+    async fn friendbot_response(response: &'static [u8]) -> (String, Friendbot) {
+        let friendbot = friendbot_serving(vec![bytes(response)]).await;
+        (friendbot.url.clone(), friendbot)
+    }
+
+    fn policy(
+        attempts: u32,
+        attempt_timeout_ms: u64,
+        backoffs_ms: [u64; 2],
+        deadline_ms: u64,
+    ) -> FriendbotRetryPolicy {
+        FriendbotRetryPolicy {
+            attempts,
+            attempt_timeout: Duration::from_millis(attempt_timeout_ms),
+            backoffs: backoffs_ms.map(Duration::from_millis),
+            deadline: Duration::from_millis(deadline_ms),
+        }
+    }
+
+    /// A policy whose pauses keep the tests short.
+    fn quick() -> FriendbotRetryPolicy {
+        policy(3, 2_000, [50, 50], 10_000)
+    }
+
+    fn status_of(outcome: Result<reqwest::Response, reqwest::Error>) -> reqwest::StatusCode {
+        outcome.expect("HTTP response").status()
     }
 
     #[tokio::test]
@@ -1108,7 +1546,7 @@ mod tests {
             .expect("HTTP response");
         assert_eq!(response.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(response.text().await.expect("response body"), "busy");
-        server.abort();
+        drop(server);
     }
 
     #[tokio::test]
@@ -1119,8 +1557,9 @@ mod tests {
         ] {
             let (url, server) = friendbot_response(headers).await;
             let error = tokio::time::timeout(Duration::from_secs(5), async {
-                let response =
-                    friendbot_request_with_timeout(&url, Duration::from_millis(200)).await;
+                let response = friendbot_request_with_policy(&url, &policy(1, 200, [0, 0], 200))
+                    .await
+                    .0;
                 if headers.is_empty() {
                     response.expect_err("stalled headers must time out")
                 } else {
@@ -1133,8 +1572,315 @@ mod tests {
             })
             .await
             .expect("request deadline must bound stalled I/O");
-            server.abort();
+            drop(server);
             assert!(error.is_timeout(), "expected request timeout: {error}");
+        }
+    }
+
+    /// A timed out attempt is followed, after the first pause, by a second
+    /// one on a new connection.
+    #[tokio::test]
+    async fn friendbot_timeout_retries_then_succeeds() {
+        let friendbot = friendbot_serving(vec![stall(), bytes(OK)]).await;
+
+        let (outcome, attempts) =
+            friendbot_request_with_policy(&friendbot.url, &policy(3, 150, [200, 900], 10_000))
+                .await;
+
+        assert_eq!(status_of(outcome), reqwest::StatusCode::OK);
+        assert_eq!(attempts, 2);
+        assert_eq!(friendbot.requests(), [0, 1]);
+        let connections = friendbot.connections();
+        let gap = connections[1] - connections[0];
+        assert!(
+            gap >= Duration::from_millis(350) && gap < Duration::from_millis(1_050),
+            "the second attempt follows the timeout and the first pause: {gap:?}"
+        );
+    }
+
+    /// A refused connection is followed by a second attempt.
+    #[tokio::test]
+    async fn friendbot_connection_error_retries_then_succeeds() {
+        let probe = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let address = probe.local_addr().expect("address");
+        drop(probe);
+        let url = friendbot_url(address);
+        let retry = policy(3, 2_000, [400, 400], 10_000);
+
+        let ((outcome, attempts), friendbot) =
+            tokio::join!(friendbot_request_with_policy(&url, &retry), async {
+                // The first attempt meets no listener; the second meets this
+                // one.
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                let listener = TcpListener::bind(address).await.expect("bind again");
+                serve(listener, vec![bytes(OK)])
+            },);
+
+        assert_eq!(status_of(outcome), reqwest::StatusCode::OK);
+        assert_eq!(attempts, 2, "the refused attempt counts");
+        assert_eq!(friendbot.requests(), [0], "the listener sees the second");
+    }
+
+    /// A connection reset after the request was sent is retried.
+    #[tokio::test]
+    async fn friendbot_reset_after_send_retries_then_succeeds() {
+        let friendbot = friendbot_serving(vec![Answer::Reset, bytes(OK)]).await;
+
+        let (outcome, attempts) = friendbot_request_with_policy(&friendbot.url, &quick()).await;
+
+        assert_eq!(status_of(outcome), reqwest::StatusCode::OK);
+        assert_eq!(attempts, 2);
+        assert_eq!(friendbot.requests(), [0, 1]);
+    }
+
+    #[tokio::test]
+    async fn friendbot_server_error_retries_then_succeeds() {
+        let friendbot = friendbot_serving(vec![bytes(BUSY), bytes(OK)]).await;
+
+        let (outcome, attempts) = friendbot_request_with_policy(&friendbot.url, &quick()).await;
+
+        assert_eq!(status_of(outcome), reqwest::StatusCode::OK);
+        assert_eq!(attempts, 2);
+        assert_eq!(friendbot.requests(), [0, 1]);
+    }
+
+    /// A status below 500 ends the run on its first answer, its body still
+    /// unread for the caller.
+    #[tokio::test]
+    async fn friendbot_other_client_errors_stop() {
+        for (status, response) in [
+            (
+                400,
+                b"HTTP/1.1 400 Bad Request\r\nContent-Length: 5\r\n\r\nfirst".as_slice(),
+            ),
+            (
+                401,
+                b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 5\r\n\r\nfirst".as_slice(),
+            ),
+            (
+                403,
+                b"HTTP/1.1 403 Forbidden\r\nContent-Length: 5\r\n\r\nfirst".as_slice(),
+            ),
+            (
+                404,
+                b"HTTP/1.1 404 Not Found\r\nContent-Length: 5\r\n\r\nfirst".as_slice(),
+            ),
+        ] {
+            let friendbot = friendbot_serving(vec![bytes(response), bytes(OK)]).await;
+
+            let (outcome, attempts) = friendbot_request_with_policy(&friendbot.url, &quick()).await;
+
+            let response = outcome.expect("HTTP response");
+            assert_eq!(response.status().as_u16(), status);
+            assert_eq!(attempts, 1, "{status}");
+            assert_eq!(friendbot.requests(), [0], "{status}: the queued 200 stays");
+            assert_eq!(response.text().await.expect("body"), "first", "{status}");
+        }
+    }
+
+    #[tokio::test]
+    async fn friendbot_unbuildable_url_sends_nothing() {
+        for url in ["not a url", "http://", "mailto:account@example.invalid"] {
+            let (outcome, attempts) = friendbot_request_with_policy(url, &quick()).await;
+            let error = outcome.expect_err("the URL cannot be built");
+            assert!(error.is_builder(), "{url}: {error}");
+            assert_eq!(attempts, 0, "{url}");
+
+            let error = friendbot_fund_with_policy(url, &quick())
+                .await
+                .expect_err("the URL cannot be built");
+            assert_eq!(error.attempts, 0, "{url}");
+            assert!(matches!(error.body, FailureBody::Unavailable), "{url}");
+            assert!(error.to_string().contains("after 0 attempts"), "{error}");
+        }
+    }
+
+    /// The third failure ends the run, and the error reports it, not the
+    /// first.
+    #[tokio::test]
+    async fn friendbot_attempt_limit_keeps_last_failure() {
+        let friendbot = friendbot_serving(vec![Answer::Close, stall(), stall(), bytes(OK)]).await;
+
+        let error = friendbot_fund_with_policy(&friendbot.url, &policy(3, 150, [50, 50], 10_000))
+            .await
+            .expect_err("three failed attempts");
+
+        assert_eq!(friendbot.requests(), [0, 1, 2], "no fourth request");
+        let display = error.to_string();
+        let debug = format!("{error:?}");
+        assert!(display.contains("after 3 attempts"), "{display}");
+        assert!(debug.contains("attempts: 3"), "{debug}");
+        for text in [&display, &debug] {
+            assert!(text.contains("timed out"), "the final cause: {text}");
+            assert!(
+                !text.contains("connection closed"),
+                "the first cause: {text}"
+            );
+            assert!(
+                !text.contains("IncompleteMessage"),
+                "the first cause: {text}"
+            );
+        }
+        assert!(
+            display.contains("no response body is available"),
+            "{display}"
+        );
+        assert!(debug.contains("body: Unavailable"), "{debug}");
+    }
+
+    /// A pause that would end past the deadline starts no further attempt and
+    /// keeps the failure before it.
+    #[tokio::test]
+    async fn friendbot_total_deadline_includes_backoff() {
+        let friendbot = friendbot_serving(vec![stall(), bytes(OK)]).await;
+
+        let (outcome, attempts) =
+            friendbot_request_with_policy(&friendbot.url, &policy(3, 100, [400, 400], 300)).await;
+
+        let error = outcome.expect_err("the stalled attempt is the outcome");
+        assert!(error.is_timeout(), "{error}");
+        assert_eq!(attempts, 1, "no attempt starts after the deadline");
+        assert_eq!(friendbot.requests(), [0]);
+    }
+
+    /// The last attempt receives only the time the deadline leaves.
+    #[tokio::test]
+    async fn friendbot_remaining_budget_bounds_request() {
+        let friendbot = friendbot_serving(vec![bytes(BUSY), bytes(BUSY), stall()]).await;
+        let started = Instant::now();
+
+        let (outcome, attempts) = tokio::time::timeout(
+            Duration::from_secs(10),
+            friendbot_request_with_policy(&friendbot.url, &policy(3, 3_000, [50, 50], 600)),
+        )
+        .await
+        .expect("the run ends");
+
+        let elapsed = started.elapsed();
+        let error = outcome.expect_err("the stalled attempt is the outcome");
+        assert!(error.is_timeout(), "{error}");
+        assert_eq!(attempts, 3);
+        assert_eq!(friendbot.requests(), [0, 1, 2]);
+        assert!(
+            elapsed < Duration::from_millis(1_500),
+            "the original deadline ends the stalled attempt: {elapsed:?}"
+        );
+    }
+
+    /// Every attempt opens its own connection: a reusable connection after a
+    /// complete 503 answer carries no second request.
+    #[tokio::test]
+    async fn friendbot_retries_use_fresh_connections() {
+        let friendbot = friendbot_serving(vec![bytes(BUSY), bytes(OK)]).await;
+
+        let (outcome, attempts) = friendbot_request_with_policy(&friendbot.url, &quick()).await;
+
+        assert_eq!(status_of(outcome), reqwest::StatusCode::OK);
+        assert_eq!(attempts, 2);
+        assert_eq!(friendbot.connections().len(), 2, "two accepted connections");
+        assert_eq!(friendbot.requests(), [0, 1], "one request on each");
+    }
+
+    #[tokio::test]
+    async fn friendbot_fund_accepts_success_and_already_funded() {
+        for response in [
+            OK,
+            b"HTTP/1.1 201 Created\r\nContent-Length: 0\r\n\r\n".as_slice(),
+            ALREADY_FUNDED,
+        ] {
+            let friendbot = friendbot_serving(vec![bytes(response)]).await;
+            friendbot_fund_with_policy(&friendbot.url, &quick())
+                .await
+                .expect("funded");
+        }
+
+        let friendbot = friendbot_serving(vec![bytes(
+            b"HTTP/1.1 400 Bad Request\r\nContent-Length: 30\r\n\r\nthe address is not a valid key",
+        )])
+        .await;
+        let error = friendbot_fund_with_policy(&friendbot.url, &quick())
+            .await
+            .expect_err("a 400 of another kind refuses");
+        assert!(
+            matches!(error.cause, FundingCause::Status(status) if status == reqwest::StatusCode::BAD_REQUEST),
+            "{error:?}"
+        );
+        assert_eq!(error.attempts, 1);
+        assert!(
+            error.to_string().contains("the address is not a valid key"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn friendbot_timeout_then_already_funded_succeeds() {
+        let friendbot = friendbot_serving(vec![stall(), bytes(ALREADY_FUNDED)]).await;
+
+        friendbot_fund_with_policy(&friendbot.url, &policy(3, 150, [50, 50], 10_000))
+            .await
+            .expect("an account funded by the timed out attempt counts as funded");
+
+        assert_eq!(friendbot.requests(), [0, 1], "two attempts");
+    }
+
+    /// Only the first 512 bytes of a failure body are kept and inspected.
+    #[tokio::test]
+    async fn friendbot_fund_bounds_failure_body() {
+        fn bad_request(body: &[u8]) -> Answer {
+            let mut response = format!(
+                "HTTP/1.1 400 Bad Request\r\nContent-Length: {}\r\n\r\n",
+                body.len()
+            )
+            .into_bytes();
+            response.extend_from_slice(body);
+            Answer::Bytes(response)
+        }
+        let filler = vec![b'x'; FRIENDBOT_FAILURE_BODY_LIMIT];
+        let tail = vec![b'y'; 64 * 1024];
+
+        let beyond = [filler.as_slice(), b"already funded", &tail].concat();
+        let friendbot = friendbot_serving(vec![bad_request(&beyond)]).await;
+        let error = friendbot_fund_with_policy(&friendbot.url, &quick())
+            .await
+            .expect_err("text beyond the prefix does not classify");
+        match &error.body {
+            FailureBody::Prefix(prefix) => assert_eq!(prefix, &filler),
+            FailureBody::Unavailable => panic!("a body arrived: {error:?}"),
+        }
+
+        let within = [b"already funded".as_slice(), &tail].concat();
+        let friendbot = friendbot_serving(vec![bad_request(&within)]).await;
+        friendbot_fund_with_policy(&friendbot.url, &quick())
+            .await
+            .expect("the prefix reports an already funded account");
+    }
+
+    /// The error reports the final answer: its status, its body, and the
+    /// number of attempts.
+    #[tokio::test]
+    async fn friendbot_fund_reports_final_status_body_and_attempts() {
+        let friendbot = friendbot_serving(vec![
+            bytes(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 5\r\n\r\nfirst"),
+            bytes(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 6\r\n\r\nsecond"),
+            bytes(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 5\r\n\r\nthird"),
+        ])
+        .await;
+
+        let error = friendbot_fund_with_policy(&friendbot.url, &quick())
+            .await
+            .expect_err("three server errors");
+
+        let display = error.to_string();
+        let debug = format!("{error:?}");
+        assert!(display.contains("after 3 attempts"), "{display}");
+        assert!(debug.contains("attempts: 3"), "{debug}");
+        for text in [&display, &debug] {
+            assert!(text.contains("503"), "{text}");
+            assert!(text.contains("third"), "{text}");
+            assert!(!text.contains("first"), "{text}");
+            assert!(!text.contains("500"), "{text}");
         }
     }
 }

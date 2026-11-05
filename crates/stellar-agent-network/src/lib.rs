@@ -91,7 +91,7 @@ pub use account::{
     fetch_account, fetch_data_entry, fetch_trustline_entry,
 };
 pub use builder::{Asset, ClassicOpBuilder};
-pub use client::{StellarRpcClient, TransactionStatusView};
+pub use client::{PreparedSigningLedgerRead, StellarRpcClient, TransactionStatusView};
 pub use context::{MainnetEndpointFlags, MainnetWriteContext, NetworkContext};
 pub use endpoint_identity::{
     EndpointIdentity, MainnetOracle, SUPPORTED_PROTOCOL_VERSIONS, SigningLedgerObservation,
