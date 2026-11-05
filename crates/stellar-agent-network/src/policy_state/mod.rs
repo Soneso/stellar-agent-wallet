@@ -86,6 +86,10 @@
 //! capacity and create no definitive failed row. A checked accounting decision
 //! binds chain, reservation, generation, and evidence. Conservative expiry
 //! records `submission.accounting_expired` with the chain outcome unknown.
+//! Accounting expiry creates a durable audit obligation in the same
+//! authenticated successor. Delivery verifies retained history, appends at
+//! most one event per decision identifier in that history, and commits
+//! acknowledgement.
 //! An explicit operator clear records its acknowledgement before releasing
 //! untimed exposure. Bounded clears preserve the accounting horizon.
 //!
@@ -179,6 +183,8 @@
 //!
 //! Entries older than the largest supported criterion window (`1w` =
 //! 604,800 s) are pruned on every write once confirmed. Pending records are retained.
+//! Accounting-expiry records are retained until audit acknowledgement and
+//! receipt projection both complete.
 
 pub mod ledger;
 pub mod lock;
@@ -192,11 +198,12 @@ pub use ledger::{
     WindowReservation,
 };
 pub use store::{
-    AccountingDecision, ChainScope, MintOutcome, POLICY_STATE_KEY_FIELD, PersistedWindowStore,
-    RECONCILE_BUDGET, RECONCILE_MIN_AGE_MS, REPORTED_SUCCESS_CODE, RETENTION_EXPIRED_CODE,
-    ReconcileFailure, ReconcileFailureKind, ReconcileReport, ReportedAnswer, ResetError,
-    ResetOutcome, ResetRecord, SettledSubmission, StateDefect, SubmissionAnchor, SubmissionHold,
-    UnrecordedAnswer,
+    AccountingDecision, ChainScope, DeliveryReport, MintOutcome, OwedAccountingExpiries,
+    POLICY_STATE_KEY_FIELD, PersistedWindowStore, RECONCILE_BUDGET, RECONCILE_MIN_AGE_MS,
+    REPORTED_SUCCESS_CODE, RETENTION_EXPIRED_CODE, ReconcileFailure, ReconcileFailureKind,
+    ReconcileReport, ReportedAnswer, ResetError, ResetOutcome, ResetRecord, SettledSubmission,
+    StateDefect, SubmissionAnchor, SubmissionHold, UnrecordedAnswer, deliver_accounting_expiries,
+    deliver_accounting_expiry, drain_accounting_obligations, project_accounting_expiries,
 };
 
 /// Records a confirmed call's contribution into `engine`'s window state and
@@ -378,6 +385,19 @@ pub enum WindowStoreError {
         /// The typed denial, built from the refused entry's limit.
         reason: Box<stellar_agent_core::policy::DenyReason>,
     },
+
+    /// The window state holds an accounting-expiry audit obligation that
+    /// delivery has not acknowledged.
+    ///
+    /// Produced by [`PersistedWindowStore::reset`] before its recorder runs.
+    /// An empty successor would erase the obligation, so the reset refuses
+    /// until the owed `submission_accounting_expired` event is delivered.
+    /// Nothing changed.
+    #[error(
+        "the spending window owes an accounting audit event that is not delivered yet; the \
+         reset refuses until it is"
+    )]
+    AccountingAuditOwed,
 
     /// The file already holds a record under the reservation's id.
     ///

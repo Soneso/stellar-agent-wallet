@@ -125,8 +125,8 @@
 //! keeps its idempotency anchor: a byte-identical resubmission of those exact
 //! bytes is still recognised. That costs nothing in practice, because a
 //! follow-up runs a fresh simulate whose fee moves the bytes. An audit row
-//! names the state the clear replaced and any accounting disposition. A
-//! cleared receipt owes no settlement row.
+//! names the state the clear replaced and any authenticated accounting
+//! disposition. No receipt status or release code writes a settlement row.
 //!
 //! The row is written first, then the accounting transition, then the mark.
 //! A re-run after a failure part-way writes no second row. A clear of an
@@ -407,13 +407,12 @@ async fn run_clear(args: &ClearArgs) -> i32 {
     // The local rule, before anything is reconciled, released or marked.
     // With `--acknowledge`, a terminal receipt without a hold has already
     // acquired the audit writer above to look for an interrupted clear; the
-    // acquisition can drain queued rows or return an audit error. Without a
-    // matching row the receipt is refused here, without reconciliation,
-    // release or marking: a re-run on an already-cleared receipt, or a
-    // bounded receipt the network has answered for, writes no row of its
-    // own.
+    // acquisition can drain queued rows or return an audit error. A `failed`
+    // receipt without a hold proceeds to the endpoint check. Any other
+    // receipt this rule refuses writes no row: a re-run on a cleared receipt,
+    // or a bounded receipt the network has answered for.
     if let Some(existing) = &existing
-        && !clearable(&existing.status, unbounded_hold)
+        && !clearable(&existing.status, held.as_ref())
     {
         render_json(&Envelope::<()>::err_raw(
             "submission.not_clearable",
@@ -426,8 +425,8 @@ async fn run_clear(args: &ClearArgs) -> i32 {
                 format!(
                     "a submission recorded as '{}' is not cleared by an operator; only a \
                      submission the endpoint cannot account for, one whose outcome is \
-                     recorded as ambiguous, and one whose authenticated hold has no time \
-                     bound, are",
+                     recorded as ambiguous, a failed one without an authenticated hold, and \
+                     one whose authenticated hold has no time bound, are",
                     existing.status.label()
                 )
             },
@@ -477,10 +476,12 @@ async fn run_clear(args: &ClearArgs) -> i32 {
     };
     // A mainnet primary's FAILED without an oracle is a claim nothing can
     // confirm: reconciliation keeps the reservation on it, and `tx status`
-    // cannot settle it either. It goes on to the acknowledged unknown outcome
-    // and its time-bound guard rather than being refused here.
-    let unconfirmable_failure =
-        chain.status == "FAILED" && profile.chain_id.is_mainnet() && oracle.is_none();
+    // cannot settle it either. A FAILED for a submission without a held
+    // reservation is an unauthenticated report reconciliation records
+    // nothing on. Both go on to the acknowledged unknown outcome and its
+    // time-bound guard rather than being refused here.
+    let unconfirmable_failure = chain.status == "FAILED"
+        && ((profile.chain_id.is_mainnet() && oracle.is_none()) || held.is_none());
     if !unbounded_hold
         && (chain.status == "SUCCESS" || (chain.status == "FAILED" && !unconfirmable_failure))
     {
@@ -500,16 +501,21 @@ async fn run_clear(args: &ClearArgs) -> i32 {
     // The oracle is refused on the same terms as the endpoint, and only an
     // oracle that reports mainnet answers at all. The oracle checked here is
     // the one reconciliation asks.
+    let veto = if unbounded_hold {
+        OracleVeto::Nothing
+    } else if held.is_none() {
+        OracleVeto::Success
+    } else {
+        OracleVeto::SuccessAndFailure
+    };
     let checked_oracle = match &oracle {
-        Some(oracle) => {
-            match oracle_precheck(oracle, &tx_hash, oracle_deadline, !unbounded_hold).await {
-                Ok(checked) => Some(checked),
-                Err(refusal) => {
-                    render_json(&refusal);
-                    return 1;
-                }
+        Some(oracle) => match oracle_precheck(oracle, &tx_hash, oracle_deadline, veto).await {
+            Ok(checked) => Some(checked),
+            Err(refusal) => {
+                render_json(&refusal);
+                return 1;
             }
-        }
+        },
         None => None,
     };
 
@@ -611,7 +617,7 @@ async fn run_clear(args: &ClearArgs) -> i32 {
             held.max_time,
             held.submission_ledger,
         ) {
-            Ok(record) if clearable(&record.status, unbounded_hold) => {}
+            Ok(record) if clearable(&record.status, Some(held)) => {}
             Ok(_) => {
                 render_json(&Envelope::<()>::err_raw(
                     "submission.not_clearable",
@@ -674,11 +680,24 @@ async fn run_clear(args: &ClearArgs) -> i32 {
         Ok(held) => held,
         Err(code) => return code,
     };
+    // The accounting decision comes from the verified window state, never
+    // from the receipt's release code.
+    let verified_decision = match window.accounting_expiry_for(&profile, &args.envelope_hash) {
+        Ok(decision) => decision,
+        Err(error) => {
+            render_json(&Envelope::<()>::err_raw(
+                error.submission_code(),
+                format!("the spending-window file could not be read: {error}"),
+            ));
+            return 1;
+        }
+    };
 
     let (evidence, exposure) = match clear_decision(
         &receipt,
         &report,
         held_now.as_ref(),
+        verified_decision.as_deref(),
         now_ms,
         context.chain_id.is_mainnet(),
         args.acknowledge_unbounded,
@@ -726,7 +745,7 @@ async fn run_clear(args: &ClearArgs) -> i32 {
         evidence,
         reservation_released,
         exposure,
-        held_now.as_ref().is_some_and(|hold| hold.max_time == 0),
+        ClearMark::for_hold(held_now.as_ref()),
         context.chain_id.caip2_str(),
         || {
             if let Some(decision) = decision {
@@ -761,10 +780,11 @@ async fn run_clear(args: &ClearArgs) -> i32 {
 /// 2. **Checked transition.** `apply` applies the accounting decision the
 ///    store checked against the authenticated hold. A refusal leaves the clear
 ///    row in place and the receipt clearable.
-/// 3. **Mark.** The receipt is marked `cleared_by_operator`. Under an untimed
-///    authenticated hold (`unbounded_hold`) every state but an earlier clear
-///    is accepted; otherwise only a state the operator may clear. A failed
-///    mark leaves the receipt clearable.
+/// 3. **Mark.** The receipt is marked `cleared_by_operator` under the rule
+///    `mark` names: under an untimed authenticated hold every state but an
+///    earlier clear, without a hold also a failure report, and otherwise only
+///    a state the operator may clear. A failed mark leaves the receipt
+///    clearable.
 ///
 /// A re-run after a failure part-way finds the clear row already written and
 /// writes none again. After a failed transition the hold stands and the
@@ -801,7 +821,7 @@ fn record_and_mark_clear_with(
     evidence: Option<ClearEvidence>,
     reservation_released: bool,
     unbounded_exposure: bool,
-    unbounded_hold: bool,
+    mark: ClearMark,
     chain_id: &str,
     apply: impl FnOnce() -> Result<(), Envelope<()>>,
 ) -> Result<ClearData, Envelope<()>> {
@@ -844,10 +864,10 @@ fn record_and_mark_clear_with(
 
     apply()?;
 
-    let marked = if unbounded_hold {
-        receipts.clear_unbounded_by_operator(&receipt.envelope_hash)
-    } else {
-        receipts.clear_by_operator(&receipt.envelope_hash)
+    let marked = match mark {
+        ClearMark::UntimedHold => receipts.clear_unbounded_by_operator(&receipt.envelope_hash),
+        ClearMark::BoundedHold => receipts.clear_by_operator(&receipt.envelope_hash),
+        ClearMark::Unheld => receipts.clear_unheld_by_operator(&receipt.envelope_hash),
     };
     marked.map_err(|e| {
         Envelope::<()>::err_raw(
@@ -912,7 +932,7 @@ fn finish_recorded_unbounded_clear(
         None,
         true,
         true,
-        true,
+        ClearMark::UntimedHold,
         chain_id,
         || Ok(()),
     ) {
@@ -975,8 +995,7 @@ fn open_reservation(
 /// chain outcome.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ClearEvidence {
-    /// The accounting disposition the receipt carries and the authenticated
-    /// window bears out.
+    /// The accounting disposition the verified window state committed.
     Disposition(ReleaseEvidence),
     /// The endpoint's answer this run's reconciliation did not record, because
     /// the receipt of an untimed hold keeps its recorded network answer.
@@ -1016,14 +1035,43 @@ enum ClearDecision {
     Refuse(Envelope<()>),
 }
 
-/// Whether the operator may clear a receipt in `status`: any state but an
-/// earlier clear under an untimed authenticated hold, otherwise the states
-/// [`ReceiptStatus::is_operator_clearable`] names.
-fn clearable(status: &ReceiptStatus, unbounded_hold: bool) -> bool {
-    if unbounded_hold {
-        status.is_clearable_with_unbounded_hold()
-    } else {
-        status.is_operator_clearable()
+/// Which receipt rule marks a clear, by the authenticated hold the clear
+/// acts on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClearMark {
+    /// An untimed hold: every state but an earlier clear.
+    UntimedHold,
+    /// A bounded hold: the states [`ReceiptStatus::is_operator_clearable`]
+    /// names.
+    BoundedHold,
+    /// No hold: the states
+    /// [`ReceiptStatus::is_operator_clearable_without_hold`] names.
+    Unheld,
+}
+
+impl ClearMark {
+    /// The rule for a clear of a submission whose authenticated hold is
+    /// `held`.
+    fn for_hold(held: Option<&SubmissionHold>) -> Self {
+        match held {
+            Some(hold) if hold.max_time == 0 => Self::UntimedHold,
+            Some(_) => Self::BoundedHold,
+            None => Self::Unheld,
+        }
+    }
+}
+
+/// Whether the operator may clear a receipt in `status` whose authenticated
+/// hold is `held`: any state but an earlier clear under an untimed hold, the
+/// states [`ReceiptStatus::is_operator_clearable`] names under a bounded hold,
+/// and also a failure report without a hold. An endpoint failure report is
+/// unauthenticated, so it settles nothing; without a hold the clear releases
+/// no counted exposure.
+fn clearable(status: &ReceiptStatus, held: Option<&SubmissionHold>) -> bool {
+    match ClearMark::for_hold(held) {
+        ClearMark::UntimedHold => status.is_clearable_with_unbounded_hold(),
+        ClearMark::BoundedHold => status.is_operator_clearable(),
+        ClearMark::Unheld => status.is_operator_clearable_without_hold(),
     }
 }
 
@@ -1043,7 +1091,7 @@ fn unbounded_exposure(
         None => {
             mainnet
                 && receipt.is_some_and(|receipt| {
-                    receipt.status.is_operator_clearable()
+                    receipt.status.is_operator_clearable_without_hold()
                         && receipt.submitted
                         && receipt.max_time == 0
                 })
@@ -1064,10 +1112,16 @@ fn unbounded_exposure(
 ///
 /// An orphan's receipt restored under the retention rule is `Ambiguous`
 /// without evidence, so it is cleared with an unknown outcome.
+///
+/// `verified_decision` is the accounting-expiry decision the verified window
+/// state holds for the submission. Only that decision, projected onto the
+/// receipt, makes the clear row's evidence `submission.accounting_expired`; a
+/// release code on the receipt alone is display data and no evidence.
 fn clear_decision(
     receipt: &SubmissionReceipt,
     report: &ReconcileReport,
     held_now: Option<&SubmissionHold>,
+    verified_decision: Option<&str>,
     now_ms: u64,
     mainnet: bool,
     acknowledge_unbounded: bool,
@@ -1075,7 +1129,7 @@ fn clear_decision(
     let unbounded_hold = held_now.is_some_and(|hold| hold.max_time == 0);
     let max_time = held_now.map_or(receipt.max_time, |hold| hold.max_time);
     // A terminal receipt report is not operator-clearable under a bounded hold.
-    if !clearable(&receipt.status, unbounded_hold) {
+    if !clearable(&receipt.status, held_now) {
         return ClearDecision::Refuse(settled_by_reconciliation(
             "reconciliation",
             receipt.status.label(),
@@ -1091,30 +1145,46 @@ fn clear_decision(
             ),
         ));
     }
+    // The receipt must carry the projection of every authenticated decision:
+    // the one this run committed and the one the verified window state holds.
+    // Projection gives an open receipt the accounting code and leaves every
+    // other status and its code in place, so only an open receipt needs it.
+    let projected = |decision_id: &str| {
+        receipt.settlement_decision_id.as_deref() == Some(decision_id)
+            && (!matches!(
+                receipt.status,
+                ReceiptStatus::Pending | ReceiptStatus::Ambiguous
+            ) || (receipt.status == ReceiptStatus::Ambiguous
+                && receipt.release_code == Some(ReleaseEvidence::AccountingExpired)))
+    };
     if report.settled.iter().any(|settled| {
         settled.envelope_hash == receipt.envelope_hash
-            && (settled.status != receipt.status || settled.release_code != receipt.release_code)
-    }) || report.unrecorded.iter().any(|unrecorded| {
-        unrecorded.envelope_hash == receipt.envelope_hash && unrecorded.recorded != receipt.status
-    }) {
+            && (!projected(&settled.decision_id)
+                || verified_decision != Some(settled.decision_id.as_str()))
+    }) || verified_decision.is_some_and(|decision_id| !projected(decision_id))
+        || report.unrecorded.iter().any(|unrecorded| {
+            unrecorded.envelope_hash == receipt.envelope_hash
+                && unrecorded.recorded != receipt.status
+        })
+    {
         return ClearDecision::Refuse(Envelope::<()>::err_raw(
             "submission.record_unavailable",
             "the submission receipt disagrees with its reconciliation; \
              run `stellar-agent tx status` on it again",
         ));
     }
-    // A disposition without a live authenticated hold remains visible on the
-    // acknowledgement. It does not create a definitive chain outcome row.
+    // An authenticated accounting expiry ended the hold. The clear row
+    // records that disposition; it creates no definitive chain outcome row.
     if !unbounded_hold
+        && held_now.is_none()
         && receipt.status == ReceiptStatus::Ambiguous
-        && let Some(code) = receipt.release_code
-        && (held_now.is_none()
-            || report.settled.iter().any(|settled| {
-                settled.envelope_hash == receipt.envelope_hash && settled.release_code == Some(code)
-            }))
+        && let Some(decision_id) = verified_decision
+        && projected(decision_id)
     {
         return ClearDecision::Clear {
-            evidence: Some(ClearEvidence::Disposition(code)),
+            evidence: Some(ClearEvidence::Disposition(
+                ReleaseEvidence::AccountingExpired,
+            )),
             unbounded_exposure: false,
         };
     }
@@ -1202,24 +1272,46 @@ fn clear_decision(
     }
 }
 
+/// The oracle reports that refuse a clear, by the submission's
+/// authenticated hold. The endpoint's own answer is refused on the same
+/// terms.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OracleVeto {
+    /// An untimed hold: no report settles its exposure.
+    Nothing,
+    /// No hold: a `FAILED` report is unauthenticated and settles nothing,
+    /// so only `SUCCESS` refuses.
+    Success,
+    /// A bounded hold: `SUCCESS` and `FAILED` both refuse the clear.
+    SuccessAndFailure,
+}
+
+impl OracleVeto {
+    /// Whether the oracle's `status` refuses the clear.
+    fn refuses(self, status: &str) -> bool {
+        match self {
+            Self::Nothing => false,
+            Self::Success => status == "SUCCESS",
+            Self::SuccessAndFailure => status == "SUCCESS" || status == "FAILED",
+        }
+    }
+}
+
 /// Checks that the oracle serves mainnet and asks it what became of
 /// `tx_hash`, both reads bounded by `deadline`, and returns the checked
 /// oracle for the reconciliation that follows.
 ///
-/// `refuse_reports` is false for an untimed authenticated hold, whose clear no
-/// oracle report settles.
-///
 /// # Errors
 ///
 /// The refusal of the clear, when the oracle does not report the mainnet
-/// passphrase or cannot answer, and, with `refuse_reports`, when it reports
-/// the transaction `SUCCESS` or `FAILED`. A `NOT_FOUND` from the oracle
-/// refuses nothing: the acknowledgement and reconciliation decide.
+/// passphrase or cannot answer, and when it reports a status `veto` refuses.
+/// A `NOT_FOUND` from the oracle refuses nothing: the acknowledgement and
+/// reconciliation decide.
 async fn oracle_precheck<'o>(
     oracle: &'o stellar_agent_network::StellarRpcClient,
     tx_hash: &str,
     deadline: tokio::time::Instant,
-    refuse_reports: bool,
+    veto: OracleVeto,
 ) -> Result<MainnetOracle<'o>, Envelope<()>> {
     let oracle = match MainnetOracle::verify(oracle, deadline).await {
         Ok(oracle) => oracle,
@@ -1255,7 +1347,7 @@ async fn oracle_precheck<'o>(
                 ));
             }
         };
-    if refuse_reports && (answer.status == "SUCCESS" || answer.status == "FAILED") {
+    if veto.refuses(&answer.status) {
         return Err(settled_by_reconciliation(
             "the oracle",
             &answer.status.to_lowercase(),
@@ -1371,7 +1463,7 @@ mod tests {
             evidence,
             reservation_released,
             unbounded_exposure,
-            false,
+            ClearMark::BoundedHold,
             chain_id,
             || Ok(()),
         )
@@ -1611,8 +1703,8 @@ mod tests {
     /// A clear lookup that cannot read the retained history refuses before the
     /// clear row and the mark, and the receipt stays as it was.
     ///
-    /// The receipt carries no release evidence, so no settled row is owed and
-    /// the strict settlement has nothing to look up. The active file holds no
+    /// No receipt status writes a settlement row, so the clear lookup is the
+    /// only history read. The active file holds no
     /// clear row for the submission, so the clear lookup visits the archive,
     /// whose interior link is broken.
     #[test]
@@ -1811,9 +1903,11 @@ mod tests {
         );
     }
 
-    /// A failed receipt write or a disagreement prevents the operator clear.
+    /// A failed receipt projection or a disagreement with the verified
+    /// accounting state prevents the operator clear.
     #[test]
     fn a_clear_refuses_an_unrecorded_reconciliation() {
+        use stellar_agent_core::profile::receipt::ReleaseEvidence;
         use stellar_agent_network::policy_state::{ReconcileReport, SettledSubmission};
 
         let dir = tempfile::tempdir().expect("tmp dir");
@@ -1823,33 +1917,106 @@ mod tests {
             .try_begin(&id, &"6b".repeat(32), "GSOURCE", 7, 0, 100)
             .expect("receipt");
         let receipt = receipts.get(&id).expect("read").expect("present");
+        let decision_id = "d1".repeat(32);
         let failed = ReconcileReport {
             receipt_write_failed: 1,
             receipt_write_error: Some("receipt store writer is locked".to_owned()),
             ..ReconcileReport::default()
         };
-        let disagrees = ReconcileReport {
+        let committed = ReconcileReport {
+            released: 1,
             settled: vec![SettledSubmission {
-                envelope_hash: id,
+                envelope_hash: id.clone(),
                 tx_hash: receipt.tx_hash.clone(),
-                status: ReceiptStatus::Success,
-                release_code: None,
-                ledger: Some(150),
+                decision_id: decision_id.clone(),
             }],
             ..ReconcileReport::default()
         };
-        for report in [failed, disagrees] {
-            let decision = clear_decision(&receipt, &report, None, 0, false, false);
-            assert!(matches!(decision, ClearDecision::Refuse(_)));
-            if let ClearDecision::Refuse(refusal) = decision {
-                assert_eq!(
-                    refusal.error.as_ref().expect("refusal").code,
-                    "submission.record_unavailable"
-                );
-                if let Some(error) = report.receipt_write_error {
-                    assert!(refusal.error.expect("refusal").message.contains(&error));
-                }
+        let mut projected = receipt.clone();
+        projected.status = ReceiptStatus::Ambiguous;
+        projected.release_code = Some(ReleaseEvidence::AccountingExpired);
+        projected.settlement_decision_id = Some(decision_id.clone());
+        let mut other = projected.clone();
+        other.settlement_decision_id = Some("d2".repeat(32));
+        // Projection keeps a failed receipt's status and code and adds only
+        // the identifier.
+        let mut failed_projected = receipt.clone();
+        failed_projected.status = ReceiptStatus::Failed {
+            code: "ledger.op_failed".to_owned(),
+        };
+        failed_projected.settlement_decision_id = Some(decision_id.clone());
+        let mut failed_other = failed_projected.clone();
+        failed_other.settlement_decision_id = Some("d2".repeat(32));
+        let cases: [(&SubmissionReceipt, &ReconcileReport, Option<&str>); 7] = [
+            // The receipt projection of this run's expiry failed.
+            (&receipt, &failed, None),
+            // This run committed an expiry the receipt does not carry.
+            (&receipt, &committed, Some(decision_id.as_str())),
+            // The receipt names another decision than the committed one.
+            (&other, &committed, Some(decision_id.as_str())),
+            // The verified state holds an expiry the receipt does not carry.
+            (
+                &receipt,
+                &ReconcileReport::default(),
+                Some(decision_id.as_str()),
+            ),
+            // This run's expiry is absent from the verified state.
+            (&projected, &committed, None),
+            // A failed receipt names another decision than the verified one.
+            (
+                &failed_other,
+                &ReconcileReport::default(),
+                Some(decision_id.as_str()),
+            ),
+            (&failed_other, &committed, Some(decision_id.as_str())),
+        ];
+        for (receipt, report, verified) in cases {
+            let decision = clear_decision(receipt, report, None, verified, 0, false, false);
+            let (code, message) = refusal_of(decision).expect("the clear is refused");
+            assert_eq!(code, "submission.record_unavailable", "{message}");
+            if let Some(error) = &report.receipt_write_error {
+                assert!(message.contains(error), "{message}");
             }
+        }
+        assert!(matches!(
+            clear_decision(
+                &projected,
+                &committed,
+                None,
+                Some(decision_id.as_str()),
+                0,
+                false,
+                false
+            ),
+            ClearDecision::Clear {
+                evidence: Some(ClearEvidence::Disposition(
+                    ReleaseEvidence::AccountingExpired
+                )),
+                unbounded_exposure: false,
+            }
+        ));
+        // An unheld failed receipt that carries the verified identifier
+        // clears on the acknowledgement, whether this run or an earlier one
+        // committed the expiry.
+        for report in [&ReconcileReport::default(), &committed] {
+            assert!(
+                matches!(
+                    clear_decision(
+                        &failed_projected,
+                        report,
+                        None,
+                        Some(decision_id.as_str()),
+                        0,
+                        false,
+                        false
+                    ),
+                    ClearDecision::Clear {
+                        evidence: None,
+                        unbounded_exposure: false,
+                    }
+                ),
+                "{report:?}"
+            );
         }
     }
 
@@ -1910,7 +2077,8 @@ mod tests {
                         ),
                         _ => (ReconcileReport::default(), None),
                     };
-                    let refused = clear_decision(&receipt, &report, Some(&held), 0, mainnet, false);
+                    let refused =
+                        clear_decision(&receipt, &report, Some(&held), None, 0, mainnet, false);
                     if hold_max > 0 {
                         let expected = if status.is_operator_clearable() {
                             "submission.still_pending"
@@ -1931,7 +2099,8 @@ mod tests {
                     );
                     assert!(message.contains("--acknowledge --acknowledge-unbounded"));
                     assert!(message.contains("sequence 7"));
-                    let decision = clear_decision(&receipt, &report, Some(&held), 0, mainnet, true);
+                    let decision =
+                        clear_decision(&receipt, &report, Some(&held), None, 0, mainnet, true);
                     assert!(
                         matches!(
                             decision,
@@ -1953,6 +2122,7 @@ mod tests {
                             &receipt,
                             &store_failed,
                             Some(&held),
+                            None,
                             0,
                             mainnet,
                             true
@@ -1969,6 +2139,7 @@ mod tests {
                             &receipt,
                             &elsewhere,
                             Some(&held),
+                            None,
                             0,
                             mainnet,
                             true
@@ -2013,6 +2184,7 @@ mod tests {
                 &receipt,
                 &ReconcileReport::default(),
                 None,
+                None,
                 0,
                 true,
                 false
@@ -2022,7 +2194,15 @@ mod tests {
             "submission.unbounded_exposure"
         );
         assert!(matches!(
-            clear_decision(&receipt, &ReconcileReport::default(), None, 0, false, false),
+            clear_decision(
+                &receipt,
+                &ReconcileReport::default(),
+                None,
+                None,
+                0,
+                false,
+                false
+            ),
             ClearDecision::Clear {
                 evidence: None,
                 unbounded_exposure: false
@@ -2037,12 +2217,12 @@ mod tests {
         receipt.max_time = 123;
         receipt.submitted = false;
         let report = ReconcileReport::default();
-        let refusal = clear_decision(&receipt, &report, Some(&held), 200_000, true, false);
+        let refusal = clear_decision(&receipt, &report, Some(&held), None, 200_000, true, false);
         assert_eq!(
             refusal_of(refusal).expect("unbounded refusal").0,
             "submission.unbounded_exposure"
         );
-        let decision = clear_decision(&receipt, &report, Some(&held), 200_000, true, true);
+        let decision = clear_decision(&receipt, &report, Some(&held), None, 200_000, true, true);
         assert!(matches!(
             decision,
             ClearDecision::Clear {
@@ -2092,10 +2272,11 @@ mod tests {
         }
     }
 
-    /// A receipt's release code is evidence only where the window bears it
-    /// out: this run released the reservation under it, or the window no
-    /// longer holds the reservation. A code on a receipt whose reservation
-    /// stands, with no release this run, clears as an unknown outcome.
+    /// A receipt's release code is display data: a fabricated code
+    /// establishes no accounting decision, with or without a hold, and the
+    /// clear proceeds on the operator's acknowledgement alone. A verified
+    /// accounting expiry, projected onto the receipt, supplies
+    /// `submission.accounting_expired` as the clear row's evidence.
     #[test]
     fn a_release_code_the_window_does_not_bear_out_is_no_evidence() {
         use stellar_agent_core::profile::receipt::ReleaseEvidence;
@@ -2108,71 +2289,82 @@ mod tests {
         receipt.status = ReceiptStatus::Ambiguous;
         receipt.release_code = Some(ReleaseEvidence::SequenceConsumed);
         let held = held_for(&receipt);
-
-        let decision = clear_decision(
-            &receipt,
-            &ReconcileReport::default(),
-            Some(&held),
-            NOW_MS,
-            false,
-            false,
-        );
-        assert!(
+        let no_evidence = |decision: ClearDecision| {
             matches!(
                 decision,
                 ClearDecision::Clear {
                     evidence: None,
                     unbounded_exposure: false
                 }
-            ),
-            "{decision:?}"
-        );
+            )
+        };
 
+        for (code, hold) in [
+            (ReleaseEvidence::SequenceConsumed, Some(&held)),
+            (ReleaseEvidence::SequenceConsumed, None),
+            (ReleaseEvidence::TimeBoundPassed, None),
+            (ReleaseEvidence::AccountingExpired, None),
+        ] {
+            receipt.release_code = Some(code);
+            let decision = clear_decision(
+                &receipt,
+                &ReconcileReport::default(),
+                hold,
+                None,
+                NOW_MS,
+                false,
+                false,
+            );
+            assert!(no_evidence(decision), "{code:?}");
+        }
+
+        let decision_id = "e7".repeat(32);
+        receipt.release_code = Some(ReleaseEvidence::AccountingExpired);
+        receipt.settlement_decision_id = Some(decision_id.clone());
         let released_now = ReconcileReport {
             released: 1,
             settled: vec![SettledSubmission {
                 envelope_hash: receipt.envelope_hash.clone(),
                 tx_hash: receipt.tx_hash.clone(),
-                status: ReceiptStatus::Ambiguous,
-                release_code: Some(ReleaseEvidence::SequenceConsumed),
-                ledger: None,
+                decision_id: decision_id.clone(),
             }],
             ..ReconcileReport::default()
         };
-        let decision = clear_decision(&receipt, &released_now, Some(&held), NOW_MS, false, false);
-        assert!(
-            matches!(
-                decision,
-                ClearDecision::Clear {
-                    evidence: Some(ClearEvidence::Disposition(
-                        ReleaseEvidence::SequenceConsumed
-                    )),
-                    unbounded_exposure: false
-                }
-            ),
-            "{decision:?}"
-        );
+        for report in [&released_now, &ReconcileReport::default()] {
+            let decision = clear_decision(
+                &receipt,
+                report,
+                None,
+                Some(decision_id.as_str()),
+                NOW_MS,
+                false,
+                false,
+            );
+            assert!(
+                matches!(
+                    decision,
+                    ClearDecision::Clear {
+                        evidence: Some(ClearEvidence::Disposition(
+                            ReleaseEvidence::AccountingExpired
+                        )),
+                        unbounded_exposure: false
+                    }
+                ),
+                "{decision:?}"
+            );
+        }
 
+        // A copied identifier proves nothing without the verified record.
         let decision = clear_decision(
             &receipt,
             &ReconcileReport::default(),
+            None,
             None,
             NOW_MS,
             false,
             false,
         );
-        assert!(
-            matches!(
-                decision,
-                ClearDecision::Clear {
-                    evidence: Some(ClearEvidence::Disposition(
-                        ReleaseEvidence::SequenceConsumed
-                    )),
-                    unbounded_exposure: false
-                }
-            ),
-            "{decision:?}"
-        );
+        assert!(no_evidence(decision));
     }
 
     /// Without an oracle a timed submission is decided on the host clock: it
@@ -2202,6 +2394,7 @@ mod tests {
                 &receipt,
                 &unwitnessed,
                 Some(&held),
+                None,
                 now_s * 1_000,
                 false,
                 false,
@@ -2215,6 +2408,7 @@ mod tests {
             &receipt,
             &unwitnessed,
             Some(&held),
+            None,
             (max_time + 1) * 1_000,
             false,
             false,
@@ -2235,6 +2429,7 @@ mod tests {
             &receipt,
             &unreachable,
             Some(&held),
+            None,
             (max_time + 1) * 1_000,
             false,
             false,
@@ -2327,7 +2522,8 @@ mod tests {
 
     /// The oracle's `SUCCESS` and `FAILED` refuse a clear of a bounded hold,
     /// and so does an oracle that cannot answer; its `NOT_FOUND` refuses
-    /// nothing. For an untimed hold no oracle report refuses the clear.
+    /// nothing. Without a hold only its `SUCCESS` refuses. For an untimed
+    /// hold no oracle report refuses the clear.
     #[tokio::test]
     async fn the_oracle_answer_decides_whether_a_clear_is_refused() {
         use stellar_agent_core::profile::caip2::MAINNET_PASSPHRASE;
@@ -2337,18 +2533,25 @@ mod tests {
         for status in ["SUCCESS", "FAILED", "NOT_FOUND"] {
             let (_server, oracle) = oracle_reporting(MAINNET_PASSPHRASE, status).await;
             assert!(
-                oracle_precheck(&oracle, &tx_hash, oracle_deadline(), false)
+                oracle_precheck(&oracle, &tx_hash, oracle_deadline(), OracleVeto::Nothing)
                     .await
                     .is_ok(),
                 "{status}: an untimed hold's clear is not refused on an oracle report"
             );
         }
-        for (status, refused) in [("SUCCESS", true), ("FAILED", true), ("NOT_FOUND", false)] {
+        for (veto, status, refused) in [
+            (OracleVeto::SuccessAndFailure, "SUCCESS", true),
+            (OracleVeto::SuccessAndFailure, "FAILED", true),
+            (OracleVeto::SuccessAndFailure, "NOT_FOUND", false),
+            (OracleVeto::Success, "SUCCESS", true),
+            (OracleVeto::Success, "FAILED", false),
+            (OracleVeto::Success, "NOT_FOUND", false),
+        ] {
             let (_server, oracle) = oracle_reporting(MAINNET_PASSPHRASE, status).await;
 
-            let checked = oracle_precheck(&oracle, &tx_hash, oracle_deadline(), true).await;
+            let checked = oracle_precheck(&oracle, &tx_hash, oracle_deadline(), veto).await;
 
-            assert_eq!(checked.is_err(), refused, "{status}");
+            assert_eq!(checked.is_err(), refused, "{veto:?} {status}");
             if refused {
                 let (code, message) = oracle_refusal_error(checked);
                 assert_eq!(code, "submission.not_clearable", "{status}");
@@ -2368,7 +2571,7 @@ mod tests {
                 &unreachable,
                 &tx_hash,
                 tokio::time::Instant::now() + std::time::Duration::from_secs(1),
-                false,
+                OracleVeto::Nothing,
             )
             .await,
         );
@@ -2389,7 +2592,7 @@ mod tests {
         let (server, oracle) = oracle_reporting(TESTNET_PASSPHRASE, "NOT_FOUND").await;
 
         let (code, message) = oracle_refusal_error(
-            oracle_precheck(&oracle, &tx_hash, oracle_deadline(), false).await,
+            oracle_precheck(&oracle, &tx_hash, oracle_deadline(), OracleVeto::Nothing).await,
         );
 
         assert_eq!(code, "submission.not_clearable");
@@ -2432,7 +2635,7 @@ mod tests {
             &oracle,
             &tx_hash,
             tokio::time::Instant::now() + DEADLINE,
-            true,
+            OracleVeto::SuccessAndFailure,
         )
         .await;
         let elapsed = started.elapsed();
@@ -2786,6 +2989,61 @@ mod tests {
                 message.starts_with("the endpoint reports this transaction as failed"),
                 "{message}"
             );
+        }
+
+        /// An oracle `FAILED` report refuses a bounded hold's clear before
+        /// reconciliation.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn an_oracle_failure_refuses_the_clear_of_a_held_submission() {
+            let fixture = Spec::new("clear-mainnet-oracle-failed-held")
+                .primary(answering("NOT_FOUND"))
+                .oracle(answering("FAILED"))
+                .build()
+                .await;
+            seed_submission(&fixture, now_secs() - 10);
+
+            let run = clear(&fixture, false).await;
+
+            assert_refused_untouched(&fixture, &run, "submission.not_clearable");
+            let message = run.1["error"]["message"].as_str().expect("message");
+            assert!(
+                message.starts_with("the oracle reports this transaction as failed"),
+                "{message}"
+            );
+        }
+
+        /// A `failed` receipt without a hold clears on the acknowledgement
+        /// while the endpoint and the oracle both report `FAILED`: the reports
+        /// are unauthenticated, and no counted exposure stands.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn an_unheld_failure_clears_while_endpoint_and_oracle_report_it() {
+            let fixture = Spec::new("clear-mainnet-unheld-failed")
+                .primary(answering("FAILED"))
+                .oracle(answering("FAILED"))
+                .build()
+                .await;
+            let source =
+                stellar_agent_test_support::signed_envelope::account_id_for_seed(AGENT_SEED);
+            let receipts = ReceiptStore::open(fixture.name).expect("receipt store");
+            receipts
+                .try_begin(ENVELOPE_HASH, TX_HASH, &source, 7, now_secs() - 10, 1_000)
+                .expect("receipt");
+            receipts.mark_submitted(ENVELOPE_HASH).expect("sent");
+            record_receipt_status(&fixture, failed_on_chain());
+
+            let (code, envelope) = clear(&fixture, false).await;
+
+            assert_eq!(code, 0, "{envelope}");
+            assert_eq!(envelope["data"]["cleared_from"], "failed", "{envelope}");
+            assert_eq!(envelope["data"]["reservation_released"], false);
+            assert_eq!(receipt_status(&fixture), ReceiptStatus::ClearedByOperator);
+            assert_eq!(fixture.pending_reservations(), 0);
+            let rows = fixture.audit_rows("submission_receipt_cleared");
+            assert_eq!(rows.len(), 1, "{rows:?}");
+            assert_eq!(rows[0]["envelope_hash"], ENVELOPE_HASH, "{}", rows[0]);
+            assert_eq!(rows[0]["reservation_released"], false, "{}", rows[0]);
         }
 
         /// An oracle that reports the testnet passphrase refuses the clear:
@@ -3273,6 +3531,7 @@ mod tests {
                 &receipt,
                 report,
                 held.as_ref(),
+                None,
                 now_ms,
                 profile.chain_id.is_mainnet(),
                 true,

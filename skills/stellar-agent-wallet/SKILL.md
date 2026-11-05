@@ -27,8 +27,8 @@ Both surfaces share the **policy engine**, **operator-approval spine**, and
 **tamper-evident audit log**. The log records transaction submissions, signed
 authorizations, approvals, and explicit key-management and lifecycle events.
 MCP balance reads and payment simulations produce no automatic invocation row.
-Under V1, payment simulations can reconcile overdue reservations and write
-settlement audit rows. Route payments, account creation, trustlines, and claims
+Under V1, payment simulations can reconcile overdue reservations and deliver
+owed accounting events. Route payments, account creation, trustlines, and claims
 through MCP's paired tools, where the pending-store approval loop exists.
 Leave operator approvals and key ceremonies to the operator.
 

@@ -16,11 +16,9 @@ use stellar_agent_core::envelope::Envelope;
 use stellar_agent_core::error::{SubmissionError, WalletError};
 use stellar_agent_core::policy::v1::ValueClass;
 use stellar_agent_core::policy::{PolicyEngine, ToolDescriptor};
-use stellar_agent_core::profile::receipt::{
-    ReceiptStatus, ReceiptStore, ReleaseEvidence, SettledRow,
-};
+use stellar_agent_core::profile::receipt::ReceiptStore;
 use stellar_agent_core::profile::schema::Profile;
-use stellar_agent_network::policy_state::PersistedWindowStore;
+use stellar_agent_network::policy_state::{DeliveryReport, PersistedWindowStore, ReconcileReport};
 use stellar_agent_network::{
     ApprovalTombstone, SequenceFloorHook, WalletSubmissionRecorder, envelope_hash_hex,
 };
@@ -452,121 +450,60 @@ pub(crate) async fn sign_and_submit_classic(
     }
 }
 
-/// Writes the value-action row that settles a reconciled submission.
+/// How a dispatch-time reconciliation pass ended.
+#[derive(Debug)]
+pub(crate) enum ReconcilePass {
+    /// The pass ran over the due reservations.
+    Completed(ReconcileReport),
+    /// The system clock is unavailable, so no pass ran.
+    ClockUnavailable,
+    /// The primary RPC client could not be built, so no pass ran.
+    ClientUnavailable,
+    /// The pass refused; every open reservation stands.
+    Failed(stellar_agent_network::policy_state::WindowStoreError),
+}
+
+/// Logs how a dispatch-time reconciliation pass ended, then drains every
+/// owed accounting obligation.
 ///
-/// The row carries the SAME value legs the gate sized, read back from the
-/// pending row this submission wrote before it was sent: they were derived
-/// once, at the gate, and are never re-derived here.
-///
-/// Only a `Failed` receipt owes a row: a `value_action_failed` row under its
-/// failure code. A reported success, an accounting disposition, a pending
-/// receipt and an ambiguous one leave the outcome open, which is what the
-/// pending row already records. A receipt an operator cleared owes no row by
-/// design; the `submission_receipt_cleared` row records the clear.
-///
-/// The writer guard is taken once and held through the settlement lookup and
-/// the append. The lookup reads the retained history through that guard,
-/// newest file first, up to the writer's verified tip, so a row appended to
-/// the file outside the writer is never read as a settlement. A settled row
-/// found there means the submission is accounted for, so a repeated
-/// reconciliation writes nothing.
-///
-/// Non-fatal: the chain has already answered, and the settled record is the
-/// receipt and the spending window. A poisoned guard or a row that cannot be
-/// appended is logged, and the receipt keeps what a later run needs to write
-/// it. A settlement lookup that cannot read the retained history is logged at
-/// WARN with the profile, the envelope hash, and the error, and writes
-/// nothing: whether the row is owed is unknown, and a row written on a guess
-/// could count one spend twice.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "settlement carries submission identity, its evidence and the reconciliation decision"
-)]
-pub(crate) fn write_settled_row(
+/// The drain runs whatever the pass did: a skipped or refused pass leaves
+/// the durable obligations of earlier passes in place, and they are
+/// delivered here. The writer is the keyed one every value verb uses,
+/// acquired only when an audit event is owed.
+pub(crate) fn finish_reconciliation(
     profile: &Profile,
     profile_name: &str,
-    audit: &Arc<Mutex<AuditWriter>>,
-    envelope_hash: &str,
-    tx_hash: &str,
-    status: &ReceiptStatus,
-    release_code: Option<ReleaseEvidence>,
-    reconciliation_decision: stellar_agent_core::audit_log::PolicyDecision,
-) {
-    use stellar_agent_core::audit_log::{AuditEntry, reader::ValueActionSettlement};
-
-    let Some(row) = status.settled_row(release_code) else {
-        return;
-    };
-
-    let Ok(mut guard) = audit.lock() else {
-        tracing::warn!(
+    binding: stellar_agent_core::audit_log::BindingCheck,
+    window: &PersistedWindowStore,
+    receipts: Option<&ReceiptStore>,
+    pass: &ReconcilePass,
+) -> Result<DeliveryReport, WalletError> {
+    match pass {
+        ReconcilePass::Completed(report) if report.receipt_write_failed > 0 => tracing::warn!(
             profile = %profile_name,
-            "value audit: audit writer mutex poisoned; row NOT emitted"
-        );
-        return;
-    };
-    let settlement = match stellar_agent_core::audit_log::reader::try_value_action_settlement(
-        &guard,
-        envelope_hash,
-    ) {
-        Ok(settlement) => settlement,
-        Err(error) => {
-            tracing::warn!(
-                profile = %profile_name,
-                envelope_hash = %envelope_hash,
-                error = %error,
-                "settlement lookup could not read the audit history; settled row NOT emitted"
-            );
-            return;
+            receipt_write_failed = report.receipt_write_failed,
+            "window reconcile: receipt writes stay owed"
+        ),
+        ReconcilePass::Completed(_) => {}
+        ReconcilePass::ClockUnavailable => {
+            tracing::debug!("window reconcile: system clock unavailable; reservations stand");
         }
-    };
-    let (tool, chain_id, legs, nonce_id, policy_decision, approval_nonce) = match settlement {
-        // Already accounted for. Reconciliation is repeatable, and one spend
-        // takes exactly one row.
-        ValueActionSettlement::Settled => return,
-        ValueActionSettlement::Owed(pending) => (
-            pending.tool,
-            pending.chain_id,
-            pending.legs,
-            pending.nonce_id,
-            pending.policy_decision,
-            pending.approval_nonce,
-        ),
-        // No pending row survives in retained history, so its sizing is
-        // unavailable. The outcome still belongs in the log, under the name
-        // of the surface that settled it.
-        ValueActionSettlement::OwedWithoutLegs => (
-            RECONCILE_TOOL.to_owned(),
-            profile.chain_id.caip2_str().to_owned().into(),
-            Vec::new(),
-            None,
-            reconciliation_decision,
-            None,
-        ),
-    };
-    let chain_id: Option<String> = chain_id;
-    let tx_redacted = stellar_agent_network::redact_tx_hash(tx_hash);
-    let request_id = uuid::Uuid::new_v4().to_string();
-    let SettledRow::Failed { code } = row;
-    let entry = AuditEntry::new_value_action_failed(
-        tool,
-        chain_id,
-        legs,
-        tx_redacted.as_str(),
-        code,
-        policy_decision,
-        Some(envelope_hash.to_owned()),
-        nonce_id,
-        approval_nonce,
-        &request_id,
-    );
-    if let Err(error) = guard.write_entry(entry) {
-        tracing::warn!(
+        ReconcilePass::ClientUnavailable => {
+            tracing::debug!("window reconcile: no primary client; reservations stand");
+        }
+        ReconcilePass::Failed(error) => tracing::debug!(
             profile = %profile_name,
-            error = %error,
-            "value audit: write_entry failed; row NOT emitted"
-        );
+            error = ?error,
+            "window reconcile: pass failed; open reservations stand"
+        ),
     }
+    stellar_agent_network::policy_state::drain_accounting_obligations(
+        window,
+        profile,
+        profile_name,
+        receipts,
+        || crate::tools::value_audit::require_value_audit_writer(profile, profile_name, binding),
+    )
 }
 
 /// Renders a submit-path error as a tool result, attaching the structured
@@ -777,6 +714,7 @@ mod tests {
     )]
 
     use super::*;
+    use stellar_agent_core::profile::receipt::ReceiptStatus;
 
     const SIGNED_XDR: &str = "AAAAAgAAAAA=";
 
@@ -1236,190 +1174,398 @@ mod tests {
         }
     }
 
-    /// Each receipt outcome selects the audit row and code it owes.
-    #[test]
-    fn settlement_rows_follow_receipt_status_and_evidence() {
-        use stellar_agent_core::audit_log::PolicyDecision;
+    /// A profile under `dir` whose window key and audit chain key live in the
+    /// keyring mock, with its window and receipt stores.
+    struct DrainFixture {
+        _dir: tempfile::TempDir,
+        profile: Profile,
+        name: String,
+        window: PersistedWindowStore,
+        receipts: ReceiptStore,
+    }
 
-        for (status, evidence, expected) in [
-            (ReceiptStatus::Success, None, None),
-            (
-                ReceiptStatus::Failed {
-                    code: "ledger.failed".to_owned(),
-                },
-                None,
-                Some(("value_action_failed", Some("ledger.failed"))),
-            ),
-            (
-                ReceiptStatus::Ambiguous,
-                Some(ReleaseEvidence::TimeBoundPassed),
-                None,
-            ),
-            (
-                ReceiptStatus::Ambiguous,
-                Some(ReleaseEvidence::SequenceConsumed),
-                None,
-            ),
-            (ReceiptStatus::Ambiguous, None, None),
-            (ReceiptStatus::Pending, None, None),
-            (ReceiptStatus::Reorged, None, None),
-            (
-                ReceiptStatus::ClearedByOperator,
-                Some(ReleaseEvidence::TimeBoundPassed),
-                None,
-            ),
-        ] {
-            let dir = tempfile::tempdir().unwrap();
-            let mut profile =
-                Profile::builder_testnet("row-kind", "default", "nonce", "default").build();
-            profile.audit_log_path = dir.path().join("audit.jsonl");
-            let audit = Arc::new(Mutex::new(
-                AuditWriter::open(profile.audit_log_path.clone(), None).unwrap(),
-            ));
-            write_settled_row(
-                &profile,
-                "row-kind",
-                &audit,
-                "envelope",
-                "transaction",
-                &status,
-                evidence,
-                PolicyDecision::Allow,
+    fn drain_fixture(name: &str) -> DrainFixture {
+        use base64::Engine as _;
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut profile = Profile::builder_testnet(name, "acct", "nonce", name).build();
+        profile.audit_log_path = dir.path().join("audit").join("log.jsonl");
+        profile.policy_window_state_key_id =
+            stellar_agent_core::profile::schema::KeyringEntryRef::default_policy_window_state_key(
+                name,
             );
-            let rows: Vec<serde_json::Value> = std::fs::read_to_string(&profile.audit_log_path)
-                .unwrap()
-                .lines()
-                .map(|line| serde_json::from_str(line).unwrap())
-                .collect();
-            if let Some((kind, code)) = expected {
-                assert_eq!(rows.len(), 1, "{status:?}/{evidence:?}");
-                assert_eq!(rows[0]["kind"], kind);
-                assert_eq!(rows[0]["code"], serde_json::to_value(code).unwrap());
-            } else {
-                assert!(rows.is_empty(), "{status:?}/{evidence:?}: {rows:?}");
-            }
+        let coordinate = &profile.audit_log_hash_chain_key_id;
+        keyring_core::Entry::new(&coordinate.service, &coordinate.account)
+            .unwrap()
+            .set_password(&base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0x52; 32]))
+            .unwrap();
+        let window = PersistedWindowStore::at_path(dir.path().join(format!("{name}.window")));
+        let receipts = ReceiptStore::open_at(dir.path(), name).unwrap();
+        DrainFixture {
+            _dir: dir,
+            profile,
+            name: name.to_owned(),
+            window,
+            receipts,
         }
     }
 
+    impl DrainFixture {
+        /// Acquires the profile's bound keyed writer, as every value verb
+        /// acquires it.
+        fn acquire(&self) -> Result<Arc<Mutex<AuditWriter>>, WalletError> {
+            crate::tools::value_audit::require_value_audit_writer(
+                &self.profile,
+                &self.name,
+                stellar_agent_core::audit_log::BindingCheck::Enforce,
+            )
+        }
+
+        fn writer(&self) -> Arc<Mutex<AuditWriter>> {
+            self.acquire().unwrap()
+        }
+
+        /// A sent submission `id` whose receipt reads `status`.
+        fn receipt(&self, id: &str, status: Option<ReceiptStatus>) {
+            self.receipts
+                .try_begin(id, id, "GSOURCE", 7, 0, 1_000)
+                .unwrap();
+            self.receipts.mark_submitted(id).unwrap();
+            match status {
+                None | Some(ReceiptStatus::Pending) => {}
+                Some(ReceiptStatus::Ambiguous) => self
+                    .receipts
+                    .finalize_released(
+                        id,
+                        stellar_agent_core::profile::receipt::ReleaseEvidence::TimeBoundPassed,
+                    )
+                    .unwrap(),
+                Some(ReceiptStatus::ClearedByOperator) => {
+                    self.receipts
+                        .finalize_released(
+                            id,
+                            stellar_agent_core::profile::receipt::ReleaseEvidence::SequenceConsumed,
+                        )
+                        .unwrap();
+                    self.receipts.clear_by_operator(id).unwrap();
+                }
+                Some(ReceiptStatus::Reorged) => {
+                    self.receipts
+                        .finalize(id, ReceiptStatus::Success, Some(5))
+                        .unwrap();
+                    self.receipts.finalize_reorged(id).unwrap();
+                }
+                Some(other) => self.receipts.finalize(id, other, Some(5)).unwrap(),
+            }
+        }
+
+        /// Commits the accounting expiry of a bounded hold whose horizon has
+        /// passed, through an ordinary reconciliation pass, and returns its
+        /// decision identifier.
+        async fn committed_expiry(&self, id: &str) -> String {
+            use stellar_agent_core::policy::v1::criteria::state_store::{
+                StateKey, WindowEntry, WindowLimit,
+            };
+            let now = stellar_agent_core::timefmt::now_unix_ms().unwrap();
+            let since = now - stellar_agent_network::policy_state::RECONCILE_MIN_AGE_MS;
+            let hold = stellar_agent_network::policy_state::SubmissionHold {
+                chain_scope: stellar_agent_network::policy_state::ChainScope::for_chain(
+                    self.profile.chain_id,
+                ),
+                id: id.to_owned(),
+                tx_hash: id.to_owned(),
+                source: "GSOURCE".to_owned(),
+                sequence: 7,
+                max_time: now / 1_000 - 61,
+                pending_since_ms: since,
+                submission_ledger: 1_000,
+                submission_anchor: None,
+                operator_required: false,
+            };
+            let entry = WindowEntry::new(
+                StateKey::new(&self.name, 1, "native", 60),
+                since,
+                300,
+                WindowLimit::Amount {
+                    asset: "native".to_owned(),
+                    window: "1m".to_owned(),
+                    max_stroops: 1_000_000,
+                },
+            );
+            self.window
+                .record_pending(&self.profile, &[entry], &hold)
+                .unwrap();
+            let client =
+                stellar_agent_network::StellarRpcClient::new("http://127.0.0.1:9").unwrap();
+            let report = self
+                .window
+                .reconcile_due(&self.profile, &client, None, None, now, 4)
+                .await
+                .unwrap();
+            assert_eq!(report.rpc_calls, 0, "local expiry asks no endpoint");
+            let [settled] = report.settled.as_slice() else {
+                panic!("one committed expiry: {report:?}");
+            };
+            settled.decision_id.clone()
+        }
+
+        /// Every row of the active audit file.
+        fn rows(&self) -> Vec<serde_json::Value> {
+            std::fs::read_to_string(&self.profile.audit_log_path)
+                .unwrap_or_default()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect()
+        }
+
+        fn rows_of(&self, kind: &str) -> usize {
+            self.rows().iter().filter(|row| row["kind"] == kind).count()
+        }
+    }
+
+    /// No receipt status selects an audit row: every receipt-only case,
+    /// `Failed` included, leaves the log untouched and never acquires the
+    /// writer. Delivery of an identifier the verified window state does not
+    /// hold refuses before any append.
     #[test]
+    #[serial_test::serial(keyring)]
+    fn no_receipt_status_selects_an_audit_row() {
+        for (label, status) in [
+            ("success", Some(ReceiptStatus::Success)),
+            (
+                "failed",
+                Some(ReceiptStatus::Failed {
+                    code: "ledger.failed".to_owned(),
+                }),
+            ),
+            ("ambiguous", Some(ReceiptStatus::Ambiguous)),
+            ("pending", None),
+            ("reorged", Some(ReceiptStatus::Reorged)),
+            ("cleared", Some(ReceiptStatus::ClearedByOperator)),
+        ] {
+            let f = drain_fixture(&format!("row-kind-{label}"));
+            f.receipt(&"ab".repeat(32), status);
+            let report = stellar_agent_network::policy_state::drain_accounting_obligations(
+                &f.window,
+                &f.profile,
+                &f.name,
+                Some(&f.receipts),
+                || panic!("{label}: no obligation acquires the writer"),
+            )
+            .unwrap();
+            assert_eq!(report, DeliveryReport::default(), "{label}");
+            assert!(f.rows().is_empty(), "{label}: {:?}", f.rows());
+        }
+
+        let f = drain_fixture("row-kind-unverifiable");
+        let writer = f.writer();
+        let before = std::fs::read(&f.profile.audit_log_path).ok();
+        let error = stellar_agent_network::policy_state::deliver_accounting_expiry(
+            &mut writer.lock().unwrap(),
+            &f.window,
+            &f.profile,
+            &f.name,
+            Some(&f.receipts),
+            &"cd".repeat(32),
+        )
+        .unwrap_err();
+        assert_eq!(error.code(), "submission.settlement_unverifiable");
+        assert_eq!(std::fs::read(&f.profile.audit_log_path).ok(), before);
+    }
+
+    /// Receipt-only reconciliation leaves the pending row, with its witness,
+    /// as the one row of the submission.
+    #[test]
+    #[serial_test::serial(keyring)]
     fn pending_witness_survives_mcp_reconciliation() {
         use stellar_agent_core::audit_log::{AuditEntry, PolicyDecision};
-        let dir = tempfile::tempdir().unwrap();
-        let mut profile = Profile::builder_testnet("signer", "witness", "nonce", "witness").build();
-        profile.audit_log_path = dir.path().join("audit.jsonl");
-        let audit = Arc::new(Mutex::new(
-            AuditWriter::open(profile.audit_log_path.clone(), None).unwrap(),
-        ));
-        let witness = stellar_agent_core::audit_log::CrossCheckRecord {
-            provider: "https://oracle.example".to_owned(),
-            ledger: 123,
-            inputs_digest: "09".repeat(32),
-            kinds: vec![stellar_agent_core::cross_check::WitnessEntry::SourceAccount],
-        };
-        audit
+        for (label, status) in [
+            ("success", ReceiptStatus::Success),
+            (
+                "failed",
+                ReceiptStatus::Failed {
+                    code: "ledger.failed".to_owned(),
+                },
+            ),
+        ] {
+            let f = drain_fixture(&format!("witness-{label}"));
+            let envelope = "ef".repeat(32);
+            let witness = stellar_agent_core::audit_log::CrossCheckRecord {
+                provider: "https://oracle.example".to_owned(),
+                ledger: 123,
+                inputs_digest: "09".repeat(32),
+                kinds: vec![stellar_agent_core::cross_check::WitnessEntry::SourceAccount],
+            };
+            f.writer()
+                .lock()
+                .unwrap()
+                .write_entry(AuditEntry::new_value_action_pending(
+                    "stellar_pay_commit",
+                    "stellar:testnet",
+                    vec![],
+                    &envelope,
+                    "source",
+                    7,
+                    PolicyDecision::Allow,
+                    Some(envelope.clone()),
+                    None,
+                    None,
+                    "pending-request",
+                    Some(witness.clone()),
+                ))
+                .unwrap();
+            f.receipt(&envelope, Some(status));
+            stellar_agent_network::policy_state::drain_accounting_obligations(
+                &f.window,
+                &f.profile,
+                &f.name,
+                Some(&f.receipts),
+                || f.acquire(),
+            )
+            .unwrap();
+            let rows: Vec<_> = f
+                .rows()
+                .into_iter()
+                .filter(|row| row["envelope_hash"] == envelope.as_str())
+                .collect();
+            assert_eq!(rows.len(), 1, "{label}: {rows:?}");
+            assert_eq!(rows[0]["kind"], "value_action_pending");
+            assert_eq!(rows[0]["tool"], "stellar_pay_commit");
+            assert_eq!(rows[0]["witness"], serde_json::to_value(&witness).unwrap());
+        }
+    }
+
+    /// A forged tail past the writer's verified tip cannot acknowledge an
+    /// authentic expiry: the integrity refusal appends nothing and leaves the
+    /// expiry owed. A forged `Failed` receipt emits no outcome row.
+    #[tokio::test]
+    #[serial_test::serial(keyring)]
+    async fn a_forged_tail_cannot_acknowledge_an_owed_expiry() {
+        use stellar_agent_core::audit_log::{AuditEntry, PolicyDecision};
+        let f = drain_fixture("forged-tail");
+        let envelope = "a1".repeat(32);
+        let decision_id = f.committed_expiry(&envelope).await;
+        f.writer()
             .lock()
             .unwrap()
             .write_entry(AuditEntry::new_value_action_pending(
                 "stellar_pay_commit",
                 "stellar:testnet",
                 vec![],
-                "transaction",
+                &envelope,
                 "source",
                 7,
                 PolicyDecision::Allow,
-                Some("envelope".to_owned()),
+                Some(envelope.clone()),
                 None,
                 None,
                 "pending-request",
-                Some(witness.clone()),
+                None,
             ))
             .unwrap();
-        write_settled_row(
-            &profile,
-            "witness",
-            &audit,
-            "envelope",
-            "transaction",
-            &ReceiptStatus::Success,
-            None,
-            PolicyDecision::Allow,
-        );
-        let rows: Vec<serde_json::Value> = std::fs::read_to_string(&profile.audit_log_path)
+        f.receipts
+            .finalize(
+                &envelope,
+                ReceiptStatus::Failed {
+                    code: "ledger.failed".to_owned(),
+                },
+                Some(5),
+            )
+            .unwrap();
+        let forged = f
+            .window
+            .accounting_expiry_event(&f.profile, &decision_id)
             .unwrap()
-            .lines()
-            .map(|line| serde_json::from_str(line).unwrap())
-            .collect();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0]["kind"], "value_action_pending");
-        assert_eq!(rows[0]["witness"], serde_json::to_value(&witness).unwrap());
-    }
-    /// A settled row appended past the writer's verified tip is not read as
-    /// the settlement: reconciliation still writes its own
-    /// `value_action_submitted` row.
-    #[test]
-    fn a_forged_settled_row_past_the_tip_does_not_suppress_the_settled_row() {
-        use stellar_agent_core::audit_log::{AuditEntry, PolicyDecision};
-        let dir = tempfile::tempdir().unwrap();
-        let mut profile = Profile::builder_testnet("forged", "forged", "nonce", "forged").build();
-        profile.audit_log_path = dir.path().join("audit.jsonl");
-        let audit = Arc::new(Mutex::new(
-            AuditWriter::open(profile.audit_log_path.clone(), None).unwrap(),
-        ));
-        audit
-            .lock()
-            .unwrap()
-            .write_entry(AuditEntry::new_value_action_pending(
-                "stellar_pay_commit",
-                "stellar:testnet",
-                vec![],
-                "transaction",
-                "source",
-                7,
-                PolicyDecision::Allow,
-                Some("envelope".to_owned()),
-                None,
-                None,
-                "pending-request",
-                None,
-            ))
             .unwrap();
         stellar_agent_core::audit_log::test_helpers::append_forged_entry(
-            &profile.audit_log_path,
-            AuditEntry::new_value_action_submitted(
-                "stellar_pay_commit",
-                Some("stellar:testnet".to_owned()),
-                vec![],
-                "transaction",
-                124,
-                PolicyDecision::Allow,
-                Some("envelope".to_owned()),
-                None,
-                None,
-                "forged-request",
-                None,
-            ),
+            &f.profile.audit_log_path,
+            forged,
             |_| None,
         );
-        write_settled_row(
-            &profile,
-            "forged",
-            &audit,
-            "envelope",
-            "transaction",
-            &ReceiptStatus::Failed {
-                code: "ledger.failed".to_owned(),
-            },
-            None,
-            PolicyDecision::Allow,
+        let before = std::fs::read(&f.profile.audit_log_path).unwrap();
+
+        let refused = stellar_agent_network::policy_state::drain_accounting_obligations(
+            &f.window,
+            &f.profile,
+            &f.name,
+            Some(&f.receipts),
+            || f.acquire(),
         );
-        let rows: Vec<serde_json::Value> = std::fs::read_to_string(&profile.audit_log_path)
-            .unwrap()
-            .lines()
-            .map(|line| serde_json::from_str(line).unwrap())
-            .collect();
-        assert_eq!(rows.len(), 3, "{rows:?}");
-        assert_eq!(rows[2]["kind"], "value_action_failed");
-        assert_ne!(rows[2]["request_id"], "forged-request");
+        assert_eq!(
+            refused.map(|_| ()).unwrap_err().code(),
+            "audit.tip_anchor_mismatch"
+        );
+        assert_eq!(std::fs::read(&f.profile.audit_log_path).unwrap(), before);
+        assert_eq!(f.rows_of("value_action_failed"), 0);
+        assert_eq!(
+            f.window
+                .owed_accounting_expiries(&f.profile)
+                .unwrap()
+                .unacknowledged,
+            vec![decision_id],
+            "the expiry stays owed"
+        );
+    }
+
+    /// The dispatch-time drain delivers an obligation an earlier pass left,
+    /// whatever the current pass did: completed, refused, or skipped for an
+    /// unavailable clock or primary client.
+    #[tokio::test]
+    #[serial_test::serial(keyring)]
+    async fn the_dispatch_drain_delivers_old_obligations_after_any_pass() {
+        for (label, pass) in [
+            (
+                "completed",
+                ReconcilePass::Completed(ReconcileReport::default()),
+            ),
+            (
+                "failed",
+                ReconcilePass::Failed(
+                    stellar_agent_network::policy_state::WindowStoreError::WriterLocked,
+                ),
+            ),
+            ("clock", ReconcilePass::ClockUnavailable),
+            ("client", ReconcilePass::ClientUnavailable),
+        ] {
+            let f = drain_fixture(&format!("dispatch-drain-{label}"));
+            let envelope = "b2".repeat(32);
+            let decision_id = f.committed_expiry(&envelope).await;
+            let report = finish_reconciliation(
+                &f.profile,
+                &f.name,
+                stellar_agent_core::audit_log::BindingCheck::Enforce,
+                &f.window,
+                Some(&f.receipts),
+                &pass,
+            )
+            .unwrap();
+            assert_eq!(
+                (report.appended, report.acknowledged, report.projected),
+                (1, 1, 1),
+                "{label}: {report:?}"
+            );
+            let rows = f.rows();
+            let expiries: Vec<_> = rows
+                .iter()
+                .filter(|row| row["kind"] == "submission_accounting_expired")
+                .collect();
+            assert_eq!(expiries.len(), 1, "{label}");
+            assert_eq!(expiries[0]["decision_id"], decision_id.as_str());
+            assert!(
+                f.window
+                    .owed_accounting_expiries(&f.profile)
+                    .unwrap()
+                    .is_empty()
+            );
+            assert_eq!(
+                f.receipts
+                    .get(&envelope)
+                    .unwrap()
+                    .unwrap()
+                    .settlement_decision_id,
+                Some(decision_id)
+            );
+        }
     }
 
     #[test]

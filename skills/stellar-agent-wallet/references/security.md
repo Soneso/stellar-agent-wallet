@@ -12,7 +12,7 @@ Approval is cryptographically bound to the exact transaction. The audit log
 records transaction submissions, signed authorizations, approvals, and explicit
 key-management and lifecycle events. MCP balance reads add no audit rows. A payment
 simulation adds no invocation row; under V1 it can reconcile overdue
-reservations and write their settlement rows. MCP tools expose no signing seed
+reservations and deliver owed accounting events. MCP tools expose no signing seed
 or operator approval command. A process running as the operator's OS user holds
 the operator's authority; the wallet does not distinguish it from the operator.
 See the [trust model](../SKILL.md#overview) for the current limits.
@@ -357,7 +357,7 @@ The per-profile, append-only, hash-chained JSONL audit log records transaction
 submissions, signed authorizations, approvals, and explicit key-management and
 lifecycle events. MCP balance reads and payment simulations produce no automatic
 invocation row. Under V1, payment simulations can reconcile overdue reservations
-and write settlement audit rows.
+and deliver owed accounting events.
 The writer is a per-profile singleton
 holding an exclusive lock and appending with an fsync per line; a second opener is
 rejected. Files rotate at a size bound with a fixed number of rotated files

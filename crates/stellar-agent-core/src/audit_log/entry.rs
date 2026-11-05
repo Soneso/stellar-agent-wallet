@@ -74,6 +74,10 @@ pub const MAX_ENTRY_BYTES: usize = 4096;
 /// `arg_keys_truncated` is set accordingly.
 pub const MAX_ARG_KEYS: usize = 64;
 
+/// The chain outcome a `submission_accounting_expired` row records: accounting
+/// expiry establishes no transaction outcome.
+pub const ACCOUNTING_EXPIRY_CHAIN_OUTCOME: &str = "unknown";
+
 /// Intentionally-lax RFC 3339 timestamp prefix check, used inside
 /// `debug_assert!` only (release builds compile this away).
 ///
@@ -2447,6 +2451,58 @@ impl AuditEntry {
         }
     }
 
+    /// Constructs a `SubmissionAccountingExpired` audit entry.
+    ///
+    /// Emitted by accounting audit delivery for one authenticated accounting
+    /// expiry. Every value comes from verified spending-window state: the
+    /// chain, the reservation identifier carried in the outer
+    /// `envelope_hash`, the decision identifier, the committing generation and
+    /// the two checked timestamps. `code` is fixed to
+    /// `submission.accounting_expired` and `chain_outcome` to `unknown`.
+    /// `transaction_hash_redacted` MUST be pre-redacted to first-8-last-8 at
+    /// the call site.
+    #[must_use]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the row names the authenticated decision and the outer entry's identity"
+    )]
+    pub fn new_submission_accounting_expired(
+        tool: impl Into<String>,
+        chain_id: impl IntoOptionalChainId,
+        reservation_id: impl Into<String>,
+        decision_id: impl Into<String>,
+        generation: u64,
+        transaction_hash_redacted: impl Into<String>,
+        observed_at_ms: u64,
+        accounting_until_ms: u64,
+        request_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            ts: current_iso8601_utc(),
+            tool: tool.into(),
+            chain_id: chain_id.into_optional_chain_id(),
+            arg_keys: vec![],
+            arg_keys_truncated: None,
+            truncated: false,
+            envelope_hash: Some(reservation_id.into()),
+            nonce_id: None,
+            policy_decision: PolicyDecision::Allow,
+            decision_reason: None,
+            request_id: request_id.into(),
+            event_kind: EventKind::SubmissionAccountingExpired {
+                decision_id: decision_id.into(),
+                generation,
+                transaction_hash_redacted: transaction_hash_redacted.into(),
+                observed_at_ms,
+                accounting_until_ms,
+                code: crate::profile::receipt::ACCOUNTING_EXPIRED_CODE.to_owned(),
+                chain_outcome: ACCOUNTING_EXPIRY_CHAIN_OUTCOME.to_owned(),
+            },
+            previous_entry_hash: String::new(),
+            entry_tag: None,
+        }
+    }
+
     /// Constructs a `SubmissionReceiptCleared` audit entry.
     ///
     /// Emitted by `tx receipt clear --acknowledge`. `cleared_from` names the receipt status the
@@ -4807,6 +4863,49 @@ mod tests {
         let key = derive_entry_tag_key(&[0x5a; 32]);
         entry.entry_tag = Some(compute_entry_tag(&key, &hash).unwrap());
         (entry, hash)
+    }
+
+    /// The accounting-expiry row carries the authenticated identity on the
+    /// outer entry and fixes its code and chain outcome.
+    #[test]
+    fn the_accounting_expiry_row_fixes_its_code_and_outcome() {
+        let entry = AuditEntry::new_submission_accounting_expired(
+            "stellar-agent accounting delivery",
+            "stellar:testnet",
+            "aa".repeat(32),
+            "bb".repeat(32),
+            7,
+            "abcd...1234",
+            1_000,
+            900,
+            "deliver",
+        );
+        assert_eq!(
+            entry.envelope_hash.as_deref(),
+            Some("aa".repeat(32).as_str())
+        );
+        assert_eq!(entry.chain_id.as_deref(), Some("stellar:testnet"));
+        assert_eq!(entry.policy_decision, PolicyDecision::Allow);
+        let EventKind::SubmissionAccountingExpired {
+            decision_id,
+            generation,
+            transaction_hash_redacted,
+            observed_at_ms,
+            accounting_until_ms,
+            code,
+            chain_outcome,
+        } = &entry.event_kind
+        else {
+            panic!("an accounting-expiry row is expected");
+        };
+        assert_eq!(decision_id, &"bb".repeat(32));
+        assert_eq!(*generation, 7);
+        assert_eq!(transaction_hash_redacted, "abcd...1234");
+        assert_eq!((*observed_at_ms, *accounting_until_ms), (1_000, 900));
+        assert_eq!(code, "submission.accounting_expired");
+        assert_eq!(chain_outcome, "unknown");
+        let json = serde_json::to_value(&entry).unwrap();
+        assert_eq!(json["kind"], "submission_accounting_expired");
     }
 
     #[test]

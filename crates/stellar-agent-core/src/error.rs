@@ -3658,6 +3658,20 @@ pub enum SubmissionError {
         detail: String,
     },
 
+    /// A settlement audit delivery named a decision identifier that the
+    /// verified spending-window state does not hold.
+    ///
+    /// Only an authenticated accounting decision authorizes a settlement
+    /// audit event. Receipt contents and copied identifiers establish none, so
+    /// delivery refuses before any audit append. The message carries no
+    /// rejected value.
+    ///
+    /// # Wire code
+    ///
+    /// `submission.settlement_unverifiable`
+    #[error("Authenticated settlement evidence is unavailable.")]
+    SettlementUnverifiable,
+
     /// The hash the endpoint returned for the accepted transaction differs
     /// from the hash computed locally from the envelope.
     ///
@@ -3706,6 +3720,7 @@ impl SubmissionError {
             Self::AuthMismatch { .. } => "submission.auth_mismatch",
             Self::OnChainFailed { .. } => "submission.on_chain_failed",
             Self::RecordUnavailable { .. } => "submission.record_unavailable",
+            Self::SettlementUnverifiable => "submission.settlement_unverifiable",
             Self::HashMismatch { .. } => "submission.hash_mismatch",
         }
     }
@@ -5120,6 +5135,10 @@ mod tests {
                 "submission.record_unavailable",
             ),
             (
+                SubmissionError::SettlementUnverifiable,
+                "submission.settlement_unverifiable",
+            ),
+            (
                 SubmissionError::HashMismatch {
                     local: full_hash.clone(),
                     server: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
@@ -5130,6 +5149,13 @@ mod tests {
         ];
 
         assert_code_round_trips!(&cases);
+
+        let unverifiable = WalletError::Submission(SubmissionError::SettlementUnverifiable);
+        assert_eq!(unverifiable.code(), "submission.settlement_unverifiable");
+        assert_eq!(
+            unverifiable.to_string(),
+            "Authenticated settlement evidence is unavailable."
+        );
 
         let wallet_err = WalletError::Submission(SubmissionError::SequenceNumberStale);
         assert_eq!(wallet_err.category(), ErrorCategory::Submission);

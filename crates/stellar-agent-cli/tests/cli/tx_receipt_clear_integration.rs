@@ -707,8 +707,8 @@ async fn an_unsent_receipt_does_not_clear_its_open_bounded_hold() {
     assert_eq!(rpc.log.sends(), 0, "the verb never sends");
 }
 
-/// A settled record whose transaction the endpoint no longer reports is
-/// refused, and writes no row.
+/// A record settled as a success whose transaction has left the endpoint's
+/// retention is refused, and writes no row.
 ///
 /// This is the state that makes the ordering load-bearing. The endpoint has
 /// forgotten the transaction, so the chain check passes; only the record's own
@@ -734,9 +734,7 @@ async fn a_settled_record_the_endpoint_forgot_is_refused_and_writes_no_row() {
         receipts
             .finalize(
                 settled,
-                stellar_agent_core::profile::receipt::ReceiptStatus::Failed {
-                    code: "submission.on_chain_failed".to_owned(),
-                },
+                stellar_agent_core::profile::receipt::ReceiptStatus::Success,
                 None,
             )
             .unwrap();
@@ -772,7 +770,7 @@ async fn a_settled_record_the_endpoint_forgot_is_refused_and_writes_no_row() {
     assert!(
         matches!(
             receipts.get(settled).unwrap().unwrap().status,
-            stellar_agent_core::profile::receipt::ReceiptStatus::Failed { .. }
+            stellar_agent_core::profile::receipt::ReceiptStatus::Success
         ),
         "the record is untouched"
     );
@@ -872,6 +870,22 @@ fn seed_window(
     stellar_agent_network::policy_state::PersistedWindowStore,
     stellar_agent_core::profile::schema::Profile,
 ) {
+    seed_window_for(home, id, TX_HASH, sequence, max_time)
+}
+
+/// Takes a due reservation for the submission `id` with transaction hash
+/// `tx_hash` in a real authenticated window, written through the
+/// subprocesses' encrypted keyring.
+fn seed_window_for(
+    home: &Path,
+    id: &str,
+    tx_hash: &str,
+    sequence: i64,
+    max_time: u64,
+) -> (
+    stellar_agent_network::policy_state::PersistedWindowStore,
+    stellar_agent_core::profile::schema::Profile,
+) {
     use stellar_agent_core::policy::v1::criteria::state_store::{
         StateKey, WindowEntry, WindowLimit,
     };
@@ -894,7 +908,7 @@ fn seed_window(
     let res = SubmissionHold {
         chain_scope: stellar_agent_network::policy_state::ChainScope::for_chain(profile.chain_id),
         id: id.to_owned(),
-        tx_hash: TX_HASH.to_owned(),
+        tx_hash: tx_hash.to_owned(),
         source: SOURCE.to_owned(),
         sequence,
         max_time,
@@ -2019,4 +2033,302 @@ async fn chain_flip_cannot_clear_original_hold() {
     assert_eq!(window.pending_reservations(&original).unwrap().len(), 1);
     assert!(primary.received_requests().await.unwrap().is_empty());
     assert!(oracle.received_requests().await.unwrap().is_empty());
+}
+
+/// The spending the window counts for the fixtures' bucket.
+fn counted(
+    window: &stellar_agent_network::policy_state::PersistedWindowStore,
+    profile: &stellar_agent_core::profile::schema::Profile,
+) -> (i128, u32) {
+    use stellar_agent_core::policy::v1::criteria::state_store::{PolicyStateStore, StateKey};
+    let state = PolicyStateStore::new();
+    window.load_into(PROFILE, profile, &state).unwrap();
+    state
+        .query_window(
+            &StateKey::new(PROFILE, 1, "native", 86_400),
+            stellar_agent_core::timefmt::now_unix_ms().unwrap() + 1_000,
+        )
+        .unwrap()
+}
+
+/// Forged receipts create no settlement rows through `tx status`. Two status
+/// calls preserve authentic holds and counted amounts. The forged cases are a
+/// receipt edited to `Failed` over an authentic untimed hold and a fabricated
+/// `Failed` receipt with no hold. An ambiguous receipt with a release code and
+/// a success report are the controls.
+#[tokio::test]
+#[serial_test::serial]
+async fn tx_status_forged_receipts_create_no_settlement_rows() {
+    for (label, endpoint_status, held) in [
+        ("edited-failed", "FAILED", true),
+        ("fabricated-failed", "FAILED", false),
+        ("ambiguous-released", "NOT_FOUND", true),
+        ("success", "SUCCESS", true),
+    ] {
+        let home = tempfile::TempDir::new().unwrap();
+        let rpc = FixedStatusRpc::new(endpoint_status);
+        let server = endpoint(&rpc).await;
+        fixture_with(home.path(), &server.uri(), 7, 0);
+        let window = held.then(|| seed_window(home.path(), ENVELOPE_HASH, 7, 0));
+        let receipts = ReceiptStore::open_at(&home.path().join("receipts"), PROFILE).unwrap();
+        match label {
+            "edited-failed" | "fabricated-failed" => receipts
+                .finalize(
+                    ENVELOPE_HASH,
+                    ReceiptStatus::Failed {
+                        code: "ledger.op_failed".to_owned(),
+                    },
+                    Some(1_001),
+                )
+                .unwrap(),
+            "ambiguous-released" => receipts
+                .finalize_released(
+                    ENVELOPE_HASH,
+                    stellar_agent_core::profile::receipt::ReleaseEvidence::SequenceConsumed,
+                )
+                .unwrap(),
+            _ => {}
+        }
+        let before = window.as_ref().map(|(window, profile)| {
+            (
+                window.pending_reservations(profile).unwrap(),
+                counted(window, profile),
+            )
+        });
+
+        for _ in 0..2 {
+            let (code, envelope) = run_cli(
+                home.path(),
+                &["tx", "status", TX_HASH, "--profile", PROFILE],
+            );
+            assert_eq!(code, 0, "{label}: {envelope}");
+            let record = &envelope["data"]["record"];
+            assert_eq!(
+                record["settlement_evidence"], "unavailable",
+                "{label}: {envelope}"
+            );
+            assert!(
+                record["settlement_decision_id"].is_null(),
+                "{label}: {envelope}"
+            );
+        }
+
+        for kind in [
+            "value_action_failed",
+            "value_action_submitted",
+            "submission_accounting_expired",
+        ] {
+            let rows = rows_of_kind(home.path(), kind);
+            assert!(rows.is_empty(), "{label}: {kind}: {rows:?}");
+        }
+        match (&window, before) {
+            (Some((window, profile)), Some((holds, counted_before))) => {
+                assert_eq!(
+                    window.pending_reservations(profile).unwrap(),
+                    holds,
+                    "{label}: the hold stands"
+                );
+                assert_eq!(holds.len(), 1, "{label}");
+                assert_eq!(counted(window, profile), counted_before, "{label}");
+                assert_eq!(counted_before, (75, 1), "{label}");
+                assert!(
+                    window.owed_accounting_expiries(profile).unwrap().is_empty(),
+                    "{label}: no accounting decision"
+                );
+            }
+            _ => assert!(
+                !home
+                    .path()
+                    .join(format!("policy/{PROFILE}.window"))
+                    .exists(),
+                "{label}: no reservation or decision is created"
+            ),
+        }
+        assert_eq!(rpc.log.sends(), 0, "{label}: the verb never sends");
+    }
+}
+
+/// Commits the accounting expiry of every due hold in `window` through an
+/// ordinary pass without the receipt store, and returns the one committed
+/// decision identifier. Delivery and projection stay owed.
+async fn commit_expiry(
+    window: &stellar_agent_network::policy_state::PersistedWindowStore,
+    profile: &stellar_agent_core::profile::schema::Profile,
+    rpc_url: &str,
+) -> String {
+    let client = stellar_agent_network::StellarRpcClient::new(rpc_url).unwrap();
+    let report = window
+        .reconcile_due(
+            profile,
+            &client,
+            None,
+            None,
+            stellar_agent_core::timefmt::now_unix_ms().unwrap(),
+            stellar_agent_network::policy_state::RECONCILE_BUDGET,
+        )
+        .await
+        .unwrap();
+    let [settled] = report.settled.as_slice() else {
+        panic!("one committed expiry: {report:?}");
+    };
+    settled.decision_id.clone()
+}
+
+/// The `submission_accounting_expired` rows naming `decision_id`.
+fn expiry_rows(home: &Path, decision_id: &str) -> usize {
+    rows_of_kind(home, "submission_accounting_expired")
+        .iter()
+        .filter(|row| row["decision_id"] == decision_id)
+        .count()
+}
+
+/// A delivered accounting event whose receipt projection is still owed
+/// completes on a `tx status` run that cannot acquire the audit writer. The
+/// output carries the projected record and the run appends no row.
+#[tokio::test]
+#[serial_test::serial]
+async fn tx_status_completes_a_projection_without_the_audit_writer() {
+    use stellar_agent_core::audit_log::{AuditWriter, BindingCheck};
+
+    let home = tempfile::TempDir::new().unwrap();
+    let rpc = FixedStatusRpc::new("NOT_FOUND");
+    let server = endpoint(&rpc).await;
+    let max_time = now_secs() - 86_401;
+    fixture_with(home.path(), &server.uri(), 7, max_time);
+    let (window, mut profile) = seed_window(home.path(), ENVELOPE_HASH, 7, max_time);
+    profile.audit_log_path = home.path().join("audit").join(format!("{PROFILE}.jsonl"));
+    let decision_id = commit_expiry(&window, &profile, &server.uri()).await;
+
+    // The event is delivered and acknowledged without the receipt store, so
+    // only the projection stays owed.
+    {
+        let access = stellar_agent_network::keyring::keyed_audit_access(
+            &profile,
+            PROFILE,
+            BindingCheck::Enforce,
+        )
+        .unwrap();
+        let mut writer = AuditWriter::open(profile.audit_log_path.clone(), Some(access)).unwrap();
+        let delivered = stellar_agent_network::policy_state::deliver_accounting_expiries(
+            &mut writer,
+            &window,
+            &profile,
+            PROFILE,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            (
+                delivered.appended,
+                delivered.acknowledged,
+                delivered.projected
+            ),
+            (1, 1, 0),
+            "{delivered:?}"
+        );
+    }
+    let owed = window.owed_accounting_expiries(&profile).unwrap();
+    assert!(owed.unacknowledged.is_empty(), "{owed:?}");
+    assert_eq!(owed.unprojected, vec![decision_id.clone()]);
+
+    // The audit chain key is absent, so no audit writer can be acquired.
+    let coordinate = profile.audit_log_hash_chain_key_id.clone();
+    keyring_core::Entry::new(&coordinate.service, &coordinate.account)
+        .unwrap()
+        .delete_credential()
+        .unwrap();
+    let rows_before = audit_rows(home.path());
+
+    let (code, envelope) = run_cli(
+        home.path(),
+        &["tx", "status", TX_HASH, "--profile", PROFILE],
+    );
+
+    assert_eq!(code, 0, "{envelope}");
+    let record = &envelope["data"]["record"];
+    assert_eq!(record["settlement_evidence"], "unavailable", "{envelope}");
+    assert_eq!(
+        record["settlement_decision_id"],
+        decision_id.as_str(),
+        "{envelope}"
+    );
+    assert_eq!(
+        record["release_code"], "submission.accounting_expired",
+        "{envelope}"
+    );
+    assert_eq!(record["status"], "ambiguous", "{envelope}");
+    assert!(
+        window
+            .owed_accounting_expiries(&profile)
+            .unwrap()
+            .is_empty(),
+        "the projection completes"
+    );
+    assert_eq!(
+        audit_rows(home.path()),
+        rows_before,
+        "the run appends no row"
+    );
+    assert_eq!(expiry_rows(home.path(), &decision_id), 1);
+    assert_eq!(rpc.log.sends(), 0, "the verb never sends");
+}
+
+/// A `tx status` run whose own reconciliation refuses still delivers the
+/// obligations of earlier runs before it renders the refusal.
+#[tokio::test]
+#[serial_test::serial]
+async fn a_refused_tx_status_delivers_old_obligations() {
+    const OLD_ENVELOPE_HASH: &str =
+        "33333333333333333333333333333333333333333333333333333333333333cc";
+    const OLD_TX_HASH: &str = "44444444444444444444444444444444444444444444444444444444444444dd";
+
+    let home = tempfile::TempDir::new().unwrap();
+    let rpc = FixedStatusRpc::new("NOT_FOUND");
+    let server = endpoint(&rpc).await;
+    let max_time = now_secs() - 86_401;
+    fixture_with(home.path(), &server.uri(), 7, max_time);
+    let (window, profile) =
+        seed_window_for(home.path(), OLD_ENVELOPE_HASH, OLD_TX_HASH, 5, max_time);
+    let old = commit_expiry(&window, &profile, &server.uri()).await;
+    seed_window(home.path(), ENVELOPE_HASH, 7, max_time);
+
+    let lock = stellar_agent_core::policy::state_lock::WindowStoreLock::acquire_for(
+        window.path(),
+        &profile.policy_window_state_key_id,
+    )
+    .unwrap();
+    let status = ["tx", "status", TX_HASH, "--profile", PROFILE];
+    let (code, refused) = run_cli(home.path(), &status);
+    assert_ne!(code, 0, "{refused}");
+    assert_eq!(
+        refused["error"]["code"], "submission.record_unavailable",
+        "{refused}"
+    );
+    assert_eq!(
+        expiry_rows(home.path(), &old),
+        1,
+        "the old event is appended before the refusal renders"
+    );
+    drop(lock);
+
+    let (code, envelope) = run_cli(home.path(), &status);
+    assert_eq!(code, 0, "{envelope}");
+    assert_eq!(
+        envelope["data"]["record"]["release_code"], "submission.accounting_expired",
+        "{envelope}"
+    );
+    assert_eq!(expiry_rows(home.path(), &old), 1, "no second row");
+    assert_eq!(
+        rows_of_kind(home.path(), "submission_accounting_expired").len(),
+        2,
+        "each decision has one row"
+    );
+    assert!(
+        window
+            .owed_accounting_expiries(&profile)
+            .unwrap()
+            .unacknowledged
+            .is_empty()
+    );
+    assert_eq!(rpc.log.sends(), 0, "the verb never sends");
 }

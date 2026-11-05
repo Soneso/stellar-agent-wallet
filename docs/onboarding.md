@@ -34,7 +34,7 @@ The wallet answers that with a strict division of roles:
   transaction submissions, signed authorizations, approvals, and explicit
   key-management and lifecycle events. MCP balance reads and payment simulations
   produce no automatic invocation row. Under V1, payment simulations can
-  reconcile overdue reservations and write settlement audit rows. If anyone
+  reconcile overdue reservations and deliver owed accounting events. If anyone
   edits the log afterward, verification fails.
 
 Your secret keys never reach the agent. They live in your operating system's

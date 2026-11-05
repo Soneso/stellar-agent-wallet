@@ -264,8 +264,10 @@ fn value_verbs_evaluate_policy_before_the_audit_preflight() {
     );
 }
 
-/// The two `tx` verbs acquire the audit writer the same way the value verbs
-/// do: fail-closed on a persisted profile, best-effort on the synthesized one.
+/// The two `tx` verbs acquire the audit writer by profile origin, the way the
+/// value verbs do: fail-closed on a persisted profile, best-effort on the
+/// synthesized one. `tx status` acquires it through the accounting delivery
+/// writer, which applies the same origin rule.
 ///
 /// A submission on a zero-config profile leaves a receipt holding its source
 /// account's sequence. If the verbs that settle it refused on a profile with
@@ -274,15 +276,41 @@ fn value_verbs_evaluate_policy_before_the_audit_preflight() {
 #[test]
 fn the_tx_verbs_acquire_the_audit_writer_by_profile_origin() {
     let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-    for file in ["commands/tx/status.rs", "commands/tx/receipt.rs"] {
-        // The Windows checkout is CRLF; the scan is substring-based, so the
-        // normalisation only keeps the reported source readable.
-        let source = std::fs::read_to_string(src.join(file))
+    // The Windows checkout is CRLF; the scan is substring-based, so the
+    // normalisation only keeps the reported source readable.
+    let read = |file: &str| {
+        std::fs::read_to_string(src.join(file))
             .expect("read source")
-            .replace("\r\n", "\n");
+            .replace("\r\n", "\n")
+    };
+    let delivery = read("commands/submission_record.rs");
+    let delivery_writer = delivery
+        .split("pub(crate) fn accounting_audit_writer(")
+        .nth(1)
+        .and_then(|body| body.split("\n}\n").next())
+        .expect("the accounting delivery writer");
+    assert!(
+        delivery_writer.contains("value_audit::require_value_audit_writer_for_origin("),
+        "the accounting delivery writer must be acquired by profile origin"
+    );
+    for (file, acquisition) in [
+        (
+            "commands/tx/status.rs",
+            "submission_record::accounting_audit_writer(",
+        ),
+        (
+            "commands/tx/receipt.rs",
+            "value_audit::require_value_audit_writer_for_origin(",
+        ),
+    ] {
+        let source = read(file);
         assert!(
-            source.contains("value_audit::require_value_audit_writer_for_origin("),
+            source.contains(acquisition),
             "{file}: the audit writer must be acquired by profile origin"
+        );
+        assert!(
+            !production_half(&source).contains("value_audit::require_value_audit_writer("),
+            "{file}: no acquisition may skip the profile origin"
         );
         assert!(
             source.contains("load_profile_or_synthesize_testnet("),

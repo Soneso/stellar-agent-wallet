@@ -1241,6 +1241,7 @@ fn verify_single_file(
             EventKind::ValueActionSubmitted { .. }
             | EventKind::ValueActionPending { .. }
             | EventKind::ValueActionFailed { .. }
+            | EventKind::SubmissionAccountingExpired { .. }
             | EventKind::SubmissionReceiptCleared { .. }
             | EventKind::X402PaymentAuthorized { .. }
             | EventKind::X402AuthorizationWithheld { .. }
@@ -2426,6 +2427,7 @@ mod tests {
             EventKind::ValueActionSubmitted { .. } => "value_action_submitted",
             EventKind::ValueActionPending { .. } => "value_action_pending",
             EventKind::ValueActionFailed { .. } => "value_action_failed",
+            EventKind::SubmissionAccountingExpired { .. } => "submission_accounting_expired",
             EventKind::SubmissionReceiptCleared { .. } => "submission_receipt_cleared",
             EventKind::X402PaymentAuthorized { .. } => "x402_payment_authorized",
             EventKind::X402AuthorizationWithheld { .. } => "x402_authorization_withheld",
@@ -2934,6 +2936,15 @@ mod tests {
                 transaction_hash_redacted: "abcd1234...5678efgh".to_owned(),
                 code: "ledger.insufficient_balance".to_owned(),
             },
+            EventKind::SubmissionAccountingExpired {
+                decision_id: "ab".repeat(32),
+                generation: 3,
+                transaction_hash_redacted: "abcd1234...5678efgh".to_owned(),
+                observed_at_ms: 1_700_000_000_000,
+                accounting_until_ms: 1_699_999_999_000,
+                code: "submission.accounting_expired".to_owned(),
+                chain_outcome: "unknown".to_owned(),
+            },
             EventKind::SubmissionReceiptCleared {
                 transaction_hash_redacted: "abcd1234...5678efgh".to_owned(),
                 cleared_from: "ambiguous".to_owned(),
@@ -3418,6 +3429,7 @@ mod tests {
                 "value_action_submitted",
                 "value_action_pending",
                 "value_action_failed",
+                "submission_accounting_expired",
                 "submission_receipt_cleared",
                 "x402_payment_authorized",
                 "x402_authorization_withheld",

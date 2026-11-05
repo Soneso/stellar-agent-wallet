@@ -31,8 +31,8 @@ commit reads the recorded attestation from the store; the agent passes none.
 Transaction submissions, signed authorizations, approvals, and explicit
 key-management and lifecycle events enter a hash-chained audit log.
 MCP balance reads and payment simulations produce no automatic invocation row.
-Under V1, payment simulations can reconcile overdue reservations and write
-settlement audit rows.
+Under V1, payment simulations can reconcile overdue reservations and deliver
+owed accounting events.
 `stellar-agent audit verify` checks the log for tampering.
 
 Use these MCP pairs for agent payments, trustlines, and claims. The CLI serves
@@ -535,7 +535,7 @@ edited grant suppresses nothing.
 
 ## The hash-chained audit log
 
-The MCP server acquires its audit writer when an operation needs it, such as a commit preflight before signing. MCP balance reads do not acquire it. Under V1, payment simulations can reconcile overdue reservations, acquire the writer, and write settlement audit rows.
+The MCP server acquires its audit writer when an operation needs it, such as a commit preflight before signing. MCP balance reads do not acquire it. Under V1, payment simulations can reconcile overdue reservations, acquire the writer, and deliver owed accounting events.
 
 The registry normally caches the writer and holds its lock until process exit. A replaced-file refusal during acquisition marks the cached writer for eviction. After callers release it, the next acquisition drops it and checks the file at the path against the anchor.
 
@@ -545,8 +545,8 @@ operation that acquired it later fails.
 A per-profile, append-only JSONL file records transaction submissions, signed
 authorizations, approvals, and explicit key-management and lifecycle events.
 MCP balance reads and payment simulations produce no automatic invocation row.
-Under V1, payment simulations can reconcile overdue reservations and write
-settlement audit rows. The writer is a per-profile singleton holding an
+Under V1, payment simulations can reconcile overdue reservations and deliver
+owed accounting events. The writer is a per-profile singleton holding an
 exclusive
 lock, appending with an fsync per line; a second opener is rejected. Files
 rotate at a size bound with a fixed number of rotated files retained.
@@ -780,12 +780,14 @@ files, open and verify refuse with `audit.too_many_rotated_files`.
 Settlement and receipt-clear lookups walk retained files newest first, and a
 match leaves older files unvisited. Each visited file's own chain is verified;
 in a log with no archives the first row must chain from the zero hash. The
-eleventh rotation deletes the oldest archive. The lookup runs outside the
-writer lock: two reconciliations of one hash can both find an owed row, and a
-concurrent append that rotates the log can move the matching file out of the
-walk. When the settlement lookup cannot read the history, `tx status` and
-`stellar_transaction_status` log the error and write no settled row. Where
-the profile has an audit writer, `tx receipt clear` refuses with the verifier's
+eleventh rotation deletes the oldest archive. Callers hold the writer guard
+during settlement and clear lookups. Accounting delivery retains it through
+append and acknowledgement. `tx status` and `stellar_transaction_status`
+acquire the writer only to deliver an unacknowledged accounting event. A
+receipt projection that is owed alone completes without the writer. When the
+writer cannot be acquired or the retained history does not verify, both still
+render their answer. The refusal is logged at WARN, and the obligation stays
+owed. Where the profile has an audit writer, `tx receipt clear` refuses with the verifier's
 code, such as `audit.chain_broken` for a broken chain, and keeps the receipt.
 
 The anchor is written after the entry it covers is fsynced, so it is not

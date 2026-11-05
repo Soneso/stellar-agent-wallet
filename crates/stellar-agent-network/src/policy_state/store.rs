@@ -9,7 +9,9 @@ use std::path::{Path, PathBuf};
 
 use hmac::{Hmac, KeyInit as _, Mac as _};
 use sha2::{Digest as _, Sha256};
+use stellar_agent_core::audit_log::AuditWriter;
 use stellar_agent_core::audit_log::schema::{PreviousState, WipedAccrualRecord, WipedBucket};
+use stellar_agent_core::error::WalletError;
 use stellar_agent_core::policy::DenyReason;
 use stellar_agent_core::policy::pin::{self, PinError, PinScope, PinState};
 use stellar_agent_core::policy::v1::criteria::state_store::{
@@ -18,7 +20,7 @@ use stellar_agent_core::policy::v1::criteria::state_store::{
 use stellar_agent_core::profile::caip2::Caip2;
 use stellar_agent_core::profile::owner_key::{self, OwnerKeyContext};
 use stellar_agent_core::profile::receipt::{
-    ReceiptStatus, ReceiptStore, ReceiptStoreError, ReleaseEvidence,
+    AccountingExpiryProjection, ReceiptStatus, ReceiptStore, ReceiptStoreError, ReleaseEvidence,
 };
 use stellar_agent_core::profile::schema::{
     KeyringEntryRef, Profile, default_policy_window_state_path_for, generation_account,
@@ -336,7 +338,7 @@ pub(super) const WIRE_VERSION_LEDGER: u32 = 4;
 /// A file written by a newer build carries records this one cannot account
 /// for, so it is refused rather than read with the fields it happens to
 /// recognise.
-pub(super) const WIRE_VERSION_MAX: u32 = 7;
+pub(super) const WIRE_VERSION_MAX: u32 = 8;
 
 /// Wire version binding the accounting network on every snapshot.
 pub(super) const WIRE_VERSION_CHAIN: u32 = 5;
@@ -347,8 +349,13 @@ pub(super) const WIRE_VERSION_CLAIM: u32 = 6;
 /// Wire version carrying conservative exposure accounting.
 pub(super) const WIRE_VERSION_EXPOSURE: u32 = 7;
 
+/// Wire version carrying durable accounting-expiry audit obligations.
+pub(super) const WIRE_VERSION_EXPIRY: u32 = 8;
+
 fn select_wire_version(wire: &WireFile) -> u32 {
-    if wire
+    if !wire.accounting_expiries.is_empty() {
+        WIRE_VERSION_EXPIRY
+    } else if wire
         .entries
         .iter()
         .flat_map(|bucket| &bucket.records)
@@ -619,6 +626,141 @@ enum AccountingEvidence {
     OperatorOverride { acknowledge_unbounded: bool },
 }
 
+/// The domain label of an accounting-expiry decision identifier.
+const ACCOUNTING_EXPIRY_ID_LABEL: &[u8] = b"stellar-agent-accounting-expiry:v1";
+
+/// The outer `tool` of a `submission_accounting_expired` row.
+const ACCOUNTING_EXPIRY_TOOL: &str = "accounting_expiry_delivery";
+
+/// An accounting expiry committed by [`PersistedWindowStore::apply_accounting_decision`]
+/// and the audit obligation it owes.
+///
+/// Only the store constructs one, while applying a checked
+/// [`AccountingDecision`] with expiry evidence, and stores it in the same
+/// authenticated successor as the debit disposition. It is stored data, not
+/// an authority: deserializing one, from the window file or anywhere else,
+/// authorizes no transition. The record carries every fact needed to rebuild
+/// the receipt, so it outlives the debit records ordinary pruning drops.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct AccountingExpiryRecord {
+    /// Deterministic digest of the committed scope, reservation, generation
+    /// and disposition; see [`accounting_expiry_decision_id`].
+    decision_id: String,
+    /// The authenticated canonical chain and passphrase hash.
+    chain_scope: ChainScope,
+    /// The authenticated reservation identifier.
+    reservation_id: String,
+    /// The authenticated transaction identifier.
+    tx_hash: String,
+    /// The account whose sequence the transaction consumes.
+    source: String,
+    /// The sequence number the transaction consumes.
+    sequence: i64,
+    /// The authenticated execution bound, `TimeBounds.maxTime` in unix seconds.
+    max_time: u64,
+    /// The ledger observed when the reservation was taken.
+    submission_ledger: u32,
+    /// The successor generation that commits the expiry.
+    generation: u64,
+    /// Always [`RecordStatus::AccountingExpired`].
+    disposition: RecordStatus,
+    /// The checked local expiry time, in unix milliseconds.
+    observed_at_ms: u64,
+    /// The greatest affected accounting horizon, in unix milliseconds.
+    accounting_until_ms: u64,
+    /// Whether the verified audit history holds this decision's event.
+    audit_acknowledged: bool,
+    /// Whether the receipt projection completed.
+    receipt_projected: bool,
+}
+
+/// Derives the decision identifier of an accounting expiry: lowercase
+/// hexadecimal SHA-256 over
+/// `label || u32be(len) || chain || passphrase_sha256 || u32be(len) ||
+/// reservation_id || u64be(generation) || u32be(len) || "accounting_expired"`.
+///
+/// `generation` is the successor generation that commits the expiry. Retries
+/// and acknowledgement read the stored identifier and never recompute it from
+/// a later generation.
+///
+/// # Errors
+/// Refuses a component whose length does not fit the encoding.
+fn accounting_expiry_decision_id(
+    scope: ChainScope,
+    reservation_id: &str,
+    generation: u64,
+) -> Result<String, WindowStoreError> {
+    fn length(bytes: &[u8]) -> Result<[u8; 4], WindowStoreError> {
+        u32::try_from(bytes.len())
+            .map(u32::to_be_bytes)
+            .map_err(|_| WindowStoreError::Invalid {
+                detail: "an accounting decision component is too long to encode".to_owned(),
+            })
+    }
+    let chain = scope.chain.caip2_str().as_bytes();
+    let disposition = ACCOUNTING_EXPIRED_DISPOSITION.as_bytes();
+    let mut digest = Sha256::new();
+    digest.update(ACCOUNTING_EXPIRY_ID_LABEL);
+    digest.update(length(chain)?);
+    digest.update(chain);
+    digest.update(scope.network_passphrase_sha256);
+    digest.update(length(reservation_id.as_bytes())?);
+    digest.update(reservation_id.as_bytes());
+    digest.update(generation.to_be_bytes());
+    digest.update(length(disposition)?);
+    digest.update(disposition);
+    Ok(stellar_agent_core::hex::encode(&digest.finalize()))
+}
+
+/// The wire name of [`RecordStatus::AccountingExpired`], bound into every
+/// accounting-expiry decision identifier.
+const ACCOUNTING_EXPIRED_DISPOSITION: &str = "accounting_expired";
+
+impl AccountingExpiryRecord {
+    /// The `submission_accounting_expired` event this record owes, under a
+    /// fresh request identifier.
+    fn event(&self) -> stellar_agent_core::audit_log::AuditEntry {
+        stellar_agent_core::audit_log::AuditEntry::new_submission_accounting_expired(
+            ACCOUNTING_EXPIRY_TOOL,
+            self.chain_scope.chain().caip2_str(),
+            self.reservation_id.as_str(),
+            self.decision_id.as_str(),
+            self.generation,
+            crate::submit::redact_tx_hash(&self.tx_hash),
+            self.observed_at_ms,
+            self.accounting_until_ms,
+            uuid::Uuid::new_v4().to_string(),
+        )
+    }
+
+    /// The receipt this record projects.
+    fn projection(&self) -> AccountingExpiryProjection<'_> {
+        AccountingExpiryProjection {
+            envelope_hash: &self.reservation_id,
+            tx_hash: &self.tx_hash,
+            source: &self.source,
+            sequence: self.sequence,
+            max_time: self.max_time,
+            recorded_at_ledger: self.submission_ledger,
+            decision_id: &self.decision_id,
+        }
+    }
+
+    /// Checks the record against the snapshot it is stored in.
+    fn check(&self, file_scope: Option<ChainScope>, file_generation: u64) -> bool {
+        file_scope == Some(self.chain_scope)
+            && self.disposition == RecordStatus::AccountingExpired
+            && self.generation <= file_generation
+            && accounting_expiry_decision_id(
+                self.chain_scope,
+                &self.reservation_id,
+                self.generation,
+            )
+            .is_ok_and(|expected| expected == self.decision_id)
+    }
+}
+
 /// One `(timestamp_ms, amount)` record within a bucket, plus the identity of
 /// the submission that reserved it.
 ///
@@ -752,8 +894,10 @@ pub struct ReconcileReport {
     /// Reservations left standing because the answers settled nothing, an
     /// endpoint failure included.
     pub kept_pending: usize,
-    /// Receipt reads and writes that failed; their reservations remain pending
-    /// for a later pass.
+    /// Receipt reads and writes that failed. Receipt projection failures are
+    /// reported separately from committed accounting changes: one can
+    /// accompany a counted release, whose projection a later drain retries
+    /// from authenticated state.
     pub receipt_write_failed: usize,
     /// The first receipt-store error, of a read or a write, that prevented an
     /// outcome from being recorded.
@@ -764,8 +908,10 @@ pub struct ReconcileReport {
     /// answer (see [`Self::unrecorded`]), and the reservations stand until an
     /// operator resolves them.
     pub retention_expired: usize,
-    /// Accounting dispositions in pass order. Endpoint reports supply no
-    /// authenticated outcome, and accounting expiry owes no failed audit row.
+    /// Committed accounting expiries in pass order, each named by its
+    /// authenticated decision identifier. Endpoint reports supply no
+    /// authenticated outcome. Each expiry owes one `submission_accounting_expired`
+    /// event, which the window state keeps until delivery acknowledges it.
     pub settled: Vec<SettledSubmission>,
     /// Endpoint answers the pass did not record, in pass order: the receipt
     /// of an untimed authenticated hold already records a network answer
@@ -872,19 +1018,16 @@ impl ReconcileFailure {
     }
 }
 
-/// One accounting disposition recorded by a reconciliation pass.
+/// One accounting expiry a reconciliation pass committed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SettledSubmission {
     /// The envelope hash naming the submission record.
     pub envelope_hash: String,
     /// The transaction hash, in full.
     pub tx_hash: String,
-    /// The receipt disposition. Accounting expiry remains `Ambiguous`.
-    pub status: ReceiptStatus,
-    /// The accounting disposition or observation. It owes no failed audit row.
-    pub release_code: Option<ReleaseEvidence>,
-    /// An endpoint-reported ledger, when available.
-    pub ledger: Option<u32>,
+    /// The committed decision identifier, which resolves against the
+    /// authenticated window state.
+    pub decision_id: String,
 }
 
 /// Wire code of [`ReportedAnswer::Success`].
@@ -951,7 +1094,8 @@ pub(super) struct WireBucket {
 /// keyring-held generation counter for the file to be accepted.
 ///
 /// Version 5 binds the accounting network on every snapshot. Version 6 carries
-/// durable signing claims. Optional fields
+/// durable signing claims. Version 7 carries conservative exposure accounting,
+/// and version 8 carries accounting-expiry audit obligations. Optional fields
 /// preserve the serialized shape of legacy snapshots for integrity checks;
 /// missing network provenance refuses at the authenticated read boundary.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
@@ -967,6 +1111,11 @@ pub(super) struct WireFile {
     /// The holds of open authorizations, keyed by `(authorization, ordinal)`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(super) holds: Vec<WireAuthorizationHold>,
+    /// Committed accounting expiries and their audit obligations. Absent from
+    /// a snapshot that holds none, so earlier authenticated bytes keep their
+    /// form.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(super) accounting_expiries: Vec<AccountingExpiryRecord>,
     /// Prepared next generation, authenticated with the current snapshot.
     /// The keyring counter selects exactly one side of the atomic commit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1111,6 +1260,9 @@ struct ResetSnapshot {
     accrual: WipedAccrualRecord,
     /// The verified snapshot being replaced, absent on a genuine first run.
     original: Option<WireFile>,
+    /// Acknowledged accounting-expiry records whose receipt projection is
+    /// incomplete; the empty successor keeps them.
+    retained_expiries: Vec<AccountingExpiryRecord>,
 }
 
 /// Whether the mainnet rules apply to `profile`: a mainnet profile in a build
@@ -1699,6 +1851,13 @@ impl PersistedWindowStore {
 
     /// Applies a checked decision under the store lock and records its disposition.
     ///
+    /// An expiry decision also records its `AccountingExpiryRecord`, built
+    /// from the verified records and their checked accounting horizons, in the
+    /// same successor that commits the debit disposition. The committed
+    /// decision identifier is returned for an expiry and `None` for every
+    /// other decision. Operator overrides and pre-exposure cancellations owe no
+    /// expiry event.
+    ///
     /// # Errors
     /// Refuses a changed chain, generation, or evidence. See [`WindowStoreError`].
     #[allow(
@@ -1709,7 +1868,7 @@ impl PersistedWindowStore {
         &self,
         profile: &Profile,
         decision: AccountingDecision,
-    ) -> Result<(), WindowStoreError> {
+    ) -> Result<Option<String>, WindowStoreError> {
         self.ensure_parent_dir()?;
         let _lock = WindowStoreLock::acquire_for_with_retry(
             &self.path,
@@ -1726,6 +1885,17 @@ impl PersistedWindowStore {
         }
         check_accounting_evidence(&wire, &decision.id, decision.evidence)?;
         let original = wire.clone();
+        let expiry = match decision.evidence {
+            AccountingEvidence::Expired { observed_at_ms } => Some(expiry_record(
+                &wire,
+                decision.chain_scope,
+                &decision.id,
+                decision.generation,
+                observed_at_ms,
+            )?),
+            AccountingEvidence::PreExposureCancellation
+            | AccountingEvidence::OperatorOverride { .. } => None,
+        };
         for bucket in &mut wire.entries {
             if matches!(
                 decision.evidence,
@@ -1754,7 +1924,12 @@ impl PersistedWindowStore {
                 }
             }
         }
-        self.commit_generation(&key, &gen_entry, original, wire)
+        let decision_id = expiry.as_ref().map(|record| record.decision_id.clone());
+        if let Some(record) = expiry {
+            wire.accounting_expiries.push(record);
+        }
+        self.commit_generation(&key, &gen_entry, original, wire)?;
+        Ok(decision_id)
     }
 
     #[cfg(test)]
@@ -1765,6 +1940,7 @@ impl PersistedWindowStore {
         }
         let decision = self.pre_exposure_cancellation(profile, id)?;
         self.apply_accounting_decision(profile, decision)
+            .map(|_| ())
     }
 
     /// Keeps an orphan's authenticated identity and debit while excluding it
@@ -1863,8 +2039,8 @@ impl PersistedWindowStore {
 
         // Oldest first, skipping ambiguous receipts without release evidence:
         // the budget goes only to reservations the endpoint can still answer
-        // for. An ambiguous receipt with evidence is a release whose window
-        // step did not complete; this pass settles it again from the chain.
+        // for. An ambiguous receipt with a release code is examined again:
+        // the code is display data, so the window and the chain decide.
         // Cleared receipts also need no endpoint answer.
         // One read of the receipt file for the whole pass. The filter below
         // consults it per candidate, and re-reading it each time would cost a
@@ -2065,6 +2241,12 @@ impl PersistedWindowStore {
     /// The recorder runs before minting a key or writing either durable state.
     /// Unverifiable state refuses before the recorder and all state writes.
     ///
+    /// An undelivered accounting-expiry audit obligation refuses with
+    /// [`WindowStoreError::AccountingAuditOwed`] before the recorder runs; the
+    /// caller delivers it first. Acknowledged expiry records whose receipt
+    /// projection is incomplete carry into the empty successor; they hold no
+    /// exposure.
+    ///
     /// A mainnet profile in a build with mainnet writes also refuses while an
     /// effective open or claimed authorization remains. Expiry releases
     /// unclaimed holds and converts claimed holds to confirmed spend in memory;
@@ -2124,6 +2306,7 @@ impl PersistedWindowStore {
             };
             let empty = WireFile {
                 chain_scope: Some(ChainScope::for_chain(profile.chain_id)),
+                accounting_expiries: snapshot.retained_expiries,
                 ..WireFile::default()
             };
             let original = snapshot.original.unwrap_or_default();
@@ -2182,12 +2365,28 @@ impl PersistedWindowStore {
                 key,
                 accrual,
                 original: None,
+                retained_expiries: Vec::new(),
             });
         };
         let hmac_key = key.as_ref().ok_or(WindowStoreError::ChainUnverifiable)?;
         let mut wire = self
             .verify_with_key(hmac_key, &bytes)
             .and_then(|wire| self.select_scoped_generation(profile, wire, counter))?;
+        // An undelivered accounting-expiry event is an audit obligation the
+        // empty successor would erase, so the reset refuses before its row.
+        if wire
+            .accounting_expiries
+            .iter()
+            .any(|record| !record.audit_acknowledged)
+        {
+            return Err(WindowStoreError::AccountingAuditOwed);
+        }
+        let retained_expiries = wire
+            .accounting_expiries
+            .iter()
+            .filter(|record| !record.receipt_projected)
+            .cloned()
+            .collect();
         let original = wire.clone();
         accrual.previous = PreviousState::Verified;
         // Authorization lifetimes use the store's clock on every transition.
@@ -2218,6 +2417,7 @@ impl PersistedWindowStore {
             key,
             accrual,
             original: Some(original),
+            retained_expiries,
         })
     }
 
@@ -2787,6 +2987,16 @@ impl PersistedWindowStore {
         self.settle_chain_answer(profile, receipts, reservation, &record, now_ms()?)
     }
 
+    /// Expires the accounting of `reservation` once every affected horizon
+    /// has passed at `observed_at_ms`.
+    ///
+    /// Accounting expiry commits its disposition and audit obligation
+    /// together. Receipt projection follows the commit and can be retried from
+    /// authenticated state.
+    ///
+    /// A receipt that cannot be written leaves the committed expiry and its
+    /// obligation in place, reported beside the release, and a later pass
+    /// projects it again from authenticated state.
     fn expire_accounting(
         &self,
         profile: &Profile,
@@ -2805,24 +3015,183 @@ impl PersistedWindowStore {
             &reservation.id,
             AccountingEvidence::Expired { observed_at_ms },
         )?;
-        let needs_receipt = receipts
-            .map(|store| store.get(&reservation.id))
-            .transpose()
-            .map_err(|error| WindowStoreError::Invalid {
-                detail: error.to_string(),
-            })?
-            .flatten()
-            .is_none_or(|receipt| receipt.status.is_operator_clearable());
-        if needs_receipt
-            && let Err(error) =
-                release_receipt(receipts, reservation, ReleaseEvidence::AccountingExpired)
-        {
-            return Ok(Some(Settlement::ReceiptWriteFailed {
-                error: error.to_string(),
-            }));
+        let decision_id = self
+            .apply_accounting_decision(profile, decision)?
+            .ok_or_else(|| WindowStoreError::Invalid {
+                detail: "the accounting expiry committed no decision".to_owned(),
+            })?;
+        #[cfg(test)]
+        tests::accounting_fault(tests::ACCOUNTING_FAULT_AFTER_COMMIT)?;
+        let receipt_error = match self.project_accounting_expiry(profile, receipts, &decision_id) {
+            Ok(_) => None,
+            Err(ProjectionError::Receipt(error)) => Some(error.to_string()),
+            Err(ProjectionError::Window(error)) => {
+                tracing::warn!(
+                    ?error,
+                    "window reconcile: the receipt projection flag was not recorded; a later \
+                     pass projects the receipt again"
+                );
+                None
+            }
+        };
+        Ok(Some(Settlement::AccountingExpired {
+            decision_id,
+            receipt_error,
+        }))
+    }
+
+    /// Lists the accounting-expiry decisions the verified window state still
+    /// owes: those whose audit event is unacknowledged, and those whose
+    /// receipt projection is incomplete.
+    ///
+    /// Verifies the file's HMAC tag and generation, like every other read,
+    /// and takes no lock.
+    ///
+    /// # Errors
+    ///
+    /// See [`WindowStoreError`].
+    pub fn owed_accounting_expiries(
+        &self,
+        profile: &Profile,
+    ) -> Result<OwedAccountingExpiries, WindowStoreError> {
+        let mut owed = OwedAccountingExpiries::default();
+        if let Some(wire) = self.read_for_inspection(profile)? {
+            for record in &wire.accounting_expiries {
+                if !record.audit_acknowledged {
+                    owed.unacknowledged.push(record.decision_id.clone());
+                }
+                if !record.receipt_projected {
+                    owed.unprojected.push(record.decision_id.clone());
+                }
+            }
         }
-        self.apply_accounting_decision(profile, decision)?;
-        Ok(Some(Settlement::AccountingExpired))
+        Ok(owed)
+    }
+
+    /// The verified accounting-expiry record named `decision_id`, or `None`
+    /// when the authenticated window state holds none.
+    fn accounting_expiry(
+        &self,
+        profile: &Profile,
+        decision_id: &str,
+    ) -> Result<Option<AccountingExpiryRecord>, WindowStoreError> {
+        Ok(self.read_for_inspection(profile)?.and_then(|wire| {
+            wire.accounting_expiries
+                .into_iter()
+                .find(|record| record.decision_id == decision_id)
+        }))
+    }
+
+    /// The `submission_accounting_expired` event the verified record
+    /// `decision_id` owes, or `None` when the authenticated window state
+    /// holds no such record.
+    ///
+    /// The event carries the committed facts alone; delivery appends it only
+    /// when the verified retained history lacks the identifier. Tests use it
+    /// to place the event in the history outside delivery.
+    ///
+    /// # Errors
+    ///
+    /// See [`WindowStoreError`].
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn accounting_expiry_event(
+        &self,
+        profile: &Profile,
+        decision_id: &str,
+    ) -> Result<Option<stellar_agent_core::audit_log::AuditEntry>, WindowStoreError> {
+        Ok(self
+            .accounting_expiry(profile, decision_id)?
+            .map(|record| record.event()))
+    }
+
+    /// The decision identifier the verified window state holds for the
+    /// accounting expiry of reservation `envelope_hash`, or `None`.
+    ///
+    /// # Errors
+    ///
+    /// See [`WindowStoreError`].
+    pub fn accounting_expiry_for(
+        &self,
+        profile: &Profile,
+        envelope_hash: &str,
+    ) -> Result<Option<String>, WindowStoreError> {
+        Ok(self.read_for_inspection(profile)?.and_then(|wire| {
+            wire.accounting_expiries
+                .into_iter()
+                .rev()
+                .find(|record| record.reservation_id == envelope_hash)
+                .map(|record| record.decision_id)
+        }))
+    }
+
+    /// Projects the committed accounting expiry `decision_id` onto its
+    /// receipt and commits `receipt_projected` once the receipt write
+    /// completes.
+    ///
+    /// The projection is built from the authenticated record alone, so a
+    /// missing receipt is rebuilt from it and receipt contents cannot change
+    /// the committed disposition. Without a receipt store nothing is written
+    /// and the flag stays unset.
+    fn project_accounting_expiry(
+        &self,
+        profile: &Profile,
+        receipts: Option<&ReceiptStore>,
+        decision_id: &str,
+    ) -> Result<Projection, ProjectionError> {
+        let record = self
+            .accounting_expiry(profile, decision_id)
+            .map_err(ProjectionError::Window)?
+            .ok_or(ProjectionError::Window(WindowStoreError::Invalid {
+                detail: "the accounting decision is not in verified window state".to_owned(),
+            }))?;
+        if record.receipt_projected {
+            return Ok(Projection::Projected);
+        }
+        let Some(receipts) = receipts else {
+            return Ok(Projection::StoreMissing);
+        };
+        receipts
+            .project_accounting_expiry(&record.projection())
+            .map_err(|error| {
+                tracing::warn!(
+                    %error,
+                    "window reconcile: receipt projection failed; the committed expiry stands"
+                );
+                ProjectionError::Receipt(error)
+            })?;
+        self.mark_accounting_expiry(profile, decision_id, |record| &mut record.receipt_projected)
+            .map_err(ProjectionError::Window)?;
+        Ok(Projection::Projected)
+    }
+
+    /// Sets one flag of the accounting-expiry record `decision_id` in a new
+    /// authenticated successor. A flag already set writes nothing.
+    fn mark_accounting_expiry(
+        &self,
+        profile: &Profile,
+        decision_id: &str,
+        flag: impl Fn(&mut AccountingExpiryRecord) -> &mut bool,
+    ) -> Result<(), WindowStoreError> {
+        let mut found = false;
+        self.rewrite_records(profile, |wire| {
+            let mut touched = false;
+            for record in &mut wire.accounting_expiries {
+                if record.decision_id == decision_id {
+                    found = true;
+                    let flag = flag(record);
+                    touched |= !*flag;
+                    *flag = true;
+                }
+            }
+            touched
+        })?;
+        if found {
+            Ok(())
+        } else {
+            Err(WindowStoreError::Invalid {
+                detail: "the accounting decision is not in verified window state".to_owned(),
+            })
+        }
     }
 
     /// Reads and fully verifies the file for inspection, taking no lock.
@@ -3315,10 +3684,14 @@ fn authenticated_scope(wire: &WireFile) -> Result<ChainScope, WindowStoreError> 
     Ok(scope)
 }
 
-/// Checks one snapshot's version and its authorization history.
+/// Checks one snapshot's version, its authorization history and its
+/// accounting-expiry records.
 ///
-/// Versions 1 through 7 decode. Snapshots below version 4 carry no authorization
+/// Versions 1 through 8 decode. Snapshots below version 4 carry no authorization
 /// history; usable snapshots also require complete authenticated scope.
+/// Accounting-expiry records need version 8, the file's own scope, the
+/// accounting-expired disposition, a generation no later than the file's, and
+/// a unique identifier that recomputes from their fields.
 fn check_snapshot(wire: &WireFile) -> Result<(), WindowStoreError> {
     if wire.version > WIRE_VERSION_MAX {
         return Err(WindowStoreError::UnsupportedVersion);
@@ -3331,6 +3704,21 @@ fn check_snapshot(wire: &WireFile) -> Result<(), WindowStoreError> {
             ),
         });
     }
+    if !wire.accounting_expiries.is_empty() && wire.version < WIRE_VERSION_EXPIRY {
+        return Err(WindowStoreError::Invalid {
+            detail: format!("accounting-expiry records require wire version {WIRE_VERSION_EXPIRY}"),
+        });
+    }
+    let mut seen = std::collections::HashSet::new();
+    for record in &wire.accounting_expiries {
+        if !record.check(wire.chain_scope, wire.generation)
+            || !seen.insert(record.decision_id.as_str())
+        {
+            return Err(WindowStoreError::Invalid {
+                detail: "an accounting-expiry record does not match its snapshot".to_owned(),
+            });
+        }
+    }
     ledger::validate(wire)
 }
 
@@ -3342,6 +3730,12 @@ fn check_snapshot(wire: &WireFile) -> Result<(), WindowStoreError> {
 /// that spend counting and take the record out of reconciliation's reach while
 /// its receipt still reports pending. A reservation that old is resolved by
 /// `tx status` or by `tx receipt clear`, not by the clock.
+///
+/// An accounting-expiry record is kept whatever its age until its audit event
+/// is acknowledged and its receipt projected; it carries every fact delivery
+/// and projection need. Keeping it restores no counted exposure. A record
+/// with both done is dropped once its observation is older than the retention
+/// interval.
 pub(super) fn prune_stale(wire: &mut WireFile, now_ms: u64) {
     let cutoff = now_ms.saturating_sub(RETENTION_MS);
     for bucket in &mut wire.entries {
@@ -3350,6 +3744,9 @@ pub(super) fn prune_stale(wire: &mut WireFile, now_ms: u64) {
             .retain(|r| r.ts_ms >= cutoff || is_exposure(r));
     }
     wire.entries.retain(|b| !b.records.is_empty());
+    wire.accounting_expiries.retain(|record| {
+        !(record.audit_acknowledged && record.receipt_projected) || record.observed_at_ms >= cutoff
+    });
     // Settled authorization history ages out on the same retention; an open
     // authorization stays whatever its age, until a transaction's sweep
     // settles it.
@@ -3373,8 +3770,14 @@ fn outcome_already_unknown(
 enum Settlement {
     /// The endpoint reports success; the reservation remains possible spend.
     Confirmed,
-    /// Accounting ends with the chain outcome unknown.
-    AccountingExpired,
+    /// Accounting ends with the chain outcome unknown. The disposition and its
+    /// audit obligation are committed under `decision_id`.
+    AccountingExpired {
+        /// The committed decision identifier.
+        decision_id: String,
+        /// The receipt-store error of a projection that did not complete.
+        receipt_error: Option<String>,
+    },
     /// The receipt store could not be read, or the receipt could not record
     /// the outcome; the reservation stands.
     ReceiptWriteFailed {
@@ -3395,6 +3798,333 @@ enum Settlement {
         /// What the endpoint answers now.
         answer: ReportedAnswer,
     },
+}
+
+/// The accounting-expiry decisions the verified window state still owes.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OwedAccountingExpiries {
+    /// Decisions whose `submission_accounting_expired` event delivery has not
+    /// acknowledged.
+    pub unacknowledged: Vec<String>,
+    /// Decisions whose receipt projection has not completed.
+    pub unprojected: Vec<String>,
+}
+
+impl OwedAccountingExpiries {
+    /// Whether nothing is owed.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.unacknowledged.is_empty() && self.unprojected.is_empty()
+    }
+}
+
+/// What one accounting audit drain did.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DeliveryReport {
+    /// `submission_accounting_expired` events appended.
+    pub appended: usize,
+    /// Obligations acknowledged in the window state, including those whose
+    /// event the verified retained history already held.
+    pub acknowledged: usize,
+    /// Receipt projections completed and recorded.
+    pub projected: usize,
+    /// Receipt projections that did not complete: a receipt-store error, or
+    /// no receipt store. Each stays owed for a later drain.
+    pub projection_pending: usize,
+    /// The first receipt-store error of a projection.
+    pub projection_error: Option<String>,
+}
+
+impl DeliveryReport {
+    fn record(&mut self, projection: Result<Projection, ProjectionError>) {
+        match projection {
+            Ok(Projection::Projected) => self.projected += 1,
+            Ok(Projection::StoreMissing) => self.projection_pending += 1,
+            Err(ProjectionError::Receipt(error)) => {
+                self.projection_pending += 1;
+                self.projection_error.get_or_insert(error.to_string());
+            }
+            Err(ProjectionError::Window(error)) => {
+                tracing::warn!(
+                    ?error,
+                    "accounting delivery: the receipt projection flag was not recorded"
+                );
+                self.projection_pending += 1;
+            }
+        }
+    }
+}
+
+/// A completed receipt projection, or the absence of a receipt store.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Projection {
+    /// The receipt carries the projection and the flag is committed.
+    Projected,
+    /// No receipt store was supplied; nothing was written.
+    StoreMissing,
+}
+
+/// Why a receipt projection did not complete.
+#[derive(Debug)]
+enum ProjectionError {
+    /// The receipt store refused the write.
+    Receipt(ReceiptStoreError),
+    /// The authenticated window state could not be read or written.
+    Window(WindowStoreError),
+}
+
+/// Delivers every accounting-expiry audit obligation the verified window
+/// state owes, then retries every incomplete receipt projection.
+///
+/// `writer` is the caller's guard of the profile's bound keyed writer; the
+/// caller holds it for the whole drain. Each unacknowledged decision goes
+/// through [`deliver_accounting_expiry`]. Decision identifiers come from the
+/// verified window state alone, never from a receipt or a reconciliation
+/// report, so obligations of earlier passes are found too.
+///
+/// # Errors
+///
+/// The first delivery refusal; see [`deliver_accounting_expiry`]. Every
+/// obligation not acknowledged stays owed for a later drain.
+pub fn deliver_accounting_expiries(
+    writer: &mut AuditWriter,
+    store: &PersistedWindowStore,
+    profile: &Profile,
+    profile_name: &str,
+    receipts: Option<&ReceiptStore>,
+) -> Result<DeliveryReport, WalletError> {
+    let owed = store
+        .owed_accounting_expiries(profile)
+        .map_err(|error| delivery_store_error(&error))?;
+    let mut report = DeliveryReport::default();
+    for decision_id in &owed.unacknowledged {
+        let delivered =
+            deliver_accounting_expiry(writer, store, profile, profile_name, receipts, decision_id)?;
+        report.appended += delivered.appended;
+        report.acknowledged += delivered.acknowledged;
+        report.projected += delivered.projected;
+        report.projection_pending += delivered.projection_pending;
+        if let Some(error) = delivered.projection_error {
+            report.projection_error.get_or_insert(error);
+        }
+    }
+    for decision_id in owed
+        .unprojected
+        .iter()
+        .filter(|id| !owed.unacknowledged.contains(id))
+    {
+        report.record(store.project_accounting_expiry(profile, receipts, decision_id));
+    }
+    Ok(report)
+}
+
+/// Delivers the accounting-expiry audit obligation `decision_id`.
+///
+/// Under the caller's writer guard, the delivery:
+///
+/// 1. verifies the writer's tip anchor and the retained history through
+///    [`AuditWriter::verify_tip_anchor`];
+/// 2. resolves `decision_id` against the verified window state;
+/// 3. looks up that exact identifier in the verified retained history;
+/// 4. appends one `submission_accounting_expired` event only when the
+///    identifier is absent, and requires the tip anchor to cover it;
+/// 5. commits `audit_acknowledged` in a second authenticated successor;
+/// 6. projects the receipt from the committed record and commits
+///    `receipt_projected` once that write completes.
+///
+/// The guard spans the lookup, the append and the acknowledgement, so the
+/// retained history holds at most one event per decision identifier. Window
+/// locks are taken in short sections inside that guard and never around the
+/// writer's acquisition. An already acknowledged decision appends nothing
+/// and only retries its projection.
+///
+/// # Errors
+///
+/// - `submission.settlement_unverifiable` before any append when the verified
+///   window state holds no record named `decision_id`.
+/// - The audit refusal of a writer whose anchor or retained history does not
+///   verify, and `audit.chain_key_unavailable` for a history the lookup cannot
+///   read.
+/// - The audit refusal of an append, and the window-state refusal of the
+///   acknowledgement.
+///
+/// A refusal leaves the obligation owed for a later delivery.
+pub fn deliver_accounting_expiry(
+    writer: &mut AuditWriter,
+    store: &PersistedWindowStore,
+    profile: &Profile,
+    profile_name: &str,
+    receipts: Option<&ReceiptStore>,
+    decision_id: &str,
+) -> Result<DeliveryReport, WalletError> {
+    use stellar_agent_core::error::SubmissionError;
+
+    writer
+        .verify_tip_anchor()
+        .map_err(|error| audit_refusal(profile_name, &error))?;
+    let record = store
+        .accounting_expiry(profile, decision_id)
+        .map_err(|error| delivery_store_error(&error))?
+        .ok_or(WalletError::Submission(
+            SubmissionError::SettlementUnverifiable,
+        ))?;
+    let mut report = DeliveryReport::default();
+    if !record.audit_acknowledged {
+        let recorded = stellar_agent_core::audit_log::reader::try_accounting_expiry_recorded(
+            writer,
+            &record.decision_id,
+        )
+        .map_err(|error| {
+            stellar_agent_core::audit_log::reader::audit_history_refusal(profile_name, &error)
+        })?;
+        if !recorded {
+            writer
+                .write_entry(record.event())
+                .map_err(|error| audit_refusal(profile_name, &error))?;
+            writer
+                .require_anchor_current()
+                .map_err(|error| audit_refusal(profile_name, &error))?;
+            report.appended += 1;
+        }
+        #[cfg(test)]
+        tests::accounting_fault(tests::ACCOUNTING_FAULT_AFTER_APPEND)
+            .map_err(|error| delivery_store_error(&error))?;
+        store
+            .mark_accounting_expiry(profile, &record.decision_id, |record| {
+                &mut record.audit_acknowledged
+            })
+            .map_err(|error| delivery_store_error(&error))?;
+        report.acknowledged += 1;
+        #[cfg(test)]
+        tests::accounting_fault(tests::ACCOUNTING_FAULT_AFTER_ACKNOWLEDGE)
+            .map_err(|error| delivery_store_error(&error))?;
+    }
+    report.record(store.project_accounting_expiry(profile, receipts, &record.decision_id));
+    Ok(report)
+}
+
+/// Retries every incomplete receipt projection without the audit writer.
+///
+/// Projection is display data rebuilt from authenticated records, so it needs
+/// no audit guard; audit obligations stay owed for
+/// [`deliver_accounting_expiries`].
+///
+/// # Errors
+///
+/// The window-state refusal of the read that lists the owed projections.
+pub fn project_accounting_expiries(
+    store: &PersistedWindowStore,
+    profile: &Profile,
+    receipts: Option<&ReceiptStore>,
+) -> Result<DeliveryReport, WalletError> {
+    let owed = store
+        .owed_accounting_expiries(profile)
+        .map_err(|error| delivery_store_error(&error))?;
+    let mut report = DeliveryReport::default();
+    for decision_id in &owed.unprojected {
+        report.record(store.project_accounting_expiry(profile, receipts, decision_id));
+    }
+    Ok(report)
+}
+
+/// Drains every accounting obligation the verified window state owes.
+///
+/// The drain reads the owed decisions from the verified window state, never
+/// from a receipt or a reconciliation report. `acquire_writer` runs only when
+/// an audit event is unacknowledged; the drain then holds that writer's guard
+/// through [`deliver_accounting_expiries`]. When only receipt projections are
+/// owed, [`project_accounting_expiries`] completes them without the writer.
+///
+/// A caller's own result does not depend on the drain. A refusal is logged
+/// at WARN with the profile and its code, and so is a receipt projection
+/// that stays owed. Every obligation the drain leaves stays owed for a later
+/// drain.
+///
+/// # Errors
+///
+/// The window-state refusal of the read that lists the obligations, the
+/// refusal of `acquire_writer`, `submission.record_unavailable` for a poisoned
+/// writer guard, and every refusal of [`deliver_accounting_expiries`].
+pub fn drain_accounting_obligations(
+    store: &PersistedWindowStore,
+    profile: &Profile,
+    profile_name: &str,
+    receipts: Option<&ReceiptStore>,
+    acquire_writer: impl FnOnce() -> Result<crate::submission_record::AuditWriterHandle, WalletError>,
+) -> Result<DeliveryReport, WalletError> {
+    let drained = drain_owed(store, profile, profile_name, receipts, acquire_writer);
+    match &drained {
+        Ok(report) if report.projection_pending > 0 => tracing::warn!(
+            profile = %profile_name,
+            projection_pending = report.projection_pending,
+            "accounting delivery: receipt projections stay owed"
+        ),
+        Ok(_) => {}
+        Err(error) => tracing::warn!(
+            profile = %profile_name,
+            code = %error.code(),
+            error = %error,
+            "accounting delivery refused; the obligations stay owed"
+        ),
+    }
+    drained
+}
+
+/// The drain of [`drain_accounting_obligations`], before its outcome is
+/// logged.
+fn drain_owed(
+    store: &PersistedWindowStore,
+    profile: &Profile,
+    profile_name: &str,
+    receipts: Option<&ReceiptStore>,
+    acquire_writer: impl FnOnce() -> Result<crate::submission_record::AuditWriterHandle, WalletError>,
+) -> Result<DeliveryReport, WalletError> {
+    let owed = store
+        .owed_accounting_expiries(profile)
+        .map_err(|error| delivery_store_error(&error))?;
+    if owed.unacknowledged.is_empty() {
+        if owed.unprojected.is_empty() {
+            return Ok(DeliveryReport::default());
+        }
+        return project_accounting_expiries(store, profile, receipts);
+    }
+    let audit = acquire_writer()?;
+    let mut guard = audit.lock().map_err(|_| {
+        WalletError::Submission(
+            stellar_agent_core::error::SubmissionError::RecordUnavailable {
+                detail: "the audit writer mutex is poisoned, so accounting delivery cannot run"
+                    .to_owned(),
+            },
+        )
+    })?;
+    deliver_accounting_expiries(&mut guard, store, profile, profile_name, receipts)
+}
+
+/// The refusal a window-state failure of accounting delivery reports: the
+/// value-free chain refusal for a scope failure, otherwise
+/// `submission.record_unavailable`.
+fn delivery_store_error(error: &WindowStoreError) -> WalletError {
+    match error.chain_validation_error() {
+        Some(refusal) => WalletError::Validation(refusal),
+        None => WalletError::Submission(
+            stellar_agent_core::error::SubmissionError::RecordUnavailable {
+                detail: format!("the spending-window state could not be read or written: {error}"),
+            },
+        ),
+    }
+}
+
+/// Maps an audit writer refusal of accounting delivery to its wire code.
+fn audit_refusal(
+    profile_name: &str,
+    error: &stellar_agent_core::audit_log::WriterError,
+) -> WalletError {
+    tracing::warn!(
+        profile = %profile_name,
+        %error,
+        "accounting delivery: the audit writer refused; the obligation stays owed"
+    );
+    stellar_agent_core::audit_log::audit_writer_refusal(profile_name, error)
 }
 
 /// Whether the receipt of `reservation` keeps its `recorded` status rather
@@ -3452,8 +4182,8 @@ fn reservation_from_receipt(
 /// definitive answer; an ambiguous status without evidence is not recorded on
 /// a receipt that does not exist.
 ///
-/// The receipt is the crash checkpoint and is written before the window is
-/// settled. A failed write leaves the reservation standing for the next pass.
+/// The receipt is written before the window records the answer. A failed
+/// write leaves the reservation standing for the next pass.
 fn finalize_receipt(
     receipts: Option<&ReceiptStore>,
     reservation: &SubmissionHold,
@@ -3464,39 +4194,6 @@ fn finalize_receipt(
     persist_receipt(receipts, reservation, restore, |store| {
         store.finalize(&reservation.id, status, ledger)
     })
-}
-
-/// Records on the receipt a reservation belongs to that the reservation was
-/// released on `evidence`.
-///
-/// A missing receipt is restored from the reservation's identity first, as
-/// for a definitive answer, so the release and its evidence stay visible to
-/// the status surfaces and the settled row stays writable after this pass.
-/// The reservation is released only after this write succeeds.
-fn release_receipt(
-    receipts: Option<&ReceiptStore>,
-    reservation: &SubmissionHold,
-    evidence: ReleaseEvidence,
-) -> Result<ReleaseEvidence, ReceiptStoreError> {
-    if let Some(store) = receipts
-        && let Some(recorded) = store
-            .get(&reservation.id)?
-            .filter(|receipt| receipt.status == ReceiptStatus::Ambiguous)
-            .and_then(|receipt| receipt.release_code)
-            .filter(|recorded| *recorded == evidence)
-    {
-        return Ok(recorded);
-    }
-    persist_receipt(receipts, reservation, true, |store| {
-        store.finalize_released(&reservation.id, evidence)
-    })?;
-    // A concurrent release can record its evidence first; the receipt owns the code.
-    Ok(receipts
-        .map(|store| store.get(&reservation.id))
-        .transpose()?
-        .flatten()
-        .and_then(|receipt| receipt.release_code)
-        .unwrap_or(evidence))
 }
 
 /// Applies `write` to the receipt store, restoring a missing receipt from the
@@ -3539,32 +4236,32 @@ fn persist_receipt(
     result
 }
 
-/// Counts one settlement into `report`, and records what the caller owes an
-/// audit row for.
+/// Counts one settlement into `report`.
 ///
-/// Endpoint reports supply no authenticated outcome. Accounting expiry reports
-/// an unknown chain outcome and never owes a failed value-action row.
+/// Endpoint reports supply no authenticated outcome. A committed accounting
+/// expiry is counted as released whether or not its receipt projection
+/// completed; a projection failure is counted beside it.
 fn record_settlement(
     report: &mut ReconcileReport,
     reservation: &SubmissionHold,
     settlement: Settlement,
 ) {
-    let settled = |status, release_code, ledger| SettledSubmission {
-        envelope_hash: reservation.id.clone(),
-        tx_hash: reservation.tx_hash.clone(),
-        status,
-        release_code,
-        ledger,
-    };
     match settlement {
         Settlement::Confirmed => report.confirmed += 1,
-        Settlement::AccountingExpired => {
+        Settlement::AccountingExpired {
+            decision_id,
+            receipt_error,
+        } => {
             report.released += 1;
-            report.settled.push(settled(
-                ReceiptStatus::Ambiguous,
-                Some(ReleaseEvidence::AccountingExpired),
-                None,
-            ));
+            report.settled.push(SettledSubmission {
+                envelope_hash: reservation.id.clone(),
+                tx_hash: reservation.tx_hash.clone(),
+                decision_id,
+            });
+            if let Some(error) = receipt_error {
+                report.receipt_write_failed += 1;
+                report.receipt_write_error.get_or_insert(error);
+            }
         }
         Settlement::ReceiptWriteFailed { error } => {
             report.receipt_write_failed += 1;
@@ -3793,6 +4490,70 @@ fn accounting_expired(wire: &WireFile, id: &str, now: u64) -> bool {
         }
     }
     found
+}
+
+/// Builds the accounting-expiry record of reservation `id` from the verified
+/// snapshot `wire` the decision was checked against.
+///
+/// The record takes the reservation's authenticated identity from its
+/// exposure records and the greatest of their accounting horizons. Its
+/// generation is the successor generation, `generation + 1`, that commits it.
+///
+/// # Errors
+/// Refuses a reservation without exposure records or horizon, a generation
+/// overflow, and an identifier the snapshot already holds.
+fn expiry_record(
+    wire: &WireFile,
+    chain_scope: ChainScope,
+    id: &str,
+    generation: u64,
+    observed_at_ms: u64,
+) -> Result<AccountingExpiryRecord, WindowStoreError> {
+    let refused = |detail: &str| WindowStoreError::Invalid {
+        detail: detail.to_owned(),
+    };
+    let mut identity = None;
+    let mut accounting_until_ms = None;
+    for bucket in &wire.entries {
+        for record in &bucket.records {
+            if record.id == id && is_exposure(record) {
+                identity.get_or_insert(record);
+                let horizon = exposure_horizon(record, bucket.window_secs)
+                    .ok_or_else(|| refused("an expired reservation has no accounting horizon"))?;
+                accounting_until_ms = Some(accounting_until_ms.unwrap_or(0).max(horizon));
+            }
+        }
+    }
+    let (Some(identity), Some(accounting_until_ms)) = (identity, accounting_until_ms) else {
+        return Err(refused("an expired reservation holds no exposure"));
+    };
+    let generation = generation
+        .checked_add(1)
+        .ok_or_else(|| refused("policy window-state generation counter overflow"))?;
+    let decision_id = accounting_expiry_decision_id(chain_scope, id, generation)?;
+    if wire
+        .accounting_expiries
+        .iter()
+        .any(|record| record.decision_id == decision_id)
+    {
+        return Err(refused("the accounting decision is already recorded"));
+    }
+    Ok(AccountingExpiryRecord {
+        decision_id,
+        chain_scope,
+        reservation_id: id.to_owned(),
+        tx_hash: identity.tx_hash.clone(),
+        source: identity.source.clone(),
+        sequence: identity.sequence,
+        max_time: identity.max_time,
+        submission_ledger: identity.submission_ledger,
+        generation,
+        disposition: RecordStatus::AccountingExpired,
+        observed_at_ms,
+        accounting_until_ms,
+        audit_acknowledged: false,
+        receipt_projected: false,
+    })
 }
 
 fn check_accounting_evidence(
@@ -6073,8 +6834,93 @@ mod tests {
         assert!(get_raw(&f.profile.policy_window_state_key_id).is_some());
     }
 
-    /// A failed receipt checkpoint keeps the window pending until a retry succeeds.
-    fn assert_settlement_waits_for_receipt(status: Option<&str>, missing: bool) {
+    /// Holds the receipt store's sidecar lock until the returned file drops.
+    fn hold_receipt_lock(receipts: &ReceiptStore) -> fs::File {
+        let held = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(receipts.lock_file_path().unwrap())
+            .unwrap();
+        held.try_lock().unwrap();
+        held
+    }
+
+    /// A reported success persists its receipt before it changes the window,
+    /// and a reported failure changes neither the receipt nor the hold.
+    fn assert_settlement_waits_for_receipt(status: &str) {
+        keyring_mock::install().unwrap();
+        let dir = TempDir::new().unwrap();
+        let profile = test_profile(dir.path(), "checkpoint");
+        let store = PersistedWindowStore::at_path(dir.path().join("checkpoint.window"));
+        let receipts = ReceiptStore::open_at(dir.path(), "checkpoint").unwrap();
+        let now = now_ms().unwrap();
+        let mut res = reservation(&"7a".repeat(32), "GSOURCE", 7, now);
+        res.max_time = (now / 1000).saturating_sub(86_401);
+        store
+            .record_pending(
+                &profile,
+                &[entry(key("checkpoint", "native", 86_400), now, 900)],
+                &res,
+            )
+            .unwrap();
+        receipts
+            .try_begin(&res.id, &res.tx_hash, &res.source, 7, 0, 100)
+            .unwrap();
+        receipts.mark_submitted(&res.id).unwrap();
+        let before = receipts.get(&res.id).unwrap();
+        let held = hold_receipt_lock(&receipts);
+        let settle = || {
+            let answer = TransactionRecord::from_raw(
+                serde_json::from_value(serde_json::json!({
+                    "status": status, "latestLedger": 200, "oldestLedger": 1,
+                    "ledger": 150, "createdAt": (now / 1_000).to_string(),
+                    "resultXdr": "AAAAAAAAAGT////wAAAAAA==",
+                }))
+                .unwrap(),
+            );
+            store.settle_chain_answer(&profile, Some(&receipts), &res, &answer, now)
+        };
+        if status == "FAILED" {
+            assert_eq!(settle().unwrap(), Settlement::KeptPending);
+            assert_eq!(receipts.get(&res.id).unwrap(), before);
+            assert_eq!(store.pending_reservations(&profile).unwrap(), vec![res]);
+            assert!(store.owed_accounting_expiries(&profile).unwrap().is_empty());
+            return;
+        }
+        let failed = settle().unwrap();
+        let mut report = ReconcileReport::default();
+        record_settlement(&mut report, &res, failed);
+        assert_eq!(report.receipt_write_failed, 1);
+        assert_eq!(
+            report.receipt_write_error.as_deref(),
+            Some(ReceiptStoreError::WriterLocked.to_string().as_str())
+        );
+        assert_eq!(report.released, 0);
+        assert_eq!(report.confirmed, 0);
+        assert_eq!(
+            store.pending_reservations(&profile).unwrap(),
+            *std::slice::from_ref(&res)
+        );
+        assert_eq!(receipts.get(&res.id).unwrap(), before);
+        drop(held);
+        assert_eq!(settle().unwrap(), Settlement::Confirmed);
+        assert_eq!(
+            store.pending_reservations(&profile).unwrap(),
+            vec![res.clone()]
+        );
+        let receipt = receipts.get(&res.id).unwrap().unwrap();
+        assert_eq!(receipt.status, ReceiptStatus::Success);
+        // A reported success authorizes no expiry event.
+        assert!(store.owed_accounting_expiries(&profile).unwrap().is_empty());
+        assert_eq!(receipt.settlement_decision_id, None);
+    }
+
+    /// An accounting expiry commits before its receipt projection: a locked
+    /// receipt store leaves the committed expiry and one owed identifier, and
+    /// once unlocked the projection completes without another expiry. A
+    /// missing receipt is rebuilt from the authenticated record.
+    fn assert_expiry_commits_before_projection(missing: bool) {
         keyring_mock::install().unwrap();
         let dir = TempDir::new().unwrap();
         let profile = test_profile(dir.path(), "checkpoint");
@@ -6097,76 +6943,83 @@ mod tests {
             receipts.mark_submitted(&res.id).unwrap();
         }
         let before = receipts.get(&res.id).unwrap();
-        let held = fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(receipts.lock_file_path().unwrap())
+        let held = hold_receipt_lock(&receipts);
+        let settlement = store
+            .expire_accounting(&profile, Some(&receipts), &res, now)
+            .unwrap()
             .unwrap();
-        held.try_lock().unwrap();
-        let settle = || {
-            if let Some(status) = status {
-                let answer = TransactionRecord::from_raw(
-                    serde_json::from_value(serde_json::json!({
-                        "status": status, "latestLedger": 200, "oldestLedger": 1,
-                        "ledger": 150, "createdAt": (now / 1_000).to_string(),
-                        "resultXdr": "AAAAAAAAAGT////wAAAAAA==",
-                    }))
-                    .unwrap(),
-                );
-                store.settle_chain_answer(&profile, Some(&receipts), &res, &answer, now)
-            } else {
-                store
-                    .expire_accounting(&profile, Some(&receipts), &res, now)
-                    .map(|settlement| settlement.unwrap())
-            }
+        let Settlement::AccountingExpired {
+            decision_id,
+            receipt_error,
+        } = settlement.clone()
+        else {
+            panic!("the expiry commits whatever the receipt store does: {settlement:?}");
         };
-        if status == Some("FAILED") {
-            assert_eq!(settle().unwrap(), Settlement::KeptPending);
-            assert_eq!(receipts.get(&res.id).unwrap(), before);
-            assert_eq!(store.pending_reservations(&profile).unwrap(), vec![res]);
-            return;
-        }
-        let failed = settle().unwrap();
-        let mut report = ReconcileReport::default();
-        record_settlement(&mut report, &res, failed);
-        assert_eq!(report.receipt_write_failed, 1);
         assert_eq!(
-            report.receipt_write_error.as_deref(),
+            receipt_error.as_deref(),
             Some(ReceiptStoreError::WriterLocked.to_string().as_str())
         );
-        assert_eq!(report.released, 0);
-        assert_eq!(report.confirmed, 0);
-        assert_eq!(
-            store.pending_reservations(&profile).unwrap(),
-            *std::slice::from_ref(&res)
-        );
+        let mut report = ReconcileReport::default();
+        record_settlement(&mut report, &res, settlement);
+        assert_eq!(report.released, 1, "the committed release counts");
+        assert_eq!(report.receipt_write_failed, 1);
+        assert_eq!(report.settled.len(), 1);
+        assert_eq!(report.settled[0].decision_id, decision_id);
+        assert!(store.pending_reservations(&profile).unwrap().is_empty());
         assert_eq!(receipts.get(&res.id).unwrap(), before);
+        let owed = store.owed_accounting_expiries(&profile).unwrap();
+        assert_eq!(owed.unacknowledged, vec![decision_id.clone()]);
+        assert_eq!(owed.unprojected, vec![decision_id.clone()]);
+
         drop(held);
-        assert!(!matches!(
-            settle().unwrap(),
-            Settlement::ReceiptWriteFailed { .. }
-        ));
         assert_eq!(
-            store.pending_reservations(&profile).unwrap().is_empty(),
-            status.is_none()
+            store
+                .project_accounting_expiry(&profile, Some(&receipts), &decision_id)
+                .unwrap(),
+            Projection::Projected
         );
         let receipt = receipts.get(&res.id).unwrap().unwrap();
-        match status {
-            Some("SUCCESS") => assert_eq!(receipt.status, ReceiptStatus::Success),
-            Some(_) => assert!(matches!(receipt.status, ReceiptStatus::Failed { .. })),
-            None => assert_eq!(
-                receipt.release_code,
-                Some(ReleaseEvidence::AccountingExpired)
+        assert_eq!(receipt.status, ReceiptStatus::Ambiguous);
+        assert_eq!(
+            receipt.release_code,
+            Some(ReleaseEvidence::AccountingExpired)
+        );
+        assert_eq!(
+            receipt.settlement_decision_id.as_deref(),
+            Some(decision_id.as_str())
+        );
+        assert_eq!(
+            (
+                receipt.tx_hash.as_str(),
+                receipt.source.as_str(),
+                receipt.sequence
             ),
-        }
+            (res.tx_hash.as_str(), res.source.as_str(), res.sequence)
+        );
+        assert_eq!(receipt.recovered_from_reservation, missing);
+        let wire = store.read_for_inspection(&profile).unwrap().unwrap();
+        assert_eq!(wire.accounting_expiries.len(), 1, "no second expiry");
+        assert!(wire.accounting_expiries[0].receipt_projected);
+        assert_eq!(
+            store
+                .owed_accounting_expiries(&profile)
+                .unwrap()
+                .unacknowledged,
+            vec![decision_id]
+        );
+        assert_eq!(
+            store
+                .expire_accounting(&profile, Some(&receipts), &res, now)
+                .unwrap(),
+            None
+        );
     }
 
-    /// An accounting expiry persists its receipt before releasing the reservation.
+    /// An accounting expiry commits before its receipt projection.
     #[test]
     #[serial]
-    fn accounting_expiry_waits_for_receipt_persistence() {
-        assert_settlement_waits_for_receipt(None, false);
+    fn accounting_expiry_commits_before_its_receipt_projection() {
+        assert_expiry_commits_before_projection(false);
     }
 
     /// A reported success persists its receipt before it changes the window,
@@ -6174,20 +7027,22 @@ mod tests {
     #[test]
     #[serial]
     fn a_success_waits_for_receipt_persistence_and_a_failure_keeps_the_hold() {
-        assert_settlement_waits_for_receipt(Some("SUCCESS"), false);
-        assert_settlement_waits_for_receipt(Some("FAILED"), false);
+        assert_settlement_waits_for_receipt("SUCCESS");
+        assert_settlement_waits_for_receipt("FAILED");
     }
 
-    /// A missing receipt is restored durably before an accounting expiry
-    /// releases its reservation.
+    /// A missing, locked receipt does not prevent the committed expiry, and
+    /// the receipt is rebuilt from the same authenticated record.
     #[test]
     #[serial]
-    fn accounting_expiry_waits_for_a_missing_receipt_restore() {
-        assert_settlement_waits_for_receipt(None, true);
+    fn accounting_expiry_commits_before_a_missing_receipt_is_rebuilt() {
+        assert_expiry_commits_before_projection(true);
     }
 
     /// An accounting expiry ends the hold of a cleared receipt and leaves the
-    /// cleared receipt and its disposition unchanged.
+    /// cleared receipt and its disposition unchanged; the projection adds only
+    /// the decision identifier, and the expiry owes one expiry event, never
+    /// another clear row.
     #[test]
     #[serial]
     fn accounting_expiry_of_a_cleared_receipt_keeps_the_receipt() {
@@ -6214,20 +7069,38 @@ mod tests {
             .unwrap();
         let cleared = receipts.clear_by_operator(&res.id).unwrap();
         assert_eq!(cleared.release_code, Some(ReleaseEvidence::TimeBoundPassed));
+        let Some(Settlement::AccountingExpired {
+            decision_id,
+            receipt_error: None,
+        }) = store
+            .expire_accounting(&profile, Some(&receipts), &res, now)
+            .unwrap()
+        else {
+            panic!("the expiry commits and projects");
+        };
+        let receipt = receipts.get(&res.id).unwrap().unwrap();
+        assert_eq!(receipt.status, ReceiptStatus::ClearedByOperator);
+        assert_eq!(receipt.release_code, cleared.release_code);
         assert_eq!(
-            store
-                .expire_accounting(&profile, Some(&receipts), &res, now)
-                .unwrap(),
-            Some(Settlement::AccountingExpired)
+            receipt.settlement_decision_id.as_deref(),
+            Some(decision_id.as_str())
         );
-        assert_eq!(receipts.get(&res.id).unwrap().unwrap(), cleared);
         assert!(store.pending_reservations(&profile).unwrap().is_empty());
+        let wire = store.read_for_inspection(&profile).unwrap().unwrap();
+        let [record] = wire.accounting_expiries.as_slice() else {
+            panic!("one owed expiry event is expected");
+        };
+        assert!(record.receipt_projected);
+        assert!(!record.audit_acknowledged);
+        assert_eq!(record.decision_id, decision_id);
     }
 
-    /// A durable evidence checkpoint needs no receipt write when its window retries.
+    /// A blocked window commit leaves the receipt bytes unchanged and owes
+    /// nothing. A committed expiry survives a later receipt failure and
+    /// supplies the projection's code and identifier.
     #[test]
     #[serial]
-    fn a_checkpointed_release_keeps_its_evidence_without_rewriting() {
+    fn an_expiry_commits_before_its_receipt_projection() {
         keyring_mock::install().unwrap();
         let dir = TempDir::new().unwrap();
         let profile = test_profile(dir.path(), "release-retry");
@@ -6246,6 +7119,8 @@ mod tests {
         receipts
             .try_begin(&res.id, &res.tx_hash, &res.source, 7, 0, 100)
             .unwrap();
+        let receipt_bytes = || fs::read(receipts.file_path().unwrap()).unwrap();
+        let original = receipt_bytes();
         let held =
             WindowStoreLock::acquire_for(&store.path, &profile.policy_window_state_key_id).unwrap();
         assert!(matches!(
@@ -6253,27 +7128,888 @@ mod tests {
             Err(WindowStoreError::WriterLocked)
         ));
         drop(held);
-        let checkpoint = receipts.get(&res.id).unwrap().unwrap();
-        let known = HashMap::from([(
-            res.id.clone(),
-            (checkpoint.status.clone(), checkpoint.release_code),
-        )]);
-        assert!(!outcome_already_unknown(&known, &res.id));
-        let held_receipt = fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(receipts.lock_file_path().unwrap())
-            .unwrap();
-        held_receipt.try_lock().unwrap();
         assert_eq!(
-            store
-                .expire_accounting(&profile, Some(&receipts), &res, now)
-                .unwrap(),
-            Some(Settlement::AccountingExpired)
+            receipt_bytes(),
+            original,
+            "a blocked commit writes no receipt"
         );
-        assert_eq!(receipts.get(&res.id).unwrap().unwrap(), checkpoint);
+        assert!(store.owed_accounting_expiries(&profile).unwrap().is_empty());
+        assert_eq!(
+            store.pending_reservations(&profile).unwrap(),
+            vec![res.clone()]
+        );
+
+        let held_receipt = hold_receipt_lock(&receipts);
+        let Some(Settlement::AccountingExpired {
+            decision_id,
+            receipt_error: Some(_),
+        }) = store
+            .expire_accounting(&profile, Some(&receipts), &res, now)
+            .unwrap()
+        else {
+            panic!("the expiry commits while the receipt is locked");
+        };
+        assert_eq!(receipt_bytes(), original);
         assert!(store.pending_reservations(&profile).unwrap().is_empty());
+        drop(held_receipt);
+        let report = project_accounting_expiries(&store, &profile, Some(&receipts)).unwrap();
+        assert_eq!(report.projected, 1, "{report:?}");
+        let receipt = receipts.get(&res.id).unwrap().unwrap();
+        assert_eq!(
+            receipt.release_code,
+            Some(ReleaseEvidence::AccountingExpired)
+        );
+        assert_eq!(receipt.settlement_decision_id, Some(decision_id));
+        assert_eq!(
+            project_accounting_expiries(&store, &profile, Some(&receipts)).unwrap(),
+            DeliveryReport::default(),
+            "a completed projection is not retried"
+        );
+    }
+
+    // ── accounting-expiry obligations ─────────────────────────────────────
+
+    /// A bound keyed writer over `profile`'s audit log, opened as a fresh
+    /// process opens it.
+    fn delivery_writer(profile: &Profile) -> AuditWriter {
+        use base64::Engine as _;
+        let coordinate = &profile.audit_log_hash_chain_key_id;
+        let entry = keyring_core::Entry::new(&coordinate.service, &coordinate.account).unwrap();
+        if entry.get_password().is_err() {
+            entry
+                .set_password(&base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([4_u8; 32]))
+                .unwrap();
+        }
+        let access = crate::keyring::keyed_audit_access(
+            profile,
+            "acct",
+            stellar_agent_core::audit_log::BindingCheck::Enforce,
+        )
+        .unwrap();
+        AuditWriter::open(profile.audit_log_path.clone(), Some(access)).unwrap()
+    }
+
+    /// The `submission_accounting_expired` rows naming `decision_id` across
+    /// the active file and every archive.
+    fn expiry_rows(profile: &Profile, decision_id: &str) -> Vec<serde_json::Value> {
+        let mut files = stellar_agent_core::audit_log::test_helpers::rotated_archives_newest_first(
+            &profile.audit_log_path,
+        );
+        files.push(profile.audit_log_path.clone());
+        files
+            .iter()
+            .filter(|path| path.exists())
+            .flat_map(|path| {
+                fs::read_to_string(path)
+                    .unwrap()
+                    .lines()
+                    .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                    .collect::<Vec<_>>()
+            })
+            .filter(|row| {
+                row["kind"] == "submission_accounting_expired" && row["decision_id"] == decision_id
+            })
+            .collect()
+    }
+
+    /// The rows of value-action kinds across the active file and archives.
+    fn value_rows(profile: &Profile) -> usize {
+        let mut files = stellar_agent_core::audit_log::test_helpers::rotated_archives_newest_first(
+            &profile.audit_log_path,
+        );
+        files.push(profile.audit_log_path.clone());
+        files
+            .iter()
+            .filter(|path| path.exists())
+            .flat_map(|path| {
+                fs::read_to_string(path)
+                    .unwrap()
+                    .lines()
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            })
+            .filter(|line| {
+                line.contains(r#""kind":"value_action_failed""#)
+                    || line.contains(r#""kind":"value_action_submitted""#)
+            })
+            .count()
+    }
+
+    /// One bounded reservation of `amount` on a 60-second window whose
+    /// accounting horizon has passed at the returned caller time.
+    struct ExpiringHold {
+        dir: TempDir,
+        profile: Profile,
+        store: PersistedWindowStore,
+        receipts: ReceiptStore,
+        hold: SubmissionHold,
+        expire_at: u64,
+    }
+
+    fn expiring_hold(name: &str, id_byte: &str, now: u64) -> ExpiringHold {
+        keyring_mock::install().unwrap();
+        let dir = TempDir::new().unwrap();
+        let profile = test_profile(dir.path(), name);
+        let store = PersistedWindowStore::at_path(dir.path().join("expiry.window"));
+        let receipts = ReceiptStore::open_at(dir.path(), name).unwrap();
+        let mut hold = reservation(&id_byte.repeat(32), "GSOURCE", 9, now);
+        hold.max_time = now / 1000 + 60;
+        store
+            .record_pending(&profile, &[entry(key(name, "native", 60), now, 300)], &hold)
+            .unwrap();
+        receipts
+            .try_begin(
+                &hold.id,
+                &hold.tx_hash,
+                &hold.source,
+                9,
+                hold.max_time,
+                1_000,
+            )
+            .unwrap();
+        receipts.mark_submitted(&hold.id).unwrap();
+        let expire_at = hold.max_time * 1000 + 60_001;
+        ExpiringHold {
+            dir,
+            profile,
+            store,
+            receipts,
+            hold,
+            expire_at,
+        }
+    }
+
+    /// Restart before the audit append replays the exact owed decision: the
+    /// obligation and its receipt facts survive a lost receipt, a reopened
+    /// store and ordinary pruning; two drains deliver one event and the
+    /// acknowledgement persists. A stop before the generation commit leaves
+    /// the prior authenticated state and owes nothing.
+    #[test]
+    #[serial]
+    fn restart_replays_exact_owed_decision() {
+        let start = now_ms().unwrap();
+        let clock = crate::mainnet::clock::set_now_ms_for_test(start);
+        let fx = expiring_hold("replay", "a1", start);
+
+        // A stop before the generation commit changes nothing durable.
+        let receipt_before = fs::read(fx.receipts.file_path().unwrap()).unwrap();
+        let generation_before = load_generation(&generation_entry_ref(&fx.profile)).unwrap();
+        {
+            let _armed = fail_store_writes();
+            assert!(matches!(
+                fx.store
+                    .expire_accounting(&fx.profile, Some(&fx.receipts), &fx.hold, fx.expire_at),
+                Err(WindowStoreError::Io { .. })
+            ));
+        }
+        assert_eq!(
+            load_generation(&generation_entry_ref(&fx.profile)).unwrap(),
+            generation_before
+        );
+        assert_eq!(
+            fs::read(fx.receipts.file_path().unwrap()).unwrap(),
+            receipt_before
+        );
+        assert_eq!(
+            fx.store.pending_reservations(&fx.profile).unwrap(),
+            vec![fx.hold.clone()]
+        );
+        assert!(
+            fx.store
+                .owed_accounting_expiries(&fx.profile)
+                .unwrap()
+                .is_empty()
+        );
+
+        // A stop right after the commit, before the receipt projection.
+        {
+            let _armed = arm_accounting_fault(ACCOUNTING_FAULT_AFTER_COMMIT);
+            assert!(matches!(
+                fx.store
+                    .expire_accounting(&fx.profile, Some(&fx.receipts), &fx.hold, fx.expire_at),
+                Err(WindowStoreError::Io {
+                    kind: std::io::ErrorKind::Interrupted
+                })
+            ));
+        }
+        let owed = fx.store.owed_accounting_expiries(&fx.profile).unwrap();
+        let [decision_id] = owed.unacknowledged.as_slice() else {
+            panic!("one owed decision is expected: {owed:?}");
+        };
+        let decision_id = decision_id.clone();
+        let committed = fx
+            .store
+            .accounting_expiry(&fx.profile, &decision_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            fx.receipts.get(&fx.hold.id).unwrap().unwrap().status,
+            ReceiptStatus::Pending
+        );
+
+        // The receipt is lost, the stores reopen, and ordinary pruning runs
+        // far past the retention interval.
+        fs::remove_file(fx.receipts.file_path().unwrap()).unwrap();
+        let store = PersistedWindowStore::at_path(fx.store.path.clone());
+        let receipts = ReceiptStore::open_at(fx.dir.path(), "replay").unwrap();
+        assert_eq!(receipts.get(&fx.hold.id).unwrap(), None);
+        clock.set(fx.expire_at + RETENTION_MS + 86_400_000);
+        store.record_and_persist(&fx.profile, &[]).unwrap();
+        let wire = store.read_for_inspection(&fx.profile).unwrap().unwrap();
+        assert!(wire.entries.is_empty(), "the expired debit itself ages out");
+        assert_eq!(wire.accounting_expiries, vec![committed.clone()]);
+        assert_eq!(committed.reservation_id, fx.hold.id);
+        assert_eq!(committed.tx_hash, fx.hold.tx_hash);
+        assert_eq!(committed.source, fx.hold.source);
+        assert_eq!(committed.sequence, fx.hold.sequence);
+        assert_eq!(committed.max_time, fx.hold.max_time);
+        assert_eq!(committed.submission_ledger, fx.hold.submission_ledger);
+        assert_eq!(committed.observed_at_ms, fx.expire_at);
+
+        // First drain: no receipt store, so the acknowledgement commits and
+        // the projection stays owed.
+        let mut writer = delivery_writer(&fx.profile);
+        let first =
+            deliver_accounting_expiries(&mut writer, &store, &fx.profile, "replay", None).unwrap();
+        assert_eq!(
+            (first.appended, first.acknowledged, first.projected),
+            (1, 1, 0)
+        );
+        drop(writer);
+        let reopened = PersistedWindowStore::at_path(store.path.clone());
+        let acknowledged = reopened
+            .accounting_expiry(&fx.profile, &decision_id)
+            .unwrap()
+            .unwrap();
+        assert!(
+            acknowledged.audit_acknowledged,
+            "the acknowledgement persists"
+        );
+        assert!(!acknowledged.receipt_projected);
+
+        // Second drain: nothing appended, the receipt is rebuilt.
+        let mut writer = delivery_writer(&fx.profile);
+        let second = deliver_accounting_expiries(
+            &mut writer,
+            &reopened,
+            &fx.profile,
+            "replay",
+            Some(&receipts),
+        )
+        .unwrap();
+        assert_eq!(
+            (second.appended, second.acknowledged, second.projected),
+            (0, 0, 1)
+        );
+        let rows = expiry_rows(&fx.profile, &decision_id);
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        let row = &rows[0];
+        assert_eq!(row["generation"], committed.generation);
+        assert_eq!(row["observed_at_ms"], committed.observed_at_ms);
+        assert_eq!(row["accounting_until_ms"], committed.accounting_until_ms);
+        assert_eq!(row["code"], "submission.accounting_expired");
+        assert_eq!(row["chain_outcome"], "unknown");
+        assert_eq!(row["envelope_hash"], fx.hold.id);
+        assert_eq!(value_rows(&fx.profile), 0, "no outcome row is written");
+        assert!(
+            stellar_agent_core::audit_log::reader::try_accounting_expiry_recorded(
+                &writer,
+                &decision_id
+            )
+            .unwrap()
+        );
+        let rebuilt = receipts.get(&fx.hold.id).unwrap().unwrap();
+        assert_eq!(rebuilt.status, ReceiptStatus::Ambiguous);
+        assert_eq!(
+            rebuilt.settlement_decision_id.as_deref(),
+            Some(decision_id.as_str())
+        );
+        assert!(
+            reopened
+                .pending_reservations(&fx.profile)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            reopened
+                .owed_accounting_expiries(&fx.profile)
+                .unwrap()
+                .is_empty()
+        );
+        let third = deliver_accounting_expiries(
+            &mut writer,
+            &reopened,
+            &fx.profile,
+            "replay",
+            Some(&receipts),
+        )
+        .unwrap();
+        assert_eq!(third, DeliveryReport::default());
+        assert_eq!(expiry_rows(&fx.profile, &decision_id).len(), 1);
+        drop(clock);
+    }
+
+    /// Restart after the append finds the retained event and acknowledges it
+    /// without another append, in the active file and in an archive. Tampered
+    /// history refuses with no append and no acknowledgement. A stop after
+    /// the acknowledgement leaves only the projection, which completes
+    /// without another append.
+    #[test]
+    #[serial]
+    fn restart_after_append_does_not_duplicate() {
+        let now = now_ms().unwrap();
+        for case in ["active", "archive", "tampered"] {
+            let fx = expiring_hold(&format!("append-{case}"), "b2", now);
+            let name = format!("append-{case}");
+            let Some(Settlement::AccountingExpired { decision_id, .. }) = fx
+                .store
+                .expire_accounting(&fx.profile, None, &fx.hold, fx.expire_at)
+                .unwrap()
+            else {
+                panic!("the expiry commits");
+            };
+            let mut writer = delivery_writer(&fx.profile);
+            {
+                let _armed = arm_accounting_fault(ACCOUNTING_FAULT_AFTER_APPEND);
+                assert!(
+                    deliver_accounting_expiries(
+                        &mut writer,
+                        &fx.store,
+                        &fx.profile,
+                        &name,
+                        Some(&fx.receipts)
+                    )
+                    .is_err()
+                );
+            }
+            assert_eq!(expiry_rows(&fx.profile, &decision_id).len(), 1);
+            drop(writer);
+            if case != "active" {
+                // A filler row rotates the event into an archive.
+                let size = fs::metadata(&fx.profile.audit_log_path).unwrap().len();
+                let threshold =
+                    stellar_agent_core::audit_log::rotation::test_seam::set_rotation_threshold(
+                        &fx.profile.audit_log_path,
+                        size,
+                    );
+                let mut writer = delivery_writer(&fx.profile);
+                writer
+                    .write_entry(
+                        stellar_agent_core::audit_log::AuditEntry::new_submission_receipt_cleared(
+                            "filler",
+                            "stellar:testnet",
+                            "other",
+                            "pending",
+                            false,
+                            false,
+                            None,
+                            Some("other".to_owned()),
+                            "filler",
+                        ),
+                    )
+                    .unwrap();
+                drop(threshold);
+                drop(writer);
+                assert!(
+                    !stellar_agent_core::audit_log::test_helpers::rotated_archives_newest_first(
+                        &fx.profile.audit_log_path
+                    )
+                    .is_empty()
+                );
+            }
+            let store = PersistedWindowStore::at_path(fx.store.path.clone());
+            let receipts = ReceiptStore::open_at(fx.dir.path(), &name).unwrap();
+            assert_eq!(
+                store
+                    .owed_accounting_expiries(&fx.profile)
+                    .unwrap()
+                    .unacknowledged,
+                vec![decision_id.clone()],
+                "the obligation stays unacknowledged across the restart"
+            );
+            if case == "tampered" {
+                stellar_agent_core::audit_log::test_helpers::break_newest_archive_link(
+                    &fx.profile.audit_log_path,
+                );
+                let audit_before = fs::read(&fx.profile.audit_log_path).unwrap();
+                let refused = match AuditWriter::open(
+                    fx.profile.audit_log_path.clone(),
+                    Some(
+                        crate::keyring::keyed_audit_access(
+                            &fx.profile,
+                            "acct",
+                            stellar_agent_core::audit_log::BindingCheck::Enforce,
+                        )
+                        .unwrap(),
+                    ),
+                ) {
+                    Err(_) => true,
+                    Ok(mut writer) => deliver_accounting_expiries(
+                        &mut writer,
+                        &store,
+                        &fx.profile,
+                        &name,
+                        Some(&receipts),
+                    )
+                    .is_err(),
+                };
+                assert!(refused, "tampered history refuses delivery");
+                assert_eq!(fs::read(&fx.profile.audit_log_path).unwrap(), audit_before);
+                assert_eq!(expiry_rows(&fx.profile, &decision_id).len(), 1);
+                assert_eq!(
+                    store
+                        .owed_accounting_expiries(&fx.profile)
+                        .unwrap()
+                        .unacknowledged,
+                    vec![decision_id.clone()],
+                    "tampering leaves delivery owed"
+                );
+                continue;
+            }
+            for _ in 0..2 {
+                let mut writer = delivery_writer(&fx.profile);
+                let report = deliver_accounting_expiries(
+                    &mut writer,
+                    &store,
+                    &fx.profile,
+                    &name,
+                    Some(&receipts),
+                )
+                .unwrap();
+                assert_eq!(report.appended, 0, "{case}: {report:?}");
+            }
+            assert_eq!(expiry_rows(&fx.profile, &decision_id).len(), 1, "{case}");
+            assert!(
+                store
+                    .owed_accounting_expiries(&fx.profile)
+                    .unwrap()
+                    .is_empty()
+            );
+            let receipt = receipts.get(&fx.hold.id).unwrap().unwrap();
+            assert_eq!(
+                receipt.settlement_decision_id.as_deref(),
+                Some(decision_id.as_str())
+            );
+        }
+
+        // A stop after the acknowledgement, before the receipt projection.
+        let fx = expiring_hold("append-ack", "c3", now);
+        let Some(Settlement::AccountingExpired { decision_id, .. }) = fx
+            .store
+            .expire_accounting(&fx.profile, None, &fx.hold, fx.expire_at)
+            .unwrap()
+        else {
+            panic!("the expiry commits");
+        };
+        let mut writer = delivery_writer(&fx.profile);
+        {
+            let _armed = arm_accounting_fault(ACCOUNTING_FAULT_AFTER_ACKNOWLEDGE);
+            assert!(
+                deliver_accounting_expiries(
+                    &mut writer,
+                    &fx.store,
+                    &fx.profile,
+                    "append-ack",
+                    Some(&fx.receipts)
+                )
+                .is_err()
+            );
+        }
+        drop(writer);
+        let store = PersistedWindowStore::at_path(fx.store.path.clone());
+        let record = store
+            .accounting_expiry(&fx.profile, &decision_id)
+            .unwrap()
+            .unwrap();
+        assert!(record.audit_acknowledged);
+        assert!(!record.receipt_projected);
+        let receipts = ReceiptStore::open_at(fx.dir.path(), "append-ack").unwrap();
+        let report = project_accounting_expiries(&store, &fx.profile, Some(&receipts)).unwrap();
+        assert_eq!(report.projected, 1, "{report:?}");
+        assert!(
+            store
+                .accounting_expiry(&fx.profile, &decision_id)
+                .unwrap()
+                .unwrap()
+                .receipt_projected
+        );
+        assert_eq!(expiry_rows(&fx.profile, &decision_id).len(), 1);
+        assert_eq!(
+            receipts
+                .get(&fx.hold.id)
+                .unwrap()
+                .unwrap()
+                .settlement_decision_id
+                .as_deref(),
+            Some(decision_id.as_str())
+        );
+    }
+
+    /// An append whose tip anchor cannot be written leaves the obligation
+    /// unacknowledged. Once the anchor store recovers, delivery finds the
+    /// appended event and acknowledges it without a second row.
+    #[test]
+    #[serial]
+    fn an_unanchored_append_is_not_acknowledged() {
+        use std::sync::Arc;
+        use stellar_agent_core::audit_log::tip_anchor::InMemoryTipAnchorStore;
+        use stellar_agent_core::audit_log::{KeyedAuditAccess, TipAnchorStore};
+
+        let now = now_ms().unwrap();
+        let fx = expiring_hold("unanchored", "e5", now);
+        let Some(Settlement::AccountingExpired { decision_id, .. }) = fx
+            .store
+            .expire_accounting(&fx.profile, None, &fx.hold, fx.expire_at)
+            .unwrap()
+        else {
+            panic!("the expiry commits");
+        };
+        let anchors = Arc::new(InMemoryTipAnchorStore::new());
+        let mut writer = AuditWriter::open(
+            fx.profile.audit_log_path.clone(),
+            Some(KeyedAuditAccess::new(
+                zeroize::Zeroizing::new([0x6b; 32]),
+                Arc::clone(&anchors) as Arc<dyn TipAnchorStore>,
+            )),
+        )
+        .unwrap();
+        anchors.fail_next_writes(usize::MAX);
+
+        let refused = deliver_accounting_expiries(
+            &mut writer,
+            &fx.store,
+            &fx.profile,
+            "unanchored",
+            Some(&fx.receipts),
+        );
+
+        assert!(refused.is_err(), "{refused:?}");
+        assert_eq!(expiry_rows(&fx.profile, &decision_id).len(), 1);
+        assert!(
+            !fx.store
+                .accounting_expiry(&fx.profile, &decision_id)
+                .unwrap()
+                .unwrap()
+                .audit_acknowledged,
+            "an event the anchor does not cover is not acknowledged"
+        );
+        anchors.fail_next_writes(0);
+        let report = deliver_accounting_expiries(
+            &mut writer,
+            &fx.store,
+            &fx.profile,
+            "unanchored",
+            Some(&fx.receipts),
+        )
+        .unwrap();
+        assert_eq!((report.appended, report.acknowledged), (0, 1), "{report:?}");
+        assert_eq!(expiry_rows(&fx.profile, &decision_id).len(), 1);
+        assert!(
+            fx.store
+                .owed_accounting_expiries(&fx.profile)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// Delivery resolves identifiers from verified window state alone: an
+    /// identifier the state does not hold refuses before any append.
+    #[test]
+    #[serial]
+    fn delivery_refuses_an_identifier_the_window_does_not_hold() {
+        let now = now_ms().unwrap();
+        let fx = expiring_hold("unverifiable", "d4", now);
+        let mut writer = delivery_writer(&fx.profile);
+        let before = fs::read(&fx.profile.audit_log_path).ok();
+        let error = deliver_accounting_expiry(
+            &mut writer,
+            &fx.store,
+            &fx.profile,
+            "unverifiable",
+            Some(&fx.receipts),
+            &"ee".repeat(32),
+        )
+        .unwrap_err();
+        assert_eq!(error.code(), "submission.settlement_unverifiable");
+        assert_eq!(
+            error.to_string(),
+            "Authenticated settlement evidence is unavailable."
+        );
+        assert_eq!(fs::read(&fx.profile.audit_log_path).ok(), before);
+    }
+
+    /// Projection follows the receipt status rule for every receipt state,
+    /// records the committed identifier, and commits the flag after a
+    /// completed write. A missing store and a receipt store error keep the
+    /// flag unset and the record recoverable, without the audit writer.
+    #[test]
+    #[serial]
+    fn projection_follows_the_receipt_status_rule() {
+        let now = now_ms().unwrap();
+        let cases: [(&str, Option<ReceiptStatus>); 7] = [
+            ("absent", None),
+            ("pending", Some(ReceiptStatus::Pending)),
+            ("ambiguous", Some(ReceiptStatus::Ambiguous)),
+            ("cleared", Some(ReceiptStatus::ClearedByOperator)),
+            ("success", Some(ReceiptStatus::Success)),
+            (
+                "failed",
+                Some(ReceiptStatus::Failed {
+                    code: "ledger.op_failed".to_owned(),
+                }),
+            ),
+            ("reorged", Some(ReceiptStatus::Reorged)),
+        ];
+        for (label, status) in cases {
+            let fx = expiring_hold(&format!("project-{label}"), "e5", now);
+            match &status {
+                None => fs::remove_file(fx.receipts.file_path().unwrap()).unwrap(),
+                Some(ReceiptStatus::Pending) => {}
+                Some(ReceiptStatus::Ambiguous) => fx
+                    .receipts
+                    .finalize_released(&fx.hold.id, ReleaseEvidence::SequenceConsumed)
+                    .unwrap(),
+                Some(ReceiptStatus::ClearedByOperator) => {
+                    fx.receipts
+                        .finalize_released(&fx.hold.id, ReleaseEvidence::TimeBoundPassed)
+                        .unwrap();
+                    fx.receipts.clear_by_operator(&fx.hold.id).unwrap();
+                }
+                Some(ReceiptStatus::Reorged) => {
+                    fx.receipts
+                        .finalize(&fx.hold.id, ReceiptStatus::Success, Some(5))
+                        .unwrap();
+                    fx.receipts.finalize_reorged(&fx.hold.id).unwrap();
+                }
+                Some(other) => fx
+                    .receipts
+                    .finalize(&fx.hold.id, other.clone(), Some(5))
+                    .unwrap(),
+            }
+            let receipts =
+                ReceiptStore::open_at(fx.dir.path(), &format!("project-{label}")).unwrap();
+            let before = receipts.get(&fx.hold.id).unwrap();
+            let Some(Settlement::AccountingExpired {
+                decision_id,
+                receipt_error: None,
+            }) = fx
+                .store
+                .expire_accounting(&fx.profile, Some(&receipts), &fx.hold, fx.expire_at)
+                .unwrap()
+            else {
+                panic!("{label}: the expiry commits and projects");
+            };
+            let after = receipts.get(&fx.hold.id).unwrap().unwrap();
+            assert_eq!(
+                after.settlement_decision_id.as_deref(),
+                Some(decision_id.as_str()),
+                "{label}"
+            );
+            match (&status, before) {
+                (None | Some(ReceiptStatus::Pending | ReceiptStatus::Ambiguous), _) => {
+                    assert_eq!(after.status, ReceiptStatus::Ambiguous, "{label}");
+                    assert_eq!(
+                        after.release_code,
+                        Some(ReleaseEvidence::AccountingExpired),
+                        "{label}"
+                    );
+                }
+                (Some(kept), Some(before)) => {
+                    assert_eq!(&after.status, kept, "{label}");
+                    assert_eq!(after.release_code, before.release_code, "{label}");
+                    assert_eq!(after.ledger, before.ledger, "{label}");
+                }
+                (Some(_), None) => panic!("{label}: the receipt existed"),
+            }
+            assert!(
+                fx.store
+                    .accounting_expiry(&fx.profile, &decision_id)
+                    .unwrap()
+                    .unwrap()
+                    .receipt_projected,
+                "{label}"
+            );
+        }
+
+        // No store, then a receipt store error: the flag stays unset and a
+        // projection-only retry completes it without the audit writer.
+        let fx = expiring_hold("project-retry", "f6", now);
+        let Some(Settlement::AccountingExpired { decision_id, .. }) = fx
+            .store
+            .expire_accounting(&fx.profile, None, &fx.hold, fx.expire_at)
+            .unwrap()
+        else {
+            panic!("the expiry commits");
+        };
+        let unprojected = |store: &PersistedWindowStore| {
+            !store
+                .accounting_expiry(&fx.profile, &decision_id)
+                .unwrap()
+                .unwrap()
+                .receipt_projected
+        };
+        assert!(unprojected(&fx.store));
+        let report = project_accounting_expiries(&fx.store, &fx.profile, None).unwrap();
+        assert_eq!((report.projected, report.projection_pending), (0, 1));
+        assert!(unprojected(&fx.store));
+        let held = hold_receipt_lock(&fx.receipts);
+        let report =
+            project_accounting_expiries(&fx.store, &fx.profile, Some(&fx.receipts)).unwrap();
+        assert_eq!((report.projected, report.projection_pending), (0, 1));
+        assert_eq!(
+            report.projection_error.as_deref(),
+            Some(ReceiptStoreError::WriterLocked.to_string().as_str())
+        );
+        assert!(unprojected(&fx.store));
+        drop(held);
+        assert!(
+            !fx.profile.audit_log_path.exists(),
+            "no audit writer is involved"
+        );
+        let report =
+            project_accounting_expiries(&fx.store, &fx.profile, Some(&fx.receipts)).unwrap();
+        assert_eq!(report.projected, 1);
+        assert!(!unprojected(&fx.store));
+        assert_eq!(
+            fx.store
+                .owed_accounting_expiries(&fx.profile)
+                .unwrap()
+                .unacknowledged,
+            vec![decision_id]
+        );
+        assert!(!fx.profile.audit_log_path.exists());
+    }
+
+    /// Pruning keeps an expiry record until it is acknowledged and projected,
+    /// and then only through the retention interval; keeping it restores no
+    /// counted exposure.
+    #[test]
+    #[serial]
+    fn prune_keeps_owed_expiry_records_whatever_their_age() {
+        let now = now_ms().unwrap();
+        let fx = expiring_hold("prune-expiry", "a7", now);
+        fx.store
+            .expire_accounting(&fx.profile, Some(&fx.receipts), &fx.hold, fx.expire_at)
+            .unwrap();
+        let mut wire = fx.store.read_for_inspection(&fx.profile).unwrap().unwrap();
+        let old = fx.expire_at + RETENTION_MS + 1;
+        let mut pruned = wire.clone();
+        prune_stale(&mut pruned, old);
+        assert_eq!(
+            pruned.accounting_expiries, wire.accounting_expiries,
+            "unacknowledged"
+        );
+        wire.accounting_expiries[0].audit_acknowledged = true;
+        wire.accounting_expiries[0].receipt_projected = false;
+        let mut pruned = wire.clone();
+        prune_stale(&mut pruned, old);
+        assert_eq!(pruned.accounting_expiries.len(), 1, "unprojected");
+        wire.accounting_expiries[0].receipt_projected = true;
+        let mut pruned = wire.clone();
+        prune_stale(&mut pruned, fx.expire_at + RETENTION_MS);
+        assert_eq!(pruned.accounting_expiries.len(), 1, "within retention");
+        let mut pruned = wire.clone();
+        prune_stale(&mut pruned, old);
+        assert!(pruned.accounting_expiries.is_empty(), "done and aged out");
+        let key = key("prune-expiry", "native", 60);
+        assert_eq!(window_in_file(&wire, &key, fx.expire_at).unwrap(), (0, 0));
+    }
+
+    /// The snapshot check refuses expiry records that do not belong to their
+    /// snapshot, and a snapshot below version 8 that carries any.
+    #[test]
+    #[serial]
+    fn snapshot_check_refuses_foreign_expiry_records() {
+        let now = now_ms().unwrap();
+        let fx = expiring_hold("snapshot-expiry", "b8", now);
+        fx.store
+            .expire_accounting(&fx.profile, None, &fx.hold, fx.expire_at)
+            .unwrap();
+        let wire = fx.store.read_for_inspection(&fx.profile).unwrap().unwrap();
+        assert_eq!(wire.version, WIRE_VERSION_EXPIRY);
+        check_snapshot(&wire).unwrap();
+        let refused = |change: &dyn Fn(&mut WireFile)| {
+            let mut changed = wire.clone();
+            change(&mut changed);
+            assert!(matches!(
+                check_snapshot(&changed),
+                Err(WindowStoreError::Invalid { .. })
+            ));
+        };
+        refused(&|wire| wire.version = WIRE_VERSION_EXPOSURE);
+        refused(&|wire| wire.chain_scope = Some(ChainScope::for_chain(Caip2::Mainnet)));
+        refused(&|wire| {
+            wire.accounting_expiries[0].chain_scope = ChainScope::for_chain(Caip2::Mainnet)
+        });
+        refused(&|wire| wire.accounting_expiries[0].disposition = RecordStatus::OperatorCleared);
+        // A generation past the file's, under an identifier recomputed for
+        // it, so only the generation bound refuses.
+        refused(&|wire| {
+            let generation = wire.generation + 1;
+            let record = &mut wire.accounting_expiries[0];
+            record.generation = generation;
+            record.decision_id = accounting_expiry_decision_id(
+                record.chain_scope,
+                &record.reservation_id,
+                generation,
+            )
+            .unwrap();
+        });
+        refused(&|wire| wire.accounting_expiries[0].reservation_id = "ff".repeat(32));
+        refused(&|wire| wire.accounting_expiries[0].decision_id = "00".repeat(32));
+        refused(&|wire| {
+            let copy = wire.accounting_expiries[0].clone();
+            wire.accounting_expiries.push(copy);
+        });
+        let mut without = wire.clone();
+        without.accounting_expiries.clear();
+        assert_eq!(select_wire_version(&without), WIRE_VERSION_EXPOSURE);
+        assert_eq!(select_wire_version(&wire), WIRE_VERSION_EXPIRY);
+        let body = serde_json::to_string(&without).unwrap();
+        assert!(!body.contains("accounting_expiries"), "{body}");
+    }
+
+    /// The reset refuses while an expiry event is undelivered, before its
+    /// recorder runs, and keeps an acknowledged record whose projection is
+    /// incomplete.
+    #[test]
+    #[serial]
+    fn reset_refuses_an_undelivered_expiry_obligation() {
+        let now = now_ms().unwrap();
+        let fx = expiring_hold("reset-expiry", "c9", now);
+        let Some(Settlement::AccountingExpired { decision_id, .. }) = fx
+            .store
+            .expire_accounting(&fx.profile, None, &fx.hold, fx.expire_at)
+            .unwrap()
+        else {
+            panic!("the expiry commits");
+        };
+        let mut recorded = false;
+        let refused = fx.store.reset(&fx.profile, now, |_| {
+            recorded = true;
+            Ok::<_, ()>(())
+        });
+        assert!(matches!(
+            refused,
+            Err(ResetError::Store {
+                error: WindowStoreError::AccountingAuditOwed,
+                minted: false,
+            })
+        ));
+        assert!(!recorded, "the refusal precedes the recorder");
+        let mut writer = delivery_writer(&fx.profile);
+        deliver_accounting_expiries(&mut writer, &fx.store, &fx.profile, "reset-expiry", None)
+            .unwrap();
+        fx.store
+            .reset(&fx.profile, now, |_| Ok::<_, ()>(()))
+            .unwrap();
+        let wire = fx.store.read_for_inspection(&fx.profile).unwrap().unwrap();
+        assert!(wire.entries.is_empty());
+        let [kept] = wire.accounting_expiries.as_slice() else {
+            panic!("the unprojected record carries into the empty successor");
+        };
+        assert_eq!(kept.decision_id, decision_id);
+        assert!(kept.audit_acknowledged && !kept.receipt_projected);
     }
 
     /// An untimed hold whose receipt records a failure keeps that failure
@@ -6676,17 +8412,34 @@ mod tests {
             .unwrap();
 
         assert_eq!(expired.released, 1, "{expired:?}");
+        let [settled] = expired.settled.as_slice() else {
+            panic!("one committed expiry is expected: {expired:?}");
+        };
+        assert_eq!(settled.envelope_hash, past.id);
+        let record = store
+            .accounting_expiry(&profile, &settled.decision_id)
+            .unwrap()
+            .expect("the committed identifier resolves against verified state");
+        assert_eq!(record.reservation_id, past.id);
+        assert!(!record.audit_acknowledged);
         assert_eq!(
-            expired
-                .settled
-                .iter()
-                .map(|settled| (settled.envelope_hash.as_str(), settled.release_code))
-                .collect::<Vec<_>>(),
-            [(past.id.as_str(), Some(ReleaseEvidence::AccountingExpired))]
+            store.accounting_expiry_for(&profile, &past.id).unwrap(),
+            Some(settled.decision_id.clone())
         );
         assert_eq!(retained.released, 0, "{retained:?}");
         assert_eq!(retained.kept_pending, 1, "{retained:?}");
         assert!(retained.settled.is_empty(), "{retained:?}");
+        assert_eq!(
+            store.accounting_expiry_for(&profile, &inside.id).unwrap(),
+            None
+        );
+        assert_eq!(
+            store
+                .owed_accounting_expiries(&profile)
+                .unwrap()
+                .unacknowledged,
+            vec![settled.decision_id.clone()]
+        );
         assert_eq!(store.pending_reservations(&profile).unwrap(), vec![inside]);
     }
 
@@ -6823,7 +8576,11 @@ mod tests {
                 },
             )
             .unwrap();
-        store.apply_accounting_decision(&profile, decision).unwrap();
+        let generation = decision.generation;
+        let decision_id = store
+            .apply_accounting_decision(&profile, decision)
+            .unwrap()
+            .expect("an expiry commits a decision identifier");
         let wire = store.read_for_inspection(&profile).unwrap().unwrap();
         assert!(
             wire.entries
@@ -6831,10 +8588,36 @@ mod tests {
                 .flat_map(|b| &b.records)
                 .all(|r| r.status == RecordStatus::AccountingExpired)
         );
-        assert_eq!(
-            ReceiptStatus::Ambiguous.settled_row(Some(ReleaseEvidence::AccountingExpired)),
-            None
+        // One unacknowledged obligation carries the greatest horizon, and the
+        // event it owes records an unknown chain outcome.
+        let [record] = wire.accounting_expiries.as_slice() else {
+            panic!("one expiry record is expected");
+        };
+        assert_eq!(record.decision_id, decision_id);
+        assert_eq!(record.accounting_until_ms, bound + 3_600_000);
+        assert_eq!(record.observed_at_ms, bound + 3_600_001);
+        assert_eq!(record.generation, generation + 1);
+        assert_eq!(record.disposition, RecordStatus::AccountingExpired);
+        assert!(!record.audit_acknowledged && !record.receipt_projected);
+        assert_eq!(wire.version, WIRE_VERSION_EXPIRY);
+        let event = stellar_agent_core::audit_log::AuditEntry::new_submission_accounting_expired(
+            ACCOUNTING_EXPIRY_TOOL,
+            "stellar:testnet",
+            record.reservation_id.as_str(),
+            record.decision_id.as_str(),
+            record.generation,
+            "abcd...wxyz",
+            record.observed_at_ms,
+            record.accounting_until_ms,
+            "horizon",
         );
+        assert!(matches!(
+            event.event_kind,
+            stellar_agent_core::audit_log::schema::EventKind::SubmissionAccountingExpired {
+                ref chain_outcome,
+                ..
+            } if chain_outcome == "unknown"
+        ));
         assert_eq!(
             ReleaseEvidence::AccountingExpired.code(),
             "submission.accounting_expired"
@@ -7905,7 +9688,7 @@ mod tests {
             f.seal(&reset_wire());
             let key =
                 crate::keyring::load_hmac_key_32(&f.profile.policy_window_state_key_id).unwrap();
-            let body = br#"{"version":8,"future_authorities":[{"open":true}],"prepared":"future representation"}"#;
+            let body = br#"{"version":9,"future_authorities":[{"open":true}],"prepared":"future representation"}"#;
             f.store
                 .write_atomic_raw(&compute_tag(key.as_ref(), body).unwrap(), body)
                 .unwrap();
@@ -8284,6 +10067,45 @@ mod tests {
         fn drop(&mut self) {
             INSPECTION_READ_HOOK.with_borrow_mut(|hook| *hook = None);
         }
+    }
+
+    /// The crash seam right after an accounting expiry commits, before its
+    /// receipt projection.
+    pub(super) const ACCOUNTING_FAULT_AFTER_COMMIT: u8 = 1;
+    /// The crash seam right after an expiry event is appended, before its
+    /// acknowledgement commits.
+    pub(super) const ACCOUNTING_FAULT_AFTER_APPEND: u8 = 2;
+    /// The crash seam right after an acknowledgement commits, before the
+    /// receipt projection.
+    pub(super) const ACCOUNTING_FAULT_AFTER_ACKNOWLEDGE: u8 = 3;
+
+    thread_local! {
+        static ACCOUNTING_FAULT: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+    }
+
+    /// Stops the operation at `point` once, when a test armed that point.
+    pub(super) fn accounting_fault(point: u8) -> Result<(), WindowStoreError> {
+        if ACCOUNTING_FAULT.get() == point {
+            ACCOUNTING_FAULT.set(0);
+            return Err(WindowStoreError::Io {
+                kind: std::io::ErrorKind::Interrupted,
+            });
+        }
+        Ok(())
+    }
+
+    /// Disarms the accounting seam on this thread when dropped.
+    struct ArmedFault;
+    impl Drop for ArmedFault {
+        fn drop(&mut self) {
+            ACCOUNTING_FAULT.set(0);
+        }
+    }
+
+    /// Stops the next operation that reaches `point` on this thread.
+    fn arm_accounting_fault(point: u8) -> ArmedFault {
+        ACCOUNTING_FAULT.set(point);
+        ArmedFault
     }
 
     type StoreWriteHook = Box<dyn FnMut() -> Result<(), WindowStoreError>>;

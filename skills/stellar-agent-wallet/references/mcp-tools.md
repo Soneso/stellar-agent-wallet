@@ -409,7 +409,7 @@ their own `x402.*` code before the `chain_id` check.
 | `stellar_create_account_commit` | Verify the nonce, re-check the envelope, sign, submit. | Signs and submits. Two-phase; approval spine. |
 | `stellar_balances` | Fetch native XLM balance and optional trustline balances. | Read-only. |
 | `stellar_friendbot` | Fund a testnet account via Friendbot. | Mutating, testnet-only; gated. |
-| `stellar_transaction_status` | Reconcile one submitted transaction against the chain and settle the wallet's record of it, by its receipt or, when the receipt is missing, by its reservation. Returns `record` (with `release_code`) and `reservation`. On a mainnet profile the primary's `FAILED` and `NOT_FOUND` settle nothing until the oracle confirms them. | Reads the chain, writes the wallet's record; moves no value and never sends. The way out of `submission.tx_timeout`. |
+| `stellar_transaction_status` | Reconcile one submitted transaction against the chain and settle the wallet's record of it, by its receipt or, when the receipt is missing, by its reservation. Returns `record` (with `release_code`, `settlement_evidence: "unavailable"` and an optional `settlement_decision_id`) and `reservation`. `record` is display data and authenticates no settlement. On a mainnet profile the primary's `FAILED` and `NOT_FOUND` settle nothing until the oracle confirms them. | Reads the chain, writes the wallet's record; moves no value and never sends. The way out of `submission.tx_timeout`. |
 
 `stellar_transaction_status` refuses with `submission.record_unavailable` when the spending-window file cannot be read.
 
@@ -1070,7 +1070,9 @@ possible spending:
 - `record.status: "ambiguous"` with `record.release_code:
   "submission.accounting_expired"`: the accounting horizon, the signed time
   bound plus each affected window's duration, has passed. The reservation has
-  ended with the outcome unknown, and no failed row is written. A fresh
+  ended with the outcome unknown, and no failed row is written. Its
+  `submission_accounting_expired` audit event carries the authenticated
+  decision identifier. A fresh
   simulate-and-commit is the next step.
 - `NOT_FOUND` with `record.status: "ambiguous"` and no `release_code`: the
   endpoint can no longer answer for it at all, and only the operator resolves
@@ -1088,8 +1090,8 @@ possible spending:
   reports. `--acknowledge` records the operator's decision; clearing
   establishes no chain outcome.
 
-When the settlement lookup cannot read the retained audit history, the status
-call still answers; it logs the error and writes no settled row.
+When accounting delivery cannot read the retained audit history, the status
+call still answers; it logs the refusal, and the obligation stays owed.
 
 Every submitting tool reports these codes, `stellar_dex_trade` and the two
 vault tools included.

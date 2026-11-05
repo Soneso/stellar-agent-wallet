@@ -1620,9 +1620,8 @@ pub struct PendingValueAction {
 
 /// What a submission's value action still owes the retained audit history.
 ///
-/// Reconciliation is an operator-repeatable verb. A settled row anywhere in the
-/// retained history means the submission is already accounted for, which is
-/// what keeps a second run from appending a second row for one spend.
+/// A settled row anywhere in the retained history means the submission is
+/// already accounted for, so no caller appends a second row for one spend.
 /// [`try_value_action_settlement`] states which files the lookup reads and the
 /// limits of that read.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1635,12 +1634,11 @@ pub enum ValueActionSettlement {
     /// policy gate sized.
     Owed(PendingValueAction),
     /// No settlement row and no pending row for the submission survives in the
-    /// retained history, so the submission is still owed a settled row and its
-    /// legs are not recoverable.
+    /// retained history, so no row is open for it and its legs are not
+    /// recoverable.
     ///
-    /// The row is written anyway, with no legs, because the submission's
-    /// outcome belongs in the log whether or not its sizing survived. Legs from
-    /// a different submission would be worse than none.
+    /// This answer authorizes no row on its own: a caller appends only for an
+    /// open pending row it can name.
     OwedWithoutLegs,
     /// A settled row already accounts for the submission.
     Settled,
@@ -1697,6 +1695,101 @@ pub fn try_value_action_settlement(
         })?
         .unwrap_or(ValueActionSettlement::OwedWithoutLegs),
     )
+}
+
+/// The settlement row that closes a submission's value action.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SettledValueAction {
+    /// A `value_action_submitted` row records a confirmed submission.
+    Submitted,
+    /// A `value_action_failed` row records a submission that moved no value.
+    Failed {
+        /// The row's failure code.
+        code: String,
+    },
+}
+
+/// Reports the latest settlement row for `envelope_hash`: the last
+/// `value_action_submitted` or `value_action_failed` row carrying the hash.
+///
+/// [`try_value_action_settlement`] answers whether a row is owed; this lookup
+/// tells a failed settlement from a submitted one where the caller decides on
+/// that difference. The walk, the writer guard and the limits are those of
+/// [`try_value_action_settlement`], with those two row kinds as the only
+/// matches.
+///
+/// # Errors
+///
+/// Returns a read, parse, rotation-gap, in-file chain, bridge, or tip
+/// integrity error.
+pub fn try_value_action_settled_row(
+    writer: &AuditWriter,
+    envelope_hash: &str,
+) -> Result<Option<SettledValueAction>, AuditLogIntegrityError> {
+    find_latest_value_row(writer, envelope_hash, |entry| match &entry.event_kind {
+        EventKind::ValueActionSubmitted { .. } => Some(SettledValueAction::Submitted),
+        EventKind::ValueActionFailed { code, .. } => {
+            Some(SettledValueAction::Failed { code: code.clone() })
+        }
+        _ => None,
+    })
+}
+
+/// Reports whether the verified retained history carries a
+/// `submission_accounting_expired` row whose `decision_id` is exactly
+/// `decision_id`.
+///
+/// Accounting audit delivery appends that row only when this lookup answers
+/// `false`, so the retained history holds at most one row per decision
+/// identifier. The lookup matches the event's own identifier: an envelope
+/// hash, a receipt status, or a settled value-action row acknowledges no
+/// expiry.
+///
+/// Unlike [`try_value_action_settlement`], the walk visits every retained
+/// file, newest first, through the writer's bounded walk under the caller's
+/// guard: the active file up to the writer's verified tip, each archive
+/// bridged to the file after it, and quarantined rows dropped. A row in an
+/// archive that retention already deleted is not read.
+///
+/// # Errors
+///
+/// Returns a read, parse, rotation-gap, in-file chain, bridge, or tip
+/// integrity error.
+pub fn try_accounting_expiry_recorded(
+    writer: &AuditWriter,
+    decision_id: &str,
+) -> Result<bool, AuditLogIntegrityError> {
+    for file in bounded_files(writer, None)? {
+        if file?.rows.iter().any(|(_, entry)| {
+            matches!(
+                &entry.event_kind,
+                EventKind::SubmissionAccountingExpired { decision_id: recorded, .. }
+                    if recorded == decision_id
+            )
+        }) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// The refusal for a retained history a lookup of this module cannot read.
+///
+/// The error is [`ValidationError::AuditLogUnusable`] for `profile`, code
+/// `audit.chain_key_unavailable`, whose detail leads with the integrity
+/// error's own `audit.*` code.
+///
+/// [`ValidationError::AuditLogUnusable`]: crate::error::ValidationError::AuditLogUnusable
+#[must_use]
+pub fn audit_history_refusal(
+    profile: &str,
+    error: &AuditLogIntegrityError,
+) -> crate::error::WalletError {
+    crate::error::WalletError::Validation(crate::error::ValidationError::AuditLogUnusable {
+        profile: profile.to_owned(),
+        detail: format!("{}: {error}", error.wire_code()),
+    })
 }
 
 /// Reports whether the retained history carries an operator-clear row for
@@ -2019,6 +2112,94 @@ mod tests {
         assert!(try_submission_receipt_cleared_exists(&guard, SETTLE_ENVELOPE).unwrap());
     }
 
+    fn accounting_expired_row(decision_id: &str) -> AuditEntry {
+        AuditEntry::new_submission_accounting_expired(
+            "accounting delivery",
+            "stellar:testnet",
+            SETTLE_ENVELOPE,
+            decision_id,
+            4,
+            "hash...tail",
+            1_000,
+            900,
+            "deliver",
+        )
+    }
+
+    /// The accounting-expiry lookup matches the event's own decision
+    /// identifier in every retained file, and nothing else acknowledges it.
+    #[test]
+    fn the_accounting_expiry_lookup_matches_the_exact_decision_id() {
+        let dir = TempDir::new().unwrap();
+        let path = tmp_log(&dir);
+        let writer = open_writer(path.clone());
+        let mut guard = writer.lock().unwrap();
+        guard.write_entry(pending_row(SETTLE_ENVELOPE)).unwrap();
+        guard.write_entry(submitted_row(SETTLE_ENVELOPE)).unwrap();
+        guard.write_entry(cleared_row()).unwrap();
+        assert!(!try_accounting_expiry_recorded(&guard, "d1").unwrap());
+        assert!(!try_accounting_expiry_recorded(&guard, SETTLE_ENVELOPE).unwrap());
+
+        guard.write_entry(accounting_expired_row("d1")).unwrap();
+        assert!(try_accounting_expiry_recorded(&guard, "d1").unwrap());
+        assert!(!try_accounting_expiry_recorded(&guard, "d2").unwrap());
+        assert!(!try_accounting_expiry_recorded(&guard, "d").unwrap());
+
+        // An archive keeps the row findable, even below newer rows for the
+        // same envelope in the active file.
+        guard.force_rotate_for_test().unwrap();
+        guard.write_entry(pending_row(SETTLE_ENVELOPE)).unwrap();
+        assert!(try_accounting_expiry_recorded(&guard, "d1").unwrap());
+        assert!(!try_accounting_expiry_recorded(&guard, "d2").unwrap());
+        // The expiry row settles no value action of its own.
+        assert!(matches!(
+            try_value_action_settlement(&guard, SETTLE_ENVELOPE).unwrap(),
+            ValueActionSettlement::Owed(_)
+        ));
+    }
+
+    /// An expiry row appended past the writer's verified tip is not read.
+    #[test]
+    fn a_forged_accounting_expiry_row_past_the_tip_is_not_read() {
+        let dir = TempDir::new().unwrap();
+        let path = tmp_log(&dir);
+        let writer = open_writer(path.clone());
+        let guard = writer.lock().unwrap();
+        forge(&path, accounting_expired_row("d1"));
+        assert!(!try_accounting_expiry_recorded(&guard, "d1").unwrap());
+    }
+
+    /// The settled-row lookup tells a failed settlement from a submitted
+    /// one, and reports the latest of them.
+    #[test]
+    fn the_settled_row_lookup_tells_failed_from_submitted() {
+        let dir = TempDir::new().unwrap();
+        let path = tmp_log(&dir);
+        let writer = open_writer(path.clone());
+        let mut guard = writer.lock().unwrap();
+        guard.write_entry(pending_row(SETTLE_ENVELOPE)).unwrap();
+        assert_eq!(
+            try_value_action_settled_row(&guard, SETTLE_ENVELOPE).unwrap(),
+            None
+        );
+        guard.write_entry(failed_row(SETTLE_ENVELOPE)).unwrap();
+        assert_eq!(
+            try_value_action_settled_row(&guard, SETTLE_ENVELOPE).unwrap(),
+            Some(SettledValueAction::Failed {
+                code: "submission.failed".to_owned()
+            })
+        );
+        guard.write_entry(submitted_row(SETTLE_ENVELOPE)).unwrap();
+        assert_eq!(
+            try_value_action_settled_row(&guard, SETTLE_ENVELOPE).unwrap(),
+            Some(SettledValueAction::Submitted)
+        );
+        assert_eq!(
+            try_value_action_settled_row(&guard, OTHER_ENVELOPE).unwrap(),
+            None
+        );
+    }
+
     #[test]
     fn a_broken_visited_archive_refuses_both_lookups() {
         let dir = TempDir::new().unwrap();
@@ -2046,6 +2227,10 @@ mod tests {
         ));
         assert!(matches!(
             try_submission_receipt_cleared_exists(&guard, SETTLE_ENVELOPE),
+            Err(AuditLogIntegrityError::ChainBroken { line: 3, .. })
+        ));
+        assert!(matches!(
+            try_accounting_expiry_recorded(&guard, "d1"),
             Err(AuditLogIntegrityError::ChainBroken { line: 3, .. })
         ));
     }
@@ -2664,6 +2849,25 @@ mod tests {
                 "match-derived wire code must equal wire_code() method output"
             );
         }
+    }
+
+    /// An unreadable history refuses with `audit.chain_key_unavailable` for
+    /// the profile, and the detail leads with the integrity error's code.
+    #[test]
+    fn audit_history_refusal_leads_with_the_integrity_code() {
+        let error = AuditLogIntegrityError::RotationGap {
+            file: "f".to_owned(),
+        };
+        let refusal = audit_history_refusal("history-profile", &error);
+        assert_eq!(refusal.code(), "audit.chain_key_unavailable");
+        let crate::error::WalletError::Validation(
+            crate::error::ValidationError::AuditLogUnusable { profile, detail },
+        ) = refusal
+        else {
+            panic!("an unreadable history is an unusable log: {refusal:?}");
+        };
+        assert_eq!(profile, "history-profile");
+        assert_eq!(detail, format!("audit.rotation_gap: {error}"));
     }
 
     // ── 7. Chain-hash tampering returns ChainBroken, not Ok(None) ────────────

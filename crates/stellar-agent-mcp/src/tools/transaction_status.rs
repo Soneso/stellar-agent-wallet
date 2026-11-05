@@ -13,7 +13,11 @@
 //! failure or missing transaction does not release possible spending, and a
 //! reported success writes no submitted row. A reservation ends once its
 //! accounting horizon has passed, with `record.release_code`
-//! `submission.accounting_expired` and the outcome unknown. A hold that
+//! `submission.accounting_expired` and the outcome unknown. That expiry owes
+//! one `submission_accounting_expired` audit event, which the call delivers
+//! from the verified window state. The receipt is display data: `record`
+//! carries `settlement_evidence: "unavailable"`, and no receipt status writes
+//! an audit row. A hold that
 //! remains is reported as `reservation`; one marked `operator_required` is
 //! resolved by the operator's `stellar-agent tx receipt clear`. No step sends
 //! the transaction again.
@@ -74,7 +78,9 @@ impl WalletServer {
                        window; untimed exposure requires explicit operator acknowledgement. \
                        Accounting expiry leaves the outcome unknown and records \
                        submission.accounting_expired in record.release_code without a failed \
-                       value-action row. A hold that remains is returned as \
+                       value-action row. record is display data: settlement_evidence is \
+                       unavailable, and settlement_decision_id only locates an accounting \
+                       decision. A hold that remains is returned as \
                        reservation {envelope_hash, operator_required}; operator_required means \
                        only the operator's tx receipt clear resolves it. This is the only way to \
                        resolve a timed-out submission: never re-simulate or resubmit, because \
@@ -88,13 +94,12 @@ impl WalletServer {
         Parameters(args): Parameters<StellarTransactionStatusArgs>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let args_value = json!({ "chain_id": &args.chain_id });
-        let reconciliation_decision = match self
+        if let Err(error) = self
             .dispatch_gate("stellar_transaction_status", &args_value, &args.chain_id)
             .await
         {
-            Ok(outcome) => outcome.audit_decision(),
-            Err(error) => return error.into_result(),
-        };
+            return error.into_result();
+        }
 
         if !is_tx_hash(&args.tx_hash) {
             return Ok(business_error_result(
@@ -103,32 +108,11 @@ impl WalletServer {
             ));
         }
 
-        // The audit writer is acquired the same way every value verb acquires
-        // it: a reconciliation that confirms a submission writes the
-        // value-action row that submission never got to write, so the chain
-        // key has to be available before anything is settled.
         let profile_name = self.profile_name_for_approval();
         let window = PersistedWindowStore::for_profile(&profile_name);
         let held = match self.open_reservation_for(&window, &args.tx_hash) {
             Ok(held) => held,
             Err(result) => return Ok(result),
-        };
-
-        let audit_writer = match crate::tools::value_audit::require_value_audit_writer(
-            &self.profile,
-            &profile_name,
-            self.audit_binding,
-        ) {
-            Ok(writer) => writer,
-            Err(err) => {
-                let envelope = Envelope::<()>::err(&err);
-                let json = envelope
-                    .to_json_pretty()
-                    .unwrap_or_else(|_| String::from("{}"));
-                let mut result = CallToolResult::success(vec![Content::text(json)]);
-                result.is_error = Some(true);
-                return Ok(result);
-            }
         };
 
         let client = match self.context.primary_client() {
@@ -191,9 +175,16 @@ impl WalletServer {
                     "stellar_transaction_status: reconciliation could not record the receipt"
                 ),
                 Ok(_) => {}
-                Err(e) => return Ok(business_error_result(e.submission_code(), e.to_string())),
+                Err(e) => {
+                    // A refused pass leaves the obligations of earlier calls
+                    // in place; they are delivered before the refusal returns.
+                    self.deliver_owed(&profile_name, &window, &receipts);
+                    return Ok(business_error_result(e.submission_code(), e.to_string()));
+                }
             }
         }
+
+        self.deliver_owed(&profile_name, &window, &receipts);
 
         if let Some(record) = &receipt
             && record.approval_nonce.is_some()
@@ -245,21 +236,6 @@ impl WalletServer {
             }
         };
 
-        // Only a status that owes an authenticated outcome row reaches the writer.
-        // Endpoint reports and accounting expiry owe none.
-        if let Some(record) = settled.as_ref() {
-            crate::tools::submission_record::write_settled_row(
-                &self.profile,
-                &profile_name,
-                &audit_writer,
-                &record.envelope_hash,
-                &record.tx_hash,
-                &record.status,
-                record.release_code,
-                reconciliation_decision,
-            );
-        }
-
         let view = json!({
             "tx_hash": args.tx_hash,
             "chain_status": chain.status,
@@ -284,6 +260,35 @@ impl WalletServer {
 }
 
 impl WalletServer {
+    /// Delivers the accounting obligations the verified window state owes,
+    /// including those of earlier calls.
+    ///
+    /// The audit writer is acquired the way every value verb acquires it,
+    /// and only when an audit event is unacknowledged, so a projection-only
+    /// retry runs without it. A refusal, an unavailable writer included, is
+    /// logged at WARN and leaves the obligations owed; the status answer does
+    /// not depend on it.
+    fn deliver_owed(
+        &self,
+        profile_name: &str,
+        window: &PersistedWindowStore,
+        receipts: &ReceiptStore,
+    ) {
+        let _ = stellar_agent_network::policy_state::drain_accounting_obligations(
+            window,
+            &self.profile,
+            profile_name,
+            Some(receipts),
+            || {
+                crate::tools::value_audit::require_value_audit_writer(
+                    &self.profile,
+                    profile_name,
+                    self.audit_binding,
+                )
+            },
+        );
+    }
+
     /// The reservation the window file holds pending for `tx_hash`, or the
     /// error result for a file that cannot be read.
     fn open_reservation_for(
@@ -315,14 +320,19 @@ impl WalletServer {
 
 /// Renders the wallet's record of a submission.
 ///
-/// `release_code` names the accounting disposition of a submission whose
-/// outcome is unknown, such as `submission.accounting_expired` once its
-/// accounting horizon passed; it is an observation, not a chain outcome. It
-/// is `null` for a submission with a reported answer and for one whose
-/// retention window closed. A reported failure or missing transaction does
-/// not release possible spending.
+/// The record is display data. `settlement_evidence` is always
+/// `"unavailable"`: no receipt field authenticates a settlement.
+/// `release_code` names a display observation or the accounting disposition
+/// of a submission whose outcome is unknown, such as
+/// `submission.accounting_expired` once its accounting horizon passed; it is
+/// not a chain outcome. `settlement_decision_id` locates the authenticated
+/// accounting decision a projection recorded; a copied identifier proves
+/// nothing. A reported failure or missing transaction does not release
+/// possible spending.
 fn receipt_view(receipt: &SubmissionReceipt, reservation_open: bool) -> serde_json::Value {
     json!({
+        "settlement_evidence": "unavailable",
+        "settlement_decision_id": receipt.settlement_decision_id,
         "reservation_open": reservation_open,
         "envelope_hash": receipt.envelope_hash,
         "status": receipt.status.label(),

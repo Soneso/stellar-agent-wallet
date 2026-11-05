@@ -227,21 +227,6 @@ pub enum ReceiptStatus {
     ClearedByOperator,
 }
 
-/// The audit row owed by a settled submission.
-///
-/// Deliberately exhaustive: every caller chooses the audit row from this
-/// answer, so a new variant must make each caller fail to compile until it
-/// handles that row. A reported success owes no row, so only a definitive
-/// failure has one.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SettledRow<'a> {
-    /// The receipt records a definitive failure.
-    Failed {
-        /// The failure or release-evidence code recorded on the row.
-        code: &'a str,
-    },
-}
-
 impl ReceiptStatus {
     /// Returns `true` if the status is terminal (no further state transition
     /// expected from the normal submission path).
@@ -293,6 +278,18 @@ impl ReceiptStatus {
     }
 
     /// Returns `true` when an operator may clear a receipt in this status
+    /// whose submission holds no authenticated window reservation.
+    ///
+    /// The states [`Self::is_operator_clearable`] names and `Failed`. An
+    /// endpoint failure report is unauthenticated, so it settles nothing on
+    /// its own, and a receipt without a hold carries no counted exposure for
+    /// the clear to release.
+    #[must_use]
+    pub fn is_operator_clearable_without_hold(&self) -> bool {
+        matches!(self, Self::Pending | Self::Ambiguous | Self::Failed { .. })
+    }
+
+    /// Returns `true` when an operator may clear a receipt in this status
     /// whose submission holds an authenticated window reservation with no
     /// execution bound.
     ///
@@ -304,20 +301,6 @@ impl ReceiptStatus {
     #[must_use]
     pub fn is_clearable_with_unbounded_hold(&self) -> bool {
         !matches!(self, Self::ClearedByOperator)
-    }
-
-    /// Returns the settled audit row owed, using the receipt's `release_code`.
-    ///
-    /// Reported success and ambiguous accounting dispositions owe no authenticated
-    /// chain fact. A definitive failed status retains its explicit failure code.
-    #[must_use]
-    pub fn settled_row(&self, release_code: Option<ReleaseEvidence>) -> Option<SettledRow<'_>> {
-        match (self, release_code) {
-            (Self::Success, _) => None,
-            (Self::Failed { code }, _) => Some(SettledRow::Failed { code }),
-            (Self::Ambiguous, Some(_)) => None,
-            _ => None,
-        }
     }
 
     /// Returns the stable wire tag for this status.
@@ -383,6 +366,28 @@ impl ReleaseEvidence {
             Self::AccountingExpired => ACCOUNTING_EXPIRED_CODE,
         }
     }
+}
+
+/// The identity and decision an authenticated accounting expiry projects
+/// onto its receipt, read by the caller from authenticated window state.
+///
+/// See [`ReceiptStore::project_accounting_expiry`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AccountingExpiryProjection<'a> {
+    /// The envelope hash naming the receipt.
+    pub envelope_hash: &'a str,
+    /// The transaction hash, in full.
+    pub tx_hash: &'a str,
+    /// The account whose sequence the transaction consumes.
+    pub source: &'a str,
+    /// The sequence number the transaction consumes.
+    pub sequence: i64,
+    /// `TimeBounds.maxTime` in absolute unix seconds; `0` means no time bound.
+    pub max_time: u64,
+    /// The ledger observed when the reservation was taken.
+    pub recorded_at_ledger: u32,
+    /// The identifier of the committed accounting decision.
+    pub decision_id: &'a str,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -571,26 +576,29 @@ pub struct SubmissionReceipt {
     #[serde(default)]
     pub recovered_from_reservation: bool,
 
-    /// The chain evidence on which reconciliation released this receipt's
-    /// reservation.
+    /// The observation or accounting disposition recorded on an ambiguous
+    /// receipt.
     ///
-    /// Set once, from `None` to `Some`, and only on an
-    /// [`ReceiptStatus::Ambiguous`] receipt, by
-    /// [`ReceiptStore::finalize_released`]. It survives an operator clear, so
-    /// a cleared receipt still names why its reservation was released, and
-    /// it is dropped when a definitive network answer replaces the status.
-    /// The status surfaces read it to write the settled `value_action_failed`
-    /// row under the evidence's wire code, so a settlement row that could not
-    /// be appended when the reservation was released is written by a later
-    /// run.
+    /// The release code is a display observation or accounting disposition.
+    /// Authenticated accounting expiry supplies its decision identifier.
+    /// Pending and ambiguous receipts also receive its accounting code. Audit
+    /// delivery reads authenticated state.
     ///
-    /// `None` on a receipt released by a binary that records no evidence and on one
-    /// whose retention window closed; such a receipt reads as `Ambiguous`
-    /// without evidence. Absent from the serialized form when `None`, so a
-    /// receipt without it keeps its bytes. A binary that predates the field
-    /// reads the receipt and drops the field when it rewrites the store.
+    /// It survives an operator clear and is dropped when a definitive network
+    /// answer replaces the status. `None` on a receipt whose retention window
+    /// closed; such a receipt reads as `Ambiguous` without evidence. Absent
+    /// from the serialized form when `None`, so a receipt without it keeps its
+    /// bytes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub release_code: Option<ReleaseEvidence>,
+
+    /// The identifier of the authenticated accounting decision projected onto
+    /// this receipt.
+    ///
+    /// This display identifier locates an authenticated accounting decision.
+    /// The identifier alone supplies no settlement authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settlement_decision_id: Option<String>,
 }
 
 /// Serde default for [`SubmissionReceipt::submitted`].
@@ -1171,6 +1179,7 @@ impl ReceiptStore {
             approval_consumed: false,
             recovered_from_reservation: true,
             release_code: None,
+            settlement_decision_id: None,
         };
         session
             .guard
@@ -1411,6 +1420,85 @@ impl ReceiptStore {
         )
     }
 
+    /// Projects an authenticated accounting expiry onto the receipt it names.
+    ///
+    /// An absent receipt is reconstructed from the identity the projection
+    /// carries, recorded as `Ambiguous` and recovered from its reservation. A
+    /// `Pending` or `Ambiguous` receipt becomes `Ambiguous` with
+    /// [`ReleaseEvidence::AccountingExpired`]. A `ClearedByOperator`,
+    /// `Success`, `Failed` or `Reorged` receipt keeps its status and code.
+    /// Every receipt records the decision identifier in
+    /// [`SubmissionReceipt::settlement_decision_id`].
+    ///
+    /// The receipt is display data. The caller reads the projection from
+    /// authenticated window state, and the receipt can be rebuilt from it.
+    ///
+    /// # Errors
+    ///
+    /// - [`ReceiptStoreError::MutexPoisoned`] if the lock is poisoned.
+    /// - [`ReceiptStoreError::WriterLocked`] if another process holds the
+    ///   sidecar lock for the whole retry window.
+    /// - [`ReceiptStoreError::Io`] or [`ReceiptStoreError::Json`] on read or
+    ///   persist failure.
+    ///
+    /// # Panics
+    ///
+    /// Never panics.
+    pub fn project_accounting_expiry(
+        &self,
+        projection: &AccountingExpiryProjection<'_>,
+    ) -> Result<(), ReceiptStoreError> {
+        let mut session = self.write_session()?;
+        let decision_id = Some(projection.decision_id.to_owned());
+        match session.guard.map.get_mut(projection.envelope_hash) {
+            Some(receipt) => {
+                let open = matches!(
+                    receipt.status,
+                    ReceiptStatus::Pending | ReceiptStatus::Ambiguous
+                );
+                if receipt.settlement_decision_id == decision_id
+                    && (!open
+                        || (receipt.status == ReceiptStatus::Ambiguous
+                            && receipt.release_code == Some(ReleaseEvidence::AccountingExpired)))
+                {
+                    return Ok(());
+                }
+                if open {
+                    receipt.status = ReceiptStatus::Ambiguous;
+                    receipt.ledger = None;
+                    receipt.release_code = Some(ReleaseEvidence::AccountingExpired);
+                }
+                receipt.settlement_decision_id = decision_id;
+            }
+            None => {
+                let receipt = SubmissionReceipt {
+                    envelope_hash: projection.envelope_hash.to_owned(),
+                    tx_hash: projection.tx_hash.to_owned(),
+                    source: projection.source.to_owned(),
+                    sequence: projection.sequence,
+                    status: ReceiptStatus::Ambiguous,
+                    ledger: None,
+                    recorded_at_ledger: projection.recorded_at_ledger,
+                    max_time: projection.max_time,
+                    prior_ledger: None,
+                    reorg_pending_at_ledger: None,
+                    submitted: true,
+                    approval_nonce: None,
+                    approval_consumed: false,
+                    recovered_from_reservation: true,
+                    release_code: Some(ReleaseEvidence::AccountingExpired),
+                    settlement_decision_id: decision_id,
+                };
+                session
+                    .guard
+                    .map
+                    .insert(projection.envelope_hash.to_owned(), receipt);
+            }
+        }
+        session.guard.rebuild_indexes();
+        persist_locked(&mut session.guard)
+    }
+
     /// The shared body of [`Self::finalize`] and [`Self::finalize_released`].
     ///
     /// `evidence` is `Some` only with `status == Ambiguous`.
@@ -1465,6 +1553,7 @@ impl ReceiptStore {
                 approval_consumed: false,
                 recovered_from_reservation: false,
                 release_code: evidence,
+                settlement_decision_id: None,
             });
 
         session.guard.rebuild_indexes();
@@ -1514,6 +1603,36 @@ impl ReceiptStore {
         envelope_hash: &str,
     ) -> Result<SubmissionReceipt, ReceiptStoreError> {
         self.clear_where(envelope_hash, ReceiptStatus::is_operator_clearable)
+    }
+
+    /// Records the operator's clear of a receipt whose submission holds no
+    /// authenticated window reservation.
+    ///
+    /// The accepted states are the ones
+    /// [`ReceiptStatus::is_operator_clearable_without_hold`] names: the states
+    /// [`Self::clear_by_operator`] accepts and a `Failed` receipt. An endpoint
+    /// failure report is unauthenticated, so the operator's acknowledgement is
+    /// what closes such a receipt. The caller establishes from the
+    /// authenticated window that no reservation is held; this method reads
+    /// the receipt and nothing else.
+    ///
+    /// # Errors
+    ///
+    /// - [`ReceiptStoreError::InvalidTransition`] if the receipt's status is
+    ///   not one the rule accepts.
+    /// - The store errors [`Self::clear_by_operator`] names.
+    ///
+    /// # Panics
+    ///
+    /// Never panics.
+    pub fn clear_unheld_by_operator(
+        &self,
+        envelope_hash: &str,
+    ) -> Result<SubmissionReceipt, ReceiptStoreError> {
+        self.clear_where(
+            envelope_hash,
+            ReceiptStatus::is_operator_clearable_without_hold,
+        )
     }
 
     /// Records the operator's clear of a receipt whose submission holds an
@@ -1932,6 +2051,7 @@ fn insert_pending(
         approval_consumed: false,
         recovered_from_reservation: false,
         release_code: None,
+        settlement_decision_id: None,
     };
 
     guard.map.insert(envelope_hash.to_owned(), receipt);
@@ -2927,6 +3047,7 @@ mod tests {
             approval_consumed: false,
             recovered_from_reservation: false,
             release_code: None,
+            settlement_decision_id: None,
         };
 
         let json = serde_json::to_string(&original).unwrap();
@@ -2966,6 +3087,7 @@ mod tests {
             approval_consumed: false,
             recovered_from_reservation: false,
             release_code: None,
+            settlement_decision_id: None,
         };
 
         let json = serde_json::to_string(&r).unwrap();
@@ -3954,15 +4076,182 @@ mod tests {
             serde_json::from_str::<ReleaseEvidence>(&encoded).unwrap(),
             evidence
         );
-        for observation in [
-            ReleaseEvidence::SequenceConsumed,
-            ReleaseEvidence::TimeBoundPassed,
-            evidence,
+        // The display fields round-trip and stay absent when unset, so a
+        // receipt without them keeps its bytes. Nothing in them is read as
+        // settlement authority.
+        let (_dir, store) = open_temp_store();
+        store
+            .try_begin(HASH_A, TX_HASH_A, SOURCE_A, SEQ_A, 0, 50)
+            .unwrap();
+        let plain = store.get(HASH_A).unwrap().unwrap();
+        let plain_json = serde_json::to_string(&plain).unwrap();
+        assert!(
+            !plain_json.contains("settlement_decision_id"),
+            "{plain_json}"
+        );
+        let mut displayed = plain;
+        displayed.status = ReceiptStatus::Ambiguous;
+        displayed.release_code = Some(evidence);
+        displayed.settlement_decision_id = Some("ab".repeat(32));
+        let json = serde_json::to_string(&displayed).unwrap();
+        assert!(
+            json.contains(&format!(
+                r#""settlement_decision_id":"{}""#,
+                "ab".repeat(32)
+            )),
+            "{json}"
+        );
+        assert_eq!(
+            serde_json::from_str::<SubmissionReceipt>(&json).unwrap(),
+            displayed
+        );
+        assert_eq!(
+            serde_json::from_str::<SubmissionReceipt>(&plain_json)
+                .unwrap()
+                .settlement_decision_id,
+            None
+        );
+    }
+
+    /// An accounting expiry projection follows the receipt status rule and
+    /// records the decision identifier on every receipt.
+    #[test]
+    fn accounting_expiry_projection_follows_the_status_rule() {
+        let (_dir, store) = open_temp_store();
+        let projection =
+            |hash: &'static str, decision_id: &'static str| AccountingExpiryProjection {
+                envelope_hash: hash,
+                tx_hash: TX_HASH_A,
+                source: SOURCE_A,
+                sequence: SEQ_A,
+                max_time: 77,
+                recorded_at_ledger: 50,
+                decision_id,
+            };
+
+        // Absent: reconstructed as an ambiguous recovered receipt.
+        store
+            .project_accounting_expiry(&projection(HASH_A, "d1"))
+            .unwrap();
+        let rebuilt = store.get(HASH_A).unwrap().unwrap();
+        assert_eq!(rebuilt.status, ReceiptStatus::Ambiguous);
+        assert_eq!(
+            rebuilt.release_code,
+            Some(ReleaseEvidence::AccountingExpired)
+        );
+        assert_eq!(rebuilt.settlement_decision_id.as_deref(), Some("d1"));
+        assert!(rebuilt.recovered_from_reservation);
+        assert!(rebuilt.submitted);
+        assert_eq!(
+            (
+                rebuilt.tx_hash.as_str(),
+                rebuilt.source.as_str(),
+                rebuilt.sequence
+            ),
+            (TX_HASH_A, SOURCE_A, SEQ_A)
+        );
+        assert_eq!((rebuilt.max_time, rebuilt.recorded_at_ledger), (77, 50));
+
+        // Pending and Ambiguous take the accounting code and identifier.
+        for (status, release) in [
+            (None, None),
+            (
+                Some(ReceiptStatus::Ambiguous),
+                Some(ReleaseEvidence::SequenceConsumed),
+            ),
         ] {
+            let (_dir, store) = open_temp_store();
+            store
+                .try_begin(HASH_A, TX_HASH_A, SOURCE_A, SEQ_A, 0, 50)
+                .unwrap();
+            if let (Some(_), Some(release)) = (status, release) {
+                store.finalize_released(HASH_A, release).unwrap();
+            }
+            store
+                .project_accounting_expiry(&projection(HASH_A, "d2"))
+                .unwrap();
+            let projected = store.get(HASH_A).unwrap().unwrap();
+            assert_eq!(projected.status, ReceiptStatus::Ambiguous);
             assert_eq!(
-                ReceiptStatus::Ambiguous.settled_row(Some(observation)),
-                None
+                projected.release_code,
+                Some(ReleaseEvidence::AccountingExpired)
             );
+            assert_eq!(projected.settlement_decision_id.as_deref(), Some("d2"));
+            assert!(!projected.recovered_from_reservation);
+        }
+
+        // Every other status keeps its status and code.
+        for status in [
+            ReceiptStatus::Success,
+            ReceiptStatus::Failed {
+                code: "ledger.op_failed".to_owned(),
+            },
+            ReceiptStatus::Reorged,
+            ReceiptStatus::ClearedByOperator,
+        ] {
+            let (_dir, store) = open_temp_store();
+            store
+                .try_begin(HASH_A, TX_HASH_A, SOURCE_A, SEQ_A, 0, 50)
+                .unwrap();
+            match &status {
+                ReceiptStatus::Reorged => {
+                    store
+                        .finalize(HASH_A, ReceiptStatus::Success, Some(9))
+                        .unwrap();
+                    store.finalize_reorged(HASH_A).unwrap();
+                }
+                ReceiptStatus::ClearedByOperator => {
+                    store
+                        .finalize_released(HASH_A, ReleaseEvidence::TimeBoundPassed)
+                        .unwrap();
+                    store.clear_by_operator(HASH_A).unwrap();
+                }
+                other => store.finalize(HASH_A, other.clone(), Some(9)).unwrap(),
+            }
+            let before = store.get(HASH_A).unwrap().unwrap();
+            store
+                .project_accounting_expiry(&projection(HASH_A, "d3"))
+                .unwrap();
+            let after = store.get(HASH_A).unwrap().unwrap();
+            assert_eq!(after.status, status);
+            assert_eq!(after.release_code, before.release_code);
+            assert_eq!(after.ledger, before.ledger);
+            assert_eq!(after.settlement_decision_id.as_deref(), Some("d3"));
+        }
+    }
+
+    /// A receipt without a hold that records a reported failure is
+    /// clearable; one already cleared is not.
+    #[test]
+    fn an_unheld_failed_receipt_is_operator_clearable() {
+        let (_dir, store) = open_temp_store();
+        store
+            .try_begin(HASH_A, TX_HASH_A, SOURCE_A, SEQ_A, 0, 50)
+            .unwrap();
+        store
+            .finalize(
+                HASH_A,
+                ReceiptStatus::Failed {
+                    code: "ledger.op_failed".to_owned(),
+                },
+                Some(9),
+            )
+            .unwrap();
+        assert!(matches!(
+            store.clear_by_operator(HASH_A),
+            Err(ReceiptStoreError::InvalidTransition { from: "failed", .. })
+        ));
+        let cleared = store.clear_unheld_by_operator(HASH_A).unwrap();
+        assert_eq!(cleared.status, ReceiptStatus::ClearedByOperator);
+        assert!(matches!(
+            store.clear_unheld_by_operator(HASH_A),
+            Err(ReceiptStoreError::InvalidTransition {
+                from: "cleared_by_operator",
+                ..
+            })
+        ));
+        for status in [ReceiptStatus::Success, ReceiptStatus::Reorged] {
+            assert!(!status.is_operator_clearable_without_hold());
         }
     }
 

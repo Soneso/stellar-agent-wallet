@@ -103,6 +103,8 @@ base64 = { workspace = true }
 toml_edit = { workspace = true }
 # OS CSPRNG for HMAC key generation during lazy-mint.
 rand_core = { workspace = true }
+# Request identifiers of the accounting-expiry audit rows.
+uuid = { workspace = true }
 
 # macOS Keychain backend (Security.framework legacy keychain).
 [target.'cfg(target_os = "macos")'.dependencies]
