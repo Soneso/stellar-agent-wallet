@@ -527,18 +527,11 @@ pub async fn run(args: &ExecuteArgs) -> i32 {
         return emit_error(&e, args.output, &request_id);
     }
     // Fail closed BEFORE signing if --expect-rule-signer is set and differs.
-    if let Some(expected_hex) = &args.expect_rule_signer
-        && expected_hex.to_lowercase() != rule_pubkey_hex
+    if let Err(e) =
+        check_expected_rule_signer(args.expect_rule_signer.as_deref(), &rule_pubkey_hex)
     {
         drop(rule_signer);
-        return emit_error(
-            &WalletError::Auth(AuthError::SignerKeyMismatch {
-                expected: expected_hex.clone(),
-                got: rule_pubkey_hex,
-            }),
-            args.output,
-            &request_id,
-        );
+        return emit_error(&e, args.output, &request_id);
     }
 
     // ── Fee-payer signer ────────────────────────────────────────────────────
@@ -845,6 +838,32 @@ fn emit_success(result: &ExecuteResult, output: OutputFormat, request_id: &str) 
     0
 }
 
+/// Refuses a rule signer whose public key differs from `--expect-rule-signer`.
+///
+/// `expected` is the flag value (hex, compared case-insensitively) and
+/// `rule_pubkey_hex` the lowercase hex public key of the resolved rule signer.
+/// No flag means no check.
+///
+/// # Errors
+///
+/// [`WalletError::Auth`] wrapping [`AuthError::SignerKeyMismatch`] naming
+/// `--expect-rule-signer` when the keys differ.
+fn check_expected_rule_signer(
+    expected: Option<&str>,
+    rule_pubkey_hex: &str,
+) -> Result<(), WalletError> {
+    match expected {
+        Some(expected_hex) if expected_hex.to_lowercase() != rule_pubkey_hex => {
+            Err(WalletError::Auth(AuthError::SignerKeyMismatch {
+                what: "--expect-rule-signer",
+                expected: expected_hex.to_owned(),
+                got: rule_pubkey_hex.to_owned(),
+            }))
+        }
+        _ => Ok(()),
+    }
+}
+
 fn emit_error(err: &WalletError, output: OutputFormat, request_id: &str) -> i32 {
     let envelope = Envelope::<()>::err_with_request_id(err, request_id.to_owned());
     match output {
@@ -1022,6 +1041,24 @@ mod tests {
                 "AAAAAg==".to_owned()
             ]
         );
+    }
+
+    #[test]
+    fn signer_key_mismatch_names_expect_rule_signer() {
+        let expected = "aa".repeat(32);
+        let got = "bb".repeat(32);
+        let err = check_expected_rule_signer(Some(&expected), &got)
+            .expect_err("a different rule signer must be refused");
+        assert_eq!(err.code(), "auth.signer_key_mismatch");
+        assert_eq!(
+            err.message(),
+            format!(
+                "signing key public key '{got}' does not match --expect-rule-signer '{expected}'"
+            )
+        );
+        // Matching (case-insensitively) or absent passes.
+        assert!(check_expected_rule_signer(Some(&expected.to_uppercase()), &expected).is_ok());
+        assert!(check_expected_rule_signer(None, &got).is_ok());
     }
 
     #[test]

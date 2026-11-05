@@ -1560,7 +1560,9 @@ async fn sign_envelope(
 
     let signer: Box<dyn Signer + Send + Sync> =
         match (args.sign_with_ledger, args.secret_env.as_deref()) {
-            (true, _) => Box::new(signer_from_ledger(args.account_index, source).await?),
+            (true, _) => {
+                Box::new(signer_from_ledger(args.account_index, source, "--source").await?)
+            }
             (false, Some(var_name)) => {
                 let SignerCeremonyOutcome {
                     signer,
@@ -1569,6 +1571,7 @@ async fn sign_envelope(
                 let derived = signer.public_key().await?.to_string().to_string();
                 if derived != source {
                     return Err(AuthError::SignerKeyMismatch {
+                        what: "--source",
                         expected: source.to_owned(),
                         got: derived,
                     }
@@ -2576,6 +2579,52 @@ mod tests {
     #[serial_test::serial]
     async fn enrolled_signing_mismatch() {
         enrolled_signing_case(EnrolledPin::Other).await;
+    }
+
+    /// A `--secret-env` seed for another account is refused before signing,
+    /// and the message names `--source`.
+    #[allow(unsafe_code, reason = "serialized test seed variable")]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn signer_key_mismatch_names_source() {
+        let g = enrolled_test_g();
+        let other = stellar_strkey::ed25519::PublicKey([7; 32])
+            .to_string()
+            .to_string();
+        let var = "SIGNER_MISMATCH_CLAIM_TEST_SEED";
+        unsafe {
+            std::env::set_var(var, enrolled_test_secret());
+        }
+        let mut profile = enrolled_mainnet_profile(EnrolledPin::Derived);
+        let server = mount_claim_rpc(&g).await;
+        profile.rpc_url = server.uri();
+        let context = NetworkContext::from_profile(&profile);
+        let mut args = minimal_args();
+        args.source = g.clone();
+        args.secret_env = Some(var.into());
+        args.fee = Some("100".into());
+        args.balance_id = CLAIM_RPC_BALANCE_HEX64.to_owned();
+        let build_context = NetworkContext::new(
+            stellar_agent_core::profile::caip2::Caip2::Testnet,
+            server.uri(),
+        );
+        let client = StellarRpcClient::new(&build_context.rpc_url).expect("mock client");
+        let id = claim_inputs(&args).expect("valid claim arguments");
+        let built = build_unsigned_envelope(&client, &build_context, &args, id)
+            .await
+            .expect("build against mock");
+        args.source = other.clone();
+        let result =
+            sign_envelope(&context, &args, &built.envelope_xdr, &profile, "enrolled").await;
+        unsafe {
+            std::env::remove_var(var);
+        }
+        let err = result.expect_err("a seed for another account must be refused");
+        assert_eq!(err.code(), "auth.signer_key_mismatch");
+        assert_eq!(
+            err.message(),
+            format!("signing key public key '{g}' does not match --source '{other}'")
+        );
     }
 
     /// The 64-hex hash of the claimable balance [`mount_claim_rpc`] serves.

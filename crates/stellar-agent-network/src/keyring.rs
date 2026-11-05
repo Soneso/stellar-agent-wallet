@@ -1154,6 +1154,7 @@ pub fn lazy_signer_from_keyring(
     let public_key =
         stellar_strkey::ed25519::PublicKey::from_string(expected_source_g).map_err(|_error| {
             WalletError::Auth(AuthError::SignerKeyMismatch {
+                what: "the keyring entry's account",
                 expected: redact_strkey_first5_last5(expected_source_g),
                 got: "invalid public account".to_owned(),
             })
@@ -1400,6 +1401,7 @@ async fn sign_payload_verifying_pubkey(
             .to_string()
             .to_string();
         return Err(WalletError::Auth(AuthError::SignerKeyMismatch {
+            what: "the cached signing public key",
             expected: expected_g,
             got: got_g,
         }));

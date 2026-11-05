@@ -409,7 +409,7 @@ async fn exercise(tool: Tool, initially_confirmed: bool, fault: Option<SignerFau
             SignerFault::OtherKey => (
                 "auth.signer_key_mismatch",
                 format!(
-                    "signing key public key '{}' does not match --source '{source}'",
+                    "signing key public key '{}' does not match the expected signing account '{source}'",
                     account_id_for_seed(OTHER_SEED)
                 ),
             ),

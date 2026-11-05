@@ -2377,14 +2377,21 @@ pub enum AuthError {
         derived: String,
     },
 
-    /// The signing key's derived public key does not match `--source`.
+    /// The signing key's derived public key does not match the identity the
+    /// command expected.
     ///
-    /// `expected` holds the `--source` G-strkey supplied by the caller.
-    /// `got` holds the public key derived from the signing key (software) or
-    /// fetched from the device (hardware). Neither carries secret material.
-    #[error("signing key public key '{got}' does not match --source '{expected}'")]
+    /// `what` names that identity: a flag such as `--source`, `--sponsor`, or
+    /// `--expect-rule-signer`, or a description such as `the expected signing
+    /// account`, `the cached signing public key`, or `the keyring entry's
+    /// account`. `expected` holds a G-strkey, a lowercase hex public key, or a
+    /// redacted account with `got` set to `invalid public account`. `got`
+    /// holds the public key derived from the signing key (software) or fetched
+    /// from the device (hardware). None carries secret material.
+    #[error("signing key public key '{got}' does not match {what} '{expected}'")]
     SignerKeyMismatch {
-        /// The `--source` G-strkey supplied by the caller.
+        /// The identity `expected` stands for, rendered in the message.
+        what: &'static str,
+        /// The caller-supplied, profile, or cached public identity.
         expected: String,
         /// The public key derived from or fetched via the signing key.
         got: String,
@@ -4087,6 +4094,7 @@ mod tests {
             (AuthError::HardwareUserRefused, "auth.hardware_user_refused"),
             (
                 AuthError::SignerKeyMismatch {
+                    what: "--source",
                     expected: "GABC".to_owned(),
                     got: "GDEF".to_owned(),
                 },
@@ -4128,6 +4136,7 @@ mod tests {
 
         // AuthError::SignerKeyMismatch
         let e = WalletError::Auth(AuthError::SignerKeyMismatch {
+            what: "--source",
             expected: "GABC123".to_owned(),
             got: "GDEF456".to_owned(),
         });
@@ -4138,6 +4147,62 @@ mod tests {
         // NetworkError::MainnetWriteForbidden (already existed, verify code unchanged)
         let e = WalletError::Network(NetworkError::MainnetWriteForbidden);
         assert_eq!(e.code(), "network.mainnet_write_forbidden");
+    }
+
+    /// `SignerKeyMismatch` names the identity the signing key failed to match,
+    /// so a `--sponsor` or cached-key mismatch no longer reads as `--source`.
+    #[test]
+    fn signer_key_mismatch_message_names_each_context() {
+        let cases: [(&'static str, &str, &str, &str); 6] = [
+            (
+                "--source",
+                "GABC123",
+                "GDEF456",
+                "signing key public key 'GDEF456' does not match --source 'GABC123'",
+            ),
+            (
+                "--sponsor",
+                "GABC123",
+                "GDEF456",
+                "signing key public key 'GDEF456' does not match --sponsor 'GABC123'",
+            ),
+            (
+                "--expect-rule-signer",
+                "aabb",
+                "ccdd",
+                "signing key public key 'ccdd' does not match --expect-rule-signer 'aabb'",
+            ),
+            (
+                "the expected signing account",
+                "GABC123",
+                "GDEF456",
+                "signing key public key 'GDEF456' does not match the expected signing account \
+                 'GABC123'",
+            ),
+            (
+                "the cached signing public key",
+                "GABC123",
+                "GDEF456",
+                "signing key public key 'GDEF456' does not match the cached signing public key \
+                 'GABC123'",
+            ),
+            (
+                "the keyring entry's account",
+                "GABC1\u{2026}C1234",
+                "invalid public account",
+                "signing key public key 'invalid public account' does not match the keyring \
+                 entry's account 'GABC1\u{2026}C1234'",
+            ),
+        ];
+        for (what, expected, got, message) in cases {
+            let e = WalletError::Auth(AuthError::SignerKeyMismatch {
+                what,
+                expected: expected.to_owned(),
+                got: got.to_owned(),
+            });
+            assert_eq!(e.code(), "auth.signer_key_mismatch");
+            assert_eq!(e.message(), message, "context {what}");
+        }
     }
 
     // ── WalletState errors ───────────────────────────────────────────────────
