@@ -63,6 +63,8 @@ pub mod deploy_policy;
 pub mod deploy_spending_limit_policy;
 pub mod deploy_webauthn_verifier;
 pub mod execute;
+/// Read-only intent accounting view.
+pub mod list_intents;
 pub mod list_rules;
 pub mod list_verifiers;
 pub mod migrate_verifier;
@@ -285,6 +287,10 @@ pub enum SmartAccountSubcommand {
     #[command(name = "list-rules")]
     ListRules(list_rules::ListRulesArgs),
 
+    /// List retained smart-account intent charges without changing wallet state.
+    #[command(name = "list-intents")]
+    ListIntents(list_intents::ListIntentsArgs),
+
     /// Register a deployed multicall router contract in the local registry.
     ///
     /// Records the address and WASM SHA-256 in
@@ -379,6 +385,7 @@ pub async fn run(args: &SmartAccountArgs) -> i32 {
         }
         SmartAccountSubcommand::ListVerifiers(list_args) => list_verifiers::run(list_args).await,
         SmartAccountSubcommand::ListRules(list_args) => list_rules::run(list_args).await,
+        SmartAccountSubcommand::ListIntents(list_args) => list_intents::run(list_args).await,
         SmartAccountSubcommand::RegisterMulticall(args) => register_multicall::run(args).await,
         SmartAccountSubcommand::UnregisterMulticall(args) => unregister_multicall::run(args).await,
         SmartAccountSubcommand::Timelock(args) => timelock::run(args).await,
@@ -406,6 +413,7 @@ impl SmartAccountArgs {
             SmartAccountSubcommand::Timelock(a) => a.profile_flag(),
             SmartAccountSubcommand::MigrateVerifier(a) => a.profile.as_deref(),
             SmartAccountSubcommand::ListRules(a) => a.profile.as_deref(),
+            SmartAccountSubcommand::ListIntents(a) => a.profile.as_deref(),
             SmartAccountSubcommand::RegisterMulticall(a) => a.profile.as_deref(),
             SmartAccountSubcommand::UnregisterMulticall(a) => a.profile.as_deref(),
             SmartAccountSubcommand::Execute(a) => a.profile.as_deref(),

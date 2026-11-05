@@ -2194,6 +2194,9 @@ async fn d3_migrate_verifier_on_chain_submit() {
     let transfer_request_id = uuid::Uuid::new_v4().to_string();
     let transfer = submit_signed_invoke(
         SubmitInvokeArgs::builder()
+            .admission(stellar_agent_network::SigningAdmission::NoValue(
+                stellar_agent_smart_account::signing::intent_test_helpers::no_value_admission(),
+            ))
             .target_contract(common::XLM_SAC_TESTNET)
             .auth_address(smart_account_strkey.as_str())
             .auth_rule_ids(&transfer_rule_ids)

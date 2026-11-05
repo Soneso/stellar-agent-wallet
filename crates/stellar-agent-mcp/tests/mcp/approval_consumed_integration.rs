@@ -55,6 +55,33 @@ const AMOUNT_STROOPS: i64 = 100_000_000;
 struct RequireApprovalEngine;
 
 impl PolicyEngine for RequireApprovalEngine {
+    fn record_confirmed_checked(
+        &self,
+        tool: &ToolDescriptor,
+        profile: &Profile,
+        value: &stellar_agent_core::policy::v1::ValueClass,
+    ) -> Result<stellar_agent_core::policy::v1::SizingOutcome, PolicyError> {
+        stellar_agent_core::policy::NoopPolicyEngine.record_confirmed_checked(tool, profile, value)
+    }
+    fn size_unvalued_call(
+        &self,
+        tool: &ToolDescriptor,
+        profile: &Profile,
+        reason: stellar_agent_core::policy::v1::OpaqueReason,
+        now_ms: u64,
+    ) -> Result<stellar_agent_core::policy::v1::SizingOutcome, PolicyError> {
+        stellar_agent_core::policy::NoopPolicyEngine
+            .size_unvalued_call(tool, profile, reason, now_ms)
+    }
+    fn size_no_value(
+        &self,
+        tool: &ToolDescriptor,
+        profile: &Profile,
+        now_ms: u64,
+    ) -> Result<stellar_agent_core::policy::v1::CheckedSizing, PolicyError> {
+        stellar_agent_core::policy::NoopPolicyEngine.size_no_value(tool, profile, now_ms)
+    }
+
     fn evaluate(
         &self,
         _tool: &ToolDescriptor,

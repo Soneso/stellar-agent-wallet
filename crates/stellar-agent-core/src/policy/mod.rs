@@ -1580,6 +1580,52 @@ pub trait PolicyEngine: Send + Sync {
         Ok(Vec::new())
     }
 
+    /// Records certified accounting entries for the supplied value.
+    ///
+    /// # Errors
+    /// Refuses when this engine does not support checked sizing.
+    fn record_confirmed_checked(
+        &self,
+        _tool: &ToolDescriptor,
+        _profile: &Profile,
+        _value: &v1::ValueClass,
+    ) -> Result<v1::SizingOutcome, PolicyError> {
+        Err(PolicyError::CriterionEvaluationFailed {
+            detail: "checked sizing is unsupported by this engine".into(),
+        })
+    }
+
+    /// Checks value rules and sizes an unvalued call without recording it.
+    ///
+    /// # Errors
+    /// Refuses when this engine does not support checked sizing.
+    fn size_unvalued_call(
+        &self,
+        _tool: &ToolDescriptor,
+        _profile: &Profile,
+        _reason: v1::OpaqueReason,
+        _now_ms: u64,
+    ) -> Result<v1::SizingOutcome, PolicyError> {
+        Err(PolicyError::CriterionEvaluationFailed {
+            detail: "checked sizing is unsupported by this engine".into(),
+        })
+    }
+
+    /// Sizes count charges for a call without a value leg.
+    ///
+    /// # Errors
+    /// Refuses when this engine does not support checked sizing.
+    fn size_no_value(
+        &self,
+        _tool: &ToolDescriptor,
+        _profile: &Profile,
+        _now_ms: u64,
+    ) -> Result<v1::CheckedSizing, PolicyError> {
+        Err(PolicyError::CriterionEvaluationFailed {
+            detail: "checked sizing is unsupported by this engine".into(),
+        })
+    }
+
     /// Returns the engine's in-memory sliding-window state store, for a
     /// caller that needs to REPLACE its contents with a freshly re-hydrated
     /// view before evaluation (a long-lived engine instance — the MCP server
@@ -1685,6 +1731,52 @@ pub struct Evaluation {
 pub struct NoopPolicyEngine;
 
 impl PolicyEngine for NoopPolicyEngine {
+    /// Returns `NoApplicableLimit` because this engine holds no window state.
+    ///
+    /// # Errors
+    /// Never returns an error.
+    fn record_confirmed_checked(
+        &self,
+        _tool: &ToolDescriptor,
+        _profile: &Profile,
+        _value: &v1::ValueClass,
+    ) -> Result<v1::SizingOutcome, PolicyError> {
+        Ok(v1::SizingOutcome::Sized(v1::CheckedSizing::new(
+            v1::SizingBasis::NoApplicableLimit,
+            Vec::new(),
+        )?))
+    }
+
+    /// Returns `NoApplicableLimit` because this engine holds no window state.
+    ///
+    /// # Errors
+    /// Never returns an error.
+    fn size_unvalued_call(
+        &self,
+        _tool: &ToolDescriptor,
+        _profile: &Profile,
+        _reason: v1::OpaqueReason,
+        _now_ms: u64,
+    ) -> Result<v1::SizingOutcome, PolicyError> {
+        Ok(v1::SizingOutcome::Sized(v1::CheckedSizing::new(
+            v1::SizingBasis::NoApplicableLimit,
+            Vec::new(),
+        )?))
+    }
+
+    /// Returns `NoApplicableLimit` because this engine holds no window state.
+    ///
+    /// # Errors
+    /// Never returns an error.
+    fn size_no_value(
+        &self,
+        _tool: &ToolDescriptor,
+        _profile: &Profile,
+        _now_ms: u64,
+    ) -> Result<v1::CheckedSizing, PolicyError> {
+        v1::CheckedSizing::new(v1::SizingBasis::NoApplicableLimit, Vec::new())
+    }
+
     fn evaluate(
         &self,
         tool: &ToolDescriptor,

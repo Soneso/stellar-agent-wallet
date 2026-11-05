@@ -243,8 +243,22 @@ pub async fn run(args: &CancelArgs) -> i32 {
         "smart-account timelock cancel: submitting"
     );
 
+    let admission = match crate::commands::smart_account::common::submission_admission(
+        &profile,
+        origin,
+        &profile_name,
+        "stellar_smart_account_timelock_cancel",
+        &context,
+    ) {
+        Ok(admission) => admission,
+        Err(error) => {
+            render_json(&Envelope::<()>::err(&error));
+            return 1;
+        }
+    };
     match stellar_agent_smart_account::timelock::cancel(
         stellar_agent_smart_account::timelock::TimelockCancelArgs::builder()
+            .intent_admission(&admission)
             .timelock_contract_strkey(&args.timelock)
             .operation_id(&operation_id)
             .signer(signer.as_ref())

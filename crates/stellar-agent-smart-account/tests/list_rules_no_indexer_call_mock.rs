@@ -162,7 +162,10 @@ async fn t8_no_indexer_call_during_enumeration() {
         NETWORK_PASSPHRASE.to_owned(),
         std::time::Duration::from_secs(5),
         CHAIN_ID.to_owned(),
-    );
+    )
+    .with_intent_admission(std::sync::Arc::new(
+        stellar_agent_smart_account::signing::intent_test_helpers::no_value_admission_owned(),
+    ));
     let manager = ContextRuleManager::new(config).expect("ContextRuleManager::new must succeed");
 
     let result = manager
@@ -286,7 +289,10 @@ async fn t8b_no_indexer_call_under_proxy_blackhole() {
         NETWORK_PASSPHRASE.to_owned(),
         std::time::Duration::from_secs(5),
         CHAIN_ID.to_owned(),
-    );
+    )
+    .with_intent_admission(std::sync::Arc::new(
+        stellar_agent_smart_account::signing::intent_test_helpers::no_value_admission_owned(),
+    ));
     let manager = ContextRuleManager::new(config).expect("ContextRuleManager::new must succeed");
 
     let result = manager

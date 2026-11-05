@@ -34,6 +34,7 @@ testnet-integration = ["test-helpers", "stellar-agent-test-support/testnet-helpe
 # Expose test-only inspection helpers as pub items for adversarial fixture tests.
 # Never enabled in production builds.
 test-helpers = []
+test-hooks = ["stellar-agent-network/test-hooks"]
 # Gates embedded deploy-time WASM bytes for binaries that upload vendored
 # verifier / policy contracts at runtime.
 deploy-cli = []
@@ -126,6 +127,7 @@ rand_core = { workspace = true }
 zeroize = { workspace = true }
 stellar-agent-core = { workspace = true }
 stellar-agent-network = { workspace = true }
+stellar-agent-soroban-auth = { workspace = true }
 stellar-agent-xdr-limits = { workspace = true }
 tracing = { workspace = true }
 async-trait = { workspace = true }
@@ -149,6 +151,7 @@ stellar-governance = { workspace = true }
 sha2 = { workspace = true }
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
 stellar-agent-network = { workspace = true, features = ["test-helpers"] }
 static_assertions = { workspace = true }
 stellar-agent-test-support = { path = "../stellar-agent-test-support", features = ["verifier-registry", "wiremock-helpers", "test-helpers"] }

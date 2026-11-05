@@ -255,8 +255,57 @@ pub async fn run(args: &ScheduleArgs) -> i32 {
         "smart-account timelock schedule: submitting"
     );
 
+    let now_ms = match stellar_agent_core::timefmt::now_unix_ms() {
+        Ok(now) => now,
+        Err(e) => {
+            render_json(&Envelope::<()>::err_raw(
+                "wallet.clock_error",
+                e.to_string(),
+            ));
+            return 1;
+        }
+    };
+    // Settle open reservations before this operation records or signs a submission.
+    if let Ok(reconcile_client) = stellar_agent_network::StellarRpcClient::new(&context.rpc_url) {
+        crate::commands::submission_record::reconcile_open_reservations(
+            &profile,
+            &profile_name,
+            origin,
+            &reconcile_client,
+            crate::commands::submission_record::settlement_oracle(&profile).as_ref(),
+            now_ms,
+        )
+        .await;
+    }
+    let chain_id = profile.chain_id.caip2_str();
+    let recorder = match crate::commands::submission_record::build_recorder(
+        crate::commands::submission_record::SubmitRecord {
+            unvalued: Some(stellar_agent_core::policy::v1::OpaqueReason::UnvaluedContractCall),
+            policy_decision: stellar_agent_core::audit_log::PolicyDecision::Allow,
+            profile: &profile,
+            profile_name: profile_name.clone(),
+            verb: "timelock schedule",
+            tool: "stellar_smart_account_timelock_schedule",
+            chain_id,
+            effects: None,
+            audit: Some(std::sync::Arc::clone(&audit_writer)),
+            now_ms,
+        },
+    ) {
+        Ok(recorder) => recorder,
+        Err(e) => {
+            render_json(&crate::commands::submission_record::error_envelope(
+                &e,
+                "",
+                "timelock schedule",
+            ));
+            return 1;
+        }
+    };
+
     let outcome = match stellar_agent_smart_account::timelock::schedule_upgrade(
         stellar_agent_smart_account::timelock::TimelockScheduleArgs::builder()
+            .submission_recorder(&recorder)
             .timelock_contract_strkey(&args.timelock)
             .target_strkey(&args.target)
             .function(&args.function)

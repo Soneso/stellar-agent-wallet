@@ -1307,7 +1307,16 @@ async fn add_run(args: &AddArgs) -> i32 {
         unreachable!("ArgGroup `new_signer_source` guarantees one signer-source flag is set")
     };
 
-    let ctx = match CommonHandlerContext::new(args, resolved, profile, origin, &context).await {
+    let ctx = match CommonHandlerContext::new_admitted(
+        args,
+        resolved,
+        profile,
+        origin,
+        &context,
+        "stellar_smart_account_signers",
+    )
+    .await
+    {
         Ok(ctx) => ctx,
         Err(e) => return emit_error(&e, &request_id),
     };
@@ -1510,7 +1519,16 @@ async fn remove_run(args: &RemoveArgs) -> i32 {
         );
     }
 
-    let ctx = match CommonHandlerContext::new(args, resolved, profile, origin, &context).await {
+    let ctx = match CommonHandlerContext::new_admitted(
+        args,
+        resolved,
+        profile,
+        origin,
+        &context,
+        "stellar_smart_account_signers",
+    )
+    .await
+    {
         Ok(ctx) => ctx,
         Err(e) => return emit_error(&e, &request_id),
     };
@@ -1651,7 +1669,16 @@ async fn set_threshold_run(args: &SetThresholdArgs) -> i32 {
         );
     }
 
-    let ctx = match CommonHandlerContext::new(args, resolved, profile, origin, &context).await {
+    let ctx = match CommonHandlerContext::new_admitted(
+        args,
+        resolved,
+        profile,
+        origin,
+        &context,
+        "stellar_smart_account_signers",
+    )
+    .await
+    {
         Ok(ctx) => ctx,
         Err(e) => return emit_error(&e, &request_id),
     };
@@ -1788,7 +1815,16 @@ async fn set_weighted_threshold_run(args: &SetWeightedThresholdArgs) -> i32 {
         );
     }
 
-    let ctx = match CommonHandlerContext::new(args, resolved, profile, origin, &context).await {
+    let ctx = match CommonHandlerContext::new_admitted(
+        args,
+        resolved,
+        profile,
+        origin,
+        &context,
+        "stellar_smart_account_signers",
+    )
+    .await
+    {
         Ok(ctx) => ctx,
         Err(e) => return emit_error(&e, &request_id),
     };
@@ -2005,7 +2041,16 @@ async fn set_signer_weight_run(args: &SetSignerWeightArgs) -> i32 {
         Err(e) => return emit_error(&e, &request_id),
     };
 
-    let ctx = match CommonHandlerContext::new(args, resolved, profile, origin, &context).await {
+    let ctx = match CommonHandlerContext::new_admitted(
+        args,
+        resolved,
+        profile,
+        origin,
+        &context,
+        "stellar_smart_account_signers",
+    )
+    .await
+    {
         Ok(ctx) => ctx,
         Err(e) => return emit_error(&e, &request_id),
     };
@@ -2233,7 +2278,16 @@ async fn batch_add_run(args: &BatchAddArgs) -> i32 {
         }
     }
 
-    let ctx = match CommonHandlerContext::new(args, resolved, profile, origin, &context).await {
+    let ctx = match CommonHandlerContext::new_admitted(
+        args,
+        resolved,
+        profile,
+        origin,
+        &context,
+        "stellar_smart_account_signers",
+    )
+    .await
+    {
         Ok(ctx) => ctx,
         Err(e) => return emit_error(&e, &request_id),
     };
@@ -3696,6 +3750,7 @@ mod tests {
         let profile_name = format!("signers-overrides-{}", Uuid::new_v4());
         let profile = Profile::builder_testnet("overrides", "owner", "overrides", "nonce")
             .with_profile_name(&profile_name)
+            .with_noop_engine()
             .audit_log_path(dir.path().join("audit.jsonl"))
             .build();
         let profiles = dir.path().join("profiles");
@@ -3738,9 +3793,16 @@ mod tests {
         let (profile, origin) = load_command_profile(&resolved).expect("profile");
         let context = network_context_for_command(&profile, &resolved.name, args.endpoint_flags())
             .expect("context");
-        let ctx = CommonHandlerContext::new(&args, resolved, profile, origin, &context)
-            .await
-            .unwrap();
+        let ctx = CommonHandlerContext::new_admitted(
+            &args,
+            resolved,
+            profile,
+            origin,
+            &context,
+            "stellar_smart_account_signers",
+        )
+        .await
+        .unwrap();
         wiremock::Mock::given(wiremock::matchers::method("POST"))
             .respond_with(OverrideRpcResponder::new(
                 &verifier,

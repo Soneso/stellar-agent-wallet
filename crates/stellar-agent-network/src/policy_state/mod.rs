@@ -186,6 +186,9 @@
 //! Accounting-expiry records are retained until audit acknowledgement and
 //! receipt projection both complete. Settled authorization records stay while
 //! their approval can still be presented, and a window state reset keeps them.
+//!
+//! A signed intent counts from its admission before the first signature.
+//! Envelope cancellation, unwinding and reconciliation never release it.
 
 pub mod ledger;
 pub mod lock;
@@ -203,9 +206,9 @@ pub use store::{
     OwnerResetSignature, POLICY_STATE_KEY_FIELD, PersistedWindowStore, RECONCILE_BUDGET,
     RECONCILE_MIN_AGE_MS, REPORTED_SUCCESS_CODE, RETENTION_EXPIRED_CODE, ReconcileFailure,
     ReconcileFailureKind, ReconcileReport, ReportedAnswer, ResetConsent, ResetError, ResetOutcome,
-    ResetRecord, SettledSubmission, StateDefect, SubmissionAnchor, SubmissionHold,
-    UnrecordedAnswer, deliver_accounting_expiries, deliver_accounting_expiry,
-    drain_accounting_obligations, project_accounting_expiries,
+    ResetRecord, SettledSubmission, SignedIntentLegView, SignedIntentView, StateDefect,
+    SubmissionAnchor, SubmissionHold, UnrecordedAnswer, deliver_accounting_expiries,
+    deliver_accounting_expiry, drain_accounting_obligations, project_accounting_expiries,
 };
 
 /// Records a confirmed call's contribution into `engine`'s window state and
@@ -293,6 +296,22 @@ pub fn record_authorized_window_state(
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum WindowStoreError {
+    /// A signing or binding differs from the admitted authority.
+    #[error("the signed intent differs at {field}")]
+    IntentBindingMismatch {
+        /// The fixed mismatching field.
+        field: &'static str,
+    },
+    /// The window holds signed authority that cannot be reset.
+    #[error(
+        "the spending window holds signed intents (authorization exposed, submission unknown: {exposed}; bound: {bound}); the reset refuses while any stands"
+    )]
+    SignedIntentLive {
+        /// The number of intents without a bound submission.
+        exposed: usize,
+        /// The number of intents with a bound submission.
+        bound: usize,
+    },
     /// The selected network disagrees with authenticated spending state.
     #[error(
         "the profile network disagrees with authenticated spending state. Restore the profile's network, or create a profile under a new name."

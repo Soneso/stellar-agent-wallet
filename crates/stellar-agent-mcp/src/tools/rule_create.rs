@@ -758,17 +758,31 @@ fn open_rule_create_audit_writer(
               propagates it"
 )]
 fn build_write_context_rule_manager(server: &WalletServer) -> Result<ContextRuleManager, SaError> {
+    let now_ms = stellar_agent_core::timefmt::now_unix_ms().map_err(|_| {
+        SaError::IntentRecordUnavailable {
+            class: "policy_unavailable",
+        }
+    })?;
+    let admission =
+        super::submission_record::no_value_admission(server, "stellar_rule_create_commit", now_ms)
+            .map_err(|_| SaError::IntentRecordUnavailable {
+                class: "policy_unavailable",
+            })?;
     let audit_writer = open_rule_create_audit_writer(server)?;
     let timeout = Duration::from_secs(DEFAULT_TIMEOUT_SECONDS);
-    let signers_manager = SignersManager::new(signers_manager_config(
-        &server.context,
-        Arc::clone(&audit_writer),
-        server.profile.audit_log_path.clone(),
-        server.profile_name_for_approval(),
-        timeout,
-    ))?;
+    let signers_manager = SignersManager::new(
+        signers_manager_config(
+            &server.context,
+            Arc::clone(&audit_writer),
+            server.profile.audit_log_path.clone(),
+            server.profile_name_for_approval(),
+            timeout,
+        )
+        .with_intent_admission(Arc::clone(&admission)),
+    )?;
 
     let config = context_rule_manager_config(&server.context, timeout)
+        .with_intent_admission(admission)
         .with_signers_manager(Arc::new(signers_manager))
         .with_audit_writer(audit_writer);
 

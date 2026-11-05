@@ -460,6 +460,7 @@ pub async fn run(args: &MulticallArgs) -> i32 {
         Duration::from_secs(args.timeout_seconds),
         profile_audit_writer,
         &audit_log_path,
+        None,
     ) {
         Ok(manager) => manager,
         Err(e) => {

@@ -145,6 +145,10 @@ impl BundlePerPeriodCapCriterion {
 }
 
 impl Criterion for BundlePerPeriodCapCriterion {
+    fn windowed(&self) -> bool {
+        true
+    }
+
     fn kind(&self) -> &'static str {
         "bundle_per_period_cap"
     }

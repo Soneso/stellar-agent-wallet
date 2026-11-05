@@ -20,7 +20,7 @@ The following commands refuse a mainnet profile with `network.mainnet_write_forb
 The following operations have no structural refusal:
 
 - `smart-account register-multicall` / `smart-account unregister-multicall` accept `mainnet` as a local-registry key.
-- The read-only verbs (`smart-account rules get`, `smart-account rules get-spending-limit`, `smart-account rules list` / `smart-account list-rules`, `smart-account list-verifiers`, `smart-account timelock list-pending`) allow mainnet inspection.
+- The read-only verbs (`smart-account rules get`, `smart-account rules get-spending-limit`, `smart-account rules list` / `smart-account list-rules`, `smart-account list-verifiers`, `smart-account list-intents`, `smart-account timelock list-pending`) allow mainnet inspection.
 - `smart-account rules verify-pins`, `smart-account signers list`, and `smart-account signers refresh` load no signer, sign nothing, and write nothing on chain, so they accept a mainnet profile. They keep their local audit writes. On a persisted profile they need `profile rotate-audit-key` first, and otherwise refuse with `audit.chain_key_unavailable`. The mainnet endpoint rules above still apply.
 
 For the terms used here ([profile](../profiles.md), policy engine, approval
@@ -60,6 +60,10 @@ Every verb that signs a transaction authorized by a rule other than rule `0` che
 Each step runs for every rule before the next step starts, so when several faults coexist the refusal is the earliest step's. The steps share one deadline: an elapse during a baseline read or a comparison refuses with `sa.auth_entry_construction_failed` at stage `baseline_read` or `signer_set_compare`. Rule 0, the bootstrap rule, is exempt from the rule lock, the signer-set check and the pin check; it has no pins, and the submit path never reads a baseline for it. A verb that locks a rule itself, such as a signer verb or `migrate-verifier`, compares that rule before it submits and the submit path does not compare it again.
 
 Nothing is sent when a check refuses. `smart-account multicall` reports the refusal as `sa.multicall_failed` at phase `policy_gate`, naming the inner code. A verb that reads an id from the transaction's return value checks the simulated return value before it signs. `signers add`, `rules add-policy` and `rules create` refuse a value of another shape with `sa.deployment_failed`, and nothing is signed or sent. The add step of `migrate-verifier` reports the same refusal as `sa.verifier_migration_failed` at phase `submit_simulate`. A verb holds a rule's lock through its signing, which can wait on a hardware signer or a passkey, and through its confirmation. A concurrent verb on the same rule then refuses at stage `rule_lock` when its own pre-submit budget ends.
+
+Signing verbs without a value effect count against V1 rate limits under their policy identifier. A charge that cannot be recorded refuses with `submission.intent_record_unavailable` before any signature.
+
+The identifiers are `stellar_smart_account_rules`, `stellar_smart_account_signers`, `stellar_smart_account_migrate_verifier` and `stellar_smart_account_timelock_cancel`.
 
 ### Pinned-hash drift check
 
@@ -630,6 +634,10 @@ Signs and submits.
 Testnet only; structurally refuses `mainnet` before any RPC call or key-material
 access.
 
+Before signing, `execute` sizes the call as an unvalued contract call. A value rule matching `stellar_smart_account_execute` without `allow_opaque_signing` refuses it with `policy.deny.unsizable_value_effect`.
+
+Count limits charge the call as one intent. The charge stays from the first signer call on, a failed call included.
+
 Two distinct signers participate (neither is the other):
 
 - The **rule signer** (`--rule-signer-ed25519-secret-env`) authorizes the smart-account call. It is the agent's own key; it never needs a funded classic account.
@@ -680,6 +688,8 @@ There is currently no MCP tool for this verb; see [MCP: why there is no agent-fa
 ## `smart-account multicall`
 
 Submits an atomic multicall bundle (1 to 50 invocations) through the registered multicall router contract for the target network. Signs and submits. The router address is resolved from the local registry (`<canonical_data_root>/networks.toml`). On a mainnet profile the command refuses with `network.mainnet_write_forbidden` before any registry, writer, or signer access. A signer source is required.
+
+Spending capacity is charged before smart-account authorization signing. A failed re-simulation keeps that charge, and the final transaction reuses it without charging the bundle twice.
 
 Each `--invocation` has the form `<target>:<fn>:<json-args>`. The target is a contract C-strkey, the function is a Soroban symbol, and the arguments are a JSON array.
 
@@ -905,6 +915,19 @@ Each entry of `rules` carries `rule_id`, `name`, `context_type_label`, `signer_c
 stellar-agent smart-account list-rules --account CABC...WXYZ
 ```
 
+### `smart-account list-intents`
+
+Lists the profile's signed smart-account intents from the verified window state. It signs and sends nothing.
+
+| Flag | Description |
+| --- | --- |
+| `--profile <NAME>` | Profile to inspect. |
+| `--output <FORMAT>` | Output format. |
+
+Each entry carries `intent_id`, `status`, `auth_address` redacted to its first and last five characters, `legs`, `greatest_expiration_ledger`, `admitted_at_ms`, `bound_tx_hash` when bound, and `accounting_horizon`.
+
+`accounting_horizon` is `open`: the intent counts against the caps. From its first signer call on, nothing releases it.
+
 ### `smart-account register-multicall`
 
 Registers a deployed multicall router address and its WASM hash in the local registry (`<canonical_data_root>/networks.toml`). State-changing on a local file plus an audit row. Idempotent. Refuses if `--wasm-sha256` does not equal the binary's compiled-in `MULTICALL_WASM_SHA256` (typo and config-plant defence). An existing entry with another digest fails lookup and blocks registration for its network: remove it with `smart-account unregister-multicall` on its normal path, without `--force`, then register.
@@ -960,6 +983,8 @@ Record it immediately: the matching `execute` call requires it, and it cannot
 be recomputed later. `cancel` takes the operation ID from
 `operation_id_full_hex` instead.
 On success the envelope also carries `operation_id_full_hex`.
+
+Scheduling authorizes value: once the delay passes, anyone can execute the operation without a wallet signature. `schedule` is sized as an unvalued contract call under `stellar_smart_account_timelock_schedule`, as `execute` is.
 
 Flags add:
 

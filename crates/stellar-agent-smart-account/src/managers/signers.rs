@@ -490,6 +490,8 @@ pub(crate) type LockedSubmitFuture<'l> = std::pin::Pin<
 #[derive(Clone)]
 #[non_exhaustive]
 pub struct SignersManagerConfig {
+    /// Count admission required by signing operations.
+    pub intent_admission: Option<Arc<stellar_agent_network::NoValueAdmission>>,
     /// Primary Soroban RPC URL.
     pub primary_rpc_url: String,
 
@@ -527,6 +529,7 @@ pub struct SignersManagerConfig {
 impl std::fmt::Debug for SignersManagerConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let Self {
+            intent_admission: _,
             primary_rpc_url,
             secondary_rpc_url,
             audit_writer: _,
@@ -556,6 +559,16 @@ impl std::fmt::Debug for SignersManagerConfig {
 }
 
 impl SignersManagerConfig {
+    /// Supplies the checked count admission for signing operations.
+    #[must_use]
+    pub fn with_intent_admission(
+        mut self,
+        admission: Arc<stellar_agent_network::NoValueAdmission>,
+    ) -> Self {
+        self.intent_admission = Some(admission);
+        self
+    }
+
     /// Constructs a new `SignersManagerConfig`.
     ///
     /// Logs a warning if `primary_rpc_url == secondary_rpc_url`, because the
@@ -595,6 +608,7 @@ impl SignersManagerConfig {
             );
         }
         Self {
+            intent_admission: None,
             primary_rpc_url,
             secondary_rpc_url,
             audit_writer,
@@ -644,6 +658,7 @@ impl SignersManagerConfig {
 ///   the active signer set to guard against configurations where the threshold
 ///   exceeds the number of available signers.
 pub struct SignersManager {
+    intent_admission: Option<Arc<stellar_agent_network::NoValueAdmission>>,
     primary_rpc_url: String,
     secondary_rpc_url: String,
     audit_writer: Arc<Mutex<AuditWriter>>,
@@ -697,6 +712,7 @@ impl SignersManager {
         let secondary_rpc_client = StellarRpcClient::new(&config.secondary_rpc_url)
             .map_err(|e| mk_err(&config.secondary_rpc_url, &e))?;
         Ok(Self {
+            intent_admission: config.intent_admission,
             primary_rpc_url: config.primary_rpc_url,
             secondary_rpc_url: config.secondary_rpc_url,
             audit_writer: config.audit_writer,
@@ -7558,6 +7574,13 @@ impl SignersManager {
         let contract_strkey = scaddress_to_strkey(&contract)?;
         let auth_address_strkey = scaddress_to_strkey(auth_address)?;
 
+        let admission = self
+            .intent_admission
+            .as_ref()
+            .ok_or(SaError::IntentRecordUnavailable {
+                class: "missing_admission",
+            })?;
+
         // Build the pre-form HostFunction from the entrypoint + args.
         let function_name =
             ScSymbol::try_from(entrypoint).map_err(|e| SaError::AuthEntryConstructionFailed {
@@ -7580,6 +7603,7 @@ impl SignersManager {
 
         crate::submit::submit_signed_invoke(
             crate::submit::SubmitInvokeArgs::builder()
+                .admission(stellar_agent_network::SigningAdmission::NoValue(admission))
                 .target_contract(&contract_strkey)
                 // auth_address differs from target_contract when the entrypoint's
                 // require_auth credential is a different address; pass it
@@ -10959,6 +10983,9 @@ pub(crate) mod tests {
         });
         crate::submit::submit_signed_invoke(
             crate::submit::SubmitInvokeArgs::builder()
+                .admission(stellar_agent_network::SigningAdmission::NoValue(
+                    crate::signing::intent_test_helpers::no_value_admission(),
+                ))
                 .target_contract(LOCK_TEST_ACCOUNT)
                 .auth_rule_ids(&rule_ids)
                 .host_function(host_function)

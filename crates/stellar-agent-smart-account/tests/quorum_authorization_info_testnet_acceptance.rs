@@ -4,10 +4,10 @@
 //!
 //! - 2-of-3 quorum success.  Deploys a C-account with 3 G-key signers
 //!   at a 2-of-3 threshold rule; invokes `execute` via
-//!   [`collect_quorum_signatures`] with 2 qualifying signers; asserts the
+//!   [`plan_quorum_signatures`] with 2 qualifying signers; asserts the
 //!   transaction is accepted by the on-chain `__check_auth`.
 //!
-//! - 1-of-3 quorum failure (offline).  A [`collect_quorum_signatures`]
+//! - 1-of-3 quorum failure (offline).  A [`plan_quorum_signatures`]
 //!   call with only 1 signer against a 2-of-3 `AuthorizationInfo` returns
 //!   `QuorumError::GroupNotSatisfiedInAndCombinator` before any RPC round-trip.
 //!   The offline path asserts fail-closed semantics without a live contract
@@ -30,7 +30,7 @@
 //!
 //! The OpenZeppelin smart-account contract's on-chain `__check_auth` enforces
 //! the threshold at invocation time.  This test verifies the wallet-side
-//! `collect_quorum_signatures` produces entry sets that pass `__check_auth`.
+//! `plan_quorum_signatures` produces entry sets that pass `__check_auth`.
 //! Threshold orchestration is wallet-side only; the on-chain contract performs
 //! per-signer auth checks, not off-chain quorum collection.
 //!
@@ -62,7 +62,7 @@ use stellar_agent_smart_account::managers::auth_entry::test_helpers::{
     baseline_authorization_simulation, matching_envelope_context,
 };
 use stellar_agent_smart_account::managers::authorization::{
-    AuthorizationInfo, Combinator, QuorumError, SignerGroup, collect_quorum_signatures,
+    AuthorizationInfo, Combinator, QuorumError, SignerGroup, plan_quorum_signatures,
 };
 use stellar_agent_smart_account::managers::rules::RuleContext;
 use stellar_agent_smart_account::managers::rules::{
@@ -480,7 +480,7 @@ async fn install_multisigner_threshold_rule(
 
 // ── Offline quorum fail-closed (no RPC) ─────────────────────────────────
 
-/// `collect_quorum_signatures` returns
+/// `plan_quorum_signatures` returns
 /// `QuorumError::GroupNotSatisfiedInAndCombinator` when fewer than `threshold`
 /// qualifying signers are provided. This test runs offline (no network).
 ///
@@ -515,7 +515,7 @@ async fn q2_insufficient_signers_fails_before_rpc() {
     // Use test_helpers builders to construct the non_exhaustive simulation and
     // envelope types without struct literals; #[non_exhaustive] types cannot be
     // constructed via struct expressions in integration tests outside the crate.
-    // The simulation data is irrelevant here — collect_quorum_signatures returns
+    // Planning returns before reading the simulation data. It returns
     // InsufficientSignersInGroup before build_authorization_entry is called.
     let simulation = baseline_authorization_simulation(TESTNET_PASSPHRASE, CHAIN_ID, vec![rule_id]);
     let envelope = matching_envelope_context(&simulation);
@@ -525,7 +525,7 @@ async fn q2_insufficient_signers_fails_before_rpc() {
         .check_signing_rules(&auth_scaddr, &[rule_id], "quorum-capacity")
         .await
         .unwrap();
-    let result = collect_quorum_signatures(
+    let result = plan_quorum_signatures(
         checked,
         &authz,
         &signers,
@@ -570,7 +570,7 @@ async fn q2_insufficient_signers_fails_before_rpc() {
 /// Deploys a C-account, installs a 2-of-3 threshold rule
 /// with three G-key signers, then:
 ///
-/// - invokes `set_threshold` via `collect_quorum_signatures` with
+/// - invokes `set_threshold` via `plan_quorum_signatures` with
 ///   2 signers; asserts the transaction is confirmed.
 /// - exercises the `SubmitInvokeArgs::authorization` path in
 ///   `submit_signed_invoke` for the same invocation shape.
@@ -697,6 +697,9 @@ async fn q1_and_q3_two_of_three_quorum_invocation_accepted() {
 
     let result = submit_signed_invoke(
         SubmitInvokeArgs::builder()
+            .admission(stellar_agent_network::SigningAdmission::NoValue(
+                stellar_agent_smart_account::signing::intent_test_helpers::no_value_admission(),
+            ))
             .target_contract(&sa_strkey)
             // auth_address: omit → defaults to None (uses target_contract)
             .auth_rule_ids(rule_ids.as_slice())

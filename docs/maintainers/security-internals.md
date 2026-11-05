@@ -1186,11 +1186,31 @@ Stateful spending criteria read amounts and counts from `PolicyStateStore`. Conf
 - **Mainnet rule**: in a build with mainnet writes, a mainnet profile's store that cannot be verified refuses every read and write with `policy.window_state_unverifiable`, naming the defect: a missing file with a committed generation, a missing or unusable key beside an existing file, a malformed file, an HMAC mismatch, or a generation mismatch. No write mints a key or a file over such a state. A missing file with no committed generation is a genuine first run. No verb recovers such state in this release; create a profile under a new name. A verifiable store that still holds an effective open or claimed mainnet authorization refuses the reset with `profile.reset_window_state_open_authorizations` and changes nothing; expiry releases unclaimed holds and retains claimed spend in memory, and nothing is written before the audit row. Testnet profiles and builds without mainnet writes also refuse unverifiable history.
 - **Rotation**: `stellar-agent profile rotate-policy-state-key <name>` first verifies an existing store file's tag under the old key. It refuses the rotation, changing nothing, when the tag does not verify or the file exists without a minted old key. It then mints a fresh key and re-signs the store file's existing body under it. The re-sign itself needs no old key. This is the same "recompute the tag over the unchanged body" shape as `rotate-audit-key`'s chain-root sidecar re-sign, so accumulated history survives rotation.
 
+A snapshot carrying a signed intent record or an intent link uses version 9, which older builds refuse.
+
+Smart-account signing admits its intent before the first signature. Admission rereads the protected generation under the window lock and counts every live intent against the caps.
+
+Admission takes a checked sizing from the policy engine. The sizing names measured value, no value, an unvalued call that passes every value rule, or no applicable limit. Empty entries alone admit nothing.
+
+An engine without checked sizing refuses every signing admission. An unvalued call under a value rule without `allow_opaque_signing` refuses with `policy.deny.unsizable_value_effect` before any signature.
+
+One authority keeps one intent identifier whatever its sizing. Admitting it again with other legs refuses with `submission.intent_binding_mismatch`, and the original charge stays.
+
+A refused admission signs and sends nothing. An in-process refusal before the first signer call cancels the admission. From that call on the charge stays, the failed call included.
+
+A signed intent counts from admission under its intent identifier, across window durations. From the first signer call on, nothing releases it: envelope cancellation, unwinding, reconciliation, accounting expiry and operator clears leave it unchanged.
+
 Stateful criteria derive window entries from the same `ValueEffects` used by evaluation and audit. Submission identity, chain scope, and the signed execution bound live in authenticated window state. Duplicate reservations refuse under the store lock.
 
 For bounded exposure, accounting starts at the later of the signed deadline and the first success observation. Each bucket adds its admitted duration with saturating arithmetic. Missing deadlines retain capacity indefinitely. Repeated reports cannot change the first observation. Endpoint timestamps remain reports.
 
 Checked accounting decisions bind the chain, reservation, generation, and evidence. Proven pre-exposure cancellation, conservative expiry, and explicit operator override have separate transitions. Raw deletion is private. Accounting expiry commits its debit transition and owed event together. Receipt projection follows the commit.
+
+The signing gate permits only the subject, signer and payload of each signing the admitted plan names. Another credential, digest, signer or envelope refuses with `submission.intent_binding_mismatch` before its signer runs.
+
+Final submission binds the envelope to its admitted intent. The recorder recomputes chain, invocation, envelope source and sequence, authorization subjects, nonces, expirations, rule identifiers, signer descriptors and legs, and refuses any difference.
+
+The bound envelope's reservation records carry the intent identifier and count nothing themselves. A repeated bind changes nothing, and a resend of the same bytes refuses as `submission.tx_already_submitted`.
 
 Delivery holds the writer guard, verifies retained history, and appends only when the decision identifier is absent. A second authenticated commit acknowledges delivery.
 
@@ -1276,6 +1296,8 @@ refuses with `profile.reset_window_state_signature_invalid`. A newer authenticat
 reset with `profile.reset_window_state_newer_version`; use a build that
 understands it.
 
+Reset also refuses while a signed intent stands, with `submission.record_unavailable`, and changes nothing.
+
 ### Operator authorization logs
 
 Each reported authorization refusal emits one warn-level entry with `path`,
@@ -1306,7 +1328,7 @@ submission outcomes require reconciliation instead.
 
 ### Injected views fail closed when absent
 
-Several criteria need state the core crate cannot fetch itself (account reserves, identity, counterparty cache, SEP-10/SEP-45 sessions, quorum). The optional views on `EvalContext` are `AccountReservesView`, `AccountIdentityView`, `CounterpartyCacheView`, `Sep10SessionView`, `Sep45SessionView`, and `QuorumView`. They keep core independent of the network and smart-account crates. `stellar-agent-network::policy_view` provides the account adapters used by CLI and MCP handlers, and `network::counterparty` provides the cache snapshot. Shipped dispatch paths populate no session or quorum views, so criteria requiring them refuse. When a configured criterion's required view is `None`, the criterion returns `Err(PolicyError::CriterionEvaluationFailed)` rather than silently passing: `minimum_reserve` with no `account_view`, `sep10_session_active` with no session view, and `home_domain_resolved` with no counterparty cache all fail closed. `AccountIdentityView` is deliberately a separate trait with no default methods so a missing `home_domain` cannot become a silent allow.
+Several criteria need state the core crate cannot fetch itself (account reserves, identity, counterparty cache, SEP-10/SEP-45 sessions, quorum). The optional views on `EvalContext` are `AccountReservesView`, `AccountIdentityView`, `CounterpartyCacheView`, `Sep10SessionView`, `Sep45SessionView`, and `QuorumView`. They keep core independent of the network and smart-account crates. `stellar-agent-network::policy_view` provides the account adapters used by CLI and MCP handlers, and `network::counterparty` provides the cache snapshot. Shipped dispatch paths populate no session or quorum views, so criteria requiring them refuse. When a configured criterion's required view is `None`, the criterion returns `Err(PolicyError::CriterionEvaluationFailed)` rather than silently passing: `minimum_reserve` with no `account_view`, `sep10_session_active` with no session view, and `home_domain_resolved` with no counterparty cache all fail closed. `minimum_reserve` denies a call whose value it cannot size with `policy.deny.unsizable_value_effect` before it reads the account view. `AccountIdentityView` is deliberately a separate trait with no default methods so a missing `home_domain` cannot become a silent allow.
 
 ### HOME_DOMAIN allowlist verification
 
@@ -1514,6 +1536,8 @@ Signing the digest rather than the raw `signature_payload` closes the rule-id do
 ### Signed invocation tree
 
 The digest covers the invocation tree inside `signature_payload`. Address credentials are not bound to a transaction, so whoever holds a signed entry can submit it in a transaction of its own until the signature expiration ledger. The rule ids do not narrow the tree either: under an OpenZeppelin `Default` rule, such as the bootstrap rule 0 the DeFi adapters sign under, `__check_auth` accepts any context. The tree the wallet signs therefore comes from the wallet, not from the RPC.
+
+The wallet therefore charges a smart-account intent durably before its first signature. A failed re-simulation or send leaves that charge in place.
 
 `submit_signed_invoke` (`crates/stellar-agent-smart-account/src/submit.rs`) requires the simulated root invocation of the wallet's entry to equal the caller's host function in contract, function name, and every argument. The sub-invocations under it must match the caller's `DeclaredSubInvocations`:
 

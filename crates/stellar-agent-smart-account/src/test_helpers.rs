@@ -57,6 +57,9 @@ pub fn signers_manager_for_tests(
         timeout,
         TEST_CHAIN_ID.to_owned(),
     );
+    let config = config.with_intent_admission(Arc::new(
+        crate::signing::intent_test_helpers::no_value_admission_owned(),
+    ));
     Arc::new(SignersManager::new(config).expect("SignersManager::new accepts the test URLs"))
 }
 
@@ -81,6 +84,9 @@ pub fn rule_manager_config_for_tests(
         timeout,
         TEST_CHAIN_ID.to_owned(),
     )
+    .with_intent_admission(Arc::new(
+        crate::signing::intent_test_helpers::no_value_admission_owned(),
+    ))
     .with_signers_manager(signers_manager)
     .with_audit_writer(audit_writer);
     match secondary_rpc_url {

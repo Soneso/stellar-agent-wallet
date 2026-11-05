@@ -58,8 +58,7 @@ use stellar_baselib::transaction_builder::{TransactionBuilder, TransactionBuilde
 use stellar_rpc_client::Client;
 use stellar_xdr::{
     HostFunction, InvokeContractArgs, InvokeHostFunctionOp, Operation, OperationBody, ScAddress,
-    ScVal, SorobanAuthorizationEntry, SorobanAuthorizedFunction, SorobanAuthorizedInvocation,
-    SorobanCredentials, VecM,
+    ScVal, SorobanAuthorizedFunction, SorobanAuthorizedInvocation, SorobanCredentials, VecM,
 };
 use tracing::info;
 
@@ -70,7 +69,9 @@ use crate::managers::auth_entry::{
     bound_pre_submit_stage, build_authorization_entry_with_sub_invocations,
     collect_mixed_signer_entries_within_budget, complete_authorization_entry_within_budget,
 };
-use crate::managers::authorization::{QuorumFailure, collect_quorum_signatures_within_budget};
+use crate::managers::authorization::{
+    QuorumFailure, plan_quorum_signatures_within_budget, sign_quorum_plan_within_budget,
+};
 use crate::managers::rules::{
     BASE_FEE_STROOPS, ExpiryCheck, HorizonCheck, SimulationErrorClass,
     build_and_sign_delegated_g_key_entry, build_signed_invoke_envelope, chain_id_fingerprint,
@@ -91,10 +92,16 @@ use crate::signing::divergence::{
     AuthContextFingerprint, EnvelopeContext, FeeEnvelopeContext, NetworkContext, SequenceContext,
     SimulationContext,
 };
+use crate::signing::gate::{SignerMatch, SigningGate, SigningRequest};
 use crate::signing::ledger_witness::{
     ResolvedKeySigner, WitnessRequest, WitnessedLedgerBound, checked_secondary_rpc_url,
     witness_signing_ledger,
 };
+use stellar_agent_network::{
+    AuthSubject, IntentSubject, SignedIntentPlan, SignerDescriptor, SigningAdmission,
+    SigningPayload,
+};
+use stellar_xdr::{ReadXdr as _, WriteXdr as _};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // MulticallCheck
@@ -299,7 +306,9 @@ pub struct PinCheck<'a> {
 /// let proof = CheckedSigningRules::new();
 /// ```
 ///
-/// and cannot be cloned:
+/// Code outside this crate cannot construct or clone it.
+/// The quorum signer copies it once per planned group, so each group
+/// consumes its own copy of the same checked rules.
 ///
 /// ```compile_fail
 /// use stellar_agent_smart_account::submit::CheckedSigningRules;
@@ -313,6 +322,14 @@ pub struct CheckedSigningRules {
 }
 
 impl CheckedSigningRules {
+    pub(crate) fn for_planned_signing(&self) -> Self {
+        Self {
+            smart_account: self.smart_account.clone(),
+            network_id: self.network_id,
+            rule_ids: self.rule_ids.clone(),
+        }
+    }
+
     pub(crate) fn check_binding(
         &self,
         smart_account: &ScAddress,
@@ -807,12 +824,9 @@ pub struct SubmitInvokeArgs<'a> {
 
     /// Quorum authorization declaration (`None` for single-signer callers).
     ///
-    /// When `Some`, `submit_signed_invoke` uses
-    /// [`collect_quorum_signatures`](crate::managers::authorization::collect_quorum_signatures)
-    /// to produce the full `SorobanAuthorizationEntry` set from the multi-signer
-    /// group declaration and ignores [`Self::signer`] for auth-entry signing.
-    /// When `None`, the original single-signer path via [`Self::signer`] is
-    /// used unchanged.
+    /// The quorum path plans its selected signers and nonces, admits that plan,
+    /// and calls `sign_quorum_plan` through its signing gate.
+    /// The single-signer path uses [`Self::signer`] for authorization entries.
     ///
     /// # Fail-closed invariant
     ///
@@ -866,15 +880,9 @@ pub struct SubmitInvokeArgs<'a> {
     /// other than the DeFi adapter submit paths leaves this unset.
     pub sequence_floor: Option<&'a dyn stellar_agent_network::SequenceFloorHook>,
 
-    /// Durable-submission recorder (see
-    /// `stellar_agent_network::submission_record::SubmissionRecorder`).
-    ///
-    /// When `Some`, the signed transaction is recorded as sent with an unknown
-    /// outcome immediately before `sendTransaction`, and that record is settled
-    /// against what the network answered. `None` (the default) reproduces the
-    /// unrecorded submit behaviour — administration verbs and deployment
-    /// stages, which move no operator-capped value, leave this unset.
-    pub submission_recorder: Option<&'a dyn stellar_agent_network::SubmissionRecorder>,
+    /// The admission capability that charges this intent before its first signature.
+    /// `Recorded` binds the final envelope to the charge; `NoValue` charges count limits only.
+    pub admission: SigningAdmission<'a>,
 
     /// Pinned-hash drift check inputs; see [`PinCheck`].
     ///
@@ -921,137 +929,64 @@ pub struct SubmitInvokeArgs<'a> {
 // submit_signed_invoke
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Seven-stage signed `InvokeHostFunction` submission with optional pre-flight
-/// checks.
+/// Submits a signed invocation through checked intent admission.
 ///
-/// Extracted from `ContextRuleManager::submit_signed_invoke` (rules.rs) and
-/// `SignersManager::submit_signed_invoke` (signers.rs). The two instance methods
-/// become thin delegating wrappers that call this free function.
-///
-/// A mainnet `network_passphrase` or a mainnet-pattern `primary_rpc_url` is
-/// refused with [`SaError::MainnetWriteForbidden`] before any signing call and
-/// any request. A submission without a usable `secondary_rpc_url` is refused
-/// with [`SaError::LedgerWitnessUnavailable`] right after that check: every
-/// signature rests on an independent ledger observation.
+/// Mainnet refuses before any key access or request. Every signature requires
+/// an independent ledger observation through a usable secondary endpoint.
 ///
 /// # Step ordering
 ///
-/// 1. **Pre-flight**: argument guards, the mainnet refusal of
-///    [`stellar_agent_network::refuse_mainnet_write`], the local check of the
-///    witness configuration, then, for every
-///    distinct non-zero rule in `auth_rule_ids` in ascending order and under
-///    one pre-submit deadline (see [`PinCheck`]):
-///    1. the rule locks: acquired here when the caller holds none, or found
-///       in the held-lock context a signers-manager verb supplies;
-///    2. the signer-set baseline read, with no RPC;
-///    3. the pinned-hash drift check;
-///    4. the signer-set comparison through both endpoints;
+/// 1. Check arguments, the network, and the witness configuration. Acquire
+///    each nonzero rule's lock in ascending order under one submission deadline.
+///    Verify its signer baseline, pinned hashes, and signer set before fetching
+///    the source account. Rule zero needs no baseline, pins, or rule lock.
+/// 2. Simulate the invocation and check the expected return shape. Obtain the
+///    ledger witness, enforce required checks, and compare both endpoints where
+///    the caller requires a multicall check.
+/// 3. Validate the simulated invocation against the wallet's declared tree.
+///    Resolve keys, refresh the witness when necessary, and repeat rule checks.
+///    The signature expiration is 100 ledgers beyond the lower observation.
+/// 4. Build every partial, choose the quorum, and freeze delegated nonces.
+///    Build the complete intent plan, admit it, and immediately construct its
+///    signing gate. Recheck witness freshness after admission.
+/// 5. Sign the frozen plan through the gate. Every signature authorizes its
+///    subject, signer, and payload before the signer future exists. Quorum
+///    signing resolves the planned keys without selecting another quorum.
+/// 6. Simulate again with signed authorization, then build the final envelope.
+///    The gate checks that envelope before its signature. Release rule locks,
+///    bind recorded exposure, link the pending reservation, and send before
+///    the submission deadline. Confirmation polling uses its own timeout.
+/// 7. Return the transaction hash, ledger, and contract return value.
 ///
-///    then the source-account fetch. Rule 0, the bootstrap rule, is exempt
-///    from the rule lock, the signer-set check and the pin check; it has no
-///    pins, and the submit path never reads a baseline for it. A submission
-///    under rule 0 only may pass `pin_check: None`; any other submission
-///    without a check is refused before network I/O. The locks acquired here
-///    are released immediately before the send.
-/// 2. **Simulate**: primary RPC. With `expected_return` set, the first
-///    simulated result must have the shape the caller reads an id from;
-///    another shape refuses before signing.
-/// 3. **Ledger witness**: mandatory on every submission. Both endpoints
-///    observe the latest ledger under the pre-submit deadline, and the pair
-///    must agree within
-///    [`MAX_SIGNING_LEDGER_SKEW`](crate::signing::ledger_witness::MAX_SIGNING_LEDGER_SKEW).
-///    The bound rests on at least one endpoint reporting the chain honestly.
-///    **Required-check enforcement + `Option<*Check>` dispatch**: for each
-///    name in `args.required_checks`, the corresponding `Option<*Check>` MUST
-///    be `Some`. Refuses with [`SaError::SubmitCheckMissing`] if `None`.
-///    Then dispatches each present `Some(_)` check; first `Deny` → return
-///    typed error. The horizon limit is measured from the lower member of the
-///    witnessed pair, and a rule must still be valid at the higher one.
-/// 4. **Cross-RPC simulate check**: the multicall path compares both
-///    endpoints' contract hash and simulation here, beside the ledger
-///    witness. A single invocation passes `multicall_check: None` and has no
-///    such step.
-/// 5. **Sign**: the signed-tree binding first: the simulated root invocation
-///    must equal `host_function` in contract, function name and every
-///    argument, and its sub-invocations must match `sub_invocations` (see
-///    [`DeclaredSubInvocations`]). Every signer key the signing needs is read
-///    next; a witness pair gone stale by then is read again as a pair and the
-///    rule checks repeat against it. The pair must be fresh and the deadline
-///    open at the signing boundary, with no key lookup after that check; the
-///    signature expiry is 100 ledgers beyond the lower member. Every signer
-///    call from there on runs under the pre-submit deadline, so a signature
-///    that finishes after it is cut and nothing further is signed or sent.
-///    Then the auth entry over the wallet's
-///    own root and the accepted subtree via
-///    `build_authorization_entry_with_sub_invocations` +
-///    `complete_authorization_entry` + delegated G-key entry.
-/// 6. **Submit**: `resimulate_with_signed_auth` + `build_signed_invoke_envelope`
-///    + `attach_signature` + `submit_transaction_and_wait`.
-/// 7. **Return**: `Ok(SubmitInvokeResult { return_val, tx_hash, ledger })`.
+/// A refusal before the first successful gate authorization cancels the
+/// unexposed admission. From that authorization on, every failure retains its
+/// charge, including signer, simulation, binding, and send failures.
+/// `SigningAdmission::NoValue` retains count charges without binding an envelope.
 ///
-/// # Audit-emission discipline
+/// # Audit emission
 ///
-/// This function does NOT emit any `Sa*` audit rows. Audit emission is
-/// caller-side: the caller's `Err(err)` match arm emits the appropriate
-/// domain-specific row via `sa_error_to_invocation_result` + `SaRawInvocation`.
+/// The caller emits domain audit rows through its invocation result mapping.
+/// This function emits no smart account audit event.
 ///
 /// # Errors
 ///
-/// - [`SaError::MainnetWriteForbidden`]: `network_passphrase` is the mainnet
-///   passphrase or `primary_rpc_url` matches a mainnet host pattern, or the
-///   submit layer refused the endpoint as serving mainnet.
-/// - [`SaError::SignerSetMissingBaseline`]: a checked rule has no signer-set
-///   state row.
-/// - [`SaError::SignerSetDiverged`] / [`SaError::NetworkRpcDivergence`]: a
-///   checked rule's signer set differs from its state row, or the two
-///   endpoints disagree on it.
-/// - [`SaError::AuditLog`]: the baseline read met an audit-log integrity
-///   error.
-/// - [`SaError::VerifierHashDrift`] / [`SaError::PolicyHashDrift`]: a live
-///   verifier or policy of a checked rule differs from the rule's pin record.
-/// - [`SaError::PinnedPolicyAbsent`]: a checked rule's pin record holds
-///   policy pins while the rule has no policy on chain.
-/// - [`SaError::PinnedVerifierAbsent`]: a checked rule holds a live
-///   `External` signer while its pin record pins no verifier.
-/// - [`SaError::WasmPinIncomplete`]: a checked rule's pin record holds
-///   eight-byte hash prefixes.
-/// - [`SaError::PinCheckUnavailable`]: the drift check of a rule could not
-///   run to a verdict.
-/// - [`SaError::SubmitCheckMissing`] — a name in `required_checks` maps to a
-///   `None` `Option<*Check>` field.
-/// - [`SaError::LedgerWitnessUnavailable`]: the secondary endpoint is absent,
-///   malformed, on the primary's host, on another network or unreachable, the
-///   primary gives no observation, the pair stays stale, or the deadline
-///   elapsed. Nothing was signed.
-/// - [`SaError::LedgerWitnessMismatch`] (wire code
-///   `simulation.divergence.ledger_skew`): the pair differs by more than the
-///   skew tolerance, a height is out of bounds, or the simulation height
-///   contradicts the pair. Nothing was signed.
-/// - [`SaError::HorizonExceeded`]: `valid_until` minus the lower witnessed
-///   ledger exceeds `max_horizon`.
-/// - [`SaError::RuleExpired`]: `valid_until` is below the higher witnessed
-///   ledger for the expiry check rule_id.
-/// - [`SaError::AuthEntryConstructionFailed`]: an argument guard refused
-///   (stages `"pin_check_required"`, `"migrating_rule_mismatch"`,
-///   `"rule_locks_without_pin_check"`, `"multicall_check_undeclared"`,
-///   `"ed25519_rule_signer_quorum_guard"`), a held-lock context lacks a
-///   checked rule (`"rule_lock_missing"`), a rule lock was not acquired
-///   within the deadline (`"rule_lock"`), the deadline elapsed during a
-///   baseline read or a comparison (`"baseline_read"`,
-///   `"signer_set_compare"`), or a pubkey fetch, XDR encoding, simulate, or
-///   auth-entry construction failure, or another pre-submit stage exceeding
-///   the collective pre-submit deadline (`args.timeout`).
-/// - [`SaError::DeploymentFailed`]: simulate error, a simulated return
-///   value of another shape than `expected_return`, envelope build, or
-///   submission failure.
-/// - [`SaError::SimulationDivergence`] with sub-code `AuthContexts` (wire code
-///   `simulation.divergence.auth_contexts`): the simulated root invocation
-///   differs from `host_function`, or its sub-invocations fall outside
-///   `sub_invocations`. Raised before anything is signed.
-/// - [`SaError::RuleIdMismatch`] / [`SaError::SimulationDivergence`] — from
-///   [`build_authorization_entry_with_sub_invocations`], whose divergence
-///   check compares the node fingerprints of the simulated tree with those of
-///   the signed tree.
+/// - [`SaError::MainnetWriteForbidden`] refuses a mainnet network or endpoint.
+/// - Baseline, pin, and signer comparison errors preserve their typed codes.
+/// - [`SaError::SubmitCheckMissing`] refuses an absent required check.
+/// - [`SaError::LedgerWitnessUnavailable`] refuses unavailable or stale
+///   observations and an elapsed deadline before signing.
+/// - [`SaError::LedgerWitnessMismatch`] refuses inconsistent ledger observations.
+/// - [`SaError::HorizonExceeded`] and [`SaError::RuleExpired`] refuse rule timing.
+/// - [`SaError::PolicyDenied`] preserves the admission criterion's denial.
+/// - [`SaError::IntentRecordUnavailable`] refuses unavailable checked admission.
+/// - [`SaError::IntentBindingMismatch`] refuses an authority or envelope outside
+///   the admitted plan. Existing exposed charges remain.
+/// - [`SaError::AuthEntryConstructionFailed`] reports argument, rule lock, key,
+///   encoding, signing, and submission deadline failures.
+/// - [`SaError::DeploymentFailed`] reports simulation, return shape, envelope,
+///   and submission failures.
+/// - [`SaError::SimulationDivergence`] refuses an invocation outside the declared
+///   tree. [`SaError::RuleIdMismatch`] refuses inconsistent rule identifiers.
 #[allow(
     clippy::too_many_lines,
     reason = "seven-stage flow; splitting across multiple functions would obscure \
@@ -1567,54 +1502,19 @@ pub async fn submit_signed_invoke(
         signature_expiration_ledger,
     };
 
-    // ── Step 5: Sign ──────────────────────────────────────────────────────────
-    // Two paths: quorum (args.authorization.is_some()) and single-signer.
-    //
-    // Quorum path (when args.authorization.is_some()):
-    //   collect_quorum_signatures iterates over the AuthorizationInfo groups,
-    //   resolves qualifying signers from args.signers, and returns the flat
-    //   SorobanAuthorizationEntry set (one entry + one delegated G-key entry
-    //   per qualifying signer).  The envelope-signing key (args.signer) is
-    //   separate and always signs the outer transaction envelope.
-    //
-    // Single-signer path:
-    //   Build the partial auth entry over `signed_root` (refusal-path checks
-    //   fire here), then sign it with the Delegated G-key or the
-    //   External-Ed25519 rule signer.
-    //
-    // The signing boundary: the last await before the first signature lies
-    // above. The signers answer from keys resolved before this freshness
-    // check. The pair must still be fresh and the deadline open here.
-    //
-    // Every signer call below, on each arm, runs under the same deadline
-    // (`sign_within_budget`): a signature that finishes after it is cut, and
-    // nothing further is signed or sent.
     ledger_bound.ensure_fresh(pre_submit_budget)?;
-
-    let auth_entries: Vec<SorobanAuthorizationEntry> = if let Some(authz) = args.authorization {
-        // ── Quorum path ───────────────────────────────────────────────────────
-        //
-        // Wallet-entrypoint guard:
-        //
-        // `collect_quorum_signatures` builds the root invocation with the
-        // wallet (`auth_scaddr`) as its contract and no sub-invocations, the
-        // shape of an OZ wallet entrypoint. A host function on another
-        // contract (a Soroswap router, a DeFindex vault) or an accepted
-        // subtree would make that digest cover a tree other than the one
-        // on-chain `__check_auth` re-hashes, so the quorum path refuses both
-        // before anything is signed.
+    // Every partial and delegated nonce is fixed before admission.
+    let (quorum_plan, single_plan, subjects) = if let Some(authz) = args.authorization {
         if invoke.contract_address != auth_scaddr || !signed_root.sub_invocations.is_empty() {
             return Err(SaError::AuthEntryConstructionFailed {
                 stage: "quorum_external_contract_guard",
                 redacted_reason: format!(
-                    "{}: the quorum path signs the wallet's own entrypoints only; \
-                     the host function targets a contract other than the wallet \
-                     smart-account or the simulated tree carries sub-invocations",
+                    "{}: the quorum path signs the wallet's own entrypoints only. The host function targets a contract other than the wallet smart-account or the simulated tree carries sub-invocations",
                     args.op_label
                 ),
             });
         }
-        collect_quorum_signatures_within_budget(
+        let quorum = plan_quorum_signatures_within_budget(
             checked_rules,
             authz,
             &quorum_signer_refs,
@@ -1629,31 +1529,10 @@ pub async fn submit_signed_invoke(
             Some(pre_submit_budget),
         )
         .await
-        .map_err(|failure| match failure {
-            QuorumFailure::Deadline(error) => error,
-            QuorumFailure::Quorum(e) => SaError::AuthEntryConstructionFailed {
-                stage: "quorum_signatures",
-                redacted_reason: format!("{}: quorum collection failed: {}", args.op_label, e),
-            },
-        })?
+        .map_err(|failure| quorum_failure_error(failure, args.op_label))?;
+        let subjects = quorum.intent_subjects();
+        (Some(quorum), None, subjects)
     } else {
-        // ── Single-signer path ────────────────────────────────────────────────
-        //
-        // External-contract single-signer pattern:
-        //
-        // On-chain `__check_auth` verifies the digest against the invocation
-        // that called `require_auth()`. For an external contract (e.g. the
-        // Soroswap router) that invocation is
-        // `router.swap_exact_tokens_for_tokens(args)`, not `wallet.fn(args)`,
-        // so the root of the signed tree is the host function's own contract,
-        // function and arguments (`signed_root`, bound to the simulation
-        // above), with the accepted subtree under it.
-        //
-        // The builder takes one address for both the root contract and the
-        // credential address; `partial.smart_account` is then set to
-        // `auth_scaddr` so the final `SorobanCredentials::Address` names the
-        // wallet. For OZ wallet entrypoints the two are the same address and
-        // the assignment changes nothing.
         let mut partial: PartialSorobanAuthorizationEntry =
             build_authorization_entry_with_sub_invocations(
                 invoke.contract_address.clone(),
@@ -1665,83 +1544,154 @@ pub async fn submit_signed_invoke(
                 signed_root.sub_invocations.clone(),
             )
             .await?;
-        // The credential MUST identify the wallet, not the external contract.
-        // This applies identically to both signing arms below: the credential
-        // address is orthogonal to which OZ `Signer` variant authenticates it.
         partial.smart_account = auth_scaddr.clone();
-
-        // Route on `ed25519_rule_signer`: External-Ed25519 (no G-key
-        // sub-entry, authenticated inside `VerifierClient::verify`) vs the
-        // default Delegated G-key path (nested `require_auth_for_args`
-        // satisfied by a separate G-key entry).  See `Ed25519RuleSigner`'s
-        // rustdoc for the on-chain rationale.
-        if let Some((resolved, verifier)) = &rule_signer {
-            // External-Ed25519 arm: sign via the crate-internal mixed-signer
-            // collector with a single descriptor.  Reuses the SAME
-            // `collect_mixed_signer_entries` substrate the quorum path uses
-            // for heterogeneous signer sets (auth_entry.rs), so the
-            // `AuthPayload` ScVal shape and the "no G-key for External"
-            // omission are covered by that function's own offline tests.
-            let mixed_signers = [crate::managers::auth_entry::MixedSigner {
-                signer: resolved,
-                kind: crate::managers::auth_entry::MixedSignerKind::ExternalEd25519 {
-                    verifier: (*verifier).clone(),
-                },
-            }];
-            collect_mixed_signer_entries_within_budget(
-                checked_rules,
-                partial,
-                &mixed_signers,
-                signature_expiration_ledger,
-                args.network_passphrase,
-                Some(pre_submit_budget),
-            )
-            .await?
+        let descriptor = if let Some((resolved, verifier)) = &rule_signer {
+            let key = resolved
+                .public_key()
+                .await
+                .map_err(|error| auth_payload_err(error.to_string()))?;
+            SignerDescriptor::External {
+                verifier: scaddress_to_strkey(verifier)?,
+                key_data_sha256: Sha256::digest(key.0).into(),
+            }
         } else {
-            // Delegated arm: sign the auth-digest, then build the
-            // secondary G-key sub-auth entry `__check_auth` requires for
-            // `Signer::Delegated(addr)`.
-            let signed_entry = complete_authorization_entry_within_budget(
-                checked_rules,
-                partial.clone(),
-                &envelope_signer,
-                Some(pre_submit_budget),
+            SignerDescriptor::Delegated {
+                account: source_pubkey.0,
+            }
+        };
+        let mut subjects = vec![
+            IntentSubject::smart_account(
+                &auth_scaddr,
+                partial.nonce,
+                signature_expiration_ledger,
+                &partial.root_invocation,
+                partial
+                    .context_rule_ids
+                    .iter()
+                    .map(ContextRuleId::as_u32)
+                    .collect(),
+                vec![descriptor],
             )
-            .await?;
-
-            let delegated_entry: SorobanAuthorizationEntry = build_and_sign_delegated_g_key_entry(
+            .map_err(|field| SaError::IntentBindingMismatch { field })?,
+        ];
+        let nonce = if rule_signer.is_none() {
+            use rand_core::RngCore as _;
+            let nonce = i64::from_ne_bytes(rand_core::OsRng.next_u64().to_ne_bytes());
+            let root = crate::managers::auth_entry::delegated_g_key_invocation(
                 &auth_scaddr,
                 &partial.auth_digest,
-                signature_expiration_ledger,
-                &envelope_signer,
-                args.network_passphrase,
+            )?;
+            let address = ScAddress::Account(stellar_xdr::AccountId(
+                stellar_xdr::PublicKey::PublicKeyTypeEd25519(stellar_xdr::Uint256(source_pubkey.0)),
+            ));
+            subjects.push(
+                IntentSubject::account_key(&address, nonce, signature_expiration_ledger, &root)
+                    .map_err(|field| SaError::IntentBindingMismatch { field })?,
+            );
+            Some(nonce)
+        } else {
+            None
+        };
+        (None, Some((checked_rules, partial, nonce)), subjects)
+    };
+    let host_bytes = args
+        .host_function
+        .to_xdr(stellar_xdr::Limits::none())
+        .map_err(|_| SaError::IntentBindingMismatch { field: "plan" })?;
+    let sequence = source_view
+        .sequence_number
+        .checked_add(1)
+        .ok_or(SaError::IntentBindingMismatch { field: "plan" })?;
+    let plan = SignedIntentPlan::new(
+        args.network_passphrase,
+        &scaddress_to_strkey(&auth_scaddr)?,
+        &source_pubkey_strkey,
+        sequence,
+        Sha256::digest(host_bytes).into(),
+        subjects,
+        Some(signature_expiration_ledger),
+    )
+    .map_err(|error| map_admission_error(&error, args.op_label))?;
+    let proof = args
+        .admission
+        .admit(&plan)
+        .await
+        .map_err(|error| map_admission_error(&error, args.op_label))?;
+    let gate = SigningGate::new(proof);
+    let signing_result = async {
+        ledger_bound.ensure_fresh(pre_submit_budget)?;
+        let auth_entries = if let Some(quorum) = &quorum_plan {
+            sign_quorum_plan_within_budget(
+                quorum,
+                &quorum_signer_refs,
+                &gate,
                 Some(pre_submit_budget),
             )
-            .await?;
-
-            vec![signed_entry, delegated_entry]
-        }
-    };
-
-    // ── Simulation-audit fingerprint capture ─────────────────────────────────
-    // Capture the expected fingerprint immediately after auth_entries is built
-    // (before the envelope string exists).  The verify call below is a
-    // CHEAP INTERNAL TRIPWIRE — NOT a live-intermediary TOCTOU gate.
-    //
-    // Inside submit_signed_invoke there is no sign→submit substitution boundary:
-    // auth_entries is built here, threaded into build_signed_invoke_envelope,
-    // and the resulting envelope is never sourced from outside.  The guard
-    // enforces the byte-identity invariant at runtime: if a future refactor
-    // mutates auth_entries between this capture point and the
-    // build_signed_invoke_envelope call, the tripwire fires loudly rather than
-    // silently producing a bad submission.
-    //
-    // The WalletConnect-host / MCP external-submit boundary is the real
-    // TOCTOU-protected surface where a pre-signed blob arrives from outside
-    // the wallet's own build path.  Not yet supported: wiring
-    // verify_auth_entries_unchanged at that entry point.
-    let c7_expected_fp =
-        stellar_agent_network::simulation_audit::AuthEntryFingerprint::from_entries(&auth_entries)
+            .await
+            .map_err(|failure| quorum_failure_error(failure, args.op_label))?
+        } else if let Some((checked, partial, nonce)) = single_plan {
+            if let Some((resolved, verifier)) = &rule_signer {
+                let mixed_signers = [crate::managers::auth_entry::MixedSigner {
+                    signer: resolved,
+                    kind: crate::managers::auth_entry::MixedSignerKind::ExternalEd25519 {
+                        verifier: (*verifier).clone(),
+                    },
+                }];
+                collect_mixed_signer_entries_within_budget(
+                    &gate,
+                    checked,
+                    partial,
+                    &mixed_signers,
+                    signature_expiration_ledger,
+                    args.network_passphrase,
+                    Some(pre_submit_budget),
+                )
+                .await?
+            } else {
+                let signed = complete_authorization_entry_within_budget(
+                    &gate,
+                    checked,
+                    partial.clone(),
+                    &envelope_signer,
+                    Some(pre_submit_budget),
+                )
+                .await?;
+                let delegated = build_and_sign_delegated_g_key_entry(
+                    &gate,
+                    nonce.ok_or(SaError::IntentBindingMismatch { field: "plan" })?,
+                    &auth_scaddr,
+                    &partial.auth_digest,
+                    signature_expiration_ledger,
+                    &envelope_signer,
+                    args.network_passphrase,
+                    Some(pre_submit_budget),
+                )
+                .await?;
+                vec![signed, delegated]
+            }
+        } else {
+            return Err(SaError::IntentBindingMismatch { field: "plan" });
+        };
+        // ── Simulation-audit fingerprint capture ─────────────────────────────────
+        // Capture the expected fingerprint after the auth entries are built.
+        // The later check compares the assembled invocation with the simulation.
+        //
+        // Inside submit_signed_invoke there is no sign→submit substitution boundary:
+        // auth_entries is built here, threaded into build_signed_invoke_envelope,
+        // and the resulting envelope is never sourced from outside.  The guard
+        // enforces the byte-identity invariant at runtime: if a future refactor
+        // mutates auth_entries between this capture point and the
+        // build_signed_invoke_envelope call, the tripwire fires loudly rather than
+        // silently producing a bad submission.
+        //
+        // The WalletConnect-host / MCP external-submit boundary is the real
+        // TOCTOU-protected surface where a pre-signed blob arrives from outside
+        // the wallet's own build path.  Not yet supported: wiring
+        // verify_auth_entries_unchanged at that entry point.
+        let c7_expected_fp =
+            stellar_agent_network::simulation_audit::AuthEntryFingerprint::from_entries(
+                &auth_entries,
+            )
             .map_err(|e| SaError::DeploymentFailed {
                 phase: "submit",
                 redacted_reason: format!(
@@ -1750,59 +1700,85 @@ pub async fn submit_signed_invoke(
                 ),
             })?;
 
-    // ── Step 6: Submit ────────────────────────────────────────────────────────
-    // Re-simulate with signed auth entries to obtain a footprint that includes
-    // __check_auth storage reads. Without this, submission traps with
-    // "trying to access contract data key outside of the footprint".
-    //
-    // `pre_submit_budget` carries the same collective deadline armed at the
-    // top of this function, so the re-fetch and re-simulate inside
-    // `resimulate_with_signed_auth` share that budget with the stages already
-    // run above (initial fetch, initial simulate, and the off-chain signing
-    // step just completed).
-    let resim_response = resimulate_with_signed_auth(
-        &server,
-        &primary_rpc_client,
-        &target_contract_scaddr,
-        function_name.clone(),
-        invoke_args_vecm.clone(),
-        auth_entries.clone(),
-        &source_pubkey_strkey,
-        args.network_passphrase,
-        pre_submit_budget,
-    )
-    .await?;
-
-    let prepared_envelope_xdr = build_signed_invoke_envelope(
-        &mut source_account,
-        args.network_passphrase,
-        target_contract_scaddr.clone(),
-        function_name,
-        invoke_args_vecm,
-        auth_entries,
-        &resim_response,
-    )?;
-
-    // The envelope is signed only while the deadline the witness rests on is
-    // open, through the key resolved before the signing boundary. A software
-    // key signs without yielding, so the deadline is checked before the
-    // bounded signature as well.
-    pre_submit_budget.check_at("sign_envelope", "auth_payload")?;
-    let final_signed_xdr = bound_pre_submit_stage(
-        pre_submit_budget,
-        "sign_envelope",
-        "auth_payload",
-        attach_signature(
-            &prepared_envelope_xdr,
-            &envelope_signer,
+        // ── Step 6: Submit ────────────────────────────────────────────────────────
+        // Re-simulate with signed auth entries to obtain a footprint that includes
+        // __check_auth storage reads. Without this, submission traps with
+        // "trying to access contract data key outside of the footprint".
+        //
+        // `pre_submit_budget` carries the same collective deadline armed at the
+        // top of this function, so the re-fetch and re-simulate inside
+        // `resimulate_with_signed_auth` share that budget with the stages already
+        // run above (initial fetch, initial simulate, and the off-chain signing
+        // step just completed).
+        let resim_response = resimulate_with_signed_auth(
+            &server,
+            &primary_rpc_client,
+            &target_contract_scaddr,
+            function_name.clone(),
+            invoke_args_vecm.clone(),
+            auth_entries.clone(),
+            &source_pubkey_strkey,
             args.network_passphrase,
-        ),
-    )
-    .await?
-    .map_err(|e| SaError::DeploymentFailed {
-        phase: "submit",
-        redacted_reason: format!("{} envelope signing failed: {e}", args.op_label),
-    })?;
+            pre_submit_budget,
+        )
+        .await?;
+
+        let prepared_envelope_xdr = build_signed_invoke_envelope(
+            &mut source_account,
+            args.network_passphrase,
+            target_contract_scaddr.clone(),
+            function_name,
+            invoke_args_vecm,
+            auth_entries,
+            &resim_response,
+        )?;
+
+        // The envelope is signed only while the deadline the witness rests on is
+        // open, through the key resolved before the signing boundary. A software
+        // key signs without yielding, so the deadline is checked before the
+        // bounded signature as well.
+        pre_submit_budget.check_at("sign_envelope", "auth_payload")?;
+        let decoded = stellar_xdr::TransactionEnvelope::from_xdr_base64(
+            &prepared_envelope_xdr,
+            stellar_xdr::Limits::none(),
+        )
+        .map_err(|_| SaError::IntentBindingMismatch {
+            field: "host_invocation",
+        })?;
+        gate.authorize(SigningRequest {
+            subject: AuthSubject::source(&source_pubkey_strkey)
+                .map_err(|field| SaError::IntentBindingMismatch { field })?,
+            signer: SignerMatch::Exact(SignerDescriptor::AccountKey {
+                public_key: source_pubkey.0,
+            }),
+            payload: SigningPayload::Envelope(&decoded),
+        })?;
+        let final_signed_xdr = bound_pre_submit_stage(
+            pre_submit_budget,
+            "sign_envelope",
+            "auth_payload",
+            attach_signature(
+                &prepared_envelope_xdr,
+                &envelope_signer,
+                args.network_passphrase,
+            ),
+        )
+        .await?
+        .map_err(|e| SaError::DeploymentFailed {
+            phase: "submit",
+            redacted_reason: format!("{} envelope signing failed: {e}", args.op_label),
+        })?;
+
+        Ok::<_, SaError>((final_signed_xdr, c7_expected_fp))
+    }
+    .await;
+    let (final_signed_xdr, c7_expected_fp) = match signing_result {
+        Ok(value) => value,
+        Err(error) => {
+            cancel_unexposed_admission(&args.admission, &gate).await;
+            return Err(error);
+        }
+    };
 
     // ── Byte-identity invariant tripwire ─────────────────────────────────────
     // Verify that the just-built final_signed_xdr carries exactly the auth
@@ -1886,7 +1862,8 @@ pub async fn submit_signed_invoke(
         args.timeout,
         args.network_passphrase,
         None,
-        args.submission_recorder,
+        args.admission.recorder(),
+        args.admission.recorder().and_then(|_| gate.exposure()),
     )
     .await
     .map_err(|e| {
@@ -2043,6 +2020,34 @@ pub(crate) fn map_sent_by_error(
 /// keeps the criterion's own code for the same reason. A mainnet refusal keeps
 /// the canonical `network.mainnet_write_forbidden` code. Every other failure is
 /// a deployment failure at the submit phase.
+pub(crate) fn map_admission_error(
+    error: &stellar_agent_core::WalletError,
+    op_label: &'static str,
+) -> SaError {
+    map_submit_error(error, op_label, "")
+}
+
+pub(crate) async fn cancel_unexposed_admission(
+    admission: &SigningAdmission<'_>,
+    gate: &SigningGate,
+) {
+    if let Some(proof) = gate.take_unexposed()
+        && let Err(error) = admission.cancel_unexposed(proof).await
+    {
+        tracing::warn!(code = error.code(), "unexposed intent cancellation refuses");
+    }
+}
+
+fn quorum_failure_error(failure: QuorumFailure, op_label: &str) -> SaError {
+    match failure {
+        QuorumFailure::Deadline(error) | QuorumFailure::Intent(error) => error,
+        QuorumFailure::Quorum(error) => SaError::AuthEntryConstructionFailed {
+            stage: "quorum_signatures",
+            redacted_reason: format!("{op_label}: quorum collection failed: {error}"),
+        },
+    }
+}
+
 pub(crate) fn map_submit_error(
     error: &stellar_agent_core::error::WalletError,
     op_label: &'static str,
@@ -2050,6 +2055,15 @@ pub(crate) fn map_submit_error(
 ) -> SaError {
     use stellar_agent_core::error::{NetworkError, SubmissionError, WalletError};
 
+    match error {
+        WalletError::Submission(SubmissionError::IntentRecordUnavailable { class }) => {
+            return SaError::IntentRecordUnavailable { class };
+        }
+        WalletError::Submission(SubmissionError::IntentBindingMismatch { field }) => {
+            return SaError::IntentBindingMismatch { field };
+        }
+        _ => {}
+    }
     // A refusal the wallet's own policy decided keeps the criterion's code:
     // nothing was sent, and an agent told the deployment failed would rebuild
     // and re-submit against a cap that has already refused it.
@@ -2768,6 +2782,23 @@ mod tests {
     #![allow(clippy::unwrap_used, reason = "test-only")]
     #![allow(clippy::panic, reason = "test-only")]
 
+    #[test]
+    fn quorum_failure_keeps_intent_codes() {
+        for error in [
+            crate::SaError::IntentBindingMismatch { field: "signers" },
+            crate::SaError::IntentRecordUnavailable {
+                class: "window_unavailable",
+            },
+        ] {
+            let code = error.wire_code();
+            assert_eq!(
+                super::quorum_failure_error(super::QuorumFailure::Intent(error), "fixture")
+                    .wire_code(),
+                code
+            );
+        }
+    }
+
     use stellar_agent_core::error::WalletError;
     use stellar_agent_network::WebAuthnAssertion;
     use stellar_xdr::{
@@ -3056,6 +3087,9 @@ mod tests {
         // construction — check_required never reads the network.
         let dummy_strkey = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM";
         SubmitInvokeArgs::builder()
+            .admission(stellar_agent_network::SigningAdmission::NoValue(
+                crate::signing::intent_test_helpers::no_value_admission(),
+            ))
             .target_contract(dummy_strkey)
             .auth_rule_ids(&[])
             .host_function(HostFunction::InvokeContract(InvokeContractArgs {
@@ -3286,6 +3320,9 @@ mod tests {
         let authz = AuthorizationInfo::new(vec![], Combinator::And);
 
         let args = SubmitInvokeArgs::builder()
+            .admission(stellar_agent_network::SigningAdmission::NoValue(
+                crate::signing::intent_test_helpers::no_value_admission(),
+            ))
             .target_contract(dummy_strkey)
             .auth_rule_ids(&[])
             .host_function(HostFunction::InvokeContract(InvokeContractArgs {
@@ -3319,6 +3356,9 @@ mod tests {
         primary_rpc_url: &'a str,
     ) -> SubmitInvokeArgs<'a> {
         SubmitInvokeArgs::builder()
+            .admission(stellar_agent_network::SigningAdmission::NoValue(
+                crate::signing::intent_test_helpers::no_value_admission(),
+            ))
             .target_contract("CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM")
             .auth_rule_ids(&[])
             .host_function(HostFunction::InvokeContract(InvokeContractArgs {
@@ -3470,6 +3510,7 @@ mod tests {
         }];
 
         let entries = collect_mixed_signer_entries(
+            &crate::signing::intent_test_helpers::mixed_gate(&partial, &mixed_signers).await,
             crate::submit::checked_rules_for_test(&partial),
             partial,
             &mixed_signers,
@@ -3997,6 +4038,7 @@ mod tests {
             inner: CountingSigner,
             auth_digests: Mutex<Vec<[u8; 32]>>,
             envelope_delay: Option<Duration>,
+            fail_auth: bool,
         }
 
         impl RecordingSigner {
@@ -4005,6 +4047,7 @@ mod tests {
                     inner: CountingSigner::new(SEED),
                     auth_digests: Mutex::new(Vec::new()),
                     envelope_delay: None,
+                    fail_auth: false,
                 }
             }
 
@@ -4033,7 +4076,15 @@ mod tests {
                 digest: &SmartAccountAuthDigest,
             ) -> Result<[u8; 64], WalletError> {
                 self.auth_digests.lock().unwrap().push(*digest.as_bytes());
-                self.inner.sign_auth_digest(digest).await
+                let result = self.inner.sign_auth_digest(digest).await;
+                if self.fail_auth {
+                    return Err(WalletError::Submission(
+                        stellar_agent_core::SubmissionError::IntentRecordUnavailable {
+                            class: "fixture_signer",
+                        },
+                    ));
+                }
+                result
             }
 
             async fn sign_soroban_address_auth_payload(
@@ -4179,7 +4230,27 @@ mod tests {
             secondary: Option<&str>,
             horizon: Option<HorizonCheck>,
         ) -> Outcome {
-            let signer = RecordingSigner::new();
+            submit_with_control(
+                path,
+                primary,
+                secondary,
+                horizon,
+                &RecordingSigner::new(),
+                stellar_agent_network::SigningAdmission::NoValue(
+                    crate::signing::intent_test_helpers::no_value_admission(),
+                ),
+            )
+            .await
+        }
+
+        async fn submit_with_control(
+            path: SigningPath,
+            primary: &AuthTreeEndpoint,
+            secondary: Option<&str>,
+            horizon: Option<HorizonCheck>,
+            signer: &RecordingSigner,
+            admission: stellar_agent_network::SigningAdmission<'_>,
+        ) -> Outcome {
             let target = wallet_strkey();
             let rule_ids = path.rule_ids();
             let declared = [nested_call()];
@@ -4201,11 +4272,12 @@ mod tests {
             };
             let result = submit_signed_invoke(
                 SubmitInvokeArgs::builder()
+                    .admission(admission)
                     .target_contract(&target)
                     .auth_rule_ids(&rule_ids)
                     .host_function(path.host_function())
                     .sub_invocations(sub_invocations)
-                    .signer(&signer)
+                    .signer(signer)
                     .primary_rpc_url(&primary.uri())
                     .maybe_secondary_rpc_url(secondary)
                     .network_passphrase(TESTNET_PASSPHRASE)
@@ -4246,6 +4318,224 @@ mod tests {
         /// Submits on `path` through endpoints at the two heights.
         async fn submit_at(path: SigningPath, primary: u32, secondary: u32) -> Outcome {
             submit_pair(path, endpoint(primary), endpoint(secondary), None).await
+        }
+
+        #[derive(Clone, Copy)]
+        enum AdmissionProbe {
+            Stale,
+            WrongPlan,
+            FailingSigner,
+        }
+
+        struct ProbeRecorder<'a> {
+            inner: stellar_agent_network::submission_record::WalletSubmissionRecorder<'a>,
+            mode: AdmissionProbe,
+            admissions: std::sync::atomic::AtomicUsize,
+            cancellations: std::sync::atomic::AtomicUsize,
+        }
+
+        #[async_trait]
+        impl stellar_agent_network::SubmissionRecorder for ProbeRecorder<'_> {
+            async fn admit_signed_intent(
+                &self,
+                plan: &stellar_agent_network::SignedIntentPlan,
+            ) -> Result<stellar_agent_network::IntentProof, WalletError> {
+                self.admissions
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let wrong;
+                let plan = if matches!(self.mode, AdmissionProbe::WrongPlan) {
+                    wrong = stellar_agent_network::SignedIntentPlan::new(
+                        TESTNET_PASSPHRASE,
+                        &wallet_strkey(),
+                        &account_id_for_seed(SEED),
+                        1,
+                        [7; 32],
+                        vec![],
+                        None,
+                    )?;
+                    &wrong
+                } else {
+                    plan
+                };
+                let proof = self.inner.admit_signed_intent(plan).await?;
+                if matches!(self.mode, AdmissionProbe::Stale) {
+                    tokio::time::pause();
+                    tokio::time::advance(
+                        crate::signing::ledger_witness::MAX_OBSERVATION_AGE
+                            + Duration::from_secs(1),
+                    )
+                    .await;
+                    tokio::time::resume();
+                }
+                Ok(proof)
+            }
+            async fn cancel_unexposed(
+                &self,
+                proof: stellar_agent_network::IntentProof,
+            ) -> Result<(), WalletError> {
+                self.cancellations
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                self.inner.cancel_unexposed(proof).await
+            }
+            async fn pre_send_bound(
+                &self,
+                intent: &stellar_agent_network::SubmissionIntent,
+                binding: &stellar_agent_network::IntentBinding<'_>,
+            ) -> Result<(), WalletError> {
+                self.inner.pre_send_bound(intent, binding).await
+            }
+            async fn pre_send(
+                &self,
+                intent: &stellar_agent_network::SubmissionIntent,
+            ) -> Result<(), WalletError> {
+                self.inner.pre_send(intent).await
+            }
+            async fn outcome(
+                &self,
+                intent: &stellar_agent_network::SubmissionIntent,
+                outcome: &stellar_agent_network::SubmissionOutcome,
+            ) {
+                self.inner.outcome(intent, outcome).await;
+            }
+        }
+
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn a_refusal_before_the_first_signature_cancels_the_admission() {
+            use stellar_agent_core::policy::v1::criteria::state_store::{
+                PolicyStateStore, StateKey, WindowEntry, WindowLimit,
+            };
+            use stellar_agent_core::policy::v1::{CheckedSizing, SizingBasis};
+            use stellar_agent_network::policy_state::PersistedWindowStore;
+            for mode in [
+                AdmissionProbe::Stale,
+                AdmissionProbe::WrongPlan,
+                AdmissionProbe::FailingSigner,
+            ] {
+                stellar_agent_test_support::keyring_mock::install().unwrap();
+                let dir = tempfile::tempdir().unwrap();
+                let profile = stellar_agent_core::profile::schema::Profile::builder_testnet_named(
+                    "intent",
+                    "intent-test",
+                    "account",
+                    "intent-nonce",
+                    "account",
+                )
+                .build();
+                let store = PersistedWindowStore::at_path(dir.path().join("intent.window"));
+                let now = stellar_agent_core::timefmt::now_unix_ms().unwrap();
+                let key = StateKey::new("intent", 1, "rate_limit", 60);
+                let entries = vec![WindowEntry::new(
+                    key.clone(),
+                    now,
+                    1,
+                    WindowLimit::Count {
+                        window: "1m".into(),
+                        max_calls: 1,
+                    },
+                )];
+                let sizing =
+                    CheckedSizing::for_test(SizingBasis::NoValue, entries.clone()).unwrap();
+                let inner =
+                    stellar_agent_network::submission_record::WalletSubmissionRecorder::new(
+                        &profile,
+                        "intent",
+                        "witness_test",
+                        Some("stellar:testnet".into()),
+                        stellar_agent_core::audit_log::PolicyDecision::Allow,
+                        vec![],
+                        entries.clone(),
+                        stellar_agent_core::profile::receipt::ReceiptStore::open_at(
+                            dir.path(),
+                            "intent",
+                        )
+                        .unwrap(),
+                        store.clone(),
+                        None,
+                        None,
+                        "fixture",
+                        now,
+                    )
+                    .with_signing_sizing(sizing);
+                let recorder = ProbeRecorder {
+                    inner,
+                    mode,
+                    admissions: 0.into(),
+                    cancellations: 0.into(),
+                };
+                let signer = RecordingSigner {
+                    fail_auth: matches!(mode, AdmissionProbe::FailingSigner),
+                    ..RecordingSigner::new()
+                };
+                let primary = endpoint(LEDGER).start().await;
+                let secondary = endpoint(LEDGER).start().await;
+                let url = second_loopback_host(&secondary.uri());
+                let result = submit_with_control(
+                    SigningPath::Single,
+                    &primary,
+                    Some(&url),
+                    None,
+                    &signer,
+                    stellar_agent_network::SigningAdmission::Recorded(&recorder),
+                )
+                .await;
+                assert_eq!(
+                    recorder
+                        .admissions
+                        .load(std::sync::atomic::Ordering::SeqCst),
+                    1
+                );
+                let exposed = matches!(mode, AdmissionProbe::FailingSigner);
+                let cancellations = recorder
+                    .cancellations
+                    .load(std::sync::atomic::Ordering::SeqCst);
+                if matches!(mode, AdmissionProbe::Stale) {
+                    result.assert_refused(UNAVAILABLE_CODE, "post-admission staleness");
+                }
+                if matches!(mode, AdmissionProbe::WrongPlan) {
+                    result.assert_refused("submission.intent_binding_mismatch", "first request");
+                }
+                if exposed {
+                    assert!(result.result.is_err());
+                    assert_eq!(result.signs, 1);
+                }
+                assert_eq!(result.signed_simulations, 0);
+                assert!(result.sent.is_empty());
+                drop(recorder);
+                drop(store);
+                let reopened = PersistedWindowStore::at_path(dir.path().join("intent.window"));
+                let intents = reopened.signed_intents("intent", &profile).unwrap();
+                assert_eq!(intents.len(), usize::from(exposed));
+                assert_eq!(cancellations, usize::from(!exposed));
+                if exposed {
+                    assert_eq!(
+                        intents[0].status,
+                        "authorization exposed, submission unknown"
+                    );
+                    assert_eq!(intents[0].legs.len(), 1);
+                }
+                if exposed {
+                    let admission = stellar_agent_network::NoValueAdmission::with_store(
+                        profile.clone(),
+                        reopened.clone(),
+                        CheckedSizing::for_test(SizingBasis::NoValue, entries).unwrap(),
+                    )
+                    .unwrap();
+                    let fresh =
+                        stellar_agent_network::signed_intent::test_helpers::intent_fixture_plan(
+                            99, 1,
+                        )
+                        .0;
+                    let error = admission.admit(&fresh).await.err().unwrap();
+                    assert_eq!(error.code(), "policy.deny.rate_limit_exceeded");
+                }
+                let state = PolicyStateStore::new();
+                reopened.load_into("intent", &profile, &state).unwrap();
+                assert_eq!(
+                    state.query_window(&key, now).unwrap(),
+                    if exposed { (1, 1) } else { (0, 0) }
+                );
+            }
         }
 
         #[tokio::test]
@@ -4607,6 +4897,9 @@ mod tests {
             let target = wallet_strkey();
             let rule_ids = SigningPath::Single.rule_ids();
             let builder = SubmitInvokeArgs::builder()
+                .admission(stellar_agent_network::SigningAdmission::NoValue(
+                    crate::signing::intent_test_helpers::no_value_admission(),
+                ))
                 .target_contract(&target)
                 .auth_rule_ids(&rule_ids)
                 .host_function(SigningPath::Single.host_function())
@@ -4793,6 +5086,9 @@ mod tests {
             let target = wallet_strkey();
             let rule_ids = SigningPath::Single.rule_ids();
             let builder = SubmitInvokeArgs::builder()
+                .admission(stellar_agent_network::SigningAdmission::NoValue(
+                    crate::signing::intent_test_helpers::no_value_admission(),
+                ))
                 .target_contract(&target)
                 .auth_rule_ids(&rule_ids)
                 .host_function(SigningPath::Single.host_function())
@@ -4913,6 +5209,9 @@ mod tests {
             let rule_ids = SigningPath::Single.rule_ids();
             let result = submit_signed_invoke(
                 SubmitInvokeArgs::builder()
+                    .admission(stellar_agent_network::SigningAdmission::NoValue(
+                        crate::signing::intent_test_helpers::no_value_admission(),
+                    ))
                     .target_contract(&target)
                     .auth_rule_ids(&rule_ids)
                     .host_function(SigningPath::Single.host_function())

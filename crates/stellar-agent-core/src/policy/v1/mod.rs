@@ -128,6 +128,8 @@ pub use criteria::Criterion;
 pub use criteria::PolicyStateStore;
 pub use loader::{PolicyDocument, PolicyRule, RuleMatch, ScopeId, validate_unsigned_policy};
 pub use schema::validate_policy_keys;
+mod sizing;
+pub use sizing::{CheckedSizing, SizingBasis, SizingOutcome};
 pub use value::{
     ActionKind, OpaqueReason, ValueClass, ValueEffects, ValueGate, ValueLeg, classify_value,
 };
@@ -1248,6 +1250,60 @@ impl PolicyEngine for PolicyEngineV1 {
         PolicyEngineV1::record_confirmed(self, tool, profile, value)
     }
 
+    fn size_unvalued_call(
+        &self,
+        tool: &ToolDescriptor,
+        profile: &Profile,
+        reason: OpaqueReason,
+        now_ms: u64,
+    ) -> Result<SizingOutcome, PolicyError> {
+        if let Some(reason) = self.unvalued_refusal(tool, profile, reason)? {
+            return Ok(SizingOutcome::Refused(reason));
+        }
+        let effective = self.effective_unvalued(tool, reason);
+        let basis = self.sizing_basis(tool, SizingBasis::Unvalued);
+        let entries = self.size_window_entries(tool, profile, &effective, now_ms)?;
+        Ok(SizingOutcome::Sized(CheckedSizing::new(basis, entries)?))
+    }
+
+    fn record_confirmed_checked(
+        &self,
+        tool: &ToolDescriptor,
+        profile: &Profile,
+        value: &ValueClass,
+    ) -> Result<SizingOutcome, PolicyError> {
+        let (basis, effective) = match value {
+            ValueClass::Value(_) => (SizingBasis::MeasuredValue, value.clone()),
+            ValueClass::ReadOnly => (SizingBasis::NoValue, ValueClass::ReadOnly),
+            ValueClass::Opaque(reason) => {
+                if let Some(reason) = self.unvalued_refusal(tool, profile, *reason)? {
+                    return Ok(SizingOutcome::Refused(reason));
+                }
+                (
+                    SizingBasis::Unvalued,
+                    self.effective_unvalued(tool, *reason),
+                )
+            }
+        };
+        let entries = self.record_confirmed(tool, profile, &effective)?;
+        Ok(SizingOutcome::Sized(CheckedSizing::new(
+            self.sizing_basis(tool, basis),
+            entries,
+        )?))
+    }
+
+    fn size_no_value(
+        &self,
+        tool: &ToolDescriptor,
+        profile: &Profile,
+        now_ms: u64,
+    ) -> Result<CheckedSizing, PolicyError> {
+        CheckedSizing::new(
+            self.sizing_basis(tool, SizingBasis::NoValue),
+            self.size_window_entries(tool, profile, &ValueClass::ReadOnly, now_ms)?,
+        )
+    }
+
     /// Returns `Some(&self.state_store)` — see the trait method's
     /// documentation for why a caller needs this to refresh a long-lived
     /// engine's window state before evaluation.
@@ -1440,6 +1496,68 @@ impl PolicyEngineV1 {
                 .size(ctx, now_ms)
                 .map(|entry| entry.into_iter().collect())
         })
+    }
+
+    fn sizing_basis(&self, tool: &ToolDescriptor, applicable: SizingBasis) -> SizingBasis {
+        if self
+            .matching_rules(&self.profile_name, self.project_id.as_deref())
+            .into_iter()
+            .find(|rule| rule.matches_tool(tool))
+            .is_some_and(|rule| rule.criteria.iter().any(|criterion| criterion.windowed()))
+        {
+            applicable
+        } else {
+            SizingBasis::NoApplicableLimit
+        }
+    }
+
+    fn unvalued_refusal(
+        &self,
+        tool: &ToolDescriptor,
+        profile: &Profile,
+        reason: OpaqueReason,
+    ) -> Result<Option<DenyReason>, PolicyError> {
+        let effective = self.effective_unvalued(tool, reason);
+        if matches!(effective, ValueClass::Opaque(_)) {
+            // Count admission uses the durable store under its lock.
+            // The value refusal walk cannot prune the engine's live entries.
+            let refusal_store = PolicyStateStore::new();
+            let mut ctx = EvalContext::new(
+                tool,
+                &Value::Null,
+                &self.profile_name,
+                profile,
+                &refusal_store,
+            );
+            ctx.value = effective.clone();
+            if let Some(rule) = self
+                .matching_rules(&self.profile_name, self.project_id.as_deref())
+                .into_iter()
+                .find(|rule| rule.matches_tool(tool))
+            {
+                for criterion in &rule.criteria {
+                    if let Some(reason @ DenyReason::UnsizableValueEffect { .. }) =
+                        criterion.evaluate(&ctx)?
+                    {
+                        return Ok(Some(reason));
+                    }
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    fn effective_unvalued(&self, tool: &ToolDescriptor, reason: OpaqueReason) -> ValueClass {
+        if self
+            .matching_rules(&self.profile_name, self.project_id.as_deref())
+            .into_iter()
+            .find(|rule| rule.matches_tool(tool))
+            .is_some_and(|rule| rule.allow_opaque_signing)
+        {
+            ValueClass::ReadOnly
+        } else {
+            ValueClass::Opaque(reason)
+        }
     }
 
     fn accounting_entries(
@@ -1816,6 +1934,22 @@ impl PolicyEngineV1 {
             return Ok(recorded);
         }
         Ok(Vec::new())
+    }
+
+    /// Records a bundle and certifies the basis of its window entries.
+    ///
+    /// # Errors
+    /// Returns an error when a criterion cannot record its entries.
+    pub fn record_confirmed_bundle_checked(
+        &self,
+        tool: &ToolDescriptor,
+        profile: &Profile,
+        bundle: &BundleView<'_>,
+    ) -> Result<SizingOutcome, PolicyError> {
+        Ok(SizingOutcome::Sized(CheckedSizing::new(
+            self.sizing_basis(tool, SizingBasis::MeasuredValue),
+            self.record_confirmed_bundle(tool, profile, bundle)?,
+        )?))
     }
 }
 
@@ -3528,6 +3662,251 @@ mod tests {
             .record_confirmed(&td, &profile, &ValueClass::ReadOnly)
             .unwrap();
         assert!(recorded.is_empty());
+    }
+
+    fn checked_engine(exemption: bool, rate: bool, cap: bool) -> PolicyEngineV1 {
+        use criteria::{PerPeriodCapCriterion, RateLimitCriterion, per_period_cap::Window};
+        let mut criteria: Vec<Box<dyn Criterion>> = Vec::new();
+        if rate {
+            criteria.push(Box::new(RateLimitCriterion::new(
+                Window::parse("1d").unwrap(),
+                1,
+            )));
+        }
+        if cap {
+            criteria.push(Box::new(PerPeriodCapCriterion::new(
+                "native".into(),
+                Window::parse("1d").unwrap(),
+                1000,
+            )));
+        }
+        let mut doc = allow_all_doc_with_criteria(criteria);
+        doc.rules[0].allow_opaque_signing = exemption;
+        PolicyEngineV1::new(doc, "alice".into())
+    }
+
+    #[allow(clippy::panic, reason = "a fixture requires a successful sizing")]
+    fn sized(outcome: SizingOutcome) -> CheckedSizing {
+        let SizingOutcome::Sized(sizing) = outcome else {
+            panic!("expected checked sizing");
+        };
+        sizing
+    }
+
+    #[test]
+    fn checked_unvalued_sizing_refuses_value_rules_and_keeps_count_charges() {
+        let mut td = tool("stellar_smart_account_execute", "stellar:testnet");
+        td.value_kind = crate::policy::ToolValueKind::OpaqueSign;
+        let profile = testnet_profile();
+        let reason = OpaqueReason::UnvaluedContractCall;
+        let engine = checked_engine(false, true, true);
+        assert!(matches!(
+            engine
+                .size_unvalued_call(&td, &profile, reason, 1000)
+                .unwrap(),
+            SizingOutcome::Refused(DenyReason::UnsizableValueEffect { .. })
+        ));
+        let engine = checked_engine(true, true, true);
+        let sizing = sized(
+            engine
+                .size_unvalued_call(&td, &profile, reason, 1000)
+                .unwrap(),
+        );
+        assert_eq!(sizing.basis(), SizingBasis::Unvalued);
+        assert_eq!(sizing.entries().len(), 1);
+        let entry = &sizing.entries()[0];
+        assert!(matches!(entry.limit(), criteria::WindowLimit::Count { .. }));
+        assert_eq!(
+            engine
+                .state_store()
+                .query_window(entry.key(), 1000)
+                .unwrap(),
+            (0, 0)
+        );
+        let engine = checked_engine(false, false, false);
+        assert_eq!(
+            sized(
+                engine
+                    .size_unvalued_call(&td, &profile, reason, 1000)
+                    .unwrap()
+            )
+            .basis(),
+            SizingBasis::NoApplicableLimit
+        );
+        let engine = PolicyEngineV1::new(
+            PolicyDocument {
+                version: 1,
+                scope: ScopeId::AllProfiles,
+                rules: Vec::new(),
+                signature: None,
+            },
+            "alice".into(),
+        );
+        let sizing = sized(
+            engine
+                .size_unvalued_call(&td, &profile, reason, 1000)
+                .unwrap(),
+        );
+        assert_eq!(sizing.basis(), SizingBasis::NoApplicableLimit);
+        assert!(sizing.entries().is_empty());
+    }
+
+    #[test]
+    fn checked_unvalued_sizing_preserves_existing_state_and_honors_exemptions() {
+        use criteria::state_store::StateKey;
+        let td = tool("stellar_smart_account_execute", "stellar:testnet");
+        let profile = testnet_profile();
+        let reason = OpaqueReason::UnvaluedContractCall;
+        let engine = checked_engine(false, true, false);
+        let key = StateKey::new("alice", 1, "rate_limit", 86_400);
+        engine.state_store().append(&key, 1000, 1).unwrap();
+        let sizing = sized(
+            engine
+                .size_unvalued_call(&td, &profile, reason, 1000)
+                .unwrap(),
+        );
+        assert_eq!(sizing.entries().len(), 1);
+        assert_eq!(
+            engine.state_store().query_window(&key, 1000).unwrap(),
+            (1, 1)
+        );
+        for exemption in [false, true] {
+            let mut doc = allow_all_doc_with_criteria(vec![Box::new(
+                criteria::MinimumReserveCriterion::new(0),
+            )]);
+            doc.rules[0].allow_opaque_signing = exemption;
+            let engine = PolicyEngineV1::new(doc, "alice".into());
+            let result = engine
+                .size_unvalued_call(&td, &profile, reason, 1000)
+                .unwrap();
+            if exemption {
+                assert_eq!(sized(result).basis(), SizingBasis::NoApplicableLimit);
+            } else {
+                assert!(matches!(
+                    result,
+                    SizingOutcome::Refused(DenyReason::UnsizableValueEffect { .. })
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn checked_no_value_sizing_only_carries_counts() {
+        let td = tool("stellar_smart_account_rules", "stellar:testnet");
+        let profile = testnet_profile();
+        for rate in [false, true] {
+            let engine = checked_engine(false, rate, true);
+            let sizing = engine.size_no_value(&td, &profile, 1000).unwrap();
+            assert_eq!(sizing.basis(), SizingBasis::NoValue);
+            assert_eq!(sizing.entries().len(), usize::from(rate));
+        }
+    }
+
+    #[test]
+    fn checked_recording_refuses_opaque_value_before_mutation() {
+        let mut td = tool("stellar_smart_account_execute", "stellar:testnet");
+        td.value_kind = crate::policy::ToolValueKind::OpaqueSign;
+        let profile = testnet_profile();
+        let engine = checked_engine(false, true, true);
+        let value = ValueClass::Opaque(OpaqueReason::UnvaluedContractCall);
+        assert!(matches!(
+            engine
+                .record_confirmed_checked(&td, &profile, &value)
+                .unwrap(),
+            SizingOutcome::Refused(DenyReason::UnsizableValueEffect { .. })
+        ));
+        let entries = engine
+            .size_window_entries(&td, &profile, &ValueClass::ReadOnly, 1000)
+            .unwrap();
+        for entry in entries {
+            assert_eq!(
+                engine
+                    .state_store()
+                    .query_window(entry.key(), 1000)
+                    .unwrap(),
+                (0, 0)
+            );
+        }
+        let engine = checked_engine(true, true, true);
+        let sizing = sized(
+            engine
+                .record_confirmed_checked(&td, &profile, &value)
+                .unwrap(),
+        );
+        assert_eq!(sizing.basis(), SizingBasis::Unvalued);
+        assert_eq!(sizing.entries().len(), 1);
+        let entry = &sizing.entries()[0];
+        assert_eq!(
+            engine
+                .state_store()
+                .query_window(entry.key(), entry.timestamp_ms())
+                .unwrap(),
+            (1, 1)
+        );
+        let value = ValueClass::single(ValueLeg {
+            kind: ActionKind::Payment,
+            amount: Some(600),
+            asset: Some("native".into()),
+            destination: None,
+        });
+        let engine = checked_engine(false, false, true);
+        let sizing = sized(
+            engine
+                .record_confirmed_checked(&td, &profile, &value)
+                .unwrap(),
+        );
+        assert_eq!(sizing.basis(), SizingBasis::MeasuredValue);
+        assert_eq!(sizing.entries()[0].amount(), 600);
+    }
+
+    #[test]
+    fn checked_engine_defaults_refuse_and_noop_certifies_no_limit() {
+        struct EvaluateOnly;
+        impl PolicyEngine for EvaluateOnly {
+            fn evaluate(
+                &self,
+                _tool: &ToolDescriptor,
+                _args: &Value,
+                _profile: &Profile,
+                _account: Option<&dyn AccountReservesView>,
+                _identity: Option<&dyn AccountIdentityView>,
+                _counterparty: Option<&dyn CounterpartyCacheView>,
+                _sep10: Option<&dyn Sep10SessionView>,
+                _sep45: Option<&dyn Sep45SessionView>,
+            ) -> Result<Decision, PolicyError> {
+                Ok(Decision::Allow)
+            }
+        }
+        let td = tool("stellar_smart_account_execute", "stellar:testnet");
+        let profile = testnet_profile();
+        let value = ValueClass::ReadOnly;
+        let reason = OpaqueReason::UnvaluedContractCall;
+        for result in [
+            EvaluateOnly
+                .record_confirmed_checked(&td, &profile, &value)
+                .map(|_| ()),
+            EvaluateOnly
+                .size_unvalued_call(&td, &profile, reason, 0)
+                .map(|_| ()),
+            EvaluateOnly.size_no_value(&td, &profile, 0).map(|_| ()),
+        ] {
+            assert!(
+                matches!(result, Err(PolicyError::CriterionEvaluationFailed { detail })
+                if detail == "checked sizing is unsupported by this engine")
+            );
+        }
+        let noop = crate::policy::NoopPolicyEngine;
+        for sizing in [
+            sized(
+                noop.record_confirmed_checked(&td, &profile, &value)
+                    .unwrap(),
+            ),
+            sized(noop.size_unvalued_call(&td, &profile, reason, 0).unwrap()),
+            noop.size_no_value(&td, &profile, 0).unwrap(),
+        ] {
+            assert_eq!(sizing.basis(), SizingBasis::NoApplicableLimit);
+            assert!(sizing.entries().is_empty());
+        }
     }
 
     #[test]

@@ -22,6 +22,7 @@ pub const MAINNET_READ_ONLY_TOOLS: &[&str] = &[
     "stellar_mpp_authorization_status",
     "stellar_x402_parse_receipt",
     "stellar_transaction_status",
+    "stellar_signed_intents_list",
 ];
 const VALUE_OUT: &[&str] = &[
     "stellar_pay",

@@ -25,7 +25,9 @@
 //!
 //! # Missing account view (fail-closed)
 //!
-//! When `ctx.account_view` is `None`, the criterion returns
+//! A call whose value cannot be sized is denied with
+//! `DenyReason::UnsizableValueEffect` before the account view is read.
+//! Otherwise, when `ctx.account_view` is `None`, the criterion returns
 //! `Err(PolicyError::CriterionEvaluationFailed)` rather than silently passing.
 //! The correct posture is fail-closed: if the guard is configured and the
 //! required account state is absent, the transaction is rejected.
@@ -57,8 +59,10 @@ use crate::protocol_consts::BASE_RESERVE_STROOPS;
 ///
 /// # Missing account view (fail-closed)
 ///
-/// When `ctx.account_view` is `None`, the criterion returns
-/// `Err(PolicyError::CriterionEvaluationFailed)` — it does NOT silently pass.
+/// A call whose value cannot be sized is denied with
+/// `DenyReason::UnsizableValueEffect` before the account view is read.
+/// Otherwise, when `ctx.account_view` is `None`, the criterion returns
+/// `Err(PolicyError::CriterionEvaluationFailed)` rather than silently passing.
 /// If the minimum-reserve guard is configured and the account state is
 /// unavailable, the call is rejected.
 ///
@@ -127,12 +131,13 @@ impl Criterion for MinimumReserveCriterion {
     /// Returns `Ok(Some(DenyReason::MinimumReserveBreached))` when the
     /// post-transaction balance would fall below the required reserve.
     ///
+    /// Returns `Ok(Some(DenyReason::UnsizableValueEffect))` first when the
+    /// call's value cannot be sized.
+    ///
     /// # Errors
     ///
     /// - [`PolicyError::CriterionEvaluationFailed`] when `ctx.account_view`
-    ///   is `None` — the criterion is configured but the dispatch site has not
-    ///   populated the account view.  **Fail-closed**: a missing account view
-    ///   does not silently bypass the reserve guard.
+    ///   is `None` for a call whose value is sized or read only.
     /// - [`PolicyError::CriterionEvaluationFailed`] when
     ///   `account_view.balance_stroops()` returns an error (balance
     ///   unreadable or parse failure).
@@ -140,6 +145,9 @@ impl Criterion for MinimumReserveCriterion {
     ///   of the value descriptor carries no resolvable amount — an unresolvable
     ///   native debit refuses rather than passing as a zero debit.
     fn evaluate(&self, ctx: &EvalContext<'_>) -> Result<Option<DenyReason>, PolicyError> {
+        if let ValueGate::Deny(reason) = classify_value(ctx) {
+            return Ok(Some(reason));
+        }
         // Fail-closed: account_view = None means the dispatch site has not
         // wired up the account state.  Silently passing would allow every
         // call to bypass the reserve guard when the wiring is absent.
@@ -842,6 +850,27 @@ mod tests {
             matches!(result, Ok(Some(DenyReason::UnsizableValueEffect { .. }))),
             "a MovesValue tool with no resolved effects must deny fail-closed, got {result:?}"
         );
+    }
+
+    #[test]
+    fn an_unsizable_value_denies_before_the_account_view() {
+        let store = PolicyStateStore::new();
+        let criterion = MinimumReserveCriterion::new(5_000_000);
+        let profile = make_profile();
+        let args = json!({});
+        for tool in [
+            make_tool("stellar_sep43_sign_transaction"),
+            make_tool_with_kind(
+                "stellar_dex_trade",
+                crate::policy::ToolValueKind::MovesValue,
+            ),
+        ] {
+            let ctx = make_ctx(&tool, &profile, &args, &store, None);
+            assert!(matches!(
+                criterion.evaluate(&ctx),
+                Ok(Some(DenyReason::UnsizableValueEffect { .. }))
+            ));
+        }
     }
 
     /// An opaque-signing call on the single-tx path must deny fail-closed.

@@ -190,16 +190,22 @@ async fn credentials_path_refuses_the_malformed_verifier_without_its_fragments()
         .mount(&server)
         .await;
     let manager = Arc::new(
-        SignersManager::new(SignersManagerConfig::new(
-            server.uri(),
-            server.uri(),
-            Arc::clone(&audit_writer),
-            audit_log_path,
-            TESTNET_PASSPHRASE.to_owned(),
-            "test-profile".to_owned(),
-            Duration::from_secs(5),
-            "stellar:testnet".to_owned(),
-        ))
+        SignersManager::new(
+            SignersManagerConfig::new(
+                server.uri(),
+                server.uri(),
+                Arc::clone(&audit_writer),
+                audit_log_path,
+                TESTNET_PASSPHRASE.to_owned(),
+                "test-profile".to_owned(),
+                Duration::from_secs(5),
+                "stellar:testnet".to_owned(),
+            )
+            .with_intent_admission(std::sync::Arc::new(
+                stellar_agent_smart_account::signing::intent_test_helpers::no_value_admission_owned(
+                ),
+            )),
+        )
         .expect("SignersManager::new must succeed"),
     );
     let credentials =
@@ -214,6 +220,7 @@ async fn credentials_path_refuses_the_malformed_verifier_without_its_fragments()
 
     let result = credentials
         .sign_with_passkey_rule(
+            &stellar_agent_smart_account::signing::intent_test_helpers::gate(vec![]),
             "laptop-passkey",
             &entry,
             manager,

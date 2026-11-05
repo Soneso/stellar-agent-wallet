@@ -283,6 +283,14 @@ impl DefindexVaultAdapter {
         ctx: &DefiAdapterCtx<'_>,
         witness: SubmitWitness,
     ) -> Result<(), DefiAdapterError> {
+        let recorder = ctx.submission_recorder.ok_or_else(|| {
+            map_submit_invoke_error(
+                &stellar_agent_smart_account::SaError::IntentRecordUnavailable {
+                    class: "missing_recorder",
+                },
+            )
+        })?;
+
         // ── Step 1: Structural validation ────────────────────────────────────
         deposit_args
             .validate_structure()
@@ -418,7 +426,7 @@ impl DefindexVaultAdapter {
                 .op_label(DEFINDEX_SUBMIT_OP_LABEL)
                 .emit_observability_logs(true)
                 .maybe_sequence_floor(ctx.sequence_floor)
-                .maybe_submission_recorder(ctx.submission_recorder)
+                .admission(stellar_agent_network::SigningAdmission::Recorded(recorder))
                 .build(),
         )
         .await;
@@ -467,6 +475,14 @@ impl DefindexVaultAdapter {
         ctx: &DefiAdapterCtx<'_>,
         witness: SubmitWitness,
     ) -> Result<(), DefiAdapterError> {
+        let recorder = ctx.submission_recorder.ok_or_else(|| {
+            map_submit_invoke_error(
+                &stellar_agent_smart_account::SaError::IntentRecordUnavailable {
+                    class: "missing_recorder",
+                },
+            )
+        })?;
+
         // ── Step 1: Structural validation ────────────────────────────────────
         withdraw_args
             .validate_structure()
@@ -593,7 +609,7 @@ impl DefindexVaultAdapter {
                 .op_label(DEFINDEX_SUBMIT_OP_LABEL)
                 .emit_observability_logs(true)
                 .maybe_sequence_floor(ctx.sequence_floor)
-                .maybe_submission_recorder(ctx.submission_recorder)
+                .admission(stellar_agent_network::SigningAdmission::Recorded(recorder))
                 .build(),
         )
         .await;
@@ -793,7 +809,9 @@ fn map_submit_invoke_error(error: &stellar_agent_smart_account::SaError) -> Defi
             envelope_hash: envelope_hash.clone(),
             timeout_seconds: *timeout_seconds,
         },
-        refusal @ (stellar_agent_smart_account::SaError::LedgerWitnessUnavailable { .. }
+        refusal @ (stellar_agent_smart_account::SaError::IntentRecordUnavailable { .. }
+        | stellar_agent_smart_account::SaError::IntentBindingMismatch { .. }
+        | stellar_agent_smart_account::SaError::LedgerWitnessUnavailable { .. }
         | stellar_agent_smart_account::SaError::LedgerWitnessMismatch { .. }) => {
             DefiAdapterError::SigningRefusal {
                 wire_code: refusal.wire_code(),
@@ -894,6 +912,16 @@ mod tests {
     #[test]
     fn a_witness_refusal_keeps_its_wire_code_through_the_adapter_mapping() {
         for (error, code) in [
+            (
+                stellar_agent_smart_account::SaError::IntentBindingMismatch { field: "signers" },
+                "submission.intent_binding_mismatch",
+            ),
+            (
+                stellar_agent_smart_account::SaError::IntentRecordUnavailable {
+                    class: "missing_recorder",
+                },
+                "submission.intent_record_unavailable",
+            ),
             (
                 stellar_agent_smart_account::SaError::LedgerWitnessUnavailable { reason: "fixed" },
                 "smart_account.ledger_witness_unavailable",
@@ -1043,7 +1071,9 @@ mod tests {
         let adapter = DefindexVaultAdapter::new();
         let pin = test_pin();
         let rpc = test_rpc();
-        let ctx = DefiAdapterCtx::new("default", &pin, &rpc);
+        let mut ctx = DefiAdapterCtx::new("default", &pin, &rpc);
+        ctx.submission_recorder =
+            Some(&stellar_agent_smart_account::signing::intent_test_helpers::NoLimitRecorder);
         let args = deposit_args();
 
         // Use the registered "lend" verb to obtain a valid SubmitWitness.
@@ -1073,7 +1103,9 @@ mod tests {
         let adapter = DefindexVaultAdapter::new();
         let pin = test_pin();
         let rpc = test_rpc();
-        let ctx = DefiAdapterCtx::new("default", &pin, &rpc);
+        let mut ctx = DefiAdapterCtx::new("default", &pin, &rpc);
+        ctx.submission_recorder =
+            Some(&stellar_agent_smart_account::signing::intent_test_helpers::NoLimitRecorder);
 
         // Use "lend" (registered verb) to get a valid SubmitWitness.
         let gate_result = dispatch_gate("lend", "test-req-2");

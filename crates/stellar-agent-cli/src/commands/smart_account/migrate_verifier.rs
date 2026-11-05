@@ -379,6 +379,7 @@ fn dry_run_signers_manager(
         timeout,
         audit_writer,
         &audit_log_path,
+        None,
     )?;
     Ok((manager, chain_id))
 }
@@ -501,11 +502,29 @@ pub async fn run(args: &MigrateVerifierArgs) -> i32 {
     }
 
     // Build handler context: resolves signer, opens audit writer, constructs RPC handles.
-    let ctx =
-        match CommonHandlerContext::new(args, resolved_profile, profile, origin, &context).await {
-            Ok(ctx) => ctx,
-            Err(e) => return emit_error(&e, &request_id),
-        };
+    let ctx = match async {
+        let admission = crate::commands::smart_account::common::submission_admission(
+            &profile,
+            origin,
+            &resolved_profile.name,
+            "stellar_smart_account_migrate_verifier",
+            &context,
+        )?;
+        CommonHandlerContext::new(
+            args,
+            resolved_profile,
+            profile,
+            origin,
+            &context,
+            Some(admission),
+        )
+        .await
+    }
+    .await
+    {
+        Ok(ctx) => ctx,
+        Err(e) => return emit_error(&e, &request_id),
+    };
 
     // Build the SignersManager — needed by MigrationPlanner for RPC access.
     let manager = match ctx.signers_manager() {
@@ -1086,6 +1105,104 @@ mod tests {
         RuleMigration, SignerStepSubmitOutcome,
     };
     use stellar_xdr::ScVal;
+
+    #[tokio::test]
+    #[serial_test::serial]
+    #[allow(clippy::unwrap_used, reason = "test fixture assertions")]
+    async fn migrate_verifier_submission_admits_under_its_own_identifier() {
+        use stellar_agent_core::policy::v1::criteria::state_store::{
+            StateKey, WindowEntry, WindowLimit,
+        };
+        use stellar_agent_network::policy_state::PersistedWindowStore;
+        for tool in [
+            "stellar_smart_account_migrate_verifier",
+            "stellar_smart_account_signers",
+        ] {
+            stellar_agent_test_support::keyring_mock::install().unwrap();
+            let dir = tempfile::tempdir().unwrap();
+            let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(dir.path());
+            let profile = stellar_agent_core::profile::schema::Profile::builder_testnet_named(
+                "intent",
+                "migration",
+                "account",
+                "migration-nonce",
+                "account",
+            )
+            .build();
+            let owner = ed25519_dalek::SigningKey::from_bytes(&[0x53; 32]);
+            let owner_key = stellar_agent_core::profile::owner_key::encode_owner_public_key(
+                &owner.verifying_key().to_bytes(),
+            );
+            keyring_core::Entry::new(
+                &profile.policy_owner_key_id.service,
+                &profile.policy_owner_key_id.account,
+            )
+            .unwrap()
+            .set_password(&owner_key)
+            .unwrap();
+            let body = format!(
+                "version = 1\nscope = \"profile:intent\"\n[[rules]]\nmatch = {{ tool = \"{tool}\", chain = \"*\" }}\ncriteria = [{{kind = \"rate_limit\", window = \"1m\", max_calls = 1}}]\ndecision = \"allow\"\n"
+            );
+            let digest = stellar_agent_core::policy::v1::signature::digest(
+                &stellar_agent_core::policy::v1::canonical::canonical_bytes(&body).unwrap(),
+            );
+            let signature = stellar_agent_core::policy::v1::signature::sign(&digest, &owner);
+            let policies = stellar_agent_core::profile::schema::default_policy_dir().unwrap();
+            std::fs::create_dir_all(&policies).unwrap();
+            std::fs::write(
+                policies.join("intent.toml"),
+                format!(
+                    "{body}\n[signature]\nowner_id = \"{}\"\nsig = \"{}\"\n",
+                    stellar_strkey::ed25519::PublicKey(owner.verifying_key().to_bytes()),
+                    stellar_agent_core::hex::encode(&signature)
+                ),
+            )
+            .unwrap();
+            let now = stellar_agent_core::timefmt::now_unix_ms().unwrap();
+            let window = PersistedWindowStore::for_profile("intent");
+            window
+                .record_and_persist(
+                    &profile,
+                    &[WindowEntry::new(
+                        StateKey::new("intent", 1, "rate_limit", 60),
+                        now,
+                        1,
+                        WindowLimit::Count {
+                            window: "1m".into(),
+                            max_calls: 1,
+                        },
+                    )],
+                )
+                .unwrap();
+            let before = std::fs::read(window.path()).unwrap();
+            let admission = crate::commands::submission_record::no_value_admission(
+                &profile,
+                "intent",
+                "stellar_smart_account_migrate_verifier",
+                "stellar:testnet",
+                now,
+            )
+            .unwrap();
+            let plan =
+                stellar_agent_network::signed_intent::test_helpers::intent_fixture_plan(1, 60).0;
+            let result = admission.admit(&plan).await;
+            if tool == "stellar_smart_account_migrate_verifier" {
+                assert_eq!(
+                    result.err().unwrap().code(),
+                    "policy.deny.rate_limit_exceeded"
+                );
+            } else {
+                assert!(result.unwrap().expose().intent_id().is_none());
+            }
+            assert_eq!(std::fs::read(window.path()).unwrap(), before);
+            assert!(
+                window
+                    .signed_intents("intent", &profile)
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+    }
 
     /// A smart-account C-strkey for the recovery fixtures.
     const ACCOUNT: &str = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM";

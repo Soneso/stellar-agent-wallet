@@ -3717,6 +3717,24 @@ pub enum SubmissionError {
         /// reading the field directly must apply redaction before logging.
         server: String,
     },
+
+    /// Smart account intent accounting cannot establish a durable charge.
+    #[error(
+        "Smart-account intent recording is unavailable ({class}). Existing exposed charges remain."
+    )]
+    IntentRecordUnavailable {
+        /// The fixed failure class.
+        class: &'static str,
+    },
+
+    /// The signing request or envelope differs from the admitted authority.
+    #[error(
+        "The signing request or final transaction does not match its admitted intent ({field}). Existing exposed charges remain."
+    )]
+    IntentBindingMismatch {
+        /// The fixed mismatching field.
+        field: &'static str,
+    },
 }
 
 impl SubmissionError {
@@ -3734,6 +3752,8 @@ impl SubmissionError {
             Self::RecordUnavailable { .. } => "submission.record_unavailable",
             Self::SettlementUnverifiable => "submission.settlement_unverifiable",
             Self::HashMismatch { .. } => "submission.hash_mismatch",
+            Self::IntentRecordUnavailable { .. } => "submission.intent_record_unavailable",
+            Self::IntentBindingMismatch { .. } => "submission.intent_binding_mismatch",
         }
     }
 }
@@ -5109,6 +5129,16 @@ mod tests {
         let full_hash =
             "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789".to_owned();
         let cases: Vec<(SubmissionError, &'static str)> = vec![
+            (
+                SubmissionError::IntentRecordUnavailable {
+                    class: "window_unavailable",
+                },
+                "submission.intent_record_unavailable",
+            ),
+            (
+                SubmissionError::IntentBindingMismatch { field: "signers" },
+                "submission.intent_binding_mismatch",
+            ),
             (
                 SubmissionError::SequenceNumberStale,
                 "submission.sequence_number_stale",

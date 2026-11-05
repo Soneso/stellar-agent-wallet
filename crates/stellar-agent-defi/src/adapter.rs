@@ -134,23 +134,21 @@ impl DefiPreview {
 ///
 /// Carries the structural context required by protocol adapters: active profile
 /// name, the resolved `DefiContractPin` for the verb, primary RPC accessor, and
-/// the submit-time context (signer, network passphrase, chain ID, optional
-/// secondary RPC, timeout).
+/// the submission context, including its signer, network, witness endpoint,
+/// timeout, and checked recorder.
 ///
 /// `#[non_exhaustive]` so further fields grow additively without breaking
 /// the trait signature.
 ///
 /// # Submit context fields
 ///
-/// The `signer`, `network_passphrase`, `chain_id`, `secondary_rpc`, and
-/// `timeout` fields carry everything a concrete adapter's `submit` needs to
-/// call `submit_signed_invoke` without re-implementing that logic in the MCP
-/// tool or CLI.  The secondary RPC is threaded here rather than via a separate
-/// site because it is structurally part of the adapter's submit context.
+/// The signer, network passphrase, chain identifier, secondary endpoint,
+/// timeout, and submission recorder supply the shared signing flow.
+/// The recorder provides checked admission before any signature.
 ///
-/// Fields are `Option<...>` where the value is genuinely optional for
-/// preview-only calls (no signer needed for preview).  `submit` returns a
-/// `DefiAdapterError::InvalidArguments` when required fields are `None`.
+/// Preview calls can omit submission fields. A missing recorder refuses with
+/// [`DefiAdapterError::SigningRefusal`] before network access. Other missing
+/// required fields return [`DefiAdapterError::InvalidArguments`].
 ///
 /// # `auth_rule_ids`
 ///
@@ -238,15 +236,11 @@ pub struct DefiAdapterCtx<'a> {
     /// `stellar_agent_mcp::sequence_floor`'s CLI-out-of-scope-by-design
     /// discipline for the classic commit verbs.
     pub sequence_floor: Option<&'a dyn stellar_agent_network::SequenceFloorHook>,
-    /// Durable-submission recorder, threaded through to
-    /// `SubmitInvokeArgs::submission_recorder` at the adapter's
-    /// `submit_signed_invoke` call site.
+    /// Checked admission and durable submission recorder for smart-account signing.
     ///
-    /// When `Some`, the recorder owns the value-action rows and the
-    /// spending-window reservation for this submission: it writes the pending
-    /// row before the send and the submitted or failed row after, so
-    /// [`Self::emit_value_action_submitted`] stands down. `None` leaves the
-    /// unrecorded behaviour, where the confirmed row is emitted here.
+    /// Adapters pass this recorder through `SubmitInvokeArgs::admission`.
+    /// A missing recorder refuses before signing with `submission.intent_record_unavailable`.
+    /// The recorder owns value-action rows and the retained intent charge.
     pub submission_recorder: Option<&'a dyn stellar_agent_network::SubmissionRecorder>,
 }
 
@@ -543,12 +537,10 @@ pub enum DefiAdapterError {
         /// The typed denial, as the governing criterion produced it.
         reason: Box<stellar_agent_core::policy::DenyReason>,
     },
-    /// The signing path refused before any signature was made, and nothing was
-    /// sent.
+    /// The signing or binding path refuses without sending a transaction.
     ///
-    /// Distinct from [`Self::Network`] and [`Self::SubmissionUnresolved`]: the
-    /// refusal has its own stable `wire_code`, which the surface reports
-    /// unchanged, and no transaction exists to reconcile.
+    /// The surface preserves its stable `wire_code`. An authorization signature
+    /// can already exist, so an exposed intent keeps its charge.
     #[error("{message}")]
     SigningRefusal {
         /// The stable wire code of the refusal.

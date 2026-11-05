@@ -26,7 +26,7 @@
 //!    audit row; `set_weighted_threshold` to 2 (still authorized by A alone,
 //!    against the pre-call threshold of 1); the same single-signer (A) auth
 //!    now fails (3213 `NotAllowed`, weight 1 < threshold 2); dual-signer auth
-//!    via `AuthorizationInfo`/`collect_quorum_signatures` succeeds (weight
+//!    via `AuthorizationInfo`/`plan_quorum_signatures` succeeds (weight
 //!    sum 1 + 2 = 3 >= threshold 2).
 //! 4. `deploy_c_external_ed25519_genesis_testnet_acceptance` — two decoupled
 //!    claims kept in one test: (a) deploys a smart account with an
@@ -872,7 +872,7 @@ async fn weighted_threshold_ordering_proof_testnet_acceptance() {
 ///    by signer A alone (the retune itself validates against the threshold
 ///    as it stood BEFORE this call takes effect, i.e. 1).
 /// 4. The SAME single-signer (A) auth now fails (weight 1 < threshold 2).
-/// 5. Dual-signer auth via `AuthorizationInfo` / `collect_quorum_signatures`
+/// 5. Dual-signer auth via `AuthorizationInfo` / `plan_quorum_signatures`
 ///    succeeds — the weight sum is now 1 (A) + 2 (B, bumped in step 2) = 3,
 ///    which is >= threshold 2.
 #[tokio::test]
@@ -997,6 +997,9 @@ async fn weighted_threshold_enforcement_proof_testnet_acceptance() {
     );
     let single_signer_result_1 = submit_signed_invoke(
         SubmitInvokeArgs::builder()
+            .admission(stellar_agent_network::SigningAdmission::NoValue(
+                stellar_agent_smart_account::signing::intent_test_helpers::no_value_admission(),
+            ))
             .target_contract(&smart_account_strkey)
             .auth_rule_ids(auth_rule_ids.as_slice())
             .host_function(read_threshold_fn.clone())
@@ -1134,6 +1137,9 @@ async fn weighted_threshold_enforcement_proof_testnet_acceptance() {
     // ── the SAME single-signer auth now fails (weight 1 < threshold 2) ───────
     let single_signer_result_2 = submit_signed_invoke(
         SubmitInvokeArgs::builder()
+            .admission(stellar_agent_network::SigningAdmission::NoValue(
+                stellar_agent_smart_account::signing::intent_test_helpers::no_value_admission(),
+            ))
             .target_contract(&smart_account_strkey)
             .auth_rule_ids(auth_rule_ids.as_slice())
             .host_function(read_threshold_fn.clone())
@@ -1164,7 +1170,7 @@ async fn weighted_threshold_enforcement_proof_testnet_acceptance() {
         other => panic!("expected DeploymentFailed{{phase:\"simulate\"}}; got {other:?}"),
     }
 
-    // ── dual-signer auth via AuthorizationInfo/collect_quorum_signatures succeeds ──
+    // ── dual-signer auth via AuthorizationInfo/plan_quorum_signatures succeeds ──
     let signer_a_pk = stellar_strkey::ed25519::PublicKey::from_string(&signer_a_g)
         .expect("signer A G-strkey must parse")
         .0;
@@ -1183,6 +1189,9 @@ async fn weighted_threshold_enforcement_proof_testnet_acceptance() {
 
     let dual_signer_result = submit_signed_invoke(
         SubmitInvokeArgs::builder()
+            .admission(stellar_agent_network::SigningAdmission::NoValue(
+                stellar_agent_smart_account::signing::intent_test_helpers::no_value_admission(),
+            ))
             .target_contract(&smart_account_strkey)
             .auth_rule_ids(auth_rule_ids.as_slice())
             .host_function(read_threshold_fn)

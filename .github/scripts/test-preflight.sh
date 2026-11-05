@@ -1318,7 +1318,7 @@ case_vendored() {
   edit crates/stellar-agent-smart-account/vendor/cap85-beacon/v0.1.0/REFERENCE.md
   pin_packages "stellar-agent-smart-account stellar-agent-approval-remote stellar-agent-cli \
 stellar-agent-defindex stellar-agent-dex stellar-agent-mcp stellar-agent-smart-account-acceptance \
-stellar-agent-webauthn-bridge" test-helpers \
+stellar-agent-webauthn-bridge" test-helpers,test-hooks \
     crates/stellar-agent-smart-account/vendor/cap85-beacon/v0.1.0/REFERENCE.md
   expect_list "${ALWAYS[@]}" vendored-tree-check "${PACKAGE_GATES[@]}" test-vendored-release-cfg
 }

@@ -323,6 +323,14 @@ impl DefiAdapter for DexSwapAdapter {
         ctx: &DefiAdapterCtx<'_>,
         witness: SubmitWitness,
     ) -> Result<(), DefiAdapterError> {
+        let recorder = ctx.submission_recorder.ok_or_else(|| {
+            map_submit_invoke_error(
+                &stellar_agent_smart_account::SaError::IntentRecordUnavailable {
+                    class: "missing_recorder",
+                },
+            )
+        })?;
+
         // ── Fail-closed downcast ──────────────────────────────────────────
         let trade_args = args
             .downcast_ref::<TradeArgs>()
@@ -546,7 +554,7 @@ impl DefiAdapter for DexSwapAdapter {
                 .op_label(DEX_SUBMIT_OP_LABEL)
                 .emit_observability_logs(true)
                 .maybe_sequence_floor(ctx.sequence_floor)
-                .maybe_submission_recorder(ctx.submission_recorder)
+                .admission(stellar_agent_network::SigningAdmission::Recorded(recorder))
                 .build(),
         )
         .await;
@@ -621,7 +629,9 @@ fn map_submit_invoke_error(error: &stellar_agent_smart_account::SaError) -> Defi
             envelope_hash: envelope_hash.clone(),
             timeout_seconds: *timeout_seconds,
         },
-        refusal @ (stellar_agent_smart_account::SaError::LedgerWitnessUnavailable { .. }
+        refusal @ (stellar_agent_smart_account::SaError::IntentRecordUnavailable { .. }
+        | stellar_agent_smart_account::SaError::IntentBindingMismatch { .. }
+        | stellar_agent_smart_account::SaError::LedgerWitnessUnavailable { .. }
         | stellar_agent_smart_account::SaError::LedgerWitnessMismatch { .. }) => {
             DefiAdapterError::SigningRefusal {
                 wire_code: refusal.wire_code(),
@@ -782,6 +792,34 @@ mod tests {
 
     use super::*;
 
+    #[tokio::test]
+    async fn submitting_without_a_recorder_refuses_before_network_io() {
+        use stellar_agent_defi::dispatch::{GateOutcome, dispatch_gate};
+        let adapter = DexSwapAdapter::new();
+        let pin = stellar_agent_defi::pins::DefiContractPin::new(
+            "trade",
+            "v1",
+            "default",
+            "stellar:testnet",
+            "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+            [0; 32],
+            "fixture",
+        );
+        let rpc = stellar_agent_network::StellarRpcClient::new("http://127.0.0.1:1").unwrap();
+        let ctx = DefiAdapterCtx::new("default", &pin, &rpc);
+        let GateOutcome::Allow(witness) = dispatch_gate("trade", "no-recorder").unwrap() else {
+            panic!("registered trade");
+        };
+        let error = adapter.submit(&(), &ctx, witness).await.unwrap_err();
+        assert!(matches!(
+            error,
+            DefiAdapterError::SigningRefusal {
+                wire_code: "submission.intent_record_unavailable",
+                ..
+            }
+        ));
+    }
+
     /// A refusal the spending window decided reaches the adapter surface as a
     /// policy denial, not as a network failure that moved nothing.
     #[test]
@@ -826,6 +864,16 @@ mod tests {
     #[test]
     fn a_witness_refusal_keeps_its_wire_code_through_the_adapter_mapping() {
         for (error, code) in [
+            (
+                stellar_agent_smart_account::SaError::IntentBindingMismatch { field: "signers" },
+                "submission.intent_binding_mismatch",
+            ),
+            (
+                stellar_agent_smart_account::SaError::IntentRecordUnavailable {
+                    class: "missing_recorder",
+                },
+                "submission.intent_record_unavailable",
+            ),
             (
                 stellar_agent_smart_account::SaError::LedgerWitnessUnavailable { reason: "fixed" },
                 "smart_account.ledger_witness_unavailable",

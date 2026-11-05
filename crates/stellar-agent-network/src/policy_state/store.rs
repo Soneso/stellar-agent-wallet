@@ -342,7 +342,7 @@ pub(super) const WIRE_VERSION_LEDGER: u32 = 4;
 /// A file written by a newer build carries records this one cannot account
 /// for, so it is refused rather than read with the fields it happens to
 /// recognise.
-pub(super) const WIRE_VERSION_MAX: u32 = 8;
+pub(super) const WIRE_VERSION_MAX: u32 = 9;
 
 /// Wire version binding the accounting network on every snapshot.
 pub(super) const WIRE_VERSION_CHAIN: u32 = 5;
@@ -356,8 +356,19 @@ pub(super) const WIRE_VERSION_EXPOSURE: u32 = 7;
 /// Wire version carrying durable accounting-expiry audit obligations.
 pub(super) const WIRE_VERSION_EXPIRY: u32 = 8;
 
+/// Wire version carrying signed intents and their reservation links.
+pub(super) const WIRE_VERSION_INTENT: u32 = 9;
+
 fn select_wire_version(wire: &WireFile) -> u32 {
-    if !wire.accounting_expiries.is_empty() {
+    if !wire.signed_intents.is_empty()
+        || wire
+            .entries
+            .iter()
+            .flat_map(|b| &b.records)
+            .any(|r| r.signed_intent.is_some())
+    {
+        WIRE_VERSION_INTENT
+    } else if !wire.accounting_expiries.is_empty() {
         WIRE_VERSION_EXPIRY
     } else if wire
         .entries
@@ -674,9 +685,9 @@ pub(super) struct AccountingExpiryRecord {
     /// The greatest affected accounting horizon, in unix milliseconds.
     accounting_until_ms: u64,
     /// Whether the verified audit history holds this decision's event.
-    audit_acknowledged: bool,
+    pub(super) audit_acknowledged: bool,
     /// Whether the receipt projection completed.
-    receipt_projected: bool,
+    pub(super) receipt_projected: bool,
 }
 
 /// Derives the decision identifier of an accounting expiry: lowercase
@@ -773,6 +784,8 @@ impl AccountingExpiryRecord {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(super) struct WireRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) signed_intent: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) chain_scope: Option<ChainScope>,
     #[serde(
         default,
@@ -833,6 +846,7 @@ impl WireRecord {
     /// timestamp and amount at the call site.
     pub(super) fn confirmed_defaults() -> Self {
         Self {
+            signed_intent: None,
             chain_scope: None,
             submission_anchor: None,
             execution_bound: None,
@@ -1120,10 +1134,158 @@ pub(super) struct WireFile {
     /// form.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(super) accounting_expiries: Vec<AccountingExpiryRecord>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(super) signed_intents: Vec<SignedIntentRecord>,
     /// Prepared next generation, authenticated with the current snapshot.
     /// The keyring counter selects exactly one side of the atomic commit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) prepared: Option<Box<WireFile>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(super) enum SignedIntentStatus {
+    Exposed,
+    Bound,
+}
+
+impl SignedIntentStatus {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Exposed => "authorization exposed, submission unknown",
+            Self::Bound => "authorization exposed, submission bound",
+        }
+    }
+}
+
+/// A redacted read-only view of a retained intent leg.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct SignedIntentLegView {
+    /// The bounded accounting bucket label.
+    pub bucket: String,
+    /// The admitted window duration in seconds.
+    pub window_secs: u64,
+    /// The amount as a decimal string.
+    pub amount: String,
+}
+
+/// A redacted read-only view of an authenticated signed intent.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct SignedIntentView {
+    /// The durable intent identity.
+    pub intent_id: String,
+    /// The authorization exposure and submission status.
+    pub status: String,
+    /// The redacted authorization address.
+    pub auth_address: String,
+    /// The accounting legs charged by this intent.
+    pub legs: Vec<SignedIntentLegView>,
+    /// The largest authorization expiration, when an entry expires.
+    pub greatest_expiration_ledger: Option<u32>,
+    /// The admission timestamp in milliseconds.
+    pub admitted_at_ms: u64,
+    /// The bound transaction hash, when present.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bound_tx_hash: Option<String>,
+    /// The accounting horizon, always open.
+    pub accounting_horizon: String,
+}
+
+impl SignedIntentView {
+    /// Returns the exposure and submission status label.
+    #[must_use]
+    pub fn status_label(&self) -> &str {
+        &self.status
+    }
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct IntentLeg {
+    scope_specificity: u8,
+    bucket: String,
+    window_secs: u64,
+    ts_ms: u64,
+    #[serde(with = "i128_decimal_str")]
+    amount: i128,
+}
+
+impl IntentLeg {
+    fn from_entry(entry: &WindowEntry) -> Self {
+        Self {
+            scope_specificity: entry.key().scope_specificity(),
+            bucket: entry.key().bucket().into(),
+            window_secs: entry.key().window_secs(),
+            ts_ms: entry.timestamp_ms(),
+            amount: entry.amount(),
+        }
+    }
+    fn identity(&self) -> (u8, &str, u64, i128) {
+        (
+            self.scope_specificity,
+            &self.bucket,
+            self.window_secs,
+            self.amount,
+        )
+    }
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct SignedIntentRecord {
+    intent_id: String,
+    chain_scope: ChainScope,
+    auth_address: String,
+    envelope_source: String,
+    envelope_sequence: i64,
+    #[serde(with = "crate::signed_intent::hash_hex")]
+    host_invocation_sha256: [u8; 32],
+    subjects: Vec<crate::signed_intent::SubjectFacts>,
+    greatest_expiration_ledger: Option<u32>,
+    legs: Vec<IntentLeg>,
+    admitted_at_ms: u64,
+    generation: u64,
+    status: SignedIntentStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    bound_envelope_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    bound_tx_hash: Option<String>,
+    #[serde(
+        default,
+        with = "crate::signed_intent::option_hash_hex",
+        skip_serializing_if = "Option::is_none"
+    )]
+    cancel_token_sha256: Option<[u8; 32]>,
+}
+
+impl SignedIntentRecord {
+    fn facts(&self) -> crate::signed_intent::PlanFacts {
+        crate::signed_intent::PlanFacts {
+            chain_scope: self.chain_scope,
+            auth_address: self.auth_address.clone(),
+            envelope_source: self.envelope_source.clone(),
+            envelope_sequence: self.envelope_sequence,
+            host_invocation_sha256: self.host_invocation_sha256,
+            subjects: self.subjects.clone(),
+            greatest_expiration_ledger: self.greatest_expiration_ledger,
+        }
+    }
+    fn same_legs(&self, entries: &[WindowEntry]) -> bool {
+        let mut stored: Vec<_> = self.legs.iter().map(IntentLeg::identity).collect();
+        let mut requested: Vec<_> = entries
+            .iter()
+            .map(|entry| {
+                (
+                    entry.key().scope_specificity(),
+                    entry.key().bucket(),
+                    entry.key().window_secs(),
+                    entry.amount(),
+                )
+            })
+            .collect();
+        stored.sort();
+        requested.sort();
+        stored == requested
+    }
 }
 
 /// Decimal-string `i128` serde adapter, mirroring
@@ -1552,6 +1714,63 @@ impl PersistedWindowStore {
         profile: &Profile,
         dest: &PolicyStateStore,
     ) -> Result<(), WindowStoreError> {
+        let Some(wire) = self.read_verified_unlocked(profile_name, profile)? else {
+            return Ok(());
+        };
+        for intent in &wire.signed_intents {
+            for leg in &intent.legs {
+                let key = StateKey::new(
+                    profile_name,
+                    leg.scope_specificity,
+                    &leg.bucket,
+                    leg.window_secs,
+                );
+                dest.append_exposure(&key, leg.ts_ms, leg.amount, &intent.intent_id, None, None)
+                    .map_err(|error| WindowStoreError::Invalid {
+                        detail: format!("in-memory intent append failed: {error}"),
+                    })?;
+            }
+        }
+        for entry in wire.entries {
+            let key = StateKey::new(
+                profile_name,
+                entry.scope_specificity,
+                &entry.bucket,
+                entry.window_secs,
+            );
+            for record in entry.records {
+                if record.signed_intent.is_some() {
+                    continue;
+                }
+                let appended = if is_exposure(&record) {
+                    let accounting_at = execution_bound(&record)
+                        .map(|bound| bound.max(record.observed_at_ms.unwrap_or(0)));
+                    dest.append_exposure(
+                        &key,
+                        record.ts_ms,
+                        record.amount,
+                        &record.id,
+                        accounting_at,
+                        exposure_horizon(&record, entry.window_secs),
+                    )
+                } else if record.status == RecordStatus::Confirmed {
+                    dest.append(&key, record.ts_ms, record.amount)
+                } else {
+                    continue;
+                };
+                appended.map_err(|e| WindowStoreError::Invalid {
+                    detail: format!("in-memory store append failed: {e}"),
+                })?;
+            }
+        }
+        Ok(())
+    }
+
+    fn read_verified_unlocked(
+        &self,
+        profile_name: &str,
+        profile: &Profile,
+    ) -> Result<Option<WireFile>, WindowStoreError> {
         let entry_ref = &profile.policy_window_state_key_id;
         refuse_owner_coordinate(profile)?;
         let gen_entry = generation_entry_ref(profile);
@@ -1568,7 +1787,7 @@ impl PersistedWindowStore {
             Ok(b) => b,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 return match load_generation(&gen_entry)? {
-                    None => Ok(()), // genuine first run — no key, no file, no history.
+                    None => Ok(None),
                     // Deletion detected.
                     Some(_) => Err(mainnet_loading_error(
                         profile,
@@ -1595,36 +1814,49 @@ impl PersistedWindowStore {
                 mainnet_loading_error(profile, e, defect)
             })?;
 
-        for entry in wire.entries {
-            let key = StateKey::new(
-                profile_name,
-                entry.scope_specificity,
-                &entry.bucket,
-                entry.window_secs,
-            );
-            for record in entry.records {
-                let appended = if is_exposure(&record) {
-                    let accounting_at = execution_bound(&record)
-                        .map(|bound| bound.max(record.observed_at_ms.unwrap_or(0)));
-                    dest.append_exposure(
-                        &key,
-                        record.ts_ms,
-                        record.amount,
-                        &record.id,
-                        accounting_at,
-                        exposure_horizon(&record, entry.window_secs),
-                    )
-                } else if record.status == RecordStatus::Confirmed {
-                    dest.append(&key, record.ts_ms, record.amount)
-                } else {
-                    continue;
-                };
-                appended.map_err(|e| WindowStoreError::Invalid {
-                    detail: format!("in-memory store append failed: {e}"),
-                })?;
-            }
-        }
-        Ok(())
+        Ok(Some(wire))
+    }
+
+    /// Lists authenticated signed intents without changing the window or its keyring.
+    ///
+    /// # Errors
+    /// Refuses unreadable, malformed, or unauthenticated state.
+    pub fn signed_intents(
+        &self,
+        profile_name: &str,
+        profile: &Profile,
+    ) -> Result<Vec<SignedIntentView>, WindowStoreError> {
+        let Some(wire) = self.read_verified_unlocked(profile_name, profile)? else {
+            return Ok(Vec::new());
+        };
+        Ok(wire
+            .signed_intents
+            .into_iter()
+            .map(|record| {
+                let auth_address =
+                    stellar_agent_core::observability::redact::redact_strkey_first5_last5(
+                        &record.auth_address,
+                    );
+                SignedIntentView {
+                    intent_id: record.intent_id,
+                    status: record.status.label().into(),
+                    auth_address,
+                    legs: record
+                        .legs
+                        .into_iter()
+                        .map(|leg| SignedIntentLegView {
+                            bucket: bounded_reset_bucket(&leg.bucket),
+                            window_secs: leg.window_secs,
+                            amount: leg.amount.to_string(),
+                        })
+                        .collect(),
+                    greatest_expiration_ledger: record.greatest_expiration_ledger,
+                    admitted_at_ms: record.admitted_at_ms,
+                    bound_tx_hash: record.bound_tx_hash,
+                    accounting_horizon: "open".into(),
+                }
+            })
+            .collect())
     }
 
     /// Locks, re-reads and fully verifies the current on-disk state (HMAC +
@@ -1763,6 +1995,209 @@ impl PersistedWindowStore {
         new_entries: &[WindowEntry],
         reservation: &SubmissionHold,
     ) -> Result<MintOutcome, WindowStoreError> {
+        self.record_pending_inner(profile, new_entries, reservation, None)
+    }
+
+    /// Charges an immutable signing plan before its first signature.
+    ///
+    /// # Errors
+    /// Refuses unavailable state, conflicting authority, or an exhausted limit.
+    pub fn admit_signed_intent(
+        &self,
+        profile: &Profile,
+        plan: &crate::SignedIntentPlan,
+    ) -> Result<crate::IntentProof, WindowStoreError> {
+        plan.chain_scope().require_profile(profile)?;
+        self.ensure_parent_dir()?;
+        let _lock = WindowStoreLock::acquire_for_with_retry(
+            &self.path,
+            &profile.policy_window_state_key_id,
+        )?;
+        let (key, _) = self.load_or_mint_key(profile)?;
+        let gen_entry = generation_entry_ref(profile);
+        let mut wire = self.read_verified(profile, &key, &gen_entry)?;
+        if wire.chain_scope != Some(plan.chain_scope()) {
+            return Err(WindowStoreError::ChainMismatch);
+        }
+        let original = wire.clone();
+        let now = now_ms()?;
+        let entries: Vec<_> = plan
+            .legs()
+            .iter()
+            .map(|entry| {
+                WindowEntry::new(
+                    entry.key().clone(),
+                    now,
+                    entry.amount(),
+                    entry.limit().clone(),
+                )
+            })
+            .collect();
+        let frozen = plan.with_legs(&entries);
+        let id = frozen.facts.intent_id();
+        let proof = crate::IntentProof::new(Some(id.clone()), frozen);
+        if let Some(record) = wire
+            .signed_intents
+            .iter_mut()
+            .find(|record| record.intent_id == id)
+        {
+            if !record.same_legs(&entries) {
+                return Err(WindowStoreError::IntentBindingMismatch { field: "legs" });
+            }
+            record.cancel_token_sha256 = None;
+            self.commit_generation(&key, &gen_entry, original, wire)?;
+            return Ok(proof);
+        }
+        if wire.signed_intents.iter().any(|record| {
+            record.subjects.iter().any(|prior| {
+                prior.nonce.is_some()
+                    && plan.facts.subjects.iter().any(|next| {
+                        prior.credential == next.credential && prior.nonce == next.nonce
+                    })
+            })
+        }) {
+            return Err(WindowStoreError::IntentBindingMismatch { field: "plan" });
+        }
+        admit(&wire, &entries)?;
+        let facts = &plan.facts;
+        wire.signed_intents.push(SignedIntentRecord {
+            intent_id: id,
+            chain_scope: facts.chain_scope,
+            auth_address: facts.auth_address.clone(),
+            envelope_source: facts.envelope_source.clone(),
+            envelope_sequence: facts.envelope_sequence,
+            host_invocation_sha256: facts.host_invocation_sha256,
+            subjects: facts.subjects.clone(),
+            greatest_expiration_ledger: facts.greatest_expiration_ledger,
+            legs: entries.iter().map(IntentLeg::from_entry).collect(),
+            admitted_at_ms: now,
+            generation: increment_generation(wire.generation)?,
+            status: SignedIntentStatus::Exposed,
+            bound_envelope_hash: None,
+            bound_tx_hash: None,
+            cancel_token_sha256: Some(Sha256::digest(proof.cancel_token).into()),
+        });
+        prune_stale(&mut wire, now);
+        self.commit_generation(&key, &gen_entry, original, wire)?;
+        Ok(proof)
+    }
+
+    /// Cancels only an unconsumed proof's exclusively held admission.
+    ///
+    /// # Errors
+    /// Refuses unavailable state or a bound intent.
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "cancellation consumes the unique proof"
+    )]
+    pub fn cancel_signed_intent(
+        &self,
+        profile: &Profile,
+        proof: crate::IntentProof,
+    ) -> Result<(), WindowStoreError> {
+        let Some(id) = &proof.intent_id else {
+            return Ok(());
+        };
+        proof.plan().chain_scope().require_profile(profile)?;
+        self.ensure_parent_dir()?;
+        let _lock = WindowStoreLock::acquire_for_with_retry(
+            &self.path,
+            &profile.policy_window_state_key_id,
+        )?;
+        let (key, _) = self.load_or_mint_key(profile)?;
+        let gen_entry = generation_entry_ref(profile);
+        let mut wire = self.read_verified(profile, &key, &gen_entry)?;
+        let Some(index) = wire
+            .signed_intents
+            .iter()
+            .position(|record| &record.intent_id == id)
+        else {
+            return Ok(());
+        };
+        let record = &wire.signed_intents[index];
+        if record.status == SignedIntentStatus::Bound {
+            return Err(WindowStoreError::IntentBindingMismatch {
+                field: "intent_state",
+            });
+        }
+        let token_hash: [u8; 32] = Sha256::digest(proof.cancel_token).into();
+        if record.cancel_token_sha256 != Some(token_hash) {
+            return Ok(());
+        }
+        let original = wire.clone();
+        wire.signed_intents.remove(index);
+        self.commit_generation(&key, &gen_entry, original, wire)
+    }
+
+    /// Binds a final envelope to its authenticated admission without charging again.
+    ///
+    /// # Errors
+    /// Refuses unavailable state or the first fact that differs from the plan.
+    pub fn bind_signed_intent(
+        &self,
+        profile: &Profile,
+        intent_id: &str,
+        facts: &crate::BindFacts,
+        legs: &[WindowEntry],
+    ) -> Result<(), WindowStoreError> {
+        self.ensure_parent_dir()?;
+        let _lock = WindowStoreLock::acquire_for_with_retry(
+            &self.path,
+            &profile.policy_window_state_key_id,
+        )?;
+        let (key, _) = self.load_or_mint_key(profile)?;
+        let gen_entry = generation_entry_ref(profile);
+        let mut wire = self.read_verified(profile, &key, &gen_entry)?;
+        let original = wire.clone();
+        let record = wire
+            .signed_intents
+            .iter_mut()
+            .find(|record| record.intent_id == intent_id)
+            .ok_or(WindowStoreError::IntentBindingMismatch {
+                field: "intent_state",
+            })?;
+        record
+            .facts()
+            .compare(&facts.facts)
+            .map_err(|field| WindowStoreError::IntentBindingMismatch { field })?;
+        if !record.same_legs(legs) {
+            return Err(WindowStoreError::IntentBindingMismatch { field: "legs" });
+        }
+        if record.status == SignedIntentStatus::Bound {
+            return if record.bound_envelope_hash.as_ref() == Some(&facts.envelope_hash) {
+                Ok(())
+            } else {
+                Err(WindowStoreError::IntentBindingMismatch { field: "envelope" })
+            };
+        }
+        record.status = SignedIntentStatus::Bound;
+        record.bound_envelope_hash = Some(facts.envelope_hash.clone());
+        record.bound_tx_hash = Some(facts.tx_hash.clone());
+        record.cancel_token_sha256 = None;
+        self.commit_generation(&key, &gen_entry, original, wire)
+    }
+
+    /// Records receipt bookkeeping linked to an intent that already carries its charge.
+    ///
+    /// # Errors
+    /// Refuses duplicate bytes or a link that differs from the bound intent.
+    pub fn record_pending_linked(
+        &self,
+        profile: &Profile,
+        entries: &[WindowEntry],
+        hold: &SubmissionHold,
+        intent_id: &str,
+    ) -> Result<MintOutcome, WindowStoreError> {
+        self.record_pending_inner(profile, entries, hold, Some(intent_id))
+    }
+
+    fn record_pending_inner(
+        &self,
+        profile: &Profile,
+        new_entries: &[WindowEntry],
+        reservation: &SubmissionHold,
+        signed_intent: Option<&str>,
+    ) -> Result<MintOutcome, WindowStoreError> {
         self.ensure_parent_dir()?;
         let _lock = WindowStoreLock::acquire_for_with_retry(
             &self.path,
@@ -1791,11 +2226,30 @@ impl PersistedWindowStore {
         // Expiry retains claimed spend and releases unclaimed holds before
         // the window is counted; remaining holds count against it.
         ledger::sweep_expired(&mut wire, now_ms);
-        admit(&wire, new_entries)?;
+        if let Some(id) = signed_intent {
+            let record = wire
+                .signed_intents
+                .iter()
+                .find(|record| record.intent_id == id)
+                .ok_or(WindowStoreError::IntentBindingMismatch {
+                    field: "intent_state",
+                })?;
+            if record.status != SignedIntentStatus::Bound
+                || record.bound_envelope_hash.as_ref() != Some(&reservation.id)
+                || !record.same_legs(new_entries)
+            {
+                return Err(WindowStoreError::IntentBindingMismatch {
+                    field: "intent_state",
+                });
+            }
+        } else {
+            admit(&wire, new_entries)?;
+        }
 
         for entry in new_entries {
             let bucket = find_or_insert_bucket(&mut wire.entries, entry.key());
             bucket.records.push(WireRecord {
+                signed_intent: signed_intent.map(str::to_owned),
                 ts_ms: entry.timestamp_ms(),
                 amount: entry.amount(),
                 chain_scope: Some(reservation.chain_scope),
@@ -2519,6 +2973,20 @@ impl PersistedWindowStore {
         {
             return Err(WindowStoreError::AccountingAuditOwed);
         }
+        if !wire.signed_intents.is_empty() {
+            return Err(WindowStoreError::SignedIntentLive {
+                exposed: wire
+                    .signed_intents
+                    .iter()
+                    .filter(|record| record.status == SignedIntentStatus::Exposed)
+                    .count(),
+                bound: wire
+                    .signed_intents
+                    .iter()
+                    .filter(|record| record.status == SignedIntentStatus::Bound)
+                    .count(),
+            });
+        }
         let retained_expiries = wire
             .accounting_expiries
             .iter()
@@ -2707,6 +3175,7 @@ impl PersistedWindowStore {
         // committed under, so its committed digest stays the same with the
         // successor beside it.
         next.version = select_wire_version(&next);
+        check_snapshot(&next)?;
         if original.generation == 0 {
             // Initialisation has no prior debit to retain. A missing trusted
             // counter on an existing file must remain a deletion error.
@@ -2715,10 +3184,19 @@ impl PersistedWindowStore {
         }
         original.prepared = Some(Box::new(next.clone()));
         self.write_atomic(key, &original)?;
+        #[cfg(test)]
+        tests::accounting_fault(tests::COMMIT_FAULT_AFTER_PREPARED)?;
         write_generation(gen_entry, &next)?;
+        #[cfg(test)]
+        tests::accounting_fault(tests::COMMIT_FAULT_AFTER_COUNTER)?;
         // The committed candidate is already durable. Compaction is optional:
         // readers use it directly if replacing the prepared image fails.
-        if let Err(error) = self.write_atomic(key, &next) {
+        #[cfg(test)]
+        let compaction = tests::accounting_fault(tests::COMMIT_FAULT_COMPACTION)
+            .and_then(|()| self.write_atomic(key, &next));
+        #[cfg(not(test))]
+        let compaction = self.write_atomic(key, &next);
+        if let Err(error) = compaction {
             tracing::warn!(
                 ?error,
                 "window store: committed prepared generation retained; compaction failed"
@@ -3308,7 +3786,7 @@ impl PersistedWindowStore {
 
     /// Sets one flag of the accounting-expiry record `decision_id` in a new
     /// authenticated successor. A flag already set writes nothing.
-    fn mark_accounting_expiry(
+    pub(super) fn mark_accounting_expiry(
         &self,
         profile: &Profile,
         decision_id: &str,
@@ -3818,6 +4296,13 @@ fn authenticated_scope(wire: &WireFile) -> Result<ChainScope, WindowStoreError> 
             return Err(WindowStoreError::ChainUnverifiable);
         }
     }
+    if wire
+        .signed_intents
+        .iter()
+        .any(|intent| intent.chain_scope != scope)
+    {
+        return Err(WindowStoreError::ChainUnverifiable);
+    }
     if let Some(prepared) = &wire.prepared
         && authenticated_scope(prepared)? != scope
     {
@@ -3829,11 +4314,12 @@ fn authenticated_scope(wire: &WireFile) -> Result<ChainScope, WindowStoreError> 
 /// Checks one snapshot's version, its authorization history and its
 /// accounting-expiry records.
 ///
-/// Versions 1 through 8 decode. Snapshots below version 4 carry no authorization
+/// Versions 1 through 9 decode. Snapshots below version 4 carry no authorization
 /// history; usable snapshots also require complete authenticated scope.
 /// Accounting-expiry records need version 8, the file's own scope, the
 /// accounting-expired disposition, a generation no later than the file's, and
 /// a unique identifier that recomputes from their fields.
+/// Signed intents and their links need version 9.
 fn check_snapshot(wire: &WireFile) -> Result<(), WindowStoreError> {
     if wire.version > WIRE_VERSION_MAX {
         return Err(WindowStoreError::UnsupportedVersion);
@@ -3861,7 +4347,77 @@ fn check_snapshot(wire: &WireFile) -> Result<(), WindowStoreError> {
             });
         }
     }
+    validate_signed_intents(wire)?;
     ledger::validate(wire)
+}
+
+fn validate_signed_intents(wire: &WireFile) -> Result<(), WindowStoreError> {
+    let invalid = || WindowStoreError::Invalid {
+        detail: "signed intent state does not match its snapshot".into(),
+    };
+    let records: Vec<_> = wire
+        .entries
+        .iter()
+        .flat_map(|bucket| &bucket.records)
+        .collect();
+    if wire.version < WIRE_VERSION_INTENT
+        && (!wire.signed_intents.is_empty() || records.iter().any(|r| r.signed_intent.is_some()))
+    {
+        return Err(invalid());
+    }
+    let mut seen = std::collections::HashSet::new();
+    for intent in &wire.signed_intents {
+        if Some(intent.chain_scope) != wire.chain_scope
+            || intent.facts().validate().is_err()
+            || intent.intent_id != intent.facts().intent_id()
+            || !seen.insert(&intent.intent_id)
+            || intent.generation == 0
+            || intent.generation > wire.generation
+            || intent.legs.is_empty()
+            || intent.legs.iter().any(|leg| {
+                leg.window_secs == 0 || leg.amount <= 0 || leg.ts_ms != intent.admitted_at_ms
+            })
+        {
+            return Err(invalid());
+        }
+        let valid_hash = |hash: &Option<String>| {
+            hash.as_ref().is_some_and(|hash| {
+                stellar_agent_core::hex::decode_hex32(hash)
+                    .is_ok_and(|bytes| crate::submit::bytes_to_hex(&bytes) == *hash)
+            })
+        };
+        match intent.status {
+            SignedIntentStatus::Exposed
+                if intent.bound_envelope_hash.is_some() || intent.bound_tx_hash.is_some() =>
+            {
+                return Err(invalid());
+            }
+            SignedIntentStatus::Bound
+                if !valid_hash(&intent.bound_envelope_hash)
+                    || !valid_hash(&intent.bound_tx_hash)
+                    || intent.cancel_token_sha256.is_some() =>
+            {
+                return Err(invalid());
+            }
+            _ => {}
+        }
+    }
+    for record in records {
+        if record.id.starts_with("intent-") {
+            return Err(invalid());
+        }
+        if let Some(id) = &record.signed_intent
+            && (!id.starts_with("intent-")
+                || !wire.signed_intents.iter().any(|intent| {
+                    &intent.intent_id == id
+                        && intent.status == SignedIntentStatus::Bound
+                        && intent.bound_envelope_hash.as_ref() == Some(&record.id)
+                }))
+        {
+            return Err(invalid());
+        }
+    }
+    Ok(())
 }
 
 /// Drops records and settled authorization history that have aged out of the
@@ -4531,7 +5087,7 @@ fn window_in_file(wire: &WireFile, key: &StateKey, now_ms: u64) -> Result<(i128,
                 && bucket.window_secs == key.window_secs()
         })
         .flat_map(|bucket| &bucket.records)
-        .filter(|record| is_exposure(record))
+        .filter(|record| record.signed_intent.is_none() && is_exposure(record))
         .map(|record| record.id.as_str())
         .collect();
     let mut fallback: HashMap<(&str, u64), (i128, u32)> = HashMap::new();
@@ -4542,6 +5098,9 @@ fn window_in_file(wire: &WireFile, key: &StateKey, now_ms: u64) -> Result<(i128,
             continue;
         }
         for record in &bucket.records {
+            if record.signed_intent.is_some() {
+                continue;
+            }
             if is_exposure(record) && record.ts_ms > future_limit {
                 return Err(DenyReason::EvaluationError {
                     detail: StateStoreError::ClockSkewExceeded {
@@ -4567,6 +5126,37 @@ fn window_in_file(wire: &WireFile, key: &StateKey, now_ms: u64) -> Result<(i128,
             } else {
                 sum = sum.saturating_add(record.amount);
                 count = count.saturating_add(1);
+            }
+        }
+    }
+    for intent in &wire.signed_intents {
+        let exact = intent.legs.iter().any(|leg| {
+            leg.scope_specificity == key.scope_specificity()
+                && leg.bucket == key.bucket()
+                && leg.window_secs == key.window_secs()
+        });
+        for leg in &intent.legs {
+            if leg.scope_specificity != key.scope_specificity() || leg.bucket != key.bucket() {
+                continue;
+            }
+            if leg.ts_ms > future_limit {
+                return Err(DenyReason::EvaluationError {
+                    detail: StateStoreError::ClockSkewExceeded {
+                        entry_ts_ms: leg.ts_ms,
+                        now_ms,
+                    }
+                    .to_string(),
+                });
+            }
+            if leg.window_secs == key.window_secs() {
+                sum = sum.saturating_add(leg.amount);
+                count = count.saturating_add(1);
+            } else if !exact {
+                let total = fallback
+                    .entry((&intent.intent_id, leg.window_secs))
+                    .or_default();
+                total.0 = total.0.saturating_add(leg.amount);
+                total.1 = total.1.saturating_add(1);
             }
         }
     }
@@ -4879,6 +5469,7 @@ mod tests {
         reason = "test-only; panics acceptable in unit tests"
     )]
 
+    use crate::signed_intent::test_helpers::{intent_fixture_kind, intent_fixture_plan};
     use std::path::Path;
 
     use serial_test::serial;
@@ -4887,6 +5478,790 @@ mod tests {
     use stellar_agent_core::policy::v1::criteria::state_store::WindowLimit;
     use stellar_agent_test_support::keyring_mock;
     use tempfile::TempDir;
+
+    fn assert_intent_totals(
+        store: &PersistedWindowStore,
+        profile: &Profile,
+        amount: i128,
+        calls: u32,
+    ) {
+        let wire = store.read_for_inspection(profile).unwrap().unwrap();
+        let loaded = PolicyStateStore::new();
+        store.load_into("intent", profile, &loaded).unwrap();
+        for window in [60, 120] {
+            for (bucket, expected) in [
+                ("native", (amount, calls)),
+                ("rate_limit", (i128::from(calls), calls)),
+            ] {
+                let key = StateKey::new("intent", 1, bucket, window);
+                assert_eq!(
+                    window_in_file(&wire, &key, now_ms().unwrap()).unwrap(),
+                    expected
+                );
+                assert_eq!(
+                    loaded.query_window(&key, now_ms().unwrap()).unwrap(),
+                    expected
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn final_submission_links_and_charges_once() {
+        keyring_mock::install().unwrap();
+        let dir = TempDir::new().unwrap();
+        let profile = test_profile(dir.path(), "intent");
+        let store = PersistedWindowStore::at_path(dir.path().join("intent.window"));
+        let (plan, envelope) = intent_fixture_plan(1, 60);
+        let exposure = store.admit_signed_intent(&profile, &plan).unwrap().expose();
+        let id = exposure.intent_id().unwrap();
+        let facts = crate::BindFacts::from_envelope(&envelope, Caip2::Testnet.network_passphrase())
+            .unwrap();
+        for _ in 0..2 {
+            store
+                .bind_signed_intent(&profile, id, &facts, plan.legs())
+                .unwrap();
+        }
+        let hold = SubmissionHold {
+            chain_scope: plan.chain_scope(),
+            id: facts.envelope_hash.clone(),
+            tx_hash: facts.tx_hash.clone(),
+            source: plan.facts.envelope_source.clone(),
+            sequence: 1,
+            max_time: 0,
+            pending_since_ms: now_ms().unwrap(),
+            submission_ledger: 1,
+            submission_anchor: None,
+            operator_required: false,
+        };
+        store
+            .record_pending_linked(&profile, plan.legs(), &hold, id)
+            .unwrap();
+        assert_intent_totals(&store, &profile, 60, 1);
+        assert!(matches!(
+            store.record_pending_linked(&profile, plan.legs(), &hold, id),
+            Err(WindowStoreError::DuplicateReservation)
+        ));
+        std::thread::scope(|scope| {
+            for _ in 0..2 {
+                scope.spawn(|| {
+                    store
+                        .bind_signed_intent(&profile, id, &facts, plan.legs())
+                        .unwrap()
+                });
+            }
+        });
+        let dir_c = TempDir::new().unwrap();
+        let profile_c = test_profile(dir_c.path(), "intent-confirm");
+        let store_c = PersistedWindowStore::at_path(dir_c.path().join("intent.window"));
+        let (plan_c, envelope_c) = intent_fixture_plan(3, 60);
+        let exposure_c = store_c
+            .admit_signed_intent(&profile_c, &plan_c)
+            .unwrap()
+            .expose();
+        let id_c = exposure_c.intent_id().unwrap();
+        let facts_c =
+            crate::BindFacts::from_envelope(&envelope_c, Caip2::Testnet.network_passphrase())
+                .unwrap();
+        store_c
+            .bind_signed_intent(&profile_c, id_c, &facts_c, plan_c.legs())
+            .unwrap();
+        let hold_c = SubmissionHold {
+            id: facts_c.envelope_hash,
+            tx_hash: facts_c.tx_hash,
+            sequence: 3,
+            ..hold.clone()
+        };
+        store_c
+            .record_pending_linked(&profile_c, plan_c.legs(), &hold_c, id_c)
+            .unwrap();
+        store_c.confirm(&profile_c, &hold_c.id, None).unwrap();
+        assert_intent_totals(&store_c, &profile_c, 60, 1);
+        let wire_c = store_c.read_for_inspection(&profile_c).unwrap().unwrap();
+        assert_eq!(wire_c.signed_intents.len(), 1);
+        assert_eq!(wire_c.signed_intents[0].status, SignedIntentStatus::Bound);
+        assert_eq!(wire_c.entries.len(), plan_c.legs().len());
+        for entry in &wire_c.entries {
+            assert_eq!(entry.records.len(), 1);
+            let record = &entry.records[0];
+            assert_eq!(record.status, RecordStatus::Exposure);
+            assert!(record.observed_at_ms.is_some());
+            assert_eq!(record.signed_intent.as_deref(), Some(id_c));
+        }
+        let decision = store.pre_exposure_cancellation(&profile, &hold.id).unwrap();
+        store.apply_accounting_decision(&profile, decision).unwrap();
+        assert!(store.pending_reservations(&profile).unwrap().is_empty());
+        assert_intent_totals(&store, &profile, 60, 1);
+        store.confirm(&profile, &hold.id, None).unwrap();
+        assert_intent_totals(&store, &profile, 60, 1);
+        let wire = store.read_for_inspection(&profile).unwrap().unwrap();
+        assert_eq!(wire.signed_intents.len(), 1);
+        assert_eq!(wire.signed_intents[0].status, SignedIntentStatus::Bound);
+        assert!(matches!(
+            assert_reset_refuses(&store, &profile),
+            WindowStoreError::SignedIntentLive {
+                exposed: 0,
+                bound: 1
+            }
+        ));
+        let (plan_b, envelope_b) = intent_fixture_plan(2, 60);
+        let larger_legs: Vec<_> = plan_b
+            .legs()
+            .iter()
+            .map(|entry| {
+                let limit = match entry.limit() {
+                    stellar_agent_core::policy::v1::criteria::WindowLimit::Amount {
+                        asset,
+                        window,
+                        ..
+                    } => stellar_agent_core::policy::v1::criteria::WindowLimit::Amount {
+                        asset: asset.clone(),
+                        window: window.clone(),
+                        max_stroops: 120,
+                    },
+                    stellar_agent_core::policy::v1::criteria::WindowLimit::Count {
+                        window, ..
+                    } => stellar_agent_core::policy::v1::criteria::WindowLimit::Count {
+                        window: window.clone(),
+                        max_calls: 2,
+                    },
+                };
+                WindowEntry::new(
+                    entry.key().clone(),
+                    entry.timestamp_ms(),
+                    entry.amount(),
+                    limit,
+                )
+            })
+            .collect();
+        let plan_b = plan_b.with_legs(&larger_legs);
+        let exposed_b = store
+            .admit_signed_intent(&profile, &plan_b)
+            .unwrap()
+            .expose();
+        let facts_b =
+            crate::BindFacts::from_envelope(&envelope_b, Caip2::Testnet.network_passphrase())
+                .unwrap();
+        assert!(matches!(
+            store.bind_signed_intent(
+                &profile,
+                exposed_b.intent_id().unwrap(),
+                &facts_b,
+                &larger_legs[..1]
+            ),
+            Err(WindowStoreError::IntentBindingMismatch { field: "legs" })
+        ));
+        assert_intent_totals(&store, &profile, 120, 2);
+        assert!(
+            store
+                .signed_intents("intent", &profile)
+                .unwrap()
+                .iter()
+                .any(|intent| intent.intent_id == exposed_b.intent_id().unwrap()
+                    && intent.status == "authorization exposed, submission unknown")
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn same_authority_with_changed_legs_refuses() {
+        for kind in 0..3 {
+            keyring_mock::install().unwrap();
+            let dir = TempDir::new().unwrap();
+            let profile = test_profile(dir.path(), "intent");
+            let store = PersistedWindowStore::at_path(dir.path().join("intent.window"));
+            let (plan, _) = intent_fixture_kind(kind);
+            let roomy = |plan: &crate::SignedIntentPlan| {
+                let legs = plan
+                    .legs()
+                    .iter()
+                    .map(|entry| {
+                        let limit = match entry.limit() {
+                            WindowLimit::Amount { asset, window, .. } => WindowLimit::Amount {
+                                asset: asset.clone(),
+                                window: window.clone(),
+                                max_stroops: 200,
+                            },
+                            WindowLimit::Count { window, .. } => WindowLimit::Count {
+                                window: window.clone(),
+                                max_calls: 3,
+                            },
+                        };
+                        WindowEntry::new(
+                            entry.key().clone(),
+                            entry.timestamp_ms(),
+                            entry.amount(),
+                            limit,
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                plan.with_legs(&legs)
+            };
+            let plan = roomy(&plan);
+            let first = store.admit_signed_intent(&profile, &plan).unwrap();
+            let second = store.admit_signed_intent(&profile, &plan).unwrap();
+            assert_eq!(first.intent_id, second.intent_id);
+            assert_intent_totals(&store, &profile, 60, 1);
+            assert_eq!(store.signed_intents("intent", &profile).unwrap().len(), 1);
+            store.cancel_signed_intent(&profile, second).unwrap();
+            store.cancel_signed_intent(&profile, first).unwrap();
+            assert_intent_totals(&store, &profile, 60, 1);
+            assert_eq!(store.signed_intents("intent", &profile).unwrap().len(), 1);
+            let changed = roomy(&plan.with_legs(intent_fixture_plan(1, 61).0.legs()));
+            let changed_result = store.admit_signed_intent(&profile, &changed);
+            assert_intent_totals(&store, &profile, 60, 1);
+            assert!(matches!(
+                changed_result,
+                Err(WindowStoreError::IntentBindingMismatch { field: "legs" })
+            ));
+            assert_eq!(plan.facts.intent_id(), changed.facts.intent_id());
+            assert!(matches!(
+                store.admit_signed_intent(&profile, &intent_fixture_plan(2, 60).0),
+                Err(WindowStoreError::PolicyDenied { .. })
+            ));
+            assert_intent_totals(&store, &profile, 60, 1);
+            assert_eq!(store.signed_intents("intent", &profile).unwrap().len(), 1);
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn cancellation_removes_only_the_unexposed_charge() {
+        keyring_mock::install().unwrap();
+        let dir = TempDir::new().unwrap();
+        let profile = test_profile(dir.path(), "intent");
+        let store = PersistedWindowStore::at_path(dir.path().join("intent.window"));
+        let (plan, _) = intent_fixture_plan(1, 60);
+        let proof = store.admit_signed_intent(&profile, &plan).unwrap();
+        assert_intent_totals(&store, &profile, 60, 1);
+        store.cancel_signed_intent(&profile, proof).unwrap();
+        assert_intent_totals(&store, &profile, 0, 0);
+        assert!(store.signed_intents("intent", &profile).unwrap().is_empty());
+    }
+
+    #[test]
+    #[serial]
+    fn signed_intents_read_without_writing_and_refuse_tampering() {
+        keyring_mock::install().unwrap();
+        let dir = TempDir::new().unwrap();
+        let profile = test_profile(dir.path(), "intent");
+        let store = PersistedWindowStore::at_path(dir.path().join("intent.window"));
+        assert!(store.signed_intents("intent", &profile).unwrap().is_empty());
+        assert!(get_raw(&profile.policy_window_state_key_id).is_none());
+        let exposure = store
+            .admit_signed_intent(&profile, &intent_fixture_plan(1, 60).0)
+            .unwrap()
+            .expose();
+        let before = fs::read(&store.path).unwrap();
+        let generation = get_raw(&generation_entry_ref(&profile));
+        let key = get_raw(&profile.policy_window_state_key_id);
+        let views = store.signed_intents("intent", &profile).unwrap();
+        assert_eq!(views.len(), 1);
+        assert_eq!(views[0].intent_id, exposure.intent_id().unwrap());
+        assert_eq!(
+            views[0].status_label(),
+            "authorization exposed, submission unknown"
+        );
+        assert_eq!(views[0].accounting_horizon, "open");
+        assert_eq!(views[0].auth_address, "GAAAA...AAWHF");
+        assert_eq!(fs::read(&store.path).unwrap(), before);
+        assert_eq!(get_raw(&generation_entry_ref(&profile)), generation);
+        assert_eq!(get_raw(&profile.policy_window_state_key_id), key);
+        let facts = crate::BindFacts::from_envelope(
+            &intent_fixture_plan(1, 60).1,
+            Caip2::Testnet.network_passphrase(),
+        )
+        .unwrap();
+        store
+            .bind_signed_intent(
+                &profile,
+                exposure.intent_id().unwrap(),
+                &facts,
+                intent_fixture_plan(1, 60).0.legs(),
+            )
+            .unwrap();
+        let before = fs::read(&store.path).unwrap();
+        let generation = get_raw(&generation_entry_ref(&profile));
+        assert_eq!(
+            store.signed_intents("intent", &profile).unwrap()[0].status_label(),
+            "authorization exposed, submission bound"
+        );
+        assert_eq!(fs::read(&store.path).unwrap(), before);
+        assert_eq!(get_raw(&generation_entry_ref(&profile)), generation);
+        let mut corrupt = before;
+        corrupt[0] ^= 1;
+        fs::write(&store.path, corrupt).unwrap();
+        assert!(matches!(
+            store.signed_intents("intent", &profile),
+            Err(WindowStoreError::HmacMismatch)
+        ));
+    }
+
+    #[test]
+    #[serial]
+    fn different_final_intent_cannot_consume_reservation() {
+        keyring_mock::install().unwrap();
+        let dir = TempDir::new().unwrap();
+        let profile = test_profile(dir.path(), "intent");
+        let store = PersistedWindowStore::at_path(dir.path().join("intent.window"));
+        let (plan, envelope) = intent_fixture_plan(1, 60);
+        let exposure = store.admit_signed_intent(&profile, &plan).unwrap().expose();
+        let id = exposure.intent_id().unwrap();
+        let facts = crate::BindFacts::from_envelope(&envelope, Caip2::Mainnet.network_passphrase())
+            .unwrap();
+        assert!(matches!(
+            store.bind_signed_intent(&profile, id, &facts, plan.legs()),
+            Err(WindowStoreError::IntentBindingMismatch { field: "chain" })
+        ));
+        let facts = crate::BindFacts::from_envelope(
+            &intent_fixture_plan(2, 60).1,
+            Caip2::Testnet.network_passphrase(),
+        )
+        .unwrap();
+        assert!(matches!(
+            store.bind_signed_intent(&profile, id, &facts, plan.legs()),
+            Err(WindowStoreError::IntentBindingMismatch {
+                field: "envelope_sequence"
+            })
+        ));
+        let facts = crate::BindFacts::from_envelope(&envelope, Caip2::Testnet.network_passphrase())
+            .unwrap();
+        assert!(matches!(
+            store.bind_signed_intent(&profile, id, &facts, intent_fixture_plan(1, 61).0.legs()),
+            Err(WindowStoreError::IntentBindingMismatch { field: "legs" })
+        ));
+        assert_intent_totals(&store, &profile, 60, 1);
+        assert!(store.pending_reservations(&profile).unwrap().is_empty());
+        assert_eq!(
+            store.signed_intents("intent", &profile).unwrap()[0].status_label(),
+            "authorization exposed, submission unknown"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn restart_preserves_exposed_intent_without_envelope() {
+        for seam in [
+            COMMIT_FAULT_AFTER_PREPARED,
+            COMMIT_FAULT_AFTER_COUNTER,
+            COMMIT_FAULT_COMPACTION,
+        ] {
+            let now = now_ms().unwrap();
+            let fx = expiring_hold("intent", "c9", now);
+            fx.store
+                .expire_accounting(&fx.profile, None, &fx.hold, fx.expire_at)
+                .unwrap();
+            let owed = fx
+                .store
+                .read_for_inspection(&fx.profile)
+                .unwrap()
+                .unwrap()
+                .accounting_expiries;
+            let armed = arm_accounting_fault(seam);
+            let outcome = fx
+                .store
+                .admit_signed_intent(&fx.profile, &intent_fixture_plan(1, 60).0);
+            drop(armed);
+            assert_eq!(outcome.is_ok(), seam == COMMIT_FAULT_COMPACTION);
+            let reopened = PersistedWindowStore::at_path(fx.store.path.clone());
+            let expected = u32::from(seam != COMMIT_FAULT_AFTER_PREPARED);
+            assert_intent_totals(&reopened, &fx.profile, i128::from(expected) * 60, expected);
+            let wire = reopened.read_for_inspection(&fx.profile).unwrap().unwrap();
+            assert_eq!(wire.accounting_expiries, owed);
+            assert_eq!(wire.signed_intents.len(), expected as usize);
+            assert!(matches!(
+                assert_reset_refuses(&reopened, &fx.profile),
+                WindowStoreError::AccountingAuditOwed
+            ));
+            let mut writer = delivery_writer(&fx.profile);
+            deliver_accounting_expiries(&mut writer, &reopened, &fx.profile, "intent", None)
+                .unwrap();
+            if expected == 0 {
+                reset_unsigned(&reopened, &fx.profile, now, |_| Ok::<_, ()>(())).unwrap();
+            } else {
+                let before = fs::read(reopened.path()).unwrap();
+                assert_eq!(
+                    reopened.signed_intents("intent", &fx.profile).unwrap()[0].status_label(),
+                    "authorization exposed, submission unknown"
+                );
+                assert!(matches!(
+                    assert_reset_refuses(&reopened, &fx.profile),
+                    WindowStoreError::SignedIntentLive {
+                        exposed: 1,
+                        bound: 0
+                    }
+                ));
+                assert_eq!(fs::read(reopened.path()).unwrap(), before);
+            }
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn malformed_intent_snapshots_refuse() {
+        let f = ResetFixture::new();
+        let (plan, envelope) = intent_fixture_kind(2);
+        let _exposure = f
+            .store
+            .admit_signed_intent(&f.profile, &plan)
+            .unwrap()
+            .expose();
+        let valid = f.store.read_for_inspection(&f.profile).unwrap().unwrap();
+        type Mutation = (&'static str, Box<dyn Fn(&mut WireFile)>);
+        let mutate: Vec<Mutation> = vec![
+            ("version", Box::new(|wire| wire.version = 8)),
+            (
+                "id",
+                Box::new(|wire| wire.signed_intents[0].intent_id = "intent-00".into()),
+            ),
+            (
+                "duplicate",
+                Box::new(|wire| wire.signed_intents.push(wire.signed_intents[0].clone())),
+            ),
+            (
+                "scope",
+                Box::new(|wire| {
+                    wire.signed_intents[0].chain_scope = ChainScope::for_chain(Caip2::Mainnet)
+                }),
+            ),
+            (
+                "generation zero",
+                Box::new(|wire| wire.signed_intents[0].generation = 0),
+            ),
+            (
+                "generation ahead",
+                Box::new(|wire| wire.signed_intents[0].generation = wire.generation + 1),
+            ),
+            (
+                "empty legs",
+                Box::new(|wire| wire.signed_intents[0].legs.clear()),
+            ),
+            (
+                "zero window",
+                Box::new(|wire| wire.signed_intents[0].legs[0].window_secs = 0),
+            ),
+            (
+                "zero amount",
+                Box::new(|wire| wire.signed_intents[0].legs[0].amount = 0),
+            ),
+            (
+                "leg clock",
+                Box::new(|wire| wire.signed_intents[0].legs[0].ts_ms += 1),
+            ),
+            (
+                "signers",
+                Box::new(|wire| wire.signed_intents[0].subjects[0].signers.clear()),
+            ),
+            (
+                "rules",
+                Box::new(|wire| wire.signed_intents[0].subjects[0].context_rule_ids.clear()),
+            ),
+            (
+                "expiry",
+                Box::new(|wire| wire.signed_intents[0].greatest_expiration_ledger = None),
+            ),
+            (
+                "source",
+                Box::new(|wire| wire.signed_intents[0].envelope_source = "invalid".into()),
+            ),
+            (
+                "sequence",
+                Box::new(|wire| wire.signed_intents[0].envelope_sequence = 0),
+            ),
+            (
+                "exposed bound hash",
+                Box::new(|wire| wire.signed_intents[0].bound_envelope_hash = Some("ab".repeat(32))),
+            ),
+            (
+                "bound no tx hash",
+                Box::new(|wire| {
+                    let intent = &mut wire.signed_intents[0];
+                    intent.status = SignedIntentStatus::Bound;
+                    intent.bound_envelope_hash = Some("ab".repeat(32));
+                    intent.cancel_token_sha256 = None;
+                }),
+            ),
+            (
+                "bound token",
+                Box::new(|wire| {
+                    let intent = &mut wire.signed_intents[0];
+                    intent.status = SignedIntentStatus::Bound;
+                    intent.bound_envelope_hash = Some("ab".repeat(32));
+                    intent.bound_tx_hash = Some("cd".repeat(32));
+                }),
+            ),
+            (
+                "source nonce",
+                Box::new(|wire| {
+                    let source = wire.signed_intents[0].envelope_source.clone();
+                    let subject = &mut wire.signed_intents[0].subjects[0];
+                    subject.kind = crate::SubjectKind::SourceAccount;
+                    subject.credential = source;
+                }),
+            ),
+            (
+                "account rules",
+                Box::new(|wire| {
+                    let subject = &mut wire.signed_intents[0].subjects[0];
+                    subject.kind = crate::SubjectKind::AccountKey;
+                    subject.credential = stellar_strkey::ed25519::PublicKey([2; 32])
+                        .to_string()
+                        .to_string();
+                    subject.signers = vec![crate::SignerDescriptor::AccountKey {
+                        public_key: [2; 32],
+                    }];
+                }),
+            ),
+            (
+                "negative amount",
+                Box::new(|wire| wire.signed_intents[0].legs[0].amount = -1),
+            ),
+            (
+                "smart account credential",
+                Box::new(|wire| {
+                    wire.signed_intents[0].subjects[0].credential =
+                        wire.signed_intents[0].envelope_source.clone();
+                }),
+            ),
+            (
+                "smart account nonce",
+                Box::new(|wire| wire.signed_intents[0].subjects[0].nonce = None),
+            ),
+            (
+                "smart account expiration",
+                Box::new(|wire| {
+                    wire.signed_intents[0].subjects[0].signature_expiration_ledger = None
+                }),
+            ),
+            (
+                "smart account key descriptor",
+                Box::new(|wire| {
+                    wire.signed_intents[0].subjects[0].signers =
+                        vec![crate::SignerDescriptor::AccountKey {
+                            public_key: [2; 32],
+                        }];
+                }),
+            ),
+            (
+                "descriptor order",
+                Box::new(|wire| {
+                    wire.signed_intents[0].subjects[0].signers = vec![
+                        crate::SignerDescriptor::Delegated { account: [2; 32] },
+                        crate::SignerDescriptor::Delegated { account: [1; 32] },
+                    ];
+                }),
+            ),
+            (
+                "subject order",
+                Box::new(|wire| {
+                    let subject = wire.signed_intents[0].subjects[0].clone();
+                    let mut later = subject.clone();
+                    later.nonce = subject.nonce.map(|nonce| nonce + 1);
+                    wire.signed_intents[0].subjects = vec![later, subject];
+                }),
+            ),
+            (
+                "exposed tx hash",
+                Box::new(|wire| wire.signed_intents[0].bound_tx_hash = Some("ab".repeat(32))),
+            ),
+            (
+                "bound no envelope hash",
+                Box::new(|wire| {
+                    let intent = &mut wire.signed_intents[0];
+                    intent.status = SignedIntentStatus::Bound;
+                    intent.bound_tx_hash = Some("ab".repeat(32));
+                    intent.cancel_token_sha256 = None;
+                }),
+            ),
+            (
+                "bound malformed hashes",
+                Box::new(|wire| {
+                    let intent = &mut wire.signed_intents[0];
+                    intent.status = SignedIntentStatus::Bound;
+                    intent.bound_envelope_hash = Some("AB".repeat(32));
+                    intent.bound_tx_hash = Some("cd".repeat(31));
+                    intent.cancel_token_sha256 = None;
+                }),
+            ),
+            (
+                "prepared version",
+                Box::new(|wire| {
+                    let mut next = wire.clone();
+                    next.version = 8;
+                    next.generation += 1;
+                    wire.prepared = Some(Box::new(next));
+                }),
+            ),
+        ];
+        for (name, change) in mutate {
+            let mut bad = valid.clone();
+            change(&mut bad);
+            if name != "id" {
+                bad.signed_intents[0].intent_id = bad.signed_intents[0].facts().intent_id();
+            }
+            f.seal(&bad);
+            assert!(
+                matches!(
+                    f.store.read_for_inspection(&f.profile),
+                    Err(WindowStoreError::Invalid { .. })
+                ),
+                "{name}"
+            );
+        }
+        for kind in [
+            crate::SubjectKind::AccountKey,
+            crate::SubjectKind::SourceAccount,
+        ] {
+            for defect in 0..6 {
+                let mut bad = valid.clone();
+                let intent = &mut bad.signed_intents[0];
+                let subject = &mut intent.subjects[0];
+                subject.kind = kind;
+                subject.credential = intent.envelope_source.clone();
+                subject.context_rule_ids.clear();
+                let key = stellar_strkey::ed25519::PublicKey::from_string(&subject.credential)
+                    .unwrap()
+                    .0;
+                if kind == crate::SubjectKind::AccountKey {
+                    subject.signers = vec![crate::SignerDescriptor::AccountKey { public_key: key }];
+                    match defect {
+                        0 => {
+                            subject.credential =
+                                stellar_strkey::Contract([0x31; 32]).to_string().to_string()
+                        }
+                        1 => subject.nonce = None,
+                        2 => subject.signature_expiration_ledger = None,
+                        3 => subject.context_rule_ids = vec![1],
+                        4 => subject.signers.clear(),
+                        _ => {
+                            subject.signers = vec![crate::SignerDescriptor::AccountKey {
+                                public_key: [0xff; 32],
+                            }]
+                        }
+                    }
+                } else {
+                    subject.nonce = None;
+                    subject.signature_expiration_ledger = None;
+                    subject.signers.clear();
+                    intent.greatest_expiration_ledger = None;
+                    match defect {
+                        0 => {
+                            subject.credential = stellar_strkey::ed25519::PublicKey([0xfe; 32])
+                                .to_string()
+                                .to_string()
+                        }
+                        1 => subject.nonce = Some(1),
+                        2 => subject.signature_expiration_ledger = Some(1),
+                        3 => subject.context_rule_ids = vec![1],
+                        4 => {
+                            subject.signers =
+                                vec![crate::SignerDescriptor::AccountKey { public_key: key }]
+                        }
+                        _ => intent.greatest_expiration_ledger = Some(1),
+                    }
+                }
+                intent.intent_id = intent.facts().intent_id();
+                f.seal(&bad);
+                assert!(
+                    matches!(
+                        f.store.read_for_inspection(&f.profile),
+                        Err(WindowStoreError::Invalid { .. })
+                    ),
+                    "{kind:?} {defect}"
+                );
+            }
+        }
+        f.seal(&valid);
+        let facts = crate::BindFacts::from_envelope(&envelope, Caip2::Testnet.network_passphrase())
+            .unwrap();
+        f.store
+            .bind_signed_intent(
+                &f.profile,
+                &valid.signed_intents[0].intent_id,
+                &facts,
+                plan.legs(),
+            )
+            .unwrap();
+        let hold = SubmissionHold {
+            id: facts.envelope_hash.clone(),
+            tx_hash: facts.tx_hash,
+            source: plan.facts.envelope_source.clone(),
+            sequence: 1,
+            max_time: 0,
+            pending_since_ms: now_ms().unwrap(),
+            submission_ledger: 1,
+            submission_anchor: None,
+            operator_required: false,
+            chain_scope: plan.chain_scope(),
+        };
+        f.store
+            .record_pending_linked(
+                &f.profile,
+                plan.legs(),
+                &hold,
+                &valid.signed_intents[0].intent_id,
+            )
+            .unwrap();
+        let linked = f.store.read_for_inspection(&f.profile).unwrap().unwrap();
+        for defect in 0..6 {
+            let mut bad = linked.clone();
+            match defect {
+                0 => bad.version = 8,
+                1 => bad.signed_intents.clear(),
+                2 => {
+                    let intent = &mut bad.signed_intents[0];
+                    intent.status = SignedIntentStatus::Exposed;
+                    intent.bound_envelope_hash = None;
+                    intent.bound_tx_hash = None;
+                }
+                3 => bad.entries[0].records[0].id = "ef".repeat(32),
+                4 => bad.entries[0].records[0].id = "intent-fixture".into(),
+                _ => bad.entries[0].records[0].signed_intent = Some("ab".repeat(32)),
+            }
+            f.seal(&bad);
+            assert!(
+                matches!(
+                    f.store.read_for_inspection(&f.profile),
+                    Err(WindowStoreError::Invalid { .. })
+                ),
+                "link {defect}"
+            );
+        }
+        let mut future = valid.clone();
+        future.version = 10;
+        f.seal(&future);
+        assert!(matches!(
+            f.store.read_for_inspection(&f.profile),
+            Err(WindowStoreError::UnsupportedVersion)
+        ));
+        let mut unknown = serde_json::to_value(&valid).unwrap();
+        unknown["signed_intents"][0]["unknown"] = serde_json::json!(true);
+        let mut prefixed_hold = serde_json::to_value(&valid).unwrap();
+        prefixed_hold["holds"] = serde_json::json!([{
+            "kind": ledger::HoldKind::Value,
+            "authorization_id": "intent-fixture",
+            "ordinal": 0,
+            "scope_specificity": 1,
+            "bucket": "native",
+            "window_secs": 60,
+            "ts_ms": valid.signed_intents[0].admitted_at_ms,
+            "amount": "1"
+        }]);
+        assert!(serde_json::from_value::<WireFile>(prefixed_hold.clone()).is_err());
+        for malformed in [unknown, prefixed_hold] {
+            let body = serde_json::to_vec(&malformed).unwrap();
+            let (key, _) = f.store.load_or_mint_key(&f.profile).unwrap();
+            let tag = compute_tag(key.as_ref(), &body).unwrap();
+            let mut bytes = tag.to_vec();
+            bytes.extend(body);
+            fs::write(f.store.path(), bytes).unwrap();
+            assert!(matches!(
+                f.store.read_for_inspection(&f.profile),
+                Err(WindowStoreError::Invalid { .. })
+            ));
+        }
+    }
 
     fn test_profile(dir: &Path, name: &str) -> Profile {
         let mut p = Profile::builder_testnet(name, "acct", "n-svc", "n-acct").build();
@@ -10344,7 +11719,7 @@ mod tests {
             f.seal(&reset_wire());
             let key =
                 crate::keyring::load_hmac_key_32(&f.profile.policy_window_state_key_id).unwrap();
-            let body = br#"{"version":9,"future_authorities":[{"open":true}],"prepared":"future representation"}"#;
+            let body = br#"{"version":10,"future_authorities":[{"open":true}],"prepared":"future representation"}"#;
             f.store
                 .write_atomic_raw(&compute_tag(key.as_ref(), body).unwrap(), body)
                 .unwrap();
@@ -10725,6 +12100,9 @@ mod tests {
     /// The crash seam right after an accounting expiry commits, before its
     /// receipt projection.
     pub(super) const ACCOUNTING_FAULT_AFTER_COMMIT: u8 = 1;
+    pub(super) const COMMIT_FAULT_AFTER_PREPARED: u8 = 4;
+    pub(super) const COMMIT_FAULT_AFTER_COUNTER: u8 = 5;
+    pub(super) const COMMIT_FAULT_COMPACTION: u8 = 6;
     /// The crash seam right after an expiry event is appended, before its
     /// acknowledgement commits.
     pub(super) const ACCOUNTING_FAULT_AFTER_APPEND: u8 = 2;

@@ -133,6 +133,12 @@ pub use simulation_audit::{
     AuthEntryFingerprint, fingerprint_soroban_auth_entries, verify_auth_entries_unchanged,
 };
 pub use stellar_rpc_client::{GetLedgerEntriesResponse, LedgerEntryResult};
+pub mod signed_intent;
+pub use signed_intent::{
+    AuthSubject, BindFacts, ExposedIntent, IntentBinding, IntentProof, IntentSubject,
+    NoValueAdmission, PermittedSigning, PlannedPayload, SignedIntentPlan, SignerDescriptor,
+    SigningAdmission, SigningPayload, SubjectKind, intent_xdr_hash,
+};
 pub use submission_record::{
     ApprovalTombstone, AuditWriterHandle, SubmissionIntent, SubmissionOutcome, SubmissionRecorder,
     WalletSubmissionRecorder,

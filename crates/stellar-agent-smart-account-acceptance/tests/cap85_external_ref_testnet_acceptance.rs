@@ -904,6 +904,9 @@ async fn install_pins_the_reference_and_signing_detects_the_repoint() {
     let transfer_request_id = rid();
     let transfer = submit_signed_invoke(
         SubmitInvokeArgs::builder()
+            .admission(stellar_agent_network::SigningAdmission::NoValue(
+                stellar_agent_smart_account::signing::intent_test_helpers::no_value_admission(),
+            ))
             .target_contract(XLM_SAC_TESTNET)
             .auth_address(smart_account.as_str())
             .auth_rule_ids(&rule_ids)
@@ -958,6 +961,9 @@ async fn install_pins_the_reference_and_signing_detects_the_repoint() {
     let drift_request_id = rid();
     let execute_refusal = submit_signed_invoke(
         SubmitInvokeArgs::builder()
+            .admission(stellar_agent_network::SigningAdmission::NoValue(
+                stellar_agent_smart_account::signing::intent_test_helpers::no_value_admission(),
+            ))
             .target_contract(XLM_SAC_TESTNET)
             .auth_address(smart_account.as_str())
             .auth_rule_ids(&rule_ids)
@@ -1060,6 +1066,7 @@ async fn install_pins_the_reference_and_signing_detects_the_repoint() {
     .expect("auth entry builds");
     let outcome = credentials
         .sign_with_passkey_rule(
+            &stellar_agent_smart_account::signing::intent_test_helpers::gate(vec![]),
             "cap85-no-such-credential",
             &entry,
             Arc::clone(&signers_manager),

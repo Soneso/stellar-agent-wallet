@@ -268,10 +268,23 @@ fn build_bundle_recorder<'a>(
         .map_err(|e| unavailable(format!("submission receipt store unavailable: {e}")))?;
     let now_ms = stellar_agent_core::timefmt::now_unix_ms()
         .map_err(|e| unavailable(format!("submission clock unavailable: {e}")))?;
-    let entries = args
+    let sizing = args
         .policy_engine
-        .record_confirmed_bundle(tool, args.profile, bundle)
+        .record_confirmed_bundle_checked(tool, args.profile, bundle)
         .map_err(|e| unavailable(format!("bundle accounting unavailable: {e}")))?;
+    let sizing = match sizing {
+        stellar_agent_core::policy::v1::SizingOutcome::Sized(sizing) => sizing,
+        stellar_agent_core::policy::v1::SizingOutcome::Refused(reason) => {
+            return Err(SaError::PolicyDenied {
+                reason: Box::new(reason),
+            });
+        }
+        _ => {
+            return Err(SaError::IntentRecordUnavailable {
+                class: "policy_unavailable",
+            });
+        }
+    };
     let legs = bundle
         .inners
         .iter()
@@ -287,14 +300,15 @@ fn build_bundle_recorder<'a>(
         Some(args.chain_id.to_owned()),
         stellar_agent_core::audit_log::PolicyDecision::Allow,
         legs,
-        entries,
+        sizing.entries().to_vec(),
         receipts,
         PersistedWindowStore::for_profile(profile_name),
         args.audit_writer.clone(),
         None,
         args.request_id,
         now_ms,
-    ))
+    )
+    .with_signing_sizing(sizing))
 }
 
 // ── MulticallResult ───────────────────────────────────────────────────────────
@@ -1661,7 +1675,7 @@ pub async fn submit_multicall_bundle(
             .emit_observability_logs(true)
             .required_checks(&["multicall"])
             .multicall_check(multicall_check)
-            .submission_recorder(&recorder)
+            .admission(stellar_agent_network::SigningAdmission::Recorded(&recorder))
             .pin_check(crate::submit::PinCheck {
                 signers_manager: args.signers_manager,
                 request_id: args.request_id,
@@ -2140,11 +2154,10 @@ struct SubmitDeniedRow {
 fn classify_submit_failure(sa_err: SaError) -> (Option<SubmitDeniedRow>, SaError) {
     match sa_err {
         SaError::SubmissionUnresolved { .. } => (None, sa_err),
-        // A reservation the window refuses is a policy denial. It carries the
-        // gate's own code, the recorder's closing row records it, and nothing
-        // was sent, so it passes through unwrapped and writes no second row.
-        SaError::PolicyDenied { .. } => (None, sa_err),
-        SaError::MainnetWriteForbidden
+        SaError::PolicyDenied { .. }
+        | SaError::IntentRecordUnavailable { .. }
+        | SaError::IntentBindingMismatch { .. }
+        | SaError::MainnetWriteForbidden
         | SaError::LedgerWitnessUnavailable { .. }
         | SaError::LedgerWitnessMismatch { .. } => (
             Some(SubmitDeniedRow {
@@ -4221,14 +4234,29 @@ wasm_sha256 = "{drifted_sha}"
         }
     }
 
-    /// A policy denial passes through with no second row.
+    /// Admission refusals carry their codes and one policy gate row.
     #[test]
-    fn classify_submit_failure_passes_a_policy_denial_through_without_a_row() {
-        let (row, returned) = classify_submit_failure(SaError::PolicyDenied {
-            reason: Box::new(stellar_agent_core::policy::DenyReason::NoMatchingRule),
-        });
-        assert_eq!(row, None);
-        assert!(matches!(returned, SaError::PolicyDenied { .. }));
+    fn classify_submit_failure_writes_a_policy_gate_row_for_a_policy_denial() {
+        for error in [
+            SaError::PolicyDenied {
+                reason: Box::new(stellar_agent_core::policy::DenyReason::NoMatchingRule),
+            },
+            SaError::IntentRecordUnavailable {
+                class: "window_unavailable",
+            },
+            SaError::IntentBindingMismatch { field: "signers" },
+        ] {
+            let code = error.wire_code();
+            let (row, returned) = classify_submit_failure(error);
+            assert_eq!(
+                row,
+                Some(SubmitDeniedRow {
+                    deny_wire_code: format!("multicall.{code}"),
+                    refusal_phase: "policy_gate"
+                })
+            );
+            assert_eq!(returned.wire_code(), code);
+        }
     }
 
     /// `HorizonExceeded` maps to `"policy_gate"`.

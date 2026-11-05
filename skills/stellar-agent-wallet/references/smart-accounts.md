@@ -11,8 +11,7 @@ The operator runs the governance and deployment examples on this page.
 Agents propose rules through MCP's two-phase rule tools and wait for operator
 approval. Delegated execution runs through the CLI's operator authority under
 the on-chain rules of the agent's key.
-Administration and deployment bypass the wallet policy engine; multicall
-requires V1 and accepts only Allow. Its approval refusal exposes
+Deployment bypasses the wallet policy engine. Administration verbs count against matching V1 rate limits, and timelock `schedule` and `execute` refuse under a value rule without `allow_opaque_signing`. Multicall requires V1 and accepts only Allow. Its approval refusal exposes
 `sa.multicall_failed`, with audit code `multicall.approval_required`.
 See [signing coverage](cli-reference.md#signing-and-approval-coverage).
 
@@ -31,7 +30,7 @@ Exceptions:
 | Verb | Mainnet behavior |
 |------|------------------|
 | `smart-account register-multicall` / `unregister-multicall` | Accept `mainnet` as a local-registry key. |
-| Read-only verbs | `smart-account rules get`, `smart-account rules get-spending-limit`, `smart-account rules list` / `smart-account list-rules`, `smart-account list-verifiers`, `smart-account timelock list-pending` accept `mainnet` unconditionally. |
+| Read-only verbs | `smart-account rules get`, `smart-account rules get-spending-limit`, `smart-account rules list` / `smart-account list-rules`, `smart-account list-verifiers`, `smart-account list-intents`, `smart-account timelock list-pending` accept `mainnet` unconditionally. |
 | `rules verify-pins`, `signers list`, `signers refresh` | Load no signer, sign nothing, and write nothing on chain, so they accept `mainnet`. They keep their local audit writes: on a persisted profile they need `profile rotate-audit-key` first, and otherwise refuse with `audit.chain_key_unavailable`. The mainnet endpoint rules still apply. |
 
 ## Signer source (write verbs)
@@ -46,7 +45,7 @@ After the last of those examples, the operator runs `unset WALLET_SK` to remove 
 
 Operations authorized by smart-account context rules sign the auth digest, which binds the authorizing rule ids. Timelock writes use direct G-key Soroban authorization for the proposer, canceller, or executor.
 
-Shared flags available on most verbs: `--profile`, `--network`, `--rpc-url`, `--secondary-rpc-url`, `--timeout-seconds`, `--output` (`json` default or `table`). `--output` is available on `rules`, `execute`, `list-rules`, `list-verifiers`, and the four `deploy-*` verbs. The `signers`, `timelock`, `migrate-verifier`, `multicall`, `register-multicall`, and `unregister-multicall` verbs do not accept it.
+Shared flags available on most verbs: `--profile`, `--network`, `--rpc-url`, `--secondary-rpc-url`, `--timeout-seconds`, `--output` (`json` default or `table`). `--output` is available on `rules`, `execute`, `list-rules`, `list-verifiers`, `list-intents`, and the four `deploy-*` verbs. The `signers`, `timelock`, `migrate-verifier`, `multicall`, `register-multicall`, and `unregister-multicall` verbs do not accept it.
 
 ## Context rules
 
@@ -262,6 +261,8 @@ For a wallet transfer, pass `[{"scval": "<wallet Address XDR>"}, {"scval": "<rec
 The policy gate values the encoded calls the transaction carries. A `transfer(Address from, Address to, i128 amount)` with the smart account as `from` counts against value criteria and bundle caps in the called contract's token. The destination is `to`, which can be an account or contract.
 
 Every other call is unsizable. A matched per-call value criterion refuses it with audit code `multicall.unsizable_value_effect` unless the rule sets `allow_opaque_signing = true`. Value-summing bundle caps always refuse generic calls. `minimum_reserve` requires an account view that bundle evaluation does not supply, so it fails closed even with the opaque exemption. `counterparty_allowlist` also fails closed when its legacy path lacks a destination.
+
+The wallet charges the bundle before signing, and a failed re-simulation keeps the charge.
 
 A bundle can target the smart account's own entrypoints, including `add_signer`, through the typed argument form. Such self-calls bypass manager install probes. A rule installed by a self-call has no pin record, so its signing is not status-checked until a pin record exists. `signers refresh` refuses to pin a revoked or retired verifier, so such a rule is repaired by `migrate-verifier` or removal.
 

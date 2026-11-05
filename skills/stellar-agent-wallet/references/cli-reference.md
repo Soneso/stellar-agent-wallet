@@ -22,8 +22,8 @@ Other CLI signing paths have these checks:
 | Signing action | Wallet policy behavior |
 |---|---|
 | Smart-account multicall | Requires V1. Only Allow proceeds; approval refuses with public code `sa.multicall_failed` and audit code `multicall.approval_required`. |
-| Delegated smart-account execution | Bypasses wallet policy; the agent's rule key authorizes the invocation under on-chain context rules. |
-| Smart-account administration | Rule and signer mutations, verifier migration, and timelock writes bypass wallet policy. They require their respective on-chain authority. |
+| Delegated smart-account execution | It is sized as an unvalued contract call before signing. A matching value rule without `allow_opaque_signing` refuses it, and count limits charge it. On-chain context rules authorize the invocation. |
+| Smart-account administration | Rule and signer mutations, verifier migration, and timelock `cancel` count against matching V1 rate limits before signing. Timelock `schedule` and `execute` are sized as unvalued contract calls. Each requires its on-chain authority. |
 | Contract deployment | Account, verifier, and policy deployment bypass wallet policy and require a deployer signer. |
 | Channel-pool initialization | Bypasses wallet policy; uses the agent's enrolled MCP signer and derived channel keys to create accounts with sponsored reserves and zero starting balances. |
 
@@ -561,7 +561,7 @@ stellar-agent counterparty refresh circle.com --profile default
 
 ## smart-account
 
-Invoke as `stellar-agent smart-account <verb>` or via the shorter `sa` alias. Administration of an on-chain OpenZeppelin smart-account: context rules, signer sets and thresholds, policy contracts, supporting infrastructure (verifier registry, multicall router registry, upgrade timelock), and multicall submission. Context-rule-authorized operations sign the smart-account auth digest, binding the authorizing rule ids. Timelock writes use direct G-key Soroban authorization. Signing verbs take a signer source (exactly one of `--signer-secret-env <VAR>` or `--sign-with-ledger`, plus `--account-index <INDEX>`, default `0`). Most on-chain signing verbs structurally refuse `mainnet`. `--output` is available on `rules`, `execute`, `list-rules`, `list-verifiers`, `deploy-webauthn-verifier`, `deploy-ed25519-verifier`, `deploy-spending-limit-policy`, and `deploy-policy` (`json` default, `table` where offered). The `signers`, `timelock`, `migrate-verifier`, `multicall`, `register-multicall`, and `unregister-multicall` verbs do not accept it.
+Invoke as `stellar-agent smart-account <verb>` or via the shorter `sa` alias. Administration of an on-chain OpenZeppelin smart-account: context rules, signer sets and thresholds, policy contracts, supporting infrastructure (verifier registry, multicall router registry, upgrade timelock), and multicall submission. Context-rule-authorized operations sign the smart-account auth digest, binding the authorizing rule ids. Timelock writes use direct G-key Soroban authorization. Signing verbs take a signer source (exactly one of `--signer-secret-env <VAR>` or `--sign-with-ledger`, plus `--account-index <INDEX>`, default `0`). Most on-chain signing verbs structurally refuse `mainnet`. `--output` is available on `rules`, `execute`, `list-rules`, `list-verifiers`, `list-intents`, `deploy-webauthn-verifier`, `deploy-ed25519-verifier`, `deploy-spending-limit-policy`, and `deploy-policy` (`json` default, `table` where offered). The `signers`, `timelock`, `migrate-verifier`, `multicall`, `register-multicall`, and `unregister-multicall` verbs do not accept it.
 
 Every verb's exact flags, the mainnet-refusal matrix, signer-kind discriminators, WASM-hash pinning and override flags, and worked examples live in [`smart-accounts.md`](smart-accounts.md). Per-verb index:
 
@@ -594,6 +594,7 @@ Every verb's exact flags, the mainnet-refusal matrix, signer-kind discriminators
 | `deploy-policy` | Deploy any of the three OZ policy contracts via one `--kind`; recommended; testnet only |
 | `migrate-verifier` | Move all External signers from one verifier to another across rules; mainnet submit refused, mainnet dry-run allowed. Each remove/add pair runs under the rule's lock against its version-2 state and records `SaSignerRemovedV2`, `SaContextRulePinsUpdatedV2` (pinned rule, names the destination's full hash), `SaSignerAddedV2`, `SaVerifierMigrated`; checks each migrating rule's policies before signing. A failure after a removal was sent returns `pending_add` and prints the `signers add` (or refresh then add) that completes the pair |
 | `list-verifiers` | Enumerate the compile-time verifier allowlist and audit-status taxonomy (read-only, no network) |
+| `list-intents` | List the profile's signed smart-account intents from the verified window state (read-only, mainnet OK, writes nothing) |
 | `register-multicall` / `unregister-multicall` | Edit the local multicall-router registry |
 | `timelock schedule` / `cancel` / `execute` / `list-pending` | OpenZeppelin upgrade-timelock lifecycle; write verbs refuse `mainnet`, `list-pending` is read-only |
 

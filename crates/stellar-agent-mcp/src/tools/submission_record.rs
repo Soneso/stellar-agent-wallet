@@ -99,15 +99,30 @@ pub(crate) fn build_recorder<'a>(
         })
     })?;
 
-    let window_entries = record
+    let sizing = record
         .engine
-        .record_confirmed(&descriptor, record.profile, &record.value_class)
+        .record_confirmed_checked(&descriptor, record.profile, &record.value_class)
         .map_err(|e| {
             WalletError::Submission(SubmissionError::RecordUnavailable {
                 detail: format!("the policy engine could not account for this action: {e}"),
             })
         })?;
 
+    let sizing = match sizing {
+        stellar_agent_core::policy::v1::SizingOutcome::Sized(sizing) => sizing,
+        stellar_agent_core::policy::v1::SizingOutcome::Refused(reason) => {
+            return Err(WalletError::PolicyDenied {
+                reason: Box::new(reason),
+            });
+        }
+        _ => {
+            return Err(WalletError::Submission(
+                SubmissionError::IntentRecordUnavailable {
+                    class: "policy_unavailable",
+                },
+            ));
+        }
+    };
     Ok(WalletSubmissionRecorder::new(
         record.profile,
         record.profile_name.clone(),
@@ -115,7 +130,7 @@ pub(crate) fn build_recorder<'a>(
         Some(record.chain_id),
         record.policy_decision,
         record.legs,
-        window_entries,
+        sizing.entries().to_vec(),
         receipts,
         PersistedWindowStore::for_profile(&record.profile_name),
         Some(record.audit),
@@ -123,8 +138,34 @@ pub(crate) fn build_recorder<'a>(
         uuid::Uuid::new_v4().to_string(),
         record.now_ms,
     )
+    .with_signing_sizing(sizing)
     .with_sequence_floor(sequence_floor)
     .with_approval(approval))
+}
+
+/// Builds checked count admission with the server's governing policy.
+pub(crate) fn no_value_admission(
+    server: &crate::server::WalletServer,
+    tool: &'static str,
+    now_ms: u64,
+) -> Result<Arc<stellar_agent_network::NoValueAdmission>, WalletError> {
+    let unavailable = || {
+        WalletError::Submission(SubmissionError::IntentRecordUnavailable {
+            class: "policy_unavailable",
+        })
+    };
+    let descriptor = profile_bound_descriptor(&server.tool_registry, &server.profile, tool)
+        .ok_or_else(unavailable)?;
+    let sizing = server
+        .policy_engine
+        .size_no_value(&descriptor, &server.profile, now_ms)
+        .map_err(|_| unavailable())?;
+    stellar_agent_network::NoValueAdmission::with_store(
+        server.profile.as_ref().clone(),
+        server.window_store.clone(),
+        sizing,
+    )
+    .map(Arc::new)
 }
 
 fn approval_binding(record: &CommitRecord<'_>) -> Result<Option<ApprovalTombstone>, WalletError> {
@@ -241,6 +282,26 @@ struct MarkedRecorder<'a> {
 
 #[async_trait::async_trait]
 impl stellar_agent_network::SubmissionRecorder for MarkedRecorder<'_> {
+    async fn admit_signed_intent(
+        &self,
+        plan: &stellar_agent_network::SignedIntentPlan,
+    ) -> Result<stellar_agent_network::IntentProof, WalletError> {
+        self.inner.admit_signed_intent(plan).await
+    }
+    async fn cancel_unexposed(
+        &self,
+        proof: stellar_agent_network::IntentProof,
+    ) -> Result<(), WalletError> {
+        self.inner.cancel_unexposed(proof).await
+    }
+    async fn pre_send_bound(
+        &self,
+        intent: &stellar_agent_network::SubmissionIntent,
+        binding: &stellar_agent_network::IntentBinding<'_>,
+    ) -> Result<(), WalletError> {
+        self.inner.pre_send_bound(intent, binding).await
+    }
+
     async fn pre_send(
         &self,
         intent: &stellar_agent_network::SubmissionIntent,
@@ -718,6 +779,135 @@ mod tests {
 
     const SIGNED_XDR: &str = "AAAAAgAAAAA=";
 
+    #[tokio::test]
+    #[serial_test::serial(keyring)]
+    async fn an_opaque_class_under_a_value_cap_builds_no_recorder() {
+        use stellar_agent_core::policy::v1::criteria::{
+            per_period_cap::{PerPeriodCapCriterion, Window},
+            rate_limit::RateLimitCriterion,
+            state_store::{StateKey, WindowEntry, WindowLimit},
+        };
+        use stellar_agent_core::policy::v1::loader::{
+            PolicyDocument, PolicyRule, RuleMatch, ScopeId,
+        };
+        use stellar_agent_core::policy::v1::{OpaqueReason, PolicyEngineV1};
+        use stellar_agent_network::SubmissionRecorder;
+        for exemption in [false, true] {
+            stellar_agent_test_support::keyring_mock::install().unwrap();
+            let dir = tempfile::tempdir().unwrap();
+            let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(dir.path());
+            let profile = Profile::builder_testnet_named(
+                "intent",
+                "opaque",
+                "account",
+                "opaque-nonce",
+                "account",
+            )
+            .build();
+            let audit = Arc::new(Mutex::new(
+                AuditWriter::open(dir.path().join("audit.jsonl"), None).unwrap(),
+            ));
+            let tool = "stellar_smart_account_execute";
+            let engine = PolicyEngineV1::new(
+                PolicyDocument {
+                    version: 1,
+                    scope: ScopeId::AllProfiles,
+                    signature: None,
+                    rules: vec![PolicyRule {
+                        r#match: RuleMatch {
+                            tool: tool.into(),
+                            chain: "*".into(),
+                        },
+                        criteria: vec![
+                            Box::new(PerPeriodCapCriterion::new(
+                                "native".into(),
+                                Window::parse("1m").unwrap(),
+                                10,
+                            )),
+                            Box::new(RateLimitCriterion::new(Window::parse("1m").unwrap(), 1)),
+                        ],
+                        decision: stellar_agent_core::policy::Decision::Allow,
+                        allow_opaque_signing: exemption,
+                    }],
+                },
+                "intent".into(),
+            );
+            let registry = HashMap::from([(
+                tool,
+                ToolDescriptor::from_registration(
+                    &stellar_agent_core::policy::McpToolRegistration {
+                        name: tool,
+                        destructive_hint: true,
+                        read_only_hint: false,
+                        chain_id_required: true,
+                        value_kind: stellar_agent_core::policy::ToolValueKind::MovesValue,
+                    },
+                ),
+            )]);
+            let window = PersistedWindowStore::for_profile("intent");
+            let now = stellar_agent_core::timefmt::now_unix_ms().unwrap();
+            let before = if exemption {
+                window
+                    .record_and_persist(
+                        &profile,
+                        &[WindowEntry::new(
+                            StateKey::new("intent", 1, "rate_limit", 60),
+                            now,
+                            1,
+                            WindowLimit::Count {
+                                window: "1m".into(),
+                                max_calls: 1,
+                            },
+                        )],
+                    )
+                    .unwrap();
+                Some(std::fs::read(window.path()).unwrap())
+            } else {
+                None
+            };
+            let result = build_recorder(
+                CommitRecord {
+                    profile: &profile,
+                    profile_name: "intent".into(),
+                    tool,
+                    chain_id: "stellar:testnet".into(),
+                    policy_decision: stellar_agent_core::audit_log::PolicyDecision::Allow,
+                    legs: vec![],
+                    engine: &engine,
+                    registry: &registry,
+                    value_class: ValueClass::Opaque(OpaqueReason::UnvaluedContractCall),
+                    audit,
+                    nonce_id: None,
+                    approval_nonce: None,
+                    approval_dir: None,
+                    now_ms: now,
+                },
+                None,
+            );
+            if exemption {
+                let recorder = result.unwrap();
+                let plan =
+                    stellar_agent_network::signed_intent::test_helpers::intent_fixture_plan(1, 60)
+                        .0;
+                let error = recorder.admit_signed_intent(&plan).await.err().unwrap();
+                assert_eq!(error.code(), "policy.deny.rate_limit_exceeded");
+                assert_eq!(std::fs::read(window.path()).unwrap(), before.unwrap());
+            } else {
+                assert_eq!(
+                    result.unwrap_err().code(),
+                    "policy.deny.unsizable_value_effect"
+                );
+                assert!(!window.path().exists());
+            }
+            assert!(
+                window
+                    .signed_intents("intent", &profile)
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+    }
+
     #[test]
     fn timeout_carries_the_full_hash_and_the_recovery_protocol() {
         let hash = "ab".repeat(32);
@@ -820,6 +1010,8 @@ mod tests {
         for expected in [
             "smart_account.ledger_witness_unavailable",
             "simulation.divergence.ledger_skew",
+            "submission.intent_record_unavailable",
+            "submission.intent_binding_mismatch",
         ] {
             let error = stellar_agent_defi::adapter::DefiAdapterError::SigningRefusal {
                 wire_code: expected,
@@ -833,6 +1025,7 @@ mod tests {
                 };
                 let json: serde_json::Value = serde_json::from_str(&text).unwrap();
                 assert_eq!(json["error"]["code"], expected, "fallback {fallback}");
+                assert_eq!(json["error"]["message"], "fixed", "fallback {fallback}");
                 assert!(
                     json["error"]["details"].is_null(),
                     "a refusal before signing names no transaction"

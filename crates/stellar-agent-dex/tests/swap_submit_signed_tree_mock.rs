@@ -195,7 +195,7 @@ async fn swap(
         "soroswap-core",
     );
     let signer = CountingSigner::new(SEED);
-    let ctx = DefiAdapterCtx::new_with_submit_ctx(
+    let mut ctx = DefiAdapterCtx::new_with_submit_ctx(
         "default",
         &pin,
         &rpc,
@@ -205,6 +205,8 @@ async fn swap(
         Some(&secondary_rpc),
         Some(Duration::from_secs(5)),
     );
+    ctx.submission_recorder =
+        Some(&stellar_agent_smart_account::signing::intent_test_helpers::NoLimitRecorder);
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()

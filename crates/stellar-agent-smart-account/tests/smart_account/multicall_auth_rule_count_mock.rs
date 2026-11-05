@@ -155,6 +155,9 @@ async fn submit(
     let declared_calls = [nested_call()];
     let result = submit_signed_invoke(
         SubmitInvokeArgs::builder()
+            .admission(stellar_agent_network::SigningAdmission::NoValue(
+                stellar_agent_smart_account::signing::intent_test_helpers::no_value_admission(),
+            ))
             .target_contract(&target)
             .auth_rule_ids(&ids)
             .host_function(HostFunction::InvokeContract(InvokeContractArgs {

@@ -103,3 +103,6 @@ pub(crate) mod identity_fixture;
 
 #[cfg(test)]
 mod message_signing_tests;
+
+/// Read-only retained intent view.
+pub mod signed_intents;
