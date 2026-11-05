@@ -391,30 +391,35 @@ around it. No recovery path sends a transaction again.
 | `submission.tx_already_submitted` | A pending record already holds this transaction's source account and sequence, or the spending window already holds these signed bytes. Nothing was sent. `details.tx_hash` names the transaction to reconcile. | Reconcile `details.tx_hash` first. Once it is settled, the sequence is free and a fresh simulate-and-commit proceeds. |
 | `submission.hash_mismatch` | The endpoint reported a transaction hash that does not describe the transaction that was sent. `details` carries both hashes. | Reconcile `details.tx_hash`. Report the mismatch to the operator: the endpoint is not describing what it was handed. |
 | `submission.record_unavailable` | A receipt, spending-window, or audit-record failure. Before submission, this means that attempt sent nothing; a pending-row anchor failure carries `audit.tip_anchor_unavailable` in the message. During status recovery, it concerns an existing submission and does not establish whether it was sent. | Report to the operator. After repair, repeat `stellar_transaction_status` for an existing submission; do not rebuild or resubmit it. Retry submission only when the failure is known to precede the send. |
-| `submission.tx_malformed` | The endpoint refused the transaction outright, reporting a validation error for the envelope (for example the fee was below the current floor). The wallet never sends those bytes again and releases the reservation. On a mainnet profile a refusal is reported as `submission.tx_timeout` instead, because no second endpoint confirms it. | A fresh simulate-and-commit is the next step; the sequence is free. |
+| `submission.tx_malformed` | The endpoint refused the transaction outright, reporting a validation error for the envelope (for example the fee was below the current floor). The wallet never sends those bytes again. A reported failure or missing transaction does not release possible spending: the record stays `pending` and the reservation keeps counting until its accounting horizon passes or the operator clears it. On a mainnet profile a refusal is reported as `submission.tx_timeout` instead, because no second endpoint confirms it. | Call `stellar_transaction_status` with `details.tx_hash`. Once the accounting horizon has passed or the operator has cleared the record, a fresh simulate-and-commit proceeds. Do not resubmit the same bytes. |
 | `policy.approval_consumed` | The approval presented was already spent. A classic approval was spent on a submission. A consumed x402 approval cannot be replayed. Its stored digest identifies the final envelope, not a chain transaction. | Do not re-present the same approval. For a classic approval, check that transaction's status before asking for the action again. For an x402 payment, request a new payment intent with call 1 and a fresh approval. |
 
 What `stellar_transaction_status` reports, and what it means:
 
-- `chain_status: "SUCCESS"`: the payment went through. Report it as done.
-- `chain_status: "FAILED"`: the transaction applied and failed. Nothing moved.
+A reported failure or missing transaction does not release possible spending.
+
+- `chain_status: "SUCCESS"`: the endpoint reports that the payment went
+  through. Report it as done. The spend keeps counting through the
+  transaction's accounting horizon, and no submitted row is written.
+- `chain_status: "FAILED"`: the endpoint reports that the transaction applied
+  and failed. The record stays `pending` and the reservation keeps counting
+  until its accounting horizon passes or the operator clears it.
 - `chain_status: "NOT_FOUND"` with `record.status: "pending"`: nothing is
-  settled. The transaction can still apply. Wait and call again.
-- On a mainnet profile, `chain_status` is the primary endpoint's answer, and
-  its `FAILED` or `NOT_FOUND` settles nothing until the oracle confirms it. A
-  profile without `oracle_provider_url` keeps such a record `pending` until the
-  operator clears it with
-  `stellar-agent tx receipt clear <ENVELOPE_HASH> --acknowledge`; a sent record
-  without a time bound also needs `--acknowledge-unbounded`. With an oracle, a
-  refused classic mainnet send settles with `submission.time_bound_passed` once
-  its deadline passes.
-- `chain_status: "NOT_FOUND"` with `record.status: "ambiguous"` and a
-  `record.release_code`: the transaction can no longer apply.
-  `submission.sequence_consumed` means another transaction used its sequence;
-  `submission.time_bound_passed` means its time bound passed, which needs an
-  envelope that carries one. The reservation is released and a
-  `value_action_failed` row is written under that code. A fresh
+  established. The transaction can still apply. Wait and call again.
+- On a mainnet profile, `chain_status` is the primary endpoint's answer; its
+  `FAILED` or `NOT_FOUND` decides nothing alone, and the oracle named by
+  `oracle_provider_url` is asked as well. A profile without an oracle keeps
+  such a record `pending` until its accounting horizon passes or the operator
+  clears it with `stellar-agent tx receipt clear <ENVELOPE_HASH>
+  --acknowledge`.
+- `record.status: "ambiguous"` with `record.release_code:
+  "submission.accounting_expired"`: the accounting horizon, the signed time
+  bound plus each affected window's duration, has passed. The reservation has
+  ended with the outcome unknown, and no failed row is written. A fresh
   simulate-and-commit is the next step.
+- A transaction without a time bound keeps its reservation until the operator
+  clears it with `--acknowledge --acknowledge-unbounded`, on every network and
+  whatever the endpoint reports.
 - `chain_status: "NOT_FOUND"` with `record.status: "ambiguous"` and no
   `release_code`: the endpoint can no longer answer for it at all, and only the
   operator can resolve it, with
@@ -432,17 +437,22 @@ An action the policy engine sized no value for takes no reservation at all, so
 `reservation_open` is `false` for it from the start and says nothing about
 whether the submission settled.
 
-`tx receipt clear --acknowledge` reconciles before it clears. It refuses with
-`submission.still_pending` while a sent transaction's time bound is open and
-its sequence unconsumed. On a mainnet profile with an oracle it also asks the
+`tx receipt clear --acknowledge` reconciles before it clears. `--acknowledge`
+records the operator's decision; clearing establishes no chain outcome. It
+refuses with `submission.still_pending` while a sent or held transaction's time
+bound is open on this host's clock. On a mainnet profile with an oracle it also asks the
 oracle, and refuses with `submission.not_clearable` when the oracle does not
 report the mainnet passphrase, reports `SUCCESS` or `FAILED`, or cannot
 answer. Without an oracle the endpoint's `FAILED` does not refuse the clear. A failed ledger-time read refuses sent, timed
 submissions with `network.rpc_unreachable`; other failed reconciliation reads
-also refuse. Both are operator conditions: wait, or ask the operator. On a
-mainnet profile it refuses a sent `pending` or `ambiguous` record without a
-time bound with `submission.unbounded_exposure` unless `--acknowledge-unbounded`
-is passed too.
+also refuse. Both are operator conditions: wait, or ask the operator. An
+authenticated hold without a time bound needs `--acknowledge-unbounded` as well
+on every network, whatever its record says and whatever the endpoint or the
+oracle reports; without it the clear refuses with
+`submission.unbounded_exposure`, and with it the hold is released. A clear
+of such a hold stopped after the release finishes when it is run again with
+both flags. On a mainnet profile a sent `pending` or `ambiguous` record
+without a time bound and with no hold needs the same flag.
 
 An operator policy that lists tools explicitly must include
 `stellar_transaction_status`, or a timed-out submission cannot be resolved

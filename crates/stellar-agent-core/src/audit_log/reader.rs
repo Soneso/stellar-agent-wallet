@@ -1725,6 +1725,41 @@ pub fn try_submission_receipt_cleared_exists(
     .is_some())
 }
 
+/// Reports whether the retained history carries an operator-clear row for
+/// `envelope_hash` that records the unbounded acknowledgement and the release
+/// of the hold.
+///
+/// Such a row is the durable decision of a clear of an untimed authenticated
+/// hold: `stellar-agent tx receipt clear` writes it before it releases the
+/// hold and marks the receipt, so a re-run after the release finishes the
+/// mark on it.
+///
+/// The walk, the writer guard and the limits are those of
+/// [`try_value_action_settlement`], with such a `submission_receipt_cleared`
+/// row as the only match.
+///
+/// # Errors
+///
+/// Returns a read, parse, rotation-gap, in-file chain, bridge, or tip
+/// integrity error.
+pub fn try_unbounded_submission_receipt_cleared_exists(
+    writer: &AuditWriter,
+    envelope_hash: &str,
+) -> Result<bool, AuditLogIntegrityError> {
+    Ok(find_latest_value_row(writer, envelope_hash, |entry| {
+        matches!(
+            entry.event_kind,
+            EventKind::SubmissionReceiptCleared {
+                unbounded_exposure: true,
+                reservation_released: true,
+                ..
+            }
+        )
+        .then_some(())
+    })?
+    .is_some())
+}
+
 /// Walks the writer's bounded files newest first and returns what `select`
 /// maps from the last matching row of the first file that holds one.
 ///

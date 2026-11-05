@@ -154,8 +154,8 @@ fn seed_keyring(profile: &Profile, seed: &Zeroizing<[u8; 32]>) {
         .set_password(&nonce_key_b64)
         .expect("set nonce key");
 
-    // Audit-log chain-root HMAC key, so the commit's post-submit
-    // `value_action_submitted` row is signed and lands.
+    // Audit-log chain-root HMAC key, so the commit's pre-send
+    // `value_action_pending` row is signed and lands.
     let audit_ref = &profile.audit_log_hash_chain_key_id;
     let audit_key_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0x54u8; 32]);
     keyring_core::Entry::new(&audit_ref.service, &audit_ref.account)
@@ -347,7 +347,7 @@ async fn t1_classic_trustline_add_two_phase_happy_path_under_minimum_reserve_rul
         "the on-chain trustline limit must equal the requested limit_stroops"
     );
 
-    // The confirmed commit must have recorded a `value_action_submitted` row
+    // The confirmed commit must have recorded a `value_action_pending` row
     // for `stellar_trustline_commit`.
     let audit_rows: Vec<serde_json::Value> = std::io::BufRead::lines(std::io::BufReader::new(
         std::fs::File::open(audit_dir.path().join("audit.jsonl")).expect("audit log after commit"),
@@ -355,9 +355,14 @@ async fn t1_classic_trustline_add_two_phase_happy_path_under_minimum_reserve_rul
     .map(|line| serde_json::from_str(&line.expect("audit line")).expect("audit JSON row"))
     .collect();
     assert!(
+        audit_rows
+            .iter()
+            .all(|row| row["kind"] != "value_action_submitted")
+    );
+    assert!(
         audit_rows.iter().any(|row| {
-            row["kind"] == "value_action_submitted" && row["tool"] == "stellar_trustline_commit"
+            row["kind"] == "value_action_pending" && row["tool"] == "stellar_trustline_commit"
         }),
-        "trustline commit must record a value_action_submitted row: {audit_rows:?}"
+        "trustline commit must record a value_action_pending row: {audit_rows:?}"
     );
 }

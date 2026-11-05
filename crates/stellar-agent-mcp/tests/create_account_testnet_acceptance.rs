@@ -12,7 +12,7 @@
 //!    nonce, and obtain the `(envelope_xdr, nonce, expires_at_unix_ms)` triple.
 //! 4. Commit: sign and submit on-chain; confirm the destination account now
 //!    exists with the sponsored starting balance.
-//! 5. Assert the confirmed commit recorded a `value_action_submitted` audit
+//! 5. Assert the confirmed commit recorded a `value_action_pending` audit
 //!    row for `stellar_create_account_commit`.
 //!
 //! Gated behind the `testnet-acceptance` feature flag:
@@ -142,8 +142,8 @@ fn seed_keyring(profile: &Profile, seed: &Zeroizing<[u8; 32]>) {
         .set_password(&nonce_key_b64)
         .expect("set nonce key");
 
-    // Audit-log chain-root HMAC key, so the commit's post-submit
-    // `value_action_submitted` row is signed and lands.
+    // Audit-log chain-root HMAC key, so the commit's pre-send
+    // `value_action_pending` row is signed and lands.
     let audit_ref = &profile.audit_log_hash_chain_key_id;
     let audit_key_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0x53u8; 32]);
     keyring_core::Entry::new(&audit_ref.service, &audit_ref.account)
@@ -159,7 +159,7 @@ fn seed_keyring(profile: &Profile, seed: &Zeroizing<[u8; 32]>) {
 /// A sponsor funds a fresh, previously non-existent destination account via
 /// `stellar_create_account` / `stellar_create_account_commit`; the destination
 /// exists on-chain afterward with the sponsored starting balance, and the
-/// commit recorded a `value_action_submitted` audit row.
+/// commit recorded a `value_action_pending` audit row.
 #[tokio::test]
 #[serial]
 async fn t1_sponsored_create_account_two_phase_happy_path() {
@@ -261,7 +261,7 @@ async fn t1_sponsored_create_account_two_phase_happy_path() {
         "destination's on-chain balance must equal the sponsored starting balance"
     );
 
-    // The confirmed commit must have recorded a `value_action_submitted` row
+    // The confirmed commit must have recorded a `value_action_pending` row
     // for `stellar_create_account_commit`.
     let audit_rows: Vec<serde_json::Value> = std::io::BufRead::lines(std::io::BufReader::new(
         std::fs::File::open(audit_dir.path().join("audit.jsonl")).expect("audit log after commit"),
@@ -269,10 +269,14 @@ async fn t1_sponsored_create_account_two_phase_happy_path() {
     .map(|line| serde_json::from_str(&line.expect("audit line")).expect("audit JSON row"))
     .collect();
     assert!(
+        audit_rows
+            .iter()
+            .all(|row| row["kind"] != "value_action_submitted")
+    );
+    assert!(
         audit_rows.iter().any(|row| {
-            row["kind"] == "value_action_submitted"
-                && row["tool"] == "stellar_create_account_commit"
+            row["kind"] == "value_action_pending" && row["tool"] == "stellar_create_account_commit"
         }),
-        "sponsored create-account commit must record a value_action_submitted row: {audit_rows:?}"
+        "sponsored create-account commit must record a value_action_pending row: {audit_rows:?}"
     );
 }

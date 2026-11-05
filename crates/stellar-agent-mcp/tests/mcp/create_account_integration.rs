@@ -2282,6 +2282,10 @@ async fn witness_create_case(amount: &str, mode: &str, expected: &str) {
         .collect();
     let mut witnesses = Vec::new();
     for kind in ["value_action_pending", "value_action_submitted"] {
+        if kind == "value_action_submitted" {
+            assert!(rows.iter().all(|row| row["kind"] != kind));
+            continue;
+        }
         let rows: Vec<_> = rows.iter().filter(|row| row["kind"] == kind).collect();
         assert_eq!(rows.len(), 1, "{kind}: {rows:?}");
         if expected == "passed" {
@@ -2301,7 +2305,7 @@ async fn witness_create_case(amount: &str, mode: &str, expected: &str) {
         }
     }
     if expected == "passed" {
-        assert_eq!(witnesses[0], witnesses[1]);
+        assert_eq!(witnesses.len(), 1);
         assert_eq!(body["data"]["cross_check"]["provider"], oracle.uri());
         assert_eq!(body["data"]["cross_check"]["ledger"], 1001);
         assert_eq!(

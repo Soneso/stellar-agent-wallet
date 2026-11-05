@@ -466,7 +466,6 @@ where
                     &receipt.envelope_hash,
                     &receipt.tx_hash,
                     &receipt.status,
-                    receipt.ledger,
                     stellar_agent_core::audit_log::PolicyDecision::Allow,
                 );
             }
@@ -527,7 +526,6 @@ where
                 &receipt.envelope_hash,
                 &receipt.tx_hash,
                 &receipt.status,
-                receipt.ledger,
                 stellar_agent_core::audit_log::PolicyDecision::Allow,
             );
         }
@@ -1301,8 +1299,8 @@ mod tests {
     mod witness {
         use super::*;
         use crate::test_rpc::{
-            ACCOUNT_SEQUENCE, ClassicRpc, account_key, account_xdr, assert_rows_carry_witness,
-            methods, sent,
+            ACCOUNT_SEQUENCE, ClassicRpc, account_key, account_xdr,
+            assert_pending_row_carries_witness, methods, sent,
         };
         use std::sync::{
             Arc,
@@ -1658,7 +1656,7 @@ mod tests {
                         }
                     );
                     if !matches!(case, Case::Skipped) {
-                        assert_rows_carry_witness(&profile, &oracle.uri());
+                        assert_pending_row_carries_witness(&profile, &oracle.uri());
                     }
                     // A resume loads the signer after the witness and reads
                     // it again to sign. The fresh path also loads it once

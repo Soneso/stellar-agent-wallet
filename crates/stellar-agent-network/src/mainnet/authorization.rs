@@ -482,6 +482,7 @@ pub(crate) struct Header {
     pub(crate) approval: ApprovalBinding,
     pub(crate) reservation: Option<WindowReservation>,
     pub(crate) witness_subject: Option<[u8; 32]>,
+    pub(crate) submission_anchor: Option<crate::policy_state::SubmissionAnchor>,
     pub(crate) audit: AuditReadiness,
     pub(crate) issued_at_ms: u64,
     pub(crate) expires_at_ms: u64,
@@ -1494,6 +1495,7 @@ mod tests {
                     },
                     reservation: Some(WindowReservation::for_crate_tests(id, "mainnet-profile")),
                     witness_subject: Some([4; 32]),
+                    submission_anchor: None,
                     audit: AuditReadiness::for_crate_tests(
                         "mainnet-profile",
                         VerifiedTipFacts {
@@ -2200,6 +2202,7 @@ mod tests {
                 },
                 reservation: minted.reservation,
                 witness_subject: witness.subject(),
+                submission_anchor: None,
                 audit,
                 issued_at_ms: minted.issued_at_ms,
                 expires_at_ms: minted.expires_at_ms,
@@ -2224,6 +2227,7 @@ mod tests {
                         max_time: 0,
                         pending_since_ms: now,
                         submission_ledger: 42,
+                        submission_anchor: None,
                     })
                 }
                 DomainBinding::FeeBumpInner { .. } | DomainBinding::FeeBumpOuter { .. } => {
@@ -2243,6 +2247,7 @@ mod tests {
                         max_time: 0,
                         pending_since_ms: now,
                         submission_ledger: 42,
+                        submission_anchor: None,
                     })
                 }
                 DomainBinding::Soroban { intent_digest } => {

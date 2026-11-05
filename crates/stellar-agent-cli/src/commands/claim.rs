@@ -3703,8 +3703,8 @@ mod tests {
     mod witness {
         use super::*;
         use crate::test_rpc::{
-            ClassicRpc, account_key, account_xdr, assert_rows_carry_witness, audit_rows, methods,
-            profile_name_for, sent, signers_resolved_by, trustline_xdr, witness_profile,
+            ClassicRpc, account_key, account_xdr, assert_pending_row_carries_witness, audit_rows,
+            methods, profile_name_for, sent, signers_resolved_by, trustline_xdr, witness_profile,
         };
         use stellar_xdr::{
             ClaimClaimableBalanceOp, ClaimPredicate, ClaimableBalanceEntry,
@@ -3839,8 +3839,8 @@ mod tests {
             assert_eq!(view["status"], "passed", "{}", run.envelope);
             assert_eq!(view["provider"], oracle.uri());
             assert_eq!(methods(&oracle).await, ["getNetwork", "getLedgerEntries"]);
-            assert_rows_carry_witness(&profile, &oracle.uri());
-            let kinds = &audit_rows(&profile, "value_action_submitted")[0]["witness"]["kinds"];
+            assert_pending_row_carries_witness(&profile, &oracle.uri());
+            let kinds = &audit_rows(&profile, "value_action_pending")[0]["witness"]["kinds"];
             assert_eq!(
                 *kinds,
                 serde_json::json!(["source_account", "claimable_balance"])
@@ -3895,7 +3895,7 @@ mod tests {
             let run = run_stage(&args_for(&claimant, &primary), &profile).await;
 
             assert_eq!(run.code, 0, "{}", run.envelope);
-            let kinds = &audit_rows(&profile, "value_action_submitted")[0]["witness"]["kinds"];
+            let kinds = &audit_rows(&profile, "value_action_pending")[0]["witness"]["kinds"];
             assert_eq!(
                 *kinds,
                 serde_json::json!(["source_account", "source_trustline", "claimable_balance"])
@@ -4221,7 +4221,7 @@ mod tests {
             assert_eq!(run.code, 0, "{}", run.envelope);
             assert_eq!(run.envelope["data"]["cross_check"]["status"], "passed");
             assert!(sent(&primary).await);
-            assert_rows_carry_witness(&profile, &oracle.uri());
+            assert_pending_row_carries_witness(&profile, &oracle.uri());
         }
 
         #[tokio::test]

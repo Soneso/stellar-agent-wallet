@@ -35,7 +35,7 @@
 //! means the pending-approval entry lands in the OS-conventional approval
 //! directory, not a per-test `tempfile::TempDir`. The happy-path commit
 //! removes its own entry on successful submission
-//! (`stellar_claim_commit_impl`'s post-submit cleanup), so no state survives
+//! (`stellar_claim_commit_impl`'s pre-send cleanup), so no state survives
 //! a passing run.
 //!
 //! Gated behind the `testnet-acceptance` feature flag:
@@ -233,8 +233,8 @@ fn seed_keyring(profile: &Profile, seed: &Zeroizing<[u8; 32]>, attestation_key: 
         .set_password(&attest_key_b64)
         .expect("set attestation key");
 
-    // Audit-log chain-root HMAC key, so the commit's post-submit
-    // `value_action_submitted` row is signed and lands.
+    // Audit-log chain-root HMAC key, so the commit's pre-send
+    // `value_action_pending` row is signed and lands.
     let audit_ref = &profile.audit_log_hash_chain_key_id;
     let audit_key_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0x33u8; 32]);
     keyring_core::Entry::new(&audit_ref.service, &audit_ref.account)
@@ -483,17 +483,22 @@ async fn t1_claim_two_phase_happy_path() {
     );
 
     // #21 — the confirmed claim commit must have recorded a
-    // `value_action_submitted` row for `stellar_claim_commit`.
+    // `value_action_pending` row for `stellar_claim_commit`.
     let audit_rows: Vec<serde_json::Value> = std::io::BufRead::lines(std::io::BufReader::new(
         std::fs::File::open(audit_dir.path().join("audit.jsonl")).expect("audit log after commit"),
     ))
     .map(|line| serde_json::from_str(&line.expect("audit line")).expect("audit JSON row"))
     .collect();
     assert!(
+        audit_rows
+            .iter()
+            .all(|row| row["kind"] != "value_action_submitted")
+    );
+    assert!(
         audit_rows.iter().any(|row| {
-            row["kind"] == "value_action_submitted" && row["tool"] == "stellar_claim_commit"
+            row["kind"] == "value_action_pending" && row["tool"] == "stellar_claim_commit"
         }),
-        "claim commit must record a value_action_submitted row: {audit_rows:?}"
+        "claim commit must record a value_action_pending row: {audit_rows:?}"
     );
 
     // ── 4. On-chain effects: claimant credited, entry gone ─────────────────────

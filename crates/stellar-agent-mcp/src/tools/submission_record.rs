@@ -456,16 +456,13 @@ pub(crate) async fn sign_and_submit_classic(
 ///
 /// The row carries the SAME value legs the gate sized, read back from the
 /// pending row this submission wrote before it was sent: they were derived
-/// once, at the gate, and are never re-derived here. `ledger` is the ledger
-/// the chain reports the transaction in.
+/// once, at the gate, and are never re-derived here.
 ///
-/// A `Success` receipt owes a `value_action_submitted` row and a `Failed` one
-/// a `value_action_failed` row under its failure code. An `Ambiguous` receipt
-/// released on chain evidence (`release_code`) owes a `value_action_failed`
-/// row under the evidence's wire code. Every other status leaves the outcome
-/// open, which is what the pending row already records: a pending receipt,
-/// and an ambiguous one whose retention window closed. A receipt an operator
-/// cleared owes no row by design.
+/// Only a `Failed` receipt owes a row: a `value_action_failed` row under its
+/// failure code. A reported success, an accounting disposition, a pending
+/// receipt and an ambiguous one leave the outcome open, which is what the
+/// pending row already records. A receipt an operator cleared owes no row by
+/// design; the `submission_receipt_cleared` row records the clear.
 ///
 /// The writer guard is taken once and held through the settlement lookup and
 /// the append. The lookup reads the retained history through that guard,
@@ -493,7 +490,6 @@ pub(crate) fn write_settled_row(
     tx_hash: &str,
     status: &ReceiptStatus,
     release_code: Option<ReleaseEvidence>,
-    ledger: Option<u32>,
     reconciliation_decision: stellar_agent_core::audit_log::PolicyDecision,
 ) {
     use stellar_agent_core::audit_log::{AuditEntry, reader::ValueActionSettlement};
@@ -524,63 +520,46 @@ pub(crate) fn write_settled_row(
             return;
         }
     };
-    let (tool, chain_id, legs, nonce_id, policy_decision, approval_nonce, witness) =
-        match settlement {
-            // Already accounted for. Reconciliation is repeatable, and a second
-            // row would count one spend twice.
-            ValueActionSettlement::Settled => return,
-            ValueActionSettlement::Owed(pending) => (
-                pending.tool,
-                pending.chain_id,
-                pending.legs,
-                pending.nonce_id,
-                pending.policy_decision,
-                pending.approval_nonce,
-                pending.witness,
-            ),
-            // No pending row survives in retained history, so its sizing is
-            // unavailable. The outcome still belongs in the log, under the name
-            // of the surface that settled it.
-            ValueActionSettlement::OwedWithoutLegs => (
-                RECONCILE_TOOL.to_owned(),
-                profile.chain_id.caip2_str().to_owned().into(),
-                Vec::new(),
-                None,
-                reconciliation_decision,
-                None,
-                None,
-            ),
-        };
+    let (tool, chain_id, legs, nonce_id, policy_decision, approval_nonce) = match settlement {
+        // Already accounted for. Reconciliation is repeatable, and one spend
+        // takes exactly one row.
+        ValueActionSettlement::Settled => return,
+        ValueActionSettlement::Owed(pending) => (
+            pending.tool,
+            pending.chain_id,
+            pending.legs,
+            pending.nonce_id,
+            pending.policy_decision,
+            pending.approval_nonce,
+        ),
+        // No pending row survives in retained history, so its sizing is
+        // unavailable. The outcome still belongs in the log, under the name
+        // of the surface that settled it.
+        ValueActionSettlement::OwedWithoutLegs => (
+            RECONCILE_TOOL.to_owned(),
+            profile.chain_id.caip2_str().to_owned().into(),
+            Vec::new(),
+            None,
+            reconciliation_decision,
+            None,
+        ),
+    };
     let chain_id: Option<String> = chain_id;
     let tx_redacted = stellar_agent_network::redact_tx_hash(tx_hash);
     let request_id = uuid::Uuid::new_v4().to_string();
-    let entry = match row {
-        SettledRow::Submitted => AuditEntry::new_value_action_submitted(
-            tool,
-            chain_id,
-            legs,
-            tx_redacted.as_str(),
-            ledger.unwrap_or(0),
-            policy_decision,
-            Some(envelope_hash.to_owned()),
-            nonce_id,
-            approval_nonce,
-            &request_id,
-            witness,
-        ),
-        SettledRow::Failed { code } => AuditEntry::new_value_action_failed(
-            tool,
-            chain_id,
-            legs,
-            tx_redacted.as_str(),
-            code,
-            policy_decision,
-            Some(envelope_hash.to_owned()),
-            nonce_id,
-            approval_nonce,
-            &request_id,
-        ),
-    };
+    let SettledRow::Failed { code } = row;
+    let entry = AuditEntry::new_value_action_failed(
+        tool,
+        chain_id,
+        legs,
+        tx_redacted.as_str(),
+        code,
+        policy_decision,
+        Some(envelope_hash.to_owned()),
+        nonce_id,
+        approval_nonce,
+        &request_id,
+    );
     if let Err(error) = guard.write_entry(entry) {
         tracing::warn!(
             profile = %profile_name,
@@ -1263,11 +1242,7 @@ mod tests {
         use stellar_agent_core::audit_log::PolicyDecision;
 
         for (status, evidence, expected) in [
-            (
-                ReceiptStatus::Success,
-                None,
-                Some(("value_action_submitted", None)),
-            ),
+            (ReceiptStatus::Success, None, None),
             (
                 ReceiptStatus::Failed {
                     code: "ledger.failed".to_owned(),
@@ -1278,12 +1253,12 @@ mod tests {
             (
                 ReceiptStatus::Ambiguous,
                 Some(ReleaseEvidence::TimeBoundPassed),
-                Some(("value_action_failed", Some("submission.time_bound_passed"))),
+                None,
             ),
             (
                 ReceiptStatus::Ambiguous,
                 Some(ReleaseEvidence::SequenceConsumed),
-                Some(("value_action_failed", Some("submission.sequence_consumed"))),
+                None,
             ),
             (ReceiptStatus::Ambiguous, None, None),
             (ReceiptStatus::Pending, None, None),
@@ -1309,7 +1284,6 @@ mod tests {
                 "transaction",
                 &status,
                 evidence,
-                Some(9),
                 PolicyDecision::Allow,
             );
             let rows: Vec<serde_json::Value> = std::fs::read_to_string(&profile.audit_log_path)
@@ -1368,7 +1342,6 @@ mod tests {
             "transaction",
             &ReceiptStatus::Success,
             None,
-            Some(124),
             PolicyDecision::Allow,
         );
         let rows: Vec<serde_json::Value> = std::fs::read_to_string(&profile.audit_log_path)
@@ -1376,10 +1349,9 @@ mod tests {
             .lines()
             .map(|line| serde_json::from_str(line).unwrap())
             .collect();
-        assert_eq!(rows.len(), 2);
-        assert_eq!(rows[1]["kind"], "value_action_submitted");
-        assert_eq!(rows[1]["witness"], serde_json::to_value(&witness).unwrap());
-        assert_eq!(rows[0]["witness"], rows[1]["witness"]);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["kind"], "value_action_pending");
+        assert_eq!(rows[0]["witness"], serde_json::to_value(&witness).unwrap());
     }
     /// A settled row appended past the writer's verified tip is not read as
     /// the settlement: reconciliation still writes its own
@@ -1434,9 +1406,10 @@ mod tests {
             &audit,
             "envelope",
             "transaction",
-            &ReceiptStatus::Success,
+            &ReceiptStatus::Failed {
+                code: "ledger.failed".to_owned(),
+            },
             None,
-            Some(124),
             PolicyDecision::Allow,
         );
         let rows: Vec<serde_json::Value> = std::fs::read_to_string(&profile.audit_log_path)
@@ -1445,7 +1418,7 @@ mod tests {
             .map(|line| serde_json::from_str(line).unwrap())
             .collect();
         assert_eq!(rows.len(), 3, "{rows:?}");
-        assert_eq!(rows[2]["kind"], "value_action_submitted");
+        assert_eq!(rows[2]["kind"], "value_action_failed");
         assert_ne!(rows[2]["request_id"], "forged-request");
     }
 

@@ -298,6 +298,82 @@ pub struct SubmissionBinding {
     pub pending_since_ms: u64,
     /// The endpoint's latest ledger when the submission took its records.
     pub submission_ledger: u32,
+    /// Independent provenance bound to this submission.
+    ///
+    /// Deserializing a binding never yields an anchor: input naming one is
+    /// refused as an unknown field. The window file reads the anchor of a
+    /// stored consumption back through its authenticated load.
+    #[serde(default, skip_serializing_if = "Option::is_none", skip_deserializing)]
+    pub submission_anchor: Option<Box<super::store::SubmissionAnchor>>,
+}
+
+/// The stored form of a [`SubmissionBinding`], read only inside the
+/// authenticated window-file load, where its anchor is restored.
+#[derive(Deserialize)]
+#[serde(remote = "SubmissionBinding", deny_unknown_fields)]
+struct StoredSubmissionBinding {
+    #[serde(default)]
+    chain_scope: Option<super::store::ChainScope>,
+    #[serde(default)]
+    fee_bump: Option<FeeBumpFacts>,
+    #[serde(with = "hex32")]
+    envelope_hash: [u8; 32],
+    #[serde(with = "hex32")]
+    tx_hash: [u8; 32],
+    source: String,
+    sequence: i64,
+    max_time: u64,
+    pending_since_ms: u64,
+    submission_ledger: u32,
+    #[serde(
+        default,
+        deserialize_with = "super::store::stored_anchor::boxed_option"
+    )]
+    submission_anchor: Option<Box<super::store::SubmissionAnchor>>,
+}
+
+/// The stored form of a [`ConsumptionBinding`], read only inside the
+/// authenticated window-file load.
+#[derive(Deserialize)]
+#[serde(
+    remote = "ConsumptionBinding",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
+enum StoredConsumptionBinding {
+    Transaction(
+        #[serde(deserialize_with = "StoredSubmissionBinding::deserialize")] SubmissionBinding,
+    ),
+    RetainedIntent {
+        #[serde(with = "hex32")]
+        intent_digest: [u8; 32],
+    },
+    PayloadRelease {
+        #[serde(default)]
+        intent_record: Option<AuthorizationId>,
+        #[serde(with = "hex32")]
+        final_envelope_sha256: [u8; 32],
+        #[serde(default, with = "opt_hex32")]
+        root_invocation_digest: Option<[u8; 32]>,
+    },
+    Message {
+        domain: MessageDomain,
+        #[serde(with = "hex32")]
+        content_digest: [u8; 32],
+        #[serde(with = "hex32")]
+        ephemeral_public_key: [u8; 32],
+    },
+}
+
+/// Reads a stored authorization's consumption, anchor included.
+fn stored_consumption<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<Option<ConsumptionBinding>, D::Error> {
+    #[derive(Deserialize)]
+    struct Stored(
+        #[serde(deserialize_with = "StoredConsumptionBinding::deserialize")] ConsumptionBinding,
+    );
+    Ok(Option::<Stored>::deserialize(d)?.map(|stored| stored.0))
 }
 
 /// How an authorization is consumed, by domain.
@@ -417,7 +493,11 @@ pub(super) struct WireAuthorization {
     pub(super) reservation: Option<AuthorizationId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) parent: Option<AuthorizationId>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "stored_consumption"
+    )]
     pub(super) consumption: Option<ConsumptionBinding>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) invalidation: Option<String>,
@@ -994,6 +1074,13 @@ fn check_consumption(
         let scope = submission
             .chain_scope
             .ok_or(WindowStoreError::ChainUnverifiable)?;
+        if submission
+            .submission_anchor
+            .as_ref()
+            .is_some_and(|anchor| !anchor.matches(scope, submission.tx_hash))
+        {
+            return Err(WindowStoreError::ChainUnverifiable);
+        }
         if scope.chain() != auth.chain || Some(scope) != wire.chain_scope {
             return Err(WindowStoreError::ChainMismatch);
         }
@@ -1165,7 +1252,18 @@ fn apply_consumption(
                 max_time: submission.max_time,
                 pending_since_ms: submission.pending_since_ms,
                 submission_ledger: submission.submission_ledger,
+                submission_anchor: submission.submission_anchor.as_deref().cloned(),
                 operator_required: false,
+                execution_bound: (submission.max_time > 0)
+                    .then(|| submission.max_time.saturating_mul(1000)),
+                admitted_window_ms: Some(hold.window_secs.saturating_mul(1000)),
+                accounting_until_ms: (submission.max_time > 0).then(|| {
+                    submission
+                        .max_time
+                        .saturating_mul(1000)
+                        .saturating_add(hold.window_secs.saturating_mul(1000))
+                }),
+                ..WireRecord::confirmed_defaults()
             },
             // Retained authorized spend: confirmed at the moment the store
             // released it, as an authorized external settlement is.
@@ -2393,6 +2491,7 @@ mod tests {
             max_time: 1_800_000_300,
             pending_since_ms: T0 + 5,
             submission_ledger: 512,
+            submission_anchor: None,
         })
     }
 
@@ -2704,6 +2803,7 @@ mod tests {
                     max_time: 0,
                     pending_since_ms: T0,
                     submission_ledger: 1,
+                    submission_anchor: None,
                     operator_required: false,
                 },
             )
@@ -3577,6 +3677,7 @@ mod tests {
                     max_time: 0,
                     pending_since_ms: T0,
                     submission_ledger: 1,
+                    submission_anchor: None,
                     operator_required: false,
                 },
             )
@@ -4703,6 +4804,7 @@ mod tests {
             max_time: 0,
             pending_since_ms: T0,
             submission_ledger: 1_000,
+            submission_anchor: None,
             operator_required: false,
             chain_scope: crate::policy_state::ChainScope::for_chain(
                 stellar_agent_core::profile::caip2::Caip2::Mainnet,
@@ -4934,5 +5036,64 @@ mod tests {
             );
             assert_eq!(l.record(minted.id).state, AuthorizationState::Open);
         }
+    }
+
+    /// A submission anchor serializes into the window file and is read back
+    /// only through the stored consumption the authenticated load uses: the
+    /// public `Deserialize` of a binding refuses input that names one.
+    #[test]
+    fn an_anchor_is_read_back_only_through_the_stored_consumption() {
+        let scope = super::super::store::ChainScope::for_chain(Caip2::Mainnet);
+        let witness_binding = [1_u8; 32];
+        let subject = [2_u8; 32];
+        let anchor = super::super::store::stored_anchor::option(serde_json::json!({
+            "chain_scope": scope,
+            "ledger": 123,
+            "observed_at_ms": 77,
+            "witness_authority": "https://oracle.example",
+            "witness_binding": witness_binding,
+            "subject": subject,
+        }))
+        .unwrap()
+        .expect("a stored anchor");
+        let binding = SubmissionBinding {
+            chain_scope: Some(scope),
+            fee_bump: None,
+            envelope_hash: [3; 32],
+            tx_hash: [4; 32],
+            source: SOURCE.to_owned(),
+            sequence: 7,
+            max_time: 0,
+            pending_since_ms: T0,
+            submission_ledger: 100,
+            submission_anchor: Some(Box::new(anchor)),
+        };
+        let stored =
+            serde_json::to_value(ConsumptionBinding::Transaction(binding.clone())).unwrap();
+        assert!(
+            stored["transaction"]["submission_anchor"].is_object(),
+            "the anchor is written: {stored}"
+        );
+
+        let public = serde_json::from_value::<ConsumptionBinding>(stored.clone()).unwrap_err();
+        assert!(
+            public
+                .to_string()
+                .contains("unknown field `submission_anchor`"),
+            "{public}"
+        );
+        let bare =
+            serde_json::from_value::<SubmissionBinding>(stored["transaction"].clone()).unwrap_err();
+        assert!(
+            bare.to_string()
+                .contains("unknown field `submission_anchor`"),
+            "{bare}"
+        );
+
+        assert_eq!(
+            stored_consumption(stored).unwrap(),
+            Some(ConsumptionBinding::Transaction(binding)),
+            "the stored form restores the anchor"
+        );
     }
 }

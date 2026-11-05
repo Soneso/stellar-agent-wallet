@@ -58,7 +58,7 @@
 //!    and now proceeds past the audit pre-flight. A cheap classic
 //!    `ChangeTrust` is used as the "tiny funded testnet signing operation".
 //! 8. The profile's (tempdir-scoped) audit log file is read back and asserted
-//!    to contain a `value_action_submitted` row for this trustline's redacted
+//!    to contain a `value_action_pending` row for this trustline's redacted
 //!    transaction hash — on-chain proof that the post-confirm audit row the
 //!    fail-closed pre-flight guards was actually emitted.
 //!
@@ -563,15 +563,20 @@ async fn profile_init_then_enroll_signer_enables_a_real_signing_operation() {
         account_after.balances
     );
 
-    // ── Audit-log proof: the confirmed submit recorded a value_action_submitted
+    // The pending row retains the submission identity.
     // row (the fail-closed pre-flight guards exactly this row) ───────────────
     let audit_entries = verified_audit_entries_from_path(&audit_log_path);
+    assert!(
+        audit_entries
+            .iter()
+            .all(|entry| !matches!(entry.event_kind, EventKind::ValueActionSubmitted { .. }))
+    );
     let redacted_tx_hash = stellar_agent_network::submit::redact_tx_hash(tx_hash);
     let found_row = audit_entries.iter().any(|entry| {
         entry.tool == "stellar_trustline"
             && matches!(
                 &entry.event_kind,
-                EventKind::ValueActionSubmitted {
+                EventKind::ValueActionPending {
                     transaction_hash_redacted,
                     ..
                 } if transaction_hash_redacted == &redacted_tx_hash
@@ -579,7 +584,7 @@ async fn profile_init_then_enroll_signer_enables_a_real_signing_operation() {
     });
     assert!(
         found_row,
-        "the audit log at {} must contain a value_action_submitted row for \
+        "the audit log at {} must contain a value_action_pending row for \
          stellar_trustline with transaction_hash_redacted {redacted_tx_hash}: {audit_entries:?}",
         audit_log_path.display()
     );

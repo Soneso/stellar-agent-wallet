@@ -740,7 +740,7 @@ async fn submit_pooled_build_and_sign_failure_releases_channel() {
 #[tokio::test]
 #[serial_test::serial]
 async fn pooled_timeout_is_recorded_and_reconcilable() {
-    stellar_agent_test_support::keyring_mock::install().unwrap();
+    common::install_keyring();
     let server = MockServer::start().await;
     let channel = channel_key().await;
     mount_network_probe(&server).await;

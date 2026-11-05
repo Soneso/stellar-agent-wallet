@@ -2015,11 +2015,17 @@ async fn witness_claim_case(case: ClaimCase, expected: &str) {
     let pending = rows_of_kind(&rows, "value_action_pending");
     let submitted = rows_of_kind(&rows, "value_action_submitted");
     assert_eq!(pending.len(), 1);
-    assert_eq!(submitted.len(), 1);
+    assert!(submitted.is_empty());
     if expected == "passed" {
         assert_eq!(pending[0]["witness"]["provider"], oracle.uri());
         assert_eq!(pending[0]["witness"]["ledger"], 1001);
-        assert_eq!(pending[0]["witness"], submitted[0]["witness"]);
+        assert_eq!(
+            pending[0]["witness"]["inputs_digest"]
+                .as_str()
+                .unwrap()
+                .len(),
+            64
+        );
     } else {
         assert!(received_methods(&oracle).await.is_empty());
     }

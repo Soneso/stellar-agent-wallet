@@ -326,7 +326,10 @@ async fn init_pool_n2_success_submits_valid_sandwich() {
         .expect("init_pool must succeed against mock RPC");
 
     let rows = std::fs::read_to_string(&recording.profile.audit_log_path).unwrap();
-    assert!(rows.contains("value_action_submitted"));
+    // The reported success writes no submitted row: the pending row stays
+    // owed until authenticated evidence settles it.
+    assert!(rows.contains("value_action_pending"));
+    assert!(!rows.contains("value_action_submitted"));
     assert!(rows.contains(&stellar_agent_network::redact_tx_hash(&result.tx_hash)));
     assert_eq!(
         recording.receipts.all().unwrap()[0].status,
@@ -584,7 +587,7 @@ async fn init_pool_invalid_channel_strkey_returns_init_failed() {
 #[tokio::test]
 #[serial_test::serial]
 async fn timed_out_initialization_is_recorded_and_reconcilable() {
-    stellar_agent_test_support::keyring_mock::install().unwrap();
+    crate::common::install_keyring();
     let rpc = MockServer::start().await;
     Mock::given(body_partial_json(json!({"method":"getNetwork"})))
         .respond_with(EchoIdResponder::new(get_network_result(TESTNET_PASSPHRASE)))

@@ -4,26 +4,26 @@
 //! This is how an agent resolves `submission.tx_timeout`. The submission was
 //! recorded before it was sent, so the wallet holds a receipt and, under a
 //! policy with a stateful criterion, a spending-window reservation for it;
-//! asking the chain what happened settles both. Re-simulating or resubmitting
-//! the same intent never does: the transaction may still apply, and the
-//! sequence it consumes may already be spent by it.
+//! asking the chain what happened records its answer on both. Re-simulating or
+//! resubmitting the same intent never resolves it: the transaction may still
+//! apply, and the sequence it consumes may already be spent by it.
 //!
-//! The tool settles a submission by its receipt, or by its reservation when
-//! the receipt is missing, the way `stellar-agent tx status` does. A
-//! reservation released on chain evidence restores the missing receipt and
-//! writes the settled `value_action_failed` row under the evidence's code,
-//! which `record.release_code` reports. A hold the reconciliation could not
-//! settle is reported as `reservation`; one marked `operator_required` is
+//! The tool reconciles a submission by its receipt, or by its reservation when
+//! the receipt is missing, the way `stellar-agent tx status` does. A reported
+//! failure or missing transaction does not release possible spending, and a
+//! reported success writes no submitted row. A reservation ends once its
+//! accounting horizon has passed, with `record.release_code`
+//! `submission.accounting_expired` and the outcome unknown. A hold that
+//! remains is reported as `reservation`; one marked `operator_required` is
 //! resolved by the operator's `stellar-agent tx receipt clear`. No step sends
 //! the transaction again.
 //!
 //! # Why a read tool is not read-only
 //!
-//! The lookup changes wallet state: a confirmed transaction turns its
-//! reservation into recorded spend and writes the value-action row the
-//! submission never got to write, and a transaction that can no longer apply
-//! releases its reservation. Both annotations say so, because the pairing is
-//! legal but unusual: `read_only_hint = false` because state changes, and
+//! The lookup changes wallet state: it records the endpoint's report on the
+//! receipt and the reservation, and ends a reservation whose accounting
+//! horizon has passed. Both annotations say so, because the pairing is legal
+//! but unusual: `read_only_hint = false` because state changes, and
 //! `ToolValueKind::ReadOnly` because no value moves as a result of the call.
 
 use rmcp::{
@@ -67,13 +67,14 @@ impl WalletServer {
     )]
     #[tool(
         name = "stellar_transaction_status",
-        description = "Reconcile one submitted transaction against the chain and settle the \
+        description = "Reconcile one submitted transaction against the chain and update the \
                        wallet's record of it. Pass the tx_hash from a submission.tx_timeout \
-                       response. A confirmed transaction records its spend and its value-action \
-                       row. One that can no longer apply releases its spending-window \
-                       reservation: record.status is then ambiguous and record.release_code \
-                       names the evidence (submission.sequence_consumed or \
-                       submission.time_bound_passed). A hold that remains is returned as \
+                       response. Endpoint success, failure, and absence are reports. Possible \
+                       spending remains charged through the signed deadline and every affected \
+                       window; untimed exposure requires explicit operator acknowledgement. \
+                       Accounting expiry leaves the outcome unknown and records \
+                       submission.accounting_expired in record.release_code without a failed \
+                       value-action row. A hold that remains is returned as \
                        reservation {envelope_hash, operator_required}; operator_required means \
                        only the operator's tx receipt clear resolves it. This is the only way to \
                        resolve a timed-out submission: never re-simulate or resubmit, because \
@@ -244,9 +245,8 @@ impl WalletServer {
             }
         };
 
-        // A submission the chain has now answered for, or whose reservation
-        // was released on chain evidence, gets the value-action row it never
-        // got to write, carrying the legs the gate sized.
+        // Only a status that owes an authenticated outcome row reaches the writer.
+        // Endpoint reports and accounting expiry owe none.
         if let Some(record) = settled.as_ref() {
             crate::tools::submission_record::write_settled_row(
                 &self.profile,
@@ -256,7 +256,6 @@ impl WalletServer {
                 &record.tx_hash,
                 &record.status,
                 record.release_code,
-                record.ledger.or(chain.ledger),
                 reconciliation_decision,
             );
         }
@@ -314,12 +313,14 @@ impl WalletServer {
     }
 }
 
-/// Renders the wallet's settled record of a submission.
+/// Renders the wallet's record of a submission.
 ///
-/// `release_code` names the chain evidence on which reconciliation released
-/// the reservation of a submission whose outcome is unknown; it is `null`
-/// for a submission the chain answered for and for one whose retention
-/// window closed. It is how an agent tells those cases apart.
+/// `release_code` names the accounting disposition of a submission whose
+/// outcome is unknown, such as `submission.accounting_expired` once its
+/// accounting horizon passed; it is an observation, not a chain outcome. It
+/// is `null` for a submission with a reported answer and for one whose
+/// retention window closed. A reported failure or missing transaction does
+/// not release possible spending.
 fn receipt_view(receipt: &SubmissionReceipt, reservation_open: bool) -> serde_json::Value {
     json!({
         "reservation_open": reservation_open,

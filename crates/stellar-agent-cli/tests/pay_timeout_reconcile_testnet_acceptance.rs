@@ -521,16 +521,16 @@ async fn pay_timeout_is_recorded_and_tx_status_reconciles_it() {
     );
     assert_eq!(
         settled["data"]["record"]["reservation_open"].as_bool(),
-        Some(false),
-        "a confirmed reservation becomes recorded spend: {settled}"
+        Some(true),
+        "a reported success retains possible spending: {settled}"
     );
 
-    // The submitted row the submission never got to write is now in the log.
+    // A success report supplies no authenticated outcome row.
     let rows = audit_rows(home.path(), &profile_name);
     assert_eq!(
         rows_for(&rows, "value_action_submitted", &envelope_hash).len(),
-        1,
-        "reconciliation writes the submitted row: {rows:?}"
+        0,
+        "reconciliation writes no authenticated outcome row: {rows:?}"
     );
 
     // The audit log's own chain still verifies after both rows.

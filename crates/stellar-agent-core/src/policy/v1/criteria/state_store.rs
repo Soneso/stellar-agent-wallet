@@ -352,6 +352,14 @@ struct StateEntry {
     timestamp_ms: u64,
     amount: i128,
     pending: bool,
+    exposure: Option<Exposure>,
+}
+
+#[derive(Debug, Clone)]
+struct Exposure {
+    reservation_id: String,
+    accounting_at_ms: Option<u64>,
+    accounting_until_ms: Option<u64>,
 }
 
 /// Error variants for [`PolicyStateStore`] operations.
@@ -442,33 +450,85 @@ impl PolicyStateStore {
                 detail: e.to_string(),
             })?;
 
-        let deque = guard.entry(key.clone()).or_default();
-
-        let window_ms = key.window_secs.saturating_mul(1_000);
-        let cutoff = now_ms.saturating_sub(window_ms);
         let future_limit = now_ms.saturating_add(CLOCK_SKEW_TOLERANCE_MS);
-
-        // Check for clock-skew violations before eviction so we surface the
-        // error before silently discarding future entries.
-        for entry in deque.iter() {
-            let ts = entry.timestamp_ms;
-            if entry.pending && ts > future_limit {
-                return Err(StateStoreError::ClockSkewExceeded {
-                    entry_ts_ms: ts,
-                    now_ms,
-                });
-            }
-        }
-
-        // Pending entries hold headroom until settlement. Confirmed entries
-        // age from ledger close time, which need not follow insertion order.
-        deque.retain(|entry| entry.pending || entry.timestamp_ms >= cutoff);
-
+        let matching = |stored: &StateKey| {
+            stored.profile_name == key.profile_name
+                && stored.scope_specificity == key.scope_specificity
+                && stored.bucket == key.bucket
+        };
+        let exact_ids: std::collections::HashSet<String> = guard
+            .get(key)
+            .into_iter()
+            .flatten()
+            .filter_map(|entry| {
+                entry
+                    .exposure
+                    .as_ref()
+                    .map(|exposure| exposure.reservation_id.clone())
+            })
+            .collect();
+        let mut fallback: HashMap<(&str, u64), (i128, u32)> = HashMap::new();
         let mut sum: i128 = 0;
         let mut count: u32 = 0;
-        for entry in deque.iter() {
-            sum = sum.saturating_add(entry.amount);
-            count = count.saturating_add(1);
+        for (stored_key, deque) in guard.iter() {
+            if !matching(stored_key) {
+                continue;
+            }
+            for entry in deque {
+                if entry.pending && entry.timestamp_ms > future_limit {
+                    return Err(StateStoreError::ClockSkewExceeded {
+                        entry_ts_ms: entry.timestamp_ms,
+                        now_ms,
+                    });
+                }
+                let live = if let Some(exposure) = &entry.exposure {
+                    let until = exposure.accounting_at_ms.map(|at| {
+                        at.saturating_add(key.window_secs.saturating_mul(1000))
+                            .max(exposure.accounting_until_ms.unwrap_or(0))
+                    });
+                    until.is_none_or(|until| now_ms <= until)
+                } else {
+                    stored_key == key
+                        && (entry.pending
+                            || entry.timestamp_ms
+                                >= now_ms.saturating_sub(key.window_secs.saturating_mul(1000)))
+                };
+                if !live {
+                    continue;
+                }
+                if stored_key != key {
+                    if let Some(exposure) = &entry.exposure
+                        && !exact_ids.contains(&exposure.reservation_id)
+                    {
+                        let total = fallback
+                            .entry((&exposure.reservation_id, stored_key.window_secs))
+                            .or_default();
+                        total.0 = total.0.saturating_add(entry.amount);
+                        total.1 = total.1.saturating_add(1);
+                    }
+                } else {
+                    sum = sum.saturating_add(entry.amount);
+                    count = count.saturating_add(1);
+                }
+            }
+        }
+        let mut retained: HashMap<&str, (i128, u32)> = HashMap::new();
+        for ((id, _), total) in fallback {
+            let maximum = retained.entry(id).or_default();
+            maximum.0 = maximum.0.max(total.0);
+            maximum.1 = maximum.1.max(total.1);
+        }
+        for total in retained.values() {
+            sum = sum.saturating_add(total.0);
+            count = count.saturating_add(total.1);
+        }
+        for (stored_key, deque) in guard.iter_mut() {
+            deque.retain(|entry| {
+                entry.exposure.is_some()
+                    || entry.pending
+                    || entry.timestamp_ms
+                        >= now_ms.saturating_sub(stored_key.window_secs.saturating_mul(1000))
+            });
         }
 
         Ok((sum, count))
@@ -518,6 +578,41 @@ impl PolicyStateStore {
         self.append_entry(key, timestamp_ms, amount_or_count, true)
     }
 
+    /// Appends conservative exposure with a separate accounting horizon.
+    ///
+    /// Missing accounting time means indefinite exposure. A changed window cannot
+    /// shorten the admitted horizon; future execution bounds are not clock skew.
+    ///
+    /// # Errors
+    /// Returns [`StateStoreError::LockPoisoned`] if the mutex is poisoned.
+    pub fn append_exposure(
+        &self,
+        key: &StateKey,
+        timestamp_ms: u64,
+        amount: i128,
+        reservation_id: &str,
+        accounting_at_ms: Option<u64>,
+        accounting_until_ms: Option<u64>,
+    ) -> Result<(), StateStoreError> {
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|error| StateStoreError::LockPoisoned {
+                detail: error.to_string(),
+            })?;
+        guard.entry(key.clone()).or_default().push_back(StateEntry {
+            timestamp_ms,
+            amount,
+            pending: true,
+            exposure: Some(Exposure {
+                reservation_id: reservation_id.to_owned(),
+                accounting_at_ms,
+                accounting_until_ms,
+            }),
+        });
+        Ok(())
+    }
+
     fn append_entry(
         &self,
         key: &StateKey,
@@ -536,6 +631,7 @@ impl PolicyStateStore {
             timestamp_ms,
             amount: amount_or_count,
             pending,
+            exposure: None,
         });
 
         Ok(())

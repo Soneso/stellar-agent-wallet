@@ -4053,20 +4053,7 @@ async fn transaction_status_confirms_a_timed_out_submission() {
         1,
         "the pending row stands: {rows:?}"
     );
-    let submitted = rows_of_kind(&rows, "value_action_submitted");
-    assert_eq!(
-        submitted.len(),
-        1,
-        "reconciliation writes the row the submission never got to write: {rows:?}"
-    );
-    assert_eq!(
-        submitted[0]["ledger"], 1005,
-        "the settled row names the ledger the chain confirmed it in: {rows:?}"
-    );
-    assert_eq!(
-        submitted[0]["envelope_hash"], envelope_hash,
-        "the settled row names the same submission as the pending row: {rows:?}"
-    );
+    assert!(rows_of_kind(&rows, "value_action_submitted").is_empty());
     assert_eq!(
         sends.load(std::sync::atomic::Ordering::SeqCst),
         1,
@@ -4075,11 +4062,11 @@ async fn transaction_status_confirms_a_timed_out_submission() {
     drop(mock_server);
 }
 
-/// Reconciling a timed-out submission the chain never took releases its hold
-/// on the spending window, and the next payment proceeds.
+/// Reconciling an absent timed-out submission retains its spending hold and
+/// the next payment remains subject to the cap.
 #[tokio::test]
 #[serial]
-async fn transaction_status_releases_a_submission_the_chain_never_took() {
+async fn transaction_status_retains_a_submission_the_endpoint_cannot_find() {
     let _data_root = crate::common::isolated_data_root();
     keyring_mock::install().expect("mock keyring store init");
     install_test_nonce_key(235);
@@ -4156,55 +4143,47 @@ async fn transaction_status_releases_a_submission_the_chain_never_took() {
     );
     assert_eq!(status_json["data"]["chain_status"], "NOT_FOUND");
     assert_eq!(
-        status_json["data"]["record"]["status"], "ambiguous",
+        status_json["data"]["record"]["status"], "pending",
         "the release rests on the endpoint's answers, so the outcome is recorded as unknown: \
          {status_json}"
     );
     assert_eq!(
-        status_json["data"]["record"]["reservation_open"], false,
-        "the reservation is released: {status_json}"
+        status_json["data"]["record"]["reservation_open"], true,
+        "the reservation stays charged: {status_json}"
     );
+    assert!(status_json["data"]["record"]["release_code"].is_null());
     assert_eq!(
-        status_json["data"]["record"]["release_code"], "submission.sequence_consumed",
-        "the record names the evidence the reservation was released on: {status_json}"
-    );
-    assert!(
-        status_json["data"]["reservation"].is_null(),
-        "no hold remains: {status_json}"
+        status_json["data"]["reservation"]["envelope_hash"],
+        envelope_hash
     );
 
     let receipts = stellar_agent_core::profile::receipt::ReceiptStore::open(&profile_name)
         .expect("receipt store");
     assert_eq!(
         receipts.get(&envelope_hash).unwrap().unwrap().status,
-        stellar_agent_core::profile::receipt::ReceiptStatus::Ambiguous
+        stellar_agent_core::profile::receipt::ReceiptStatus::Pending
     );
     let rows = audit_rows(&audit_profile);
     let failed: Vec<_> = rows_of_kind(&rows, "value_action_failed")
         .into_iter()
         .filter(|row| row["envelope_hash"] == envelope_hash.as_str())
         .collect();
-    assert_eq!(
-        failed.len(),
-        1,
-        "the release writes its settled row: {rows:?}"
-    );
-    assert_eq!(failed[0]["code"], "submission.sequence_consumed");
+    assert!(failed.is_empty(), "{rows:?}");
     assert_eq!(
         sends.load(std::sync::atomic::Ordering::SeqCst),
         1,
         "reconciliation sent nothing after the commit's own send"
     );
 
-    // With the reservation released, the cap admits the next payment again.
+    // The retained reservation keeps the next payment over the cap.
     let sim = server
         .call_stellar_pay(pay_args(&source_g, "600000000"))
         .await
         .expect("the next simulate must not error");
-    assert_ne!(
+    assert_eq!(
         sim.is_error,
         Some(true),
-        "a released reservation stops holding the cap: {}",
+        "the reservation keeps holding the cap: {}",
         call_result_text(&sim)
     );
 }
@@ -4325,8 +4304,8 @@ async fn a_resend_after_a_lost_receipt_is_refused_and_the_original_settles_later
     let rows = audit_rows(&audit_profile);
     assert_eq!(
         named(&rows, "value_action_submitted"),
-        1,
-        "the original's settled row is the submitted one: {rows:?}"
+        0,
+        "a reported success supplies no authenticated outcome row: {rows:?}"
     );
     assert_eq!(named(&rows, "value_action_failed"), 0, "{rows:?}");
     drop(mock_server);
@@ -4393,6 +4372,7 @@ impl CompetingReservationResponder {
                     max_time: 0,
                     pending_since_ms: now,
                     submission_ledger: 1_000,
+                    submission_anchor: None,
                     operator_required: false,
                 },
             )
@@ -5360,6 +5340,10 @@ async fn witness_payment_case(
     );
     let rows = audit_rows(&profile);
     for kind in ["value_action_pending", "value_action_submitted"] {
+        if kind == "value_action_submitted" {
+            assert!(rows.iter().all(|row| row["kind"] != kind));
+            continue;
+        }
         let rows = rows_of_kind(&rows, kind);
         assert_eq!(rows.len(), 1, "{kind}: {rows:?}");
         if expected == "passed" {
@@ -5381,10 +5365,7 @@ async fn witness_payment_case(
             crate::common::received_methods(&oracle).await,
             ["getNetwork", "getLedgerEntries"]
         );
-        assert_eq!(
-            rows_of_kind(&rows, "value_action_pending")[0]["witness"],
-            rows_of_kind(&rows, "value_action_submitted")[0]["witness"]
-        );
+        assert!(rows_of_kind(&rows, "value_action_submitted").is_empty());
     } else {
         assert!(crate::common::received_methods(&oracle).await.is_empty());
         assert_eq!(

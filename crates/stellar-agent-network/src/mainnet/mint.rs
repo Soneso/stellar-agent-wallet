@@ -39,7 +39,7 @@ pub(crate) fn header(
     witness: Option<&crate::cross_check::CrossCheckWitness>,
     audit: super::audit_readiness::AuditReadiness,
 ) -> Header {
-    assemble(
+    let mut header = assemble(
         context,
         store,
         request,
@@ -56,7 +56,18 @@ pub(crate) fn header(
         approval,
         witness.and_then(|w| w.subject()),
         audit,
-    )
+    );
+    if let crate::policy_state::DomainBinding::Transaction { tx_hash, .. } = &request.binding {
+        header.submission_anchor = witness.and_then(|witness| {
+            crate::policy_state::SubmissionAnchor::from_witness(
+                crate::policy_state::ChainScope::for_chain(context.chain()),
+                witness,
+                *tx_hash,
+                header.issued_at_ms,
+            )
+        });
+    }
+    header
 }
 
 /// The Message arm: the authorization of a minted zero-value message record.
@@ -145,6 +156,7 @@ fn assemble(
         },
         reservation: minted.reservation,
         witness_subject,
+        submission_anchor: None,
         audit,
         issued_at_ms: minted.issued_at_ms,
         expires_at_ms: minted.expires_at_ms,

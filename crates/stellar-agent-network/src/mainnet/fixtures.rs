@@ -204,6 +204,7 @@ pub(crate) fn header(
         },
         reservation: None,
         witness_subject: None,
+        submission_anchor: None,
         audit: AuditReadiness::for_crate_tests(profile, facts, now, Arc::clone(writer)),
         issued_at_ms: now,
         expires_at_ms: now + TTL_MS,
@@ -317,6 +318,7 @@ pub(crate) fn intent(envelope: &SignedTestEnvelope) -> SubmissionIntent {
         sequence: envelope.sequence(),
         max_time: crate::idempotent_submit::extract_max_time(&decoded),
         submission_ledger: 100,
+        submission_anchor: None,
     }
 }
 

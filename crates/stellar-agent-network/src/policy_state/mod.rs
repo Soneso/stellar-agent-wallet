@@ -77,24 +77,22 @@
 //!
 //! # Reservation settlement
 //!
-//! Pending records count regardless of age. Confirmation requires the applying
-//! transaction's `created_at` ledger close time; missing time leaves the hold
-//! pending. Confirmed records age from that close time.
+//! Exposure counts through the signed execution deadline and each admitted
+//! window duration. A reported success uses the later of first local observation
+//! and the deadline. Reported chain time remains a report. Missing deadlines
+//! retain capacity indefinitely; repeat reports preserve the first observation.
 //!
-//! A NOT_FOUND releases only within retention after observing a consumed
-//! sequence or a ledger close time strictly past a nonzero maxTime, followed
-//! by a fresh NOT_FOUND. That release records its evidence on the receipt as
-//! `release_code` and is reported as settled, so the caller writes the
-//! settled audit row under it. A fresh SUCCESS or FAILED settles that chain
-//! outcome. A release drops only the pending records of a reservation; a
-//! confirmed record under the same id keeps counting. A reservation id is
-//! the envelope hash of one signed envelope, so a second reservation for an
-//! id the file already holds is refused as
-//! [`WindowStoreError::DuplicateReservation`].
-//! The pass shares one bounded getLedgers observation; unavailable or invalid
-//! chain time closes the time arm. The host clock only controls minimum age.
-//! Receiptless holds beyond retention carry an authenticated operator marker,
-//! retain their debit, and are excluded from automatic selection.
+//! Endpoint failure, absence, consumed sequence, and time claims release no
+//! capacity and create no definitive failed row. A checked accounting decision
+//! binds chain, reservation, generation, and evidence. Conservative expiry
+//! records `submission.accounting_expired` with the chain outcome unknown.
+//! An explicit operator clear records its acknowledgement before releasing
+//! untimed exposure. Bounded clears preserve the accounting horizon.
+//!
+//! A reservation id names one signed envelope. Duplicate admission refuses
+//! under the store lock. Independent witness anchors bind the subject, chain,
+//! oracle ledger, authority, digest, and local acquisition time. Legacy bare
+//! ledgers remain unanchored observations.
 //!
 //! # Wire format
 //!
@@ -194,9 +192,11 @@ pub use ledger::{
     WindowReservation,
 };
 pub use store::{
-    ChainScope, MintOutcome, POLICY_STATE_KEY_FIELD, PersistedWindowStore, RECONCILE_BUDGET,
-    RECONCILE_MIN_AGE_MS, ReconcileFailure, ReconcileFailureKind, ReconcileReport, ResetError,
-    ResetOutcome, ResetRecord, SettledSubmission, StateDefect, SubmissionHold,
+    AccountingDecision, ChainScope, MintOutcome, POLICY_STATE_KEY_FIELD, PersistedWindowStore,
+    RECONCILE_BUDGET, RECONCILE_MIN_AGE_MS, REPORTED_SUCCESS_CODE, RETENTION_EXPIRED_CODE,
+    ReconcileFailure, ReconcileFailureKind, ReconcileReport, ReportedAnswer, ResetError,
+    ResetOutcome, ResetRecord, SettledSubmission, StateDefect, SubmissionAnchor, SubmissionHold,
+    UnrecordedAnswer,
 };
 
 /// Records a confirmed call's contribution into `engine`'s window state and

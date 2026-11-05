@@ -453,6 +453,7 @@ async fn submit_unauthorized(
         sequence,
         max_time: crate::idempotent_submit::extract_max_time(&envelope),
         submission_ledger,
+        submission_anchor: None,
     };
 
     // The record is written before the send, so a submission whose outcome
@@ -656,6 +657,10 @@ pub(crate) async fn authorized_submission(
     authorization.check_tx_hash(&local_hash_bytes)?;
 
     let (source, sequence) = replay_identity(&envelope)?;
+    #[cfg(feature = "mainnet-write")]
+    let submission_anchor = authorization.0.header.submission_anchor.clone();
+    #[cfg(not(feature = "mainnet-write"))]
+    let submission_anchor = None;
     let intent = SubmissionIntent {
         chain_scope: crate::policy_state::ChainScope::for_chain(
             stellar_agent_core::profile::caip2::Caip2::Mainnet,
@@ -666,6 +671,7 @@ pub(crate) async fn authorized_submission(
         sequence,
         max_time: crate::idempotent_submit::extract_max_time(&envelope),
         submission_ledger,
+        submission_anchor,
     };
     let authorization_id = authorization.id();
 
@@ -2363,6 +2369,7 @@ mod tests {
             sequence: 1,
             max_time: 0,
             submission_ledger: 1,
+            submission_anchor: None,
         }
     }
 
@@ -3002,9 +3009,14 @@ mod tests {
             );
             assert_eq!(recorder.outcomes(), ["success"]);
             assert!(!case.fx.is_open(id), "the record is used");
+            assert!(
+                case.reservation_is_open(),
+                "a reported success keeps the reservation as possible spending"
+            );
             assert_eq!(
                 case.fx.audit_kinds(),
-                ["value_action_pending", "value_action_submitted"]
+                ["value_action_pending"],
+                "a reported success writes no submitted row"
             );
             case.server.verify().await;
         }
@@ -3226,8 +3238,9 @@ mod tests {
         }
 
         /// A proof that differs from the submission in one field is refused
-        /// before the send, after the consumption, and the record is settled
-        /// as rejected.
+        /// before the send, after the consumption. The outcome is recorded as
+        /// rejected and the converted reservation stands: the signed bytes
+        /// exist outside the wallet and may still apply.
         async fn assert_tampered_proof_refused(
             label: &str,
             tamper: Tamper,
@@ -3247,12 +3260,8 @@ mod tests {
             assert_eq!(recorder.outcomes(), ["rejected"]);
             case.fx.assert_used_without_holds(id);
             assert!(
-                case.fx
-                    .window
-                    .pending_reservations(&case.fx.profile)
-                    .unwrap()
-                    .is_empty(),
-                "rejection settles the converted reservations"
+                case.reservation_is_open(),
+                "a rejection keeps the converted reservation"
             );
             case.server.verify().await;
         }
@@ -3322,11 +3331,12 @@ mod tests {
             case.server.verify().await;
         }
 
-        /// The oracle's own `FAILED` settles the submission as failed on
-        /// chain, under the code of the oracle's result.
+        /// The oracle's own `FAILED` is returned under the code of the
+        /// oracle's result, and the submission stands: a reported failure does
+        /// not release possible spending and writes no failed row.
         #[tokio::test]
         #[serial]
-        async fn a_failed_confirmation_the_oracle_confirms_releases_with_the_oracle_code() {
+        async fn a_failed_confirmation_the_oracle_confirms_returns_the_oracle_code_and_stands() {
             let case = Case::new("submit-failed-oracle-failed").await;
             mount_answers(
                 &case.server,
@@ -3354,19 +3364,14 @@ mod tests {
 
             assert_eq!(error.code(), "ledger.op_failed", "the oracle's code");
             assert_eq!(recorder.outcomes(), ["on_chain_failed"]);
-            assert!(!case.reservation_is_open(), "the reservation is released");
-            assert_eq!(
-                case.receipt_status(),
-                ReceiptStatus::Failed {
-                    code: "ledger.op_failed".to_owned()
-                }
-            );
+            assert!(case.reservation_is_open(), "the reservation stands");
+            assert_eq!(case.receipt_status(), ReceiptStatus::Pending);
             assert_eq!(
                 case.fx.audit_kinds(),
-                ["value_action_pending", "value_action_failed"]
+                ["value_action_pending"],
+                "a reported failure writes no failed row"
             );
             let log = std::fs::read_to_string(&case.fx.profile.audit_log_path).unwrap();
-            assert!(log.contains("\"ledger.op_failed\""), "{log}");
             assert!(!log.contains("submission.sequence_number_stale"), "{log}");
             case.server.verify().await;
         }

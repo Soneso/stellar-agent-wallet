@@ -1495,7 +1495,6 @@ impl WalletServer {
                 &settled.tx_hash,
                 &settled.status,
                 settled.release_code,
-                settled.ledger,
                 stellar_agent_core::audit_log::PolicyDecision::Allow,
             );
         }
@@ -7124,9 +7123,9 @@ pub(crate) mod tests {
             );
         }
 
-        /// The confirmed window rows each classic accept leaves: the count of
+        /// The window rows one classic commit of `tool` reserves: the count of
         /// rows and the sum of their amounts.
-        fn settled_rows(tool: Tool) -> (usize, u64) {
+        fn reserved_rows(tool: Tool) -> (usize, u64) {
             match tool {
                 Tool::Pay => (2, 11),
                 Tool::CreateAccount => (2, 10_000_001),
@@ -7161,10 +7160,10 @@ pub(crate) mod tests {
                 "{tool:?}"
             );
             let rows = window_records(&run.f);
-            let (count, sum) = settled_rows(tool);
+            let (count, sum) = reserved_rows(tool);
             assert_eq!(rows.len(), count, "{tool:?}: {rows:?}");
             assert!(
-                rows.iter().all(|row| row["status"] == "confirmed"),
+                rows.iter().all(|row| row["status"] == "exposure"),
                 "{tool:?}: {rows:?}"
             );
             assert_eq!(
@@ -8226,7 +8225,7 @@ pub(crate) mod tests {
                     "{tool:?}"
                 );
                 let rows = window_records(&run.f);
-                let (count, sum) = settled_rows(tool);
+                let (count, sum) = reserved_rows(tool);
                 assert_eq!(rows.len(), count, "{tool:?}: {rows:?}");
                 assert!(
                     rows.iter()
@@ -8297,13 +8296,12 @@ pub(crate) mod tests {
             }
         }
 
-        /// A `FAILED` confirmation settles a mainnet submission on the
-        /// oracle's own `FAILED`: the commit reports the failure and the
-        /// converted rows are released. Without the oracle's answer the
-        /// primary's alone would leave them pending behind the timeout shape.
+        /// A mainnet `FAILED` confirmation the oracle confirms with its own
+        /// `FAILED` is reported as the failure, and the converted rows stay
+        /// pending: a reported failure does not release possible spending.
         #[tokio::test]
         #[serial_test::serial(keyring)]
-        async fn mainnet_classic_failure_the_oracle_confirms_releases_the_converted_rows() {
+        async fn mainnet_classic_failure_the_oracle_confirms_keeps_the_converted_rows() {
             for tool in Tool::ALL {
                 let run = ClassicRun::new(tool).await;
                 run.control.transaction_failed.store(true, Ordering::SeqCst);
@@ -8323,9 +8321,10 @@ pub(crate) mod tests {
                     "{tool:?}: the oracle was asked"
                 );
                 let rows = window_records(&run.f);
+                assert!(!rows.is_empty(), "{tool:?}: the rows stand");
                 assert!(
-                    rows.is_empty(),
-                    "{tool:?}: the converted rows are released: {rows:?}"
+                    rows.iter().all(|row| row["status"] == "pending"),
+                    "{tool:?}: the converted rows stay pending: {rows:?}"
                 );
             }
         }

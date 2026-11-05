@@ -514,14 +514,17 @@ async fn exercise(tool: Tool, initially_confirmed: bool, fault: Option<SignerFau
             receipts.get(envelope_hash).unwrap().unwrap().status,
             ReceiptStatus::Success
         );
-        assert!(window.pending_reservations(&profile).unwrap().is_empty());
+        assert_eq!(
+            window.pending_reservations(&profile).unwrap().is_empty(),
+            matches!(tool, Tool::Withdraw)
+        );
         assert_eq!(
             crate::common::rows_of_kind(
                 &crate::common::audit_rows(&profile),
                 "value_action_submitted"
             )
             .len(),
-            1
+            0
         );
     }
     for _ in 0..2 {
@@ -539,12 +542,18 @@ async fn exercise(tool: Tool, initially_confirmed: bool, fault: Option<SignerFau
             *envelope_hash
         );
         assert_eq!(status_json["data"]["record"]["status"], "success");
-        assert_eq!(status_json["data"]["record"]["reservation_open"], false);
+        assert_eq!(
+            status_json["data"]["record"]["reservation_open"],
+            !matches!(tool, Tool::Withdraw)
+        );
         assert_eq!(
             receipts.get(envelope_hash).unwrap().unwrap().status,
             ReceiptStatus::Success
         );
-        assert!(window.pending_reservations(&profile).unwrap().is_empty());
+        assert_eq!(
+            window.pending_reservations(&profile).unwrap().is_empty(),
+            matches!(tool, Tool::Withdraw)
+        );
         assert_window_total(&window, &profile, &profile_name, tool);
         let rows = crate::common::audit_rows(&profile);
         assert_eq!(
@@ -553,7 +562,7 @@ async fn exercise(tool: Tool, initially_confirmed: bool, fault: Option<SignerFau
         );
         assert_eq!(
             crate::common::rows_of_kind(&rows, "value_action_submitted").len(),
-            1,
+            0,
             "settlement is idempotent"
         );
     }

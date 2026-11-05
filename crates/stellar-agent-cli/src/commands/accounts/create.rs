@@ -2951,7 +2951,7 @@ mod tests {
     mod witness {
         use super::*;
         use crate::test_rpc::{
-            ClassicRpc, EnvSigner, account_key, account_xdr, assert_rows_carry_witness,
+            ClassicRpc, EnvSigner, account_key, account_xdr, assert_pending_row_carries_witness,
             last_rendered, methods, sent, signers_resolved_by, witness_profile, zero_config,
         };
 
@@ -3146,7 +3146,7 @@ mod tests {
                 };
                 assert_eq!(value["data"]["cross_check"]["status"], status, "{value}");
                 if status == "passed" {
-                    assert_rows_carry_witness(&profile, &oracle.uri());
+                    assert_pending_row_carries_witness(&profile, &oracle.uri());
                 } else {
                     assert!(methods(&oracle).await.is_empty());
                 }
