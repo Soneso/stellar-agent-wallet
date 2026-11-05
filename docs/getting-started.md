@@ -23,10 +23,10 @@ reads secret keys from a named environment variable, not from the command line.
 
 - `stellar:testnet` is the default network.
   `accounts create --fund-with-friendbot` funds testnet accounts.
-  `stellar-agent friendbot --network futurenet --friendbot-url https://friendbot-futurenet.stellar.org`
-  funds a futurenet account. The explicit URL is needed because the default
-  Friendbot URL is the testnet one for every `--network`. Friendbot funding on
-  mainnet is refused.
+  `stellar-agent friendbot --network futurenet --friendbot-url
+  https://friendbot-futurenet.stellar.org` funds a futurenet account.
+  The explicit URL is needed because the default Friendbot URL is the
+  testnet one for every `--network`. Friendbot funding on mainnet is refused.
 - `stellar:mainnet` is accepted for read-only commands. Select it with a
   mainnet profile (`--profile <NAME>`), or with `--rpc-url` for `balances`
   (which has no `--network` flag). `--network` asserts the profile's chain
