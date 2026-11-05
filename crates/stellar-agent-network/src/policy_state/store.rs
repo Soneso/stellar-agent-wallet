@@ -5878,9 +5878,7 @@ mod tests {
             deliver_accounting_expiries(&mut writer, &reopened, &fx.profile, "intent", None)
                 .unwrap();
             if expected == 0 {
-                reopened
-                    .reset(&fx.profile, now, |_| Ok::<_, ()>(()))
-                    .unwrap();
+                reset_unsigned(&reopened, &fx.profile, now, |_| Ok::<_, ()>(())).unwrap();
             } else {
                 let before = fs::read(reopened.path()).unwrap();
                 assert_eq!(
