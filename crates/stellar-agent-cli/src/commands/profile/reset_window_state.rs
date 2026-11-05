@@ -29,6 +29,14 @@
 //! The row records intent and the generation pair. Completion requires loading
 //! the empty store at the recorded generation after the mutation.
 //!
+//! # Owed accounting events
+//!
+//! Before the reset, the command delivers every owed
+//! `submission_accounting_expired` event under the writer it holds. A reset
+//! refuses with `submission.record_unavailable` while any such event stays
+//! unacknowledged, and the empty store keeps each acknowledged record whose
+//! receipt projection is incomplete.
+//!
 //! # Newer formats
 //!
 //! On every chain, a store whose authenticated format version is newer than
@@ -89,16 +97,19 @@ use stellar_agent_core::audit_log::schema::{
 };
 use stellar_agent_core::audit_log::{AuditEntry, AuditWriter, WriterError, audit_writer_refusal};
 use stellar_agent_core::envelope::Envelope;
-use stellar_agent_core::error::{InternalError, ValidationError, WalletError, WalletStateError};
+use stellar_agent_core::error::{
+    InternalError, SubmissionError, ValidationError, WalletError, WalletStateError,
+};
 use stellar_agent_core::policy::PolicyError;
 use stellar_agent_core::policy::pin::PinState;
 use stellar_agent_core::policy::v1::signature::{WindowResetStatement, sign, window_reset_digest};
 use stellar_agent_core::profile::owner_key::encode_owner_public_key;
+use stellar_agent_core::profile::receipt::ReceiptStore;
 use stellar_agent_core::profile::schema::Profile;
 use stellar_agent_core::profile::{ResolvedProfileName, loader};
 use stellar_agent_network::keyring::init_platform_keyring_store;
 use stellar_agent_network::policy_state::{
-    PersistedWindowStore, ResetError, ResetRecord, WindowStoreError,
+    PersistedWindowStore, ResetError, ResetRecord, WindowStoreError, deliver_accounting_expiries,
 };
 use uuid::Uuid;
 
@@ -288,6 +299,21 @@ fn reset_with_owner(
         }
     };
     let store = PersistedWindowStore::for_profile(name);
+    // Owed accounting events are delivered under the held writer first; the
+    // reset refuses while any stays unacknowledged. A store that cannot be
+    // read is left to the reset, which reports its own refusal.
+    if store
+        .owed_accounting_expiries(profile)
+        .is_ok_and(|owed| !owed.unacknowledged.is_empty())
+    {
+        let receipts = ReceiptStore::open(name).ok();
+        if let Err(error) =
+            deliver_accounting_expiries(&mut writer, &store, profile, name, receipts.as_ref())
+        {
+            render::render_json(&Envelope::err(&error));
+            return 1;
+        }
+    }
     let request_id = Uuid::new_v4().to_string();
     let result = store.reset(profile, now_ms, |record| {
         let reason = bound_window_reset_reason(&args.reason);
@@ -457,6 +483,11 @@ fn store_refusal(name: &str, error: WindowStoreError) -> WalletError {
             WalletError::Validation(ValidationError::ResetWindowStateOpenAuthorizations {
                 profile: name.to_owned(),
                 open,
+            })
+        }
+        WindowStoreError::AccountingAuditOwed => {
+            WalletError::Submission(SubmissionError::RecordUnavailable {
+                detail: WindowStoreError::AccountingAuditOwed.to_string(),
             })
         }
         error => WalletError::Internal(InternalError::UnexpectedState {

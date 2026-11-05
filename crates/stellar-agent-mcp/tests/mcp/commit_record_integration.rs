@@ -317,8 +317,8 @@ async fn a_timed_out_trustline_records_the_submission_and_reports_the_hash() {
 // stellar_create_account_commit
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// A timed-out account creation leaves the record, and the settled row appears
-/// once `stellar_transaction_status` reconciles it.
+/// A timed-out account creation leaves the record, and
+/// `stellar_transaction_status` addresses it by the reported hash.
 #[tokio::test]
 #[serial]
 async fn a_timed_out_create_account_records_the_submission_and_reports_the_hash() {

@@ -17,8 +17,8 @@
 //! value-moving signing verb calls BEFORE any signing key is touched or
 //! transaction submitted: it proves the audit writer is acquirable, refusing
 //! with `audit.chain_key_unavailable` if not. The verb then threads the
-//! returned writer to the post-confirm row, which
-//! [`emit_value_audit_row_on_guard`] appends on a guard of that writer.
+//! returned writer to the post-confirm row, which it appends on a guard of
+//! that writer.
 //!
 //! The reset ceremony acquires the keyed writer before locking the window
 //! store. Its recorder uses the strict append mapping through that writer.
@@ -53,9 +53,9 @@ use crate::common::profile_access::ProfileOrigin;
 ///
 /// Callers invoke this BEFORE any signing key is touched and BEFORE any
 /// transaction is submitted (see the module docs). A verb with a post-confirm
-/// row reuses the returned writer for it ([`emit_value_audit_row_on_guard`])
-/// rather than re-acquiring it. A verb whose row is written strictly before a
-/// transmission discards the handle, and the strict write acquires again.
+/// row reuses the returned writer for it rather than re-acquiring it. A verb
+/// whose row is written strictly before a transmission discards the handle,
+/// and the strict write acquires again.
 /// [`drain_consent_rows_before_signing`] discards it too: that acquisition
 /// exists for its drain.
 ///
@@ -348,29 +348,6 @@ fn try_keyed_value_audit_writer(
     }
 }
 
-/// Writes `entry` on `guard`, a held guard of an audit writer the caller
-/// already acquired (via [`require_value_audit_writer`]).
-///
-/// The caller holds the guard through any lookup the row depends on, so the
-/// row lands on the tip that lookup read.
-///
-/// Non-fatal: the write has nothing left to gate, since the transaction
-/// already committed, so a failure to append the row logs a `tracing::warn!`
-/// and returns without disturbing the caller.
-pub(crate) fn emit_value_audit_row_on_guard(
-    guard: &mut AuditWriter,
-    profile_name: &str,
-    entry: AuditEntry,
-) {
-    if let Err(e) = guard.write_entry(entry) {
-        tracing::warn!(
-            profile = %profile_name,
-            error = %e,
-            "value audit: write_entry failed; row NOT emitted"
-        );
-    }
-}
-
 /// Appends `entry` through `writer`, logging a poisoned writer mutex or a
 /// refused append at `error` with `event_kind`.
 ///
@@ -600,7 +577,7 @@ mod tests {
             "req-require-1",
             None,
         );
-        emit_value_audit_row_on_guard(&mut writer.lock().unwrap(), "require-seeded", entry);
+        writer.lock().unwrap().write_entry(entry).unwrap();
 
         let file = std::fs::File::open(&profile.audit_log_path).expect("audit.jsonl exists");
         let rows: Vec<serde_json::Value> = std::io::BufReader::new(file)
@@ -712,7 +689,7 @@ mod tests {
             "req-origin-synth-1",
             None,
         );
-        emit_value_audit_row_on_guard(&mut writer.lock().unwrap(), "origin-synth-seeded", entry);
+        writer.lock().unwrap().write_entry(entry).unwrap();
 
         let file = std::fs::File::open(&profile.audit_log_path).expect("audit.jsonl exists");
         let rows: Vec<serde_json::Value> = std::io::BufReader::new(file)

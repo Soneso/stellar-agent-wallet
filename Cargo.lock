@@ -4992,6 +4992,7 @@ dependencies = [
  "tracing-log",
  "tracing-subscriber",
  "url",
+ "uuid",
  "windows-native-keyring-store",
  "wiremock",
  "zeroize",

@@ -267,6 +267,67 @@ fn event_count(home: &Path, kind: &str) -> usize {
         .count()
 }
 
+/// The `value_action_failed` rows carrying `code`.
+fn failed_rows_with(home: &Path, code: &str) -> usize {
+    std::fs::read_to_string(profile(home).audit_log_path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .filter(|row| row["kind"] == "value_action_failed" && row["code"] == code)
+        .count()
+}
+
+/// Appends `entries` to the profile's log through a bound keyed writer, the
+/// way another surface of the wallet writes it.
+fn append_rows(home: &Path, entries: Vec<stellar_agent_core::audit_log::AuditEntry>) {
+    use stellar_agent_core::audit_log::{AuditWriter, BindingCheck};
+    seed(home);
+    let p = profile(home);
+    let access =
+        stellar_agent_network::keyring::keyed_audit_access(&p, NAME, BindingCheck::Enforce)
+            .unwrap();
+    let mut writer = AuditWriter::open(p.audit_log_path.clone(), Some(access)).unwrap();
+    for entry in entries {
+        writer.write_entry(entry).unwrap();
+    }
+}
+
+/// Rewrites the checkpoint's submission identity to an attempt whose
+/// envelope and transaction hash are `hash`.
+fn rename_checkpoint_submission(home: &Path, hash: &str) {
+    let path = profile_path(home);
+    let mut document: toml::Value =
+        toml::from_str(&std::fs::read_to_string(&path).unwrap()).expect("the profile must parse");
+    let submission = &mut document["pool_initialization"]["submission"];
+    submission["envelope_hash"] = toml::Value::String(hash.to_owned());
+    submission["tx_hash"] = toml::Value::String(hash.to_owned());
+    std::fs::write(&path, toml::to_string_pretty(&document).unwrap()).unwrap();
+}
+
+/// The `pool status` acknowledgement command, if it names one.
+fn clear_with(home: &Path) -> Option<String> {
+    let (code, status) = cli(home, &["pool", "status", "--profile", NAME]);
+    assert_eq!(code, 0, "{status}");
+    status["data"]["pending"]["clear_with"]
+        .as_str()
+        .map(str::to_owned)
+}
+
+fn clear_receipt(home: &Path, envelope_hash: &str) -> (i32, Value) {
+    cli(
+        home,
+        &[
+            "tx",
+            "receipt",
+            "clear",
+            envelope_hash,
+            "--acknowledge",
+            "--profile",
+            NAME,
+        ],
+    )
+}
+
 async fn fixture() -> (tempfile::TempDir, MockServer, Rpc) {
     fixture_with_fee(None).await
 }
@@ -493,8 +554,11 @@ async fn force_refuses_a_pending_initialization() {
     assert_eq!(rpc.0.lock().unwrap().send_count, 0);
 }
 
-/// A definitive failure with no channel accounts permits a fresh envelope for
-/// the same sponsored creations and preserves the failed attempt's receipt.
+/// An endpoint failure report is not the operator's statement that the
+/// attempt did not apply. Resume keeps the checkpoint, sends nothing more and
+/// writes no failure row, and `pool status` names the acknowledgement. After
+/// `tx receipt clear --acknowledge`, resume retries with the same keys while
+/// the original transaction still answers `FAILED`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 async fn failed_creation_retries_with_the_same_keys_and_a_distinct_receipt() {
@@ -502,7 +566,31 @@ async fn failed_creation_retries_with_the_same_keys_and_a_distinct_receipt() {
     rpc.0.lock().unwrap().next_status = "FAILED";
     assert_eq!(start(home.path()).0, 1);
     let checkpoint = profile(home.path()).pool_initialization.unwrap();
+    let submission = checkpoint.submission.clone().unwrap();
     let before = seed(home.path());
+    assert_eq!(event_count(home.path(), "value_action_failed"), 0);
+
+    let bytes = std::fs::read(profile_path(home.path())).unwrap();
+    let (code, held) = resume(home.path());
+    assert_eq!(code, 0, "{held}");
+    assert_eq!(held["data"]["pending"], true);
+    assert_eq!(rpc.0.lock().unwrap().send_count, 1);
+    assert_eq!(std::fs::read(profile_path(home.path())).unwrap(), bytes);
+    assert_eq!(
+        receipt_status(home.path(), &submission.envelope_hash),
+        ReceiptStatus::Ambiguous
+    );
+    assert_eq!(
+        event_count(home.path(), "value_action_failed"),
+        0,
+        "an endpoint failure report writes no failure row"
+    );
+    let command = clear_with(home.path()).expect("the held attempt names its acknowledgement");
+    assert!(command.contains(&submission.envelope_hash), "{command}");
+
+    let (code, cleared) = clear_receipt(home.path(), &submission.envelope_hash);
+    assert_eq!(code, 0, "{cleared}");
+    assert_eq!(event_count(home.path(), "submission_receipt_cleared"), 1);
     rpc.0.lock().unwrap().next_status = "SUCCESS";
     let (code, output) = resume(home.path());
     assert_eq!(code, 0, "{output}");
@@ -512,21 +600,99 @@ async fn failed_creation_retries_with_the_same_keys_and_a_distinct_receipt() {
         profile(home.path()).pool_config.unwrap().channels,
         checkpoint.channels
     );
-    let records = ReceiptStore::open_at(&home.path().join("receipts"), NAME)
-        .unwrap()
-        .all()
-        .unwrap();
+    let records = receipts(home.path()).all().unwrap();
     assert_eq!(records.len(), 2);
     assert!(
         records
             .iter()
-            .any(|record| matches!(record.status, ReceiptStatus::Failed { .. }))
+            .any(|record| record.status == ReceiptStatus::ClearedByOperator)
     );
     assert!(
         records
             .iter()
             .any(|record| record.status == ReceiptStatus::Success)
     );
+    assert_eq!(event_count(home.path(), "value_action_failed"), 0);
+}
+
+/// A Failed receipt without a hold can be cleared and retried with the same
+/// keys. `pool status` names the clear, and the clear marks the receipt.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn an_older_failed_receipt_is_cleared_and_retried() {
+    let (home, _server, rpc) = fixture().await;
+    rpc.0.lock().unwrap().next_status = "FAILED";
+    assert_eq!(start(home.path()).0, 1);
+    let checkpoint = profile(home.path()).pool_initialization.unwrap();
+    let submission = checkpoint.submission.clone().unwrap();
+    receipts(home.path())
+        .finalize(
+            &submission.envelope_hash,
+            ReceiptStatus::Failed {
+                code: "ledger.op_failed".to_owned(),
+            },
+            Some(1001),
+        )
+        .unwrap();
+
+    let (code, held) = resume(home.path());
+    assert_eq!(code, 0, "{held}");
+    assert_eq!(held["data"]["pending"], true);
+    assert_eq!(rpc.0.lock().unwrap().send_count, 1);
+    assert_eq!(
+        receipt_status(home.path(), &submission.envelope_hash),
+        ReceiptStatus::Failed {
+            code: "ledger.op_failed".to_owned()
+        },
+        "the recorded status stands"
+    );
+    let command = clear_with(home.path()).expect("a failed receipt names its acknowledgement");
+    assert!(command.contains(&submission.envelope_hash), "{command}");
+
+    let (code, cleared) = clear_receipt(home.path(), &submission.envelope_hash);
+    assert_eq!(code, 0, "{cleared}");
+    assert_eq!(cleared["data"]["cleared_from"], "failed");
+    assert_eq!(
+        receipt_status(home.path(), &submission.envelope_hash),
+        ReceiptStatus::ClearedByOperator
+    );
+    rpc.0.lock().unwrap().next_status = "SUCCESS";
+    let (code, output) = resume(home.path());
+    assert_eq!(code, 0, "{output}");
+    assert_eq!(rpc.0.lock().unwrap().send_count, 2);
+    assert_eq!(
+        profile(home.path()).pool_config.unwrap().channels,
+        checkpoint.channels
+    );
+    assert_eq!(event_count(home.path(), "value_action_failed"), 0);
+}
+
+/// A receipt edited to `cleared_by_operator` without a verified clear row
+/// authorizes no send: resume keeps the checkpoint.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn an_edited_cleared_receipt_authorizes_no_send() {
+    let (home, _server, rpc) = fixture().await;
+    rpc.0.lock().unwrap().next_status = "FAILED";
+    assert_eq!(start(home.path()).0, 1);
+    let submission = profile(home.path())
+        .pool_initialization
+        .unwrap()
+        .submission
+        .unwrap();
+    assert_eq!(resume(home.path()).0, 0);
+    receipts(home.path())
+        .clear_by_operator(&submission.envelope_hash)
+        .unwrap();
+    assert_eq!(event_count(home.path(), "submission_receipt_cleared"), 0);
+
+    let bytes = std::fs::read(profile_path(home.path())).unwrap();
+    rpc.0.lock().unwrap().next_status = "SUCCESS";
+    let (code, held) = resume(home.path());
+    assert_eq!(code, 0, "{held}");
+    assert_eq!(held["data"]["pending"], true);
+    assert_eq!(rpc.0.lock().unwrap().send_count, 1);
+    assert_eq!(std::fs::read(profile_path(home.path())).unwrap(), bytes);
 }
 
 /// A durable completion row closes the audit obligation exactly once, including
@@ -628,9 +794,47 @@ async fn timeout_status_is_pending_until_the_chain_reports_the_channels() {
     .expect("pool timeout recovery must remain bounded");
 }
 
+/// How an unsent attempt's durable record looks before resume.
+#[derive(Debug, Clone, Copy)]
+enum UnsentCase {
+    /// The receipt is intact.
+    Intact,
+    /// The receipt store is gone.
+    MissingReceipt,
+    /// The receipt is edited to a failure the chain never reported.
+    EditedReceipt,
+    /// The checkpoint names an envelope whose only open pending row belongs
+    /// to another attempt.
+    ForeignHash,
+    /// Another tool's pending row is the latest row for the envelope.
+    OtherTool,
+    /// A `value_action_submitted` row is the latest row for the envelope.
+    Submitted,
+    /// The send refused after the pending row and closed it with a
+    /// refusal-coded `value_action_failed` row.
+    RefusedAfterRow,
+    /// The receipt is edited to a success the chain never reported.
+    SuccessReceipt,
+}
+
+/// The rows of `kind` in the profile's log, oldest first.
+fn rows_of(home: &Path, kind: &str) -> Vec<Value> {
+    std::fs::read_to_string(profile(home).audit_log_path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .filter(|row| row["kind"] == kind)
+        .collect()
+}
+
 /// A submission identity that is durable while its barrier is not proves that
-/// the attempt never left. Resume retires that attempt's receipt, keeps the
-/// channel keys, and sends the next attempt exactly once.
+/// the attempt never left. With an open `pool init` pending row for the
+/// checkpoint's envelope, resume appends one `submission.not_transmitted`
+/// row whatever failure the receipt holds, keeps the channel keys, and sends
+/// the next attempt exactly once. The row carries the checkpoint's hashes and
+/// the context of the pending row. Without an open row it appends nothing. A
+/// row of another tool, a submitted row or a successful receipt refuses and
+/// keeps the checkpoint.
 ///
 /// The endpoint refuses the transport for the first attempt, so it accepts no
 /// submission; the barrier is then cleared on disk, which is the checkpoint a
@@ -638,48 +842,265 @@ async fn timeout_status_is_pending_until_the_chain_reports_the_channels() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 async fn unsent_attempt_is_retired_and_retried_with_one_send() {
-    let (home, _server, rpc) = fixture().await;
-    rpc.0.lock().unwrap().refuse_send = true;
-    assert_eq!(start(home.path()).0, 1);
-    assert_eq!(rpc.0.lock().unwrap().send_count, 0);
+    use stellar_agent_core::audit_log::{AuditEntry, PolicyDecision};
 
+    for case in [
+        UnsentCase::Intact,
+        UnsentCase::MissingReceipt,
+        UnsentCase::EditedReceipt,
+        UnsentCase::ForeignHash,
+        UnsentCase::OtherTool,
+        UnsentCase::Submitted,
+        UnsentCase::RefusedAfterRow,
+        UnsentCase::SuccessReceipt,
+    ] {
+        let (home, _server, rpc) = fixture().await;
+        rpc.0.lock().unwrap().refuse_send = true;
+        assert_eq!(start(home.path()).0, 1, "{case:?}");
+        assert_eq!(rpc.0.lock().unwrap().send_count, 0);
+
+        let checkpoint = profile(home.path()).pool_initialization.unwrap();
+        let unsent = checkpoint.submission.clone().unwrap();
+        assert_eq!(checkpoint.attempt, 0);
+        assert_eq!(
+            receipt_status(home.path(), &unsent.envelope_hash),
+            ReceiptStatus::Pending
+        );
+        assert_eq!(event_count(home.path(), "value_action_pending"), 1);
+
+        clear_send_barrier(home.path());
+        let mut envelope_hash = unsent.envelope_hash.clone();
+        match case {
+            UnsentCase::Intact => {}
+            UnsentCase::MissingReceipt => {
+                std::fs::remove_file(receipts(home.path()).file_path().unwrap()).unwrap();
+            }
+            UnsentCase::EditedReceipt => receipts(home.path())
+                .finalize(
+                    &unsent.envelope_hash,
+                    ReceiptStatus::Failed {
+                        code: "ledger.op_failed".to_owned(),
+                    },
+                    Some(1001),
+                )
+                .unwrap(),
+            UnsentCase::ForeignHash => {
+                envelope_hash = "f0".repeat(32);
+                rename_checkpoint_submission(home.path(), &envelope_hash);
+                std::fs::remove_file(receipts(home.path()).file_path().unwrap()).unwrap();
+            }
+            UnsentCase::OtherTool => append_rows(
+                home.path(),
+                vec![AuditEntry::new_value_action_pending(
+                    "stellar_pay_commit",
+                    "stellar:testnet",
+                    Vec::new(),
+                    stellar_agent_network::redact_tx_hash(&unsent.tx_hash),
+                    "source",
+                    2,
+                    PolicyDecision::Allow,
+                    Some(unsent.envelope_hash.clone()),
+                    None,
+                    None,
+                    "other-tool",
+                    None,
+                )],
+            ),
+            UnsentCase::Submitted => append_rows(
+                home.path(),
+                vec![AuditEntry::new_value_action_submitted(
+                    "pool init",
+                    Some("stellar:testnet".to_owned()),
+                    Vec::new(),
+                    stellar_agent_network::redact_tx_hash(&unsent.tx_hash),
+                    1001,
+                    PolicyDecision::Allow,
+                    Some(unsent.envelope_hash.clone()),
+                    None,
+                    None,
+                    "submitted",
+                    None,
+                )],
+            ),
+            UnsentCase::SuccessReceipt => receipts(home.path())
+                .finalize(&unsent.envelope_hash, ReceiptStatus::Success, Some(1001))
+                .unwrap(),
+            UnsentCase::RefusedAfterRow => append_rows(
+                home.path(),
+                vec![AuditEntry::new_value_action_failed(
+                    "pool init",
+                    Some("stellar:testnet".to_owned()),
+                    Vec::new(),
+                    stellar_agent_network::redact_tx_hash(&unsent.tx_hash),
+                    "submission.record_unavailable",
+                    PolicyDecision::Allow,
+                    Some(unsent.envelope_hash.clone()),
+                    None,
+                    None,
+                    "refused-after-row",
+                )],
+            ),
+        }
+        rpc.0.lock().unwrap().refuse_send = false;
+        let failed_before = event_count(home.path(), "value_action_failed");
+        let bytes = std::fs::read(profile_path(home.path())).unwrap();
+        let (code, output) = resume(home.path());
+
+        if matches!(
+            case,
+            UnsentCase::OtherTool | UnsentCase::Submitted | UnsentCase::SuccessReceipt
+        ) {
+            assert_eq!(code, 1, "{case:?}: {output}");
+            assert_eq!(
+                output["error"]["code"], "submission.record_unavailable",
+                "{case:?}: {output}"
+            );
+            assert_eq!(rpc.0.lock().unwrap().send_count, 0, "{case:?}");
+            assert_eq!(
+                std::fs::read(profile_path(home.path())).unwrap(),
+                bytes,
+                "{case:?}: the checkpoint stays"
+            );
+            assert_eq!(
+                event_count(home.path(), "value_action_failed"),
+                failed_before,
+                "{case:?}"
+            );
+            continue;
+        }
+        assert_eq!(code, 0, "{case:?}: {output}");
+        assert_eq!(rpc.0.lock().unwrap().send_count, 1, "{case:?}");
+        let expected_rows = usize::from(matches!(
+            case,
+            UnsentCase::Intact | UnsentCase::MissingReceipt | UnsentCase::EditedReceipt
+        ));
+        assert_eq!(
+            failed_rows_with(home.path(), "submission.not_transmitted"),
+            expected_rows,
+            "{case:?}"
+        );
+        assert_eq!(
+            event_count(home.path(), "value_action_failed"),
+            failed_before + expected_rows,
+            "{case:?}"
+        );
+        if expected_rows == 1 {
+            let pending = rows_of(home.path(), "value_action_pending")
+                .into_iter()
+                .find(|row| row["envelope_hash"] == unsent.envelope_hash.as_str())
+                .expect("the pending row of the unsent attempt");
+            let emitted = rows_of(home.path(), "value_action_failed")
+                .into_iter()
+                .find(|row| row["code"] == "submission.not_transmitted")
+                .unwrap();
+            assert_eq!(pending["chain_id"], "stellar:testnet", "{case:?}");
+            assert!(pending["legs"].is_array(), "{case:?}: {pending}");
+            assert!(
+                pending["policy_decision"].is_string(),
+                "{case:?}: {pending}"
+            );
+            assert_eq!(emitted["tool"], "pool init", "{case:?}");
+            assert_eq!(
+                emitted["envelope_hash"],
+                unsent.envelope_hash.as_str(),
+                "{case:?}"
+            );
+            assert_eq!(
+                emitted["transaction_hash_redacted"],
+                stellar_agent_network::redact_tx_hash(&unsent.tx_hash).as_str(),
+                "{case:?}"
+            );
+            for field in [
+                "tool",
+                "chain_id",
+                "legs",
+                "transaction_hash_redacted",
+                "policy_decision",
+                "nonce_id",
+                "approval_nonce",
+            ] {
+                assert_eq!(
+                    emitted[field], pending[field],
+                    "{case:?}: {field} comes from the pending row"
+                );
+            }
+        }
+        match case {
+            UnsentCase::Intact => assert_eq!(
+                receipt_status(home.path(), &envelope_hash),
+                ReceiptStatus::Failed {
+                    code: "submission.not_transmitted".to_owned()
+                }
+            ),
+            UnsentCase::EditedReceipt => assert_eq!(
+                receipt_status(home.path(), &envelope_hash),
+                ReceiptStatus::Failed {
+                    code: "ledger.op_failed".to_owned()
+                },
+                "the edited receipt is display data and stays"
+            ),
+            _ => {}
+        }
+        assert!(
+            receipts(home.path())
+                .all()
+                .unwrap()
+                .iter()
+                .any(|record| record.status == ReceiptStatus::Success),
+            "{case:?}: the retry carries its own receipt"
+        );
+        assert_eq!(
+            profile(home.path()).pool_config.unwrap().channels,
+            checkpoint.channels
+        );
+        assert!(profile(home.path()).pool_initialization.is_none());
+        assert_eq!(event_count(home.path(), "channel_pool_initialised"), 1);
+    }
+}
+
+/// A send refused before its pending row leaves an unsent checkpoint and no
+/// row. Resume retires the attempt without a `submission.not_transmitted`
+/// row and sends the next attempt exactly once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn a_refusal_before_the_pending_row_is_retired_without_a_row() {
+    let (home, _server, rpc) = fixture().await;
+    // An open receipt for the funder's next sequence makes the receipt claim
+    // refuse, ahead of the pending row.
+    let blocking = "e0".repeat(32);
+    receipts(home.path())
+        .try_begin(
+            &blocking,
+            &blocking,
+            &account_id_for_seed(FUNDER_SEED),
+            2,
+            0,
+            1000,
+        )
+        .unwrap();
+    let (code, output) = start(home.path());
+    assert_eq!(code, 1, "{output}");
+    assert_eq!(rpc.0.lock().unwrap().send_count, 0);
     let checkpoint = profile(home.path()).pool_initialization.unwrap();
     let unsent = checkpoint.submission.clone().unwrap();
-    assert_eq!(checkpoint.attempt, 0);
-    assert_eq!(
-        receipt_status(home.path(), &unsent.envelope_hash),
-        ReceiptStatus::Pending
-    );
-    assert_eq!(event_count(home.path(), "value_action_pending"), 1);
+    assert!(!unsent.send_started, "the barrier proves nothing left");
+    assert_eq!(event_count(home.path(), "value_action_pending"), 0);
+    assert_eq!(event_count(home.path(), "value_action_failed"), 0);
+    std::fs::remove_file(receipts(home.path()).file_path().unwrap()).unwrap();
 
-    clear_send_barrier(home.path());
-    rpc.0.lock().unwrap().refuse_send = false;
     let (code, output) = resume(home.path());
     assert_eq!(code, 0, "{output}");
-
     assert_eq!(rpc.0.lock().unwrap().send_count, 1);
     assert_eq!(
-        receipt_status(home.path(), &unsent.envelope_hash),
-        ReceiptStatus::Failed {
-            code: "submission.not_transmitted".to_owned()
-        }
+        failed_rows_with(home.path(), "submission.not_transmitted"),
+        0
     );
-    assert_eq!(event_count(home.path(), "value_action_failed"), 1);
-
-    let records = receipts(home.path()).all().unwrap();
-    assert_eq!(records.len(), 2);
-    let sent = records
-        .iter()
-        .find(|record| record.envelope_hash != unsent.envelope_hash)
-        .expect("the retry must carry its own receipt");
-    assert_eq!(sent.status, ReceiptStatus::Success);
-
+    assert_eq!(event_count(home.path(), "value_action_failed"), 0);
     assert_eq!(
         profile(home.path()).pool_config.unwrap().channels,
         checkpoint.channels
     );
     assert!(profile(home.path()).pool_initialization.is_none());
-    assert_eq!(event_count(home.path(), "channel_pool_initialised"), 1);
 }
 
 /// An attempt the endpoint can no longer account for settles as ambiguous, and

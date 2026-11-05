@@ -27,7 +27,12 @@
 //!   window's duration, has passed on this host's clock, the reservation ends
 //!   with the outcome unknown: the receipt is marked ambiguous with
 //!   `release_code` `submission.accounting_expired`, and no failed row is
-//!   owed. An absent receipt is restored from the reservation first.
+//!   owed. The expiry owes one `submission_accounting_expired` audit event,
+//!   which this verb delivers from the verified window state. An absent
+//!   receipt is rebuilt from the committed expiry.
+//! - The receipt is display data. `record` carries
+//!   `settlement_evidence: "unavailable"`, and no receipt status writes an
+//!   audit row.
 //! - When the submission ledger predates the endpoint's retention floor,
 //!   `NOT_FOUND` proves nothing, so the reservation stands and the receipt is
 //!   marked ambiguous, without evidence, for `tx receipt clear` to resolve.
@@ -38,12 +43,15 @@
 //!
 //! # Concurrency
 //!
-//! Writing a settled audit row needs the audit writer's exclusive lock. While an MCP server holds
-//! that profile's writer, this verb refuses with `audit.writer_locked`. Stop that server,
-//! reconcile, and start it again. The server acquires its writer when needed, including for V1
-//! reservation reconciliation during simulation. The registry normally retains it until exit. A
-//! replaced-file refusal during acquisition marks it for eviction; a later acquisition drops it
-//! once callers release it.
+//! Delivering an accounting audit event needs the audit writer's exclusive
+//! lock, and the verb acquires the writer only for an unacknowledged event.
+//! While an MCP server holds that profile's writer, the verb still reconciles
+//! and reports. The event stays owed, and the refusal is logged at WARN. Stop
+//! that server and run the verb again to deliver it. The server acquires its
+//! writer when needed, including for V1 reservation reconciliation during
+//! simulation. The registry normally retains it until exit. A replaced-file
+//! refusal during acquisition marks it for eviction; a later acquisition
+//! drops it once callers release it.
 //!
 //! # Exit codes
 //!
@@ -107,11 +115,16 @@ struct RecordView {
     submitted: bool,
     /// Whether a spending-window reservation is still open for it.
     reservation_open: bool,
-    /// The chain evidence on which reconciliation released the reservation:
-    /// `submission.sequence_consumed` or `submission.time_bound_passed`.
-    /// Absent when the outcome was answered by the chain or is unknown.
+    /// A display observation or the accounting disposition, such as
+    /// `submission.accounting_expired`. Absent when the receipt records none.
     #[serde(skip_serializing_if = "Option::is_none")]
     release_code: Option<&'static str>,
+    /// Always `"unavailable"`: no receipt field authenticates a settlement.
+    settlement_evidence: &'static str,
+    /// The authenticated accounting decision a projection recorded. A copied
+    /// identifier proves nothing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    settlement_decision_id: Option<String>,
 }
 
 /// Authenticated hold identity, available even when its receipt is absent.
@@ -180,23 +193,6 @@ pub async fn run(args: &StatusArgs) -> i32 {
                 e.submission_code(),
                 format!("the spending-window file could not be read: {e}"),
             ));
-            return 1;
-        }
-    };
-
-    // The audit writer is proved acquirable before anything is settled: a
-    // reconciliation that confirms a submission writes the value-action row
-    // that submission never got to write. A persisted profile fails closed on
-    // it; the synthesized zero-config profile has no audit key to fail on, and
-    // reconciling is still the thing that frees its sequence.
-    let audit_writer = match crate::commands::value_audit::require_value_audit_writer_for_origin(
-        &profile,
-        &resolved.name,
-        origin,
-    ) {
-        Ok(writer) => writer,
-        Err(e) => {
-            render_json(&Envelope::<()>::err(&e));
             return 1;
         }
     };
@@ -271,11 +267,16 @@ pub async fn run(args: &StatusArgs) -> i32 {
             ),
             Ok(_) => {}
             Err(e) => {
+                // A refused pass leaves the obligations of earlier runs in
+                // place; they are delivered before the refusal renders.
+                deliver_owed(&profile, &resolved.name, origin, &window, &receipts);
                 render_json(&Envelope::<()>::err_raw(e.submission_code(), e.to_string()));
                 return 1;
             }
         }
     }
+
+    deliver_owed(&profile, &resolved.name, origin, &window, &receipts);
 
     if let Some(record) = &receipt
         && record.approval_nonce.is_some()
@@ -319,8 +320,8 @@ pub async fn run(args: &StatusArgs) -> i32 {
             return 1;
         }
     };
-    // Reconciliation can restore a receipt from the authenticated hold. Read
-    // the resulting record so its status and settlement audit row are surfaced.
+    // Reconciliation and delivery can rebuild a receipt from authenticated
+    // state. Read the resulting record for display.
     let receipt = match receipts.find_by_tx_hash(&args.tx_hash) {
         Ok(record) => record,
         Err(e) => {
@@ -331,30 +332,12 @@ pub async fn run(args: &StatusArgs) -> i32 {
             return 1;
         }
     };
-    let record = match receipt {
-        Some(settled) => {
-            // A submission the chain has now answered for gets the
-            // value-action row it never got to write, carrying the legs the
-            // gate sized.
-            if let Some(audit) = audit_writer.as_ref() {
-                crate::commands::submission_record::write_settled_row_with_evidence(
-                    &profile,
-                    &resolved.name,
-                    audit,
-                    &settled.envelope_hash,
-                    &settled.tx_hash,
-                    &settled.status,
-                    settled.release_code,
-                    stellar_agent_core::audit_log::PolicyDecision::Allow,
-                );
-            }
-            let reservation_open = reservation
-                .as_ref()
-                .is_some_and(|r| r.id == settled.envelope_hash);
-            Some(record_view(&settled, reservation_open))
-        }
-        None => None,
-    };
+    let record = receipt.map(|settled| {
+        let reservation_open = reservation
+            .as_ref()
+            .is_some_and(|r| r.id == settled.envelope_hash);
+        record_view(&settled, reservation_open)
+    });
 
     render_json(&Envelope::ok(StatusData {
         tx_hash: args.tx_hash.clone(),
@@ -367,6 +350,36 @@ pub async fn run(args: &StatusArgs) -> i32 {
         }),
     }));
     0
+}
+
+/// Delivers the accounting obligations the verified window state owes,
+/// including those of earlier runs.
+///
+/// The audit writer is acquired under the binding check of `origin`, and
+/// only when an audit event is unacknowledged, so a projection-only retry
+/// runs without it. A refusal, an unavailable writer included, is logged at
+/// WARN and leaves the obligations owed; the status answer does not depend
+/// on it.
+fn deliver_owed(
+    profile: &stellar_agent_core::profile::schema::Profile,
+    profile_name: &str,
+    origin: crate::common::profile_access::ProfileOrigin,
+    window: &PersistedWindowStore,
+    receipts: &ReceiptStore,
+) {
+    let _ = stellar_agent_network::policy_state::drain_accounting_obligations(
+        window,
+        profile,
+        profile_name,
+        Some(receipts),
+        || {
+            crate::commands::submission_record::accounting_audit_writer(
+                profile,
+                profile_name,
+                origin,
+            )
+        },
+    );
 }
 
 fn record_view(receipt: &SubmissionReceipt, reservation_open: bool) -> RecordView {
@@ -385,6 +398,8 @@ fn record_view(receipt: &SubmissionReceipt, reservation_open: bool) -> RecordVie
         submitted: receipt.submitted,
         reservation_open,
         release_code: receipt.release_code.map(ReleaseEvidence::code),
+        settlement_evidence: "unavailable",
+        settlement_decision_id: receipt.settlement_decision_id.clone(),
     }
 }
 

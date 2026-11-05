@@ -1433,71 +1433,52 @@ impl WalletServer {
     /// of the primary endpoint settles a reservation. An oracle client that
     /// cannot be built is logged, and the pass then keeps every reservation
     /// the primary reports as failed or unknown.
+    ///
+    /// Every owed accounting obligation is then drained, also after a pass
+    /// that was skipped or refused, so obligations of earlier passes are
+    /// delivered too.
     async fn reconcile_open_reservations(&self) {
-        let Ok(now_ms) = stellar_agent_core::timefmt::now_unix_ms() else {
-            tracing::debug!("window reconcile: system clock unavailable; reservations stand");
-            return;
-        };
-        let Ok(client) = self.context.primary_client() else {
-            return;
-        };
-        let oracle = self.settlement_oracle();
+        use crate::tools::submission_record::ReconcilePass;
+
         let profile_name = self.profile_name_for_approval();
         let receipts = stellar_agent_core::profile::receipt::ReceiptStore::open(&profile_name).ok();
         let window = self.window_store.clone();
-        let report = match window
-            .reconcile_due(
-                self.security_profile(),
-                &client,
-                oracle.as_ref(),
-                receipts.as_ref(),
-                now_ms,
-                stellar_agent_network::policy_state::RECONCILE_BUDGET,
-            )
-            .await
-        {
-            Ok(report) => report,
-            Err(e) => {
-                tracing::debug!(
-                    profile = %profile_name,
-                    error = ?e,
-                    "window reconcile: pass failed; open reservations stand"
-                );
-                return;
+        let pass = match (
+            stellar_agent_core::timefmt::now_unix_ms(),
+            self.context.primary_client(),
+        ) {
+            (Err(_), _) => ReconcilePass::ClockUnavailable,
+            (Ok(_), Err(_)) => ReconcilePass::ClientUnavailable,
+            (Ok(now_ms), Ok(client)) => {
+                let oracle = self.settlement_oracle();
+                match window
+                    .reconcile_due(
+                        self.security_profile(),
+                        &client,
+                        oracle.as_ref(),
+                        receipts.as_ref(),
+                        now_ms,
+                        stellar_agent_network::policy_state::RECONCILE_BUDGET,
+                    )
+                    .await
+                {
+                    Ok(report) => ReconcilePass::Completed(report),
+                    Err(error) => ReconcilePass::Failed(error),
+                }
             }
         };
 
-        // A submission the pass settled is owed the value-action row it never
-        // got to write. The writer is the same keyed one every value verb
-        // uses, so a log that cannot be appended leaves the row owed rather
-        // than the settlement undone.
-        if report.settled.is_empty() {
-            return;
-        }
-        let Ok(audit) = crate::tools::value_audit::require_value_audit_writer(
+        // Accounting expiry commits its audit obligation with the expiry, so
+        // the drain delivers it, and any obligation an earlier pass left, from
+        // the verified window state. A refusal is logged and stays owed.
+        let _ = crate::tools::submission_record::finish_reconciliation(
             self.security_profile(),
             &profile_name,
             self.audit_binding,
-        ) else {
-            tracing::debug!(
-                profile = %profile_name,
-                settled = report.settled.len(),
-                "window reconcile: no audit writer; the settled rows stay owed"
-            );
-            return;
-        };
-        for settled in &report.settled {
-            crate::tools::submission_record::write_settled_row(
-                self.security_profile(),
-                &profile_name,
-                &audit,
-                &settled.envelope_hash,
-                &settled.tx_hash,
-                &settled.status,
-                settled.release_code,
-                stellar_agent_core::audit_log::PolicyDecision::Allow,
-            );
-        }
+            &window,
+            receipts.as_ref(),
+            &pass,
+        );
     }
 
     /// Checks policy inputs against the profile-bound descriptor.

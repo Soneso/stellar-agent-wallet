@@ -14,8 +14,8 @@ An AI agent calls wallet tools on its own initiative. The model does not assume 
 - A **hash-chained audit log** records transaction submissions, signed
   authorizations, approvals, and explicit key-management and lifecycle events.
   MCP balance reads and payment simulations produce no automatic invocation row.
-  Under V1, payment simulations can reconcile overdue reservations and write
-  settlement audit rows. Value-moving signing
+  Under V1, payment simulations can reconcile overdue reservations and deliver
+  owed accounting events. Value-moving signing
   verbs acquire the audit writer before touching the signing key or submitting.
   A persisted profile without its audit key refuses. A synthesized profile
   attempts keyed audit acquisition and tolerates an unavailable key or writer.
@@ -355,7 +355,7 @@ The **per-action payment approval** (`PaymentSimulated`) fires on every toolset-
 
 Audit rows come from explicit event-writing operations. MCP balance reads
 and payment simulations produce no automatic invocation row. Under V1, payment
-simulations can reconcile overdue reservations and write settlement audit rows.
+simulations can reconcile overdue reservations and deliver owed accounting events.
 Reconciliation acquires the audit writer, which can block audit-key rotation.
 The event-writing paths include:
 
@@ -404,7 +404,7 @@ described in [Audit-log recovery](maintainers/audit-log-recovery.md).
 Post-confirmation `value_action_submitted` row failures remain non-fatal.
 Read-only tools and build/simulate stages do not reach the signing preflight.
 V1 MCP payment simulations can still acquire the writer for reservation
-reconciliation and its settlement audit rows.
+reconciliation and owed accounting events.
 
 `pay`, `claim`, and `accounts create` synthesize a testnet profile when no
 profile is named and no `default.toml` exists. It attempts keyed audit

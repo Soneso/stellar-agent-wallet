@@ -303,8 +303,9 @@ Report pool utilisation: `initialised`, `pool_size`, `free`, and `in_flight`.
 Read-only and makes no network call: it reads the pool config, initialization
 checkpoint, and the checkpoint's receipt when present. While initialization is
 pending, `initialised` is false and `pending` carries `channel_count`,
-`seed_ready`, `tx_hash`, and `resume_with`. An ambiguous receipt adds `clear_with`,
-the operator acknowledgment command required before resume can retry.
+`seed_ready`, `tx_hash`, and `resume_with`. An ambiguous or failed receipt adds
+`clear_with`, the operator acknowledgment command required before resume can
+retry; resume retries only once the verified audit history holds its clear row.
 In a fresh CLI invocation `free == pool_size` and `in_flight == 0`. The result
 carries a note that `free` and `in_flight` reflect the persisted config of a
 stateless process, not a live allocator; do not read `in_flight: 0` as "safe to

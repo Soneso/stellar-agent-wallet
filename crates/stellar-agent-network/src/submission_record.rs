@@ -702,8 +702,7 @@ impl SubmissionRecorder for WalletSubmissionRecorder<'_> {
                 // A duplicate found under the lock is a resend of bytes another
                 // process reserved between the check above and this write. The
                 // pending row just written names the same envelope hash as that
-                // submission's, so the settled row its reconciliation writes
-                // closes both, and this row stays open. Every other refusal
+                // submission's and stays open with it. Every other refusal
                 // attempts to close the row, even if the duplicate check did
                 // not run, whatever the anchor check found.
                 let reached = match e {
@@ -1306,6 +1305,7 @@ impl WalletSubmissionRecorder<'_> {
                 .and_then(|decision| {
                     self.window
                         .apply_accounting_decision(self.profile, decision)
+                        .map(|_| ())
                 }),
         };
         if let Err(e) = result {

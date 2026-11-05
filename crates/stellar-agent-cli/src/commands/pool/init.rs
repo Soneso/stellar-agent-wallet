@@ -3,8 +3,11 @@
 //! The profile records channel identities before the keyring seed is written.
 //! The seed is durable before the submission can leave. A pending lifecycle
 //! excludes replacement; `pool init --resume` completes it using the same keys.
-//! An attempt whose outcome is recorded as unknown is retried only after an
-//! operator acknowledges it through `tx receipt clear --acknowledge`.
+//! A sent attempt is retried only after an operator acknowledges it through
+//! `tx receipt clear --acknowledge`, whose clear row the verified audit
+//! history holds. An endpoint failure report is not that acknowledgement.
+//! An unsent attempt, proved by the durable send barrier, is retired with one
+//! `submission.not_transmitted` row when its pending row is still open.
 //! Only the pool keys in the stored profile are patched, so runtime environment
 //! overlays remain transient. The profile contains no signing material.
 
@@ -13,7 +16,10 @@ use clap::Args;
 use keyring_core::Entry as KeyringEntry;
 use rand_core::{OsRng, RngCore};
 use std::{fs::OpenOptions, path::Path, sync::Mutex, time::Duration};
-use stellar_agent_core::audit_log::{entry::AuditEntry, reader::AuditReader};
+use stellar_agent_core::audit_log::{
+    entry::AuditEntry,
+    reader::{AuditReader, audit_history_refusal},
+};
 use stellar_agent_core::cross_check::CrossCheckValue;
 use stellar_agent_core::envelope::{Envelope, OutputFormat};
 use stellar_agent_core::error::FeeSource;
@@ -47,7 +53,7 @@ use stellar_agent_pool::{
 use stellar_agent_sep5::Sep5Wallet;
 use zeroize::Zeroizing;
 
-use crate::commands::submission_record::{SubmitRecord, build_recorder, write_settled_row};
+use crate::commands::submission_record::{SubmitRecord, build_recorder};
 use crate::common::network::{check_endpoint_identity, mainnet_write_refusal};
 use crate::common::profile_access::load_profile_reconciled;
 use crate::common::{render::render_json, resolve_profile_name};
@@ -447,24 +453,11 @@ where
         if ledger == 0 {
             return Err(unavailable("the channel observation has no ledger"));
         }
-        // A definitive answer also settles the receipt; account existence can
-        // finish configuration when the transaction is outside RPC retention.
+        // The endpoint's answer is recorded on the receipt for display;
+        // account existence finishes configuration, also when the transaction
+        // is outside RPC retention. Neither writes a transaction outcome row.
         if let Some(submission) = &pending.submission {
             settle_record(&client, &receipts, submission).await?;
-            if let Some(receipt) = receipts
-                .get(&submission.envelope_hash)
-                .map_err(|error| unavailable(error.to_string()))?
-            {
-                write_settled_row(
-                    &profile,
-                    name,
-                    &audit,
-                    &receipt.envelope_hash,
-                    &receipt.tx_hash,
-                    &receipt.status,
-                    stellar_agent_core::audit_log::PolicyDecision::Allow,
-                );
-            }
         }
         pending.completion_ledger = Some(ledger);
         persist(name, &master, &pending)?;
@@ -474,56 +467,41 @@ where
         return Ok(pending_data(name, &pending));
     }
     if let Some(submission) = &pending.submission {
-        let status = if submission.send_started {
-            settle_record(&client, &receipts, submission).await?
+        if submission.send_started {
+            // No channel account exists, so a fresh envelope cannot create one
+            // twice. Retry requires the operator's verified clear row. The
+            // endpoint must not report success. An endpoint failure report, an
+            // unknown outcome and a receipt status each hold the checkpoint.
+            settle_record(&client, &receipts, submission).await?;
+            if !operator_clear_recorded(name, &audit, submission)? {
+                return Ok(pending_data(name, &pending));
+            }
         } else {
-            // The durable barrier proves that no bytes left for this receipt.
+            // The durable barrier proves that no bytes left for this attempt.
             if let Some(receipt) = receipts
                 .get(&submission.envelope_hash)
                 .map_err(|error| unavailable(error.to_string()))?
+                && receipt.status == ReceiptStatus::Success
             {
-                if receipt.status == ReceiptStatus::Success {
-                    return Err(unavailable("an unsent checkpoint has a successful receipt"));
-                }
+                return Err(unavailable("an unsent checkpoint has a successful receipt"));
+            }
+            write_not_transmitted_row(name, &audit, submission)?;
+            // The receipt is display data; it follows the audit decision.
+            if receipts
+                .get(&submission.envelope_hash)
+                .map_err(|error| unavailable(error.to_string()))?
+                .is_some_and(|receipt| receipt.status == ReceiptStatus::Pending)
+            {
                 receipts
                     .finalize(
                         &submission.envelope_hash,
                         ReceiptStatus::Failed {
-                            code: "submission.not_transmitted".to_owned(),
+                            code: NOT_TRANSMITTED_CODE.to_owned(),
                         },
                         None,
                     )
                     .map_err(|error| unavailable(error.to_string()))?;
             }
-            Some(ReceiptStatus::Failed {
-                code: "submission.not_transmitted".to_owned(),
-            })
-        };
-        // No channel account exists at this point, so a fresh envelope cannot
-        // create one twice. Two records permit it. A definitive failure is one.
-        // The other is the operator's acknowledgement through
-        // `tx receipt clear --acknowledge`, which states that the transaction
-        // did not apply and which that verb writes only after the endpoint
-        // declines to report the transaction as successful or failed. An
-        // outcome recorded as merely unknown is not that statement: it is the
-        // state where a second envelope could create the channels a second
-        // time, so it holds the checkpoint until an operator resolves it.
-        let Some(ReceiptStatus::Failed { .. } | ReceiptStatus::ClearedByOperator) = status else {
-            return Ok(pending_data(name, &pending));
-        };
-        if let Some(receipt) = receipts
-            .get(&submission.envelope_hash)
-            .map_err(|error| unavailable(error.to_string()))?
-        {
-            write_settled_row(
-                &profile,
-                name,
-                &audit,
-                &receipt.envelope_hash,
-                &receipt.tx_hash,
-                &receipt.status,
-                stellar_agent_core::audit_log::PolicyDecision::Allow,
-            );
         }
     }
     if args.resume {
@@ -650,37 +628,171 @@ fn map_init_error(error: PoolError, name: &str) -> WalletError {
     }
 }
 
+/// The failure code of an attempt the send barrier proves was never sent.
+const NOT_TRANSMITTED_CODE: &str = "submission.not_transmitted";
+
+/// The audit tool name of the pool initialization's pending row.
+const POOL_INIT_TOOL: &str = "pool init";
+
+/// Records the endpoint's answer for a sent attempt on its receipt, for
+/// display, and returns the receipt's status.
+///
+/// `SUCCESS` records success. `FAILED` moves only a `Pending` receipt, to
+/// `Ambiguous` without evidence: an endpoint failure report is
+/// unauthenticated and authorizes neither a failure row nor a retry. A receipt
+/// already `Ambiguous`, `Failed` or `ClearedByOperator` keeps its status. The
+/// checkpoint stays in every case.
+///
+/// # Errors
+///
+/// `submission.record_unavailable` for a missing or unreadable receipt, and
+/// the endpoint's error for an answer it could not give.
 async fn settle_record(
     client: &StellarRpcClient,
     receipts: &ReceiptStore,
     submission: &PoolInitSubmission,
 ) -> Result<Option<ReceiptStatus>, WalletError> {
-    if receipts
+    let Some(recorded) = receipts
         .get(&submission.envelope_hash)
         .map_err(|error| unavailable(error.to_string()))?
-        .is_none()
-    {
+    else {
         return Err(unavailable(
             "the pending pool receipt is missing; restore it before resuming",
         ));
-    }
-    let answer = client.get_transaction_status(&submission.tx_hash).await?;
-    let status = match answer.status.as_str() {
-        "SUCCESS" => Some(ReceiptStatus::Success),
-        "FAILED" => Some(ReceiptStatus::Failed {
-            code: "ledger.op_failed".to_owned(),
-        }),
-        _ => None,
     };
-    if let Some(status) = status {
-        receipts
-            .finalize(&submission.envelope_hash, status, answer.ledger)
-            .map_err(|error| unavailable(error.to_string()))?;
+    let answer = client.get_transaction_status(&submission.tx_hash).await?;
+    match answer.status.as_str() {
+        "SUCCESS" => receipts
+            .finalize(
+                &submission.envelope_hash,
+                ReceiptStatus::Success,
+                answer.ledger,
+            )
+            .map_err(|error| unavailable(error.to_string()))?,
+        "FAILED" if recorded.status == ReceiptStatus::Pending => receipts
+            .finalize(&submission.envelope_hash, ReceiptStatus::Ambiguous, None)
+            .map_err(|error| unavailable(error.to_string()))?,
+        _ => {}
     }
     Ok(receipts
         .get(&submission.envelope_hash)
         .map_err(|error| unavailable(error.to_string()))?
         .map(|receipt| receipt.status))
+}
+
+/// Takes the writer guard and verifies its tip anchor and retained history.
+fn verified_guard<'a>(
+    profile_name: &str,
+    audit: &'a stellar_agent_network::submission_record::AuditWriterHandle,
+) -> Result<std::sync::MutexGuard<'a, stellar_agent_core::audit_log::AuditWriter>, WalletError> {
+    let mut guard = audit
+        .lock()
+        .map_err(|_| unavailable("audit writer mutex is poisoned"))?;
+    guard.verify_tip_anchor().map_err(|error| {
+        stellar_agent_core::audit_log::audit_writer_refusal(profile_name, &error)
+    })?;
+    Ok(guard)
+}
+
+/// Whether the verified audit history holds an operator's
+/// `submission_receipt_cleared` row for the attempt.
+///
+/// The row is read under the writer guard, up to the writer's verified tip.
+/// The receipt's own `cleared_by_operator` status authorizes nothing.
+///
+/// # Errors
+///
+/// The writer's refusal of its tip anchor or retained history, and
+/// `audit.chain_key_unavailable` for a history the lookup cannot read.
+fn operator_clear_recorded(
+    profile_name: &str,
+    audit: &stellar_agent_network::submission_record::AuditWriterHandle,
+    submission: &PoolInitSubmission,
+) -> Result<bool, WalletError> {
+    let guard = verified_guard(profile_name, audit)?;
+    stellar_agent_core::audit_log::reader::try_submission_receipt_cleared_exists(
+        &guard,
+        &submission.envelope_hash,
+    )
+    .map_err(|error| audit_history_refusal(profile_name, &error))
+}
+
+/// Settles the audit record of an attempt the durable send barrier proves
+/// was never sent, before the attempt is retired.
+///
+/// `submission` is the durable checkpoint's attempt; it must record
+/// `send_started == false`.
+///
+/// The writer guard spans the verification, the lookup and the append. The
+/// lookup reads the verified history for the checkpoint's envelope hash:
+///
+/// - an open pending row written by `pool init` takes one
+///   `value_action_failed` row with the fixed code
+///   `submission.not_transmitted`, carrying that pending row's legs, nonce,
+///   policy decision and approval nonce;
+/// - a latest `value_action_failed` row, or no row at all, means no pending
+///   row is open, and nothing is appended;
+/// - an open pending row of another tool, or a latest
+///   `value_action_submitted` row, refuses with
+///   `submission.record_unavailable` and keeps the checkpoint.
+///
+/// No receipt status or receipt code takes part.
+///
+/// # Errors
+///
+/// The refusals above, the writer's refusal of its tip anchor, retained
+/// history or append, and `audit.chain_key_unavailable` for a history the
+/// lookup cannot read.
+fn write_not_transmitted_row(
+    profile_name: &str,
+    audit: &stellar_agent_network::submission_record::AuditWriterHandle,
+    submission: &PoolInitSubmission,
+) -> Result<(), WalletError> {
+    use stellar_agent_core::audit_log::reader::{
+        SettledValueAction, ValueActionSettlement, try_value_action_settled_row,
+        try_value_action_settlement,
+    };
+
+    if submission.send_started {
+        return Err(unavailable(
+            "a sent pool attempt cannot be recorded as not transmitted",
+        ));
+    }
+    let mut guard = verified_guard(profile_name, audit)?;
+    let settlement = try_value_action_settlement(&guard, &submission.envelope_hash)
+        .map_err(|error| audit_history_refusal(profile_name, &error))?;
+    let open = match settlement {
+        ValueActionSettlement::Owed(open) if open.tool == POOL_INIT_TOOL => open,
+        ValueActionSettlement::Owed(_) => {
+            return Err(unavailable(
+                "the unsent pool attempt's envelope has an open pending row of another tool",
+            ));
+        }
+        ValueActionSettlement::OwedWithoutLegs => return Ok(()),
+        ValueActionSettlement::Settled => {
+            return match try_value_action_settled_row(&guard, &submission.envelope_hash)
+                .map_err(|error| audit_history_refusal(profile_name, &error))?
+            {
+                Some(SettledValueAction::Failed { .. }) => Ok(()),
+                _ => Err(unavailable(
+                    "the unsent pool attempt's envelope has a submitted row",
+                )),
+            };
+        }
+    };
+    let entry = AuditEntry::new_value_action_failed(
+        POOL_INIT_TOOL,
+        open.chain_id,
+        open.legs,
+        stellar_agent_network::redact_tx_hash(&submission.tx_hash).as_str(),
+        NOT_TRANSMITTED_CODE,
+        open.policy_decision,
+        Some(submission.envelope_hash.clone()),
+        open.nonce_id,
+        open.approval_nonce,
+        uuid::Uuid::new_v4().to_string(),
+    );
+    crate::commands::value_audit::append_value_audit_row_strict(&mut guard, profile_name, entry)
 }
 
 fn complete(

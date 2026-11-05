@@ -918,8 +918,8 @@ pub enum EventKind {
     /// The CLI `mpp state prune` command emits this before pruning.
     /// Transaction submissions, signed authorizations, approvals, and lifecycle
     /// changes use their dedicated event kinds at their emission sites.
-    /// MCP payment simulation can trigger reconciliation and settlement rows;
-    /// it produces no automatic `ToolInvocation` row.
+    /// MCP payment simulation can trigger reconciliation and accounting audit
+    /// delivery; it produces no automatic `ToolInvocation` row.
     ToolInvocation,
 
     /// A fail-closed executable policy plugin was invoked.
@@ -3291,6 +3291,45 @@ pub enum EventKind {
         code: String,
     },
 
+    /// An authenticated accounting decision expired a reservation's
+    /// conservative accounting horizon.
+    ///
+    /// The event records accounting expiry, never transaction failure: the
+    /// chain outcome stays unknown. The spending window commits the
+    /// disposition and this event's obligation in one authenticated
+    /// successor, and delivery appends at most one event per `decision_id`
+    /// in the verified retained history. Receipt contents never produce it.
+    ///
+    /// The outer [`AuditEntry`](super::entry::AuditEntry) carries the
+    /// authenticated chain and, in `envelope_hash`, the reservation
+    /// identifier.
+    ///
+    /// # Field redaction
+    ///
+    /// - `transaction_hash_redacted`: first-8-last-8.
+    ///
+    /// # Schema additivity
+    ///
+    /// Additive under `#[non_exhaustive]`; hash-chain integrity preserved.
+    SubmissionAccountingExpired {
+        /// The authenticated decision identifier: lowercase hexadecimal
+        /// SHA-256 over the canonical chain, passphrase hash, reservation,
+        /// committing generation and disposition.
+        decision_id: String,
+        /// The spending-window generation that committed the expiry.
+        generation: u64,
+        /// Transaction hash, redacted first-8-last-8.
+        transaction_hash_redacted: String,
+        /// The checked local expiry time, in unix milliseconds.
+        observed_at_ms: u64,
+        /// The greatest affected accounting horizon, in unix milliseconds.
+        accounting_until_ms: u64,
+        /// Always `"submission.accounting_expired"`.
+        code: String,
+        /// Always `"unknown"`.
+        chain_outcome: String,
+    },
+
     /// An operator acknowledged a submission and released its hold on the
     /// spending window.
     ///
@@ -3303,8 +3342,9 @@ pub enum EventKind {
     /// that is unknown.
     ///
     /// The row is not a settlement: a cleared receipt owes no
-    /// `value_action_*` row. When reconciliation released the reservation on
-    /// evidence, the settled `value_action_failed` row precedes this one.
+    /// `value_action_*` row. The clear row records the operator's
+    /// acknowledgement before capacity changes. Accounting expiry has a
+    /// separate event whose chain outcome remains unknown.
     ///
     /// # Field redaction
     ///
@@ -3768,7 +3808,7 @@ pub enum EventKind {
 /// the test stays green, leaving the new variant unpinned by any tag assertion.
 /// Closing that would need the count derived from the enum itself, which needs a
 /// derive macro this workspace does not carry.
-pub const EVENT_KIND_VARIANT_COUNT: usize = 80;
+pub const EVENT_KIND_VARIANT_COUNT: usize = 81;
 
 /// Why an [`EventKind::AuditTipAnchored`] row was written.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -7291,6 +7331,24 @@ mod tests {
     fn reset_row_without_wiped_keeps_golden_bytes() {
         let golden = r#"{"kind":"policy_window_state_reset","profile":"alice","reason":"repair"}"#;
         let row: EventKind = serde_json::from_str(golden).unwrap();
+        assert_eq!(serde_json::to_string(&row).unwrap(), golden);
+    }
+
+    /// The accounting-expiry event carries its fixed code and unknown chain
+    /// outcome under its own wire kind.
+    #[test]
+    fn accounting_expired_row_has_its_own_kind() {
+        let golden = concat!(
+            r#"{"kind":"submission_accounting_expired","decision_id":"ab","generation":4,"#,
+            r#""transaction_hash_redacted":"abcd...wxyz","observed_at_ms":10,"#,
+            r#""accounting_until_ms":9,"code":"submission.accounting_expired","#,
+            r#""chain_outcome":"unknown"}"#
+        );
+        let row: EventKind = serde_json::from_str(golden).unwrap();
+        assert!(matches!(
+            &row,
+            EventKind::SubmissionAccountingExpired { generation: 4, .. }
+        ));
         assert_eq!(serde_json::to_string(&row).unwrap(), golden);
     }
 

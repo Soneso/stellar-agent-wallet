@@ -176,8 +176,9 @@ stellar-agent-toolsets-install = { path = "../stellar-agent-toolsets-install", f
 stellar-agent-mcp = { path = ".", default-features = false, features = ["test-helpers"] }
 stellar-agent-test-support = { path = "../stellar-agent-test-support", features = ["test-helpers"] }
 # test-hooks counts StellarRpcClient constructions, so the tool tests can show
-# which clients a prepare or commit call builds.
-stellar-agent-network = { path = "../stellar-agent-network", features = ["test-loopback", "test-hooks"] }
+# which clients a prepare or commit call builds. test-helpers places window
+# stores at explicit paths in the accounting delivery tests.
+stellar-agent-network = { path = "../stellar-agent-network", features = ["test-loopback", "test-hooks", "test-helpers"] }
 stellar-agent-nonce = { path = "../stellar-agent-nonce", features = ["test-helpers"] }
 # The SEP-10 prepare step, the authorized completion and its signing hooks for
 # the authenticated x402 mainnet tests.

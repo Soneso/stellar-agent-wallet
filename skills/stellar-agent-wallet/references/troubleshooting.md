@@ -440,10 +440,12 @@ whether the submission settled.
 `tx receipt clear --acknowledge` reconciles before it clears. `--acknowledge`
 records the operator's decision; clearing establishes no chain outcome. It
 refuses with `submission.still_pending` while a sent or held transaction's time
-bound is open on this host's clock. On a mainnet profile with an oracle it also asks the
-oracle, and refuses with `submission.not_clearable` when the oracle does not
-report the mainnet passphrase, reports `SUCCESS` or `FAILED`, or cannot
-answer. Without an oracle the endpoint's `FAILED` does not refuse the clear. A failed ledger-time read refuses sent, timed
+bound is open on this host's clock. On mainnet, the verb also asks its
+configured oracle. It refuses with `submission.not_clearable` when the oracle
+cannot answer or does not report the mainnet passphrase. It also refuses
+`SUCCESS`, and `FAILED` for a held reservation. Without an oracle the
+endpoint's `FAILED` does not refuse the clear. A failed ledger-time read
+refuses sent, timed
 submissions with `network.rpc_unreachable`; other failed reconciliation reads
 also refuse. Both are operator conditions: wait, or ask the operator. An
 authenticated hold without a time bound needs `--acknowledge-unbounded` as well

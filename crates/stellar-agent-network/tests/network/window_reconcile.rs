@@ -1152,9 +1152,10 @@ async fn reservations_the_endpoint_cannot_answer_for_do_not_hold_the_budget() {
     );
 }
 
-/// The automatic pass finishes an accounting expiry whose window write failed
-/// after its receipt checkpoint, on the local horizon alone, and keeps the
-/// disposition the checkpoint recorded.
+/// A blocked window commit leaves the receipt untouched. The next automatic
+/// pass commits the expiry on the local horizon alone, its obligation survives
+/// a receipt failure, and a projection-only retry rebuilds the receipt without
+/// another endpoint call or send.
 #[tokio::test]
 #[serial]
 async fn the_automatic_pass_finishes_a_checkpointed_accounting_expiry() {
@@ -1194,11 +1195,14 @@ async fn the_automatic_pass_finishes_a_checkpointed_accounting_expiry() {
         Err(stellar_agent_network::policy_state::WindowStoreError::WriterLocked)
     ));
     let checkpoint = fx.receipts.get(&res.id).unwrap().unwrap();
-    assert_eq!(
-        checkpoint.release_code,
-        Some(ReleaseEvidence::AccountingExpired)
+    assert_eq!(checkpoint.status, ReceiptStatus::Pending);
+    assert_eq!(checkpoint.release_code, None, "no receipt checkpoint");
+    assert!(
+        fx.window
+            .owed_accounting_expiries(&fx.profile)
+            .unwrap()
+            .is_empty()
     );
-    assert_eq!(fx.window_total(now), (0, 0));
     drop(held);
 
     // The horizon has passed on the host clock, so the next pass expires the
@@ -1215,7 +1219,7 @@ async fn the_automatic_pass_finishes_a_checkpointed_accounting_expiry() {
     mount(&server, "getHealth", health(1), &counts).await;
     mount(&server, "getLedgers", ledgers(now / 1_000, 1), &counts).await;
     mount_send_guard(&server, &counts).await;
-    // The durable receipt needs no second write, even while its writer is busy.
+    // The expiry commits even while the receipt writer is busy.
     let held_receipt = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -1237,9 +1241,9 @@ async fn the_automatic_pass_finishes_a_checkpointed_accounting_expiry() {
         .unwrap();
     assert_eq!(report.examined, 1);
     assert_eq!(report.released, 1);
-    assert_eq!(report.receipt_write_failed, 0);
+    assert_eq!(report.receipt_write_failed, 1);
     assert_eq!(report.settled.len(), 1);
-    assert_eq!(report.settled[0].release_code, checkpoint.release_code);
+    let decision_id = report.settled[0].decision_id.clone();
     assert_eq!(fx.receipts.get(&res.id).unwrap().unwrap(), checkpoint);
     assert!(
         fx.window
@@ -1248,6 +1252,36 @@ async fn the_automatic_pass_finishes_a_checkpointed_accounting_expiry() {
             .is_empty()
     );
     assert_eq!(fx.window_total(now), (0, 0));
+    let owed = fx.window.owed_accounting_expiries(&fx.profile).unwrap();
+    assert_eq!(owed.unacknowledged, vec![decision_id.clone()]);
+    assert_eq!(owed.unprojected, vec![decision_id.clone()]);
+    drop(held_receipt);
+
+    let projected = stellar_agent_network::policy_state::project_accounting_expiries(
+        &fx.window,
+        &fx.profile,
+        Some(&fx.receipts),
+    )
+    .unwrap();
+    assert_eq!(projected.projected, 1);
+    let rebuilt = fx.receipts.get(&res.id).unwrap().unwrap();
+    assert_eq!(rebuilt.status, ReceiptStatus::Ambiguous);
+    assert_eq!(
+        rebuilt.release_code,
+        Some(ReleaseEvidence::AccountingExpired)
+    );
+    assert_eq!(
+        rebuilt.settlement_decision_id.as_deref(),
+        Some(decision_id.as_str())
+    );
+    assert_eq!(
+        fx.window
+            .owed_accounting_expiries(&fx.profile)
+            .unwrap()
+            .unacknowledged,
+        vec![decision_id],
+        "the audit event stays owed"
+    );
     assert_eq!(
         counts.count("getTransaction"),
         0,
@@ -2239,20 +2273,9 @@ async fn an_endpoint_failure_survives_a_later_successful_read() {
     );
 }
 
-/// A receipt write is the checkpoint before a reservation can settle.
-async fn assert_receipt_checkpoint(status: &str, missing: bool) {
-    let now = now_ms();
-    let fx = fixture("reconcile-checkpoint");
-    let source = account_id_for_seed([0x36; 32]);
-    let mut res = reservation(&"6a".repeat(32), &source, 1, due_since(now));
-    if status != "SUCCESS" {
-        res.max_time = now / 1000 - 86_401;
-    }
-    fx.take_reservation(now, &res, 500);
-    if missing {
-        std::fs::remove_file(&fx.receipt_file).unwrap();
-    }
-    let before = fx.receipts.get(&res.id).unwrap();
+/// Opens the receipt writer lock so every receipt write refuses until the
+/// returned file is dropped.
+fn hold_receipt_lock(fx: &Fixture) -> std::fs::File {
     let held = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -2260,19 +2283,44 @@ async fn assert_receipt_checkpoint(status: &str, missing: bool) {
         .open(fx.receipts.lock_file_path().unwrap())
         .unwrap();
     held.try_lock().unwrap();
+    held
+}
+
+/// Mounts the endpoint answers one reconciliation pass reads.
+async fn mount_reconcile_answers(
+    server: &MockServer,
+    counts: &MethodCounts,
+    status: &str,
+    now: u64,
+    source: &str,
+) {
+    mount(server, "getTransaction", get_transaction(status), counts).await;
+    mount(server, "getHealth", health(1), counts).await;
+    mount(server, "getLedgers", ledgers(now / 1_000, 1), counts).await;
+    mount(
+        server,
+        "getLedgerEntries",
+        ledger_entries_result_for(&[source]),
+        counts,
+    )
+    .await;
+}
+
+/// A reported success waits for its receipt write before the window records it.
+#[tokio::test]
+#[serial]
+async fn a_success_waits_for_its_receipt_and_retries() {
+    let now = now_ms();
+    let fx = fixture("reconcile-checkpoint");
+    let source = account_id_for_seed([0x36; 32]);
+    let res = reservation(&"6a".repeat(32), &source, 1, due_since(now));
+    fx.take_reservation(now, &res, 500);
+    let before = fx.receipts.get(&res.id).unwrap();
+    let held = hold_receipt_lock(&fx);
 
     let counts = MethodCounts::default();
     let server = MockServer::start().await;
-    mount(&server, "getTransaction", get_transaction(status), &counts).await;
-    mount(&server, "getHealth", health(1), &counts).await;
-    mount(&server, "getLedgers", ledgers(now / 1_000, 1), &counts).await;
-    mount(
-        &server,
-        "getLedgerEntries",
-        ledger_entries_result_for(&[&source]),
-        &counts,
-    )
-    .await;
+    mount_reconcile_answers(&server, &counts, "SUCCESS", now, &source).await;
     let client = StellarRpcClient::new(&server.uri()).unwrap();
     let report = fx
         .window
@@ -2296,47 +2344,114 @@ async fn assert_receipt_checkpoint(status: &str, missing: bool) {
         .await
         .unwrap();
     assert_eq!(retried.receipt_write_failed, 0);
+    assert_eq!(retried.confirmed, 1);
+    assert!(retried.settled.is_empty(), "a success owes no expiry event");
     assert_eq!(
+        fx.receipts.get(&res.id).unwrap().unwrap().status,
+        ReceiptStatus::Success
+    );
+    assert_eq!(fx.window_total(now), (500, 1));
+    assert!(
+        fx.window
+            .owed_accounting_expiries(&fx.profile)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+/// An accounting expiry commits ahead of its receipt projection: a refused
+/// receipt write leaves one committed expiry with one owed identifier, and the
+/// retry projects that identifier without a second expiry.
+async fn assert_expiry_commits_before_projection(missing: bool) {
+    let now = now_ms();
+    let fx = fixture("reconcile-expiry-projection");
+    let source = account_id_for_seed([0x36; 32]);
+    let mut res = reservation(&"6b".repeat(32), &source, 1, due_since(now));
+    res.max_time = now / 1000 - 86_401;
+    fx.take_reservation(now, &res, 500);
+    if missing {
+        std::fs::remove_file(&fx.receipt_file).unwrap();
+    }
+    let before = fx.receipts.get(&res.id).unwrap();
+    let held = hold_receipt_lock(&fx);
+
+    let counts = MethodCounts::default();
+    let server = MockServer::start().await;
+    mount_reconcile_answers(&server, &counts, "NOT_FOUND", now, &source).await;
+    mount_send_guard(&server, &counts).await;
+    let client = StellarRpcClient::new(&server.uri()).unwrap();
+    let report = fx
+        .window
+        .reconcile_one(&fx.profile, &client, None, Some(&fx.receipts), &res.id, now)
+        .await
+        .unwrap();
+    assert_eq!(report.released, 1, "{report:?}");
+    assert_eq!(report.receipt_write_failed, 1, "{report:?}");
+    let [settled] = report.settled.as_slice() else {
+        panic!("one committed expiry: {report:?}");
+    };
+    assert!(
         fx.window
             .pending_reservations(&fx.profile)
             .unwrap()
-            .is_empty(),
-        status != "SUCCESS"
+            .is_empty()
     );
+    assert_eq!(fx.window_total(now), (0, 0));
+    assert_eq!(fx.receipts.get(&res.id).unwrap(), before);
+    let owed = fx.window.owed_accounting_expiries(&fx.profile).unwrap();
+    assert_eq!(owed.unacknowledged, vec![settled.decision_id.clone()]);
+    assert_eq!(owed.unprojected, vec![settled.decision_id.clone()]);
+    drop(held);
+
+    let retried = fx
+        .window
+        .reconcile_due(
+            &fx.profile,
+            &client,
+            None,
+            Some(&fx.receipts),
+            now,
+            RECONCILE_BUDGET,
+        )
+        .await
+        .unwrap();
+    assert_eq!(retried.released, 0, "no second expiry: {retried:?}");
+    let projected = stellar_agent_network::policy_state::project_accounting_expiries(
+        &fx.window,
+        &fx.profile,
+        Some(&fx.receipts),
+    )
+    .unwrap();
+    assert_eq!(projected.projected, 1);
     let receipt = fx.receipts.get(&res.id).unwrap().unwrap();
-    if status == "SUCCESS" {
-        assert_eq!(retried.confirmed, 1);
-        assert_eq!(receipt.status, ReceiptStatus::Success);
-        assert_eq!(fx.window_total(now), (500, 1));
-    } else {
-        assert_eq!(retried.released, 1);
-        assert_eq!(receipt.status, ReceiptStatus::Ambiguous);
-        assert_eq!(
-            receipt.release_code,
-            Some(ReleaseEvidence::AccountingExpired)
-        );
-    }
+    assert_eq!(receipt.status, ReceiptStatus::Ambiguous);
+    assert_eq!(
+        receipt.release_code,
+        Some(ReleaseEvidence::AccountingExpired)
+    );
+    assert_eq!(
+        receipt.settlement_decision_id.as_deref(),
+        Some(settled.decision_id.as_str())
+    );
+    let owed = fx.window.owed_accounting_expiries(&fx.profile).unwrap();
+    assert_eq!(owed.unacknowledged, vec![settled.decision_id.clone()]);
+    assert!(owed.unprojected.is_empty());
+    assert_eq!(counts.count("sendTransaction"), 0);
 }
 
-/// An accounting expiry retries its receipt checkpoint before it ends the hold.
+/// An accounting expiry commits before its receipt write, which then retries.
 #[tokio::test]
 #[serial]
-async fn an_accounting_expiry_waits_for_its_receipt_and_retries() {
-    assert_receipt_checkpoint("NOT_FOUND", false).await;
+async fn an_accounting_expiry_commits_before_its_receipt_and_retries() {
+    assert_expiry_commits_before_projection(false).await;
 }
 
-/// A reported success retries its receipt checkpoint before it is recorded.
+/// A missing receipt cannot prevent an accounting expiry or lose its owed
+/// event; the projection rebuilds the receipt from the committed record.
 #[tokio::test]
 #[serial]
-async fn a_success_waits_for_its_receipt_and_retries() {
-    assert_receipt_checkpoint("SUCCESS", false).await;
-}
-
-/// An orphan's accounting expiry waits for a durable reconstructed receipt.
-#[tokio::test]
-#[serial]
-async fn a_missing_receipt_must_be_restored_before_accounting_expiry() {
-    assert_receipt_checkpoint("NOT_FOUND", true).await;
+async fn a_missing_receipt_is_rebuilt_after_accounting_expiry() {
+    assert_expiry_commits_before_projection(true).await;
 }
 
 // ── Confirmed spend is never dated before its reservation ────────────────
@@ -2481,6 +2596,181 @@ fn forge_released_receipt(fx: &Fixture, id: &str, release_code: &str) {
         forged.release_code.map(ReleaseEvidence::code),
         Some(release_code)
     );
+}
+
+/// The accounting-expiry decision identifier, encoded independently of the
+/// production helper: SHA-256 over the label, the length-prefixed CAIP-2
+/// chain, the passphrase hash, the length-prefixed reservation, the big-endian
+/// generation and the length-prefixed disposition.
+fn expected_decision_id(
+    chain: &str,
+    passphrase: &str,
+    reservation: &str,
+    generation: u64,
+) -> String {
+    use sha2::{Digest, Sha256};
+    let prefixed = |digest: &mut Sha256, bytes: &[u8]| {
+        digest.update(u32::try_from(bytes.len()).unwrap().to_be_bytes());
+        digest.update(bytes);
+    };
+    let mut digest = Sha256::new();
+    digest.update(b"stellar-agent-accounting-expiry:v1");
+    prefixed(&mut digest, chain.as_bytes());
+    digest.update(Sha256::digest(passphrase.as_bytes()));
+    prefixed(&mut digest, reservation.as_bytes());
+    digest.update(generation.to_be_bytes());
+    prefixed(&mut digest, b"accounting_expired");
+    digest
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// The identifier encoding is pinned by one known-answer vector.
+#[test]
+fn the_decision_id_encoding_has_a_known_answer() {
+    assert_eq!(
+        expected_decision_id("stellar:testnet", TESTNET_PASSPHRASE, &"ab".repeat(32), 7),
+        "c9118296dcb79eefe2dadabf09d0ef8f0037e10aa9bcd08aa5ee8687f1541b93"
+    );
+}
+
+/// A forged release code yields no audit event of its own: genuine accounting
+/// expiry commits its decision, delivery appends exactly one verified
+/// `submission_accounting_expired` row under the authenticated identifier, and
+/// the projection overwrites the forged code with the accounting code.
+#[tokio::test]
+#[serial]
+#[cfg(feature = "test-hooks")]
+async fn authentic_decision_overrides_forged_release_code() {
+    use base64::Engine as _;
+    use stellar_agent_core::audit_log::{AuditWriter, EventKind};
+
+    let now = now_ms();
+    let _clock = stellar_agent_network::mainnet::clock::set_now_ms_for_test(now);
+    let mut fx = fixture("reconcile-authentic-expiry");
+    let audit_path = fx._dir.path().join("audit").join("log.jsonl");
+    fx.profile.audit_log_path = audit_path.clone();
+    let coordinate = &fx.profile.audit_log_hash_chain_key_id;
+    keyring_core::Entry::new(&coordinate.service, &coordinate.account)
+        .unwrap()
+        .set_password(&base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([5_u8; 32]))
+        .unwrap();
+    let source = account_id_for_seed([0x19; 32]);
+    let mut res = reservation(&"ad".repeat(32), &source, 7, due_since(now));
+    res.max_time = now / 1_000 - 86_401;
+    fx.take_reservation(now, &res, 500);
+    forge_released_receipt(&fx, &res.id, "submission.sequence_consumed");
+
+    let counts = MethodCounts::default();
+    let server = MockServer::start().await;
+    mount_reconcile_answers(&server, &counts, "NOT_FOUND", now, &source).await;
+    mount_send_guard(&server, &counts).await;
+    let client = StellarRpcClient::new(&server.uri()).unwrap();
+    let report = fx
+        .window
+        .reconcile_due(
+            &fx.profile,
+            &client,
+            None,
+            Some(&fx.receipts),
+            now,
+            RECONCILE_BUDGET,
+        )
+        .await
+        .unwrap();
+    assert_eq!(report.released, 1, "{report:?}");
+    let [settled] = report.settled.as_slice() else {
+        panic!("one committed expiry: {report:?}");
+    };
+
+    let access = stellar_agent_network::keyring::keyed_audit_access(
+        &fx.profile,
+        &fx.profile_name,
+        stellar_agent_core::audit_log::BindingCheck::Enforce,
+    )
+    .unwrap();
+    let mut writer = AuditWriter::open(audit_path.clone(), Some(access)).unwrap();
+    let delivered = stellar_agent_network::policy_state::deliver_accounting_expiries(
+        &mut writer,
+        &fx.window,
+        &fx.profile,
+        &fx.profile_name,
+        Some(&fx.receipts),
+    )
+    .unwrap();
+    assert_eq!(delivered.appended, 1, "{delivered:?}");
+    assert_eq!(delivered.acknowledged, 1, "{delivered:?}");
+    drop(writer);
+
+    let entries =
+        stellar_agent_core::audit_log::test_helpers::verified_audit_entries_from_path(&audit_path);
+    let expiries: Vec<_> = entries
+        .iter()
+        .filter(|entry| {
+            matches!(
+                entry.event_kind,
+                EventKind::SubmissionAccountingExpired { .. }
+            )
+        })
+        .collect();
+    let [row] = expiries.as_slice() else {
+        panic!("exactly one verified expiry row: {entries:?}");
+    };
+    let EventKind::SubmissionAccountingExpired {
+        decision_id,
+        generation,
+        observed_at_ms,
+        accounting_until_ms,
+        code,
+        chain_outcome,
+        ..
+    } = &row.event_kind
+    else {
+        unreachable!("filtered on the kind");
+    };
+    assert_eq!(row.envelope_hash.as_deref(), Some(res.id.as_str()));
+    assert_eq!(code, "submission.accounting_expired");
+    assert_eq!(chain_outcome, "unknown");
+    assert_eq!(decision_id, &settled.decision_id);
+    assert_eq!(
+        decision_id,
+        &expected_decision_id("stellar:testnet", TESTNET_PASSPHRASE, &res.id, *generation)
+    );
+    assert_eq!(*observed_at_ms, now);
+    assert_eq!(*accounting_until_ms, res.max_time * 1_000 + 86_400_000);
+    assert!(
+        entries.iter().all(|entry| !matches!(
+            entry.event_kind,
+            EventKind::ValueActionFailed { .. } | EventKind::ValueActionSubmitted { .. }
+        )),
+        "no outcome row is written"
+    );
+
+    let receipt = fx.receipts.get(&res.id).unwrap().unwrap();
+    assert_eq!(receipt.status, ReceiptStatus::Ambiguous);
+    assert_eq!(
+        receipt.release_code,
+        Some(ReleaseEvidence::AccountingExpired)
+    );
+    assert_eq!(
+        receipt.settlement_decision_id.as_deref(),
+        Some(decision_id.as_str())
+    );
+    assert!(
+        fx.window
+            .pending_reservations(&fx.profile)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        fx.window
+            .owed_accounting_expiries(&fx.profile)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(counts.count("sendTransaction"), 0);
 }
 
 /// A receipt edited to claim a release releases nothing: the pass asks the

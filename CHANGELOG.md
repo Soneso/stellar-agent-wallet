@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `submission_accounting_expired` audit event and the
+  `submission.settlement_unverifiable` code.
+
+- `audit_log::reader::audit_history_refusal` reports an unreadable retained
+  history as `audit.chain_key_unavailable`, with the integrity code at the
+  head of the detail.
+
 - `rule_approval_spent_entry_ref`, `RuleApprovalSpentStore`, and
   `KeyringRuleApprovalSpentStore` provide the protected record of spent rule
   approvals. `approval.spent_record_unavailable` reports an unusable record.
@@ -156,6 +163,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reports a clear row with the unbounded acknowledgement and the release.
 
 ### Changed
+
+- `pool init --resume` keeps an attempt the endpoint reports as failed.
+  `pool status` names `tx receipt clear --acknowledge`, and resume retries with
+  the same keys after the clear.
+
+- `SettledSubmission` carries `decision_id` in place of `status`,
+  `release_code` and `ledger`. `SubmissionReceipt` gains
+  `settlement_decision_id`.
+
+- A window snapshot carrying an accounting expiry record uses wire version 8,
+  which older builds refuse.
+
+- `tx status` and `stellar_transaction_status` acquire the audit writer only
+  to deliver an unacknowledged accounting event. An unavailable writer leaves
+  the event owed and logs the refusal at WARN; the answer still renders.
+
+- On mainnet, an oracle `FAILED` answer refuses `tx receipt clear` only for a
+  held reservation.
 
 - `Decision::Approve` carries the view digest the approving page rendered
   (`shown_view_digest`). The local inbox's approve request and the remote
@@ -725,6 +750,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Removed
 
+- `SettledRow` and `ReceiptStatus::settled_row`.
+
 - `compute_context_rule_proposal_sha256`, `compute_rule_proposal_digest` and
   `RULE_PROPOSAL_DOMAIN_TAG`; `rule_proposal_digest` replaces them.
 
@@ -756,6 +783,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Timelock signing validates SourceAccount invocation trees and refuses unsupported
   credential variants before any auth or envelope signature is produced.
+
+- Receipt contents authorize no settlement audit rows. Accounting expiry
+  persists a durable audit obligation with its accounting transition. Verified
+  recovery delivers each obligation once per decision identifier in the
+  retained audit history.
+
+- Receipt status is display data, with settlement evidence marked unavailable.
 
 - An approval on the local or remote inbox attests the request its page showed.
   The page carries a digest of the request, and approval refuses with
