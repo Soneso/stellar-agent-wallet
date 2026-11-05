@@ -219,6 +219,10 @@ fn presence_challenge_binds_every_consent_field() {
         expires: 65_000,
     };
     assert_eq!(
+        crate::hex::encode(&approval_view_digest(&entry, &binding()).unwrap()),
+        "222d207e1cb41099b23a312cc11e9c98e7b6769a24379f64b84441cddb3f0120"
+    );
+    assert_eq!(
         crate::hex::encode(&base.challenge()),
         "2f60f36c17ce1bc6a6eaac0cbc5062b3afed68c1d91ec7a434723e8f805d35a4"
     );

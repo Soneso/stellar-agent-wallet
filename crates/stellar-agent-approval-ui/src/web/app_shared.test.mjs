@@ -482,3 +482,97 @@ for (const [name, attributes] of [
     assert.equal(page.fetches.length, 0);
   });
 }
+
+const VIEW_DIGEST = "ab".repeat(32);
+const CHANGED = {
+  error: "approval.presence_changed",
+  message: "The consent details have changed; reload the approval page and review them again.",
+};
+
+function digestDetailPage(reply) {
+  const page = browser({
+    islands: {
+      "approval-data": {
+        nonce: "NONCE", csrf: "c".repeat(64), activity_csrf: "d".repeat(64),
+        approvable: true, view_digest: VIEW_DIGEST,
+      },
+    },
+    elements: ["approve-btn", "reject-btn", "result"],
+    storage: { [INBOX_PROOF_KEY]: PROOF },
+    reply,
+  });
+  page.run("./app_shared.js");
+  page.run("./app.js");
+  return page;
+}
+
+function remoteDetailPage(reply) {
+  const page = browser({
+    islands: {
+      "approval-data": { nonce: "NONCE", csrf: "c".repeat(64), approvable: true, view_digest: VIEW_DIGEST },
+    },
+    elements: ["approve-btn", "reject-btn", "result"],
+    reply,
+    credential: () => { throw new Error("no passkey is asked for in this test"); },
+  });
+  page.run("./app_shared.js");
+  page.run("../../../stellar-agent-approval-remote/src/web/app.js");
+  return page;
+}
+
+test("the loopback approve posts the island digest", () => {
+  const page = digestDetailPage();
+  page.byId["approve-btn"].listeners.click[0]();
+  assert.equal(page.fetches.length, 1);
+  const { url, init } = page.fetches[0];
+  assert.equal(url, "/approval/NONCE/approve");
+  assert.equal(init.headers["Content-Type"], "application/json");
+  assert.deepEqual(JSON.parse(init.body), { view_digest: VIEW_DIGEST });
+});
+
+test("the remote approve posts it to the challenge route", () => {
+  const page = remoteDetailPage(() => new Promise(() => {}));
+  page.byId["approve-btn"].listeners.click[0]();
+  assert.equal(page.fetches.length, 1);
+  const { url, init } = page.fetches[0];
+  assert.equal(url, "/approval/NONCE/challenge");
+  assert.equal(init.method, "POST");
+  assert.equal(init.headers["content-type"], "application/json");
+  assert.equal(init.headers["x-stellar-remote-approval-csrf"], "c".repeat(64));
+  assert.deepEqual(JSON.parse(init.body), { view_digest: VIEW_DIGEST });
+});
+
+test("a reject posts no digest", () => {
+  const local = digestDetailPage();
+  local.byId["reject-btn"].listeners.click[0]();
+  assert.equal(local.fetches[0].url, "/approval/NONCE/reject");
+  assert.equal(local.fetches[0].init.body, undefined);
+  const remote = remoteDetailPage(() => new Promise(() => {}));
+  remote.byId["reject-btn"].listeners.click[0]();
+  assert.equal(remote.fetches[0].url, "/approval/NONCE/challenge");
+  assert.equal(remote.fetches[0].init.body, undefined);
+});
+
+test("a refusal shows its code and message", async () => {
+  const page = digestDetailPage(() => jsonReply(409, CHANGED));
+  page.byId["approve-btn"].listeners.click[0]();
+  const result = page.byId.result;
+  await until(() => result.children.length === 2, "the refusal");
+  assert.equal(result.className, "result refused");
+  assert.equal(result.children[0].textContent, "Not recorded: approval.presence_changed");
+  assert.equal(result.children[1].textContent, CHANGED.message);
+  assert.equal(page.documentElement.attributes["data-state"], "error");
+});
+
+test("a refused challenge asks for no passkey", async () => {
+  const page = remoteDetailPage(() => jsonReply(409, CHANGED));
+  page.byId["approve-btn"].listeners.click[0]();
+  const result = page.byId.result;
+  await until(() => result.children.length === 2, "the refusal");
+  assert.equal(page.credentialCalls.length, 0);
+  assert.equal(page.fetches.length, 1, "no decision is posted");
+  assert.equal(result.className, "result refused");
+  assert.equal(result.children[0].textContent, "Not recorded: approval.presence_changed");
+  assert.equal(result.children[1].textContent, CHANGED.message);
+  assert.equal(page.documentElement.attributes["data-state"], "error");
+});

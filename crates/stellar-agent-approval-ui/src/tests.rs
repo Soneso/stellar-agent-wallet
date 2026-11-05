@@ -38,8 +38,8 @@ use tower::ServiceExt as _;
 use stellar_agent_core::approval::AttestedApprover;
 use stellar_agent_core::approval::attestation::{compute_attestation_v4, verify_attestation};
 use stellar_agent_core::approval::{
-    ApprovalKind, DEFAULT_TTL_MS, PendingApproval, PendingApprovalStore, decode_sha256_hex,
-    fixtures, process_uid_for_attestation,
+    ApprovalKind, DEFAULT_TTL_MS, PendingApproval, PendingApprovalStore, approval_view_digest,
+    decode_sha256_hex, fixtures, process_uid_for_attestation,
 };
 use stellar_agent_core::audit_log::writer::AuditWriter;
 use stellar_agent_core::profile::schema::KeyringEntryRef;
@@ -51,6 +51,19 @@ use crate::auth::{
 };
 use crate::decision::DecisionContext;
 use crate::{PageIdentity, ServeConfig, ServeStartError, ServeState, build_router, start_serve};
+
+/// The approve body a freshly loaded detail page sends: the view digest of
+/// the entry the store holds for `nonce` now, or `null` when the page would
+/// carry none. `the_detail_page_carries_the_digest_of_the_entry_it_renders`
+/// pins that the page carries exactly this value.
+pub(crate) fn view_digest_body_for(ctx: &DecisionContext, nonce: &str) -> Body {
+    let store = PendingApprovalStore::open(ctx.store_path.clone()).unwrap();
+    let digest = store
+        .get(nonce)
+        .and_then(|entry| approval_view_digest(entry, &ctx.context.binding()).ok())
+        .map(|digest| stellar_agent_core::hex::encode(&digest));
+    Body::from(serde_json::json!({ "view_digest": digest }).to_string())
+}
 
 const BOUND: &str = "127.0.0.1:8080";
 const HOST: &str = "127.0.0.1:8080";
@@ -126,6 +139,12 @@ impl Harness {
     pub(crate) fn router(&self) -> Router {
         let bound: SocketAddr = BOUND.parse().unwrap();
         build_router(self.state.clone(), bound)
+    }
+
+    /// The body the detail page's approve sends for `nonce` (see
+    /// [`view_digest_body_for`]).
+    pub(crate) fn view_digest_body(&self, nonce: &str) -> Body {
+        view_digest_body_for(&self.state.ctx, nonce)
     }
 
     pub(crate) fn insert(&self, entry: PendingApproval) -> String {
@@ -302,7 +321,7 @@ async fn post_without_origin_is_403() {
         .header(header::COOKIE, &cookie)
         .header("x-stellar-approval-csrf", csrf)
         .header("x-session-proof", h.proof())
-        .body(Body::empty())
+        .body(h.view_digest_body(&nonce))
         .unwrap();
     let resp = h.router().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
@@ -322,7 +341,7 @@ async fn post_with_missing_or_wrong_csrf_is_403_and_does_not_mutate() {
         .header(header::HOST, HOST)
         .header(header::ORIGIN, ORIGIN)
         .header(header::COOKIE, &cookie)
-        .body(Body::empty())
+        .body(h.view_digest_body(&nonce))
         .unwrap();
     let resp = h.router().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
@@ -378,7 +397,7 @@ async fn approve_payment_mints_verifiable_attestation() {
         .header(header::COOKIE, &cookie)
         .header("x-stellar-approval-csrf", csrf)
         .header("x-session-proof", h.proof())
-        .body(Body::empty())
+        .body(h.view_digest_body(&nonce))
         .unwrap();
     let resp = h.router().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -456,7 +475,7 @@ async fn serve_trustline_json_returns_attestation() {
         .header(header::COOKIE, &cookie)
         .header("x-stellar-approval-csrf", csrf)
         .header("x-session-proof", h.proof())
-        .body(Body::empty())
+        .body(h.view_digest_body(&nonce))
         .unwrap();
     let resp = h.router().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -550,7 +569,7 @@ async fn second_approve_is_idempotent_already_resolved() {
             .header(header::COOKIE, &cookie)
             .header("x-stellar-approval-csrf", &csrf)
             .header("x-session-proof", h.proof())
-            .body(Body::empty())
+            .body(h.view_digest_body(&nonce))
             .unwrap()
     };
 
@@ -582,7 +601,7 @@ async fn approve_expired_entry_reports_expired() {
         .header(header::COOKIE, &cookie)
         .header("x-stellar-approval-csrf", csrf)
         .header("x-session-proof", h.proof())
-        .body(Body::empty())
+        .body(h.view_digest_body(&nonce))
         .unwrap();
     let resp = h.router().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -619,7 +638,7 @@ async fn approve_foreign_process_uid_reports_user_mismatch() {
         .header(header::COOKIE, &cookie)
         .header("x-stellar-approval-csrf", csrf)
         .header("x-session-proof", h.proof())
-        .body(Body::empty())
+        .body(h.view_digest_body(&nonce))
         .unwrap();
     let resp = h.router().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -730,6 +749,7 @@ async fn approve_when_store_locked_returns_503_busy() {
     let cookie = h.bootstrap().await;
     let nonce = h.insert(payment_entry(DEFAULT_TTL_MS));
     let csrf = h.csrf_for(&nonce);
+    let body = h.view_digest_body(&nonce);
 
     // Hold the store lock for the whole request so open_with_retry exhausts.
     let _holder = PendingApprovalStore::open(h.store_path.clone()).unwrap();
@@ -742,7 +762,7 @@ async fn approve_when_store_locked_returns_503_busy() {
         .header(header::COOKIE, &cookie)
         .header("x-stellar-approval-csrf", csrf)
         .header("x-session-proof", h.proof())
-        .body(Body::empty())
+        .body(body)
         .unwrap();
     let resp = h.router().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
@@ -1258,7 +1278,7 @@ async fn detail_page_reshows_attestation_after_approve() {
         .header(header::COOKIE, &cookie)
         .header("x-stellar-approval-csrf", csrf)
         .header("x-session-proof", h.proof())
-        .body(Body::empty())
+        .body(h.view_digest_body(&nonce))
         .unwrap();
     let approve_resp = h.router().oneshot(approve_req).await.unwrap();
     let attestation = body_json(approve_resp).await["attestation"]
@@ -1428,7 +1448,7 @@ async fn approve_toolset_first_invoke_gate_via_router_returns_grant_active() {
         .header(header::COOKIE, &cookie)
         .header("x-stellar-approval-csrf", csrf)
         .header("x-session-proof", h.proof())
-        .body(Body::empty())
+        .body(h.view_digest_body(&nonce))
         .unwrap();
     let resp = h.router().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -1451,7 +1471,7 @@ async fn approve_unknown_nonce_via_router_returns_not_found_status() {
         .header(header::COOKIE, &cookie)
         .header("x-stellar-approval-csrf", csrf)
         .header("x-session-proof", h.proof())
-        .body(Body::empty())
+        .body(h.view_digest_body(&nonce))
         .unwrap();
     let resp = h.router().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -1485,7 +1505,7 @@ async fn approve_sign_with_passkey_via_router_returns_wrong_kind_status() {
         .header(header::COOKIE, &cookie)
         .header("x-stellar-approval-csrf", csrf)
         .header("x-session-proof", h.proof())
-        .body(Body::empty())
+        .body(h.view_digest_body(&nonce))
         .unwrap();
     let resp = h.router().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -1573,7 +1593,7 @@ async fn approve_with_unseeded_keyring_returns_unavailable_status() {
         .header(header::COOKIE, &cookie)
         .header("x-stellar-approval-csrf", csrf)
         .header("x-session-proof", &proof)
-        .body(Body::empty())
+        .body(view_digest_body_for(&state.ctx, &nonce))
         .unwrap();
     let approve_resp = router.oneshot(approve_req).await.unwrap();
     assert_eq!(approve_resp.status(), StatusCode::SERVICE_UNAVAILABLE);
@@ -1818,17 +1838,16 @@ async fn cookie_and_csrf_without_proof_cannot_mutate() {
         assert!(entry.attestation_blob_b64.is_none());
     }
 
-    // The same request with the proof is the operator's and goes through.
-    let resp = h
-        .router()
-        .oneshot(mutation(
-            &format!("/approval/{nonce}/approve"),
-            &cookie,
-            Some(&csrf),
-            Some(&h.proof()),
-        ))
-        .await
-        .unwrap();
+    // The same request with the proof, and the digest the page carries, is
+    // the operator's and goes through.
+    let mut approve = mutation(
+        &format!("/approval/{nonce}/approve"),
+        &cookie,
+        Some(&csrf),
+        Some(&h.proof()),
+    );
+    *approve.body_mut() = h.view_digest_body(&nonce);
+    let resp = h.router().oneshot(approve).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(body_json(resp).await["status"], "attested");
 }
@@ -2267,4 +2286,216 @@ async fn bootstrap_trace_redacts_token() {
         assert!(!line.contains(&nonce), "nonce in trace: {line}");
         assert!(!line.contains(&proof), "proof in trace: {line}");
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// What the page showed
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The `#approval-data` island of the detail page of `nonce`.
+async fn detail_island(h: &Harness, cookie: &str, nonce: &str) -> serde_json::Value {
+    let req = Request::builder()
+        .uri(format!("/approval/{nonce}"))
+        .header(header::HOST, HOST)
+        .header(header::COOKIE, cookie)
+        .body(Body::empty())
+        .unwrap();
+    let resp = h.router().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = to_bytes(resp.into_body(), 256 * 1024).await.unwrap();
+    json_island(std::str::from_utf8(&bytes).unwrap(), "approval-data")
+}
+
+/// Posts an approve of `nonce` with `body`.
+async fn post_approve(
+    h: &Harness,
+    cookie: &str,
+    nonce: &str,
+    body: impl Into<Body>,
+) -> axum::response::Response {
+    let req = Request::builder()
+        .method("POST")
+        .uri(format!("/approval/{nonce}/approve"))
+        .header(header::HOST, HOST)
+        .header(header::ORIGIN, ORIGIN)
+        .header(header::COOKIE, cookie)
+        .header("x-stellar-approval-csrf", h.csrf_for(nonce))
+        .header("x-session-proof", h.proof())
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(body.into())
+        .unwrap();
+    h.router().oneshot(req).await.unwrap()
+}
+
+fn digest_body(digest: &serde_json::Value) -> String {
+    serde_json::json!({ "view_digest": digest }).to_string()
+}
+
+async fn assert_presence_changed(resp: axum::response::Response) {
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    let json = body_json(resp).await;
+    assert_eq!(json["error"], "approval.presence_changed");
+    assert_eq!(
+        json["message"],
+        "The consent details have changed; reload the approval page and review them again."
+    );
+}
+
+fn assert_unattested(h: &Harness, nonce: &str) {
+    let store = PendingApprovalStore::open(h.store_path.clone()).unwrap();
+    assert!(store.get(nonce).unwrap().attestation_blob_b64.is_none());
+    drop(store);
+    let log = h.audit_bytes().unwrap_or_default();
+    assert!(
+        !String::from_utf8_lossy(&log).contains(r#""kind":"approval_attested""#),
+        "no consent row"
+    );
+}
+
+fn rule_entry(name_suffix: &str) -> PendingApproval {
+    let mut definition = fixtures::rule_proposal_snapshot();
+    definition.name.push_str(name_suffix);
+    PendingApproval::new_rule_proposal_pending(
+        "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+        stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE.to_owned(),
+        "stellar:testnet".to_owned(),
+        definition,
+        "fixture summary".to_owned(),
+        uid(),
+        DEFAULT_TTL_MS,
+    )
+    .unwrap()
+}
+
+/// The detail page carries the view digest of the entry it renders, and
+/// none for an entry no surface can approve.
+#[tokio::test]
+#[serial]
+async fn the_detail_page_carries_the_digest_of_the_entry_it_renders() {
+    let h = Harness::new("page-digest");
+    let cookie = h.bootstrap().await;
+    let entry = payment_entry(DEFAULT_TTL_MS);
+    let expected = approval_view_digest(&entry, &h.state.ctx.context.binding()).unwrap();
+    let nonce = h.insert(entry);
+    let island = detail_island(&h, &cookie, &nonce).await;
+    assert_eq!(island["approvable"], true);
+    assert_eq!(
+        island["view_digest"],
+        stellar_agent_core::hex::encode(&expected)
+    );
+
+    let mut inconsistent = payment_entry(DEFAULT_TTL_MS);
+    let ApprovalKind::PaymentSimulated {
+        envelope_xdr_b64, ..
+    } = &mut inconsistent.kind
+    else {
+        unreachable!()
+    };
+    *envelope_xdr_b64 = fixtures::payment_envelope(SOURCE_G, SOURCE_G, "XLM", 9, None, 100, 1);
+    let nonce = h.insert(inconsistent);
+    let island = detail_island(&h, &cookie, &nonce).await;
+    assert_eq!(island["view_digest"], serde_json::Value::Null);
+
+    let nonce = h.insert(payment_entry(1));
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    let island = detail_island(&h, &cookie, &nonce).await;
+    assert_eq!(island["approvable"], false);
+    assert_eq!(island["view_digest"], serde_json::Value::Null);
+}
+
+/// The page renders one request, a same-user writer swaps in another valid
+/// one, and the approve the page sends refuses and attests nothing. A
+/// reload renders the current request, and its approve attests that one.
+#[tokio::test]
+#[serial]
+async fn an_entry_swapped_after_the_page_loaded_is_not_attested() {
+    let payment_d1 = fixtures::payment_pending(
+        SOURCE_G,
+        DEST_G,
+        "XLM",
+        90_000_000,
+        None,
+        100,
+        1_234_567,
+        uid(),
+        DEFAULT_TTL_MS,
+    );
+    for (kind, d2, mut d1) in [
+        ("payment", payment_entry(DEFAULT_TTL_MS), payment_d1),
+        ("rule", rule_entry(""), rule_entry("-other")),
+    ] {
+        let h = Harness::new(&format!("page-swap-{kind}"));
+        let cookie = h.bootstrap().await;
+        let nonce = h.insert(d2);
+        let shown = detail_island(&h, &cookie, &nonce).await["view_digest"].clone();
+        assert!(shown.is_string(), "{kind}");
+
+        d1.approval_nonce.clone_from(&nonce);
+        {
+            let mut store = PendingApprovalStore::open(h.store_path.clone()).unwrap();
+            assert!(store.remove(&nonce).unwrap());
+            store
+                .insert(d1.clone(), timefmt::now_unix_ms().unwrap())
+                .unwrap();
+        }
+        let resp = post_approve(&h, &cookie, &nonce, digest_body(&shown)).await;
+        assert_presence_changed(resp).await;
+        assert_unattested(&h, &nonce);
+
+        let reloaded = detail_island(&h, &cookie, &nonce).await["view_digest"].clone();
+        assert_ne!(
+            reloaded, shown,
+            "{kind}: the reload renders the current entry"
+        );
+        let resp = post_approve(&h, &cookie, &nonce, digest_body(&reloaded)).await;
+        assert_eq!(resp.status(), StatusCode::OK, "{kind}");
+        let json = body_json(resp).await;
+        assert_eq!(json["status"], "attested", "{kind}");
+        let blob: [u8; 32] = URL_SAFE_NO_PAD
+            .decode(json["attestation"].as_str().unwrap())
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let binding = h.state.ctx.context.binding();
+        let expected = compute_attestation_v4(
+            &h.raw_key,
+            &binding,
+            &nonce,
+            &stellar_agent_core::approval::approval_view_subject(&d1, &binding).unwrap(),
+            &d1.process_uid,
+            &d1.attested_lifetime(),
+            &AttestedApprover::Local,
+        );
+        assert_eq!(
+            blob, expected,
+            "{kind}: the attestation binds the reloaded entry"
+        );
+    }
+}
+
+/// An approve without a well-formed digest of the current entry refuses.
+#[tokio::test]
+#[serial]
+async fn a_missing_or_malformed_view_digest_refuses() {
+    let h = Harness::new("malformed-digest");
+    let cookie = h.bootstrap().await;
+    let nonce = h.insert(payment_entry(DEFAULT_TTL_MS));
+    let shown = detail_island(&h, &cookie, &nonce).await["view_digest"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    for body in [
+        String::new(),
+        "{}".to_owned(),
+        r#"{"view_digest":null}"#.to_owned(),
+        format!(r#"{{"view_digest":"{}"}}"#, "zz".repeat(32)),
+        format!(r#"{{"view_digest":"{}"}}"#, &shown[..63]),
+        format!(r#"{{"view_digest":"{shown}","nonce":"{nonce}"}}"#),
+    ] {
+        let resp = post_approve(&h, &cookie, &nonce, body.clone()).await;
+        assert_presence_changed(resp).await;
+        assert_unattested(&h, &nonce);
+    }
+    let resp = post_approve(&h, &cookie, &nonce, digest_body(&shown.into())).await;
+    assert_eq!(body_json(resp).await["status"], "attested");
 }

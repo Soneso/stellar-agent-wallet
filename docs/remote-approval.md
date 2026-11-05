@@ -16,8 +16,10 @@ runs on a headless host or a different machine than the one you carry around.
 The wallet host mints an attestation under the serving profile name and CAIP-2 chain id.
 The shared HMAC also binds the pending nonce, digest, and process uid.
 The detail page shows the profile, network, endpoint authority, and enrolled signer above the request summary.
-Summary rows render challenge-bound entry data. Header rows come from the serving profile and are not challenge-bound.
+Summary rows render challenge-bound entry data. Header rows come from the serving profile. The profile and network rows are inputs of the view digest the challenge covers; the endpoint authority and enrolled signer rows are display context.
 A payment, claim, or trustline summary is decoded from the transaction envelope whose digest the challenge and the attestation bind, so the page shows the transaction an approval signs.
+The detail page carries a digest of the request it renders: its terms, nonce, requester, lifetime, profile, and network. Approve sends that digest when it asks for a challenge. The listener mints a challenge only while the digest names the current pending request, and the challenge is derived over it, so the passkey assertion commits to the request the page showed. The approval gate compares the same digest with the request it attests.
+A request that changed after the page loaded is refused with HTTP 409 `approval.presence_changed` before any passkey prompt, or at the decision when it changed after the prompt, and nothing is attested. Reload the page to review the current request.
 Every summary value renders control characters as visible escapes such as `\u{1b}` and `\u{202e}`.
 Memos retain their type: `none`, `text "<escaped value>"`, `id <n>`, `hash <hex>`, or `return <hex>`.
 MPP terms and the network are checked against the authorization fingerprint before display or attestation; the charge commit checks the transport, authority, and target against the prepared request.
@@ -237,8 +239,8 @@ approval, names another `rp_id` or another chain, or cannot be read.
 - **A passkey prompt on every approve or reject is intentional**, not a bug to
   route around. The per-action ceremony is what makes what-you-see-is-what-you-sign
   real for a network-exposed surface: the challenge is bound to the entry you
-  are looking at, so an assertion produced for one entry can never be replayed
-  to authorize a different one.
+  are looking at and to the terms the page shows, so an assertion produced for
+  one entry can never be replayed to authorize a different one or other terms.
 - **The pre-authentication login endpoint is rate-limited** by an in-process
   token bucket, to bound how fast an unauthenticated caller can mint login
   challenges. This is not a substitute for network-level protection.

@@ -41,7 +41,7 @@ use stellar_agent_core::{
         ApprovalContext, ApprovalKind, ApprovalSummaryView, ApproverIdentity,
         CurrentMainnetApprovalPolicy, DEFAULT_RETRY_ATTEMPTS, DEFAULT_RETRY_BACKOFF,
         MainnetApprovalAuthority, MainnetAssertionWire, PendingApproval, PendingApprovalStore,
-        PendingApprovalView, PendingMainnetPresence, VerifiedMainnetPresence,
+        PendingApprovalView, PendingMainnetPresence, VerifiedMainnetPresence, approval_view_digest,
         issue_mainnet_presence, load_and_validate_entry, mainnet_consent_view_digest,
         mainnet_presence_origin, open_with_retry, process_uid_for_attestation,
         verify_mainnet_presence,
@@ -261,12 +261,15 @@ impl PresenceState {
     ) -> Response {
         let csrf = compute_csrf(&session.csrf_key, &view.approval_nonce);
         let html = match self.mode {
+            // A mainnet approve takes a passkey consent, which this page does
+            // not offer, so it carries no view digest.
             Mode::Inbox(_) => crate::templates::render_detail_page(
                 view,
                 &self.context,
                 &csrf,
                 &compute_csrf(&session.csrf_key, SESSION_ACTIVITY_NONCE),
                 attestation,
+                None,
                 &self.identity,
             ),
             Mode::OneShot { .. } => crate::templates::render_detail_page_with(
@@ -275,6 +278,7 @@ impl PresenceState {
                 &csrf,
                 "",
                 attestation,
+                None,
                 &self.identity,
                 false,
             ),
@@ -905,7 +909,13 @@ async fn assertion(
         match &state.mode {
             Mode::Inbox(context) => Ok(outcome_to_response(apply_decision(
                 context,
-                Decision::Approve { nonce },
+                Decision::Approve {
+                    nonce,
+                    shown_view_digest: Some(approval_view_digest(
+                        &entry,
+                        &state.context.binding(),
+                    )?),
+                },
                 RequestIdentity::Mainnet(presence),
             ))),
             Mode::OneShot { completion, .. } => {

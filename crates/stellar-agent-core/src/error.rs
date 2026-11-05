@@ -715,7 +715,10 @@ pub enum ApprovalFailure {
     #[error("The mainnet presence assertion is invalid; start a new approval ceremony.")]
     PresenceInvalid,
     /// The consent details a page renders differ from the current entry or
-    /// policy when a challenge is requested.
+    /// policy: when a mainnet challenge is requested or its assertion
+    /// returns, and when an approval on any other chain arrives from the
+    /// local or remote inbox with a view digest that is absent or is not the
+    /// digest of the current entry. Nothing is attested.
     ///
     /// # Wire code
     ///

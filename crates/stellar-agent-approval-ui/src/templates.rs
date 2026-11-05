@@ -352,6 +352,14 @@ pub(crate) fn render_not_found_page(nonce: &str, identity: &PageIdentity) -> Str
 /// can wire the Approve / Reject buttons; the response JSON (including any
 /// surfaced attestation blob) is rendered into the result container by the JS.
 ///
+/// `view_digest_hex` is the hex [`approval_view_digest`] of the entry `view`
+/// was rendered from, read from the same store handle. The island carries it
+/// as `view_digest` when the page offers Approve and `null` otherwise, and
+/// the approve request returns it, so an approve attests only the entry this
+/// page rendered.
+///
+/// [`approval_view_digest`]: stellar_agent_core::approval::approval_view_digest
+///
 /// The two absolute unix-millisecond timestamps are rendered as text AND as
 /// `data-created-ms` / `data-expires-ms` attributes, from which
 /// `/static/app.js` derives the readable wording. The raw values are what
@@ -363,6 +371,7 @@ pub(crate) fn render_detail_page(
     csrf_hex: &str,
     activity_csrf_hex: &str,
     attestation_blob: Option<&str>,
+    view_digest_hex: Option<&str>,
     identity: &PageIdentity,
 ) -> String {
     render_detail_page_with(
@@ -371,6 +380,7 @@ pub(crate) fn render_detail_page(
         csrf_hex,
         activity_csrf_hex,
         attestation_blob,
+        view_digest_hex,
         identity,
         true,
     )
@@ -381,12 +391,17 @@ pub(crate) fn render_detail_page(
 /// mainnet consent ceremony, renders the same card, notices and recorded
 /// attestation with no action.
 #[must_use]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the page renders the view, its context, both CSRF values, the recorded attestation, the view digest, the identity and the decision mode"
+)]
 pub(crate) fn render_detail_page_with(
     view: &PendingApprovalView,
     context: &stellar_agent_core::approval::ApprovalContext,
     csrf_hex: &str,
     activity_csrf_hex: &str,
     attestation_blob: Option<&str>,
+    view_digest_hex: Option<&str>,
     identity: &PageIdentity,
     decisions: bool,
 ) -> String {
@@ -457,6 +472,7 @@ pub(crate) fn render_detail_page_with(
         "csrf": csrf_hex,
         "activity_csrf": activity_csrf_hex,
         "approvable": approvable,
+        "view_digest": if approvable { view_digest_hex } else { None },
     }));
     let title = identity.page_title("Approval detail");
     let topbar = identity.topbar_html("Approvals");
@@ -1384,6 +1400,7 @@ mod tests {
             &"c".repeat(64),
             &"d".repeat(64),
             None,
+            None,
             &neutral(),
         );
         assert!(
@@ -1568,6 +1585,7 @@ mod tests {
             &"c".repeat(64),
             &"d".repeat(64),
             None,
+            None,
             &neutral(),
         );
         assert!(html.contains("Approve"));
@@ -1591,6 +1609,7 @@ mod tests {
             &"c".repeat(64),
             &"d".repeat(64),
             None,
+            None,
             &neutral(),
         );
         assert!(html.contains("expired"));
@@ -1608,6 +1627,7 @@ mod tests {
             &"c".repeat(64),
             &"d".repeat(64),
             Some("BLOB123"),
+            None,
             &neutral(),
         );
         assert!(html.contains("BLOB123"));
@@ -1862,6 +1882,7 @@ mod tests {
             &test_context(),
             "aa",
             "bb",
+            None,
             None,
             &PageIdentity::default(),
         );
@@ -2133,6 +2154,7 @@ mod tests {
             &"c".repeat(64),
             &"d".repeat(64),
             None,
+            None,
             &neutral(),
         );
         assert!(html.contains(r#"id="reject-btn""#));
@@ -2150,6 +2172,7 @@ mod tests {
             &test_context(),
             &"c".repeat(64),
             &"d".repeat(64),
+            None,
             None,
             &neutral(),
         );
@@ -2186,6 +2209,7 @@ mod tests {
                     &test_context(),
                     &"c".repeat(64),
                     &"d".repeat(64),
+                    None,
                     None,
                     identity,
                 ),
@@ -2329,6 +2353,7 @@ mod tests {
                     &csrf,
                     &"d".repeat(64),
                     None,
+                    None,
                     identity,
                 ))
                 .to_owned()
@@ -2402,6 +2427,7 @@ mod tests {
             &"c".repeat(64),
             &"d".repeat(64),
             None,
+            None,
             &neutral(),
         );
 
@@ -2447,6 +2473,7 @@ mod tests {
             &"c".repeat(64),
             &"d".repeat(64),
             None,
+            None,
             &neutral(),
         );
         assert!(html.contains("900719925.4740993 XLM"), "{html}");
@@ -2480,6 +2507,7 @@ mod tests {
             &"c".repeat(64),
             &"d".repeat(64),
             None,
+            None,
             &neutral(),
         );
         assert!(html.contains("1.2500000 USDC"), "{html}");
@@ -2499,6 +2527,7 @@ mod tests {
             &test_context(),
             &"c".repeat(64),
             &"d".repeat(64),
+            None,
             None,
             &neutral(),
         );
@@ -2557,6 +2586,7 @@ mod tests {
             &"c".repeat(64),
             &"d".repeat(64),
             None,
+            None,
             &neutral(),
         );
         assert!(live.contains(r#"data-expiry-form="remaining""#), "{live}");
@@ -2568,6 +2598,7 @@ mod tests {
             &test_context(),
             &"c".repeat(64),
             &"d".repeat(64),
+            None,
             None,
             &neutral(),
         );
@@ -2587,6 +2618,7 @@ mod tests {
             &"c".repeat(64),
             &"d".repeat(64),
             Some("BLOB123"),
+            None,
             &neutral(),
         );
         assert!(
@@ -2604,6 +2636,7 @@ mod tests {
             &test_context(),
             &"c".repeat(64),
             &"d".repeat(64),
+            None,
             None,
             &neutral(),
         );
@@ -2629,6 +2662,7 @@ mod tests {
             &"c".repeat(64),
             &"d".repeat(64),
             None,
+            None,
             &neutral(),
         );
         assert!(
@@ -2651,6 +2685,7 @@ mod tests {
             &test_context(),
             &"c".repeat(64),
             &"d".repeat(64),
+            None,
             None,
             &neutral(),
         );
@@ -2677,6 +2712,7 @@ mod tests {
             &"c".repeat(64),
             &"d".repeat(64),
             None,
+            None,
             &neutral(),
         );
         assert!(html.contains(r#"<div class="notice warn">"#), "{html}");
@@ -2696,6 +2732,7 @@ mod tests {
             &test_context(),
             &"c".repeat(64),
             &"d".repeat(64),
+            None,
             None,
             &neutral(),
         );
@@ -2795,6 +2832,7 @@ mod tests {
             &"c".repeat(64),
             &"d".repeat(64),
             None,
+            None,
             &neutral(),
         );
         for row in [
@@ -2810,7 +2848,7 @@ mod tests {
             );
         }
         context.signer_account = None;
-        let html = render_detail_page(view, &context, "csrf", "activity", None, &neutral());
+        let html = render_detail_page(view, &context, "csrf", "activity", None, None, &neutral());
         assert!(html.contains("<dt>Signer</dt><dd>(not enrolled)</dd>"));
     }
 
@@ -2819,7 +2857,15 @@ mod tests {
     fn detail_page_renders_the_decoded_claim_source() {
         let dir = TempDir::new().unwrap();
         let view = claim_view(&dir);
-        let html = render_detail_page(&view, &test_context(), "csrf", "activity", None, &neutral());
+        let html = render_detail_page(
+            &view,
+            &test_context(),
+            "csrf",
+            "activity",
+            None,
+            None,
+            &neutral(),
+        );
         assert!(
             html.contains(&format!("<dt>Source</dt><dd>{SOURCE_G}</dd>")),
             "{html}"
@@ -2827,7 +2873,15 @@ mod tests {
         assert!(!html.contains("stored summary"), "{html}");
         let dir = TempDir::new().unwrap();
         let view = payment_view(&dir, false, NOW_MS);
-        let html = render_detail_page(&view, &test_context(), "csrf", "activity", None, &neutral());
+        let html = render_detail_page(
+            &view,
+            &test_context(),
+            "csrf",
+            "activity",
+            None,
+            None,
+            &neutral(),
+        );
         assert!(
             html.contains(&format!("<dt>Source</dt><dd>{SOURCE_G}</dd>")),
             "{html}"
@@ -2872,6 +2926,7 @@ mod tests {
                 &"c".repeat(64),
                 &"d".repeat(64),
                 None,
+                None,
                 &neutral(),
             );
             for text in [
@@ -2895,6 +2950,7 @@ mod tests {
             &"c".repeat(64),
             &"d".repeat(64),
             None,
+            None,
             &neutral(),
         );
         assert!(!html.contains(">Approve trustline</button>"));
@@ -2905,6 +2961,7 @@ mod tests {
             &test_context(),
             &"c".repeat(64),
             &"d".repeat(64),
+            None,
             None,
             &neutral(),
         );
@@ -2964,6 +3021,7 @@ mod tests {
             &"c".repeat(64),
             &"d".repeat(64),
             None,
+            None,
             &neutral(),
         );
         assert!(html.contains("7500.0000000 XLM"), "{html}");
@@ -3014,6 +3072,7 @@ mod tests {
             &test_context(),
             &"c".repeat(64),
             &"d".repeat(64),
+            None,
             None,
             &neutral(),
         );
@@ -3078,6 +3137,7 @@ mod tests {
             &test_context(),
             &"c".repeat(64),
             &"d".repeat(64),
+            None,
             None,
             &neutral(),
         );

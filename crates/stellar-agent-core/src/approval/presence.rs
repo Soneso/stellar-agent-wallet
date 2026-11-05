@@ -179,6 +179,7 @@ pub const MAINNET_PRESENCE_RECEIPT_VERSION: u32 = 1;
 
 const CHALLENGE_DOMAIN: &[u8] = b"stellar-agent-mainnet-presence:v1";
 const VIEW_DOMAIN: &[u8] = b"stellar-agent-mainnet-consent-view:v1";
+const APPROVAL_VIEW_DOMAIN: &[u8] = b"stellar-agent-approval-view:v1";
 const RECEIPT_DOMAIN: &[u8] = b"stellar-agent-mainnet-presence-receipt:v1";
 const CREDENTIAL_FINGERPRINT_DOMAIN: &[u8] = b"stellar-agent-mainnet-approval-credential:v1";
 
@@ -491,27 +492,38 @@ impl MainnetApprovalCredential {
 // Subject and view digest
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// The subject a mainnet consent to `entry` approves.
+/// The subject an approval of `entry` attests: the digest its attestation,
+/// grant or consent binds.
 ///
-/// Payment, claim and trustline entries approve SHA-256 of the exact stored
-/// unsigned envelope text, after the stored digest is checked against it and
-/// the envelope decodes. An x402 entry approves its verified intent subject
-/// on the binding's network, authenticated or not. A trustline clawback
-/// opt-in approves its `(network, code, issuer)` commitment, and its network
-/// must be the binding's chain. Every other kind refuses: no zero or
-/// placeholder subject exists.
+/// The entry's stored terms are checked first ([`super::verify_entry_terms`]),
+/// so a surface that renders the entry and the attester agree on what it
+/// approves. Then, per kind:
+///
+/// - Payment, claim and trustline: SHA-256 of the exact stored unsigned
+///   envelope text, after the stored digest is checked against it and the
+///   envelope decodes.
+/// - x402: the verified intent subject on the binding's network.
+/// - Rule proposal: the stored `proposal_sha256`.
+/// - MPP charge: the subject of its authorization fingerprint and prepared
+///   artifact hash.
+/// - Toolset first-invoke gate: the toolset gate digest of its fields.
+/// - Trustline clawback opt-in: its `(network, code, issuer)` commitment.
+///
+/// No zero or placeholder subject exists.
 ///
 /// # Errors
 ///
-/// `approval.wrong_kind` for an unsupported kind,
-/// `approval.entry_inconsistent` for a classic entry whose digest or envelope
-/// does not check, `approval.attestation_invalid` for an x402 invocation that
-/// does not match its digest, and `approval.binding_mismatch` for a chain
-/// that is not a CAIP-2 chain or an opt-in for another network.
-pub fn mainnet_consent_subject(
+/// `approval.entry_inconsistent` for stored terms or a classic digest or
+/// envelope that do not check, `approval.attestation_invalid` for an x402
+/// invocation that does not match its digest, `approval.binding_mismatch`
+/// for an x402 chain that is not a CAIP-2 chain, `approval.wrong_kind` for a
+/// passkey request, which the WebAuthn bridge decides, and
+/// `approval.rejected` or `approval.consumed` for a tombstone.
+pub fn approval_view_subject(
     entry: &PendingApproval,
     binding: &AttestationBinding<'_>,
 ) -> Result<[u8; 32], WalletError> {
+    super::verify_entry_terms(&entry.kind)?;
     match &entry.kind {
         ApprovalKind::PaymentSimulated {
             envelope_xdr_b64, ..
@@ -541,16 +553,80 @@ pub fn mainnet_consent_subject(
                 chain.network_passphrase(),
             )
         }
+        ApprovalKind::RuleProposalSimulated {
+            proposal_sha256, ..
+        } => Ok(*proposal_sha256),
+        ApprovalKind::MppChargeSimulated {
+            prepared_artifact_hash,
+            authorization_fingerprint,
+            ..
+        } => Ok(super::mpp::approval_subject(
+            authorization_fingerprint,
+            prepared_artifact_hash,
+        )),
+        ApprovalKind::ToolsetFirstInvokeGate {
+            toolset_name,
+            install_id,
+            package_version,
+            package_shasum,
+            capability,
+            destination,
+            asset,
+            amount_min_stroops,
+            amount_max_stroops,
+        } => Ok(super::attestation::compute_toolset_gate_digest(
+            toolset_name,
+            install_id,
+            package_version,
+            package_shasum,
+            capability,
+            destination,
+            asset,
+            *amount_min_stroops,
+            *amount_max_stroops,
+        )),
         ApprovalKind::TrustlineClawbackOptIn {
             network,
             code,
             issuer,
         } => {
-            if network != binding.chain_id {
-                return Err(binding_mismatch());
-            }
             Ok(super::attestation::compute_trustline_clawback_opt_in_digest(network, code, issuer))
         }
+        ApprovalKind::SignWithPasskey { .. } | ApprovalKind::RegisterPasskey { .. } => {
+            Err(WalletError::Approval(ApprovalFailure::WrongKind {
+                detail: "a passkey request is decided in the WebAuthn bridge".to_owned(),
+            }))
+        }
+        ApprovalKind::Rejected { .. } => Err(super::attest::rejected_error()),
+        ApprovalKind::Consumed { .. } => Err(super::attest::consumed_error()),
+    }
+}
+
+/// The subject a mainnet consent to `entry` approves.
+///
+/// The kinds with a mainnet consent path approve their
+/// [`approval_view_subject`]: payment, claim, trustline, x402, and a
+/// trustline clawback opt-in, whose network must be the binding's chain.
+/// Every other kind refuses: no zero or placeholder subject exists.
+///
+/// # Errors
+///
+/// `approval.wrong_kind` for an unsupported kind,
+/// `approval.binding_mismatch` for an opt-in for another network, and the
+/// errors of [`approval_view_subject`].
+pub fn mainnet_consent_subject(
+    entry: &PendingApproval,
+    binding: &AttestationBinding<'_>,
+) -> Result<[u8; 32], WalletError> {
+    match &entry.kind {
+        ApprovalKind::TrustlineClawbackOptIn { network, .. } if network != binding.chain_id => {
+            Err(binding_mismatch())
+        }
+        ApprovalKind::PaymentSimulated { .. }
+        | ApprovalKind::ClaimSimulated { .. }
+        | ApprovalKind::TrustlineSimulated { .. }
+        | ApprovalKind::X402Payment { .. }
+        | ApprovalKind::TrustlineClawbackOptIn { .. } => approval_view_subject(entry, binding),
         ApprovalKind::SignWithPasskey { .. }
         | ApprovalKind::RegisterPasskey { .. }
         | ApprovalKind::ToolsetFirstInvokeGate { .. }
@@ -561,13 +637,12 @@ pub fn mainnet_consent_subject(
     }
 }
 
-/// The consent fields every challenge and view digest binds, in order.
-fn consent_fields(
+/// The entry fields every challenge and view digest binds, in order.
+fn entry_fields(
     preimage: &mut Preimage,
     entry: &PendingApproval,
     binding: &AttestationBinding<'_>,
     subject: &[u8; 32],
-    policy: &VerifiedPolicy,
 ) {
     preimage
         .lp(entry.approval_nonce.as_bytes())
@@ -577,10 +652,57 @@ fn consent_fields(
         .fixed(subject)
         .lp(entry.process_uid.as_bytes())
         .u64(entry.created_at_unix_ms)
-        .u64(entry.expires_at_unix_ms)
+        .u64(entry.expires_at_unix_ms);
+}
+
+/// The consent fields every mainnet challenge and consent view digest binds,
+/// in order: the entry fields, then the policy.
+fn consent_fields(
+    preimage: &mut Preimage,
+    entry: &PendingApproval,
+    binding: &AttestationBinding<'_>,
+    subject: &[u8; 32],
+    policy: &VerifiedPolicy,
+) {
+    entry_fields(preimage, entry, binding, subject);
+    preimage
         .i64(policy.sequence())
         .fixed(&policy.digest())
         .fixed(&policy.owner());
+}
+
+/// The digest of the approval terms a page renders, which the page returns
+/// with its approve request.
+///
+/// ```text
+/// SHA-256(
+///   b"stellar-agent-approval-view:v1" || lp(approval_nonce) ||
+///   lp(profile_name) || lp(chain_caip2) || lp(kind_name) || subject32 ||
+///   lp(process_uid) || u64be(entry_created_at_ms) ||
+///   u64be(entry_expires_at_ms)
+/// )
+/// ```
+///
+/// `subject32` is the [`approval_view_subject`]. An approval surface renders
+/// the digest of the entry it shows, and the approve path compares it with
+/// the digest of the entry it attests: any change to the terms, the nonce,
+/// the requester or the lifetime between the render and the approve refuses.
+/// The entry's `reason` is not a term and is not bound. The digest adds no
+/// authority: every input is server-side, and it lives only between one
+/// rendered page and its approve request.
+///
+/// # Errors
+///
+/// The errors of [`approval_view_subject`], and `approval.presence_invalid`
+/// for a field longer than `u32::MAX` bytes.
+pub fn approval_view_digest(
+    entry: &PendingApproval,
+    binding: &AttestationBinding<'_>,
+) -> Result<[u8; 32], WalletError> {
+    let subject = approval_view_subject(entry, binding)?;
+    let mut preimage = Preimage::new(APPROVAL_VIEW_DOMAIN);
+    entry_fields(&mut preimage, entry, binding, &subject);
+    preimage.finish().ok_or_else(presence_invalid)
 }
 
 /// The digest of the consent details a page renders, for a stale-view check.

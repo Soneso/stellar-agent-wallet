@@ -141,9 +141,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   build an `AddressInvalid` refusal for a named argument or for a fixed check.
   `stellar_agent_core::policy::toml_syntax_detail` and `PolicyError::toml_syntax`
   report a policy body that is not valid TOML by position.
+- `stellar_agent_core::approval::approval_view_subject` returns the subject
+  an approval of an entry attests, and `approval_view_digest` the digest of
+  the approval terms a page renders.
+  `stellar_agent_approval_ui::shown_view_digest` reads that digest from an
+  approve request body, and `consent_changed` is the
+  `approval.presence_changed` refusal.
 
 ### Changed
 
+- `Decision::Approve` carries the view digest the approving page rendered
+  (`shown_view_digest`). The local inbox's approve request and the remote
+  inbox's approve challenge request send `{"view_digest":"<hex>"}`; a reject
+  sends no body. The remote action challenge is derived over that digest:
+  `derive_action_challenge` takes the view digest, `ActionChallengeStore::mint`
+  stores it with the challenge, and `ActionChallengeStore::consume` returns it
+  in a `ConsumedActionChallenge`.
 - `compute_toolset_gate_digest`, `verify_toolset_gate_attestation`,
   `build_attested_grant`, `record_first_invoke_grant`,
   `new_toolset_first_invoke_gate_pending` and `ToolsetGrantRequest` take an install
@@ -678,6 +691,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- An approval on the local or remote inbox attests the request its page showed.
+  The page carries a digest of the request, and approval refuses with
+  `approval.presence_changed` when the pending request differs. Reload the page
+  and review it again.
 - A toolset install record carries a random install identity that its tag covers,
   and every first-invoke approval request and grant is bound to that identity,
   the package version and the package shasum. A request queued before a reinstall

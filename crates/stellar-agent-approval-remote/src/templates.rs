@@ -13,7 +13,9 @@
 //! `'unsafe-inline'`.
 //!
 //! Summary rows render challenge-bound entry data from `PendingApprovalView`.
-//! Header rows come from the serving profile and are not challenge-bound.
+//! Header rows come from the serving profile. The profile and network rows
+//! are inputs of the view digest the challenge covers; the endpoint authority
+//! and enrolled signer rows are display context.
 //!
 //! Every summary value that reaches the HTML body (asset codes, memos,
 //! addresses) passes through `stellar_agent_approval_ui::escape_value`:
@@ -307,13 +309,21 @@ pub(crate) fn render_not_found_page(nonce: &str, identity: &PageIdentity) -> Str
 /// Renders the per-approval detail page (`GET /approval/{{nonce}}`,
 /// session-gated).
 ///
-/// Every field of the entry's redacted view is rendered server-side — the
-/// same fields `crate::routes::entry_envelope_sha256` reads to derive the
-/// per-action challenge's envelope hash. The CSRF value and the nonce ride
-/// in the `#approval-data` island so `/static/app.js` can drive the full
-/// ceremony (mint the action challenge, run `navigator.credentials.get`,
-/// POST the decision); the response JSON (including any surfaced
-/// attestation blob) is rendered into the result container by the JS.
+/// Every field of the entry's redacted view is rendered server-side. The
+/// CSRF value and the nonce ride in the `#approval-data` island so
+/// `/static/app.js` can drive the full ceremony (mint the action challenge,
+/// run `navigator.credentials.get`, POST the decision); the response JSON
+/// (including any surfaced attestation blob) is rendered into the result
+/// container by the JS.
+///
+/// `view_digest_hex` is the hex [`approval_view_digest`] of the entry `view`
+/// was rendered from, read from the same store handle. The island carries it
+/// as `view_digest` when the page offers Approve and `null` otherwise. An
+/// approve sends it to the challenge route, which mints a challenge only for
+/// the digest of the current entry and binds the challenge to it, so the
+/// passkey assertion commits to the terms this page rendered.
+///
+/// [`approval_view_digest`]: stellar_agent_core::approval::approval_view_digest
 ///
 /// The two absolute unix-millisecond timestamps are rendered as text AND as
 /// `data-created-ms` / `data-expires-ms` attributes, from which
@@ -325,6 +335,7 @@ pub(crate) fn render_detail_page(
     context: &stellar_agent_core::approval::ApprovalContext,
     csrf_hex: &str,
     attestation_blob: Option<&str>,
+    view_digest_hex: Option<&str>,
     identity: &PageIdentity,
 ) -> String {
     let approvable = kind_is_approvable(&view.summary) && !view.expired && !view.attested;
@@ -440,6 +451,7 @@ pub(crate) fn render_detail_page(
         "nonce": view.approval_nonce,
         "csrf": csrf_hex,
         "approvable": approvable,
+        "view_digest": if approvable { view_digest_hex } else { None },
     }));
     let title = identity.page_title("Approval detail");
     let topbar = identity.topbar_html("Approvals");
@@ -618,7 +630,14 @@ mod tests {
         store.insert(entry, NOW_MS).unwrap();
         let view = store.snapshot(NOW_MS).into_iter().next().unwrap();
 
-        let html = render_detail_page(&view, &test_context(), &"c".repeat(64), None, &neutral());
+        let html = render_detail_page(
+            &view,
+            &test_context(),
+            &"c".repeat(64),
+            None,
+            None,
+            &neutral(),
+        );
         assert!(
             !html.contains('\u{202E}'),
             "no raw right-to-left override may reach the page"
@@ -691,7 +710,14 @@ mod tests {
     fn detail_page_escapes_summary_and_offers_approve() {
         let dir = TempDir::new().unwrap();
         let view = payment_view(&dir, false, NOW_MS);
-        let html = render_detail_page(&view, &test_context(), &"c".repeat(64), None, &neutral());
+        let html = render_detail_page(
+            &view,
+            &test_context(),
+            &"c".repeat(64),
+            None,
+            None,
+            &neutral(),
+        );
         assert!(html.contains("Approve"));
         assert!(html.contains("Reject"));
         // The raw `<script>` memo must be escaped, never literal.
@@ -705,7 +731,14 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let view = payment_view(&dir, false, u64::MAX);
         assert!(view.expired);
-        let html = render_detail_page(&view, &test_context(), &"c".repeat(64), None, &neutral());
+        let html = render_detail_page(
+            &view,
+            &test_context(),
+            &"c".repeat(64),
+            None,
+            None,
+            &neutral(),
+        );
         assert!(html.contains("expired"));
         assert!(!html.contains("id=\"approve-btn\""));
         assert!(html.contains("id=\"reject-btn\""));
@@ -721,6 +754,7 @@ mod tests {
             &test_context(),
             &"c".repeat(64),
             Some("BLOB123"),
+            None,
             &neutral(),
         );
         assert!(html.contains("BLOB123"));
@@ -910,7 +944,14 @@ mod tests {
         assert!(!view.expired);
         assert!(!view.attested);
         assert!(!kind_is_approvable(&view.summary));
-        let html = render_detail_page(&view, &test_context(), &"c".repeat(64), None, &neutral());
+        let html = render_detail_page(
+            &view,
+            &test_context(),
+            &"c".repeat(64),
+            None,
+            None,
+            &neutral(),
+        );
         assert!(html.contains(r#"id="reject-btn""#));
         assert!(!html.contains(r#"id="approve-btn""#));
     }
@@ -920,7 +961,14 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let view = rejected_view(&dir);
         assert!(matches!(view.summary, ApprovalSummaryView::Rejected { .. }));
-        let html = render_detail_page(&view, &test_context(), &"c".repeat(64), None, &neutral());
+        let html = render_detail_page(
+            &view,
+            &test_context(),
+            &"c".repeat(64),
+            None,
+            None,
+            &neutral(),
+        );
         assert!(!html.contains(r#"id="approve-btn""#));
         assert!(!html.contains(r#"id="reject-btn""#));
     }
@@ -978,7 +1026,14 @@ mod tests {
             ("empty inbox", render_inbox_page(&[], identity)),
             (
                 "detail",
-                render_detail_page(&view, &test_context(), &"c".repeat(64), None, identity),
+                render_detail_page(
+                    &view,
+                    &test_context(),
+                    &"c".repeat(64),
+                    None,
+                    None,
+                    identity,
+                ),
             ),
             ("not found", render_not_found_page("nonce", identity)),
         ]
@@ -1077,6 +1132,7 @@ mod tests {
                     &test_context(),
                     &csrf,
                     None,
+                    None,
                     identity,
                 ))
                 .to_owned()
@@ -1167,7 +1223,14 @@ mod tests {
     fn detail_page_renders_payment_amount_in_both_denominations_and_the_full_destination() {
         let dir = TempDir::new().unwrap();
         let view = payment_view(&dir, false, NOW_MS);
-        let html = render_detail_page(&view, &test_context(), &"c".repeat(64), None, &neutral());
+        let html = render_detail_page(
+            &view,
+            &test_context(),
+            &"c".repeat(64),
+            None,
+            None,
+            &neutral(),
+        );
 
         // The fixture is 2_500_000 stroops of XLM.
         assert!(html.contains("0.2500000 XLM"), "{html}");
@@ -1186,6 +1249,7 @@ mod tests {
             &payment_view(&dir, false, NOW_MS),
             &test_context(),
             &"c".repeat(64),
+            None,
             None,
             &neutral(),
         );
@@ -1209,6 +1273,7 @@ mod tests {
             &test_context(),
             &"c".repeat(64),
             None,
+            None,
             &neutral(),
         );
         assert!(live.contains(r#"data-expiry-form="remaining""#), "{live}");
@@ -1219,6 +1284,7 @@ mod tests {
             &payment_view(&dir, false, u64::MAX),
             &test_context(),
             &"c".repeat(64),
+            None,
             None,
             &neutral(),
         );
@@ -1237,6 +1303,7 @@ mod tests {
             &test_context(),
             &"c".repeat(64),
             Some("BLOB123"),
+            None,
             &neutral(),
         );
         assert!(
@@ -1253,6 +1320,7 @@ mod tests {
             &rejected_view(&dir),
             &test_context(),
             &"c".repeat(64),
+            None,
             None,
             &neutral(),
         );
@@ -1272,7 +1340,14 @@ mod tests {
     fn detail_page_renders_the_nonce_as_a_visible_field() {
         let dir = TempDir::new().unwrap();
         let view = payment_view(&dir, false, NOW_MS);
-        let html = render_detail_page(&view, &test_context(), &"c".repeat(64), None, &neutral());
+        let html = render_detail_page(
+            &view,
+            &test_context(),
+            &"c".repeat(64),
+            None,
+            None,
+            &neutral(),
+        );
         assert!(
             html.contains(&format!(
                 "<dt>Nonce</dt><dd>{}</dd>",
@@ -1288,7 +1363,14 @@ mod tests {
     fn detail_page_carries_absolute_timestamps_in_data_attributes() {
         let dir = TempDir::new().unwrap();
         let view = payment_view(&dir, false, NOW_MS);
-        let html = render_detail_page(&view, &test_context(), &"c".repeat(64), None, &neutral());
+        let html = render_detail_page(
+            &view,
+            &test_context(),
+            &"c".repeat(64),
+            None,
+            None,
+            &neutral(),
+        );
         assert!(
             html.contains(&format!(
                 r#"data-created-ms="{}" data-expires-ms="{}""#,
@@ -1364,7 +1446,14 @@ mod tests {
         store.insert(entry, NOW_MS).unwrap();
         let view = store.snapshot(NOW_MS).into_iter().next().unwrap();
 
-        let html = render_detail_page(&view, &test_context(), &"c".repeat(64), None, &neutral());
+        let html = render_detail_page(
+            &view,
+            &test_context(),
+            &"c".repeat(64),
+            None,
+            None,
+            &neutral(),
+        );
         assert!(html.contains("900719925.4740993 XLM"), "{html}");
         assert!(html.contains("9007199254740993 stroops"), "{html}");
     }
@@ -1390,7 +1479,14 @@ mod tests {
         store.insert(entry, NOW_MS).unwrap();
         let view = store.snapshot(NOW_MS).into_iter().next().unwrap();
 
-        let html = render_detail_page(&view, &test_context(), &"c".repeat(64), None, &neutral());
+        let html = render_detail_page(
+            &view,
+            &test_context(),
+            &"c".repeat(64),
+            None,
+            None,
+            &neutral(),
+        );
         assert!(html.contains("1.2500000 USDC"), "{html}");
         assert!(
             html.contains(&format!("USDC:{issuer}")),
@@ -1405,7 +1501,14 @@ mod tests {
     fn detail_page_mpp_charge_keeps_the_amount_in_base_units() {
         let dir = TempDir::new().unwrap();
         let view = mpp_charge_view(&dir);
-        let html = render_detail_page(&view, &test_context(), &"c".repeat(64), None, &neutral());
+        let html = render_detail_page(
+            &view,
+            &test_context(),
+            &"c".repeat(64),
+            None,
+            None,
+            &neutral(),
+        );
         assert!(
             html.contains("1000000 <small>base units of the token contract</small>"),
             "the charge must stay in the token's own base units: {html}"
@@ -1430,7 +1533,14 @@ mod tests {
     fn detail_page_expired_states_the_reason_as_a_warning() {
         let dir = TempDir::new().unwrap();
         let view = payment_view(&dir, false, u64::MAX);
-        let html = render_detail_page(&view, &test_context(), &"c".repeat(64), None, &neutral());
+        let html = render_detail_page(
+            &view,
+            &test_context(),
+            &"c".repeat(64),
+            None,
+            None,
+            &neutral(),
+        );
         assert!(html.contains(r#"<div class="notice warn">"#), "{html}");
         assert!(html.contains("This request has expired"), "{html}");
         assert!(!html.contains(r#"id="approve-btn""#), "{html}");
@@ -1463,7 +1573,7 @@ mod tests {
         context.chain_id = "stellar:mainnet".to_owned();
         context.endpoint_host = "https://context-rpc.example".to_owned();
         context.signer_account = Some("GSIGNER".to_owned());
-        let html = render_detail_page(view, &context, &"c".repeat(64), None, &neutral());
+        let html = render_detail_page(view, &context, &"c".repeat(64), None, None, &neutral());
         for row in [
             "<dt>Profile</dt><dd>treasury &lt;&amp;&quot;</dd>",
             "<dt>Network</dt><dd>stellar:mainnet</dd>",
@@ -1477,7 +1587,7 @@ mod tests {
             );
         }
         context.signer_account = None;
-        let html = render_detail_page(view, &context, "csrf", None, &neutral());
+        let html = render_detail_page(view, &context, "csrf", None, None, &neutral());
         assert!(html.contains("<dt>Signer</dt><dd>(not enrolled)</dd>"));
     }
 
@@ -1486,7 +1596,7 @@ mod tests {
     fn detail_page_renders_the_decoded_claim_source() {
         let dir = TempDir::new().unwrap();
         let view = claim_view(&dir);
-        let html = render_detail_page(&view, &test_context(), "csrf", None, &neutral());
+        let html = render_detail_page(&view, &test_context(), "csrf", None, None, &neutral());
         assert!(
             html.contains(&format!("<dt>Source</dt><dd>{SOURCE_G}</dd>")),
             "{html}"
@@ -1494,7 +1604,7 @@ mod tests {
         assert!(!html.contains("stored summary"), "{html}");
         let dir = TempDir::new().unwrap();
         let view = payment_view(&dir, false, NOW_MS);
-        let html = render_detail_page(&view, &test_context(), "csrf", None, &neutral());
+        let html = render_detail_page(&view, &test_context(), "csrf", None, None, &neutral());
         assert!(
             html.contains(&format!("<dt>Source</dt><dd>{SOURCE_G}</dd>")),
             "{html}"
@@ -1533,8 +1643,14 @@ mod tests {
             if let ApprovalSummaryView::Trustline { limit_stroops, .. } = &mut view.summary {
                 *limit_stroops = limit;
             }
-            let html =
-                render_detail_page(&view, &test_context(), &"c".repeat(64), None, &neutral());
+            let html = render_detail_page(
+                &view,
+                &test_context(),
+                &"c".repeat(64),
+                None,
+                None,
+                &neutral(),
+            );
             for text in [
                 "TRUSTLINE",
                 ">Approve trustline</button>",
@@ -1550,11 +1666,25 @@ mod tests {
             assert!(!html.contains(">Approve payment</button>"));
         }
         view.attested = true;
-        let html = render_detail_page(&view, &test_context(), &"c".repeat(64), None, &neutral());
+        let html = render_detail_page(
+            &view,
+            &test_context(),
+            &"c".repeat(64),
+            None,
+            None,
+            &neutral(),
+        );
         assert!(!html.contains(">Approve trustline</button>"));
         view.attested = false;
         view.expired = true;
-        let html = render_detail_page(&view, &test_context(), &"c".repeat(64), None, &neutral());
+        let html = render_detail_page(
+            &view,
+            &test_context(),
+            &"c".repeat(64),
+            None,
+            None,
+            &neutral(),
+        );
         assert!(!html.contains(">Approve trustline</button>"));
     }
 
@@ -1592,7 +1722,14 @@ mod tests {
         OTHER_G.clone_into(summary_to);
         *summary_amount_stroops = 10_000;
         let view = view_of(entry);
-        let html = render_detail_page(&view, &test_context(), &"c".repeat(64), None, &neutral());
+        let html = render_detail_page(
+            &view,
+            &test_context(),
+            &"c".repeat(64),
+            None,
+            None,
+            &neutral(),
+        );
         assert!(html.contains("7500.0000000 XLM"), "{html}");
         assert!(html.contains("75000000000 stroops"), "{html}");
         assert!(
@@ -1633,7 +1770,14 @@ mod tests {
         *envelope_xdr_b64 = fixtures::payment_envelope(SOURCE_G, OTHER_G, "XLM", 9, None, 100, 1);
         let view = view_of(entry);
         assert!(!kind_is_approvable(&view.summary));
-        let html = render_detail_page(&view, &test_context(), &"c".repeat(64), None, &neutral());
+        let html = render_detail_page(
+            &view,
+            &test_context(),
+            &"c".repeat(64),
+            None,
+            None,
+            &neutral(),
+        );
         assert!(html.contains(INCONSISTENT_NOTICE), "{html}");
         assert!(html.contains("INCONSISTENT"), "{html}");
         assert!(!html.contains("approve-btn"), "{html}");
@@ -1658,7 +1802,14 @@ mod tests {
             ApprovalSummaryView::Inconsistent { .. }
         ));
         assert!(!kind_is_approvable(&view.summary));
-        let html = render_detail_page(&view, &test_context(), &"c".repeat(64), None, &neutral());
+        let html = render_detail_page(
+            &view,
+            &test_context(),
+            &"c".repeat(64),
+            None,
+            None,
+            &neutral(),
+        );
         assert!(html.contains(INCONSISTENT_NOTICE), "{html}");
         let json = stellar_agent_approval_ui::pending_json_value(&[view]);
         assert_eq!(json[0]["summary"]["kind"], "inconsistent");

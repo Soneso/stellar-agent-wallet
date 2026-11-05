@@ -506,6 +506,7 @@ async fn mainnet_local_approve_route_requires_assertion() {
         &h.decision(),
         Decision::Approve {
             nonce: h.entry.approval_nonce.clone(),
+            shown_view_digest: Some(approval_view_digest(&h.entry, &h.fixture.binding()).unwrap()),
         },
         RequestIdentity::Local,
     );

@@ -154,6 +154,7 @@ export function browser({
   Object.assign(context, globals);
   vm.createContext(context);
   return {
+    documentElement: document.documentElement,
     byId,
     stored,
     log,

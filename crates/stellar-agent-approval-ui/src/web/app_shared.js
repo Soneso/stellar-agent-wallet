@@ -472,9 +472,11 @@ var stellarAgentApproval = (function () {
   }
 
   // Renders a decision the server REFUSED. A refusal is not a status to read
-  // past: a rejected passkey assertion, a stale CSRF value, or an entry that
-  // resolved elsewhere all mean nothing was signed, and the panel has to say so
-  // in its own treatment rather than as "Status: unknown".
+  // past: a rejected passkey assertion, a stale CSRF value, a page whose request
+  // changed, or an entry that resolved elsewhere all mean nothing was signed,
+  // and the panel has to say so in its own treatment rather than as "Status:
+  // unknown". The server's fixed message, when it sends one, follows the code
+  // as its own paragraph.
   function renderRefusal(result, data, fallback) {
     result.textContent = "";
     result.className = "result refused";
@@ -484,6 +486,11 @@ var stellarAgentApproval = (function () {
       ? "Not recorded: " + detail
       : "Not recorded: " + fallback;
     result.appendChild(line);
+    if (data && typeof data.message === "string" && data.message) {
+      var message = document.createElement("p");
+      message.textContent = data.message;
+      result.appendChild(message);
+    }
   }
 
   // The ceremony state the brand mark reads. "ok" / "error" / "busy".

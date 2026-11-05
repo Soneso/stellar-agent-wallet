@@ -116,8 +116,9 @@ pub use operator_credentials::{
 pub use presence::{
     ApprovalCredentialError, MAINNET_APPROVAL_RP_ID, MainnetApprovalCredential,
     MainnetAssertionWire, MainnetPresenceOptions, MainnetPresenceReceipt, PendingMainnetPresence,
-    VerifiedMainnetPresence, issue_mainnet_presence, mainnet_consent_subject,
-    mainnet_consent_view_digest, mainnet_presence_origin, verify_mainnet_presence,
+    VerifiedMainnetPresence, approval_view_digest, approval_view_subject, issue_mainnet_presence,
+    mainnet_consent_subject, mainnet_consent_view_digest, mainnet_presence_origin,
+    verify_mainnet_presence,
 };
 pub use presence_policy::{CurrentMainnetApprovalPolicy, MainnetApprovalAuthority};
 pub use registration_input::RegistrationInput;

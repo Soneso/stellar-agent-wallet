@@ -145,7 +145,10 @@
   //
   // A tab without the session proof cannot act: the decision would be refused,
   // so nothing is sent and the refusal names the way back.
-  function post(url, csrf, result) {
+  //
+  // `body`, when given, is sent as JSON: an approve returns the view digest
+  // the page rendered, so the server attests only the request this page shows.
+  function post(url, csrf, result, body) {
     var proof = readProof();
     if (!proof) {
       result.className = "result refused";
@@ -158,14 +161,19 @@
     result.className = "result";
     result.textContent = "Working…";
     shared.setPageState("busy");
-    fetch(url, {
+    var init = {
       method: "POST",
       headers: {
         "X-Stellar-Approval-CSRF": csrf,
         "X-Session-Proof": proof,
         Accept: "application/json",
       },
-    })
+    };
+    if (body !== undefined) {
+      init.headers["Content-Type"] = "application/json";
+      init.body = JSON.stringify(body);
+    }
+    fetch(url, init)
       .then(function (r) {
         return r
           .json()
@@ -198,6 +206,7 @@
     var result = document.getElementById("result");
     var nonce = encodeURIComponent(island.nonce);
     var csrf = island.csrf;
+    var viewDigest = island.view_digest;
 
     shared.refreshTimestamps();
     setInterval(shared.refreshTimestamps, 1000);
@@ -205,7 +214,7 @@
     var approveBtn = document.getElementById("approve-btn");
     if (approveBtn) {
       approveBtn.addEventListener("click", function () {
-        post("/approval/" + nonce + "/approve", csrf, result);
+        post("/approval/" + nonce + "/approve", csrf, result, { view_digest: viewDigest });
       });
     }
     var rejectBtn = document.getElementById("reject-btn");
