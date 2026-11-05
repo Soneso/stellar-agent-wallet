@@ -443,11 +443,11 @@ sub-code. A rotation-spanning outage can require `audit reanchor` after restart.
 | `x402.network_passphrase_mismatch` | The requirement's network is not the active profile's network. | Do not pay with this requirement. Pick another `accepts[]` element on the profile's network, or report the mismatch to the operator. Do not switch profiles on your own. |
 | `x402.invalid_asset_address` | The requirement's `asset` is not a contract address (C-strkey). | Do not pay with this requirement. Pick another `accepts[]` element, or report the requirement to the operator. |
 | `x402.fees_not_sponsored` | The requirement's `extra.areFeesSponsored` is not the JSON boolean `true`. | Do not pay with this requirement. Pick another `accepts[]` element with sponsored fees, or report the requirement to the operator. |
-| `x402.amount_conversion` | The requirement's `amount` is not a positive integer. | Do not pay with this requirement. Pick another `accepts[]` element, or report the requirement to the operator. |
-| `x402.keyring_load_failed` | The signer could not be loaded, for a reason that has no `auth.*` code of its own. | Do not retry. Ask the operator to check the profile's signer entry. |
-| `x402.auth_entry_sign_failed` | `stellar_x402_create_payment` could not sign the payer's authorization entry. `stellar_x402_authenticated_payment` reports this as `x402.payment_build_failed`. | Do not retry in a loop. Report it to the operator. |
-| `x402.transaction_build_failed` | `stellar_x402_create_payment` could not assemble the payment, for example because the re-simulation data does not decode. `stellar_x402_authenticated_payment` reports this as `x402.payment_build_failed`. | Do not retry in a loop. Report it to the operator. |
-| `x402.receipt_parse_failed` | The input to `stellar_x402_parse_receipt` is neither a base64 `PAYMENT-RESPONSE` value nor a raw JSON `SettleResponse`. | Pass the `PAYMENT-RESPONSE` header value unchanged: no decoding, trimming, or re-encoding. |
+| `x402.amount_conversion` | The requirement's `amount` is not a positive integer, or does not fit in a signed 128-bit integer. | Do not pay with this requirement. Pick another `accepts[]` element, or report the requirement to the operator. |
+| `x402.keyring_load_failed` | The signer cannot be loaded, for a reason that has no `auth.*` code of its own. | Do not retry. Ask the operator to check the profile's signer entry. |
+| `x402.auth_entry_sign_failed` | `stellar_x402_create_payment` cannot sign the payer's authorization entry. `stellar_x402_authenticated_payment` reports this as `x402.payment_build_failed`. | Do not retry in a loop. Report it to the operator. |
+| `x402.transaction_build_failed` | `stellar_x402_create_payment` cannot assemble the payment, for example because the re-simulation data does not decode. `stellar_x402_authenticated_payment` reports this as `x402.payment_build_failed`. | Do not retry in a loop. Report it to the operator. |
+| `x402.receipt_parse_failed` | The input to `stellar_x402_parse_receipt` is neither a base64 `PAYMENT-RESPONSE` value that decodes to a `SettleResponse` nor a raw JSON `SettleResponse`. | Pass the `PAYMENT-RESPONSE` header value unchanged: no decoding, trimming, or re-encoding. |
 
 ## SEP-24 interactive POST contract
 
