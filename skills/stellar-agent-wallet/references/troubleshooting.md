@@ -71,15 +71,17 @@ amount, asset, or memo before building the transaction.
 |---|---|---|
 | `validation.amount_units_required` | The amount has no unit label, such as `"10"`. | Resend it with its unit, such as `"10 XLM"`, or pass `amount_in_stroops` to `stellar_pay` or `stellar_pay_commit`. |
 | `validation.amount_precision_exceeded` | The amount has more than seven decimal places. | Round it to seven decimal places and resend. |
-| `validation.amount_out_of_range` | The value does not fit the signed 64-bit stroop range. | Lower the amount and resend. |
-| `validation.amount_malformed` | The value is not a decimal number followed by its unit, or the unit is not the asset's code (case-sensitive for an issued asset, case-insensitive `XLM` for native). `stellar-agent pay` and `stellar-agent accounts create` report every amount refusal under this code. | Resend the amount as a decimal string followed by the asset code, such as `"10.5 USDC"`. |
+| `validation.amount_out_of_range` | The value exceeds 9223372036854775807 stroops (922337203685.4775807 in asset units) in magnitude. | Resend an amount within that limit. |
+| `validation.amount_malformed` | The value is not a decimal number followed by its unit, or the unit is not the asset's code (case-sensitive for an issued asset, case-insensitive `XLM` for native). `stellar-agent pay` and `stellar-agent accounts create` report every amount refusal under this code. | Resend the amount as a decimal string followed by the asset code, such as `"10.5 USDC"`. On the CLI, also check the precision and the range. |
 | `validation.asset_invalid` | The descriptor is neither `native` or `XLM` nor `CODE:ISSUER` with a 1 to 12 character alphanumeric code and a valid G-strkey issuer. | Fix the descriptor and resend. |
 | `validation.memo_invalid_type` | A hash or return memo is not exactly 64 hex characters, or, on `stellar-agent pay`, a text memo is longer than 28 bytes. The MCP tools refuse a longer text memo as an invalid argument before this check. | Resend a 64-character hex value for a hash or return memo, or shorten the text memo to 28 bytes. |
 | `validation.memo_mutually_exclusive` | More than one memo field is set. The CLI parser refuses two memo flags as `validation.usage_error`. | Send one memo field only. |
 
-The two MCP payment tools return the four amount codes and
-`validation.asset_invalid` as a JSON-RPC invalid-params error whose message
-starts with the code, and return the two memo codes in the result envelope.
+The two MCP payment tools return the four amount codes as a JSON-RPC
+invalid-params error whose message starts with the code, and
+`validation.asset_invalid` as one whose message starts with `invalid asset:`
+followed by the code. `stellar_pay` returns the two memo codes in the result
+envelope; `stellar_pay_commit` reports a memo refusal as `nonce.expired`.
 
 ## Policy-engine codes
 
