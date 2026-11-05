@@ -503,26 +503,12 @@ pub async fn run(args: &MigrateVerifierArgs) -> i32 {
 
     // Build handler context: resolves signer, opens audit writer, constructs RPC handles.
     let ctx = match async {
-        crate::commands::smart_account::common::open_audit_writer(
+        let admission = crate::commands::smart_account::common::submission_admission(
             &profile,
             origin,
             &resolved_profile.name,
-        )?;
-        if !context.chain_id.is_mainnet() {
-            crate::commands::smart_account::common::signing_secondary_rpc_url(&context)
-                .map_err(|error| wrap_sa_error(&error))?;
-        }
-        let admission = submission_admission(
-            &profile,
-            &resolved_profile.name,
-            context.chain_id.caip2_str(),
-            stellar_agent_core::timefmt::now_unix_ms().map_err(|_| {
-                WalletError::Submission(
-                    stellar_agent_core::SubmissionError::IntentRecordUnavailable {
-                        class: "policy_unavailable",
-                    },
-                )
-            })?,
+            "stellar_smart_account_migrate_verifier",
+            &context,
         )?;
         CommonHandlerContext::new(
             args,
@@ -1111,22 +1097,6 @@ fn emit_error_sa(err: &SaError, request_id: &str) -> i32 {
     emit_error(&wrap_sa_error(err), request_id)
 }
 
-/// Supplies count admission only for the submitting migration path.
-fn submission_admission(
-    profile: &stellar_agent_core::profile::schema::Profile,
-    profile_name: &str,
-    chain_id: &str,
-    now_ms: u64,
-) -> Result<std::sync::Arc<stellar_agent_network::NoValueAdmission>, WalletError> {
-    crate::commands::submission_record::no_value_admission(
-        profile,
-        profile_name,
-        "stellar_smart_account_migrate_verifier",
-        chain_id,
-        now_ms,
-    )
-}
-
 #[cfg(test)]
 mod tests {
     #![allow(clippy::expect_used, reason = "test fixture assertions")]
@@ -1205,8 +1175,14 @@ mod tests {
                 )
                 .unwrap();
             let before = std::fs::read(window.path()).unwrap();
-            let admission =
-                submission_admission(&profile, "intent", "stellar:testnet", now).unwrap();
+            let admission = crate::commands::submission_record::no_value_admission(
+                &profile,
+                "intent",
+                "stellar_smart_account_migrate_verifier",
+                "stellar:testnet",
+                now,
+            )
+            .unwrap();
             let plan =
                 stellar_agent_network::signed_intent::test_helpers::intent_fixture_plan(1, 60).0;
             let result = admission.admit(&plan).await;

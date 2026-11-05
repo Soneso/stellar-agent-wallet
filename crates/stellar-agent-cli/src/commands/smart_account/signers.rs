@@ -1307,16 +1307,14 @@ async fn add_run(args: &AddArgs) -> i32 {
         unreachable!("ArgGroup `new_signer_source` guarantees one signer-source flag is set")
     };
 
-    let ctx = match async {
-        let admission = crate::commands::smart_account::common::submission_admission(
-            &profile,
-            origin,
-            &resolved.name,
-            "stellar_smart_account_signers",
-            &context,
-        )?;
-        CommonHandlerContext::new(args, resolved, profile, origin, &context, Some(admission)).await
-    }
+    let ctx = match CommonHandlerContext::new_admitted(
+        args,
+        resolved,
+        profile,
+        origin,
+        &context,
+        "stellar_smart_account_signers",
+    )
     .await
     {
         Ok(ctx) => ctx,
@@ -1521,16 +1519,14 @@ async fn remove_run(args: &RemoveArgs) -> i32 {
         );
     }
 
-    let ctx = match async {
-        let admission = crate::commands::smart_account::common::submission_admission(
-            &profile,
-            origin,
-            &resolved.name,
-            "stellar_smart_account_signers",
-            &context,
-        )?;
-        CommonHandlerContext::new(args, resolved, profile, origin, &context, Some(admission)).await
-    }
+    let ctx = match CommonHandlerContext::new_admitted(
+        args,
+        resolved,
+        profile,
+        origin,
+        &context,
+        "stellar_smart_account_signers",
+    )
     .await
     {
         Ok(ctx) => ctx,
@@ -1673,16 +1669,14 @@ async fn set_threshold_run(args: &SetThresholdArgs) -> i32 {
         );
     }
 
-    let ctx = match async {
-        let admission = crate::commands::smart_account::common::submission_admission(
-            &profile,
-            origin,
-            &resolved.name,
-            "stellar_smart_account_signers",
-            &context,
-        )?;
-        CommonHandlerContext::new(args, resolved, profile, origin, &context, Some(admission)).await
-    }
+    let ctx = match CommonHandlerContext::new_admitted(
+        args,
+        resolved,
+        profile,
+        origin,
+        &context,
+        "stellar_smart_account_signers",
+    )
     .await
     {
         Ok(ctx) => ctx,
@@ -1821,16 +1815,14 @@ async fn set_weighted_threshold_run(args: &SetWeightedThresholdArgs) -> i32 {
         );
     }
 
-    let ctx = match async {
-        let admission = crate::commands::smart_account::common::submission_admission(
-            &profile,
-            origin,
-            &resolved.name,
-            "stellar_smart_account_signers",
-            &context,
-        )?;
-        CommonHandlerContext::new(args, resolved, profile, origin, &context, Some(admission)).await
-    }
+    let ctx = match CommonHandlerContext::new_admitted(
+        args,
+        resolved,
+        profile,
+        origin,
+        &context,
+        "stellar_smart_account_signers",
+    )
     .await
     {
         Ok(ctx) => ctx,
@@ -2049,16 +2041,14 @@ async fn set_signer_weight_run(args: &SetSignerWeightArgs) -> i32 {
         Err(e) => return emit_error(&e, &request_id),
     };
 
-    let ctx = match async {
-        let admission = crate::commands::smart_account::common::submission_admission(
-            &profile,
-            origin,
-            &resolved.name,
-            "stellar_smart_account_signers",
-            &context,
-        )?;
-        CommonHandlerContext::new(args, resolved, profile, origin, &context, Some(admission)).await
-    }
+    let ctx = match CommonHandlerContext::new_admitted(
+        args,
+        resolved,
+        profile,
+        origin,
+        &context,
+        "stellar_smart_account_signers",
+    )
     .await
     {
         Ok(ctx) => ctx,
@@ -2288,16 +2278,14 @@ async fn batch_add_run(args: &BatchAddArgs) -> i32 {
         }
     }
 
-    let ctx = match async {
-        let admission = crate::commands::smart_account::common::submission_admission(
-            &profile,
-            origin,
-            &resolved.name,
-            "stellar_smart_account_signers",
-            &context,
-        )?;
-        CommonHandlerContext::new(args, resolved, profile, origin, &context, Some(admission)).await
-    }
+    let ctx = match CommonHandlerContext::new_admitted(
+        args,
+        resolved,
+        profile,
+        origin,
+        &context,
+        "stellar_smart_account_signers",
+    )
     .await
     {
         Ok(ctx) => ctx,
@@ -3805,17 +3793,14 @@ mod tests {
         let (profile, origin) = load_command_profile(&resolved).expect("profile");
         let context = network_context_for_command(&profile, &resolved.name, args.endpoint_flags())
             .expect("context");
-        let ctx = async {
-            let admission = crate::commands::smart_account::common::submission_admission(
-                &profile,
-                origin,
-                &resolved.name,
-                "stellar_smart_account_signers",
-                &context,
-            )?;
-            CommonHandlerContext::new(&args, resolved, profile, origin, &context, Some(admission))
-                .await
-        }
+        let ctx = CommonHandlerContext::new_admitted(
+            &args,
+            resolved,
+            profile,
+            origin,
+            &context,
+            "stellar_smart_account_signers",
+        )
         .await
         .unwrap();
         wiremock::Mock::given(wiremock::matchers::method("POST"))

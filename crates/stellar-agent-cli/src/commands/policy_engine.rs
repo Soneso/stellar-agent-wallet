@@ -1038,6 +1038,7 @@ mod tests {
     use stellar_agent_core::profile::schema::{PolicyEngineKind, Profile};
 
     use super::*;
+    use stellar_agent_network::policy_state::PersistedWindowStore;
 
     /// Constructs a minimal testnet `Profile` whose `policy_owner_key_id.service`
     /// is set to `service`.
@@ -2328,6 +2329,162 @@ decision = "allow"
             "a forged/corrupted policy signature must fail closed, not silently disable \
              enforcement"
         );
+    }
+
+    struct UnvaluedRecorderFixture {
+        profile: Profile,
+        _home_guard: stellar_agent_test_support::StellarAgentHomeGuard,
+        _pubkey_guard: TestEnvVarGuard,
+        _home: tempfile::TempDir,
+    }
+
+    fn unvalued_recorder_fixture(name: &str, policy_body: &str) -> UnvaluedRecorderFixture {
+        use ed25519_dalek::SigningKey;
+        use rand_core::OsRng;
+
+        stellar_agent_test_support::keyring_mock::install().expect("mock keyring store init");
+
+        let home = tempfile::TempDir::new().expect("tempdir");
+        write_v1_profile_toml(home.path(), name);
+
+        let owner_sk = SigningKey::generate(&mut OsRng);
+        let owner_pk = owner_sk.verifying_key().to_bytes();
+
+        let canon = stellar_agent_core::policy::v1::canonical::canonical_bytes(policy_body)
+            .expect("canonical_bytes");
+        let policy_digest = stellar_agent_core::policy::v1::signature::digest(&canon);
+        let sig = stellar_agent_core::policy::v1::signature::sign(&policy_digest, &owner_sk);
+        let sig_hex: String = sig.iter().map(|b| format!("{b:02x}")).collect();
+        let owner_g = stellar_strkey::ed25519::PublicKey(owner_pk)
+            .to_string()
+            .to_string();
+        let signed_policy =
+            format!("{policy_body}\n[signature]\nowner_id = \"{owner_g}\"\nsig = \"{sig_hex}\"\n");
+
+        let policies_dir = home.path().join("policies");
+        std::fs::create_dir_all(&policies_dir).expect("create policies dir");
+        std::fs::write(policies_dir.join(format!("{name}.toml")), signed_policy)
+            .expect("write policy toml");
+
+        let pubkey_file = home.path().join("owner_pubkey.txt");
+        std::fs::write(
+            &pubkey_file,
+            stellar_agent_core::profile::owner_key::encode_owner_public_key(&owner_pk),
+        )
+        .expect("write owner pubkey file");
+
+        let home_guard = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
+        let pubkey_guard = TestEnvVarGuard::set(
+            "STELLAR_AGENT_TEST_OWNER_PUBKEY_FILE",
+            pubkey_file.as_os_str(),
+        );
+
+        let profile = stellar_agent_core::profile::loader::load(name, None)
+            .expect("v1 profile file must load");
+        UnvaluedRecorderFixture {
+            profile,
+            _home_guard: home_guard,
+            _pubkey_guard: pubkey_guard,
+            _home: home,
+        }
+    }
+
+    fn unvalued_record<'a>(
+        profile: &'a Profile,
+        name: &str,
+        tool: &'static str,
+    ) -> crate::commands::submission_record::SubmitRecord<'a> {
+        crate::commands::submission_record::SubmitRecord {
+            profile,
+            profile_name: name.into(),
+            verb: "execute",
+            tool,
+            policy_decision: stellar_agent_core::audit_log::PolicyDecision::Allow,
+            chain_id: "stellar:testnet",
+            effects: None,
+            unvalued: Some(stellar_agent_core::policy::v1::OpaqueReason::UnvaluedContractCall),
+            audit: None,
+            now_ms: stellar_agent_core::timefmt::now_unix_ms().unwrap(),
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn an_unvalued_call_under_a_value_cap_builds_no_recorder() {
+        for tool in [
+            "stellar_smart_account_execute",
+            "stellar_smart_account_timelock_execute",
+            "stellar_smart_account_timelock_schedule",
+        ] {
+            let name = "unvalued-cap";
+            let policy = format!(
+                r#"version = 1
+scope = "profile:{name}"
+[[rules]]
+match = {{ tool = "{tool}", chain = "*" }}
+criteria = [{{ kind = "per_period_cap", asset = "native", window = "1d", max_stroops = 1000000000 }}]
+decision = "allow"
+"#
+            );
+            let fixture = unvalued_recorder_fixture(name, &policy);
+            let result = crate::commands::submission_record::build_recorder(unvalued_record(
+                &fixture.profile,
+                name,
+                tool,
+            ));
+            let error = result
+                .map(|_| ())
+                .expect_err("unvalued calls refuse a value cap");
+            assert_eq!(error.code(), "policy.deny.unsizable_value_effect", "{tool}");
+            assert!(!PersistedWindowStore::for_profile(name).path().exists());
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn an_exempt_unvalued_call_takes_its_count_charge() {
+        use stellar_agent_network::{SignedIntentPlan, SubmissionRecorder};
+        let name = "unvalued-exempt";
+        let tool = "stellar_smart_account_execute";
+        let policy = format!(
+            r#"version = 1
+scope = "profile:{name}"
+[[rules]]
+match = {{ tool = "{tool}", chain = "*" }}
+allow_opaque_signing = true
+criteria = [{{ kind = "rate_limit", window = "1d", max_calls = 1 }}]
+decision = "allow"
+"#
+        );
+        let fixture = unvalued_recorder_fixture(name, &policy);
+        let recorder = crate::commands::submission_record::build_recorder(unvalued_record(
+            &fixture.profile,
+            name,
+            tool,
+        ))
+        .unwrap();
+        let plan = |sequence| {
+            SignedIntentPlan::new(
+                stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE,
+                "fixture",
+                "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+                sequence,
+                [7; 32],
+                vec![],
+                None,
+            )
+            .unwrap()
+        };
+        let _proof = recorder.admit_signed_intent(&plan(1)).await.unwrap();
+        let intents = PersistedWindowStore::for_profile(name)
+            .signed_intents(name, &fixture.profile)
+            .unwrap();
+        assert_eq!(intents.len(), 1);
+        assert_eq!(intents[0].legs.len(), 1);
+        assert_eq!(intents[0].legs[0].bucket, "rate_limit");
+        assert_eq!(intents[0].legs[0].amount, "1");
+        let error = recorder.admit_signed_intent(&plan(2)).await.err().unwrap();
+        assert_eq!(error.code(), "policy.deny.rate_limit_exceeded");
     }
 
     // ── Cross-process shape: two independent `build_v1_policy_engine` calls

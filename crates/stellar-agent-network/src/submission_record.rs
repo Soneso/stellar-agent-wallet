@@ -923,15 +923,8 @@ impl WalletSubmissionRecorder<'_> {
     }
 }
 
-/// Turns a refused reservation write into the error the caller reports.
-///
-/// A bucket that can no longer admit the spend is a policy denial, reported
-/// under the wire code the gate reports for the same reason and carrying the
-/// same typed reason. A window that already holds these bytes is a
-/// resubmission, reported as `submission.tx_already_submitted` with the
-/// transaction to reconcile. Every other refusal is a record the wallet could
-/// not write, which is what `submission.record_unavailable` names. All of
-/// them refuse the send.
+/// Reports a refused signed intent write through the intent error,
+/// keeping a duplicate reservation as a resubmission.
 fn signing_reservation_refusal(
     error: WindowStoreError,
     intent: &SubmissionIntent,
@@ -944,6 +937,15 @@ fn signing_reservation_refusal(
     }
 }
 
+/// Turns a refused reservation write into the error the caller reports.
+///
+/// A bucket that cannot admit the spend is a policy denial, reported
+/// under the wire code the gate reports for the same reason and carrying the
+/// same typed reason. A window that already holds these bytes is a
+/// resubmission, reported as `submission.tx_already_submitted` with the
+/// transaction to reconcile. Every other refusal is a record the wallet could
+/// not write, which is what `submission.record_unavailable` names. All of
+/// them refuse the send.
 fn reservation_refusal(error: WindowStoreError, intent: &SubmissionIntent) -> WalletError {
     if let Some(error) = error.chain_validation_error() {
         return WalletError::Validation(error);
@@ -1655,10 +1657,10 @@ mod tests {
                 .code(),
             "submission.tx_already_submitted"
         );
-        let assert_totals = |amount, calls| {
+        let assert_totals = |window: &PersistedWindowStore, profile: &Profile, amount, calls| {
             let state = PolicyStateStore::new();
             PersistedWindowStore::at_path(window.path().to_path_buf())
-                .load_into("intent", &profile, &state)
+                .load_into("intent", profile, &state)
                 .unwrap();
             for duration in [60, 120] {
                 assert_eq!(
@@ -1681,14 +1683,85 @@ mod tests {
                 );
             }
         };
-        assert_totals(60, 1);
+        assert_totals(&window, &profile, 60, 1);
+        let dir_c = tempfile::tempdir().unwrap();
+        let profile_c = Profile::builder_testnet_named(
+            "intent-confirm",
+            "bind-once",
+            "account",
+            "confirm-nonce",
+            "account",
+        )
+        .build();
+        let window_c = PersistedWindowStore::at_path(dir_c.path().join("intent.window"));
+        let (plan_c, envelope_c) = intent_fixture_plan(3, 60);
+        let sizing_c =
+            CheckedSizing::for_test(SizingBasis::MeasuredValue, plan_c.legs().to_vec()).unwrap();
+        let recorder_c = WalletSubmissionRecorder::new(
+            &profile_c,
+            "intent",
+            "test",
+            Some("stellar:testnet".into()),
+            PolicyDecision::Allow,
+            vec![],
+            plan_c.legs().to_vec(),
+            ReceiptStore::open_at(dir_c.path(), "intent").unwrap(),
+            window_c.clone(),
+            None,
+            None,
+            "request",
+            1000,
+        )
+        .with_signing_sizing(sizing_c);
+        let exposure_c = recorder_c
+            .admit_signed_intent(&plan_c)
+            .await
+            .unwrap()
+            .expose();
+        let intent_c = make_intent(&envelope_c);
+        recorder_c
+            .pre_send_bound(
+                &intent_c,
+                &crate::IntentBinding::new(&exposure_c, &envelope_c),
+            )
+            .await
+            .unwrap();
+        recorder_c
+            .outcome(
+                &intent_c,
+                &SubmissionOutcome::Success {
+                    ledger: 2,
+                    created_at: None,
+                },
+            )
+            .await;
+        assert_totals(&window_c, &profile_c, 60, 1);
+        let intents_c = window_c.signed_intents("intent", &profile_c).unwrap();
+        assert_eq!(intents_c.len(), 1);
+        assert_eq!(
+            intents_c[0].status,
+            "authorization exposed, submission bound"
+        );
+        let wire_c: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(window_c.path()).unwrap()[32..]).unwrap();
+        assert_eq!(
+            wire_c["entries"].as_array().unwrap().len(),
+            plan_c.legs().len()
+        );
+        for entry in wire_c["entries"].as_array().unwrap() {
+            let records = entry["records"].as_array().unwrap();
+            assert_eq!(records.len(), 1);
+            assert_eq!(records[0]["status"], "exposure");
+            assert!(records[0]["observed_at_ms"].is_u64());
+            assert_eq!(records[0]["signed_intent"], exposure_c.intent_id().unwrap());
+        }
         recorder.settle_window(&intent, WindowSettlement::Release);
         assert!(window.pending_reservations(&profile).unwrap().is_empty());
         assert_eq!(
             window.signed_intents("intent", &profile).unwrap()[0].status,
             "authorization exposed, submission bound"
         );
-        assert_totals(60, 1);
+        assert_totals(&window, &profile, 60, 1);
         recorder
             .outcome(
                 &intent,
@@ -1698,7 +1771,7 @@ mod tests {
                 },
             )
             .await;
-        assert_totals(60, 1);
+        assert_totals(&window, &profile, 60, 1);
         let (plan_b, envelope_b) = intent_fixture_plan(2, 60);
         let legs: Vec<_> = plan_b
             .legs()
@@ -1743,7 +1816,7 @@ mod tests {
             error,
             WalletError::Submission(SubmissionError::IntentBindingMismatch { field: "legs" })
         ));
-        assert_totals(120, 2);
+        assert_totals(&window, &profile, 120, 2);
         assert!(
             window
                 .signed_intents("intent", &profile)

@@ -924,7 +924,7 @@ Lists the profile's signed smart-account intents from the verified window state.
 | `--profile <NAME>` | Profile to inspect. |
 | `--output <FORMAT>` | Output format. |
 
-Each entry carries `intent_id`, `status`, `legs`, `greatest_expiration_ledger`, `admitted_at_ms`, `bound_tx_hash` when bound, and `accounting_horizon`.
+Each entry carries `intent_id`, `status`, `auth_address` redacted to its first and last five characters, `legs`, `greatest_expiration_ledger`, `admitted_at_ms`, `bound_tx_hash` when bound, and `accounting_horizon`.
 
 `accounting_horizon` is `open`: the intent counts against the caps. From its first signer call on, nothing releases it.
 

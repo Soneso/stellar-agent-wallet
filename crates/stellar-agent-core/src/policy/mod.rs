@@ -1731,10 +1731,10 @@ pub struct Evaluation {
 pub struct NoopPolicyEngine;
 
 impl PolicyEngine for NoopPolicyEngine {
-    /// Records certified accounting entries for the supplied value.
+    /// Returns `NoApplicableLimit` because this engine holds no window state.
     ///
     /// # Errors
-    /// Returns no applicable limit because this engine holds no window state.
+    /// Never returns an error.
     fn record_confirmed_checked(
         &self,
         _tool: &ToolDescriptor,
@@ -1747,10 +1747,10 @@ impl PolicyEngine for NoopPolicyEngine {
         )?))
     }
 
-    /// Checks value rules and sizes an unvalued call without recording it.
+    /// Returns `NoApplicableLimit` because this engine holds no window state.
     ///
     /// # Errors
-    /// Returns no applicable limit because this engine holds no window state.
+    /// Never returns an error.
     fn size_unvalued_call(
         &self,
         _tool: &ToolDescriptor,
@@ -1764,10 +1764,10 @@ impl PolicyEngine for NoopPolicyEngine {
         )?))
     }
 
-    /// Sizes count charges for a call without a value leg.
+    /// Returns `NoApplicableLimit` because this engine holds no window state.
     ///
     /// # Errors
-    /// Returns no applicable limit because this engine holds no window state.
+    /// Never returns an error.
     fn size_no_value(
         &self,
         _tool: &ToolDescriptor,

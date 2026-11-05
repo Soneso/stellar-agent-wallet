@@ -24,11 +24,13 @@ pub enum SignerDescriptor {
     /// A classic account key signing address authorization or the envelope.
     AccountKey {
         /// The Ed25519 public key.
+        #[serde(with = "hash_hex")]
         public_key: [u8; 32],
     },
     /// A delegated account in the smart account payload.
     Delegated {
         /// The delegated Ed25519 public key.
+        #[serde(with = "hash_hex")]
         account: [u8; 32],
     },
     /// A verifier contract and the hash of its encoded key data.
@@ -36,6 +38,7 @@ pub enum SignerDescriptor {
         /// The verifier's contract strkey.
         verifier: String,
         /// SHA-256 of the verifier's key data.
+        #[serde(with = "hash_hex")]
         key_data_sha256: [u8; 32],
     },
 }
@@ -146,51 +149,56 @@ pub(crate) struct SubjectFacts {
     pub signers: Vec<SignerDescriptor>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum SubjectStage {
+    Credential,
+    Nonce,
+    Expiration,
+    Invocation,
+    RuleIds,
+    Signers,
+}
+
 impl SubjectFacts {
-    fn encode_through(&self, field: u8) -> Vec<u8> {
+    fn encode_through(&self, stage: SubjectStage) -> Vec<u8> {
         let mut bytes = vec![match self.kind {
             SubjectKind::SmartAccount => 0,
             SubjectKind::AccountKey => 1,
             SubjectKind::SourceAccount => 2,
         }];
         string(&mut bytes, &self.credential);
-        if field == 0 {
-            return bytes;
+        if stage >= SubjectStage::Nonce {
+            option(&mut bytes, self.nonce, |out, value| {
+                out.extend(value.to_be_bytes())
+            });
         }
-        option(&mut bytes, self.nonce, |out, value| {
-            out.extend(value.to_be_bytes())
-        });
-        if field == 1 {
-            return bytes;
+        if stage >= SubjectStage::Expiration {
+            option(
+                &mut bytes,
+                self.signature_expiration_ledger,
+                |out, value| out.extend(value.to_be_bytes()),
+            );
         }
-        option(
-            &mut bytes,
-            self.signature_expiration_ledger,
-            |out, value| out.extend(value.to_be_bytes()),
-        );
-        if field == 2 {
-            return bytes;
+        if stage >= SubjectStage::Invocation {
+            bytes.extend(self.invocation_sha256);
         }
-        bytes.extend(self.invocation_sha256);
-        if field == 3 {
-            return bytes;
+        if stage >= SubjectStage::RuleIds {
+            count(&mut bytes, self.context_rule_ids.len());
+            for id in &self.context_rule_ids {
+                bytes.extend(id.to_be_bytes());
+            }
         }
-        count(&mut bytes, self.context_rule_ids.len());
-        for id in &self.context_rule_ids {
-            bytes.extend(id.to_be_bytes());
-        }
-        if field == 4 {
-            return bytes;
-        }
-        count(&mut bytes, self.signers.len());
-        for signer in &self.signers {
-            bytes.extend(signer.encode());
+        if stage >= SubjectStage::Signers {
+            count(&mut bytes, self.signers.len());
+            for signer in &self.signers {
+                bytes.extend(signer.encode());
+            }
         }
         bytes
     }
 
     pub(crate) fn encode(&self) -> Vec<u8> {
-        self.encode_through(5)
+        self.encode_through(SubjectStage::Signers)
     }
 
     fn validate(&self, envelope_source: &str) -> Result<(), &'static str> {
@@ -545,6 +553,14 @@ impl PlanFacts {
     }
 
     pub(crate) fn compare(&self, other: &Self) -> Result<(), &'static str> {
+        const STAGES: [(SubjectStage, &str); 6] = [
+            (SubjectStage::Credential, "auth_subjects"),
+            (SubjectStage::Nonce, "nonce"),
+            (SubjectStage::Expiration, "expiration"),
+            (SubjectStage::Invocation, "invocation"),
+            (SubjectStage::RuleIds, "context_rule_ids"),
+            (SubjectStage::Signers, "signers"),
+        ];
         if self.chain_scope != other.chain_scope {
             return Err("chain");
         }
@@ -557,21 +573,11 @@ impl PlanFacts {
         if self.envelope_sequence != other.envelope_sequence {
             return Err("envelope_sequence");
         }
-        for (stage, field) in [
-            "auth_subjects",
-            "nonce",
-            "expiration",
-            "invocation",
-            "context_rule_ids",
-            "signers",
-        ]
-        .into_iter()
-        .enumerate()
-        {
+        for (stage, field) in STAGES {
             let projection = |subjects: &[SubjectFacts]| {
                 let mut values: Vec<_> = subjects
                     .iter()
-                    .map(|subject| subject.encode_through(stage as u8))
+                    .map(|subject| subject.encode_through(stage))
                     .collect();
                 values.sort();
                 values
@@ -927,70 +933,25 @@ pub(crate) mod hash_hex {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    #![allow(clippy::unwrap_used, clippy::panic, reason = "test assertions")]
-    use super::*;
-    use stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE;
+pub(crate) mod option_hash_hex {
+    use serde::{Deserialize, Deserializer, Serializer};
 
-    fn empty_plan(sequence: i64) -> Result<SignedIntentPlan, WalletError> {
-        SignedIntentPlan::new(
-            TESTNET_PASSPHRASE,
-            "fixture",
-            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
-            sequence,
-            [7; 32],
-            Vec::new(),
-            None,
-        )
+    pub fn serialize<S: Serializer>(
+        value: &Option<[u8; 32]>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        match value {
+            Some(value) => serializer.serialize_some(&crate::submit::bytes_to_hex(value)),
+            None => serializer.serialize_none(),
+        }
     }
 
-    #[test]
-    fn intent_identity_known_answer_and_leg_independence() {
-        use stellar_agent_core::policy::v1::criteria::{WindowLimit, state_store::StateKey};
-        let plan = empty_plan(1).unwrap();
-        assert_eq!(
-            plan.facts.intent_id(),
-            "intent-d2fc2b717c1d24c19de849b48773fd969c9fb697d1668c443846d1b09879081d"
-        );
-        let with_legs = plan.with_legs(&[WindowEntry::new(
-            StateKey::new("fixture", 1, "rate_limit", 60),
-            1000,
-            1,
-            WindowLimit::Count {
-                window: "1m".into(),
-                max_calls: 1,
-            },
-        )]);
-        assert_eq!(plan.facts.intent_id(), with_legs.facts.intent_id());
-        assert_ne!(
-            plan.facts.intent_id(),
-            empty_plan(2).unwrap().facts.intent_id()
-        );
-        assert!(empty_plan(0).is_err());
-        assert_eq!(plan.permitted_signings().len(), 1);
-    }
-
-    #[test]
-    fn canonical_subject_rejects_another_address_kind() {
-        let account = ScAddress::Account(stellar_xdr::AccountId(
-            stellar_xdr::PublicKey::PublicKeyTypeEd25519(stellar_xdr::Uint256([0; 32])),
-        ));
-        let contract = ScAddress::Contract(stellar_xdr::ContractId(Hash([1; 32])));
-        assert_eq!(AuthSubject::smart_account(&account), Err("auth_subjects"));
-        assert_eq!(AuthSubject::account_key(&contract), Err("auth_subjects"));
-        assert!(AuthSubject::source("not-an-account").is_err());
-    }
-
-    #[test]
-    fn proof_exposure_keeps_frozen_plan() {
-        let proof = IntentProof::new(None, empty_plan(1).unwrap());
-        let exposure = proof.expose();
-        assert!(exposure.intent_id().is_none());
-        assert_eq!(
-            exposure.plan().facts.intent_id(),
-            "intent-d2fc2b717c1d24c19de849b48773fd969c9fb697d1668c443846d1b09879081d"
-        );
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Option<[u8; 32]>, D::Error> {
+        #[derive(Deserialize)]
+        struct Hash(#[serde(with = "super::hash_hex")] [u8; 32]);
+        Ok(Option::<Hash>::deserialize(deserializer)?.map(|hash| hash.0))
     }
 }
 
@@ -1134,6 +1095,135 @@ pub(crate) fn store_refusal(error: crate::policy_state::WindowStoreError) -> Wal
         WindowStoreError::PolicyDenied { reason } => WalletError::PolicyDenied { reason },
         WindowStoreError::IntentBindingMismatch { field } => mismatch(field),
         _ => unavailable("window_unavailable"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::panic, reason = "test assertions")]
+    use super::*;
+    use stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE;
+
+    fn empty_plan(sequence: i64) -> Result<SignedIntentPlan, WalletError> {
+        SignedIntentPlan::new(
+            TESTNET_PASSPHRASE,
+            "fixture",
+            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+            sequence,
+            [7; 32],
+            Vec::new(),
+            None,
+        )
+    }
+
+    #[test]
+    fn intent_identity_known_answer_and_leg_independence() {
+        use stellar_agent_core::policy::v1::criteria::{WindowLimit, state_store::StateKey};
+        let plan = empty_plan(1).unwrap();
+        assert_eq!(
+            plan.facts.intent_id(),
+            "intent-d2fc2b717c1d24c19de849b48773fd969c9fb697d1668c443846d1b09879081d"
+        );
+        let with_legs = plan.with_legs(&[WindowEntry::new(
+            StateKey::new("fixture", 1, "rate_limit", 60),
+            1000,
+            1,
+            WindowLimit::Count {
+                window: "1m".into(),
+                max_calls: 1,
+            },
+        )]);
+        assert_eq!(plan.facts.intent_id(), with_legs.facts.intent_id());
+        assert_ne!(
+            plan.facts.intent_id(),
+            empty_plan(2).unwrap().facts.intent_id()
+        );
+        assert!(empty_plan(0).is_err());
+        assert_eq!(plan.permitted_signings().len(), 1);
+    }
+
+    #[test]
+    fn intent_identity_known_answer_covers_every_subject_kind() {
+        let facts = PlanFacts {
+            chain_scope: ChainScope::from_passphrase(TESTNET_PASSPHRASE).unwrap(),
+            auth_address: "CABAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAFNSZ".into(),
+            envelope_source: "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF".into(),
+            envelope_sequence: 4_294_967_297,
+            host_invocation_sha256: [7; 32],
+            subjects: vec![
+                SubjectFacts {
+                    kind: SubjectKind::SmartAccount,
+                    credential: "CABAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAFNSZ".into(),
+                    nonce: Some(0x0102_0304_0506_0708),
+                    signature_expiration_ledger: Some(1_000_000),
+                    invocation_sha256: [8; 32],
+                    context_rule_ids: vec![3, 1],
+                    signers: vec![
+                        SignerDescriptor::Delegated { account: [4; 32] },
+                        SignerDescriptor::External {
+                            verifier: "CACQKBIFAUCQKBIFAUCQKBIFAUCQKBIFAUCQKBIFAUCQKBIFAUCQLC2U"
+                                .into(),
+                            key_data_sha256: [6; 32],
+                        },
+                    ],
+                },
+                SubjectFacts {
+                    kind: SubjectKind::AccountKey,
+                    credential: "GAAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQDZ7H".into(),
+                    nonce: Some(42),
+                    signature_expiration_ledger: Some(999_999),
+                    invocation_sha256: [9; 32],
+                    context_rule_ids: vec![],
+                    signers: vec![SignerDescriptor::AccountKey {
+                        public_key: [1; 32],
+                    }],
+                },
+                SubjectFacts {
+                    kind: SubjectKind::SourceAccount,
+                    credential: "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF".into(),
+                    nonce: None,
+                    signature_expiration_ledger: None,
+                    invocation_sha256: [10; 32],
+                    context_rule_ids: vec![],
+                    signers: vec![],
+                },
+            ],
+            greatest_expiration_ledger: Some(1_000_000),
+        };
+        assert!(facts.validate().is_ok());
+        assert_eq!(
+            facts.intent_id(),
+            "intent-c08cb0b270df5b730c5d533244b0537bdd5a4daa73faea8f90c3b80b4306b052"
+        );
+        let mut duplicate = facts.clone();
+        duplicate.subjects.insert(1, duplicate.subjects[0].clone());
+        assert!(duplicate.validate().is_ok());
+        assert_eq!(
+            duplicate.intent_id(),
+            "intent-0078b97cffb5771a73eff5e1b84ee11d40d21aa6152c543a18b5397ce3c2ebc4"
+        );
+    }
+
+    #[test]
+    fn canonical_subject_rejects_another_address_kind() {
+        let account = ScAddress::Account(stellar_xdr::AccountId(
+            stellar_xdr::PublicKey::PublicKeyTypeEd25519(stellar_xdr::Uint256([0; 32])),
+        ));
+        let contract = ScAddress::Contract(stellar_xdr::ContractId(Hash([1; 32])));
+        assert_eq!(AuthSubject::smart_account(&account), Err("auth_subjects"));
+        assert_eq!(AuthSubject::account_key(&contract), Err("auth_subjects"));
+        assert!(AuthSubject::source("not-an-account").is_err());
+    }
+
+    #[test]
+    fn proof_exposure_keeps_frozen_plan() {
+        let proof = IntentProof::new(None, empty_plan(1).unwrap());
+        let exposure = proof.expose();
+        assert!(exposure.intent_id().is_none());
+        assert_eq!(
+            exposure.plan().facts.intent_id(),
+            "intent-d2fc2b717c1d24c19de849b48773fd969c9fb697d1668c443846d1b09879081d"
+        );
     }
 }
 

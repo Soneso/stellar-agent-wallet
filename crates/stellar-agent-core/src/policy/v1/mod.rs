@@ -1257,33 +1257,10 @@ impl PolicyEngine for PolicyEngineV1 {
         reason: OpaqueReason,
         now_ms: u64,
     ) -> Result<SizingOutcome, PolicyError> {
-        let effective = self.effective_unvalued(tool, reason);
-        if matches!(effective, ValueClass::Opaque(_)) {
-            // Count admission uses the durable store under its lock.
-            // The value refusal walk cannot prune the engine's live entries.
-            let refusal_store = PolicyStateStore::new();
-            let mut ctx = EvalContext::new(
-                tool,
-                &Value::Null,
-                &self.profile_name,
-                profile,
-                &refusal_store,
-            );
-            ctx.value = effective.clone();
-            if let Some(rule) = self
-                .matching_rules(&self.profile_name, self.project_id.as_deref())
-                .into_iter()
-                .find(|rule| rule.matches_tool(tool))
-            {
-                for criterion in &rule.criteria {
-                    if let Some(reason @ DenyReason::UnsizableValueEffect { .. }) =
-                        criterion.evaluate(&ctx)?
-                    {
-                        return Ok(SizingOutcome::Refused(reason));
-                    }
-                }
-            }
+        if let Some(reason) = self.unvalued_refusal(tool, profile, reason)? {
+            return Ok(SizingOutcome::Refused(reason));
         }
+        let effective = self.effective_unvalued(tool, reason);
         let basis = self.sizing_basis(tool, SizingBasis::Unvalued);
         let entries = self.size_window_entries(tool, profile, &effective, now_ms)?;
         Ok(SizingOutcome::Sized(CheckedSizing::new(basis, entries)?))
@@ -1299,10 +1276,8 @@ impl PolicyEngine for PolicyEngineV1 {
             ValueClass::Value(_) => (SizingBasis::MeasuredValue, value.clone()),
             ValueClass::ReadOnly => (SizingBasis::NoValue, ValueClass::ReadOnly),
             ValueClass::Opaque(reason) => {
-                if let refusal @ SizingOutcome::Refused(_) =
-                    self.size_unvalued_call(tool, profile, *reason, 0)?
-                {
-                    return Ok(refusal);
+                if let Some(reason) = self.unvalued_refusal(tool, profile, *reason)? {
+                    return Ok(SizingOutcome::Refused(reason));
                 }
                 (
                     SizingBasis::Unvalued,
@@ -1534,6 +1509,42 @@ impl PolicyEngineV1 {
         } else {
             SizingBasis::NoApplicableLimit
         }
+    }
+
+    fn unvalued_refusal(
+        &self,
+        tool: &ToolDescriptor,
+        profile: &Profile,
+        reason: OpaqueReason,
+    ) -> Result<Option<DenyReason>, PolicyError> {
+        let effective = self.effective_unvalued(tool, reason);
+        if matches!(effective, ValueClass::Opaque(_)) {
+            // Count admission uses the durable store under its lock.
+            // The value refusal walk cannot prune the engine's live entries.
+            let refusal_store = PolicyStateStore::new();
+            let mut ctx = EvalContext::new(
+                tool,
+                &Value::Null,
+                &self.profile_name,
+                profile,
+                &refusal_store,
+            );
+            ctx.value = effective.clone();
+            if let Some(rule) = self
+                .matching_rules(&self.profile_name, self.project_id.as_deref())
+                .into_iter()
+                .find(|rule| rule.matches_tool(tool))
+            {
+                for criterion in &rule.criteria {
+                    if let Some(reason @ DenyReason::UnsizableValueEffect { .. }) =
+                        criterion.evaluate(&ctx)?
+                    {
+                        return Ok(Some(reason));
+                    }
+                }
+            }
+        }
+        Ok(None)
     }
 
     fn effective_unvalued(&self, tool: &ToolDescriptor, reason: OpaqueReason) -> ValueClass {

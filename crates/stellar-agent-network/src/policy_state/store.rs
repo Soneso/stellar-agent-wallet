@@ -1249,7 +1249,11 @@ pub(super) struct SignedIntentRecord {
     bound_envelope_hash: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     bound_tx_hash: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        with = "crate::signed_intent::option_hash_hex",
+        skip_serializing_if = "Option::is_none"
+    )]
     cancel_token_sha256: Option<[u8; 32]>,
 }
 
@@ -1710,7 +1714,7 @@ impl PersistedWindowStore {
         profile: &Profile,
         dest: &PolicyStateStore,
     ) -> Result<(), WindowStoreError> {
-        let Some(wire) = self.read_intent_view(profile_name, profile)? else {
+        let Some(wire) = self.read_verified_unlocked(profile_name, profile)? else {
             return Ok(());
         };
         for intent in &wire.signed_intents {
@@ -1762,7 +1766,7 @@ impl PersistedWindowStore {
         Ok(())
     }
 
-    fn read_intent_view(
+    fn read_verified_unlocked(
         &self,
         profile_name: &str,
         profile: &Profile,
@@ -1822,30 +1826,17 @@ impl PersistedWindowStore {
         profile_name: &str,
         profile: &Profile,
     ) -> Result<Vec<SignedIntentView>, WindowStoreError> {
-        let Some(wire) = self.read_intent_view(profile_name, profile)? else {
+        let Some(wire) = self.read_verified_unlocked(profile_name, profile)? else {
             return Ok(Vec::new());
         };
         Ok(wire
             .signed_intents
             .into_iter()
             .map(|record| {
-                let auth_address = if record.auth_address.len() > 10 {
-                    format!(
-                        "{}...{}",
-                        record.auth_address.chars().take(5).collect::<String>(),
-                        record
-                            .auth_address
-                            .chars()
-                            .rev()
-                            .take(5)
-                            .collect::<String>()
-                            .chars()
-                            .rev()
-                            .collect::<String>()
-                    )
-                } else {
-                    "<redacted>".into()
-                };
+                let auth_address =
+                    stellar_agent_core::observability::redact::redact_strkey_first5_last5(
+                        &record.auth_address,
+                    );
                 SignedIntentView {
                     intent_id: record.intent_id,
                     status: record.status.label().into(),
@@ -4323,11 +4314,12 @@ fn authenticated_scope(wire: &WireFile) -> Result<ChainScope, WindowStoreError> 
 /// Checks one snapshot's version, its authorization history and its
 /// accounting-expiry records.
 ///
-/// Versions 1 through 8 decode. Snapshots below version 4 carry no authorization
+/// Versions 1 through 9 decode. Snapshots below version 4 carry no authorization
 /// history; usable snapshots also require complete authenticated scope.
 /// Accounting-expiry records need version 8, the file's own scope, the
 /// accounting-expired disposition, a generation no later than the file's, and
 /// a unique identifier that recomputes from their fields.
+/// Signed intents and their links need version 9.
 fn check_snapshot(wire: &WireFile) -> Result<(), WindowStoreError> {
     if wire.version > WIRE_VERSION_MAX {
         return Err(WindowStoreError::UnsupportedVersion);
@@ -4424,13 +4416,6 @@ fn validate_signed_intents(wire: &WireFile) -> Result<(), WindowStoreError> {
         {
             return Err(invalid());
         }
-    }
-    if wire
-        .holds
-        .iter()
-        .any(|hold| hold.authorization_id.to_hex().starts_with("intent-"))
-    {
-        return Err(invalid());
     }
     Ok(())
 }
@@ -5484,6 +5469,7 @@ mod tests {
         reason = "test-only; panics acceptable in unit tests"
     )]
 
+    use crate::signed_intent::test_helpers::{intent_fixture_kind, intent_fixture_plan};
     use std::path::Path;
 
     use serial_test::serial;
@@ -5492,75 +5478,6 @@ mod tests {
     use stellar_agent_core::policy::v1::criteria::state_store::WindowLimit;
     use stellar_agent_test_support::keyring_mock;
     use tempfile::TempDir;
-
-    fn intent_fixture_plan(
-        sequence: i64,
-        amount: i128,
-    ) -> (crate::SignedIntentPlan, stellar_xdr::TransactionEnvelope) {
-        use stellar_agent_core::policy::v1::criteria::WindowLimit;
-        use stellar_xdr::*;
-        let host = HostFunction::InvokeContract(InvokeContractArgs {
-            contract_address: ScAddress::Contract(ContractId(Hash([1; 32]))),
-            function_name: ScSymbol::try_from("call").unwrap(),
-            args: Default::default(),
-        });
-        let source = stellar_strkey::ed25519::PublicKey([0; 32])
-            .to_string()
-            .as_str()
-            .to_owned();
-        let plan = crate::SignedIntentPlan::new(
-            Caip2::Testnet.network_passphrase(),
-            &source,
-            &source,
-            sequence,
-            crate::intent_xdr_hash(&host).unwrap(),
-            Vec::new(),
-            None,
-        )
-        .unwrap();
-        let plan = plan.with_legs(&[
-            WindowEntry::new(
-                StateKey::new("intent", 1, "native", 60),
-                1000,
-                amount,
-                WindowLimit::Amount {
-                    asset: "native".into(),
-                    window: "1m".into(),
-                    max_stroops: amount,
-                },
-            ),
-            WindowEntry::new(
-                StateKey::new("intent", 1, "rate_limit", 60),
-                1000,
-                1,
-                WindowLimit::Count {
-                    window: "1m".into(),
-                    max_calls: 1,
-                },
-            ),
-        ]);
-        let envelope = TransactionEnvelope::Tx(TransactionV1Envelope {
-            tx: Transaction {
-                source_account: MuxedAccount::Ed25519(Uint256([0; 32])),
-                fee: 100,
-                seq_num: SequenceNumber(sequence),
-                cond: Preconditions::None,
-                memo: Memo::None,
-                operations: vec![Operation {
-                    source_account: None,
-                    body: OperationBody::InvokeHostFunction(InvokeHostFunctionOp {
-                        host_function: host,
-                        auth: Default::default(),
-                    }),
-                }]
-                .try_into()
-                .unwrap(),
-                ext: TransactionExt::V0,
-            },
-            signatures: Default::default(),
-        });
-        (plan, envelope)
-    }
 
     fn assert_intent_totals(
         store: &PersistedWindowStore,
@@ -5635,6 +5552,43 @@ mod tests {
                 });
             }
         });
+        let dir_c = TempDir::new().unwrap();
+        let profile_c = test_profile(dir_c.path(), "intent-confirm");
+        let store_c = PersistedWindowStore::at_path(dir_c.path().join("intent.window"));
+        let (plan_c, envelope_c) = intent_fixture_plan(3, 60);
+        let exposure_c = store_c
+            .admit_signed_intent(&profile_c, &plan_c)
+            .unwrap()
+            .expose();
+        let id_c = exposure_c.intent_id().unwrap();
+        let facts_c =
+            crate::BindFacts::from_envelope(&envelope_c, Caip2::Testnet.network_passphrase())
+                .unwrap();
+        store_c
+            .bind_signed_intent(&profile_c, id_c, &facts_c, plan_c.legs())
+            .unwrap();
+        let hold_c = SubmissionHold {
+            id: facts_c.envelope_hash,
+            tx_hash: facts_c.tx_hash,
+            sequence: 3,
+            ..hold.clone()
+        };
+        store_c
+            .record_pending_linked(&profile_c, plan_c.legs(), &hold_c, id_c)
+            .unwrap();
+        store_c.confirm(&profile_c, &hold_c.id, None).unwrap();
+        assert_intent_totals(&store_c, &profile_c, 60, 1);
+        let wire_c = store_c.read_for_inspection(&profile_c).unwrap().unwrap();
+        assert_eq!(wire_c.signed_intents.len(), 1);
+        assert_eq!(wire_c.signed_intents[0].status, SignedIntentStatus::Bound);
+        assert_eq!(wire_c.entries.len(), plan_c.legs().len());
+        for entry in &wire_c.entries {
+            assert_eq!(entry.records.len(), 1);
+            let record = &entry.records[0];
+            assert_eq!(record.status, RecordStatus::Exposure);
+            assert!(record.observed_at_ms.is_some());
+            assert_eq!(record.signed_intent.as_deref(), Some(id_c));
+        }
         let decision = store.pre_exposure_cancellation(&profile, &hold.id).unwrap();
         store.apply_accounting_decision(&profile, decision).unwrap();
         assert!(store.pending_reservations(&profile).unwrap().is_empty());
@@ -5883,130 +5837,6 @@ mod tests {
             store.signed_intents("intent", &profile).unwrap()[0].status_label(),
             "authorization exposed, submission unknown"
         );
-    }
-
-    fn fixture_entry(source: bool) -> stellar_xdr::SorobanAuthorizationEntry {
-        use stellar_xdr::*;
-        let (_, envelope) = intent_fixture_plan(1, 60);
-        let TransactionEnvelope::Tx(envelope) = envelope else {
-            panic!("V1");
-        };
-        let OperationBody::InvokeHostFunction(op) = &envelope.tx.operations[0].body else {
-            panic!("invoke");
-        };
-        let HostFunction::InvokeContract(call) = &op.host_function else {
-            panic!("call");
-        };
-        let root_invocation = SorobanAuthorizedInvocation {
-            function: SorobanAuthorizedFunction::ContractFn(call.clone()),
-            sub_invocations: Default::default(),
-        };
-        if source {
-            return SorobanAuthorizationEntry {
-                credentials: SorobanCredentials::SourceAccount,
-                root_invocation,
-            };
-        }
-        let symbol = |name: &str| ScVal::Symbol(ScSymbol::try_from(name).unwrap());
-        let bytes = |value: u8| ScVal::Bytes(ScBytes(vec![value; 32].try_into().unwrap()));
-        let mut signers = vec![
-            ScMapEntry {
-                key: ScVal::Vec(Some(
-                    vec![
-                        symbol("Delegated"),
-                        ScVal::Address(ScAddress::Account(AccountId(
-                            PublicKey::PublicKeyTypeEd25519(Uint256([2; 32])),
-                        ))),
-                    ]
-                    .try_into()
-                    .unwrap(),
-                )),
-                val: bytes(0),
-            },
-            ScMapEntry {
-                key: ScVal::Vec(Some(
-                    vec![
-                        symbol("External"),
-                        ScVal::Address(ScAddress::Contract(ContractId(Hash([3; 32])))),
-                        bytes(4),
-                    ]
-                    .try_into()
-                    .unwrap(),
-                )),
-                val: bytes(0),
-            },
-        ];
-        signers.sort_by(|a, b| a.key.cmp(&b.key));
-        let signature = ScVal::Map(Some(
-            vec![
-                ScMapEntry {
-                    key: symbol("context_rule_ids"),
-                    val: ScVal::Vec(Some(vec![ScVal::U32(3)].try_into().unwrap())),
-                },
-                ScMapEntry {
-                    key: symbol("signers"),
-                    val: ScVal::Map(Some(signers.try_into().unwrap())),
-                },
-            ]
-            .try_into()
-            .unwrap(),
-        ));
-        SorobanAuthorizationEntry {
-            credentials: SorobanCredentials::Address(SorobanAddressCredentials {
-                address: ScAddress::Contract(ContractId(Hash([1; 32]))),
-                nonce: 7,
-                signature_expiration_ledger: 100,
-                signature,
-            }),
-            root_invocation,
-        }
-    }
-
-    fn intent_fixture_kind(
-        kind: u8,
-    ) -> (crate::SignedIntentPlan, stellar_xdr::TransactionEnvelope) {
-        use stellar_xdr::*;
-        let (base, mut envelope) = intent_fixture_plan(1, 60);
-        if kind != 0 {
-            let TransactionEnvelope::Tx(tx) = &mut envelope else {
-                panic!("V1");
-            };
-            let mut operations = tx.tx.operations.to_vec();
-            let OperationBody::InvokeHostFunction(op) = &mut operations[0].body else {
-                panic!("invoke");
-            };
-            op.auth = vec![fixture_entry(kind == 1)].try_into().unwrap();
-            tx.tx.operations = operations.try_into().unwrap();
-        }
-        let TransactionEnvelope::Tx(tx) = &envelope else {
-            panic!("V1");
-        };
-        let OperationBody::InvokeHostFunction(op) = &tx.tx.operations[0].body else {
-            panic!("invoke");
-        };
-        let subjects = op
-            .auth
-            .iter()
-            .map(|entry| {
-                crate::IntentSubject::of_entry(entry, &base.facts.envelope_source).unwrap()
-            })
-            .collect::<Vec<_>>();
-        let expiration = subjects
-            .iter()
-            .filter_map(crate::IntentSubject::expiration)
-            .max();
-        let plan = crate::SignedIntentPlan::new(
-            Caip2::Testnet.network_passphrase(),
-            &base.facts.auth_address,
-            &base.facts.envelope_source,
-            1,
-            base.facts.host_invocation_sha256,
-            subjects,
-            expiration,
-        )
-        .unwrap()
-        .with_legs(base.legs());
-        (plan, envelope)
     }
 
     #[test]
@@ -6420,6 +6250,7 @@ mod tests {
             "ts_ms": valid.signed_intents[0].admitted_at_ms,
             "amount": "1"
         }]);
+        assert!(serde_json::from_value::<WireFile>(prefixed_hold.clone()).is_err());
         for malformed in [unknown, prefixed_hold] {
             let body = serde_json::to_vec(&malformed).unwrap();
             let (key, _) = f.store.load_or_mint_key(&f.profile).unwrap();

@@ -35,6 +35,12 @@ impl WalletServer {
         Parameters(_args): Parameters<SignedIntentsArgs>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let chain = self.profile.chain_id.caip2_str();
+        if let Err(error) = self
+            .dispatch_gate("stellar_signed_intents_list", &serde_json::json!({}), chain)
+            .await
+        {
+            return error.into_result();
+        }
         let intents = match self
             .window_store
             .signed_intents(&self.profile_name_for_approval(), &self.profile)
@@ -47,12 +53,6 @@ impl WalletServer {
                 ));
             }
         };
-        if let Err(error) = self
-            .dispatch_gate("stellar_signed_intents_list", &serde_json::json!({}), chain)
-            .await
-        {
-            return error.into_result();
-        }
         let envelope = Envelope::ok(serde_json::json!({ "signed_intents": intents }));
         let json = envelope.to_json_pretty().map_err(|_| {
             rmcp::ErrorData::internal_error("intent view serialization refuses", None)
@@ -65,6 +65,28 @@ impl WalletServer {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::panic, reason = "test fixture assertions")]
     use super::*;
+
+    struct DenyIntentList;
+
+    impl stellar_agent_core::policy::PolicyEngine for DenyIntentList {
+        fn evaluate(
+            &self,
+            tool: &stellar_agent_core::policy::ToolDescriptor,
+            _args: &serde_json::Value,
+            _profile: &stellar_agent_core::profile::schema::Profile,
+            _account_view: Option<&dyn stellar_agent_core::policy::v1::AccountReservesView>,
+            _identity_view: Option<&dyn stellar_agent_core::policy::v1::AccountIdentityView>,
+            _counterparty_cache: Option<&dyn stellar_agent_core::policy::v1::CounterpartyCacheView>,
+            _sep10_sessions: Option<&dyn stellar_agent_core::policy::v1::Sep10SessionView>,
+            _sep45_sessions: Option<&dyn stellar_agent_core::policy::v1::Sep45SessionView>,
+        ) -> Result<stellar_agent_core::policy::Decision, stellar_agent_core::policy::PolicyError>
+        {
+            assert_eq!(tool.name, "stellar_signed_intents_list");
+            Ok(stellar_agent_core::policy::Decision::Deny(
+                stellar_agent_core::policy::DenyReason::NoMatchingRule,
+            ))
+        }
+    }
 
     #[tokio::test]
     #[serial_test::serial(keyring)]
@@ -149,6 +171,8 @@ mod tests {
         let mut corrupt = before;
         corrupt[0] ^= 1;
         std::fs::write(store.path(), &corrupt).unwrap();
+        let stateful_policy = server.policy_engine.clone();
+        server.policy_engine = std::sync::Arc::new(DenyIntentList);
         let result = server
             .stellar_signed_intents_list(Parameters(SignedIntentsArgs {}))
             .await
@@ -157,8 +181,18 @@ mod tests {
             panic!("text");
         };
         let value: serde_json::Value = serde_json::from_str(&text.text).unwrap();
-        assert_eq!(value["error"]["code"], "submission.record_unavailable");
+        assert_eq!(value["error"]["code"], "policy.deny.no_matching_rule");
         assert!(value["data"].is_null());
+        server.policy_engine = stateful_policy;
+        let result = server
+            .stellar_signed_intents_list(Parameters(SignedIntentsArgs {}))
+            .await
+            .unwrap();
+        let rmcp::model::RawContent::Text(text) = &result.content[0].raw else {
+            panic!("text");
+        };
+        let value: serde_json::Value = serde_json::from_str(&text.text).unwrap();
+        assert_eq!(value["error"]["code"], "policy.engine_required");
         assert_eq!(std::fs::read(store.path()).unwrap(), corrupt);
         assert_eq!(generation.get_password().unwrap(), generation_before);
     }

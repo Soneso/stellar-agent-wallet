@@ -721,11 +721,8 @@ pub(crate) async fn submit_timelock_invoke_with_g_key_auth(
 
         // ── Step 6: Build final transaction envelope ──────────────────────────────
         //
-        // Build the envelope with signed auth entries + soroban_data from the
-        // re-simulate response.  Re-fetch the sequence number once more: the
-        // `BaselibAccount` sequence advances with each `build_for_simulation()`
-        // call so we must use the live on-chain state (not an incremented in-memory
-        // counter) to get the correct sequence number for the final submission.
+        // Fetch the source sequence again before building the final envelope.
+        // A signed entry plan refuses a sequence other than the one it admits.
         let source_view3 = bound_pre_submit_stage(
             pre_submit_budget,
             "fetch_account_submit",

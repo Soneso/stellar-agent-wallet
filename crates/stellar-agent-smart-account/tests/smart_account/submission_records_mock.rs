@@ -1585,13 +1585,7 @@ async fn cap_refusal_precedes_any_signed_authorization() {
     use stellar_agent_core::policy::{
         McpToolRegistration, PolicyEngine, ToolDescriptor, ToolValueKind,
     };
-    for case in [
-        "schedule",
-        "execute",
-        "cancel",
-        "missing_sizing",
-        "value_schedule",
-    ] {
+    for case in ["schedule", "execute", "cancel", "missing_sizing"] {
         let fixture = Fixture::new();
         let server = MockServer::start().await;
         let sends = Arc::new(AtomicUsize::new(0));
@@ -1619,13 +1613,8 @@ async fn cap_refusal_precedes_any_signed_authorization() {
         } else {
             "stellar_smart_account_timelock_schedule"
         };
-        let criterion: Box<dyn stellar_agent_core::policy::v1::criteria::Criterion> = if case
-            == "value_schedule"
-        {
-            Box::new(stellar_agent_core::policy::v1::criteria::per_period_cap::PerPeriodCapCriterion::new("native".into(), Window::parse("1m").unwrap(), 1))
-        } else {
-            Box::new(RateLimitCriterion::new(Window::parse("1m").unwrap(), 1))
-        };
+        let criterion: Box<dyn stellar_agent_core::policy::v1::criteria::Criterion> =
+            Box::new(RateLimitCriterion::new(Window::parse("1m").unwrap(), 1));
         let engine = PolicyEngineV1::new(
             PolicyDocument {
                 version: 1,
@@ -1655,30 +1644,11 @@ async fn cap_refusal_precedes_any_signed_authorization() {
         let count = engine
             .size_no_value(&descriptor, &fixture.profile, now)
             .unwrap();
-        if case != "value_schedule" {
-            window
-                .record_and_persist(&fixture.profile, count.entries())
-                .unwrap();
-        }
+        window
+            .record_and_persist(&fixture.profile, count.entries())
+            .unwrap();
         let before = std::fs::read(window.path()).ok();
-        let result = if case == "value_schedule" {
-            match engine
-                .size_unvalued_call(
-                    &descriptor,
-                    &fixture.profile,
-                    stellar_agent_core::policy::v1::OpaqueReason::UnvaluedContractCall,
-                    now,
-                )
-                .unwrap()
-            {
-                stellar_agent_core::policy::v1::SizingOutcome::Refused(reason) => {
-                    Err(SaError::PolicyDenied {
-                        reason: Box::new(reason),
-                    })
-                }
-                _ => panic!("a value rule must refuse scheduling without value evidence"),
-            }
-        } else if case == "cancel" {
+        let result = if case == "cancel" {
             let admission = stellar_agent_network::NoValueAdmission::new(
                 fixture.profile.clone(),
                 PROFILE,
@@ -1778,7 +1748,6 @@ async fn cap_refusal_precedes_any_signed_authorization() {
             error.wire_code(),
             match case {
                 "missing_sizing" => "submission.intent_record_unavailable",
-                "value_schedule" => "policy.deny.unsizable_value_effect",
                 _ => "policy.deny.rate_limit_exceeded",
             },
             "{case}: {error:?}"

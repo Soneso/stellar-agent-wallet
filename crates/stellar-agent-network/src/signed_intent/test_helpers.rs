@@ -76,7 +76,12 @@ pub fn intent_fixture_plan(
     (plan, envelope)
 }
 
-fn fixture_entry(source: bool) -> stellar_xdr::SorobanAuthorizationEntry {
+/// Builds source or smart account authorization for the fixture invocation.
+///
+/// # Panics
+/// Panics if the fixed fixture cannot encode its authorization.
+#[must_use]
+pub fn fixture_entry(source: bool) -> stellar_xdr::SorobanAuthorizationEntry {
     use stellar_xdr::*;
     let (_, envelope) = intent_fixture_plan(1, 60);
     let TransactionEnvelope::Tx(envelope) = envelope else {

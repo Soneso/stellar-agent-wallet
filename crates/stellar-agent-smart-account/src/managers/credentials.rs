@@ -62,6 +62,7 @@ use crate::managers::signers::{RuleLockGuard, SignersManager, V1Handling};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
+use sha2::Digest as _;
 use stellar_agent_core::approval::retry::{
     DEFAULT_RETRY_ATTEMPTS, DEFAULT_RETRY_BACKOFF, open_with_retry,
 };
@@ -2441,7 +2442,6 @@ impl CredentialsManager {
         };
         let mut key_data = pubkey_arr.to_vec();
         key_data.extend_from_slice(&credential_id_bytes);
-        use sha2::Digest as _;
         if let Err(error) = gate.authorize(crate::signing::gate::SigningRequest {
             subject,
             signer: crate::signing::gate::SignerMatch::ExternalKeyData(
@@ -3796,7 +3796,6 @@ registered_at_unix_ms = 1700000000000
         if partial.validate().is_err() {
             return crate::signing::intent_test_helpers::gate(vec![]);
         }
-        use sha2::Digest as _;
         let mut key_data = decode_validated_sec1("entry-check", &metadata.public_key_sec1_b64)
             .unwrap()
             .to_vec();

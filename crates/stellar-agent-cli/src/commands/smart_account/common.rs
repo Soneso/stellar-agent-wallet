@@ -331,6 +331,22 @@ pub struct CommonHandlerContext {
 }
 
 impl CommonHandlerContext {
+    /// Builds a context with count admission for the submitting tool.
+    ///
+    /// # Errors
+    /// Refuses unavailable admission, audit state, endpoints, or signer setup.
+    pub async fn new_admitted(
+        args: &impl CommonArgsView,
+        resolved: ResolvedProfileName,
+        profile: Profile,
+        origin: ProfileOrigin,
+        context: &NetworkContext,
+        tool: &'static str,
+    ) -> Result<Self, WalletError> {
+        let admission = submission_admission(&profile, origin, &resolved.name, tool, context)?;
+        Self::new(args, resolved, profile, origin, context, Some(admission)).await
+    }
+
     /// Builds a context from common CLI args.
     ///
     /// # Errors
@@ -721,13 +737,13 @@ pub(crate) fn load_command_profile(
 /// acquisition reads the audit binding and the audit key.
 ///
 /// A store already registered is kept.
-fn ensure_keyring_store() -> Result<(), WalletError> {
+pub(crate) fn ensure_keyring_store() -> Result<(), WalletError> {
     ensure_keyring_store_with(register_keyring_store)
 }
 
 /// [`ensure_keyring_store`] with the registrar injected: `register` runs only
 /// when no store is registered.
-fn ensure_keyring_store_with(
+pub(crate) fn ensure_keyring_store_with(
     register: impl FnOnce() -> Result<(), WalletError>,
 ) -> Result<(), WalletError> {
     if keyring_core::get_default_store().is_none() {

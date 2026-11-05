@@ -266,16 +266,14 @@ async fn prepare_write_context<A>(
 where
     A: CommonArgsView + Sync,
 {
-    let ctx = async {
-        let admission = crate::commands::smart_account::common::submission_admission(
-            &profile,
-            origin,
-            &resolved.name,
-            "stellar_smart_account_rules",
-            context,
-        )?;
-        CommonHandlerContext::new(args, resolved, profile, origin, context, Some(admission)).await
-    }
+    let ctx = CommonHandlerContext::new_admitted(
+        args,
+        resolved,
+        profile,
+        origin,
+        context,
+        "stellar_smart_account_rules",
+    )
     .await
     .map_err(|e| emit_error(&e, output, request_id))?;
     let manager = ctx
@@ -1066,16 +1064,14 @@ async fn create_run(args: &CreateArgs) -> i32 {
     // `prepare_write_context` because it has substantial pre-validation above.
     // The explicit `context_rule_manager()` call is required to wire the
     // `SignersManager` for wasm-hash pin enforcement.
-    let ctx = match async {
-        let admission = crate::commands::smart_account::common::submission_admission(
-            &profile,
-            origin,
-            &resolved.name,
-            "stellar_smart_account_rules",
-            &context,
-        )?;
-        CommonHandlerContext::new(args, resolved, profile, origin, &context, Some(admission)).await
-    }
+    let ctx = match CommonHandlerContext::new_admitted(
+        args,
+        resolved,
+        profile,
+        origin,
+        &context,
+        "stellar_smart_account_rules",
+    )
     .await
     {
         Ok(ctx) => ctx,
@@ -2543,16 +2539,14 @@ async fn add_policy_run(args: &AddPolicyArgs) -> i32 {
     };
 
     // Build CommonHandlerContext (signer + manager + audit writer).
-    let ctx = match async {
-        let admission = crate::commands::smart_account::common::submission_admission(
-            &profile,
-            origin,
-            &resolved.name,
-            "stellar_smart_account_rules",
-            &context,
-        )?;
-        CommonHandlerContext::new(args, resolved, profile, origin, &context, Some(admission)).await
-    }
+    let ctx = match CommonHandlerContext::new_admitted(
+        args,
+        resolved,
+        profile,
+        origin,
+        &context,
+        "stellar_smart_account_rules",
+    )
     .await
     {
         Ok(ctx) => ctx,
@@ -2801,16 +2795,14 @@ async fn remove_policy_run(args: &RemovePolicyArgs) -> i32 {
     };
 
     // Build CommonHandlerContext.
-    let ctx = match async {
-        let admission = crate::commands::smart_account::common::submission_admission(
-            &profile,
-            origin,
-            &resolved.name,
-            "stellar_smart_account_rules",
-            &context,
-        )?;
-        CommonHandlerContext::new(args, resolved, profile, origin, &context, Some(admission)).await
-    }
+    let ctx = match CommonHandlerContext::new_admitted(
+        args,
+        resolved,
+        profile,
+        origin,
+        &context,
+        "stellar_smart_account_rules",
+    )
     .await
     {
         Ok(ctx) => ctx,
@@ -3183,16 +3175,14 @@ async fn set_spending_limit_run(args: &SetSpendingLimitArgs) -> i32 {
         );
     }
 
-    let ctx = match async {
-        let admission = crate::commands::smart_account::common::submission_admission(
-            &profile,
-            origin,
-            &resolved.name,
-            "stellar_smart_account_rules",
-            &context,
-        )?;
-        CommonHandlerContext::new(args, resolved, profile, origin, &context, Some(admission)).await
-    }
+    let ctx = match CommonHandlerContext::new_admitted(
+        args,
+        resolved,
+        profile,
+        origin,
+        &context,
+        "stellar_smart_account_rules",
+    )
     .await
     {
         Ok(ctx) => ctx,

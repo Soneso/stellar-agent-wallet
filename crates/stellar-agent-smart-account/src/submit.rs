@@ -306,7 +306,9 @@ pub struct PinCheck<'a> {
 /// let proof = CheckedSigningRules::new();
 /// ```
 ///
-/// and cannot be cloned:
+/// Code outside this crate cannot construct or clone it.
+/// The quorum signer copies it once per planned group, so each group
+/// consumes its own copy of the same checked rules.
 ///
 /// ```compile_fail
 /// use stellar_agent_smart_account::submit::CheckedSigningRules;
@@ -2030,12 +2032,9 @@ pub(crate) async fn cancel_unexposed_admission(
     gate: &SigningGate,
 ) {
     if let Some(proof) = gate.take_unexposed()
-        && admission.cancel_unexposed(proof).await.is_err()
+        && let Err(error) = admission.cancel_unexposed(proof).await
     {
-        tracing::warn!(
-            class = "window_unavailable",
-            "unexposed intent cancellation refuses"
-        );
+        tracing::warn!(code = error.code(), "unexposed intent cancellation refuses");
     }
 }
 

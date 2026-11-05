@@ -91,50 +91,47 @@ pub(crate) fn build_recorder(
         .map(|e| e.legs().iter().map(Into::into).collect())
         .unwrap_or_default();
 
-    let sizing = if record.effects.is_some() || record.unvalued.is_some() {
-        let engine = crate::commands::policy_engine::build_v1_policy_engine(
+    let engine = || {
+        crate::commands::policy_engine::build_v1_policy_engine(
             record.verb,
             &record.profile.policy.engine,
             record.profile,
             &record.profile_name,
         )
         .map_err(|error| {
-            record_unavailable(format!("the policy engine could not be rebuilt: {error}"))
-        })?;
-        let outcome = if let Some(effects) = record.effects {
-            engine.record_confirmed_checked(
-                &descriptor_for(record.tool, record.chain_id, ToolValueKind::MovesValue),
-                record.profile,
-                &ValueClass::Value(effects.clone()),
-            )
-        } else if let Some(reason) = record.unvalued {
-            engine.size_unvalued_call(
-                &descriptor_for(record.tool, record.chain_id, ToolValueKind::OpaqueSign),
-                record.profile,
-                reason,
-                record.now_ms,
-            )
-        } else {
-            return Err(record_unavailable("missing sizing input".to_owned()));
-        };
-        Some(
-            match outcome.map_err(|error| {
-                record_unavailable(format!(
-                    "the policy engine could not account for this action: {error}"
-                ))
-            })? {
-                stellar_agent_core::policy::v1::SizingOutcome::Sized(sizing) => sizing,
-                stellar_agent_core::policy::v1::SizingOutcome::Refused(reason) => {
-                    return Err(WalletError::PolicyDenied {
-                        reason: Box::new(reason),
-                    });
-                }
-                _ => return Err(record_unavailable("unsupported sizing outcome".to_owned())),
-            },
-        )
-    } else {
-        None
+            record_unavailable(format!("the policy engine cannot be rebuilt: {error}"))
+        })
     };
+    let sizing = match (record.effects, record.unvalued) {
+        (Some(effects), _) => Some(engine()?.record_confirmed_checked(
+            &descriptor_for(record.tool, record.chain_id, ToolValueKind::MovesValue),
+            record.profile,
+            &ValueClass::Value(effects.clone()),
+        )),
+        (None, Some(reason)) => Some(engine()?.size_unvalued_call(
+            &descriptor_for(record.tool, record.chain_id, ToolValueKind::OpaqueSign),
+            record.profile,
+            reason,
+            record.now_ms,
+        )),
+        (None, None) => None,
+    }
+    .map(|outcome| {
+        match outcome.map_err(|error| {
+            record_unavailable(format!(
+                "the policy engine cannot account for this action: {error}"
+            ))
+        })? {
+            stellar_agent_core::policy::v1::SizingOutcome::Sized(sizing) => Ok(sizing),
+            stellar_agent_core::policy::v1::SizingOutcome::Refused(reason) => {
+                Err(WalletError::PolicyDenied {
+                    reason: Box::new(reason),
+                })
+            }
+            _ => Err(record_unavailable("unsupported sizing outcome".to_owned())),
+        }
+    })
+    .transpose()?;
     let window_entries = sizing
         .as_ref()
         .map(|sizing| sizing.entries().to_vec())
