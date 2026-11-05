@@ -2047,7 +2047,7 @@ mod tests {
 
         /// Records a pending reservation on a 60-second window and commits its
         /// accounting expiry, which owes an undelivered audit event.
-        fn owe_expiry(&self) -> SubmissionHold {
+        fn owe_expiry(&self) {
             let mut reservation = SubmissionHold {
                 id: "cd".repeat(32),
                 tx_hash: "ab".repeat(32),
@@ -2083,7 +2083,6 @@ mod tests {
                 matches!(settled, Some(Settlement::AccountingExpired { .. })),
                 "{settled:?}"
             );
-            reservation
         }
 
         /// A bound keyed writer over the fixture's audit log.

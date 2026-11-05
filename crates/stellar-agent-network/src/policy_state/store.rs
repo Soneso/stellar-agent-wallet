@@ -10360,11 +10360,8 @@ mod tests {
                 defect_of(&WindowStoreError::UnsupportedVersion, false),
                 None
             );
-            let called = std::cell::Cell::new(false);
-            let result = reset_unsigned(&f.store, &f.profile, 100_000, |_| -> Result<(), ()> {
-                called.set(true);
-                Ok(())
-            });
+            let (result, authorized, recorded) =
+                counted_reset(&f.store, &f.profile, owner_name(&f.profile), unsigned);
             assert!(
                 matches!(
                     result,
@@ -10375,7 +10372,7 @@ mod tests {
                 ),
                 "{chain:?}: {result:?}"
             );
-            assert!(!called.get(), "{chain:?}");
+            assert_eq!((authorized, recorded), (0, 0), "{chain:?}");
             assert_eq!(fs::read(f.store.path()).unwrap(), before, "{chain:?}");
         }
     }
