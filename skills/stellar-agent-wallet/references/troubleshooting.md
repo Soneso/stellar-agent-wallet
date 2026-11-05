@@ -62,6 +62,25 @@ key names. Typed value events retain each leg's amount, asset, and redacted dest
 - Asset is `"native"` / `"XLM"` for the native asset, or `"CODE:GISSUER"` for an
   issued asset.
 
+## Payment argument codes
+
+`stellar_pay`, `stellar_pay_commit`, and `stellar-agent pay` refuse a malformed
+amount, asset, or memo before building the transaction.
+
+| Code | Meaning | Agent action |
+|---|---|---|
+| `validation.amount_units_required` | The amount has no unit label, such as `"10"`. | Resend it with its unit, such as `"10 XLM"`, or pass `amount_in_stroops` to `stellar_pay` or `stellar_pay_commit`. |
+| `validation.amount_precision_exceeded` | The amount has more than seven decimal places. | Round it to seven decimal places and resend. |
+| `validation.amount_out_of_range` | The value does not fit the signed 64-bit stroop range. | Lower the amount and resend. |
+| `validation.amount_malformed` | The value is not a decimal number followed by its unit, or the unit is not the asset's code (case-sensitive for an issued asset, case-insensitive `XLM` for native). `stellar-agent pay` and `stellar-agent accounts create` report every amount refusal under this code. | Resend the amount as a decimal string followed by the asset code, such as `"10.5 USDC"`. |
+| `validation.asset_invalid` | The descriptor is neither `native` or `XLM` nor `CODE:ISSUER` with a 1 to 12 character alphanumeric code and a valid G-strkey issuer. | Fix the descriptor and resend. |
+| `validation.memo_invalid_type` | A hash or return memo is not exactly 64 hex characters, or, on `stellar-agent pay`, a text memo is longer than 28 bytes. The MCP tools refuse a longer text memo as an invalid argument before this check. | Resend a 64-character hex value for a hash or return memo, or shorten the text memo to 28 bytes. |
+| `validation.memo_mutually_exclusive` | More than one memo field is set. The CLI parser refuses two memo flags as `validation.usage_error`. | Send one memo field only. |
+
+The two MCP payment tools return the four amount codes and
+`validation.asset_invalid` as a JSON-RPC invalid-params error whose message
+starts with the code, and return the two memo codes in the result envelope.
+
 ## Policy-engine codes
 
 The policy engine evaluates every gated call before any signing, returning
