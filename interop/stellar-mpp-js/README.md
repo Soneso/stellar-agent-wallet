@@ -21,7 +21,7 @@ newer `mppx`. The rule `"@stellar/mpp@0.7.1>mppx": "0.8.19"` under
 `pnpm.peerDependencyRules.allowedVersions` in `package.json` accepts `mppx`
 0.8.19 as the peer of `@stellar/mpp` 0.7.1 only. pnpm reports any other
 pairing as an unmet peer. The setting `strict-peer-dependencies=true` in
-`.npmrc` makes `pnpm install` fail on an unmet peer instead of warning.
+`.npmrc` makes `pnpm install` fail on an unmet peer.
 
 With `mppx@0.8.19` the released server emits the fixture's challenge,
 credential, and receipt bytes. It answers a credential that fails its
