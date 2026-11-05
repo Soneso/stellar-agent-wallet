@@ -102,10 +102,12 @@ fn contract_code_ledger_key(wasm_hash: &[u8; 32]) -> LedgerKey {
     })
 }
 
-/// Applies first-5-last-5 redaction to a strkey for use in error messages.
+/// Applies first-5-last-5 redaction to a contract ID that passed the strkey
+/// parse.
 ///
-/// Account and contract IDs are redacted before inclusion in log-visible fields
-/// or error messages to prevent leaking user identifiers at info level.
+/// Contract IDs are redacted before inclusion in log-visible fields or error
+/// messages to prevent leaking user identifiers at info level. A refused value
+/// never reaches this helper.
 fn redact_strkey(s: &str) -> String {
     if s.len() <= 10 {
         return "REDACTED".to_owned();
@@ -273,9 +275,7 @@ pub(crate) async fn resolve_wasm_hash(
             ),
         }),
         Err(FetchContractWasmHashError::InvalidAddress { .. }) => {
-            Err(Sep48Error::InvalidContractAddress {
-                addr: redact_strkey(contract_strkey),
-            })
+            Err(Sep48Error::InvalidContractAddress)
         }
         Err(e) => Err(Sep48Error::RpcFetchFailure {
             reason: redact_rpc_error(&e.to_string()),

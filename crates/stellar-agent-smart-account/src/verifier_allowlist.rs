@@ -361,14 +361,12 @@ pub(crate) fn verifier_status_refusal(
         VerifierAuditStatus::Revoked { reason, .. } => Err(crate::SaError::VerifierWasmRevoked {
             rule_id,
             smart_account_redacted: RedactedStrkey::from_already_redacted(smart_account_redacted),
-            verifier_hash_first8: stellar_agent_core::hex::wasm_hash_first8_hex(hash),
             revoked_reason: (*reason).to_owned(),
             request_id: request_id.to_owned(),
         }),
         VerifierAuditStatus::Retired { .. } => Err(crate::SaError::VerifierWasmRetired {
             rule_id,
             smart_account_redacted: RedactedStrkey::from_already_redacted(smart_account_redacted),
-            verifier_hash_first8: stellar_agent_core::hex::wasm_hash_first8_hex(hash),
             request_id: request_id.to_owned(),
         }),
         VerifierAuditStatus::Audited { .. }

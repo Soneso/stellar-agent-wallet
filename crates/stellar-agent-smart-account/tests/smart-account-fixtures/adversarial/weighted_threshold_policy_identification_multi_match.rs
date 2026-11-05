@@ -89,16 +89,10 @@ async fn two_allowlisted_policies_returns_identification_failed_multi_match() {
 /// multi-match shape.
 #[test]
 fn identification_failed_multi_match_wire_code() {
-    use stellar_agent_smart_account::signers::types::WasmHashSummary;
-
     let err = SaError::WeightedThresholdPolicyIdentificationFailed {
         rule_id: 1,
         smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...AD2KM"),
-        observed_wasm_hashes_summary: WasmHashSummary::new(
-            2,
-            Some([0xe3, 0xd8, 0xcc, 0x5a, 0xb9, 0x66, 0x85, 0x26]),
-        )
-        .expect("count=2 + Some is valid"),
+        observed_policy_count: 2,
         request_id: Uuid::new_v4().to_string(),
     };
     assert_eq!(

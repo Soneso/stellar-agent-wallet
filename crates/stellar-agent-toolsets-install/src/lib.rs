@@ -863,9 +863,7 @@ fn uninstall_inner(package: &str, toolsets_root: &Path) -> Result<(), ToolsetIns
     match std::fs::symlink_metadata(&pin_path) {
         Ok(_) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Err(ToolsetInstallError::NotInstalled {
-                package: package.to_owned(),
-            });
+            return Err(ToolsetInstallError::NotInstalled);
         }
         Err(e) => return Err(ToolsetInstallError::from_io(e)),
     }
@@ -877,20 +875,14 @@ fn uninstall_inner(package: &str, toolsets_root: &Path) -> Result<(), ToolsetIns
     match std::fs::symlink_metadata(&toolset_dir) {
         Ok(meta) if meta.file_type().is_symlink() => {
             return Err(ToolsetInstallError::PinRecordMalformed {
-                detail: format!(
-                    "toolset directory '{}' is a symlink; refusing removal",
-                    stellar_agent_toolsets::sanitise_display(
-                        &toolset_dir.display().to_string(),
-                        256
-                    )
-                ),
+                detail: "the toolset directory must be a real directory; refusing removal of a \
+                         symlink"
+                    .to_owned(),
             });
         }
         Ok(_) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Err(ToolsetInstallError::NotInstalled {
-                package: package.to_owned(),
-            });
+            return Err(ToolsetInstallError::NotInstalled);
         }
         Err(e) => return Err(ToolsetInstallError::from_io(e)),
     }
@@ -955,8 +947,8 @@ fn parse_version_str(version: &str) -> Result<Version, ToolsetInstallError> {
             ),
         });
     }
-    Version::parse(version).map_err(|e| ToolsetInstallError::InvalidVersion {
-        detail: stellar_agent_toolsets::sanitise_display(&e.to_string(), 256),
+    Version::parse(version).map_err(|_| ToolsetInstallError::InvalidVersion {
+        detail: "version must be SemVer, such as 1.2.3".to_owned(),
     })
 }
 
@@ -1794,7 +1786,7 @@ mod tests {
 
         let err = uninstall_locked("my-toolset", &toolsets_root).unwrap_err();
         assert!(
-            matches!(err, ToolsetInstallError::NotInstalled { .. }),
+            matches!(err, ToolsetInstallError::NotInstalled),
             "expected NotInstalled, got: {err:?}"
         );
     }

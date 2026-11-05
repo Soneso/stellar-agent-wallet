@@ -1678,44 +1678,49 @@ mod tests {
         );
     }
 
-    /// A home domain the identity gate refuses for its form aborts before
-    /// payment, and the warning of the abort does not carry the home domain.
-    #[tokio::test(flavor = "current_thread")]
+    /// A home domain the identity gate refuses for its form aborts before any
+    /// fetch, and no event at the most verbose level carries the domain or its
+    /// authority.
+    #[test]
     #[serial_test::serial(keyring)]
-    async fn x402_home_domain_marker_is_not_logged() {
-        use stellar_agent_test_support::rejected_value::{
-            CREDENTIAL_MARKER, assert_no_marker_in_text,
-        };
-
+    fn x402_home_domain_marker_is_not_logged() {
         stellar_agent_test_support::keyring_mock::install().unwrap();
         let fixture = crate::tools::message_signing_tests::Fixture::new();
         fixture.seed_audit();
         let server = fixture.server();
-        let (capture, guard) =
-            stellar_agent_test_support::WarningCapture::capture(Some("stellar_agent"));
-        let result = server
-            .call_stellar_x402_authenticated_payment(X402AuthenticatedPaymentArgs {
-                chain_id: "stellar:testnet".to_owned(),
-                home_domain: format!("{CREDENTIAL_MARKER}.example.com"),
-                payment_required: sample_requirements_json(),
-                address: None,
-                approval_nonce: None,
-                approval_attestation: None,
-            })
-            .await
-            .expect("the identity abort is a business envelope");
-        drop(guard);
-        let (code, _message, text) = crate::tools::common::assert_business_envelope(&result);
-        assert_eq!(code, "identity.home_domain_invalid");
-        assert_no_marker_in_text(&text, CREDENTIAL_MARKER);
-        let warnings = capture.seen();
-        assert!(
-            warnings.iter().any(|fields| fields
-                .get("message")
-                .is_some_and(|m| m.contains("identity gate aborted before payment"))),
-            "the test must reach the abort warning; got: {warnings:?}"
-        );
-        assert_no_marker_in_text(&format!("{warnings:?}"), CREDENTIAL_MARKER);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        for home_domain in ["credmarker7_invalid.example", "credmarker7.example:1"] {
+            let mut result = None;
+            let logs = stellar_agent_test_support::log_capture::with_captured_trace_logs(|| {
+                result = Some(
+                    runtime.block_on(server.call_stellar_x402_authenticated_payment(
+                        X402AuthenticatedPaymentArgs {
+                            chain_id: "stellar:testnet".to_owned(),
+                            home_domain: home_domain.to_owned(),
+                            payment_required: sample_requirements_json(),
+                            address: None,
+                            approval_nonce: None,
+                            approval_attestation: None,
+                        },
+                    )),
+                );
+            });
+            let result = result
+                .expect("the call ran")
+                .expect("the identity abort is a business envelope");
+            let (code, _message, text) = crate::tools::common::assert_business_envelope(&result);
+            assert_eq!(code, "identity.home_domain_invalid");
+            assert!(!text.contains("credmarker7"), "{text}");
+            assert!(
+                logs.contains("identity gate aborted before payment"),
+                "{logs}"
+            );
+            assert!(!logs.contains("fetching stellar.toml"), "{logs}");
+            assert!(!logs.contains("credmarker7"), "{logs}");
+        }
     }
 
     /// A policy denial precedes the audit pre-flight: with a denying engine

@@ -61,25 +61,20 @@ pub enum PoolError {
     ///
     /// Wire code: `pool.size_out_of_range`.
     #[error(
-        "pool.size_out_of_range: requested size {requested}; valid range is 1..=19 \
-         (N+1 signatures must not exceed the 20-signature VecM cap)"
+        "pool.size_out_of_range: pool size (--size) must be an integer from 1 through 19 so all \
+         transaction signatures fit"
     )]
-    SizeOutOfRange {
-        /// The invalid size that was requested.
-        requested: usize,
-    },
+    SizeOutOfRange,
 
     /// The per-operation fee times the sandwich's operation count does not
     /// fit the transaction's `u32` fee field.
     ///
     /// Returned by `init_pool` before anything is built, signed, or sent.
     #[error(
-        "pool.fee_overflow: per-operation fee {fee_per_op} stroops times {op_count} operations \
-         exceeds the transaction fee limit"
+        "pool.fee_overflow: classic_fee_per_op_stroops multiplied by the operation count must \
+         fit in u32; lower classic_fee_per_op_stroops."
     )]
     FeeOverflow {
-        /// Per-operation fee in stroops.
-        fee_per_op: u32,
         /// Operations in the sandwich transaction.
         op_count: u32,
     },
@@ -104,11 +99,12 @@ pub enum PoolError {
     )]
     AlreadyInitialised,
 
-    /// Channel key derivation failed.
+    /// The channel index is outside the hardened derivation range.
     ///
-    /// Wraps [`stellar_agent_sep5::DeriveError`].
-    #[error("pool.derive_failed: {0}")]
-    DeriveFailed(#[from] stellar_agent_sep5::DeriveError),
+    /// The variant keeps neither the refused index nor the derivation error
+    /// that holds it.
+    #[error("pool.derive_failed: channel index must be less than 2147483648")]
+    DeriveFailed,
 
     /// An underlying wallet error propagated from network / signing / core.
     #[error("pool.wallet_error: {0}")]

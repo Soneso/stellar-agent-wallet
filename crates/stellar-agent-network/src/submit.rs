@@ -47,6 +47,7 @@
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+use stellar_agent_core::envelope_decode::TRANSACTION_ENVELOPE_XDR_FORM;
 use stellar_agent_core::error::{
     LedgerError, NetworkError, ProtocolError, SubmissionError, WalletError,
 };
@@ -398,9 +399,12 @@ async fn submit_unauthorized(
         envelope_xdr,
         stellar_agent_xdr_limits::untrusted_decode_limits(envelope_xdr.len()),
     )
-    .map_err(|e| {
+    .map_err(|_| {
         WalletError::Protocol(ProtocolError::XdrCodecFailed {
-            detail: format!("failed to decode TransactionEnvelope from base64 XDR: {e}"),
+            detail: format!(
+                "failed to decode TransactionEnvelope from base64 XDR: \
+                 {TRANSACTION_ENVELOPE_XDR_FORM}"
+            ),
         })
     })?;
 
@@ -627,9 +631,12 @@ pub(crate) async fn authorized_submission(
         envelope_xdr,
         stellar_agent_xdr_limits::untrusted_decode_limits(envelope_xdr.len()),
     )
-    .map_err(|e| {
+    .map_err(|_| {
         WalletError::Protocol(ProtocolError::XdrCodecFailed {
-            detail: format!("failed to decode TransactionEnvelope from base64 XDR: {e}"),
+            detail: format!(
+                "failed to decode TransactionEnvelope from base64 XDR: \
+                 {TRANSACTION_ENVELOPE_XDR_FORM}"
+            ),
         })
     })?;
     let send_deadline = tokio::time::Instant::now() + timeout;
@@ -1947,6 +1954,35 @@ mod tests {
         ENDPOINT, ENDPOINT_AUTHORITY, ERROR_OBJECTS, assert_scrubbed, call_client_error,
         call_error, xdr_error,
     };
+
+    /// An envelope that fails to decode is refused by its accepted form, with
+    /// no decoder diagnostic, for malformed base64 and for malformed XDR.
+    #[tokio::test]
+    async fn undecodable_envelope_reports_the_accepted_form() {
+        use base64::Engine as _;
+        let client = StellarRpcClient::new("http://127.0.0.1:9").unwrap();
+        let xdr = base64::engine::general_purpose::STANDARD.encode([0xAA_u8; 64]);
+        for envelope in ["~", xdr.as_str()] {
+            let error = submit_transaction_and_wait(
+                &client,
+                envelope,
+                Duration::from_secs(1),
+                "Test SDF Network ; September 2015",
+                None,
+                None,
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error.code(), "protocol.xdr_codec_failed");
+            let text = error.to_string();
+            assert_eq!(
+                text,
+                "XDR codec operation failed: failed to decode TransactionEnvelope from base64 \
+                 XDR: must be base64-encoded TransactionEnvelope XDR"
+            );
+            assert!(!format!("{error:?}").contains("Invalid symbol"));
+        }
+    }
 
     /// The send step's failure message, in the form the RPC client renders a
     /// JSON-RPC error object it got instead of a status, keeps its own wording

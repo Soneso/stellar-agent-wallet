@@ -119,6 +119,11 @@ use crate::common::signer_ceremony::record_mlock_degradation;
 /// Default submission timeout in seconds.
 const DEFAULT_TIMEOUT_SECONDS: u64 = 60;
 
+/// `target_contract` of an invocation string with fewer than three fields.
+/// The bundle check refuses it as an invalid C-strkey; it holds none of the
+/// invocation string because the refusal is for that string.
+const MISSING_FIELDS_SENTINEL: &str = "<parse_error: missing fields>";
+
 /// Default per-op base fee in stroops.
 const DEFAULT_FEE_STROOPS: u32 = 100;
 
@@ -575,7 +580,7 @@ fn parse_single_invocation(raw: &str) -> MulticallInvocation {
     let parts: Vec<&str> = raw.splitn(3, ':').collect();
     if parts.len() != 3 {
         return MulticallInvocation {
-            target_contract: format!("<parse_error: missing fields in {raw:?}>"),
+            target_contract: MISSING_FIELDS_SENTINEL.to_owned(),
             fn_name: String::new(),
             args_json: serde_json::Value::Null,
         };
@@ -653,14 +658,14 @@ mod tests {
 
     #[test]
     fn parse_invocation_missing_fields() {
-        let raw = "CABC123:transfer";
+        let raw = "credmarker7:transfer";
         let inv = parse_single_invocation(raw);
-        // Target contract gets the error sentinel.
-        assert!(
-            inv.target_contract.starts_with("<parse_error:"),
-            "expected sentinel: got {:?}",
-            inv.target_contract
-        );
+        // Target contract gets the error sentinel, and the invocation holds
+        // none of the refused input.
+        assert_eq!(inv.target_contract, "<parse_error: missing fields>");
+        assert_eq!(inv.fn_name, "");
+        assert_eq!(inv.args_json, serde_json::Value::Null);
+        assert!(!format!("{inv:?}").contains("credmarker7"), "{inv:?}");
     }
 
     #[test]

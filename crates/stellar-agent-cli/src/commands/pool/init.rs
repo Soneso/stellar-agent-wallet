@@ -165,9 +165,7 @@ fn channels(
     size: usize,
 ) -> Result<Vec<PoolChannelRecord>, WalletError> {
     if !(1..=stellar_agent_pool::ChannelPool::MAX_SIZE).contains(&size) {
-        return Err(pool_err_to_wallet_err(&PoolError::SizeOutOfRange {
-            requested: size,
-        }));
+        return Err(pool_err_to_wallet_err(&PoolError::SizeOutOfRange));
     }
     let mut seed_copy = Zeroizing::new([0u8; 64]);
     seed_copy.copy_from_slice(seed.as_ref());
@@ -177,7 +175,7 @@ fn channels(
             wallet
                 .derive_account(index)
                 .map(|key| PoolChannelRecord::new(index, key.public_key_strkey()))
-                .map_err(|error| pool_err_to_wallet_err(&PoolError::from(error)))
+                .map_err(|_| pool_err_to_wallet_err(&PoolError::DeriveFailed))
         })
         .collect()
 }
@@ -337,9 +335,7 @@ where
     if let Some(size) = args.size
         && !(1..=stellar_agent_pool::ChannelPool::MAX_SIZE).contains(&size)
     {
-        return Err(pool_err_to_wallet_err(&PoolError::SizeOutOfRange {
-            requested: size,
-        }));
+        return Err(pool_err_to_wallet_err(&PoolError::SizeOutOfRange));
     }
     let resolved = resolve_profile_name(args.profile.as_deref());
     // Validate the name and existing profile before constructing the sidecar path.
@@ -645,14 +641,8 @@ fn precheck_init_fee(
 fn map_init_error(error: PoolError, name: &str) -> WalletError {
     match error {
         // Nothing was built, signed, or sent: the operator lowers the fee.
-        PoolError::FeeOverflow {
-            fee_per_op,
-            op_count,
-        } => WalletError::Validation(
-            stellar_agent_core::error::ValidationError::FeeTotalOverflow {
-                per_op: fee_per_op,
-                op_count,
-            },
+        PoolError::FeeOverflow { op_count } => WalletError::Validation(
+            stellar_agent_core::error::ValidationError::FeeTotalOverflow { op_count },
         ),
         other => WalletError::Internal(InternalError::UnexpectedState {
             detail: format!("{other}; run 'stellar-agent pool init --resume --profile {name}'"),
@@ -1253,17 +1243,46 @@ mod tests {
              profile writes the env-merged view into the profile TOML"
         );
     }
+
+    /// A fee per operation that overflows the transaction fee is refused
+    /// with the fixed text, on the pool error and on the wallet error it maps
+    /// to, and stays out of the events of the check.
+    #[test]
+    fn overflowing_fee_stays_out_of_the_refusal() {
+        use stellar_agent_test_support::rejected_value::{
+            assert_no_marker, assert_no_marker_in_text,
+        };
+
+        const OVERFLOWING_FEE: &str = "4294967295";
+        let produced = total_init_fee(u32::MAX, 1).unwrap_err();
+        assert_no_marker(&produced, OVERFLOWING_FEE);
+        let profile = Profile::builder_testnet_named("pool-fee-test", "s", "a", "n", "a")
+            .with_noop_engine()
+            .build();
+        let mut mapped = None;
+        let logs = stellar_agent_test_support::log_capture::with_captured_trace_logs(|| {
+            mapped = precheck_init_fee(u32::MAX, 1, &profile, "pool-fee-test").err();
+        });
+        let mapped = mapped.expect("the fee overflows");
+        assert_eq!(mapped.code(), "validation.fee_total_overflow");
+        assert_eq!(
+            mapped.to_string(),
+            "classic_fee_per_op_stroops multiplied by the operation count must fit in u32; lower \
+             classic_fee_per_op_stroops."
+        );
+        assert_no_marker(&mapped, OVERFLOWING_FEE);
+        assert_no_marker_in_text(&logs, OVERFLOWING_FEE);
+    }
+
     #[test]
     fn fee_overflow_maps_to_validation() {
-        let error = map_init_error(
-            PoolError::FeeOverflow {
-                fee_per_op: u32::MAX,
-                op_count: 3,
-            },
-            "pool-fee-test",
-        );
+        let error = map_init_error(PoolError::FeeOverflow { op_count: 3 }, "pool-fee-test");
         assert_eq!(error.code(), "validation.fee_total_overflow");
-        assert!(error.to_string().contains("3 operations"));
+        assert_eq!(
+            error.to_string(),
+            "classic_fee_per_op_stroops multiplied by the operation count must fit in u32; lower \
+             classic_fee_per_op_stroops."
+        );
     }
     #[test]
     fn pool_result_omits_an_absent_witness_and_reads_legacy_json() {
@@ -1290,7 +1309,11 @@ mod tests {
         profile.classic_max_fee_per_op_stroops = Some(100);
         let error = precheck_init_fee(u32::MAX, 2, &profile, "fee").unwrap_err();
         assert_eq!(error.code(), "fees.percentile_exceeds_cap");
-        assert!(error.to_string().contains("profile's per-operation fee"));
+        assert!(
+            error
+                .to_string()
+                .contains("classic_fee_per_op_stroops must not exceed")
+        );
         profile.classic_max_fee_per_op_stroops = None;
         let error = precheck_init_fee(u32::MAX, 2, &profile, "fee").unwrap_err();
         assert_eq!(error.code(), "validation.fee_total_overflow");

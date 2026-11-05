@@ -101,12 +101,12 @@ pub enum ToolsetInstallError {
 
     /// The signer public key is not present in the trust set.
     ///
-    /// The publisher key is redacted to first-5-last-5 in `Display` output.
-    #[error("untrusted publisher: signer {publisher_key_redacted} is not in the trust set")]
-    UntrustedPublisher {
-        /// Publisher G-strkey, redacted to first-5-last-5.
-        publisher_key_redacted: String,
-    },
+    /// The refused key stays out of the error.
+    #[error(
+        "untrusted publisher: the --publisher key must be in the trust set; add its G-strkey to \
+         the trust set"
+    )]
+    UntrustedPublisher,
 
     /// Trust-set file is absent or contains no entries.
     ///
@@ -163,11 +163,8 @@ pub enum ToolsetInstallError {
     ///
     /// Triggered by `..` components, absolute paths, drive prefixes, or
     /// root-only paths.
-    #[error("archive path traversal: entry {entry_name} escapes the package root")]
-    ArchivePathTraversal {
-        /// Sanitised entry name (length-capped, control/ANSI stripped).
-        entry_name: String,
-    },
+    #[error("archive path traversal: every entry must stay within the package root")]
+    ArchivePathTraversal,
 
     /// Archive entry name contains NUL, control bytes, or non-UTF-8 bytes.
     ///
@@ -189,13 +186,8 @@ pub enum ToolsetInstallError {
     /// Rejected to prevent APFS/HFS+ case-folding attacks.  ASCII-lowercase
     /// collision detection is used; full Unicode NFC+case-fold is not yet
     /// implemented.
-    #[error(
-        "archive duplicate entry: {entry_name} collides with an already-seen entry (ASCII-lowercase)"
-    )]
-    ArchiveDuplicateEntry {
-        /// Sanitised entry name that triggered the collision.
-        entry_name: String,
-    },
+    #[error("archive duplicate entry: entry names must be unique under ASCII-lowercase comparison")]
+    ArchiveDuplicateEntry,
 
     /// Archive entry count exceeds the configured cap.
     #[error("archive too many entries: exceeds the {cap}-entry cap")]
@@ -230,11 +222,9 @@ pub enum ToolsetInstallError {
     ///
     /// A valid package must contain exactly one top-level directory whose name
     /// equals the package name.
-    #[error(
-        "archive bad top-level: expected exactly one directory named after the package; got {detail}"
-    )]
+    #[error("archive bad top-level: {detail}")]
     ArchiveBadTopLevel {
-        /// Sanitised description of the top-level shape found.
+        /// Fixed description of the shape the archive must have.
         detail: String,
     },
 
@@ -291,11 +281,8 @@ pub enum ToolsetInstallError {
     },
 
     /// Uninstall was requested for a toolset that is not installed.
-    #[error("not installed: '{package}' is not installed")]
-    NotInstalled {
-        /// Package name requested for uninstall (validated).
-        package: String,
-    },
+    #[error("not installed: the requested package must be installed before it can be uninstalled")]
+    NotInstalled,
 
     /// The stored pin record is invalid.
     ///
@@ -393,15 +380,12 @@ pub enum ToolsetInstallError {
     /// DISTINCT from the publisher trust set (`trust.txt`) — placing a key in
     /// `trust.txt` does NOT implicitly grant auditor status.
     ///
-    /// The auditor key is redacted to first-5-last-5 in `Display`.
+    /// The refused key stays out of the error.
     #[error(
-        "auditor untrusted: auditor {auditor_key_redacted} is not in the auditor trust set \
-         (auditor-trust.txt); add the key to trust it"
+        "auditor untrusted: the attestation auditor key must be in auditor-trust.txt; add the \
+         key to trust it"
     )]
-    AuditorUntrusted {
-        /// Auditor G-strkey, redacted to first-5-last-5.
-        auditor_key_redacted: String,
-    },
+    AuditorUntrusted,
 
     /// An attestation field does not match the verified install values.
     ///

@@ -197,10 +197,11 @@ pub fn build_weighted_threshold_install_param(
     }
 
     if threshold > total_weight {
-        return Err(refuse(format!(
-            "--threshold ({threshold}) must not exceed the sum of signer weights \
-             ({total_weight}); OZ install rejects this with InvalidThreshold"
-        )));
+        return Err(refuse(
+            "threshold must be non-zero and must not exceed the sum of signer weights; lower \
+             --threshold or increase the signer weights."
+                .to_owned(),
+        ));
     }
 
     // Build (key, value) pairs for the inner signer_weights map.
@@ -511,6 +512,35 @@ mod tests {
             err,
             SaError::WeightedThresholdInstallRefused { .. }
         ));
+    }
+
+    /// A threshold above the weight sum is refused with the check and holds
+    /// the requested value in no rendered form.
+    #[test]
+    fn excessive_threshold_stays_out_of_the_refusal() {
+        let signers = [
+            (
+                WeightedThresholdSignerInput::Delegated {
+                    g_strkey: ed25519_g_strkey(0x11),
+                },
+                1,
+            ),
+            (
+                WeightedThresholdSignerInput::Delegated {
+                    g_strkey: ed25519_g_strkey(0x22),
+                },
+                1,
+            ),
+        ];
+        let error = build_weighted_threshold_install_param(&signers, 424_242)
+            .expect_err("a threshold above the weight sum must refuse");
+        assert_eq!(
+            error.to_string(),
+            "weighted-threshold policy install refused: threshold must be non-zero and must not \
+             exceed the sum of signer weights; lower --threshold or increase the signer weights."
+        );
+        assert!(!format!("{error:?}").contains("424242"), "{error:?}");
+        assert!(!serde_json::to_string(&error).unwrap().contains("424242"));
     }
 
     /// `threshold == 0` is refused even with a valid non-empty signer set.

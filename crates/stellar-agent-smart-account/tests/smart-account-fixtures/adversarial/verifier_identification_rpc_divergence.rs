@@ -24,9 +24,10 @@ use wiremock::{
 
 use super::rpc_mock_helpers::SorobanRpcDispatcher;
 use super::rpc_mock_helpers::{
-    SOURCE_G, UNKNOWN_WASM_HASH, ZERO_CONTRACT_REDACTED, build_ledger_entries_contract_instance,
-    build_simulate_response, build_threshold_scval_xdr, manager_two_url, signer_set_n_of_n,
-    tmp_audit_writer, write_baseline,
+    SOURCE_G, UNKNOWN_WASM_HASH, ZERO_CONTRACT_REDACTED, assert_refusal_holds_no_marker,
+    build_ledger_entries_contract_instance, build_simulate_response, build_threshold_scval_xdr,
+    manager_two_url, mcp_error_envelope, signer_set_n_of_n, tmp_audit_writer, wallet_traced,
+    write_baseline,
 };
 
 /// Verifier address used throughout this fixture (`[0x03; 32]` hash bytes —
@@ -50,75 +51,101 @@ fn smart_account_sc_address() -> stellar_xdr::ScAddress {
 ///
 /// The two-RPC agreement check in `identify_verifier` detects the hash
 /// disagreement and returns `NetworkRpcDivergence` before the allowlist check.
-#[tokio::test]
-async fn verifier_hash_rpc_disagreement_returns_rpc_divergence() {
+/// Both fetched hashes are refused: the error names each side as `<Wasm>`,
+/// and no channel of the refusal holds either hash, whole or as its first
+/// eight bytes: not the Display, Debug and source chain, the serialized
+/// form, the MCP error envelope, or the wallet's logs.
+#[test]
+fn verifier_hash_rpc_disagreement_returns_rpc_divergence() {
     let (audit_writer, audit_log_path, _dir) = tmp_audit_writer();
 
     // Write a valid baseline so rule_id=1 is not missing-baseline.
     let baseline = signer_set_n_of_n(1);
     write_baseline(&audit_writer, 1, ZERO_CONTRACT_REDACTED, &baseline);
 
-    let smart_account = smart_account_sc_address();
-    let verifier = verifier_sc_address();
+    let (result, logs) = wallet_traced(async move {
+        let smart_account = smart_account_sc_address();
+        let verifier = verifier_sc_address();
 
-    // Context rule simulate response — not exercised by identify_verifier (no rule fetch),
-    // but required by the SorobanRpcDispatcher which expects a simulate response.
-    let sim_threshold = build_simulate_response(&build_threshold_scval_xdr(1));
+        // Context rule simulate response: not exercised by identify_verifier (no rule
+        // fetch), but required by the SorobanRpcDispatcher which expects a simulate
+        // response.
+        let sim_threshold = build_simulate_response(&build_threshold_scval_xdr(1));
 
-    // Primary: serves VERIFIER_ALLOWLIST[0].wasm_hash for the verifier contract instance.
-    let primary_server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/"))
-        .respond_with(SorobanRpcDispatcher::new(
-            build_ledger_entries_contract_instance(&verifier, VERIFIER_ALLOWLIST[0].wasm_hash),
-            sim_threshold.clone(),
-        ))
-        .mount(&primary_server)
-        .await;
+        // Primary: serves VERIFIER_ALLOWLIST[0].wasm_hash for the verifier contract instance.
+        let primary_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .respond_with(SorobanRpcDispatcher::new(
+                build_ledger_entries_contract_instance(&verifier, VERIFIER_ALLOWLIST[0].wasm_hash),
+                sim_threshold.clone(),
+            ))
+            .mount(&primary_server)
+            .await;
 
-    // Secondary: serves UNKNOWN_WASM_HASH for the verifier contract instance.
-    let secondary_server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/"))
-        .respond_with(SorobanRpcDispatcher::new(
-            build_ledger_entries_contract_instance(&verifier, UNKNOWN_WASM_HASH),
-            sim_threshold,
-        ))
-        .mount(&secondary_server)
-        .await;
+        // Secondary: serves UNKNOWN_WASM_HASH for the verifier contract instance.
+        let secondary_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .respond_with(SorobanRpcDispatcher::new(
+                build_ledger_entries_contract_instance(&verifier, UNKNOWN_WASM_HASH),
+                sim_threshold,
+            ))
+            .mount(&secondary_server)
+            .await;
 
-    let manager = manager_two_url(
-        &primary_server.uri(),
-        &secondary_server.uri(),
-        Arc::clone(&audit_writer),
-        audit_log_path,
-    );
+        let manager = manager_two_url(
+            &primary_server.uri(),
+            &secondary_server.uri(),
+            Arc::clone(&audit_writer),
+            audit_log_path,
+        );
 
-    let result = manager
-        .identify_verifier(
-            smart_account,
-            verifier,
-            1,
-            SOURCE_G,
-            Uuid::new_v4().to_string(),
-        )
-        .await;
+        manager
+            .identify_verifier(
+                smart_account,
+                verifier,
+                1,
+                SOURCE_G,
+                Uuid::new_v4().to_string(),
+            )
+            .await
+    });
 
-    assert!(
-        matches!(
-            result,
-            Err(SaError::NetworkRpcDivergence {
-                rule_id: Some(1),
-                ..
-            })
-        ),
-        "verifier hash disagreement must return NetworkRpcDivergence; got: {result:?}"
-    );
+    let error = result.expect_err("verifier hash disagreement must refuse");
+    let SaError::NetworkRpcDivergence {
+        rule_id,
+        primary_view_digest_first8,
+        secondary_view_digest_first8,
+        ..
+    } = &error
+    else {
+        panic!("verifier hash disagreement must return NetworkRpcDivergence; got: {error:?}");
+    };
+    assert_eq!(*rule_id, Some(1));
+    assert_eq!(primary_view_digest_first8, "<Wasm>");
+    assert_eq!(secondary_view_digest_first8, "<Wasm>");
     assert_eq!(
-        result.unwrap_err().wire_code(),
+        error.wire_code(),
         "network.rpc_divergence",
         "wire_code must be 'network.rpc_divergence'"
     );
+    assert!(
+        mcp_error_envelope(&error).contains("\"network.rpc_divergence\""),
+        "the MCP envelope carries the wire code"
+    );
+    let mut markers = Vec::new();
+    for hash in [VERIFIER_ALLOWLIST[0].wasm_hash, UNKNOWN_WASM_HASH] {
+        markers.push(hex::encode(hash));
+        markers.push(hex::encode(&hash[..8]));
+    }
+    let markers: Vec<&str> = markers.iter().map(String::as_str).collect();
+    // The path emits no wallet event; the capture holds the RPC exchange.
+    assert!(
+        !logs.is_empty(),
+        "the capture records the RPC exchange of both endpoints"
+    );
+    assert_refusal_holds_no_marker(&error, &logs, &markers, &[]);
 }
 
 /// Type-level: `NetworkRpcDivergence` from verifier-identification carries the

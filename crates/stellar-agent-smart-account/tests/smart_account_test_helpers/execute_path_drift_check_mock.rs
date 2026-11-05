@@ -1783,6 +1783,53 @@ fn chain_with_rule_one(verifier_hash: [u8; 32]) -> Chain {
 
 // ── Drift refusals ────────────────────────────────────────────────────────────
 
+/// Asserts that the drift refusal `err` holds no form of the `observed`
+/// executable hash, which differs from the pin, in its Display, Debug or
+/// serialized envelope, its first eight bytes included unless the pin
+/// shares them, and that the one drift row `request_id` wrote carries the
+/// observed hash's first eight bytes. Returns the row's executable summary.
+fn assert_the_drift_row_alone_keeps_the_observed_hash(
+    h: &Harness,
+    err: &SaError,
+    request_id: &str,
+    observed: &WasmHashPin,
+) -> Option<String> {
+    let pinned = match err {
+        SaError::VerifierHashDrift { pinned_hash, .. }
+        | SaError::PolicyHashDrift { pinned_hash, .. } => pinned_hash,
+        other => panic!("expected a drift refusal; got {other:?}"),
+    };
+    assert_ne!(pinned, observed, "the observed hash differs from the pin");
+    let rendered = format!("{err}\n{err:?}\n{}", serde_json::to_string(err).unwrap());
+    assert!(!rendered.contains(&observed.to_hex()), "{rendered}");
+    if observed.first8_display() != pinned.first8_display() {
+        assert!(!rendered.contains(&observed.first8_display()), "{rendered}");
+    }
+    let rows: Vec<(String, Option<String>)> = h
+        .rows()
+        .into_iter()
+        .filter(|entry| entry.request_id == request_id)
+        .filter_map(|entry| match entry.event_kind {
+            EventKind::SaVerifierHashDrift {
+                observed_hash_first8,
+                observed_executable,
+                ..
+            }
+            | EventKind::SaPolicyHashDrift {
+                observed_hash_first8,
+                observed_executable,
+                ..
+            } => Some((observed_hash_first8, observed_executable)),
+            _ => None,
+        })
+        .collect();
+    let [(observed_first8, executable)] = rows.as_slice() else {
+        panic!("one drift row for {request_id}: {rows:?}");
+    };
+    assert_eq!(observed_first8, &observed.first8_display());
+    executable.clone()
+}
+
 /// A live verifier that differs from the rule's pin refuses the submission
 /// before its invocation is simulated, and the drift row carries the
 /// caller's request id. The rule's baseline is present, so the refusal is
@@ -1808,17 +1855,21 @@ async fn verifier_drift_refuses_before_simulation_with_the_callers_request_id() 
         SaError::VerifierHashDrift {
             rule_id,
             pinned_hash,
-            observed_hash,
             request_id,
             ..
         } => {
             assert_eq!(*rule_id, 1);
             assert_eq!(*pinned_hash, FOREIGN_HASH);
-            assert_eq!(observed_hash.as_ref(), Some(&full(&webauthn_hash())));
             assert_eq!(request_id, "req-verifier-drift");
         }
         other => panic!("expected VerifierHashDrift; got {other:?}"),
     }
+    assert_the_drift_row_alone_keeps_the_observed_hash(
+        &h,
+        &err,
+        "req-verifier-drift",
+        &full(&webauthn_hash()),
+    );
     let drift_rows: Vec<AuditEntry> = h
         .rows()
         .into_iter()
@@ -1860,17 +1911,21 @@ async fn policy_drift_refuses_before_simulation_with_the_callers_request_id() {
         SaError::PolicyHashDrift {
             rule_id,
             pinned_hash,
-            observed_hash,
             request_id,
             ..
         } => {
             assert_eq!(*rule_id, 1);
             assert_eq!(*pinned_hash, FOREIGN_HASH);
-            assert_eq!(observed_hash.as_ref(), Some(&full(&KNOWN_WASM_HASH)));
             assert_eq!(request_id, "req-policy-drift");
         }
         other => panic!("expected PolicyHashDrift; got {other:?}"),
     }
+    assert_the_drift_row_alone_keeps_the_observed_hash(
+        &h,
+        &err,
+        "req-policy-drift",
+        &full(&KNOWN_WASM_HASH),
+    );
     let drift_rows: Vec<AuditEntry> = h
         .rows()
         .into_iter()
@@ -1893,8 +1948,161 @@ async fn policy_drift_refuses_before_simulation_with_the_callers_request_id() {
     assert_eq!(h.sends(), 0);
 }
 
+/// The forms of `hash` a refusal of its observation never holds: the full
+/// hex, the first eight bytes and the first eight hex characters.
+fn hash_markers(hash: &[u8; 32]) -> [String; 3] {
+    let whole = hex::encode(hash);
+    [whole.clone(), whole[..16].to_owned(), whole[..8].to_owned()]
+}
+
+/// The `no drift` events of `kind` in `logs`, as captured lines.
+fn match_events<'a>(logs: &'a str, kind: &str) -> Vec<&'a str> {
+    let message = format!("verify_pinned_{kind}_against_chain: executable matches pin (no drift)");
+    logs.lines()
+        .filter(|line| line.contains(&message))
+        .collect()
+}
+
+/// Two rules share verifier V; rule 1 pins its live hash and rule 2 pins
+/// another. The submission checks one observation of V against both pins
+/// and refuses with rule 2's drift, so rule 1's match event names no part of
+/// the observation: the refusal's Display, Debug, source chain, serialized
+/// form and MCP envelope and every captured event hold neither the observed
+/// hash, whole, as its first eight bytes or as its first eight hex
+/// characters, nor the executable summary. The match event of rule 1 is
+/// logged with its rule id, and rule 2 logs none.
+#[test]
+fn a_verifier_matching_rule_one_and_drifting_from_rule_two_logs_no_observed_hash() {
+    let observed = webauthn_hash();
+    let (err, logs) = rpc_mock_helpers::wallet_traced(async {
+        let chain = Chain::default()
+            .with_rule(
+                1,
+                rule(1, vec![external_signer(&verifier_v(), &[0x11; 32])], vec![]),
+            )
+            .with_rule(
+                2,
+                rule(2, vec![external_signer(&verifier_v(), &[0x12; 32])], vec![]),
+            )
+            .with_entry(wasm_instance(&verifier_v(), observed));
+        let h = Harness::new(chain).await;
+        h.baseline_v2(1);
+        h.baseline_v2(2);
+        h.pin_created(1, vec![full(&observed)], vec![], vec![], vec![]);
+        h.pin_created(2, vec![FOREIGN_HASH], vec![], vec![], vec![]);
+        let err = h
+            .submit_invocation("pair", &[1, 2], Some("req-verifier-two-pins"), None)
+            .await
+            .unwrap_err();
+        assert_eq!(h.primary_instance_reads(&verifier_v()), 1);
+        assert_eq!(h.sends(), 0);
+        err
+    });
+    match &err {
+        SaError::VerifierHashDrift {
+            rule_id,
+            pinned_hash,
+            request_id,
+            ..
+        } => {
+            assert_eq!(*rule_id, 2);
+            assert_eq!(*pinned_hash, FOREIGN_HASH);
+            assert_eq!(request_id, "req-verifier-two-pins");
+        }
+        other => panic!("expected VerifierHashDrift; got {other:?}"),
+    }
+    let events = match_events(&logs, "verifier");
+    let [event] = events.as_slice() else {
+        panic!("one verifier match event, rule 1's: {events:?}");
+    };
+    assert!(event.contains("\"rule_id\":1"), "{event}");
+    let markers = hash_markers(&observed);
+    let markers: Vec<&str> = markers.iter().map(String::as_str).collect();
+    rpc_mock_helpers::assert_refusal_holds_no_marker(&err, &logs, &markers, &["wasm"]);
+}
+
+/// Two rules share policy P; rule 1 pins its live hash and rule 2 pins
+/// another. The submission refuses with rule 2's policy drift, and rule 1's
+/// match event names no part of the observation in any channel the
+/// verifier case of
+/// [`a_verifier_matching_rule_one_and_drifting_from_rule_two_logs_no_observed_hash`]
+/// reads. The match event of rule 1 is logged with its rule id, and rule 2
+/// logs none.
+#[test]
+fn a_policy_matching_rule_one_and_drifting_from_rule_two_logs_no_observed_hash() {
+    let observed = KNOWN_WASM_HASH;
+    let (err, logs) = rpc_mock_helpers::wallet_traced(async {
+        let chain = Chain::default()
+            .with_rule(
+                1,
+                rule(
+                    1,
+                    vec![external_signer(&verifier_v(), &[0x11; 32])],
+                    vec![policy_p()],
+                ),
+            )
+            .with_rule(
+                2,
+                rule(
+                    2,
+                    vec![external_signer(&verifier_v(), &[0x12; 32])],
+                    vec![policy_p()],
+                ),
+            )
+            .with_entry(wasm_instance(&verifier_v(), webauthn_hash()))
+            .with_wasm(&policy_p(), observed)
+            .with_threshold(&policy_p(), 1, 1)
+            .with_threshold(&policy_p(), 2, 1);
+        let h = Harness::new(chain).await;
+        h.baseline_v2(1);
+        h.baseline_v2(2);
+        h.pin_created(
+            1,
+            vec![full(&webauthn_hash())],
+            vec![full(&observed)],
+            vec![],
+            vec![],
+        );
+        h.pin_created(
+            2,
+            vec![full(&webauthn_hash())],
+            vec![FOREIGN_HASH],
+            vec![],
+            vec![],
+        );
+        let err = h
+            .submit_invocation("pair", &[1, 2], Some("req-policy-two-pins"), None)
+            .await
+            .unwrap_err();
+        assert_eq!(h.primary_instance_reads(&policy_p()), 1);
+        assert_eq!(h.sends(), 0);
+        err
+    });
+    match &err {
+        SaError::PolicyHashDrift {
+            rule_id,
+            pinned_hash,
+            request_id,
+            ..
+        } => {
+            assert_eq!(*rule_id, 2);
+            assert_eq!(*pinned_hash, FOREIGN_HASH);
+            assert_eq!(request_id, "req-policy-two-pins");
+        }
+        other => panic!("expected PolicyHashDrift; got {other:?}"),
+    }
+    let events = match_events(&logs, "policy");
+    let [event] = events.as_slice() else {
+        panic!("one policy match event, rule 1's: {events:?}");
+    };
+    assert!(event.contains("\"rule_id\":1"), "{event}");
+    let markers = hash_markers(&observed);
+    let markers: Vec<&str> = markers.iter().map(String::as_str).collect();
+    rpc_mock_helpers::assert_refusal_holds_no_marker(&err, &logs, &markers, &["wasm"]);
+}
+
 /// A pinned external reference whose tag now resolves to another hash
-/// refuses with the observed executable named.
+/// refuses naming the pin; the drift row names the observed executable.
 #[tokio::test]
 async fn a_repointed_external_reference_refuses_with_the_observed_executable() {
     let chain = Chain::default()
@@ -1916,27 +2124,26 @@ async fn a_repointed_external_reference_refuses_with_the_observed_executable() {
 
     let err = h.submit(&[1], Some("req-ref-drift")).await.unwrap_err();
     match &err {
-        SaError::VerifierHashDrift {
-            pinned_hash,
-            observed_hash,
-            observed_executable: Some(observed_executable),
-            ..
-        } => {
+        SaError::VerifierHashDrift { pinned_hash, .. } => {
             assert_eq!(pinned_hash, &full(&webauthn_hash()));
-            assert_eq!(observed_hash.as_ref(), Some(&full(&ed25519_hash())));
-            assert!(
-                observed_executable.starts_with("external reference owner ")
-                    && observed_executable.contains(&format!(
-                        "tag \"verifier\" resolved {}",
-                        full(&ed25519_hash())
-                    )),
-                "{observed_executable}"
-            );
         }
-        other => {
-            panic!("expected VerifierHashDrift {{ observed_executable: Some(..) }}; got {other:?}")
-        }
+        other => panic!("expected VerifierHashDrift; got {other:?}"),
     }
+    let observed_executable = assert_the_drift_row_alone_keeps_the_observed_hash(
+        &h,
+        &err,
+        "req-ref-drift",
+        &full(&ed25519_hash()),
+    )
+    .expect("the drift row carries the executable summary");
+    assert!(
+        observed_executable.starts_with("external reference owner ")
+            && observed_executable.contains(&format!(
+                "tag \"verifier\" resolved {}",
+                full(&ed25519_hash())
+            )),
+        "{observed_executable}"
+    );
     assert_eq!(h.sends(), 0);
 }
 
@@ -4431,6 +4638,56 @@ async fn removing_a_policy_no_pin_of_two_matches_writes_no_row() {
     assert_eq!(h.sends(), 1);
 }
 
+/// Removing a policy no pin covers, from a rule with several policies whose
+/// single policy pin matches none of them, writes no pin update, and its
+/// event names the rule and the policy id but not the removed policy's hash,
+/// whole or as its first eight bytes: the next verb refuses the rule's
+/// policies against that pin.
+#[test]
+fn removing_a_policy_no_pin_matches_logs_no_hash_and_the_next_verb_refuses() {
+    let removed = [0xdd_u8; 32];
+    let (err, logs) = rpc_mock_helpers::wallet_traced(async {
+        let h = policy_harness(vec![policy_q(), policy_r()]).await;
+        h.baseline_v2(1);
+        h.pin_created(
+            1,
+            vec![full(&webauthn_hash())],
+            vec![full(&KNOWN_WASM_HASH)],
+            vec![],
+            vec![],
+        );
+        h.after_send(1, rule_one_with_policies(vec![policy_q()]));
+        remove_policy(&h, 1, "req-remove-unmatched").await.unwrap();
+        assert_eq!(h.sends(), 1);
+        assert!(h.pins_updated_rows().is_empty());
+        h.submit(&[1], Some("req-after-remove-unmatched"))
+            .await
+            .unwrap_err()
+    });
+    assert!(
+        matches!(err, SaError::PolicyHashDrift { rule_id: 1, .. }),
+        "{err:?}"
+    );
+    let event = logs
+        .lines()
+        .find(|line| {
+            line.contains(
+                "remove_policy: no policy pin is the removed policy's; no pin update is written",
+            )
+        })
+        .unwrap_or_else(|| panic!("the removal event is captured: {logs}"));
+    assert!(
+        event.contains("\"rule_id\":1") && event.contains("\"policy_id\":1"),
+        "{event}"
+    );
+    rpc_mock_helpers::assert_refusal_holds_no_marker(
+        &err,
+        &logs,
+        &[&hex::encode(removed), &hex::encode(&removed[..8])],
+        &[],
+    );
+}
+
 // ── Policy pins with no policy on chain ───────────────────────────────────────
 
 /// A record pinning a policy on a rule with no policy on chain refuses the
@@ -5498,16 +5755,17 @@ async fn a_confirmed_passkey_add_that_fails_to_record_still_pins_its_verifier() 
             .await
             .unwrap_err();
         match &err {
-            SaError::VerifierHashDrift {
-                pinned_hash,
-                observed_hash,
-                ..
-            } => {
+            SaError::VerifierHashDrift { pinned_hash, .. } => {
                 assert_eq!(pinned_hash, &full(&webauthn_hash()));
-                assert_eq!(observed_hash.as_ref(), Some(&full(&ed25519_hash())));
             }
             other => panic!("batch {batch}: expected VerifierHashDrift; got {other:?}"),
         }
+        assert_the_drift_row_alone_keeps_the_observed_hash(
+            &h,
+            &err,
+            "req-pinned-verifier-drift",
+            &full(&ed25519_hash()),
+        );
         assert_eq!(err.wire_code(), "sa.verifier_hash_drift");
     }
 }
@@ -5960,9 +6218,9 @@ async fn two_allowlisted_threshold_policies_refuse_the_observation() {
         .unwrap_err();
     match &err {
         SaError::ThresholdPolicyIdentificationFailed {
-            observed_wasm_hashes_summary,
+            observed_policy_count,
             ..
-        } => assert_eq!(observed_wasm_hashes_summary.count, 2),
+        } => assert_eq!(*observed_policy_count, 2),
         other => panic!("expected ThresholdPolicyIdentificationFailed; got {other:?}"),
     }
     assert!(!h.simulated("get_threshold"));
@@ -7392,9 +7650,9 @@ async fn three_threshold_policies_refuse_the_detach() {
     match &err {
         SaError::ThresholdPolicyIdentificationFailed {
             rule_id: 1,
-            observed_wasm_hashes_summary,
+            observed_policy_count,
             ..
-        } => assert_eq!(observed_wasm_hashes_summary.count, 3),
+        } => assert_eq!(*observed_policy_count, 3),
         other => panic!("expected ThresholdPolicyIdentificationFailed; got {other:?}"),
     }
     assert_refused_before_submission(&h, &err, "remove_policy", "req-three");
@@ -7422,10 +7680,7 @@ async fn a_missing_rule_and_an_unattached_policy_id_refuse_the_removal() {
         .await
         .unwrap_err();
     assert!(
-        matches!(
-            missing_rule,
-            SaError::SignerSetMissingBaseline { rule_id: 9, .. }
-        ),
+        matches!(missing_rule, SaError::SignerSetMissingBaseline { .. }),
         "{missing_rule:?}"
     );
     assert_refused_before_submission(
@@ -7448,7 +7703,8 @@ async fn a_missing_rule_and_an_unattached_policy_id_refuse_the_removal() {
             assert_eq!(*phase, "simulate");
             assert_eq!(
                 redacted_reason,
-                "remove_policy: policy 5 is not attached to rule 1"
+                "policy_id must identify a policy attached to the selected rule; list the rule \
+                 policies and choose an attached policy ID."
             );
         }
         other => panic!("expected DeploymentFailed; got {other:?}"),
@@ -7611,12 +7867,7 @@ async fn a_missing_baseline_never_signs_or_baselines() {
     let h = Harness::new(two_rule_chain()).await;
     let err = h.submit(&[1], Some("req-no-baseline")).await.unwrap_err();
     match &err {
-        SaError::SignerSetMissingBaseline {
-            rule_id,
-            request_id,
-            ..
-        } => {
-            assert_eq!(*rule_id, 1);
+        SaError::SignerSetMissingBaseline { request_id, .. } => {
             assert_eq!(request_id, "req-no-baseline");
         }
         other => panic!("expected SignerSetMissingBaseline; got {other:?}"),
@@ -7855,7 +8106,7 @@ async fn coexisting_faults_refuse_in_the_check_order() {
         .await
         .unwrap_err();
     assert!(
-        matches!(err, SaError::SignerSetMissingBaseline { rule_id: 1, .. }),
+        matches!(err, SaError::SignerSetMissingBaseline { .. }),
         "{err:?}"
     );
     assert!(h.primary_log.simulated().is_empty());
@@ -8080,12 +8331,7 @@ async fn an_attach_under_an_unbaselined_auth_rule_refuses_missing_baseline() {
         .await
         .unwrap_err();
     match &err {
-        SaError::SignerSetMissingBaseline {
-            rule_id,
-            request_id,
-            ..
-        } => {
-            assert_eq!(*rule_id, 2);
+        SaError::SignerSetMissingBaseline { request_id, .. } => {
             assert_eq!(request_id, "req-attach-auth-unbaselined");
         }
         other => panic!("expected SignerSetMissingBaseline; got {other:?}"),
@@ -8240,7 +8486,7 @@ async fn a_spending_limit_retune_under_an_unbaselined_admin_rule_refuses() {
         .await
         .unwrap_err();
     assert!(
-        matches!(err, SaError::SignerSetMissingBaseline { rule_id: 2, .. }),
+        matches!(err, SaError::SignerSetMissingBaseline { .. }),
         "{err:?}"
     );
     assert!(
@@ -9493,14 +9739,18 @@ async fn a_migration_to_an_equal_prefix_destination_pins_its_full_hash() {
         SaError::VerifierHashDrift {
             rule_id: 1,
             pinned_hash,
-            observed_hash,
             ..
         } => {
             assert_eq!(pinned_hash, &full(&twin));
-            assert_eq!(observed_hash.as_ref(), Some(&full(&PINNED)));
         }
         other => panic!("expected VerifierHashDrift; got {other:?}"),
     }
+    assert_the_drift_row_alone_keeps_the_observed_hash(
+        &h,
+        &err,
+        "req-source-after-migration",
+        &full(&PINNED),
+    );
     assert_eq!(h.sends(), 3);
 }
 
@@ -9777,4 +10027,304 @@ async fn an_incomplete_pin_record_refuses_a_migration_with_no_signature_and_no_s
         h.pins_updated_rows().is_empty(),
         "no pin row repoints an incomplete record"
     );
+}
+
+/// The refused-value marker of the argument refusals below.
+const REFUSED_NUMBER: u32 = 424_242;
+
+/// Asserts that a warning with `message` fired and carries `reason` as its
+/// error, and that no warning holds the refused number.
+fn assert_failure_event(
+    capture: &stellar_agent_test_support::log_capture::WarningCapture,
+    message: &str,
+    reason: &str,
+) {
+    let events = capture.seen();
+    let event = events
+        .iter()
+        .find(|event| event.get("message").is_some_and(|m| m == message))
+        .unwrap_or_else(|| panic!("expected the {message:?} event: {events:?}"));
+    assert_eq!(event["error"], reason, "{event:?}");
+    assert!(
+        !format!("{events:?}").contains(&REFUSED_NUMBER.to_string()),
+        "{events:?}"
+    );
+}
+
+/// Asserts that `error` holds the refused number in no rendered form.
+fn assert_no_refused_number(error: &SaError) {
+    let forms = format!(
+        "{error}\n{error:?}\n{}",
+        serde_json::to_string(error).unwrap()
+    );
+    assert!(!forms.contains(&REFUSED_NUMBER.to_string()), "{forms}");
+}
+
+/// A rule whose only policy is the weighted-threshold policy, with
+/// `threshold`, two signers of weight one, and the reads the weight checks
+/// use.
+async fn weighted_harness(threshold: u32) -> Harness {
+    let weighted = contract(0x35);
+    let chain = Chain::default()
+        .with_rule(1, rule_with_ids(1, verb_signers(), vec![weighted.clone()]))
+        .with_wasm(
+            &weighted,
+            stellar_agent_smart_account::weighted_threshold_policy::WEIGHTED_THRESHOLD_POLICY_WASM_HASHES[0],
+        )
+        .with_threshold(&weighted, 1, threshold);
+    let h = Harness::new(chain).await;
+    let weights: VecM<ScMapEntry> = vec![
+        ScMapEntry {
+            key: delegated_account(0x10),
+            val: ScVal::U32(1),
+        },
+        ScMapEntry {
+            key: delegated_account(0x11),
+            val: ScVal::U32(1),
+        },
+    ]
+    .try_into()
+    .unwrap();
+    h.set_simulated_return("get_signer_weights", ScVal::Map(Some(ScMap(weights))));
+    h
+}
+
+/// A threshold above the fetched weight sum is refused with the check; the
+/// error and its failure event hold the requested threshold in no form.
+#[tokio::test]
+async fn a_threshold_above_the_weight_sum_stays_out_of_the_refusal() {
+    let (capture, _guard) = stellar_agent_test_support::log_capture::WarningCapture::capture(None);
+    let h = weighted_harness(2).await;
+    let signer = SoftwareSigningKey::new_from_bytes(SEED);
+
+    let error = h
+        .manager
+        .set_weighted_threshold(
+            smart_account(),
+            1,
+            REFUSED_NUMBER,
+            &[ContextRuleId::new(1)],
+            &signer,
+            "req-weighted-threshold".to_owned(),
+        )
+        .await
+        .unwrap_err();
+
+    let expected = "weighted-threshold policy install refused: --new-threshold must be non-zero \
+                    and must not exceed the sum of current signer weights; lower the threshold \
+                    or increase signer weights.";
+    assert_eq!(error.to_string(), expected);
+    assert_no_refused_number(&error);
+    assert_failure_event(
+        &capture,
+        "set_weighted_threshold: operation failed",
+        expected,
+    );
+    assert_eq!(h.sends(), 0);
+}
+
+/// A weight that drops the fetched sum below the threshold is refused with
+/// the check; the error and its failure event hold the requested weight in
+/// no form.
+#[tokio::test]
+async fn a_weight_below_the_threshold_stays_out_of_the_refusal() {
+    let (capture, _guard) = stellar_agent_test_support::log_capture::WarningCapture::capture(None);
+    let h = weighted_harness(500_000).await;
+    let signer = SoftwareSigningKey::new_from_bytes(SEED);
+    let target = stellar_agent_smart_account::weighted_threshold_policy::WeightedThresholdSignerInput::Delegated {
+        g_strkey: "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF".to_owned(),
+    };
+
+    let error = h
+        .manager
+        .set_signer_weight(
+            smart_account(),
+            1,
+            target,
+            REFUSED_NUMBER,
+            &[ContextRuleId::new(1)],
+            &signer,
+            "req-weighted-weight".to_owned(),
+        )
+        .await
+        .unwrap_err();
+
+    let expected = "weighted-threshold policy install refused: --new-weight must keep the sum of \
+                    signer weights at or above the current threshold; lower the threshold first \
+                    or choose a sufficient weight.";
+    assert_eq!(error.to_string(), expected);
+    assert_no_refused_number(&error);
+    assert_failure_event(&capture, "set_signer_weight: operation failed", expected);
+    assert_eq!(h.sends(), 0);
+}
+
+/// The text of the missing-baseline refusal, which names no rule.
+const MISSING_BASELINE: &str = "rule_id must identify a rule with a recorded signer-set \
+                                baseline; run 'smart-account signers list --rule-id <RULE_ID>' \
+                                to record one before retrying.";
+
+/// A missing baseline of a spending-limit retune's admin rule is refused
+/// with the check; the error and the operation's failure event hold the
+/// rule id in no form.
+#[tokio::test]
+async fn a_missing_baseline_of_a_spending_limit_retune_names_no_rule() {
+    let (capture, _guard) = stellar_agent_test_support::log_capture::WarningCapture::capture(None);
+    let h = Harness::new(spending_limit_chain()).await;
+    h.set_simulated_return("get_spending_limit_data", spending_limit_data(1_000, 100));
+
+    let error = set_spending_limit_under(&h, &[REFUSED_NUMBER], "req-retune-unbaselined")
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.to_string(), MISSING_BASELINE);
+    assert_no_refused_number(&error);
+    assert_failure_event(
+        &capture,
+        "set_spending_limit: operation failed",
+        MISSING_BASELINE,
+    );
+    assert_eq!(h.sends(), 0);
+}
+
+/// A signer verb on a rule without a baseline is refused with the check;
+/// the error and the verb's failure event hold the rule id in no form.
+#[tokio::test]
+async fn a_missing_baseline_of_a_signer_verb_names_no_rule() {
+    let (capture, _guard) = stellar_agent_test_support::log_capture::WarningCapture::capture(None);
+    let chain = Chain::default().with_rule(
+        REFUSED_NUMBER,
+        rule_with_ids(REFUSED_NUMBER, verb_signers(), vec![]),
+    );
+    let h = Harness::new(chain).await;
+    let signer = SoftwareSigningKey::new_from_bytes(SEED);
+
+    let error = h
+        .manager
+        .remove_signer(
+            smart_account(),
+            REFUSED_NUMBER,
+            2,
+            &signer,
+            "req-verb-unbaselined".to_owned(),
+        )
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.to_string(), MISSING_BASELINE);
+    assert_no_refused_number(&error);
+    assert_failure_event(&capture, "signer verb failed", MISSING_BASELINE);
+    assert_eq!(h.sends(), 0);
+}
+
+/// A non-positive limit is refused by the library check with the shared
+/// text before any request.
+#[tokio::test]
+async fn a_non_positive_limit_stays_out_of_the_refusal() {
+    use stellar_agent_smart_account::managers::signers::SPENDING_LIMIT_POSITIVE_REASON;
+
+    let h = Harness::new(spending_limit_chain()).await;
+    let signer = SoftwareSigningKey::new_from_bytes(SEED);
+
+    let error = h
+        .manager
+        .set_spending_limit(
+            smart_account(),
+            1,
+            &[ContextRuleId::new(1)],
+            -i128::from(REFUSED_NUMBER),
+            &signer,
+            "req-negative-limit".to_owned(),
+        )
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(
+            &error,
+            SaError::SpendingLimitInstallRefused { reason }
+                if reason == SPENDING_LIMIT_POSITIVE_REASON
+        ),
+        "{error:?}"
+    );
+    assert_eq!(
+        SPENDING_LIMIT_POSITIVE_REASON,
+        "--limit must be positive; supply a positive spending limit."
+    );
+    assert_no_refused_number(&error);
+}
+
+/// A supplied operation id that differs from the derived one is refused
+/// with the check; the error and every event hold the id in no form, whole
+/// or as the first or last eight hex digits.
+#[test]
+fn a_mismatched_operation_id_stays_out_of_the_refusal() {
+    use stellar_agent_smart_account::error::TimelockExecuteFailureReason;
+    use stellar_agent_smart_account::timelock::{
+        TimelockExecuteArgs, TimelockOperationId, execute,
+    };
+    use stellar_agent_test_support::log_capture::RedactionStrictSubscriber;
+
+    let mut supplied = [0x42u8; 32];
+    supplied[..4].copy_from_slice(&[0x63, 0x72, 0x65, 0x64]);
+    supplied[28..].copy_from_slice(&[0x6d, 0x61, 0x72, 0x6b]);
+    let supplied_id = TimelockOperationId::from_bytes(supplied);
+    let forbidden = [
+        hex::encode(supplied),
+        "63726564".to_owned(),
+        "6d61726b".to_owned(),
+    ];
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let h = runtime.block_on(Harness::new(Chain::default()));
+    h.set_simulated_return("get_operation_ledger", ScVal::U32(100));
+    let derived: BytesM = vec![0x11u8; 32].try_into().unwrap();
+    h.set_simulated_return("hash_operation", ScVal::Bytes(derived.into()));
+
+    let primary = h.primary.uri();
+    let secondary = h.secondary_uri();
+    let signer = SoftwareSigningKey::new_from_bytes(SEED);
+    let contract = strkey(&policy_p());
+    let args = TimelockExecuteArgs::builder()
+        .timelock_contract_strkey(&contract)
+        .target_strkey(&contract)
+        .function("upgrade")
+        .salt([5u8; 32])
+        .signer(&signer)
+        .primary_rpc_url(&primary)
+        .secondary_rpc_url(&secondary)
+        .network_passphrase(PASSPHRASE)
+        .audit_writer(&h.audit)
+        .request_id("req-operation-mismatch")
+        .expected_operation_id(&supplied_id)
+        .build();
+
+    let capture = RedactionStrictSubscriber::new(forbidden.clone());
+    let error = capture.run(|| runtime.block_on(execute(args)).unwrap_err());
+
+    assert!(
+        matches!(
+            &error,
+            SaError::TimelockExecuteFailed {
+                failure_reason: TimelockExecuteFailureReason::OperationIdMismatch,
+                ..
+            }
+        ),
+        "{error:?}"
+    );
+    assert_eq!(
+        error.to_string(),
+        "timelock execute failed (operation_id_mismatch): operation_id must match the operation \
+         derived from the scheduled target, function, arguments, salt and predecessor; check \
+         --operation-id, --target, --function, --salt and predecessor against the scheduled \
+         operation."
+    );
+    let forms = format!("{error:?}\n{}", serde_json::to_string(&error).unwrap());
+    for form in &forbidden {
+        assert!(!forms.contains(form), "{form} in {forms}");
+    }
+    capture.assert_clean();
+    assert_eq!(h.sends(), 0);
 }

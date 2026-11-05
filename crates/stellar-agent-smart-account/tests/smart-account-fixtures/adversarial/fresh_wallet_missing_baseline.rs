@@ -104,10 +104,7 @@ async fn verify_returns_missing_baseline_on_empty_audit_log() {
         .await;
 
     assert!(
-        matches!(
-            result,
-            Err(SaError::SignerSetMissingBaseline { rule_id: 1, .. })
-        ),
+        matches!(result, Err(SaError::SignerSetMissingBaseline { .. })),
         "fresh wallet must return SignerSetMissingBaseline (no RPC call); got: {result:?}"
     );
 }
@@ -135,10 +132,10 @@ async fn missing_baseline_wire_code_is_correct() {
         "wire_code must be 'sa.signer_set_missing_baseline'; got: '{}'",
         err.wire_code()
     );
-    let message = err.to_string();
-    assert!(
-        message.contains("'smart-account signers list --rule-id 2'"),
-        "the message must name the command that records the baseline: {message}"
+    assert_eq!(
+        err.to_string(),
+        "rule_id must identify a rule with a recorded signer-set baseline; run \
+         'smart-account signers list --rule-id <RULE_ID>' to record one before retrying."
     );
 }
 
@@ -200,10 +197,7 @@ async fn missing_baseline_is_per_rule() {
         .await;
 
     assert!(
-        matches!(
-            result,
-            Err(SaError::SignerSetMissingBaseline { rule_id: 1, .. })
-        ),
+        matches!(result, Err(SaError::SignerSetMissingBaseline { .. })),
         "rule 1 must return SignerSetMissingBaseline even if rule 0 has a baseline; got: {result:?}"
     );
 

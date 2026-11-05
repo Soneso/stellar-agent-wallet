@@ -31,6 +31,7 @@ use stellar_xdr::{
     ReadXdr, TransactionEnvelope, TransactionV1Envelope,
 };
 
+use stellar_agent_core::envelope_decode::TRANSACTION_ENVELOPE_XDR_FORM;
 use stellar_agent_xdr_limits::untrusted_decode_limits;
 
 use crate::error::Sep48Error;
@@ -69,9 +70,11 @@ pub fn decode_invoke_host_function(tx_xdr_base64: &str) -> Result<DecodedInvocat
     // Passing the base64 string length is safe: the decoded byte count is
     // strictly smaller, so valid input is never rejected.
     let limits = untrusted_decode_limits(tx_xdr_base64.len());
-    let envelope = TransactionEnvelope::from_xdr_base64(tx_xdr_base64, limits).map_err(|e| {
+    let envelope = TransactionEnvelope::from_xdr_base64(tx_xdr_base64, limits).map_err(|_| {
         Sep48Error::InvokeDecodeFailed {
-            reason: format!("TransactionEnvelope XDR decode failed: {e}"),
+            reason: format!(
+                "TransactionEnvelope XDR decode failed: {TRANSACTION_ENVELOPE_XDR_FORM}"
+            ),
         }
     })?;
 
@@ -481,5 +484,23 @@ mod tests {
             matches!(result, Err(Sep48Error::InvokeDecodeFailed { .. })),
             "depth-600 nested invocation must return InvokeDecodeFailed (depth limit), got: {result:?}"
         );
+    }
+
+    /// A refused envelope is named by the accepted form, for malformed base64
+    /// and for valid base64 that holds malformed XDR.
+    #[test]
+    fn refused_envelopes_report_the_accepted_form() {
+        for envelope in ["~", "qqqqqqqqqqqq"] {
+            let err = decode_invoke_host_function(envelope).unwrap_err();
+            match &err {
+                Sep48Error::InvokeDecodeFailed { reason } => assert_eq!(
+                    reason,
+                    "TransactionEnvelope XDR decode failed: must be base64-encoded \
+                     TransactionEnvelope XDR"
+                ),
+                other => panic!("expected InvokeDecodeFailed, got {other:?}"),
+            }
+            assert!(!format!("{err:?}").contains("Invalid symbol"), "{err:?}");
+        }
     }
 }

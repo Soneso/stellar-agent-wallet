@@ -73,6 +73,8 @@ mod profile_show_profile_flag_equivalence;
 mod reconcile_pass_discipline;
 #[path = "cli/rejected_input.rs"]
 mod rejected_input;
+#[path = "cli/rejected_input_events.rs"]
+mod rejected_input_events;
 #[path = "cli/rpc_credential_cli.rs"]
 mod rpc_credential_cli;
 #[path = "cli/rpc_error_text_redaction.rs"]

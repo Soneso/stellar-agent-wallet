@@ -105,20 +105,17 @@ impl SignerGroup {
     /// ```
     pub fn new(name: String, members: Vec<[u8; 32]>, threshold: u32) -> Result<Self, String> {
         if members.is_empty() {
-            return Err(format!("SignerGroup '{name}': members must not be empty"));
+            return Err("SignerGroup members must not be empty".to_owned());
         }
         if threshold == 0 {
-            return Err(format!("SignerGroup '{name}': threshold must be ≥ 1"));
+            return Err("SignerGroup threshold must be at least 1".to_owned());
         }
         #[allow(
             clippy::cast_possible_truncation,
             reason = "members.len() is bounded by u32 max in practice"
         )]
         if threshold > members.len() as u32 {
-            return Err(format!(
-                "SignerGroup '{name}': threshold {threshold} > members.len() {}",
-                members.len()
-            ));
+            return Err("SignerGroup threshold must not exceed the member count".to_owned());
         }
         Ok(Self {
             name,
@@ -985,19 +982,19 @@ mod tests {
     #[test]
     fn signer_group_empty_members_rejected() {
         let e = SignerGroup::new("ops".into(), vec![], 1).unwrap_err();
-        assert!(e.contains("members must not be empty"), "got: {e}");
+        assert_eq!(e, "SignerGroup members must not be empty");
     }
 
     #[test]
     fn signer_group_zero_threshold_rejected() {
         let e = SignerGroup::new("ops".into(), vec![[0u8; 32]], 0).unwrap_err();
-        assert!(e.contains("threshold must be ≥ 1"), "got: {e}");
+        assert_eq!(e, "SignerGroup threshold must be at least 1");
     }
 
     #[test]
     fn signer_group_threshold_exceeds_members_rejected() {
         let e = SignerGroup::new("ops".into(), vec![[0u8; 32]], 2).unwrap_err();
-        assert!(e.contains("threshold 2 > members.len() 1"), "got: {e}");
+        assert_eq!(e, "SignerGroup threshold must not exceed the member count");
     }
 
     // ── QuorumError wire codes ─────────────────────────────────────────────────

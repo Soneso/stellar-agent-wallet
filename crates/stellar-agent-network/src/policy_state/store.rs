@@ -23,6 +23,7 @@ use stellar_agent_core::profile::receipt::{
 use stellar_agent_core::profile::schema::{
     KeyringEntryRef, Profile, default_policy_window_state_path_for, generation_account,
 };
+use stellar_agent_core::redact::describe_json_error;
 use subtle::ConstantTimeEq as _;
 
 use crate::endpoint_identity::MainnetOracle;
@@ -3010,17 +3011,20 @@ impl PersistedWindowStore {
         }
         let version: Version =
             serde_json::from_slice(body).map_err(|error| WindowStoreError::Invalid {
-                detail: format!("store body has no readable version: {error}"),
+                detail: format!(
+                    "store body has no readable version: the body {}",
+                    describe_json_error(&error)
+                ),
             })?;
         if version.version > WIRE_VERSION_MAX {
-            return Err(WindowStoreError::UnsupportedVersion {
-                version: version.version,
-                max: WIRE_VERSION_MAX,
-            });
+            return Err(WindowStoreError::UnsupportedVersion);
         }
         let wire: WireFile =
             serde_json::from_slice(body).map_err(|e| WindowStoreError::Invalid {
-                detail: format!("store body is not valid JSON: {e}"),
+                detail: format!(
+                    "store body is not valid JSON: the body {}",
+                    describe_json_error(&e)
+                ),
             })?;
         check_snapshot(&wire)?;
         if let Some(prepared) = &wire.prepared {
@@ -3167,8 +3171,8 @@ fn load_counter(entry_ref: &KeyringEntryRef) -> Result<Option<GenerationState>, 
                 }));
             }
             let committed: GenerationCommitment =
-                serde_json::from_str(&value).map_err(|e| WindowStoreError::Keyring {
-                    detail: format!("generation entry value is not a valid commitment: {e}"),
+                serde_json::from_str(&value).map_err(|_| WindowStoreError::Keyring {
+                    detail: "the generation value must be a valid generation commitment".to_owned(),
                 })?;
             if committed.body_sha256.len() != 64
                 || !committed
@@ -3317,10 +3321,7 @@ fn authenticated_scope(wire: &WireFile) -> Result<ChainScope, WindowStoreError> 
 /// history; usable snapshots also require complete authenticated scope.
 fn check_snapshot(wire: &WireFile) -> Result<(), WindowStoreError> {
     if wire.version > WIRE_VERSION_MAX {
-        return Err(WindowStoreError::UnsupportedVersion {
-            version: wire.version,
-            max: WIRE_VERSION_MAX,
-        });
+        return Err(WindowStoreError::UnsupportedVersion);
     }
     if wire.version == 0 {
         return Err(WindowStoreError::Invalid {
@@ -3971,6 +3972,7 @@ mod tests {
     #![allow(
         clippy::unwrap_used,
         clippy::expect_used,
+        clippy::panic,
         reason = "test-only; panics acceptable in unit tests"
     )]
 
@@ -3991,6 +3993,56 @@ mod tests {
             );
         p.audit_log_path = dir.join("audit.jsonl");
         p
+    }
+
+    /// An authenticated body that fails its schema reports the category and
+    /// position, never the refused value.
+    #[test]
+    fn authenticated_body_that_fails_its_schema_reports_position_only() {
+        let dir = TempDir::new().unwrap();
+        let store = PersistedWindowStore::at_path(dir.path().join("state.window"));
+        let key = [7_u8; 32];
+        for (body, expected) in [
+            (
+                br#"{"version":"credmarker7"}"#.as_slice(),
+                "store body has no readable version: the body has a missing field or a field of \
+                 the wrong type or value (line 1, column 24)",
+            ),
+            (
+                br#"{"version":1,"generation":"credmarker7"}"#.as_slice(),
+                "store body is not valid JSON: the body has a missing field or a field of the \
+                 wrong type or value (line 1, column 39)",
+            ),
+        ] {
+            let mut bytes = compute_tag(&key, body).unwrap().to_vec();
+            bytes.extend_from_slice(body);
+            match store.verify_with_key(&key, &bytes) {
+                Err(WindowStoreError::Invalid { detail }) => assert_eq!(detail, expected),
+                other => panic!("expected a schema refusal, got {other:?}"),
+            }
+        }
+    }
+
+    /// A stored generation value that fails its schema is named by the rule.
+    #[test]
+    #[serial]
+    fn invalid_generation_value_stays_out_of_the_error() {
+        keyring_mock::install().unwrap();
+        let entry_ref = KeyringEntryRef::new("generation-invalid-test", "default");
+        keyring_core::Entry::new(&entry_ref.service, &entry_ref.account)
+            .unwrap()
+            .set_password(r#"{"credmarker7":true}"#)
+            .unwrap();
+        let Err(error) = load_counter(&entry_ref) else {
+            panic!("expected a keyring refusal");
+        };
+        match error {
+            WindowStoreError::Keyring { detail } => assert_eq!(
+                detail,
+                "the generation value must be a valid generation commitment"
+            ),
+            other => panic!("expected a keyring refusal, got {other:?}"),
+        }
     }
 
     /// One entry under a cap far above every amount these tests record.
@@ -5208,19 +5260,22 @@ mod tests {
         store
             .record_and_persist(&profile, &[entry(k, now, 1)])
             .unwrap();
-        rewrite_body_version(&store, &profile, WIRE_VERSION_MAX + 1);
+        rewrite_body_version(&store, &profile, 3_141_592_653);
 
         let dest = PolicyStateStore::new();
         let err = store
             .load_into("v3-read", &profile, &dest)
             .expect_err("a newer wire version must be refused");
         assert!(
-            matches!(
-                err,
-                WindowStoreError::UnsupportedVersion { version: 8, max: 7 }
-            ),
+            matches!(err, WindowStoreError::UnsupportedVersion),
             "the refusal must name the version condition; got {err:?}"
         );
+        assert_eq!(
+            err.to_string(),
+            "policy window-state version must be supported by this build; use the build that \
+             wrote the file"
+        );
+        stellar_agent_test_support::rejected_value::assert_no_marker(&err, "3141592653");
     }
 
     /// The reconciliation budget and minimum age are the bound a value verb
@@ -7858,15 +7913,12 @@ mod tests {
             assert!(
                 matches!(
                     f.store.verify_with_key(&key, &before),
-                    Err(WindowStoreError::UnsupportedVersion { version: 8, max: 7 })
+                    Err(WindowStoreError::UnsupportedVersion)
                 ),
                 "{chain:?}"
             );
             assert_eq!(
-                defect_of(
-                    &WindowStoreError::UnsupportedVersion { version: 8, max: 7 },
-                    false
-                ),
+                defect_of(&WindowStoreError::UnsupportedVersion, false),
                 None
             );
             let called = std::cell::Cell::new(false);
@@ -7878,7 +7930,7 @@ mod tests {
                 matches!(
                     result,
                     Err(ResetError::Store {
-                        error: WindowStoreError::UnsupportedVersion { version: 8, max: 7 },
+                        error: WindowStoreError::UnsupportedVersion,
                         minted: false,
                     })
                 ),

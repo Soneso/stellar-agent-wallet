@@ -264,9 +264,9 @@ where
     if process_uid_is_valid(&s) {
         return Ok(s);
     }
-    Err(serde::de::Error::custom(format!(
-        "process_uid must be numeric ASCII, Windows SID, or 'non-unix-stub', got: {s:?}"
-    )))
+    Err(serde::de::Error::custom(
+        "process_uid must be numeric ASCII, a Windows SID, or non-unix-stub; repair the pending approval record.",
+    ))
 }
 
 fn process_uid_is_valid(s: &str) -> bool {
@@ -848,9 +848,10 @@ impl ConsumedOutcome {
         match raw {
             "confirmed" => Ok(Self::Confirmed),
             "unknown" => Ok(Self::Unknown),
-            other => Err(format!(
-                "Consumed.outcome must be `confirmed` or `unknown`, got `{other}`"
-            )),
+            _ => Err(
+                "Consumed.outcome must be confirmed or unknown; repair the pending approval record."
+                    .to_owned(),
+            ),
         }
     }
 }
@@ -1206,6 +1207,20 @@ fn hex_encode(bytes: &[u8]) -> String {
 // ─────────────────────────────────────────────────────────────────────────────
 // ApprovalKind serde — custom impl for untagged/structural disambiguation
 // ─────────────────────────────────────────────────────────────────────────────
+
+/// The refusal of an RP ID that is an IP address literal. WebAuthn-2 section
+/// 5.1.2 forbids IP addresses as an RP ID; the text never repeats the address.
+const RP_ID_IP_LITERAL_REASON: &str =
+    "rp_id must be a DNS name, not an IP address literal; use localhost for loopback.";
+
+/// The refusal of an approval asset of any malformed shape.
+const APPROVAL_ASSET_REASON: &str = "asset must be XLM or a 1-12 character ASCII alphanumeric code followed by a colon and a G-strkey; repair the pending approval record.";
+
+/// The refusal of a clawback approval code of any malformed shape.
+const CLAWBACK_CODE_REASON: &str = "code must contain 1-12 uppercase ASCII alphanumeric characters [A-Z0-9]; repair the pending approval record.";
+
+/// The refusal of a stored smart-account abbreviation of any malformed shape.
+const SMART_ACCOUNT_REDACTED_REASON: &str = "smart_account_redacted must match ^C[A-Z2-7]{4}\\.\\.\\.[A-Z2-7]{5}$; repair the pending approval record.";
 
 /// Redacts a G-strkey to first-5-last-5 characters for debug output and CLI
 /// rendering, preventing full addresses from appearing in logs.
@@ -1712,9 +1727,9 @@ where
             if valid {
                 Ok(Some(s))
             } else {
-                Err(serde::de::Error::custom(format!(
-                    "summary_to must be a valid Stellar G-strkey (56 chars, ^G[A-Z2-7]{{55}}$), got: {s:?}"
-                )))
+                Err(serde::de::Error::custom(
+                    "summary_to must match ^G[A-Z2-7]{55}$; repair the pending approval record.",
+                ))
             }
         }
     }
@@ -1745,9 +1760,9 @@ where
                     return Ok(Some(s));
                 }
             }
-            Err(serde::de::Error::custom(format!(
-                "summary_asset must be 'XLM' or '<code>:<G-strkey>', got: {s:?}"
-            )))
+            Err(serde::de::Error::custom(
+                "summary_asset must be XLM or a 1-12 character ASCII alphanumeric code followed by a colon and a G-strkey; repair the pending approval record.",
+            ))
         }
     }
 }
@@ -4572,10 +4587,7 @@ fn validate_sign_with_passkey_invariants(
     // forbids IP addresses as rpId.  `parse::<std::net::IpAddr>()` rejects
     // both IPv4 and IPv6 in one pass.
     if rp_id.parse::<std::net::IpAddr>().is_ok() {
-        return Err(format!(
-            "rp_id must not be an IP address literal (WebAuthn-2 §5.1.2 forbids \
-             IP rpId); got {rp_id:?}.  Use \"localhost\" for loopback."
-        ));
+        return Err(RP_ID_IP_LITERAL_REASON.to_owned());
     }
     if !rp_id
         .chars()
@@ -4632,9 +4644,10 @@ fn validate_toolset_first_invoke_gate_invariants(
         .chars()
         .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
     {
-        return Err(format!(
-            "toolset_name must contain only [a-z0-9-] characters, got: {toolset_name:?}"
-        ));
+        return Err(
+            "toolset_name must contain 1-64 characters from [a-z0-9-]; repair the pending approval record."
+                .to_owned(),
+        );
     }
 
     // capability: 1–64 bytes, [a-z0-9-] charset.
@@ -4649,9 +4662,10 @@ fn validate_toolset_first_invoke_gate_invariants(
         .chars()
         .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
     {
-        return Err(format!(
-            "capability must contain only [a-z0-9-] characters, got: {capability:?}"
-        ));
+        return Err(
+            "capability must contain 1-64 characters from [a-z0-9-]; repair the pending approval record."
+                .to_owned(),
+        );
     }
 
     // destination: a valid Stellar G-strkey (the `sign-payment` gated
@@ -4666,11 +4680,10 @@ fn validate_toolset_first_invoke_gate_invariants(
             .chars()
             .all(|c| matches!(c, 'A'..='Z' | '2'..='7'));
     if !dest_shape_valid {
-        return Err(format!(
-            "destination must be a valid Stellar G-strkey or C-strkey (56 chars, \
-             ^[GC][A-Z2-7]{{55}}$), got: {dest_redacted}",
-            dest_redacted = redact_g_strkey(destination)
-        ));
+        return Err(
+            "destination must match ^[GC][A-Z2-7]{55}$; repair the pending approval record."
+                .to_owned(),
+        );
     }
 
     // asset: "XLM" or "<code>:<G-strkey>".
@@ -4685,32 +4698,29 @@ fn validate_toolset_first_invoke_gate_invariants(
                 .chars()
                 .all(|c| matches!(c, 'A'..='Z' | '2'..='7'));
         if !code_valid || !issuer_valid {
-            return Err(format!(
-                "asset must be 'XLM' or '<alphanumeric_code>:<G-strkey>', got: {asset:?}"
-            ));
+            return Err(APPROVAL_ASSET_REASON.to_owned());
         }
     } else {
-        return Err(format!(
-            "asset must be 'XLM' or '<code>:<G-strkey>', got: {asset:?}"
-        ));
+        return Err(APPROVAL_ASSET_REASON.to_owned());
     }
 
     // amount_min_stroops ≥ 0, max > 0, and min ≤ max.
     if amount_min_stroops < 0 {
-        return Err(format!(
-            "amount_min_stroops must be ≥ 0, got {amount_min_stroops}"
-        ));
+        return Err(
+            "amount_min_stroops must be nonnegative; repair the pending approval record."
+                .to_owned(),
+        );
     }
     if amount_max_stroops <= 0 {
-        return Err(format!(
-            "amount_max_stroops must be positive, got {amount_max_stroops}"
-        ));
+        return Err(
+            "amount_max_stroops must be positive; repair the pending approval record.".to_owned(),
+        );
     }
     if amount_min_stroops > amount_max_stroops {
-        return Err(format!(
-            "amount_min_stroops ({amount_min_stroops}) must be ≤ \
-             amount_max_stroops ({amount_max_stroops})"
-        ));
+        return Err(
+            "amount_min_stroops must be no greater than amount_max_stroops; repair the pending approval record."
+                .to_owned(),
+        );
     }
 
     Ok(())
@@ -4745,18 +4755,13 @@ fn validate_trustline_clawback_opt_in_invariants(
     // code: 1–12 bytes, uppercase ASCII alphanumeric [A-Z0-9].
     // Stellar asset codes are uppercase (normalised at resolution time).
     if code.is_empty() || code.len() > 12 {
-        return Err(format!(
-            "code must be 1–12 bytes, got {} bytes: {code:?}",
-            code.len()
-        ));
+        return Err(CLAWBACK_CODE_REASON.to_owned());
     }
     if !code
         .chars()
         .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
     {
-        return Err(format!(
-            "code must contain only uppercase ASCII alphanumeric characters [A-Z0-9], got: {code:?}"
-        ));
+        return Err(CLAWBACK_CODE_REASON.to_owned());
     }
 
     // issuer: valid Stellar G-strkey (56 chars, G + 55 base32).
@@ -4766,11 +4771,9 @@ fn validate_trustline_clawback_opt_in_invariants(
             .chars()
             .all(|c| matches!(c, 'A'..='Z' | '2'..='7'));
     if !issuer_valid {
-        return Err(format!(
-            "issuer must be a valid Stellar G-strkey (56 chars, ^G[A-Z2-7]{{55}}$), \
-             got: {issuer_redacted}",
-            issuer_redacted = redact_g_strkey(issuer)
-        ));
+        return Err(
+            "issuer must match ^G[A-Z2-7]{55}$; repair the pending approval record.".to_owned(),
+        );
     }
 
     Ok(())
@@ -4874,16 +4877,15 @@ fn validate_claim_simulated_invariants(
                             .all(|c| matches!(c, 'A'..='Z' | '2'..='7'))
                 });
             if !asset_valid {
-                return Err(format!(
-                    "asset must be 'XLM' or '<code>:<G-strkey>', got: {asset:?}"
-                ));
+                return Err(APPROVAL_ASSET_REASON.to_owned());
             }
 
             // amount_stroops: strictly positive.
             if amount_stroops <= 0 {
-                return Err(format!(
-                    "amount_stroops must be strictly positive, got {amount_stroops}"
-                ));
+                return Err(
+                    "amount_stroops must be strictly positive; repair the pending approval record."
+                        .to_owned(),
+                );
             }
         }
         _ => return Err("claim asset and amount must both be present or absent".to_owned()),
@@ -4896,11 +4898,9 @@ fn validate_claim_simulated_invariants(
             .chars()
             .all(|c| matches!(c, 'A'..='Z' | '2'..='7'));
     if !source_valid {
-        return Err(format!(
-            "source must be a valid Stellar G-strkey (56 chars, ^G[A-Z2-7]{{55}}$), \
-             got: {source_redacted}",
-            source_redacted = redact_g_strkey(source)
-        ));
+        return Err(
+            "source must match ^G[A-Z2-7]{55}$; repair the pending approval record.".to_owned(),
+        );
     }
 
     Ok(())
@@ -4955,10 +4955,7 @@ fn validate_register_passkey_invariants(
     // would pass the charset guard (IPv4 digits + dot ⊂ LDH) but be rejected
     // here before reaching the bridge's HTML renderer.
     if rp_id.parse::<std::net::IpAddr>().is_ok() {
-        return Err(format!(
-            "rp_id must not be an IP address literal (WebAuthn-2 §5.1.2 forbids \
-             IP rpId); got {rp_id:?}.  Use \"localhost\" for loopback."
-        ));
+        return Err(RP_ID_IP_LITERAL_REASON.to_owned());
     }
     if !rp_id
         .chars()
@@ -4982,45 +4979,18 @@ fn validate_register_passkey_invariants(
 ///
 /// Returns `Ok(())` on success, `Err(reason)` on failure.
 fn validate_smart_account_redacted(s: &str) -> Result<(), String> {
-    // Length must be exactly 13 characters.
-    if s.len() != 13 {
-        return Err(format!(
-            "smart_account_redacted must be 13 characters \
-             (first-5-last-5 redaction of a C-strkey: C + 4 base32 + ... + 5 base32), \
-             got {} characters: {s:?}",
-            s.len()
-        ));
-    }
+    let is_base32 = |b: &u8| matches!(*b, b'A'..=b'Z' | b'2'..=b'7');
     let bytes = s.as_bytes();
-    // First char must be 'C'.
-    if bytes[0] != b'C' {
-        return Err(format!(
-            "smart_account_redacted must start with 'C' (C-strkey redaction), got: {s:?}"
-        ));
+    let valid = bytes.len() == 13
+        && bytes[0] == b'C'
+        && bytes[1..5].iter().all(is_base32)
+        && &bytes[5..8] == b"..."
+        && bytes[8..13].iter().all(is_base32);
+    if valid {
+        Ok(())
+    } else {
+        Err(SMART_ACCOUNT_REDACTED_REASON.to_owned())
     }
-    // Chars 1..5 must be base32 [A-Z2-7].
-    for &b in &bytes[1..5] {
-        if !matches!(b, b'A'..=b'Z' | b'2'..=b'7') {
-            return Err(format!(
-                "smart_account_redacted chars 1..5 must be base32 [A-Z2-7], got: {s:?}"
-            ));
-        }
-    }
-    // Chars 5..8 must be "...".
-    if &bytes[5..8] != b"..." {
-        return Err(format!(
-            "smart_account_redacted chars 5..8 must be '...', got: {s:?}"
-        ));
-    }
-    // Chars 8..13 must be base32 [A-Z2-7].
-    for &b in &bytes[8..13] {
-        if !matches!(b, b'A'..=b'Z' | b'2'..=b'7') {
-            return Err(format!(
-                "smart_account_redacted chars 8..13 must be base32 [A-Z2-7], got: {s:?}"
-            ));
-        }
-    }
-    Ok(())
 }
 
 /// Validates a FULL smart-account C-strkey: 56 characters, `C` prefix,
@@ -5036,10 +5006,10 @@ fn validate_smart_account_full(s: &str) -> Result<(), String> {
     if valid {
         Ok(())
     } else {
-        Err(format!(
-            "smart_account must be a valid C-strkey (56 chars, ^C[A-Z2-7]{{55}}$), got: {}",
-            redact_g_strkey(s)
-        ))
+        Err(
+            "smart_account must match ^C[A-Z2-7]{55}$; repair the pending approval record."
+                .to_owned(),
+        )
     }
 }
 
@@ -8844,10 +8814,7 @@ user_handle = [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
         let err =
             validate_sign_with_passkey_invariants(&cred_id, &rule_ids, &redacted, "127.0.0.1")
                 .unwrap_err();
-        assert!(
-            err.contains("IP address literal"),
-            "error must cite IP address literal; got: {err}"
-        );
+        assert_eq!(err, RP_ID_IP_LITERAL_REASON);
     }
 
     /// `validate_sign_with_passkey_invariants` rejects IPv6 rp_id literals.
@@ -8858,10 +8825,7 @@ user_handle = [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
         let redacted = "CAAAA...AAAAA".to_owned();
         let err = validate_sign_with_passkey_invariants(&cred_id, &rule_ids, &redacted, "::1")
             .unwrap_err();
-        assert!(
-            err.contains("IP address literal"),
-            "error must cite IP address literal; got: {err}"
-        );
+        assert_eq!(err, RP_ID_IP_LITERAL_REASON);
     }
 
     /// `validate_sign_with_passkey_invariants` rejects non-loopback IPv4.
@@ -8873,10 +8837,7 @@ user_handle = [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
         let err =
             validate_sign_with_passkey_invariants(&cred_id, &rule_ids, &redacted, "192.168.1.1")
                 .unwrap_err();
-        assert!(
-            err.contains("IP address literal"),
-            "error must cite IP address literal; got: {err}"
-        );
+        assert_eq!(err, RP_ID_IP_LITERAL_REASON);
     }
 
     /// `validate_sign_with_passkey_invariants` accepts `"localhost"`.
@@ -8906,10 +8867,7 @@ user_handle = [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
         let rule_ids = vec![0u32];
         let err =
             validate_register_passkey_invariants(&redacted, &rule_ids, "127.0.0.1").unwrap_err();
-        assert!(
-            err.contains("IP address literal"),
-            "error must cite IP address literal; got: {err}"
-        );
+        assert_eq!(err, RP_ID_IP_LITERAL_REASON);
     }
 
     /// `validate_register_passkey_invariants` rejects IPv6 rp_id literals.
@@ -8918,10 +8876,7 @@ user_handle = [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
         let redacted = "CAAAA...AAAAA".to_owned();
         let rule_ids = vec![0u32];
         let err = validate_register_passkey_invariants(&redacted, &rule_ids, "::1").unwrap_err();
-        assert!(
-            err.contains("IP address literal"),
-            "error must cite IP address literal; got: {err}"
-        );
+        assert_eq!(err, RP_ID_IP_LITERAL_REASON);
     }
 
     /// `validate_register_passkey_invariants` accepts `"localhost"`.
@@ -10020,49 +9975,241 @@ amount_max_stroops = 1000000
     fn smart_account_redacted_rejects_non_c_prefix() {
         // 13 chars starting with 'G' instead of 'C'.
         let err = validate_smart_account_redacted("GAAAA...BBBBB").unwrap_err();
-        assert!(
-            err.contains("start with 'C'"),
-            "error must cite 'C' prefix requirement; got: {err}"
-        );
+        assert_eq!(err, SMART_ACCOUNT_REDACTED_REASON);
     }
 
     #[test]
     fn smart_account_redacted_rejects_non_base32_chars_in_prefix() {
         // Chars 1..5 contain a digit 1 which is NOT in base32 [A-Z2-7].
         let err = validate_smart_account_redacted("C1AAA...BBBBB").unwrap_err();
-        assert!(
-            err.contains("base32"),
-            "error must cite base32 requirement for chars 1..5; got: {err}"
-        );
+        assert_eq!(err, SMART_ACCOUNT_REDACTED_REASON);
     }
 
     #[test]
     fn smart_account_redacted_rejects_wrong_separator() {
         // Separator must be "...", not "---".
         let err = validate_smart_account_redacted("CAAAA---BBBBB").unwrap_err();
-        assert!(
-            err.contains("'...'"),
-            "error must cite '...' separator requirement; got: {err}"
-        );
+        assert_eq!(err, SMART_ACCOUNT_REDACTED_REASON);
     }
 
     #[test]
     fn smart_account_redacted_rejects_non_base32_chars_in_suffix() {
         // Chars 8..13 contain '!' which is NOT in base32 [A-Z2-7].
         let err = validate_smart_account_redacted("CAAAA...BB!BB").unwrap_err();
-        assert!(
-            err.contains("base32"),
-            "error must cite base32 requirement for chars 8..13; got: {err}"
-        );
+        assert_eq!(err, SMART_ACCOUNT_REDACTED_REASON);
     }
 
     #[test]
     fn smart_account_redacted_rejects_wrong_length() {
         // 12 chars (one short).
         let err = validate_smart_account_redacted("CAAAA...BBBB").unwrap_err();
-        assert!(
-            err.contains("13 characters"),
-            "error must cite 13-character length; got: {err}"
+        assert_eq!(err, SMART_ACCOUNT_REDACTED_REASON);
+    }
+
+    // ── Refused values stay out of every reason ───────────────────────────────
+
+    const MARKER: &str = "credmarker7";
+
+    /// Runs the toolset gate validator with one field replaced.
+    fn toolset_gate_reason(
+        name: &str,
+        capability: &str,
+        destination: &str,
+        asset: &str,
+        min: i64,
+        max: i64,
+    ) -> String {
+        validate_toolset_first_invoke_gate_invariants(
+            name,
+            capability,
+            destination,
+            asset,
+            min,
+            max,
+        )
+        .unwrap_err()
+    }
+
+    fn assert_reason_exact(reason: &str, expected: &str, refused: &[&str]) {
+        assert_eq!(reason, expected);
+        for value in refused {
+            assert!(!reason.contains(value), "{reason} repeats {value}");
+        }
+    }
+
+    #[test]
+    fn ip_literal_rp_ids_stay_out_of_the_reason() {
+        let rule_ids = vec![0_u32];
+        let redacted = "CAAAA...AAAAA";
+        for address in ["192.0.2.77", "2001:db8::77"] {
+            for reason in [
+                validate_sign_with_passkey_invariants(&[0_u8; 16], &rule_ids, redacted, address)
+                    .unwrap_err(),
+                validate_register_passkey_invariants(redacted, &rule_ids, address).unwrap_err(),
+            ] {
+                assert_reason_exact(
+                    &reason,
+                    "rp_id must be a DNS name, not an IP address literal; use localhost for \
+                     loopback.",
+                    &[address],
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn stored_field_deserializers_state_the_form_without_the_value() {
+        type Plain = serde::de::value::StringDeserializer<serde::de::value::Error>;
+        use serde::de::IntoDeserializer as _;
+        let plain: Plain = format!("{MARKER}!").into_deserializer();
+        assert_reason_exact(
+            &deserialize_process_uid(plain).unwrap_err().to_string(),
+            "process_uid must be numeric ASCII, a Windows SID, or non-unix-stub; repair the \
+             pending approval record.",
+            &[MARKER],
+        );
+        assert_reason_exact(
+            &ConsumedOutcome::parse(MARKER).unwrap_err(),
+            "Consumed.outcome must be confirmed or unknown; repair the pending approval record.",
+            &[MARKER],
+        );
+        let value = || serde_json::Value::String(format!("{MARKER}!"));
+        assert_reason_exact(
+            &deserialize_opt_summary_to(value()).unwrap_err().to_string(),
+            "summary_to must match ^G[A-Z2-7]{55}$; repair the pending approval record.",
+            &[MARKER],
+        );
+        assert_reason_exact(
+            &deserialize_opt_summary_asset(value())
+                .unwrap_err()
+                .to_string(),
+            "summary_asset must be XLM or a 1-12 character ASCII alphanumeric code followed by \
+             a colon and a G-strkey; repair the pending approval record.",
+            &[MARKER],
+        );
+    }
+
+    #[test]
+    fn toolset_gate_reasons_hold_no_refused_value() {
+        let bad = format!("{MARKER}!");
+        let (name, capability) = ("toolset", "sign-payment");
+        assert_reason_exact(
+            &toolset_gate_reason(&bad, capability, VALID_SUMMARY_TO, "XLM", 0, 1),
+            "toolset_name must contain 1-64 characters from [a-z0-9-]; repair the pending \
+             approval record.",
+            &[MARKER],
+        );
+        assert_reason_exact(
+            &toolset_gate_reason(name, &bad, VALID_SUMMARY_TO, "XLM", 0, 1),
+            "capability must contain 1-64 characters from [a-z0-9-]; repair the pending \
+             approval record.",
+            &[MARKER],
+        );
+        assert_reason_exact(
+            &toolset_gate_reason(name, capability, "creda_bad_value_mark7", "XLM", 0, 1),
+            "destination must match ^[GC][A-Z2-7]{55}$; repair the pending approval record.",
+            &["creda_bad_value_mark7", "creda", "mark7"],
+        );
+        for asset in [
+            bad.clone(),
+            format!("CODE:{MARKER}"),
+            format!("CODETHIRTEENX:{VALID_SUMMARY_TO}"),
+        ] {
+            assert_reason_exact(
+                &toolset_gate_reason(name, capability, VALID_SUMMARY_TO, &asset, 0, 1),
+                APPROVAL_ASSET_REASON,
+                &[MARKER, "CODETHIRTEENX"],
+            );
+        }
+        assert_reason_exact(
+            &toolset_gate_reason(name, capability, VALID_SUMMARY_TO, "XLM", -424_242, 1),
+            "amount_min_stroops must be nonnegative; repair the pending approval record.",
+            &["424242"],
+        );
+        assert_reason_exact(
+            &toolset_gate_reason(name, capability, VALID_SUMMARY_TO, "XLM", 0, -424_242),
+            "amount_max_stroops must be positive; repair the pending approval record.",
+            &["424242"],
+        );
+        assert_reason_exact(
+            &toolset_gate_reason(name, capability, VALID_SUMMARY_TO, "XLM", 424_243, 424_242),
+            "amount_min_stroops must be no greater than amount_max_stroops; repair the pending \
+             approval record.",
+            &["424242", "424243"],
+        );
+    }
+
+    #[test]
+    fn clawback_reasons_hold_no_refused_value() {
+        let network = "stellar:testnet";
+        for code in ["CREDMARKER7CODE", "credmarker7"] {
+            assert_reason_exact(
+                &validate_trustline_clawback_opt_in_invariants(network, code, VALID_SUMMARY_TO)
+                    .unwrap_err(),
+                CLAWBACK_CODE_REASON,
+                &[code],
+            );
+        }
+        let issuer = format!("mark1{}mark2", "x".repeat(46));
+        assert_reason_exact(
+            &validate_trustline_clawback_opt_in_invariants(network, "USDC", &issuer).unwrap_err(),
+            "issuer must match ^G[A-Z2-7]{55}$; repair the pending approval record.",
+            &["mark1", "mark2"],
+        );
+    }
+
+    #[test]
+    fn claim_reasons_hold_no_refused_value() {
+        let hex72 = "ab".repeat(36);
+        let claim = |asset, amount, source| {
+            validate_claim_simulated_invariants(
+                &hex72,
+                VALID_BALANCE_ID_STRKEY,
+                Some(asset),
+                Some(amount),
+                source,
+            )
+            .unwrap_err()
+        };
+        assert_reason_exact(
+            &claim("credmarker7!", 1, VALID_SUMMARY_TO),
+            APPROVAL_ASSET_REASON,
+            &[MARKER],
+        );
+        assert_reason_exact(
+            &claim("XLM", -424_242, VALID_SUMMARY_TO),
+            "amount_stroops must be strictly positive; repair the pending approval record.",
+            &["424242"],
+        );
+        let source = format!("mark1{}mark2", "x".repeat(46));
+        assert_reason_exact(
+            &claim("XLM", 1, &source),
+            "source must match ^G[A-Z2-7]{55}$; repair the pending approval record.",
+            &["mark1", "mark2"],
+        );
+    }
+
+    #[test]
+    fn smart_account_shape_reasons_hold_no_refused_value() {
+        for value in [
+            "CAAAA...BBBB",
+            "GAAAA...BBBBB",
+            "C1AAA...BBBBB",
+            "CAAAA---BBBBB",
+            "CAAAA...BB!BB",
+        ] {
+            assert_reason_exact(
+                &validate_smart_account_redacted(value).unwrap_err(),
+                "smart_account_redacted must match ^C[A-Z2-7]{4}\\.\\.\\.[A-Z2-7]{5}$; repair \
+                 the pending approval record.",
+                &[value],
+            );
+        }
+        let full = format!("mark1{}mark2", "x".repeat(46));
+        assert_reason_exact(
+            &validate_smart_account_full(&full).unwrap_err(),
+            "smart_account must match ^C[A-Z2-7]{55}$; repair the pending approval record.",
+            &["mark1", "mark2"],
         );
     }
 
@@ -10070,26 +10217,7 @@ amount_max_stroops = 1000000
 
     #[test]
     fn redact_g_strkey_short_string_uses_redacted_placeholder() {
-        // Access via the Debug output of a TrustlineClawbackOptIn entry
-        // with a very short issuer — exercises the < 10 branch of redact_g_strkey.
-        // We call the internal function directly since it's private.
-        // Use the toolset gate debug with a short-looking destination via the
-        // ToolsetFirstInvokeGate validator which calls redact_g_strkey on error.
-        let err = validate_toolset_first_invoke_gate_invariants(
-            "my-toolset",
-            "sign-payment",
-            "tooshort",
-            "XLM",
-            0,
-            1_000,
-        )
-        .unwrap_err();
-        // The error message must contain the redacted form (not the full key).
-        // For "tooshort" (8 chars < 10), redact_g_strkey returns "<redacted>".
-        assert!(
-            err.contains("<redacted>") || err.contains("tooshort"),
-            "short destination must appear redacted or verbatim in error: {err}"
-        );
+        assert_eq!(redact_g_strkey("tooshort"), "<redacted>");
     }
 
     // ── process_uid_is_valid: non-unix-stub path ──────────────────────────────
@@ -10191,10 +10319,7 @@ amount_max_stroops = 1000000
             "IP-literal rp_id must return Invalid: {err:?}"
         );
         if let ApprovalError::Invalid { reason } = err {
-            assert!(
-                reason.contains("IP address literal"),
-                "reason must cite IP address literal: {reason}"
-            );
+            assert_eq!(reason, RP_ID_IP_LITERAL_REASON);
         }
     }
 
@@ -10786,6 +10911,29 @@ issuer = "{TESTNET_USDC_ISSUER}"
         )
         .unwrap_err();
         assert!(matches!(err, ApprovalError::Invalid { .. }));
+    }
+
+    /// A snapshot version this build does not accept stays out of the refusal
+    /// of the public constructor.
+    #[test]
+    fn new_rule_proposal_pending_refusal_holds_no_snapshot_version() {
+        let mut snapshot = valid_rule_proposal_snapshot();
+        snapshot.snapshot_version = 3_141_592_653;
+        let err = PendingApproval::new_rule_proposal_pending(
+            RULE_PROPOSAL_SMART_ACCOUNT.to_owned(),
+            TESTNET_PASSPHRASE.to_owned(),
+            "stellar:testnet".to_owned(),
+            snapshot,
+            "summary".to_owned(),
+            "1000".to_owned(),
+            DEFAULT_TTL_MS,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&err, ApprovalError::Invalid { reason } if reason == "snapshot_version must be 1"),
+            "{err:?}"
+        );
+        stellar_agent_test_support::rejected_value::assert_no_marker(&err, "3141592653");
     }
 
     #[test]

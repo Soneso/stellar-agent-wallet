@@ -87,6 +87,7 @@ use stellar_agent_smart_account::managers::rules::{
     decode_policy_count_from_scval, parse_c_strkey_to_smart_account,
     parse_delegated_signer_address, parse_g_strkey_to_signer_address,
 };
+use stellar_agent_smart_account::managers::signers::SPENDING_LIMIT_POSITIVE_REASON;
 use stellar_agent_smart_account::simple_threshold_policy::build_simple_threshold_install_param;
 use stellar_agent_smart_account::spending_limit_policy::{
     build_spending_limit_install_param, ensure_call_contract_context_for_spending_limit,
@@ -450,9 +451,6 @@ pub async fn run(args: &RulesArgs) -> i32 {
 async fn list_rules_run(args: &ListArgs) -> i32 {
     info!(
         command = "smart-account rules list",
-        account = tracing::field::display(
-            stellar_agent_core::observability::redact_strkey_first5_last5(&args.account)
-        ),
         network = ?args.network,
         "smart-account rules list: dispatching to list-rules handler"
     );
@@ -1804,7 +1802,6 @@ async fn verify_pins_run(args: &VerifyPinsArgs) -> i32 {
 
     info!(
         smart_account = %account_redacted,
-        rule_id = args.rule_id,
         "smart-account rules verify-pins: running",
     );
 
@@ -2161,11 +2158,11 @@ async fn add_policy_run(args: &AddPolicyArgs) -> i32 {
                 },
             ) {
                 Ok(v) => v,
-                Err(e) => {
+                Err(_) => {
                     return emit_error(
                         &WalletError::Validation(ValidationError::XdrArgumentMalformed {
                             arg: "install-param".to_owned(),
-                            reason: format!("{e}"),
+                            reason: stellar_agent_core::envelope_decode::SCVAL_XDR_FORM.to_owned(),
                         }),
                         args.output,
                         &request_id,
@@ -2566,10 +2563,10 @@ async fn add_policy_run(args: &AddPolicyArgs) -> i32 {
         Ok(Some(scval)) => scval,
         Ok(None) => {
             return emit_error(
-                &WalletError::Validation(ValidationError::address_check(format!(
-                    "--rule-id {} names no rule on the smart account",
-                    args.rule_id
-                ))),
+                &WalletError::Validation(ValidationError::address_check(
+                    "--rule-id must identify a rule on the smart account; run \
+                     'smart-account list-rules' to list the rules",
+                )),
                 args.output,
                 &request_id,
             );
@@ -3136,12 +3133,7 @@ async fn set_spending_limit_run(args: &SetSpendingLimitArgs) -> i32 {
     if args.limit <= 0 {
         return emit_error_sa(
             &SaError::SpendingLimitInstallRefused {
-                reason: format!(
-                    "set-spending-limit refused: --limit must be positive; got {} \
-                     (OZ set_spending_limit rejects non-positive values with \
-                     InvalidLimitOrPeriod)",
-                    args.limit
-                ),
+                reason: SPENDING_LIMIT_POSITIVE_REASON.to_owned(),
             },
             args.output,
             &request_id,
@@ -3158,8 +3150,9 @@ async fn set_spending_limit_run(args: &SetSpendingLimitArgs) -> i32 {
         Err(e) => return emit_error(&e, args.output, &request_id),
     };
 
+    // The manager checks that the rule holds a spending-limit policy after
+    // this event, so the event omits the rule id.
     info!(
-        rule_id = args.rule_id,
         new_limit = args.limit,
         account = %account_redacted,
         "smart-account rules set-spending-limit: submitting set_spending_limit"
@@ -5293,16 +5286,12 @@ mod tests {
             .finish();
 
         // Emit the same structured event that `list_rules_run` emits at the
-        // dispatch site. The account field is redacted per the redaction rules.
-        let account_redacted = stellar_agent_core::observability::redact_strkey_first5_last5(
-            "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
-        );
+        // dispatch site.
         let network = TargetNetwork::Testnet;
         tracing::subscriber::with_default(subscriber, || {
             tracing::callsite::rebuild_interest_cache();
             tracing::info!(
                 command = "smart-account rules list",
-                account = tracing::field::display(&account_redacted),
                 network = %network,
                 "smart-account rules list: dispatching to list-rules handler"
             );

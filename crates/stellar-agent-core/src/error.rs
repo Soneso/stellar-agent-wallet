@@ -1350,13 +1350,9 @@ pub enum ValidationError {
     ///
     /// `"audit.log_not_found"`.
     #[error(
-        "audit log not found at {path}; nothing has been written to the audit \
-         log yet, or the log path is incorrect"
+        "log_path must name an existing audit log file; choose an existing file and retry audit verify."
     )]
-    AuditLogNotFound {
-        /// Display path of the missing primary audit-log file.
-        path: String,
-    },
+    AuditLogNotFound,
 
     /// A mainnet profile names no RPC endpoint.
     ///
@@ -1926,8 +1922,9 @@ pub enum ValidationError {
     /// `"fees.percentile_exceeds_cap"`.
     #[error("{}", fee_above_cap_text(*per_op, *cap, fee_source))]
     FeeAboveCap {
-        /// Per-operation fee in stroops the stage would sign or send.
-        per_op: u32,
+        /// Per-operation fee in stroops that the stage refuses to sign or
+        /// send, when the wallet derived it.
+        per_op: DerivedFee,
         /// The profile's per-operation cap in stroops.
         cap: u32,
         /// Where the per-operation fee came from.
@@ -1941,12 +1938,10 @@ pub enum ValidationError {
     ///
     /// `"validation.fee_total_overflow"`.
     #[error(
-        "per-operation fee {per_op} stroops times {op_count} operations exceeds the \
-         transaction fee limit; lower classic_fee_per_op_stroops"
+        "classic_fee_per_op_stroops multiplied by the operation count must fit in u32; \
+         lower classic_fee_per_op_stroops."
     )]
     FeeTotalOverflow {
-        /// Per-operation fee in stroops.
-        per_op: u32,
         /// Operations in the transaction.
         op_count: u32,
     },
@@ -2034,17 +2029,12 @@ pub enum ValidationError {
     ///
     /// `"profile.reset_window_state_newer_version"`.
     #[error(
-        "the policy window-state of profile '{profile}' has format version {version}, newer \
-         than the version {max} this build reads; reset-window-state refuses it. Use the \
-         build that wrote it"
+        "the policy window-state of profile '{profile}' cannot be reset: policy window-state \
+         version must be supported by this build; use the build that wrote the file"
     )]
     ResetWindowStateNewerVersion {
         /// Selected profile name.
         profile: String,
-        /// The authenticated file's format version.
-        version: u32,
-        /// The highest format version this build reads.
-        max: u32,
     },
 }
 
@@ -2105,22 +2095,50 @@ pub enum FeeSource {
     Envelope,
 }
 
-fn fee_above_cap_text(per_op: u32, cap: u32, fee_source: &FeeSource) -> String {
+/// The per-operation fee a cap refusal reports.
+///
+/// A fee the caller or the profile chose is the refused value, so the wallet
+/// keeps no copy of it; a fee the wallet derived stays for the diagnostic.
+/// [`DerivedFee::new`] is the only constructor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DerivedFee(Option<u32>);
+
+impl DerivedFee {
+    /// Keeps `per_op` unless `fee_source` names a fee the caller or the
+    /// profile chose.
+    #[must_use]
+    pub fn new(per_op: u32, fee_source: &FeeSource) -> Self {
+        match fee_source {
+            FeeSource::Explicit | FeeSource::ProfileDefault => Self(None),
+            FeeSource::Selected { .. } | FeeSource::CommandDefault | FeeSource::Envelope => {
+                Self(Some(per_op))
+            }
+        }
+    }
+
+    /// The derived fee in stroops, or `None` for a chosen fee.
+    #[must_use]
+    pub fn stroops(self) -> Option<u32> {
+        self.0
+    }
+}
+
+fn fee_above_cap_text(per_op: DerivedFee, cap: u32, fee_source: &FeeSource) -> String {
+    let per_op = per_op.stroops().unwrap_or_default();
     match fee_source {
         FeeSource::Selected { percentile } => format!(
             "auto-selected per-operation fee {per_op} stroops (percentile {percentile}) exceeds \
              the profile cap of {cap} stroops; raise classic_max_fee_per_op_stroops or accept a \
              lower fee percentile"
         ),
-        FeeSource::Explicit => format!(
-            "the explicit per-operation fee {per_op} stroops exceeds the profile cap of {cap} \
-             stroops; lower the fee or raise classic_max_fee_per_op_stroops"
-        ),
-        FeeSource::ProfileDefault => format!(
-            "the profile's per-operation fee {per_op} stroops (classic_fee_per_op_stroops) \
-             exceeds the profile cap of {cap} stroops; lower classic_fee_per_op_stroops or \
-             raise classic_max_fee_per_op_stroops"
-        ),
+        FeeSource::Explicit => "--fee must be a per-operation stroop amount within \
+             classic_max_fee_per_op_stroops; lower --fee or raise \
+             classic_max_fee_per_op_stroops."
+            .to_owned(),
+        FeeSource::ProfileDefault => "classic_fee_per_op_stroops must not exceed \
+             classic_max_fee_per_op_stroops; lower classic_fee_per_op_stroops or raise \
+             classic_max_fee_per_op_stroops."
+            .to_owned(),
         FeeSource::CommandDefault => format!(
             "the default per-operation fee {per_op} stroops exceeds the profile cap of {cap} \
              stroops; pass an explicit fee within the cap or raise \
@@ -2548,17 +2566,11 @@ pub enum NetworkError {
     /// A signature on the envelope verifies under neither the endpoint's
     /// network id nor mainnet's, for any ed25519 signer of the transaction's
     /// source accounts.
-    ///
-    /// `hint` is the `DecoratedSignature` hint as 8 lowercase hex characters —
-    /// the last four bytes of a public key, which is public material.
     #[error(
-        "the envelope signature with hint {hint} does not verify under the network \
-         the endpoint serves, for any signer of the transaction's source accounts"
+        "transaction_xdr must contain signatures that verify against a source-account \
+         signer on the selected network; rebuild and sign the envelope for that network."
     )]
-    EnvelopeSignatureUnverifiable {
-        /// The `DecoratedSignature` hint, 8 lowercase hex characters.
-        hint: String,
-    },
+    EnvelopeSignatureUnverifiable,
 
     /// The envelope carries no signatures at all.
     ///
@@ -2842,12 +2854,41 @@ pub const MAINNET_SIGNING_REFUSAL_DETAIL: &str =
 // Auth errors
 // ──────────────────────────────────────────────────────────────────────────────
 
+/// Why a keyring read found no usable entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum KeyringMissingCause {
+    /// The store holds no entry at the configured coordinate.
+    MissingEntry,
+    /// The session has no platform credential store.
+    NoDefaultStore,
+    /// The entry exists and its value is not an S-strkey.
+    InvalidSecret,
+}
+
+impl std::fmt::Display for KeyringMissingCause {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::MissingEntry => {
+                "the configured keyring entry must exist; provision or select the required entry."
+            }
+            Self::NoDefaultStore => {
+                "a platform keychain must be available for this session; start and unlock macOS \
+                 Keychain, GNOME Keyring, KWallet, or Windows Credential Manager."
+            }
+            Self::InvalidSecret => {
+                "the configured keyring entry must hold an S-strkey; provision or select the \
+                 required entry."
+            }
+        })
+    }
+}
+
 /// Errors arising from keyring access or signing authentication.
 ///
 /// # Secret-material policy
 ///
-/// No field in any variant carries secret material.  The `name` field in
-/// `KeyringNotFound` holds a keyring label (a non-secret identifier).
+/// No field in any variant carries secret material or a keyring coordinate.
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum AuthError {
@@ -2896,13 +2937,14 @@ pub enum AuthError {
     )]
     KeyringInteractiveSessionRequired,
 
-    /// The specified keyring entry was not found.
+    /// A keyring read found no usable entry.
     ///
-    /// `name` holds the keyring entry label as supplied by the caller.
-    #[error("keyring entry '{name}' was not found")]
+    /// `cause` tells the conditions apart; the error holds no keyring
+    /// coordinate.
+    #[error("{cause}")]
     KeyringNotFound {
-        /// The keyring entry label that was not found.
-        name: String,
+        /// Why the read found no usable entry.
+        cause: KeyringMissingCause,
     },
 
     /// The headless keyring backend the environment selects cannot be set up
@@ -3959,12 +4001,7 @@ mod tests {
                 },
                 "validation.rule_name_too_long",
             ),
-            (
-                ValidationError::AuditLogNotFound {
-                    path: "/tmp/audit.jsonl".to_owned(),
-                },
-                "audit.log_not_found",
-            ),
+            (ValidationError::AuditLogNotFound, "audit.log_not_found"),
             (
                 ValidationError::ProviderAttestationInvalid {
                     name: "mainnet".into(),
@@ -4149,17 +4186,14 @@ mod tests {
             ),
             (
                 ValidationError::FeeAboveCap {
-                    per_op: 500,
+                    per_op: DerivedFee::new(500, &FeeSource::Envelope),
                     cap: 400,
                     fee_source: FeeSource::Envelope,
                 },
                 "fees.percentile_exceeds_cap",
             ),
             (
-                ValidationError::FeeTotalOverflow {
-                    per_op: u32::MAX,
-                    op_count: 3,
-                },
+                ValidationError::FeeTotalOverflow { op_count: 3 },
                 "validation.fee_total_overflow",
             ),
             (
@@ -4179,8 +4213,6 @@ mod tests {
             (
                 ValidationError::ResetWindowStateNewerVersion {
                     profile: "default".to_owned(),
-                    version: 5,
-                    max: 4,
                 },
                 "profile.reset_window_state_newer_version",
             ),
@@ -4305,9 +4337,7 @@ mod tests {
                         max: *max,
                     }
                 }
-                ValidationError::AuditLogNotFound { path } => {
-                    ValidationError::AuditLogNotFound { path: path.clone() }
-                }
+                ValidationError::AuditLogNotFound => ValidationError::AuditLogNotFound,
                 ValidationError::ProviderAttestationInvalid { name, source } => {
                     ValidationError::ProviderAttestationInvalid {
                         name: name.clone(),
@@ -4459,9 +4489,8 @@ mod tests {
                     cap: *cap,
                     fee_source: fee_source.clone(),
                 },
-                ValidationError::FeeTotalOverflow { per_op, op_count } => {
+                ValidationError::FeeTotalOverflow { op_count } => {
                     ValidationError::FeeTotalOverflow {
-                        per_op: *per_op,
                         op_count: *op_count,
                     }
                 }
@@ -4479,15 +4508,11 @@ mod tests {
                     derived: derived.clone(),
                     pinned: pinned.clone(),
                 },
-                ValidationError::ResetWindowStateNewerVersion {
-                    profile,
-                    version,
-                    max,
-                } => ValidationError::ResetWindowStateNewerVersion {
-                    profile: profile.clone(),
-                    version: *version,
-                    max: *max,
-                },
+                ValidationError::ResetWindowStateNewerVersion { profile } => {
+                    ValidationError::ResetWindowStateNewerVersion {
+                        profile: profile.clone(),
+                    }
+                }
                 #[cfg(feature = "mainnet-write")]
                 ValidationError::WindowStateUnverifiable { profile, defect } => {
                     ValidationError::WindowStateUnverifiable {
@@ -4513,13 +4538,33 @@ mod tests {
         }
     }
 
+    /// A fee the caller or the profile chose stays out of every rendering of
+    /// the cap and overflow refusals; a derived fee stays in the diagnostic.
+    #[test]
+    fn chosen_fees_stay_out_of_cap_refusals() {
+        for fee_source in [FeeSource::Explicit, FeeSource::ProfileDefault] {
+            let error = ValidationError::FeeAboveCap {
+                per_op: DerivedFee::new(424_242, &fee_source),
+                cap: 100,
+                fee_source,
+            };
+            stellar_agent_test_support::rejected_value::assert_no_marker(&error, "424242");
+        }
+        let derived = ValidationError::FeeAboveCap {
+            per_op: DerivedFee::new(424_242, &FeeSource::Envelope),
+            cap: 100,
+            fee_source: FeeSource::Envelope,
+        };
+        assert!(derived.to_string().contains("424242"), "{derived}");
+    }
+
     /// Each fee source names its own remedy, and the mainnet and overflow
     /// refusals carry their fixed texts.
     #[test]
     fn fee_cap_texts_name_the_fee_source() {
         let text = |fee_source: FeeSource| {
             ValidationError::FeeAboveCap {
-                per_op: 500,
+                per_op: DerivedFee::new(500, &fee_source),
                 cap: 400,
                 fee_source,
             }
@@ -4535,14 +4580,13 @@ mod tests {
         );
         assert_eq!(
             text(FeeSource::Explicit),
-            "the explicit per-operation fee 500 stroops exceeds the profile cap of 400 stroops; \
-             lower the fee or raise classic_max_fee_per_op_stroops"
+            "--fee must be a per-operation stroop amount within classic_max_fee_per_op_stroops; \
+             lower --fee or raise classic_max_fee_per_op_stroops."
         );
         assert_eq!(
             text(FeeSource::ProfileDefault),
-            "the profile's per-operation fee 500 stroops (classic_fee_per_op_stroops) exceeds \
-             the profile cap of 400 stroops; lower classic_fee_per_op_stroops or raise \
-             classic_max_fee_per_op_stroops"
+            "classic_fee_per_op_stroops must not exceed classic_max_fee_per_op_stroops; lower \
+             classic_fee_per_op_stroops or raise classic_max_fee_per_op_stroops."
         );
         assert_eq!(
             text(FeeSource::CommandDefault),
@@ -4560,13 +4604,9 @@ mod tests {
              fee cap in the profile file"
         );
         assert_eq!(
-            ValidationError::FeeTotalOverflow {
-                per_op: 75_400_000,
-                op_count: 57,
-            }
-            .to_string(),
-            "per-operation fee 75400000 stroops times 57 operations exceeds the transaction fee \
-             limit; lower classic_fee_per_op_stroops"
+            ValidationError::FeeTotalOverflow { op_count: 57 }.to_string(),
+            "classic_fee_per_op_stroops multiplied by the operation count must fit in u32; lower \
+             classic_fee_per_op_stroops."
         );
     }
 
@@ -4696,9 +4736,7 @@ mod tests {
                 "network.envelope_signed_for_mainnet",
             ),
             (
-                NetworkError::EnvelopeSignatureUnverifiable {
-                    hint: "0a1b2c3d".to_owned(),
-                },
+                NetworkError::EnvelopeSignatureUnverifiable,
                 "network.envelope_signature_unverifiable",
             ),
             (NetworkError::EnvelopeUnsigned, "network.envelope_unsigned"),
@@ -4845,7 +4883,7 @@ mod tests {
             ),
             (
                 AuthError::KeyringNotFound {
-                    name: "main".to_owned(),
+                    cause: crate::error::KeyringMissingCause::MissingEntry,
                 },
                 "auth.keyring_not_found",
             ),
@@ -5414,9 +5452,7 @@ mod tests {
                 supported_max: 30,
             }),
             WalletError::Network(NetworkError::EnvelopeSignedForMainnet),
-            WalletError::Network(NetworkError::EnvelopeSignatureUnverifiable {
-                hint: "0a1b2c3d".to_owned(),
-            }),
+            WalletError::Network(NetworkError::EnvelopeSignatureUnverifiable),
             WalletError::Network(NetworkError::EnvelopeUnsigned),
             WalletError::Network(NetworkError::FriendbotAccountAlreadyFunded {
                 account_id: "GABCDEFGHIJKLMNOPQR".to_owned(),
@@ -5560,7 +5596,7 @@ mod tests {
             }),
             WalletError::Auth(AuthError::KeyringInteractiveSessionRequired),
             WalletError::Auth(AuthError::KeyringNotFound {
-                name: "main".to_owned(),
+                cause: crate::error::KeyringMissingCause::MissingEntry,
             }),
             WalletError::Auth(AuthError::KeyringConfigInvalid {
                 detail: "STELLAR_AGENT_HEADLESS_KEYRING_KEY: value has base64 padding".to_owned(),

@@ -1465,10 +1465,9 @@ mod tests {
         bind_oracle_credential(&mut profile, None);
         let error = run_profile(&profile).await.unwrap_err();
         assert_eq!(error.code(), "auth.keyring_not_found");
-        assert!(
-            error
-                .to_string()
-                .contains("stellar-agent-witness-test/oracle")
+        assert_eq!(
+            error.to_string(),
+            "the configured keyring entry must exist; provision or select the required entry."
         );
         assert!(methods(&server).await.is_empty());
     }

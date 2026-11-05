@@ -91,6 +91,7 @@
 use std::time::Duration;
 
 use sha2::{Digest as _, Sha256};
+use stellar_agent_core::envelope_decode::TRANSACTION_ENVELOPE_XDR_FORM;
 use stellar_agent_core::error::{NetworkError, ProtocolError, SubmissionError, WalletError};
 use stellar_agent_core::profile::receipt::{
     BeginOutcome, ReceiptStatus, ReceiptStore, SubmissionReceipt,
@@ -392,9 +393,9 @@ fn base64_decode(s: &str) -> Result<Vec<u8>, WalletError> {
     use base64::Engine as _;
     base64::engine::general_purpose::STANDARD
         .decode(s.trim())
-        .map_err(|e| {
+        .map_err(|_| {
             WalletError::Protocol(ProtocolError::XdrCodecFailed {
-                detail: format!("base64 decode failed: {e}"),
+                detail: format!("base64 decode failed: {TRANSACTION_ENVELOPE_XDR_FORM}"),
             })
         })
 }
@@ -873,9 +874,9 @@ async fn pre_send_checks(
         use base64::Engine as _;
         let xdr_bytes = base64::engine::general_purpose::STANDARD
             .decode(envelope_xdr.trim())
-            .map_err(|e| {
+            .map_err(|_| {
                 WalletError::Protocol(ProtocolError::XdrCodecFailed {
-                    detail: format!("base64 decode failed: {e}"),
+                    detail: format!("base64 decode failed: {TRANSACTION_ENVELOPE_XDR_FORM}"),
                 })
             })?;
         TransactionEnvelope::from_xdr(

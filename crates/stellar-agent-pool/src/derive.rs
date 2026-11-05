@@ -165,7 +165,9 @@ pub fn derive_channel_signer(
     // the wallet zeroizes it on drop at the end of this function.
     let wallet = Sep5Wallet::from_bip39_seed_zeroizing(seed);
     // seed has been consumed; the wallet holds the only live copy.
-    let account = wallet.derive_account(index)?;
+    let account = wallet
+        .derive_account(index)
+        .map_err(|_| PoolError::DeriveFailed)?;
 
     // Copy the secret seed from the DerivedAccount's SecretBox into a zeroed
     // Zeroizing buffer for the SoftwareSigningKey constructor. Copying from the

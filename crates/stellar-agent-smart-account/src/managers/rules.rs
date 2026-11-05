@@ -44,9 +44,7 @@ use stellar_agent_core::audit_log::signer_set::{
     SignerIdentityV2, SignerSetView, ThresholdObservation,
 };
 use stellar_agent_core::audit_log::writer::AuditWriter;
-use stellar_agent_core::observability::{
-    RedactedStrkey, redact_strkey_first5_last5, untrusted_display_bounded,
-};
+use stellar_agent_core::observability::{RedactedStrkey, redact_strkey_first5_last5};
 use stellar_agent_core::scval::scval_variant_name;
 use stellar_agent_core::smart_account::rule_id::ContextRuleId;
 use stellar_agent_network::signing::Signer;
@@ -1668,8 +1666,9 @@ impl ContextRuleManager {
     ///   at stage `rule_lock` a rule's lock not acquired within the signers
     ///   manager's timeout.
     /// - [`SaError::DeploymentFailed`]: simulate or submit failure.
-    ///   On simulate failure the `redacted_reason` is augmented with the OZ
-    ///   symbolic error name via `augment_with_oz_error_name`; notably
+    ///   On simulate failure the `redacted_reason` is the
+    ///   `SimulationErrorClass` of the error, with the OZ symbolic name of
+    ///   a known contract error code; notably
     ///   `TooManyPolicies = 3011` (the on-chain defence for a bypassed CLI cap),
     ///   or the pinned rule's policies could not be read.
     /// - [`SaError::AuditLog`]: the pin record or the state row could not be
@@ -3004,7 +3003,7 @@ impl ContextRuleManager {
     async fn simulate_read_only(
         &self,
         smart_account: ScAddress,
-        entrypoint: &str,
+        entrypoint: &'static str,
         invoke_args: Vec<ScVal>,
         source_account_strkey: &str,
     ) -> Result<ScVal, SaError> {
@@ -3061,10 +3060,7 @@ impl ContextRuleManager {
         if let Some(sim_error) = &sim_response.error {
             return Err(SaError::DeploymentFailed {
                 phase: "simulate",
-                redacted_reason: format!(
-                    "{entrypoint} simulation returned error: {}",
-                    augment_with_oz_error_name(sim_error)
-                ),
+                redacted_reason: read_only_simulation_reason(entrypoint, sim_error),
             });
         }
 
@@ -3987,13 +3983,10 @@ pub fn context_rule_definition_from_snapshot(
         }
         RuleProposalContextType::CreateContract { wasm_hash_hex } => {
             let bytes = hex::decode(wasm_hash_hex)
-                .map_err(|e| err(format!("context_type.wasm_hash_hex: not valid hex: {e}")))?;
-            let wasm_hash: [u8; 32] = bytes.try_into().map_err(|v: Vec<u8>| {
-                err(format!(
-                    "context_type.wasm_hash_hex: decoded to {} bytes, expected 32",
-                    v.len()
-                ))
-            })?;
+                .map_err(|_| err("wasm_hash_hex must be 64 hexadecimal characters".to_owned()))?;
+            let wasm_hash: [u8; 32] = bytes
+                .try_into()
+                .map_err(|_| err("wasm_hash_hex must be 64 hexadecimal characters".to_owned()))?;
             RuleContext::CreateContract { wasm_hash }
         }
         // `RuleProposalContextType` is `#[non_exhaustive]` in
@@ -4049,9 +4042,9 @@ pub fn context_rule_definition_from_snapshot(
         use base64::Engine as _;
         let decoded_xdr = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .decode(&p.params_xdr_b64)
-            .map_err(|e| {
+            .map_err(|_| {
                 err(format!(
-                    "policies[{idx}].params_xdr_b64: not valid base64: {e}"
+                    "policies[{idx}]: params_xdr_b64 must be URL-safe base64 without padding"
                 ))
             })?;
         let params = ScVal::from_xdr(
@@ -4061,9 +4054,9 @@ pub fn context_rule_definition_from_snapshot(
                 len: 10 * 1024 * 1024,
             },
         )
-        .map_err(|e| {
+        .map_err(|_| {
             err(format!(
-                "policies[{idx}].params_xdr_b64: XDR decode failed: {e:?}"
+                "policies[{idx}]: params_xdr_b64 must decode to a single ScVal"
             ))
         })?;
         policies.push(ContextRulePolicy::new(policy_address, params));
@@ -4271,10 +4264,9 @@ fn rule_context_from_context_type_scval(context_type: &ScVal) -> Result<RuleCont
                 ))),
             }
         }
-        other => Err(parse_err(format!(
-            "unknown context_type variant \"{}\"",
-            untrusted_display_bounded(other.as_bytes())
-        ))),
+        _ => Err(parse_err(
+            "context_type variant must be Default, CallContract or CreateContract".to_owned(),
+        )),
     }
 }
 
@@ -4615,16 +4607,198 @@ pub(crate) fn augment_with_oz_error_name(message: &str) -> String {
         let after_hash = &message[start + "Error(Contract, #".len()..];
         if let Some(end) = after_hash.find(')')
             && let Ok(code) = after_hash[..end].parse::<u32>()
+            && let Some(name) = oz_error_name(code)
         {
-            let name = oz_smart_account_error_name(code)
-                .or_else(|| oz_spending_limit_policy_error_name(code))
-                .or_else(|| oz_timelock_error_name(code));
-            if let Some(name) = name {
-                return format!("{message} [OZ:{name}]");
-            }
+            return format!("{message} [OZ:{name}]");
         }
     }
     message.to_owned()
+}
+
+/// The symbolic OZ name of the contract error `code`, from the
+/// `SmartAccountError`, `SpendingLimitError` and `TimelockError` ranges.
+fn oz_error_name(code: u32) -> Option<&'static str> {
+    oz_smart_account_error_name(code)
+        .or_else(|| oz_spending_limit_policy_error_name(code))
+        .or_else(|| oz_timelock_error_name(code))
+}
+
+/// The discriminants of the `SmartAccountError`, `SpendingLimitError` and
+/// `TimelockError` ranges; [`oz_error_name`] names the known ones.
+fn oz_error_codes() -> impl Iterator<Item = u32> {
+    (3000..=3016).chain(3220..=3227).chain(4000..=4006)
+}
+
+/// The `ScErrorType` names other than `Contract`, as the host renders them
+/// in `Error(<type>, <code>)`.
+const HOST_ERROR_TYPES: [&str; 9] = [
+    "WasmVm", "Context", "Storage", "Object", "Crypto", "Events", "Budget", "Value", "Auth",
+];
+
+/// The `ScErrorCode` names, as the host renders them in
+/// `Error(<type>, <code>)` for every error type other than `Contract`.
+const HOST_ERROR_CODES: [&str; 10] = [
+    "ArithDomain",
+    "IndexBounds",
+    "InvalidInput",
+    "MissingValue",
+    "ExistingValue",
+    "ExceededLimit",
+    "InvalidAction",
+    "InternalError",
+    "UnexpectedType",
+    "UnexpectedSize",
+];
+
+/// The `get_context_rule` refusal of a rule id that names no rule on chain.
+pub(crate) const GET_CONTEXT_RULE_NOT_FOUND: &str =
+    "get_context_rule: rule_id must identify an existing on-chain rule [OZ:ContextRuleNotFound]";
+
+/// The OZ `SmartAccountError::ContextRuleNotFound` discriminant.
+const CONTEXT_RULE_NOT_FOUND_CODE: u32 = 3000;
+
+/// The fixed class of a simulation error text.
+///
+/// The classes, in precedence order: the first contract error code, the
+/// first host error, the first OZ error name, unclassified.
+///
+/// A simulation error is text from the RPC endpoint. Its diagnostic event
+/// log renders the invocation's arguments (`fn_call` data), among them
+/// values a check in the same call refuses, such as a rule id that names no
+/// rule. No such text is logged or retained: an error, a log event or a
+/// retained source holds only this class, built from the error's numeric
+/// code and fixed names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SimulationErrorClass {
+    /// The first `Error(Contract, #<code>)` the text names, with the OZ name
+    /// of `code` when it is a known discriminant.
+    Contract {
+        /// The contract error code.
+        code: u32,
+        /// The symbolic OZ name of `code`.
+        name: Option<&'static str>,
+    },
+    /// The first OZ error name the text holds as a whole word, when it
+    /// names no contract error code and no host error.
+    ContractNamed {
+        /// The symbolic OZ name.
+        name: &'static str,
+    },
+    /// The first `Error(<type>, <code>)` the text names in the host's fixed
+    /// vocabulary, when it names no contract error code.
+    Host {
+        /// The `ScErrorType` name.
+        error_type: &'static str,
+        /// The `ScErrorCode` name.
+        code: &'static str,
+    },
+    /// The text names no error in either vocabulary.
+    Unclassified,
+}
+
+impl SimulationErrorClass {
+    /// Classifies the simulation error text `raw`.
+    pub(crate) fn of(raw: &str) -> Self {
+        if let Some(code) = first_contract_error_code(raw) {
+            return Self::Contract {
+                code,
+                name: oz_error_name(code),
+            };
+        }
+        if let Some((error_type, code)) = first_host_error(raw) {
+            return Self::Host { error_type, code };
+        }
+        first_oz_error_name(raw).map_or(Self::Unclassified, |name| Self::ContractNamed { name })
+    }
+
+    /// Whether the class is OZ `SmartAccountError::ContextRuleNotFound`, by
+    /// its code or by its name.
+    fn is_context_rule_not_found(self) -> bool {
+        match self {
+            Self::Contract { code, .. } => code == CONTEXT_RULE_NOT_FOUND_CODE,
+            Self::ContractNamed { name } => {
+                oz_error_name(CONTEXT_RULE_NOT_FOUND_CODE) == Some(name)
+            }
+            Self::Host { .. } | Self::Unclassified => false,
+        }
+    }
+}
+
+impl std::fmt::Display for SimulationErrorClass {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Contract {
+                code,
+                name: Some(name),
+            } => write!(f, "Error(Contract, #{code}) [OZ:{name}]"),
+            Self::Contract { code, name: None } => write!(f, "Error(Contract, #{code})"),
+            Self::ContractNamed { name } => write!(f, "[OZ:{name}]"),
+            Self::Host { error_type, code } => write!(f, "Error({error_type}, {code})"),
+            Self::Unclassified => f.write_str("unclassified error"),
+        }
+    }
+}
+
+/// The code of the first `Error(Contract, #<code>)` in `raw` whose code is a
+/// `u32`.
+fn first_contract_error_code(raw: &str) -> Option<u32> {
+    const PREFIX: &str = "Error(Contract, #";
+    raw.match_indices(PREFIX).find_map(|(start, _)| {
+        let rest = &raw[start + PREFIX.len()..];
+        let end = rest.find(')')?;
+        rest[..end].parse::<u32>().ok()
+    })
+}
+
+/// The known OZ error name that `raw` holds first as a whole word: bounded on
+/// each side by the text's end or by a character that is neither
+/// alphanumeric nor `_`.
+fn first_oz_error_name(raw: &str) -> Option<&'static str> {
+    let is_word_char = |c: char| c.is_alphanumeric() || c == '_';
+    oz_error_codes()
+        .filter_map(oz_error_name)
+        .filter_map(|name| {
+            raw.match_indices(name)
+                .find(|(start, _)| {
+                    let before = raw[..*start].chars().next_back();
+                    let after = raw[start + name.len()..].chars().next();
+                    !before.is_some_and(is_word_char) && !after.is_some_and(is_word_char)
+                })
+                .map(|(start, _)| (start, name))
+        })
+        .min_by_key(|(start, _)| *start)
+        .map(|(_, name)| name)
+}
+
+/// The type and code names of the first `Error(<type>, <code>)` in `raw`
+/// whose names are both in the host's fixed vocabulary.
+fn first_host_error(raw: &str) -> Option<(&'static str, &'static str)> {
+    const PREFIX: &str = "Error(";
+    raw.match_indices(PREFIX).find_map(|(start, _)| {
+        let rest = &raw[start + PREFIX.len()..];
+        let (inner, _) = rest.split_once(')')?;
+        let (error_type, code) = inner.split_once(", ")?;
+        let error_type = HOST_ERROR_TYPES.iter().find(|name| **name == error_type)?;
+        let code = HOST_ERROR_CODES.iter().find(|name| **name == code)?;
+        Some((*error_type, *code))
+    })
+}
+
+/// The reason a failed read-only simulation of `entrypoint` carries, from
+/// the simulation error text `raw`.
+///
+/// `get_context_rule` refusing its rule id reads
+/// [`GET_CONTEXT_RULE_NOT_FOUND`]; any other classified failure reads
+/// `<entrypoint> simulation error: <class>`; an unclassified one reads
+/// `<entrypoint> simulation failed`. The reason holds no text of `raw`.
+pub(crate) fn read_only_simulation_reason(entrypoint: &'static str, raw: &str) -> String {
+    match SimulationErrorClass::of(raw) {
+        class if entrypoint == "get_context_rule" && class.is_context_rule_not_found() => {
+            GET_CONTEXT_RULE_NOT_FOUND.to_owned()
+        }
+        SimulationErrorClass::Unclassified => format!("{entrypoint} simulation failed"),
+        class => format!("{entrypoint} simulation error: {class}"),
+    }
 }
 
 /// Casts the simulation response's `min_resource_fee` (a u64) down to the u32
@@ -4836,11 +5010,12 @@ fn parse_context_rule_summary(scval: ScVal, rule_id: u32) -> Result<ContextRuleS
                             "Default" => "default",
                             "CallContract" => "call_contract",
                             "CreateContract" => "create_contract",
-                            other => {
-                                return Err(parse_err(format!(
-                                    "context_type: unknown variant \"{}\"",
-                                    untrusted_display_bounded(other.as_bytes())
-                                )));
+                            _ => {
+                                return Err(parse_err(
+                                    "context_type: variant must be Default, CallContract or \
+                                     CreateContract"
+                                        .to_owned(),
+                                ));
                             }
                         },
                         other => {
@@ -5405,7 +5580,7 @@ pub(crate) fn sa_error_to_invocation_result(
                 R::SimulationFailed
                 | R::AuditWriterPoisoned
                 | R::OperationNotReady { .. }
-                | R::OperationIdMismatch { .. } => SaInvocationResult::PreSubmissionRefused,
+                | R::OperationIdMismatch => SaInvocationResult::PreSubmissionRefused,
                 // Tx submitted and confirmed; OZ OperationExecuted event absent
                 // from tx meta.
                 R::EventConfirmationMissing => SaInvocationResult::PostSubmitVerificationFailed,
@@ -5571,15 +5746,21 @@ async fn verify_kind_pins(
                         .push(non_wasm_executable_summary(executable));
                 }
             }
-            (PinnedKind::Verifier, Err(SaError::VerifierHashDrift { observed_hash, .. }))
-            | (PinnedKind::Policy, Err(SaError::PolicyHashDrift { observed_hash, .. })) => {
+            // The drift error holds no part of the observed executable; the
+            // report, the operator's drift inspection, reads it from the
+            // cache, which the check filled before it compared.
+            (PinnedKind::Verifier, Err(SaError::VerifierHashDrift { .. }))
+            | (PinnedKind::Policy, Err(SaError::PolicyHashDrift { .. })) => {
                 report.status = PinStatus::Drift;
-                report.observed_hashes.push(observed_hash);
-                report.observed_executable.push(
-                    wasm_hash_cache
-                        .get(&cache_key)
-                        .and_then(non_wasm_executable_summary),
+                let executable = wasm_hash_cache.get(&cache_key);
+                report.observed_hashes.push(
+                    executable
+                        .and_then(crate::managers::signers::ObservedExecutable::effective_hash)
+                        .map(WasmHashPin::new),
                 );
+                report
+                    .observed_executable
+                    .push(executable.and_then(non_wasm_executable_summary));
             }
             // A live verifier the record does not pin is drift with no
             // observed hash: the check refused before reading the verifier.
@@ -5718,6 +5899,54 @@ mod tests {
             redacted_reason.starts_with("signers[1].address: "),
             "{redacted_reason}"
         );
+    }
+
+    /// A snapshot field that fails its check is refused with the check at
+    /// the computed policy position, and holds no decoder diagnostic.
+    #[test]
+    fn rule_snapshot_refusals_hold_no_decoder_diagnostic() {
+        use stellar_agent_core::approval::{RuleProposalContextType, RuleProposalPolicy};
+
+        let reason_of = |error: SaError| match error {
+            SaError::AuthEntryConstructionFailed {
+                stage,
+                redacted_reason,
+            } => {
+                assert_eq!(stage, "rule_definition_snapshot");
+                redacted_reason
+            }
+            other => panic!("unexpected refusal: {other:?}"),
+        };
+
+        for wasm_hash_hex in ["~".repeat(64), "ab".repeat(31)] {
+            let mut snapshot = snapshot_with_delegates(&[SIMULATE_SENTINEL_G]);
+            snapshot.context_type = RuleProposalContextType::CreateContract { wasm_hash_hex };
+            let error = context_rule_definition_from_snapshot(&snapshot).unwrap_err();
+            assert_eq!(
+                reason_of(error),
+                "wasm_hash_hex must be 64 hexadecimal characters"
+            );
+        }
+
+        let policy = stellar_strkey::Contract([0x32; 32]).to_string();
+        for (params_xdr_b64, expected) in [
+            (
+                "~",
+                "policies[0]: params_xdr_b64 must be URL-safe base64 without padding",
+            ),
+            (
+                "AAAA",
+                "policies[0]: params_xdr_b64 must decode to a single ScVal",
+            ),
+        ] {
+            let mut snapshot = snapshot_with_delegates(&[SIMULATE_SENTINEL_G]);
+            snapshot.policies = vec![RuleProposalPolicy::new(
+                policy.as_str().to_owned(),
+                params_xdr_b64.to_owned(),
+            )];
+            let error = context_rule_definition_from_snapshot(&snapshot).unwrap_err();
+            assert_eq!(reason_of(error), expected);
+        }
     }
 
     /// `parse_delegated_signer_address` reads a G-strkey as an account and a
@@ -6297,6 +6526,151 @@ mod tests {
         assert_eq!(augmented, msg, "OZ v0.7.2 skips 3001; must not annotate");
     }
 
+    /// A host error rendering whose diagnostic event log carries the
+    /// invocation's arguments in `fn_call` data; `error` is the host error
+    /// line.
+    fn host_error_with_arguments(error: &str) -> String {
+        format!(
+            "transaction simulation failed: host invocation failed\n\nCaused by:\n    \
+             HostError: {error}\n\n    Event log (newest first):\n       \
+             0: [Diagnostic Event] topics:[error, {error}], data:\"escalating error\"\n       \
+             1: [Diagnostic Event] topics:[fn_call, CAAAA, add_context_rule], \
+             data:[\"{SIMULATION_ARGUMENT_MARKER}\", 2718281828]\n"
+        )
+    }
+
+    /// A value a test passes as an invocation argument the simulation
+    /// renders in its diagnostic event log.
+    const SIMULATION_ARGUMENT_MARKER: &str = "SIMARGMARKER7";
+
+    /// The class of a simulation error is the first contract error code with
+    /// its OZ name, else the first host error in the fixed vocabulary, else
+    /// unclassified; no class holds an argument the event log renders.
+    #[test]
+    fn simulation_error_class_holds_only_the_code_and_fixed_names() {
+        let cases = [
+            (
+                host_error_with_arguments("Error(Contract, #3015)"),
+                "Error(Contract, #3015) [OZ:NameTooLong]",
+            ),
+            (
+                host_error_with_arguments("Error(Contract, #3210)"),
+                "Error(Contract, #3210)",
+            ),
+            (
+                host_error_with_arguments("Error(Budget, ExceededLimit)"),
+                "Error(Budget, ExceededLimit)",
+            ),
+            (
+                format!(
+                    "Error({SIMULATION_ARGUMENT_MARKER}, InvalidInput) then \
+                     Error(Storage, {SIMULATION_ARGUMENT_MARKER}) then \
+                     Error(Storage, MissingValue)"
+                ),
+                "Error(Storage, MissingValue)",
+            ),
+            (
+                format!("Error(Contract, #{SIMULATION_ARGUMENT_MARKER}) Error(Contract, #4004)"),
+                "Error(Contract, #4004) [OZ:Unauthorized]",
+            ),
+            (
+                format!("ContextRuleNotFound: rule {SIMULATION_ARGUMENT_MARKER} not found"),
+                "[OZ:ContextRuleNotFound]",
+            ),
+            (
+                format!("{SIMULATION_ARGUMENT_MARKER}UnauthorizedSigner_x Unauthorized"),
+                "[OZ:Unauthorized]",
+            ),
+            (
+                format!("transaction {SIMULATION_ARGUMENT_MARKER} is malformed"),
+                "unclassified error",
+            ),
+        ];
+        for (raw, expected) in &cases {
+            let class = SimulationErrorClass::of(raw).to_string();
+            assert_eq!(class, *expected, "class of {raw:?}");
+            assert!(!class.contains(SIMULATION_ARGUMENT_MARKER));
+            assert!(!class.contains("2718281828"));
+        }
+    }
+
+    /// A text that names several classes is classified by precedence, not by
+    /// position: a contract error code before a host error, a host error
+    /// before an OZ name. Each lower class precedes the higher one in the
+    /// text.
+    #[test]
+    fn simulation_error_class_precedence_is_code_then_host_then_name() {
+        let cases = [
+            (
+                format!(
+                    "Unauthorized for {SIMULATION_ARGUMENT_MARKER}: Error(Budget, ExceededLimit) \
+                     then Error(Contract, #3006)"
+                ),
+                "Error(Contract, #3006) [OZ:SignerNotFound]",
+            ),
+            (
+                format!(
+                    "ContextRuleNotFound for {SIMULATION_ARGUMENT_MARKER}: \
+                     Error(Storage, MissingValue)"
+                ),
+                "Error(Storage, MissingValue)",
+            ),
+            (
+                format!("SignerNotFound for {SIMULATION_ARGUMENT_MARKER}"),
+                "[OZ:SignerNotFound]",
+            ),
+        ];
+        for (raw, expected) in &cases {
+            let class = SimulationErrorClass::of(raw).to_string();
+            assert_eq!(class, *expected, "class of {raw:?}");
+            assert!(!class.contains(SIMULATION_ARGUMENT_MARKER));
+        }
+    }
+
+    /// A read-only simulation's reason: the fixed `get_context_rule`
+    /// refusal for `ContextRuleNotFound`, the class for any other classified
+    /// error, and `<entrypoint> simulation failed` otherwise.
+    #[test]
+    fn read_only_simulation_reason_is_the_fixed_class() {
+        assert_eq!(
+            read_only_simulation_reason(
+                "get_context_rule",
+                &host_error_with_arguments("Error(Contract, #3000)")
+            ),
+            "get_context_rule: rule_id must identify an existing on-chain rule \
+             [OZ:ContextRuleNotFound]"
+        );
+        assert_eq!(
+            read_only_simulation_reason(
+                "get_context_rule",
+                &host_error_with_arguments("Error(Contract, #3006)")
+            ),
+            "get_context_rule simulation error: Error(Contract, #3006) [OZ:SignerNotFound]"
+        );
+        assert_eq!(
+            read_only_simulation_reason(
+                "get_context_rules_count",
+                &host_error_with_arguments("Error(Contract, #3000)")
+            ),
+            "get_context_rules_count simulation error: Error(Contract, #3000) \
+             [OZ:ContextRuleNotFound]"
+        );
+        assert_eq!(
+            read_only_simulation_reason(
+                "get_context_rule",
+                &format!("ContextRuleNotFound: rule {SIMULATION_ARGUMENT_MARKER}")
+            ),
+            GET_CONTEXT_RULE_NOT_FOUND
+        );
+        assert_eq!(
+            read_only_simulation_reason(
+                "get_context_rule",
+                &format!("node answered {SIMULATION_ARGUMENT_MARKER}")
+            ),
+            "get_context_rule simulation failed"
+        );
+    }
+
     // ── OZ caps panic discriminant mapping ────────────────────────────────────
     //
     // These tests are placed in this internal `#[cfg(test)]` block rather than
@@ -6874,7 +7248,6 @@ mod tests {
             let err = SaError::TimelockCancelFailed {
                 failure_reason: reason.clone(),
                 redacted_reason: "test".to_owned(),
-                operation_id_redacted: "aaaa...bbbb".to_owned(),
                 request_id: "req-test".to_owned(),
             };
             assert!(
@@ -6897,7 +7270,6 @@ mod tests {
         let err = SaError::TimelockCancelFailed {
             failure_reason: R::EventConfirmationMissing,
             redacted_reason: "test".to_owned(),
-            operation_id_redacted: "aaaa...bbbb".to_owned(),
             request_id: "req-test".to_owned(),
         };
         assert!(
@@ -6926,7 +7298,6 @@ mod tests {
             let err = SaError::TimelockCancelFailed {
                 failure_reason: reason.clone(),
                 redacted_reason: "test".to_owned(),
-                operation_id_redacted: "aaaa...bbbb".to_owned(),
                 request_id: "req-test".to_owned(),
             };
             assert!(
@@ -6955,16 +7326,12 @@ mod tests {
                 current_ledger: Some(100),
                 ready_ledger: 200,
             },
-            R::OperationIdMismatch {
-                user_supplied: "aaaa".to_owned(),
-                simulate_derived: "bbbb".to_owned(),
-            },
+            R::OperationIdMismatch,
         ];
         for reason in &reasons {
             let err = SaError::TimelockExecuteFailed {
                 failure_reason: reason.clone(),
                 redacted_reason: "test".to_owned(),
-                operation_id_redacted: "aaaa...bbbb".to_owned(),
                 request_id: "req-test".to_owned(),
             };
             assert!(
@@ -6987,7 +7354,6 @@ mod tests {
         let err = SaError::TimelockExecuteFailed {
             failure_reason: R::EventConfirmationMissing,
             redacted_reason: "test".to_owned(),
-            operation_id_redacted: "aaaa...bbbb".to_owned(),
             request_id: "req-test".to_owned(),
         };
         assert!(
@@ -7015,7 +7381,6 @@ mod tests {
             let err = SaError::TimelockExecuteFailed {
                 failure_reason: reason.clone(),
                 redacted_reason: "test".to_owned(),
-                operation_id_redacted: "aaaa...bbbb".to_owned(),
                 request_id: "req-test".to_owned(),
             };
             assert!(
@@ -7443,10 +7808,10 @@ mod tests {
         assert!(!redacted_reason.contains("ZZZZ"));
     }
 
-    /// An unknown context-type tag renders through the bounded untrusted
-    /// renderer, so a control character in the ledger symbol is escaped.
+    /// An unknown context-type tag is not rendered: the reason is the fixed
+    /// text naming the accepted variants.
     #[test]
-    fn rule_context_decode_unknown_tag_is_rendered_escaped() {
+    fn rule_context_decode_unknown_tag_is_not_rendered() {
         let bogus = ScVal::Vec(Some(ScVec(
             vec![ScVal::Symbol(ScSymbol(
                 b"Bad\ntag".to_vec().try_into().unwrap(),
@@ -7464,7 +7829,8 @@ mod tests {
         };
         assert_eq!(
             redacted_reason,
-            "decode context_type: unknown context_type variant \"Bad\\ntag\""
+            "decode context_type: context_type variant must be Default, CallContract or \
+             CreateContract"
         );
     }
 
@@ -8368,6 +8734,20 @@ mod tests {
             deployment_failed_reason(&err),
             "parse ContextRule id=3: get_context_rule: policies[0] is not an Address: Void"
         );
+    }
+
+    /// The summary refuses an unknown context-type tag with the fixed text
+    /// naming the accepted variants; the tag is not rendered.
+    #[test]
+    fn parse_context_rule_summary_refuses_an_unknown_context_type_without_the_tag() {
+        let scval = synthetic_context_rule_scval(3, "my-rule", "FutureCTXMARKER7", 0, 1, None);
+        let err = parse_context_rule_summary(scval, 3).unwrap_err();
+        assert_eq!(
+            deployment_failed_reason(&err),
+            "parse ContextRule id=3: context_type: variant must be Default, CallContract or \
+             CreateContract"
+        );
+        assert!(!format!("{err} {err:?}").contains("CTXMARKER7"));
     }
 
     /// The summary refuses a `policy_ids` list that repeats an id.

@@ -32,7 +32,7 @@
 //! returns `AuthError::SignerKeyMismatch`, ensuring no RPC or network call
 //! proceeds if the key doesn't match the claimed source.
 
-use stellar_agent_core::error::{AuthError, ValidationError, WalletError};
+use stellar_agent_core::error::{AuthError, KeyringMissingCause, ValidationError, WalletError};
 use zeroize::Zeroizing;
 
 use crate::signing::Signer;
@@ -50,24 +50,24 @@ use crate::signing::software::SoftwareSigningKey;
 /// descriptor lets the inner helper construct the correct typed error directly,
 /// removing the fragile "match on a magic error string" rewrap each caller used
 /// to apply.
-pub(crate) enum SecretStrkeySource<'a> {
+pub(crate) enum SecretStrkeySource {
     /// The S-strkey was read from the named environment variable. A parse
     /// failure classifies as [`ValidationError::SecretEnvInvalid`].
     EnvVar,
-    /// The S-strkey was read from the named keyring entry (service alias). A
-    /// parse failure classifies as [`AuthError::KeyringNotFound`] naming the
-    /// entry — the keyring stored an unparseable value.
-    KeyringEntry(&'a str),
+    /// The S-strkey was read from a keyring entry. A parse failure classifies
+    /// as [`AuthError::KeyringNotFound`] with
+    /// [`KeyringMissingCause::InvalidSecret`]: the keyring stored an
+    /// unparseable value.
+    KeyringEntry,
 }
 
-impl SecretStrkeySource<'_> {
-    /// Builds the classification error for an S-strkey that failed to parse,
-    /// naming the keyring service only for keyring failures, never the value.
+impl SecretStrkeySource {
+    /// Builds the classification error for an S-strkey that failed to parse.
     fn invalid_strkey_error(&self) -> WalletError {
         match self {
             Self::EnvVar => WalletError::Validation(ValidationError::SecretEnvInvalid),
-            Self::KeyringEntry(service) => WalletError::Auth(AuthError::KeyringNotFound {
-                name: format!("keyring entry '{service}' contains an invalid S-strkey"),
+            Self::KeyringEntry => WalletError::Auth(AuthError::KeyringNotFound {
+                cause: KeyringMissingCause::InvalidSecret,
             }),
         }
     }
@@ -98,7 +98,7 @@ impl SecretStrkeySource<'_> {
 pub(crate) async fn signer_from_s_strkey(
     s_strkey: Zeroizing<String>,
     expected_source_g: &str,
-    source: SecretStrkeySource<'_>,
+    source: SecretStrkeySource,
 ) -> Result<SoftwareSigningKey, WalletError> {
     // stellar_strkey::ed25519::PrivateKey is Copy and has no Drop/Zeroize.
     // Parse the S-strkey, immediately copy the 32-byte seed into a Zeroizing
@@ -305,21 +305,20 @@ mod tests {
     #[tokio::test]
     async fn keyring_source_invalid_sstrkey_returns_keyring_not_found() {
         // With the keyring-entry source, the same parse failure classifies as a
-        // genuine keyring-content condition naming the service alias.
+        // genuine keyring-content condition.
         let bad = Zeroizing::new("not-a-valid-strkey".to_owned());
-        let result = signer_from_s_strkey(
-            bad,
-            "GDUMMY",
-            SecretStrkeySource::KeyringEntry("stellar-agent-signer"),
-        )
-        .await;
+        let result = signer_from_s_strkey(bad, "GDUMMY", SecretStrkeySource::KeyringEntry).await;
         let err = match result {
             Err(e) => e,
             Ok(_) => panic!("expected Err"),
         };
         assert_eq!(err.category(), ErrorCategory::Auth);
         assert_eq!(err.code(), "auth.keyring_not_found");
-        assert!(err.message().contains("stellar-agent-signer"));
+        assert_eq!(
+            err.message(),
+            "the configured keyring entry must hold an S-strkey; provision or select the \
+             required entry."
+        );
     }
 
     #[tokio::test]

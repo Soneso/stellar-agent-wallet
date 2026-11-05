@@ -58,6 +58,8 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
+use crate::redact::describe_json_error;
+
 use super::{
     binding::BindingHistory,
     chain::{
@@ -442,9 +444,7 @@ fn verify_walk(
                 // log is a user-actionable condition (nothing logged yet, or a
                 // wrong path), not an ambient I/O failure — surface it via the
                 // dedicated `LogNotFound` variant so it classifies distinctly.
-                return Err(VerifyError::LogNotFound {
-                    path: path.display().to_string(),
-                });
+                return Err(VerifyError::LogNotFound);
             }
             // A rotated file referenced by the chain does not exist.
             let basename = path
@@ -1000,7 +1000,7 @@ fn verify_single_file(
         let entry: AuditEntry =
             serde_json::from_str(line).map_err(|e| VerifyError::ParseError {
                 line: line_number,
-                detail: e.to_string(),
+                detail: format!("the entry {}", describe_json_error(&e)),
             })?;
 
         let current_ts_ms =
@@ -1765,9 +1765,7 @@ fn read_bounded(reader: impl Read, cap: u64) -> std::io::Result<Option<Vec<u8>>>
 /// platform the opened handle must then be a regular file. A refusal is
 /// [`VerifyError::NonRegularFileLogPath`].
 pub(super) fn open_regular_file(path: &Path) -> Result<File, VerifyError> {
-    let non_regular = || VerifyError::NonRegularFileLogPath {
-        path: path.to_path_buf(),
-    };
+    let non_regular = || VerifyError::NonRegularFileLogPath;
     #[cfg(unix)]
     let file = {
         use std::os::unix::fs::OpenOptionsExt as _;
@@ -2117,12 +2115,11 @@ pub enum VerifyError {
     ///
     /// Rejecting directories and symlinks before open closes the symlink-redirect
     /// attack surface where `audit verify` could be pointed at an arbitrary file.
-    /// Display emits the basename only to avoid leaking full filesystem paths.
-    #[error("audit.non_regular_file_log_path: {}", basename_lossy(path))]
-    NonRegularFileLogPath {
-        /// Rejected path. Display uses only the basename.
-        path: PathBuf,
-    },
+    #[error(
+        "audit.non_regular_file_log_path: log_path must name a regular audit log file; choose a \
+         regular file and retry audit verify."
+    )]
+    NonRegularFileLogPath,
 
     /// A JSON line could not be parsed.
     ///
@@ -2157,11 +2154,11 @@ pub enum VerifyError {
     /// than an internal invariant violation.
     ///
     /// Wire code: `audit.log_not_found`.
-    #[error("audit.log_not_found: audit log not found at {path}")]
-    LogNotFound {
-        /// Display path of the missing primary audit-log file.
-        path: String,
-    },
+    #[error(
+        "audit.log_not_found: log_path must name an existing audit log file; choose an existing \
+         file and retry audit verify."
+    )]
+    LogNotFound,
 
     /// An I/O error occurred while reading the log.
     ///
@@ -2357,6 +2354,7 @@ mod tests {
     use std::cell::RefCell;
     use std::fs;
     use std::rc::Rc;
+    use stellar_agent_test_support::rejected_value::assert_no_marker;
     use tempfile::TempDir;
     use zeroize::Zeroizing;
 
@@ -3953,7 +3951,7 @@ mod tests {
         let result = verify_log(dir.path(), None);
 
         assert!(
-            matches!(result, Err(VerifyError::NonRegularFileLogPath { .. })),
+            matches!(result, Err(VerifyError::NonRegularFileLogPath)),
             "expected NonRegularFileLogPath for directory, got {result:?}"
         );
     }
@@ -3972,7 +3970,7 @@ mod tests {
         let result = verify_log(&link, None);
 
         assert!(
-            matches!(result, Err(VerifyError::NonRegularFileLogPath { .. })),
+            matches!(result, Err(VerifyError::NonRegularFileLogPath)),
             "expected NonRegularFileLogPath for symlink, got {result:?}"
         );
     }
@@ -4189,10 +4187,7 @@ mod tests {
             "audit.too_many_rotated_files"
         );
         assert_eq!(
-            VerifyError::NonRegularFileLogPath {
-                path: PathBuf::from("/tmp/f.jsonl")
-            }
-            .wire_code(),
+            VerifyError::NonRegularFileLogPath.wire_code(),
             "audit.non_regular_file_log_path"
         );
         assert_eq!(
@@ -5482,16 +5477,11 @@ mod tests {
     }
 
     #[test]
-    fn verify_error_non_regular_file_log_path_display_basename_only() {
-        // Display must emit only the basename, not the full path.
-        let err = VerifyError::NonRegularFileLogPath {
-            path: PathBuf::from("/home/user/very/secret/path/audit.jsonl"),
-        };
-        let s = err.to_string();
-        assert!(s.contains("audit.jsonl"), "must contain basename: {s}");
-        assert!(
-            !s.contains("/home/user/very"),
-            "must NOT contain full path: {s}"
+    fn verify_error_non_regular_file_log_path_states_the_rule() {
+        assert_eq!(
+            VerifyError::NonRegularFileLogPath.to_string(),
+            "audit.non_regular_file_log_path: log_path must name a regular audit log file; \
+             choose a regular file and retry audit verify."
         );
     }
 
@@ -5600,13 +5590,71 @@ mod tests {
 
         let result = verify_log(&path, None);
         assert!(
-            matches!(result, Err(VerifyError::LogNotFound { .. })),
+            matches!(result, Err(VerifyError::LogNotFound)),
             "missing primary log file must return LogNotFound, got {result:?}"
         );
         assert_eq!(
             result.unwrap_err().wire_code(),
             "audit.log_not_found",
             "missing primary log must carry the audit.log_not_found wire code"
+        );
+    }
+
+    /// A log path that fails a check stays out of the refusal in every
+    /// rendering; each message states the rule and the remedy.
+    #[test]
+    fn refused_log_paths_stay_out_of_the_error() {
+        const MISSING: &str = "audit.log_not_found: log_path must name an existing audit log \
+                               file; choose an existing file and retry audit verify.";
+        const NON_REGULAR: &str = "audit.non_regular_file_log_path: log_path must name a regular \
+                                   audit log file; choose a regular file and retry audit verify.";
+        let dir = TempDir::new().unwrap();
+        let missing = dir.path().join("credmarker7-missing.jsonl");
+        let error = verify_log(&missing, None).unwrap_err();
+        assert_eq!(error.to_string(), MISSING);
+        assert_no_marker(&error, "credmarker7");
+
+        let directory = dir.path().join("credmarker7-directory.jsonl");
+        fs::create_dir(&directory).unwrap();
+        let error = verify_log(&directory, None).unwrap_err();
+        assert_eq!(error.to_string(), NON_REGULAR);
+        assert_no_marker(&error, "credmarker7");
+
+        #[cfg(unix)]
+        {
+            let target = dir.path().join("target.jsonl");
+            fs::write(&target, b"").unwrap();
+            let link = dir.path().join("credmarker7-link.jsonl");
+            std::os::unix::fs::symlink(&target, &link).unwrap();
+            let error = verify_log(&link, None).unwrap_err();
+            assert_eq!(error.to_string(), NON_REGULAR);
+            assert_no_marker(&error, "credmarker7");
+        }
+    }
+
+    /// A stored line that fails its schema reports the category and position,
+    /// never the refused value.
+    #[test]
+    fn unparsable_entry_reports_category_and_position_only() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        fs::write(
+            &path,
+            format!(
+                "{}\n",
+                crate::audit_log::test_helpers::line_refused_by_the_schema("credmarker7")
+            ),
+        )
+        .unwrap();
+        let error = verify_log(&path, None).unwrap_err();
+        assert_no_marker(&error, "credmarker7");
+        let text = error.to_string();
+        assert!(
+            text.starts_with(
+                "audit.parse_error: line 1: the entry has a missing field or a field of the \
+                 wrong type or value (line 1, column "
+            ),
+            "{text}"
         );
     }
 
@@ -5829,13 +5877,11 @@ mod tests {
 
     // ── Regular-file open ─────────────────────────────────────────────────────
 
-    fn assert_refused_as_non_regular(result: Result<File, VerifyError>, path: &Path) {
-        match result {
-            Err(VerifyError::NonRegularFileLogPath { path: refused }) => {
-                assert_eq!(refused, path);
-            }
-            other => panic!("expected a non-regular-file refusal, got {other:?}"),
-        }
+    fn assert_refused_as_non_regular(result: &Result<File, VerifyError>) {
+        assert!(
+            matches!(result, Err(VerifyError::NonRegularFileLogPath)),
+            "expected a non-regular-file refusal, got {result:?}"
+        );
     }
 
     #[test]
@@ -5856,7 +5902,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("directory");
         fs::create_dir(&path).unwrap();
-        assert_refused_as_non_regular(open_regular_file(&path), &path);
+        assert_refused_as_non_regular(&open_regular_file(&path));
     }
 
     #[cfg(unix)]
@@ -5867,7 +5913,7 @@ mod tests {
         fs::write(&target, b"bytes").unwrap();
         let link = dir.path().join("link");
         std::os::unix::fs::symlink(&target, &link).unwrap();
-        assert_refused_as_non_regular(open_regular_file(&link), &link);
+        assert_refused_as_non_regular(&open_regular_file(&link));
     }
 
     /// The refusal comes from the open, which never waits for a writer; a
@@ -5888,7 +5934,7 @@ mod tests {
             })
         };
         match opened.recv_timeout(std::time::Duration::from_secs(5)) {
-            Ok(result) => assert_refused_as_non_regular(result, &fifo),
+            Ok(result) => assert_refused_as_non_regular(&result),
             Err(RecvTimeoutError::Disconnected) => match opener.join() {
                 Err(panic) => std::panic::resume_unwind(panic),
                 Ok(()) => panic!("the open thread ended without reporting"),
@@ -5909,7 +5955,7 @@ mod tests {
         fs::write(&target, b"bytes").unwrap();
         let link = dir.path().join("link");
         std::os::windows::fs::symlink_file(&target, &link).unwrap();
-        assert_refused_as_non_regular(open_regular_file(&link), &link);
+        assert_refused_as_non_regular(&open_regular_file(&link));
     }
 
     /// Serves `len` bytes and counts how many a reader asked for.

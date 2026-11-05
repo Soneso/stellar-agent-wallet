@@ -1247,7 +1247,7 @@ async fn detail_page_unknown_nonce_returns_not_found_page() {
     let h = Harness::new("detail-unknown");
     let cookie = h.bootstrap().await;
     let req = Request::builder()
-        .uri("/approval/AAAAAAAAAAAAAAAAAAAAAA")
+        .uri("/approval/credmarker7AAAAAAAAAAA")
         .header(header::HOST, HOST)
         .header(header::COOKIE, &cookie)
         .body(Body::empty())
@@ -1260,6 +1260,9 @@ async fn detail_page_unknown_nonce_returns_not_found_page() {
     let bytes = to_bytes(resp.into_body(), 256 * 1024).await.unwrap();
     let html = std::str::from_utf8(&bytes).unwrap();
     assert!(html.contains("Approval not found"));
+    assert!(html.contains("Approval nonce must identify a pending approval"));
+    assert!(html.contains(r#"href="/inbox""#));
+    assert!(!html.contains("credmarker7"), "{html}");
 }
 
 #[tokio::test]

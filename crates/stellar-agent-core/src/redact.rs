@@ -82,6 +82,35 @@ pub fn redact_url_userinfo(url: &str) -> String {
 pub const CREDENTIALED_URL_INPUT_REFUSAL: &str = "never carries credentials; only a testnet \
      profile file may hold an endpoint URL with a username or password";
 
+/// Describes a `serde_json` parse failure by its category and position.
+///
+/// A `serde_json` error quotes the value, variant or field it refused, so a
+/// file or request that failed to parse reports this text and never the
+/// error itself.
+///
+/// # Examples
+///
+/// ```
+/// use stellar_agent_core::redact::describe_json_error;
+///
+/// let error = serde_json::from_str::<u8>("\"MARKER\"").unwrap_err();
+/// assert_eq!(
+///     describe_json_error(&error),
+///     "has a missing field or a field of the wrong type or value (line 1, column 8)"
+/// );
+/// ```
+#[must_use]
+pub fn describe_json_error(error: &serde_json::Error) -> String {
+    use serde_json::error::Category;
+    let what = match error.classify() {
+        Category::Syntax => "is not valid JSON",
+        Category::Eof => "ends before the value is complete",
+        Category::Data => "has a missing field or a field of the wrong type or value",
+        Category::Io => "could not be read",
+    };
+    format!("{what} (line {}, column {})", error.line(), error.column())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{redact_url_authority, redact_url_userinfo};

@@ -170,8 +170,19 @@ pub struct CaptureWriter {
 /// whenever a test asserts on captured log content. The hand-rolled form is
 /// for a test that must also drive the subscriber or the writer directly.
 pub fn with_captured_logs<F: FnOnce()>(f: F) -> String {
+    capture_at(tracing::Level::INFO, f)
+}
+
+/// [`with_captured_logs`] at the `TRACE` level, for an assertion on a
+/// `debug!` event.
+pub fn with_captured_trace_logs<F: FnOnce()>(f: F) -> String {
+    capture_at(tracing::Level::TRACE, f)
+}
+
+fn capture_at<F: FnOnce()>(level: tracing::Level, f: F) -> String {
     let capture = CaptureWriter::new();
     let subscriber = tracing_subscriber::fmt()
+        .with_max_level(level)
         .with_writer(capture.clone())
         .with_ansi(false)
         .finish();

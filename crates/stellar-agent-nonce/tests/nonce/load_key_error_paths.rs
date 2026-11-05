@@ -25,9 +25,10 @@ use keyring_core::mock;
 use serial_test::serial;
 use stellar_agent_core::error::{AuthError, WalletError};
 use stellar_agent_nonce::{NonceError, NonceMint, rotate_nonce_key};
+use stellar_agent_test_support::rejected_value::assert_no_marker;
 
 use crate::helpers::{
-    StaticCatalogue, far_future_expiry, init_mock, make_profile, now_before_expiry,
+    StaticCatalogue, far_future_expiry, init_mock, make_profile, now_before_expiry, seed_key,
 };
 
 // ─── load_key: missing entry ──────────────────────────────────────────────────
@@ -225,4 +226,55 @@ fn rotate_nonce_key_returns_wallet_error_on_set_password_failure() {
         "a backend NoStorageAccess on the write must classify as \
          KeyringPlatformError, not collapse into not-found; got: {err:?}"
     );
+}
+
+// ─── load_key: rejected coordinates ──────────────────────────────────────────
+
+/// A keyring read refusal names neither coordinate field, in the error, its
+/// `Debug` form or the log, for a missing entry and for an absent store.
+#[test]
+#[serial]
+fn keyring_refusals_hold_no_coordinate() {
+    const MISSING: &str = "keyring error: the configured keyring entry must exist; provision or \
+                           select the required entry.";
+    const NO_STORE: &str = "keyring error: a platform keychain must be available for this \
+                            session; start and unlock macOS Keychain, GNOME Keyring, KWallet, or \
+                            Windows Credential Manager.";
+    init_mock();
+    let profile = make_profile("credmarker7");
+    let mint = NonceMint::from_profile(&profile, "nonce-test").expect("from_profile");
+    let cat = StaticCatalogue(&["stellar_pay"]);
+    let mint_once = || {
+        mint.mint(
+            &cat,
+            b"xdr",
+            now_before_expiry(),
+            far_future_expiry(),
+            "stellar_pay",
+            "stellar:testnet",
+        )
+        .expect_err("the read refuses")
+    };
+
+    let mut missing = None;
+    let logs = stellar_agent_test_support::with_captured_logs(|| missing = Some(mint_once()));
+    let missing = missing.expect("the mint ran");
+    assert_eq!(missing.to_string(), MISSING);
+    assert_no_marker(&missing, "credmarker7");
+    assert!(!logs.contains("credmarker7"), "{logs}");
+
+    seed_key(&profile, &[0xA7; 32]);
+    let coordinate = &profile.mcp_nonce_key_alias;
+    let entry = keyring_core::Entry::new(&coordinate.service, &coordinate.account).unwrap();
+    entry
+        .as_any()
+        .downcast_ref::<mock::Cred>()
+        .expect("mock credential")
+        .set_error(keyring_core::Error::NoDefaultStore);
+    let mut absent = None;
+    let logs = stellar_agent_test_support::with_captured_logs(|| absent = Some(mint_once()));
+    let absent = absent.expect("the mint ran");
+    assert_eq!(absent.to_string(), NO_STORE);
+    assert_no_marker(&absent, "credmarker7");
+    assert!(!logs.contains("credmarker7"), "{logs}");
 }

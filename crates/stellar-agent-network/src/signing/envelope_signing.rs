@@ -23,6 +23,7 @@
 //! which checks a transaction authorization before it touches the signer and
 //! verifies the signature before it attaches it.
 
+use stellar_agent_core::envelope_decode::TRANSACTION_ENVELOPE_XDR_FORM;
 use stellar_agent_core::error::{NetworkError, ProtocolError, WalletError};
 use stellar_agent_core::profile::caip2::Caip2;
 use stellar_xdr::{
@@ -191,9 +192,11 @@ fn decode_envelope(envelope_xdr: &str) -> Result<TransactionEnvelope, WalletErro
         envelope_xdr,
         stellar_agent_xdr_limits::untrusted_decode_limits(envelope_xdr.len()),
     )
-    .map_err(|e| {
+    .map_err(|_| {
         WalletError::Protocol(ProtocolError::XdrCodecFailed {
-            detail: format!("failed to decode TransactionEnvelope: {e}"),
+            detail: format!(
+                "failed to decode TransactionEnvelope: {TRANSACTION_ENVELOPE_XDR_FORM}"
+            ),
         })
     })
 }
@@ -635,14 +638,19 @@ mod tests {
             matches!(
                 &err,
                 WalletError::Protocol(ProtocolError::XdrCodecFailed { detail })
-                    if detail.contains("failed to decode TransactionEnvelope")
+                    if detail == DECODE_REFUSAL
             ),
             "expected XdrCodecFailed with decode message, got: {err:?}"
         );
     }
 
+    /// The decode refusal of both failure classes: it states the accepted form
+    /// and no decoder diagnostic.
+    const DECODE_REFUSAL: &str =
+        "failed to decode TransactionEnvelope: must be base64-encoded TransactionEnvelope XDR";
+
     /// Valid base64 that does not decode to any recognized XDR type returns
-    /// `XdrCodecFailed` with "failed to decode TransactionEnvelope".
+    /// `XdrCodecFailed` with [`DECODE_REFUSAL`].
     #[tokio::test]
     async fn random_base64_not_xdr_returns_xdr_codec_failed() {
         use base64::Engine as _;
@@ -658,7 +666,7 @@ mod tests {
             matches!(
                 &err,
                 WalletError::Protocol(ProtocolError::XdrCodecFailed { detail })
-                    if detail.contains("failed to decode TransactionEnvelope")
+                    if detail == DECODE_REFUSAL
             ),
             "expected XdrCodecFailed for garbage XDR bytes, got: {err:?}"
         );

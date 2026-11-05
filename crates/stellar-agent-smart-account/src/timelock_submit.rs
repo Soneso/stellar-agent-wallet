@@ -87,7 +87,7 @@ use stellar_xdr::{
 use crate::SaError;
 use crate::managers::auth_entry::{PreSubmitBudget, bound_pre_submit_stage};
 use crate::managers::rules::{
-    BASE_FEE_STROOPS, augment_with_oz_error_name, fingerprint_invocation, parse_min_resource_fee,
+    BASE_FEE_STROOPS, SimulationErrorClass, fingerprint_invocation, parse_min_resource_fee,
     validate_latest_ledger,
 };
 use crate::signing::ledger_witness::{
@@ -351,7 +351,7 @@ pub(crate) async fn submit_timelock_invoke_with_g_key_auth(
             redacted_reason: format!(
                 "{} simulation returned error: {}",
                 args.op_label,
-                augment_with_oz_error_name(err)
+                SimulationErrorClass::of(err)
             ),
         });
     }
@@ -648,7 +648,7 @@ pub(crate) async fn submit_timelock_invoke_with_g_key_auth(
             redacted_reason: format!(
                 "{} re-simulate returned error: {}",
                 args.op_label,
-                augment_with_oz_error_name(err)
+                SimulationErrorClass::of(err)
             ),
         });
     }

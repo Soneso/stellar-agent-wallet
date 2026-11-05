@@ -43,9 +43,10 @@
 //! # Divergence detection
 //!
 //! The single-contract case compares the two endpoints' whole outcomes and
-//! reports a bounded summary of each side on divergence: first-8 hex of a
-//! Wasm hash, the `<SAC>` / `<Absent>` sentinel, or the redacted owner,
-//! bounded tag and resolved first-8 of an external reference.  A malformed
+//! reports a kind summary of each side on divergence: `<Wasm>`, the `<SAC>` /
+//! `<Absent>` sentinel, or the redacted owner and bounded tag of an external
+//! reference. Both outcomes are refused, so neither summary holds any part of
+//! a fetched hash.  A malformed
 //! ledger entry on either endpoint is reported as
 //! [`FetchContractWasmHashError::Malformed`] before any comparison.  The
 //! multi-key smart-account batch path uses a SHA-256
@@ -209,9 +210,10 @@ impl fmt::Debug for ExternalRefExecutable {
 /// Error returned when primary and secondary RPC endpoints disagree on the
 /// on-chain executable.
 ///
-/// Carries a bounded summary of each side; full 32-byte hashes and full
-/// addresses are NOT included. This guards against contract-substitution by
-/// requiring both endpoints to agree before the caller proceeds.
+/// Both outcomes are refused, so each side is a kind summary that holds no
+/// part of a fetched hash; full addresses are NOT included either. This
+/// guards against contract-substitution by requiring both endpoints to agree
+/// before the caller proceeds.
 #[derive(Debug, thiserror::Error)]
 #[error(
     "two-RPC WASM-hash divergence for {contract_redacted}: \
@@ -220,9 +222,8 @@ impl fmt::Debug for ExternalRefExecutable {
 pub struct WasmHashDivergenceError {
     /// First-5-last-5 redacted contract address.
     pub contract_redacted: String,
-    /// Summary of the primary RPC's outcome: first-8 hex of a Wasm hash,
-    /// `<SAC>`, `<Absent>`, or
-    /// `external-ref(owner=<redacted> tag="<bounded>" resolved=<first-8 or <unset>>)`.
+    /// Summary of the primary RPC's outcome: `<Wasm>`, `<SAC>`, `<Absent>`,
+    /// or `external-ref(owner=<redacted> tag="<bounded>")`.
     pub primary_summary: String,
     /// Summary of the secondary RPC's outcome, in the same form as
     /// `primary_summary`.
@@ -275,8 +276,8 @@ pub async fn fetch_contract_wasm_hash(
     secondary_rpc: Option<&StellarRpcClient>,
     contract_address: &str,
 ) -> Result<WasmHashFetch, FetchContractWasmHashError> {
-    let contract_redacted = redact_strkey_first5_last5(contract_address);
     let key = contract_instance_ledger_key(contract_address)?;
+    let contract_redacted = redact_strkey_first5_last5(contract_address);
 
     match secondary_rpc {
         Some(secondary) => {
@@ -323,18 +324,17 @@ pub use stellar_agent_core::sc_address::executable_tag_ledger_key;
 
 /// Error returned by [`fetch_contract_wasm_hash`].
 ///
-/// All variants carry first-8 hex redactions, first-5-last-5 addresses or
-/// fixed shape descriptions; full hashes, full addresses and decoded ledger
-/// content NEVER appear in `Display` or `Debug`.
+/// All variants carry kind summaries, first-5-last-5 forms of an address
+/// that parsed, or fixed shape descriptions; a refused address, any part of a
+/// fetched hash, full addresses and decoded ledger content NEVER appear in
+/// `Display` or `Debug`.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum FetchContractWasmHashError {
     /// The contract address is not a valid Stellar strkey.
-    #[error("invalid contract address {contract_redacted}: {reason}")]
+    #[error("invalid contract address: {reason}")]
     InvalidAddress {
-        /// First-5-last-5 redacted contract address.
-        contract_redacted: String,
-        /// Non-sensitive reason string.
+        /// The fixed rule the address failed.
         reason: String,
     },
     /// The RPC fetch failed (primary or secondary).
@@ -534,12 +534,9 @@ async fn fetch_entry_for_key(
 fn contract_instance_ledger_key(
     contract_address: &str,
 ) -> Result<LedgerKey, FetchContractWasmHashError> {
-    let contract_redacted = redact_strkey_first5_last5(contract_address);
-
-    let contract = stellar_strkey::Contract::from_string(contract_address).map_err(|e| {
+    let contract = stellar_strkey::Contract::from_string(contract_address).map_err(|_| {
         FetchContractWasmHashError::InvalidAddress {
-            contract_redacted: contract_redacted.clone(),
-            reason: e.to_string(),
+            reason: "the address must be a C-strkey".to_owned(),
         }
     })?;
 
@@ -553,28 +550,30 @@ fn contract_instance_ledger_key(
     }))
 }
 
-/// Returns a bounded summary of a `WasmHashFetch` outcome for divergence
-/// reporting.
+/// Returns a bounded kind summary of a `WasmHashFetch` outcome for
+/// divergence reporting.
 ///
-/// `Wasm` renders first-8 hex; `Sac` and `Absent` render distinguishable
-/// constant strings; `ExternalRef` renders the redacted owner, the bounded
-/// tag and the resolved first-8 (or `<unset>`), so divergence messages
-/// identify the exact mismatch without leaking full hashes or addresses.
+/// A divergence refuses both fetched outcomes, so the summary holds no part
+/// of a fetched hash. `Wasm` renders `<Wasm>`; `Sac` and `Absent` render
+/// `<SAC>` and `<Absent>`; `ExternalRef` renders
+/// `external-ref(owner=<redacted> tag="<bounded>")` with the redacted owner
+/// and the bounded tag, without the resolved hash.
 fn wasm_hash_fetch_summary(fetch: &WasmHashFetch) -> String {
     match fetch {
-        WasmHashFetch::Wasm(hash) => wasm_hash_first8_hex(hash),
+        WasmHashFetch::Wasm(_) => "<Wasm>".to_owned(),
         WasmHashFetch::Sac => "<SAC>".to_owned(),
         WasmHashFetch::ExternalRef(external) => format!(
-            "external-ref(owner={} tag=\"{}\" resolved={})",
+            "external-ref(owner={} tag=\"{}\")",
             external.owner_redacted(),
             external.tag_display(),
-            external.resolved_first8()
         ),
         WasmHashFetch::Absent => "<Absent>".to_owned(),
     }
 }
 
 /// Redacts a strkey to first-5-last-5 characters for safe error reporting.
+///
+/// The caller passes an address that parsed: the slices assume its ASCII form.
 fn redact_strkey_first5_last5(strkey: &str) -> String {
     if strkey.len() <= 10 {
         return strkey.to_owned();
@@ -603,6 +602,23 @@ mod tests {
     };
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer};
+
+    /// A refused address is named by the rule alone, before any redaction
+    /// slices it, so a multibyte address cannot panic the slice.
+    #[tokio::test]
+    async fn refused_contract_addresses_stay_out_of_the_error() {
+        let client = StellarRpcClient::new("http://127.0.0.1:9").unwrap();
+        for address in ["credmarker7", "abcd\u{e9}credmarker7\u{e9}\u{e9}\u{e9}"] {
+            let error = fetch_contract_wasm_hash(&client, None, address)
+                .await
+                .unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "invalid contract address: the address must be a C-strkey"
+            );
+            stellar_agent_test_support::rejected_value::assert_no_marker(&error, "credmarker7");
+        }
+    }
 
     // ── Helpers ──────────────────────────────────────────────────────────────
 
@@ -635,26 +651,53 @@ mod tests {
 
     // ── Two-RPC divergence path ────────────────────────────────────────────
 
-    /// Asserts that when primary and secondary return different hashes, the
-    /// function returns `FetchContractWasmHashError::Divergent`.
+    /// Primary and secondary return two different Wasm hashes. Both outcomes
+    /// are refused, so the divergence error names the kind of each side and
+    /// holds no part of either hash.
     #[tokio::test]
-    async fn two_rpc_divergence_returns_error() {
-        let hash_a = [0xaau8; 32];
-        let hash_b = [0xbbu8; 32];
+    async fn two_rpc_wasm_divergence_holds_neither_hash() {
+        let hash_a: [u8; 32] = std::array::from_fn(|i| 0xa0 ^ u8::try_from(i).unwrap());
+        let hash_b: [u8; 32] = std::array::from_fn(|i| 0x50 ^ u8::try_from(i).unwrap());
 
         let (_s1, primary) = mock_rpc_with_result(wasm_result_json(hash_a)).await;
         let (_s2, secondary) = mock_rpc_with_result(wasm_result_json(hash_b)).await;
 
         let result = fetch_contract_wasm_hash(&primary, Some(&secondary), TEST_CONTRACT).await;
 
+        let Err(error) = result else {
+            panic!("expected Divergent; got {result:?}");
+        };
+        let FetchContractWasmHashError::Divergent(divergence) = &error else {
+            panic!("expected Divergent; got {error:?}");
+        };
+        assert_eq!(divergence.primary_summary, "<Wasm>");
+        assert_eq!(divergence.secondary_summary, "<Wasm>");
+        let display = error.to_string();
         assert!(
-            matches!(result, Err(FetchContractWasmHashError::Divergent(_))),
-            "expected Divergent; got {result:?}"
+            display.contains("primary=<Wasm> secondary=<Wasm>"),
+            "{display}"
         );
-        // Inspect divergence detail — must contain first-8 of each hash.
-        if let Err(FetchContractWasmHashError::Divergent(e)) = result {
-            assert_eq!(e.primary_summary, "aaaaaaaaaaaaaaaa");
-            assert_eq!(e.secondary_summary, "bbbbbbbbbbbbbbbb");
+        for (channel, rendered) in [
+            ("Display", display.clone()),
+            ("Debug", format!("{error:?}")),
+            ("Debug of the divergence", format!("{divergence:?}")),
+        ] {
+            for hash in [hash_a, hash_b] {
+                let full = stellar_agent_core::hex::encode(&hash);
+                let first8 = stellar_agent_core::hex::encode(&hash[..8]);
+                assert!(!rendered.contains(&full), "{channel}: {rendered}");
+                assert!(!rendered.contains(&first8), "{channel}: {rendered}");
+            }
+        }
+        // The fetch errors have no serde form; the check walks the Display
+        // and Debug of the error and of every error in its source chain.
+        for hash in [hash_a, hash_b] {
+            for marker in [
+                stellar_agent_core::hex::encode(&hash),
+                stellar_agent_core::hex::encode(&hash[..8]),
+            ] {
+                stellar_agent_test_support::rejected_value::assert_no_marker(&error, &marker);
+            }
         }
     }
 
@@ -1122,14 +1165,21 @@ mod tests {
         };
         assert_eq!(
             e.primary_summary,
-            "external-ref(owner=CAAAA...ABSC4 tag=\"pool-v2\" resolved=aaaaaaaaaaaaaaaa)"
+            "external-ref(owner=CAAAA...ABSC4 tag=\"pool-v2\")"
         );
         assert_eq!(
             e.secondary_summary,
-            "external-ref(owner=CAAAA...ABSC4 tag=\"pool-v2\" resolved=bbbbbbbbbbbbbbbb)"
+            "external-ref(owner=CAAAA...ABSC4 tag=\"pool-v2\")"
         );
         let display = e.to_string();
         assert!(!display.contains(OWNER), "full owner leaked: {display}");
+        let forms = format!("{display}\n{e:?}");
+        for resolved in [[0xaa; 32], [0xbb; 32]] {
+            assert!(
+                !forms.contains(&stellar_agent_core::hex::encode(&resolved[..8])),
+                "a refused resolved hash leaked: {forms}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -1222,16 +1272,16 @@ mod tests {
     // ── Display/Debug redaction audit ─────────────────────────────────────
 
     #[test]
-    fn divergence_error_display_redacts_full_hash() {
+    fn divergence_error_display_names_the_contract_and_both_kinds() {
         let err = WasmHashDivergenceError {
             contract_redacted: "CAAAA\u{2026}AAB".to_owned(),
-            primary_summary: "aaaaaaaaaaaaaaa1".to_owned(),
-            secondary_summary: "bbbbbbbbbbbbbbb2".to_owned(),
+            primary_summary: wasm_hash_fetch_summary(&WasmHashFetch::Wasm([0xaa; 32])),
+            secondary_summary: wasm_hash_fetch_summary(&WasmHashFetch::Sac),
         };
-        let display = err.to_string();
-        // Full hex of a known hash must not appear
-        let full_hash_hex: String = [0xaau8; 32].iter().map(|b| format!("{b:02x}")).collect();
-        assert!(!display.contains(&full_hash_hex));
-        assert!(display.contains("aaaaaaaaaaaaaaa1"));
+        assert_eq!(
+            err.to_string(),
+            "two-RPC WASM-hash divergence for CAAAA\u{2026}AAB: primary=<Wasm> secondary=<SAC>"
+        );
+        assert_eq!(wasm_hash_fetch_summary(&WasmHashFetch::Absent), "<Absent>");
     }
 }

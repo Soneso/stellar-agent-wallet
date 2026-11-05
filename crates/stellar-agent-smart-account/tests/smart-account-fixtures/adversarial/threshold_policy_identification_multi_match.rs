@@ -96,21 +96,14 @@ async fn two_allowlisted_policies_returns_identification_failed_multi_match() {
 
 /// Type-level: verify the `ThresholdPolicyIdentificationFailed` multi-match shape.
 ///
-/// The `observed_wasm_hashes_summary.count` carries the number of observed policies
+/// The `observed_policy_count` carries the number of attached policies
 /// (not the number of matches), allowing operators to diagnose the configuration.
 #[test]
 fn identification_failed_multi_match_wire_code() {
-    use stellar_agent_smart_account::signers::types::WasmHashSummary;
-
-    // count=2 (two policies observed), first_first8=Some([...]) from the first hash.
     let err = SaError::ThresholdPolicyIdentificationFailed {
         rule_id: 1,
         smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...AD2KM"),
-        observed_wasm_hashes_summary: WasmHashSummary::new(
-            2,
-            Some([0x43, 0xc4, 0x87, 0x90, 0xb8, 0x3f, 0xbe, 0x28]),
-        )
-        .expect("count=2 + Some is valid"),
+        observed_policy_count: 2,
         request_id: Uuid::new_v4().to_string(),
     };
     assert_eq!(err.wire_code(), "sa.threshold_policy_identification_failed");

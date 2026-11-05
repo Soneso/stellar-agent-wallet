@@ -74,8 +74,7 @@ impl std::fmt::Debug for RpcCredentialBinding {
 /// # Errors
 ///
 /// - The keyring errors of [`read_rpc_credential`]: `auth.keyring_not_found`
-///   naming `service/account`, the other keyring codes, and
-///   [`NetworkError::RpcCredentialInvalid`].
+///   the other keyring codes, and [`NetworkError::RpcCredentialInvalid`].
 /// - [`NetworkError::RpcCredentialUnusable`] when the credential cannot be
 ///   sent to the endpoint.
 /// - [`NetworkError::RpcUnreachable`] when the transport refuses the URL.
@@ -107,8 +106,7 @@ pub(crate) fn rpc_client(
 /// # Errors
 ///
 /// - The keyring errors of [`read_rpc_credential`]: `auth.keyring_not_found`
-///   naming `service/account`, the other keyring codes, and
-///   [`NetworkError::RpcCredentialInvalid`].
+///   the other keyring codes, and [`NetworkError::RpcCredentialInvalid`].
 /// - [`NetworkError::RpcCredentialUnusable`] when the credential cannot be
 ///   sent to the endpoint.
 /// - [`NetworkError::RpcUnreachable`] when the transport refuses the URL.
@@ -338,9 +336,9 @@ mod tests {
             .err()
             .unwrap();
         assert_eq!(error.code(), "auth.keyring_not_found");
-        assert!(
-            error.to_string().contains("stellar-agent-rpc-unit/oracle"),
-            "{error}"
+        assert_eq!(
+            error.to_string(),
+            "the configured keyring entry must exist; provision or select the required entry."
         );
         assert!(is_credential_error(&error));
     }
@@ -351,7 +349,7 @@ mod tests {
         use stellar_agent_core::profile::schema::RpcCredentialDefect;
         let credential = [
             WalletError::Auth(AuthError::KeyringNotFound {
-                name: "s/a".to_owned(),
+                cause: stellar_agent_core::error::KeyringMissingCause::MissingEntry,
             }),
             WalletError::Network(NetworkError::RpcCredentialInvalid {
                 entry: "s/a".to_owned(),

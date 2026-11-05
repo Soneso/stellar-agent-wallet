@@ -194,6 +194,34 @@ fn halt_checked_tool_name<'a>(
     std::borrow::Cow::Borrowed(tool)
 }
 
+/// Start of the text rmcp returns for a tool call whose arguments fail to
+/// deserialize. The rest of that text is the `serde_json` message, which quotes
+/// the supplied value.
+const ARGUMENT_DESERIALIZATION_PREFIX: &str = "failed to deserialize parameters:";
+
+/// Replaces rmcp's argument deserialization text in `result` with a fixed
+/// refusal naming `tool`.
+///
+/// rmcp reports this failure only for a route it matched, so `tool` is a
+/// registered name. Every other result passes unchanged.
+fn fixed_argument_refusal(
+    tool: &str,
+    result: rmcp::model::CallToolResult,
+) -> rmcp::model::CallToolResult {
+    let deserialization_failed = result.is_error == Some(true)
+        && result
+            .content
+            .first()
+            .and_then(|content| content.as_text())
+            .is_some_and(|text| text.text.starts_with(ARGUMENT_DESERIALIZATION_PREFIX));
+    if !deserialization_failed {
+        return result;
+    }
+    rmcp::model::CallToolResult::error(vec![rmcp::model::Content::text(format!(
+        "{tool}: the arguments have a missing field or a field of the wrong type or value"
+    ))])
+}
+
 fn profile_resource_uri(name: &str) -> String {
     format!("{PROFILE_RESOURCE_PREFIX}{name}")
 }
@@ -1404,8 +1432,10 @@ impl ServerHandler for WalletServer {
         if let Some(refusal) = self.halt_refusal_for_tool(&checked) {
             return Ok(refusal);
         }
+        let tool = request.name.clone();
         let call = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
-        self.tool_router.call(call).await
+        let result = self.tool_router.call(call).await?;
+        Ok(fixed_argument_refusal(&tool, result))
     }
 
     fn get_info(&self) -> InitializeResult {

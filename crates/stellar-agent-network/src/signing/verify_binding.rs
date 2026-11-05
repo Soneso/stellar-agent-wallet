@@ -56,7 +56,7 @@ use tokio::time::Instant;
 
 use crate::account::fetch_account_signers;
 use crate::client::StellarRpcClient;
-use crate::submit::{MAINNET_PASSPHRASE, bytes_to_hex};
+use crate::submit::MAINNET_PASSPHRASE;
 
 /// The `Display` detail used when a legacy V0 envelope reaches a path that
 /// only handles the SEP-23 tagged-transaction variants.
@@ -304,11 +304,7 @@ fn verify_one_signature(
     mainnet_hash: &[u8; 32],
 ) -> Result<(), WalletError> {
     let hint = signature.hint.0;
-    let unverifiable = || {
-        WalletError::Network(NetworkError::EnvelopeSignatureUnverifiable {
-            hint: bytes_to_hex(&hint),
-        })
-    };
+    let unverifiable = || WalletError::Network(NetworkError::EnvelopeSignatureUnverifiable);
 
     let candidates: Vec<&[u8; 32]> = candidate_keys
         .iter()
@@ -401,4 +397,31 @@ pub(crate) fn reject_v0_envelope(envelope: &TransactionEnvelope) -> Result<(), W
         }));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, reason = "test-only")]
+
+    use stellar_xdr::{BytesM, DecoratedSignature, Signature, SignatureHint};
+
+    use super::*;
+
+    /// A signature that matches no signer is refused by the rule, with no
+    /// rendering of its hint.
+    #[test]
+    fn unverifiable_signature_hint_stays_out_of_the_error() {
+        let signature = DecoratedSignature {
+            hint: SignatureHint([0xDE, 0xAD, 0xBE, 0xEF]),
+            signature: Signature(BytesM::try_from(vec![0_u8; 64]).unwrap()),
+        };
+        let error = verify_one_signature(&signature, &[[1; 32]], &[2; 32], &[3; 32]).unwrap_err();
+        assert_eq!(error.code(), "network.envelope_signature_unverifiable");
+        assert_eq!(
+            error.to_string(),
+            "transaction_xdr must contain signatures that verify against a source-account signer \
+             on the selected network; rebuild and sign the envelope for that network."
+        );
+        stellar_agent_test_support::rejected_value::assert_no_marker(&error, "deadbeef");
+    }
 }

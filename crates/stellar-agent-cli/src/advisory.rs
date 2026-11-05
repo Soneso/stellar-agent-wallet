@@ -172,7 +172,6 @@ fn advisory_impl(audit_log_path: &Path, allowlist: &[VerifierAllowlistEntry]) ->
             Ok(w) => Some(w),
             Err(e) => {
                 warn!(
-                    audit_log_path = %audit_log_path.display(),
                     error = %e,
                     "startup advisory: could not open audit writer; the log is read without \
                      it and no advisory row is written"
@@ -192,7 +191,6 @@ fn advisory_impl(audit_log_path: &Path, allowlist: &[VerifierAllowlistEntry]) ->
         Ok(rows) => rows,
         Err(e) => {
             warn!(
-                audit_log_path = %audit_log_path.display(),
                 error = %e,
                 "startup advisory: audit-log scan failed; advisory skipped"
             );

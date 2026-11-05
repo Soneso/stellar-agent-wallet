@@ -19,7 +19,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use stellar_agent_core::error::{NetworkError, WalletError};
+use stellar_agent_core::error::{NetworkError, ValidationError, WalletError};
 
 use crate::account::fetch_account;
 use crate::client::StellarRpcClient;
@@ -484,6 +484,10 @@ pub async fn fund_with_friendbot(
         ));
     }
 
+    // The request and its event carry only an account that passed this parse.
+    stellar_strkey::ed25519::PublicKey::from_string(account_id)
+        .map_err(|_| WalletError::Validation(ValidationError::address_argument("account_id")))?;
+
     let url = format!("{friendbot_url}?addr={account_id}");
 
     tracing::debug!(
@@ -582,6 +586,29 @@ mod tests {
     )]
 
     use super::*;
+
+    /// A refused account reaches neither the GET event nor a request.
+    #[test]
+    fn refused_friendbot_account_stays_out_of_the_event() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let logs = stellar_agent_test_support::log_capture::with_captured_trace_logs(|| {
+            let error = runtime
+                .block_on(fund_with_friendbot(
+                    "http://127.0.0.1:9/friendbot",
+                    "credmarker7",
+                    "Test SDF Network ; September 2015",
+                    "http://127.0.0.1:9",
+                ))
+                .unwrap_err();
+            assert_eq!(error.code(), "validation.address_invalid");
+            assert!(!error.to_string().contains("credmarker7"), "{error}");
+        });
+        assert!(!logs.contains("credmarker7"), "{logs}");
+        assert!(!logs.contains("fund_with_friendbot: GET"), "{logs}");
+    }
 
     #[test]
     fn friendbot_url_marker_is_not_echoed() {
@@ -723,7 +750,7 @@ mod tests {
 
         let error = fund_with_friendbot(
             &friendbot_url,
-            "private-account",
+            FUNDED_ACCOUNT,
             "Test SDF Network ; September 2015",
             "http://127.0.0.1:1",
         )
@@ -882,7 +909,7 @@ mod tests {
     async fn a_refused_funding_request_reports_a_redacted_transport_error() {
         let error = fund_with_friendbot(
             "http://funding-user:funding-secret@127.0.0.1:1/private-funding-path",
-            "private-account",
+            FUNDED_ACCOUNT,
             "Test SDF Network ; September 2015",
             "http://127.0.0.1:1",
         )
@@ -899,7 +926,7 @@ mod tests {
             "funding-user",
             "funding-secret",
             "private-funding-path",
-            "private-account",
+            FUNDED_ACCOUNT,
             "addr=",
         ] {
             assert!(

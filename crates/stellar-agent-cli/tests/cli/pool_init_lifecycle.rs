@@ -937,12 +937,10 @@ async fn fee_total_overflow_refuses_with_its_code() {
         output["error"]["code"], "validation.fee_total_overflow",
         "{output}"
     );
-    assert!(
-        output["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("times 6 operations exceeds the transaction fee limit"),
-        "{output}"
+    assert_eq!(
+        output["error"]["message"],
+        "classic_fee_per_op_stroops multiplied by the operation count must fit in u32; lower \
+         classic_fee_per_op_stroops."
     );
     assert_eq!(rpc.0.lock().unwrap().send_count, 0);
     assert!(

@@ -144,10 +144,7 @@ async fn wholesale_replacement_with_wrong_account_returns_missing_baseline() {
         .await;
 
     assert!(
-        matches!(
-            result,
-            Err(SaError::SignerSetMissingBaseline { rule_id: 1, .. })
-        ),
+        matches!(result, Err(SaError::SignerSetMissingBaseline { .. })),
         "wholesale replacement for wrong account must return SignerSetMissingBaseline; got: {result:?}"
     );
 }
@@ -189,10 +186,7 @@ async fn wholesale_replacement_with_wrong_rule_id_returns_missing_baseline() {
         .await;
 
     assert!(
-        matches!(
-            result,
-            Err(SaError::SignerSetMissingBaseline { rule_id: 1, .. })
-        ),
+        matches!(result, Err(SaError::SignerSetMissingBaseline { .. })),
         "wholesale replacement for wrong rule must return SignerSetMissingBaseline; got: {result:?}"
     );
 }

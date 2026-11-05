@@ -148,7 +148,7 @@ async fn list_signers_refuses_a_rule_with_an_undecodable_signer() {
     assert_eq!(
         redacted_reason,
         "get_context_rule: signer at index 2 (id 2) is not a recognised Signer: \
-         unknown signer tag \"Future\""
+         signer tag must be Delegated or External"
     );
 
     assert_eq!(

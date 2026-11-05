@@ -1306,8 +1306,12 @@ fn read_file_rows(
             line: line_number,
             detail,
         };
-        let entry: AuditEntry =
-            serde_json::from_slice(&raw).map_err(|e| parse_error(e.to_string()))?;
+        let entry: AuditEntry = serde_json::from_slice(&raw).map_err(|e| {
+            parse_error(format!(
+                "the entry {}",
+                crate::redact::describe_json_error(&e)
+            ))
+        })?;
         let body = entry
             .canonical_json_body()
             .map_err(|e| parse_error(e.to_string()))?;
@@ -1580,9 +1584,7 @@ fn extract_signer_set_view(kind: &EventKind, key: SignerSetKey<'_>) -> Option<Si
 fn open_regular_file(path: &Path) -> Result<std::fs::File, AuditLogIntegrityError> {
     let metadata = std::fs::symlink_metadata(path).map_err(AuditLogIntegrityError::Io)?;
     if !metadata.file_type().is_file() {
-        return Err(AuditLogIntegrityError::NonRegularFileLogPath {
-            path: path.to_path_buf(),
-        });
+        return Err(AuditLogIntegrityError::NonRegularFileLogPath);
     }
     std::fs::File::open(path).map_err(AuditLogIntegrityError::Io)
 }
@@ -2573,12 +2575,10 @@ mod tests {
                 AuditLogIntegrityError::TooManyRotatedFiles { .. } => {
                     "audit.too_many_rotated_files"
                 }
-                AuditLogIntegrityError::NonRegularFileLogPath { .. } => {
-                    "audit.non_regular_file_log_path"
-                }
+                AuditLogIntegrityError::NonRegularFileLogPath => "audit.non_regular_file_log_path",
                 AuditLogIntegrityError::ParseError { .. } => "audit.parse_error",
                 AuditLogIntegrityError::PathContract { .. } => "audit.path_contract",
-                AuditLogIntegrityError::LogNotFound { .. } => "audit.log_not_found",
+                AuditLogIntegrityError::LogNotFound => "audit.log_not_found",
                 AuditLogIntegrityError::Io(_) => "audit.io_error",
                 AuditLogIntegrityError::SignerSetCanonicalBody(_) => {
                     "audit.signer_set_canonical_body"
@@ -2606,9 +2606,7 @@ mod tests {
                 file: "f".to_owned(),
             },
             AuditLogIntegrityError::TooManyRotatedFiles { found: 22, cap: 21 },
-            AuditLogIntegrityError::NonRegularFileLogPath {
-                path: PathBuf::from("/dev/null"),
-            },
+            AuditLogIntegrityError::NonRegularFileLogPath,
             AuditLogIntegrityError::ParseError {
                 line: 1,
                 detail: "bad json".to_owned(),
@@ -2616,9 +2614,7 @@ mod tests {
             AuditLogIntegrityError::PathContract {
                 detail: "no parent".to_owned(),
             },
-            AuditLogIntegrityError::LogNotFound {
-                path: "/tmp/audit.jsonl".to_owned(),
-            },
+            AuditLogIntegrityError::LogNotFound,
             AuditLogIntegrityError::Io(std::io::Error::other("ambient")),
             AuditLogIntegrityError::SignerSetCanonicalBody(
                 crate::audit_log::signer_set::SignerSetCanonicalBodyError::MalformedObservedSignerSet {
@@ -4795,6 +4791,32 @@ mod tests {
 
     // ── 34. Non-regular file at log path → NonRegularFileLogPath ──────────────
 
+    /// A stored line that fails its schema reports the category and position,
+    /// never the refused value.
+    #[test]
+    fn unparsable_row_reports_category_and_position_only() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        std::fs::write(
+            &path,
+            format!(
+                "{}\n",
+                crate::audit_log::test_helpers::line_refused_by_the_schema("credmarker7")
+            ),
+        )
+        .unwrap();
+        let error = read_file_rows(&path, None, None, None).err().unwrap();
+        stellar_agent_test_support::rejected_value::assert_no_marker(&error, "credmarker7");
+        let text = error.to_string();
+        assert!(
+            text.starts_with(
+                "audit.parse_error: line 1: the entry has a missing field or a field of the \
+                 wrong type or value (line 1, column "
+            ),
+            "{text}"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn symlink_at_log_path_returns_non_regular_file_error() {
@@ -4812,7 +4834,7 @@ mod tests {
         let result = read_file_rows(&path, None, None, None);
 
         match result {
-            Err(AuditLogIntegrityError::NonRegularFileLogPath { .. }) => {}
+            Err(AuditLogIntegrityError::NonRegularFileLogPath) => {}
             Err(AuditLogIntegrityError::Io(_)) => {
                 // Acceptable: some OS configurations return an Io error when
                 // symlink_metadata fails on a dangling symlink.
@@ -5212,7 +5234,13 @@ mod tests {
         match reader.find_latest_signer_set_view(1, "CDABC...12345", &READER_DIGEST) {
             Err(AuditLogIntegrityError::ParseError { line, detail }) => {
                 assert_eq!(line, 2);
-                assert!(detail.contains("missing field `threshold`"), "{detail}");
+                assert!(
+                    detail.starts_with(
+                        "the entry has a missing field or a field of the wrong type or value \
+                         (line 1, column "
+                    ),
+                    "{detail}"
+                );
             }
             other => panic!("expected ParseError at line 2, got {other:?}"),
         }

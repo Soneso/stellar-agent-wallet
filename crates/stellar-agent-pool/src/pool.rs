@@ -241,19 +241,12 @@ impl ChannelPool {
     pub fn from_config(config: &PoolConfig, sequence_numbers: &[i64]) -> Result<Self, PoolError> {
         let pool_size = config.pool_size;
         if !(Self::MIN_SIZE..=Self::MAX_SIZE).contains(&pool_size) {
-            return Err(PoolError::SizeOutOfRange {
-                requested: pool_size,
-            });
+            return Err(PoolError::SizeOutOfRange);
         }
         if config.channels.len() != pool_size || sequence_numbers.len() != pool_size {
             return Err(PoolError::InitFailed {
-                detail: format!(
-                    "config.channels.len() ({}) or sequence_numbers.len() ({}) \
-                     does not match pool_size ({})",
-                    config.channels.len(),
-                    sequence_numbers.len(),
-                    pool_size,
-                ),
+                detail: "config.channels and sequence_numbers must each hold pool_size entries"
+                    .to_owned(),
             });
         }
 
@@ -296,9 +289,7 @@ impl ChannelPool {
     ) -> Result<Self, PoolError> {
         let pool_size = channels.len();
         if !(Self::MIN_SIZE..=Self::MAX_SIZE).contains(&pool_size) {
-            return Err(PoolError::SizeOutOfRange {
-                requested: pool_size,
-            });
+            return Err(PoolError::SizeOutOfRange);
         }
         if sequence_numbers.len() != pool_size {
             return Err(PoolError::InitFailed {

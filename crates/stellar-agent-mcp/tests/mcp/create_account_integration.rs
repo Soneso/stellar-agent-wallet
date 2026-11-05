@@ -599,9 +599,9 @@ async fn simulate_create_account_fee_explicit_above_profile_cap_fails() {
     );
     assert_eq!(
         message,
-        "the explicit per-operation fee 500 stroops exceeds the profile cap of 100 stroops; \
-         lower the fee or raise classic_max_fee_per_op_stroops",
-        "cap-exceeded detail must carry the explicit fee and the cap; got: {message}"
+        "--fee must be a per-operation stroop amount within classic_max_fee_per_op_stroops; \
+         lower --fee or raise classic_max_fee_per_op_stroops.",
+        "the cap-exceeded detail states the check and holds no fee; got: {message}"
     );
 }
 

@@ -60,6 +60,7 @@ use stellar_agent_pool::derive::derive_channel_signer;
 use stellar_agent_pool::pool::{ChannelPool, TerminalOutcome};
 use stellar_agent_pool::submit::submit_pooled;
 use stellar_agent_pool::{ChannelRecord, PoolError};
+use stellar_agent_test_support::rejected_value::{assert_no_marker, assert_no_marker_in_text};
 use stellar_agent_test_support::signed_envelope::{get_network_result, ledger_entries_result_for};
 use stellar_agent_test_support::{EchoIdResponder, SubmissionEchoResponder};
 use zeroize::Zeroizing;
@@ -103,6 +104,108 @@ async fn make_pool_1() -> ChannelPool {
         vec![INITIAL_SEQ],
     )
     .expect("pool construction must succeed")
+}
+
+/// A channel index outside the hardened range stays out of every event of the
+/// submission and out of the returned error, its Debug form and its source
+/// chain. The failure keeps its fixed class and releases the channel.
+#[test]
+fn refused_channel_index_stays_out_of_the_events_and_the_error() {
+    const REFUSED_INDEX: u32 = 3_141_592_653;
+    const MARKER: &str = "3141592653";
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let pool =
+        ChannelPool::from_records(vec![ChannelRecord::new(REFUSED_INDEX, DEST_KEY)], vec![1])
+            .expect("pool construction must succeed");
+    let direct = derive_channel_signer(mock_seed(), REFUSED_INDEX)
+        .err()
+        .expect("the index is out of range");
+    let client = StellarRpcClient::new("http://127.0.0.1:9").unwrap();
+    let recording = crate::common::RecorderFixture::new();
+    let mut returned = None;
+    let logs = stellar_agent_test_support::log_capture::with_captured_trace_logs(|| {
+        returned = Some(runtime.block_on(submit_pooled(
+            &pool,
+            &client,
+            &mock_seed(),
+            TESTNET_PASSPHRASE,
+            FEE_PER_OP,
+            TIMEOUT,
+            &recording.recorder(),
+            |_| {},
+        )));
+    });
+    let error = returned
+        .expect("the submission ran")
+        .expect_err("the index is out of range");
+    for error in [&direct, &error] {
+        assert_no_marker(error, MARKER);
+        assert_eq!(
+            error.to_string(),
+            "pool.derive_failed: channel index must be less than 2147483648"
+        );
+    }
+    assert!(logs.contains("channel key derivation failed"), "{logs}");
+    assert!(logs.contains("channel_key_derivation"), "{logs}");
+    assert_no_marker_in_text(&logs, MARKER);
+    assert_eq!(pool.free_count(), 1);
+}
+
+/// A channel key the builder refuses as a source account stays out of every
+/// event of the submission, in full and in its abbreviated ends, and out of
+/// the returned error. The failure releases the channel.
+#[test]
+fn refused_channel_key_stays_out_of_the_events_and_the_error() {
+    const REFUSED_KEY: &str = "GZQXJ4444444444444444444444444444444444444444444444QJXZK";
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let pool = ChannelPool::from_records(
+        vec![ChannelRecord::new(CHANNEL_INDEX, REFUSED_KEY)],
+        vec![INITIAL_SEQ],
+    )
+    .expect("pool construction must succeed");
+    let client = StellarRpcClient::new("http://127.0.0.1:9").unwrap();
+    let recording = crate::common::RecorderFixture::new();
+    let mut returned = None;
+    let logs = stellar_agent_test_support::log_capture::with_captured_trace_logs(|| {
+        returned = Some(runtime.block_on(submit_pooled(
+            &pool,
+            &client,
+            &mock_seed(),
+            TESTNET_PASSPHRASE,
+            FEE_PER_OP,
+            TIMEOUT,
+            &recording.recorder(),
+            |builder| {
+                builder
+                    .payment(
+                        DEST_KEY,
+                        stellar_agent_core::StellarAmount::from_stroops(1),
+                        &stellar_agent_network::builder::Asset::Native,
+                    )
+                    .expect("the payment operation is valid");
+            },
+        )));
+    });
+    let error = returned
+        .expect("the submission ran")
+        .expect_err("the builder refuses the channel key");
+    assert!(
+        matches!(error, PoolError::Wallet(WalletError::Protocol(_))),
+        "{error:?}"
+    );
+    assert!(logs.contains("submit_pooled: channel acquired"), "{logs}");
+    assert!(logs.contains("build_and_sign failed"), "{logs}");
+    for marker in [REFUSED_KEY, &REFUSED_KEY[..5], &REFUSED_KEY[51..]] {
+        assert_no_marker(&error, marker);
+        assert_no_marker_in_text(&logs, marker);
+    }
+    assert_eq!(pool.free_count(), 1);
 }
 
 /// Mounts the endpoint-identity probe the submit path performs before every
@@ -626,7 +729,7 @@ async fn submit_pooled_tx_bad_seq_with_successful_refetch_updates_sequence() {
 ///
 /// `derive_channel_signer` calls `Sep5Wallet::derive_account(index)` which
 /// returns `DeriveError::IndexOutOfRange` for any index >= 0x8000_0000.
-/// `PoolError::DeriveFailed` wraps the `DeriveError` via `#[from]`.
+/// `PoolError::DeriveFailed` keeps neither that error nor the index.
 #[tokio::test]
 async fn submit_pooled_derive_failed_releases_channel() {
     // Index 0x8000_0000 (2_147_483_648) is the first out-of-range hardened index.
@@ -662,7 +765,7 @@ async fn submit_pooled_derive_failed_releases_channel() {
 
     // Derivation failure → PoolError::DeriveFailed.
     match &result {
-        Err(PoolError::DeriveFailed(_)) => {}
+        Err(PoolError::DeriveFailed) => {}
         other => panic!("expected PoolError::DeriveFailed for out-of-range index, got: {other:?}"),
     }
 

@@ -26,6 +26,7 @@ use stellar_agent_smart_account::managers::rules::{
     ContextRuleDefinition, ContextRulePolicy, ContextRuleSignerInput,
 };
 use stellar_agent_smart_account::managers::verifiers::pin_referenced_contracts;
+use stellar_agent_test_support::log_capture::WarningCapture;
 use stellar_xdr::{
     ContractDataDurability, ContractDataEntry, ContractExecutable, ContractId, ExtensionPoint,
     Hash, ScAddress, ScContractInstance, ScVal,
@@ -200,6 +201,30 @@ async fn unpinnable_instance_rejected_regardless_of_mutable_override() {
     }
 }
 
+/// Fixed refusal for a contract whose executable cannot be pinned.
+const UNSUPPORTED_REFUSAL: &str = "verifier or policy address must identify a deployed contract \
+                                   with a supported, resolvable Wasm executable; repair the \
+                                   deployment or select another contract.";
+
+/// Asserts that a warning with `message` fired, and that neither `error`
+/// nor any warning holds the contract `strkey`, whole or abbreviated.
+fn assert_contract_absent(capture: &WarningCapture, message: &str, error: &SaError, strkey: &str) {
+    let events = capture.seen();
+    assert!(
+        events
+            .iter()
+            .any(|event| event.get("message").is_some_and(|m| m == message)),
+        "expected the {message:?} event: {events:?}"
+    );
+    let redacted = stellar_agent_core::observability::redact_strkey_first5_last5(strkey);
+    let forms = format!(
+        "{error}\n{error:?}\n{}\n{events:?}",
+        serde_json::to_string(error).unwrap()
+    );
+    assert!(!forms.contains(strkey), "{forms}");
+    assert!(!forms.contains(&redacted), "{forms}");
+}
+
 /// A verifier or policy whose instance executable is an external reference
 /// with no live tag entry is refused with
 /// `ContractInstanceUnsupported { reason: ExternalRefUnresolved }` whatever
@@ -213,6 +238,7 @@ async fn external_ref_without_live_tag_entry_rejected_before_any_override() {
     let contract = contract_addr();
     let contract_strkey =
         stellar_agent_core::sc_address::scaddress_to_strkey(&contract).expect("contract strkey");
+    let (capture, _guard) = WarningCapture::capture(None);
 
     for contract_kind in [ContractKind::Verifier, ContractKind::Policy] {
         for (accept_mutable_verifier, accept_unknown_verifier) in
@@ -297,11 +323,12 @@ async fn external_ref_without_live_tag_entry_rejected_before_any_override() {
                 ),
                 "{case}: {error:?}"
             );
-            assert!(
-                error
-                    .to_string()
-                    .contains("external reference with no live tag entry"),
-                "{case}: {error}"
+            assert_eq!(error.to_string(), UNSUPPORTED_REFUSAL, "{case}");
+            assert_contract_absent(
+                &capture,
+                "observe_contract: external reference has no live tag entry; refusing",
+                &error,
+                &contract_strkey,
             );
 
             assert!(
@@ -337,6 +364,9 @@ async fn received_methods(server: &MockServer) -> Vec<String> {
 #[tokio::test]
 async fn contract_without_wasm_code_is_refused_under_every_override_combination() {
     let contract = contract_addr();
+    let contract_strkey =
+        stellar_agent_core::sc_address::scaddress_to_strkey(&contract).expect("contract strkey");
+    let (capture, _guard) = WarningCapture::capture(None);
     for (shape, entries) in [
         (
             "absent instance",
@@ -426,9 +456,12 @@ async fn contract_without_wasm_code_is_refused_under_every_override_combination(
                     ),
                     "{case}: {error:?}"
                 );
-                assert!(
-                    error.to_string().contains("no Wasm code"),
-                    "{case}: {error}"
+                assert_eq!(error.to_string(), UNSUPPORTED_REFUSAL, "{case}");
+                assert_contract_absent(
+                    &capture,
+                    "pin_referenced_contracts: the contract has no Wasm code; refusing",
+                    &error,
+                    &contract_strkey,
                 );
                 assert_eq!(
                     serde_json::to_value(&error).unwrap()["context"]["reason"],

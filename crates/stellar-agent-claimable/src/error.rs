@@ -37,11 +37,8 @@ pub enum ClaimError {
     BalanceNotFound,
 
     /// The queried account does not appear as a claimant on the entry.
-    #[error("claim.not_claimant: {account} does not appear as a claimant on this balance")]
-    NotClaimant {
-        /// The account G-strkey that was checked.
-        account: String,
-    },
+    #[error("claim.not_claimant: the source account must appear as a claimant on this balance")]
+    NotClaimant,
 
     /// The matched claimant's predicate does not currently evaluate to
     /// satisfied.
@@ -167,13 +164,7 @@ mod tests {
             ClaimError::BalanceNotFound.code(),
             "claim.balance_not_found"
         );
-        assert_eq!(
-            ClaimError::NotClaimant {
-                account: "GABC".to_owned()
-            }
-            .code(),
-            "claim.not_claimant"
-        );
+        assert_eq!(ClaimError::NotClaimant.code(), "claim.not_claimant");
         assert_eq!(
             ClaimError::PredicateNotSatisfied {
                 hint: "x".to_owned()

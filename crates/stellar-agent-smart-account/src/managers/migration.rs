@@ -1062,12 +1062,11 @@ impl<'a> MigrationPlanner<'a> {
     ) -> Result<MigrationPlan, SaError> {
         let smart_account_strkey = scaddress_to_strkey(&smart_account)?;
         let smart_account_redacted = redact_strkey_first5_last5(&smart_account_strkey);
-        let to_verifier_strkey = scaddress_to_strkey(&to_verifier_addr)?;
-        let to_verifier_redacted = redact_strkey_first5_last5(&to_verifier_strkey);
+        // The destination has passed no check yet, so the event below omits it.
+        scaddress_to_strkey(&to_verifier_addr)?;
 
         debug!(
             smart_account = %smart_account_redacted,
-            to_verifier = %to_verifier_redacted,
             request_id,
             "MigrationPlanner::build: starting pre-flight"
         );
@@ -1110,17 +1109,15 @@ impl<'a> MigrationPlanner<'a> {
                 smart_account_redacted: RedactedStrkey::from_already_redacted(
                     smart_account_redacted.clone(),
                 ),
-                detail: format!(
-                    "destination verifier contract at {to_verifier_redacted} has no deployed WASM \
-                 (contract not found or not a contract instance)"
-                ),
+                detail: "to_verifier must identify a deployed verifier contract with Wasm code; \
+                         deploy an allowlisted immutable verifier."
+                    .to_owned(),
                 request_id: request_id.to_owned(),
             }
         })?;
 
-        let to_hash_first8 = stellar_agent_core::hex::wasm_hash_first8_hex(&to_hash);
-
-        // Pre-flight 1: destination hash must be in VERIFIER_ALLOWLIST.
+        // Pre-flight 1: destination hash must be in VERIFIER_ALLOWLIST. A
+        // refused destination hash is named in no field of the error.
         let allowlist_entry = VERIFIER_ALLOWLIST
             .iter()
             .find(|e| e.wasm_hash == to_hash)
@@ -1129,9 +1126,7 @@ impl<'a> MigrationPlanner<'a> {
                 smart_account_redacted: RedactedStrkey::from_already_redacted(
                     smart_account_redacted.clone(),
                 ),
-                detail: format!(
-                    "destination verifier wasm hash {to_hash_first8} is not in VERIFIER_ALLOWLIST"
-                ),
+                detail: "destination verifier wasm hash must be in VERIFIER_ALLOWLIST".to_owned(),
                 request_id: request_id.to_owned(),
             })?;
 
@@ -1163,31 +1158,15 @@ impl<'a> MigrationPlanner<'a> {
             request_id: request_id.to_owned(),
         })?;
 
-        if let MutabilityStatus::Mutable {
-            admin_or_owner_key,
-            executable_ref,
-            ..
-        } = &mutability
-        {
-            let reference = executable_ref
-                .as_ref()
-                .map_or_else(String::new, |external| {
-                    format!(
-                        ", owner {}, tag \"{}\"",
-                        external.owner_redacted(),
-                        external.tag_display()
-                    )
-                });
+        if matches!(mutability, MutabilityStatus::Mutable { .. }) {
             return Err(SaError::VerifierMigrationFailed {
                 phase: MIGRATION_PHASES[1], // "preflight_destination_mutable"
                 smart_account_redacted: RedactedStrkey::from_already_redacted(
                     smart_account_redacted.clone(),
                 ),
-                detail: format!(
-                    "destination verifier at {to_verifier_redacted} is mutable \
-                     (reason={admin_or_owner_key}{reference}); mutable contracts are \
-                     refused as migration destinations"
-                ),
+                detail: "to_verifier must identify an immutable verifier contract; deploy or \
+                         select an immutable verifier."
+                    .to_owned(),
                 request_id: request_id.to_owned(),
             });
         }
@@ -1203,9 +1182,6 @@ impl<'a> MigrationPlanner<'a> {
                 smart_account_redacted: RedactedStrkey::from_already_redacted(
                     smart_account_redacted.clone(),
                 ),
-                contract_address_redacted: RedactedStrkey::from_already_redacted(
-                    to_verifier_redacted,
-                ),
                 reason: crate::AdminOrOwnerKey::ExecutableChanged,
                 request_id: request_id.to_owned(),
             });
@@ -1213,7 +1189,7 @@ impl<'a> MigrationPlanner<'a> {
 
         debug!(
             smart_account = %smart_account_redacted,
-            to_hash_first8 = %to_hash_first8,
+            to_hash_first8 = %stellar_agent_core::hex::wasm_hash_first8_hex(&to_hash),
             request_id,
             "MigrationPlanner::build: pre-flight passed; building rule-signer inventory"
         );
@@ -1524,7 +1500,7 @@ impl<'a> MigrationPlanner<'a> {
         .map_err(|e| SaError::VerifierMigrationFailed {
             phase: MIGRATION_PHASES[2],
             smart_account_redacted: RedactedStrkey::from_already_redacted(smart_account_redacted),
-            detail: format!("get_context_rule({rule_id}) simulation failed: {e}"),
+            detail: format!("get_context_rule simulation failed: {e}"),
             request_id: request_id.to_owned(),
         })?;
 
@@ -2475,7 +2451,7 @@ mod tests {
         assert_eq!(
             detail,
             "get_context_rule(6): signer at index 1 (id 20) is not a recognised Signer: \
-             unknown signer tag \"Future\""
+             signer tag must be Delegated or External"
         );
     }
 

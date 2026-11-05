@@ -287,6 +287,30 @@ pub fn hold_audit_lock(path: &std::path::Path) -> Result<HeldAuditLock, super::W
     AuditWriterLock::acquire(path).map(HeldAuditLock)
 }
 
+/// A valid audit entry line whose `policy_decision` value the schema refuses.
+///
+/// `serde_json` quotes the refused variant in its error, so a parse failure
+/// that forwards the error carries `marker`.
+#[cfg(test)]
+#[expect(
+    clippy::expect_used,
+    reason = "a test fixture that cannot serialize fails the calling test"
+)]
+pub(crate) fn line_refused_by_the_schema(marker: &str) -> String {
+    let entry = crate::audit_log::entry::AuditEntry::new_tool_invocation(
+        crate::audit_log::entry::NewToolInvocation::new(
+            "tool".to_owned(),
+            "stellar:testnet",
+            vec![],
+            crate::audit_log::schema::PolicyDecision::Allow,
+            uuid::Uuid::new_v4().to_string(),
+        ),
+    );
+    let mut value = serde_json::to_value(entry).expect("an entry serializes");
+    value["policy_decision"] = serde_json::Value::String(marker.to_owned());
+    value.to_string()
+}
+
 #[cfg(test)]
 mod tests {
     #![expect(

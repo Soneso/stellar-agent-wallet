@@ -199,7 +199,6 @@ fn fee_bump_error_code_all_variants() {
         (
             "feebump.fee_below_cap15_minimum",
             FeeBumpError::FeeBelowCap15Minimum {
-                supplied: 100,
                 minimum: 200,
                 inner_op_count: 1,
                 inner_fee: 100,
@@ -207,10 +206,7 @@ fn fee_bump_error_code_all_variants() {
         ),
         (
             "feebump.fee_exceeds_policy_cap",
-            FeeBumpError::FeeExceedsPolicyCap {
-                supplied: 5000,
-                cap: 1000,
-            },
+            FeeBumpError::FeeExceedsPolicyCap { cap: 1000 },
         ),
         (
             "feebump.invalid_fee_source",
@@ -328,7 +324,6 @@ fn from_invalid_fee_source_yields_validation_address_invalid() {
 #[test]
 fn from_fee_below_cap15_minimum_yields_submission_tx_malformed() {
     let err = FeeBumpError::FeeBelowCap15Minimum {
-        supplied: 100,
         minimum: 200,
         inner_op_count: 1,
         inner_fee: 100,
@@ -342,21 +337,17 @@ fn from_fee_below_cap15_minimum_yields_submission_tx_malformed() {
         "FeeBelowCap15Minimum must convert to WalletError::Submission(TxMalformed); got: {wallet_err:?}"
     );
     assert_eq!(wallet_err.code(), "submission.tx_malformed");
-    // The detail message must mention the exact supplied and minimum values.
-    let detail = format!("{wallet_err:?}");
-    assert!(
-        detail.contains("100") && detail.contains("200"),
-        "TxMalformed detail must mention supplied=100 and minimum=200; got: {detail}"
+    assert_eq!(
+        wallet_err.message(),
+        "the transaction is malformed: fee_bump: outer_fee_stroops must meet the CAP-15 minimum \
+         of the inner transaction"
     );
 }
 
 /// `FeeBumpError::FeeExceedsPolicyCap` converts to `WalletError::Submission(TxMalformed)`.
 #[test]
 fn from_fee_exceeds_policy_cap_yields_submission_tx_malformed() {
-    let err = FeeBumpError::FeeExceedsPolicyCap {
-        supplied: 5000,
-        cap: 1000,
-    };
+    let err = FeeBumpError::FeeExceedsPolicyCap { cap: 1000 };
     let wallet_err = WalletError::from(err);
     assert!(
         matches!(
@@ -366,6 +357,10 @@ fn from_fee_exceeds_policy_cap_yields_submission_tx_malformed() {
         "FeeExceedsPolicyCap must convert to WalletError::Submission(TxMalformed); got: {wallet_err:?}"
     );
     assert_eq!(wallet_err.code(), "submission.tx_malformed");
+    assert_eq!(
+        wallet_err.message(),
+        "the transaction is malformed: fee_bump: outer_fee_stroops must not exceed the policy cap"
+    );
 }
 
 /// `FeeBumpError::FeeSourceSignerMismatch` converts to `WalletError::Submission(TxMalformed)`.
@@ -747,14 +742,12 @@ async fn outer_fee_one_above_policy_cap_is_rejected() {
         err.code()
     );
     assert!(
-        matches!(
-            err,
-            FeeBumpError::FeeExceedsPolicyCap {
-                supplied: 5001,
-                cap: 5000,
-            }
-        ),
-        "FeeExceedsPolicyCap fields must match supplied=5001, cap=5000; got: {err:?}"
+        matches!(err, FeeBumpError::FeeExceedsPolicyCap { cap: 5000 }),
+        "FeeExceedsPolicyCap must carry cap=5000; got: {err:?}"
+    );
+    assert!(
+        !err.to_string().contains("5001") && !format!("{err:?}").contains("5001"),
+        "the supplied fee stays out of the refusal; got: {err:?}"
     );
 }
 
@@ -784,12 +777,10 @@ async fn fee_below_cap15_minimum_carries_exact_inner_metadata() {
     let err = result.err().expect("outer_fee=799 must be rejected");
     match err {
         FeeBumpError::FeeBelowCap15Minimum {
-            supplied,
             minimum,
             inner_op_count,
             inner_fee,
         } => {
-            assert_eq!(supplied, 799, "supplied must be 799; got: {supplied}");
             assert_eq!(minimum, 800, "minimum must be 800 (4*200); got: {minimum}");
             assert_eq!(
                 inner_op_count, 3,

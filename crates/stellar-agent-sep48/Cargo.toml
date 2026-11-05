@@ -25,6 +25,7 @@ wasmparser            = { workspace = true }
 serde                 = { workspace = true }
 serde_json            = { workspace = true }
 thiserror             = { workspace = true }
+stellar-agent-core    = { workspace = true }
 stellar-agent-network = { workspace = true }
 stellar-agent-xdr-limits = { workspace = true }
 tracing               = { workspace = true }

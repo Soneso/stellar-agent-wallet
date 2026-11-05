@@ -83,7 +83,9 @@ use stellar_agent_core::audit_log::{
     audit_writer_refusal, resign_chain_root_sidecars, verify::VerifyError, verify_entry_tags,
 };
 use stellar_agent_core::envelope::Envelope;
-use stellar_agent_core::error::{AuthError, InternalError, ValidationError, WalletError};
+use stellar_agent_core::error::{
+    AuthError, InternalError, KeyringMissingCause, ValidationError, WalletError,
+};
 use stellar_agent_core::profile::ResolvedProfileName;
 use stellar_agent_core::profile::loader;
 use stellar_agent_core::profile::owner_key;
@@ -128,13 +130,10 @@ fn existing_audit_key(
 ) -> Result<Option<Zeroizing<[u8; 32]>>, WalletError> {
     match load_audit_hmac_key(profile, profile_name) {
         Ok(key) => Ok(Some(key)),
-        // Only NoEntry maps to the bare service name; NoDefaultStore adds
-        // session guidance to its KeyringNotFound name.
-        Err(WalletError::Auth(AuthError::KeyringNotFound { name }))
-            if name == profile.audit_log_hash_chain_key_id.service =>
-        {
-            Ok(None)
-        }
+        // An absent entry is the only cause that means no key exists yet.
+        Err(WalletError::Auth(AuthError::KeyringNotFound {
+            cause: KeyringMissingCause::MissingEntry,
+        })) => Ok(None),
         Err(error) => Err(unusable_stored_key(error, profile_name)),
     }
 }

@@ -112,9 +112,10 @@ use tracing::info;
 use uuid::Uuid;
 
 use crate::commands::smart_account::common::{
-    CommonHandlerContext, ReadArgsView, ReadHandlerContext, SignerSourceFlags,
-    impl_common_args_view, impl_read_args_view, load_command_profile, map_access_error,
-    open_verifier_registry, wrap_sa_error,
+    CommonHandlerContext, ED25519_VERIFIER_ADDRESS_INVALID, ReadArgsView, ReadHandlerContext,
+    SignerSourceFlags, VERIFIER_REGISTRY_ADDRESS_INVALID, impl_common_args_view,
+    impl_read_args_view, load_command_profile, map_access_error, open_verifier_registry,
+    wrap_sa_error,
 };
 use crate::common::network::{EndpointUrlFlag, TargetNetwork, network_context_for_command};
 use crate::common::render::render_json;
@@ -471,7 +472,6 @@ async fn list_run(args: &ListArgs) -> i32 {
     };
 
     info!(
-        rule_id = args.rule_id,
         account = %redact_strkey_first5_last5(&args.account),
         "smart-account signers list: querying on-chain signer set"
     );
@@ -718,7 +718,6 @@ async fn refresh_run(args: &RefreshArgs) -> i32 {
     };
 
     info!(
-        rule_id = args.rule_id,
         account = %redact_strkey_first5_last5(&args.account),
         "smart-account signers refresh: writing fresh baseline"
     );
@@ -1097,10 +1096,7 @@ async fn add_run(args: &AddArgs) -> i32 {
                 return emit_error(
                     &WalletError::SmartAccount {
                         wire_code: e.wire_code(),
-                        message: format!(
-                            "verifier registry address '{}' is not a valid C-strkey: {e}",
-                            verifier_entry.address
-                        ),
+                        message: VERIFIER_REGISTRY_ADDRESS_INVALID.to_owned(),
                     },
                     &request_id,
                 );
@@ -1284,7 +1280,7 @@ async fn add_run(args: &AddArgs) -> i32 {
                 return emit_error(
                     &WalletError::SmartAccount {
                         wire_code: e.wire_code(),
-                        message: format!("--signer-ed25519 verifier '{verifier_c_strkey}': {e}"),
+                        message: ED25519_VERIFIER_ADDRESS_INVALID.to_owned(),
                     },
                     &request_id,
                 );
@@ -1391,7 +1387,6 @@ async fn add_run(args: &AddArgs) -> i32 {
     };
 
     info!(
-        rule_id = args.rule_id,
         account = %redact_strkey_first5_last5(&args.account),
         signer_source = %signer_source_label,
         "smart-account signers add: submitting add_signer"
@@ -1526,8 +1521,6 @@ async fn remove_run(args: &RemoveArgs) -> i32 {
     };
 
     info!(
-        rule_id = args.rule_id,
-        signer_id = args.signer_id,
         account = %redact_strkey_first5_last5(&args.account),
         "smart-account signers remove: submitting remove_signer"
     );
@@ -1669,8 +1662,6 @@ async fn set_threshold_run(args: &SetThresholdArgs) -> i32 {
     };
 
     info!(
-        rule_id = args.rule_id,
-        new_threshold = args.new_threshold,
         account = %redact_strkey_first5_last5(&args.account),
         "smart-account signers set-threshold: submitting set_threshold"
     );
@@ -1814,8 +1805,6 @@ async fn set_weighted_threshold_run(args: &SetWeightedThresholdArgs) -> i32 {
     ];
 
     info!(
-        rule_id = args.rule_id,
-        new_threshold = args.new_threshold,
         account = %redact_strkey_first5_last5(&args.account),
         "smart-account signers set-weighted-threshold: submitting set_threshold"
     );
@@ -2033,8 +2022,6 @@ async fn set_signer_weight_run(args: &SetSignerWeightArgs) -> i32 {
     ];
 
     info!(
-        rule_id = args.rule_id,
-        new_weight = args.new_weight,
         account = %redact_strkey_first5_last5(&args.account),
         "smart-account signers set-signer-weight: submitting set_signer_weight"
     );
@@ -2257,8 +2244,6 @@ async fn batch_add_run(args: &BatchAddArgs) -> i32 {
     };
 
     info!(
-        rule_id = args.rule_id,
-        batch_len = new_signers.len(),
         account = %redact_strkey_first5_last5(&args.account),
         "smart-account signers batch-add: submitting batch_add_signer"
     );
@@ -2321,10 +2306,7 @@ async fn resolve_webauthn_source(
         parse_c_strkey_to_smart_account(&verifier_entry.address).map_err(|e| {
             WalletError::SmartAccount {
                 wire_code: e.wire_code(),
-                message: format!(
-                    "verifier registry address '{}' is not a valid C-strkey: {e}",
-                    verifier_entry.address
-                ),
+                message: VERIFIER_REGISTRY_ADDRESS_INVALID.to_owned(),
             }
         })?;
 
@@ -2411,7 +2393,7 @@ fn resolve_ed25519_source(
     let verifier_sc_addr = parse_c_strkey_to_smart_account(&verifier_c_strkey).map_err(|e| {
         WalletError::SmartAccount {
             wire_code: e.wire_code(),
-            message: format!("--signer-ed25519 verifier '{verifier_c_strkey}': {e}"),
+            message: ED25519_VERIFIER_ADDRESS_INVALID.to_owned(),
         }
     })?;
     Ok((verifier_sc_addr, key_data))

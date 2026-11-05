@@ -56,8 +56,10 @@ pub struct GcArgs {
 /// Success payload for the `approve gc` JSON envelope.
 #[derive(Debug, Serialize)]
 struct GcData {
-    /// Profile for which GC was performed.
-    profile: String,
+    /// Saved profile for which GC was performed; absent when the name
+    /// resolves to no saved profile.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    profile: Option<String>,
     /// Number of expired entries that were evicted.
     evicted_count: usize,
 }
@@ -133,13 +135,9 @@ pub async fn run(args: GcArgs) -> i32 {
     };
 
     // ── 6. Emit success envelope ──────────────────────────────────────────────
-    tracing::debug!(
-        profile = %profile_name,
-        evicted = evicted_count,
-        "approval gc completed"
-    );
+    tracing::debug!(evicted = evicted_count, "approval gc completed");
     render::render_json(&Envelope::ok(GcData {
-        profile: profile_name,
+        profile: super::common::saved_profile_name(profile_name),
         evicted_count,
     }));
     0

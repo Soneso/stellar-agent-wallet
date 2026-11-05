@@ -681,7 +681,7 @@ fn untrusted_auditor_refused() {
     .unwrap_err();
 
     assert!(
-        matches!(err, ToolsetInstallError::AuditorUntrusted { .. }),
+        matches!(err, ToolsetInstallError::AuditorUntrusted),
         "expected AuditorUntrusted for key not in auditor trust set, got: {err:?}"
     );
 }
@@ -1317,17 +1317,15 @@ fn redaction_error_display_no_key_bytes() {
     let auditor_sk = SigningKey::from_bytes(&AUDITOR_TEST_SEED);
     let auditor_pk = auditor_sk.verifying_key().to_bytes();
 
-    // AuditorUntrusted display should use a redacted key, not raw bytes.
+    // AuditorUntrusted states the rule, with no form of the key.
     let mut empty_set = BTreeSet::new();
     let err = check_auditor_trusted(&auditor_pk, &empty_set).unwrap_err();
-    let display = err.to_string();
-
-    // Raw pubkey hex must not appear in Display.
-    let pk_hex = hex::encode(auditor_pk);
-    assert!(
-        !display.contains(&pk_hex),
-        "AuditorUntrusted Display must not contain raw key hex; got: {display}"
+    assert_eq!(
+        err.to_string(),
+        "auditor untrusted: the attestation auditor key must be in auditor-trust.txt; add the \
+         key to trust it"
     );
+    assert_eq!(format!("{err:?}"), "AuditorUntrusted");
 
     // AttestationInvalid display must not contain variant detail beyond the static string.
     let invalid_err = ToolsetInstallError::AttestationInvalid {

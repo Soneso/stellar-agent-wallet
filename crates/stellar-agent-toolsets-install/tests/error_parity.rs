@@ -25,9 +25,7 @@ fn all_variants_covered_and_display_non_panicking() {
         ToolsetInstallError::PackageTooLarge { cap: 1024 },
         ToolsetInstallError::HashMismatch,
         ToolsetInstallError::SignatureInvalid,
-        ToolsetInstallError::UntrustedPublisher {
-            publisher_key_redacted: "GABCD...EFGHI".to_owned(),
-        },
+        ToolsetInstallError::UntrustedPublisher,
         ToolsetInstallError::TrustSetEmpty,
         ToolsetInstallError::TrustSetMalformed {
             detail: "bad entry".to_owned(),
@@ -41,16 +39,12 @@ fn all_variants_covered_and_display_non_panicking() {
         ToolsetInstallError::InvalidPackageName {
             detail: "contains uppercase".to_owned(),
         },
-        ToolsetInstallError::ArchivePathTraversal {
-            entry_name: "../etc/passwd".to_owned(),
-        },
+        ToolsetInstallError::ArchivePathTraversal,
         ToolsetInstallError::ArchiveEntryNameInvalid {
             detail: "nul byte".to_owned(),
         },
         ToolsetInstallError::ArchiveDisallowedEntryType,
-        ToolsetInstallError::ArchiveDuplicateEntry {
-            entry_name: "my-toolset/readme.md".to_owned(),
-        },
+        ToolsetInstallError::ArchiveDuplicateEntry,
         ToolsetInstallError::ArchiveTooManyEntries { cap: 4096 },
         ToolsetInstallError::ArchiveEntryTooLarge {
             cap: 32 * 1024 * 1024,
@@ -76,9 +70,7 @@ fn all_variants_covered_and_display_non_panicking() {
             new_version: "0.9.0".to_owned(),
             installed_version: "1.0.0".to_owned(),
         },
-        ToolsetInstallError::NotInstalled {
-            package: "my-toolset".to_owned(),
-        },
+        ToolsetInstallError::NotInstalled,
         ToolsetInstallError::PinRecordMalformed {
             detail: "invalid name".to_owned(),
         },
@@ -96,9 +88,7 @@ fn all_variants_covered_and_display_non_panicking() {
         ToolsetInstallError::AttestationInvalid {
             detail: "ed25519 verify_strict failed for attestation signature",
         },
-        ToolsetInstallError::AuditorUntrusted {
-            auditor_key_redacted: "GABCD...EFGHI".to_owned(),
-        },
+        ToolsetInstallError::AuditorUntrusted,
         // Only one field value is constructed here to satisfy the parity count.
         // Exhaustive field-value coverage for all four closed-set values
         // ("package", "version", "shasum", "capabilities") lives in

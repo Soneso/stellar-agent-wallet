@@ -189,6 +189,64 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `stellar_agent_core::policy::pin::write` is internal to the core crate;
   test fixtures use `pin::write_for_test` under the `test-helpers` feature.
+- Public error enums hold no field for a refused value. Removed: `ValidationError::AuditLogNotFound.path`,
+  `FeeTotalOverflow.per_op`, `ResetWindowStateNewerVersion.version`, `.max`;
+  `NetworkError::EnvelopeSignatureUnverifiable.hint`;
+  `WindowStoreError::UnsupportedVersion.version`, `.max`;
+  `VerifyError::NonRegularFileLogPath.path`, `LogNotFound.path`;
+  `SignerSetCanonicalBodyError::InvalidVerifierContract.strkey`;
+  `WalletLifecycleError::TtlInvalid.ttl_seconds`, `.reason`;
+  `WriterError::PathMismatch.requested_path`;
+  `FeeBumpError::FeeBelowCap15Minimum.supplied`, `FeeExceedsPolicyCap.supplied`;
+  `vault_redacted` of `DefindexPinError::{HashMismatch, SacNotVault, ExternalRef,
+  Absent}`; `ClaimError::NotClaimant.account`; `PoolError::SizeOutOfRange.requested`,
+  `FeeOverflow.fee_per_op`, the `DeriveError` of `DeriveFailed`; `QuoteError::SlippageExceeded.amount_out_min`;
+  `ResolveError::UsdtRefused.code`, `LookalikeRefused.code`, `.issuer_redacted`,
+  `PinnedCodeIssuerMismatch.supplied_issuer_redacted`,
+  `UnresolvableSacAddress.address_redacted`;
+  `Sep48Error::InvalidContractAddress.addr`, `FunctionNotFound.function_name`;
+  `ToolsetFormatError::DuplicateKey.key`, `ReservedMetadataKey.key`,
+  `NameDirMismatch.name`, `.dir`, `CapabilityTokenInvalidChar.token`,
+  `UnknownCapability.token`; `ToolsetInstallError::UntrustedPublisher.publisher_key_redacted`,
+  `ArchivePathTraversal.entry_name`, `ArchiveDuplicateEntry.entry_name`,
+  `NotInstalled.package`, `AuditorUntrusted.auditor_key_redacted`;
+  `SaError::ThresholdUnreachable.requested_op`, `contract_address_redacted` of
+  `VerifierMutable`, `PolicyMutable` and `ContractInstanceUnsupported`, `recorded`
+  of the five `*Sha256Drift` variants, `NetworksTomlIo.path`,
+  `SignerSetMissingBaseline.rule_id`, `MulticallSha256Drift.attempted`,
+  `.existing`, `VerifierHashDrift.observed_hash`, `.observed_executable`,
+  `PolicyHashDrift.observed_hash`, `.observed_executable`,
+  `VerifierWasmNotInAllowlist.observed_hash_first8`,
+  `PolicyWasmNotInAllowlist.observed_hash_first8`,
+  `PinVerifyError::Drift.observed_first8`,
+  `PinVerifyError::Divergent.primary_first8`, `.secondary_first8`,
+  `VerifierWasmRevoked.verifier_hash_first8`,
+  `VerifierWasmRetired.verifier_hash_first8`,
+  `SignerDecodeError::UnknownTag.tag`, `TimelockCancelFailed.operation_id_redacted`,
+  `TimelockExecuteFailed.operation_id_redacted`, and the fields of
+  `TimelockExecuteFailureReason::OperationIdMismatch`.
+  Replaced: `AuthError::KeyringNotFound.name` by `cause: KeyringMissingCause`,
+  `ValidationError::FeeAboveCap.per_op` by a `DerivedFee` field,
+  `ReceiptStoreError::Json.source` by `detail`,
+  `FetchContractWasmHashError::InvalidAddress.contract_redacted` by `reason`, and
+  `observed_wasm_hashes_summary` of `SaError::ThresholdPolicyIdentificationFailed`,
+  `SpendingLimitPolicyIdentificationFailed` and
+  `WeightedThresholdPolicyIdentificationFailed` by `observed_policy_count`, the
+  number of attached policies. `signers::types::WasmHashSummary` and
+  `WasmHashSummaryError` are removed. The drift audit rows keep the observed
+  hash and executable.
+  `WriterError` gains `EntryParse`, and `stellar_agent_mcp::transport` gains
+  `BoundedTransport`, `SessionStartError` and `serve_on`. The `approve list` and
+  `approve gc` reports name `profile` only when the name resolves to a saved
+  profile.
+- A single-contract executable-fetch divergence names the kind of each side,
+  `<Wasm>`, `<SAC>`, `<Absent>` or
+  `external-ref(owner=<redacted> tag="<bounded>")`, and no part of either
+  fetched hash, in `WasmHashDivergenceError` and in the
+  `network.rpc_divergence` error of the smart-account checks.
+- The migration destination allowlist refusal and the multicall router hash
+  refusal name no part of the refused hash. The router refusal names the leg
+  that diverged and the first eight hex characters of the pinned hash.
 - On a mainnet profile `--secret-env` is refused by `pay`, `claim` and
   `accounts create` with `validation.mainnet_secret_env_refused`, and these
   verbs sign with the enrolled seed in the keyring when no signer flag is
@@ -282,10 +340,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and `observed_policy_hashes`. `smart-account migrate-verifier`:
   `from_hash_first8`, `to_hash_first8` and `current_hash_first8` become
   `from_hash`, `to_hash` and `current_hash`. The `sa.verifier_hash_drift` and
-  `sa.policy_hash_drift` error details: `pinned_hash_first8` and
-  `observed_hash_first8` become `pinned_hash` and `observed_hash`, and the
-  message prints both in full. The library types follow the same names:
-  `PinResult::pinned_verifier_hashes` and `pinned_policy_hashes`,
+  `sa.policy_hash_drift` error details: `pinned_hash_first8` becomes
+  `pinned_hash`, and the message prints it in full. The library types follow
+  the same names: `PinResult::pinned_verifier_hashes` and `pinned_policy_hashes`,
   `PinnedHashesRecord`, `VerifyPinsResult`, `SignerMigrationStep`,
   `RuleMigration`, `MigrationPlan` and `ExecutableRefPin` carry
   `WasmHashPin` values.
@@ -295,9 +352,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   as the Stellar Asset Contract, with `sa.contract_instance_unsupported` and
   the reason `no Wasm code` (`AdminOrOwnerKey::NoWasmCode`).
   Neither override flag admits it. At signing, a contract with no Wasm code never
-  matches a pin. The drift errors omit `observed_hash`, the drift rows carry
-  `none`, and `rules verify-pins` reports a `null` entry in
-  `observed_verifier_hashes` / `observed_policy_hashes` for a contract with
+  matches a pin. The drift rows carry `none`, and `rules verify-pins` reports a
+  `null` entry in `observed_verifier_hashes` / `observed_policy_hashes` for a contract with
   no Wasm code or an external reference with no live tag entry, beside its
   executable summary.
 - `stellar-agent-cli` and `stellar-agent-mcp` enable the `mainnet-write`
@@ -771,6 +827,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Smart-account, timelock and multicall signing require an independent ledger
   observation before creating signatures. Missing or inconsistent evidence
   refuses the operation.
+
+- An error, log event, MCP result, stderr line or HTTP response holds no value
+  that a check refused, in any form: whole, redacted to a fragment, decoded to
+  one byte, or inside a retained dependency error. The rule covers CLI
+  arguments, MCP arguments, environment variables, configuration and wallet
+  state files, keyring values, browser request bodies and the public function
+  arguments of the published crates. Refusals state the check, the argument and
+  the accepted form; stable error codes are unchanged. Simulation failures
+  report a contract code and any known OpenZeppelin name, a recognized name
+  alone, a host class, or a fixed fallback. The missing-rule refusal uses its
+  fixed rule text. Endpoint diagnostics are omitted. Three dependency paths
+  follow the same rule: an MCP tool argument that fails to deserialize answers
+  `<tool>: the arguments have a missing field or a field of the wrong type or
+  value`, a refused WebAuthn bridge body answers `{"error":"invalid_body"}`, and
+  a non-overridable log filter keeps the rmcp events that format a client's
+  message out of the log at every operator directive.
 - Crate publication rebuilds every vendored contract Wasm file of the published
   commit from its pinned source with the pinned tools and compares the bytes
   before the registry credential is requested. A failed, cancelled or skipped

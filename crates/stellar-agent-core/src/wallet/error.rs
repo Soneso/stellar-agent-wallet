@@ -42,13 +42,11 @@ pub enum WalletLifecycleError {
     /// disposed and would be a programming error at the call site).  TTLs
     /// greater than 600 seconds (10 minutes) are prohibited to limit the
     /// maximum window during which signing materials reside in memory.
-    #[error("invalid TTL {ttl_seconds}s: {reason}")]
-    TtlInvalid {
-        /// The rejected TTL value supplied by the caller.
-        ttl_seconds: u32,
-        /// Human-readable reason explaining why the value is rejected.
-        reason: String,
-    },
+    #[error(
+        "wallet.unlock_ttl_seconds must be an integer from 1 through 600; update the profile and \
+         retry unlocking."
+    )]
+    TtlInvalid,
 
     /// A dispose operation was attempted on a wallet that has already been
     /// disposed.
@@ -116,13 +114,11 @@ mod tests {
 
     #[test]
     fn ttl_invalid_display() {
-        let e = WalletLifecycleError::TtlInvalid {
-            ttl_seconds: 0,
-            reason: "must be > 0".to_owned(),
-        };
-        let s = format!("{e}");
-        assert!(s.contains("0s"), "got: {s}");
-        assert!(s.contains("must be > 0"), "got: {s}");
+        assert_eq!(
+            WalletLifecycleError::TtlInvalid.to_string(),
+            "wallet.unlock_ttl_seconds must be an integer from 1 through 600; update the profile \
+             and retry unlocking."
+        );
     }
 
     #[test]
@@ -189,10 +185,7 @@ mod tests {
                 errno: 1,
             },
             WalletLifecycleError::Disposed,
-            WalletLifecycleError::TtlInvalid {
-                ttl_seconds: 0,
-                reason: "zero".to_owned(),
-            },
+            WalletLifecycleError::TtlInvalid,
             WalletLifecycleError::AlreadyDisposed,
             WalletLifecycleError::ClockError {
                 detail: "test clock error".to_owned(),
@@ -218,10 +211,7 @@ mod tests {
                 errno: 12,
             },
             WalletLifecycleError::Disposed,
-            WalletLifecycleError::TtlInvalid {
-                ttl_seconds: 0,
-                reason: "must be > 0".to_owned(),
-            },
+            WalletLifecycleError::TtlInvalid,
             WalletLifecycleError::AlreadyDisposed,
             WalletLifecycleError::ClockError {
                 detail: "system clock is before UNIX_EPOCH".to_owned(),

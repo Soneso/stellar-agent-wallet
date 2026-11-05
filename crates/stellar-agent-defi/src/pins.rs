@@ -26,6 +26,9 @@
 //!   constant), never a stringified RPC error.
 //! - Full WASM hashes and contract addresses NEVER appear in `Display`, `Debug`,
 //!   log events, or panic messages on this module's public types.
+//! - An on-chain hash that fails to match the pin appears in no error and no
+//!   log event, whole or as a fragment. The report-only `PinOutcome::Drift`
+//!   carries its first-8 hex for the operator.
 
 use stellar_agent_core::observability::redact_strkey_first5_last5;
 use thiserror::Error;
@@ -183,26 +186,25 @@ impl std::fmt::Debug for DefiContractPin {
 /// path.  The "proceed on Unavailable/absent/SAC/external reference" branch is
 /// unrepresentable.
 ///
-/// All variants carry first-8 hex hashes and first-5-last-5 contract addresses
-/// where applicable; NEVER the full 32-byte hash or full address.
+/// Contract addresses render first-5-last-5. A drift refusal names the pin
+/// alone, the first-8 hex of the pinned hash, and a divergence refusal names
+/// no hash; no variant holds any part of an on-chain hash it refused.
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum PinVerifyError {
     /// The on-chain WASM hash does not match the pin.
     ///
-    /// Fields carry first-8 hex redactions; full hashes never appear in
-    /// `Display` or `Debug`.
+    /// The variant carries the pin: the redacted contract address and the
+    /// first-8 hex of the pinned `wasm_hash`.
     #[error(
-        "DeFi contract pin DRIFT for {contract_redacted}: \
-         pinned={pinned_first8} on-chain={observed_first8}"
+        "DeFi executable must match the pinned executable for {contract_redacted}: \
+         pinned={pinned_first8}"
     )]
     Drift {
         /// First-5-last-5 redacted contract address.
         contract_redacted: String,
         /// First-8 hex of the pinned `wasm_hash`.
         pinned_first8: String,
-        /// First-8 hex of the on-chain WASM hash.
-        observed_first8: String,
     },
 
     /// The contract is a Stellar Asset Contract (SAC); DeFi adapters only accept
@@ -274,8 +276,8 @@ pub enum PinVerifyError {
 
     /// Primary and secondary RPC disagree on the on-chain WASM hash.
     ///
-    /// Fields carry first-8 hex redactions; full hashes never appear in
-    /// `Display` or `Debug`.
+    /// Both observed hashes are refused, so the variant carries neither, in
+    /// whole or in part; it names the redacted contract address alone.
     /// `wire_code` is [`WIRE_CODE_DIVERGENT`] for machine-stable MCP-envelope
     /// mapping.
     ///
@@ -284,15 +286,11 @@ pub enum PinVerifyError {
     /// this variant.  No function in this crate currently constructs it.
     #[error(
         "DeFi contract pin DIVERGENT for {contract_redacted}: \
-         primary={primary_first8} secondary={secondary_first8} (wire_code={wire_code})"
+         RPC executables must agree (wire_code={wire_code})"
     )]
     Divergent {
         /// First-5-last-5 redacted contract address.
         contract_redacted: String,
-        /// First-8 hex of the primary RPC's observed hash.
-        primary_first8: String,
-        /// First-8 hex of the secondary RPC's observed hash.
-        secondary_first8: String,
         /// Typed machine-stable wire-code; always [`WIRE_CODE_DIVERGENT`].
         wire_code: &'static str,
     },
@@ -396,27 +394,26 @@ pub fn verify_pin_for_sign(
 
     match fetch {
         WasmHashFetch::Wasm(observed) => {
-            let observed_first8 = hash_first8_hex(observed);
             // Full 32-byte compare: any partial-match gate (e.g. first-8 bytes only)
             // would be a security weakness — 8-byte collisions are trivially cheap.
             if *observed == pin.wasm_hash {
                 debug!(
                     contract_redacted = %contract_redacted,
-                    hash_first8 = %observed_first8,
+                    hash_first8 = %hash_first8_hex(observed),
                     "defi pin verify: hash match"
                 );
                 Ok(())
             } else {
+                // The on-chain hash failed to match, so the warning and the
+                // error name the pin alone.
                 warn!(
                     contract_redacted = %contract_redacted,
                     pinned_first8 = %pinned_first8,
-                    observed_first8 = %observed_first8,
-                    "defi pin verify: DRIFT — refusing sign"
+                    "defi pin verify: DRIFT; refusing sign"
                 );
                 Err(PinVerifyError::Drift {
                     contract_redacted,
                     pinned_first8,
-                    observed_first8,
                 })
             }
         }
@@ -449,8 +446,7 @@ pub fn verify_pin_for_sign(
                 contract_redacted = %contract_redacted,
                 owner_redacted = %owner_redacted,
                 tag = %tag,
-                resolved_first8 = %external.resolved_first8(),
-                "defi pin verify: external-reference executable — refusing sign"
+                "defi pin verify: external-reference executable; refusing sign"
             );
             Err(PinVerifyError::ExternalRef {
                 contract_redacted,
@@ -761,10 +757,32 @@ mod tests {
     fn verify_pin_for_sign_external_ref_refuses_even_when_resolved_equals_pin() {
         let hash = [7u8; 32];
         let pin = test_pin(hash);
-        let result = verify_pin_for_sign(&pin, &external_ref(Some(hash), b"pool-v2"));
-        let Err(err) = result else {
+        let mut captured = None;
+        let logs = stellar_agent_test_support::log_capture::with_captured_logs(|| {
+            captured = Some(verify_pin_for_sign(
+                &pin,
+                &external_ref(Some(hash), b"pool-v2"),
+            ));
+        });
+        let Some(Err(err)) = captured else {
             panic!("external reference must be refused");
         };
+        assert!(
+            logs.contains("defi pin verify: external-reference executable; refusing sign"),
+            "{logs}"
+        );
+        assert!(logs.contains("pool-v2"), "{logs}");
+        assert!(
+            !logs.contains("0707070707070707"),
+            "the resolved hash is refused and absent from the logs: {logs}"
+        );
+        // `PinVerifyError` has no serde form; the check walks the Display and
+        // Debug of the error and of every error in its source chain.
+        let resolved_full = stellar_agent_core::hex::encode(&hash);
+        let resolved_first8 = stellar_agent_core::hex::encode(&hash[..8]);
+        for marker in [&resolved_full, &resolved_first8] {
+            stellar_agent_test_support::rejected_value::assert_no_marker(&err, marker);
+        }
         let display = err.to_string();
         let PinVerifyError::ExternalRef {
             owner_redacted,
@@ -871,32 +889,108 @@ mod tests {
     // NEVER appear in Display/Debug output of the error types.
 
     #[test]
-    fn pin_verify_error_drift_display_redacts_full_hash() {
+    fn pin_verify_error_drift_display_is_the_exact_pin_text() {
         let pinned = [0xabu8; 32];
         let observed = [0xcdu8; 32];
         let pin = test_pin(pinned);
         let err = verify_pin_for_sign(&pin, &WasmHashFetch::Wasm(observed)).unwrap_err();
-        let display = err.to_string();
-        // Full 32-byte hex (64 chars of "ab" repeated) must not appear
+        assert_eq!(
+            err.to_string(),
+            "DeFi executable must match the pinned executable for CAAAA...AD2KM: \
+             pinned=abababababababab"
+        );
         let full_pinned_hex: String = pinned.iter().map(|b| format!("{b:02x}")).collect();
-        let full_observed_hex: String = observed.iter().map(|b| format!("{b:02x}")).collect();
         assert!(
-            !display.contains(&full_pinned_hex),
-            "full pinned hash in Display: {display}"
+            !err.to_string().contains(&full_pinned_hex),
+            "full pinned hash in Display: {err}"
+        );
+    }
+
+    /// A drifted on-chain hash is refused, so neither the error nor the
+    /// drift warning holds any part of it; the warning names the pin.
+    #[test]
+    fn pin_verify_error_drift_holds_no_part_of_the_observed_hash() {
+        let pinned = [0x11u8; 32];
+        let observed: [u8; 32] = std::array::from_fn(|i| 0xc0 ^ u8::try_from(i).unwrap());
+        let pin = test_pin(pinned);
+        let mut result = None;
+        let logs = stellar_agent_test_support::log_capture::with_captured_logs(|| {
+            result = Some(verify_pin_for_sign(&pin, &WasmHashFetch::Wasm(observed)));
+        });
+        let err = result
+            .expect("the closure ran")
+            .expect_err("a drifted hash must be refused");
+        assert!(
+            matches!(&err, PinVerifyError::Drift { pinned_first8, .. }
+                if pinned_first8 == "1111111111111111"),
+            "{err:?}"
         );
         assert!(
-            !display.contains(&full_observed_hex),
-            "full observed hash in Display: {display}"
+            logs.contains("defi pin verify: DRIFT; refusing sign"),
+            "the drift warning is captured: {logs}"
         );
-        // first-8 hex must appear
-        assert!(
-            display.contains("abababab"),
-            "first-8 of pinned not in Display: {display}"
+        assert!(logs.contains("1111111111111111"), "{logs}");
+        let observed_full = stellar_agent_core::hex::encode(&observed);
+        let observed_first8 = stellar_agent_core::hex::encode(&observed[..8]);
+        for (channel, rendered) in [
+            ("Display", err.to_string()),
+            ("Debug", format!("{err:?}")),
+            ("logs", logs.clone()),
+        ] {
+            assert!(
+                !rendered.contains(&observed_full),
+                "{channel} holds the observed hash: {rendered}"
+            );
+            assert!(
+                !rendered.contains(&observed_first8),
+                "{channel} holds the observed first-8: {rendered}"
+            );
+        }
+        // `PinVerifyError` has no serde form; the check walks the Display and
+        // Debug of the error and of every error in its source chain.
+        for marker in [&observed_full, &observed_first8] {
+            stellar_agent_test_support::rejected_value::assert_no_marker(&err, marker);
+        }
+    }
+
+    /// A divergence refusal names the redacted contract address and the wire
+    /// code, and no field holds either RPC's hash.
+    #[test]
+    fn pin_verify_error_divergent_is_the_exact_text_without_hashes() {
+        let pin = test_pin([1u8; 32]);
+        let err = PinVerifyError::Divergent {
+            contract_redacted: pin.redacted_address(),
+            wire_code: WIRE_CODE_DIVERGENT,
+        };
+        assert_eq!(
+            err.to_string(),
+            "DeFi contract pin DIVERGENT for CAAAA...AD2KM: RPC executables must agree \
+             (wire_code=defi.pin.divergent)"
         );
-        assert!(
-            display.contains("cdcdcdcd"),
-            "first-8 of observed not in Display: {display}"
+        assert_eq!(
+            format!("{err:?}"),
+            "Divergent { contract_redacted: \"CAAAA...AD2KM\", wire_code: \"defi.pin.divergent\" }"
         );
+    }
+
+    /// The report-only drift outcome keeps the observed first-8 hex for the
+    /// operator, in its value and in its serde form.
+    #[test]
+    fn check_pin_outcome_drift_reports_the_observed_first8() {
+        let pinned = [0x11u8; 32];
+        let observed = [0xcdu8; 32];
+        let pin = test_pin(pinned);
+        let outcome = check_pin_outcome(&pin, &WasmHashFetch::Wasm(observed));
+        assert_eq!(
+            outcome,
+            PinOutcome::Drift {
+                contract_redacted: pin.redacted_address(),
+                pinned_first8: "1111111111111111".to_owned(),
+                observed_first8: "cdcdcdcdcdcdcdcd".to_owned(),
+            }
+        );
+        let json = serde_json::to_string(&outcome).expect("serializes");
+        assert!(json.contains("cdcdcdcdcdcdcdcd"), "{json}");
     }
 
     #[test]

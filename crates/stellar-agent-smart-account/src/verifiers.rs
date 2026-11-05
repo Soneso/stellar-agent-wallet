@@ -565,10 +565,8 @@ impl VerifierRegistry {
             });
         }
 
-        let contents = std::fs::read_to_string(&path).map_err(|e| SaError::NetworksTomlIo {
-            source: e,
-            path: path.clone(),
-        })?;
+        let contents =
+            std::fs::read_to_string(&path).map_err(|e| SaError::NetworksTomlIo { source: e })?;
 
         let file: RegistryFile =
             toml::from_str(&contents).map_err(|e| SaError::NetworksTomlParse {
@@ -753,7 +751,6 @@ impl VerifierRegistry {
             // Different sha256 → refuse.
             return Err(SaError::WebAuthnVerifierSha256Drift {
                 network: network_passphrase.to_owned(),
-                recorded: existing.wasm_sha256.clone(),
                 attempted: wasm_sha256,
             });
         }
@@ -814,7 +811,6 @@ impl VerifierRegistry {
             }
             return Err(SaError::Ed25519VerifierSha256Drift {
                 network: network_passphrase.to_owned(),
-                recorded: existing.wasm_sha256.clone(),
                 attempted: wasm_sha256,
             });
         }
@@ -876,7 +872,6 @@ impl VerifierRegistry {
             }
             return Err(SaError::SpendingLimitPolicySha256Drift {
                 network: network_passphrase.to_owned(),
-                recorded: existing.wasm_sha256.clone(),
                 attempted: wasm_sha256,
             });
         }
@@ -923,7 +918,6 @@ impl VerifierRegistry {
             }
             return Err(SaError::SimpleThresholdPolicySha256Drift {
                 network: network_passphrase.to_owned(),
-                recorded: existing.wasm_sha256.clone(),
                 attempted: wasm_sha256,
             });
         }
@@ -970,7 +964,6 @@ impl VerifierRegistry {
             }
             return Err(SaError::WeightedThresholdPolicySha256Drift {
                 network: network_passphrase.to_owned(),
-                recorded: existing.wasm_sha256.clone(),
                 attempted: wasm_sha256,
             });
         }
@@ -1023,13 +1016,9 @@ impl VerifierRegistry {
                 std::io::ErrorKind::InvalidInput,
                 "registry path has no parent directory",
             ),
-            path: path.clone(),
         })?;
 
-        create_dir_0700(parent).map_err(|e| SaError::NetworksTomlIo {
-            source: e,
-            path: parent.to_path_buf(),
-        })?;
+        create_dir_0700(parent).map_err(|e| SaError::NetworksTomlIo { source: e })?;
 
         // Build the TOML file contents.  Fully-empty records (no contract slot
         // populated) are omitted so a transiently-created-then-emptied entry
@@ -1047,15 +1036,12 @@ impl VerifierRegistry {
             // toml::ser::Error does not implement std::io::Error; wrap as io::Error.
             SaError::NetworksTomlIo {
                 source: std::io::Error::other(e.to_string()),
-                path: path.clone(),
             }
         })?;
 
         // Atomic write: write to temp file, fsync, rename.
-        atomic_write_0600(path, toml_str.as_bytes()).map_err(|e| SaError::NetworksTomlIo {
-            source: e,
-            path: path.clone(),
-        })?;
+        atomic_write_0600(path, toml_str.as_bytes())
+            .map_err(|e| SaError::NetworksTomlIo { source: e })?;
 
         Ok(())
     }
@@ -1132,7 +1118,6 @@ fn default_networks_toml_path_with_override(
                 std::io::ErrorKind::NotFound,
                 "cannot determine OS data directory; set STELLAR_AGENT_NETWORKS_TOML",
             ),
-            path: PathBuf::from("<data-dir>"),
         }
     })?;
 
@@ -1349,6 +1334,55 @@ mod tests {
         assert_eq!(t1, t2, "timestamp must be unchanged on AlreadyRecorded");
     }
 
+    /// Every deployment-pin refusal states the check for its fixed field and
+    /// holds the hash the registry recorded in no rendered form.
+    #[test]
+    fn deployment_pin_refusals_hold_no_recorded_hash() {
+        type Record =
+            fn(&mut VerifierRegistry, &str, String, String) -> Result<RecordOutcome, SaError>;
+        let cases: [(Record, &str); 5] = [
+            (
+                VerifierRegistry::record_webauthn_verifier,
+                "webauthn_verifier_wasm_sha256",
+            ),
+            (
+                VerifierRegistry::record_ed25519_verifier,
+                "ed25519_verifier_wasm_sha256",
+            ),
+            (
+                VerifierRegistry::record_spending_limit_policy,
+                "spending_limit_policy_wasm_sha256",
+            ),
+            (
+                VerifierRegistry::record_simple_threshold_policy,
+                "simple_threshold_policy_wasm_sha256",
+            ),
+            (
+                VerifierRegistry::record_weighted_threshold_policy,
+                "weighted_threshold_policy_wasm_sha256",
+            ),
+        ];
+        let recorded = "63726564".repeat(8);
+        for (record, field) in cases {
+            let (_guard, path) = temp_registry();
+            let mut reg = VerifierRegistry::open_at(path).expect("open");
+            record(&mut reg, testnet(), fake_address(), recorded.clone()).expect("first record");
+
+            let error = record(&mut reg, testnet(), fake_address(), alt_sha256())
+                .expect_err("a different hash must be refused");
+
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "{field} must match the binary vendored Wasm SHA-256 pin; verify the \
+                     deployment and correct the registry entry."
+                )
+            );
+            let forms = format!("{error:?}\n{}", serde_json::to_string(&error).unwrap());
+            assert!(!forms.contains(&recorded), "{forms}");
+        }
+    }
+
     /// Second `record_webauthn_verifier` with a different `wasm_sha256` returns
     /// `SaError::WebAuthnVerifierSha256Drift`.
     #[test]
@@ -1368,11 +1402,8 @@ mod tests {
                 err,
                 SaError::WebAuthnVerifierSha256Drift {
                     ref network,
-                    ref recorded,
                     ref attempted,
-                } if network == testnet()
-                    && recorded == &fake_sha256()
-                    && attempted == &alt_sha256()
+                } if network == testnet() && attempted == &alt_sha256()
             ),
             "unexpected error: {err:?}"
         );

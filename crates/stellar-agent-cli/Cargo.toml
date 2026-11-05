@@ -129,6 +129,8 @@ stellar-agent-windows-identity = { workspace = true }
 stellar-agent-approval-ui = { path = "../stellar-agent-approval-ui", features = ["test-helpers"] }
 # WalletServer::call_stellar_pay for the CLI and MCP policy parity test.
 stellar-agent-mcp = { path = "../stellar-agent-mcp", default-features = false, features = ["test-helpers"] }
+# Authenticate a raw policy window-state body in the reset refusal test.
+hmac = { workspace = true }
 # Build signed toolset .tar.gz fixtures in the install tests.
 flate2 = { workspace = true }
 tar = { workspace = true }

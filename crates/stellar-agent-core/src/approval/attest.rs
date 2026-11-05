@@ -374,12 +374,13 @@ pub fn load_attestation_key(
         map_keyring_operation_error(&e, KeyringOperation::Read, &entry_ref.service)
     })?);
 
-    let key_bytes = Zeroizing::new(URL_SAFE_NO_PAD.decode(secret_b64.as_bytes()).map_err(|e| {
-        tracing::debug!(error = %e, "attestation key base64 decode failed");
-        WalletError::Approval(ApprovalFailure::KeyDecodeFailed {
-            detail: "attestation key is not valid base64".to_owned(),
-        })
-    })?);
+    let key_bytes =
+        Zeroizing::new(URL_SAFE_NO_PAD.decode(secret_b64.as_bytes()).map_err(|_| {
+            tracing::debug!("attestation key base64 decode failed");
+            WalletError::Approval(ApprovalFailure::KeyDecodeFailed {
+                detail: "attestation key is not valid base64".to_owned(),
+            })
+        })?);
 
     if key_bytes.len() != 32 {
         return Err(WalletError::Approval(ApprovalFailure::KeyLengthError {

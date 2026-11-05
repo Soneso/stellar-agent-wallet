@@ -160,13 +160,7 @@ async fn a_missing_baseline_refuses_before_the_drift_check_reads_the_chain() {
 
     match &result {
         Err(CredentialsError::SignerSetDivergence { source }) => assert!(
-            matches!(
-                source.as_ref(),
-                SaError::SignerSetMissingBaseline {
-                    rule_id: RULE_ID,
-                    ..
-                }
-            ),
+            matches!(source.as_ref(), SaError::SignerSetMissingBaseline { .. }),
             "the baseline read refuses first: {source:?}"
         ),
         other => panic!("expected SignerSetDivergence; got {other:?}"),

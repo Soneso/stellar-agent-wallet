@@ -83,7 +83,8 @@ use crate::error::{
 };
 use crate::managers::credentials::AuditWriterPoisonContext;
 use crate::managers::rules::{
-    BASE_FEE_STROOPS, augment_with_oz_error_name, parse_c_strkey_to_smart_account,
+    BASE_FEE_STROOPS, SimulationErrorClass, augment_with_oz_error_name,
+    parse_c_strkey_to_smart_account,
 };
 use crate::signing::ledger_witness::checked_secondary_rpc_url;
 use crate::submit::refuse_mainnet_sa;
@@ -500,11 +501,7 @@ fn schedule_submit_error(e: SaError, request_id: &str) -> SaError {
 /// [`SaError::MainnetWriteForbidden`] and the two ledger witness refusals pass
 /// through unchanged and keep their codes. Every other error becomes
 /// [`SaError::TimelockCancelFailed`], classified from its text.
-fn cancel_submit_error(
-    e: SaError,
-    operation_id: &TimelockOperationId,
-    request_id: &str,
-) -> SaError {
+fn cancel_submit_error(e: SaError, request_id: &str) -> SaError {
     if keeps_its_wire_code(&e) {
         return e;
     }
@@ -519,7 +516,6 @@ fn cancel_submit_error(
     SaError::TimelockCancelFailed {
         failure_reason: classified,
         redacted_reason: augment_with_oz_error_name(&reason),
-        operation_id_redacted: operation_id.redacted(),
         request_id: request_id.to_owned(),
     }
 }
@@ -530,11 +526,7 @@ fn cancel_submit_error(
 /// the two ledger witness refusals pass through unchanged and keep their
 /// codes. Every other error becomes [`SaError::TimelockExecuteFailed`],
 /// classified from its text.
-fn execute_submit_error(
-    e: SaError,
-    operation_id: &TimelockOperationId,
-    request_id: &str,
-) -> SaError {
+fn execute_submit_error(e: SaError, request_id: &str) -> SaError {
     if matches!(e, SaError::SubmissionUnresolved { .. }) || keeps_its_wire_code(&e) {
         return e;
     }
@@ -544,7 +536,6 @@ fn execute_submit_error(
     SaError::TimelockExecuteFailed {
         failure_reason: classified,
         redacted_reason: augment_with_oz_error_name(&reason),
-        operation_id_redacted: operation_id.redacted(),
         request_id: request_id.to_owned(),
     }
 }
@@ -815,7 +806,10 @@ async fn query_operation_ready_ledger(
         // If the operation is unscheduled, OZ `get_operation_ledger` returns
         // UNSET_LEDGER (0) directly — it does not panic. Any simulation error
         // here indicates a real RPC failure, not an "operation not found".
-        return Err(format!("simulation error: {err}"));
+        return Err(format!(
+            "simulation error: {}",
+            SimulationErrorClass::of(err)
+        ));
     }
 
     let return_val = sim_response
@@ -990,7 +984,6 @@ fn emit_cancelled_audit(
                 "audit writer poisoned: {}",
                 AuditWriterPoisonContext::TimelockCancelEmission
             ),
-            operation_id_redacted: operation_id.redacted(),
             request_id: request_id.to_owned(),
         }
     })?;
@@ -1061,7 +1054,6 @@ fn emit_executed_audit(
                 "audit writer poisoned: {}",
                 AuditWriterPoisonContext::TimelockExecuteEmission
             ),
-            operation_id_redacted: operation_id.redacted(),
             request_id: request_id.to_owned(),
         }
     })?;
@@ -1871,7 +1863,6 @@ pub async fn cancel(args: TimelockCancelArgs<'_>) -> Result<(), SaError> {
             SaError::TimelockCancelFailed {
                 failure_reason: TimelockCancelFailureReason::SimulationFailed,
                 redacted_reason: format!("timelock address parse failed: {e:?}"),
-                operation_id_redacted: operation_id.redacted(),
                 request_id: request_id.to_owned(),
             }
         })?;
@@ -1884,7 +1875,6 @@ pub async fn cancel(args: TimelockCancelArgs<'_>) -> Result<(), SaError> {
         .map_err(|e| SaError::TimelockCancelFailed {
             failure_reason: TimelockCancelFailureReason::SimulationFailed,
             redacted_reason: format!("canceller public key fetch failed: {e}"),
-            operation_id_redacted: operation_id.redacted(),
             request_id: request_id.to_owned(),
         })?;
     let canceller_sc_address = {
@@ -1893,7 +1883,6 @@ pub async fn cancel(args: TimelockCancelArgs<'_>) -> Result<(), SaError> {
             Strkey::from_string(&canceller_strkey).map_err(|e| SaError::TimelockCancelFailed {
                 failure_reason: TimelockCancelFailureReason::SimulationFailed,
                 redacted_reason: format!("canceller strkey parse failed: {e:?}"),
-                operation_id_redacted: operation_id.redacted(),
                 request_id: request_id.to_owned(),
             })?;
         match strkey {
@@ -1904,7 +1893,6 @@ pub async fn cancel(args: TimelockCancelArgs<'_>) -> Result<(), SaError> {
                 return Err(SaError::TimelockCancelFailed {
                     failure_reason: TimelockCancelFailureReason::SimulationFailed,
                     redacted_reason: "canceller must be a G-strkey".to_owned(),
-                    operation_id_redacted: operation_id.redacted(),
                     request_id: request_id.to_owned(),
                 });
             }
@@ -1917,7 +1905,6 @@ pub async fn cancel(args: TimelockCancelArgs<'_>) -> Result<(), SaError> {
             SaError::TimelockCancelFailed {
                 failure_reason: TimelockCancelFailureReason::SimulationFailed,
                 redacted_reason: format!("operation_id ScBytes failed: {e:?}"),
-                operation_id_redacted: operation_id.redacted(),
                 request_id: request_id.to_owned(),
             }
         })?);
@@ -1934,7 +1921,6 @@ pub async fn cancel(args: TimelockCancelArgs<'_>) -> Result<(), SaError> {
             .map_err(|e| SaError::TimelockCancelFailed {
                 failure_reason: TimelockCancelFailureReason::SimulationFailed,
                 redacted_reason: format!("cancel args VecM encoding failed: {e:?}"),
-                operation_id_redacted: operation_id.redacted(),
                 request_id: request_id.to_owned(),
             })?;
 
@@ -1942,7 +1928,6 @@ pub async fn cancel(args: TimelockCancelArgs<'_>) -> Result<(), SaError> {
         ScSymbol::try_from(FN_CANCEL).map_err(|e| SaError::TimelockCancelFailed {
             failure_reason: TimelockCancelFailureReason::SimulationFailed,
             redacted_reason: format!("'cancel' symbol encoding failed: {e:?}"),
-            operation_id_redacted: operation_id.redacted(),
             request_id: request_id.to_owned(),
         })?;
 
@@ -1968,7 +1953,7 @@ pub async fn cancel(args: TimelockCancelArgs<'_>) -> Result<(), SaError> {
         },
     )
     .await
-    .map_err(|e| cancel_submit_error(e, operation_id, request_id))?;
+    .map_err(|e| cancel_submit_error(e, request_id))?;
 
     // Cross-confirm OperationCancelled event on BOTH primary and secondary RPCs.
     cross_confirm_event(
@@ -1985,7 +1970,6 @@ pub async fn cancel(args: TimelockCancelArgs<'_>) -> Result<(), SaError> {
         CrossConfirmError::EventMissing(reason) => SaError::TimelockCancelFailed {
             failure_reason: TimelockCancelFailureReason::EventConfirmationMissing,
             redacted_reason: reason,
-            operation_id_redacted: operation_id.redacted(),
             request_id: request_id.to_owned(),
         },
         CrossConfirmError::Divergence {
@@ -2105,14 +2089,12 @@ pub async fn execute(args: TimelockExecuteArgs<'_>) -> Result<String, SaError> {
         StellarRpcClient::new(primary_rpc_url).map_err(|e| SaError::TimelockExecuteFailed {
             failure_reason: TimelockExecuteFailureReason::SimulationFailed,
             redacted_reason: format!("primary RPC client construction failed: {e}"),
-            operation_id_redacted: "unknown".to_owned(),
             request_id: request_id.to_owned(),
         })?;
     let secondary_rpc =
         StellarRpcClient::new(secondary_rpc_url).map_err(|e| SaError::TimelockExecuteFailed {
             failure_reason: TimelockExecuteFailureReason::SimulationFailed,
             redacted_reason: format!("secondary RPC client construction failed: {e}"),
-            operation_id_redacted: "unknown".to_owned(),
             request_id: request_id.to_owned(),
         })?;
 
@@ -2142,7 +2124,6 @@ pub async fn execute(args: TimelockExecuteArgs<'_>) -> Result<String, SaError> {
                 redacted_reason: "fetch_latest_ledger returned None for primary RPC; \
                                   cannot determine operation readiness"
                     .to_owned(),
-                operation_id_redacted: pre_check_id.redacted(),
                 request_id: request_id.to_owned(),
             }
         })?;
@@ -2167,7 +2148,6 @@ pub async fn execute(args: TimelockExecuteArgs<'_>) -> Result<String, SaError> {
                         "operation is Waiting; ready at ledger {ready_ledger}, \
                          current {current_ledger}"
                     ),
-                    operation_id_redacted: pre_check_id.redacted(),
                     request_id: request_id.to_owned(),
                 });
             }
@@ -2182,7 +2162,6 @@ pub async fn execute(args: TimelockExecuteArgs<'_>) -> Result<String, SaError> {
                     },
                     redacted_reason: "operation is Unset (not scheduled or already cancelled)"
                         .to_owned(),
-                    operation_id_redacted: pre_check_id.redacted(),
                     request_id: request_id.to_owned(),
                 });
             }
@@ -2190,7 +2169,6 @@ pub async fn execute(args: TimelockExecuteArgs<'_>) -> Result<String, SaError> {
                 return Err(SaError::TimelockExecuteFailed {
                     failure_reason: TimelockExecuteFailureReason::InvalidOperationState,
                     redacted_reason: "operation is already Done (already executed)".to_owned(),
-                    operation_id_redacted: pre_check_id.redacted(),
                     request_id: request_id.to_owned(),
                 });
             }
@@ -2223,18 +2201,12 @@ pub async fn execute(args: TimelockExecuteArgs<'_>) -> Result<String, SaError> {
         && *expected != operation_id
     {
         return Err(SaError::TimelockExecuteFailed {
-            failure_reason: TimelockExecuteFailureReason::OperationIdMismatch {
-                user_supplied: expected.to_hex(),
-                simulate_derived: operation_id.to_hex(),
-            },
-            redacted_reason: format!(
-                "caller-supplied operation_id {} does not match \
-                 simulate-derived {} — check --operation-id, --target, \
-                 --function, --salt, and predecessor match the scheduled operation",
-                expected.redacted(),
-                operation_id.redacted()
-            ),
-            operation_id_redacted: expected.redacted(),
+            failure_reason: TimelockExecuteFailureReason::OperationIdMismatch,
+            redacted_reason: "operation_id must match the operation derived from the scheduled \
+                              target, function, arguments, salt and predecessor; check \
+                              --operation-id, --target, --function, --salt and predecessor \
+                              against the scheduled operation."
+                .to_owned(),
             request_id: request_id.to_owned(),
         });
     }
@@ -2264,7 +2236,6 @@ pub async fn execute(args: TimelockExecuteArgs<'_>) -> Result<String, SaError> {
                 redacted_reason: "fetch_latest_ledger returned None for primary RPC; \
                                   cannot determine operation readiness"
                     .to_owned(),
-                operation_id_redacted: operation_id.redacted(),
                 request_id: request_id.to_owned(),
             }
         })?;
@@ -2288,7 +2259,6 @@ pub async fn execute(args: TimelockExecuteArgs<'_>) -> Result<String, SaError> {
                         "operation is Waiting; ready at ledger {ready_ledger}, \
                          current {current_ledger}"
                     ),
-                    operation_id_redacted: operation_id.redacted(),
                     request_id: request_id.to_owned(),
                 });
             }
@@ -2302,7 +2272,6 @@ pub async fn execute(args: TimelockExecuteArgs<'_>) -> Result<String, SaError> {
                     },
                     redacted_reason: "operation is Unset (not scheduled or already cancelled)"
                         .to_owned(),
-                    operation_id_redacted: operation_id.redacted(),
                     request_id: request_id.to_owned(),
                 });
             }
@@ -2310,7 +2279,6 @@ pub async fn execute(args: TimelockExecuteArgs<'_>) -> Result<String, SaError> {
                 return Err(SaError::TimelockExecuteFailed {
                     failure_reason: TimelockExecuteFailureReason::InvalidOperationState,
                     redacted_reason: "operation is already Done (already executed)".to_owned(),
-                    operation_id_redacted: operation_id.redacted(),
                     request_id: request_id.to_owned(),
                 });
             }
@@ -2327,7 +2295,6 @@ pub async fn execute(args: TimelockExecuteArgs<'_>) -> Result<String, SaError> {
             SaError::TimelockExecuteFailed {
                 failure_reason: TimelockExecuteFailureReason::SimulationFailed,
                 redacted_reason: format!("timelock address parse failed: {e:?}"),
-                operation_id_redacted: operation_id.redacted(),
                 request_id: request_id.to_owned(),
             }
         })?;
@@ -2336,7 +2303,6 @@ pub async fn execute(args: TimelockExecuteArgs<'_>) -> Result<String, SaError> {
         SaError::TimelockExecuteFailed {
             failure_reason: TimelockExecuteFailureReason::SimulationFailed,
             redacted_reason: format!("target address parse failed: {e:?}"),
-            operation_id_redacted: operation_id.redacted(),
             request_id: request_id.to_owned(),
         }
     })?;
@@ -2344,7 +2310,6 @@ pub async fn execute(args: TimelockExecuteArgs<'_>) -> Result<String, SaError> {
     let fn_sym = ScSymbol::try_from(function).map_err(|e| SaError::TimelockExecuteFailed {
         failure_reason: TimelockExecuteFailureReason::SimulationFailed,
         redacted_reason: format!("function symbol encoding failed: {e:?}"),
-        operation_id_redacted: operation_id.redacted(),
         request_id: request_id.to_owned(),
     })?;
 
@@ -2353,7 +2318,6 @@ pub async fn execute(args: TimelockExecuteArgs<'_>) -> Result<String, SaError> {
             SaError::TimelockExecuteFailed {
                 failure_reason: TimelockExecuteFailureReason::SimulationFailed,
                 redacted_reason: format!("predecessor ScBytes failed: {e:?}"),
-                operation_id_redacted: operation_id.redacted(),
                 request_id: request_id.to_owned(),
             }
         })?);
@@ -2361,7 +2325,6 @@ pub async fn execute(args: TimelockExecuteArgs<'_>) -> Result<String, SaError> {
         SaError::TimelockExecuteFailed {
             failure_reason: TimelockExecuteFailureReason::SimulationFailed,
             redacted_reason: format!("salt ScBytes failed: {e:?}"),
-            operation_id_redacted: operation_id.redacted(),
             request_id: request_id.to_owned(),
         }
     })?);
@@ -2372,7 +2335,6 @@ pub async fn execute(args: TimelockExecuteArgs<'_>) -> Result<String, SaError> {
             .map_err(|e| SaError::TimelockExecuteFailed {
                 failure_reason: TimelockExecuteFailureReason::SimulationFailed,
                 redacted_reason: format!("target-function args VecM encoding failed: {e:?}"),
-                operation_id_redacted: operation_id.redacted(),
                 request_id: request_id.to_owned(),
             })?;
     let args_scval = ScVal::Vec(Some(ScVec(args_vecm)));
@@ -2399,7 +2361,6 @@ pub async fn execute(args: TimelockExecuteArgs<'_>) -> Result<String, SaError> {
             .map_err(|e| SaError::TimelockExecuteFailed {
                 failure_reason: TimelockExecuteFailureReason::SimulationFailed,
                 redacted_reason: format!("execute args VecM encoding failed: {e:?}"),
-                operation_id_redacted: operation_id.redacted(),
                 request_id: request_id.to_owned(),
             })?;
 
@@ -2407,7 +2368,6 @@ pub async fn execute(args: TimelockExecuteArgs<'_>) -> Result<String, SaError> {
         ScSymbol::try_from(FN_EXECUTE).map_err(|e| SaError::TimelockExecuteFailed {
             failure_reason: TimelockExecuteFailureReason::SimulationFailed,
             redacted_reason: format!("'execute' symbol encoding failed: {e:?}"),
-            operation_id_redacted: operation_id.redacted(),
             request_id: request_id.to_owned(),
         })?;
 
@@ -2434,7 +2394,7 @@ pub async fn execute(args: TimelockExecuteArgs<'_>) -> Result<String, SaError> {
         },
     )
     .await
-    .map_err(|e| execute_submit_error(e, &operation_id, request_id))?;
+    .map_err(|e| execute_submit_error(e, request_id))?;
 
     // Cross-confirm OperationExecuted event on BOTH primary and secondary RPCs.
     cross_confirm_event(
@@ -2451,7 +2411,6 @@ pub async fn execute(args: TimelockExecuteArgs<'_>) -> Result<String, SaError> {
         CrossConfirmError::EventMissing(reason) => SaError::TimelockExecuteFailed {
             failure_reason: TimelockExecuteFailureReason::EventConfirmationMissing,
             redacted_reason: reason,
-            operation_id_redacted: operation_id.redacted(),
             request_id: request_id.to_owned(),
         },
         CrossConfirmError::Divergence {
@@ -2683,7 +2642,6 @@ async fn simulate_hash_operation(
             SaError::TimelockExecuteFailed {
                 failure_reason: TimelockExecuteFailureReason::SimulationFailed,
                 redacted_reason: format!("timelock address parse failed: {e:?}"),
-                operation_id_redacted: "unknown".to_owned(),
                 request_id: request_id.to_owned(),
             }
         })?;
@@ -2691,14 +2649,12 @@ async fn simulate_hash_operation(
         SaError::TimelockExecuteFailed {
             failure_reason: TimelockExecuteFailureReason::SimulationFailed,
             redacted_reason: format!("target address parse failed: {e:?}"),
-            operation_id_redacted: "unknown".to_owned(),
             request_id: request_id.to_owned(),
         }
     })?;
     let fn_sym = ScSymbol::try_from(function).map_err(|e| SaError::TimelockExecuteFailed {
         failure_reason: TimelockExecuteFailureReason::SimulationFailed,
         redacted_reason: format!("function symbol encoding failed: {e:?}"),
-        operation_id_redacted: "unknown".to_owned(),
         request_id: request_id.to_owned(),
     })?;
 
@@ -2709,7 +2665,6 @@ async fn simulate_hash_operation(
             .map_err(|e| SaError::TimelockExecuteFailed {
                 failure_reason: TimelockExecuteFailureReason::SimulationFailed,
                 redacted_reason: format!("args VecM encoding failed: {e:?}"),
-                operation_id_redacted: "unknown".to_owned(),
                 request_id: request_id.to_owned(),
             })?;
     let args_scval = ScVal::Vec(Some(ScVec(args_vecm)));
@@ -2719,7 +2674,6 @@ async fn simulate_hash_operation(
             SaError::TimelockExecuteFailed {
                 failure_reason: TimelockExecuteFailureReason::SimulationFailed,
                 redacted_reason: format!("predecessor ScBytes encoding failed: {e:?}"),
-                operation_id_redacted: "unknown".to_owned(),
                 request_id: request_id.to_owned(),
             }
         })?);
@@ -2727,7 +2681,6 @@ async fn simulate_hash_operation(
         SaError::TimelockExecuteFailed {
             failure_reason: TimelockExecuteFailureReason::SimulationFailed,
             redacted_reason: format!("salt ScBytes encoding failed: {e:?}"),
-            operation_id_redacted: "unknown".to_owned(),
             request_id: request_id.to_owned(),
         }
     })?);
@@ -2748,7 +2701,6 @@ async fn simulate_hash_operation(
             .map_err(|e| SaError::TimelockExecuteFailed {
                 failure_reason: TimelockExecuteFailureReason::SimulationFailed,
                 redacted_reason: format!("invoke args VecM encoding failed: {e:?}"),
-                operation_id_redacted: "unknown".to_owned(),
                 request_id: request_id.to_owned(),
             })?;
 
@@ -2756,7 +2708,6 @@ async fn simulate_hash_operation(
         ScSymbol::try_from("hash_operation").map_err(|e| SaError::TimelockExecuteFailed {
             failure_reason: TimelockExecuteFailureReason::SimulationFailed,
             redacted_reason: format!("'hash_operation' symbol encoding failed: {e:?}"),
-            operation_id_redacted: "unknown".to_owned(),
             request_id: request_id.to_owned(),
         })?;
 
@@ -2786,7 +2737,6 @@ async fn simulate_hash_operation(
         SaError::TimelockExecuteFailed {
             failure_reason: TimelockExecuteFailureReason::SimulationFailed,
             redacted_reason: format!("BaselibAccount: {e:?}"),
-            operation_id_redacted: "unknown".to_owned(),
             request_id: request_id.to_owned(),
         }
     })?;
@@ -2804,14 +2754,12 @@ async fn simulate_hash_operation(
         build_rpc_server(primary_rpc_url).map_err(|e| SaError::TimelockExecuteFailed {
             failure_reason: TimelockExecuteFailureReason::SimulationFailed,
             redacted_reason: format!("primary RPC Client construction failed: {e}"),
-            operation_id_redacted: "unknown".to_owned(),
             request_id: request_id.to_owned(),
         })?;
     let secondary_server =
         build_rpc_server(secondary_rpc_url).map_err(|e| SaError::TimelockExecuteFailed {
             failure_reason: TimelockExecuteFailureReason::SimulationFailed,
             redacted_reason: format!("secondary RPC Client construction failed: {e}"),
-            operation_id_redacted: "unknown".to_owned(),
             request_id: request_id.to_owned(),
         })?;
 
@@ -2821,7 +2769,6 @@ async fn simulate_hash_operation(
         .map_err(|e| SaError::TimelockExecuteFailed {
             failure_reason: TimelockExecuteFailureReason::SimulationFailed,
             redacted_reason: format!("to_envelope failed: {e:?}"),
-            operation_id_redacted: "unknown".to_owned(),
             request_id: request_id.to_owned(),
         })?;
     let (primary_sim, secondary_sim) = tokio::join!(
@@ -2832,29 +2779,31 @@ async fn simulate_hash_operation(
     let primary_sim = primary_sim.map_err(|e| SaError::TimelockExecuteFailed {
         failure_reason: TimelockExecuteFailureReason::SimulationFailed,
         redacted_reason: format!("primary simulate_transaction_envelope failed: {e}"),
-        operation_id_redacted: "unknown".to_owned(),
         request_id: request_id.to_owned(),
     })?;
     let secondary_sim = secondary_sim.map_err(|e| SaError::TimelockExecuteFailed {
         failure_reason: TimelockExecuteFailureReason::SimulationFailed,
         redacted_reason: format!("secondary simulate_transaction_envelope failed: {e}"),
-        operation_id_redacted: "unknown".to_owned(),
         request_id: request_id.to_owned(),
     })?;
 
     if let Some(err) = &primary_sim.error {
         return Err(SaError::TimelockExecuteFailed {
             failure_reason: TimelockExecuteFailureReason::SimulationFailed,
-            redacted_reason: format!("primary simulation error: {err}"),
-            operation_id_redacted: "unknown".to_owned(),
+            redacted_reason: format!(
+                "primary simulation error: {}",
+                SimulationErrorClass::of(err)
+            ),
             request_id: request_id.to_owned(),
         });
     }
     if let Some(err) = &secondary_sim.error {
         return Err(SaError::TimelockExecuteFailed {
             failure_reason: TimelockExecuteFailureReason::SimulationFailed,
-            redacted_reason: format!("secondary simulation error: {err}"),
-            operation_id_redacted: "unknown".to_owned(),
+            redacted_reason: format!(
+                "secondary simulation error: {}",
+                SimulationErrorClass::of(err)
+            ),
             request_id: request_id.to_owned(),
         });
     }
@@ -2868,7 +2817,6 @@ async fn simulate_hash_operation(
             .map_err(|e| SaError::TimelockExecuteFailed {
                 failure_reason: TimelockExecuteFailureReason::SimulationFailed,
                 redacted_reason: format!("{label} simulate results decode failed: {e}"),
-                operation_id_redacted: "unknown".to_owned(),
                 request_id: request_id.to_owned(),
             })?
             .into_iter()
@@ -2876,7 +2824,6 @@ async fn simulate_hash_operation(
             .ok_or_else(|| SaError::TimelockExecuteFailed {
                 failure_reason: TimelockExecuteFailureReason::SimulationFailed,
                 redacted_reason: format!("{label} simulate returned no result"),
-                operation_id_redacted: "unknown".to_owned(),
                 request_id: request_id.to_owned(),
             })?
             .xdr;
@@ -2895,7 +2842,6 @@ async fn simulate_hash_operation(
                             "{label} hash_operation returned {} bytes, expected 32",
                             slice.len()
                         ),
-                        operation_id_redacted: "unknown".to_owned(),
                         request_id: request_id.to_owned(),
                     })
                 }
@@ -2907,7 +2853,6 @@ async fn simulate_hash_operation(
                     "32-byte Bytes",
                     &other,
                 ),
-                operation_id_redacted: "unknown".to_owned(),
                 request_id: request_id.to_owned(),
             }),
         }
@@ -3020,11 +2965,10 @@ mod tests {
             ),
         ] as [(fn() -> SaError, &str); 2]
         {
-            let operation_id = TimelockOperationId::from_bytes([3u8; 32]);
             for mapped in [
                 schedule_submit_error(error(), "req"),
-                cancel_submit_error(error(), &operation_id, "req"),
-                execute_submit_error(error(), &operation_id, "req"),
+                cancel_submit_error(error(), "req"),
+                execute_submit_error(error(), "req"),
             ] {
                 assert_eq!(mapped.wire_code(), code, "{mapped:?}");
             }
@@ -3562,11 +3506,11 @@ mod tests {
 
     #[tokio::test]
     async fn cancel_refuses_mainnet_before_signer_and_request() {
+        let operation_id = TimelockOperationId::from_bytes([3u8; 32]);
         let mock = wiremock::MockServer::start().await;
         let uri = mock.uri();
         let dir = tempfile::tempdir().unwrap();
         let writer = audit_writer(&dir);
-        let operation_id = TimelockOperationId::from_bytes([3u8; 32]);
         let args = TimelockCancelArgs::builder()
             .timelock_contract_strkey(ZERO_CONTRACT)
             .operation_id(&operation_id)
@@ -3636,28 +3580,127 @@ mod tests {
 
     #[test]
     fn cancel_submit_error_passes_the_mainnet_refusal_through() {
-        let operation_id = TimelockOperationId::from_bytes([3u8; 32]);
-        let mapped = cancel_submit_error(SaError::MainnetWriteForbidden, &operation_id, "req-2");
+        let mapped = cancel_submit_error(SaError::MainnetWriteForbidden, "req-2");
         assert!(
             matches!(mapped, SaError::MainnetWriteForbidden),
             "the mainnet refusal must keep its variant, got {mapped:?}"
         );
-        let wrapped = cancel_submit_error(other_submit_error(), &operation_id, "req-2");
+        let wrapped = cancel_submit_error(other_submit_error(), "req-2");
         assert!(
             matches!(wrapped, SaError::TimelockCancelFailed { ref request_id, .. } if request_id == "req-2"),
             "another error must still be wrapped, got {wrapped:?}"
         );
     }
 
+    /// Answers as a testnet endpoint whose timelock panics with
+    /// `InvalidOperationState` on every simulation, which is what the contract
+    /// does for an operation that was never scheduled.
+    struct NeverScheduled;
+
+    impl wiremock::Respond for NeverScheduled {
+        fn respond(&self, request: &wiremock::Request) -> wiremock::ResponseTemplate {
+            use stellar_agent_test_support::signed_envelope::{
+                account_id_for_seed, get_network_result, ledger_entries_result_for,
+            };
+
+            let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            let result = match body["method"].as_str().unwrap() {
+                "getNetwork" => {
+                    get_network_result(stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE)
+                }
+                "getLatestLedger" => serde_json::json!({
+                    "id": "ab".repeat(32), "sequence": 1000, "protocolVersion": 27
+                }),
+                "getLedgerEntries" => {
+                    ledger_entries_result_for(&[account_id_for_seed([0x51; 32]).as_str()])
+                }
+                "simulateTransaction" => serde_json::json!({
+                    "error": "HostError: Error(Contract, #4002)", "latestLedger": 1000
+                }),
+                other => panic!("the fixture does not serve {other}"),
+            };
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "jsonrpc": "2.0", "id": body["id"], "result": result
+            }))
+        }
+    }
+
+    /// A cancel of an operation that was never scheduled is refused with the
+    /// check, and neither end of the identifier reaches the returned error, its
+    /// Debug form or any event.
+    #[test]
+    fn cancelling_a_never_scheduled_operation_states_the_check() {
+        use stellar_agent_test_support::rejected_value::{
+            assert_no_marker, assert_no_marker_in_text,
+        };
+
+        let mut bytes = [0xab; 32];
+        bytes[..4].copy_from_slice(&[0xc0, 0xff, 0xee, 0x42]);
+        bytes[28..].copy_from_slice(&[0x1c, 0xed, 0x7e, 0xa5]);
+        let operation_id = TimelockOperationId::from_bytes(bytes);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let writer = audit_writer(&dir);
+        let signer = stellar_agent_network::signing::test_doubles::CountingSigner::new([0x51; 32]);
+        let mut returned = None;
+        let logs = stellar_agent_test_support::log_capture::with_captured_trace_logs(|| {
+            returned = Some(runtime.block_on(async {
+                let server = wiremock::MockServer::start().await;
+                wiremock::Mock::given(wiremock::matchers::method("POST"))
+                    .respond_with(NeverScheduled)
+                    .mount(&server)
+                    .await;
+                let uri = server.uri();
+                let secondary = stellar_agent_test_support::second_loopback_host(&uri);
+                cancel(
+                    TimelockCancelArgs::builder()
+                        .timelock_contract_strkey(ZERO_CONTRACT)
+                        .operation_id(&operation_id)
+                        .signer(&signer)
+                        .primary_rpc_url(&uri)
+                        .secondary_rpc_url(&secondary)
+                        .network_passphrase(stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE)
+                        .audit_writer(&writer)
+                        .request_id("req-never-scheduled")
+                        .build(),
+                )
+                .await
+            }));
+        });
+        let error = returned.unwrap().unwrap_err();
+        assert!(
+            matches!(
+                error,
+                SaError::TimelockCancelFailed {
+                    failure_reason: TimelockCancelFailureReason::InvalidOperationState,
+                    ..
+                }
+            ),
+            "{error:?}"
+        );
+        assert!(
+            error
+                .to_string()
+                .ends_with("; operation_id must identify a pending scheduled operation"),
+            "{error}"
+        );
+        for fragment in ["c0ffee42", "1ced7ea5"] {
+            assert_no_marker(&error, fragment);
+            assert_no_marker_in_text(&logs, fragment);
+        }
+    }
+
     #[test]
     fn execute_submit_error_passes_the_mainnet_refusal_through() {
-        let operation_id = TimelockOperationId::from_bytes([3u8; 32]);
-        let mapped = execute_submit_error(SaError::MainnetWriteForbidden, &operation_id, "req-3");
+        let mapped = execute_submit_error(SaError::MainnetWriteForbidden, "req-3");
         assert!(
             matches!(mapped, SaError::MainnetWriteForbidden),
             "the mainnet refusal must keep its variant, got {mapped:?}"
         );
-        let wrapped = execute_submit_error(other_submit_error(), &operation_id, "req-3");
+        let wrapped = execute_submit_error(other_submit_error(), "req-3");
         assert!(
             matches!(wrapped, SaError::TimelockExecuteFailed { ref request_id, .. } if request_id == "req-3"),
             "another error must still be wrapped, got {wrapped:?}"

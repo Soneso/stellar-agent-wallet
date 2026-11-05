@@ -43,8 +43,8 @@ use wiremock::{
 
 use super::combined_rpc_responder::JsonRpcResultResponder;
 use super::rpc_mock_helpers::{
-    ZERO_CONTRACT_REDACTED, build_ledger_entries_contract_instance, manager_one_url,
-    tmp_audit_writer,
+    ZERO_CONTRACT_REDACTED, assert_refusal_holds_no_marker, build_ledger_entries_contract_instance,
+    manager_one_url, mcp_error_envelope, tmp_audit_writer, wallet_traced,
 };
 
 // ── Address helpers ───────────────────────────────────────────────────────────
@@ -60,100 +60,132 @@ fn policy_addr() -> ScAddress {
 /// on-chain hash returned by the mock RPC, `verify_pinned_policy_against_chain`
 /// returns `SaError::PolicyHashDrift` and emits a `SaPolicyHashDrift` audit row.
 ///
-/// Verifies that a pinned policy WASM hash mismatch is detected at sign time.
-#[tokio::test]
-async fn policy_wasm_hash_drift_detected_and_audit_row_emitted() {
-    let policy = policy_addr();
-
-    // ── Step 1: Mock RPC serves THRESHOLD_POLICY_WASM_HASHES[0] ─────────────
+/// The refusal holds no form of the observed hash, whole or as its first
+/// eight bytes, nor its executable summary, in its Display, Debug and source
+/// chain, its serialized form, the MCP error envelope or the wallet's logs,
+/// which hold the drift warning. The drift row keeps the observed hash's
+/// first eight bytes and the executable summary.
+#[test]
+fn policy_wasm_hash_drift_detected_and_audit_row_emitted() {
     let live_wasm_hash = THRESHOLD_POLICY_WASM_HASHES[0];
-    let ledger_entries = build_ledger_entries_contract_instance(&policy, live_wasm_hash);
-
-    let server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/"))
-        .respond_with(JsonRpcResultResponder(ledger_entries))
-        .mount(&server)
-        .await;
+    let observed_full = hex::encode(live_wasm_hash);
+    let observed_first8 = WasmHashPin::new(live_wasm_hash).first8_display();
+    assert!(observed_full.starts_with(&observed_first8));
 
     let (audit_writer, audit_log_path, _dir) = tmp_audit_writer();
-    let manager = manager_one_url(&server.uri(), Arc::clone(&audit_writer), audit_log_path);
 
-    // ── Step 2: Write fake SaContextRuleCreatedV2 with a DIFFERENT pinned policy hash
+    // A pin record whose policy hash differs from the live one.
     let fake_pinned = WasmHashPin::new([0x02; 32]);
     let rule_id: u32 = 1;
     let request_id = Uuid::new_v4().to_string();
+    audit_writer
+        .lock()
+        .expect("audit writer poisoned")
+        .write_entry(AuditEntry::new_sa_context_rule_created_v2(
+            ZERO_CONTRACT_REDACTED,
+            rule_id,
+            "default",
+            1,
+            1,
+            None,
+            "stellar:testnet",
+            &request_id,
+            vec![],
+            vec![fake_pinned],
+            false,
+            false,
+            vec![],
+            vec![],
+        ))
+        .expect("write_entry must succeed");
 
-    let fake_entry = AuditEntry::new_sa_context_rule_created_v2(
-        ZERO_CONTRACT_REDACTED,
-        rule_id,
-        "default",
-        1,
-        1,
-        None,
-        "stellar:testnet",
-        &request_id,
-        vec![],
-        vec![fake_pinned],
-        false,
-        false,
-        vec![],
-        vec![],
-    );
-    {
-        let mut writer = audit_writer.lock().expect("audit writer poisoned");
-        writer
-            .write_entry(fake_entry)
-            .expect("write_entry must succeed");
-    }
+    let (result, logs) = wallet_traced({
+        let audit_writer = Arc::clone(&audit_writer);
+        let request_id = request_id.clone();
+        async move {
+            // The mock RPC serves THRESHOLD_POLICY_WASM_HASHES[0].
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/"))
+                .respond_with(JsonRpcResultResponder(
+                    build_ledger_entries_contract_instance(&policy_addr(), live_wasm_hash),
+                ))
+                .mount(&server)
+                .await;
+            let manager = manager_one_url(&server.uri(), audit_writer, audit_log_path);
+            let mut cache: HashMap<Vec<u8>, ObservedExecutable> = HashMap::new();
+            test_helpers::verify_pinned_policy_against_chain(
+                &manager,
+                policy_addr(),
+                rule_id,
+                ZERO_CONTRACT_REDACTED,
+                &request_id,
+                &mut cache,
+            )
+            .await
+        }
+    });
 
-    // ── Step 3: Call verify_pinned_policy_against_chain ──────────────────────
-    let mut cache: HashMap<Vec<u8>, ObservedExecutable> = HashMap::new();
-
-    let result = test_helpers::verify_pinned_policy_against_chain(
-        &manager,
-        policy.clone(),
-        rule_id,
-        ZERO_CONTRACT_REDACTED,
-        &request_id,
-        &mut cache,
-    )
-    .await;
-
-    // ── Step 4: Assertions ────────────────────────────────────────────────────
-    assert!(
-        matches!(result, Err(SaError::PolicyHashDrift { .. })),
-        "wasm-hash drift must return SaError::PolicyHashDrift; got: {result:?}"
-    );
+    let err = result.expect_err("wasm-hash drift must refuse");
+    let SaError::PolicyHashDrift { pinned_hash, .. } = &err else {
+        panic!("wasm-hash drift must return SaError::PolicyHashDrift; got: {err:?}");
+    };
+    assert_eq!(*pinned_hash, fake_pinned);
     assert_eq!(
-        result.unwrap_err().wire_code(),
+        err.wire_code(),
         "sa.policy_hash_drift",
         "wire_code must be 'sa.policy_hash_drift'"
     );
-
-    // The SaPolicyHashDrift audit row must be emitted.
-    let entries = verified_audit_entries(&audit_writer);
-    let drift_row = entries.iter().find(|e| {
-        matches!(
-            &e.event_kind,
-            EventKind::SaPolicyHashDrift { rule_id: rid, .. } if *rid == rule_id
-        )
-    });
-    assert!(
-        drift_row.is_some(),
-        "SaPolicyHashDrift audit row must be emitted after drift detection"
-    );
-
-    let drift_entry = drift_row.unwrap();
     assert_eq!(
-        drift_entry.request_id, request_id,
-        "SaPolicyHashDrift row must carry the same request_id as the verify call"
+        err.to_string(),
+        format!(
+            "policy executable must match the pinned executable for rule 1: pinned={}",
+            fake_pinned.to_hex()
+        )
     );
+    assert!(
+        logs.contains(
+            "verify_pinned_policy_against_chain: policy executable must match the pinned"
+        ),
+        "the drift warning is captured: {logs}"
+    );
+    assert!(
+        mcp_error_envelope(&err).contains("\"sa.policy_hash_drift\""),
+        "the MCP envelope carries the wire code"
+    );
+    assert_refusal_holds_no_marker(&err, &logs, &[&observed_full, &observed_first8], &["wasm"]);
+
+    // The SaPolicyHashDrift audit row is emitted with the call's request id
+    // and keeps the observed hash's first eight bytes and executable.
+    let entries = verified_audit_entries(&audit_writer);
+    let rows: Vec<&EventKind> = entries
+        .iter()
+        .filter(|entry| entry.request_id == request_id)
+        .map(|entry| &entry.event_kind)
+        .filter(|kind| matches!(kind, EventKind::SaPolicyHashDrift { .. }))
+        .collect();
+    let [
+        EventKind::SaPolicyHashDrift {
+            rule_id: row_rule_id,
+            pinned_hash_first8,
+            observed_hash_first8,
+            observed_executable,
+            ..
+        },
+    ] = rows.as_slice()
+    else {
+        panic!("one SaPolicyHashDrift row with the call's request id: {rows:?}");
+    };
+    assert_eq!(*row_rule_id, rule_id);
+    assert_eq!(pinned_hash_first8, &fake_pinned.first8_display());
+    assert_eq!(observed_hash_first8, &observed_first8);
+    assert_eq!(observed_executable.as_deref(), Some("wasm"));
 }
 
 /// A live policy whose hash shares the pinned hash's first eight bytes
-/// refuses as drift, naming both full hashes, although neither hash is in
-/// the policy allowlist; the exact pinned hash passes.
+/// refuses as drift although neither hash is in the policy allowlist; the
+/// exact pinned hash passes. The error names the full pin; the drift audit
+/// row keeps the observed hash and executable.
 #[tokio::test]
 async fn an_equal_prefix_policy_twin_refuses_as_drift_outside_the_allowlist() {
     let pinned = [0x42u8; 32];
@@ -199,14 +231,12 @@ async fn an_equal_prefix_policy_twin_refuses_as_drift_outside_the_allowlist() {
         )
         .await;
         if drift {
-            match outcome {
-                Err(SaError::PolicyHashDrift {
-                    pinned_hash,
-                    observed_hash,
-                    ..
-                }) => {
-                    assert_eq!(pinned_hash, WasmHashPin::new(pinned));
-                    assert_eq!(observed_hash, Some(WasmHashPin::new(twin)));
+            match &outcome {
+                Err(err @ SaError::PolicyHashDrift { pinned_hash, .. }) => {
+                    assert_eq!(*pinned_hash, WasmHashPin::new(pinned));
+                    let rendered =
+                        format!("{err}\n{err:?}\n{}", serde_json::to_string(err).unwrap());
+                    assert!(!rendered.contains(&hex::encode(twin)), "{rendered}");
                 }
                 other => panic!("expected PolicyHashDrift, got {other:?}"),
             }

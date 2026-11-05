@@ -126,9 +126,9 @@ pub async fn simulate_invoke_returning_scval(
     _network_passphrase: &str,
 ) -> Result<ScVal, SimulateError> {
     // Parse contract address.
-    let contract_bytes = stellar_strkey::Contract::from_string(contract_address).map_err(|e| {
+    let contract_bytes = stellar_strkey::Contract::from_string(contract_address).map_err(|_| {
         SimulateError::InvalidAddress {
-            reason: format!("contract address parse failed: {e}"),
+            reason: "contract_address must be a C-strkey".to_owned(),
         }
     })?;
     let contract_sc_addr = ScAddress::Contract(ContractId(Hash(contract_bytes.0)));
@@ -348,10 +348,12 @@ mod tests {
             "Test SDF Network ; September 2015",
         )
         .await;
-        assert!(
-            matches!(result, Err(SimulateError::InvalidAddress { .. })),
-            "invalid C-strkey must return InvalidAddress: {result:?}"
-        );
+        match result {
+            Err(SimulateError::InvalidAddress { reason }) => {
+                assert_eq!(reason, "contract_address must be a C-strkey");
+            }
+            other => panic!("invalid C-strkey must return InvalidAddress: {other:?}"),
+        }
     }
 
     // ── simulate_invoke_returning_scval: wiremock RPC paths ──────────────────

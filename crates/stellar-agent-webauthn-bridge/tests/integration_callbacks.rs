@@ -2348,3 +2348,59 @@ async fn origin_layer_blocks_post_without_origin() {
 
     handle.shutdown().await.expect("shutdown");
 }
+
+/// A body the JSON extractor refuses answers the fixed code on both POST
+/// routes, with the status of the refusal and none of the body.
+#[tokio::test]
+async fn refused_bodies_answer_the_fixed_code() {
+    let (handle, store, _dir) = start_test_bridge().await;
+    let local = handle.local_addr();
+    let (register_nonce, register_csrf) = insert_register_passkey(&store).await;
+    let (approve_nonce, approve_csrf) = insert_sign_with_passkey(&store).await;
+    let routes = [
+        (
+            format!("http://{local}/register/{register_nonce}/credential"),
+            register_csrf,
+        ),
+        (
+            format!("http://{local}/approve/{approve_nonce}/assertion"),
+            approve_csrf,
+        ),
+    ];
+    let wrong_type = r#"{"id":"AAAA","rawId":"AAAA","type":"public-key","response":"credmarker7"}"#;
+    let cases = [
+        (
+            wrong_type,
+            "application/json",
+            StatusCode::UNPROCESSABLE_ENTITY,
+        ),
+        (
+            "{\"id\":\"credmarker7\"",
+            "application/json",
+            StatusCode::BAD_REQUEST,
+        ),
+        (wrong_type, "text/plain", StatusCode::UNSUPPORTED_MEDIA_TYPE),
+    ];
+    for (url, csrf) in &routes {
+        for (body, content_type, status) in cases {
+            let resp = client()
+                .post(url)
+                .header("Host", local.to_string())
+                .header("Origin", format!("http://{local}"))
+                .header("X-Stellar-Approval-CSRF", hex::encode(csrf))
+                .header("Content-Type", content_type)
+                .body(body)
+                .send()
+                .await
+                .expect("POST");
+            assert_eq!(resp.status(), status, "{url} {content_type}");
+            assert_eq!(
+                resp.text().await.expect("text body"),
+                r#"{"error":"invalid_body"}"#,
+                "{url} {content_type}"
+            );
+        }
+    }
+
+    handle.shutdown().await.expect("shutdown");
+}

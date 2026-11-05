@@ -87,7 +87,7 @@ fn storage(error: impl std::fmt::Display) -> Failure {
 fn enrolled_owner_key(coordinate: &KeyringEntryRef) -> Result<[u8; 32], Failure> {
     let raw = read_keyring_string(coordinate)?.ok_or_else(|| {
         WalletError::from(AuthError::KeyringNotFound {
-            name: coordinate.service.clone(),
+            cause: stellar_agent_core::error::KeyringMissingCause::MissingEntry,
         })
     })?;
     decode_owner_public_key(&raw).map_err(|_| {

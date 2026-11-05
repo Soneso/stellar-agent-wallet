@@ -313,23 +313,16 @@ impl Nonce {
 }
 
 impl std::fmt::Debug for Nonce {
-    /// Shows the first 4 bytes of the 16-byte salt as hex for tracing
-    /// correlation (`salt=aabbccdd...`).
+    /// Renders the fixed text `Nonce([REDACTED])`.
     ///
-    /// The full 32-byte HMAC-SHA256 tag is **redacted entirely**.  Rationale:
-    /// although the tag alone does not reveal the key, logging it creates an
-    /// oracle for offline pre-image attacks; a 4-byte salt prefix is
-    /// sufficient to correlate log lines across mint and verify calls.
+    /// A nonce reaches this path from a caller's input, and verification may
+    /// have refused it, so neither the salt nor the HMAC-SHA256 tag appears.
     ///
     /// # Panics
     ///
     /// Never panics.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "Nonce(salt={:02x}{:02x}{:02x}{:02x}..., tag=[REDACTED])",
-            self.inner[0], self.inner[1], self.inner[2], self.inner[3]
-        )
+        f.write_str("Nonce([REDACTED])")
     }
 }
 
@@ -1434,10 +1427,7 @@ mod tests {
 
         let n = Nonce::from_raw(raw);
         let debug = format!("{n:?}");
-        assert!(debug.contains("Nonce(salt=01020304..."));
-        assert!(debug.contains("tag=[REDACTED]"));
-        assert!(!debug.contains("05060708090a0b0c0d0e0f10"));
-        assert!(!debug.contains("abababababababab"));
+        assert_eq!(debug, "Nonce([REDACTED])");
     }
 
     /// `inner_bytes` returns the full 48-byte `[salt || tag]` array, preserving
