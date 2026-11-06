@@ -687,6 +687,7 @@ async fn deploy_policy_all_kinds_and_idempotent_testnet_acceptance() {
 /// `get_signer_weights` views).
 #[tokio::test]
 async fn weighted_threshold_ordering_proof_testnet_acceptance() {
+    stellar_agent_test_support::keyring_mock::install().expect("install the in-memory keyring");
     let tmp = tempfile::tempdir().expect("tempdir must be created");
     let registry_path = tmp.path().join("networks.toml");
 
@@ -877,6 +878,7 @@ async fn weighted_threshold_ordering_proof_testnet_acceptance() {
 ///    which is >= threshold 2.
 #[tokio::test]
 async fn weighted_threshold_enforcement_proof_testnet_acceptance() {
+    stellar_agent_test_support::keyring_mock::install().expect("install the in-memory keyring");
     let tmp = tempfile::tempdir().expect("tempdir must be created");
     let registry_path = tmp.path().join("networks.toml");
 
@@ -1236,6 +1238,7 @@ async fn weighted_threshold_enforcement_proof_testnet_acceptance() {
 /// account below, in the SAME test function to keep the two claims together.
 #[tokio::test]
 async fn deploy_c_external_ed25519_genesis_testnet_acceptance() {
+    stellar_agent_test_support::keyring_mock::install().expect("install the in-memory keyring");
     let tmp = tempfile::tempdir().expect("tempdir must be created");
     let registry_path = tmp.path().join("networks.toml");
 
@@ -1422,6 +1425,7 @@ async fn deploy_c_external_ed25519_genesis_testnet_acceptance() {
 ///   `rule_id` and one of the returned `new_signer_ids`.
 #[tokio::test]
 async fn batch_add_delegated_signers_testnet_acceptance() {
+    stellar_agent_test_support::keyring_mock::install().expect("install the in-memory keyring");
     let (admin_g, admin_signer) = fresh_signer();
     fund_via_friendbot(&admin_g).await;
     let smart_account_strkey = deploy_fresh_smart_account(&admin_g, None).await;
@@ -1572,6 +1576,7 @@ async fn batch_add_delegated_signers_testnet_acceptance() {
 /// suffice, so the wallet cannot check a removal.
 #[tokio::test]
 async fn weighted_threshold_negatives_testnet_acceptance() {
+    stellar_agent_test_support::keyring_mock::install().expect("install the in-memory keyring");
     let tmp = tempfile::tempdir().expect("tempdir must be created");
     let registry_path = tmp.path().join("networks.toml");
 
@@ -2009,6 +2014,7 @@ async fn register_one_credential(
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires testnet, chromium, and explicit --ignored flag"]
 async fn deploy_c_webauthn_genesis_and_batch_add_testnet_acceptance() {
+    stellar_agent_test_support::keyring_mock::install().expect("install the in-memory keyring");
     let tmp = TempDir::new().expect("tempdir must be created");
     let registry_path = tmp.path().join("networks.toml");
     let passkeys_dir = tmp.path().join("passkeys");

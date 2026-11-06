@@ -329,6 +329,7 @@ async fn h_a_install_horizon_exceeded() {
 ///
 #[tokio::test]
 async fn h_b_update_horizon_exceeded() {
+    stellar_agent_test_support::keyring_mock::install().expect("install the in-memory keyring");
     // ── Locate the release binary ─────────────────────────────────────────────
     let binary = release_binary();
     if !binary.exists() {

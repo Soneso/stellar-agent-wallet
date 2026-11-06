@@ -575,6 +575,7 @@ async fn goto_loopback(page: &chromiumoxide::Page, url: &str) -> Result<(), Goto
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires testnet, chromium, and explicit --ignored flag"]
 async fn webauthn_passkey_signing_testnet_acceptance() {
+    stellar_agent_test_support::keyring_mock::install().expect("install the in-memory keyring");
     // ── Temporary directories ─────────────────────────────────────────────────
     let tmp = TempDir::new().expect("tempdir must be created");
     let passkeys_dir = tmp.path().join("passkeys");

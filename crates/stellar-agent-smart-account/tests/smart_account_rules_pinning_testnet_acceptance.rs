@@ -549,6 +549,7 @@ fn encode_simple_threshold_params(threshold: u32) -> ScVal {
 ///   `crates/stellar-agent-smart-account/src/signers/policy_identification.rs`.
 #[tokio::test]
 async fn pin_and_install_with_canonical_oz_threshold_policy_no_drift() {
+    stellar_agent_test_support::keyring_mock::install().expect("install the in-memory keyring");
     let (signer_g, signer_box) = fresh_signer();
     fund_via_friendbot(&signer_g).await;
 
@@ -792,6 +793,7 @@ async fn install_rule_refuses_unknown_wasm_verifier_without_override() {
 ///   `crates/stellar-agent-smart-account/src/managers/credentials.rs`.
 #[tokio::test(flavor = "multi_thread")]
 async fn p3_policy_hash_drift_detection_at_signing_time() {
+    stellar_agent_test_support::keyring_mock::install().expect("install the in-memory keyring");
     let (signer_g, signer_box) = fresh_signer();
     fund_via_friendbot(&signer_g).await;
 
@@ -1045,6 +1047,7 @@ async fn p3_policy_hash_drift_detection_at_signing_time() {
 ///   (drift-detection re-fetch — policy path).
 #[tokio::test(flavor = "multi_thread")]
 async fn p4_unknown_verifier_override_real_hash_stored_drift_regression() {
+    stellar_agent_test_support::keyring_mock::install().expect("install the in-memory keyring");
     let (signer_g, signer_box) = fresh_signer();
     fund_via_friendbot(&signer_g).await;
 
@@ -1355,6 +1358,7 @@ async fn p4_unknown_verifier_override_real_hash_stored_drift_regression() {
 /// Infra failure routes to `DriftCheckUnavailable`, not drift.
 #[tokio::test]
 async fn p5_drift_check_infra_failure_routes_to_drift_check_unavailable_not_drift() {
+    stellar_agent_test_support::keyring_mock::install().expect("install the in-memory keyring");
     let (signer_g, signer_box) = fresh_signer();
     fund_via_friendbot(&signer_g).await;
 

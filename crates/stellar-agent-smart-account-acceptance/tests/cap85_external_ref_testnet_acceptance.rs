@@ -604,6 +604,7 @@ fn proxy_rule_definition(
 /// signing-time drift paths report the change.
 #[tokio::test(flavor = "multi_thread")]
 async fn install_pins_the_reference_and_signing_detects_the_repoint() {
+    stellar_agent_test_support::keyring_mock::install().expect("install the in-memory keyring");
     const TEST: &str = "install-drift";
     let registry = tempfile::tempdir().expect("tempdir");
     let registry_path = registry.path().join("networks.toml");

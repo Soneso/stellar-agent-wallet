@@ -259,6 +259,7 @@ async fn deploy_fresh_smart_account_with_initial_signer(signer_g: &str) -> Strin
 /// across all assertions.
 #[tokio::test]
 async fn full_metadata_only_lifecycle_on_testnet() {
+    stellar_agent_test_support::keyring_mock::install().expect("install the in-memory keyring");
     // ── Setup ──────────────────────────────────────────────────────────
     let (signer_g, signer_box) = fresh_signer();
     // The signer who authorises rule operations doubles as the
@@ -522,6 +523,7 @@ async fn full_metadata_only_lifecycle_on_testnet() {
 ///    and the `sa.ok` `SaRawInvocation`.
 #[tokio::test(flavor = "multi_thread")]
 async fn e1_install_rule_emits_audit_rows_via_self_audit_writer() {
+    stellar_agent_test_support::keyring_mock::install().expect("install the in-memory keyring");
     // ── Setup ──────────────────────────────────────────────────────────────────
     let (signer_g, signer_box) = fresh_signer();
     fund_via_friendbot(&signer_g).await;
@@ -706,6 +708,7 @@ async fn e1_install_rule_emits_audit_rows_via_self_audit_writer() {
 /// first-3-chars + `len=N` form and never appears verbatim.
 #[tokio::test(flavor = "multi_thread")]
 async fn e2_metadata_updates_emit_typed_forensic_rows() {
+    stellar_agent_test_support::keyring_mock::install().expect("install the in-memory keyring");
     // ── Setup (mirrors the audit-fallback test) ─────────────────────────────────────────────────
     let (signer_g, signer_box) = fresh_signer();
     fund_via_friendbot(&signer_g).await;
@@ -895,6 +898,7 @@ async fn e2_metadata_updates_emit_typed_forensic_rows() {
 ///    `SaPolicyHashDrift` row carrying that rename's request id.
 #[tokio::test(flavor = "multi_thread")]
 async fn e3_self_authorized_rename_through_the_production_manager_shape() {
+    stellar_agent_test_support::keyring_mock::install().expect("install the in-memory keyring");
     let (signer_g, signer_box) = fresh_signer();
     fund_via_friendbot(&signer_g).await;
 

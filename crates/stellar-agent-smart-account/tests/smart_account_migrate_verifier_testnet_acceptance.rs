@@ -1059,6 +1059,7 @@ async fn d1_migrate_verifier_dry_run_constructs_plan_without_submitting() {
 ///
 #[tokio::test(flavor = "multi_thread")]
 async fn d2_migrate_verifier_dry_run_identifies_one_external_signer() {
+    stellar_agent_test_support::keyring_mock::install().expect("install the in-memory keyring");
     // ── 1. Deploy a fresh smart account on testnet ────────────────────────────
 
     let (signer_g, signer_box) = fresh_signer();
@@ -1407,6 +1408,7 @@ async fn d2_migrate_verifier_dry_run_identifies_one_external_signer() {
 ///   in its own transaction.
 #[tokio::test(flavor = "multi_thread")]
 async fn d3_migrate_verifier_on_chain_submit() {
+    stellar_agent_test_support::keyring_mock::install().expect("install the in-memory keyring");
     // ── 1. Deploy a fresh smart account on testnet ────────────────────────────
 
     let (signer_g, signer_box) = fresh_signer();

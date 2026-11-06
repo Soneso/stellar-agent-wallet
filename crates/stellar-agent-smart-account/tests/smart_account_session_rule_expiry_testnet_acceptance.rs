@@ -320,6 +320,7 @@ fn rid() -> String {
 /// operators can reconstruct the timeline forensically.
 #[tokio::test]
 async fn h_1_revocation_audit_log_timeline() {
+    stellar_agent_test_support::keyring_mock::install().expect("install the in-memory keyring");
     // ── Step 1: Fresh signer + fund ───────────────────────────────────────────
     let (signer_g, _signer_s, signer_box) = fresh_signer();
     fund_via_friendbot(&signer_g).await;
@@ -494,6 +495,7 @@ async fn h_1_revocation_audit_log_timeline() {
 ///
 #[tokio::test]
 async fn h_2_post_revocation_new_sign_refused() {
+    stellar_agent_test_support::keyring_mock::install().expect("install the in-memory keyring");
     // ── Step 1: Fresh signer + fund ───────────────────────────────────────────
     let (signer_g, _signer_s, signer_box) = fresh_signer();
     fund_via_friendbot(&signer_g).await;

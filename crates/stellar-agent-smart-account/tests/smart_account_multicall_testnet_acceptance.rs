@@ -39,6 +39,10 @@
 //! The CLI's on-chain multicall coverage lives in the `stellar-agent-cli`
 //! suite `smart_account_multicall_cli_testnet_acceptance`.
 //!
+//! Each test installs the in-memory keyring store first. The policy gate and
+//! the signing admission read their keyring entries there. The test's data
+//! root and its keyring start empty together.
+//!
 //! # Reference cross-check
 //!
 //! - Router contract `exec(caller, invocations: Vec<(Address, Symbol, Vec<Val>)>)`:
@@ -382,6 +386,7 @@ fn registry_with_entry(router_address: &str) -> MulticallRegistry {
 #[tokio::test]
 #[serial_test::serial]
 async fn h1_three_native_sac_symbol_calls_confirm() {
+    stellar_agent_test_support::keyring_mock::install().expect("install the in-memory keyring");
     let data_root = tempfile::tempdir().expect("temporary wallet data root");
     let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(data_root.path());
     let secondary_rpc_url = stellar_agent_test_support::testnet_secondary_rpc_url();
@@ -505,6 +510,7 @@ async fn check_host_cap(
     expected_code: &str,
     expected_index: Option<u32>,
 ) {
+    stellar_agent_test_support::keyring_mock::install().expect("install the in-memory keyring");
     let dir = tempfile::tempdir().unwrap();
     let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(dir.path());
     let (audit, _) = audit_writer_in(dir.path());
@@ -548,16 +554,20 @@ async fn check_host_cap(
                 "{error:?}"
             );
         } else {
-            assert!(
-                matches!(
-                    error,
-                    SaError::MulticallFailed {
-                        phase: "policy_gate",
-                        ..
-                    }
-                ),
-                "{error:?}"
-            );
+            match &error {
+                SaError::MulticallFailed {
+                    phase,
+                    redacted_reason,
+                    ..
+                } => {
+                    assert_eq!(*phase, "policy_gate", "{error:?}");
+                    assert_eq!(
+                        redacted_reason, "policy denied the multicall bundle",
+                        "the policy gate denies the bundle: {error:?}"
+                    );
+                }
+                other => panic!("expected MulticallFailed at policy_gate; got {other:?}"),
+            }
             let entries = verified_audit_entries(&audit);
             assert!(entries.iter().any(|entry| matches!(&entry.event_kind,
                 EventKind::SaMulticallBundleDenied { deny_wire_code, denied_inner_index, .. }
@@ -596,6 +606,7 @@ fn audit_writer_in(dir: &std::path::Path) -> (Arc<Mutex<AuditWriter>>, std::path
 #[tokio::test]
 #[serial_test::serial]
 async fn h5_bundle_under_a_rule_other_than_0_checks_its_signer_set() {
+    stellar_agent_test_support::keyring_mock::install().expect("install the in-memory keyring");
     let data_root = tempfile::tempdir().expect("temporary wallet data root");
     let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(data_root.path());
     let secondary_rpc_url = stellar_agent_test_support::testnet_secondary_rpc_url();

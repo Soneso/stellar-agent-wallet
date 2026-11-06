@@ -268,6 +268,7 @@ async fn deploy_verifier_and_policy(registry_path: &Path) -> (String, String) {
 /// real on-chain auth requirement.
 #[tokio::test]
 async fn agent_delegation_full_flow_testnet_acceptance() {
+    stellar_agent_test_support::keyring_mock::install().expect("install the in-memory keyring");
     let tmp = tempfile::tempdir().expect("tempdir must be created");
     let registry_path = tmp.path().join("networks.toml");
 

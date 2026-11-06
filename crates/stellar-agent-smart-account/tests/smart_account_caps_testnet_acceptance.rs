@@ -252,6 +252,7 @@ fn release_binary() -> std::path::PathBuf {
 /// Context rule signer cap: the 16th signer is refused before simulate/submit.
 #[tokio::test]
 async fn h1_16th_signer_refused() {
+    stellar_agent_test_support::keyring_mock::install().expect("install the in-memory keyring");
     // ── Locate the release binary ─────────────────────────────────────────────
     let binary = release_binary();
     if !binary.exists() {
@@ -799,6 +800,7 @@ async fn deploy_five_distinct_policies_h2(
 /// Context rule policy cap: the 6th policy is refused before simulate/submit.
 #[tokio::test]
 async fn h2_6th_policy_refused() {
+    stellar_agent_test_support::keyring_mock::install().expect("install the in-memory keyring");
     // ── Locate the release binary ─────────────────────────────────────────────
     let binary = release_binary();
     if !binary.exists() {

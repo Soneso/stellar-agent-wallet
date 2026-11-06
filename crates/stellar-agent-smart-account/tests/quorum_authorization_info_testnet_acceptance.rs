@@ -587,6 +587,7 @@ async fn q2_insufficient_signers_fails_before_rpc() {
 #[tokio::test]
 #[serial]
 async fn q1_and_q3_two_of_three_quorum_invocation_accepted() {
+    stellar_agent_test_support::keyring_mock::install().expect("install the in-memory keyring");
     // ── Provision: fund 4 accounts (bootstrap + signer1 + signer2 + signer3)
     //
     // ALL three quorum signers must have funded Stellar G-key accounts so that the

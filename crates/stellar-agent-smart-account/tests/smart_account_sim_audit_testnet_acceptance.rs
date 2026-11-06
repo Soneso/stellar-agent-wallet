@@ -138,6 +138,7 @@ fn fresh_manager() -> (ContextRuleManager, TempDir) {
 /// byte-identity invariant.
 #[tokio::test]
 async fn sim_audit_happy_path_on_chain_submit() {
+    stellar_agent_test_support::keyring_mock::install().expect("install the in-memory keyring");
     // ── Setup: fresh signer + deployer, Friendbot-fund both ───────────────
     let (signer_g, signer_box) = fresh_signer();
     // Fund the signer — it pays gas fees as source-account for all submissions.

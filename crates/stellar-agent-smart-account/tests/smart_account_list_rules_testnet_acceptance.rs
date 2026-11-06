@@ -277,6 +277,7 @@ async fn install_rule_with_name_and_valid_until(
 ///     end-to-end at the live RPC for the deleted rule ID.
 #[tokio::test]
 async fn h1_list_rules_across_sparse_id_gap_on_testnet() {
+    stellar_agent_test_support::keyring_mock::install().expect("install the in-memory keyring");
     // ── Setup: fresh signer + funded account ─────────────────────────────────
     let (signer_g, signer_box) = fresh_signer();
     fund_via_friendbot(&signer_g).await;
@@ -479,6 +480,7 @@ async fn h1_list_rules_across_sparse_id_gap_on_testnet() {
 /// `TryFromVal<E, Val> for Option<T>` conversion.
 #[tokio::test]
 async fn h2_valid_until_some_decoded_correctly_on_testnet() {
+    stellar_agent_test_support::keyring_mock::install().expect("install the in-memory keyring");
     // A far-future ledger sequence — large enough that it will not be reached
     // during testnet testing but representable as u32.
     const LARGE_FUTURE_LEDGER: u32 = 999_999_999;
@@ -591,6 +593,7 @@ async fn h2_valid_until_some_decoded_correctly_on_testnet() {
 ///
 #[tokio::test]
 async fn h3_cli_envelope_shape_on_testnet() {
+    stellar_agent_test_support::keyring_mock::install().expect("install the in-memory keyring");
     // ── Locate the release binary ─────────────────────────────────────────────
     // CARGO_MANIFEST_DIR is the `crates/stellar-agent-smart-account` directory;
     // walk up two levels to reach the workspace root, then descend into the
