@@ -1272,6 +1272,8 @@ async fn negative_test_fixture() -> (WalletServer, TempDir, String, String, [u8;
         &proposer_g,
     )
     .with_noop_engine()
+    // The server's audit log stays inside the fixture's directory.
+    .audit_log_path(approval_dir.path().join("wallet-audit.jsonl"))
     .build();
     profile.rpc_url = TESTNET_RPC_URL.to_owned();
     profile.secondary_rpc_url =

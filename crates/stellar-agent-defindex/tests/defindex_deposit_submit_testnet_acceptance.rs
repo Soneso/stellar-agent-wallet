@@ -467,10 +467,12 @@ async fn defindex_deposit_submit_and_confirm() {
         override_upgradable: true,
     };
 
-    // Wire audit emission exactly as the MCP `stellar_defindex_vault_deposit`
-    // handler does, so the confirmed deposit records its value_action_submitted
-    // row.  Legs are built from the SAME amounts/asset/vault the deposit uses
-    // (single-derivation invariant); the writer uses a fixed test key.
+    // Wire the audit writer and legs exactly as the MCP
+    // `stellar_defindex_vault_deposit` handler does. The recorder writes the
+    // pending row before the send. A reported success updates the receipt and
+    // keeps the pending record until authenticated settlement. Legs are built
+    // from the SAME amounts/asset/vault the deposit uses (single-derivation
+    // invariant); the writer uses a fixed test key.
     let audit_dir = std::env::temp_dir().join(format!("defindex-deposit-audit-{}", now_secs()));
     std::fs::create_dir_all(&audit_dir).expect("create audit dir");
     let audit_log_path = audit_dir.join("audit.jsonl");
@@ -533,8 +535,9 @@ async fn defindex_deposit_submit_and_confirm() {
                 redact_strkey(DEFINDEX_TESTNET_VAULT),
             );
 
-            // #21 — the confirmed on-chain deposit must have recorded a
-            // value_action_submitted row for stellar_defindex_vault_deposit.
+            // The recorder wrote the pending row before the send. A reported
+            // success updates the receipt and keeps the pending record until
+            // authenticated settlement, so no submitted row follows.
             let audit_rows: Vec<serde_json::Value> = std::io::BufRead::lines(
                 std::io::BufReader::new(
                     std::fs::File::open(&audit_log_path).expect("audit log after submit"),
@@ -542,16 +545,37 @@ async fn defindex_deposit_submit_and_confirm() {
             )
             .map(|line| serde_json::from_str(&line.expect("audit line")).expect("audit JSON row"))
             .collect();
-            assert!(
-                audit_rows.iter().any(|row| {
-                    row["kind"] == "value_action_submitted"
+            let deposit_rows: Vec<&serde_json::Value> = audit_rows
+                .iter()
+                .filter(|row| {
+                    row["kind"] == "value_action_pending"
                         && row["tool"] == "stellar_defindex_vault_deposit"
-                }),
-                "confirmed DeFindex deposit must record a value_action_submitted row: {audit_rows:?}"
+                })
+                .collect();
+            assert_eq!(
+                deposit_rows.len(),
+                1,
+                "one pending row for stellar_defindex_vault_deposit: {audit_rows:?}"
+            );
+            assert!(
+                !audit_rows
+                    .iter()
+                    .any(|row| row["kind"] == "value_action_submitted"),
+                "no submitted row on a reported success: {audit_rows:?}"
+            );
+            let receipt = record_state.receipt(
+                deposit_rows[0]["envelope_hash"]
+                    .as_str()
+                    .expect("the pending row carries the envelope hash"),
+            );
+            assert!(
+                receipt.status == stellar_agent_core::profile::receipt::ReceiptStatus::Success
+                    && receipt.ledger.is_some(),
+                "the receipt of the pending row is Success with a ledger: {receipt:?}"
             );
 
             // The confirmed deposit is charged once against the durable daily
-            // `native` window, and its reservation is settled.
+            // `native` window, and its exposure stays open.
             assert_eq!(
                 record_state.native_window(),
                 (XLM_DEPOSIT_AMOUNT, 1),
@@ -559,8 +583,8 @@ async fn defindex_deposit_submit_and_confirm() {
             );
             assert_eq!(
                 record_state.pending_reservations(),
-                0,
-                "the confirmed deposit must settle its window reservation"
+                1,
+                "a reported success keeps the debit's exposure open until authenticated settlement"
             );
 
             // The deposit's signing admission is the window's only signed
@@ -932,9 +956,11 @@ async fn defindex_deposit_then_withdraw_submit_and_confirm() {
         override_upgradable: true,
     };
 
-    // Wire audit emission exactly as the MCP `stellar_defindex_vault_withdraw`
-    // handler does, so the confirmed withdraw records its value_action_submitted
-    // row.  The leg is built from the SAME shares/vault the withdraw uses.
+    // Wire the audit writer and leg exactly as the MCP
+    // `stellar_defindex_vault_withdraw` handler does. The recorder writes the
+    // pending row before the send. A reported success updates the receipt and
+    // keeps the pending record until authenticated settlement. The leg is built
+    // from the SAME shares/vault the withdraw uses.
     let withdraw_audit_legs = vec![stellar_agent_core::audit_log::ValueLegRecord::from(
         &stellar_agent_defindex::value::vault_withdraw_value_leg(
             withdraw_args.withdraw_shares,
@@ -977,8 +1003,9 @@ async fn defindex_deposit_then_withdraw_submit_and_confirm() {
                 share_balance,
             );
 
-            // #21 — the confirmed on-chain withdraw must have recorded a
-            // value_action_submitted row for stellar_defindex_vault_withdraw.
+            // The recorder wrote each pending row before its send. A reported
+            // success updates the receipt and keeps the pending record until
+            // authenticated settlement, so no submitted row follows.
             let audit_rows: Vec<serde_json::Value> = std::io::BufRead::lines(
                 std::io::BufReader::new(
                     std::fs::File::open(&withdraw_audit_log_path).expect("audit log after submit"),
@@ -986,16 +1013,42 @@ async fn defindex_deposit_then_withdraw_submit_and_confirm() {
             )
             .map(|line| serde_json::from_str(&line.expect("audit line")).expect("audit JSON row"))
             .collect();
+            let pending_rows = |tool: &str| -> Vec<&serde_json::Value> {
+                audit_rows
+                    .iter()
+                    .filter(|row| row["kind"] == "value_action_pending" && row["tool"] == tool)
+                    .collect()
+            };
+            for tool in [
+                "stellar_defindex_vault_deposit",
+                "stellar_defindex_vault_withdraw",
+            ] {
+                assert_eq!(
+                    pending_rows(tool).len(),
+                    1,
+                    "one pending row for {tool}: {audit_rows:?}"
+                );
+            }
             assert!(
-                audit_rows.iter().any(|row| {
-                    row["kind"] == "value_action_submitted"
-                        && row["tool"] == "stellar_defindex_vault_withdraw"
-                }),
-                "confirmed DeFindex withdraw must record a value_action_submitted row: {audit_rows:?}"
+                !audit_rows
+                    .iter()
+                    .any(|row| row["kind"] == "value_action_submitted"),
+                "no submitted row on a reported success: {audit_rows:?}"
+            );
+            let receipt = record_state.receipt(
+                pending_rows("stellar_defindex_vault_deposit")[0]["envelope_hash"]
+                    .as_str()
+                    .expect("the pending row carries the envelope hash"),
+            );
+            assert!(
+                receipt.status == stellar_agent_core::profile::receipt::ReceiptStatus::Success
+                    && receipt.ledger.is_some(),
+                "the receipt of the pending row is Success with a ledger: {receipt:?}"
             );
 
             // The deposit is the test's only debit: the withdraw returns funds
-            // and adds no charge, and both reservations are settled.
+            // and adds no charge. The deposit's exposure stays open, and the
+            // withdraw has no native entry and holds no reservation.
             assert_eq!(
                 record_state.native_window(),
                 (XLM_DEPOSIT_AMOUNT, 1),
@@ -1003,8 +1056,8 @@ async fn defindex_deposit_then_withdraw_submit_and_confirm() {
             );
             assert_eq!(
                 record_state.pending_reservations(),
-                0,
-                "the confirmed submissions must settle their window reservations"
+                1,
+                "a reported success keeps the debit's exposure open until authenticated settlement"
             );
 
             // The withdraw leg has no native entry, so its sizing is empty and

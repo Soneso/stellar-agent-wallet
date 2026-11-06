@@ -349,19 +349,22 @@ impl<'a> DefiAdapterCtx<'a> {
 
     /// Emits a `ValueActionSubmitted` audit row for a confirmed DeFi submit.
     ///
-    /// No-op unless an audit writer, gate-derived legs, tool identity, and
-    /// chain id were all threaded into this context. Non-fatal: the submit has
-    /// already confirmed, so a row-write failure logs a warning and does not
-    /// affect the caller. `tx_hash_redacted` MUST already be redacted.
+    /// The row is written only when no submission recorder is attached,
+    /// because the recorder owns the submission's audit rows. Without a
+    /// recorder it is a no-op unless an audit writer, gate-derived legs, tool
+    /// identity, and chain id were all threaded into this context. Non-fatal:
+    /// the submit has already confirmed, so a row-write failure logs a warning
+    /// and does not affect the caller. `tx_hash_redacted` MUST already be
+    /// redacted.
     pub fn emit_value_action_submitted(
         &self,
         tx_hash_redacted: &str,
         ledger: u32,
         request_id: &str,
     ) {
-        // The recorder writes this row itself, from the same gate-sized legs,
-        // alongside the pending row it wrote before the send. One row, not
-        // two.
+        // The recorder wrote the pending audit row before the send. A reported
+        // success updates the receipt and keeps the exposure open until
+        // authenticated settlement, so no submitted row follows.
         if self.submission_recorder.is_some() {
             return;
         }

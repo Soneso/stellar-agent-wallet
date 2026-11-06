@@ -873,10 +873,12 @@ async fn acceptance_submit_and_confirm() {
         deadline: None, // adapter defaults to now + 300s
     };
 
-    // Wire audit emission exactly as the MCP `stellar_dex_trade` handler does,
-    // so the confirmed swap records its value_action_submitted row.  The leg is
-    // built from the SAME amount/path/router the trade uses (single-derivation
-    // invariant); the writer uses a fixed test key.
+    // Wire the audit writer and leg exactly as the MCP `stellar_dex_trade`
+    // handler does. The recorder writes the pending row before the send. A
+    // reported success updates the receipt and keeps the pending record until
+    // authenticated settlement. The leg is built from the SAME amount/path/router
+    // the trade uses (single-derivation invariant); the writer uses a fixed test
+    // key.
     let audit_dir = std::env::temp_dir().join(format!("dex-audit-{}", now_secs()));
     std::fs::create_dir_all(&audit_dir).expect("create audit dir");
     let audit_log_path = audit_dir.join("audit.jsonl");
@@ -938,22 +940,42 @@ async fn acceptance_submit_and_confirm() {
         redact_strkey(&wallet_c)
     );
 
-    // #21 — the confirmed on-chain swap must have recorded a
-    // value_action_submitted row for stellar_dex_trade.
+    // The recorder wrote the pending row before the send. A reported success
+    // updates the receipt and keeps the pending record until authenticated
+    // settlement, so no submitted row follows.
     let audit_rows: Vec<serde_json::Value> = std::io::BufRead::lines(std::io::BufReader::new(
         std::fs::File::open(&audit_log_path).expect("audit log after submit"),
     ))
     .map(|line| serde_json::from_str(&line.expect("audit line")).expect("audit JSON row"))
     .collect();
+    let trade_rows: Vec<&serde_json::Value> = audit_rows
+        .iter()
+        .filter(|row| row["kind"] == "value_action_pending" && row["tool"] == "stellar_dex_trade")
+        .collect();
+    assert_eq!(
+        trade_rows.len(),
+        1,
+        "one pending row for stellar_dex_trade: {audit_rows:?}"
+    );
     assert!(
-        audit_rows.iter().any(|row| {
-            row["kind"] == "value_action_submitted" && row["tool"] == "stellar_dex_trade"
-        }),
-        "confirmed DEX swap must record a value_action_submitted row: {audit_rows:?}"
+        !audit_rows
+            .iter()
+            .any(|row| row["kind"] == "value_action_submitted"),
+        "no submitted row on a reported success: {audit_rows:?}"
+    );
+    let receipt = record_state.receipt(
+        trade_rows[0]["envelope_hash"]
+            .as_str()
+            .expect("the pending row carries the envelope hash"),
+    );
+    assert!(
+        receipt.status == stellar_agent_core::profile::receipt::ReceiptStatus::Success
+            && receipt.ledger.is_some(),
+        "the receipt of the pending row is Success with a ledger: {receipt:?}"
     );
 
     // The confirmed swap is charged once against the durable daily `native`
-    // window, and its reservation is settled rather than left open.
+    // window, and its exposure stays open.
     assert_eq!(
         record_state.native_window(),
         (SWAP_AMOUNT_IN, 1),
@@ -961,8 +983,8 @@ async fn acceptance_submit_and_confirm() {
     );
     assert_eq!(
         record_state.pending_reservations(),
-        0,
-        "the confirmed swap must settle its window reservation"
+        1,
+        "a reported success keeps the debit's exposure open until authenticated settlement"
     );
 
     // The swap's signing admission is the window's only signed intent, and its

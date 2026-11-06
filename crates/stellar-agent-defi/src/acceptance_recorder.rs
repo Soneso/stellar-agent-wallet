@@ -15,6 +15,7 @@ use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use stellar_agent_core::policy::v1::{PolicyEngineV1, ValueEffects};
+use stellar_agent_core::profile::receipt::{ReceiptStore, SubmissionReceipt};
 use stellar_agent_core::profile::schema::Profile;
 use stellar_agent_network::policy_state::{PersistedWindowStore, SignedIntentView};
 use stellar_agent_network::{AuditWriterHandle, WalletSubmissionRecorder};
@@ -164,11 +165,8 @@ impl SubmissionRecordState {
             stellar_agent_core::audit_log::PolicyDecision::Allow,
             legs,
             window_entries,
-            stellar_agent_core::profile::receipt::ReceiptStore::open_at(
-                self.dir.path(),
-                &self.profile_name,
-            )
-            .expect("open the receipt store"),
+            ReceiptStore::open_at(self.dir.path(), &self.profile_name)
+                .expect("open the receipt store"),
             self.window_store(),
             Some(audit),
             None,
@@ -214,6 +212,22 @@ impl SubmissionRecordState {
             .pending_reservations(&self.profile)
             .expect("read the pending reservations")
             .len()
+    }
+
+    /// The receipt the recorder keeps for `envelope_hash`, read back from the
+    /// state's receipt store.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the receipt store cannot be opened or read, and panics with
+    /// the hash when the store holds no receipt for `envelope_hash`.
+    #[must_use]
+    pub fn receipt(&self, envelope_hash: &str) -> SubmissionReceipt {
+        ReceiptStore::open_at(self.dir.path(), &self.profile_name)
+            .expect("open the receipt store")
+            .get(envelope_hash)
+            .expect("read the receipt store")
+            .unwrap_or_else(|| panic!("no receipt for envelope hash {envelope_hash}"))
     }
 
     /// The signed intents the window holds, in admission order.
