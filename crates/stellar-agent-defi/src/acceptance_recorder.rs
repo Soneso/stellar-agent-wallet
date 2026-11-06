@@ -282,7 +282,7 @@ mod tests {
     /// The native debit the recorder charges: 1 XLM, far below the daily cap.
     const DEBIT_STROOPS: i128 = 10_000_000;
 
-    // The acceptance policy sizes the debit only while it stays under the cap.
+    // Keep the fixture debit below the admission cap.
     const _: () = assert!(DEBIT_STROOPS < NATIVE_DAILY_CAP_STROOPS);
 
     /// The ledger the mocked endpoint confirms the submission in.
@@ -428,8 +428,7 @@ mod tests {
         let effects = native_debit(DEBIT_STROOPS);
         let recorder = state.recorder("stellar_dex_trade", &effects, Arc::clone(&audit));
 
-        // The signing admission charges the sized debit leg before the first
-        // signature, and the store's admission of the frozen plan exposes it.
+        // Re-admission uses the frozen plan to preserve its sized legs.
         let (plan, envelope_xdr) = signed_invocation(SOURCE_SEED).await;
         let admitted = recorder.admit_signed_intent(&plan).await.unwrap().expose();
         assert!(
@@ -443,8 +442,7 @@ mod tests {
             .expose();
         assert_eq!(exposure.intent_id(), admitted.intent_id());
 
-        // The submit layer derives the intent from the envelope, binds it to
-        // the exposed intent before the send and settles it on the confirmation.
+        // Binding links the envelope to the admitted intent before submission.
         let server = confirming_endpoint(&account_id_for_seed(SOURCE_SEED), &envelope_xdr).await;
         let client = StellarRpcClient::new(&server.uri()).unwrap();
         let result = submit_transaction_and_wait_sent_by(
@@ -464,8 +462,7 @@ mod tests {
         let receipt = state.receipt(&envelope_hash_hex(&envelope_xdr));
         assert_eq!(receipt.status, ReceiptStatus::Success, "{receipt:?}");
         assert_eq!(receipt.ledger, Some(CONFIRMED_LEDGER), "{receipt:?}");
-        // The bound submission is charged once, and the confirmation keeps its
-        // exposure open until authenticated settlement.
+        // Confirmation leaves the exposure open until authenticated settlement.
         assert_eq!(state.native_window(), (DEBIT_STROOPS, 1));
         assert_eq!(state.pending_reservations(), 1);
         let intents = state.signed_intents();
