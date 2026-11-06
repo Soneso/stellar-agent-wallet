@@ -56,7 +56,7 @@ use base64::Engine as _;
 use serial_test::serial;
 use stellar_agent_core::{
     DEFAULT_CLASSIC_FEE_STROOPS,
-    approval::{PendingApprovalStore, store::PendingApproval},
+    approval::{DEFAULT_TTL_MS, PendingApprovalStore, store::PendingApproval},
     policy::v1::{
         AccountIdentityView, AccountReservesView, CounterpartyCacheView, Sep10SessionView,
         Sep45SessionView,
@@ -171,7 +171,7 @@ impl PolicyEngine for RequireApprovalEngine {
     ) -> Result<Decision, PolicyError> {
         Ok(Decision::RequireApproval(ApprovalRequest::new(
             "test-nonce".into(),
-            120,
+            (DEFAULT_TTL_MS / 1_000) as u32,
         )))
     }
 }
@@ -283,8 +283,8 @@ async fn build_scaffold(
         .expect("payment op");
     let envelope_xdr = builder.build().expect("envelope build");
 
-    let now_ms: u64 = 1_893_456_000_000; // 2030-01-01 UTC test epoch
-    let expiry_ms: u64 = now_ms + 60_000;
+    let expiry_ms = u64::MAX;
+    let now_ms = expiry_ms - 60_000;
 
     let nonce_mint =
         NonceMint::from_profile(&profile, "nonce-test").expect("NonceMint::from_profile");
@@ -872,7 +872,7 @@ async fn valid_attestation_passes_gate() {
         100,
         101,
         uid.clone(),
-        60_000, // 60s TTL → live
+        DEFAULT_TTL_MS,
     )
     .expect("new_payment_pending");
     let approval_nonce_id = entry.approval_nonce.clone();
@@ -1002,7 +1002,7 @@ async fn an_attestation_under_the_owner_public_key_returns_the_uniform_error() {
         100,
         101,
         uid.clone(),
-        60_000,
+        DEFAULT_TTL_MS,
     )
     .expect("new_payment_pending");
     let approval_nonce_id = entry.approval_nonce.clone();

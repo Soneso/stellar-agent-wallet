@@ -88,9 +88,6 @@
   "skills/stellar-agent-wallet/references/security.md": {
     "british-behaviour": 2
   },
-  "skills/stellar-agent-wallet/references/smart-accounts.md": {
-    "em-dash": 10
-  },
   "tests/policy-fixtures/README.md": {
     "em-dash": 2
   }

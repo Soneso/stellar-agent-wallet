@@ -1103,7 +1103,9 @@ async fn sign_envelope(
 
     let signer: Box<dyn Signer + Send + Sync> =
         match (args.sign_with_ledger, args.secret_env.as_deref()) {
-            (true, _) => Box::new(signer_from_ledger(args.account_index, sponsor).await?),
+            (true, _) => {
+                Box::new(signer_from_ledger(args.account_index, sponsor, "--sponsor").await?)
+            }
             (false, Some(var_name)) => {
                 let SignerCeremonyOutcome {
                     signer,
@@ -1113,6 +1115,7 @@ async fn sign_envelope(
                 let derived = signer.public_key().await?.to_string().to_string();
                 if derived != sponsor {
                     return Err(AuthError::SignerKeyMismatch {
+                        what: "--sponsor",
                         expected: sponsor.to_owned(),
                         got: derived,
                     }
@@ -2838,6 +2841,59 @@ mod tests {
     #[serial_test::serial]
     async fn enrolled_signing_mismatch() {
         enrolled_signing_case(EnrolledPin::Other).await;
+    }
+
+    /// A `--secret-env` seed for another account than the sponsor is refused
+    /// before signing, and the message names `--sponsor`.
+    #[allow(unsafe_code, reason = "serialized test seed variable")]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn signer_key_mismatch_names_sponsor() {
+        let g = enrolled_test_g();
+        let other = stellar_strkey::ed25519::PublicKey([7; 32])
+            .to_string()
+            .to_string();
+        let var = "SIGNER_MISMATCH_ACCOUNTS_CREATE_TEST_SEED";
+        unsafe {
+            std::env::set_var(var, enrolled_test_secret());
+        }
+        let mut profile = enrolled_mainnet_profile(EnrolledPin::Derived);
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(CreateBuildRpcResponder::new(
+                account_ledger_key_xdr(&g),
+                account_entry_xdr_with_balance(&g, 100_000_000_000),
+                fee_stats_result("100", "100"),
+            ))
+            .mount(&server)
+            .await;
+        profile.rpc_url = server.uri();
+        let context = NetworkContext::from_profile(&profile);
+        let mut args = minimal_sponsored_args();
+        args.sponsor = Some(g.clone());
+        args.secret_env = Some(var.into());
+        args.fee = Some("100".into());
+        let client = StellarRpcClient::new(&context.rpc_url).expect("mock client");
+        let (_, selection) = select_create_fee(&client, &args).await.unwrap();
+        let built = build_sponsored_unsigned_envelope(
+            &context,
+            &g,
+            0,
+            DEST_G,
+            StellarAmount::parse_with_unit("1 XLM").expect("amount"),
+            selection.per_op_stroops,
+        )
+        .expect("build against mock");
+        let result = sign_envelope(&context, &args, &built, &other, &profile, "enrolled").await;
+        unsafe {
+            std::env::remove_var(var);
+        }
+        let err = result.expect_err("a seed for another account must be refused");
+        assert_eq!(err.code(), "auth.signer_key_mismatch");
+        assert_eq!(
+            err.message(),
+            format!("signing key public key '{g}' does not match --sponsor '{other}'")
+        );
     }
 
     // ── Endpoint identity: one client, checked before the sponsor read ─────

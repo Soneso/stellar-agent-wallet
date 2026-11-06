@@ -68,6 +68,27 @@ key names. Typed value events retain each leg's amount, asset, and redacted dest
 - Asset is `"native"` / `"XLM"` for the native asset, or `"CODE:GISSUER"` for an
   issued asset.
 
+## Payment argument codes
+
+`stellar_pay`, `stellar_pay_commit`, and `stellar-agent pay` refuse a malformed
+amount, asset, or memo before building the transaction.
+
+| Code | Meaning | Agent action |
+|---|---|---|
+| `validation.amount_units_required` | The amount has no unit label, such as `"10"`. | Resend it with its unit, such as `"10 XLM"`, or pass `amount_in_stroops` to `stellar_pay` or `stellar_pay_commit`. |
+| `validation.amount_precision_exceeded` | The amount has more than seven decimal places. | Round it to seven decimal places and resend. |
+| `validation.amount_out_of_range` | The value exceeds 9223372036854775807 stroops (922337203685.4775807 in asset units) in magnitude. | Resend an amount within that limit. |
+| `validation.amount_malformed` | The value is not a decimal number followed by its unit, or the unit is not the asset's code (case-sensitive for an issued asset, case-insensitive `XLM` for native). `stellar-agent pay` and `stellar-agent accounts create` report every amount refusal under this code. | Resend the amount as a decimal string followed by the asset code, such as `"10.5 USDC"`. On the CLI, also check the precision and the range. |
+| `validation.asset_invalid` | The descriptor is neither `native` or `XLM` nor `CODE:ISSUER` with a 1 to 12 character alphanumeric code and a valid G-strkey issuer. | Fix the descriptor and resend. |
+| `validation.memo_invalid_type` | A hash or return memo is not exactly 64 hex characters, or, on `stellar-agent pay`, a text memo is longer than 28 bytes. The MCP tools refuse a longer text memo as an invalid argument before this check. | Resend a 64-character hex value for a hash or return memo, or shorten the text memo to 28 bytes. |
+| `validation.memo_mutually_exclusive` | More than one memo field is set. The CLI parser refuses two memo flags as `validation.usage_error`. | Send one memo field only. |
+
+The two MCP payment tools return the four amount codes as a JSON-RPC
+invalid-params error whose message starts with the code, and
+`validation.asset_invalid` as one whose message starts with `invalid asset:`
+followed by the code. `stellar_pay` returns the two memo codes in the result
+envelope; `stellar_pay_commit` reports a memo refusal as `nonce.expired`.
+
 ## Policy-engine codes
 
 The policy engine evaluates every gated call before any signing, returning
@@ -761,6 +782,22 @@ sub-code. A rotation-spanning outage can require `audit reanchor` after restart.
 | `profile.mainnet_requires_explicit_profile` | The environment or the default source selected a mainnet profile. | Pass `--profile <name>`. For a mainnet `default.toml`, pass `--profile default`; keep the filename because its identity binds the keyring entries. |
 | `profile.key_scope_conflict` | A profile shares a wallet or derived entry with a sibling, two of its fields collide, an overlay names another scope, its owner account is not `default`, or a mainnet profile's `policy_window_state_key_id` is not its default entry. An unreadable selected document or profiles directory also triggers it. Mainnet refuses; testnet warns. Unreadable siblings only warn. Backups in the profiles directory count as siblings. | Do not retry under another name. Give this profile its own entry when it claims another profile's coordinate; correct the sibling file when it claims this profile's canonical entry. Read the offending field with `profile show`. Moving an enrolled reference orphans the stored key; enroll or rotate at its replacement. |
 | `profile.name_mismatch` | The profile FILE that was loaded belongs to a different profile: its `policy_owner_key_id.service` names another profile, or carries no `stellar-agent-owner-` prefix at all. Both binaries refuse it: the MCP server at startup, the CLI at every command that loads a profile. The refusal applies because the signed policy file and the owner-key keyring entry resolve through the name the FILE carries. The approval store, audit log, and policy-window state key on the name that was ASKED for. Almost always a copied or renamed `<name>.toml`. Distinct from `validation.config_invalid`, which covers the profile CONFIGURATION being unusable: a name that is not a valid path component, a malformed TOML, an unsupported schema version, an out-of-range field. None of these conditions is covered by this code. Here the file parses and the name is valid; it simply belongs to another profile. | Not agent-recoverable by retry, and do NOT retry under a different profile name. Report the message to the operator: it names the offending field and the recovery, without either profile name or the stored value. Recovery is `stellar-agent profile init --profile <name>` for a genuinely new profile, or correcting `policy_owner_key_id.service` to `stellar-agent-owner-<name>`. `stellar-agent profile show <name>` still displays the file so the field can be read. |
+
+## x402 codes
+
+`stellar_x402_create_payment` and `stellar_x402_authenticated_payment` return the first five codes while validating the payment requirement, before the spending window is touched. Nothing is signed or sent. The x402 flow is described in `protocols.md`.
+
+| Code | Meaning | Agent action |
+|---|---|---|
+| `x402.unsupported_network` | The requirement's `network` is neither `stellar:testnet` nor `stellar:pubnet`. | Do not pay with this requirement. Pick another `accepts[]` element with a supported network, or report the requirement to the operator. |
+| `x402.network_passphrase_mismatch` | The requirement's network is not the active profile's network. | Do not pay with this requirement. Pick another `accepts[]` element on the profile's network, or report the mismatch to the operator. Do not switch profiles on your own. |
+| `x402.invalid_asset_address` | The requirement's `asset` is not a contract address (C-strkey). | Do not pay with this requirement. Pick another `accepts[]` element, or report the requirement to the operator. |
+| `x402.fees_not_sponsored` | The requirement's `extra.areFeesSponsored` is not the JSON boolean `true`. | Do not pay with this requirement. Pick another `accepts[]` element with sponsored fees, or report the requirement to the operator. |
+| `x402.amount_conversion` | The requirement's `amount` is not a positive integer, or does not fit in a signed 128-bit integer. | Do not pay with this requirement. Pick another `accepts[]` element, or report the requirement to the operator. |
+| `x402.keyring_load_failed` | The signer cannot be loaded, for a reason that has no `auth.*` code of its own. | Do not retry. Ask the operator to check the profile's signer entry. |
+| `x402.auth_entry_sign_failed` | `stellar_x402_create_payment` cannot sign the payer's authorization entry. `stellar_x402_authenticated_payment` reports this as `x402.payment_build_failed`. | Do not retry in a loop. Report it to the operator. |
+| `x402.transaction_build_failed` | `stellar_x402_create_payment` cannot assemble the payment, for example because the re-simulation data does not decode. `stellar_x402_authenticated_payment` reports this as `x402.payment_build_failed`. | Do not retry in a loop. Report it to the operator. |
+| `x402.receipt_parse_failed` | The input to `stellar_x402_parse_receipt` is neither a base64 `PAYMENT-RESPONSE` value that decodes to a `SettleResponse` nor a raw JSON `SettleResponse`. | Pass the `PAYMENT-RESPONSE` header value unchanged: no decoding, trimming, or re-encoding. |
 
 ## SEP-24 interactive POST contract
 

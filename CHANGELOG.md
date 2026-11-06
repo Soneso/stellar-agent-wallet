@@ -819,6 +819,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - CLI `pay`, `stellar_pay` and `stellar_pay_commit` accept the asset code as the
   amount unit for an issued asset and refuse any other label. The documented
   form `"100 TST"` with `TST:<issuer>` works.
+- The `auth.signer_key_mismatch` message names the identity the signing key
+  fails to match: `--source`, `--sponsor`, `--expect-rule-signer`, the
+  expected signing account, the cached signing public key, or the keyring
+  entry's account. Every context named `--source`.
 - Testnet funding helpers retry transient Friendbot failures within bounded
   attempts and time. They accept already funded responses and report bounded
   failure details.

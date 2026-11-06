@@ -125,6 +125,7 @@ pub(crate) async fn signer_from_s_strkey(
     let signer_gstrkey = signer_pk.to_string().to_string();
     if signer_gstrkey != expected_source_g {
         return Err(WalletError::Auth(AuthError::SignerKeyMismatch {
+            what: "the expected signing account",
             expected: expected_source_g.to_owned(),
             got: signer_gstrkey,
         }));
@@ -185,6 +186,8 @@ pub async fn signer_from_env(
 /// Opens a native HID connection, applies the `account_index` override for
 /// the BIP-32 path (`m/44'/148'/<account_index>'`), fetches the device's
 /// public key, and verifies it matches `expected_source_g` before returning.
+/// `what` names the identity `expected_source_g` stands for (for example
+/// `--source` or `--sponsor`); it appears in the mismatch error message.
 ///
 /// No secret key material ever leaves the device. The device is not prompted
 /// for signing approval during this call (Ledger Stellar app GET_PUBLIC_KEY
@@ -211,12 +214,14 @@ pub async fn signer_from_env(
 /// let signer = signer_from_ledger(
 ///     0,
 ///     "GAQAA5L65LSYH7CQ3VTJ7F3HHLGCL3DSLAR2Y47263D56MNNGHSQSTVY",
+///     "--source",
 /// ).await?;
 /// # Ok(()) }
 /// ```
 pub async fn signer_from_ledger(
     account_index: u32,
     expected_source_g: &str,
+    what: &'static str,
 ) -> Result<HardwareSigningKey, WalletError> {
     let hw_key = HardwareSigningKey::native()?.with_account_index(account_index);
 
@@ -230,6 +235,7 @@ pub async fn signer_from_ledger(
     let signer_gstrkey = signer_pk.to_string().to_string();
     if signer_gstrkey != expected_source_g {
         return Err(WalletError::Auth(AuthError::SignerKeyMismatch {
+            what,
             expected: expected_source_g.to_owned(),
             got: signer_gstrkey,
         }));
