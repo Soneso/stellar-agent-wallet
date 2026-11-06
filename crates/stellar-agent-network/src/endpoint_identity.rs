@@ -467,20 +467,15 @@ mod tests {
         assert_eq!(warning.get("supported_max").map(String::as_str), Some("30"));
     }
 
+    /// A mainnet endpoint at protocol 29 or 30 passes silently.
     #[test]
     fn mainnet_inside_the_range_passes_without_a_warning() {
-        let (result, warnings) = with_warnings(|| check_protocol_version(Some(Caip2::Mainnet), 29));
-        assert!(result.is_ok(), "{result:?}");
-        assert!(warnings.is_empty(), "{warnings:?}");
-    }
-
-    /// Protocol 30 is the top of the supported range: a mainnet endpoint
-    /// reporting it passes, and passes silently.
-    #[test]
-    fn mainnet_at_protocol_30_passes_without_a_warning() {
-        let (result, warnings) = with_warnings(|| check_protocol_version(Some(Caip2::Mainnet), 30));
-        assert!(result.is_ok(), "{result:?}");
-        assert!(warnings.is_empty(), "{warnings:?}");
+        for version in [29, 30] {
+            let (result, warnings) =
+                with_warnings(|| check_protocol_version(Some(Caip2::Mainnet), version));
+            assert!(result.is_ok(), "protocol {version}: {result:?}");
+            assert!(warnings.is_empty(), "protocol {version}: {warnings:?}");
+        }
     }
 
     #[test]

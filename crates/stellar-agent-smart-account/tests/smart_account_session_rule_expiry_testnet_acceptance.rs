@@ -306,14 +306,13 @@ fn rid() -> String {
 /// # Design
 ///
 /// The revocation pattern:
-/// - `valid_until = current_ledger + REVOKE_HEADROOM_LEDGERS`: the headroom
-///   absorbs the window between the ledger read and the apply ledger (the
-///   contract rejects `valid_until < e.ledger().sequence()` at apply time with
-///   `PastValidUntil = 3005`; `current_ledger` alone is stale by then). The
-///   canonical value is `sim_response.latest_ledger` inside
-///   `submit_signed_invoke`; the test uses
-///   `fetch_latest_ledger() + REVOKE_HEADROOM_LEDGERS` as the
-///   externally-observable proxy.
+/// - `valid_until = current_ledger + REVOKE_HEADROOM_LEDGERS`. The headroom
+///   covers the ledgers between the read and the apply ledger; `current_ledger`
+///   alone is stale by then. The contract rejects
+///   `valid_until < e.ledger().sequence()` at apply time with
+///   `PastValidUntil = 3005`. The canonical value is `sim_response.latest_ledger`
+///   inside `submit_signed_invoke`; the test reads `fetch_latest_ledger()` and
+///   adds the headroom as the observable proxy.
 /// - After `revocation_ledger` closes, `current_ledger > valid_until`, which
 ///   the validate-time check (`valid_until < e.ledger().sequence()`) catches.
 ///

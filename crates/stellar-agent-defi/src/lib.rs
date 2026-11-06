@@ -68,6 +68,8 @@
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
+#[cfg(feature = "test-helpers")]
+pub mod acceptance_recorder;
 pub mod adapter;
 pub mod dispatch;
 pub mod network;

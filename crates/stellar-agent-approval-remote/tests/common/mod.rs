@@ -11,10 +11,10 @@ use stellar_agent_core::profile::schema::Profile;
 
 /// A policy engine that parks every dispatch as a pending approval.
 ///
-/// The commit path sizes the approved action before it submits, so the checked
-/// sizing methods delegate to [`NoopPolicyEngine`]: the action is sized as on a
-/// profile that holds no window state, and the operator's decision is what the
-/// suites exercise.
+/// Checked sizing delegates to [`NoopPolicyEngine`]: the action is sized as
+/// on a profile that holds no window state. The commit path sizes the approved
+/// action before it submits, and the operator's decision is what the suites
+/// exercise.
 pub struct RequireApprovalEngine {
     /// The reason the pending approval carries.
     pub reason: &'static str,

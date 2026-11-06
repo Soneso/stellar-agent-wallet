@@ -1012,20 +1012,21 @@ pub(crate) async fn fetch_wasm_hash_via_rpc(
 ///    and expiration ledgers and setting signatures to void on cloned entries.
 ///    Credential addresses, source-account credentials, and entire invocation
 ///    trees stay byte-exact.
-/// 2. Transaction data as XDR after zeroing temporary read-write nonce keys that
-///    match the simulation's address credentials. The host records consumed
-///    nonces in the footprint. A persistent read-write nonce key, or a
+/// 2. Transaction data field by field after zeroing temporary read-write nonce
+///    keys that match the simulation's address credentials. The host records
+///    consumed nonces in the footprint. A persistent read-write nonce key, or a
 ///    read-write nonce key that matches no address credential of its own
 ///    simulation, refuses. A nonce key in another access mode stays unchanged,
-///    so the byte-exact comparison refuses it when its nonce differs between
-///    the simulations. All other fields stay byte-exact.
+///    so the comparison refuses it when its nonce differs between the
+///    simulations. Every other field is compared exactly.
 /// 3. `min_resource_fee` within 5 percent numeric tolerance.
 ///
 /// Ledger heights can differ between RPCs and are excluded from this comparison.
 /// Every refusal is a `MulticallFailed` error with phase `rpc_divergence`. A
 /// transaction-data refusal names each differing part in fixed words
 /// (`footprint`, `instructions`, `read bytes`, `write bytes`, `resource fee`),
-/// and a fee refusal names `min resource fee`. No refusal carries a value.
+/// and a fee refusal names `min resource fee`. Neither of these two refusals
+/// carries a value of either simulation.
 pub(crate) fn cross_rpc_compare_simulate_responses(
     primary: &stellar_rpc_client::SimulateTransactionResponse,
     secondary: &stellar_rpc_client::SimulateTransactionResponse,
@@ -1106,23 +1107,17 @@ pub(crate) fn cross_rpc_compare_simulate_responses(
         (Some(p_td), Some(s_td)) => {
             let p_td = normalize_simulated_nonce_keys(p_td, &primary_entries)?;
             let s_td = normalize_simulated_nonce_keys(s_td, &secondary_entries)?;
-            // Compare as XDR base64 strings.
-            // `SorobanTransactionData::to_xdr_base64` is from `stellar_xdr::WriteXdr`.
-            let p_xdr = p_td.to_xdr_base64(Limits::none()).unwrap_or_default();
-            let s_xdr = s_td.to_xdr_base64(Limits::none()).unwrap_or_default();
-            if p_xdr != s_xdr {
-                let parts = diverging_transaction_data_parts(&p_td, &s_td);
-                let redacted_reason = if parts.is_empty() {
-                    "transaction_data diverges between primary and secondary RPC".to_owned()
-                } else {
-                    format!(
-                        "transaction_data diverges between primary and secondary RPC: {}",
-                        parts.join(", ")
-                    )
-                };
+            // XDR encoding is deterministic, so two data values encode equal bytes
+            // exactly when every field is equal, and
+            // `diverging_transaction_data_parts` destructures every field.
+            let parts = diverging_transaction_data_parts(&p_td, &s_td);
+            if !parts.is_empty() {
                 return Err(SaError::MulticallFailed {
                     phase: "rpc_divergence",
-                    redacted_reason,
+                    redacted_reason: format!(
+                        "transaction_data diverges between primary and secondary RPC: {}",
+                        parts.join(", ")
+                    ),
                     post_submit_kind: None,
                 });
             }
@@ -1202,7 +1197,7 @@ fn diverging_transaction_data_parts(
 /// and nonce, and its nonce is then zeroed. A persistent read-write nonce key,
 /// or one that matches no address credential of its own simulation, refuses
 /// with phase `rpc_divergence`. A nonce key in another access mode stays
-/// unchanged, so the byte-exact comparison refuses it with the same phase when
+/// unchanged, so the comparison refuses it with the same phase when
 /// its nonce differs between the simulations. Addresses, access modes, key
 /// counts, and resources stay exact.
 fn normalize_simulated_nonce_keys(
@@ -3526,16 +3521,27 @@ wasm_sha256 = "{MULTICALL_WASM_SHA256}"
         assert_eq!(reason, format!("{TRANSACTION_DATA_DIVERGES}resource fee"));
     }
 
-    /// Several differing parts are each named, in the fixed order.
+    /// Every differing part is named, in the fixed order.
     #[test]
     fn cross_rpc_divergence_names_every_differing_part() {
+        use stellar_xdr::{Hash, LedgerKey, LedgerKeyContractCode};
         let reason = transaction_data_divergence(|data| {
+            data.resources.footprint.read_only =
+                vec![LedgerKey::ContractCode(LedgerKeyContractCode {
+                    hash: Hash([9; 32]),
+                })]
+                .try_into()
+                .unwrap();
             data.resources.instructions += 1;
+            data.resources.disk_read_bytes += 1;
+            data.resources.write_bytes += 1;
             data.resource_fee += 1;
         });
         assert_eq!(
             reason,
-            format!("{TRANSACTION_DATA_DIVERGES}instructions, resource fee")
+            format!(
+                "{TRANSACTION_DATA_DIVERGES}footprint, instructions, read bytes, write bytes, resource fee"
+            )
         );
     }
 
