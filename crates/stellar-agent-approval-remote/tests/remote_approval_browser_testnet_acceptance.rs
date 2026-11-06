@@ -102,13 +102,6 @@ use stellar_agent_core::approval::operator_credentials::{
 use stellar_agent_core::audit_log::schema::EventKind;
 use stellar_agent_core::audit_log::test_helpers::verified_audit_entries_from_path;
 use stellar_agent_core::audit_log::writer::AuditWriter;
-use stellar_agent_core::policy::v1::{
-    AccountIdentityView, AccountReservesView, CounterpartyCacheView, Sep10SessionView,
-    Sep45SessionView,
-};
-use stellar_agent_core::policy::{
-    ApprovalRequest, Decision as PolicyDecision, PolicyEngine, PolicyError, ToolDescriptor,
-};
 use stellar_agent_core::profile::schema::Profile;
 use stellar_agent_core::timefmt;
 use stellar_agent_mcp::server::{StellarPayArgs, StellarPayCommitArgs, WalletServer};
@@ -116,6 +109,9 @@ use stellar_agent_network::{StellarRpcClient, fetch_account};
 use stellar_agent_test_support::keyring_mock;
 use tempfile::TempDir;
 use zeroize::Zeroizing;
+
+mod common;
+use common::RequireApprovalEngine;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Constants
@@ -133,30 +129,8 @@ const PAYMENT_STROOPS: i64 = 10_000_000; // 1 XLM
 /// resolves from `localhost` on any standard host.
 const TEST_RP_ID: &str = "localhost";
 
-// ─────────────────────────────────────────────────────────────────────────────
-// RequireApproval policy engine — forces stellar_pay to park a pending entry
-// ─────────────────────────────────────────────────────────────────────────────
-
-struct RequireApprovalEngine;
-
-impl PolicyEngine for RequireApprovalEngine {
-    fn evaluate(
-        &self,
-        _tool: &ToolDescriptor,
-        _args: &serde_json::Value,
-        _profile: &Profile,
-        _account_view: Option<&dyn AccountReservesView>,
-        _identity_view: Option<&dyn AccountIdentityView>,
-        _counterparty_cache: Option<&dyn CounterpartyCacheView>,
-        _sep10_sessions: Option<&dyn Sep10SessionView>,
-        _sep45_sessions: Option<&dyn Sep45SessionView>,
-    ) -> Result<PolicyDecision, PolicyError> {
-        Ok(PolicyDecision::RequireApproval(ApprovalRequest::new(
-            "remote-approval-browser-testnet-acceptance".into(),
-            600,
-        )))
-    }
-}
+/// The reason every pending approval of this suite carries.
+const REQUIRE_APPROVAL_REASON: &str = "remote-approval-browser-testnet-acceptance";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Testnet helpers
@@ -637,7 +611,9 @@ async fn remote_approval_browser_drives_real_payment_commit() {
 
     let mut server = WalletServer::new(profile.clone()).expect("WalletServer::new");
     server.set_approval_dir_for_test(approval_dir.path().to_path_buf());
-    server.set_policy_engine_for_test(Arc::new(RequireApprovalEngine));
+    server.set_policy_engine_for_test(Arc::new(RequireApprovalEngine {
+        reason: REQUIRE_APPROVAL_REASON,
+    }));
 
     // ── 1. Simulate under RequireApproval: parks a real pending entry ───────
     let sim = server

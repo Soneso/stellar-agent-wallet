@@ -462,7 +462,7 @@ signing; stale startup bindings report the restart requirement.
 its first action read. Submission checks it again before send. A network
 mismatch uses `network.endpoint_network_mismatch`; unavailable identity uses
 `network.endpoint_identity_unavailable`. Credential refusals use
-`network.rpc_credential_refused`. Authorized mainnet operations require protocol 29.
+`network.rpc_credential_refused`. Authorized mainnet operations require protocol 29 or 30.
 Signatures must verify under the endpoint network. See
 [network-binding codes](references/troubleshooting.md#network-binding-codes-submit-layer).
 A submission timeout requires reconciliation, not a new payment attempt.

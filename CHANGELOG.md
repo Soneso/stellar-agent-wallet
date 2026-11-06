@@ -175,6 +175,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- The wallet accepts protocol 30 on mainnet endpoints beside protocol 29.
+
 - `pool init --resume` keeps an attempt the endpoint reports as failed.
   `pool status` names `tx receipt clear --acknowledge`, and resume retries with
   the same keys after the clear.

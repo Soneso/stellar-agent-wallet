@@ -218,7 +218,7 @@ Sends a payment from a source account to a destination, enforcing SEP-29 memo-re
 - **Network.** Full mode admits configured mainnet writes in a feature-enabled
   build. Staged modes refuse with `network.mainnet_write_forbidden`. Endpoint
   identity and signature-network checks apply before sending. This release
-  supports protocol 29. Outside it, testnet and other networks log a warning;
+  supports protocols 29 and 30. Outside them, testnet and other networks log a warning;
   mainnet refuses with `network.unsupported_protocol_version`. See
   [Submit-layer network binding](index.md#submit-layer-network-binding).
 - **Submission record.** Before the transaction is sent, the command records it as submitted with an unknown outcome: a submission receipt, a spending-window reservation under a policy with a stateful criterion, and a `value_action_pending` audit row. A submission that ends without a confirmed outcome exits 1 with `submission.tx_timeout` and keeps that record: the confirmation deadline passed, the endpoint reported an unexpected status, or a transport failure struck during or after the send. The transaction may still apply, and the message says to settle it by its transaction hash and not to resubmit. Resolve it with `stellar-agent tx status <HASH>`, never by rebuilding and re-sending: a second submission for the same source account and sequence is refused with `submission.tx_already_submitted` while the first stands, and so is a resend of the same signed bytes that the spending window already holds. `error.details` carries the full transaction hash and the envelope hash the operator verbs take. See [`stellar-agent tx`](#stellar-agent-tx).
@@ -353,7 +353,7 @@ The respective refusals are `claim.not_claimant`, `claim.predicate_not_satisfied
 - **Network.** Full mode admits configured mainnet writes in a feature-enabled
   build. Staged modes refuse with `network.mainnet_write_forbidden`. Endpoint
   identity and signature-network checks apply before sending. This release
-  supports protocol 29. Outside it, testnet and other networks log a warning;
+  supports protocols 29 and 30. Outside them, testnet and other networks log a warning;
   mainnet refuses with `network.unsupported_protocol_version`. See
   [Submit-layer network binding](index.md#submit-layer-network-binding).
 - **Timing.** The predicate is evaluated against the local clock; on-chain

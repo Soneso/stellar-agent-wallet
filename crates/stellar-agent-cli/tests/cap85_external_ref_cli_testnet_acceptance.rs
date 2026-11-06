@@ -664,11 +664,14 @@ async fn rules_create_pins_the_reference_and_verify_pins_reports_the_repoint() {
         Some("sa.verifier_hash_drift"),
         "execute must refuse with sa.verifier_hash_drift after the repoint: {envelope}"
     );
+    // The envelope message is the error's Display form, which prefixes the
+    // smart-account wire code to the refusal.
     let message = envelope["error"]["message"].as_str().unwrap_or_default();
     assert_eq!(
         message,
         format!(
-            "verifier executable must match the pinned executable for rule {rule_id}: pinned={}",
+            "smart-account operation failed (sa.verifier_hash_drift): \
+             verifier executable must match the pinned executable for rule {rule_id}: pinned={}",
             hex::encode(ed25519_hash)
         )
     );

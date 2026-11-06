@@ -18,7 +18,7 @@ use stellar_agent_core::profile::caip2::Caip2;
 /// tests ran against that version. [`check_protocol_version`] refuses a
 /// mainnet endpoint outside the range and logs a warning for any other
 /// network.
-pub const SUPPORTED_PROTOCOL_VERSIONS: RangeInclusive<u32> = 29..=29;
+pub const SUPPORTED_PROTOCOL_VERSIONS: RangeInclusive<u32> = 29..=30;
 
 /// What an RPC endpoint reports about itself, after the wallet checks it.
 ///
@@ -437,7 +437,7 @@ mod tests {
             }) => {
                 assert_eq!(protocol_version, version);
                 assert_eq!(supported_min, 29);
-                assert_eq!(supported_max, 29);
+                assert_eq!(supported_max, 30);
             }
             other => panic!("mainnet at version {version} must refuse; got {other:?}"),
         }
@@ -464,12 +464,21 @@ mod tests {
             Some(version.to_string().as_str())
         );
         assert_eq!(warning.get("supported_min").map(String::as_str), Some("29"));
-        assert_eq!(warning.get("supported_max").map(String::as_str), Some("29"));
+        assert_eq!(warning.get("supported_max").map(String::as_str), Some("30"));
     }
 
     #[test]
     fn mainnet_inside_the_range_passes_without_a_warning() {
         let (result, warnings) = with_warnings(|| check_protocol_version(Some(Caip2::Mainnet), 29));
+        assert!(result.is_ok(), "{result:?}");
+        assert!(warnings.is_empty(), "{warnings:?}");
+    }
+
+    /// Protocol 30 is the top of the supported range: a mainnet endpoint
+    /// reporting it passes, and passes silently.
+    #[test]
+    fn mainnet_at_protocol_30_passes_without_a_warning() {
+        let (result, warnings) = with_warnings(|| check_protocol_version(Some(Caip2::Mainnet), 30));
         assert!(result.is_ok(), "{result:?}");
         assert!(warnings.is_empty(), "{warnings:?}");
     }
@@ -481,25 +490,27 @@ mod tests {
 
     #[test]
     fn mainnet_above_the_range_refuses() {
-        assert_refused(30);
+        assert_refused(31);
     }
 
     #[test]
     fn testnet_outside_the_range_passes_with_one_warning() {
-        assert_one_warning(Some(Caip2::Testnet), 30);
+        assert_one_warning(Some(Caip2::Testnet), 31);
     }
 
     #[test]
     fn another_network_outside_the_range_passes_with_one_warning() {
-        assert_one_warning(None, 30);
+        assert_one_warning(None, 31);
     }
 
     #[test]
     fn any_network_inside_the_range_passes_without_a_warning() {
         for chain in [Some(Caip2::Testnet), None] {
-            let (result, warnings) = with_warnings(|| check_protocol_version(chain, 29));
-            assert!(result.is_ok(), "{chain:?}: {result:?}");
-            assert!(warnings.is_empty(), "{chain:?}: {warnings:?}");
+            for version in SUPPORTED_PROTOCOL_VERSIONS {
+                let (result, warnings) = with_warnings(|| check_protocol_version(chain, version));
+                assert!(result.is_ok(), "{chain:?} at {version}: {result:?}");
+                assert!(warnings.is_empty(), "{chain:?} at {version}: {warnings:?}");
+            }
         }
     }
 }

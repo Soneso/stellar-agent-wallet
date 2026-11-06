@@ -261,6 +261,172 @@ async fn submit_testnet_signed_xdr(
     .await?)
 }
 
+/// The daily `native` cap the acceptance policy sizes a swap against: 100 XLM.
+///
+/// The cap is far above the swap, so it never refuses; its role is to give the
+/// swap's debit leg a window entry, which the recorder charges as the signed
+/// intent before the first signature.
+const NATIVE_DAILY_CAP_STROOPS: i128 = 1_000_000_000;
+
+/// Wallet state the production submission recorder writes for one swap.
+///
+/// The receipt store and the spending-window file live in a fresh directory
+/// under the test's temporary directory, and the window store's key lives in
+/// the in-memory keyring, so the run never touches an operator's wallet state.
+/// The recorder is built the way the `trade` verb builds it: the policy engine
+/// sizes the gate's value effects, and that sizing is both the recorder's
+/// window entries and its signing admission.
+struct SubmissionRecordState {
+    dir: std::path::PathBuf,
+    profile: stellar_agent_core::profile::schema::Profile,
+    profile_name: String,
+    engine: stellar_agent_core::policy::v1::PolicyEngineV1,
+}
+
+impl SubmissionRecordState {
+    fn new(profile_name: &str, audit_log_path: &std::path::Path) -> Self {
+        use stellar_agent_core::policy::{
+            Decision,
+            v1::{
+                PolicyDocument, PolicyEngineV1, PolicyRule, RuleMatch, ScopeId,
+                criteria::per_period_cap::{PerPeriodCapCriterion, Window},
+            },
+        };
+
+        static KEYRING: std::sync::Once = std::sync::Once::new();
+        KEYRING.call_once(|| {
+            stellar_agent_test_support::keyring_mock::install()
+                .expect("install the in-memory keyring");
+        });
+        let dir = std::env::temp_dir().join(format!("{profile_name}-records-{}", now_secs()));
+        let profile = stellar_agent_core::profile::schema::Profile::builder_testnet(
+            "stellar-agent-signer",
+            profile_name,
+            "stellar-agent-nonce",
+            profile_name,
+        )
+        .audit_log_path(audit_log_path)
+        .build();
+        let engine = PolicyEngineV1::new(
+            PolicyDocument {
+                version: 1,
+                scope: ScopeId::AllProfiles,
+                signature: None,
+                rules: vec![PolicyRule {
+                    r#match: RuleMatch {
+                        tool: "*".into(),
+                        chain: "*".into(),
+                    },
+                    criteria: vec![Box::new(PerPeriodCapCriterion::new(
+                        "native".into(),
+                        Window::parse("1d").expect("a one-day window"),
+                        NATIVE_DAILY_CAP_STROOPS,
+                    ))],
+                    decision: Decision::Allow,
+                    allow_opaque_signing: false,
+                }],
+            },
+            profile_name.to_owned(),
+        );
+        Self {
+            dir,
+            profile,
+            profile_name: profile_name.to_owned(),
+            engine,
+        }
+    }
+
+    fn window_store(&self) -> stellar_agent_network::policy_state::PersistedWindowStore {
+        stellar_agent_network::policy_state::PersistedWindowStore::at_path(
+            self.dir.join("policy-window-state.json"),
+        )
+    }
+
+    /// Builds the recorder for one submission of `tool` with `effects`.
+    fn recorder(
+        &self,
+        tool: &'static str,
+        effects: &stellar_agent_core::policy::v1::ValueEffects,
+        audit: stellar_agent_network::AuditWriterHandle,
+    ) -> stellar_agent_network::WalletSubmissionRecorder<'_> {
+        use stellar_agent_core::policy::{
+            McpToolRegistration, PolicyEngine, ToolDescriptor, ToolValueKind,
+            v1::{SizingOutcome, ValueClass},
+        };
+
+        let mut descriptor = ToolDescriptor::from_registration(&McpToolRegistration {
+            name: tool,
+            destructive_hint: true,
+            read_only_hint: false,
+            chain_id_required: true,
+            value_kind: ToolValueKind::MovesValue,
+        });
+        descriptor.chain_id = TESTNET_CHAIN_ID.to_owned();
+        let sizing = match self
+            .engine
+            .record_confirmed_checked(
+                &descriptor,
+                &self.profile,
+                &ValueClass::Value(effects.clone()),
+            )
+            .expect("the acceptance policy sizes the action")
+        {
+            SizingOutcome::Sized(sizing) => sizing,
+            other => panic!("the acceptance policy must size the action, got {other:?}"),
+        };
+        let legs = effects.legs().iter().map(Into::into).collect();
+        let window_entries = sizing.entries().to_vec();
+        stellar_agent_network::WalletSubmissionRecorder::new(
+            &self.profile,
+            self.profile_name.clone(),
+            tool,
+            Some(TESTNET_CHAIN_ID.to_owned()),
+            stellar_agent_core::audit_log::PolicyDecision::Allow,
+            legs,
+            window_entries,
+            stellar_agent_core::profile::receipt::ReceiptStore::open_at(
+                &self.dir,
+                &self.profile_name,
+            )
+            .expect("open the receipt store"),
+            self.window_store(),
+            Some(audit),
+            None,
+            format!("{}-{}", self.profile_name, now_secs()),
+            stellar_agent_core::timefmt::now_unix_ms().expect("read the clock"),
+        )
+        .with_signing_sizing(sizing)
+    }
+
+    /// The amount and call count the durable window holds under the daily
+    /// `native` cap, read back the way the policy gate reads it.
+    fn native_window(&self) -> (i128, u32) {
+        let state = stellar_agent_core::policy::v1::PolicyStateStore::new();
+        self.window_store()
+            .load_into(&self.profile_name, &self.profile, &state)
+            .expect("load the window state");
+        state
+            .query_window(
+                &stellar_agent_core::policy::v1::criteria::state_store::StateKey::new(
+                    &self.profile_name,
+                    1,
+                    "native",
+                    86_400,
+                ),
+                stellar_agent_core::timefmt::now_unix_ms().expect("read the clock"),
+            )
+            .expect("query the window")
+    }
+
+    /// The reservations the window still holds open.
+    fn pending_reservations(&self) -> usize {
+        self.window_store()
+            .pending_reservations(&self.profile)
+            .expect("read the pending reservations")
+            .len()
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Acceptance — Venue allowlist
 // ─────────────────────────────────────────────────────────────────────────────
@@ -897,6 +1063,25 @@ async fn acceptance_submit_and_confirm() {
     ctx.audit_legs = Some(&audit_legs);
     ctx.audit_tool = Some("stellar_dex_trade");
 
+    // Record the submission before the bytes leave, as the `trade` verb does:
+    // the receipt, the pending audit row, the signed-intent charge and the
+    // spending-window reservation. The effects carry the same leg as the
+    // audit rows (single-derivation invariant).
+    let record_state = SubmissionRecordState::new("dex-swap-acceptance", &audit_log_path);
+    let value_effects = stellar_agent_core::policy::v1::ValueEffects::new(vec![
+        stellar_agent_dex::value::dex_trade_value_leg(
+            trade_args.amount_in,
+            &trade_args.path,
+            SOROSWAP_ROUTER_ADDRESS_TESTNET,
+        ),
+    ]);
+    let recorder = record_state.recorder(
+        "stellar_dex_trade",
+        &value_effects,
+        std::sync::Arc::clone(&audit_writer),
+    );
+    ctx.submission_recorder = Some(&recorder);
+
     // Execute the swap.
     // NOTE: `witness` is consumed (moved) by `submit`; cannot retry.
     // submit includes its own internal retry for transient RPC issues.
@@ -929,6 +1114,19 @@ async fn acceptance_submit_and_confirm() {
             row["kind"] == "value_action_submitted" && row["tool"] == "stellar_dex_trade"
         }),
         "confirmed DEX swap must record a value_action_submitted row: {audit_rows:?}"
+    );
+
+    // The confirmed swap is charged once against the durable daily `native`
+    // window, and its reservation is settled rather than left open.
+    assert_eq!(
+        record_state.native_window(),
+        (SWAP_AMOUNT_IN, 1),
+        "the confirmed swap must charge its debit leg once against the durable window"
+    );
+    assert_eq!(
+        record_state.pending_reservations(),
+        0,
+        "the confirmed swap must settle its window reservation"
     );
 
     // ── Step 6: Assert the multi-auth-entry guard observed count == 1 ─

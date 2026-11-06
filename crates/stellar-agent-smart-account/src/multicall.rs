@@ -1022,7 +1022,10 @@ pub(crate) async fn fetch_wasm_hash_via_rpc(
 /// 3. `min_resource_fee` within 5 percent numeric tolerance.
 ///
 /// Ledger heights can differ between RPCs and are excluded from this comparison.
-/// Every refusal is a `MulticallFailed` error with phase `rpc_divergence`.
+/// Every refusal is a `MulticallFailed` error with phase `rpc_divergence`. A
+/// transaction-data refusal names each differing part in fixed words
+/// (`footprint`, `instructions`, `read bytes`, `write bytes`, `resource fee`),
+/// and a fee refusal names `min resource fee`. No refusal carries a value.
 pub(crate) fn cross_rpc_compare_simulate_responses(
     primary: &stellar_rpc_client::SimulateTransactionResponse,
     secondary: &stellar_rpc_client::SimulateTransactionResponse,
@@ -1108,11 +1111,18 @@ pub(crate) fn cross_rpc_compare_simulate_responses(
             let p_xdr = p_td.to_xdr_base64(Limits::none()).unwrap_or_default();
             let s_xdr = s_td.to_xdr_base64(Limits::none()).unwrap_or_default();
             if p_xdr != s_xdr {
+                let parts = diverging_transaction_data_parts(&p_td, &s_td);
+                let redacted_reason = if parts.is_empty() {
+                    "transaction_data diverges between primary and secondary RPC".to_owned()
+                } else {
+                    format!(
+                        "transaction_data diverges between primary and secondary RPC: {}",
+                        parts.join(", ")
+                    )
+                };
                 return Err(SaError::MulticallFailed {
                     phase: "rpc_divergence",
-                    redacted_reason:
-                        "footprint (transaction_data) diverges between primary and secondary RPC"
-                            .to_owned(),
+                    redacted_reason,
                     post_submit_kind: None,
                 });
             }
@@ -1123,9 +1133,64 @@ pub(crate) fn cross_rpc_compare_simulate_responses(
     let primary_fee = primary.min_resource_fee;
     let secondary_fee = secondary.min_resource_fee;
 
-    check_numeric_tolerance("min_resource_fee", primary_fee, secondary_fee)?;
+    check_numeric_tolerance("min resource fee", primary_fee, secondary_fee)?;
 
     Ok(())
+}
+
+/// Names the parts of two simulations' transaction data that differ, in a
+/// fixed order and fixed words.
+///
+/// The destructuring names every field, so a field the XDR gains fails to
+/// compile here rather than diverging unnamed. The extension lists archived
+/// entries by their index in the read-write footprint, so a differing
+/// extension is reported as `footprint`. The words carry no value of either
+/// simulation.
+fn diverging_transaction_data_parts(
+    primary: &stellar_xdr::SorobanTransactionData,
+    secondary: &stellar_xdr::SorobanTransactionData,
+) -> Vec<&'static str> {
+    let stellar_xdr::SorobanTransactionData {
+        ext: primary_ext,
+        resources:
+            stellar_xdr::SorobanResources {
+                footprint: primary_footprint,
+                instructions: primary_instructions,
+                disk_read_bytes: primary_read_bytes,
+                write_bytes: primary_write_bytes,
+            },
+        resource_fee: primary_resource_fee,
+    } = primary;
+    let stellar_xdr::SorobanTransactionData {
+        ext: secondary_ext,
+        resources:
+            stellar_xdr::SorobanResources {
+                footprint: secondary_footprint,
+                instructions: secondary_instructions,
+                disk_read_bytes: secondary_read_bytes,
+                write_bytes: secondary_write_bytes,
+            },
+        resource_fee: secondary_resource_fee,
+    } = secondary;
+    [
+        (
+            primary_footprint != secondary_footprint || primary_ext != secondary_ext,
+            "footprint",
+        ),
+        (
+            primary_instructions != secondary_instructions,
+            "instructions",
+        ),
+        (primary_read_bytes != secondary_read_bytes, "read bytes"),
+        (primary_write_bytes != secondary_write_bytes, "write bytes"),
+        (
+            primary_resource_fee != secondary_resource_fee,
+            "resource fee",
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(differs, part)| differs.then_some(part))
+    .collect()
 }
 
 /// Normalizes the host's consumed nonce keys in a simulation's transaction data.
@@ -2456,6 +2521,8 @@ fn emit_audit_event(
 }
 
 /// Checks that two numeric estimates are within ±5% tolerance.
+///
+/// The refusal names `label` and carries neither estimate.
 fn check_numeric_tolerance(
     label: &'static str,
     primary: u64,
@@ -2473,7 +2540,7 @@ fn check_numeric_tolerance(
         return Err(SaError::MulticallFailed {
             phase: "rpc_divergence",
             redacted_reason: format!(
-                "estimate '{label}' differs beyond 5%: primary={primary}, secondary={secondary}"
+                "{label} diverges between primary and secondary RPC beyond the tolerance"
             ),
             post_submit_kind: None,
         });
@@ -3158,6 +3225,14 @@ wasm_sha256 = "{MULTICALL_WASM_SHA256}"
         auth: &[stellar_xdr::SorobanAuthorizationEntry],
         data: &stellar_xdr::SorobanTransactionData,
     ) -> stellar_rpc_client::SimulateTransactionResponse {
+        simulated_response_with_fee(auth, data, 1000)
+    }
+
+    fn simulated_response_with_fee(
+        auth: &[stellar_xdr::SorobanAuthorizationEntry],
+        data: &stellar_xdr::SorobanTransactionData,
+        min_resource_fee: u64,
+    ) -> stellar_rpc_client::SimulateTransactionResponse {
         use stellar_xdr::{Limits, WriteXdr};
         let auth: Vec<_> = auth
             .iter()
@@ -3165,7 +3240,7 @@ wasm_sha256 = "{MULTICALL_WASM_SHA256}"
             .collect();
         serde_json::from_value(serde_json::json!({
             "latestLedger": 100,
-            "minResourceFee": "1000",
+            "minResourceFee": min_resource_fee.to_string(),
             "transactionData": data.to_xdr_base64(Limits::none()).unwrap(),
             "results": [{"auth": auth, "xdr": ScVal::Void.to_xdr_base64(Limits::none()).unwrap()}],
         }))
@@ -3354,6 +3429,127 @@ wasm_sha256 = "{MULTICALL_WASM_SHA256}"
             let secondary = simulated_response(std::slice::from_ref(&entry), &changed);
             assert_rpc_divergence(&primary, &secondary, "transaction_data");
         }
+    }
+
+    /// The divergence refusal for one changed part of the transaction data.
+    ///
+    /// The primary and secondary simulations share the authorization entry and
+    /// differ only in what `change` alters.
+    fn transaction_data_divergence(
+        change: impl FnOnce(&mut stellar_xdr::SorobanTransactionData),
+    ) -> String {
+        let entry = simulated_auth_entry(123, 200);
+        let data = simulated_nonce_data(&entry);
+        let primary = simulated_response(std::slice::from_ref(&entry), &data);
+        let mut changed = data;
+        change(&mut changed);
+        let secondary = simulated_response(std::slice::from_ref(&entry), &changed);
+        divergence_reason(&primary, &secondary)
+    }
+
+    fn divergence_reason(
+        primary: &stellar_rpc_client::SimulateTransactionResponse,
+        secondary: &stellar_rpc_client::SimulateTransactionResponse,
+    ) -> String {
+        match cross_rpc_compare_simulate_responses(primary, secondary) {
+            Err(SaError::MulticallFailed {
+                phase: "rpc_divergence",
+                redacted_reason,
+                ..
+            }) => {
+                assert!(
+                    !redacted_reason.chars().any(|c| c.is_ascii_digit()),
+                    "the refusal carries no value: {redacted_reason}"
+                );
+                redacted_reason
+            }
+            other => panic!("expected an rpc_divergence refusal, got {other:?}"),
+        }
+    }
+
+    const TRANSACTION_DATA_DIVERGES: &str =
+        "transaction_data diverges between primary and secondary RPC: ";
+
+    /// A differing footprint key is named `footprint`.
+    #[test]
+    fn cross_rpc_divergence_names_the_footprint() {
+        use stellar_xdr::{Hash, LedgerKey, LedgerKeyContractCode};
+        let reason = transaction_data_divergence(|data| {
+            data.resources.footprint.read_only =
+                vec![LedgerKey::ContractCode(LedgerKeyContractCode {
+                    hash: Hash([9; 32]),
+                })]
+                .try_into()
+                .unwrap();
+        });
+        assert_eq!(reason, format!("{TRANSACTION_DATA_DIVERGES}footprint"));
+    }
+
+    /// A differing archived-entry extension indexes the footprint and is named
+    /// `footprint`.
+    #[test]
+    fn cross_rpc_divergence_names_the_archived_entries_as_the_footprint() {
+        use stellar_xdr::{SorobanResourcesExtV0, SorobanTransactionDataExt};
+        let reason = transaction_data_divergence(|data| {
+            data.ext = SorobanTransactionDataExt::V1(SorobanResourcesExtV0 {
+                archived_soroban_entries: vec![0].try_into().unwrap(),
+            });
+        });
+        assert_eq!(reason, format!("{TRANSACTION_DATA_DIVERGES}footprint"));
+    }
+
+    /// A differing instruction budget is named `instructions`.
+    #[test]
+    fn cross_rpc_divergence_names_the_instructions() {
+        let reason = transaction_data_divergence(|data| data.resources.instructions += 1);
+        assert_eq!(reason, format!("{TRANSACTION_DATA_DIVERGES}instructions"));
+    }
+
+    /// A differing disk read budget is named `read bytes`.
+    #[test]
+    fn cross_rpc_divergence_names_the_read_bytes() {
+        let reason = transaction_data_divergence(|data| data.resources.disk_read_bytes += 1);
+        assert_eq!(reason, format!("{TRANSACTION_DATA_DIVERGES}read bytes"));
+    }
+
+    /// A differing write budget is named `write bytes`.
+    #[test]
+    fn cross_rpc_divergence_names_the_write_bytes() {
+        let reason = transaction_data_divergence(|data| data.resources.write_bytes += 1);
+        assert_eq!(reason, format!("{TRANSACTION_DATA_DIVERGES}write bytes"));
+    }
+
+    /// A differing resource fee is named `resource fee`.
+    #[test]
+    fn cross_rpc_divergence_names_the_resource_fee() {
+        let reason = transaction_data_divergence(|data| data.resource_fee += 1);
+        assert_eq!(reason, format!("{TRANSACTION_DATA_DIVERGES}resource fee"));
+    }
+
+    /// Several differing parts are each named, in the fixed order.
+    #[test]
+    fn cross_rpc_divergence_names_every_differing_part() {
+        let reason = transaction_data_divergence(|data| {
+            data.resources.instructions += 1;
+            data.resource_fee += 1;
+        });
+        assert_eq!(
+            reason,
+            format!("{TRANSACTION_DATA_DIVERGES}instructions, resource fee")
+        );
+    }
+
+    /// A minimum resource fee beyond the tolerance is named `min resource fee`.
+    #[test]
+    fn cross_rpc_divergence_names_the_min_resource_fee() {
+        let entry = simulated_auth_entry(123, 200);
+        let data = simulated_nonce_data(&entry);
+        let primary = simulated_response_with_fee(std::slice::from_ref(&entry), &data, 1000);
+        let secondary = simulated_response_with_fee(std::slice::from_ref(&entry), &data, 2000);
+        assert_eq!(
+            divergence_reason(&primary, &secondary),
+            "min resource fee diverges between primary and secondary RPC beyond the tolerance"
+        );
     }
 
     /// A nonce key must match its simulation's credential address, nonce, and durability.

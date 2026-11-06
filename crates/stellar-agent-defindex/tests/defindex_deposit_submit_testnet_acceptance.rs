@@ -258,6 +258,172 @@ async fn submit_testnet_signed_xdr(
     .await?)
 }
 
+/// The daily `native` cap the acceptance policy sizes a deposit against: 100 XLM.
+///
+/// The cap is far above the deposits, so it never refuses; its role is to give
+/// a deposit's debit leg a window entry, which the recorder charges as the signed
+/// intent before the first signature.
+const NATIVE_DAILY_CAP_STROOPS: i128 = 1_000_000_000;
+
+/// Wallet state the production submission recorder writes for one test.
+///
+/// The receipt store and the spending-window file live in a fresh directory
+/// under the test's temporary directory, and the window store's key lives in
+/// the in-memory keyring, so the run never touches an operator's wallet state.
+/// The recorder is built the way the `vault` verbs build it: the policy engine
+/// sizes the gate's value effects, and that sizing is both the recorder's
+/// window entries and its signing admission.
+struct SubmissionRecordState {
+    dir: std::path::PathBuf,
+    profile: stellar_agent_core::profile::schema::Profile,
+    profile_name: String,
+    engine: stellar_agent_core::policy::v1::PolicyEngineV1,
+}
+
+impl SubmissionRecordState {
+    fn new(profile_name: &str, audit_log_path: &std::path::Path) -> Self {
+        use stellar_agent_core::policy::{
+            Decision,
+            v1::{
+                PolicyDocument, PolicyEngineV1, PolicyRule, RuleMatch, ScopeId,
+                criteria::per_period_cap::{PerPeriodCapCriterion, Window},
+            },
+        };
+
+        static KEYRING: std::sync::Once = std::sync::Once::new();
+        KEYRING.call_once(|| {
+            stellar_agent_test_support::keyring_mock::install()
+                .expect("install the in-memory keyring");
+        });
+        let dir = std::env::temp_dir().join(format!("{profile_name}-records-{}", now_secs()));
+        let profile = stellar_agent_core::profile::schema::Profile::builder_testnet(
+            "stellar-agent-signer",
+            profile_name,
+            "stellar-agent-nonce",
+            profile_name,
+        )
+        .audit_log_path(audit_log_path)
+        .build();
+        let engine = PolicyEngineV1::new(
+            PolicyDocument {
+                version: 1,
+                scope: ScopeId::AllProfiles,
+                signature: None,
+                rules: vec![PolicyRule {
+                    r#match: RuleMatch {
+                        tool: "*".into(),
+                        chain: "*".into(),
+                    },
+                    criteria: vec![Box::new(PerPeriodCapCriterion::new(
+                        "native".into(),
+                        Window::parse("1d").expect("a one-day window"),
+                        NATIVE_DAILY_CAP_STROOPS,
+                    ))],
+                    decision: Decision::Allow,
+                    allow_opaque_signing: false,
+                }],
+            },
+            profile_name.to_owned(),
+        );
+        Self {
+            dir,
+            profile,
+            profile_name: profile_name.to_owned(),
+            engine,
+        }
+    }
+
+    fn window_store(&self) -> stellar_agent_network::policy_state::PersistedWindowStore {
+        stellar_agent_network::policy_state::PersistedWindowStore::at_path(
+            self.dir.join("policy-window-state.json"),
+        )
+    }
+
+    /// Builds the recorder for one submission of `tool` with `effects`.
+    fn recorder(
+        &self,
+        tool: &'static str,
+        effects: &stellar_agent_core::policy::v1::ValueEffects,
+        audit: stellar_agent_network::AuditWriterHandle,
+    ) -> stellar_agent_network::WalletSubmissionRecorder<'_> {
+        use stellar_agent_core::policy::{
+            McpToolRegistration, PolicyEngine, ToolDescriptor, ToolValueKind,
+            v1::{SizingOutcome, ValueClass},
+        };
+
+        let mut descriptor = ToolDescriptor::from_registration(&McpToolRegistration {
+            name: tool,
+            destructive_hint: true,
+            read_only_hint: false,
+            chain_id_required: true,
+            value_kind: ToolValueKind::MovesValue,
+        });
+        descriptor.chain_id = TESTNET_CHAIN_ID.to_owned();
+        let sizing = match self
+            .engine
+            .record_confirmed_checked(
+                &descriptor,
+                &self.profile,
+                &ValueClass::Value(effects.clone()),
+            )
+            .expect("the acceptance policy sizes the action")
+        {
+            SizingOutcome::Sized(sizing) => sizing,
+            other => panic!("the acceptance policy must size the action, got {other:?}"),
+        };
+        let legs = effects.legs().iter().map(Into::into).collect();
+        let window_entries = sizing.entries().to_vec();
+        stellar_agent_network::WalletSubmissionRecorder::new(
+            &self.profile,
+            self.profile_name.clone(),
+            tool,
+            Some(TESTNET_CHAIN_ID.to_owned()),
+            stellar_agent_core::audit_log::PolicyDecision::Allow,
+            legs,
+            window_entries,
+            stellar_agent_core::profile::receipt::ReceiptStore::open_at(
+                &self.dir,
+                &self.profile_name,
+            )
+            .expect("open the receipt store"),
+            self.window_store(),
+            Some(audit),
+            None,
+            format!("{}-{}", self.profile_name, now_secs()),
+            stellar_agent_core::timefmt::now_unix_ms().expect("read the clock"),
+        )
+        .with_signing_sizing(sizing)
+    }
+
+    /// The amount and call count the durable window holds under the daily
+    /// `native` cap, read back the way the policy gate reads it.
+    fn native_window(&self) -> (i128, u32) {
+        let state = stellar_agent_core::policy::v1::PolicyStateStore::new();
+        self.window_store()
+            .load_into(&self.profile_name, &self.profile, &state)
+            .expect("load the window state");
+        state
+            .query_window(
+                &stellar_agent_core::policy::v1::criteria::state_store::StateKey::new(
+                    &self.profile_name,
+                    1,
+                    "native",
+                    86_400,
+                ),
+                stellar_agent_core::timefmt::now_unix_ms().expect("read the clock"),
+            )
+            .expect("query the window")
+    }
+
+    /// The reservations the window still holds open.
+    fn pending_reservations(&self) -> usize {
+        self.window_store()
+            .pending_reservations(&self.profile)
+            .expect("read the pending reservations")
+            .len()
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Classifiers
 // ─────────────────────────────────────────────────────────────────────────────
@@ -493,6 +659,25 @@ async fn defindex_deposit_submit_and_confirm() {
     deposit_ctx.audit_legs = Some(&audit_legs);
     deposit_ctx.audit_tool = Some("stellar_defindex_vault_deposit");
 
+    // Record the submission before the bytes leave, as the `vault deposit`
+    // verb does: the receipt, the pending audit row, the signed-intent charge
+    // and the spending-window reservation. The effects carry the same legs as
+    // the audit rows (single-derivation invariant).
+    let record_state = SubmissionRecordState::new("defindex-deposit-acceptance", &audit_log_path);
+    let deposit_effects = stellar_agent_core::policy::v1::ValueEffects::new(
+        stellar_agent_defindex::value::vault_deposit_value_legs(
+            &deposit_args.amounts_desired,
+            &[XLM_SAC_TESTNET.to_owned()],
+            &deposit_args.vault_address,
+        ),
+    );
+    let deposit_recorder = record_state.recorder(
+        "stellar_defindex_vault_deposit",
+        &deposit_effects,
+        std::sync::Arc::clone(&audit_writer),
+    );
+    deposit_ctx.submission_recorder = Some(&deposit_recorder);
+
     let defindex_adapter = DefindexVaultAdapter::new();
     let deposit_result = defindex_adapter
         .submit(&deposit_args, &deposit_ctx, deposit_witness)
@@ -524,6 +709,19 @@ async fn defindex_deposit_submit_and_confirm() {
                         && row["tool"] == "stellar_defindex_vault_deposit"
                 }),
                 "confirmed DeFindex deposit must record a value_action_submitted row: {audit_rows:?}"
+            );
+
+            // The confirmed deposit is charged once against the durable daily
+            // `native` window, and its reservation is settled.
+            assert_eq!(
+                record_state.native_window(),
+                (XLM_DEPOSIT_AMOUNT, 1),
+                "the confirmed deposit must charge its debit leg once against the durable window"
+            );
+            assert_eq!(
+                record_state.pending_reservations(),
+                0,
+                "the confirmed deposit must settle its window reservation"
             );
         }
         Err(e) => {
@@ -707,7 +905,7 @@ async fn defindex_deposit_then_withdraw_submit_and_confirm() {
     let secondary_rpc =
         StellarRpcClient::new(stellar_agent_test_support::testnet_secondary_rpc_url())
             .expect("secondary RPC URL must be valid");
-    let deposit_ctx = DefiAdapterCtx::new_with_submit_ctx(
+    let mut deposit_ctx = DefiAdapterCtx::new_with_submit_ctx(
         "default",
         &vault_pin,
         &primary_rpc_for_deposit,
@@ -726,6 +924,38 @@ async fn defindex_deposit_then_withdraw_submit_and_confirm() {
         invest: false,
         override_upgradable: true,
     };
+
+    // One profile's wallet state and audit log record both submissions of
+    // this test: the deposit here and the withdraw in step 5.
+    let withdraw_audit_dir =
+        std::env::temp_dir().join(format!("defindex-withdraw-audit-{}", now_secs()));
+    std::fs::create_dir_all(&withdraw_audit_dir).expect("create audit dir");
+    let withdraw_audit_log_path = withdraw_audit_dir.join("audit.jsonl");
+    let withdraw_audit_writer = std::sync::Arc::new(std::sync::Mutex::new(
+        stellar_agent_core::audit_log::AuditWriter::open_keyed_unanchored_for_test(
+            withdraw_audit_log_path.clone(),
+            Zeroizing::new([0x11u8; 32]),
+        )
+        .expect("open audit writer"),
+    ));
+    let record_state =
+        SubmissionRecordState::new("defindex-withdraw-acceptance", &withdraw_audit_log_path);
+
+    // Record the deposit before the bytes leave, as the `vault deposit` verb
+    // does.
+    let deposit_effects = stellar_agent_core::policy::v1::ValueEffects::new(
+        stellar_agent_defindex::value::vault_deposit_value_legs(
+            &deposit_args.amounts_desired,
+            &[XLM_SAC_TESTNET.to_owned()],
+            &deposit_args.vault_address,
+        ),
+    );
+    let deposit_recorder = record_state.recorder(
+        "stellar_defindex_vault_deposit",
+        &deposit_effects,
+        std::sync::Arc::clone(&withdraw_audit_writer),
+    );
+    deposit_ctx.submission_recorder = Some(&deposit_recorder);
 
     let defindex_adapter = DefindexVaultAdapter::new();
     let deposit_result = defindex_adapter
@@ -853,17 +1083,6 @@ async fn defindex_deposit_then_withdraw_submit_and_confirm() {
     // Wire audit emission exactly as the MCP `stellar_defindex_vault_withdraw`
     // handler does, so the confirmed withdraw records its value_action_submitted
     // row.  The leg is built from the SAME shares/vault the withdraw uses.
-    let withdraw_audit_dir =
-        std::env::temp_dir().join(format!("defindex-withdraw-audit-{}", now_secs()));
-    std::fs::create_dir_all(&withdraw_audit_dir).expect("create audit dir");
-    let withdraw_audit_log_path = withdraw_audit_dir.join("audit.jsonl");
-    let withdraw_audit_writer = std::sync::Arc::new(std::sync::Mutex::new(
-        stellar_agent_core::audit_log::AuditWriter::open_keyed_unanchored_for_test(
-            withdraw_audit_log_path.clone(),
-            Zeroizing::new([0x11u8; 32]),
-        )
-        .expect("open audit writer"),
-    ));
     let withdraw_audit_legs = vec![stellar_agent_core::audit_log::ValueLegRecord::from(
         &stellar_agent_defindex::value::vault_withdraw_value_leg(
             withdraw_args.withdraw_shares,
@@ -873,6 +1092,21 @@ async fn defindex_deposit_then_withdraw_submit_and_confirm() {
     withdraw_ctx.audit_writer = Some(std::sync::Arc::clone(&withdraw_audit_writer));
     withdraw_ctx.audit_legs = Some(&withdraw_audit_legs);
     withdraw_ctx.audit_tool = Some("stellar_defindex_vault_withdraw");
+
+    // Record the withdraw before the bytes leave, as the `vault withdraw` verb
+    // does, from the same leg the audit rows carry.
+    let withdraw_effects = stellar_agent_core::policy::v1::ValueEffects::new(vec![
+        stellar_agent_defindex::value::vault_withdraw_value_leg(
+            withdraw_args.withdraw_shares,
+            &withdraw_args.vault_address,
+        ),
+    ]);
+    let withdraw_recorder = record_state.recorder(
+        "stellar_defindex_vault_withdraw",
+        &withdraw_effects,
+        std::sync::Arc::clone(&withdraw_audit_writer),
+    );
+    withdraw_ctx.submission_recorder = Some(&withdraw_recorder);
 
     let withdraw_result = defindex_adapter
         .submit(&withdraw_args, &withdraw_ctx, withdraw_witness)
@@ -906,6 +1140,19 @@ async fn defindex_deposit_then_withdraw_submit_and_confirm() {
                         && row["tool"] == "stellar_defindex_vault_withdraw"
                 }),
                 "confirmed DeFindex withdraw must record a value_action_submitted row: {audit_rows:?}"
+            );
+
+            // The deposit is the test's only debit: the withdraw returns funds
+            // and adds no charge, and both reservations are settled.
+            assert_eq!(
+                record_state.native_window(),
+                (XLM_DEPOSIT_AMOUNT, 1),
+                "only the deposit is charged against the durable window"
+            );
+            assert_eq!(
+                record_state.pending_reservations(),
+                0,
+                "the confirmed submissions must settle their window reservations"
             );
         }
         Err(e) => {

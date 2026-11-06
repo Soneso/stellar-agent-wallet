@@ -1010,7 +1010,7 @@ The outcomes, in the order the check reaches them:
 - endpoint reports a different network than the caller declared: `network.endpoint_network_mismatch`
 - protocol version outside the supported range on mainnet: `network.unsupported_protocol_version`
 
-The same answer carries the endpoint's protocol version, which the protocol rule checks against `SUPPORTED_PROTOCOL_VERSIONS`, protocol 29 in this release. A release adds a version to the range only after its testnet acceptance tests ran against that version. On testnet, and on any other network whose passphrase matches the declaration, a version outside the range passes with one logged warning that carries the version and the range. On mainnet the same version is refused. Ordinary submission refuses mainnet before the protocol check. Authorized submission enforces the mainnet protocol range.
+The same answer carries the endpoint's protocol version, which the protocol rule checks against `SUPPORTED_PROTOCOL_VERSIONS`, protocols 29 and 30 in this release. A release adds a version to the range only after its testnet acceptance tests ran against that version. On testnet, and on any other network whose passphrase matches the declaration, a version outside the range passes with one logged warning that carries the version and the range. On mainnet the same version is refused. Ordinary submission refuses mainnet before the protocol check. Authorized submission enforces the mainnet protocol range.
 
 The probe runs on the client instance that will carry `sendTransaction`, not on a fresh one, so the identity that was established is the identity of the connection the transaction goes out on.
 
