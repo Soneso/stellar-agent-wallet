@@ -1122,9 +1122,13 @@ impl WalletSubmissionRecorder<'_> {
     /// Requires the envelope's network to agree with this submission's accounting.
     ///
     /// Window entries debit the authenticated store, so the comparison reads
-    /// it. Without entries the submission debits nothing and touches neither
-    /// the store nor the keyring: a profile with no spending window submits
-    /// on a host without either, and its envelope answers to the profile alone.
+    /// it. Without entries the submission debits nothing. The admission creates
+    /// the window directory and its lock file. It reads the generation entry of
+    /// the registered keyring store to detect a deleted window file. With no
+    /// window state on disk, an admission without entries writes no accounting
+    /// state. With window state on disk, it may advance or prune retained
+    /// intents, which writes the file and the generation entry. The envelope
+    /// answers to the profile alone.
     fn require_submission_scope(&self, intent: &SubmissionIntent) -> Result<(), WindowStoreError> {
         if self.window_entries.is_empty() {
             return intent.chain_scope.require_profile(self.profile);

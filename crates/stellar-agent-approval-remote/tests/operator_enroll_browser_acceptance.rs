@@ -538,9 +538,17 @@ fn synthetic_valid_body(seed: u8, port: u16) -> serde_json::Value {
 
 /// Parses the JSON data island `id` in a served page, as the offline
 /// template tests do, applied here to a real HTTP response body.
+///
+/// The opening tag is matched up to its `id` attribute and ends at the next
+/// `>`, so attributes after the `id`, such as `data-purpose`, are accepted.
 fn extract_island(html: &str, id: &str) -> serde_json::Value {
-    let open = format!(r#"<script type="application/json" id="{id}">"#);
-    let start = html.find(&open).expect("data island opening tag present") + open.len();
+    let open = format!(r#"<script type="application/json" id="{id}""#);
+    let tag = html.find(&open).expect("data island opening tag present");
+    let start = tag
+        + html[tag..]
+            .find('>')
+            .expect("data island opening tag end present")
+        + 1;
     let rest = &html[start..];
     let end = rest
         .find("</script>")

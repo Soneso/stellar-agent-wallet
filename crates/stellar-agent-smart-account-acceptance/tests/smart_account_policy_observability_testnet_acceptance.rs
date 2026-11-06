@@ -617,6 +617,7 @@ fn write_read_rules_toolset_pin(toolsets_root: &Path, toolset_name: &str) {
 #[tokio::test]
 #[serial_test::serial]
 async fn policy_observability_full_flow_testnet_acceptance() {
+    stellar_agent_test_support::keyring_mock::install().expect("install the in-memory keyring");
     let tmp = tempfile::tempdir().expect("tempdir must be created");
     let registry_path = tmp.path().join("networks.toml");
 

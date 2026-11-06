@@ -175,6 +175,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- The wallet accepts protocol 30 on mainnet endpoints beside protocol 29.
+
+- A multicall cross-RPC simulation divergence names each differing part of
+  the transaction data, `footprint`, `instructions`, `read bytes`,
+  `write bytes` or `resource fee`, and a minimum resource fee beyond the
+  tolerance names `min resource fee`. The `resource_fee` field of the
+  transaction data holds within the same 5 percent tolerance as the minimum
+  resource fee. Neither refusal carries a value of either simulation.
+
+- The MPP interoperability harness runs the released `@stellar/mpp` 0.7.1
+  server on `@stellar/stellar-sdk` 16.4.1, which decodes protocol 30 ledger
+  headers.
+
 - `pool init --resume` keeps an attempt the endpoint reports as failed.
   `pool status` names `tx receipt clear --acknowledge`, and resume retries with
   the same keys after the clear.

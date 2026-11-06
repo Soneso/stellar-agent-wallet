@@ -688,6 +688,7 @@ async fn install_threshold_policy_on_fresh_sa(
 /// baseline records a threshold (bootstrap rule_id=0 has no policy).
 #[tokio::test]
 async fn b4_fresh_wallet_missing_baseline_then_refresh_then_verify_ok() {
+    stellar_agent_test_support::keyring_mock::install().expect("install the in-memory keyring");
     let (signer_g, signer_box) = fresh_signer();
     fund_via_friendbot(&signer_g).await;
 
@@ -807,6 +808,7 @@ async fn b4_fresh_wallet_missing_baseline_then_refresh_then_verify_ok() {
 /// `InvokeHostFunctionOp`.
 #[tokio::test]
 async fn b1_threshold_brick_refusal() {
+    stellar_agent_test_support::keyring_mock::install().expect("install the in-memory keyring");
     let (signer_g, signer_box) = fresh_signer();
     fund_via_friendbot(&signer_g).await;
 
@@ -914,6 +916,7 @@ async fn b1_threshold_brick_refusal() {
 /// observation's version-1 projection with it.
 #[tokio::test]
 async fn b3_divergence_detection_via_injected_baseline() {
+    stellar_agent_test_support::keyring_mock::install().expect("install the in-memory keyring");
     let (signer_g, signer_box) = fresh_signer();
     fund_via_friendbot(&signer_g).await;
 
@@ -1047,6 +1050,7 @@ async fn b3_divergence_detection_via_injected_baseline() {
 /// - [`build_external_signer_scval`] encodes this layout.
 #[tokio::test]
 async fn b7_add_external_signer_to_existing_rule() {
+    stellar_agent_test_support::keyring_mock::install().expect("install the in-memory keyring");
     use stellar_agent_smart_account::deployment::{
         ResolvedFeePerOp, WebAuthnVerifierDeployArgs, deploy_webauthn_verifier,
     };
@@ -1253,6 +1257,7 @@ async fn b7_add_external_signer_to_existing_rule() {
 /// - `Signer::External(Address, Bytes)` ScVal encoding (no WebAuthn variant on-chain).
 #[tokio::test]
 async fn b8_add_webauthn_signer_to_existing_rule() {
+    stellar_agent_test_support::keyring_mock::install().expect("install the in-memory keyring");
     use stellar_agent_smart_account::deployment::{
         ResolvedFeePerOp, WebAuthnVerifierDeployArgs, deploy_webauthn_verifier,
     };
@@ -1473,6 +1478,7 @@ fn digest_matches_first8_last8_pattern(s: &str) -> bool {
 /// - `get_threshold(e, context_rule_id: u32, smart_account: Address) -> u32`.
 #[tokio::test]
 async fn b2_set_threshold_single_op() {
+    stellar_agent_test_support::keyring_mock::install().expect("install the in-memory keyring");
     let (signer_g, signer_box) = fresh_signer();
     fund_via_friendbot(&signer_g).await;
 
@@ -1692,6 +1698,7 @@ async fn b5_a_policyless_rule_baselines_without_a_threshold() {
 /// writer-sharing architecture, not an on-chain contract surface.
 #[tokio::test(flavor = "multi_thread")]
 async fn b6_audit_log_request_id_pairing_across_divergence_emit() {
+    stellar_agent_test_support::keyring_mock::install().expect("install the in-memory keyring");
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
     let (signer_g, signer_box) = fresh_signer();

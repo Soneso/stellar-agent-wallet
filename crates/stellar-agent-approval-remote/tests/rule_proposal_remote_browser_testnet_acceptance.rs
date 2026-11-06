@@ -121,13 +121,6 @@ use stellar_agent_core::approval::{ApprovalKind, DEFAULT_TTL_MS, process_uid_for
 use stellar_agent_core::audit_log::schema::EventKind;
 use stellar_agent_core::audit_log::test_helpers::verified_audit_entries_from_path;
 use stellar_agent_core::audit_log::writer::AuditWriter;
-use stellar_agent_core::policy::v1::{
-    AccountIdentityView, AccountReservesView, CounterpartyCacheView, Sep10SessionView,
-    Sep45SessionView,
-};
-use stellar_agent_core::policy::{
-    ApprovalRequest, Decision as PolicyDecision, PolicyEngine, PolicyError, ToolDescriptor,
-};
 use stellar_agent_core::profile::schema::{Profile, default_passkeys_dir};
 use stellar_agent_core::timefmt;
 use stellar_agent_mcp::server::{
@@ -145,6 +138,9 @@ use tempfile::TempDir;
 use tokio::sync::Mutex as TokioMutex;
 use zeroize::Zeroizing;
 
+mod common;
+use common::RequireApprovalEngine;
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Constants
 // ─────────────────────────────────────────────────────────────────────────────
@@ -161,30 +157,8 @@ const TESTNET_CHAIN_ID: &str = "stellar:testnet";
 /// credentials scoped to this one RP-ID across both origins.
 const TEST_RP_ID: &str = "localhost";
 
-// ─────────────────────────────────────────────────────────────────────────────
-// RequireApproval policy engine — forces every dispatch to park a pending entry
-// ─────────────────────────────────────────────────────────────────────────────
-
-struct RequireApprovalEngine;
-
-impl PolicyEngine for RequireApprovalEngine {
-    fn evaluate(
-        &self,
-        _tool: &ToolDescriptor,
-        _args: &serde_json::Value,
-        _profile: &Profile,
-        _account_view: Option<&dyn AccountReservesView>,
-        _identity_view: Option<&dyn AccountIdentityView>,
-        _counterparty_cache: Option<&dyn CounterpartyCacheView>,
-        _sep10_sessions: Option<&dyn Sep10SessionView>,
-        _sep45_sessions: Option<&dyn Sep45SessionView>,
-    ) -> Result<PolicyDecision, PolicyError> {
-        Ok(PolicyDecision::RequireApproval(ApprovalRequest::new(
-            "rule-proposal-remote-browser-testnet-acceptance".into(),
-            600,
-        )))
-    }
-}
+/// The reason every pending approval of this suite carries.
+const REQUIRE_APPROVAL_REASON: &str = "rule-proposal-remote-browser-testnet-acceptance";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Testnet helpers
@@ -880,7 +854,9 @@ async fn rule_proposal_remote_browser_drives_real_rule_install() {
 
     let mut server = WalletServer::new(profile.clone()).expect("WalletServer::new");
     server.set_approval_dir_for_test(approval_dir.path().to_path_buf());
-    server.set_policy_engine_for_test(Arc::new(RequireApprovalEngine));
+    server.set_policy_engine_for_test(Arc::new(RequireApprovalEngine {
+        reason: REQUIRE_APPROVAL_REASON,
+    }));
     let profile_name = server.profile_name_for_approval();
 
     // ── 2. Launch Chromium + a DEDICATED virtual authenticator for the
@@ -1296,6 +1272,8 @@ async fn negative_test_fixture() -> (WalletServer, TempDir, String, String, [u8;
         &proposer_g,
     )
     .with_noop_engine()
+    // The server's audit log stays inside the fixture's directory.
+    .audit_log_path(approval_dir.path().join("wallet-audit.jsonl"))
     .build();
     profile.rpc_url = TESTNET_RPC_URL.to_owned();
     profile.secondary_rpc_url =
@@ -1304,7 +1282,9 @@ async fn negative_test_fixture() -> (WalletServer, TempDir, String, String, [u8;
 
     let mut server = WalletServer::new(profile).expect("WalletServer::new");
     server.set_approval_dir_for_test(approval_dir.path().to_path_buf());
-    server.set_policy_engine_for_test(Arc::new(RequireApprovalEngine));
+    server.set_policy_engine_for_test(Arc::new(RequireApprovalEngine {
+        reason: REQUIRE_APPROVAL_REASON,
+    }));
 
     (
         server,

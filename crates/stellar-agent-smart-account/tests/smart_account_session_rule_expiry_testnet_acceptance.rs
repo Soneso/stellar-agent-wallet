@@ -8,8 +8,8 @@
 //!
 //! | Fixture | Description |
 //! |---------|-------------|
-//! | [`h_1_revocation_audit_log_timeline`] | Deploy SA; install session rule with `valid_until = current + 5`; revoke (`set-valid-until = current_ledger + 2`); assert `SaRawInvocation` audit row exists |
-//! | [`h_2_post_revocation_new_sign_refused`] | Deploy SA; install session rule; revoke (`set-valid-until = current_ledger + 2`); wait past revocation_ledger; attempt `add_policy`; assert `SaError::RuleExpired` with `current > valid_until` |
+//! | [`h_1_revocation_audit_log_timeline`] | Deploy SA; install session rule with `valid_until = current + INSTALL_HEADROOM_LEDGERS`; revoke (`set-valid-until = current_ledger + REVOKE_HEADROOM_LEDGERS`); assert `SaRawInvocation` audit row exists |
+//! | [`h_2_post_revocation_new_sign_refused`] | Deploy SA; install session rule; revoke (`set-valid-until = current_ledger + REVOKE_HEADROOM_LEDGERS`); wait past revocation_ledger; attempt `add_policy`; assert `SaError::RuleExpired` with `current > valid_until` |
 //!
 //! # Gating
 //!
@@ -78,19 +78,46 @@ const TESTNET_PASSPHRASE: &str = "Test SDF Network ; September 2015";
 const FEE_STROOPS: u32 = 1_000_000;
 const TIMEOUT_SECS: u64 = 120;
 
+// ── Ledger headroom ───────────────────────────────────────────────────────────
+
+/// Ledgers between the ledger read right before an install and the session
+/// rule's `valid_until`.
+///
+/// Before the install applies, the signing pipeline runs the two-endpoint
+/// ledger witness with its rereads, the durable intent charge, simulation and
+/// submission, which on testnet takes up to about 35 s (7 ledgers). Twenty
+/// ledgers (about 100 s) keep the rule valid until the install lands.
+const INSTALL_HEADROOM_LEDGERS: u32 = 20;
+
+/// Ledgers between the ledger read right before a revocation and the
+/// revocation's `valid_until`.
+///
+/// The contract refuses a `valid_until` below the ledger the update applies in
+/// (`PastValidUntil = 3005`), and the same pipeline runs before the update
+/// applies. Ten ledgers (about 50 s) keep the bound ahead of the apply ledger
+/// while the rule still expires within a minute.
+const REVOKE_HEADROOM_LEDGERS: u32 = 10;
+
+/// Polls of [`wait_for_ledger_past`] that cover the revocation headroom twice.
+///
+/// Each poll waits 6 s, longer than one ledger, so the bound outlasts every
+/// ledger of the headroom with margin for slow ledger closes.
+const REVOKE_WAIT_POLLS: u32 = REVOKE_HEADROOM_LEDGERS * 2;
+
 // ── Design note ──────────────────────────────────────────────────────────────
 //
-// Revocation ledger offset: tests set `valid_until = current_ledger + 2` rather
-// than `current_ledger` to absorb the simulate→apply timing window. The
-// contract's `update_context_rule_valid_until` checks
-// `valid_until < e.ledger().sequence()`
-// at *apply* time (one or more ledgers after simulate returns), so
-// `valid_until = simulate_ledger` may already be stale by apply time and trigger
-// `PastValidUntil = 3005`. Adding 2 gives a two-ledger (~10 s) buffer while
-// still making the rule expire quickly enough to test it. The canonical
+// Revocation ledger offset: tests set
+// `valid_until = current_ledger + REVOKE_HEADROOM_LEDGERS` rather than
+// `current_ledger` to absorb the window between the ledger read and the apply
+// ledger. The contract's `update_context_rule_valid_until` checks
+// `valid_until < e.ledger().sequence()` at *apply* time, after the signing
+// pipeline and simulation, so `valid_until = current_ledger` is stale by apply
+// time and triggers `PastValidUntil = 3005`. The headroom covers that pipeline
+// while still making the rule expire quickly enough to test it. The canonical
 // production pattern is `valid_until = latest_ledger_from_simulate_response`
 // (available inside submit_signed_invoke as `sim_response.latest_ledger`); the
-// tests use `fetch_latest_ledger() + 2` as the externally-observable proxy.
+// tests use `fetch_latest_ledger() + REVOKE_HEADROOM_LEDGERS` as the
+// externally-observable proxy.
 //
 // After setting `valid_until = revocation_ledger`, we wait until the
 // chain advances past `revocation_ledger`. The expiry check fires AFTER simulate
@@ -194,7 +221,8 @@ async fn fetch_latest_ledger() -> u32 {
 /// `get_latest_ledger` up to `max_polls` times with a 6-second delay.
 ///
 /// 6 seconds is slightly longer than the nominal 5-second ledger time to
-/// allow for minor timing jitter. `max_polls = 10` gives a 60-second bound.
+/// allow for minor timing jitter, so `max_polls` polls bound the wait at
+/// `6 * max_polls` seconds.
 async fn wait_for_ledger_past(target_ledger: u32, max_polls: u32) -> u32 {
     for poll in 0..max_polls {
         let current = fetch_latest_ledger().await;
@@ -246,8 +274,9 @@ fn rule_manager_uncapped_over(
     signers_manager: Arc<SignersManager>,
     audit_writer: Arc<Mutex<AuditWriter>>,
 ) -> ContextRuleManager {
-    // Use a very large cap so the substrate install with `current + 5`
-    // does not trigger the horizon enforcement.  The horizon test is in
+    // Use a very large cap so the substrate install with
+    // `current + INSTALL_HEADROOM_LEDGERS` does not trigger the horizon
+    // enforcement.  The horizon test is in
     // `smart_account_session_rule_horizon_testnet_acceptance.rs`; here we focus
     // on the expiry detection.
     ContextRuleManager::new(
@@ -270,20 +299,20 @@ fn rid() -> String {
 // ── Revocation audit-log timeline ────────────────────────────────────────────
 
 /// Deploy a fresh smart account, install a session rule with `valid_until =
-/// current_ledger + 5`, then immediately revoke via `update_valid_until(=
-/// current_ledger + 2)`. Assert the audit log records a `SaRawInvocation` row
-/// with a successful outcome.
+/// current_ledger + INSTALL_HEADROOM_LEDGERS`, then immediately revoke via
+/// `update_valid_until(= current_ledger + REVOKE_HEADROOM_LEDGERS)`. Assert the
+/// audit log records a `SaRawInvocation` row with a successful outcome.
 ///
 /// # Design
 ///
 /// The revocation pattern:
-/// - `valid_until = current_ledger + 2` — the `+2` absorbs the simulate→apply
-///   timing window (the contract rejects `valid_until < e.ledger().sequence()`
-///   at apply time with `PastValidUntil = 3005`; `current_ledger` alone may be
-///   stale by
-///   then). The canonical value is `sim_response.latest_ledger` inside
-///   `submit_signed_invoke`; the test uses `fetch_latest_ledger() + 2` as the
-///   externally-observable proxy.
+/// - `valid_until = current_ledger + REVOKE_HEADROOM_LEDGERS`. The headroom
+///   covers the ledgers between the read and the apply ledger; `current_ledger`
+///   alone is stale by then. The contract rejects
+///   `valid_until < e.ledger().sequence()` at apply time with
+///   `PastValidUntil = 3005`. The canonical value is `sim_response.latest_ledger`
+///   inside `submit_signed_invoke`; the test reads `fetch_latest_ledger()` and
+///   adds the headroom as the observable proxy.
 /// - After `revocation_ledger` closes, `current_ledger > valid_until`, which
 ///   the validate-time check (`valid_until < e.ledger().sequence()`) catches.
 ///
@@ -291,6 +320,7 @@ fn rid() -> String {
 /// operators can reconstruct the timeline forensically.
 #[tokio::test]
 async fn h_1_revocation_audit_log_timeline() {
+    stellar_agent_test_support::keyring_mock::install().expect("install the in-memory keyring");
     // ── Step 1: Fresh signer + fund ───────────────────────────────────────────
     let (signer_g, _signer_s, signer_box) = fresh_signer();
     fund_via_friendbot(&signer_g).await;
@@ -300,19 +330,20 @@ async fn h_1_revocation_audit_log_timeline() {
     let sa_strkey = deploy_fresh_smart_account(&signer_g).await;
     eprintln!("smart_account = {}", &sa_strkey[..8]);
 
-    // ── Step 3: Install session rule with valid_until = current_ledger + 5 ────
-    let current_ledger = fetch_latest_ledger().await;
-    let session_valid_until = current_ledger.saturating_add(5);
-    eprintln!(
-        "current_ledger = {current_ledger}; installing rule with \
-         valid_until = {session_valid_until}"
-    );
-
+    // ── Step 3: Install session rule valid for INSTALL_HEADROOM_LEDGERS ───────
     let (audit_writer, audit_log_path, _tmpdir) = tmp_audit_writer();
     let manager = fresh_rule_manager_uncapped(Arc::clone(&audit_writer), audit_log_path.clone());
 
     let sa_addr = parse_c_strkey_to_smart_account(&sa_strkey).expect("C-strkey must parse");
     let signer_addr = parse_g_strkey_to_signer_address(&signer_g).expect("G-strkey must parse");
+
+    // The bound derives from a ledger read right before the install.
+    let current_ledger = fetch_latest_ledger().await;
+    let session_valid_until = current_ledger.saturating_add(INSTALL_HEADROOM_LEDGERS);
+    eprintln!(
+        "current_ledger = {current_ledger}; installing rule with \
+         valid_until = {session_valid_until}"
+    );
 
     let definition = ContextRuleDefinition::new(
         RuleContext::Default,
@@ -342,17 +373,23 @@ async fn h_1_revocation_audit_log_timeline() {
     eprintln!("session rule installed: rule_id = {rule_id}");
 
     // ── Step 4: Immediately revoke via update_valid_until ─────────────────────
-    // Revocation sets `valid_until` to a ledger in the very near future.
+    // Revocation sets `valid_until` to a ledger in the near future.
     //
-    // `current_ledger + 2` absorbs the simulate→apply timing window: the contract
-    // rejects `valid_until < e.ledger().sequence()` at apply time
-    // (PastValidUntil = 3005). A 2-ledger (~10 s) buffer avoids the race
-    // while still making the rule expire quickly enough to verify on-chain expiry.
+    // `current_ledger + REVOKE_HEADROOM_LEDGERS`, read right before the call,
+    // absorbs the window up to the apply ledger: the contract rejects
+    // `valid_until < e.ledger().sequence()` at apply time (PastValidUntil =
+    // 3005). The headroom avoids the race while still making the rule expire
+    // quickly enough to verify on-chain expiry.
     //
     // The `update_valid_until_inner` path does NOT have the expiry check
     // wired — revocation is always allowed.
-    let revocation_ledger = fetch_latest_ledger().await.saturating_add(2);
-    eprintln!("revoking: set valid_until = {revocation_ledger} (current_ledger + 2)");
+    let revocation_ledger = fetch_latest_ledger()
+        .await
+        .saturating_add(REVOKE_HEADROOM_LEDGERS);
+    eprintln!(
+        "revoking: set valid_until = {revocation_ledger} \
+         (current_ledger + {REVOKE_HEADROOM_LEDGERS})"
+    );
 
     manager
         .update_valid_until(
@@ -458,6 +495,7 @@ async fn h_1_revocation_audit_log_timeline() {
 ///
 #[tokio::test]
 async fn h_2_post_revocation_new_sign_refused() {
+    stellar_agent_test_support::keyring_mock::install().expect("install the in-memory keyring");
     // ── Step 1: Fresh signer + fund ───────────────────────────────────────────
     let (signer_g, _signer_s, signer_box) = fresh_signer();
     fund_via_friendbot(&signer_g).await;
@@ -467,19 +505,20 @@ async fn h_2_post_revocation_new_sign_refused() {
     let sa_strkey = deploy_fresh_smart_account(&signer_g).await;
     eprintln!("smart_account = {}", &sa_strkey[..8]);
 
-    // ── Step 3: Install a session rule with valid_until = current + 5 ─────────
-    let current_ledger = fetch_latest_ledger().await;
-    let session_valid_until = current_ledger.saturating_add(5);
-    eprintln!(
-        "current_ledger = {current_ledger}; installing rule with \
-         valid_until = {session_valid_until}"
-    );
-
+    // ── Step 3: Install a session rule valid for INSTALL_HEADROOM_LEDGERS ─────
     let (audit_writer, audit_log_path, _tmpdir) = tmp_audit_writer();
     let rule_manager = fresh_rule_manager_uncapped(Arc::clone(&audit_writer), audit_log_path);
 
     let sa_addr = parse_c_strkey_to_smart_account(&sa_strkey).expect("C-strkey must parse");
     let signer_addr = parse_g_strkey_to_signer_address(&signer_g).expect("G-strkey must parse");
+
+    // The bound derives from a ledger read right before the install.
+    let current_ledger = fetch_latest_ledger().await;
+    let session_valid_until = current_ledger.saturating_add(INSTALL_HEADROOM_LEDGERS);
+    eprintln!(
+        "current_ledger = {current_ledger}; installing rule with \
+         valid_until = {session_valid_until}"
+    );
 
     let definition = ContextRuleDefinition::new(
         RuleContext::Default,
@@ -509,11 +548,17 @@ async fn h_2_post_revocation_new_sign_refused() {
     eprintln!("session rule installed: rule_id = {rule_id}");
 
     // ── Step 4: Revoke via update_valid_until ─────────────────────────────────
-    // `current_ledger + 2` absorbs the simulate→apply timing window (see design
-    // note at the top of this file). After `revocation_ledger` closes, the
-    // expiry check `valid_until < latestLedger` fires in `add_signer`.
-    let revocation_ledger = fetch_latest_ledger().await.saturating_add(2);
-    eprintln!("revoking: set valid_until = {revocation_ledger} (current_ledger + 2)");
+    // `current_ledger + REVOKE_HEADROOM_LEDGERS`, read right before the call,
+    // absorbs the window up to the apply ledger (see the design note at the top
+    // of this file). After `revocation_ledger` closes, the expiry check
+    // `valid_until < latestLedger` fires in `add_policy`.
+    let revocation_ledger = fetch_latest_ledger()
+        .await
+        .saturating_add(REVOKE_HEADROOM_LEDGERS);
+    eprintln!(
+        "revoking: set valid_until = {revocation_ledger} \
+         (current_ledger + {REVOKE_HEADROOM_LEDGERS})"
+    );
 
     rule_manager
         .update_valid_until(
@@ -536,7 +581,7 @@ async fn h_2_post_revocation_new_sign_refused() {
     // After this, `latest_ledger` from the next `simulateTransaction` response
     // will be > `revocation_ledger = valid_until`, so `valid_until < latest_ledger`
     // → `RuleExpired` refusal.
-    let post_revocation_ledger = wait_for_ledger_past(revocation_ledger, 10).await;
+    let post_revocation_ledger = wait_for_ledger_past(revocation_ledger, REVOKE_WAIT_POLLS).await;
     eprintln!(
         "chain advanced: post_revocation_ledger = {post_revocation_ledger} \
          (was {revocation_ledger}); current > valid_until invariant holds"

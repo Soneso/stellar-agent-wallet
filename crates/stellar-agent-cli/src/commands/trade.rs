@@ -409,17 +409,19 @@ where
         secondary_rpc.as_ref(),
         Some(timeout),
     );
-    // Thread the pre-flight-acquired audit writer + gate-derived leg so the
-    // adapter emits the ValueActionSubmitted row after a confirmed submit
-    // (non-fatal past this point — the pre-flight above is what fails closed).
+    // Thread the pre-flight-acquired audit writer and the gate-derived leg into
+    // the context. With a recorder attached, the adapter emits no
+    // `ValueActionSubmitted` row on success. Failure paths emit
+    // `SaRawInvocation` when an audit writer is available. The audit pre-flight
+    // fails closed.
     ctx.audit_writer = Some(std::sync::Arc::clone(&audit_writer));
     ctx.audit_legs = Some(&audit_legs);
     ctx.audit_tool = Some("stellar_dex_trade");
 
     // Record the submission before the bytes leave: the receipt, the pending
-    // audit row and the spending-window reservation. The recorder settles all
-    // three against what the network answers, and owns the confirmed row the
-    // adapter would otherwise emit.
+    // audit row and the spending-window reservation. A reported success
+    // updates the receipt and keeps the exposure open until authenticated
+    // settlement.
     let recorder = match crate::commands::submission_record::build_recorder(
         crate::commands::submission_record::SubmitRecord {
             unvalued: None,

@@ -241,6 +241,7 @@ async fn deploy_timelock_controller(
 /// audit-row presence on cancel).
 #[tokio::test]
 async fn t1_schedule_cancel_lifecycle() {
+    stellar_agent_test_support::keyring_mock::install().expect("install the in-memory keyring");
     // Setup: fresh signer (proposer + canceller via CANCELLER_ROLE auto-grant).
     let (signer_g, seed_bytes, signer_box) = fresh_signer();
     fund_via_friendbot(&signer_g).await;
@@ -418,6 +419,7 @@ async fn t1_schedule_cancel_lifecycle() {
 /// `Waiting { ready_ledger <= current_ledger }` to `Ready`.
 #[tokio::test]
 async fn t2_schedule_ready_state_min_delay_zero() {
+    stellar_agent_test_support::keyring_mock::install().expect("install the in-memory keyring");
     let (signer_g, seed_bytes, signer_box) = fresh_signer();
     fund_via_friendbot(&signer_g).await;
 
@@ -664,6 +666,7 @@ async fn t4_execute_not_ready_rejected() {
 /// from the `schedule_upgrade` arguments.
 #[tokio::test]
 async fn t5_schedule_emits_audit_row() {
+    stellar_agent_test_support::keyring_mock::install().expect("install the in-memory keyring");
     let (signer_g, seed_bytes, signer_box) = fresh_signer();
     fund_via_friendbot(&signer_g).await;
 
@@ -865,6 +868,7 @@ impl Respond for EventStrippingSecondary {
 /// defence-in-depth measure with no equivalent in the underlying contract.
 #[tokio::test]
 async fn t6_cross_confirm_event_divergence_rejection() {
+    stellar_agent_test_support::keyring_mock::install().expect("install the in-memory keyring");
     // Setup: fresh signer (proposer + canceller).
     let (signer_g, seed_bytes, signer_box) = fresh_signer();
     fund_via_friendbot(&signer_g).await;
@@ -991,6 +995,7 @@ async fn t6_cross_confirm_event_divergence_rejection() {
 /// authorisation.
 #[tokio::test]
 async fn t7_schedule_execute_min_delay_zero() {
+    stellar_agent_test_support::keyring_mock::install().expect("install the in-memory keyring");
     // Controller signer: proposer + executor role on the controller timelock.
     let (signer_g, seed_bytes, _signer_box) = fresh_signer();
     fund_via_friendbot(&signer_g).await;

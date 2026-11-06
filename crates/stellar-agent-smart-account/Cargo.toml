@@ -33,7 +33,7 @@ default = []
 testnet-integration = ["test-helpers", "stellar-agent-test-support/testnet-helpers"]
 # Expose test-only inspection helpers as pub items for adversarial fixture tests.
 # Never enabled in production builds.
-test-helpers = []
+test-helpers = ["stellar-agent-network/test-helpers"]
 test-hooks = ["stellar-agent-network/test-hooks"]
 # Gates embedded deploy-time WASM bytes for binaries that upload vendored
 # verifier / policy contracts at runtime.

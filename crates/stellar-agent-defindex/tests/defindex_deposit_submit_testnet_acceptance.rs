@@ -49,6 +49,7 @@ use std::{
 };
 
 use stellar_agent_defi::{
+    acceptance_recorder::SubmissionRecordState,
     adapter::{DefiAdapter, DefiAdapterCtx},
     dispatch::{GateOutcome, dispatch_gate},
     pins::DefiContractPin,
@@ -466,10 +467,12 @@ async fn defindex_deposit_submit_and_confirm() {
         override_upgradable: true,
     };
 
-    // Wire audit emission exactly as the MCP `stellar_defindex_vault_deposit`
-    // handler does, so the confirmed deposit records its value_action_submitted
-    // row.  Legs are built from the SAME amounts/asset/vault the deposit uses
-    // (single-derivation invariant); the writer uses a fixed test key.
+    // Wire the audit writer and legs exactly as the MCP
+    // `stellar_defindex_vault_deposit` handler does. The recorder writes the
+    // pending row before the send. A reported success updates the receipt and
+    // keeps the pending record until authenticated settlement. Legs are built
+    // from the SAME amounts/asset/vault the deposit uses (single-derivation
+    // invariant); the writer uses a fixed test key.
     let audit_dir = std::env::temp_dir().join(format!("defindex-deposit-audit-{}", now_secs()));
     std::fs::create_dir_all(&audit_dir).expect("create audit dir");
     let audit_log_path = audit_dir.join("audit.jsonl");
@@ -493,6 +496,29 @@ async fn defindex_deposit_submit_and_confirm() {
     deposit_ctx.audit_legs = Some(&audit_legs);
     deposit_ctx.audit_tool = Some("stellar_defindex_vault_deposit");
 
+    // Record the submission before the bytes leave, as the `vault deposit`
+    // verb does: the receipt, the pending audit row, the signed-intent charge
+    // and the spending-window reservation. The effects carry the same legs as
+    // the audit rows (single-derivation invariant).
+    let record_state = SubmissionRecordState::new(
+        "defindex-deposit-acceptance",
+        TESTNET_CHAIN_ID,
+        &audit_log_path,
+    );
+    let deposit_effects = stellar_agent_core::policy::v1::ValueEffects::new(
+        stellar_agent_defindex::value::vault_deposit_value_legs(
+            &deposit_args.amounts_desired,
+            &[XLM_SAC_TESTNET.to_owned()],
+            &deposit_args.vault_address,
+        ),
+    );
+    let deposit_recorder = record_state.recorder(
+        "stellar_defindex_vault_deposit",
+        &deposit_effects,
+        std::sync::Arc::clone(&audit_writer),
+    );
+    deposit_ctx.submission_recorder = Some(&deposit_recorder);
+
     let defindex_adapter = DefindexVaultAdapter::new();
     let deposit_result = defindex_adapter
         .submit(&deposit_args, &deposit_ctx, deposit_witness)
@@ -509,8 +535,9 @@ async fn defindex_deposit_submit_and_confirm() {
                 redact_strkey(DEFINDEX_TESTNET_VAULT),
             );
 
-            // #21 — the confirmed on-chain deposit must have recorded a
-            // value_action_submitted row for stellar_defindex_vault_deposit.
+            // The recorder wrote the pending row before the send. A reported
+            // success updates the receipt and keeps the pending record until
+            // authenticated settlement, so no submitted row follows.
             let audit_rows: Vec<serde_json::Value> = std::io::BufRead::lines(
                 std::io::BufReader::new(
                     std::fs::File::open(&audit_log_path).expect("audit log after submit"),
@@ -518,12 +545,55 @@ async fn defindex_deposit_submit_and_confirm() {
             )
             .map(|line| serde_json::from_str(&line.expect("audit line")).expect("audit JSON row"))
             .collect();
-            assert!(
-                audit_rows.iter().any(|row| {
-                    row["kind"] == "value_action_submitted"
+            let deposit_rows: Vec<&serde_json::Value> = audit_rows
+                .iter()
+                .filter(|row| {
+                    row["kind"] == "value_action_pending"
                         && row["tool"] == "stellar_defindex_vault_deposit"
-                }),
-                "confirmed DeFindex deposit must record a value_action_submitted row: {audit_rows:?}"
+                })
+                .collect();
+            assert_eq!(
+                deposit_rows.len(),
+                1,
+                "one pending row for stellar_defindex_vault_deposit: {audit_rows:?}"
+            );
+            assert!(
+                !audit_rows
+                    .iter()
+                    .any(|row| row["kind"] == "value_action_submitted"),
+                "no submitted row on a reported success: {audit_rows:?}"
+            );
+            let receipt = record_state.receipt(
+                deposit_rows[0]["envelope_hash"]
+                    .as_str()
+                    .expect("the pending row carries the envelope hash"),
+            );
+            assert!(
+                receipt.status == stellar_agent_core::profile::receipt::ReceiptStatus::Success
+                    && receipt.ledger.is_some(),
+                "the receipt of the pending row is Success with a ledger: {receipt:?}"
+            );
+
+            // The confirmed deposit is charged once against the durable daily
+            // `native` window, and its exposure stays open.
+            assert_eq!(
+                record_state.native_window(),
+                (XLM_DEPOSIT_AMOUNT, 1),
+                "the confirmed deposit must charge its debit leg once against the durable window"
+            );
+            assert_eq!(
+                record_state.pending_reservations(),
+                1,
+                "a reported success keeps the debit's exposure open until authenticated settlement"
+            );
+
+            // The signing admission creates the only signed intent. Pre-send
+            // binding links it to the submitted transaction.
+            let intents = record_state.signed_intents();
+            assert_eq!(intents.len(), 1, "{intents:?}");
+            assert_eq!(
+                intents[0].status, "authorization exposed, submission bound",
+                "{intents:?}"
             );
         }
         Err(e) => {
@@ -707,7 +777,7 @@ async fn defindex_deposit_then_withdraw_submit_and_confirm() {
     let secondary_rpc =
         StellarRpcClient::new(stellar_agent_test_support::testnet_secondary_rpc_url())
             .expect("secondary RPC URL must be valid");
-    let deposit_ctx = DefiAdapterCtx::new_with_submit_ctx(
+    let mut deposit_ctx = DefiAdapterCtx::new_with_submit_ctx(
         "default",
         &vault_pin,
         &primary_rpc_for_deposit,
@@ -726,6 +796,41 @@ async fn defindex_deposit_then_withdraw_submit_and_confirm() {
         invest: false,
         override_upgradable: true,
     };
+
+    // One profile's wallet state and audit log record both submissions of
+    // this test: the deposit here and the withdraw in step 5.
+    let withdraw_audit_dir =
+        std::env::temp_dir().join(format!("defindex-withdraw-audit-{}", now_secs()));
+    std::fs::create_dir_all(&withdraw_audit_dir).expect("create audit dir");
+    let withdraw_audit_log_path = withdraw_audit_dir.join("audit.jsonl");
+    let withdraw_audit_writer = std::sync::Arc::new(std::sync::Mutex::new(
+        stellar_agent_core::audit_log::AuditWriter::open_keyed_unanchored_for_test(
+            withdraw_audit_log_path.clone(),
+            Zeroizing::new([0x11u8; 32]),
+        )
+        .expect("open audit writer"),
+    ));
+    let record_state = SubmissionRecordState::new(
+        "defindex-withdraw-acceptance",
+        TESTNET_CHAIN_ID,
+        &withdraw_audit_log_path,
+    );
+
+    // Record the deposit before the bytes leave, as the `vault deposit` verb
+    // does.
+    let deposit_effects = stellar_agent_core::policy::v1::ValueEffects::new(
+        stellar_agent_defindex::value::vault_deposit_value_legs(
+            &deposit_args.amounts_desired,
+            &[XLM_SAC_TESTNET.to_owned()],
+            &deposit_args.vault_address,
+        ),
+    );
+    let deposit_recorder = record_state.recorder(
+        "stellar_defindex_vault_deposit",
+        &deposit_effects,
+        std::sync::Arc::clone(&withdraw_audit_writer),
+    );
+    deposit_ctx.submission_recorder = Some(&deposit_recorder);
 
     let defindex_adapter = DefindexVaultAdapter::new();
     let deposit_result = defindex_adapter
@@ -850,20 +955,11 @@ async fn defindex_deposit_then_withdraw_submit_and_confirm() {
         override_upgradable: true,
     };
 
-    // Wire audit emission exactly as the MCP `stellar_defindex_vault_withdraw`
-    // handler does, so the confirmed withdraw records its value_action_submitted
-    // row.  The leg is built from the SAME shares/vault the withdraw uses.
-    let withdraw_audit_dir =
-        std::env::temp_dir().join(format!("defindex-withdraw-audit-{}", now_secs()));
-    std::fs::create_dir_all(&withdraw_audit_dir).expect("create audit dir");
-    let withdraw_audit_log_path = withdraw_audit_dir.join("audit.jsonl");
-    let withdraw_audit_writer = std::sync::Arc::new(std::sync::Mutex::new(
-        stellar_agent_core::audit_log::AuditWriter::open_keyed_unanchored_for_test(
-            withdraw_audit_log_path.clone(),
-            Zeroizing::new([0x11u8; 32]),
-        )
-        .expect("open audit writer"),
-    ));
+    // Wire the audit writer and leg exactly as the MCP
+    // `stellar_defindex_vault_withdraw` handler does. The recorder writes the
+    // pending row before the send. A reported success updates the receipt and
+    // keeps the pending record until authenticated settlement. The leg is built
+    // from the SAME shares/vault the withdraw uses.
     let withdraw_audit_legs = vec![stellar_agent_core::audit_log::ValueLegRecord::from(
         &stellar_agent_defindex::value::vault_withdraw_value_leg(
             withdraw_args.withdraw_shares,
@@ -873,6 +969,21 @@ async fn defindex_deposit_then_withdraw_submit_and_confirm() {
     withdraw_ctx.audit_writer = Some(std::sync::Arc::clone(&withdraw_audit_writer));
     withdraw_ctx.audit_legs = Some(&withdraw_audit_legs);
     withdraw_ctx.audit_tool = Some("stellar_defindex_vault_withdraw");
+
+    // Record the withdraw before the bytes leave, as the `vault withdraw` verb
+    // does, from the same leg the audit rows carry.
+    let withdraw_effects = stellar_agent_core::policy::v1::ValueEffects::new(vec![
+        stellar_agent_defindex::value::vault_withdraw_value_leg(
+            withdraw_args.withdraw_shares,
+            &withdraw_args.vault_address,
+        ),
+    ]);
+    let withdraw_recorder = record_state.recorder(
+        "stellar_defindex_vault_withdraw",
+        &withdraw_effects,
+        std::sync::Arc::clone(&withdraw_audit_writer),
+    );
+    withdraw_ctx.submission_recorder = Some(&withdraw_recorder);
 
     let withdraw_result = defindex_adapter
         .submit(&withdraw_args, &withdraw_ctx, withdraw_witness)
@@ -891,8 +1002,9 @@ async fn defindex_deposit_then_withdraw_submit_and_confirm() {
                 share_balance,
             );
 
-            // #21 — the confirmed on-chain withdraw must have recorded a
-            // value_action_submitted row for stellar_defindex_vault_withdraw.
+            // The recorder wrote each pending row before its send. A reported
+            // success updates the receipt and keeps the pending record until
+            // authenticated settlement, so no submitted row follows.
             let audit_rows: Vec<serde_json::Value> = std::io::BufRead::lines(
                 std::io::BufReader::new(
                     std::fs::File::open(&withdraw_audit_log_path).expect("audit log after submit"),
@@ -900,12 +1012,71 @@ async fn defindex_deposit_then_withdraw_submit_and_confirm() {
             )
             .map(|line| serde_json::from_str(&line.expect("audit line")).expect("audit JSON row"))
             .collect();
+            let pending_rows = |tool: &str| -> Vec<&serde_json::Value> {
+                audit_rows
+                    .iter()
+                    .filter(|row| row["kind"] == "value_action_pending" && row["tool"] == tool)
+                    .collect()
+            };
+            for tool in [
+                "stellar_defindex_vault_deposit",
+                "stellar_defindex_vault_withdraw",
+            ] {
+                assert_eq!(
+                    pending_rows(tool).len(),
+                    1,
+                    "one pending row for {tool}: {audit_rows:?}"
+                );
+            }
             assert!(
-                audit_rows.iter().any(|row| {
-                    row["kind"] == "value_action_submitted"
-                        && row["tool"] == "stellar_defindex_vault_withdraw"
-                }),
-                "confirmed DeFindex withdraw must record a value_action_submitted row: {audit_rows:?}"
+                !audit_rows
+                    .iter()
+                    .any(|row| row["kind"] == "value_action_submitted"),
+                "no submitted row on a reported success: {audit_rows:?}"
+            );
+            let receipt = record_state.receipt(
+                pending_rows("stellar_defindex_vault_deposit")[0]["envelope_hash"]
+                    .as_str()
+                    .expect("the pending row carries the envelope hash"),
+            );
+            assert!(
+                receipt.status == stellar_agent_core::profile::receipt::ReceiptStatus::Success
+                    && receipt.ledger.is_some(),
+                "the receipt of the pending row is Success with a ledger: {receipt:?}"
+            );
+
+            // The deposit is the test's only debit: the withdraw returns funds
+            // and adds no charge. The deposit's exposure stays open, and the
+            // withdraw has no native entry and holds no reservation.
+            assert_eq!(
+                record_state.native_window(),
+                (XLM_DEPOSIT_AMOUNT, 1),
+                "only the deposit is charged against the durable window"
+            );
+            assert_eq!(
+                record_state.pending_reservations(),
+                1,
+                "a reported success keeps the debit's exposure open until authenticated settlement"
+            );
+
+            // The withdraw leg has no native entry, so its sizing is empty and
+            // it writes no signed intent. The deposit's signing admission
+            // creates the only signed intent. Pre-send binding links it to the
+            // submitted transaction. The count and statuses are printed for the
+            // run record.
+            let intents = record_state.signed_intents();
+            eprintln!(
+                "signed intents after the withdraw: count={} statuses={:?}",
+                intents.len(),
+                intents
+                    .iter()
+                    .map(|intent| intent.status.as_str())
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(intents.len(), 1, "{intents:?}");
+            assert_eq!(
+                intents[0].status, "authorization exposed, submission bound",
+                "{intents:?}"
             );
         }
         Err(e) => {

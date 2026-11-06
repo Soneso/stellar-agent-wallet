@@ -11,9 +11,15 @@ keywords = ["stellar", "soroban", "defi", "wallet"]
 categories = ["cryptography::cryptocurrencies", "api-bindings"]
 
 [features]
-# Exposes test helper constructors and the mock adapter used by cross-crate tests.
-# Never enable in production binaries.
-test-helpers = []
+# Exposes test helper constructors, the mock adapter and the acceptance
+# submission recorder used by cross-crate tests. The recorder needs the
+# in-memory keyring, an owned temporary directory and a window store at an
+# explicit path. Never enable in production binaries.
+test-helpers = [
+    "dep:stellar-agent-test-support",
+    "dep:tempfile",
+    "stellar-agent-network/test-helpers",
+]
 
 [dependencies]
 stellar-agent-core      = { workspace = true }
@@ -26,6 +32,8 @@ async-trait             = { workspace = true }
 stellar-xdr             = { workspace = true }
 stellar-rpc-client      = { workspace = true }
 stellar-strkey          = { workspace = true }
+stellar-agent-test-support = { workspace = true, optional = true }
+tempfile                = { workspace = true, optional = true }
 
 [dev-dependencies]
 stellar-agent-test-support = { path = "../stellar-agent-test-support", features = ["test-helpers"] }
@@ -33,6 +41,7 @@ tokio                      = { workspace = true, features = ["rt-multi-thread", 
 wiremock                   = { workspace = true }
 serde_json                 = { workspace = true }
 tempfile                   = { workspace = true }
+zeroize                    = { workspace = true }
 
 [lints]
 workspace = true
