@@ -1018,17 +1018,19 @@ pub(crate) async fn fetch_wasm_hash_via_rpc(
 ///    read-write nonce key that matches no address credential of its own
 ///    simulation, refuses. A nonce key in another access mode stays unchanged,
 ///    so the comparison refuses it when its nonce differs between the
-///    simulations. The `resource_fee` field holds within the same 5 percent
-///    tolerance as `min_resource_fee`, because its rent component depends on
-///    the ledger at which the endpoint simulated. Every other field is compared
-///    exactly.
+///    simulations. Two nonnegative `resource_fee` values hold within the same
+///    5 percent tolerance as `min_resource_fee`, because the rent component
+///    depends on the ledger at which the endpoint simulated. A pair that
+///    includes a negative value is compared exactly. Every other field is
+///    compared exactly.
 /// 3. `min_resource_fee` within 5 percent numeric tolerance.
 ///
 /// Ledger heights can differ between RPCs and are excluded from this comparison.
 /// Every refusal is a `MulticallFailed` error with phase `rpc_divergence`. A
 /// transaction-data refusal names each differing part in fixed words
 /// (`footprint`, `instructions`, `read bytes`, `write bytes`, `resource fee`).
-/// It names `resource fee` only beyond the tolerance. A fee refusal names
+/// It names `resource fee` when nonnegative fees exceed the tolerance or when
+/// unequal fees include a negative value. A fee refusal names
 /// `min resource fee`. Neither of these two refusals carries a value of either
 /// simulation.
 pub(crate) fn cross_rpc_compare_simulate_responses(
@@ -3527,8 +3529,6 @@ wasm_sha256 = "{MULTICALL_WASM_SHA256}"
     }
 
     /// A resource fee beyond the tolerance is named `resource fee`.
-    ///
-    /// Doubling the fee and adding 1000 exceeds 5 percent whatever the base.
     #[test]
     fn cross_rpc_divergence_names_the_resource_fee() {
         let reason = transaction_data_divergence(|data| {
