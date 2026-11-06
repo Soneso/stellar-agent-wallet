@@ -250,3 +250,241 @@ fn now_secs() -> u64 {
         .expect("system clock must work")
         .as_secs()
 }
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, reason = "test assertions")]
+
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use serde_json::json;
+    use stellar_agent_core::audit_log::AuditWriter;
+    use stellar_agent_core::policy::v1::{ActionKind, ValueEffects, ValueLeg};
+    use stellar_agent_core::profile::receipt::ReceiptStatus;
+    use stellar_agent_network::signing::envelope_signing::attach_signature;
+    use stellar_agent_network::submit::{envelope_hash_hex, submit_transaction_and_wait_sent_by};
+    use stellar_agent_network::{
+        SignedIntentPlan, SoftwareSigningKey, StellarRpcClient, SubmissionRecorder, intent_xdr_hash,
+    };
+    use stellar_agent_test_support::EchoIdResponder;
+    use stellar_agent_test_support::signed_envelope::{
+        TESTNET_PASSPHRASE, account_id_for_seed, get_network_result, ledger_entries_result_for,
+        public_key_for_seed, transaction_hash_hex,
+    };
+    use stellar_xdr::{Limits, WriteXdr};
+    use wiremock::matchers::{body_partial_json, method};
+    use wiremock::{Mock, MockServer};
+    use zeroize::Zeroizing;
+
+    use super::{NATIVE_DAILY_CAP_STROOPS, SubmissionRecordState};
+
+    /// The native debit the recorder charges: 1 XLM, far below the daily cap.
+    const DEBIT_STROOPS: i128 = 10_000_000;
+
+    // The acceptance policy sizes the debit only while it stays under the cap.
+    const _: () = assert!(DEBIT_STROOPS < NATIVE_DAILY_CAP_STROOPS);
+
+    /// The ledger the mocked endpoint confirms the submission in.
+    const CONFIRMED_LEDGER: u32 = 1_002;
+
+    /// How long the submit layer waits for the confirmation.
+    const SUBMIT_TIMEOUT: Duration = Duration::from_secs(30);
+
+    /// The router address the debit leg names as its destination.
+    const ROUTER: &str = "CCJUD55AG6W5HAI5LRVNKAE5WDP5XGZBUDS5WNTIVDU7O264UZZE7BRD";
+
+    /// The seed of the account that signs and submits the invocation.
+    const SOURCE_SEED: [u8; 32] = [0x31; 32];
+
+    /// A keyed audit writer over `path`, as the protocol acceptance suites open it.
+    fn audit_writer(path: &std::path::Path) -> Arc<Mutex<AuditWriter>> {
+        Arc::new(Mutex::new(
+            AuditWriter::open_keyed_unanchored_for_test(
+                path.to_owned(),
+                Zeroizing::new([0x11u8; 32]),
+            )
+            .expect("open the audit writer"),
+        ))
+    }
+
+    /// One native debit leg, built the way the DEX trade derives its leg.
+    fn native_debit(amount: i128) -> ValueEffects {
+        ValueEffects::single(ValueLeg {
+            kind: ActionKind::DexTrade,
+            amount: Some(amount),
+            asset: Some("native".to_owned()),
+            destination: Some(ROUTER.to_owned()),
+        })
+    }
+
+    /// A contract invocation from `seed`'s account at sequence 1, its signing
+    /// plan, and the envelope signed by that account's key under testnet.
+    ///
+    /// The envelope carries no authorization entries, so the plan's authority
+    /// is the source account itself, which the binding recomputes from the bytes.
+    async fn signed_invocation(seed: [u8; 32]) -> (SignedIntentPlan, String) {
+        use stellar_xdr::{
+            ContractId, Hash, HostFunction, InvokeContractArgs, InvokeHostFunctionOp, Memo,
+            MuxedAccount, Operation, OperationBody, Preconditions, ScAddress, ScSymbol,
+            SequenceNumber, Transaction, TransactionEnvelope, TransactionExt,
+            TransactionV1Envelope, Uint256,
+        };
+        let host = HostFunction::InvokeContract(InvokeContractArgs {
+            contract_address: ScAddress::Contract(ContractId(Hash([1; 32]))),
+            function_name: ScSymbol::try_from("call").unwrap(),
+            args: Default::default(),
+        });
+        let source = account_id_for_seed(seed);
+        let plan = SignedIntentPlan::new(
+            TESTNET_PASSPHRASE,
+            &source,
+            &source,
+            1,
+            intent_xdr_hash(&host).unwrap(),
+            Vec::new(),
+            None,
+        )
+        .unwrap()
+        .classify_purpose(&host, None)
+        .unwrap();
+        let unsigned = TransactionEnvelope::Tx(TransactionV1Envelope {
+            tx: Transaction {
+                source_account: MuxedAccount::Ed25519(Uint256(public_key_for_seed(seed))),
+                fee: 100,
+                seq_num: SequenceNumber(1),
+                cond: Preconditions::None,
+                memo: Memo::None,
+                operations: vec![Operation {
+                    source_account: None,
+                    body: OperationBody::InvokeHostFunction(InvokeHostFunctionOp {
+                        host_function: host,
+                        auth: Default::default(),
+                    }),
+                }]
+                .try_into()
+                .unwrap(),
+                ext: TransactionExt::V0,
+            },
+            signatures: Default::default(),
+        })
+        .to_xdr_base64(Limits::none())
+        .unwrap();
+        let signed = attach_signature(
+            &unsigned,
+            &SoftwareSigningKey::new_from_bytes(seed),
+            TESTNET_PASSPHRASE,
+        )
+        .await
+        .unwrap();
+        (plan, signed)
+    }
+
+    /// An endpoint that reports testnet, the source account's signers, a
+    /// pending send and a confirmation in [`CONFIRMED_LEDGER`].
+    async fn confirming_endpoint(source: &str, envelope_xdr: &str) -> MockServer {
+        let server = MockServer::start().await;
+        let mut ledger_entries = ledger_entries_result_for(&[source]);
+        ledger_entries
+            .as_object_mut()
+            .expect("the ledger entries result is an object")
+            .insert("latestLedger".to_owned(), json!(1_000));
+        for (rpc_method, result) in [
+            ("getNetwork", get_network_result(TESTNET_PASSPHRASE)),
+            ("getLedgerEntries", ledger_entries),
+            (
+                "sendTransaction",
+                json!({
+                    "hash": transaction_hash_hex(envelope_xdr, TESTNET_PASSPHRASE),
+                    "status": "PENDING",
+                    "latestLedger": 1_001,
+                    "latestLedgerCloseTime": "1699999999",
+                }),
+            ),
+            (
+                "getTransaction",
+                json!({
+                    "status": "SUCCESS",
+                    "latestLedger": CONFIRMED_LEDGER,
+                    "ledger": CONFIRMED_LEDGER,
+                }),
+            ),
+        ] {
+            Mock::given(method("POST"))
+                .and(body_partial_json(json!({ "method": rpc_method })))
+                .respond_with(EchoIdResponder::new(result))
+                .mount(&server)
+                .await;
+        }
+        server
+    }
+
+    #[tokio::test]
+    async fn a_confirmed_submission_records_its_receipt_window_charge_and_signed_intent() {
+        let audit_dir = tempfile::tempdir().unwrap();
+        let audit_log_path = audit_dir.path().join("audit.jsonl");
+        let audit = audit_writer(&audit_log_path);
+        let state = SubmissionRecordState::new("recorder-unit", "stellar:testnet", &audit_log_path);
+        let effects = native_debit(DEBIT_STROOPS);
+        let recorder = state.recorder("stellar_dex_trade", &effects, Arc::clone(&audit));
+
+        // The signing admission charges the sized debit leg before the first
+        // signature, and the store's admission of the frozen plan exposes it.
+        let (plan, envelope_xdr) = signed_invocation(SOURCE_SEED).await;
+        let admitted = recorder.admit_signed_intent(&plan).await.unwrap().expose();
+        assert!(
+            admitted.intent_id().is_some(),
+            "a sized admission names its intent"
+        );
+        let exposure = state
+            .window_store()
+            .admit_signed_intent(&state.profile, admitted.plan())
+            .unwrap()
+            .expose();
+        assert_eq!(exposure.intent_id(), admitted.intent_id());
+
+        // The submit layer derives the intent from the envelope, binds it to
+        // the exposed intent before the send and settles it on the confirmation.
+        let server = confirming_endpoint(&account_id_for_seed(SOURCE_SEED), &envelope_xdr).await;
+        let client = StellarRpcClient::new(&server.uri()).unwrap();
+        let result = submit_transaction_and_wait_sent_by(
+            &client,
+            &envelope_xdr,
+            tokio::time::Instant::now() + SUBMIT_TIMEOUT,
+            SUBMIT_TIMEOUT,
+            TESTNET_PASSPHRASE,
+            None,
+            Some(&recorder),
+            Some(&exposure),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.ledger, CONFIRMED_LEDGER);
+
+        let receipt = state.receipt(&envelope_hash_hex(&envelope_xdr));
+        assert_eq!(receipt.status, ReceiptStatus::Success, "{receipt:?}");
+        assert_eq!(receipt.ledger, Some(CONFIRMED_LEDGER), "{receipt:?}");
+        // The bound submission is charged once, and the confirmation keeps its
+        // exposure open until authenticated settlement.
+        assert_eq!(state.native_window(), (DEBIT_STROOPS, 1));
+        assert_eq!(state.pending_reservations(), 1);
+        let intents = state.signed_intents();
+        assert_eq!(intents.len(), 1, "{intents:?}");
+        assert_eq!(
+            intents[0].status, "authorization exposed, submission bound",
+            "{intents:?}"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "no receipt for envelope hash")]
+    fn receipt_refuses_an_envelope_hash_the_store_does_not_hold() {
+        let audit_dir = tempfile::tempdir().unwrap();
+        let state = SubmissionRecordState::new(
+            "recorder-unknown",
+            "stellar:testnet",
+            &audit_dir.path().join("audit.jsonl"),
+        );
+        let _ = state.receipt(&"0".repeat(64));
+    }
+}
