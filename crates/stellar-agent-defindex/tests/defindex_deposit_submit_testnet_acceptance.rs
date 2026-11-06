@@ -587,9 +587,8 @@ async fn defindex_deposit_submit_and_confirm() {
                 "a reported success keeps the debit's exposure open until authenticated settlement"
             );
 
-            // The deposit's signing admission is the window's only signed
-            // intent, and its confirmation bound the intent to the submitted
-            // transaction.
+            // The signing admission creates the only signed intent. Pre-send
+            // binding links it to the submitted transaction.
             let intents = record_state.signed_intents();
             assert_eq!(intents.len(), 1, "{intents:?}");
             assert_eq!(
@@ -1061,9 +1060,10 @@ async fn defindex_deposit_then_withdraw_submit_and_confirm() {
             );
 
             // The withdraw leg has no native entry, so its sizing is empty and
-            // it writes no signed intent. The deposit's intent stays the only
-            // one, bound to the confirmed deposit. The count and statuses are
-            // printed for the run record.
+            // it writes no signed intent. The deposit's signing admission
+            // creates the only signed intent. Pre-send binding links it to the
+            // submitted transaction. The count and statuses are printed for the
+            // run record.
             let intents = record_state.signed_intents();
             eprintln!(
                 "signed intents after the withdraw: count={} statuses={:?}",

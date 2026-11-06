@@ -987,8 +987,8 @@ async fn acceptance_submit_and_confirm() {
         "a reported success keeps the debit's exposure open until authenticated settlement"
     );
 
-    // The swap's signing admission is the window's only signed intent, and its
-    // confirmation bound the intent to the submitted transaction.
+    // The signing admission creates the only signed intent. Pre-send binding
+    // links it to the submitted transaction.
     let intents = record_state.signed_intents();
     assert_eq!(intents.len(), 1, "{intents:?}");
     assert_eq!(

@@ -582,8 +582,10 @@ where
         Some(timeout),
     );
     // Thread the pre-flight-acquired audit writer and the gate-derived legs into
-    // the context. With a recorder attached the adapter writes no row of its
-    // own; the pre-flight above is what fails closed.
+    // the context. With a recorder attached, the adapter emits no
+    // `ValueActionSubmitted` row on success. Failure paths emit
+    // `SaRawInvocation` when an audit writer is available. The audit pre-flight
+    // fails closed.
     ctx.audit_writer = Some(std::sync::Arc::clone(&audit_writer));
     ctx.audit_legs = Some(&audit_legs);
     ctx.audit_tool = Some("stellar_defindex_vault_deposit");
@@ -996,8 +998,10 @@ where
         Some(timeout),
     );
     // Thread the pre-flight-acquired audit writer and the gate-derived leg into
-    // the context. With a recorder attached the adapter writes no row of its
-    // own; the pre-flight above is what fails closed.
+    // the context. With a recorder attached, the adapter emits no
+    // `ValueActionSubmitted` row on success. Failure paths emit
+    // `SaRawInvocation` when an audit writer is available. The audit pre-flight
+    // fails closed.
     ctx.audit_writer = Some(std::sync::Arc::clone(&audit_writer));
     ctx.audit_legs = Some(&audit_legs);
     ctx.audit_tool = Some("stellar_defindex_vault_withdraw");
