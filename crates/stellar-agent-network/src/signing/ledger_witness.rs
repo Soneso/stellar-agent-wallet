@@ -1003,7 +1003,7 @@ mod tests {
             [101, 101],
             [old, old],
             [1000, 1000],
-            now + Duration::from_secs(2),
+            now + MAX_OBSERVATION_AGE + Duration::from_secs(5),
         )
         .unwrap();
         let observed = capability.read_operation_states(&first).await;

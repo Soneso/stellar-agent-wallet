@@ -8176,7 +8176,7 @@ mod tests {
         store
             .observe_signed_intents(&profile, &progress_witness([101, 101], 2000))
             .unwrap();
-        let before = file_sha256(store.path());
+        let closed = file_sha256(store.path());
         let closed_generation = get_raw(&generation_entry_ref(&profile));
         let wire = store.read_for_inspection(&profile).unwrap().unwrap();
         let loaded = PolicyStateStore::new();
@@ -8189,7 +8189,7 @@ mod tests {
                     if detail == "signed intent horizon overflows"
             ));
             assert!(matches!(loaded.query_window(&key,2000),Err(stellar_agent_core::policy::v1::criteria::state_store::StateStoreError::HorizonOverflow)));
-            assert_eq!(file_sha256(store.path()), before);
+            assert_eq!(file_sha256(store.path()), closed);
             assert_eq!(get_raw(&generation_entry_ref(&profile)), closed_generation);
             assert_intent_totals(&store, &profile, 60, 1);
         }
