@@ -1018,15 +1018,19 @@ pub(crate) async fn fetch_wasm_hash_via_rpc(
 ///    read-write nonce key that matches no address credential of its own
 ///    simulation, refuses. A nonce key in another access mode stays unchanged,
 ///    so the comparison refuses it when its nonce differs between the
-///    simulations. Every other field is compared exactly.
+///    simulations. The `resource_fee` field holds within the same 5 percent
+///    tolerance as `min_resource_fee`, because its rent component depends on
+///    the ledger at which the endpoint simulated. Every other field is compared
+///    exactly.
 /// 3. `min_resource_fee` within 5 percent numeric tolerance.
 ///
 /// Ledger heights can differ between RPCs and are excluded from this comparison.
 /// Every refusal is a `MulticallFailed` error with phase `rpc_divergence`. A
 /// transaction-data refusal names each differing part in fixed words
-/// (`footprint`, `instructions`, `read bytes`, `write bytes`, `resource fee`),
-/// and a fee refusal names `min resource fee`. Neither of these two refusals
-/// carries a value of either simulation.
+/// (`footprint`, `instructions`, `read bytes`, `write bytes`, `resource fee`).
+/// It names `resource fee` only beyond the tolerance. A fee refusal names
+/// `min resource fee`. Neither of these two refusals carries a value of either
+/// simulation.
 pub(crate) fn cross_rpc_compare_simulate_responses(
     primary: &stellar_rpc_client::SimulateTransactionResponse,
     secondary: &stellar_rpc_client::SimulateTransactionResponse,
@@ -1107,9 +1111,8 @@ pub(crate) fn cross_rpc_compare_simulate_responses(
         (Some(p_td), Some(s_td)) => {
             let p_td = normalize_simulated_nonce_keys(p_td, &primary_entries)?;
             let s_td = normalize_simulated_nonce_keys(s_td, &secondary_entries)?;
-            // XDR encoding is deterministic, so two data values encode equal bytes
-            // exactly when every field is equal, and
-            // `diverging_transaction_data_parts` destructures every field.
+            // `diverging_transaction_data_parts` destructures every field, so no
+            // field of the transaction data escapes the comparison.
             let parts = diverging_transaction_data_parts(&p_td, &s_td);
             if !parts.is_empty() {
                 return Err(SaError::MulticallFailed {
@@ -1136,11 +1139,13 @@ pub(crate) fn cross_rpc_compare_simulate_responses(
 /// Names the parts of two simulations' transaction data that differ, in a
 /// fixed order and fixed words.
 ///
-/// The destructuring names every field, so a field the XDR gains fails to
-/// compile here rather than diverging unnamed. The extension lists archived
-/// entries by their index in the read-write footprint, so a differing
-/// extension is reported as `footprint`. The words carry no value of either
-/// simulation.
+/// The resource fee differs only beyond the 5 percent tolerance of
+/// `beyond_five_percent`. A negative fee on either side is compared exactly.
+/// Every other field is compared exactly. The destructuring names every field,
+/// so a field the XDR gains fails to compile here rather than diverging
+/// unnamed. The extension lists archived entries by their index in the
+/// read-write footprint, so a differing extension is reported as `footprint`.
+/// The words carry no value of either simulation.
 fn diverging_transaction_data_parts(
     primary: &stellar_xdr::SorobanTransactionData,
     secondary: &stellar_xdr::SorobanTransactionData,
@@ -1167,6 +1172,14 @@ fn diverging_transaction_data_parts(
             },
         resource_fee: secondary_resource_fee,
     } = secondary;
+    // The rent component of the fee depends on the ledger at which each endpoint simulates.
+    let fee_differs = match (
+        u64::try_from(*primary_resource_fee),
+        u64::try_from(*secondary_resource_fee),
+    ) {
+        (Ok(primary_fee), Ok(secondary_fee)) => beyond_five_percent(primary_fee, secondary_fee),
+        _ => primary_resource_fee != secondary_resource_fee,
+    };
     [
         (
             primary_footprint != secondary_footprint || primary_ext != secondary_ext,
@@ -1178,10 +1191,7 @@ fn diverging_transaction_data_parts(
         ),
         (primary_read_bytes != secondary_read_bytes, "read bytes"),
         (primary_write_bytes != secondary_write_bytes, "write bytes"),
-        (
-            primary_resource_fee != secondary_resource_fee,
-            "resource fee",
-        ),
+        (fee_differs, "resource fee"),
     ]
     .into_iter()
     .filter_map(|(differs, part)| differs.then_some(part))
@@ -2523,15 +2533,7 @@ fn check_numeric_tolerance(
     primary: u64,
     secondary: u64,
 ) -> Result<(), SaError> {
-    // Allow exact zero on both sides (common for write_bytes in read-only ops).
-    if primary == 0 && secondary == 0 {
-        return Ok(());
-    }
-    let max = primary.max(secondary);
-    let min = primary.min(secondary);
-    // Compute as 5% of max; use saturating arithmetic.
-    let tolerance = max.saturating_div(20); // 5% = 1/20
-    if max.saturating_sub(min) > tolerance {
+    if beyond_five_percent(primary, secondary) {
         return Err(SaError::MulticallFailed {
             phase: "rpc_divergence",
             redacted_reason: format!(
@@ -2541,6 +2543,16 @@ fn check_numeric_tolerance(
         });
     }
     Ok(())
+}
+
+/// Reports whether two estimates differ by more than 5 percent of the larger one.
+///
+/// The tolerance is the larger estimate divided by 20 and rounded down, so a
+/// difference equal to it passes. Both zero is within the tolerance.
+fn beyond_five_percent(primary: u64, secondary: u64) -> bool {
+    let max = primary.max(secondary);
+    let min = primary.min(secondary);
+    max.saturating_sub(min) > max / 20
 }
 
 /// Validates whether `s` is a valid 64-char lowercase hex SHA-256.
@@ -3514,11 +3526,53 @@ wasm_sha256 = "{MULTICALL_WASM_SHA256}"
         assert_eq!(reason, format!("{TRANSACTION_DATA_DIVERGES}write bytes"));
     }
 
-    /// A differing resource fee is named `resource fee`.
+    /// A resource fee beyond the tolerance is named `resource fee`.
+    ///
+    /// Doubling the fee and adding 1000 exceeds 5 percent whatever the base.
     #[test]
     fn cross_rpc_divergence_names_the_resource_fee() {
-        let reason = transaction_data_divergence(|data| data.resource_fee += 1);
+        let reason = transaction_data_divergence(|data| {
+            data.resource_fee = data.resource_fee.saturating_mul(2).saturating_add(1_000);
+        });
         assert_eq!(reason, format!("{TRANSACTION_DATA_DIVERGES}resource fee"));
+    }
+
+    /// The transaction-data comparison for two resource fees under one
+    /// authorization entry and one footprint.
+    fn resource_fee_comparison(
+        primary_fee: i64,
+        secondary_fee: i64,
+    ) -> (
+        stellar_rpc_client::SimulateTransactionResponse,
+        stellar_rpc_client::SimulateTransactionResponse,
+    ) {
+        let entry = simulated_auth_entry(123, 200);
+        let mut primary_data = simulated_nonce_data(&entry);
+        primary_data.resource_fee = primary_fee;
+        let mut secondary_data = simulated_nonce_data(&entry);
+        secondary_data.resource_fee = secondary_fee;
+        (
+            simulated_response(std::slice::from_ref(&entry), &primary_data),
+            simulated_response(std::slice::from_ref(&entry), &secondary_data),
+        )
+    }
+
+    /// A resource fee 4 percent apart passes, since its rent component depends
+    /// on the ledger at which each endpoint simulates.
+    #[test]
+    fn cross_rpc_resource_fee_within_the_tolerance_passes() {
+        let (primary, secondary) = resource_fee_comparison(10_000, 10_400);
+        assert!(cross_rpc_compare_simulate_responses(&primary, &secondary).is_ok());
+    }
+
+    /// A resource fee 6 percent apart is named `resource fee`.
+    #[test]
+    fn cross_rpc_resource_fee_beyond_the_tolerance_is_named() {
+        let (primary, secondary) = resource_fee_comparison(10_000, 10_600);
+        assert_eq!(
+            divergence_reason(&primary, &secondary),
+            format!("{TRANSACTION_DATA_DIVERGES}resource fee")
+        );
     }
 
     /// Every differing part is named, in the fixed order.
@@ -3535,7 +3589,7 @@ wasm_sha256 = "{MULTICALL_WASM_SHA256}"
             data.resources.instructions += 1;
             data.resources.disk_read_bytes += 1;
             data.resources.write_bytes += 1;
-            data.resource_fee += 1;
+            data.resource_fee = data.resource_fee.saturating_mul(2).saturating_add(1_000);
         });
         assert_eq!(
             reason,
