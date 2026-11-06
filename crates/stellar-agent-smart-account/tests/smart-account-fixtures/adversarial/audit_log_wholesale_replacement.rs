@@ -55,9 +55,9 @@ fn manager_with_url(
         Duration::from_secs(5),
         "stellar:testnet".to_owned(),
     )
-    .with_intent_admission(std::sync::Arc::new(
-        stellar_agent_smart_account::signing::intent_test_helpers::no_value_admission_owned(),
-    ));
+    .with_intent_admission(
+        stellar_agent_smart_account::signing::intent_test_helpers::shared_no_value_admission(),
+    );
     SignersManager::new(config).expect("SignersManager::new must succeed")
 }
 
@@ -101,7 +101,9 @@ fn write_baseline(
 /// the victim's `(rule_id, smart_account_redacted)` pair because it does not appear
 /// in the attacker's log.
 #[tokio::test]
+#[serial_test::serial]
 async fn wholesale_replacement_with_wrong_account_returns_missing_baseline() {
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let dir = tempfile::tempdir().expect("tempdir must succeed");
     let log_path = dir.path().join("audit.jsonl");
 
@@ -155,7 +157,9 @@ async fn wholesale_replacement_with_wrong_account_returns_missing_baseline() {
 /// A wholesale-replaced log written for a DIFFERENT rule_id is not matched →
 /// `SignerSetMissingBaseline` for the queried rule_id.
 #[tokio::test]
+#[serial_test::serial]
 async fn wholesale_replacement_with_wrong_rule_id_returns_missing_baseline() {
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let dir = tempfile::tempdir().expect("tempdir must succeed");
     let log_path = dir.path().join("audit.jsonl");
 

@@ -150,9 +150,9 @@ async fn build_fixture() -> DivergenceFixture {
             Duration::from_secs(5),
             CHAIN_ID.to_owned(),
         )
-        .with_intent_admission(std::sync::Arc::new(
-            stellar_agent_smart_account::signing::intent_test_helpers::no_value_admission_owned(),
-        ))
+        .with_intent_admission(
+            stellar_agent_smart_account::signing::intent_test_helpers::shared_no_value_admission(),
+        )
         .with_secondary_rpc_url(second_loopback_host(&secondary_server.uri()))
         .with_signers_manager(signers_manager)
         .with_audit_writer(Arc::clone(&audit_writer)),
@@ -250,7 +250,9 @@ fn assert_divergence_raw_row(entries: &[AuditEntry], request_id: &str, op: &str)
 /// Divergence is refused before signing/submission and the failure row
 /// preserves the call request ID.
 #[tokio::test]
+#[serial_test::serial]
 async fn install_rule_divergence_failure_emits_via_self_audit_writer() {
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let fixture = build_fixture().await;
     let request_id = Uuid::new_v4().to_string();
 
@@ -286,7 +288,9 @@ async fn install_rule_divergence_failure_emits_via_self_audit_writer() {
 /// Divergence is refused before signing/submission and the failure row
 /// preserves the call request ID.
 #[tokio::test]
+#[serial_test::serial]
 async fn delete_rule_divergence_failure_emits_via_self_audit_writer() {
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let fixture = build_fixture().await;
     let request_id = Uuid::new_v4().to_string();
 
@@ -320,7 +324,9 @@ async fn delete_rule_divergence_failure_emits_via_self_audit_writer() {
 /// Divergence is refused before signing/submission and the failure row
 /// preserves the call request ID.
 #[tokio::test]
+#[serial_test::serial]
 async fn update_name_divergence_failure_emits_via_self_audit_writer() {
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let fixture = build_fixture().await;
     let request_id = Uuid::new_v4().to_string();
 
@@ -355,7 +361,9 @@ async fn update_name_divergence_failure_emits_via_self_audit_writer() {
 /// Divergence is refused before signing/submission and the failure row
 /// preserves the call request ID.
 #[tokio::test]
+#[serial_test::serial]
 async fn update_valid_until_divergence_failure_emits_via_self_audit_writer() {
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let fixture = build_fixture().await;
     let request_id = Uuid::new_v4().to_string();
 

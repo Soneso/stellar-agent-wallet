@@ -2,6 +2,15 @@
 #![allow(clippy::unwrap_used, clippy::panic, reason = "test fixture invariants")]
 use stellar_agent_core::policy::v1::criteria::state_store::{StateKey, WindowEntry};
 use stellar_agent_core::profile::caip2::Caip2;
+/// Freezes explicit checked fixture entries into a test plan.
+#[must_use]
+pub fn with_legs(
+    plan: &crate::SignedIntentPlan,
+    entries: &[WindowEntry],
+) -> crate::SignedIntentPlan {
+    plan.with_legs(entries)
+}
+
 /// Builds an empty authorization fixture with amount and count legs.
 #[must_use]
 ///

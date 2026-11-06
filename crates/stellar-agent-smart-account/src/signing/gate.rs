@@ -201,11 +201,8 @@ impl SigningGate {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::panic, reason = "test assertions")]
     use super::*;
-    use stellar_agent_core::policy::{
-        McpToolRegistration, NoopPolicyEngine, PolicyEngine, ToolDescriptor, ToolValueKind,
-    };
-    use stellar_agent_core::profile::{caip2::TESTNET_PASSPHRASE, schema::Profile};
-    use stellar_agent_network::{IntentSubject, NoValueAdmission};
+    use stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE;
+    use stellar_agent_network::IntentSubject;
     use stellar_xdr::*;
 
     fn root() -> SorobanAuthorizedInvocation {
@@ -238,22 +235,15 @@ mod tests {
     }
 
     async fn gate(plan: SignedIntentPlan) -> SigningGate {
-        let profile =
-            Profile::builder_testnet("intent-test", "account", "nonce-test", "account").build();
-        let tool = ToolDescriptor::from_registration(&McpToolRegistration {
-            name: "test",
-            destructive_hint: true,
-            read_only_hint: false,
-            chain_id_required: true,
-            value_kind: ToolValueKind::ReadOnly,
-        });
-        let sizing = NoopPolicyEngine.size_no_value(&tool, &profile, 0).unwrap();
-        let admission = NoValueAdmission::new(profile, "intent-test", sizing).unwrap();
+        let (_directory, admission) = super::super::intent_test_helpers::no_value_admission_owned();
         SigningGate::new(admission.admit(&plan).await.unwrap())
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn the_gate_refuses_what_the_plan_does_not_name() {
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        super::super::intent_test_helpers::assert_envelope_bounds_refuse_before_signing().await;
         let address = ScAddress::Contract(ContractId(Hash([1; 32])));
         let other = ScAddress::Contract(ContractId(Hash([2; 32])));
         let descriptor = SignerDescriptor::Delegated { account: [3; 32] };
@@ -300,7 +290,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn a_refused_request_keeps_the_proof_and_multiplicity_is_exact() {
+        stellar_agent_test_support::keyring_mock::install().unwrap();
         let address = ScAddress::Contract(ContractId(Hash([1; 32])));
         let descriptor = SignerDescriptor::External {
             verifier: stellar_strkey::Contract([4; 32])
@@ -343,7 +335,9 @@ mod tests {
         assert!(allowed.authorize(request([5; 32])).is_err());
     }
     #[tokio::test]
+    #[serial_test::serial]
     async fn an_envelope_outside_the_plan_refuses_before_exposure() {
+        stellar_agent_test_support::keyring_mock::install().unwrap();
         for kind in [0, 1, 2] {
             let (plan, envelope) =
                 stellar_agent_network::signed_intent::test_helpers::intent_fixture_kind(kind);
@@ -391,5 +385,63 @@ mod tests {
                 assert!(signing_gate.exposure().is_none());
             }
         }
+    }
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn bound_mismatch_refuses_at_gate_and_bind() {
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        use stellar_agent_network::signing::test_doubles::CountingSigner;
+        use stellar_agent_network::signing::{Signer, TxSigningPayload};
+        let signer = CountingSigner::new([0; 32]);
+        let (fixture, envelope) =
+            stellar_agent_network::signed_intent::test_helpers::intent_fixture_kind(2);
+        let plan = fixture.with_envelope_max_ledger(50).unwrap();
+        let signing_gate = gate(plan).await;
+        for maximum in [None, Some(0), Some(49), Some(51)] {
+            let mut changed = envelope.clone();
+            let TransactionEnvelope::Tx(tx) = &mut changed else {
+                panic!("V1 envelope")
+            };
+            tx.tx.cond = Preconditions::V2(PreconditionsV2 {
+                time_bounds: None,
+                ledger_bounds: maximum.map(|max_ledger| LedgerBounds {
+                    min_ledger: 0,
+                    max_ledger,
+                }),
+                min_seq_num: None,
+                min_seq_age: Duration(0),
+                min_seq_ledger_gap: 0,
+                extra_signers: VecM::default(),
+            });
+            let source = stellar_strkey::ed25519::PublicKey([0; 32])
+                .to_string()
+                .to_string();
+            let result = signing_gate.authorize(SigningRequest {
+                subject: AuthSubject::source(&source).unwrap(),
+                signer: SignerMatch::Exact(SignerDescriptor::AccountKey {
+                    public_key: [0; 32],
+                }),
+                payload: SigningPayload::Envelope(&changed),
+            });
+            if result.is_ok() {
+                let _ = signer
+                    .sign_tx_payload(
+                        &TxSigningPayload::for_envelope(&changed, TESTNET_PASSPHRASE).unwrap(),
+                    )
+                    .await;
+            }
+            assert!(
+                matches!(
+                    result,
+                    Err(SaError::IntentBindingMismatch {
+                        field: "expiration"
+                    })
+                ),
+                "{maximum:?}: {result:?}"
+            );
+            assert_eq!(signer.sign_calls(), 0);
+            assert!(signing_gate.exposure().is_none());
+        }
+        assert!(signing_gate.take_unexposed().is_some());
     }
 }

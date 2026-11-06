@@ -1547,6 +1547,29 @@ pub async fn submit_multicall_bundle(
         "rule_id": args.rule_id,
     });
 
+    let window = stellar_agent_network::policy_state::PersistedWindowStore::for_profile(
+        args.policy_engine.profile_name(),
+    );
+    window.observe_before_policy(args.profile).await;
+    args.policy_engine
+        .state_store()
+        .clear()
+        .map_err(|error| SaError::MulticallFailed {
+            phase: "policy_gate",
+            redacted_reason: error.to_string(),
+            post_submit_kind: None,
+        })?;
+    window
+        .load_into(
+            args.policy_engine.profile_name(),
+            args.profile,
+            args.policy_engine.state_store(),
+        )
+        .map_err(|error| SaError::MulticallFailed {
+            phase: "policy_gate",
+            redacted_reason: error.to_string(),
+            post_submit_kind: None,
+        })?;
     let policy_decision = args
         .policy_engine
         .evaluate_bundle(&tool, &eval_args, args.profile, &bundle_view)

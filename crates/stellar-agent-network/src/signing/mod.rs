@@ -51,6 +51,8 @@
 
 pub mod envelope_signing;
 pub mod hardware;
+pub mod ledger_witness;
+pub use ledger_witness::LedgerWitnessCapability;
 pub mod payload;
 pub mod software;
 pub mod source;

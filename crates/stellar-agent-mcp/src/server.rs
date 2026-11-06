@@ -1160,6 +1160,8 @@ impl WalletServer {
 
     /// Resolves an agent's secondary endpoint against the command context.
     ///
+    /// Signing through a supplied secondary endpoint does not give that endpoint authority to close retained intents.
+    ///
     /// On a mainnet context a supplied value is refused with
     /// `profile.non_overlayable_field`; a value with credentials is refused on
     /// every chain. An absent value yields the context's secondary endpoint.

@@ -77,7 +77,7 @@ fn read_intents(
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, reason = "test fixture assertions")]
+    #![allow(clippy::unwrap_used, clippy::panic, reason = "test fixture assertions")]
     use super::*;
 
     struct RestoreStore(Option<std::sync::Arc<keyring_core::CredentialStore>>);
@@ -154,7 +154,7 @@ mod tests {
         let store = PersistedWindowStore::for_profile("intent");
         stellar_agent_network::signed_intent::test_helpers::seed_two_intents(&profile, &store)
             .unwrap();
-        let before = std::fs::read(store.path()).unwrap();
+        let before = stellar_agent_test_support::file_sha256(store.path());
         let key = &profile.policy_window_state_key_id;
         let generation = keyring_core::Entry::new(
             &key.service,
@@ -191,16 +191,52 @@ mod tests {
                 .iter()
                 .all(|i| i.accounting_horizon == "open" && i.legs.len() == 2)
         );
-        assert_eq!(std::fs::read(store.path()).unwrap(), before);
+        assert_eq!(
+            stellar_agent_test_support::file_sha256(store.path()),
+            before
+        );
         assert_eq!(generation.get_password().unwrap(), generation_before);
-        let mut corrupt = before;
+        let mut corrupt = std::fs::read(store.path()).unwrap();
         corrupt[0] ^= 1;
         std::fs::write(store.path(), &corrupt).unwrap();
+        let corrupt_digest = stellar_agent_test_support::file_sha256(store.path());
         assert_eq!(
             read_intents("intent", &profile).unwrap_err().code(),
             "submission.record_unavailable"
         );
-        assert_eq!(std::fs::read(store.path()).unwrap(), corrupt);
+        assert_eq!(
+            stellar_agent_test_support::file_sha256(store.path()),
+            corrupt_digest
+        );
         assert_eq!(generation.get_password().unwrap(), generation_before);
+    }
+    #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial]
+    async fn intent_views_report_horizons_without_mutation() {
+        use stellar_agent_network::intent_view_test_helpers::IntentViewFixture;
+        for mode in ["invoke", "done", "unset", "unclassified"] {
+            let fixture = IntentViewFixture::new(mode).await;
+            for endpoint_state in ["complete", "missing", "unreadable"] {
+                fixture.set_endpoints(endpoint_state);
+                let value =
+                    serde_json::to_value(list("intent", &fixture.profile, || Ok(())).unwrap())
+                        .unwrap();
+                assert_eq!(value.as_array().unwrap().len(), 1);
+                fixture.assert_view(&value, endpoint_state);
+                fixture.assert_unchanged().await;
+            }
+            for missing in [false, true] {
+                fixture.damage_store(missing);
+                let error = list("intent", &fixture.profile, || Ok(())).unwrap_err();
+                assert!(
+                    matches!(&error, WalletError::Submission(SubmissionError::RecordUnavailable { detail }) if detail == "the authenticated intent window is unavailable")
+                );
+                assert_eq!(error.code(), "submission.record_unavailable");
+                fixture.assert_resources_unchanged().await;
+                if missing {
+                    assert!(!fixture.store.path().exists());
+                }
+            }
+        }
     }
 }

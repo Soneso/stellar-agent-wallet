@@ -123,6 +123,9 @@ impl Criterion for RateLimitCriterion {
                 detail: format!("rate_limit: system clock is before UNIX epoch: {e}"),
             })?;
 
+        #[cfg(any(test, feature = "test-helpers"))]
+        let now_ms = super::state_store::query_time_for_test().unwrap_or(now_ms);
+
         let state_key = StateKey::new(
             ctx.profile_name,
             // Scope specificity 1 (AllProfiles) is the default; the dispatch
@@ -212,6 +215,8 @@ impl Criterion for RateLimitCriterion {
                     "rate_limit: record_confirmed system clock is before UNIX epoch: {e}"
                 ),
             })?;
+        #[cfg(any(test, feature = "test-helpers"))]
+        let now_ms = super::state_store::query_time_for_test().unwrap_or(now_ms);
         let entry = self.size(ctx, now_ms)?;
         if let Some(entry) = &entry {
             ctx.state_store

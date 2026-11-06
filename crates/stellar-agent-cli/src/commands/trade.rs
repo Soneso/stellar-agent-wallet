@@ -297,6 +297,7 @@ where
     // `stellar_dex_trade` twin's `dispatch_gate_with_value` mechanism) ───────
     // The debit leg is built from the SAME `amount_in` / `canonical_path`
     // used to construct `trade_args` below (single-decode invariant).
+    crate::commands::submission_record::observe_intents(&profile, &profile_name).await;
     let policy_engine =
         match build_v1_policy_engine("trade", &profile.policy.engine, &profile, &profile_name) {
             Ok(pe) => pe,
@@ -606,5 +607,52 @@ mod tests {
             code, 1,
             "run must surface the keyring init failure instead of reaching signer resolution"
         );
+    }
+    #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial]
+    async fn early_observation_precedes_window_gate() {
+        use crate::commands::submission_record::intent_gate_fixture::{IntentGateState, home};
+        let (_home, _guard) = home();
+        let primary = wiremock::MockServer::start().await;
+        let name = "intent-trade";
+        let mut profile = Profile::builder_testnet_named(name, "signer", "account", "nonce", name)
+            .rpc_url(primary.uri())
+            .build();
+        let state = IntentGateState::seed(name, &mut profile).await;
+        let args = TradeArgs {
+            profile: Some(name.into()),
+            from: stellar_strkey::Contract([1; 32]).to_string().to_string(),
+            amount_in: 1,
+            amount_out_min: 1,
+            path: vec![
+                stellar_strkey::Contract([2; 32]).to_string().to_string(),
+                stellar_strkey::Contract([3; 32]).to_string().to_string(),
+            ],
+            deadline: None,
+            secondary_rpc_url: None,
+        };
+        for after in [false, false, true] {
+            if after {
+                state.after_retention();
+            }
+            let before = state.bytes();
+            crate::common::render::take_rendered_for_test();
+            assert_eq!(
+                run_with_dependencies(&args, |_| Ok(profile.clone()), || Ok(())).await,
+                1
+            );
+            assert_eq!(
+                crate::test_rpc::last_rendered()["error"]["code"],
+                if after {
+                    "audit.chain_key_unavailable"
+                } else {
+                    "policy.deny.rate_limit_exceeded"
+                }
+            );
+            state.assert_closed(&profile, u32::from(!after)).await;
+            if after {
+                assert_eq!(state.bytes(), before);
+            }
+        }
     }
 }

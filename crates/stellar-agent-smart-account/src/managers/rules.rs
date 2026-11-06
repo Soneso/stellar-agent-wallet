@@ -3721,7 +3721,7 @@ pub(crate) const BASE_FEE_STROOPS: u32 = 100;
 /// [`crate::signing::ledger_witness::WitnessedLedgerBound`], which needs a
 /// second endpoint's agreement. It assumes at least one of the two endpoints
 /// reports the chain honestly.
-pub(crate) const AUTH_VALIDITY_LEDGERS: u32 = 100;
+pub(crate) use stellar_agent_network::signing::ledger_witness::AUTH_VALIDITY_LEDGERS;
 
 /// Validates that an RPC-returned `latest_ledger` is a plausible integer.
 ///
@@ -3762,11 +3762,7 @@ pub(crate) fn validate_latest_ledger(latest_ledger: u32) -> Result<(), SaError> 
                 .to_owned(),
         });
     }
-    // Upper bound: leave AUTH_VALIDITY_LEDGERS + 1_000_000 headroom below u32::MAX.
-    let ceiling = u32::MAX
-        .saturating_sub(AUTH_VALIDITY_LEDGERS)
-        .saturating_sub(1_000_000);
-    if latest_ledger > ceiling {
+    if !stellar_agent_network::signing::ledger_witness::operational_ledger(latest_ledger) {
         return Err(SaError::DeploymentFailed {
             phase: "simulate",
             redacted_reason: "RPC-returned latest_ledger out of operational bounds (above ceiling)"
@@ -10629,7 +10625,9 @@ mod tests {
     /// A pair that goes stale during the rule read is read again as a pair, and
     /// the signatures rest on the new pair: (1002, 1001), not (1000, 1001).
     #[tokio::test]
+    #[serial_test::serial]
     async fn a_pair_gone_stale_during_the_rule_read_is_read_again() {
+        stellar_agent_test_support::keyring_mock::install().unwrap();
         let primary = rule_read_rpc(1200, 1000)
             .slow_simulations(2..3, RULE_READ_OUTLASTS_OBSERVATION)
             .latest_ledger_after_simulation(2, 1002);
@@ -10647,7 +10645,9 @@ mod tests {
 
     /// A second pair that also goes stale during its rule read signs nothing.
     #[tokio::test]
+    #[serial_test::serial]
     async fn a_pair_stale_again_after_the_second_rule_read_refuses() {
+        stellar_agent_test_support::keyring_mock::install().unwrap();
         let primary =
             rule_read_rpc(1200, 1000).slow_simulations(2..4, RULE_READ_OUTLASTS_OBSERVATION);
 
@@ -10667,7 +10667,9 @@ mod tests {
     /// primary at 1000 cannot keep alive a rule the secondary at 1002 sees
     /// expired.
     #[tokio::test]
+    #[serial_test::serial]
     async fn rule_validity_uses_the_higher_witnessed_ledger() {
+        stellar_agent_test_support::keyring_mock::install().unwrap();
         match submit_under_rule_valid_until(1001).await {
             Err(SaError::RuleExpired {
                 valid_until,

@@ -11018,7 +11018,9 @@ pub(crate) mod tests {
     /// names refuses at stage `rule_lock_missing` naming that rule, before
     /// any network I/O; the submit path acquires nothing in its place.
     #[tokio::test]
+    #[serial_test::serial]
     async fn a_held_lock_context_without_a_named_rule_refuses_rule_lock_missing() {
+        stellar_agent_test_support::keyring_mock::install().unwrap();
         let (manager, _dir) = lock_test_manager();
         let guards = manager
             .acquire_rule_locks(LOCK_TEST_ACCOUNT, [1], lock_test_budget())
@@ -11048,7 +11050,9 @@ pub(crate) mod tests {
     /// account: the context's guard of rule 1 on a second account refuses
     /// rule 1 at stage `rule_lock_missing`.
     #[tokio::test]
+    #[serial_test::serial]
     async fn a_held_lock_context_for_another_account_refuses_rule_lock_missing() {
+        stellar_agent_test_support::keyring_mock::install().unwrap();
         let (manager, _dir) = lock_test_manager();
         let guards = manager
             .acquire_rule_locks(&other_lock_test_account(), [1], lock_test_budget())
@@ -11076,7 +11080,9 @@ pub(crate) mod tests {
     /// manager and submitted with another's drift check refuses rule 1 at
     /// stage `rule_lock_missing`.
     #[tokio::test]
+    #[serial_test::serial]
     async fn a_held_lock_context_from_another_log_refuses_rule_lock_missing() {
+        stellar_agent_test_support::keyring_mock::install().unwrap();
         let (lending, _lending_dir) = lock_test_manager();
         let (checking, _checking_dir) = lock_test_manager();
         let guards = lending
@@ -11103,7 +11109,9 @@ pub(crate) mod tests {
     /// A held-lock context without a drift check refuses at stage
     /// `rule_locks_without_pin_check`, whatever the auth rules are.
     #[tokio::test]
+    #[serial_test::serial]
     async fn a_held_lock_context_without_a_pin_check_refuses() {
+        stellar_agent_test_support::keyring_mock::install().unwrap();
         let (manager, _dir) = lock_test_manager();
         let guards = manager
             .acquire_rule_locks(LOCK_TEST_ACCOUNT, [1, 2], lock_test_budget())

@@ -133,7 +133,9 @@ fn dummy_host_function() -> HostFunction {
 /// returns promptly right after the fetch, without needing a full
 /// simulate/auth/submit success fixture.
 #[tokio::test]
+#[serial_test::serial]
 async fn initial_fetch_consults_the_sequence_floor_hook() {
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let server = MockServer::start().await;
     let ledger_resp = build_ledger_entries_account(SOURCE_G);
     let simulate_error = serde_json::json!({
@@ -195,7 +197,9 @@ async fn initial_fetch_consults_the_sequence_floor_hook() {
 /// paths) reproduces the identical error and consults no hook — the
 /// back-compat default.
 #[tokio::test]
+#[serial_test::serial]
 async fn no_hook_reproduces_plain_fetch_behaviour() {
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let server = MockServer::start().await;
     let ledger_resp = build_ledger_entries_account(SOURCE_G);
     let simulate_error = serde_json::json!({

@@ -952,6 +952,7 @@ where
     // ── Operator policy evaluation (before signing/submission) ───────────────
     let chain_id = context.chain_id.caip2_str();
     let starting_balance_stroops = starting_balance.as_stroops();
+    crate::commands::submission_record::observe_intents(profile, &resolved.name).await;
     let create_effects = match evaluate_create_policy(
         args,
         profile,
@@ -3680,5 +3681,48 @@ mod tests {
             ),
             "expected AddressInvalid, got: {err:?}"
         );
+    }
+    #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial]
+    async fn early_observation_precedes_window_gate() {
+        use crate::commands::submission_record::intent_gate_fixture::{IntentGateState, home};
+        let (_home, _guard) = home();
+        let primary = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(crate::test_rpc::ClassicRpc::testnet(&[SOURCE_G]))
+            .mount(&primary)
+            .await;
+        let name = "intent-create";
+        let mut profile = Profile::builder_testnet_named(name, "signer", SOURCE_G, "nonce", name)
+            .rpc_url(primary.uri())
+            .build();
+        let state = IntentGateState::seed(name, &mut profile).await;
+        let mut args = minimal_sponsored_args();
+        args.profile = Some(name.into());
+        args.rpc_url = Some(primary.uri());
+        args.fee = Some("100".into());
+        for after in [false, false, true] {
+            if after {
+                state.after_retention();
+            }
+            let before = state.bytes();
+            crate::common::render::take_rendered_for_test();
+            assert_eq!(
+                run_with_dependencies(&args, |_| Ok(profile.clone()), || Ok(())).await,
+                1
+            );
+            assert_eq!(
+                crate::test_rpc::last_rendered()["error"]["code"],
+                if after {
+                    "audit.chain_key_unavailable"
+                } else {
+                    "policy.deny.rate_limit_exceeded"
+                }
+            );
+            state.assert_closed(&profile, u32::from(!after)).await;
+            if after {
+                assert_eq!(state.bytes(), before);
+            }
+        }
     }
 }

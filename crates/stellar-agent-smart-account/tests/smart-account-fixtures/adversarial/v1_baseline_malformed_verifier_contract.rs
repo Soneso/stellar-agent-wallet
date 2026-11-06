@@ -149,7 +149,9 @@ async fn signers_path_refuses_the_malformed_verifier_without_its_fragments() {
 /// divergence; no ceremony starts.
 #[cfg(feature = "test-helpers")]
 #[tokio::test]
+#[serial_test::serial]
 async fn credentials_path_refuses_the_malformed_verifier_without_its_fragments() {
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
 
@@ -201,10 +203,7 @@ async fn credentials_path_refuses_the_malformed_verifier_without_its_fragments()
                 Duration::from_secs(5),
                 "stellar:testnet".to_owned(),
             )
-            .with_intent_admission(std::sync::Arc::new(
-                stellar_agent_smart_account::signing::intent_test_helpers::no_value_admission_owned(
-                ),
-            )),
+            .with_intent_admission(stellar_agent_smart_account::signing::intent_test_helpers::shared_no_value_admission()),
         )
         .expect("SignersManager::new must succeed"),
     );

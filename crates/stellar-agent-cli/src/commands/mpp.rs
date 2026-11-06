@@ -407,6 +407,7 @@ async fn commit_cli(
     record: &stellar_agent_mpp::AuthorizationRecord,
     now_unix: i64,
 ) -> i32 {
+    crate::commands::submission_record::observe_intents(profile, profile_name).await;
     let engine =
         match build_v1_policy_engine("mpp charge", &profile.policy.engine, profile, profile_name) {
             Ok(engine) => engine,
@@ -968,6 +969,10 @@ fn print_success(value: impl Serialize) {
 
 #[allow(clippy::print_stdout, reason = "CLI result channel")]
 fn print_json(value: &impl Serialize) {
+    #[cfg(test)]
+    if let Ok(value) = serde_json::to_value(value) {
+        tests::RENDERED.with(|rendered| rendered.borrow_mut().push(value));
+    }
     println!(
         "{}",
         serde_json::to_string(value).unwrap_or_else(|_| "{}".to_owned())
@@ -1143,6 +1148,11 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+
+    thread_local! {
+        pub(super) static RENDERED: std::cell::RefCell<Vec<serde_json::Value>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
 
     fn put_raw(entry_ref: &stellar_agent_core::profile::schema::KeyringEntryRef, value: &str) {
         keyring_core::Entry::new(&entry_ref.service, &entry_ref.account)
@@ -1627,7 +1637,12 @@ mod tests {
         seed_secret: bool,
         configure: impl FnOnce(&mut Simulate, &Path),
     ) -> StageCase {
-        let home = TempDir::new().expect("home");
+        let scratch = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/tmp");
+        std::fs::create_dir_all(&scratch).expect("scratch directory");
+        let home = tempfile::Builder::new()
+            .prefix("mpp-stage-")
+            .tempdir_in(scratch)
+            .expect("home");
         let guard = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
         stellar_agent_test_support::keyring_mock::install().expect("mock keyring");
         let payer = g_strkey(seed);
@@ -1890,5 +1905,54 @@ mod tests {
             vec![true],
             "the consent row must be in the log when the signed entry reaches the RPC"
         );
+    }
+    #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial]
+    async fn early_observation_precedes_window_gate() {
+        use crate::commands::submission_record::intent_gate_fixture::IntentGateState;
+        let name = "intent-mpp";
+        let mut case = stage_case(name, [0x67; 32], false, |_, _| {}).await;
+        let (authorization, record) = prepare_charge(&case.profile, name, 12, None).await;
+        let state = IntentGateState::seed(name, &mut case.profile).await;
+        let audit_key = &case.profile.audit_log_hash_chain_key_id;
+        keyring_core::Entry::new(&audit_key.service, &audit_key.account)
+            .expect("fixture")
+            .delete_credential()
+            .expect("fixture");
+        let context = testnet_context(&case.profile).ok().expect("fixture");
+        for after in [false, false, true] {
+            if after {
+                state.after_retention();
+            }
+            let before = state.bytes();
+            RENDERED.with(|rendered| rendered.borrow_mut().clear());
+            assert_eq!(
+                commit_cli(
+                    &context,
+                    name,
+                    &case.profile,
+                    &authorization,
+                    &record,
+                    now_unix()
+                )
+                .await,
+                1
+            );
+            assert_eq!(
+                RENDERED.with(|rendered| {
+                    rendered.borrow().last().expect("command envelope")["error"]["code"].clone()
+                }),
+                if after {
+                    "audit.chain_key_unavailable"
+                } else {
+                    "mpp.approval_invalid"
+                }
+            );
+            state.assert_closed(&case.profile, u32::from(!after)).await;
+            assert_eq!(case.signed.load(std::sync::atomic::Ordering::SeqCst), 0);
+            if after {
+                assert_eq!(state.bytes(), before);
+            }
+        }
     }
 }

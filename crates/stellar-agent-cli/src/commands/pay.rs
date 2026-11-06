@@ -1046,6 +1046,26 @@ async fn evaluate_staged_pay_policy(
         .as_ref()
         .map(stellar_agent_network::policy_view::AccountViewAdapter::new);
 
+    if let Err(error) = crate::commands::submission_record::observe_and_refresh_intents(
+        profile,
+        profile_name,
+        policy_engine.as_ref(),
+    )
+    .await
+    {
+        print_error(
+            &Envelope::<()>::err_raw(
+                if error.chain_validation_error().is_some() {
+                    error.submission_code()
+                } else {
+                    "policy.engine_unavailable"
+                },
+                error.to_string(),
+            ),
+            args.output,
+        );
+        return Err(1);
+    }
     let decoded = decode_result.as_ref().ok().cloned();
     let effects = match dispatch_staged_pay_gate(
         policy_engine.as_ref(),
@@ -1388,6 +1408,7 @@ where
             return 1;
         }
     };
+    crate::commands::submission_record::observe_intents(profile, &resolved.name).await;
     let pay_effects =
         match evaluate_pay_policy(args, &built, chain_id, profile, &resolved.name, total_fee) {
             Ok(effects) => effects,
@@ -7339,6 +7360,72 @@ mod tests {
             .await;
 
             assert_build_only_reserve_refusal(&run);
+        }
+    }
+    #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial]
+    async fn early_observation_precedes_window_gate() {
+        use crate::commands::submission_record::intent_gate_fixture::{IntentGateState, home};
+        for staged in [false, true] {
+            let (_home, _guard) = home();
+            let primary = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(crate::test_rpc::ClassicRpc::testnet(&[SOURCE_G, DEST_G]))
+                .mount(&primary)
+                .await;
+            let name = "intent-pay";
+            let mut profile =
+                Profile::builder_testnet_named(name, "signer", SOURCE_G, "nonce", name)
+                    .rpc_url(primary.uri())
+                    .build();
+            let state = IntentGateState::seed(name, &mut profile).await;
+            let mut args = minimal_args();
+            args.profile = Some(name.into());
+            args.source = Some(SOURCE_G.into());
+            args.destination = DEST_G.into();
+            args.rpc_url = Some(primary.uri());
+            args.fee = Some("100".into());
+            for after in [false, false, true] {
+                if after {
+                    state.after_retention();
+                }
+                let before = state.bytes();
+                crate::common::render::take_rendered_for_test();
+                if staged {
+                    let result = evaluate_staged_pay_policy(
+                        None,
+                        &NetworkContext::from_profile(&profile),
+                        &args,
+                        &pay_envelope_b64(10_000_000),
+                        &profile,
+                        name,
+                    )
+                    .await;
+                    assert_eq!(result.is_ok(), after);
+                    if !after {
+                        assert_eq!(
+                            crate::test_rpc::last_rendered()["error"]["code"],
+                            "policy.deny.rate_limit_exceeded"
+                        );
+                    }
+                } else {
+                    let code =
+                        run_with_dependencies(&args, |_| Ok(profile.clone()), || Ok(())).await;
+                    assert_eq!(code, 1);
+                    assert_eq!(
+                        crate::test_rpc::last_rendered()["error"]["code"],
+                        if after {
+                            "audit.chain_key_unavailable"
+                        } else {
+                            "policy.deny.rate_limit_exceeded"
+                        }
+                    );
+                }
+                state.assert_closed(&profile, u32::from(!after)).await;
+                if after {
+                    assert_eq!(state.bytes(), before);
+                }
+            }
         }
     }
 }

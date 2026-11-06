@@ -892,6 +892,72 @@ mod tests {
     }
 
     #[test]
+    #[serial]
+    fn reset_explains_permanent_and_missing_secondary_blocks() {
+        use stellar_agent_network::intent_view_test_helpers::{PERMANENT, SECONDARY};
+        for (permanent, missing) in [(true, false), (false, true), (true, true)] {
+            stellar_agent_test_support::keyring_mock::install().unwrap();
+            let dir = tempfile::tempdir().unwrap();
+            let profile = Profile::builder_testnet_named(
+                "intent",
+                "reset",
+                "account",
+                "reset-nonce",
+                "account",
+            )
+            .build();
+            let mut stored =
+                "chain_id = \"stellar:testnet\"\nrpc_url = \"https://primary.example/rpc\"\n"
+                    .to_owned();
+            if !missing {
+                stored.push_str("secondary_rpc_url = \"https://secondary.example/rpc\"\n");
+            }
+            std::fs::write(dir.path().join("intent.toml"), stored).unwrap();
+            let store = PersistedWindowStore::at_path(dir.path().join("intent.window"))
+                .with_profile_directory("intent", dir.path().to_owned());
+            let (mut plan, envelope) =
+                stellar_agent_network::signed_intent::test_helpers::intent_fixture_plan(1, 60);
+            if !permanent {
+                let stellar_xdr::TransactionEnvelope::Tx(tx) = &envelope else {
+                    panic!("transaction")
+                };
+                let stellar_xdr::OperationBody::InvokeHostFunction(op) = &tx.tx.operations[0].body
+                else {
+                    panic!("invoke")
+                };
+                plan = plan
+                    .classify_purpose(&op.host_function, None)
+                    .unwrap()
+                    .with_envelope_max_ledger(100)
+                    .unwrap();
+            }
+            let _exposure = store.admit_signed_intent(&profile, &plan).unwrap().expose();
+            let before = std::fs::read(store.path()).unwrap();
+            let result = store.reset(
+                &profile,
+                "intent",
+                1000,
+                "fixture",
+                "fixture",
+                |_| -> Result<ResetConsent, ()> { panic!("no authorization ceremony") },
+                |_, _| -> Result<(), ()> { panic!("no reset row") },
+            );
+            let Err(stellar_agent_network::policy_state::ResetError::Store {
+                error,
+                minted: false,
+            }) = result
+            else {
+                panic!("live intent refusal")
+            };
+            let rendered = store_refusal("intent", error);
+            assert_eq!(rendered.code(), "submission.record_unavailable");
+            assert_eq!(rendered.to_string().contains(PERMANENT), permanent);
+            assert_eq!(rendered.to_string().contains(SECONDARY), missing);
+            assert_eq!(std::fs::read(store.path()).unwrap(), before);
+        }
+    }
+
+    #[test]
     fn reset_store_scope_refusals_keep_their_codes() {
         for (refusal, code) in [
             (

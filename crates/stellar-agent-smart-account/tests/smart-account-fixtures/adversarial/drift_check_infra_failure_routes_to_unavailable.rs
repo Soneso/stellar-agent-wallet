@@ -124,7 +124,9 @@ impl Respond for SequencedLedgerResponder {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn policy_rpc_divergence_routes_to_drift_check_unavailable() {
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let (audit_writer, audit_log_path, dir) = tmp_audit_writer();
     let smart_account_strkey = format!("{}", stellar_strkey::Contract([0u8; 32]));
     let smart_account_redacted = redact_strkey_first5_last5(&smart_account_strkey);

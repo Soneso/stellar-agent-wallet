@@ -1499,3 +1499,19 @@ to finish it.
 4. The operator periodically runs `audit verify` to confirm the log has not been tampered with, supplying `--profile` to check the chain-root HMAC sidecars and the tip anchor as well as the hash chain.
 
 Key rotation backs this loop: `rotate-attestation-key` invalidates outstanding approvals, and `rotate-audit-key` re-keys the chain root and re-signs every existing per-file sidecar. See [concepts](../concepts.md) for the full model.
+
+## Retained smart-account charges
+
+Reset refuses while an intent remains open or retained. A closed and pruned intent does not block reset.
+
+An open intent without an authenticated purpose permanently blocks reset for this profile. Continue with a new profile.
+
+Retained intents close only through the profile's stored secondary endpoint. Add one to the profile.
+
+The profile's stored endpoint configuration is unreadable. Retained intents close only through stored endpoints that load.
+
+Only the endpoints stored in the profile authorize charge closure. Endpoint overrides can bound signatures but cannot close charges.
+
+Environment variables and programmatic overlays do not change which endpoints authorize charge closure.
+
+Snapshots containing signed intents or intent links use version 9. Records missing required intent fields refuse as unreadable. Readers that cannot account for the format refuse current and prepared snapshots.

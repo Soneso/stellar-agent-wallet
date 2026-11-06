@@ -586,9 +586,9 @@ async fn verify_pins_report(
             std::time::Duration::from_secs(5),
             "stellar:testnet".to_owned(),
         )
-        .with_intent_admission(std::sync::Arc::new(
-            stellar_agent_smart_account::signing::intent_test_helpers::no_value_admission_owned(),
-        ))
+        .with_intent_admission(
+            stellar_agent_smart_account::signing::intent_test_helpers::shared_no_value_admission(),
+        )
         .with_signers_manager(signers_manager)
         .with_audit_writer(audit_writer),
     )
@@ -609,7 +609,9 @@ async fn verify_pins_report(
 /// reference summary, aligned with the hash lists, for a verifier and for a
 /// policy.
 #[tokio::test]
+#[serial_test::serial]
 async fn verify_pins_reports_the_pinned_and_observed_external_reference() {
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     use stellar_agent_smart_account::managers::rules::PinStatus;
 
     for kind in [Kind::Verifier, Kind::Policy] {
@@ -668,7 +670,9 @@ async fn verify_pins_reports_the_pinned_and_observed_external_reference() {
 /// A reference pin against live Wasm code reports drift, the pin, and `None`
 /// for the observed Wasm executable at the drifted position.
 #[tokio::test]
+#[serial_test::serial]
 async fn verify_pins_reports_live_wasm_against_a_reference_pin_as_none() {
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     use stellar_agent_smart_account::managers::rules::PinStatus;
 
     let resolved = VERIFIER_ALLOWLIST[0].wasm_hash;
@@ -691,7 +695,9 @@ async fn verify_pins_reports_live_wasm_against_a_reference_pin_as_none() {
 /// no observed hash for it: the entry is JSON `null` beside the `"no code"`
 /// executable summary, never a zero hash.
 #[tokio::test]
+#[serial_test::serial]
 async fn verify_pins_reports_absent_code_as_null() {
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     use stellar_agent_smart_account::managers::rules::PinStatus;
 
     for kind in [Kind::Verifier, Kind::Policy] {

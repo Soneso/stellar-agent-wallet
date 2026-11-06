@@ -1611,7 +1611,10 @@ pub async fn submit_signed_invoke(
         subjects,
         Some(signature_expiration_ledger),
     )
-    .map_err(|error| map_admission_error(&error, args.op_label))?;
+    .map_err(|error| map_admission_error(&error, args.op_label))?
+    .classify_purpose(&args.host_function, None)
+    .map_err(|error| map_admission_error(&error, args.op_label))?
+    .with_capability(ledger_bound.capability());
     let proof = args
         .admission
         .admit(&plan)
@@ -3111,7 +3114,9 @@ mod tests {
     /// `check_required` with `required_checks = &["multicall"]` and a
     /// fully-populated `MulticallCheck` returns `Ok(())`.
     #[test]
+    #[serial_test::serial]
     fn check_required_passes_when_multicall_check_present() {
+        stellar_agent_test_support::keyring_mock::install().unwrap();
         let mc = MulticallCheck {
             registry_entry_address: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM"
                 .to_owned(),
@@ -3127,7 +3132,9 @@ mod tests {
     /// `multicall_check: Some(_)` without `"multicall"` in `required_checks`
     /// is refused with a typed error in every build profile.
     #[test]
+    #[serial_test::serial]
     fn submit_guard_refuses_an_undeclared_multicall_check() {
+        stellar_agent_test_support::keyring_mock::install().unwrap();
         let mc = MulticallCheck {
             registry_entry_address: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM"
                 .to_owned(),
@@ -3153,7 +3160,9 @@ mod tests {
     /// `"multicall"` in `required_checks`, and no multicall check at all,
     /// both pass the guard.
     #[test]
+    #[serial_test::serial]
     fn submit_guard_accepts_a_declared_or_absent_multicall_check() {
+        stellar_agent_test_support::keyring_mock::install().unwrap();
         let mc = MulticallCheck {
             registry_entry_address: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM"
                 .to_owned(),
@@ -3168,7 +3177,9 @@ mod tests {
     /// `check_required` with `required_checks = &["multicall"]` and
     /// `multicall_check = None` returns `Err(SubmitCheckMissing)`.
     #[test]
+    #[serial_test::serial]
     fn check_required_fails_when_multicall_check_missing() {
+        stellar_agent_test_support::keyring_mock::install().unwrap();
         let args = minimal_args(None, &["multicall"]);
         let hf_kind = host_function_kind_str(&args.host_function);
         let err = check_required(&args, "multicall", hf_kind).unwrap_err();
@@ -3179,7 +3190,9 @@ mod tests {
     /// gate is a no-op — preserving behaviour for callers that pass an empty
     /// slice.
     #[test]
+    #[serial_test::serial]
     fn check_required_passes_when_required_check_not_listed() {
+        stellar_agent_test_support::keyring_mock::install().unwrap();
         // required_checks = &[], multicall_check = None → no gate fires.
         let args = minimal_args(None, &[]);
         let hf_kind = host_function_kind_str(&args.host_function);
@@ -3193,7 +3206,9 @@ mod tests {
     /// `check_required` with an unrecognised name returns `Err(SubmitCheckMissing)`
     /// regardless of the `Option<*Check>` fields (fail-CLOSED on unknown names).
     #[test]
+    #[serial_test::serial]
     fn check_required_fails_on_unknown_check_name() {
+        stellar_agent_test_support::keyring_mock::install().unwrap();
         // multicall_check is Some — should not matter for an unrecognised name.
         let mc = MulticallCheck {
             registry_entry_address: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM"
@@ -3310,7 +3325,9 @@ mod tests {
     /// function (not a stand-in) without a live RPC endpoint: `primary_rpc_url`
     /// is a URL that is never dialed.
     #[tokio::test]
+    #[serial_test::serial]
     async fn submit_signed_invoke_rejects_ed25519_rule_signer_with_quorum_before_network_io() {
+        stellar_agent_test_support::keyring_mock::install().unwrap();
         use crate::managers::authorization::{AuthorizationInfo, Combinator};
         use stellar_agent_network::SoftwareSigningKey;
 
@@ -3379,7 +3396,9 @@ mod tests {
     /// signer, which panics on any call, and before any request to the mock
     /// primary endpoint.
     #[tokio::test]
+    #[serial_test::serial]
     async fn submit_signed_invoke_refuses_mainnet_passphrase_before_signer_and_request() {
+        stellar_agent_test_support::keyring_mock::install().unwrap();
         let mock = wiremock::MockServer::start().await;
         let primary = mock.uri();
         let args = mainnet_refusal_args(
@@ -3401,7 +3420,9 @@ mod tests {
     /// A testnet passphrase with a dialable mainnet-pattern primary URL is
     /// refused the same way.
     #[tokio::test]
+    #[serial_test::serial]
     async fn submit_signed_invoke_refuses_mainnet_pattern_url_before_signer_and_request() {
+        stellar_agent_test_support::keyring_mock::install().unwrap();
         let mock = wiremock::MockServer::start().await;
         let primary = format!("{}/pubnet", mock.uri());
         let args = mainnet_refusal_args(
@@ -3437,7 +3458,9 @@ mod tests {
     ///    (the external-contract shape, e.g. `SAC.transfer` invoked as a
     ///    sub-invocation of an external router).
     #[tokio::test]
+    #[serial_test::serial]
     async fn ed25519_rule_signer_arm_patches_credential_and_omits_g_key() {
+        stellar_agent_test_support::keyring_mock::install().unwrap();
         use crate::managers::auth_entry::{
             MixedSigner, MixedSignerKind, build_authorization_entry, collect_mixed_signer_entries,
         };
@@ -4536,16 +4559,156 @@ mod tests {
                     if exposed { (1, 1) } else { (0, 0) }
                 );
             }
+            stellar_agent_test_support::keyring_mock::install().unwrap();
+            let scratch = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/tmp");
+            std::fs::create_dir_all(&scratch).unwrap();
+            let dir = tempfile::Builder::new()
+                .prefix("cancel-progress-")
+                .tempdir_in(scratch)
+                .unwrap();
+            let profile = stellar_agent_core::profile::schema::Profile::builder_testnet_named(
+                "intent",
+                "progress-test",
+                "account",
+                "progress-nonce",
+                "account",
+            )
+            .build();
+            let primary = endpoint(LEDGER).start().await;
+            let secondary = endpoint(LEDGER).start().await;
+            let secondary_url = second_loopback_host(&secondary.uri());
+            std::fs::write(
+                dir.path().join("intent.toml"),
+                format!(
+                    "chain_id = \"stellar:testnet\"\nrpc_url = {:?}\nsecondary_rpc_url = {:?}\n",
+                    primary.uri(),
+                    secondary_url,
+                ),
+            )
+            .unwrap();
+            let store = PersistedWindowStore::at_path(dir.path().join("intent.window"))
+                .with_profile_directory("intent", dir.path().to_owned());
+            let clock = stellar_agent_network::mainnet::clock::set_now_ms_for_test(1000);
+            let retained_key = StateKey::new("intent", 1, "retained-rate", 60);
+            let retained_entries = [WindowEntry::new(
+                retained_key.clone(),
+                1000,
+                1,
+                WindowLimit::Count {
+                    window: "1m".into(),
+                    max_calls: 1,
+                },
+            )];
+            let (prior, envelope) =
+                stellar_agent_network::signed_intent::test_helpers::intent_fixture_plan(99, 1);
+            let TransactionEnvelope::Tx(tx) = envelope else {
+                panic!("V1")
+            };
+            let OperationBody::InvokeHostFunction(op) = &tx.tx.operations[0].body else {
+                panic!("invoke")
+            };
+            let prior = prior
+                .classify_purpose(&op.host_function, None)
+                .unwrap()
+                .with_envelope_max_ledger(100)
+                .unwrap();
+            let prior = stellar_agent_network::signed_intent::test_helpers::with_legs(
+                &prior,
+                &retained_entries,
+            );
+            let retained = store
+                .admit_signed_intent(&profile, &prior)
+                .unwrap()
+                .expose();
+            let retained_id = retained.intent_id().unwrap().to_owned();
+            clock.set(2000);
+            let current_key = StateKey::new("intent", 1, "rate_limit", 60);
+            let entries = vec![WindowEntry::new(
+                current_key.clone(),
+                2000,
+                1,
+                WindowLimit::Count {
+                    window: "1m".into(),
+                    max_calls: 1,
+                },
+            )];
+            let inner = stellar_agent_network::submission_record::WalletSubmissionRecorder::new(
+                &profile,
+                "intent",
+                "witness_test",
+                Some("stellar:testnet".into()),
+                stellar_agent_core::audit_log::PolicyDecision::Allow,
+                vec![],
+                entries.clone(),
+                stellar_agent_core::profile::receipt::ReceiptStore::open_at(dir.path(), "intent")
+                    .unwrap(),
+                store.clone(),
+                None,
+                None,
+                "progress-fixture",
+                2000,
+            )
+            .with_signing_sizing(CheckedSizing::for_test(SizingBasis::NoValue, entries).unwrap());
+            let recorder = ProbeRecorder {
+                inner,
+                mode: AdmissionProbe::Stale,
+                admissions: 0.into(),
+                cancellations: 0.into(),
+            };
+            let signer = RecordingSigner::new();
+            let result = submit_with_control(
+                SigningPath::Single,
+                &primary,
+                Some(&secondary_url),
+                None,
+                &signer,
+                stellar_agent_network::SigningAdmission::Recorded(&recorder),
+            )
+            .await;
+            result.assert_refused(
+                UNAVAILABLE_CODE,
+                "stale admission preserves independent progress",
+            );
+            assert_eq!(
+                recorder
+                    .admissions
+                    .load(std::sync::atomic::Ordering::SeqCst),
+                1
+            );
+            assert_eq!(
+                recorder
+                    .cancellations
+                    .load(std::sync::atomic::Ordering::SeqCst),
+                1
+            );
+            assert_eq!(result.signs, 0);
+            assert_eq!(result.signed_simulations, 0);
+            assert!(result.sent.is_empty());
+            drop(recorder);
+            let reopened = PersistedWindowStore::at_path(store.path().to_owned());
+            let intents = reopened.signed_intents("intent", &profile).unwrap();
+            assert_eq!(intents.len(), 1);
+            assert_eq!(intents[0].intent_id, retained_id);
+            assert_eq!(intents[0].expiry_observed_at_ms, Some(2000));
+            assert_eq!(intents[0].accounting_horizon, "62000");
+            let memory = PolicyStateStore::new();
+            reopened.load_into("intent", &profile, &memory).unwrap();
+            assert_eq!(memory.query_window(&retained_key, 2000).unwrap(), (1, 1));
+            assert_eq!(memory.query_window(&current_key, 2000).unwrap(), (0, 0));
         }
 
         #[tokio::test]
+        #[serial_test::serial]
         async fn single_invoke_refuses_plausible_inflated_height() {
+            stellar_agent_test_support::keyring_mock::install().unwrap();
             let outcome = submit_at(SigningPath::Single, 1_000_000, LEDGER).await;
             outcome.assert_refused(SKEW_CODE, "an inflated primary");
         }
 
         #[tokio::test]
+        #[serial_test::serial]
         async fn allowed_skew_has_exact_bounded_expiry() {
+            stellar_agent_test_support::keyring_mock::install().unwrap();
             for path in PATHS {
                 for (primary, secondary) in [
                     (LEDGER, LEDGER),
@@ -4572,7 +4735,9 @@ mod tests {
         }
 
         #[tokio::test]
+        #[serial_test::serial]
         async fn a_skew_of_three_with_the_primary_behind_refuses() {
+            stellar_agent_test_support::keyring_mock::install().unwrap();
             for path in PATHS {
                 submit_at(path, LEDGER, LEDGER + 3)
                     .await
@@ -4581,7 +4746,9 @@ mod tests {
         }
 
         #[tokio::test]
+        #[serial_test::serial]
         async fn a_skew_of_three_with_the_primary_ahead_refuses() {
+            stellar_agent_test_support::keyring_mock::install().unwrap();
             for path in PATHS {
                 submit_at(path, LEDGER + 3, LEDGER)
                     .await
@@ -4592,7 +4759,9 @@ mod tests {
         /// Heights no ledger can have refuse as a pair that cannot bound an
         /// expiry, whichever endpoint reports them.
         #[tokio::test]
+        #[serial_test::serial]
         async fn out_of_bounds_heights_refuse_before_signing() {
+            stellar_agent_test_support::keyring_mock::install().unwrap();
             for path in PATHS {
                 for (primary, secondary) in [(0, 1), (1, 0), (0, 0), (u32::MAX - 1, u32::MAX - 1)] {
                     let case = format!("{path:?} ({primary}, {secondary})");
@@ -4606,7 +4775,9 @@ mod tests {
         /// A simulation that answers from a height the primary's own
         /// observation contradicts is not a base for a signature.
         #[tokio::test]
+        #[serial_test::serial]
         async fn a_simulated_height_outside_the_pair_refuses_before_signing() {
+            stellar_agent_test_support::keyring_mock::install().unwrap();
             for (simulated, case) in [(1_000_000, "above"), (LEDGER - 3, "below")] {
                 let primary = endpoint(LEDGER).simulated_ledger(simulated);
                 submit_pair(SigningPath::Single, primary, endpoint(LEDGER), None)
@@ -4616,7 +4787,9 @@ mod tests {
         }
 
         #[tokio::test]
+        #[serial_test::serial]
         async fn a_simulated_height_within_the_tolerance_of_the_pair_signs() {
+            stellar_agent_test_support::keyring_mock::install().unwrap();
             for simulated in [LEDGER - 2, LEDGER + 2] {
                 let path = SigningPath::Single;
                 let primary = endpoint(LEDGER).simulated_ledger(simulated);
@@ -4631,7 +4804,9 @@ mod tests {
         }
 
         #[tokio::test]
+        #[serial_test::serial]
         async fn absent_unavailable_or_wrong_chain_witness_refuses() {
+            stellar_agent_test_support::keyring_mock::install().unwrap();
             for path in PATHS {
                 let case = |name: &str| format!("{path:?}: {name}");
 
@@ -4736,7 +4911,9 @@ mod tests {
 
         /// A refused configuration sends nothing: the reason is local.
         #[tokio::test]
+        #[serial_test::serial]
         async fn a_refused_witness_configuration_reaches_no_endpoint() {
+            stellar_agent_test_support::keyring_mock::install().unwrap();
             let primary = endpoint(LEDGER).start().await;
             let outcome = submit_with(
                 SigningPath::Single,
@@ -4754,7 +4931,9 @@ mod tests {
         }
 
         #[tokio::test]
+        #[serial_test::serial]
         async fn rule_horizon_uses_witnessed_ledger() {
+            stellar_agent_test_support::keyring_mock::install().unwrap();
             let horizon = HorizonCheck {
                 valid_until: 1101,
                 max_horizon: 100,
@@ -4789,7 +4968,9 @@ mod tests {
         /// The same pair admits a horizon of exactly the maximum from the
         /// lower height.
         #[tokio::test]
+        #[serial_test::serial]
         async fn a_rule_horizon_at_the_maximum_from_the_lower_ledger_signs() {
+            stellar_agent_test_support::keyring_mock::install().unwrap();
             let path = SigningPath::Single;
             let horizon = HorizonCheck {
                 valid_until: 1100,
@@ -4939,7 +5120,9 @@ mod tests {
         /// deadline, never reaches a signature: the lookups precede the last
         /// witness check, which refuses. The cases run side by side.
         #[tokio::test]
+        #[serial_test::serial]
         async fn a_key_lookup_delayed_past_the_freshness_limit_refuses_before_signing() {
+            stellar_agent_test_support::keyring_mock::install().unwrap();
             let (quorum_stale, rule_signer_stale, quorum_late, rule_signer_late) = tokio::join!(
                 submit_with_slow_key(LookupPath::Quorum, LOOKUP_OUTLASTS_OBSERVATION),
                 submit_with_slow_key(LookupPath::RuleSigner, LOOKUP_OUTLASTS_OBSERVATION),
@@ -5143,14 +5326,18 @@ mod tests {
         /// A quorum signer's signature that outlasts the deadline is cut at
         /// it: no further signature, nothing sent.
         #[tokio::test]
+        #[serial_test::serial]
         async fn a_quorum_signature_past_the_deadline_is_cut_and_nothing_is_sent() {
+            stellar_agent_test_support::keyring_mock::install().unwrap();
             assert_auth_signature_cut(SigningArm::Quorum).await;
         }
 
         /// A rule signer's signature that outlasts the deadline is cut at it:
         /// no further signature, nothing sent.
         #[tokio::test]
+        #[serial_test::serial]
         async fn a_rule_signer_signature_past_the_deadline_is_cut_and_nothing_is_sent() {
+            stellar_agent_test_support::keyring_mock::install().unwrap();
             assert_auth_signature_cut(SigningArm::RuleSigner).await;
         }
 
@@ -5158,7 +5345,9 @@ mod tests {
         /// is cut at it: its delegated entry and the envelope are not signed,
         /// and nothing is sent.
         #[tokio::test]
+        #[serial_test::serial]
         async fn a_delegated_signature_past_the_deadline_is_cut_and_nothing_is_sent() {
+            stellar_agent_test_support::keyring_mock::install().unwrap();
             assert_auth_signature_cut(SigningArm::Delegated).await;
         }
 
@@ -5167,7 +5356,9 @@ mod tests {
         /// envelope is not signed, nothing is re-simulated, and nothing is
         /// sent.
         #[tokio::test]
+        #[serial_test::serial]
         async fn a_delegated_entry_signature_past_the_deadline_is_cut_and_nothing_is_sent() {
+            stellar_agent_test_support::keyring_mock::install().unwrap();
             let outcome =
                 submit_with_slow_signature(SigningArm::Delegated, SlowCall::DelegatedEntry).await;
 
@@ -5258,7 +5449,9 @@ mod tests {
         /// envelope is neither signed nor sent. The smart account's entry and
         /// its delegated entry are signed before.
         #[tokio::test]
+        #[serial_test::serial]
         async fn an_envelope_signature_past_the_deadline_is_cut_and_nothing_is_sent() {
+            stellar_agent_test_support::keyring_mock::install().unwrap();
             let outcome = submit_with_late_send(Some(PAST_THE_DEADLINE), None).await;
 
             assert_deadline_refusal(&outcome, "sign_envelope");
@@ -5274,7 +5467,9 @@ mod tests {
         /// nothing. Every signature is made, and the envelope signer's key is
         /// the one read before the signing boundary.
         #[tokio::test]
+        #[serial_test::serial]
         async fn a_pre_send_step_past_the_deadline_sends_nothing() {
+            stellar_agent_test_support::keyring_mock::install().unwrap();
             let outcome = submit_with_late_send(None, Some(PAST_THE_DEADLINE)).await;
 
             assert_deadline_refusal(&outcome, "send_endpoint_identity");

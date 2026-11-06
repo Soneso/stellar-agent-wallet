@@ -7,6 +7,10 @@ The chain and endpoints come from the resolved profile. Optional `--network` mus
 Optional RPC flags override testnet endpoints; a mainnet profile refuses either RPC flag, including equal values.
 Without a secondary flag, the profile's `secondary_rpc_url` applies. RPC flags refuse URLs containing credentials.
 
+Only the endpoints stored in the profile authorize charge closure. Endpoint overrides can bound signatures but cannot close charges.
+
+Environment variables and programmatic overlays do not change which endpoints authorize charge closure.
+
 Mainnet signers must match `mcp_signer_default.account`, including both signers on `execute`. A placeholder or malformed pin refuses before signing.
 
 The `smart-account` command group (also available under the shorter alias `sa`) governs an on-chain OpenZeppelin smart-account: its context rules, its signer sets and thresholds, the policy contracts attached to each rule, and the supporting infrastructure (verifier registry, multicall router registry, upgrade timelock). It also submits multicall bundles through the registered router.
@@ -926,7 +930,27 @@ Lists the profile's signed smart-account intents from the verified window state.
 
 Each entry carries `intent_id`, `status`, `auth_address` redacted to its first and last five characters, `legs`, `greatest_expiration_ledger`, `admitted_at_ms`, `bound_tx_hash` when bound, and `accounting_horizon`.
 
-`accounting_horizon` is `open`: the intent counts against the caps. From its first signer call on, nothing releases it.
+The intent view reports the accounting horizon, retention boundary, operation purpose, and schedule terminal state without changing state.
+
+`accounting_horizon` is `open` for executable or unclassified authority. Otherwise it is the admitted accounting horizon in milliseconds. `retained_until_ms` is the separate inclusive retention boundary.
+
+A bounded invocation charge closes when a later policy check or admission witnesses both profile endpoints above every authorization and envelope bound.
+
+Each queried window counts a closed charge through the later of its observation plus that window and its admitted accounting horizon.
+
+A closed intent record remains until more than one week has passed since its observation.
+
+A schedule charge closes when both endpoints, above every authorization expiration, report its operation done or unset.
+
+Intents without an authenticated purpose remain open. Calls whose authorization tree names `approve`, `increase_allowance` or `approve_for_all` retain their charges without closure by authorization expiry.
+
+Reset refuses while an intent remains open or retained. A closed and pruned intent does not block reset.
+
+An open intent without an authenticated purpose permanently blocks reset for this profile. Continue with a new profile.
+
+Retained intents close only through the profile's stored secondary endpoint. Add one to the profile.
+
+The profile's stored endpoint configuration is unreadable. Retained intents close only through stored endpoints that load.
 
 ### `smart-account register-multicall`
 
@@ -973,6 +997,10 @@ Schedule, cancel, execute, and list pending operations on an OpenZeppelin timelo
 Without `--secondary-rpc-url`, the profile secondary applies. A configured mainnet secondary requires its provider attestation and a host distinct from the primary. If neither source supplies a secondary, `list-pending` reads through the primary alone.
 
 Smart-account writes require a secondary RPC on the same network. Signing refuses unavailable or disagreeing ledger observations. The expiry bound assumes at least one independently operated endpoint reports the chain honestly. Ledger observations may differ by at most two in either order. Signature expiry is 100 ledgers beyond the lower observation.
+
+Timelock envelopes carry an exact maximum ledger before signing. The maximum ledger is exclusive.
+
+See [signed intent closure](#smart-account-list-intents) for schedule closure and retained authority.
 
 #### `smart-account timelock schedule`
 

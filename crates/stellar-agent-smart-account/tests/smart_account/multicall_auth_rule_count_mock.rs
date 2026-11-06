@@ -186,7 +186,9 @@ async fn submit(
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn three_rules_for_two_contexts_are_refused_before_send() {
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let (result, sends) = submit(3).await;
     assert_eq!(sends, 0);
     match result {
@@ -210,13 +212,17 @@ async fn three_rules_for_two_contexts_are_refused_before_send() {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn one_rule_expands_across_two_contexts_and_reaches_send() {
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let (result, sends) = submit(1).await;
     assert_eq!(sends, 1, "single rule must reach send: {result:?}");
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn two_rules_cover_two_contexts_and_reach_send() {
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let (result, sends) = submit(2).await;
     assert_eq!(sends, 1, "exact coverage must reach send: {result:?}");
 }

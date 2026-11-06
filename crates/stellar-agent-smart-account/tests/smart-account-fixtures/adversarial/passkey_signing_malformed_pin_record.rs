@@ -69,7 +69,9 @@ fn pin() -> ExecutableRefPin {
 /// error routed to `DriftCheckUnavailable`, before any ceremony, whether or
 /// not the single-verifier override is set.
 #[tokio::test]
+#[serial_test::serial]
 async fn malformed_pin_record_routes_to_drift_check_unavailable() {
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let mut long_tag = pin();
     long_tag.tag = "t".repeat(65);
     let mut disagreeing = pin();
@@ -180,7 +182,9 @@ async fn malformed_pin_record_routes_to_drift_check_unavailable() {
 /// ceremony and any RPC, whether or not the single-verifier override is set.
 /// No override admits an incomplete record.
 #[tokio::test]
+#[serial_test::serial]
 async fn an_incomplete_pin_record_refuses_passkey_signing_before_any_ceremony() {
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     for accept_single_verifier in [false, true] {
         let (audit_writer, audit_log_path, dir) = tmp_audit_writer();
         let smart_account_strkey = format!("{}", stellar_strkey::Contract([0u8; 32]));

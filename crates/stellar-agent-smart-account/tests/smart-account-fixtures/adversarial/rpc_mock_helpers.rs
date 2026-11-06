@@ -1083,9 +1083,9 @@ pub fn manager_two_url(
         Duration::from_secs(5),
         "stellar:testnet".to_owned(),
     )
-    .with_intent_admission(std::sync::Arc::new(
-        stellar_agent_smart_account::signing::intent_test_helpers::no_value_admission_owned(),
-    ));
+    .with_intent_admission(
+        stellar_agent_smart_account::signing::intent_test_helpers::shared_no_value_admission(),
+    );
     SignersManager::new(config).expect("SignersManager::new must succeed")
 }
 

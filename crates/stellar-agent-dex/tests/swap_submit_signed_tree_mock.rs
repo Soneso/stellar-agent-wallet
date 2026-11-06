@@ -159,6 +159,8 @@ impl Outcome {
 async fn swap(
     transfer: impl Fn() -> SorobanAuthorizedInvocation + Send + Sync + 'static,
 ) -> Outcome {
+    static KEYRING: std::sync::Once = std::sync::Once::new();
+    KEYRING.call_once(|| stellar_agent_test_support::keyring_mock::install().unwrap());
     let endpoint = AuthTreeRpc::new(TESTNET_PASSPHRASE, wallet())
         .account(&account_id_for_seed(SEED))
         .instance(

@@ -94,13 +94,31 @@ pub use echo_id_responder::SubmissionEchoResponder;
 pub use echo_id_responder::{EchoIdResponder, KeyedLedgerEntriesResponder, rpc_request_count};
 pub use env_guard::{ProfileEnvVarGuard, StellarAgentHomeGuard};
 pub use log_capture::{
-    CaptureWriter, RedactionStrictSubscriber, WarningCapture, inert_dispatcher, with_captured_logs,
+    CaptureWriter, RAW_TRANSPORT_LOG_TARGET, RedactionStrictSubscriber, WarningCapture,
+    inert_dispatcher, with_captured_logs,
 };
 pub use secret_patterns::assert_no_secret_bytes;
 #[cfg(feature = "test-helpers")]
 pub use signed_envelope::{
     SignedTestEnvelope, SignedTestEnvelopeBuilder, send_transaction_hash_hex, transaction_hash_hex,
 };
+
+/// Returns the hexadecimal SHA-256 digest of a fixture file.
+///
+/// # Panics
+/// Panics if the fixture file cannot be read.
+#[cfg(feature = "test-helpers")]
+#[must_use]
+#[allow(
+    clippy::expect_used,
+    reason = "an unreadable fixture fails the calling test"
+)]
+pub fn file_sha256(path: &std::path::Path) -> String {
+    use sha2::{Digest as _, Sha256};
+    signed_envelope::hex(&Sha256::digest(
+        std::fs::read(path).expect("fixture file is readable"),
+    ))
+}
 
 /// Names the second testnet Soroban RPC endpoint of the live suites.
 pub const TESTNET_SECONDARY_RPC_URL_ENV: &str = "STELLAR_AGENT_TESTNET_SECONDARY_RPC_URL";

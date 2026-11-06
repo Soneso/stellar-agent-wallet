@@ -64,9 +64,9 @@ fn manager_with_url(
         Duration::from_secs(5),
         "stellar:testnet".to_owned(),
     )
-    .with_intent_admission(std::sync::Arc::new(
-        stellar_agent_smart_account::signing::intent_test_helpers::no_value_admission_owned(),
-    ));
+    .with_intent_admission(
+        stellar_agent_smart_account::signing::intent_test_helpers::shared_no_value_admission(),
+    );
     SignersManager::new(config).expect("SignersManager::new must succeed with valid URL")
 }
 
@@ -86,7 +86,9 @@ fn zero_sc_address() -> ScAddress {
 /// no network I/O occurs — if RPC were called, the test would fail with
 /// a connection error, not `SignerSetMissingBaseline`.
 #[tokio::test]
+#[serial_test::serial]
 async fn verify_returns_missing_baseline_on_empty_audit_log() {
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let (audit_writer, audit_log_path, _dir) = tmp_audit_writer();
 
     // Intentionally unreachable URL — any RPC attempt would return a
@@ -114,7 +116,9 @@ async fn verify_returns_missing_baseline_on_empty_audit_log() {
 
 /// The wire code on `SignerSetMissingBaseline` is `"sa.signer_set_missing_baseline"`.
 #[tokio::test]
+#[serial_test::serial]
 async fn missing_baseline_wire_code_is_correct() {
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let (audit_writer, audit_log_path, _dir) = tmp_audit_writer();
 
     let manager = manager_with_url("http://127.0.0.1:1", audit_writer, audit_log_path);
@@ -145,7 +149,9 @@ async fn missing_baseline_wire_code_is_correct() {
 /// Rule 0 (bootstrap rule) and rule 1 are independent in the audit log.
 /// Missing baseline for rule 1 returns the error even if rule 0 has a baseline.
 #[tokio::test]
+#[serial_test::serial]
 async fn missing_baseline_is_per_rule() {
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let (audit_writer, audit_log_path, _dir) = tmp_audit_writer();
 
     // Write a baseline for rule 0 (bootstrap rule is skipped in divergence checks

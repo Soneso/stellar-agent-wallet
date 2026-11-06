@@ -55,9 +55,9 @@ fn config_for_server(server: &MockServer) -> ContextRuleManagerConfig {
         std::time::Duration::from_secs(5),
         CHAIN_ID.to_owned(),
     )
-    .with_intent_admission(std::sync::Arc::new(
-        stellar_agent_smart_account::signing::intent_test_helpers::no_value_admission_owned(),
-    ))
+    .with_intent_admission(
+        stellar_agent_smart_account::signing::intent_test_helpers::shared_no_value_admission(),
+    )
 }
 
 /// A rule manager over `server` with a signers manager over the same
@@ -121,7 +121,9 @@ fn simulate_error_response(error_msg: &str) -> serde_json::Value {
 /// the RPC-observed `latest_ledger` and an empty `pin_result`: the
 /// definition references no verifier or policy contract to pin.
 #[tokio::test]
+#[serial_test::serial]
 async fn success_shape_returns_pin_result_and_latest_ledger() {
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     use stellar_xdr::{Limits, ScVal, WriteXdr};
 
     use stellar_xdr::{ContractId, Hash, ScAddress};
@@ -178,7 +180,9 @@ async fn success_shape_returns_pin_result_and_latest_ledger() {
 /// `SaError::DeploymentFailed { phase: "simulate", .. }` — `simulate_install_rule`
 /// does not swallow or misclassify the RPC-reported simulate failure.
 #[tokio::test]
+#[serial_test::serial]
 async fn simulate_error_propagates_as_deployment_failed() {
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     use stellar_xdr::{ContractId, Hash, ScAddress};
 
     let server = MockServer::start().await;
@@ -226,7 +230,9 @@ async fn simulate_error_propagates_as_deployment_failed() {
 /// (plus the `getLedgerEntries` account fetch) — it does not sign or submit,
 /// and does not re-simulate.
 #[tokio::test]
+#[serial_test::serial]
 async fn does_not_modify_install_rule_path_no_extra_simulate_calls() {
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     use stellar_xdr::{ContractId, Hash, Limits, ScAddress, ScVal, WriteXdr};
 
     let server = MockServer::start().await;
@@ -270,7 +276,9 @@ async fn does_not_modify_install_rule_path_no_extra_simulate_calls() {
 /// Without a signers manager `simulate_install_rule` refuses with
 /// `sa.signers_manager_not_configured`, naming no rule, before any RPC.
 #[tokio::test]
+#[serial_test::serial]
 async fn a_simulation_without_a_signers_manager_refuses_before_any_rpc() {
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     use stellar_xdr::{ContractId, Hash, ScAddress};
 
     let server = MockServer::start().await;

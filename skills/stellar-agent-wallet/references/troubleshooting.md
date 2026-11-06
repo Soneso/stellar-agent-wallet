@@ -849,3 +849,19 @@ query authorization status and reconcile any known server transaction.
 - Environment or key problems (`keyring.*`, `mcp.disabled_per_profile`,
   `audit.chain_key_unavailable`, other non-zero startup exits): operator-side;
   not agent-recoverable at runtime.
+
+## Retained smart-account charges
+
+Reset refuses while an intent remains open or retained. A closed and pruned intent does not block reset.
+
+An open intent without an authenticated purpose permanently blocks reset for this profile. Continue with a new profile.
+
+Retained intents close only through the profile's stored secondary endpoint. Add one to the profile.
+
+The profile's stored endpoint configuration is unreadable. Retained intents close only through stored endpoints that load.
+
+Snapshots containing signed intents or intent links use version 9. Records missing required intent fields refuse as unreadable. Readers that cannot account for the format refuse current and prepared snapshots.
+
+An unavailable observation leaves retained charges unchanged while the policy check continues. Read only tools and preparation requests acquire no charge closure witnesses.
+
+Signing through a supplied secondary endpoint does not give that endpoint authority to close retained intents.

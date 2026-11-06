@@ -136,7 +136,9 @@ fn write_rule_created(writer: &Arc<Mutex<AuditWriter>>, rule_id: u32, sa_redacte
 /// Rule 1 is NOT probed by the enumeration — Count=1 causes early-exit.
 /// But the audit log has rule 1 as installed → audit_log_missing = [1].
 #[tokio::test]
+#[serial_test::serial]
 async fn t11_audit_log_missing_fires_on_rpc_drop() {
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let server = MockServer::start().await;
     let smart_account = addr(0x00); // zero address → CAAAA...ABSC4
 
@@ -170,9 +172,9 @@ async fn t11_audit_log_missing_fires_on_rpc_drop() {
         std::time::Duration::from_secs(5),
         CHAIN_ID.to_owned(),
     )
-    .with_intent_admission(std::sync::Arc::new(
-        stellar_agent_smart_account::signing::intent_test_helpers::no_value_admission_owned(),
-    ))
+    .with_intent_admission(
+        stellar_agent_smart_account::signing::intent_test_helpers::shared_no_value_admission(),
+    )
     .with_audit_writer(Arc::clone(&audit_writer));
 
     let manager = ContextRuleManager::new(config).expect("ContextRuleManager::new must succeed");
@@ -211,7 +213,9 @@ async fn t11_audit_log_missing_fires_on_rpc_drop() {
 /// Both rules 0 and 1 are in the audit log; the RPC serves Count=2 and both rules.
 /// No desync → `audit_log_missing.is_empty()`.
 #[tokio::test]
+#[serial_test::serial]
 async fn t11b_no_audit_log_missing_when_in_sync() {
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let server = MockServer::start().await;
     let smart_account = addr(0x00);
 
@@ -245,9 +249,9 @@ async fn t11b_no_audit_log_missing_when_in_sync() {
         std::time::Duration::from_secs(5),
         CHAIN_ID.to_owned(),
     )
-    .with_intent_admission(std::sync::Arc::new(
-        stellar_agent_smart_account::signing::intent_test_helpers::no_value_admission_owned(),
-    ))
+    .with_intent_admission(
+        stellar_agent_smart_account::signing::intent_test_helpers::shared_no_value_admission(),
+    )
     .with_audit_writer(Arc::clone(&audit_writer));
 
     let manager = ContextRuleManager::new(config).expect("ContextRuleManager::new must succeed");

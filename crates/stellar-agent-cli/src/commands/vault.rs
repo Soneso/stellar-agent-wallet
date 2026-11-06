@@ -472,6 +472,7 @@ where
     // used to validate the amounts length above, and zips 1:1 against the
     // SAME `vault_args.amounts_desired` vector later placed into
     // `VaultDepositArgs` (single-decode invariant).
+    crate::commands::submission_record::observe_intents(&profile, &profile_name).await;
     let policy_engine =
         match build_v1_policy_engine("vault", &profile.policy.engine, &profile, &profile_name) {
             Ok(pe) => pe,
@@ -886,6 +887,7 @@ where
     // ── Operator policy evaluation (value-carrying; mirrors the MCP
     // `stellar_defindex_vault_withdraw` twin's `dispatch_gate_with_value`
     // mechanism) ──────────────────────────────────────────────────────────
+    crate::commands::submission_record::observe_intents(&profile, &profile_name).await;
     let policy_engine =
         match build_v1_policy_engine("vault", &profile.policy.engine, &profile, &profile_name) {
             Ok(pe) => pe,
@@ -1640,5 +1642,80 @@ mod tests {
              bypassed, short-circuited, or the pre-flight fired at the wrong \
              point"
         );
+    }
+    #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial]
+    async fn early_observation_precedes_window_gate() {
+        use crate::commands::submission_record::intent_gate_fixture::{IntentGateState, home};
+        for withdraw in [false, true] {
+            let (_home, _guard) = home();
+            let vault = stellar_strkey::Contract([1; 32]).to_string().to_string();
+            let asset = stellar_strkey::Contract([2; 32]).to_string().to_string();
+            let (key_xdr, entry_xdr) =
+                defindex_vault_instance_key_and_entry_xdr(&vault, DEFINDEX_VAULT_WASM_HASH, &asset);
+            let primary = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(VaultInstanceResponder { key_xdr, entry_xdr })
+                .mount(&primary)
+                .await;
+            let name = "intent-vault";
+            let mut profile =
+                Profile::builder_testnet_named(name, "signer", "account", "nonce", name)
+                    .rpc_url(primary.uri())
+                    .build();
+            let state = IntentGateState::seed(name, &mut profile).await;
+            for after in [false, false, true] {
+                if after {
+                    state.after_retention();
+                }
+                let before = state.bytes();
+                crate::common::render::take_rendered_for_test();
+                let code = if withdraw {
+                    run_withdraw_with_dependencies(
+                        &VaultWithdrawCliArgs {
+                            profile: Some(name.into()),
+                            vault: vault.clone(),
+                            from: asset.clone(),
+                            shares: 1_000_000,
+                            min_amounts_out: vec![900_000],
+                            override_upgradable: false,
+                            secondary_rpc_url: None,
+                        },
+                        |_| Ok(profile.clone()),
+                        || Ok(()),
+                    )
+                    .await
+                } else {
+                    run_deposit_with_dependencies(
+                        &VaultDepositCliArgs {
+                            profile: Some(name.into()),
+                            vault: vault.clone(),
+                            from: asset.clone(),
+                            amounts_desired: vec![1_000_000],
+                            amounts_min: vec![900_000],
+                            invest: false,
+                            override_upgradable: false,
+                            secondary_rpc_url: None,
+                        },
+                        |_| Ok(profile.clone()),
+                        || Ok(()),
+                    )
+                    .await
+                };
+                assert_eq!(code, 1);
+                assert_eq!(
+                    crate::test_rpc::last_rendered()["error"]["code"],
+                    if after {
+                        "audit.chain_key_unavailable"
+                    } else {
+                        "policy.deny.rate_limit_exceeded"
+                    }
+                );
+                state.assert_closed(&profile, u32::from(!after)).await;
+                if after {
+                    assert_eq!(state.bytes(), before);
+                }
+            }
+        }
     }
 }

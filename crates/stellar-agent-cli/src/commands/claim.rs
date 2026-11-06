@@ -970,6 +970,22 @@ async fn evaluate_staged_claim_policy(
         .and_then(|decoded| decoded.get("total_fee_stroops"))
         .and_then(serde_json::Value::as_u64)
         .and_then(|fee| u32::try_from(fee).ok());
+    crate::commands::submission_record::observe_and_refresh_intents(
+        profile,
+        profile_name,
+        policy_engine.as_ref(),
+    )
+    .await
+    .map_err(|error| {
+        Envelope::<()>::err_raw(
+            if error.chain_validation_error().is_some() {
+                error.submission_code()
+            } else {
+                "policy.engine_unavailable"
+            },
+            error.to_string(),
+        )
+    })?;
     let effects = dispatch_staged_claim_gate(
         policy_engine.as_ref(),
         profile,
@@ -1224,6 +1240,7 @@ where
         Ok(fee) => fee,
         Err(e) => return failed(Envelope::<()>::err(&e)),
     };
+    crate::commands::submission_record::observe_intents(profile, &resolved.name).await;
     let claim_effects =
         match evaluate_claim_policy(&built, chain_id, profile, &resolved.name, total_fee) {
             Ok(effects) => effects,
@@ -4929,6 +4946,64 @@ mod tests {
             .await;
 
             assert_build_only_reserve_refusal(&run);
+        }
+    }
+    #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial]
+    async fn early_observation_precedes_window_gate() {
+        use crate::commands::submission_record::intent_gate_fixture::{IntentGateState, home};
+        for staged in [false, true] {
+            let (_home, _guard) = home();
+            let primary = mount_claim_rpc(SOURCE_G).await;
+            let name = "intent-claim";
+            let mut profile =
+                Profile::builder_testnet_named(name, "signer", SOURCE_G, "nonce", name)
+                    .rpc_url(primary.uri())
+                    .build();
+            let state = IntentGateState::seed(name, &mut profile).await;
+            let mut args = one_envelope_args(&primary, "100");
+            args.profile = Some(name.into());
+            args.build_only = false;
+            for after in [false, false, true] {
+                if after {
+                    state.after_retention();
+                }
+                let before = state.bytes();
+                if staged {
+                    let result = evaluate_staged_claim_policy(
+                        None,
+                        &NetworkContext::from_profile(&profile),
+                        &args,
+                        &claim_envelope_b64(),
+                        &profile,
+                        name,
+                    )
+                    .await;
+                    assert_eq!(result.is_ok(), after);
+                    if let Err(error) = result {
+                        assert_eq!(error.error.unwrap().code, "policy.deny.rate_limit_exceeded");
+                    }
+                } else {
+                    let mut out = Vec::new();
+                    let code =
+                        run_with_dependencies(&args, |_| Ok(profile.clone()), || Ok(()), &mut out)
+                            .await;
+                    assert_eq!(code, 1);
+                    let value: serde_json::Value = serde_json::from_slice(&out).unwrap();
+                    assert_eq!(
+                        value["error"]["code"],
+                        if after {
+                            "audit.chain_key_unavailable"
+                        } else {
+                            "policy.deny.rate_limit_exceeded"
+                        }
+                    );
+                }
+                state.assert_closed(&profile, u32::from(!after)).await;
+                if after {
+                    assert_eq!(state.bytes(), before);
+                }
+            }
         }
     }
 }

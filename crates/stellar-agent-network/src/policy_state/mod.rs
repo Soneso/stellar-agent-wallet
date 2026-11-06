@@ -206,8 +206,8 @@ pub use store::{
     OwnerResetSignature, POLICY_STATE_KEY_FIELD, PersistedWindowStore, RECONCILE_BUDGET,
     RECONCILE_MIN_AGE_MS, REPORTED_SUCCESS_CODE, RETENTION_EXPIRED_CODE, ReconcileFailure,
     ReconcileFailureKind, ReconcileReport, ReportedAnswer, ResetConsent, ResetError, ResetOutcome,
-    ResetRecord, SettledSubmission, SignedIntentLegView, SignedIntentView, StateDefect,
-    SubmissionAnchor, SubmissionHold, UnrecordedAnswer, deliver_accounting_expiries,
+    ResetRecord, ScheduleTerminal, SettledSubmission, SignedIntentLegView, SignedIntentView,
+    StateDefect, SubmissionAnchor, SubmissionHold, UnrecordedAnswer, deliver_accounting_expiries,
     deliver_accounting_expiry, drain_accounting_obligations, project_accounting_expiries,
 };
 
@@ -304,9 +304,12 @@ pub enum WindowStoreError {
     },
     /// The window holds signed authority that cannot be reset.
     #[error(
-        "the spending window holds signed intents (authorization exposed, submission unknown: {exposed}; bound: {bound}); the reset refuses while any stands"
+        "the spending window holds signed intents (authorization exposed, submission unknown: {exposed}; bound: {bound}); the reset refuses while any stands.{separator}{explanation}",
+        separator = if .explanation.is_empty() { "" } else { " " }
     )]
     SignedIntentLive {
+        /// Applicable purpose and endpoint explanations.
+        explanation: String,
         /// The number of intents without a bound submission.
         exposed: usize,
         /// The number of intents with a bound submission.
@@ -568,6 +571,27 @@ impl WindowStoreError {
             format!("{refusal}. {NO_RECOVERY_NOTICE}")
         } else {
             refusal
+        }
+    }
+}
+
+#[cfg(test)]
+mod display_tests {
+    use super::WindowStoreError;
+
+    #[test]
+    fn signed_intent_live_explanation_has_only_its_required_space() {
+        let base = "the spending window holds signed intents (authorization exposed, submission unknown: 1; bound: 2); the reset refuses while any stands.";
+        for (explanation, expected) in [
+            ("", base.to_owned()),
+            ("Retained intent.", format!("{base} Retained intent.")),
+        ] {
+            let error = WindowStoreError::SignedIntentLive {
+                explanation: explanation.into(),
+                exposed: 1,
+                bound: 2,
+            };
+            assert_eq!(error.to_string(), expected);
         }
     }
 }

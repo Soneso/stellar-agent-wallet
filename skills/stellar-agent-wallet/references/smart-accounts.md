@@ -373,3 +373,21 @@ When a smart-account authorizes a call into an external contract (a DeFi adapter
 - One or more authorizing context-rule ids bind the auth digest; a single rule id is auto-expanded to match the number of invocation contexts.
 
 This is the same convention the higher-level value-transfer and DeFi verbs use under the hood when the source is a smart-account.
+
+## Retained smart-account charges
+
+A bounded invocation charge closes when a later policy check or admission witnesses both profile endpoints above every authorization and envelope bound.
+
+A schedule charge closes when both endpoints, above every authorization expiration, report its operation done or unset.
+
+Intents without an authenticated purpose remain open. Calls whose authorization tree names `approve`, `increase_allowance` or `approve_for_all` retain their charges without closure by authorization expiry.
+
+Timelock envelopes carry an exact maximum ledger before signing. The maximum ledger is exclusive.
+
+Each queried window counts a closed charge through the later of its observation plus that window and its admitted accounting horizon.
+
+A closed intent record remains until more than one week has passed since its observation.
+
+The intent view reports the accounting horizon, retention boundary, operation purpose, and schedule terminal state without changing state.
+
+`accounting_horizon` is `open` for executable or unclassified authority. Otherwise it is the admitted accounting horizon in milliseconds. `retained_until_ms` is the separate inclusive retention boundary.

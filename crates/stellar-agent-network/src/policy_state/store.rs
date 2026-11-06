@@ -19,6 +19,7 @@ use stellar_agent_core::policy::DenyReason;
 use stellar_agent_core::policy::pin::{self, PinError, PinScope, PinState};
 use stellar_agent_core::policy::v1::criteria::state_store::{
     CLOCK_SKEW_TOLERANCE_MS, PolicyStateStore, StateKey, StateStoreError, WindowEntry,
+    exposure_is_live,
 };
 use stellar_agent_core::policy::v1::signature::{WindowResetStatement, window_reset_digest};
 use stellar_agent_core::profile::caip2::Caip2;
@@ -36,6 +37,8 @@ use crate::endpoint_identity::MainnetOracle;
 use crate::policy_state::ledger::{self, WireAuthorization, WireAuthorizationHold};
 use crate::policy_state::lock::WindowStoreLock;
 use crate::policy_state::{NO_RECOVERY_NOTICE, WindowStoreError};
+use crate::signed_intent::IntentPurpose;
+use crate::signing::LedgerWitnessCapability;
 use crate::transaction_record::TransactionRecord;
 
 type HmacSha256 = Hmac<Sha256>;
@@ -52,7 +55,8 @@ const HMAC_CONTEXT_LABEL: &[u8] = b"stellar-agent-policy-window/v1/body\x00";
 /// milliseconds. Entries older than `now_ms - RETENTION_MS` are pruned on
 /// every write, so the store never grows unbounded even if a criterion's
 /// window shrinks or a rule is removed.
-pub(super) const RETENTION_MS: u64 = 604_800 * 1_000;
+pub(super) const RETENTION_MS: u64 =
+    stellar_agent_core::policy::v1::criteria::per_period_cap::MAX_SUPPORTED_WINDOW_SECS * 1_000;
 
 /// Bounds the chain-time observation independently of the transport timeout.
 const LEDGER_OBSERVATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
@@ -1186,8 +1190,42 @@ pub struct SignedIntentView {
     /// The bound transaction hash, when present.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bound_tx_hash: Option<String>,
-    /// The accounting horizon, always open.
+    /// The admitted horizon in milliseconds, or open.
     pub accounting_horizon: String,
+    /// The first authenticated closure observation.
+    pub expiry_observed_at_ms: Option<u64>,
+    /// The inclusive retention boundary in milliseconds.
+    pub retained_until_ms: Option<u64>,
+    /// The authenticated operation purpose, when known.
+    pub purpose: Option<IntentPurpose>,
+    /// The agreed terminal state for a closed schedule.
+    pub schedule_terminal: Option<ScheduleTerminal>,
+    /// Applicable reasons that retained authority blocks reset.
+    pub reset_explanations: Vec<String>,
+}
+
+/// Explains purpose and stored endpoint requirements without acquiring evidence.
+fn intent_reset_explanations(
+    permanent: bool,
+    open: bool,
+    endpoints: Option<&stellar_agent_core::profile::loader::OnDiskRpcEndpoints>,
+) -> Vec<&'static str> {
+    let mut messages = Vec::new();
+    if permanent {
+        messages.push("An open intent without an authenticated purpose permanently blocks reset for this profile. Continue with a new profile.");
+    }
+    if open {
+        match endpoints {
+            Some(endpoints) if endpoints.secondary_rpc_url.is_none() => messages.push(
+                "Retained intents close only through the profile's stored secondary endpoint. Add one to the profile.",
+            ),
+            None => messages.push(
+                "The profile's stored endpoint configuration is unreadable. Retained intents close only through stored endpoints that load.",
+            ),
+            Some(_) => {}
+        }
+    }
+    messages
 }
 
 impl SignedIntentView {
@@ -1241,6 +1279,25 @@ pub(super) struct SignedIntentRecord {
     host_invocation_sha256: [u8; 32],
     subjects: Vec<crate::signed_intent::SubjectFacts>,
     greatest_expiration_ledger: Option<u32>,
+    #[serde(deserialize_with = "required_nullable")]
+    purpose: Option<IntentPurpose>,
+    #[serde(deserialize_with = "required_nullable")]
+    envelope_max_ledger: Option<u32>,
+    admitted_window_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    witness_lower: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    witness_upper: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    expiry_observed_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    accounting_until_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    schedule_terminal: Option<ScheduleTerminal>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    schedule_read_primary_ledger: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    schedule_read_secondary_ledger: Option<u32>,
     legs: Vec<IntentLeg>,
     admitted_at_ms: u64,
     generation: u64,
@@ -1257,6 +1314,24 @@ pub(super) struct SignedIntentRecord {
     cancel_token_sha256: Option<[u8; 32]>,
 }
 
+fn required_nullable<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::Deserialize<'de>,
+{
+    <Option<T> as serde::Deserialize>::deserialize(deserializer)
+}
+
+/// The terminal state both schedule probes report.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScheduleTerminal {
+    /// The operation executes.
+    Done,
+    /// The operation has no stored schedule.
+    Unset,
+}
+
 impl SignedIntentRecord {
     fn facts(&self) -> crate::signed_intent::PlanFacts {
         crate::signed_intent::PlanFacts {
@@ -1267,6 +1342,8 @@ impl SignedIntentRecord {
             host_invocation_sha256: self.host_invocation_sha256,
             subjects: self.subjects.clone(),
             greatest_expiration_ledger: self.greatest_expiration_ledger,
+            purpose: self.purpose.clone(),
+            envelope_max_ledger: self.envelope_max_ledger,
         }
     }
     fn same_legs(&self, entries: &[WindowEntry]) -> bool {
@@ -1502,6 +1579,8 @@ pub enum ResetError<E> {
 #[derive(Debug, Clone)]
 pub struct PersistedWindowStore {
     path: PathBuf,
+    profile_name: Option<String>,
+    profile_dir: Option<PathBuf>,
 }
 
 /// What the reset established before either callback runs.
@@ -1648,6 +1727,8 @@ impl PersistedWindowStore {
     pub fn for_profile(profile_name: &str) -> Self {
         Self {
             path: default_policy_window_state_path_for(profile_name),
+            profile_name: Some(profile_name.into()),
+            profile_dir: None,
         }
     }
 
@@ -1657,7 +1738,48 @@ impl PersistedWindowStore {
     #[cfg(any(test, feature = "test-helpers"))]
     #[must_use]
     pub fn at_path(path: PathBuf) -> Self {
-        Self { path }
+        Self {
+            path,
+            profile_name: None,
+            profile_dir: None,
+        }
+    }
+
+    /// Selects the fixture profile directory for file-only provenance checks.
+    #[cfg(any(test, feature = "test-helpers"))]
+    #[must_use]
+    pub fn with_profile_directory(mut self, name: &str, dir: PathBuf) -> Self {
+        self.profile_name = Some(name.into());
+        self.profile_dir = Some(dir);
+        self
+    }
+
+    fn stored_endpoints(
+        &self,
+        profile: &Profile,
+    ) -> Option<stellar_agent_core::profile::loader::OnDiskRpcEndpoints> {
+        let name = self.profile_name.as_deref().or_else(|| {
+            stellar_agent_core::profile::name::derive_profile_name_from_owner_key(profile)
+        })?;
+        let directory = self
+            .profile_dir
+            .clone()
+            .or_else(|| stellar_agent_core::profile::loader::default_profile_dir().ok())?;
+        stellar_agent_core::profile::loader::read_rpc_endpoints_on_disk(name, &directory).ok()
+    }
+
+    fn capability_is_current(
+        &self,
+        profile: &Profile,
+        capability: &LedgerWitnessCapability,
+    ) -> bool {
+        #[cfg(test)]
+        tests::before_capability_check();
+        self.stored_endpoints(profile).is_some_and(|endpoints| {
+            now_ms().is_ok_and(|current| {
+                capability.authorizes(&endpoints, ChainScope::for_chain(profile.chain_id), current)
+            })
+        })
     }
 
     /// Returns `true` if the store file exists on disk.
@@ -1725,10 +1847,17 @@ impl PersistedWindowStore {
                     &leg.bucket,
                     leg.window_secs,
                 );
-                dest.append_exposure(&key, leg.ts_ms, leg.amount, &intent.intent_id, None, None)
-                    .map_err(|error| WindowStoreError::Invalid {
-                        detail: format!("in-memory intent append failed: {error}"),
-                    })?;
+                dest.append_exposure(
+                    &key,
+                    leg.ts_ms,
+                    leg.amount,
+                    &intent.intent_id,
+                    intent.expiry_observed_at_ms,
+                    intent.accounting_until_ms,
+                )
+                .map_err(|error| WindowStoreError::Invalid {
+                    detail: format!("in-memory intent append failed: {error}"),
+                })?;
             }
         }
         for entry in wire.entries {
@@ -1829,6 +1958,11 @@ impl PersistedWindowStore {
         let Some(wire) = self.read_verified_unlocked(profile_name, profile)? else {
             return Ok(Vec::new());
         };
+        let endpoints = self.stored_endpoints(profile);
+        let open = wire
+            .signed_intents
+            .iter()
+            .any(|record| record.expiry_observed_at_ms.is_none());
         Ok(wire
             .signed_intents
             .into_iter()
@@ -1853,7 +1987,23 @@ impl PersistedWindowStore {
                     greatest_expiration_ledger: record.greatest_expiration_ledger,
                     admitted_at_ms: record.admitted_at_ms,
                     bound_tx_hash: record.bound_tx_hash,
-                    accounting_horizon: "open".into(),
+                    accounting_horizon: record
+                        .accounting_until_ms
+                        .map_or_else(|| "open".into(), |t| t.to_string()),
+                    expiry_observed_at_ms: record.expiry_observed_at_ms,
+                    retained_until_ms: record
+                        .expiry_observed_at_ms
+                        .and_then(|t| t.checked_add(RETENTION_MS)),
+                    reset_explanations: intent_reset_explanations(
+                        record.purpose.is_none() && record.expiry_observed_at_ms.is_none(),
+                        open,
+                        endpoints.as_ref(),
+                    )
+                    .iter()
+                    .map(|text| (*text).into())
+                    .collect(),
+                    purpose: record.purpose,
+                    schedule_terminal: record.schedule_terminal,
                 }
             })
             .collect())
@@ -2013,73 +2163,226 @@ impl PersistedWindowStore {
             &self.path,
             &profile.policy_window_state_key_id,
         )?;
+        let existing = self.read_for_inspection_once(profile)?;
+        if existing.is_none() && plan.legs().is_empty() {
+            return Ok(crate::IntentProof::new(None, plan.clone()));
+        }
         let (key, _) = self.load_or_mint_key(profile)?;
         let gen_entry = generation_entry_ref(profile);
-        let mut wire = self.read_verified(profile, &key, &gen_entry)?;
-        if wire.chain_scope != Some(plan.chain_scope()) {
+        let original = self.read_verified(profile, &key, &gen_entry)?;
+        if original.chain_scope != Some(plan.chain_scope()) {
             return Err(WindowStoreError::ChainMismatch);
         }
-        let original = wire.clone();
+        let mut witness = plan
+            .capability()
+            .filter(|capability| self.capability_is_current(profile, capability));
+        loop {
+            let now = now_ms()?;
+            let mut progress = original.clone();
+            let progress_changed = reduce_intent_progress(&mut progress, witness, now, false)?;
+            let mut proposed = progress.clone();
+            let result = install_intent_admission(&mut proposed, plan, now);
+            if witness.is_some_and(|capability| !self.capability_is_current(profile, capability)) {
+                witness = None;
+                continue;
+            }
+            match result {
+                Ok((proof, admission_changed)) => {
+                    if (progress_changed || admission_changed)
+                        && !self.commit_generation_if(
+                            &key,
+                            &gen_entry,
+                            original.clone(),
+                            proposed,
+                            || {
+                                witness.is_none_or(|capability| {
+                                    self.capability_is_current(profile, capability)
+                                })
+                            },
+                        )?
+                    {
+                        witness = None;
+                        continue;
+                    }
+                    return Ok(proof);
+                }
+                Err(refusal) => {
+                    if progress_changed
+                        && !self.commit_generation_if(
+                            &key,
+                            &gen_entry,
+                            original.clone(),
+                            progress,
+                            || {
+                                witness.is_none_or(|capability| {
+                                    self.capability_is_current(profile, capability)
+                                })
+                            },
+                        )?
+                    {
+                        witness = None;
+                        continue;
+                    }
+                    return Err(refusal);
+                }
+            }
+        }
+    }
+
+    /// Commits witnessed progress without admitting or authorizing a signature.
+    ///
+    /// # Errors
+    /// Refuses unverifiable state, inconsistent scope, overflow, or a failed generation commit.
+    pub fn observe_signed_intents(
+        &self,
+        profile: &Profile,
+        capability: &LedgerWitnessCapability,
+    ) -> Result<(), WindowStoreError> {
+        self.ensure_parent_dir()?;
+        let _lock = WindowStoreLock::acquire_for_with_retry(
+            &self.path,
+            &profile.policy_window_state_key_id,
+        )?;
+        let Some(original) = self.read_for_inspection_once(profile)? else {
+            return Ok(());
+        };
         let now = now_ms()?;
-        let entries: Vec<_> = plan
-            .legs()
+        let mut witness = self
+            .capability_is_current(profile, capability)
+            .then_some(capability);
+        let mut progress = original.clone();
+        let mut changed = reduce_intent_progress(&mut progress, witness, now, true)?;
+        let mut key = if changed {
+            Some(
+                crate::keyring::load_hmac_key_32(&profile.policy_window_state_key_id)
+                    .map_err(|e| key_load_error(profile, &e))?,
+            )
+        } else {
+            None
+        };
+        if witness.is_some() && !self.capability_is_current(profile, capability) {
+            witness = None;
+            progress = original.clone();
+            changed = reduce_intent_progress(&mut progress, None, now_ms()?, true)?;
+            if changed && key.is_none() {
+                key = Some(
+                    crate::keyring::load_hmac_key_32(&profile.policy_window_state_key_id)
+                        .map_err(|e| key_load_error(profile, &e))?,
+                );
+            }
+        }
+        if changed {
+            let key =
+                key.ok_or_else(|| intent_invalid("signed intent progress key is unavailable"))?;
+            if !self.commit_generation_if(
+                &key,
+                &generation_entry_ref(profile),
+                original.clone(),
+                progress,
+                || witness.is_none() || self.capability_is_current(profile, capability),
+            )? {
+                let mut retained = original.clone();
+                if reduce_intent_progress(&mut retained, None, now_ms()?, true)? {
+                    self.commit_generation(
+                        &key,
+                        &generation_entry_ref(profile),
+                        original,
+                        retained,
+                    )?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Attempts optional observation before a policy gate reads retained state.
+    ///
+    /// Verification failures remain visible to the gate's required state refresh.
+    pub async fn observe_before_policy(&self, profile: &Profile) {
+        let snapshot = (|| -> Result<Option<WireFile>, WindowStoreError> {
+            self.ensure_parent_dir()?;
+            let _lock = WindowStoreLock::acquire_for_with_retry(
+                &self.path,
+                &profile.policy_window_state_key_id,
+            )?;
+            self.read_for_inspection_once(profile)
+        })();
+        let Ok(Some(snapshot)) = snapshot else {
+            return;
+        };
+        if !snapshot
+            .signed_intents
             .iter()
-            .map(|entry| {
-                WindowEntry::new(
-                    entry.key().clone(),
-                    now,
-                    entry.amount(),
-                    entry.limit().clone(),
-                )
+            .any(|intent| intent.expiry_observed_at_ms.is_none())
+        {
+            return;
+        }
+        let probes = snapshot
+            .signed_intents
+            .iter()
+            .filter_map(|intent| {
+                if intent.expiry_observed_at_ms.is_some() {
+                    return None;
+                }
+                let Some(IntentPurpose::TimelockSchedule {
+                    timelock,
+                    operation_id,
+                }) = &intent.purpose
+                else {
+                    return None;
+                };
+                Some(crate::signing::ledger_witness::ScheduleProbe {
+                    intent_id: intent.intent_id.clone(),
+                    timelock: timelock.clone(),
+                    operation_id: *operation_id,
+                    expiration: intent.facts().execution_bound()?,
+                    admitted_at_ms: intent.admitted_at_ms,
+                })
             })
             .collect();
-        let frozen = plan.with_legs(&entries);
-        let id = frozen.facts.intent_id();
-        let proof = crate::IntentProof::new(Some(id.clone()), frozen);
-        if let Some(record) = wire
-            .signed_intents
-            .iter_mut()
-            .find(|record| record.intent_id == id)
-        {
-            if !record.same_legs(&entries) {
-                return Err(WindowStoreError::IntentBindingMismatch { field: "legs" });
-            }
-            record.cancel_token_sha256 = None;
-            self.commit_generation(&key, &gen_entry, original, wire)?;
-            return Ok(proof);
+        let Some(profile_name) = self.profile_name.as_deref().or_else(|| {
+            stellar_agent_core::profile::name::derive_profile_name_from_owner_key(profile)
+        }) else {
+            return;
+        };
+        let probe_scope = format!("{profile_name}:{}", profile.chain_id);
+        let probes = crate::signing::ledger_witness::select_schedule_probes(&probe_scope, probes);
+        let Some(endpoints) = self.stored_endpoints(profile) else {
+            return;
+        };
+        if endpoints.chain_id != profile.chain_id {
+            return;
         }
-        if wire.signed_intents.iter().any(|record| {
-            record.subjects.iter().any(|prior| {
-                prior.nonce.is_some()
-                    && plan.facts.subjects.iter().any(|next| {
-                        prior.credential == next.credential && prior.nonce == next.nonce
-                    })
-            })
-        }) {
-            return Err(WindowStoreError::IntentBindingMismatch { field: "plan" });
-        }
-        admit(&wire, &entries)?;
-        let facts = &plan.facts;
-        wire.signed_intents.push(SignedIntentRecord {
-            intent_id: id,
-            chain_scope: facts.chain_scope,
-            auth_address: facts.auth_address.clone(),
-            envelope_source: facts.envelope_source.clone(),
-            envelope_sequence: facts.envelope_sequence,
-            host_invocation_sha256: facts.host_invocation_sha256,
-            subjects: facts.subjects.clone(),
-            greatest_expiration_ledger: facts.greatest_expiration_ledger,
-            legs: entries.iter().map(IntentLeg::from_entry).collect(),
-            admitted_at_ms: now,
-            generation: increment_generation(wire.generation)?,
-            status: SignedIntentStatus::Exposed,
-            bound_envelope_hash: None,
-            bound_tx_hash: None,
-            cancel_token_sha256: Some(Sha256::digest(proof.cancel_token).into()),
-        });
-        prune_stale(&mut wire, now);
-        self.commit_generation(&key, &gen_entry, original, wire)?;
-        Ok(proof)
+        let Some(secondary) = endpoints.secondary_rpc_url.as_deref() else {
+            return;
+        };
+        use stellar_agent_core::profile::schema::ProviderRole;
+        let mut stored_profile = profile.clone();
+        stored_profile.rpc_url = endpoints.rpc_url.clone();
+        stored_profile.secondary_rpc_url = endpoints.secondary_rpc_url.clone();
+        let Ok(primary) =
+            crate::profile_rpc_client(&stored_profile, ProviderRole::Primary, &endpoints.rpc_url)
+        else {
+            return;
+        };
+        let Ok(secondary) =
+            crate::profile_rpc_client(&stored_profile, ProviderRole::Secondary, secondary)
+        else {
+            return;
+        };
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        let Ok(capability) = LedgerWitnessCapability::acquire(
+            &primary,
+            &secondary,
+            profile.chain_id.network_passphrase(),
+            deadline,
+        )
+        .await
+        else {
+            return;
+        };
+        let capability = capability.read_operation_states(&probes).await;
+        let _ = self.observe_signed_intents(profile, &capability);
     }
 
     /// Cancels only an unconsumed proof's exclusively held admission.
@@ -2156,9 +2459,8 @@ impl PersistedWindowStore {
             .ok_or(WindowStoreError::IntentBindingMismatch {
                 field: "intent_state",
             })?;
-        record
-            .facts()
-            .compare(&facts.facts)
+        facts
+            .compare_to(&record.facts())
             .map_err(|field| WindowStoreError::IntentBindingMismatch { field })?;
         if !record.same_legs(legs) {
             return Err(WindowStoreError::IntentBindingMismatch { field: "legs" });
@@ -2973,8 +3275,20 @@ impl PersistedWindowStore {
         {
             return Err(WindowStoreError::AccountingAuditOwed);
         }
+        let original = wire.clone();
+        prune_closed_intents(&mut wire, crate::policy_state::store::now_ms()?)?;
         if !wire.signed_intents.is_empty() {
             return Err(WindowStoreError::SignedIntentLive {
+                explanation: intent_reset_explanations(
+                    wire.signed_intents.iter().any(|intent| {
+                        intent.purpose.is_none() && intent.expiry_observed_at_ms.is_none()
+                    }),
+                    wire.signed_intents
+                        .iter()
+                        .any(|intent| intent.expiry_observed_at_ms.is_none()),
+                    self.stored_endpoints(profile).as_ref(),
+                )
+                .join(" "),
                 exposed: wire
                     .signed_intents
                     .iter()
@@ -2993,7 +3307,6 @@ impl PersistedWindowStore {
             .filter(|record| !record.receipt_projected)
             .cloned()
             .collect();
-        let original = wire.clone();
         accrual.previous = PreviousState::Verified;
         // Authorization lifetimes use the store's clock on every transition.
         let clock = crate::policy_state::store::now_ms()?;
@@ -3159,9 +3472,21 @@ impl PersistedWindowStore {
         &self,
         key: &[u8; 32],
         gen_entry: &KeyringEntryRef,
+        original: WireFile,
+        next: WireFile,
+    ) -> Result<(), WindowStoreError> {
+        self.commit_generation_if(key, gen_entry, original, next, || true)?;
+        Ok(())
+    }
+
+    fn commit_generation_if(
+        &self,
+        key: &[u8; 32],
+        gen_entry: &KeyringEntryRef,
         mut original: WireFile,
         mut next: WireFile,
-    ) -> Result<(), WindowStoreError> {
+        still_valid: impl Fn() -> bool,
+    ) -> Result<bool, WindowStoreError> {
         next.generation =
             original
                 .generation
@@ -3176,16 +3501,25 @@ impl PersistedWindowStore {
         // successor beside it.
         next.version = select_wire_version(&next);
         check_snapshot(&next)?;
+        if !still_valid() {
+            return Ok(false);
+        }
         if original.generation == 0 {
             // Initialisation has no prior debit to retain. A missing trusted
             // counter on an existing file must remain a deletion error.
             write_generation(gen_entry, &next)?;
-            return self.write_atomic(key, &next);
+            self.write_atomic(key, &next)?;
+            return Ok(true);
         }
         original.prepared = Some(Box::new(next.clone()));
         self.write_atomic(key, &original)?;
         #[cfg(test)]
         tests::accounting_fault(tests::COMMIT_FAULT_AFTER_PREPARED)?;
+        if !still_valid() {
+            original.prepared = None;
+            self.write_atomic(key, &original)?;
+            return Ok(false);
+        }
         write_generation(gen_entry, &next)?;
         #[cfg(test)]
         tests::accounting_fault(tests::COMMIT_FAULT_AFTER_COUNTER)?;
@@ -3202,7 +3536,7 @@ impl PersistedWindowStore {
                 "window store: committed prepared generation retained; compaction failed"
             );
         }
-        Ok(())
+        Ok(true)
     }
 
     /// Settles one reservation on chain answers. See [`Self::reconcile_due`]
@@ -4008,6 +4342,14 @@ impl PersistedWindowStore {
         if version.version > WIRE_VERSION_MAX {
             return Err(WindowStoreError::UnsupportedVersion);
         }
+        let value: serde_json::Value =
+            serde_json::from_slice(body).map_err(|error| WindowStoreError::Invalid {
+                detail: format!(
+                    "store body is not valid JSON: the body {}",
+                    describe_json_error(&error)
+                ),
+            })?;
+        check_intent_json(&value)?;
         let wire: WireFile =
             serde_json::from_slice(body).map_err(|e| WindowStoreError::Invalid {
                 detail: format!(
@@ -4351,10 +4693,192 @@ fn check_snapshot(wire: &WireFile) -> Result<(), WindowStoreError> {
     ledger::validate(wire)
 }
 
+fn intent_invalid(detail: &'static str) -> WindowStoreError {
+    WindowStoreError::Invalid {
+        detail: detail.into(),
+    }
+}
+
+fn admitted_duration(legs: &[IntentLeg]) -> Result<u64, WindowStoreError> {
+    use stellar_agent_core::policy::v1::criteria::per_period_cap::MAX_SUPPORTED_WINDOW_SECS;
+    legs.iter().try_fold(0, |maximum, leg| {
+        let duration = leg
+            .window_secs
+            .checked_mul(1000)
+            .ok_or_else(|| intent_invalid("signed intent horizon overflows"))?;
+        if ![60, 300, 3600, 86400, MAX_SUPPORTED_WINDOW_SECS].contains(&leg.window_secs) {
+            return Err(intent_invalid("signed intent window is unsupported"));
+        }
+        Ok(maximum.max(duration))
+    })
+}
+
+fn prune_closed_intents(wire: &mut WireFile, now: u64) -> Result<bool, WindowStoreError> {
+    for intent in &wire.signed_intents {
+        if let Some(t) = intent.expiry_observed_at_ms {
+            t.checked_add(RETENTION_MS)
+                .ok_or_else(|| intent_invalid("signed intent horizon overflows"))?;
+        }
+    }
+    let before = wire.signed_intents.len();
+    wire.signed_intents.retain(|intent| {
+        intent
+            .expiry_observed_at_ms
+            .is_none_or(|t| now <= t + RETENTION_MS)
+    });
+    Ok(before != wire.signed_intents.len())
+}
+
+fn reduce_intent_progress(
+    wire: &mut WireFile,
+    witness: Option<&LedgerWitnessCapability>,
+    now: u64,
+    schedules: bool,
+) -> Result<bool, WindowStoreError> {
+    let mut changed = false;
+    if let Some(witness) = witness {
+        for intent in &mut wire.signed_intents {
+            if intent.expiry_observed_at_ms.is_some() || intent.chain_scope != witness.scope() {
+                continue;
+            }
+            let Some(expiration) = intent.facts().execution_bound() else {
+                continue;
+            };
+            let (t, terminal) = match &intent.purpose {
+                Some(IntentPurpose::Invoke) => (witness.arrived_at_ms(), None),
+                Some(IntentPurpose::TimelockSchedule {
+                    timelock,
+                    operation_id,
+                }) if schedules => {
+                    let Some((value, heights, t)) = witness.terminal_for(
+                        &intent.intent_id,
+                        timelock,
+                        operation_id,
+                        expiration,
+                        intent.admitted_at_ms,
+                        now,
+                    ) else {
+                        continue;
+                    };
+                    (
+                        t,
+                        Some((
+                            if value == 0 {
+                                ScheduleTerminal::Unset
+                            } else {
+                                ScheduleTerminal::Done
+                            },
+                            heights,
+                        )),
+                    )
+                }
+                _ => continue,
+            };
+            if witness.lower() <= expiration || t < intent.admitted_at_ms || t > now {
+                continue;
+            }
+            let horizon = t
+                .checked_add(intent.admitted_window_ms)
+                .ok_or_else(|| intent_invalid("signed intent horizon overflows"))?;
+            t.checked_add(RETENTION_MS)
+                .ok_or_else(|| intent_invalid("signed intent horizon overflows"))?;
+            intent.witness_lower = Some(witness.lower());
+            intent.witness_upper = Some(witness.upper());
+            intent.expiry_observed_at_ms = Some(t);
+            intent.accounting_until_ms = Some(horizon);
+            if let Some((terminal, heights)) = terminal {
+                intent.schedule_terminal = Some(terminal);
+                intent.schedule_read_primary_ledger = Some(heights[0]);
+                intent.schedule_read_secondary_ledger = Some(heights[1]);
+            }
+            changed = true;
+        }
+    }
+    Ok(prune_closed_intents(wire, now)? || changed)
+}
+
+fn install_intent_admission(
+    wire: &mut WireFile,
+    plan: &crate::SignedIntentPlan,
+    now: u64,
+) -> Result<(crate::IntentProof, bool), WindowStoreError> {
+    let entries: Vec<_> = plan
+        .legs()
+        .iter()
+        .map(|entry| {
+            WindowEntry::new(
+                entry.key().clone(),
+                now,
+                entry.amount(),
+                entry.limit().clone(),
+            )
+        })
+        .collect();
+    let frozen = plan.with_legs(&entries);
+    let id = frozen.facts.intent_id();
+    if let Some(record) = wire
+        .signed_intents
+        .iter_mut()
+        .find(|record| record.facts().same_authority(&plan.facts))
+    {
+        if record.purpose != plan.facts.purpose {
+            return Err(WindowStoreError::IntentBindingMismatch { field: "purpose" });
+        }
+        if record.envelope_max_ledger != plan.facts.envelope_max_ledger {
+            return Err(WindowStoreError::IntentBindingMismatch {
+                field: "expiration",
+            });
+        }
+        if record.intent_id != id {
+            return Err(WindowStoreError::IntentBindingMismatch { field: "plan" });
+        }
+        if !record.same_legs(&entries) {
+            return Err(WindowStoreError::IntentBindingMismatch { field: "legs" });
+        }
+        let changed = record.cancel_token_sha256.take().is_some();
+        return Ok((crate::IntentProof::new(Some(id), frozen), changed));
+    }
+    if entries.is_empty() {
+        return Ok((crate::IntentProof::new(None, frozen), false));
+    }
+    let legs: Vec<_> = entries.iter().map(IntentLeg::from_entry).collect();
+    let admitted_window_ms = admitted_duration(&legs)?;
+    admit(wire, &entries)?;
+    let proof = crate::IntentProof::new(Some(id.clone()), frozen);
+    let facts = &plan.facts;
+    wire.signed_intents.push(SignedIntentRecord {
+        intent_id: id,
+        chain_scope: facts.chain_scope,
+        auth_address: facts.auth_address.clone(),
+        envelope_source: facts.envelope_source.clone(),
+        envelope_sequence: facts.envelope_sequence,
+        host_invocation_sha256: facts.host_invocation_sha256,
+        subjects: facts.subjects.clone(),
+        greatest_expiration_ledger: facts.greatest_expiration_ledger,
+        purpose: facts.purpose.clone(),
+        envelope_max_ledger: facts.envelope_max_ledger,
+        admitted_window_ms,
+        witness_lower: None,
+        witness_upper: None,
+        expiry_observed_at_ms: None,
+        accounting_until_ms: None,
+        schedule_terminal: None,
+        schedule_read_primary_ledger: None,
+        schedule_read_secondary_ledger: None,
+        legs,
+        admitted_at_ms: now,
+        generation: increment_generation(wire.generation)?,
+        status: SignedIntentStatus::Exposed,
+        bound_envelope_hash: None,
+        bound_tx_hash: None,
+        cancel_token_sha256: Some(Sha256::digest(proof.cancel_token).into()),
+    });
+    prune_stale(wire, now);
+    Ok((proof, true))
+}
+
 fn validate_signed_intents(wire: &WireFile) -> Result<(), WindowStoreError> {
-    let invalid = || WindowStoreError::Invalid {
-        detail: "signed intent state does not match its snapshot".into(),
-    };
+    let invalid = || intent_invalid("signed intent state does not match its snapshot");
     let records: Vec<_> = wire
         .entries
         .iter()
@@ -4363,22 +4887,148 @@ fn validate_signed_intents(wire: &WireFile) -> Result<(), WindowStoreError> {
     if wire.version < WIRE_VERSION_INTENT
         && (!wire.signed_intents.is_empty() || records.iter().any(|r| r.signed_intent.is_some()))
     {
-        return Err(invalid());
+        return Err(intent_invalid("signed intent state requires version 9"));
     }
-    let mut seen = std::collections::HashSet::new();
-    for intent in &wire.signed_intents {
+    for (index, intent) in wire.signed_intents.iter().enumerate() {
+        let facts = intent.facts();
+        if intent.envelope_max_ledger == Some(0) {
+            return Err(intent_invalid("signed intent envelope bound is invalid"));
+        }
+        if facts.greatest_expiration_ledger != facts.execution_bound() {
+            return Err(intent_invalid("signed intent expiration does not match"));
+        }
+        if let Some(IntentPurpose::TimelockSchedule { timelock, .. }) = &intent.purpose
+            && !stellar_strkey::Contract::from_string(timelock)
+                .is_ok_and(|key| key.to_string().as_str() == timelock.as_str())
+        {
+            return Err(intent_invalid("signed intent timelock is invalid"));
+        }
+        if intent.admitted_window_ms != admitted_duration(&intent.legs)? {
+            return Err(intent_invalid(
+                "signed intent admitted window does not match",
+            ));
+        }
         if Some(intent.chain_scope) != wire.chain_scope
-            || intent.facts().validate().is_err()
-            || intent.intent_id != intent.facts().intent_id()
-            || !seen.insert(&intent.intent_id)
+            || facts.validate().is_err()
             || intent.generation == 0
             || intent.generation > wire.generation
             || intent.legs.is_empty()
-            || intent.legs.iter().any(|leg| {
-                leg.window_secs == 0 || leg.amount <= 0 || leg.ts_ms != intent.admitted_at_ms
-            })
+            || intent
+                .legs
+                .iter()
+                .any(|leg| leg.amount <= 0 || leg.ts_ms != intent.admitted_at_ms)
         {
             return Err(invalid());
+        }
+        if intent.intent_id != facts.intent_id() {
+            return Err(intent_invalid("signed intent identifier does not match"));
+        }
+        if wire.signed_intents[..index]
+            .iter()
+            .any(|prior| prior.facts().same_authority(&facts))
+        {
+            return Err(intent_invalid("signed intent authority conflicts"));
+        }
+        let common = [
+            intent.witness_lower.is_some(),
+            intent.witness_upper.is_some(),
+            intent.expiry_observed_at_ms.is_some(),
+            intent.accounting_until_ms.is_some(),
+        ];
+        let closed = common.iter().all(|present| *present);
+        if !closed && common.iter().any(|present| *present) {
+            return Err(intent_invalid("signed intent closure is incomplete"));
+        }
+        let terminal = [
+            intent.schedule_terminal.is_some(),
+            intent.schedule_read_primary_ledger.is_some(),
+            intent.schedule_read_secondary_ledger.is_some(),
+        ];
+        let schedule = matches!(intent.purpose, Some(IntentPurpose::TimelockSchedule { .. }));
+        if !closed && terminal.iter().any(|present| *present) {
+            return Err(intent_invalid(
+                "signed intent open record carries terminal evidence",
+            ));
+        }
+        if !schedule && terminal.iter().any(|present| *present) {
+            return Err(intent_invalid(
+                "signed intent purpose cannot carry terminal evidence",
+            ));
+        }
+        if let (Some(lower), Some(upper), Some(t), Some(until)) = (
+            intent.witness_lower,
+            intent.witness_upper,
+            intent.expiry_observed_at_ms,
+            intent.accounting_until_ms,
+        ) {
+            let expiration = facts
+                .execution_bound()
+                .ok_or_else(|| intent_invalid("signed intent closure lacks an execution bound"))?;
+            if !crate::signing::ledger_witness::operational_ledger(lower)
+                || !crate::signing::ledger_witness::operational_ledger(upper)
+            {
+                return Err(intent_invalid("signed intent witness height is invalid"));
+            }
+            if lower > upper {
+                return Err(intent_invalid("signed intent witness order is invalid"));
+            }
+            if upper - lower > crate::signing::ledger_witness::MAX_SIGNING_LEDGER_SKEW {
+                return Err(intent_invalid("signed intent witness skew is excessive"));
+            }
+            if lower <= expiration {
+                return Err(intent_invalid("signed intent authority remains executable"));
+            }
+            if intent.purpose.is_none() {
+                return Err(intent_invalid(
+                    "signed intent closure lacks an authenticated purpose",
+                ));
+            }
+            if t < intent.admitted_at_ms {
+                return Err(intent_invalid("signed intent closure precedes admission"));
+            }
+            let expected = t
+                .checked_add(intent.admitted_window_ms)
+                .ok_or_else(|| intent_invalid("signed intent horizon overflows"))?;
+            t.checked_add(RETENTION_MS)
+                .ok_or_else(|| intent_invalid("signed intent horizon overflows"))?;
+            if until != expected {
+                return Err(intent_invalid(
+                    "signed intent accounting horizon does not match",
+                ));
+            }
+            if schedule {
+                if !terminal.iter().all(|present| *present) {
+                    return Err(intent_invalid(
+                        "signed intent schedule evidence is incomplete",
+                    ));
+                }
+                if intent
+                    .schedule_read_primary_ledger
+                    .is_none_or(|height| height <= expiration)
+                {
+                    return Err(intent_invalid(
+                        "signed intent primary state read precedes expiry",
+                    ));
+                }
+                if intent
+                    .schedule_read_secondary_ledger
+                    .is_none_or(|height| height <= expiration)
+                {
+                    return Err(intent_invalid(
+                        "signed intent secondary state read precedes expiry",
+                    ));
+                }
+                if [
+                    intent.schedule_read_primary_ledger,
+                    intent.schedule_read_secondary_ledger,
+                ]
+                .into_iter()
+                .flatten()
+                .any(|height| !crate::signing::ledger_witness::operational_ledger(height))
+                {
+                    return Err(intent_invalid("signed intent witness height is invalid"));
+                }
+            }
         }
         let valid_hash = |hash: &Option<String>| {
             hash.as_ref().is_some_and(|hash| {
@@ -4406,16 +5056,104 @@ fn validate_signed_intents(wire: &WireFile) -> Result<(), WindowStoreError> {
         if record.id.starts_with("intent-") {
             return Err(invalid());
         }
-        if let Some(id) = &record.signed_intent
-            && (!id.starts_with("intent-")
-                || !wire.signed_intents.iter().any(|intent| {
-                    &intent.intent_id == id
-                        && intent.status == SignedIntentStatus::Bound
-                        && intent.bound_envelope_hash.as_ref() == Some(&record.id)
-                }))
-        {
-            return Err(invalid());
+        if let Some(id) = &record.signed_intent {
+            if !id.strip_prefix("intent-").is_some_and(|hash| {
+                stellar_agent_core::hex::decode_hex32(hash)
+                    .is_ok_and(|bytes| crate::submit::bytes_to_hex(&bytes) == hash)
+            }) {
+                return Err(invalid());
+            }
+            if wire.signed_intents.iter().any(|intent| {
+                &intent.intent_id == id
+                    && (intent.status != SignedIntentStatus::Bound
+                        || intent.bound_envelope_hash.as_ref() != Some(&record.id))
+            }) {
+                return Err(invalid());
+            }
         }
+    }
+    Ok(())
+}
+
+/// Classifies authenticated intent schema failures without disclosing values.
+fn check_intent_json(value: &serde_json::Value) -> Result<(), WindowStoreError> {
+    if value
+        .get("version")
+        .and_then(serde_json::Value::as_u64)
+        .is_some_and(|version| version > u64::from(WIRE_VERSION_MAX))
+    {
+        return Err(WindowStoreError::UnsupportedVersion);
+    }
+    if let Some(intents) = value
+        .get("signed_intents")
+        .and_then(serde_json::Value::as_array)
+    {
+        for intent in intents {
+            for (field, detail) in [
+                ("purpose", "signed intent purpose field is missing"),
+                (
+                    "envelope_max_ledger",
+                    "signed intent envelope bound field is missing",
+                ),
+                (
+                    "admitted_window_ms",
+                    "signed intent admitted window field is missing",
+                ),
+            ] {
+                if intent.get(field).is_none() {
+                    return Err(intent_invalid(detail));
+                }
+            }
+            match &intent["purpose"] {
+                serde_json::Value::Null => {}
+                serde_json::Value::String(name) if name == "Invoke" => {}
+                serde_json::Value::Object(purpose)
+                    if purpose.len() == 1 && purpose.contains_key("TimelockSchedule") =>
+                {
+                    let schedule = &purpose["TimelockSchedule"];
+                    if !schedule
+                        .get("timelock")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|text| {
+                            stellar_strkey::Contract::from_string(text)
+                                .is_ok_and(|key| key.to_string() == text)
+                        })
+                    {
+                        return Err(intent_invalid("signed intent timelock is invalid"));
+                    }
+                    if !schedule
+                        .get("operation_id")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|text| {
+                            stellar_agent_core::hex::decode_hex32(text)
+                                .is_ok_and(|bytes| crate::submit::bytes_to_hex(&bytes) == text)
+                        })
+                    {
+                        return Err(intent_invalid(
+                            "signed intent operation identifier is invalid",
+                        ));
+                    }
+                }
+                _ => return Err(intent_invalid("signed intent purpose is unknown")),
+            }
+            if let Some(terminal) = intent.get("schedule_terminal")
+                && !terminal.is_null()
+                && !matches!(terminal.as_str(), Some("done" | "unset"))
+            {
+                return Err(intent_invalid("signed intent terminal state is unknown"));
+            }
+            let bound = &intent["envelope_max_ledger"];
+            if !bound.is_null()
+                && !bound
+                    .as_u64()
+                    .is_some_and(|bound| bound > 0 && bound <= u64::from(u32::MAX))
+            {
+                return Err(intent_invalid("signed intent envelope bound is invalid"));
+            }
+        }
+    }
+    if let Some(prepared) = value.get("prepared").filter(|value| !value.is_null()) {
+        check_intent_json(prepared)?;
     }
     Ok(())
 }
@@ -4424,9 +5162,9 @@ fn validate_signed_intents(wire: &WireFile) -> Result<(), WindowStoreError> {
 /// retention window.
 ///
 /// A pending reservation is kept whatever its age. It holds the operator's cap
-/// for a submission whose outcome is still unknown, and dropping it would stop
-/// that spend counting and take the record out of reconciliation's reach while
-/// its receipt still reports pending. A reservation that old is resolved by
+/// for a submission whose outcome is still unknown. Dropping it stops that spend
+/// counting and takes the record out of reconciliation's reach while its receipt
+/// still reports pending. A reservation that old is resolved by
 /// `tx status` or by `tx receipt clear`, not by the clock.
 ///
 /// An accounting-expiry record is kept whatever its age until its audit event
@@ -5130,6 +5868,18 @@ fn window_in_file(wire: &WireFile, key: &StateKey, now_ms: u64) -> Result<(i128,
         }
     }
     for intent in &wire.signed_intents {
+        if !exposure_is_live(
+            intent.expiry_observed_at_ms,
+            intent.accounting_until_ms,
+            key.window_secs(),
+            now_ms,
+        )
+        .map_err(|error| DenyReason::EvaluationError {
+            detail: error.to_string(),
+        })? {
+            continue;
+        }
+
         let exact = intent.legs.iter().any(|leg| {
             leg.scope_specificity == key.scope_specificity()
                 && leg.bucket == key.bucket()
@@ -5407,9 +6157,9 @@ fn snapshot_accrual(wire: &WireFile, now_ms: u64, accrual: &mut WipedAccrualReco
 /// Refuses `entries` when any of them would take its bucket past the limit it
 /// carries, measured against `wire` plus the entries ahead of it in the batch.
 ///
-/// The batch is one submission's reservation, so entries that share a key are
-/// accumulated against each other: a batch whose own entries jointly exceed a
-/// bucket is refused, at the first entry that tips it.
+/// The batch is one submission's reservation. Entries that share a key accumulate
+/// against each other. A batch that exceeds a bucket is refused at the first
+/// entry that tips it.
 pub(super) fn admit(wire: &WireFile, entries: &[WindowEntry]) -> Result<(), WindowStoreError> {
     let mut batch: HashMap<&StateKey, (i128, u32)> = HashMap::new();
     for entry in entries {
@@ -5476,8 +6226,1974 @@ mod tests {
 
     use super::*;
     use stellar_agent_core::policy::v1::criteria::state_store::WindowLimit;
-    use stellar_agent_test_support::keyring_mock;
+    use stellar_agent_test_support::{file_sha256, keyring_mock};
     use tempfile::TempDir;
+
+    #[test]
+    #[serial]
+    fn an_unbounded_source_subject_never_closes() {
+        for kind in 0..3 {
+            let (_dir, profile, store, _) = progress_fixture();
+            let clock = crate::mainnet::clock::set_now_ms_for_test(1000);
+            let mut plan = intent_fixture_kind(kind).0;
+            if kind == 2 {
+                plan.facts
+                    .subjects
+                    .extend(intent_fixture_kind(1).0.facts.subjects);
+                plan.facts
+                    .subjects
+                    .sort_by_key(crate::signed_intent::SubjectFacts::encode);
+            }
+            plan.facts.purpose = Some(IntentPurpose::Invoke);
+            plan.facts.greatest_expiration_ledger = plan.facts.execution_bound();
+            assert_eq!(plan.facts.greatest_expiration_ledger, None);
+            let _exposure = store.admit_signed_intent(&profile, &plan).unwrap().expose();
+            let before = file_sha256(store.path());
+            clock.set(2 * RETENTION_MS);
+            store
+                .observe_signed_intents(&profile, &progress_witness([900, 901], 2 * RETENTION_MS))
+                .unwrap();
+            assert_eq!(file_sha256(store.path()), before);
+            assert_intent_totals(&store, &profile, 60, 1);
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn closure_survives_each_commit_seam() {
+        assert_closure_and_pruning_survive_each_commit_seam();
+    }
+
+    fn assert_closure_and_pruning_survive_each_commit_seam() {
+        for schedule in [false, true] {
+            for seam in [
+                COMMIT_FAULT_AFTER_PREPARED,
+                COMMIT_FAULT_AFTER_COUNTER,
+                COMMIT_FAULT_COMPACTION,
+            ] {
+                let clock = crate::mainnet::clock::set_now_ms_for_test(1000);
+                let fx = expiring_hold("intent", "c9", 1000);
+                fx.store
+                    .expire_accounting(&fx.profile, None, &fx.hold, fx.expire_at)
+                    .unwrap();
+                let owed = fx
+                    .store
+                    .read_for_inspection(&fx.profile)
+                    .unwrap()
+                    .unwrap()
+                    .accounting_expiries;
+                fs::write(fx.dir.path().join("intent.toml"), "chain_id = \"stellar:testnet\"\nrpc_url = \"https://primary.example/rpc\"\nsecondary_rpc_url = \"https://secondary.example/rpc\"\n").unwrap();
+                let store = fx
+                    .store
+                    .clone()
+                    .with_profile_directory("intent", fx.dir.path().to_owned());
+                let mut plan = intent_fixture_plan(1, 60)
+                    .0
+                    .with_envelope_max_ledger(100)
+                    .unwrap();
+                plan.facts.purpose = Some(if schedule {
+                    IntentPurpose::TimelockSchedule {
+                        timelock: stellar_strkey::Contract([1; 32]).to_string().to_string(),
+                        operation_id: [3; 32],
+                    }
+                } else {
+                    IntentPurpose::Invoke
+                });
+                let _exposure = store
+                    .admit_signed_intent(&fx.profile, &plan)
+                    .unwrap()
+                    .expose();
+                clock.set(2000);
+                let mut witness = progress_witness([101, 102], 2000);
+                if let Some(IntentPurpose::TimelockSchedule {
+                    timelock,
+                    operation_id,
+                }) = &plan.facts.purpose
+                {
+                    witness = witness.with_operation_states_for_test(
+                        crate::signing::ledger_witness::ScheduleProbe {
+                            intent_id: plan.facts.intent_id(),
+                            timelock: timelock.clone(),
+                            operation_id: *operation_id,
+                            expiration: 100,
+                            admitted_at_ms: 1000,
+                        },
+                        [0, 0],
+                        [101, 102],
+                        [1999, 2000],
+                    );
+                }
+                let armed = arm_accounting_fault(seam);
+                let result = store.observe_signed_intents(&fx.profile, &witness);
+                drop(armed);
+                assert_eq!(result.is_ok(), seam == COMMIT_FAULT_COMPACTION);
+                let reopened = PersistedWindowStore::at_path(store.path.clone());
+                let wire = reopened.read_for_inspection(&fx.profile).unwrap().unwrap();
+                let closes = seam != COMMIT_FAULT_AFTER_PREPARED;
+                let record = &wire.signed_intents[0];
+                assert_eq!(record.expiry_observed_at_ms, closes.then_some(2000));
+                assert_eq!(record.accounting_until_ms, closes.then_some(62000));
+                assert_eq!(record.witness_lower, closes.then_some(101));
+                assert_eq!(record.witness_upper, closes.then_some(102));
+                assert_eq!(
+                    record.schedule_terminal,
+                    (closes && schedule).then_some(ScheduleTerminal::Unset)
+                );
+                assert_eq!(
+                    record.schedule_read_primary_ledger,
+                    (closes && schedule).then_some(101)
+                );
+                assert_eq!(
+                    record.schedule_read_secondary_ledger,
+                    (closes && schedule).then_some(102)
+                );
+                assert_eq!(wire.accounting_expiries, owed);
+                assert!(matches!(
+                    reopened.reset_snapshot(&fx.profile, 2000 + RETENTION_MS + 1),
+                    Err(WindowStoreError::AccountingAuditOwed)
+                ));
+                clock.set(122001);
+                assert_intent_totals(
+                    &reopened,
+                    &fx.profile,
+                    if closes { 0 } else { 60 },
+                    u32::from(!closes),
+                );
+                let reopened = reopened.with_profile_directory("intent", fx.dir.path().to_owned());
+                clock.set(2000);
+                reopened
+                    .observe_signed_intents(&fx.profile, &witness)
+                    .unwrap();
+                let closed = reopened.read_for_inspection(&fx.profile).unwrap().unwrap();
+                assert_eq!(closed.signed_intents[0].expiry_observed_at_ms, Some(2000));
+                assert_eq!(closed.accounting_expiries, owed);
+                clock.set(2001 + RETENTION_MS);
+                let armed = arm_accounting_fault(seam);
+                let result = reopened.observe_signed_intents(&fx.profile, &witness);
+                drop(armed);
+                assert_eq!(result.is_ok(), seam == COMMIT_FAULT_COMPACTION);
+                let selected = PersistedWindowStore::at_path(store.path.clone());
+                let wire = selected.read_for_inspection(&fx.profile).unwrap().unwrap();
+                assert_eq!(
+                    wire.signed_intents.len(),
+                    usize::from(seam == COMMIT_FAULT_AFTER_PREPARED)
+                );
+                if let Some(record) = wire.signed_intents.first() {
+                    assert_eq!(record.expiry_observed_at_ms, Some(2000));
+                    assert_eq!(record.accounting_until_ms, Some(62_000));
+                    assert_eq!(
+                        record.schedule_terminal,
+                        schedule.then_some(ScheduleTerminal::Unset)
+                    );
+                }
+                assert_eq!(wire.accounting_expiries, owed);
+                assert_intent_totals(&selected, &fx.profile, 0, 0);
+                assert!(matches!(
+                    selected.reset_snapshot(&fx.profile, 2001 + RETENTION_MS),
+                    Err(WindowStoreError::AccountingAuditOwed)
+                ));
+            }
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn freshness_is_rechecked_at_the_protected_commit() {
+        for admission in [false, true] {
+            let (_dir, profile, store, plan) = progress_fixture();
+            let clock = crate::mainnet::clock::set_now_ms_for_test(1000);
+            let _exposure = store.admit_signed_intent(&profile, &plan).unwrap().expose();
+            clock.set(2000);
+            let before = file_sha256(store.path());
+            let generation = get_raw(&generation_entry_ref(&profile));
+            let instant = tokio::time::Instant::now();
+            let witness = LedgerWitnessCapability::for_test(
+                ChainScope::for_chain(Caip2::Testnet),
+                [
+                    "https://primary.example/rpc",
+                    "https://secondary.example/rpc",
+                ],
+                [101, 102],
+                [instant, instant],
+                [1999, 2000],
+                instant + std::time::Duration::from_millis(100),
+            )
+            .unwrap();
+            STORE_WRITE_HOOK.with_borrow_mut(|hook| {
+                let mut writes = 0;
+                *hook = Some(Box::new(move || {
+                    writes += 1;
+                    if writes == 1 {
+                        std::thread::sleep(std::time::Duration::from_millis(120));
+                    }
+                    Ok(())
+                }));
+            });
+            let armed = ArmedWrite;
+            if admission {
+                let _proof = store
+                    .admit_signed_intent(
+                        &profile,
+                        &intent_fixture_plan(2, 1)
+                            .0
+                            .with_legs(&[])
+                            .with_capability(witness),
+                    )
+                    .unwrap();
+            } else {
+                store.observe_signed_intents(&profile, &witness).unwrap();
+            }
+            drop(armed);
+            assert_eq!(file_sha256(store.path()), before);
+            assert_eq!(get_raw(&generation_entry_ref(&profile)), generation);
+            assert_intent_totals(&store, &profile, 60, 1);
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn older_readers_refuse_final_intent_snapshots() {
+        // This decoder is a frozen copy of the version 8 reader's ceiling check at 8ebb68c5.
+        fn check_version_eight(body: &[u8]) -> Result<(), WindowStoreError> {
+            const WIRE_VERSION_MAX: u32 = 8;
+            #[derive(serde::Deserialize)]
+            struct Version {
+                version: u32,
+            }
+            let version: Version =
+                serde_json::from_slice(body).map_err(|error| WindowStoreError::Invalid {
+                    detail: format!(
+                        "store body has no readable version: the body {}",
+                        describe_json_error(&error)
+                    ),
+                })?;
+            if version.version > WIRE_VERSION_MAX {
+                return Err(WindowStoreError::UnsupportedVersion);
+            }
+            Ok(())
+        }
+        fn decode_version_eight(key: &[u8; 32], bytes: &[u8]) -> Result<(), WindowStoreError> {
+            let (tag, body) = bytes.split_at(HMAC_TAG_LEN);
+            if !bool::from(tag.ct_eq(&compute_tag(key, body)?)) {
+                return Err(WindowStoreError::HmacMismatch);
+            }
+            check_version_eight(body)?;
+            let wire: serde_json::Value = serde_json::from_slice(body).unwrap();
+            if let Some(prepared) = wire.get("prepared").filter(|value| !value.is_null()) {
+                check_version_eight(&serde_json::to_vec(prepared).unwrap())?;
+            }
+            Ok(())
+        }
+        let (_dir, profile, store, plan) = progress_fixture();
+        let _clock = crate::mainnet::clock::set_now_ms_for_test(1000);
+        let _exposure = store.admit_signed_intent(&profile, &plan).unwrap().expose();
+        let successor = store.read_for_inspection(&profile).unwrap().unwrap();
+        assert_eq!(successor.version, WIRE_VERSION_INTENT);
+        let key = crate::keyring::load_hmac_key_32(&profile.policy_window_state_key_id).unwrap();
+        let encode = |wire: &WireFile| {
+            let body = serde_json::to_vec(wire).unwrap();
+            let mut bytes = compute_tag(key.as_ref(), &body).unwrap().to_vec();
+            bytes.extend(body);
+            bytes
+        };
+        let mut parent = successor.clone();
+        parent.signed_intents.clear();
+        parent.version = 8;
+        assert!(decode_version_eight(&key, &encode(&parent)).is_ok());
+        assert!(matches!(
+            decode_version_eight(&key, &encode(&successor)),
+            Err(WindowStoreError::UnsupportedVersion)
+        ));
+        parent.prepared = Some(Box::new(successor));
+        assert_eq!(
+            parent.prepared.as_ref().unwrap().version,
+            WIRE_VERSION_INTENT
+        );
+        assert!(matches!(
+            decode_version_eight(&key, &encode(&parent)),
+            Err(WindowStoreError::UnsupportedVersion)
+        ));
+    }
+
+    #[test]
+    #[serial]
+    fn final_intent_snapshot_predicates_are_distinct() {
+        assert_final_intent_snapshot_predicates_are_distinct();
+    }
+
+    fn assert_final_intent_snapshot_predicates_are_distinct() {
+        let (_dir, profile, store, plan) = progress_fixture();
+        let clock = crate::mainnet::clock::set_now_ms_for_test(1000);
+        let _exposure = store.admit_signed_intent(&profile, &plan).unwrap().expose();
+        clock.set(2000);
+        store
+            .observe_signed_intents(&profile, &progress_witness([101, 102], 2000))
+            .unwrap();
+        let valid = store.read_for_inspection(&profile).unwrap().unwrap();
+        let key = crate::keyring::load_hmac_key_32(&profile.policy_window_state_key_id).unwrap();
+        let encode = |value: &serde_json::Value| {
+            let body = serde_json::to_vec(value).unwrap();
+            let mut bytes = compute_tag(key.as_ref(), &body).unwrap().to_vec();
+            bytes.extend(body);
+            bytes
+        };
+        type Case = (&'static str, Box<dyn Fn(&mut serde_json::Value)>);
+        let mut cases: Vec<Case> = vec![
+            (
+                "signed intent state requires version 9",
+                Box::new(|v| v["version"] = 8.into()),
+            ),
+            (
+                "signed intent identifier does not match",
+                Box::new(|v| v["signed_intents"][0]["intent_id"] = "intent-00".into()),
+            ),
+            (
+                "signed intent authority conflicts",
+                Box::new(|v| {
+                    let duplicate = v["signed_intents"][0].clone();
+                    v["signed_intents"].as_array_mut().unwrap().push(duplicate);
+                }),
+            ),
+            (
+                "signed intent purpose is unknown",
+                Box::new(|v| v["signed_intents"][0]["purpose"] = "SECRET_UNKNOWN_PURPOSE".into()),
+            ),
+            (
+                "signed intent terminal state is unknown",
+                Box::new(|v| {
+                    v["signed_intents"][0]["schedule_terminal"] = "SECRET_UNKNOWN_TERMINAL".into()
+                }),
+            ),
+            (
+                "signed intent window is unsupported",
+                Box::new(|v| {
+                    v["signed_intents"][0]["legs"][0]["window_secs"] = 61.into();
+                    v["signed_intents"][0]["admitted_window_ms"] = 61_000.into();
+                    v["signed_intents"][0]["accounting_until_ms"] = 63_000.into();
+                }),
+            ),
+            (
+                "signed intent admitted window does not match",
+                Box::new(|v| {
+                    v["signed_intents"][0]["admitted_window_ms"] = 59_000.into();
+                    v["signed_intents"][0]["accounting_until_ms"] = 61_000.into();
+                }),
+            ),
+            (
+                "signed intent expiration does not match",
+                Box::new(|v| v["signed_intents"][0]["greatest_expiration_ledger"] = 99.into()),
+            ),
+            (
+                "signed intent envelope bound is invalid",
+                Box::new(|v| {
+                    v["signed_intents"][0]["envelope_max_ledger"] = 0.into();
+                    v["signed_intents"][0]["greatest_expiration_ledger"] = 0.into();
+                }),
+            ),
+            (
+                "signed intent closure is incomplete",
+                Box::new(|v| {
+                    v["signed_intents"][0]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("witness_upper");
+                }),
+            ),
+            (
+                "signed intent witness height is invalid",
+                Box::new(|v| {
+                    v["signed_intents"][0]["witness_upper"] = u32::MAX.into();
+                    v["signed_intents"][0]["witness_lower"] = u32::MAX.into();
+                }),
+            ),
+            (
+                "signed intent witness order is invalid",
+                Box::new(|v| v["signed_intents"][0]["witness_lower"] = 103.into()),
+            ),
+            (
+                "signed intent witness skew is excessive",
+                Box::new(|v| v["signed_intents"][0]["witness_upper"] = 104.into()),
+            ),
+            (
+                "signed intent authority remains executable",
+                Box::new(|v| v["signed_intents"][0]["witness_lower"] = 100.into()),
+            ),
+            (
+                "signed intent closure precedes admission",
+                Box::new(|v| {
+                    v["signed_intents"][0]["expiry_observed_at_ms"] = 999.into();
+                    v["signed_intents"][0]["accounting_until_ms"] = 60_999.into();
+                }),
+            ),
+            (
+                "signed intent horizon overflows",
+                Box::new(|v| {
+                    v["signed_intents"][0]["expiry_observed_at_ms"] = u64::MAX.into();
+                    v["signed_intents"][0]["accounting_until_ms"] = u64::MAX.into();
+                }),
+            ),
+            (
+                "signed intent accounting horizon does not match",
+                Box::new(|v| v["signed_intents"][0]["accounting_until_ms"] = 62_001.into()),
+            ),
+            (
+                "signed intent purpose cannot carry terminal evidence",
+                Box::new(|v| v["signed_intents"][0]["schedule_terminal"] = "done".into()),
+            ),
+        ];
+        for (field, detail) in [
+            ("purpose", "signed intent purpose field is missing"),
+            (
+                "envelope_max_ledger",
+                "signed intent envelope bound field is missing",
+            ),
+            (
+                "admitted_window_ms",
+                "signed intent admitted window field is missing",
+            ),
+        ] {
+            cases.push((
+                detail,
+                Box::new(move |v| {
+                    v["signed_intents"][0]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove(field);
+                }),
+            ));
+        }
+        let reidentify = |value: &mut serde_json::Value| {
+            let record: SignedIntentRecord =
+                serde_json::from_value(value["signed_intents"][0].clone()).unwrap();
+            value["signed_intents"][0]["intent_id"] = record.facts().intent_id().into();
+        };
+        let mut no_bound = serde_json::to_value(&valid).unwrap();
+        no_bound["signed_intents"][0]["envelope_max_ledger"] = serde_json::Value::Null;
+        no_bound["signed_intents"][0]["greatest_expiration_ledger"] = serde_json::Value::Null;
+        reidentify(&mut no_bound);
+        let mut no_purpose = serde_json::to_value(&valid).unwrap();
+        no_purpose["signed_intents"][0]["purpose"] = serde_json::Value::Null;
+        reidentify(&mut no_purpose);
+        let mut schedule = serde_json::to_value(&valid).unwrap();
+        schedule["signed_intents"][0]["purpose"] = serde_json::json!({"TimelockSchedule": {
+            "timelock": stellar_strkey::Contract([5; 32]).to_string().as_str(), "operation_id": "07".repeat(32)}});
+        schedule["signed_intents"][0]["schedule_terminal"] = "done".into();
+        schedule["signed_intents"][0]["schedule_read_primary_ledger"] = 101.into();
+        schedule["signed_intents"][0]["schedule_read_secondary_ledger"] = 102.into();
+        reidentify(&mut schedule);
+        let mut fixtures = vec![
+            ("signed intent closure lacks an execution bound", no_bound),
+            (
+                "signed intent closure lacks an authenticated purpose",
+                no_purpose,
+            ),
+        ];
+        for (detail, modify) in cases {
+            let mut value = serde_json::to_value(&valid).unwrap();
+            modify(&mut value);
+            if matches!(
+                detail,
+                "signed intent expiration does not match"
+                    | "signed intent envelope bound is invalid"
+            ) {
+                reidentify(&mut value);
+            }
+            fixtures.push((detail, value));
+        }
+        for (field, detail, replacement) in [
+            (
+                "schedule_terminal",
+                "signed intent schedule evidence is incomplete",
+                serde_json::Value::Null,
+            ),
+            (
+                "schedule_read_primary_ledger",
+                "signed intent primary state read precedes expiry",
+                100.into(),
+            ),
+            (
+                "schedule_read_secondary_ledger",
+                "signed intent secondary state read precedes expiry",
+                100.into(),
+            ),
+        ] {
+            let mut value = schedule.clone();
+            value["signed_intents"][0][field] = replacement;
+            fixtures.push((detail, value));
+        }
+        for (field, detail) in [
+            ("timelock", "signed intent timelock is invalid"),
+            (
+                "operation_id",
+                "signed intent operation identifier is invalid",
+            ),
+        ] {
+            let mut value = schedule.clone();
+            value["signed_intents"][0]["purpose"]["TimelockSchedule"][field] =
+                "SECRET_INVALID_VALUE".into();
+            if field == "timelock" {
+                reidentify(&mut value);
+            }
+            fixtures.push((detail, value));
+        }
+        for field in [
+            "schedule_read_primary_ledger",
+            "schedule_read_secondary_ledger",
+        ] {
+            let mut value = schedule.clone();
+            value["signed_intents"][0][field] = u32::MAX.into();
+            fixtures.push(("signed intent witness height is invalid", value));
+        }
+        let mut open_terminal = schedule.clone();
+        for field in [
+            "witness_lower",
+            "witness_upper",
+            "expiry_observed_at_ms",
+            "accounting_until_ms",
+        ] {
+            open_terminal["signed_intents"][0]
+                .as_object_mut()
+                .unwrap()
+                .remove(field);
+        }
+        fixtures.push((
+            "signed intent open record carries terminal evidence",
+            open_terminal,
+        ));
+        let mut incomplete = serde_json::to_value(&valid).unwrap();
+        for field in ["purpose", "envelope_max_ledger", "admitted_window_ms"] {
+            incomplete["signed_intents"][0]
+                .as_object_mut()
+                .unwrap()
+                .remove(field);
+        }
+        fixtures.push(("signed intent purpose field is missing", incomplete));
+        let facts = valid.signed_intents[0].facts();
+        let mut v1 = b"stellar-agent-signed-intent:v1".to_vec();
+        let string = |out: &mut Vec<u8>, value: &str| {
+            out.extend(u32::try_from(value.len()).unwrap().to_be_bytes());
+            out.extend(value.as_bytes());
+        };
+        string(&mut v1, &facts.chain_scope.chain().to_string());
+        v1.extend(Sha256::digest(
+            facts.chain_scope.chain().network_passphrase().as_bytes(),
+        ));
+        string(&mut v1, &facts.auth_address);
+        string(&mut v1, &facts.envelope_source);
+        v1.extend(facts.envelope_sequence.to_be_bytes());
+        v1.extend(facts.host_invocation_sha256);
+        v1.extend(u32::try_from(facts.subjects.len()).unwrap().to_be_bytes());
+        for subject in &facts.subjects {
+            v1.extend(subject.encode());
+        }
+        match facts.greatest_expiration_ledger {
+            Some(value) => {
+                v1.push(1);
+                v1.extend(value.to_be_bytes());
+            }
+            None => v1.push(0),
+        }
+        let mut legacy_id = serde_json::to_value(&valid).unwrap();
+        legacy_id["signed_intents"][0]["intent_id"] = format!(
+            "intent-{}",
+            crate::submit::bytes_to_hex(&Sha256::digest(v1))
+        )
+        .into();
+        fixtures.push(("signed intent identifier does not match", legacy_id));
+        for control in [serde_json::to_value(&valid).unwrap(), schedule] {
+            assert!(store.verify_with_key(&key, &encode(&control)).is_ok());
+        }
+        for (detail, value) in fixtures {
+            for prepared in [false, true] {
+                let snapshot = if prepared {
+                    let mut parent = serde_json::to_value(&valid).unwrap();
+                    parent["prepared"] = value.clone();
+                    parent
+                } else {
+                    value.clone()
+                };
+                let error = store.verify_with_key(&key, &encode(&snapshot)).unwrap_err();
+                assert!(
+                    matches!(error, WindowStoreError::Invalid { detail: ref actual } if actual == detail),
+                    "{detail}, prepared={prepared}: {error:?}"
+                );
+                assert!(!error.to_string().contains("SECRET"));
+            }
+        }
+        let mut unsupported = serde_json::to_value(&valid).unwrap();
+        unsupported["version"] = 10.into();
+        assert!(matches!(
+            store.verify_with_key(&key, &encode(&unsupported)),
+            Err(WindowStoreError::UnsupportedVersion)
+        ));
+        let mut prepared_unsupported = serde_json::to_value(&valid).unwrap();
+        prepared_unsupported["prepared"] = unsupported;
+        assert!(matches!(
+            store.verify_with_key(&key, &encode(&prepared_unsupported)),
+            Err(WindowStoreError::UnsupportedVersion)
+        ));
+        for prepared in [false, true] {
+            let mut unknown = serde_json::to_value(&valid).unwrap();
+            unknown["signed_intents"][0]["secret_unknown_field"] = "SECRET".into();
+            if prepared {
+                let mut parent = serde_json::to_value(&valid).unwrap();
+                parent["prepared"] = unknown;
+                unknown = parent;
+            }
+            let error = store.verify_with_key(&key, &encode(&unknown)).unwrap_err();
+            assert!(
+                matches!(error,WindowStoreError::Invalid { ref detail } if detail.starts_with("store body is not valid JSON: the body has a missing field or a field of the wrong type or value")),
+                "{error:?}"
+            );
+            assert!(!error.to_string().contains("SECRET"));
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn reset_obeys_intent_retention_and_refusal_order() {
+        for schedule in [false, true] {
+            let (dir, profile, store, mut plan) = progress_fixture();
+            let clock = crate::mainnet::clock::set_now_ms_for_test(1000);
+            if schedule {
+                plan.facts.purpose = Some(IntentPurpose::TimelockSchedule {
+                    timelock: stellar_strkey::Contract([1; 32]).to_string().to_string(),
+                    operation_id: [3; 32],
+                });
+            }
+            let exposure = store.admit_signed_intent(&profile, &plan).unwrap().expose();
+            let linked = if schedule {
+                None
+            } else {
+                let (_, mut envelope) = intent_fixture_plan(1, 60);
+                let stellar_xdr::TransactionEnvelope::Tx(tx) = &mut envelope else {
+                    panic!("V1")
+                };
+                tx.tx.cond = stellar_xdr::Preconditions::V2(stellar_xdr::PreconditionsV2 {
+                    time_bounds: None,
+                    ledger_bounds: Some(stellar_xdr::LedgerBounds {
+                        min_ledger: 0,
+                        max_ledger: 100,
+                    }),
+                    min_seq_num: None,
+                    min_seq_age: stellar_xdr::Duration(0),
+                    min_seq_ledger_gap: 0,
+                    extra_signers: Default::default(),
+                });
+                let facts =
+                    crate::BindFacts::from_envelope(&envelope, Caip2::Testnet.network_passphrase())
+                        .unwrap();
+                store
+                    .bind_signed_intent(
+                        &profile,
+                        exposure.intent_id().unwrap(),
+                        &facts,
+                        plan.legs(),
+                    )
+                    .unwrap();
+                let hold = SubmissionHold {
+                    chain_scope: plan.chain_scope(),
+                    id: facts.envelope_hash,
+                    tx_hash: facts.tx_hash,
+                    source: plan.facts.envelope_source.clone(),
+                    sequence: 1,
+                    max_time: 0,
+                    pending_since_ms: 1000,
+                    submission_ledger: 1,
+                    submission_anchor: None,
+                    operator_required: false,
+                };
+                store
+                    .record_pending_linked(
+                        &profile,
+                        plan.legs(),
+                        &hold,
+                        exposure.intent_id().unwrap(),
+                    )
+                    .unwrap();
+                let receipts = ReceiptStore::open_at(dir.path(), "intent").unwrap();
+                receipts
+                    .try_begin(&hold.id, &hold.tx_hash, &hold.source, hold.sequence, 0, 1)
+                    .unwrap();
+                receipts.mark_submitted(&hold.id).unwrap();
+                Some((hold, receipts))
+            };
+            let attempt = |now| {
+                let mut authorized = 0;
+                let mut recorded = 0;
+                let result = store.reset(
+                    &profile,
+                    owner_name(&profile),
+                    now,
+                    "repair",
+                    "intent-reset",
+                    |_| {
+                        authorized += 1;
+                        Ok::<_, ()>(ResetConsent::default())
+                    },
+                    |_, _| {
+                        recorded += 1;
+                        Ok(())
+                    },
+                );
+                (result, authorized, recorded)
+            };
+            let before = file_sha256(store.path());
+            let (result, authorized, recorded) = attempt(1000);
+            assert!(matches!(
+                result,
+                Err(ResetError::Store {
+                    error: WindowStoreError::SignedIntentLive { .. },
+                    minted: false
+                })
+            ));
+            assert_eq!((authorized, recorded), (0, 0));
+            assert_eq!(file_sha256(store.path()), before);
+            assert!(matches!(
+                store.reset_snapshot(&profile, 1000),
+                Err(WindowStoreError::SignedIntentLive { .. })
+            ));
+            clock.set(2000);
+            let mut witness = progress_witness([101, 102], 2000);
+            if let Some(IntentPurpose::TimelockSchedule {
+                timelock,
+                operation_id,
+            }) = &plan.facts.purpose
+            {
+                witness = witness.with_operation_states_for_test(
+                    crate::signing::ledger_witness::ScheduleProbe {
+                        intent_id: plan.facts.intent_id(),
+                        timelock: timelock.clone(),
+                        operation_id: *operation_id,
+                        expiration: 100,
+                        admitted_at_ms: 1000,
+                    },
+                    [1, 1],
+                    [101, 102],
+                    [1999, 2000],
+                );
+            }
+            store.observe_signed_intents(&profile, &witness).unwrap();
+            let before = file_sha256(store.path());
+            #[cfg(feature = "test-hooks")]
+            let clients = crate::client::constructions_on_this_thread();
+            clock.set(2000 + RETENTION_MS);
+            let (result, authorized, recorded) = attempt(2000 + RETENTION_MS);
+            assert!(matches!(
+                result,
+                Err(ResetError::Store {
+                    error: WindowStoreError::SignedIntentLive { .. },
+                    minted: false
+                })
+            ));
+            assert_eq!((authorized, recorded), (0, 0));
+            assert!(matches!(
+                store.reset_snapshot(&profile, 2000 + RETENTION_MS),
+                Err(WindowStoreError::SignedIntentLive { .. })
+            ));
+            clock.set(2001 + RETENTION_MS);
+            assert!(store.reset_snapshot(&profile, 2001 + RETENTION_MS).is_ok());
+            assert_eq!(
+                file_sha256(store.path()),
+                before,
+                "snapshot inspection does not mutate"
+            );
+            clock.set(2001 + RETENTION_MS);
+            store.observe_signed_intents(&profile, &witness).unwrap();
+            assert!(store.signed_intents("intent", &profile).unwrap().is_empty());
+            assert_intent_totals(&store, &profile, 0, 0);
+            if let Some((hold, receipts)) = &linked {
+                assert_eq!(
+                    store.pending_reservations(&profile).unwrap(),
+                    vec![hold.clone()]
+                );
+                assert_eq!(
+                    receipts.get(&hold.id).unwrap().unwrap().status,
+                    ReceiptStatus::Pending
+                );
+            }
+            let (result, authorized, recorded) = attempt(2001 + RETENTION_MS);
+            assert!(result.is_ok(), "{result:?}");
+            assert_eq!((authorized, recorded), (1, 1));
+            if let Some((hold, receipts)) = &linked {
+                assert_eq!(
+                    receipts.get(&hold.id).unwrap().unwrap().status,
+                    ReceiptStatus::Pending
+                );
+                assert!(reservation_from_receipt(receipts, &hold.id, plan.chain_scope()).is_some());
+            }
+            #[cfg(feature = "test-hooks")]
+            assert_eq!(crate::client::constructions_on_this_thread(), clients);
+        }
+        let clock = crate::mainnet::clock::set_now_ms_for_test(1000);
+        let fx = expiring_hold("intent", "de", 1000);
+        fx.store
+            .expire_accounting(&fx.profile, None, &fx.hold, fx.expire_at)
+            .unwrap();
+        clock.set(fx.expire_at);
+        let plan = intent_fixture_plan(1, 60).0;
+        let _exposure = fx
+            .store
+            .admit_signed_intent(&fx.profile, &plan)
+            .unwrap()
+            .expose();
+        let before = file_sha256(fx.store.path());
+        let mut authorized = 0;
+        let mut recorded = 0;
+        let result = fx.store.reset(
+            &fx.profile,
+            owner_name(&fx.profile),
+            fx.expire_at,
+            "repair",
+            "owed-first",
+            |_| {
+                authorized += 1;
+                Ok::<_, ()>(ResetConsent::default())
+            },
+            |_, _| {
+                recorded += 1;
+                Ok(())
+            },
+        );
+        assert!(matches!(
+            result,
+            Err(ResetError::Store {
+                error: WindowStoreError::AccountingAuditOwed,
+                minted: false
+            })
+        ));
+        assert_eq!((authorized, recorded), (0, 0));
+        assert_eq!(file_sha256(fx.store.path()), before);
+        assert_eq!(
+            fx.store
+                .signed_intents("intent", &fx.profile)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn intent_views_report_horizons_without_mutation() {
+        for terminal in [None, Some(0), Some(1)] {
+            let (_dir, profile, store, mut plan) = progress_fixture();
+            let clock = crate::mainnet::clock::set_now_ms_for_test(1000);
+            if terminal.is_some() {
+                plan.facts.purpose = Some(IntentPurpose::TimelockSchedule {
+                    timelock: stellar_strkey::Contract([1; 32]).to_string().to_string(),
+                    operation_id: [3; 32],
+                });
+            }
+            let _exposure = store.admit_signed_intent(&profile, &plan).unwrap().expose();
+            clock.set(2000);
+            let mut witness = progress_witness([101, 102], 2000);
+            if let (
+                Some(value),
+                Some(IntentPurpose::TimelockSchedule {
+                    timelock,
+                    operation_id,
+                }),
+            ) = (terminal, &plan.facts.purpose)
+            {
+                witness = witness.with_operation_states_for_test(
+                    crate::signing::ledger_witness::ScheduleProbe {
+                        intent_id: plan.facts.intent_id(),
+                        timelock: timelock.clone(),
+                        operation_id: *operation_id,
+                        expiration: 100,
+                        admitted_at_ms: 1000,
+                    },
+                    [value, value],
+                    [101, 102],
+                    [1999, 2000],
+                );
+            }
+            store.observe_signed_intents(&profile, &witness).unwrap();
+            let before = file_sha256(store.path());
+            let generation = get_raw(&generation_entry_ref(&profile));
+            let key = get_raw(&profile.policy_window_state_key_id);
+            #[cfg(feature = "test-hooks")]
+            let clients = crate::client::constructions_on_this_thread();
+            clock.set(2001 + RETENTION_MS);
+            for _ in 0..2 {
+                let views = store.signed_intents("intent", &profile).unwrap();
+                assert_eq!(views.len(), 1);
+                assert_eq!(views[0].accounting_horizon, "62000");
+                assert_eq!(views[0].expiry_observed_at_ms, Some(2000));
+                assert_eq!(views[0].retained_until_ms, Some(2000 + RETENTION_MS));
+                assert_eq!(views[0].purpose, plan.facts.purpose);
+                assert_eq!(
+                    views[0].schedule_terminal,
+                    terminal.map(|value| if value == 0 {
+                        ScheduleTerminal::Unset
+                    } else {
+                        ScheduleTerminal::Done
+                    })
+                );
+                assert!(views[0].reset_explanations.is_empty());
+                assert_eq!(file_sha256(store.path()), before);
+                assert_eq!(get_raw(&generation_entry_ref(&profile)), generation);
+                assert_eq!(get_raw(&profile.policy_window_state_key_id), key);
+            }
+            #[cfg(feature = "test-hooks")]
+            assert_eq!(crate::client::constructions_on_this_thread(), clients);
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn schedule_closure_requires_two_terminal_reads() {
+        for (values, heights, lower, closes) in [
+            ([0, 0], [101, 102], 101, true),
+            ([1, 1], [101, 102], 101, true),
+            ([0, 1], [101, 102], 101, false),
+            ([1, 0], [101, 102], 101, false),
+            ([0, 0], [100, 102], 101, false),
+            ([1, 1], [101, 100], 101, false),
+            ([0, 0], [101, 102], 100, false),
+            ([1, 1], [101, 102], 100, false),
+            ([90, 90], [101, 102], 101, false),
+            ([300, 300], [101, 102], 101, false),
+        ] {
+            let (_dir, profile, store, mut plan) = progress_fixture();
+            let clock = crate::mainnet::clock::set_now_ms_for_test(1000);
+            let timelock = stellar_strkey::Contract([1; 32]).to_string().to_string();
+            plan.facts.purpose = Some(IntentPurpose::TimelockSchedule {
+                timelock: timelock.clone(),
+                operation_id: [3; 32],
+            });
+            let _exposure = store.admit_signed_intent(&profile, &plan).unwrap().expose();
+            clock.set(2000);
+            let probe = crate::signing::ledger_witness::ScheduleProbe {
+                intent_id: plan.facts.intent_id(),
+                timelock,
+                operation_id: [3; 32],
+                expiration: 100,
+                admitted_at_ms: 1000,
+            };
+            let witness = progress_witness([lower, lower + 1], 1900)
+                .with_operation_states_for_test(probe, values, heights, [1999, 2000]);
+            let empty = intent_fixture_plan(2, 1)
+                .0
+                .with_legs(&[])
+                .with_capability(witness.clone());
+            let _proof = store.admit_signed_intent(&profile, &empty).unwrap();
+            assert!(
+                store
+                    .read_for_inspection(&profile)
+                    .unwrap()
+                    .unwrap()
+                    .signed_intents[0]
+                    .expiry_observed_at_ms
+                    .is_none(),
+                "signing admission cannot close a schedule"
+            );
+            store.observe_signed_intents(&profile, &witness).unwrap();
+            let wire = store.read_for_inspection(&profile).unwrap().unwrap();
+            assert_eq!(
+                wire.signed_intents[0].expiry_observed_at_ms,
+                closes.then_some(2000)
+            );
+            assert_eq!(
+                wire.signed_intents[0].schedule_read_primary_ledger,
+                closes.then_some(heights[0])
+            );
+            assert_eq!(
+                wire.signed_intents[0].schedule_read_secondary_ledger,
+                closes.then_some(heights[1])
+            );
+            assert_eq!(
+                wire.signed_intents[0].schedule_terminal,
+                closes.then_some(if values[0] == 0 {
+                    ScheduleTerminal::Unset
+                } else {
+                    ScheduleTerminal::Done
+                })
+            );
+        }
+        use stellar_xdr::WriteXdr as _;
+        use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
+        for missing_primary in [false, true] {
+            let (dir, profile, store, mut plan) = progress_fixture();
+            let clock = crate::mainnet::clock::set_now_ms_for_test(1000);
+            let timelock = stellar_strkey::Contract([1; 32]).to_string().to_string();
+            plan.facts.purpose = Some(IntentPurpose::TimelockSchedule {
+                timelock: timelock.clone(),
+                operation_id: [3; 32],
+            });
+            let _exposure = store.admit_signed_intent(&profile, &plan).unwrap().expose();
+            let primary = MockServer::start().await;
+            let secondary = MockServer::start().await;
+            for (server, refuses) in [(&primary, missing_primary), (&secondary, !missing_primary)] {
+                Mock::given(method("POST")).respond_with(move |request: &wiremock::Request| {
+                    let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                    let result = match body["method"].as_str().unwrap() {
+                        "getNetwork" => stellar_agent_test_support::signed_envelope::get_network_result(Caip2::Testnet.network_passphrase()),
+                        "getLatestLedger" => serde_json::json!({"id":"ab".repeat(32),"sequence":101,"protocolVersion":27}),
+                        "simulateTransaction" if refuses => serde_json::json!({"latestLedger":102,"error":"unavailable"}),
+                        "simulateTransaction" => serde_json::json!({"latestLedger":102,"minResourceFee":"100","transactionData":"","results":[{"auth":[],"xdr":stellar_xdr::ScVal::U32(1).to_xdr_base64(stellar_xdr::Limits::none()).unwrap()}]}),
+                        _ => panic!("only witness and state requests"),
+                    };
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!({"jsonrpc":"2.0","id":body["id"],"result":result}))
+                }).mount(server).await;
+            }
+            let primary_url = primary.uri();
+            let secondary_url = stellar_agent_test_support::second_loopback_host(&secondary.uri());
+            fs::write(dir.path().join("intent.toml"),format!("chain_id = \"stellar:testnet\"\nrpc_url = {primary_url:?}\nsecondary_rpc_url = {secondary_url:?}\n")).unwrap();
+            clock.set(2000);
+            let capability = LedgerWitnessCapability::acquire(
+                &crate::StellarRpcClient::new(&primary_url).unwrap(),
+                &crate::StellarRpcClient::new(&secondary_url).unwrap(),
+                Caip2::Testnet.network_passphrase(),
+                tokio::time::Instant::now() + std::time::Duration::from_secs(10),
+            )
+            .await
+            .unwrap();
+            let probe = crate::signing::ledger_witness::ScheduleProbe {
+                intent_id: plan.facts.intent_id(),
+                timelock,
+                operation_id: [3; 32],
+                expiration: 100,
+                admitted_at_ms: 1000,
+            };
+            let capability = capability.read_operation_states(&[probe]).await;
+            let before = file_sha256(store.path());
+            let generation = get_raw(&generation_entry_ref(&profile));
+            store.observe_signed_intents(&profile, &capability).unwrap();
+            assert_eq!(
+                file_sha256(store.path()),
+                before,
+                "one state answer supplies no closure evidence"
+            );
+            assert_eq!(get_raw(&generation_entry_ref(&profile)), generation);
+            assert_intent_totals(&store, &profile, 60, 1);
+            assert_eq!(primary.received_requests().await.unwrap().len(), 3);
+            assert_eq!(secondary.received_requests().await.unwrap().len(), 3);
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn schedule_evidence_matches_guarded_record() {
+        let (_dir, profile, store, mut plan) = progress_fixture();
+        let clock = crate::mainnet::clock::set_now_ms_for_test(1000);
+        let timelock = stellar_strkey::Contract([1; 32]).to_string().to_string();
+        plan.facts.purpose = Some(IntentPurpose::TimelockSchedule {
+            timelock: timelock.clone(),
+            operation_id: [3; 32],
+        });
+        let _exposure = store.admit_signed_intent(&profile, &plan).unwrap().expose();
+        clock.set(2000);
+        let before = file_sha256(store.path());
+        let probe = crate::signing::ledger_witness::ScheduleProbe {
+            intent_id: plan.facts.intent_id(),
+            timelock,
+            operation_id: [3; 32],
+            expiration: 100,
+            admitted_at_ms: 1000,
+        };
+        for change in 0..4 {
+            let mut changed = probe.clone();
+            match change {
+                0 => changed.intent_id = "intent-other".into(),
+                1 => changed.timelock = stellar_strkey::Contract([2; 32]).to_string().to_string(),
+                2 => changed.operation_id = [4; 32],
+                _ => changed.expiration = 99,
+            }
+            let witness = progress_witness([101, 101], 1900).with_operation_states_for_test(
+                changed,
+                [1, 1],
+                [102, 102],
+                [1990, 1995],
+            );
+            store.observe_signed_intents(&profile, &witness).unwrap();
+            assert_eq!(file_sha256(store.path()), before);
+        }
+        let witness = progress_witness([101, 101], 1900).with_operation_states_for_test(
+            probe,
+            [1, 1],
+            [102, 102],
+            [1990, 1995],
+        );
+        store.observe_signed_intents(&profile, &witness).unwrap();
+        assert_eq!(
+            store
+                .read_for_inspection(&profile)
+                .unwrap()
+                .unwrap()
+                .signed_intents[0]
+                .expiry_observed_at_ms,
+            Some(1995)
+        );
+        clock.set(3000);
+        store.observe_signed_intents(&profile, &witness).unwrap();
+        assert_eq!(
+            store
+                .read_for_inspection(&profile)
+                .unwrap()
+                .unwrap()
+                .signed_intents[0]
+                .expiry_observed_at_ms,
+            Some(1995)
+        );
+
+        for change in 0..5 {
+            let (dir, profile, store, mut plan) = progress_fixture();
+            let clock = crate::mainnet::clock::set_now_ms_for_test(1000);
+            let timelock = stellar_strkey::Contract([1; 32]).to_string().to_string();
+            plan.facts.purpose = Some(IntentPurpose::TimelockSchedule {
+                timelock: timelock.clone(),
+                operation_id: [3; 32],
+            });
+            let _exposure = store.admit_signed_intent(&profile, &plan).unwrap().expose();
+            clock.set(2000);
+            let probe = crate::signing::ledger_witness::ScheduleProbe {
+                intent_id: plan.facts.intent_id(),
+                timelock,
+                operation_id: [3; 32],
+                expiration: 100,
+                admitted_at_ms: 1000,
+            };
+            let witness = progress_witness([101, 101], 1900).with_operation_states_for_test(
+                probe,
+                [1, 1],
+                [102, 102],
+                [1990, 1995],
+            );
+            let key =
+                crate::keyring::load_hmac_key_32(&profile.policy_window_state_key_id).unwrap();
+            let generation_entry = generation_entry_ref(&profile);
+            {
+                let _guard = WindowStoreLock::acquire_for_with_retry(
+                    store.path(),
+                    &profile.policy_window_state_key_id,
+                )
+                .unwrap();
+                let original = store
+                    .read_verified(&profile, &key, &generation_entry)
+                    .unwrap();
+                let mut successor = original.clone();
+                let record = &mut successor.signed_intents[0];
+                match change {
+                    0 => record.envelope_sequence += 1,
+                    1 => {
+                        let Some(IntentPurpose::TimelockSchedule { timelock, .. }) =
+                            &mut record.purpose
+                        else {
+                            panic!("the fixture carries a schedule purpose");
+                        };
+                        *timelock = stellar_strkey::Contract([2; 32]).to_string().to_string();
+                    }
+                    2 => {
+                        let Some(IntentPurpose::TimelockSchedule { operation_id, .. }) =
+                            &mut record.purpose
+                        else {
+                            panic!("the fixture carries a schedule purpose");
+                        };
+                        *operation_id = [4; 32];
+                    }
+                    3 => {
+                        record.envelope_max_ledger = Some(99);
+                        record.greatest_expiration_ledger = Some(99);
+                    }
+                    _ => {
+                        record.witness_lower = Some(101);
+                        record.witness_upper = Some(101);
+                        record.expiry_observed_at_ms = Some(1800);
+                        record.accounting_until_ms = Some(61_800);
+                        record.schedule_terminal = Some(ScheduleTerminal::Done);
+                        record.schedule_read_primary_ledger = Some(102);
+                        record.schedule_read_secondary_ledger = Some(102);
+                    }
+                }
+                record.intent_id = record.facts().intent_id();
+                store
+                    .commit_generation(&key, &generation_entry, original, successor)
+                    .unwrap();
+            }
+            let reopened = PersistedWindowStore::at_path(store.path().to_owned())
+                .with_profile_directory("intent", dir.path().to_owned());
+            let before = file_sha256(reopened.path());
+            let generation = get_raw(&generation_entry);
+            reopened.observe_signed_intents(&profile, &witness).unwrap();
+            assert_eq!(file_sha256(reopened.path()), before, "change={change}");
+            assert_eq!(get_raw(&generation_entry), generation, "change={change}");
+            let wire = reopened.read_for_inspection(&profile).unwrap().unwrap();
+            let record = &wire.signed_intents[0];
+            let Some(IntentPurpose::TimelockSchedule {
+                timelock,
+                operation_id,
+            }) = &record.purpose
+            else {
+                panic!("the fixture carries a schedule purpose");
+            };
+            let matching_probe = crate::signing::ledger_witness::ScheduleProbe {
+                intent_id: record.intent_id.clone(),
+                timelock: timelock.clone(),
+                operation_id: *operation_id,
+                expiration: record.greatest_expiration_ledger.unwrap(),
+                admitted_at_ms: record.admitted_at_ms,
+            };
+            let matching = progress_witness([101, 101], 1900).with_operation_states_for_test(
+                matching_probe,
+                [1, 1],
+                [102, 102],
+                [1990, 1995],
+            );
+            clock.set(3000);
+            reopened
+                .observe_signed_intents(&profile, &matching)
+                .unwrap();
+            let restarted = PersistedWindowStore::at_path(store.path().to_owned())
+                .with_profile_directory("intent", dir.path().to_owned());
+            let record = restarted
+                .read_for_inspection(&profile)
+                .unwrap()
+                .unwrap()
+                .signed_intents
+                .remove(0);
+            assert_eq!(
+                record.expiry_observed_at_ms,
+                Some(if change == 4 { 1800 } else { 1995 }),
+                "change={change}"
+            );
+            assert_eq!(record.schedule_terminal, Some(ScheduleTerminal::Done));
+            assert_eq!(record.schedule_read_primary_ledger, Some(102));
+            assert_eq!(record.schedule_read_secondary_ledger, Some(102));
+            assert_eq!(
+                record.accounting_until_ms,
+                Some(if change == 4 { 61_800 } else { 61_995 })
+            );
+            if change == 4 {
+                assert_eq!(file_sha256(restarted.path()), before);
+                assert_eq!(get_raw(&generation_entry), generation);
+            }
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn insufficient_evidence_keeps_intents_open() {
+        for purpose in [
+            None,
+            Some(IntentPurpose::TimelockSchedule {
+                timelock: stellar_strkey::Contract([1; 32]).to_string().to_string(),
+                operation_id: [3; 32],
+            }),
+        ] {
+            let (dir, profile, store, mut plan) = progress_fixture();
+            let clock = crate::mainnet::clock::set_now_ms_for_test(1000);
+            let (_, mut envelope) = intent_fixture_plan(1, 60);
+            let stellar_xdr::TransactionEnvelope::Tx(tx) = &mut envelope else {
+                panic!("V1")
+            };
+            tx.tx.cond = stellar_xdr::Preconditions::V2(stellar_xdr::PreconditionsV2 {
+                time_bounds: None,
+                ledger_bounds: Some(stellar_xdr::LedgerBounds {
+                    min_ledger: 0,
+                    max_ledger: 100,
+                }),
+                min_seq_num: None,
+                min_seq_age: stellar_xdr::Duration(0),
+                min_seq_ledger_gap: 0,
+                extra_signers: Default::default(),
+            });
+            if purpose.is_some() {
+                let host =
+                    stellar_xdr::HostFunction::InvokeContract(stellar_xdr::InvokeContractArgs {
+                        contract_address: stellar_xdr::ScAddress::Contract(
+                            stellar_xdr::ContractId(stellar_xdr::Hash([1; 32])),
+                        ),
+                        function_name: stellar_xdr::ScSymbol::try_from("schedule").unwrap(),
+                        args: Default::default(),
+                    });
+                plan.facts.host_invocation_sha256 = crate::intent_xdr_hash(&host).unwrap();
+                let mut operations = tx.tx.operations.to_vec();
+                let stellar_xdr::OperationBody::InvokeHostFunction(op) = &mut operations[0].body
+                else {
+                    panic!("invoke")
+                };
+                op.host_function = host;
+                tx.tx.operations = operations.try_into().unwrap();
+            }
+            plan.facts.purpose = purpose;
+            let exposure = store.admit_signed_intent(&profile, &plan).unwrap().expose();
+            let before = file_sha256(store.path());
+            let generation = get_raw(&generation_entry_ref(&profile));
+            let now = RETENTION_MS * 2;
+            clock.set(now);
+            let witness = progress_witness([101, 102], now);
+            store.observe_signed_intents(&profile, &witness).unwrap();
+            assert_eq!(file_sha256(store.path()), before);
+            assert_intent_totals(&store, &profile, 60, 1);
+            let mut signing_witness = witness;
+            if let Some(IntentPurpose::TimelockSchedule {
+                timelock,
+                operation_id,
+            }) = &plan.facts.purpose
+            {
+                signing_witness = signing_witness.with_operation_states_for_test(
+                    crate::signing::ledger_witness::ScheduleProbe {
+                        intent_id: plan.facts.intent_id(),
+                        timelock: timelock.clone(),
+                        operation_id: *operation_id,
+                        expiration: 100,
+                        admitted_at_ms: 1000,
+                    },
+                    [1, 1],
+                    [101, 102],
+                    [now - 1, now],
+                );
+            }
+            let candidate = intent_fixture_plan(2, 1)
+                .0
+                .with_legs(&[])
+                .with_capability(signing_witness);
+            let proof = store.admit_signed_intent(&profile, &candidate).unwrap();
+            assert!(proof.intent_id.is_none());
+            store.cancel_signed_intent(&profile, proof).unwrap();
+            assert_eq!(file_sha256(store.path()), before);
+            assert_eq!(get_raw(&generation_entry_ref(&profile)), generation);
+            let facts =
+                crate::BindFacts::from_envelope(&envelope, Caip2::Testnet.network_passphrase())
+                    .unwrap();
+            store
+                .bind_signed_intent(&profile, exposure.intent_id().unwrap(), &facts, plan.legs())
+                .unwrap();
+            let hold = SubmissionHold {
+                chain_scope: plan.chain_scope(),
+                id: facts.envelope_hash.clone(),
+                tx_hash: facts.tx_hash,
+                source: plan.facts.envelope_source.clone(),
+                sequence: 1,
+                max_time: 0,
+                pending_since_ms: now,
+                submission_ledger: 101,
+                submission_anchor: None,
+                operator_required: false,
+            };
+            store
+                .record_pending_linked(&profile, plan.legs(), &hold, exposure.intent_id().unwrap())
+                .unwrap();
+            let intents_before_outcome = serde_json::to_value(
+                store
+                    .read_for_inspection(&profile)
+                    .unwrap()
+                    .unwrap()
+                    .signed_intents,
+            )
+            .unwrap();
+            let receipts = ReceiptStore::open_at(dir.path(), "intent").unwrap();
+            let hash = hold.id.clone();
+            receipts
+                .try_begin(&hash, &hash, &plan.facts.envelope_source, 1, 0, 101)
+                .unwrap();
+            receipts.mark_submitted(&hash).unwrap();
+            receipts
+                .finalize(&hash, ReceiptStatus::Success, Some(102))
+                .unwrap();
+            store.confirm(&profile, &hash, Some(2)).unwrap();
+            assert_eq!(
+                receipts.get(&hash).unwrap().unwrap().status,
+                ReceiptStatus::Success
+            );
+            assert_eq!(
+                serde_json::to_value(
+                    store
+                        .read_for_inspection(&profile)
+                        .unwrap()
+                        .unwrap()
+                        .signed_intents
+                )
+                .unwrap(),
+                intents_before_outcome
+            );
+            assert_intent_totals(&store, &profile, 60, 1);
+            assert!(matches!(
+                store.reset_snapshot(&profile, now),
+                Err(WindowStoreError::SignedIntentLive { .. })
+            ));
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn readmission_cannot_reclassify_an_intent() {
+        assert_readmission_cannot_reclassify_an_intent();
+    }
+
+    fn assert_readmission_cannot_reclassify_an_intent() {
+        let (_dir, profile, store, mut plan) = progress_fixture();
+        let _clock = crate::mainnet::clock::set_now_ms_for_test(1000);
+        plan.facts.purpose = None;
+        let _exposure = store.admit_signed_intent(&profile, &plan).unwrap().expose();
+        let before = file_sha256(store.path());
+        let generation = get_raw(&generation_entry_ref(&profile));
+        let reopened = PersistedWindowStore::at_path(store.path().to_owned());
+        plan.facts.purpose = Some(IntentPurpose::Invoke);
+        assert!(matches!(
+            reopened.admit_signed_intent(&profile, &plan),
+            Err(WindowStoreError::IntentBindingMismatch { field: "purpose" })
+        ));
+        assert_eq!(file_sha256(reopened.path()), before);
+        assert_eq!(get_raw(&generation_entry_ref(&profile)), generation);
+        let views = reopened.signed_intents("intent", &profile).unwrap();
+        assert_eq!(views.len(), 1);
+        assert_eq!(views[0].purpose, None);
+        assert_eq!(views[0].expiry_observed_at_ms, None);
+        assert_intent_totals(&reopened, &profile, 60, 1);
+    }
+
+    fn progress_fixture() -> (
+        TempDir,
+        Profile,
+        PersistedWindowStore,
+        crate::SignedIntentPlan,
+    ) {
+        keyring_mock::install().unwrap();
+        let dir = TempDir::new().unwrap();
+        let profile = test_profile(dir.path(), "intent");
+        fs::write(dir.path().join("intent.toml"), "chain_id = \"stellar:testnet\"\nrpc_url = \"https://primary.example/rpc\"\nsecondary_rpc_url = \"https://secondary.example/rpc\"\n").unwrap();
+        let store = PersistedWindowStore::at_path(dir.path().join("intent.window"))
+            .with_profile_directory("intent", dir.path().to_owned());
+        let mut plan = intent_fixture_plan(1, 60)
+            .0
+            .with_envelope_max_ledger(100)
+            .unwrap();
+        plan.facts.purpose = Some(IntentPurpose::Invoke);
+        (dir, profile, store, plan)
+    }
+
+    #[test]
+    #[serial]
+    fn stored_testnet_default_primary_authorizes_capability() {
+        let (dir, profile, store, plan) = progress_fixture();
+        let clock = crate::mainnet::clock::set_now_ms_for_test(1000);
+        fs::write(dir.path().join("intent.toml"), "chain_id = \"stellar:testnet\"\nsecondary_rpc_url = \"https://secondary.example/rpc\"\n").unwrap();
+        let endpoints =
+            stellar_agent_core::profile::loader::read_rpc_endpoints_on_disk("intent", dir.path())
+                .unwrap();
+        assert_eq!(endpoints.rpc_url, Caip2::Testnet.default_rpc_url().unwrap());
+        assert_eq!(
+            endpoints.secondary_rpc_url.as_deref(),
+            Some("https://secondary.example/rpc")
+        );
+        let _exposure = store.admit_signed_intent(&profile, &plan).unwrap().expose();
+        clock.set(2000);
+        let instant = tokio::time::Instant::now();
+        let witness = LedgerWitnessCapability::for_test(
+            ChainScope::for_chain(Caip2::Testnet),
+            [
+                &endpoints.rpc_url,
+                endpoints.secondary_rpc_url.as_deref().unwrap(),
+            ],
+            [101, 102],
+            [instant, instant],
+            [1999, 2000],
+            instant + std::time::Duration::from_secs(10),
+        )
+        .unwrap();
+        assert!(store.capability_is_current(&profile, &witness));
+        store.observe_signed_intents(&profile, &witness).unwrap();
+        assert_eq!(
+            store.signed_intents("intent", &profile).unwrap()[0].expiry_observed_at_ms,
+            Some(2000)
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn intent_reset_explanations_follow_open_records_and_stored_endpoints() {
+        use crate::intent_view_test_helpers::{SECONDARY, UNREADABLE};
+        for closed in [false, true] {
+            for unreadable in [false, true] {
+                let (dir, profile, store, plan) = progress_fixture();
+                let clock = crate::mainnet::clock::set_now_ms_for_test(1000);
+                let _exposure = store.admit_signed_intent(&profile, &plan).unwrap().expose();
+                clock.set(2000);
+                if closed {
+                    store
+                        .observe_signed_intents(&profile, &progress_witness([101, 102], 2000))
+                        .unwrap();
+                }
+                fs::write(dir.path().join("intent.toml"), if unreadable {
+                    "invalid profile"
+                } else {
+                    "chain_id = \"stellar:testnet\"\nrpc_url = \"https://primary.example/rpc\"\n"
+                }).unwrap();
+                let expected = if closed {
+                    ""
+                } else if unreadable {
+                    UNREADABLE
+                } else {
+                    SECONDARY
+                };
+                let Err(WindowStoreError::SignedIntentLive {
+                    explanation,
+                    exposed,
+                    bound,
+                }) = store.reset_snapshot(&profile, 2000)
+                else {
+                    panic!("retained intent blocks reset");
+                };
+                assert_eq!(explanation, expected);
+                assert_eq!((exposed, bound), (1, 0));
+                let views = store.signed_intents("intent", &profile).unwrap();
+                let expected: Vec<_> = if expected.is_empty() {
+                    vec![]
+                } else {
+                    vec![expected]
+                };
+                assert_eq!(views[0].reset_explanations, expected);
+            }
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn reset_retains_closed_intents_on_store_clock() {
+        let (_dir, profile, store, plan) = progress_fixture();
+        let clock = crate::mainnet::clock::set_now_ms_for_test(1000);
+        let _exposure = store.admit_signed_intent(&profile, &plan).unwrap().expose();
+        clock.set(2000);
+        store
+            .observe_signed_intents(&profile, &progress_witness([101, 102], 2000))
+            .unwrap();
+        let before = store.read_for_inspection(&profile).unwrap().unwrap();
+        let Err(WindowStoreError::SignedIntentLive { exposed, bound, .. }) =
+            store.reset_snapshot(&profile, 2000 + 2 * RETENTION_MS)
+        else {
+            panic!("the store clock retains the closed record");
+        };
+        assert_eq!((exposed, bound), (1, 0));
+        let after = store.read_for_inspection(&profile).unwrap().unwrap();
+        assert_eq!(
+            serde_json::to_value(&after.signed_intents).unwrap(),
+            serde_json::to_value(&before.signed_intents).unwrap(),
+        );
+        assert_eq!(after.generation, before.generation);
+        assert_eq!(
+            store.signed_intents("intent", &profile).unwrap()[0].expiry_observed_at_ms,
+            Some(2000)
+        );
+    }
+
+    thread_local! {
+        static CAPABILITY_CHECK_HOOK: std::cell::RefCell<Option<Box<dyn FnMut()>>> = std::cell::RefCell::new(None);
+    }
+
+    pub(super) fn before_capability_check() {
+        CAPABILITY_CHECK_HOOK.with_borrow_mut(|hook| {
+            if let Some(hook) = hook {
+                hook();
+            }
+        });
+    }
+
+    struct CapabilityCheckHook;
+    impl Drop for CapabilityCheckHook {
+        fn drop(&mut self) {
+            CAPABILITY_CHECK_HOOK.with_borrow_mut(|hook| *hook = None);
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn stale_observation_commits_pruning_once() {
+        let runtime = std::sync::Arc::new(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .start_paused(true)
+                .build()
+                .unwrap(),
+        );
+        let _runtime = runtime.enter();
+        let advancing = runtime.clone();
+        let (_dir, profile, store, plan) = progress_fixture();
+        let clock = crate::mainnet::clock::set_now_ms_for_test(1000);
+        let _exposure = store.admit_signed_intent(&profile, &plan).unwrap().expose();
+        clock.set(2000);
+        store
+            .observe_signed_intents(&profile, &progress_witness([101, 102], 2000))
+            .unwrap();
+        let before = store.read_for_inspection(&profile).unwrap().unwrap();
+        let boundary = 2000 + RETENTION_MS;
+        clock.set(boundary);
+        let witness = progress_witness([101, 102], boundary);
+        CAPABILITY_CHECK_HOOK.with_borrow_mut(|hook| {
+            let mut checks = 0;
+            *hook = Some(Box::new(move || {
+                checks += 1;
+                assert!(
+                    checks <= 2,
+                    "pruning only progress does not recheck the stale witness"
+                );
+                if checks == 2 {
+                    clock.set(boundary + 10_001);
+                    advancing.block_on(tokio::time::advance(std::time::Duration::from_millis(
+                        10_001,
+                    )));
+                }
+            }));
+        });
+        let hook = CapabilityCheckHook;
+        store.observe_signed_intents(&profile, &witness).unwrap();
+        drop(hook);
+        let after = store.read_for_inspection(&profile).unwrap().unwrap();
+        assert!(after.signed_intents.is_empty());
+        assert_eq!(after.generation, before.generation + 1);
+    }
+
+    fn progress_witness(heights: [u32; 2], t: u64) -> LedgerWitnessCapability {
+        let instant = tokio::time::Instant::now();
+        LedgerWitnessCapability::for_test(
+            ChainScope::for_chain(Caip2::Testnet),
+            [
+                "https://primary.example/rpc",
+                "https://secondary.example/rpc",
+            ],
+            heights,
+            [instant, instant],
+            [t - 1, t],
+            instant + std::time::Duration::from_secs(10),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    #[serial]
+    fn witnessed_closure_requires_stored_pair() {
+        let (_dir, profile, store, plan) = progress_fixture();
+        let clock = crate::mainnet::clock::set_now_ms_for_test(1000);
+        let _exposure = store.admit_signed_intent(&profile, &plan).unwrap().expose();
+        let before = file_sha256(store.path());
+        clock.set(2000);
+        for heights in [[100, 102], [102, 100]] {
+            store
+                .observe_signed_intents(&profile, &progress_witness(heights, 2000))
+                .unwrap();
+            assert_eq!(file_sha256(store.path()), before, "equality remains open");
+        }
+        let instant = tokio::time::Instant::now();
+        for (scope, endpoints, heights, deadline, refusal) in [
+            (
+                ChainScope::for_chain(Caip2::Mainnet),
+                [
+                    "https://primary.example/rpc",
+                    "https://secondary.example/rpc",
+                ],
+                [101, 102],
+                instant + std::time::Duration::from_secs(10),
+                None,
+            ),
+            (
+                ChainScope::for_chain(Caip2::Testnet),
+                [
+                    "https://primary.example/rpc",
+                    "https://primary.example/secondary",
+                ],
+                [101, 102],
+                instant + std::time::Duration::from_secs(10),
+                Some("no secondary RPC endpoint on a host other than the primary's is configured"),
+            ),
+            (
+                ChainScope::for_chain(Caip2::Testnet),
+                [
+                    "https://primary.example/rpc",
+                    "https://secondary.example/rpc",
+                ],
+                [101, 104],
+                instant + std::time::Duration::from_secs(10),
+                Some("the endpoints' latest ledgers differ by more than the tolerance"),
+            ),
+            (
+                ChainScope::for_chain(Caip2::Testnet),
+                [
+                    "https://primary.example/rpc",
+                    "https://secondary.example/rpc",
+                ],
+                [101, 102],
+                instant,
+                None,
+            ),
+        ] {
+            let result = LedgerWitnessCapability::for_test(
+                scope,
+                endpoints,
+                heights,
+                [instant, instant],
+                [1999, 2000],
+                deadline,
+            );
+            match refusal {
+                Some(expected) => assert!(
+                    matches!(result, Err(crate::signing::ledger_witness::LedgerWitnessError::Unavailable { reason } | crate::signing::ledger_witness::LedgerWitnessError::Mismatch { reason }) if reason == expected),
+                    "pair refuses the exact invalid evidence"
+                ),
+                None => store
+                    .observe_signed_intents(&profile, &result.unwrap())
+                    .unwrap(),
+            }
+            assert_eq!(
+                file_sha256(store.path()),
+                before,
+                "unauthorized pair leaves the record open"
+            );
+            assert_intent_totals(&store, &profile, 60, 1);
+        }
+        assert!(
+            crate::signing::ledger_witness::checked_secondary_rpc_url(
+                "https://primary.example/rpc",
+                None,
+                Caip2::Testnet.network_passphrase()
+            )
+            .is_err()
+        );
+        let generation = get_raw(&generation_entry_ref(&profile));
+        let bare = intent_fixture_plan(2, 1).0;
+        assert!(matches!(
+            store.admit_signed_intent(&profile, &bare),
+            Err(WindowStoreError::PolicyDenied { .. })
+        ));
+        assert_eq!(get_raw(&generation_entry_ref(&profile)), generation);
+        assert_eq!(
+            file_sha256(store.path()),
+            before,
+            "a plan without a capability closes nothing"
+        );
+        for endpoints in [
+            [
+                "https://primary.example/override",
+                "https://secondary.example/rpc",
+            ],
+            [
+                "https://primary.example/rpc",
+                "https://secondary.example/override",
+            ],
+        ] {
+            let witness = LedgerWitnessCapability::for_test(
+                ChainScope::for_chain(Caip2::Testnet),
+                endpoints,
+                [101, 102],
+                [instant, instant],
+                [1999, 2000],
+                instant + std::time::Duration::from_secs(10),
+            )
+            .unwrap();
+            store.observe_signed_intents(&profile, &witness).unwrap();
+            assert_eq!(
+                file_sha256(store.path()),
+                before,
+                "endpoint replacement remains open"
+            );
+        }
+        for (arrived, observed) in [
+            (999, instant),
+            (2001, instant),
+            (2000, instant + std::time::Duration::from_secs(1)),
+            (2000, instant - std::time::Duration::from_secs(11)),
+        ] {
+            let witness = LedgerWitnessCapability::for_test(
+                ChainScope::for_chain(Caip2::Testnet),
+                [
+                    "https://primary.example/rpc",
+                    "https://secondary.example/rpc",
+                ],
+                [101, 102],
+                [observed, observed],
+                [arrived, arrived],
+                instant + std::time::Duration::from_secs(10),
+            )
+            .unwrap();
+            store.observe_signed_intents(&profile, &witness).unwrap();
+            assert_eq!(
+                file_sha256(store.path()),
+                before,
+                "invalid clock evidence remains open"
+            );
+        }
+        clock.set(2500);
+        store
+            .observe_signed_intents(&profile, &progress_witness([101, 103], 2000))
+            .unwrap();
+        let closed = store.read_for_inspection(&profile).unwrap().unwrap();
+        assert_eq!(closed.signed_intents[0].expiry_observed_at_ms, Some(2000));
+        assert_eq!(closed.signed_intents[0].accounting_until_ms, Some(62_000));
+        clock.set(3000);
+        store
+            .observe_signed_intents(&profile, &progress_witness([105, 105], 3000))
+            .unwrap();
+        assert_eq!(
+            store
+                .read_for_inspection(&profile)
+                .unwrap()
+                .unwrap()
+                .signed_intents[0]
+                .expiry_observed_at_ms,
+            Some(2000)
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn intent_horizons_survive_window_lengthening() {
+        assert_intent_horizons_survive_window_lengthening();
+    }
+
+    fn assert_intent_horizons_survive_window_lengthening() {
+        let (_dir, profile, store, plan) = progress_fixture();
+        let clock = crate::mainnet::clock::set_now_ms_for_test(1000);
+        let _exposure = store.admit_signed_intent(&profile, &plan).unwrap().expose();
+        clock.set(2000);
+        let witness = progress_witness([101, 101], 2000);
+        store.observe_signed_intents(&profile, &witness).unwrap();
+        for (now, short_count, week_count, retained) in [
+            (62_000, 1, 1, true),
+            (62_001, 0, 1, true),
+            (2000 + RETENTION_MS, 0, 1, true),
+            (2001 + RETENTION_MS, 0, 0, false),
+        ] {
+            clock.set(now);
+            store.observe_signed_intents(&profile, &witness).unwrap();
+            let wire = store.read_for_inspection(&profile).unwrap().unwrap();
+            assert_eq!(!wire.signed_intents.is_empty(), retained);
+            let loaded = PolicyStateStore::new();
+            store.load_into("intent", &profile, &loaded).unwrap();
+            for (seconds, count) in [(60, short_count), (604_800, week_count)] {
+                for (bucket, amount) in [("native", 60), ("rate_limit", 1)] {
+                    let key = StateKey::new("intent", 1, bucket, seconds);
+                    let expected = (amount * i128::from(count), count);
+                    assert_eq!(window_in_file(&wire, &key, now).unwrap(), expected);
+                    assert_eq!(loaded.query_window(&key, now).unwrap(), expected);
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn refused_admission_commits_only_progress() {
+        let (_dir, profile, store, plan) = progress_fixture();
+        let clock = crate::mainnet::clock::set_now_ms_for_test(1000);
+        let _exposure = store.admit_signed_intent(&profile, &plan).unwrap().expose();
+        clock.set(2000);
+        let candidate = intent_fixture_plan(2, 1)
+            .0
+            .with_capability(progress_witness([101, 101], 2000));
+        assert!(matches!(
+            store.admit_signed_intent(&profile, &candidate),
+            Err(WindowStoreError::PolicyDenied { .. })
+        ));
+        let wire = store.read_for_inspection(&profile).unwrap().unwrap();
+        assert_eq!(wire.signed_intents.len(), 1);
+        assert_eq!(wire.signed_intents[0].expiry_observed_at_ms, Some(2000));
+        let (_conflict_dir, conflict_profile, conflict_store, original_plan) = progress_fixture();
+        clock.set(1000);
+        let _exposure = conflict_store
+            .admit_signed_intent(&conflict_profile, &original_plan)
+            .unwrap()
+            .expose();
+        clock.set(2000);
+        let changed_legs = intent_fixture_plan(1, 61).0.legs().to_vec();
+        let conflicting = original_plan
+            .with_legs(&changed_legs)
+            .with_capability(progress_witness([101, 101], 2000));
+        assert!(matches!(
+            conflict_store.admit_signed_intent(&conflict_profile, &conflicting),
+            Err(WindowStoreError::IntentBindingMismatch { field: "legs" })
+        ));
+        let reopened = PersistedWindowStore::at_path(conflict_store.path().to_owned());
+        let conflict_wire = reopened
+            .read_for_inspection(&conflict_profile)
+            .unwrap()
+            .unwrap();
+        assert_eq!(conflict_wire.signed_intents.len(), 1);
+        assert_eq!(
+            conflict_wire.signed_intents[0].expiry_observed_at_ms,
+            Some(2000)
+        );
+        assert_intent_totals(&reopened, &conflict_profile, 60, 1);
+        let (_second_dir, profile, store, plan) = progress_fixture();
+        clock.set(1000);
+        let _exposure = store.admit_signed_intent(&profile, &plan).unwrap().expose();
+        clock.set(2000);
+        let before = file_sha256(store.path());
+        let _failure = fail_store_writes();
+        let error = store
+            .admit_signed_intent(&profile, &candidate)
+            .err()
+            .unwrap();
+        assert_eq!(
+            crate::signed_intent::store_refusal(error).code(),
+            "submission.intent_record_unavailable"
+        );
+        assert_eq!(file_sha256(store.path()), before);
+    }
+
+    #[test]
+    #[serial]
+    fn intent_horizon_overflow_changes_nothing() {
+        let (_dir, profile, store, plan) = progress_fixture();
+        let clock = crate::mainnet::clock::set_now_ms_for_test(1000);
+        let _exposure = store.admit_signed_intent(&profile, &plan).unwrap().expose();
+        let before = file_sha256(store.path());
+        let generation = get_raw(&generation_entry_ref(&profile));
+        for t in [u64::MAX, u64::MAX - 60_000] {
+            clock.set(t);
+            let error = store
+                .observe_signed_intents(&profile, &progress_witness([101, 101], t))
+                .unwrap_err();
+            assert!(
+                matches!(error,WindowStoreError::Invalid { ref detail } if detail == "signed intent horizon overflows")
+            );
+            assert_eq!(file_sha256(store.path()), before);
+            assert_eq!(get_raw(&generation_entry_ref(&profile)), generation);
+            assert_intent_totals(&store, &profile, 60, 1);
+        }
+        clock.set(2000);
+        let huge = WindowEntry::new(
+            StateKey::new("intent", 1, "native", u64::MAX),
+            2000,
+            1,
+            WindowLimit::Amount {
+                asset: "native".into(),
+                window: "1w".into(),
+                max_stroops: 100,
+            },
+        );
+        let candidate = intent_fixture_plan(2, 1).0.with_legs(&[huge]);
+        let error = store
+            .admit_signed_intent(&profile, &candidate)
+            .err()
+            .unwrap();
+        assert!(
+            matches!(error,WindowStoreError::Invalid { ref detail } if detail == "signed intent horizon overflows")
+        );
+        assert_eq!(file_sha256(store.path()), before);
+        assert_eq!(get_raw(&generation_entry_ref(&profile)), generation);
+        assert_intent_totals(&store, &profile, 60, 1);
+        store
+            .observe_signed_intents(&profile, &progress_witness([101, 101], 2000))
+            .unwrap();
+        let closed = file_sha256(store.path());
+        let closed_generation = get_raw(&generation_entry_ref(&profile));
+        let wire = store.read_for_inspection(&profile).unwrap().unwrap();
+        let loaded = PolicyStateStore::new();
+        store.load_into("intent", &profile, &loaded).unwrap();
+        for seconds in [u64::MAX, u64::MAX / 1000] {
+            let key = StateKey::new("intent", 1, "native", seconds);
+            assert!(matches!(
+                window_in_file(&wire, &key, 2000),
+                Err(DenyReason::EvaluationError { ref detail })
+                    if detail == "signed intent horizon overflows"
+            ));
+            assert!(matches!(loaded.query_window(&key,2000),Err(stellar_agent_core::policy::v1::criteria::state_store::StateStoreError::HorizonOverflow)));
+            assert_eq!(file_sha256(store.path()), closed);
+            assert_eq!(get_raw(&generation_entry_ref(&profile)), closed_generation);
+            assert_intent_totals(&store, &profile, 60, 1);
+        }
+    }
 
     fn assert_intent_totals(
         store: &PersistedWindowStore,
@@ -5602,7 +8318,8 @@ mod tests {
             assert_reset_refuses(&store, &profile),
             WindowStoreError::SignedIntentLive {
                 exposed: 0,
-                bound: 1
+                bound: 1,
+                ..
             }
         ));
         let (plan_b, envelope_b) = intent_fixture_plan(2, 60);
@@ -5660,6 +8377,135 @@ mod tests {
                 .iter()
                 .any(|intent| intent.intent_id == exposed_b.intent_id().unwrap()
                     && intent.status == "authorization exposed, submission unknown")
+        );
+        assert_bound_intent_links_prune_to_zero();
+    }
+
+    fn assert_bound_intent_links_prune_to_zero() {
+        use stellar_xdr::{LedgerBounds, Preconditions, PreconditionsV2, TransactionEnvelope};
+        let (dir, profile, store, _) = progress_fixture();
+        let clock = crate::mainnet::clock::set_now_ms_for_test(1000);
+        let (fixture, mut envelope) = intent_fixture_kind(2);
+        let TransactionEnvelope::Tx(tx) = &mut envelope else {
+            unreachable!()
+        };
+        tx.tx.cond = Preconditions::V2(PreconditionsV2 {
+            time_bounds: None,
+            ledger_bounds: Some(LedgerBounds {
+                min_ledger: 0,
+                max_ledger: 50,
+            }),
+            min_seq_num: None,
+            min_seq_age: stellar_xdr::Duration(0),
+            min_seq_ledger_gap: 0,
+            extra_signers: Default::default(),
+        });
+        let stellar_xdr::OperationBody::InvokeHostFunction(op) = &tx.tx.operations[0].body else {
+            unreachable!()
+        };
+        let plan = fixture
+            .with_envelope_max_ledger(50)
+            .unwrap()
+            .classify_purpose(&op.host_function, None)
+            .unwrap();
+        assert_eq!(plan.purpose(), Some(&IntentPurpose::Invoke));
+        assert_eq!(plan.facts.greatest_expiration_ledger, Some(100));
+        assert_eq!(plan.check_envelope(&envelope), Ok(()));
+        let exposure = store.admit_signed_intent(&profile, &plan).unwrap().expose();
+        let id = exposure.intent_id().unwrap();
+        let facts = crate::BindFacts::from_envelope(&envelope, Caip2::Testnet.network_passphrase())
+            .unwrap();
+        let before = file_sha256(store.path());
+        for bound in [None, Some(0), Some(49), Some(51)] {
+            let mut changed = facts.clone();
+            changed.facts.envelope_max_ledger = bound;
+            assert!(matches!(
+                store.bind_signed_intent(&profile, id, &changed, plan.legs()),
+                Err(WindowStoreError::IntentBindingMismatch {
+                    field: "expiration"
+                })
+            ));
+            assert_eq!(file_sha256(store.path()), before);
+        }
+        let mut changed = facts.clone();
+        let stellar_xdr::HostFunction::InvokeContract(call) = &mut changed.host else {
+            unreachable!()
+        };
+        call.function_name = stellar_xdr::ScSymbol::try_from("schedule").unwrap();
+        assert!(matches!(
+            store.bind_signed_intent(&profile, id, &changed, plan.legs()),
+            Err(WindowStoreError::IntentBindingMismatch { field: "purpose" })
+        ));
+        assert_eq!(file_sha256(store.path()), before);
+        store
+            .bind_signed_intent(&profile, id, &facts, plan.legs())
+            .unwrap();
+        let hold = SubmissionHold {
+            chain_scope: plan.chain_scope(),
+            id: facts.envelope_hash,
+            tx_hash: facts.tx_hash,
+            source: plan.facts.envelope_source.clone(),
+            sequence: 1,
+            max_time: 0,
+            pending_since_ms: 1000,
+            submission_ledger: 1,
+            submission_anchor: None,
+            operator_required: false,
+        };
+        store
+            .record_pending_linked(&profile, plan.legs(), &hold, id)
+            .unwrap();
+        let receipts = ReceiptStore::open_at(dir.path(), "intent").unwrap();
+        receipts
+            .try_begin(&hold.id, &hold.tx_hash, &hold.source, 1, 0, 1)
+            .unwrap();
+        receipts.mark_submitted(&hold.id).unwrap();
+        assert_intent_totals(&store, &profile, 60, 1);
+        clock.set(2000);
+        let witness = progress_witness([101, 102], 2000);
+        store.observe_signed_intents(&profile, &witness).unwrap();
+        assert_eq!(
+            store.signed_intents("intent", &profile).unwrap()[0].expiry_observed_at_ms,
+            Some(2000)
+        );
+        clock.set(2001 + RETENTION_MS);
+        store.observe_signed_intents(&profile, &witness).unwrap();
+        let reopened = PersistedWindowStore::at_path(store.path().to_owned());
+        assert!(
+            reopened
+                .signed_intents("intent", &profile)
+                .unwrap()
+                .is_empty()
+        );
+        assert_intent_totals(&reopened, &profile, 0, 0);
+        let wire = reopened.read_for_inspection(&profile).unwrap().unwrap();
+        let loaded = PolicyStateStore::new();
+        reopened.load_into("intent", &profile, &loaded).unwrap();
+        for bucket in ["native", "rate_limit"] {
+            for seconds in [60, 604_800] {
+                let key = StateKey::new("intent", 1, bucket, seconds);
+                assert_eq!(
+                    window_in_file(&wire, &key, 2001 + RETENTION_MS).unwrap(),
+                    (0, 0)
+                );
+                assert_eq!(
+                    loaded.query_window(&key, 2001 + RETENTION_MS).unwrap(),
+                    (0, 0)
+                );
+            }
+        }
+        assert_eq!(wire.entries.len(), plan.legs().len());
+        for entry in &wire.entries {
+            assert_eq!(entry.records.len(), 1);
+            assert_eq!(entry.records[0].signed_intent.as_deref(), Some(id));
+        }
+        assert_eq!(
+            reopened.pending_reservations(&profile).unwrap(),
+            vec![hold.clone()]
+        );
+        assert_eq!(
+            receipts.get(&hold.id).unwrap().unwrap().status,
+            ReceiptStatus::Pending
         );
     }
 
@@ -5723,6 +8569,21 @@ mod tests {
             assert_intent_totals(&store, &profile, 60, 1);
             assert_eq!(store.signed_intents("intent", &profile).unwrap().len(), 1);
         }
+        let known = crate::SignedIntentPlan::new(
+            Caip2::Testnet.network_passphrase(),
+            "fixture",
+            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+            1,
+            [7; 32],
+            Vec::new(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            known.facts.intent_id(),
+            "intent-81fe93946f940554a2cf311403afec303ebd5bfa92c70e1862c2a06ae0646e51"
+        );
+        assert_readmission_cannot_reclassify_an_intent();
     }
 
     #[test]
@@ -5889,12 +8750,14 @@ mod tests {
                     assert_reset_refuses(&reopened, &fx.profile),
                     WindowStoreError::SignedIntentLive {
                         exposed: 1,
-                        bound: 0
+                        bound: 0,
+                        ..
                     }
                 ));
                 assert_eq!(fs::read(reopened.path()).unwrap(), before);
             }
         }
+        assert_closure_and_pruning_survive_each_commit_seam();
     }
 
     #[test]
@@ -6101,12 +8964,21 @@ mod tests {
                 bad.signed_intents[0].intent_id = bad.signed_intents[0].facts().intent_id();
             }
             f.seal(&bad);
+            let detail = match name {
+                "version" | "prepared version" => "signed intent state requires version 9",
+                "id" => "signed intent identifier does not match",
+                "duplicate" => "signed intent authority conflicts",
+                "empty legs" => "signed intent admitted window does not match",
+                "zero window" => "signed intent window is unsupported",
+                "expiry" | "source nonce" | "smart account expiration" => {
+                    "signed intent expiration does not match"
+                }
+                _ => "signed intent state does not match its snapshot",
+            };
+            let error = f.store.read_for_inspection(&f.profile).unwrap_err();
             assert!(
-                matches!(
-                    f.store.read_for_inspection(&f.profile),
-                    Err(WindowStoreError::Invalid { .. })
-                ),
-                "{name}"
+                matches!(&error, WindowStoreError::Invalid { detail: actual } if actual == detail),
+                "{name}: {error:?}"
             );
         }
         for kind in [
@@ -6163,12 +9035,17 @@ mod tests {
                 }
                 intent.intent_id = intent.facts().intent_id();
                 f.seal(&bad);
+                let detail = if (kind == crate::SubjectKind::AccountKey && defect == 2)
+                    || (kind == crate::SubjectKind::SourceAccount && defect == 5)
+                {
+                    "signed intent expiration does not match"
+                } else {
+                    "signed intent state does not match its snapshot"
+                };
+                let error = f.store.read_for_inspection(&f.profile).unwrap_err();
                 assert!(
-                    matches!(
-                        f.store.read_for_inspection(&f.profile),
-                        Err(WindowStoreError::Invalid { .. })
-                    ),
-                    "{kind:?} {defect}"
+                    matches!(&error, WindowStoreError::Invalid { detail: actual } if actual == detail),
+                    "{kind:?} {defect}: {error:?}"
                 );
             }
         }
@@ -6220,13 +9097,36 @@ mod tests {
                 _ => bad.entries[0].records[0].signed_intent = Some("ab".repeat(32)),
             }
             f.seal(&bad);
-            assert!(
-                matches!(
-                    f.store.read_for_inspection(&f.profile),
-                    Err(WindowStoreError::Invalid { .. })
-                ),
-                "link {defect}"
-            );
+            if defect == 1 {
+                let wire = f.store.read_for_inspection(&f.profile).unwrap().unwrap();
+                assert_eq!(
+                    window_in_file(&wire, plan.legs()[0].key(), now_ms().unwrap()).unwrap(),
+                    (0, 0)
+                );
+                let loaded = PolicyStateStore::new();
+                f.store.load_into("intent", &f.profile, &loaded).unwrap();
+                assert_eq!(
+                    loaded
+                        .query_window(plan.legs()[0].key(), now_ms().unwrap())
+                        .unwrap(),
+                    (0, 0)
+                );
+                assert_eq!(
+                    wire.entries[0].records[0].signed_intent,
+                    linked.entries[0].records[0].signed_intent
+                );
+            } else {
+                let detail = if defect == 0 {
+                    "signed intent state requires version 9"
+                } else {
+                    "signed intent state does not match its snapshot"
+                };
+                let error = f.store.read_for_inspection(&f.profile).unwrap_err();
+                assert!(
+                    matches!(&error, WindowStoreError::Invalid { detail: actual } if actual == detail),
+                    "link {defect}: {error:?}"
+                );
+            }
         }
         let mut future = valid.clone();
         future.version = 10;
@@ -6256,11 +9156,80 @@ mod tests {
             let mut bytes = tag.to_vec();
             bytes.extend(body);
             fs::write(f.store.path(), bytes).unwrap();
-            assert!(matches!(
-                f.store.read_for_inspection(&f.profile),
-                Err(WindowStoreError::Invalid { .. })
-            ));
+            let error = f.store.read_for_inspection(&f.profile).unwrap_err();
+            assert!(
+                matches!(&error, WindowStoreError::Invalid { detail }
+                if detail.starts_with("store body is not valid JSON: the body has a missing field or a field of the wrong type or value")),
+                "{error:?}"
+            );
         }
+        let facts = valid.signed_intents[0].facts();
+        let mut identity = b"stellar-agent-signed-intent:v1".to_vec();
+        let encode_string = |out: &mut Vec<u8>, value: &str| {
+            out.extend(u32::try_from(value.len()).unwrap().to_be_bytes());
+            out.extend(value.as_bytes());
+        };
+        encode_string(&mut identity, &facts.chain_scope.chain().to_string());
+        identity.extend(Sha256::digest(
+            facts.chain_scope.chain().network_passphrase().as_bytes(),
+        ));
+        encode_string(&mut identity, &facts.auth_address);
+        encode_string(&mut identity, &facts.envelope_source);
+        identity.extend(facts.envelope_sequence.to_be_bytes());
+        identity.extend(facts.host_invocation_sha256);
+        identity.extend(u32::try_from(facts.subjects.len()).unwrap().to_be_bytes());
+        for subject in &facts.subjects {
+            identity.extend(subject.encode());
+        }
+        if let Some(expiration) = facts.greatest_expiration_ledger {
+            identity.push(1);
+            identity.extend(expiration.to_be_bytes());
+        } else {
+            identity.push(0);
+        }
+        let mut predecessor = serde_json::to_value(&valid).unwrap();
+        predecessor["signed_intents"][0]["intent_id"] = format!(
+            "intent-{}",
+            crate::submit::bytes_to_hex(&Sha256::digest(identity))
+        )
+        .into();
+        for field in [
+            "purpose",
+            "envelope_max_ledger",
+            "admitted_window_ms",
+            "witness_lower",
+            "witness_upper",
+            "expiry_observed_at_ms",
+            "accounting_until_ms",
+            "schedule_terminal",
+            "schedule_read_primary_ledger",
+            "schedule_read_secondary_ledger",
+        ] {
+            predecessor["signed_intents"][0]
+                .as_object_mut()
+                .unwrap()
+                .remove(field);
+        }
+        let (key, _) = f.store.load_or_mint_key(&f.profile).unwrap();
+        for prepared in [false, true] {
+            let value = if prepared {
+                let mut parent = serde_json::to_value(&valid).unwrap();
+                parent["prepared"] = predecessor.clone();
+                parent
+            } else {
+                predecessor.clone()
+            };
+            let body = serde_json::to_vec(&value).unwrap();
+            let mut bytes = compute_tag(key.as_ref(), &body).unwrap().to_vec();
+            bytes.extend(body);
+            let error = f.store.verify_with_key(&key, &bytes).unwrap_err();
+            assert!(
+                matches!(&error, WindowStoreError::Invalid { detail }
+                if detail == "signed intent purpose field is missing"),
+                "prepared={prepared}: {error:?}"
+            );
+        }
+        assert_final_intent_snapshot_predicates_are_distinct();
     }
 
     fn test_profile(dir: &Path, name: &str) -> Profile {
@@ -10780,6 +13749,7 @@ mod tests {
         store.load_into("edited-horizon", &profile, &state).unwrap();
         assert_eq!(state.query_window(&long, until).unwrap(), (18, 2));
         assert_eq!(state.query_window(&long, until + 1).unwrap(), (0, 0));
+        assert_intent_horizons_survive_window_lengthening();
     }
 
     fn assert_success_horizon(delayed: bool) {
@@ -11328,6 +14298,48 @@ mod tests {
             assert_eq!(
                 written.version, 5,
                 "{pair}: the next write selects its version from its content"
+            );
+        }
+
+        for committed in [false, true] {
+            let (_dir, profile, store, plan) = progress_fixture();
+            let _clock = crate::mainnet::clock::set_now_ms_for_test(1000);
+            let _exposure = store.admit_signed_intent(&profile, &plan).unwrap().expose();
+            let key =
+                crate::keyring::load_hmac_key_32(&profile.policy_window_state_key_id).unwrap();
+            let gen_entry = generation_entry_ref(&profile);
+            let mut successor = store.read_for_inspection(&profile).unwrap().unwrap();
+            let mut parent = successor.clone();
+            parent.signed_intents.clear();
+            parent.version = 8;
+            successor.generation += 1;
+            successor.version = 9;
+            write_generation(&gen_entry, if committed { &successor } else { &parent }).unwrap();
+            parent.prepared = Some(Box::new(successor));
+            store.write_atomic(&key, &parent).unwrap();
+            let reopened = PersistedWindowStore::at_path(store.path().to_owned());
+            let selected = reopened.read_for_inspection(&profile).unwrap().unwrap();
+            assert_eq!(selected.version, if committed { 9 } else { 8 });
+            assert_eq!(selected.signed_intents.len(), usize::from(committed));
+            let loaded = PolicyStateStore::new();
+            reopened.load_into("intent", &profile, &loaded).unwrap();
+            assert_eq!(
+                loaded
+                    .query_window(&StateKey::new("intent", 1, "native", 60), 1000)
+                    .unwrap(),
+                (if committed { 60 } else { 0 }, u32::from(committed))
+            );
+            let mut malformed = serde_json::to_value(&parent).unwrap();
+            malformed["prepared"]["signed_intents"][0]
+                .as_object_mut()
+                .unwrap()
+                .remove("purpose");
+            let body = serde_json::to_vec(&malformed).unwrap();
+            let mut bytes = compute_tag(key.as_ref(), &body).unwrap().to_vec();
+            bytes.extend(body);
+            fs::write(store.path(), bytes).unwrap();
+            assert!(
+                matches!(reopened.read_for_inspection(&profile), Err(WindowStoreError::Invalid { detail }) if detail == "signed intent purpose field is missing")
             );
         }
     }
