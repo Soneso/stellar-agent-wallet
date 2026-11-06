@@ -22,10 +22,11 @@
 # or a NOT_CARRIED entry. The case reads step names and run: keys only, never
 # the commands.
 #
-# Usage: test-preflight.sh [--case <name>]
+# Usage: test-preflight.sh [--case <name> | --mutations [<control>]]
 # Prints "preflight test: N of N passed" and exits 0, or lists each failed
-# case with its output and exits 1. Needs bash 3.2 or later and Python 3.11
-# or later.
+# case with its output and exits 1. The mutation modes print "preflight
+# mutation controls: N of N passed" or list each failed control the same way.
+# Needs bash 3.2 or later and Python 3.11 or later.
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/../.." && pwd -P)
@@ -185,6 +186,10 @@ build_fixture() {
     cp "$ROOT/$file" "$dir/$file"
   done
   cp -R "$ROOT/.github" "$dir/.github"
+  if [ -n "${2:-}" ]; then
+    apply_mutation "$2" "$dir/.github/scripts/preflight.sh"
+    bash -n "$dir/.github/scripts/preflight.sh"
+  fi
   (cd "$dir" && git init -q -b main && git add -A && git commit -q -m fixture)
   mkdir -p "$dir/contracts/cap85-beacon/src" "$dir/crates/stellar-agent-sep7/tests"
 }
@@ -1620,13 +1625,166 @@ case_coverage_unavailable() {
   assert_clean_calls
 }
 
+MUTATION_CONTROLS="rename-source untracked-paths dev-dependencies target-dependencies unique-gates failed-gate unavailable-gate fresh-coverage"
+
+# Prints the existing case that pins mutation control $1, then the message of
+# the assertion that must end the case log on the mutant.
+mutation_case() {
+  local differs="the list differs from the expected gates with base main"
+  local end="the run exited 0, expected 1 with the last line 'preflight:" floors
+  case "$1" in
+    rename-source) echo "committed-cross-scope-rename $differs" ;;
+    untracked-paths) echo "untracked-test-file $differs" ;;
+    dev-dependencies) echo "dev-dependency-edge $differs" ;;
+    target-dependencies) echo "target-specific-edge $differs" ;;
+    unique-gates) echo "duplicate-triggers $differs" ;;
+    failed-gate) echo "exit-aggregation $end 5 gates run, 1 failed, 0 unavailable'" ;;
+    unavailable-gate) echo "unavailable-tool $end 3 gates run, 0 failed, 1 unavailable'" ;;
+    fresh-coverage)
+      floors=$(registry_row coverage-floors | cut -f 2)
+      echo "coverage-suppression the run printed no line '- \`$floors\`:" \
+        "not run (no coverage file from this run)'" ;;
+    *) return 1 ;;
+  esac
+}
+
+# Applies mutation control $1 to the preflight script $2; each edit matches
+# exactly one line.
+# shellcheck disable=SC2016
+apply_mutation() {
+  local file=$2
+  case "$1" in
+    rename-source)
+      replace_line "$file" '  git diff --name-only -z --no-renames --merge-base "$BASE" -- >"$SCRATCH/diff" ||' \
+        '  git diff --name-only -z --merge-base "$BASE" -- >"$SCRATCH/diff" ||' ;;
+    untracked-paths)
+      replace_line "$file" '  git status --porcelain=v1 -z --untracked-files=all >"$SCRATCH/status" ||' \
+        '  git status --porcelain=v1 -z --untracked-files=no >"$SCRATCH/status" ||' ;;
+    dev-dependencies)
+      replace_line "$file" '    yield manifest.get("dev-dependencies", {})' ;;
+    target-dependencies)
+      replace_line "$file" '    for platform in manifest.get("target", {}).values():'
+      replace_line "$file" '        yield platform.get("dependencies", {})'
+      replace_line "$file" '        yield platform.get("dev-dependencies", {})' ;;
+    unique-gates)
+      replace_line "$file" '  SELECTED_POSITIONS=$(printf '"'"'%s'"'"' "$SELECTED" | sort -n | uniq)' \
+        '  SELECTED_POSITIONS=$(printf '"'"'%s'"'"' "$SELECTED" | sort -n)' ;;
+    failed-gate)
+      replace_line "$file" '      failed=$((failed + 1))' '      :' ;;
+    unavailable-gate)
+      replace_line "$file" '      unavailable=$((unavailable + 1))' '      :' ;;
+    fresh-coverage)
+      replace_line "$file" '    if [ "$id" = coverage-floors ] && [ "$coverage_written" -eq 0 ]; then' \
+        '    if false; then' ;;
+  esac
+}
+
+# Runs command $2... in a subshell with errexit, logs its output to $1, and
+# sets STEP_RC to its status. Callers run it as a plain command, because a
+# condition context disables errexit inside the subshell as well.
+run_logged() {
+  local log=$1
+  shift
+  set +e
+  (
+    set -e
+    "$@"
+  ) >"$log" 2>&1
+  STEP_RC=$?
+  set -e
+}
+
+# Sets CASE_NAME to $1 and runs that case.
+run_case() {
+  CASE_NAME=$1
+  "case_${1//-/_}"
+}
+
+# Checks the call log that case $1 left, independently of the case: an
+# execution case made only expected calls, and for control $2 fresh-coverage
+# the coverage-floors command ran.
+check_mutant_calls() {
+  local floors
+  set_case_paths "$1"
+  if [ -d "$STATE" ]; then
+    assert_clean_calls
+  fi
+  if [ "$2" = fresh-coverage ]; then
+    record_gate_calls
+    floors=$(command_record "$(registry_row coverage-floors | cut -f 2)")
+    grep -qxF -- "$floors" "$CASE_DIR.calls" || fail "the coverage-floors command was not logged"
+  fi
+}
+
+# Runs each mutation control $@. The pinning case passes on the clean
+# fixture. On a fresh fixture that carries the mutation, it ends with the
+# control's assertion message. An execution case also leaves a clean call log.
+run_mutations() {
+  local control name message log passed=0 total=0 failures=""
+  mkdir -p "$TMP/cases" "$TMP/logs" "$TMP/xdg"
+  build_fixture "$TMP/fixture"
+  assert_fixture_complete "$TMP/fixture"
+  for control in "$@"; do
+    total=$((total + 1))
+    read -r name message <<<"$(mutation_case "$control")"
+    log="$TMP/logs/$control"
+    FIXTURE="$TMP/fixture"
+    run_logged "$log.clean.log" run_case "$name"
+    if [ "$STEP_RC" -ne 0 ]; then
+      failures="$failures $control"
+      continue
+    fi
+    rm -rf "$TMP/cases"
+    mkdir -p "$TMP/cases"
+    FIXTURE="$TMP/mutant-$control"
+    run_logged "$log.fixture.log" build_fixture "$FIXTURE" "$control"
+    if [ "$STEP_RC" -ne 0 ]; then
+      failures="$failures $control"
+      continue
+    fi
+    run_logged "$log.mutant.log" run_case "$name"
+    if [ "$STEP_RC" -eq 0 ] || [ "$(tail -n 1 "$log.mutant.log")" != "$message" ]; then
+      echo "the mutant run did not end with '$message'" >>"$log.mutant.log"
+      failures="$failures $control"
+      continue
+    fi
+    run_logged "$log.calls.log" check_mutant_calls "$name" "$control"
+    if [ "$STEP_RC" -ne 0 ]; then
+      failures="$failures $control"
+      continue
+    fi
+    passed=$((passed + 1))
+  done
+  for control in $failures; do
+    echo "FAILED $control"
+    for log in "$TMP/logs/$control".{clean,fixture,mutant,calls}.log; do
+      if [ -f "$log" ]; then
+        sed 's/^/  /' "$log"
+      fi
+    done
+  done
+  echo "preflight mutation controls: $passed of $total passed"
+  [ -z "$failures" ] || exit 1
+}
+
 usage() {
-  echo "usage: test-preflight.sh [--case <name>]" >&2
+  echo "usage: test-preflight.sh [--case <name> | --mutations [<control>]]" >&2
   exit 2
 }
 
 main() {
   local selected=$CASES name passed=0 total=0 failures="" rc
+  if [ "${1:-}" = --mutations ]; then
+    if [ "$#" -eq 1 ]; then
+      # shellcheck disable=SC2086
+      run_mutations $MUTATION_CONTROLS
+    elif [ "$#" -eq 2 ] && mutation_case "$2" >/dev/null; then
+      run_mutations "$2"
+    else
+      usage
+    fi
+    exit 0
+  fi
   if [ "$#" -gt 0 ]; then
     if [ "$#" -ne 2 ] || [ "$1" != --case ]; then
       usage
