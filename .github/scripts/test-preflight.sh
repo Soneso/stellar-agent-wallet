@@ -185,6 +185,10 @@ build_fixture() {
     cp "$ROOT/$file" "$dir/$file"
   done
   cp -R "$ROOT/.github" "$dir/.github"
+  if [ -n "${2:-}" ]; then
+    apply_mutation "$2" "$dir/.github/scripts/preflight.sh"
+    bash -n "$dir/.github/scripts/preflight.sh"
+  fi
   (cd "$dir" && git init -q -b main && git add -A && git commit -q -m fixture)
   mkdir -p "$dir/contracts/cap85-beacon/src" "$dir/crates/stellar-agent-sep7/tests"
 }
@@ -1620,13 +1624,135 @@ case_coverage_unavailable() {
   assert_clean_calls
 }
 
+MUTATION_CONTROLS="rename-source untracked-paths dev-dependencies target-dependencies unique-gates failed-gate unavailable-gate fresh-coverage"
+
+# Prints the existing case that pins mutation control $1.
+mutation_case() {
+  case "$1" in
+    rename-source) echo committed-cross-scope-rename ;;
+    untracked-paths) echo untracked-test-file ;;
+    dev-dependencies) echo dev-dependency-edge ;;
+    target-dependencies) echo target-specific-edge ;;
+    unique-gates) echo duplicate-triggers ;;
+    failed-gate) echo exit-aggregation ;;
+    unavailable-gate) echo unavailable-tool ;;
+    fresh-coverage) echo coverage-suppression ;;
+    *) return 1 ;;
+  esac
+}
+
+# Applies mutation control $1 to the preflight script $2; each edit matches
+# exactly one line.
+# shellcheck disable=SC2016
+apply_mutation() {
+  local file=$2
+  case "$1" in
+    rename-source)
+      replace_line "$file" '  git diff --name-only -z --no-renames --merge-base "$BASE" -- >"$SCRATCH/diff" ||' \
+        '  git diff --name-only -z --merge-base "$BASE" -- >"$SCRATCH/diff" ||' ;;
+    untracked-paths)
+      replace_line "$file" '  git status --porcelain=v1 -z --untracked-files=all >"$SCRATCH/status" ||' \
+        '  git status --porcelain=v1 -z --untracked-files=no >"$SCRATCH/status" ||' ;;
+    dev-dependencies)
+      replace_line "$file" '    yield manifest.get("dev-dependencies", {})' ;;
+    target-dependencies)
+      replace_line "$file" '    for platform in manifest.get("target", {}).values():'
+      replace_line "$file" '        yield platform.get("dependencies", {})'
+      replace_line "$file" '        yield platform.get("dev-dependencies", {})' ;;
+    unique-gates)
+      replace_line "$file" '  SELECTED_POSITIONS=$(printf '"'"'%s'"'"' "$SELECTED" | sort -n | uniq)' \
+        '  SELECTED_POSITIONS=$(printf '"'"'%s'"'"' "$SELECTED" | sort -n)' ;;
+    failed-gate)
+      replace_line "$file" '      failed=$((failed + 1))' '      :' ;;
+    unavailable-gate)
+      replace_line "$file" '      unavailable=$((unavailable + 1))' '      :' ;;
+    fresh-coverage)
+      replace_line "$file" '    if [ "$id" = coverage-floors ] && [ "$coverage_written" -eq 0 ]; then' \
+        '    if false; then' ;;
+  esac
+}
+
+# Runs case $1 in a subshell and logs it to $2; returns the case status.
+run_case() {
+  local rc
+  set +e
+  (
+    set -e
+    CASE_NAME=$1
+    "case_${1//-/_}"
+  ) >"$2" 2>&1
+  rc=$?
+  set -e
+  return "$rc"
+}
+
+# Runs each mutation control $@: the pinning case passes on the clean
+# fixture and fails on a fresh fixture that carries the mutation.
+run_mutations() {
+  local control name passed=0 total=0 failures=""
+  mkdir -p "$TMP/cases" "$TMP/logs" "$TMP/xdg"
+  build_fixture "$TMP/fixture"
+  assert_fixture_complete "$TMP/fixture" || exit 1
+  for control in "$@"; do
+    total=$((total + 1))
+    name=$(mutation_case "$control")
+    FIXTURE="$TMP/fixture"
+    if ! run_case "$name" "$TMP/logs/$control.clean.log"; then
+      failures="$failures $control"
+      continue
+    fi
+    rm -rf "$TMP/cases"
+    mkdir -p "$TMP/cases"
+    FIXTURE="$TMP/mutant-$control"
+    if ! (build_fixture "$FIXTURE" "$control") >"$TMP/logs/$control.fixture.log" 2>&1; then
+      failures="$failures $control"
+      continue
+    fi
+    if run_case "$name" "$TMP/logs/$control.log" ||
+      grep -qE 'python3 ran outside|cargo metadata ran' "$TMP/logs/$control.log"; then
+      failures="$failures $control"
+      continue
+    fi
+    # fresh-coverage: the logged coverage-floors command shows the failure.
+    if [ "$control" = fresh-coverage ] && ! (
+      CASE_DIR="$TMP/cases/$name"
+      STATE="$TMP/cases/$name.state"
+      record_gate_calls
+      grep -qxF -- "$(command_record "$(registry_row coverage-floors | cut -f 2)")" \
+        "$CASE_DIR.calls"
+    ) >>"$TMP/logs/$control.log" 2>&1; then
+      echo "the coverage-floors command was not logged" >>"$TMP/logs/$control.log"
+      failures="$failures $control"
+      continue
+    fi
+    passed=$((passed + 1))
+  done
+  for control in $failures; do
+    echo "FAILED $control"
+    cat "$TMP/logs/$control".*log "$TMP/logs/$control.log" 2>/dev/null | sed 's/^/  /'
+  done
+  echo "preflight mutation controls: $passed of $total passed"
+  [ -z "$failures" ] || exit 1
+}
+
 usage() {
-  echo "usage: test-preflight.sh [--case <name>]" >&2
+  echo "usage: test-preflight.sh [--case <name> | --mutations [<control>]]" >&2
   exit 2
 }
 
 main() {
   local selected=$CASES name passed=0 total=0 failures="" rc
+  if [ "${1:-}" = --mutations ]; then
+    if [ "$#" -eq 1 ]; then
+      # shellcheck disable=SC2086
+      run_mutations $MUTATION_CONTROLS
+    elif [ "$#" -eq 2 ] && mutation_case "$2" >/dev/null; then
+      run_mutations "$2"
+    else
+      usage
+    fi
+    exit 0
+  fi
   if [ "$#" -gt 0 ]; then
     if [ "$#" -ne 2 ] || [ "$1" != --case ]; then
       usage
