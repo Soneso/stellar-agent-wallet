@@ -365,6 +365,10 @@ struct Exposure {
 /// Error variants for [`PolicyStateStore`] operations.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum StateStoreError {
+    /// An accounting duration or horizon exceeds its representation.
+    #[error("signed intent horizon overflows")]
+    HorizonOverflow,
+
     /// The state store lock is poisoned (internal invariant violation).
     #[error("state store lock poisoned: {detail}")]
     LockPoisoned {
@@ -386,6 +390,29 @@ pub enum StateStoreError {
         /// The wall-clock time at the moment of detection in unix-milliseconds.
         now_ms: u64,
     },
+}
+
+/// Checks inclusive exposure accounting for the queried window.
+///
+/// # Errors
+/// Refuses a duration or horizon that overflows milliseconds.
+pub fn exposure_is_live(
+    accounting_at_ms: Option<u64>,
+    accounting_until_ms: Option<u64>,
+    window_secs: u64,
+    now_ms: u64,
+) -> Result<bool, StateStoreError> {
+    let duration = window_secs
+        .checked_mul(1000)
+        .ok_or(StateStoreError::HorizonOverflow)?;
+    let Some(at) = accounting_at_ms else {
+        return Ok(true);
+    };
+    let until = at
+        .checked_add(duration)
+        .ok_or(StateStoreError::HorizonOverflow)?
+        .max(accounting_until_ms.unwrap_or(0));
+    Ok(now_ms <= until)
 }
 
 impl PolicyStateStore {
@@ -482,11 +509,12 @@ impl PolicyStateStore {
                     });
                 }
                 let live = if let Some(exposure) = &entry.exposure {
-                    let until = exposure.accounting_at_ms.map(|at| {
-                        at.saturating_add(key.window_secs.saturating_mul(1000))
-                            .max(exposure.accounting_until_ms.unwrap_or(0))
-                    });
-                    until.is_none_or(|until| now_ms <= until)
+                    exposure_is_live(
+                        exposure.accounting_at_ms,
+                        exposure.accounting_until_ms,
+                        key.window_secs,
+                        now_ms,
+                    )?
                 } else {
                     stored_key == key
                         && (entry.pending
@@ -696,6 +724,31 @@ mod tests {
     )]
 
     use super::*;
+
+    #[test]
+    fn intent_horizons_survive_window_lengthening() {
+        use super::super::per_period_cap::MAX_SUPPORTED_WINDOW_SECS;
+        let store = PolicyStateStore::new();
+        let short = StateKey::new("intent", 1, "native", 60);
+        let long = StateKey::new("intent", 1, "native", MAX_SUPPORTED_WINDOW_SECS);
+        let t = 1_000_000;
+        store
+            .append_exposure(&short, t, 9, "intent-one", Some(t), Some(t + 60_000))
+            .unwrap();
+        assert_eq!(store.query_window(&short, t + 60_000).unwrap(), (9, 1));
+        assert_eq!(store.query_window(&short, t + 60_001).unwrap(), (0, 0));
+        let retained = t + MAX_SUPPORTED_WINDOW_SECS * 1000;
+        assert_eq!(store.query_window(&long, retained).unwrap(), (9, 1));
+        assert_eq!(store.query_window(&long, retained + 1).unwrap(), (0, 0));
+        assert_eq!(
+            exposure_is_live(Some(u64::MAX), None, 60, 0),
+            Err(StateStoreError::HorizonOverflow)
+        );
+        assert_eq!(
+            exposure_is_live(None, None, u64::MAX, 0),
+            Err(StateStoreError::HorizonOverflow)
+        );
+    }
 
     fn key() -> StateKey {
         StateKey::new("alice", 2, "native", 3_600)
@@ -1001,4 +1054,46 @@ mod tests {
         assert_eq!(sum, expected);
         assert_eq!(count, 3);
     }
+}
+
+#[cfg(any(test, feature = "test-helpers"))]
+thread_local! {
+    static QUERY_TIME: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+/// Restores the current thread's policy clock when the fixture ends.
+#[cfg(any(test, feature = "test-helpers"))]
+pub struct QueryTimeGuard {
+    previous: Option<u64>,
+    thread: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+
+#[cfg(any(test, feature = "test-helpers"))]
+impl QueryTimeGuard {
+    /// Advances the current thread's controlled policy time.
+    pub fn set(&self, milliseconds: u64) {
+        QUERY_TIME.set(Some(milliseconds));
+    }
+}
+
+#[cfg(any(test, feature = "test-helpers"))]
+impl Drop for QueryTimeGuard {
+    fn drop(&mut self) {
+        QUERY_TIME.set(self.previous);
+    }
+}
+
+/// Controls policy evaluation time on the calling test thread.
+#[cfg(any(test, feature = "test-helpers"))]
+#[must_use]
+pub fn set_query_time_for_test(milliseconds: u64) -> QueryTimeGuard {
+    QueryTimeGuard {
+        previous: QUERY_TIME.replace(Some(milliseconds)),
+        thread: std::marker::PhantomData,
+    }
+}
+
+#[cfg(any(test, feature = "test-helpers"))]
+pub(crate) fn query_time_for_test() -> Option<u64> {
+    QUERY_TIME.get()
 }

@@ -81,9 +81,9 @@ async fn manager_with_rule(
             Duration::from_secs(5),
             CHAIN_ID.to_owned(),
         )
-        .with_intent_admission(std::sync::Arc::new(
-            stellar_agent_smart_account::signing::intent_test_helpers::no_value_admission_owned(),
-        ))
+        .with_intent_admission(
+            stellar_agent_smart_account::signing::intent_test_helpers::shared_no_value_admission(),
+        )
         .with_signers_manager(signers_manager)
         .with_audit_writer(audit_writer),
     )
@@ -169,6 +169,7 @@ fn account_bytes(g: &str) -> [u8; 32] {
 #[serial]
 #[allow(clippy::expect_used, reason = "test asserts successful fixture path")]
 async fn verify_rule_wasm_pins_returns_no_contracts_when_rule_has_no_external_contracts() {
+    assert!(stellar_agent_test_support::keyring_mock::install().is_ok());
     let rule_id = 31;
     for source in [None, Some(EXPLICIT_SOURCE_G)] {
         let (manager, server, _tmp_dir) =
@@ -216,6 +217,7 @@ async fn verify_rule_wasm_pins_returns_no_contracts_when_rule_has_no_external_co
 #[serial]
 #[allow(clippy::expect_used, reason = "test asserts successful fixture path")]
 async fn verify_rule_wasm_pins_returns_no_pin_when_contracts_exist_without_audit_pin() {
+    assert!(stellar_agent_test_support::keyring_mock::install().is_ok());
     let rule_id = 32;
     let (manager, _server, _tmp_dir) =
         manager_with_rule(rule_id, vec![policy_sc_address()], SOURCE_G).await;
@@ -281,6 +283,7 @@ impl Respond for MixedPinsResponder {
     reason = "test fixture construction and assertions"
 )]
 async fn verify_pins_mixed_drift_and_unavailable_preserves_both_statuses_and_code() {
+    assert!(stellar_agent_test_support::keyring_mock::install().is_ok());
     let verifier = stellar_strkey::Contract([0x41; 32]).to_string();
     let policy = stellar_strkey::Contract([0x42; 32]).to_string();
     let vector = |items: Vec<ScVal>| ScVal::Vec(Some(ScVec(items.try_into().unwrap())));
@@ -374,10 +377,7 @@ async fn verify_pins_mixed_drift_and_unavailable_preserves_both_statuses_and_cod
                 Duration::from_secs(5),
                 CHAIN_ID.to_owned(),
             )
-            .with_intent_admission(std::sync::Arc::new(
-                stellar_agent_smart_account::signing::intent_test_helpers::no_value_admission_owned(
-                ),
-            ))
+            .with_intent_admission(stellar_agent_smart_account::signing::intent_test_helpers::shared_no_value_admission())
             .with_signers_manager(signers)
             .with_audit_writer(audit),
         )
@@ -515,9 +515,9 @@ async fn single_verifier_report(
             Duration::from_secs(5),
             CHAIN_ID.to_owned(),
         )
-        .with_intent_admission(std::sync::Arc::new(
-            stellar_agent_smart_account::signing::intent_test_helpers::no_value_admission_owned(),
-        ))
+        .with_intent_admission(
+            stellar_agent_smart_account::signing::intent_test_helpers::shared_no_value_admission(),
+        )
         .with_signers_manager(signers)
         .with_audit_writer(audit),
     )

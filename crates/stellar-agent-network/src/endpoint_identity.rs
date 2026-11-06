@@ -207,6 +207,7 @@ pub struct SigningLedgerObservation {
     identity: EndpointIdentity,
     ledger: u32,
     observed_at: tokio::time::Instant,
+    arrived_at_ms: u64,
 }
 
 impl SigningLedgerObservation {
@@ -216,12 +217,20 @@ impl SigningLedgerObservation {
         identity: EndpointIdentity,
         ledger: u32,
         observed_at: tokio::time::Instant,
+        arrived_at_ms: u64,
     ) -> Self {
         Self {
             identity,
             ledger,
             observed_at,
+            arrived_at_ms,
         }
+    }
+
+    /// The local arrival time in store clock milliseconds.
+    #[must_use]
+    pub fn arrived_at_ms(&self) -> u64 {
+        self.arrived_at_ms
     }
 
     /// The checked identity of the endpoint that reported the height.

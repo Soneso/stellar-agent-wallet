@@ -382,7 +382,9 @@ fn honest_with(
 // ── Root binding ─────────────────────────────────────────────────────────────
 
 #[tokio::test]
+#[serial_test::serial]
 async fn a_root_on_another_contract_is_refused_before_signing() {
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let outcome = submit(entrypoint(), DeclaredSubInvocations::None, |invoke| {
         let mut root = invoke.clone();
         root.contract_address = attacker();
@@ -394,7 +396,9 @@ async fn a_root_on_another_contract_is_refused_before_signing() {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn a_root_with_another_function_is_refused_before_signing() {
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let outcome = submit(entrypoint(), DeclaredSubInvocations::None, |invoke| {
         let mut root = invoke.clone();
         root.function_name = ScSymbol("upgrade".try_into().unwrap());
@@ -406,7 +410,9 @@ async fn a_root_with_another_function_is_refused_before_signing() {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn a_root_with_another_argument_is_refused_before_signing() {
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let outcome = submit(entrypoint(), DeclaredSubInvocations::None, |invoke| {
         let mut root = invoke.clone();
         root.args = vec![ScVal::U32(u32::MAX)].try_into().unwrap();
@@ -422,7 +428,9 @@ async fn a_root_with_another_argument_is_refused_before_signing() {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn an_honest_entrypoint_root_signs() {
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let outcome = submit(
         entrypoint(),
         DeclaredSubInvocations::None,
@@ -436,7 +444,9 @@ async fn an_honest_entrypoint_root_signs() {
 // ── Declared sub-invocations: none ───────────────────────────────────────────
 
 #[tokio::test]
+#[serial_test::serial]
 async fn an_undeclared_sub_invocation_is_refused_before_signing() {
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let outcome = submit(
         entrypoint(),
         DeclaredSubInvocations::None,
@@ -460,7 +470,9 @@ fn bounded_to_any() -> [DeclaredTransfer; 1] {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn a_declared_transfer_within_its_bound_signs() {
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let declared = bounded_to_any();
     let drawn = leaf(transfer(token(), wallet(), pair(), BOUND));
     let outcome = submit(
@@ -474,7 +486,9 @@ async fn a_declared_transfer_within_its_bound_signs() {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn a_transfer_above_its_bound_is_refused() {
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let declared = bounded_to_any();
     let outcome = submit(
         swap(),
@@ -487,7 +501,9 @@ async fn a_transfer_above_its_bound_is_refused() {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn a_transfer_on_another_token_is_refused() {
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let declared = bounded_to_any();
     let outcome = submit(
         swap(),
@@ -500,7 +516,9 @@ async fn a_transfer_on_another_token_is_refused() {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn a_transfer_from_another_address_is_refused() {
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let declared = bounded_to_any();
     let outcome = submit(
         swap(),
@@ -516,7 +534,9 @@ async fn a_transfer_from_another_address_is_refused() {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn two_transfers_above_the_bound_together_are_refused() {
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let declared = bounded_to_any();
     let half_and_one = BOUND / 2 + 1;
     let outcome = submit(
@@ -536,7 +556,9 @@ async fn two_transfers_above_the_bound_together_are_refused() {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn a_nested_node_under_a_transfer_is_refused() {
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let declared = bounded_to_any();
     let outcome = submit(
         swap(),
@@ -555,7 +577,9 @@ async fn a_nested_node_under_a_transfer_is_refused() {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn a_declared_transfer_to_another_recipient_is_refused() {
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let declared = [DeclaredTransfer {
         token: token(),
         to: Some(pair()),
@@ -582,7 +606,9 @@ fn second_call() -> InvokeContractArgs {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn declared_calls_in_order_sign() {
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let declared = [first_call(), second_call()];
     let subs = vec![leaf(first_call()), leaf(second_call())];
     let outcome = submit(
@@ -596,7 +622,9 @@ async fn declared_calls_in_order_sign() {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn an_extra_or_reordered_call_is_refused() {
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let declared = [first_call(), second_call()];
 
     let reordered = submit(
@@ -650,7 +678,9 @@ async fn an_extra_or_reordered_call_is_refused() {
 /// balance to the attacker under it. A signature over that tree would be an
 /// authorization the RPC could submit on its own.
 #[tokio::test]
+#[serial_test::serial]
 async fn a_swap_tree_with_a_substituted_root_and_a_drain_is_refused_before_signing() {
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let declared = bounded_to_any();
     let outcome = submit(
         swap(),
@@ -672,7 +702,9 @@ async fn a_swap_tree_with_a_substituted_root_and_a_drain_is_refused_before_signi
 /// The swap's honest tree with only the drain substituted is refused by the
 /// declaration, so neither half of the hostile tree is signed alone.
 #[tokio::test]
+#[serial_test::serial]
 async fn a_swap_tree_with_the_honest_root_and_a_drain_is_refused_before_signing() {
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let declared = bounded_to_any();
     let outcome = submit(
         swap(),
@@ -692,7 +724,9 @@ async fn a_swap_tree_with_the_honest_root_and_a_drain_is_refused_before_signing(
 /// The refusal's reason carries the fingerprint of the simulated tree for
 /// attribution, never the amounts or addresses it holds.
 #[tokio::test]
+#[serial_test::serial]
 async fn the_refusal_names_the_simulated_tree_by_fingerprint_only() {
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let outcome = submit(
         entrypoint(),
         DeclaredSubInvocations::None,
@@ -719,7 +753,9 @@ async fn the_refusal_names_the_simulated_tree_by_fingerprint_only() {
 /// subtree the declaration accepts is still refused on that path, before any
 /// key signs and before a re-simulation.
 #[tokio::test]
+#[serial_test::serial]
 async fn the_quorum_path_refuses_an_accepted_subtree_before_signing() {
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let declared = bounded_to_any();
     let outcome = submit_on(
         SigningPath::Quorum,
@@ -751,7 +787,9 @@ async fn the_quorum_path_refuses_an_accepted_subtree_before_signing() {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn the_quorum_path_signs_an_entrypoint_with_an_empty_subtree() {
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let outcome = submit_on(
         SigningPath::Quorum,
         entrypoint(),

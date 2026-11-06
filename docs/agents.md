@@ -402,3 +402,19 @@ also blocks in every mode.
   chain-root key was never minted (an `init`-minted profile, before the operator runs
   `rotate-audit-key`). This is an operator setup gap, not agent misuse: report the
   error back and stop retrying until the operator has minted the key.
+
+## Retained smart-account charges
+
+A bounded invocation charge closes when a later policy check or admission witnesses both profile endpoints above every authorization and envelope bound.
+
+Only the endpoints stored in the profile authorize charge closure. Endpoint overrides can bound signatures but cannot close charges.
+
+Environment variables and programmatic overlays do not change which endpoints authorize charge closure.
+
+An unavailable observation leaves retained charges unchanged while the policy check continues. Read only tools and preparation requests acquire no charge closure witnesses.
+
+Reset refuses while an intent remains open or retained. A closed and pruned intent does not block reset.
+
+An open intent without an authenticated purpose permanently blocks reset for this profile. Continue with a new profile.
+
+Retained intents close only through the profile's stored secondary endpoint. Add one to the profile.

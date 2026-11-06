@@ -509,3 +509,21 @@ states. See [Agent payments with MPP](agent-payments.md).
 | Halt marker | The file `profiles/<name>.halt` that `profile halt` writes and `profile resume` removes. While it exists, every action that signs or submits, and every MCP tool that is not read-only, refuses with `profile.halted`; the CLI verbs that only record or reconcile local state stay usable. `stellar_toolset_invoke` applies the check to the tool its action routes to, so a read-only routed action answers. See [Emergency stop](#emergency-stop). |
 | First-invoke gate | A one-time gate on a toolset's first use of a signing-adjacent capability; once approved, a time-boxed grant suppresses only that re-prompt. |
 | Per-action payment approval | The payment approval that fires unconditionally on every toolset-routed payment and binds the actual executed envelope. |
+
+## Retained smart-account charges
+
+A bounded invocation charge closes when a later policy check or admission witnesses both profile endpoints above every authorization and envelope bound.
+
+Each queried window counts a closed charge through the later of its observation plus that window and its admitted accounting horizon.
+
+A closed intent record remains until more than one week has passed since its observation.
+
+A schedule charge closes when both endpoints, above every authorization expiration, report its operation done or unset.
+
+Intents without an authenticated purpose remain open. Calls whose authorization tree names `approve`, `increase_allowance` or `approve_for_all` retain their charges without closure by authorization expiry.
+
+Reset refuses while an intent remains open or retained. A closed and pruned intent does not block reset.
+
+An open intent without an authenticated purpose permanently blocks reset for this profile. Continue with a new profile.
+
+Retained intents close only through the profile's stored secondary endpoint. Add one to the profile.

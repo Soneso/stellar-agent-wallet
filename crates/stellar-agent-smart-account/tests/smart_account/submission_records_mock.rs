@@ -186,7 +186,9 @@ impl Respond for Rpc {
                 let function = invoke.function_name.0.to_utf8_string().unwrap();
                 let value = match function.as_str() {
                     "get_operation_ledger" => ScVal::U32(500),
-                    "hash_operation" => ScVal::Bytes(vec![0x46; 32].try_into().unwrap()),
+                    "hash_operation" | "schedule" => {
+                        ScVal::Bytes(vec![0x46; 32].try_into().unwrap())
+                    }
                     "exec" => ScVal::Vec(Some(
                         vec![ScVal::Void; exec_subtree(invoke).len()]
                             .try_into()
@@ -376,7 +378,12 @@ struct Fixture {
 impl Fixture {
     fn new() -> Self {
         keyring_mock::install().unwrap();
-        let root = TempDir::new().unwrap();
+        let scratch = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/tmp");
+        std::fs::create_dir_all(&scratch).unwrap();
+        let root = tempfile::Builder::new()
+            .prefix("submission-records-")
+            .tempdir_in(scratch)
+            .unwrap();
         let home = StellarAgentHomeGuard::new(root.path());
         let mut profile = Profile::builder_testnet("svc", PROFILE, "nonce", PROFILE)
             .with_profile_name(PROFILE)
@@ -1544,6 +1551,15 @@ async fn the_entry_guard_is_free_at_every_signer_rpc_and_writer_call() {
             count.fetch_add(1, Ordering::SeqCst);
         }) as Arc<dyn Fn() + Send + Sync>
     };
+    let clock = stellar_agent_network::mainnet::clock::set_now_ms_for_test(1000);
+    let observation_calls = Arc::new(AtomicUsize::new(0));
+    let observation = seed_observable_intent(
+        &fixture,
+        true,
+        Some(observer(Arc::clone(&observation_calls))),
+    )
+    .await;
+    clock.set(2000);
     *fixture.signer.hook.lock().unwrap() = Some(observer(Arc::clone(&signer_calls)));
     let seen = Arc::new(Mutex::new(SeenEnvelopes::default()));
     let server = MockServer::start().await;
@@ -1576,6 +1592,8 @@ async fn the_entry_guard_is_free_at_every_signer_rpc_and_writer_call() {
     assert_eq!(signer_calls.load(Ordering::SeqCst), 3);
     assert_eq!(rpc_calls.load(Ordering::SeqCst), 2);
     assert_eq!(writer_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(observation_calls.load(Ordering::SeqCst), 6);
+    assert_eq!(observation.received_requests().await.unwrap().len(), 6);
 }
 
 #[tokio::test]
@@ -1773,4 +1791,174 @@ async fn cap_refusal_precedes_any_signed_authorization() {
                 .is_empty()
         );
     }
+}
+
+async fn seed_observable_intent(
+    fixture: &Fixture,
+    schedule: bool,
+    hook: Option<Arc<dyn Fn() + Send + Sync>>,
+) -> MockServer {
+    let endpoint = MockServer::start().await;
+    Mock::given(method("POST")).respond_with(move |request: &Request| {
+        if let Some(hook) = &hook { hook(); }
+        let body: Value = serde_json::from_slice(&request.body).unwrap();
+        let result = match body["method"].as_str().unwrap() {
+            "getNetwork" => get_network_result(PASSPHRASE),
+            "getLatestLedger" => json!({"id":"ab".repeat(32), "sequence":101, "protocolVersion":27}),
+            "simulateTransaction" => json!({"latestLedger":102, "minResourceFee":"100", "transactionData":"", "results":[{"auth":[], "xdr":ScVal::U32(0).to_xdr_base64(Limits::none()).unwrap()}]}),
+            method => panic!("unexpected observation request {method}"),
+        };
+        ResponseTemplate::new(200).set_body_json(json!({"jsonrpc":"2.0", "id":body["id"], "result":result}))
+    }).mount(&endpoint).await;
+    let directory = stellar_agent_core::profile::loader::default_profile_dir().unwrap();
+    std::fs::create_dir_all(&directory).unwrap();
+    std::fs::write(
+        directory.join(format!("{PROFILE}.toml")),
+        format!(
+            "chain_id = \"stellar:testnet\"\nrpc_url = {:?}\nsecondary_rpc_url = {:?}\n",
+            endpoint.uri(),
+            second_loopback_host(&endpoint.uri()),
+        ),
+    )
+    .unwrap();
+    let host = HostFunction::InvokeContract(InvokeContractArgs {
+        contract_address: ScAddress::Contract(ContractId(Hash([1; 32]))),
+        function_name: if schedule { "schedule" } else { "call" }
+            .try_into()
+            .unwrap(),
+        args: Default::default(),
+    });
+    let source = stellar_strkey::ed25519::PublicKey([0; 32])
+        .to_string()
+        .to_string();
+    let timelock = contract(1);
+    let plan = stellar_agent_network::SignedIntentPlan::new(
+        PASSPHRASE,
+        &source,
+        &source,
+        1,
+        stellar_agent_network::intent_xdr_hash(&host).unwrap(),
+        vec![],
+        None,
+    )
+    .unwrap()
+    .with_envelope_max_ledger(100)
+    .unwrap()
+    .classify_purpose(&host, schedule.then_some((timelock.as_str(), [8; 32])))
+    .unwrap();
+    let entries = [WindowEntry::new(
+        StateKey::new(PROFILE, 1, "rate_limit", 604800),
+        1000,
+        1,
+        WindowLimit::Count {
+            window: "1w".into(),
+            max_calls: 1,
+        },
+    )];
+    let plan = stellar_agent_network::signed_intent::test_helpers::with_legs(&plan, &entries);
+    let _exposure = PersistedWindowStore::for_profile(PROFILE)
+        .admit_signed_intent(&fixture.profile, &plan)
+        .unwrap()
+        .expose();
+    endpoint
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn early_observation_precedes_window_gate() {
+    use stellar_agent_core::policy::v1::criteria::rate_limit::RateLimitCriterion;
+    let fixture = Fixture::new();
+    let clock = stellar_agent_network::mainnet::clock::set_now_ms_for_test(1000);
+    let query_clock =
+        stellar_agent_core::policy::v1::criteria::state_store::set_query_time_for_test(1000);
+    let observation = seed_observable_intent(&fixture, false, None).await;
+    let (primary, sends, _) = rpc("SUCCESS").await;
+    let engine = Arc::new(PolicyEngineV1::new(
+        PolicyDocument {
+            version: 1,
+            scope: ScopeId::AllProfiles,
+            signature: None,
+            rules: vec![PolicyRule {
+                r#match: RuleMatch {
+                    tool: "*".into(),
+                    chain: "*".into(),
+                },
+                criteria: vec![Box::new(RateLimitCriterion::new(
+                    Window::parse("1w").unwrap(),
+                    1,
+                ))],
+                decision: Decision::Allow,
+                allow_opaque_signing: false,
+            }],
+        },
+        PROFILE.into(),
+    ));
+    let store = PersistedWindowStore::for_profile(PROFILE);
+    store
+        .load_into(PROFILE, &fixture.profile, engine.state_store())
+        .unwrap();
+    clock.set(2000);
+    query_clock.set(2000);
+    let mut closed_bytes = None;
+    for _ in 0..2 {
+        let result = fixture
+            .multicall_with_policy(
+                &primary.uri(),
+                fixture.bundle().into_iter().take(1).collect(),
+                Arc::clone(&engine),
+            )
+            .await;
+        let error = result.unwrap_err();
+        assert!(
+            matches!(
+                error,
+                SaError::MulticallFailed {
+                    phase: "policy_gate",
+                    ..
+                }
+            ),
+            "{error:?}"
+        );
+        assert_eq!(
+            fixture.rows("sa_multicall_bundle_denied").last().unwrap()["deny_wire_code"],
+            "multicall.rate_limit_exceeded"
+        );
+        let views = store.signed_intents(PROFILE, &fixture.profile).unwrap();
+        assert_eq!(views.len(), 1);
+        assert_eq!(views[0].expiry_observed_at_ms, Some(2000));
+        assert_eq!(
+            engine
+                .state_store()
+                .query_window(&StateKey::new(PROFILE, 1, "rate_limit", 604800), 2000)
+                .unwrap(),
+            (1, 1)
+        );
+        let bytes = std::fs::read(store.path()).unwrap();
+        if let Some(before) = &closed_bytes {
+            assert_eq!(&bytes, before);
+        } else {
+            closed_bytes = Some(bytes);
+        }
+        assert_eq!(sends.load(Ordering::SeqCst), 0);
+    }
+    assert_eq!(observation.received_requests().await.unwrap().len(), 4);
+    clock.set(604802001);
+    query_clock.set(604802001);
+    fixture
+        .multicall_with_policy(
+            &primary.uri(),
+            fixture.bundle().into_iter().take(1).collect(),
+            Arc::clone(&engine),
+        )
+        .await
+        .unwrap();
+    assert_eq!(sends.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        engine
+            .state_store()
+            .query_window(&StateKey::new(PROFILE, 1, "rate_limit", 604800), 604802001)
+            .unwrap(),
+        (0, 0)
+    );
+    assert_eq!(observation.received_requests().await.unwrap().len(), 4);
 }

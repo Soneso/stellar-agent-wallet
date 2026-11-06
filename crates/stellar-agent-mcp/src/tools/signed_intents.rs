@@ -27,7 +27,7 @@ impl WalletServer {
     )]
     #[tool(
         name = "stellar_signed_intents_list",
-        description = "List authenticated smart-account intent charges. Each exposed charge remains with an open accounting horizon. This read-only view reports status and redacted authority without releasing charges.",
+        description = "List authenticated smart-account intent charges. The view reports the accounting horizon, retention boundary, purpose, schedule terminal state, and reset requirements without changing state.",
         annotations(read_only_hint = true, destructive_hint = false)
     )]
     async fn stellar_signed_intents_list(
@@ -195,5 +195,44 @@ mod tests {
         assert_eq!(value["error"]["code"], "policy.engine_required");
         assert_eq!(std::fs::read(store.path()).unwrap(), corrupt);
         assert_eq!(generation.get_password().unwrap(), generation_before);
+    }
+    #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial(keyring)]
+    async fn intent_views_report_horizons_without_mutation() {
+        use stellar_agent_network::intent_view_test_helpers::IntentViewFixture;
+        for mode in ["invoke", "done", "unset", "unclassified"] {
+            let fixture = IntentViewFixture::new(mode).await;
+            let mut server = WalletServer::new(fixture.profile.clone()).unwrap();
+            server.window_store = fixture.store.clone();
+            for endpoint_state in ["complete", "missing", "unreadable"] {
+                fixture.set_endpoints(endpoint_state);
+                let result = server
+                    .stellar_signed_intents_list(Parameters(SignedIntentsArgs {}))
+                    .await
+                    .unwrap();
+                assert_ne!(result.is_error, Some(true));
+                let text = result.content[0].as_text().unwrap();
+                let envelope: serde_json::Value = serde_json::from_str(&text.text).unwrap();
+                let value = envelope["data"]["signed_intents"].clone();
+                assert_eq!(value.as_array().unwrap().len(), 1);
+                fixture.assert_view(&value, endpoint_state);
+                fixture.assert_unchanged().await;
+            }
+            for missing in [false, true] {
+                fixture.damage_store(missing);
+                let result = server
+                    .stellar_signed_intents_list(Parameters(SignedIntentsArgs {}))
+                    .await
+                    .unwrap();
+                assert_eq!(result.is_error, Some(true));
+                let text = result.content[0].as_text().unwrap();
+                let envelope: serde_json::Value = serde_json::from_str(&text.text).unwrap();
+                assert_eq!(envelope["error"]["code"], "submission.record_unavailable");
+                fixture.assert_resources_unchanged().await;
+                if missing {
+                    assert!(!fixture.store.path().exists());
+                }
+            }
+        }
     }
 }

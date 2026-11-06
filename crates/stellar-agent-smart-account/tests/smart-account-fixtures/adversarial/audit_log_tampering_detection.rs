@@ -49,9 +49,9 @@ fn manager_with_url(
         Duration::from_secs(5),
         "stellar:testnet".to_owned(),
     )
-    .with_intent_admission(std::sync::Arc::new(
-        stellar_agent_smart_account::signing::intent_test_helpers::no_value_admission_owned(),
-    ));
+    .with_intent_admission(
+        stellar_agent_smart_account::signing::intent_test_helpers::shared_no_value_admission(),
+    );
     SignersManager::new(config).expect("SignersManager::new must succeed")
 }
 
@@ -80,7 +80,9 @@ fn signer_set_1_of_1() -> ObservedSignerSet {
 /// This validates the audit-log integrity gate is active on the divergence-check
 /// code path (audit-log integrity risk).
 #[tokio::test]
+#[serial_test::serial]
 async fn tampered_payload_returns_audit_log_integrity_error() {
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let (audit_writer, audit_log_path, _dir) = tmp_audit_writer();
     let observed = signer_set_1_of_1();
 
@@ -212,7 +214,9 @@ async fn tampered_payload_returns_audit_log_integrity_error() {
 /// A torn row, parse error, or chain-hash mismatch propagates
 /// `AuditLogIntegrityError` — MUST NOT reinterpret as `Ok(None)`.
 #[tokio::test]
+#[serial_test::serial]
 async fn torn_tail_returns_integrity_error_not_none() {
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let (audit_writer, audit_log_path, _dir) = tmp_audit_writer();
     let observed = signer_set_1_of_1();
 

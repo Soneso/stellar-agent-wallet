@@ -194,11 +194,11 @@ pub struct TransactionStatusView {
 /// ```
 #[non_exhaustive]
 pub struct StellarRpcClient {
-    pub(crate) inner: Client,
-    pub(crate) url: RpcEndpoint,
+    pub(crate) inner: std::sync::Arc<Client>,
+    pub(crate) url: std::sync::Arc<RpcEndpoint>,
     id: u64,
     #[cfg(test)]
-    identity_requests: std::sync::atomic::AtomicUsize,
+    identity_requests: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 /// The next client identity; every construction takes one, so two clients
@@ -234,12 +234,22 @@ impl StellarRpcClient {
         let endpoint = RpcEndpoint::plain(url);
         let inner = Client::new(url).map_err(|e| construction_failure(&endpoint, &e))?;
         Ok(Self {
-            inner,
-            url: endpoint,
+            inner: std::sync::Arc::new(inner),
+            url: std::sync::Arc::new(endpoint),
             id: next_client_id(),
             #[cfg(test)]
-            identity_requests: std::sync::atomic::AtomicUsize::new(0),
+            identity_requests: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         })
+    }
+
+    pub(crate) fn share_for_witness(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            url: self.url.clone(),
+            id: self.id,
+            #[cfg(test)]
+            identity_requests: self.identity_requests.clone(),
+        }
     }
 
     /// The URL the transport sends requests to, which a test transport
@@ -260,11 +270,11 @@ impl StellarRpcClient {
         let inner =
             Client::new(transport_url).map_err(|error| construction_failure(&endpoint, &error))?;
         Ok(Self {
-            inner,
-            url: endpoint,
+            inner: std::sync::Arc::new(inner),
+            url: std::sync::Arc::new(endpoint),
             id: next_client_id(),
             #[cfg(test)]
-            identity_requests: std::sync::atomic::AtomicUsize::new(0),
+            identity_requests: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         })
     }
 
@@ -355,11 +365,11 @@ impl StellarRpcClient {
         let endpoint = RpcEndpoint::credentialed(url, value, placement);
         let inner = built.map_err(|e| construction_failure(&endpoint, &e))?;
         Ok(Self {
-            inner,
-            url: endpoint,
+            inner: std::sync::Arc::new(inner),
+            url: std::sync::Arc::new(endpoint),
             id: next_client_id(),
             #[cfg(test)]
-            identity_requests: std::sync::atomic::AtomicUsize::new(0),
+            identity_requests: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         })
     }
 
@@ -959,6 +969,8 @@ impl PreparedSigningLedgerRead<'_> {
     /// or if the `getLatestLedger` request does not complete within the
     /// deadline, fails, or returns a body that does not deserialize. The
     /// `url` field is authority-only.
+    /// [`stellar_agent_core::error::WalletStateError::ClockError`] if the local
+    /// arrival time cannot be read in store clock milliseconds.
     pub async fn read(&self) -> Result<SigningLedgerObservation, WalletError> {
         let client = self.client;
         if self.identity.client_id() != client.id() {
@@ -982,6 +994,7 @@ impl PreparedSigningLedgerRead<'_> {
             self.identity.clone(),
             latest.sequence,
             Instant::now(),
+            crate::mainnet::clock::now_ms()?,
         ))
     }
 }

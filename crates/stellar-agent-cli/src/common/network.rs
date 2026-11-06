@@ -109,6 +109,7 @@ pub(crate) struct EndpointFlags<'a> {
 }
 
 /// The network context of a command, from the loaded profile and the flags.
+/// Supplied endpoints authorize signing; only both endpoints stored in the profile authorize charge closure.
 pub(crate) fn network_context_for_command(
     profile: &stellar_agent_core::profile::Profile,
     profile_name: &str,

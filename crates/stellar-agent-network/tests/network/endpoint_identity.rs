@@ -449,6 +449,7 @@ async fn observation(
 /// An observation binds the height to the identity of the endpoint that
 /// reported it and to the local time of the answer.
 #[tokio::test]
+#[serial_test::serial]
 async fn an_observation_binds_the_height_to_the_checked_identity() {
     let server = serve_get_network(network(TESTNET_PASSPHRASE, 29)).await;
     mount_latest_ledger(&server, latest_ledger(4321)).await;
@@ -457,6 +458,7 @@ async fn an_observation_binds_the_height_to_the_checked_identity() {
         "http://user:SECRET@127.0.0.1:{port}/rpc?token=SECRET"
     ))
     .unwrap();
+    let before_ms = stellar_agent_network::mainnet::clock::now_ms().unwrap();
     let before = tokio::time::Instant::now();
 
     let found = observation(&client, GENEROUS_DEADLINE).await.unwrap();
@@ -468,6 +470,8 @@ async fn an_observation_binds_the_height_to_the_checked_identity() {
         found.identity().authority(),
         format!("http://127.0.0.1:{port}")
     );
+    assert!(found.arrived_at_ms() >= before_ms);
+    assert!(found.arrived_at_ms() <= stellar_agent_network::mainnet::clock::now_ms().unwrap());
     assert!(found.observed_at() >= before);
     assert!(found.observed_at() <= tokio::time::Instant::now());
     assert_eq!(rpc_request_count(&server, "getNetwork").await, 1);
@@ -579,6 +583,7 @@ impl Respond for AdvancingLedger {
 /// identity, stamps the moment its own answer arrived, and stays under the
 /// deadline given at preparation.
 #[tokio::test]
+#[serial_test::serial]
 async fn prepared_observation_keeps_client_deadline_and_arrival_time() {
     let server = serve_get_network(network(TESTNET_PASSPHRASE, 29)).await;
     let arrivals = Arc::new(Mutex::new(Vec::new()));
@@ -599,8 +604,16 @@ async fn prepared_observation_keeps_client_deadline_and_arrival_time() {
         .await
         .unwrap();
 
-    let first = prepared.read().await.unwrap();
-    let second = prepared.read().await.unwrap();
+    let first = {
+        let _clock = stellar_agent_network::mainnet::clock::set_now_ms_for_test(1000);
+        prepared.read().await.unwrap()
+    };
+    let second = {
+        let _clock = stellar_agent_network::mainnet::clock::set_now_ms_for_test(2000);
+        prepared.read().await.unwrap()
+    };
+    assert_eq!(first.arrived_at_ms(), 1000);
+    assert_eq!(second.arrived_at_ms(), 2000);
 
     let arrived = arrivals.lock().unwrap().clone();
     assert_eq!((first.ledger(), second.ledger()), (700, 701));

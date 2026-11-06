@@ -450,6 +450,7 @@ where
     // ── GATE 4: Operator policy evaluation (args-path; mirrors the MCP
     // `stellar_trustline` twin, which derives its `Trustline` leg from the
     // dispatch args via `derive_value_class` rather than a typed builder) ────
+    crate::commands::submission_record::observe_intents(&profile, &profile_name).await;
     let policy_engine = match build_v1_policy_engine(
         "trustline",
         &profile.policy.engine,
@@ -3231,6 +3232,60 @@ mod tests {
                 run.envelope
             );
             assert!(fixture.sent_envelopes().await.is_empty());
+        }
+    }
+    #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial]
+    async fn early_observation_precedes_window_gate() {
+        use crate::commands::submission_record::intent_gate_fixture::{IntentGateState, home};
+        use wiremock::{Mock, MockServer, matchers::method};
+        let (_home, _guard) = home();
+        let primary = MockServer::start().await;
+        let source = stellar_strkey::ed25519::PublicKey([1; 32])
+            .to_string()
+            .to_string();
+        let issuer = stellar_strkey::ed25519::PublicKey([2; 32])
+            .to_string()
+            .to_string();
+        Mock::given(method("POST"))
+            .respond_with(crate::test_rpc::ClassicRpc::testnet(&[&source, &issuer]))
+            .mount(&primary)
+            .await;
+        let name = "intent-trustline";
+        let mut profile = Profile::builder_testnet_named(name, "signer", &source, "nonce", name)
+            .rpc_url(primary.uri())
+            .build();
+        let state = IntentGateState::seed(name, &mut profile).await;
+        let args = TrustlineArgs {
+            profile: Some(name.into()),
+            from: source,
+            asset: format!("USD:{issuer}"),
+            limit_stroops: None,
+            classic_base: Some("100".into()),
+        };
+        for after in [false, false, true] {
+            if after {
+                state.after_retention();
+            }
+            let before = state.bytes();
+            let mut out = Vec::new();
+            assert_eq!(
+                run_with_dependencies(&args, |_| Ok(profile.clone()), || Ok(()), &mut out).await,
+                1
+            );
+            let value: serde_json::Value = serde_json::from_slice(&out).unwrap();
+            assert_eq!(
+                value["error"]["code"],
+                if after {
+                    "audit.chain_key_unavailable"
+                } else {
+                    "policy.deny.rate_limit_exceeded"
+                }
+            );
+            state.assert_closed(&profile, u32::from(!after)).await;
+            if after {
+                assert_eq!(state.bytes(), before);
+            }
         }
     }
 }

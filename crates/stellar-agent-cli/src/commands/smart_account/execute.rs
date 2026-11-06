@@ -230,6 +230,7 @@ pub struct ExecuteArgs {
     /// On testnet, this flag overrides the profile endpoint.
     /// On mainnet, this flag is refused, including equal values.
     /// URL credentials are refused.
+    /// Only both endpoints stored in the profile authorize retained charge closure.
     #[arg(long, value_name = "URL", value_parser = EndpointUrlFlag)]
     pub rpc_url: Option<String>,
 
@@ -237,6 +238,7 @@ pub struct ExecuteArgs {
     /// On testnet, this flag overrides the profile endpoint.
     /// On mainnet, this flag is refused, including equal values.
     /// URL credentials are refused.
+    /// Only both endpoints stored in the profile authorize retained charge closure.
     #[arg(long, value_name = "URL", value_parser = EndpointUrlFlag)]
     pub secondary_rpc_url: Option<String>,
 

@@ -74,10 +74,10 @@ use stellar_baselib::transaction_builder::{TransactionBuilder, TransactionBuilde
 use stellar_rpc_client::Client;
 use stellar_xdr::{
     AccountId, Hash, HashIdPreimage, HashIdPreimageSorobanAuthorization, HostFunction,
-    InvokeContractArgs, InvokeHostFunctionOp, Limits, Operation, OperationBody,
-    PublicKey as XdrPublicKey, ScAddress, ScVal, SorobanAddressCredentials,
-    SorobanAuthorizationEntry, SorobanAuthorizedFunction, SorobanAuthorizedInvocation,
-    SorobanCredentials, Uint256, VecM, WriteXdr,
+    InvokeContractArgs, InvokeHostFunctionOp, LedgerBounds, Limits, Operation, OperationBody,
+    Preconditions, PreconditionsV2, PublicKey as XdrPublicKey, ScAddress, ScVal,
+    SorobanAddressCredentials, SorobanAuthorizationEntry, SorobanAuthorizedFunction,
+    SorobanAuthorizedInvocation, SorobanCredentials, TransactionEnvelope, Uint256, VecM, WriteXdr,
 };
 
 use crate::SaError;
@@ -132,6 +132,8 @@ pub(crate) struct TimelockSubmitResult {
 pub(crate) struct TimelockSubmitArgs<'a> {
     /// The pre-built `InvokeContract` host function (timelock entrypoint).
     pub(crate) host_function: HostFunction,
+    /// The schedule identity computed from both checked endpoints before admission.
+    pub(crate) schedule_identity: Option<(&'a str, [u8; 32])>,
     /// The signer whose G-key holds the required role (PROPOSER/CANCELLER/EXECUTOR).
     pub(crate) signer: &'a (dyn Signer + Send + Sync),
     /// Primary Soroban RPC URL.
@@ -150,6 +152,18 @@ pub(crate) struct TimelockSubmitArgs<'a> {
     pub(crate) op_label: &'static str,
     /// Charges the intent before its first signature.
     pub(crate) admission: SigningAdmission<'a>,
+}
+
+fn check_schedule_prediction(
+    identity: Option<(&str, [u8; 32])>,
+    prediction: &ScVal,
+) -> Result<(), SaError> {
+    if let Some((_, operation_id)) = identity
+        && !matches!(prediction, ScVal::Bytes(bytes) if bytes.as_slice() == operation_id)
+    {
+        return Err(SaError::IntentBindingMismatch { field: "purpose" });
+    }
+    Ok(())
 }
 
 // ── Main submit function ──────────────────────────────────────────────────────
@@ -410,6 +424,7 @@ pub(crate) async fn submit_timelock_invoke_with_g_key_auth(
             redacted_reason: format!("{}: simulate returned no result entry", args.op_label),
         })?;
     let return_val = sim_first_result.xdr;
+    check_schedule_prediction(args.schedule_identity, &return_val)?;
     let auth_entries = sim_first_result.auth;
 
     // The primary answered the simulation, so its height decides nothing on
@@ -502,7 +517,7 @@ pub(crate) async fn submit_timelock_invoke_with_g_key_auth(
     )
     .into();
     let auth_address = crate::managers::rules::scaddress_to_strkey(&invoke.contract_address)?;
-    let make_plan = |sequence: i64| {
+    let make_plan = |sequence: i64, envelope_max: u32| {
         SignedIntentPlan::new(
             args.network_passphrase,
             &auth_address,
@@ -512,6 +527,8 @@ pub(crate) async fn submit_timelock_invoke_with_g_key_auth(
             subjects.clone(),
             signs_entries.then_some(signature_expiration_ledger),
         )
+        .and_then(|plan| plan.classify_purpose(&args.host_function, args.schedule_identity))
+        .and_then(|plan| plan.with_envelope_max_ledger(envelope_max))
         .map_err(|error| crate::submit::map_admission_error(&error, args.op_label))
     };
     let frozen_sequence = source_view
@@ -520,7 +537,8 @@ pub(crate) async fn submit_timelock_invoke_with_g_key_auth(
         .ok_or(SaError::IntentBindingMismatch { field: "plan" })?;
     let mut gate = None;
     if signs_entries {
-        let plan = make_plan(frozen_sequence)?;
+        let plan = make_plan(frozen_sequence, signature_expiration_ledger)?
+            .with_capability(ledger_bound.capability());
         let proof = args
             .admission
             .admit(&plan)
@@ -676,12 +694,13 @@ pub(crate) async fn submit_timelock_invoke_with_g_key_auth(
         tx_builder2.add_operation(op_resim);
         let tx_resim = tx_builder2.build_for_simulation();
 
-        let resim_envelope = tx_resim.to_envelope().map_err(|e| {
+        let mut resim_envelope = tx_resim.to_envelope().map_err(|e| {
             auth_err(
                 "auth_payload",
                 format!("{}: to_envelope (resim) failed: {e:?}", args.op_label),
             )
         })?;
+        set_envelope_max_ledger(&mut resim_envelope, signature_expiration_ledger)?;
         let resim_response = bound_pre_submit_stage(
             pre_submit_budget,
             "simulate_resim",
@@ -708,6 +727,16 @@ pub(crate) async fn submit_timelock_invoke_with_g_key_auth(
                     SimulationErrorClass::of(err)
                 ),
             });
+        }
+        if args.schedule_identity.is_some() {
+            let prediction = resim_response
+                .results()
+                .map_err(|_| SaError::IntentBindingMismatch { field: "purpose" })?
+                .into_iter()
+                .next()
+                .ok_or(SaError::IntentBindingMismatch { field: "purpose" })?
+                .xdr;
+            check_schedule_prediction(args.schedule_identity, &prediction)?;
         }
         if resim_response.min_resource_fee == 0 || resim_response.transaction_data.is_empty() {
             return Err(SaError::DeploymentFailed {
@@ -767,6 +796,12 @@ pub(crate) async fn submit_timelock_invoke_with_g_key_auth(
                 )
             })?;
 
+        let ready = if signs_entries {
+            ledger_bound
+        } else {
+            pair_for_first_signature(ledger_bound, &witness_request, pre_submit_budget).await?
+        };
+        let final_expiration = ready.signature_expiration_ledger()?;
         let op_final = Operation {
             source_account: None,
             body: OperationBody::InvokeHostFunction(InvokeHostFunctionOp {
@@ -788,12 +823,13 @@ pub(crate) async fn submit_timelock_invoke_with_g_key_auth(
             tx_final.soroban_data = Some(data);
         }
 
-        let envelope = tx_final.to_envelope().map_err(|e| {
+        let mut envelope = tx_final.to_envelope().map_err(|e| {
             auth_err(
                 "auth_payload",
                 format!("{}: Transaction::to_envelope failed: {e:?}", args.op_label),
             )
         })?;
+        set_envelope_max_ledger(&mut envelope, final_expiration)?;
         let envelope_xdr = envelope.to_xdr_base64(Limits::none()).map_err(|e| {
             auth_err(
                 "auth_payload",
@@ -806,21 +842,19 @@ pub(crate) async fn submit_timelock_invoke_with_g_key_auth(
         // two re-fetches and the re-simulation since the witness can outlast an
         // observation: the pair is readied here.
         if !signs_entries {
-            let ready =
-                pair_for_first_signature(ledger_bound, &witness_request, pre_submit_budget).await?;
             let sequence = source_view3
                 .sequence_number
                 .checked_add(1)
                 .ok_or(SaError::IntentBindingMismatch { field: "plan" })?;
-            let plan = make_plan(sequence)?;
+            let plan = make_plan(sequence, final_expiration)?.with_capability(ready.capability());
             let proof = args
                 .admission
                 .admit(&plan)
                 .await
                 .map_err(|error| crate::submit::map_admission_error(&error, args.op_label))?;
             gate = Some(SigningGate::new(proof));
-            ready.ensure_fresh_at(pre_submit_budget, final_check_instant())?;
         }
+        ready.ensure_fresh_at(pre_submit_budget, final_check_instant())?;
         // The envelope is signed only while the deadline the witness rests on is
         // open, through the key read in step 1. A software key signs without
         // yielding, so the deadline is checked before the bounded signature as
@@ -898,6 +932,43 @@ pub(crate) async fn submit_timelock_invoke_with_g_key_auth(
     })
 }
 
+/// Sets the exact exclusive ledger bound while preserving other preconditions.
+fn set_envelope_max_ledger(
+    envelope: &mut TransactionEnvelope,
+    max_ledger: u32,
+) -> Result<(), SaError> {
+    if max_ledger == 0 {
+        return Err(SaError::IntentBindingMismatch {
+            field: "expiration",
+        });
+    }
+    let TransactionEnvelope::Tx(v1) = envelope else {
+        return Err(SaError::IntentBindingMismatch {
+            field: "expiration",
+        });
+    };
+    let mut conditions = match &v1.tx.cond {
+        Preconditions::V2(v2) => v2.clone(),
+        existing => PreconditionsV2 {
+            time_bounds: match existing {
+                Preconditions::Time(time) => Some(time.clone()),
+                _ => None,
+            },
+            ledger_bounds: None,
+            min_seq_num: None,
+            min_seq_age: stellar_xdr::Duration(0),
+            min_seq_ledger_gap: 0,
+            extra_signers: VecM::default(),
+        },
+    };
+    conditions.ledger_bounds = Some(LedgerBounds {
+        min_ledger: 0,
+        max_ledger,
+    });
+    v1.tx.cond = Preconditions::V2(conditions);
+    Ok(())
+}
+
 /// The pair the first signature of a timelock call rests on.
 ///
 /// `bound` stands while it is fresh. A stale pair is read again as a pair,
@@ -953,6 +1024,43 @@ mod tests {
 
     use super::*;
 
+    fn no_value_fixture() -> (tempfile::TempDir, stellar_agent_network::NoValueAdmission) {
+        use stellar_agent_core::policy::{
+            McpToolRegistration, NoopPolicyEngine, PolicyEngine, ToolDescriptor, ToolValueKind,
+        };
+        use stellar_agent_core::profile::schema::Profile;
+
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        let scratch = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/tmp");
+        std::fs::create_dir_all(&scratch).unwrap();
+        let dir = tempfile::Builder::new()
+            .prefix("timelock-bounds-")
+            .tempdir_in(scratch)
+            .unwrap();
+        let profile = Profile::builder_testnet_named(
+            "intent",
+            "timelock-fixture-owner",
+            "account",
+            "timelock-fixture-nonce",
+            "account",
+        )
+        .build();
+        let tool = ToolDescriptor::from_registration(&McpToolRegistration {
+            name: "stellar_smart_account_timelock_cancel",
+            destructive_hint: true,
+            read_only_hint: false,
+            chain_id_required: true,
+            value_kind: ToolValueKind::MovesValue,
+        });
+        let sizing = NoopPolicyEngine.size_no_value(&tool, &profile, 0).unwrap();
+        let store = stellar_agent_network::policy_state::PersistedWindowStore::at_path(
+            dir.path().join("intent.window"),
+        );
+        let admission =
+            stellar_agent_network::NoValueAdmission::with_store(profile, store, sizing).unwrap();
+        (dir, admission)
+    }
+
     /// Verifies that `TimelockSubmitArgs` with a non-`InvokeContract` host function
     /// returns `AuthEntryConstructionFailed` before any network I/O.
     ///
@@ -1007,9 +1115,11 @@ mod tests {
     async fn submit_on(
         network_passphrase: &str,
     ) -> (Result<TimelockSubmitResult, SaError>, usize, usize) {
+        let (_dir, admission) = no_value_fixture();
         let server = wiremock::MockServer::start().await;
         let signer = stellar_agent_network::signing::test_doubles::CountingSigner::new([0x51; 32]);
         let result = submit_timelock_invoke_with_g_key_auth(TimelockSubmitArgs {
+            schedule_identity: None,
             host_function: HostFunction::InvokeContract(InvokeContractArgs {
                 contract_address: ScAddress::Contract(ContractId(Hash([0x52; 32]))),
                 function_name: ScSymbol::try_from("schedule").unwrap(),
@@ -1021,9 +1131,7 @@ mod tests {
             network_passphrase,
             timeout: std::time::Duration::from_secs(1),
             op_label: "schedule",
-            admission: stellar_agent_network::SigningAdmission::NoValue(
-                crate::signing::intent_test_helpers::no_value_admission(),
-            ),
+            admission: stellar_agent_network::SigningAdmission::NoValue(&admission),
         })
         .await;
         let requests = server.received_requests().await.unwrap().len();
@@ -1031,6 +1139,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn a_testnet_submit_reaches_the_signer_and_the_endpoint() {
         let (result, key_accesses, requests) =
             submit_on(stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE).await;
@@ -1044,6 +1153,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn a_mainnet_submit_is_refused_before_the_signer_and_the_endpoint() {
         let (result, key_accesses, requests) =
             submit_on(stellar_agent_core::profile::caip2::MAINNET_PASSPHRASE).await;
@@ -1185,6 +1295,7 @@ mod tests {
             source_account_auth: bool,
             final_sequence_bump: bool,
             overflowing_final_fee: bool,
+            schedule_predictions: Option<[[u8; 32]; 2]>,
             /// The height `getLatestLedger` reports once this many reads
             /// were answered.
             ledger_after_reads: Option<(usize, u32)>,
@@ -1203,6 +1314,7 @@ mod tests {
                     source_account_auth: false,
                     final_sequence_bump: false,
                     overflowing_final_fee: false,
+                    schedule_predictions: None,
                     ledger_after_reads: None,
                 }
             }
@@ -1274,11 +1386,26 @@ mod tests {
                             panic!("contract function")
                         };
                         let value = match invoke.function_name.0.as_slice() {
+                            b"schedule" if self.chain.schedule_predictions.is_some() => {
+                                let index = (self.simulations.load(Ordering::SeqCst) - 1).min(1);
+                                ScVal::Bytes(
+                                    self.chain.schedule_predictions.unwrap()[index]
+                                        .to_vec()
+                                        .try_into()
+                                        .unwrap(),
+                                )
+                            }
                             b"hash_operation" => ScVal::Bytes(vec![0x77; 32].try_into().unwrap()),
+                            b"schedule" if invoke.args.len() == 7 => {
+                                ScVal::Bytes(vec![0x77; 32].try_into().unwrap())
+                            }
                             b"get_operation_ledger" => ScVal::U32(READY_LEDGER),
                             _ => ScVal::Void,
                         };
-                        let auth = if value != ScVal::Void {
+                        let auth = if matches!(
+                            invoke.function_name.0.as_slice(),
+                            b"hash_operation" | b"get_operation_ledger"
+                        ) {
                             Vec::new()
                         } else if op.auth.is_empty() {
                             self.entries.clone().unwrap_or_else(|| {
@@ -1410,7 +1537,43 @@ mod tests {
             }
         }
 
+        async fn sent_envelope(server: &MockServer) -> Option<TransactionEnvelope> {
+            use stellar_xdr::ReadXdr as _;
+            server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .find_map(|request| {
+                    let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                    (body["method"] == "sendTransaction").then(|| {
+                        TransactionEnvelope::from_xdr_base64(
+                            body["params"]["transaction"].as_str().unwrap(),
+                            Limits::none(),
+                        )
+                        .unwrap()
+                    })
+                })
+        }
+
+        fn assert_envelope_bound(envelope: Option<&TransactionEnvelope>, maximum: u32) {
+            let Some(TransactionEnvelope::Tx(tx)) = envelope else {
+                panic!("a signed V1 envelope")
+            };
+            let stellar_xdr::Preconditions::V2(conditions) = &tx.tx.cond else {
+                panic!("V2 signing preconditions")
+            };
+            assert_eq!(
+                conditions.ledger_bounds,
+                Some(stellar_xdr::LedgerBounds {
+                    min_ledger: 0,
+                    max_ledger: maximum
+                })
+            );
+        }
+
         struct Outcome {
+            sent: Option<TransactionEnvelope>,
             result: Result<super::super::TimelockSubmitResult, SaError>,
             signs: usize,
             auth_signs: usize,
@@ -1519,6 +1682,7 @@ mod tests {
             + 'static,
             entries: Option<Vec<SorobanAuthorizationEntry>>,
         ) -> Outcome {
+            let (_dir, admission) = super::no_value_fixture();
             let server = MockServer::start().await;
             let simulations = Arc::new(AtomicUsize::new(0));
             let ledger_reads = Arc::new(AtomicUsize::new(0));
@@ -1539,6 +1703,7 @@ mod tests {
                 source: CountingSigner::new(SEED),
             };
             let result = submit_timelock_invoke_with_g_key_auth(TimelockSubmitArgs {
+                schedule_identity: None,
                 host_function: HostFunction::InvokeContract(schedule()),
                 signer: &signer,
                 primary_rpc_url: &server.uri(),
@@ -1546,13 +1711,12 @@ mod tests {
                 network_passphrase: stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE,
                 timeout: std::time::Duration::from_secs(5),
                 op_label: "schedule",
-                admission: stellar_agent_network::SigningAdmission::NoValue(
-                    crate::signing::intent_test_helpers::no_value_admission(),
-                ),
+                admission: stellar_agent_network::SigningAdmission::NoValue(&admission),
             })
             .await;
             let resimulated = resimulated.lock().unwrap().clone();
             Outcome {
+                sent: sent_envelope(&server).await,
                 result,
                 signs: signer.auth.sign_calls() + signer.source.sign_calls(),
                 auth_signs: signer.auth.sign_calls(),
@@ -1565,6 +1729,7 @@ mod tests {
         }
 
         #[tokio::test]
+        #[serial_test::serial]
         async fn a_timelock_root_on_another_contract_is_refused_before_signing() {
             let outcome = submit(|_| leaf(drain())).await;
             let reason = outcome.refused_before_signing();
@@ -1573,6 +1738,7 @@ mod tests {
         }
 
         #[tokio::test]
+        #[serial_test::serial]
         async fn a_timelock_root_with_a_sub_invocation_is_refused() {
             let outcome = submit(|invoke| SorobanAuthorizedInvocation {
                 function: SorobanAuthorizedFunction::ContractFn(invoke.clone()),
@@ -1584,6 +1750,7 @@ mod tests {
         }
 
         #[tokio::test]
+        #[serial_test::serial]
         async fn a_timelock_root_with_other_arguments_is_refused() {
             let outcome = submit(|invoke| {
                 let mut root = invoke.clone();
@@ -1600,6 +1767,7 @@ mod tests {
         /// Every entry is checked before any is signed, so an honest first
         /// entry is not signed when the second is refused.
         #[tokio::test]
+        #[serial_test::serial]
         async fn an_honest_first_entry_is_not_signed_when_a_second_is_refused() {
             let outcome = submit_entries(|invoke| vec![leaf(invoke.clone()), leaf(drain())]).await;
             let reason = outcome.refused_before_signing();
@@ -1607,6 +1775,7 @@ mod tests {
         }
 
         #[tokio::test]
+        #[serial_test::serial]
         async fn the_timelock_signs_its_own_call() {
             let outcome = submit(|invoke| leaf(invoke.clone())).await;
             assert!(outcome.result.is_ok(), "{:?}", outcome.result);
@@ -1713,6 +1882,7 @@ mod tests {
         }
 
         #[tokio::test]
+        #[serial_test::serial]
         async fn source_account_foreign_root_refuses_before_envelope_signing() {
             for (entry, reason) in foreign_source_roots() {
                 let outcome = submit_auth_entries(vec![entry]).await;
@@ -1724,6 +1894,7 @@ mod tests {
         }
 
         #[tokio::test]
+        #[serial_test::serial]
         async fn source_account_nested_invocation_refuses_before_signing() {
             let (entry, reason) = nested_source_root();
             let outcome = submit_auth_entries(vec![entry]).await;
@@ -1734,6 +1905,7 @@ mod tests {
         }
 
         #[tokio::test]
+        #[serial_test::serial]
         async fn unsupported_credentials_produce_zero_signatures() {
             for entry in unsupported_entries() {
                 submit_auth_entries(vec![entry])
@@ -1743,6 +1915,7 @@ mod tests {
         }
 
         #[tokio::test]
+        #[serial_test::serial]
         async fn foreign_address_credentials_refuse_before_signing() {
             submit_auth_entries(vec![foreign_address_entry()])
                 .await
@@ -1756,6 +1929,7 @@ mod tests {
         }
 
         #[tokio::test]
+        #[serial_test::serial]
         async fn valid_first_invalid_second_never_partially_signs() {
             let invalid_cases = foreign_source_roots()
                 .into_iter()
@@ -1787,6 +1961,7 @@ mod tests {
         }
 
         #[tokio::test]
+        #[serial_test::serial]
         async fn exact_source_account_root_reaches_envelope_signing() {
             let entry = SorobanAuthorizationEntry {
                 credentials: SorobanCredentials::SourceAccount,
@@ -1798,6 +1973,200 @@ mod tests {
             assert_eq!(outcome.key_reads, 1);
             assert_eq!(outcome.simulations, 2);
             assert_eq!(outcome.resimulated, vec![entry]);
+            assert_envelope_bound(outcome.sent.as_ref(), 1100);
+        }
+
+        struct BoundRecorder {
+            admission: stellar_agent_network::NoValueAdmission,
+            plans: Mutex<Vec<stellar_agent_network::SignedIntentPlan>>,
+        }
+
+        #[async_trait::async_trait]
+        impl stellar_agent_network::SubmissionRecorder for BoundRecorder {
+            async fn admit_signed_intent(
+                &self,
+                plan: &stellar_agent_network::SignedIntentPlan,
+            ) -> Result<stellar_agent_network::IntentProof, WalletError> {
+                self.plans.lock().unwrap().push(plan.clone());
+                self.admission.admit(plan).await
+            }
+
+            async fn cancel_unexposed(
+                &self,
+                proof: stellar_agent_network::IntentProof,
+            ) -> Result<(), WalletError> {
+                self.admission.cancel_unexposed(proof).await
+            }
+
+            async fn pre_send_bound(
+                &self,
+                _: &stellar_agent_network::SubmissionIntent,
+                _: &stellar_agent_network::IntentBinding<'_>,
+            ) -> Result<(), WalletError> {
+                Ok(())
+            }
+
+            async fn pre_send(
+                &self,
+                _: &stellar_agent_network::SubmissionIntent,
+            ) -> Result<(), WalletError> {
+                Ok(())
+            }
+
+            async fn outcome(
+                &self,
+                _: &stellar_agent_network::SubmissionIntent,
+                _: &stellar_agent_network::SubmissionOutcome,
+            ) {
+            }
+        }
+
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn timelock_envelopes_have_exact_ledger_bounds() {
+            use stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE;
+            use stellar_xdr::{LedgerBounds, Preconditions};
+
+            let source = SorobanAuthorizationEntry {
+                credentials: SorobanCredentials::SourceAccount,
+                root_invocation: leaf(schedule()),
+            };
+            let address = SorobanAuthorizationEntry {
+                credentials: SorobanCredentials::Address(address_credentials()),
+                root_invocation: leaf(schedule()),
+            };
+            for entries in [
+                Vec::new(),
+                vec![source.clone()],
+                vec![address.clone()],
+                vec![source, address],
+            ] {
+                let (_dir, admission) = super::no_value_fixture();
+                let recorder = BoundRecorder {
+                    admission,
+                    plans: Mutex::new(Vec::new()),
+                };
+                let server = MockServer::start().await;
+                let simulations = Arc::new(AtomicUsize::new(0));
+                let ledger_reads = Arc::new(AtomicUsize::new(0));
+                Mock::given(method("POST"))
+                    .respond_with(Rpc {
+                        trees: Arc::new(|_| Vec::new()),
+                        entries: Some(entries.clone()),
+                        simulations: Arc::clone(&simulations),
+                        ledger_reads: Arc::clone(&ledger_reads),
+                        resimulated: Arc::default(),
+                        chain: Chain::at(1000),
+                    })
+                    .mount(&server)
+                    .await;
+                let signer = AuthAndSourceSigner {
+                    auth: CountingSigner::new(SEED),
+                    source: CountingSigner::new(SEED),
+                };
+                let result = submit_timelock_invoke_with_g_key_auth(TimelockSubmitArgs {
+                    schedule_identity: None,
+                    host_function: HostFunction::InvokeContract(schedule()),
+                    signer: &signer,
+                    primary_rpc_url: &server.uri(),
+                    secondary_rpc_url: &second_loopback_host(&server.uri()),
+                    network_passphrase: TESTNET_PASSPHRASE,
+                    timeout: std::time::Duration::from_secs(5),
+                    op_label: "schedule",
+                    admission: stellar_agent_network::SigningAdmission::Recorded(&recorder),
+                })
+                .await;
+                assert!(result.is_ok(), "{result:?}");
+                assert_eq!(simulations.load(Ordering::SeqCst), 2);
+                assert_eq!(ledger_reads.load(Ordering::SeqCst), 2);
+                assert_eq!(signer.source.sign_calls(), 1);
+                assert_eq!(
+                    signer.auth.sign_calls(),
+                    entries
+                        .iter()
+                        .filter(|entry| matches!(entry.credentials, SorobanCredentials::Address(_)))
+                        .count()
+                );
+
+                let requests: Vec<Value> = server
+                    .received_requests()
+                    .await
+                    .unwrap()
+                    .iter()
+                    .map(|request| serde_json::from_slice(&request.body).unwrap())
+                    .collect();
+                let decode = |request: &Value| {
+                    TransactionEnvelope::from_xdr_base64(
+                        request["params"]["transaction"].as_str().unwrap(),
+                        Limits::none(),
+                    )
+                    .unwrap()
+                };
+                let simulated: Vec<_> = requests
+                    .iter()
+                    .filter(|request| request["method"] == "simulateTransaction")
+                    .map(decode)
+                    .collect();
+                let sent = decode(
+                    requests
+                        .iter()
+                        .find(|request| request["method"] == "sendTransaction")
+                        .unwrap(),
+                );
+                let (TransactionEnvelope::Tx(provisional), TransactionEnvelope::Tx(final_tx)) =
+                    (&simulated[1], &sent)
+                else {
+                    panic!("V1 envelopes")
+                };
+                let Preconditions::V2(provisional_conditions) = &provisional.tx.cond else {
+                    panic!("provisional V2")
+                };
+                let Preconditions::V2(final_conditions) = &final_tx.tx.cond else {
+                    panic!("final V2")
+                };
+                let expected = Some(LedgerBounds {
+                    min_ledger: 0,
+                    max_ledger: 1100,
+                });
+                assert_eq!(provisional_conditions.ledger_bounds, expected);
+                assert_eq!(final_conditions.ledger_bounds, expected);
+                assert_eq!(
+                    provisional_conditions.to_xdr(Limits::none()).unwrap().len(),
+                    final_conditions.to_xdr(Limits::none()).unwrap().len()
+                );
+                let mut normalized = final_tx.clone();
+                normalized.signatures = VecM::default();
+                normalized.tx.ext = provisional.tx.ext.clone();
+                normalized.tx.fee = provisional.tx.fee;
+                assert_eq!(
+                    TransactionEnvelope::Tx(normalized)
+                        .to_xdr(Limits::none())
+                        .unwrap()
+                        .len(),
+                    simulated[1].to_xdr(Limits::none()).unwrap().len()
+                );
+
+                let payload = TxSigningPayload::for_envelope(&sent, TESTNET_PASSPHRASE).unwrap();
+                let signature = ed25519_dalek::Signature::from_slice(
+                    final_tx.signatures[0].signature.0.as_slice(),
+                )
+                .unwrap();
+                ed25519_dalek::VerifyingKey::from_bytes(&public_key_for_seed(SEED))
+                    .unwrap()
+                    .verify_strict(payload.as_bytes(), &signature)
+                    .unwrap();
+                let plans = recorder.plans.lock().unwrap();
+                assert_eq!(plans.len(), 1);
+                assert_eq!(plans[0].check_envelope(&sent), Ok(()));
+                for subject in plans[0].subjects() {
+                    if subject.expiration().is_some() {
+                        assert_eq!(subject.expiration(), Some(1100));
+                    }
+                }
+                let mut changed = sent.clone();
+                super::super::set_envelope_max_ledger(&mut changed, 1101).unwrap();
+                assert_eq!(plans[0].check_envelope(&changed), Err("expiration"));
+            }
         }
 
         /// Asserts that `signed` expires at `expiration` and that its signature
@@ -1959,6 +2328,7 @@ mod tests {
             }
 
             struct Outcome {
+                sent: Option<stellar_xdr::TransactionEnvelope>,
                 result: Result<TimelockSubmitResult, SaError>,
                 signs: usize,
                 resimulated: Vec<stellar_xdr::SorobanAuthorizationEntry>,
@@ -1994,7 +2364,9 @@ mod tests {
                 counter: &CountingSigner,
                 timeout: Duration,
             ) -> Outcome {
+                let (_dir, admission) = super::super::no_value_fixture();
                 let result = submit_timelock_invoke_with_g_key_auth(TimelockSubmitArgs {
+                    schedule_identity: None,
                     host_function: HostFunction::InvokeContract(schedule()),
                     signer,
                     primary_rpc_url: &primary.uri(),
@@ -2002,12 +2374,11 @@ mod tests {
                     network_passphrase: TESTNET_PASSPHRASE,
                     timeout,
                     op_label: "schedule",
-                    admission: stellar_agent_network::SigningAdmission::NoValue(
-                        crate::signing::intent_test_helpers::no_value_admission(),
-                    ),
+                    admission: stellar_agent_network::SigningAdmission::NoValue(&admission),
                 })
                 .await;
                 Outcome {
+                    sent: super::sent_envelope(&primary.server).await,
                     result,
                     signs: counter.sign_calls(),
                     resimulated: primary.resimulated(),
@@ -2119,6 +2490,7 @@ mod tests {
                 binds: AtomicUsize,
                 ledger_reads_at_admission: AtomicUsize,
                 subjects: Mutex<Vec<stellar_agent_network::SubjectKind>>,
+                admitted_plan: Mutex<Option<stellar_agent_network::SignedIntentPlan>>,
             }
 
             #[async_trait]
@@ -2130,6 +2502,7 @@ mod tests {
                     assert_eq!(self.signer.auth.sign_calls(), 0);
                     assert_eq!(self.signer.source.sign_calls(), 0);
                     self.admissions.fetch_add(1, Ordering::SeqCst);
+                    *self.admitted_plan.lock().unwrap() = Some(plan.clone());
                     *self.subjects.lock().unwrap() = plan
                         .subjects()
                         .iter()
@@ -2176,6 +2549,139 @@ mod tests {
                     outcome: &stellar_agent_network::SubmissionOutcome,
                 ) {
                     self.inner.outcome(intent, outcome).await;
+                }
+            }
+
+            #[tokio::test]
+            #[serial_test::serial]
+            async fn schedule_identity_is_frozen_before_admission() {
+                use stellar_agent_core::policy::v1::criteria::state_store::{
+                    PolicyStateStore, StateKey, WindowEntry, WindowLimit,
+                };
+                use stellar_agent_core::policy::v1::{CheckedSizing, SizingBasis};
+                use stellar_agent_network::SigningAdmission;
+                use stellar_agent_network::policy_state::PersistedWindowStore;
+                for (predictions, admissions, signatures) in [
+                    ([[8; 32], [7; 32]], 0, 0),
+                    ([[7; 32], [8; 32]], 1, 1),
+                    ([[7; 32], [7; 32]], 1, 2),
+                ] {
+                    stellar_agent_test_support::keyring_mock::install().unwrap();
+                    let dir = tempfile::tempdir().unwrap();
+                    let profile =
+                        stellar_agent_core::profile::schema::Profile::builder_testnet_named(
+                            "intent",
+                            "prediction-test",
+                            "account",
+                            "prediction-nonce",
+                            "account",
+                        )
+                        .build();
+                    let store = PersistedWindowStore::at_path(dir.path().join("intent.window"));
+                    let primary = Endpoint::start(Chain {
+                        schedule_predictions: Some(predictions),
+                        ..Chain::at(LEDGER)
+                    })
+                    .await;
+                    let secondary = Endpoint::start(Chain::at(LEDGER)).await;
+                    let signer = super::AuthAndSourceSigner {
+                        auth: CountingSigner::new(SEED),
+                        source: CountingSigner::new(SEED),
+                    };
+                    let now = stellar_agent_core::timefmt::now_unix_ms().unwrap();
+                    let key = StateKey::new("intent", 1, "rate_limit", 60);
+                    let entries = vec![WindowEntry::new(
+                        key.clone(),
+                        now,
+                        1,
+                        WindowLimit::Count {
+                            window: "1m".into(),
+                            max_calls: 1,
+                        },
+                    )];
+                    let sizing =
+                        CheckedSizing::for_test(SizingBasis::NoValue, entries.clone()).unwrap();
+                    let inner =
+                        stellar_agent_network::submission_record::WalletSubmissionRecorder::new(
+                            &profile,
+                            "intent",
+                            "timelock_test",
+                            Some("stellar:testnet".into()),
+                            stellar_agent_core::audit_log::PolicyDecision::Allow,
+                            vec![],
+                            entries,
+                            stellar_agent_core::profile::receipt::ReceiptStore::open_at(
+                                dir.path(),
+                                "intent",
+                            )
+                            .unwrap(),
+                            store.clone(),
+                            None,
+                            None,
+                            "fixture",
+                            now,
+                        )
+                        .with_signing_sizing(sizing);
+
+                    let recorder = AdmissionRecorder {
+                        inner,
+                        stale: false,
+                        signer: &signer,
+                        endpoint: &primary,
+                        admissions: 0.into(),
+                        cancellations: 0.into(),
+                        binds: 0.into(),
+                        ledger_reads_at_admission: 0.into(),
+                        subjects: Mutex::new(vec![]),
+                        admitted_plan: Mutex::new(None),
+                    };
+                    let timelock = stellar_strkey::Contract([0x52; 32]).to_string().to_string();
+                    let result = submit_timelock_invoke_with_g_key_auth(TimelockSubmitArgs {
+                        schedule_identity: Some((&timelock, [7; 32])),
+                        host_function: HostFunction::InvokeContract(schedule()),
+                        signer: &signer,
+                        primary_rpc_url: &primary.uri(),
+                        secondary_rpc_url: &secondary.witness_uri(),
+                        network_passphrase: TESTNET_PASSPHRASE,
+                        timeout: Duration::from_secs(30),
+                        op_label: "schedule",
+                        admission: SigningAdmission::Recorded(&recorder),
+                    })
+                    .await;
+                    assert_eq!(recorder.admissions.load(Ordering::SeqCst), admissions);
+                    assert_eq!(
+                        signer.auth.sign_calls() + signer.source.sign_calls(),
+                        signatures
+                    );
+                    if predictions[0] != predictions[1] {
+                        assert!(
+                            matches!(
+                                result,
+                                Err(SaError::IntentBindingMismatch { field: "purpose" })
+                            ),
+                            "{result:?}"
+                        );
+                        assert_eq!(recorder.binds.load(Ordering::SeqCst), 0);
+                    } else {
+                        assert!(result.is_ok(), "{result:?}");
+                    }
+                    let views = store.signed_intents("intent", &profile).unwrap();
+                    assert_eq!(views.len(), admissions);
+                    if admissions == 0 {
+                        assert!(!store.path().exists());
+                    } else {
+                        assert_eq!(views[0].accounting_horizon, "open");
+                        assert_eq!(
+                            views[0].purpose,
+                            Some(stellar_agent_network::IntentPurpose::TimelockSchedule {
+                                timelock: timelock.clone(),
+                                operation_id: [7; 32]
+                            })
+                        );
+                        let loaded = PolicyStateStore::new();
+                        store.load_into("intent", &profile, &loaded).unwrap();
+                        assert_eq!(loaded.query_window(&key, now).unwrap(), (1, 1));
+                    }
                 }
             }
 
@@ -2289,8 +2795,10 @@ mod tests {
                         binds: 0.into(),
                         ledger_reads_at_admission: 0.into(),
                         subjects: Mutex::new(vec![]),
+                        admitted_plan: Mutex::new(None),
                     };
                     let result = submit_timelock_invoke_with_g_key_auth(TimelockSubmitArgs {
+                        schedule_identity: None,
                         host_function: HostFunction::InvokeContract(schedule()),
                         signer: &signer,
                         primary_rpc_url: &primary.uri(),
@@ -2334,6 +2842,68 @@ mod tests {
                         assert!(result.is_ok(), "{case}: {result:?}");
                         assert_eq!(recorder.binds.load(Ordering::SeqCst), 1);
                         assert_eq!(signer.source.sign_calls(), 1);
+                        let sent = super::sent_envelope(&primary.server).await;
+                        super::assert_envelope_bound(sent.as_ref(), LEDGER + 100);
+                        let sent = sent.unwrap();
+                        {
+                            let plan = recorder.admitted_plan.lock().unwrap();
+                            let plan = plan.as_ref().unwrap();
+                            assert_eq!(plan.check_envelope(&sent), Ok(()));
+                            let mut changed = sent.clone();
+                            super::super::super::set_envelope_max_ledger(
+                                &mut changed,
+                                LEDGER + 101,
+                            )
+                            .unwrap();
+                            assert_eq!(plan.check_envelope(&changed), Err("expiration"));
+                        }
+                        use stellar_xdr::{
+                            Limits, Preconditions, ReadXdr, TransactionEnvelope, WriteXdr,
+                        };
+                        let requests = primary.server.received_requests().await.unwrap();
+                        let resimulated: serde_json::Value = requests
+                            .iter()
+                            .map(|request| serde_json::from_slice(&request.body).unwrap())
+                            .filter(|body: &serde_json::Value| {
+                                body["method"] == "simulateTransaction"
+                            })
+                            .nth(1)
+                            .unwrap();
+                        let provisional = TransactionEnvelope::from_xdr_base64(
+                            resimulated["params"]["transaction"].as_str().unwrap(),
+                            Limits::none(),
+                        )
+                        .unwrap();
+                        super::assert_envelope_bound(Some(&provisional), LEDGER + 100);
+                        let (
+                            TransactionEnvelope::Tx(provisional_tx),
+                            TransactionEnvelope::Tx(final_tx),
+                        ) = (&provisional, &sent)
+                        else {
+                            panic!("V1 envelopes")
+                        };
+                        let (
+                            Preconditions::V2(provisional_conditions),
+                            Preconditions::V2(final_conditions),
+                        ) = (&provisional_tx.tx.cond, &final_tx.tx.cond)
+                        else {
+                            panic!("V2 preconditions")
+                        };
+                        assert_eq!(
+                            provisional_conditions.to_xdr(Limits::none()).unwrap().len(),
+                            final_conditions.to_xdr(Limits::none()).unwrap().len()
+                        );
+                        let mut normalized = final_tx.clone();
+                        normalized.signatures = Default::default();
+                        normalized.tx.ext = provisional_tx.tx.ext.clone();
+                        normalized.tx.fee = provisional_tx.tx.fee;
+                        assert_eq!(
+                            TransactionEnvelope::Tx(normalized)
+                                .to_xdr(Limits::none())
+                                .unwrap()
+                                .len(),
+                            provisional.to_xdr(Limits::none()).unwrap().len()
+                        );
                         if case == "empty" {
                             assert!(recorder.subjects.lock().unwrap().is_empty());
                             assert_eq!(signer.auth.sign_calls(), 0);
@@ -2354,6 +2924,9 @@ mod tests {
                     let reopened = PersistedWindowStore::at_path(dir.path().join("intent.window"));
                     let intents = reopened.signed_intents("intent", &profile).unwrap();
                     assert_eq!(intents.len(), usize::from(!stale));
+                    for intent in &intents {
+                        assert_eq!(intent.greatest_expiration_ledger, Some(LEDGER + 100));
+                    }
                     if case.starts_with("sequence") {
                         assert_eq!(
                             intents[0].status,
@@ -2450,6 +3023,7 @@ mod tests {
             }
 
             #[tokio::test]
+            #[serial_test::serial]
             async fn timelock_refuses_plausible_inflated_height() {
                 for verb in VERBS {
                     let primary = Endpoint::start(Chain::at(1_000_000)).await;
@@ -2462,6 +3036,7 @@ mod tests {
             }
 
             #[tokio::test]
+            #[serial_test::serial]
             async fn allowed_skew_has_exact_bounded_expiry() {
                 for (primary, secondary) in [
                     (LEDGER, LEDGER),
@@ -2476,6 +3051,10 @@ mod tests {
                         panic!("one signed entry: {:?}", outcome.resimulated)
                     };
                     assert_signed_at(signed, schedule(), primary.min(secondary) + 100);
+                    super::assert_envelope_bound(
+                        outcome.sent.as_ref(),
+                        primary.min(secondary) + 100,
+                    );
                 }
                 for (primary, secondary) in [(LEDGER, LEDGER + 3), (LEDGER + 3, LEDGER)] {
                     submit_at(primary, secondary)
@@ -2492,6 +3071,7 @@ mod tests {
             /// The simulation's own height must not contradict the pair
             /// observed after it, in either direction.
             #[tokio::test]
+            #[serial_test::serial]
             async fn a_simulated_height_outside_the_pair_refuses_before_signing() {
                 for (simulated, case) in [(1_000_000, "above"), (LEDGER - 3, "below")] {
                     let primary = Endpoint::start(Chain {
@@ -2511,6 +3091,7 @@ mod tests {
             /// the deadline refusal, and the envelope is neither signed nor
             /// sent. The authorization entry is signed before that read.
             #[tokio::test]
+            #[serial_test::serial]
             async fn a_final_fetch_past_the_deadline_refuses_before_the_envelope_is_signed() {
                 let primary = Endpoint::start(Chain {
                     final_fetch_delay: Some(DEADLINE + Duration::from_secs(1)),
@@ -2546,6 +3127,7 @@ mod tests {
             /// the envelope is neither signed nor sent. The authorization
             /// entry is signed before.
             #[tokio::test]
+            #[serial_test::serial]
             async fn an_envelope_signature_past_the_deadline_is_cut_and_nothing_is_sent() {
                 let primary = Endpoint::start(Chain::at(LEDGER)).await;
                 let secondary = Endpoint::start(Chain::at(LEDGER)).await;
@@ -2566,6 +3148,7 @@ mod tests {
             /// An authorization signature that outlasts the deadline is cut
             /// at it: nothing is signed, re-simulated or sent.
             #[tokio::test]
+            #[serial_test::serial]
             async fn an_entry_signature_past_the_deadline_is_cut_and_nothing_is_sent() {
                 let primary = Endpoint::start(Chain::at(LEDGER)).await;
                 let secondary = Endpoint::start(Chain::at(LEDGER)).await;
@@ -2588,6 +3171,7 @@ mod tests {
             /// deadline the witness rests on: an identity probe that outlasts
             /// it sends nothing, though both signatures are made.
             #[tokio::test]
+            #[serial_test::serial]
             async fn a_pre_send_step_past_the_deadline_sends_nothing() {
                 let primary = Endpoint::start(Chain {
                     pre_send_delay: Some(DEADLINE + Duration::from_secs(1)),
@@ -2618,6 +3202,7 @@ mod tests {
                 let primary = Endpoint::start(Chain {
                     source_account_auth: true,
                     resimulation_delay: Some(RESIMULATION_OUTLASTS_OBSERVATION),
+                    ledger_after_reads: Some((1, LEDGER + 1)),
                     ..Chain::at(LEDGER)
                 })
                 .await;
@@ -2648,13 +3233,17 @@ mod tests {
             /// the signature, and at no check before it, refuses with nothing
             /// signed or sent. The cases run side by side.
             #[tokio::test]
+            #[serial_test::serial]
             async fn a_stale_pair_is_read_again_before_a_first_envelope_signature() {
                 let (
                     (fresh, primary, secondary),
                     (refused, refused_primary, refused_secondary),
                     (stale, stale_primary, stale_secondary),
                 ) = tokio::join!(
-                    submit_source_account_only(Chain::at(LEDGER)),
+                    submit_source_account_only(Chain {
+                        ledger_after_reads: Some((1, LEDGER + 1)),
+                        ..Chain::at(LEDGER)
+                    }),
                     submit_source_account_only(Chain {
                         ledger_after_reads: Some((1, LEDGER + 50)),
                         ..Chain::at(LEDGER)
@@ -2670,6 +3259,68 @@ mod tests {
                 assert_eq!(secondary.ledger_reads(), 2, "the pair is read again");
                 assert_eq!(primary.ledger_reads(), 2, "the pair is read again");
                 assert_eq!(primary.sends().await, 1);
+
+                use stellar_xdr::{Limits, Preconditions, ReadXdr, TransactionEnvelope, WriteXdr};
+                let requests: Vec<serde_json::Value> = primary
+                    .server
+                    .received_requests()
+                    .await
+                    .unwrap()
+                    .iter()
+                    .map(|request| serde_json::from_slice(&request.body).unwrap())
+                    .collect();
+                let decode = |request: &serde_json::Value| {
+                    TransactionEnvelope::from_xdr_base64(
+                        request["params"]["transaction"].as_str().unwrap(),
+                        Limits::none(),
+                    )
+                    .unwrap()
+                };
+                let sent = decode(
+                    requests
+                        .iter()
+                        .find(|request| request["method"] == "sendTransaction")
+                        .unwrap(),
+                );
+                let resimulated = decode(
+                    requests
+                        .iter()
+                        .filter(|request| request["method"] == "simulateTransaction")
+                        .nth(1)
+                        .unwrap(),
+                );
+                let (TransactionEnvelope::Tx(sent), TransactionEnvelope::Tx(resimulated)) =
+                    (sent, resimulated)
+                else {
+                    panic!("V1 envelopes")
+                };
+                let (
+                    Preconditions::V2(final_conditions),
+                    Preconditions::V2(provisional_conditions),
+                ) = (&sent.tx.cond, &resimulated.tx.cond)
+                else {
+                    panic!("V2 preconditions")
+                };
+                assert_eq!(
+                    provisional_conditions
+                        .ledger_bounds
+                        .as_ref()
+                        .unwrap()
+                        .max_ledger,
+                    LEDGER + 100
+                );
+                assert_eq!(
+                    final_conditions.ledger_bounds.as_ref().unwrap().max_ledger,
+                    LEDGER + 101
+                );
+                assert_eq!(
+                    final_conditions.ledger_bounds.as_ref().unwrap().min_ledger,
+                    0
+                );
+                assert_eq!(
+                    provisional_conditions.to_xdr(Limits::none()).unwrap().len(),
+                    final_conditions.to_xdr(Limits::none()).unwrap().len()
+                );
 
                 match &refused.result {
                     Err(error) => assert_eq!(error.wire_code(), SKEW_CODE, "{error:?}"),
@@ -2705,6 +3356,7 @@ mod tests {
             }
 
             #[tokio::test]
+            #[serial_test::serial]
             async fn a_skew_of_three_with_the_primary_behind_refuses() {
                 submit_at(LEDGER, LEDGER + 3)
                     .await
@@ -2712,6 +3364,7 @@ mod tests {
             }
 
             #[tokio::test]
+            #[serial_test::serial]
             async fn a_skew_of_three_with_the_primary_ahead_refuses() {
                 submit_at(LEDGER + 3, LEDGER)
                     .await
@@ -2719,6 +3372,7 @@ mod tests {
             }
 
             #[tokio::test]
+            #[serial_test::serial]
             async fn absent_unavailable_or_wrong_chain_witness_refuses() {
                 let primary = Endpoint::start(Chain::at(LEDGER)).await;
 

@@ -3745,7 +3745,9 @@ registered_at_unix_ms = 1700000000000
     /// A loopback signing bridge for a credential with another RP ID warns
     /// with the check and holds the RP ID in no field.
     #[tokio::test]
+    #[serial_test::serial]
     async fn signing_warning_holds_no_rp_id() {
+        stellar_agent_test_support::keyring_mock::install().unwrap();
         let dir = TempDir::new().unwrap();
         let mgr = test_manager(&dir);
         let mut metadata = make_metadata("entry-check");
@@ -3854,7 +3856,10 @@ registered_at_unix_ms = 1700000000000
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn the_gate_refuses_what_the_plan_does_not_name() {
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        crate::signing::intent_test_helpers::assert_envelope_bounds_refuse_before_signing().await;
         use std::sync::atomic::{AtomicUsize, Ordering};
         for wrong_credential in [false, true] {
             let dir = TempDir::new().unwrap();
@@ -3901,7 +3906,9 @@ registered_at_unix_ms = 1700000000000
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn sign_with_passkey_rule_starts_the_ceremony_for_a_valid_testnet_entry() {
+        stellar_agent_test_support::keyring_mock::install().unwrap();
         let (result, url_calls, audit_lines) = sign_entry(&testnet_partial(&[0])).await;
 
         assert!(
@@ -3916,7 +3923,9 @@ registered_at_unix_ms = 1700000000000
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn sign_with_passkey_rule_refuses_a_mainnet_entry_before_the_ceremony() {
+        stellar_agent_test_support::keyring_mock::install().unwrap();
         let partial = partial_on(stellar_agent_core::profile::caip2::MAINNET_PASSPHRASE, &[0]);
 
         let (result, url_calls, audit_lines) = sign_entry(&partial).await;
@@ -3936,7 +3945,9 @@ registered_at_unix_ms = 1700000000000
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn sign_with_passkey_rule_refuses_a_tampered_digest_before_the_ceremony() {
+        stellar_agent_test_support::keyring_mock::install().unwrap();
         let mut partial = testnet_partial(&[0]);
         partial.auth_digest[0] ^= 0x01;
 
@@ -3959,7 +3970,9 @@ registered_at_unix_ms = 1700000000000
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn sign_with_passkey_rule_emits_audit_on_approval_store_unavailable() {
+        stellar_agent_test_support::keyring_mock::install().unwrap();
         use std::net::{IpAddr, Ipv4Addr, SocketAddr};
         let dir = TempDir::new().unwrap();
         // Read-only manager — no approval store.
@@ -4003,7 +4016,9 @@ registered_at_unix_ms = 1700000000000
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn sign_with_passkey_rule_emits_audit_on_not_found() {
+        stellar_agent_test_support::keyring_mock::install().unwrap();
         use std::net::{IpAddr, Ipv4Addr, SocketAddr};
         let dir = TempDir::new().unwrap();
         let mgr = test_manager(&dir);
@@ -4052,7 +4067,9 @@ registered_at_unix_ms = 1700000000000
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn sign_with_passkey_rule_emits_audit_on_missing_public_key() {
+        stellar_agent_test_support::keyring_mock::install().unwrap();
         use std::net::{IpAddr, Ipv4Addr, SocketAddr};
         let dir = TempDir::new().unwrap();
         let mgr = test_manager(&dir);
@@ -4105,7 +4122,9 @@ registered_at_unix_ms = 1700000000000
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn sign_with_passkey_rule_rejects_empty_rule_ids() {
+        stellar_agent_test_support::keyring_mock::install().unwrap();
         use std::net::{IpAddr, Ipv4Addr, SocketAddr};
         let dir = TempDir::new().unwrap();
         let mgr = test_manager(&dir);
@@ -4136,7 +4155,9 @@ registered_at_unix_ms = 1700000000000
     // ── smart_account_redacted in PasskeyAssertion ────────────────────────────
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn sign_with_passkey_rule_emits_smart_account_redacted_in_audit() {
+        stellar_agent_test_support::keyring_mock::install().unwrap();
         use std::net::{IpAddr, Ipv4Addr, SocketAddr};
         let dir = TempDir::new().unwrap();
         let mgr = test_manager(&dir);
@@ -4259,7 +4280,9 @@ registered_at_unix_ms = 1700000000000
     /// approval store, so `ApprovalStoreUnavailable` is the terminal result —
     /// but the audit row is emitted BEFORE the approval-store check.
     #[tokio::test]
+    #[serial_test::serial]
     async fn diversification_override_emits_audit_row_when_accept_single_verifier_true() {
+        stellar_agent_test_support::keyring_mock::install().unwrap();
         use std::net::{IpAddr, Ipv4Addr, SocketAddr};
         let dir = TempDir::new().unwrap();
         // Read-only manager: ApprovalStoreUnavailable fires after the
@@ -4328,7 +4351,9 @@ registered_at_unix_ms = 1700000000000
     /// the single-verifier override, is refused for its missing baseline. No
     /// event of the call carries the rule id.
     #[test]
+    #[serial_test::serial]
     fn missing_baseline_refusal_logs_no_rule_id() {
+        stellar_agent_test_support::keyring_mock::install().unwrap();
         use std::net::{IpAddr, Ipv4Addr, SocketAddr};
         const REFUSED_RULE_ID: u32 = 424_242;
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -4449,7 +4474,9 @@ registered_at_unix_ms = 1700000000000
     /// A missing credential whose assertion row meets a poisoned writer is
     /// warned about without its name.
     #[test]
+    #[serial_test::serial]
     fn poisoned_writer_warning_holds_no_missing_credential_name() {
+        stellar_agent_test_support::keyring_mock::install().unwrap();
         use stellar_agent_test_support::rejected_value::{
             CREDENTIAL_MARKER, assert_no_marker, assert_no_marker_in_text,
         };
@@ -4483,7 +4510,9 @@ registered_at_unix_ms = 1700000000000
     /// about without its name. The name is longer than an audit row may be,
     /// so the write refuses the row.
     #[test]
+    #[serial_test::serial]
     fn audit_write_failure_warning_holds_no_missing_credential_name() {
+        stellar_agent_test_support::keyring_mock::install().unwrap();
         use stellar_agent_core::audit_log::writer::MAX_ROW_BYTES;
         use stellar_agent_test_support::rejected_value::{
             CREDENTIAL_MARKER, assert_no_marker, assert_no_marker_in_text,
@@ -4515,7 +4544,9 @@ registered_at_unix_ms = 1700000000000
     /// append rotates, so the rotation's rename fails the append.
     #[cfg(unix)]
     #[test]
+    #[serial_test::serial]
     fn override_write_failure_warning_holds_no_rule_id() {
+        stellar_agent_test_support::keyring_mock::install().unwrap();
         use std::os::unix::fs::PermissionsExt as _;
         use stellar_agent_test_support::rejected_value::{
             assert_no_marker, assert_no_marker_in_text,
@@ -4569,7 +4600,9 @@ registered_at_unix_ms = 1700000000000
     /// The logs are the wallet's own subscriber stack at the most verbose
     /// filter, which keeps the RPC transport's raw response logging out.
     #[test]
+    #[serial_test::serial]
     fn missing_on_chain_rule_warning_holds_no_rule_id() {
+        stellar_agent_test_support::keyring_mock::install().unwrap();
         use stellar_agent_core::audit_log::signer_set::{
             BaselineReason, SignerEntryV2, SignerIdentityV2, SignerSetSnapshotV2, account_digest,
         };
@@ -4677,7 +4710,9 @@ registered_at_unix_ms = 1700000000000
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn diversification_override_returns_error_when_audit_writer_poisoned() {
+        stellar_agent_test_support::keyring_mock::install().unwrap();
         use std::net::{IpAddr, Ipv4Addr, SocketAddr};
         let dir = TempDir::new().unwrap();
         let mgr = test_manager_readonly(&dir);
@@ -4725,7 +4760,9 @@ registered_at_unix_ms = 1700000000000
     ///
     /// Same setup as the override test but with `accept_single_verifier = false`.
     #[tokio::test]
+    #[serial_test::serial]
     async fn result_tag_failure_verifier_diversification_required_emitted_on_refusal() {
+        stellar_agent_test_support::keyring_mock::install().unwrap();
         use std::net::{IpAddr, Ipv4Addr, SocketAddr};
         let dir = TempDir::new().unwrap();
         // Read-only manager: if the diversification check is bypassed (bug),
@@ -5198,7 +5235,9 @@ registered_at_unix_ms = 1700000000000
     // ── result tag for InvalidRuleIds emits failure:invalid_rule_ids ──────────
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn sign_with_passkey_rule_emits_invalid_rule_ids_audit_tag() {
+        stellar_agent_test_support::keyring_mock::install().unwrap();
         use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
         // Use a SignersManager-backed writer so the PasskeyAssertion audit row is emitted.

@@ -1590,6 +1590,213 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial]
+    async fn bound_mismatch_refuses_at_gate_and_bind() {
+        use crate::signed_intent::test_helpers::intent_fixture_kind;
+        use stellar_agent_core::policy::v1::{CheckedSizing, SizingBasis};
+        use stellar_agent_core::profile::caip2::Caip2;
+        use stellar_xdr::{LedgerBounds, Preconditions, PreconditionsV2, TransactionEnvelope};
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let profile = Profile::builder_testnet_named(
+            "intent",
+            "bound-recorder",
+            "account",
+            "bound-recorder-nonce",
+            "account",
+        )
+        .build();
+        let window = PersistedWindowStore::at_path(dir.path().join("intent.window"));
+        let (fixture, mut envelope) = intent_fixture_kind(2);
+        let plan = fixture.with_envelope_max_ledger(50).unwrap();
+        let set_bound = |envelope: &mut TransactionEnvelope, maximum: Option<u32>| {
+            let TransactionEnvelope::Tx(tx) = envelope else {
+                unreachable!()
+            };
+            tx.tx.cond = Preconditions::V2(PreconditionsV2 {
+                time_bounds: None,
+                ledger_bounds: maximum.map(|max_ledger| LedgerBounds {
+                    min_ledger: 0,
+                    max_ledger,
+                }),
+                min_seq_num: None,
+                min_seq_age: stellar_xdr::Duration(0),
+                min_seq_ledger_gap: 0,
+                extra_signers: Default::default(),
+            });
+        };
+        set_bound(&mut envelope, Some(50));
+        let recorder = WalletSubmissionRecorder::new(
+            &profile,
+            "intent",
+            "test",
+            Some("stellar:testnet".into()),
+            PolicyDecision::Allow,
+            vec![],
+            plan.legs().to_vec(),
+            ReceiptStore::open_at(dir.path(), "intent").unwrap(),
+            window.clone(),
+            None,
+            None,
+            "fixture",
+            1000,
+        )
+        .with_signing_sizing(
+            CheckedSizing::for_test(SizingBasis::MeasuredValue, plan.legs().to_vec()).unwrap(),
+        );
+        let _clock = crate::mainnet::clock::set_now_ms_for_test(1000);
+        let exposure = recorder.admit_signed_intent(&plan).await.unwrap().expose();
+        let before = std::fs::read(window.path()).unwrap();
+        let before_views =
+            serde_json::to_value(window.signed_intents("intent", &profile).unwrap()).unwrap();
+        for maximum in [None, Some(0), Some(49), Some(51)] {
+            let mut changed = envelope.clone();
+            set_bound(&mut changed, maximum);
+            let facts =
+                crate::BindFacts::from_envelope(&changed, Caip2::Testnet.network_passphrase())
+                    .unwrap_or_else(|_| {
+                        crate::BindFacts::from_envelope(
+                            &envelope,
+                            Caip2::Testnet.network_passphrase(),
+                        )
+                        .unwrap()
+                    });
+            let (source, sequence) = crate::submit::replay_identity(&changed).unwrap();
+            let intent = SubmissionIntent {
+                chain_scope: crate::policy_state::ChainScope::for_chain(Caip2::Testnet),
+                envelope_hash: facts.envelope_hash,
+                tx_hash: facts.tx_hash,
+                source,
+                sequence,
+                max_time: 0,
+                submission_ledger: 1,
+                submission_anchor: None,
+            };
+            let binding = crate::IntentBinding::new(&exposure, &changed);
+            let error = recorder
+                .pre_send_bound(&intent, &binding)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    WalletError::Submission(SubmissionError::IntentBindingMismatch {
+                        field: "expiration"
+                    })
+                ),
+                "{maximum:?}: {error:?}"
+            );
+            assert_eq!(std::fs::read(window.path()).unwrap(), before);
+            assert_eq!(
+                serde_json::to_value(window.signed_intents("intent", &profile).unwrap()).unwrap(),
+                before_views
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn entryless_admission_commits_progress() {
+        use crate::policy_state::ChainScope;
+        use crate::signing::ledger_witness::LedgerWitnessCapability;
+        use stellar_agent_core::policy::v1::{CheckedSizing, SizingBasis};
+        use stellar_agent_core::profile::caip2::Caip2;
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let profile =
+            Profile::builder_testnet_named("intent", "entryless", "account", "nonce", "account")
+                .build();
+        std::fs::write(dir.path().join("intent.toml"), "chain_id = \"stellar:testnet\"\nrpc_url = \"https://primary.example/rpc\"\nsecondary_rpc_url = \"https://secondary.example/rpc\"\n").unwrap();
+        let window = PersistedWindowStore::at_path(dir.path().join("intent.window"))
+            .with_profile_directory("intent", dir.path().to_owned());
+        let receipts = ReceiptStore::open_at(dir.path(), "intent").unwrap();
+        let recorder = WalletSubmissionRecorder::new(
+            &profile,
+            "intent",
+            "fixture",
+            Some("stellar:testnet".into()),
+            PolicyDecision::Allow,
+            vec![],
+            vec![],
+            receipts,
+            window.clone(),
+            None,
+            None,
+            "fixture",
+            1000,
+        )
+        .with_signing_sizing(
+            CheckedSizing::for_test(SizingBasis::NoApplicableLimit, vec![]).unwrap(),
+        );
+        let (mut plan, envelope) = crate::signed_intent::test_helpers::intent_fixture_plan(1, 60);
+        let stellar_xdr::TransactionEnvelope::Tx(tx) = &envelope else {
+            unreachable!()
+        };
+        let stellar_xdr::OperationBody::InvokeHostFunction(op) = &tx.tx.operations[0].body else {
+            unreachable!()
+        };
+        plan = plan
+            .classify_purpose(&op.host_function, None)
+            .unwrap()
+            .with_envelope_max_ledger(100)
+            .unwrap();
+        let clock = crate::mainnet::clock::set_now_ms_for_test(1000);
+        let _proof = recorder.admit_signed_intent(&plan).await.unwrap();
+        assert!(!window.path().exists());
+        let _exposure = window
+            .admit_signed_intent(&profile, &plan)
+            .unwrap()
+            .expose();
+        clock.set(2000);
+        let instant = tokio::time::Instant::now();
+        let witness = LedgerWitnessCapability::for_test(
+            ChainScope::for_chain(Caip2::Testnet),
+            [
+                "https://primary.example/rpc",
+                "https://secondary.example/rpc",
+            ],
+            [101, 102],
+            [instant, instant],
+            [1999, 2000],
+            instant + std::time::Duration::from_secs(10),
+        )
+        .unwrap();
+        let candidate = crate::signed_intent::test_helpers::intent_fixture_plan(2, 1)
+            .0
+            .with_capability(witness);
+        let _proof = recorder.admit_signed_intent(&candidate).await.unwrap();
+        let views = window.signed_intents("intent", &profile).unwrap();
+        assert_eq!(views.len(), 1);
+        assert_eq!(views[0].expiry_observed_at_ms, Some(2000));
+        assert_eq!(views[0].accounting_horizon, "62000");
+        clock.set(2000 + 604_800_000);
+        let _proof = recorder.admit_signed_intent(&candidate).await.unwrap();
+        assert_eq!(window.signed_intents("intent", &profile).unwrap().len(), 1);
+        clock.set(2001 + 604_800_000);
+        let _proof = recorder.admit_signed_intent(&candidate).await.unwrap();
+        assert!(
+            window
+                .signed_intents("intent", &profile)
+                .unwrap()
+                .is_empty()
+        );
+        std::fs::remove_file(window.path()).unwrap();
+        let error = recorder
+            .admit_signed_intent(&candidate)
+            .await
+            .err()
+            .unwrap();
+        assert!(matches!(
+            error,
+            WalletError::Submission(
+                stellar_agent_core::SubmissionError::IntentRecordUnavailable {
+                    class: "window_unavailable"
+                }
+            )
+        ));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
     async fn final_submission_links_and_charges_once() {
         use crate::signed_intent::test_helpers::intent_fixture_plan;
         use stellar_agent_core::policy::v1::criteria::{
@@ -1826,11 +2033,164 @@ mod tests {
                     && i.status == "authorization exposed, submission unknown")
         );
         assert!(window.pending_reservations(&profile).unwrap().is_empty());
+        assert_different_final_intent_cannot_consume_reservation().await;
+        assert_recorder_links_prune_to_zero().await;
+    }
+
+    async fn assert_recorder_links_prune_to_zero() {
+        use crate::policy_state::ChainScope;
+        use crate::signing::ledger_witness::LedgerWitnessCapability;
+        use stellar_agent_core::policy::v1::criteria::state_store::{PolicyStateStore, StateKey};
+        use stellar_agent_core::policy::v1::{CheckedSizing, SizingBasis};
+        use stellar_agent_core::profile::caip2::Caip2;
+        use stellar_xdr::{LedgerBounds, Preconditions, PreconditionsV2, TransactionEnvelope};
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let profile = Profile::builder_testnet_named(
+            "intent",
+            "pruned-link",
+            "account",
+            "pruned-link-nonce",
+            "account",
+        )
+        .build();
+        std::fs::write(dir.path().join("intent.toml"), "chain_id = \"stellar:testnet\"\nrpc_url = \"https://primary.example/rpc\"\nsecondary_rpc_url = \"https://secondary.example/rpc\"\n").unwrap();
+        let window = PersistedWindowStore::at_path(dir.path().join("intent.window"))
+            .with_profile_directory("intent", dir.path().to_owned());
+        let receipts = ReceiptStore::open_at(dir.path(), "intent").unwrap();
+        let (fixture, mut envelope) = crate::signed_intent::test_helpers::intent_fixture_kind(2);
+        let TransactionEnvelope::Tx(tx) = &mut envelope else {
+            unreachable!()
+        };
+        tx.tx.cond = Preconditions::V2(PreconditionsV2 {
+            time_bounds: None,
+            ledger_bounds: Some(LedgerBounds {
+                min_ledger: 0,
+                max_ledger: 50,
+            }),
+            min_seq_num: None,
+            min_seq_age: stellar_xdr::Duration(0),
+            min_seq_ledger_gap: 0,
+            extra_signers: Default::default(),
+        });
+        let stellar_xdr::OperationBody::InvokeHostFunction(op) = &tx.tx.operations[0].body else {
+            unreachable!()
+        };
+        let plan = fixture
+            .with_envelope_max_ledger(50)
+            .unwrap()
+            .classify_purpose(&op.host_function, None)
+            .unwrap();
+        assert_eq!(
+            plan.purpose(),
+            Some(&crate::signed_intent::IntentPurpose::Invoke)
+        );
+        assert_eq!(plan.check_envelope(&envelope), Ok(()));
+        let recorder = WalletSubmissionRecorder::new(
+            &profile,
+            "intent",
+            "test",
+            Some("stellar:testnet".into()),
+            PolicyDecision::Allow,
+            vec![],
+            plan.legs().to_vec(),
+            receipts.clone(),
+            window.clone(),
+            None,
+            None,
+            "pruned-link",
+            1000,
+        )
+        .with_signing_sizing(
+            CheckedSizing::for_test(SizingBasis::MeasuredValue, plan.legs().to_vec()).unwrap(),
+        );
+        let clock = crate::mainnet::clock::set_now_ms_for_test(1000);
+        let exposure = recorder.admit_signed_intent(&plan).await.unwrap().expose();
+        let facts = crate::BindFacts::from_envelope(&envelope, Caip2::Testnet.network_passphrase())
+            .unwrap();
+        let (source, sequence) = crate::submit::replay_identity(&envelope).unwrap();
+        let intent = SubmissionIntent {
+            chain_scope: ChainScope::for_chain(Caip2::Testnet),
+            envelope_hash: facts.envelope_hash,
+            tx_hash: facts.tx_hash,
+            source,
+            sequence,
+            max_time: 0,
+            submission_ledger: 1,
+            submission_anchor: None,
+        };
+        recorder
+            .pre_send_bound(&intent, &crate::IntentBinding::new(&exposure, &envelope))
+            .await
+            .unwrap();
+        let standing = window.pending_reservations(&profile).unwrap();
+        assert_eq!(standing.len(), 1);
+        assert_eq!(standing[0].id, intent.envelope_hash);
+        clock.set(2000);
+        let instant = tokio::time::Instant::now();
+        let witness = LedgerWitnessCapability::for_test(
+            ChainScope::for_chain(Caip2::Testnet),
+            [
+                "https://primary.example/rpc",
+                "https://secondary.example/rpc",
+            ],
+            [101, 102],
+            [instant, instant],
+            [1999, 2000],
+            instant + std::time::Duration::from_secs(10),
+        )
+        .unwrap();
+        window.observe_signed_intents(&profile, &witness).unwrap();
+        assert_eq!(
+            window.signed_intents("intent", &profile).unwrap()[0].expiry_observed_at_ms,
+            Some(2000)
+        );
+        clock.set(2001 + 604_800_000);
+        window.observe_signed_intents(&profile, &witness).unwrap();
+        let reopened = PersistedWindowStore::at_path(window.path().to_owned());
+        assert!(
+            reopened
+                .signed_intents("intent", &profile)
+                .unwrap()
+                .is_empty()
+        );
+        let state = PolicyStateStore::new();
+        reopened.load_into("intent", &profile, &state).unwrap();
+        for bucket in ["native", "rate_limit"] {
+            for seconds in [60, 604_800] {
+                assert_eq!(
+                    state
+                        .query_window(
+                            &StateKey::new("intent", 1, bucket, seconds),
+                            2001 + 604_800_000
+                        )
+                        .unwrap(),
+                    (0, 0)
+                );
+            }
+        }
+        assert_eq!(reopened.pending_reservations(&profile).unwrap(), standing);
+        assert_eq!(
+            receipts.get(&intent.envelope_hash).unwrap().unwrap().status,
+            ReceiptStatus::Pending
+        );
+        let wire: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(window.path()).unwrap()[32..]).unwrap();
+        assert_eq!(wire["entries"].as_array().unwrap().len(), plan.legs().len());
+        for entry in wire["entries"].as_array().unwrap() {
+            let records = entry["records"].as_array().unwrap();
+            assert_eq!(records.len(), 1);
+            assert_eq!(records[0]["signed_intent"], exposure.intent_id().unwrap());
+        }
     }
 
     #[tokio::test]
     #[serial_test::serial]
     async fn different_final_intent_cannot_consume_reservation() {
+        assert_different_final_intent_cannot_consume_reservation().await;
+    }
+
+    async fn assert_different_final_intent_cannot_consume_reservation() {
         use crate::signed_intent::test_helpers::intent_fixture_kind;
         use stellar_agent_core::policy::v1::criteria::state_store::{PolicyStateStore, StateKey};
         use stellar_agent_core::policy::v1::{CheckedSizing, SizingBasis};
@@ -1853,6 +2213,11 @@ mod tests {
             "legs",
             "chain",
             "operation_source",
+            "envelope_bound_missing",
+            "envelope_bound_zero",
+            "envelope_bound_smaller",
+            "envelope_bound_larger",
+            "purpose",
         ];
         let mut mismatches = Vec::new();
         for case in cases {
@@ -1868,7 +2233,41 @@ mod tests {
             .build();
             let window = PersistedWindowStore::at_path(dir.path().join("intent.window"));
             let receipts = ReceiptStore::open_at(dir.path(), "intent").unwrap();
-            let (plan, mut envelope) = intent_fixture_kind(2);
+            let (fixture, mut envelope) = intent_fixture_kind(2);
+            let TransactionEnvelope::Tx(tx) = &mut envelope else {
+                unreachable!()
+            };
+            tx.tx.cond = Preconditions::V2(PreconditionsV2 {
+                time_bounds: None,
+                ledger_bounds: Some(LedgerBounds {
+                    min_ledger: 0,
+                    max_ledger: 50,
+                }),
+                min_seq_num: None,
+                min_seq_age: Duration(0),
+                min_seq_ledger_gap: 0,
+                extra_signers: VecM::default(),
+            });
+            let OperationBody::InvokeHostFunction(op) = &tx.tx.operations[0].body else {
+                unreachable!()
+            };
+            let plan = fixture
+                .with_envelope_max_ledger(50)
+                .unwrap()
+                .classify_purpose(&op.host_function, None)
+                .unwrap();
+            assert_eq!(
+                plan.purpose(),
+                Some(&crate::signed_intent::IntentPurpose::Invoke)
+            );
+            assert_eq!(
+                plan.subjects()
+                    .iter()
+                    .filter_map(crate::IntentSubject::expiration)
+                    .max(),
+                Some(100)
+            );
+            assert_eq!(plan.check_envelope(&envelope), Ok(()));
             let entries = plan.legs().to_vec();
             let sizing =
                 CheckedSizing::for_test(SizingBasis::MeasuredValue, entries.clone()).unwrap();
@@ -1889,6 +2288,7 @@ mod tests {
             )
             .with_signing_sizing(sizing);
             let exposure = recorder.admit_signed_intent(&plan).await.unwrap().expose();
+            let before = std::fs::read(window.path()).unwrap();
             let TransactionEnvelope::Tx(tx) = &mut envelope else {
                 unreachable!()
             };
@@ -1898,6 +2298,22 @@ mod tests {
             if case == "envelope_sequence" {
                 tx.tx.seq_num.0 += 1;
             }
+            if case.starts_with("envelope_bound_") {
+                let Preconditions::V2(conditions) = &mut tx.tx.cond else {
+                    unreachable!()
+                };
+                conditions.ledger_bounds = match case {
+                    "envelope_bound_missing" => None,
+                    _ => Some(LedgerBounds {
+                        min_ledger: 0,
+                        max_ledger: match case {
+                            "envelope_bound_zero" => 0,
+                            "envelope_bound_smaller" => 49,
+                            _ => 51,
+                        },
+                    }),
+                };
+            }
             let mut operations = tx.tx.operations.to_vec();
             if case == "operation_source" {
                 operations[0].source_account = Some(MuxedAccount::Ed25519(Uint256([9; 32])));
@@ -1905,11 +2321,16 @@ mod tests {
             let OperationBody::InvokeHostFunction(op) = &mut operations[0].body else {
                 unreachable!()
             };
-            if case == "host_invocation" {
+            if case == "host_invocation" || case == "purpose" {
                 let HostFunction::InvokeContract(call) = &mut op.host_function else {
                     unreachable!()
                 };
-                call.function_name = ScSymbol::try_from("other").unwrap();
+                call.function_name = ScSymbol::try_from(if case == "purpose" {
+                    "schedule"
+                } else {
+                    "other"
+                })
+                .unwrap();
             }
             let mut auth = op.auth.to_vec();
             if case == "duplicate" {
@@ -2024,6 +2445,10 @@ mod tests {
                 "credential" | "duplicate" | "added" | "removed" => "auth_subjects",
                 "external_verifier" | "external_key" | "delegated" => "signers",
                 "operation_source" => "envelope_source",
+                "envelope_bound_missing"
+                | "envelope_bound_zero"
+                | "envelope_bound_smaller"
+                | "envelope_bound_larger" => "expiration",
                 other => other,
             };
             let refused = if case == "chain" {
@@ -2037,6 +2462,7 @@ mod tests {
                 mismatches.push(format!("{case}: expected {expected}, got {result:?}"));
                 continue;
             }
+            assert_eq!(std::fs::read(window.path()).unwrap(), before, "{case}");
             assert!(window.pending_reservations(&profile).unwrap().is_empty());
             let intents = window.signed_intents("intent", &profile).unwrap();
             assert_eq!(intents.len(), 1, "{case}");

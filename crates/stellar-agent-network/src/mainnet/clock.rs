@@ -6,7 +6,7 @@
 //! same clock. A caller never supplies the time a transition is checked
 //! against.
 //!
-//! Under the `test-hooks` feature, and in this crate's own tests,
+//! Under either test feature, and in this crate's own tests,
 //! [`set_now_ms_for_test`] fixes the clock for every caller in the process
 //! until its guard drops; tests that use it run serially.
 
@@ -19,7 +19,7 @@ use stellar_agent_core::error::{WalletError, WalletStateError};
 /// `wallet.clock_error` when the system clock is before the Unix epoch or
 /// its milliseconds do not fit a `u64`.
 pub fn now_ms() -> Result<u64, WalletError> {
-    #[cfg(any(test, feature = "test-hooks"))]
+    #[cfg(any(test, feature = "test-hooks", feature = "test-helpers"))]
     if let Some(now) = *test_override::lock() {
         return match now {
             ClockOverride::At(now) => Ok(now),
@@ -35,7 +35,7 @@ pub fn now_ms() -> Result<u64, WalletError> {
     })
 }
 
-#[cfg(any(test, feature = "test-hooks"))]
+#[cfg(any(test, feature = "test-hooks", feature = "test-helpers"))]
 #[derive(Clone, Copy)]
 enum ClockOverride {
     At(u64),
@@ -43,14 +43,14 @@ enum ClockOverride {
 }
 
 /// Makes the authorization clock fail until its guard drops.
-#[cfg(any(test, feature = "test-hooks"))]
+#[cfg(any(test, feature = "test-hooks", feature = "test-helpers"))]
 #[doc(hidden)]
 pub fn set_clock_error_for_test() -> TestClockGuard {
     *test_override::lock() = Some(ClockOverride::Fail);
     TestClockGuard(())
 }
 
-#[cfg(any(test, feature = "test-hooks"))]
+#[cfg(any(test, feature = "test-hooks", feature = "test-helpers"))]
 mod test_override {
     use std::sync::{Mutex, MutexGuard, PoisonError};
 
@@ -64,14 +64,14 @@ mod test_override {
 /// Holds the clock override set by [`set_now_ms_for_test`]; dropping it
 /// restores the system clock.
 ///
-/// Only compiled with the `test-hooks` feature or in this crate's tests.
-#[cfg(any(test, feature = "test-hooks"))]
+/// Available only with `test-hooks`, `test-helpers`, or this crate's tests.
+#[cfg(any(test, feature = "test-hooks", feature = "test-helpers"))]
 #[doc(hidden)]
 #[derive(Debug)]
 #[must_use = "the override lasts only while the guard lives"]
 pub struct TestClockGuard(());
 
-#[cfg(any(test, feature = "test-hooks"))]
+#[cfg(any(test, feature = "test-hooks", feature = "test-helpers"))]
 impl TestClockGuard {
     /// Moves the overridden clock to `now_ms`.
     pub fn set(&self, now_ms: u64) {
@@ -79,7 +79,7 @@ impl TestClockGuard {
     }
 }
 
-#[cfg(any(test, feature = "test-hooks"))]
+#[cfg(any(test, feature = "test-hooks", feature = "test-helpers"))]
 impl Drop for TestClockGuard {
     fn drop(&mut self) {
         *test_override::lock() = None;
@@ -88,9 +88,9 @@ impl Drop for TestClockGuard {
 
 /// Fixes [`now_ms`] at `now_ms` for every caller until the guard drops.
 ///
-/// Only compiled with the `test-hooks` feature or in this crate's tests.
-/// Never include `test-hooks` in production or release builds.
-#[cfg(any(test, feature = "test-hooks"))]
+/// Available only with `test-hooks`, `test-helpers`, or this crate's tests.
+/// Production and release builds exclude both test features.
+#[cfg(any(test, feature = "test-hooks", feature = "test-helpers"))]
 #[doc(hidden)]
 pub fn set_now_ms_for_test(now_ms: u64) -> TestClockGuard {
     *test_override::lock() = Some(ClockOverride::At(now_ms));

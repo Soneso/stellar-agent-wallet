@@ -51,12 +51,33 @@ pub fn assert_no_marker(error: &(dyn std::error::Error + 'static), marker: &str)
 ///
 /// # Panics
 ///
-/// Panics when `text` contains `marker`, without printing either.
+/// Panics with the first match's byte offset, text length, and 48 bytes on each side.
+/// Every marker in the context appears as `[marker]`.
 pub fn assert_no_marker_in_text(text: &str, marker: &str) {
-    assert!(
-        !text.contains(marker),
-        "the rendered text contains the rejected value"
-    );
+    assert_no_marker_in_labeled_text("rendered text", text, marker);
+}
+
+/// Checks rendered text and prefixes any failure with `label`.
+///
+/// # Panics
+/// Panics with the first match's byte offset, text length, and 48 bytes on each side.
+/// Every marker in the label and context appears as `[marker]`.
+pub fn assert_no_marker_in_labeled_text(label: &str, text: &str, marker: &str) {
+    if let Some(offset) = text.find(marker) {
+        let start = offset.saturating_sub(48);
+        let end = offset
+            .saturating_add(marker.len())
+            .saturating_add(48)
+            .min(text.len());
+        let context =
+            String::from_utf8_lossy(&text.as_bytes()[start..end]).replace(marker, "[marker]");
+        let label = label.replace(marker, "[marker]");
+        assert!(
+            !text.contains(marker),
+            "{label}: rejected marker at byte offset {offset}; text length {}; context {context:?}",
+            text.len(),
+        );
+    }
 }
 
 /// Asserts that `error` renders as exactly `expected` and holds no
@@ -120,6 +141,26 @@ mod tests {
         fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
             Some(&self.0)
         }
+    }
+
+    #[test]
+    #[allow(
+        clippy::expect_used,
+        reason = "the test inspects a formatted panic payload"
+    )]
+    fn marker_failure_reports_redacted_context_and_offset() {
+        let marker = "MARKER_FIXTURE";
+        let text = format!("{}{}{}{}", "a".repeat(60), marker, "é".repeat(3), marker);
+        let panic = std::panic::catch_unwind(|| {
+            assert_no_marker_in_labeled_text("fixture stderr", &text, marker);
+        })
+        .expect_err("the marker fails the assertion");
+        let message = panic.downcast_ref::<String>().expect("formatted assertion");
+        assert!(message.contains("byte offset 60"));
+        assert!(message.contains(&format!("text length {}", text.len())));
+        assert!(message.contains("fixture stderr"));
+        assert_eq!(message.matches("[marker]").count(), 2);
+        assert!(!message.contains(marker));
     }
 
     #[test]

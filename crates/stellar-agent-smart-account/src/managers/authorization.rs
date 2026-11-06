@@ -1392,7 +1392,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn plan_quorum_signatures_signs_a_testnet_quorum() {
+        stellar_agent_test_support::keyring_mock::install().unwrap();
         let (result, key_accesses) = quorum_over(
             stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE,
             stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE,
@@ -1495,7 +1497,9 @@ mod tests {
         assert_eq!(signer.key_accesses(), 0);
     }
     #[tokio::test]
+    #[serial_test::serial]
     async fn quorum_signing_signs_the_admitted_plan() {
+        stellar_agent_test_support::keyring_mock::install().unwrap();
         use crate::managers::auth_entry::test_helpers::{
             baseline_authorization_simulation, matching_envelope_context,
         };

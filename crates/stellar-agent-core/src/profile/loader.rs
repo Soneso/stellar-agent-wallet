@@ -1466,6 +1466,67 @@ pub fn read_mainnet_view_on_disk(
     Ok(OnDiskMainnetView { chain_id, rpc_url })
 }
 
+/// The stored chain and endpoints, without environment or programmatic overlays.
+#[derive(Clone, PartialEq, Eq)]
+pub struct OnDiskRpcEndpoints {
+    /// The stored chain identity.
+    pub chain_id: super::caip2::Caip2,
+    /// The complete stored primary URL.
+    pub rpc_url: String,
+    /// The complete stored secondary URL, when configured.
+    pub secondary_rpc_url: Option<String>,
+}
+
+/// Reads both endpoint roles directly from the selected profile file.
+///
+/// # Errors
+/// Refuses an invalid name, absent file, malformed TOML, or invalid endpoint fields.
+pub fn read_rpc_endpoints_on_disk(
+    name: &str,
+    dir: &Path,
+) -> Result<OnDiskRpcEndpoints, ProfileLoadError> {
+    guard_name_for_load(name)?;
+    let path = dir.join(format!("{name}.toml"));
+    let failure = || ProfileLoadError::MainnetViewUnreadable {
+        detail: "the stored RPC endpoint configuration is unreadable".into(),
+    };
+    let raw = std::fs::read_to_string(path).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            ProfileLoadError::NotFound
+        } else {
+            failure()
+        }
+    })?;
+    let doc: toml::Value = toml::from_str(&raw).map_err(|_| failure())?;
+    let chain_id: super::caip2::Caip2 = doc
+        .get("chain_id")
+        .and_then(toml::Value::as_str)
+        .ok_or_else(failure)?
+        .parse()
+        .map_err(|_| failure())?;
+    let rpc_url = match doc.get("rpc_url") {
+        Some(value) => value.as_str().ok_or_else(failure)?,
+        None => chain_id.default_rpc_url().ok_or_else(failure)?,
+    }
+    .to_owned();
+    let secondary_rpc_url = doc
+        .get("secondary_rpc_url")
+        .map(|value| value.as_str().map(str::to_owned).ok_or_else(failure))
+        .transpose()?;
+    for (field, url) in std::iter::once(("rpc_url", rpc_url.as_str())).chain(
+        secondary_rpc_url
+            .as_deref()
+            .map(|url| ("secondary_rpc_url", url)),
+    ) {
+        super::schema::check_endpoint_url(field, url, chain_id).map_err(|_| failure())?;
+    }
+    Ok(OnDiskRpcEndpoints {
+        chain_id,
+        rpc_url,
+        secondary_rpc_url,
+    })
+}
+
 /// Sets ONLY `mcp_signer_default.account` in the profile's on-disk TOML
 /// document, preserving every other stored key verbatim, and writes the
 /// result atomically.
@@ -8042,6 +8103,118 @@ account = "a"
                 load_provider_file(&file).unwrap().providers,
                 Some(providers)
             );
+        }
+    }
+
+    #[test]
+    fn stored_testnet_endpoints_default_primary() {
+        let file = format!(
+            "secondary_rpc_url = \"https://secondary.example/rpc\"\n{}",
+            minimal_toml()
+        );
+        let (dir, name) = write_profile(&file);
+        let endpoints = read_rpc_endpoints_on_disk(&name, dir.path()).unwrap();
+        assert_eq!(endpoints.chain_id, super::super::caip2::Caip2::Testnet);
+        assert_eq!(
+            endpoints.rpc_url,
+            endpoints.chain_id.default_rpc_url().unwrap()
+        );
+        assert_eq!(
+            endpoints.secondary_rpc_url.as_deref(),
+            Some("https://secondary.example/rpc")
+        );
+        std::fs::write(
+            dir.path().join(format!("{name}.toml")),
+            "chain_id = \"stellar:mainnet\"\n",
+        )
+        .unwrap();
+        assert!(read_rpc_endpoints_on_disk(&name, dir.path()).is_err());
+    }
+
+    #[test]
+    fn stored_endpoints_ignore_environment_and_overlay() {
+        const CHILD: &str = "STORED_ENDPOINTS_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "profile::loader::tests::stored_endpoints_ignore_environment_and_overlay",
+                ])
+                .env(CHILD, "1")
+                .env("STELLAR_AGENT_RPC_URL", "https://env-primary.example")
+                .env(
+                    "STELLAR_AGENT_SECONDARY_RPC_URL",
+                    "https://env-secondary.example",
+                )
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success(),
+                "{stdout} {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(stdout.contains("test result: ok. 1 passed;"), "{stdout}");
+            return;
+        }
+        let file = format!(
+            "rpc_url = \"https://stored-primary.example\"\nsecondary_rpc_url = \"https://stored-secondary.example/path?key=fixture\"\n{}",
+            minimal_toml()
+        );
+        let (dir, name) = write_profile(&file);
+        let stored = read_rpc_endpoints_on_disk(&name, dir.path()).unwrap();
+        let loaded = load_from_dir(&name, dir.path(), None).unwrap();
+        assert_eq!(loaded.rpc_url, "https://env-primary.example");
+        assert_eq!(
+            loaded.secondary_rpc_url.as_deref(),
+            Some("https://env-secondary.example")
+        );
+        assert_ne!(stored.rpc_url, loaded.rpc_url);
+        assert_eq!(
+            stored.secondary_rpc_url.as_deref(),
+            Some("https://stored-secondary.example/path?key=fixture")
+        );
+        let overlay = HashMap::from([
+            (
+                "rpc_url",
+                serde_json::json!("https://overlay-primary.example"),
+            ),
+            (
+                "secondary_rpc_url",
+                serde_json::json!("https://overlay-secondary.example"),
+            ),
+        ]);
+        let merged = load_with_overlay_from_dir(&name, dir.path(), overlay, None).unwrap();
+        assert_eq!(merged.rpc_url, "https://overlay-primary.example");
+        assert_eq!(
+            merged.secondary_rpc_url.as_deref(),
+            Some("https://overlay-secondary.example")
+        );
+        let again = read_rpc_endpoints_on_disk(&name, dir.path()).unwrap();
+        assert!(stored == again);
+        let missing_secondary = format!(
+            "rpc_url = \"https://stored-primary.example\"\n{}",
+            minimal_toml()
+        );
+        let (missing_dir, missing_name) = write_profile(&missing_secondary);
+        assert!(
+            read_rpc_endpoints_on_disk(&missing_name, missing_dir.path())
+                .unwrap()
+                .secondary_rpc_url
+                .is_none()
+        );
+        for field in ["rpc_url", "secondary_rpc_url"] {
+            let valid_primary = if field == "secondary_rpc_url" {
+                "rpc_url = \"https://primary.example\"\n"
+            } else {
+                ""
+            };
+            let malformed = format!(
+                "chain_id = \"stellar:testnet\"\n{valid_primary}{field} = [\"https://secret.example\"]\n"
+            );
+            std::fs::write(dir.path().join(format!("{name}.toml")), malformed).unwrap();
+            let error = read_rpc_endpoints_on_disk(&name, dir.path()).err().unwrap();
+            assert!(!error.to_string().contains("secret.example"));
         }
     }
 

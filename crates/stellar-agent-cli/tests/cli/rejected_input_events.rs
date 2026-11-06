@@ -342,7 +342,7 @@ async fn timelock_execute_of_a_never_scheduled_operation_holds_no_operation_id()
 #[test]
 #[serial]
 fn pool_size_refusal_holds_no_size() {
-    const REFUSED_SIZE: &str = "424242";
+    const REFUSED_SIZE: &str = "4242424";
     let home = tempfile::tempdir().expect("home");
     let output = run(
         home.path(),
@@ -634,7 +634,7 @@ async fn missing_rule_refusal_holds_no_rule_id() {
             "--account",
             ACCOUNT,
             "--rule-id",
-            "424242",
+            "4242424",
             "--kind",
             "raw",
             "--policy-address",
@@ -656,7 +656,7 @@ async fn missing_rule_refusal_holds_no_rule_id() {
          list the rules"
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(!stdout.contains("424242"), "{stdout}");
+    assert!(!stdout.contains("4242424"), "{stdout}");
 }
 
 /// A rule id the account does not hold stays out of the spending-limit submit
@@ -676,7 +676,7 @@ async fn spending_limit_submit_event_holds_no_rule_id() {
             "--account",
             ACCOUNT,
             "--rule-id",
-            "424242",
+            "4242424",
             "--limit",
             "100",
             "--signer-secret-env",
@@ -697,7 +697,7 @@ async fn spending_limit_submit_event_holds_no_rule_id() {
         "{output:?}"
     );
     for text in [&output.stdout, &output.stderr] {
-        assert_no_marker_in_text(&String::from_utf8_lossy(text), "424242");
+        assert_no_marker_in_text(&String::from_utf8_lossy(text), "4242424");
     }
 }
 
@@ -719,7 +719,7 @@ async fn signers_add_submit_event_holds_no_missing_rule_id() {
             "--account",
             ACCOUNT,
             "--rule-id",
-            "424242",
+            "4242424",
             "--signer-delegated",
             delegated.as_str(),
             "--signer-secret-env",
@@ -737,7 +737,7 @@ async fn signers_add_submit_event_holds_no_missing_rule_id() {
     let error = error_of(&output);
     assert_eq!(error["code"], "sa.signer_set_missing_baseline", "{error}");
     for text in [&output.stdout, &output.stderr] {
-        assert_no_marker_in_text(&String::from_utf8_lossy(text), "424242");
+        assert_no_marker_in_text(&String::from_utf8_lossy(text), "4242424");
     }
 }
 
@@ -748,7 +748,7 @@ async fn signers_add_submit_event_holds_no_missing_rule_id() {
 #[tokio::test]
 #[serial]
 async fn signer_verb_events_hold_no_rule_values() {
-    const MARKERS: [&str; 4] = ["424242", "434343", "444444", "454545"];
+    const MARKERS: [&str; 4] = ["4242424", "4343434", "4444444", "4545454"];
     let delegated = account_id_for_seed([9; 32]);
     let second = account_id_for_seed([11; 32]);
     let signer = ["--signer-secret-env", SECRET_VAR];
@@ -764,13 +764,17 @@ async fn signer_verb_events_hold_no_rule_values() {
             "sa.deployment_failed",
         ),
         (
-            [&["signers", "remove", "--signer-id", "434343"][..], &signer].concat(),
+            [
+                &["signers", "remove", "--signer-id", "4343434"][..],
+                &signer,
+            ]
+            .concat(),
             "smart-account signers remove: submitting remove_signer",
             "sa.signer_set_missing_baseline",
         ),
         (
             [
-                &["signers", "set-threshold", "--new-threshold", "444444"][..],
+                &["signers", "set-threshold", "--new-threshold", "4444444"][..],
                 &signer,
             ]
             .concat(),
@@ -783,7 +787,7 @@ async fn signer_verb_events_hold_no_rule_values() {
                     "signers",
                     "set-weighted-threshold",
                     "--new-threshold",
-                    "444444",
+                    "4444444",
                 ][..],
                 &signer,
             ]
@@ -793,7 +797,7 @@ async fn signer_verb_events_hold_no_rule_values() {
         ),
         (
             [
-                &["signers", "set-signer-weight", "--new-weight", "454545"][..],
+                &["signers", "set-signer-weight", "--new-weight", "4545454"][..],
                 &["--signer-delegated", delegated.as_str()],
                 &signer,
             ]
@@ -828,7 +832,7 @@ async fn signer_verb_events_hold_no_rule_values() {
                 "--account",
                 ACCOUNT,
                 "--rule-id",
-                "424242",
+                "4242424",
             ],
             &verb[2..],
         ]
@@ -846,9 +850,13 @@ async fn signer_verb_events_hold_no_rule_values() {
             "missing {message:?}: {output:?}"
         );
         assert_eq!(error_of(&output)["code"], code, "{message}: {output:?}");
-        for text in [&output.stdout, &output.stderr] {
+        for (stream, text) in [("stdout", &output.stdout), ("stderr", &output.stderr)] {
             for marker in MARKERS {
-                assert_no_marker_in_text(&String::from_utf8_lossy(text), marker);
+                stellar_agent_test_support::rejected_value::assert_no_marker_in_labeled_text(
+                    &format!("{message}: {stream}"),
+                    &String::from_utf8_lossy(text),
+                    marker,
+                );
             }
         }
         // The batch of two signers has a size no marker can hold, so the
@@ -877,7 +885,7 @@ fn timelock_schedule_submit_event_holds_no_delay() {
                 "--function",
                 "upgrade",
                 "--delay-ledgers",
-                "424242",
+                "4242424",
             ],
         )
         .iter()
@@ -896,7 +904,7 @@ fn timelock_schedule_submit_event_holds_no_delay() {
         "{output:?}"
     );
     for text in [&output.stdout, &output.stderr] {
-        assert_no_marker_in_text(&String::from_utf8_lossy(text), "424242");
+        assert_no_marker_in_text(&String::from_utf8_lossy(text), "4242424");
     }
 }
 

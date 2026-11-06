@@ -37,7 +37,7 @@ test-hooks = []
 # `NoopCounterpartyResolver`) gated behind this feature so they do not appear in
 # production builds. Enable only in dev-dependencies or
 # `cargo test --features test-helpers`.
-test-helpers = []
+test-helpers = ["dep:stellar-agent-test-support", "dep:wiremock", "stellar-agent-core/test-helpers"]
 
 # Gate end-to-end testnet acceptance tests for the fee-bump path.
 # Run with: cargo test -p stellar-agent-network --features testnet-acceptance
@@ -118,6 +118,15 @@ dbus-secret-service-keyring-store = { workspace = true, features = ["crypto-rust
 # Windows Credential Manager backend.
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-native-keyring-store = { workspace = true }
+
+[dependencies.stellar-agent-test-support]
+workspace = true
+optional = true
+features = ["wiremock-helpers", "test-helpers"]
+
+[dependencies.wiremock]
+workspace = true
+optional = true
 
 [dev-dependencies]
 # Path-only self-reference: enables this crate's own test helpers for its

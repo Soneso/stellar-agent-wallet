@@ -277,3 +277,23 @@ properties:
 The core library compiles under `#![forbid(unsafe_code)]`. Logging redaction is enforced
 throughout: secret material is never written to logs, and account, strkey, and
 transaction-hash fields are truncated at the output boundary.
+
+## Retained smart-account charges
+
+A bounded invocation charge closes when a later policy check or admission witnesses both profile endpoints above every authorization and envelope bound.
+
+Only the endpoints stored in the profile authorize charge closure. Endpoint overrides can bound signatures but cannot close charges.
+
+Environment variables and programmatic overlays do not change which endpoints authorize charge closure.
+
+A schedule charge closes when both endpoints, above every authorization expiration, report its operation done or unset.
+
+Intents without an authenticated purpose remain open. Calls whose authorization tree names `approve`, `increase_allowance` or `approve_for_all` retain their charges without closure by authorization expiry.
+
+Timelock envelopes carry an exact maximum ledger before signing. The maximum ledger is exclusive.
+
+Each queried window counts a closed charge through the later of its observation plus that window and its admitted accounting horizon.
+
+A closed intent record remains until more than one week has passed since its observation.
+
+Snapshots containing signed intents or intent links use version 9. Records missing required intent fields refuse as unreadable. Readers that cannot account for the format refuse current and prepared snapshots.

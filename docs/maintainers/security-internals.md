@@ -1190,7 +1190,7 @@ A snapshot carrying a signed intent record or an intent link uses version 9, whi
 
 Smart-account signing admits its intent before the first signature. Admission rereads the protected generation under the window lock and counts every live intent against the caps.
 
-Admission takes a checked sizing from the policy engine. The sizing names measured value, no value, an unvalued call that passes every value rule, or no applicable limit. Empty entries alone admit nothing.
+Admission takes a checked sizing from the policy engine. The sizing names measured value, no value, an unvalued call that passes every value rule, or no applicable limit. Empty entries process existing closure and pruning without admitting a new charge.
 
 An engine without checked sizing refuses every signing admission. An unvalued call under a value rule without `allow_opaque_signing` refuses with `policy.deny.unsizable_value_effect` before any signature.
 
@@ -1198,7 +1198,35 @@ One authority keeps one intent identifier whatever its sizing. Admitting it agai
 
 A refused admission signs and sends nothing. An in-process refusal before the first signer call cancels the admission. From that call on the charge stays, the failed call included.
 
-A signed intent counts from admission under its intent identifier, across window durations. From the first signer call on, nothing releases it: envelope cancellation, unwinding, reconciliation, accounting expiry and operator clears leave it unchanged.
+A bounded invocation charge closes when a later policy check or admission witnesses both profile endpoints above every authorization and envelope bound.
+
+Envelope cancellation, unwinding, reconciliation, accounting expiry and operator clears leave an exposed charge unchanged; only witnessed closure and retention end it.
+
+Only the endpoints stored in the profile authorize charge closure. Endpoint overrides can bound signatures but cannot close charges.
+
+Environment variables and programmatic overlays do not change which endpoints authorize charge closure.
+
+A refused admission still commits the closures its witness establishes.
+
+Each queried window counts a closed charge through the later of its observation plus that window and its admitted accounting horizon.
+
+A closed intent record remains until more than one week has passed since its observation.
+
+A schedule charge closes when both endpoints, above every authorization expiration, report its operation done or unset.
+
+Intents without an authenticated purpose remain open. Calls whose authorization tree names `approve`, `increase_allowance` or `approve_for_all` retain their charges without closure by authorization expiry.
+
+Timelock envelopes carry an exact maximum ledger before signing. The maximum ledger is exclusive.
+
+Snapshots containing signed intents or intent links use version 9. Records missing required intent fields refuse as unreadable. Readers that cannot account for the format refuse current and prepared snapshots.
+
+An unavailable observation leaves retained charges unchanged while the policy check continues. Read only tools and preparation requests acquire no charge closure witnesses.
+
+Reset refuses while an intent remains open or retained. A closed and pruned intent does not block reset.
+
+An open intent without an authenticated purpose permanently blocks reset for this profile. Continue with a new profile.
+
+Retained intents close only through the profile's stored secondary endpoint. Add one to the profile.
 
 Stateful criteria derive window entries from the same `ValueEffects` used by evaluation and audit. Submission identity, chain scope, and the signed execution bound live in authenticated window state. Duplicate reservations refuse under the store lock.
 

@@ -1787,6 +1787,9 @@ impl WalletServer {
             && self.policy_engine.window_state_store().is_some()
         {
             self.reconcile_open_reservations().await;
+            self.window_store
+                .observe_before_policy(self.security_profile())
+                .await;
         }
 
         // Refresh window state before evaluation.
@@ -2530,6 +2533,284 @@ impl WalletServer {
 // ─────────────────────────────────────────────────────────────────────────────
 // Tests
 // ─────────────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod signed_intent_observation_tests {
+    #![allow(clippy::unwrap_used, clippy::panic, reason = "test assertions")]
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use stellar_agent_core::policy::v1::criteria::state_store::PolicyStateStore;
+    use stellar_agent_core::policy::{Decision, PolicyEngine, PolicyError, ToolDescriptor};
+    use stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE;
+    use stellar_agent_network::{NoValueAdmission, SignedIntentPlan};
+    use stellar_xdr::{ContractId, Hash, HostFunction, InvokeContractArgs, ScAddress, ScSymbol};
+    use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate, matchers::method};
+
+    struct EvaluatingEngine {
+        state: PolicyStateStore,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl PolicyEngine for EvaluatingEngine {
+        fn evaluate(
+            &self,
+            _: &ToolDescriptor,
+            _: &Value,
+            _: &Profile,
+            _: Option<&dyn stellar_agent_core::policy::v1::AccountReservesView>,
+            _: Option<&dyn stellar_agent_core::policy::v1::AccountIdentityView>,
+            _: Option<&dyn stellar_agent_core::policy::v1::CounterpartyCacheView>,
+            _: Option<&dyn stellar_agent_core::policy::v1::Sep10SessionView>,
+            _: Option<&dyn stellar_agent_core::policy::v1::Sep45SessionView>,
+        ) -> Result<Decision, PolicyError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(Decision::Allow)
+        }
+
+        fn window_state_store(&self) -> Option<&PolicyStateStore> {
+            Some(&self.state)
+        }
+    }
+
+    struct ObservationRpc {
+        identity_failure: bool,
+    }
+    impl Respond for ObservationRpc {
+        fn respond(&self, request: &Request) -> ResponseTemplate {
+            let request: Value = serde_json::from_slice(&request.body).unwrap();
+            let result = match request["method"].as_str().unwrap() {
+                "getNetwork" => stellar_agent_test_support::signed_envelope::get_network_result(
+                    if self.identity_failure {
+                        "unknown fixture network"
+                    } else {
+                        TESTNET_PASSPHRASE
+                    },
+                ),
+                "getLatestLedger" => {
+                    serde_json::json!({"id": "ab".repeat(32), "sequence": 101, "protocolVersion": 27})
+                }
+                "simulateTransaction" => {
+                    serde_json::json!({"error": "fixture probe failure", "latestLedger": 101})
+                }
+                method => panic!("unexpected observation method {method}"),
+            };
+            ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({"jsonrpc": "2.0", "id": request["id"], "result": result}),
+            )
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(keyring)]
+    async fn dispatch_observation_is_optional_but_verification_is_required() {
+        use stellar_agent_core::policy::v1::criteria::{
+            per_period_cap::Window, rate_limit::RateLimitCriterion,
+        };
+        use stellar_agent_core::policy::{McpToolRegistration, ToolValueKind};
+        use stellar_agent_core::{PolicyDocument, PolicyEngineV1, PolicyRule, RuleMatch, ScopeId};
+        const SOURCE: &str = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF";
+
+        for case in [
+            "read_only",
+            "preparation",
+            "missing_secondary",
+            "no_open",
+            "acquisition_failure",
+            "probe_failure",
+            "corrupt",
+            "deleted",
+        ] {
+            stellar_agent_test_support::keyring_mock::install().unwrap();
+            let scratch = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/tmp");
+            std::fs::create_dir_all(&scratch).unwrap();
+            let dir = tempfile::Builder::new()
+                .prefix("dispatch-observation-")
+                .tempdir_in(scratch)
+                .unwrap();
+            let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(dir.path());
+            let rpc = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(ObservationRpc {
+                    identity_failure: case == "acquisition_failure",
+                })
+                .mount(&rpc)
+                .await;
+            let secondary = stellar_agent_test_support::second_loopback_host(&rpc.uri());
+            let profile = Profile::builder_testnet_named(
+                "intent",
+                "observer-signer",
+                "account",
+                "observer-nonce",
+                "account",
+            )
+            .with_noop_engine()
+            .rpc_url(rpc.uri())
+            .secondary_rpc_url(secondary.clone())
+            .build();
+            let mut server = crate::server::WalletServer::new(profile.clone()).unwrap();
+            let profiles = stellar_agent_core::profile::loader::default_profile_dir().unwrap();
+            std::fs::create_dir_all(&profiles).unwrap();
+            let stored_secondary = if case == "missing_secondary" {
+                String::new()
+            } else {
+                format!("secondary_rpc_url = {secondary:?}\n")
+            };
+            std::fs::write(
+                profiles.join("intent.toml"),
+                format!(
+                    "chain_id = \"stellar:testnet\"\nrpc_url = {:?}\n{stored_secondary}",
+                    rpc.uri()
+                ),
+            )
+            .unwrap();
+            let clock = stellar_agent_network::mainnet::clock::set_now_ms_for_test(1000);
+            let query_clock =
+                stellar_agent_core::policy::v1::criteria::state_store::set_query_time_for_test(
+                    1000,
+                );
+            {
+                let engine = PolicyEngineV1::new(
+                    PolicyDocument {
+                        version: 1,
+                        scope: ScopeId::AllProfiles,
+                        signature: None,
+                        rules: vec![PolicyRule {
+                            r#match: RuleMatch {
+                                tool: "*".into(),
+                                chain: "*".into(),
+                            },
+                            criteria: vec![Box::new(RateLimitCriterion::new(
+                                Window::parse("1m").unwrap(),
+                                1,
+                            ))],
+                            decision: Decision::Allow,
+                            allow_opaque_signing: false,
+                        }],
+                    },
+                    "intent".into(),
+                );
+                let descriptor = ToolDescriptor::from_registration(&McpToolRegistration {
+                    name: "stellar_smart_account_timelock_cancel",
+                    destructive_hint: true,
+                    read_only_hint: false,
+                    chain_id_required: true,
+                    value_kind: ToolValueKind::MovesValue,
+                });
+                let sizing = engine.size_no_value(&descriptor, &profile, 1000).unwrap();
+                let host = HostFunction::InvokeContract(InvokeContractArgs {
+                    contract_address: ScAddress::Contract(ContractId(Hash([1; 32]))),
+                    function_name: ScSymbol::try_from(if case == "probe_failure" {
+                        "schedule"
+                    } else {
+                        "call"
+                    })
+                    .unwrap(),
+                    args: Default::default(),
+                });
+                let timelock = stellar_strkey::Contract([1; 32]).to_string();
+                let schedule = (case == "probe_failure").then_some((timelock.as_str(), [8; 32]));
+                let plan = SignedIntentPlan::new(
+                    TESTNET_PASSPHRASE,
+                    SOURCE,
+                    SOURCE,
+                    1,
+                    stellar_agent_network::intent_xdr_hash(&host).unwrap(),
+                    Vec::new(),
+                    None,
+                )
+                .unwrap()
+                .classify_purpose(&host, schedule)
+                .unwrap()
+                .with_envelope_max_ledger(100)
+                .unwrap();
+                let admission = NoValueAdmission::with_store(
+                    profile.clone(),
+                    server.window_store.clone(),
+                    sizing,
+                )
+                .unwrap();
+                let proof = admission.admit(&plan).await.unwrap();
+                if case == "no_open" {
+                    server
+                        .window_store
+                        .cancel_signed_intent(&profile, proof)
+                        .unwrap();
+                } else {
+                    let _exposure = proof.expose();
+                }
+            }
+            clock.set(2000);
+            query_clock.set(2000);
+            let path = server.window_store.path().to_owned();
+            if case == "corrupt" {
+                let mut bytes = std::fs::read(&path).unwrap();
+                bytes[0] ^= 1;
+                std::fs::write(&path, bytes).unwrap();
+            } else if case == "deleted" {
+                std::fs::rename(&path, dir.path().join("committed.window")).unwrap();
+            }
+            let before = std::fs::read(&path).ok();
+            let calls = Arc::new(AtomicUsize::new(0));
+            server.policy_engine = Arc::new(EvaluatingEngine {
+                state: PolicyStateStore::new(),
+                calls: Arc::clone(&calls),
+            });
+            let tool = if case == "read_only" {
+                "stellar_balances"
+            } else {
+                "stellar_pay"
+            };
+            let clients = stellar_agent_network::client::constructions_on_this_thread();
+            let result = server
+                .dispatch_gate_inner(
+                    tool,
+                    &serde_json::json!({
+                        "amount_stroops": "1", "asset": "native", "destination": SOURCE,
+                    }),
+                    "stellar:testnet",
+                    None,
+                    None,
+                    None,
+                    case == "preparation",
+                )
+                .await;
+            if matches!(case, "corrupt" | "deleted") {
+                let Err(ToolError::Business(refusal)) = result else {
+                    panic!("{case} must refuse verification")
+                };
+                let (code, _, _) = assert_business_envelope(&refusal);
+                assert_eq!(code, "policy.engine_required", "{case}");
+                assert_eq!(calls.load(Ordering::SeqCst), 0);
+            } else {
+                assert!(
+                    matches!(result, Ok(DispatchOutcome::Allow(_))),
+                    "{case}: {result:?}"
+                );
+                assert_eq!(calls.load(Ordering::SeqCst), 1, "{case}");
+            }
+            let requests = rpc.received_requests().await.unwrap();
+            match case {
+                "acquisition_failure" => assert_eq!(requests.len(), 2),
+                "probe_failure" => assert_eq!(requests.len(), 6),
+                _ => assert!(requests.is_empty(), "{case}: observation RPCs are absent"),
+            }
+            if matches!(
+                case,
+                "read_only" | "preparation" | "missing_secondary" | "no_open"
+            ) {
+                // Stateful dispatch builds one client for ordinary reconciliation.
+                let reconciliation_clients =
+                    usize::from(matches!(case, "missing_secondary" | "no_open"));
+                assert_eq!(
+                    stellar_agent_network::client::constructions_on_this_thread(),
+                    clients + reconciliation_clients,
+                    "{case}: skipped observation constructs no client"
+                );
+            }
+            assert_eq!(std::fs::read(&path).ok(), before, "{case}");
+        }
+    }
+}
 
 #[cfg(test)]
 pub(crate) mod tests {

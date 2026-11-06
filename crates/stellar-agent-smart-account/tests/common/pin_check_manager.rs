@@ -47,9 +47,9 @@ pub fn pin_check_manager(
             TIMEOUT,
             CHAIN_ID.to_owned(),
         )
-        .with_intent_admission(std::sync::Arc::new(
-            stellar_agent_smart_account::signing::intent_test_helpers::no_value_admission_owned(),
-        )),
+        .with_intent_admission(
+            stellar_agent_smart_account::signing::intent_test_helpers::shared_no_value_admission(),
+        ),
     )
     .unwrap_or_else(|e| panic!("SignersManager construction must succeed: {e}"))
 }

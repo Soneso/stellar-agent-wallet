@@ -92,10 +92,7 @@ fn signers_manager(
                 timeout,
                 "stellar:testnet".to_owned(),
             )
-            .with_intent_admission(std::sync::Arc::new(
-                stellar_agent_smart_account::signing::intent_test_helpers::no_value_admission_owned(
-                ),
-            )),
+            .with_intent_admission(stellar_agent_smart_account::signing::intent_test_helpers::shared_no_value_admission()),
         )
         .expect("SignersManager::new must succeed"),
     )
@@ -105,7 +102,9 @@ fn signers_manager(
 /// signer-set state row refuses at the baseline read, before any RPC: no
 /// drift row is written and the endpoint is never contacted.
 #[tokio::test]
+#[serial_test::serial]
 async fn a_missing_baseline_refuses_before_the_drift_check_reads_the_chain() {
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let (audit_writer, audit_log_path, dir) = tmp_audit_writer();
     let smart_account_strkey = format!("{}", stellar_strkey::Contract([0u8; 32]));
     let smart_account_redacted = redact_strkey_first5_last5(&smart_account_strkey);
@@ -201,7 +200,9 @@ async fn a_missing_baseline_refuses_before_the_drift_check_reads_the_chain() {
 /// A deadline of zero passes during the baseline read, and the refusal is
 /// the read's elapse, wrapped as a signer-set refusal.
 #[tokio::test]
+#[serial_test::serial]
 async fn a_spent_deadline_refuses_at_the_baseline_read() {
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let (audit_writer, audit_log_path, dir) = tmp_audit_writer();
     let smart_account_strkey = format!("{}", stellar_strkey::Contract([0u8; 32]));
     let smart_account_redacted = redact_strkey_first5_last5(&smart_account_strkey);
@@ -259,7 +260,9 @@ async fn a_spent_deadline_refuses_at_the_baseline_read() {
 /// diverged row and the `PasskeyAssertion` row share the request id, and no
 /// ceremony starts.
 #[tokio::test]
+#[serial_test::serial]
 async fn a_changed_signer_set_refuses_at_the_comparison() {
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let (audit_writer, audit_log_path, dir) = tmp_audit_writer();
     let smart_account_strkey = format!("{}", stellar_strkey::Contract([0u8; 32]));
     let smart_account_redacted = redact_strkey_first5_last5(&smart_account_strkey);

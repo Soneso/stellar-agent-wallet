@@ -53,6 +53,8 @@ pub mod fee_bump_retry;
 pub mod fees;
 pub mod friendbot;
 pub mod idempotent_submit;
+#[cfg(any(test, feature = "test-helpers"))]
+pub mod intent_view_test_helpers;
 pub mod keyring;
 pub mod mainnet;
 pub mod memo;
@@ -135,9 +137,9 @@ pub use simulation_audit::{
 pub use stellar_rpc_client::{GetLedgerEntriesResponse, LedgerEntryResult};
 pub mod signed_intent;
 pub use signed_intent::{
-    AuthSubject, BindFacts, ExposedIntent, IntentBinding, IntentProof, IntentSubject,
-    NoValueAdmission, PermittedSigning, PlannedPayload, SignedIntentPlan, SignerDescriptor,
-    SigningAdmission, SigningPayload, SubjectKind, intent_xdr_hash,
+    AuthSubject, BindFacts, ExposedIntent, IntentBinding, IntentProof, IntentPurpose,
+    IntentSubject, NoValueAdmission, PermittedSigning, PlannedPayload, SignedIntentPlan,
+    SignerDescriptor, SigningAdmission, SigningPayload, SubjectKind, intent_xdr_hash,
 };
 pub use submission_record::{
     ApprovalTombstone, AuditWriterHandle, SubmissionIntent, SubmissionOutcome, SubmissionRecorder,

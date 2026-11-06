@@ -2,26 +2,52 @@
 #![allow(clippy::unwrap_used, clippy::panic, reason = "test fixture invariants")]
 
 use super::gate::SigningGate;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use stellar_agent_core::policy::{
     McpToolRegistration, NoopPolicyEngine, PolicyEngine, ToolDescriptor, ToolValueKind,
 };
 use stellar_agent_core::profile::{caip2::TESTNET_PASSPHRASE, schema::Profile};
 use stellar_agent_network::{IntentSubject, NoValueAdmission, SignedIntentPlan, SignerDescriptor};
 
+fn shared_admission() -> &'static (tempfile::TempDir, Arc<NoValueAdmission>) {
+    static ADMISSION: OnceLock<(tempfile::TempDir, Arc<NoValueAdmission>)> = OnceLock::new();
+    ADMISSION.get_or_init(|| {
+        let (directory, admission) = no_value_admission_owned();
+        (directory, Arc::new(admission))
+    })
+}
+
 /// Returns an explicit policy with no applicable window limit.
 pub fn no_value_admission() -> &'static NoValueAdmission {
-    static ADMISSION: OnceLock<NoValueAdmission> = OnceLock::new();
-    ADMISSION.get_or_init(no_value_admission_owned)
+    &shared_admission().1
+}
+
+/// Shares the admission whose directory guard lives for the process.
+pub fn shared_no_value_admission() -> Arc<NoValueAdmission> {
+    Arc::clone(&shared_admission().1)
 }
 
 /// Builds an owned checked no-limit admission fixture.
+/// The caller installs the mock keyring under its test's serial lock.
 ///
 /// # Panics
 /// Panics if the fixture cannot form a valid signing plan.
-pub fn no_value_admission_owned() -> NoValueAdmission {
-    let profile =
-        Profile::builder_testnet("intent-fixture", "account", "intent-fixture", "account").build();
+pub fn no_value_admission_owned() -> (tempfile::TempDir, NoValueAdmission) {
+    let name = format!("intent-fixture-{}", uuid::Uuid::new_v4());
+    let scratch = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/tmp");
+    std::fs::create_dir_all(&scratch).unwrap();
+    let directory = tempfile::Builder::new()
+        .prefix("intent-fixture-")
+        .tempdir_in(scratch)
+        .unwrap();
+    let profile = Profile::builder_testnet_named(
+        &name,
+        &format!("{name}-owner"),
+        "account",
+        &format!("{name}-nonce"),
+        "account",
+    )
+    .build();
     let tool = ToolDescriptor::from_registration(&McpToolRegistration {
         name: "fixture",
         destructive_hint: true,
@@ -30,7 +56,106 @@ pub fn no_value_admission_owned() -> NoValueAdmission {
         value_kind: ToolValueKind::ReadOnly,
     });
     let sizing = NoopPolicyEngine.size_no_value(&tool, &profile, 0).unwrap();
-    NoValueAdmission::new(profile, "intent-fixture", sizing).unwrap()
+    let store = stellar_agent_network::policy_state::PersistedWindowStore::at_path(
+        directory.path().join(format!("{name}.window")),
+    )
+    .with_profile_directory(&name, directory.path().to_owned());
+    (
+        directory,
+        NoValueAdmission::with_store(profile, store, sizing).unwrap(),
+    )
+}
+
+/// Checks exact envelope bounds at the shared gate before signer exposure.
+/// The caller owns the mock keyring and serial test lock.
+///
+/// # Panics
+/// Panics if a changed bound reaches a signer or consumes the proof.
+#[cfg(test)]
+pub async fn assert_envelope_bounds_refuse_before_signing() {
+    use super::gate::{SignerMatch, SigningRequest};
+    use stellar_agent_network::signing::test_doubles::CountingSigner;
+    use stellar_agent_network::signing::{Signer as _, TxSigningPayload};
+    use stellar_agent_network::{AuthSubject, SigningPayload};
+    use stellar_xdr::*;
+    let signer = CountingSigner::new([0; 32]);
+    let (fixture, mut envelope) =
+        stellar_agent_network::signed_intent::test_helpers::intent_fixture_kind(2);
+    let TransactionEnvelope::Tx(tx) = &mut envelope else {
+        panic!("the fixture uses a V1 envelope");
+    };
+    tx.tx.cond = Preconditions::V2(PreconditionsV2 {
+        time_bounds: None,
+        ledger_bounds: Some(LedgerBounds {
+            min_ledger: 0,
+            max_ledger: 50,
+        }),
+        min_seq_num: None,
+        min_seq_age: Duration(0),
+        min_seq_ledger_gap: 0,
+        extra_signers: VecM::default(),
+    });
+    let OperationBody::InvokeHostFunction(op) = &tx.tx.operations[0].body else {
+        panic!("the fixture invokes a host function");
+    };
+    let plan = fixture
+        .with_envelope_max_ledger(50)
+        .unwrap()
+        .classify_purpose(&op.host_function, None)
+        .unwrap();
+    assert_eq!(
+        plan.subjects()
+            .iter()
+            .filter_map(IntentSubject::expiration)
+            .max(),
+        Some(100)
+    );
+    assert_eq!(plan.check_envelope(&envelope), Ok(()));
+    let (_directory, admission) = no_value_admission_owned();
+    let signing_gate = SigningGate::new(admission.admit(&plan).await.unwrap());
+    let source = stellar_strkey::ed25519::PublicKey([0; 32])
+        .to_string()
+        .to_string();
+    for maximum in [None, Some(0), Some(49), Some(51)] {
+        let mut changed = envelope.clone();
+        let TransactionEnvelope::Tx(tx) = &mut changed else {
+            panic!("the fixture uses a V1 envelope");
+        };
+        let Preconditions::V2(conditions) = &mut tx.tx.cond else {
+            panic!("the fixture uses V2 preconditions");
+        };
+        conditions.ledger_bounds = maximum.map(|max_ledger| LedgerBounds {
+            min_ledger: 0,
+            max_ledger,
+        });
+        let result = signing_gate.authorize(SigningRequest {
+            subject: AuthSubject::source(&source).unwrap(),
+            signer: SignerMatch::Exact(SignerDescriptor::AccountKey {
+                public_key: [0; 32],
+            }),
+            payload: SigningPayload::Envelope(&changed),
+        });
+        if result.is_ok() {
+            let _ = signer
+                .sign_tx_payload(
+                    &TxSigningPayload::for_envelope(&changed, TESTNET_PASSPHRASE).unwrap(),
+                )
+                .await;
+        }
+        assert!(
+            matches!(
+                result,
+                Err(crate::SaError::IntentBindingMismatch {
+                    field: "expiration"
+                })
+            ),
+            "{maximum:?}: {result:?}"
+        );
+        assert_eq!(signer.sign_calls(), 0);
+        assert!(signing_gate.exposure().is_none());
+    }
+    assert!(signing_gate.take_unexposed().is_some());
+    assert!(signing_gate.exposure().is_none());
 }
 
 /// Admits the named fixture subjects without a durable charge.
@@ -58,7 +183,9 @@ pub fn gate(subjects: Vec<IntentSubject>) -> SigningGate {
     let mut context = std::task::Context::from_waker(std::task::Waker::noop());
     match admission.as_mut().poll(&mut context) {
         std::task::Poll::Ready(proof) => SigningGate::new(proof.unwrap()),
-        std::task::Poll::Pending => panic!("an empty checked sizing requires no I/O"),
+        std::task::Poll::Pending => {
+            panic!("the checked fixture admission completes synchronously")
+        }
     }
 }
 

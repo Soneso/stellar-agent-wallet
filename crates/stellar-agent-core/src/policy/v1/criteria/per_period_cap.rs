@@ -89,6 +89,9 @@ pub struct Window {
     label: &'static str,
 }
 
+/// The longest supported accounting window, in seconds.
+pub const MAX_SUPPORTED_WINDOW_SECS: u64 = 604_800;
+
 impl Window {
     /// Parses a window string.
     ///
@@ -134,7 +137,7 @@ impl Window {
                 label: "1d",
             }),
             "1w" => Ok(Self {
-                secs: 604_800,
+                secs: MAX_SUPPORTED_WINDOW_SECS,
                 label: "1w",
             }),
             _ => Err(PolicyError::PolicyFileParseFailed {
@@ -489,6 +492,10 @@ impl PerPeriodCapCriterion {
 /// Returns [`PolicyError::CriterionEvaluationFailed`] when `SystemTime::now()`
 /// is before the UNIX epoch (should not occur on any supported platform).
 fn system_time_to_ms() -> Result<u64, PolicyError> {
+    #[cfg(any(test, feature = "test-helpers"))]
+    if let Some(now) = super::state_store::query_time_for_test() {
+        return Ok(now);
+    }
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)

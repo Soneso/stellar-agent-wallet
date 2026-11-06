@@ -491,6 +491,22 @@ pub struct PermittedSigning {
     pub payload: PlannedPayload,
 }
 
+/// Authenticated operation authority retained with an intent.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub enum IntentPurpose {
+    /// An invocation without recognized persistent authority.
+    Invoke,
+    /// A schedule whose frozen operation requires terminal state evidence.
+    TimelockSchedule {
+        /// The canonical timelock contract address.
+        timelock: String,
+        /// The operation identity computed before admission.
+        #[serde(with = "hash_hex")]
+        operation_id: [u8; 32],
+    },
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct PlanFacts {
@@ -502,6 +518,8 @@ pub(crate) struct PlanFacts {
     pub host_invocation_sha256: [u8; 32],
     pub subjects: Vec<SubjectFacts>,
     pub greatest_expiration_ledger: Option<u32>,
+    pub purpose: Option<IntentPurpose>,
+    pub envelope_max_ledger: Option<u32>,
 }
 
 impl PlanFacts {
@@ -517,20 +535,53 @@ impl PlanFacts {
             .subjects
             .windows(2)
             .all(|pair| pair[0].encode() <= pair[1].encode())
-            || self.greatest_expiration_ledger
-                != self
-                    .subjects
-                    .iter()
-                    .filter_map(|s| s.signature_expiration_ledger)
-                    .max()
+            || self.greatest_expiration_ledger != self.execution_bound()
         {
             return Err("plan");
         }
         Ok(())
     }
 
+    pub(crate) fn execution_bound(&self) -> Option<u32> {
+        if self.subjects.iter().any(|subject| {
+            subject.kind != SubjectKind::SourceAccount
+                && subject.signature_expiration_ledger.is_none()
+        }) || ((self.subjects.is_empty()
+            || self
+                .subjects
+                .iter()
+                .any(|s| s.kind == SubjectKind::SourceAccount))
+            && self.envelope_max_ledger.is_none())
+        {
+            return None;
+        }
+        self.subjects
+            .iter()
+            .filter_map(|s| s.signature_expiration_ledger)
+            .chain(self.envelope_max_ledger)
+            .max()
+    }
+
+    pub(crate) fn same_authority(&self, other: &Self) -> bool {
+        self.chain_scope == other.chain_scope
+            && ((self.envelope_source == other.envelope_source
+                && self.envelope_sequence == other.envelope_sequence
+                && self.host_invocation_sha256 == other.host_invocation_sha256
+                && self
+                    .subjects
+                    .iter()
+                    .map(SubjectFacts::encode)
+                    .eq(other.subjects.iter().map(SubjectFacts::encode)))
+                || self.subjects.iter().any(|prior| {
+                    prior.nonce.is_some()
+                        && other.subjects.iter().any(|next| {
+                            prior.credential == next.credential && prior.nonce == next.nonce
+                        })
+                }))
+    }
+
     pub(crate) fn intent_id(&self) -> String {
-        let mut bytes = b"stellar-agent-signed-intent:v1".to_vec();
+        let mut bytes = b"stellar-agent-signed-intent:v2".to_vec();
         string(&mut bytes, &self.chain_scope.chain().to_string());
         bytes.extend(Sha256::digest(
             self.chain_scope.chain().network_passphrase().as_bytes(),
@@ -544,6 +595,21 @@ impl PlanFacts {
             bytes.extend(subject.encode());
         }
         option(&mut bytes, self.greatest_expiration_ledger, |out, value| {
+            out.extend(value.to_be_bytes())
+        });
+        match &self.purpose {
+            None => bytes.push(0),
+            Some(IntentPurpose::Invoke) => bytes.push(1),
+            Some(IntentPurpose::TimelockSchedule {
+                timelock,
+                operation_id,
+            }) => {
+                bytes.push(2);
+                string(&mut bytes, timelock);
+                bytes.extend(operation_id);
+            }
+        }
+        option(&mut bytes, self.envelope_max_ledger, |out, value| {
             out.extend(value.to_be_bytes())
         });
         format!(
@@ -561,6 +627,12 @@ impl PlanFacts {
             (SubjectStage::RuleIds, "context_rule_ids"),
             (SubjectStage::Signers, "signers"),
         ];
+        if self.purpose != other.purpose {
+            return Err("purpose");
+        }
+        if self.envelope_max_ledger != other.envelope_max_ledger {
+            return Err("expiration");
+        }
         if self.chain_scope != other.chain_scope {
             return Err("chain");
         }
@@ -601,6 +673,7 @@ pub struct SignedIntentPlan {
     subjects: Vec<IntentSubject>,
     permitted: Vec<PermittedSigning>,
     legs: Vec<WindowEntry>,
+    capability: Option<crate::signing::LedgerWitnessCapability>,
 }
 
 impl SignedIntentPlan {
@@ -620,7 +693,11 @@ impl SignedIntentPlan {
     ) -> Result<Self, WalletError> {
         let chain_scope = ChainScope::from_passphrase(network_passphrase)?;
         subjects.sort_by_key(|subject| subject.facts.encode());
-        let facts = PlanFacts {
+        if greatest_expiration_ledger != subjects.iter().filter_map(IntentSubject::expiration).max()
+        {
+            return Err(mismatch("plan"));
+        }
+        let mut facts = PlanFacts {
             chain_scope,
             auth_address: auth_address.into(),
             envelope_source: envelope_source.into(),
@@ -631,7 +708,10 @@ impl SignedIntentPlan {
                 .map(|subject| subject.facts.clone())
                 .collect(),
             greatest_expiration_ledger,
+            purpose: None,
+            envelope_max_ledger: None,
         };
+        facts.greatest_expiration_ledger = facts.execution_bound();
         facts.validate().map_err(|_| mismatch("plan"))?;
         let mut permitted = Vec::new();
         for subject in &subjects {
@@ -698,9 +778,56 @@ impl SignedIntentPlan {
             subjects,
             permitted,
             legs: Vec::new(),
+            capability: None,
         })
     }
 
+    /// Freezes the exact exclusive envelope ledger bound.
+    ///
+    /// # Errors
+    /// Refuses a zero bound.
+    pub fn with_envelope_max_ledger(mut self, maximum: u32) -> Result<Self, WalletError> {
+        if maximum == 0 {
+            return Err(mismatch("expiration"));
+        }
+        self.facts.envelope_max_ledger = Some(maximum);
+        self.facts.greatest_expiration_ledger = self.facts.execution_bound();
+        Ok(self)
+    }
+
+    /// Classifies the checked host invocation and every authorization function.
+    ///
+    /// # Errors
+    /// Refuses host facts that differ from the frozen invocation hash or schedule contract.
+    pub fn classify_purpose(
+        mut self,
+        host: &stellar_xdr::HostFunction,
+        schedule: Option<(&str, [u8; 32])>,
+    ) -> Result<Self, WalletError> {
+        if xdr_hash(host).map_err(mismatch)? != self.facts.host_invocation_sha256 {
+            return Err(mismatch("purpose"));
+        }
+        self.facts.purpose = classify_purpose(host, &self.subjects, schedule).map_err(mismatch)?;
+        Ok(self)
+    }
+
+    /// The authenticated operation purpose, when classification is complete.
+    #[must_use]
+    pub fn purpose(&self) -> Option<&IntentPurpose> {
+        self.facts.purpose.as_ref()
+    }
+
+    /// Attaches the checked witness that precedes admission.
+    #[must_use]
+    pub fn with_capability(mut self, capability: crate::signing::LedgerWitnessCapability) -> Self {
+        self.capability = Some(capability);
+        self
+    }
+    /// Returns the acquired witness, when the signing path supplies one.
+    #[must_use]
+    pub fn capability(&self) -> Option<&crate::signing::LedgerWitnessCapability> {
+        self.capability.as_ref()
+    }
     /// Returns the plan's canonical chain scope.
     #[must_use]
     pub fn chain_scope(&self) -> ChainScope {
@@ -736,19 +863,47 @@ impl SignedIntentPlan {
             envelope,
             self.facts.chain_scope.chain().network_passphrase(),
         )?;
-        self.facts.compare(&facts.facts)
+        self.compare_bound(&facts)
+    }
+    pub(crate) fn compare_bound(&self, facts: &BindFacts) -> Result<(), &'static str> {
+        facts.compare_to(&self.facts)
     }
 }
 
 /// Facts recomputed from a final envelope for durable binding.
 #[derive(Clone, Debug)]
 pub struct BindFacts {
+    pub(crate) host: stellar_xdr::HostFunction,
+    pub(crate) subjects: Vec<IntentSubject>,
     pub(crate) facts: PlanFacts,
     pub(crate) envelope_hash: String,
     pub(crate) tx_hash: String,
 }
 
 impl BindFacts {
+    pub(crate) fn compare_to(&self, expected: &PlanFacts) -> Result<(), &'static str> {
+        if matches!(
+            expected.purpose,
+            Some(IntentPurpose::TimelockSchedule { .. })
+        ) && self.facts.host_invocation_sha256 != expected.host_invocation_sha256
+        {
+            return Err("purpose");
+        }
+        let mut bound = self.facts.clone();
+        let schedule = match &expected.purpose {
+            Some(IntentPurpose::TimelockSchedule {
+                timelock,
+                operation_id,
+            }) => Some((timelock.as_str(), *operation_id)),
+            _ => None,
+        };
+        bound.purpose = classify_purpose(&self.host, &self.subjects, schedule)?;
+        if expected.purpose.is_none() {
+            bound.purpose = None;
+        }
+        expected.compare(&bound)
+    }
+
     /// Recomputes every authorization fact from the decoded envelope.
     ///
     /// # Errors
@@ -772,31 +927,50 @@ impl BindFacts {
         };
         let (envelope_source, envelope_sequence) =
             crate::submit::replay_identity(envelope).map_err(|_| "envelope_source")?;
-        let mut subjects = op
+        let subjects = op
             .auth
             .iter()
-            .map(|entry| {
-                IntentSubject::of_entry(entry, &envelope_source).map(|subject| subject.facts)
-            })
+            .map(|entry| IntentSubject::of_entry(entry, &envelope_source))
             .collect::<Result<Vec<_>, _>>()?;
-        subjects.sort_by_key(SubjectFacts::encode);
-        let greatest_expiration_ledger = subjects
+        let mut subject_facts: Vec<_> = subjects
+            .iter()
+            .map(|subject| subject.facts.clone())
+            .collect();
+        subject_facts.sort_by_key(SubjectFacts::encode);
+        let greatest_expiration_ledger = subject_facts
             .iter()
             .filter_map(|s| s.signature_expiration_ledger)
             .max();
+        let envelope_max_ledger = match &v1.tx.cond {
+            stellar_xdr::Preconditions::V2(v2) => match &v2.ledger_bounds {
+                Some(bounds) if bounds.min_ledger != 0 => return Err("expiration"),
+                Some(bounds) => Some(bounds.max_ledger),
+                None => None,
+            },
+            _ => None,
+        };
+        if envelope_max_ledger == Some(0) {
+            return Err("expiration");
+        }
         let encoded = envelope
             .to_xdr_base64(Limits::none())
             .map_err(|_| "envelope")?;
+        let mut facts = PlanFacts {
+            chain_scope,
+            auth_address: String::new(),
+            envelope_source,
+            envelope_sequence,
+            host_invocation_sha256: xdr_hash(&op.host_function)?,
+            subjects: subject_facts,
+            greatest_expiration_ledger,
+            purpose: classify_purpose(&op.host_function, &subjects, None)?,
+            envelope_max_ledger,
+        };
+        facts.greatest_expiration_ledger = facts.execution_bound();
         Ok(Self {
-            facts: PlanFacts {
-                chain_scope,
-                auth_address: String::new(),
-                envelope_source,
-                envelope_sequence,
-                host_invocation_sha256: xdr_hash(&op.host_function)?,
-                subjects,
-                greatest_expiration_ledger,
-            },
+            facts,
+            host: op.host_function.clone(),
+            subjects,
             envelope_hash: crate::submit::envelope_hash_hex(&encoded),
             tx_hash: crate::submit::compute_local_tx_hash_hex(envelope, network_passphrase)
                 .map_err(|_| "envelope")?,
@@ -866,6 +1040,60 @@ impl<'a> IntentBinding<'a> {
     pub(crate) fn new(exposure: &'a ExposedIntent, envelope: &'a TransactionEnvelope) -> Self {
         Self { exposure, envelope }
     }
+}
+
+fn classify_purpose(
+    host: &stellar_xdr::HostFunction,
+    subjects: &[IntentSubject],
+    schedule: Option<(&str, [u8; 32])>,
+) -> Result<Option<IntentPurpose>, &'static str> {
+    use stellar_xdr::{HostFunction, SorobanAuthorizedFunction};
+    let HostFunction::InvokeContract(invoke) = host else {
+        return Ok(None);
+    };
+    let allowance = |name: &[u8]| {
+        matches!(
+            name,
+            b"approve" | b"increase_allowance" | b"approve_for_all"
+        )
+    };
+    let schedule_host = schedule.is_some() && invoke.function_name.0.as_slice() == b"schedule";
+    if let Some((timelock, _)) = schedule {
+        contract_key(timelock).map_err(|_| "purpose")?;
+        if !schedule_host
+            || scaddress_to_strkey(&invoke.contract_address).map_err(|_| "purpose")? != timelock
+        {
+            return Err("purpose");
+        }
+    }
+    if allowance(invoke.function_name.0.as_slice())
+        || (!schedule_host && invoke.function_name.0.as_slice() == b"schedule")
+    {
+        return Ok(None);
+    }
+    let mut stack: Vec<_> = subjects
+        .iter()
+        .map(|subject| (&subject.root_invocation, true))
+        .collect();
+    while let Some((node, root)) = stack.pop() {
+        let SorobanAuthorizedFunction::ContractFn(function) = &node.function else {
+            return Ok(None);
+        };
+        if allowance(function.function_name.0.as_slice())
+            || (function.function_name.0.as_slice() == b"schedule"
+                && !(schedule_host && root && function == invoke))
+        {
+            return Ok(None);
+        }
+        stack.extend(node.sub_invocations.iter().map(|child| (child, false)));
+    }
+    Ok(Some(match schedule {
+        Some((timelock, operation_id)) => IntentPurpose::TimelockSchedule {
+            timelock: timelock.into(),
+            operation_id,
+        },
+        None => IntentPurpose::Invoke,
+    }))
 }
 
 fn account_key(address: &str) -> Result<[u8; 32], &'static str> {
@@ -1074,9 +1302,6 @@ pub(crate) fn admit_checked(
         .require_profile(profile)
         .map_err(store_refusal)?;
     let frozen = plan.with_legs(sizing.entries());
-    if sizing.entries().is_empty() {
-        return Ok(IntentProof::new(None, frozen));
-    }
     window
         .admit_signed_intent(profile, &frozen)
         .map_err(store_refusal)
@@ -1122,7 +1347,7 @@ mod tests {
         let plan = empty_plan(1).unwrap();
         assert_eq!(
             plan.facts.intent_id(),
-            "intent-d2fc2b717c1d24c19de849b48773fd969c9fb697d1668c443846d1b09879081d"
+            "intent-81fe93946f940554a2cf311403afec303ebd5bfa92c70e1862c2a06ae0646e51"
         );
         let with_legs = plan.with_legs(&[WindowEntry::new(
             StateKey::new("fixture", 1, "rate_limit", 60),
@@ -1189,18 +1414,20 @@ mod tests {
                 },
             ],
             greatest_expiration_ledger: Some(1_000_000),
+            purpose: Some(IntentPurpose::Invoke),
+            envelope_max_ledger: Some(1_000_000),
         };
         assert!(facts.validate().is_ok());
         assert_eq!(
             facts.intent_id(),
-            "intent-c08cb0b270df5b730c5d533244b0537bdd5a4daa73faea8f90c3b80b4306b052"
+            "intent-25abc1062d314e742df61ac2330ca880f685450608851ce5dee31afb588ec260"
         );
         let mut duplicate = facts.clone();
         duplicate.subjects.insert(1, duplicate.subjects[0].clone());
         assert!(duplicate.validate().is_ok());
         assert_eq!(
             duplicate.intent_id(),
-            "intent-0078b97cffb5771a73eff5e1b84ee11d40d21aa6152c543a18b5397ce3c2ebc4"
+            "intent-7570e32798474ceee2884af73c99467ebe54f0f85482fc82ffee04d6021e867a"
         );
     }
 
@@ -1222,10 +1449,13 @@ mod tests {
         assert!(exposure.intent_id().is_none());
         assert_eq!(
             exposure.plan().facts.intent_id(),
-            "intent-d2fc2b717c1d24c19de849b48773fd969c9fb697d1668c443846d1b09879081d"
+            "intent-81fe93946f940554a2cf311403afec303ebd5bfa92c70e1862c2a06ae0646e51"
         );
     }
 }
 
 #[cfg(any(test, feature = "test-helpers"))]
 pub mod test_helpers;
+
+#[cfg(test)]
+mod closure_tests;

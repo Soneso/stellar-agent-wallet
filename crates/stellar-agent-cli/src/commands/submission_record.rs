@@ -33,6 +33,35 @@ use stellar_agent_network::{
 
 use crate::common::profile_access::ProfileOrigin;
 
+/// Observes retained intents before the caller constructs its policy engine.
+pub(crate) async fn observe_intents(profile: &Profile, profile_name: &str) {
+    PersistedWindowStore::for_profile(profile_name)
+        .observe_before_policy(profile)
+        .await;
+}
+
+/// Observes and replaces the state of an existing policy engine.
+///
+/// # Errors
+/// Refuses a state clear or verified refresh failure.
+pub(crate) async fn observe_and_refresh_intents(
+    profile: &Profile,
+    profile_name: &str,
+    engine: &dyn stellar_agent_core::policy::PolicyEngine,
+) -> Result<(), stellar_agent_network::policy_state::WindowStoreError> {
+    let Some(state) = engine.window_state_store() else {
+        return Ok(());
+    };
+    let window = PersistedWindowStore::for_profile(profile_name);
+    window.observe_before_policy(profile).await;
+    state.clear().map_err(|error| {
+        stellar_agent_network::policy_state::WindowStoreError::Invalid {
+            detail: error.to_string(),
+        }
+    })?;
+    window.load_into(profile_name, profile, state)
+}
+
 /// The verb this binary names as the way to reconcile a submission whose
 /// outcome is not known.
 pub(crate) const RECONCILE_VERB: &str = "stellar-agent tx status";
@@ -1666,5 +1695,200 @@ mod tests {
             2,
             "each decision has one row"
         );
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod intent_gate_fixture {
+    #![allow(clippy::unwrap_used, clippy::panic, reason = "test fixture assertions")]
+    use super::*;
+    use stellar_agent_core::policy::v1::criteria::state_store::StateKey;
+    use stellar_agent_core::profile::schema::PolicyEngineKind;
+    use stellar_xdr::{OperationBody, TransactionEnvelope};
+    use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
+
+    pub(crate) struct IntentGateState {
+        name: String,
+        store: PersistedWindowStore,
+        endpoint: MockServer,
+        clock: stellar_agent_network::mainnet::clock::TestClockGuard,
+        query_clock: stellar_agent_core::policy::v1::criteria::state_store::QueryTimeGuard,
+        key: StateKey,
+    }
+
+    impl IntentGateState {
+        pub(crate) async fn seed(name: &str, profile: &mut Profile) -> Self {
+            let clock = stellar_agent_network::mainnet::clock::set_now_ms_for_test(1000);
+            let query_clock =
+                stellar_agent_core::policy::v1::criteria::state_store::set_query_time_for_test(
+                    1000,
+                );
+            let endpoint = MockServer::start().await;
+            Mock::given(method("POST")).respond_with(|request: &wiremock::Request| {
+                let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                let result = match body["method"].as_str().unwrap() {
+                    "getNetwork" => stellar_agent_test_support::signed_envelope::get_network_result(stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE),
+                    "getLatestLedger" => serde_json::json!({"id": "ab".repeat(32), "sequence": 101, "protocolVersion": 27}),
+                    method => panic!("unexpected observation request {method}"),
+                };
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"jsonrpc":"2.0", "id":body["id"], "result":result}))
+            }).mount(&endpoint).await;
+            let profiles = stellar_agent_core::profile::loader::default_profile_dir().unwrap();
+            std::fs::create_dir_all(&profiles).unwrap();
+            std::fs::write(profiles.join(format!("{name}.toml")), format!(
+                "version = 2\nchain_id = \"stellar:testnet\"\nrpc_url = {:?}\nsecondary_rpc_url = {:?}\n",
+                endpoint.uri(), stellar_agent_test_support::second_loopback_host(&endpoint.uri()),
+            )).unwrap();
+            profile.policy.engine = PolicyEngineKind::V1;
+            let owner = ed25519_dalek::SigningKey::from_bytes(&[0x57; 32]);
+            let owner_key = owner.verifying_key().to_bytes();
+            let key = &profile.policy_owner_key_id;
+            keyring_core::Entry::new(&key.service, &key.account)
+                .unwrap()
+                .set_password(
+                    &stellar_agent_core::profile::owner_key::encode_owner_public_key(&owner_key),
+                )
+                .unwrap();
+            let policy = format!(
+                "version = 1\nscope = \"profile:{name}\"\n[[rules]]\nmatch = {{ tool = \"*\", chain = \"*\" }}\ncriteria = [{{ kind = \"rate_limit\", window = \"1w\", max_calls = 1 }}]\ndecision = \"allow\"\n"
+            );
+            let canonical =
+                stellar_agent_core::policy::v1::canonical::canonical_bytes(&policy).unwrap();
+            let digest = stellar_agent_core::policy::v1::signature::digest(&canonical);
+            let signature = stellar_agent_core::policy::v1::signature::sign(&digest, &owner);
+            let owner_g = stellar_strkey::ed25519::PublicKey(owner_key).to_string();
+            let signed = format!(
+                "{policy}\n[signature]\nowner_id = {:?}\nsig = {:?}\n",
+                owner_g.as_str(),
+                hex::encode(signature)
+            );
+            let policies = stellar_agent_core::profile::schema::default_policy_dir().unwrap();
+            std::fs::create_dir_all(&policies).unwrap();
+            std::fs::write(policies.join(format!("{name}.toml")), signed).unwrap();
+            let engine = crate::commands::policy_engine::build_v1_policy_engine(
+                "fixture",
+                &profile.policy.engine,
+                profile,
+                name,
+            )
+            .unwrap();
+            let descriptor = ToolDescriptor::from_registration(&McpToolRegistration {
+                name: "fixture",
+                destructive_hint: true,
+                read_only_hint: false,
+                chain_id_required: true,
+                value_kind: ToolValueKind::ReadOnly,
+            });
+            let sizing = engine.size_no_value(&descriptor, profile, 1000).unwrap();
+            assert_eq!(sizing.entries().len(), 1);
+            let key = sizing.entries()[0].key().clone();
+            let (fixture, envelope) =
+                stellar_agent_network::signed_intent::test_helpers::intent_fixture_plan(1, 1);
+            let TransactionEnvelope::Tx(tx) = envelope else {
+                panic!("transaction")
+            };
+            let OperationBody::InvokeHostFunction(op) = &tx.tx.operations[0].body else {
+                panic!("invoke")
+            };
+            let plan = fixture
+                .classify_purpose(&op.host_function, None)
+                .unwrap()
+                .with_envelope_max_ledger(100)
+                .unwrap();
+            let plan = stellar_agent_network::signed_intent::test_helpers::with_legs(
+                &plan,
+                sizing.entries(),
+            );
+            let store = PersistedWindowStore::for_profile(name);
+            let _exposure = store.admit_signed_intent(profile, &plan).unwrap().expose();
+            clock.set(2000);
+            query_clock.set(2000);
+            Self {
+                name: name.into(),
+                store,
+                endpoint,
+                clock,
+                query_clock,
+                key,
+            }
+        }
+
+        pub(crate) async fn assert_closed(&self, profile: &Profile, count: u32) {
+            let views = self.store.signed_intents(&self.name, profile).unwrap();
+            assert_eq!(views.len(), 1);
+            assert_eq!(views[0].expiry_observed_at_ms, Some(2000));
+            assert_eq!(views[0].accounting_horizon, "604802000");
+            let engine = crate::commands::policy_engine::build_v1_policy_engine(
+                "fixture",
+                &profile.policy.engine,
+                profile,
+                &self.name,
+            )
+            .unwrap();
+            assert_eq!(
+                engine
+                    .window_state_store()
+                    .unwrap()
+                    .query_window(&self.key, if count == 0 { 604802001 } else { 2000 })
+                    .unwrap(),
+                (i128::from(count), count)
+            );
+            assert_eq!(self.endpoint.received_requests().await.unwrap().len(), 4);
+        }
+
+        pub(crate) fn after_retention(&self) {
+            self.clock.set(604802001);
+            self.query_clock.set(604802001);
+        }
+
+        pub(crate) fn bytes(&self) -> Vec<u8> {
+            std::fs::read(self.store.path()).unwrap()
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial]
+    async fn early_observation_precedes_window_gate() {
+        let (_home, _guard) = home();
+        let name = "intent-refresh";
+        let mut profile =
+            Profile::builder_testnet_named(name, "signer", "account", "nonce", name).build();
+        let state = IntentGateState::seed(name, &mut profile).await;
+        let engine = crate::commands::policy_engine::build_v1_policy_engine(
+            "fixture",
+            &profile.policy.engine,
+            &profile,
+            name,
+        )
+        .unwrap();
+        let memory = engine.window_state_store().unwrap();
+        assert_eq!(memory.query_window(&state.key, 2000).unwrap(), (1, 1));
+        for after in [false, false, true] {
+            if after {
+                state.after_retention();
+            }
+            observe_and_refresh_intents(&profile, name, engine.as_ref())
+                .await
+                .unwrap();
+            let now = if after { 604802001 } else { 2000 };
+            let expected = if after { (0, 0) } else { (1, 1) };
+            assert_eq!(memory.query_window(&state.key, now).unwrap(), expected);
+            state.assert_closed(&profile, u32::from(!after)).await;
+        }
+    }
+
+    pub(crate) fn home() -> (
+        tempfile::TempDir,
+        stellar_agent_test_support::StellarAgentHomeGuard,
+    ) {
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        let scratch = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/tmp");
+        std::fs::create_dir_all(&scratch).unwrap();
+        let home = tempfile::Builder::new()
+            .prefix("intent-gate-")
+            .tempdir_in(scratch)
+            .unwrap();
+        let guard = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
+        (home, guard)
     }
 }

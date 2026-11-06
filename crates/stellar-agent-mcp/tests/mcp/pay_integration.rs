@@ -2735,6 +2735,348 @@ fn per_period_cap_engine(
     stellar_agent_core::policy::v1::PolicyEngineV1::new(document, profile_name.to_owned())
 }
 
+#[tokio::test]
+async fn dispatch_observes_stored_endpoints_before_refresh() {
+    let primary = MockServer::start().await;
+    let secondary = MockServer::start().await;
+    for endpoint in [&primary, &secondary] {
+        Mock::given(method("POST"))
+            .respond_with(|request: &Request| {
+                let request: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                let result = match request["method"].as_str().unwrap() {
+                    "getNetwork" => {
+                        stellar_agent_test_support::signed_envelope::get_network_result(
+                            stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE,
+                        )
+                    }
+                    "getLatestLedger" => serde_json::json!({
+                        "id": "ab".repeat(32), "sequence": 100_000, "protocolVersion": 27,
+                    }),
+                    method => panic!("unexpected environment request {method}"),
+                };
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "jsonrpc": "2.0", "id": request["id"], "result": result,
+                }))
+            })
+            .mount(endpoint)
+            .await;
+    }
+    let primary_url = primary.uri();
+    let secondary_url = stellar_agent_test_support::second_loopback_host(&secondary.uri());
+    let output = tokio::task::spawn_blocking(move || {
+        std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "pay_integration::dispatch_stored_endpoints_environment_child",
+            ])
+            .env("DISPATCH_STORED_ENDPOINTS_CHILD", "1")
+            .env("STELLAR_AGENT_RPC_URL", primary_url)
+            .env("STELLAR_AGENT_SECONDARY_RPC_URL", secondary_url)
+            .output()
+            .unwrap()
+    })
+    .await
+    .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "{stdout} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(stdout.contains("test result: ok. 1 passed;"), "{stdout}");
+    for endpoint in [&primary, &secondary] {
+        assert!(endpoint.received_requests().await.unwrap().is_empty());
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn dispatch_stored_endpoints_environment_child() {
+    if std::env::var_os("DISPATCH_STORED_ENDPOINTS_CHILD").is_none() {
+        return;
+    }
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use stellar_agent_core::policy::Decision;
+    use stellar_agent_core::policy::v1::criteria::state_store::StateKey;
+    use stellar_agent_core::policy::v1::criteria::{
+        per_period_cap::Window, rate_limit::RateLimitCriterion,
+    };
+    use stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE;
+    use stellar_agent_core::{PolicyDocument, PolicyEngineV1, PolicyRule, RuleMatch, ScopeId};
+    use stellar_agent_network::policy_state::PersistedWindowStore;
+    use stellar_xdr::{OperationBody, TransactionEnvelope};
+
+    struct WitnessRpc(Arc<AtomicU32>);
+    impl Respond for WitnessRpc {
+        fn respond(&self, request: &Request) -> ResponseTemplate {
+            let request: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            let result = match request["method"].as_str().unwrap() {
+                "getNetwork" => stellar_agent_test_support::signed_envelope::get_network_result(
+                    TESTNET_PASSPHRASE,
+                ),
+                "getLatestLedger" => {
+                    serde_json::json!({"id": "ab".repeat(32), "sequence": self.0.load(Ordering::SeqCst), "protocolVersion": 27})
+                }
+                method => panic!("unexpected stored-endpoint request {method}"),
+            };
+            ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({"jsonrpc": "2.0", "id": request["id"], "result": result}),
+            )
+        }
+    }
+
+    keyring_mock::install().unwrap();
+    install_test_nonce_key(246);
+    let scratch = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/tmp");
+    std::fs::create_dir_all(&scratch).unwrap();
+    let dir = tempfile::Builder::new()
+        .prefix("dispatch-retention-")
+        .tempdir_in(scratch)
+        .unwrap();
+    let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(dir.path());
+    let stored_primary = MockServer::start().await;
+    let stored_secondary = MockServer::start().await;
+    let stored_height = Arc::new(AtomicU32::new(100));
+    for endpoint in [&stored_primary, &stored_secondary] {
+        Mock::given(method("POST"))
+            .respond_with(WitnessRpc(Arc::clone(&stored_height)))
+            .mount(endpoint)
+            .await;
+    }
+    let environment_primary = std::env::var("STELLAR_AGENT_RPC_URL").unwrap();
+    let environment_secondary = std::env::var("STELLAR_AGENT_SECONDARY_RPC_URL").unwrap();
+    let caller_secondary = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(WitnessRpc(Arc::new(AtomicU32::new(100_000))))
+        .mount(&caller_secondary)
+        .await;
+    let loaded_primary = funded_accounts_endpoint().await;
+    let mut stored = Profile::builder_testnet_named("intent", "svc", "acct", "n-svc", "n-acct")
+        .with_noop_engine()
+        .rpc_url(stored_primary.uri())
+        .secondary_rpc_url(stellar_agent_test_support::second_loopback_host(
+            &stored_secondary.uri(),
+        ))
+        .build();
+    crate::common::install_test_audit_key(&mut stored);
+    let profiles = stellar_agent_core::profile::loader::default_profile_dir().unwrap();
+    std::fs::create_dir_all(&profiles).unwrap();
+    let mut profile_toml = format!(
+        "version = 2\nchain_id = \"stellar:testnet\"\nrpc_url = {:?}\nsecondary_rpc_url = {:?}\n",
+        stored.rpc_url,
+        stored.secondary_rpc_url.as_ref().unwrap(),
+    );
+    for (table, key) in [
+        ("mcp_signer_default", &stored.mcp_signer_default),
+        ("mcp_nonce_key_alias", &stored.mcp_nonce_key_alias),
+        (
+            "audit_log_hash_chain_key_id",
+            &stored.audit_log_hash_chain_key_id,
+        ),
+        ("policy_owner_key_id", &stored.policy_owner_key_id),
+        ("attestation_key_id", &stored.attestation_key_id),
+        (
+            "counterparty_cache_key_id",
+            &stored.counterparty_cache_key_id,
+        ),
+        (
+            "policy_window_state_key_id",
+            &stored.policy_window_state_key_id,
+        ),
+    ] {
+        profile_toml.push_str(&format!(
+            "\n[{table}]\nservice = {:?}\naccount = {:?}\n",
+            key.service, key.account,
+        ));
+    }
+    profile_toml.push_str("\n[policy]\nengine = \"noop\"\n");
+    std::fs::write(profiles.join("intent.toml"), profile_toml).unwrap();
+    let environment_loaded =
+        stellar_agent_core::profile::loader::load_from_dir("intent", &profiles, None).unwrap();
+    assert_eq!(environment_loaded.rpc_url, environment_primary);
+    assert_eq!(
+        environment_loaded.secondary_rpc_url.as_deref(),
+        Some(environment_secondary.as_str())
+    );
+    let profile = stellar_agent_core::profile::loader::load_with_overlay_from_dir(
+        "intent",
+        &profiles,
+        std::collections::HashMap::from([
+            ("rpc_url", serde_json::json!(loaded_primary.uri())),
+            (
+                "secondary_rpc_url",
+                serde_json::json!(stellar_agent_test_support::second_loopback_host(
+                    &caller_secondary.uri()
+                )),
+            ),
+        ]),
+        None,
+    )
+    .unwrap();
+    assert_eq!(profile.rpc_url, loaded_primary.uri());
+    let mut server = WalletServer::new(profile.clone()).unwrap();
+    assert_eq!(server.profile_name_for_approval(), "intent");
+    let engine = Arc::new(PolicyEngineV1::new(
+        PolicyDocument {
+            version: 1,
+            scope: ScopeId::AllProfiles,
+            signature: None,
+            rules: vec![PolicyRule {
+                r#match: RuleMatch {
+                    tool: "*".into(),
+                    chain: "*".into(),
+                },
+                criteria: vec![Box::new(RateLimitCriterion::new(
+                    Window::parse("1w").unwrap(),
+                    1,
+                ))],
+                decision: Decision::Allow,
+                allow_opaque_signing: false,
+            }],
+        },
+        "intent".into(),
+    ));
+    server.set_policy_engine_for_test(engine.clone());
+    let clock = stellar_agent_network::mainnet::clock::set_now_ms_for_test(1000);
+    let query_clock =
+        stellar_agent_core::policy::v1::criteria::state_store::set_query_time_for_test(1000);
+    let store = PersistedWindowStore::for_profile("intent");
+    let (plan, envelope) =
+        stellar_agent_network::signed_intent::test_helpers::intent_fixture_plan(1, 60);
+    let TransactionEnvelope::Tx(tx) = envelope else {
+        panic!("V1 fixture")
+    };
+    let OperationBody::InvokeHostFunction(op) = &tx.tx.operations[0].body else {
+        panic!("invoke fixture")
+    };
+    let plan = plan
+        .classify_purpose(&op.host_function, None)
+        .unwrap()
+        .with_envelope_max_ledger(100)
+        .unwrap();
+    let _exposure = store.admit_signed_intent(&profile, &plan).unwrap().expose();
+    store
+        .load_into("intent", &profile, engine.state_store())
+        .unwrap();
+    let count_key = StateKey::new("intent", 1, "rate_limit", 604_800);
+    assert_eq!(
+        engine.state_store().query_window(&count_key, 1000).unwrap(),
+        (1, 1)
+    );
+    let original = std::fs::read(store.path()).unwrap();
+
+    let denied = server
+        .call_stellar_pay(pay_args(SOURCE_G, "1"))
+        .await
+        .unwrap();
+    assert_eq!(
+        crate::common::assert_business_envelope(&denied).0,
+        "policy.deny.rate_limit_exceeded"
+    );
+    assert_eq!(
+        std::fs::read(store.path()).unwrap(),
+        original,
+        "override heights cannot close at stored equality"
+    );
+    assert_eq!(
+        store.signed_intents("intent", &profile).unwrap()[0].expiry_observed_at_ms,
+        None
+    );
+
+    stored_height.store(101, Ordering::SeqCst);
+    clock.set(2000);
+    query_clock.set(2000);
+    let denied = server
+        .call_stellar_pay(pay_args(SOURCE_G, "1"))
+        .await
+        .unwrap();
+    assert_eq!(
+        crate::common::assert_business_envelope(&denied).0,
+        "policy.deny.rate_limit_exceeded"
+    );
+    let closed = std::fs::read(store.path()).unwrap();
+    assert_ne!(closed, original);
+    assert_eq!(
+        store.signed_intents("intent", &profile).unwrap()[0].expiry_observed_at_ms,
+        Some(2000)
+    );
+    assert_eq!(
+        engine.state_store().query_window(&count_key, 2000).unwrap(),
+        (1, 1)
+    );
+    for endpoint in [&stored_primary, &stored_secondary] {
+        assert_eq!(endpoint.received_requests().await.unwrap().len(), 4);
+    }
+    assert!(
+        caller_secondary
+            .received_requests()
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    let retention =
+        stellar_agent_core::policy::v1::criteria::per_period_cap::MAX_SUPPORTED_WINDOW_SECS * 1000;
+    for now in [3000, 2000 + retention] {
+        clock.set(now);
+        query_clock.set(now);
+        let denied = server
+            .call_stellar_pay(pay_args(SOURCE_G, "1"))
+            .await
+            .unwrap();
+        assert_eq!(
+            crate::common::assert_business_envelope(&denied).0,
+            "policy.deny.rate_limit_exceeded"
+        );
+        assert_eq!(
+            engine.state_store().query_window(&count_key, now).unwrap(),
+            (1, 1)
+        );
+        assert_eq!(std::fs::read(store.path()).unwrap(), closed);
+    }
+    clock.set(2001 + retention);
+    query_clock.set(2001 + retention);
+    let allowed = server
+        .call_stellar_pay(pay_args(SOURCE_G, "1"))
+        .await
+        .unwrap();
+    assert_ne!(
+        allowed.is_error,
+        Some(true),
+        "{}",
+        call_result_text(&allowed)
+    );
+    assert_eq!(
+        engine
+            .state_store()
+            .query_window(&count_key, 2001 + retention)
+            .unwrap(),
+        (0, 0)
+    );
+    assert_eq!(std::fs::read(store.path()).unwrap(), closed);
+    for endpoint in [&stored_primary, &stored_secondary] {
+        assert_eq!(endpoint.received_requests().await.unwrap().len(), 4);
+    }
+    assert!(
+        caller_secondary
+            .received_requests()
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        loaded_primary
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .all(|request| {
+                let request: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                request["method"] != "getLatestLedger" && request["method"] != "sendTransaction"
+            })
+    );
+}
+
 /// Two dispatches of `stellar_pay` through the SAME server instance under a
 /// `per_period_cap` rule (cap 100 XLM, each payment 60 XLM): the first
 /// simulates, commits, and submits successfully, which records the confirmed
@@ -4719,9 +5061,32 @@ async fn the_gate_reconcile_client_is_the_only_other_client_a_v1_round_trip_buil
     install_test_nonce_key(232);
     let seed = [0x57_u8; 32];
     let endpoint = round_trip_endpoint(seed, crate::common::EndpointNetwork::testnet()).await;
-    let mut server =
-        WalletServer::new(testnet_profile_with_rpc(&endpoint.uri())).expect("WalletServer::new");
+    let stored_primary = MockServer::start().await;
+    let stored_secondary = MockServer::start().await;
+    let profile = testnet_profile_with_rpc(&endpoint.uri());
+    let mut server = WalletServer::new(profile.clone()).expect("WalletServer::new");
     let profile_name = server.profile_name_for_approval();
+    let profiles = stellar_agent_core::profile::loader::default_profile_dir().unwrap();
+    std::fs::create_dir_all(&profiles).unwrap();
+    std::fs::write(
+        profiles.join(format!("{profile_name}.toml")),
+        format!(
+            "chain_id = \"stellar:testnet\"\nrpc_url = {:?}\nsecondary_rpc_url = {:?}\n",
+            stored_primary.uri(),
+            stellar_agent_test_support::second_loopback_host(&stored_secondary.uri()),
+        ),
+    )
+    .unwrap();
+    let window =
+        stellar_agent_network::policy_state::PersistedWindowStore::for_profile(&profile_name);
+    window.record_and_persist(&profile, &[]).unwrap();
+    assert!(window.path().exists());
+    assert!(
+        window
+            .signed_intents(&profile_name, &profile)
+            .unwrap()
+            .is_empty()
+    );
     server.set_policy_engine_for_test(Arc::new(per_period_cap_engine(
         &["stellar_pay", "stellar_pay_commit"],
         &profile_name,
@@ -4751,6 +5116,20 @@ async fn the_gate_reconcile_client_is_the_only_other_client_a_v1_round_trip_buil
         commit_clients, 2,
         "the commit client and the gate's reconcile client"
     );
+    assert!(stored_primary.received_requests().await.unwrap().is_empty());
+    assert!(
+        stored_secondary
+            .received_requests()
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        window
+            .signed_intents(&profile_name, &profile)
+            .unwrap()
+            .is_empty()
+    );
 }
 
 /// The gate's reconcile client carries the primary credential too: a V1
@@ -4765,13 +5144,25 @@ async fn the_gate_reconcile_client_reads_the_primary_credential() {
     let entry = crate::common::rpc_credential_entry(ProviderRole::Primary);
     let reads = Arc::new(AtomicUsize::new(0));
     let counter = Arc::clone(&reads);
-    keyring_mock::install_with_read_hooks(vec![keyring_mock::ReadHook::new(
-        &entry.service,
-        &entry.account,
-        Arc::new(move || {
-            counter.fetch_add(1, Ordering::SeqCst);
-        }),
-    )])
+    let secondary_entry = crate::common::rpc_credential_entry(ProviderRole::Secondary);
+    let secondary_reads = Arc::new(AtomicUsize::new(0));
+    let secondary_counter = Arc::clone(&secondary_reads);
+    keyring_mock::install_with_read_hooks(vec![
+        keyring_mock::ReadHook::new(
+            &entry.service,
+            &entry.account,
+            Arc::new(move || {
+                counter.fetch_add(1, Ordering::SeqCst);
+            }),
+        ),
+        keyring_mock::ReadHook::new(
+            &secondary_entry.service,
+            &secondary_entry.account,
+            Arc::new(move || {
+                secondary_counter.fetch_add(1, Ordering::SeqCst);
+            }),
+        ),
+    ])
     .expect("hooked mock keyring store init");
     install_test_nonce_key(236);
     let seed = [0x5b_u8; 32];
@@ -4779,7 +5170,7 @@ async fn the_gate_reconcile_client_reads_the_primary_credential() {
     crate::common::require_rpc_credential(&endpoint).await;
     let mut profile = testnet_profile_with_rpc(&endpoint.uri());
     crate::common::bind_rpc_credential(&mut profile, ProviderRole::Primary, true);
-    let mut server = WalletServer::new(profile).expect("WalletServer::new");
+    let mut server = WalletServer::new(profile.clone()).expect("WalletServer::new");
     let profile_name = server.profile_name_for_approval();
     server.set_policy_engine_for_test(Arc::new(per_period_cap_engine(
         &["stellar_pay", "stellar_pay_commit"],
@@ -4804,6 +5195,101 @@ async fn the_gate_reconcile_client_reads_the_primary_credential() {
     );
     let trace = crate::common::credential_trace(&endpoint).await;
     assert!(trace.iter().all(|(_, keyed)| *keyed), "{trace:?}");
+    let stored_primary = MockServer::start().await;
+    let stored_secondary = MockServer::start().await;
+    let caller_secondary = MockServer::start().await;
+    for witness in [&stored_primary, &stored_secondary] {
+        crate::common::require_rpc_credential(witness).await;
+        Mock::given(method("POST")).respond_with(|request: &Request| {
+            let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            let result = match body["method"].as_str().unwrap() {
+                "getNetwork" => stellar_agent_test_support::signed_envelope::get_network_result(
+                    stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE),
+                "getLatestLedger" => serde_json::json!({"id":"ab".repeat(32),"sequence":101,"protocolVersion":27}),
+                other => panic!("only stored witness reads are expected: {other}"),
+            };
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({"jsonrpc":"2.0","id":body["id"],"result":result}))
+        }).mount(witness).await;
+    }
+    profile.secondary_rpc_url = Some(caller_secondary.uri());
+    crate::common::bind_rpc_credential(&mut profile, ProviderRole::Secondary, true);
+    let profiles = stellar_agent_core::profile::loader::default_profile_dir().unwrap();
+    std::fs::create_dir_all(&profiles).unwrap();
+    std::fs::write(
+        profiles.join(format!("{profile_name}.toml")),
+        format!(
+            "chain_id = \"stellar:testnet\"\nrpc_url = {:?}\nsecondary_rpc_url = {:?}\n",
+            stored_primary.uri(),
+            stellar_agent_test_support::second_loopback_host(&stored_secondary.uri()),
+        ),
+    )
+    .unwrap();
+    let mut server = WalletServer::new(profile.clone()).unwrap();
+    server.set_policy_engine_for_test(Arc::new(per_period_cap_engine(
+        &["stellar_pay", "stellar_pay_commit"],
+        &profile_name,
+        10_000_000_000,
+        "1d",
+    )));
+    let clock = stellar_agent_network::mainnet::clock::set_now_ms_for_test(1000);
+    let query_clock =
+        stellar_agent_core::policy::v1::criteria::state_store::set_query_time_for_test(1000);
+    let (plan, envelope) =
+        stellar_agent_network::signed_intent::test_helpers::intent_fixture_plan(99, 1);
+    let stellar_xdr::TransactionEnvelope::Tx(tx) = envelope else {
+        panic!("V1")
+    };
+    let stellar_xdr::OperationBody::InvokeHostFunction(op) = &tx.tx.operations[0].body else {
+        panic!("invoke")
+    };
+    let plan = plan
+        .classify_purpose(&op.host_function, None)
+        .unwrap()
+        .with_envelope_max_ledger(100)
+        .unwrap();
+    let window =
+        stellar_agent_network::policy_state::PersistedWindowStore::for_profile(&profile_name);
+    let _exposure = window
+        .admit_signed_intent(&profile, &plan)
+        .unwrap()
+        .expose();
+    clock.set(2000);
+    query_clock.set(2000);
+    let primary_before = reads.load(Ordering::SeqCst);
+    let secondary_before = secondary_reads.load(Ordering::SeqCst);
+    let (sim, clients) = crate::common::clients_built_by(
+        server.call_stellar_pay(pay_args(&gstrkey_for_seed(seed), "1000000000")),
+    )
+    .await;
+    let sim = sim.unwrap();
+    assert_ne!(sim.is_error, Some(true), "{}", call_result_text(&sim));
+    assert_eq!(
+        clients, 4,
+        "the command, reconcile, and two stored witnesses"
+    );
+    assert_eq!(reads.load(Ordering::SeqCst) - primary_before, 3);
+    assert_eq!(secondary_reads.load(Ordering::SeqCst) - secondary_before, 1);
+    assert_eq!(
+        window.signed_intents(&profile_name, &profile).unwrap()[0].expiry_observed_at_ms,
+        Some(2000)
+    );
+    for witness in [&stored_primary, &stored_secondary] {
+        let trace = crate::common::credential_trace(witness).await;
+        assert_eq!(
+            trace,
+            vec![
+                ("getNetwork".into(), true),
+                ("getLatestLedger".into(), true)
+            ]
+        );
+    }
+    assert!(
+        caller_secondary
+            .received_requests()
+            .await
+            .unwrap()
+            .is_empty()
+    );
 }
 
 /// Runs `commit` against `endpoint` twice. While the endpoint reports testnet,

@@ -5221,6 +5221,14 @@ mod tests {
         let id = proof.intent_id.clone().unwrap();
         let second = second_path(&l);
         let facts = crate::BindFacts {
+            host: stellar_xdr::HostFunction::InvokeContract(stellar_xdr::InvokeContractArgs {
+                contract_address: stellar_xdr::ScAddress::Contract(stellar_xdr::ContractId(
+                    stellar_xdr::Hash([1; 32]),
+                )),
+                function_name: stellar_xdr::ScSymbol::try_from("call").unwrap(),
+                args: Default::default(),
+            }),
+            subjects: Vec::new(),
             facts: plan.facts.clone(),
             envelope_hash: "ab".repeat(32),
             tx_hash: "cd".repeat(32),
@@ -5239,6 +5247,23 @@ mod tests {
         ));
         assert!(matches!(
             second.bind_signed_intent(&l.profile, &id, &facts, plan.legs()),
+            Err(WindowStoreError::WriterLocked)
+        ));
+        let instant = tokio::time::Instant::now();
+        let capability = crate::signing::ledger_witness::LedgerWitnessCapability::for_test(
+            crate::policy_state::ChainScope::for_chain(l.profile.chain_id),
+            [
+                "https://primary.example/rpc",
+                "https://secondary.example/rpc",
+            ],
+            [1001, 1001],
+            [instant, instant],
+            [T0, T0],
+            instant + std::time::Duration::from_secs(10),
+        )
+        .unwrap();
+        assert!(matches!(
+            second.observe_signed_intents(&l.profile, &capability),
             Err(WindowStoreError::WriterLocked)
         ));
         assert_eq!(commitment(&l), committed);
@@ -5342,10 +5367,31 @@ mod tests {
             plan.clone(),
         )));
         let facts = crate::BindFacts {
+            host: stellar_xdr::HostFunction::InvokeContract(stellar_xdr::InvokeContractArgs {
+                contract_address: stellar_xdr::ScAddress::Contract(stellar_xdr::ContractId(
+                    stellar_xdr::Hash([1; 32]),
+                )),
+                function_name: stellar_xdr::ScSymbol::try_from("call").unwrap(),
+                args: Default::default(),
+            }),
+            subjects: Vec::new(),
             facts: plan.facts.clone(),
             envelope_hash: "ab".repeat(32),
             tx_hash: "cd".repeat(32),
         };
+        let instant = tokio::time::Instant::now();
+        let capability = crate::signing::ledger_witness::LedgerWitnessCapability::for_test(
+            crate::policy_state::ChainScope::for_chain(profile.chain_id),
+            [
+                "https://primary.example/rpc",
+                "https://secondary.example/rpc",
+            ],
+            [1001, 1001],
+            [instant, instant],
+            [T0, T0],
+            instant + std::time::Duration::from_secs(10),
+        )
+        .unwrap();
         let transitions: Vec<Transition<'_>> = vec![
             (
                 "acknowledge_accounting_expiry",
@@ -5362,6 +5408,10 @@ mod tests {
                         &mut record.receipt_projected
                     })
                 }),
+            ),
+            (
+                "observe_signed_intents",
+                Box::new(|| second.observe_signed_intents(profile, &capability)),
             ),
             (
                 "admit_signed_intent",

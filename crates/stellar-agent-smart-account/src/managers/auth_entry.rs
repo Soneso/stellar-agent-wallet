@@ -2296,7 +2296,9 @@ mod tests {
     /// `complete_authorization_entry_multi_signer` refuses immediately when the
     /// `signers` slice is empty, without touching the partial entry.
     #[tokio::test]
+    #[serial_test::serial]
     async fn multi_signer_complete_empty_signers_guard() {
+        stellar_agent_test_support::keyring_mock::install().unwrap();
         let (simulation, envelope) = contexts();
         let partial = build_authorization_entry(
             contract_address(2),
@@ -2345,7 +2347,9 @@ mod tests {
     /// map contains two entries sorted by pubkey, each with a valid 64-byte
     /// signature that cryptographically verifies against the same auth_digest.
     #[tokio::test]
+    #[serial_test::serial]
     async fn multi_signer_complete_two_signers_assembles_correct_auth_payload() {
+        stellar_agent_test_support::keyring_mock::install().unwrap();
         use ed25519_dalek::{Signature, Verifier, VerifyingKey};
         use stellar_agent_network::SoftwareSigningKey;
 
@@ -2481,7 +2485,9 @@ mod tests {
     /// against the signer's public key applied to the Soroban preimage of the
     /// entry's own nonce / expiration.
     #[tokio::test]
+    #[serial_test::serial]
     async fn delegated_g_key_entry_shape_and_signature_verify() {
+        stellar_agent_test_support::keyring_mock::install().unwrap();
         use ed25519_dalek::{Signature, Verifier, VerifyingKey};
         use sha2::{Digest as _, Sha256};
         use stellar_agent_network::SoftwareSigningKey;
@@ -2716,7 +2722,9 @@ mod tests {
     /// pubkey when applied to the auth-digest (cryptographic closure:
     /// signature ↔ auth_digest ↔ context_rule_ids binding).
     #[tokio::test]
+    #[serial_test::serial]
     async fn complete_authorization_entry_signs_and_assembles_authpayload() {
+        stellar_agent_test_support::keyring_mock::install().unwrap();
         use ed25519_dalek::{Signature, Verifier, VerifyingKey};
         use stellar_agent_network::SoftwareSigningKey;
 
@@ -2986,7 +2994,9 @@ mod tests {
     /// smart-account entry, no G-key), and a mixed set yields one smart-account
     /// entry plus exactly one G-key entry per Delegated signer.
     #[tokio::test]
+    #[serial_test::serial]
     async fn collect_mixed_signer_entries_gkey_only_for_delegated() {
+        stellar_agent_test_support::keyring_mock::install().unwrap();
         use stellar_agent_network::SoftwareSigningKey;
 
         let (simulation, envelope) = contexts();
@@ -3457,7 +3467,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn complete_authorization_entry_refuses_a_different_checked_rule() {
+        stellar_agent_test_support::keyring_mock::install().unwrap();
         let partial = partial_on(TESTNET_PASSPHRASE);
         let mut other = partial.clone();
         other.context_rule_ids = vec![ContextRuleId::new(999)];
@@ -3484,7 +3496,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn multi_signer_completion_refuses_a_different_checked_account() {
+        stellar_agent_test_support::keyring_mock::install().unwrap();
         let partial = partial_on(TESTNET_PASSPHRASE);
         let mut other = partial.clone();
         other.smart_account = contract_address(0x99);
@@ -3511,7 +3525,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn ed25519_rule_signing_refuses_a_different_checked_network() {
+        stellar_agent_test_support::keyring_mock::install().unwrap();
         let (simulation, envelope) = contexts();
         let checked = crate::submit::checked_context_for_test(
             &contract_address(7),
@@ -3547,7 +3563,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn complete_authorization_entry_signs_a_testnet_partial() {
+        stellar_agent_test_support::keyring_mock::install().unwrap();
         let signer = CountingSigner::new([0x41; 32]);
 
         complete_authorization_entry(
@@ -3572,7 +3590,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn complete_authorization_entry_refuses_a_mainnet_partial_before_any_key_access() {
+        stellar_agent_test_support::keyring_mock::install().unwrap();
         let signer = CountingSigner::new([0x41; 32]);
 
         let err = complete_authorization_entry(
@@ -3590,7 +3610,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn complete_authorization_entry_refuses_a_tampered_digest_before_any_key_access() {
+        stellar_agent_test_support::keyring_mock::install().unwrap();
         let signer = CountingSigner::new([0x41; 32]);
 
         let err = complete_authorization_entry(
@@ -3616,7 +3638,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn complete_authorization_entry_multi_signer_signs_a_testnet_partial() {
+        stellar_agent_test_support::keyring_mock::install().unwrap();
         let a = CountingSigner::new([0x42; 32]);
         let b = CountingSigner::new([0x43; 32]);
 
@@ -3648,8 +3672,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn complete_authorization_entry_multi_signer_refuses_a_mainnet_partial_before_any_key_access()
      {
+        stellar_agent_test_support::keyring_mock::install().unwrap();
         let a = CountingSigner::new([0x42; 32]);
         let b = CountingSigner::new([0x43; 32]);
 
@@ -3667,8 +3693,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn complete_authorization_entry_multi_signer_refuses_a_tampered_digest_before_any_key_access()
      {
+        stellar_agent_test_support::keyring_mock::install().unwrap();
         let a = CountingSigner::new([0x42; 32]);
         let b = CountingSigner::new([0x43; 32]);
 
@@ -3694,7 +3722,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn collect_mixed_signer_entries_signs_a_testnet_partial_with_the_testnet_passphrase() {
+        stellar_agent_test_support::keyring_mock::install().unwrap();
         let signer = CountingSigner::new([0x44; 32]);
 
         let entries = collect_mixed_signer_entries(
@@ -3722,7 +3752,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn collect_mixed_signer_entries_refuses_the_mainnet_passphrase_before_any_key_access() {
+        stellar_agent_test_support::keyring_mock::install().unwrap();
         let signer = CountingSigner::new([0x44; 32]);
 
         let err = collect_mixed_signer_entries(
@@ -3741,7 +3773,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn collect_mixed_signer_entries_refuses_a_mainnet_partial_before_any_key_access() {
+        stellar_agent_test_support::keyring_mock::install().unwrap();
         let signer = CountingSigner::new([0x44; 32]);
 
         let err = collect_mixed_signer_entries(
@@ -3760,7 +3794,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn collect_mixed_signer_entries_refuses_a_tampered_digest_before_any_key_access() {
+        stellar_agent_test_support::keyring_mock::install().unwrap();
         let signer = CountingSigner::new([0x44; 32]);
 
         let err = collect_mixed_signer_entries(
@@ -3787,8 +3823,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn collect_mixed_signer_entries_refuses_a_passphrase_of_another_network_before_any_key_access()
      {
+        stellar_agent_test_support::keyring_mock::install().unwrap();
         let signer = CountingSigner::new([0x44; 32]);
 
         let err = collect_mixed_signer_entries(
@@ -3818,7 +3856,9 @@ mod tests {
     /// The rule signer reaches the collector's mainnet refusal before any key
     /// access; the function has no check of its own.
     #[tokio::test]
+    #[serial_test::serial]
     async fn sign_with_ed25519_rule_refuses_the_mainnet_passphrase_before_any_key_access() {
+        stellar_agent_test_support::keyring_mock::install().unwrap();
         let (simulation, envelope) = contexts();
         let signer = CountingSigner::new([0x45; 32]);
 
@@ -3847,7 +3887,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn build_and_sign_delegated_g_key_entry_signs_on_testnet() {
+        stellar_agent_test_support::keyring_mock::install().unwrap();
         let signer = CountingSigner::new([0x46; 32]);
         let partial = partial_on(TESTNET_PASSPHRASE);
 
@@ -3876,8 +3918,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn build_and_sign_delegated_g_key_entry_refuses_the_mainnet_passphrase_before_any_key_access()
      {
+        stellar_agent_test_support::keyring_mock::install().unwrap();
         let signer = CountingSigner::new([0x46; 32]);
         let partial = partial_on(TESTNET_PASSPHRASE);
 
@@ -3898,7 +3942,10 @@ mod tests {
         assert_eq!(signer.key_accesses(), 0);
     }
     #[tokio::test]
+    #[serial_test::serial]
     async fn the_gate_refuses_what_the_plan_does_not_name() {
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        admission_fixture::assert_envelope_bounds_refuse_before_signing().await;
         let partial = partial_on(TESTNET_PASSPHRASE);
         let seed = [0x51; 32];
         let key = ed25519_dalek::SigningKey::from_bytes(&seed)
