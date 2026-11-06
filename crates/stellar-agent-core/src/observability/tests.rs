@@ -2328,6 +2328,14 @@ fn resolved_filter_keeps_raw_transport_logging_off() {
     }
 }
 
+#[test]
+fn strict_harness_raw_transport_prefix_matches_wallet() {
+    assert_eq!(
+        RAW_TRANSPORT_LOG_TARGET,
+        stellar_agent_test_support::RAW_TRANSPORT_LOG_TARGET
+    );
+}
+
 /// A byte sink shared between a subscriber and the test that reads it.
 #[derive(Clone, Default)]
 struct SharedLog(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
