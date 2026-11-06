@@ -752,10 +752,11 @@ read, and no nonce, pin, policy change, or audit row is written. A profile
 that sets `oracle_provider_url` without its `providers.oracle` record does not
 load, and the ceremony refuses it with `profile.enable_mainnet_precondition`
 and the loader's message.
-An enabled profile whose oracle is removed refuses every mainnet write, in the
-CLI and in the MCP server, with `profile.mainnet_oracle_required` before any
-signature, until the oracle is set again. The MCP server reads the profile at
-startup, so it applies an oracle change from its next start. Before the first nonce is written, a signed v2 policy
+An enabled profile whose oracle is removed refuses every CLI mainnet write
+with `profile.mainnet_oracle_required` before any signature, until the oracle
+is set again. A running MCP server checks the profile it loaded at startup,
+and its freshness check does not read the oracle fields. It refuses mainnet
+writes for a removed oracle from its next start. Before the first nonce is written, a signed v2 policy
 establishes the pin with its verified sequence, digest, and owner.
 Create and sign that policy before running the ceremony; it may omit `[mainnet]`.
 A v1 policy refuses with `profile.enable_mainnet_precondition` and

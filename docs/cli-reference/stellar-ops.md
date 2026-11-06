@@ -625,8 +625,11 @@ settles them.
 
 ### `stellar-agent tx status <HASH> [flags]`
 
-Asks the endpoint what became of `<HASH>` and settles the wallet's record of it.
-This is the way out of `submission.tx_timeout`.
+Asks the endpoint what became of `<HASH>` and records the answer on the
+receipt as a report. A reported success writes no submitted row, and a
+reported failure or missing transaction releases nothing. The reservation ends
+at its accounting horizon, which owes one `submission_accounting_expired` audit
+event. This is the way out of `submission.tx_timeout`.
 
 | Flag / arg | Meaning | Required | Default |
 |---|---|---|---|

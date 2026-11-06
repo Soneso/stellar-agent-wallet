@@ -571,9 +571,11 @@ An MCP payment needs both payment rules: `stellar_pay` builds and simulates it,
 `stellar_pay_commit` signs and submits it, and each phase matches rules under
 its own tool name.
 Other gated actions wait for operator approval in MCP tools with an approval
-workflow and the CLI `stellar-agent mpp charge authorize` flow. Other CLI signing
-commands refuse `RequireApproval` with `policy.approval_required`; MCP signing
-tools without an approval flow refuse with `policy.approval_required_unsupported`.
+workflow and the CLI `stellar-agent mpp charge authorize` flow. On mainnet, full-mode `pay`, `claim`,
+sponsored `accounts create`, and `trustline` ask for passkey confirmation in
+the local browser for `RequireApproval`. Other CLI signing commands refuse
+`RequireApproval` with `policy.approval_required`; MCP signing tools without
+an approval flow refuse with `policy.approval_required_unsupported`.
 Review the rules before signing. See [policy rules](concepts.md#the-policy-engine)
 for additional restrictions.
 
