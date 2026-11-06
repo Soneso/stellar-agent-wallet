@@ -158,7 +158,7 @@ async fn pubkey_mismatch_returns_signer_key_mismatch() {
     assert_eq!(err.category(), ErrorCategory::Auth);
     assert_eq!(err.code(), "auth.signer_key_mismatch");
     // Verify the error surfaces the expected and got keys (both non-secret).
-    if let WalletError::Auth(AuthError::SignerKeyMismatch { expected, got }) = &err {
+    if let WalletError::Auth(AuthError::SignerKeyMismatch { expected, got, .. }) = &err {
         assert_eq!(expected, wrong_g);
         assert_eq!(*got, gstrkey_for_seed(seed));
     } else {

@@ -74,6 +74,8 @@ jobs:
       - name: Check workflows
         run: actionlint
       - name: Self-test the preflight
-        run: bash .github/scripts/test-preflight.sh
+        run: |
+          bash .github/scripts/test-preflight.sh
+          bash .github/scripts/test-preflight.sh --mutations
       - name: Shellcheck the preflight
         run: shellcheck -s bash .github/scripts/preflight.sh .github/scripts/test-preflight.sh

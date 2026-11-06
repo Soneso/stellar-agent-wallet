@@ -1768,6 +1768,7 @@ mod tests {
         assert!(matches!(submit_failure_stage(true), S::PreSendRefused));
         let unavailable =
             WalletError::Auth(stellar_agent_core::error::AuthError::SignerKeyMismatch {
+                what: "the expected signing account",
                 expected: "expected".to_owned(),
                 got: "missing".to_owned(),
             });

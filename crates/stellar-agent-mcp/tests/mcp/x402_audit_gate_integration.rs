@@ -681,7 +681,7 @@ async fn signer_load_auth_error(tool: Tool, profile_name: &str, seed: u8, fault:
             (
                 "auth.signer_key_mismatch",
                 format!(
-                    "signing key public key '{}' does not match --source '{account}'",
+                    "signing key public key '{}' does not match the expected signing account '{account}'",
                     gstrkey_for_seed(OTHER_SEED)
                 ),
             )

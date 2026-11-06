@@ -410,7 +410,9 @@ async fn ledger_signer(
     if let Some(factory) = LEDGER_SIGNER_FACTORY.with(|slot| slot.borrow().clone()) {
         return factory(account_index, source);
     }
-    Ok(Box::new(signer_from_ledger(account_index, source).await?))
+    Ok(Box::new(
+        signer_from_ledger(account_index, source, "the expected signing account").await?,
+    ))
 }
 
 /// The lazy keyring handle of the enrolled agent seed, recording whether a

@@ -782,6 +782,7 @@ mod tests {
     #[test]
     fn another_code_keeps_its_message() {
         let err = WalletError::Auth(AuthError::SignerKeyMismatch {
+            what: "the expected signing account",
             expected: "GAQAA5L65LSYH7CQ3VTJ7F3HHLGCL3DSLAR2Y47263D56MNNGHSQSTVY".to_owned(),
             got: "GBPXXOA5N4JYPESHAADMQKBPWZWQDQ64ZV6ZL2S3LAGW4SY7NTCMWIVL".to_owned(),
         });

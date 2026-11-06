@@ -128,10 +128,10 @@ Flags:
 - `--accept-mutable-verifier`: proceed even if a referenced verifier or policy contract is mutable. It has an admin/owner key, or its executable is an owner-managed external reference (reason `owner-managed external reference`). The envelope reports `mutable_override: true`. For an external reference the pin records the owner, the tag, and the full 32-byte resolved code hash. The envelope lists them in `pinned_verifier_executable_refs` / `pinned_policy_executable_refs`, and the pinned hashes in `pinned_verifier_wasm_hashes` / `pinned_policy_wasm_hashes` as 64 lowercase hex characters. When the resolved hash, reference identity, or executable kind differs from the pin, the [pinned-hash drift check](#pinned-hash-drift-check) refuses signing under the rule with `sa.verifier_hash_drift` / `sa.policy_hash_drift`. It refuses in `execute`, `multicall`, the rule and signer write verbs, and `migrate-verifier` for the rule's policies. A rule whose record holds policy pins while the rule has no policy on chain refuses with `sa.pinned_policy_absent`. A rule holding an `External` signer while its record pins no verifier refuses with `sa.pinned_verifier_absent`, and a check that cannot run refuses with `sa.pin_check_unavailable`. `--accept-unknown-verifier` is also required when the resolved hash is not in the allowlist. The wallet refuses an external reference with no live tag entry, an undecodable instance, or an instance returned under an unrequested key. It also refuses a contract with no Wasm code (no instance at the address, or a built-in executable such as the Stellar Asset Contract), a non-Wasm executable, or an executable that changes during install. These cases return `sa.contract_instance_unsupported`. The reason is `external reference with no live tag entry`, `undecodable instance`, `no Wasm code`, `non-Wasm executable`, or `executable changed during install`. Neither override flag admits them, because the wallet cannot pin their code.
 - `--accept-unknown-verifier`: proceed even if a referenced verifier or policy WASM hash (for an external reference, the hash its tag resolves to) is not in the allowlist. The envelope reports `unknown_override: true`.
 - `--auth-rule-id <U32>`: authorizing rule id(s). Repeatable. Default `[0]` (the bootstrap rule installed at deploy time).
-- `--valid-until <LEDGER>`: expiry ledger sequence, or `none` for a permanent rule. Default `none`.
+- `--valid-until <LEDGER>`: expiry ledger sequence, or `none` for a permanent rule. Default `none`. A value is refused as `validation.valid_until_invalid` unless it is `none` in any ASCII letter case or a decimal integer from `0` through `4294967295`, with an optional leading `+`. After simulation and before signing, an expiry more ledgers ahead than the profile's [`session_rule_max_horizon_ledgers`](../profiles.md#cross-check-mcp-and-scan-bounds) is refused as `validation.session_rule_horizon_exceeded`.
 - Shared: `--profile`, signer-source group, `--network`, `--rpc-url`, `--secondary-rpc-url`, `--timeout-seconds`, `--output`.
 
-At least one `--signer-delegated`, `--signer-webauthn`, or `--signer-ed25519` is required.
+At least one `--signer-delegated`, `--signer-webauthn`, or `--signer-ed25519` is required. More than 15 signers are refused as `validation.context_rule_caps_exceeded`.
 
 Before submission each referenced verifier and policy contract is identified and probed. A refusal from that step (`sa.verifier_wasm_not_in_allowlist`, `sa.verifier_wasm_revoked`, `sa.verifier_wasm_retired`, `sa.policy_wasm_not_in_allowlist`, `sa.verifier_mutable`, `sa.policy_mutable`, `sa.contract_instance_unsupported` or `network.rpc_divergence`) carries no `rule_id` and its message names no rule, because the rule has no on-chain id yet. No flag overrides `sa.verifier_wasm_revoked` or `sa.verifier_wasm_retired`. When `--accept-mutable-verifier` or `--accept-unknown-verifier` admits a contract, the audit log records `SaMutableContractOverride` or `SaUnknownContractOverride` after the install confirms, carrying the new rule's id, before the `SaContextRuleCreatedV2` row. A refused install writes no override row.
 
@@ -199,7 +199,13 @@ Flags:
 - `--account <C_STRKEY>` (required).
 - `--rule-id <U32>` (required): rule to update.
 - `--valid-until <LEDGER|none>` (required): a ledger sequence sets explicit
-  expiry; `none` clears it (permanent rule).
+  expiry; `none` clears it (permanent rule). A value is refused as
+  `validation.valid_until_invalid` unless it is `none` in any ASCII letter
+  case or a decimal integer from `0` through `4294967295`, with an optional
+  leading `+`. After simulation and before signing, an
+  expiry more ledgers ahead than the profile's
+  [`session_rule_max_horizon_ledgers`](../profiles.md#cross-check-mcp-and-scan-bounds)
+  is refused as `validation.session_rule_horizon_exceeded`.
 - `--auth-rule-id <U32>` (optional): defaults to `--rule-id`. The authorizing rule passes the [pre-submission checks](#pre-submission-checks), its signer-set baseline included.
 - Shared: `--profile`, signer-source group, `--network`, `--rpc-url`, `--secondary-rpc-url`, `--timeout-seconds`, `--output`.
 
@@ -258,7 +264,7 @@ stellar-agent smart-account rules verify-pins \
 
 ### `smart-account rules add-policy`
 
-Adds a policy contract to a rule (OZ `add_policy`). The per-rule policy cap (5) is checked before simulation via a `get_context_rule` pre-fetch. Signs and submits. Testnet only. Returns the assigned `policy_id`.
+Adds a policy contract to a rule (OZ `add_policy`). The per-rule policy cap (5) is checked before simulation via a `get_context_rule` pre-fetch; a sixth policy is refused as `validation.context_rule_caps_exceeded`. Signs and submits. Testnet only. Returns the assigned `policy_id`.
 
 `--kind <raw|spending-limit|simple-threshold|weighted-threshold>` (default `raw`) selects the install-parameter mode:
 
@@ -272,7 +278,7 @@ Flags:
 - `--account <C_STRKEY>` (required).
 - `--rule-id <U32>` (required): rule to add the policy to.
 - `--policy-address <C_STRKEY>`: policy contract address. Required with `--kind raw`; rejected with the other kinds.
-- `--install-param <SCVAL_BASE64>`: a standard-base64 XDR `ScVal` install parameter (not base64url), passed to `add_policy` as given (raw passthrough). One exception: when the policy is recognized as the allowlisted simple-threshold policy, the parameter must be exactly `{ threshold: U32(t) }` with `t >= 1`, or the add refuses with `sa.simple_threshold_install_refused`. Required with `--kind raw`; rejected with the other kinds.
+- `--install-param <SCVAL_BASE64>`: a standard-base64 XDR `ScVal` install parameter (not base64url), passed to `add_policy` as given (raw passthrough). One exception: when the policy is recognized as the allowlisted simple-threshold policy, the parameter must be exactly `{ threshold: U32(t) }` with `t >= 1`, or the add refuses with `sa.simple_threshold_install_refused`. Required with `--kind raw`; rejected with the other kinds. An `--install-param` value that fails standard base64 XDR `ScVal` decoding within depth 500 and 10 MiB is refused as `validation.xdr_argument_malformed`, naming `--install-param`.
 - `--limit <STROOPS>`: spending limit in stroops (`--kind spending-limit`, required). The `i128` amount the rolling window admits before the policy panics `SpendingLimitExceeded`.
 - `--period <LEDGERS>`: rolling-window length in ledgers (`--kind spending-limit`, required).
 - `--policy <C_STRKEY>`: spending-limit policy contract override (`--kind spending-limit`). When omitted, resolves from the registry populated by `smart-account deploy-spending-limit-policy`; fails closed with a deploy-first hint if absent.
@@ -491,7 +497,7 @@ stellar-agent smart-account signers refresh \
 
 ### `smart-account signers add`
 
-Adds one signer to a rule (OZ `add_signer`). Signs and submits. Testnet only. The per-rule signer cap (15) is checked before submission via a `get_rule` pre-fetch. Returns the `new_signer_id`.
+Adds one signer to a rule (OZ `add_signer`). Signs and submits. Testnet only. The per-rule signer cap (15) is checked before submission via a `get_rule` pre-fetch; a sixteenth signer is refused as `validation.context_rule_caps_exceeded`. Returns the `new_signer_id`.
 
 Exactly one of the following signer-source forms is required (mutually exclusive group):
 
@@ -652,7 +658,7 @@ Flags:
 - `--account <C_STRKEY>` (required): the smart account whose rule authorizes the call (`auth_address`).
 - `--contract <C_STRKEY>` (required): the external target contract (`target_contract`). For most delegated calls this differs from `--account`.
 - `--function <NAME>` (required): the contract function to invoke.
-- `--arg <SCVAL_BASE64>`: one standard-base64 XDR `ScVal` argument, in call order. Repeatable. Decoded client-side only to validate well-formedness (bounded XDR decode): never re-encoded; a malformed value is refused with the failing argument's index named.
+- `--arg <SCVAL_BASE64>`: one standard-base64 XDR `ScVal` argument, in call order. Repeatable. The arguments undergo a bounded XDR decode (depth 500, length bounded by the argument's own encoded length) and are canonically re-encoded for submission. A value that fails decoding is refused as `validation.xdr_argument_malformed`, naming its argument index, starting at 0.
 - `--auth-rule-id <U32>` (required): authorizing rule id(s). Repeatable, with no default. The delegation call names a specific scoped rule. A default bootstrap rule (`[0]`) could authorize against the wrong rule or produce an on-chain refusal that hides the caller's mistake.
 - `--rule-signer-ed25519-secret-env <VAR>` (required): environment variable holding the rule signer's S-strkey seed.
 - `--expect-rule-signer <64_HEX>`: fail closed, before any signing, if the seed-derived public key differs from this value. Surfaces a misconfigured environment variable before any signing.
@@ -705,7 +711,7 @@ Flags:
 
 - `--smart-account <C_STRKEY>` (required): the smart-account executing the bundle.
 - `--rule-id <U32>` (required): the context rule authorizing the bundle.
-- `--invocation <TARGET:FN:JSON_ARGS>` (required, repeatable, 1 to 50): one invocation descriptor.
+- `--invocation <TARGET:FN:JSON_ARGS>` (required, repeatable, 1 to 50): one invocation descriptor. More than 50 values are refused as `validation.bundle_too_large`.
 - `--secondary-rpc-url <URL>`: secondary RPC for cross-verification and the ledger witness. Resolved from the flag, else the profile's `secondary_rpc_url`, else `smart_account.ledger_witness_unavailable`. Ledger observations may differ by at most two in either order. Signature expiry is 100 ledgers beyond the lower observation.
 - `--fee <STROOPS>`: per-op base fee in stroops (default 100). Unlike the deploy verb, `auto[:pNN]` is rejected here.
 - Signer-source flags are required (one of `--signer-secret-env` or `--sign-with-ledger`); `--account-index <INDEX>` defaults to `0`.

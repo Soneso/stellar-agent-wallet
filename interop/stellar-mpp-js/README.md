@@ -31,6 +31,8 @@ accept the pins as peers of `@stellar/mpp` 0.7.1 only:
 `"@stellar/mpp@0.7.1>@stellar/stellar-sdk": "16.4.1"` and
 `"@stellar/mpp@0.7.1>mppx": "0.8.19"`. pnpm reports any other pairing as an
 unmet peer.
+The setting `strict-peer-dependencies=true` in `.npmrc` makes `pnpm install`
+fail on an unmet peer.
 
 With `mppx@0.8.19` the released server emits the fixture's challenge,
 credential, and receipt bytes. It answers a credential that fails its
