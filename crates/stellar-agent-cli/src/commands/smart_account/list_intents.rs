@@ -154,7 +154,7 @@ mod tests {
         let store = PersistedWindowStore::for_profile("intent");
         stellar_agent_network::signed_intent::test_helpers::seed_two_intents(&profile, &store)
             .unwrap();
-        let before = std::fs::read(store.path()).unwrap();
+        let before = stellar_agent_test_support::file_sha256(store.path());
         let key = &profile.policy_window_state_key_id;
         let generation = keyring_core::Entry::new(
             &key.service,
@@ -191,16 +191,23 @@ mod tests {
                 .iter()
                 .all(|i| i.accounting_horizon == "open" && i.legs.len() == 2)
         );
-        assert_eq!(std::fs::read(store.path()).unwrap(), before);
+        assert_eq!(
+            stellar_agent_test_support::file_sha256(store.path()),
+            before
+        );
         assert_eq!(generation.get_password().unwrap(), generation_before);
-        let mut corrupt = before;
+        let mut corrupt = std::fs::read(store.path()).unwrap();
         corrupt[0] ^= 1;
         std::fs::write(store.path(), &corrupt).unwrap();
+        let corrupt_digest = stellar_agent_test_support::file_sha256(store.path());
         assert_eq!(
             read_intents("intent", &profile).unwrap_err().code(),
             "submission.record_unavailable"
         );
-        assert_eq!(std::fs::read(store.path()).unwrap(), corrupt);
+        assert_eq!(
+            stellar_agent_test_support::file_sha256(store.path()),
+            corrupt_digest
+        );
         assert_eq!(generation.get_password().unwrap(), generation_before);
     }
     #[tokio::test(flavor = "current_thread")]

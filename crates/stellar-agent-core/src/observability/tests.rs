@@ -2328,6 +2328,7 @@ fn resolved_filter_keeps_raw_transport_logging_off() {
     }
 }
 
+/// The strict harness drops the raw transport prefix the wallet's subscriber keeps off.
 #[test]
 fn strict_harness_raw_transport_prefix_matches_wallet() {
     assert_eq!(

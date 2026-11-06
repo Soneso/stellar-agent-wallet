@@ -4,6 +4,7 @@
 use crate::policy_state::PersistedWindowStore;
 use stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE;
 use stellar_agent_core::profile::schema::Profile;
+use stellar_agent_test_support::file_sha256;
 use stellar_xdr::{
     ContractId, Hash, HostFunction, InvokeContractArgs, Limits, ScAddress, ScSymbol, ScVal,
     WriteXdr,
@@ -31,6 +32,7 @@ pub struct IntentViewFixture {
     stored: String,
     timelock: String,
     before: Vec<u8>,
+    digest_before: String,
     hmac: keyring_core::Entry,
     generation: keyring_core::Entry,
     key_before: String,
@@ -146,6 +148,7 @@ impl IntentViewFixture {
         );
 
         let before = std::fs::read(store.path()).unwrap();
+        let digest_before = file_sha256(store.path());
         let key = &profile.policy_window_state_key_id;
         let hmac = keyring_core::Entry::new(&key.service, &key.account).unwrap();
         let generation = keyring_core::Entry::new(
@@ -167,6 +170,7 @@ impl IntentViewFixture {
             stored,
             timelock,
             before,
+            digest_before,
             hmac,
             generation,
             key_before,
@@ -238,8 +242,6 @@ impl IntentViewFixture {
         let mut explanations = Vec::new();
         if mode == "unclassified" {
             explanations.push(PERMANENT);
-        }
-        if mode == "unclassified" {
             match endpoint_state {
                 "missing" => explanations.push(SECONDARY),
                 "unreadable" => explanations.push(UNREADABLE),
@@ -257,7 +259,7 @@ impl IntentViewFixture {
     /// # Panics
     /// Panics if listing mutates state or starts a client or request.
     pub async fn assert_unchanged(&self) {
-        assert_eq!(std::fs::read(self.store.path()).unwrap(), self.before);
+        assert_eq!(file_sha256(self.store.path()), self.digest_before);
         self.assert_resources_unchanged().await;
     }
 

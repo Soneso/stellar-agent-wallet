@@ -95,18 +95,20 @@ pub fn checked_secondary_rpc_url<'a>(
 /// The most height pairs one witness call reads under its deadline.
 const MAX_PAIR_ACQUISITIONS: u32 = 3;
 
+/// The fixed reason of a refusal: `LedgerWitnessError::Unavailable` or
+/// `LedgerWitnessError::Mismatch` never echoes endpoint input, which can hold a
+/// credential.
 mod reason {
     pub(super) const SKEW: &str = "the endpoints' latest ledgers differ by more than the tolerance";
     pub(super) const STALE: &str = "the ledger observations are stale";
     pub(super) const DEADLINE_ELAPSED: &str = "the pre-submit deadline elapsed";
 }
 
+/// One endpoint's height, reduced to what the bound keeps of it.
 #[derive(Debug, Clone)]
 struct ObservedLedger {
     ledger: u32,
     authority: String,
-    #[cfg(test)]
-    chain_id: Option<Caip2>,
     observed_at: Instant,
 }
 
@@ -115,8 +117,6 @@ impl From<SigningLedgerObservation> for ObservedLedger {
         Self {
             ledger: observation.ledger(),
             authority: observation.identity().authority().to_owned(),
-            #[cfg(test)]
-            chain_id: observation.identity().chain_id(),
             observed_at: observation.observed_at(),
         }
     }
@@ -379,10 +379,10 @@ impl LedgerWitnessCapability {
     /// Refuses stale observations or an elapsed deadline.
     pub fn ensure_fresh(&self, now: Instant) -> Result<(), LedgerWitnessError> {
         if now >= self.deadline {
-            return Err(unavailable("the pre-submit deadline elapsed"));
+            return Err(unavailable(reason::DEADLINE_ELAPSED));
         }
         if self.is_stale(now) {
-            return Err(unavailable("the ledger observations are stale"));
+            return Err(unavailable(reason::STALE));
         }
         Ok(())
     }
@@ -810,7 +810,6 @@ mod tests {
         ObservedLedger {
             ledger,
             authority: authority.into(),
-            chain_id: Some(Caip2::Testnet),
             observed_at,
         }
     }
@@ -818,6 +817,7 @@ mod tests {
     fn bind_classified(
         primary: ObservedLedger,
         secondary: ObservedLedger,
+        secondary_chain: Option<Caip2>,
     ) -> Result<LedgerWitnessCapability, PairRefusal> {
         let observed = [primary, secondary];
         let clients = [
@@ -827,7 +827,11 @@ mod tests {
         let observation = |index: usize| {
             SigningLedgerObservation::checked(
                 crate::EndpointIdentity::checked(
-                    observed[index].chain_id,
+                    if index == 0 {
+                        Some(Caip2::Testnet)
+                    } else {
+                        secondary_chain
+                    },
                     23,
                     stellar_agent_core::redact::redact_url_authority(&observed[index].authority),
                     clients[index].id(),
@@ -852,7 +856,7 @@ mod tests {
         primary: ObservedLedger,
         secondary: ObservedLedger,
     ) -> Result<LedgerWitnessCapability, LedgerWitnessError> {
-        bind_classified(primary, secondary).map_err(PairRefusal::into_error)
+        bind_classified(primary, secondary, Some(Caip2::Testnet)).map_err(PairRefusal::into_error)
     }
 
     fn budget(left: Duration) -> Instant {
@@ -963,7 +967,9 @@ mod tests {
         );
         server.reset().await;
         Mock::given(method("POST"))
-            .respond_with(ResponseTemplate::new(500).set_delay(Duration::from_secs(2)))
+            .respond_with(
+                ResponseTemplate::new(500).set_delay(MAX_OBSERVATION_AGE + Duration::from_secs(5)),
+            )
             .mount(&server)
             .await;
         let now = Instant::now();
@@ -984,7 +990,9 @@ mod tests {
         );
         server.reset().await;
         Mock::given(method("POST"))
-            .respond_with(ResponseTemplate::new(500).set_delay(Duration::from_millis(700)))
+            .respond_with(
+                ResponseTemplate::new(500).set_delay(MAX_OBSERVATION_AGE + Duration::from_secs(5)),
+            )
             .mount(&server)
             .await;
         let now = Instant::now();
@@ -1050,9 +1058,10 @@ mod tests {
     #[test]
     fn observations_of_different_chains_refuse() {
         let now = Instant::now();
-        let mut secondary = observed_at(1000, SECONDARY, now);
-        secondary.chain_id = None;
-        let error = bind(observed_at(1000, PRIMARY, now), secondary).unwrap_err();
+        let secondary = observed_at(1000, SECONDARY, now);
+        let error = bind_classified(observed_at(1000, PRIMARY, now), secondary, None)
+            .map_err(PairRefusal::into_error)
+            .unwrap_err();
         assert!(matches!(error, LedgerWitnessError::Mismatch { .. }));
         assert_eq!(reason_of(&error), reason::CHAIN);
     }
@@ -1143,6 +1152,7 @@ mod tests {
         bind_classified(
             observed_at(primary, PRIMARY, now),
             observed_at(secondary, SECONDARY, now),
+            Some(Caip2::Testnet),
         )
     }
 
@@ -1276,21 +1286,21 @@ mod tests {
     #[serial_test::serial]
     async fn terminal_pair_failures_do_not_retry() {
         let now = Instant::now();
-        let mut other_chain = observed_at(1000, SECONDARY, now);
-        other_chain.chain_id = None;
+        let other_chain = observed_at(1000, SECONDARY, now);
         let cases = [
             (
                 "invalid height",
                 bind_classified(
                     observed_at(0, PRIMARY, now),
                     observed_at(1000, SECONDARY, now),
+                    Some(Caip2::Testnet),
                 ),
                 reason::HEIGHT_OUT_OF_BOUNDS,
                 "simulation.divergence.ledger_skew",
             ),
             (
                 "chain mismatch",
-                bind_classified(observed_at(1000, PRIMARY, now), other_chain),
+                bind_classified(observed_at(1000, PRIMARY, now), other_chain, None),
                 reason::CHAIN,
                 "simulation.divergence.ledger_skew",
             ),
@@ -1299,6 +1309,7 @@ mod tests {
                 bind_classified(
                     observed_at(1000, PRIMARY, now),
                     observed_at(1000, "https://primary.example:8443", now),
+                    Some(Caip2::Testnet),
                 ),
                 reason::SAME_HOST,
                 "smart_account.ledger_witness_unavailable",
@@ -1471,6 +1482,7 @@ mod tests {
                 SECONDARY,
                 now.checked_sub(secondary_age).unwrap(),
             ),
+            Some(Caip2::Testnet),
         )
     }
 

@@ -302,7 +302,8 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CaptureWriter {
 /// subscriber. Tests execute the code under test through [`Self::run`] so the
 /// subscriber is mounted only for the closure body, then call
 /// [`Self::assert_clean`] after capture has stopped.
-/// The harness excludes raw transport events and spans at every level, matching the wallet's subscriber.
+/// The harness excludes raw transport events and spans at every level, as the
+/// wallet's subscriber does.
 pub struct RedactionStrictSubscriber {
     capture: CaptureWriter,
     forbidden: Vec<Vec<u8>>,

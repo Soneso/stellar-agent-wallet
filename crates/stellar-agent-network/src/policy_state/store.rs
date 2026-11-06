@@ -6226,7 +6226,7 @@ mod tests {
 
     use super::*;
     use stellar_agent_core::policy::v1::criteria::state_store::WindowLimit;
-    use stellar_agent_test_support::keyring_mock;
+    use stellar_agent_test_support::{file_sha256, keyring_mock};
     use tempfile::TempDir;
 
     #[test]
@@ -6248,15 +6248,12 @@ mod tests {
             plan.facts.greatest_expiration_ledger = plan.facts.execution_bound();
             assert_eq!(plan.facts.greatest_expiration_ledger, None);
             let _exposure = store.admit_signed_intent(&profile, &plan).unwrap().expose();
-            let before = fs::read(store.path()).unwrap();
+            let before = file_sha256(store.path());
             clock.set(2 * RETENTION_MS);
             store
                 .observe_signed_intents(&profile, &progress_witness([900, 901], 2 * RETENTION_MS))
                 .unwrap();
-            assert_eq!(
-                stellar_agent_core::hex::encode(&Sha256::digest(fs::read(store.path()).unwrap())),
-                stellar_agent_core::hex::encode(&Sha256::digest(&before))
-            );
+            assert_eq!(file_sha256(store.path()), before);
             assert_intent_totals(&store, &profile, 60, 1);
         }
     }
@@ -6407,7 +6404,7 @@ mod tests {
             let clock = crate::mainnet::clock::set_now_ms_for_test(1000);
             let _exposure = store.admit_signed_intent(&profile, &plan).unwrap().expose();
             clock.set(2000);
-            let before = fs::read(store.path()).unwrap();
+            let before = file_sha256(store.path());
             let generation = get_raw(&generation_entry_ref(&profile));
             let instant = tokio::time::Instant::now();
             let witness = LedgerWitnessCapability::for_test(
@@ -6447,10 +6444,7 @@ mod tests {
                 store.observe_signed_intents(&profile, &witness).unwrap();
             }
             drop(armed);
-            assert_eq!(
-                stellar_agent_core::hex::encode(&Sha256::digest(fs::read(store.path()).unwrap())),
-                stellar_agent_core::hex::encode(&Sha256::digest(&before))
-            );
+            assert_eq!(file_sha256(store.path()), before);
             assert_eq!(get_raw(&generation_entry_ref(&profile)), generation);
             assert_intent_totals(&store, &profile, 60, 1);
         }
@@ -6944,7 +6938,7 @@ mod tests {
                 );
                 (result, authorized, recorded)
             };
-            let before = fs::read(store.path()).unwrap();
+            let before = file_sha256(store.path());
             let (result, authorized, recorded) = attempt(1000);
             assert!(matches!(
                 result,
@@ -6954,10 +6948,7 @@ mod tests {
                 })
             ));
             assert_eq!((authorized, recorded), (0, 0));
-            assert_eq!(
-                stellar_agent_core::hex::encode(&Sha256::digest(fs::read(store.path()).unwrap())),
-                stellar_agent_core::hex::encode(&Sha256::digest(&before))
-            );
+            assert_eq!(file_sha256(store.path()), before);
             assert!(matches!(
                 store.reset_snapshot(&profile, 1000),
                 Err(WindowStoreError::SignedIntentLive { .. })
@@ -6983,7 +6974,7 @@ mod tests {
                 );
             }
             store.observe_signed_intents(&profile, &witness).unwrap();
-            let before = fs::read(store.path()).unwrap();
+            let before = file_sha256(store.path());
             #[cfg(feature = "test-hooks")]
             let clients = crate::client::constructions_on_this_thread();
             clock.set(2000 + RETENTION_MS);
@@ -7003,8 +6994,8 @@ mod tests {
             clock.set(2001 + RETENTION_MS);
             assert!(store.reset_snapshot(&profile, 2001 + RETENTION_MS).is_ok());
             assert_eq!(
-                stellar_agent_core::hex::encode(&Sha256::digest(fs::read(store.path()).unwrap())),
-                stellar_agent_core::hex::encode(&Sha256::digest(&before)),
+                file_sha256(store.path()),
+                before,
                 "snapshot inspection does not mutate"
             );
             clock.set(2001 + RETENTION_MS);
@@ -7046,7 +7037,7 @@ mod tests {
             .admit_signed_intent(&fx.profile, &plan)
             .unwrap()
             .expose();
-        let before = fs::read(fx.store.path()).unwrap();
+        let before = file_sha256(fx.store.path());
         let mut authorized = 0;
         let mut recorded = 0;
         let result = fx.store.reset(
@@ -7072,10 +7063,7 @@ mod tests {
             })
         ));
         assert_eq!((authorized, recorded), (0, 0));
-        assert_eq!(
-            stellar_agent_core::hex::encode(&Sha256::digest(fs::read(fx.store.path()).unwrap())),
-            stellar_agent_core::hex::encode(&Sha256::digest(&before))
-        );
+        assert_eq!(file_sha256(fx.store.path()), before);
         assert_eq!(
             fx.store
                 .signed_intents("intent", &fx.profile)
@@ -7122,7 +7110,7 @@ mod tests {
                 );
             }
             store.observe_signed_intents(&profile, &witness).unwrap();
-            let before = fs::read(store.path()).unwrap();
+            let before = file_sha256(store.path());
             let generation = get_raw(&generation_entry_ref(&profile));
             let key = get_raw(&profile.policy_window_state_key_id);
             #[cfg(feature = "test-hooks")]
@@ -7144,12 +7132,7 @@ mod tests {
                     })
                 );
                 assert!(views[0].reset_explanations.is_empty());
-                assert_eq!(
-                    stellar_agent_core::hex::encode(&Sha256::digest(
-                        fs::read(store.path()).unwrap()
-                    )),
-                    stellar_agent_core::hex::encode(&Sha256::digest(&before))
-                );
+                assert_eq!(file_sha256(store.path()), before);
                 assert_eq!(get_raw(&generation_entry_ref(&profile)), generation);
                 assert_eq!(get_raw(&profile.policy_window_state_key_id), key);
             }
@@ -7275,12 +7258,12 @@ mod tests {
                 admitted_at_ms: 1000,
             };
             let capability = capability.read_operation_states(&[probe]).await;
-            let before = fs::read(store.path()).unwrap();
+            let before = file_sha256(store.path());
             let generation = get_raw(&generation_entry_ref(&profile));
             store.observe_signed_intents(&profile, &capability).unwrap();
             assert_eq!(
-                stellar_agent_core::hex::encode(&Sha256::digest(fs::read(store.path()).unwrap())),
-                stellar_agent_core::hex::encode(&Sha256::digest(&before)),
+                file_sha256(store.path()),
+                before,
                 "one state answer supplies no closure evidence"
             );
             assert_eq!(get_raw(&generation_entry_ref(&profile)), generation);
@@ -7302,7 +7285,7 @@ mod tests {
         });
         let _exposure = store.admit_signed_intent(&profile, &plan).unwrap().expose();
         clock.set(2000);
-        let original = fs::read(store.path()).unwrap();
+        let before = file_sha256(store.path());
         let probe = crate::signing::ledger_witness::ScheduleProbe {
             intent_id: plan.facts.intent_id(),
             timelock,
@@ -7325,10 +7308,7 @@ mod tests {
                 [1990, 1995],
             );
             store.observe_signed_intents(&profile, &witness).unwrap();
-            assert_eq!(
-                stellar_agent_core::hex::encode(&Sha256::digest(fs::read(store.path()).unwrap())),
-                stellar_agent_core::hex::encode(&Sha256::digest(&original))
-            );
+            assert_eq!(file_sha256(store.path()), before);
         }
         let witness = progress_witness([101, 101], 1900).with_operation_states_for_test(
             probe,
@@ -7434,16 +7414,10 @@ mod tests {
             }
             let reopened = PersistedWindowStore::at_path(store.path().to_owned())
                 .with_profile_directory("intent", dir.path().to_owned());
-            let original = fs::read(reopened.path()).unwrap();
+            let before = file_sha256(reopened.path());
             let generation = get_raw(&generation_entry);
             reopened.observe_signed_intents(&profile, &witness).unwrap();
-            assert_eq!(
-                stellar_agent_core::hex::encode(&Sha256::digest(
-                    fs::read(reopened.path()).unwrap()
-                )),
-                stellar_agent_core::hex::encode(&Sha256::digest(&original)),
-                "change={change}"
-            );
+            assert_eq!(file_sha256(reopened.path()), before, "change={change}");
             assert_eq!(get_raw(&generation_entry), generation, "change={change}");
             let wire = reopened.read_for_inspection(&profile).unwrap().unwrap();
             let record = &wire.signed_intents[0];
@@ -7492,12 +7466,7 @@ mod tests {
                 Some(if change == 4 { 61_800 } else { 61_995 })
             );
             if change == 4 {
-                assert_eq!(
-                    stellar_agent_core::hex::encode(&Sha256::digest(
-                        fs::read(restarted.path()).unwrap()
-                    )),
-                    stellar_agent_core::hex::encode(&Sha256::digest(&original))
-                );
+                assert_eq!(file_sha256(restarted.path()), before);
                 assert_eq!(get_raw(&generation_entry), generation);
             }
         }
@@ -7550,16 +7519,13 @@ mod tests {
             }
             plan.facts.purpose = purpose;
             let exposure = store.admit_signed_intent(&profile, &plan).unwrap().expose();
-            let before = fs::read(store.path()).unwrap();
+            let before = file_sha256(store.path());
             let generation = get_raw(&generation_entry_ref(&profile));
             let now = RETENTION_MS * 2;
             clock.set(now);
             let witness = progress_witness([101, 102], now);
             store.observe_signed_intents(&profile, &witness).unwrap();
-            assert_eq!(
-                stellar_agent_core::hex::encode(&Sha256::digest(fs::read(store.path()).unwrap())),
-                stellar_agent_core::hex::encode(&Sha256::digest(&before))
-            );
+            assert_eq!(file_sha256(store.path()), before);
             assert_intent_totals(&store, &profile, 60, 1);
             let mut signing_witness = witness;
             if let Some(IntentPurpose::TimelockSchedule {
@@ -7587,10 +7553,7 @@ mod tests {
             let proof = store.admit_signed_intent(&profile, &candidate).unwrap();
             assert!(proof.intent_id.is_none());
             store.cancel_signed_intent(&profile, proof).unwrap();
-            assert_eq!(
-                stellar_agent_core::hex::encode(&Sha256::digest(fs::read(store.path()).unwrap())),
-                stellar_agent_core::hex::encode(&Sha256::digest(&before))
-            );
+            assert_eq!(file_sha256(store.path()), before);
             assert_eq!(get_raw(&generation_entry_ref(&profile)), generation);
             let facts =
                 crate::BindFacts::from_envelope(&envelope, Caip2::Testnet.network_passphrase())
@@ -7665,7 +7628,7 @@ mod tests {
         let _clock = crate::mainnet::clock::set_now_ms_for_test(1000);
         plan.facts.purpose = None;
         let _exposure = store.admit_signed_intent(&profile, &plan).unwrap().expose();
-        let before = fs::read(store.path()).unwrap();
+        let before = file_sha256(store.path());
         let generation = get_raw(&generation_entry_ref(&profile));
         let reopened = PersistedWindowStore::at_path(store.path().to_owned());
         plan.facts.purpose = Some(IntentPurpose::Invoke);
@@ -7673,10 +7636,7 @@ mod tests {
             reopened.admit_signed_intent(&profile, &plan),
             Err(WindowStoreError::IntentBindingMismatch { field: "purpose" })
         ));
-        assert_eq!(
-            stellar_agent_core::hex::encode(&Sha256::digest(fs::read(reopened.path()).unwrap())),
-            stellar_agent_core::hex::encode(&Sha256::digest(&before))
-        );
+        assert_eq!(file_sha256(reopened.path()), before);
         assert_eq!(get_raw(&generation_entry_ref(&profile)), generation);
         let views = reopened.signed_intents("intent", &profile).unwrap();
         assert_eq!(views.len(), 1);
@@ -7745,8 +7705,7 @@ mod tests {
     #[test]
     #[serial]
     fn intent_reset_explanations_follow_open_records_and_stored_endpoints() {
-        const SECONDARY: &str = "Retained intents close only through the profile's stored secondary endpoint. Add one to the profile.";
-        const UNREADABLE: &str = "The profile's stored endpoint configuration is unreadable. Retained intents close only through stored endpoints that load.";
+        use crate::intent_view_test_helpers::{SECONDARY, UNREADABLE};
         for closed in [false, true] {
             for unreadable in [false, true] {
                 let (dir, profile, store, plan) = progress_fixture();
@@ -7908,17 +7867,13 @@ mod tests {
         let (_dir, profile, store, plan) = progress_fixture();
         let clock = crate::mainnet::clock::set_now_ms_for_test(1000);
         let _exposure = store.admit_signed_intent(&profile, &plan).unwrap().expose();
-        let original = fs::read(store.path()).unwrap();
+        let before = file_sha256(store.path());
         clock.set(2000);
         for heights in [[100, 102], [102, 100]] {
             store
                 .observe_signed_intents(&profile, &progress_witness(heights, 2000))
                 .unwrap();
-            assert_eq!(
-                stellar_agent_core::hex::encode(&Sha256::digest(fs::read(store.path()).unwrap())),
-                stellar_agent_core::hex::encode(&Sha256::digest(&original)),
-                "equality remains open"
-            );
+            assert_eq!(file_sha256(store.path()), before, "equality remains open");
         }
         let instant = tokio::time::Instant::now();
         for (scope, endpoints, heights, deadline, refusal) in [
@@ -7981,8 +7936,8 @@ mod tests {
                     .unwrap(),
             }
             assert_eq!(
-                stellar_agent_core::hex::encode(&Sha256::digest(fs::read(store.path()).unwrap())),
-                stellar_agent_core::hex::encode(&Sha256::digest(&original)),
+                file_sha256(store.path()),
+                before,
                 "unauthorized pair leaves the record open"
             );
             assert_intent_totals(&store, &profile, 60, 1);
@@ -8003,8 +7958,8 @@ mod tests {
         ));
         assert_eq!(get_raw(&generation_entry_ref(&profile)), generation);
         assert_eq!(
-            stellar_agent_core::hex::encode(&Sha256::digest(fs::read(store.path()).unwrap())),
-            stellar_agent_core::hex::encode(&Sha256::digest(&original)),
+            file_sha256(store.path()),
+            before,
             "a plan without a capability closes nothing"
         );
         for endpoints in [
@@ -8028,8 +7983,8 @@ mod tests {
             .unwrap();
             store.observe_signed_intents(&profile, &witness).unwrap();
             assert_eq!(
-                stellar_agent_core::hex::encode(&Sha256::digest(fs::read(store.path()).unwrap())),
-                stellar_agent_core::hex::encode(&Sha256::digest(&original)),
+                file_sha256(store.path()),
+                before,
                 "endpoint replacement remains open"
             );
         }
@@ -8053,8 +8008,8 @@ mod tests {
             .unwrap();
             store.observe_signed_intents(&profile, &witness).unwrap();
             assert_eq!(
-                stellar_agent_core::hex::encode(&Sha256::digest(fs::read(store.path()).unwrap())),
-                stellar_agent_core::hex::encode(&Sha256::digest(&original)),
+                file_sha256(store.path()),
+                before,
                 "invalid clock evidence remains open"
             );
         }
@@ -8163,7 +8118,7 @@ mod tests {
         clock.set(1000);
         let _exposure = store.admit_signed_intent(&profile, &plan).unwrap().expose();
         clock.set(2000);
-        let before = fs::read(store.path()).unwrap();
+        let before = file_sha256(store.path());
         let _failure = fail_store_writes();
         let error = store
             .admit_signed_intent(&profile, &candidate)
@@ -8173,10 +8128,7 @@ mod tests {
             crate::signed_intent::store_refusal(error).code(),
             "submission.intent_record_unavailable"
         );
-        assert_eq!(
-            stellar_agent_core::hex::encode(&Sha256::digest(fs::read(store.path()).unwrap())),
-            stellar_agent_core::hex::encode(&Sha256::digest(&before))
-        );
+        assert_eq!(file_sha256(store.path()), before);
     }
 
     #[test]
@@ -8185,7 +8137,7 @@ mod tests {
         let (_dir, profile, store, plan) = progress_fixture();
         let clock = crate::mainnet::clock::set_now_ms_for_test(1000);
         let _exposure = store.admit_signed_intent(&profile, &plan).unwrap().expose();
-        let before = fs::read(store.path()).unwrap();
+        let before = file_sha256(store.path());
         let generation = get_raw(&generation_entry_ref(&profile));
         for t in [u64::MAX, u64::MAX - 60_000] {
             clock.set(t);
@@ -8195,10 +8147,7 @@ mod tests {
             assert!(
                 matches!(error,WindowStoreError::Invalid { ref detail } if detail == "signed intent horizon overflows")
             );
-            assert_eq!(
-                stellar_agent_core::hex::encode(&Sha256::digest(fs::read(store.path()).unwrap())),
-                stellar_agent_core::hex::encode(&Sha256::digest(&before))
-            );
+            assert_eq!(file_sha256(store.path()), before);
             assert_eq!(get_raw(&generation_entry_ref(&profile)), generation);
             assert_intent_totals(&store, &profile, 60, 1);
         }
@@ -8221,16 +8170,13 @@ mod tests {
         assert!(
             matches!(error,WindowStoreError::Invalid { ref detail } if detail == "signed intent horizon overflows")
         );
-        assert_eq!(
-            stellar_agent_core::hex::encode(&Sha256::digest(fs::read(store.path()).unwrap())),
-            stellar_agent_core::hex::encode(&Sha256::digest(&before))
-        );
+        assert_eq!(file_sha256(store.path()), before);
         assert_eq!(get_raw(&generation_entry_ref(&profile)), generation);
         assert_intent_totals(&store, &profile, 60, 1);
         store
             .observe_signed_intents(&profile, &progress_witness([101, 101], 2000))
             .unwrap();
-        let closed = fs::read(store.path()).unwrap();
+        let before = file_sha256(store.path());
         let closed_generation = get_raw(&generation_entry_ref(&profile));
         let wire = store.read_for_inspection(&profile).unwrap().unwrap();
         let loaded = PolicyStateStore::new();
@@ -8243,10 +8189,7 @@ mod tests {
                     if detail == "signed intent horizon overflows"
             ));
             assert!(matches!(loaded.query_window(&key,2000),Err(stellar_agent_core::policy::v1::criteria::state_store::StateStoreError::HorizonOverflow)));
-            assert_eq!(
-                stellar_agent_core::hex::encode(&Sha256::digest(fs::read(store.path()).unwrap())),
-                stellar_agent_core::hex::encode(&Sha256::digest(&closed))
-            );
+            assert_eq!(file_sha256(store.path()), before);
             assert_eq!(get_raw(&generation_entry_ref(&profile)), closed_generation);
             assert_intent_totals(&store, &profile, 60, 1);
         }
@@ -8472,7 +8415,7 @@ mod tests {
         let id = exposure.intent_id().unwrap();
         let facts = crate::BindFacts::from_envelope(&envelope, Caip2::Testnet.network_passphrase())
             .unwrap();
-        let original = fs::read(store.path()).unwrap();
+        let before = file_sha256(store.path());
         for bound in [None, Some(0), Some(49), Some(51)] {
             let mut changed = facts.clone();
             changed.facts.envelope_max_ledger = bound;
@@ -8482,10 +8425,7 @@ mod tests {
                     field: "expiration"
                 })
             ));
-            assert_eq!(
-                stellar_agent_core::hex::encode(&Sha256::digest(fs::read(store.path()).unwrap())),
-                stellar_agent_core::hex::encode(&Sha256::digest(&original))
-            );
+            assert_eq!(file_sha256(store.path()), before);
         }
         let mut changed = facts.clone();
         let stellar_xdr::HostFunction::InvokeContract(call) = &mut changed.host else {
@@ -8496,10 +8436,7 @@ mod tests {
             store.bind_signed_intent(&profile, id, &changed, plan.legs()),
             Err(WindowStoreError::IntentBindingMismatch { field: "purpose" })
         ));
-        assert_eq!(
-            stellar_agent_core::hex::encode(&Sha256::digest(fs::read(store.path()).unwrap())),
-            stellar_agent_core::hex::encode(&Sha256::digest(&original))
-        );
+        assert_eq!(file_sha256(store.path()), before);
         store
             .bind_signed_intent(&profile, id, &facts, plan.legs())
             .unwrap();

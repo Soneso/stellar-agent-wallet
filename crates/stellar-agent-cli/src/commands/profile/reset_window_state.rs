@@ -894,8 +894,7 @@ mod tests {
     #[test]
     #[serial]
     fn reset_explains_permanent_and_missing_secondary_blocks() {
-        const PERMANENT: &str = "An open intent without an authenticated purpose permanently blocks reset for this profile. Continue with a new profile.";
-        const SECONDARY: &str = "Retained intents close only through the profile's stored secondary endpoint. Add one to the profile.";
+        use stellar_agent_network::intent_view_test_helpers::{PERMANENT, SECONDARY};
         for (permanent, missing) in [(true, false), (false, true), (true, true)] {
             stellar_agent_test_support::keyring_mock::install().unwrap();
             let dir = tempfile::tempdir().unwrap();

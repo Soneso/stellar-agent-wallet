@@ -418,3 +418,4 @@ Reset refuses while an intent remains open or retained. A closed and pruned inte
 An open intent without an authenticated purpose permanently blocks reset for this profile. Continue with a new profile.
 
 Retained intents close only through the profile's stored secondary endpoint. Add one to the profile.
+The profile's stored endpoint configuration is unreadable. Retained intents close only through stored endpoints that load.

@@ -785,7 +785,7 @@ fn strkey_bytes(strkey: &str) -> [u8; 32] {
 }
 
 /// Lowercase hex encoding.
-fn hex(bytes: &[u8]) -> String {
+pub(crate) fn hex(bytes: &[u8]) -> String {
     bytes
         .iter()
         .fold(String::with_capacity(bytes.len() * 2), |mut out, b| {
