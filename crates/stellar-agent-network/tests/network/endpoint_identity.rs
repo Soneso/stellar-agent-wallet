@@ -15,18 +15,21 @@
 )]
 
 use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde_json::{Value, json};
 use stellar_agent_core::error::{NetworkError, WalletError};
 use stellar_agent_core::profile::caip2::Caip2;
-use stellar_agent_network::{EndpointIdentity, SUPPORTED_PROTOCOL_VERSIONS, StellarRpcClient};
+use stellar_agent_network::{
+    EndpointIdentity, SUPPORTED_PROTOCOL_VERSIONS, SigningLedgerObservation, StellarRpcClient,
+};
 use stellar_agent_test_support::signed_envelope::{
     MAINNET_PASSPHRASE, TESTNET_PASSPHRASE, get_network_result,
 };
 use stellar_agent_test_support::{EchoIdResponder, WarningCapture, rpc_request_count};
 use wiremock::matchers::{body_partial_json, method};
-use wiremock::{Mock, MockServer, ResponseTemplate};
+use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
 /// A network whose passphrase names neither testnet nor mainnet.
 const FUTURENET_PASSPHRASE: &str = "Test SDF Future Network ; October 2022";
@@ -428,13 +431,19 @@ async fn mount_latest_ledger(server: &MockServer, result: Value) {
         .await;
 }
 
+/// Prepares a read of `client` under `deadline` and reads one height through
+/// it.
 async fn observation(
     client: &StellarRpcClient,
     deadline: Duration,
-) -> Result<stellar_agent_network::SigningLedgerObservation, WalletError> {
-    client
-        .signing_ledger_observation(TESTNET_PASSPHRASE, tokio::time::Instant::now() + deadline)
-        .await
+) -> Result<SigningLedgerObservation, WalletError> {
+    let prepared = client
+        .prepare_signing_ledger_observation(
+            TESTNET_PASSPHRASE,
+            tokio::time::Instant::now() + deadline,
+        )
+        .await?;
+    prepared.read().await
 }
 
 /// An observation binds the height to the identity of the endpoint that
@@ -541,4 +550,78 @@ async fn an_answer_past_the_deadline_gives_no_observation() {
         "the deadline ends the read: {:?}",
         started.elapsed()
     );
+}
+
+/// Answers `getLatestLedger` with `first`, then `first + 1`, and so on, each
+/// after `delay`, and records when each request arrived.
+struct AdvancingLedger {
+    first: u32,
+    delay: Duration,
+    arrivals: Arc<Mutex<Vec<tokio::time::Instant>>>,
+}
+
+impl Respond for AdvancingLedger {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        let mut arrivals = self.arrivals.lock().unwrap();
+        arrivals.push(tokio::time::Instant::now());
+        let sequence = self.first + u32::try_from(arrivals.len() - 1).unwrap();
+        let id = serde_json::from_slice::<Value>(&request.body)
+            .ok()
+            .and_then(|body| body.get("id").cloned())
+            .unwrap_or_else(|| json!(1));
+        ResponseTemplate::new(200)
+            .set_body_json(json!({"jsonrpc": "2.0", "id": id, "result": latest_ledger(sequence)}))
+            .set_delay(self.delay)
+    }
+}
+
+/// Every read of one prepared value goes through the client that checked the
+/// identity, stamps the moment its own answer arrived, and stays under the
+/// deadline given at preparation.
+#[tokio::test]
+async fn prepared_observation_keeps_client_deadline_and_arrival_time() {
+    let server = serve_get_network(network(TESTNET_PASSPHRASE, 29)).await;
+    let arrivals = Arc::new(Mutex::new(Vec::new()));
+    let delay = Duration::from_millis(150);
+    Mock::given(method("POST"))
+        .and(body_partial_json(json!({"method": "getLatestLedger"})))
+        .respond_with(AdvancingLedger {
+            first: 700,
+            delay,
+            arrivals: Arc::clone(&arrivals),
+        })
+        .mount(&server)
+        .await;
+    let client = StellarRpcClient::new(&server.uri()).unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    let prepared = client
+        .prepare_signing_ledger_observation(TESTNET_PASSPHRASE, deadline)
+        .await
+        .unwrap();
+
+    let first = prepared.read().await.unwrap();
+    let second = prepared.read().await.unwrap();
+
+    let arrived = arrivals.lock().unwrap().clone();
+    assert_eq!((first.ledger(), second.ledger()), (700, 701));
+    for (observation, arrival) in [(&first, arrived[0]), (&second, arrived[1])] {
+        assert_eq!(observation.identity().client_id(), client.id());
+        assert!(
+            observation.observed_at() >= arrival + delay,
+            "the stamp follows the answer to its own request"
+        );
+    }
+    assert!(
+        first.observed_at() < arrived[1],
+        "the first stamp precedes the second request"
+    );
+    assert_eq!(rpc_request_count(&server, "getNetwork").await, 1);
+
+    tokio::time::sleep_until(deadline).await;
+    match prepared.read().await {
+        Err(WalletError::Network(NetworkError::RpcUnreachable { reason, .. })) => {
+            assert_eq!(reason, "getLatestLedger exceeded its deadline");
+        }
+        other => panic!("the original deadline bounds a later read: {other:?}"),
+    }
 }

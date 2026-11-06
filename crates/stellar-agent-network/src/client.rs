@@ -707,44 +707,34 @@ impl StellarRpcClient {
         self.checked_identity(&network)
     }
 
-    /// Reads the endpoint's latest ledger for a signing path, bound to the
-    /// endpoint's checked identity and the local time of the answer.
+    /// Checks the endpoint's identity once for a signing path and returns a
+    /// read of its latest ledger through this client.
     ///
-    /// [`Self::endpoint_identity`] runs first, then `getLatestLedger`, both
-    /// through this client and under `deadline`, so the height comes from the
-    /// endpoint the identity names. The height is the endpoint's claim: the
-    /// caller compares it with an observation from another endpoint.
+    /// [`Self::endpoint_identity`] runs through this client under `deadline`.
+    /// The returned [`PreparedSigningLedgerRead`] keeps that identity, this
+    /// client, and `deadline` bound together, and each
+    /// [`PreparedSigningLedgerRead::read`] asks `getLatestLedger` through the
+    /// same client under the same deadline. A caller that needs both
+    /// endpoints' identities before it reads either height prepares both
+    /// first. Each height is the endpoint's claim: the caller compares it with
+    /// an observation from another endpoint.
     ///
     /// # Errors
     ///
-    /// - The errors of [`Self::endpoint_identity`].
-    /// - [`NetworkError::RpcUnreachable`] if the `getLatestLedger` request
-    ///   does not complete within `deadline`, fails, or returns a body that
-    ///   does not deserialize. The `url` field is authority-only.
-    pub async fn signing_ledger_observation(
+    /// The errors of [`Self::endpoint_identity`].
+    pub async fn prepare_signing_ledger_observation(
         &self,
         expected_passphrase: &str,
         deadline: Instant,
-    ) -> Result<SigningLedgerObservation, WalletError> {
+    ) -> Result<PreparedSigningLedgerRead<'_>, WalletError> {
         let identity = self
             .endpoint_identity(expected_passphrase, deadline)
             .await?;
-        let latest = tokio::time::timeout_at(deadline, self.witness_latest_ledger())
-            .await
-            .map_err(|_| {
-                WalletError::Network(NetworkError::RpcUnreachable {
-                    url: self.redacted_url(),
-                    reason: LATEST_LEDGER_DEADLINE_ELAPSED.to_owned(),
-                })
-            })?
-            .map_err(|e| {
-                WalletError::Network(rpc_unreachable(&self.url, GET_LATEST_LEDGER_FAILED, &e))
-            })?;
-        Ok(SigningLedgerObservation::checked(
+        Ok(PreparedSigningLedgerRead {
             identity,
-            latest.sequence,
-            Instant::now(),
-        ))
+            client: self,
+            deadline,
+        })
     }
 
     /// Asks the endpoint which network it serves for a submission under a
@@ -881,6 +871,130 @@ impl StellarRpcClient {
     }
 }
 
+/// An endpoint identity checked for a signing path, bound to the client it
+/// was established through and to the deadline of the signing attempt.
+///
+/// [`StellarRpcClient::prepare_signing_ledger_observation`] is the only
+/// constructor. The prepared read keeps its identity, client, and deadline
+/// bound together. Each read checks the client identity before requesting a
+/// height. A read takes no client, identity, or deadline of its own, so every
+/// [`SigningLedgerObservation`] it returns carries the identity of the
+/// endpoint that reported the height, read under the original deadline.
+///
+/// The fields are private, so a value cannot be built outside this crate:
+///
+/// ```compile_fail,E0451
+/// use stellar_agent_network::{EndpointIdentity, PreparedSigningLedgerRead, StellarRpcClient};
+/// fn forge<'a>(
+///     identity: EndpointIdentity,
+///     client: &'a StellarRpcClient,
+///     deadline: tokio::time::Instant,
+/// ) -> PreparedSigningLedgerRead<'a> {
+///     PreparedSigningLedgerRead { identity, client, deadline }
+/// }
+/// ```
+///
+/// Nor can a prepared read move to another client, identity, or deadline:
+///
+/// ```compile_fail,E0616
+/// use stellar_agent_network::{PreparedSigningLedgerRead, StellarRpcClient};
+/// fn rebind<'a>(prepared: &mut PreparedSigningLedgerRead<'a>, other: &'a StellarRpcClient) {
+///     prepared.client = other;
+/// }
+/// ```
+///
+/// ```compile_fail,E0616
+/// use stellar_agent_network::{EndpointIdentity, PreparedSigningLedgerRead};
+/// fn relabel(prepared: &mut PreparedSigningLedgerRead<'_>, other: EndpointIdentity) {
+///     prepared.identity = other;
+/// }
+/// ```
+///
+/// ```compile_fail,E0616
+/// use stellar_agent_network::PreparedSigningLedgerRead;
+/// fn extend(prepared: &mut PreparedSigningLedgerRead<'_>, later: tokio::time::Instant) {
+///     prepared.deadline = later;
+/// }
+/// ```
+///
+/// The import and the intended calls resolve, so the snippets above fail on
+/// the barrier they name and not on the path:
+///
+/// ```
+/// use stellar_agent_core::error::WalletError;
+/// use stellar_agent_network::{
+///     PreparedSigningLedgerRead, SigningLedgerObservation, StellarRpcClient,
+/// };
+/// async fn observe_twice(
+///     client: &StellarRpcClient,
+///     passphrase: &str,
+///     deadline: tokio::time::Instant,
+/// ) -> Result<[SigningLedgerObservation; 2], WalletError> {
+///     let prepared: PreparedSigningLedgerRead<'_> = client
+///         .prepare_signing_ledger_observation(passphrase, deadline)
+///         .await?;
+///     Ok([prepared.read().await?, prepared.read().await?])
+/// }
+/// let _ = observe_twice;
+/// ```
+pub struct PreparedSigningLedgerRead<'a> {
+    identity: EndpointIdentity,
+    client: &'a StellarRpcClient,
+    deadline: Instant,
+}
+
+impl PreparedSigningLedgerRead<'_> {
+    /// Reads the endpoint's latest ledger through the bound client, under
+    /// the bound deadline, and binds the height to the checked identity and
+    /// the local time of the answer.
+    ///
+    /// The read first checks that the identity names the bound client, and
+    /// requests no height when it does not. Each call sends one
+    /// `getLatestLedger` request, so repeated calls observe the endpoint
+    /// again without checking its identity again.
+    ///
+    /// # Errors
+    ///
+    /// [`NetworkError::RpcUnreachable`] if the identity names another client,
+    /// or if the `getLatestLedger` request does not complete within the
+    /// deadline, fails, or returns a body that does not deserialize. The
+    /// `url` field is authority-only.
+    pub async fn read(&self) -> Result<SigningLedgerObservation, WalletError> {
+        let client = self.client;
+        if self.identity.client_id() != client.id() {
+            return Err(WalletError::Network(NetworkError::RpcUnreachable {
+                url: client.redacted_url(),
+                reason: PREPARED_READ_CLIENT_MISMATCH.to_owned(),
+            }));
+        }
+        let latest = tokio::time::timeout_at(self.deadline, client.witness_latest_ledger())
+            .await
+            .map_err(|_| {
+                WalletError::Network(NetworkError::RpcUnreachable {
+                    url: client.redacted_url(),
+                    reason: LATEST_LEDGER_DEADLINE_ELAPSED.to_owned(),
+                })
+            })?
+            .map_err(|e| {
+                WalletError::Network(rpc_unreachable(&client.url, GET_LATEST_LEDGER_FAILED, &e))
+            })?;
+        Ok(SigningLedgerObservation::checked(
+            self.identity.clone(),
+            latest.sequence,
+            Instant::now(),
+        ))
+    }
+}
+
+impl std::fmt::Debug for PreparedSigningLedgerRead<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PreparedSigningLedgerRead")
+            .field("identity", &self.identity)
+            .field("deadline", &self.deadline)
+            .finish_non_exhaustive()
+    }
+}
+
 #[cfg(feature = "test-hooks")]
 thread_local! {
     /// Calls to [`StellarRpcClient::new`] and [`StellarRpcClient::with_credential`]
@@ -927,6 +1041,9 @@ const GET_LATEST_LEDGER_FAILED: &str = "getLatestLedger failed: ";
 
 /// The reason of a `getLatestLedger` call its deadline cut off.
 const LATEST_LEDGER_DEADLINE_ELAPSED: &str = "getLatestLedger exceeded its deadline";
+
+/// The reason of a prepared read whose identity names another client.
+const PREPARED_READ_CLIENT_MISMATCH: &str = "the prepared read is bound to another client";
 
 /// The reason prefix of a failed `getTransaction` call.
 const GET_TRANSACTION_FAILED: &str = "getTransaction failed: ";
@@ -1494,5 +1611,52 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(error.code(), "network.endpoint_network_mismatch");
+    }
+
+    /// A prepared read whose identity names another client sends no request
+    /// and refuses with the binding reason under the endpoint's authority. The
+    /// same client bound to its own identity reads.
+    #[tokio::test]
+    async fn prepared_read_refuses_a_mismatched_client() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer};
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(stellar_agent_test_support::EchoIdResponder::new(
+                serde_json::json!({"id": "ab".repeat(32), "sequence": 1000, "protocolVersion": 29}),
+            ))
+            .mount(&server)
+            .await;
+        let client = StellarRpcClient::new(&format!("{}/rpc?token=SECRET", server.uri())).unwrap();
+        let other = StellarRpcClient::new(&server.uri()).unwrap();
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        let identity_of = |client_id| {
+            EndpointIdentity::checked(Some(Caip2::Testnet), 29, client.redacted_url(), client_id)
+        };
+
+        let mismatched = PreparedSigningLedgerRead {
+            identity: identity_of(other.id()),
+            client: &client,
+            deadline,
+        };
+        match mismatched.read().await {
+            Err(WalletError::Network(NetworkError::RpcUnreachable { url, reason })) => {
+                assert_eq!(url, server.uri());
+                assert_eq!(reason, PREPARED_READ_CLIENT_MISMATCH);
+            }
+            other => panic!("a mismatched binding must refuse: {other:?}"),
+        }
+        assert!(
+            server.received_requests().await.unwrap().is_empty(),
+            "no height is requested"
+        );
+
+        let bound = PreparedSigningLedgerRead {
+            identity: identity_of(client.id()),
+            client: &client,
+            deadline,
+        };
+        assert_eq!(bound.read().await.unwrap().ledger(), 1000);
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
     }
 }

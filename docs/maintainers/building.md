@@ -416,15 +416,19 @@ gate except `shellcheck-changed`, which needs a changed shell script.
     unification.
 14. `release-shape`: `--full` only. It needs libudev on Linux; see
     [Feature discipline and release markers](#feature-discipline-and-release-markers).
-15. `test-vendored-release-cfg`: a Rust change whose test packages include
+15. `test-support-friendbot`: a Rust change whose test packages include
+    `stellar-agent-test-support`, or that selects the workspace command.
+16. `test-vendored-release-cfg`: a Rust change whose test packages include
     `stellar-agent-smart-account`, or that selects the workspace command.
-16. `machete`, `deny`, `coverage`, `coverage-floors`, `coverage:feature-on`,
+17. `test-policy-pin-release-cfg`: a Rust change whose test packages include
+    `stellar-agent-core`, or that selects the workspace command.
+18. `machete`, `deny`, `coverage`, `coverage-floors`, `coverage:feature-on`,
     and `coverage-floors:feature-on`: `--full` only. Each floor check
     requires its own successful measurement in the current run.
-17. `inbox-js` and `mainnet-presence-js`: a change under
+19. `inbox-js` and `mainnet-presence-js`: a change under
     `crates/stellar-agent-approval-ui/src/web/` or
     `crates/stellar-agent-approval-ui/src/operator_enroll/web/`.
-18. `interop:mpp` and `interop:sdk-v17`: `--full` only.
+20. `interop:mpp` and `interop:sdk-v17`: `--full` only.
 
 `package-skill.sh`, `run-testnet-acceptance.sh`, and
 `release-preflight-version-check.sh` have no self-test. The preflight runs the

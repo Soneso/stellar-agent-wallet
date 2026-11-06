@@ -70,6 +70,9 @@ OFFLINE_FEATURES=test-helpers,test-hooks,test-loopback,verifier-registry
 VENDORED_CRATE=stellar-agent-smart-account
 # The crate whose policy pin doctests check its release configuration.
 POLICY_PIN_CRATE=stellar-agent-core
+# The crate whose Friendbot unit tests build with testnet-helpers alone.
+# Its library tests run whenever the test packages include it.
+TEST_SUPPORT_CRATE=stellar-agent-test-support
 # The workflows that check-workflow-invariants.py reads, as its docstring
 # names them.
 INVARIANT_WORKFLOWS="release publish notarize-smoke labels stale triage triage-review triage-sweep welcome coverage release-rehearsal ci vendored-wasm"
@@ -156,6 +159,7 @@ feature-on:doc	RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --feat
 feature-on:test	cargo test --workspace --features mainnet-write,$OFFLINE_FEATURES	cargo	ci.yml	feature-on-test	Run the offline tests
 feature-on:network	cargo check -p stellar-agent-network --features mainnet-write	cargo	ci.yml	feature-on-test	Check network feature forwarding in isolation
 release-shape	bash .github/scripts/release/check-host.sh	cargo,libudev	ci.yml	release-shape	Build and check the release binaries
+test-support-friendbot	cargo test -p $TEST_SUPPORT_CRATE --no-default-features --features testnet-helpers --lib	cargo	ci.yml	test	Run the test-support Friendbot unit tests
 test-vendored-release-cfg	cargo test -p $VENDORED_CRATE --test vendored_wasm_release_cfg	cargo	ci.yml	test	Test the vendored Wasm release configuration
 test-policy-pin-release-cfg	cargo test -p $POLICY_PIN_CRATE --doc policy::pin	cargo	ci.yml	test	Test the policy pin release configuration
 machete	cargo machete	cargo,cargo-machete	ci.yml	machete	Check for unused dependencies
@@ -472,12 +476,13 @@ PY
 
 # Replaces clippy, rustdoc, and test commands with per-package commands when
 # every changed Rust path belongs to a workspace member. Selects each release
-# configuration test when the packages include its crate or the workspace
-# command applies.
+# configuration test, and the Friendbot unit tests of the test-support crate,
+# when the packages include its crate or the workspace command applies.
 plan_rust_gates() {
-  local clippy rustdoc command vendored policy_pin on_clippy on_doc on_test
+  local clippy rustdoc command vendored policy_pin test_support on_clippy on_doc on_test
   # Any planner failure, an unexpected exception included, exits 2.
-  python3 - "$OFFLINE_FEATURES" "$VENDORED_CRATE" "$POLICY_PIN_CRATE" "$SCRATCH/rust" >"$SCRATCH/plan" <<'PY' || exit 2
+  python3 - "$OFFLINE_FEATURES" "$VENDORED_CRATE" "$POLICY_PIN_CRATE" "$TEST_SUPPORT_CRATE" "$SCRATCH/rust" \
+    >"$SCRATCH/plan" <<'PY' || exit 2
 import pathlib
 import posixpath
 import shlex
@@ -487,7 +492,8 @@ import tomllib
 offline_features = sys.argv[1].split(",")
 vendored_crate = sys.argv[2]
 policy_pin_crate = sys.argv[3]
-with open(sys.argv[4], "rb") as stream:
+test_support_crate = sys.argv[4]
+with open(sys.argv[5], "rb") as stream:
     changed = [path.decode("utf-8", "surrogateescape") for path in stream.read().split(b"\0") if path]
 
 
@@ -536,9 +542,11 @@ def owner(path):
     return names.get(max(containing, key=len)) if containing else None
 
 
-# The output has eight lines: the clippy, rustdoc, and test commands, then
-# one flag per release configuration test, 1 when it applies, else 0,
-# then the feature-on clippy, rustdoc, and test commands.
+# The output has nine lines: clippy, rustdoc, and test commands; three
+# fixed-command test flags; then feature-on clippy, rustdoc, and test
+# commands. The flags are 1 when applicable, else 0, ordered as vendored
+# release configuration, policy pin release configuration, and test-support
+# Friendbot tests.
 # Empty command lines retain the workspace commands.
 owners = []
 for path in changed:
@@ -547,6 +555,7 @@ for path in changed:
         print()
         print()
         print()
+        print(1)
         print(1)
         print(1)
         print()
@@ -610,6 +619,7 @@ command = ["cargo", "test", *packages]
 print(shlex.join(command + ["--no-default-features"] + (["--features", ",".join(features)] if features else [])))
 print(1 if vendored_crate in selected else 0)
 print(1 if policy_pin_crate in selected else 0)
+print(1 if test_support_crate in selected else 0)
 on_features = (["mainnet-write"] if "mainnet-write" in declared else []) + all_features
 on_args = ["--features", ",".join(on_features)] if on_features else []
 print(shlex.join(["cargo", "clippy", *packages, "--all-targets", *on_args, "--", "-D", "warnings"]))
@@ -620,7 +630,7 @@ PY
   {
     IFS= read -r clippy && IFS= read -r rustdoc &&
       IFS= read -r command && IFS= read -r vendored &&
-      IFS= read -r policy_pin &&
+      IFS= read -r policy_pin && IFS= read -r test_support &&
       IFS= read -r on_clippy && IFS= read -r on_doc && IFS= read -r on_test
   } <"$SCRATCH/plan"
   if [ -n "$command" ]; then
@@ -642,6 +652,9 @@ PY
   fi
   if [ "$policy_pin" = 1 ]; then
     select_gate test-policy-pin-release-cfg
+  fi
+  if [ "$test_support" = 1 ]; then
+    select_gate test-support-friendbot
   fi
 }
 

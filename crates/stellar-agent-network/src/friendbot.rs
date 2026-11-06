@@ -322,6 +322,9 @@ async fn read_error_body(mut response: reqwest::Response) -> String {
 
 /// Whether a Friendbot error body reports that the account is already
 /// funded, compared without regard to ASCII case.
+///
+/// Its twin is `reports_already_funded` in the test-support testnet helpers,
+/// which test funding uses; both keep one rule.
 fn reports_already_funded(body: &str) -> bool {
     body.to_ascii_lowercase().contains("already funded")
 }

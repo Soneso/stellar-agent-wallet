@@ -168,6 +168,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `stellar_agent_core::audit_log::reader::try_unbounded_submission_receipt_cleared_exists`
   reports a clear row with the unbounded acknowledgement and the release.
 
+- `PreparedSigningLedgerRead` checks an endpoint's identity once and reads
+  its latest ledger through the same client under the same deadline.
+- `friendbot_fund`, `FriendbotFundingError` and `FriendbotRequestError` in the
+  test-support testnet helpers.
+
 ### Changed
 
 - `pool init --resume` keeps an attempt the endpoint reports as failed.
@@ -764,6 +769,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `WindowStoreLock::acquire` require the `test-helpers` feature;
   `PersistedWindowStore::resign` takes the profile; `PersistedWindowStore::path`
   is public.
+- `friendbot_funding_request` in the test-support testnet helpers returns
+  `FriendbotRequestError`. Its `DeadlineElapsed` variant reports a deadline
+  that expires before the first attempt, so no request starts.
 
 ### Removed
 
@@ -778,6 +786,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the wallet or signer owns the seed until disposal or drop.
 - `LockedSeed::is_disposed`. Disposal consumes the `LockedSeed`, so no disposed
   value remains to query.
+- `StellarRpcClient::signing_ledger_observation`.
+  `StellarRpcClient::prepare_signing_ledger_observation` and
+  `PreparedSigningLedgerRead::read` replace it.
 
 ### Fixed
 
@@ -795,6 +806,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - CLI `pay`, `stellar_pay` and `stellar_pay_commit` accept the asset code as the
   amount unit for an issued asset and refuse any other label. The documented
   form `"100 TST"` with `TST:<issuer>` works.
+- Testnet funding helpers retry transient Friendbot failures within bounded
+  attempts and time. They accept already funded responses and report bounded
+  failure details.
+- Smart account signing checks both endpoints before it reads either ledger
+  height. It reads the pair again when it is stale or disagrees, within the
+  pre submit deadline. The two ledger tolerance and the expiry bound stay.
 
 ### Security
 

@@ -217,14 +217,9 @@ fn fresh_signer() -> (String, Box<dyn Signer + Send + Sync>) {
 /// Funds a G-strkey via testnet Friendbot and waits for ledger settlement.
 async fn fund_via_friendbot(g_strkey: &str) {
     let url = format!("{TESTNET_FRIENDBOT_URL}?addr={g_strkey}");
-    let resp = stellar_agent_test_support::testnet_helpers::friendbot_funding_request(&url)
+    stellar_agent_test_support::testnet_helpers::friendbot_fund(&url)
         .await
-        .expect("Friendbot HTTP must succeed");
-    assert!(
-        resp.status().is_success(),
-        "Friendbot must return 200 for {g_strkey}; got {}",
-        resp.status()
-    );
+        .expect("Friendbot funds the account");
     // Short wait for ledger settlement.
     tokio::time::sleep(Duration::from_secs(3)).await;
 }

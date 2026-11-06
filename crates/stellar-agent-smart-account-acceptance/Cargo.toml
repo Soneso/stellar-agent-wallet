@@ -24,7 +24,6 @@ testnet-integration = [
     "dep:hex",
     "dep:keyring-core",
     "dep:rand_core",
-    "dep:reqwest",
     "dep:rmcp",
     "dep:serial_test",
     "dep:serde_json",
@@ -106,8 +105,6 @@ stellar-agent-sep48 = { workspace = true, optional = true }
 stellar-agent-defi = { workspace = true, optional = true }
 stellar-agent-defindex = { workspace = true, optional = true }
 soroban-spec-tools = { workspace = true, optional = true }
-# Friendbot status check in the shared smart-account `tests/common/mod.rs`.
-reqwest = { workspace = true, optional = true }
 # The suites name the sync and time modules directly.
 tokio = { workspace = true, optional = true, features = ["sync", "time"] }
 base64 = { workspace = true, optional = true }
@@ -126,9 +123,3 @@ zeroize = { workspace = true, optional = true }
 
 [lints]
 workspace = true
-
-# The suites reach reqwest only through the shared smart-account
-# `tests/common/mod.rs`, which they include by path from outside this
-# directory, so a scan of this directory finds no use.
-[package.metadata.cargo-machete]
-ignored = ["reqwest"]

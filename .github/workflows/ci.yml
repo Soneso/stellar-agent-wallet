@@ -136,6 +136,9 @@ jobs:
       # enable it by default.
       - name: Run the offline tests
         run: cargo test --workspace --no-default-features --features test-helpers,test-hooks,test-loopback,verifier-registry
+      # The Friendbot helper tests run against loopback listeners only; `testnet-helpers` compiles the live client without reaching the network.
+      - name: Run the test-support Friendbot unit tests
+        run: cargo test -p stellar-agent-test-support --no-default-features --features testnet-helpers --lib
       # Without test-helpers, the integration target also checks that the library excludes the revoked test fixture.
       - name: Test the vendored Wasm release configuration
         run: cargo test -p stellar-agent-smart-account --test vendored_wasm_release_cfg

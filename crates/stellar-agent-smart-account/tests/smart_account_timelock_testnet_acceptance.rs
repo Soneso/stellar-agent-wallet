@@ -122,19 +122,14 @@ fn signer_from_seed(seed_bytes: [u8; 32]) -> Box<dyn stellar_agent_network::Sign
 
 /// Funds an account via testnet Friendbot and waits until it is queryable.
 ///
-/// Friendbot returning 200 does not guarantee the RPC has indexed the new
-/// account yet; the view can lag by a few seconds. The wait lets callers build
-/// transactions against the account immediately after this returns.
+/// A funded answer from Friendbot does not guarantee the RPC has indexed the
+/// new account yet; the view can lag by a few seconds. The wait lets callers
+/// build transactions against the account immediately after this returns.
 async fn fund_via_friendbot(g_strkey: &str) {
     let url = format!("{TESTNET_FRIENDBOT_URL}?addr={g_strkey}");
-    let resp = stellar_agent_test_support::testnet_helpers::friendbot_funding_request(&url)
+    stellar_agent_test_support::testnet_helpers::friendbot_fund(&url)
         .await
-        .expect("Friendbot HTTP must succeed");
-    assert!(
-        resp.status().is_success(),
-        "Friendbot must return 200 for {g_strkey}; got {}",
-        resp.status()
-    );
+        .expect("Friendbot funds the account");
 
     let rpc = stellar_agent_network::StellarRpcClient::new(TESTNET_RPC_URL)
         .expect("RPC client construction must succeed");

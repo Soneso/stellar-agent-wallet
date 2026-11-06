@@ -136,14 +136,9 @@ impl Funded {
                 .as_str()
                 .to_owned();
         let url = format!("{TESTNET_FRIENDBOT_URL}?addr={address}");
-        let resp = stellar_agent_test_support::testnet_helpers::friendbot_funding_request(&url)
+        stellar_agent_test_support::testnet_helpers::friendbot_fund(&url)
             .await
-            .unwrap_or_else(|e| panic!("[UNAVAILABLE] Friendbot unreachable for the {role}: {e}"));
-        assert!(
-            resp.status().is_success(),
-            "[UNAVAILABLE] Friendbot returned {} for the {role}",
-            resp.status()
-        );
+            .unwrap_or_else(|e| panic!("[UNAVAILABLE] Friendbot funds the {role}: {e}"));
         Self {
             address,
             seed: Zeroizing::new(signing_key.to_bytes()),
