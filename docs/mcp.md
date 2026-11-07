@@ -361,7 +361,7 @@ probe is retried with bounded exponential backoff inside the caller's timeout
 and never falls back to the declaration; an answer that does not parse, and a
 401 or 403 answer, is not retried.
 [Retries, deadlines, and failover](maintainers/security-internals.md#retries-deadlines-and-failover)
-gives the numbers. This release supports protocol version 29. On testnet and
+gives the numbers. This release supports protocol versions 29 and 30. On testnet and
 other networks, a version outside that range is logged as a warning. On mainnet
 it is refused with `network.unsupported_protocol_version`, a refusal a mainnet
 endpoint never reaches while `network.mainnet_write_forbidden` refuses it first.

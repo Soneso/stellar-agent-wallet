@@ -94,7 +94,7 @@ fn assert_one_protocol_warning(warnings: &[BTreeMap<String, String>], version: u
     );
     assert_eq!(
         warning.get("supported_max").map(String::as_str),
-        Some("29"),
+        Some("30"),
         "{warning:?}"
     );
 }
@@ -304,7 +304,7 @@ async fn identity_429_and_500_are_still_retried() {
 /// warning; outside the range it passes with one warning.
 #[tokio::test]
 async fn a_matching_custom_network_yields_no_chain_and_warns_only_outside_the_range() {
-    for (version, warns) in [(29, false), (30, true)] {
+    for (version, warns) in [(29, false), (30, false), (31, true)] {
         let server = serve_get_network(network(FUTURENET_PASSPHRASE, version)).await;
         let (warnings, guard) = WarningCapture::capture(Some("stellar_agent_network"));
         let found = identity(&server, FUTURENET_PASSPHRASE).await.unwrap();
@@ -325,7 +325,7 @@ async fn a_matching_custom_network_yields_no_chain_and_warns_only_outside_the_ra
 /// none.
 #[tokio::test]
 async fn testnet_outside_the_range_passes_with_one_warning() {
-    for (version, warns) in [(30, true), (29, false)] {
+    for (version, warns) in [(31, true), (30, false), (29, false)] {
         let server = serve_get_network(network(TESTNET_PASSPHRASE, version)).await;
         let (warnings, guard) = WarningCapture::capture(Some("stellar_agent_network"));
         let found = identity(&server, TESTNET_PASSPHRASE).await.unwrap();
@@ -347,7 +347,7 @@ async fn testnet_outside_the_range_passes_with_one_warning() {
 /// sees its unsupported version, even when mainnet was expected.
 #[tokio::test]
 async fn a_mainnet_endpoint_is_refused_before_the_protocol_rule() {
-    let server = serve_get_network(network(MAINNET_PASSPHRASE, 30)).await;
+    let server = serve_get_network(network(MAINNET_PASSPHRASE, 31)).await;
 
     let result = identity(&server, MAINNET_PASSPHRASE).await;
     assert!(
@@ -363,7 +363,7 @@ async fn a_mainnet_endpoint_is_refused_before_the_protocol_rule() {
 /// protocol rule sees its unsupported version.
 #[tokio::test]
 async fn a_mismatch_is_refused_before_the_protocol_rule() {
-    let server = serve_get_network(network(TESTNET_PASSPHRASE, 30)).await;
+    let server = serve_get_network(network(TESTNET_PASSPHRASE, 31)).await;
 
     let (warnings, _guard) = WarningCapture::capture(Some("stellar_agent_network"));
 

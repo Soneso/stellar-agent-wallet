@@ -435,8 +435,8 @@ is `network.endpoint_network_mismatch`; an endpoint whose identity cannot be
 established in time is `network.endpoint_identity_unavailable`; one that
 answers the identity request with HTTP 401 or 403 is
 `network.rpc_credential_refused`. The same answer
-carries the endpoint's protocol version: this release supports protocol 29.
-Outside it, testnet logs a warning and continues; on mainnet the rule refuses
+carries the endpoint's protocol version: this release supports protocols 29 and 30.
+Outside them, testnet logs a warning and continues; on mainnet the rule refuses
 with `network.unsupported_protocol_version`, which a mainnet endpoint never
 reaches while mainnet writes are refused. Signatures are
 then checked against the network the endpoint reported: an envelope signed for
