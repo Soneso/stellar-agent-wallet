@@ -7504,7 +7504,7 @@ pub(crate) mod tests {
 
         #[tokio::test]
         #[serial_test::serial(keyring)]
-        async fn commit_copies_the_presented_deadline_across_elapsed_time() {
+        async fn mainnet_time_bounds_prepare_and_commit_preserve_the_deadline() {
             let now = stellar_agent_core::timefmt::now_unix_ms().unwrap() + CLOCK_LEAD_MS;
             let clock = stellar_agent_network::mainnet::clock::set_now_ms_for_test(now);
             for tool in Tool::ALL {

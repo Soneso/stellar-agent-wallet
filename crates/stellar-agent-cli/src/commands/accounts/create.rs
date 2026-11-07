@@ -3486,7 +3486,7 @@ mod tests {
         /// authorization and its confirmation entry.
         #[tokio::test(flavor = "current_thread")]
         #[serial_test::serial]
-        async fn accept_below_the_threshold() {
+        async fn mainnet_time_bounds_sponsored_accounts_create() {
             let fixture = Spec::new("mainnet-create-accept").build().await;
 
             let built_at_ms =

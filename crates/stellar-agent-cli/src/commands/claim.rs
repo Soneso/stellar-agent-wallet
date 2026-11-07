@@ -4597,7 +4597,7 @@ mod tests {
         /// authorization and its confirmation entry.
         #[tokio::test(flavor = "current_thread")]
         #[serial_test::serial]
-        async fn accept() {
+        async fn mainnet_time_bounds_claim() {
             let fixture = spec("mainnet-claim-accept").build().await;
 
             let built_at_ms =

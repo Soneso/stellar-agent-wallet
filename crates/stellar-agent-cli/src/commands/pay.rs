@@ -5923,7 +5923,7 @@ mod tests {
         /// confirmation entry and never reaches the oracle.
         #[tokio::test(flavor = "current_thread")]
         #[serial_test::serial]
-        async fn accept_with_a_memo_below_the_threshold() {
+        async fn mainnet_time_bounds_pay() {
             let fixture = Spec::new("mainnet-pay-accept-memo").build().await;
 
             let built_at_ms =

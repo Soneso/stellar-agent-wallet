@@ -2884,7 +2884,7 @@ mod tests {
         /// signed through the keyring handle and sent once.
         #[tokio::test(flavor = "current_thread")]
         #[serial_test::serial]
-        async fn accept() {
+        async fn mainnet_time_bounds_trustline() {
             let fixture = spec("mainnet-trustline-accept").build().await;
 
             let built_at_ms =
