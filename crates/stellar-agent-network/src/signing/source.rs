@@ -1,8 +1,10 @@
 //! Shared signer-resolution helpers — software and hardware.
 //!
 //! Centralises the seed-zeroisation discipline for both signing paths.
-//! Every call site resolves to a `signer_from_env` / `signer_from_ledger`
-//! call followed by `attach_signature`.
+//! [`signer_from_env`] and [`signer_from_ledger`] resolve a signer
+//! and check its key.
+//! [`require_signer_key`] checks the key
+//! for a caller that opens the device itself.
 //!
 //! # Seed-zeroisation invariant
 //!
@@ -11,12 +13,12 @@
 //! 1. `std::env::var` result immediately wrapped in `Zeroizing<String>`.
 //! 2. `stellar_strkey::ed25519::PrivateKey::from_string` parses the S-strkey.
 //! 3. Seed bytes copied into `Zeroizing<[u8; 32]>`.
-//! 4. `zeroize::Zeroize::zeroize(&mut private_key.0)` — explicit zeroisation of
-//!    the `Copy` residue in the `PrivateKey` stack local.
-//! 5. `Zeroizing<String>` holding the S-strkey dropped before `SoftwareSigningKey`
-//!    is returned.
-//! 6. `SoftwareSigningKey::new_from_zeroizing` moves the seed into a `SecretBox`,
-//!    whose `Drop` impl zeroes the heap allocation.
+//! 4. `zeroize::Zeroize::zeroize(&mut private_key.0)`: explicit zeroisation
+//!    of the `Copy` residue in the `PrivateKey` stack local.
+//! 5. `Zeroizing<String>` holding the S-strkey dropped before
+//!    `SoftwareSigningKey` is returned.
+//! 6. `SoftwareSigningKey::new_from_zeroizing` moves the seed into a
+//!    `SecretBox`, whose `Drop` impl zeroes the heap allocation.
 //!
 //! # stellar-strkey upstream gap
 //!
@@ -27,7 +29,8 @@
 //!
 //! # Public key verification before use
 //!
-//! Both helpers derive or fetch the public key from the signer and compare it
+//! `signer_from_env` and `signer_from_ledger` derive or fetch the public key
+//! from the signer and compare it
 //! against the `expected_source_g` argument BEFORE returning. Any mismatch
 //! returns `AuthError::SignerKeyMismatch`, ensuring no RPC or network call
 //! proceeds if the key doesn't match the claimed source.
@@ -120,16 +123,7 @@ pub(crate) async fn signer_from_s_strkey(
     // Derive public key and compare to expected_source_g BEFORE any RPC call.
     // A key mismatch exits here — the signer is never returned.
     let signer_pk: stellar_strkey::ed25519::PublicKey = signer.public_key().await?;
-    // stellar-strkey's PublicKey::to_string() returns a heapless String; the second
-    // .to_string() (Display) converts to std::String.
-    let signer_gstrkey = signer_pk.to_string().to_string();
-    if signer_gstrkey != expected_source_g {
-        return Err(WalletError::Auth(AuthError::SignerKeyMismatch {
-            what: "the expected signing account",
-            expected: expected_source_g.to_owned(),
-            got: signer_gstrkey,
-        }));
-    }
+    require_signer_key(signer_pk, expected_source_g, "the expected signing account")?;
 
     Ok(signer)
 }
@@ -230,9 +224,37 @@ pub async fn signer_from_ledger(
     // for approval (Ledger Stellar app P1=0x00 path). Mismatch exits here
     // without proceeding to sign.
     let signer_pk: stellar_strkey::ed25519::PublicKey = hw_key.public_key().await?;
+    require_signer_key(signer_pk, expected_source_g, what)?;
+
+    Ok(hw_key)
+}
+
+/// Requires the signer's public key to match the expected signing account.
+///
+/// `what` names the account in the mismatch message, such as `--source`.
+///
+/// # Errors
+///
+/// Returns [`WalletError::Auth`] wrapping [`AuthError::SignerKeyMismatch`]
+/// when the public keys differ.
+///
+/// # Examples
+///
+/// ```
+/// use stellar_agent_network::signing::source::require_signer_key;
+///
+/// let public_key = stellar_strkey::ed25519::PublicKey([1; 32]);
+/// require_signer_key(public_key, &public_key.to_string(), "--source")?;
+/// # Ok::<(), stellar_agent_core::WalletError>(())
+/// ```
+pub fn require_signer_key(
+    public_key: stellar_strkey::ed25519::PublicKey,
+    expected_source_g: &str,
+    what: &'static str,
+) -> Result<(), WalletError> {
     // stellar-strkey's PublicKey::to_string() returns a heapless String; the second
     // .to_string() (Display) converts to std::String.
-    let signer_gstrkey = signer_pk.to_string().to_string();
+    let signer_gstrkey = public_key.to_string().to_string();
     if signer_gstrkey != expected_source_g {
         return Err(WalletError::Auth(AuthError::SignerKeyMismatch {
             what,
@@ -241,7 +263,7 @@ pub async fn signer_from_ledger(
         }));
     }
 
-    Ok(hw_key)
+    Ok(())
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -346,6 +368,27 @@ mod tests {
         };
         assert_eq!(err.category(), ErrorCategory::Auth);
         assert_eq!(err.code(), "auth.signer_key_mismatch");
+    }
+
+    #[test]
+    fn require_signer_key_mismatch_names_what() {
+        let expected_key = stellar_strkey::ed25519::PublicKey([1; 32]);
+        let device_key = stellar_strkey::ed25519::PublicKey([2; 32]);
+        let expected_account = expected_key.to_string().to_string();
+
+        let err = require_signer_key(device_key, &expected_account, "--source").unwrap_err();
+        match err {
+            WalletError::Auth(AuthError::SignerKeyMismatch {
+                what,
+                expected,
+                got,
+            }) => {
+                assert_eq!(what, "--source");
+                assert_eq!(expected, expected_account);
+                assert_eq!(got, device_key.to_string().to_string());
+            }
+            other => panic!("expected signer key mismatch, got {other:?}"),
+        }
     }
 
     #[tokio::test]

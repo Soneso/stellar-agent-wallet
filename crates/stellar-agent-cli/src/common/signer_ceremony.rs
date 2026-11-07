@@ -57,10 +57,11 @@ use stellar_agent_core::wallet::{DEFAULT_TTL_SECONDS, MlockRequired};
 use stellar_agent_core::wallet::{MlockDegradation, Wallet};
 use stellar_agent_network::keyring::{EnrolledSigner, lazy_signer_from_keyring};
 use stellar_agent_network::signing::hardware::HardwareSigningKey;
+use stellar_agent_network::signing::source::require_signer_key;
 use stellar_agent_network::signing::wallet::signer_from_wallet;
 use stellar_agent_network::{
     KeyringSignHandle, MessagePayload, Signer, SmartAccountAuthDigest, SoftwareSigningKey,
-    SorobanAuthPayload, TxSigningPayload, WebAuthnAssertion, signer_from_ledger,
+    SorobanAuthPayload, TxSigningPayload, WebAuthnAssertion,
 };
 use stellar_agent_smart_account::deployment::DeployerKeypair;
 use zeroize::Zeroizing;
@@ -103,11 +104,20 @@ pub(crate) fn signer_resolutions_on_this_thread() -> usize {
     SIGNER_RESOLUTIONS.with(std::cell::Cell::get) + MAINNET_SIGNERS.with(std::cell::Cell::get)
 }
 
-/// Builds the Ledger signer in place of the device, for a test on this
-/// thread.
+/// Supplies the device public key and Ledger signer for a test on this thread.
 #[cfg(test)]
-pub(crate) type LedgerSignerFactory =
-    std::rc::Rc<dyn Fn(u32, &str) -> Result<Box<dyn Signer + Send + Sync>, WalletError>>;
+pub(crate) type LedgerSignerFactory = std::rc::Rc<
+    dyn Fn(
+        u32,
+        &str,
+    ) -> Result<
+        (
+            stellar_strkey::ed25519::PublicKey,
+            Box<dyn Signer + Send + Sync>,
+        ),
+        WalletError,
+    >,
+>;
 
 #[cfg(test)]
 thread_local! {
@@ -379,12 +389,13 @@ pub(crate) async fn mainnet_signer(
     choice: &MainnetSignerChoice,
     enrolled: &EnrolledSigner,
     source: &str,
+    source_flag: &'static str,
 ) -> Result<MainnetSigner, WalletError> {
     #[cfg(test)]
     MAINNET_SIGNERS.with(|count| count.set(count.get() + 1));
     match choice {
         MainnetSignerChoice::Ledger { account_index } => Ok(MainnetSigner {
-            signer: ledger_signer(*account_index, source).await?,
+            signer: ledger_signer(*account_index, source, source_flag).await?,
             handle_failure: None,
         }),
         MainnetSignerChoice::Keyring => {
@@ -405,14 +416,25 @@ pub(crate) async fn mainnet_signer(
 async fn ledger_signer(
     account_index: u32,
     source: &str,
+    source_flag: &'static str,
 ) -> Result<Box<dyn Signer + Send + Sync>, WalletError> {
+    let device = async {
+        let signer = HardwareSigningKey::native()?.with_account_index(account_index);
+        let public_key = signer.public_key().await?;
+        Ok::<_, WalletError>((
+            public_key,
+            Box::new(signer) as Box<dyn Signer + Send + Sync>,
+        ))
+    };
     #[cfg(test)]
-    if let Some(factory) = LEDGER_SIGNER_FACTORY.with(|slot| slot.borrow().clone()) {
-        return factory(account_index, source);
-    }
-    Ok(Box::new(
-        signer_from_ledger(account_index, source, "the expected signing account").await?,
-    ))
+    let (public_key, signer) = match LEDGER_SIGNER_FACTORY.with(|slot| slot.borrow().clone()) {
+        Some(factory) => factory(account_index, source)?,
+        None => device.await?,
+    };
+    #[cfg(not(test))]
+    let (public_key, signer) = device.await?;
+    require_signer_key(public_key, source, source_flag)?;
+    Ok(signer)
 }
 
 /// The lazy keyring handle of the enrolled agent seed, recording whether a
@@ -692,13 +714,20 @@ mod tests {
         assert!(target.sign_tx_payload(&tx_payload(7)).await.is_ok());
         assert!(!failed.load(Ordering::SeqCst));
         let record = Arc::clone(&failed);
+        let agent_public = SoftwareSigningKey::new_from_bytes(AGENT_SEED)
+            .public_key()
+            .await
+            .unwrap();
         let _factory = set_ledger_signer_factory(std::rc::Rc::new(move |_, _| {
-            Ok(Box::new(ForwardingSigner {
-                target: KeyringHandleSigner {
-                    handle: lazy_signer_from_keyring(&entry, &public.to_string())?,
-                    failed: Arc::clone(&record),
-                },
-            }))
+            Ok((
+                agent_public,
+                Box::new(ForwardingSigner {
+                    target: KeyringHandleSigner {
+                        handle: lazy_signer_from_keyring(&entry, &public.to_string())?,
+                        failed: Arc::clone(&record),
+                    },
+                }),
+            ))
         }));
         let command = PayCommand::parse_from([
             "pay",

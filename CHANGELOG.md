@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `stellar_agent_network::signing::source::require_signer_key` compares a signer's public key with the expected signing account and names that account in the mismatch error.
+
 - `submission_accounting_expired` audit event and the
   `submission.settlement_unverifiable` code.
 
@@ -805,6 +807,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A Ledger signer-key mismatch on mainnet names the flag that supplies the account (`--source` or `--sponsor`), as the testnet path does.
 - A file-backed store lock (approval, audit writer, window state, receipt, counterparty cache, MPP, pool initialization, headless keyring) is released when its guard drops, also while a process spawned by another thread still holds a copy of the descriptor. The next opener of the same store succeeds at once instead of reading the store as locked by another writer.
 - Interrupted MPP writes leave the committed store readable or complete on the
   next read. State reset keeps authenticated records and closes unclaimed

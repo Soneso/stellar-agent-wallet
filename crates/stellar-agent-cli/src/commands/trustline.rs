@@ -1402,6 +1402,7 @@ where
             probe_deadline: profile.submit_timeout(),
             submit_timeout: profile.submit_timeout(),
             source: &args.from,
+            source_flag: "--from",
             signer: MainnetSignerChoice::Keyring,
             policy: &policy,
             evaluation: &evaluation,
