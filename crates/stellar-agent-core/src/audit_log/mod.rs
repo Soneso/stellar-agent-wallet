@@ -110,9 +110,10 @@
 //!
 //! # Reserved event kinds
 //!
-//! `PluginInvoked` and `AuditRotationHandoff` are declared in [`EventKind`]
-//! but not currently emitted by this crate; they are recognised by
-//! `audit verify` so future additions require no retroactive schema change.
+//! `PluginInvoked` is declared in [`EventKind`] but not currently emitted by
+//! this crate; it is recognised by `audit verify` so future additions require
+//! no retroactive schema change. `AuditRotationHandoff` is emitted at every
+//! rotation; see the "Per-rotation hash-chain bridge" section above.
 //! `WalletMlockFailed` is emitted by the CLI's secret-env signer ceremony
 //! (`stellar-agent-cli::common::signer_ceremony`) when `Wallet::unlock`
 //! degrades under `MlockRequired::Warn`.
