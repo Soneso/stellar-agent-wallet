@@ -13,16 +13,20 @@
 //! the receipt is missing, the way `stellar-agent tx status` does. A reported
 //! failure or missing transaction does not release possible spending, and a
 //! reported success writes no submitted row. A reservation ends once its
-//! accounting horizon has passed, with `record.release_code`
-//! `submission.accounting_expired` and the outcome unknown. That expiry owes
+//! accounting horizon has passed, with the outcome unknown. A pending or
+//! ambiguous `record` then carries `release_code`
+//! `submission.accounting_expired`, and a record with another status keeps its
+//! status and code. That expiry owes
 //! one `submission_accounting_expired` audit event, which the call delivers
 //! from the verified window state. The receipt is display data: `record`
 //! carries `settlement_evidence: "unavailable"`, and no receipt status writes
 //! an audit row. A hold that remains is reported as `reservation`. One marked
 //! `operator_required` ends at its accounting horizon when it has a time
-//! bound. Before that, or without a time bound, the operator's
-//! `stellar-agent tx receipt clear` resolves it, and an untimed one needs
-//! `--acknowledge-unbounded` as well. No step sends the transaction again.
+//! bound. Once its execution bound has passed, the operator's
+//! `stellar-agent tx receipt clear --acknowledge` clears an eligible receipt,
+//! and the bounded spend stays charged through the horizon. An untimed hold
+//! clears with `--acknowledge --acknowledge-unbounded`. No step sends the
+//! transaction again.
 //!
 //! # Why a read tool is not read-only
 //!
@@ -81,8 +85,9 @@ impl WalletServer {
                        spending remains charged through the later of the signed deadline and \
                        the first success observation, plus every affected window; untimed \
                        exposure requires explicit operator acknowledgement. \
-                       Accounting expiry leaves the outcome unknown and records \
-                       submission.accounting_expired in record.release_code without a failed \
+                       Accounting expiry leaves the outcome unknown, records \
+                       submission.accounting_expired in record.release_code of a pending or \
+                       ambiguous record, keeps any other status and code, and writes no failed \
                        value-action row. record is display data: settlement_evidence is \
                        unavailable, and settlement_decision_id only locates an accounting \
                        decision. A hold that remains is returned as \

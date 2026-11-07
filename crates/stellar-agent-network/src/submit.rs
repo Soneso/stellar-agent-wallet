@@ -748,16 +748,21 @@ pub(crate) async fn authorized_submission(
     .map_err(|error| error.into_wallet_error(client, timeout))?)
 }
 
-/// What settles a negative answer of the endpoint a submission was sent to.
+/// Which negative answers of the endpoint a submission was sent to are
+/// reported to the recorder as definitive.
+///
+/// A report retains exposure: the wallet's recorder keeps the receipt, the
+/// pending audit row and the reservation for every outcome it receives.
 #[derive(Clone, Copy)]
 enum FailureWitness<'a> {
-    /// The endpoint's own `FAILED` confirmation and its own send refusal
-    /// settle the submission.
+    /// The endpoint's own `FAILED` confirmation and its own send refusal are
+    /// reported as definitive.
     Primary,
-    /// A mainnet submission: a `FAILED` confirmation settles the submission
-    /// only when this oracle reports `FAILED` for the same hash, and a send
-    /// refusal settles nothing. `None` is a profile without an oracle, whose
-    /// negative answers therefore settle nothing.
+    /// A mainnet submission: a `FAILED` confirmation is reported as failed on
+    /// chain only when this oracle reports `FAILED` for the same hash, and a
+    /// send refusal is reported as an unknown outcome. `None` is a profile
+    /// without an oracle, whose negative answers are therefore reported as
+    /// unknown outcomes.
     Oracle(Option<&'a StellarRpcClient>),
 }
 
@@ -814,11 +819,11 @@ fn proof_matches(
 
 /// Sends the recorded envelope once, through the retry of transport failures
 /// that resends the same bytes, compares the endpoint's hash with the local
-/// one, and polls for the confirmation. `witness` decides what settles a
-/// negative answer.
+/// one, and polls for the confirmation. `witness` decides how a negative
+/// answer is reported.
 ///
 /// With `send_by`, no attempt starts at or after it, the first included;
-/// [`refuse_past_send_by`] settles the record of a refused attempt.
+/// [`refuse_past_send_by`] reports a refused attempt to the recorder.
 #[allow(
     clippy::too_many_arguments,
     reason = "the facts both submit paths established before the send"
@@ -1047,8 +1052,8 @@ fn lose_send_answer(
 /// abort the submission. Every path ends at the deadline at the latest, even
 /// when every poll errors.
 ///
-/// A `FAILED` answer settles the record as [`settle_failed_answer`] decides
-/// under `witness`.
+/// A `FAILED` answer is reported as [`settle_failed_answer`] decides under
+/// `witness`; the record and its reservation stand.
 ///
 /// Keep in sync with the poll loop in `idempotent_submit.rs`: any change to
 /// the deadline or retryable-error treatment here must be mirrored there.
@@ -1201,7 +1206,7 @@ where
 /// Under [`FailureWitness::Primary`] the answer is reported as failed on
 /// chain, and the failure it maps to is returned. Under
 /// [`FailureWitness::Oracle`] the answer is a claim the oracle is consulted
-/// about: only the oracle's own `FAILED` for the same hash is reported as
+/// about. Only the oracle's own `FAILED` for the same hash is reported as
 /// failed on chain, under the code mapped from the oracle's record. Anything
 /// else is reported as an unknown outcome, as for a lost answer, and the
 /// caller gets the timeout shape. The wallet's

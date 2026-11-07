@@ -460,8 +460,8 @@ signer. Its default fee comes from `classic_fee_per_op_stroops`, or 100 when
 unset. Cap refusals identify that profile default.
 Only an absent issuer produces `trustline.gate_refused`; other issuer read
 errors retain their own codes and scrubbed messages.
-The JSON result includes `cross_check`; pending and submitted rows carry a
-passed witness.
+The JSON result includes `cross_check`; the pending row carries a passed
+witness.
 
 | Flag | Meaning | Required | Default |
 |---|---|---|---|
@@ -625,9 +625,11 @@ settles them.
 
 ### `stellar-agent tx status <HASH> [flags]`
 
-Asks the endpoint what became of `<HASH>` and records the answer on the
-receipt as a report. A reported success writes no submitted row, and a
-reported failure or missing transaction releases nothing. The reservation ends
+Asks the endpoint what became of `<HASH>` and records a reported success on
+the receipt, unless the receipt of an untimed hold already records another
+network answer. A reported success writes no submitted row. A reported failure
+or missing transaction preserves the existing receipt status and releases
+nothing. The reservation ends
 at its accounting horizon, which owes one `submission_accounting_expired` audit
 event. This is the way out of `submission.tx_timeout`.
 
@@ -836,10 +838,10 @@ replaced and any accounting disposition.
 An outage that interrupts submissions leaves their records standing. Two things
 resolve them, and nothing else does:
 
-1. **Wait.** Every value verb settles the oldest open reservations before its
+1. **Wait.** Every value verb reconciles the oldest open reservations before its
    own policy gate, once they are five minutes old and the chain can answer for
    them. Typically there are none and the verb costs nothing extra.
-2. **Ask.** `tx status <HASH>` settles one submission by name, with no waiting
+2. **Ask.** `tx status <HASH>` reconciles one submission by name, with no waiting
    period.
 
 Until a record is settled, the same intent at the same sequence is refused with

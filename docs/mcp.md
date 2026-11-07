@@ -695,7 +695,7 @@ against the profile; it selects the router from it.
 
 The four classic MCP commits obtain a witness after their policy and fee checks
 and before the audit pre-flight, nonce consumption, and signer load.
-Results include `cross_check`; pending and submitted rows carry a passed witness.
+Results include `cross_check`; the pending row carries a passed witness.
 Trustline and claim commits are unvalued. Testnet without an oracle reports
 `skipped`; a configured but unavailable oracle refuses `network.witness_unavailable`.
 Disagreements refuse `simulation.divergence`. Credential failures keep
@@ -755,7 +755,7 @@ Other non-ASCII text is accepted.
 
 `stellar_transaction_status` refuses with `submission.record_unavailable` when the spending-window file cannot be read.
 
-A v1 rule set that names tools explicitly must include `stellar_transaction_status` to settle timed-out submissions through that server; the server logs `policy.transaction_status_unmatched` at startup when neither that tool nor `*` appears.
+A v1 rule set that names tools explicitly must include `stellar_transaction_status` to reconcile timed-out submissions through that server; the server logs `policy.transaction_status_unmatched` at startup when neither that tool nor `*` appears.
 
 ### Trustline
 

@@ -427,16 +427,16 @@ A mainnet profile requires `providers.oracle`, a host distinct from `rpc_url`,
 and a `[providers.primary]` record. Endpoint validation and URL redaction apply.
 `providers.oracle` can name a keyring credential for the endpoint.
 
-On mainnet the oracle also witnesses settlement, once it reports the mainnet
-passphrase. A submission the primary endpoint reports failed, refused, or
-unknown is checked against the oracle's answers: its transaction status, and
+On mainnet the oracle also witnesses reconciliation, once it reports the
+mainnet passphrase. A submission the primary endpoint reports failed, refused,
+or unknown is checked against the oracle's answers: its transaction status, and
 for an unknown transaction its retention window, ledger close time and account
 sequence. The oracle's success is recorded as a report, and its failure or
 absence keeps the spending-window reservation. When the profile names no
-oracle at settlement, as after the operator removes it, such a submission
-stays pending with its reservation held. Accounting expiry runs before any
-endpoint or oracle lookup, so a time-bounded reservation still ends once its
-accounting horizon passes. An untimed one stays until the operator clears it
+oracle at reconciliation, as after the operator removes it, such a submission
+preserves the existing receipt status and its reservation. Accounting expiry
+runs before any endpoint or oracle lookup, so a time-bounded reservation still
+ends once its accounting horizon passes. An untimed one stays until the operator clears it
 with `stellar-agent tx receipt clear`.
 
 ### Provider attestations

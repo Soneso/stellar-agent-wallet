@@ -690,9 +690,10 @@ impl<'a> WalletSubmissionRecorder<'a> {
 
 /// Completes a sent receipt's approval tombstone and acknowledges it durably.
 ///
-/// The receipt holds the nonce until a definitive send refusal releases it.
-/// A failed approval write or acknowledgement leaves the obligation available
-/// to the next status call, and the commit gate continues to refuse reuse.
+/// The receipt holds the nonce durably, and every sent outcome consumes it,
+/// a refused send included. A failed approval write or acknowledgement leaves
+/// a retryable consumption repair for the next status call, and the commit
+/// gate continues to refuse reuse.
 ///
 /// # Errors
 ///

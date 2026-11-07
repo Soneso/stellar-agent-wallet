@@ -207,7 +207,7 @@ pub enum ReceiptStatus {
     /// separately from "it was rejected".
     Reorged,
 
-    /// An operator acknowledged a submission and cleared its receipt.
+    /// An operator acknowledges a submission and clears its receipt.
     ///
     /// Written by `tx receipt clear --acknowledge` after the command has
     /// reconciled the submission against the chain: for an `Ambiguous`
@@ -1386,9 +1386,9 @@ impl ReceiptStore {
         self.finalize_with_release(envelope_hash, status, ledger, None)
     }
 
-    /// Records that reconciliation released the receipt's reservation on
-    /// `evidence`: the status becomes `Ambiguous` and
-    /// [`SubmissionReceipt::release_code`] carries the evidence.
+    /// Records an observation on the receipt: the status becomes `Ambiguous`
+    /// and [`SubmissionReceipt::release_code`] carries `evidence`. The code
+    /// is display data and releases no reservation.
     ///
     /// Follows the transition rule of [`Self::finalize`]: a `Pending` receipt
     /// and an `Ambiguous` one accept it, and a settled or cleared receipt

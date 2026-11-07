@@ -154,7 +154,7 @@ sequenceDiagram
   M->>L: Receipt, pending row, optional reservation
   M->>R: sendTransaction and poll getTransaction
   alt Confirmed
-    M->>L: Record submitted outcome
+    M->>L: Record reported success on receipt
     M->>S: Mark approval consumed
     M-->>A: Transaction hash and ledger
   else Definitive send refusal
@@ -181,11 +181,11 @@ sequenceDiagram
 7. The server checks the halt marker again before dispatch; the handler checks mainnet authorization on a mainnet profile, evaluates decoded arguments against fresh reads, verifies required consent, and rejects an envelope that differs from its rebuild.
 8. It obtains any required oracle witness, checks audit readiness, and consumes the verified nonce before loading the signing key.
 9. After signing, the submit layer checks endpoint and signature binding, then records the receipt, pending audit row, and any spending reservation before sending.
-10. Confirmation records success. A definitive failure, like an uncertain outcome, keeps the receipt, the pending row, and the reservation until accounting expiry or an operator clear. Reconciliation, the process of checking what actually settled, reads the chain meanwhile.
+10. Confirmation records success. A definitive failure, like an uncertain outcome, keeps the receipt, the pending row, and the reservation. A bounded reservation stays charged through its accounting horizon, even after an operator clear; an untimed one ends only at an operator clear with both acknowledgement flags. Reconciliation, the process of checking what actually settled, reads the chain meanwhile.
 
 Only confirmed success returns a ledger number.
 A sent submission consumes its approval hold, the reservation of consent for one submission, whatever its outcome.
-Outcome audit writes after submission are best effort; the durable pending record supports recovery.
+No outcome audit row follows the send; the durable pending record supports recovery.
 
 ## Guarantees and who enforces them
 

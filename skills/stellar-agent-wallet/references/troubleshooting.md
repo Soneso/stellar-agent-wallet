@@ -415,7 +415,7 @@ around it. No recovery path sends a transaction again.
 | `submission.tx_already_submitted` | A pending record already holds this transaction's source account and sequence, or the spending window already holds these signed bytes. Nothing was sent. `details.tx_hash` names the transaction to reconcile. | Reconcile `details.tx_hash` first. Once it is settled, the sequence is free and a fresh simulate-and-commit proceeds. |
 | `submission.hash_mismatch` | The endpoint reported a transaction hash that does not describe the transaction that was sent. `details` carries both hashes. | Reconcile `details.tx_hash`. Report the mismatch to the operator: the endpoint is not describing what it was handed. |
 | `submission.record_unavailable` | A receipt, spending-window, or audit-record failure. Before submission, this means that attempt sent nothing; a pending-row anchor failure carries `audit.tip_anchor_unavailable` in the message. During status recovery, it concerns an existing submission and does not establish whether it was sent. | Report to the operator. After repair, repeat `stellar_transaction_status` for an existing submission; do not rebuild or resubmit it. Retry submission only when the failure is known to precede the send. |
-| `submission.tx_malformed` | The endpoint refused the transaction outright, reporting a validation error for the envelope (for example the fee was below the current floor). The wallet never sends those bytes again. A reported failure or missing transaction does not release possible spending: the record stays `pending` and the reservation keeps counting until its accounting horizon passes or the operator clears it. On a mainnet profile a refusal is reported as `submission.tx_timeout` instead, because no second endpoint confirms it. | Call `stellar_transaction_status` with `details.tx_hash`. Once the accounting horizon has passed or the operator has cleared the record, a fresh simulate-and-commit proceeds. Do not resubmit the same bytes. |
+| `submission.tx_malformed` | The endpoint refused the transaction outright, reporting a validation error for the envelope (for example the fee was below the current floor). The wallet never sends those bytes again. A reported failure or missing transaction does not release possible spending: the record stays `pending`. The reservation keeps counting through its accounting horizon or, without a time bound, until the operator clears it with both acknowledgement flags. On a mainnet profile a refusal is reported as `submission.tx_timeout` instead, because no second endpoint confirms it. | Call `stellar_transaction_status` with `details.tx_hash`. Once the accounting horizon has passed or the operator has cleared the record, a fresh simulate-and-commit proceeds. Do not resubmit the same bytes. |
 | `policy.approval_consumed` | The approval presented was already spent. A classic approval was spent on a submission. A consumed x402 approval cannot be replayed. Its stored digest identifies the final envelope, not a chain transaction. | Do not re-present the same approval. For a classic approval, check that transaction's status before asking for the action again. For an x402 payment, request a new payment intent with call 1 and a fresh approval. |
 
 What `stellar_transaction_status` reports, and what it means:
@@ -426,16 +426,20 @@ A reported failure or missing transaction does not release possible spending.
   through. Report it as done. The spend keeps counting through the
   transaction's accounting horizon, and no submitted row is written.
 - `chain_status: "FAILED"`: the endpoint reports that the transaction applied
-  and failed. The record keeps its status and the reservation keeps counting
-  until its accounting horizon passes or the operator clears it.
+  and failed. The record keeps its status, and the reservation keeps counting
+  through its accounting horizon. Without a time bound it counts until the
+  operator clears it with both acknowledgement flags.
 - `chain_status: "NOT_FOUND"` with `record.status: "pending"`: nothing is
   established. The transaction can still apply. Wait and call again.
 - On a mainnet profile, `chain_status` is the primary endpoint's answer; its
   `FAILED` or `NOT_FOUND` decides nothing alone, and the oracle named by
-  `oracle_provider_url` is asked as well. A profile without an oracle keeps
-  such a record `pending` until its accounting horizon passes or the operator
-  clears it with `stellar-agent tx receipt clear <ENVELOPE_HASH>
-  --acknowledge`.
+  `oracle_provider_url` is asked as well. A profile without an oracle
+  preserves the existing receipt status and the reservation. A time-bounded
+  reservation ends at its accounting horizon. Once its execution bound has
+  passed, an eligible receipt clears with `stellar-agent tx receipt clear
+  <ENVELOPE_HASH> --acknowledge`, and the bounded spend stays charged through
+  the horizon. An untimed hold clears with `--acknowledge
+  --acknowledge-unbounded`.
 - `record.status: "ambiguous"` with `record.release_code:
   "submission.accounting_expired"`: the accounting horizon has passed. The
   horizon is the later of the signed time bound and the first local success
@@ -447,20 +451,22 @@ A reported failure or missing transaction does not release possible spending.
   whatever the endpoint reports.
 - `chain_status: "NOT_FOUND"` with `record.status: "ambiguous"` and no
   `release_code`: the endpoint can no longer answer for it at all. A
-  time-bounded reservation still ends at its accounting horizon. Before that,
-  or without a time bound, the operator resolves it with
-  `stellar-agent tx receipt clear <ENVELOPE_HASH> --acknowledge`, plus
-  `--acknowledge-unbounded` for a transaction without a time bound.
+  time-bounded reservation still ends at its accounting horizon. Once its
+  execution bound has passed, an eligible receipt clears with
+  `stellar-agent tx receipt clear <ENVELOPE_HASH> --acknowledge`, and the
+  bounded spend stays charged through the horizon. An untimed hold clears with
+  `--acknowledge --acknowledge-unbounded`.
 - A validation error for the envelope at the send, such as
   `submission.tx_malformed` on testnet, records no failure. The record stays
-  `pending`, and the reservation keeps counting until its accounting horizon
-  passes or the operator clears it. The wallet never sends those bytes again.
+  `pending`. The reservation keeps counting through its accounting horizon,
+  or, without a time bound, until the operator clears it with both
+  acknowledgement flags. The wallet never sends those bytes again.
 - No `record`, and a `reservation` with `operator_required: true`: the receipt
   is missing and the endpoint can no longer answer for the transaction. A
-  time-bounded reservation still ends at its accounting horizon. Before that,
-  or without a time bound, the operator resolves it with
-  `tx receipt clear --acknowledge`, plus `--acknowledge-unbounded` for a
-  transaction without a time bound.
+  time-bounded reservation still ends at its accounting horizon. Once its
+  execution bound has passed, `tx receipt clear --acknowledge` clears the
+  receipt, and the bounded spend stays charged through the horizon. An untimed
+  hold clears with `--acknowledge --acknowledge-unbounded`.
 
 Read `record.status` and `record.release_code`, not `record.reservation_open`.
 An action the policy engine sized no value for takes no reservation at all, so

@@ -76,7 +76,7 @@ enum Commands {
     ///
     /// Provides:
     /// - `tx status <HASH>`: reconcile one submitted transaction against the
-    ///   chain and record the answer as a report. This is the way out of
+    ///   chain and record a reported success. This is the way out of
     ///   `submission.tx_timeout`.
     /// - `tx receipt clear <ENVELOPE_HASH> --acknowledge`: close a submission
     ///   record after reconciling it against the chain.

@@ -82,8 +82,9 @@ the review approves with no blocking findings.
   `a_transport_failure_after_the_record_returns_the_timeout_shape` and
   `a_refused_send_retains_the_reservation_and_sequence`. Confirm that transport
   failures return the timeout shape and definitive refusals return the
-  endpoint's code. Both retain the receipt, the reservation, and the sequence
-  until accounting expiry or an operator clear.
+  endpoint's code. Both retain the receipt, the reservation, and the
+  sequence. A bounded reservation stays charged through its accounting
+  horizon, and an operator clear releases only an untimed one.
 
 ### 6. Public API and dead code
 

@@ -1,10 +1,11 @@
 //! Shared audit emission for value-moving CLI commands.
 //!
-//! Value verbs (pay, claim, create-account, trustline, trade) record a
-//! hash-chained, HMAC-signed `ValueActionSubmitted` row after the on-chain
-//! action confirms. Emission is NON-FATAL post-success: the transaction has
-//! already committed, so a row-write failure logs a `tracing::warn!` and never
-//! changes the command result or exit code.
+//! Value verbs (pay, claim, create-account, trustline, trade) write their
+//! hash-chained, HMAC-signed `ValueActionPending` row through the submission
+//! recorder before the send, and a confirmed submit writes no further value
+//! row. A row [`write_row_logged`] appends after the act it records is
+//! NON-FATAL: a row-write failure logs at `error` and never changes the
+//! command result or exit code.
 //!
 //! The legs carried in a row are the SAME `ValueEffects` the policy gate sized
 //! (single-derivation invariant); this module only serialises what the caller

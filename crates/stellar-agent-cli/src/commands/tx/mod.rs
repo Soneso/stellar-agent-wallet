@@ -29,10 +29,11 @@ pub struct TxArgs {
 pub enum TxSubcommand {
     /// Reconcile one submitted transaction against the chain.
     ///
-    /// Asks the endpoint what became of `<HASH>` and records the answer on
-    /// the receipt as a report. A reported success writes no submitted row,
-    /// and a reported failure or missing transaction does not release the
-    /// spending-window reservation. The reservation ends with the outcome
+    /// Asks the endpoint what became of `<HASH>` and records a reported
+    /// success on the receipt, unless the receipt of an untimed hold already
+    /// records another network answer. A reported success writes no submitted
+    /// row. A reported failure or missing transaction preserves the existing
+    /// receipt status and does not release the spending-window reservation. The reservation ends with the outcome
     /// unknown once its accounting horizon has passed, which owes one
     /// `submission_accounting_expired` audit event.
     ///

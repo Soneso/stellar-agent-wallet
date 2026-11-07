@@ -445,7 +445,7 @@ The non-regular-file check rejects directories and symlinks before open, closing
 
 ### Value-action emission sites
 
-The commit and submit paths in the following table write `value_action_submitted` after the on-chain action confirms. It carries the SAME value legs the policy gate sized (single-derivation invariant: the legs are the `ValueEffects` the gate evaluated, never re-derived at the emission site). The redacted transaction hash (first-8-last-8) and confirmed ledger are recorded; the row never carries key material. Emission is non-fatal: a row-write failure after a confirmed submit logs a warning and never changes the result. A DeFi adapter that instead FAILS at submit records a `sa_raw_invocation` row (with the mapped `SaInvocationResult`) in its error arm.
+The commit and submit paths in the following table write `value_action_pending` through the submission recorder before the send. It carries the SAME value legs the policy gate sized (single-derivation invariant: the legs are the `ValueEffects` the gate evaluated, never re-derived at the emission site). The locally computed transaction hash is recorded redacted (first-8-last-8); the row never carries key material. A row the writer cannot append refuses the send with `submission.record_unavailable`. A reported success writes no further row: the receipt records it as a report. A DeFi adapter that instead FAILS at submit records a `sa_raw_invocation` row (with the mapped `SaInvocationResult`) in its error arm.
 
 x402 authorization signing is the exception to the row kind and to the timing. It writes `x402_payment_authorized` (its own `EventKind` carrying legs, network, and scheme) rather than `value_action_submitted`. The wallet signs the payment authorization without submitting it. The signed authorization still leaves the wallet: the payment flow re-simulates the signed entry against the configured RPC. That RPC therefore observes the signed x402 authorization and is part of the trust boundary.
 
@@ -469,11 +469,11 @@ On mainnet, after release authorization is consumed, the tool consumes the pendi
 
 | Surface | Verb / tool | Row |
 | --- | --- | --- |
-| MCP | `stellar_pay_commit`, `stellar_create_account_commit`, `stellar_claim_commit`, `stellar_trustline_commit` | `value_action_submitted` (sized legs) |
-| MCP | `stellar_dex_trade`, `stellar_defindex_vault_deposit`, `stellar_defindex_vault_withdraw` | `value_action_submitted` on success; `sa_raw_invocation` on submit failure |
+| MCP | `stellar_pay_commit`, `stellar_create_account_commit`, `stellar_claim_commit`, `stellar_trustline_commit` | `value_action_pending` (sized legs) |
+| MCP | `stellar_dex_trade`, `stellar_defindex_vault_deposit`, `stellar_defindex_vault_withdraw` | `value_action_pending` before the send; `sa_raw_invocation` on submit failure |
 | MCP | `stellar_x402_create_payment`, `stellar_x402_authenticated_payment` | `x402_payment_authorized` (its own `EventKind` carrying legs, network, and scheme, plus a passed witness when the payment required one), fatal, before the signed re-simulation. `x402_authorization_withheld` follows a later failure, at a stage the paragraphs above list. Mainnet `x402_payment_authorized` rows record `RequireApproval` before signed re-simulation. Later withholding rows identify the failed stage with the same request identifier. |
-| MCP | `stellar_sep43_sign_and_submit_transaction` | `value_action_submitted` (opaque: empty legs + `opaque_reason`) |
-| CLI | `pay`, `claim`, `accounts create` (sponsored mode only), `trustline`, `trade` | `value_action_submitted` (sized legs) |
+| MCP | `stellar_sep43_sign_and_submit_transaction` | `value_action_pending` (empty legs for an envelope the policy could not size) |
+| CLI | `pay`, `claim`, `accounts create` (sponsored mode only), `trustline`, `trade` | `value_action_pending` (sized legs) |
 
 The value descriptor reaches the emission site through the policy engine's `evaluate_full` / `evaluate_with_value_full`, which surface the sized `ValueEffects` on the allow path; the decision-only `evaluate` / `evaluate_with_value` views discard it and must never gate a value-moving dispatch (see the rustdoc on those methods). Rows are written under the profile's `audit_log_hash_chain_key_id`, loaded through the single `stellar_agent_network::keyring::load_hmac_key_32` source, so `audit verify` covers them.
 
@@ -948,8 +948,9 @@ One oracle request reads every distinct key. The comparator associates answers
 by returned key XDR and validates each entry's embedded identity.
 Duplicate, unrequested, malformed, or inconsistent entries refuse as
 `network.witness_unavailable`. The witness records the oracle authority, ledger,
-SHA-256 digest of compared inputs, and entry kinds. Pending and submitted audit
-rows preserve this evidence, including when reconciliation writes the outcome.
+SHA-256 digest of compared inputs, and entry kinds. The pending audit row
+preserves this evidence. No endpoint answer or reconciliation writes an outcome
+row for the submission.
 
 The chain enforces sequence, source balance, trustline existence, authorization,
 and limits; credit-payment destination existence; account-creation destination

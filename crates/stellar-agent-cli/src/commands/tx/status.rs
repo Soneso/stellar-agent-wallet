@@ -15,20 +15,24 @@
 //!
 //! # What it changes
 //!
-//! - `SUCCESS` is recorded on the receipt as a report. The reservation keeps
-//!   counting through the transaction's accounting horizon, and no submitted
+//! - `SUCCESS` is recorded on the receipt as a report, unless the receipt of
+//!   an untimed hold already records another network answer, which it keeps.
+//!   The reservation keeps counting through the transaction's accounting
+//!   horizon, and no submitted
 //!   row is written: the pending row stays until authenticated evidence
 //!   settles it.
 //! - A reported failure or missing transaction does not release possible
 //!   spending. `FAILED`, and `NOT_FOUND` with a consumed sequence or a ledger
-//!   close time past the time bound, keep the reservation and the receipt
-//!   pending, and owe no `value_action_failed` row.
+//!   close time past the time bound, keep the reservation, preserve the
+//!   existing receipt status, and owe no `value_action_failed` row.
 //! - The accounting horizon is the later of the signed time bound and the
 //!   first local success observation, plus each affected window's duration.
 //!   Once it has passed on this host's clock, the reservation ends with the
-//!   outcome unknown: the receipt is marked ambiguous with
-//!   `release_code` `submission.accounting_expired`, and no failed row is
-//!   owed. The expiry owes one `submission_accounting_expired` audit event,
+//!   outcome unknown, and no failed row is owed. A `pending` or `ambiguous`
+//!   receipt is marked ambiguous with `release_code`
+//!   `submission.accounting_expired`; a receipt with another status keeps its
+//!   status and code. Every projected receipt carries the decision
+//!   identifier. The expiry owes one `submission_accounting_expired` audit event,
 //!   which this verb delivers from the verified window state. An absent
 //!   receipt is rebuilt from the committed expiry.
 //! - The receipt is display data. `record` carries

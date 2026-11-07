@@ -433,8 +433,8 @@ signer. Its default fee comes from `classic_fee_per_op_stroops`, or 100 when
 unset. Cap refusals identify that profile default.
 Only an absent issuer produces `trustline.gate_refused`; other issuer read
 errors retain their own codes and scrubbed messages.
-The JSON result includes `cross_check`; pending and submitted rows carry a
-passed witness.
+The JSON result includes `cross_check`; the pending row carries a passed
+witness.
 Fee-cap and witness refusals carry `error.details.preview` after preview approval.
 
 | Flag | Meaning | Default |
@@ -1324,7 +1324,7 @@ Settles the submission records the value verbs write. Every value-moving verb re
 
 ### `tx status <HASH> [flags]`
 
-Asks the endpoint what became of `<HASH>` and records the answer on the wallet's record of it. This is the way out of `submission.tx_timeout`.
+Asks the endpoint what became of `<HASH>` and records a reported success on the wallet's record of it. This is the way out of `submission.tx_timeout`.
 
 | Flag / arg | Meaning | Default |
 |---|---|---|
@@ -1332,7 +1332,7 @@ Asks the endpoint what became of `<HASH>` and records the answer on the wallet's
 | `--profile <NAME>` | Profile whose records and spending window are settled | `STELLAR_AGENT_PROFILE`, else `default` |
 | `--output <FORMAT>` | `json` or `table` | `json` |
 
-Returns `{tx_hash, chain_status, ledger, record, reservation}`, omitting absent fields. `record` is the wallet's receipt: `envelope_hash`, `status`, `failure_code`, `release_code`, `ledger`, `source_redacted`, `sequence`, `submitted`, `reservation_open`, `settlement_evidence` and `settlement_decision_id`. Receipt output includes `settlement_evidence: unavailable` and an optional `settlement_decision_id`; these display fields do not authenticate settlement. `reservation` is a hold that remains after reconciliation, `{envelope_hash, operator_required}`; `operator_required: true` marks a reservation whose receipt is missing beyond the endpoint's retention window. A time-bounded one still ends at its accounting horizon. Before that, or without a time bound, only `tx receipt clear --acknowledge` resolves it, plus `--acknowledge-unbounded` for one without a time bound.
+Returns `{tx_hash, chain_status, ledger, record, reservation}`, omitting absent fields. `record` is the wallet's receipt: `envelope_hash`, `status`, `failure_code`, `release_code`, `ledger`, `source_redacted`, `sequence`, `submitted`, `reservation_open`, `settlement_evidence` and `settlement_decision_id`. Receipt output includes `settlement_evidence: unavailable` and an optional `settlement_decision_id`; these display fields do not authenticate settlement. `reservation` is a hold that remains after reconciliation, `{envelope_hash, operator_required}`; `operator_required: true` marks a reservation whose receipt is missing beyond the endpoint's retention window. A time-bounded one still ends at its accounting horizon. Once its execution bound has passed, `tx receipt clear --acknowledge` clears an eligible receipt, and the bounded spend stays charged through the horizon. An untimed hold clears with `--acknowledge --acknowledge-unbounded`.
 
 A reported failure or missing transaction does not release possible spending. Bounded uncertainty counts through the later of the signed deadline and the first local success observation, plus each affected spending window.
 

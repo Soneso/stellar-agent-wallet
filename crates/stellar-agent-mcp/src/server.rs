@@ -1538,7 +1538,7 @@ impl ServerHandler for WalletServer {
              read-only); \
              stellar_signed_intents_list (read authenticated smart-account intent charges without writing state); \
              stellar_transaction_status (reconcile one submitted transaction against \
-             the chain and record the answer as a report; the way out of \
+             the chain and record a reported success; the way out of \
              submission.tx_timeout, never re-simulate); \
              stellar_defindex_vault_deposit (DeFindex vault deposit via \
              smart-account submit, destructive); \

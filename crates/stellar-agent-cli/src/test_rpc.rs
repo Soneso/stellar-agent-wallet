@@ -439,7 +439,7 @@ impl Drop for EnvSigner {
 ///
 /// The audit log lives in `audit_dir`, and the profile's audit chain-root key
 /// is minted in the mock keyring [`zero_config`] installed, so a stage
-/// acquires its audit writer and records its pending and submitted rows. The
+/// acquires its audit writer and records its pending rows. The
 /// audit writer registry is process-wide and keyed by profile name, so each
 /// test names its own profile.
 pub(crate) fn witness_profile(
