@@ -178,6 +178,8 @@ pub(crate) struct MainnetWriteRequest<'a> {
     pub(crate) submit_timeout: Duration,
     /// The source account the enrolled signer must be.
     pub(crate) source: &'a str,
+    /// The flag that supplies the source account.
+    pub(crate) source_flag: &'static str,
     /// The signer the flags chose.
     pub(crate) signer: MainnetSignerChoice,
     /// The verified policy and its enablement.
@@ -382,6 +384,7 @@ pub(crate) async fn authorize_and_submit(
         probe_deadline,
         submit_timeout,
         source,
+        source_flag,
         signer: choice,
         policy,
         evaluation,
@@ -403,7 +406,7 @@ pub(crate) async fn authorize_and_submit(
     let source_key = stellar_strkey::ed25519::PublicKey::from_string(source)
         .map_err(|_| {
             Envelope::<()>::err(&WalletError::Validation(ValidationError::address_argument(
-                "--source",
+                source_flag,
             )))
         })?
         .0;
@@ -486,7 +489,7 @@ pub(crate) async fn authorize_and_submit(
     let recorder = prepared.bind_authorized(&auth);
     record_bound_recorder(&recorder);
 
-    let signer = mainnet_signer(&choice, &enrolled, source)
+    let signer = mainnet_signer(&choice, &enrolled, source, source_flag)
         .await
         .map_err(|e| {
             refused(

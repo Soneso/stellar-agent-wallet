@@ -2339,6 +2339,7 @@ where
         probe_deadline: timeout,
         submit_timeout: timeout,
         source,
+        source_flag: "--source",
         signer,
         policy: &policy,
         evaluation: &evaluation,
@@ -6133,6 +6134,28 @@ mod tests {
                 run.message()
             );
             fixture.assert_no_consent_ceremony();
+        }
+
+        /// A Ledger key mismatch names the flag that supplies the account.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn signer_key_mismatch_names_source() {
+            let fixture = Spec::new("mainnet-pay-signer-mismatch").build().await;
+            let _ledger = crate::common::mainnet_write_fixture::install_mismatched_ledger();
+            let args = ledger_args(&fixture);
+
+            let run = run(&fixture, &args).await;
+
+            assert_eq!(run.code(), "auth.signer_key_mismatch", "{}", run.envelope);
+            assert_eq!(
+                run.envelope["error"]["message"],
+                format!(
+                    "signing key public key '{DESTINATION}' does not match --source '{}'. \
+                     The signature was withheld and nothing was sent.",
+                    fixture.agent.g
+                )
+            );
+            assert!(fixture.sent_envelopes().await.is_empty());
         }
 
         /// Enrollment: the Ledger choice with an unenrolled key names the

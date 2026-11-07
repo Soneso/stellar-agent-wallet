@@ -960,13 +960,32 @@ pub(crate) fn install_ledger_double(
     let guard = set_ledger_signer_factory(Rc::new(move |_account_index, _source| {
         record.lock().unwrap().push("construct");
         construct()?;
-        Ok(Box::new(LedgerDouble {
-            key: ed25519_dalek::SigningKey::from_bytes(&AGENT_SEED),
-            calls: Arc::clone(&record),
-            before_sign: Arc::clone(&before_sign),
-        }) as Box<dyn Signer + Send + Sync>)
+        let key = ed25519_dalek::SigningKey::from_bytes(&AGENT_SEED);
+        Ok((
+            stellar_strkey::ed25519::PublicKey(key.verifying_key().to_bytes()),
+            Box::new(LedgerDouble {
+                key,
+                calls: Arc::clone(&record),
+                before_sign: Arc::clone(&before_sign),
+            }) as Box<dyn Signer + Send + Sync>,
+        ))
     }));
     (guard, calls)
+}
+
+/// Makes the mainnet Ledger on this thread report `DESTINATION` as its
+/// public key until the guard drops. The double panics when asked to sign.
+pub(crate) fn install_mismatched_ledger() -> LedgerSignerFactoryGuard {
+    set_ledger_signer_factory(Rc::new(|_, _| {
+        Ok((
+            stellar_strkey::ed25519::PublicKey::from_string(DESTINATION).unwrap(),
+            Box::new(LedgerDouble {
+                key: ed25519_dalek::SigningKey::from_bytes(&AGENT_SEED),
+                calls: Arc::default(),
+                before_sign: Arc::new(|| panic!("a mismatched Ledger must not sign")),
+            }),
+        ))
+    }))
 }
 
 /// The authorizations of the stored profile `name` effective at `now_ms`,
