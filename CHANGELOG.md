@@ -9,7 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- The wallet accepts protocol 30 on mainnet endpoints beside protocol 29.
+- The endpoint protocol check accepts protocol versions 29 and 30. This release
+  still refuses every mainnet endpoint before that check runs.
 - The MPP interoperability harness runs the released `@stellar/mpp` 0.7.1
   server on `@stellar/stellar-sdk` 16.4.1, which decodes protocol 30 ledger
   headers.
