@@ -1,18 +1,17 @@
-// The released `@stellar/mpp` 0.7.1 runs with the SDK's 16 line: the 15 line
-// ends at 15.1.0, whose XDR cannot decode a protocol 30 ledger header, and 17
-// changes the XDR union interface the server calls, so its verification fails
-// with `txEnvelope.switch is not a function`.  The harness therefore runs
-// only on 16.4.1, the version the fixture's provenance records, or a later
-// 16.x release.
+// The harness requires SDK 16.4.1 or a later 16.x release without suffixes.
+// SDK 15 cannot decode protocol 30 ledger headers.
+// SDK 17 changes the server's XDR union interface and breaks verification.
 export const SDK_MINIMUM = '16.4.1'
 
 // Decides whether the loaded `@stellar/stellar-sdk` version is one the
 // harness may run with.
 //
-// Returns `true` when `version` is 16.4.1 or a later 16.x release, and
-// otherwise a refusal message naming the version, for the caller to print.
+// Returns `true` when `version` is a canonical `major.minor.patch` string
+// for 16.4.1 or a later 16.x release, and otherwise a refusal message naming
+// the version, for the caller to print. A canonical component is `0` or a
+// number without a leading zero, and nothing follows the patch.
 export function sdkVersionAcceptable(version) {
-  const match = /^(\d+)\.(\d+)\.(\d+)(?:[-+].*)?$/.exec(version ?? '')
+  const match = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/.exec(version ?? '')
   if (!match) {
     return `@stellar/stellar-sdk version ${JSON.stringify(version ?? '')} is not a semver version`
   }

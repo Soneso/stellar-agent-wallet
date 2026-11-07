@@ -10,10 +10,8 @@ import { Mppx, Store } from 'mppx/server'
 
 import { sdkVersionAcceptable } from './sdk-version.mjs'
 
-// The check runs with whatever `@stellar/stellar-sdk` the install resolved,
-// so it reads the installed version and refuses one the released server
-// cannot work with, naming it.  A bump to 17.x that the peer rules let
-// through would otherwise pass here and fail at charge time instead.
+// Read the installed SDK version and refuse unsupported versions before
+// constructing the server. Refusals name the installed version.
 const installedSdk = JSON.parse(
   await readFile(
     new URL('./node_modules/@stellar/stellar-sdk/package.json', import.meta.url),

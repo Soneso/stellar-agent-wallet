@@ -22,10 +22,10 @@ header. On a protocol 30 network the released server then fails its payment
 verification and answers HTTP 402. SDK 16.4.1 decodes the header. SDK 17
 changes the XDR union interface that `@stellar/mpp` 0.7.1 calls, and its
 server then fails verification with `txEnvelope.switch is not a function`.
-The check reads the version of the installed `@stellar/stellar-sdk` from
-its package manifest and refuses any release outside the 16 line at or
-after 16.4.1, naming the version it found, so a bump the peer rules let
-through fails here instead of at charge time.
+The check reads the installed `@stellar/stellar-sdk` version from its
+package manifest. It accepts 16.4.1 and later 16.x releases without
+prerelease or build suffixes. A refusal names the installed version, even
+when peer rules allow that version.
 
 The `mppx` 0.6 line carries the advisories GHSA-727h-3vm5-qwq6 and
 GHSA-vc9j-9wph-qghj, which 0.8.2 fixes.
