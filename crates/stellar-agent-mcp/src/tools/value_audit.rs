@@ -1,10 +1,13 @@
 //! Shared audit emission for value-moving MCP tools.
 //!
 //! Value verbs (pay, create_account, claim, trustline, the DeFi adapters, and
-//! the opaque sep43 submit) record a hash-chained, HMAC-signed row after the
-//! on-chain action is confirmed. That emission is NON-FATAL post-success: the
-//! action has already committed, so a row-write failure logs a
-//! `tracing::warn!` and never changes the tool result or exit path.
+//! the opaque sep43 submit) write their hash-chained, HMAC-signed
+//! `ValueActionPending` row through the submission recorder before the send,
+//! and a confirmed submit writes no further value row. The sign-only tools
+//! write their row through [`emit_value_audit_row_with_writer`] after the
+//! signature is produced. That emission is NON-FATAL: the signature already
+//! exists, so a row-write failure logs a `tracing::warn!` and never changes
+//! the tool result or exit path.
 //!
 //! The MPP commit writes its authorization row through
 //! [`emit_value_audit_row_strict`] before the credential is released. The x402
@@ -22,14 +25,16 @@
 //! registry validates the HMAC-key fingerprint per path, so a prior open of the
 //! same path with a different (or absent) key makes the signed acquisition fail.
 //!
-//! # Pre-flight (fail-closed) vs. post-confirm (fail-open)
+//! # Pre-flight (fail-closed) vs. rows after the act (fail-open)
 //!
 //! [`require_value_audit_writer`] is the fail-closed pre-flight every
 //! value-moving commit/submit tool calls BEFORE any signing key is touched or
 //! transaction submitted: it proves the audit writer is acquirable, refusing
-//! with `audit.chain_key_unavailable` if not. The tool then threads the
-//! returned writer into [`emit_value_audit_row_with_writer`] for the
-//! post-confirm row, with no second acquisition.
+//! with `audit.chain_key_unavailable` if not. A value tool then hands the
+//! returned writer to its submission recorder, which appends the pending row
+//! through it before the send. A sign-only tool threads it into
+//! [`emit_value_audit_row_with_writer`] for the row it writes after signing,
+//! with no second acquisition.
 //!
 //! Every keyed acquisition also drains the audit outbox: consent rows that
 //! `stellar-agent approve` queued while this server held the writer enter the
@@ -53,9 +58,10 @@ use stellar_agent_network::keyring::keyed_audit_access;
 /// commit/submit MCP tools.
 ///
 /// Callers invoke this BEFORE any signing key is touched and BEFORE any
-/// transaction is submitted (see the module docs). A tool with a post-confirm
-/// row reuses the returned writer for it
-/// ([`emit_value_audit_row_with_writer`]) rather than re-acquiring it. A tool
+/// transaction is submitted (see the module docs). A value tool hands the
+/// returned writer to its submission recorder for the pending row, and a
+/// sign-only tool reuses it for the row it writes after signing
+/// ([`emit_value_audit_row_with_writer`]), rather than re-acquiring it. A tool
 /// whose row is written strictly before a transmission discards the handle,
 /// and the strict write acquires again.
 ///
@@ -160,8 +166,8 @@ fn audit_writer_open_failed(profile_name: &str) -> WalletError {
 /// Non-fatal: the write has nothing left to gate, since the transaction or the
 /// sign-only signature it records already committed. A failure to take the
 /// lock or append the row logs a `tracing::warn!` and returns without
-/// disturbing the caller. Callers construct `entry` with the gate-derived legs
-/// already in hand (e.g. [`AuditEntry::new_value_action_submitted`]).
+/// disturbing the caller. Callers construct `entry` from facts already in
+/// hand, for example [`AuditEntry::new_opaque_payload_signed`].
 pub(crate) fn emit_value_audit_row_with_writer(
     writer: &Arc<Mutex<AuditWriter>>,
     profile_name: &str,

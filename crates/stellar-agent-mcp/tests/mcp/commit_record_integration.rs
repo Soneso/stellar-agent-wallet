@@ -184,7 +184,7 @@ fn assert_timeout_records(
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// A timed-out claim leaves the record, and `stellar_transaction_status`
-/// settles it once the chain has the transaction.
+/// reconciles it once the chain has the transaction.
 #[tokio::test]
 #[serial]
 async fn a_timed_out_claim_records_the_submission_and_reports_the_hash() {

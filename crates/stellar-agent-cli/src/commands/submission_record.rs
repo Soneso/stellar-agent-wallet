@@ -2,8 +2,8 @@
 //! reporting what the submit layer refused.
 //!
 //! Every value verb that broadcasts records its submission before the
-//! transaction is sent, and settles that record against what the network
-//! answers. The construction is identical across the verbs, so it lives here
+//! transaction is sent, and records a reported success on it. The
+//! construction is identical across the verbs, so it lives here
 //! once, alongside the reconciliation pass each verb runs before its policy
 //! gate and the mapping that turns the three unresolved-submission refusals
 //! into a response an operator or an agent can act on.

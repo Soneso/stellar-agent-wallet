@@ -431,7 +431,8 @@ impl WalletServer {
 
         // Record the submission before the bytes leave: the receipt, the
         // pending audit row and the spending-window reservation. The recorder
-        // settles all three against what the network answers, and owns the
+        // records a reported success on the receipt and in the reservation,
+        // leaves all three standing on every other answer, and owns the
         // confirmed row the adapter would otherwise emit.
         let now_ms = match stellar_agent_core::timefmt::now_unix_ms() {
             Ok(v) => v,

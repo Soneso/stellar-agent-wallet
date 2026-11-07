@@ -4532,8 +4532,8 @@ async fn transaction_status_retains_a_submission_the_endpoint_cannot_find() {
 }
 
 /// A resend of the same signed bytes after their receipt was lost is refused
-/// before the send, and the original's settlement stays owed, so a later
-/// `SUCCESS` writes the submitted row for it.
+/// before the send and writes no row. The original's pending row stays open,
+/// and a later `SUCCESS` is recorded on the receipt without a submitted row.
 ///
 /// The rebuilt payment carries the same fee, sequence and operation, so its
 /// envelope hash is the original's. The receipt gate admits it because the

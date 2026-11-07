@@ -3,8 +3,8 @@
 //!
 //! `--acknowledge` records the operator's decision; clearing establishes no
 //! chain outcome. The verb asks the endpoint first and reconciles before it
-//! decides: a bounded transaction the chain has answered for is settled by
-//! reconciliation, not by an operator; one that can still apply is refused;
+//! decides: a bounded transaction the chain has answered for is not the
+//! operator's to clear; one that can still apply is refused;
 //! and an endpoint that cannot answer is not a licence to clear either. A
 //! reported failure or missing transaction does not release possible
 //! spending. An authenticated hold without a time bound is cleared only with

@@ -158,10 +158,10 @@ impl WalletServer {
             .map(|r| r.envelope_hash.clone())
             .or_else(|| held.as_ref().map(|r| r.id.clone()));
 
-        // The reconciliation pass settles this submission's reservation and
+        // The reconciliation pass reconciles this submission's reservation and
         // its receipt together, with no budget: the agent asked about this
         // transaction by name. A submission whose receipt is missing is
-        // settled by its authenticated reservation.
+        // reconciled from its authenticated reservation.
         if let Some(envelope_hash) = &envelope_hash {
             let Ok(now_ms) = stellar_agent_core::timefmt::now_unix_ms() else {
                 return Ok(business_error_result(
@@ -170,7 +170,7 @@ impl WalletServer {
                 ));
             };
             // On a mainnet profile the oracle witnesses the primary's negative
-            // answers before the reservation settles on them.
+            // answers. No negative answer releases the reservation.
             let oracle = self.settlement_oracle();
             match window
                 .reconcile_one(

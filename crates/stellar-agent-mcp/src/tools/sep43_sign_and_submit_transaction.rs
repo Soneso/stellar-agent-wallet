@@ -434,7 +434,7 @@ impl WalletServer {
 
                 // A reported success is an endpoint claim, not authenticated
                 // evidence: it writes no submitted audit row, and the pending
-                // row stays owed until authenticated evidence settles it.
+                // row stays open.
                 let response = json!({
                     "signedTxXdr": signed_xdr,
                     "txHash": result.tx_hash,

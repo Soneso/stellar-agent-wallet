@@ -251,8 +251,8 @@ pub enum SentByError {
     /// Before the first attempt nothing was sent, `sent_tx_hash` is `None`,
     /// and a record written before the send is settled as rejected. Before a
     /// resend the earlier send may have reached the network: `sent_tx_hash`
-    /// names the transaction, and its record stands unresolved until
-    /// reconciliation settles it.
+    /// names the transaction, and its record stands unresolved for
+    /// reconciliation.
     Elapsed {
         /// The step the instant passed at.
         stage: PreSendStage,
@@ -567,7 +567,8 @@ pub enum MainnetSubmitGrant {
 ///   deadline, or no oracle (`oracle` is `None`) records
 ///   [`SubmissionOutcome::TransportAfterSend`] and returns
 ///   [`SubmissionError::TxTimeout`]: the reservation, the receipt and the
-///   pending audit row stand until reconciliation settles them.
+///   pending audit row stand. The reservation ends at its accounting horizon
+///   or, without an execution bound, at an operator clear.
 /// - A `sendTransaction` refusal is never confirmed, since a refused
 ///   transaction has no record an oracle could report. It records
 ///   [`SubmissionOutcome::TransportAfterSend`] naming the refusal and

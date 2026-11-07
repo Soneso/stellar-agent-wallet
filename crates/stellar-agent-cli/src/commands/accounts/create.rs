@@ -99,8 +99,8 @@
 //! synthesized zero-config profile the pre-flight stays fail-open (warn-only,
 //! no refusal). Friendbot mode signs nothing and emits no audit row, so it is
 //! exempt (same rationale as the policy gate above). Where a writer was
-//! acquired, it is reused (not re-acquired) for the post-confirm
-//! `value_action_submitted` row.
+//! acquired, the submission recorder reuses it (not re-acquired) for the
+//! `value_action_pending` row it writes before the send.
 //!
 //! # Endpoint identity (sponsored mode)
 //!
@@ -1003,8 +1003,9 @@ where
     // comment. Proves the audit writer is acquirable AFTER the policy gate
     // (a denial is a clean refusal that signs nothing and needs no audit
     // setup) but BEFORE `sponsored_create` touches the signer or submits.
-    // Where `Some`, the writer is reused (not re-acquired) for the
-    // post-confirm `value_action_submitted` row.
+    // Where `Some`, the submission recorder reuses the writer (not
+    // re-acquired) for the `value_action_pending` row it writes before the
+    // send.
     let audit_writer = match crate::commands::value_audit::require_value_audit_writer_for_origin(
         profile,
         &resolved.name,
@@ -1019,7 +1020,8 @@ where
 
     // Record, then sign and submit. The recorder writes the receipt, the
     // pending audit row and the spending-window reservation before the bytes
-    // leave, and settles all three against what the network answers.
+    // leave. It records a reported success on the receipt and in the
+    // reservation, and every other answer leaves all three standing.
     // Sponsored mode only: the Friendbot path is not policy-gated.
     let recorder = match crate::commands::submission_record::build_recorder(
         crate::commands::submission_record::SubmitRecord {

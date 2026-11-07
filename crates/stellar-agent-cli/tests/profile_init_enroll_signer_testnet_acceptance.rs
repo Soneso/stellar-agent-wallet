@@ -59,8 +59,8 @@
 //!    `ChangeTrust` is used as the "tiny funded testnet signing operation".
 //! 8. The profile's (tempdir-scoped) audit log file is read back and asserted
 //!    to contain a `value_action_pending` row for this trustline's redacted
-//!    transaction hash — on-chain proof that the post-confirm audit row the
-//!    fail-closed pre-flight guards was actually emitted.
+//!    transaction hash, proof that the pending audit row the fail-closed
+//!    pre-flight guards was written before the send.
 //!
 //! # Audit-log isolation
 //!

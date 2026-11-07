@@ -14,10 +14,13 @@
 //! So the record is written first. [`SubmissionRecorder::pre_send`] runs after
 //! the endpoint identity probe and the signature-binding check, immediately
 //! before the send, and refuses the send when it cannot write.
-//! [`SubmissionRecorder::outcome`] runs at every exit after the send and
-//! settles the record against what the network said. A transport failure and a
-//! poll timeout settle nothing: the record stands until reconciliation or an
-//! operator resolves it.
+//! [`SubmissionRecorder::outcome`] runs at every exit after the send. A
+//! reported success is recorded on the receipt and in the reservation, which
+//! keeps counting through its accounting horizon. A reported failure, a
+//! refused send, a transport failure and a poll timeout leave the receipt, the
+//! pending row and the reservation standing. Every sent outcome consumes the
+//! approval nonce. A reservation ends at its accounting horizon or, without an
+//! execution bound, at an operator clear.
 //!
 //! # The audit tip anchor
 //!
@@ -47,7 +50,7 @@
 //! the original submission.
 //! Without current window entries, a reservation from an earlier stateful
 //! policy can remain and let reconciliation recover its identity. Without
-//! that reservation, reconciliation has no record left to settle it by.
+//! that reservation, reconciliation has no record left to reconcile it by.
 //! An outcome row the original process writes later wins the lookup.
 //!
 //! # A mainnet grant
@@ -396,7 +399,7 @@ impl<'a> WalletSubmissionRecorder<'a> {
         self
     }
 
-    /// Carries a completed oracle comparison into the pending and submitted audit rows.
+    /// Carries a completed oracle comparison into the pending audit row.
     #[must_use]
     pub fn with_witness(mut self, witness: Option<&crate::cross_check::CrossCheckWitness>) -> Self {
         self.witness = witness.map(crate::cross_check::CrossCheckWitness::record);
@@ -828,8 +831,9 @@ impl SubmissionRecorder for WalletSubmissionRecorder<'_> {
             | SubmissionOutcome::Timeout { .. }
             | SubmissionOutcome::TransportAfterSend { .. } => {
                 // The transaction may still apply. The receipt, the pending
-                // audit row and the reservation all stand, and only
-                // reconciliation or an operator clears them.
+                // audit row and the reservation all stand. The reservation
+                // ends at its accounting horizon or, without an execution
+                // bound, at an operator clear.
                 self.record_floor(intent).await;
                 self.tombstone_approval(intent);
             }

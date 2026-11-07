@@ -1048,9 +1048,9 @@ All three carry `error.details`:
 **What to do.** Call `stellar_transaction_status` with `details.tx_hash`. Never
 re-simulate, rebuild or resubmit the payment: the transaction may still apply,
 the sequence it consumes may already be spent by it, and a second submission at
-that sequence is refused with `submission.tx_already_submitted` until the first
-is settled. A different fee does not get around it. No recovery path sends a
-transaction again.
+that sequence is refused with `submission.tx_already_submitted` while the first
+one's receipt remains pending. A different fee does not get around it. No
+recovery path sends a transaction again.
 
 `stellar_transaction_status` reports what the chain says and records a reported
 success on the wallet's record. A reported failure or missing transaction does not release
@@ -1058,8 +1058,8 @@ possible spending:
 
 - `SUCCESS`: the endpoint reports that the payment went through. Report it as
   done. The spend keeps counting against the window through the transaction's
-  accounting horizon, and no submitted row is written: the pending row stays
-  until authenticated evidence settles it.
+  accounting horizon. No submitted row is written, and the pending row stays
+  open.
 - `FAILED`: the endpoint reports that the transaction applied and failed. The
   record keeps its status, the reservation keeps counting through its
   accounting horizon, and no failed row is written. Without a time bound it
@@ -1093,8 +1093,10 @@ possible spending:
   is missing and the endpoint can no longer answer for the transaction. A
   time-bounded reservation still ends at its accounting horizon. Once its
   execution bound has passed, `tx receipt clear --acknowledge` clears the
-  receipt, and the bounded spend stays charged through the horizon. An untimed
-  hold clears with `--acknowledge --acknowledge-unbounded`.
+  receipt while the endpoint still reports `NOT_FOUND` below its retention
+  floor. On mainnet the oracle is asked as well and can refuse the clear. The
+  bounded spend stays charged through the horizon. An untimed hold clears
+  with `--acknowledge --acknowledge-unbounded`.
 - A transaction without a time bound keeps its reservation until the operator
   clears it with `stellar-agent tx receipt clear <ENVELOPE_HASH> --acknowledge
   --acknowledge-unbounded`, on every network and whatever the endpoint

@@ -1364,8 +1364,8 @@ fn settled_by_reconciliation(source: &str, answer: &str, tx_hash: &str) -> Envel
     Envelope::<()>::err_raw(
         "submission.not_clearable",
         format!(
-            "{source} reports this transaction as {answer}, so the submission is settled by \
-             reconciliation rather than by an operator; run 'stellar-agent tx status {}'",
+            "{source} reports this transaction as {answer}, so the submission is not the \
+             operator's to clear; run 'stellar-agent tx status {}'",
             stellar_agent_network::redact_tx_hash(tx_hash),
         ),
     )

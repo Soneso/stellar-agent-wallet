@@ -1362,8 +1362,9 @@ impl ReceiptStore {
     ///
     /// [`SubmissionReceipt::release_code`] stays consistent with the status:
     /// writing `Ambiguous` keeps the evidence a receipt already carries, and
-    /// writing any other status drops it. Only
-    /// [`Self::finalize_released`] sets it.
+    /// writing any other status drops it. [`Self::finalize_released`] and
+    /// [`Self::project_accounting_expiry`] set it, and the projection also
+    /// sets it on the receipt it reconstructs.
     ///
     /// # Errors
     ///

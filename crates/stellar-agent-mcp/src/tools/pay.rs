@@ -1461,7 +1461,8 @@ impl WalletServer {
         // path, from the Allow the override displaced. Empty when the engine
         // sized no value (the row then records an unsized allow).
         // Resolved once and reused for BOTH the audit row's legs and the
-        // pre-send window reservation, which confirmation settles.
+        // pre-send window reservation, on which confirmation records its
+        // success report.
         let gate_value_effects: Option<stellar_agent_core::policy::v1::ValueEffects> =
             match &dispatch_outcome {
                 super::common::DispatchOutcome::Allow(allowed) => allowed
@@ -1642,8 +1643,8 @@ impl WalletServer {
         // Proves the profile's audit chain-root key is acquirable BEFORE the
         // nonce below is consumed, the signer is loaded, or the transaction is
         // submitted — a refusal here burns no nonce/replay-window attestation.
-        // Reused (not re-acquired) for the post-confirm `value_action_submitted`
-        // row.
+        // The submission recorder reuses it (not re-acquired) for the
+        // `value_action_pending` row it writes before the send.
         let (audit_writer, audit_readiness) = match self.write_audit() {
             Ok(w) => w,
             Err(err) => {

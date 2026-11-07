@@ -327,7 +327,7 @@ async fn init_pool_n2_success_submits_valid_sandwich() {
 
     let rows = std::fs::read_to_string(&recording.profile.audit_log_path).unwrap();
     // The reported success writes no submitted row: the pending row stays
-    // owed until authenticated evidence settles it.
+    // open.
     assert!(rows.contains("value_action_pending"));
     assert!(!rows.contains("value_action_submitted"));
     assert!(rows.contains(&stellar_agent_network::redact_tx_hash(&result.tx_hash)));

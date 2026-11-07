@@ -1,5 +1,5 @@
 //! Testnet acceptance: a payment whose confirmation does not arrive in time is
-//! recorded, and `tx status` settles it against the chain.
+//! recorded, and `tx status` reconciles it against the chain.
 //!
 //! # What this proves on-chain
 //!
@@ -26,8 +26,8 @@
 //! 3. `stellar-agent tx status <HASH>` reconciles the submission: the chain
 //!    reports `SUCCESS`, the receipt becomes `success`, and the reservation
 //!    becomes recorded spend.
-//! 4. The audit log holds the pending row written before the send and the
-//!    submitted row reconciliation wrote after.
+//! 4. The audit log holds the pending row written before the send, and
+//!    reconciliation writes no submitted row after it.
 //!
 //! # Fixture setup
 //!
@@ -370,7 +370,7 @@ fn audit_rows(home: &std::path::Path, profile: &str) -> Vec<serde_json::Value> {
         .collect()
 }
 
-/// A timed-out payment is recorded, reported with its hash, and settled by
+/// A timed-out payment is recorded, reported with its hash, and reconciled by
 /// `tx status` once the chain has it.
 #[tokio::test]
 #[serial_test::serial]

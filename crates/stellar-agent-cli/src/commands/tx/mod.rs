@@ -32,8 +32,11 @@ pub enum TxSubcommand {
     /// Asks the endpoint what became of `<HASH>` and records a reported
     /// success on the receipt, unless the receipt of an untimed hold already
     /// records another network answer. A reported success writes no submitted
-    /// row. A reported failure or missing transaction preserves the existing
-    /// receipt status and does not release the spending-window reservation. The reservation ends with the outcome
+    /// row. A reported failure preserves the existing receipt status, and so
+    /// does a missing transaction while the endpoint retains the submission's
+    /// ledger. Beyond that retention, a missing transaction marks a pending or
+    /// ambiguous receipt ambiguous. No reported answer releases the
+    /// spending-window reservation. The reservation ends with the outcome
     /// unknown once its accounting horizon has passed, which owes one
     /// `submission_accounting_expired` audit event.
     ///

@@ -3155,14 +3155,13 @@ pub enum EventKind {
         operator_credential_id_redacted: String,
     },
 
-    /// A value-moving action CONFIRMED on-chain.
+    /// Records a reported on-chain confirmation.
     ///
     /// The wallet's submit and reconciliation paths write no such row: a
     /// reported success is recorded on the receipt, and the pending row
     /// stands. A DeFi adapter context without a submission recorder writes it
-    /// after a confirmed submit. It covers an allow-path value verb (classic
-    /// pay / create-account / claim / trustline, and the DeFi trade / lend /
-    /// vault adapters). The `legs` are the SAME descriptor the
+    /// after a confirmed submit of an allow-path trade or vault action. The
+    /// `legs` are the SAME descriptor the
     /// policy gate sized — the single-derivation invariant, never a second
     /// derivation. The verb identity, chain id, policy decision, and request id
     /// ride on the OUTER [`AuditEntry`](super::entry::AuditEntry) fields, as
@@ -3276,8 +3275,9 @@ pub enum EventKind {
     /// pool attempt that was never transmitted. No endpoint answer writes it:
     /// a refused send, a reported failure and a missing transaction keep the
     /// pending row and the reservation. The local pre-send cleanup releases
-    /// the reservation the submission took best-effort; one left standing
-    /// remains until accounting expiry or an operator clear.
+    /// the reservation the submission took best-effort. One left standing
+    /// with an execution bound counts through its accounting horizon, and an
+    /// operator clear releases one without an execution bound.
     ///
     /// # Field redaction
     ///

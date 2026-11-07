@@ -7,7 +7,9 @@
 //! submission whose confirmation never arrived leaves a receipt and a
 //! spending-window reservation behind. Those hold the operator's caps and the
 //! wallet's duplicate check. This verb asks the endpoint what became of the
-//! transaction and records the answer as a report.
+//! transaction. It records a reported success on the receipt and classifies
+//! a missing transaction against the endpoint's retention. Accounting expiry
+//! ends the reservation independently of any answer.
 //!
 //! It is also the answer to `submission.tx_timeout`: rebuilding and
 //! re-submitting the same intent is never the answer, because the sequence the
@@ -18,9 +20,7 @@
 //! - `SUCCESS` is recorded on the receipt as a report, unless the receipt of
 //!   an untimed hold already records another network answer, which it keeps.
 //!   The reservation keeps counting through the transaction's accounting
-//!   horizon, and no submitted
-//!   row is written: the pending row stays until authenticated evidence
-//!   settles it.
+//!   horizon. No submitted row is written, and the pending row stays open.
 //! - A reported failure or missing transaction does not release possible
 //!   spending. `FAILED`, and `NOT_FOUND` with a consumed sequence or a ledger
 //!   close time past the time bound, keep the reservation, preserve the
@@ -39,10 +39,12 @@
 //!   `settlement_evidence: "unavailable"`, and no receipt status writes an
 //!   audit row.
 //! - When the submission ledger predates the endpoint's retention floor,
-//!   `NOT_FOUND` proves nothing, so the reservation stands and the receipt is
-//!   marked ambiguous, without evidence, for `tx receipt clear` to resolve.
-//!   An absent receipt leaves an authenticated hold marked
-//!   `operator_required`.
+//!   `NOT_FOUND` proves nothing, so the reservation stands. A `pending` or
+//!   `ambiguous` receipt is marked ambiguous and keeps any release evidence
+//!   it already carries; `tx receipt clear` resolves it. The receipt of an
+//!   untimed hold keeps a recorded network answer. Any other receipt refuses
+//!   the transition, which the verb logs as a receipt write failure. An
+//!   absent receipt leaves an authenticated hold marked `operator_required`.
 //!
 //! No step sends the transaction again.
 //!
@@ -88,7 +90,7 @@ pub struct StatusArgs {
     #[arg(value_name = "HASH")]
     pub tx_hash: String,
 
-    /// Profile whose submission records and spending window are settled.
+    /// Profile whose submission records and spending window are reconciled.
     #[arg(long, value_name = "NAME")]
     pub profile: Option<String>,
 
@@ -253,7 +255,7 @@ pub async fn run(args: &StatusArgs) -> i32 {
             }
         };
         // On a mainnet profile the oracle witnesses the primary's negative
-        // answers before the reservation settles on them.
+        // answers. No negative answer releases the reservation.
         let oracle = crate::commands::submission_record::settlement_oracle_in(&profile, &context);
         match window
             .reconcile_one(

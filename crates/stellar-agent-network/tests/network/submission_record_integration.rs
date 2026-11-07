@@ -581,7 +581,7 @@ async fn a_timeout_reports_the_local_hash_and_leaves_the_record_standing() {
     assert!(receipt.submitted, "the bytes were sent");
     assert!(
         fx.reservation_is_open(&hash),
-        "the reservation stands until reconciliation or an operator settles it"
+        "the reservation stands through its accounting horizon or until an operator clear"
     );
 }
 
@@ -2077,9 +2077,9 @@ async fn a_reservation_the_window_cannot_admit_is_refused_as_a_policy_denial() {
 /// The receipt gate admits the resend because the receipt is gone, but the
 /// window file still holds the original's reservation under the same envelope
 /// hash. The resend is refused with the transaction to reconcile, before its
-/// pending row: the original's pending row stays owed, so the settled row its
-/// own reconciliation writes is the one that closes it. The cap is far above
-/// both amounts, so admission does not decide this.
+/// pending row: the refused resend writes no row, and the original's pending
+/// row stays owed. The cap is far above both amounts, so admission does not
+/// decide this.
 #[tokio::test]
 #[serial]
 async fn a_resend_after_a_lost_receipt_is_refused_before_the_send() {

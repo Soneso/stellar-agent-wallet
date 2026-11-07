@@ -2297,7 +2297,9 @@ impl AuditEntry {
 
     /// Constructs a `ValueActionSubmitted` audit entry.
     ///
-    /// Emitted after a value-moving verb's on-chain submit confirms. `legs`
+    /// A DeFi adapter context without a submission recorder emits it after a
+    /// confirmed submit; the wallet's submit and reconciliation paths write no
+    /// such row. `legs`
     /// MUST be built from the SAME `ValueEffects` the policy gate sized — the
     /// single-derivation invariant. `transaction_hash_redacted` MUST be
     /// pre-redacted to first-8-last-8 at the call site; `legs` destinations are
@@ -2403,12 +2405,11 @@ impl AuditEntry {
 
     /// Constructs a `ValueActionFailed` audit entry.
     ///
-    /// Emitted where a recorded submission reached a definitive negative
-    /// answer: the send step refused the bytes, the poll reported the
-    /// transaction applied and failed, or reconciliation released its
-    /// reservation on chain evidence. It also closes the pending row of a
-    /// submission refused before the send. `code` is the stable wire code of
-    /// that answer: the refusal's code, or the evidence's code for a release.
+    /// Emitted where a recorded submission never left the wallet: it closes
+    /// the pending row of a submission the recorder refused before the send,
+    /// and of a pool attempt proven never transmitted. No endpoint answer
+    /// emits it. `code` is the stable wire code of the local refusal, or the
+    /// pool's not-transmitted code.
     /// `transaction_hash_redacted` MUST be pre-redacted to first-8-last-8 at
     /// the call site.
     #[must_use]
@@ -2555,8 +2556,10 @@ impl AuditEntry {
 
     /// Constructs an opaque `ValueActionSubmitted` audit entry.
     ///
-    /// Emitted after a raw sign-and-submit that the policy could not size (an
+    /// Describes a raw sign-and-submit that the policy could not size (an
     /// opaque-sign surface such as `stellar_sep43_sign_and_submit_transaction`).
+    /// The wallet's submit and reconciliation paths write no such row: the
+    /// submission recorder writes the pending row before the send.
     /// `legs` is empty and `opaque_reason` carries the policy opaque-reason's
     /// stable string form — legs are never fabricated for an envelope the policy
     /// could not size. The outer entry's `envelope_hash` identifies what was

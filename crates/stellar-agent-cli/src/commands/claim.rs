@@ -105,8 +105,7 @@
 //! the trustline of an issued asset; the staged stages compare the source
 //! account they re-read. Both checks refuse before the audit pre-flight, the
 //! signer, and the send; the outcome is the result's `cross_check` field and
-//! travels into the pending and submitted audit rows. `--build-only` obtains
-//! no witness.
+//! travels into the pending audit row. `--build-only` obtains no witness.
 //!
 //! # Audit pre-flight (fail-closed for a persisted profile; fail-open for the
 //! synthesized zero-config profile)
@@ -122,8 +121,9 @@
 //! For the synthesized zero-config profile the pre-flight stays fail-open
 //! (warn-only, no refusal), so an unauthored profile never blocks signing on a
 //! key-rotation step the operator never opted into. `--build-only` is exempt:
-//! it neither signs nor submits. Where a writer was acquired, it is reused
-//! (not re-acquired) for the post-confirm `value_action_submitted` row.
+//! it neither signs nor submits. Where a writer was acquired, the submission
+//! recorder reuses it (not re-acquired) for the `value_action_pending` row it
+//! writes before the send.
 
 use std::io::Write;
 use std::time::Duration;
@@ -794,8 +794,8 @@ where
     // needs no audit setup) but BEFORE the transaction below is submitted,
     // for a persisted profile — fails closed. The synthesized zero-config
     // profile stays fail-open, yielding `None` when no writer could be
-    // acquired. Where `Some`, the writer is reused (not re-acquired) for the
-    // post-confirm emission.
+    // acquired. Where `Some`, the submission recorder reuses the writer (not
+    // re-acquired) for the pending row it writes before the send.
     let audit_writer = match crate::commands::value_audit::require_value_audit_writer_for_origin(
         profile,
         &resolved.name,
@@ -1268,8 +1268,8 @@ where
     // and BEFORE the transaction is submitted (step 3), for a persisted
     // profile — fails closed. The synthesized zero-config profile stays
     // fail-open, yielding `None` when no writer could be acquired. Where
-    // `Some`, the writer is reused (not re-acquired) for the post-confirm
-    // emission.
+    // `Some`, the submission recorder reuses the writer (not re-acquired) for
+    // the pending row it writes before the send.
     let audit_writer = match crate::commands::value_audit::require_value_audit_writer_for_origin(
         profile,
         &resolved.name,
@@ -1287,8 +1287,9 @@ where
         };
 
     // 3. Record, then submit. The recorder writes the receipt, the pending
-    // audit row and the spending-window reservation before the bytes leave,
-    // and settles all three against what the network answers.
+    // audit row and the spending-window reservation before the bytes leave.
+    // It records a reported success on the receipt and in the reservation,
+    // and every other answer leaves all three standing.
     let recorder = match crate::commands::submission_record::build_recorder(
         crate::commands::submission_record::SubmitRecord {
             unvalued: None,

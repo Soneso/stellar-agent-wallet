@@ -218,13 +218,11 @@ pub use store::{
 /// applied on-chain. Authorized external settlement records through
 /// [`record_authorized_window_state`] instead. `value`
 /// MUST be the SAME [`stellar_agent_core::policy::v1::ValueClass`] the
-/// original gate evaluated — the single-derivation invariant, matching the
-/// audit-row `value_action_submitted` emission this call is always paired
-/// with.
+/// original gate evaluated (the single-derivation invariant).
 ///
-/// Non-fatal by design, mirroring the audit-row emission discipline: the
-/// on-chain action already committed and is irreversible, so a recording
-/// failure here is surfaced via `tracing::warn!` rather than propagated. A
+/// Non-fatal by design: the on-chain action already committed and is
+/// irreversible, so a recording failure here is surfaced via `tracing::warn!`
+/// rather than propagated. A
 /// failed record means the NEXT call under-counts against the accumulated
 /// window — that is loud in the log, not silent.
 pub fn record_confirmed_window_state(

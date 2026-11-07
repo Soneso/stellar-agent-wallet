@@ -326,7 +326,8 @@ refuses leaves its row open for the original submission's settlement. For a
 `record_pending` error other than the duplicate refusal, the recorder also
 attempts to close the row. That error can precede the duplicate decision, so it
 does not prove exclusive ownership of the hash. A reservation persisted before
-the error stands until reconciliation settles it. Without current window
+the error counts through its accounting horizon when it has an execution bound.
+Without one, it stands until an operator clears it. Without current window
 entries, a reservation from an earlier stateful policy can also remain.
 A closing row can settle that submission too.
 
@@ -447,7 +448,7 @@ The non-regular-file check rejects directories and symlinks before open, closing
 
 The commit and submit paths in the following table write `value_action_pending` through the submission recorder before the send. It carries the SAME value legs the policy gate sized (single-derivation invariant: the legs are the `ValueEffects` the gate evaluated, never re-derived at the emission site). The locally computed transaction hash is recorded redacted (first-8-last-8); the row never carries key material. A row the writer cannot append refuses the send with `submission.record_unavailable`. A reported success writes no further row: the receipt records it as a report. A DeFi adapter that instead FAILS at submit records a `sa_raw_invocation` row (with the mapped `SaInvocationResult`) in its error arm.
 
-x402 authorization signing is the exception to the row kind and to the timing. It writes `x402_payment_authorized` (its own `EventKind` carrying legs, network, and scheme) rather than `value_action_submitted`. The wallet signs the payment authorization without submitting it. The signed authorization still leaves the wallet: the payment flow re-simulates the signed entry against the configured RPC. That RPC therefore observes the signed x402 authorization and is part of the trust boundary.
+x402 authorization signing is the exception to the row kind and to the timing. It writes `x402_payment_authorized` (its own `EventKind` carrying legs, network, and scheme) rather than `value_action_pending`. The wallet signs the payment authorization without submitting it. The signed authorization still leaves the wallet: the payment flow re-simulates the signed entry against the configured RPC. That RPC therefore observes the signed x402 authorization and is part of the trust boundary.
 
 The ordinary path, `exact::create_payment`, receives its clients from the host. Its `validate_requirements` refuses a mainnet passphrase or a mainnet-pattern endpoint before any request. The authorized path, `exact::create_payment_authorized`, takes bound mainnet proofs and returns the payment with its release authorization. It obtains its primary client from the bound context and its witness through the bound network helper. Both paths share the checks below.
 
