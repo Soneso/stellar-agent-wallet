@@ -7504,7 +7504,7 @@ pub(crate) mod tests {
 
         #[tokio::test]
         #[serial_test::serial(keyring)]
-        async fn commit_copies_the_presented_deadline_across_elapsed_time() {
+        async fn mainnet_time_bounds_prepare_and_commit_preserve_the_deadline() {
             let now = stellar_agent_core::timefmt::now_unix_ms().unwrap() + CLOCK_LEAD_MS;
             let clock = stellar_agent_network::mainnet::clock::set_now_ms_for_test(now);
             for tool in Tool::ALL {
@@ -7525,6 +7525,39 @@ pub(crate) mod tests {
                     presented_classic_deadline(&sent[0]).unwrap(),
                     now / 1000 + 120
                 );
+            }
+        }
+
+        /// A commit after the presented deadline has passed refuses with
+        /// `simulation.deadline_invalid` naming `deadline_elapsed`, before
+        /// any authorization is minted: no seed read, so nothing is signed,
+        /// and nothing is sent.
+        #[tokio::test]
+        #[serial_test::serial(keyring)]
+        async fn mainnet_time_bounds_commit_after_the_deadline_signs_nothing() {
+            use stellar_agent_network::mainnet::resolve::MAINNET_CLASSIC_DEADLINE_SECONDS;
+            let now = stellar_agent_core::timefmt::now_unix_ms().unwrap() + CLOCK_LEAD_MS;
+            let clock = stellar_agent_network::mainnet::clock::set_now_ms_for_test(now);
+            for tool in Tool::ALL {
+                clock.set(now);
+                let run = ClassicRun::new(tool).await;
+                assert_eq!(
+                    presented_classic_deadline(run.args["envelope_xdr"].as_str().unwrap()).unwrap(),
+                    now / 1000 + MAINNET_CLASSIC_DEADLINE_SECONDS
+                );
+                clock.set(now + (MAINNET_CLASSIC_DEADLINE_SECONDS + 1) * 1000);
+                let result = run.commit().await;
+                assert_refused_before_mint(&run, &result, "simulation.deadline_invalid");
+                assert!(
+                    result["error"]["message"]
+                        .as_str()
+                        .unwrap()
+                        .contains("(deadline_elapsed)"),
+                    "{tool:?}: {result}"
+                );
+                assert!(run.control.sent().is_empty(), "{tool:?}");
+                assert!(run.oracle_control.sent().is_empty(), "{tool:?}");
+                assert_no_pre_send_entry(&run);
             }
         }
 

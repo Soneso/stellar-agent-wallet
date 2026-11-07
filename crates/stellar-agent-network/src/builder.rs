@@ -1491,7 +1491,7 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn with_mainnet_deadline_sets_the_window_on_mainnet_only() {
+    fn mainnet_time_bounds_builder_sets_the_window_on_mainnet_only() {
         use stellar_agent_core::profile::caip2::{MAINNET_PASSPHRASE, TESTNET_PASSPHRASE};
         use stellar_xdr::{Limits, Preconditions, ReadXdr as _, TransactionEnvelope};
         let now = 1_800_000_000_123;
