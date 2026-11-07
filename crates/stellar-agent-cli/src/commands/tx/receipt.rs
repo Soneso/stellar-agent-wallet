@@ -50,9 +50,12 @@
 //! same way and left for `tx status`, and so is an endpoint that cannot
 //! answer. On a mainnet profile that names an oracle, the oracle is asked as
 //! well and refuses the clear the same way. Its `SUCCESS` refuses, and so does
-//! its `FAILED` for a held reservation. So do an oracle that cannot answer,
-//! one that does not report the mainnet passphrase or whose identity cannot be
-//! read, and an oracle client that cannot be built. Every oracle read
+//! its `FAILED` for a held reservation. So do an oracle that cannot answer
+//! and one that does not report the mainnet passphrase or whose identity
+//! cannot be read. An oracle client that cannot be built refuses with its own
+//! error. A credential refusal keeps its code, such as
+//! `network.rpc_credential_refused`, and any other construction failure is
+//! `network.witness_unavailable`. Every oracle read
 //! of the command, these and reconciliation's below, ends by one deadline: the
 //! profile's submit timeout, counted from the oracle's identity read. A mainnet
 //! profile without an oracle has no second answer to ask for: the primary's
@@ -99,8 +102,8 @@
 //!   a chain outcome. A `release_code` on the receipt alone is display data,
 //!   and such a receipt is decided by the rows below, as an unknown outcome.
 //! - **Still able to apply.** A `pending` or `ambiguous` receipt with a held
-//!   reservation or a sent receipt, whose time bound has not passed on this
-//!   host's clock. Refused with `submission.still_pending`, naming the time
+//!   reservation or a sent receipt, or a sent `failed` receipt with no held
+//!   reservation, whose time bound has not passed on this host's clock. Refused with `submission.still_pending`, naming the time
 //!   bound; nothing changes.
 //! - **Outcome unknown.** An `ambiguous` receipt without evidence (the
 //!   endpoint's retention window closed), a `pending` receipt whose time bound

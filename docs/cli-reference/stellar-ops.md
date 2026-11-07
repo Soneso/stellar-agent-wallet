@@ -743,7 +743,7 @@ a matching row a `success` or `reorged` receipt is refused without
 reconciliation, release or marking. A `failed` receipt without a hold proceeds
 to the endpoint check. Then the verb asks the endpoint what became of the transaction. A
 `SUCCESS` answer, or a `FAILED` answer for a held reservation, is refused with
-`submission.not_clearable` and the record is left for `tx status` to record.
+`submission.not_clearable` and the record is left for `tx status`.
 A `FAILED` answer without a held reservation is an unauthenticated report, so
 the clear proceeds on the acknowledgement. An endpoint that cannot answer is
 refused under the same code: a transaction still in flight is exactly the case
@@ -783,8 +783,8 @@ does, and decides:
 | An authenticated hold without a time bound, with both acknowledgement flags | The receipt is cleared and the hold released, whatever the endpoint or the oracle reported. A receipt that records a network answer keeps it until the clear, and an endpoint answer reconciliation did not record is the row's `evidence`. |
 | Authenticated accounting expiry, identified by its decision identifier. | Accounting expiry leaves the chain outcome unknown. Its audit event uses the authenticated decision identifier. The expiry commits the accounting disposition before the clear, and the clear row records the acknowledgement. |
 | On mainnet, a sent `pending` or `ambiguous` receipt without a time bound and with no held reservation, without `--acknowledge-unbounded` | Refused with `submission.unbounded_exposure`. |
-| `pending` or `ambiguous` with a held reservation or a sent receipt, and a time bound that has not passed on this host's clock | Refused with `submission.still_pending`, naming the time bound. Nothing changes. |
-| `ambiguous` without evidence (retention window closed), `ambiguous` with a `release_code` the spending window does not bear out, `failed` with no held reservation, `pending` with a passed time bound or none, or `pending`, never sent and with no held reservation, each with the required acknowledgement flags | The receipt is cleared. A bounded hold keeps counting through its accounting horizon, so the output and the row carry `reservation_released: false`. |
+| `pending` or `ambiguous` with a held reservation or a sent receipt, or a sent `failed` receipt with no held reservation, and a time bound that has not passed on this host's clock | Refused with `submission.still_pending`, naming the time bound. Nothing changes. |
+| `ambiguous` without evidence (retention window closed), `ambiguous` with a `release_code` the spending window does not bear out, `failed` with no held reservation and either never sent or with a passed time bound or none, `pending` with a passed time bound or none, or `pending`, never sent and with no held reservation, each with the required acknowledgement flags | The receipt is cleared. A bounded hold keeps counting through its accounting horizon, so the output and the row carry `reservation_released: false`. |
 
 Every oracle read of the verb ends by one deadline: the profile's
 `submit_timeout_seconds`, counted from the oracle's identity read. A stalled
