@@ -295,9 +295,12 @@ SEP-7 URI parsing, SEP-10 web auth through the x402 identity gate, SEP-24/6
 transfer hand-off, SEP-43 wallet signing (`get_address`, `get_network`, `sign_transaction`, `sign_auth_entry`,
 `sign_message`, `sign_and_submit_transaction`), SEP-47/48 contract discovery, and
 SEP-53 signed messages. SEP-45 is library-only, with no CLI command or MCP tool.
-The wallet also signs x402 v2 Exact Stellar agent payments and testnet sponsored MPP charges. Both x402 payment tools support
-approved mainnet payments in a feature-enabled build. Authenticated payments
-bind their SEP-10 identity operation to the payment approval. MPP uses
+The wallet also signs x402 v2 Exact Stellar agent payments and testnet
+sponsored MPP charges.
+Builds from this repository and releases from v0.1.0-alpha.14 on carry
+`mainnet-write`. Both x402 payment tools support approved mainnet payments
+in these builds. Authenticated payments bind their SEP-10 identity operation
+to the payment approval. MPP uses
 `stellar_mpp_charge_prepare` then one `stellar_mpp_charge_commit`; the trusted
 host sends the returned credential to the exact bound HTTP or MCP request. See
 `references/protocols.md`.
@@ -323,9 +326,10 @@ Drive installed toolsets with `stellar_toolset_list` and `stellar_toolset_invoke
   `halted`. On either code, stop and report the message to the operator. Never
   run `stellar-agent profile resume` yourself, and do not retry under another
   profile; the halt is the operator's decision.
-- Released binaries have `mainnet-write` on and admit the four classic
-  full-mode CLI operations and classic MCP commits after operator setup and
-  approval for each action. See
+- Builds from this repository and releases from v0.1.0-alpha.14 on carry
+  `mainnet-write`. These builds admit the four classic full-mode CLI
+  operations and classic MCP commits after operator setup and approval for
+  each action. See
   [profiles and keys](references/profiles-and-keys.md#mainnet-policy-body) and
   [classic MCP authorization](references/mcp-tools.md#classic-mainnet-authorization).
   Mainnet reads retain selection, key-scope, and policy requirements.
@@ -333,8 +337,8 @@ Drive installed toolsets with `stellar_toolset_list` and `stellar_toolset_invoke
   Policy evaluation alone grants no signing authority. Signing and submission
   independently check sealed authorization. Smart-account writes, DeFi, pool
   submission, MPP, generic signing, and toolset signing remain excluded.
-  A feature-enabled build moves real funds on mainnet, and the operator uses it
-  at their own risk. Before the first mainnet write of a session, confirm that
+  Mainnet writes move real funds, and the operator uses the wallet at their
+  own risk. Before the first mainnet write of a session, confirm that
   the operator intends mainnet, and suggest a testnet run and a small amount.
 
 - `profile.key_scope_conflict` refuses mainnet startup or CLI reconciliation
@@ -384,8 +388,8 @@ Drive installed toolsets with `stellar_toolset_list` and `stellar_toolset_invoke
 
   Both x402 payment tools, `stellar_x402_create_payment` and
   `stellar_x402_authenticated_payment`, and the four classic commits depend on
-  the feature. With the feature off, they refuse at entry with the same code. A
-  feature-enabled build admits them after setup, as
+  the feature. With the feature off, they refuse at entry with the same code.
+  Builds with the feature on admit them after setup, as
   [classic MCP authorization](references/mcp-tools.md#classic-mainnet-authorization)
   describes. With the feature enabled, both x402 tools use the approved two-call
   flow.

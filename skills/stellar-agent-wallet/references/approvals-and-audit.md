@@ -72,10 +72,12 @@ Each gated invocation is evaluated before it signs. Three decisions:
 | Deny | The call is refused, carrying a typed reason with a stable wire code. |
 | RequireApproval | The call is held pending an out-of-band operator approval. |
 
-The engine in `[policy]` governs policy evaluation. Mainnet writes also need a
-feature-enabled build, installation setup, and sealed authorization. Signing
-and submission independently verify authority. The endpoint network binds every
-envelope signature. Reads retain their selection and key-scope checks.
+The engine in `[policy]` governs policy evaluation.
+Builds from this repository and releases from v0.1.0-alpha.14 on carry
+`mainnet-write`. Mainnet writes also need installation setup and sealed
+authorization. Signing and submission independently verify authority. The
+endpoint network binds every envelope signature. Reads retain their selection
+and key-scope checks.
 
 ### Classic mainnet confirmation
 

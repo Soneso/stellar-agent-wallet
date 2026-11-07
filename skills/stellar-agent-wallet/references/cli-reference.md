@@ -127,9 +127,10 @@ unset WALLET_SK
 
 ### Mainnet write behavior
 
-Released binaries have `mainnet-write` on and admit full-mode
-`pay`, `claim`, sponsored `accounts create`, and `trustline` after installation
-setup and consent for each action. Build-only, sign-only, submit-only,
+Builds from this repository and releases from v0.1.0-alpha.14 on carry
+`mainnet-write`. These builds admit full-mode `pay`, `claim`, sponsored
+`accounts create`, and `trustline` after installation setup and consent for
+each action. Build-only, sign-only, submit-only,
 Friendbot creation, generated-account creation, and relayer paths remain excluded.
 
 Select an explicit nondefault mainnet profile with matching stored configuration.

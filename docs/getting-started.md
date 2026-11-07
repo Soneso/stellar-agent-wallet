@@ -182,8 +182,8 @@ The build writes the two binaries to:
 - `target/release/stellar-agent`
 - `target/release/stellar-agent-mcp`
 
-A source build and `cargo install` build both binaries with
-`mainnet-write` on. A prebuilt archive carries the state of its release, which
+Builds from this repository and releases from v0.1.0-alpha.14 on carry
+`mainnet-write`. A prebuilt archive carries the state of its release, which
 `--version` reports.
 
 When `stellar-agent` is on your `PATH`, the incumbent `stellar-cli` discovers it
@@ -794,15 +794,15 @@ for the full flag set.
 
 ## Mainnet configurations and scope
 
-Released binaries have `mainnet-write` on and admit only the operations listed
-below, after operator setup and approval for each action.
+Builds from this repository and releases from v0.1.0-alpha.14 on carry
+`mainnet-write`. These builds admit only the operations listed below, after
+operator setup and approval for each action.
 `--no-default-features` builds them with the feature off. The version marker
 reports the build configuration.
 
 Mainnet writes move real funds. The wallet is alpha software and comes without
-warranty under the Apache-2.0 license. Use a feature-enabled build on mainnet at
-your own risk. Test each flow on testnet first, and start with small amounts and
-tight policy limits.
+warranty under the Apache-2.0 license. Use mainnet at your own risk. Test each
+flow on testnet first, and start with small amounts and tight policy limits.
 
 With the feature on, only a typed authorization issued for the action can
 satisfy the mainnet-write guard, and the binary attests its feature state. With

@@ -72,8 +72,9 @@ describe an attempted reset that did not take effect.
   required by most MCP tools. Where it is omittable (the SEP-43 read tools) it
   defaults to the active profile's chain; the wallet's default network is
   `stellar:testnet`.
-- Mainnet writes require a feature-enabled build, installation setup, and
-  per-action approval. Excluded operations retain their refusal codes.
+- Builds from this repository and releases from v0.1.0-alpha.14 on carry
+  `mainnet-write`. Mainnet writes require installation setup and per-action
+  approval. Excluded operations retain their refusal codes.
 - A single-use nonce is minted by the wallet at simulation time and must be passed
   back unchanged at commit time. Do not generate, cache across restarts, reuse, or
   mutate it.
@@ -187,14 +188,15 @@ window.
 
 ## Mainnet authorization boundaries
 
-Released binaries have `mainnet-write` on. With the feature on, only a typed
+Builds from this repository and releases from v0.1.0-alpha.14 on carry
+`mainnet-write`. With the feature on, only a typed
 authorization issued for the action can satisfy the mainnet-write guard, and
 the binary attests its feature state. A build with `--no-default-features` has
 the feature off, and no code path in it can satisfy the guard.
 The guarantee has one precondition: the claim holds only under the dependency
 set pinned and verified by the release.
 
-Feature-enabled builds admit only configured operations. See the local
+These builds admit only configured operations. See the local
 [CLI](cli-reference.md#mainnet-write-behavior),
 [MCP](mcp-tools.md#classic-mainnet-authorization), and
 [policy](profiles-and-keys.md#mainnet-policy-body) references for setup.
