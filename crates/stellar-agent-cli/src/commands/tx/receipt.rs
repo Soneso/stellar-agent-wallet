@@ -20,8 +20,9 @@
 //!
 //! A submission whose outcome never came back leaves a receipt behind and,
 //! under a policy with a stateful criterion, a spending-window reservation
-//! that counts against the operator's caps. `tx status` records what the
-//! endpoint reports. This verb closes a record the operator has decided
+//! that counts against the operator's caps. `tx status` reconciles the
+//! submission; a negative answer keeps its receipt and exposure. This verb
+//! closes a record the operator has decided
 //! about, and it reconciles first, so it decides on the chain's latest answer
 //! rather than on the record as it was left.
 //!
@@ -66,10 +67,10 @@
 //! Without `--acknowledge` nothing is reconciled or written: the verb exits 1
 //! with `submission.acknowledgement_required`, and the message names the next
 //! step, computed from the record. While a sent transaction's time bound is
-//! open, that is to wait for it to pass or run `tx status`; otherwise it is
+//! open, that is to wait for it to pass or run `tx status`. Otherwise it is
 //! `--acknowledge`, plus `--acknowledge-unbounded` for an authenticated hold
 //! without a time bound on every network and, on mainnet, for a sent
-//! `pending` or `ambiguous` receipt without one when no hold exists.
+//! `pending`, `ambiguous` or `failed` receipt without one when no hold exists.
 //!
 //! With `--acknowledge` the verb acquires the audit writer, restores an
 //! orphan's receipt from its reservation, reconciles the submission with the
@@ -227,9 +228,9 @@ pub struct ClearArgs {
     /// spend is then not counted.
     ///
     /// Required on every network for an authenticated hold without a time
-    /// bound, whatever its receipt records or the endpoint reports, and on
-    /// mainnet for a sent `pending` or `ambiguous` receipt without one when no
-    /// hold exists. Both acknowledgement flags are also required to finish a
+    /// bound, whatever its receipt records or the endpoint reports. Also
+    /// required on mainnet for a sent `pending`, `ambiguous` or `failed`
+    /// receipt without one when no hold exists. Both acknowledgement flags are also required to finish a
     /// recorded unbounded clear.
     #[arg(long)]
     pub acknowledge_unbounded: bool,
@@ -439,9 +440,10 @@ async fn run_clear(args: &ClearArgs) -> i32 {
         return 1;
     }
 
-    // Then the chain. A bounded hold's chain answer is reconciliation's to
-    // record, and the endpoint is the only thing that can contradict the
-    // operator. An endpoint that cannot answer is not a licence to clear: a
+    // Then the chain. A bounded hold's chain answer is reconciliation's:
+    // `tx status` reconciles the submission, and a negative answer keeps its
+    // receipt and exposure. The endpoint is the only thing that can contradict
+    // the operator. An endpoint that cannot answer is not a license to clear: a
     // transaction in flight is exactly the case in which the operator's
     // decision can be wrong.
     let context = crate::common::network::profile_network_context(&profile);

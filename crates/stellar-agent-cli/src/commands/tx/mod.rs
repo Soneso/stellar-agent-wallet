@@ -7,8 +7,8 @@
 //! produced window entries for the submission. This group is how those are
 //! resolved:
 //!
-//! - [`status`] asks the chain what became of one transaction and records the
-//!   answer as a report. This is the way out of `submission.tx_timeout`.
+//! - [`status`] asks the chain what became of one transaction and reconciles
+//!   the submission; a negative answer keeps its receipt and exposure. This is the way out of `submission.tx_timeout`.
 //! - [`receipt`]: close a submission record after reconciling it against the chain.
 
 pub mod receipt;

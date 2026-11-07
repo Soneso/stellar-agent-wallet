@@ -764,8 +764,8 @@ with `submission.acknowledgement_required`. The message names the next step,
 computed from the record: while a sent transaction's time bound is still open,
 wait for it to pass or run `tx status`; otherwise pass `--acknowledge`. An
 authenticated hold without a time bound also requires `--acknowledge-unbounded`
-on every network, and so does, on mainnet, a sent `pending` or `ambiguous`
-receipt without a time bound when no hold exists. This states that the
+on every network, and so does, on mainnet, a sent `pending`, `ambiguous` or
+`failed` receipt without a time bound when no hold exists. This states that the
 transaction can still apply and its spend stops counting against the window;
 the clear row records `unbounded_exposure: true`.
 
@@ -782,7 +782,7 @@ does, and decides:
 | An authenticated hold without a time bound, whatever its receipt records, without `--acknowledge-unbounded` | Refused with `submission.unbounded_exposure`. Pass both acknowledgement flags to clear and record the exposure. |
 | An authenticated hold without a time bound, with both acknowledgement flags | The receipt is cleared and the hold released, whatever the endpoint or the oracle reported. A receipt that records a network answer keeps it until the clear, and an endpoint answer reconciliation did not record is the row's `evidence`. |
 | Authenticated accounting expiry, identified by its decision identifier. | Accounting expiry leaves the chain outcome unknown. Its audit event uses the authenticated decision identifier. The expiry commits the accounting disposition before the clear, and the clear row records the acknowledgement. |
-| On mainnet, a sent `pending` or `ambiguous` receipt without a time bound and with no held reservation, without `--acknowledge-unbounded` | Refused with `submission.unbounded_exposure`. |
+| On mainnet, a sent `pending`, `ambiguous` or `failed` receipt without a time bound and with no held reservation, without `--acknowledge-unbounded` | Refused with `submission.unbounded_exposure`. |
 | `pending` or `ambiguous` with a held reservation or a sent receipt, or a sent `failed` receipt with no held reservation, and a time bound that has not passed on this host's clock | Refused with `submission.still_pending`, naming the time bound. Nothing changes. |
 | `ambiguous` without evidence (retention window closed), `ambiguous` with a `release_code` the spending window does not bear out, `failed` with no held reservation and either never sent or with a passed time bound or none, `pending` with a passed time bound or none, or `pending`, never sent and with no held reservation, each with the required acknowledgement flags | The receipt is cleared. A bounded hold keeps counting through its accounting horizon, so the output and the row carry `reservation_released: false`. |
 
@@ -824,7 +824,7 @@ reports `reservation_released: true`.
 | `<ENVELOPE_HASH>` (positional) | Envelope hash of the submission, 64 lowercase hex characters: `tx status` reports it as `record.envelope_hash` | yes | none |
 | `--profile <NAME>` | Profile whose record and spending window are cleared | optional | `STELLAR_AGENT_PROFILE`, else `default` |
 | `--acknowledge` | Record the operator's decision to clear, and reconcile before clearing; clearing establishes no chain outcome | yes | `false` |
-| `--acknowledge-unbounded` | Accept that this untimed transaction can still apply and that its spend is then not counted | for an authenticated hold without a time bound on every network, and on mainnet for a sent `pending` or `ambiguous` receipt without one when no hold exists; both acknowledgement flags are also required to finish a recorded unbounded clear | `false` |
+| `--acknowledge-unbounded` | Accept that this untimed transaction can still apply and that its spend is then not counted | for an authenticated hold without a time bound on every network, and on mainnet for a sent `pending`, `ambiguous` or `failed` receipt without one when no hold exists; both acknowledgement flags are also required to finish a recorded unbounded clear | `false` |
 | `--output <FORMAT>` | `json` or `table` | optional | `json` |
 
 `--acknowledge` is required because the wallet cannot establish what became of

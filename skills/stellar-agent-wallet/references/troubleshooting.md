@@ -492,8 +492,8 @@ on every network, whatever its record says and whatever the endpoint or the
 oracle reports; without it the clear refuses with
 `submission.unbounded_exposure`, and with it the hold is released. A clear
 of such a hold stopped after the release finishes when it is run again with
-both flags. On a mainnet profile a sent `pending` or `ambiguous` record
-without a time bound and with no hold needs the same flag.
+both flags. On a mainnet profile a sent `pending`, `ambiguous` or `failed`
+record without a time bound and with no hold needs the same flag.
 
 An operator policy that lists tools explicitly must include
 `stellar_transaction_status`, or a timed-out submission cannot be resolved
