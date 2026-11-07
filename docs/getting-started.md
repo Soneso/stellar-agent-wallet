@@ -797,7 +797,7 @@ for the full flag set.
 Builds from this repository and releases from v0.1.0-alpha.14 on carry
 `mainnet-write`. These builds admit only the operations listed below, after
 operator setup and approval for each action.
-`--no-default-features` builds them with the feature off. The version marker
+A `--no-default-features` build has the feature off. The version marker
 reports the build configuration.
 
 Mainnet writes move real funds. The wallet is alpha software and comes without

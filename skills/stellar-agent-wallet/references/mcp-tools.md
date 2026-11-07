@@ -223,7 +223,7 @@ The policy engine returns one verdict:
 ### Classic mainnet authorization
 
 Builds from this repository and releases from v0.1.0-alpha.14 on carry
-`mainnet-write`. These servers admit `stellar_pay_commit`,
+`mainnet-write`. The MCP server in these builds admits `stellar_pay_commit`,
 `stellar_claim_commit`, `stellar_create_account_commit`, and
 `stellar_trustline_commit` after setup.
 Both prepare and commit policy names need matching rules. The four pairs require

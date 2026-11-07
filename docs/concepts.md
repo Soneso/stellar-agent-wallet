@@ -27,16 +27,7 @@ A fifth control addresses a different risk: which tool definitions the agent may
 
 A sixth control stops an agent outright. The per-profile **emergency stop**, `stellar-agent profile halt`, refuses every action on the profile that signs or submits until the operator runs `stellar-agent profile resume`, with no server restart and no key or policy change. See [Emergency stop](#emergency-stop).
 
-The default network is `stellar:testnet`. A command with no named profile and
-no `default.toml` uses the zero-config testnet profile.
-Builds from this repository and releases from v0.1.0-alpha.14 on carry
-`mainnet-write`. Only a typed authorization issued for the action can satisfy
-the mainnet-write guard, and each binary attests its feature state. These
-builds admit only the scope-table operations, after setup and per-action
-approval. Policy evaluation, sealed authorization, signing checks, and
-submission checks are separate boundaries. The endpoint determines the
-network, and each envelope signature must verify under it. Read-only commands
-retain mainnet selection and key-scope requirements.
+The default network is `stellar:testnet`. A command with no named profile and no `default.toml` uses the zero-config testnet profile. Builds from this repository and releases from v0.1.0-alpha.14 on carry `mainnet-write`. Only a typed authorization issued for the action can satisfy the mainnet-write guard, and each binary attests its feature state. These builds admit only the scope-table operations, after setup and per-action approval. Policy evaluation, sealed authorization, signing checks, and submission checks are separate boundaries. The endpoint determines the network, and each envelope signature must verify under it. Read-only commands retain mainnet selection and key-scope requirements.
 
 ## Two account models
 

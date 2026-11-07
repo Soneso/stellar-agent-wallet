@@ -196,7 +196,7 @@ the feature off, and no code path in it can satisfy the guard.
 The guarantee has one precondition: the claim holds only under the dependency
 set pinned and verified by the release.
 
-These builds admit only configured operations. See the local
+Builds with the feature on admit only configured operations. See the local
 [CLI](cli-reference.md#mainnet-write-behavior),
 [MCP](mcp-tools.md#classic-mainnet-authorization), and
 [policy](profiles-and-keys.md#mainnet-policy-body) references for setup.
