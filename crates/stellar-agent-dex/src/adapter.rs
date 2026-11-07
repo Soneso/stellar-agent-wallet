@@ -563,35 +563,29 @@ impl DefiAdapter for DexSwapAdapter {
         let request_id = witness.request_id().to_owned();
         drop(witness); // consumed here — gate ran before this point
 
-        let result = match submit_result {
-            Ok(r) => r,
-            Err(e) => {
-                // Caller-side Err-arm discipline: record the failure as a
-                // SaRawInvocation row (non-fatal, no-op unless a writer was
-                // threaded in).
-                if let Some(writer) = ctx.audit_writer.as_ref() {
-                    let smart_account_redacted =
-                        stellar_agent_core::observability::redact_strkey_first5_last5(
-                            &trade_args.from_address,
-                        );
-                    stellar_agent_smart_account::submit::emit_sa_raw_invocation_failure(
-                        writer,
-                        &smart_account_redacted,
-                        &e,
-                        ctx.auth_rule_ids.map_or(1, |ids| ids.len() as u32),
-                        ctx.chain_id,
-                        &request_id,
+        if let Err(e) = submit_result {
+            // Caller-side Err-arm discipline: record the failure as a
+            // SaRawInvocation row (non-fatal, no-op unless a writer was
+            // threaded in).
+            if let Some(writer) = ctx.audit_writer.as_ref() {
+                let smart_account_redacted =
+                    stellar_agent_core::observability::redact_strkey_first5_last5(
+                        &trade_args.from_address,
                     );
-                }
-                return Err(map_submit_invoke_error(&e));
+                stellar_agent_smart_account::submit::emit_sa_raw_invocation_failure(
+                    writer,
+                    &smart_account_redacted,
+                    &e,
+                    ctx.auth_rule_ids.map_or(1, |ids| ids.len() as u32),
+                    ctx.chain_id,
+                    &request_id,
+                );
             }
-        };
+            return Err(map_submit_invoke_error(&e));
+        }
 
-        // Non-fatal allow-path value-audit row (no-op unless the caller threaded
-        // a writer + gate-derived legs into the context).
-        let tx_hash_redacted = stellar_agent_network::redact_tx_hash(&result.tx_hash);
-        ctx.emit_value_action_submitted(&tx_hash_redacted, result.ledger, &request_id);
-
+        // The recorder wrote the pending row before the send; a reported
+        // success writes no further row.
         Ok(())
     }
 }

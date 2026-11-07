@@ -471,14 +471,20 @@ On mainnet, after release authorization is consumed, the tool consumes the pendi
 | Surface | Verb / tool | Row |
 | --- | --- | --- |
 | MCP | `stellar_pay_commit`, `stellar_create_account_commit`, `stellar_claim_commit`, `stellar_trustline_commit` | `value_action_pending` (sized legs) |
-| MCP | `stellar_dex_trade`, `stellar_defindex_vault_deposit`, `stellar_defindex_vault_withdraw` | `value_action_pending` before the send; `sa_raw_invocation` on submit failure |
+| MCP | `stellar_dex_trade`, `stellar_defindex_vault_deposit`, `stellar_defindex_vault_withdraw` | `value_action_pending` (sized legs) before the send; `sa_raw_invocation` on submit failure |
 | MCP | `stellar_x402_create_payment`, `stellar_x402_authenticated_payment` | `x402_payment_authorized` (its own `EventKind` carrying legs, network, and scheme, plus a passed witness when the payment required one), fatal, before the signed re-simulation. `x402_authorization_withheld` follows a later failure, at a stage the paragraphs above list. Mainnet `x402_payment_authorized` rows record `RequireApproval` before signed re-simulation. Later withholding rows identify the failed stage with the same request identifier. |
 | MCP | `stellar_sep43_sign_and_submit_transaction` | `value_action_pending` (empty legs for an envelope the policy could not size) |
-| CLI | `pay`, `claim`, `accounts create` (sponsored mode only), `trustline`, `trade` | `value_action_pending` (sized legs) |
+| CLI | `pay`, `claim`, `accounts create` (sponsored mode only), `trustline` | `value_action_pending` (sized legs) |
+| CLI | `trade`, `vault deposit`, `vault withdraw` | `value_action_pending` (sized legs) before the send; `sa_raw_invocation` on submit failure |
+| CLI | `pool init` | `value_action_pending` (empty legs) |
+| CLI | `smart-account execute`, `smart-account timelock schedule`, `smart-account timelock execute` | `value_action_pending` (empty legs for an unvalued contract call) |
+| CLI | `smart-account multicall` | `value_action_pending` (the legs of the bundle's value-moving inner calls) |
+
+A policy decision that carries no value effects yields a pending row with empty legs on every surface.
 
 The value descriptor reaches the emission site through the policy engine's `evaluate_full` / `evaluate_with_value_full`, which surface the sized `ValueEffects` on the allow path; the decision-only `evaluate` / `evaluate_with_value` views discard it and must never gate a value-moving dispatch (see the rustdoc on those methods). Rows are written under the profile's `audit_log_hash_chain_key_id`, loaded through the single `stellar_agent_network::keyring::load_hmac_key_32` source, so `audit verify` covers them.
 
-The emission layer differs by surface. The CLI `pay`, `claim`, `accounts create`, and `trustline` verbs and the CLI `trade` verb emit at the CLI layer. The DEX and DeFindex submits emit inside the shared DeFi adapters, so both the MCP and CLI DeFi paths route through the same emission site rather than each surface emitting its own row.
+The submission recorder writes the pending row in its pre-send step (`WalletSubmissionRecorder::pre_send` and its bound and authorized forms in `stellar-agent-network`), the same site on every surface. The DEX and DeFindex adapters write only the `sa_raw_invocation` row of a failed submit (`emit_sa_raw_invocation_failure` in `stellar-agent-smart-account`). The smart-account verbs also write their own `sa_*` domain rows.
 
 ### Key-write emission sites
 

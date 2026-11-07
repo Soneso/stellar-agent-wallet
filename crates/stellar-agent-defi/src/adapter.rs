@@ -208,23 +208,24 @@ pub struct DefiAdapterCtx<'a> {
     ///
     /// `None` delegates the default count decision to the concrete adapter.
     pub auth_rule_ids: Option<&'a [ContextRuleId]>,
-    /// Audit writer for the value-action row a context without a submission
-    /// recorder emits after a confirmed submit.
+    /// Audit writer for the `sa_raw_invocation` row a failed submit writes.
     ///
-    /// `None` for preview-only calls and any caller that does not record value
-    /// rows. When `Some` and no submission recorder is attached, the adapter
-    /// emits a `ValueActionSubmitted` row in the submit Ok arm; an attached
-    /// recorder owns the submission's audit rows, and no such row is written.
-    /// The writer MUST have been opened with the profile's audit chain-root
-    /// HMAC key so `audit verify` covers the row.
+    /// `None` for preview-only calls and any caller that does not record
+    /// audit rows. A confirmed submit writes no row, because the recorder owns
+    /// the submission's rows. The writer MUST have been opened with the
+    /// profile's audit chain-root HMAC key so `audit verify` covers the row.
     pub audit_writer:
         Option<std::sync::Arc<std::sync::Mutex<stellar_agent_core::audit_log::AuditWriter>>>,
-    /// Gate-derived value legs recorded in the value-action row — the same
-    /// descriptor the policy gate sized (single-derivation invariant). Emission
-    /// is skipped when `None`.
+    /// Gate-derived value legs: the same descriptor the policy gate sized
+    /// (single-derivation invariant).
+    ///
+    /// No adapter reads this field. The submission recorder carries the legs
+    /// of the rows it writes.
     pub audit_legs: Option<&'a [stellar_agent_core::audit_log::ValueLegRecord]>,
-    /// MCP/CLI tool identity for the audit row's outer `tool` field (e.g.
-    /// `"stellar_blend_lend"`). Emission is skipped when `None`.
+    /// MCP/CLI tool identity of the action (e.g. `"stellar_blend_lend"`).
+    ///
+    /// No adapter reads this field. The submission recorder carries the tool
+    /// identity of the rows it writes.
     pub audit_tool: Option<&'a str>,
     /// Confirmed-sequence floor hook, threaded through to
     /// `SubmitInvokeArgs::sequence_floor` at the adapter's `submit_signed_invoke`
@@ -347,69 +348,6 @@ impl<'a> DefiAdapterCtx<'a> {
             audit_tool: None,
             sequence_floor: None,
             submission_recorder: None,
-        }
-    }
-
-    /// Emits a `ValueActionSubmitted` audit row for a confirmed DeFi submit.
-    ///
-    /// The row is written only when no submission recorder is attached,
-    /// because the recorder owns the submission's audit rows. Without a
-    /// recorder it is a no-op unless an audit writer, gate-derived legs, tool
-    /// identity, and chain id were all threaded into this context. Non-fatal:
-    /// the submit has already confirmed, so a row-write failure logs a warning
-    /// and does not affect the caller. `tx_hash_redacted` MUST already be
-    /// redacted.
-    pub fn emit_value_action_submitted(
-        &self,
-        tx_hash_redacted: &str,
-        ledger: u32,
-        request_id: &str,
-    ) {
-        // The recorder wrote the pending audit row before the send. A reported
-        // success updates the receipt and keeps the exposure open through its
-        // accounting horizon or, without a time bound, until an operator clears
-        // it. The pending row stays open, so no submitted row follows.
-        if self.submission_recorder.is_some() {
-            return;
-        }
-
-        let (Some(writer), Some(legs), Some(tool), Some(chain_id)) = (
-            self.audit_writer.as_ref(),
-            self.audit_legs,
-            self.audit_tool,
-            self.chain_id,
-        ) else {
-            return;
-        };
-
-        let entry = stellar_agent_core::audit_log::AuditEntry::new_value_action_submitted(
-            tool,
-            chain_id,
-            legs.to_vec(),
-            tx_hash_redacted,
-            ledger,
-            stellar_agent_core::audit_log::PolicyDecision::Allow,
-            None,
-            None,
-            None,
-            request_id,
-            None,
-        );
-
-        match writer.lock() {
-            Ok(mut guard) => {
-                if let Err(e) = guard.write_entry(entry) {
-                    tracing::warn!(
-                        error = %e,
-                        "defi value audit: write_entry failed; ValueActionSubmitted NOT emitted"
-                    );
-                }
-            }
-            Err(_) => {
-                tracing::warn!(
-                    "defi value audit: writer mutex poisoned; ValueActionSubmitted NOT emitted"
-                );
-            }
         }
     }
 }
