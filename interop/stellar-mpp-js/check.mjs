@@ -53,7 +53,7 @@ const actual = {
   provenance: {
     package: '@stellar/mpp@0.7.1',
     sourceCommit: '9f2f8254421e09906dfb7e983e2491a273120adf',
-    stellarSdk: '15.1.0',
+    stellarSdk: '16.4.1',
     mppx: '0.8.19',
     node: '24.5.0',
     pnpm: '10.33.0',
