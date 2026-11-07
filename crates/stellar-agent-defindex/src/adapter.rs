@@ -444,9 +444,8 @@ impl DefindexVaultAdapter {
                     tx_hash_redacted = %tx_hash_redacted,
                     "DeFindex vault deposit: submit succeeded"
                 );
-                // Non-fatal allow-path value-audit row (no-op unless the caller
-                // threaded a writer + gate-derived legs into the context).
-                ctx.emit_value_action_submitted(&tx_hash_redacted, result.ledger, &request_id);
+                // The recorder wrote the pending row before the send; a
+                // reported success writes no further row.
                 Ok(())
             }
             Err(e) => {
@@ -627,9 +626,8 @@ impl DefindexVaultAdapter {
                     tx_hash_redacted = %tx_hash_redacted,
                     "DeFindex vault withdraw: submit succeeded"
                 );
-                // Non-fatal allow-path value-audit row (no-op unless the caller
-                // threaded a writer + gate-derived legs into the context).
-                ctx.emit_value_action_submitted(&tx_hash_redacted, result.ledger, &request_id);
+                // The recorder wrote the pending row before the send; a
+                // reported success writes no further row.
                 Ok(())
             }
             Err(e) => {

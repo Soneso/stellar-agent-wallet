@@ -2297,9 +2297,8 @@ impl AuditEntry {
 
     /// Constructs a `ValueActionSubmitted` audit entry.
     ///
-    /// A DeFi adapter context without a submission recorder emits it after a
-    /// confirmed submit; the wallet's submit and reconciliation paths write no
-    /// such row. `legs`
+    /// Tests that build retained logs for the readers use this constructor;
+    /// the wallet's submit and reconciliation paths write no such row. `legs`
     /// MUST be built from the SAME `ValueEffects` the policy gate sized — the
     /// single-derivation invariant. `transaction_hash_redacted` MUST be
     /// pre-redacted to first-8-last-8 at the call site; `legs` destinations are

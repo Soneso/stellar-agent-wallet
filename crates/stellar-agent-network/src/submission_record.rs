@@ -3372,21 +3372,19 @@ mod tests {
         #[tokio::test]
         #[serial]
         async fn endpoint_outcomes_keep_stateless_consumption_open() {
-            for (label, outcome, _reported_kind) in [
+            for (label, outcome) in [
                 (
                     "rejected",
                     SubmissionOutcome::Rejected {
                         code: "transaction.failed".to_owned(),
                         error: "definitive refusal".to_owned(),
                     },
-                    "value_action_failed",
                 ),
                 (
                     "failed",
                     SubmissionOutcome::OnChainFailed {
                         code: "transaction.failed".to_owned(),
                     },
-                    "value_action_failed",
                 ),
                 (
                     "succeeded",
@@ -3394,7 +3392,6 @@ mod tests {
                         ledger: 512,
                         created_at: Some(1_800_000_001),
                     },
-                    "value_action_submitted",
                 ),
             ] {
                 let fx = LedgerFixture::new(label, NOW);

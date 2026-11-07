@@ -3159,26 +3159,22 @@ pub enum EventKind {
     ///
     /// The wallet's submit and reconciliation paths write no such row: a
     /// reported success is recorded on the receipt, and the pending row
-    /// stands. A DeFi adapter context without a submission recorder writes it
-    /// after a confirmed submit of an allow-path trade or vault action. The
-    /// `legs` are the SAME descriptor the
-    /// policy gate sized — the single-derivation invariant, never a second
-    /// derivation. The verb identity, chain id, policy decision, and request id
-    /// ride on the OUTER [`AuditEntry`](super::entry::AuditEntry) fields, as
-    /// with every other row.
+    /// stands. Readers accept this row in retained logs. The `legs` are the
+    /// SAME descriptor the policy gate sized: the single-derivation
+    /// invariant, never a second derivation. The verb identity, chain id,
+    /// policy decision, and request id ride on the OUTER
+    /// [`AuditEntry`](super::entry::AuditEntry) fields, as with every other
+    /// row.
     ///
-    /// # Sized vs opaque submits
+    /// # Sized vs opaque rows
     ///
-    /// A sized submit (classic pay/create/claim/trustline, DeFi trade/lend/vault
-    /// under a value-sizing policy engine) carries non-empty `legs` and
-    /// `opaque_reason: None`. An opaque submit — a raw sign-and-submit the
-    /// policy could not size (e.g. `stellar_sep43_sign_and_submit_transaction`)
-    /// — carries empty `legs` and `opaque_reason: Some(reason)`; the outer
-    /// entry's `envelope_hash` identifies what was submitted. Empty `legs` with
-    /// `opaque_reason: None` records an allow from an engine that sizes no
-    /// value (the no-op engine returns no descriptor). Non-empty `legs` is
-    /// valid ONLY with `opaque_reason: None`: legs are never fabricated for an
-    /// envelope the policy could not size.
+    /// A sized row carries non-empty `legs` and `opaque_reason: None`; an
+    /// opaque row carries empty `legs` and `opaque_reason: Some(reason)`, and
+    /// the outer entry's `envelope_hash` identifies what was submitted. Empty
+    /// `legs` with `opaque_reason: None` records an allow from an engine that
+    /// sizes no value (the no-op engine returns no descriptor). Non-empty
+    /// `legs` is valid ONLY with `opaque_reason: None`: legs are never
+    /// fabricated for an envelope the policy could not size.
     ///
     /// # Field redaction
     ///

@@ -804,6 +804,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `StellarRpcClient::signing_ledger_observation`.
   `StellarRpcClient::prepare_signing_ledger_observation` and
   `PreparedSigningLedgerRead::read` replace it.
+- `DefiAdapterCtx::emit_value_action_submitted` in `stellar-agent-defi`. Every
+  DEX and DeFindex submit refuses a context without a submission recorder, and
+  the recorder writes no row for a reported success.
 
 ### Fixed
 
