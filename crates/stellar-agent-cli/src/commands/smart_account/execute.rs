@@ -199,7 +199,7 @@ pub struct ExecuteArgs {
     ///
     /// Surfaces a misconfigured `--rule-signer-ed25519-secret-env` client-side
     /// instead of as an on-chain `NotAllowed`.
-    #[arg(long, value_name = "64_HEX")]
+    #[arg(long, value_name = "64_HEX", value_parser = RuleSignerHexFlag)]
     pub expect_rule_signer: Option<String>,
 
     /// Ed25519-verifier contract C-strkey override.
@@ -837,11 +837,57 @@ fn emit_success(result: &ExecuteResult, output: OutputFormat, request_id: &str) 
     0
 }
 
+/// Typed parser for `--expect-rule-signer`.
+///
+/// Accepts exactly 64 hexadecimal characters, upper- or lowercase, and stores
+/// them lowercased. Any other value is refused at parse time, before the
+/// profile or the rule key is read, and the refusal never echoes the value.
+/// This includes an S-strkey secret seed pasted into the wrong flag.
+#[derive(Clone)]
+struct RuleSignerHexFlag;
+
+impl clap::builder::TypedValueParser for RuleSignerHexFlag {
+    type Value = String;
+
+    fn parse_ref(
+        &self,
+        _cmd: &clap::Command,
+        arg: Option<&clap::Arg>,
+        value: &std::ffi::OsStr,
+    ) -> Result<String, clap::Error> {
+        use clap::error::{ContextKind, ContextValue, ErrorKind};
+        let flag = arg
+            .and_then(clap::Arg::get_long)
+            .unwrap_or("expect-rule-signer");
+        let refusal = || {
+            let mut error = clap::Error::raw(
+                ErrorKind::ValueValidation,
+                format!("--{flag} must be exactly 64 hexadecimal characters"),
+            );
+            if let Some(long) = arg.and_then(clap::Arg::get_long) {
+                error.insert(
+                    ContextKind::InvalidArg,
+                    ContextValue::String(format!("--{long}")),
+                );
+            }
+            error
+        };
+        let value = match value.to_str() {
+            Some(value) => value,
+            None => return Err(refusal()),
+        };
+        if value.len() != 64 || !value.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(refusal());
+        }
+        Ok(value.to_ascii_lowercase())
+    }
+}
+
 /// Refuses a rule signer whose public key differs from `--expect-rule-signer`.
 ///
-/// `expected` is the flag value (hex, compared case-insensitively) and
-/// `rule_pubkey_hex` the lowercase hex public key of the resolved rule signer.
-/// No flag means no check.
+/// `expected` is the validated, lowercase hex flag value produced by
+/// [`RuleSignerHexFlag`], and `rule_pubkey_hex` the lowercase hex public key
+/// of the resolved rule signer. No flag means no check.
 ///
 /// # Errors
 ///
@@ -852,7 +898,7 @@ fn check_expected_rule_signer(
     rule_pubkey_hex: &str,
 ) -> Result<(), WalletError> {
     match expected {
-        Some(expected_hex) if expected_hex.to_lowercase() != rule_pubkey_hex => {
+        Some(expected_hex) if expected_hex != rule_pubkey_hex => {
             Err(WalletError::Auth(AuthError::SignerKeyMismatch {
                 what: "--expect-rule-signer",
                 expected: expected_hex.to_owned(),
@@ -1055,8 +1101,9 @@ mod tests {
                 "signing key public key '{got}' does not match --expect-rule-signer '{expected}'"
             )
         );
-        // Matching (case-insensitively) or absent passes.
-        assert!(check_expected_rule_signer(Some(&expected.to_uppercase()), &expected).is_ok());
+        // A matching value or an absent flag passes; the parser has already
+        // lowercased the flag value.
+        assert!(check_expected_rule_signer(Some(&expected), &expected).is_ok());
         assert!(check_expected_rule_signer(None, &got).is_ok());
     }
 
@@ -1073,6 +1120,57 @@ mod tests {
             parsed.args.expect_rule_signer.as_deref(),
             Some(expected.as_str())
         );
+    }
+
+    #[test]
+    fn clap_expect_rule_signer_accepts_uppercase_and_stores_lowercase() {
+        let mut a = base_args();
+        let expected = "AA".repeat(32);
+        a.extend(["--expect-rule-signer", &expected]);
+        let parsed = ExecuteArgsHarness::try_parse_from(a).expect("must parse");
+        let lower = "aa".repeat(32);
+        assert_eq!(
+            parsed.args.expect_rule_signer.as_deref(),
+            Some(lower.as_str())
+        );
+    }
+
+    #[test]
+    fn clap_expect_rule_signer_refuses_a_seed_without_echoing_it() {
+        use clap::error::{ContextKind, ContextValue, ErrorKind};
+        use stellar_agent_test_support::rejected_value::{assert_no_marker, seed_marker};
+
+        let seed = seed_marker();
+        assert_eq!(seed.len(), 56, "the marker is a 56-character S-strkey");
+        let mut a = base_args();
+        a.extend(["--expect-rule-signer", &seed]);
+        let error =
+            ExecuteArgsHarness::try_parse_from(a).expect_err("a seed is not 64 hex characters");
+        assert_eq!(error.kind(), ErrorKind::ValueValidation);
+        assert_eq!(
+            error.get(ContextKind::InvalidArg),
+            Some(&ContextValue::String("--expect-rule-signer".to_owned()))
+        );
+        assert_no_marker(&error, &seed);
+    }
+
+    #[test]
+    fn clap_expect_rule_signer_refuses_wrong_length_and_non_hex() {
+        use clap::error::ErrorKind;
+
+        for value in [
+            String::new(),
+            "a".repeat(63),
+            "a".repeat(65),
+            format!("{}g", "a".repeat(63)),
+            format!(" {}", "a".repeat(63)),
+        ] {
+            let mut a = base_args();
+            a.extend(["--expect-rule-signer", &value]);
+            let error = ExecuteArgsHarness::try_parse_from(a)
+                .expect_err("a value that is not 64 hex characters must be refused");
+            assert_eq!(error.kind(), ErrorKind::ValueValidation, "{value:?}");
+        }
     }
 
     // ── Envelope shape ──────────────────────────────────────────────────────
