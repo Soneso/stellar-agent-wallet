@@ -66,11 +66,13 @@
 //!
 //! Without `--acknowledge` nothing is reconciled or written: the verb exits 1
 //! with `submission.acknowledgement_required`, and the message names the next
-//! step, computed from the record. While a sent transaction's time bound is
-//! open, that is to wait for it to pass or run `tx status`. Otherwise it is
-//! `--acknowledge`, plus `--acknowledge-unbounded` for an authenticated hold
-//! without a time bound on every network and, on mainnet, for a sent
-//! `pending`, `ambiguous` or `failed` receipt without one when no hold exists.
+//! step, computed from the record. An unbounded exposure needs `--acknowledge`
+//! and `--acknowledge-unbounded`. That is an authenticated hold without a time
+//! bound on every network and, on mainnet, a sent `pending`, `ambiguous` or
+//! `failed` receipt without one when no hold exists. Otherwise, for a sent
+//! `pending` receipt whose time bound is open on the host clock, the next step
+//! is to wait for the bound to pass or run `tx status`. Every other record
+//! needs `--acknowledge`.
 //!
 //! With `--acknowledge` the verb acquires the audit writer, restores an
 //! orphan's receipt from its reservation, reconciles the submission with the
@@ -1379,9 +1381,12 @@ fn settled_by_reconciliation(source: &str, answer: &str, tx_hash: &str) -> Envel
 }
 
 /// The refusal without `--acknowledge`, naming the next step computed from
-/// the record without reconciling: a sent transaction whose time bound is
-/// still open on the host clock waits or goes to `tx status`, and every other
-/// record needs the acknowledgement.
+/// the record without reconciling.
+///
+/// An unbounded exposure comes first and needs both acknowledgement flags.
+/// Otherwise a sent `pending` receipt whose time bound is open on the host
+/// clock waits or goes to `tx status`. Every other record needs
+/// `--acknowledge`.
 fn acknowledgement_required(
     existing: Option<&SubmissionReceipt>,
     held: Option<&stellar_agent_network::policy_state::SubmissionHold>,

@@ -761,13 +761,14 @@ profile or receipt does not migrate it.
 
 Without `--acknowledge` nothing is reconciled or written, and the verb exits 1
 with `submission.acknowledgement_required`. The message names the next step,
-computed from the record: while a sent transaction's time bound is still open,
-wait for it to pass or run `tx status`; otherwise pass `--acknowledge`. An
-authenticated hold without a time bound also requires `--acknowledge-unbounded`
-on every network, and so does, on mainnet, a sent `pending`, `ambiguous` or
-`failed` receipt without a time bound when no hold exists. This states that the
-transaction can still apply and its spend stops counting against the window;
-the clear row records `unbounded_exposure: true`.
+computed from the record. An authenticated hold without a time bound requires
+`--acknowledge-unbounded` beside `--acknowledge` on every network, and so does,
+on mainnet, a sent `pending`, `ambiguous` or `failed` receipt without a time
+bound when no hold exists. This states that the transaction can still apply and
+its spend stops counting against the window; the clear row records
+`unbounded_exposure: true`. Otherwise, while a sent `pending` receipt's time
+bound is still open, wait for it to pass or run `tx status`. Every other record
+takes `--acknowledge`.
 
 With `--acknowledge` the verb takes the audit writer, restores a missing
 receipt from its reservation, reconciles the submission the way `tx status`
@@ -824,7 +825,7 @@ reports `reservation_released: true`.
 | `<ENVELOPE_HASH>` (positional) | Envelope hash of the submission, 64 lowercase hex characters: `tx status` reports it as `record.envelope_hash` | yes | none |
 | `--profile <NAME>` | Profile whose record and spending window are cleared | optional | `STELLAR_AGENT_PROFILE`, else `default` |
 | `--acknowledge` | Record the operator's decision to clear, and reconcile before clearing; clearing establishes no chain outcome | yes | `false` |
-| `--acknowledge-unbounded` | Accept that this untimed transaction can still apply and that its spend is then not counted | for an authenticated hold without a time bound on every network, and on mainnet for a sent `pending`, `ambiguous` or `failed` receipt without one when no hold exists; both acknowledgement flags are also required to finish a recorded unbounded clear | `false` |
+| `--acknowledge-unbounded` | Accept that this untimed transaction can still apply and that its spend is then not counted | for an authenticated hold without a time bound on every network, and on mainnet for a sent `pending`, `ambiguous` or `failed` receipt without one when no hold exists. Both acknowledgement flags are also required to finish a recorded unbounded clear | `false` |
 | `--output <FORMAT>` | `json` or `table` | optional | `json` |
 
 `--acknowledge` is required because the wallet cannot establish what became of
