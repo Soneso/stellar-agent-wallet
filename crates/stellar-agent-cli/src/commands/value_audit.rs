@@ -233,10 +233,10 @@ pub(crate) fn audit_writer_open_failed(profile_name: &str) -> WalletError {
 ///   profile file, no `rotate-audit-key` step to run. The writer is acquired
 ///   opportunistically (a `tracing::warn!` on failure, no refusal), matching
 ///   the pre-existing zero-config behavior. Returns `Ok(None)` when the writer
-///   could not be acquired; the caller then skips the pending row rather
-///   than treating the operation as unaudited — there was no audit guarantee
-///   to defeat here, since the operator never persisted a profile in the
-///   first place. A recorded audit binding that differs from the profile's
+///   could not be acquired, and the caller then skips the pending row rather
+///   than treating the operation as unaudited. No audit guarantee is defeated
+///   here, since the operator never persisted a profile in the first place.
+///   A recorded audit binding that differs from the profile's
 ///   refuses: the binding check compares without recording, and its refusal
 ///   precedes any signing.
 ///
@@ -547,7 +547,7 @@ mod tests {
 
     /// With a real 32-byte chain-root key seeded (the post-`rotate-audit-key`
     /// state), `require_value_audit_writer` returns `Ok` with a writer that
-    /// writes through to the profile's audit log — the same acquisition
+    /// writes through to the profile's audit log. It is the same acquisition
     /// [`emit_value_audit_row_strict`] performs internally, exposed so the caller can
     /// hand it to the submission recorder for the pending row.
     #[test]

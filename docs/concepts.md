@@ -402,7 +402,7 @@ before signing-key access or submission. An unavailable key or writer refuses
 with `audit.chain_key_unavailable`, subject to the specific audit refusals
 described in [Audit-log recovery](maintainers/audit-log-recovery.md).
 
-The pending row is written before the send, and a confirmed submission writes no further row.
+The submission recorder writes the pending row before the send, and a confirmed submission it records writes no further value-action outcome row.
 Read-only tools and build/simulate stages do not reach the signing preflight.
 V1 MCP payment simulations can still acquire the writer for reservation
 reconciliation and owed accounting events.

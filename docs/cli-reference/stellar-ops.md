@@ -619,8 +619,9 @@ stellar-agent counterparty rotate-hmac-key --profile default
 
 Reconciles and clears the submission records the value verbs write. Every
 value-moving verb records a transaction before it is sent, so a submission
-whose confirmation never arrived leaves a receipt and a spending-window
-reservation behind. The reservation holds the operator's caps through its
+whose confirmation never arrived leaves a receipt behind. It also leaves a
+spending-window reservation when the policy produced window entries for the
+submission. The reservation holds the operator's caps through its
 accounting horizon or, without a time bound, until an operator clears it. A
 pending receipt holds the wallet's duplicate check.
 
@@ -780,7 +781,7 @@ does, and decides:
 | A reconciliation read of the oracle was still open at the verb's oracle deadline, and the reservation stood | Refused with `network.rpc_unreachable`. Nothing changes. |
 | An authenticated hold without a time bound, whatever its receipt records, without `--acknowledge-unbounded` | Refused with `submission.unbounded_exposure`. Pass both acknowledgement flags to clear and record the exposure. |
 | An authenticated hold without a time bound, with both acknowledgement flags | The receipt is cleared and the hold released, whatever the endpoint or the oracle reported. A receipt that records a network answer keeps it until the clear, and an endpoint answer reconciliation did not record is the row's `evidence`. |
-| Authenticated accounting expiry, identified by its decision identifier. | Accounting expiry leaves the chain outcome unknown. Its audit event uses the authenticated decision identifier. The expiry already committed the accounting disposition, and the clear row records the acknowledgement. |
+| Authenticated accounting expiry, identified by its decision identifier. | Accounting expiry leaves the chain outcome unknown. Its audit event uses the authenticated decision identifier. The expiry commits the accounting disposition before the clear, and the clear row records the acknowledgement. |
 | On mainnet, a sent `pending` or `ambiguous` receipt without a time bound and with no held reservation, without `--acknowledge-unbounded` | Refused with `submission.unbounded_exposure`. |
 | `pending` or `ambiguous` with a held reservation or a sent receipt, and a time bound that has not passed on this host's clock | Refused with `submission.still_pending`, naming the time bound. Nothing changes. |
 | `ambiguous` without evidence (retention window closed), `ambiguous` with a `release_code` the spending window does not bear out, `failed` with no held reservation, `pending` with a passed time bound or none, or `pending`, never sent and with no held reservation, each with the required acknowledgement flags | The receipt is cleared. A bounded hold keeps counting through its accounting horizon, so the output and the row carry `reservation_released: false`. |

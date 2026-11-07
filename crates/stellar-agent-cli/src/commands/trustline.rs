@@ -494,9 +494,9 @@ where
 
     // ── Audit pre-flight (fail-closed) ────────────────────────────────────────
     // Proves the profile's audit chain-root key is acquirable AFTER the
-    // policy gate (a denial is a clean refusal that signs nothing and needs
-    // no audit setup) but BEFORE the signer is loaded (below) or the
-    // transaction is submitted. The submission recorder reuses it (not
+    // policy gate but BEFORE the signer is loaded (below) or the transaction
+    // is submitted. A policy denial is a clean refusal that signs nothing and
+    // needs no audit setup. The submission recorder reuses it (not
     // re-acquired) for the `value_action_pending` row it writes before the
     // send.
     let audit_writer =

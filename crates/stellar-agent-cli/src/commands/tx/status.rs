@@ -44,7 +44,8 @@
 //!   it already carries; `tx receipt clear` resolves it. The receipt of an
 //!   untimed hold keeps a recorded network answer. Any other receipt refuses
 //!   the transition, which the verb logs as a receipt write failure. An
-//!   absent receipt leaves an authenticated hold marked `operator_required`.
+//!   absent receipt leaves an authenticated hold marked `operator_required`
+//!   unless the hold records a reported success.
 //!
 //! No step sends the transaction again.
 //!

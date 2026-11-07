@@ -1320,7 +1320,7 @@ to finish it.
 
 ## tx
 
-Reconciles and clears the submission records the value verbs write. Every value-moving verb records a transaction before it is sent, so a submission whose confirmation never arrived leaves a receipt and a spending-window reservation behind. The reservation holds the operator's caps through its accounting horizon or, without a time bound, until an operator clears it. A pending receipt holds the wallet's duplicate check.
+Reconciles and clears the submission records the value verbs write. Every value-moving verb records a transaction before it is sent, so a submission whose confirmation never arrived leaves a receipt behind. It also leaves a spending-window reservation when the policy produced window entries for the submission. The reservation holds the operator's caps through its accounting horizon or, without a time bound, until an operator clears it. A pending receipt holds the wallet's duplicate check.
 
 ### `tx status <HASH> [flags]`
 
@@ -1345,7 +1345,7 @@ No failure row follows from an endpoint's failure, absence, or time claim.
 The authenticated reservation controls the bound and chain; editing a receipt
 cannot shorten either. A checked independent witness supplies anchor provenance.
 
-Accounting audit delivery needs the audit writer's exclusive lock, so while a `stellar-agent-mcp` server holds that writer the verb refuses with `audit.writer_locked`. Stop the server, reconcile, start it again.
+Accounting audit delivery needs the audit writer's exclusive lock. While a `stellar-agent-mcp` server holds that writer, the verb still reconciles and reports. The event stays owed and the refusal is logged at WARN. Stop the server and run the verb again to deliver it.
 
 ### `tx receipt clear <ENVELOPE_HASH> --acknowledge [flags]`
 

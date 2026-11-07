@@ -1,10 +1,10 @@
 //! What the submit layer records, and when, against a mocked Stellar RPC
 //! endpoint.
 //!
-//! The record is written before the transaction is sent and settled against
-//! what the network answered. These tests pin the order of the two checks that
-//! write it, the outcome each exit reports, and what each outcome leaves
-//! behind.
+//! The record is written before the transaction is sent, and each exit
+//! reports what the network answered to it. These tests pin the order of the
+//! two checks that write it, the outcome each exit reports, and what each
+//! outcome leaves behind.
 
 #![allow(
     clippy::unwrap_used,

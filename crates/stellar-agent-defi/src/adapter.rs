@@ -366,8 +366,9 @@ impl<'a> DefiAdapterCtx<'a> {
         request_id: &str,
     ) {
         // The recorder wrote the pending audit row before the send. A reported
-        // success updates the receipt and keeps the exposure open until
-        // authenticated settlement, so no submitted row follows.
+        // success updates the receipt and keeps the exposure open through its
+        // accounting horizon or, without a time bound, until an operator clears
+        // it. The pending row stays open, so no submitted row follows.
         if self.submission_recorder.is_some() {
             return;
         }

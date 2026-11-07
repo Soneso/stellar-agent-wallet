@@ -839,8 +839,9 @@ persisted profile proves the audit writer is acquirable BEFORE the signing key
 is touched or a transaction is submitted. If the key was never minted (run
 `stellar-agent profile rotate-audit-key <name>`), the verb refuses
 `audit.chain_key_unavailable` instead of signing unaudited. This applies on
-both policy engines. The `value_action_pending` row above is written before
-the send, and a confirmed submission writes no further row.
+both policy engines. The submission recorder writes the `value_action_pending`
+row above before the send, and a confirmed submission it records writes no
+further value-action outcome row.
 Read-only tools and the build/simulate stages of two-phase verbs never reach
 this pre-flight. `smart-account rules verify-pins`, `signers list`, and
 `signers refresh` record audit rows, so they reach it without loading a signer.

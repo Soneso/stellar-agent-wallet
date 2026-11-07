@@ -25,7 +25,8 @@
 //!    and the verb that resolves it.
 //! 3. `stellar-agent tx status <HASH>` reconciles the submission: the chain
 //!    reports `SUCCESS`, the receipt becomes `success`, and the reservation
-//!    becomes recorded spend.
+//!    stays open as exposure through its accounting horizon or, without a
+//!    time bound, until an operator clears it.
 //! 4. The audit log holds the pending row written before the send, and
 //!    reconciliation writes no submitted row after it.
 //!

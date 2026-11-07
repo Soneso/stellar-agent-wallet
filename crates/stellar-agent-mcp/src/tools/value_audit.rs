@@ -2,8 +2,8 @@
 //!
 //! Value verbs (pay, create_account, claim, trustline, the DeFi adapters, and
 //! the opaque sep43 submit) write their hash-chained, HMAC-signed
-//! `ValueActionPending` row through the submission recorder before the send,
-//! and a confirmed submit writes no further value row. The sign-only tools
+//! `ValueActionPending` row through the submission recorder before the send.
+//! A confirmed submit writes no further value row. The sign-only tools
 //! write their row through [`emit_value_audit_row_with_writer`] after the
 //! signature is produced. That emission is NON-FATAL: the signature already
 //! exists, so a row-write failure logs a `tracing::warn!` and never changes

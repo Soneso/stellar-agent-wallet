@@ -462,7 +462,8 @@ mod tests {
         let receipt = state.receipt(&envelope_hash_hex(&envelope_xdr));
         assert_eq!(receipt.status, ReceiptStatus::Success, "{receipt:?}");
         assert_eq!(receipt.ledger, Some(CONFIRMED_LEDGER), "{receipt:?}");
-        // Confirmation leaves the exposure open until authenticated settlement.
+        // The envelope carries no time bound, so confirmation keeps the
+        // exposure open until an operator clears it.
         assert_eq!(state.native_window(), (DEBIT_STROOPS, 1));
         assert_eq!(state.pending_reservations(), 1);
         let intents = state.signed_intents();

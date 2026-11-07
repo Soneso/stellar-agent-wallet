@@ -592,8 +592,9 @@ where
 
     // Record the submission before the bytes leave: the receipt, the pending
     // audit row and the spending-window reservation. A reported success
-    // updates the receipt and keeps the exposure open until authenticated
-    // settlement.
+    // updates the receipt and keeps the exposure open through its accounting
+    // horizon or, without a time bound, until an operator clears it. The
+    // pending audit row stays open.
     let recorder = match crate::commands::submission_record::build_recorder(
         crate::commands::submission_record::SubmitRecord {
             unvalued: None,
@@ -1008,8 +1009,9 @@ where
 
     // Record the submission before the bytes leave: the receipt, the pending
     // audit row and the spending-window reservation. A reported success
-    // updates the receipt and keeps the exposure open until authenticated
-    // settlement.
+    // updates the receipt and keeps the exposure open through its accounting
+    // horizon or, without a time bound, until an operator clears it. The
+    // pending audit row stays open.
     let recorder = match crate::commands::submission_record::build_recorder(
         crate::commands::submission_record::SubmitRecord {
             unvalued: None,

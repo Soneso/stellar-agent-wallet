@@ -249,7 +249,8 @@ pub enum SentByError {
     /// attempt, and no attempt starts after it.
     ///
     /// Before the first attempt nothing was sent, `sent_tx_hash` is `None`,
-    /// and a record written before the send is settled as rejected. Before a
+    /// and the recorder is told the submission was rejected; the wallet's
+    /// recorder retains the record for reconciliation. Before a
     /// resend the earlier send may have reached the network: `sent_tx_hash`
     /// names the transaction, and its record stands unresolved for
     /// reconciliation.
@@ -324,11 +325,11 @@ fn send_by_elapsed(client: &StellarRpcClient, timeout: Duration) -> WalletError 
 ///   precedes envelope decoding and network access.
 /// - [`SentByError::Elapsed`] when `send_by` passes before a
 ///   `sendTransaction` attempt. Before the first attempt nothing was sent,
-///   and a record the recorder wrote is settled as
-///   [`SubmissionOutcome::Rejected`] with the code of
-///   [`NetworkError::RpcTimeout`]. Before a resend the record is settled as
+///   and the recorder is told [`SubmissionOutcome::Rejected`] with the code
+///   of [`NetworkError::RpcTimeout`]. Before a resend it is told
 ///   [`SubmissionOutcome::TransportAfterSend`]: the earlier send's outcome is
-///   unknown, and the error names its transaction hash.
+///   unknown, and the error names its transaction hash. The wallet's
+///   recorder retains the record for reconciliation after either report.
 /// - [`SentByError::Failed`] with every error of
 ///   [`submit_transaction_and_wait`].
 ///
@@ -562,12 +563,12 @@ pub enum MainnetSubmitGrant {
 ///   that failure is returned. The wallet's
 ///   [`WalletSubmissionRecorder`](crate::submission_record::WalletSubmissionRecorder)
 ///   retains the reservation, the receipt and the pending audit row for that
-///   report too. Any other oracle answer, an oracle that reports another
-///   network or whose identity cannot be read, an oracle error, no answer before the
-///   deadline, or no oracle (`oracle` is `None`) records
-///   [`SubmissionOutcome::TransportAfterSend`] and returns
-///   [`SubmissionError::TxTimeout`]: the reservation, the receipt and the
-///   pending audit row stand. The reservation ends at its accounting horizon
+///   report too. Any other oracle answer, an oracle error, or no answer
+///   before the deadline records [`SubmissionOutcome::TransportAfterSend`]
+///   and returns [`SubmissionError::TxTimeout`]. So do an oracle that reports
+///   another network or whose identity cannot be read, and a missing oracle
+///   (`oracle` is `None`). The reservation, the receipt and the pending audit
+///   row stand. The reservation ends at its accounting horizon
 ///   or, without an execution bound, at an operator clear.
 /// - A `sendTransaction` refusal is never confirmed, since a refused
 ///   transaction has no record an oracle could report. It records

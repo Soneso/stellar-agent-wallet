@@ -89,13 +89,13 @@
 //!   `submission.unbounded_exposure`. With it, the receipt is cleared and the
 //!   hold released whatever the receipt records; the clear row records the
 //!   unbounded exposure and `reservation_released: true`.
-//! - **Accounting disposition.** The receipt carries `release_code`, and the
-//!   authenticated spending window bears it out rather than the receipt: this
-//!   run's reconciliation expired the accounting under that code, or the
-//!   window holds no reservation for it. The clear row records the code
-//!   as `evidence`; it is an observation, not a chain outcome. A receipt whose
-//!   code the window does not bear out is decided by the rows below, as an
-//!   unknown outcome.
+//! - **Accounting disposition.** The verified spending window holds an
+//!   accounting-expiry decision for the submission and no reservation for
+//!   it, and the `ambiguous` receipt carries that decision's projection: its
+//!   decision identifier and `release_code` `submission.accounting_expired`.
+//!   The clear row records the code as `evidence`; it is an observation, not
+//!   a chain outcome. A `release_code` on the receipt alone is display data,
+//!   and such a receipt is decided by the rows below, as an unknown outcome.
 //! - **Still able to apply.** A `pending` or `ambiguous` receipt with a held
 //!   reservation or a sent receipt, whose time bound has not passed on this
 //!   host's clock. Refused with `submission.still_pending`, naming the time
