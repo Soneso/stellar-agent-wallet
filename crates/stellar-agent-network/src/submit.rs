@@ -1032,8 +1032,8 @@ fn lose_send_answer(
     answer
 }
 
-/// Polls `getTransaction` through `poll` until the transaction settles or
-/// `send_deadline` passes, and settles the record to match.
+/// Polls `getTransaction` through `poll` until an answer ends the poll or
+/// `send_deadline` passes, and reports the outcome to `recorder`.
 ///
 /// `poll` issues one `getTransaction` request for the submitted transaction.
 /// Each poll reads the raw answer: status, ledger and created-at are read as
@@ -1348,8 +1348,8 @@ pub(crate) async fn sleep_before_next_poll(interval: Duration, deadline: tokio::
     tokio::time::sleep_until(deadline.min(tokio::time::Instant::now() + interval)).await;
 }
 
-/// Settles the record for a submission whose confirmation never arrived, and
-/// builds the timeout the caller returns.
+/// Reports a timeout to `recorder` for a submission whose confirmation never
+/// arrived, and builds the timeout the caller returns.
 ///
 /// The transaction was accepted for inclusion and may still apply, so the
 /// receipt, the pending audit row and the window reservation all stand. The

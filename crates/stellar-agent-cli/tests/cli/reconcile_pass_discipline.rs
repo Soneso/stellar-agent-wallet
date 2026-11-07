@@ -2,9 +2,9 @@
 //! policy gate.
 //!
 //! A submission whose outcome never came back holds a spending-window
-//! reservation, and that reservation counts against the operator's caps
-//! through its accounting horizon or, without a time bound, until an operator
-//! clears it. The bounded pass is what expires a time-bounded one at its
+//! reservation when the policy produced window entries for it. That
+//! reservation counts against the operator's caps through its accounting
+//! horizon or, without a time bound, until an operator clears it. The bounded pass is what expires a time-bounded one at its
 //! horizon without the operator asking, so a value verb that skips it lets a
 //! stale hold shrink
 //! every later action's headroom. Two public documents state the rule for

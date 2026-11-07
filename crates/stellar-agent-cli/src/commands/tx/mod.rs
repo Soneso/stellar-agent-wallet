@@ -2,8 +2,10 @@
 //! submissions.
 //!
 //! Every value-moving verb records its submission before the transaction is
-//! sent, so a submission whose outcome never came back leaves a receipt and a
-//! spending-window reservation behind. This group is how those are resolved:
+//! sent, so a submission whose outcome never came back leaves a receipt
+//! behind. It also leaves a spending-window reservation when the policy
+//! produced window entries for the submission. This group is how those are
+//! resolved:
 //!
 //! - [`status`] asks the chain what became of one transaction and records the
 //!   answer as a report. This is the way out of `submission.tx_timeout`.

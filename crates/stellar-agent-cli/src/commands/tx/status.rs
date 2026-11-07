@@ -4,8 +4,9 @@
 //! # What it is for
 //!
 //! A value verb records its submission before the transaction is sent, so a
-//! submission whose confirmation never arrived leaves a receipt and a
-//! spending-window reservation behind. Those hold the operator's caps and the
+//! submission whose confirmation never arrived leaves a receipt behind. It
+//! also leaves a spending-window reservation when the policy produced window
+//! entries for the submission. Those hold the operator's caps and the
 //! wallet's duplicate check. This verb asks the endpoint what became of the
 //! transaction. It records a reported success on the receipt and classifies
 //! a missing transaction against the endpoint's retention. Accounting expiry

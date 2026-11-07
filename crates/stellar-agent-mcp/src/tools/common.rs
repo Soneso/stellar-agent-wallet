@@ -1425,11 +1425,12 @@ impl WalletServer {
     ///
     /// Never fails the dispatch. An endpoint that cannot be reached, a
     /// receipt store that cannot be opened, and a window file that cannot be
-    /// read all leave every reservation standing, which is the direction that
+    /// read all leave every reservation standing. That is the direction that
     /// keeps the operator's caps honest: a reservation that may still apply
     /// keeps counting. The exception is a reservation past its accounting
-    /// horizon: with a readable window file and a built endpoint client, the
-    /// pass expires it before it reads any endpoint.
+    /// horizon. With a readable window file and a built endpoint client, the
+    /// pass runs accounting expiry for each selected reservation before that
+    /// reservation's endpoint reads.
     ///
     /// On a mainnet profile the pass consults the oracle about a negative
     /// answer of the primary endpoint, and a negative answer from either keeps
@@ -1779,8 +1780,9 @@ impl WalletServer {
         // failure to reach the endpoint leaves every reservation standing and
         // the dispatch continues, because counting a reservation that may
         // still apply is the safe direction. The exception is a reservation
-        // past its accounting horizon: with a readable window file and a built
-        // endpoint client, the pass expires it before it reads any endpoint.
+        // past its accounting horizon. With a readable window file and a built
+        // endpoint client, the pass runs accounting expiry for each selected
+        // reservation before that reservation's endpoint reads.
         // It never joins the hydration
         // errors below, which are fail-closed for a different reason.
         //

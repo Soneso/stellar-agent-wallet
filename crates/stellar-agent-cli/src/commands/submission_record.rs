@@ -465,11 +465,12 @@ pub(crate) fn settlement_oracle_in(
 ///
 /// A reservation counts against the operator's caps while it stands, so a
 /// verb that is about to be gated asks the chain about the oldest few first.
-/// Reconciliation is not a gate of its own: a pass that cannot reach the
+/// Reconciliation is not a gate of its own. A pass that cannot reach the
 /// endpoint leaves every reservation standing and the verb continues, because
 /// counting a reservation that may still apply is the safe direction. The
-/// exception is a reservation past its accounting horizon, which the pass
-/// expires before it reads any endpoint.
+/// exception is a reservation past its accounting horizon. For each selected
+/// reservation, accounting expiry runs before that reservation's endpoint
+/// reads.
 ///
 /// On a mainnet profile `oracle` witnesses the primary endpoint's negative
 /// answers; [`settlement_oracle`] builds it.

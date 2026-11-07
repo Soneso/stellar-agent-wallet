@@ -1,10 +1,11 @@
 //! What the submit layer records, and when, against a mocked Stellar RPC
 //! endpoint.
 //!
-//! The record is written before the transaction is sent, and each exit
-//! reports what the network answered to it. These tests pin the order of the
-//! two checks that write it, the outcome each exit reports, and what each
-//! outcome leaves behind.
+//! The record is written before the transaction is sent. The submit layer
+//! reports outcomes through the recorder's outcome callback, and a failure to
+//! write the record returns before any callback. These tests pin the order of
+//! the two checks that write it, which outcome, if any, each exit reports, and
+//! what each outcome leaves behind.
 
 #![allow(
     clippy::unwrap_used,
@@ -1103,8 +1104,8 @@ async fn a_muxed_source_reaches_the_send() {
 /// An unexpected `getTransaction` status after the send reports the timeout
 /// shape, so the agent gets the hash it needs to reconcile.
 ///
-/// The record is settled as an unknown outcome either way; what this pins is
-/// that the caller is told which transaction to ask about.
+/// The outcome is reported as unknown either way; what this pins is that the
+/// caller is told which transaction to ask about.
 #[tokio::test]
 #[serial]
 async fn an_unexpected_poll_status_reports_the_timeout_shape() {
@@ -1158,7 +1159,7 @@ async fn an_unexpected_poll_status_reports_the_timeout_shape() {
             calls.last(),
             Some(Call::Outcome(SubmissionOutcome::TransportAfterSend { .. }))
         ),
-        "the record is settled as an unknown outcome; got {calls:?}"
+        "the outcome is reported as unknown; got {calls:?}"
     );
 
     let envelope_hash = stellar_agent_network::envelope_hash_hex(envelope.envelope_xdr());

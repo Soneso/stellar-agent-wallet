@@ -229,10 +229,10 @@ pub(crate) fn audit_writer_open_failed(profile_name: &str) -> WalletError {
 ///   fails closed with `audit.chain_key_unavailable` when the writer cannot be
 ///   acquired. An operator who authored a profile file is expected to run
 ///   `stellar-agent profile rotate-audit-key <name>` before signing.
-/// - [`crate::common::profile_access::ProfileOrigin::Synthesized`] is the zero-config quickstart path — no
-///   profile file, no `rotate-audit-key` step to run. The writer is acquired
-///   opportunistically (a `tracing::warn!` on failure, no refusal), matching
-///   the pre-existing zero-config behavior. Returns `Ok(None)` when the writer
+/// - [`crate::common::profile_access::ProfileOrigin::Synthesized`] is the zero-config quickstart path, with no
+///   profile file and no `rotate-audit-key` step to run. The writer is
+///   acquired opportunistically: a failure to acquire it logs a
+///   `tracing::warn!` and refuses nothing. Returns `Ok(None)` when the writer
 ///   could not be acquired, and the caller then skips the pending row rather
 ///   than treating the operation as unaudited. No audit guarantee is defeated
 ///   here, since the operator never persisted a profile in the first place.
