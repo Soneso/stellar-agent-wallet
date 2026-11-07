@@ -417,18 +417,19 @@ fn descriptor_for(tool: &'static str, chain_id: &str, value_kind: ToolValueKind)
     descriptor
 }
 
-/// The oracle a reconciliation pass of `profile` asks before a negative
-/// answer of the primary endpoint settles a mainnet reservation, built from
-/// the profile.
+/// The oracle a reconciliation pass of `profile` consults about a negative
+/// answer of the primary endpoint for a mainnet reservation, built from the
+/// profile. The reservation stands whatever the oracle answers negatively.
 ///
 /// See [`settlement_oracle_in`].
 pub(crate) fn settlement_oracle(profile: &Profile) -> Option<StellarRpcClient> {
     settlement_oracle_in(profile, &NetworkContext::from_profile(profile))
 }
 
-/// The oracle a reconciliation pass of `profile` asks before a negative
-/// answer of the primary endpoint settles a mainnet reservation, built as
-/// `context` builds its clients.
+/// The oracle a reconciliation pass of `profile` consults about a negative
+/// answer of the primary endpoint for a mainnet reservation, built as
+/// `context` builds its clients. The reservation stands whatever the oracle
+/// answers negatively.
 ///
 /// `None` for a profile on another chain, whose pass never reads an oracle,
 /// and for a mainnet profile that names none. An oracle client that cannot

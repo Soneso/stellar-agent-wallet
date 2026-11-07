@@ -1538,7 +1538,7 @@ impl ServerHandler for WalletServer {
              read-only); \
              stellar_signed_intents_list (read authenticated smart-account intent charges without writing state); \
              stellar_transaction_status (reconcile one submitted transaction against \
-             the chain and settle the wallet's record of it; the way out of \
+             the chain and record the answer as a report; the way out of \
              submission.tx_timeout, never re-simulate); \
              stellar_defindex_vault_deposit (DeFindex vault deposit via \
              smart-account submit, destructive); \
@@ -1712,9 +1712,10 @@ impl WalletServer {
             .map_or(&self.profile, |context| context.profile())
     }
 
-    /// The oracle reconciliation asks before a negative answer of the
-    /// primary endpoint settles a mainnet reservation, built as this
-    /// server's network context builds its clients.
+    /// The oracle reconciliation consults about a negative answer of the
+    /// primary endpoint for a mainnet reservation, built as this server's
+    /// network context builds its clients. The reservation stands whatever the
+    /// oracle answers negatively.
     ///
     /// `None` for a profile on another chain, whose reconciliation never
     /// reads an oracle, and for a mainnet profile that names none. A client

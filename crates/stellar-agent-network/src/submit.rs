@@ -557,10 +557,13 @@ pub enum MainnetSubmitGrant {
 /// - A `FAILED` confirmation is checked against `oracle`: one `getNetwork`
 ///   that has to report the mainnet passphrase, then one `getTransaction`
 ///   for the same hash, both bounded by the remaining deadline. Only the
-///   oracle's own `FAILED` settles the submission as failed on chain, with
-///   the oracle's result code, and that failure is returned. Any other
-///   oracle answer, an oracle that reports another network or whose
-///   identity cannot be read, an oracle error, no answer before the
+///   oracle's own `FAILED` is reported to the recorder as
+///   [`SubmissionOutcome::OnChainFailed`], with the oracle's result code, and
+///   that failure is returned. The wallet's
+///   [`WalletSubmissionRecorder`](crate::submission_record::WalletSubmissionRecorder)
+///   retains the reservation, the receipt and the pending audit row for that
+///   report too. Any other oracle answer, an oracle that reports another
+///   network or whose identity cannot be read, an oracle error, no answer before the
 ///   deadline, or no oracle (`oracle` is `None`) records
 ///   [`SubmissionOutcome::TransportAfterSend`] and returns
 ///   [`SubmissionError::TxTimeout`]: the reservation, the receipt and the
@@ -570,8 +573,8 @@ pub enum MainnetSubmitGrant {
 ///   [`SubmissionOutcome::TransportAfterSend`] naming the refusal and
 ///   returns [`SubmissionError::TxTimeout`] the same way.
 ///
-/// A refusal of the consumption proof before the send still settles the
-/// submission as rejected: nothing was sent.
+/// A refusal of the consumption proof before the send is still reported as
+/// rejected: nothing was sent.
 ///
 /// Compiled in every build; without mainnet writes no grant exists, so the
 /// function cannot be called.
@@ -925,14 +928,17 @@ async fn send_and_confirm(
     .await?)
 }
 
-/// Settles the record of a submission whose send-by instant passed before a
-/// `sendTransaction` attempt, after `attempts` earlier attempts, and returns
-/// the refusal.
+/// Reports a submission whose send-by instant passed before a
+/// `sendTransaction` attempt, after `attempts` earlier attempts, to the
+/// recorder, and returns the refusal.
 ///
-/// Before the first attempt nothing was sent: the record settles as
+/// Before the first attempt nothing was sent: the submission is reported as
 /// rejected under the timeout code. After an attempt the earlier send may
-/// have reached the network, so the record settles as an unknown outcome
-/// and the refusal names the transaction hash a reconciliation settles.
+/// have reached the network, so it is reported as an unknown outcome and the
+/// refusal names the transaction hash a reconciliation reads. The wallet's
+/// [`WalletSubmissionRecorder`](crate::submission_record::WalletSubmissionRecorder)
+/// retains the reservation, the receipt and the pending audit row for either
+/// report.
 async fn refuse_past_send_by(
     client: &StellarRpcClient,
     intent: &SubmissionIntent,
@@ -1189,16 +1195,19 @@ where
     }
 }
 
-/// Settles the record for a `FAILED` confirmation answer, and builds the
+/// Reports a `FAILED` confirmation answer to the recorder, and builds the
 /// error the caller returns.
 ///
-/// Under [`FailureWitness::Primary`] the answer settles the submission as
-/// failed on chain, and the failure it maps to is returned. Under
-/// [`FailureWitness::Oracle`] the answer is a claim the oracle has to
-/// confirm: only the oracle's own `FAILED` for the same hash settles the
-/// submission, under the code mapped from the oracle's record. Anything
-/// else leaves the outcome unknown, so the record stands as for a lost
-/// answer and the caller gets the timeout shape.
+/// Under [`FailureWitness::Primary`] the answer is reported as failed on
+/// chain, and the failure it maps to is returned. Under
+/// [`FailureWitness::Oracle`] the answer is a claim the oracle is consulted
+/// about: only the oracle's own `FAILED` for the same hash is reported as
+/// failed on chain, under the code mapped from the oracle's record. Anything
+/// else is reported as an unknown outcome, as for a lost answer, and the
+/// caller gets the timeout shape. The wallet's
+/// [`WalletSubmissionRecorder`](crate::submission_record::WalletSubmissionRecorder)
+/// retains the reservation, the receipt and the pending audit row for every
+/// one of these reports.
 async fn settle_failed_answer(
     record: &TransactionRecord,
     witness: FailureWitness<'_>,
@@ -1358,14 +1367,16 @@ async fn record_timeout(
     })
 }
 
-/// Settles the record for a send that did not return a transaction hash, and
+/// Reports a send that did not return a transaction hash to the recorder, and
 /// builds the error the caller returns.
 ///
-/// Two classes, and they settle differently:
+/// Two classes, and they return different errors:
 ///
-/// - The endpoint refused the bytes with a real `TransactionResult`. Nothing
-///   was queued and no value moved, so the reservation goes back and the
-///   caller gets the refusal itself, with its result code.
+/// - The endpoint refused the bytes with a real `TransactionResult`. The
+///   submission is reported as rejected, and the caller gets the refusal
+///   itself, with its result code. The bytes left the wallet, so the wallet's
+///   [`WalletSubmissionRecorder`](crate::submission_record::WalletSubmissionRecorder)
+///   retains the reservation, the receipt and the pending audit row.
 /// - Anything else left the outcome unknown. The layer cannot tell a refused
 ///   connection from a lost response, and by this point the same client has
 ///   already answered the identity probe and the signer fetch, so the failure
@@ -1470,8 +1481,8 @@ pub(crate) fn bytes_to_hex(bytes: &[u8]) -> String {
 /// unrelated conditions: a request that never produced a response, which the
 /// client prefixes with this marker, and an endpoint that answered
 /// `status: "ERROR"` with a decoded `TransactionResult`, whose message is that
-/// result. The two settle a submission differently, so they have to be told
-/// apart.
+/// result. The two return different errors to the caller, so they have to be
+/// told apart.
 const SEND_NO_RESPONSE_MARKER: &str = "No status yet:";
 
 /// Returns true when the send step's failure is the endpoint's own verdict on
@@ -1480,8 +1491,8 @@ const SEND_NO_RESPONSE_MARKER: &str = "No status yet:";
 /// The test is negative on purpose. A failure the layer cannot positively
 /// attribute to a verdict is treated as one whose outcome is unknown, which is
 /// the direction that keeps a transaction that may have been queued recorded.
-/// Classifying the other way round would release a reservation and record a
-/// failure for a transaction that later applies.
+/// A lost response classified as a verdict reports a refusal code instead of
+/// the timeout shape for a transaction that can still apply.
 ///
 /// # Dependency coupling
 ///
@@ -1490,13 +1501,13 @@ const SEND_NO_RESPONSE_MARKER: &str = "No status yet:";
 /// `src/lib.rs`, in the arm that wraps a `jsonrpsee` request failure, while
 /// the arm that wraps an endpoint verdict carries the decoded
 /// `TransactionResult` instead. A version bump that rewords either arm
-/// reclassifies every transport failure as a verdict, which would release a
-/// reservation and record a failure for a transaction that may have been
-/// queued.
+/// reclassifies every transport failure as a verdict, which reports a
+/// refusal code instead of the timeout shape for a transaction that may have
+/// been queued.
 ///
 /// Both sides are pinned against the real client by
 /// `a_transport_failure_after_the_record_returns_the_timeout_shape` and
-/// `a_refused_send_releases_the_reservation_and_frees_the_sequence`
+/// `a_refused_send_retains_the_reservation_and_sequence`
 /// (`tests/network/submission_record_integration.rs`), which drive a mocked endpoint
 /// through the real client. A reword fails those two rather than silently
 /// reclassifying submissions, so a `stellar-rpc-client` bump that turns them

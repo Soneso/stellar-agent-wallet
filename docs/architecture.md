@@ -158,10 +158,11 @@ sequenceDiagram
     M->>S: Mark approval consumed
     M-->>A: Transaction hash and ledger
   else Definitive send refusal
-    M->>L: Record failure and release holds
+    M->>L: Keep receipt, pending row, reservation
+    M->>S: Mark approval consumed
     M-->>A: Submission error
   else Failed on chain
-    M->>L: Record failure and release reservation
+    M->>L: Keep receipt, pending row, reservation
     M->>S: Mark approval consumed
     M-->>A: Submission error
   else Outcome unknown
@@ -180,11 +181,10 @@ sequenceDiagram
 7. The server checks the halt marker again before dispatch; the handler checks mainnet authorization on a mainnet profile, evaluates decoded arguments against fresh reads, verifies required consent, and rejects an envelope that differs from its rebuild.
 8. It obtains any required oracle witness, checks audit readiness, and consumes the verified nonce before loading the signing key.
 9. After signing, the submit layer checks endpoint and signature binding, then records the receipt, pending audit row, and any spending reservation before sending.
-10. Confirmation records success; definitive failure releases spend reservations, while an uncertain outcome keeps records pending for reconciliation, the process of checking what actually settled.
+10. Confirmation records success. A definitive failure, like an uncertain outcome, keeps the receipt, the pending row, and the reservation until accounting expiry or an operator clear. Reconciliation, the process of checking what actually settled, reads the chain meanwhile.
 
 Only confirmed success returns a ledger number.
-A definitive send refusal releases the approval hold, the reservation of consent for one submission.
-An on-chain outcome or uncertain send consumes the approval.
+A sent submission consumes its approval hold, the reservation of consent for one submission, whatever its outcome.
 Outcome audit writes after submission are best effort; the durable pending record supports recovery.
 
 ## Guarantees and who enforces them

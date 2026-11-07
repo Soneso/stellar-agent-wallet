@@ -3343,16 +3343,16 @@ pub enum EventKind {
         chain_outcome: String,
     },
 
-    /// An operator acknowledged a submission and released its hold on the
-    /// spending window.
+    /// An operator acknowledged a submission and cleared its receipt.
     ///
     /// Written by `tx receipt clear --acknowledge` after the command has
     /// reconciled the submission against the chain. The row names the state
     /// the receipt was left in, so the log records what the operator
-    /// acknowledged rather than only that they acknowledged something, and
-    /// it names the chain evidence when reconciliation released the
-    /// reservation on evidence. A row without `evidence` records an outcome
-    /// that is unknown.
+    /// acknowledged rather than only that they acknowledged something. It
+    /// names, as `evidence`, the accounting disposition the window bears out
+    /// or the endpoint's unrecorded answer under an untimed hold; neither is a
+    /// chain outcome. A row without `evidence` records an outcome that is
+    /// unknown.
     ///
     /// The row is not a settlement: a cleared receipt owes no
     /// `value_action_*` row. The clear row records the operator's

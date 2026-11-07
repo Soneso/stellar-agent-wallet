@@ -75,8 +75,8 @@ enum Commands {
     /// Submission-record subcommand group.
     ///
     /// Provides:
-    /// - `tx status <HASH>` — reconcile one submitted transaction against the
-    ///   chain and settle the wallet's record of it. This is the way out of
+    /// - `tx status <HASH>`: reconcile one submitted transaction against the
+    ///   chain and record the answer as a report. This is the way out of
     ///   `submission.tx_timeout`.
     /// - `tx receipt clear <ENVELOPE_HASH> --acknowledge`: close a submission
     ///   record after reconciling it against the chain.

@@ -4306,8 +4306,9 @@ impl Respond for PayReconcileRpcResponder {
     }
 }
 
-/// Reconciling a timed-out submission the chain did confirm records the spend
-/// and writes the value-action row the submission never got to write.
+/// Reconciling a timed-out submission the chain did confirm records the
+/// success on the receipt and sends nothing. No submitted row is written, and
+/// the pending row stands.
 #[tokio::test]
 #[serial]
 async fn transaction_status_confirms_a_timed_out_submission() {

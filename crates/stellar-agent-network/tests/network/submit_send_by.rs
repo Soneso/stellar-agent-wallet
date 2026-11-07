@@ -3,8 +3,8 @@
 //! The identity probe and signer-set read end at the send-by instant. The
 //! instant is checked again after the pre-send record, and before every
 //! resend of the same bytes. A record written for a submission that is not
-//! sent settles as rejected; a resend refused after a send leaves the record
-//! unresolved. The confirmation poll runs past the instant, under the
+//! sent is reported as rejected; a resend refused after a send leaves the
+//! record unresolved. The confirmation poll runs past the instant, under the
 //! submission's own timeout.
 
 #![allow(
@@ -233,10 +233,10 @@ async fn a_signer_set_read_past_the_send_by_instant_sends_nothing() {
 }
 
 /// The instant is checked immediately before `sendTransaction`: a pre-send
-/// record that outlasts it sends nothing and settles as rejected under the
-/// timeout code.
+/// record that outlasts it sends nothing and is reported as rejected under
+/// the timeout code.
 #[tokio::test]
-async fn a_record_past_the_send_by_instant_sends_nothing_and_settles_as_rejected() {
+async fn a_record_past_the_send_by_instant_sends_nothing_and_is_reported_as_rejected() {
     let recorder = Recorder {
         pre_send_delay: PAST_SEND_BY,
         ..Recorder::default()

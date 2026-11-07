@@ -75,14 +75,15 @@ the review approves with no blocking findings.
   construction and re-check `is_definitive_send_refusal` in
   `crates/stellar-agent-network/src/submit.rs`. The classifier depends on the
   client's `No status yet:` wording to distinguish an unknown transport outcome
-  from a definitive endpoint refusal; that distinction controls reservation
-  retention and sequence release.
+  from a definitive endpoint refusal; that distinction controls the code the
+  caller receives.
 - Run both real-client tests in
   `crates/stellar-agent-network/tests/network/submission_record_integration.rs`:
   `a_transport_failure_after_the_record_returns_the_timeout_shape` and
-  `a_refused_send_releases_the_reservation_and_frees_the_sequence`. Confirm that
-  transport failures retain the submission for reconciliation and definitive
-  refusals release the reservation and sequence.
+  `a_refused_send_retains_the_reservation_and_sequence`. Confirm that transport
+  failures return the timeout shape and definitive refusals return the
+  endpoint's code. Both retain the receipt, the reservation, and the sequence
+  until accounting expiry or an operator clear.
 
 ### 6. Public API and dead code
 

@@ -375,7 +375,7 @@ Clawback re-check refusals use `trustline.gate_refused` or
 
 ## stellar_transaction_status
 
-Reconciles one submitted transaction against the chain and records the endpoint's answer on the wallet's record of it.
+Reconciles one submitted transaction against the chain and records a reported success on the wallet's record of it.
 
 **Arguments:**
 - `chain_id` (string, required): CAIP-2 chain identifier.
@@ -388,7 +388,7 @@ Reconciles one submitted transaction against the chain and records the endpoint'
 
 The tool reconciles a submission by its receipt, or by its reservation when the receipt is missing, and sends nothing.
 
-**Annotations:** `readOnlyHint=false`, `destructiveHint=false`. The pairing is deliberate: the call moves no value, and it does change the wallet's record. It records the endpoint's report on the receipt and the reservation, and ends a reservation whose accounting horizon has passed. No receipt status writes an audit row: a reported success writes no submitted row, and an accounting expiry writes no `value_action_failed` row.
+**Annotations:** `readOnlyHint=false`, `destructiveHint=false`. The pairing is deliberate: the call moves no value, and it does change the wallet's record. It records a success report on the receipt and in the spending window, and ends a reservation whose accounting horizon has passed. A failure report leaves the receipt and the reservation as they were. No receipt status writes an audit row: a reported success writes no submitted row, and an accounting expiry writes no `value_action_failed` row.
 
 **Error codes:** `validation.address_invalid`, `submission.record_unavailable`, `network.rpc_unreachable`, `audit.chain_key_unavailable`, `audit.tip_anchor_mismatch`.
 
@@ -411,10 +411,10 @@ Three error codes describe a submission whose outcome the wallet cannot settle o
 - `outcome`: always `"unknown"`.
 - `reconcile_with`: `"stellar_transaction_status"`.
 
-**Recovery protocol.** Call `stellar_transaction_status` with `details.tx_hash`. Do not re-simulate, rebuild, or resubmit the payment: the transaction may still apply, the sequence number it consumes may already be spent by it, and a second submission at that sequence is refused with `submission.tx_already_submitted` until the first is settled. `stellar_transaction_status` reports what the endpoint says and records it as a report. A reported failure or missing transaction does not release possible spending:
+**Recovery protocol.** Call `stellar_transaction_status` with `details.tx_hash`. Do not re-simulate, rebuild, or resubmit the payment: the transaction may still apply, and the sequence number it consumes may already be spent by it. A second submission at that sequence is refused with `submission.tx_already_submitted` until the first is settled. `stellar_transaction_status` reports what the endpoint says and records a success as a report. A reported failure or missing transaction does not release possible spending:
 
-- `SUCCESS`: the endpoint reports that the transaction applied. The receipt records `success`, and the reservation keeps counting through its accounting horizon. No submitted row is written: the pending row stays until authenticated evidence settles it.
-- `FAILED`: the endpoint reports that the transaction applied and failed. The reservation and the receipt stay pending, and no `value_action_failed` row is owed.
+- `SUCCESS`: the endpoint reports that the transaction applied. The receipt records `success`, unless it belongs to an untimed reservation and already records another network answer, which it keeps. The reservation keeps counting through its accounting horizon. No submitted row is written: the pending row stays until authenticated evidence settles it.
+- `FAILED`: the endpoint reports that the transaction applied and failed. The report changes neither the reservation nor the receipt, and no `value_action_failed` row is owed.
 - `NOT_FOUND`: the endpoint has no record of it. Within the retention window, an observed ledger close time strictly past its time bound, or a source account sequence that has reached the transaction's, is followed by a second transaction lookup. Neither observation proves that the transaction can no longer apply. A second `NOT_FOUND` keeps the reservation, and a `SUCCESS` is recorded as above. Without such an observation the record stands: call again later.
 
 Accounting expiry ends a reservation whatever the endpoint reports. The accounting horizon is the later of the signed time bound and a recorded success observation, plus each affected window's duration. Once it has passed on this host's clock, the reservation ends with the outcome unknown. The receipt reads `ambiguous` with `release_code` `submission.accounting_expired`, and an absent receipt is rebuilt from the committed expiry. The expiry owes one `submission_accounting_expired` audit event, which the call delivers from the authenticated window state. Repeated calls append no second event, and no `value_action_failed` row is written. A reservation without a time bound has no accounting horizon.
@@ -443,11 +443,11 @@ the approval-store consumption write fails, the commit gate still reports
 `policy.approval_consumed`; a status call completes the owed write. Repeating
 status is safe.
 
-No endpoint answer settles a submission whose ledger has fallen outside the endpoint's retention window. `stellar_transaction_status` reports it as `ambiguous` with no `release_code`, or, when its receipt is missing, as `reservation` with `operator_required: true`. A time-bounded reservation still ends at its accounting horizon without an operator clear. Before that, or without a time bound, the operator resolves it with `stellar-agent tx receipt clear <ENVELOPE_HASH> --acknowledge`.
+No endpoint answer settles a submission whose ledger has fallen outside the endpoint's retention window. When the endpoint answers `NOT_FOUND` for it, `stellar_transaction_status` reports it as `ambiguous` with no `release_code`, or, when its receipt is missing, as `reservation` with `operator_required: true`. A `SUCCESS` is recorded as above, and an untimed reservation's receipt that already records a network answer keeps it. A time-bounded reservation still ends at its accounting horizon without an operator clear. Before that, the operator resolves it with `stellar-agent tx receipt clear <ENVELOPE_HASH> --acknowledge`. Without a time bound, the clear needs `--acknowledge --acknowledge-unbounded`.
 
-On a testnet profile, a send the endpoint refused outright is settled at the send and never reaches this protocol. When `sendTransaction` answers `ERROR` with a transaction result, the endpoint has reported a validation error for the envelope: the commit returns that error's code, the receipt records the failure, the reservation is released, and the wallet never sends those bytes again. They did leave the wallet, though. A copy relayed elsewhere that later becomes valid applies without being counted against the window, and its receipt stays `failed`.
+On a testnet profile, a send the endpoint refused outright returns the refusal's code at the send, not `submission.tx_timeout`. When `sendTransaction` answers `ERROR` with a transaction result, the endpoint has reported a validation error for the envelope. The commit returns that error's code, and the wallet never sends those bytes again. The bytes did leave the wallet, so the receipt stays `pending`. The pending row and the reservation stand until the accounting horizon passes or the operator clears the receipt. A reservation without a time bound has no accounting horizon, so the clear needs `--acknowledge --acknowledge-unbounded`. A copy relayed elsewhere that later becomes valid counts against the window while the reservation stands.
 
-On a mainnet profile no second endpoint confirms a refusal at the send, so the commit returns `submission.tx_timeout`. The receipt, the pending row and the reservation stand: `stellar_transaction_status` records the oracle's answers as reports, and the reservation ends at its accounting horizon. A consumed sequence releases nothing. A refused envelope without a time bound stays pending until the operator clears it with `stellar-agent tx receipt clear`.
+On a mainnet profile no second endpoint confirms a refusal at the send, so the commit returns `submission.tx_timeout`. The receipt, the pending row and the reservation stand: `stellar_transaction_status` records the oracle's answers as reports, and the reservation ends at its accounting horizon. A consumed sequence releases nothing. A refused envelope without a time bound stays pending until the operator clears it with `stellar-agent tx receipt clear <ENVELOPE_HASH> --acknowledge --acknowledge-unbounded`.
 
 No recovery path sends a transaction again.
 

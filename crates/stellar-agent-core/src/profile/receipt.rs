@@ -155,10 +155,12 @@ pub const RECEIPT_LOCK_BACKOFF: Duration = Duration::from_millis(20);
 ///
 /// # Variant lifecycle
 ///
-/// The submission path produces and consumes: `Pending`, `Success`, `Failed`.
-/// Reconciliation against the chain sets `Success`, `Failed` and `Ambiguous`;
-/// the idempotent submit helper's retention-aware polling sets `Ambiguous` and
-/// `Reorged`; `tx receipt clear --acknowledge` sets `ClearedByOperator`.
+/// The wallet's submission recorder produces `Pending` and `Success`.
+/// Reconciliation against the chain sets `Success` and `Ambiguous`; a reported
+/// failure records nothing. `pool init` sets `Failed` for a checkpoint whose
+/// bytes never left the wallet. The idempotent submit helper sets `Failed`,
+/// and its retention-aware polling sets `Ambiguous` and `Reorged`.
+/// `tx receipt clear --acknowledge` sets `ClearedByOperator`.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "state")]
@@ -187,13 +189,9 @@ pub enum ReceiptStatus {
     /// records its outcome as unknown.
     ///
     /// Set by:
-    /// - Window-store reconciliation when it releases a reservation on chain
-    ///   evidence: the source account's sequence reached the transaction's,
-    ///   or an observed ledger close time passed its nonzero time bound, and
-    ///   a fresh `getTransaction` still reports `NOT_FOUND`. The receipt then
-    ///   carries the evidence in [`SubmissionReceipt::release_code`]. The
-    ///   transaction can no longer apply, which rests on the endpoint's
-    ///   answers being honest.
+    /// - Accounting expiry, projected from the committed window decision. The
+    ///   receipt then carries `submission.accounting_expired` in
+    ///   [`SubmissionReceipt::release_code`], and the outcome stays unknown.
     /// - Window-store reconciliation when the endpoint's retention window no
     ///   longer covers the submission ledger, so `NOT_FOUND` proves nothing.
     ///   No evidence is recorded and the reservation stands.
@@ -209,8 +207,7 @@ pub enum ReceiptStatus {
     /// separately from "it was rejected".
     Reorged,
 
-    /// An operator acknowledged a submission and released its hold on the
-    /// spending window.
+    /// An operator acknowledged a submission and cleared its receipt.
     ///
     /// Written by `tx receipt clear --acknowledge` after the command has
     /// reconciled the submission against the chain: for an `Ambiguous`

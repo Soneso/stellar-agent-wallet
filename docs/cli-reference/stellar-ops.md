@@ -657,7 +657,7 @@ can carry no bound. A confirmation after the deadline refuses with
 `network.mainnet_authorization_refused` (`deadline_elapsed`); run the command
 again for a fresh envelope.
 
-A reported failure or missing transaction does not release possible spending. Bounded uncertainty counts through the signed deadline and each affected spending window.
+A reported failure or missing transaction does not release possible spending. Bounded uncertainty counts through the later of the signed deadline and the first local success observation, plus each affected spending window.
 
 A reported success time does not backdate accounting. Untimed pending transactions remain reserved until an explicit acknowledgement clears their unbounded exposure.
 

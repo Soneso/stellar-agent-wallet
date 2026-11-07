@@ -573,9 +573,12 @@ its own tool name.
 Other gated actions wait for operator approval in MCP tools with an approval
 workflow and the CLI `stellar-agent mpp charge authorize` flow. On mainnet, full-mode `pay`, `claim`,
 sponsored `accounts create`, and `trustline` ask for passkey confirmation in
-the local browser for `RequireApproval`. Other CLI signing commands refuse
-`RequireApproval` with `policy.approval_required`; MCP signing tools without
-an approval flow refuse with `policy.approval_required_unsupported`.
+the local browser for `RequireApproval`. On testnet these four commands,
+`trade`, and the vault commands refuse `RequireApproval` with
+`policy.approval_required`. `smart-account multicall` refuses it with
+`sa.multicall_failed`, and its denied audit row records
+`multicall.approval_required`. MCP signing tools without an approval flow
+refuse with `policy.approval_required_unsupported`.
 Review the rules before signing. See [policy rules](concepts.md#the-policy-engine)
 for additional restrictions.
 

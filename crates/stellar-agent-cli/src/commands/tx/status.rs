@@ -23,9 +23,10 @@
 //!   spending. `FAILED`, and `NOT_FOUND` with a consumed sequence or a ledger
 //!   close time past the time bound, keep the reservation and the receipt
 //!   pending, and owe no `value_action_failed` row.
-//! - Once the accounting horizon, the signed time bound plus each affected
-//!   window's duration, has passed on this host's clock, the reservation ends
-//!   with the outcome unknown: the receipt is marked ambiguous with
+//! - The accounting horizon is the later of the signed time bound and the
+//!   first local success observation, plus each affected window's duration.
+//!   Once it has passed on this host's clock, the reservation ends with the
+//!   outcome unknown: the receipt is marked ambiguous with
 //!   `release_code` `submission.accounting_expired`, and no failed row is
 //!   owed. The expiry owes one `submission_accounting_expired` audit event,
 //!   which this verb delivers from the verified window state. An absent

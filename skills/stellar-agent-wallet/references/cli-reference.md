@@ -11,10 +11,14 @@ under the on-chain rules of the agent's key.
 
 ## Signing and approval coverage
 
-CLI payment and claim commands evaluate policy and refuse approval decisions
-with `policy.approval_required`, directing callers to MCP. Sponsored account
-creation, trustline, trade, and vault commands use the same refusal.
-These commands create no pending policy approval. Use their MCP tools for agent
+On testnet, CLI payment and claim commands evaluate policy and refuse approval
+decisions with `policy.approval_required`, directing callers to MCP. Sponsored
+account creation, trustline, trade, and vault commands use the same refusal.
+On testnet these commands create no pending policy approval. On mainnet, trade
+and vault commands refuse with `network.mainnet_write_forbidden`. Full-mode
+payment, claim, sponsored creation, and trustline commands insert a pending
+entry and ask for passkey confirmation in the local browser, for `Allow` and
+`RequireApproval` alike. Use their MCP tools for agent
 actions; DeFi tools also refuse policy approval decisions without a pending loop.
 
 Other CLI signing paths have these checks:
@@ -1328,9 +1332,9 @@ Asks the endpoint what became of `<HASH>` and records the answer on the wallet's
 | `--profile <NAME>` | Profile whose records and spending window are settled | `STELLAR_AGENT_PROFILE`, else `default` |
 | `--output <FORMAT>` | `json` or `table` | `json` |
 
-Returns `{tx_hash, chain_status, ledger, record, reservation}`, omitting absent fields. `record` is the wallet's receipt: `envelope_hash`, `status`, `failure_code`, `release_code`, `ledger`, `source_redacted`, `sequence`, `submitted`, `reservation_open`, `settlement_evidence` and `settlement_decision_id`. Receipt output includes `settlement_evidence: unavailable` and an optional `settlement_decision_id`; these display fields do not authenticate settlement. `reservation` is a hold that remains after reconciliation, `{envelope_hash, operator_required}`; `operator_required: true` marks a reservation whose receipt is missing beyond the endpoint's retention window, which only `tx receipt clear` resolves.
+Returns `{tx_hash, chain_status, ledger, record, reservation}`, omitting absent fields. `record` is the wallet's receipt: `envelope_hash`, `status`, `failure_code`, `release_code`, `ledger`, `source_redacted`, `sequence`, `submitted`, `reservation_open`, `settlement_evidence` and `settlement_decision_id`. Receipt output includes `settlement_evidence: unavailable` and an optional `settlement_decision_id`; these display fields do not authenticate settlement. `reservation` is a hold that remains after reconciliation, `{envelope_hash, operator_required}`; `operator_required: true` marks a reservation whose receipt is missing beyond the endpoint's retention window. A time-bounded one still ends at its accounting horizon. Before that, or without a time bound, only `tx receipt clear --acknowledge` resolves it, plus `--acknowledge-unbounded` for one without a time bound.
 
-A reported failure or missing transaction does not release possible spending. Bounded uncertainty counts through the signed deadline and each affected spending window.
+A reported failure or missing transaction does not release possible spending. Bounded uncertainty counts through the later of the signed deadline and the first local success observation, plus each affected spending window.
 
 A reported success time does not backdate accounting. Untimed pending transactions remain reserved until an explicit acknowledgement clears their unbounded exposure.
 

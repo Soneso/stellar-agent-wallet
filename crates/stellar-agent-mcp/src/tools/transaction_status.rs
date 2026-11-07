@@ -4,9 +4,10 @@
 //! This is how an agent resolves `submission.tx_timeout`. The submission was
 //! recorded before it was sent, so the wallet holds a receipt and, under a
 //! policy with a stateful criterion, a spending-window reservation for it;
-//! asking the chain what happened records its answer on both. Re-simulating or
-//! resubmitting the same intent never resolves it: the transaction may still
-//! apply, and the sequence it consumes may already be spent by it.
+//! asking the chain what happened records a reported success on both.
+//! Re-simulating or resubmitting the same intent never resolves it: the
+//! transaction may still apply, and the sequence it consumes may already be
+//! spent by it.
 //!
 //! The tool reconciles a submission by its receipt, or by its reservation when
 //! the receipt is missing, the way `stellar-agent tx status` does. A reported
@@ -17,17 +18,20 @@
 //! one `submission_accounting_expired` audit event, which the call delivers
 //! from the verified window state. The receipt is display data: `record`
 //! carries `settlement_evidence: "unavailable"`, and no receipt status writes
-//! an audit row. A hold that
-//! remains is reported as `reservation`; one marked `operator_required` is
-//! resolved by the operator's `stellar-agent tx receipt clear`. No step sends
-//! the transaction again.
+//! an audit row. A hold that remains is reported as `reservation`. One marked
+//! `operator_required` ends at its accounting horizon when it has a time
+//! bound. Before that, or without a time bound, the operator's
+//! `stellar-agent tx receipt clear` resolves it, and an untimed one needs
+//! `--acknowledge-unbounded` as well. No step sends the transaction again.
 //!
 //! # Why a read tool is not read-only
 //!
-//! The lookup changes wallet state: it records the endpoint's report on the
+//! The lookup changes wallet state: it records a reported success on the
 //! receipt and the reservation, and ends a reservation whose accounting
-//! horizon has passed. Both annotations say so, because the pairing is legal
-//! but unusual: `read_only_hint = false` because state changes, and
+//! horizon has passed. A reported failure leaves both as they were. An untimed
+//! reservation's receipt that already records another network answer keeps
+//! it. Both annotations say so, because the pairing is legal but unusual:
+//! `read_only_hint = false` because state changes, and
 //! `ToolValueKind::ReadOnly` because no value moves as a result of the call.
 
 use rmcp::{
@@ -74,16 +78,20 @@ impl WalletServer {
         description = "Reconcile one submitted transaction against the chain and update the \
                        wallet's record of it. Pass the tx_hash from a submission.tx_timeout \
                        response. Endpoint success, failure, and absence are reports. Possible \
-                       spending remains charged through the signed deadline and every affected \
-                       window; untimed exposure requires explicit operator acknowledgement. \
+                       spending remains charged through the later of the signed deadline and \
+                       the first success observation, plus every affected window; untimed \
+                       exposure requires explicit operator acknowledgement. \
                        Accounting expiry leaves the outcome unknown and records \
                        submission.accounting_expired in record.release_code without a failed \
                        value-action row. record is display data: settlement_evidence is \
                        unavailable, and settlement_decision_id only locates an accounting \
                        decision. A hold that remains is returned as \
-                       reservation {envelope_hash, operator_required}; operator_required means \
-                       only the operator's tx receipt clear resolves it. This is the only way to \
-                       resolve a timed-out submission: never re-simulate or resubmit, because \
+                       reservation {envelope_hash, operator_required}; operator_required means no \
+                       endpoint answer resolves it. A time-bounded hold still ends at its \
+                       accounting horizon; otherwise only the operator's tx receipt clear \
+                       resolves it, with --acknowledge-unbounded as well for an untimed hold. \
+                       This is the only way to resolve a timed-out submission: never \
+                       re-simulate or resubmit, because \
                        the transaction may still apply and its sequence may already be spent. \
                        read_only_hint=false (the wallet's record changes); the call moves no \
                        value. destructive_hint=false.",

@@ -145,9 +145,9 @@ impl NetworkContext {
     /// routed client, and every other oracle the profile's credential-bound
     /// client. No request is sent.
     ///
-    /// On a mainnet profile the oracle is the independent witness a
-    /// negative answer of the primary endpoint needs before a submission
-    /// settles on it, in the submit path and in reconciliation.
+    /// On a mainnet profile the submit path and reconciliation consult this
+    /// oracle about a negative answer of the primary endpoint. The
+    /// reservation stands whatever either endpoint answers negatively.
     ///
     /// `Ok(None)` when the profile sets no `oracle_provider_url`.
     ///
@@ -424,8 +424,9 @@ impl MainnetWriteContext {
     /// [`NetworkContext::oracle_client`] builds it for the network context
     /// this one returns. No request is sent.
     ///
-    /// The mainnet submit path asks this oracle before a `FAILED`
-    /// confirmation settles a submission.
+    /// The mainnet submit path consults this oracle about a `FAILED`
+    /// confirmation of the primary endpoint. The reservation stands whatever
+    /// the oracle answers.
     ///
     /// `Ok(None)` when the stored profile sets no `oracle_provider_url`.
     ///

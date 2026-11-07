@@ -1429,8 +1429,9 @@ impl WalletServer {
     /// keeps the operator's caps honest: a reservation that may still apply
     /// keeps counting.
     ///
-    /// On a mainnet profile the pass asks the oracle before a negative answer
-    /// of the primary endpoint settles a reservation. An oracle client that
+    /// On a mainnet profile the pass consults the oracle about a negative
+    /// answer of the primary endpoint, and a negative answer from either keeps
+    /// the reservation. An oracle client that
     /// cannot be built is logged, and the pass then keeps every reservation
     /// the primary reports as failed or unknown.
     ///

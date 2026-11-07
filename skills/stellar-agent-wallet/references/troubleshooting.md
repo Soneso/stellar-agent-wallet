@@ -213,7 +213,7 @@ tool.
 | State when a check refuses | Checks, by class | Codes |
 |---|---|---|
 | Nothing sent or signed | Entry: the compiled feature, an explicit nondefault mainnet profile with matching stored configuration and an oracle, full mode and keyring access (CLI), the asset and amount (CLI, classic MCP), envelope and address decoding (classic MCP). Policy: the V1 engine; classic MCP and x402 also check the verified policy and enablement here. URL: client construction and its credential (CLI, classic MCP, plain x402). x402: call 1 ends here. Plain x402 call 2 sends nothing before the payment build. Its checks up to there: requirements, `chain_id`, the approval pair, enrollment and address, local policy evaluation, forced approval, the attestation, audit readiness, the signing handle. Authenticated x402 call 2 runs the same checks through the attestation, plus the home domain, the audit pre-flight, and identity audit readiness. It leaves this state at the identity exchange. | `network.mainnet_write_forbidden`, profile and validation codes, keyring codes, `network.rpc_unreachable`, `network.rpc_credential_refused`, `simulation.divergence` (classic MCP), JSON-RPC invalid params, `x402.*` requirement codes, `identity.home_domain_invalid`, `policy.approval_required`, `policy.approval_rejected`, `policy.approval_consumed`, `policy.deny.*`, `policy.engine_required`, `policy.unexpected_decision`, `auth.enrolled_*`, `audit.*`, approval-store codes |
-| Unsigned requests sent: the endpoint identity probe, account and chain reads, the oracle simulation or latest-ledger read, the unsigned payment simulation (x402) | URL: endpoint identity, protocol version. Entry: the remaining input decoding (CLI, classic MCP). Policy: the verified policy and enablement (CLI), the rebuilt envelope (classic MCP), the policy evaluation, the fee cap and the operation conditions (CLI, classic MCP), the required witness, the oracle's ledger bound below the threshold on mainnet, the health read (x402). Authorization: the attestation or the passkey confirmation in the local browser, audit readiness, the nonce, signer enrollment, the resolver's sealed checks (CLI, classic MCP); the payment intent authorization (x402). Authenticated x402: the bound SEP-10 authentication runs in this state, and its signed challenge reaches the web-auth server before the payment checks. Payment audit readiness, the signing handle, the payment asset, and client construction follow it. | `network.endpoint_network_mismatch`, `network.endpoint_identity_unavailable`, `network.unsupported_protocol_version`, `network.rpc_credential_refused`, `network.rpc_unreachable` (authenticated x402), read codes, keyring codes, `simulation.divergence`, `network.mainnet_write_forbidden` (CLI), `profile.mainnet_enablement_invalid`, `policy.engine_unavailable`, `trustline.policy_engine_unavailable`, `policy.deny.*`, `policy.engine_required`, `policy.unexpected_decision`, fee-cap codes, `trustline.*`, `network.witness_unavailable`, `confirm.*`, `policy.approval_required`, `policy.approval_rejected`, `policy.approval_consumed`, `audit.*`, `nonce.*`, `auth.enrolled_*`, `identity.*`, `x402.rpc_simulate_failed`, `x402.unexpected_auth_entries`, `x402.invalid_asset_address` (authenticated x402), `x402.payment_build_failed` (authenticated), `network.mainnet_authorization_refused` |
+| Unsigned requests sent: the endpoint identity probe, account and chain reads, the oracle simulation or latest-ledger read, the unsigned payment simulation (x402) | URL: endpoint identity, protocol version. Entry: the remaining input decoding (CLI, classic MCP). Policy: the verified policy and enablement (CLI), the rebuilt envelope (classic MCP), the policy evaluation, and the fee cap and the operation conditions (CLI, classic MCP). Policy also checks the required witness, the oracle's ledger bound below the threshold on mainnet, and the health read (x402). Authorization: the attestation or the passkey confirmation in the local browser, audit readiness, the nonce, signer enrollment, the resolver's sealed checks (CLI, classic MCP); the payment intent authorization (x402). Authenticated x402: the bound SEP-10 authentication runs in this state, and its signed challenge reaches the web-auth server before the payment checks. Payment audit readiness, the signing handle, the payment asset, and client construction follow it. | `network.endpoint_network_mismatch`, `network.endpoint_identity_unavailable`, `network.unsupported_protocol_version`, `network.rpc_credential_refused`, `network.rpc_unreachable` (authenticated x402), read codes, keyring codes, `simulation.divergence`, `network.mainnet_write_forbidden` (CLI), `profile.mainnet_enablement_invalid`, `policy.engine_unavailable`, `trustline.policy_engine_unavailable`, `policy.deny.*`, `policy.engine_required`, `policy.unexpected_decision`, fee-cap codes, `trustline.*`, `network.witness_unavailable`, `confirm.*`, `policy.approval_required`, `policy.approval_rejected`, `policy.approval_consumed`, `audit.*`, `nonce.*`, `auth.enrolled_*`, `identity.*`, `x402.rpc_simulate_failed`, `x402.unexpected_auth_entries`, `x402.invalid_asset_address` (authenticated x402), `x402.payment_build_failed` (authenticated), `network.mainnet_authorization_refused` |
 | Signed locally, no signed material sent | Authorization: the signer and the signature check. Submission (CLI, classic MCP): the shared checks before the send: authorization, envelope shape, endpoint identity recheck, signature network binding, transaction hash, pre-send record, consumption proof. x402: the entry signature, the audit row, and the intent consumption before the re-simulation. | `network.mainnet_authorization_refused`, keyring and signer codes, `audit.*`, `protocol.xdr_codec_failed`, endpoint and protocol codes, `submission.record_unavailable`, `submission.tx_already_submitted`, `policy.deny.*`, `x402.transaction_build_failed`, `x402.payment_build_failed` (authenticated) |
 | Signed material sent | Submission (CLI, classic MCP): the send and the confirmation; reconcile an unknown outcome. x402: the signed re-simulation sends the signed authorization to the configured RPC. After it, the re-simulation answer checks, the release authorization, the payload encoding, the release consumption, and the pending-approval consumption withhold the payload. | `submission.*`, `x402.rpc_simulate_failed`, `x402.transaction_build_failed`, `x402.unexpected_auth_entries`, `x402.payment_build_failed` (authenticated), encoding codes, approval-store codes, `network.mainnet_authorization_refused` (payload withheld) |
 
@@ -426,7 +426,7 @@ A reported failure or missing transaction does not release possible spending.
   through. Report it as done. The spend keeps counting through the
   transaction's accounting horizon, and no submitted row is written.
 - `chain_status: "FAILED"`: the endpoint reports that the transaction applied
-  and failed. The record stays `pending` and the reservation keeps counting
+  and failed. The record keeps its status and the reservation keeps counting
   until its accounting horizon passes or the operator clears it.
 - `chain_status: "NOT_FOUND"` with `record.status: "pending"`: nothing is
   established. The transaction can still apply. Wait and call again.
@@ -437,24 +437,30 @@ A reported failure or missing transaction does not release possible spending.
   clears it with `stellar-agent tx receipt clear <ENVELOPE_HASH>
   --acknowledge`.
 - `record.status: "ambiguous"` with `record.release_code:
-  "submission.accounting_expired"`: the accounting horizon, the signed time
-  bound plus each affected window's duration, has passed. The reservation has
+  "submission.accounting_expired"`: the accounting horizon has passed. The
+  horizon is the later of the signed time bound and the first local success
+  observation, plus each affected window's duration. The reservation has
   ended with the outcome unknown, and no failed row is written. A fresh
   simulate-and-commit is the next step.
 - A transaction without a time bound keeps its reservation until the operator
   clears it with `--acknowledge --acknowledge-unbounded`, on every network and
   whatever the endpoint reports.
 - `chain_status: "NOT_FOUND"` with `record.status: "ambiguous"` and no
-  `release_code`: the endpoint can no longer answer for it at all, and only the
-  operator can resolve it, with
-  `stellar-agent tx receipt clear <ENVELOPE_HASH> --acknowledge`.
-- `chain_status: "NOT_FOUND"` with `record.status: "failed"`: the endpoint
-  reported a validation error for the envelope or previously reported an
-  on-chain `FAILED` that has left its retained history. The wallet never sends
-  those bytes again. A fresh simulate-and-commit is the next step.
+  `release_code`: the endpoint can no longer answer for it at all. A
+  time-bounded reservation still ends at its accounting horizon. Before that,
+  or without a time bound, the operator resolves it with
+  `stellar-agent tx receipt clear <ENVELOPE_HASH> --acknowledge`, plus
+  `--acknowledge-unbounded` for a transaction without a time bound.
+- A validation error for the envelope at the send, such as
+  `submission.tx_malformed` on testnet, records no failure. The record stays
+  `pending`, and the reservation keeps counting until its accounting horizon
+  passes or the operator clears it. The wallet never sends those bytes again.
 - No `record`, and a `reservation` with `operator_required: true`: the receipt
-  is missing and the endpoint can no longer answer for the transaction. Only
-  the operator resolves it, with `tx receipt clear`.
+  is missing and the endpoint can no longer answer for the transaction. A
+  time-bounded reservation still ends at its accounting horizon. Before that,
+  or without a time bound, the operator resolves it with
+  `tx receipt clear --acknowledge`, plus `--acknowledge-unbounded` for a
+  transaction without a time bound.
 
 Read `record.status` and `record.release_code`, not `record.reservation_open`.
 An action the policy engine sized no value for takes no reservation at all, so
