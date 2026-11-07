@@ -29,8 +29,8 @@ GHSA-vc9j-9wph-qghj, which 0.8.2 fixes.
 Two rules under `pnpm.peerDependencyRules.allowedVersions` in `package.json`
 accept the pins as peers of `@stellar/mpp` 0.7.1 only:
 `"@stellar/mpp@0.7.1>@stellar/stellar-sdk": "16.4.1"` and
-`"@stellar/mpp@0.7.1>mppx": "0.8.19"`. pnpm reports any other pairing as an
-unmet peer.
+`"@stellar/mpp@0.7.1>mppx": "0.8.19"`. pnpm reports a pairing outside both
+the declared peer range and these two rules as an unmet peer.
 The setting `strict-peer-dependencies=true` in `.npmrc` makes `pnpm install`
 fail on an unmet peer.
 

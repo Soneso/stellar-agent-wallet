@@ -224,8 +224,11 @@ DeFi, pool submission, generic signing, and toolset signing remain excluded.
 Prepare and commit probe the endpoint before action reads on their client.
 Submission checks the sending client again. The endpoint network binds every
 signature. `network.envelope_signed_for_mainnet` means verification fails under
-the endpoint network and succeeds under mainnet. Authorized mainnet paths also
-check the supported protocol version.
+the endpoint network and succeeds under mainnet. The identity answer also
+carries the endpoint's protocol version. This release supports protocols 29
+and 30. Outside them, testnet and other networks log a warning. Ordinary
+submission refuses a mainnet endpoint before this rule. Authorized submission
+refuses it with `network.unsupported_protocol_version`.
 
 After authorization refusal, report the failed action to the operator.
 Do not switch networks, nor point at a different RPC endpoint to get past a
