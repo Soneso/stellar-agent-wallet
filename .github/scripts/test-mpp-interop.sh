@@ -13,4 +13,5 @@ fi
 
 cd "$HARNESS"
 corepack pnpm install --frozen-lockfile --ignore-scripts
+node --test sdk-version.test.mjs
 corepack pnpm run check
