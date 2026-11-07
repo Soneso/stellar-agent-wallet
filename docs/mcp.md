@@ -16,10 +16,11 @@ for build configuration, admitted operations, and exclusions. Per tool on
   submit.
 - Every tool named above and the signing actions of `stellar_toolset_invoke`
   refuse at handler entry with `network.mainnet_write_forbidden` in every
-  build, except both x402 payment tools and the four classic commits. A
-  feature-enabled build admits the four classic commits and both x402 payment
-  tools after setup. With the feature off, these tools refuse mainnet at entry
-  with the same code.
+  build, except both x402 payment tools and the four classic commits.
+  Builds from this repository and releases from v0.1.0-alpha.14 on carry
+  `mainnet-write`. These builds admit the four classic commits and both x402
+  payment tools after setup. With the feature off, these tools refuse mainnet
+  at entry with the same code.
 - `stellar_toolset_invoke` is annotated destructive, so its own policy gate
   refuses its other actions on mainnet: the default engine refuses a
   destructive tool, and a mainnet policy rule cannot name it.
@@ -39,9 +40,11 @@ before signing.
 `stellar_mpp_reconcile_transaction`, and `stellar_mpp_authorization_status`
 run without a policy verdict. Tools with an approval flow wait for operator
 consent; single-shot signing tools refuse `RequireApproval` with
-`policy.approval_required_unsupported`. Mainnet writes also require a
-feature-enabled build, operator setup, and per-action authorization. The four
-classic commit tools use independent signing and submission checks. See
+`policy.approval_required_unsupported`.
+Builds from this repository and releases from v0.1.0-alpha.14 on carry
+`mainnet-write`. Mainnet writes also require operator setup and per-action
+authorization. The four classic commit tools use independent signing and
+submission checks. See
 [Concepts](./concepts.md) for the shared guardrail model.
 
 ## What it is
@@ -286,10 +289,10 @@ Notes:
   `default`, pass one: `"args": ["--profile", "alice"]`, or set
   `STELLAR_AGENT_PROFILE` in the environment the client spawns the process with.
   Arguments other than `--profile`, `--help`, and `--version` are refused.
-- The second line of `--version` and `-V` output,
-  `STELLAR_AGENT_BUILD_MAINNET_WRITE=off` or `=on`, reports the build state of
-  the `mainnet-write` Cargo feature, which the binary packages enable by
-  default.
+- Builds from this repository and releases from v0.1.0-alpha.14 on carry
+  `mainnet-write`. The second line of `--version` and `-V` output,
+  `STELLAR_AGENT_BUILD_MAINNET_WRITE=off` or `=on`, reports the compiled
+  feature state.
 - The exact location and schema of the configuration file depend on the MCP
   client. Consult that client's documentation for where to place the stanza.
 
@@ -373,8 +376,10 @@ looks up the tool's registry descriptor and calls
 
 ### Classic mainnet authorization
 
-A feature-enabled server admits `stellar_pay_commit`, `stellar_claim_commit`,
-`stellar_create_account_commit`, and `stellar_trustline_commit` after setup.
+Builds from this repository and releases from v0.1.0-alpha.14 on carry
+`mainnet-write`. The MCP server in these builds admits `stellar_pay_commit`,
+`stellar_claim_commit`, `stellar_create_account_commit`, and
+`stellar_trustline_commit` after setup.
 Both prepare and commit policy names need matching rules. The four pairs require
 approval even under Allow. A pending approval uses the shorter lifetime from
 the prepare and commit evaluations. Allow contributes 600 seconds;

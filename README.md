@@ -43,14 +43,14 @@ the planned work per release.
 
 - testnet (`stellar:testnet`) is the default network: a command with no
   named profile and no `default.toml` runs on the zero-config testnet profile.
-- Released binaries have `mainnet-write` on and admit configured mainnet
-  operations with approval for each action.
+- Builds from this repository and releases from v0.1.0-alpha.14 on carry
+  `mainnet-write`. They admit configured mainnet operations with approval for
+  each action.
   [Mainnet configurations and scope](docs/getting-started.md#mainnet-configurations-and-scope)
   lists the commands, the layers, and the wire codes.
 - Mainnet writes move real funds. The wallet is alpha software and comes
-  without warranty under the Apache-2.0 license. Use a feature-enabled build
-  on mainnet at your own risk, and start with small amounts and tight policy
-  limits.
+  without warranty under the Apache-2.0 license. Use mainnet at your own risk,
+  and start with small amounts and tight policy limits.
 - Friendbot funding is testnet/futurenet only; mainnet is structurally refused.
 
 Release archives are published on the

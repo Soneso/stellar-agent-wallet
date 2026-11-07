@@ -16,10 +16,11 @@ for build configuration, admitted operations, and exclusions. Per tool on
   submit.
 - Every tool named above and the signing actions of `stellar_toolset_invoke`
   refuse at handler entry with `network.mainnet_write_forbidden` in every
-  build, except both x402 payment tools and the four classic commits. A
-  feature-enabled build admits the four classic commits and both x402 payment
-  tools after setup. With the feature off, these tools refuse mainnet at entry
-  with the same code.
+  build, except both x402 payment tools and the four classic commits.
+  Builds from this repository and releases from v0.1.0-alpha.14 on carry
+  `mainnet-write`. These builds admit the four classic commits and both x402
+  payment tools after setup. With the feature off, these tools refuse mainnet
+  at entry with the same code.
 - `stellar_toolset_invoke` is annotated destructive, so its own policy gate
   refuses its other actions on mainnet: the default engine refuses a
   destructive tool, and a mainnet policy rule cannot name it.
@@ -221,8 +222,10 @@ The policy engine returns one verdict:
 
 ### Classic mainnet authorization
 
-A feature-enabled server admits `stellar_pay_commit`, `stellar_claim_commit`,
-`stellar_create_account_commit`, and `stellar_trustline_commit` after setup.
+Builds from this repository and releases from v0.1.0-alpha.14 on carry
+`mainnet-write`. The MCP server in these builds admits `stellar_pay_commit`,
+`stellar_claim_commit`, `stellar_create_account_commit`, and
+`stellar_trustline_commit` after setup.
 Both prepare and commit policy names need matching rules. The four pairs require
 approval even under Allow. A pending approval uses the shorter lifetime from
 the prepare and commit evaluations. Allow contributes 600 seconds;

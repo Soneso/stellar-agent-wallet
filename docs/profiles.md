@@ -840,9 +840,10 @@ engine = "v1"
 
 Until this is done, a migrated profile continues to run under `noop`, which
 refuses mainnet destructive operations with `policy.engine_required`. Opting in
-to `v1` changes policy evaluation. Mainnet writes also need a feature-enabled
-build, enablement, a signed v2 body, and approval for each action. For the governance flow that V1
-enforces, see
+to `v1` changes policy evaluation.
+Builds from this repository and releases from v0.1.0-alpha.14 on carry
+`mainnet-write`. Mainnet writes also need enablement, a signed v2 body, and
+approval for each action. For the governance flow that V1 enforces, see
 [cli-reference/profile-and-governance.md](cli-reference/profile-and-governance.md).
 
 ### Create the V1 policy file
