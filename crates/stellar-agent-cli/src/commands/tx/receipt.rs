@@ -39,18 +39,20 @@
 //! clear needs `--acknowledge-unbounded` as well.
 //!
 //! Otherwise, the record's own state comes first: a receipt recorded as
-//! `success`, `failed`, `reorged` or `cleared_by_operator` is refused with
-//! `submission.not_clearable`. With `--acknowledge`, a terminal receipt without
-//! a hold first acquires the audit writer to look for an interrupted clear; the
-//! acquisition can drain queued rows or return an audit error. Without a
-//! matching row the receipt is refused without reconciliation, release or
-//! marking. Then the chain: an endpoint that reports the transaction `SUCCESS`
-//! or `FAILED` is refused the same way, because reconciliation records it
-//! (`tx status`), and so is an endpoint that cannot answer. On a mainnet
-//! profile that names an oracle, the oracle is asked as well and refuses the
-//! clear the same way: its `SUCCESS` or `FAILED`, an oracle that cannot answer,
-//! an oracle that does not report the mainnet passphrase or whose identity
-//! cannot be read, and an oracle client that cannot be built. Every oracle read
+//! `success`, `reorged` or `cleared_by_operator`, or as `failed` under a held
+//! reservation, is refused with `submission.not_clearable`. With
+//! `--acknowledge`, a terminal receipt without a hold first acquires the audit
+//! writer to look for an interrupted clear; the acquisition can drain queued
+//! rows or return an audit error. Without a matching row a `success` or
+//! `reorged` receipt is refused without reconciliation, release or marking,
+//! and a `failed` one goes on to the endpoint. Then the chain: an endpoint
+//! that reports `SUCCESS`, or `FAILED` for a held reservation, is refused the
+//! same way and left for `tx status`, and so is an endpoint that cannot
+//! answer. On a mainnet profile that names an oracle, the oracle is asked as
+//! well and refuses the clear the same way. Its `SUCCESS` refuses, and so does
+//! its `FAILED` for a held reservation. So do an oracle that cannot answer,
+//! one that does not report the mainnet passphrase or whose identity cannot be
+//! read, and an oracle client that cannot be built. Every oracle read
 //! of the command, these and reconciliation's below, ends by one deadline: the
 //! profile's submit timeout, counted from the oracle's identity read. A mainnet
 //! profile without an oracle has no second answer to ask for: the primary's

@@ -6,8 +6,9 @@
 //! decides. A reported success for a bounded transaction is not the
 //! operator's to clear. A reported failure is not either, except for a
 //! submission without a held reservation or on a mainnet profile without an
-//! oracle; such a failure clears only after its time bound. One that can
-//! still apply is refused. An endpoint that cannot answer is not a license to
+//! oracle. A bounded hold or submitted receipt waits for its time bound. An
+//! unsent receipt without a hold can clear earlier. One that can still apply
+//! is refused. An endpoint that cannot answer is not a license to
 //! clear either. A
 //! reported failure or missing transaction does not release possible
 //! spending. An authenticated hold without a time bound is cleared only with
