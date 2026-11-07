@@ -47,7 +47,7 @@ use stellar_agent_network::{
     MessagePayload, Signer, SmartAccountAuthDigest, SorobanAuthPayload, TxSigningPayload,
     WebAuthnAssertion,
 };
-use stellar_agent_test_support::{ProfileEnvVarGuard, StellarAgentHomeGuard};
+use stellar_agent_test_support::{ProfileEnvVarGuard, StellarAgentHomeGuard, WarningCapture};
 use wiremock::MockServer;
 
 use crate::commands::profile::{
@@ -80,6 +80,20 @@ pub(crate) fn assert_deadline_bound(envelope: &str, built_at_ms: u64) {
     assert_eq!(bounds.min_time.0, 0);
     assert!(bounds.max_time.0 > built_at_ms / 1000);
     assert!(bounds.max_time.0 <= built_at_ms / 1000 + 120);
+}
+
+/// The `precondition` field of each warning whose message is the mainnet
+/// refusal log line and whose `path` is `path`.
+pub(crate) fn refusal_warnings(capture: &WarningCapture, path: &str) -> Vec<String> {
+    capture
+        .seen()
+        .into_iter()
+        .filter(|event| {
+            event.get("message").map(String::as_str) == Some("mainnet authorization refused")
+                && event.get("path").map(String::as_str) == Some(&format!("{path:?}"))
+        })
+        .map(|event| event.get("precondition").cloned().unwrap_or_default())
+        .collect()
 }
 
 /// The host of the profile's primary endpoint.
@@ -653,6 +667,25 @@ impl MainnetFixture {
         // before the new driver is installed.
         self.presence = None;
         self.presence = Some(driver::install(Box::new(driver) as Driver));
+    }
+
+    /// Answers every later presence ceremony with the fixture credential one
+    /// second past the on-chain deadline of an envelope built at the prompt:
+    /// before it answers, the driver sets `clock` to the prompt time plus
+    /// [`MAINNET_CLASSIC_DEADLINE_SECONDS`] and one second.
+    ///
+    /// [`MAINNET_CLASSIC_DEADLINE_SECONDS`]: stellar_agent_network::mainnet::resolve::MAINNET_CLASSIC_DEADLINE_SECONDS
+    pub(crate) fn present_past_the_deadline(
+        &mut self,
+        clock: Rc<stellar_agent_network::mainnet::clock::TestClockGuard>,
+    ) {
+        use stellar_agent_network::mainnet::resolve::MAINNET_CLASSIC_DEADLINE_SECONDS;
+        let mut answer = driver::fixture_credential();
+        self.present_with(move |ceremony| {
+            let prompted_at = stellar_agent_network::mainnet::clock::now_ms().unwrap();
+            clock.set(prompted_at + (MAINNET_CLASSIC_DEADLINE_SECONDS + 1) * 1000);
+            answer(ceremony)
+        });
     }
 
     /// Drives the real loopback listener with signed assertion flags.

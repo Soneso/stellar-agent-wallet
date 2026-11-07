@@ -2736,17 +2736,22 @@ mod tests {
     #[cfg(feature = "mainnet-write")]
     mod mainnet_full {
         use super::*;
+        use std::rc::Rc;
         use std::sync::Arc;
 
         use serde_json::Value;
         use stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE;
+        use stellar_agent_test_support::WarningCapture;
         use stellar_agent_test_support::signed_envelope::get_network_result;
 
-        use crate::common::mainnet_write::invalidations_on_this_thread;
+        use crate::common::mainnet_write::{
+            invalidations_on_this_thread, submission_kinds_on_this_thread,
+        };
         use crate::common::mainnet_write_fixture::{
             AGENT_SEED, CLOCK_LEAD_MS, DESTINATION, ISSUER, MainnetFixture, Spec, TRUSTLINE_ASSET,
-            minimum_reserve, trustline_rule,
+            minimum_reserve, refusal_warnings, trustline_rule,
         };
+        use crate::common::signer_ceremony::signer_resolutions_on_this_thread;
         use crate::test_rpc::{ACCOUNT_SEQUENCE, ClassicRpc, account_key, account_xdr};
 
         /// The native balance the mocked endpoints report for every account.
@@ -2908,6 +2913,47 @@ mod tests {
             let entries = fixture.pending_entries();
             assert_eq!(entries.len(), 1);
             assert_eq!(entries[0].kind_name, "Consumed");
+        }
+
+        /// Elapsed bound: a confirmation one second past the envelope's
+        /// on-chain deadline refuses at the resolver with `deadline_elapsed`,
+        /// before any signer is resolved: the keyring never signs and nothing
+        /// is sent.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn mainnet_time_bounds_trustline_elapsed_refuses_before_signing() {
+            let mut fixture = spec("mainnet-trustline-elapsed").build().await;
+            let clock = Rc::new(stellar_agent_network::mainnet::clock::set_now_ms_for_test(
+                now() + CLOCK_LEAD_MS,
+            ));
+            fixture.present_past_the_deadline(Rc::clone(&clock));
+            let args = mainnet_args(&fixture);
+            let resolutions = signer_resolutions_on_this_thread();
+            let kinds = submission_kinds_on_this_thread().len();
+            let (capture, _guard) = WarningCapture::capture(None);
+
+            let run = run(&fixture, &args).await;
+
+            drop(clock);
+            assert_eq!(run.code, 1, "{}", run.envelope);
+            assert_eq!(
+                run.code(),
+                "network.mainnet_authorization_refused",
+                "{}",
+                run.envelope
+            );
+            assert_eq!(
+                refusal_warnings(&capture, "resolve_tx_sign"),
+                vec!["\"deadline_elapsed\"".to_owned()]
+            );
+            assert!(records(&fixture).is_empty(), "no authorization record");
+            let entries = fixture.pending_entries();
+            assert_eq!(entries.len(), 1, "{entries:?}");
+            assert_eq!(entries[0].kind_name, "TrustlineSimulated");
+            assert!(fixture.sent_envelopes().await.is_empty(), "nothing is sent");
+            assert!(invalidations_on_this_thread().is_empty());
+            assert_eq!(signer_resolutions_on_this_thread(), resolutions);
+            assert_eq!(submission_kinds_on_this_thread().len(), kinds);
         }
 
         /// Engine kind: a Noop profile refuses at the engine check.

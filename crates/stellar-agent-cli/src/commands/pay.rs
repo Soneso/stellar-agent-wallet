@@ -5740,7 +5740,7 @@ mod tests {
         use crate::common::mainnet_write_fixture::{
             AGENT_SEED, AGENT_VAR, CLOCK_LEAD_MS, DESTINATION, ISSUER, MainnetFixture, Spec,
             install_ledger_double, minimum_reserve, open_authorizations_of, pay_rule,
-            pay_rule_capped,
+            pay_rule_capped, refusal_warnings,
         };
         use crate::common::signer_ceremony::signer_resolutions_on_this_thread;
         use crate::test_rpc::{ACCOUNT_SEQUENCE, ClassicRpc, last_rendered};
@@ -5880,21 +5880,6 @@ mod tests {
                             && record["ts_ms"] == auth["claimed_ms"])
                 );
             }
-        }
-
-        /// The `precondition` field of each warning whose message is the
-        /// refusal log line and whose `path` is `path`.
-        fn refusal_warnings(capture: &WarningCapture, path: &str) -> Vec<String> {
-            capture
-                .seen()
-                .into_iter()
-                .filter(|event| {
-                    event.get("message").map(String::as_str)
-                        == Some("mainnet authorization refused")
-                        && event.get("path").map(String::as_str) == Some(&format!("{path:?}"))
-                })
-                .map(|event| event.get("precondition").cloned().unwrap_or_default())
-                .collect()
         }
 
         /// The agent account at `balance` as `getLedgerEntries` answers it.
