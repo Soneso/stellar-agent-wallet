@@ -20,8 +20,9 @@
 //!
 //! A submission whose outcome never came back leaves a receipt behind and,
 //! under a policy with a stateful criterion, a spending-window reservation
-//! that counts against the operator's caps. `tx status` records what the
-//! endpoint reports. This verb closes a record the operator has decided
+//! that counts against the operator's caps. `tx status` reconciles the
+//! submission; a negative answer keeps its receipt and exposure. This verb
+//! closes a record the operator has decided
 //! about, and it reconciles first, so it decides on the chain's latest answer
 //! rather than on the record as it was left.
 //!
@@ -39,18 +40,23 @@
 //! clear needs `--acknowledge-unbounded` as well.
 //!
 //! Otherwise, the record's own state comes first: a receipt recorded as
-//! `success`, `failed`, `reorged` or `cleared_by_operator` is refused with
-//! `submission.not_clearable`. With `--acknowledge`, a terminal receipt without
-//! a hold first acquires the audit writer to look for an interrupted clear; the
-//! acquisition can drain queued rows or return an audit error. Without a
-//! matching row the receipt is refused without reconciliation, release or
-//! marking. Then the chain: an endpoint that reports the transaction `SUCCESS`
-//! or `FAILED` is refused the same way, because reconciliation records it
-//! (`tx status`), and so is an endpoint that cannot answer. On a mainnet
-//! profile that names an oracle, the oracle is asked as well and refuses the
-//! clear the same way: its `SUCCESS` or `FAILED`, an oracle that cannot answer,
-//! an oracle that does not report the mainnet passphrase or whose identity
-//! cannot be read, and an oracle client that cannot be built. Every oracle read
+//! `success`, `reorged` or `cleared_by_operator`, or as `failed` under a held
+//! reservation, is refused with `submission.not_clearable`. With
+//! `--acknowledge`, a terminal receipt without a hold first acquires the audit
+//! writer to look for an interrupted clear; the acquisition can drain queued
+//! rows or return an audit error. Without a matching row a `success` or
+//! `reorged` receipt is refused without reconciliation, release or marking,
+//! and a `failed` one goes on to the endpoint. Then the chain: an endpoint
+//! that reports `SUCCESS`, or `FAILED` for a held reservation, is refused the
+//! same way and left for `tx status`, and so is an endpoint that cannot
+//! answer. On a mainnet profile that names an oracle, the oracle is asked as
+//! well and refuses the clear the same way. Its `SUCCESS` refuses, and so does
+//! its `FAILED` for a held reservation. So do an oracle that cannot answer
+//! and one that does not report the mainnet passphrase or whose identity
+//! cannot be read. An oracle client that cannot be built refuses with its own
+//! error. A credential refusal keeps its code, such as
+//! `network.rpc_credential_refused`, and any other construction failure is
+//! `network.witness_unavailable`. Every oracle read
 //! of the command, these and reconciliation's below, ends by one deadline: the
 //! profile's submit timeout, counted from the oracle's identity read. A mainnet
 //! profile without an oracle has no second answer to ask for: the primary's
@@ -60,11 +66,13 @@
 //!
 //! Without `--acknowledge` nothing is reconciled or written: the verb exits 1
 //! with `submission.acknowledgement_required`, and the message names the next
-//! step, computed from the record. While a sent transaction's time bound is
-//! open, that is to wait for it to pass or run `tx status`; otherwise it is
-//! `--acknowledge`, plus `--acknowledge-unbounded` for an authenticated hold
-//! without a time bound on every network and, on mainnet, for a sent
-//! `pending` or `ambiguous` receipt without one when no hold exists.
+//! step, computed from the record. An unbounded exposure needs `--acknowledge`
+//! and `--acknowledge-unbounded`. That is an authenticated hold without a time
+//! bound on every network and, on mainnet, a sent `pending`, `ambiguous` or
+//! `failed` receipt without one when no hold exists. Otherwise, for a sent
+//! `pending` receipt whose time bound is open on the host clock, the next step
+//! is to wait for the bound to pass or run `tx status`. Every other record
+//! needs `--acknowledge`.
 //!
 //! With `--acknowledge` the verb acquires the audit writer, restores an
 //! orphan's receipt from its reservation, reconciles the submission with the
@@ -89,16 +97,16 @@
 //!   `submission.unbounded_exposure`. With it, the receipt is cleared and the
 //!   hold released whatever the receipt records; the clear row records the
 //!   unbounded exposure and `reservation_released: true`.
-//! - **Accounting disposition.** The receipt carries `release_code`, and the
-//!   authenticated spending window bears it out rather than the receipt: this
-//!   run's reconciliation expired the accounting under that code, or the
-//!   window holds no reservation for it. The clear row records the code
-//!   as `evidence`; it is an observation, not a chain outcome. A receipt whose
-//!   code the window does not bear out is decided by the rows below, as an
-//!   unknown outcome.
+//! - **Accounting disposition.** The verified spending window holds an
+//!   accounting-expiry decision for the submission and no reservation for
+//!   it, and the `ambiguous` receipt carries that decision's projection: its
+//!   decision identifier and `release_code` `submission.accounting_expired`.
+//!   The clear row records the code as `evidence`; it is an observation, not
+//!   a chain outcome. A `release_code` on the receipt alone is display data,
+//!   and such a receipt is decided by the rows below, as an unknown outcome.
 //! - **Still able to apply.** A `pending` or `ambiguous` receipt with a held
-//!   reservation or a sent receipt, whose time bound has not passed on this
-//!   host's clock. Refused with `submission.still_pending`, naming the time
+//!   reservation or a sent receipt, or a sent `failed` receipt with no held
+//!   reservation, whose time bound has not passed on this host's clock. Refused with `submission.still_pending`, naming the time
 //!   bound; nothing changes.
 //! - **Outcome unknown.** An `ambiguous` receipt without evidence (the
 //!   endpoint's retention window closed), a `pending` receipt whose time bound
@@ -222,9 +230,9 @@ pub struct ClearArgs {
     /// spend is then not counted.
     ///
     /// Required on every network for an authenticated hold without a time
-    /// bound, whatever its receipt records or the endpoint reports, and on
-    /// mainnet for a sent `pending` or `ambiguous` receipt without one when no
-    /// hold exists. Both acknowledgement flags are also required to finish a
+    /// bound, whatever its receipt records or the endpoint reports. Also
+    /// required on mainnet for a sent `pending`, `ambiguous` or `failed`
+    /// receipt without one when no hold exists. Both acknowledgement flags are also required to finish a
     /// recorded unbounded clear.
     #[arg(long)]
     pub acknowledge_unbounded: bool,
@@ -434,9 +442,10 @@ async fn run_clear(args: &ClearArgs) -> i32 {
         return 1;
     }
 
-    // Then the chain. A bounded hold's chain answer is reconciliation's to
-    // record, and the endpoint is the only thing that can contradict the
-    // operator. An endpoint that cannot answer is not a licence to clear: a
+    // Then the chain. A bounded hold's chain answer is reconciliation's:
+    // `tx status` reconciles the submission, and a negative answer keeps its
+    // receipt and exposure. The endpoint is the only thing that can contradict
+    // the operator. An endpoint that cannot answer is not a license to clear: a
     // transaction in flight is exactly the case in which the operator's
     // decision can be wrong.
     let context = crate::common::network::profile_network_context(&profile);
@@ -1364,17 +1373,20 @@ fn settled_by_reconciliation(source: &str, answer: &str, tx_hash: &str) -> Envel
     Envelope::<()>::err_raw(
         "submission.not_clearable",
         format!(
-            "{source} reports this transaction as {answer}, so the submission is settled by \
-             reconciliation rather than by an operator; run 'stellar-agent tx status {}'",
+            "{source} reports this transaction as {answer}, so the submission is not the \
+             operator's to clear; run 'stellar-agent tx status {}'",
             stellar_agent_network::redact_tx_hash(tx_hash),
         ),
     )
 }
 
 /// The refusal without `--acknowledge`, naming the next step computed from
-/// the record without reconciling: a sent transaction whose time bound is
-/// still open on the host clock waits or goes to `tx status`, and every other
-/// record needs the acknowledgement.
+/// the record without reconciling.
+///
+/// An unbounded exposure comes first and needs both acknowledgement flags.
+/// Otherwise a sent `pending` receipt whose time bound is open on the host
+/// clock waits or goes to `tx status`. Every other record needs
+/// `--acknowledge`.
 fn acknowledgement_required(
     existing: Option<&SubmissionReceipt>,
     held: Option<&stellar_agent_network::policy_state::SubmissionHold>,

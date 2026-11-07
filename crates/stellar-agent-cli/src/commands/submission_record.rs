@@ -2,11 +2,11 @@
 //! reporting what the submit layer refused.
 //!
 //! Every value verb that broadcasts records its submission before the
-//! transaction is sent, and settles that record against what the network
-//! answers. The construction is identical across the verbs, so it lives here
-//! once, alongside the reconciliation pass each verb runs before its policy
-//! gate and the mapping that turns the three unresolved-submission refusals
-//! into a response an operator or an agent can act on.
+//! transaction is sent, and records a reported success on it. The
+//! construction is identical across the verbs, so it lives here once. So do
+//! the reconciliation pass each verb runs before its policy gate and the
+//! mapping of the three unresolved-submission refusals. That mapping turns
+//! each refusal into a response an operator or an agent can act on.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -417,18 +417,19 @@ fn descriptor_for(tool: &'static str, chain_id: &str, value_kind: ToolValueKind)
     descriptor
 }
 
-/// The oracle a reconciliation pass of `profile` asks before a negative
-/// answer of the primary endpoint settles a mainnet reservation, built from
-/// the profile.
+/// The oracle a reconciliation pass of `profile` consults about a negative
+/// answer of the primary endpoint for a mainnet reservation, built from the
+/// profile. The reservation stands whatever the oracle answers negatively.
 ///
 /// See [`settlement_oracle_in`].
 pub(crate) fn settlement_oracle(profile: &Profile) -> Option<StellarRpcClient> {
     settlement_oracle_in(profile, &NetworkContext::from_profile(profile))
 }
 
-/// The oracle a reconciliation pass of `profile` asks before a negative
-/// answer of the primary endpoint settles a mainnet reservation, built as
-/// `context` builds its clients.
+/// The oracle a reconciliation pass of `profile` consults about a negative
+/// answer of the primary endpoint for a mainnet reservation, built as
+/// `context` builds its clients. The reservation stands whatever the oracle
+/// answers negatively.
 ///
 /// `None` for a profile on another chain, whose pass never reads an oracle,
 /// and for a mainnet profile that names none. An oracle client that cannot
@@ -464,9 +465,12 @@ pub(crate) fn settlement_oracle_in(
 ///
 /// A reservation counts against the operator's caps while it stands, so a
 /// verb that is about to be gated asks the chain about the oldest few first.
-/// Reconciliation is not a gate of its own: a pass that cannot reach the
+/// Reconciliation is not a gate of its own. A pass that cannot reach the
 /// endpoint leaves every reservation standing and the verb continues, because
-/// counting a reservation that may still apply is the safe direction.
+/// counting a reservation that may still apply is the safe direction. The
+/// exception is a reservation past its accounting horizon. For each selected
+/// reservation, accounting expiry runs before that reservation's endpoint
+/// reads.
 ///
 /// On a mainnet profile `oracle` witnesses the primary endpoint's negative
 /// answers; [`settlement_oracle`] builds it.

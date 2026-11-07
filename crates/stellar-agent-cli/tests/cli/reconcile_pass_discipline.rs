@@ -1,9 +1,12 @@
-//! Every value verb settles what stands open before its own policy gate.
+//! Every value verb runs the bounded reconciliation pass before its own
+//! policy gate.
 //!
 //! A submission whose outcome never came back holds a spending-window
-//! reservation, and that reservation counts against the operator's caps until
-//! something settles it. The bounded pass is what settles it without the
-//! operator asking, so a value verb that skips it lets a stale hold shrink
+//! reservation when the policy produced window entries for it. That
+//! reservation counts against the operator's caps through its accounting
+//! horizon or, without a time bound, until an operator clears it. The bounded pass is what expires a time-bounded one at its
+//! horizon without the operator asking, so a value verb that skips it lets a
+//! stale hold shrink
 //! every later action's headroom. Two public documents state the rule for
 //! every value verb, so the scan is what keeps the statement true.
 //!

@@ -875,10 +875,11 @@ async fn acceptance_submit_and_confirm() {
 
     // Wire the audit writer and leg exactly as the MCP `stellar_dex_trade`
     // handler does. The recorder writes the pending row before the send. A
-    // reported success updates the receipt and keeps the pending record until
-    // authenticated settlement. The leg is built from the SAME amount/path/router
-    // the trade uses (single-derivation invariant); the writer uses a fixed test
-    // key.
+    // reported success updates the receipt and keeps the exposure open through
+    // its accounting horizon or, without a time bound, until an operator clears
+    // it. The pending row stays open. The leg is built from the SAME
+    // amount/path/router the trade uses (single-derivation invariant); the
+    // writer uses a fixed test key.
     let audit_dir = std::env::temp_dir().join(format!("dex-audit-{}", now_secs()));
     std::fs::create_dir_all(&audit_dir).expect("create audit dir");
     let audit_log_path = audit_dir.join("audit.jsonl");
@@ -941,8 +942,9 @@ async fn acceptance_submit_and_confirm() {
     );
 
     // The recorder wrote the pending row before the send. A reported success
-    // updates the receipt and keeps the pending record until authenticated
-    // settlement, so no submitted row follows.
+    // updates the receipt and keeps the exposure open through its accounting
+    // horizon or, without a time bound, until an operator clears it. The
+    // pending row stays open, so no submitted row follows.
     let audit_rows: Vec<serde_json::Value> = std::io::BufRead::lines(std::io::BufReader::new(
         std::fs::File::open(&audit_log_path).expect("audit log after submit"),
     ))
@@ -984,7 +986,8 @@ async fn acceptance_submit_and_confirm() {
     assert_eq!(
         record_state.pending_reservations(),
         1,
-        "a reported success keeps the debit's exposure open until authenticated settlement"
+        "a reported success keeps the debit's exposure open through its accounting horizon \
+         or, without a time bound, until an operator clears it"
     );
 
     // The signing admission creates the only signed intent. Pre-send binding

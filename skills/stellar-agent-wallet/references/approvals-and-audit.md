@@ -239,13 +239,14 @@ recorded does not count either.
 A recorded x402 or MPP authorization stays counted when a later step fails,
 such as signing or delivering the credential.
 For x402 that includes a refused endpoint identity check.
-A submission that fails on chain or is refused at the send stops counting.
-One without a confirmed outcome counts until reconciliation settles it or an
-operator clears its receipt with `tx receipt clear`.
-A confirmed submission leaves the window measured from the close time of the
-ledger that applied it.
-Without a usable close time in the confirmation, the reservation stays pending
-and keeps counting.
+A sent submission keeps counting whatever the endpoint reports, a failure on
+chain or a refusal at the send included.
+A time-bounded one counts through its accounting horizon: the later of its
+signed time bound and the first local success observation, plus the window's
+duration.
+A reported ledger close time does not backdate that horizon.
+An untimed one counts until an operator clears its receipt with
+`tx receipt clear --acknowledge --acknowledge-unbounded`.
 The count is kept per profile and window, in the profile's window-state store.
 Every `rate_limit` and `bundle_rate_limit` criterion of the profile with the
 same window reads one shared count, whichever rule carries it.
@@ -559,8 +560,9 @@ never logged; only their key names are. Strkeys in a decision reason are redacte
 first-five-last-five and transaction hashes to first-eight-last-eight; the
 envelope hash is left intact (it is a SHA-256 digest carrying no user data).
 
-The log records `value_action_submitted` on every
-confirmed value-moving submit (carrying the gate-sized value legs) and
+The log records `value_action_pending` before every
+value-moving submit that runs with an audit writer (carrying the gate-sized
+value legs) and
 `keyring_key_written` on each key-writing profile command. It records
 `x402_payment_authorized`, with a passed cross-check witness when the payment
 required one, before a signed x402 authorization leaves the wallet
@@ -837,9 +839,9 @@ persisted profile proves the audit writer is acquirable BEFORE the signing key
 is touched or a transaction is submitted. If the key was never minted (run
 `stellar-agent profile rotate-audit-key <name>`), the verb refuses
 `audit.chain_key_unavailable` instead of signing unaudited. This applies on
-both policy engines. It is distinct from the writer's post-confirm emission
-(the `value_action_submitted` row above), which stays non-fatal: the
-transaction has already committed by then, so refusing helps nobody.
+both policy engines. The submission recorder writes the `value_action_pending`
+row above before the send, and a confirmed submission it records writes no
+further value-action outcome row.
 Read-only tools and the build/simulate stages of two-phase verbs never reach
 this pre-flight. `smart-account rules verify-pins`, `signers list`, and
 `signers refresh` record audit rows, so they reach it without loading a signer.

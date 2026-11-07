@@ -235,13 +235,14 @@ recorded does not count either.
 A recorded x402 or MPP authorization stays counted when a later step fails,
 such as signing or delivering the credential.
 For x402 that includes a refused endpoint identity check.
-A submission that fails on chain or is refused at the send stops counting.
-One without a confirmed outcome counts until reconciliation settles it or an
-operator clears its receipt with `tx receipt clear`.
-A confirmed submission leaves the window measured from the close time of the
-ledger that applied it.
-Without a usable close time in the confirmation, the reservation stays pending
-and keeps counting.
+A sent submission keeps counting whatever the endpoint reports, a failure on
+chain or a refusal at the send included.
+A time-bounded one counts through its accounting horizon: the later of its
+signed time bound and the first local success observation, plus the window's
+duration.
+A reported ledger close time does not backdate that horizon.
+An untimed one counts until an operator clears its receipt with
+`tx receipt clear --acknowledge --acknowledge-unbounded`.
 The count is kept per profile and window, in the profile's window-state store.
 Every `rate_limit` and `bundle_rate_limit` criterion of the profile with the
 same window reads one shared count, whichever rule carries it.
@@ -380,9 +381,9 @@ Files rotate at a size bound with a fixed number of rotated files retained.
 
 ### What is recorded
 
-Each entry carries a timestamp, the tool name, the chain id, the **argument key names** (`arg_keys`), the envelope hash, and the nonce id. It also carries the policy decision (`allow` / `deny:<reason>` / `require_approval`), an optional decision reason, a request id, the event kind, and the previous entry's hash. The event kind enumerates tool invocations alongside smart-account lifecycle events (rule changes, signer-set and threshold changes, passkey registration and assertion, multicall, timelock, channel-pool, rotation handoff, and others). Recorded submissions write `value_action_pending` before sending, `value_action_submitted` on confirmation with the gate-sized value legs, and `value_action_failed` on definitive refusal or failure. An unknown outcome keeps its pending row for reconciliation. Key-writing profile commands record `keyring_key_written`. `x402_payment_authorized` is written before a signed x402 authorization leaves the wallet in the RPC re-simulation, and records the signature expiration ledger through which that authorization is valid on chain. `x402_authorization_withheld` is written when that payment then fails, paired with the authorized row by its request id. Approval rows (`approval_attested`, `approval_rejected`, and their remote twins) are written before the decision takes effect.
+Each entry carries a timestamp, the tool name, the chain id, the **argument key names** (`arg_keys`), the envelope hash, and the nonce id. It also carries the policy decision (`allow` / `deny:<reason>` / `require_approval`), an optional decision reason, a request id, the event kind, and the previous entry's hash. The event kind enumerates tool invocations alongside smart-account lifecycle events (rule changes, signer-set and threshold changes, passkey registration and assertion, multicall, timelock, channel-pool, rotation handoff, and others). Recorded submissions write `value_action_pending` with the gate-sized value legs before sending. No endpoint answer writes an outcome row: a reported success is recorded on the receipt, and the pending row stands. `value_action_failed` closes the pending row of a submission the wallet refused before the send. Key-writing profile commands record `keyring_key_written`. `x402_payment_authorized` is written before a signed x402 authorization leaves the wallet in the RPC re-simulation, and records the signature expiration ledger through which that authorization is valid on chain. `x402_authorization_withheld` is written when that payment then fails, paired with the authorized row by its request id. Approval rows (`approval_attested`, `approval_rejected`, and their remote twins) are written before the decision takes effect.
 
-Raw argument **values are never logged**: `arg_keys` holds only their key names. Typed event fields such as the value legs of `value_action_submitted` retain each leg's amount, asset, and redacted destination. Strkeys appearing in a decision reason are redacted to first-five-last-five and transaction hashes to first-eight-last-eight; the envelope hash is left intact because it is a SHA-256 digest carrying no user data.
+Raw argument **values are never logged**: `arg_keys` holds only their key names. Typed event fields such as the value legs of `value_action_pending` retain each leg's amount, asset, and redacted destination. Strkeys appearing in a decision reason are redacted to first-five-last-five and transaction hashes to first-eight-last-eight; the envelope hash is left intact because it is a SHA-256 digest carrying no user data.
 
 ### Tamper evidence
 
@@ -401,7 +402,7 @@ before signing-key access or submission. An unavailable key or writer refuses
 with `audit.chain_key_unavailable`, subject to the specific audit refusals
 described in [Audit-log recovery](maintainers/audit-log-recovery.md).
 
-Post-confirmation `value_action_submitted` row failures remain non-fatal.
+The submission recorder writes the pending row before the send, and a confirmed submission it records writes no further value-action outcome row.
 Read-only tools and build/simulate stages do not reach the signing preflight.
 V1 MCP payment simulations can still acquire the writer for reservation
 reconciliation and owed accounting events.

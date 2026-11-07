@@ -470,9 +470,10 @@ async fn defindex_deposit_submit_and_confirm() {
     // Wire the audit writer and legs exactly as the MCP
     // `stellar_defindex_vault_deposit` handler does. The recorder writes the
     // pending row before the send. A reported success updates the receipt and
-    // keeps the pending record until authenticated settlement. Legs are built
-    // from the SAME amounts/asset/vault the deposit uses (single-derivation
-    // invariant); the writer uses a fixed test key.
+    // keeps the exposure open through its accounting horizon or, without a
+    // time bound, until an operator clears it. The pending row stays open.
+    // Legs are built from the SAME amounts/asset/vault the deposit uses
+    // (single-derivation invariant); the writer uses a fixed test key.
     let audit_dir = std::env::temp_dir().join(format!("defindex-deposit-audit-{}", now_secs()));
     std::fs::create_dir_all(&audit_dir).expect("create audit dir");
     let audit_log_path = audit_dir.join("audit.jsonl");
@@ -536,8 +537,10 @@ async fn defindex_deposit_submit_and_confirm() {
             );
 
             // The recorder wrote the pending row before the send. A reported
-            // success updates the receipt and keeps the pending record until
-            // authenticated settlement, so no submitted row follows.
+            // success updates the receipt and keeps the exposure open through
+            // its accounting horizon or, without a time bound, until an
+            // operator clears it. The pending row stays open, so no submitted
+            // row follows.
             let audit_rows: Vec<serde_json::Value> = std::io::BufRead::lines(
                 std::io::BufReader::new(
                     std::fs::File::open(&audit_log_path).expect("audit log after submit"),
@@ -584,7 +587,8 @@ async fn defindex_deposit_submit_and_confirm() {
             assert_eq!(
                 record_state.pending_reservations(),
                 1,
-                "a reported success keeps the debit's exposure open until authenticated settlement"
+                "a reported success keeps the debit's exposure open through its accounting \
+                 horizon or, without a time bound, until an operator clears it"
             );
 
             // The signing admission creates the only signed intent. Pre-send
@@ -958,8 +962,9 @@ async fn defindex_deposit_then_withdraw_submit_and_confirm() {
     // Wire the audit writer and leg exactly as the MCP
     // `stellar_defindex_vault_withdraw` handler does. The recorder writes the
     // pending row before the send. A reported success updates the receipt and
-    // keeps the pending record until authenticated settlement. The leg is built
-    // from the SAME shares/vault the withdraw uses.
+    // keeps the exposure open through its accounting horizon or, without a
+    // time bound, until an operator clears it. The pending row stays open.
+    // The leg is built from the SAME shares/vault the withdraw uses.
     let withdraw_audit_legs = vec![stellar_agent_core::audit_log::ValueLegRecord::from(
         &stellar_agent_defindex::value::vault_withdraw_value_leg(
             withdraw_args.withdraw_shares,
@@ -1003,8 +1008,10 @@ async fn defindex_deposit_then_withdraw_submit_and_confirm() {
             );
 
             // The recorder wrote each pending row before its send. A reported
-            // success updates the receipt and keeps the pending record until
-            // authenticated settlement, so no submitted row follows.
+            // success updates the receipt and keeps the exposure open through
+            // its accounting horizon or, without a time bound, until an
+            // operator clears it. The pending row stays open, so no submitted
+            // row follows.
             let audit_rows: Vec<serde_json::Value> = std::io::BufRead::lines(
                 std::io::BufReader::new(
                     std::fs::File::open(&withdraw_audit_log_path).expect("audit log after submit"),
@@ -1056,7 +1063,8 @@ async fn defindex_deposit_then_withdraw_submit_and_confirm() {
             assert_eq!(
                 record_state.pending_reservations(),
                 1,
-                "a reported success keeps the debit's exposure open until authenticated settlement"
+                "a reported success keeps the debit's exposure open through its accounting \
+                 horizon or, without a time bound, until an operator clears it"
             );
 
             // The withdraw leg has no native entry, so its sizing is empty and

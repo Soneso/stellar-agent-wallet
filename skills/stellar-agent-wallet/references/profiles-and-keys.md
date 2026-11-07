@@ -334,9 +334,10 @@ mainnet profile that loads without `oracle_provider_url` is refused with
 `profile.mainnet_oracle_required`: `profile enable-mainnet` refuses before it
 reads a keyring entry and writes no enablement state, and every mainnet
 write, in the CLI and in the MCP server, refuses before any signature. An
-enabled profile whose oracle is removed refuses every mainnet write until the
-oracle is set again. The MCP server reads the profile at startup, so it
-applies an oracle change from its next start. On testnet the oracle is
+enabled profile whose oracle is removed refuses every CLI mainnet write until
+the oracle is set again. A running MCP server checks the profile it loaded at
+startup, so it refuses mainnet writes for a removed oracle from its next
+start. On testnet the oracle is
 optional, and a required witness without one warns.
 For the x402 payment tools, the oracle simulates the same unsigned transfer the
 primary simulated, and the answers are compared before the payer signs.

@@ -208,12 +208,15 @@ pub struct DefiAdapterCtx<'a> {
     ///
     /// `None` delegates the default count decision to the concrete adapter.
     pub auth_rule_ids: Option<&'a [ContextRuleId]>,
-    /// Audit writer for the value-action row emitted after a confirmed submit.
+    /// Audit writer for the value-action row a context without a submission
+    /// recorder emits after a confirmed submit.
     ///
     /// `None` for preview-only calls and any caller that does not record value
-    /// rows. When `Some`, the adapter emits a `ValueActionSubmitted` row in the
-    /// submit Ok arm; the writer MUST have been opened with the profile's audit
-    /// chain-root HMAC key so `audit verify` covers the row.
+    /// rows. When `Some` and no submission recorder is attached, the adapter
+    /// emits a `ValueActionSubmitted` row in the submit Ok arm; an attached
+    /// recorder owns the submission's audit rows, and no such row is written.
+    /// The writer MUST have been opened with the profile's audit chain-root
+    /// HMAC key so `audit verify` covers the row.
     pub audit_writer:
         Option<std::sync::Arc<std::sync::Mutex<stellar_agent_core::audit_log::AuditWriter>>>,
     /// Gate-derived value legs recorded in the value-action row — the same
@@ -363,8 +366,9 @@ impl<'a> DefiAdapterCtx<'a> {
         request_id: &str,
     ) {
         // The recorder wrote the pending audit row before the send. A reported
-        // success updates the receipt and keeps the exposure open until
-        // authenticated settlement, so no submitted row follows.
+        // success updates the receipt and keeps the exposure open through its
+        // accounting horizon or, without a time bound, until an operator clears
+        // it. The pending row stays open, so no submitted row follows.
         if self.submission_recorder.is_some() {
             return;
         }

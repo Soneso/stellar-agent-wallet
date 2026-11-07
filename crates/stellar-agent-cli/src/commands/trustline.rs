@@ -27,8 +27,8 @@
 //!    chain-root key must be acquirable via
 //!    [`crate::commands::value_audit::require_value_audit_writer`] before any
 //!    later step touches the signer or submits; refuses
-//!    `audit.chain_key_unavailable` otherwise. The acquired writer is reused
-//!    for the post-confirm row.
+//!    `audit.chain_key_unavailable` otherwise. The submission recorder reuses
+//!    the acquired writer for the pending row it writes before the send.
 //! 8. `clawback_gate(flags, opt_in_present)` where `opt_in_present` is derived
 //!    from the wallet-controlled `PendingApprovalStore` (NOT a CLI flag).
 //! 9. `TrustlinePreview::build`: the typed preview of the trustline.
@@ -494,10 +494,11 @@ where
 
     // ── Audit pre-flight (fail-closed) ────────────────────────────────────────
     // Proves the profile's audit chain-root key is acquirable AFTER the
-    // policy gate (a denial is a clean refusal that signs nothing and needs
-    // no audit setup) but BEFORE the signer is loaded (below) or the
-    // transaction is submitted. Reused (not re-acquired) for the
-    // post-confirm `value_action_submitted` row.
+    // policy gate but BEFORE the signer is loaded (below) or the transaction
+    // is submitted. A policy denial is a clean refusal that signs nothing and
+    // needs no audit setup. The submission recorder reuses it (not
+    // re-acquired) for the `value_action_pending` row it writes before the
+    // send.
     let audit_writer =
         match crate::commands::value_audit::require_value_audit_writer(&profile, &profile_name) {
             Ok(w) => w,
@@ -667,8 +668,9 @@ where
 
     // ── Record, then submit ───────────────────────────────────────────────────
     // The recorder writes the receipt, the pending audit row and the
-    // spending-window reservation before the bytes leave, and settles all
-    // three against what the network answers.
+    // spending-window reservation before the bytes leave. It records a
+    // reported success on the receipt and in the reservation, and every other
+    // answer leaves all three standing.
     let submission_failure = |e: WalletError| {
         crate::commands::submission_record::error_envelope_with_fallback(
             &e,

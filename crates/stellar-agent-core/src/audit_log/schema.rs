@@ -3155,11 +3155,13 @@ pub enum EventKind {
         operator_credential_id_redacted: String,
     },
 
-    /// A value-moving action was CONFIRMED on-chain.
+    /// Records a reported on-chain confirmation.
     ///
-    /// Emitted after a successful submit-and-confirm on an allow-path value
-    /// verb (classic pay / create-account / claim / trustline, and the DeFi
-    /// trade / lend / vault adapters). The `legs` are the SAME descriptor the
+    /// The wallet's submit and reconciliation paths write no such row: a
+    /// reported success is recorded on the receipt, and the pending row
+    /// stands. A DeFi adapter context without a submission recorder writes it
+    /// after a confirmed submit of an allow-path trade or vault action. The
+    /// `legs` are the SAME descriptor the
     /// policy gate sized — the single-derivation invariant, never a second
     /// derivation. The verb identity, chain id, policy decision, and request id
     /// ride on the OUTER [`AuditEntry`](super::entry::AuditEntry) fields, as
@@ -3217,11 +3219,10 @@ pub enum EventKind {
     /// A signed value-moving transaction was recorded before it was sent.
     ///
     /// Written immediately before `sendTransaction`, so the log holds the
-    /// intent whatever happens to the send. The row stands until a
-    /// [`Self::ValueActionSubmitted`] or [`Self::ValueActionFailed`] row
-    /// records the outcome; a row that stands alone is a submission whose
-    /// outcome is not known, resolved by reconciling `transaction_hash_redacted`
-    /// against the chain.
+    /// intent whatever happens to the send. No endpoint answer closes the
+    /// row: a sent submission's row stands, and reconciling
+    /// `transaction_hash_redacted` against the chain records a reported
+    /// success on the receipt.
     ///
     /// A pending row can also describe an attempt the recorder refused before
     /// the send. A [`Self::ValueActionFailed`] row under the refusal's code
@@ -3267,18 +3268,16 @@ pub enum EventKind {
         sequence: i64,
     },
 
-    /// A recorded value-moving submission that moved no value: refused before
-    /// or at the send, or failed on-chain.
+    /// A recorded value-moving submission that never left the wallet.
     ///
-    /// Written where a [`Self::ValueActionPending`] row's submission reached
-    /// a definitive negative answer: the send step refused the bytes, the
-    /// poll reported the transaction applied and failed, or reconciliation
-    /// released the submission's reservation on chain evidence that the
-    /// transaction can no longer apply, in which case `code` names that
-    /// evidence. It also closes the pending row of a submission the recorder
-    /// refused before the send, under the refusal's code. A spending-window
-    /// reservation the submission took is released best-effort; one left
-    /// standing remains until reconciliation or an operator settles it.
+    /// Closes the [`Self::ValueActionPending`] row of a submission the
+    /// recorder refused before the send, under the refusal's code, and of a
+    /// pool attempt that was never transmitted. No endpoint answer writes it:
+    /// a refused send, a reported failure and a missing transaction keep the
+    /// pending row and the reservation. The local pre-send cleanup releases
+    /// the reservation the submission took best-effort. One left standing
+    /// with an execution bound counts through its accounting horizon, and an
+    /// operator clear releases one without an execution bound.
     ///
     /// # Field redaction
     ///
@@ -3343,16 +3342,16 @@ pub enum EventKind {
         chain_outcome: String,
     },
 
-    /// An operator acknowledged a submission and released its hold on the
-    /// spending window.
+    /// An operator acknowledges a submission and clears its receipt.
     ///
     /// Written by `tx receipt clear --acknowledge` after the command has
     /// reconciled the submission against the chain. The row names the state
     /// the receipt was left in, so the log records what the operator
-    /// acknowledged rather than only that they acknowledged something, and
-    /// it names the chain evidence when reconciliation released the
-    /// reservation on evidence. A row without `evidence` records an outcome
-    /// that is unknown.
+    /// acknowledged rather than only that they acknowledged something. It
+    /// names, as `evidence`, the accounting disposition the window bears out
+    /// or the endpoint's unrecorded answer under an untimed hold; neither is a
+    /// chain outcome. A row without `evidence` records an outcome that is
+    /// unknown.
     ///
     /// The row is not a settlement: a cleared receipt owes no
     /// `value_action_*` row. The clear row records the operator's

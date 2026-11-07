@@ -414,9 +414,10 @@ mainnet profile that loads without `oracle_provider_url` is refused with
 `profile.mainnet_oracle_required`: `profile enable-mainnet` refuses before it
 reads a keyring entry and writes no enablement state, and every mainnet
 write, in the CLI and in the MCP server, refuses before any signature. An
-enabled profile whose oracle is removed refuses every mainnet write until the
-oracle is set again. The MCP server reads the profile at startup, so it
-applies an oracle change from its next start. On testnet the oracle is
+enabled profile whose oracle is removed refuses every CLI mainnet write until
+the oracle is set again. A running MCP server checks the profile it loaded at
+startup, so it refuses mainnet writes for a removed oracle from its next
+start. On testnet the oracle is
 optional, and a required witness without one warns.
 For the x402 payment tools, the oracle simulates the same unsigned transfer the
 primary simulated, and the answers are compared before the payer signs.
@@ -426,14 +427,17 @@ A mainnet profile requires `providers.oracle`, a host distinct from `rpc_url`,
 and a `[providers.primary]` record. Endpoint validation and URL redaction apply.
 `providers.oracle` can name a keyring credential for the endpoint.
 
-On mainnet the oracle also witnesses settlement, once it reports the mainnet
-passphrase. A submission the primary endpoint reports failed, refused, or
-unknown is settled on the oracle's answers: its transaction status, and for an
-unknown transaction its retention window, ledger close time and account
-sequence. When the profile names no oracle at settlement, as after the
-operator removes it, every such submission stays pending, with its
-spending-window reservation held, until the operator clears it with
-`stellar-agent tx receipt clear`.
+On mainnet the oracle also witnesses reconciliation, once it reports the
+mainnet passphrase. A submission the primary endpoint reports failed, refused,
+or unknown is checked against the oracle's answers: its transaction status, and
+for an unknown transaction its retention window, ledger close time and account
+sequence. The oracle's success is recorded as a report, and its failure or
+absence keeps the spending-window reservation. When the profile names no
+oracle at reconciliation, as after the operator removes it, such a submission
+preserves the existing receipt status and its reservation. Accounting expiry
+runs before any endpoint or oracle lookup, so a time-bounded reservation still
+ends once its accounting horizon passes. An untimed one stays until the operator clears it
+with `stellar-agent tx receipt clear`.
 
 ### Provider attestations
 

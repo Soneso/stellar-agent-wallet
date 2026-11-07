@@ -51,10 +51,11 @@ attempts to close the row. The attempt is best-effort. If written, the
 settlement lookup reads that row for the original submission too, unless the
 original's outcome row is newer.
 
-Automatic reconstruction needs a retained pending reservation and either a
-definitive chain answer or release evidence. It restores the transaction
-identity before the reservation settles, and an operator clear after an
-acknowledged `NOT_FOUND` beyond retention restores it too. Without a retained
+Automatic reconstruction needs a retained pending reservation and one of two
+paths. A success report restores the receipt through `finalize_receipt` before
+the window records the answer. A committed accounting expiry rebuilds it
+through `project_accounting_expiry`. An operator clear after an acknowledged
+`NOT_FOUND` beyond retention restores the transaction identity too. Without a retained
 reservation, a lost receipt loses the reconciliation identity. Reconstruction
 does not recover the approval nonce, so the owed approval-consumption repair is
 lost, and the previous operator-clear state is lost. The pending audit row
@@ -325,7 +326,8 @@ refuses leaves its row open for the original submission's settlement. For a
 `record_pending` error other than the duplicate refusal, the recorder also
 attempts to close the row. That error can precede the duplicate decision, so it
 does not prove exclusive ownership of the hash. A reservation persisted before
-the error stands until reconciliation settles it. Without current window
+the error counts through its accounting horizon when it has an execution bound.
+Without one, it stands until an operator clears it. Without current window
 entries, a reservation from an earlier stateful policy can also remain.
 A closing row can settle that submission too.
 
@@ -444,9 +446,9 @@ The non-regular-file check rejects directories and symlinks before open, closing
 
 ### Value-action emission sites
 
-The commit and submit paths in the following table write `value_action_submitted` after the on-chain action confirms. It carries the SAME value legs the policy gate sized (single-derivation invariant: the legs are the `ValueEffects` the gate evaluated, never re-derived at the emission site). The redacted transaction hash (first-8-last-8) and confirmed ledger are recorded; the row never carries key material. Emission is non-fatal: a row-write failure after a confirmed submit logs a warning and never changes the result. A DeFi adapter that instead FAILS at submit records a `sa_raw_invocation` row (with the mapped `SaInvocationResult`) in its error arm.
+The commit and submit paths in the following table write `value_action_pending` through the submission recorder before the send. It carries the SAME value legs the policy gate sized (single-derivation invariant: the legs are the `ValueEffects` the gate evaluated, never re-derived at the emission site). The locally computed transaction hash is recorded redacted (first-8-last-8); the row never carries key material. A row the writer cannot append refuses the send with `submission.record_unavailable`. A reported success writes no further row: the receipt records it as a report. A DeFi adapter that instead FAILS at submit records a `sa_raw_invocation` row (with the mapped `SaInvocationResult`) in its error arm.
 
-x402 authorization signing is the exception to the row kind and to the timing. It writes `x402_payment_authorized` (its own `EventKind` carrying legs, network, and scheme) rather than `value_action_submitted`. The wallet signs the payment authorization without submitting it. The signed authorization still leaves the wallet: the payment flow re-simulates the signed entry against the configured RPC. That RPC therefore observes the signed x402 authorization and is part of the trust boundary.
+x402 authorization signing is the exception to the row kind and to the timing. It writes `x402_payment_authorized` (its own `EventKind` carrying legs, network, and scheme) rather than `value_action_pending`. The wallet signs the payment authorization without submitting it. The signed authorization still leaves the wallet: the payment flow re-simulates the signed entry against the configured RPC. That RPC therefore observes the signed x402 authorization and is part of the trust boundary.
 
 The ordinary path, `exact::create_payment`, receives its clients from the host. Its `validate_requirements` refuses a mainnet passphrase or a mainnet-pattern endpoint before any request. The authorized path, `exact::create_payment_authorized`, takes bound mainnet proofs and returns the payment with its release authorization. It obtains its primary client from the bound context and its witness through the bound network helper. Both paths share the checks below.
 
@@ -468,11 +470,11 @@ On mainnet, after release authorization is consumed, the tool consumes the pendi
 
 | Surface | Verb / tool | Row |
 | --- | --- | --- |
-| MCP | `stellar_pay_commit`, `stellar_create_account_commit`, `stellar_claim_commit`, `stellar_trustline_commit` | `value_action_submitted` (sized legs) |
-| MCP | `stellar_dex_trade`, `stellar_defindex_vault_deposit`, `stellar_defindex_vault_withdraw` | `value_action_submitted` on success; `sa_raw_invocation` on submit failure |
+| MCP | `stellar_pay_commit`, `stellar_create_account_commit`, `stellar_claim_commit`, `stellar_trustline_commit` | `value_action_pending` (sized legs) |
+| MCP | `stellar_dex_trade`, `stellar_defindex_vault_deposit`, `stellar_defindex_vault_withdraw` | `value_action_pending` before the send; `sa_raw_invocation` on submit failure |
 | MCP | `stellar_x402_create_payment`, `stellar_x402_authenticated_payment` | `x402_payment_authorized` (its own `EventKind` carrying legs, network, and scheme, plus a passed witness when the payment required one), fatal, before the signed re-simulation. `x402_authorization_withheld` follows a later failure, at a stage the paragraphs above list. Mainnet `x402_payment_authorized` rows record `RequireApproval` before signed re-simulation. Later withholding rows identify the failed stage with the same request identifier. |
-| MCP | `stellar_sep43_sign_and_submit_transaction` | `value_action_submitted` (opaque: empty legs + `opaque_reason`) |
-| CLI | `pay`, `claim`, `accounts create` (sponsored mode only), `trustline`, `trade` | `value_action_submitted` (sized legs) |
+| MCP | `stellar_sep43_sign_and_submit_transaction` | `value_action_pending` (empty legs for an envelope the policy could not size) |
+| CLI | `pay`, `claim`, `accounts create` (sponsored mode only), `trustline`, `trade` | `value_action_pending` (sized legs) |
 
 The value descriptor reaches the emission site through the policy engine's `evaluate_full` / `evaluate_with_value_full`, which surface the sized `ValueEffects` on the allow path; the decision-only `evaluate` / `evaluate_with_value` views discard it and must never gate a value-moving dispatch (see the rustdoc on those methods). Rows are written under the profile's `audit_log_hash_chain_key_id`, loaded through the single `stellar_agent_network::keyring::load_hmac_key_32` source, so `audit verify` covers them.
 
@@ -947,8 +949,9 @@ One oracle request reads every distinct key. The comparator associates answers
 by returned key XDR and validates each entry's embedded identity.
 Duplicate, unrequested, malformed, or inconsistent entries refuse as
 `network.witness_unavailable`. The witness records the oracle authority, ledger,
-SHA-256 digest of compared inputs, and entry kinds. Pending and submitted audit
-rows preserve this evidence, including when reconciliation writes the outcome.
+SHA-256 digest of compared inputs, and entry kinds. The pending audit row
+preserves this evidence. No endpoint answer or reconciliation writes an outcome
+row for the submission.
 
 The chain enforces sequence, source balance, trustline existence, authorization,
 and limits; credit-payment destination existence; account-creation destination
@@ -1054,7 +1057,7 @@ The identity check, the signer-set fetch, and `sendTransaction` share one retry 
 - After failed attempt n, counted from 0, a random sleep in `0..=min(8 s, 500 ms × 2^n)` precedes the next attempt. The four sleep caps are 0.5, 1, 2, and 4 s.
 - Each attempt and each sleep ends at the deadline of the invocation that started it. A sleep that reaches the deadline ends the retries with the last error.
 
-Two retry scopes are distinct, and only the first exists. Inside one submission, the retry combinator wraps `sendTransaction`, but under the pinned `stellar-rpc-client` a submission sends once. The client turns every transport failure on send into `TransactionSubmissionFailed` with the `No status yet:` marker, and an `ERROR` answer with a result into the same variant, and one without a result into `MissingError`; the send classifier retries none of them. An HTTP 500 on send therefore ends as one send and an unknown outcome, which `a_transport_failure_after_the_record_returns_the_timeout_shape` pins with an exact send count. The combinator covers the variants the client does not produce on send, `TransactionSubmissionTimeout` and `JsonRpc`, and its own tests drive those. A submission with a send-by instant checks it before every send attempt, and a backoff sleep ends at it. When the instant has passed before the first send, nothing is sent and the record settles as rejected. When it passes before a resend, the resend does not start and the submission stays unresolved, because the earlier send may have reached the network. Across submissions there is no retry: no recovery path sends. `tx status`, `stellar_transaction_status`, the reconciliation pass before each value verb's gate, and `tx receipt clear` read the chain and write the wallet's records, and their tests count zero sends. The idempotent helpers `submit_transaction_idempotent`, `reconcile_receipt` and `submit_fee_bump_idempotent` have no caller in the shipped verbs and are not part of the recovery protocol.
+Two retry scopes are distinct, and only the first exists. Inside one submission, the retry combinator wraps `sendTransaction`, but under the pinned `stellar-rpc-client` a submission sends once. The client turns every transport failure on send into `TransactionSubmissionFailed` with the `No status yet:` marker, and an `ERROR` answer with a result into the same variant. It turns one without a result into `MissingError`, and the send classifier retries none of them. An HTTP 500 on send therefore ends as one send and an unknown outcome, which `a_transport_failure_after_the_record_returns_the_timeout_shape` pins with an exact send count. The combinator covers the variants the client does not produce on send, `TransactionSubmissionTimeout` and `JsonRpc`, and its own tests drive those. A submission with a send-by instant checks it before every send attempt, and a backoff sleep ends at it. When the instant has passed before the first send, nothing is sent and the submission is reported as rejected; the receipt, the pending row and the reservation stand. When it passes before a resend, the resend does not start and the submission stays unresolved, because the earlier send may have reached the network. Across submissions there is no retry: no recovery path sends. `tx status`, `stellar_transaction_status`, the reconciliation pass before each value verb's gate, and `tx receipt clear` read the chain and write the wallet's records, and their tests count zero sends. The idempotent helpers `submit_transaction_idempotent`, `reconcile_receipt` and `submit_fee_bump_idempotent` have no caller in the shipped verbs and are not part of the recovery protocol.
 
 The confirmation poll asks `getTransaction` every 2 s under the same deadline. No poll request and no sleep between polls runs past it. An answer that arrives after it is not accepted. The caller gets the timeout outcome and reconciles the hash with `tx status`. The retention-aware poll of the idempotent path makes one exception. At the deadline it runs one final `getHealth` retention check, bounded to 2 s, so it returns within the deadline plus 2 s.
 

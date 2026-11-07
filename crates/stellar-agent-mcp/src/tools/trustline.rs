@@ -1337,8 +1337,8 @@ impl WalletServer {
         // Proves the profile's audit chain-root key is acquirable BEFORE the
         // nonce below is consumed, the signer is loaded, or the transaction is
         // submitted — a refusal here burns no nonce/replay-window attestation.
-        // Reused (not re-acquired) for the post-confirm `value_action_submitted`
-        // row.
+        // The submission recorder reuses it (not re-acquired) for the
+        // `value_action_pending` row it writes before the send.
         let (audit_writer, audit_readiness) = match self.write_audit() {
             Ok(w) => w,
             Err(err) => {

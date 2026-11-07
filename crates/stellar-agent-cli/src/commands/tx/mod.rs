@@ -2,11 +2,13 @@
 //! submissions.
 //!
 //! Every value-moving verb records its submission before the transaction is
-//! sent, so a submission whose outcome never came back leaves a receipt and a
-//! spending-window reservation behind. This group is how those are settled:
+//! sent, so a submission whose outcome never came back leaves a receipt
+//! behind. It also leaves a spending-window reservation when the policy
+//! produced window entries for the submission. This group is how those are
+//! resolved:
 //!
-//! - [`status`] asks the chain what became of one transaction and settles the
-//!   wallet's record of it. This is the way out of `submission.tx_timeout`.
+//! - [`status`] asks the chain what became of one transaction and reconciles
+//!   the submission; a negative answer keeps its receipt and exposure. This is the way out of `submission.tx_timeout`.
 //! - [`receipt`]: close a submission record after reconciling it against the chain.
 
 pub mod receipt;
@@ -29,10 +31,16 @@ pub struct TxArgs {
 pub enum TxSubcommand {
     /// Reconcile one submitted transaction against the chain.
     ///
-    /// Asks the endpoint what became of `<HASH>` and settles the wallet's
-    /// record of it: a confirmed transaction records its spend and its
-    /// value-action row, and one that can no longer apply releases its
-    /// spending-window reservation.
+    /// Asks the endpoint what became of `<HASH>` and records a reported
+    /// success on the receipt, unless the receipt of an untimed hold already
+    /// records another network answer. A reported success writes no submitted
+    /// row. A reported failure preserves the existing receipt status, and so
+    /// does a missing transaction while the endpoint retains the submission's
+    /// ledger. Beyond that retention, a missing transaction marks a pending or
+    /// ambiguous receipt ambiguous. No reported answer releases the
+    /// spending-window reservation. The reservation ends with the outcome
+    /// unknown once its accounting horizon has passed, which owes one
+    /// `submission_accounting_expired` audit event.
     ///
     /// Exits 0 when the lookup completes, whatever the chain reported; exits 1
     /// when the record or the endpoint could not be reached.

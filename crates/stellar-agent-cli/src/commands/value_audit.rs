@@ -1,24 +1,26 @@
 //! Shared audit emission for value-moving CLI commands.
 //!
-//! Value verbs (pay, claim, create-account, trustline, trade) record a
-//! hash-chained, HMAC-signed `ValueActionSubmitted` row after the on-chain
-//! action confirms. Emission is NON-FATAL post-success: the transaction has
-//! already committed, so a row-write failure logs a `tracing::warn!` and never
-//! changes the command result or exit code.
+//! Value verbs (pay, claim, create-account, trustline, trade) write their
+//! hash-chained, HMAC-signed `ValueActionPending` row through the submission
+//! recorder before the send, and a confirmed submit writes no further value
+//! row. A row [`write_row_logged`] appends after the act it records is
+//! NON-FATAL: a row-write failure logs at `error` and never changes the
+//! command result or exit code.
 //!
 //! The legs carried in a row are the SAME `ValueEffects` the policy gate sized
 //! (single-derivation invariant); this module only serialises what the caller
 //! supplies and never derives value. Rows are written under the profile's audit
 //! chain-root HMAC key so `stellar-agent audit verify` covers them.
 //!
-//! # Pre-flight (fail-closed) vs. post-confirm (fail-open)
+//! # Pre-flight (fail-closed) vs. rows after the act (fail-open)
 //!
 //! [`require_value_audit_writer`] is the fail-closed pre-flight every
 //! value-moving signing verb calls BEFORE any signing key is touched or
 //! transaction submitted: it proves the audit writer is acquirable, refusing
-//! with `audit.chain_key_unavailable` if not. The verb then threads the
-//! returned writer to the post-confirm row, which it appends on a guard of
-//! that writer.
+//! with `audit.chain_key_unavailable` if not. A value verb then hands the
+//! returned writer to its submission recorder, which appends the pending row
+//! through it before the send. A row that records an act already done goes
+//! through [`write_row_logged`] on a guard of the writer.
 //!
 //! The reset ceremony acquires the keyed writer before locking the window
 //! store. Its recorder uses the strict append mapping through that writer.
@@ -52,10 +54,11 @@ use crate::common::profile_access::ProfileOrigin;
 /// signing verbs.
 ///
 /// Callers invoke this BEFORE any signing key is touched and BEFORE any
-/// transaction is submitted (see the module docs). A verb with a post-confirm
-/// row reuses the returned writer for it rather than re-acquiring it. A verb
-/// whose row is written strictly before a transmission discards the handle,
-/// and the strict write acquires again.
+/// transaction is submitted (see the module docs). A value verb hands the
+/// returned writer to its submission recorder, which writes the pending row
+/// through it rather than re-acquiring it. A verb whose row is written
+/// strictly before a transmission discards the handle, and the strict write
+/// acquires again.
 /// [`drain_consent_rows_before_signing`] discards it too: that acquisition
 /// exists for its drain.
 ///
@@ -226,14 +229,14 @@ pub(crate) fn audit_writer_open_failed(profile_name: &str) -> WalletError {
 ///   fails closed with `audit.chain_key_unavailable` when the writer cannot be
 ///   acquired. An operator who authored a profile file is expected to run
 ///   `stellar-agent profile rotate-audit-key <name>` before signing.
-/// - [`crate::common::profile_access::ProfileOrigin::Synthesized`] is the zero-config quickstart path — no
-///   profile file, no `rotate-audit-key` step to run. The writer is acquired
-///   opportunistically (a `tracing::warn!` on failure, no refusal), matching
-///   the pre-existing zero-config behavior. Returns `Ok(None)` when the writer
-///   could not be acquired; the caller then skips the post-confirm row rather
-///   than treating the operation as unaudited — there was no audit guarantee
-///   to defeat here, since the operator never persisted a profile in the
-///   first place. A recorded audit binding that differs from the profile's
+/// - [`crate::common::profile_access::ProfileOrigin::Synthesized`] is the zero-config quickstart path, with no
+///   profile file and no `rotate-audit-key` step to run. The writer is
+///   acquired opportunistically: a failure to acquire it logs a
+///   `tracing::warn!` and refuses nothing. Returns `Ok(None)` when the writer
+///   could not be acquired, and the caller then skips the pending row rather
+///   than treating the operation as unaudited. No audit guarantee is defeated
+///   here, since the operator never persisted a profile in the first place.
+///   A recorded audit binding that differs from the profile's
 ///   refuses: the binding check compares without recording, and its refusal
 ///   precedes any signing.
 ///
@@ -544,9 +547,9 @@ mod tests {
 
     /// With a real 32-byte chain-root key seeded (the post-`rotate-audit-key`
     /// state), `require_value_audit_writer` returns `Ok` with a writer that
-    /// writes through to the profile's audit log — the same acquisition
+    /// writes through to the profile's audit log. It is the same acquisition
     /// [`emit_value_audit_row_strict`] performs internally, exposed so the caller can
-    /// reuse it for the post-confirm emission.
+    /// hand it to the submission recorder for the pending row.
     #[test]
     #[serial]
     fn require_value_audit_writer_returns_writer_when_key_seeded() {

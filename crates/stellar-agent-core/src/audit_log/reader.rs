@@ -1595,9 +1595,10 @@ fn open_regular_file(path: &Path) -> Result<std::fs::File, AuditLogIntegrityErro
 
 /// What a `value_action_pending` row recorded for one submission.
 ///
-/// The reconciliation surfaces settle a submission whose confirmation never
-/// arrived, and the row they write has to carry the SAME value legs the gate
-/// sized. Those legs were written once, by the pending row, so they are read
+/// A pending row no submitted or failed row closes stays owed. A closing row
+/// written from it, such as the failed row of a pool attempt never
+/// transmitted, has to carry the SAME value legs the gate sized. Those legs
+/// were written once, by the pending row, so they are read
 /// back from it rather than re-derived.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]

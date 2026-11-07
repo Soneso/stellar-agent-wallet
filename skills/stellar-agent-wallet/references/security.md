@@ -372,8 +372,9 @@ request id, the event kind, and the previous entry's hash. Each entry is
 hash-chained to the one before it; each file carries a root-HMAC sidecar signed
 with the profile's audit key.
 
-The log records `value_action_submitted` on every
-confirmed value-moving submit (carrying the gate-sized value legs) and
+The log records `value_action_pending` before every
+value-moving submit that runs with an audit writer (carrying the gate-sized
+value legs) and
 `keyring_key_written` on each key-writing profile command. It records
 `x402_payment_authorized`, with a passed cross-check witness when the payment
 required one, before a signed x402 authorization leaves the wallet

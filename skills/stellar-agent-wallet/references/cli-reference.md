@@ -11,10 +11,14 @@ under the on-chain rules of the agent's key.
 
 ## Signing and approval coverage
 
-CLI payment and claim commands evaluate policy and refuse approval decisions
-with `policy.approval_required`, directing callers to MCP. Sponsored account
-creation, trustline, trade, and vault commands use the same refusal.
-These commands create no pending policy approval. Use their MCP tools for agent
+On testnet, CLI payment and claim commands evaluate policy and refuse approval
+decisions with `policy.approval_required`, directing callers to MCP. Sponsored
+account creation, trustline, trade, and vault commands use the same refusal.
+On testnet these commands create no pending policy approval. On mainnet, trade
+and vault commands refuse with `network.mainnet_write_forbidden`. Full-mode
+payment, claim, sponsored creation, and trustline commands insert a pending
+entry and ask for passkey confirmation in the local browser, for `Allow` and
+`RequireApproval` alike. Use their MCP tools for agent
 actions; DeFi tools also refuse policy approval decisions without a pending loop.
 
 Other CLI signing paths have these checks:
@@ -259,7 +263,7 @@ witness is required, with a native floor of 1000 XLM.
 
 The result includes `cross_check` with `passed`, `skipped`, or `not_required`.
 Table output prints its witness line. Friendbot results omit the field.
-Pending and submitted audit rows carry a passed witness.
+The pending audit row carries a passed witness.
 A sponsored confirmation timeout reports `error.details.envelope_hash` from the
 signed envelope, without returning the envelope. A failure before signing has
 no envelope hash.
@@ -429,8 +433,8 @@ signer. Its default fee comes from `classic_fee_per_op_stroops`, or 100 when
 unset. Cap refusals identify that profile default.
 Only an absent issuer produces `trustline.gate_refused`; other issuer read
 errors retain their own codes and scrubbed messages.
-The JSON result includes `cross_check`; pending and submitted rows carry a
-passed witness.
+The JSON result includes `cross_check`; the pending row carries a passed
+witness.
 Fee-cap and witness refusals carry `error.details.preview` after preview approval.
 
 | Flag | Meaning | Default |
@@ -752,10 +756,11 @@ read, and no nonce, pin, policy change, or audit row is written. A profile
 that sets `oracle_provider_url` without its `providers.oracle` record does not
 load, and the ceremony refuses it with `profile.enable_mainnet_precondition`
 and the loader's message.
-An enabled profile whose oracle is removed refuses every mainnet write, in the
-CLI and in the MCP server, with `profile.mainnet_oracle_required` before any
-signature, until the oracle is set again. The MCP server reads the profile at
-startup, so it applies an oracle change from its next start. Before the first nonce is written, a signed v2 policy
+An enabled profile whose oracle is removed refuses every CLI mainnet write
+with `profile.mainnet_oracle_required` before any signature, until the oracle
+is set again. A running MCP server checks the profile it loaded at startup,
+and its freshness check does not read the oracle fields. It refuses mainnet
+writes for a removed oracle from its next start. Before the first nonce is written, a signed v2 policy
 establishes the pin with its verified sequence, digest, and owner.
 Create and sign that policy before running the ceremony; it may omit `[mainnet]`.
 A v1 policy refuses with `profile.enable_mainnet_precondition` and
@@ -1315,21 +1320,21 @@ to finish it.
 
 ## tx
 
-Settles the submission records the value verbs write. Every value-moving verb records a transaction before it is sent, so a submission whose confirmation never arrived leaves a receipt and a spending-window reservation behind; both hold the operator's caps and the wallet's duplicate check until something settles them.
+Reconciles and clears the submission records the value verbs write. Every value-moving verb records a transaction before it is sent, so a submission whose confirmation never arrived leaves a receipt behind. It also leaves a spending-window reservation when the policy produced window entries for the submission. The reservation holds the operator's caps through its accounting horizon or, without a time bound, until an operator clears it. A pending receipt holds the wallet's duplicate check.
 
 ### `tx status <HASH> [flags]`
 
-Asks the endpoint what became of `<HASH>` and records the answer on the wallet's record of it. This is the way out of `submission.tx_timeout`.
+Asks the endpoint what became of `<HASH>` and records a reported success on the wallet's record of it. This is the way out of `submission.tx_timeout`.
 
 | Flag / arg | Meaning | Default |
 |---|---|---|
 | `<HASH>` (positional) | Transaction hash, 64 lowercase hex: `error.details.tx_hash` from the timed-out submission | none |
-| `--profile <NAME>` | Profile whose records and spending window are settled | `STELLAR_AGENT_PROFILE`, else `default` |
+| `--profile <NAME>` | Profile whose records and spending window are reconciled | `STELLAR_AGENT_PROFILE`, else `default` |
 | `--output <FORMAT>` | `json` or `table` | `json` |
 
-Returns `{tx_hash, chain_status, ledger, record, reservation}`, omitting absent fields. `record` is the wallet's receipt: `envelope_hash`, `status`, `failure_code`, `release_code`, `ledger`, `source_redacted`, `sequence`, `submitted`, `reservation_open`, `settlement_evidence` and `settlement_decision_id`. Receipt output includes `settlement_evidence: unavailable` and an optional `settlement_decision_id`; these display fields do not authenticate settlement. `reservation` is a hold that remains after reconciliation, `{envelope_hash, operator_required}`; `operator_required: true` marks a reservation whose receipt is missing beyond the endpoint's retention window, which only `tx receipt clear` resolves.
+Returns `{tx_hash, chain_status, ledger, record, reservation}`, omitting absent fields. `record` is the wallet's receipt: `envelope_hash`, `status`, `failure_code`, `release_code`, `ledger`, `source_redacted`, `sequence`, `submitted`, `reservation_open`, `settlement_evidence` and `settlement_decision_id`. Receipt output includes `settlement_evidence: unavailable` and an optional `settlement_decision_id`; these display fields do not authenticate settlement. `reservation` is a hold that remains after reconciliation, `{envelope_hash, operator_required}`; `operator_required: true` marks a reservation whose receipt is missing beyond the endpoint's retention window. A time-bounded one still ends at its accounting horizon. Once its execution bound has passed, `tx receipt clear --acknowledge` clears an eligible receipt, and the bounded spend stays charged through the horizon. An untimed hold clears with `--acknowledge --acknowledge-unbounded`.
 
-A reported failure or missing transaction does not release possible spending. Bounded uncertainty counts through the signed deadline and each affected spending window.
+A reported failure or missing transaction does not release possible spending. Bounded uncertainty counts through the later of the signed deadline and the first local success observation, plus each affected spending window.
 
 A reported success time does not backdate accounting. Untimed pending transactions remain reserved until an explicit acknowledgement clears their unbounded exposure.
 
@@ -1340,14 +1345,14 @@ No failure row follows from an endpoint's failure, absence, or time claim.
 The authenticated reservation controls the bound and chain; editing a receipt
 cannot shorten either. A checked independent witness supplies anchor provenance.
 
-Accounting audit delivery needs the audit writer's exclusive lock, so while a `stellar-agent-mcp` server holds that writer the verb refuses with `audit.writer_locked`. Stop the server, reconcile, start it again.
+Accounting audit delivery needs the audit writer's exclusive lock. While a `stellar-agent-mcp` server holds that writer, the verb still reconciles and reports. The event stays owed and the refusal is logged at WARN. Stop the server and run the verb again to deliver it.
 
 ### `tx receipt clear <ENVELOPE_HASH> --acknowledge [flags]`
 
 | Flag | Meaning |
 |---|---|
 | `--acknowledge` | Record the operator's decision and reconcile before clearing. Clearing establishes no chain outcome. |
-| `--acknowledge-unbounded` | Accept that this untimed transaction can still apply and that its spend is then not counted. Required beside `--acknowledge` on every network for an authenticated hold without a time bound, whatever its receipt records or the endpoint reports, and on mainnet for a sent `pending` or `ambiguous` receipt without one when no hold exists. Both acknowledgement flags are also required to finish a recorded unbounded clear. |
+| `--acknowledge-unbounded` | Accept that this untimed transaction can still apply and that its spend is then not counted. Required beside `--acknowledge` on every network for an authenticated hold without a time bound, whatever its receipt records or the endpoint reports. Also required on mainnet for a sent `pending`, `ambiguous` or `failed` receipt without one when no hold exists. Both acknowledgement flags are also required to finish a recorded unbounded clear. |
 
 Closes a submission record after reconciling it against the chain. `--acknowledge` records the operator's decision; clearing establishes no chain outcome. A reported failure or missing transaction does not release possible spending.
 
@@ -1355,15 +1360,15 @@ An authenticated hold without a time bound is cleared with `--acknowledge` and `
 
 For every other submission, a record recorded as `success`, `reorged` or `cleared_by_operator`, or as `failed` under a held reservation, is refused with `submission.not_clearable`. So is an endpoint answer of `SUCCESS`, an answer of `FAILED` for a held reservation, and an endpoint that cannot answer at all. With `--acknowledge`, a terminal receipt without a hold first acquires the audit writer to look for an interrupted clear; the acquisition can drain queued rows or return an audit error. Without a matching row a `success` or `reorged` receipt is refused without reconciliation, release or marking. A `failed` receipt without a hold proceeds to the endpoint check. A reservation with a time bound whose receipt is missing is cleared only when the endpoint reports `NOT_FOUND` below its retention floor. On a mainnet profile with an oracle, the oracle is asked as well and refuses the clear the same way, and so does an oracle that does not report the mainnet passphrase. Without an oracle nothing confirms the endpoint's `FAILED`, so it does not refuse the clear and the acknowledgement decides; the endpoint's `SUCCESS` still refuses.
 
-Without `--acknowledge` nothing is reconciled or written: the exit code is 1 with `submission.acknowledgement_required`, and the message names the next step. While a sent transaction's time bound is open that is to wait or run `tx status`; otherwise it is `--acknowledge`. An authenticated hold without a time bound also requires `--acknowledge-unbounded` on every network, and so does, on mainnet, a sent `pending` or `ambiguous` receipt without one when no hold exists, stating that the bytes can still apply and their spend stops counting against the window. With the required flags the verb reconciles the submission the way `tx status` does, then:
+Without `--acknowledge` nothing is reconciled or written: the exit code is 1 with `submission.acknowledgement_required`, and the message names the next step. An authenticated hold without a time bound requires `--acknowledge-unbounded` beside `--acknowledge` on every network, and so does, on mainnet, a sent `pending`, `ambiguous` or `failed` receipt without one when no hold exists. The flag states that the bytes can still apply and their spend stops counting against the window. Otherwise, while a sent `pending` receipt's time bound is open, the next step is to wait or run `tx status`. Every other record gets `--acknowledge`. With the required flags the verb reconciles the submission the way `tx status` does, then:
 
 - The reconciled outcome could not be recorded on its receipt: refused with `submission.record_unavailable`, naming the receipt-store error. Run `stellar-agent tx status` again.
-- The receipt disagrees with its reconciliation: refused with `submission.record_unavailable`. Run `stellar-agent tx status` again.
-- An accounting disposition (`release_code` set, and this run expires accounting or the spending window holds no reservation): the clear row records the acknowledgement. Neither observations nor accounting expiry establish a failed chain outcome. An audit write failure leaves the record clearable.
-- An authenticated hold without a time bound, whatever its receipt records, without `--acknowledge-unbounded`: refused with `submission.unbounded_exposure`. Both flags clear it, release the hold and record `unbounded_exposure: true`. On mainnet a sent `pending` or `ambiguous` receipt without a time bound and with no hold is refused the same way.
+- The receipt disagrees with its reconciliation or with the verified accounting decision: refused with `submission.record_unavailable`. Run `stellar-agent tx status` again.
+- An authenticated accounting expiry (the verified window state holds the expiry decision, and the receipt carries its projection): the clear row records that disposition. A `release_code` on the receipt alone is display data and no evidence. Neither observations nor accounting expiry establish a failed chain outcome. An audit write failure leaves the record clearable.
+- An authenticated hold without a time bound, whatever its receipt records, without `--acknowledge-unbounded`: refused with `submission.unbounded_exposure`. Both flags clear it, release the hold and record `unbounded_exposure: true`. On mainnet a sent `pending`, `ambiguous` or `failed` receipt without a time bound and with no hold is refused the same way.
 - `ambiguous` without evidence or with a `release_code` the spending window does not bear out, `pending` with a passed time bound, or `pending`, never sent and with no held reservation, each with the required acknowledgement flags: it clears the receipt. A bounded hold remains charged through its horizon, so the clear reports `reservation_released: false`.
-- `pending` or `ambiguous`, sent or held, with an open time bound on this host's clock: refused with `submission.still_pending`, naming the time bound.
-- During reconciliation, `SUCCESS` on a bounded hold prevents operator clear. `FAILED` retains exposure; clearing after the execution bound preserves its accounting horizon.
+- `pending` or `ambiguous`, sent or held, or a sent `failed` receipt with no held reservation, with an open time bound on this host's clock: refused with `submission.still_pending`, naming the time bound.
+- During reconciliation, `SUCCESS` on a bounded hold prevents operator clear, and `FAILED` retains exposure. A passed execution bound does not lift the refusal of an endpoint or oracle `FAILED` for a held reservation. An eligible clear after the bound preserves the accounting horizon.
 - A mainnet profile without an oracle: a `pending`, sent record whose time bound has not passed on this host's clock is refused with `submission.still_pending`; any other `pending` record is cleared with the required acknowledgement flags. Without an oracle, passing the deadline permits an acknowledged clear; it does not establish chain evidence.
 - A ledger-time read failed for a sent submission whose hold or receipt carries a time bound, or another reconciliation read of the endpoint or the oracle failed: refused with `network.rpc_unreachable`.
 - A reconciliation read of the oracle was still open at the verb's oracle deadline: refused with `network.rpc_unreachable`. Every oracle read of the verb ends by one deadline, the profile's `submit_timeout_seconds` counted from the oracle's identity read, so a stalled oracle cannot hold the audit writer past it. Reconciliation asks the oracle the verb already found serving mainnet and does not read its identity again, so an oracle identity failure refuses before the acknowledgement with `submission.not_clearable`, never during reconciliation.

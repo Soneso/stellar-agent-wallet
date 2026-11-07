@@ -439,10 +439,11 @@ read, and no nonce, pin, policy change, or audit row is written. A profile
 that sets `oracle_provider_url` without its `providers.oracle` record does not
 load, and the ceremony refuses it with `profile.enable_mainnet_precondition`
 and the loader's message.
-An enabled profile whose oracle is removed refuses every mainnet write, in the
-CLI and in the MCP server, with `profile.mainnet_oracle_required` before any
-signature, until the oracle is set again. The MCP server reads the profile at
-startup, so it applies an oracle change from its next start. A process on a headless keyring backend
+An enabled profile whose oracle is removed refuses every CLI mainnet write
+with `profile.mainnet_oracle_required` before any signature, until the oracle
+is set again. A running MCP server checks the profile it loaded at startup,
+and its freshness check does not read the oracle fields. It refuses mainnet
+writes for a removed oracle from its next start. A process on a headless keyring backend
 (`STELLAR_AGENT_KEYRING_BACKEND` set to `headless-env` or `headless-dpapi`)
 is refused in every mode with `network.mainnet_keyring_backend_unsupported`
 before any keyring entry is read: mainnet needs the platform keyring.

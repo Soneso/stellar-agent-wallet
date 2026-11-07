@@ -4,30 +4,38 @@
 //! This is how an agent resolves `submission.tx_timeout`. The submission was
 //! recorded before it was sent, so the wallet holds a receipt and, under a
 //! policy with a stateful criterion, a spending-window reservation for it;
-//! asking the chain what happened records its answer on both. Re-simulating or
-//! resubmitting the same intent never resolves it: the transaction may still
-//! apply, and the sequence it consumes may already be spent by it.
+//! asking the chain what happened records a reported success on both.
+//! Re-simulating or resubmitting the same intent never resolves it: the
+//! transaction may still apply, and the sequence it consumes may already be
+//! spent by it.
 //!
 //! The tool reconciles a submission by its receipt, or by its reservation when
 //! the receipt is missing, the way `stellar-agent tx status` does. A reported
 //! failure or missing transaction does not release possible spending, and a
 //! reported success writes no submitted row. A reservation ends once its
-//! accounting horizon has passed, with `record.release_code`
-//! `submission.accounting_expired` and the outcome unknown. That expiry owes
+//! accounting horizon has passed, with the outcome unknown. A pending or
+//! ambiguous `record` then carries `release_code`
+//! `submission.accounting_expired`, and a record with another status keeps its
+//! status and code. That expiry owes
 //! one `submission_accounting_expired` audit event, which the call delivers
 //! from the verified window state. The receipt is display data: `record`
 //! carries `settlement_evidence: "unavailable"`, and no receipt status writes
-//! an audit row. A hold that
-//! remains is reported as `reservation`; one marked `operator_required` is
-//! resolved by the operator's `stellar-agent tx receipt clear`. No step sends
-//! the transaction again.
+//! an audit row. A hold that remains is reported as `reservation`. One marked
+//! `operator_required` ends at its accounting horizon when it has a time
+//! bound. Once its execution bound has passed, the operator's
+//! `stellar-agent tx receipt clear --acknowledge` clears an eligible receipt,
+//! and the bounded spend stays charged through the horizon. An untimed hold
+//! clears with `--acknowledge --acknowledge-unbounded`. No step sends the
+//! transaction again.
 //!
 //! # Why a read tool is not read-only
 //!
-//! The lookup changes wallet state: it records the endpoint's report on the
+//! The lookup changes wallet state: it records a reported success on the
 //! receipt and the reservation, and ends a reservation whose accounting
-//! horizon has passed. Both annotations say so, because the pairing is legal
-//! but unusual: `read_only_hint = false` because state changes, and
+//! horizon has passed. A reported failure leaves both as they were. An untimed
+//! reservation's receipt that already records another network answer keeps
+//! it. Both annotations say so, because the pairing is legal but unusual:
+//! `read_only_hint = false` because state changes, and
 //! `ToolValueKind::ReadOnly` because no value moves as a result of the call.
 
 use rmcp::{
@@ -74,16 +82,21 @@ impl WalletServer {
         description = "Reconcile one submitted transaction against the chain and update the \
                        wallet's record of it. Pass the tx_hash from a submission.tx_timeout \
                        response. Endpoint success, failure, and absence are reports. Possible \
-                       spending remains charged through the signed deadline and every affected \
-                       window; untimed exposure requires explicit operator acknowledgement. \
-                       Accounting expiry leaves the outcome unknown and records \
-                       submission.accounting_expired in record.release_code without a failed \
+                       spending remains charged through the later of the signed deadline and \
+                       the first success observation, plus every affected window; untimed \
+                       exposure requires explicit operator acknowledgement. \
+                       Accounting expiry leaves the outcome unknown, records \
+                       submission.accounting_expired in record.release_code of a pending or \
+                       ambiguous record, keeps any other status and code, and writes no failed \
                        value-action row. record is display data: settlement_evidence is \
                        unavailable, and settlement_decision_id only locates an accounting \
                        decision. A hold that remains is returned as \
-                       reservation {envelope_hash, operator_required}; operator_required means \
-                       only the operator's tx receipt clear resolves it. This is the only way to \
-                       resolve a timed-out submission: never re-simulate or resubmit, because \
+                       reservation {envelope_hash, operator_required}; operator_required means no \
+                       endpoint answer resolves it. A time-bounded hold still ends at its \
+                       accounting horizon; otherwise only the operator's tx receipt clear \
+                       resolves it, with --acknowledge-unbounded as well for an untimed hold. \
+                       This is the only way to resolve a timed-out submission: never \
+                       re-simulate or resubmit, because \
                        the transaction may still apply and its sequence may already be spent. \
                        read_only_hint=false (the wallet's record changes); the call moves no \
                        value. destructive_hint=false.",
@@ -145,10 +158,10 @@ impl WalletServer {
             .map(|r| r.envelope_hash.clone())
             .or_else(|| held.as_ref().map(|r| r.id.clone()));
 
-        // The reconciliation pass settles this submission's reservation and
+        // The reconciliation pass reconciles this submission's reservation and
         // its receipt together, with no budget: the agent asked about this
         // transaction by name. A submission whose receipt is missing is
-        // settled by its authenticated reservation.
+        // reconciled from its authenticated reservation.
         if let Some(envelope_hash) = &envelope_hash {
             let Ok(now_ms) = stellar_agent_core::timefmt::now_unix_ms() else {
                 return Ok(business_error_result(
@@ -157,7 +170,7 @@ impl WalletServer {
                 ));
             };
             // On a mainnet profile the oracle witnesses the primary's negative
-            // answers before the reservation settles on them.
+            // answers. No negative answer releases the reservation.
             let oracle = self.settlement_oracle();
             match window
                 .reconcile_one(

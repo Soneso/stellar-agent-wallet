@@ -1,10 +1,11 @@
 //! What the submit layer records, and when, against a mocked Stellar RPC
 //! endpoint.
 //!
-//! The record is written before the transaction is sent and settled against
-//! what the network answered. These tests pin the order of the two checks that
-//! write it, the outcome each exit reports, and what each outcome leaves
-//! behind.
+//! The record is written before the transaction is sent. The submit layer
+//! reports outcomes through the recorder's outcome callback, and a failure to
+//! write the record returns before any callback. These tests pin the order of
+//! the two checks that write it, which outcome, if any, each exit reports, and
+//! what each outcome leaves behind.
 
 #![allow(
     clippy::unwrap_used,
@@ -581,7 +582,7 @@ async fn a_timeout_reports_the_local_hash_and_leaves_the_record_standing() {
     assert!(receipt.submitted, "the bytes were sent");
     assert!(
         fx.reservation_is_open(&hash),
-        "the reservation stands until reconciliation or an operator settles it"
+        "the reservation stands through its accounting horizon or until an operator clear"
     );
 }
 
@@ -1103,8 +1104,8 @@ async fn a_muxed_source_reaches_the_send() {
 /// An unexpected `getTransaction` status after the send reports the timeout
 /// shape, so the agent gets the hash it needs to reconcile.
 ///
-/// The record is settled as an unknown outcome either way; what this pins is
-/// that the caller is told which transaction to ask about.
+/// The outcome is reported as unknown either way; what this pins is that the
+/// caller is told which transaction to ask about.
 #[tokio::test]
 #[serial]
 async fn an_unexpected_poll_status_reports_the_timeout_shape() {
@@ -1158,7 +1159,7 @@ async fn an_unexpected_poll_status_reports_the_timeout_shape() {
             calls.last(),
             Some(Call::Outcome(SubmissionOutcome::TransportAfterSend { .. }))
         ),
-        "the record is settled as an unknown outcome; got {calls:?}"
+        "the outcome is reported as unknown; got {calls:?}"
     );
 
     let envelope_hash = stellar_agent_network::envelope_hash_hex(envelope.envelope_xdr());
@@ -2077,9 +2078,9 @@ async fn a_reservation_the_window_cannot_admit_is_refused_as_a_policy_denial() {
 /// The receipt gate admits the resend because the receipt is gone, but the
 /// window file still holds the original's reservation under the same envelope
 /// hash. The resend is refused with the transaction to reconcile, before its
-/// pending row: the original's pending row stays owed, so the settled row its
-/// own reconciliation writes is the one that closes it. The cap is far above
-/// both amounts, so admission does not decide this.
+/// pending row: the refused resend writes no row, and the original's pending
+/// row stays owed. The cap is far above both amounts, so admission does not
+/// decide this.
 #[tokio::test]
 #[serial]
 async fn a_resend_after_a_lost_receipt_is_refused_before_the_send() {

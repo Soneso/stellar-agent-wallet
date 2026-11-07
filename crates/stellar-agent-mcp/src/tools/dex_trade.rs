@@ -421,17 +421,18 @@ impl WalletServer {
         // classic commit verbs use, and its confirmed submit advances the
         // same floor.
         ctx.sequence_floor = Some(&sequence_floor_hook);
-        // Thread the pre-flight-acquired audit writer + gate-derived leg so the
-        // adapter emits the ValueActionSubmitted row after a confirmed submit
-        // (non-fatal past this point — the pre-flight above is what fails
-        // closed).
+        // Thread the pre-flight-acquired audit writer + gate-derived leg into
+        // the adapter context. The attached submission recorder owns the
+        // submission's audit rows, so a confirmed submit writes no
+        // ValueActionSubmitted row; the pre-flight above is what fails closed.
         ctx.audit_writer = Some(std::sync::Arc::clone(&audit_writer));
         ctx.audit_legs = Some(&audit_legs);
         ctx.audit_tool = Some("stellar_dex_trade");
 
         // Record the submission before the bytes leave: the receipt, the
         // pending audit row and the spending-window reservation. The recorder
-        // settles all three against what the network answers, and owns the
+        // records a reported success on the receipt and in the reservation,
+        // leaves all three standing on every other answer, and owns the
         // confirmed row the adapter would otherwise emit.
         let now_ms = match stellar_agent_core::timefmt::now_unix_ms() {
             Ok(v) => v,

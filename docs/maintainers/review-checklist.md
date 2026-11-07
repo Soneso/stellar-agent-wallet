@@ -22,9 +22,9 @@ the review approves with no blocking findings.
 - Fail closed. A check that runs before signing or submission refuses on error
   rather than proceeds. The behaviors that deliberately differ are documented:
   the audit chain-key pre-flight on the synthesized zero-config profile in
-  [SECURITY.md](../../SECURITY.md#security-model-summary) and the
-  post-confirmation audit append in
-  [concepts](../concepts.md#fail-closed-on-an-unminted-audit-key). A change adds
+  [SECURITY.md](../../SECURITY.md#security-model-summary) and the audit rows
+  written after the chain action in
+  [concepts](../concepts.md#the-hash-chained-audit-log). A change adds
   no new one without a security review.
 - No secrets or mainnet keys are committed.
 - A credential or authorization returned without local submission is treated as
@@ -75,14 +75,16 @@ the review approves with no blocking findings.
   construction and re-check `is_definitive_send_refusal` in
   `crates/stellar-agent-network/src/submit.rs`. The classifier depends on the
   client's `No status yet:` wording to distinguish an unknown transport outcome
-  from a definitive endpoint refusal; that distinction controls reservation
-  retention and sequence release.
+  from a definitive endpoint refusal; that distinction controls the code the
+  caller receives.
 - Run both real-client tests in
   `crates/stellar-agent-network/tests/network/submission_record_integration.rs`:
   `a_transport_failure_after_the_record_returns_the_timeout_shape` and
-  `a_refused_send_releases_the_reservation_and_frees_the_sequence`. Confirm that
-  transport failures retain the submission for reconciliation and definitive
-  refusals release the reservation and sequence.
+  `a_refused_send_retains_the_reservation_and_sequence`. Confirm that transport
+  failures return the timeout shape and definitive refusals return the
+  endpoint's code. Both retain the receipt, the reservation, and the
+  sequence. A bounded reservation stays charged through its accounting
+  horizon, and an operator clear releases only an untimed one.
 
 ### 6. Public API and dead code
 

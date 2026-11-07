@@ -702,11 +702,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reservation standing.
 - `PersistedWindowStore::reconcile_due` and `reconcile_one` take the oracle
   client after the primary client. On a mainnet profile the primary's `FAILED`
-  and `NOT_FOUND` settle on the answers of an oracle that reports the mainnet
-  passphrase, checked once per pass with one `getNetwork` request that is not
-  retried, and a pass may spend four reads per reservation and one for the
-  oracle's identity. `reconcile_one_within` settles one submission on an
-  oracle the caller already checked, a `MainnetOracle`, and ends every read of
+  and `NOT_FOUND` are checked against the answers of an oracle that reports
+  the mainnet passphrase. The oracle's identity is checked once per pass with
+  one `getNetwork` request that is not retried, and a pass may spend four reads
+  per reservation and one for the oracle's identity. `reconcile_one_within` reconciles one submission
+  against an oracle the caller already checked, a `MainnetOracle`, and ends every read of
   that oracle by the caller's deadline. `ReconcileFailure` gains
   `kind`, a `ReconcileFailureKind` (`Unreachable`, `OracleNotConfigured`,
   `OracleNetworkMismatch`, `OracleProtocolUnsupported` or
@@ -907,8 +907,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Clearing an untimed transaction needs both acknowledgement flags on every
   network and releases its hold whatever the endpoint reported.
 
-- A reported success writes no submitted audit row; the pending record stays
-  until authenticated evidence settles it.
+- A reported success writes no submitted audit row; the pending row stays
+  open, and the reservation counts through its accounting horizon.
 
 - The receipt of an untimed hold that records a network answer keeps it
   through reconciliation. The clear row's `evidence` records an endpoint

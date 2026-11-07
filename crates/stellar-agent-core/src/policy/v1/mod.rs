@@ -1449,7 +1449,7 @@ impl PolicyEngineV1 {
     /// single-derivation invariant).
     ///
     /// `value` MUST be the SAME [`value::ValueClass`] the original gate
-    /// evaluated (the `value_action_submitted` audit row's `ValueEffects`
+    /// evaluated (the `value_action_pending` audit row's `ValueEffects`
     /// wrapped back into a `ValueClass::Value`, or `ValueClass::ReadOnly` for
     /// a call that carries no resolved value effects) — never re-derived.
     ///

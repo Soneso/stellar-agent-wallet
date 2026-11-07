@@ -3,9 +3,13 @@
 //!
 //! `--acknowledge` records the operator's decision; clearing establishes no
 //! chain outcome. The verb asks the endpoint first and reconciles before it
-//! decides: a bounded transaction the chain has answered for is settled by
-//! reconciliation, not by an operator; one that can still apply is refused;
-//! and an endpoint that cannot answer is not a licence to clear either. A
+//! decides. A reported success for a bounded transaction is not the
+//! operator's to clear. A reported failure is not either, except for a
+//! submission without a held reservation or on a mainnet profile without an
+//! oracle. A bounded hold or submitted receipt waits for its time bound. An
+//! unsent receipt without a hold can clear earlier. One that can still apply
+//! is refused. An endpoint that cannot answer is not a license to
+//! clear either. A
 //! reported failure or missing transaction does not release possible
 //! spending. An authenticated hold without a time bound is cleared only with
 //! `--acknowledge-unbounded` as well, whatever the endpoint reports. No path

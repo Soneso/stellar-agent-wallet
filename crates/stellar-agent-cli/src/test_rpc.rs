@@ -439,7 +439,7 @@ impl Drop for EnvSigner {
 ///
 /// The audit log lives in `audit_dir`, and the profile's audit chain-root key
 /// is minted in the mock keyring [`zero_config`] installed, so a stage
-/// acquires its audit writer and records its pending and submitted rows. The
+/// acquires its audit writer and records its pending rows. The
 /// audit writer registry is process-wide and keyed by profile name, so each
 /// test names its own profile.
 pub(crate) fn witness_profile(
@@ -486,7 +486,7 @@ pub(crate) fn audit_rows(profile: &Profile, kind: &str) -> Vec<Value> {
 
 /// Asserts that the pending row carries the witness of `oracle` at the
 /// fixture ledger, and that the reported success wrote no submitted row: the
-/// pending row stays owed until authenticated evidence settles it.
+/// pending row stays open.
 pub(crate) fn assert_pending_row_carries_witness(profile: &Profile, oracle: &str) {
     let pending = audit_rows(profile, "value_action_pending");
     let submitted = audit_rows(profile, "value_action_submitted");
