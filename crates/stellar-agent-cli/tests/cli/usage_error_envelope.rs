@@ -243,3 +243,41 @@ fn profile_migration_refusal_omits_the_requested_name() {
     assert!(!String::from_utf8_lossy(&output.stdout).contains("CREDMARKER7"));
     assert!(!String::from_utf8_lossy(&output.stderr).contains("CREDMARKER7"));
 }
+
+#[test]
+fn a_seed_as_expect_rule_signer_is_not_echoed() {
+    use stellar_agent_test_support::rejected_value::seed_marker;
+
+    let seed = seed_marker();
+    assert_eq!(seed.len(), 56, "the marker is a 56-character S-strkey");
+    assert!(seed.starts_with('S'), "the marker is an S-strkey seed");
+    let output = run(&[
+        "smart-account",
+        "execute",
+        "--account",
+        "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+        "--contract",
+        "CBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB4RJU",
+        "--function",
+        "transfer",
+        "--auth-rule-id",
+        "1",
+        "--rule-signer-ed25519-secret-env",
+        "__EXEC_TEST_RULE_SIGNER",
+        "--signer-secret-env",
+        "__EXEC_TEST_FEE_PAYER",
+        "--expect-rule-signer",
+        &seed,
+    ]);
+    let message = assert_usage_error(&output);
+    assert_eq!(
+        message,
+        "the argument value is not valid: --expect-rule-signer; run the command with --help for the accepted arguments"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let envelope: Value = serde_json::from_slice(&output.stdout).expect("JSON envelope");
+    assert!(!stdout.contains(&seed), "{stdout}");
+    assert!(!stderr.contains(&seed), "{stderr}");
+    assert!(!envelope.to_string().contains(&seed), "{envelope}");
+}
