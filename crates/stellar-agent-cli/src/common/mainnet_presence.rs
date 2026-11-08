@@ -87,7 +87,7 @@ pub(crate) async fn acquire_mainnet_presence(
 pub(crate) const TEST_NO_BROWSER_ENV: &str = "STELLAR_AGENT_TEST_PRESENCE_NO_BROWSER";
 
 /// Whether a local browser can take the ceremony: a graphical session, and
-/// in a `test-helpers` build no [`TEST_NO_BROWSER_ENV`].
+/// in a `test-helpers` build no `TEST_NO_BROWSER_ENV`.
 fn browser_available() -> bool {
     #[cfg(feature = "test-helpers")]
     if std::env::var_os(TEST_NO_BROWSER_ENV).is_some() {

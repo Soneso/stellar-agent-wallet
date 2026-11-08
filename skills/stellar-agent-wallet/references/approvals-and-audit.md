@@ -639,16 +639,20 @@ the audit writer. Eight outcomes:
 | No anchor, file has entries, chain verifies, none of that evidence | Adopts the current tip and records `audit_tip_anchored { reason: adopted }` |
 | No anchor, file empty, no chain-root sidecar | Proceeds; no anchor and no row until the first append |
 
-The ahead-of-anchor case is ordinary, not an exception. Writers opened without
-the audit key append without moving the anchor: the CLI startup advisory, and
-the zero-config and read-only smart-account paths of a profile whose audit key
-is not minted. Adoption records the active tip on the first keyed use of a
-log that only unkeyed writers write. Keyed use also requires the whole retained
-history to verify. An archive without a root tag needs an operator history
-check and `profile rotate-audit-key` to re-sign it. A log with keyed history first needs
-`stellar-agent audit bind-carriers --profile <NAME>` with every wallet process
-stopped. An adoption writes its row only for a non-empty
-file.
+Writers opened without the audit key append without moving the anchor. The
+zero-config and read-only smart-account paths use them when the profile's audit
+key does not load and the log shows no keying. An unkeyed open of a log that
+shows keying refuses with `audit.chain_key_unavailable`. The CLI startup
+advisory scans without a writer and acquires the profile's keyed writer only for
+a finding. Its unkeyed fallback applies only to a persisted profile whose audit
+key does not load and whose log shows no keying. The ahead-of-anchor case is the
+ordinary one for appends without an anchor. Adoption records the active tip on
+the first keyed use of a log that only unkeyed writers write. Keyed use also
+requires the whole retained history to verify. An archive without a root tag
+needs an operator history check and `profile rotate-audit-key` to re-sign it. A
+log with keyed history first needs `stellar-agent audit bind-carriers --profile
+<NAME>` with every wallet process stopped. An adoption writes its row only for a
+non-empty file.
 
 The anchor names a PATH, not a profile, so a changed `audit_log_path` or audit
 key has an anchor coordinate of its own. The audit binding guards that change.

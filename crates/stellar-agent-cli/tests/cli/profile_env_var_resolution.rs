@@ -24,12 +24,12 @@
 //! - `profile init` writes `<profiles>/<name>.toml`, so the created path is
 //!   the observation.
 //! - The startup advisory (pre-dispatch, in `main.rs`) resolves an audit-log
-//!   path per profile; an unreadable log at that path makes it name the path
-//!   in a `warn!` on stderr.
+//!   path per profile. A malformed row on a distinct line in each log
+//!   identifies the scanned profile through the scan warning.
 //! - `pay`, `claim`, and `accounts create` receive one unreachable
 //!   `--rpc-url` in every run, so the endpoint does not discriminate the
 //!   profile for them. They are pinned on the per-profile
-//!   audit-log path the startup advisory opens. That is the advisory's
+//!   audit-log contents the startup advisory scans. That is the advisory's
 //!   resolution of the verb's own parsed `--profile` value
 //!   (`main.rs`'s `profile_flag`), not the verb's own load, so it observes
 //!   the same clap field and the same resolver one step earlier. The verb's
@@ -479,40 +479,50 @@ fn profile_init_profile_flag_beats_the_environment_variable() {
 // Startup advisory (main.rs, pre-dispatch)
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Writes an audit log the advisory cannot open, so its skip-`warn!` names the
-/// path — and therefore the profile the advisory resolved.
-///
-/// The advisory short-circuits on an absent or empty file, so the fixture must
-/// exist and be non-empty; its content is not a valid hash-chained log, which
-/// is what makes the open fail loudly instead of silently succeeding.
-fn write_unreadable_audit_log(home: &Path, profile: &str) {
+/// Each profile's malformed row occupies a different physical line, so the
+/// scan error identifies the selected log without requiring a writer open.
+fn audit_parse_error_for(profile: &str) -> String {
+    format!("audit.parse_error: line {}:", audit_fixture_line(profile))
+}
+
+fn audit_fixture_line(profile: &str) -> usize {
+    match profile {
+        ENV_PROFILE => 2,
+        FLAG_PROFILE => 3,
+        "default" => 4,
+        _ => panic!("no audit fixture line for {profile}"),
+    }
+}
+
+/// Writes a non-empty, malformed log whose scan error identifies its profile.
+fn write_malformed_audit_log(home: &Path, profile: &str) {
     let dir = home.join("audit");
     std::fs::create_dir_all(&dir).expect("audit dir");
-    std::fs::write(
-        dir.join(format!("{profile}.jsonl")),
-        b"not-a-hash-chained-audit-row\n",
-    )
-    .expect("audit fixture");
+    let content = format!(
+        "{}not-a-hash-chained-audit-row\n",
+        "\n".repeat(audit_fixture_line(profile) - 1),
+    );
+    std::fs::write(dir.join(format!("{profile}.jsonl")), content).expect("audit fixture");
 }
 
 #[test]
 fn startup_advisory_scans_the_audit_log_of_the_environment_variable_profile() {
     let home = tempfile::tempdir().expect("temp home");
     write_profile(home.path(), ENV_PROFILE, ENV_PROFILE_RPC, None);
-    write_unreadable_audit_log(home.path(), ENV_PROFILE);
-    write_unreadable_audit_log(home.path(), "default");
+    write_malformed_audit_log(home.path(), ENV_PROFILE);
+    write_malformed_audit_log(home.path(), "default");
 
     // `counterparty list` resolves the variable, so the advisory must too.
     let run = run_cli(home.path(), Some(ENV_PROFILE), &["counterparty", "list"]);
 
     assert!(
-        run.stderr.contains(&format!("{ENV_PROFILE}.jsonl")),
+        run.stderr.contains(&audit_parse_error_for(ENV_PROFILE)),
         "the advisory must scan the audit log of the profile the variable names; \
          stderr={}",
         run.stderr
     );
     assert!(
-        !run.stderr.contains("default.jsonl"),
+        !run.stderr.contains(&audit_parse_error_for("default")),
         "the advisory must not fall back to `default` when the variable names a \
          profile; stderr={}",
         run.stderr
@@ -523,8 +533,8 @@ fn startup_advisory_scans_the_audit_log_of_the_environment_variable_profile() {
 fn startup_advisory_profile_flag_beats_the_environment_variable() {
     let home = tempfile::tempdir().expect("temp home");
     write_profile(home.path(), FLAG_PROFILE, FLAG_PROFILE_RPC, None);
-    write_unreadable_audit_log(home.path(), FLAG_PROFILE);
-    write_unreadable_audit_log(home.path(), ENV_PROFILE);
+    write_malformed_audit_log(home.path(), FLAG_PROFILE);
+    write_malformed_audit_log(home.path(), ENV_PROFILE);
 
     let run = run_cli(
         home.path(),
@@ -533,12 +543,12 @@ fn startup_advisory_profile_flag_beats_the_environment_variable() {
     );
 
     assert!(
-        run.stderr.contains(&format!("{FLAG_PROFILE}.jsonl")),
+        run.stderr.contains(&audit_parse_error_for(FLAG_PROFILE)),
         "`--profile` must select the advisory's audit log; stderr={}",
         run.stderr
     );
     assert!(
-        !run.stderr.contains(&format!("{ENV_PROFILE}.jsonl")),
+        !run.stderr.contains(&audit_parse_error_for(ENV_PROFILE)),
         "the variable must not select the advisory's audit log when the flag names a \
          profile; stderr={}",
         run.stderr
@@ -546,23 +556,20 @@ fn startup_advisory_profile_flag_beats_the_environment_variable() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// pay / claim / accounts create — the audit-log path is the observation
+// pay / claim / accounts create: the scan error identifies the profile
 // ─────────────────────────────────────────────────────────────────────────────
 //
 // Every run of these three receives the same unreachable `--rpc-url`, so the
 // endpoint discriminator used above does not apply to them.
-// Their audit surface is keyed on the resolved profile name
-// (`commands/value_audit.rs`), and the startup advisory opens that same
-// per-profile audit-log path by running the verb's own parsed `--profile`
-// value through the same resolver (`main.rs`'s `profile_flag`) — so an
-// unreadable log at `<name>.jsonl` names the profile that field resolves to.
-// What this pins is the clap field plus the resolver; the verb's own load of
-// that name is pinned on its refusal in `profile_provenance_refusal.rs`.
+// The startup advisory scans each verb's profile log by passing its parsed
+// profile flag through the shared resolver. Distinct malformed-row positions
+// identify which profile supplies that scan. The verb's own load is pinned
+// on its refusal in `profile_provenance_refusal.rs`.
 
 /// The argument vector for each moved verb, minus any profile selector.
 ///
 /// Every one is refused or fails on the endpoint long after the advisory has
-/// run; the advisory's `warn!` is the observation, not the exit code.
+/// run; the advisory's scan error identifies the selected profile.
 const MOVED_VERB_ARGS: &[(&str, &[&str])] = &[
     (
         "pay",
@@ -626,19 +633,19 @@ fn the_moved_verbs_audit_under_the_profile_named_by_the_environment_variable() {
         let home = tempfile::tempdir().expect("temp home");
         write_profile(home.path(), ENV_PROFILE, ENV_PROFILE_RPC, None);
         write_profile(home.path(), "default", DEFAULT_PROFILE_RPC, None);
-        write_unreadable_audit_log(home.path(), ENV_PROFILE);
-        write_unreadable_audit_log(home.path(), "default");
+        write_malformed_audit_log(home.path(), ENV_PROFILE);
+        write_malformed_audit_log(home.path(), "default");
 
         let run = run_cli(home.path(), Some(ENV_PROFILE), argv);
 
         assert_reached_only_the_unreachable_endpoint(&run, verb);
         assert!(
-            run.stderr.contains(&format!("{ENV_PROFILE}.jsonl")),
+            run.stderr.contains(&audit_parse_error_for(ENV_PROFILE)),
             "`{verb}` must audit under the profile the variable names; stderr={}",
             run.stderr
         );
         assert!(
-            !run.stderr.contains("default.jsonl"),
+            !run.stderr.contains(&audit_parse_error_for("default")),
             "`{verb}` must not fall back to `default` when the variable names a \
              profile; stderr={}",
             run.stderr
@@ -652,8 +659,8 @@ fn the_moved_verbs_let_the_profile_flag_beat_the_environment_variable() {
         let home = tempfile::tempdir().expect("temp home");
         write_profile(home.path(), ENV_PROFILE, ENV_PROFILE_RPC, None);
         write_profile(home.path(), FLAG_PROFILE, FLAG_PROFILE_RPC, None);
-        write_unreadable_audit_log(home.path(), ENV_PROFILE);
-        write_unreadable_audit_log(home.path(), FLAG_PROFILE);
+        write_malformed_audit_log(home.path(), ENV_PROFILE);
+        write_malformed_audit_log(home.path(), FLAG_PROFILE);
 
         let mut args = argv.to_vec();
         args.extend_from_slice(&["--profile", FLAG_PROFILE]);
@@ -661,12 +668,12 @@ fn the_moved_verbs_let_the_profile_flag_beat_the_environment_variable() {
 
         assert_reached_only_the_unreachable_endpoint(&run, verb);
         assert!(
-            run.stderr.contains(&format!("{FLAG_PROFILE}.jsonl")),
+            run.stderr.contains(&audit_parse_error_for(FLAG_PROFILE)),
             "`{verb}`: `--profile` must win over the variable; stderr={}",
             run.stderr
         );
         assert!(
-            !run.stderr.contains(&format!("{ENV_PROFILE}.jsonl")),
+            !run.stderr.contains(&audit_parse_error_for(ENV_PROFILE)),
             "`{verb}`: the variable's profile must not be audited when the flag names \
              one; stderr={}",
             run.stderr

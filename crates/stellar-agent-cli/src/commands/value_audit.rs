@@ -41,7 +41,8 @@
 use std::sync::{Arc, Mutex};
 
 use stellar_agent_core::audit_log::{
-    AuditEntry, AuditWriter, AuditWriterRegistry, BindingCheck, WriterError, audit_writer_refusal,
+    AuditEntry, AuditWriter, AuditWriterRegistry, BindingCheck, KeyedAuditAccess, WriterError,
+    audit_writer_refusal,
 };
 use stellar_agent_core::error::{ValidationError, WalletError};
 use stellar_agent_core::profile::schema::Profile;
@@ -150,6 +151,58 @@ impl KeyedAcquireError {
     }
 }
 
+/// A local writer open failure, without a command refusal or logging policy.
+#[derive(Debug)]
+pub(crate) enum AuditWriterOpenError {
+    /// The keyring access or profile binding check fails.
+    Access(WalletError),
+    /// The log cannot be opened with the selected access.
+    Writer(WriterError),
+}
+
+impl std::fmt::Display for AuditWriterOpenError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Access(error) => error.fmt(f),
+            Self::Writer(error) => error.fmt(f),
+        }
+    }
+}
+
+/// Loads the key, checks the binding, and attaches the profile's anchor store.
+/// Callers own logging and decide whether the writer is cached.
+fn load_keyed_audit_access(
+    profile: &Profile,
+    profile_name: &str,
+    binding: BindingCheck,
+) -> Result<KeyedAuditAccess, WalletError> {
+    keyed_audit_access(profile, profile_name, binding)
+}
+
+/// Opens a local writer whose drop releases the sidecar lock.
+///
+/// A loaded key supplies the profile's anchor store and drains its outbox.
+/// An unavailable key permits an unkeyed open only if the log shows no keying.
+/// Binding refusals propagate. This function neither registers nor logs.
+///
+/// # Errors
+///
+/// Returns the binding refusal or the typed writer failure.
+pub(crate) fn open_best_effort_audit_writer(
+    profile: &Profile,
+    profile_name: &str,
+    origin: ProfileOrigin,
+) -> Result<AuditWriter, AuditWriterOpenError> {
+    let access = match load_keyed_audit_access(profile, profile_name, origin.binding_check()) {
+        Ok(access) => Some(access),
+        Err(error) if is_binding_refusal(&error) => {
+            return Err(AuditWriterOpenError::Access(error));
+        }
+        Err(_) => None,
+    };
+    AuditWriter::open(profile.audit_log_path.clone(), access).map_err(AuditWriterOpenError::Writer)
+}
+
 /// Acquires the keyed writer with the caller's binding policy and keeps
 /// failures typed. Persisted profiles use [`BindingCheck::Enforce`];
 /// synthesized profiles use [`BindingCheck::CheckOnly`].
@@ -164,7 +217,7 @@ pub(crate) fn acquire_keyed_audit_writer(
     profile_name: &str,
     binding: BindingCheck,
 ) -> Result<Arc<Mutex<AuditWriter>>, KeyedAcquireError> {
-    let access = keyed_audit_access(profile, profile_name, binding).map_err(|e| {
+    let access = load_keyed_audit_access(profile, profile_name, binding).map_err(|e| {
         // A binding refusal keeps its own code and remedy.
         if is_binding_refusal(&e) {
             tracing::warn!(
@@ -326,7 +379,7 @@ fn try_keyed_value_audit_writer(
     profile_name: &str,
     origin: ProfileOrigin,
 ) -> Result<Option<Arc<Mutex<AuditWriter>>>, WalletError> {
-    let access = match keyed_audit_access(profile, profile_name, origin.binding_check()) {
+    let access = match load_keyed_audit_access(profile, profile_name, origin.binding_check()) {
         Ok(access) => access,
         Err(e) if is_binding_refusal(&e) => return Err(e),
         Err(e) => {
