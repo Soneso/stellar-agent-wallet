@@ -7285,6 +7285,75 @@ impl AuditWriterRegistry {
         Ok((handle, facts.ok_or(WriterError::TipAnchorUnavailable)?))
     }
 
+    /// Drains the audit outbox of every keyed writer this process already
+    /// holds, and returns the number of writers that drained successfully.
+    ///
+    /// The MCP server calls this at exit, on client EOF and on SIGINT or
+    /// SIGTERM, so an operator row queued by `profile halt`, `profile resume`,
+    /// or `approve --id` while the server held the writer reaches the log
+    /// before the process goes away. A halted profile may see no further keyed
+    /// command for a long time, and until one arrives `audit verify` reports
+    /// the row as `outbox_pending`.
+    ///
+    /// # Only cached writers
+    ///
+    /// A shutdown opens no writer: only entries already cached with a key are
+    /// drained. An entry evicted as a replaced log is skipped, because its
+    /// writer no longer holds the file at the path and draining would append
+    /// the rows to a file the log no longer names. Unkeyed entries are skipped
+    /// because only a keyed writer drains.
+    ///
+    /// Each writer is drained through [`AuditWriter::verify_tip_anchor`], the
+    /// same check [`AuditWriterRegistry::get_or_open_keyed`] applies on a cache
+    /// hit, under one writer guard. A refusal — `audit.outbox_busy`,
+    /// `audit.outbox_unusable`, `audit.outbox_rows_missing`, a tip-anchor
+    /// mismatch — leaves the outbox unchanged and is logged; the remaining
+    /// writers are still drained, and the caller's exit code is unaffected.
+    /// Delivery stays at least once.
+    ///
+    /// # Panics
+    ///
+    /// Does not panic. A poisoned registry mutex yields `0` with a warning.
+    #[must_use]
+    pub fn drain_cached_outboxes() -> usize {
+        let Some(registry) = REGISTRY.get() else {
+            return 0;
+        };
+        let cached: Vec<(String, Arc<Mutex<AuditWriter>>)> = {
+            let Ok(map) = registry.lock() else {
+                tracing::warn!(
+                    "audit writer registry mutex poisoned; no cached audit outbox was drained"
+                );
+                return 0;
+            };
+            map.iter()
+                .filter(|(_, entry)| {
+                    entry.hmac_key_fingerprint.is_some() && entry.evicted.is_none()
+                })
+                .map(|(name, entry)| (name.clone(), Arc::clone(&entry.handle)))
+                .collect()
+        };
+        let mut drained = 0;
+        for (profile_name, handle) in cached {
+            match lock_for_verification(&handle).and_then(|mut writer| writer.verify_tip_anchor()) {
+                Ok(()) => {
+                    drained += 1;
+                    tracing::debug!(
+                        profile = %profile_name,
+                        "audit outbox drained from the cached writer at shutdown"
+                    );
+                }
+                Err(e) => tracing::warn!(
+                    profile = %profile_name,
+                    error = %e,
+                    "audit outbox not drained at shutdown; the rows stay queued for the next \
+                     draining writer"
+                ),
+            }
+        }
+        drained
+    }
+
     fn acquire_keyed(
         profile_name: &str,
         log_path: &Path,
@@ -7876,6 +7945,47 @@ mod tests {
             AuditWriterRegistry::get_or_open_keyed(name, &path, retained_history_access(&store)),
             Err(WriterError::RetainedHistoryUnverified(_))
         ));
+    }
+
+    #[test]
+    fn drain_cached_outboxes_drains_a_queued_row_from_the_cached_writer() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let name = "drain-cached-outboxes";
+        let (writer, store) = cached_history_fixture(&path, name, 0);
+        let outbox = super::super::outbox::AuditOutbox::for_log(&path, store.clone());
+        outbox
+            .append(&AuditEntry::new_profile_halted(
+                name,
+                "2026-10-31T12:00:00Z",
+                Some("shutdown"),
+                "drain-cached-outboxes",
+            ))
+            .unwrap();
+        assert_eq!(
+            super::super::outbox::inspect_outbox(&path).unwrap().pending,
+            1,
+            "the row is queued while the cached writer holds the log"
+        );
+
+        let drained = AuditWriterRegistry::drain_cached_outboxes();
+        assert!(drained >= 1, "the cached keyed writer drains");
+        assert_eq!(
+            super::super::outbox::inspect_outbox(&path).unwrap().pending,
+            0,
+            "the queued row reached the log"
+        );
+        let content = fs::read_to_string(&path).unwrap();
+        assert!(
+            content.lines().any(|line| {
+                let value: serde_json::Value = serde_json::from_str(line).unwrap();
+                value["kind"] == "profile_halted"
+            }),
+            "the halt row is in the log: {content}"
+        );
+
+        drop(writer);
+        AuditWriterRegistry::remove_for_test(name);
     }
 
     #[test]

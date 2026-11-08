@@ -44,7 +44,10 @@
 //! written when the log is available and the command exits `0` either way.
 //!
 //! While an MCP server holds the profile's audit log, both rows are queued in
-//! the audit outbox, and the server appends them at its next audit write.
+//! the audit outbox, and the server appends them at its next audit write. The
+//! server also drains the outbox when it exits, on client EOF and on SIGINT or
+//! SIGTERM. A row queued after that last drain waits for the next draining
+//! writer.
 //!
 //! # Output (JSON envelope)
 //!

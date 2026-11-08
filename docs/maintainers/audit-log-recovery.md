@@ -298,7 +298,8 @@ A failed state write truncates the line back and refuses the append.
 
 - when it opens, right after the tip-anchor check;
 - on every keyed acquisition in a running process, under the same lock as that check;
-- before each row of its own.
+- before each row of its own;
+- when the MCP server exits, on client EOF and on SIGINT or SIGTERM, for every keyed writer it cached.
 
 A command that consumes an approval acquires the writer after it reads the approval and before it loads a signing key. A queued consent row is therefore in the log before the key is touched. `audit reanchor` drains after its repair rows. The repair writer never drains when it opens, and its reporting form never drains.
 

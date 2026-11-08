@@ -310,6 +310,29 @@ pub fn build_selected_server(
 /// Returns a boxed error if the rmcp service encounters a fatal error during
 /// initialisation or operation.
 pub async fn serve(server: WalletServer) -> Result<(), Box<dyn std::error::Error>> {
+    serve_until(server, std::future::pending::<()>()).await
+}
+
+/// Runs the MCP stdio loop for an already-constructed server until the client
+/// disconnects or `shutdown` resolves.
+///
+/// `shutdown` is polled from before the session starts. When it resolves, the
+/// service is cancelled and awaited, so its transport is closed and its task
+/// has finished before this function returns. A caller that holds
+/// process-global state, such as the audit writer registry, can then drain it
+/// with nothing else in the process appending.
+///
+/// # Errors
+///
+/// [`SessionStartError`] when the session does not start, or the join error of
+/// the running service.
+pub async fn serve_until<F>(
+    server: WalletServer,
+    shutdown: F,
+) -> Result<(), Box<dyn std::error::Error>>
+where
+    F: std::future::Future<Output = ()>,
+{
     // ── Max-line mitigation: BoundedStdioTransport with 1 MiB max-line bound ──
     // Do NOT use `.serve(rmcp::transport::stdio())` or `.serve((stdin, stdout))`
     // — those paths call `AsyncRwTransport::new` which internally uses
@@ -324,7 +347,7 @@ pub async fn serve(server: WalletServer) -> Result<(), Box<dyn std::error::Error
     // Verification point: the codec construction is in
     // `BoundedTransport::over()` above in this file; the `default()`
     // constructor is never called.
-    serve_on(server, BoundedStdioTransport::new()).await
+    serve_on_until(server, BoundedStdioTransport::new(), shutdown).await
 }
 
 /// Runs `server` on `transport` until the client disconnects.
@@ -341,13 +364,55 @@ where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
 {
-    let service = server
-        .serve(transport)
-        .await
-        .map_err(SessionStartError::from)?;
+    serve_on_until(server, transport, std::future::pending::<()>()).await
+}
+
+/// Runs `server` on `transport` until the client disconnects or `shutdown`
+/// resolves.
+///
+/// # Errors
+///
+/// [`SessionStartError`] when the session does not start, or the join error of
+/// the running service.
+pub async fn serve_on_until<R, W, F>(
+    server: WalletServer,
+    transport: BoundedTransport<R, W>,
+    shutdown: F,
+) -> Result<(), Box<dyn std::error::Error>>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
+    F: std::future::Future<Output = ()>,
+{
+    tokio::pin!(shutdown);
+    let starting = server.serve(transport);
+    tokio::pin!(starting);
+    let service = tokio::select! {
+        result = &mut starting => result.map_err(SessionStartError::from)?,
+        () = &mut shutdown => {
+            tracing::info!(
+                "stellar-agent-mcp: shutdown signal received before the session started"
+            );
+            return Ok(());
+        }
+    };
 
     tracing::info!("stellar-agent-mcp: MCP server ready");
-    service.waiting().await?;
+    let cancellation = service.cancellation_token();
+    let waiting = service.waiting();
+    tokio::pin!(waiting);
+    tokio::select! {
+        result = &mut waiting => {
+            result?;
+        }
+        () = &mut shutdown => {
+            tracing::info!(
+                "stellar-agent-mcp: shutdown signal received; stopping the MCP server"
+            );
+            cancellation.cancel();
+            waiting.await?;
+        }
+    }
     Ok(())
 }
 
