@@ -840,9 +840,9 @@ fn emit_success(result: &ExecuteResult, output: OutputFormat, request_id: &str) 
 /// Typed parser for `--expect-rule-signer`.
 ///
 /// Accepts exactly 64 hexadecimal characters, upper- or lowercase, and stores
-/// them lowercased. Any other value is refused at parse time, before the
-/// profile or the rule key is read, and the refusal never echoes the value.
-/// This includes an S-strkey secret seed pasted into the wrong flag.
+/// them lowercased. Any other value, such as an S-strkey seed pasted into the
+/// wrong flag, is refused at parse time, before the profile or the rule key is
+/// read. The refusal never echoes the value.
 #[derive(Clone)]
 struct RuleSignerHexFlag;
 
@@ -1164,6 +1164,8 @@ mod tests {
             "a".repeat(65),
             format!("{}g", "a".repeat(63)),
             format!(" {}", "a".repeat(63)),
+            format!(" {}", "a".repeat(64)),
+            format!("{} ", "a".repeat(64)),
         ] {
             let mut a = base_args();
             a.extend(["--expect-rule-signer", &value]);
@@ -1171,6 +1173,36 @@ mod tests {
                 .expect_err("a value that is not 64 hex characters must be refused");
             assert_eq!(error.kind(), ErrorKind::ValueValidation, "{value:?}");
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clap_expect_rule_signer_refuses_non_utf8_without_echoing_it() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        use clap::error::{ContextKind, ContextValue, ErrorKind};
+        use stellar_agent_test_support::rejected_value::assert_no_marker;
+
+        let bytes = [0xfe_u8, 0xff].repeat(32);
+        assert_eq!(bytes.len(), 64, "the value has the accepted length");
+        assert!(
+            std::str::from_utf8(&bytes).is_err(),
+            "the value is not UTF-8"
+        );
+        let lossy = String::from_utf8_lossy(&bytes).into_owned();
+        let mut a: Vec<OsString> = base_args().into_iter().map(OsString::from).collect();
+        a.push(OsString::from("--expect-rule-signer"));
+        a.push(OsString::from_vec(bytes));
+        let error = ExecuteArgsHarness::try_parse_from(a)
+            .expect_err("a value that is not UTF-8 must be refused");
+        assert_eq!(error.kind(), ErrorKind::ValueValidation);
+        assert_eq!(
+            error.get(ContextKind::InvalidArg),
+            Some(&ContextValue::String("--expect-rule-signer".to_owned()))
+        );
+        assert_no_marker(&error, "\u{FFFD}");
+        assert_no_marker(&error, &lossy);
     }
 
     // ── Envelope shape ──────────────────────────────────────────────────────

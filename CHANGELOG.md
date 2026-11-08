@@ -810,6 +810,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `smart-account execute` refuses an `--expect-rule-signer` value that is not 64
+  hexadecimal characters at the argument parser, before any profile or key is
+  read. The `validation.usage_error` envelope names the flag, never the value.
+  Thanks to @PrathaMesh3056.
 - The startup advisory scan reads the audit log without a writer. It opens one,
   with the profile's audit key, only to append a
   `sa_verifier_allowlist_advisory` row for a finding. A start without findings

@@ -270,7 +270,10 @@ fn a_seed_as_expect_rule_signer_is_not_echoed() {
         &seed,
     ]);
     let message = assert_usage_error(&output);
-    assert!(message.contains("--expect-rule-signer"), "{message}");
+    assert_eq!(
+        message,
+        "the argument value is not valid: --expect-rule-signer; run the command with --help for the accepted arguments"
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     let envelope: Value = serde_json::from_slice(&output.stdout).expect("JSON envelope");
