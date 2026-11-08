@@ -237,7 +237,18 @@ Once a log's entry tags are in force, or its active file holds a row that carrie
 
 ## 6. Appends made without the anchor
 
-Not every writer carries the anchor. The zero-config best-effort path and the read-only smart-account verbs of a profile whose audit key does not load open the log unkeyed and do not move it; on a log that shows keying they refuse instead (section 5.1), and the CLI startup advisory then reads without a writer and writes no row. Appends of an unkeyed writer leave the log AHEAD of the anchor, which is not an error before the boundary row: the next acquisition that does carry the anchor replays the appended tail, confirms it chains off the anchored tip, and re-anchors on the new tip. No row is written for that; the appended rows are their own record. Past the boundary, an untagged tail refuses (section 1).
+The zero-config best-effort path and read-only smart-account verbs open the
+log unkeyed when the profile's audit key does not load. They do not move the
+anchor, and they refuse a log that shows keying (section 5.1). The CLI startup
+advisory scans without a writer. A finding acquires the profile's keyed writer
+to append an advisory row. Its unkeyed fallback applies only to a persisted
+profile whose audit key does not load and whose log shows no keying.
+
+Appends of an unkeyed writer leave the log ahead of the anchor. Before the
+boundary row, the next keyed acquisition replays that tail, confirms it chains
+from the anchored tip, and advances the anchor. The appended rows serve as the
+record, so this reconciliation writes no row. Past the boundary, an untagged
+tail refuses (section 1).
 
 The same path absorbs the crash window between an entry's `fsync` and the anchor write. The entry is durable and tagged, the anchor is one behind, and the next reconciliation closes the gap.
 

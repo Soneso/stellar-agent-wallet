@@ -13,23 +13,24 @@
 //! # No-network invariant
 //!
 //! [`run_startup_advisory`] accepts NO `StellarRpcClient` parameter. The only
-//! I/O is reading the local audit-log file. The in-crate AST import-scan test
+//! I/O is local: the scan reads the audit log, and the injected opener accesses
+//! the keyring, checks the profile binding, and handles the tip anchor and
+//! outbox for a keyed append. The writer appends local audit rows. The AST test
 //! in `tests/cli/advisory_no_network_deps.rs` enforces this invariant by walking
 //! the transitive call closure of `run_startup_advisory` and asserting that no
 //! networking, subprocess, or DNS import is reachable.
 //!
 //! # Advisory posture
 //!
-//! The advisory is purely informational and NON-FATAL. Audit-log errors
-//! (file absent, I/O error, integrity violation) are logged at `warn!` level
-//! and the advisory returns an empty [`AdvisoryResult`]; CLI startup
-//! continues normally.
+//! The advisory is informational and non-fatal. An absent or empty log
+//! returns an empty [`AdvisoryResult`] silently. A scan failure logs a warning
+//! and returns an empty result. CLI startup continues normally.
 //!
-//! The advisory opens an unkeyed writer, which refuses a log that shows
-//! keying (`audit.chain_key_unavailable`). On such a log the advisory reads
-//! the pin records without a writer and without its verified-tip bound, keeps
-//! its stderr lines, and writes no audit row: those reads feed only the
-//! operator-facing warnings.
+//! The scan reads without a writer or its verified-tip bound. A finding
+//! opens the caller-supplied writer once and appends an advisory row. The
+//! caller supplies the profile's audit key when available. A failed open or
+//! append leaves the stderr advisory intact. A scan without findings opens
+//! no writer and logs nothing.
 //!
 //! # Test-helpers feature gate
 //!
@@ -50,7 +51,7 @@ use uuid::Uuid;
 
 use stellar_agent_core::audit_log::entry::AuditEntry;
 use stellar_agent_core::audit_log::reader::{
-    AuditReader, ContextRulePinRecord, scan_all_context_rule_pin_records_unanchored,
+    ContextRulePinRecord, scan_all_context_rule_pin_records_unanchored,
 };
 use stellar_agent_core::audit_log::schema::{VerifierAdvisoryKind, WasmHashPin};
 use stellar_agent_core::audit_log::writer::AuditWriter;
@@ -87,20 +88,25 @@ pub struct AdvisoryResult {
 ///
 /// # Non-fatal
 ///
-/// Audit-log errors are logged at `warn!` level and an empty
-/// [`AdvisoryResult`] is returned. CLI startup is NEVER aborted.
+/// A scan failure logs a warning and returns an empty [`AdvisoryResult`].
+/// A writer acquisition or append failure logs a warning and preserves the
+/// findings. An absent or empty log returns silently. CLI startup continues.
 ///
 /// # No-network invariant
 ///
 /// This function MUST NOT import or invoke `StellarRpcClient`,
 /// `stellar_agent_network::rpc::*`, `use reqwest`, or `tokio::net::*`.
-/// The only I/O is reading the local audit-log file at `audit_log_path`.
+/// The scan reads the local audit-log file at `audit_log_path`. A finding
+/// calls `open_writer` at most once to append rows through a local writer.
 /// The AST import-scan in `tests/cli/advisory_no_network_deps.rs` enforces this
 /// invariant by walking the transitive call closure and checking for forbidden
 /// networking, subprocess, or DNS imports.
 #[must_use]
-pub fn run_startup_advisory(audit_log_path: &Path) -> AdvisoryResult {
-    advisory_impl(audit_log_path, VERIFIER_ALLOWLIST)
+pub fn run_startup_advisory(
+    audit_log_path: &Path,
+    open_writer: impl FnOnce() -> Result<Arc<Mutex<AuditWriter>>, String>,
+) -> AdvisoryResult {
+    advisory_impl(audit_log_path, VERIFIER_ALLOWLIST, open_writer)
 }
 
 /// Runs the startup advisory scan with a caller-supplied `allowlist` slice.
@@ -112,25 +118,22 @@ pub fn run_startup_advisory(audit_log_path: &Path) -> AdvisoryResult {
 /// # Short-circuit
 ///
 /// When the audit-log file is absent or empty (zero bytes), returns an empty
-/// [`AdvisoryResult`] immediately — avoiding an `AuditWriter::open` + drop
-/// cycle before subcommand dispatch.
+/// [`AdvisoryResult`] immediately without calling `open_writer`.
 ///
 /// # Algorithm
 ///
 /// 1. If the audit-log file is absent or empty, return early.
-/// 2. Open an unkeyed `AuditWriter` to drive `AuditReader` construction and
-///    advisory-row emission. When the open refuses, for example on a keyed
-///    log, continue without a writer.
-/// 3. Scan every rule's pin record: the newest pin row of either version per
-///    rule, through the writer's bounded reader, or without a writer through
+/// 2. Scan every rule's newest pin record without a writer through
 ///    `scan_all_context_rule_pin_records_unanchored`.
+/// 3. Keep `open_writer` for the first finding that needs an audit row.
 /// 4. For a record of eight-byte hash prefixes, emit one `[advisory]` stderr
 ///    line naming `sa.wasm_pin_incomplete` and the recovery, record the rule
 ///    in [`AdvisoryResult::incomplete_pin_rule_ids`], and look up no status.
 /// 5. For a complete record, deduplicate the full verifier hashes, and for
 ///    any hash equal in all 32 bytes to a `Revoked` or `Retired` allowlist
-///    entry, emit one `[advisory]` stderr line and, with a writer, one
-///    `SaVerifierAllowlistAdvisory` audit row.
+///    entry, emit one `[advisory]` stderr line. Call `open_writer` once on
+///    the first finding and reuse its writer for each advisory audit row.
+///    A failed open logs one warning and leaves the stderr lines intact.
 /// 6. Record `rule_id` in [`AdvisoryResult::triggered_rule_ids`] once per rule.
 #[cfg(any(test, feature = "test-helpers"))]
 #[cfg_attr(not(test), allow(dead_code))]
@@ -138,56 +141,33 @@ pub fn run_startup_advisory(audit_log_path: &Path) -> AdvisoryResult {
 pub fn run_startup_advisory_with_allowlist(
     audit_log_path: &Path,
     allowlist: &[VerifierAllowlistEntry],
+    open_writer: impl FnOnce() -> Result<Arc<Mutex<AuditWriter>>, String>,
 ) -> AdvisoryResult {
-    advisory_impl(audit_log_path, allowlist)
+    advisory_impl(audit_log_path, allowlist, open_writer)
 }
 
-/// Shared implementation — called by both entry points above.
+/// Shared implementation called by both entry points above.
 #[allow(
     clippy::print_stderr,
     reason = "advisory output is operator-facing stderr"
 )]
-fn advisory_impl(audit_log_path: &Path, allowlist: &[VerifierAllowlistEntry]) -> AdvisoryResult {
+fn advisory_impl(
+    audit_log_path: &Path,
+    allowlist: &[VerifierAllowlistEntry],
+    open_writer: impl FnOnce() -> Result<Arc<Mutex<AuditWriter>>, String>,
+) -> AdvisoryResult {
     // ── 0. Short-circuit if audit-log is absent or empty ────────────────────
-    // Avoids a redundant AuditWriter open/close cycle before subcommand dispatch.
+    // No pin records exist to scan in an absent or empty log.
     match std::fs::metadata(audit_log_path) {
-        // Race window note: `metadata().len() == 0` is checked AFTER the file
-        // exists; a concurrent writer appending between the metadata read and
-        // `AuditWriter::open` would cause us to return `AdvisoryResult::default()`
-        // instead of reading the new content. Currently safe because no
-        // concurrent writers exist during startup-advisory (the advisory runs
-        // before subcommand dispatch + before any production manager acquires the
-        // audit-writer lock). If startup concurrency changes, reconsider this
-        // short-circuit.
+        // A concurrent append after this metadata read is seen on the next
+        // invocation. The advisory is informational and runs before dispatch.
         Ok(meta) if meta.len() == 0 => return AdvisoryResult::default(),
         Err(_) => return AdvisoryResult::default(),
         Ok(_) => {}
     }
 
-    // ── 1. Open the audit writer ─────────────────────────────────────────────
-    // The writer drives AuditReader construction and writes the advisory rows.
-    // An unkeyed open refuses a keyed log; the scan then reads without it.
-    let writer: Option<Arc<Mutex<AuditWriter>>> =
-        match open_audit_writer_for_advisory(audit_log_path) {
-            Ok(w) => Some(w),
-            Err(e) => {
-                warn!(
-                    error = %e,
-                    "startup advisory: could not open audit writer; the log is read without \
-                     it and no advisory row is written"
-                );
-                None
-            }
-        };
-
-    // ── 2. Scan every rule's pin record (newest created or pins-updated row) ──
-    let scanned = match &writer {
-        Some(writer) => {
-            AuditReader::new(Arc::clone(writer), None).scan_all_context_rule_pin_records()
-        }
-        None => scan_all_context_rule_pin_records_unanchored(audit_log_path),
-    };
-    let all_rules = match scanned {
+    // ── 1. Read pin records without a writer or keyring access ─────────────
+    let all_rules = match scan_all_context_rule_pin_records_unanchored(audit_log_path) {
         Ok(rows) => rows,
         Err(e) => {
             warn!(
@@ -202,10 +182,12 @@ fn advisory_impl(audit_log_path: &Path, allowlist: &[VerifierAllowlistEntry]) ->
         return AdvisoryResult::default();
     }
 
-    // ── 3. Check each rule's pinned hashes against the allowlist ──────────────
+    // ── 2. Check each rule's pinned hashes against the allowlist ──────────────
     let mut triggered_rule_ids: Vec<u32> = Vec::new();
     let mut incomplete_pin_rule_ids: Vec<u32> = Vec::new();
     let request_id = Uuid::new_v4().to_string();
+    let mut open_writer = Some(open_writer);
+    let mut writer = None;
 
     for (rule_id, smart_account_redacted, record) in &all_rules {
         let pinned = match record {
@@ -235,7 +217,7 @@ fn advisory_impl(audit_log_path: &Path, allowlist: &[VerifierAllowlistEntry]) ->
                 continue;
             };
 
-            // 3a. Emit operator-facing stderr advisory with variant-aware wording
+            // 2a. Emit operator-facing stderr advisory with variant-aware wording
             //     ("revoked verifier" would be misleading for a Retired entry).
             eprintln!(
                 "[advisory] rule {} references {} verifier {}; \
@@ -243,9 +225,22 @@ fn advisory_impl(audit_log_path: &Path, allowlist: &[VerifierAllowlistEntry]) ->
                 rule_id, advisory_kind, hash,
             );
 
-            // 3b. Emit SaVerifierAllowlistAdvisory audit row; its hash field
+            // 2b. Emit SaVerifierAllowlistAdvisory audit row; its hash field
             //     is the labeled first-8 display projection of the full hash.
             //     Without a writer the stderr line is the whole advisory.
+            if let Some(open_writer) = open_writer.take() {
+                writer = match open_writer() {
+                    Ok(writer) => Some(writer),
+                    Err(error) => {
+                        warn!(
+                            error = %error,
+                            "startup advisory: audit writer open failed; \
+                             stderr advisory stands and the command proceeds; advisory rows skipped"
+                        );
+                        None
+                    }
+                };
+            }
             let hash_first8 = hash.first8_display();
             if let Some(writer) = &writer {
                 write_advisory_row(
@@ -258,7 +253,7 @@ fn advisory_impl(audit_log_path: &Path, allowlist: &[VerifierAllowlistEntry]) ->
                 );
             }
 
-            // 3c. Record triggered rule_id (once per rule, not once per hash).
+            // 2c. Record triggered rule_id (once per rule, not once per hash).
             if !triggered_rule_ids.contains(rule_id) {
                 triggered_rule_ids.push(*rule_id);
             }
@@ -368,25 +363,6 @@ pub(crate) fn find_advisory_kind_in(
     None
 }
 
-/// Opens (or creates) the audit-log writer at `audit_log_path`.
-///
-/// Creates parent directories if absent. Maps errors to a `String` so the
-/// advisory can `warn!` and skip non-fatally.
-fn open_audit_writer_for_advisory(
-    audit_log_path: &Path,
-) -> Result<Arc<Mutex<AuditWriter>>, String> {
-    if let Some(parent) = audit_log_path.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("create parent dirs for audit log: {e}"))?;
-    }
-
-    let writer = AuditWriter::open(audit_log_path.to_path_buf(), None)
-        .map_err(|e| format!("open audit writer: {e}"))?;
-    Ok(Arc::new(Mutex::new(writer)))
-}
-
 // ── Tests ──────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -403,7 +379,12 @@ mod tests {
 
     use stellar_agent_core::audit_log::entry::{AuditEntry, NewToolInvocation};
     use stellar_agent_core::audit_log::schema::{EventKind, PolicyDecision};
+    use stellar_agent_core::audit_log::tip_anchor::{
+        InMemoryTipAnchorStore, KeyedAuditAccess, TipAnchorStore,
+    };
+    use stellar_agent_core::audit_log::verify::verify_log;
     use stellar_agent_core::audit_log::writer::AuditWriter;
+    use stellar_agent_test_support::log_capture::{CaptureWriter, inert_dispatcher};
     use tempfile::TempDir;
     use uuid::Uuid;
 
@@ -495,6 +476,7 @@ mod tests {
 
         let dir = TempDir::new().unwrap();
         let _home = StellarAgentHomeGuard::new(dir.path());
+        stellar_agent_test_support::keyring_mock::install().unwrap();
         let path = dir.path().join("custom-audit.jsonl");
         let profile =
             Profile::builder_testnet_named("configured", "signer", "test", "nonce", "test")
@@ -519,9 +501,12 @@ mod tests {
                 reason: "test fixture",
             },
         )];
-        let result = crate::run_profile_startup_advisory(Some("configured"), |selected_path| {
-            run_startup_advisory_with_allowlist(selected_path, &allowlist)
-        });
+        let result = crate::run_profile_startup_advisory(
+            Some("configured"),
+            |selected_path, open_writer| {
+                run_startup_advisory_with_allowlist(selected_path, &allowlist, open_writer)
+            },
+        );
 
         assert_eq!(result.triggered_rule_ids, vec![4]);
         assert!(
@@ -532,12 +517,11 @@ mod tests {
         assert_eq!(std::fs::read(&default_path).unwrap(), default_bytes);
     }
 
-    /// The advisory writer is unkeyed, so it neither records nor checks the
-    /// audit binding. An absent binding stays absent, and a recorded binding
-    /// naming another log is left as it is while the advisory writes its row.
+    /// A finding acquires the profile's keyed writer and records its binding.
+    /// A changed binding refuses the row while the scan still reports findings.
     #[test]
     #[serial_test::serial]
-    fn the_advisory_records_and_checks_no_binding() {
+    fn the_advisory_records_and_checks_the_profile_binding() {
         use stellar_agent_core::profile::{loader, schema::Profile};
         use stellar_agent_network::keyring::KeyringAuditBindingStore;
         use stellar_agent_test_support::StellarAgentHomeGuard;
@@ -564,16 +548,33 @@ mod tests {
                 .unwrap()
         };
         let run = || {
-            crate::run_profile_startup_advisory(Some(name), |selected_path| {
-                run_startup_advisory_with_allowlist(selected_path, &allowlist)
+            crate::run_profile_startup_advisory(Some(name), |selected_path, open_writer| {
+                run_startup_advisory_with_allowlist(selected_path, &allowlist, open_writer)
             })
         };
 
         let writer = open_writer(path.clone());
         write_context_rule_created(&writer, 4, "CDABC...12345", vec![h(0xab)]);
         drop(writer);
+        let coord = &profile.audit_log_hash_chain_key_id;
+        stellar_agent_network::keyring::rotate_keyring_secret_32(&coord.service, &coord.account)
+            .unwrap();
+        assert!(binding().is_none());
         assert_eq!(run().triggered_rule_ids, vec![4]);
-        assert!(binding().is_none(), "the advisory records no binding");
+        assert!(
+            binding().is_some(),
+            "the keyed advisory records its binding"
+        );
+        let key = stellar_agent_network::keyring::load_hmac_key_32(coord).unwrap();
+        let verified = verify_log(&path, Some(&key)).unwrap();
+        assert!(verified.hmac_verified);
+        assert!(verified.entry_tags_verified);
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(content.matches("sa_verifier_allowlist_advisory").count(), 1);
+        let writer =
+            crate::commands::value_audit::require_value_audit_writer(&profile, name).unwrap();
+        write_context_rule_created(&writer, 5, "CDABC...12345", vec![h(0xab)]);
+        drop(writer);
 
         let mut elsewhere = profile.clone();
         elsewhere.audit_log_path = dir.path().join("elsewhere.jsonl");
@@ -583,30 +584,234 @@ mod tests {
             ))
             .unwrap();
         let recorded = binding();
-        let before = std::fs::read(&path).unwrap().len();
-        let writer = open_writer(path.clone());
-        write_context_rule_created(&writer, 5, "CDABC...12345", vec![h(0xab)]);
-        drop(writer);
+        let before = std::fs::read(&path).unwrap();
         assert!(
             run().triggered_rule_ids.contains(&5),
             "the advisory still runs"
         );
-        assert!(std::fs::read(&path).unwrap().len() > before);
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            before,
+            "a binding refusal writes no row"
+        );
         assert!(
             binding() == recorded,
-            "the advisory checks and rewrites no binding"
+            "the advisory preserves the refused binding"
         );
     }
 
-    /// On a keyed log the unkeyed advisory writer refuses to open: the
-    /// advisory reads the pin records without it, reports the rule, and
-    /// writes no row.
+    /// Persists a profile and one revoked pin, with an optional seeded audit key.
+    fn startup_profile_with_finding(
+        dir: &TempDir,
+        name: &str,
+        keyed: bool,
+    ) -> stellar_agent_core::profile::schema::Profile {
+        use stellar_agent_core::audit_log::BindingCheck;
+        use stellar_agent_core::profile::{loader, schema::Profile};
+        use stellar_agent_network::keyring::{keyed_audit_access, rotate_keyring_secret_32};
+
+        let path = dir.path().join("audit.jsonl");
+        let profile = Profile::builder_testnet_named(name, "signer", "test", "nonce", "test")
+            .audit_log_path(&path)
+            .build();
+        loader::save(name, &profile).unwrap();
+        let access = keyed.then(|| {
+            let coord = &profile.audit_log_hash_chain_key_id;
+            rotate_keyring_secret_32(&coord.service, &coord.account).unwrap();
+            keyed_audit_access(&profile, name, BindingCheck::Enforce).unwrap()
+        });
+        let writer = Arc::new(Mutex::new(AuditWriter::open(path, access).unwrap()));
+        write_context_rule_created(&writer, 4, "CDABC...12345", vec![h(0xab)]);
+        profile
+    }
+
+    fn run_profile_with_revoked_pin(name: &str) -> AdvisoryResult {
+        let allowlist = [VerifierAllowlistEntry::new_for_test(
+            [0xab; 32],
+            VerifierAuditStatus::Revoked {
+                revoked_at: "2026-01-01",
+                reason: "test fixture",
+            },
+        )];
+        crate::run_profile_startup_advisory(Some(name), |path, open_writer| {
+            run_startup_advisory_with_allowlist(path, &allowlist, open_writer)
+        })
+    }
+
     #[test]
-    fn the_advisory_on_a_keyed_log_prints_and_writes_no_row() {
-        use stellar_agent_core::audit_log::tip_anchor::{
-            InMemoryTipAnchorStore, KeyedAuditAccess, TipAnchorStore,
+    #[serial_test::serial]
+    fn startup_advisory_releases_keyed_writer_for_rotation() {
+        use stellar_agent_core::audit_log::BindingCheck;
+        use stellar_agent_network::keyring::keyed_audit_access;
+
+        let dir = TempDir::new().unwrap();
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(dir.path());
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        let name = "advisory-release-keyed";
+        let profile = startup_profile_with_finding(&dir, name, true);
+        assert_eq!(
+            run_profile_with_revoked_pin(name).triggered_rule_ids,
+            vec![4]
+        );
+        let content = std::fs::read_to_string(&profile.audit_log_path).unwrap();
+        assert_eq!(content.matches("sa_verifier_allowlist_advisory").count(), 1);
+        let access = keyed_audit_access(&profile, name, BindingCheck::Enforce).unwrap();
+        let binding = access.binding_history();
+        let (key, store) = access.into_parts();
+        let _rotation = AuditWriter::open_for_key_rotation(
+            profile.audit_log_path.clone(),
+            Some(key),
+            store,
+            binding,
+        )
+        .expect("the advisory releases the sidecar lock before rotation");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn startup_advisory_releases_unkeyed_writer_for_first_key() {
+        use stellar_agent_core::audit_log::BindingCheck;
+        use stellar_agent_network::keyring::{
+            keyed_audit_access, load_hmac_key_32, rotate_keyring_secret_32,
         };
 
+        let dir = TempDir::new().unwrap();
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(dir.path());
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        let name = "advisory-release-unkeyed";
+        let profile = startup_profile_with_finding(&dir, name, false);
+        let coord = &profile.audit_log_hash_chain_key_id;
+        assert!(load_hmac_key_32(coord).is_err());
+        assert_eq!(
+            run_profile_with_revoked_pin(name).triggered_rule_ids,
+            vec![4]
+        );
+        let content = std::fs::read_to_string(&profile.audit_log_path).unwrap();
+        assert_eq!(content.matches("sa_verifier_allowlist_advisory").count(), 1);
+        rotate_keyring_secret_32(&coord.service, &coord.account).unwrap();
+        let access = keyed_audit_access(&profile, name, BindingCheck::Enforce).unwrap();
+        let writer = AuditWriter::open(profile.audit_log_path.clone(), Some(access))
+            .expect("the first keyed open succeeds after the unkeyed advisory");
+        drop(writer);
+        let key = load_hmac_key_32(coord).unwrap();
+        let verified = verify_log(&profile.audit_log_path, Some(&key)).unwrap();
+        assert!(verified.hmac_verified);
+        assert!(verified.entry_tags_verified);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn startup_advisory_production_open_failure_warns_once_and_keeps_findings() {
+        use stellar_agent_core::profile::{loader, schema::Profile};
+        use stellar_agent_network::keyring::load_hmac_key_32;
+
+        let dir = TempDir::new().unwrap();
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(dir.path());
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        let name = "advisory-missing-key";
+        let path = tmp_log(&dir);
+        let profile = Profile::builder_testnet_named(name, "signer", "test", "nonce", "test")
+            .audit_log_path(&path)
+            .build();
+        loader::save(name, &profile).unwrap();
+        let access = KeyedAuditAccess::new(
+            zeroize::Zeroizing::new([0x4e; 32]),
+            Arc::new(InMemoryTipAnchorStore::new()),
+        );
+        let writer = Arc::new(Mutex::new(
+            AuditWriter::open(path.clone(), Some(access)).unwrap(),
+        ));
+        write_context_rule_created(&writer, 4, "CDABC...12345", vec![h(0xab)]);
+        drop(writer);
+        assert!(load_hmac_key_32(&profile.audit_log_hash_chain_key_id).is_err());
+        let before = std::fs::read(&path).unwrap();
+        let capture = CaptureWriter::new();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_ansi(false)
+            .with_writer(capture.clone())
+            .finish();
+        let _inert = inert_dispatcher();
+        let result = tracing::subscriber::with_default(subscriber, || {
+            tracing::callsite::rebuild_interest_cache();
+            run_profile_with_revoked_pin(name)
+        });
+        assert_eq!(result.triggered_rule_ids, vec![4]);
+        let logs = capture.captured_str();
+        assert_eq!(
+            logs.lines().filter(|line| line.contains("WARN")).count(),
+            1,
+            "{logs}"
+        );
+        assert!(logs.contains("audit.chain_key_unavailable"), "{logs}");
+        assert!(
+            logs.contains("stderr advisory stands and the command proceeds"),
+            "{logs}"
+        );
+        assert!(!logs.contains("refuses to proceed unaudited"), "{logs}");
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    /// A keyed finding appends one advisory row authenticated by the same key.
+    #[test]
+    fn the_advisory_on_a_keyed_log_prints_and_writes_a_keyed_row() {
+        let dir = TempDir::new().unwrap();
+        let path = tmp_log(&dir);
+        let key = [0x4e; 32];
+        let anchor: Arc<dyn TipAnchorStore> = Arc::new(InMemoryTipAnchorStore::new());
+        let access = || KeyedAuditAccess::new(zeroize::Zeroizing::new(key), Arc::clone(&anchor));
+        let writer = Arc::new(Mutex::new(
+            AuditWriter::open(path.clone(), Some(access())).unwrap(),
+        ));
+        write_context_rule_created(&writer, 4, "CDABC...12345", vec![h(0xab)]);
+        drop(writer);
+        let before = verify_log(&path, Some(&key)).unwrap();
+        let allowlist = [VerifierAllowlistEntry::new_for_test(
+            [0xAB; 32],
+            VerifierAuditStatus::Revoked {
+                revoked_at: "2026-01-01",
+                reason: "test fixture",
+            },
+        )];
+        let mut opens = 0;
+        let result = run_startup_advisory_with_allowlist(&path, &allowlist, || {
+            opens += 1;
+            AuditWriter::open(path.clone(), Some(access()))
+                .map(|writer| Arc::new(Mutex::new(writer)))
+                .map_err(|error| error.to_string())
+        });
+
+        assert_eq!(opens, 1);
+        assert_eq!(result.triggered_rule_ids, vec![4]);
+        let content = std::fs::read_to_string(&path).unwrap();
+        let rows: Vec<AuditEntry> = content
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .filter(|entry: &AuditEntry| {
+                matches!(
+                    entry.event_kind,
+                    EventKind::SaVerifierAllowlistAdvisory { .. }
+                )
+            })
+            .collect();
+        assert_eq!(rows.len(), 1);
+        assert!(matches!(
+            rows[0].event_kind,
+            EventKind::SaVerifierAllowlistAdvisory {
+                rule_id: 4,
+                advised_status: VerifierAdvisoryKind::Revoked,
+                ..
+            }
+        ));
+        let verified = verify_log(&path, Some(&key)).unwrap();
+        assert_eq!(verified.entries_verified, before.entries_verified + 1);
+        assert!(verified.hmac_verified);
+        assert!(verified.entry_tags_verified);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn advisory_on_a_keyed_log_without_findings_never_opens_or_warns() {
         let dir = TempDir::new().unwrap();
         let path = tmp_log(&dir);
         let access = KeyedAuditAccess::new(
@@ -617,20 +822,83 @@ mod tests {
             AuditWriter::open(path.clone(), Some(access)).unwrap(),
         ));
         write_context_rule_created(&writer, 4, "CDABC...12345", vec![h(0xab)]);
-        drop(writer);
         let before = std::fs::read(&path).unwrap();
         let allowlist = [VerifierAllowlistEntry::new_for_test(
-            [0xAB; 32],
-            VerifierAuditStatus::Revoked {
-                revoked_at: "2026-01-01",
-                reason: "test fixture",
-            },
+            [0xab; 32],
+            VerifierAuditStatus::Unaudited,
         )];
+        let capture = CaptureWriter::new();
+        let _inert = inert_dispatcher();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_ansi(false)
+            .with_writer(capture.clone())
+            .finish();
+        let mut opens = 0;
+        let result = tracing::subscriber::with_default(subscriber, || {
+            tracing::callsite::rebuild_interest_cache();
+            run_startup_advisory_with_allowlist(&path, &allowlist, || {
+                opens += 1;
+                Err("no finding needs a writer".to_owned())
+            })
+        });
+        assert_eq!(result, AdvisoryResult::default());
+        assert_eq!(opens, 0);
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        let logs = capture.captured_str();
+        assert!(!logs.contains("WARN"), "{logs}");
+        assert!(logs.is_empty(), "{logs}");
+    }
 
-        let result = run_startup_advisory_with_allowlist(&path, &allowlist);
-
+    /// Two findings on one rule keep both stderr lines when the single open fails.
+    /// The startup test in main captures those lines from this test's process.
+    #[test]
+    #[serial_test::serial]
+    fn advisory_writer_open_failure_warns_once_and_keeps_findings() {
+        let dir = TempDir::new().unwrap();
+        let path = tmp_log(&dir);
+        let writer = open_writer(path.clone());
+        write_context_rule_created(&writer, 4, "CDABC...12345", vec![h(0xab), h(0xcd)]);
+        drop(writer);
+        let before = std::fs::read(&path).unwrap();
+        let allowlist = [0xab, 0xcd].map(|byte| {
+            VerifierAllowlistEntry::new_for_test(
+                [byte; 32],
+                VerifierAuditStatus::Revoked {
+                    revoked_at: "2026-01-01",
+                    reason: "test fixture",
+                },
+            )
+        });
+        let capture = CaptureWriter::new();
+        let _inert = inert_dispatcher();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_ansi(false)
+            .with_writer(capture.clone())
+            .finish();
+        let mut opens = 0;
+        let result = tracing::subscriber::with_default(subscriber, || {
+            tracing::callsite::rebuild_interest_cache();
+            run_startup_advisory_with_allowlist(&path, &allowlist, || {
+                opens += 1;
+                Err("fixture writer unavailable".to_owned())
+            })
+        });
+        assert_eq!(opens, 1);
         assert_eq!(result.triggered_rule_ids, vec![4]);
-        assert_eq!(std::fs::read(&path).unwrap(), before, "no row is written");
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        let logs = capture.captured_str();
+        assert_eq!(
+            logs.lines().filter(|line| line.contains("WARN")).count(),
+            1,
+            "{logs}"
+        );
+        assert!(logs.contains("fixture writer unavailable"), "{logs}");
+        assert!(
+            logs.contains("startup advisory: audit writer open failed"),
+            "{logs}"
+        );
     }
 
     #[test]
@@ -648,7 +916,7 @@ mod tests {
         loader::save("mismatched", &profile).unwrap();
 
         for name in ["missing", "malformed", "mismatched"] {
-            let result = crate::run_profile_startup_advisory(Some(name), |_| {
+            let result = crate::run_profile_startup_advisory(Some(name), |_, _| {
                 panic!("a profile load failure must not scan an audit log")
             });
             assert_eq!(result, AdvisoryResult::default());
@@ -659,18 +927,14 @@ mod tests {
 
     #[test]
     fn advisory_returns_empty_when_audit_log_absent() {
-        // Path nested under a non-existent directory — open_audit_writer_for_advisory
-        // will fail because it tries to create_dir_all then open the writer;
-        // since the advisory has a guard path deep in the non-existent tree,
-        // the create_dir_all would create them — so use an impossible path
-        // (file as parent component).
         let dir = TempDir::new().unwrap();
         // Create a regular file, then try to use it as a directory (impossible parent).
         let file_as_dir = dir.path().join("regular_file");
         std::fs::write(&file_as_dir, b"content").unwrap();
         let impossible_path = file_as_dir.join("nested").join("audit.jsonl");
 
-        let result = run_startup_advisory(&impossible_path);
+        let result =
+            run_startup_advisory(&impossible_path, || panic!("an absent log needs no writer"));
         assert!(
             result.triggered_rule_ids.is_empty(),
             "advisory must return empty when audit log path cannot be opened"
@@ -696,11 +960,9 @@ mod tests {
             ));
             w.write_entry(entry).unwrap();
         }
-        // Drop the writer so the new open inside run_startup_advisory can acquire
-        // the file-level lock (same process, different writer instance).
         drop(writer);
 
-        let result = run_startup_advisory(&path);
+        let result = run_startup_advisory(&path, || panic!("no finding needs a writer"));
         assert!(
             result.triggered_rule_ids.is_empty(),
             "advisory must return empty when no SaContextRuleCreated rows exist"
@@ -728,7 +990,7 @@ mod tests {
         write_context_rule_created(&writer, 4, "CDABC...12345", vec![h(0xde)]);
         drop(writer);
 
-        let result = run_startup_advisory(&path);
+        let result = run_startup_advisory(&path, || panic!("no finding needs a writer"));
         assert!(
             result.triggered_rule_ids.is_empty(),
             "hash not in VERIFIER_ALLOWLIST must not trigger advisory; triggered={:?}",
@@ -752,7 +1014,7 @@ mod tests {
         );
         drop(writer);
 
-        let result = run_startup_advisory(&path);
+        let result = run_startup_advisory(&path, || panic!("no finding needs a writer"));
         assert!(
             result.triggered_rule_ids.is_empty(),
             "Provisional entry must not trigger advisory; triggered={:?}",
@@ -777,7 +1039,7 @@ mod tests {
         write_context_rule_created(&writer, 7, "CDABC...12345", vec![h(0xca)]);
         drop(writer);
 
-        let result = run_startup_advisory(&path);
+        let result = run_startup_advisory(&path, || panic!("no finding needs a writer"));
         assert!(
             result.triggered_rule_ids.is_empty(),
             "hash not in allowlist must not trigger advisory"
@@ -794,7 +1056,7 @@ mod tests {
         let writer = open_writer(path.clone());
         drop(writer);
 
-        let result = run_startup_advisory(&path);
+        let result = run_startup_advisory(&path, || panic!("no finding needs a writer"));
         assert!(
             result.triggered_rule_ids.is_empty(),
             "empty audit log must not trigger advisory"
@@ -906,7 +1168,9 @@ mod tests {
             },
         )];
 
-        let result = run_startup_advisory_with_allowlist(&path, &allowlist);
+        let result = run_startup_advisory_with_allowlist(&path, &allowlist, || {
+            Ok(open_writer(path.clone()))
+        });
 
         assert_eq!(result.triggered_rule_ids, vec![4]);
         assert!(result.incomplete_pin_rule_ids.is_empty());
@@ -980,7 +1244,9 @@ mod tests {
         write_context_rule_created(&writer, 4, "CDABC...12345", vec![twin(revoked)]);
         write_context_rule_created(&writer, 5, "CDABC...12345", vec![twin(retired)]);
         drop(writer);
-        let result = run_startup_advisory_with_allowlist(&path, &allowlist);
+        let result = run_startup_advisory_with_allowlist(&path, &allowlist, || {
+            Ok(open_writer(path.clone()))
+        });
         assert!(result.triggered_rule_ids.is_empty(), "{result:?}");
         assert!(
             !std::fs::read_to_string(&path)
@@ -1012,7 +1278,9 @@ mod tests {
             },
         )];
 
-        let result = run_startup_advisory_with_allowlist(&path, &allowlist);
+        let result = run_startup_advisory_with_allowlist(&path, &allowlist, || {
+            Ok(open_writer(path.clone()))
+        });
 
         assert!(result.triggered_rule_ids.is_empty(), "{result:?}");
         assert_eq!(result.incomplete_pin_rule_ids, vec![4]);
@@ -1062,7 +1330,9 @@ mod tests {
         );
         drop(writer);
 
-        let result = run_startup_advisory_with_allowlist(&path, &synthetic_allowlist);
+        let result = run_startup_advisory_with_allowlist(&path, &synthetic_allowlist, || {
+            Ok(open_writer(path.clone()))
+        });
 
         // (a) AdvisoryResult.triggered_rule_ids contains rule_id 4.
         assert_eq!(
@@ -1128,7 +1398,9 @@ mod tests {
         );
         drop(writer);
 
-        let result = run_startup_advisory_with_allowlist(&path, &synthetic_allowlist);
+        let result = run_startup_advisory_with_allowlist(&path, &synthetic_allowlist, || {
+            Ok(open_writer(path.clone()))
+        });
 
         // (a) AdvisoryResult.triggered_rule_ids contains rule_id 7.
         assert_eq!(
@@ -1187,7 +1459,9 @@ mod tests {
         );
         drop(writer);
 
-        let result = run_startup_advisory_with_allowlist(&path, &synthetic_allowlist);
+        let result = run_startup_advisory_with_allowlist(&path, &synthetic_allowlist, || {
+            Ok(open_writer(path.clone()))
+        });
 
         // Rule 2 triggered once (not twice despite the duplicate hash).
         assert_eq!(
@@ -1244,7 +1518,9 @@ mod tests {
         );
         drop(writer);
 
-        let result = run_startup_advisory_with_allowlist(&path, &synthetic_allowlist);
+        let result = run_startup_advisory_with_allowlist(&path, &synthetic_allowlist, || {
+            Ok(open_writer(path.clone()))
+        });
         assert_eq!(result.triggered_rule_ids, vec![4]);
 
         let content = std::fs::read_to_string(&path).unwrap();
@@ -1315,7 +1591,12 @@ mod tests {
         write_context_rule_created(&writer, 5, "CAAAA...00003", vec![WasmHashPin::new(hash_b)]);
         drop(writer);
 
-        let result = run_startup_advisory_with_allowlist(&path, &synthetic_allowlist);
+        let mut opens = 0;
+        let result = run_startup_advisory_with_allowlist(&path, &synthetic_allowlist, || {
+            opens += 1;
+            Ok(open_writer(path.clone()))
+        });
+        assert_eq!(opens, 1);
 
         // Both rules triggered.
         let mut triggered = result.triggered_rule_ids.clone();

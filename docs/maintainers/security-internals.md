@@ -354,7 +354,26 @@ Check semantics, applied at writer open and again on every keyed acquisition by 
 | No anchor, file empty, no chain-root sidecar | Store nothing and write no row; the first append writes the first anchor |
 | No anchor, chain broken | Refuse |
 
-The ahead-of-anchor case is the ordinary one, not an exception. Unkeyed writers receive no anchor handle; they append only to zero-config logs, which show no keying: no tags in force, no tagged row, no chain-root sidecar, and no anchoring row. An unkeyed open of a log that shows any of these refuses with `audit.chain_key_unavailable`, and an open with an anchor store but no key refuses one with tags in force or a tagged row. The CLI startup advisory reads such a log without a writer and writes no row. The crash window between an entry's `fsync` and the anchor write lands in the same place. Adoption with no operator action is the path for a log that nothing shows was anchored, such as one written only by unkeyed writers on the zero-config quickstart. A log with keyed history first needs `stellar-agent audit bind-carriers --profile <NAME>` with every wallet process stopped.
+Unkeyed writers receive no anchor handle. The zero-config and read-only
+smart-account paths use them when the profile's audit key does not load. They
+append only to zero-config logs that show no keying: no tags in force, tagged
+row, chain-root sidecar, or anchoring row.
+
+An unkeyed open of a log that shows any of these refuses with
+`audit.chain_key_unavailable`. An open with an anchor store but no key refuses
+a log with tags in force or a tagged row. The CLI startup advisory scans
+without a writer. A finding acquires the profile's keyed writer to append a
+`sa_verifier_allowlist_advisory` row. Its unkeyed fallback applies only to a
+persisted profile whose audit key does not load and whose log shows no keying.
+
+The ahead-of-anchor case is the ordinary one for appends without an anchor.
+
+The crash window between an entry's `fsync` and the anchor write also leaves
+the log ahead of its anchor. Adoption needs no operator action for a log that
+nothing shows was anchored, such as one written only by unkeyed writers on the
+zero-config quickstart. A log with keyed history first needs
+`stellar-agent audit bind-carriers --profile <NAME>` with every wallet process
+stopped.
 
 **Missing anchor.** An absent anchor is adopted only when nothing shows one was written. Three facts outlive a deleted anchor and show it: an audit binding recorded for the profile before this use, a chain-root sidecar beside the active file, and an `audit_tip_anchored` row of any reason in it. For an empty active file only the sidecar counts, since a rotation renames the sidecar with its archive and an empty file with one was truncated. With any of them the writer refuses with `audit.tip_anchor_missing`, naming the fact, and writes neither an anchor nor a row; the cached-writer check refuses the same way. Without the check, deleting the anchor and truncating the log would be adopted as a fresh log and the removed rows would leave no trace. A keyed use records an absent binding only after the audit key has loaded and passed the owner-key check, so a binding is never recorded for a profile with no key. `profile rotate-audit-key` minting a profile's first key treats a recorded binding as no evidence, since no keyed use of that log could have happened, and records an absent binding only after its writer opens. A log a keyed writer wrote with no anchor store carries a sidecar and is refused too. The way out is `audit reanchor --acknowledge-rollback`, whose `rollback_acknowledged` row is the permanent record. `audit verify --profile` applies the same rule to the profile's own log after the walk and fails with `audit.tip_anchor_missing`, its message saying `anchor: missing`. A keyed access on an empty log records the binding without writing an anchor; when only unkeyed writers append after it, the next keyed open reads the binding as evidence and refuses until the repair.
 

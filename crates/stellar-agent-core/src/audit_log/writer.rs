@@ -7269,7 +7269,7 @@ impl AuditWriterRegistry {
 
     /// Acquires a keyed writer and collects tip facts under its verification guard.
     ///
-    /// The writer mutex stays held from history verification through fact collection.
+    /// The writer stays exclusively held from history verification through fact collection.
     /// Both a fresh open and a cache hit walk the retained history once.
     ///
     /// # Errors
@@ -7420,24 +7420,12 @@ impl AuditWriterRegistry {
         // Perform the I/O (directory creation, advisory lock, chain recovery)
         // without holding the registry lock so concurrent opens for different
         // profiles do not serialise behind each other's I/O.
-        let (key, store, binding) = match access {
-            Some(access) => {
-                let binding = access.binding_history();
-                let (key, store) = access.into_parts();
-                (Some(key), Some(store), binding)
-            }
-            None => (None, None, BindingHistory::NotRecorded),
-        };
-        let handle = Arc::new(Mutex::new(AuditWriter::open_before_history(
+        let handle = Arc::new(Mutex::new(AuditWriter::open(
             log_path.to_path_buf(),
-            key,
-            store,
-            binding,
-            TipAnchorOpenMode::Check,
+            access,
         )?));
         let facts = {
             let mut writer = lock_for_verification(&handle)?;
-            writer.verify_retained_history()?;
             if collect_facts {
                 Some(writer.tip_facts_after_verification()?)
             } else {

@@ -285,7 +285,24 @@ The same pre-flight proves the audit log still contains the chain tip its keyrin
 
 ## Startup advisory
 
-Before dispatching any command, the CLI runs a local-only startup advisory: it scans the profile's audit log for context rules that reference revoked or retired verifier WASM hashes. The scan issues no network calls and is non-fatal. If it cannot run, the error is logged at warn level and the command proceeds. The advisory reads the audit log of the profile the command it precedes operates on: it takes the profile the parsed subcommand resolved and applies the same resolution order as that subcommand. The advisory therefore never opens — or appends to — a different profile's log than the command itself uses.
+Before dispatching any command, the CLI scans the profile's audit log for
+context rules that reference revoked or retired verifier WASM hashes. The scan
+reads without a writer and issues no network calls.
+
+A finding prints a stderr advisory and opens a writer to append a
+`sa_verifier_allowlist_advisory` row with the profile's audit key. The writer
+opens unkeyed only for a persisted profile whose audit key does not load and
+whose log shows no keying. A keyed finding append checks the profile binding
+and handles the tip anchor like every keyed append. Later findings reuse the
+writer, which closes before command dispatch. An incomplete pin record prints its recovery without an
+allowlist lookup or audit row.
+
+A start without findings writes nothing and logs nothing. A scan failure logs a
+warning and the command proceeds. A writer acquisition or append failure logs
+a warning and leaves the stderr advisory intact.
+
+The advisory uses the parsed subcommand's profile selection and resolution
+order. It reads and appends to the same profile's configured log as the command.
 
 Signing under a rule pinned to a revoked or retired verifier refuses with `sa.verifier_wasm_revoked` or `sa.verifier_wasm_retired`. No flag overrides this status.
 

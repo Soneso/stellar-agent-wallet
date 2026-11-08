@@ -23,9 +23,10 @@ mod render;
 #[cfg(test)]
 mod test_rpc;
 
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock, Mutex};
 
 use clap::{Parser, Subcommand};
+use stellar_agent_core::audit_log::AuditWriter;
 use stellar_agent_core::observability;
 
 use crate::common::resolve_profile_name;
@@ -372,8 +373,9 @@ async fn async_main() -> i32 {
     //
     // `run_startup_advisory` accepts no `StellarRpcClient`: the advisory scan is
     // strictly local and issues no network calls.
-    let _ =
-        run_profile_startup_advisory(cli.command.profile_flag(), advisory::run_startup_advisory);
+    let _ = run_profile_startup_advisory(cli.command.profile_flag(), |path, open_writer| {
+        advisory::run_startup_advisory(path, open_writer)
+    });
 
     match cli.command {
         Commands::Vault(args) => commands::vault::run(&args).await,
@@ -486,11 +488,25 @@ fn schema_argument_name(command: &clap::Command, reported: &str) -> Option<Strin
 /// failure and none for a profile that does not exist yet.
 fn run_profile_startup_advisory(
     profile_flag: Option<&str>,
-    scan: impl FnOnce(&std::path::Path) -> advisory::AdvisoryResult,
+    scan: impl FnOnce(
+        &std::path::Path,
+        Box<dyn FnOnce() -> Result<Arc<Mutex<AuditWriter>>, String> + '_>,
+    ) -> advisory::AdvisoryResult,
 ) -> advisory::AdvisoryResult {
     let resolved = resolve_profile_name(profile_flag);
     match common::profile_access::load_profile_reconciled(&resolved) {
-        Ok(profile) => scan(&profile.audit_log_path),
+        Ok(profile) => scan(
+            &profile.audit_log_path,
+            Box::new(|| {
+                commands::value_audit::open_best_effort_audit_writer(
+                    &profile,
+                    &resolved.name,
+                    common::profile_access::ProfileOrigin::Persisted,
+                )
+                .map(|writer| Arc::new(Mutex::new(writer)))
+                .map_err(|error| error.to_string())
+            }),
+        ),
         Err(error) => {
             tracing::debug!(
                 code = error.code(),
@@ -522,7 +538,7 @@ mod tests {
         let _inert = inert_dispatcher();
         tracing::subscriber::with_default(subscriber, || {
             tracing::callsite::rebuild_interest_cache();
-            run_profile_startup_advisory(Some("CREDMARKER7"), |_| {
+            run_profile_startup_advisory(Some("CREDMARKER7"), |_, _| {
                 unreachable!("an absent profile cannot be scanned")
             });
         });
@@ -531,6 +547,60 @@ mod tests {
         assert!(logs.contains("code="));
         assert!(!logs.contains("CREDMARKER7"));
         assert!(!logs.contains("profile="));
+    }
+
+    #[test]
+    fn startup_advisory_writer_failure_keeps_stderr() {
+        let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args([
+                "--exact",
+                "advisory::tests::advisory_writer_open_failure_warns_once_and_keeps_findings",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .output()
+            .expect("run advisory failure fixture");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{stdout}\n{stderr}");
+        assert!(stdout.contains("test result: ok. 1 passed"), "{stdout}");
+        let lines: Vec<&str> = stderr.lines().collect();
+        assert_eq!(lines.len(), 2, "{stderr}");
+        for (line, byte) in lines.iter().zip(["ab", "cd"]) {
+            assert_eq!(
+                *line,
+                format!(
+                    "[advisory] rule 4 references revoked verifier {}; \
+                     run 'stellar-agent smart-account migrate-verifier' to remediate",
+                    byte.repeat(32),
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn startup_advisory_production_writer_failure_keeps_stderr() {
+        let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args([
+                "--exact",
+                "advisory::tests::startup_advisory_production_open_failure_warns_once_and_keeps_findings",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .output()
+            .expect("run production advisory failure fixture");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{stdout}\n{stderr}");
+        assert!(stdout.contains("test result: ok. 1 passed"), "{stdout}");
+        assert_eq!(
+            stderr.trim_end(),
+            format!(
+                "[advisory] rule 4 references revoked verifier {}; \
+                 run 'stellar-agent smart-account migrate-verifier' to remediate",
+                "ab".repeat(32),
+            ),
+        );
     }
 
     /// Parses an argument vector the way `main` does and returns the profile
