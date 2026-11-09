@@ -8,6 +8,22 @@ import { stellar } from '@stellar/mpp/charge/server'
 import { Challenge, Credential, Receipt } from 'mppx'
 import { Mppx, Store } from 'mppx/server'
 
+import { sdkVersionAcceptable } from './sdk-version.mjs'
+
+// Read the installed SDK version and refuse unsupported versions before
+// constructing the server. Refusals name the installed version.
+const installedSdk = JSON.parse(
+  await readFile(
+    new URL('./node_modules/@stellar/stellar-sdk/package.json', import.meta.url),
+    'utf8',
+  ),
+).version
+const sdkVerdict = sdkVersionAcceptable(installedSdk)
+if (sdkVerdict !== true) {
+  console.error(sdkVerdict)
+  process.exit(1)
+}
+
 const contract = 'CBIELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEIE3USCIHMXQDAMA'
 const payer = 'GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF'
 const recipient = 'GAJZR5RMNUNEK7CRXJVEWXZ5XUXWT7FJGILCDDOITF7EC26RPWJ4UVOE'
@@ -53,7 +69,7 @@ const actual = {
   provenance: {
     package: '@stellar/mpp@0.7.1',
     sourceCommit: '9f2f8254421e09906dfb7e983e2491a273120adf',
-    stellarSdk: '16.4.1',
+    stellarSdk: installedSdk,
     mppx: '0.8.19',
     node: '24.5.0',
     pnpm: '10.33.0',
