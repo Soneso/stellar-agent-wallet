@@ -8,10 +8,14 @@
 //! and the keyring is a mock store with a read hook on the signer coordinate,
 //! so a refused call proves it sent nothing and loaded no key.
 //!
-//! The last two tests drive the real binary over stdio. They queue a
-//! `profile_halted` row in the audit outbox while the server holds the keyed
-//! writer, then close stdin or send SIGTERM, and assert the server drains the
-//! row into the log before it exits.
+//! Two tests drive the real binary over stdio. They queue a `profile_halted`
+//! row in the audit outbox while the server holds the keyed writer, then close
+//! stdin or send SIGTERM, and assert the server drains the row into the log
+//! before it exits.
+//!
+//! Two more tests drive `serve_on_until` over a duplex stream: a shutdown
+//! future stops a live session, and the shutdown wait bounds a session that
+//! cannot stop.
 //!
 //! The tools under test come from the server's own descriptors, so a tool
 //! added later is covered without editing this file.
@@ -28,6 +32,7 @@ use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -41,9 +46,10 @@ use stellar_agent_core::profile::halt::{self, HaltMarker};
 use stellar_agent_core::profile::loader;
 use stellar_agent_core::profile::schema::Profile;
 use stellar_agent_mcp::server::WalletServer;
+use stellar_agent_mcp::transport::{BoundedTransport, SHUTDOWN_WAIT, serve_on_until};
 use stellar_agent_network::keyring::KeyringTipAnchorStore;
 use stellar_agent_test_support::{StellarAgentHomeGuard, keyring_mock};
-use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
+use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _, BufReader};
 
 use crate::common::policy_mock::MockPolicyEngine;
 
@@ -79,6 +85,11 @@ impl Client {
                 .expect("server initializes");
             let _ = service.waiting().await;
         });
+        Self::over(client_side).await
+    }
+
+    /// Completes the MCP initialization handshake on `client_side`.
+    async fn over(client_side: tokio::io::DuplexStream) -> Self {
         let (read, write) = tokio::io::split(client_side);
         let mut client = Self {
             write,
@@ -570,6 +581,112 @@ async fn the_signer_read_and_request_witnesses_count_an_unhalted_call() {
     );
 }
 
+/// A resolved shutdown future cancels a live session while its client stays
+/// connected, and the session stops before the fallback wait expires.
+#[tokio::test]
+#[serial]
+async fn serve_on_until_returns_after_the_shutdown_future_resolves() {
+    let server = WalletServer::new(
+        Profile::builder_testnet_named("shutdown-future", "svc", "acct", "nonce-svc", "nonce-acct")
+            .with_noop_engine()
+            .build(),
+    )
+    .unwrap();
+    let (client_side, server_side) = tokio::io::duplex(1 << 20);
+    let (server_read, server_write) = tokio::io::split(server_side);
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let task = tokio::spawn(async move {
+        serve_on_until(
+            server,
+            BoundedTransport::over(server_read, server_write),
+            async {
+                let _ = rx.await;
+            },
+        )
+        .await
+        .map_err(|error| error.to_string())
+    });
+    let mut client = Client::over(client_side).await;
+    // A response after initialization proves shutdown reaches the running session.
+    let ping = client.request("ping", json!({})).await;
+    assert!(ping.get("result").is_some(), "ping failed: {ping}");
+
+    let signalled_at = Instant::now();
+    tx.send(()).unwrap();
+    let result = tokio::time::timeout(Duration::from_secs(10), task)
+        .await
+        .expect("the serving task returns within ten seconds")
+        .expect("the serving task joins");
+    assert!(result.is_ok(), "the session stops cleanly: {result:?}");
+    assert!(
+        signalled_at.elapsed() < SHUTDOWN_WAIT,
+        "cancellation stops the session before the shutdown wait expires"
+    );
+    drop(client);
+}
+
+/// A session whose write is blocked cannot stop on cancel; the shutdown wait
+/// bounds it and the function returns on the warn path.
+#[tokio::test]
+#[serial]
+async fn serve_on_until_returns_after_the_shutdown_wait_when_the_session_cannot_stop() {
+    let server = WalletServer::new(
+        Profile::builder_testnet_named("shutdown-wait", "svc", "acct", "nonce-svc", "nonce-acct")
+            .with_noop_engine()
+            .build(),
+    )
+    .unwrap();
+    let (client_side, server_side) = tokio::io::duplex(256);
+    let (server_read, server_write) = tokio::io::split(server_side);
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let task = tokio::spawn(async move {
+        serve_on_until(
+            server,
+            BoundedTransport::over(server_read, server_write),
+            async {
+                let _ = rx.await;
+            },
+        )
+        .await
+        .map_err(|error| error.to_string())
+    });
+    let mut client = Client::over(client_side).await;
+    let ping = client.request("ping", json!({})).await;
+    assert!(ping.get("result").is_some(), "ping failed: {ping}");
+
+    // Reading one raw byte proves the tool-list response holds the write mutex.
+    // The remaining response fills the buffer and blocks the write through cancellation.
+    let id = client.next_id;
+    client.next_id += 1;
+    client
+        .send(&json!({ "jsonrpc": "2.0", "id": id, "method": "tools/list", "params": {} }))
+        .await;
+    let mut byte = [0];
+    tokio::time::timeout(
+        Duration::from_secs(30),
+        client.lines.get_mut().get_mut().read_exact(&mut byte),
+    )
+    .await
+    .expect("the reply write starts")
+    .unwrap();
+
+    let signalled_at = Instant::now();
+    tx.send(()).unwrap();
+    let result = tokio::time::timeout(SHUTDOWN_WAIT + Duration::from_secs(5), task)
+        .await
+        .expect("the serving task returns within the shutdown wait plus five seconds")
+        .expect("the serving task joins");
+    assert!(
+        result.is_ok(),
+        "the warn path returns successfully: {result:?}"
+    );
+    assert!(
+        signalled_at.elapsed() >= SHUTDOWN_WAIT,
+        "the blocked session reaches the shutdown wait"
+    );
+    drop(client);
+}
+
 // ── The binary's exit drain ──────────────────────────────────────────────────
 
 /// The key that seals the headless store the test process and the server child
@@ -630,6 +747,8 @@ impl HeadlessServer {
         command
             .args(["--profile", PROFILE])
             .env("STELLAR_AGENT_HOME", self.home.path())
+            .env("STELLAR_AGENT_LOG", "info")
+            .env_remove("RUST_LOG")
             .env("STELLAR_AGENT_KEYRING_BACKEND", "headless-env")
             .env(
                 "STELLAR_AGENT_HEADLESS_KEYRING_KEY",
@@ -810,9 +929,10 @@ fn the_server_drains_a_queued_halt_row_when_its_stdin_closes() {
     let fixture = HeadlessServer::new();
     let mut server = ChildServer::start(fixture.command());
     let response = server.call("stellar_sep43_sign_message", &sign_message_args());
-    assert!(
-        response.get("result").is_some(),
-        "the signing call answers through the audit pre-flight: {response}"
+    assert_eq!(
+        envelope_code(&response).as_deref(),
+        Some("sep43.wallet_unlock_failed"),
+        "the signing call reaches the missing seed after the audit pre-flight: {response}"
     );
     assert!(
         fixture.profile.audit_log_path.is_file(),
@@ -840,8 +960,8 @@ fn the_server_drains_a_queued_halt_row_when_its_stdin_closes() {
     assert_halt_row_in_log(&fixture.profile.audit_log_path, &marker);
 }
 
-/// The same contract for SIGTERM, which the process would otherwise take as
-/// the default action and never reach the drain.
+/// The same contract for SIGTERM: the server handles the signal, drains the
+/// queued row, and exits `0`.
 #[cfg(unix)]
 #[test]
 #[serial]
@@ -849,9 +969,10 @@ fn the_server_drains_a_queued_halt_row_on_sigterm() {
     let fixture = HeadlessServer::new();
     let mut server = ChildServer::start(fixture.command());
     let response = server.call("stellar_sep43_sign_message", &sign_message_args());
-    assert!(
-        response.get("result").is_some(),
-        "the signing call answers through the audit pre-flight: {response}"
+    assert_eq!(
+        envelope_code(&response).as_deref(),
+        Some("sep43.wallet_unlock_failed"),
+        "the signing call reaches the missing seed after the audit pre-flight: {response}"
     );
     assert!(
         fixture.profile.audit_log_path.is_file(),

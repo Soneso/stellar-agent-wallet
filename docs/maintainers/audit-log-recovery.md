@@ -173,7 +173,7 @@ The anchor is also not a cross-host guarantee. It is held in the local keyring a
 
 It is also not continuous in time. The anchor is written after the entry it covers is fsynced, because failing an append over a keyring error would misreport a row that was written. That leaves three states, and they differ in kind:
 
-- **Lagging.** Between an entry's fsync and its anchor write landing, the anchor names the previous entry of this file. A rollback to that entry or later is absorbed; anything earlier is still refused. The write retries once immediately, then on the next append or keyed acquisition. After process exit, rollback to the previous anchor silently loses the unanchored tail. An outage widens the lag to the appends made during the outage.
+- **Lagging.** Between an entry's fsync and its anchor write landing, the anchor names the previous entry of this file. A rollback to that entry or later is absorbed; anything earlier is still refused. The write retries once immediately, then on the next append or keyed acquisition. The MCP server's exit drain retries it as well. After process exit, rollback to the previous anchor silently loses the unanchored tail. An outage widens the lag to the appends made during the outage.
 - **Off, no anchor yet.** Until the first keyed append on a log path, nothing is anchored: a new profile, or a log written only by unkeyed writers. A changed `audit_log_path` is refused by the audit binding until it is acknowledged (§4). Adoption takes the file as it finds it. A rollback performed before that first acquisition becomes the baseline, silently, because there is no earlier anchored state to compare it against. Once a keyed writer has run, a deleted anchor no longer returns the log to this state (section 1.1).
 - **Off, freshly rotated file.** From a rotation until the first append into the new file has its anchor write land, the anchor still names the archive's handoff. Any prefix of the new file, down to empty, is accepted if it chains from that handoff. Normally one append wide; a keyring outage spanning that append holds it open.
 
@@ -299,7 +299,7 @@ A failed state write truncates the line back and refuses the append.
 - when it opens, right after the tip-anchor check;
 - on every keyed acquisition in a running process, under the same lock as that check;
 - before each row of its own;
-- when the MCP server exits, on client EOF and on SIGINT or SIGTERM, for every keyed writer it cached.
+- when the MCP server exits on client EOF, on SIGINT, or on SIGTERM on Unix, for every keyed writer it caches.
 
 A command that consumes an approval acquires the writer after it reads the approval and before it loads a signing key. A queued consent row is therefore in the log before the key is touched. `audit reanchor` drains after its repair rows. The repair writer never drains when it opens, and its reporting form never drains.
 

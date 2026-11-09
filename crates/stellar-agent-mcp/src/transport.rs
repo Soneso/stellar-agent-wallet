@@ -24,6 +24,7 @@ use rmcp::{
     },
 };
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::Mutex as TokioMutex;
 use tokio_util::codec::{FramedRead, FramedWrite};
@@ -317,10 +318,10 @@ pub async fn serve(server: WalletServer) -> Result<(), Box<dyn std::error::Error
 /// disconnects or `shutdown` resolves.
 ///
 /// `shutdown` is polled from before the session starts. When it resolves, the
-/// service is cancelled and awaited, so its transport is closed and its task
-/// has finished before this function returns. A caller that holds
-/// process-global state, such as the audit writer registry, can then drain it
-/// with nothing else in the process appending.
+/// service is cancelled and its session task is awaited for at most
+/// [`SHUTDOWN_WAIT`]. Within that wait the task closes the transport before
+/// this function returns. A tool call that runs past the session's own drain
+/// timeout keeps running; it reaches the audit log only through the writer mutex.
 ///
 /// # Errors
 ///
@@ -367,6 +368,10 @@ where
     serve_on_until(server, transport, std::future::pending::<()>()).await
 }
 
+/// Bounds the session's stop after a shutdown signal, allowing more than
+/// rmcp's two-second response drain.
+pub const SHUTDOWN_WAIT: Duration = Duration::from_secs(5);
+
 /// Runs `server` on `transport` until the client disconnects or `shutdown`
 /// resolves.
 ///
@@ -410,7 +415,18 @@ where
                 "stellar-agent-mcp: shutdown signal received; stopping the MCP server"
             );
             cancellation.cancel();
-            waiting.await?;
+            match tokio::time::timeout(SHUTDOWN_WAIT, &mut waiting).await {
+                Ok(result) => {
+                    result?;
+                }
+                Err(_elapsed) => {
+                    tracing::warn!(
+                        wait_seconds = SHUTDOWN_WAIT.as_secs(),
+                        "stellar-agent-mcp: the session did not stop within \
+                         the shutdown wait; draining and exiting"
+                    );
+                }
+            }
         }
     }
     Ok(())

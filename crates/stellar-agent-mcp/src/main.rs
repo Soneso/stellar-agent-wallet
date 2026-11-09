@@ -284,9 +284,8 @@ fn resolve_and_validate_profile_name(requested: Option<&str>) -> ResolvedProfile
 ///
 /// The server races this against the stdio session. When it resolves, the
 /// transport cancels the session and returns, and `main` drains the audit
-/// outboxes of the writers this process cached before it exits. Handling the
-/// signal here, rather than letting the default action terminate the process,
-/// is what gives that drain a chance to run.
+/// outboxes of the writers this process cached before it exits. Handling these
+/// signals lets that drain run before the process ends.
 async fn shutdown_signal() {
     let ctrl_c = async {
         if let Err(error) = tokio::signal::ctrl_c().await {
@@ -517,9 +516,9 @@ async fn main() {
     // The transport returns on client EOF and on SIGINT/SIGTERM. Either way a
     // `profile halt` or `profile resume` row queued while this server held the
     // writer must reach the log now: a halted profile may see no further keyed
-    // command for a long time. A refused drain is logged by the registry and
-    // leaves the outbox unchanged, so delivery stays at least once and the
-    // exit code is unaffected.
+    // command for a long time. A failed check is logged by the registry; a
+    // refused drain leaves the outbox unchanged, so delivery stays at least
+    // once. The exit code is unaffected.
     let drained = stellar_agent_core::audit_log::AuditWriterRegistry::drain_cached_outboxes();
     tracing::info!(
         writers = drained,

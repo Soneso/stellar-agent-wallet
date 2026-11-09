@@ -810,10 +810,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- The MCP server drains the audit outbox of every keyed writer it cached when
-  it exits, on client EOF and on SIGINT or SIGTERM, so a `profile_halted` or
-  `profile_resumed` row queued while it held the writer reaches the log at
-  shutdown instead of waiting for the next keyed command.
+- The MCP server drains the audit outbox of every keyed writer it holds when
+  it exits on client EOF, on SIGINT, or on SIGTERM on Unix. A consent, halt,
+  or resume row queued while the server held the writer reaches the log at
+  shutdown. A refused drain leaves the rows queued. After SIGINT or SIGTERM
+  the server exits `0`. Thanks to @PrathaMesh3056.
 - `smart-account execute` refuses an `--expect-rule-signer` value that is not 64
   hexadecimal characters at the argument parser, before any profile or key is
   read. The `validation.usage_error` envelope names the flag, never the value.
