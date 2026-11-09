@@ -153,7 +153,7 @@ stellar-agent-anchor = { path = "crates/stellar-agent-anchor", version = "0.1.0-
 stellar-agent-mcp-macros = { path = "crates/stellar-agent-mcp-macros", version = "0.1.0-alpha.13" }
 stellar-agent-mcp = { path = "crates/stellar-agent-mcp", version = "0.1.0-alpha.13", default-features = false }
 # CLI binary (stellar-agent) deps.
-clap = { version = "=4.6.1", default-features = false, features = ["std", "derive", "help", "usage"] }
+clap = { version = "=4.6.1", default-features = false, features = ["std", "derive", "help", "usage", "error-context"] }
 # webbrowser: launches the system browser for the loopback handoffs. The only
 # URL it ever receives is the file:// URL of the private redirect file that the
 # CLI's `common::private_open` builds after accepting only a wallet loopback
