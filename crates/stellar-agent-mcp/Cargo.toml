@@ -136,8 +136,9 @@ tokio-util = { workspace = true }
 # SinkExt + StreamExt traits for the bounded stdio transport.
 futures = { workspace = true }
 
-# Tokio async runtime — `rt-multi-thread` for the MCP stdio server.
-tokio = { workspace = true, features = ["rt-multi-thread", "io-std"] }
+# Tokio async runtime: `rt-multi-thread` for the MCP stdio server, `signal` and
+# `time` for the SIGINT/SIGTERM shutdown that drains the audit outbox before exit.
+tokio = { workspace = true, features = ["rt-multi-thread", "io-std", "signal", "time"] }
 
 # Raw prctl(2) on Linux for process isolation; #[cfg(target_os = "linux")] only,
 # a zero-dep no-op on macOS/Windows.
@@ -199,6 +200,9 @@ inventory                  = { workspace = true }
 # through dispatch_gate_inner's window-state refresh/record and need the
 # persisted store isolated to a temp dir instead of the real OS state dir.
 stellar-agent-core = { path = "../stellar-agent-core", features = ["test-helpers"] }
+# The headless keyring store the binary-spawn halt tests install in-process and
+# point the child at with STELLAR_AGENT_KEYRING_BACKEND=headless-env.
+stellar-agent-headless-keyring = { path = "../stellar-agent-headless-keyring", features = ["test-helpers"] }
 stellar-agent-mcp-macros = { path = "../stellar-agent-mcp-macros" }
 # Wiremock for the friendbot + balances handler tests.
 wiremock                   = { workspace = true }

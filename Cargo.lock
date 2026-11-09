@@ -4863,6 +4863,7 @@ dependencies = [
  "stellar-agent-defi",
  "stellar-agent-defindex",
  "stellar-agent-dex",
+ "stellar-agent-headless-keyring",
  "stellar-agent-mcp",
  "stellar-agent-mcp-macros",
  "stellar-agent-mpp",

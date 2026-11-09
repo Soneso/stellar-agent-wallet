@@ -2,11 +2,20 @@
 //! the server's `tools/call` entry point, before any signer read or RPC
 //! request.
 //!
-//! Each test serves a [`WalletServer`] over an in-memory duplex stream and
-//! speaks JSON-RPC to it, so every call takes the same path a client's call
+//! Most tests serve a [`WalletServer`] over an in-memory duplex stream and
+//! speak JSON-RPC to it, so every call takes the same path a client's call
 //! takes. The profile's endpoint is a mock server that records every request,
 //! and the keyring is a mock store with a read hook on the signer coordinate,
 //! so a refused call proves it sent nothing and loaded no key.
+//!
+//! Two tests drive the real binary over stdio. They queue a `profile_halted`
+//! row in the audit outbox while the server holds the keyed writer, then close
+//! stdin or send SIGTERM, and assert the server drains the row into the log
+//! before it exits.
+//!
+//! Two more tests drive `serve_on_until` over a duplex stream: a shutdown
+//! future stops a live session, and the shutdown wait bounds a session that
+//! cannot stop.
 //!
 //! The tools under test come from the server's own descriptors, so a tool
 //! added later is covered without editing this file.
@@ -18,20 +27,29 @@
     reason = "test-only; panics and unwraps are acceptable in integration tests"
 )]
 
+use std::io::{BufRead as _, Write as _};
 use std::path::Path;
+use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
+use base64::Engine as _;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use rmcp::ServiceExt as _;
 use serde_json::{Value, json};
 use serial_test::serial;
+use stellar_agent_core::audit_log::outbox::OUTBOX_LOCK_WAIT_ENV;
+use stellar_agent_core::audit_log::{AuditEntry, AuditOutbox, inspect_outbox};
 use stellar_agent_core::policy::ToolValueKind;
 use stellar_agent_core::profile::halt::{self, HaltMarker};
 use stellar_agent_core::profile::loader;
 use stellar_agent_core::profile::schema::Profile;
 use stellar_agent_mcp::server::WalletServer;
+use stellar_agent_mcp::transport::{BoundedTransport, SHUTDOWN_WAIT, serve_on_until};
+use stellar_agent_network::keyring::KeyringTipAnchorStore;
 use stellar_agent_test_support::{StellarAgentHomeGuard, keyring_mock};
-use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
+use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _, BufReader};
 
 use crate::common::policy_mock::MockPolicyEngine;
 
@@ -67,6 +85,11 @@ impl Client {
                 .expect("server initializes");
             let _ = service.waiting().await;
         });
+        Self::over(client_side).await
+    }
+
+    /// Completes the MCP initialization handshake on `client_side`.
+    async fn over(client_side: tokio::io::DuplexStream) -> Self {
         let (read, write) = tokio::io::split(client_side);
         let mut client = Self {
             write,
@@ -556,4 +579,430 @@ async fn the_signer_read_and_request_witnesses_count_an_unhalted_call() {
         requests,
         "the halted call sends no request"
     );
+}
+
+/// A resolved shutdown future cancels a live session while its client stays
+/// connected, and the session stops before the fallback wait expires.
+#[tokio::test]
+#[serial]
+async fn serve_on_until_returns_after_the_shutdown_future_resolves() {
+    let server = WalletServer::new(
+        Profile::builder_testnet_named("shutdown-future", "svc", "acct", "nonce-svc", "nonce-acct")
+            .with_noop_engine()
+            .build(),
+    )
+    .unwrap();
+    let (client_side, server_side) = tokio::io::duplex(1 << 20);
+    let (server_read, server_write) = tokio::io::split(server_side);
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let task = tokio::spawn(async move {
+        serve_on_until(
+            server,
+            BoundedTransport::over(server_read, server_write),
+            async {
+                let _ = rx.await;
+            },
+        )
+        .await
+        .map_err(|error| error.to_string())
+    });
+    let mut client = Client::over(client_side).await;
+    // A response after initialization proves shutdown reaches the running session.
+    let ping = client.request("ping", json!({})).await;
+    assert!(ping.get("result").is_some(), "ping failed: {ping}");
+
+    let signalled_at = Instant::now();
+    tx.send(()).unwrap();
+    let result = tokio::time::timeout(Duration::from_secs(10), task)
+        .await
+        .expect("the serving task returns within ten seconds")
+        .expect("the serving task joins");
+    assert!(result.is_ok(), "the session stops cleanly: {result:?}");
+    assert!(
+        signalled_at.elapsed() < SHUTDOWN_WAIT,
+        "cancellation stops the session before the shutdown wait expires"
+    );
+    drop(client);
+}
+
+/// A session whose write is blocked cannot stop on cancel; the shutdown wait
+/// bounds it and the function returns on the warn path.
+#[tokio::test]
+#[serial]
+async fn serve_on_until_returns_after_the_shutdown_wait_when_the_session_cannot_stop() {
+    let server = WalletServer::new(
+        Profile::builder_testnet_named("shutdown-wait", "svc", "acct", "nonce-svc", "nonce-acct")
+            .with_noop_engine()
+            .build(),
+    )
+    .unwrap();
+    let (client_side, server_side) = tokio::io::duplex(256);
+    let (server_read, server_write) = tokio::io::split(server_side);
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let task = tokio::spawn(async move {
+        serve_on_until(
+            server,
+            BoundedTransport::over(server_read, server_write),
+            async {
+                let _ = rx.await;
+            },
+        )
+        .await
+        .map_err(|error| error.to_string())
+    });
+    let mut client = Client::over(client_side).await;
+    let ping = client.request("ping", json!({})).await;
+    assert!(ping.get("result").is_some(), "ping failed: {ping}");
+
+    // Reading one raw byte proves the tool-list response holds the write mutex.
+    // The remaining response fills the buffer and blocks the write through cancellation.
+    let id = client.next_id;
+    client.next_id += 1;
+    client
+        .send(&json!({ "jsonrpc": "2.0", "id": id, "method": "tools/list", "params": {} }))
+        .await;
+    let mut byte = [0];
+    tokio::time::timeout(
+        Duration::from_secs(30),
+        client.lines.get_mut().get_mut().read_exact(&mut byte),
+    )
+    .await
+    .expect("the reply write starts")
+    .unwrap();
+
+    let signalled_at = Instant::now();
+    tx.send(()).unwrap();
+    let result = tokio::time::timeout(SHUTDOWN_WAIT + Duration::from_secs(5), task)
+        .await
+        .expect("the serving task returns within the shutdown wait plus five seconds")
+        .expect("the serving task joins");
+    assert!(
+        result.is_ok(),
+        "the warn path returns successfully: {result:?}"
+    );
+    assert!(
+        signalled_at.elapsed() >= SHUTDOWN_WAIT,
+        "the blocked session reaches the shutdown wait"
+    );
+    drop(client);
+}
+
+// ── The binary's exit drain ──────────────────────────────────────────────────
+
+/// The key that seals the headless store the test process and the server child
+/// share.
+const HEADLESS_KEY: [u8; 32] = [0x6d; 32];
+
+/// Installs the file-backed keyring store at the path the child resolves from
+/// `STELLAR_AGENT_HOME`, and makes it this process's default store.
+fn install_headless_store(home: &Path) {
+    let store: Arc<keyring_core::CredentialStore> =
+        Arc::new(stellar_agent_headless_keyring::store::HeadlessStore::new(
+            home.join("headless-keyring").join("store.keyring"),
+            stellar_agent_headless_keyring::crypto::ProtectionMode::EnvKey(Arc::new(
+                zeroize::Zeroizing::new(HEADLESS_KEY),
+            )),
+        ));
+    keyring_core::set_default_store(store);
+}
+
+/// A temporary data root with a saved testnet profile, its audit key, and the
+/// signer identity record, all in the headless keyring the child will read.
+struct HeadlessServer {
+    home: tempfile::TempDir,
+    profile: Profile,
+}
+
+impl HeadlessServer {
+    fn new() -> Self {
+        let home = tempfile::tempdir().unwrap();
+        install_headless_store(home.path());
+        let profile =
+            Profile::builder_testnet(SIGNER_SERVICE, SIGNER_ACCOUNT, "halt-e2e-nonce", "default")
+                .with_profile_name(PROFILE)
+                // The signing call must fail at the seed read, after the audit
+                // writer is cached, so this endpoint is never contacted.
+                .rpc_url("http://127.0.0.1:9")
+                .audit_log_path(home.path().join("audit").join(format!("{PROFILE}.jsonl")))
+                .with_noop_engine()
+                .build();
+        let audit_key = &profile.audit_log_hash_chain_key_id;
+        keyring_core::Entry::new(&audit_key.service, &audit_key.account)
+            .unwrap()
+            .set_password(&URL_SAFE_NO_PAD.encode(AUDIT_KEY))
+            .unwrap();
+        crate::common::store_named_signer_identity(
+            PROFILE,
+            SIGNER_SERVICE,
+            SIGNER_ACCOUNT,
+            [0x48; 32],
+        );
+        loader::save_to_dir(PROFILE, &profile, &home.path().join("profiles")).unwrap();
+        Self { home, profile }
+    }
+
+    /// The binary bound to this home and the headless keyring.
+    fn command(&self) -> Command {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_stellar-agent-mcp"));
+        command
+            .args(["--profile", PROFILE])
+            .env("STELLAR_AGENT_HOME", self.home.path())
+            .env("STELLAR_AGENT_LOG", "info")
+            .env_remove("RUST_LOG")
+            .env("STELLAR_AGENT_KEYRING_BACKEND", "headless-env")
+            .env(
+                "STELLAR_AGENT_HEADLESS_KEYRING_KEY",
+                URL_SAFE_NO_PAD.encode(HEADLESS_KEY),
+            )
+            // Ambient overlays must not select another profile, endpoint, or
+            // signer; the persisted profile is what this test exercises.
+            .env_remove("STELLAR_AGENT_PROFILE")
+            .env_remove("STELLAR_AGENT_CHAIN_ID")
+            .env_remove("STELLAR_AGENT_RPC_URL")
+            .env_remove("STELLAR_AGENT_SECONDARY_RPC_URL")
+            .env_remove("STELLAR_AGENT_ORACLE_PROVIDER_URL")
+            .env_remove("STELLAR_AGENT_MCP_SIGNER_DEFAULT")
+            .env_remove(OUTBOX_LOCK_WAIT_ENV);
+        command
+    }
+
+    /// Writes the halt marker and queues its audit row in the outbox, as
+    /// `profile halt` does while the server holds the draining writer.
+    fn queue_halt_row(&self) -> HaltMarker {
+        let marker = HaltMarker::new(
+            "2026-10-31T12:00:00Z".to_owned(),
+            Some("queued while the server held the writer".to_owned()),
+        )
+        .unwrap();
+        halt::write_halt(self.home.path(), PROFILE, &marker).unwrap();
+        AuditOutbox::for_log(
+            &self.profile.audit_log_path,
+            KeyringTipAnchorStore::shared(
+                &self.profile.audit_log_hash_chain_key_id,
+                &self.profile.audit_log_path,
+            ),
+        )
+        .append(&AuditEntry::new_profile_halted(
+            PROFILE,
+            marker.halted_at.as_str(),
+            marker.reason.as_deref(),
+            "shutdown-drain-test",
+        ))
+        .unwrap();
+        marker
+    }
+}
+
+/// The number of rows queued in the outbox beside `log_path`.
+fn outbox_pending(log_path: &Path) -> usize {
+    inspect_outbox(log_path).unwrap().pending
+}
+
+/// Asserts the drained `profile_halted` row is in the log.
+fn assert_halt_row_in_log(log_path: &Path, marker: &HaltMarker) {
+    let content =
+        std::fs::read_to_string(log_path).expect("the drained log exists after the server exits");
+    let row = content
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .find(|row| row["kind"] == "profile_halted")
+        .unwrap_or_else(|| panic!("the drained halt row is in the log: {content}"));
+    assert_eq!(row["halted_at"], marker.halted_at.as_str());
+    assert_eq!(row["reason"], marker.reason.as_deref().unwrap());
+}
+
+/// A server child driven over its real stdio pipes.
+struct ChildServer {
+    child: Child,
+    stdin: Option<std::io::BufWriter<std::process::ChildStdin>>,
+    stdout: std::io::BufReader<std::process::ChildStdout>,
+    stderr: Option<std::process::ChildStderr>,
+    next_id: u64,
+}
+
+impl ChildServer {
+    fn start(mut command: Command) -> Self {
+        let mut child = command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("stellar-agent-mcp binary must spawn");
+        let stdin = std::io::BufWriter::new(child.stdin.take().expect("child stdin must be piped"));
+        let stdout =
+            std::io::BufReader::new(child.stdout.take().expect("child stdout must be piped"));
+        let stderr = child.stderr.take();
+        let mut server = Self {
+            child,
+            stdin: Some(stdin),
+            stdout,
+            stderr,
+            next_id: 1,
+        };
+        let init = server.request(
+            "initialize",
+            &json!({
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": { "name": "halt-integration", "version": "0" },
+            }),
+        );
+        assert!(init.get("result").is_some(), "initialize failed: {init}");
+        server.send(&json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }));
+        server
+    }
+
+    fn send(&mut self, message: &Value) {
+        let line = serde_json::to_string(message).unwrap();
+        let stdin = self.stdin.as_mut().expect("child stdin is open");
+        writeln!(stdin, "{line}").unwrap();
+        stdin.flush().unwrap();
+    }
+
+    /// Sends one request and returns its response, skipping notifications.
+    fn request(&mut self, method: &str, params: &Value) -> Value {
+        let id = self.next_id;
+        self.next_id += 1;
+        self.send(&json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }));
+        loop {
+            let mut line = String::new();
+            let read = self
+                .stdout
+                .read_line(&mut line)
+                .expect("child stdout must be readable");
+            assert!(
+                read > 0,
+                "the server closed stdout before answering {method}"
+            );
+            let message: Value = serde_json::from_str(&line).unwrap();
+            if message["id"] == json!(id) {
+                return message;
+            }
+        }
+    }
+
+    fn call(&mut self, tool: &str, arguments: &Value) -> Value {
+        self.request(
+            "tools/call",
+            &json!({ "name": tool, "arguments": arguments }),
+        )
+    }
+
+    /// Closes the child's stdin, which ends the stdio session at EOF.
+    fn close_stdin(&mut self) {
+        self.stdin = None;
+    }
+
+    /// Waits for the child to exit and returns its status and stderr.
+    fn wait(mut self) -> (std::process::ExitStatus, String) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            if let Some(status) = self.child.try_wait().unwrap() {
+                let mut stderr = String::new();
+                if let Some(mut pipe) = self.stderr.take() {
+                    use std::io::Read as _;
+                    pipe.read_to_string(&mut stderr).unwrap();
+                }
+                return (status, stderr);
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+                let mut stderr = String::new();
+                if let Some(mut pipe) = self.stderr.take() {
+                    use std::io::Read as _;
+                    let _ = pipe.read_to_string(&mut stderr);
+                }
+                panic!("the MCP server did not exit within 30 seconds.\nstderr: {stderr}");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+    }
+}
+
+/// Opens the server's keyed audit writer by making a signing call that fails
+/// at the seed read, then queues a halt row and closes stdin. The server must
+/// drain the row before it exits, with no keyed command run after it.
+#[test]
+#[serial]
+fn the_server_drains_a_queued_halt_row_when_its_stdin_closes() {
+    let fixture = HeadlessServer::new();
+    let mut server = ChildServer::start(fixture.command());
+    let response = server.call("stellar_sep43_sign_message", &sign_message_args());
+    assert_eq!(
+        envelope_code(&response).as_deref(),
+        Some("sep43.wallet_unlock_failed"),
+        "the signing call reaches the missing seed after the audit pre-flight: {response}"
+    );
+    assert!(
+        fixture.profile.audit_log_path.is_file(),
+        "the call opened and cached the keyed audit writer"
+    );
+
+    let marker = fixture.queue_halt_row();
+    assert_eq!(
+        outbox_pending(&fixture.profile.audit_log_path),
+        1,
+        "the halt row is queued while the server holds the writer"
+    );
+
+    server.close_stdin();
+    let (status, stderr) = server.wait();
+    assert!(
+        status.success(),
+        "the server exits cleanly at EOF.\nstderr: {stderr}"
+    );
+    assert_eq!(
+        outbox_pending(&fixture.profile.audit_log_path),
+        0,
+        "the server drains the queued halt row at exit.\nstderr: {stderr}"
+    );
+    assert_halt_row_in_log(&fixture.profile.audit_log_path, &marker);
+}
+
+/// The same contract for SIGTERM: the server handles the signal, drains the
+/// queued row, and exits `0`.
+#[cfg(unix)]
+#[test]
+#[serial]
+fn the_server_drains_a_queued_halt_row_on_sigterm() {
+    let fixture = HeadlessServer::new();
+    let mut server = ChildServer::start(fixture.command());
+    let response = server.call("stellar_sep43_sign_message", &sign_message_args());
+    assert_eq!(
+        envelope_code(&response).as_deref(),
+        Some("sep43.wallet_unlock_failed"),
+        "the signing call reaches the missing seed after the audit pre-flight: {response}"
+    );
+    assert!(
+        fixture.profile.audit_log_path.is_file(),
+        "the call opened and cached the keyed audit writer"
+    );
+
+    let marker = fixture.queue_halt_row();
+    assert_eq!(
+        outbox_pending(&fixture.profile.audit_log_path),
+        1,
+        "the halt row is queued while the server holds the writer"
+    );
+
+    // `kill` is a shell builtin, so this needs no procps installation.
+    let delivered = Command::new("sh")
+        .arg("-c")
+        .arg(format!("kill -TERM {}", server.child.id()))
+        .status()
+        .expect("sh must run");
+    assert!(delivered.success(), "SIGTERM must be delivered");
+
+    let (status, stderr) = server.wait();
+    assert!(
+        status.success(),
+        "the server exits cleanly on SIGTERM.\nstderr: {stderr}"
+    );
+    assert_eq!(
+        outbox_pending(&fixture.profile.audit_log_path),
+        0,
+        "the server drains the queued halt row on SIGTERM.\nstderr: {stderr}"
+    );
+    assert_halt_row_in_log(&fixture.profile.audit_log_path, &marker);
 }

@@ -280,6 +280,48 @@ fn resolve_and_validate_profile_name(requested: Option<&str>) -> ResolvedProfile
     resolved
 }
 
+/// Resolves when the process receives SIGINT, or SIGTERM on Unix.
+///
+/// The server races this against the stdio session. When it resolves, the
+/// transport cancels the session and returns, and `main` drains the audit
+/// outboxes of the writers this process cached before it exits. Handling these
+/// signals lets that drain run before the process ends.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        if let Err(error) = tokio::signal::ctrl_c().await {
+            tracing::warn!(
+                error = %error,
+                "stellar-agent-mcp: cannot listen for SIGINT; the server will not drain on Ctrl-C"
+            );
+            std::future::pending::<()>().await;
+        }
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut signal) => {
+                signal.recv().await;
+            }
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "stellar-agent-mcp: cannot listen for SIGTERM; the server will not drain on \
+                     SIGTERM"
+                );
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        () = ctrl_c => {}
+        () = terminate => {}
+    }
+}
+
 #[tokio::main]
 async fn main() {
     // ── 0. Argument parsing and profile-name resolution ──────────────────────
@@ -468,10 +510,32 @@ async fn main() {
     };
 
     // ── 6. Start MCP server ───────────────────────────────────────────────────
-    if let Err(err) = transport::serve(server).await {
+    let result = transport::serve_until(server, shutdown_signal()).await;
+
+    // ── 7. Drain the audit outboxes this process cached ───────────────────────
+    // The transport returns on client EOF and on SIGINT/SIGTERM. Either way a
+    // `profile halt` or `profile resume` row queued while this server held the
+    // writer must reach the log now: a halted profile may see no further keyed
+    // command for a long time. A failed check is logged by the registry; a
+    // refused drain leaves the outbox unchanged, so delivery stays at least
+    // once. The exit code is unaffected.
+    let drained = stellar_agent_core::audit_log::AuditWriterRegistry::drain_cached_outboxes();
+    tracing::info!(
+        writers = drained,
+        "stellar-agent-mcp: drained cached audit outboxes at exit"
+    );
+
+    if let Err(err) = result {
         tracing::error!(error = %err, "stellar-agent-mcp: server error");
         std::process::exit(1);
     }
+
+    // The stdio transport reads through `tokio::io::stdin()`, whose blocking
+    // read cannot be cancelled. With the client still holding the pipe open,
+    // dropping the runtime waits for that read to return, so a normal return
+    // would hang after a signal-triggered shutdown. The outboxes are drained
+    // above and the subscriber writes synchronously to stderr, so exit here.
+    std::process::exit(0);
 }
 
 /// Logs a server-construction failure, naming the command that fixes it for the

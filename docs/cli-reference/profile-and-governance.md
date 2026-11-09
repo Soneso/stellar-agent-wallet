@@ -789,6 +789,8 @@ Read-only commands, `profile show`, `audit verify`, the operator ceremonies (`pr
 
 The `profile_halted` audit row records the profile, `halted_at`, and the reason. The marker is written first, so the halt is in effect even when the row cannot be written. The result's `audit_row` field reports where the row went: `written`, `queued` when a running MCP server or `approve serve` inbox holds the audit writer and the row waits in the audit outbox, or `not_written` with the cause in the log.
 
+When a running MCP server exits on client EOF, on SIGINT, or on SIGTERM on Unix, it drains the outboxes of the keyed audit writers it holds. A queued `profile_halted` row then reaches the log at shutdown. A refused drain leaves the row queued and is logged. A row queued after that drain waits for the next draining writer.
+
 ```json
 {"ok":true,"data":{"profile":"default","halted":true,"halted_at":"2026-10-31T12:00:00Z","reason":"agent sent unexpected payments","audit_row":"written"},"request_id":"..."}
 ```

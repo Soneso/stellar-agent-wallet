@@ -24,6 +24,7 @@ use rmcp::{
     },
 };
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::Mutex as TokioMutex;
 use tokio_util::codec::{FramedRead, FramedWrite};
@@ -310,6 +311,29 @@ pub fn build_selected_server(
 /// Returns a boxed error if the rmcp service encounters a fatal error during
 /// initialisation or operation.
 pub async fn serve(server: WalletServer) -> Result<(), Box<dyn std::error::Error>> {
+    serve_until(server, std::future::pending::<()>()).await
+}
+
+/// Runs the MCP stdio loop for an already-constructed server until the client
+/// disconnects or `shutdown` resolves.
+///
+/// `shutdown` is polled from before the session starts. When it resolves, the
+/// service is cancelled and its session task is awaited for at most
+/// [`SHUTDOWN_WAIT`]. Within that wait the task closes the transport before
+/// this function returns. A tool call that runs past the session's own drain
+/// timeout keeps running; it reaches the audit log only through the writer mutex.
+///
+/// # Errors
+///
+/// [`SessionStartError`] when the session does not start, or the join error of
+/// the running service.
+pub async fn serve_until<F>(
+    server: WalletServer,
+    shutdown: F,
+) -> Result<(), Box<dyn std::error::Error>>
+where
+    F: std::future::Future<Output = ()>,
+{
     // ── Max-line mitigation: BoundedStdioTransport with 1 MiB max-line bound ──
     // Do NOT use `.serve(rmcp::transport::stdio())` or `.serve((stdin, stdout))`
     // — those paths call `AsyncRwTransport::new` which internally uses
@@ -324,7 +348,7 @@ pub async fn serve(server: WalletServer) -> Result<(), Box<dyn std::error::Error
     // Verification point: the codec construction is in
     // `BoundedTransport::over()` above in this file; the `default()`
     // constructor is never called.
-    serve_on(server, BoundedStdioTransport::new()).await
+    serve_on_until(server, BoundedStdioTransport::new(), shutdown).await
 }
 
 /// Runs `server` on `transport` until the client disconnects.
@@ -341,13 +365,70 @@ where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
 {
-    let service = server
-        .serve(transport)
-        .await
-        .map_err(SessionStartError::from)?;
+    serve_on_until(server, transport, std::future::pending::<()>()).await
+}
+
+/// Bounds the session's stop after a shutdown signal, allowing more than
+/// rmcp's two-second response drain.
+pub const SHUTDOWN_WAIT: Duration = Duration::from_secs(5);
+
+/// Runs `server` on `transport` until the client disconnects or `shutdown`
+/// resolves.
+///
+/// # Errors
+///
+/// [`SessionStartError`] when the session does not start, or the join error of
+/// the running service.
+pub async fn serve_on_until<R, W, F>(
+    server: WalletServer,
+    transport: BoundedTransport<R, W>,
+    shutdown: F,
+) -> Result<(), Box<dyn std::error::Error>>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
+    F: std::future::Future<Output = ()>,
+{
+    tokio::pin!(shutdown);
+    let starting = server.serve(transport);
+    tokio::pin!(starting);
+    let service = tokio::select! {
+        result = &mut starting => result.map_err(SessionStartError::from)?,
+        () = &mut shutdown => {
+            tracing::info!(
+                "stellar-agent-mcp: shutdown signal received before the session started"
+            );
+            return Ok(());
+        }
+    };
 
     tracing::info!("stellar-agent-mcp: MCP server ready");
-    service.waiting().await?;
+    let cancellation = service.cancellation_token();
+    let waiting = service.waiting();
+    tokio::pin!(waiting);
+    tokio::select! {
+        result = &mut waiting => {
+            result?;
+        }
+        () = &mut shutdown => {
+            tracing::info!(
+                "stellar-agent-mcp: shutdown signal received; stopping the MCP server"
+            );
+            cancellation.cancel();
+            match tokio::time::timeout(SHUTDOWN_WAIT, &mut waiting).await {
+                Ok(result) => {
+                    result?;
+                }
+                Err(_elapsed) => {
+                    tracing::warn!(
+                        wait_seconds = SHUTDOWN_WAIT.as_secs(),
+                        "stellar-agent-mcp: the session did not stop within \
+                         the shutdown wait; draining and exiting"
+                    );
+                }
+            }
+        }
+    }
     Ok(())
 }
 

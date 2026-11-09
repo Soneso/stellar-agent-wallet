@@ -641,7 +641,7 @@ it, such as a commit preflight before signing. MCP balance reads do not acquire
 it. Under V1, payment simulations can reconcile overdue reservations, acquire
 the writer, and deliver owed accounting events.
 
-The registry normally caches the writer and holds its lock until process exit. A replaced-file refusal during acquisition marks the cached writer for eviction. After callers release it, the next acquisition drops it and checks the file at the path against the anchor.
+The registry normally caches the writer and holds its lock until process exit. A replaced-file refusal during acquisition marks the cached writer for eviction. After callers release it, the next acquisition drops it and checks the file at the path against the anchor. When the server exits on client EOF, on SIGINT, or on SIGTERM on Unix, it drains the outbox of every keyed writer it still caches. A queued operator row then reaches the log at shutdown; a refused drain leaves it queued and is logged.
 
 A log restored from an older copy, truncated, or substituted refuses with
 `audit.tip_anchor_mismatch`. Both in-place overwrites and replacements by
