@@ -8,11 +8,13 @@
 //! # Impact on pending approvals
 //!
 //! Rotation changes the HMAC key used to sign attestation blobs at
-//! `stellar-agent approve` time.  **All pending approvals are immediately
-//! invalidated** — any `attestation_blob` produced with the old key fails
-//! HMAC verify at commit time, returning `policy.approval_required`.  The
-//! operator (or the issuing agent) must re-initiate the simulation + approval
-//! round trip.
+//! `stellar-agent approve` time.  Attestations minted under the old key fail
+//! HMAC verify at commit time, returning `policy.approval_required` — the
+//! operator (or the issuing agent) re-initiates the simulation + approval
+//! round trip for them.  Unattested pending requests can still be approved
+//! under the new key: a pending request carries no key binding, and
+//! `stellar-agent approve` attests it with the key that is current at that
+//! time.
 //!
 //! # Output (JSON envelope)
 //!
@@ -179,7 +181,9 @@ where
                 &request_id,
             );
             // Info-level log omits the keyring service name to avoid leaking it.
-            tracing::info!("attestation key rotated; pending approvals are now invalid");
+            tracing::info!(
+                "attestation key rotated; attestations minted under the old key fail verification at commit"
+            );
             render::render_json(&Envelope::ok(RotateAttestationKeyData {
                 profile: args.profile_name().to_owned(),
                 rotated: true,
