@@ -1340,6 +1340,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Only the endpoints stored in the profile authorize charge closure. A refused admission still commits the closures its witness establishes.
 - Snapshots containing signed intents or intent links use version 9. Records missing required intent fields refuse as unreadable.
 - An open intent without an authenticated purpose permanently blocks reset for this profile. Continue with a new profile.
+- `deny.toml` accepts RUSTSEC-2026-0462 on `rmcp` 1.8.0 with its rationale:
+  the Streamable HTTP clients before 3.9.0 read non-streaming response bodies
+  into memory without a size limit. That code compiles only under two client
+  features the workspace does not enable. The MCP server speaks over stdio and
+  never runs an rmcp HTTP client. The entry goes when the server moves to
+  `rmcp` 3.9 or later.
 
 ## [0.1.0-alpha.13] - 2026-10-31
 

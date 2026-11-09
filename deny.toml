@@ -40,6 +40,18 @@ ignore = [
     # soroban-env-host accepts elliptic-curve 0.14 and the workspace p256 pin
     # moves to 0.14.
     "RUSTSEC-2026-0387", # crypto-bigint: secret-dependent branches
+    # RUSTSEC-2026-0462: the Streamable HTTP clients of rmcp before 3.9.0 read
+    # non-streaming HTTP response bodies into memory without a size limit. That
+    # code compiles only under the rmcp features
+    # transport-streamable-http-client-reqwest and
+    # transport-streamable-http-client-unix-socket. The workspace enables
+    # server, macros, transport-io and schemars, no crate adds a feature, and
+    # no other dependency depends on rmcp. The MCP server speaks over stdio and
+    # test MCP sessions over stdio or in-process duplex streams; the wallet
+    # never runs an rmcp HTTP client. The fix is only in rmcp 3.9.0, two major
+    # versions above the pinned 1.8.0. Remove this entry once the server moves
+    # to rmcp 3.9 or later.
+    "RUSTSEC-2026-0462", # rmcp: unbounded response bodies in the HTTP clients
 ]
 
 [licenses]
