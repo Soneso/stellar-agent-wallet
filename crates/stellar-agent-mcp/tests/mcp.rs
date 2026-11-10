@@ -83,3 +83,6 @@ mod trustline_integration;
 mod version_marker;
 #[path = "mcp/x402_audit_gate_integration.rs"]
 mod x402_audit_gate_integration;
+
+#[path = "mcp/transaction_status_wire_guard.rs"]
+mod transaction_status_wire_guard;

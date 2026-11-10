@@ -8,7 +8,6 @@
 //! mapping of the three unresolved-submission refusals. That mapping turns
 //! each refusal into a response an operator or an agent can act on.
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use stellar_agent_core::approval::witness::ApprovalWitness;
@@ -23,13 +22,16 @@ use stellar_agent_core::profile::schema::Profile;
 use stellar_agent_network::cross_check::CrossCheckWitness;
 use stellar_agent_network::mainnet::audit_readiness::AuditReadiness;
 use stellar_agent_network::mainnet::authorization::MainnetTxSignAuthorization;
-use stellar_agent_network::mainnet::consumed::AuthorizationConsumed;
-use stellar_agent_network::policy_state::{PersistedWindowStore, RECONCILE_BUDGET};
-use stellar_agent_network::{
-    ApprovalTombstone, AuditWriterHandle, MainnetSubmitGrant, MainnetWriteContext, NetworkContext,
-    StellarRpcClient, SubmissionIntent, SubmissionOutcome, SubmissionRecorder,
-    WalletSubmissionRecorder, envelope_hash_hex,
+use stellar_agent_network::policy_state::PersistedWindowStore;
+use stellar_agent_network::submission_flow::{
+    self, RecorderInputs, assemble_recorder, checked_sizing, open_receipts, submission_details,
 };
+use stellar_agent_network::{
+    ApprovalTombstone, AuditWriterHandle, MainnetWriteContext, NetworkContext, StellarRpcClient,
+    WalletSubmissionRecorder,
+};
+
+pub(crate) use stellar_agent_network::submission_flow::StageMarkedRecorder;
 
 use crate::common::profile_access::ProfileOrigin;
 
@@ -109,11 +111,7 @@ pub(crate) struct SubmitRecord<'a> {
 pub(crate) fn build_recorder(
     record: SubmitRecord<'_>,
 ) -> Result<WalletSubmissionRecorder<'_>, WalletError> {
-    let receipts = ReceiptStore::open(&record.profile_name).map_err(|e| {
-        record_unavailable(format!(
-            "the submission receipt store could not be opened: {e}"
-        ))
-    })?;
+    let receipts = open_receipts(&record.profile_name)?;
 
     let legs: Vec<ValueLegRecord> = record
         .effects
@@ -146,45 +144,29 @@ pub(crate) fn build_recorder(
         (None, None) => None,
     }
     .map(|outcome| {
-        match outcome.map_err(|error| {
+        let outcome = outcome.map_err(|error| {
             record_unavailable(format!(
                 "the policy engine cannot account for this action: {error}"
             ))
-        })? {
-            stellar_agent_core::policy::v1::SizingOutcome::Sized(sizing) => Ok(sizing),
-            stellar_agent_core::policy::v1::SizingOutcome::Refused(reason) => {
-                Err(WalletError::PolicyDenied {
-                    reason: Box::new(reason),
-                })
-            }
-            _ => Err(record_unavailable("unsupported sizing outcome".to_owned())),
-        }
+        })?;
+        checked_sizing(outcome, || record_unavailable("unsupported sizing outcome"))
     })
     .transpose()?;
-    let window_entries = sizing
-        .as_ref()
-        .map(|sizing| sizing.entries().to_vec())
-        .unwrap_or_default();
-
-    let recorder = WalletSubmissionRecorder::new(
-        record.profile,
-        record.profile_name.clone(),
-        record.tool,
-        Some(record.chain_id.to_owned()),
-        record.policy_decision,
-        legs,
-        window_entries,
+    Ok(assemble_recorder(
+        RecorderInputs {
+            profile: record.profile,
+            profile_name: record.profile_name,
+            tool: record.tool,
+            chain_id: record.chain_id.to_owned(),
+            policy_decision: record.policy_decision,
+            legs,
+            audit: record.audit,
+            nonce_id: None,
+            now_ms: record.now_ms,
+        },
         receipts,
-        PersistedWindowStore::for_profile(&record.profile_name),
-        record.audit,
-        None,
-        uuid::Uuid::new_v4().to_string(),
-        record.now_ms,
-    );
-    Ok(match sizing {
-        Some(sizing) => recorder.with_signing_sizing(sizing),
-        None => recorder,
-    })
+        sizing,
+    ))
 }
 
 /// Builds checked count admission from the profile's policy engine.
@@ -267,11 +249,7 @@ pub(crate) fn prepare_mainnet_recorder<'a>(
     approval: &ApprovalWitness,
 ) -> Result<PreparedMainnetRecorder<'a>, WalletError> {
     let profile_name = context.profile_name().to_owned();
-    let receipts = ReceiptStore::open(&profile_name).map_err(|e| {
-        record_unavailable(format!(
-            "the submission receipt store could not be opened: {e}"
-        ))
-    })?;
+    let receipts = open_receipts(&profile_name)?;
     let store_dir = crate::commands::approve::approval_store_dir().map_err(|e| {
         record_unavailable(format!(
             "the approval store directory could not be resolved: {e}"
@@ -329,77 +307,7 @@ impl<'a> PreparedMainnetRecorder<'a> {
         )
         .with_witness(self.witness)
         .with_approval(Some(self.tombstone));
-        StageMarkedRecorder {
-            inner: recorder,
-            pre_send_entered: AtomicBool::new(false),
-        }
-    }
-}
-
-/// The recorder of a mainnet write, marking whether the submit reached the
-/// authorized pre-send hook.
-///
-/// The mark separates the two refusals of the submit that share a code: a
-/// refusal of the submit gate before the hook, and a refusal inside it.
-pub(crate) struct StageMarkedRecorder<'a> {
-    inner: WalletSubmissionRecorder<'a>,
-    pre_send_entered: AtomicBool,
-}
-
-impl StageMarkedRecorder<'_> {
-    /// Whether [`SubmissionRecorder::pre_send_authorized`] was entered.
-    #[must_use]
-    pub(crate) fn pre_send_entered(&self) -> bool {
-        self.pre_send_entered.load(Ordering::SeqCst)
-    }
-}
-
-impl std::fmt::Debug for StageMarkedRecorder<'_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("StageMarkedRecorder")
-            .field("inner", &self.inner)
-            .field("pre_send_entered", &self.pre_send_entered())
-            .finish()
-    }
-}
-
-#[async_trait::async_trait]
-impl SubmissionRecorder for StageMarkedRecorder<'_> {
-    async fn admit_signed_intent(
-        &self,
-        plan: &stellar_agent_network::SignedIntentPlan,
-    ) -> Result<stellar_agent_network::IntentProof, WalletError> {
-        self.inner.admit_signed_intent(plan).await
-    }
-    async fn cancel_unexposed(
-        &self,
-        proof: stellar_agent_network::IntentProof,
-    ) -> Result<(), WalletError> {
-        self.inner.cancel_unexposed(proof).await
-    }
-    async fn pre_send_bound(
-        &self,
-        intent: &stellar_agent_network::SubmissionIntent,
-        binding: &stellar_agent_network::IntentBinding<'_>,
-    ) -> Result<(), WalletError> {
-        self.inner.pre_send_bound(intent, binding).await
-    }
-
-    async fn pre_send(&self, intent: &SubmissionIntent) -> Result<(), WalletError> {
-        self.inner.pre_send(intent).await
-    }
-
-    async fn pre_send_authorized(
-        &self,
-        intent: &SubmissionIntent,
-        grant: MainnetSubmitGrant,
-    ) -> Result<AuthorizationConsumed, WalletError> {
-        self.pre_send_entered.store(true, Ordering::SeqCst);
-        self.inner.pre_send_authorized(intent, grant).await
-    }
-
-    async fn outcome(&self, intent: &SubmissionIntent, outcome: &SubmissionOutcome) {
-        self.inner.outcome(intent, outcome).await;
+        StageMarkedRecorder::new(recorder)
     }
 }
 
@@ -441,23 +349,7 @@ pub(crate) fn settlement_oracle_in(
     context: &NetworkContext,
 ) -> Option<StellarRpcClient> {
     let name = stellar_agent_core::profile::name::derive_profile_name_from_owner_key(profile)?;
-    let scope = PersistedWindowStore::for_profile(name)
-        .chain_scope(profile)
-        .ok()?;
-    if !scope.chain().is_mainnet() {
-        return None;
-    }
-    match context.oracle_client(profile) {
-        Ok(oracle) => oracle,
-        Err(e) => {
-            tracing::warn!(
-                code = %e.code(),
-                "window reconcile: the oracle client could not be built; negative answers of \
-                 the primary endpoint settle nothing this pass"
-            );
-            None
-        }
-    }
+    submission_flow::settlement_oracle(&PersistedWindowStore::for_profile(name), profile, context)
 }
 
 /// Settles the reservations that have stood long enough to be settleable,
@@ -487,7 +379,7 @@ pub(crate) async fn reconcile_open_reservations(
     oracle: Option<&StellarRpcClient>,
     now_ms: u64,
 ) {
-    let receipts = match ReceiptStore::open(profile_name) {
+    let receipts = match open_receipts(profile_name) {
         Ok(store) => Some(store),
         Err(e) => {
             tracing::debug!(
@@ -499,38 +391,21 @@ pub(crate) async fn reconcile_open_reservations(
         }
     };
     let window = PersistedWindowStore::for_profile(profile_name);
-    match window
-        .reconcile_due(
-            profile,
-            client,
-            oracle,
-            receipts.as_ref(),
-            now_ms,
-            RECONCILE_BUDGET,
-        )
-        .await
-    {
-        Ok(report) if report.receipt_write_failed > 0 => tracing::debug!(
-            profile = %profile_name,
-            receipt_write_failed = report.receipt_write_failed,
-            "window reconcile: receipt writes stay owed"
-        ),
-        Ok(_) => {}
-        Err(e) => tracing::debug!(
-            profile = %profile_name,
-            error = ?e,
-            "window reconcile: pass failed; open reservations stand"
-        ),
-    }
-
-    // Accounting expiry commits its audit obligation with the expiry, so the
-    // drain delivers it from the verified window state. A refusal is logged
-    // and stays owed.
-    let _ = stellar_agent_network::policy_state::drain_accounting_obligations(
+    let pass = submission_flow::reconcile_pass(
+        profile,
         &window,
+        client,
+        oracle,
+        receipts.as_ref(),
+        now_ms,
+    )
+    .await;
+    let _ = submission_flow::finish_reconciliation(
         profile,
         profile_name,
+        &window,
         receipts.as_ref(),
+        &pass,
         || accounting_audit_writer(profile, profile_name, origin),
     );
 }
@@ -571,10 +446,7 @@ pub(crate) fn error_envelope(err: &WalletError, signed_xdr: &str, verb: &str) ->
     if let Some(envelope) = policy_denial_envelope(err, verb) {
         return envelope;
     }
-    match submission_details(err, signed_xdr) {
-        Some(details) => Envelope::<()>::err_with_details(err, details),
-        None => Envelope::<()>::err(err),
-    }
+    submission_flow::submission_error_envelope(err, signed_xdr, RECONCILE_VERB)
 }
 
 /// The refusal envelope for a policy denial reported by the submit path, or
@@ -775,44 +647,10 @@ pub(crate) fn error_envelope_with_fallback(
     if let Some(envelope) = policy_denial_envelope(err, verb) {
         return envelope;
     }
-    match submission_details(err, signed_xdr) {
+    match submission_details(err, signed_xdr, RECONCILE_VERB) {
         Some(details) => Envelope::<()>::err_with_details(err, details),
         None => Envelope::<()>::err_raw(fallback_code, err.message()),
     }
-}
-
-/// The structured detail for the three codes that carry one, or `None`.
-fn submission_details(err: &WalletError, signed_xdr: &str) -> Option<serde_json::Value> {
-    let WalletError::Submission(submission) = err else {
-        return None;
-    };
-    let mut details = serde_json::Map::new();
-    match submission {
-        SubmissionError::TxTimeout { tx_hash, seconds } => {
-            details.insert("tx_hash".to_owned(), tx_hash.clone().into());
-            details.insert("timeout_seconds".to_owned(), (*seconds).into());
-        }
-        SubmissionError::TxAlreadySubmitted { hash } => {
-            details.insert("tx_hash".to_owned(), hash.clone().into());
-        }
-        SubmissionError::HashMismatch { local, server } => {
-            details.insert("tx_hash".to_owned(), local.clone().into());
-            details.insert("server_tx_hash".to_owned(), server.clone().into());
-        }
-        _ => return None,
-    }
-    // The envelope hash names the submission record the operator verbs
-    // address. A caller that does not hold the signed bytes reports the
-    // transaction hash alone rather than a hash of nothing.
-    if !signed_xdr.is_empty() {
-        details.insert(
-            "envelope_hash".to_owned(),
-            envelope_hash_hex(signed_xdr).into(),
-        );
-    }
-    details.insert("outcome".to_owned(), "unknown".into());
-    details.insert("reconcile_with".to_owned(), RECONCILE_VERB.into());
-    Some(serde_json::Value::Object(details))
 }
 
 fn record_unavailable(detail: impl Into<String>) -> WalletError {
@@ -832,7 +670,96 @@ mod tests {
 
     use super::*;
     use stellar_agent_core::profile::receipt::{ReceiptStatus, ReleaseEvidence};
+    use stellar_agent_network::envelope_hash_hex;
     use stellar_agent_network::policy_state::DeliveryReport;
+
+    #[test]
+    fn submission_error_wire_guard_timeout() {
+        let err = WalletError::Submission(SubmissionError::TxTimeout {
+            tx_hash: "ab".repeat(32),
+            seconds: 30,
+        });
+        let text = error_envelope(&err, SIGNED_XDR, "pay")
+            .to_json_pretty()
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let text = text.replace(value["request_id"].as_str().unwrap(), "REQUEST_ID");
+        assert_eq!(
+            text,
+            r#"{
+  "ok": false,
+  "error": {
+    "code": "submission.tx_timeout",
+    "message": "transaction 'abababab...abababab' was not confirmed within 30s; its outcome is unknown: settle it by its transaction hash and do not resubmit",
+    "details": {
+      "envelope_hash": "fdca46b81c5c77753f52cce8845503c8eef69ef48266f0e4ded1ea19060db975",
+      "outcome": "unknown",
+      "reconcile_with": "stellar-agent tx status",
+      "timeout_seconds": 30,
+      "tx_hash": "abababababababababababababababababababababababababababababababab"
+    }
+  },
+  "request_id": "REQUEST_ID"
+}"#
+        );
+    }
+
+    /// The verb's oracle builds the configured oracle for a mainnet profile
+    /// and none for a testnet profile with the same oracle configuration.
+    #[test]
+    #[serial_test::serial]
+    fn settlement_oracle_in_follows_the_profile_chain() {
+        use stellar_agent_core::profile::schema::{PrimaryProviderRecord, ProviderRecord};
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(dir.path());
+        let mainnet = Profile::builder_mainnet_named(
+            "oracle-wrapper",
+            "https://primary.example",
+            "s",
+            "a",
+            "n",
+            "a",
+        )
+        .primary_provider(PrimaryProviderRecord::new("Primary", "primary.example"))
+        .oracle_provider_url(url::Url::parse("https://oracle.example").unwrap())
+        .oracle_provider(ProviderRecord::new("Oracle", "oracle.example", true))
+        .build();
+        let mut testnet = mainnet.clone();
+        testnet.chain_id = stellar_agent_core::profile::caip2::Caip2::Testnet;
+
+        let context = NetworkContext::from_profile(&mainnet);
+        assert!(settlement_oracle_in(&mainnet, &context).is_some());
+        assert!(settlement_oracle(&mainnet).is_some());
+        let context = NetworkContext::from_profile(&testnet);
+        assert!(settlement_oracle_in(&testnet, &context).is_none());
+        assert!(settlement_oracle(&testnet).is_none());
+    }
+
+    #[test]
+    fn submission_error_wire_guard_policy_denied() {
+        let err = WalletError::PolicyDenied {
+            reason: Box::new(stellar_agent_core::policy::DenyReason::EvaluationError {
+                detail: "guard refusal".to_owned(),
+            }),
+        };
+        let text = error_envelope(&err, SIGNED_XDR, "pay")
+            .to_json_pretty()
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let text = text.replace(value["request_id"].as_str().unwrap(), "REQUEST_ID");
+        assert_eq!(
+            text,
+            r#"{
+  "ok": false,
+  "error": {
+    "code": "policy.deny.evaluation_error",
+    "message": "pay operation denied by operator policy: guard refusal"
+  },
+  "request_id": "REQUEST_ID"
+}"#
+        );
+    }
 
     const SIGNED_XDR: &str = "AAAAAgAAAAA=";
 

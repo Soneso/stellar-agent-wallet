@@ -274,7 +274,7 @@ pub async fn run(args: &ReceiptArgs) -> i32 {
 }
 
 async fn run_clear(args: &ClearArgs) -> i32 {
-    if !crate::commands::tx::status::is_tx_hash(&args.envelope_hash) {
+    if !stellar_agent_network::submission_flow::is_tx_hash(&args.envelope_hash) {
         render_json(&Envelope::<()>::err_raw(
             "validation.address_invalid",
             "ENVELOPE_HASH must be 64 lowercase hex characters",
@@ -348,7 +348,7 @@ async fn run_clear(args: &ClearArgs) -> i32 {
     let tx_hash = match (&existing, &held) {
         (Some(record), _) => record.tx_hash.clone(),
         (None, Some(reservation)) => {
-            if !super::status::is_tx_hash(&reservation.tx_hash)
+            if !stellar_agent_network::submission_flow::is_tx_hash(&reservation.tx_hash)
                 || stellar_strkey::ed25519::PublicKey::from_string(&reservation.source).is_err()
                 || reservation.sequence <= 0
                 || reservation.submission_ledger == 0

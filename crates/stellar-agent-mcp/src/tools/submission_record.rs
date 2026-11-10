@@ -18,10 +18,11 @@ use stellar_agent_core::policy::v1::ValueClass;
 use stellar_agent_core::policy::{PolicyEngine, ToolDescriptor};
 use stellar_agent_core::profile::receipt::ReceiptStore;
 use stellar_agent_core::profile::schema::Profile;
-use stellar_agent_network::policy_state::{DeliveryReport, PersistedWindowStore, ReconcileReport};
-use stellar_agent_network::{
-    ApprovalTombstone, SequenceFloorHook, WalletSubmissionRecorder, envelope_hash_hex,
+use stellar_agent_network::policy_state::PersistedWindowStore;
+use stellar_agent_network::submission_flow::{
+    self, RecorderInputs, StageMarkedRecorder, assemble_recorder, checked_sizing, open_receipts,
 };
+use stellar_agent_network::{ApprovalTombstone, SequenceFloorHook, WalletSubmissionRecorder};
 
 use super::common::profile_bound_descriptor;
 
@@ -93,11 +94,7 @@ pub(crate) fn build_recorder<'a>(
             })
         })?;
 
-    let receipts = ReceiptStore::open(&record.profile_name).map_err(|e| {
-        WalletError::Submission(SubmissionError::RecordUnavailable {
-            detail: format!("the submission receipt store could not be opened: {e}"),
-        })
-    })?;
+    let receipts = open_receipts(&record.profile_name)?;
 
     let sizing = record
         .engine
@@ -108,37 +105,26 @@ pub(crate) fn build_recorder<'a>(
             })
         })?;
 
-    let sizing = match sizing {
-        stellar_agent_core::policy::v1::SizingOutcome::Sized(sizing) => sizing,
-        stellar_agent_core::policy::v1::SizingOutcome::Refused(reason) => {
-            return Err(WalletError::PolicyDenied {
-                reason: Box::new(reason),
-            });
-        }
-        _ => {
-            return Err(WalletError::Submission(
-                SubmissionError::IntentRecordUnavailable {
-                    class: "policy_unavailable",
-                },
-            ));
-        }
-    };
-    Ok(WalletSubmissionRecorder::new(
-        record.profile,
-        record.profile_name.clone(),
-        record.tool,
-        Some(record.chain_id),
-        record.policy_decision,
-        record.legs,
-        sizing.entries().to_vec(),
+    let sizing = checked_sizing(sizing, || {
+        WalletError::Submission(SubmissionError::IntentRecordUnavailable {
+            class: "policy_unavailable",
+        })
+    })?;
+    Ok(assemble_recorder(
+        RecorderInputs {
+            profile: record.profile,
+            profile_name: record.profile_name,
+            tool: record.tool,
+            chain_id: record.chain_id,
+            policy_decision: record.policy_decision,
+            legs: record.legs,
+            audit: Some(record.audit),
+            nonce_id: record.nonce_id,
+            now_ms: record.now_ms,
+        },
         receipts,
-        PersistedWindowStore::for_profile(&record.profile_name),
-        Some(record.audit),
-        record.nonce_id,
-        uuid::Uuid::new_v4().to_string(),
-        record.now_ms,
+        Some(sizing),
     )
-    .with_signing_sizing(sizing)
     .with_sequence_floor(sequence_floor)
     .with_approval(approval))
 }
@@ -220,11 +206,7 @@ pub(crate) fn prepare_authorized_recorder(
             detail: format!("the submission tool {} has no registry entry", record.tool),
         })
     })?;
-    let receipts = ReceiptStore::open(&record.profile_name).map_err(|error| {
-        WalletError::Submission(SubmissionError::RecordUnavailable {
-            detail: format!("the submission receipt store could not be opened: {error}"),
-        })
-    })?;
+    let receipts = open_receipts(&record.profile_name)?;
     window
         .load_into(
             &record.profile_name,
@@ -252,79 +234,29 @@ impl<'a> PreparedRecorder<'a> {
         self,
         authorization: &stellar_agent_network::mainnet::authorization::MainnetTxSignAuthorization,
         floor: Option<&'a dyn SequenceFloorHook>,
-    ) -> WalletSubmissionRecorder<'a> {
+        witness: Option<&'a stellar_agent_network::cross_check::CrossCheckWitness>,
+    ) -> StageMarkedRecorder<'a> {
         let record = self.record;
-        WalletSubmissionRecorder::new_authorized(
-            record.profile,
-            record.profile_name,
-            record.tool,
-            Some(record.chain_id),
-            record.policy_decision,
-            record.legs,
-            authorization,
-            self.receipts,
-            self.window,
-            Some(record.audit),
-            record.nonce_id,
-            uuid::Uuid::new_v4().to_string(),
-            record.now_ms,
+        StageMarkedRecorder::new(
+            WalletSubmissionRecorder::new_authorized(
+                record.profile,
+                record.profile_name,
+                record.tool,
+                Some(record.chain_id),
+                record.policy_decision,
+                record.legs,
+                authorization,
+                self.receipts,
+                self.window,
+                Some(record.audit),
+                record.nonce_id,
+                uuid::Uuid::new_v4().to_string(),
+                record.now_ms,
+            )
+            .with_sequence_floor(floor)
+            .with_approval(self.approval)
+            .with_witness(witness),
         )
-        .with_sequence_floor(floor)
-        .with_approval(self.approval)
-    }
-}
-
-/// Marks entry before delegating the durable consumption hook.
-struct MarkedRecorder<'a> {
-    inner: WalletSubmissionRecorder<'a>,
-    entered: std::sync::atomic::AtomicBool,
-}
-
-#[async_trait::async_trait]
-impl stellar_agent_network::SubmissionRecorder for MarkedRecorder<'_> {
-    async fn admit_signed_intent(
-        &self,
-        plan: &stellar_agent_network::SignedIntentPlan,
-    ) -> Result<stellar_agent_network::IntentProof, WalletError> {
-        self.inner.admit_signed_intent(plan).await
-    }
-    async fn cancel_unexposed(
-        &self,
-        proof: stellar_agent_network::IntentProof,
-    ) -> Result<(), WalletError> {
-        self.inner.cancel_unexposed(proof).await
-    }
-    async fn pre_send_bound(
-        &self,
-        intent: &stellar_agent_network::SubmissionIntent,
-        binding: &stellar_agent_network::IntentBinding<'_>,
-    ) -> Result<(), WalletError> {
-        self.inner.pre_send_bound(intent, binding).await
-    }
-
-    async fn pre_send(
-        &self,
-        intent: &stellar_agent_network::SubmissionIntent,
-    ) -> Result<(), WalletError> {
-        self.inner.pre_send(intent).await
-    }
-
-    async fn pre_send_authorized(
-        &self,
-        intent: &stellar_agent_network::SubmissionIntent,
-        grant: stellar_agent_network::submit::MainnetSubmitGrant,
-    ) -> Result<stellar_agent_network::mainnet::consumed::AuthorizationConsumed, WalletError> {
-        self.entered
-            .store(true, std::sync::atomic::Ordering::SeqCst);
-        self.inner.pre_send_authorized(intent, grant).await
-    }
-
-    async fn outcome(
-        &self,
-        intent: &stellar_agent_network::SubmissionIntent,
-        outcome: &stellar_agent_network::SubmissionOutcome,
-    ) {
-        self.inner.outcome(intent, outcome).await;
     }
 }
 
@@ -458,10 +390,7 @@ pub(crate) async fn sign_and_submit_classic(
                 return Err(render(error));
             }
         };
-        let recorder = MarkedRecorder {
-            inner: prepared.build(&authorization, floor).with_witness(witness),
-            entered: std::sync::atomic::AtomicBool::new(false),
-        };
+        let recorder = prepared.build(&authorization, floor, witness);
         let result = submit_authorized_transaction_and_wait(
             client,
             oracle.as_ref(),
@@ -479,7 +408,7 @@ pub(crate) async fn sign_and_submit_classic(
                 &store,
                 guard.context,
                 id,
-                submit_failure_stage(recorder.entered.load(std::sync::atomic::Ordering::SeqCst)),
+                submit_failure_stage(recorder.pre_send_entered()),
             );
         }
         result.map_err(|error| submission_error_result(&error, &signed))
@@ -511,62 +440,6 @@ pub(crate) async fn sign_and_submit_classic(
     }
 }
 
-/// How a dispatch-time reconciliation pass ended.
-#[derive(Debug)]
-pub(crate) enum ReconcilePass {
-    /// The pass ran over the due reservations.
-    Completed(ReconcileReport),
-    /// The system clock is unavailable, so no pass ran.
-    ClockUnavailable,
-    /// The primary RPC client could not be built, so no pass ran.
-    ClientUnavailable,
-    /// The pass refused; every open reservation stands.
-    Failed(stellar_agent_network::policy_state::WindowStoreError),
-}
-
-/// Logs how a dispatch-time reconciliation pass ended, then drains every
-/// owed accounting obligation.
-///
-/// The drain runs whatever the pass did: a skipped or refused pass leaves
-/// the durable obligations of earlier passes in place, and they are
-/// delivered here. The writer is the keyed one every value verb uses,
-/// acquired only when an audit event is owed.
-pub(crate) fn finish_reconciliation(
-    profile: &Profile,
-    profile_name: &str,
-    binding: stellar_agent_core::audit_log::BindingCheck,
-    window: &PersistedWindowStore,
-    receipts: Option<&ReceiptStore>,
-    pass: &ReconcilePass,
-) -> Result<DeliveryReport, WalletError> {
-    match pass {
-        ReconcilePass::Completed(report) if report.receipt_write_failed > 0 => tracing::warn!(
-            profile = %profile_name,
-            receipt_write_failed = report.receipt_write_failed,
-            "window reconcile: receipt writes stay owed"
-        ),
-        ReconcilePass::Completed(_) => {}
-        ReconcilePass::ClockUnavailable => {
-            tracing::debug!("window reconcile: system clock unavailable; reservations stand");
-        }
-        ReconcilePass::ClientUnavailable => {
-            tracing::debug!("window reconcile: no primary client; reservations stand");
-        }
-        ReconcilePass::Failed(error) => tracing::debug!(
-            profile = %profile_name,
-            error = ?error,
-            "window reconcile: pass failed; open reservations stand"
-        ),
-    }
-    stellar_agent_network::policy_state::drain_accounting_obligations(
-        window,
-        profile,
-        profile_name,
-        receipts,
-        || crate::tools::value_audit::require_value_audit_writer(profile, profile_name, binding),
-    )
-}
-
 /// Renders a submit-path error as a tool result, attaching the structured
 /// detail the three unknown-outcome codes need.
 ///
@@ -581,10 +454,7 @@ pub(crate) fn submission_error_result(err: &WalletError, signed_xdr: &str) -> Ca
     if let Some(result) = policy_denial_result(err) {
         return result;
     }
-    let envelope = match submission_details(err, signed_xdr) {
-        Some(details) => Envelope::<()>::err_with_details(err, details),
-        None => Envelope::<()>::err(err),
-    };
+    let envelope = submission_flow::submission_error_envelope(err, signed_xdr, RECONCILE_TOOL);
     let json = envelope
         .to_json_pretty()
         .unwrap_or_else(|_| String::from("{}"));
@@ -731,40 +601,6 @@ pub(crate) fn unresolved_result(unresolved: &UnresolvedSubmission<'_>) -> CallTo
     result
 }
 
-/// The structured detail for the three codes that carry one, or `None`.
-fn submission_details(err: &WalletError, signed_xdr: &str) -> Option<serde_json::Value> {
-    let WalletError::Submission(submission) = err else {
-        return None;
-    };
-    let mut details = serde_json::Map::new();
-    match submission {
-        SubmissionError::TxTimeout { tx_hash, seconds } => {
-            details.insert("tx_hash".to_owned(), tx_hash.clone().into());
-            details.insert("timeout_seconds".to_owned(), (*seconds).into());
-        }
-        SubmissionError::TxAlreadySubmitted { hash } => {
-            details.insert("tx_hash".to_owned(), hash.clone().into());
-        }
-        SubmissionError::HashMismatch { local, server } => {
-            details.insert("tx_hash".to_owned(), local.clone().into());
-            details.insert("server_tx_hash".to_owned(), server.clone().into());
-        }
-        _ => return None,
-    }
-    // The envelope hash names the submission record the operator verbs
-    // address. A caller that does not hold the signed bytes reports the
-    // transaction hash alone rather than a hash of nothing.
-    if !signed_xdr.is_empty() {
-        details.insert(
-            "envelope_hash".to_owned(),
-            envelope_hash_hex(signed_xdr).into(),
-        );
-    }
-    details.insert("outcome".to_owned(), "unknown".into());
-    details.insert("reconcile_with".to_owned(), RECONCILE_TOOL.into());
-    Some(serde_json::Value::Object(details))
-}
-
 #[cfg(test)]
 mod tests {
     #![allow(
@@ -776,6 +612,69 @@ mod tests {
 
     use super::*;
     use stellar_agent_core::profile::receipt::ReceiptStatus;
+    use stellar_agent_network::policy_state::{DeliveryReport, ReconcileReport};
+    use stellar_agent_network::submission_flow::{ReconcilePass, finish_reconciliation};
+    use stellar_agent_network::{envelope_hash_hex, submission_flow::submission_details};
+
+    #[test]
+    fn submission_error_wire_guard_timeout() {
+        let err = WalletError::Submission(SubmissionError::TxTimeout {
+            tx_hash: "ab".repeat(32),
+            seconds: 30,
+        });
+        let text = submission_error_result(&err, SIGNED_XDR).content[0]
+            .as_text()
+            .unwrap()
+            .text
+            .clone();
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let text = text.replace(value["request_id"].as_str().unwrap(), "REQUEST_ID");
+        assert_eq!(
+            text,
+            r#"{
+  "ok": false,
+  "error": {
+    "code": "submission.tx_timeout",
+    "message": "transaction 'abababab...abababab' was not confirmed within 30s; its outcome is unknown: settle it by its transaction hash and do not resubmit",
+    "details": {
+      "envelope_hash": "fdca46b81c5c77753f52cce8845503c8eef69ef48266f0e4ded1ea19060db975",
+      "outcome": "unknown",
+      "reconcile_with": "stellar_transaction_status",
+      "timeout_seconds": 30,
+      "tx_hash": "abababababababababababababababababababababababababababababababab"
+    }
+  },
+  "request_id": "REQUEST_ID"
+}"#
+        );
+    }
+
+    #[test]
+    fn submission_error_wire_guard_policy_denied() {
+        let err = WalletError::PolicyDenied {
+            reason: Box::new(stellar_agent_core::policy::DenyReason::EvaluationError {
+                detail: "guard refusal".to_owned(),
+            }),
+        };
+        let text = submission_error_result(&err, SIGNED_XDR).content[0]
+            .as_text()
+            .unwrap()
+            .text
+            .clone();
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let text = text.replace(value["request_id"].as_str().unwrap(), "REQUEST_ID");
+        assert_eq!(
+            text,
+            r#"{
+  "ok": false,
+  "error": {
+    "code": "policy.deny.evaluation_error",
+    "message": "policy denied this operation: {\"EvaluationError\":{\"detail\":\"guard refusal\"}}"
+  },
+  "request_id": "REQUEST_ID"
+}"#
+        );
+    }
 
     const SIGNED_XDR: &str = "AAAAAgAAAAA=";
 
@@ -915,7 +814,7 @@ mod tests {
             tx_hash: hash.clone(),
             seconds: 30,
         });
-        let details = submission_details(&err, SIGNED_XDR).unwrap();
+        let details = submission_details(&err, SIGNED_XDR, RECONCILE_TOOL).unwrap();
         assert_eq!(details["tx_hash"], hash);
         assert_eq!(details["timeout_seconds"], 30);
         assert_eq!(details["outcome"], "unknown");
@@ -928,7 +827,7 @@ mod tests {
         let hash = "cd".repeat(32);
         let err =
             WalletError::Submission(SubmissionError::TxAlreadySubmitted { hash: hash.clone() });
-        let details = submission_details(&err, SIGNED_XDR).unwrap();
+        let details = submission_details(&err, SIGNED_XDR, RECONCILE_TOOL).unwrap();
         assert_eq!(details["tx_hash"], hash);
         assert_eq!(details["outcome"], "unknown");
     }
@@ -941,7 +840,7 @@ mod tests {
             local: local.clone(),
             server: server.clone(),
         });
-        let details = submission_details(&err, SIGNED_XDR).unwrap();
+        let details = submission_details(&err, SIGNED_XDR, RECONCILE_TOOL).unwrap();
         assert_eq!(details["tx_hash"], local);
         assert_eq!(details["server_tx_hash"], server);
     }
@@ -951,14 +850,14 @@ mod tests {
         let err = WalletError::Submission(SubmissionError::TxMalformed {
             detail: "txINSUFFICIENT_FEE".to_owned(),
         });
-        assert!(submission_details(&err, SIGNED_XDR).is_none());
+        assert!(submission_details(&err, SIGNED_XDR, RECONCILE_TOOL).is_none());
     }
 
     #[test]
     fn non_submission_errors_carry_no_details() {
         let err =
             WalletError::Network(stellar_agent_core::error::NetworkError::MainnetWriteForbidden);
-        assert!(submission_details(&err, SIGNED_XDR).is_none());
+        assert!(submission_details(&err, SIGNED_XDR, RECONCILE_TOOL).is_none());
     }
 
     /// A DeFi submit failure whose outcome is unknown keeps the submission
@@ -1726,10 +1625,10 @@ mod tests {
             let report = finish_reconciliation(
                 &f.profile,
                 &f.name,
-                stellar_agent_core::audit_log::BindingCheck::Enforce,
                 &f.window,
                 Some(&f.receipts),
                 &pass,
+                || f.acquire(),
             )
             .unwrap();
             assert_eq!(

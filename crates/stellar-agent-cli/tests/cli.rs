@@ -98,3 +98,6 @@ mod profile_counterparty_key;
 mod profile_key_scope;
 #[path = "cli/profile_window_reset.rs"]
 mod profile_window_reset;
+
+#[path = "cli/tx_status_wire_guard.rs"]
+mod tx_status_wire_guard;

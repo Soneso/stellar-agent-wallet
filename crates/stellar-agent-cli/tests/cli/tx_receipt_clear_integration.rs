@@ -37,11 +37,12 @@ use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
 /// A throwaway 32-byte URL-safe base64 key for the headless keyring backend,
 /// so no child process can reach the login keychain.
-const HEADLESS_KEY: &str = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8";
+pub(super) const HEADLESS_KEY: &str = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8";
 
-const PROFILE: &str = "clear-guard";
-const ENVELOPE_HASH: &str = "11111111111111111111111111111111111111111111111111111111111111aa";
-const TX_HASH: &str = "22222222222222222222222222222222222222222222222222222222222222bb";
+pub(super) const PROFILE: &str = "clear-guard";
+pub(super) const ENVELOPE_HASH: &str =
+    "11111111111111111111111111111111111111111111111111111111111111aa";
+pub(super) const TX_HASH: &str = "22222222222222222222222222222222222222222222222222222222222222bb";
 const SOURCE: &str = "GAQAA5L65LSYH7CQ3VTJ7F3HHLGCL3DSLAR2Y47263D56MNNGHSQSTVY";
 
 /// The current time in unix seconds.
@@ -245,7 +246,7 @@ fn fixture(home: &Path, rpc_url: &str) {
 
 /// Writes the profile and seeds a sent receipt for `ENVELOPE_HASH` at
 /// `sequence` with time bound `max_time`.
-fn fixture_with(home: &Path, rpc_url: &str, sequence: i64, max_time: u64) {
+pub(super) fn fixture_with(home: &Path, rpc_url: &str, sequence: i64, max_time: u64) {
     write_profile(home, rpc_url);
     let receipts = ReceiptStore::open_at(&home.join("receipts"), PROFILE).unwrap();
     receipts
@@ -865,7 +866,7 @@ fn windowed_fixture(
     seed_window(home, ENVELOPE_HASH, sequence, 0)
 }
 
-fn seed_window(
+pub(super) fn seed_window(
     home: &Path,
     id: &str,
     sequence: i64,
@@ -1617,6 +1618,38 @@ async fn the_gate_pass_retains_negative_exposure_and_never_sends() {
     assert_eq!(receipt(home.path()).release_code, None);
     let failed = rows_of_kind(home.path(), "value_action_failed");
     assert!(failed.is_empty(), "{failed:?}");
+    assert_eq!(rpc.log.sends(), 0, "the gate pass never sends");
+}
+
+/// The gate pass delivers the accounting expiry it commits before the fee
+/// refuses the run.
+#[tokio::test]
+#[serial_test::serial]
+async fn the_gate_pass_drains_accounting_obligations_before_the_refusal() {
+    let home = tempfile::TempDir::new().unwrap();
+    let rpc = FixedStatusRpc::new("NOT_FOUND");
+    let server = endpoint(&rpc).await;
+    fixture_with(home.path(), &server.uri(), 7, 1);
+    let (window, profile) = seed_window(home.path(), ENVELOPE_HASH, 7, 1);
+
+    let (code, envelope) = pay_refused_after_the_reconcile_pass(home.path());
+
+    assert_refused_on_the_fee(code, &envelope);
+    assert!(
+        window.pending_reservations(&profile).unwrap().is_empty(),
+        "the expired reservation ends"
+    );
+    assert!(
+        window
+            .owed_accounting_expiries(&profile)
+            .unwrap()
+            .is_empty(),
+        "no accounting expiry stays owed"
+    );
+    assert_eq!(
+        rows_of_kind(home.path(), "submission_accounting_expired").len(),
+        1
+    );
     assert_eq!(rpc.log.sends(), 0, "the gate pass never sends");
 }
 
