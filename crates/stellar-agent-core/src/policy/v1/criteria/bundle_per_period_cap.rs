@@ -50,8 +50,6 @@
 //! recorded on single-tx calls also counts toward the bundle cap (shared sliding
 //! window across both call paths).
 
-use std::time::{SystemTime, UNIX_EPOCH};
-
 use crate::policy::v1::EvalContext;
 use crate::policy::v1::asset_equivalence::assets_equivalent;
 use crate::policy::v1::bundle::InnerOpDescriptor;
@@ -181,9 +179,8 @@ impl Criterion for BundlePerPeriodCapCriterion {
     ///
     /// # Errors
     ///
-    /// Returns [`PolicyError::CriterionEvaluationFailed`] when:
-    /// - [`SystemTime`] is before UNIX epoch.
-    /// - The state store detects clock skew exceeding 30 seconds.
+    /// Returns [`PolicyError::CriterionEvaluationFailed`] when the state store
+    /// detects clock skew exceeding 30 seconds against `ctx.now_ms`.
     fn evaluate(&self, ctx: &EvalContext<'_>) -> Result<Option<DenyReason>, PolicyError> {
         let Some(view) = ctx.bundle else {
             // Single-tx path: criterion does not apply.
@@ -192,12 +189,7 @@ impl Criterion for BundlePerPeriodCapCriterion {
 
         let criterion_asset = asset_normalise(&self.asset);
 
-        let now_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .map_err(|e| PolicyError::CriterionEvaluationFailed {
-                detail: format!("bundle_per_period_cap: system clock is before UNIX epoch: {e}"),
-            })?;
+        let now_ms = ctx.now_ms;
 
         // Use the same StateKey derivation as PerPeriodCapCriterion so that
         // period usage recorded on single-tx `stellar_pay` calls counts toward
@@ -276,14 +268,7 @@ impl Criterion for BundlePerPeriodCapCriterion {
         };
 
         let criterion_asset = asset_normalise(&self.asset);
-        let now_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .map_err(|e| PolicyError::CriterionEvaluationFailed {
-                detail: format!(
-                    "bundle_per_period_cap: record_confirmed system clock is before UNIX epoch: {e}"
-                ),
-            })?;
+        let now_ms = ctx.now_ms;
         let state_key = StateKey::new(ctx.profile_name, 1, &criterion_asset, self.window.as_secs());
 
         let mut recorded = Vec::new();
@@ -368,11 +353,9 @@ mod tests {
         }
     }
 
+    /// The fixture evaluation instant every context of this module carries.
     fn now_ms() -> u64 {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system clock should be after UNIX epoch")
-            .as_millis() as u64
+        1_700_000_000_000
     }
 
     fn make_ctx_with_bundle<'a>(
@@ -397,6 +380,7 @@ mod tests {
             bundle: view,
             policy_digest: [0; 32],
             provisional: false,
+            now_ms: now_ms(),
         }
     }
 

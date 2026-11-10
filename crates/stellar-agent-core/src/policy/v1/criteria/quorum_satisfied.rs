@@ -219,7 +219,8 @@ mod tests {
         let args = serde_json::Value::Null;
         let store = PolicyStateStore::new();
         let view = SatisfiedQuorum;
-        let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store).with_quorum(&view);
+        let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store, 1_700_000_000_000)
+            .with_quorum(&view);
 
         let result = criterion.evaluate(&ctx).unwrap();
         assert!(result.is_none(), "expected pass, got: {result:?}");
@@ -237,7 +238,8 @@ mod tests {
         let view = UnsatisfiedAndQuorum {
             short_groups: vec!["admins".to_owned(), "ops".to_owned()],
         };
-        let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store).with_quorum(&view);
+        let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store, 1_700_000_000_000)
+            .with_quorum(&view);
 
         let result = criterion.evaluate(&ctx).unwrap();
         match result {
@@ -264,7 +266,8 @@ mod tests {
         let view = UnsatisfiedOrQuorum {
             all_groups: vec!["g1".to_owned(), "g2".to_owned()],
         };
-        let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store).with_quorum(&view);
+        let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store, 1_700_000_000_000)
+            .with_quorum(&view);
 
         let result = criterion.evaluate(&ctx).unwrap();
         match result {
@@ -289,7 +292,7 @@ mod tests {
         let args = serde_json::Value::Null;
         let store = PolicyStateStore::new();
         // No .with_quorum() call — ctx.quorum is None.
-        let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store);
+        let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store, 1_700_000_000_000);
 
         let result = criterion.evaluate(&ctx);
         match result {

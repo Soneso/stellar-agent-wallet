@@ -7,7 +7,7 @@
 //! against.
 //!
 //! Under either test feature, and in this crate's own tests,
-//! [`set_now_ms_for_test`] fixes the clock for every caller in the process
+//! `set_now_ms_for_test` fixes the clock for every caller in the process
 //! until its guard drops; tests that use it run serially.
 
 use stellar_agent_core::error::{WalletError, WalletStateError};

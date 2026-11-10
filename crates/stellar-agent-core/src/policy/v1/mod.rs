@@ -797,6 +797,12 @@ pub struct EvalContext<'a> {
     /// `minimum_reserve` and `balance_floor` pass while it is set; no other
     /// criterion reads it.
     pub provisional: bool,
+    /// The evaluation instant in Unix milliseconds.
+    ///
+    /// One evaluation reads time once and every criterion reads this field,
+    /// never the clock, so window queries, session expiry and recorded
+    /// timestamps all agree on a single instant.
+    pub now_ms: u64,
 }
 
 impl<'a> EvalContext<'a> {
@@ -835,7 +841,7 @@ impl<'a> EvalContext<'a> {
     /// let profile = Profile::builder_testnet("alice", "acct", "n-svc", "n-acct").build();
     /// let args = serde_json::Value::Null;
     /// let store = PolicyStateStore::new();
-    /// let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store);
+    /// let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store, 1_700_000_000_000);
     /// assert!(ctx.bundle.is_none());
     /// assert!(ctx.account_view.is_none());
     /// assert!(ctx.identity_view.is_none());
@@ -850,6 +856,7 @@ impl<'a> EvalContext<'a> {
         profile_name: &'a str,
         profile: &'a Profile,
         state_store: &'a PolicyStateStore,
+        now_ms: u64,
     ) -> Self {
         Self {
             tool,
@@ -867,6 +874,7 @@ impl<'a> EvalContext<'a> {
             bundle: None,
             policy_digest: [0; 32],
             provisional: false,
+            now_ms,
         }
     }
 
@@ -951,7 +959,7 @@ impl<'a> EvalContext<'a> {
     /// let args = serde_json::Value::Null;
     /// let store = PolicyStateStore::new();
     /// let view = AlwaysSatisfied;
-    /// let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store)
+    /// let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store, 1_700_000_000_000)
     ///     .with_quorum(&view);
     /// assert!(ctx.quorum.is_some());
     /// ```
@@ -995,7 +1003,7 @@ impl<'a> EvalContext<'a> {
     /// let args = serde_json::Value::Null;
     /// let store = PolicyStateStore::new();
     /// let cache = EmptyCache;
-    /// let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store)
+    /// let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store, 1_700_000_000_000)
     ///     .with_counterparty_cache(&cache);
     /// assert!(ctx.counterparty_cache.is_some());
     /// ```
@@ -1035,7 +1043,7 @@ impl<'a> EvalContext<'a> {
     /// let args = serde_json::Value::Null;
     /// let store = PolicyStateStore::new();
     /// let sessions = AlwaysActive;
-    /// let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store)
+    /// let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store, 1_700_000_000_000)
     ///     .with_sep10_sessions(&sessions);
     /// assert!(ctx.sep10_sessions.is_some());
     /// ```
@@ -1075,7 +1083,7 @@ impl<'a> EvalContext<'a> {
     /// let args = serde_json::Value::Null;
     /// let store = PolicyStateStore::new();
     /// let sessions = AlwaysActive;
-    /// let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store)
+    /// let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store, 1_700_000_000_000)
     ///     .with_sep45_sessions(&sessions);
     /// assert!(ctx.sep45_sessions.is_some());
     /// ```
@@ -1395,6 +1403,7 @@ impl PolicyEngine for PolicyEngineV1 {
         counterparty_cache: Option<&dyn CounterpartyCacheView>,
         sep10_sessions: Option<&dyn Sep10SessionView>,
         sep45_sessions: Option<&dyn Sep45SessionView>,
+        now_ms: u64,
     ) -> Result<Decision, PolicyError> {
         self.evaluate_full(
             tool,
@@ -1405,6 +1414,7 @@ impl PolicyEngine for PolicyEngineV1 {
             counterparty_cache,
             sep10_sessions,
             sep45_sessions,
+            now_ms,
         )
         .map(|e| e.decision)
     }
@@ -1419,6 +1429,7 @@ impl PolicyEngine for PolicyEngineV1 {
         counterparty_cache: Option<&dyn CounterpartyCacheView>,
         sep10_sessions: Option<&dyn Sep10SessionView>,
         sep45_sessions: Option<&dyn Sep45SessionView>,
+        now_ms: u64,
     ) -> Result<crate::policy::Evaluation, PolicyError> {
         // Derive the typed value descriptor from the same (tool, args) the
         // criteria gate on. Two-phase classic tools carry the resolved keys in
@@ -1427,7 +1438,7 @@ impl PolicyEngine for PolicyEngineV1 {
         // supply their resolved effects via `evaluate_with_value_full` instead.
         let value = value::derive_value_class(&tool.name, args);
         self.assert_value_kind_populated(tool, &value);
-        let (decision, class) = self.evaluate_inner(
+        let (decision, class, rule_ordinal) = self.evaluate_inner(
             tool,
             args,
             profile,
@@ -1438,11 +1449,13 @@ impl PolicyEngine for PolicyEngineV1 {
             sep10_sessions,
             sep45_sessions,
             false,
+            now_ms,
         )?;
         Ok(crate::policy::Evaluation {
             value_effects: value_effects_on_permitted_decision(&decision, &value, class),
             decision,
             provisional: false,
+            rule_ordinal,
         })
     }
 
@@ -1457,6 +1470,7 @@ impl PolicyEngine for PolicyEngineV1 {
         counterparty_cache: Option<&dyn CounterpartyCacheView>,
         sep10_sessions: Option<&dyn Sep10SessionView>,
         sep45_sessions: Option<&dyn Sep45SessionView>,
+        now_ms: u64,
     ) -> Result<Decision, PolicyError> {
         self.evaluate_with_value_full(
             tool,
@@ -1468,6 +1482,7 @@ impl PolicyEngine for PolicyEngineV1 {
             counterparty_cache,
             sep10_sessions,
             sep45_sessions,
+            now_ms,
         )
         .map(|e| e.decision)
     }
@@ -1483,12 +1498,13 @@ impl PolicyEngine for PolicyEngineV1 {
         counterparty_cache: Option<&dyn CounterpartyCacheView>,
         sep10_sessions: Option<&dyn Sep10SessionView>,
         sep45_sessions: Option<&dyn Sep45SessionView>,
+        now_ms: u64,
     ) -> Result<crate::policy::Evaluation, PolicyError> {
         // The dispatch site resolved the value from the SAME decoded requirements
         // it signs (the single-decode invariant); use it as-is and echo it back
         // for allowed and approval-required calls so recording uses the gate sizing.
         self.assert_value_kind_populated(tool, &value);
-        let (decision, class) = self.evaluate_inner(
+        let (decision, class, rule_ordinal) = self.evaluate_inner(
             tool,
             args,
             profile,
@@ -1499,11 +1515,13 @@ impl PolicyEngine for PolicyEngineV1 {
             sep10_sessions,
             sep45_sessions,
             false,
+            now_ms,
         )?;
         Ok(crate::policy::Evaluation {
             value_effects: value_effects_on_permitted_decision(&decision, &value, class),
             decision,
             provisional: false,
+            rule_ordinal,
         })
     }
 
@@ -1522,9 +1540,10 @@ impl PolicyEngine for PolicyEngineV1 {
         counterparty_cache: Option<&dyn CounterpartyCacheView>,
         sep10_sessions: Option<&dyn Sep10SessionView>,
         sep45_sessions: Option<&dyn Sep45SessionView>,
+        now_ms: u64,
     ) -> Result<crate::policy::Evaluation, PolicyError> {
         self.assert_value_kind_populated(tool, &value);
-        let (decision, class) = self.evaluate_inner(
+        let (decision, class, rule_ordinal) = self.evaluate_inner(
             tool,
             args,
             profile,
@@ -1535,11 +1554,13 @@ impl PolicyEngine for PolicyEngineV1 {
             sep10_sessions,
             sep45_sessions,
             true,
+            now_ms,
         )?;
         Ok(crate::policy::Evaluation {
             value_effects: value_effects_on_permitted_decision(&decision, &value, class),
             decision,
             provisional: true,
+            rule_ordinal,
         })
     }
 
@@ -1561,7 +1582,7 @@ impl PolicyEngine for PolicyEngineV1 {
         reason: OpaqueReason,
         now_ms: u64,
     ) -> Result<SizingOutcome, PolicyError> {
-        if let Some(reason) = self.unvalued_refusal(tool, profile, reason)? {
+        if let Some(reason) = self.unvalued_refusal(tool, profile, reason, now_ms)? {
             return Ok(SizingOutcome::Refused(reason));
         }
         let effective = self.effective_unvalued(tool, reason);
@@ -1576,11 +1597,12 @@ impl PolicyEngine for PolicyEngineV1 {
         profile: &Profile,
         value: &ValueClass,
     ) -> Result<SizingOutcome, PolicyError> {
+        let now_ms = sample_policy_instant("record_confirmed_checked")?;
         let (basis, effective) = match value {
             ValueClass::Value(_) => (SizingBasis::MeasuredValue, value.clone()),
             ValueClass::ReadOnly => (SizingBasis::NoValue, ValueClass::ReadOnly),
             ValueClass::Opaque(reason) => {
-                if let Some(reason) = self.unvalued_refusal(tool, profile, *reason)? {
+                if let Some(reason) = self.unvalued_refusal(tool, profile, *reason, now_ms)? {
                     return Ok(SizingOutcome::Refused(reason));
                 }
                 (
@@ -1589,7 +1611,7 @@ impl PolicyEngine for PolicyEngineV1 {
                 )
             }
         };
-        let entries = self.record_confirmed(tool, profile, &effective)?;
+        let entries = self.record_confirmed_at(tool, profile, &effective, now_ms)?;
         Ok(SizingOutcome::Sized(CheckedSizing::new(
             self.sizing_basis(tool, basis),
             entries,
@@ -1652,6 +1674,16 @@ fn strictest_recipient_class(
     Ok(strictest)
 }
 
+/// Samples the policy instant for an entry point that receives none, so the
+/// whole operation observes that one sample. A failure is a criterion
+/// evaluation failure naming the operation, since no criterion can run
+/// without an instant.
+fn sample_policy_instant(operation: &str) -> Result<u64, PolicyError> {
+    crate::policy::policy_now_ms().map_err(|error| PolicyError::CriterionEvaluationFailed {
+        detail: format!("{operation}: {error}"),
+    })
+}
+
 impl PolicyEngineV1 {
     /// The pinned population guard (design §2.3): a `MovesValue` tool that
     /// reaches the gate MUST carry resolved `ValueClass::Value` effects, and an
@@ -1680,9 +1712,12 @@ impl PolicyEngineV1 {
     /// receives it). Honours the per-rule `allow_opaque_signing` exemption by
     /// treating an opaque value as read-only for a rule that opted in.
     ///
-    /// Returns the decision and, for a permitted decision, the strictest
-    /// recipient class of the matched rule's counterparty criteria.
-    /// `provisional` defers the account-dependent criteria.
+    /// Returns the decision; for a permitted decision, the strictest
+    /// recipient class of the matched rule's counterparty criteria; and the
+    /// zero-based document position of the rule that decided it. The position
+    /// counts every rule in the resolved scope, before tool filtering, and is
+    /// `None` for the default-deny. `provisional` defers the account-dependent
+    /// criteria.
     #[allow(clippy::too_many_arguments)]
     fn evaluate_inner(
         &self,
@@ -1696,12 +1731,14 @@ impl PolicyEngineV1 {
         sep10_sessions: Option<&dyn Sep10SessionView>,
         sep45_sessions: Option<&dyn Sep45SessionView>,
         provisional: bool,
-    ) -> Result<(Decision, Option<RecipientClass>), PolicyError> {
+        now_ms: u64,
+    ) -> Result<(Decision, Option<RecipientClass>, Option<usize>), PolicyError> {
         // project_id is cached at engine construction time from STELLAR_AGENT_PROJECT.
         let rules = self.matching_rules(&self.profile_name, self.project_id.as_deref());
 
-        // First-match stop-semantics.
-        for rule in rules {
+        // First-match stop-semantics. The ordinal is taken before the tool
+        // filter so it names the rule's position in the document.
+        for (ordinal, rule) in rules.into_iter().enumerate() {
             if !rule.matches_tool(tool) {
                 continue;
             }
@@ -1736,13 +1773,16 @@ impl PolicyEngineV1 {
                 bundle: None,
                 policy_digest: self.policy_digest,
                 provisional,
+                now_ms,
             };
 
             let mut escalation = None;
             for criterion in &rule.criteria {
                 match criterion.evaluate_decision(&ctx)? {
                     Decision::Allow => {}
-                    Decision::Deny(deny) => return Ok((Decision::Deny(deny), None)),
+                    Decision::Deny(deny) => {
+                        return Ok((Decision::Deny(deny), None, Some(ordinal)));
+                    }
                     Decision::RequireApproval(request) => {
                         escalation.get_or_insert(request);
                     }
@@ -1758,11 +1798,11 @@ impl PolicyEngineV1 {
             } else {
                 strictest_recipient_class(rule, &ctx)?
             };
-            return Ok((decision, class));
+            return Ok((decision, class, Some(ordinal)));
         }
 
         // No matching rule — default-deny.
-        Ok((Decision::Deny(DenyReason::NoMatchingRule), None))
+        Ok((Decision::Deny(DenyReason::NoMatchingRule), None, None))
     }
 
     /// Returns the profile name this engine was constructed for.
@@ -1805,16 +1845,29 @@ impl PolicyEngineV1 {
     ///
     /// # Errors
     ///
-    /// Returns [`PolicyError::CriterionEvaluationFailed`] if any criterion's
-    /// `record_confirmed` fails (state-store lock poisoning or a clock read
-    /// failure).
+    /// Returns [`PolicyError::CriterionEvaluationFailed`] if the policy clock
+    /// cannot be sampled or any criterion's `record_confirmed` fails
+    /// (state-store lock poisoning).
     pub fn record_confirmed(
         &self,
         tool: &ToolDescriptor,
         profile: &Profile,
         value: &value::ValueClass,
     ) -> Result<Vec<criteria::state_store::WindowEntry>, PolicyError> {
-        self.accounting_entries(tool, profile, value, |criterion, ctx| {
+        let now_ms = sample_policy_instant("record_confirmed")?;
+        self.record_confirmed_at(tool, profile, value, now_ms)
+    }
+
+    /// Records a confirmed call at the supplied instant; every criterion of the
+    /// matched rule stamps its entries with `now_ms`.
+    fn record_confirmed_at(
+        &self,
+        tool: &ToolDescriptor,
+        profile: &Profile,
+        value: &value::ValueClass,
+        now_ms: u64,
+    ) -> Result<Vec<criteria::state_store::WindowEntry>, PolicyError> {
+        self.accounting_entries(tool, profile, value, now_ms, |criterion, ctx| {
             criterion.record_confirmed(ctx)
         })
     }
@@ -1830,7 +1883,7 @@ impl PolicyEngineV1 {
         value: &value::ValueClass,
         now_ms: u64,
     ) -> Result<Vec<criteria::state_store::WindowEntry>, PolicyError> {
-        self.accounting_entries(tool, profile, value, |criterion, ctx| {
+        self.accounting_entries(tool, profile, value, now_ms, |criterion, ctx| {
             criterion
                 .size(ctx, now_ms)
                 .map(|entry| entry.into_iter().collect())
@@ -1855,6 +1908,7 @@ impl PolicyEngineV1 {
         tool: &ToolDescriptor,
         profile: &Profile,
         reason: OpaqueReason,
+        now_ms: u64,
     ) -> Result<Option<DenyReason>, PolicyError> {
         let effective = self.effective_unvalued(tool, reason);
         if matches!(effective, ValueClass::Opaque(_)) {
@@ -1867,6 +1921,7 @@ impl PolicyEngineV1 {
                 &self.profile_name,
                 profile,
                 &refusal_store,
+                now_ms,
             );
             ctx.value = effective.clone();
             if let Some(rule) = self
@@ -1904,6 +1959,7 @@ impl PolicyEngineV1 {
         tool: &ToolDescriptor,
         profile: &Profile,
         value: &value::ValueClass,
+        now_ms: u64,
         mut account: impl FnMut(
             &dyn Criterion,
             &EvalContext<'_>,
@@ -1930,6 +1986,7 @@ impl PolicyEngineV1 {
                 bundle: None,
                 policy_digest: self.policy_digest,
                 provisional: false,
+                now_ms,
             };
             let mut recorded = Vec::new();
             for criterion in &rule.criteria {
@@ -2008,9 +2065,9 @@ impl PolicyEngineV1 {
     ///
     /// # Errors
     ///
-    /// Returns [`PolicyError::CriterionEvaluationFailed`] if any criterion's
-    /// `evaluate` call returns an error (e.g. i128 overflow in
-    /// `bundle_aggregate_cap`).
+    /// Returns [`PolicyError::CriterionEvaluationFailed`] if the policy clock
+    /// cannot be sampled or any criterion's `evaluate` call returns an error
+    /// (e.g. i128 overflow in `bundle_aggregate_cap`).
     ///
     pub fn evaluate_bundle(
         &self,
@@ -2018,6 +2075,20 @@ impl PolicyEngineV1 {
         args: &Value,
         profile: &Profile,
         bundle: &BundleView<'_>,
+    ) -> Result<Decision, PolicyError> {
+        let now_ms = sample_policy_instant("evaluate_bundle")?;
+        self.evaluate_bundle_at(tool, args, profile, bundle, now_ms)
+    }
+
+    /// Evaluates a bundle at the supplied instant; every per-inner and
+    /// bundle-level context carries `now_ms`.
+    fn evaluate_bundle_at(
+        &self,
+        tool: &ToolDescriptor,
+        args: &Value,
+        profile: &Profile,
+        bundle: &BundleView<'_>,
+        now_ms: u64,
     ) -> Result<Decision, PolicyError> {
         use crate::policy::v1::criteria::inner_invocation_count_cap::DEFAULT_INNER_INVOCATION_COUNT_CAP;
 
@@ -2099,6 +2170,7 @@ impl PolicyEngineV1 {
                     bundle: Some(&inner_view),
                     policy_digest: self.policy_digest,
                     provisional: false,
+                    now_ms,
                 };
                 let mut per_inner_deny: Option<DenyReason> = None;
                 for criterion in &rule.criteria {
@@ -2157,6 +2229,7 @@ impl PolicyEngineV1 {
                     bundle: None,
                     policy_digest: self.policy_digest,
                     provisional: false,
+                    now_ms,
                 };
                 for criterion in &rule.criteria {
                     if criterion.is_bundle_level() {
@@ -2194,6 +2267,7 @@ impl PolicyEngineV1 {
             bundle: Some(&final_view),
             policy_digest: self.policy_digest,
             provisional: false,
+            now_ms,
         };
 
         // Implicit coupling: any value-summing bundle cap on the matched rule
@@ -2269,14 +2343,28 @@ impl PolicyEngineV1 {
     ///
     /// # Errors
     ///
-    /// Returns [`PolicyError::CriterionEvaluationFailed`] if any criterion's
-    /// `record_confirmed` fails, or if a criterion that records each inner
-    /// meets an inner that is not a recognized transfer.
+    /// Returns [`PolicyError::CriterionEvaluationFailed`] if the policy clock
+    /// cannot be sampled, if any criterion's `record_confirmed` fails, or if a
+    /// criterion that records each inner meets an inner that is not a
+    /// recognized transfer.
     pub fn record_confirmed_bundle(
         &self,
         tool: &ToolDescriptor,
         profile: &Profile,
         bundle: &BundleView<'_>,
+    ) -> Result<Vec<criteria::state_store::WindowEntry>, PolicyError> {
+        let now_ms = sample_policy_instant("record_confirmed_bundle")?;
+        self.record_confirmed_bundle_at(tool, profile, bundle, now_ms)
+    }
+
+    /// Records a confirmed bundle at the supplied instant; every criterion of
+    /// the matched rule stamps its entries with `now_ms`.
+    fn record_confirmed_bundle_at(
+        &self,
+        tool: &ToolDescriptor,
+        profile: &Profile,
+        bundle: &BundleView<'_>,
+        now_ms: u64,
     ) -> Result<Vec<criteria::state_store::WindowEntry>, PolicyError> {
         let rules = self.matching_rules(&self.profile_name, self.project_id.as_deref());
         for rule in rules {
@@ -2299,6 +2387,7 @@ impl PolicyEngineV1 {
                 bundle: Some(bundle),
                 policy_digest: self.policy_digest,
                 provisional: false,
+                now_ms,
             };
             let mut recorded = Vec::new();
             for criterion in &rule.criteria {
@@ -2310,6 +2399,7 @@ impl PolicyEngineV1 {
                             tool,
                             profile,
                             inner,
+                            now_ms,
                         )?);
                     }
                 } else {
@@ -2326,7 +2416,8 @@ impl PolicyEngineV1 {
     ///
     /// The inner's value carries the strictest recipient class of the rule's
     /// counterparty criteria, classified without views as the bundle
-    /// evaluation classified it.
+    /// evaluation classified it. Every inner records at the bundle's instant
+    /// `now_ms`.
     fn record_confirmed_inner(
         &self,
         rule: &PolicyRule,
@@ -2334,6 +2425,7 @@ impl PolicyEngineV1 {
         tool: &ToolDescriptor,
         profile: &Profile,
         inner: &bundle::InnerOpDescriptor,
+        now_ms: u64,
     ) -> Result<Vec<criteria::state_store::WindowEntry>, PolicyError> {
         let value::ValueClass::Value(effects) = value::value_class_for_inner(inner) else {
             return Err(PolicyError::CriterionEvaluationFailed {
@@ -2361,6 +2453,7 @@ impl PolicyEngineV1 {
             bundle: None,
             policy_digest: self.policy_digest,
             provisional: false,
+            now_ms,
         };
         let class = strictest_recipient_class(rule, &ctx)?;
         ctx.value = value::ValueClass::Value(effects.with_recipient_class(class));
@@ -2399,6 +2492,10 @@ mod tests {
     use super::*;
     use crate::policy::v1::bundle::InnerOpDescriptor;
     use crate::policy::{McpToolRegistration, ToolDescriptor};
+
+    /// The fixed evaluation instant of the tests that supply one. Tests that
+    /// also reach a sampling entry point fix the policy clock at it.
+    const TEST_NOW_MS: u64 = 1_700_000_000_000;
 
     struct ReserveOnlyView;
     struct WithIdentityView;
@@ -2727,6 +2824,7 @@ mod tests {
                 None,
                 None,
                 None,
+                TEST_NOW_MS,
             )
             .unwrap();
         assert_eq!(result, Decision::Deny(DenyReason::NoMatchingRule));
@@ -2761,6 +2859,7 @@ mod tests {
                 None,
                 None,
                 None,
+                TEST_NOW_MS,
             )
             .unwrap();
         assert_eq!(result, Decision::Allow);
@@ -2804,6 +2903,7 @@ mod tests {
                             None,
                             None,
                             None,
+                            TEST_NOW_MS,
                         )
                         .unwrap();
                     let expected = if with_cap && amount > 500 {
@@ -2858,6 +2958,7 @@ mod tests {
                             None,
                             None,
                             None,
+                            TEST_NOW_MS,
                         )
                         .unwrap(),
                     decision
@@ -2898,11 +2999,31 @@ mod tests {
         let args = serde_json::json!({"amount_stroops": "150", "asset": "USDC:GISSUER"});
         assert_eq!(
             engine
-                .evaluate(&td, &args, &profile, None, None, None, None, None)
+                .evaluate(
+                    &td,
+                    &args,
+                    &profile,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    TEST_NOW_MS
+                )
                 .unwrap(),
             Decision::Allow
         );
-        let result = engine.evaluate(&td, &Value::Null, &profile, None, None, None, None, None);
+        let result = engine.evaluate(
+            &td,
+            &Value::Null,
+            &profile,
+            None,
+            None,
+            None,
+            None,
+            None,
+            TEST_NOW_MS,
+        );
         assert!(
             matches!(result, Err(PolicyError::CriterionEvaluationFailed { .. })),
             "{result:?}"
@@ -2953,7 +3074,17 @@ mod tests {
             doc.rules[0].decision = decision.clone();
             let engine = PolicyEngineV1::new(doc, "alice".into());
             let evaluation = engine
-                .evaluate_full(&td, &args, &profile, None, None, None, None, None)
+                .evaluate_full(
+                    &td,
+                    &args,
+                    &profile,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    TEST_NOW_MS,
+                )
                 .unwrap();
             assert_eq!(evaluation.decision, decision);
             let value::ValueClass::Value(ref effects) = derived else {
@@ -2974,6 +3105,7 @@ mod tests {
                     None,
                     None,
                     None,
+                    TEST_NOW_MS,
                 )
                 .unwrap();
             assert_eq!(evaluation.decision, decision);
@@ -3198,7 +3330,17 @@ mod tests {
         // Calling evaluate() (single-tx path) must produce Allow with no
         // overlay side-effects.
         let result = engine
-            .evaluate(&td, &Value::Null, &profile, None, None, None, None, None)
+            .evaluate(
+                &td,
+                &Value::Null,
+                &profile,
+                None,
+                None,
+                None,
+                None,
+                None,
+                TEST_NOW_MS,
+            )
             .unwrap();
         assert_eq!(
             result,
@@ -3750,17 +3892,15 @@ mod tests {
     fn evaluate_bundle_rate_limit_boundary_does_not_double_deny() {
         use crate::policy::v1::criteria::per_period_cap::Window;
         use crate::policy::v1::criteria::rate_limit::RateLimitCriterion;
-        use crate::policy::v1::criteria::state_store::{PolicyStateStore, StateKey};
-        use std::time::{SystemTime, UNIX_EPOCH};
+        use crate::policy::v1::criteria::state_store::{
+            PolicyStateStore, StateKey, set_query_time_for_test,
+        };
 
         // Seed the store with 4 calls — one below the cap of 5.
+        let _clock = set_query_time_for_test(TEST_NOW_MS);
         let store = PolicyStateStore::new();
         let state_key = StateKey::new("alice", 1, "rate_limit", 60);
-        let now_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as u64;
-        let t = now_ms.saturating_sub(1_000); // 1 second ago — inside the window
+        let t = TEST_NOW_MS - 1_000; // One second before the evaluation instant, inside the window.
         for _ in 0..4 {
             store.append(&state_key, t, 1).unwrap();
         }
@@ -3877,6 +4017,7 @@ mod tests {
     /// the cap — pinning that recording actually feeds back into evaluation.
     #[test]
     fn record_confirmed_per_period_cap_accumulates_then_second_call_denies() {
+        let _clock = criteria::state_store::set_query_time_for_test(TEST_NOW_MS);
         use crate::policy::v1::criteria::per_period_cap::{PerPeriodCapCriterion, Window};
         use crate::policy::v1::value::{ActionKind, ValueClass, ValueEffects, ValueLeg};
 
@@ -3906,6 +4047,7 @@ mod tests {
                 None,
                 None,
                 None,
+                TEST_NOW_MS,
             )
             .unwrap();
         assert_eq!(d1, Decision::Allow, "first call must be allowed");
@@ -3930,6 +4072,7 @@ mod tests {
                 None,
                 None,
                 None,
+                TEST_NOW_MS,
             )
             .unwrap();
         assert!(
@@ -3942,6 +4085,7 @@ mod tests {
     /// exhaust it; a fourth is denied.
     #[test]
     fn record_confirmed_rate_limit_accumulates_calls_until_cap() {
+        let _clock = criteria::state_store::set_query_time_for_test(TEST_NOW_MS);
         use crate::policy::v1::criteria::per_period_cap::Window;
         use crate::policy::v1::criteria::rate_limit::RateLimitCriterion;
         use crate::policy::v1::value::ValueClass;
@@ -3965,6 +4109,7 @@ mod tests {
                     None,
                     None,
                     None,
+                    TEST_NOW_MS,
                 )
                 .unwrap();
             assert_eq!(d, Decision::Allow, "call {i} must be allowed");
@@ -3985,6 +4130,7 @@ mod tests {
                 None,
                 None,
                 None,
+                TEST_NOW_MS,
             )
             .unwrap();
         assert!(
@@ -4304,6 +4450,7 @@ mod tests {
                 _counterparty: Option<&dyn CounterpartyCacheView>,
                 _sep10: Option<&dyn Sep10SessionView>,
                 _sep45: Option<&dyn Sep45SessionView>,
+                _now_ms: u64,
             ) -> Result<Decision, PolicyError> {
                 Ok(Decision::Allow)
             }
@@ -4433,6 +4580,7 @@ mod tests {
                     None,
                     None,
                     None,
+                    TEST_NOW_MS,
                 )
                 .unwrap_err();
             assert!(
@@ -4443,6 +4591,227 @@ mod tests {
                 "{err:?}"
             );
             assert_no_marker(&err, CREDENTIAL_MARKER);
+        }
+    }
+
+    /// A document whose payment rule records a rate limit and a period cap
+    /// and whose multicall rule records their bundle forms: every recording
+    /// path of the engine writes window entries under it.
+    fn recording_document() -> PolicyDocument {
+        use criteria::{
+            BundlePerPeriodCapCriterion, BundleRateLimitCriterion, PerPeriodCapCriterion,
+            RateLimitCriterion, per_period_cap::Window,
+        };
+        let rule = |tool: &str, criteria: Vec<Box<dyn Criterion>>| PolicyRule {
+            r#match: RuleMatch {
+                tool: tool.into(),
+                chain: "*".into(),
+            },
+            criteria,
+            decision: Decision::Allow,
+            allow_opaque_signing: false,
+        };
+        PolicyDocument {
+            version: 1,
+            scope: ScopeId::AllProfiles,
+            rules: vec![
+                rule(
+                    "stellar_pay",
+                    vec![
+                        Box::new(RateLimitCriterion::new(Window::parse("1m").unwrap(), 2)),
+                        Box::new(PerPeriodCapCriterion::new(
+                            "native".into(),
+                            Window::parse("1d").unwrap(),
+                            1_000,
+                        )),
+                    ],
+                ),
+                rule(
+                    "stellar_multicall",
+                    vec![
+                        Box::new(BundlePerPeriodCapCriterion::new(
+                            "native".into(),
+                            Window::parse("1d").unwrap(),
+                            1_000,
+                        )),
+                        Box::new(BundleRateLimitCriterion::new(
+                            Window::parse("1m").unwrap(),
+                            5,
+                        )),
+                    ],
+                ),
+            ],
+            signature: None,
+        }
+    }
+
+    /// One evaluation reads one instant. The instant lies far from the host
+    /// clock and the window entries sit relative to it, so a criterion that
+    /// read the host clock would see them as skewed into the future and fail.
+    /// Single and bundle evaluations decide by the instant they receive, and
+    /// both record paths stamp every entry with the one sample they take.
+    #[test]
+    #[serial_test::serial]
+    fn evaluation_reads_one_sampled_instant() {
+        use criteria::state_store::{StateKey, set_query_time_for_test};
+
+        const FAR: u64 = 4_000_000_000_000;
+        let _clock = set_query_time_for_test(FAR);
+        let profile = testnet_profile();
+        let pay = tool("stellar_pay", "stellar:testnet");
+        let args = serde_json::json!({"amount_stroops": "10", "asset": "native"});
+
+        let engine = PolicyEngineV1::new(recording_document(), "alice".into());
+        let rate_key = StateKey::new("alice", 1, "rate_limit", 60);
+        engine
+            .state_store()
+            .append(&rate_key, FAR - 1_000, 1)
+            .unwrap();
+        engine
+            .state_store()
+            .append(&rate_key, FAR - 2_000, 1)
+            .unwrap();
+        let evaluate = |now_ms| {
+            engine
+                .evaluate(&pay, &args, &profile, None, None, None, None, None, now_ms)
+                .unwrap()
+        };
+        assert!(matches!(
+            evaluate(FAR),
+            Decision::Deny(DenyReason::RateLimitExceeded { .. })
+        ));
+        assert_eq!(evaluate(FAR + 61_000), Decision::Allow);
+
+        let value = value::derive_value_class("stellar_pay", &args);
+        let recorded = engine.record_confirmed(&pay, &profile, &value).unwrap();
+        assert_eq!(recorded.len(), 2);
+        let checked = sized(
+            engine
+                .record_confirmed_checked(&pay, &profile, &value)
+                .unwrap(),
+        );
+        assert_eq!(checked.entries().len(), 2);
+        for entry in recorded.iter().chain(checked.entries()) {
+            assert_eq!(entry.timestamp_ms(), FAR);
+        }
+
+        let engine = PolicyEngineV1::new(recording_document(), "alice".into());
+        let period_key = StateKey::new("alice", 1, "native", 86_400);
+        engine
+            .state_store()
+            .append(&period_key, FAR - 1_000, 995)
+            .unwrap();
+        let multicall = tool("stellar_multicall", "stellar:testnet");
+        let inners = [token_transfer_inner(4), token_transfer_inner(10)];
+        let overlay = BundleStateOverlay::default();
+        let view = BundleView {
+            inners: &inners,
+            overlay: &overlay,
+        };
+        assert!(matches!(
+            engine
+                .evaluate_bundle(&multicall, &Value::Null, &profile, &view)
+                .unwrap(),
+            Decision::Deny(DenyReason::BundleDenied { inner_index: 1, .. })
+        ));
+        let recorded = engine
+            .record_confirmed_bundle(&multicall, &profile, &view)
+            .unwrap();
+        assert_eq!(recorded.len(), 4);
+        let checked = sized(
+            engine
+                .record_confirmed_bundle_checked(&multicall, &profile, &view)
+                .unwrap(),
+        );
+        assert_eq!(checked.entries().len(), 4);
+        for entry in recorded.iter().chain(checked.entries()) {
+            assert_eq!(entry.timestamp_ms(), FAR);
+        }
+    }
+
+    /// A clock failure at each of the five entry points that sample their own
+    /// instant refuses with a criterion evaluation failure naming the
+    /// operation, and none of them writes to the state store.
+    #[test]
+    #[serial_test::serial]
+    fn a_policy_clock_failure_refuses_sampling_entry_points() {
+        use criteria::state_store::{
+            StateKey, set_policy_clock_error_for_test, set_query_time_for_test,
+        };
+
+        let profile = testnet_profile();
+        let pay = tool("stellar_pay", "stellar:testnet");
+        let args = serde_json::json!({"amount_stroops": "10", "asset": "native"});
+        let value = value::derive_value_class("stellar_pay", &args);
+        let multicall = tool("stellar_multicall", "stellar:testnet");
+        let inners = [token_transfer_inner(4)];
+        let overlay = BundleStateOverlay::default();
+        let view = BundleView {
+            inners: &inners,
+            overlay: &overlay,
+        };
+
+        // The keys both recording paths write under a readable clock.
+        let keys: std::collections::HashSet<StateKey> = {
+            let _clock = set_query_time_for_test(TEST_NOW_MS);
+            let control = PolicyEngineV1::new(recording_document(), "alice".into());
+            control
+                .record_confirmed(&pay, &profile, &value)
+                .unwrap()
+                .into_iter()
+                .chain(
+                    control
+                        .record_confirmed_bundle(&multicall, &profile, &view)
+                        .unwrap(),
+                )
+                .map(|entry| entry.key().clone())
+                .collect()
+        };
+        assert!(!keys.is_empty());
+
+        let engine = PolicyEngineV1::new(recording_document(), "alice".into());
+        let _broken = set_policy_clock_error_for_test();
+        assert!(crate::policy::policy_now_ms().is_err());
+        let refusals: [(&str, Result<(), PolicyError>); 5] = [
+            (
+                "record_confirmed",
+                engine.record_confirmed(&pay, &profile, &value).map(drop),
+            ),
+            (
+                "record_confirmed_checked",
+                engine
+                    .record_confirmed_checked(&pay, &profile, &value)
+                    .map(drop),
+            ),
+            (
+                "evaluate_bundle",
+                engine
+                    .evaluate_bundle(&multicall, &Value::Null, &profile, &view)
+                    .map(drop),
+            ),
+            (
+                "record_confirmed_bundle",
+                engine
+                    .record_confirmed_bundle(&multicall, &profile, &view)
+                    .map(drop),
+            ),
+            (
+                "record_confirmed_bundle",
+                engine
+                    .record_confirmed_bundle_checked(&multicall, &profile, &view)
+                    .map(drop),
+            ),
+        ];
+        for (operation, result) in refusals {
+            assert!(
+                matches!(&result, Err(PolicyError::CriterionEvaluationFailed { detail })
+                    if detail.starts_with(&format!("{operation}: wallet clock error"))),
+                "{operation}: {result:?}"
+            );
+        }
+        // A query at instant zero evicts nothing, so it counts every entry.
+        for key in &keys {
+            assert_eq!(engine.state_store().query_window(key, 0).unwrap(), (0, 0));
         }
     }
 }

@@ -372,6 +372,7 @@ pub struct WalletSubmissionRecorder<'a> {
     now_ms: u64,
     sequence_floor: Option<&'a dyn SequenceFloorHook>,
     approval: Option<ApprovalTombstone>,
+    provenance: Option<stellar_agent_core::mainnet::decision::MainnetProvenance>,
 }
 
 impl std::fmt::Debug for WalletSubmissionRecorder<'_> {
@@ -384,6 +385,7 @@ impl std::fmt::Debug for WalletSubmissionRecorder<'_> {
             .field("has_audit_writer", &self.audit.is_some())
             .field("has_sequence_floor", &self.sequence_floor.is_some())
             .field("has_approval", &self.approval.is_some())
+            .field("has_provenance", &self.provenance.is_some())
             .finish()
     }
 }
@@ -403,6 +405,17 @@ impl<'a> WalletSubmissionRecorder<'a> {
     #[must_use]
     pub fn with_witness(mut self, witness: Option<&crate::cross_check::CrossCheckWitness>) -> Self {
         self.witness = witness.map(crate::cross_check::CrossCheckWitness::record);
+        self
+    }
+
+    /// Carries the mainnet policy provenance into the pending audit row: the
+    /// policy digest and the deciding rule's index.
+    #[must_use]
+    pub fn with_provenance(
+        mut self,
+        provenance: stellar_agent_core::mainnet::decision::MainnetProvenance,
+    ) -> Self {
+        self.provenance = Some(provenance);
         self
     }
 
@@ -454,6 +467,7 @@ impl<'a> WalletSubmissionRecorder<'a> {
             sequence_floor: None,
             approval: None,
             witness: None,
+            provenance: None,
         }
     }
 
@@ -584,9 +598,10 @@ impl<'a> WalletSubmissionRecorder<'a> {
         })
     }
 
-    /// The pending value-action row of a submission.
+    /// The pending value-action row of a submission, with the recorder's
+    /// policy provenance when it carries one.
     fn pending_entry(&self, intent: &SubmissionIntent) -> AuditEntry {
-        AuditEntry::new_value_action_pending(
+        let entry = AuditEntry::new_value_action_pending(
             self.tool,
             self.chain_id.clone(),
             self.legs.clone(),
@@ -601,7 +616,11 @@ impl<'a> WalletSubmissionRecorder<'a> {
                 .map(|approval| approval.approval_nonce.clone()),
             &self.request_id,
             self.witness.clone(),
-        )
+        );
+        match &self.provenance {
+            Some(provenance) => entry.with_provenance(provenance),
+            None => entry,
+        }
     }
 
     /// Maps an audit-writer failure on the pending-row path to the refusal the
@@ -2678,74 +2697,119 @@ mod tests {
         assert_eq!(std::fs::read(&state).unwrap(), b"unverifiable");
     }
 
+    /// The provenance the recorder tests attach, and its pending-row form.
+    fn test_provenance() -> stellar_agent_core::mainnet::decision::MainnetProvenance {
+        stellar_agent_core::mainnet::decision::MainnetProvenance {
+            policy_digest: [3; 32],
+            policy_sequence: 4,
+            rule_index: 2,
+            evaluated_at_ms: 1_000,
+        }
+    }
+
+    /// Asserts that `row` carries [`test_provenance`]: the policy digest as
+    /// lowercase hex and the deciding rule's index.
+    fn assert_row_carries_test_provenance(row: &serde_json::Value) {
+        assert_eq!(row["policy_digest"], "03".repeat(32), "{row}");
+        assert_eq!(row["rule_index"], 2, "{row}");
+    }
+
+    /// The pending row carries the witness and the policy provenance whether
+    /// the recorder is built directly or assembled from recorder inputs, and
+    /// a success writes no submitted row.
     #[tokio::test]
     #[serial_test::serial]
     async fn pending_row_carries_the_witness_and_success_writes_no_submitted_row() {
         stellar_agent_test_support::keyring_mock::install().unwrap();
-        let dir = tempfile::tempdir().unwrap();
-        let mut profile = Profile::builder_testnet("signer", "witness", "nonce", "witness").build();
-        profile.audit_log_path = dir.path().join("audit.jsonl");
-        let audit = Arc::new(Mutex::new(
-            AuditWriter::open(profile.audit_log_path.clone(), None).unwrap(),
-        ));
+        let home = tempfile::tempdir().unwrap();
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
         let witness = crate::cross_check::CrossCheckWitness::for_crate_tests(
             "https://oracle.example",
             123,
             [9; 32],
             vec![stellar_agent_core::cross_check::WitnessEntry::SourceAccount],
         );
-        let recorder = WalletSubmissionRecorder::new(
-            &profile,
-            "witness",
-            "stellar_pay_commit",
-            Some("stellar:testnet".to_owned()),
-            PolicyDecision::Allow,
-            vec![],
-            vec![],
-            ReceiptStore::open_at(dir.path(), "witness").unwrap(),
-            PersistedWindowStore::at_path(dir.path().join("window.json")),
-            Some(audit),
-            None,
-            "request",
-            1_000,
-        )
-        .with_witness(Some(&witness));
-        let intent = SubmissionIntent {
-            chain_scope: crate::policy_state::ChainScope::for_chain(
-                stellar_agent_core::profile::caip2::Caip2::Testnet,
-            ),
-            envelope_hash: "a".repeat(64),
-            tx_hash: "b".repeat(64),
-            source: stellar_strkey::ed25519::PublicKey([7; 32])
-                .to_string()
-                .to_string(),
-            sequence: 7,
-            max_time: 0,
-            submission_ledger: 123,
-            submission_anchor: None,
-        };
-        recorder.pre_send(&intent).await.unwrap();
-        recorder
-            .outcome(
-                &intent,
-                &SubmissionOutcome::Success {
-                    ledger: 124,
-                    created_at: Some(1),
-                },
-            )
-            .await;
-        let rows: Vec<serde_json::Value> = std::fs::read_to_string(&profile.audit_log_path)
-            .unwrap()
-            .lines()
-            .map(|line| serde_json::from_str(line).unwrap())
-            .collect();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0]["kind"], "value_action_pending");
-        for row in rows {
+        for assembled in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut profile =
+                Profile::builder_testnet("signer", "witness", "nonce", "witness").build();
+            profile.audit_log_path = dir.path().join("audit.jsonl");
+            let audit = Arc::new(Mutex::new(
+                AuditWriter::open(profile.audit_log_path.clone(), None).unwrap(),
+            ));
+            let receipts = ReceiptStore::open_at(dir.path(), "witness").unwrap();
+            let recorder = if assembled {
+                crate::submission_flow::assemble_recorder(
+                    crate::submission_flow::RecorderInputs {
+                        profile: &profile,
+                        profile_name: "witness".to_owned(),
+                        tool: "stellar_pay_commit",
+                        chain_id: "stellar:testnet".to_owned(),
+                        policy_decision: PolicyDecision::Allow,
+                        legs: vec![],
+                        audit: Some(audit),
+                        nonce_id: None,
+                        now_ms: 1_000,
+                        provenance: Some(test_provenance()),
+                    },
+                    receipts,
+                    None,
+                )
+            } else {
+                WalletSubmissionRecorder::new(
+                    &profile,
+                    "witness",
+                    "stellar_pay_commit",
+                    Some("stellar:testnet".to_owned()),
+                    PolicyDecision::Allow,
+                    vec![],
+                    vec![],
+                    receipts,
+                    PersistedWindowStore::at_path(dir.path().join("window.json")),
+                    Some(audit),
+                    None,
+                    "request",
+                    1_000,
+                )
+                .with_provenance(test_provenance())
+            }
+            .with_witness(Some(&witness));
+            let intent = SubmissionIntent {
+                chain_scope: crate::policy_state::ChainScope::for_chain(
+                    stellar_agent_core::profile::caip2::Caip2::Testnet,
+                ),
+                envelope_hash: "a".repeat(64),
+                tx_hash: "b".repeat(64),
+                source: stellar_strkey::ed25519::PublicKey([7; 32])
+                    .to_string()
+                    .to_string(),
+                sequence: 7,
+                max_time: 0,
+                submission_ledger: 123,
+                submission_anchor: None,
+            };
+            recorder.pre_send(&intent).await.unwrap();
+            recorder
+                .outcome(
+                    &intent,
+                    &SubmissionOutcome::Success {
+                        ledger: 124,
+                        created_at: Some(1),
+                    },
+                )
+                .await;
+            let rows: Vec<serde_json::Value> = std::fs::read_to_string(&profile.audit_log_path)
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            assert_eq!(rows.len(), 1, "assembled={assembled}");
+            assert_eq!(rows[0]["kind"], "value_action_pending");
             assert_eq!(
-                row["witness"],
+                rows[0]["witness"],
                 serde_json::to_value(witness.record()).unwrap()
             );
+            assert_row_carries_test_provenance(&rows[0]);
         }
     }
 
@@ -3887,6 +3951,44 @@ mod tests {
             assert!(fx.is_open(id));
             assert_eq!(reservations(&fx), 0);
             assert!(receipt(&fx, &sub.intent).is_none());
+        }
+
+        /// A recorder built from an authorization writes the policy
+        /// provenance it carries into the pending row its consume appends.
+        #[tokio::test]
+        #[serial]
+        async fn authorized_pending_row_carries_the_provenance() {
+            let fx = LedgerFixture::new("authorized-provenance", NOW);
+            let sub = submission();
+            let (_, authorization) = grant(&fx, &sub, &holds(&fx, 100), "approval-1");
+            let recorder = WalletSubmissionRecorder::new_authorized(
+                &fx.profile,
+                fx.name.clone(),
+                "stellar_pay_commit",
+                Some("stellar:mainnet".into()),
+                PolicyDecision::Allow,
+                vec![],
+                &authorization,
+                fx.receipts.clone(),
+                fx.window.clone(),
+                Some(Arc::clone(&fx.writer)),
+                None,
+                "request",
+                NOW,
+            )
+            .with_provenance(test_provenance());
+            recorder
+                .consume_for_submission(&sub.intent, MainnetSubmitGrant::Tx(authorization))
+                .unwrap();
+            let pending: Vec<serde_json::Value> =
+                std::fs::read_to_string(&fx.profile.audit_log_path)
+                    .unwrap()
+                    .lines()
+                    .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                    .filter(|row| row["kind"] == "value_action_pending")
+                    .collect();
+            assert_eq!(pending.len(), 1, "{pending:?}");
+            assert_row_carries_test_provenance(&pending[0]);
         }
 
         #[tokio::test]

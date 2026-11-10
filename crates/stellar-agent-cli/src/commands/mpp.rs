@@ -820,6 +820,7 @@ fn evaluate_policy(
     effects: &stellar_agent_core::policy::v1::ValueEffects,
 ) -> Result<ApprovalDisposition, MppError> {
     let descriptor = policy_descriptor(context, tool_name);
+    let now_ms = stellar_agent_core::policy::policy_now_ms().map_err(|_| state_error())?;
     let evaluation = engine
         .evaluate_with_value_full(
             &descriptor,
@@ -831,6 +832,7 @@ fn evaluate_policy(
             None,
             None,
             None,
+            now_ms,
         )
         .map_err(|_| state_error())?;
     match evaluation.decision {

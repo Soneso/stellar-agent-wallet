@@ -79,6 +79,9 @@ pub struct RecorderInputs<'a> {
     pub nonce_id: Option<String>,
     /// The caller's Unix clock in milliseconds.
     pub now_ms: u64,
+    /// The mainnet policy provenance the pending row records, when the
+    /// submission proceeds under a mainnet decision.
+    pub provenance: Option<stellar_agent_core::mainnet::decision::MainnetProvenance>,
 }
 
 /// Assembles the stores, window entries and signing sizing for a recorder.
@@ -107,6 +110,10 @@ pub fn assemble_recorder(
         uuid::Uuid::new_v4().to_string(),
         inputs.now_ms,
     );
+    let recorder = match inputs.provenance {
+        Some(provenance) => recorder.with_provenance(provenance),
+        None => recorder,
+    };
     match sizing {
         Some(sizing) => recorder.with_signing_sizing(sizing),
         None => recorder,

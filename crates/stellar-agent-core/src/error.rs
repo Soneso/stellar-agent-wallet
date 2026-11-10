@@ -3286,6 +3286,34 @@ pub enum WalletStateError {
 }
 
 impl WalletStateError {
+    /// The `wallet.clock_error` refusal for a clock read that failed with a
+    /// [`crate::wallet::WalletLifecycleError`], carrying the lifecycle error's
+    /// text. The lifecycle error carries no secret material.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use stellar_agent_core::error::WalletStateError;
+    /// use stellar_agent_core::wallet::WalletLifecycleError;
+    ///
+    /// let lifecycle = WalletLifecycleError::ClockError {
+    ///     detail: "system clock is before UNIX_EPOCH".to_owned(),
+    ///     source: None,
+    /// };
+    /// let error = WalletStateError::clock_error(&lifecycle);
+    /// assert_eq!(error.code(), "wallet.clock_error");
+    /// assert_eq!(
+    ///     error.to_string(),
+    ///     "system clock error: wallet clock error: system clock is before UNIX_EPOCH"
+    /// );
+    /// ```
+    #[must_use]
+    pub fn clock_error(error: &crate::wallet::WalletLifecycleError) -> Self {
+        Self::ClockError {
+            detail: error.to_string(),
+        }
+    }
+
     /// Returns the stable wire-format subcode for this wallet-state error.
     #[must_use]
     pub fn code(&self) -> &'static str {

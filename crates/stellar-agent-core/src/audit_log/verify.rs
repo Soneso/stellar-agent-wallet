@@ -2924,6 +2924,8 @@ mod tests {
                 transaction_hash_redacted: "abcd1234...5678efgh".to_owned(),
                 source_redacted: "GAAAA...ZZZZZ".to_owned(),
                 sequence: 7,
+                policy_digest: None,
+                rule_index: None,
             },
             EventKind::ValueActionFailed {
                 approval_nonce: None,
@@ -2965,6 +2967,10 @@ mod tests {
                 }],
                 network: "stellar:testnet".to_owned(),
                 scheme: "exact".to_owned(),
+                policy_digest: None,
+                policy_sequence: None,
+                rule_index: None,
+                evaluated_at_ms: None,
             },
             EventKind::X402AuthorizationWithheld {
                 network: "stellar:testnet".to_owned(),

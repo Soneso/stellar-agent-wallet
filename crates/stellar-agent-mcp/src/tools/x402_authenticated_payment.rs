@@ -951,6 +951,10 @@ impl WalletServer {
                 &json!({"chain_id": args.chain_id, "home_domain": args.home_domain}),
                 &args.chain_id,
                 value,
+                stellar_agent_core::mainnet::decision::EvaluationScope::X402Authenticated {
+                    home_domain: args.home_domain.clone(),
+                    tool: TOOL.to_owned(),
+                },
             )
             .await
         {
@@ -1020,6 +1024,8 @@ impl WalletServer {
             Ok(None) => return Ok(approval_required_indistinguishable(name)),
             Err(result) => return Ok(result),
         };
+        let authority =
+            stellar_agent_network::mainnet::authority::MainnetAuthority::Approval(&approval);
         // ── Audit pre-flight (fail-closed) ────────────────────────────────────
         // A log that cannot take a row refuses before the SEP-10 exchange
         // spends the approval.
@@ -1045,7 +1051,7 @@ impl WalletServer {
             intent: &intent,
             policy: guard.policy,
             enablement: guard.enablement,
-            approval: &approval,
+            authority: &authority,
             audit: identity_audit,
             store: &store,
         };
@@ -1093,7 +1099,7 @@ impl WalletServer {
                 guard.context,
                 guard.policy,
                 guard.enablement,
-                &approval,
+                &authority,
                 &signer,
                 &handle,
                 readiness,
@@ -1540,6 +1546,7 @@ mod tests {
             _counterparty_cache: Option<&dyn CounterpartyCacheView>,
             _sep10_sessions: Option<&dyn Sep10SessionView>,
             _sep45_sessions: Option<&dyn Sep45SessionView>,
+            _now_ms: u64,
         ) -> Result<Decision, PolicyError> {
             Ok(Decision::RequireApproval(ApprovalRequest::new(
                 "test-nonce".into(),
@@ -1561,6 +1568,7 @@ mod tests {
             _counterparty_cache: Option<&dyn CounterpartyCacheView>,
             _sep10_sessions: Option<&dyn Sep10SessionView>,
             _sep45_sessions: Option<&dyn Sep45SessionView>,
+            _now_ms: u64,
         ) -> Result<Decision, PolicyError> {
             Ok(Decision::Deny(DenyReason::NoMatchingRule))
         }

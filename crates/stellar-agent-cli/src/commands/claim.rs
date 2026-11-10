@@ -1953,7 +1953,7 @@ where
     let source_adapter =
         stellar_agent_network::policy_view::AccountViewAdapter::new(&built.account_view);
     let evaluation = match evaluate_mainnet_policy(
-        policy.engine.as_ref(),
+        &policy.verified,
         profile,
         "stellar_claim",
         stellar_agent_core::policy::ToolValueKind::MovesValue,

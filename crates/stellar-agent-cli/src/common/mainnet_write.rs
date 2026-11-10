@@ -31,6 +31,7 @@ use stellar_agent_core::profile::name::ResolvedProfileName;
 use stellar_agent_network::cross_check::CrossCheckWitness;
 use stellar_agent_network::keyring::{EnrolledRole, enrolled_signer};
 use stellar_agent_network::mainnet::audit_readiness::audit_readiness;
+use stellar_agent_network::mainnet::authority::MainnetAuthority;
 use stellar_agent_network::mainnet::resolve::{
     InvalidationStage, TxSignRequest, invalidate_unconsumed, resolve_tx_sign,
 };
@@ -446,6 +447,7 @@ pub(crate) async fn authorize_and_submit(
     )
     .await
     .map_err(|e| Envelope::<()>::err(&e))?;
+    let authority = MainnetAuthority::Approval(&approval);
 
     drain_consent_rows_before_signing(profile, name)
         .map_err(|e| refused(PipelineStep::ConsentDrain, &e, "", verb, None))?;
@@ -455,10 +457,10 @@ pub(crate) async fn authorize_and_submit(
         context,
         tool,
         evaluation.verdict.audit_decision(),
-        evaluation.effects.as_ref(),
+        evaluation.decision.value_effects(),
         &readiness,
         witness,
-        &approval,
+        &authority,
     )
     .map_err(|e| refused(PipelineStep::RecorderPreparation, &e, "", verb, None))?;
 
@@ -473,7 +475,7 @@ pub(crate) async fn authorize_and_submit(
         signer: &enrolled,
         policy: &policy.verified,
         enablement: &policy.enablement,
-        approval: &approval,
+        authority: &authority,
         audit: readiness,
         store: &window_store,
     })

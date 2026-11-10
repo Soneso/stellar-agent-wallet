@@ -273,7 +273,7 @@ mod tests {
         };
         let cache = MockCacheView::with_domains(&["circle.com"]);
 
-        let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store)
+        let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store, 1_700_000_000_000)
             .with_identity_view(&identity)
             .with_counterparty_cache(&cache);
 
@@ -297,7 +297,7 @@ mod tests {
         };
         let cache = MockCacheView::with_domains(&["circle.com"]);
 
-        let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store)
+        let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store, 1_700_000_000_000)
             .with_identity_view(&identity)
             .with_counterparty_cache(&cache);
 
@@ -328,7 +328,7 @@ mod tests {
         // No cache needed because home_domain is absent.
         let cache = MockCacheView::with_domains(&[]);
 
-        let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store)
+        let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store, 1_700_000_000_000)
             .with_identity_view(&identity)
             .with_counterparty_cache(&cache);
 
@@ -353,8 +353,8 @@ mod tests {
         };
 
         // No .with_counterparty_cache() call — ctx.counterparty_cache is None.
-        let ctx =
-            EvalContext::new(&tool, &args, "alice", &profile, &store).with_identity_view(&identity);
+        let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store, 1_700_000_000_000)
+            .with_identity_view(&identity);
 
         let result = criterion.evaluate(&ctx);
         match result {
@@ -384,7 +384,7 @@ mod tests {
         let cache = MockCacheView::with_domains(&["circle.com"]);
 
         // No .with_identity_view() call — ctx.identity_view is None.
-        let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store)
+        let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store, 1_700_000_000_000)
             .with_counterparty_cache(&cache);
 
         let result = criterion.evaluate(&ctx);

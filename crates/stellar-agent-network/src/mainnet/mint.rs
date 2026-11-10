@@ -1,12 +1,11 @@
 //! Sealed composition of checked proofs and durable authorization records.
 
 use super::authorization::{
-    ApprovalBinding, ClaimTarget, EndpointBinding, Header, MainnetMessageSignAuthorization,
+    AuthorityBinding, ClaimTarget, EndpointBinding, Header, MainnetMessageSignAuthorization,
     MessageSignInner, PolicyBinding, SignerBinding,
 };
 use super::{MainnetAuthorizationError, MainnetPrecondition, SignerRole};
 use crate::policy_state::{MintRequest, MintedRecord, WindowStoreError};
-use stellar_agent_core::approval::witness::ApprovalWitness;
 use stellar_agent_core::mainnet::enablement::EnablementRecord;
 
 pub(crate) fn store_error(error: WindowStoreError) -> MainnetAuthorizationError {
@@ -35,7 +34,6 @@ pub(crate) fn header(
     endpoint: &crate::endpoint_identity::EndpointIdentity,
     signer: &crate::keyring::EnrolledSigner,
     enablement: &EnablementRecord,
-    approval: &ApprovalWitness,
     witness: Option<&crate::cross_check::CrossCheckWitness>,
     audit: super::audit_readiness::AuditReadiness,
 ) -> Header {
@@ -53,7 +51,6 @@ pub(crate) fn header(
             role: SignerRole::AgentSigner,
         },
         enablement,
-        approval,
         witness.and_then(|w| w.subject()),
         audit,
     );
@@ -88,7 +85,6 @@ pub(crate) fn message(
     minted: MintedRecord,
     ephemeral_public_key: [u8; 32],
     enablement: &EnablementRecord,
-    approval: &ApprovalWitness,
     audit: super::audit_readiness::AuditReadiness,
 ) -> MainnetMessageSignAuthorization {
     let header = assemble(
@@ -102,7 +98,6 @@ pub(crate) fn message(
             role: SignerRole::Sep10Ephemeral,
         },
         enablement,
-        approval,
         None,
         audit,
     );
@@ -114,9 +109,9 @@ pub(crate) fn message(
 
 /// The one assembly of every header: the minted record's identity, lifetime,
 /// reservation, and bindings digest; the context's profile name and chain;
-/// the request's domain, consumer, and policy; the enablement nonce digest;
-/// the approval's nonce and expiry; and the endpoint, signer, witness subject,
-/// and audit lease the caller supplies.
+/// the request's domain, consumer, policy, and authority; the enablement
+/// nonce digest; and the endpoint, signer, witness subject, and audit lease
+/// the caller supplies.
 #[allow(
     clippy::too_many_arguments,
     reason = "the header binds every independently checked proof"
@@ -129,7 +124,6 @@ fn assemble(
     endpoint: Option<EndpointBinding>,
     signer: SignerBinding,
     enablement: &EnablementRecord,
-    approval: &ApprovalWitness,
     witness_subject: Option<[u8; 32]>,
     audit: super::audit_readiness::AuditReadiness,
 ) -> Header {
@@ -150,10 +144,7 @@ fn assemble(
             digest: request.policy_digest,
         },
         enablement_nonce_digest: *enablement.nonce_digest(),
-        approval: ApprovalBinding {
-            nonce: approval.nonce().to_owned(),
-            expires_at_ms: approval.expires_at_ms(),
-        },
+        authority: AuthorityBinding::of(&request.authority),
         reservation: minted.reservation,
         witness_subject,
         submission_anchor: None,

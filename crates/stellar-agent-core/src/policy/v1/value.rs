@@ -937,14 +937,13 @@ mod tests {
         let profile = Profile::builder_testnet("alice", "acct", "n-svc", "n-acct").build();
         let args = json!({});
         let store = PolicyStateStore::new();
-        let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store).with_value(
-            ValueClass::single(ValueLeg {
+        let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store, 1_700_000_000_000)
+            .with_value(ValueClass::single(ValueLeg {
                 kind: ActionKind::Payment,
                 amount: Some(1),
                 asset: Some("native".into()),
                 destination: None,
-            }),
-        );
+            }));
         assert!(matches!(classify_value(&ctx), ValueGate::Effects(_)));
     }
 
@@ -956,7 +955,7 @@ mod tests {
         let profile = Profile::builder_testnet("alice", "acct", "n-svc", "n-acct").build();
         let args = json!({});
         let store = PolicyStateStore::new();
-        let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store);
+        let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store, 1_700_000_000_000);
         assert!(matches!(
             classify_value(&ctx),
             ValueGate::Deny(DenyReason::UnsizableValueEffect { .. })
@@ -969,7 +968,7 @@ mod tests {
         let profile = Profile::builder_testnet("alice", "acct", "n-svc", "n-acct").build();
         let args = json!({});
         let store = PolicyStateStore::new();
-        let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store);
+        let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store, 1_700_000_000_000);
         assert!(matches!(classify_value(&ctx), ValueGate::NotApplicable));
     }
 
@@ -982,7 +981,7 @@ mod tests {
         let args = json!({});
         let store = PolicyStateStore::new();
 
-        let single = EvalContext::new(&tool, &args, "alice", &profile, &store)
+        let single = EvalContext::new(&tool, &args, "alice", &profile, &store, 1_700_000_000_000)
             .with_value(ValueClass::Opaque(OpaqueReason::RawTransactionSignature));
         assert!(matches!(
             classify_value(&single),
@@ -995,7 +994,7 @@ mod tests {
             inners: &inners,
             overlay: &overlay,
         };
-        let bundled = EvalContext::new(&tool, &args, "alice", &profile, &store)
+        let bundled = EvalContext::new(&tool, &args, "alice", &profile, &store, 1_700_000_000_000)
             .with_value(ValueClass::Opaque(OpaqueReason::RawTransactionSignature))
             .with_bundle(&view);
         let ValueGate::Deny(DenyReason::UnsizableValueEffect { detail }) = classify_value(&bundled)

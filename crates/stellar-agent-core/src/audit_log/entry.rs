@@ -2396,10 +2396,50 @@ impl AuditEntry {
                 transaction_hash_redacted: transaction_hash_redacted.into(),
                 source_redacted: source_redacted.into(),
                 sequence,
+                policy_digest: None,
+                rule_index: None,
             },
             previous_entry_hash: String::new(),
             entry_tag: None,
         }
+    }
+
+    /// Returns `self` with the mainnet policy provenance recorded.
+    ///
+    /// A `value_action_pending` row records the policy digest and the rule
+    /// index; an `x402_payment_authorized` row records the digest, the policy
+    /// sequence, the rule index and the evaluation instant. The digest is
+    /// written as 64 lowercase hex characters. Every other row kind carries no
+    /// provenance and is returned unchanged.
+    #[must_use]
+    pub fn with_provenance(
+        mut self,
+        provenance: &crate::mainnet::decision::MainnetProvenance,
+    ) -> Self {
+        match &mut self.event_kind {
+            EventKind::ValueActionPending {
+                policy_digest,
+                rule_index,
+                ..
+            } => {
+                *policy_digest = Some(crate::hex::encode(&provenance.policy_digest));
+                *rule_index = Some(provenance.rule_index);
+            }
+            EventKind::X402PaymentAuthorized {
+                policy_digest,
+                policy_sequence,
+                rule_index,
+                evaluated_at_ms,
+                ..
+            } => {
+                *policy_digest = Some(crate::hex::encode(&provenance.policy_digest));
+                *policy_sequence = Some(provenance.policy_sequence);
+                *rule_index = Some(provenance.rule_index);
+                *evaluated_at_ms = Some(provenance.evaluated_at_ms);
+            }
+            _ => {}
+        }
+        self
     }
 
     /// Constructs a `ValueActionFailed` audit entry.
@@ -2685,6 +2725,10 @@ impl AuditEntry {
                 legs,
                 network: super::schema::bound_recorded_str(&network.into()),
                 scheme: super::schema::bound_recorded_str(&scheme.into()),
+                policy_digest: None,
+                policy_sequence: None,
+                rule_index: None,
+                evaluated_at_ms: None,
             },
             previous_entry_hash: String::new(),
             entry_tag: None,
@@ -8625,5 +8669,189 @@ mod tests {
         assert!(!json.contains("Payment ey"));
         assert!(!json.contains("AAAAAgAAA"));
         assert!(!json.contains(&"x".repeat(RECORDED_STR_MAX + 1)));
+    }
+
+    /// A fixed `value_action_pending` row and a fixed `x402_payment_authorized`
+    /// row serialize to exact texts, and each text reads back and serializes to
+    /// the same bytes, which the audit chain's body hash requires.
+    #[test]
+    fn pending_and_x402_rows_serialize_unchanged() {
+        let leg = |action, asset: &str| ValueLegRecord {
+            action,
+            amount: Some(1_250_000),
+            asset: Some(asset.to_owned()),
+            destination_redacted: Some("GABCD...WXYZ2".to_owned()),
+        };
+        let mut pending = AuditEntry::new_value_action_pending(
+            "stellar_pay",
+            "stellar:mainnet",
+            vec![leg(crate::audit_log::ValueActionKind::Payment, "native")],
+            "aaaaaaaa...bbbbbbbb",
+            "GSRCE...ABCDE",
+            42,
+            PolicyDecision::RequireApproval,
+            Some("ab".repeat(32)),
+            None,
+            Some("approval-nonce".to_owned()),
+            "req-pending",
+            None,
+        );
+        pending.ts = "2026-01-02T03:04:05.006Z".to_owned();
+        let mut x402 = AuditEntry::new_x402_payment_authorized(
+            "stellar_x402_create_payment",
+            "stellar:mainnet",
+            vec![leg(
+                crate::audit_log::ValueActionKind::X402Payment,
+                "CTOKEN",
+            )],
+            "stellar:mainnet",
+            "exact",
+            PolicyDecision::Allow,
+            "req-x402",
+            None,
+            Some(1_060),
+        );
+        x402.ts = "2026-01-02T03:04:05.007Z".to_owned();
+        let expected_pending = concat!(
+            r#"{"ts":"2026-01-02T03:04:05.006Z","tool":"stellar_pay","chain_id":"stellar:mainnet","#,
+            r#""arg_keys":[],"envelope_hash":"abababababababababababababababababababababababababababababababab","#,
+            r#""policy_decision":"require_approval","request_id":"req-pending","#,
+            r#""kind":"value_action_pending","approval_nonce":"approval-nonce","#,
+            r#""legs":[{"action":"payment","amount":"1250000","asset":"native","#,
+            r#""destination_redacted":"GABCD...WXYZ2"}],"#,
+            r#""transaction_hash_redacted":"aaaaaaaa...bbbbbbbb","source_redacted":"GSRCE...ABCDE","#,
+            r#""sequence":42,"previous_entry_hash":""}"#,
+        );
+        let expected_x402 = concat!(
+            r#"{"ts":"2026-01-02T03:04:05.007Z","tool":"stellar_x402_create_payment","#,
+            r#""chain_id":"stellar:mainnet","arg_keys":[],"policy_decision":"allow","#,
+            r#""request_id":"req-x402","kind":"x402_payment_authorized","#,
+            r#""signature_expiration_ledger":1060,"#,
+            r#""legs":[{"action":"x402_payment","amount":"1250000","asset":"CTOKEN","#,
+            r#""destination_redacted":"GABCD...WXYZ2"}],"#,
+            r#""network":"stellar:mainnet","scheme":"exact","previous_entry_hash":""}"#,
+        );
+        for (entry, expected) in [(&pending, expected_pending), (&x402, expected_x402)] {
+            let json = serde_json::to_string(entry).unwrap();
+            assert_eq!(json, expected);
+            let back: AuditEntry = serde_json::from_str(&json).unwrap();
+            assert_eq!(serde_json::to_string(&back).unwrap(), json);
+        }
+    }
+
+    fn provenance_rows() -> (AuditEntry, AuditEntry) {
+        let leg = |action| ValueLegRecord {
+            action,
+            amount: Some(5),
+            asset: Some("native".to_owned()),
+            destination_redacted: None,
+        };
+        let pending = AuditEntry::new_value_action_pending(
+            "stellar_pay",
+            "stellar:mainnet",
+            vec![leg(crate::audit_log::ValueActionKind::Payment)],
+            "aaaaaaaa...bbbbbbbb",
+            "GSRCE...ABCDE",
+            7,
+            PolicyDecision::Allow,
+            None,
+            None,
+            None,
+            "req-pending",
+            None,
+        );
+        let x402 = AuditEntry::new_x402_payment_authorized(
+            "stellar_x402_create_payment",
+            "stellar:mainnet",
+            vec![leg(crate::audit_log::ValueActionKind::X402Payment)],
+            "stellar:mainnet",
+            "exact",
+            PolicyDecision::Allow,
+            "req-x402",
+            None,
+            None,
+        );
+        (pending, x402)
+    }
+
+    /// `with_provenance` adds the digest and rule index to a pending row and
+    /// the four provenance fields to an x402 row, in their JSON forms, and
+    /// leaves every other row kind unchanged.
+    #[test]
+    fn with_provenance_records_the_policy_provenance() {
+        let provenance = crate::mainnet::decision::MainnetProvenance {
+            policy_digest: [0xab; 32],
+            policy_sequence: 12,
+            rule_index: 3,
+            evaluated_at_ms: 1_700_000_000_123,
+        };
+        let digest = "ab".repeat(32);
+        let (pending, x402) = provenance_rows();
+        let pending = serde_json::to_value(pending.with_provenance(&provenance)).unwrap();
+        assert_eq!(pending["policy_digest"], serde_json::json!(digest));
+        assert_eq!(pending["rule_index"], serde_json::json!(3));
+        assert!(pending.get("policy_sequence").is_none());
+        assert!(pending.get("evaluated_at_ms").is_none());
+        let x402 = serde_json::to_value(x402.with_provenance(&provenance)).unwrap();
+        assert_eq!(x402["policy_digest"], serde_json::json!(digest));
+        assert_eq!(x402["policy_sequence"], serde_json::json!(12));
+        assert_eq!(x402["rule_index"], serde_json::json!(3));
+        assert_eq!(
+            x402["evaluated_at_ms"],
+            serde_json::json!(1_700_000_000_123_u64)
+        );
+
+        let other = AuditEntry::new_value_action_failed(
+            "stellar_pay",
+            "stellar:mainnet",
+            vec![],
+            "aaaaaaaa...bbbbbbbb",
+            "submission.refused",
+            PolicyDecision::Allow,
+            None,
+            None,
+            None,
+            "req-failed",
+        );
+        let before = serde_json::to_string(&other).unwrap();
+        assert_eq!(
+            serde_json::to_string(&other.with_provenance(&provenance)).unwrap(),
+            before
+        );
+    }
+
+    /// Rows written without provenance load with every provenance field
+    /// absent and reserialize without them.
+    #[test]
+    fn legacy_rows_load_without_provenance() {
+        let (pending, x402) = provenance_rows();
+        for entry in [pending, x402] {
+            let json = serde_json::to_string(&entry).unwrap();
+            let back: AuditEntry = serde_json::from_str(&json).unwrap();
+            match &back.event_kind {
+                EventKind::ValueActionPending {
+                    policy_digest,
+                    rule_index,
+                    ..
+                } => {
+                    assert!(policy_digest.is_none());
+                    assert!(rule_index.is_none());
+                }
+                EventKind::X402PaymentAuthorized {
+                    policy_digest,
+                    policy_sequence,
+                    rule_index,
+                    evaluated_at_ms,
+                    ..
+                } => {
+                    assert!(policy_digest.is_none());
+                    assert!(policy_sequence.is_none());
+                    assert!(rule_index.is_none());
+                    assert!(evaluated_at_ms.is_none());
+                }
+                other => panic!("unexpected row kind {other:?}"),
+            }
+            assert_eq!(serde_json::to_string(&back).unwrap(), json);
+        }
     }
 }

@@ -48,6 +48,7 @@
 //! and settle from there; holds never reach the engine's in-memory view.
 
 use serde::{Deserialize, Serialize};
+use stellar_agent_core::mainnet::decision::AuthorityScope;
 use stellar_agent_core::policy::pin::{self, PinError, PinScope};
 use stellar_agent_core::policy::state_lock::WindowStoreLock;
 use stellar_agent_core::policy::v1::criteria::state_store::{CLOCK_SKEW_TOLERANCE_MS, WindowEntry};
@@ -483,8 +484,12 @@ pub(super) struct WireAuthorization {
     pub(super) policy_sequence: i64,
     #[serde(with = "hex32")]
     pub(super) policy_digest: [u8; 32],
-    pub(super) approval_nonce: String,
-    pub(super) approval_expires_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) approval_nonce: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) approval_expires_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) policy_authority: Option<WirePolicyAuthorityBinding>,
     #[serde(with = "hex32")]
     pub(super) bindings_digest: [u8; 32],
     #[serde(with = "hex32")]
@@ -501,6 +506,137 @@ pub(super) struct WireAuthorization {
     pub(super) consumption: Option<ConsumptionBinding>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) invalidation: Option<String>,
+}
+
+impl WireAuthorization {
+    /// The authority the record was minted under.
+    ///
+    /// # Errors
+    ///
+    /// [`WindowStoreError::Invalid`] with the [`WireAuthorizationShape`]
+    /// detail unless the record carries exactly an approval nonce with its
+    /// expiry, or exactly a policy authority.
+    pub(super) fn authority(&self) -> Result<MintAuthority, WindowStoreError> {
+        match (
+            &self.approval_nonce,
+            self.approval_expires_ms,
+            &self.policy_authority,
+        ) {
+            (Some(nonce), Some(expires_at_ms), None) => Ok(MintAuthority::Approval {
+                nonce: nonce.clone(),
+                expires_at_ms,
+            }),
+            (None, None, Some(policy)) => Ok(MintAuthority::Policy(policy.clone().into())),
+            _ => Err(WindowStoreError::Invalid {
+                detail: WireAuthorizationShape.to_string(),
+            }),
+        }
+    }
+
+    /// The end of the record's authority in Unix milliseconds: the
+    /// approval's expiry or the policy authority's governing end. A record
+    /// without a single authority has none and keeps nothing alive.
+    fn authority_end_ms(&self) -> u64 {
+        self.authority()
+            .map_or(0, |authority| authority.expires_at_ms())
+    }
+}
+
+/// The wire fields of `authority`: the approval nonce and expiry, or the
+/// policy authority, each in its own optional field.
+fn wire_authority(
+    authority: &MintAuthority,
+) -> (
+    Option<String>,
+    Option<u64>,
+    Option<WirePolicyAuthorityBinding>,
+) {
+    match authority {
+        MintAuthority::Approval {
+            nonce,
+            expires_at_ms,
+        } => (Some(nonce.clone()), Some(*expires_at_ms), None),
+        MintAuthority::Policy(binding) => (None, None, Some(binding.clone().into())),
+    }
+}
+
+/// The detail of a record whose authority fields do not hold exactly one
+/// authority: an approval nonce with its expiry, or a policy authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct WireAuthorizationShape;
+
+impl std::fmt::Display for WireAuthorizationShape {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(
+            "an authorization carries neither exactly an approval nonce with its expiry \
+             nor exactly a policy authority",
+        )
+    }
+}
+
+/// The persisted policy authority of a record.
+///
+/// Every field is required and an unknown field refuses the read; the digest
+/// is 64 lowercase hex characters.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct WirePolicyAuthorityBinding {
+    #[serde(with = "hex32")]
+    pub(super) policy_digest: [u8; 32],
+    pub(super) policy_sequence: i64,
+    pub(super) rule_index: u32,
+    pub(super) evaluated_at_ms: u64,
+    pub(super) governing_until_ms: u64,
+    pub(super) scope: WireAuthorityScope,
+}
+
+/// The persisted scope of a policy authority:
+/// `{"kind":"classic"}` or
+/// `{"kind":"x402_authenticated","home_domain":"...","tool":"..."}`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub(super) enum WireAuthorityScope {
+    /// A write whose authority binds to its own transaction. A struct
+    /// variant, so an unknown field beside the tag refuses.
+    Classic {},
+    /// An authenticated x402 payment for one home domain by one tool.
+    X402Authenticated { home_domain: String, tool: String },
+}
+
+impl From<PolicyAuthorityBinding> for WirePolicyAuthorityBinding {
+    fn from(binding: PolicyAuthorityBinding) -> Self {
+        Self {
+            policy_digest: binding.policy_digest,
+            policy_sequence: binding.policy_sequence,
+            rule_index: binding.rule_index,
+            evaluated_at_ms: binding.evaluated_at_ms,
+            governing_until_ms: binding.governing_until_ms,
+            scope: match binding.scope {
+                AuthorityScope::Classic => WireAuthorityScope::Classic {},
+                AuthorityScope::X402Authenticated { home_domain, tool } => {
+                    WireAuthorityScope::X402Authenticated { home_domain, tool }
+                }
+            },
+        }
+    }
+}
+
+impl From<WirePolicyAuthorityBinding> for PolicyAuthorityBinding {
+    fn from(wire: WirePolicyAuthorityBinding) -> Self {
+        Self {
+            policy_digest: wire.policy_digest,
+            policy_sequence: wire.policy_sequence,
+            rule_index: wire.rule_index,
+            evaluated_at_ms: wire.evaluated_at_ms,
+            governing_until_ms: wire.governing_until_ms,
+            scope: match wire.scope {
+                WireAuthorityScope::Classic {} => AuthorityScope::Classic,
+                WireAuthorityScope::X402Authenticated { home_domain, tool } => {
+                    AuthorityScope::X402Authenticated { home_domain, tool }
+                }
+            },
+        }
+    }
 }
 
 /// One hold an open authorization owns.
@@ -582,6 +718,14 @@ pub(super) fn validate(wire: &WireFile) -> Result<(), WindowStoreError> {
                 "an authorization's parent disagrees with its domain".to_owned(),
             ));
         }
+        if let MintAuthority::Policy(policy) = auth.authority()?
+            && (policy.policy_digest != auth.policy_digest
+                || policy.policy_sequence != auth.policy_sequence)
+        {
+            return Err(invalid(
+                "an authorization's policy authority names another policy".to_owned(),
+            ));
+        }
     }
     let mut keys = std::collections::HashSet::new();
     let mut holding = std::collections::HashSet::new();
@@ -661,24 +805,25 @@ fn retain_hold(entries: &mut Vec<WireBucket>, hold: &WireAuthorizationHold, reco
     find_or_insert_bucket(entries, &key).records.push(record);
 }
 
-/// Drops settled authorization history older than `cutoff` whose approval
-/// ends at or before `now_ms`; open and claimed records stay whatever their
-/// age.
+/// Drops settled authorization history older than `cutoff` whose authority
+/// ends at or before `now_ms`: the approval's expiry, or a policy authority's
+/// governing end. Open and claimed records stay whatever their age.
 pub(super) fn prune_history(wire: &mut WireFile, cutoff: u64, now_ms: u64) {
     wire.authorizations.retain(|auth| {
         auth.state.holds()
-            || auth.approval_expires_ms > now_ms
+            || auth.authority_end_ms() > now_ms
             || auth.settled_ms.is_some_and(|t| t >= cutoff)
     });
 }
 
 /// The authorization records a window state reset keeps: every record whose
-/// approval can still be presented at `now_ms`. The successor holds no holds,
-/// so a record that holds capacity becomes expired at `now_ms`.
+/// authority can still be presented at `now_ms`, by the approval's expiry or
+/// a policy authority's governing end. The successor holds no holds, so a
+/// record that holds capacity becomes expired at `now_ms`.
 pub(super) fn reset_survivors(wire: &WireFile, now_ms: u64) -> Vec<WireAuthorization> {
     wire.authorizations
         .iter()
-        .filter(|auth| auth.approval_expires_ms > now_ms)
+        .filter(|auth| auth.authority_end_ms() > now_ms)
         .map(|auth| {
             let mut kept = auth.clone();
             if kept.state.holds() {
@@ -721,10 +866,9 @@ pub struct MintRequest {
     pub policy_sequence: i64,
     /// The verified policy's digest, which must equal the policy pin's.
     pub policy_digest: [u8; 32],
-    /// The approval nonce.
-    pub approval_nonce: String,
-    /// The approval's expiry, in Unix milliseconds.
-    pub approval_expires_at_ms: u64,
+    /// The authority the action proceeds under; the authorization expires no
+    /// later than its end.
+    pub authority: MintAuthority,
     /// The signed envelope's on-chain deadline; the authorization expires no later.
     pub chain_deadline_ms: Option<u64>,
     /// The authorization's lifetime, in milliseconds.
@@ -740,6 +884,91 @@ pub struct MintRequest {
     /// authenticated x402 intent, which shares its approval. Absent for every
     /// other record.
     pub parent: Option<AuthorizationId>,
+}
+
+/// The policy authority a record is minted under: the decision that allowed
+/// the action without an approval, and the end of the authority it grants.
+///
+/// Its digest, [`crate::mainnet::digest::policy_authority_digest`], binds the
+/// record's authority into the header's bindings and its expectations.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PolicyAuthorityBinding {
+    /// The BLAKE3 digest of the verified policy's canonical bytes.
+    pub policy_digest: [u8; 32],
+    /// The verified policy's signed sequence.
+    pub policy_sequence: i64,
+    /// The zero-based document position of the deciding rule.
+    pub rule_index: u32,
+    /// The evaluation instant, in Unix milliseconds.
+    pub evaluated_at_ms: u64,
+    /// The end of the authority, in Unix milliseconds; an authorization under
+    /// it expires no later.
+    pub governing_until_ms: u64,
+    /// The scope the decision covers.
+    pub scope: AuthorityScope,
+}
+
+impl PolicyAuthorityBinding {
+    /// The policy-authority digest of this binding.
+    #[must_use]
+    pub fn digest(&self) -> [u8; 32] {
+        crate::mainnet::digest::policy_authority_digest(self)
+    }
+}
+
+/// The authority a mint records: an operator approval or a policy authority.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MintAuthority {
+    /// An operator approval.
+    Approval {
+        /// The approval nonce, single use within retention.
+        nonce: String,
+        /// The approval's expiry, in Unix milliseconds.
+        expires_at_ms: u64,
+    },
+    /// A policy authority.
+    Policy(PolicyAuthorityBinding),
+}
+
+impl MintAuthority {
+    /// The end of the authority in Unix milliseconds: the approval's expiry
+    /// or the policy authority's governing end.
+    #[must_use]
+    pub fn expires_at_ms(&self) -> u64 {
+        match self {
+            Self::Approval { expires_at_ms, .. } => *expires_at_ms,
+            Self::Policy(binding) => binding.governing_until_ms,
+        }
+    }
+}
+
+/// Compares the authority a transition presents with the one the record was
+/// minted under: an approval by nonce and then expiry, a policy authority by
+/// its digest. Two authorities of different variants never match.
+fn compare_authority(
+    recorded: &MintAuthority,
+    expected: &MintAuthority,
+) -> Result<(), WindowStoreError> {
+    use MainnetPrecondition as P;
+    match (recorded, expected) {
+        (
+            MintAuthority::Approval {
+                nonce,
+                expires_at_ms,
+            },
+            MintAuthority::Approval {
+                nonce: expected_nonce,
+                expires_at_ms: expected_expiry,
+            },
+        ) => {
+            check(nonce == expected_nonce, P::ApprovalNonce)?;
+            check(expires_at_ms == expected_expiry, P::ApprovalExpiry)
+        }
+        (MintAuthority::Policy(binding), MintAuthority::Policy(expected)) => {
+            check(binding.digest() == expected.digest(), P::AuthorityMismatch)
+        }
+        _ => Err(refused(P::AuthorityMismatch)),
+    }
 }
 
 /// Whether a record of `domain` minted for `consumer` continues a parent: an
@@ -889,8 +1118,8 @@ pub struct MintedRecord {
     pub id: AuthorizationId,
     /// When the store issued it, in Unix milliseconds on its clock.
     pub issued_at_ms: u64,
-    /// When it expires: the earlier of the issue time plus the lifetime and
-    /// the approval's expiry.
+    /// When it expires: the earliest of the issue time plus the lifetime, the
+    /// end of its authority, and the envelope's on-chain deadline.
     pub expires_at_ms: u64,
     /// The window reservation of its holds; absent when it holds nothing.
     pub reservation: Option<WindowReservation>,
@@ -905,7 +1134,7 @@ pub struct ClaimExpect {
     pub(crate) bindings_digest: [u8; 32],
     pub(crate) policy_sequence: i64,
     pub(crate) policy_digest: [u8; 32],
-    pub(crate) approval_nonce: String,
+    pub(crate) authority: MintAuthority,
 }
 
 /// The expectation a consumption is compared against: an authorization's
@@ -923,8 +1152,7 @@ pub struct ConsumeExpect {
     binding: DomainBinding,
     policy_sequence: i64,
     policy_digest: [u8; 32],
-    approval_nonce: String,
-    approval_expires_ms: u64,
+    authority: MintAuthority,
     reservation: Option<AuthorizationId>,
     entries_digest: [u8; 32],
     bindings_digest: [u8; 32],
@@ -947,8 +1175,7 @@ impl ConsumeExpect {
         binding: DomainBinding,
         policy_sequence: i64,
         policy_digest: [u8; 32],
-        approval_nonce: String,
-        approval_expires_ms: u64,
+        authority: MintAuthority,
         reservation: Option<AuthorizationId>,
         bindings_digest: [u8; 32],
         recorded_audit: AuditFacts,
@@ -963,8 +1190,7 @@ impl ConsumeExpect {
             binding,
             policy_sequence,
             policy_digest,
-            approval_nonce,
-            approval_expires_ms,
+            authority,
             reservation,
             entries_digest: recomputed.entries_digest,
             bindings_digest,
@@ -1050,13 +1276,11 @@ fn compare_expectation(
         P::PolicySequence,
     )?;
     check(auth.policy_digest == expect.policy_digest, P::PolicyDigest)?;
+    let recorded = auth.authority()?;
+    compare_authority(&recorded, &expect.authority)?;
     check(
-        auth.approval_nonce == expect.approval_nonce,
-        P::ApprovalNonce,
-    )?;
-    check(
-        auth.approval_expires_ms == expect.approval_expires_ms,
-        P::ApprovalExpiry,
+        auth.expires_ms <= recorded.expires_at_ms(),
+        P::LifetimeInvalid,
     )?;
     check(
         auth.reservation == expect.reservation,
@@ -1329,16 +1553,18 @@ impl PersistedWindowStore {
     /// reservation digest; a Soroban intent's consumer must be an x402 verb;
     /// a domain that holds nothing refuses entries; an x402 submission names a
     /// parent and no other request does; no hold may be dated past the store
-    /// clock plus [`CLOCK_SKEW_TOLERANCE_MS`]; the lifetime is the
-    /// earlier of the issue time plus `authorization_ttl_ms` and the
-    /// approval's expiry, and a zero, an overflowing, or an already elapsed
-    /// lifetime refuses; the policy pin must be present and equal to the
-    /// request's policy. These checks precede the window key, so a refusal
-    /// among them mints no key. Then expired authorizations are swept; no open
-    /// authorization may name the same domain and content; an x402 submission
-    /// must continue a used Soroban intent of the same profile, chain,
-    /// consumer, policy, and approval that has no child yet, and every other
-    /// request's approval nonce must appear on no record within retention;
+    /// clock plus [`CLOCK_SKEW_TOLERANCE_MS`]; a policy authority must name
+    /// the request's policy; the lifetime is the earliest of the issue time
+    /// plus `authorization_ttl_ms`, the end of the authority, and the
+    /// envelope's on-chain deadline, and a zero, an overflowing, or an
+    /// already elapsed lifetime refuses; the policy pin must be present and
+    /// equal to the request's policy. These checks precede the window key, so
+    /// a refusal among them mints no key. Then expired authorizations are
+    /// swept; no open authorization may name the same domain and content,
+    /// whatever its authority; a continuation must continue a used parent of
+    /// the same profile, chain, consumer, policy, and authority that has no
+    /// child yet; and every other request under an approval must carry a
+    /// nonce that appears on no record within retention;
     /// at most [`MAX_OPEN_AUTHORIZATIONS`] may be open; and the holds must be
     /// admitted against the window's spend, its pending records, and every
     /// other hold.
@@ -1398,12 +1624,22 @@ impl PersistedWindowStore {
                 .all(|entry| entry.timestamp_ms() <= now.saturating_add(CLOCK_SKEW_TOLERANCE_MS)),
             P::HoldsMismatch,
         )?;
+        if let MintAuthority::Policy(binding) = &request.authority {
+            check(
+                binding.policy_sequence == request.policy_sequence,
+                P::PolicySequence,
+            )?;
+            check(
+                binding.policy_digest == request.policy_digest,
+                P::PolicyDigest,
+            )?;
+        }
         check(request.authorization_ttl_ms > 0, P::LifetimeInvalid)?;
         let ttl_end = now
             .checked_add(request.authorization_ttl_ms)
             .ok_or_else(|| refused(P::LifetimeInvalid))?;
         let expires = ttl_end
-            .min(request.approval_expires_at_ms)
+            .min(request.authority.expires_at_ms())
             .min(request.chain_deadline_ms.unwrap_or(u64::MAX));
         check(expires > now, P::LifetimeInvalid)?;
 
@@ -1447,8 +1683,9 @@ impl PersistedWindowStore {
                             && parent.consumer == request.consumer
                             && parent.policy_sequence == request.policy_sequence
                             && parent.policy_digest == request.policy_digest
-                            && parent.approval_nonce == request.approval_nonce
-                            && parent.approval_expires_ms == request.approval_expires_at_ms
+                            && parent
+                                .authority()
+                                .is_ok_and(|authority| authority == request.authority)
                     }),
                     P::IntentRecordMismatch,
                 )?;
@@ -1460,13 +1697,17 @@ impl PersistedWindowStore {
                     P::IntentRecordMismatch,
                 )?;
             }
-            None => check(
-                !wire
-                    .authorizations
-                    .iter()
-                    .any(|auth| auth.approval_nonce == request.approval_nonce),
-                P::ApprovalNonceReused,
-            )?,
+            None => {
+                if let MintAuthority::Approval { nonce, .. } = &request.authority {
+                    check(
+                        !wire
+                            .authorizations
+                            .iter()
+                            .any(|auth| auth.approval_nonce.as_ref() == Some(nonce)),
+                        P::ApprovalNonceReused,
+                    )?;
+                }
+            }
         }
         check(
             wire.authorizations
@@ -1513,6 +1754,8 @@ impl PersistedWindowStore {
             .fact_digest()
         });
         let bindings_digest = bindings_digest(&bindings);
+        let (approval_nonce, approval_expires_ms, policy_authority) =
+            wire_authority(&request.authority);
         wire.authorizations.push(WireAuthorization {
             id,
             profile: profile_name.clone(),
@@ -1528,8 +1771,9 @@ impl PersistedWindowStore {
             claimed_ms: None,
             policy_sequence: request.policy_sequence,
             policy_digest: request.policy_digest,
-            approval_nonce: request.approval_nonce.clone(),
-            approval_expires_ms: request.approval_expires_at_ms,
+            approval_nonce,
+            approval_expires_ms,
+            policy_authority,
             bindings_digest,
             entries_digest: entries_digest(&request.holds),
             reservation,
@@ -1605,10 +1849,7 @@ impl PersistedWindowStore {
             P::PolicySequence,
         )?;
         check(auth.policy_digest == expect.policy_digest, P::PolicyDigest)?;
-        check(
-            auth.approval_nonce == expect.approval_nonce,
-            P::ApprovalNonce,
-        )?;
+        compare_authority(&auth.authority()?, &expect.authority)?;
         pin::compare(
             &lock,
             &PinScope::for_profile(self.path(), profile),
@@ -1833,11 +2074,37 @@ mod tests {
 
     use super::super::store::{
         RETENTION_MS, ResetConsent, ResetError, ResetOutcome, Settlement, SubmissionHold,
-        deliver_accounting_expiries,
+        WIRE_VERSION_POLICY_AUTHORITY, deliver_accounting_expiries,
     };
     use super::*;
     use crate::mainnet::clock::{TestClockGuard, set_now_ms_for_test};
     use crate::mainnet::types::RecomputedFacts;
+
+    impl MintAuthority {
+        /// The nonce of an approval authority.
+        fn nonce(&self) -> &String {
+            match self {
+                Self::Approval { nonce, .. } => nonce,
+                Self::Policy(_) => panic!("a policy authority carries no nonce"),
+            }
+        }
+
+        /// The nonce of an approval authority, for a test to change.
+        fn nonce_mut(&mut self) -> &mut String {
+            match self {
+                Self::Approval { nonce, .. } => nonce,
+                Self::Policy(_) => panic!("a policy authority carries no nonce"),
+            }
+        }
+
+        /// The expiry of an approval authority, for a test to change.
+        fn approval_expiry_mut(&mut self) -> &mut u64 {
+            match self {
+                Self::Approval { expires_at_ms, .. } => expires_at_ms,
+                Self::Policy(_) => panic!("a policy authority carries no approval expiry"),
+            }
+        }
+    }
 
     /// A change to a mint request that breaks one continuation requirement.
     type Mutation = fn(&mut MintRequest);
@@ -1931,8 +2198,10 @@ mod tests {
                 binding,
                 policy_sequence: 7,
                 policy_digest: [7; 32],
-                approval_nonce: format!("nonce-{n}"),
-                approval_expires_at_ms: T0 + APPROVAL_MS,
+                authority: MintAuthority::Approval {
+                    nonce: format!("nonce-{n}"),
+                    expires_at_ms: T0 + APPROVAL_MS,
+                },
                 chain_deadline_ms: None,
                 authorization_ttl_ms: TTL_MS,
                 bindings: BindingFacts {
@@ -1942,7 +2211,7 @@ mod tests {
                     enablement: [4; 32],
                     witness: None,
                     reservation: None,
-                    approval: [7; 32],
+                    authority: [7; 32],
                     audit: [8; 32],
                 },
                 holds,
@@ -1961,7 +2230,7 @@ mod tests {
                 bindings_digest: minted.bindings_digest,
                 policy_sequence: request.policy_sequence,
                 policy_digest: request.policy_digest,
-                approval_nonce: request.approval_nonce.clone(),
+                authority: request.authority.clone(),
             }
         }
 
@@ -1985,8 +2254,7 @@ mod tests {
                 request.binding.clone(),
                 request.policy_sequence,
                 request.policy_digest,
-                request.approval_nonce.clone(),
-                request.approval_expires_at_ms,
+                request.authority.clone(),
                 minted.reservation.as_ref().map(WindowReservation::id),
                 minted.bindings_digest,
                 AUDIT,
@@ -2436,7 +2704,7 @@ mod tests {
                 MainnetPrecondition::PolicyDigest,
             ),
             (
-                |e| e.approval_nonce = "another".to_owned(),
+                |e| *e.authority.nonce_mut() = "another".to_owned(),
                 MainnetPrecondition::ApprovalNonce,
             ),
         ];
@@ -2666,7 +2934,7 @@ mod tests {
         assert_eq!(record.entries_digest, entries_digest(&request.holds));
         assert_eq!(record.reservation, Some(minted.id));
         assert_eq!((record.minted_ms, record.expires_ms), (T0, T0 + TTL_MS));
-        assert_eq!(record.approval_expires_ms, T0 + APPROVAL_MS);
+        assert_eq!(record.approval_expires_ms, Some(T0 + APPROVAL_MS));
         let holds: Vec<_> = wire
             .holds
             .iter()
@@ -2705,7 +2973,7 @@ mod tests {
     fn the_lifetime_is_the_earlier_of_the_ttl_and_the_approval_expiry() {
         let l = Ledger::new();
         let mut short_approval = l.request(message(1), vec![]);
-        short_approval.approval_expires_at_ms = T0 + 30_000;
+        *short_approval.authority.approval_expiry_mut() = T0 + 30_000;
         assert_eq!(l.mint(&short_approval).unwrap().expires_at_ms, T0 + 30_000);
 
         let longer = l.request(message(2), vec![]);
@@ -2723,7 +2991,7 @@ mod tests {
         );
 
         let mut elapsed = l.request(message(5), vec![]);
-        elapsed.approval_expires_at_ms = T0;
+        *elapsed.authority.approval_expiry_mut() = T0;
         assert_eq!(
             refusal(l.mint(&elapsed)),
             MainnetPrecondition::LifetimeInvalid
@@ -2824,7 +3092,7 @@ mod tests {
         let first = l.request(message(1), vec![]);
         let minted = l.mint(&first).unwrap();
         let mut reuse = l.request(message(2), vec![]);
-        reuse.approval_nonce = first.approval_nonce.clone();
+        *reuse.authority.nonce_mut() = first.authority.nonce().clone();
         assert_eq!(
             refusal(l.mint(&reuse)),
             MainnetPrecondition::ApprovalNonceReused
@@ -3136,7 +3404,10 @@ mod tests {
             (
                 "approval nonce",
                 ConsumeExpect {
-                    approval_nonce: "other".to_owned(),
+                    authority: MintAuthority::Approval {
+                        nonce: "other".to_owned(),
+                        expires_at_ms: T0 + APPROVAL_MS,
+                    },
                     ..base.clone()
                 },
                 P::ApprovalNonce,
@@ -3144,7 +3415,10 @@ mod tests {
             (
                 "approval expiry",
                 ConsumeExpect {
-                    approval_expires_ms: T0 + APPROVAL_MS + 1,
+                    authority: MintAuthority::Approval {
+                        nonce: base.authority.nonce().clone(),
+                        expires_at_ms: T0 + APPROVAL_MS + 1,
+                    },
                     ..base.clone()
                 },
                 P::ApprovalExpiry,
@@ -3416,7 +3690,7 @@ mod tests {
         l.consume(&intent, &minted, &consumption_of(&intent.binding))
             .unwrap();
         let mut child = l.request(x402(1), vec![]);
-        child.approval_nonce = intent.approval_nonce.clone();
+        *child.authority.nonce_mut() = intent.authority.nonce().clone();
         child.parent = Some(minted.id);
         (intent, minted, child)
     }
@@ -3440,7 +3714,7 @@ mod tests {
         assert_eq!(records_before, records_after, "a release adds no spend");
 
         let mut second = l.request(x402(2), vec![]);
-        second.approval_nonce = child.approval_nonce.clone();
+        *second.authority.nonce_mut() = child.authority.nonce().clone();
         second.parent = Some(parent.id);
         assert_eq!(
             refusal(l.mint(&second)),
@@ -3459,7 +3733,7 @@ mod tests {
             let intent = l.request(soroban(1), vec![]);
             let open = l.mint(&intent).unwrap();
             let mut child = l.request(x402(1), vec![]);
-            child.approval_nonce = intent.approval_nonce.clone();
+            *child.authority.nonce_mut() = intent.authority.nonce().clone();
             child.parent = Some(open.id);
             assert_eq!(refusal(l.mint(&child)), P::IntentRecordMismatch);
         }
@@ -3468,8 +3742,10 @@ mod tests {
             ("consumer", |c| {
                 c.consumer = MainnetConsumer::X402Authenticated
             }),
-            ("nonce", |c| c.approval_nonce = "other".to_owned()),
-            ("approval expiry", |c| c.approval_expires_at_ms -= 1),
+            ("nonce", |c| *c.authority.nonce_mut() = "other".to_owned()),
+            ("approval expiry", |c| {
+                *c.authority.approval_expiry_mut() -= 1
+            }),
             ("unknown parent", |c| {
                 c.parent = Some(AuthorizationId::from_bytes([0xcd; 32]));
             }),
@@ -3514,7 +3790,7 @@ mod tests {
             l.consume(&tx_request, &used, &consumption_of(&tx_request.binding))
                 .unwrap();
             let mut child = l.request(x402(1), vec![]);
-            child.approval_nonce = tx_request.approval_nonce.clone();
+            *child.authority.nonce_mut() = tx_request.authority.nonce().clone();
             child.parent = Some(used.id);
             assert_eq!(refusal(l.mint(&child)), P::IntentRecordMismatch);
         }
@@ -3808,7 +4084,7 @@ mod tests {
         l.consume(&first, &used, &binding).unwrap();
         assert!(l.store.pending_reservations(&l.profile).unwrap().is_empty());
         let mut second = l.request(tx(1), vec![]);
-        second.approval_nonce = "fresh-approval".to_owned();
+        *second.authority.nonce_mut() = "fresh-approval".to_owned();
         let open = l.mint(&second).unwrap();
         let before = l.bytes();
         let ConsumptionBinding::Transaction(mut different_tx_hash) = binding.clone() else {
@@ -3978,9 +4254,9 @@ mod tests {
         // An old settlement stays while its approval can still be presented,
         // and goes once the approval ends at the pruning time.
         let mut presentable = sample(AuthorizationState::Expired, 3, Some(5));
-        presentable.approval_expires_ms = 1_001;
+        presentable.approval_expires_ms = Some(1_001);
         let mut ended = presentable.clone();
-        ended.approval_expires_ms = 1_000;
+        ended.approval_expires_ms = Some(1_000);
         for (old, kept) in [(presentable.clone(), true), (ended, false)] {
             wire.authorizations = vec![open.clone(), old.clone(), recent_settled.clone()];
             prune_history(&mut wire, 100, 1_000);
@@ -4007,7 +4283,7 @@ mod tests {
     /// A mint of another binding that copies `request`'s approval nonce.
     fn nonce_copy(l: &Ledger, request: &MintRequest) -> MintRequest {
         let mut reuse = l.request(tx(2), vec![hold(1)]);
-        reuse.approval_nonce = request.approval_nonce.clone();
+        *reuse.authority.nonce_mut() = request.authority.nonce().clone();
         reuse
     }
 
@@ -4124,7 +4400,7 @@ mod tests {
             assert_eq!(wire.authorizations.len(), kept as usize, "{clock}");
             if kept == 0 {
                 let mut again = l.request(soroban(2), vec![]);
-                again.approval_nonce = request.approval_nonce.clone();
+                *again.authority.nonce_mut() = request.authority.nonce().clone();
                 assert_eq!(
                     refusal(l.mint(&again)),
                     MainnetPrecondition::LifetimeInvalid
@@ -4143,7 +4419,7 @@ mod tests {
     fn a_reset_settles_a_record_minted_ahead_of_the_store_clock() {
         let l = Ledger::new();
         let mut request = l.request(tx(1), vec![hold(70)]);
-        request.approval_expires_at_ms = T0 + RETENTION_MS;
+        *request.authority.approval_expiry_mut() = T0 + RETENTION_MS;
         let minted = l.mint(&request).unwrap();
         l.clock.set(T0 - 1_000);
         let outcome = l.reset(T0 - 1_000).unwrap();
@@ -4172,7 +4448,7 @@ mod tests {
             "pruning keeps a record whose approval can still be presented"
         );
         let mut reuse = nonce_copy(&l, &request);
-        reuse.approval_expires_at_ms = request.approval_expires_at_ms;
+        *reuse.authority.approval_expiry_mut() = request.authority.expires_at_ms();
         assert_eq!(
             refusal(l.mint(&reuse)),
             MainnetPrecondition::ApprovalNonceReused
@@ -4205,7 +4481,7 @@ mod tests {
         };
         assert_eq!(find(parent.id), Some(parent_before));
         let mut second = l.request(x402(2), vec![]);
-        second.approval_nonce = child.approval_nonce.clone();
+        *second.authority.nonce_mut() = child.authority.nonce().clone();
         second.parent = Some(parent.id);
         assert_eq!(
             refusal(l.mint(&second)),
@@ -4366,8 +4642,9 @@ mod tests {
             claimed_ms: None,
             policy_sequence: 7,
             policy_digest: [7; 32],
-            approval_nonce: format!("n{n}"),
-            approval_expires_ms: 1_000,
+            approval_nonce: Some(format!("n{n}")),
+            approval_expires_ms: Some(1_000),
+            policy_authority: None,
             bindings_digest: [9; 32],
             entries_digest: entries_digest(&[]),
             reservation: None,
@@ -4650,7 +4927,7 @@ mod tests {
                     MainnetPrecondition::IntentRecordMismatch
                 );
                 let (message_request, parent) = used_message(&l);
-                request.approval_nonce = message_request.approval_nonce;
+                *request.authority.nonce_mut() = message_request.authority.nonce().clone();
                 request.parent = Some(parent.id);
             }
             l.mint(&request).unwrap();
@@ -4676,7 +4953,7 @@ mod tests {
     ) -> MintRequest {
         let mut child = l.request(soroban(n), vec![hold(40)]);
         child.consumer = MainnetConsumer::X402Authenticated;
-        child.approval_nonce = message_request.approval_nonce.clone();
+        *child.authority.nonce_mut() = message_request.authority.nonce().clone();
         child.parent = Some(parent.id);
         child
     }
@@ -4765,8 +5042,10 @@ mod tests {
         }
         // The fields are equal.
         let mutations: [(&str, Mutation); 2] = [
-            ("nonce", |c| c.approval_nonce = "other".to_owned()),
-            ("approval expiry", |c| c.approval_expires_at_ms -= 1),
+            ("nonce", |c| *c.authority.nonce_mut() = "other".to_owned()),
+            ("approval expiry", |c| {
+                *c.authority.approval_expiry_mut() -= 1
+            }),
         ];
         for (name, mutate) in mutations {
             let l = Ledger::new();
@@ -4825,7 +5104,7 @@ mod tests {
                 .unwrap();
             let mut child = l.request(soroban(2), vec![hold(40)]);
             child.consumer = MainnetConsumer::X402Authenticated;
-            child.approval_nonce = message_request.approval_nonce.clone();
+            *child.authority.nonce_mut() = message_request.authority.nonce().clone();
             child.parent = Some(used.id);
             assert_unchanged_refusal(&l, &child, "intent parent of an intent");
         }
@@ -4835,7 +5114,7 @@ mod tests {
             let (message_request, parent) = used_message(&l);
             let mut child = l.request(x402(1), vec![]);
             child.consumer = MainnetConsumer::X402Authenticated;
-            child.approval_nonce = message_request.approval_nonce.clone();
+            *child.authority.nonce_mut() = message_request.authority.nonce().clone();
             child.parent = Some(parent.id);
             assert_unchanged_refusal(&l, &child, "message parent of a submission");
         }
@@ -4844,7 +5123,7 @@ mod tests {
             let l = Ledger::new();
             let (message_request, parent) = used_message(&l);
             let mut child = l.request(binding, vec![]);
-            child.approval_nonce = message_request.approval_nonce.clone();
+            *child.authority.nonce_mut() = message_request.authority.nonce().clone();
             child.parent = Some(parent.id);
             assert_unchanged_refusal(&l, &child, "parent of a parentless record");
         }
@@ -4865,8 +5144,7 @@ mod tests {
             request.binding.clone(),
             request.policy_sequence,
             request.policy_digest,
-            request.approval_nonce.clone(),
-            request.approval_expires_at_ms,
+            request.authority.clone(),
             None,
             minted.bindings_digest,
             AUDIT,
@@ -5281,7 +5559,10 @@ mod tests {
         let second = second_path(&l);
         let request = l.request(tx(2), vec![hold(1)]);
         let mut rival = l.request(tx(3), vec![hold(1)]);
-        rival.approval_nonce.clone_from(&request.approval_nonce);
+        rival
+            .authority
+            .nonce_mut()
+            .clone_from(request.authority.nonce());
 
         let outcome = std::rc::Rc::new(std::cell::RefCell::new(None));
         let observed = outcome.clone();
@@ -5304,7 +5585,7 @@ mod tests {
         assert_eq!(
             wire.authorizations
                 .iter()
-                .filter(|auth| auth.approval_nonce == request.approval_nonce)
+                .filter(|auth| auth.approval_nonce.as_ref() == Some(request.authority.nonce()))
                 .count(),
             1
         );
@@ -5721,5 +6002,516 @@ mod tests {
             Some(ConsumptionBinding::Transaction(binding)),
             "the stored form restores the anchor"
         );
+    }
+
+    /// A version 9 snapshot of approval authorizations, as this build's
+    /// writer serialized it: a used transaction record with its claim and
+    /// consumption, a used message record, and an open transaction record
+    /// with its hold.
+    const VERSION_NINE_BODY: &str = concat!(
+        r#"{"chain_scope":{"chain":"stellar:mainnet","network_passphrase_sha256":[122,195,57,151,84,"#,
+        r#"78,49,117,210,102,189,2,36,57,178,44,219,22,80,140,1,22,63,38,229,203,42,62,16,69,169,"#,
+        r#"121]},"version":9,"generation":6,"entries":[{"scope_specificity":1,"bucket":"native","#,
+        r#""window_secs":86400,"records":[{"chain_scope":{"chain":"stellar:mainnet","#,
+        r#""network_passphrase_sha256":[122,195,57,151,84,78,49,117,210,102,189,2,36,57,178,44,219,"#,
+        r#"22,80,140,1,22,63,38,229,203,42,62,16,69,169,121]},"execution_bound":1800000300000,"#,
+        r#""accounting_until_ms":1800086700000,"admitted_window_ms":86400000,"ts_ms":1800000000000,"#,
+        r#""amount":"70","id":"dbdbdbdbdbdbdbdbdbdbdbdbdbdbdbdbdbdbdbdbdbdbdbdbdbdbdbdbdbdbdbdb","#,
+        r#""status":"pending","#,
+        r#""tx_hash":"8181818181818181818181818181818181818181818181818181818181818181","#,
+        r#""source":"GAAQEAYEAUDAOCAJBIFQYDIOB4IBCEQTCQKRMFYYDENBWHA5DYPSABGM","sequence":101,"#,
+        r#""max_time":1800000300,"pending_since_ms":1800000000005,"submission_ledger":512,"#,
+        r#""operator_required":false}]}],"#,
+        r#""authorizations":[{"id":"af8a9f4c233fab4521e9592e640c6eb66c17ef8ee54e9372bbce098e99bd878f","#,
+        r#""profile":"ledger","chain":"stellar:mainnet","domain":"transaction","consumer":"cli_pay","#,
+        r#""content_digest":"9e27c27f47fdf65289eef198a7d4c281ee1d6a4edb829573008964de73313ae5","#,
+        r#""binding":{"transaction":{"unsigned_envelope_sha256":"0101010101010101010101010101010101010101010101010101010101010101","#,
+        r#""tx_hash":"8181818181818181818181818181818181818181818181818181818181818181","#,
+        r#""source":"GAAQEAYEAUDAOCAJBIFQYDIOB4IBCEQTCQKRMFYYDENBWHA5DYPSABGM","sequence":101}},"#,
+        r#""state":"used","minted_ms":1800000000000,"expires_ms":1800000120000,"#,
+        r#""settled_ms":1800000000000,"claimed_ms":1800000000000,"policy_sequence":7,"#,
+        r#""policy_digest":"0707070707070707070707070707070707070707070707070707070707070707","#,
+        r#""approval_nonce":"nonce-1","approval_expires_ms":1800000600000,"#,
+        r#""bindings_digest":"c1d6092063cba806b8ced30b9e9d821f64f16141dd4a46c55fcebb363a283a7f","#,
+        r#""entries_digest":"72f52439d5854828c8c2365172dedcd280588791f347495f7c87af3cdde4fbfb","#,
+        r#""reservation":"af8a9f4c233fab4521e9592e640c6eb66c17ef8ee54e9372bbce098e99bd878f","#,
+        r#""consumption":{"transaction":{"chain_scope":{"chain":"stellar:mainnet","#,
+        r#""network_passphrase_sha256":[122,195,57,151,84,78,49,117,210,102,189,2,36,57,178,44,219,"#,
+        r#"22,80,140,1,22,63,38,229,203,42,62,16,69,169,121]},"#,
+        r#""envelope_hash":"dbdbdbdbdbdbdbdbdbdbdbdbdbdbdbdbdbdbdbdbdbdbdbdbdbdbdbdbdbdbdbdb","#,
+        r#""tx_hash":"8181818181818181818181818181818181818181818181818181818181818181","#,
+        r#""source":"GAAQEAYEAUDAOCAJBIFQYDIOB4IBCEQTCQKRMFYYDENBWHA5DYPSABGM","sequence":101,"#,
+        r#""max_time":1800000300,"pending_since_ms":1800000000005,"submission_ledger":512}}},"#,
+        r#"{"id":"15c01edd3ec574572628f3c991668dd82de560427bfd2119405121710964bbe2","#,
+        r#""profile":"ledger","chain":"stellar:mainnet","domain":"message","#,
+        r#""consumer":"x402_authenticated","#,
+        r#""content_digest":"31bbb00ecdf7732570a9dc038a99ef499265b080e7b11a408dfcf50a699cea0e","#,
+        r#""binding":{"message":{"domain":{"home_domain":"example.com","#,
+        r#""web_auth_domain":"auth.example.com","#,
+        r#""server_key":"0303030303030303030303030303030303030303030303030303030303030303"},"#,
+        r#""content_digest":"0202020202020202020202020202020202020202020202020202020202020202","#,
+        r#""ephemeral_public_key":"0404040404040404040404040404040404040404040404040404040404040404"}},"#,
+        r#""state":"used","minted_ms":1800000000000,"expires_ms":1800000120000,"#,
+        r#""settled_ms":1800000000000,"policy_sequence":7,"#,
+        r#""policy_digest":"0707070707070707070707070707070707070707070707070707070707070707","#,
+        r#""approval_nonce":"nonce-2","approval_expires_ms":1800000600000,"#,
+        r#""bindings_digest":"3e7ec0e8166269e268cb355e89f608a878ff317dee2a7a5d35168ab6f4abd475","#,
+        r#""entries_digest":"7f5c3895b5a03f8439bd58a8878102768b3fc053bb9b0c9aa110c84e1b1823e2","#,
+        r#""consumption":{"message":{"domain":{"home_domain":"example.com","#,
+        r#""web_auth_domain":"auth.example.com","#,
+        r#""server_key":"0303030303030303030303030303030303030303030303030303030303030303"},"#,
+        r#""content_digest":"0202020202020202020202020202020202020202020202020202020202020202","#,
+        r#""ephemeral_public_key":"0404040404040404040404040404040404040404040404040404040404040404"}}},"#,
+        r#"{"id":"88191b1272cc480aca17360b43b1605934dc9da050437963efcd9cb3d05cc8d7","#,
+        r#""profile":"ledger","chain":"stellar:mainnet","domain":"transaction","consumer":"cli_pay","#,
+        r#""content_digest":"a3d3fdb483cee56fce1758da1714b2cc680d470a550f39a5a38a4c34f07f115e","#,
+        r#""binding":{"transaction":{"unsigned_envelope_sha256":"0303030303030303030303030303030303030303030303030303030303030303","#,
+        r#""tx_hash":"8383838383838383838383838383838383838383838383838383838383838383","#,
+        r#""source":"GAAQEAYEAUDAOCAJBIFQYDIOB4IBCEQTCQKRMFYYDENBWHA5DYPSABGM","sequence":103}},"#,
+        r#""state":"open","minted_ms":1800000000000,"expires_ms":1800000120000,"policy_sequence":7,"#,
+        r#""policy_digest":"0707070707070707070707070707070707070707070707070707070707070707","#,
+        r#""approval_nonce":"nonce-3","approval_expires_ms":1800000600000,"#,
+        r#""bindings_digest":"eb2b57ce5a080a8aedae04e674e9fd9c077e31d5b9905127cc8e59a5fccafe99","#,
+        r#""entries_digest":"6fadf72103004d189a93177f819b04c78ec215cbfa0309b60067922a36ca682a","#,
+        r#""reservation":"88191b1272cc480aca17360b43b1605934dc9da050437963efcd9cb3d05cc8d7"}],"#,
+        r#""holds":[{"kind":"value","#,
+        r#""authorization_id":"88191b1272cc480aca17360b43b1605934dc9da050437963efcd9cb3d05cc8d7","#,
+        r#""ordinal":0,"scope_specificity":1,"bucket":"native","window_secs":86400,"#,
+        r#""ts_ms":1800000000000,"amount":"5"}]}"#,
+    );
+
+    /// A version 9 snapshot whose authorizations carry approval authority
+    /// loads, validates, and serializes back to the same bytes, so its HMAC
+    /// tag and generation commitment still verify.
+    #[test]
+    fn version_nine_authorizations_reserialize_byte_identically() {
+        let wire: WireFile = serde_json::from_str(VERSION_NINE_BODY).unwrap();
+        assert_eq!(wire.version, 9);
+        assert_eq!(wire.authorizations.len(), 3);
+        validate(&wire).unwrap();
+        assert_eq!(serde_json::to_string(&wire).unwrap(), VERSION_NINE_BODY);
+    }
+
+    // ── Policy authority ────────────────────────────────────────────────
+
+    /// A classic policy authority over the fixture's pinned policy,
+    /// governing until `governing_until_ms`.
+    fn policy_binding(governing_until_ms: u64) -> PolicyAuthorityBinding {
+        PolicyAuthorityBinding {
+            policy_digest: [7; 32],
+            policy_sequence: 7,
+            rule_index: 0,
+            evaluated_at_ms: T0,
+            governing_until_ms,
+            scope: AuthorityScope::Classic,
+        }
+    }
+
+    /// `request` under the policy authority of [`policy_binding`].
+    fn under_policy(mut request: MintRequest, governing_until_ms: u64) -> MintRequest {
+        request.authority = MintAuthority::Policy(policy_binding(governing_until_ms));
+        request
+    }
+
+    /// An open record blocks the same domain and content under either
+    /// authority until it settles.
+    #[test]
+    #[serial]
+    fn a_duplicate_open_policy_content_refuses_until_the_record_settles() {
+        let l = Ledger::new();
+        let first = under_policy(l.request(tx(1), vec![]), T0 + APPROVAL_MS);
+        let minted = l.mint(&first).unwrap();
+        let again = under_policy(l.request(tx(1), vec![]), T0 + APPROVAL_MS);
+        assert_eq!(refusal(l.mint(&again)), MainnetPrecondition::DuplicateOpen);
+        assert_eq!(
+            refusal(l.mint(&l.request(tx(1), vec![]))),
+            MainnetPrecondition::DuplicateOpen,
+            "an approval does not bypass an open policy record"
+        );
+        l.consume(&first, &minted, &consumption_of(&first.binding))
+            .unwrap();
+        let reminted = l.mint(&again).unwrap();
+        assert_eq!(
+            refusal(l.mint(&under_policy(l.request(tx(1), vec![]), T0 + APPROVAL_MS))),
+            MainnetPrecondition::DuplicateOpen
+        );
+        l.clock.set(reminted.expires_at_ms);
+        l.mint(&under_policy(
+            l.request(tx(1), vec![]),
+            T0 + 2 * APPROVAL_MS,
+        ))
+        .unwrap();
+        assert_eq!(l.record(reminted.id).state, AuthorizationState::Expired);
+    }
+
+    /// A continuation keeps its parent's authority: a policy child of an
+    /// approval parent refuses, and so does an approval child of a policy
+    /// parent. A policy child of a policy parent under the same authority
+    /// continues it.
+    #[test]
+    #[serial]
+    fn policy_child_under_approval_parent_refuses() {
+        {
+            let l = Ledger::new();
+            let (_intent, _parent, child) = used_intent(&l);
+            let child = under_policy(child, T0 + APPROVAL_MS);
+            assert_eq!(
+                refusal(l.mint(&child)),
+                MainnetPrecondition::IntentRecordMismatch
+            );
+        }
+        let l = Ledger::new();
+        let intent = under_policy(l.request(soroban(1), vec![hold(40)]), T0 + APPROVAL_MS);
+        let parent = l.mint(&intent).unwrap();
+        l.consume(&intent, &parent, &consumption_of(&intent.binding))
+            .unwrap();
+        let mut approval_child = l.request(x402(1), vec![]);
+        approval_child.parent = Some(parent.id);
+        assert_eq!(
+            refusal(l.mint(&approval_child)),
+            MainnetPrecondition::IntentRecordMismatch
+        );
+        let mut other_policy = under_policy(l.request(x402(1), vec![]), T0 + APPROVAL_MS - 1);
+        other_policy.parent = Some(parent.id);
+        assert_eq!(
+            refusal(l.mint(&other_policy)),
+            MainnetPrecondition::IntentRecordMismatch,
+            "another policy authority is another authority"
+        );
+        let mut child = under_policy(l.request(x402(1), vec![]), T0 + APPROVAL_MS);
+        child.parent = Some(parent.id);
+        let minted = l.mint(&child).unwrap();
+        assert_eq!(l.record(minted.id).parent, Some(parent.id));
+        assert_eq!(l.record(minted.id).authority().unwrap(), intent.authority);
+    }
+
+    /// A record carries exactly one authority: an approval nonce with its
+    /// expiry, or a policy authority. Every other shape refuses the read, and
+    /// a mainnet load reports the state unverifiable.
+    #[test]
+    #[serial]
+    fn wire_authorization_refuses_both_projections() {
+        let approval = sample(AuthorizationState::Expired, 2, Some(9));
+        let mut policy = approval.clone();
+        policy.approval_nonce = None;
+        policy.approval_expires_ms = None;
+        policy.policy_authority = Some(policy_binding(1_000).into());
+        let wire = |record: &WireAuthorization| WireFile {
+            version: WIRE_VERSION_POLICY_AUTHORITY,
+            authorizations: vec![record.clone()],
+            ..WireFile::default()
+        };
+        validate(&wire(&approval)).unwrap();
+        validate(&wire(&policy)).unwrap();
+
+        let shape = WireAuthorizationShape.to_string();
+        let mut both = approval.clone();
+        both.policy_authority = policy.policy_authority.clone();
+        let mut neither = approval.clone();
+        neither.approval_nonce = None;
+        neither.approval_expires_ms = None;
+        let mut nonce_only = approval.clone();
+        nonce_only.approval_expires_ms = None;
+        let mut expiry_only = approval.clone();
+        expiry_only.approval_nonce = None;
+        let mut nonce_and_policy = policy.clone();
+        nonce_and_policy.approval_nonce = approval.approval_nonce.clone();
+        let mut expiry_and_policy = policy.clone();
+        expiry_and_policy.approval_expires_ms = approval.approval_expires_ms;
+        for (name, record) in [
+            ("both", both.clone()),
+            ("neither", neither),
+            ("nonce only", nonce_only),
+            ("expiry only", expiry_only),
+            ("nonce and policy", nonce_and_policy),
+            ("expiry and policy", expiry_and_policy),
+        ] {
+            assert!(
+                matches!(validate(&wire(&record)), Err(WindowStoreError::Invalid { detail }) if detail == shape),
+                "{name}"
+            );
+        }
+        let mut other_policy = policy.clone();
+        other_policy.policy_digest = [8; 32];
+        assert!(matches!(
+            validate(&wire(&other_policy)),
+            Err(WindowStoreError::Invalid { .. })
+        ));
+
+        #[cfg(feature = "mainnet-write")]
+        {
+            let l = Ledger::new();
+            let request = l.request(tx(1), vec![]);
+            let minted = l.mint(&request).unwrap();
+            let mut sealed = l.wire();
+            let record = sealed
+                .authorizations
+                .iter_mut()
+                .find(|auth| auth.id == minted.id)
+                .unwrap();
+            record.policy_authority = Some(policy_binding(T0 + APPROVAL_MS).into());
+            sealed.version = WIRE_VERSION_POLICY_AUTHORITY;
+            l.store.seal_unchecked_for_test(&l.profile, &sealed);
+            let error = l
+                .store
+                .load_into("ledger", &l.profile, &PolicyStateStore::new())
+                .unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    WindowStoreError::MainnetStateUnverifiable {
+                        defect: super::super::StateDefect::Malformed
+                    }
+                ),
+                "{error:?}"
+            );
+            assert!(
+                error
+                    .to_string()
+                    .starts_with("policy.window_state_unverifiable"),
+                "{error}"
+            );
+        }
+    }
+
+    /// The file is written as version 10 exactly when a record carries a
+    /// policy authority, and a lower version carrying one refuses the read.
+    #[test]
+    #[serial]
+    fn version_ten_only_with_policy_authority() {
+        let l = Ledger::new();
+        let approval = l.request(tx(1), vec![hold(5)]);
+        l.mint(&approval).unwrap();
+        let version = l.wire().version;
+        assert!(version < WIRE_VERSION_POLICY_AUTHORITY, "{version}");
+        let policy = under_policy(l.request(tx(2), vec![hold(5)]), T0 + APPROVAL_MS);
+        let minted = l.mint(&policy).unwrap();
+        let wire = l.wire();
+        assert_eq!(wire.version, WIRE_VERSION_POLICY_AUTHORITY);
+        let record = l.record(minted.id);
+        assert_eq!(record.approval_nonce, None);
+        assert_eq!(record.approval_expires_ms, None);
+        assert_eq!(
+            record.authority().unwrap(),
+            MintAuthority::Policy(policy_binding(T0 + APPROVAL_MS))
+        );
+        let body = serde_json::to_value(&record).unwrap();
+        assert!(body.get("approval_nonce").is_none());
+        assert!(body.get("approval_expires_ms").is_none());
+        assert_eq!(
+            body["policy_authority"],
+            serde_json::json!({
+                "policy_digest": "07".repeat(32),
+                "policy_sequence": 7,
+                "rule_index": 0,
+                "evaluated_at_ms": T0,
+                "governing_until_ms": T0 + APPROVAL_MS,
+                "scope": {"kind": "classic"},
+            })
+        );
+
+        let mut lowered = wire;
+        lowered.version = WIRE_VERSION_POLICY_AUTHORITY - 1;
+        l.store.seal_unchecked_for_test(&l.profile, &lowered);
+        let result = l.store.read_for_inspection(&l.profile);
+        #[cfg(feature = "mainnet-write")]
+        assert!(
+            matches!(
+                &result,
+                Err(WindowStoreError::MainnetStateUnverifiable {
+                    defect: super::super::StateDefect::Malformed
+                })
+            ),
+            "{result:?}"
+        );
+        #[cfg(not(feature = "mainnet-write"))]
+        assert!(
+            matches!(
+                &result,
+                Err(WindowStoreError::Invalid { detail })
+                    if detail == "a policy authority requires wire version 10"
+            ),
+            "{result:?}"
+        );
+    }
+
+    /// The persisted policy authority denies unknown fields and requires
+    /// every field; its scopes have the documented shapes.
+    #[test]
+    fn the_wire_policy_authority_is_closed() {
+        let scoped = PolicyAuthorityBinding {
+            scope: AuthorityScope::X402Authenticated {
+                home_domain: "pay.example.org".to_owned(),
+                tool: "stellar_x402_authenticated_payment".to_owned(),
+            },
+            ..policy_binding(1_000)
+        };
+        let wire = WirePolicyAuthorityBinding::from(scoped.clone());
+        let body = serde_json::to_value(&wire).unwrap();
+        assert_eq!(
+            body["scope"],
+            serde_json::json!({
+                "kind": "x402_authenticated",
+                "home_domain": "pay.example.org",
+                "tool": "stellar_x402_authenticated_payment",
+            })
+        );
+        let back: WirePolicyAuthorityBinding = serde_json::from_value(body.clone()).unwrap();
+        assert_eq!(PolicyAuthorityBinding::from(back), scoped);
+        for field in [
+            "policy_digest",
+            "policy_sequence",
+            "rule_index",
+            "evaluated_at_ms",
+            "governing_until_ms",
+            "scope",
+        ] {
+            let mut missing = body.clone();
+            missing.as_object_mut().unwrap().remove(field);
+            assert!(
+                serde_json::from_value::<WirePolicyAuthorityBinding>(missing).is_err(),
+                "{field}"
+            );
+        }
+        let mut unknown = body.clone();
+        unknown["extra"] = serde_json::json!(1);
+        assert!(serde_json::from_value::<WirePolicyAuthorityBinding>(unknown).is_err());
+        let mut unknown_scope = body.clone();
+        unknown_scope["scope"]["extra"] = serde_json::json!(1);
+        assert!(serde_json::from_value::<WirePolicyAuthorityBinding>(unknown_scope).is_err());
+        let mut upper = body;
+        upper["policy_digest"] = serde_json::json!("AB".repeat(32));
+        assert!(serde_json::from_value::<WirePolicyAuthorityBinding>(upper).is_err());
+        assert!(
+            serde_json::from_value::<WireAuthorityScope>(
+                serde_json::json!({"kind": "classic", "extra": 1})
+            )
+            .is_err()
+        );
+    }
+
+    /// A claim and a consumption compare the record's authority: another
+    /// variant or another policy authority refuses, the record's own
+    /// proceeds.
+    #[test]
+    #[serial]
+    fn a_policy_record_compares_its_authority() {
+        let l = Ledger::new();
+        let request = under_policy(l.request(tx(1), vec![]), T0 + APPROVAL_MS);
+        let minted = l.mint(&request).unwrap();
+        let before = l.bytes();
+        let approval = MintAuthority::Approval {
+            nonce: "nonce".to_owned(),
+            expires_at_ms: T0 + APPROVAL_MS,
+        };
+        let other = MintAuthority::Policy(policy_binding(T0 + APPROVAL_MS - 1));
+        for authority in [approval.clone(), other.clone()] {
+            let mut claim = l.claim_expect(&request, &minted);
+            claim.authority = authority.clone();
+            assert_eq!(
+                refusal(l.store.claim_authorization(&l.profile, minted.id, &claim)),
+                MainnetPrecondition::AuthorityMismatch
+            );
+            let mut consume = l.expect(&request, &minted);
+            consume.authority = authority;
+            assert_eq!(
+                refusal(l.store.consume_authorization(
+                    &l.profile,
+                    minted.id,
+                    &consume,
+                    &consumption_of(&request.binding)
+                )),
+                MainnetPrecondition::AuthorityMismatch
+            );
+        }
+        assert_eq!(l.bytes(), before);
+        l.claim(&request, &minted).unwrap();
+        l.consume(&request, &minted, &consumption_of(&request.binding))
+            .unwrap();
+
+        let approved = l.request(tx(2), vec![]);
+        let minted = l.mint(&approved).unwrap();
+        let mut consume = l.expect(&approved, &minted);
+        consume.authority = MintAuthority::Policy(policy_binding(T0 + APPROVAL_MS));
+        assert_eq!(
+            refusal(l.store.consume_authorization(
+                &l.profile,
+                minted.id,
+                &consume,
+                &consumption_of(&approved.binding)
+            )),
+            MainnetPrecondition::AuthorityMismatch
+        );
+    }
+
+    /// A policy authority bounds the record: the mint expires no later than
+    /// its governing end, a mint whose policy authority names another policy
+    /// refuses, and a consumption refuses a record that outlives its
+    /// authority.
+    #[test]
+    #[serial]
+    fn a_policy_record_lives_within_its_governing_end() {
+        let l = Ledger::new();
+        let request = under_policy(l.request(tx(1), vec![]), T0 + 30_000);
+        let minted = l.mint(&request).unwrap();
+        assert_eq!(minted.expires_at_ms, T0 + 30_000);
+
+        let mut foreign = under_policy(l.request(tx(2), vec![]), T0 + APPROVAL_MS);
+        if let MintAuthority::Policy(binding) = &mut foreign.authority {
+            binding.policy_digest = [8; 32];
+        }
+        assert_eq!(refusal(l.mint(&foreign)), MainnetPrecondition::PolicyDigest);
+        let mut foreign = under_policy(l.request(tx(2), vec![]), T0 + APPROVAL_MS);
+        if let MintAuthority::Policy(binding) = &mut foreign.authority {
+            binding.policy_sequence = 8;
+        }
+        assert_eq!(
+            refusal(l.mint(&foreign)),
+            MainnetPrecondition::PolicySequence
+        );
+
+        let mut sealed = l.wire();
+        sealed
+            .authorizations
+            .iter_mut()
+            .find(|auth| auth.id == minted.id)
+            .unwrap()
+            .expires_ms = T0 + 30_001;
+        l.store.seal_unchecked_for_test(&l.profile, &sealed);
+        assert_eq!(
+            refusal(l.consume(&request, &minted, &consumption_of(&request.binding))),
+            MainnetPrecondition::LifetimeInvalid
+        );
+    }
+
+    /// Settled history and a reset keep a policy record while its governing
+    /// end lies after the time, and drop it once the end is reached.
+    #[test]
+    fn policy_records_survive_by_their_governing_end() {
+        let open = sample(AuthorizationState::Open, 0, None);
+        let recent_settled = sample(AuthorizationState::Expired, 0, Some(100));
+        let mut presentable = sample(AuthorizationState::Expired, 3, Some(5));
+        presentable.approval_nonce = None;
+        presentable.approval_expires_ms = None;
+        presentable.policy_authority = Some(policy_binding(1_001).into());
+        let mut ended = presentable.clone();
+        ended.policy_authority = Some(policy_binding(1_000).into());
+        for (old, kept) in [(presentable, true), (ended, false)] {
+            let mut wire = WireFile {
+                version: WIRE_VERSION_POLICY_AUTHORITY,
+                authorizations: vec![open.clone(), old.clone(), recent_settled.clone()],
+                ..WireFile::default()
+            };
+            prune_history(&mut wire, 100, 1_000);
+            assert_eq!(wire.authorizations.contains(&old), kept);
+            let survivors = reset_survivors(
+                &WireFile {
+                    authorizations: vec![old.clone()],
+                    ..WireFile::default()
+                },
+                1_000,
+            );
+            assert_eq!(survivors.len(), usize::from(kept));
+        }
     }
 }

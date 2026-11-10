@@ -729,6 +729,7 @@ mod tests {
             _counterparty_cache: Option<&dyn CounterpartyCacheView>,
             _sep10_sessions: Option<&dyn Sep10SessionView>,
             _sep45_sessions: Option<&dyn Sep45SessionView>,
+            _now_ms: u64,
         ) -> Result<Decision, PolicyError> {
             Ok(Decision::Deny(DenyReason::NoMatchingRule))
         }
@@ -869,6 +870,7 @@ mod tests {
             _counterparty_cache: Option<&dyn CounterpartyCacheView>,
             _sep10_sessions: Option<&dyn Sep10SessionView>,
             _sep45_sessions: Option<&dyn Sep45SessionView>,
+            _now_ms: u64,
         ) -> Result<Decision, PolicyError> {
             Ok(Decision::Allow)
         }

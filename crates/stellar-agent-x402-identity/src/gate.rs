@@ -75,8 +75,6 @@
 use tracing::{debug, warn};
 use url::Url;
 
-#[cfg(feature = "mainnet-write")]
-use stellar_agent_core::approval::witness::ApprovalWitness;
 use stellar_agent_core::error::MAINNET_SIGNING_REFUSAL_DETAIL;
 #[cfg(feature = "mainnet-write")]
 use stellar_agent_core::mainnet::enablement::EnablementRecord;
@@ -93,6 +91,8 @@ use stellar_agent_network::counterparty::{
 };
 #[cfg(feature = "mainnet-write")]
 use stellar_agent_network::mainnet::audit_readiness::AuditReadiness;
+#[cfg(feature = "mainnet-write")]
+use stellar_agent_network::mainnet::authority::MainnetAuthority;
 #[cfg(feature = "mainnet-write")]
 use stellar_agent_network::mainnet::message::MessageUseReceipt;
 #[cfg(feature = "mainnet-write")]
@@ -664,21 +664,20 @@ fn sep10_client(
 /// The mainnet proofs the authorized gate spends on the message
 /// authorization of its SEP-10 challenge.
 ///
-/// The approval is the operator's approval of the authenticated payment
-/// `intent` for the gate's home domain; one approval covers the message and
-/// the payment.
+/// The authority covers the authenticated payment `intent` for the gate's
+/// home domain; one authority covers the message and the payment.
 #[cfg(feature = "mainnet-write")]
 pub struct MainnetIdentityInputs<'a> {
     /// The mainnet write context; its passphrase is the SEP-10 network.
     pub context: &'a MainnetWriteContext,
-    /// The authenticated payment intent the approval names.
+    /// The authenticated payment intent the authority covers.
     pub intent: &'a SorobanIntent<'a>,
     /// The verified mainnet policy.
     pub policy: &'a VerifiedPolicy,
     /// The verified enablement.
     pub enablement: &'a EnablementRecord,
-    /// The verified approval of the authenticated payment.
-    pub approval: &'a ApprovalWitness,
+    /// The authority of the authenticated payment.
+    pub authority: &'a MainnetAuthority<'a>,
     /// The audit readiness, consumed by the message resolution.
     pub audit: AuditReadiness,
     /// The window store holding the authorization ledger.
@@ -863,7 +862,7 @@ async fn run_authorized_gate(
         message: &message,
         policy: inputs.policy,
         enablement: inputs.enablement,
-        approval: inputs.approval,
+        authority: inputs.authority,
         audit: inputs.audit,
         store: inputs.store,
     })

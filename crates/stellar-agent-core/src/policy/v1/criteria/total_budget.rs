@@ -22,7 +22,6 @@ use crate::policy::v1::EvalContext;
 use crate::policy::v1::asset_equivalence::assets_equivalent;
 use crate::policy::v1::bundle::{BundleStateOverlay, InnerOpDescriptor};
 use crate::policy::v1::criteria::Criterion;
-use crate::policy::v1::criteria::per_period_cap::system_time_to_ms;
 use crate::policy::v1::criteria::per_tx_cap::{AssetDebitSum, asset_debit_sum};
 use crate::policy::v1::criteria::state_store::{StateKey, WindowEntry, WindowLimit};
 use crate::policy::v1::value::{ValueClass, asset_normalise};
@@ -172,10 +171,11 @@ impl Criterion for TotalBudgetCriterion {
     /// # Errors
     ///
     /// Returns [`PolicyError::CriterionEvaluationFailed`] under an all-zero
-    /// policy digest, whatever the call, or on a clock or state-store failure.
+    /// policy digest, whatever the call, or on a state-store failure. The
+    /// debit is dated at the evaluation instant `ctx.now_ms`.
     fn record_confirmed(&self, ctx: &EvalContext<'_>) -> Result<Vec<WindowEntry>, PolicyError> {
         let epoch = epoch(ctx)?;
-        let now_ms = system_time_to_ms()?;
+        let now_ms = ctx.now_ms;
         let entry = self.size(ctx, now_ms)?;
         if let Some(entry) = &entry {
             ctx.state_store

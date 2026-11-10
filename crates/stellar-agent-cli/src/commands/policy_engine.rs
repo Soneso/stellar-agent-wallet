@@ -45,15 +45,20 @@
 
 use std::sync::Arc;
 use stellar_agent_core::envelope::Envelope;
+use stellar_agent_core::error::{WalletError, WalletStateError};
+use stellar_agent_core::mainnet::decision::{
+    EvaluationScope, MainnetDecision, MainnetEvaluationRequest, MainnetRefusal, evaluate_mainnet,
+};
 use stellar_agent_core::policy::v1::{AccountIdentityView, AccountReservesView, PolicyEngineV1};
 use stellar_agent_core::policy::{
     Decision, McpToolRegistration, NoopPolicyEngine, PolicyEngine, ToolDescriptor, ToolValueKind,
+    policy_now_ms,
 };
+use stellar_agent_core::wallet::WalletLifecycleError;
 // `OWNER_KEY_SERVICE_PREFIX` and the strip that inverts it are owned by
 // `stellar-agent-core`, beside `KeyringEntryRef::default_owner_key`, which is
 // the only writer of the coordinate. Both binaries import them, so the
 // construction and its inverse cannot drift apart.
-use stellar_agent_core::approval::store::governing_ttl_ms;
 use stellar_agent_core::mainnet::enablement::EnablementRecord;
 use stellar_agent_core::mainnet::verified_policy::{MainnetBody, VerifiedPolicy};
 use stellar_agent_core::policy::v1::verified::OwnerKeySource;
@@ -365,8 +370,6 @@ fn build_error_message(
 /// The engine, the verified signed policy and the installation's enablement
 /// a mainnet write is evaluated and authorized under.
 pub(crate) struct MainnetPolicy {
-    /// The evaluator the verified policy carries.
-    pub(crate) engine: Arc<dyn PolicyEngine>,
     /// The verified signed policy, which has a `[mainnet]` table.
     pub(crate) verified: VerifiedPolicy,
     /// The verified policy's `[mainnet]` table.
@@ -441,7 +444,7 @@ fn mainnet_policy_from(
     verb: &str,
 ) -> Result<MainnetPolicy, Envelope<()>> {
     let BuiltPolicyEngine {
-        engine,
+        engine: _,
         verified,
         enablement,
     } = built;
@@ -467,7 +470,6 @@ fn mainnet_policy_from(
         ));
     };
     Ok(MainnetPolicy {
-        engine,
         verified,
         body,
         enablement,
@@ -557,8 +559,9 @@ impl MainnetVerdict {
 pub(crate) struct MainnetEvaluation {
     /// The decision the write proceeds under.
     pub(crate) verdict: MainnetVerdict,
-    /// The value effects the evaluation sized; the recorder's legs.
-    pub(crate) effects: Option<stellar_agent_core::policy::v1::ValueEffects>,
+    /// The provenance-bearing decision; its value effects are the
+    /// recorder's legs.
+    pub(crate) decision: MainnetDecision,
 }
 
 /// Evaluates operator policy for a mainnet write, with the inputs of
@@ -568,18 +571,23 @@ pub(crate) struct MainnetEvaluation {
 /// confirmation serves the requirement, under the TTL the evaluated rule
 /// permits. A deny is refused before any TTL is asked for.
 ///
+/// The evaluation reads one instant, sampled through [`policy_now_ms`], and
+/// covers the [`EvaluationScope::Classic`] scope of a write whose authority
+/// binds to its own transaction.
+///
 /// # Errors
 ///
 /// The deny reason's wire code on a deny, `policy.unexpected_decision` on a
-/// decision this build does not know, and `policy.engine_required` when the
-/// evaluator fails.
+/// decision this build does not know, `policy.engine_required` when the
+/// evaluator fails, and `wallet.clock_error` when the evaluation instant
+/// cannot be read.
 #[allow(
     clippy::too_many_arguments,
     reason = "the parameter set of evaluate_value_moving_policy, whose per-verb view contract \
               the mainnet evaluation shares"
 )]
 pub(crate) fn evaluate_mainnet_policy(
-    policy_engine: &dyn PolicyEngine,
+    policy: &VerifiedPolicy,
     profile: &Profile,
     tool_name: &'static str,
     value_kind: ToolValueKind,
@@ -590,35 +598,62 @@ pub(crate) fn evaluate_mainnet_policy(
     identity_view: Option<&dyn AccountIdentityView>,
 ) -> Result<MainnetEvaluation, Envelope<()>> {
     let tool_descriptor = value_descriptor(tool_name, value_kind, chain_id);
-    let evaluation = policy_engine
-        .evaluate_full(
-            &tool_descriptor,
-            policy_args,
-            profile,
-            account_view,
-            identity_view,
-            None,
-            None,
-            None,
-        )
-        .map_err(|e| Envelope::<()>::err_raw("policy.engine_required", format!("{e}")))?;
-    let verdict = match &evaluation.decision {
+    let decision = policy_now_ms()
+        .map_err(MainnetRefusal::Clock)
+        .and_then(|now_ms| {
+            evaluate_mainnet(
+                policy,
+                EvaluationScope::Classic,
+                now_ms,
+                MainnetEvaluationRequest {
+                    chain_id,
+                    tool: &tool_descriptor,
+                    args: policy_args,
+                    profile,
+                    value: None,
+                    account_view,
+                    identity_view,
+                    counterparty_cache: None,
+                    sep10_sessions: None,
+                    sep45_sessions: None,
+                },
+            )
+        })
+        .map_err(|refusal| mainnet_refusal(refusal, verb))?;
+    let verdict = match decision.decision() {
         Decision::Allow => MainnetVerdict::Allow,
-        Decision::Deny(reason) => {
-            return Err(Envelope::<()>::err_raw(
-                reason.wire_code(),
-                format!("{verb} operation denied by operator policy"),
-            ));
-        }
         Decision::RequireApproval(_) => MainnetVerdict::RequireApproval {
-            ttl_ms: governing_ttl_ms(&evaluation),
+            ttl_ms: decision.governing_ttl_ms(),
         },
         _ => return Err(unexpected_decision()),
     };
-    Ok(MainnetEvaluation {
-        verdict,
-        effects: evaluation.value_effects,
-    })
+    Ok(MainnetEvaluation { verdict, decision })
+}
+
+/// The refusal envelope of a mainnet evaluation that produced no decision.
+fn mainnet_refusal(refusal: MainnetRefusal, verb: &str) -> Envelope<()> {
+    match refusal {
+        MainnetRefusal::Denied { reason, .. } => Envelope::<()>::err_raw(
+            reason.wire_code(),
+            format!("{verb} operation denied by operator policy"),
+        ),
+        MainnetRefusal::Engine(e) => {
+            Envelope::<()>::err_raw("policy.engine_required", format!("{e}"))
+        }
+        MainnetRefusal::Clock(error) => clock_refusal(&error),
+    }
+}
+
+/// The refusal of a policy evaluation whose instant cannot be read.
+fn clock_refusal(error: &WalletLifecycleError) -> Envelope<()> {
+    Envelope::<()>::err(&WalletError::WalletState(WalletStateError::clock_error(
+        error,
+    )))
+}
+
+/// The one instant an off-mainnet policy evaluation reads.
+fn evaluation_instant() -> Result<u64, Envelope<()>> {
+    policy_now_ms().map_err(|error| clock_refusal(&error))
 }
 
 /// The refusal of a policy decision this build does not know.
@@ -813,7 +848,8 @@ pub(crate) fn trustline_policy_args(from: &str, asset: &str) -> serde_json::Valu
 /// # Errors
 ///
 /// Returns `Err(envelope)` on `Decision::Deny`, `Decision::RequireApproval`,
-/// an unexpected `Decision` variant, or a policy-engine evaluation error.
+/// an unexpected `Decision` variant, or a policy-engine evaluation error,
+/// and `wallet.clock_error` when the evaluation instant cannot be read.
 #[allow(
     clippy::too_many_arguments,
     reason = "mirrors evaluate_full's parameter set (engine, profile, descriptor \
@@ -834,6 +870,7 @@ pub(crate) fn evaluate_value_moving_policy(
     identity_view: Option<&dyn AccountIdentityView>,
 ) -> Result<Option<stellar_agent_core::policy::v1::ValueEffects>, Envelope<()>> {
     let tool_descriptor = value_descriptor(tool_name, value_kind, chain_id);
+    let now_ms = evaluation_instant()?;
 
     match policy_engine.evaluate_full(
         &tool_descriptor,
@@ -844,6 +881,7 @@ pub(crate) fn evaluate_value_moving_policy(
         None,
         None,
         None,
+        now_ms,
     ) {
         Ok(evaluation) => match evaluation.decision {
             Decision::Allow => Ok(evaluation.value_effects),
@@ -886,7 +924,8 @@ pub(crate) fn evaluate_value_moving_policy(
 /// # Errors
 ///
 /// Returns `Err(envelope)` on `Decision::Deny`, `Decision::RequireApproval`,
-/// an unexpected `Decision` variant, or a policy-engine evaluation error.
+/// an unexpected `Decision` variant, or a policy-engine evaluation error,
+/// and `wallet.clock_error` when the evaluation instant cannot be read.
 pub(crate) fn evaluate_value_moving_policy_with_value(
     policy_engine: &dyn PolicyEngine,
     profile: &Profile,
@@ -910,6 +949,7 @@ pub(crate) fn evaluate_value_moving_policy_with_value(
     // calls the decision-only `evaluate_with_value` view. The caller supplies the
     // value descriptor and retains it for its own audit row (single-decode
     // invariant), so the effects the engine echoes here are not re-read.
+    let now_ms = evaluation_instant()?;
     match policy_engine.evaluate_with_value_full(
         &tool_descriptor,
         policy_args,
@@ -920,6 +960,7 @@ pub(crate) fn evaluate_value_moving_policy_with_value(
         None,
         None,
         None,
+        now_ms,
     ) {
         Ok(evaluation) => match evaluation.decision {
             Decision::Allow => Ok(()),
@@ -966,7 +1007,8 @@ pub(crate) fn evaluate_value_moving_policy_with_value(
 /// # Errors
 ///
 /// Returns `Err(envelope)` on `Decision::Deny`, `Decision::RequireApproval`,
-/// an unexpected `Decision` variant, or a policy-engine evaluation error.
+/// an unexpected `Decision` variant, or a policy-engine evaluation error,
+/// and `wallet.clock_error` when the evaluation instant cannot be read.
 pub(crate) fn evaluate_opaque_signing_policy(
     policy_engine: &dyn PolicyEngine,
     profile: &Profile,
@@ -989,6 +1031,7 @@ pub(crate) fn evaluate_opaque_signing_policy(
     // recognised shape, so there is nothing to carry beyond the opaque
     // classification itself.
     let policy_args = serde_json::json!({});
+    let now_ms = evaluation_instant()?;
 
     match policy_engine.evaluate_with_value_full(
         &tool_descriptor,
@@ -1000,6 +1043,7 @@ pub(crate) fn evaluate_opaque_signing_policy(
         None,
         None,
         None,
+        now_ms,
     ) {
         Ok(evaluation) => match evaluation.decision {
             Decision::Allow => Ok(()),
@@ -3020,47 +3064,249 @@ decision = "allow"
         }
     }
 
-    /// A policy engine whose evaluator fails.
-    struct FailingEngine;
-
-    impl PolicyEngine for FailingEngine {
-        fn evaluate(
-            &self,
-            _tool: &ToolDescriptor,
-            _args: &serde_json::Value,
-            _profile: &Profile,
-            _account_view: Option<&dyn AccountReservesView>,
-            _identity_view: Option<&dyn AccountIdentityView>,
-            _counterparty_cache: Option<&dyn stellar_agent_core::policy::v1::CounterpartyCacheView>,
-            _sep10_sessions: Option<&dyn stellar_agent_core::policy::v1::Sep10SessionView>,
-            _sep45_sessions: Option<&dyn stellar_agent_core::policy::v1::Sep45SessionView>,
-        ) -> Result<Decision, stellar_agent_core::policy::PolicyError> {
-            Err(
-                stellar_agent_core::policy::PolicyError::CriterionEvaluationFailed {
-                    detail: "the evaluator failed".to_owned(),
-                },
-            )
-        }
+    /// A version 1 policy for the `guard` profile, signed and verified under a
+    /// fixed owner key: `stellar_pay` caps native payments at 100 stroops, and
+    /// `stellar_claim` requires a reserve that an evaluation without an
+    /// account view cannot check. It installs the process-global mock
+    /// keyring store, so its callers hold the binary's serial key.
+    fn refusal_guard_policy(dir: &std::path::Path, profile: &Profile) -> VerifiedPolicy {
+        use stellar_agent_core::policy::v1::{
+            canonical, signature,
+            verified::{OwnerKeySource, PinMode, PolicyLoad, load_verified_policy},
+        };
+        stellar_agent_test_support::keyring_mock::install().expect("mock keyring");
+        let owner = ed25519_dalek::SigningKey::from_bytes(&[0x21; 32]);
+        let owner_address =
+            stellar_strkey::ed25519::PublicKey(owner.verifying_key().to_bytes()).to_string();
+        let body = r#"version = 1
+scope = "profile:guard"
+[[rules]]
+match = { tool = "stellar_pay", chain = "*" }
+criteria = [{ kind = "per_tx_cap", asset = "native", max_stroops = 100 }]
+decision = "allow"
+[[rules]]
+match = { tool = "stellar_claim", chain = "*" }
+criteria = [{ kind = "minimum_reserve", margin_stroops = 0 }]
+decision = "allow"
+"#;
+        let canonical = canonical::canonical_bytes(body).expect("canonical policy");
+        let sig = hex::encode(signature::sign(&signature::digest(&canonical), &owner));
+        let path = dir.join("guard.toml");
+        std::fs::write(
+            &path,
+            format!("{body}\n[signature]\nowner_id = \"{owner_address}\"\nsig = \"{sig}\"\n"),
+        )
+        .expect("signed policy");
+        load_verified_policy(
+            &PolicyLoad {
+                path: &path,
+                profile,
+                profile_name: "guard",
+                owner_pubkey: &owner.verifying_key().to_bytes(),
+                owner_source: OwnerKeySource::Keyring,
+                window_path: &dir.join("guard.window"),
+            },
+            stellar_agent_core::policy::v1::criteria::state_store::PolicyStateStore::new(),
+            PinMode::Advance,
+        )
+        .expect("verified policy")
     }
 
-    /// An evaluator error refuses the mainnet write as an engine failure.
+    /// The deny and engine-error refusals of a mainnet evaluation render
+    /// exact envelopes.
     #[test]
-    fn an_evaluator_error_refuses_as_engine_required() {
-        let profile = make_profile(PolicyEngineKind::V1, "stellar-agent-owner-default");
-        let Err(envelope) = evaluate_mainnet_policy(
-            &FailingEngine,
+    #[serial_test::serial]
+    fn mainnet_policy_refusals_render_today() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let profile = make_profile(PolicyEngineKind::V1, "stellar-agent-owner-guard");
+        let verified = refusal_guard_policy(dir.path(), &profile);
+        let render = |result: Result<MainnetEvaluation, Envelope<()>>| {
+            let Err(mut envelope) = result else {
+                panic!("the evaluation must refuse");
+            };
+            envelope.request_id = "guard".to_owned();
+            serde_json::to_string(&envelope).expect("envelope JSON")
+        };
+        let denied = evaluate_mainnet_policy(
+            &verified,
             &profile,
             "stellar_pay",
             ToolValueKind::MovesValue,
-            "stellar:mainnet",
-            &serde_json::json!({}),
+            "stellar:testnet",
+            &pay_policy_args(1_000, "native", PARITY_DEST_G),
             "pay",
+            None,
+            None,
+        );
+        assert_eq!(
+            render(denied),
+            r#"{"ok":false,"error":{"code":"policy.deny.per_tx_cap_exceeded","message":"pay operation denied by operator policy"},"request_id":"guard"}"#
+        );
+        let failed = evaluate_mainnet_policy(
+            &verified,
+            &profile,
+            "stellar_claim",
+            ToolValueKind::MovesValue,
+            "stellar:testnet",
+            &claim_policy_args("00000000"),
+            "claim",
+            None,
+            None,
+        );
+        assert_eq!(
+            render(failed),
+            concat!(
+                r#"{"ok":false,"error":{"code":"policy.engine_required","#,
+                r#""message":"criterion evaluation failed: minimum_reserve criterion configured "#,
+                r#"for tool 'stellar_claim' but account_view was not populated by the dispatch "#,
+                r#"site; AccountViewAdapter wiring required to enable reserve checking at "#,
+                r#"runtime"},"request_id":"guard"}"#,
+            )
+        );
+    }
+
+    /// An evaluator error refuses the mainnet write as an engine failure:
+    /// the reserve criterion of `stellar_claim` fails without an account
+    /// view.
+    #[test]
+    #[serial_test::serial]
+    fn an_evaluator_error_refuses_as_engine_required() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let profile = make_profile(PolicyEngineKind::V1, "stellar-agent-owner-guard");
+        let verified = refusal_guard_policy(dir.path(), &profile);
+        let Err(envelope) = evaluate_mainnet_policy(
+            &verified,
+            &profile,
+            "stellar_claim",
+            ToolValueKind::MovesValue,
+            "stellar:mainnet",
+            &claim_policy_args("00000000"),
+            "claim",
             None,
             None,
         ) else {
             panic!("an evaluator error must refuse");
         };
         assert_eq!(envelope.error.unwrap().code, "policy.engine_required");
+    }
+
+    /// A mainnet evaluation whose instant cannot be read refuses with
+    /// `wallet.clock_error` before the engine decides; the same call
+    /// allows once the clock reads again.
+    #[test]
+    #[serial_test::serial]
+    fn mainnet_gate_clock_failure_renders_wallet_clock_error() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let profile = make_profile(PolicyEngineKind::V1, "stellar-agent-owner-guard");
+        let verified = refusal_guard_policy(dir.path(), &profile);
+        let evaluate = || {
+            evaluate_mainnet_policy(
+                &verified,
+                &profile,
+                "stellar_pay",
+                ToolValueKind::MovesValue,
+                "stellar:mainnet",
+                &pay_policy_args(50, "native", PARITY_DEST_G),
+                "pay",
+                None,
+                None,
+            )
+        };
+        let broken =
+            stellar_agent_core::policy::v1::criteria::state_store::set_policy_clock_error_for_test(
+            );
+        let Err(envelope) = evaluate() else {
+            panic!("a clock failure must refuse");
+        };
+        let error = envelope
+            .error
+            .expect("refusal envelope must carry an error block");
+        assert_eq!(error.code, "wallet.clock_error");
+        assert!(
+            error.message.starts_with("system clock error: "),
+            "{}",
+            error.message
+        );
+        drop(broken);
+        let Ok(evaluation) = evaluate() else {
+            panic!("the call under the cap allows once the clock reads");
+        };
+        assert!(matches!(evaluation.verdict, MainnetVerdict::Allow));
+    }
+
+    /// Each off-mainnet evaluation refuses with `wallet.clock_error` when its
+    /// instant cannot be read, although the same calls allow under a
+    /// readable clock and no criterion reads time.
+    #[test]
+    fn off_mainnet_clock_failure_renders_wallet_clock_error() {
+        let profile = parity_profile();
+        let pay_engine = per_tx_cap_engine("stellar_pay", 1_000_000_000);
+        let trade_engine = per_tx_cap_engine("stellar_dex_trade", 1_000_000_000);
+        let opaque_engine = PolicyEngineV1::new(
+            PolicyDocument {
+                version: 1,
+                scope: ScopeId::AllProfiles,
+                rules: vec![PolicyRule {
+                    r#match: RuleMatch {
+                        tool: "stellar_pay".to_owned(),
+                        chain: "*".to_owned(),
+                    },
+                    criteria: vec![Box::new(PerTxCapCriterion::new(
+                        "native".to_owned(),
+                        1_000_000_000,
+                    ))],
+                    decision: Decision::Allow,
+                    allow_opaque_signing: true,
+                }],
+                signature: None,
+            },
+            "alice".to_owned(),
+        );
+        let pay_args = pay_policy_args(500_000_000, "native", PARITY_DEST_G);
+        let trade_args = serde_json::json!({ "from_address": PARITY_DEST_G });
+        let value_moving = || {
+            evaluate_value_moving_policy(
+                &pay_engine,
+                &profile,
+                "stellar_pay",
+                ToolValueKind::MovesValue,
+                "stellar:testnet",
+                &pay_args,
+                "pay",
+                None,
+                None,
+            )
+        };
+        let with_value = || {
+            evaluate_value_moving_policy_with_value(
+                &trade_engine,
+                &profile,
+                "stellar_dex_trade",
+                "stellar:testnet",
+                &trade_args,
+                dex_trade_leg(500_000_000),
+                "trade",
+            )
+        };
+        let opaque = || {
+            evaluate_opaque_signing_policy(
+                &opaque_engine,
+                &profile,
+                "stellar_pay",
+                "stellar:testnet",
+                stellar_agent_core::policy::v1::OpaqueReason::RawTransactionSignature,
+                "pay",
+            )
+        };
+        assert!(value_moving().is_ok());
+        assert!(with_value().is_ok());
+        assert!(opaque().is_ok());
+        let _broken =
+            stellar_agent_core::policy::v1::criteria::state_store::set_policy_clock_error_for_test(
+            );
+        assert_eq!(envelope_code(&value_moving()), "wallet.clock_error");
+        assert_eq!(envelope_code(&with_value()), "wallet.clock_error");
+        assert_eq!(envelope_code(&opaque()), "wallet.clock_error");
     }
 
     /// The effective cap is the cap the signed check enforces: a fee equal

@@ -671,7 +671,8 @@ fn authorized_settlements_share_admission_and_refusal_records_nothing() {
                     None,
                     None,
                     None,
-                    None
+                    None,
+                    stellar_agent_core::policy::policy_now_ms().unwrap(),
                 )
                 .unwrap(),
             Decision::Allow

@@ -24,8 +24,6 @@
 //! The criterion only reads accumulated state.  Recording a new call entry at
 //! commit time is the dispatch site's responsibility.
 
-use std::time::{SystemTime, UNIX_EPOCH};
-
 use crate::policy::v1::EvalContext;
 use crate::policy::v1::bundle::{BundleStateOverlay, InnerOpDescriptor};
 use crate::policy::v1::criteria::Criterion;
@@ -112,19 +110,10 @@ impl Criterion for RateLimitCriterion {
     ///
     /// # Errors
     ///
-    /// Returns [`PolicyError::CriterionEvaluationFailed`] when:
-    /// - `SystemTime::now()` is before UNIX epoch.
-    /// - The state store detects clock skew exceeding 30 seconds.
+    /// Returns [`PolicyError::CriterionEvaluationFailed`] when the state store
+    /// detects clock skew exceeding 30 seconds against `ctx.now_ms`.
     fn evaluate(&self, ctx: &EvalContext<'_>) -> Result<Option<DenyReason>, PolicyError> {
-        let now_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .map_err(|e| PolicyError::CriterionEvaluationFailed {
-                detail: format!("rate_limit: system clock is before UNIX epoch: {e}"),
-            })?;
-
-        #[cfg(any(test, feature = "test-helpers"))]
-        let now_ms = super::state_store::query_time_for_test().unwrap_or(now_ms);
+        let now_ms = ctx.now_ms;
 
         let state_key = StateKey::new(
             ctx.profile_name,
@@ -207,17 +196,7 @@ impl Criterion for RateLimitCriterion {
     /// (this criterion's `evaluate` is not called at bundle level either — see
     /// its per-tool-call scoping).
     fn record_confirmed(&self, ctx: &EvalContext<'_>) -> Result<Vec<WindowEntry>, PolicyError> {
-        let now_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .map_err(|e| PolicyError::CriterionEvaluationFailed {
-                detail: format!(
-                    "rate_limit: record_confirmed system clock is before UNIX epoch: {e}"
-                ),
-            })?;
-        #[cfg(any(test, feature = "test-helpers"))]
-        let now_ms = super::state_store::query_time_for_test().unwrap_or(now_ms);
-        let entry = self.size(ctx, now_ms)?;
+        let entry = self.size(ctx, ctx.now_ms)?;
         if let Some(entry) = &entry {
             ctx.state_store
                 .append(entry.key(), entry.timestamp_ms(), entry.amount())
@@ -307,14 +286,13 @@ mod tests {
             bundle: None,
             policy_digest: [0; 32],
             provisional: false,
+            now_ms: now_ms(),
         }
     }
 
+    /// The fixture evaluation instant every context of this module carries.
     fn now_ms() -> u64 {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system clock should be after UNIX epoch")
-            .as_millis() as u64
+        1_700_000_000_000
     }
 
     #[test]
@@ -498,6 +476,7 @@ mod tests {
             bundle: Some(&view),
             policy_digest: [0; 32],
             provisional: false,
+            now_ms: now_ms(),
         };
         let result = criterion.evaluate(&ctx).unwrap();
         assert!(

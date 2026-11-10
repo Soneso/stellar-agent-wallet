@@ -11,6 +11,8 @@
 //! - [`entries_digest`]: the digest of the window entries an authorization
 //!   holds, in order.
 //! - [`bindings_digest`]: the aggregate digest over the proofs' fact digests.
+//! - [`policy_authority_digest`]: the digest of a policy authority, which
+//!   stands for the authority in the bindings when no approval does.
 //! - The fact-digest labels of the eight proofs, from
 //!   [`stellar_agent_core::mainnet::fact`].
 //!
@@ -40,11 +42,25 @@
 //! ```text
 //! SHA256("stellar-agent-authz-bindings:v1"
 //!     || opt(endpoint) || signer || policy || enablement
-//!     || opt(witness) || opt(reservation) || approval || audit)
+//!     || opt(witness) || opt(reservation) || authority || audit)
 //! ```
 //!
 //! over the proofs' 32-byte fact digests in that fixed order, where
-//! `opt(x)` is `0x00` for an absent proof or `0x01 || x`.
+//! `opt(x)` is `0x00` for an absent proof or `0x01 || x`. The authority is
+//! the approval witness's fact digest under an approval and the policy
+//! authority digest under a policy authority.
+//!
+//! # Policy authority digest
+//!
+//! ```text
+//! SHA256("stellar-agent-wallet/policy-authority/v1"
+//!     || policy_digest || i64be(policy_sequence) || u32be(rule_index)
+//!     || u64be(evaluated_at_ms) || u64be(governing_until_ms) || scope)
+//! ```
+//!
+//! where `scope` is `0x00` for a classic scope, and `0x01 || lp(home_domain)
+//! || lp(tool)` for an authenticated x402 scope, with `lp(x)` the UTF-8 bytes
+//! of `x` behind their length as four big-endian bytes.
 
 use sha2::{Digest as _, Sha256};
 use stellar_agent_core::policy::v1::criteria::state_store::WindowEntry;
@@ -70,6 +86,9 @@ pub const ENTRIES_LABEL: &[u8] = b"stellar-agent-authz-holds:v1";
 
 /// Label of the bindings digest.
 pub const BINDINGS_LABEL: &[u8] = b"stellar-agent-authz-bindings:v1";
+
+/// Label of the policy authority digest.
+pub const POLICY_AUTHORITY_LABEL: &[u8] = b"stellar-agent-wallet/policy-authority/v1";
 
 use stellar_agent_core::approval::subject::length_prefixed;
 
@@ -114,14 +133,15 @@ pub struct BindingFacts {
     pub witness: Option<[u8; 32]>,
     /// The window reservation's fact digest, when the record holds entries.
     pub reservation: Option<[u8; 32]>,
-    /// The approval witness's fact digest.
-    pub approval: [u8; 32],
+    /// The authority's digest: the approval witness's fact digest, or the
+    /// policy authority digest.
+    pub authority: [u8; 32],
     /// The audit readiness's fact digest.
     pub audit: [u8; 32],
 }
 
 /// The aggregate digest over the proofs' fact digests, in the fixed order
-/// endpoint, signer, policy, enablement, witness, reservation, approval,
+/// endpoint, signer, policy, enablement, witness, reservation, authority,
 /// audit.
 #[must_use]
 pub fn bindings_digest(facts: &BindingFacts) -> [u8; 32] {
@@ -140,8 +160,31 @@ pub fn bindings_digest(facts: &BindingFacts) -> [u8; 32] {
     hasher.update(facts.enablement);
     optional(&mut hasher, facts.witness.as_ref());
     optional(&mut hasher, facts.reservation.as_ref());
-    hasher.update(facts.approval);
+    hasher.update(facts.authority);
     hasher.update(facts.audit);
+    hasher.finalize().into()
+}
+
+/// The digest of a policy authority, over its fields in declaration order
+/// with the layout in the module documentation.
+#[must_use]
+pub fn policy_authority_digest(binding: &crate::policy_state::PolicyAuthorityBinding) -> [u8; 32] {
+    use stellar_agent_core::mainnet::decision::AuthorityScope;
+    let mut hasher = Sha256::new();
+    hasher.update(POLICY_AUTHORITY_LABEL);
+    hasher.update(binding.policy_digest);
+    hasher.update(binding.policy_sequence.to_be_bytes());
+    hasher.update(binding.rule_index.to_be_bytes());
+    hasher.update(binding.evaluated_at_ms.to_be_bytes());
+    hasher.update(binding.governing_until_ms.to_be_bytes());
+    match &binding.scope {
+        AuthorityScope::Classic => hasher.update([0]),
+        AuthorityScope::X402Authenticated { home_domain, tool } => {
+            hasher.update([1]);
+            length_prefixed(&mut hasher, home_domain.as_bytes());
+            length_prefixed(&mut hasher, tool.as_bytes());
+        }
+    }
     hasher.finalize().into()
 }
 
@@ -236,7 +279,7 @@ mod tests {
             enablement: [4; 32],
             witness: None,
             reservation: Some([6; 32]),
-            approval: [7; 32],
+            authority: [7; 32],
             audit: [8; 32],
         };
         assert_eq!(
@@ -259,12 +302,73 @@ mod tests {
             enablement: [4; 32],
             witness: Some([5; 32]),
             reservation: Some([6; 32]),
-            approval: [7; 32],
+            authority: [7; 32],
             audit: [8; 32],
         };
         assert_eq!(
             hex(&bindings_digest(&facts)),
             "20d70736524ada8f1beb54f911c7f3c97bafdf812843deb1ffbe65fdc9fd88b9"
         );
+    }
+
+    /// The policy authority digest of a classic and an authenticated x402
+    /// scope, against vectors computed independently from the documented
+    /// layout; every field changes it.
+    #[test]
+    fn policy_authority_digest_follows_the_layout() {
+        use crate::policy_state::PolicyAuthorityBinding;
+        use stellar_agent_core::mainnet::decision::AuthorityScope;
+        let classic = PolicyAuthorityBinding {
+            policy_digest: [0x11; 32],
+            policy_sequence: 7,
+            rule_index: 3,
+            evaluated_at_ms: 1_900_000_000_000,
+            governing_until_ms: 1_900_000_600_000,
+            scope: AuthorityScope::Classic,
+        };
+        let scoped = PolicyAuthorityBinding {
+            scope: AuthorityScope::X402Authenticated {
+                home_domain: "pay.example.org".to_owned(),
+                tool: "stellar_x402_authenticated_payment".to_owned(),
+            },
+            ..classic.clone()
+        };
+        let negative = PolicyAuthorityBinding {
+            policy_sequence: -2,
+            ..classic.clone()
+        };
+        assert_eq!(
+            hex(&policy_authority_digest(&classic)),
+            "ef888a79e2396d09ee803cdbdcaac6bc46d0cd6bb5233b01accc05510220545a"
+        );
+        assert_eq!(
+            hex(&policy_authority_digest(&scoped)),
+            "5d04887a74747ee81865d199ea8d961a5b86673bd66a3d7b0c81bdfa37c36dd1"
+        );
+        assert_eq!(
+            hex(&policy_authority_digest(&negative)),
+            "3d7c91709ecf9a8e0be1701395f80a9b33c3f5e819a07f3fda9ec35cc58c1c5f"
+        );
+        assert_eq!(classic.digest(), policy_authority_digest(&classic));
+        let changes: [fn(&mut PolicyAuthorityBinding); 5] = [
+            |b| b.policy_digest[0] ^= 1,
+            |b| b.rule_index += 1,
+            |b| b.evaluated_at_ms += 1,
+            |b| b.governing_until_ms += 1,
+            |b| {
+                b.scope = AuthorityScope::X402Authenticated {
+                    home_domain: "pay.example.org".to_owned(),
+                    tool: "other".to_owned(),
+                }
+            },
+        ];
+        for change in changes {
+            let mut changed = scoped.clone();
+            change(&mut changed);
+            assert_ne!(
+                policy_authority_digest(&changed),
+                policy_authority_digest(&scoped)
+            );
+        }
     }
 }

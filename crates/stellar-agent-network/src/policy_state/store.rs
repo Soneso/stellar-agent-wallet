@@ -346,7 +346,7 @@ pub(super) const WIRE_VERSION_LEDGER: u32 = 4;
 /// A file written by a newer build carries records this one cannot account
 /// for, so it is refused rather than read with the fields it happens to
 /// recognise.
-pub(super) const WIRE_VERSION_MAX: u32 = 9;
+pub(super) const WIRE_VERSION_MAX: u32 = 10;
 
 /// Wire version binding the accounting network on every snapshot.
 pub(super) const WIRE_VERSION_CHAIN: u32 = 5;
@@ -363,8 +363,17 @@ pub(super) const WIRE_VERSION_EXPIRY: u32 = 8;
 /// Wire version carrying signed intents and their reservation links.
 pub(super) const WIRE_VERSION_INTENT: u32 = 9;
 
+/// Wire version carrying authorizations minted under policy authority.
+pub(super) const WIRE_VERSION_POLICY_AUTHORITY: u32 = 10;
+
 fn select_wire_version(wire: &WireFile) -> u32 {
-    if !wire.signed_intents.is_empty()
+    if wire
+        .authorizations
+        .iter()
+        .any(|auth| auth.policy_authority.is_some())
+    {
+        WIRE_VERSION_POLICY_AUTHORITY
+    } else if !wire.signed_intents.is_empty()
         || wire
             .entries
             .iter()
@@ -4656,12 +4665,13 @@ fn authenticated_scope(wire: &WireFile) -> Result<ChainScope, WindowStoreError> 
 /// Checks one snapshot's version, its authorization history and its
 /// accounting-expiry records.
 ///
-/// Versions 1 through 9 decode. Snapshots below version 4 carry no authorization
+/// Versions 1 through 10 decode. Snapshots below version 4 carry no authorization
 /// history; usable snapshots also require complete authenticated scope.
 /// Accounting-expiry records need version 8, the file's own scope, the
 /// accounting-expired disposition, a generation no later than the file's, and
 /// a unique identifier that recomputes from their fields.
-/// Signed intents and their links need version 9.
+/// Signed intents and their links need version 9. An authorization under
+/// policy authority needs version 10.
 fn check_snapshot(wire: &WireFile) -> Result<(), WindowStoreError> {
     if wire.version > WIRE_VERSION_MAX {
         return Err(WindowStoreError::UnsupportedVersion);
@@ -4688,6 +4698,18 @@ fn check_snapshot(wire: &WireFile) -> Result<(), WindowStoreError> {
                 detail: "an accounting-expiry record does not match its snapshot".to_owned(),
             });
         }
+    }
+    if wire.version < WIRE_VERSION_POLICY_AUTHORITY
+        && wire
+            .authorizations
+            .iter()
+            .any(|auth| auth.policy_authority.is_some())
+    {
+        return Err(WindowStoreError::Invalid {
+            detail: format!(
+                "a policy authority requires wire version {WIRE_VERSION_POLICY_AUTHORITY}"
+            ),
+        });
     }
     validate_signed_intents(wire)?;
     ledger::validate(wire)
@@ -6229,6 +6251,21 @@ mod tests {
     use stellar_agent_test_support::{file_sha256, keyring_mock};
     use tempfile::TempDir;
 
+    impl PersistedWindowStore {
+        /// Writes `wire` as the profile's committed file, under its key and
+        /// generation, without the snapshot checks a commit applies, so a
+        /// test can present a file the writer never produces.
+        pub(in crate::policy_state) fn seal_unchecked_for_test(
+            &self,
+            profile: &Profile,
+            wire: &WireFile,
+        ) {
+            let (key, _) = self.load_or_mint_key(profile).unwrap();
+            self.write_atomic(&key, wire).unwrap();
+            write_generation(&generation_entry_ref(profile), wire).unwrap();
+        }
+    }
+
     #[test]
     #[serial]
     fn an_unbounded_source_subject_never_closes() {
@@ -6821,7 +6858,7 @@ mod tests {
             }
         }
         let mut unsupported = serde_json::to_value(&valid).unwrap();
-        unsupported["version"] = 10.into();
+        unsupported["version"] = (WIRE_VERSION_MAX + 1).into();
         assert!(matches!(
             store.verify_with_key(&key, &encode(&unsupported)),
             Err(WindowStoreError::UnsupportedVersion)
@@ -9131,7 +9168,7 @@ mod tests {
             }
         }
         let mut future = valid.clone();
-        future.version = 10;
+        future.version = WIRE_VERSION_MAX + 1;
         f.seal(&future);
         assert!(matches!(
             f.store.read_for_inspection(&f.profile),
@@ -9831,6 +9868,7 @@ mod tests {
                 None,
                 None,
                 None,
+                stellar_agent_core::policy::policy_now_ms().unwrap(),
             )
             .unwrap();
         assert_eq!(d1, Decision::Allow, "first call must be allowed");
@@ -9859,6 +9897,7 @@ mod tests {
                 None,
                 None,
                 None,
+                stellar_agent_core::policy::policy_now_ms().unwrap(),
             )
             .unwrap();
         assert!(
@@ -14027,8 +14066,9 @@ mod tests {
             settled_ms: Some(now_ms().unwrap()),
             policy_sequence: 1,
             policy_digest: [1; 32],
-            approval_nonce: format!("versions-{n}"),
-            approval_expires_ms: 2,
+            approval_nonce: Some(format!("versions-{n}")),
+            approval_expires_ms: Some(2),
+            policy_authority: None,
             bindings_digest: [2; 32],
             entries_digest: [3; 32],
             reservation: None,
@@ -14733,7 +14773,7 @@ mod tests {
             f.seal(&reset_wire());
             let key =
                 crate::keyring::load_hmac_key_32(&f.profile.policy_window_state_key_id).unwrap();
-            let body = br#"{"version":10,"future_authorities":[{"open":true}],"prepared":"future representation"}"#;
+            let body = br#"{"version":11,"future_authorities":[{"open":true}],"prepared":"future representation"}"#;
             f.store
                 .write_atomic_raw(&compute_tag(key.as_ref(), body).unwrap(), body)
                 .unwrap();

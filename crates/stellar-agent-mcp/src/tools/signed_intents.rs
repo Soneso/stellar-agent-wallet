@@ -79,6 +79,7 @@ mod tests {
             _counterparty_cache: Option<&dyn stellar_agent_core::policy::v1::CounterpartyCacheView>,
             _sep10_sessions: Option<&dyn stellar_agent_core::policy::v1::Sep10SessionView>,
             _sep45_sessions: Option<&dyn stellar_agent_core::policy::v1::Sep45SessionView>,
+            _now_ms: u64,
         ) -> Result<stellar_agent_core::policy::Decision, stellar_agent_core::policy::PolicyError>
         {
             assert_eq!(tool.name, "stellar_signed_intents_list");

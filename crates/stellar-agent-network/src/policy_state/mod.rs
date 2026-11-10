@@ -198,8 +198,8 @@ use lock::StateLockError;
 
 pub use ledger::{
     ClaimExpect, ConsumeExpect, ConsumeReceipt, ConsumptionBinding, DomainBinding, FeeBumpFacts,
-    MAX_OPEN_AUTHORIZATIONS, MintRequest, MintedRecord, OpenAuthorization, SubmissionBinding,
-    WindowReservation,
+    MAX_OPEN_AUTHORIZATIONS, MintAuthority, MintRequest, MintedRecord, OpenAuthorization,
+    PolicyAuthorityBinding, SubmissionBinding, WindowReservation,
 };
 pub use store::{
     AccountingDecision, ChainScope, DeliveryReport, MintOutcome, OwedAccountingExpiries,

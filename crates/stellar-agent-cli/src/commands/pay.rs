@@ -2294,7 +2294,7 @@ where
         .map(stellar_agent_network::policy_view::AccountViewAdapter::new);
     let chain_id = context.chain().caip2_str();
     let evaluation = match evaluate_mainnet_policy(
-        policy.engine.as_ref(),
+        &policy.verified,
         profile,
         "stellar_pay",
         stellar_agent_core::policy::ToolValueKind::MovesValue,

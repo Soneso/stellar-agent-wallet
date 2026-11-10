@@ -629,6 +629,10 @@ async fn call_one_writes_the_pending_approval_without_a_request() {
             &serde_json::json!({"chain_id":"stellar:mainnet", "home_domain":HOME}),
             "stellar:mainnet",
             ValueClass::single(x402_value_leg(&requirements, 10)),
+            stellar_agent_core::mainnet::decision::EvaluationScope::X402Authenticated {
+                home_domain: HOME.to_owned(),
+                tool: TOOL.to_owned(),
+            },
         )
         .await
         .unwrap();
@@ -1145,6 +1149,10 @@ impl Boundary {
                 &serde_json::json!({"chain_id":"stellar:mainnet", "home_domain":HOME}),
                 "stellar:mainnet",
                 ValueClass::single(x402_value_leg(&self.requirements, 10)),
+                stellar_agent_core::mainnet::decision::EvaluationScope::X402Authenticated {
+                    home_domain: HOME.to_owned(),
+                    tool: TOOL.to_owned(),
+                },
             )
             .await
             .unwrap();
@@ -1227,7 +1235,9 @@ impl Boundary {
             message: facts,
             policy: guard.policy,
             enablement: guard.enablement,
-            approval,
+            authority: &stellar_agent_network::mainnet::authority::MainnetAuthority::Approval(
+                approval,
+            ),
             audit,
             store: &store,
         })
@@ -1472,7 +1482,9 @@ async fn the_identity_gate_refuses_a_future_created_approval() {
             intent: &intent,
             policy: guard.policy,
             enablement: guard.enablement,
-            approval: &approval,
+            authority: &stellar_agent_network::mainnet::authority::MainnetAuthority::Approval(
+                &approval,
+            ),
             audit,
             store: &store,
         },
@@ -1509,7 +1521,9 @@ async fn the_identity_inputs_print_the_profile_only() {
         intent: &intent,
         policy: guard.policy,
         enablement: guard.enablement,
-        approval: &approval,
+        authority: &stellar_agent_network::mainnet::authority::MainnetAuthority::Approval(
+            &approval,
+        ),
         audit,
         store: &store,
     };
@@ -1553,7 +1567,9 @@ async fn the_mainnet_session_prints_no_jwt_and_no_envelope() {
             intent: &intent,
             policy: guard.policy,
             enablement: guard.enablement,
-            approval: &approval,
+            authority: &stellar_agent_network::mainnet::authority::MainnetAuthority::Approval(
+                &approval,
+            ),
             audit,
             store: &store,
         },

@@ -121,6 +121,7 @@ pub(crate) fn build_recorder<'a>(
             audit: Some(record.audit),
             nonce_id: record.nonce_id,
             now_ms: record.now_ms,
+            provenance: None,
         },
         receipts,
         Some(sizing),
@@ -314,7 +315,7 @@ pub(crate) fn cleanup_authorization(
 pub(crate) async fn sign_and_submit_classic(
     server: &crate::server::WalletServer,
     guard: Option<&crate::server::MainnetWriteGuard<'_>>,
-    approval: Option<&stellar_agent_core::approval::witness::ApprovalWitness>,
+    authority: Option<&stellar_agent_network::mainnet::authority::MainnetAuthority<'_>>,
     audit: Option<stellar_agent_network::mainnet::audit_readiness::AuditReadiness>,
     consumer: stellar_agent_network::mainnet::MainnetConsumer,
     client: &stellar_agent_network::StellarRpcClient,
@@ -334,7 +335,7 @@ pub(crate) async fn sign_and_submit_classic(
     let render = |error: WalletError| submission_error_result(&error, envelope);
     let timeout = super::common::submit_timeout(record.profile);
     if let Some(guard) = guard {
-        let approval = approval.ok_or_else(|| {
+        let authority = authority.ok_or_else(|| {
             super::common::approval_required_indistinguishable(&record.profile_name)
         })?;
         let audit = audit.ok_or_else(|| {
@@ -367,7 +368,7 @@ pub(crate) async fn sign_and_submit_classic(
                 signer: &signer,
                 policy: guard.policy,
                 enablement: guard.enablement,
-                approval,
+                authority,
                 audit,
                 store: &prepared.window,
             },

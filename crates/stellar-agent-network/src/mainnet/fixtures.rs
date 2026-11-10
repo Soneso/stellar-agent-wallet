@@ -36,8 +36,9 @@ use stellar_xdr::{Limits, ReadXdr, TransactionEnvelope};
 
 use super::audit_readiness::AuditReadiness;
 use super::authorization::{
-    ApprovalBinding, ClaimTarget, EndpointBinding, Header, MainnetSorobanIntentAuthorization,
-    MainnetTxSignAuthorization, PolicyBinding, SignerBinding, SorobanIntentInner, TxSignInner,
+    ApprovalBinding, AuthorityBinding, ClaimTarget, EndpointBinding, Header,
+    MainnetSorobanIntentAuthorization, MainnetTxSignAuthorization, PolicyBinding, SignerBinding,
+    SorobanIntentInner, TxSignInner,
 };
 use super::clock::{TestClockGuard, set_now_ms_for_test};
 use super::digest::{BindingFacts, approval_subject_classic};
@@ -141,8 +142,7 @@ pub(crate) fn mint_header(header: &mut Header, binding: &DomainBinding, holds: &
                 consumer: header.consumer,
                 policy_sequence: header.policy.sequence,
                 policy_digest: header.policy.digest,
-                approval_nonce: header.approval.nonce.clone(),
-                approval_expires_at_ms: header.approval.expires_at_ms,
+                authority: header.authority.mint_authority(),
                 chain_deadline_ms: None,
                 authorization_ttl_ms: TTL_MS,
                 bindings: BindingFacts {
@@ -152,7 +152,7 @@ pub(crate) fn mint_header(header: &mut Header, binding: &DomainBinding, holds: &
                     enablement: [4; 32],
                     witness: None,
                     reservation: None,
-                    approval: [5; 32],
+                    authority: [5; 32],
                     audit: [6; 32],
                 },
                 holds: holds.to_vec(),
@@ -198,10 +198,10 @@ pub(crate) fn header(
             digest: POLICY_DIGEST,
         },
         enablement_nonce_digest: [3; 32],
-        approval: ApprovalBinding {
+        authority: AuthorityBinding::Approval(ApprovalBinding {
             nonce: "fixture-approval".to_owned(),
             expires_at_ms: now + APPROVAL_WINDOW_MS,
-        },
+        }),
         reservation: None,
         witness_subject: None,
         submission_anchor: None,
@@ -260,7 +260,7 @@ pub(crate) fn soroban_authorization(
             enablement: [0; 32],
             witness: None,
             reservation: None,
-            approval: [0; 32],
+            authority: [0; 32],
             audit: [0; 32],
         },
         authorization_ttl_ms: TTL_MS,
@@ -506,8 +506,10 @@ impl LedgerFixture {
                     consumer: header.consumer,
                     policy_sequence: POLICY_SEQUENCE,
                     policy_digest: POLICY_DIGEST,
-                    approval_nonce: nonce.to_owned(),
-                    approval_expires_at_ms: header.approval.expires_at_ms,
+                    authority: crate::policy_state::MintAuthority::Approval {
+                        nonce: nonce.to_owned(),
+                        expires_at_ms: header.authority.expires_at_ms(),
+                    },
                     chain_deadline_ms: None,
                     authorization_ttl_ms: TTL_MS,
                     bindings: BindingFacts {
@@ -517,7 +519,7 @@ impl LedgerFixture {
                         enablement: [4; 32],
                         witness: None,
                         reservation: None,
-                        approval: [5; 32],
+                        authority: [5; 32],
                         audit: [6; 32],
                     },
                     holds: holds.to_vec(),
@@ -526,7 +528,9 @@ impl LedgerFixture {
             )
             .unwrap();
         header.id = minted.id;
-        header.approval.nonce = nonce.to_owned();
+        if let AuthorityBinding::Approval(approval) = &mut header.authority {
+            approval.nonce = nonce.to_owned();
+        }
         header.reservation = minted.reservation;
         header.issued_at_ms = minted.issued_at_ms;
         header.expires_at_ms = minted.expires_at_ms;
@@ -1307,7 +1311,7 @@ impl ResolverFixture {
         &'a self,
         intent: &'a super::resolve::SorobanIntent<'a>,
         message: &'a super::message::MessageFacts,
-        approval: &'a stellar_agent_core::approval::witness::ApprovalWitness,
+        authority: &'a super::authority::MainnetAuthority<'a>,
     ) -> super::resolve::MessageSignRequest<'a> {
         super::resolve::MessageSignRequest {
             context: &self.context,
@@ -1316,7 +1320,7 @@ impl ResolverFixture {
             message,
             policy: &self.policy,
             enablement: &self.enablement,
-            approval,
+            authority,
             audit: self.audit(),
             store: &self.window,
         }
@@ -1343,9 +1347,12 @@ impl ResolverFixture {
         approval: &stellar_agent_core::approval::witness::ApprovalWitness,
     ) -> super::message::MessageUseReceipt {
         let intent = x402_intent(root, MainnetConsumer::X402Authenticated);
-        let authorization =
-            super::resolve::resolve_message_sign(self.message_request(&intent, message, approval))
-                .unwrap();
+        let authorization = super::resolve::resolve_message_sign(self.message_request(
+            &intent,
+            message,
+            &super::authority::MainnetAuthority::Approval(approval),
+        ))
+        .unwrap();
         super::resolve::consume_message_sign(&self.context, authorization, &self.window).unwrap()
     }
 }

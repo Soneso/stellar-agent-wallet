@@ -18,12 +18,18 @@ use std::{collections::HashMap, sync::Arc};
 
 use rmcp::ErrorData;
 use serde_json::Value;
+use stellar_agent_core::error::{WalletError, WalletStateError};
+use stellar_agent_core::mainnet::decision::{
+    EvaluationScope, MainnetDecision, MainnetEvaluationRequest, MainnetRefusal, evaluate_mainnet,
+};
 use stellar_agent_core::observability::redact_strkey_first5_last5 as redact_account_id_value;
 use stellar_agent_core::policy::{
     ApprovalRequest, BuildRegistryError, Decision, DenyReason, McpToolRegistration, ToolDescriptor,
+    policy_now_ms,
 };
 use stellar_agent_core::profile::caip2::validate_chain_id_matches_profile;
 use stellar_agent_core::profile::schema::Profile;
+use stellar_agent_core::wallet::WalletLifecycleError;
 use stellar_agent_nonce::{
     Nonce, NonceError, NonceMint, NonceVerifyHmacOnlyRequest, ReplayWindow, ToolCatalogue,
 };
@@ -91,12 +97,35 @@ impl DispatchOutcome {
                     .with_reason("mainnet confirmation".to_owned()),
                 governing_ttl_ms: ttl_ms,
                 value_effects: allowed.value_effects,
+                now_ms: allowed.now_ms,
+                decision: allowed.decision,
             },
             Self::RequireApproval(approval) => approval,
         };
         approval.governing_ttl_ms = ttl_ms;
         approval.request.ttl_seconds = ttl_seconds;
         Ok(Self::RequireApproval(approval))
+    }
+
+    /// The instant the evaluation that produced this outcome read; `None`
+    /// for an outcome no evaluation produced.
+    fn now_ms(&self) -> Option<u64> {
+        match self {
+            Self::Allow(allowed) => allowed.now_ms,
+            Self::RequireApproval(approval) => approval.now_ms,
+        }
+    }
+
+    /// Lowers the governing lifetime of the carried mainnet decision to at
+    /// most `ttl_ms`.
+    fn bound_governing_ttl(&mut self, ttl_ms: u64) {
+        let decision = match self {
+            Self::Allow(allowed) => allowed.decision.as_mut(),
+            Self::RequireApproval(approval) => approval.decision.as_mut(),
+        };
+        if let Some(decision) = decision {
+            decision.bound_governing_ttl(ttl_ms);
+        }
     }
 
     /// The policy decision retained by submission audit rows.
@@ -111,18 +140,28 @@ impl DispatchOutcome {
 }
 
 /// Effects and governing lifetime captured from one allowed evaluation.
+///
+/// `now_ms` is the instant the evaluation read and `decision` the
+/// provenance-bearing decision of a mainnet evaluation; `decision` is `None`
+/// off mainnet and on a server without a verified mainnet policy.
 #[derive(Debug)]
 pub(crate) struct AllowOutcome {
     pub value_effects: Option<stellar_agent_core::policy::v1::ValueEffects>,
     pub governing_ttl_ms: u64,
+    pub now_ms: Option<u64>,
+    pub decision: Option<MainnetDecision>,
 }
 
-/// An approval request together with the effects its policy criteria sized.
+/// An approval request together with the effects its policy criteria sized,
+/// the instant the evaluation read and, for a mainnet evaluation, the
+/// provenance-bearing decision.
 #[derive(Debug)]
 pub(crate) struct ApprovalOutcome {
     pub request: ApprovalRequest,
     pub governing_ttl_ms: u64,
     pub value_effects: Option<stellar_agent_core::policy::v1::ValueEffects>,
+    pub now_ms: Option<u64>,
+    pub decision: Option<MainnetDecision>,
 }
 
 impl From<ApprovalRequest> for ApprovalOutcome {
@@ -133,8 +172,62 @@ impl From<ApprovalRequest> for ApprovalOutcome {
             governing_ttl_ms: u64::from(request.ttl_seconds) * 1_000,
             request,
             value_effects: None,
+            now_ms: None,
+            decision: None,
         }
     }
+}
+
+/// One gate evaluation: the decision, the effects its criteria sized, its
+/// governing lifetime and, for a mainnet evaluation, the provenance-bearing
+/// decision.
+#[derive(Debug)]
+pub(crate) struct GateEvaluation {
+    pub(crate) decision: Decision,
+    pub(crate) value_effects: Option<stellar_agent_core::policy::v1::ValueEffects>,
+    pub(crate) governing_ttl_ms: u64,
+    pub(crate) mainnet: Option<MainnetDecision>,
+}
+
+impl GateEvaluation {
+    /// The gate evaluation of an engine evaluation off mainnet.
+    fn engine(evaluation: stellar_agent_core::policy::Evaluation) -> Self {
+        Self {
+            governing_ttl_ms: stellar_agent_core::approval::governing_ttl_ms(&evaluation),
+            decision: evaluation.decision,
+            value_effects: evaluation.value_effects,
+            mainnet: None,
+        }
+    }
+
+    /// The gate evaluation of a mainnet decision; the effects move out of
+    /// the decision into the evaluation.
+    fn mainnet(mut decision: MainnetDecision) -> Self {
+        Self {
+            decision: decision.decision().clone(),
+            value_effects: decision.take_value_effects(),
+            governing_ttl_ms: decision.governing_ttl_ms(),
+            mainnet: Some(decision),
+        }
+    }
+
+    /// The gate evaluation of a mainnet denial.
+    fn denied(reason: DenyReason) -> Self {
+        Self {
+            decision: Decision::Deny(reason),
+            value_effects: None,
+            governing_ttl_ms: 0,
+            mainnet: None,
+        }
+    }
+}
+
+/// The refusal of a policy evaluation whose instant cannot be read:
+/// `wallet.clock_error`, rendered as the network clock renders.
+fn policy_clock_refusal(error: &WalletLifecycleError) -> ToolError {
+    ToolError::Business(ledger_err_result(&WalletError::WalletState(
+        WalletStateError::clock_error(error),
+    )))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -540,6 +633,7 @@ impl stellar_agent_core::policy::PolicyEngine for AllowAllPolicyEngine {
         _counterparty_cache: Option<&dyn stellar_agent_core::policy::v1::CounterpartyCacheView>,
         _sep10_sessions: Option<&dyn stellar_agent_core::policy::v1::Sep10SessionView>,
         _sep45_sessions: Option<&dyn stellar_agent_core::policy::v1::Sep45SessionView>,
+        _now_ms: u64,
     ) -> Result<stellar_agent_core::policy::Decision, stellar_agent_core::policy::PolicyError> {
         Ok(stellar_agent_core::policy::Decision::Allow)
     }
@@ -1350,8 +1444,17 @@ impl WalletServer {
         args_value: &Value,
         chain_id: &str,
     ) -> Result<DispatchOutcome, ToolError> {
-        self.dispatch_gate_inner(tool_name, args_value, chain_id, None, None, None, false)
-            .await
+        self.dispatch_gate_inner(
+            tool_name,
+            args_value,
+            chain_id,
+            None,
+            None,
+            None,
+            EvaluationScope::Classic,
+            false,
+        )
+        .await
     }
 
     /// Variant of [`Self::dispatch_gate`] that injects account-derived policy
@@ -1379,6 +1482,7 @@ impl WalletServer {
             None,
             account_view,
             identity_view,
+            EvaluationScope::Classic,
             false,
         )
         .await
@@ -1415,6 +1519,7 @@ impl WalletServer {
             Some(value),
             account_view,
             identity_view,
+            EvaluationScope::Classic,
             false,
         )
         .await
@@ -1535,11 +1640,16 @@ impl WalletServer {
     ///
     /// The gate runs the same evaluation after its refresh, and a simulate step
     /// calls this for its paired commit tool. Every verdict, `Deny` included,
-    /// returns to the caller for inspection.
+    /// returns to the caller for inspection. The evaluation reads `now_ms`
+    /// and covers the classic scope.
     ///
     /// # Errors
     ///
     /// Returns [`ToolError`] for a descriptor, chain, or engine failure.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the gate's evaluation inputs plus the instant the caller sampled"
+    )]
     pub(crate) async fn evaluate_policy_only(
         &self,
         tool_name: &'static str,
@@ -1548,18 +1658,53 @@ impl WalletServer {
         value: Option<stellar_agent_core::policy::v1::ValueClass>,
         account_view: Option<&dyn stellar_agent_core::policy::v1::AccountReservesView>,
         identity_view: Option<&dyn stellar_agent_core::policy::v1::AccountIdentityView>,
-    ) -> Result<stellar_agent_core::policy::Evaluation, ToolError> {
+        now_ms: u64,
+    ) -> Result<GateEvaluation, ToolError> {
         let descriptor = self.checked_policy_descriptor(tool_name, args_value, chain_id)?;
-        self.evaluate_with_descriptor(&descriptor, args_value, value, account_view, identity_view)
-            .await
+        self.evaluate_with_descriptor(
+            &descriptor,
+            args_value,
+            value,
+            account_view,
+            identity_view,
+            EvaluationScope::Classic,
+            now_ms,
+        )
+        .await
+    }
+
+    /// The verified mainnet policy a gate evaluates under: the server holds
+    /// a mainnet context, dispatches on that context's chain, and holds a
+    /// verified mainnet policy. `None` otherwise, so every other evaluation
+    /// runs through the server's engine. The descriptor binds to the mainnet
+    /// context's profile, so it names that context's chain.
+    fn mainnet_evaluation_policy(
+        &self,
+    ) -> Option<&stellar_agent_core::mainnet::verified_policy::VerifiedPolicy> {
+        if self.context.chain_id != self.mainnet_context.as_ref()?.chain() {
+            return None;
+        }
+        self.verified_policy
+            .as_deref()
+            .filter(|policy| policy.mainnet().is_some())
     }
 
     /// Evaluates policy for a descriptor that [`Self::checked_policy_descriptor`]
     /// returned, so a gate dispatch checks its inputs once.
     ///
+    /// Every criterion reads `now_ms`. A server dispatching on its mainnet
+    /// context's chain under a verified mainnet policy evaluates through
+    /// [`evaluate_mainnet`] for `scope`, and the result carries the
+    /// provenance-bearing decision; every other server evaluates through its
+    /// engine.
+    ///
     /// # Errors
     ///
     /// Returns `policy.engine_required` when the engine fails to evaluate.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the gate's evaluation inputs plus the scope and the sampled instant"
+    )]
     async fn evaluate_with_descriptor(
         &self,
         descriptor: &ToolDescriptor,
@@ -1567,7 +1712,9 @@ impl WalletServer {
         value: Option<stellar_agent_core::policy::v1::ValueClass>,
         account_view: Option<&dyn stellar_agent_core::policy::v1::AccountReservesView>,
         identity_view: Option<&dyn stellar_agent_core::policy::v1::AccountIdentityView>,
-    ) -> Result<stellar_agent_core::policy::Evaluation, ToolError> {
+        scope: EvaluationScope,
+        now_ms: u64,
+    ) -> Result<GateEvaluation, ToolError> {
         let counterparty_cache =
             match stellar_agent_network::CounterpartyCacheSnapshot::from_resolver(
                 &*self.counterparty_resolver,
@@ -1593,6 +1740,40 @@ impl WalletServer {
         let counterparty_view = counterparty_cache
             .as_ref()
             .map(|snapshot| snapshot as &dyn stellar_agent_core::policy::v1::CounterpartyCacheView);
+        // Engine error → fail closed as `policy.engine_required` (fires for
+        // `Noop` and for `V1` engine errors such as a missing policy document).
+        let engine_required = |err: stellar_agent_core::policy::PolicyError| {
+            ToolError::Business(business_error_result(
+                "policy.engine_required",
+                format!("policy engine evaluation failed: {err}"),
+            ))
+        };
+        if let Some(policy) = self.mainnet_evaluation_policy() {
+            // The verified policy's engine is the server's engine, so the
+            // window state the gate refreshed is the state it evaluates.
+            return match evaluate_mainnet(
+                policy,
+                scope,
+                now_ms,
+                MainnetEvaluationRequest {
+                    chain_id: &descriptor.chain_id,
+                    tool: descriptor,
+                    args: args_value,
+                    profile: self.security_profile(),
+                    value,
+                    account_view,
+                    identity_view,
+                    counterparty_cache: counterparty_view,
+                    sep10_sessions: None,
+                    sep45_sessions: None,
+                },
+            ) {
+                Ok(decision) => Ok(GateEvaluation::mainnet(decision)),
+                Err(MainnetRefusal::Denied { reason, .. }) => Ok(GateEvaluation::denied(reason)),
+                Err(MainnetRefusal::Engine(err)) => Err(engine_required(err)),
+                Err(MainnetRefusal::Clock(error)) => Err(policy_clock_refusal(&error)),
+            };
+        }
         // The `_full` evaluation additionally surfaces the value descriptor the
         // gate sized on the allow path, threaded into `DispatchOutcome::Allow` so
         // the value-verb handlers record exactly what the gate evaluated.
@@ -1607,6 +1788,7 @@ impl WalletServer {
                 counterparty_view,
                 None,
                 None,
+                now_ms,
             ),
             None => self.policy_engine.evaluate_full(
                 descriptor,
@@ -1617,21 +1799,12 @@ impl WalletServer {
                 counterparty_view,
                 None,
                 None, // sep45_sessions: wired at dispatch site when sep45_session_active criterion active
+                now_ms,
             ),
         };
-        let evaluation = match evaluation {
-            Ok(evaluation) => evaluation,
-            Err(err) => {
-                // Engine error → fail closed as `policy.engine_required`
-                // (fires for `Noop` and for `V1` engine errors such as a
-                // missing policy document).
-                return Err(ToolError::Business(business_error_result(
-                    "policy.engine_required",
-                    format!("policy engine evaluation failed: {err}"),
-                )));
-            }
-        };
-        Ok(evaluation)
+        evaluation
+            .map(GateEvaluation::engine)
+            .map_err(engine_required)
     }
 
     /// Evaluates the paired commit before an admitted preparation persists approval.
@@ -1671,6 +1844,10 @@ impl WalletServer {
             }
         };
         commit_args["chain_id"] = Value::String(chain_id.to_owned());
+        let now_ms = match outcome.now_ms() {
+            Some(now_ms) => now_ms,
+            None => policy_now_ms().map_err(|error| policy_clock_refusal(&error))?,
+        };
         let evaluation = match self
             .evaluate_policy_only(
                 commit_tool,
@@ -1679,6 +1856,7 @@ impl WalletServer {
                 None,
                 account_view,
                 identity_view,
+                now_ms,
             )
             .await
         {
@@ -1693,14 +1871,18 @@ impl WalletServer {
                 Ok(outcome)
             };
         }
-        let paired_ttl_ms = stellar_agent_core::approval::governing_ttl_ms(&evaluation);
+        let paired_ttl_ms = evaluation.governing_ttl_ms;
         let ttl_ms = outcome.governing_ttl_ms().min(paired_ttl_ms);
-        let paired = match evaluation.decision {
+        // The governing decision is the commit's when it requires approval,
+        // and the initial one otherwise; it governs for the shorter lifetime.
+        let mut paired = match evaluation.decision {
             Decision::RequireApproval(request) => {
                 DispatchOutcome::RequireApproval(ApprovalOutcome {
                     request,
                     value_effects: evaluation.value_effects,
                     governing_ttl_ms: paired_ttl_ms,
+                    now_ms: Some(now_ms),
+                    decision: evaluation.mainnet,
                 })
             }
             Decision::Allow => outcome,
@@ -1711,6 +1893,7 @@ impl WalletServer {
                 )));
             }
         };
+        paired.bound_governing_ttl(ttl_ms);
         if mainnet {
             paired.require_mainnet_confirmation(ttl_ms)
         } else {
@@ -1731,7 +1914,8 @@ impl WalletServer {
         }
     }
 
-    /// Refreshes verified local state without reconciling through RPC.
+    /// Refreshes verified local state without reconciling through RPC and
+    /// evaluates `tool` for `scope`.
     #[cfg(feature = "mainnet-write")]
     pub(crate) async fn dispatch_preparation(
         &self,
@@ -1739,17 +1923,23 @@ impl WalletServer {
         args: &Value,
         chain: &str,
         value: stellar_agent_core::policy::v1::ValueClass,
+        scope: EvaluationScope,
     ) -> Result<DispatchOutcome, ToolError> {
-        self.dispatch_gate_inner(tool, args, chain, Some(value), None, None, true)
+        self.dispatch_gate_inner(tool, args, chain, Some(value), None, None, scope, true)
             .await
     }
 
     /// Shared gate core. `value` is `Some` for the value-carrying path
     /// ([`Self::dispatch_gate_with_value`]) and `None` for the args-derived path
-    /// ([`Self::dispatch_gate`] / [`Self::dispatch_gate_with_views`]).
+    /// ([`Self::dispatch_gate`] / [`Self::dispatch_gate_with_views`]). `scope`
+    /// is the scope a mainnet evaluation covers.
+    ///
+    /// The evaluation reads one instant, sampled through [`policy_now_ms`]
+    /// right before it; a clock that cannot be read refuses with
+    /// `wallet.clock_error`.
     #[allow(
         clippy::too_many_arguments,
-        reason = "dispatch carries independent checked views and preparation mode"
+        reason = "dispatch carries independent checked views, the scope and preparation mode"
     )]
     async fn dispatch_gate_inner(
         &self,
@@ -1759,6 +1949,7 @@ impl WalletServer {
         value: Option<stellar_agent_core::policy::v1::ValueClass>,
         account_view: Option<&dyn stellar_agent_core::policy::v1::AccountReservesView>,
         identity_view: Option<&dyn stellar_agent_core::policy::v1::AccountIdentityView>,
+        scope: EvaluationScope,
         preparation: bool,
     ) -> Result<DispatchOutcome, ToolError> {
         let descriptor = self.checked_policy_descriptor(tool_name, args_value, chain_id)?;
@@ -1839,15 +2030,29 @@ impl WalletServer {
             }
         }
 
-        let evaluation = self
-            .evaluate_with_descriptor(&descriptor, args_value, value, account_view, identity_view)
+        let now_ms = policy_now_ms().map_err(|error| policy_clock_refusal(&error))?;
+        let GateEvaluation {
+            decision,
+            value_effects,
+            governing_ttl_ms,
+            mainnet,
+        } = self
+            .evaluate_with_descriptor(
+                &descriptor,
+                args_value,
+                value,
+                account_view,
+                identity_view,
+                scope,
+                now_ms,
+            )
             .await?;
-        let governing_ttl_ms = stellar_agent_core::approval::governing_ttl_ms(&evaluation);
-        let value_effects = evaluation.value_effects;
-        let outcome = match evaluation.decision {
+        let outcome = match decision {
             Decision::Allow => DispatchOutcome::Allow(AllowOutcome {
                 value_effects,
                 governing_ttl_ms,
+                now_ms: Some(now_ms),
+                decision: mainnet,
             }),
 
             Decision::Deny(reason) => {
@@ -1871,6 +2076,8 @@ impl WalletServer {
                     request: req,
                     governing_ttl_ms,
                     value_effects,
+                    now_ms: Some(now_ms),
+                    decision: mainnet,
                 })
             }
 
@@ -2566,6 +2773,7 @@ mod signed_intent_observation_tests {
             _: Option<&dyn stellar_agent_core::policy::v1::CounterpartyCacheView>,
             _: Option<&dyn stellar_agent_core::policy::v1::Sep10SessionView>,
             _: Option<&dyn stellar_agent_core::policy::v1::Sep45SessionView>,
+            _now_ms: u64,
         ) -> Result<Decision, PolicyError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Ok(Decision::Allow)
@@ -2775,6 +2983,7 @@ mod signed_intent_observation_tests {
                     None,
                     None,
                     None,
+                    EvaluationScope::Classic,
                     case == "preparation",
                 )
                 .await;
@@ -3061,6 +3270,7 @@ pub(crate) mod tests {
             _counterparty_cache: Option<&dyn CounterpartyCacheView>,
             _sep10_sessions: Option<&dyn Sep10SessionView>,
             _sep45_sessions: Option<&dyn Sep45SessionView>,
+            _now_ms: u64,
         ) -> Result<Decision, PolicyError> {
             self.result.clone()
         }
@@ -3081,6 +3291,7 @@ pub(crate) mod tests {
             counterparty_cache: Option<&dyn CounterpartyCacheView>,
             _sep10_sessions: Option<&dyn Sep10SessionView>,
             _sep45_sessions: Option<&dyn Sep45SessionView>,
+            _now_ms: u64,
         ) -> Result<Decision, PolicyError> {
             if counterparty_cache
                 .map(|cache| cache.has_resolved("circle.com"))
@@ -3164,6 +3375,7 @@ pub(crate) mod tests {
             counterparty_cache: Option<&dyn CounterpartyCacheView>,
             sep10_sessions: Option<&dyn Sep10SessionView>,
             sep45_sessions: Option<&dyn Sep45SessionView>,
+            now_ms: u64,
         ) -> Result<Decision, PolicyError> {
             self.evaluations.fetch_add(1, Ordering::SeqCst);
             self.inner.evaluate(
@@ -3175,6 +3387,7 @@ pub(crate) mod tests {
                 counterparty_cache,
                 sep10_sessions,
                 sep45_sessions,
+                now_ms,
             )
         }
     }
@@ -3308,6 +3521,62 @@ pub(crate) mod tests {
                 }))
             ),
             "{supplied:?}"
+        );
+    }
+
+    /// A gate whose evaluation instant cannot be read refuses with
+    /// `wallet.clock_error` on each dispatch path, although the same calls
+    /// allow under a readable clock and no criterion reads time; an allowed
+    /// testnet outcome carries its instant and no mainnet decision.
+    #[tokio::test]
+    #[serial_test::serial(keyring)]
+    async fn off_mainnet_clock_failure_renders_wallet_clock_error() {
+        use stellar_agent_core::policy::v1::value::derive_value_class;
+        let home = tempfile::tempdir().expect("isolated home");
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
+        stellar_agent_test_support::keyring_mock::install().expect("mock keyring");
+        let server = make_server_with_engine(chain_engine("stellar:testnet", None));
+        let args = serde_json::json!({
+            "amount_stroops": "50", "asset": "native", "destination": "recipient"
+        });
+        let broken =
+            stellar_agent_core::policy::v1::criteria::state_store::set_policy_clock_error_for_test(
+            );
+        let derived = server
+            .dispatch_gate("stellar_pay", &args, "stellar:testnet")
+            .await;
+        let supplied = server
+            .dispatch_gate_with_value(
+                "stellar_x402_create_payment",
+                &args,
+                "stellar:testnet",
+                derive_value_class("stellar_pay", &args),
+                None,
+                None,
+            )
+            .await;
+        drop(broken);
+        for refused in [derived, supplied] {
+            let Err(ToolError::Business(refusal)) = refused else {
+                panic!("a clock failure must refuse: {refused:?}");
+            };
+            let (code, message, _) = assert_business_envelope(&refusal);
+            assert_eq!(code, "wallet.clock_error");
+            assert!(message.starts_with("system clock error: "), "{message}");
+        }
+        let allowed = server
+            .dispatch_gate("stellar_pay", &args, "stellar:testnet")
+            .await;
+        assert!(
+            matches!(
+                allowed,
+                Ok(DispatchOutcome::Allow(AllowOutcome {
+                    now_ms: Some(_),
+                    decision: None,
+                    ..
+                }))
+            ),
+            "{allowed:?}"
         );
     }
 
@@ -3864,6 +4133,8 @@ pub(crate) mod tests {
                 DispatchOutcome::Allow(AllowOutcome {
                     value_effects: None,
                     governing_ttl_ms: 600_000,
+                    now_ms: None,
+                    decision: None,
                 }),
                 envelope.envelope_xdr(),
                 "stellar_pay_commit",
@@ -3884,6 +4155,8 @@ pub(crate) mod tests {
                 DispatchOutcome::Allow(AllowOutcome {
                     value_effects: None,
                     governing_ttl_ms: 600_000,
+                    now_ms: None,
+                    decision: None,
                 }),
                 "not-an-envelope",
                 "stellar_pay_commit",
@@ -3897,7 +4170,9 @@ pub(crate) mod tests {
                 undecodable,
                 Ok(DispatchOutcome::Allow(AllowOutcome {
                     value_effects: None,
-                    governing_ttl_ms: 600_000
+                    governing_ttl_ms: 600_000,
+                    now_ms: None,
+                    decision: None,
                 }))
             ),
             "an undecodable envelope leaves the outcome unchanged, got {undecodable:?}"
@@ -5064,7 +5339,9 @@ pub(crate) mod tests {
                 &server,
                 &DispatchOutcome::Allow(AllowOutcome {
                     value_effects: None,
-                    governing_ttl_ms: 600_000
+                    governing_ttl_ms: 600_000,
+                    now_ms: None,
+                    decision: None,
                 }),
                 GatedApprovalKind::Trustline,
                 "AAAA",
@@ -5917,6 +6194,8 @@ pub(crate) mod tests {
                         DispatchOutcome::Allow(AllowOutcome {
                             value_effects: None,
                             governing_ttl_ms: 600_000,
+                            now_ms: None,
+                            decision: None,
                         }),
                     )
                     .unwrap();
@@ -5986,6 +6265,7 @@ pub(crate) mod tests {
                     outcome.governing_ttl_ms(),
                     u64::from(prepare.unwrap_or(600)) * 1000
                 );
+                let initial_now = outcome.now_ms().expect("the gate's instant");
                 let paired = server
                     .paired_commit_outcome(
                         outcome,
@@ -6011,6 +6291,24 @@ pub(crate) mod tests {
                     approval.value_effects.is_some(),
                     "the payment's effects stay"
                 );
+                // The carried decision is the commit's when the commit rule
+                // requires approval, else the preparation's, and it governs
+                // for the shorter lifetime from the gate's instant.
+                let decision = approval
+                    .decision
+                    .as_ref()
+                    .expect("the mainnet decision is carried");
+                assert_eq!(decision.governing_ttl_ms(), expected * 1000);
+                assert_eq!(decision.rule_index(), u32::from(commit.is_some()));
+                let policy = server.verified_policy.as_deref().unwrap();
+                assert_eq!(decision.policy_digest(), policy.digest());
+                assert_eq!(decision.policy_sequence(), policy.sequence());
+                assert_eq!(
+                    decision.scope(),
+                    &stellar_agent_core::mainnet::decision::AuthorityScope::Classic
+                );
+                assert_eq!(approval.now_ms, Some(initial_now));
+                assert_eq!(decision.evaluated_at_ms(), initial_now);
             }
         }
 
@@ -6130,6 +6428,50 @@ pub(crate) mod tests {
                     .join("operator.toml")
                     .exists()
             );
+        }
+
+        /// A mainnet gate whose evaluation instant cannot be read refuses
+        /// with `wallet.clock_error`. Under a readable clock the same
+        /// dispatch carries the provenance-bearing decision of the verified
+        /// policy, evaluated at the outcome's instant for the classic scope.
+        #[tokio::test]
+        #[serial_test::serial(keyring)]
+        async fn mainnet_gate_clock_failure_renders_wallet_clock_error() {
+            let f = Fixture::new(|raw| raw);
+            let broken = stellar_agent_core::policy::v1::criteria::state_store::set_policy_clock_error_for_test();
+            let refused = f
+                .server
+                .dispatch_gate("stellar_pay_commit", &f.args(), "stellar:mainnet")
+                .await;
+            drop(broken);
+            let Err(ToolError::Business(refusal)) = refused else {
+                panic!("a clock failure must refuse: {refused:?}");
+            };
+            let (code, message, _) = assert_business_envelope(&refusal);
+            assert_eq!(code, "wallet.clock_error");
+            assert!(message.starts_with("system clock error: "), "{message}");
+            let outcome = f
+                .server
+                .dispatch_gate("stellar_pay_commit", &f.args(), "stellar:mainnet")
+                .await
+                .unwrap();
+            let (now_ms, decision) = match &outcome {
+                DispatchOutcome::Allow(allowed) => (allowed.now_ms, allowed.decision.as_ref()),
+                DispatchOutcome::RequireApproval(approval) => {
+                    (approval.now_ms, approval.decision.as_ref())
+                }
+            };
+            let decision = decision.expect("a mainnet evaluation carries its decision");
+            assert_eq!(Some(decision.evaluated_at_ms()), now_ms);
+            assert_eq!(
+                decision.policy_digest(),
+                f.server.verified_policy.as_ref().unwrap().digest()
+            );
+            assert_eq!(
+                decision.scope(),
+                &stellar_agent_core::mainnet::decision::AuthorityScope::Classic
+            );
+            assert_eq!(decision.governing_ttl_ms(), outcome.governing_ttl_ms());
         }
 
         #[tokio::test]
@@ -9406,6 +9748,7 @@ pub(crate) mod tests {
                             &requirements,
                             10,
                         )),
+                        stellar_agent_core::mainnet::decision::EvaluationScope::Classic,
                     )
                     .await
                     .unwrap();
@@ -9491,7 +9834,10 @@ pub(crate) mod tests {
                     signer: &self.signer,
                     policy: self.guard.policy,
                     enablement: self.guard.enablement,
-                    approval: &self.approval,
+                    authority:
+                        &stellar_agent_network::mainnet::authority::MainnetAuthority::Approval(
+                            &self.approval,
+                        ),
                     audit: self.audit(),
                     store: &self.store,
                     authenticated: None,
@@ -9836,7 +10182,9 @@ pub(crate) mod tests {
                     approved.guard.context,
                     approved.guard.policy,
                     approved.guard.enablement,
-                    &approved.approval,
+                    &stellar_agent_network::mainnet::authority::MainnetAuthority::Approval(
+                        &approved.approval,
+                    ),
                     &approved.signer,
                     &approved.handle,
                     approved.audit(),
@@ -10170,7 +10518,9 @@ pub(crate) mod tests {
                 signer: &signer,
                 policy: guard.policy,
                 enablement: guard.enablement,
-                approval: &approval,
+                authority: &stellar_agent_network::mainnet::authority::MainnetAuthority::Approval(
+                    &approval,
+                ),
                 audit,
                 store: &store,
             })
