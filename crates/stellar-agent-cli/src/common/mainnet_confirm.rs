@@ -34,6 +34,7 @@ use stellar_agent_core::{
 use stellar_agent_network::{
     MainnetWriteContext,
     mainnet::{MainnetConsumer, resolve::classic_consumer_tools},
+    operational::OperationalReport,
 };
 use stellar_xdr::{ReadXdr as _, TransactionEnvelope};
 
@@ -65,6 +66,10 @@ pub(crate) struct MainnetWriteSummary {
     fee: u32,
     fee_cap: u32,
     memo: String,
+    /// The endpoint's latest ledger as the operational check observed it.
+    /// The summary shows it; the pending entry, the digest and the
+    /// attestation do not include it.
+    ledger: Option<OperationalReport>,
 }
 
 /// `approval.wrong_kind`: the consumer has no approval kind this
@@ -159,7 +164,15 @@ impl MainnetWriteSummary {
             fee: tx.tx.fee,
             fee_cap,
             memo,
+            ledger: None,
         })
+    }
+
+    /// The summary with the ledger the endpoint's operational check
+    /// observed, which the rendered summary names after the fee lines.
+    pub(crate) fn with_ledger(mut self, report: OperationalReport) -> Self {
+        self.ledger = Some(report);
+        self
     }
 
     fn render(
@@ -206,9 +219,17 @@ impl MainnetWriteSummary {
         writeln!(output, "Memo: {}", esc(&self.memo))?;
         writeln!(
             output,
-            "Fee: {} stroops\nFee cap: {} stroops per operation\n{CONSENT_LINE}",
+            "Fee: {} stroops\nFee cap: {} stroops per operation",
             self.fee, self.fee_cap
-        )
+        )?;
+        if let Some(ledger) = &self.ledger {
+            writeln!(
+                output,
+                "Ledger {}, closed {} s ago",
+                ledger.latest_ledger, ledger.close_lag_seconds
+            )?;
+        }
+        writeln!(output, "{CONSENT_LINE}")
     }
     fn string(&self, key: &str) -> String {
         self.args[key].as_str().unwrap_or("").to_owned()
@@ -672,6 +693,37 @@ mod tests {
             assert!(output.ends_with(&format!("{CONSENT_LINE}\n")), "{output}");
             assert!(!output.contains("Type the profile name"), "{output}");
         }
+    }
+
+    /// The ledger the operational check observed renders as one line after
+    /// the fee lines and before the consent line; a summary without it
+    /// renders no ledger line.
+    #[test]
+    #[cfg(feature = "mainnet-write")]
+    #[serial_test::serial]
+    fn summary_names_the_ledger_after_the_fee_lines() {
+        let (_dir, context, envelope) = confirmation_fixture("confirm-ledger");
+        let render = |summary: &MainnetWriteSummary| {
+            let mut output = Vec::new();
+            summary.render(&context, &mut output).unwrap();
+            String::from_utf8(output).unwrap()
+        };
+        let plain =
+            MainnetWriteSummary::from_envelope(&envelope, MainnetConsumer::CliPay, 500).unwrap();
+        assert!(!render(&plain).contains("Ledger "), "{}", render(&plain));
+
+        let summary = plain.with_ledger(OperationalReport {
+            latest_ledger: 2000,
+            close_time_unix: 1_800_000_000,
+            close_lag_seconds: 4,
+        });
+        let output = render(&summary);
+        assert!(
+            output.ends_with(&format!(
+                "Fee cap: 500 stroops per operation\nLedger 2000, closed 4 s ago\n{CONSENT_LINE}\n"
+            )),
+            "{output}"
+        );
     }
 
     /// A trustline envelope with `asset_code` and a text memo of `memo`

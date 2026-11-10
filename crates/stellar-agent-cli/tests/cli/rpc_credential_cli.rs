@@ -102,14 +102,9 @@ impl Respond for Rpc {
             "getTransaction" => json!({
                 "status": "NOT_FOUND", "latestLedger": 2000, "oldestLedger": 1
             }),
-            "getHealth" => json!({
-                "status": "healthy", "latestLedger": 2000, "oldestLedger": 1,
-                "ledgerRetentionWindow": 1999
-            }),
-            "getLedgers" => json!({
-                "latestLedger": 2000, "oldestLedger": 1, "latestLedgerCloseTime": "100",
-                "oldestLedgerCloseTime": 1, "cursor": "2000", "ledgers": []
-            }),
+            readiness @ ("getHealth" | "getLedgers") => {
+                crate::classic_ledger::readiness_result(readiness).unwrap()
+            }
             other => panic!("unexpected RPC method {other}"),
         };
         ResponseTemplate::new(200)

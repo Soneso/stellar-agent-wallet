@@ -2,6 +2,9 @@
 //! send, and the confirmation for the ledger entries it holds, quotes one
 //! inclusion fee in every fee-statistics percentile, and counts the sends.
 //!
+//! It answers the readiness reads `getHealth` and `getLedgers` as a healthy
+//! endpoint whose latest ledger closed at the time of the request.
+//!
 //! Every server it starts shares its entries and its send counter, so a
 //! primary and an oracle served from one ledger read the same state and
 //! their sends add up. A method outside the classic verbs' set panics the
@@ -22,6 +25,33 @@ use stellar_agent_test_support::signed_envelope::{
 use stellar_agent_test_support::xdr_fixtures::{account_entry_xdr, account_ledger_key_xdr};
 use wiremock::matchers::method;
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
+
+/// The host clock in Unix seconds.
+pub fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+}
+
+/// The answer of a healthy, current endpoint to the readiness read
+/// `rpc_method`: `getHealth` reports latest ledger 2000, and `getLedgers`
+/// reports that ledger closed at the time of the request. `None` for any
+/// other method.
+pub fn readiness_result(rpc_method: &str) -> Option<Value> {
+    match rpc_method {
+        "getHealth" => Some(json!({
+            "status": "healthy", "latestLedger": 2000, "oldestLedger": 1,
+            "ledgerRetentionWindow": 1999
+        })),
+        "getLedgers" => Some(json!({
+            "latestLedger": 2000, "oldestLedger": 1,
+            "latestLedgerCloseTime": now_unix().to_string(),
+            "oldestLedgerCloseTime": 1, "cursor": "2000", "ledgers": []
+        })),
+        _ => None,
+    }
+}
 
 /// The native balance of every account the ledger funds: 10 000 XLM.
 pub const ACCOUNT_BALANCE: i64 = 100_000_000_000;
@@ -134,14 +164,7 @@ impl Respond for ClassicLedger {
                 "status": "SUCCESS", "txHash": body["params"]["hash"], "ledger": 1005,
                 "createdAt": "1700000005", "latestLedger": 1006, "oldestLedger": 1
             }),
-            "getHealth" => json!({
-                "status": "healthy", "latestLedger": 2000, "oldestLedger": 1,
-                "ledgerRetentionWindow": 1999
-            }),
-            "getLedgers" => json!({
-                "latestLedger": 2000, "oldestLedger": 1, "latestLedgerCloseTime": "100",
-                "oldestLedgerCloseTime": 1, "cursor": "2000", "ledgers": []
-            }),
+            readiness @ ("getHealth" | "getLedgers") => readiness_result(readiness).unwrap(),
             other => panic!("unexpected RPC method {other}"),
         };
         ResponseTemplate::new(200)

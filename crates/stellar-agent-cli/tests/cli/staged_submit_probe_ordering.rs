@@ -1,13 +1,18 @@
 //! Offline process tests: `pay --submit-only` and `claim --submit-only` refuse
 //! an endpoint serving another network before the staged policy gate and
-//! before the audit-key pre-flight.
+//! before the audit-key pre-flight. On testnet they check the endpoint's
+//! health and the close time of its latest ledger after the identity check
+//! and before the first account read, and refuse a stale endpoint there.
 //!
 //! Driven as subprocesses of the real `stellar-agent` binary so the printed
 //! error envelope is the one an operator sees. The CLI crate has no `[lib]`
 //! target, so an in-process test cannot read that envelope.
 //!
-//! The mock RPC server answers `getNetwork` with a third network and answers
-//! `getLedgerEntries` for both the source and the destination account. Those
+//! The mock RPC server answers `getNetwork` with a third network, or with
+//! testnet for the readiness tests, answers `getHealth` and `getLedgers` for a
+//! latest ledger that closed a set number of seconds before the request, and
+//! answers `getLedgerEntries` for both the source and the destination
+//! account. Those
 //! account bodies are what make the ordering assertions discriminate: with the
 //! probe placed after the policy gate, the gate's own account reads would
 //! succeed and be recorded, the run would continue to the audit pre-flight,
@@ -34,6 +39,7 @@ use std::path::Path;
 use std::process::Command;
 
 use serde_json::{Value, json};
+use stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE;
 use stellar_agent_test_support::signed_envelope::{SignedTestEnvelope, get_network_result};
 use stellar_agent_test_support::xdr_fixtures::{account_entry_xdr, account_ledger_key_xdr};
 use wiremock::matchers::{method, path};
@@ -53,9 +59,22 @@ const SOURCE_SEED: [u8; 32] = [61u8; 32];
 // Mock RPC
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Answers `getNetwork` with a foreign network and `getLedgerEntries` with the
-/// account entry whose key the request names.
+/// How many seconds before the request the latest ledger of a fresh mock
+/// endpoint closed.
+const FRESH_CLOSE_AGE_SECS: u64 = 3;
+
+/// How many seconds before the request the latest ledger of a stale mock
+/// endpoint closed, beyond the 60-second bound of the readiness check.
+const STALE_CLOSE_AGE_SECS: u64 = 120;
+
+/// Answers `getNetwork` with `network`, `getHealth` and `getLedgers` for a
+/// latest ledger that closed `close_age_secs` before the request, and
+/// `getLedgerEntries` with the account entry whose key the request names.
 struct StagedGateRpcResponder {
+    /// The passphrase `getNetwork` reports.
+    network: &'static str,
+    /// How many seconds before the request the latest ledger closed.
+    close_age_secs: u64,
     /// `(ledger key XDR, account entry XDR)` per answerable account.
     accounts: Vec<(String, String)>,
 }
@@ -70,7 +89,27 @@ impl Respond for StagedGateRpcResponder {
             .unwrap_or_default();
 
         let result = match rpc_method {
-            "getNetwork" => get_network_result(FUTURENET_PASSPHRASE),
+            "getNetwork" => get_network_result(self.network),
+            "getHealth" => json!({
+                "status": "healthy",
+                "latestLedger": 2000,
+                "oldestLedger": 1,
+                "ledgerRetentionWindow": 1999
+            }),
+            "getLedgers" => {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs();
+                json!({
+                    "latestLedger": 2000,
+                    "oldestLedger": 1,
+                    "latestLedgerCloseTime": (now - self.close_age_secs).to_string(),
+                    "oldestLedgerCloseTime": 1,
+                    "cursor": "2000",
+                    "ledgers": []
+                })
+            }
             "getLedgerEntries" => {
                 let raw = String::from_utf8_lossy(&request.body);
                 let entries: Vec<Value> = self
@@ -111,9 +150,20 @@ impl Respond for StagedGateRpcResponder {
     }
 }
 
-/// Starts a mock endpoint that can answer for the envelope's source and
-/// destination accounts.
+/// Starts a mock endpoint that reports a foreign network and can answer for
+/// the envelope's source and destination accounts.
 async fn start_mock(envelope: &SignedTestEnvelope) -> MockServer {
+    start_mock_on(envelope, FUTURENET_PASSPHRASE, FRESH_CLOSE_AGE_SECS).await
+}
+
+/// Starts a mock endpoint that reports `network`, whose latest ledger closed
+/// `close_age_secs` before each request, and that can answer for the
+/// envelope's source and destination accounts.
+async fn start_mock_on(
+    envelope: &SignedTestEnvelope,
+    network: &'static str,
+    close_age_secs: u64,
+) -> MockServer {
     let server = MockServer::start().await;
     let accounts = vec![
         (
@@ -127,7 +177,11 @@ async fn start_mock(envelope: &SignedTestEnvelope) -> MockServer {
     ];
     Mock::given(method("POST"))
         .and(path("/"))
-        .respond_with(StagedGateRpcResponder { accounts })
+        .respond_with(StagedGateRpcResponder {
+            network,
+            close_age_secs,
+            accounts,
+        })
         .mount(&server)
         .await;
     server
@@ -211,9 +265,112 @@ async fn assert_probe_refused_first(verb: &str, code: i32, envelope: &Value, ser
     );
 }
 
+/// The requests a testnet run makes before its first account read: the
+/// identity check, then the readiness check.
+const CHECKS: [&str; 3] = ["getNetwork", "getHealth", "getLedgers"];
+
+/// Asserts that the run checked the endpoint's identity and readiness, in
+/// that order, and then read an account.
+async fn assert_checks_precede_the_account_read(verb: &str, envelope: &Value, server: &MockServer) {
+    let methods = received_methods(server).await;
+    assert!(
+        methods.len() > CHECKS.len(),
+        "{verb} must read an account after the checks: {methods:?} {envelope}"
+    );
+    assert_eq!(
+        methods[..CHECKS.len()],
+        CHECKS,
+        "{verb} must check identity, then readiness: {methods:?} {envelope}"
+    );
+    assert_eq!(
+        methods[CHECKS.len()],
+        "getLedgerEntries",
+        "{verb} must read the account right after the checks: {methods:?} {envelope}"
+    );
+}
+
+/// Asserts that the run refused a stale endpoint with the readiness code
+/// before any account read.
+async fn assert_stale_refused_before_the_account_read(
+    verb: &str,
+    code: i32,
+    envelope: &Value,
+    server: &MockServer,
+) {
+    assert_eq!(code, 1, "{verb} must refuse: {envelope}");
+    assert_eq!(
+        envelope["error"]["code"].as_str(),
+        Some("network.endpoint_not_ready"),
+        "{verb} must refuse a stale endpoint with the readiness code: {envelope}"
+    );
+    assert_eq!(
+        received_methods(server).await,
+        CHECKS,
+        "{verb} must read no account from a stale endpoint"
+    );
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // pay
 // ─────────────────────────────────────────────────────────────────────────────
+
+/// The arguments of a testnet `pay --submit-only` run of `envelope` against
+/// `server` under the persisted profile `profile`.
+fn pay_submit_only_args<'a>(
+    envelope: &'a SignedTestEnvelope,
+    server_uri: &'a str,
+    profile: &'a str,
+) -> Vec<&'a str> {
+    vec![
+        "pay",
+        envelope.destination(),
+        "1 XLM",
+        "--source",
+        envelope.source(),
+        "--profile",
+        profile,
+        "--network",
+        "testnet",
+        "--rpc-url",
+        server_uri,
+        "--submit-only",
+        envelope.envelope_xdr(),
+        "--output",
+        "json",
+    ]
+}
+
+#[tokio::test]
+async fn pay_submit_only_checks_readiness_before_the_account_read() {
+    let envelope = SignedTestEnvelope::for_source(SOURCE_SEED);
+    let server = start_mock_on(&envelope, TESTNET_PASSPHRASE, FRESH_CLOSE_AGE_SECS).await;
+    let home = tempfile::tempdir().expect("temp home");
+    init_persisted_profile(home.path(), "ready-pay");
+    let uri = server.uri();
+
+    let (_, out) = run_cli(
+        home.path(),
+        &pay_submit_only_args(&envelope, &uri, "ready-pay"),
+    );
+
+    assert_checks_precede_the_account_read("pay", &out, &server).await;
+}
+
+#[tokio::test]
+async fn pay_submit_only_refuses_a_stale_endpoint_before_the_account_read() {
+    let envelope = SignedTestEnvelope::for_source(SOURCE_SEED);
+    let server = start_mock_on(&envelope, TESTNET_PASSPHRASE, STALE_CLOSE_AGE_SECS).await;
+    let home = tempfile::tempdir().expect("temp home");
+    init_persisted_profile(home.path(), "stale-pay");
+    let uri = server.uri();
+
+    let (code, out) = run_cli(
+        home.path(),
+        &pay_submit_only_args(&envelope, &uri, "stale-pay"),
+    );
+
+    assert_stale_refused_before_the_account_read("pay", code, &out, &server).await;
+}
 
 #[tokio::test]
 async fn pay_submit_only_probes_before_the_gate_on_the_zero_config_profile() {
@@ -366,4 +523,61 @@ async fn claim_submit_only_probes_before_the_audit_preflight_on_a_persisted_prof
          would mean the probe ran after the audit pre-flight: {out}"
     );
     assert_probe_refused_first("claim", code, &out, &server).await;
+}
+
+/// The arguments of a testnet `claim --submit-only` run of `envelope` against
+/// `server` under the persisted profile `profile`.
+fn claim_submit_only_args<'a>(
+    envelope: &'a SignedTestEnvelope,
+    server_uri: &'a str,
+    profile: &'a str,
+) -> Vec<&'a str> {
+    vec![
+        "claim",
+        BALANCE_ID,
+        "--source",
+        envelope.source(),
+        "--profile",
+        profile,
+        "--network",
+        "testnet",
+        "--rpc-url",
+        server_uri,
+        "--submit-only",
+        envelope.envelope_xdr(),
+        "--output",
+        "json",
+    ]
+}
+
+#[tokio::test]
+async fn claim_submit_only_checks_readiness_before_the_account_read() {
+    let envelope = claim_envelope();
+    let server = start_mock_on(&envelope, TESTNET_PASSPHRASE, FRESH_CLOSE_AGE_SECS).await;
+    let home = tempfile::tempdir().expect("temp home");
+    init_persisted_profile(home.path(), "ready-claim");
+    let uri = server.uri();
+
+    let (_, out) = run_cli(
+        home.path(),
+        &claim_submit_only_args(&envelope, &uri, "ready-claim"),
+    );
+
+    assert_checks_precede_the_account_read("claim", &out, &server).await;
+}
+
+#[tokio::test]
+async fn claim_submit_only_refuses_a_stale_endpoint_before_the_account_read() {
+    let envelope = claim_envelope();
+    let server = start_mock_on(&envelope, TESTNET_PASSPHRASE, STALE_CLOSE_AGE_SECS).await;
+    let home = tempfile::tempdir().expect("temp home");
+    init_persisted_profile(home.path(), "stale-claim");
+    let uri = server.uri();
+
+    let (code, out) = run_cli(
+        home.path(),
+        &claim_submit_only_args(&envelope, &uri, "stale-claim"),
+    );
+
+    assert_stale_refused_before_the_account_read("claim", code, &out, &server).await;
 }

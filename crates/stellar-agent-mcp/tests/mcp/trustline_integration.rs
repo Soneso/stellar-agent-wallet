@@ -169,7 +169,9 @@ impl Respond for TrustlineSubmitSuccessRpcResponder {
                 "ledger": 1005,
                 "txHash": crate::common::polled_tx_hash(request),
             }),
-            _ => serde_json::json!({}),
+            other => {
+                crate::common::operational_result(other).unwrap_or_else(|| serde_json::json!({}))
+            }
         };
 
         ResponseTemplate::new(200)
@@ -256,6 +258,7 @@ async fn trustline_commit_full_round_trip_succeeds_with_string_encoded_limit() {
         Some(&serde_json::json!("1000000000")),
         "preview must report limit_stroops as a decimal string: {sim_data}"
     );
+    crate::common::assert_operational_reported(sim_data);
 
     let nonce = sim_data
         .get("nonce")

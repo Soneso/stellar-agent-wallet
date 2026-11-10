@@ -148,7 +148,9 @@ impl Respond for PayFeeRpcResponder {
                     })
                 }
             }
-            _ => serde_json::json!({}),
+            other => {
+                crate::common::operational_result(other).unwrap_or_else(|| serde_json::json!({}))
+            }
         };
 
         ResponseTemplate::new(200)
@@ -249,6 +251,225 @@ async fn funded_accounts_endpoint() -> MockServer {
         .mount(&server)
         .await;
     server
+}
+
+/// Answers `rpc_method` on `server` with `result`, ahead of the server's
+/// other mocks.
+async fn mount_ahead(server: &MockServer, rpc_method: &str, result: serde_json::Value) {
+    Mock::given(method("POST"))
+        .and(wiremock::matchers::body_partial_json(
+            serde_json::json!({ "method": rpc_method }),
+        ))
+        .respond_with(stellar_agent_test_support::EchoIdResponder::new(result))
+        .with_priority(1)
+        .mount(server)
+        .await;
+}
+
+/// A `getLedgers` answer whose latest ledger 1001 closed at `close`, in Unix
+/// seconds.
+fn ledgers_closed_at(close: u64) -> serde_json::Value {
+    serde_json::json!({
+        "latestLedger": 1001, "latestLedgerCloseTime": close.to_string(),
+        "oldestLedger": 1, "oldestLedgerCloseTime": 1, "cursor": "1001", "ledgers": []
+    })
+}
+
+/// The test clock in Unix seconds.
+fn now_secs() -> u64 {
+    stellar_agent_core::timefmt::now_unix_ms().unwrap() / 1000
+}
+
+/// A native 10 XLM testnet payment from `SOURCE_G` to `DEST_G`.
+fn ten_xlm_args() -> StellarPayArgs {
+    StellarPayArgs {
+        chain_id: "stellar:testnet".to_owned(),
+        source: SOURCE_G.to_owned(),
+        destination: DEST_G.to_owned(),
+        amount: Some(serde_json::from_str(r#""10 XLM""#).unwrap()),
+        amount_in_stroops: None,
+        asset: "native".to_owned(),
+        memo_text: None,
+        memo_id: None,
+        memo_hash_hex: None,
+        memo_return_hex: None,
+        classic_base: None,
+    }
+}
+
+/// Asserts that a prepare refused with `network.endpoint_not_ready` after
+/// exactly the requests `checks`, minting no prepare token.
+async fn assert_not_ready_before_any_read(
+    result: Result<rmcp::model::CallToolResult, rmcp::ErrorData>,
+    endpoint: &MockServer,
+    checks: &[&str],
+) -> serde_json::Value {
+    let result = result.expect("a not-ready endpoint is a tool-level refusal");
+    assert_eq!(result.is_error, Some(true), "{}", call_result_text(&result));
+    let json = call_result_json(&result);
+    assert_eq!(
+        json["error"]["code"], "network.endpoint_not_ready",
+        "{json}"
+    );
+    assert!(json.get("data").is_none(), "no prepare token: {json}");
+    assert_eq!(
+        crate::common::received_methods(endpoint).await,
+        checks,
+        "the readiness check precedes every account read"
+    );
+    json
+}
+
+/// The prepare result carries the ledger the operational check observed:
+/// the mock's latest ledger, its close time, and the lag of that close time
+/// against the clock of the check.
+#[tokio::test]
+#[serial]
+async fn simulate_reports_the_ledger_the_operational_check_observed() {
+    let _data_root = crate::common::isolated_data_root();
+    keyring_mock::install().expect("mock keyring store init");
+    install_test_nonce_key(21);
+    let endpoint = funded_accounts_endpoint().await;
+    let close = now_secs() - 7;
+    mount_ahead(&endpoint, "getLedgers", ledgers_closed_at(close)).await;
+    let server =
+        WalletServer::new(testnet_profile_with_rpc(&endpoint.uri())).expect("WalletServer::new");
+
+    let before = now_secs();
+    let result = server
+        .call_stellar_pay(ten_xlm_args())
+        .await
+        .expect("simulate must not error");
+    let after = now_secs();
+
+    assert_ne!(result.is_error, Some(true), "{}", call_result_text(&result));
+    let operational = call_result_json(&result)["data"]["operational"].clone();
+    assert_eq!(operational["latest_ledger"], 1001, "{operational}");
+    assert_eq!(operational["close_time_unix"], close, "{operational}");
+    let lag = operational["close_lag_seconds"].as_u64().unwrap();
+    assert!(
+        (before - close..=after - close).contains(&lag),
+        "the lag is the check's clock minus the close time: {operational}"
+    );
+}
+
+/// A latest ledger that closed beyond the readiness bound refuses the
+/// prepare with `network.endpoint_not_ready` and no prepare token; the
+/// reason names the lag the check's clock observed.
+#[tokio::test]
+#[serial]
+async fn simulate_refuses_a_stale_endpoint_before_any_account_read() {
+    let _data_root = crate::common::isolated_data_root();
+    keyring_mock::install().expect("mock keyring store init");
+    install_test_nonce_key(22);
+    let endpoint = funded_accounts_endpoint().await;
+    let close = now_secs() - 120;
+    mount_ahead(&endpoint, "getLedgers", ledgers_closed_at(close)).await;
+    let server =
+        WalletServer::new(testnet_profile_with_rpc(&endpoint.uri())).expect("WalletServer::new");
+
+    let before = now_secs();
+    let result = server.call_stellar_pay(ten_xlm_args()).await;
+    let after = now_secs();
+
+    let json = assert_not_ready_before_any_read(
+        result,
+        &endpoint,
+        &["getNetwork", "getHealth", "getLedgers"],
+    )
+    .await;
+    let message = json["error"]["message"].as_str().unwrap();
+    let lag: u64 = message
+        .split_once("ledger 1001 closed ")
+        .and_then(|(_, rest)| rest.split_once(" s ago; "))
+        .and_then(|(lag, _)| lag.parse().ok())
+        .unwrap_or_else(|| panic!("the reason names the ledger and its lag: {json}"));
+    assert!(
+        (before - close..=after - close).contains(&lag),
+        "the lag is the check's clock minus the close time: {json}"
+    );
+}
+
+/// An account read still running at the deadline the readiness check ran
+/// under refuses the prepare with `network.endpoint_not_ready` and no
+/// prepare token, and the prepare sends no later request.
+#[tokio::test]
+#[serial]
+async fn simulate_refuses_an_account_read_past_the_readiness_deadline() {
+    let _data_root = crate::common::isolated_data_root();
+    keyring_mock::install().expect("mock keyring store init");
+    install_test_nonce_key(24);
+    let endpoint = funded_accounts_endpoint().await;
+    Mock::given(method("POST"))
+        .and(wiremock::matchers::body_partial_json(
+            serde_json::json!({ "method": "getLedgerEntries" }),
+        ))
+        .respond_with(
+            crate::common::TimeoutRpc::new(vec![(
+                account_ledger_key_xdr(SOURCE_G),
+                account_entry_xdr_with_balance(SOURCE_G, 100_000_000_000_000),
+            )])
+            .with_delay(std::time::Duration::from_secs(3)),
+        )
+        .with_priority(1)
+        .mount(&endpoint)
+        .await;
+    let mut profile = testnet_profile_with_rpc(&endpoint.uri());
+    profile.submit_timeout_seconds = Some(1);
+    let server = WalletServer::new(profile).expect("WalletServer::new");
+
+    let started = std::time::Instant::now();
+    let result = server.call_stellar_pay(ten_xlm_args()).await;
+
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(3),
+        "the deadline ends the read before its answer"
+    );
+    let json = assert_not_ready_before_any_read(
+        result,
+        &endpoint,
+        &["getNetwork", "getHealth", "getLedgers", "getLedgerEntries"],
+    )
+    .await;
+    assert!(
+        json["error"]["message"]
+            .as_str()
+            .unwrap()
+            .ends_with("account read exceeded the readiness deadline"),
+        "{json}"
+    );
+}
+
+/// An endpoint reporting a status other than healthy refuses the prepare
+/// with `network.endpoint_not_ready` and no prepare token, before it is
+/// asked for its ledgers.
+#[tokio::test]
+#[serial]
+async fn simulate_refuses_an_unhealthy_endpoint_before_any_account_read() {
+    let _data_root = crate::common::isolated_data_root();
+    keyring_mock::install().expect("mock keyring store init");
+    install_test_nonce_key(23);
+    let endpoint = funded_accounts_endpoint().await;
+    mount_ahead(
+        &endpoint,
+        "getHealth",
+        crate::common::health_result("unhealthy"),
+    )
+    .await;
+    let server =
+        WalletServer::new(testnet_profile_with_rpc(&endpoint.uri())).expect("WalletServer::new");
+
+    let result = server.call_stellar_pay(ten_xlm_args()).await;
+
+    let json =
+        assert_not_ready_before_any_read(result, &endpoint, &["getNetwork", "getHealth"]).await;
+    assert!(
+        json["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("endpoint reports status \"unhealthy\""),
+        "{json}"
+    );
 }
 
 /// Builds a mainnet profile with `engine = Noop` and a caller-supplied
@@ -405,8 +626,14 @@ async fn simulate_rejects_chain_id_mismatch() {
     );
     assert_eq!(
         crate::common::received_methods(&endpoint).await,
-        ["getNetwork", "getLedgerEntries", "getLedgerEntries"],
-        "the chain check runs after the endpoint check and the account reads"
+        [
+            "getNetwork",
+            "getHealth",
+            "getLedgers",
+            "getLedgerEntries",
+            "getLedgerEntries"
+        ],
+        "the chain check runs after the endpoint checks and the account reads"
     );
 }
 
@@ -2176,7 +2403,9 @@ impl Respond for AccountOnlyResponder {
                     serde_json::json!({ "entries": [], "latestLedger": 1001 })
                 }
             }
-            _ => serde_json::json!({}),
+            other => {
+                crate::common::operational_result(other).unwrap_or_else(|| serde_json::json!({}))
+            }
         };
 
         ResponseTemplate::new(200)
@@ -2273,7 +2502,9 @@ impl Respond for PaySubmitSuccessRpcResponder {
                 "ledger": 1005,
                 "txHash": crate::common::polled_tx_hash(request),
             }),
-            _ => serde_json::json!({}),
+            other => {
+                crate::common::operational_result(other).unwrap_or_else(|| serde_json::json!({}))
+            }
         };
 
         ResponseTemplate::new(200)
@@ -3786,7 +4017,9 @@ impl Respond for PayTimeoutRpcResponder {
                 "latestLedger": 1002,
                 "oldestLedger": 1,
             }),
-            _ => serde_json::json!({}),
+            other => {
+                crate::common::operational_result(other).unwrap_or_else(|| serde_json::json!({}))
+            }
         };
 
         ResponseTemplate::new(200)
@@ -4293,7 +4526,9 @@ impl Respond for PayReconcileRpcResponder {
                     })
                 }
             }
-            _ => serde_json::json!({}),
+            other => {
+                crate::common::operational_result(other).unwrap_or_else(|| serde_json::json!({}))
+            }
         };
 
         ResponseTemplate::new(200)

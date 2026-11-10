@@ -467,7 +467,7 @@ impl wiremock::Respond for TimeoutRpc {
                     "oldestLedger": 1,
                 }),
             },
-            _ => serde_json::json!({}),
+            other => operational_result(other).unwrap_or_else(|| serde_json::json!({})),
         };
 
         let template = wiremock::ResponseTemplate::new(200)
@@ -519,6 +519,137 @@ impl wiremock::Respond for RpcErrorAnswer {
                 "jsonrpc": "2.0",
                 "id": req_id,
                 "error": {"code": -32000, "message": self.message},
+            }))
+            .insert_header("content-type", "application/json")
+    }
+}
+
+/// The answer of a healthy endpoint whose latest ledger closed at the time of
+/// the request, to the `getHealth` or `getLedgers` request of the operational
+/// check a prepare tool runs; `None` for every other method.
+#[allow(
+    dead_code,
+    reason = "shared across integration-test binaries; unused in some"
+)]
+#[must_use]
+pub fn operational_result(rpc_method: &str) -> Option<serde_json::Value> {
+    match rpc_method {
+        "getHealth" => Some(health_result("healthy")),
+        "getLedgers" => Some(ledgers_result(0)),
+        _ => None,
+    }
+}
+
+/// A `getHealth` answer reporting `status` with latest ledger
+/// [`OPERATIONAL_LATEST_LEDGER`].
+#[allow(
+    dead_code,
+    reason = "shared across integration-test binaries; unused in some"
+)]
+#[must_use]
+pub fn health_result(status: &str) -> serde_json::Value {
+    serde_json::json!({
+        "status": status,
+        "latestLedger": OPERATIONAL_LATEST_LEDGER,
+        "oldestLedger": 1,
+        "ledgerRetentionWindow": OPERATIONAL_LATEST_LEDGER - 1,
+    })
+}
+
+/// A `getLedgers` answer whose latest ledger [`OPERATIONAL_LATEST_LEDGER`]
+/// closed `age_secs` seconds before the call.
+#[allow(
+    dead_code,
+    reason = "shared across integration-test binaries; unused in some"
+)]
+#[must_use]
+pub fn ledgers_result(age_secs: u64) -> serde_json::Value {
+    let now = stellar_agent_core::timefmt::now_unix_ms().expect("test clock") / 1000;
+    serde_json::json!({
+        "latestLedger": OPERATIONAL_LATEST_LEDGER,
+        "latestLedgerCloseTime": (now - age_secs).to_string(),
+        "oldestLedger": 1,
+        "oldestLedgerCloseTime": 1,
+        "cursor": OPERATIONAL_LATEST_LEDGER.to_string(),
+        "ledgers": [],
+    })
+}
+
+/// The latest ledger the operational answers of [`operational_result`]
+/// name.
+#[allow(
+    dead_code,
+    reason = "shared across integration-test binaries; unused in some"
+)]
+pub const OPERATIONAL_LATEST_LEDGER: u32 = 1001;
+
+/// Asserts that a prepare result's `data` carries the `operational` object of
+/// an endpoint answering with [`operational_result`]: its latest ledger, the
+/// close time, and a lag within the readiness bound that matches the close
+/// time against the test clock.
+///
+/// # Panics
+///
+/// Panics when the object is missing or names other values.
+#[allow(
+    dead_code,
+    reason = "shared across integration-test binaries; unused in some"
+)]
+pub fn assert_operational_reported(data: &serde_json::Value) {
+    let operational = &data["operational"];
+    assert_eq!(
+        operational["latest_ledger"],
+        serde_json::json!(OPERATIONAL_LATEST_LEDGER),
+        "{data}"
+    );
+    assert!(operational["close_time_unix"].is_u64(), "{data}");
+    assert!(operational["close_lag_seconds"].is_u64(), "{data}");
+    let close = operational["close_time_unix"]
+        .as_u64()
+        .expect("close_time_unix is a number");
+    let lag = operational["close_lag_seconds"]
+        .as_u64()
+        .expect("close_lag_seconds is a number");
+    let now = stellar_agent_core::timefmt::now_unix_ms().expect("test clock") / 1000;
+    assert!(lag <= 60, "{data}");
+    assert!(close + lag <= now && now - (close + lag) <= 60, "{data}");
+}
+
+/// Answers every `getHealth` and `getLedgers` request on `server` as a
+/// healthy endpoint whose latest ledger closed at the time of the request,
+/// ahead of the server's other mocks.
+#[allow(
+    dead_code,
+    reason = "shared across integration-test binaries; unused in some"
+)]
+pub async fn mount_ready_endpoint(server: &wiremock::MockServer) {
+    for rpc_method in ["getHealth", "getLedgers"] {
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::body_partial_json(
+                serde_json::json!({ "method": rpc_method }),
+            ))
+            .respond_with(ReadyAnswer(rpc_method))
+            .with_priority(1)
+            .mount(server)
+            .await;
+    }
+}
+
+/// Answers the operational read it names with [`operational_result`], under
+/// the request's own id.
+struct ReadyAnswer(&'static str);
+
+impl wiremock::Respond for ReadyAnswer {
+    fn respond(&self, request: &wiremock::Request) -> wiremock::ResponseTemplate {
+        let req_id = serde_json::from_slice::<serde_json::Value>(&request.body)
+            .ok()
+            .and_then(|body| body.get("id").cloned())
+            .unwrap_or_else(|| serde_json::json!(1));
+        wiremock::ResponseTemplate::new(200)
+            .set_body_json(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "result": operational_result(self.0),
             }))
             .insert_header("content-type", "application/json")
     }

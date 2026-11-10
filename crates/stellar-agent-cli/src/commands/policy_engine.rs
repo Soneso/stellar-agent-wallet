@@ -1347,7 +1347,8 @@ mod tests {
                             "inclusionFee": fees, "sorobanInclusionFee": fees, "latestLedger": 1001
                         })
                     }
-                    other => panic!("unexpected RPC method: {other}"),
+                    other => crate::test_rpc::operational_result(other)
+                        .unwrap_or_else(|| panic!("unexpected RPC method: {other}")),
                 };
                 ResponseTemplate::new(200).set_body_json(json!({
                     "jsonrpc": "2.0", "id": body["id"], "result": result

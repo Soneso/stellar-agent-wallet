@@ -476,7 +476,11 @@ identity cannot be established within the submission timeout is refused with
 with HTTP 401 or 403 is refused with `network.rpc_credential_refused`. The
 probe is retried with bounded exponential backoff inside the caller's timeout
 and never falls back to the declaration; an answer that does not parse, and a
-401 or 403 answer, is not retried.
+401 or 403 answer, is not retried. Every classic prepare then checks, on the
+same client and before it reads the account it signs against, that the
+endpoint reports a healthy status and that its latest ledger closed within 60
+seconds of the host clock; a failed check is refused with
+`network.endpoint_not_ready`.
 [Retries, deadlines, and failover](maintainers/security-internals.md#retries-deadlines-and-failover)
 gives the numbers. This release supports protocol versions 29 and 30. On testnet and
 other networks, a version outside that range is logged as a warning. On mainnet

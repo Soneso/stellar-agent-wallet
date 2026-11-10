@@ -6796,6 +6796,12 @@ pub(crate) mod tests {
                     "getHealth" => answer(
                         serde_json::json!({"status":"healthy", "latestLedger":100, "oldestLedger":1, "ledgerRetentionWindow":100}),
                     ),
+                    "getLedgers" => answer(serde_json::json!({
+                        "latestLedger":100, "oldestLedger":1,
+                        "latestLedgerCloseTime":(stellar_agent_core::timefmt::now_unix_ms().unwrap() / 1000)
+                            .to_string(),
+                        "oldestLedgerCloseTime":1, "cursor":"100", "ledgers":[]
+                    })),
                     "sendTransaction" => answer(self.send(&body)),
                     "getTransaction" if self.control.transaction_failed.load(Ordering::SeqCst) => {
                         use stellar_xdr::*;

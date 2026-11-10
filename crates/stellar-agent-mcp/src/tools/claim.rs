@@ -301,6 +301,8 @@ impl WalletServer {
                        renders a typed preview, and enforces the claim guards (claimant, \
                        predicate, trustline, fee affordability). Returns \
                        {envelope_xdr, nonce, expires_at_unix_ms, preview}. \
+                       The result carries operational {latest_ledger, close_time_unix, \
+                       close_lag_seconds}, the endpoint ledger the readiness check observed. \
                        The approval response includes profile and chain_id. \
                        Pass all three to \
                        stellar_claim_commit to sign and submit. \
@@ -345,16 +347,22 @@ impl WalletServer {
         // on this client. The values read here feed the envelope the commit
         // signs and the policy gate, so an endpoint serving another network
         // answers none of them.
-        if let Err(e) = self
-            .probe_write_endpoint(
-                &client,
-                tokio::time::Instant::now()
-                    + crate::tools::common::submit_timeout(self.security_profile()),
-            )
-            .await
-        {
+        let deadline = tokio::time::Instant::now()
+            + crate::tools::common::submit_timeout(self.security_profile());
+        if let Err(e) = self.probe_write_endpoint(&client, deadline).await {
             return Ok(crate::tools::common::endpoint_refusal_result(&e));
         }
+
+        // The endpoint must be healthy and current before the first account
+        // read: the account state read below comes through the same client
+        // after this check and under its deadline, so the sequence the
+        // envelope is built against is at least as fresh as the ledger the
+        // check observed.
+        let operational =
+            match stellar_agent_network::operational::operational_check(&client, deadline).await {
+                Ok(report) => report,
+                Err(e) => return Ok(crate::tools::common::endpoint_refusal_result(&e)),
+            };
 
         // ── Fetch the claimable-balance entry ─────────────────────────────────
         let entry = match fetch_claimable_balance_entry(&client, &id).await {
@@ -363,11 +371,12 @@ impl WalletServer {
         };
 
         // ── Fetch source account (sequence number + native balance) ───────────
-        let account_view = match crate::sequence_floor::fetch_account_with_sequence_catchup(
+        let account_view = match crate::sequence_floor::fetch_account_with_sequence_catchup_within(
             &self.sequence_floor,
             &client,
             &source,
             &[],
+            deadline,
         )
         .await
         {
@@ -616,6 +625,7 @@ impl WalletServer {
             "nonce": &nonce_b64,
             "expires_at_unix_ms": expiry_unix_ms,
             "preview": preview_json,
+            "operational": operational,
         });
         if let Some(approval) = approval_block {
             view["approval"] = approval;

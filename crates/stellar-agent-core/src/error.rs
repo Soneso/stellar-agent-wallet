@@ -2541,6 +2541,22 @@ pub enum NetworkError {
         url: String,
     },
 
+    /// The RPC endpoint is not ready for a transaction: it reports a status
+    /// other than healthy, it does not supply a valid close time for its
+    /// latest ledger, or that close time lies too far from the host clock.
+    ///
+    /// A value ceremony reads the account it signs against only after the
+    /// endpoint passes this check, so a stalled or lagging endpoint never
+    /// supplies the sequence, the fee, or the policy views of an envelope.
+    ///
+    /// The reason names the failed check and never carries the endpoint URL
+    /// or a credential; text the endpoint supplies enters it scrubbed.
+    #[error("the endpoint is not ready for a transaction: {reason}")]
+    EndpointNotReady {
+        /// Which check failed and what it observed.
+        reason: String,
+    },
+
     /// A mainnet RPC endpoint reports a protocol version outside the range
     /// this release supports.
     ///
@@ -2834,6 +2850,7 @@ impl NetworkError {
             }
             Self::EndpointNetworkMismatch { .. } => "network.endpoint_network_mismatch",
             Self::EndpointIdentityUnavailable { .. } => "network.endpoint_identity_unavailable",
+            Self::EndpointNotReady { .. } => "network.endpoint_not_ready",
             Self::UnsupportedProtocolVersion { .. } => "network.unsupported_protocol_version",
             Self::EnvelopeSignedForMainnet => "network.envelope_signed_for_mainnet",
             Self::EnvelopeSignatureUnverifiable { .. } => "network.envelope_signature_unverifiable",
@@ -4792,6 +4809,12 @@ mod tests {
                 "network.endpoint_identity_unavailable",
             ),
             (
+                NetworkError::EndpointNotReady {
+                    reason: "endpoint reports status \"catching up\"".to_owned(),
+                },
+                "network.endpoint_not_ready",
+            ),
+            (
                 NetworkError::UnsupportedProtocolVersion {
                     protocol_version: 31,
                     supported_min: 28,
@@ -5592,6 +5615,10 @@ mod tests {
             WalletError::Network(NetworkError::EndpointIdentityUnavailable {
                 url: "https://rpc.example.com".to_owned(),
             }),
+            WalletError::Network(NetworkError::EndpointNotReady {
+                reason: "ledger 100 closed 61 s ago; the endpoint or the host clock is behind"
+                    .to_owned(),
+            }),
             WalletError::Network(NetworkError::UnsupportedProtocolVersion {
                 protocol_version: 31,
                 supported_min: 28,
@@ -5621,6 +5648,22 @@ mod tests {
         assert_eq!(
             err.message(),
             "account 'GABCDEFGHIJKLMNOPQR' already holds the Friendbot starting balance; Friendbot funds only an account below it"
+        );
+    }
+
+    /// The not-ready refusal carries its reason after a fixed prefix and the
+    /// `network.endpoint_not_ready` code.
+    #[test]
+    fn endpoint_not_ready_names_the_reason() {
+        let err = WalletError::Network(NetworkError::EndpointNotReady {
+            reason: "ledger 100 closed 61 s ago; the endpoint or the host clock is behind"
+                .to_owned(),
+        });
+        assert_eq!(err.code(), "network.endpoint_not_ready");
+        assert_eq!(
+            err.message(),
+            "the endpoint is not ready for a transaction: ledger 100 closed 61 s ago; the \
+             endpoint or the host clock is behind"
         );
     }
 

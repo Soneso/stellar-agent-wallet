@@ -51,10 +51,16 @@ requires the signed cap. The resolver independently reevaluates effective fees
 and thresholds. An admitted mainnet prepare probes endpoint identity before
 action reads, as does commit before consuming its nonce.
 
+Every classic prepare, on any network, checks that the endpoint reports a
+healthy status and that its latest ledger closed within 60 seconds of the host
+clock, before it reads the account it signs against. A failed check refuses with
+`network.endpoint_not_ready`. The prepare result carries the observed ledger as
+`operational`: `{latest_ledger, close_time_unix, close_lag_seconds}`.
+
 Endpoint refusals preserve `network.endpoint_network_mismatch`,
 `network.endpoint_identity_unavailable`, `network.unsupported_protocol_version`,
-and `network.rpc_credential_refused`. `network.envelope_signed_for_mainnet`
-means a signature fails under the endpoint network but verifies under mainnet.
+`network.endpoint_not_ready`, and `network.rpc_credential_refused`.
+`network.envelope_signed_for_mainnet` means a signature fails under the endpoint network but verifies under mainnet.
 
 Missing, invalid, expired, or unverifiable approvals use `policy.approval_required`.
 A live rejection uses `policy.approval_rejected`. A live consumed approval or an
@@ -116,7 +122,7 @@ Simulate step: builds a CreateAccount transaction envelope and mints a single-us
 - `starting_balance` (string, required): Amount with unit suffix, e.g. `"1 XLM"`.
 - `fee` (string, optional): Classic fee per operation: `<stroops>`, `auto`, or `auto:pNN`.
 
-**Returns:** `{envelope_xdr, nonce, expires_at_unix_ms, simulation}`.
+**Returns:** `{envelope_xdr, nonce, expires_at_unix_ms, simulation, operational}`.
 
 **Annotations:** `readOnlyHint=false`, `destructiveHint=false`.
 
@@ -187,7 +193,7 @@ Simulate step: builds a Payment transaction envelope for a native XLM or non-nat
 - `memo_return_hex` (string, optional): 32-byte return memo as 64 hex chars. Mutually exclusive.
 - `fee` (string, optional): Classic fee per operation: `<stroops>`, `auto`, or `auto:pNN`.
 
-**Returns:** `{envelope_xdr, nonce, expires_at_unix_ms, simulation}`.
+**Returns:** `{envelope_xdr, nonce, expires_at_unix_ms, simulation, operational}`.
 
 **Annotations:** `readOnlyHint=false`, `destructiveHint=false`.
 
@@ -259,7 +265,7 @@ Simulate step: fetches the claimable-balance entry, renders a typed preview, enf
 - `balance_id` (string, required): Claimable-balance id: a `B...` strkey, the canonical 72-hex id, or the bare 64-hex hash.
 - `source_account` (string, optional): G-strkey of the claiming account. Defaults to the profile's default MCP signer account.
 
-**Returns:** `{envelope_xdr, nonce, expires_at_unix_ms, preview}`.
+**Returns:** `{envelope_xdr, nonce, expires_at_unix_ms, preview, operational}`.
 
 **Annotations:** `readOnlyHint=false`, `destructiveHint=false`.
 
@@ -318,7 +324,7 @@ Simulate step: resolves the asset, fetches the issuer's live flags, runs the cla
 - `limit_stroops` (string, optional): Trustline limit in stroops as a decimal string. Absent sets the protocol default (`i64::MAX`); `"0"` removes the trustline.
 - `fee` (string, optional): Classic fee per operation: `<stroops>`, `auto`, or `auto:pNN`.
 
-**Returns:** `{envelope_xdr, nonce, expires_at_unix_ms, preview}`.
+**Returns:** `{envelope_xdr, nonce, expires_at_unix_ms, preview, operational}`.
 
 **Annotations:** `readOnlyHint=false`, `destructiveHint=false`.
 

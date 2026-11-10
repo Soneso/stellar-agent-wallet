@@ -149,7 +149,8 @@ reason = "Operator review"
             },
             "sendTransaction" => json!({"hash":send_transaction_hash_hex(&body, NETWORK), "status":"PENDING", "latestLedger":1001, "latestLedgerCloseTime":"1234567890"}),
             "getTransaction" => json!({"status":"SUCCESS", "ledger":1001, "latestLedger":1002, "oldestLedger":1, "createdAt":(stellar_agent_core::timefmt::now_unix_ms().unwrap() / 1000).to_string()}),
-            other => panic!("unexpected RPC method: {other}"),
+            other => crate::classic_ledger::readiness_result(other)
+                .unwrap_or_else(|| panic!("unexpected RPC method: {other}")),
         };
         ResponseTemplate::new(200).set_body_json(json!({"jsonrpc":"2.0", "id":body["id"], "result":result}))
     }).mount(&rpc).await;
