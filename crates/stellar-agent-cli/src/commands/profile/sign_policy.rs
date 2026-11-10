@@ -1914,7 +1914,7 @@ mod tests {
             message.starts_with(&framing) && message.ends_with(ending),
             "{message}"
         );
-        let unmet = full.replace("ttl_secs = 3600", "ttl_secs = 3601");
+        let unmet = full.replace("ttl_secs = 3600", "ttl_secs = 86401");
         let result = prepare_policy(&unmet, &profile, "operator", &policy, &window);
         assert_eq!(result.is_err(), cfg!(feature = "mainnet-write"));
         if let Err(error) = result {

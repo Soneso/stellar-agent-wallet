@@ -44,7 +44,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
 
-use crate::policy::DenyReason;
+use crate::policy::{DenyReason, UnlistedBound};
 
 /// Maximum tolerated future clock skew for host-dated pending entries, in milliseconds.
 pub const CLOCK_SKEW_TOLERANCE_MS: u64 = 30_000;
@@ -160,6 +160,26 @@ pub enum WindowLimit {
         /// The calls the window admits.
         max_calls: u32,
     },
+    /// The rolling-window bound of an unlisted-recipient budget, as the
+    /// `unlisted` table of a `counterparty_allowlist` configures it.
+    Unlisted {
+        /// The budget asset identifier, as its denial names it.
+        asset: String,
+        /// The window label (e.g. `"1d"`).
+        window: String,
+        /// The aggregate stroops the window admits for unlisted recipients.
+        max_stroops: i128,
+    },
+    /// A non-renewing total allocation, as `total_budget` configures it.
+    ///
+    /// Its entries carry the policy digest as their epoch, and time never
+    /// releases them.
+    Total {
+        /// The asset identifier, as its denial names it.
+        asset: String,
+        /// The total allocation of the signed policy.
+        max_stroops: i128,
+    },
 }
 
 /// One window record a call contributes, with the limit that governs it.
@@ -195,6 +215,7 @@ pub struct WindowEntry {
     timestamp_ms: u64,
     amount: i128,
     limit: WindowLimit,
+    epoch: Option<[u8; 32]>,
 }
 
 impl WindowEntry {
@@ -203,6 +224,8 @@ impl WindowEntry {
     /// `amount` is the stroop total for an amount bucket and `1` for a
     /// call-count bucket, matching what the criterion appends to the
     /// in-memory store.
+    ///
+    /// The entry carries no epoch; [`Self::with_epoch`] sets one.
     #[must_use]
     pub fn new(key: StateKey, timestamp_ms: u64, amount: i128, limit: WindowLimit) -> Self {
         Self {
@@ -210,7 +233,46 @@ impl WindowEntry {
             timestamp_ms,
             amount,
             limit,
+            epoch: None,
         }
+    }
+
+    /// Returns the entry with `epoch` set.
+    ///
+    /// A total-budget entry carries the digest of the signed policy that sized
+    /// it. Accounting counts it against that policy's allocation only, and
+    /// regardless of its age.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use stellar_agent_core::policy::v1::criteria::state_store::{
+    ///     StateKey, WindowEntry, WindowLimit,
+    /// };
+    ///
+    /// let entry = WindowEntry::new(
+    ///     StateKey::new("operator", 1, "total:native", 0),
+    ///     1_000,
+    ///     5,
+    ///     WindowLimit::Total {
+    ///         asset: "native".to_owned(),
+    ///         max_stroops: 10,
+    ///     },
+    /// )
+    /// .with_epoch(Some([7; 32]));
+    /// assert_eq!(entry.epoch(), Some([7; 32]));
+    /// ```
+    #[must_use]
+    pub fn with_epoch(mut self, epoch: Option<[u8; 32]>) -> Self {
+        self.epoch = epoch;
+        self
+    }
+
+    /// Returns the policy digest a total-budget entry counts against, or
+    /// `None` for a windowed entry.
+    #[must_use]
+    pub fn epoch(&self) -> Option<[u8; 32]> {
+        self.epoch
     }
 
     /// Returns the bucket this entry accumulates into.
@@ -241,9 +303,10 @@ impl WindowEntry {
     /// already holds `used_stroops` across `calls` entries, or `None` when the
     /// window admits it.
     ///
-    /// The comparison is the gate's own: an amount entry is refused when
-    /// `used_stroops + amount > max_stroops`, a count entry when
-    /// `calls + 1 > max_calls`.
+    /// The comparison is the gate's own: an amount, unlisted, or total entry
+    /// is refused when `used_stroops + amount > max_stroops`, a count entry
+    /// when `calls + 1 > max_calls`. For a total entry `used_stroops` is the
+    /// use within the entry's epoch.
     ///
     /// # Examples
     ///
@@ -290,6 +353,23 @@ impl WindowEntry {
                     calls_in_window: calls,
                 })
             }
+            WindowLimit::Unlisted {
+                asset, max_stroops, ..
+            } => (used_stroops.saturating_add(self.amount) > *max_stroops).then(|| {
+                DenyReason::UnlistedBudgetExceeded {
+                    asset: asset.clone(),
+                    bound: UnlistedBound::PerPeriod,
+                    max_stroops: *max_stroops,
+                    attempted_stroops: self.amount,
+                }
+            }),
+            WindowLimit::Total { asset, max_stroops } => (used_stroops.saturating_add(self.amount)
+                > *max_stroops)
+                .then(|| DenyReason::TotalBudgetExhausted {
+                    asset: asset.clone(),
+                    max_stroops: *max_stroops,
+                    remaining_stroops: max_stroops.saturating_sub(used_stroops).max(0),
+                }),
         }
     }
 }
@@ -353,6 +433,9 @@ struct StateEntry {
     amount: i128,
     pending: bool,
     exposure: Option<Exposure>,
+    /// The policy digest a total-budget entry counts against. Retention keeps
+    /// every entry that carries one.
+    epoch: Option<[u8; 32]>,
 }
 
 #[derive(Debug, Clone)]
@@ -552,7 +635,8 @@ impl PolicyStateStore {
         }
         for (stored_key, deque) in guard.iter_mut() {
             deque.retain(|entry| {
-                entry.exposure.is_some()
+                entry.epoch.is_some()
+                    || entry.exposure.is_some()
                     || entry.pending
                     || entry.timestamp_ms
                         >= now_ms.saturating_sub(stored_key.window_secs.saturating_mul(1000))
@@ -637,8 +721,82 @@ impl PolicyStateStore {
                 accounting_at_ms,
                 accounting_until_ms,
             }),
+            epoch: None,
         });
         Ok(())
+    }
+
+    /// Appends a confirmed total-budget entry that counts against `epoch`.
+    ///
+    /// The entry never ages out: [`Self::query_epoch`] counts it regardless of
+    /// time, and retention keeps it.
+    ///
+    /// # Errors
+    /// Returns [`StateStoreError::LockPoisoned`] if the mutex is poisoned.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use stellar_agent_core::policy::v1::criteria::state_store::{PolicyStateStore, StateKey};
+    ///
+    /// let store = PolicyStateStore::new();
+    /// let key = StateKey::new("operator", 1, "total:native", 0);
+    /// store.append_epoch(&key, 1_000, 40, [1; 32]).unwrap();
+    /// assert_eq!(store.query_epoch(&key, [1; 32]).unwrap(), (40, 1));
+    /// assert_eq!(store.query_epoch(&key, [2; 32]).unwrap(), (0, 0));
+    /// ```
+    pub fn append_epoch(
+        &self,
+        key: &StateKey,
+        timestamp_ms: u64,
+        amount: i128,
+        epoch: [u8; 32],
+    ) -> Result<(), StateStoreError> {
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|error| StateStoreError::LockPoisoned {
+                detail: error.to_string(),
+            })?;
+        guard.entry(key.clone()).or_default().push_back(StateEntry {
+            timestamp_ms,
+            amount,
+            pending: false,
+            exposure: None,
+            epoch: Some(epoch),
+        });
+        Ok(())
+    }
+
+    /// Returns `(sum_of_amounts, count_of_entries)` of the entries under
+    /// exactly `key` that carry `epoch`, pending or confirmed, regardless of
+    /// their age.
+    ///
+    /// Entries of another epoch, entries without an epoch, and entries under
+    /// any other key never count, so a re-signed policy starts at zero.
+    ///
+    /// # Errors
+    /// Returns [`StateStoreError::LockPoisoned`] if the mutex is poisoned.
+    pub fn query_epoch(
+        &self,
+        key: &StateKey,
+        epoch: [u8; 32],
+    ) -> Result<(i128, u32), StateStoreError> {
+        let guard = self
+            .inner
+            .lock()
+            .map_err(|error| StateStoreError::LockPoisoned {
+                detail: error.to_string(),
+            })?;
+        let mut sum: i128 = 0;
+        let mut count: u32 = 0;
+        for entry in guard.get(key).into_iter().flatten() {
+            if entry.epoch == Some(epoch) {
+                sum = sum.saturating_add(entry.amount);
+                count = count.saturating_add(1);
+            }
+        }
+        Ok((sum, count))
     }
 
     fn append_entry(
@@ -660,6 +818,7 @@ impl PolicyStateStore {
             amount: amount_or_count,
             pending,
             exposure: None,
+            epoch: None,
         });
 
         Ok(())

@@ -1070,13 +1070,13 @@ When either family cannot be held, the ceremony does not start.
 | `chain` | Every rule names exactly `stellar:mainnet`. |
 | `tool` | Every rule names an admitted policy tool or an explicitly listed read/local tool. A rule does not itself admit a binary operation. |
 | `opaque` | `allow_opaque_signing` is absent or false. |
-| `rule_ttl` | Every RequireApproval rule supplies `ttl_secs` from 1 through 3600. |
+| `rule_ttl` | Every RequireApproval rule supplies `ttl_secs` from 1 through 86400. |
 | `asset_allowlist` | Non-deny value-out and trustline rules contain exactly one nonempty pinned asset allowlist. Claim rules contain none. |
 | `destination` | Non-deny value-out rules require `G_ACCOUNT` or `C_ACCOUNT`. `KNOWN_ISSUER` may accompany them. No other kind may appear in that restriction. |
 | `home_domain` | Rules contain neither `HOME_DOMAIN` nor `home_domain_resolved`. |
 | `per_tx_cap` | Non-deny value-out rules cap every allowlisted asset per transaction. |
 | `per_period_cap` | Non-deny value-out rules cap every allowlisted asset per period. |
-| `rate_limit` | Non-deny value-out rules contain a rate limit. |
+| `rate_limit` | Non-deny value-out, trustline, and claim rules contain a rate limit. |
 | `fee_cap` | The signed mainnet table contains the classic per-operation cap. |
 | `thresholds` | Signed thresholds use pinned identities and positive i128 values. The native threshold meets the floor. |
 | `ttl` | Authorization TTL is absent or from 1 through 120 seconds. |

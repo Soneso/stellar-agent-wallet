@@ -294,8 +294,8 @@ minimum!(minimum_opaque, "opaque", |d: &mut DocumentMut| {
 minimum!(minimum_ttl_absent, "rule_ttl", |d: &mut DocumentMut| {
     rule(d).remove("ttl_secs");
 });
-minimum!(minimum_ttl_above_hour, "rule_ttl", |d: &mut DocumentMut| {
-    rule(d)["ttl_secs"] = value(3601);
+minimum!(minimum_ttl_above_day, "rule_ttl", |d: &mut DocumentMut| {
+    rule(d)["ttl_secs"] = value(86_401);
 });
 minimum!(
     minimum_asset_allowlist,
@@ -437,9 +437,11 @@ fn minimum_read_only_and_trustline_requirements() {
         let mut doc = FULL.parse::<DocumentMut>().unwrap();
         rule(&mut doc)["match"]["tool"] = value(tool);
         let criteria = rule(&mut doc)["criteria"].as_array_mut().unwrap();
-        while criteria.len() > usize::from(tool == "stellar_trustline") {
-            criteria.remove(criteria.len() - 1);
-        }
+        criteria.retain(|c| {
+            let kind = c.as_inline_table().unwrap()["kind"].as_str().unwrap();
+            kind == "rate_limit" || (tool == "stellar_trustline" && kind == "asset_allowlist")
+        });
+        assert_eq!(criteria.len(), 1 + usize::from(tool == "stellar_trustline"));
         assert!(mainnet_minimum::validate(&doc, &profile, "operator").is_ok());
     }
 }
@@ -893,10 +895,59 @@ fn mainnet_configuration_condition() {
         )
         .is_ok()
     );
-    let invalid = FULL.replace("ttl_secs = 3600", "ttl_secs = 3601");
+    let invalid = FULL.replace("ttl_secs = 3600", "ttl_secs = 86401");
     assert_eq!(
         load(dir.path(), &invalid, &profile, &key, PinMode::CompareOnly).is_err(),
         cfg!(feature = "mainnet-write")
+    );
+}
+/// The engine of a verified policy carries the digest of the signed canonical
+/// bytes, which is the proof's digest and the epoch of a sized total entry.
+#[test]
+#[serial]
+fn policy_digest_matches_verified_policy() {
+    use stellar_agent_core::policy::v1::{
+        criteria::state_store::WindowLimit,
+        value::{ActionKind, ValueClass, ValueLeg},
+    };
+    let (dir, profile, key) = fixture();
+    let mut doc = without_mainnet().parse::<DocumentMut>().unwrap();
+    rule(&mut doc)["match"]["chain"] = value("*");
+    rule(&mut doc)["decision"] = value("allow");
+    rule(&mut doc).remove("reason");
+    rule(&mut doc).remove("ttl_secs");
+    rule(&mut doc)["criteria"].as_array_mut().unwrap().push(
+        "{ kind = \"total_budget\", asset = \"native\", max_stroops = 500 }"
+            .parse::<toml_edit::Value>()
+            .unwrap(),
+    );
+    let raw = doc.to_string();
+    let verified = load(dir.path(), &raw, &profile, &key, PinMode::CompareOnly).unwrap();
+    let digest = *blake3::hash(&canonical_bytes(&raw).unwrap()).as_bytes();
+    assert_eq!(verified.digest(), digest);
+    let engine = verified.engine();
+    assert_eq!(engine.policy_digest(), digest);
+
+    let value = ValueClass::single(ValueLeg {
+        kind: ActionKind::Payment,
+        amount: Some(50),
+        asset: Some("native".to_owned()),
+        destination: Some("GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF".to_owned()),
+    });
+    let entries = engine
+        .size_window_entries(&tool(), &profile, &value, 1_800_000_000_000)
+        .unwrap();
+    let total = entries
+        .iter()
+        .find(|entry| matches!(entry.limit(), WindowLimit::Total { .. }))
+        .unwrap();
+    assert_eq!(total.epoch(), Some(digest));
+    assert_eq!(total.amount(), 50);
+    assert!(
+        entries
+            .iter()
+            .filter(|entry| !matches!(entry.limit(), WindowLimit::Total { .. }))
+            .all(|entry| entry.epoch().is_none())
     );
 }
 fn criterion(doc: &mut DocumentMut, index: usize) -> &mut toml_edit::InlineTable {

@@ -20,9 +20,11 @@
 
 use serde_json::Value;
 
+use crate::envelope_decode::ClassicMemo;
 use crate::policy::v1::EvalContext;
 use crate::policy::v1::bundle::InnerOpDescriptor;
 use crate::policy::v1::criteria::amount_extract::resolve_pay_or_create_account_stroops;
+use crate::policy::v1::criteria::counterparty_allowlist::RecipientClass;
 use crate::policy::{DenyReason, ToolValueKind};
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -103,10 +105,20 @@ impl ValueClass {
 /// empty [`ValueEffects`] is a construction bug. Use [`ValueEffects::single`]
 /// or [`ValueEffects::new`], which document and (in debug builds) assert the
 /// invariant.
+///
+/// # Carried facts
+///
+/// [`Self::memo`] is the memo the signed transaction carries, set by the
+/// dispatch site from the same source as the legs. [`Self::recipient_class`]
+/// is the class the evaluation assigned to the recipients; the engine attaches
+/// it to the effects of a permitted decision, so accounting reads the class
+/// the gate decided with and never classifies again.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ValueEffects {
     /// The per-leg effects. Non-empty for a [`ValueClass::Value`].
     pub legs: Vec<ValueLeg>,
+    memo: Option<ClassicMemo>,
+    recipient_class: Option<RecipientClass>,
 }
 
 impl ValueEffects {
@@ -123,19 +135,71 @@ impl ValueEffects {
             !legs.is_empty(),
             "ValueEffects must carry at least one leg for a value-moving call"
         );
-        Self { legs }
+        Self {
+            legs,
+            memo: None,
+            recipient_class: None,
+        }
     }
 
     /// Constructs a single-leg [`ValueEffects`].
     #[must_use]
     pub fn single(leg: ValueLeg) -> Self {
-        Self { legs: vec![leg] }
+        Self::new(vec![leg])
     }
 
     /// Returns the legs.
     #[must_use]
     pub fn legs(&self) -> &[ValueLeg] {
         &self.legs
+    }
+
+    /// Returns the effects with the transaction's memo set.
+    ///
+    /// `None` means the dispatch site supplied no memo fact; the
+    /// `memo_binding` criterion refuses a bound payment without one.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use stellar_agent_core::envelope_decode::ClassicMemo;
+    /// use stellar_agent_core::policy::v1::value::{ActionKind, ValueEffects, ValueLeg};
+    ///
+    /// let effects = ValueEffects::single(ValueLeg {
+    ///     kind: ActionKind::Payment,
+    ///     amount: Some(1),
+    ///     asset: Some("native".into()),
+    ///     destination: None,
+    /// })
+    /// .with_memo(Some(ClassicMemo::Id(7)));
+    /// assert_eq!(effects.memo(), Some(&ClassicMemo::Id(7)));
+    /// ```
+    #[must_use]
+    pub fn with_memo(mut self, memo: Option<ClassicMemo>) -> Self {
+        self.memo = memo;
+        self
+    }
+
+    /// Returns the transaction's memo, or `None` when no memo fact was
+    /// supplied.
+    #[must_use]
+    pub fn memo(&self) -> Option<&ClassicMemo> {
+        self.memo.as_ref()
+    }
+
+    /// Returns the effects with the evaluated recipient class set.
+    #[must_use]
+    pub fn with_recipient_class(mut self, class: Option<RecipientClass>) -> Self {
+        self.recipient_class = class;
+        self
+    }
+
+    /// Returns the recipient class the evaluation assigned, or `None` when the
+    /// effects did not come from a permitted decision with a counterparty
+    /// criterion.
+    #[must_use]
+    pub fn recipient_class(&self) -> Option<RecipientClass> {
+        self.recipient_class
     }
 }
 

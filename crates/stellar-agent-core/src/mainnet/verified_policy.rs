@@ -163,13 +163,22 @@ impl std::fmt::Debug for VerifiedPolicy {
     }
 }
 
+/// Returns the BLAKE3 digest of a signed policy's canonical bytes.
+///
+/// The digest identifies the signed policy: the owner signature covers it,
+/// the pin stores it, and it is the epoch of every `total_budget` allocation,
+/// so each of these reads one function.
+pub(crate) fn policy_digest(canonical_bytes: &[u8]) -> [u8; 32] {
+    *blake3::hash(canonical_bytes).as_bytes()
+}
+
 impl VerifiedPolicy {
     /// Records the policy the loader verified: the signed `sequence` (`0` for
     /// a version 1 document), the `canonical_bytes` the signature covers, the
     /// verifying `owner` key, the engine built from the document, and its
     /// mainnet section.
     ///
-    /// The digest is the BLAKE3 digest of `canonical_bytes`.
+    /// The digest is [`policy_digest`] of `canonical_bytes`.
     pub(crate) fn from_verified(
         sequence: i64,
         canonical_bytes: &[u8],
@@ -179,7 +188,7 @@ impl VerifiedPolicy {
     ) -> Self {
         Self {
             sequence,
-            digest: *blake3::hash(canonical_bytes).as_bytes(),
+            digest: policy_digest(canonical_bytes),
             owner,
             engine,
             mainnet,

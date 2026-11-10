@@ -349,7 +349,7 @@ fn evaluate_rule(findings: &mut Findings, index: usize, rule: &dyn TableLike, pr
             || rule
                 .get("ttl_secs")
                 .and_then(Item::as_integer)
-                .is_some_and(|ttl| (1..=3600).contains(&ttl)),
+                .is_some_and(|ttl| (1..=86_400).contains(&ttl)),
     );
     let criteria: Vec<&InlineTable> = rule
         .get("criteria")
@@ -383,6 +383,13 @@ fn evaluate_rule(findings: &mut Findings, index: usize, rule: &dyn TableLike, pr
     }
     if decision == Some("deny") {
         return;
+    }
+    if VALUE_OUT.contains(&tool) || TRUSTLINE.contains(&tool) || CLAIM.contains(&tool) {
+        findings.rule(
+            Requirement::RateLimit,
+            index,
+            criteria.iter().any(|c| kind(c) == "rate_limit"),
+        );
     }
     if !(VALUE_OUT.contains(&tool) || TRUSTLINE.contains(&tool)) {
         return;
@@ -443,11 +450,6 @@ fn evaluate_rule(findings: &mut Findings, index: usize, rule: &dyn TableLike, pr
                 }),
         );
     }
-    findings.rule(
-        Requirement::RateLimit,
-        index,
-        criteria.iter().any(|c| kind(c) == "rate_limit"),
-    );
 }
 
 /// Returns every unmet requirement as a `policy.mainnet_minimum_unmet` error,

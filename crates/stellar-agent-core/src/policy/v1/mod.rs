@@ -37,6 +37,7 @@
 //! both crates are already in scope.
 
 use crate::policy::v1::bundle::{BundleStateOverlay, BundleView};
+use crate::policy::v1::criteria::counterparty_allowlist::RecipientClass;
 use crate::policy::{Decision, DenyReason, PolicyEngine, PolicyError, ToolDescriptor};
 use crate::profile::schema::Profile;
 use serde_json::Value;
@@ -428,6 +429,192 @@ pub trait AccountReservesView: Send + Sync {
     /// The `detail` field of the error MUST NOT include key material or other
     /// secret input.
     fn balance_stroops(&self) -> Result<i64, AccountReserveLookupError>;
+
+    /// Returns the ledger and time facts of the live account read this view
+    /// carries, or `None` when the view records no read.
+    ///
+    /// The `balance_floor` criterion refuses without an observation and
+    /// checks its age. Only [`ObservedAccount`] supplies one.
+    fn observation(&self) -> Option<AccountObservation> {
+        None
+    }
+
+    /// Returns the native reservations of the profile's open authorizations
+    /// that count against this account, in stroops, or `None` when the view
+    /// carries no sum.
+    ///
+    /// The `balance_floor` criterion subtracts the sum from the balance and
+    /// refuses without one. [`FloorInput`] supplies it.
+    fn effective_native_reservations_stroops(&self) -> Option<u64> {
+        None
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// AccountObservation / ObservedAccount / FloorInput
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The ledger and time facts of one live account read.
+///
+/// # Examples
+///
+/// ```
+/// use stellar_agent_core::policy::v1::AccountObservation;
+///
+/// let observation = AccountObservation {
+///     ledger_sequence: 100,
+///     observed_at_ms: 1_700_000_000_000,
+///     close_time_floor_ms: 1_699_999_995_000,
+/// };
+/// assert_eq!(observation.ledger_sequence, 100);
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AccountObservation {
+    /// The ledger the account read reflects.
+    pub ledger_sequence: u32,
+    /// The host time of the read, in unix milliseconds.
+    pub observed_at_ms: u64,
+    /// A lower bound of that ledger's close time, in unix milliseconds.
+    pub close_time_floor_ms: u64,
+}
+
+/// An account view together with the facts of the live read that produced it.
+///
+/// [`Self::new`] records a live account read: the network crate's account
+/// fetch constructs it right after the read, from the response and the
+/// readiness report of the same client. No other source of the observation
+/// is valid, because the floor check trusts its ledger and its age.
+///
+/// # Examples
+///
+/// ```
+/// use stellar_agent_core::policy::v1::{
+///     AccountReserveLookupError, AccountReservesView, ObservedAccount,
+/// };
+///
+/// struct Balance(i64);
+/// impl AccountReservesView for Balance {
+///     fn reserves_stroops(&self, base_reserve_stroops: i64) -> i64 {
+///         2 * base_reserve_stroops
+///     }
+///     fn balance_stroops(&self) -> Result<i64, AccountReserveLookupError> {
+///         Ok(self.0)
+///     }
+/// }
+///
+/// let observed = ObservedAccount::new(Balance(50), 100, 1_000, 900);
+/// assert_eq!(observed.balance_stroops().unwrap(), 50);
+/// assert_eq!(observed.observation().unwrap().ledger_sequence, 100);
+/// ```
+#[derive(Debug, Clone)]
+pub struct ObservedAccount<V: AccountReservesView> {
+    view: V,
+    ledger_sequence: u32,
+    observed_at_ms: u64,
+    close_time_floor_ms: u64,
+}
+
+impl<V: AccountReservesView> ObservedAccount<V> {
+    /// Records a live account read of `view` at `ledger_sequence`, made at
+    /// host time `observed_at_ms`, whose ledger closed no earlier than
+    /// `close_time_floor_ms`.
+    ///
+    /// Callers construct it only from a live account read, immediately after
+    /// the read returns.
+    #[must_use]
+    pub fn new(
+        view: V,
+        ledger_sequence: u32,
+        observed_at_ms: u64,
+        close_time_floor_ms: u64,
+    ) -> Self {
+        Self {
+            view,
+            ledger_sequence,
+            observed_at_ms,
+            close_time_floor_ms,
+        }
+    }
+
+    /// Returns the account view the read produced.
+    #[must_use]
+    pub fn view(&self) -> &V {
+        &self.view
+    }
+}
+
+impl<V: AccountReservesView> AccountReservesView for ObservedAccount<V> {
+    fn reserves_stroops(&self, base_reserve_stroops: i64) -> i64 {
+        self.view.reserves_stroops(base_reserve_stroops)
+    }
+
+    fn balance_stroops(&self) -> Result<i64, AccountReserveLookupError> {
+        self.view.balance_stroops()
+    }
+
+    fn observation(&self) -> Option<AccountObservation> {
+        Some(AccountObservation {
+            ledger_sequence: self.ledger_sequence,
+            observed_at_ms: self.observed_at_ms,
+            close_time_floor_ms: self.close_time_floor_ms,
+        })
+    }
+}
+
+/// The account input of the `balance_floor` criterion: an observed account
+/// and the native reservations that count against it.
+///
+/// Callers pass it as the `account_view` of an evaluation. It delegates the
+/// reserve, balance, and observation facts to `observed` and supplies
+/// `effective_reservations_stroops` as the reservation sum.
+///
+/// # Examples
+///
+/// ```
+/// use stellar_agent_core::policy::v1::{
+///     AccountReserveLookupError, AccountReservesView, FloorInput, ObservedAccount,
+/// };
+///
+/// struct Balance(i64);
+/// impl AccountReservesView for Balance {
+///     fn reserves_stroops(&self, base_reserve_stroops: i64) -> i64 {
+///         2 * base_reserve_stroops
+///     }
+///     fn balance_stroops(&self) -> Result<i64, AccountReserveLookupError> {
+///         Ok(self.0)
+///     }
+/// }
+///
+/// let observed = ObservedAccount::new(Balance(50), 100, 1_000, 900);
+/// let input = FloorInput { observed: &observed, effective_reservations_stroops: 7 };
+/// assert_eq!(input.effective_native_reservations_stroops(), Some(7));
+/// assert_eq!(input.observation(), observed.observation());
+/// ```
+#[derive(Debug, Clone, Copy)]
+pub struct FloorInput<'a, V: AccountReservesView> {
+    /// The observed operating account.
+    pub observed: &'a ObservedAccount<V>,
+    /// The native reservations of the profile's authorizations that count
+    /// against the account, in stroops.
+    pub effective_reservations_stroops: u64,
+}
+
+impl<V: AccountReservesView> AccountReservesView for FloorInput<'_, V> {
+    fn reserves_stroops(&self, base_reserve_stroops: i64) -> i64 {
+        self.observed.reserves_stroops(base_reserve_stroops)
+    }
+
+    fn balance_stroops(&self) -> Result<i64, AccountReserveLookupError> {
+        self.observed.balance_stroops()
+    }
+
+    fn observation(&self) -> Option<AccountObservation> {
+        self.observed.observation()
+    }
+
+    fn effective_native_reservations_stroops(&self) -> Option<u64> {
+        Some(self.effective_reservations_stroops)
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -598,6 +785,18 @@ pub struct EvalContext<'a> {
     /// bundle.
     ///
     pub bundle: Option<&'a BundleView<'a>>,
+    /// The BLAKE3 digest of the signed policy's canonical bytes.
+    ///
+    /// The epoch of a `total_budget` allocation. All zeros for an engine built
+    /// outside the verified loader; `total_budget` then refuses rather than
+    /// count against an unidentified epoch.
+    pub policy_digest: [u8; 32],
+    /// Whether the evaluation defers the account-dependent criteria.
+    ///
+    /// Set only by [`crate::policy::PolicyEngine::evaluate_provisional`].
+    /// `minimum_reserve` and `balance_floor` pass while it is set; no other
+    /// criterion reads it.
+    pub provisional: bool,
 }
 
 impl<'a> EvalContext<'a> {
@@ -666,7 +865,29 @@ impl<'a> EvalContext<'a> {
             sep45_sessions: None,
             state_store,
             bundle: None,
+            policy_digest: [0; 32],
+            provisional: false,
         }
+    }
+
+    /// Returns `self` with the `policy_digest` field set.
+    ///
+    /// Builder-style; consumes and returns `self`. Supply the digest of the
+    /// signed policy when a `total_budget` criterion is evaluated directly.
+    #[must_use]
+    pub fn with_policy_digest(mut self, policy_digest: [u8; 32]) -> Self {
+        self.policy_digest = policy_digest;
+        self
+    }
+
+    /// Returns `self` with the `provisional` field set.
+    ///
+    /// Builder-style; consumes and returns `self`. A provisional context lets
+    /// `minimum_reserve` and `balance_floor` pass without an account read.
+    #[must_use]
+    pub fn with_provisional(mut self, provisional: bool) -> Self {
+        self.provisional = provisional;
+        self
     }
 
     /// Returns `self` with the `value` field set.
@@ -938,6 +1159,13 @@ pub struct PolicyEngineV1 {
     /// store when sharing state across engine instances.  The default constructor
     /// allocates a fresh per-engine store.
     state_store: PolicyStateStore,
+    /// The BLAKE3 digest of the signed policy's canonical bytes, the epoch of
+    /// its `total_budget` allocations.
+    ///
+    /// Set by the verified loader through `new_verified`; all zeros for an
+    /// engine built with [`PolicyEngineV1::new`] or
+    /// [`PolicyEngineV1::new_with_store`].
+    policy_digest: [u8; 32],
 }
 
 impl PolicyEngineV1 {
@@ -979,6 +1207,7 @@ impl PolicyEngineV1 {
             profile_name,
             project_id,
             state_store: PolicyStateStore::new(),
+            policy_digest: [0; 32],
         }
     }
 
@@ -1017,7 +1246,42 @@ impl PolicyEngineV1 {
             profile_name,
             project_id,
             state_store,
+            policy_digest: [0; 32],
         }
+    }
+
+    /// Constructs the engine of a verified policy, recording the digest of
+    /// `canonical_bytes`, the bytes its owner signature covers.
+    ///
+    /// The digest is the one [`crate::mainnet::verified_policy::VerifiedPolicy::digest`]
+    /// reports, so `total_budget` counts against the policy the loader
+    /// verified.
+    pub(crate) fn new_verified(
+        document: PolicyDocument,
+        profile_name: String,
+        state_store: PolicyStateStore,
+        canonical_bytes: &[u8],
+    ) -> Self {
+        Self {
+            policy_digest: crate::mainnet::verified_policy::policy_digest(canonical_bytes),
+            ..Self::new_with_store(document, profile_name, state_store)
+        }
+    }
+
+    /// Returns the engine with `policy_digest` set, for tests that evaluate a
+    /// `total_budget` criterion without the verified loader.
+    #[cfg(any(test, feature = "test-helpers"))]
+    #[must_use]
+    pub fn with_policy_digest_for_test(mut self, policy_digest: [u8; 32]) -> Self {
+        self.policy_digest = policy_digest;
+        self
+    }
+
+    /// Returns the BLAKE3 digest of the signed policy's canonical bytes, or
+    /// all zeros for an engine built outside the verified loader.
+    #[must_use]
+    pub fn policy_digest(&self) -> [u8; 32] {
+        self.policy_digest
     }
 
     /// Returns all rules from `self.document` when the document scope matches
@@ -1163,7 +1427,7 @@ impl PolicyEngine for PolicyEngineV1 {
         // supply their resolved effects via `evaluate_with_value_full` instead.
         let value = value::derive_value_class(&tool.name, args);
         self.assert_value_kind_populated(tool, &value);
-        let decision = self.evaluate_inner(
+        let (decision, class) = self.evaluate_inner(
             tool,
             args,
             profile,
@@ -1173,10 +1437,12 @@ impl PolicyEngine for PolicyEngineV1 {
             counterparty_cache,
             sep10_sessions,
             sep45_sessions,
+            false,
         )?;
         Ok(crate::policy::Evaluation {
-            value_effects: value_effects_on_permitted_decision(&decision, &value),
+            value_effects: value_effects_on_permitted_decision(&decision, &value, class),
             decision,
+            provisional: false,
         })
     }
 
@@ -1222,7 +1488,7 @@ impl PolicyEngine for PolicyEngineV1 {
         // it signs (the single-decode invariant); use it as-is and echo it back
         // for allowed and approval-required calls so recording uses the gate sizing.
         self.assert_value_kind_populated(tool, &value);
-        let decision = self.evaluate_inner(
+        let (decision, class) = self.evaluate_inner(
             tool,
             args,
             profile,
@@ -1232,10 +1498,48 @@ impl PolicyEngine for PolicyEngineV1 {
             counterparty_cache,
             sep10_sessions,
             sep45_sessions,
+            false,
         )?;
         Ok(crate::policy::Evaluation {
-            value_effects: value_effects_on_permitted_decision(&decision, &value),
+            value_effects: value_effects_on_permitted_decision(&decision, &value, class),
             decision,
+            provisional: false,
+        })
+    }
+
+    /// Evaluates with `minimum_reserve` and `balance_floor` deferred: both pass
+    /// without an account read, and every other criterion decides as in
+    /// [`PolicyEngine::evaluate_with_value_full`], escalations included. The
+    /// result is marked provisional.
+    fn evaluate_provisional(
+        &self,
+        tool: &ToolDescriptor,
+        args: &Value,
+        profile: &Profile,
+        value: value::ValueClass,
+        account_view: Option<&dyn AccountReservesView>,
+        identity_view: Option<&dyn AccountIdentityView>,
+        counterparty_cache: Option<&dyn CounterpartyCacheView>,
+        sep10_sessions: Option<&dyn Sep10SessionView>,
+        sep45_sessions: Option<&dyn Sep45SessionView>,
+    ) -> Result<crate::policy::Evaluation, PolicyError> {
+        self.assert_value_kind_populated(tool, &value);
+        let (decision, class) = self.evaluate_inner(
+            tool,
+            args,
+            profile,
+            &value,
+            account_view,
+            identity_view,
+            counterparty_cache,
+            sep10_sessions,
+            sep45_sessions,
+            true,
+        )?;
+        Ok(crate::policy::Evaluation {
+            value_effects: value_effects_on_permitted_decision(&decision, &value, class),
+            decision,
+            provisional: true,
         })
     }
 
@@ -1313,17 +1617,39 @@ impl PolicyEngine for PolicyEngineV1 {
 }
 
 /// Carries the resolved value effects for calls that may proceed after any
-/// required approval. Denials and calls without sized value carry no effects.
+/// required approval, with the recipient class the evaluation assigned.
+/// Denials and calls without sized value carry no effects.
 fn value_effects_on_permitted_decision(
     decision: &Decision,
     value: &value::ValueClass,
+    class: Option<RecipientClass>,
 ) -> Option<value::ValueEffects> {
     match (decision, value) {
         (Decision::Allow | Decision::RequireApproval(_), value::ValueClass::Value(effects)) => {
-            Some(effects.clone())
+            Some(effects.clone().with_recipient_class(class))
         }
         _ => None,
     }
+}
+
+/// Returns the strictest recipient class the counterparty criteria of `rule`
+/// assign to the call, or `None` when no counterparty criterion classifies it.
+///
+/// The criteria are found by type, as the loader finds them.
+fn strictest_recipient_class(
+    rule: &PolicyRule,
+    ctx: &EvalContext<'_>,
+) -> Result<Option<RecipientClass>, PolicyError> {
+    let mut strictest = None;
+    for criterion in &rule.criteria {
+        let Some(counterparty) = (criterion.as_ref() as &dyn std::any::Any)
+            .downcast_ref::<criteria::CounterpartyAllowlistCriterion>()
+        else {
+            continue;
+        };
+        strictest = RecipientClass::stricter(strictest, counterparty.recipient_class(ctx)?);
+    }
+    Ok(strictest)
 }
 
 impl PolicyEngineV1 {
@@ -1353,6 +1679,10 @@ impl PolicyEngineV1 {
     /// (which derives `value`) and [`PolicyEngine::evaluate_with_value`] (which
     /// receives it). Honours the per-rule `allow_opaque_signing` exemption by
     /// treating an opaque value as read-only for a rule that opted in.
+    ///
+    /// Returns the decision and, for a permitted decision, the strictest
+    /// recipient class of the matched rule's counterparty criteria.
+    /// `provisional` defers the account-dependent criteria.
     #[allow(clippy::too_many_arguments)]
     fn evaluate_inner(
         &self,
@@ -1365,7 +1695,8 @@ impl PolicyEngineV1 {
         counterparty_cache: Option<&dyn CounterpartyCacheView>,
         sep10_sessions: Option<&dyn Sep10SessionView>,
         sep45_sessions: Option<&dyn Sep45SessionView>,
-    ) -> Result<Decision, PolicyError> {
+        provisional: bool,
+    ) -> Result<(Decision, Option<RecipientClass>), PolicyError> {
         // project_id is cached at engine construction time from STELLAR_AGENT_PROJECT.
         let rules = self.matching_rules(&self.profile_name, self.project_id.as_deref());
 
@@ -1403,27 +1734,35 @@ impl PolicyEngineV1 {
                 state_store: &self.state_store,
                 // Single-tx path: no bundle view.
                 bundle: None,
+                policy_digest: self.policy_digest,
+                provisional,
             };
 
             let mut escalation = None;
             for criterion in &rule.criteria {
                 match criterion.evaluate_decision(&ctx)? {
                     Decision::Allow => {}
-                    Decision::Deny(deny) => return Ok(Decision::Deny(deny)),
+                    Decision::Deny(deny) => return Ok((Decision::Deny(deny), None)),
                     Decision::RequireApproval(request) => {
                         escalation.get_or_insert(request);
                     }
                 }
             }
 
-            return Ok(match (&rule.decision, escalation) {
+            let decision = match (&rule.decision, escalation) {
                 (Decision::Allow, Some(request)) => Decision::RequireApproval(request),
                 _ => rule.decision.clone(),
-            });
+            };
+            let class = if matches!(decision, Decision::Deny(_)) {
+                None
+            } else {
+                strictest_recipient_class(rule, &ctx)?
+            };
+            return Ok((decision, class));
         }
 
         // No matching rule — default-deny.
-        Ok(Decision::Deny(DenyReason::NoMatchingRule))
+        Ok((Decision::Deny(DenyReason::NoMatchingRule), None))
     }
 
     /// Returns the profile name this engine was constructed for.
@@ -1589,6 +1928,8 @@ impl PolicyEngineV1 {
                 sep45_sessions: None,
                 state_store: &self.state_store,
                 bundle: None,
+                policy_digest: self.policy_digest,
+                provisional: false,
             };
             let mut recorded = Vec::new();
             for criterion in &rule.criteria {
@@ -1616,7 +1957,9 @@ impl PolicyEngineV1 {
     ///
     /// 1. Reject bundles with `> 50` inners (hard floor; amplification defence).
     /// 2. Resolve the matching rule via [`Self::matching_rules`].  If no rule
-    ///    matches, return `Deny(NoMatchingRule)`.
+    ///    matches, return `Deny(NoMatchingRule)`. When a criterion of the rule
+    ///    records each inner ([`Criterion::records_bundle_inners`]), a `Generic`
+    ///    inner returns `Deny(BundleContainsGenericKind)`.
     /// 3. Build a mutable [`BundleStateOverlay`].
     /// 4. Phase 1 — per-inner evaluation of non-bundle-level criteria.
     ///    For each inner descriptor in `bundle.inners`:
@@ -1697,6 +2040,20 @@ impl PolicyEngineV1 {
             return Ok(Decision::Deny(DenyReason::NoMatchingRule));
         };
 
+        // A criterion that records each inner of a confirmed bundle cannot
+        // size an unrecognized inner at confirmation, so the bundle refuses
+        // before any inner is evaluated and is never submitted unrecordable.
+        if rule.criteria.iter().any(|c| c.records_bundle_inners())
+            && let Some(index) = bundle
+                .inners
+                .iter()
+                .position(|inner| matches!(inner, bundle::InnerOpDescriptor::Generic { .. }))
+        {
+            return Ok(Decision::Deny(DenyReason::BundleContainsGenericKind {
+                inner_index: u32::try_from(index).unwrap_or(u32::MAX),
+            }));
+        }
+
         // Build a mutable overlay for accumulating per-inner state.
         let mut overlay = BundleStateOverlay::default();
 
@@ -1740,6 +2097,8 @@ impl PolicyEngineV1 {
                     sep45_sessions: None,
                     state_store: &self.state_store,
                     bundle: Some(&inner_view),
+                    policy_digest: self.policy_digest,
+                    provisional: false,
                 };
                 let mut per_inner_deny: Option<DenyReason> = None;
                 for criterion in &rule.criteria {
@@ -1796,6 +2155,8 @@ impl PolicyEngineV1 {
                     sep45_sessions: None,
                     state_store: &self.state_store,
                     bundle: None,
+                    policy_digest: self.policy_digest,
+                    provisional: false,
                 };
                 for criterion in &rule.criteria {
                     if criterion.is_bundle_level() {
@@ -1831,6 +2192,8 @@ impl PolicyEngineV1 {
             sep45_sessions: None,
             state_store: &self.state_store,
             bundle: Some(&final_view),
+            policy_digest: self.policy_digest,
+            provisional: false,
         };
 
         // Implicit coupling: any value-summing bundle cap on the matched rule
@@ -1894,13 +2257,21 @@ impl PolicyEngineV1 {
     /// while `BundlePerPeriodCapCriterion` / `BundleRateLimitCriterion` record
     /// once per matching inner.
     ///
+    /// A criterion whose [`Criterion::records_bundle_inners`] is true
+    /// (`total_budget`, and `counterparty_allowlist` with an unlisted budget)
+    /// instead records each inner as a call of its own. Its context carries
+    /// the inner's value and the recipient class the rule's counterparty
+    /// criteria assign it without views, as [`Self::evaluate_bundle`] and the
+    /// bundle overlay saw it.
+    ///
     /// Mutates `self.state_store` in place and returns every
     /// `(key, timestamp_ms, amount)` tuple appended, for the caller to persist.
     ///
     /// # Errors
     ///
     /// Returns [`PolicyError::CriterionEvaluationFailed`] if any criterion's
-    /// `record_confirmed` fails.
+    /// `record_confirmed` fails, or if a criterion that records each inner
+    /// meets an inner that is not a recognized transfer.
     pub fn record_confirmed_bundle(
         &self,
         tool: &ToolDescriptor,
@@ -1926,14 +2297,74 @@ impl PolicyEngineV1 {
                 sep45_sessions: None,
                 state_store: &self.state_store,
                 bundle: Some(bundle),
+                policy_digest: self.policy_digest,
+                provisional: false,
             };
             let mut recorded = Vec::new();
             for criterion in &rule.criteria {
-                recorded.extend(criterion.record_confirmed(&ctx)?);
+                if criterion.records_bundle_inners() {
+                    for inner in bundle.inners {
+                        recorded.extend(self.record_confirmed_inner(
+                            rule,
+                            criterion.as_ref(),
+                            tool,
+                            profile,
+                            inner,
+                        )?);
+                    }
+                } else {
+                    recorded.extend(criterion.record_confirmed(&ctx)?);
+                }
             }
             return Ok(recorded);
         }
         Ok(Vec::new())
+    }
+
+    /// Records one inner of a confirmed bundle for a criterion that records
+    /// each inner as a call of its own.
+    ///
+    /// The inner's value carries the strictest recipient class of the rule's
+    /// counterparty criteria, classified without views as the bundle
+    /// evaluation classified it.
+    fn record_confirmed_inner(
+        &self,
+        rule: &PolicyRule,
+        criterion: &dyn Criterion,
+        tool: &ToolDescriptor,
+        profile: &Profile,
+        inner: &bundle::InnerOpDescriptor,
+    ) -> Result<Vec<criteria::state_store::WindowEntry>, PolicyError> {
+        let value::ValueClass::Value(effects) = value::value_class_for_inner(inner) else {
+            return Err(PolicyError::CriterionEvaluationFailed {
+                detail: format!(
+                    "{}: a confirmed bundle of tool '{}' carries an inner that is not a \
+                     recognized transfer and cannot be recorded",
+                    criterion.kind(),
+                    tool.name
+                ),
+            });
+        };
+        let mut ctx = EvalContext {
+            tool,
+            args: &Value::Null,
+            profile_name: &self.profile_name,
+            profile,
+            value: value::ValueClass::Value(effects.clone()),
+            account_view: None,
+            identity_view: None,
+            quorum: None,
+            counterparty_cache: None,
+            sep10_sessions: None,
+            sep45_sessions: None,
+            state_store: &self.state_store,
+            bundle: None,
+            policy_digest: self.policy_digest,
+            provisional: false,
+        };
+        let class = strictest_recipient_class(rule, &ctx)?;
+        ctx.value = value::ValueClass::Value(effects.with_recipient_class(class));
+        criterion.record_confirmed(&ctx)
     }
 
     /// Records a bundle and certifies the basis of its window entries.

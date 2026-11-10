@@ -68,7 +68,7 @@ pub(crate) const CRITERION_KEY_SETS: &[(&str, &[&str])] = &[
     ("rate_limit", &["kind", "window", "max_calls"]),
     (
         "counterparty_allowlist",
-        &["kind", "kinds", "allowlist", "gate_inflows"],
+        &["kind", "kinds", "allowlist", "gate_inflows", "unlisted"],
     ),
     ("minimum_reserve", &["kind", "margin_stroops"]),
     ("inner_invocation_count_cap", &["kind", "max_count"]),
@@ -84,7 +84,24 @@ pub(crate) const CRITERION_KEY_SETS: &[(&str, &[&str])] = &[
     ("home_domain_resolved", &["kind"]),
     ("sep10_session_active", &["kind"]),
     ("sep45_session_active", &["kind"]),
+    ("total_budget", &["kind", "asset", "max_stroops"]),
+    ("balance_floor", &["kind", "min_stroops"]),
+    ("memo_binding", &["kind", "bindings"]),
 ];
+
+/// Keys of the inline `unlisted` table of a `counterparty_allowlist`
+/// criterion. Modes `deny` and `approval` admit `mode` alone; the loader
+/// refuses the other keys with them.
+pub(crate) const UNLISTED_KEYS: &[&str] = &[
+    "mode",
+    "per_tx_stroops",
+    "per_period_stroops",
+    "asset",
+    "window",
+];
+
+/// Keys of one element of a `memo_binding` criterion's `bindings` array.
+pub(crate) const MEMO_BINDING_KEYS: &[&str] = &["destination", "kind", "value"];
 
 /// Returns the closed key set of the criterion kind `kind`, or `None` when the
 /// loader does not support the kind.
@@ -107,7 +124,9 @@ pub(crate) fn criterion_keys(kind: &str) -> Option<&'static [&'static str]> {
 /// 3. The `[signature]` and `[owner_rotation]` tables.
 /// 4. Each rule of a `[[rules]]` array or an inline `rules = [...]` array in
 ///    order, with its `match` table and its criteria. Each criterion is checked
-///    against the key set of its `kind`.
+///    against the key set of its `kind`, then an inline `unlisted` table of a
+///    `counterparty_allowlist` criterion and each inline element of a
+///    `memo_binding` criterion's `bindings` array against their own sets.
 ///
 /// A container of another shape, and a criterion whose `kind` is absent, not
 /// a string, or not a supported kind, is left to the loader's own diagnostics.
@@ -115,7 +134,8 @@ pub(crate) fn criterion_keys(kind: &str) -> Option<&'static [&'static str]> {
 /// The first container that holds an unknown key is reported with the
 /// loader's location form and the keys that container accepts, for example
 /// `rule[0].match: unknown key; match accepts tool, chain`. The other
-/// locations are `rule[1]`, `rule[2].criteria[0]`, `mainnet`,
+/// locations are `rule[1]`, `rule[2].criteria[0]`,
+/// `rule[2].criteria[0].unlisted`, `rule[2].criteria[0].bindings[1]`, `mainnet`,
 /// `mainnet.cross_check_thresholds`, `signature`, `owner_rotation`, and no
 /// location for a top-level key. The rejected key is never part of the detail.
 ///
@@ -250,12 +270,42 @@ fn validate_rule_keys(rule: &dyn TableLike, idx: usize) -> Result<(), PolicyErro
             else {
                 continue;
             };
+            let criterion_loc = format!("{loc}.criteria[{criterion_idx}]");
             reject_unknown_keys(
                 criterion,
                 keys,
-                Some(&format!("{loc}.criteria[{criterion_idx}]")),
+                Some(&criterion_loc),
                 &format!("a `{kind}` criterion"),
             )?;
+            match kind {
+                "counterparty_allowlist" => {
+                    if let Some(unlisted) =
+                        criterion.get("unlisted").and_then(Value::as_inline_table)
+                    {
+                        reject_unknown_keys(
+                            unlisted,
+                            UNLISTED_KEYS,
+                            Some(&format!("{criterion_loc}.unlisted")),
+                            "an `unlisted` table",
+                        )?;
+                    }
+                }
+                "memo_binding" => {
+                    if let Some(bindings) = criterion.get("bindings").and_then(Value::as_array) {
+                        for (binding_idx, binding) in bindings.iter().enumerate() {
+                            if let Some(binding) = binding.as_inline_table() {
+                                reject_unknown_keys(
+                                    binding,
+                                    MEMO_BINDING_KEYS,
+                                    Some(&format!("{criterion_loc}.bindings[{binding_idx}]")),
+                                    "a binding",
+                                )?;
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
         }
     }
 
@@ -267,7 +317,7 @@ fn validate_rule_keys(rule: &dyn TableLike, idx: usize) -> Result<(), PolicyErro
 /// `location` prefixes the detail in the loader's form; `owner` names the
 /// container in the list of accepted keys. The rejected key is not part of the
 /// detail: a policy key is operator input and may hold a secret.
-fn reject_unknown_keys(
+pub(crate) fn reject_unknown_keys(
     table: &dyn TableLike,
     accepted: &[&str],
     location: Option<&str>,

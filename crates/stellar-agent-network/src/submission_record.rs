@@ -2003,6 +2003,7 @@ mod tests {
                         window: window.clone(),
                         max_calls: 2,
                     },
+                    other => other.clone(),
                 };
                 WindowEntry::new(
                     entry.key().clone(),

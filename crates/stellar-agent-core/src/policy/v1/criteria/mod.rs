@@ -25,6 +25,9 @@
 //! | `home_domain_resolved` | `HomeDomainResolvedCriterion` | `"home_domain_resolved"` |
 //! | `sep10_session_active` | `Sep10SessionActiveCriterion` | `"sep10_session_active"` |
 //! | `sep45_session_active` | `Sep45SessionActiveCriterion` | `"sep45_session_active"` |
+//! | `total_budget` | `TotalBudgetCriterion` | `"total_budget"` |
+//! | `balance_floor` | `BalanceFloorCriterion` | `"balance_floor"` |
+//! | `memo_binding` | `MemoBindingCriterion` | `"memo_binding"` |
 
 use crate::policy::v1::EvalContext;
 use crate::policy::v1::bundle::{BundleStateOverlay, InnerOpDescriptor};
@@ -34,6 +37,7 @@ pub(crate) mod amount_extract;
 pub mod approval_above;
 /// Restricts every valued leg to pinned asset identities.
 pub mod asset_allowlist;
+pub mod balance_floor;
 pub mod bundle_aggregate_cap;
 pub mod bundle_per_period_cap;
 pub mod bundle_per_tx_cap;
@@ -41,6 +45,7 @@ pub mod bundle_rate_limit;
 pub mod counterparty_allowlist;
 pub mod home_domain_resolved;
 pub mod inner_invocation_count_cap;
+pub mod memo_binding;
 pub mod minimum_reserve;
 pub mod per_period_cap;
 pub mod per_tx_cap;
@@ -50,8 +55,10 @@ pub mod restrict_bundle_to_recognised_kinds;
 pub mod sep10_session_active;
 pub mod sep45_session_active;
 pub mod state_store;
+pub mod total_budget;
 
 pub use approval_above::ApprovalAboveCriterion;
+pub use balance_floor::BalanceFloorCriterion;
 pub use bundle_aggregate_cap::BundleAggregateCapCriterion;
 pub use bundle_per_period_cap::BundlePerPeriodCapCriterion;
 pub use bundle_per_tx_cap::BundlePerTxCapCriterion;
@@ -59,6 +66,7 @@ pub use bundle_rate_limit::BundleRateLimitCriterion;
 pub use counterparty_allowlist::CounterpartyAllowlistCriterion;
 pub use home_domain_resolved::HomeDomainResolvedCriterion;
 pub use inner_invocation_count_cap::InnerInvocationCountCapCriterion;
+pub use memo_binding::MemoBindingCriterion;
 pub use minimum_reserve::MinimumReserveCriterion;
 pub use per_period_cap::PerPeriodCapCriterion;
 pub use per_tx_cap::PerTxCapCriterion;
@@ -68,6 +76,7 @@ pub use restrict_bundle_to_recognised_kinds::RestrictBundleToRecognisedKindsCrit
 pub use sep10_session_active::Sep10SessionActiveCriterion;
 pub use sep45_session_active::Sep45SessionActiveCriterion;
 pub use state_store::{PolicyStateStore, WindowEntry, WindowLimit};
+pub use total_budget::TotalBudgetCriterion;
 
 /// A single policy criterion evaluated against an [`EvalContext`].
 ///
@@ -188,6 +197,21 @@ pub trait Criterion: Send + Sync + std::fmt::Debug + std::any::Any {
     /// amount caps) is never enforced for that criterion.  Per-inner stateful
     /// criteria (`per_period_cap`, `rate_limit`) MUST keep the default `false`.
     fn is_bundle_level(&self) -> bool {
+        false
+    }
+
+    /// Whether this criterion records each inner transfer of a confirmed
+    /// bundle as a call of its own.
+    ///
+    /// [`crate::policy::v1::PolicyEngineV1::record_confirmed_bundle`] gives
+    /// such a criterion one context per inner, valued and classified as
+    /// [`crate::policy::v1::PolicyEngineV1::evaluate_bundle`] evaluated it, and
+    /// fails when an inner cannot be sized. The bundle evaluation therefore
+    /// refuses an unrecognized inner under a rule carrying such a criterion
+    /// before it evaluates any inner.
+    ///
+    /// Default `false`.
+    fn records_bundle_inners(&self) -> bool {
         false
     }
 

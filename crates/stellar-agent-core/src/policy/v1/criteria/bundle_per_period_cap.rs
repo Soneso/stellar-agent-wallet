@@ -395,6 +395,8 @@ mod tests {
             sep45_sessions: None,
             state_store: store,
             bundle: view,
+            policy_digest: [0; 32],
+            provisional: false,
         }
     }
 

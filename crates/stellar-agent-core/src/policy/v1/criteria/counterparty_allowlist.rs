@@ -33,7 +33,10 @@
 //!
 //! Extracts `args["destination"]` and validates it as a G-strkey via
 //! [`stellar_strkey::ed25519::PublicKey::from_string`].  If the destination is
-//! not on the allowlist, returns [`DenyReason::CounterpartyDenied`].
+//! not on the allowlist, returns [`DenyReason::CounterpartyDenied`]. A debit
+//! leg's muxed (M) destination is checked by its base account, as the
+//! envelope decoder reduces a muxed XDR destination; the denial names the
+//! destination as given.
 //!
 //! # C_ACCOUNT logic
 //!
@@ -122,13 +125,47 @@
 //! mode for operator triage: no on-chain domain, non-ASCII homoglyph, cache
 //! not populated, no live domain binding in the cache, account not listed by the
 //! domain's `stellar.toml`, or (only once verified) not on the allowlist.
+//!
+//! # Unlisted recipients
+//!
+//! A version 2 policy can give one criterion an `unlisted` table. It decides a
+//! call whose only failure is a debit recipient that is well-formed, verified,
+//! and outside this criterion's own list ([`RecipientClass::Unlisted`]):
+//!
+//! ```toml
+//! { kind = "counterparty_allowlist", kinds = ["G_ACCOUNT"], allowlist = ["GABC..."], unlisted = { mode = "approval" } }
+//! { kind = "counterparty_allowlist", kinds = ["G_ACCOUNT"], allowlist = ["GABC..."], unlisted = { mode = "budget", per_tx_stroops = 2000000, per_period_stroops = 5000000, asset = "native", window = "1d" } }
+//! ```
+//!
+//! - `deny`, the default, returns the criterion's denial.
+//! - `approval` requires approval at any amount.
+//! - `budget` admits the call when its debit in `asset` stays within
+//!   `per_tx_stroops` and, with the window's earlier unlisted debits, within
+//!   `per_period_stroops`. Every rule's budget in one asset and window shares
+//!   the bucket `unlisted:<asset>`.
+//!
+//! A missing destination or asset, an unverified home domain, or an
+//! unsupported kind is [`RecipientClass::Unverifiable`] and keeps the denial in
+//! every mode, as do an inflow-leg denial and the raw-argument path. The
+//! strictest class over the debit legs governs the call.
 
-use stellar_strkey::{Contract, ed25519::PublicKey};
+use stellar_strkey::{
+    Contract,
+    ed25519::{MuxedAccount, PublicKey},
+};
 
 use crate::policy::v1::EvalContext;
+use crate::policy::v1::asset_equivalence::assets_equivalent;
+use crate::policy::v1::bundle::{BundleStateOverlay, InnerOpDescriptor};
 use crate::policy::v1::criteria::Criterion;
-use crate::policy::v1::value::{ValueEffects, ValueGate, classify_value};
-use crate::policy::{DenyReason, PolicyError};
+use crate::policy::v1::criteria::per_period_cap::{Window, system_time_to_ms};
+use crate::policy::v1::criteria::state_store::{StateKey, WindowEntry, WindowLimit};
+use crate::policy::v1::loader::DEFAULT_APPROVAL_TTL_SECONDS;
+use crate::policy::v1::value::{
+    ValueClass, ValueEffects, ValueGate, ValueLeg, asset_normalise, classify_value,
+    value_class_for_inner,
+};
+use crate::policy::{ApprovalRequest, Decision, DenyReason, PolicyError, UnlistedBound};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // CounterpartyKind
@@ -201,6 +238,158 @@ impl CounterpartyKind {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// RecipientClass / UnlistedMode
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The class a counterparty criterion assigns to the recipients of a call.
+///
+/// Only debit legs are classified; an inflow leg has no recipient class. The
+/// strictest class over the legs and kinds governs the call:
+/// `Unverifiable`, then `Unlisted`, then `Listed`.
+///
+/// # Examples
+///
+/// ```
+/// use stellar_agent_core::policy::v1::criteria::counterparty_allowlist::RecipientClass;
+///
+/// assert_ne!(RecipientClass::Listed, RecipientClass::Unlisted);
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecipientClass {
+    /// The criterion's own list names every recipient.
+    Listed,
+    /// A well-formed, verified recipient outside the criterion's list.
+    Unlisted,
+    /// A recipient the criterion cannot establish: a missing destination or
+    /// asset, an unverified home domain, or an unsupported kind.
+    Unverifiable,
+}
+
+impl RecipientClass {
+    fn rank(self) -> u8 {
+        match self {
+            Self::Listed => 0,
+            Self::Unlisted => 1,
+            Self::Unverifiable => 2,
+        }
+    }
+
+    /// Returns the stricter of two optional classes. A present class is
+    /// stricter than an absent one.
+    pub(crate) fn stricter(a: Option<Self>, b: Option<Self>) -> Option<Self> {
+        match (a, b) {
+            (Some(a), Some(b)) => Some(if b.rank() > a.rank() { b } else { a }),
+            (a, None) => a,
+            (None, b) => b,
+        }
+    }
+}
+
+/// How a `counterparty_allowlist` criterion treats a well-formed, verified
+/// recipient outside its list.
+///
+/// A missing or unverified recipient never reaches the mode: it is refused
+/// with the criterion's own denial in every mode.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum UnlistedMode {
+    /// Refuse with the criterion's denial, as a criterion without the mode does.
+    Deny,
+    /// Require approval at any amount; every other criterion still applies.
+    Approval,
+    /// Admit the payment within a per-transaction and a rolling-window bound.
+    Budget(UnlistedBudget),
+}
+
+/// The bounds of an unlisted-recipient budget.
+///
+/// # Examples
+///
+/// ```
+/// use stellar_agent_core::policy::v1::criteria::counterparty_allowlist::UnlistedBudget;
+/// use stellar_agent_core::policy::v1::criteria::per_period_cap::Window;
+///
+/// let budget = UnlistedBudget::new("native".into(), 10, 40, Window::parse("1d").unwrap());
+/// assert_eq!(budget.per_tx_stroops(), 10);
+/// assert_eq!(budget.per_period_stroops(), 40);
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnlistedBudget {
+    asset: String,
+    per_tx_stroops: i128,
+    per_period_stroops: i128,
+    window: Window,
+}
+
+impl UnlistedBudget {
+    /// Constructs a budget of `per_tx_stroops` per call and
+    /// `per_period_stroops` per `window` in `asset`.
+    #[must_use]
+    pub fn new(
+        asset: String,
+        per_tx_stroops: i128,
+        per_period_stroops: i128,
+        window: Window,
+    ) -> Self {
+        Self {
+            asset,
+            per_tx_stroops,
+            per_period_stroops,
+            window,
+        }
+    }
+
+    /// Returns the budget asset identifier.
+    #[must_use]
+    pub fn asset(&self) -> &str {
+        &self.asset
+    }
+
+    /// Returns the per-transaction bound in stroops.
+    #[must_use]
+    pub fn per_tx_stroops(&self) -> i128 {
+        self.per_tx_stroops
+    }
+
+    /// Returns the rolling-window bound in stroops.
+    #[must_use]
+    pub fn per_period_stroops(&self) -> i128 {
+        self.per_period_stroops
+    }
+
+    /// Returns the rolling window.
+    #[must_use]
+    pub fn window(&self) -> Window {
+        self.window
+    }
+
+    /// The bucket every rule's unlisted budget in this asset and window
+    /// shares, at scope specificity 1 as `per_period_cap` uses.
+    fn state_key(&self, profile_name: &str) -> StateKey {
+        StateKey::new(
+            profile_name,
+            1,
+            &format!("unlisted:{}", asset_normalise(&self.asset)),
+            self.window.as_secs(),
+        )
+    }
+
+    /// The limit every recorded entry carries, so the durable reservation
+    /// write re-applies the rolling-window bound.
+    fn window_limit(&self) -> WindowLimit {
+        WindowLimit::Unlisted {
+            asset: self.asset.clone(),
+            window: self.window.label().to_owned(),
+            max_stroops: self.per_period_stroops,
+        }
+    }
+}
+
+/// The fixed reason of an unlisted-recipient approval. It names no address.
+const UNLISTED_APPROVAL_REASON: &str =
+    "counterparty_allowlist: an unlisted recipient requires approval";
+
+// ─────────────────────────────────────────────────────────────────────────────
 // CounterpartyAllowlistCriterion
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -209,6 +398,10 @@ impl CounterpartyKind {
 /// Checks that the destination account or asset issuer is present in the
 /// configured `allowlist` for each of the specified `kinds`.  All kinds are
 /// checked; the first denial wins.
+///
+/// An optional [`UnlistedMode`] decides a call whose only failure is a
+/// well-formed, verified recipient outside the list. Every other failure keeps
+/// the criterion's first denial in every mode.
 ///
 /// # Examples
 ///
@@ -235,6 +428,8 @@ pub struct CounterpartyAllowlistCriterion {
     /// descriptor (debit and inflow alike) instead of debit legs only.  See
     /// the module-level `# KNOWN_ISSUER logic` section.  Defaults to `false`.
     gate_inflows: bool,
+    /// The treatment of an unlisted recipient; `None` keeps the denial.
+    unlisted: Option<UnlistedMode>,
 }
 
 impl CounterpartyAllowlistCriterion {
@@ -260,6 +455,7 @@ impl CounterpartyAllowlistCriterion {
             kinds,
             allowlist,
             gate_inflows: false,
+            unlisted: None,
         }
     }
 
@@ -284,16 +480,125 @@ impl CounterpartyAllowlistCriterion {
         self
     }
 
+    /// Sets the treatment of an unlisted recipient.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use stellar_agent_core::policy::v1::criteria::counterparty_allowlist::{
+    ///     CounterpartyAllowlistCriterion, CounterpartyKind, UnlistedMode,
+    /// };
+    ///
+    /// let criterion = CounterpartyAllowlistCriterion::new(
+    ///     vec![CounterpartyKind::GAccount],
+    ///     vec!["GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN".to_owned()],
+    /// )
+    /// .with_unlisted(UnlistedMode::Approval);
+    /// assert_eq!(criterion.unlisted(), Some(&UnlistedMode::Approval));
+    /// ```
+    #[must_use]
+    pub fn with_unlisted(mut self, mode: UnlistedMode) -> Self {
+        self.unlisted = Some(mode);
+        self
+    }
+
     /// Returns whether the `KNOWN_ISSUER`-only inflow-gating opt-in is set.
     #[must_use]
     pub fn gate_inflows(&self) -> bool {
         self.gate_inflows
+    }
+
+    /// Returns the treatment of an unlisted recipient, or `None` when the
+    /// criterion carries no `unlisted` table.
+    #[must_use]
+    pub fn unlisted(&self) -> Option<&UnlistedMode> {
+        self.unlisted.as_ref()
+    }
+
+    /// Returns the budget of a criterion in budget mode.
+    fn budget(&self) -> Option<&UnlistedBudget> {
+        match &self.unlisted {
+            Some(UnlistedMode::Budget(budget)) => Some(budget),
+            _ => None,
+        }
+    }
+
+    /// Classifies the recipients of the call against this criterion's own
+    /// list.
+    ///
+    /// Returns `None` unless the call carries resolved value effects. Debit
+    /// legs only are classified, with the same per-kind checks the criterion
+    /// applies; with no debit leg the class is `Listed`. A muxed destination
+    /// is classified by its base account.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PolicyError::CriterionEvaluationFailed`] for a malformed
+    /// destination strkey or asset issuer, as the criterion's evaluation does.
+    pub fn recipient_class(
+        &self,
+        ctx: &EvalContext<'_>,
+    ) -> Result<Option<RecipientClass>, PolicyError> {
+        let ValueGate::Effects(effects) = classify_value(ctx) else {
+            return Ok(None);
+        };
+        Ok(Some(self.classify_effects(ctx, effects)?.class))
+    }
+}
+
+/// The result of an evaluation before it maps to the deny-only or the
+/// decision interface.
+enum Outcome {
+    Pass,
+    Deny(DenyReason),
+    /// An unlisted recipient under `approval`, with the denial the deny-only
+    /// interface returns.
+    Escalate(DenyReason),
+}
+
+/// The classification of every leg of a call against one criterion.
+struct Classification {
+    /// The strictest class over the debit legs.
+    class: RecipientClass,
+    /// Whether an inflow leg fails the `gate_inflows` issuer check.
+    inflow_denied: bool,
+}
+
+/// The outcome of one counterparty check, with the denial it produces.
+enum Check {
+    Listed,
+    Unlisted(DenyReason),
+    Unverifiable(DenyReason),
+}
+
+impl Check {
+    fn class(&self) -> RecipientClass {
+        match self {
+            Self::Listed => RecipientClass::Listed,
+            Self::Unlisted(_) => RecipientClass::Unlisted,
+            Self::Unverifiable(_) => RecipientClass::Unverifiable,
+        }
+    }
+
+    fn denial(self) -> Option<DenyReason> {
+        match self {
+            Self::Listed => None,
+            Self::Unlisted(denial) | Self::Unverifiable(denial) => Some(denial),
+        }
     }
 }
 
 impl Criterion for CounterpartyAllowlistCriterion {
     fn kind(&self) -> &'static str {
         "counterparty_allowlist"
+    }
+
+    fn windowed(&self) -> bool {
+        self.budget().is_some()
+    }
+
+    fn records_bundle_inners(&self) -> bool {
+        self.budget().is_some()
     }
 
     /// Evaluates each configured kind against the current tool call.
@@ -306,39 +611,340 @@ impl Criterion for CounterpartyAllowlistCriterion {
     /// `Ok(Some(DenyReason::CounterpartyKindUnsupported))` when an unsupported
     /// kind (`SEP10_IDENTITY`, `ONE_TIME_ADDRESS`) is listed.
     ///
+    /// Under `unlisted.mode = "approval"` an unlisted recipient returns the
+    /// denial here; [`Criterion::evaluate_decision`] escalates it. Under
+    /// `budget` an unlisted recipient passes within both bounds and refuses
+    /// with [`DenyReason::UnlistedBudgetExceeded`] beyond either.
+    ///
     /// # Errors
     ///
     /// Returns [`PolicyError::CriterionEvaluationFailed`] when the destination
     /// field is missing or is not a valid strkey.
     fn evaluate(&self, ctx: &EvalContext<'_>) -> Result<Option<DenyReason>, PolicyError> {
-        // The shared fail-closed gate: an opaque-sign call under a matched
-        // rule (without `allow_opaque_signing`) or a forgotten `MovesValue`
-        // population denies here. `NotApplicable` (a genuinely read-only call,
-        // or a tool the descriptor derivation has not classified) falls
-        // through to the legacy per-kind path below, unchanged.
-        match classify_value(ctx) {
-            ValueGate::Deny(reason) => return Ok(Some(reason)),
-            ValueGate::Effects(effects) => {
-                for kind in &self.kinds {
-                    if let Some(deny) = self.evaluate_kind_over_effects(kind, ctx, effects)? {
-                        return Ok(Some(deny));
-                    }
-                }
-                return Ok(None);
-            }
-            ValueGate::NotApplicable => {}
-        }
+        Ok(match self.outcome(ctx)? {
+            Outcome::Pass => None,
+            Outcome::Deny(denial) | Outcome::Escalate(denial) => Some(denial),
+        })
+    }
 
-        for kind in &self.kinds {
-            if let Some(deny) = self.evaluate_kind(kind, ctx)? {
-                return Ok(Some(deny));
-            }
+    /// Escalates an unlisted recipient under `approval` with the default
+    /// approval lifetime and a fixed reason that names no address.
+    fn evaluate_decision(&self, ctx: &EvalContext<'_>) -> Result<Decision, PolicyError> {
+        Ok(match self.outcome(ctx)? {
+            Outcome::Pass => Decision::Allow,
+            Outcome::Deny(denial) => Decision::Deny(denial),
+            Outcome::Escalate(_) => Decision::RequireApproval(
+                ApprovalRequest::new(String::new(), DEFAULT_APPROVAL_TTL_SECONDS)
+                    .with_reason(UNLISTED_APPROVAL_REASON.to_owned()),
+            ),
+        })
+    }
+
+    /// Accumulates an unlisted inner's transfer into the budget's bundle
+    /// overlay, under the key the budget check reads.
+    ///
+    /// The inner is classified against the list without account views, as the
+    /// bundle evaluation checks it. A listed inner consumes no budget.
+    fn accumulate_overlay(
+        &self,
+        ctx: &EvalContext<'_>,
+        inner: &InnerOpDescriptor,
+        overlay: &mut BundleStateOverlay,
+    ) {
+        let Some(budget) = self.budget() else {
+            return;
+        };
+        let InnerOpDescriptor::TokenTransfer { asset, amount, .. } = inner else {
+            return;
+        };
+        let inner_ctx = EvalContext {
+            tool: ctx.tool,
+            args: ctx.args,
+            profile_name: ctx.profile_name,
+            profile: ctx.profile,
+            value: value_class_for_inner(inner),
+            account_view: None,
+            identity_view: None,
+            quorum: None,
+            counterparty_cache: None,
+            sep10_sessions: None,
+            sep45_sessions: None,
+            state_store: ctx.state_store,
+            bundle: None,
+            policy_digest: ctx.policy_digest,
+            provisional: ctx.provisional,
+        };
+        if !matches!(
+            self.recipient_class(&inner_ctx),
+            Ok(Some(RecipientClass::Unlisted))
+        ) {
+            return;
         }
-        Ok(None)
+        if !assets_equivalent(
+            &asset_normalise(asset),
+            &asset_normalise(budget.asset()),
+            &ctx.profile.network_passphrase,
+        ) {
+            return;
+        }
+        overlay.accumulate(budget.state_key(ctx.profile_name), *amount);
+    }
+
+    /// Records the confirmed debit to unlisted recipients into the budget's
+    /// window, under the key the budget check reads.
+    fn record_confirmed(&self, ctx: &EvalContext<'_>) -> Result<Vec<WindowEntry>, PolicyError> {
+        if self.budget().is_none() {
+            return Ok(Vec::new());
+        }
+        let now_ms = system_time_to_ms()?;
+        let entry = self.size(ctx, now_ms)?;
+        if let Some(entry) = &entry {
+            ctx.state_store
+                .append(entry.key(), entry.timestamp_ms(), entry.amount())
+                .map_err(|error| PolicyError::CriterionEvaluationFailed {
+                    detail: format!(
+                        "counterparty_allowlist: record_confirmed state store error: {error}"
+                    ),
+                })?;
+        }
+        Ok(entry.into_iter().collect())
+    }
+
+    /// Sizes the budget entry of a call the evaluation classified `Unlisted`.
+    ///
+    /// Reads the class the evaluation carried on the effects and never
+    /// classifies again; a listed call sizes no entry.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PolicyError::CriterionEvaluationFailed`] when the effects
+    /// carry no recipient class.
+    fn size(&self, ctx: &EvalContext<'_>, now_ms: u64) -> Result<Option<WindowEntry>, PolicyError> {
+        let Some(budget) = self.budget() else {
+            return Ok(None);
+        };
+        let ValueClass::Value(effects) = &ctx.value else {
+            return Ok(None);
+        };
+        match effects.recipient_class() {
+            None => {
+                return Err(PolicyError::CriterionEvaluationFailed {
+                    detail: format!(
+                        "counterparty_allowlist: sizing the unlisted budget for tool '{}' \
+                         requires the evaluated recipient class",
+                        ctx.tool.name
+                    ),
+                });
+            }
+            Some(RecipientClass::Unlisted) => {}
+            Some(RecipientClass::Listed | RecipientClass::Unverifiable) => return Ok(None),
+        }
+        let budget_asset = asset_normalise(budget.asset());
+        let mut matched = false;
+        let mut sum: i128 = 0;
+        for leg in effects.legs() {
+            if !leg.kind.carries_debit() {
+                continue;
+            }
+            let Some(leg_asset) = leg.asset.as_deref() else {
+                continue;
+            };
+            if !assets_equivalent(leg_asset, &budget_asset, &ctx.profile.network_passphrase) {
+                continue;
+            }
+            let Some(amount) = leg.amount else {
+                continue;
+            };
+            matched = true;
+            sum = sum.saturating_add(amount);
+        }
+        if !matched {
+            return Ok(None);
+        }
+        Ok(Some(WindowEntry::new(
+            budget.state_key(ctx.profile_name),
+            now_ms,
+            sum,
+            budget.window_limit(),
+        )))
     }
 }
 
 impl CounterpartyAllowlistCriterion {
+    /// Evaluates the call: the per-kind checks in order, then the unlisted
+    /// mode for a call whose only failure is an unlisted debit recipient.
+    fn outcome(&self, ctx: &EvalContext<'_>) -> Result<Outcome, PolicyError> {
+        // The shared fail-closed gate: an opaque-sign call under a matched
+        // rule (without `allow_opaque_signing`) or a forgotten `MovesValue`
+        // population denies here. `NotApplicable` (a genuinely read-only call,
+        // or a tool the descriptor derivation has not classified) falls
+        // through to the legacy per-kind path below, unchanged in every mode.
+        let effects = match classify_value(ctx) {
+            ValueGate::Deny(reason) => return Ok(Outcome::Deny(reason)),
+            ValueGate::Effects(effects) => effects,
+            ValueGate::NotApplicable => {
+                for kind in &self.kinds {
+                    if let Some(deny) = self.evaluate_kind(kind, ctx)? {
+                        return Ok(Outcome::Deny(deny));
+                    }
+                }
+                return Ok(Outcome::Pass);
+            }
+        };
+
+        let mut first_denial = None;
+        for kind in &self.kinds {
+            if let Some(deny) = self.evaluate_kind_over_effects(kind, ctx, effects)? {
+                first_denial = Some(deny);
+                break;
+            }
+        }
+        let Some(denial) = first_denial else {
+            return Ok(Outcome::Pass);
+        };
+
+        // Only a call whose debit recipients are well-formed, verified, and
+        // unlisted, with no failing inflow leg, reaches the mode. Every other
+        // failure keeps the first denial in its base order.
+        let mode = match &self.unlisted {
+            None | Some(UnlistedMode::Deny) => return Ok(Outcome::Deny(denial)),
+            Some(mode) => mode,
+        };
+        let classification = self.classify_effects(ctx, effects)?;
+        if classification.class != RecipientClass::Unlisted || classification.inflow_denied {
+            return Ok(Outcome::Deny(denial));
+        }
+        match mode {
+            UnlistedMode::Approval => Ok(Outcome::Escalate(denial)),
+            UnlistedMode::Budget(budget) => self.check_budget(ctx, effects, budget, denial),
+            UnlistedMode::Deny => Ok(Outcome::Deny(denial)),
+        }
+    }
+
+    /// Checks an unlisted call against both budget bounds.
+    ///
+    /// The attempt sums the debit legs in the budget asset. A debit leg in
+    /// another asset, or without an asset, keeps the criterion's denial.
+    fn check_budget(
+        &self,
+        ctx: &EvalContext<'_>,
+        effects: &ValueEffects,
+        budget: &UnlistedBudget,
+        denial: DenyReason,
+    ) -> Result<Outcome, PolicyError> {
+        let budget_asset = asset_normalise(budget.asset());
+        let mut attempted_stroops: i128 = 0;
+        for leg in effects.legs() {
+            if !leg.kind.carries_debit() {
+                continue;
+            }
+            let Some(leg_asset) = leg.asset.as_deref() else {
+                return Ok(Outcome::Deny(denial));
+            };
+            if !assets_equivalent(leg_asset, &budget_asset, &ctx.profile.network_passphrase) {
+                return Ok(Outcome::Deny(denial));
+            }
+            let amount = leg
+                .amount
+                .ok_or_else(|| PolicyError::CriterionEvaluationFailed {
+                    detail: format!(
+                        "counterparty_allowlist: unresolvable amount for a debit leg of tool '{}'",
+                        ctx.tool.name
+                    ),
+                })?;
+            attempted_stroops = attempted_stroops.saturating_add(amount);
+        }
+
+        if attempted_stroops > budget.per_tx_stroops() {
+            return Ok(Outcome::Deny(DenyReason::UnlistedBudgetExceeded {
+                asset: budget.asset().to_owned(),
+                bound: UnlistedBound::PerTx,
+                max_stroops: budget.per_tx_stroops(),
+                attempted_stroops,
+            }));
+        }
+
+        let now_ms = system_time_to_ms()?;
+        let state_key = budget.state_key(ctx.profile_name);
+        let (window_used_stroops, _) =
+            ctx.state_store
+                .query_window(&state_key, now_ms)
+                .map_err(|e| PolicyError::CriterionEvaluationFailed {
+                    detail: format!("counterparty_allowlist: state store error: {e}"),
+                })?;
+        let bundle_accumulated_stroops = ctx
+            .bundle
+            .map(|view| view.overlay.get(&state_key))
+            .unwrap_or(0);
+        let would_use = window_used_stroops
+            .saturating_add(bundle_accumulated_stroops)
+            .saturating_add(attempted_stroops);
+        if would_use > budget.per_period_stroops() {
+            return Ok(Outcome::Deny(DenyReason::UnlistedBudgetExceeded {
+                asset: budget.asset().to_owned(),
+                bound: UnlistedBound::PerPeriod,
+                max_stroops: budget.per_period_stroops(),
+                attempted_stroops,
+            }));
+        }
+        Ok(Outcome::Pass)
+    }
+
+    /// Classifies every leg of `effects` against each configured kind.
+    fn classify_effects(
+        &self,
+        ctx: &EvalContext<'_>,
+        effects: &ValueEffects,
+    ) -> Result<Classification, PolicyError> {
+        let mut class = RecipientClass::Listed;
+        let mut inflow_denied = false;
+        let mut strictest = |check: &Check| {
+            if check.class().rank() > class.rank() {
+                class = check.class();
+            }
+        };
+        let has_debit = effects.legs().iter().any(|leg| leg.kind.carries_debit());
+        for kind in &self.kinds {
+            match kind {
+                CounterpartyKind::GAccount => {
+                    for leg in effects.legs().iter().filter(|l| l.kind.carries_debit()) {
+                        strictest(&self.g_account_leg(ctx, leg)?);
+                    }
+                }
+                CounterpartyKind::CAccount => {
+                    for leg in effects.legs().iter().filter(|l| l.kind.carries_debit()) {
+                        strictest(&self.c_account_leg(ctx, leg)?);
+                    }
+                }
+                CounterpartyKind::KnownIssuer => {
+                    for leg in effects.legs() {
+                        if leg.kind.carries_debit() {
+                            strictest(&self.known_issuer_leg(ctx, leg, true)?);
+                        } else if self.gate_inflows
+                            && !matches!(self.known_issuer_leg(ctx, leg, false)?, Check::Listed)
+                        {
+                            inflow_denied = true;
+                        }
+                    }
+                }
+                CounterpartyKind::HomeDomain => {
+                    if has_debit {
+                        strictest(&self.home_domain_check(ctx));
+                    }
+                }
+                unsupported => strictest(&Check::Unverifiable(
+                    DenyReason::CounterpartyKindUnsupported {
+                        kind: unsupported.tag().to_owned(),
+                    },
+                )),
+            }
+        }
+        Ok(Classification {
+            class,
+            inflow_denied,
+        })
+    }
+
     /// Legacy per-kind dispatch reading raw `ctx.args` — reached only when
     /// [`classify_value`] resolves `NotApplicable` for the current call (a
     /// genuinely read-only tool, or one the descriptor derivation has not yet
@@ -352,7 +958,7 @@ impl CounterpartyAllowlistCriterion {
             CounterpartyKind::GAccount => self.check_g_account(ctx),
             CounterpartyKind::CAccount => self.check_c_account(ctx),
             CounterpartyKind::KnownIssuer => self.check_known_issuer(ctx),
-            CounterpartyKind::HomeDomain => self.check_home_domain(ctx),
+            CounterpartyKind::HomeDomain => Ok(self.home_domain_check(ctx).denial()),
             unsupported => Ok(Some(DenyReason::CounterpartyKindUnsupported {
                 kind: unsupported.tag().to_owned(),
             })),
@@ -374,7 +980,7 @@ impl CounterpartyAllowlistCriterion {
             CounterpartyKind::GAccount => self.check_g_account_legs(ctx, effects),
             CounterpartyKind::CAccount => self.check_c_account_legs(ctx, effects),
             CounterpartyKind::KnownIssuer => self.check_known_issuer_legs(ctx, effects),
-            CounterpartyKind::HomeDomain => self.check_home_domain(ctx),
+            CounterpartyKind::HomeDomain => Ok(self.home_domain_check(ctx).denial()),
             unsupported => Ok(Some(DenyReason::CounterpartyKindUnsupported {
                 kind: unsupported.tag().to_owned(),
             })),
@@ -404,31 +1010,45 @@ impl CounterpartyAllowlistCriterion {
             if !leg.kind.carries_debit() {
                 continue;
             }
-            let Some(destination) = leg.destination.as_deref() else {
-                return Ok(Some(DenyReason::CounterpartyDenied {
-                    kind: "G_ACCOUNT".to_owned(),
-                    value: String::new(),
-                }));
-            };
-
-            PublicKey::from_string(destination).map_err(|e| {
-                PolicyError::CriterionEvaluationFailed {
-                    detail: format!(
-                        "counterparty_allowlist: invalid G-strkey in a debit leg's \
-                         destination for tool '{}': {e}",
-                        ctx.tool.name
-                    ),
-                }
-            })?;
-
-            if !self.allowlist.iter().any(|a| a == destination) {
-                return Ok(Some(DenyReason::CounterpartyDenied {
-                    kind: "G_ACCOUNT".to_owned(),
-                    value: destination.to_owned(),
-                }));
+            if let Some(denial) = self.g_account_leg(ctx, leg)?.denial() {
+                return Ok(Some(denial));
             }
         }
         Ok(None)
+    }
+
+    /// Checks one debit leg's destination as an account against the
+    /// allowlist. A muxed destination is checked by its base account; its
+    /// denial names the destination as given.
+    fn g_account_leg(&self, ctx: &EvalContext<'_>, leg: &ValueLeg) -> Result<Check, PolicyError> {
+        let Some(destination) = leg.destination.as_deref() else {
+            return Ok(Check::Unverifiable(DenyReason::CounterpartyDenied {
+                kind: "G_ACCOUNT".to_owned(),
+                value: String::new(),
+            }));
+        };
+
+        let base =
+            account_base(destination).map_err(|e| PolicyError::CriterionEvaluationFailed {
+                detail: format!(
+                    "counterparty_allowlist: invalid G-strkey in a debit leg's \
+                     destination for tool '{}': {e}",
+                    ctx.tool.name
+                ),
+            })?;
+
+        if self
+            .allowlist
+            .iter()
+            .any(|a| a == destination || *a == base)
+        {
+            Ok(Check::Listed)
+        } else {
+            Ok(Check::Unlisted(DenyReason::CounterpartyDenied {
+                kind: "G_ACCOUNT".to_owned(),
+                value: destination.to_owned(),
+            }))
+        }
     }
 
     /// Checks each debit leg's `destination` as a C-strkey against the
@@ -448,31 +1068,38 @@ impl CounterpartyAllowlistCriterion {
             if !leg.kind.carries_debit() {
                 continue;
             }
-            let Some(destination) = leg.destination.as_deref() else {
-                return Ok(Some(DenyReason::CounterpartyDenied {
-                    kind: "C_ACCOUNT".to_owned(),
-                    value: String::new(),
-                }));
-            };
-
-            Contract::from_string(destination).map_err(|e| {
-                PolicyError::CriterionEvaluationFailed {
-                    detail: format!(
-                        "counterparty_allowlist: invalid C-strkey in a debit leg's \
-                         destination for tool '{}': {e}",
-                        ctx.tool.name
-                    ),
-                }
-            })?;
-
-            if !self.allowlist.iter().any(|a| a == destination) {
-                return Ok(Some(DenyReason::CounterpartyDenied {
-                    kind: "C_ACCOUNT".to_owned(),
-                    value: destination.to_owned(),
-                }));
+            if let Some(denial) = self.c_account_leg(ctx, leg)?.denial() {
+                return Ok(Some(denial));
             }
         }
         Ok(None)
+    }
+
+    /// Checks one debit leg's destination as a contract against the allowlist.
+    fn c_account_leg(&self, ctx: &EvalContext<'_>, leg: &ValueLeg) -> Result<Check, PolicyError> {
+        let Some(destination) = leg.destination.as_deref() else {
+            return Ok(Check::Unverifiable(DenyReason::CounterpartyDenied {
+                kind: "C_ACCOUNT".to_owned(),
+                value: String::new(),
+            }));
+        };
+
+        Contract::from_string(destination).map_err(|e| PolicyError::CriterionEvaluationFailed {
+            detail: format!(
+                "counterparty_allowlist: invalid C-strkey in a debit leg's \
+                     destination for tool '{}': {e}",
+                ctx.tool.name
+            ),
+        })?;
+
+        if self.allowlist.iter().any(|a| a == destination) {
+            Ok(Check::Listed)
+        } else {
+            Ok(Check::Unlisted(DenyReason::CounterpartyDenied {
+                kind: "C_ACCOUNT".to_owned(),
+                value: destination.to_owned(),
+            }))
+        }
     }
 
     /// Checks each leg's `asset` issuer against the allowlist.
@@ -504,47 +1131,61 @@ impl CounterpartyAllowlistCriterion {
             if !is_debit && !self.gate_inflows {
                 continue;
             }
-            // A checked leg whose asset the dispatch site could not resolve
-            // cannot be checked against the issuer allowlist, so it denies
-            // fail-closed — mirroring the None-destination
-            // posture in `check_g_account_legs`. A `None` here is never a
-            // silent pass, for either direction.
-            let Some(asset_str) = leg.asset.as_deref() else {
-                return Ok(Some(DenyReason::CounterpartyDenied {
-                    kind: "KNOWN_ISSUER".to_owned(),
-                    value: if is_debit {
-                        String::new()
-                    } else {
-                        "inflow leg carries no resolvable asset".to_owned()
-                    },
-                }));
-            };
-            if asset_str.eq_ignore_ascii_case("native") || asset_str.eq_ignore_ascii_case("xlm") {
-                continue;
-            }
-
-            let issuer = parse_asset_issuer(asset_str, ctx)?;
-
-            let on_list = self.allowlist.iter().any(|entry| {
-                if let Some(list_issuer) = entry.split_once(':').map(|(_, i)| i) {
-                    list_issuer == issuer
-                } else {
-                    entry == &issuer
-                }
-            });
-
-            if !on_list {
-                return Ok(Some(DenyReason::CounterpartyDenied {
-                    kind: "KNOWN_ISSUER".to_owned(),
-                    value: if is_debit {
-                        issuer
-                    } else {
-                        format!("inflow leg issuer {issuer} not allowlisted")
-                    },
-                }));
+            if let Some(denial) = self.known_issuer_leg(ctx, leg, is_debit)?.denial() {
+                return Ok(Some(denial));
             }
         }
         Ok(None)
+    }
+
+    /// Checks one leg's asset issuer against the allowlist.
+    fn known_issuer_leg(
+        &self,
+        ctx: &EvalContext<'_>,
+        leg: &ValueLeg,
+        is_debit: bool,
+    ) -> Result<Check, PolicyError> {
+        // A checked leg whose asset the dispatch site could not resolve
+        // cannot be checked against the issuer allowlist, so it denies
+        // fail-closed, mirroring the None-destination
+        // posture in `check_g_account_legs`. A `None` here is never a
+        // silent pass, for either direction.
+        let Some(asset_str) = leg.asset.as_deref() else {
+            return Ok(Check::Unverifiable(DenyReason::CounterpartyDenied {
+                kind: "KNOWN_ISSUER".to_owned(),
+                value: if is_debit {
+                    String::new()
+                } else {
+                    "inflow leg carries no resolvable asset".to_owned()
+                },
+            }));
+        };
+        if asset_str.eq_ignore_ascii_case("native") || asset_str.eq_ignore_ascii_case("xlm") {
+            return Ok(Check::Listed);
+        }
+
+        let issuer = parse_asset_issuer(asset_str, ctx)?;
+
+        let on_list = self.allowlist.iter().any(|entry| {
+            if let Some(list_issuer) = entry.split_once(':').map(|(_, i)| i) {
+                list_issuer == issuer
+            } else {
+                entry == &issuer
+            }
+        });
+
+        if on_list {
+            Ok(Check::Listed)
+        } else {
+            Ok(Check::Unlisted(DenyReason::CounterpartyDenied {
+                kind: "KNOWN_ISSUER".to_owned(),
+                value: if is_debit {
+                    issuer
+                } else {
+                    format!("inflow leg issuer {issuer} not allowlisted")
+                },
+            }))
+        }
     }
 
     fn check_g_account(&self, ctx: &EvalContext<'_>) -> Result<Option<DenyReason>, PolicyError> {
@@ -638,15 +1279,17 @@ impl CounterpartyAllowlistCriterion {
     /// the full 5-step rationale. Reads `home_domain` via
     /// [`crate::policy::v1::AccountIdentityView::home_domain`] (supplied in
     /// [`EvalContext::identity_view`]) and cross-checks it against
-    /// [`EvalContext::counterparty_cache`]. Every failure mode returns
-    /// [`DenyReason::CounterpartyDenied`] with `kind = "HOME_DOMAIN"`; the
+    /// [`EvalContext::counterparty_cache`]. Every failure mode denies with
+    /// [`DenyReason::CounterpartyDenied`] and `kind = "HOME_DOMAIN"`; the
     /// `value` field distinguishes which step failed for operator triage.
-    fn check_home_domain(&self, ctx: &EvalContext<'_>) -> Result<Option<DenyReason>, PolicyError> {
-        fn deny(value: impl Into<String>) -> Result<Option<DenyReason>, PolicyError> {
-            Ok(Some(DenyReason::CounterpartyDenied {
+    /// Every unverified step is `Unverifiable`; only a verified domain outside
+    /// the allowlist is `Unlisted`.
+    fn home_domain_check(&self, ctx: &EvalContext<'_>) -> Check {
+        fn deny(value: impl Into<String>) -> DenyReason {
+            DenyReason::CounterpartyDenied {
                 kind: "HOME_DOMAIN".to_owned(),
                 value: value.into(),
-            }))
+            }
         }
 
         // Step 1: retrieve the (self-asserted) home_domain from the identity
@@ -654,10 +1297,10 @@ impl CounterpartyAllowlistCriterion {
         // implementation, so forgetting to implement it at the dispatch site
         // is a compile error.
         let Some(identity) = ctx.identity_view else {
-            return deny(String::new());
+            return Check::Unverifiable(deny(String::new()));
         };
         let Some(resolved) = identity.home_domain() else {
-            return deny(String::new());
+            return Check::Unverifiable(deny(String::new()));
         };
 
         // Step 2: strict-ASCII enforcement — the homoglyph defence. If the
@@ -667,7 +1310,7 @@ impl CounterpartyAllowlistCriterion {
         // denied. Non-ASCII bytes are REDACTED from the value to avoid leaking
         // potentially sensitive data in error/audit envelopes.
         if !resolved.bytes().all(|b| b.is_ascii()) {
-            return deny("<non-ascii-redacted>");
+            return Check::Unverifiable(deny("<non-ascii-redacted>"));
         }
 
         // Case-insensitive ASCII comparison per RFC 4343. Lowercase the
@@ -681,19 +1324,16 @@ impl CounterpartyAllowlistCriterion {
         // operator independently fetched a real stellar.toml at this domain —
         // it does NOT (by itself) prove this specific account belongs to it,
         // since the cache is keyed by domain alone.
-        let cache = match ctx.counterparty_cache {
-            Some(c) => c,
-            None => {
-                return deny(format!(
-                    "{resolved_lower}: not verified (counterparty cache not populated)"
-                ));
-            }
+        let Some(cache) = ctx.counterparty_cache else {
+            return Check::Unverifiable(deny(format!(
+                "{resolved_lower}: not verified (counterparty cache not populated)"
+            )));
         };
         if !cache.has_resolved(&resolved_lower) {
-            return deny(format!(
+            return Check::Unverifiable(deny(format!(
                 "{resolved_lower}: not verified (no live entry in the counterparty cache; \
                  run `stellar-agent counterparty refresh {resolved_lower}`)"
-            ));
+            )));
         }
 
         // Step 4: account-listing verification — the bidirectional half of
@@ -702,25 +1342,42 @@ impl CounterpartyAllowlistCriterion {
         // operator's home_domain and pass, since has_resolved does not
         // distinguish which account a resolved domain belongs to.
         if !cache.is_account_listed(&resolved_lower, identity.account_id()) {
-            return deny(format!(
+            return Check::Unverifiable(deny(format!(
                 "{resolved_lower}: not verified (account not listed by domain's stellar.toml)"
-            ));
+            )));
         }
 
         // Step 5: only a VERIFIED domain is checked against the operator's
         // allowlist. A verified-but-non-allowlisted domain still denies, with
         // a distinct value text from every unverified-domain deny above.
         if !self.allowlist.iter().any(|entry| entry == &resolved_lower) {
-            return deny(resolved_lower);
+            return Check::Unlisted(deny(resolved_lower));
         }
 
-        Ok(None)
+        Check::Listed
     }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Helpers
 // ─────────────────────────────────────────────────────────────────────────────
+
+/// Returns the base account of a G or M strkey.
+///
+/// A muxed account pays its base account, so the allowlist checks the base.
+///
+/// # Errors
+///
+/// Returns the G-strkey decode error when `destination` is neither a G nor an
+/// M strkey.
+fn account_base(destination: &str) -> Result<String, stellar_strkey::DecodeError> {
+    match PublicKey::from_string(destination) {
+        Ok(_) => Ok(destination.to_owned()),
+        Err(error) => MuxedAccount::from_string(destination)
+            .map(|muxed| format!("{}", PublicKey(muxed.ed25519)))
+            .map_err(|_| error),
+    }
+}
 
 /// Resolves the counterparty destination for the current call from raw
 /// `ctx.args`.
@@ -872,6 +1529,8 @@ mod tests {
             sep45_sessions: None,
             state_store: store,
             bundle: None,
+            policy_digest: [0; 32],
+            provisional: false,
         }
     }
 
@@ -1333,6 +1992,8 @@ mod tests {
             sep45_sessions: None,
             state_store: store,
             bundle: None,
+            policy_digest: [0; 32],
+            provisional: false,
         }
     }
 
@@ -1381,6 +2042,8 @@ mod tests {
             sep45_sessions: None,
             state_store: store,
             bundle: None,
+            policy_digest: [0; 32],
+            provisional: false,
         }
     }
 

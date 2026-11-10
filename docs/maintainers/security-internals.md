@@ -1168,7 +1168,7 @@ Each criterion is a `Box<dyn Criterion>` (`Send + Sync`) with a snake_case kind 
 | `approval_above` | Per-transaction approval threshold on `allow` rules |
 | `per_period_cap` | Sliding-window per-period value cap |
 | `rate_limit` | Sliding-window count of recorded calls, one shared count per profile and window |
-| `counterparty_allowlist` | Destination allowlist (`G_ACCOUNT` / `C_ACCOUNT` / `KNOWN_ISSUER` / `HOME_DOMAIN`; `SEP10_IDENTITY` and `ONE_TIME_ADDRESS` are reserved, not evaluated); `KNOWN_ISSUER` checks debit legs only unless the criterion's `gate_inflows = true` opt-in extends it to inflow legs too |
+| `counterparty_allowlist` | Destination allowlist (`G_ACCOUNT` / `C_ACCOUNT` / `KNOWN_ISSUER` / `HOME_DOMAIN`; `SEP10_IDENTITY` and `ONE_TIME_ADDRESS` are reserved, not evaluated); `KNOWN_ISSUER` checks debit legs only unless the criterion's `gate_inflows = true` opt-in extends it to inflow legs too; the v2 `unlisted` table denies, escalates, or budgets a verified recipient outside the list |
 | `minimum_reserve` | Minimum-reserve guard (classic-account tools only, see below) |
 | `inner_invocation_count_cap` | Multicall inner-count cap |
 | `bundle_aggregate_cap` | Multicall aggregate-value cap (implicitly enforces the Generic-rejection check below, on any rule that carries it) |
@@ -1180,6 +1180,29 @@ Each criterion is a `Box<dyn Criterion>` (`Send + Sync`) with a snake_case kind 
 | `home_domain_resolved` | Counterparty `stellar.toml` resolved/cached (contract counterparties only, see below) |
 | `sep10_session_active` | Refuses in shipped CLI and MCP dispatch paths because no SEP-10 session view is supplied |
 | `sep45_session_active` | Refuses in shipped CLI and MCP dispatch paths because no SEP-45 session view is supplied |
+| `total_budget` | Non-renewing allocation of one asset per signed policy, on v2 `allow` rules; its epoch is the policy digest |
+| `balance_floor` | Absolute native floor over an observed account read, v2 only |
+| `memo_binding` | Required memo per bound `G...` destination, v2 only |
+
+Recipient classes govern the `unlisted` table. Each debit leg is `Listed`,
+`Unlisted` (well-formed, verified, outside the criterion's own list), or
+`Unverifiable` (missing destination or asset, an unverified home-domain step,
+or an unsupported kind). The strictest class over the legs and kinds governs.
+Only `Unlisted` reaches the mode; every other failure keeps the criterion's
+first denial, so `G_ACCOUNT` and `C_ACCOUNT` denials stay byte-identical.
+A muxed destination is classified by its base account. Inflow legs carry no
+class. The evaluation carries the class of the matched rule on its
+`ValueEffects`, and budget sizing reads it there instead of classifying again.
+A budget entry uses the key `unlisted:<asset>` at the window's length, shared
+by every rule. A bundle accumulates unlisted transfers in its overlay.
+
+`total_budget` entries carry the policy digest as their epoch, use the key
+`total:<asset>` with a zero window, and count regardless of age.
+`PolicyEngineV1::new_verified` sets the digest from the signed canonical bytes,
+and `VerifiedPolicy::digest()` returns the same value. An engine built outside
+the verified loader has an all-zero digest, under which a valued
+`total_budget` evaluation, sizing, or recording fails with
+`CriterionEvaluationFailed`.
 
 `approval_above` shares `per_tx_cap` amount extraction and fail-closed value
 checks. Its `asset` and positive `max_stroops` threshold apply only to `allow`
@@ -1206,12 +1229,14 @@ A `mainnet-write` build enforces the minimum policy when a mainnet profile
 loads or signs a v2 body with `[mainnet]`. It requires a positive sequence,
 a profile-specific scope, at least one rule, exact mainnet chain and tool
 matches, and no opaque signing or home-domain criteria.
-Approval rules require an explicit TTL of at most 3600 seconds.
+Approval rules require an explicit TTL of at most 86,400 seconds.
 
 Non-deny value-out rules require one asset allowlist, a destination allowlist
 with `G_ACCOUNT` or `C_ACCOUNT`, per-transaction and per-period caps covering
-every allowed asset, and a rate limit. Trustline rules require one asset
-allowlist; claim rules must not carry one. Read-only rules need no value caps.
+every allowed asset, and a rate limit. Non-deny trustline and claim rules,
+commit tools included, also require a rate limit. Trustline rules require one
+asset allowlist; claim rules must not carry one. Read-only rules need no value
+caps.
 Allow `stellar_balances` and `stellar_transaction_status` so MCP can reconcile
 a timed-out submission. Message-signing tools are outside the read-only set.
 
@@ -1427,6 +1452,8 @@ submission outcomes require reconciliation instead.
 ### Injected views fail closed when absent
 
 Several criteria need state the core crate cannot fetch itself (account reserves, identity, counterparty cache, SEP-10/SEP-45 sessions, quorum). The optional views on `EvalContext` are `AccountReservesView`, `AccountIdentityView`, `CounterpartyCacheView`, `Sep10SessionView`, `Sep45SessionView`, and `QuorumView`. They keep core independent of the network and smart-account crates. `stellar-agent-network::policy_view` provides the account adapters used by CLI and MCP handlers, and `network::counterparty` provides the cache snapshot. Shipped dispatch paths populate no session or quorum views, so criteria requiring them refuse. When a configured criterion's required view is `None`, the criterion returns `Err(PolicyError::CriterionEvaluationFailed)` rather than silently passing: `minimum_reserve` with no `account_view`, `sep10_session_active` with no session view, and `home_domain_resolved` with no counterparty cache all fail closed. `minimum_reserve` denies a call whose value it cannot size with `policy.deny.unsizable_value_effect` before it reads the account view. `AccountIdentityView` is deliberately a separate trait with no default methods so a missing `home_domain` cannot become a silent allow.
+
+`balance_floor` reads its account through the same `account_view`. Only an `ObservedAccount`, constructed right after a live account read, supplies the read's ledger and time, and only a `FloorInput` around it supplies the native reservations of open authorizations. Without either, or without a readable balance, the criterion refuses with `account.unread` instead of failing; an observation older than 120,000 ms refuses with `account.stale`. `PolicyEngine::evaluate_provisional` defers `minimum_reserve` and `balance_floor` for a call that reads no account before its approval, applies every other criterion, and marks the `Evaluation` provisional. The default implementation evaluates strictly. The caller evaluates strictly with a live read before it signs.
 
 ### HOME_DOMAIN allowlist verification
 
