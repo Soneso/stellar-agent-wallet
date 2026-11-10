@@ -52,6 +52,12 @@ const LISTED: &str = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF";
 const UNLISTED: &str = "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN";
 /// A fixed policy clock for tests that read time.
 const NOW_MS: u64 = 1_800_000_000_000;
+
+/// The instant an evaluation reads: the policy clock, which a test that reads
+/// time fixes at [`NOW_MS`].
+fn instant() -> u64 {
+    stellar_agent_core::policy::policy_now_ms().expect("policy clock")
+}
 /// One week in milliseconds.
 const WEEK_MS: u64 = 7 * 86_400_000;
 
@@ -214,6 +220,7 @@ fn strict(
         None,
         None,
         None,
+        instant(),
     )
 }
 
@@ -229,6 +236,7 @@ fn provisional(engine: &dyn PolicyEngine, value: ValueClass) -> Result<Evaluatio
         None,
         None,
         None,
+        instant(),
     )
 }
 
@@ -821,7 +829,8 @@ fn classify(
     let profile = profile();
     let store = PolicyStateStore::new();
     let args = Value::Null;
-    let mut ctx = EvalContext::new(&tool, &args, "operator", &profile, &store).with_value(value);
+    let mut ctx =
+        EvalContext::new(&tool, &args, "operator", &profile, &store, instant()).with_value(value);
     if let Some(identity) = identity {
         ctx = ctx.with_identity_view(identity);
     }
@@ -993,8 +1002,8 @@ fn unverifiable_recipients_never_escalate() {
             let profile = profile();
             let store = PolicyStateStore::new();
             let args = Value::Null;
-            let mut ctx =
-                EvalContext::new(&tool, &args, "operator", &profile, &store).with_value(value);
+            let mut ctx = EvalContext::new(&tool, &args, "operator", &profile, &store, instant())
+                .with_value(value);
             if let Some(identity) = identity {
                 ctx = ctx.with_identity_view(identity);
             }
@@ -1680,6 +1689,7 @@ fn total_budget_refuses_without_policy_digest() {
                     None,
                     None,
                     None,
+                    instant(),
                 )
                 .unwrap_err(),
         );
@@ -2019,6 +2029,7 @@ impl PolicyEngine for StrictOnly {
         counterparty_cache: Option<&dyn CounterpartyCacheView>,
         sep10_sessions: Option<&dyn Sep10SessionView>,
         sep45_sessions: Option<&dyn Sep45SessionView>,
+        now_ms: u64,
     ) -> Result<Decision, PolicyError> {
         self.0.evaluate(
             tool,
@@ -2029,6 +2040,7 @@ impl PolicyEngine for StrictOnly {
             counterparty_cache,
             sep10_sessions,
             sep45_sessions,
+            now_ms,
         )
     }
 
@@ -2043,6 +2055,7 @@ impl PolicyEngine for StrictOnly {
         counterparty_cache: Option<&dyn CounterpartyCacheView>,
         sep10_sessions: Option<&dyn Sep10SessionView>,
         sep45_sessions: Option<&dyn Sep45SessionView>,
+        now_ms: u64,
     ) -> Result<Evaluation, PolicyError> {
         self.0.evaluate_with_value_full(
             tool,
@@ -2054,6 +2067,7 @@ impl PolicyEngine for StrictOnly {
             counterparty_cache,
             sep10_sessions,
             sep45_sessions,
+            now_ms,
         )
     }
 }
@@ -2089,7 +2103,8 @@ fn floor_decision(
     let tool = pay();
     let profile = profile();
     let store = PolicyStateStore::new();
-    let mut ctx = EvalContext::new(&tool, args, "operator", &profile, &store).with_value(value);
+    let mut ctx =
+        EvalContext::new(&tool, args, "operator", &profile, &store, instant()).with_value(value);
     if let Some(view) = account_view {
         ctx = ctx.with_account_view(view);
     }
@@ -2203,6 +2218,71 @@ fn observed_floor_checks_age_and_exact_balance() {
     );
 }
 
+/// The unlisted budget, the total budget and the balance floor of one rule
+/// decide and record at the supplied instant, which lies years before the
+/// host clock: the floor's observation is fresh only at that instant, the
+/// recorded debits carry it, and the unlisted window counts them only from
+/// it.
+#[test]
+fn grammar_criteria_read_the_evaluation_instant() {
+    const SAMPLE_MS: u64 = 1_000_000_000_000;
+    let _clock = set_query_time_for_test(SAMPLE_MS);
+    let engine = engine_from_criteria(&format!(
+        "{}, {{ kind = \"total_budget\", asset = \"native\", max_stroops = 1000 }}, \
+         {{ kind = \"balance_floor\", min_stroops = 0 }}",
+        budget(100, 150)
+    ));
+    let account = ObservedAccount::new(Balance(1_000_000), 7, SAMPLE_MS - 1_000, SAMPLE_MS - 6_000);
+    let input = FloorInput {
+        observed: &account,
+        effective_reservations_stroops: 0,
+    };
+    let evaluate = |value: ValueClass| {
+        engine
+            .evaluate_with_value_full(
+                &pay(),
+                &Value::Null,
+                &profile(),
+                value,
+                Some(&input),
+                None,
+                None,
+                None,
+                None,
+                SAMPLE_MS,
+            )
+            .unwrap()
+    };
+
+    let allowed = evaluate(payment(100, UNLISTED));
+    assert_eq!(allowed.decision, Decision::Allow);
+    let recorded = engine
+        .record_confirmed(
+            &pay(),
+            &profile(),
+            &ValueClass::Value(allowed.value_effects.unwrap()),
+        )
+        .unwrap();
+    let stamps: std::collections::HashMap<StateKey, u64> = recorded
+        .iter()
+        .map(|entry| (entry.key().clone(), entry.timestamp_ms()))
+        .collect();
+    assert_eq!(recorded.len(), 2, "{recorded:?}");
+    assert_eq!(
+        stamps,
+        std::collections::HashMap::from([(total_key(), SAMPLE_MS), (unlisted_key(), SAMPLE_MS)])
+    );
+    assert_eq!(
+        evaluate(payment(51, UNLISTED)).decision,
+        Decision::Deny(DenyReason::UnlistedBudgetExceeded {
+            asset: "native".to_owned(),
+            bound: UnlistedBound::PerPeriod,
+            max_stroops: 150,
+            attempted_stroops: 51,
+        })
+    );
+}
+
 #[test]
 fn balance_floor_requires_v2_and_admits_every_decision() {
     let floor = "{ kind = \"balance_floor\", min_stroops = 20000000 }";
@@ -2247,7 +2327,7 @@ fn memo_decision(
     let profile = profile();
     let store = PolicyStateStore::new();
     let args = Value::Null;
-    let ctx = EvalContext::new(&tool, &args, "operator", &profile, &store)
+    let ctx = EvalContext::new(&tool, &args, "operator", &profile, &store, instant())
         .with_value(ValueClass::Value(ValueEffects::new(legs).with_memo(memo)));
     criterion.evaluate(&ctx)
 }

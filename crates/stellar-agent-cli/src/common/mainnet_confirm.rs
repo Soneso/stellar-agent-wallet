@@ -21,7 +21,7 @@ use stellar_agent_core::{
         attest::{attest_mainnet_confirmation, record_error},
         error::ApprovalError,
         load_attestation_key, open_with_retry, process_uid_for_attestation,
-        store::MAINNET_CONFIRMATION_TTL_SECONDS,
+        store::MAINNET_POLICY_AUTHORITY_TTL_SECONDS,
         subject::approval_subject_classic,
         witness::{ApprovalExpectation, ApprovalWitness, ApprovedKind, verify_approval},
     },
@@ -45,7 +45,7 @@ pub(crate) enum ConfirmDecision {
 impl ConfirmDecision {
     fn ttl_ms(self) -> u64 {
         match self {
-            Self::Allow => MAINNET_CONFIRMATION_TTL_SECONDS * 1000,
+            Self::Allow => MAINNET_POLICY_AUTHORITY_TTL_SECONDS * 1000,
             Self::RequireApproval { ttl_ms } => ttl_ms,
         }
     }
@@ -1183,6 +1183,8 @@ mod tests {
         assert_eq!(witness.authority(), "https://oracle.example.invalid");
         assert!(!oracle.received_requests().await.unwrap().is_empty());
         let store = PersistedWindowStore::for_profile(name);
+        let authority =
+            stellar_agent_network::mainnet::authority::MainnetAuthority::Approval(&approval);
         let request = |witness| TxSignRequest {
             context: &context,
             consumer: MainnetConsumer::CliClaim,
@@ -1193,7 +1195,7 @@ mod tests {
             signer: &signer,
             policy: &policy,
             enablement: &enablement,
-            approval: &approval,
+            authority: &authority,
             audit: audit_readiness(context.profile(), context.profile_name()).unwrap(),
             store: &store,
         };

@@ -8,6 +8,9 @@
 //! `stellar_agent_network::mainnet`. The approval witness lives in
 //! [`crate::approval::witness`].
 
+/// The provenance-bearing mainnet policy decision and its producer.
+pub mod decision;
+
 /// The verified mainnet enablement of a profile.
 pub mod enablement;
 

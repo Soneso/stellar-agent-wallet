@@ -129,8 +129,8 @@ proptest! {
                 "starting_balance_stroops": amount.to_string(),
                 "asset": "native",
             });
-            let first = engine.evaluate(&tool, &args, &profile, None, None, None, None, None);
-            let second = engine.evaluate(&tool, &args, &profile, None, None, None, None, None);
+            let first = engine.evaluate(&tool, &args, &profile, None, None, None, None, None, 1_700_000_000_000);
+            let second = engine.evaluate(&tool, &args, &profile, None, None, None, None, None, 1_700_000_000_000);
             prop_assert!(decisions_equiv(&first, &second));
             let expected = if let Some(cap) = cap.filter(|cap| amount > *cap) {
                 Decision::Deny(DenyReason::PerTxCapExceeded {
@@ -169,8 +169,8 @@ proptest! {
     ) {
         let doc = single_rule_document(rule);
         let engine = PolicyEngineV1::new(doc, profile_name);
-        let r1 = engine.evaluate(&tool, &args, &profile, None, None, None, None, None);
-        let r2 = engine.evaluate(&tool, &args, &profile, None, None, None, None, None);
+        let r1 = engine.evaluate(&tool, &args, &profile, None, None, None, None, None, 1_700_000_000_000);
+        let r2 = engine.evaluate(&tool, &args, &profile, None, None, None, None, None, 1_700_000_000_000);
         prop_assert!(
             decisions_equiv(&r1, &r2),
             "per_tx_cap determinism failed: first={r1:?} repeat={r2:?}"
@@ -189,8 +189,8 @@ proptest! {
     ) {
         let doc = single_rule_document(rule);
         let engine = PolicyEngineV1::new(doc, profile_name);
-        let r1 = engine.evaluate(&tool, &args, &profile, None, None, None, None, None);
-        let r2 = engine.evaluate(&tool, &args, &profile, None, None, None, None, None);
+        let r1 = engine.evaluate(&tool, &args, &profile, None, None, None, None, None, 1_700_000_000_000);
+        let r2 = engine.evaluate(&tool, &args, &profile, None, None, None, None, None, 1_700_000_000_000);
         prop_assert!(
             decisions_equiv(&r1, &r2),
             "counterparty_allowlist determinism failed: first={r1:?} second={r2:?}"
@@ -215,8 +215,8 @@ proptest! {
         let doc = single_rule_document(rule);
         let engine = PolicyEngineV1::new(doc, profile_name);
         // Evaluate without account_view (fail-closed path).
-        let r1 = engine.evaluate(&tool, &args, &profile, None, None, None, None, None);
-        let r2 = engine.evaluate(&tool, &args, &profile, None, None, None, None, None);
+        let r1 = engine.evaluate(&tool, &args, &profile, None, None, None, None, None, 1_700_000_000_000);
+        let r2 = engine.evaluate(&tool, &args, &profile, None, None, None, None, None, 1_700_000_000_000);
         prop_assert!(
             decisions_equiv(&r1, &r2),
             "minimum_reserve determinism failed: first={r1:?} second={r2:?}"
@@ -259,14 +259,14 @@ proptest! {
         // Step 1: evaluate with base rule only.
         let doc_base = single_rule_document(base_rule);
         let mut engine_base = PolicyEngineV1::new(doc_base, profile_name.clone());
-        let r_base = engine_base.evaluate(&tool, &args, &profile, None, None, None, None, None);
+        let r_base = engine_base.evaluate(&tool, &args, &profile, None, None, None, None, None, 1_700_000_000_000);
 
         // Step 2: if base allowed, prepend a strict deny rule.
         if matches!(r_base, Ok(Decision::Allow)) {
             let base_rule = engine_base.document.rules.remove(0);
             let doc_with_deny = two_rule_document(strict_deny_rule, base_rule);
             let engine_with_deny = PolicyEngineV1::new(doc_with_deny, profile_name.clone());
-            let r_with_deny = engine_with_deny.evaluate(&tool, &args, &profile, None, None, None, None, None);
+            let r_with_deny = engine_with_deny.evaluate(&tool, &args, &profile, None, None, None, None, None, 1_700_000_000_000);
 
             prop_assert!(
                 !matches!(r_with_deny, Ok(Decision::Allow)),

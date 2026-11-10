@@ -264,6 +264,7 @@ mod tests {
             bundle: None,
             policy_digest: [0; 32],
             provisional: false,
+            now_ms: 1_700_000_000_000,
         }
     }
 
@@ -750,7 +751,7 @@ mod tests {
             asset: Some("native".to_owned()),
             destination: Some("GBBB".to_owned()),
         };
-        let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store)
+        let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store, 1_700_000_000_000)
             .with_value(ValueClass::Value(ValueEffects::new(vec![leg_a, leg_b])));
         let result = criterion.evaluate(&ctx).unwrap();
         assert!(
@@ -781,7 +782,7 @@ mod tests {
             asset: Some("native".to_owned()),
             destination: Some("GAAA".to_owned()),
         };
-        let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store)
+        let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store, 1_700_000_000_000)
             .with_value(ValueClass::Value(ValueEffects::single(leg)));
         let result = criterion.evaluate(&ctx).unwrap();
         assert!(
@@ -817,7 +818,7 @@ mod tests {
             asset: Some("native".to_owned()),
             destination: Some("CAAA".to_owned()),
         };
-        let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store)
+        let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store, 1_700_000_000_000)
             .with_value(ValueClass::Value(ValueEffects::new(vec![outflow, inflow])));
         let result = criterion.evaluate(&ctx).unwrap();
         assert!(

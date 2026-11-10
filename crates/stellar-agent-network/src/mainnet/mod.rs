@@ -3,6 +3,8 @@
 //! proofs into signing authority.
 //!
 //! - [`audit_readiness`]: the audit readiness proof and its producer.
+//! - [`authority`]: the authority an action proceeds under, an operator
+//!   approval or the verified policy's own decision.
 //! - [`authorization`]: the five mainnet authorization types and their
 //!   checks.
 //! - [`clock`]: the clock the ledger, the signing points, and the submit gate
@@ -21,6 +23,7 @@
 //! `stellar_agent_core::mainnet` and `stellar_agent_core::approval::witness`.
 
 pub mod audit_readiness;
+pub mod authority;
 pub mod authorization;
 pub mod clock;
 pub mod consumed;

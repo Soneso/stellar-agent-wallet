@@ -1355,7 +1355,7 @@ where
     let policy_args = with_total_fee(trustline_policy_args(&args.from, &args.asset), total_fee);
     let source_adapter = AccountViewAdapter::new(&source_account_view);
     let evaluation = match evaluate_mainnet_policy(
-        policy.engine.as_ref(),
+        &policy.verified,
         profile,
         "stellar_trustline",
         stellar_agent_core::policy::ToolValueKind::MovesValue,

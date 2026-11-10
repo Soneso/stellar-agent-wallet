@@ -58,7 +58,7 @@ fn descriptor_ctx<'a>(
     profile: &'a Profile,
     store: &'a PolicyStateStore,
 ) -> EvalContext<'a> {
-    EvalContext::new(tool, args, "alice", profile, store)
+    EvalContext::new(tool, args, "alice", profile, store, 1_700_000_000_000)
         .with_value(derive_value_class(tool.name.as_str(), args))
 }
 
@@ -287,7 +287,17 @@ fn engine_derives_descriptor_and_denies_over_cap_pay() {
     let args =
         json!({ "amount_stroops": "1500000000", "asset": "native", "destination": G_ALLOWED });
     let decision = engine
-        .evaluate(&t, &args, &profile, None, None, None, None, None)
+        .evaluate(
+            &t,
+            &args,
+            &profile,
+            None,
+            None,
+            None,
+            None,
+            None,
+            1_700_000_000_000,
+        )
         .unwrap();
     assert!(
         matches!(

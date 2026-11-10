@@ -1399,10 +1399,13 @@ impl WalletServer {
             .map(stellar_agent_core::policy::v1::ValueClass::Value)
             .unwrap_or(stellar_agent_core::policy::v1::ValueClass::ReadOnly);
         let floor_hook = crate::sequence_floor::hook(&self.sequence_floor);
+        let authority = approval_witness
+            .as_ref()
+            .map(stellar_agent_network::mainnet::authority::MainnetAuthority::Approval);
         match crate::tools::submission_record::sign_and_submit_classic(
             self,
             mainnet.as_ref(),
-            approval_witness.as_ref(),
+            authority.as_ref(),
             audit_readiness,
             stellar_agent_network::mainnet::MainnetConsumer::McpTrustline,
             &client,

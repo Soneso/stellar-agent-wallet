@@ -158,7 +158,7 @@ use crate::policy::v1::EvalContext;
 use crate::policy::v1::asset_equivalence::assets_equivalent;
 use crate::policy::v1::bundle::{BundleStateOverlay, InnerOpDescriptor};
 use crate::policy::v1::criteria::Criterion;
-use crate::policy::v1::criteria::per_period_cap::{Window, system_time_to_ms};
+use crate::policy::v1::criteria::per_period_cap::Window;
 use crate::policy::v1::criteria::state_store::{StateKey, WindowEntry, WindowLimit};
 use crate::policy::v1::loader::DEFAULT_APPROVAL_TTL_SECONDS;
 use crate::policy::v1::value::{
@@ -673,6 +673,7 @@ impl Criterion for CounterpartyAllowlistCriterion {
             bundle: None,
             policy_digest: ctx.policy_digest,
             provisional: ctx.provisional,
+            now_ms: ctx.now_ms,
         };
         if !matches!(
             self.recipient_class(&inner_ctx),
@@ -696,7 +697,7 @@ impl Criterion for CounterpartyAllowlistCriterion {
         if self.budget().is_none() {
             return Ok(Vec::new());
         }
-        let now_ms = system_time_to_ms()?;
+        let now_ms = ctx.now_ms;
         let entry = self.size(ctx, now_ms)?;
         if let Some(entry) = &entry {
             ctx.state_store
@@ -864,7 +865,7 @@ impl CounterpartyAllowlistCriterion {
             }));
         }
 
-        let now_ms = system_time_to_ms()?;
+        let now_ms = ctx.now_ms;
         let state_key = budget.state_key(ctx.profile_name);
         let (window_used_stroops, _) =
             ctx.state_store
@@ -1531,6 +1532,7 @@ mod tests {
             bundle: None,
             policy_digest: [0; 32],
             provisional: false,
+            now_ms: 1_700_000_000_000,
         }
     }
 
@@ -1734,7 +1736,7 @@ mod tests {
             asset: None,
             destination: Some("CAAA".to_owned()),
         };
-        let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store)
+        let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store, 1_700_000_000_000)
             .with_value(ValueClass::Value(ValueEffects::single(leg)));
         let result = criterion.evaluate(&ctx).unwrap();
         assert!(
@@ -1757,7 +1759,8 @@ mod tests {
             let args =
                 json!({"asset_code": "USDC", "asset_issuer": issuer, "limit_stroops": "1000000"});
             let value = crate::policy::v1::value::derive_value_class(&tool.name, &args);
-            let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store).with_value(value);
+            let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store, 1_700_000_000_000)
+                .with_value(value);
             let result = criterion.evaluate(&ctx).unwrap();
             if issuer == USDC_ISSUER {
                 assert!(
@@ -1803,7 +1806,7 @@ mod tests {
         );
         let args = json!({});
         let leg = inflow_leg(Some(&format!("MYTOKEN:{USDC_ISSUER}")));
-        let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store)
+        let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store, 1_700_000_000_000)
             .with_value(ValueClass::Value(ValueEffects::single(leg)));
         let result = criterion.evaluate(&ctx).unwrap();
         assert!(
@@ -1828,7 +1831,7 @@ mod tests {
         .with_gate_inflows(true);
         let args = json!({});
         let leg = inflow_leg(Some(&format!("MYTOKEN:{USDC_ISSUER}")));
-        let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store)
+        let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store, 1_700_000_000_000)
             .with_value(ValueClass::Value(ValueEffects::single(leg)));
         let result = criterion.evaluate(&ctx).unwrap();
         match result {
@@ -1861,7 +1864,7 @@ mod tests {
         .with_gate_inflows(true);
         let args = json!({});
         let leg = inflow_leg(Some(&format!("USDC:{USDC_ISSUER}")));
-        let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store)
+        let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store, 1_700_000_000_000)
             .with_value(ValueClass::Value(ValueEffects::single(leg)));
         let result = criterion.evaluate(&ctx).unwrap();
         assert!(
@@ -1887,7 +1890,7 @@ mod tests {
         .with_gate_inflows(true);
         let args = json!({});
         let leg = inflow_leg(None);
-        let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store)
+        let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store, 1_700_000_000_000)
             .with_value(ValueClass::Value(ValueEffects::single(leg)));
         let result = criterion.evaluate(&ctx).unwrap();
         match result {
@@ -1928,7 +1931,7 @@ mod tests {
             asset: Some(format!("MYTOKEN:{USDC_ISSUER}")),
             destination: Some("CAAA".to_owned()),
         };
-        let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store)
+        let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store, 1_700_000_000_000)
             .with_value(ValueClass::Value(ValueEffects::single(leg)));
         let result = criterion.evaluate(&ctx).unwrap();
         match result {
@@ -1994,6 +1997,7 @@ mod tests {
             bundle: None,
             policy_digest: [0; 32],
             provisional: false,
+            now_ms: 1_700_000_000_000,
         }
     }
 
@@ -2044,6 +2048,7 @@ mod tests {
             bundle: None,
             policy_digest: [0; 32],
             provisional: false,
+            now_ms: 1_700_000_000_000,
         }
     }
 
@@ -2602,7 +2607,7 @@ mod tests {
             destination: None,
         };
         let args = json!({});
-        let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store)
+        let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store, 1_700_000_000_000)
             .with_value(ValueClass::Value(ValueEffects::single(leg)));
         let result = criterion.evaluate(&ctx).unwrap();
         assert!(

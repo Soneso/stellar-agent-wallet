@@ -1020,11 +1020,18 @@ fn ctx<'a>(
     args: &'a serde_json::Value,
     state: &'a PolicyStateStore,
 ) -> stellar_agent_core::policy::v1::EvalContext<'a> {
-    stellar_agent_core::policy::v1::EvalContext::new(tool, args, "operator", profile, state)
-        .with_value(stellar_agent_core::policy::v1::value::derive_value_class(
-            "stellar_pay",
-            args,
-        ))
+    stellar_agent_core::policy::v1::EvalContext::new(
+        tool,
+        args,
+        "operator",
+        profile,
+        state,
+        1_700_000_000_000,
+    )
+    .with_value(stellar_agent_core::policy::v1::value::derive_value_class(
+        "stellar_pay",
+        args,
+    ))
 }
 fn classic_and_sac(profile: &Profile) -> (String, String) {
     let classic = "USD:GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF".to_owned();

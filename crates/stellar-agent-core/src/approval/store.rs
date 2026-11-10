@@ -172,14 +172,16 @@ pub(crate) fn x402_transfer_terms(
     })
 }
 
-/// Lifetime of an interactive mainnet confirmation, in seconds.
-pub const MAINNET_CONFIRMATION_TTL_SECONDS: u64 = 600;
+/// Lifetime of the authority an `Allow` decision grants on mainnet, in
+/// seconds: the window of an interactive confirmation and the governing
+/// lifetime of a policy authority.
+pub const MAINNET_POLICY_AUTHORITY_TTL_SECONDS: u64 = 600;
 
 /// Returns the approval lifetime permitted by the evaluated decision.
 #[must_use]
 pub fn governing_ttl_ms(evaluation: &crate::policy::Evaluation) -> u64 {
     match &evaluation.decision {
-        crate::policy::Decision::Allow => MAINNET_CONFIRMATION_TTL_SECONDS * 1000,
+        crate::policy::Decision::Allow => MAINNET_POLICY_AUTHORITY_TTL_SECONDS * 1000,
         crate::policy::Decision::RequireApproval(requirement) => {
             u64::from(requirement.ttl_seconds) * 1000
         }
@@ -12537,6 +12539,7 @@ is_proposer = true
                     decision,
                     value_effects: None,
                     provisional: false,
+                    rule_ordinal: None,
                 }),
                 expected
             );

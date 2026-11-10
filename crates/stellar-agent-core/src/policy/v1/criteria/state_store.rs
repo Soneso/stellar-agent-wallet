@@ -45,6 +45,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
 
 use crate::policy::{DenyReason, UnlistedBound};
+use crate::wallet::WalletLifecycleError;
 
 /// Maximum tolerated future clock skew for host-dated pending entries, in milliseconds.
 pub const CLOCK_SKEW_TOLERANCE_MS: u64 = 30_000;
@@ -1253,6 +1254,71 @@ pub fn set_query_time_for_test(milliseconds: u64) -> QueryTimeGuard {
 }
 
 #[cfg(any(test, feature = "test-helpers"))]
-pub(crate) fn query_time_for_test() -> Option<u64> {
-    QUERY_TIME.get()
+thread_local! {
+    static POLICY_CLOCK_ERROR: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Restores the current thread's policy clock to working order when the
+/// fixture ends.
+#[cfg(any(test, feature = "test-helpers"))]
+pub struct PolicyClockErrorGuard {
+    previous: bool,
+    thread: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+
+#[cfg(any(test, feature = "test-helpers"))]
+impl Drop for PolicyClockErrorGuard {
+    fn drop(&mut self) {
+        POLICY_CLOCK_ERROR.set(self.previous);
+    }
+}
+
+/// Makes [`policy_now_ms`] fail on the calling test thread while the guard
+/// lives. The failure takes precedence over [`set_query_time_for_test`].
+#[cfg(any(test, feature = "test-helpers"))]
+#[must_use]
+pub fn set_policy_clock_error_for_test() -> PolicyClockErrorGuard {
+    PolicyClockErrorGuard {
+        previous: POLICY_CLOCK_ERROR.replace(true),
+        thread: std::marker::PhantomData,
+    }
+}
+
+/// Samples the policy evaluation instant in Unix milliseconds.
+///
+/// Every policy evaluation reads time exactly once, through this function or
+/// through an instant its caller supplies, and hands that one sample to every
+/// criterion. A criterion never reads the clock itself, so one evaluation
+/// cannot observe two instants.
+///
+/// Test builds honor `set_policy_clock_error_for_test` first and then
+/// `set_query_time_for_test` on the calling thread.
+///
+/// # Errors
+///
+/// Returns [`WalletLifecycleError::ClockError`] when the system clock is
+/// before the Unix epoch or its millisecond count overflows `u64`.
+///
+/// # Examples
+///
+/// ```
+/// use stellar_agent_core::policy::policy_now_ms;
+///
+/// let now = policy_now_ms().expect("system clock should be valid");
+/// assert!(now > 0);
+/// ```
+pub fn policy_now_ms() -> Result<u64, WalletLifecycleError> {
+    #[cfg(any(test, feature = "test-helpers"))]
+    {
+        if POLICY_CLOCK_ERROR.get() {
+            return Err(WalletLifecycleError::ClockError {
+                detail: "policy clock unavailable (test injection)".to_owned(),
+                source: None,
+            });
+        }
+        if let Some(now) = QUERY_TIME.get() {
+            return Ok(now);
+        }
+    }
+    crate::timefmt::now_unix_ms()
 }

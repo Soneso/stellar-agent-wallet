@@ -23,7 +23,7 @@
 //!
 //! # Clock-skew tolerance
 //!
-//! `now_ms` is derived from `std::time::SystemTime::now()`. Host-dated pending
+//! `now_ms` is the evaluation instant [`EvalContext::now_ms`]. Host-dated pending
 //! entries up to 30 seconds in the future are tolerated; beyond that,
 //! [`PolicyError::CriterionEvaluationFailed`] is returned.
 //!
@@ -53,8 +53,6 @@
 //! any `MovesValue` tool whose descriptor resolves debit legs in the
 //! configured asset (see [`crate::policy::v1::value`]).
 //!
-
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::policy::v1::EvalContext;
 use crate::policy::v1::asset_equivalence::assets_equivalent;
@@ -255,7 +253,6 @@ impl Criterion for PerPeriodCapCriterion {
     ///
     /// Returns [`PolicyError::CriterionEvaluationFailed`] when:
     /// - The required amount field is missing or unparseable.
-    /// - [`SystemTime`] is before UNIX epoch (should not occur in practice).
     /// - The state store detects clock skew exceeding 30 seconds.
     fn evaluate(&self, ctx: &EvalContext<'_>) -> Result<Option<DenyReason>, PolicyError> {
         let tool_name = ctx.tool.name.as_str();
@@ -360,8 +357,7 @@ impl Criterion for PerPeriodCapCriterion {
     /// criterion's asset (e.g. the single-tx path of a multicall bundle, whose
     /// per-inner debits are recorded by `BundlePerPeriodCapCriterion` instead).
     fn record_confirmed(&self, ctx: &EvalContext<'_>) -> Result<Vec<WindowEntry>, PolicyError> {
-        let now_ms = system_time_to_ms()?;
-        let entry = self.size(ctx, now_ms)?;
+        let entry = self.size(ctx, ctx.now_ms)?;
         if let Some(entry) = &entry {
             ctx.state_store
                 .append(entry.key(), entry.timestamp_ms(), entry.amount())
@@ -438,16 +434,15 @@ impl PerPeriodCapCriterion {
     ///
     /// # Errors
     ///
-    /// Returns [`PolicyError::CriterionEvaluationFailed`] when [`SystemTime`]
-    /// is before UNIX epoch, or the state store detects clock skew exceeding
-    /// 30 seconds.
+    /// Returns [`PolicyError::CriterionEvaluationFailed`] when the state store
+    /// detects clock skew exceeding 30 seconds against `ctx.now_ms`.
     fn check_window(
         &self,
         ctx: &EvalContext<'_>,
         criterion_asset: &str,
         attempted_stroops: i128,
     ) -> Result<Option<DenyReason>, PolicyError> {
-        let now_ms = system_time_to_ms()?;
+        let now_ms = ctx.now_ms;
 
         let state_key = StateKey::new(
             ctx.profile_name,
@@ -497,25 +492,6 @@ impl PerPeriodCapCriterion {
 // Helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Returns the current time as unix-milliseconds.
-///
-/// # Errors
-///
-/// Returns [`PolicyError::CriterionEvaluationFailed`] when `SystemTime::now()`
-/// is before the UNIX epoch (should not occur on any supported platform).
-pub(super) fn system_time_to_ms() -> Result<u64, PolicyError> {
-    #[cfg(any(test, feature = "test-helpers"))]
-    if let Some(now) = super::state_store::query_time_for_test() {
-        return Ok(now);
-    }
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .map_err(|e| PolicyError::CriterionEvaluationFailed {
-            detail: format!("per_period_cap: system clock is before UNIX epoch: {e}"),
-        })
-}
-
 // ─────────────────────────────────────────────────────────────────────────────
 // Tests
 // ─────────────────────────────────────────────────────────────────────────────
@@ -547,6 +523,11 @@ mod tests {
             value_kind: crate::policy::ToolValueKind::ReadOnly,
         };
         ToolDescriptor::from_registration(&reg)
+    }
+
+    /// The fixture evaluation instant every context of this module carries.
+    fn now_ms() -> u64 {
+        1_700_000_000_000
     }
 
     /// Constructs a standard testnet `Profile` for criterion tests.
@@ -581,6 +562,7 @@ mod tests {
             bundle: None,
             policy_digest: [0; 32],
             provisional: false,
+            now_ms: now_ms(),
         }
     }
 
@@ -609,7 +591,7 @@ mod tests {
 
         // Pre-seed 200 XLM spent (within a 1-day window).
         let key = StateKey::new("alice", 1, "native", 86_400);
-        let now = system_time_to_ms().unwrap();
+        let now = now_ms();
         store.append(&key, now - 1_000, 2_000_000_000).unwrap(); // 200 XLM
 
         // Try to spend another 100 XLM → total 300 XLM < 500 XLM cap.
@@ -632,7 +614,7 @@ mod tests {
         let criterion = PerPeriodCapCriterion::new("native".into(), w, 5_000_000_000);
 
         let key = StateKey::new("alice", 1, "native", 86_400);
-        let now = system_time_to_ms().unwrap();
+        let now = now_ms();
         // Pre-seed 450 XLM spent.
         store.append(&key, now - 1_000, 4_500_000_000).unwrap(); // 450 XLM
 
@@ -659,7 +641,7 @@ mod tests {
         );
         let key = StateKey::new("alice", 1, "native", 3_600);
         store
-            .append(&key, system_time_to_ms().unwrap() + 3_600_000, 600_000_000)
+            .append(&key, now_ms() + 3_600_000, 600_000_000)
             .unwrap();
         let allowed = json!({ "amount": "40 XLM", "asset": "native" });
         assert!(
@@ -690,7 +672,7 @@ mod tests {
         let criterion = PerPeriodCapCriterion::new("native".into(), w, 1_000_000_000);
 
         let key = StateKey::new("alice", 1, "native", 3_600);
-        let now = system_time_to_ms().unwrap();
+        let now = now_ms();
         // Insert an entry 31 seconds in the future (clock skew violation).
         store.append_pending(&key, now + 31_000, 1).unwrap();
 
@@ -777,7 +759,7 @@ mod tests {
         let store = PolicyStateStore::new();
         let w = Window::parse("1d").unwrap();
         let key = StateKey::new("alice", 1, "native", w.as_secs());
-        let now_ms = system_time_to_ms().unwrap();
+        let now_ms = now_ms();
         store.append(&key, now_ms, 1).unwrap();
 
         let criterion = PerPeriodCapCriterion::new("native".into(), w, 1_000_000_000);
@@ -823,7 +805,7 @@ mod tests {
 
         // Pre-seed 400 XLM in the state store.
         let key = StateKey::new("alice", 1, "native", 86_400);
-        let now = system_time_to_ms().unwrap();
+        let now = now_ms();
         store.append(&key, now - 1_000, 4_000_000_000).unwrap(); // 400 XLM
 
         // Single-tx attempt of 50 XLM — bundle=None should see 400+50=450 XLM total,
@@ -853,7 +835,7 @@ mod tests {
 
         // Pre-seed 400 XLM in the state store.
         let key = StateKey::new("alice", 1, "native", 86_400);
-        let now = system_time_to_ms().unwrap();
+        let now = now_ms();
         store.append(&key, now - 1_000, 4_000_000_000).unwrap(); // 400 XLM
 
         // Overlay simulates 80 XLM already approved in earlier inners.
@@ -883,6 +865,7 @@ mod tests {
             bundle: Some(&view),
             policy_digest: [0; 32],
             provisional: false,
+            now_ms: now_ms(),
         };
         let result = criterion.evaluate(&ctx).unwrap();
         assert!(
@@ -1118,7 +1101,7 @@ mod tests {
             asset: Some("native".to_owned()),
             destination: Some("GBBB".to_owned()),
         };
-        let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store)
+        let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store, now_ms())
             .with_value(ValueClass::Value(ValueEffects::new(vec![leg_a, leg_b])));
         let result = criterion.evaluate(&ctx).unwrap();
         assert!(
@@ -1153,7 +1136,7 @@ mod tests {
             asset: Some("native".to_owned()),
             destination: Some("GAAA".to_owned()),
         };
-        let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store)
+        let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store, now_ms())
             .with_value(ValueClass::Value(ValueEffects::single(leg)));
         let result = criterion.evaluate(&ctx).unwrap();
         assert!(
@@ -1194,7 +1177,7 @@ mod tests {
             asset: Some("native".to_owned()),
             destination: Some("CAAA".to_owned()),
         };
-        let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store)
+        let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store, now_ms())
             .with_value(ValueClass::Value(ValueEffects::new(vec![outflow, inflow])));
         let result = criterion.evaluate(&ctx).unwrap();
         assert!(
@@ -1224,7 +1207,7 @@ mod tests {
         // Pre-record a window total strictly above i64::MAX.
         let recorded_total: i128 = i128::from(i64::MAX) + 1_000_000_000;
         let key = StateKey::new("alice", 1, "native", w.as_secs());
-        let now_ms = system_time_to_ms().unwrap();
+        let now_ms = now_ms();
         store.append(&key, now_ms - 1_000, recorded_total).unwrap();
 
         // Cap set to exactly (recorded_total + attempted) - 1: the attempted
@@ -1239,7 +1222,7 @@ mod tests {
             asset: Some("native".to_owned()),
             destination: Some("GAAA".to_owned()),
         };
-        let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store)
+        let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store, now_ms)
             .with_value(ValueClass::Value(ValueEffects::single(leg)));
 
         let result = criterion.evaluate(&ctx).unwrap();
@@ -1268,7 +1251,7 @@ mod tests {
 
         let recorded_total: i128 = i128::from(i64::MAX) + 1_000_000_000;
         let key = StateKey::new("alice", 1, "native", w.as_secs());
-        let now_ms = system_time_to_ms().unwrap();
+        let now_ms = now_ms();
         store.append(&key, now_ms - 1_000, recorded_total).unwrap();
 
         // Cap set to exactly (recorded_total + attempted): the attempted debit
@@ -1283,7 +1266,7 @@ mod tests {
             asset: Some("native".to_owned()),
             destination: Some("GAAA".to_owned()),
         };
-        let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store)
+        let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store, now_ms)
             .with_value(ValueClass::Value(ValueEffects::single(leg)));
 
         let result = criterion.evaluate(&ctx).unwrap();

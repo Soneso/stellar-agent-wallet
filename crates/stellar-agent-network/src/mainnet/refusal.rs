@@ -228,6 +228,16 @@ pub enum MainnetPrecondition {
     /// A SEP-10 challenge's client account is not the ephemeral account
     /// that signs it.
     MessageClientAccount,
+    /// Under policy authority, the resolver's own evaluation did not allow
+    /// the action: an approval requirement or a denial needs an approval.
+    FreshDecisionRequiresApproval,
+    /// A policy authority's scope does not cover the message: it is not an
+    /// authenticated x402 scope, or names another home domain.
+    AuthorityScopeMismatch,
+    /// The authority a transition presents differs from the one the record
+    /// was minted under: another variant, another approval, or another
+    /// policy authority.
+    AuthorityMismatch,
 }
 
 impl MainnetPrecondition {
@@ -339,6 +349,9 @@ impl MainnetPrecondition {
             Self::SignatureInvalid => "signature_invalid",
             Self::MessageUseMismatch => "message_use_mismatch",
             Self::MessageClientAccount => "message_client_account",
+            Self::FreshDecisionRequiresApproval => "fresh_decision_requires_approval",
+            Self::AuthorityScopeMismatch => "authority_scope_mismatch",
+            Self::AuthorityMismatch => "authority_mismatch",
         }
     }
 }
@@ -568,6 +581,9 @@ mod tests {
             P::SignatureInvalid,
             P::MessageUseMismatch,
             P::MessageClientAccount,
+            P::FreshDecisionRequiresApproval,
+            P::AuthorityScopeMismatch,
+            P::AuthorityMismatch,
         ];
         for precondition in all {
             match precondition {
@@ -673,7 +689,10 @@ mod tests {
                 | P::AuditNotAnchored
                 | P::SignatureInvalid
                 | P::MessageUseMismatch
-                | P::MessageClientAccount => {}
+                | P::MessageClientAccount
+                | P::FreshDecisionRequiresApproval
+                | P::AuthorityScopeMismatch
+                | P::AuthorityMismatch => {}
             }
         }
         all.to_vec()
@@ -789,6 +808,9 @@ mod tests {
             "signature_invalid",
             "message_use_mismatch",
             "message_client_account",
+            "fresh_decision_requires_approval",
+            "authority_scope_mismatch",
+            "authority_mismatch",
         ];
         assert_eq!(all.iter().map(|p| p.label()).collect::<Vec<_>>(), expected);
         let mut labels: Vec<_> = all.iter().map(|p| p.label()).collect();

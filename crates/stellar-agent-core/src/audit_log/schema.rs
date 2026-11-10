@@ -3262,6 +3262,15 @@ pub enum EventKind {
         source_redacted: String,
         /// The sequence number the transaction consumes.
         sequence: i64,
+        /// Optional. The BLAKE3 digest of the verified policy that decided
+        /// the submission, as 64 lowercase hex characters. Absent when the
+        /// row records no policy provenance.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        policy_digest: Option<String>,
+        /// Optional. The zero-based document position of the deciding rule.
+        /// Absent when the row records no policy provenance.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rule_index: Option<u32>,
     },
 
     /// A recorded value-moving submission that never left the wallet.
@@ -3432,6 +3441,20 @@ pub enum EventKind {
         /// constant identifying how the host settles, facilitator-supplied and
         /// bounded to [`RECORDED_STR_MAX`] characters at construction.
         scheme: String,
+        /// Optional. The BLAKE3 digest of the verified policy that decided
+        /// the authorization, as 64 lowercase hex characters. Absent when the
+        /// row records no policy provenance.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        policy_digest: Option<String>,
+        /// Optional. The signed sequence of that policy.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        policy_sequence: Option<i64>,
+        /// Optional. The zero-based document position of the deciding rule.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rule_index: Option<u32>,
+        /// Optional. The evaluation instant in Unix milliseconds.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        evaluated_at_ms: Option<u64>,
     },
 
     /// An x402 payment whose `x402_payment_authorized` row was written did not
@@ -6590,6 +6613,10 @@ mod tests {
             }],
             network: "stellar:testnet".to_owned(),
             scheme: "exact".to_owned(),
+            policy_digest: None,
+            policy_sequence: None,
+            rule_index: None,
+            evaluated_at_ms: None,
         };
         let s = serde_json::to_string(&ev).unwrap();
         let back: EventKind = serde_json::from_str(&s).unwrap();
@@ -7099,6 +7126,8 @@ mod tests {
                 transaction_hash_redacted: "hash".into(),
                 source_redacted: "source".into(),
                 sequence: 7,
+                policy_digest: None,
+                rule_index: None,
             };
             assert_eq!(
                 serde_json::to_string(&event).unwrap(),
@@ -7137,6 +7166,10 @@ mod tests {
                 legs: vec![],
                 network: "stellar:testnet".into(),
                 scheme: "exact".into(),
+                policy_digest: None,
+                policy_sequence: None,
+                rule_index: None,
+                evaluated_at_ms: None,
             };
             assert_eq!(
                 serde_json::to_string(&event).unwrap(),
@@ -7154,6 +7187,10 @@ mod tests {
                 legs: vec![],
                 network: "stellar:mainnet".into(),
                 scheme: "exact".into(),
+                policy_digest: None,
+                policy_sequence: None,
+                rule_index: None,
+                evaluated_at_ms: None,
             };
             let text = serde_json::to_string(&event).unwrap();
             assert_eq!(
@@ -7198,6 +7235,10 @@ mod tests {
                 legs: vec![],
                 network: "stellar:testnet".into(),
                 scheme: "exact".into(),
+                policy_digest: None,
+                policy_sequence: None,
+                rule_index: None,
+                evaluated_at_ms: None,
             };
             let json = serde_json::to_value(&x402).unwrap();
             assert_eq!(
@@ -7214,6 +7255,8 @@ mod tests {
                     transaction_hash_redacted: "hash".into(),
                     source_redacted: "source".into(),
                     sequence: 7,
+                    policy_digest: None,
+                    rule_index: None,
                 },
                 EventKind::ValueActionSubmitted {
                     witness: Some(witness.clone()),
@@ -7229,6 +7272,10 @@ mod tests {
                     legs: vec![],
                     network: "stellar:testnet".into(),
                     scheme: "exact".into(),
+                    policy_digest: None,
+                    policy_sequence: None,
+                    rule_index: None,
+                    evaluated_at_ms: None,
                 },
             ];
             for event in events {

@@ -1481,7 +1481,7 @@ where
     let sponsor_adapter =
         stellar_agent_network::policy_view::AccountViewAdapter::new(&sponsor_account_view);
     let evaluation = match evaluate_mainnet_policy(
-        policy.engine.as_ref(),
+        &policy.verified,
         profile,
         "stellar_create_account",
         stellar_agent_core::policy::ToolValueKind::MovesValue,

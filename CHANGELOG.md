@@ -231,6 +231,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Policy evaluation reads one clock instant per evaluation; a clock failure
+  before an evaluation refuses with `wallet.clock_error`.
+
+- The window-state file uses version 10 when an authorization carries policy
+  authority.
+
+- `MAINNET_CONFIRMATION_TTL_SECONDS` is renamed
+  `MAINNET_POLICY_AUTHORITY_TTL_SECONDS`.
+
 - The mainnet minimum policy accepts approval rule lifetimes up to 86,400
   seconds and requires a rate limit on non-deny trustline and claim rules.
 

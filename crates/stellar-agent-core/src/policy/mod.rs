@@ -78,6 +78,8 @@ pub mod pin;
 /// the store, its authorization ledger, and the policy pin.
 pub mod state_lock;
 
+pub use v1::criteria::state_store::policy_now_ms;
+
 // ─────────────────────────────────────────────────────────────────────────────
 // BuildRegistryError
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1359,6 +1361,16 @@ pub enum PolicyError {
         /// Non-secret evaluator diagnostic.
         detail: String,
     },
+
+    /// A policy evaluation reached a state its own invariants exclude, such
+    /// as a rule position that does not fit the provenance width.
+    ///
+    /// `detail` contains the non-secret diagnostic.
+    #[error("policy internal error: {detail}")]
+    Internal {
+        /// Non-secret diagnostic.
+        detail: String,
+    },
 }
 
 /// Renders the remedy that [`PolicyError::OwnerSignatureInvalid`] appends
@@ -1470,6 +1482,7 @@ impl PolicyError {
             Self::MissingOwnerKey { .. } => "policy.missing_owner_key",
             Self::ScopeResolutionFailed { .. } => "policy.scope_resolution_failed",
             Self::CriterionEvaluationFailed { .. } => "policy.criterion_evaluation_failed",
+            Self::Internal { .. } => "policy.internal",
         }
     }
 }
@@ -1527,6 +1540,9 @@ pub trait PolicyEngine: Send + Sync {
     /// - `sep45_sessions` — optional SEP-45 session view for the
     ///   `sep45_session_active` criterion.  Pass `None` when the criterion is
     ///   not active or when no session store is available at the dispatch site.
+    /// - `now_ms`: the evaluation instant in Unix milliseconds. Every
+    ///   criterion reads this one sample and never the clock; a caller without
+    ///   an instant of its own takes it from [`policy_now_ms`].
     ///
     /// # Errors
     ///
@@ -1546,6 +1562,7 @@ pub trait PolicyEngine: Send + Sync {
         counterparty_cache: Option<&dyn crate::policy::v1::CounterpartyCacheView>,
         sep10_sessions: Option<&dyn crate::policy::v1::Sep10SessionView>,
         sep45_sessions: Option<&dyn crate::policy::v1::Sep45SessionView>,
+        now_ms: u64,
     ) -> Result<Decision, PolicyError>;
 
     /// Evaluates a tool call with the value descriptor supplied explicitly by
@@ -1582,6 +1599,7 @@ pub trait PolicyEngine: Send + Sync {
         counterparty_cache: Option<&dyn crate::policy::v1::CounterpartyCacheView>,
         sep10_sessions: Option<&dyn crate::policy::v1::Sep10SessionView>,
         sep45_sessions: Option<&dyn crate::policy::v1::Sep45SessionView>,
+        now_ms: u64,
     ) -> Result<Decision, PolicyError> {
         self.evaluate(
             tool,
@@ -1592,6 +1610,7 @@ pub trait PolicyEngine: Send + Sync {
             counterparty_cache,
             sep10_sessions,
             sep45_sessions,
+            now_ms,
         )
     }
 
@@ -1619,6 +1638,7 @@ pub trait PolicyEngine: Send + Sync {
         counterparty_cache: Option<&dyn crate::policy::v1::CounterpartyCacheView>,
         sep10_sessions: Option<&dyn crate::policy::v1::Sep10SessionView>,
         sep45_sessions: Option<&dyn crate::policy::v1::Sep45SessionView>,
+        now_ms: u64,
     ) -> Result<Evaluation, PolicyError> {
         let decision = self.evaluate(
             tool,
@@ -1629,11 +1649,13 @@ pub trait PolicyEngine: Send + Sync {
             counterparty_cache,
             sep10_sessions,
             sep45_sessions,
+            now_ms,
         )?;
         Ok(Evaluation {
             decision,
             value_effects: None,
             provisional: false,
+            rule_ordinal: None,
         })
     }
 
@@ -1658,6 +1680,7 @@ pub trait PolicyEngine: Send + Sync {
         counterparty_cache: Option<&dyn crate::policy::v1::CounterpartyCacheView>,
         sep10_sessions: Option<&dyn crate::policy::v1::Sep10SessionView>,
         sep45_sessions: Option<&dyn crate::policy::v1::Sep45SessionView>,
+        now_ms: u64,
     ) -> Result<Evaluation, PolicyError> {
         let decision = self.evaluate_with_value(
             tool,
@@ -1669,11 +1692,13 @@ pub trait PolicyEngine: Send + Sync {
             counterparty_cache,
             sep10_sessions,
             sep45_sessions,
+            now_ms,
         )?;
         Ok(Evaluation {
             decision,
             value_effects: None,
             provisional: false,
+            rule_ordinal: None,
         })
     }
 
@@ -1705,6 +1730,7 @@ pub trait PolicyEngine: Send + Sync {
         counterparty_cache: Option<&dyn crate::policy::v1::CounterpartyCacheView>,
         sep10_sessions: Option<&dyn crate::policy::v1::Sep10SessionView>,
         sep45_sessions: Option<&dyn crate::policy::v1::Sep45SessionView>,
+        now_ms: u64,
     ) -> Result<Evaluation, PolicyError> {
         self.evaluate_with_value_full(
             tool,
@@ -1716,6 +1742,7 @@ pub trait PolicyEngine: Send + Sync {
             counterparty_cache,
             sep10_sessions,
             sep45_sessions,
+            now_ms,
         )
     }
 
@@ -1849,6 +1876,14 @@ pub struct Evaluation {
     /// authorizes signing: the caller re-evaluates strictly with a live
     /// account read first.
     pub provisional: bool,
+    /// The zero-based position, in document order, of the rule that decided
+    /// the call.
+    ///
+    /// The position counts every rule in the resolved scope, including rules
+    /// whose tool pattern does not match this call, so it names the same rule
+    /// for every tool. `None` for the default-deny when no rule matches and
+    /// for engines without rules ([`NoopPolicyEngine`]).
+    pub rule_ordinal: Option<usize>,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1888,7 +1923,7 @@ pub struct Evaluation {
 ///     name: "stellar_pay", destructive_hint: true, read_only_hint: false, chain_id_required: true,
 ///     value_kind: stellar_agent_core::policy::ToolValueKind::ReadOnly,
 /// });
-/// assert_eq!(engine.evaluate(&tool, &args, &profile, None, None, None, None, None).unwrap(), Decision::Allow);
+/// assert_eq!(engine.evaluate(&tool, &args, &profile, None, None, None, None, None, 0).unwrap(), Decision::Allow);
 ///
 /// // Mainnet: read-only tool is allowed.
 /// let profile_mainnet = Profile::builder_mainnet("https://rpc.example", "svc", "acct", "n-svc", "n-acct")
@@ -1898,14 +1933,14 @@ pub struct Evaluation {
 ///     name: "stellar_balances", destructive_hint: false, read_only_hint: true, chain_id_required: true,
 ///     value_kind: stellar_agent_core::policy::ToolValueKind::ReadOnly,
 /// });
-/// assert_eq!(engine.evaluate(&read_tool, &args, &profile_mainnet, None, None, None, None, None).unwrap(), Decision::Allow);
+/// assert_eq!(engine.evaluate(&read_tool, &args, &profile_mainnet, None, None, None, None, None, 0).unwrap(), Decision::Allow);
 ///
 /// // Mainnet: destructive tool is NOT implemented yet.
 /// let write_tool = ToolDescriptor::from_registration(&McpToolRegistration {
 ///     name: "stellar_pay", destructive_hint: true, read_only_hint: false, chain_id_required: true,
 ///     value_kind: stellar_agent_core::policy::ToolValueKind::ReadOnly,
 /// });
-/// assert!(engine.evaluate(&write_tool, &args, &profile_mainnet, None, None, None, None, None).is_err());
+/// assert!(engine.evaluate(&write_tool, &args, &profile_mainnet, None, None, None, None, None, 0).is_err());
 /// ```
 pub struct NoopPolicyEngine;
 
@@ -1966,6 +2001,7 @@ impl PolicyEngine for NoopPolicyEngine {
         _counterparty_cache: Option<&dyn crate::policy::v1::CounterpartyCacheView>,
         _sep10_sessions: Option<&dyn crate::policy::v1::Sep10SessionView>,
         _sep45_sessions: Option<&dyn crate::policy::v1::Sep45SessionView>,
+        _now_ms: u64,
     ) -> Result<Decision, PolicyError> {
         // Testnet: all tools allowed.
         if !profile.chain_id.is_mainnet() {
@@ -2048,6 +2084,7 @@ mod tests {
             None,
             None,
             None,
+            1_700_000_000_000,
         );
         assert_eq!(result.unwrap(), Decision::Allow);
     }
@@ -2064,6 +2101,7 @@ mod tests {
             None,
             None,
             None,
+            1_700_000_000_000,
         );
         assert_eq!(result.unwrap(), Decision::Allow);
     }
@@ -2080,6 +2118,7 @@ mod tests {
             None,
             None,
             None,
+            1_700_000_000_000,
         );
         assert_eq!(result.unwrap(), Decision::Allow);
     }
@@ -2096,6 +2135,7 @@ mod tests {
             None,
             None,
             None,
+            1_700_000_000_000,
         );
         assert!(
             matches!(result, Err(PolicyError::NotImplemented)),
@@ -2173,6 +2213,7 @@ mod tests {
                 PolicyError::MissingOwnerKey { .. } => {}
                 PolicyError::ScopeResolutionFailed { .. } => {}
                 PolicyError::CriterionEvaluationFailed { .. } => {}
+                PolicyError::Internal { .. } => {}
             }
         }
 
@@ -2215,6 +2256,9 @@ mod tests {
             PolicyError::CriterionEvaluationFailed {
                 detail: detail.to_owned(),
             },
+            PolicyError::Internal {
+                detail: detail.to_owned(),
+            },
         ]
     }
 
@@ -2238,6 +2282,7 @@ mod tests {
             PolicyError::MissingOwnerKey { .. } => "policy.missing_owner_key",
             PolicyError::ScopeResolutionFailed { .. } => "policy.scope_resolution_failed",
             PolicyError::CriterionEvaluationFailed { .. } => "policy.criterion_evaluation_failed",
+            PolicyError::Internal { .. } => "policy.internal",
         }
     }
 

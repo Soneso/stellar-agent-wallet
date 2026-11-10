@@ -151,29 +151,37 @@ impl WalletServer {
                 &prepared,
                 now_unix,
             ) {
-                Ok(record) => match self
-                    .evaluate_policy_only(
-                        "stellar_mpp_charge_commit",
-                        &json!({"authorization_id": record.authorization_id()}),
-                        "stellar:testnet",
-                        Some(ValueClass::Value(effects)),
-                        None,
-                        None,
-                    )
-                    .await
-                {
-                    Ok(evaluation) => {
-                        if matches!(
-                            evaluation.decision,
-                            stellar_agent_core::policy::Decision::RequireApproval(_)
-                        ) {
-                            disposition = ApprovalDisposition::RequireApproval;
+                Ok(record) => match stellar_agent_core::policy::policy_now_ms() {
+                    Ok(now_ms) => match self
+                        .evaluate_policy_only(
+                            "stellar_mpp_charge_commit",
+                            &json!({"authorization_id": record.authorization_id()}),
+                            "stellar:testnet",
+                            Some(ValueClass::Value(effects)),
+                            None,
+                            None,
+                            now_ms,
+                        )
+                        .await
+                    {
+                        Ok(evaluation) => {
+                            if matches!(
+                                evaluation.decision,
+                                stellar_agent_core::policy::Decision::RequireApproval(_)
+                            ) {
+                                disposition = ApprovalDisposition::RequireApproval;
+                            }
                         }
-                    }
+                        Err(error) => tracing::debug!(
+                            tool = "stellar_mpp_charge_commit",
+                            error_code = %error.code(),
+                            "stellar_mpp_charge_prepare: commit policy evaluation failed; disposition unchanged"
+                        ),
+                    },
                     Err(error) => tracing::debug!(
                         tool = "stellar_mpp_charge_commit",
-                        error_code = %error.code(),
-                        "stellar_mpp_charge_prepare: commit policy evaluation failed; disposition unchanged"
+                        error = %error,
+                        "stellar_mpp_charge_prepare: policy clock unreadable; disposition unchanged"
                     ),
                 },
                 Err(error) => tracing::debug!(

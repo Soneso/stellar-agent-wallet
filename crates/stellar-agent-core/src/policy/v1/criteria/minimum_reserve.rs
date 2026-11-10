@@ -368,6 +368,7 @@ mod tests {
             bundle: None,
             policy_digest: [0; 32],
             provisional: false,
+            now_ms: 1_700_000_000_000,
         }
     }
 
@@ -932,7 +933,7 @@ mod tests {
         let args = json!({});
         let tool = make_tool("stellar_multicall");
         let profile = make_profile();
-        let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store)
+        let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store, 1_700_000_000_000)
             .with_account_view(&view)
             .with_value(ValueClass::Value(ValueEffects::single(leg)));
         let result = criterion.evaluate(&ctx).unwrap();

@@ -231,6 +231,7 @@ mod tests {
             bundle: view,
             policy_digest: [0; 32],
             provisional: false,
+            now_ms: 1_700_000_000_000,
         }
     }
 

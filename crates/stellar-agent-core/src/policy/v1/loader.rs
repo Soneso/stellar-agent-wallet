@@ -2238,6 +2238,7 @@ mod tests {
             bundle: None,
             policy_digest: [0; 32],
             provisional: false,
+            now_ms: 1_700_000_000_000,
         };
         doc.rules[0].criteria[0]
             .evaluate(&ctx)
@@ -2890,7 +2891,7 @@ garbage = "not-a-number"
             asset: Some(asset.to_owned()),
             destination: Some("CAAA".to_owned()),
         };
-        let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store)
+        let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store, 1_700_000_000_000)
             .with_value(ValueClass::Value(ValueEffects::single(leg)));
         doc.rules[0].criteria[0]
             .evaluate(&ctx)

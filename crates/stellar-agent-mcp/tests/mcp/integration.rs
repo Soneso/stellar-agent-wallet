@@ -386,7 +386,17 @@ fn policy_engine_allows_stellar_balances_read_only() {
     let args = serde_json::Value::Null;
 
     let testnet = Profile::builder_testnet("svc", "acct", "n-svc", "n-acct").build();
-    let result = engine.evaluate(&descriptor, &args, &testnet, None, None, None, None, None);
+    let result = engine.evaluate(
+        &descriptor,
+        &args,
+        &testnet,
+        None,
+        None,
+        None,
+        None,
+        None,
+        1_700_000_000_000,
+    );
     assert_eq!(
         result.unwrap(),
         Decision::Allow,
@@ -401,7 +411,17 @@ fn policy_engine_allows_stellar_balances_read_only() {
         "n-acct",
     )
     .build();
-    let result = engine.evaluate(&descriptor, &args, &mainnet, None, None, None, None, None);
+    let result = engine.evaluate(
+        &descriptor,
+        &args,
+        &mainnet,
+        None,
+        None,
+        None,
+        None,
+        None,
+        1_700_000_000_000,
+    );
     assert_eq!(
         result.unwrap(),
         Decision::Allow,

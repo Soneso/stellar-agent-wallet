@@ -10,17 +10,17 @@
 
 use std::sync::{Arc, Mutex};
 
-use stellar_agent_core::approval::witness::ApprovalWitness;
 use stellar_agent_core::audit_log::schema::ValueLegRecord;
 use stellar_agent_core::audit_log::writer::AuditWriter;
 use stellar_agent_core::envelope::Envelope;
-use stellar_agent_core::error::{NetworkError, SubmissionError, WalletError};
+use stellar_agent_core::error::{InternalError, NetworkError, SubmissionError, WalletError};
 use stellar_agent_core::policy::v1::{ValueClass, ValueEffects};
 use stellar_agent_core::policy::{McpToolRegistration, ToolDescriptor, ToolValueKind};
 use stellar_agent_core::profile::receipt::ReceiptStore;
 use stellar_agent_core::profile::schema::Profile;
 use stellar_agent_network::cross_check::CrossCheckWitness;
 use stellar_agent_network::mainnet::audit_readiness::AuditReadiness;
+use stellar_agent_network::mainnet::authority::MainnetAuthority;
 use stellar_agent_network::mainnet::authorization::MainnetTxSignAuthorization;
 use stellar_agent_network::policy_state::PersistedWindowStore;
 use stellar_agent_network::submission_flow::{
@@ -163,6 +163,7 @@ pub(crate) fn build_recorder(
             audit: record.audit,
             nonce_id: None,
             now_ms: record.now_ms,
+            provenance: None,
         },
         receipts,
         sizing,
@@ -232,13 +233,15 @@ pub(crate) struct PreparedMainnetRecorder<'a> {
 /// The legs are the evaluation's `effects`; the window entries come from the
 /// authorization at [`PreparedMainnetRecorder::bind_authorized`], never from
 /// a rebuilt engine. The audit writer is the one `readiness` verified. The
-/// confirmation entry `approval` names is tombstoned when the submission
-/// settles.
+/// confirmation entry the approval `authority` names is tombstoned when the
+/// submission settles.
 ///
 /// # Errors
 ///
-/// `submission.record_unavailable` when the receipt store cannot be opened,
-/// the approval directory cannot be resolved, or the clock cannot be read.
+/// `internal.unexpected_state` when `authority` is a policy authority, which
+/// names no confirmation entry to tombstone; `submission.record_unavailable`
+/// when the receipt store cannot be opened, the approval directory cannot be
+/// resolved, or the clock cannot be read.
 pub(crate) fn prepare_mainnet_recorder<'a>(
     context: &'a MainnetWriteContext,
     tool: &'static str,
@@ -246,8 +249,13 @@ pub(crate) fn prepare_mainnet_recorder<'a>(
     effects: Option<&ValueEffects>,
     readiness: &AuditReadiness,
     witness: Option<&'a CrossCheckWitness>,
-    approval: &ApprovalWitness,
+    authority: &MainnetAuthority<'_>,
 ) -> Result<PreparedMainnetRecorder<'a>, WalletError> {
+    let MainnetAuthority::Approval(approval) = authority else {
+        return Err(WalletError::Internal(InternalError::UnexpectedState {
+            detail: "the mainnet recorder needs an approval to tombstone".to_owned(),
+        }));
+    };
     let profile_name = context.profile_name().to_owned();
     let receipts = open_receipts(&profile_name)?;
     let store_dir = crate::commands::approve::approval_store_dir().map_err(|e| {
@@ -1148,6 +1156,94 @@ mod tests {
         let rendered = envelope.error.as_ref().unwrap();
         assert_eq!(rendered.code, "submission.record_unavailable");
         assert!(rendered.details.is_none());
+    }
+
+    /// Every file and directory under `root`, with each file's length, in
+    /// path order.
+    #[cfg(feature = "mainnet-write")]
+    fn listing(root: &std::path::Path) -> Vec<(std::path::PathBuf, u64)> {
+        let mut out = Vec::new();
+        let mut pending = vec![root.to_path_buf()];
+        while let Some(dir) = pending.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                let entry = entry.unwrap();
+                let meta = entry.metadata().unwrap();
+                if meta.is_dir() {
+                    pending.push(entry.path());
+                    out.push((entry.path(), 0));
+                } else {
+                    out.push((entry.path(), meta.len()));
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+
+    /// A policy authority names no confirmation entry to tombstone, so the
+    /// approval recorder refuses it with `internal.unexpected_state` before it
+    /// opens any store: the state directory is unchanged, and the receipt
+    /// directory, which every receipt-store open creates, stays absent.
+    #[cfg(feature = "mainnet-write")]
+    #[test]
+    #[serial_test::serial]
+    fn policy_authority_in_approval_helper_refuses() {
+        use stellar_agent_core::approval::mainnet_fixtures::MainnetConsentFixture;
+        use stellar_agent_core::mainnet::decision::{AuthorityScope, MainnetDecision};
+        use stellar_agent_core::profile::name::ResolvedProfileName;
+
+        let name = "recorder-policy";
+        let fixture = MainnetConsentFixture::new(name);
+        let chain_key = &fixture.profile().audit_log_hash_chain_key_id;
+        stellar_agent_network::keyring::rotate_keyring_secret_32(
+            &chain_key.service,
+            &chain_key.account,
+        )
+        .unwrap();
+        let context = stellar_agent_network::NetworkContext::mainnet_write(
+            fixture.profile(),
+            &ResolvedProfileName::from_flag(name),
+            &fixture.home().join("profiles"),
+            stellar_agent_network::MainnetEndpointFlags::default(),
+        )
+        .unwrap();
+        let readiness = stellar_agent_network::mainnet::audit_readiness::audit_readiness(
+            context.profile(),
+            context.profile_name(),
+        )
+        .unwrap();
+        let decision = MainnetDecision::for_test(
+            stellar_agent_core::policy::Decision::Allow,
+            None,
+            [7; 32],
+            fixture.sequence(),
+            0,
+            name,
+            context.chain().caip2_str(),
+            1_900_000_000_000,
+            600_000,
+            AuthorityScope::Classic,
+        );
+        let authority = MainnetAuthority::from_decision(&decision, None).unwrap();
+        assert!(matches!(authority, MainnetAuthority::Policy(_)));
+        let receipts_dir = stellar_agent_core::profile::receipt::default_receipts_dir().unwrap();
+        assert!(receipts_dir.starts_with(fixture.home()), "{receipts_dir:?}");
+        assert!(!receipts_dir.exists());
+        let before = listing(fixture.home());
+        let Err(error) = prepare_mainnet_recorder(
+            &context,
+            "stellar_pay",
+            stellar_agent_core::audit_log::PolicyDecision::Allow,
+            None,
+            &readiness,
+            None,
+            &authority,
+        ) else {
+            panic!("a policy authority reached the approval recorder");
+        };
+        assert_eq!(error.code(), "internal.unexpected_state");
+        assert!(!receipts_dir.exists());
+        assert_eq!(listing(fixture.home()), before);
     }
 
     /// A submission that was never sent carries no `details`.

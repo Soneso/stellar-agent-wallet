@@ -113,6 +113,7 @@ mod tests {
                 bundle: None,
                 policy_digest: [0; 32],
                 provisional: false,
+                now_ms: 1_700_000_000_000,
             };
             if amount <= 100 {
                 assert_eq!(criterion.evaluate(&ctx).unwrap(), None);

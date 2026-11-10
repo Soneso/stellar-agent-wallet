@@ -41,7 +41,6 @@
 )]
 
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use ed25519_dalek::Signer;
 use rand_core::OsRng;
@@ -362,6 +361,9 @@ impl stellar_agent_core::policy::v1::CounterpartyCacheView for MockCounterpartyC
 // Per-period cap state seeding
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// The evaluation instant of every case, in Unix milliseconds.
+const EVALUATION_INSTANT_MS: u64 = 1_700_000_000_000;
+
 /// Pre-populates a `PolicyStateStore` from the `state_seed` array in the case
 /// metadata.  Each seed entry specifies how many seconds ago the entry was
 /// recorded and the amount.
@@ -371,11 +373,11 @@ impl stellar_agent_core::policy::v1::CounterpartyCacheView for MockCounterpartyC
 /// - scope_specificity = 1 (AllProfiles default)
 /// - bucket = "native" (all per_period_rollover and combinator fixtures use native)
 /// - window_secs = 86_400 (1d, matching the fixture TOML)
+///
+/// Entries sit relative to [`EVALUATION_INSTANT_MS`], the instant the case
+/// evaluates at.
 fn seed_state_store(store: &PolicyStateStore, profile_name: &str, seeds: &[StateSeedEntry]) {
-    let now_ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system time before UNIX epoch")
-        .as_millis() as u64;
+    let now_ms = EVALUATION_INSTANT_MS;
 
     let key = StateKey::new(profile_name, 1, "native", 86_400);
 
@@ -497,6 +499,7 @@ fn run_evaluate_case(case_path: &Path, meta: &CaseMeta, policy_body: &str) -> Re
         cache_ref,
         None,
         None,
+        EVALUATION_INSTANT_MS,
     );
 
     // If expected.kind == "Error", assert the evaluation errored.

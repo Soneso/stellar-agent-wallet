@@ -160,14 +160,20 @@ fn counterparty_deny_mode_is_byte_identical() {
         "amount_stroops": "50",
     });
     let store = PolicyStateStore::new();
-    let ctx = EvalContext::new(&tool, &args, "operator", &profile, &store).with_value(
-        ValueClass::single(ValueLeg {
-            kind: ActionKind::Payment,
-            amount: Some(50),
-            asset: Some("native".to_owned()),
-            destination: Some(UNLISTED.to_owned()),
-        }),
-    );
+    let ctx = EvalContext::new(
+        &tool,
+        &args,
+        "operator",
+        &profile,
+        &store,
+        1_700_000_000_000,
+    )
+    .with_value(ValueClass::single(ValueLeg {
+        kind: ActionKind::Payment,
+        amount: Some(50),
+        asset: Some("native".to_owned()),
+        destination: Some(UNLISTED.to_owned()),
+    }));
     let denial: DenyReason = criterion.evaluate(&ctx).unwrap().unwrap();
     assert_eq!(
         serde_json::to_string(&denial).unwrap(),

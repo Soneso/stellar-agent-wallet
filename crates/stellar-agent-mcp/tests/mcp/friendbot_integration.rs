@@ -189,7 +189,17 @@ fn noopengine_rejects_stellar_friendbot_on_mainnet() {
     });
 
     let profile = mainnet_profile();
-    let result = engine.evaluate(&descriptor, &args, &profile, None, None, None, None, None);
+    let result = engine.evaluate(
+        &descriptor,
+        &args,
+        &profile,
+        None,
+        None,
+        None,
+        None,
+        None,
+        1_700_000_000_000,
+    );
     assert!(
         result.is_err(),
         "NoopPolicyEngine must reject stellar_friendbot on mainnet: {result:?}"
@@ -215,7 +225,17 @@ fn noopengine_allows_stellar_friendbot_on_testnet() {
     });
 
     let profile = testnet_profile();
-    let result = engine.evaluate(&descriptor, &args, &profile, None, None, None, None, None);
+    let result = engine.evaluate(
+        &descriptor,
+        &args,
+        &profile,
+        None,
+        None,
+        None,
+        None,
+        None,
+        1_700_000_000_000,
+    );
     assert_eq!(
         result.unwrap(),
         Decision::Allow,

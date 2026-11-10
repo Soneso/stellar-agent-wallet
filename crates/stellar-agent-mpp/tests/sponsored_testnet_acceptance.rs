@@ -366,6 +366,7 @@ async fn released_server_accepts_wallet_credential_and_settles_exact_transfer() 
             None,
             None,
             None,
+            stellar_agent_core::policy::policy_now_ms().expect("policy clock"),
         )
         .expect("policy evaluation");
     assert!(matches!(evaluation.decision, Decision::Allow));
@@ -716,6 +717,7 @@ async fn owner_signed_v1_period_cap_refuses_charge_before_signing() {
             None,
             None,
             None,
+            stellar_agent_core::policy::policy_now_ms().expect("policy clock"),
         )
         .expect("production V1 evaluation");
     match evaluation.decision {

@@ -593,6 +593,7 @@ impl WalletServer {
                 &json!({"chain_id": args.chain_id}),
                 &args.chain_id,
                 value,
+                stellar_agent_core::mainnet::decision::EvaluationScope::Classic,
             )
             .await
         {
@@ -660,6 +661,8 @@ impl WalletServer {
             Ok(None) => return Ok(approval_required_indistinguishable(name)),
             Err(result) => return Ok(result),
         };
+        let authority =
+            stellar_agent_network::mainnet::authority::MainnetAuthority::Approval(&approval);
         let readiness =
             match stellar_agent_network::mainnet::audit_readiness::audit_readiness(profile, name) {
                 Ok(readiness) => readiness,
@@ -688,7 +691,7 @@ impl WalletServer {
                 guard.context,
                 guard.policy,
                 guard.enablement,
-                &approval,
+                &authority,
                 &signer,
                 &handle,
                 readiness,
@@ -1777,6 +1780,7 @@ mod tests {
             _counterparty_cache: Option<&dyn CounterpartyCacheView>,
             _sep10_sessions: Option<&dyn Sep10SessionView>,
             _sep45_sessions: Option<&dyn Sep45SessionView>,
+            _now_ms: u64,
         ) -> Result<Decision, PolicyError> {
             Ok(Decision::RequireApproval(ApprovalRequest::new(
                 "test-nonce".into(),
@@ -1798,6 +1802,7 @@ mod tests {
             _counterparty_cache: Option<&dyn CounterpartyCacheView>,
             _sep10_sessions: Option<&dyn Sep10SessionView>,
             _sep45_sessions: Option<&dyn Sep45SessionView>,
+            _now_ms: u64,
         ) -> Result<Decision, PolicyError> {
             Ok(Decision::Deny(DenyReason::NoMatchingRule))
         }
@@ -2308,6 +2313,7 @@ mod tests {
                 &json!({"chain_id":"stellar:mainnet"}),
                 "stellar:mainnet",
                 ValueClass::single(x402_value_leg(&requirements, 10)),
+                stellar_agent_core::mainnet::decision::EvaluationScope::Classic,
             )
             .await
             .unwrap();
@@ -2377,6 +2383,7 @@ mod tests {
                 &json!({"chain_id":"stellar:mainnet"}),
                 "stellar:mainnet",
                 ValueClass::single(x402_value_leg(&requirements, 10)),
+                stellar_agent_core::mainnet::decision::EvaluationScope::Classic,
             )
             .await
             .unwrap();

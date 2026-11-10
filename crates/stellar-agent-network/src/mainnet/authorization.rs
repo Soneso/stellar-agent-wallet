@@ -452,6 +452,51 @@ pub(crate) struct ApprovalBinding {
     pub(crate) expires_at_ms: u64,
 }
 
+/// The authority an authorization binds: an operator approval, or a policy
+/// authority with its governing end.
+#[cfg(feature = "mainnet-write")]
+pub(crate) enum AuthorityBinding {
+    Approval(ApprovalBinding),
+    Policy(crate::policy_state::PolicyAuthorityBinding),
+}
+
+#[cfg(feature = "mainnet-write")]
+impl AuthorityBinding {
+    /// The binding a mint records for `authority`.
+    pub(crate) fn of(authority: &crate::policy_state::MintAuthority) -> Self {
+        match authority {
+            crate::policy_state::MintAuthority::Approval {
+                nonce,
+                expires_at_ms,
+            } => Self::Approval(ApprovalBinding {
+                nonce: nonce.clone(),
+                expires_at_ms: *expires_at_ms,
+            }),
+            crate::policy_state::MintAuthority::Policy(binding) => Self::Policy(binding.clone()),
+        }
+    }
+
+    /// The authority the ledger compares at claim and consumption.
+    pub(crate) fn mint_authority(&self) -> crate::policy_state::MintAuthority {
+        match self {
+            Self::Approval(approval) => crate::policy_state::MintAuthority::Approval {
+                nonce: approval.nonce.clone(),
+                expires_at_ms: approval.expires_at_ms,
+            },
+            Self::Policy(binding) => crate::policy_state::MintAuthority::Policy(binding.clone()),
+        }
+    }
+
+    /// The end of the authority in Unix milliseconds: the approval's expiry
+    /// or the policy authority's governing end.
+    pub(crate) fn expires_at_ms(&self) -> u64 {
+        match self {
+            Self::Approval(approval) => approval.expires_at_ms,
+            Self::Policy(binding) => binding.governing_until_ms,
+        }
+    }
+}
+
 /// The store and profile whose ledger grants this signing authority.
 #[cfg(feature = "mainnet-write")]
 pub(crate) struct ClaimTarget {
@@ -461,9 +506,10 @@ pub(crate) struct ClaimTarget {
 
 /// The facts every mainnet authorization binds.
 ///
-/// Assembled only by this crate's resolvers. `expires_at_ms` is the earlier
-/// of the issue time plus the authorization lifetime and the approval's
-/// expiry; `bindings_digest` is
+/// Assembled only by this crate's resolvers. `expires_at_ms` is no later
+/// than the issue time plus the authorization lifetime and the end of the
+/// authority, the approval's expiry or the policy authority's governing end;
+/// `bindings_digest` is
 /// [`crate::mainnet::digest::bindings_digest`] over the proofs' fact
 /// digests. The audit proof keeps the audit writer alive while the
 /// authorization lives.
@@ -479,7 +525,7 @@ pub(crate) struct Header {
     pub(crate) signer: SignerBinding,
     pub(crate) policy: PolicyBinding,
     pub(crate) enablement_nonce_digest: [u8; 32],
-    pub(crate) approval: ApprovalBinding,
+    pub(crate) authority: AuthorityBinding,
     pub(crate) reservation: Option<WindowReservation>,
     pub(crate) witness_subject: Option<[u8; 32]>,
     pub(crate) submission_anchor: Option<crate::policy_state::SubmissionAnchor>,
@@ -503,7 +549,7 @@ impl Header {
                     bindings_digest: self.bindings_digest,
                     policy_sequence: self.policy.sequence,
                     policy_digest: self.policy.digest,
-                    approval_nonce: self.approval.nonce.clone(),
+                    authority: self.authority.mint_authority(),
                 },
             )
             .map(|_| ())
@@ -577,7 +623,14 @@ impl Header {
     }
 
     fn check_approval(&self, nonce: &str) -> Result<(), MainnetAuthorizationError> {
-        require(nonce == self.approval.nonce, P::ApprovalNonce)
+        match &self.authority {
+            AuthorityBinding::Approval(approval) => {
+                require(nonce == approval.nonce, P::ApprovalNonce)
+            }
+            AuthorityBinding::Policy(_) => {
+                Err(MainnetAuthorizationError::Refused(P::ApprovalNonce))
+            }
+        }
     }
 
     fn check_reservation(
@@ -613,7 +666,7 @@ impl Header {
 
     pub(crate) fn check_not_expired(&self, now_ms: u64) -> Result<(), MainnetAuthorizationError> {
         require(
-            self.expires_at_ms <= self.approval.expires_at_ms,
+            self.expires_at_ms <= self.authority.expires_at_ms(),
             P::LifetimeInvalid,
         )?;
         require(self.issued_at_ms <= now_ms, P::NotYetValid)?;
@@ -638,8 +691,7 @@ impl Header {
             binding,
             self.policy.sequence,
             self.policy.digest,
-            self.approval.nonce.clone(),
-            self.approval.expires_at_ms,
+            self.authority.mint_authority(),
             self.reservation.as_ref().map(WindowReservation::id),
             self.bindings_digest,
             AuditFacts {
@@ -911,7 +963,8 @@ macro_rules! shared_methods {
 
         gated_method! {
             /// Requires `nonce` to be the bound approval's. Freshness is the
-            /// authorization's own expiry.
+            /// authorization's own expiry. An authorization under policy
+            /// authority binds no approval and refuses every nonce.
             ///
             /// # Errors
             ///
@@ -962,8 +1015,9 @@ macro_rules! shared_methods {
 
         gated_method! {
             /// Requires `issued_at <= now_ms < expires_at`; the expiry itself
-            /// is expired. An expiry beyond the approval's refuses as
-            /// inconsistent.
+            /// is expired. An expiry beyond the end of the authority, the
+            /// approval's expiry or the policy authority's governing end,
+            /// refuses as inconsistent.
             ///
             /// # Errors
             ///
@@ -1489,10 +1543,10 @@ mod tests {
                         digest: [7; 32],
                     },
                     enablement_nonce_digest: [8; 32],
-                    approval: ApprovalBinding {
+                    authority: AuthorityBinding::Approval(ApprovalBinding {
                         nonce: "nonce-secret-1".to_owned(),
                         expires_at_ms: 2_000,
-                    },
+                    }),
                     reservation: Some(WindowReservation::for_crate_tests(id, "mainnet-profile")),
                     witness_subject: Some([4; 32]),
                     submission_anchor: None,
@@ -1519,7 +1573,7 @@ mod tests {
                             enablement: [4; 32],
                             witness: None,
                             reservation: None,
-                            approval: [7; 32],
+                            authority: [7; 32],
                             audit: [8; 32],
                         },
                     ),
@@ -1734,7 +1788,7 @@ mod tests {
                     enablement: [0; 32],
                     witness: None,
                     reservation: None,
-                    approval: [0; 32],
+                    authority: [0; 32],
                     audit: [0; 32],
                 },
                 authorization_ttl_ms: 120_000,
@@ -2068,7 +2122,7 @@ mod tests {
                 enablement: enablement_fact.finish(),
                 witness: Some(witness.fact_digest()),
                 reservation: None,
-                approval: approval.fact_digest(),
+                authority: approval.fact_digest(),
                 audit: audit.fact_digest(),
             };
             let binding = match domain {
@@ -2159,8 +2213,10 @@ mod tests {
                 },
                 policy_sequence,
                 policy_digest,
-                approval_nonce: approval.nonce().to_owned(),
-                approval_expires_at_ms: approval.expires_at_ms(),
+                authority: crate::policy_state::MintAuthority::Approval {
+                    nonce: approval.nonce().to_owned(),
+                    expires_at_ms: approval.expires_at_ms(),
+                },
                 chain_deadline_ms: None,
                 authorization_ttl_ms: 60_000,
                 bindings: facts,
@@ -2196,10 +2252,10 @@ mod tests {
                     digest: policy_digest,
                 },
                 enablement_nonce_digest: nonce_digest,
-                approval: ApprovalBinding {
+                authority: AuthorityBinding::Approval(ApprovalBinding {
                     nonce,
                     expires_at_ms: approval.expires_at_ms(),
-                },
+                }),
                 reservation: minted.reservation,
                 witness_subject: witness.subject(),
                 submission_anchor: None,
@@ -2355,6 +2411,7 @@ mod tests {
         #[serial]
         async fn mainnet_authorization_rejects_receipt_from_another_policy() {
             use crate::mainnet::MainnetAuthorizationError;
+            use crate::mainnet::authority::MainnetAuthority;
             use crate::mainnet::fixtures::{
                 MESSAGE_HOME_DOMAIN, ResolverFixture, message_facts, x402_fixture, x402_intent,
                 x402_root,
@@ -2380,6 +2437,7 @@ mod tests {
             assert_eq!(other.mainnet(), f.policy.mainnet());
             assert_ne!(other.digest(), f.policy.digest());
             assert_eq!(approval.policy_digest(), f.policy.digest());
+            let authority = MainnetAuthority::Approval(&approval);
             let request = |policy| TxSignRequest {
                 context: &context,
                 consumer: MainnetConsumer::CliPay,
@@ -2390,7 +2448,7 @@ mod tests {
                 signer: &f.signer,
                 policy,
                 enablement: &f.enablement,
-                approval: &approval,
+                authority: &authority,
                 audit: f.audit(),
                 store: &f.window,
             };
@@ -2406,12 +2464,13 @@ mod tests {
             let message = message_facts([1; 32], [0xe1; 32]);
             let approval = f.x402_approval(&root, Some(MESSAGE_HOME_DOMAIN), f.now);
             let other = f.another_policy();
-            let mut req = f.message_request(&intent, &message, &approval);
+            let authority = MainnetAuthority::Approval(&approval);
+            let mut req = f.message_request(&intent, &message, &authority);
             req.policy = &other;
             let before = f.wire();
             policy_refusal(resolve_message_sign(req).unwrap_err());
             assert_eq!(f.wire(), before, "the refusal records nothing");
-            resolve_message_sign(f.message_request(&intent, &message, &approval)).unwrap();
+            resolve_message_sign(f.message_request(&intent, &message, &authority)).unwrap();
         }
 
         #[tokio::test]

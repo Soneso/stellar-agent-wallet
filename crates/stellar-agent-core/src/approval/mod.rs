@@ -143,8 +143,8 @@ pub use spent::{
 };
 pub use store::{
     ApprovalKind, ConsumedOutcome, DEFAULT_TTL_MS, EXPECTED_NONCE_LEN,
-    MAINNET_CONFIRMATION_TTL_SECONDS, PendingApproval, PendingApprovalStore, RuleProposalGateError,
-    generate_csrf_token, governing_ttl_ms,
+    MAINNET_POLICY_AUTHORITY_TTL_SECONDS, PendingApproval, PendingApprovalStore,
+    RuleProposalGateError, generate_csrf_token, governing_ttl_ms,
 };
 pub use toolset_grant::{
     GrantQuery, TOOLSET_GRANT_DEFAULT_TTL_MS, ToolsetGrant, ToolsetGrantStore,

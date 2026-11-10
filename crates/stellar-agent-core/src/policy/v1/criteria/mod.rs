@@ -360,7 +360,7 @@ mod tests {
         profile: &'a Profile,
         store: &'a PolicyStateStore,
     ) -> EvalContext<'a> {
-        EvalContext::new(tool, args, "alice", profile, store)
+        EvalContext::new(tool, args, "alice", profile, store, 1_700_000_000_000)
     }
 
     #[test]

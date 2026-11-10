@@ -9,7 +9,7 @@
 //! | [`parser`] | `toml_edit`-based extraction of SEP-1 fields into [`parser::MinimalSep1`] |
 //! | [`cache`]  | HMAC-protected per-profile cache; [`cache::StellarTomlResolver`] implements the trait |
 //! | [`validation`] | Shared lowercase LDH `home_domain` validation façade |
-//! | [`lock`]   | OFD-advisory single-writer flock (`std::fs::File::try_lock`) |
+//! | `lock`     | OFD-advisory single-writer flock (`std::fs::File::try_lock`) |
 //!
 //! # Threat model boundary
 //!

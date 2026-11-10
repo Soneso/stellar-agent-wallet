@@ -31,7 +31,6 @@ use crate::policy::v1::criteria::Criterion;
 use crate::policy::v1::criteria::minimum_reserve::{
     AmountOutcome, extract_amount_stroops, extract_total_fee_stroops,
 };
-use crate::policy::v1::criteria::per_period_cap::system_time_to_ms;
 use crate::policy::v1::value::{ValueGate, classify_value};
 use crate::policy::{DenyReason, PolicyError};
 
@@ -84,7 +83,8 @@ impl Criterion for BalanceFloorCriterion {
     /// # Errors
     ///
     /// Returns [`PolicyError::CriterionEvaluationFailed`] when a native debit
-    /// leg carries no resolvable amount, or the clock cannot be read.
+    /// leg carries no resolvable amount. The observation's age is measured at
+    /// the evaluation instant `ctx.now_ms`.
     fn evaluate(&self, ctx: &EvalContext<'_>) -> Result<Option<DenyReason>, PolicyError> {
         if ctx.provisional {
             return Ok(None);
@@ -105,7 +105,7 @@ impl Criterion for BalanceFloorCriterion {
             return Ok(Some(DenyReason::AccountUnread));
         };
 
-        let age_ms = system_time_to_ms()?.saturating_sub(observation.observed_at_ms);
+        let age_ms = ctx.now_ms.saturating_sub(observation.observed_at_ms);
         if age_ms > MAX_OBSERVATION_AGE_MS {
             return Ok(Some(DenyReason::AccountStale { age_ms }));
         }
