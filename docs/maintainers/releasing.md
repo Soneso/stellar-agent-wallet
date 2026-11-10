@@ -354,6 +354,20 @@ The build job builds `aarch64-apple-darwin` with no secrets. The sign job runs
 in `release-signing`, signs and notarizes the binaries with the version
 `0.0.0-smoke`, and checks the archive layout and the signature authority.
 
+To export the signed archive for the
+[keychain measurement](keychain-measurement.md), set the `export_archive`
+input:
+
+```bash
+gh workflow run notarize-smoke.yml --ref main -f export_archive=true
+```
+
+After its checks pass, the sign job uploads the signed archive as the
+workflow artifact `signed-aarch64-apple-darwin-smoke`, kept for 7 days. The
+archive carries the version `0.0.0-smoke`: it is a smoke build, never a
+release, and it serves only the keychain measurement. Without the input the
+run uploads no signed archive.
+
 ### Feature-state checks
 
 Release, publish and rehearsal expect `mainnet-write` to be on. The shared

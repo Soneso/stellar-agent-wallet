@@ -141,3 +141,71 @@ way in the pull request description.
 7. **House style.** The change follows the writing rules of
    [CONTRIBUTING.md](../../CONTRIBUTING.md), the lint posture of the root
    `Cargo.toml`, and the test naming of the crate it changes.
+
+## Mainnet release reviews
+
+A release that ships the `mainnet-write` build gets two reviews beyond the
+dimensions above: a signing-authority review and an approval-flow review.
+Each runs against the commit the release is cut from. Two reviewers who did
+not implement the reviewed code carry out each review.
+
+### Signing-authority review
+
+Scope:
+
+- The policy Allow path, from the policy decision to the signature.
+- The presence-gated witness path.
+- The operation record and its single use.
+- The recovery transitions.
+- The audit writer and its outbox.
+
+Attacker model:
+
+- An agent process with the wallet's MCP access.
+- Another process of the same OS user.
+- A malicious or stalled RPC endpoint.
+- A replayed or copied approval record.
+- A restored older state file.
+
+Pass criteria:
+
+- A test or a named probe reproduces every finding.
+- Every blocking finding is closed with a regression test.
+- Every claimed invariant has a named test.
+- The two reviewers did not implement the reviewed code.
+
+Deliverable: a written verdict that lists the invariants checked, the probes
+run, the findings, and the closure of each finding.
+
+### Approval-flow review
+
+Scope:
+
+- The durable approval record.
+- The consumption of an approval.
+- Revocation.
+- Re-sign invalidation: a policy re-sign at a higher sequence invalidates
+  every consent, witness, and authorization issued under the earlier
+  signature, also when the credentials are unchanged.
+  `mainnet_witness_reloads_current_policy` in
+  `crates/stellar-agent-core/src/approval/witness.rs` proves it.
+- The intent the consent page renders.
+- The remote listener's origin and certificate binding.
+- Enrollment.
+
+Attacker model: every attacker of the signing-authority review, and a device
+on the approving network.
+
+Pass criteria:
+
+- A named test demonstrates single use.
+- A named test demonstrates digest binding.
+- A named test demonstrates revocation.
+- A named test demonstrates re-sign invalidation.
+- A named test demonstrates origin binding.
+- The browser acceptance suites pass at the configured origin. The
+  [serialized driver](building.md#live-testnet-acceptance-tests) runs them.
+- The wallet refuses the remote listener without the signed configuration.
+- Every finding is reproduced and closed as in the signing-authority review.
+
+Deliverable: a written verdict as for the signing-authority review.

@@ -179,6 +179,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the policy gate that the CLI and the MCP server share: recorder assembly,
   recovery details, the settlement oracle, reconciliation and transaction
   status.
+- The testnet acceptance driver runs the mainnet consent browser suite,
+  records the wall seconds of every suite, and runs every suite against the
+  `mainnet-write` build on request (`MAINNET_WRITE=on`, or the `mainnet_write`
+  input of the `Testnet acceptance` workflow).
+- The notarization smoke exports its signed archive as a workflow artifact on
+  request (the `export_archive` input), for the keychain measurement.
+- Maintainer pages describe the keychain measurement and the mainnet release
+  reviews.
 
 ### Changed
 
