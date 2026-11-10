@@ -72,6 +72,7 @@ mod context;
 pub mod error;
 #[cfg(any(test, feature = "test-helpers"))]
 pub mod fixtures;
+pub mod intent;
 #[cfg(any(test, feature = "test-helpers"))]
 pub mod mainnet_fixtures;
 pub mod mpp;
@@ -109,6 +110,10 @@ pub use attestation::{
 };
 pub use context::{ApprovalContext, approve_hint};
 pub use error::ApprovalError;
+pub use intent::{
+    CLASSIC_INTENT_DIGEST_LABEL, ClassicIntent, IntentAsset, IntentBase, IntentDigest, IntentError,
+    IntentPayload, MemoFact,
+};
 pub use operator_credentials::{
     OperatorApprovalCredential, OperatorApprovalCredentialStore,
     default_operator_approval_credentials_path,
@@ -146,7 +151,7 @@ pub use toolset_grant::{
     build_attested_grant, default_toolset_grants_path,
 };
 pub use user_id::{ApproverIdentity, VerifiedPasskeyAssertion, process_uid_for_attestation};
-pub use view::{ApprovalSummaryView, PendingApprovalView};
+pub use view::{ApprovalSummaryView, IntentView, PendingApprovalView};
 
 /// Checks that displayed approval terms agree with their authorization binding.
 ///

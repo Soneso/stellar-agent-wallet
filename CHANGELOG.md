@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `stellar_agent_core::approval::intent` defines the classic intent, its canonical bytes and digest, and its claim value leg; `stellar_agent_core::approval::IntentView` shows it.
+
 - Every classic prepare on MCP and the CLI verbs `pay`, `claim`, sponsored
   `accounts create`, and `trustline` check the endpoint's health, latest
   ledger, and close-time lag before reading the account they sign against. A
