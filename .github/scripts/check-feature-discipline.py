@@ -153,6 +153,7 @@ POSITIVE_CONTROLS = {
 # gives mainnet-write before it when the crate's manifest has a line that
 # starts with a mainnet-write assignment, as the grep reads it.
 TESTNET_DRIVER = '.github/scripts/run-testnet-acceptance.sh'
+TESTNET_ACTIVATION_ALLOWANCE = (('testnet.yml', 'acceptance', TESTNET_DRIVER),)
 TESTNET_FEATURES_FUNCTION = '''suite_features() {
   local crate="$1" feature="$2"
   if [ "$MAINNET_WRITE" = "on" ] && grep -qE '^mainnet-write *=' "crates/$crate/Cargo.toml"; then
@@ -190,6 +191,7 @@ ENV_FILE_READERS = {
 }
 # D3 and D9 read the cargo and cross text of these scripts as data, each
 # for the reason given. Every other named script is scanned for commands.
+# D9 allows the testnet driver's resolved mainnet-write lists only in testnet.yml:acceptance.
 DATA_SCRIPTS = {
     '.github/scripts/preflight.sh':
         'its registry rows mirror CI steps for local runs, and '
@@ -895,6 +897,18 @@ def step_scripts(text, scripts):
             pending.extend(SCRIPT_REF.findall('\n'.join(logical_lines(source))))
 
 
+def testnet_suite_entries(source):
+    suites = re.search(r'^SUITES=\((.*?)^\)', source, re.M | re.S)
+    if not suites:
+        raise ValueError('SUITES literal is missing')
+    for suite in shlex.split(suites[1], comments=True):
+        # The script splits an entry on IFS: space, tab and line feed.
+        fields = [field for field in re.split(r'[ \t\n]+', suite) if field]
+        if len(fields) != 3:
+            raise ValueError('invalid SUITES entry')
+        yield dict(zip(('crate', 'feature', 'target'), fields))
+
+
 def testnet_feature_lists(root, source, entry):
     """The distinct feature lists the testnet acceptance driver passes one
     SUITES entry, off first; refuses a driver whose suite_features or
@@ -941,16 +955,8 @@ def inventory(root, workflows, scripts):
                     builds.append({**values, 'TARGET': target})
             variants = builds
         if source.endswith('run-testnet-acceptance.sh'):
-            suites = re.search(r'^SUITES=\((.*?)^\)', scripts[source], re.M | re.S)
-            if not suites:
-                raise ValueError('SUITES literal is missing')
             contexts, variants = variants, []
-            for suite in shlex.split(suites[1], comments=True):
-                # The script splits an entry on IFS: space, tab and line feed.
-                fields = [field for field in re.split(r'[ \t\n]+', suite) if field]
-                if len(fields) != 3:
-                    raise ValueError('invalid SUITES entry')
-                entry = dict(zip(('crate', 'feature', 'target'), fields))
+            for entry in testnet_suite_entries(scripts[source]):
                 variants.extend({**values, **entry, 'features': features}
                                 for features in testnet_feature_lists(root, scripts[source], entry)
                                 for values in contexts)
@@ -1450,21 +1456,30 @@ class Checker:
         yield 'building.md', (self.root / 'docs/maintainers/building.md').read_text()
 
     def D9(self):
-        """Only the CI feature-on jobs and the coverage job name it in a feature list."""
+        """CI feature-on jobs and coverage may name mainnet-write; the testnet driver's resolved lists are allowed only in testnet.yml:acceptance."""
         for workflow, document in self.workflows.items():
             top = document.get('env', {})
             jobs = document.get('jobs') or {'composite': {'steps': document.get('runs', {}).get('steps', [])}}
             for job_name, job in jobs.items():
                 allowed = workflow == 'ci.yml' and job_name in ('feature-on-clippy', 'feature-on-test', 'feature-on-doc')
                 allowed = allowed or workflow == 'coverage.yml' and job_name == 'coverage'
-                if allowed:
-                    continue
                 where = f'{workflow}:{job_name}'
                 for step in job.get('steps', []):
-                    env = {**top, **job.get('env', {}), **step.get('env', {})}
                     text = run_text(step)
+                    scripts = list(step_scripts(text, self.scripts))
+                    for path, source in scripts:
+                        if path.as_posix() == TESTNET_DRIVER:
+                            activations = [features for entry in testnet_suite_entries(source)
+                                           for features in testnet_feature_lists(self.root, source, entry)
+                                           if FEATURE in features.split(',')]
+                            if activations and (workflow, job_name, TESTNET_DRIVER) not in TESTNET_ACTIVATION_ALLOWANCE:
+                                self.fail('D9', f'{where}: feature activation outside allowed jobs: '
+                                          f'{TESTNET_DRIVER} ({activations[0]})')
+                    if allowed:
+                        continue
+                    env = {**top, **job.get('env', {}), **step.get('env', {})}
                     calls = list(commands(text, where))
-                    for path, source in step_scripts(text, self.scripts):
+                    for path, source in scripts:
                         calls.extend(script_commands(path, source))
                     for command in calls:
                         if activates(command, env):
