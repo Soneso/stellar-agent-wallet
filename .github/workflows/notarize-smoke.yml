@@ -2,13 +2,24 @@
 # path of release.yml. A build job with no secrets builds one darwin target
 # and hands the unsigned binaries to a signing job. The signing job runs the
 # same checks and the same composite action as the release's sign-macos job,
-# with the fixed version 0.0.0-smoke. It creates no release and uploads no
-# signed archive. Run it from main after rotating the certificate or the App
-# Store Connect API key, and before the first release that relies on either.
+# with the fixed version 0.0.0-smoke. It creates no release. With the
+# export_archive input it uploads the signed smoke archive as a workflow
+# artifact, kept for seven days, as the input of the keychain measurement;
+# the archive is a smoke build and never a release. Run it from main after
+# rotating the certificate or the App Store Connect API key, and before the
+# first release that relies on either.
 name: Notarization smoke
 
 on:
   workflow_dispatch:
+    inputs:
+      export_archive:
+        description: >-
+          Upload the signed smoke archive as a workflow artifact for the
+          keychain measurement; it is a smoke build, never a release
+        type: boolean
+        required: false
+        default: false
 
 permissions:
   contents: read
@@ -150,3 +161,14 @@ jobs:
             fi
             printf '%s\n' "$info" | /usr/bin/grep '^TeamIdentifier='
           done
+
+      # The keychain measurement installs this archive; the upload runs only
+      # on request and after the archive passes the checks above.
+      - name: Export the signed smoke archive
+        if: ${{ inputs.export_archive }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: signed-aarch64-apple-darwin-smoke
+          path: ${{ steps.sign.outputs.archive }}
+          retention-days: 7
+          if-no-files-found: error

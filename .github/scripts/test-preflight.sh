@@ -53,7 +53,7 @@ FIXTURE="$TMP/fixture"
 CASES="docs-only upstream-base origin-base synced-fork-base install-surface-doc deleted-install-surface-doc welcome-workflow release-workflow
 release-rehearsal-workflow vendored-wasm-workflow
 triage-workflow triage-review-workflow triage-sweep-workflow
-ci-yml-only python-check-script shell-check-script skill inbox-web enroll-web bridge-web one-crate two-owners
+ci-yml-only python-check-script shell-check-script testnet-driver-script skill inbox-web enroll-web bridge-web one-crate two-owners
 target-specific-edge dev-dependency-edge optional-dependency-edge root-manifest lockfile toolchain
 unowned-rust-path
 wallet-manifest removed-member untracked-test-file fixture-markdown
@@ -102,6 +102,7 @@ self-test:test-preflight.sh	bash .github/scripts/test-preflight.sh
 self-test:test-publish-crates-check.sh	.github/scripts/test-publish-crates-check.sh
 self-test:test-publish-crates-verify.sh	bash .github/scripts/test-publish-crates-verify.sh
 self-test:test-rebuild-vendored-wasm.sh	bash .github/scripts/test-rebuild-vendored-wasm.sh
+self-test:test-run-testnet-acceptance.sh	bash .github/scripts/test-run-testnet-acceptance.sh
 self-test:test-sync-labels.py	python3 .github/scripts/test-sync-labels.py
 self-test:test-take-workflow.py	python3 .github/scripts/test-take-workflow.py
 self-test:test-triage-workflow.py	python3 .github/scripts/test-triage-workflow.py
@@ -1109,6 +1110,17 @@ case_shell_check_script() {
     "shellcheck-changed=shellcheck -s bash .github/scripts/check-gate-tool-versions.sh"
 }
 
+# The testnet acceptance driver selects its self-test, and shellcheck reads it.
+# A workflow runs it and it runs cargo, so the feature discipline gates
+# read it too.
+case_testnet_driver_script() {
+  start_case
+  edit .github/scripts/run-testnet-acceptance.sh
+  expect_list "${ALWAYS[@]}" feature-discipline self-test:test-check-feature-discipline.py \
+    self-test:test-run-testnet-acceptance.sh \
+    "shellcheck-changed=shellcheck -s bash .github/scripts/run-testnet-acceptance.sh"
+}
+
 case_skill() {
   start_case
   edit skills/stellar-agent-wallet/SKILL.md
@@ -1318,8 +1330,8 @@ case_full() {
   start_case
   edit CONTRIBUTING.md
   read -r -a ids <<<"$(printf '%s\n' "$EXPECTED_REGISTRY" | awk -F '\t' '{ printf "%s ", $1 }')"
-  if [ "${#ids[@]}" -ne 55 ]; then
-    fail "the expected registry holds ${#ids[@]} rows, expected 55"
+  if [ "${#ids[@]}" -ne 56 ]; then
+    fail "the expected registry holds ${#ids[@]} rows, expected 56"
   fi
   expect_list --full "${ids[@]}"
 }

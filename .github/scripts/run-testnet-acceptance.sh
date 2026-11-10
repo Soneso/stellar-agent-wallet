@@ -20,8 +20,18 @@
 #                   keyring backend for the spawned binary. Unset selects the
 #                   encrypted headless store with a key generated for this
 #                   run, so no suite reaches the machine's own keyring.
+#   MAINNET_WRITE   on or off (default off). With on, every suite of a crate
+#                   that declares a mainnet-write feature builds with that
+#                   feature beside the suite's own, which is the build the
+#                   binaries ship by default; a crate without the feature
+#                   builds as with off. Any other value fails the run before
+#                   the first suite.
 #   PACE            seconds to sleep between suites (default 30)
 #   RETRY_COOLDOWN  seconds to sleep before the single retry (default 60)
+#
+# Each result line, the summary, and the step summary carry the wall seconds
+# of the attempt that produced the result, and for a retried suite the
+# seconds of all its attempts; the summary closes with the leg's wall time.
 #
 # The WebAuthn suite (smart_account_rules_webauthn_testnet_acceptance), the
 # remote-approval browser suite (remote_approval_browser_testnet_acceptance),
@@ -33,10 +43,11 @@
 # dependency for its ONE `#[ignore]`d passkey-genesis test only — its other
 # five tests need no browser. The operator-enroll browser acceptance suite
 # (operator_enroll_browser_acceptance) has the same Chromium dependency for
-# its ONE browser-driven test only — its two negative-path tests drive the
-# real HTTP surface directly and need no browser; unlike every other suite
-# in this list it has NO testnet/RPC dependency at all (the interactive
-# enrollment server is purely loopback HTTP).
+# its one browser-driven test only; its two negative-path tests drive the
+# real HTTP surface directly and need no browser. The mainnet consent browser
+# suite (mainnet_presence_browser_acceptance) has the same Chromium
+# dependency for its one test. Both suites serve their pages over loopback
+# HTTP and need no testnet or RPC.
 #
 # Every suite that signs a smart-account authorization needs
 # STELLAR_AGENT_TESTNET_SECONDARY_RPC_URL: a testnet Soroban RPC endpoint on
@@ -54,6 +65,9 @@ PACE="${PACE:-30}"
 RETRY_COOLDOWN="${RETRY_COOLDOWN:-60}"
 BROWSER_RETRY_COOLDOWN="${BROWSER_RETRY_COOLDOWN:-90}"
 FILTER="${FILTER:-}"
+# Unset means off; a value set to the empty string is refused like any other
+# value that is not on or off.
+MAINNET_WRITE="${MAINNET_WRITE-off}"
 
 # The suites spawn the real binary, which reads its audit keys, window-state
 # generation counters and tip anchors from the OS keyring. On macOS that is
@@ -84,6 +98,7 @@ BROWSER_SUITE_TARGETS=(
   "smart_account_rules_webauthn_testnet_acceptance"
   "smart_account_ergonomics_testnet_acceptance"
   "operator_enroll_browser_acceptance"
+  "mainnet_presence_browser_acceptance"
   "remote_approval_browser_testnet_acceptance"
   "rule_proposal_remote_browser_testnet_acceptance"
 )
@@ -93,21 +108,45 @@ is_browser_suite() {
   printf '%s\n' "${BROWSER_SUITE_TARGETS[@]}" | grep -qxF "$target"
 }
 
-# Completeness guard: every live-network test file on disk must be listed in
-# SUITES below. The per-suite zero-tests guard cannot catch a file that is
-# never invoked at all, so an unlisted file would silently not execute while
-# the run reports green.
+# Completeness guard: every live test file on disk, a *testnet* file or a
+# *_browser_acceptance file, must be listed in SUITES below. The per-suite
+# zero-tests guard cannot catch a file that is never invoked at all, so an
+# unlisted file would silently not execute while the run reports green.
 check_suite_completeness() {
   local missing=0
   while IFS= read -r f; do
     local target
     target="$(basename "$f" .rs)"
     if ! printf '%s\n' "${SUITES[@]}" | grep -q " ${target}$"; then
-      echo "ERROR: ${f} is not listed in SUITES — add it (or rename it away from the *testnet* pattern if it is not a live suite)" >&2
+      echo "ERROR: ${f} is not listed in SUITES; add it, or rename it away from the *testnet* and *_browser_acceptance patterns if it is not a live suite" >&2
       missing=1
     fi
-  done < <(find crates -path '*/tests/*' -name '*testnet*.rs' -not -path '*fixtures*' | sort)
+  done < <(find crates -path '*/tests/*' \( -name '*testnet*.rs' -o -name '*_browser_acceptance.rs' \) \
+    -not -path '*fixtures*' | sort)
   return "$missing"
+}
+
+# Refuses a MAINNET_WRITE value other than on or off, so a misspelled value
+# never runs the leg against a build the caller did not ask for.
+check_mainnet_write() {
+  case "$MAINNET_WRITE" in
+    on | off) return 0 ;;
+  esac
+  echo "error: MAINNET_WRITE must be on or off, not '${MAINNET_WRITE}'" >&2
+  return 1
+}
+
+# Prints the --features list of one suite: the suite's feature, preceded by
+# mainnet-write when MAINNET_WRITE is on and the crate's manifest declares a
+# mainnet-write feature. A crate without that feature has no mainnet-write
+# gate of its own, and naming the feature would fail its build.
+suite_features() {
+  local crate="$1" feature="$2"
+  if [ "$MAINNET_WRITE" = "on" ] && grep -qE '^mainnet-write *=' "crates/$crate/Cargo.toml"; then
+    printf 'mainnet-write,%s\n' "$feature"
+  else
+    printf '%s\n' "$feature"
+  fi
 }
 
 # "<crate> <feature> <test target>", ordered light-to-heavy: auth round-trips
@@ -174,6 +213,7 @@ SUITES=(
   "stellar-agent-smart-account-acceptance testnet-integration smart_account_policy_observability_testnet_acceptance"
   "stellar-agent-smart-account-acceptance testnet-integration smart_account_ergonomics_testnet_acceptance"
   "stellar-agent-approval-remote operator-enroll-browser-acceptance operator_enroll_browser_acceptance"
+  "stellar-agent-approval-remote operator-enroll-browser-acceptance mainnet_presence_browser_acceptance"
   "stellar-agent-approval-remote testnet-acceptance remote_approval_browser_testnet_acceptance"
   "stellar-agent-approval-remote testnet-acceptance rule_proposal_remote_browser_testnet_acceptance"
 )
@@ -187,17 +227,21 @@ SUITES=(
 # Sets LAST_SKIPS to the number of self-skip markers the suite printed. Tests
 # that need an unavailable precondition print a SKIP line and return without
 # failing; surfacing the count in the summary keeps a green run honest about
-# what did not execute.
+# what did not execute. Sets LAST_SECONDS to the wall seconds of the attempt.
 #
-# Every suite builds with --no-default-features, so live acceptance runs with
-# mainnet-write off; no entry of SUITES enables the feature.
+# Every suite builds with --no-default-features and the list suite_features
+# prints, so mainnet-write is on only under MAINNET_WRITE=on and only for a
+# crate that declares the feature.
 run_suite() {
-  local crate="$1" feature="$2" target="$3" log status summary executed deterministic tmp_root
+  local crate="$1" feature="$2" target="$3" features log status summary executed deterministic tmp_root start
+  features=$(suite_features "$crate" "$feature")
   tmp_root=${TMPDIR:-/tmp}
   log=$(mktemp "${tmp_root%/}/run-testnet-acceptance.XXXXXX")
-  cargo test -p "$crate" --no-default-features --features "$feature" --test "$target" \
+  start=$SECONDS
+  cargo test -p "$crate" --no-default-features --features "$features" --test "$target" \
     -- --include-ignored --test-threads=1 --nocapture 2>&1 | tee "$log"
   status=${PIPESTATUS[0]}
+  LAST_SECONDS=$((SECONDS - start))
   # Last harness summary line, e.g.:
   #   test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; ...
   summary=$(grep -E '^test result:' "$log" | tail -1)
@@ -222,103 +266,135 @@ run_suite() {
   return 0
 }
 
-declare -a report_status report_suite
-failures=0
-ran=0
-
-check_suite_completeness || exit 3
-
-for line in "${SUITES[@]}"; do
-  read -r crate feature target <<< "$line"
-  suite="$crate/$target"
-  if [ -n "$FILTER" ] && [[ "$suite" != *"$FILTER"* ]]; then
-    continue
+# Prints a suite result: the outcome, then in parentheses its notes, the wall
+# seconds of the attempt that produced it, and for a retried suite the wall
+# seconds of all attempts, as in "pass (retry, 412 s, 830 s total)".
+format_result() {
+  local outcome="$1" notes="$2" attempts="$3" last="$4" total="$5" detail
+  detail="${notes:+$notes, }${last} s"
+  if [ "$attempts" -gt 1 ]; then
+    detail="${detail}, ${total} s total"
   fi
-  if [ "$ran" -gt 0 ]; then
-    echo "pacing: sleeping ${PACE}s before the next suite"
-    sleep "$PACE"
-  fi
-  ran=$((ran + 1))
-  echo "::group::$suite"
-  if run_suite "$crate" "$feature" "$target"; then
-    result="pass"
-    if [ "${LAST_SKIPS:-0}" -gt 0 ]; then
-      result="pass (${LAST_SKIPS} skip marker(s))"
+  printf '%s (%s)\n' "$outcome" "$detail"
+}
+
+main() {
+  local line crate feature target suite rc attempts suite_seconds outcome notes result leg_start leg_seconds i
+  check_mainnet_write || exit 2
+  check_suite_completeness || exit 3
+
+  report_status=()
+  report_suite=()
+  report_seconds=()
+  failures=0
+  ran=0
+  leg_start=$SECONDS
+  echo "testnet acceptance: mainnet-write ${MAINNET_WRITE}"
+
+  for line in "${SUITES[@]}"; do
+    read -r crate feature target <<< "$line"
+    suite="$crate/$target"
+    if [ -n "$FILTER" ] && [[ "$suite" != *"$FILTER"* ]]; then
+      continue
     fi
-  else
+    if [ "$ran" -gt 0 ]; then
+      echo "pacing: sleeping ${PACE}s before the next suite"
+      sleep "$PACE"
+    fi
+    ran=$((ran + 1))
+    echo "::group::$suite"
+    run_suite "$crate" "$feature" "$target"
     rc=$?
-    if [ "$rc" -eq 2 ]; then
-      # A vacuous pass is deterministic; retrying cannot change it.
-      result="FAIL (vacuous: zero tests executed)"
-      failures=$((failures + 1))
-    elif [ "$rc" -eq 3 ]; then
-      # Compile / unknown-target / unknown-feature errors are deterministic;
-      # retrying cannot change them.
-      result="FAIL (build or target error)"
-      failures=$((failures + 1))
-    else
+    attempts=1
+    suite_seconds=$LAST_SECONDS
+    # A vacuous pass (2) and a compile, unknown-target, or unknown-feature
+    # error (3) are deterministic; retrying cannot change them. A test
+    # failure (1) is retried once after a cooldown.
+    if [ "$rc" -eq 1 ]; then
       echo "suite $suite failed; retrying once after ${RETRY_COOLDOWN}s cooldown"
       sleep "$RETRY_COOLDOWN"
-      if run_suite "$crate" "$feature" "$target"; then
-        result="pass (retry)"
-        if [ "${LAST_SKIPS:-0}" -gt 0 ]; then
-          result="pass (retry, ${LAST_SKIPS} skip marker(s))"
-        fi
-      elif is_browser_suite "$target"; then
+      run_suite "$crate" "$feature" "$target"
+      rc=$?
+      attempts=2
+      suite_seconds=$((suite_seconds + LAST_SECONDS))
+      if [ "$rc" -ne 0 ] && is_browser_suite "$target"; then
         # Headless-Chromium page-load failures are a distinct environmental
-        # flake from the rest of this suite's dependencies; browser suites get
-        # one additional retry beyond the universal retry-once default.
+        # flake from the rest of this suite's dependencies; browser suites
+        # get one additional retry beyond the universal retry-once default.
         echo "browser suite $suite failed twice; retrying once more after \
 ${BROWSER_RETRY_COOLDOWN}s cooldown"
         sleep "$BROWSER_RETRY_COOLDOWN"
-        if run_suite "$crate" "$feature" "$target"; then
-          result="pass (retry 2)"
-          if [ "${LAST_SKIPS:-0}" -gt 0 ]; then
-            result="pass (retry 2, ${LAST_SKIPS} skip marker(s))"
-          fi
-        else
-          result="FAIL"
-          failures=$((failures + 1))
-        fi
-      else
-        result="FAIL"
-        failures=$((failures + 1))
+        run_suite "$crate" "$feature" "$target"
+        rc=$?
+        attempts=3
+        suite_seconds=$((suite_seconds + LAST_SECONDS))
       fi
     fi
+    notes=""
+    if [ "$rc" -eq 0 ]; then
+      outcome="pass"
+      case "$attempts" in
+        2) notes="retry" ;;
+        3) notes="retry 2" ;;
+      esac
+      if [ "${LAST_SKIPS:-0}" -gt 0 ]; then
+        notes="${notes:+$notes, }${LAST_SKIPS} skip marker(s)"
+      fi
+    else
+      outcome="FAIL"
+      failures=$((failures + 1))
+      if [ "$attempts" -eq 1 ] && [ "$rc" -eq 2 ]; then
+        notes="vacuous: zero tests executed"
+      elif [ "$attempts" -eq 1 ] && [ "$rc" -eq 3 ]; then
+        notes="build or target error"
+      fi
+    fi
+    result=$(format_result "$outcome" "$notes" "$attempts" "$LAST_SECONDS" "$suite_seconds")
+    echo "::endgroup::"
+    echo "result: $suite -> $result"
+    report_status+=("$result")
+    report_suite+=("$suite")
+    report_seconds+=("$suite_seconds")
+  done
+
+  if [ "$ran" -eq 0 ]; then
+    echo "error: no suite matched FILTER='$FILTER'" >&2
+    exit 2
   fi
-  echo "::endgroup::"
-  echo "result: $suite -> $result"
-  report_status+=("$result")
-  report_suite+=("$suite")
-done
+  leg_seconds=$((SECONDS - leg_start))
 
-if [ "$ran" -eq 0 ]; then
-  echo "error: no suite matched FILTER='$FILTER'" >&2
-  exit 2
-fi
-
-echo ""
-echo "==== testnet acceptance summary ($ran suites) ===="
-for i in "${!report_suite[@]}"; do
-  printf '%-90s %s\n' "${report_suite[$i]}" "${report_status[$i]}"
-done
-
-if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
-  {
-    echo "## Testnet acceptance ($ran suites)"
-    echo ""
-    echo "| suite | result |"
-    echo "| --- | --- |"
-    for i in "${!report_suite[@]}"; do
-      echo "| ${report_suite[$i]} | ${report_status[$i]} |"
-    done
-  } >> "$GITHUB_STEP_SUMMARY"
-fi
-
-if [ "$failures" -gt 0 ]; then
   echo ""
-  echo "$failures suite(s) failed"
-  exit 1
+  echo "==== testnet acceptance summary ($ran suites, mainnet-write ${MAINNET_WRITE}) ===="
+  for i in "${!report_suite[@]}"; do
+    printf '%-90s %s\n' "${report_suite[$i]}" "${report_status[$i]}"
+  done
+  echo "leg wall time: ${leg_seconds} s"
+
+  if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+    {
+      echo "## Testnet acceptance ($ran suites, mainnet-write ${MAINNET_WRITE})"
+      echo ""
+      echo "| suite | result | seconds |"
+      echo "| --- | --- | --- |"
+      for i in "${!report_suite[@]}"; do
+        echo "| ${report_suite[$i]} | ${report_status[$i]} | ${report_seconds[$i]} |"
+      done
+      echo ""
+      echo "Leg wall time: ${leg_seconds} s."
+    } >> "$GITHUB_STEP_SUMMARY"
+  fi
+
+  if [ "$failures" -gt 0 ]; then
+    echo ""
+    echo "$failures suite(s) failed"
+    exit 1
+  fi
+  echo ""
+  echo "all suites passed"
+}
+
+# The run starts only when the script is executed; a test sources it for its
+# functions and suite lists.
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
 fi
-echo ""
-echo "all suites passed"

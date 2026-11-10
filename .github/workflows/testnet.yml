@@ -18,6 +18,12 @@ on:
           substring (empty runs the full leg)
         required: false
         default: ''
+      mainnet_write:
+        description: >-
+          Run every suite against the build with mainnet-write on
+        type: boolean
+        required: false
+        default: false
   schedule:
     # Weekly, Monday 05:00 UTC.
     - cron: '0 5 * * 1'
@@ -94,12 +100,14 @@ jobs:
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: "24.5.0"
-      # Serialization, inter-suite pacing, one-retry-with-cooldown, and the
-      # zero-tests-executed guard all live in the driver script so the same
-      # entrypoint runs locally and in CI.
+      # Serialization, inter-suite pacing, one-retry-with-cooldown, the
+      # zero-tests-executed guard, and the per-suite durations all live in the
+      # driver script so the same entrypoint runs locally and in CI. A
+      # scheduled run has no inputs and builds with mainnet-write off.
       - name: Run testnet acceptance suites
         env:
           FILTER: ${{ inputs.filter }}
+          MAINNET_WRITE: ${{ inputs.mainnet_write && 'on' || 'off' }}
           STELLAR_AGENT_TESTNET_SECONDARY_RPC_URL: ${{ vars.TESTNET_SECONDARY_RPC_URL }}
         run: |
           dbus-run-session -- bash -c '

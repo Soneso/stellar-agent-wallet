@@ -669,9 +669,13 @@ of them.
 
 These tests require network reachability to testnet RPC and Friendbot. Testnet is
 the default network; Friendbot funding is testnet-only. Live acceptance runs
-with `mainnet-write` off: the runner passes `--no-default-features` to every
-suite, and none of its selections enables the feature. These tests establish
-no live-mainnet acceptance.
+with `mainnet-write` off by default: the runner passes `--no-default-features`
+to every suite. With `MAINNET_WRITE=on`, each suite of a crate that declares a
+`mainnet-write` feature also enables that feature, which is the build the
+binaries ship by default. A crate without the feature builds as with
+`MAINNET_WRITE=off`. Any other value fails the run before the first suite.
+Either way the suites run against testnet, so these tests establish no
+live-mainnet acceptance.
 
 The MPP acceptance target also requires Node.js and pnpm for the pinned released
 `@stellar/mpp` server harness. Its package and lock files must contain the exact
@@ -702,18 +706,40 @@ Friendbot and the RPC load balancer are not hit back-to-back:
 ```bash
 .github/scripts/run-testnet-acceptance.sh                # everything
 FILTER=stellar-agent-dex .github/scripts/run-testnet-acceptance.sh   # one crate
+MAINNET_WRITE=on .github/scripts/run-testnet-acceptance.sh   # mainnet-write build
 ```
 
-The driver enforces a completeness guard: it fails the run if any `tests/*testnet*.rs`
-file on disk is missing from its suite list, so a new live suite must be added to
-`SUITES` in `.github/scripts/run-testnet-acceptance.sh`.
+The driver enforces a completeness guard: it fails the run if any
+`tests/*testnet*.rs` or `tests/*_browser_acceptance.rs` file on disk is missing
+from its suite list, so a new live suite must be added to `SUITES` in
+`.github/scripts/run-testnet-acceptance.sh`. The self-test
+`.github/scripts/test-run-testnet-acceptance.sh` checks the suite list against
+the files in both directions, the browser suite list, the feature selection,
+and the refusal of an unknown `MAINNET_WRITE` value. The `release contracts` CI
+job runs it.
+
+Each result line carries the wall seconds of the attempt that produced the
+result. A retried suite also carries the seconds of all its attempts, as in
+`pass (retry, 412 s, 830 s total)`. The summary header names the build,
+`mainnet-write off` or `mainnet-write on`, and the summary closes with the
+leg's wall time. In a workflow run the step summary table has a `seconds`
+column with each suite's seconds across its attempts.
 
 The same script backs the `Testnet acceptance` workflow
-(`.github/workflows/testnet.yml`), which runs on manual dispatch (with an
-optional suite filter input) and on a weekly schedule; it is deliberately not
-part of per-push CI. The WebAuthn suite needs a Chromium binary on `PATH` (or
-the `CHROME` env var). The driver reports each self-skip as a skip marker in
-the run summary, so a green leg states what did not execute.
+(`.github/workflows/testnet.yml`), which runs on manual dispatch and on a
+weekly schedule; it is deliberately not part of per-push CI. A dispatch takes
+an optional suite filter input and the boolean `mainnet_write` input, which
+runs every suite against the build with `mainnet-write` on. A scheduled run
+builds with `mainnet-write` off.
+
+The browser suites need a Chromium binary on `PATH` (or the `CHROME` env var).
+Among them, the mainnet consent browser suite
+`stellar-agent-approval-remote` / `mainnet_presence_browser_acceptance`
+(feature `operator-enroll-browser-acceptance`) enrolls an approval credential
+and drives the mainnet consent pages over loopback HTTP; like the
+operator-enroll suite, it needs no testnet. The driver reports each self-skip
+as a skip marker in the run summary, so a green leg states what did not
+execute.
 
 The multicall suites run without extra configuration. The library suite
 `stellar-agent-smart-account` / `smart_account_multicall_testnet_acceptance`
@@ -1070,6 +1096,12 @@ The depth of the review follows what a change touches:
 
 The second review pass checks the change against every dimension of the
 checklist. Review repeats until a pass ends with no blocking findings.
+
+A release that ships the `mainnet-write` build also gets the signing-authority
+and approval-flow reviews that
+[Mainnet release reviews](review-checklist.md#mainnet-release-reviews)
+describes. The [keychain measurement](keychain-measurement.md) records the
+macOS keychain dialogs that the signed binaries raise.
 
 See [../../CONTRIBUTING.md](../../CONTRIBUTING.md) for the contribution workflow.
 

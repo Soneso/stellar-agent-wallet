@@ -33,7 +33,8 @@ ROOT = HERE.parent.parent
 # The live inputs each workflow rule reads besides .github: D5 walks the
 # fixture root itself, D12 reads the Rust sources under crates/.
 RULE_INPUTS = {'D5': (), 'D6': ('Cross.toml',), 'D7': (),
-               'D8': ('docs/maintainers/building.md',), 'D9': (),
+               'D8': ('docs/maintainers/building.md',),
+               'D9': tuple(path.relative_to(ROOT).as_posix() for path in sorted((ROOT / 'crates').glob('*/Cargo.toml'))),
                'D10': ('docs/maintainers/building.md',), 'D11': (),
                'D12': ('crates',), 'D13': ()}
 # Violating variants per rule. D1 has eight variants. Three remove forwards:
@@ -732,6 +733,75 @@ def case_feature_loop(m, tmp, checker):
     rows = m.inventory(tmp, workflow, {})
     assert len(rows) == 2, 'feature-loop: literal list drift was ignored'
     assert {row['features'][-1] for row in rows} == {'test-helpers', 'testnet-helpers'}, 'feature-loop: incorrect expansion'
+
+
+def testnet_driver(m, function=None, assignment=None, extra=''):
+    """A testnet acceptance driver with two suites: crate a declares
+    mainnet-write, crate b does not."""
+    function = m.TESTNET_FEATURES_FUNCTION if function is None else function
+    assignment = m.TESTNET_FEATURES_ASSIGNMENT if assignment is None else assignment
+    return (function + '\n'
+            'SUITES=(\n  "a testnet-acceptance a_testnet"\n  "b testnet-integration b_testnet"\n)\n'
+            'run_suite() {\n  local crate="$1" feature="$2" target="$3" features\n'
+            f'  {assignment}\n{extra}'
+            '  cargo test -p "$crate" --no-default-features --features "$features" --test "$target"\n}\n')
+
+
+def testnet_inventory(m, tmp, driver, manifests=('a', 'b')):
+    for crate in manifests:
+        (tmp / 'crates' / crate).mkdir(parents=True, exist_ok=True)
+        features = 'mainnet-write = []\n' if crate == 'a' else 'other = []\n'
+        (tmp / 'crates' / crate / 'Cargo.toml').write_text('[features]\n' + features)
+    workflow = {'testnet.yml': {'jobs': {'acceptance': {'runs-on': 'ubuntu-24.04', 'steps': [
+        {'name': 'suites', 'run': 'bash ' + m.TESTNET_DRIVER}]}}}}
+    return m.inventory(tmp, workflow, {m.TESTNET_DRIVER: driver})
+
+
+@unit('testnet-driver-features')
+def case_testnet_driver_features(m, tmp, checker):
+    rows = testnet_inventory(m, tmp, testnet_driver(m))
+    found = sorted((row['selection'][1], row['features'][-1], row['relied_on']) for row in rows)
+    assert found == [('a', 'mainnet-write,testnet-acceptance', 'on'), ('a', 'testnet-acceptance', 'off'),
+                     ('b', 'testnet-integration', 'off')], f'testnet-driver-features: {found}'
+
+
+@unit('testnet-driver-reviewed-text')
+def case_testnet_driver_reviewed_text(m, tmp, checker):
+    always_on = m.TESTNET_FEATURES_FUNCTION.replace('if [ "$MAINNET_WRITE" = "on" ] && grep', 'if grep', 1)
+    assert always_on != m.TESTNET_FEATURES_FUNCTION, 'testnet-driver-reviewed-text: fixture edit missed'
+    cases = [
+        ('changed function', testnet_driver(m, function=always_on), ('a', 'b'), 'suite_features differs'),
+        ('second function', testnet_driver(m, function=m.TESTNET_FEATURES_FUNCTION + '\n' + always_on),
+         ('a', 'b'), 'suite_features differs'),
+        ('changed assignment', testnet_driver(m, assignment='features="mainnet-write,$feature"'),
+         ('a', 'b'), 'features assignment differs'),
+        ('second assignment', testnet_driver(m, extra='  features="mainnet-write,$feature"\n'),
+         ('a', 'b'), 'features assignment differs'),
+        ('missing manifest', testnet_driver(m), ('a',), 'no manifest for suite crate b'),
+    ]
+    for label, driver, manifests, message in cases:
+        directory = tmp / label.replace(' ', '-')
+        try:
+            testnet_inventory(m, directory, driver, manifests)
+        except Exception as error:
+            assert isinstance(error, ValueError) and message in str(error), \
+                f'testnet-driver-reviewed-text: {label}: {type(error).__name__}: {error}'
+        else:
+            raise AssertionError(f'testnet-driver-reviewed-text: {label}: accepted')
+
+
+@unit('testnet-driver-activation')
+def case_testnet_driver_activation(m, tmp, checker):
+    root = live_root('D9', tmp / 'testnet-driver-activation')
+    workflows, scripts = m.workflow_inputs(root)
+    accepts(bare_checker(m, root, workflows, scripts), 'D9', 'testnet-driver-activation')
+    replace(root, '.github/workflows/testnet.yml', '  acceptance:\n', '  nightly:\n')
+    workflows, scripts = m.workflow_inputs(root)
+    c = bare_checker(m, root, workflows, scripts)
+    c.D9()
+    expected = f'D9: testnet.yml:nightly: feature activation outside allowed jobs: {m.TESTNET_DRIVER} (mainnet-write,'
+    assert c.errors and all(error.startswith(expected) for error in c.errors), \
+        f'testnet-driver-activation: nightly fixture accepted or wrong failure: {c.errors}'
 
 
 @unit('transitive-scripts')
@@ -1872,6 +1942,24 @@ MUTATIONS = {
         "        if '$' in word:\n            raise ValueError(f'unresolved command family {word}')\n",
         "        if False:\n            raise ValueError(f'unresolved command family {word}')\n",
         'cargo-global-options: cargo $ARGS build --release: accepted'),
+    'D3-testnet-on-list': ('testnet-driver-features',
+        "lists.append(f'{FEATURE},{entry[\"feature\"]}')", 'pass', 'testnet-driver-features:'),
+    'D3-testnet-function': ('testnet-driver-reviewed-text',
+        'if functions != [TESTNET_FEATURES_FUNCTION]:', 'if False:',
+        'testnet-driver-reviewed-text: changed function: accepted'),
+    'D3-testnet-assignment': ('testnet-driver-reviewed-text',
+        'if assignments != [TESTNET_FEATURES_ASSIGNMENT]:', 'if False:',
+        'testnet-driver-reviewed-text: changed assignment: accepted'),
+    'D3-testnet-manifest': ('testnet-driver-reviewed-text',
+        'if not manifest.is_file():', 'if False:',
+        'testnet-driver-reviewed-text: missing manifest: FileNotFoundError'),
+    'D9-testnet-allowance': ('testnet-driver-activation',
+        "TESTNET_ACTIVATION_ALLOWANCE = (('testnet.yml', 'acceptance', TESTNET_DRIVER),)",
+        'TESTNET_ACTIVATION_ALLOWANCE = ()',
+        'testnet-driver-activation: accepted form rejected: [\'D9: testnet.yml:acceptance:'),
+    'D9-testnet-detection': ('testnet-driver-activation',
+        'if path.as_posix() == TESTNET_DRIVER:', 'if False:',
+        'testnet-driver-activation: nightly fixture accepted or wrong failure: []'),
     'D8-mapping-flags': ('workflow-flag-guards',
         'yield name, json.dumps(document)',
         "yield name, '\\n'.join(run_text(step) for job in document.get('jobs', {}).values() for step in job.get('steps', []))",
