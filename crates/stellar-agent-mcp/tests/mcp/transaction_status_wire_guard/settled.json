@@ -1,0 +1,26 @@
+{
+  "ok": true,
+  "data": {
+    "chain_status": "NOT_FOUND",
+    "ledger": null,
+    "record": {
+      "envelope_hash": "77777777777777777777777777777777777777777777777777777777777777aa",
+      "failure_code": "ledger.failed",
+      "ledger": 1500,
+      "release_code": null,
+      "reservation_open": true,
+      "sequence": 7,
+      "settlement_decision_id": null,
+      "settlement_evidence": "unavailable",
+      "source_redacted": "GAQAA...QSTVY",
+      "status": "failed",
+      "submitted": true
+    },
+    "reservation": {
+      "envelope_hash": "77777777777777777777777777777777777777777777777777777777777777aa",
+      "operator_required": false
+    },
+    "tx_hash": "88888888888888888888888888888888888888888888888888888888888888bb"
+  },
+  "request_id": "REQUEST_ID"
+}

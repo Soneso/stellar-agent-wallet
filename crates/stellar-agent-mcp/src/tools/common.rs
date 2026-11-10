@@ -1442,10 +1442,9 @@ impl WalletServer {
     /// that was skipped or refused, so obligations of earlier passes are
     /// delivered too.
     async fn reconcile_open_reservations(&self) {
-        use crate::tools::submission_record::ReconcilePass;
-
+        use stellar_agent_network::submission_flow::{self, ReconcilePass};
         let profile_name = self.profile_name_for_approval();
-        let receipts = stellar_agent_core::profile::receipt::ReceiptStore::open(&profile_name).ok();
+        let receipts = submission_flow::open_receipts(&profile_name).ok();
         let window = self.window_store.clone();
         let pass = match (
             stellar_agent_core::timefmt::now_unix_ms(),
@@ -1455,33 +1454,30 @@ impl WalletServer {
             (Ok(_), Err(_)) => ReconcilePass::ClientUnavailable,
             (Ok(now_ms), Ok(client)) => {
                 let oracle = self.settlement_oracle();
-                match window
-                    .reconcile_due(
-                        self.security_profile(),
-                        &client,
-                        oracle.as_ref(),
-                        receipts.as_ref(),
-                        now_ms,
-                        stellar_agent_network::policy_state::RECONCILE_BUDGET,
-                    )
-                    .await
-                {
-                    Ok(report) => ReconcilePass::Completed(report),
-                    Err(error) => ReconcilePass::Failed(error),
-                }
+                submission_flow::reconcile_pass(
+                    self.security_profile(),
+                    &window,
+                    &client,
+                    oracle.as_ref(),
+                    receipts.as_ref(),
+                    now_ms,
+                )
+                .await
             }
         };
-
-        // Accounting expiry commits its audit obligation with the expiry, so
-        // the drain delivers it, and any obligation an earlier pass left, from
-        // the verified window state. A refusal is logged and stays owed.
-        let _ = crate::tools::submission_record::finish_reconciliation(
+        let _ = submission_flow::finish_reconciliation(
             self.security_profile(),
             &profile_name,
-            self.audit_binding,
             &window,
             receipts.as_ref(),
             &pass,
+            || {
+                crate::tools::value_audit::require_value_audit_writer(
+                    self.security_profile(),
+                    &profile_name,
+                    self.audit_binding,
+                )
+            },
         );
     }
 

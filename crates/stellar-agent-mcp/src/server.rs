@@ -1723,22 +1723,11 @@ impl WalletServer {
     /// then keeps every reservation the primary reports as failed or
     /// unknown, as it does when the oracle cannot be reached.
     pub(crate) fn settlement_oracle(&self) -> Option<stellar_agent_network::StellarRpcClient> {
-        let profile = self.security_profile();
-        let scope = self.window_store.chain_scope(profile).ok()?;
-        if !scope.chain().is_mainnet() {
-            return None;
-        }
-        match self.context.oracle_client(profile) {
-            Ok(oracle) => oracle,
-            Err(error) => {
-                tracing::warn!(
-                    code = %error.code(),
-                    "window reconcile: the oracle client could not be built; negative answers \
-                     of the primary endpoint settle nothing"
-                );
-                None
-            }
-        }
+        stellar_agent_network::submission_flow::settlement_oracle(
+            &self.window_store,
+            self.security_profile(),
+            &self.context,
+        )
     }
 
     pub(crate) fn mainnet_write_admission(
@@ -2004,6 +1993,37 @@ mod tests {
         let server = WalletServer::new(profile).unwrap();
         assert_eq!(server.context.chain_id, server.profile.chain_id);
         assert_eq!(server.context.rpc_url, server.profile.rpc_url);
+    }
+
+    /// The server builds the configured oracle for a mainnet profile and none
+    /// for a testnet profile with the same oracle configuration.
+    #[test]
+    #[serial_test::serial(keyring)]
+    fn settlement_oracle_follows_the_profile_chain() {
+        use stellar_agent_core::profile::schema::{PrimaryProviderRecord, ProviderRecord};
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(dir.path());
+        let mainnet = Profile::builder_mainnet_named(
+            "oracle-wrapper",
+            "https://primary.example",
+            "s",
+            "a",
+            "n",
+            "a",
+        )
+        .primary_provider(PrimaryProviderRecord::new("Primary", "primary.example"))
+        .oracle_provider_url(url::Url::parse("https://oracle.example").unwrap())
+        .oracle_provider(ProviderRecord::new("Oracle", "oracle.example", true))
+        .with_noop_engine()
+        .build();
+        let mut testnet = mainnet.clone();
+        testnet.chain_id = stellar_agent_core::profile::caip2::Caip2::Testnet;
+
+        let server = WalletServer::new(mainnet).unwrap();
+        assert!(server.settlement_oracle().is_some());
+        let server = WalletServer::new(testnet).unwrap();
+        assert!(server.settlement_oracle().is_none());
     }
 
     /// The owner key being absent keeps the `OwnerKeyAbsent` contract.

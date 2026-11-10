@@ -50,7 +50,7 @@ pub const ALLOWED_FRIENDBOT_HOSTS: &[&str] =
     &["friendbot.stellar.org", "friendbot-futurenet.stellar.org"];
 
 /// Errors returned by [`validate_friendbot_url`] and
-/// [`validate_friendbot_url_allowing_loopback`].
+/// `validate_friendbot_url_allowing_loopback`.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum FriendbotUrlError {

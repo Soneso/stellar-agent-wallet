@@ -175,7 +175,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `friendbot_fund`, `FriendbotFundingError` and `FriendbotRequestError` in the
   test-support testnet helpers.
 
+- `stellar_agent_network::submission_flow` holds the submission flow after
+  the policy gate that the CLI and the MCP server share: recorder assembly,
+  recovery details, the settlement oracle, reconciliation and transaction
+  status.
+
 ### Changed
+
+- The CLI and MCP server share submission recording, reconciliation and
+  transaction status logic; the wire output is unchanged.
 
 - The wallet accepts protocol 30 on mainnet endpoints beside protocol 29.
 

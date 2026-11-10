@@ -1,0 +1,14 @@
+{
+  "ok": true,
+  "data": {
+    "chain_status": "NOT_FOUND",
+    "ledger": null,
+    "record": null,
+    "reservation": {
+      "envelope_hash": "77777777777777777777777777777777777777777777777777777777777777aa",
+      "operator_required": false
+    },
+    "tx_hash": "88888888888888888888888888888888888888888888888888888888888888bb"
+  },
+  "request_id": "REQUEST_ID"
+}

@@ -29,9 +29,10 @@ use stellar_agent_test_support::xdr_fixtures::{
 use wiremock::matchers::method;
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
-const ENVELOPE_HASH: &str = "77777777777777777777777777777777777777777777777777777777777777aa";
-const TX_HASH: &str = "88888888888888888888888888888888888888888888888888888888888888bb";
-const SOURCE: &str = "GAQAA5L65LSYH7CQ3VTJ7F3HHLGCL3DSLAR2Y47263D56MNNGHSQSTVY";
+pub(super) const ENVELOPE_HASH: &str =
+    "77777777777777777777777777777777777777777777777777777777777777aa";
+pub(super) const TX_HASH: &str = "88888888888888888888888888888888888888888888888888888888888888bb";
+pub(super) const SOURCE: &str = "GAQAA5L65LSYH7CQ3VTJ7F3HHLGCL3DSLAR2Y47263D56MNNGHSQSTVY";
 const DESTINATION: &str = "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN";
 /// The sequence the source account reports.
 const ACCOUNT_SEQUENCE: i64 = 41;
@@ -129,7 +130,7 @@ impl Respond for StatusRpc {
 
 /// A profile under its own signer account, so its audit log is not shared
 /// with another test in this binary.
-fn status_profile(rpc_url: &str, account: &str) -> Profile {
+pub(super) fn status_profile(rpc_url: &str, account: &str) -> Profile {
     let mut p = Profile::builder_testnet("svc", account, "n-svc", "n-acct")
         .with_noop_engine()
         .build();
@@ -140,7 +141,7 @@ fn status_profile(rpc_url: &str, account: &str) -> Profile {
 }
 
 /// Seeds a sent, unanswered receipt for `ENVELOPE_HASH`.
-fn seed_receipt(profile_name: &str, sequence: i64, max_time: u64) {
+pub(super) fn seed_receipt(profile_name: &str, sequence: i64, max_time: u64) {
     let receipts = ReceiptStore::open(profile_name).unwrap();
     receipts
         .begin_submission(
@@ -156,7 +157,11 @@ fn seed_receipt(profile_name: &str, sequence: i64, max_time: u64) {
 }
 
 /// Takes a reservation for `ENVELOPE_HASH` that a gate pass treats as due.
-fn seed_reservation(profile: &Profile, profile_name: &str, sequence: i64) -> PersistedWindowStore {
+pub(super) fn seed_reservation(
+    profile: &Profile,
+    profile_name: &str,
+    sequence: i64,
+) -> PersistedWindowStore {
     let now = now_ms();
     let window = PersistedWindowStore::for_profile(profile_name);
     window
