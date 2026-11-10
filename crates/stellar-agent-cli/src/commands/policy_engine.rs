@@ -570,7 +570,7 @@ pub(crate) struct MainnetEvaluation {
 ///
 /// # Errors
 ///
-/// `policy.deny.{code}` on a deny, `policy.unexpected_decision` on a
+/// The deny reason's wire code on a deny, `policy.unexpected_decision` on a
 /// decision this build does not know, and `policy.engine_required` when the
 /// evaluator fails.
 #[allow(
@@ -606,7 +606,7 @@ pub(crate) fn evaluate_mainnet_policy(
         Decision::Allow => MainnetVerdict::Allow,
         Decision::Deny(reason) => {
             return Err(Envelope::<()>::err_raw(
-                format!("policy.deny.{}", reason.code()),
+                reason.wire_code(),
                 format!("{verb} operation denied by operator policy"),
             ));
         }
@@ -848,7 +848,7 @@ pub(crate) fn evaluate_value_moving_policy(
         Ok(evaluation) => match evaluation.decision {
             Decision::Allow => Ok(evaluation.value_effects),
             Decision::Deny(reason) => Err(Envelope::<()>::err_raw(
-                format!("policy.deny.{}", reason.code()),
+                reason.wire_code(),
                 format!("{verb} operation denied by operator policy"),
             )),
             Decision::RequireApproval(_) => Err(Envelope::<()>::err_raw(
@@ -924,7 +924,7 @@ pub(crate) fn evaluate_value_moving_policy_with_value(
         Ok(evaluation) => match evaluation.decision {
             Decision::Allow => Ok(()),
             Decision::Deny(reason) => Err(Envelope::<()>::err_raw(
-                format!("policy.deny.{}", reason.code()),
+                reason.wire_code(),
                 format!("{verb} operation denied by operator policy"),
             )),
             Decision::RequireApproval(_) => Err(Envelope::<()>::err_raw(
@@ -1004,7 +1004,7 @@ pub(crate) fn evaluate_opaque_signing_policy(
         Ok(evaluation) => match evaluation.decision {
             Decision::Allow => Ok(()),
             Decision::Deny(reason) => Err(Envelope::<()>::err_raw(
-                format!("policy.deny.{}", reason.code()),
+                reason.wire_code(),
                 format!("{verb} operation denied by operator policy"),
             )),
             Decision::RequireApproval(_) => Err(Envelope::<()>::err_raw(
@@ -1498,6 +1498,43 @@ decision = "allow"
             "policy.deny.per_tx_cap_exceeded",
             "150 XLM over a 100 XLM cap must deny with the same wire code the MCP \
              `stellar_pay` twin returns for the identical rule"
+        );
+    }
+
+    #[test]
+    fn pay_gate_floor_without_account_read_refuses_with_account_code() {
+        use stellar_agent_core::policy::v1::criteria::balance_floor::BalanceFloorCriterion;
+        let rule = PolicyRule {
+            r#match: RuleMatch {
+                tool: "stellar_pay".to_owned(),
+                chain: "*".to_owned(),
+            },
+            criteria: vec![Box::new(BalanceFloorCriterion::new(20_000_000))],
+            decision: Decision::Allow,
+            allow_opaque_signing: false,
+        };
+        let doc = PolicyDocument {
+            version: 2,
+            scope: ScopeId::AllProfiles,
+            rules: vec![rule],
+            signature: None,
+        };
+        let engine = PolicyEngineV1::new(doc, "alice".to_owned());
+        let result = evaluate_value_moving_policy(
+            &engine,
+            &parity_profile(),
+            "stellar_pay",
+            ToolValueKind::MovesValue,
+            "stellar:testnet",
+            &pay_policy_args(10_000_000, "native", PARITY_DEST_G),
+            "pay",
+            None,
+            None,
+        );
+        assert_eq!(
+            envelope_code(&result),
+            "account.unread",
+            "a floor without an account read refuses with its account code, unprefixed"
         );
     }
 

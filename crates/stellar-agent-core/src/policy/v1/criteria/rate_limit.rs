@@ -305,6 +305,8 @@ mod tests {
             sep45_sessions: None,
             state_store: store,
             bundle: None,
+            policy_digest: [0; 32],
+            provisional: false,
         }
     }
 
@@ -494,6 +496,8 @@ mod tests {
             sep45_sessions: None,
             state_store: &store,
             bundle: Some(&view),
+            policy_digest: [0; 32],
+            provisional: false,
         };
         let result = criterion.evaluate(&ctx).unwrap();
         assert!(

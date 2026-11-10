@@ -181,12 +181,14 @@ pub(crate) fn claim_rule(extra: &str) -> String {
     )
 }
 
-/// The trustline rule pinning [`TRUSTLINE_ASSET`], with `extra` criteria.
+/// The trustline rule pinning [`TRUSTLINE_ASSET`] under a rate limit, with
+/// `extra` criteria.
 pub(crate) fn trustline_rule(extra: &str) -> String {
     format!(
         "[[rules]]\nmatch = {{ tool = \"stellar_trustline\", chain = \"stellar:mainnet\" }}\n\
          criteria = [\n\
          {{ kind = \"asset_allowlist\", assets = [\"{TRUSTLINE_ASSET}\"] }},\n\
+         {{ kind = \"rate_limit\", window = \"1d\", max_calls = 100 }},\n\
          {extra}]\ndecision = \"allow\"\n"
     )
 }

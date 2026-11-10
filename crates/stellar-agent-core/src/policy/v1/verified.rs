@@ -400,7 +400,7 @@ fn check_body(load: &PolicyLoad<'_>, signed: &SignedPolicy) -> Result<CheckedBod
         0
     };
     let canonical = canonical_bytes(&signed.raw)?;
-    let digest = *blake3::hash(&canonical).as_bytes();
+    let digest = crate::mainnet::verified_policy::policy_digest(&canonical);
     Ok(CheckedBody {
         sequence,
         canonical,
@@ -417,10 +417,11 @@ fn into_verified(
     body: CheckedBody,
     window_state: PolicyStateStore,
 ) -> VerifiedPolicy {
-    let engine = Arc::new(PolicyEngineV1::new_with_store(
+    let engine = Arc::new(PolicyEngineV1::new_verified(
         document,
         load.profile_name.to_owned(),
         window_state,
+        &body.canonical,
     ));
     VerifiedPolicy::from_verified(
         body.sequence,

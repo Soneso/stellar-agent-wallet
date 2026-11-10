@@ -69,14 +69,21 @@ use crate::counterparty::is_valid_ldh_home_domain;
 use crate::policy::v1::asset_equivalence::assets_equivalent;
 use crate::policy::v1::canonical::{OPTIONAL_RULE_KEYS, canonical_bytes};
 use crate::policy::v1::criteria::counterparty_allowlist::CounterpartyKind;
+use crate::policy::v1::criteria::counterparty_allowlist::{UnlistedBudget, UnlistedMode};
+use crate::policy::v1::criteria::memo_binding::{
+    MAX_MEMO_BINDINGS, MemoBinding, MemoBindingCriterion, MemoRequirement,
+};
 use crate::policy::v1::criteria::per_period_cap::Window;
 use crate::policy::v1::criteria::{
-    ApprovalAboveCriterion, BundleAggregateCapCriterion, BundlePerPeriodCapCriterion,
-    BundlePerTxCapCriterion, BundleRateLimitCriterion, CounterpartyAllowlistCriterion, Criterion,
-    InnerInvocationCountCapCriterion, MinimumReserveCriterion, PerPeriodCapCriterion,
-    PerTxCapCriterion, RateLimitCriterion, RestrictBundleToRecognisedKindsCriterion,
+    ApprovalAboveCriterion, BalanceFloorCriterion, BundleAggregateCapCriterion,
+    BundlePerPeriodCapCriterion, BundlePerTxCapCriterion, BundleRateLimitCriterion,
+    CounterpartyAllowlistCriterion, Criterion, InnerInvocationCountCapCriterion,
+    MinimumReserveCriterion, PerPeriodCapCriterion, PerTxCapCriterion, RateLimitCriterion,
+    RestrictBundleToRecognisedKindsCriterion, TotalBudgetCriterion,
 };
-use crate::policy::v1::schema::{criterion_keys, validate_policy_keys};
+use crate::policy::v1::schema::{
+    MEMO_BINDING_KEYS, UNLISTED_KEYS, criterion_keys, reject_unknown_keys, validate_policy_keys,
+};
 use crate::policy::v1::signature::{digest, verify};
 use crate::policy::{Decision, DenyReason, PolicyError};
 
@@ -639,7 +646,7 @@ fn parse_policy_body(
     super::signature::parse_owner_rotation(doc)?;
     let scope = extract_scope(doc)?;
     reject_scope_profile_mismatch(&scope, profile_name)?;
-    let rules = extract_rules(doc, network_passphrase)?;
+    let rules = extract_rules(doc, network_passphrase, version)?;
     Ok(PolicyBody {
         version,
         scope,
@@ -839,10 +846,14 @@ fn parse_scope_string(s: &str) -> Result<ScopeId, PolicyError> {
 
 /// Extracts and parses the `[[rules]]` array.
 ///
-/// Returns an empty vec when no `rules` key is present.
+/// Returns an empty vec when no `rules` key is present. `version` is the
+/// document's policy version; criteria and keys of version 2 refuse in a
+/// version 1 document. At most one criterion of the policy carries an
+/// `unlisted` table.
 fn extract_rules(
     doc: &DocumentMut,
     network_passphrase: &str,
+    version: u32,
 ) -> Result<Vec<PolicyRule>, PolicyError> {
     let rules_item = match doc.get("rules") {
         Some(item) => item,
@@ -860,9 +871,40 @@ fn extract_rules(
 
     let mut rules = Vec::with_capacity(aot.len());
     for (i, table) in aot.iter().enumerate() {
-        rules.push(parse_rule(table, i, network_passphrase)?);
+        rules.push(parse_rule(table, i, network_passphrase, version)?);
     }
+    reject_second_unlisted(&rules)?;
     Ok(rules)
+}
+
+/// Refuses a policy in which more than one criterion carries an `unlisted`
+/// table, in one rule or across rules.
+///
+/// One table keeps the treatment of an unlisted recipient unambiguous for
+/// every call the policy governs.
+fn reject_second_unlisted(rules: &[PolicyRule]) -> Result<(), PolicyError> {
+    let mut first: Option<(usize, usize)> = None;
+    for (rule_idx, rule) in rules.iter().enumerate() {
+        for (criterion_idx, criterion) in rule.criteria.iter().enumerate() {
+            let carries = (criterion.as_ref() as &dyn std::any::Any)
+                .downcast_ref::<CounterpartyAllowlistCriterion>()
+                .is_some_and(|c| c.unlisted().is_some());
+            if !carries {
+                continue;
+            }
+            if let Some((first_rule, first_criterion)) = first {
+                return Err(PolicyError::PolicyFileParseFailed {
+                    detail: format!(
+                        "rule[{rule_idx}].criteria[{criterion_idx}]: a policy carries at most \
+                         one `unlisted` table; rule[{first_rule}].criteria[{first_criterion}] \
+                         carries the first"
+                    ),
+                });
+            }
+            first = Some((rule_idx, criterion_idx));
+        }
+    }
+    Ok(())
 }
 
 /// Parses a single rule table.
@@ -876,6 +918,7 @@ fn parse_rule(
     table: &toml_edit::Table,
     idx: usize,
     network_passphrase: &str,
+    version: u32,
 ) -> Result<PolicyRule, PolicyError> {
     // match clause
     let match_item = table
@@ -886,7 +929,7 @@ fn parse_rule(
     let rule_match = parse_rule_match(match_item, idx)?;
 
     // criteria (may be absent or empty)
-    let criteria = parse_criteria(table.get("criteria"), idx)?;
+    let criteria = parse_criteria(table.get("criteria"), idx, version)?;
 
     // decision
     let decision_str = table
@@ -900,6 +943,8 @@ fn parse_rule(
     let ttl_secs = parse_optional_ttl_secs(table, idx)?;
     let decision = parse_decision(decision_str, idx, reason, ttl_secs)?;
     validate_approval_above(&criteria, idx, &decision, network_passphrase)?;
+    validate_unlisted(&criteria, idx, &decision, network_passphrase)?;
+    validate_total_budget(&criteria, idx, &decision)?;
 
     // Optional opaque-signing exemption (design §2.4). Absent → false; present
     // but not a boolean → parse error (fail-closed on a malformed exemption).
@@ -962,6 +1007,102 @@ fn validate_approval_above(
     Ok(())
 }
 
+/// Validates an `unlisted` table against the decision and the hard caps of
+/// its rule.
+///
+/// `approval` and `budget` require `decision = "allow"`. A budget bound must be
+/// strictly below every matching hard cap of its rule. `per_tx_stroops` stays
+/// below each equivalent-asset `per_tx_cap`. `per_period_stroops` stays below
+/// each equivalent-asset `per_period_cap` of the same window. Both stay below
+/// each equivalent-asset `total_budget`. Asset identity is the one evaluation
+/// applies on the governed profile's network.
+fn validate_unlisted(
+    criteria: &[Box<dyn Criterion>],
+    rule_idx: usize,
+    decision: &Decision,
+    network_passphrase: &str,
+) -> Result<(), PolicyError> {
+    for (criterion_idx, criterion) in criteria.iter().enumerate() {
+        let Some(mode) = (criterion.as_ref() as &dyn std::any::Any)
+            .downcast_ref::<CounterpartyAllowlistCriterion>()
+            .and_then(CounterpartyAllowlistCriterion::unlisted)
+        else {
+            continue;
+        };
+        let loc = format!("rule[{rule_idx}].criteria[{criterion_idx}].unlisted");
+        let budget = match mode {
+            UnlistedMode::Deny => continue,
+            UnlistedMode::Approval => None,
+            UnlistedMode::Budget(budget) => Some(budget),
+        };
+        if !matches!(decision, Decision::Allow) {
+            return Err(PolicyError::PolicyFileParseFailed {
+                detail: format!("{loc}: this mode requires decision = \"allow\""),
+            });
+        }
+        let Some(budget) = budget else {
+            continue;
+        };
+        let equivalent = |asset: &str| assets_equivalent(budget.asset(), asset, network_passphrase);
+        for cap in criteria.iter().map(|c| c.as_ref() as &dyn std::any::Any) {
+            if let Some(cap) = cap.downcast_ref::<PerTxCapCriterion>()
+                && equivalent(cap.asset())
+                && budget.per_tx_stroops() >= cap.max_stroops()
+            {
+                return Err(PolicyError::PolicyFileParseFailed {
+                    detail: format!(
+                        "{loc}: `per_tx_stroops` must be less than the `per_tx_cap` bound"
+                    ),
+                });
+            }
+            if let Some(cap) = cap.downcast_ref::<PerPeriodCapCriterion>()
+                && equivalent(cap.asset())
+                && cap.window() == budget.window()
+                && budget.per_period_stroops() >= cap.max_stroops()
+            {
+                return Err(PolicyError::PolicyFileParseFailed {
+                    detail: format!(
+                        "{loc}: `per_period_stroops` must be less than the `per_period_cap` \
+                         bound of the same window"
+                    ),
+                });
+            }
+            if let Some(total) = cap.downcast_ref::<TotalBudgetCriterion>()
+                && equivalent(total.asset())
+                && (budget.per_tx_stroops() >= total.max_stroops()
+                    || budget.per_period_stroops() >= total.max_stroops())
+            {
+                return Err(PolicyError::PolicyFileParseFailed {
+                    detail: format!(
+                        "{loc}: `per_tx_stroops` and `per_period_stroops` must be less than \
+                         the `total_budget` bound"
+                    ),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Refuses a `total_budget` criterion on a rule whose decision is not `allow`.
+fn validate_total_budget(
+    criteria: &[Box<dyn Criterion>],
+    rule_idx: usize,
+    decision: &Decision,
+) -> Result<(), PolicyError> {
+    for (criterion_idx, criterion) in criteria.iter().enumerate() {
+        if criterion.kind() == "total_budget" && !matches!(decision, Decision::Allow) {
+            return Err(PolicyError::PolicyFileParseFailed {
+                detail: format!(
+                    "rule[{rule_idx}].criteria[{criterion_idx}]: `total_budget` requires \
+                     decision = \"allow\""
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
 /// Iterates the `criteria` TOML array and instantiates each criterion.
 ///
 /// Returns an empty vec when the `criteria` key is absent.  Returns an error
@@ -976,6 +1117,7 @@ fn validate_approval_above(
 fn parse_criteria(
     item: Option<&Item>,
     rule_idx: usize,
+    version: u32,
 ) -> Result<Vec<Box<dyn Criterion>>, PolicyError> {
     let array = match item {
         None => return Ok(vec![]),
@@ -990,7 +1132,7 @@ fn parse_criteria(
     let mut criteria: Vec<Box<dyn Criterion>> = Vec::with_capacity(array.len());
     for (criterion_idx, elem) in array.iter().enumerate() {
         let item = Item::Value(elem.clone());
-        criteria.push(parse_criterion(&item, rule_idx, criterion_idx)?);
+        criteria.push(parse_criterion(&item, rule_idx, criterion_idx, version)?);
     }
     Ok(criteria)
 }
@@ -1019,6 +1161,13 @@ fn parse_criteria(
 /// | `"quorum_satisfied"`       | [`QuorumSatisfiedCriterion`]         |
 /// | `"home_domain_resolved"`   | [`HomeDomainResolvedCriterion`]      |
 /// | `"sep10_session_active"`   | [`Sep10SessionActiveCriterion`]      |
+/// | `"total_budget"`           | [`TotalBudgetCriterion`]             |
+/// | `"balance_floor"`          | [`BalanceFloorCriterion`]            |
+/// | `"memo_binding"`           | [`MemoBindingCriterion`]             |
+///
+/// `total_budget`, `balance_floor`, `memo_binding`, and the `unlisted` table
+/// of `counterparty_allowlist` require policy version 2; `version` is the
+/// document's version.
 ///
 /// # Errors
 ///
@@ -1038,6 +1187,7 @@ fn parse_criterion(
     item: &Item,
     rule_idx: usize,
     criterion_idx: usize,
+    version: u32,
 ) -> Result<Box<dyn Criterion>, PolicyError> {
     let loc = format!("rule[{rule_idx}].criteria[{criterion_idx}]");
 
@@ -1064,6 +1214,21 @@ fn parse_criterion(
     // parsed kind has its keys checked.
     if criterion_keys(kind).is_none() {
         return Err(unknown_criterion_kind(&loc));
+    }
+
+    let v2_only = match kind {
+        "total_budget" | "balance_floor" | "memo_binding" => Some(kind),
+        "counterparty_allowlist" if table.contains_key("unlisted") => {
+            Some("counterparty_allowlist.unlisted")
+        }
+        _ => None,
+    };
+    if let Some(feature) = v2_only
+        && version < 2
+    {
+        return Err(PolicyError::PolicyFileParseFailed {
+            detail: format!("{loc}: {feature} requires policy version 2"),
+        });
     }
 
     match kind {
@@ -1200,10 +1365,12 @@ fn parse_criterion(
                         detail: format!("{loc}: `gate_inflows` must be a boolean"),
                     })?,
             };
-            Ok(Box::new(
-                CounterpartyAllowlistCriterion::new(kinds, allowlist)
-                    .with_gate_inflows(gate_inflows),
-            ))
+            let criterion = CounterpartyAllowlistCriterion::new(kinds, allowlist)
+                .with_gate_inflows(gate_inflows);
+            Ok(Box::new(match table.get("unlisted") {
+                None => criterion,
+                Some(unlisted) => criterion.with_unlisted(parse_unlisted(unlisted, &loc)?),
+            }))
         }
         "minimum_reserve" => {
             let margin_stroops = require_i64(table, "margin_stroops", &loc)?;
@@ -1314,8 +1481,153 @@ fn parse_criterion(
         "sep45_session_active" => Ok(Box::new(
             crate::policy::v1::criteria::sep45_session_active::Sep45SessionActiveCriterion::new(),
         )),
+        "total_budget" => {
+            let asset = require_str(table, "asset", &loc)?;
+            let max_stroops = require_nonnegative_i128(table, "max_stroops", &loc)?;
+            Ok(Box::new(TotalBudgetCriterion::new(asset, max_stroops)))
+        }
+        "balance_floor" => {
+            let min_stroops = require_nonnegative_i128(table, "min_stroops", &loc)?;
+            Ok(Box::new(BalanceFloorCriterion::new(min_stroops)))
+        }
+        "memo_binding" => Ok(Box::new(MemoBindingCriterion::new(parse_memo_bindings(
+            table, &loc,
+        )?))),
         _ => Err(unknown_criterion_kind(&loc)),
     }
+}
+
+/// Parses the `unlisted` table of a `counterparty_allowlist` criterion at
+/// `loc`.
+///
+/// `mode` is `deny` (also when omitted), `approval`, or `budget`. `budget`
+/// requires `per_tx_stroops`, `per_period_stroops`, and `window`, and takes
+/// `asset`, `native` by default. Both bounds are nonnegative integers or
+/// decimal strings.
+fn parse_unlisted(item: &Value, loc: &str) -> Result<UnlistedMode, PolicyError> {
+    let loc = format!("{loc}.unlisted");
+    let table = item
+        .as_inline_table()
+        .ok_or_else(|| PolicyError::PolicyFileParseFailed {
+            detail: format!("{loc}: must be an inline table"),
+        })?;
+    reject_unknown_keys(table, UNLISTED_KEYS, Some(&loc), "an `unlisted` table")?;
+    let mode = match table.get("mode") {
+        None => "deny",
+        Some(mode) => mode
+            .as_str()
+            .ok_or_else(|| PolicyError::PolicyFileParseFailed {
+                detail: format!("{loc}: `mode` must be a string"),
+            })?,
+    };
+    match mode {
+        "deny" | "approval" => {
+            if table.iter().any(|(key, _)| key != "mode") {
+                return Err(PolicyError::PolicyFileParseFailed {
+                    detail: format!("{loc}: mode `{mode}` accepts no key other than `mode`"),
+                });
+            }
+            Ok(if mode == "deny" {
+                UnlistedMode::Deny
+            } else {
+                UnlistedMode::Approval
+            })
+        }
+        "budget" => {
+            let per_tx_stroops = require_nonnegative_i128(table, "per_tx_stroops", &loc)?;
+            let per_period_stroops = require_nonnegative_i128(table, "per_period_stroops", &loc)?;
+            let window_str = require_str(table, "window", &loc)?;
+            let window =
+                Window::parse(&window_str).map_err(|_| PolicyError::PolicyFileParseFailed {
+                    detail: format!(
+                        "{loc}: `window` is not accepted; valid values: 1m, 5m, 1h, 1d, 1w"
+                    ),
+                })?;
+            let asset = match table.get("asset") {
+                None => "native".to_owned(),
+                Some(asset) => asset.as_str().map(ToOwned::to_owned).ok_or_else(|| {
+                    PolicyError::PolicyFileParseFailed {
+                        detail: format!("{loc}: `asset` must be a string"),
+                    }
+                })?,
+            };
+            Ok(UnlistedMode::Budget(UnlistedBudget::new(
+                asset,
+                per_tx_stroops,
+                per_period_stroops,
+                window,
+            )))
+        }
+        _ => Err(PolicyError::PolicyFileParseFailed {
+            detail: format!("{loc}: `mode` must be deny, approval, or budget"),
+        }),
+    }
+}
+
+/// Parses the `bindings` array of a `memo_binding` criterion at `loc`.
+///
+/// Requires 1 to 64 inline tables with distinct G-strkey destinations; the
+/// kind and value rules are those of [`MemoRequirement::parse`].
+fn parse_memo_bindings(
+    table: &toml_edit::InlineTable,
+    loc: &str,
+) -> Result<Vec<MemoBinding>, PolicyError> {
+    let array = table
+        .get("bindings")
+        .and_then(Value::as_array)
+        .ok_or_else(|| PolicyError::PolicyFileParseFailed {
+            detail: format!("{loc}: missing or non-array required field `bindings`"),
+        })?;
+    if array.is_empty() || array.len() > MAX_MEMO_BINDINGS {
+        return Err(PolicyError::PolicyFileParseFailed {
+            detail: format!("{loc}: `bindings` holds 1 to {MAX_MEMO_BINDINGS} bindings"),
+        });
+    }
+    let mut bindings: Vec<MemoBinding> = Vec::with_capacity(array.len());
+    for (idx, element) in array.iter().enumerate() {
+        let at = format!("{loc}.bindings[{idx}]");
+        let binding =
+            element
+                .as_inline_table()
+                .ok_or_else(|| PolicyError::PolicyFileParseFailed {
+                    detail: format!("{at}: must be an inline table"),
+                })?;
+        reject_unknown_keys(binding, MEMO_BINDING_KEYS, Some(&at), "a binding")?;
+        let destination = require_str(binding, "destination", &at)?;
+        let kind = require_str(binding, "kind", &at)?;
+        let value = match binding.get("value") {
+            None => None,
+            Some(value) => {
+                Some(
+                    value
+                        .as_str()
+                        .ok_or_else(|| PolicyError::PolicyFileParseFailed {
+                            detail: format!("{at}: `value` must be a string"),
+                        })?,
+                )
+            }
+        };
+        let requirement = MemoRequirement::parse(&kind, value).map_err(|detail| {
+            PolicyError::PolicyFileParseFailed {
+                detail: format!("{at}: {detail}"),
+            }
+        })?;
+        let parsed = MemoBinding::new(&destination, requirement).map_err(|detail| {
+            PolicyError::PolicyFileParseFailed {
+                detail: format!("{at}: {detail}"),
+            }
+        })?;
+        if bindings
+            .iter()
+            .any(|existing| existing.destination() == parsed.destination())
+        {
+            return Err(PolicyError::PolicyFileParseFailed {
+                detail: format!("{at}: `destination` repeats an earlier binding"),
+            });
+        }
+        bindings.push(parsed);
+    }
+    Ok(bindings)
 }
 
 /// The refusal of a criterion `kind` the loader does not support, at `loc`.
@@ -1328,7 +1640,7 @@ fn unknown_criterion_kind(loc: &str) -> PolicyError {
              bundle_aggregate_cap, restrict_bundle_to_recognised_kinds, \
              bundle_per_period_cap, bundle_per_tx_cap, bundle_rate_limit, \
              quorum_satisfied, home_domain_resolved, sep10_session_active, \
-             sep45_session_active"
+             sep45_session_active, total_budget, balance_floor, memo_binding"
         ),
     }
 }
@@ -1405,6 +1717,27 @@ fn require_i128(table: &toml_edit::InlineTable, key: &str, loc: &str) -> Result<
     Err(PolicyError::PolicyFileParseFailed {
         detail: format!("{loc}: missing or non-integer required field `{key}`"),
     })
+}
+
+/// Extracts a required nonnegative amount field, as [`require_i128`] reads
+/// it. Zero is accepted.
+///
+/// # Errors
+///
+/// Returns [`PolicyError::PolicyFileParseFailed`] when the field is absent,
+/// unparseable, or negative.
+fn require_nonnegative_i128(
+    table: &toml_edit::InlineTable,
+    key: &str,
+    loc: &str,
+) -> Result<i128, PolicyError> {
+    let value = require_i128(table, key, loc)?;
+    if value < 0 {
+        return Err(PolicyError::PolicyFileParseFailed {
+            detail: format!("{loc}: `{key}` must be non-negative"),
+        });
+    }
+    Ok(value)
 }
 
 /// Extracts a required boolean field from a criterion inline table.
@@ -1903,6 +2236,8 @@ mod tests {
             sep45_sessions: None,
             state_store: store,
             bundle: None,
+            policy_digest: [0; 32],
+            provisional: false,
         };
         doc.rules[0].criteria[0]
             .evaluate(&ctx)
@@ -3719,7 +4054,8 @@ decision = "deny"
     }
 
     /// Every key of every criterion key set loads in a valid criterion, so the
-    /// closed sets refuse no key the loader parses.
+    /// closed sets refuse no key the loader parses. A criterion or key of
+    /// version 2 loads in a version 2 document.
     #[test]
     fn every_key_of_each_criterion_key_set_loads() {
         let criteria = [
@@ -3730,7 +4066,9 @@ decision = "deny"
             r#"{ kind = "rate_limit", window = "1h", max_calls = 5 }"#,
             concat!(
                 r#"{ kind = "counterparty_allowlist", kinds = ["G_ACCOUNT"], "#,
-                r#"allowlist = ["GAAAA"], gate_inflows = true }"#,
+                r#"allowlist = ["GAAAA"], gate_inflows = true, unlisted = { mode = "budget", "#,
+                r#"per_tx_stroops = 10, per_period_stroops = 20, asset = "native", "#,
+                r#"window = "1d" } }"#,
             ),
             r#"{ kind = "minimum_reserve", margin_stroops = 0 }"#,
             r#"{ kind = "inner_invocation_count_cap", max_count = 3 }"#,
@@ -3746,6 +4084,13 @@ decision = "deny"
             r#"{ kind = "home_domain_resolved" }"#,
             r#"{ kind = "sep10_session_active" }"#,
             r#"{ kind = "sep45_session_active" }"#,
+            r#"{ kind = "total_budget", asset = "native", max_stroops = 100 }"#,
+            r#"{ kind = "balance_floor", min_stroops = 0 }"#,
+            concat!(
+                r#"{ kind = "memo_binding", bindings = [{ destination = ""#,
+                "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN",
+                r#"", kind = "id", value = "7" }] }"#,
+            ),
         ];
         assert_eq!(
             criteria.len(),
@@ -3764,7 +4109,20 @@ decision = "deny"
                 *keys,
                 "{kind}: the criterion must carry every key of its set"
             );
-            let loaded = load_signed_body_after(&body_with_criterion(criterion), |signed| signed);
+            let v2_only = matches!(
+                *kind,
+                "counterparty_allowlist" | "total_budget" | "balance_floor" | "memo_binding"
+            );
+            let body = if v2_only {
+                body_with_criterion(criterion).replacen(
+                    "version = 1\n",
+                    "version = 2\nsequence = 1\n",
+                    1,
+                )
+            } else {
+                body_with_criterion(criterion)
+            };
+            let loaded = load_signed_body_after(&body, |signed| signed);
             assert!(
                 loaded.is_ok(),
                 "{kind}: a criterion with every key must load: {:?}",
@@ -3923,7 +4281,7 @@ decision = "deny"
         for (kind, _) in crate::policy::v1::schema::CRITERION_KEY_SETS {
             let doc = DocumentMut::from_str(&format!("c = {{ kind = \"{kind}\" }}")).unwrap();
             if let Err(PolicyError::PolicyFileParseFailed { detail }) =
-                parse_criterion(&doc["c"], 0, 0)
+                parse_criterion(&doc["c"], 0, 0, 2)
             {
                 assert!(
                     !detail.contains("unknown criterion kind"),

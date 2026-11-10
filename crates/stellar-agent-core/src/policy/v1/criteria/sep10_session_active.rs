@@ -265,6 +265,8 @@ mod tests {
             sep45_sessions: None,
             state_store: &store,
             bundle: None,
+            policy_digest: [0; 32],
+            provisional: false,
         };
 
         let result = criterion.evaluate(&ctx);
@@ -309,6 +311,8 @@ mod tests {
             sep45_sessions: None,
             state_store: &store,
             bundle: None,
+            policy_digest: [0; 32],
+            provisional: false,
         };
 
         let result = criterion.evaluate(&ctx);
@@ -342,6 +346,8 @@ mod tests {
             sep45_sessions: None,
             state_store: &store,
             bundle: None,
+            policy_digest: [0; 32],
+            provisional: false,
         };
 
         let result = criterion.evaluate(&ctx);
@@ -388,6 +394,8 @@ mod tests {
             sep45_sessions: None,
             state_store: &store,
             bundle: None,
+            policy_digest: [0; 32],
+            provisional: false,
         };
 
         // Must pass because the view is active for the exact profile account.
@@ -418,6 +426,8 @@ mod tests {
             sep45_sessions: None,
             state_store: &store,
             bundle: None,
+            policy_digest: [0; 32],
+            provisional: false,
         };
 
         assert!(

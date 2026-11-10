@@ -134,6 +134,9 @@ impl Criterion for MinimumReserveCriterion {
     /// Returns `Ok(Some(DenyReason::UnsizableValueEffect))` first when the
     /// call's value cannot be sized.
     ///
+    /// Returns `Ok(None)` without reading the account when the evaluation is
+    /// provisional.
+    ///
     /// # Errors
     ///
     /// - [`PolicyError::CriterionEvaluationFailed`] when `ctx.account_view`
@@ -145,6 +148,11 @@ impl Criterion for MinimumReserveCriterion {
     ///   of the value descriptor carries no resolvable amount — an unresolvable
     ///   native debit refuses rather than passing as a zero debit.
     fn evaluate(&self, ctx: &EvalContext<'_>) -> Result<Option<DenyReason>, PolicyError> {
+        // A provisional evaluation reads no account; the strict evaluation
+        // before signing applies this check.
+        if ctx.provisional {
+            return Ok(None);
+        }
         if let ValueGate::Deny(reason) = classify_value(ctx) {
             return Ok(Some(reason));
         }
@@ -209,7 +217,7 @@ impl Criterion for MinimumReserveCriterion {
 
 /// The outcome of resolving the transaction's native debit for the reserve
 /// check.
-enum AmountOutcome {
+pub(super) enum AmountOutcome {
     /// The resolved native-XLM debit in stroops (0 for a genuinely value-less
     /// call; the reserve check still fires on the fee alone).
     ///
@@ -243,7 +251,7 @@ enum AmountOutcome {
 ///
 /// Returns [`PolicyError::CriterionEvaluationFailed`] when a native debit leg
 /// carries no resolvable amount.
-fn extract_amount_stroops(ctx: &EvalContext<'_>) -> Result<AmountOutcome, PolicyError> {
+pub(super) fn extract_amount_stroops(ctx: &EvalContext<'_>) -> Result<AmountOutcome, PolicyError> {
     let effects = match classify_value(ctx) {
         ValueGate::NotApplicable => return Ok(AmountOutcome::Debit(0)),
         ValueGate::Deny(reason) => return Ok(AmountOutcome::Deny(reason)),
@@ -275,7 +283,7 @@ fn extract_amount_stroops(ctx: &EvalContext<'_>) -> Result<AmountOutcome, Policy
 ///
 /// `decode_authoritative_args` and the CLI full-mode argument maps write this
 /// value as a JSON number. Arguments without it count the fee as 0.
-fn extract_total_fee_stroops(ctx: &EvalContext<'_>) -> i64 {
+pub(super) fn extract_total_fee_stroops(ctx: &EvalContext<'_>) -> i64 {
     ctx.args
         .get("total_fee_stroops")
         .and_then(serde_json::Value::as_i64)
@@ -358,6 +366,8 @@ mod tests {
             sep45_sessions: None,
             state_store: store,
             bundle: None,
+            policy_digest: [0; 32],
+            provisional: false,
         }
     }
 

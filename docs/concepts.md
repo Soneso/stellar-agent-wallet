@@ -172,6 +172,89 @@ every call.
 Reserve, identity, and counterparty-cache criteria receive external state
 through injected views; a missing required view refuses the call.
 
+A version 2 policy accepts four more restrictions: an `unlisted` table on
+`counterparty_allowlist`, `total_budget`, `balance_floor`, and `memo_binding`.
+A version 1 policy that uses one fails to load. A policy without them keeps
+its canonical bytes and its signature.
+
+The `unlisted` table decides a payment to a well-formed, verified recipient
+outside the criterion's own list:
+
+```toml
+criteria = [
+  { kind = "counterparty_allowlist", kinds = ["G_ACCOUNT"], allowlist = ["GA..."], unlisted = { mode = "budget", per_tx_stroops = 10_0000000, per_period_stroops = 50_0000000, window = "1d" } },
+  { kind = "per_tx_cap", asset = "native", max_stroops = 500_0000000 },
+]
+```
+
+`mode` is `deny`, `approval`, or `budget`, and an omitted mode denies.
+`deny` keeps the `policy.deny.counterparty_denied` refusal unchanged.
+`approval` requests approval at any amount, with the default approval lifetime
+and a reason that names no address.
+`budget` admits such payments up to `per_tx_stroops` per call and
+`per_period_stroops` per rolling `window`.
+Beyond either bound the call is refused with
+`policy.deny.unlisted_budget_exceeded`.
+`asset` sets the budget's asset and defaults to `native`. A debit in another
+asset keeps the counterparty refusal.
+`approval` and `budget` require `decision = "allow"`, and every other criterion
+of the rule still applies.
+`per_tx_stroops` must be below every `per_tx_cap` of the same asset in its rule.
+`per_period_stroops` must be below every `per_period_cap` of the same asset and
+window in its rule.
+Both bounds must be below every `total_budget` of the same asset in its rule.
+A policy carries at most one `unlisted` table.
+A missing destination, an unverified home domain, or an unsupported kind
+refuses in every mode. A muxed destination is checked by its base account.
+
+`total_budget` bounds the debits of one asset over the life of the signed
+policy:
+
+```toml
+criteria = [{ kind = "total_budget", asset = "native", max_stroops = 200_0000000 }]
+```
+
+The allocation never renews with time. Signing the policy again starts a new
+allocation at zero. An exhausted allocation refuses with
+`policy.deny.total_budget_exhausted`, which names the maximum and the
+remaining amount. The criterion requires `decision = "allow"`.
+A confirmed `smart-account multicall` bundle counts each of its transfers
+against the allocation and against an unlisted budget.
+Under either criterion, a bundle with a call the wallet does not recognize as
+a transfer refuses with `policy.deny.bundle_contains_generic_kind`.
+
+`balance_floor` refuses a call that would leave the operating account's native
+balance below an absolute floor:
+
+```toml
+criteria = [{ kind = "balance_floor", min_stroops = 2_0000000 }]
+```
+
+The check subtracts the native reservations of open authorizations, the
+native debit, and the fee from a live account read.
+A result below `min_stroops` refuses with `account.floor_refused`.
+A missing read refuses with `account.unread`, and a read older than 120 seconds
+refuses with `account.stale`. Any decision may carry the criterion.
+
+`memo_binding` requires the memo a destination expects, such as an exchange
+deposit's customer memo:
+
+```toml
+criteria = [
+  { kind = "memo_binding", bindings = [{ destination = "GA...", kind = "id", value = "123456" }] },
+]
+```
+
+A criterion carries 1 to 64 bindings with distinct `G...` destinations.
+`kind` is `text`, `id`, `hash`, `return`, or `any`.
+`value` is required for every kind except `any`, which refuses it.
+A text value holds at most 28 bytes; an id is a decimal without sign or
+leading zero; a hash or return value is 64 lowercase hex digits.
+A payment to a bound destination, or to a muxed address on it, needs a memo
+of that kind and value.
+Without one the call is refused with `policy.deny.memo_binding_mismatch`,
+which names the required kind only. Unbound and contract destinations pass.
+
 `approval_above` permits amounts at or below its threshold and requests
 approval above it. It uses `asset` and `max_stroops`, with the same units and
 asset matching as `per_tx_cap`. One XLM is 10,000,000 stroops.

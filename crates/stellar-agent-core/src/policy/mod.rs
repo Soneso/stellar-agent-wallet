@@ -809,6 +809,116 @@ pub enum DenyReason {
         /// found or has expired. Redacted at the MCP dispatch-gate boundary.
         contract_id: String,
     },
+
+    // ── Non-renewing total budget ──────────────────────────────────────
+    /// The call would exceed the total allocation of the signed policy.
+    ///
+    /// Wire code: `policy.deny.total_budget_exhausted`.
+    ///
+    /// Time never releases the allocation; only a re-signed policy starts
+    /// another. `remaining_stroops` is the allocation minus its use, floored
+    /// at zero.
+    TotalBudgetExhausted {
+        /// The configured asset identifier.
+        asset: String,
+        /// The total allocation, serialized as a decimal string.
+        #[serde(with = "crate::wire_stroops::i128")]
+        max_stroops: i128,
+        /// The allocation left before this call, serialized as a decimal string.
+        #[serde(with = "crate::wire_stroops::i128")]
+        remaining_stroops: i128,
+    },
+
+    // ── Unlisted-recipient budget ──────────────────────────────────────
+    /// A payment to an unlisted recipient exceeds one bound of the unlisted
+    /// budget.
+    ///
+    /// Wire code: `policy.deny.unlisted_budget_exceeded`. The payload names no
+    /// recipient.
+    UnlistedBudgetExceeded {
+        /// The configured budget asset identifier.
+        asset: String,
+        /// The bound the call exceeds.
+        bound: UnlistedBound,
+        /// The exceeded bound, serialized as a decimal string.
+        #[serde(with = "crate::wire_stroops::i128")]
+        max_stroops: i128,
+        /// The attempted debit total, serialized as a decimal string.
+        #[serde(with = "crate::wire_stroops::i128")]
+        attempted_stroops: i128,
+    },
+
+    // ── Memo binding ───────────────────────────────────────────────────
+    /// A payment to a bound destination lacks the memo its binding requires.
+    ///
+    /// Wire code: `policy.deny.memo_binding_mismatch`. The payload carries the
+    /// required memo kind only, never a destination or a memo value.
+    MemoBindingMismatch {
+        /// The required memo kind: `text`, `id`, `hash`, `return`, or `any`.
+        kind: String,
+    },
+
+    // ── Observed operating-account floor ───────────────────────────────
+    /// The call would leave the operating balance below the signed floor.
+    ///
+    /// Code and wire code: `account.floor_refused`, outside the
+    /// `policy.deny.` prefix because the refusal depends on an account read.
+    AccountFloorRefused {
+        /// The signed floor, serialized as a decimal string.
+        #[serde(with = "crate::wire_stroops::i128")]
+        min_stroops: i128,
+        /// The balance left after reservations, the debit, and the fee,
+        /// serialized as a decimal string.
+        #[serde(with = "crate::wire_stroops::i128")]
+        balance_after_stroops: i128,
+    },
+    /// The floor check has no account observation, reservation sum, or
+    /// balance.
+    ///
+    /// Code and wire code: `account.unread`.
+    AccountUnread,
+    /// The account observation is older than the floor admits.
+    ///
+    /// Code and wire code: `account.stale`.
+    AccountStale {
+        /// The observation age in milliseconds.
+        age_ms: u64,
+    },
+}
+
+/// The bound of an unlisted-recipient budget a call exceeds.
+///
+/// Serialized as `per_tx` or `per_period`.
+///
+/// # Examples
+///
+/// ```
+/// use stellar_agent_core::policy::UnlistedBound;
+///
+/// assert_eq!(UnlistedBound::PerTx.as_str(), "per_tx");
+/// assert_eq!(
+///     serde_json::to_string(&UnlistedBound::PerPeriod).unwrap(),
+///     "\"per_period\""
+/// );
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UnlistedBound {
+    /// The per-transaction bound.
+    PerTx,
+    /// The rolling-window bound.
+    PerPeriod,
+}
+
+impl UnlistedBound {
+    /// Returns the wire label, `per_tx` or `per_period`.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::PerTx => "per_tx",
+            Self::PerPeriod => "per_period",
+        }
+    }
 }
 
 impl DenyReason {
@@ -823,6 +933,11 @@ impl DenyReason {
     /// prepend the prefix here — see [`PolicyError::wire_code`] for the parallel
     /// method that returns the full prefixed wire code (load-time errors are not
     /// routed through `dispatch_gate`).
+    ///
+    /// The account refusals ([`Self::AccountFloorRefused`],
+    /// [`Self::AccountUnread`], [`Self::AccountStale`]) are the exception:
+    /// their code is the full `account.*` code, and [`Self::wire_code`]
+    /// returns it unchanged.
     ///
     /// # Examples
     ///
@@ -864,6 +979,12 @@ impl DenyReason {
             Self::HomeDomainNotResolved { .. } => "home_domain_not_resolved",
             Self::Sep10SessionMissing { .. } => "sep10.session_missing",
             Self::Sep45SessionMissing { .. } => "sep45.session_missing",
+            Self::TotalBudgetExhausted { .. } => "total_budget_exhausted",
+            Self::UnlistedBudgetExceeded { .. } => "unlisted_budget_exceeded",
+            Self::MemoBindingMismatch { .. } => "memo_binding_mismatch",
+            Self::AccountFloorRefused { .. } => "account.floor_refused",
+            Self::AccountUnread => "account.unread",
+            Self::AccountStale { .. } => "account.stale",
         }
     }
 
@@ -872,7 +993,8 @@ impl DenyReason {
     /// The same string `dispatch_gate` and the CLI's policy-evaluation
     /// helpers build from [`Self::code`], available as a `&'static str` to
     /// callers that carry a denial through a typed error whose own `code()`
-    /// returns `&'static str`.
+    /// returns `&'static str`. An account refusal returns its `account.*`
+    /// code without the prefix, equal to [`Self::code`].
     ///
     /// # Examples
     ///
@@ -919,6 +1041,12 @@ impl DenyReason {
             Self::HomeDomainNotResolved { .. } => "policy.deny.home_domain_not_resolved",
             Self::Sep10SessionMissing { .. } => "policy.deny.sep10.session_missing",
             Self::Sep45SessionMissing { .. } => "policy.deny.sep45.session_missing",
+            Self::TotalBudgetExhausted { .. } => "policy.deny.total_budget_exhausted",
+            Self::UnlistedBudgetExceeded { .. } => "policy.deny.unlisted_budget_exceeded",
+            Self::MemoBindingMismatch { .. } => "policy.deny.memo_binding_mismatch",
+            Self::AccountFloorRefused { .. } => "account.floor_refused",
+            Self::AccountUnread => "account.unread",
+            Self::AccountStale { .. } => "account.stale",
         }
     }
 }
@@ -1505,6 +1633,7 @@ pub trait PolicyEngine: Send + Sync {
         Ok(Evaluation {
             decision,
             value_effects: None,
+            provisional: false,
         })
     }
 
@@ -1544,7 +1673,50 @@ pub trait PolicyEngine: Send + Sync {
         Ok(Evaluation {
             decision,
             value_effects: None,
+            provisional: false,
         })
+    }
+
+    /// Evaluates a call that reads no account before its approval, deferring
+    /// the account-dependent criteria.
+    ///
+    /// Takes the arguments of [`Self::evaluate_with_value_full`]. An engine
+    /// that overrides it skips `minimum_reserve` and `balance_floor`, applies
+    /// every other criterion, and marks the result
+    /// [`Evaluation::provisional`]. The caller runs the strict evaluation with
+    /// a live account read before it signs, so a deferred refusal stays final.
+    ///
+    /// The default delegates to [`Self::evaluate_with_value_full`], so an
+    /// engine without the override evaluates strictly and returns
+    /// `provisional = false`.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::evaluate_with_value_full`].
+    #[allow(clippy::too_many_arguments)]
+    fn evaluate_provisional(
+        &self,
+        tool: &ToolDescriptor,
+        args: &serde_json::Value,
+        profile: &Profile,
+        value: crate::policy::v1::ValueClass,
+        account_view: Option<&dyn crate::policy::v1::AccountReservesView>,
+        identity_view: Option<&dyn crate::policy::v1::AccountIdentityView>,
+        counterparty_cache: Option<&dyn crate::policy::v1::CounterpartyCacheView>,
+        sep10_sessions: Option<&dyn crate::policy::v1::Sep10SessionView>,
+        sep45_sessions: Option<&dyn crate::policy::v1::Sep45SessionView>,
+    ) -> Result<Evaluation, PolicyError> {
+        self.evaluate_with_value_full(
+            tool,
+            args,
+            profile,
+            value,
+            account_view,
+            identity_view,
+            counterparty_cache,
+            sep10_sessions,
+            sep45_sessions,
+        )
     }
 
     /// Records a CONFIRMED call's contribution into the engine's persisted
@@ -1670,6 +1842,13 @@ pub struct Evaluation {
     pub decision: Decision,
     /// The sized value effects for an allowed or approval-required call, or `None`.
     pub value_effects: Option<crate::policy::v1::ValueEffects>,
+    /// Whether the decision deferred the account-dependent criteria.
+    ///
+    /// `true` only from an engine's override of
+    /// [`PolicyEngine::evaluate_provisional`]. A provisional decision never
+    /// authorizes signing: the caller re-evaluates strictly with a live
+    /// account read first.
+    pub provisional: bool,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2268,16 +2447,18 @@ mod tests {
         );
     }
 
-    /// Every `DenyReason` variant's full wire code is its `code()` under the
-    /// `policy.deny.` prefix, so a surface that reports a denial through a
+    /// Every policy `DenyReason` variant's full wire code is its `code()`
+    /// under the `policy.deny.` prefix, and every account variant's wire code
+    /// is its `code()` unprefixed, so a surface that reports a denial through a
     /// typed error names it exactly as the gate does.
     ///
     /// The list is the closed variant inventory: a new variant that is not
     /// added here leaves its `wire_code()` unchecked, so the list is what
     /// keeps the two tables from drifting apart.
     #[test]
-    fn deny_reason_wire_code_is_the_prefixed_code_for_every_variant() {
+    fn deny_reason_wire_codes_match_variant_namespaces() {
         let all = [
+            DenyReason::AssetNotAllowlisted,
             DenyReason::ApprovalAboveExceeded {
                 asset: "native".into(),
                 max_stroops: 1,
@@ -2349,11 +2530,31 @@ mod tests {
             DenyReason::Sep45SessionMissing {
                 contract_id: "CAAA".into(),
             },
+            DenyReason::TotalBudgetExhausted {
+                asset: "native".into(),
+                max_stroops: 1,
+                remaining_stroops: 0,
+            },
+            DenyReason::UnlistedBudgetExceeded {
+                asset: "native".into(),
+                bound: UnlistedBound::PerPeriod,
+                max_stroops: 1,
+                attempted_stroops: 2,
+            },
+            DenyReason::MemoBindingMismatch { kind: "id".into() },
+        ];
+        let account = [
+            DenyReason::AccountFloorRefused {
+                min_stroops: 1,
+                balance_after_stroops: 0,
+            },
+            DenyReason::AccountUnread,
+            DenyReason::AccountStale { age_ms: 120_001 },
         ];
 
         assert_eq!(
-            all.len(),
-            20,
+            all.len() + account.len(),
+            27,
             "the inventory must name every DenyReason variant"
         );
         for reason in &all {
@@ -2361,6 +2562,14 @@ mod tests {
                 reason.wire_code(),
                 format!("policy.deny.{}", reason.code()),
                 "wire_code must be the prefixed code for {reason:?}"
+            );
+        }
+        for reason in &account {
+            assert!(reason.code().starts_with("account."), "{reason:?}");
+            assert_eq!(
+                reason.wire_code(),
+                reason.code(),
+                "an account wire code is its code for {reason:?}"
             );
         }
     }

@@ -322,6 +322,12 @@ fn enumerate_deny_reason_for_test(v: &DenyReason) -> &'static str {
         DenyReason::HomeDomainNotResolved { .. } => "home_domain_not_resolved",
         DenyReason::Sep10SessionMissing { .. } => "sep10.session_missing",
         DenyReason::Sep45SessionMissing { .. } => "sep45.session_missing",
+        DenyReason::TotalBudgetExhausted { .. } => "total_budget_exhausted",
+        DenyReason::UnlistedBudgetExceeded { .. } => "unlisted_budget_exceeded",
+        DenyReason::MemoBindingMismatch { .. } => "memo_binding_mismatch",
+        DenyReason::AccountFloorRefused { .. } => "account.floor_refused",
+        DenyReason::AccountUnread => "account.unread",
+        DenyReason::AccountStale { .. } => "account.stale",
     }
 }
 
@@ -429,6 +435,24 @@ fn deny_reason_wire_codes_are_unique() {
         DenyReason::Sep45SessionMissing {
             contract_id: "CABC1".into(),
         },
+        DenyReason::TotalBudgetExhausted {
+            asset: "native".into(),
+            max_stroops: 10,
+            remaining_stroops: 0,
+        },
+        DenyReason::UnlistedBudgetExceeded {
+            asset: "native".into(),
+            bound: crate::policy::UnlistedBound::PerTx,
+            max_stroops: 10,
+            attempted_stroops: 11,
+        },
+        DenyReason::MemoBindingMismatch { kind: "id".into() },
+        DenyReason::AccountFloorRefused {
+            min_stroops: 10,
+            balance_after_stroops: 9,
+        },
+        DenyReason::AccountUnread,
+        DenyReason::AccountStale { age_ms: 120_001 },
     ];
 
     let mut codes: HashSet<&'static str> = HashSet::new();
@@ -460,7 +484,7 @@ fn deny_reason_wire_codes_are_unique() {
     // but forgets the corresponding entry in `variants`, this catches it.
     assert_eq!(
         variants.len(),
-        21,
+        27,
         "variants list count drifted from DenyReason variant count.  \
          Update enumerate_deny_reason_for_test, the variants vec, and this assertion."
     );

@@ -222,6 +222,18 @@ impl PerPeriodCapCriterion {
     pub fn max_stroops(&self) -> i128 {
         self.max_stroops
     }
+
+    /// Returns the configured asset identifier.
+    #[must_use]
+    pub fn asset(&self) -> &str {
+        &self.asset
+    }
+
+    /// Returns the rolling window.
+    #[must_use]
+    pub fn window(&self) -> Window {
+        self.window
+    }
 }
 
 impl Criterion for PerPeriodCapCriterion {
@@ -491,7 +503,7 @@ impl PerPeriodCapCriterion {
 ///
 /// Returns [`PolicyError::CriterionEvaluationFailed`] when `SystemTime::now()`
 /// is before the UNIX epoch (should not occur on any supported platform).
-fn system_time_to_ms() -> Result<u64, PolicyError> {
+pub(super) fn system_time_to_ms() -> Result<u64, PolicyError> {
     #[cfg(any(test, feature = "test-helpers"))]
     if let Some(now) = super::state_store::query_time_for_test() {
         return Ok(now);
@@ -567,6 +579,8 @@ mod tests {
             sep45_sessions: None,
             state_store: store,
             bundle: None,
+            policy_digest: [0; 32],
+            provisional: false,
         }
     }
 
@@ -867,6 +881,8 @@ mod tests {
             sep45_sessions: None,
             state_store: &store,
             bundle: Some(&view),
+            policy_digest: [0; 32],
+            provisional: false,
         };
         let result = criterion.evaluate(&ctx).unwrap();
         assert!(

@@ -111,6 +111,8 @@ mod tests {
                 sep45_sessions: None,
                 state_store: &store,
                 bundle: None,
+                policy_digest: [0; 32],
+                provisional: false,
             };
             if amount <= 100 {
                 assert_eq!(criterion.evaluate(&ctx).unwrap(), None);

@@ -11,6 +11,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `stellar_agent_core::approval::intent` defines the classic intent, its canonical bytes and digest, and its claim value leg; `stellar_agent_core::approval::IntentView` shows it.
 
+- Version 2 policies accept an `unlisted` table on `counterparty_allowlist`.
+  Its `approval` mode requests approval for a verified recipient outside the
+  list. Its `budget` mode admits such payments within a per-call and a
+  rolling-window bound and refuses beyond them with
+  `policy.deny.unlisted_budget_exceeded`. A policy carries at most one table.
+
+- The `total_budget` criterion bounds the debits of one asset over the life of
+  a signed policy and refuses with `policy.deny.total_budget_exhausted`. A
+  newly signed policy starts a new allocation. A confirmed multicall bundle
+  counts each transfer against the allocation and any unlisted budget. A
+  bundle with an unrecognized call refuses under either criterion.
+
+- The `balance_floor` criterion refuses a call that would leave the observed
+  native balance below a floor, with `account.floor_refused`, `account.unread`,
+  or `account.stale`.
+
+- The `memo_binding` criterion requires the bound memo on payments to up to 64
+  destinations and refuses with `policy.deny.memo_binding_mismatch`.
+
+- `PolicyEngine::evaluate_provisional` evaluates a call without its
+  account-dependent criteria and marks the result provisional.
+  `PolicyEngineV1::policy_digest` returns the digest of the verified policy.
+
 - Every classic prepare on MCP and the CLI verbs `pay`, `claim`, sponsored
   `accounts create`, and `trustline` check the endpoint's health, latest
   ledger, and close-time lag before reading the account they sign against. A
@@ -202,6 +225,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reviews.
 
 ### Changed
+
+- The mainnet minimum policy accepts approval rule lifetimes up to 86,400
+  seconds and requires a rate limit on non-deny trustline and claim rules.
+
+- A `counterparty_allowlist` with `G_ACCOUNT` checks a muxed destination by
+  its base account.
 
 - The CLI and MCP server share submission recording, reconciliation and
   transaction status logic; the wire output is unchanged.

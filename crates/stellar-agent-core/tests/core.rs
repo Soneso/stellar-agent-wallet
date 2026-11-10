@@ -6,10 +6,15 @@ mod audit_log_alpha9_signer_set_fixture;
 mod envelope_decode_authoritative_args;
 #[path = "core/panic_hook_message_bound.rs"]
 mod panic_hook_message_bound;
+#[path = "core/policy_compat_guards.rs"]
+mod policy_compat_guards;
 #[path = "core/policy_descriptor_equivalence.rs"]
 mod policy_descriptor_equivalence;
 #[path = "core/policy_fixtures_adversarial.rs"]
 mod policy_fixtures_adversarial;
+#[cfg(feature = "test-helpers")]
+#[path = "core/policy_grammar.rs"]
+mod policy_grammar;
 #[cfg(feature = "test-helpers")]
 #[path = "core/policy_v2.rs"]
 mod policy_v2;
