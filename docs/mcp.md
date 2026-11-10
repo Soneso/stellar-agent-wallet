@@ -839,7 +839,7 @@ terms.
 | `stellar_dex_quote` | On-chain Soroswap `router_get_amounts_out` quote for a token path. | Read-only. |
 
 The three DeFi signing tools accept an optional `secondary_rpc_url`. On testnet, it overrides the profile secondary; absent input uses that secondary.
-Signing requires a secondary endpoint on the same network and on a host other than the primary's. Without one the tools refuse with `smart_account.ledger_witness_unavailable`, and with `simulation.divergence.ledger_skew` when the two endpoints' latest ledgers differ by more than two.
+Signing requires a secondary endpoint on the same network and on a host other than the primary's. Without one the tools refuse with `smart_account.ledger_witness_unavailable`. Endpoint disagreement beyond two ledgers refuses with `simulation.divergence.ledger_skew`. The simulated ledger height must lie between the lower observation minus two and the higher observation plus two, inclusive. A height below this range permits one unsigned re-simulation against the same pair. A height above it, or a replacement outside it, refuses with `simulation.divergence.ledger_skew`. Recovery runs within the same pre-submit deadline.
 Credentialed input URLs are refused. On a mainnet profile the three tools refuse at entry with `network.mainnet_write_forbidden`, before this input, the lookups, and the gates.
 
 ### SEP-43 (wallet interface)

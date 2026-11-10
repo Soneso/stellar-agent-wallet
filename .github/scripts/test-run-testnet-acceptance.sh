@@ -163,6 +163,140 @@ expect_cargo() {
 }
 expect_cargo on mainnet-write,testnet-acceptance
 expect_cargo off testnet-acceptance
+# (f) Cargo and sleep stubs exercise attempts without network or waiting.
+cat > "$STUB/cargo" <<'STUB_EOF'
+#!/usr/bin/env bash
+root=$(dirname "$0")
+echo "$*" >> "$root/args"
+count=$(wc -l < "$root/args" | tr -d ' ')
+case "$STUB_MODE" in
+  build) echo 'error: could not compile fixture'; exit 101 ;;
+  zero) echo 'test result: ok. 0 passed; 0 failed; 0 ignored'; exit 0 ;;
+  retry) if [ "$count" -eq 1 ]; then echo 'test result: FAILED. 0 passed; 1 failed'; exit 101; fi ;;
+  browser) if [ "$count" -le 2 ]; then echo 'test result: FAILED. 0 passed; 1 failed'; exit 101; fi ;;
+  fail) echo 'test result: FAILED. 0 passed; 1 failed'; exit 101 ;;
+esac
+echo 'SKIP fixture prerequisite'
+echo 'test result: ok. 1 passed; 0 failed; 0 ignored'
+STUB_EOF
+cat > "$STUB/sleep" <<'STUB_EOF'
+#!/usr/bin/env bash
+echo "$*" >> "$(dirname "$0")/sleeps"
+STUB_EOF
+chmod +x "$STUB/sleep"
+run_main_with_stubs() {
+  local mode="$1"
+  local -a SUITES=("stellar-agent-cli testnet-acceptance claim_testnet_acceptance"
+                   "stellar-agent-approval-remote operator-enroll-browser-acceptance operator_enroll_browser_acceptance")
+  local -x PATH="$STUB:$PATH" STUB_MODE="$mode" GITHUB_STEP_SUMMARY="$STUB/summary"
+  local FILTER='' MAINNET_WRITE=off
+  if [ "$mode" = browser ]; then SUITES=("${SUITES[1]}"); fi
+  check_suite_completeness() { return 0; }
+  main
+}
+for mode in build zero retry browser fail pass; do
+  : > "$STUB/args"
+  : > "$STUB/sleeps"
+  : > "$STUB/summary"
+  out=$(run_main_with_stubs "$mode")
+  rc=$?
+  calls=$(wc -l < "$STUB/args" | tr -d ' ')
+  sleeps=$(tr '\n' ',' < "$STUB/sleeps")
+  case "$mode" in
+    build) want_rc=1; want_calls=2; want_sleeps='30,'; note='build or target error' ;;
+    zero) want_rc=1; want_calls=2; want_sleeps='30,'; note='vacuous: zero tests executed' ;;
+    retry) want_rc=0; want_calls=3; want_sleeps='60,30,'; note='pass (retry,' ;;
+    browser) want_rc=0; want_calls=3; want_sleeps='60,90,'; note='pass (retry 2,' ;;
+    fail) want_rc=1; want_calls=5; want_sleeps='60,30,60,90,'; note='FAIL' ;;
+    pass) want_rc=0; want_calls=2; want_sleeps='30,'; note='1 skip marker(s)' ;;
+  esac
+  if [ "$rc/$calls/$sleeps" = "$want_rc/$want_calls/$want_sleeps" ] \
+    && [[ "$out" == *"$note"* && "$out" == *'leg wall time:'* ]] \
+    && grep -q '| suite | result | seconds |' "$STUB/summary" \
+    && grep -q 'mainnet-write off' "$STUB/summary" \
+    && grep -q 'Leg wall time: [0-9]* s.' "$STUB/summary" \
+    && grep -qE ' [0-9]+ s' "$STUB/summary"; then
+    pass "(f) $mode attempts, pacing, cooldowns, continuation and summaries"
+  else
+    fail "(f) $mode: rc/calls/sleeps=$rc/$calls/$sleeps; output: $out"
+  fi
+done
+# (g) Run the real registry through every share and compare ordered targets.
+selection_case() {
+  local share="$1" filter="$2" want_rc="$3" index crate feature target expected='' actual out rc count=0
+  : > "$STUB/args"; : > "$STUB/sleeps"; : > "$STUB/summary"
+  for index in "${!SUITES[@]}"; do
+    read -r crate feature target <<< "${SUITES[$index]}"
+    if [ -n "$share" ] && [ "$((index % ${share#*/}))" -ne "$((${share%/*} - 1))" ]; then continue; fi
+    [[ "$crate/$target" == *"$filter"* ]] || continue
+    expected="${expected}${target} "
+    count=$((count + 1))
+  done
+  out=$(SHARE="$share" FILTER="$filter" MAINNET_WRITE=off STUB_MODE=pass \
+    PATH="$STUB:$PATH" GITHUB_STEP_SUMMARY="$STUB/summary" bash "$DRIVER" 2>&1)
+  rc=$?
+  actual=$(awk '{ for (i=1; i<=NF; i++) if ($i == "--test") printf "%s ", $(i+1) }' "$STUB/args")
+  if [ "$rc" -eq "$want_rc" ] && [ "$actual" = "$expected" ] \
+    && { [ "$rc" -ne 0 ] || { [[ "$out" == *"($count suites, share ${share:-all}, mainnet-write off)"* ]] \
+      && grep -q "($count suites, share ${share:-all}, mainnet-write off)" "$STUB/summary" \
+      && [ "$(grep -c '^| stellar-agent' "$STUB/summary")" -eq "$count" ]; }; }; then
+    pass "(g) share ${share:-all}, filter '$filter': $count ordered suites, exit $rc"
+  else
+    fail "(g) share $share filter '$filter': exit $rc, targets '$actual', expected '$expected'; $out"
+  fi
+}
+for denominator in 2 3; do
+  for ((numerator=1; numerator<=denominator; numerator++)); do
+    selection_case "$numerator/$denominator" '' 0
+    selection_case "$numerator/$denominator" "$NO_MATCH" 2
+  done
+done
+selection_case '' '' 0
+# The first registered target belongs only to share 1/2.
+read -r _ _ first_target <<< "${SUITES[0]}"
+selection_case '1/2' "$first_target" 0
+selection_case '2/2' "$first_target" 0
+for share in 0/2 3/2 1/0 a/b 1/2/3; do
+  : > "$STUB/args"
+  out=$(SHARE="$share" MAINNET_WRITE=off STUB_MODE=pass PATH="$STUB:$PATH" bash "$DRIVER" 2>&1)
+  rc=$?
+  if [ "$rc" -eq 2 ] && [ ! -s "$STUB/args" ] \
+    && [[ "$out" == "SHARE must be k/N with 1 <= k <= N, got '$share'" ]]; then
+    pass "(g) invalid share '$share' refuses before cargo"
+  else
+    fail "(g) invalid share '$share': exit $rc; $out"
+  fi
+done
+# Unset SHARE selects the full registry, including browser entries.
+# shellcheck source-path=SCRIPTDIR source=run-testnet-acceptance.sh
+if (unset SHARE; source "$DRIVER"; check_share && in_share 60); then
+  pass '(g) unset SHARE selects every entry'
+else
+  fail '(g) unset SHARE rejects a registered entry'
+fi
+# (h) Pin the chained jobs and their shared schedule and environment settings.
+if python3 - <<'CHECK_WORKFLOW'
+from pathlib import Path
+import re
+text = Path('.github/workflows/testnet.yml').read_text()
+assert re.search(r'^concurrency:\n  group: testnet-acceptance\n  cancel-in-progress: false$', text, re.M)
+jobs = re.findall(r'^  (acceptance-[12]):\n(.*?)(?=^  [a-z].*:\n|\Z)', text, re.M | re.S)
+assert [name for name, _ in jobs] == ['acceptance-1', 'acceptance-2']
+condition = "github.event_name != 'schedule' || vars.TESTNET_SCHEDULE != 'off'"
+for index, (_, body) in enumerate(jobs, 1):
+    assert f'          SHARE: {index}/2\n' in body
+    assert '    timeout-minutes: 360\n' in body
+    assert '          FILTER: ${{ inputs.filter }}\n' in body
+    assert "          MAINNET_WRITE: ${{ inputs.mainnet_write && 'on' || 'off' }}\n" in body
+    assert '          STELLAR_AGENT_TESTNET_SECONDARY_RPC_URL: ${{ vars.TESTNET_SECONDARY_RPC_URL }}\n' in body
+    assert 'Setup Chromium' in body and 'actions/setup-node@' in body
+assert f'    if: {condition}\n' in jobs[0][1]
+assert '    needs: acceptance-1\n' in jobs[1][1]
+assert '    if: ${{ !cancelled() && (' + condition + ') }}\n' in jobs[1][1]
+CHECK_WORKFLOW
+then pass '(h) shares, timeouts, chaining, schedule, concurrency and environments';
+else fail '(h) workflow structure'; fi
+rm -f "$STUB/sleep" "$STUB/sleeps" "$STUB/summary"
 rm -f "$STUB/cargo" "$STUB/args"
 rmdir "$STUB"
 

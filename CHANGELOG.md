@@ -200,6 +200,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   request (the `export_archive` input), for the keychain measurement.
 - Maintainer pages describe the keychain measurement and the mainnet release
   reviews.
+- The testnet acceptance driver selects a share of the suite registry
+  (`SHARE=k/N`: every N-th suite from position k, in registry order) and
+  refuses a malformed share before the first build. The `Testnet acceptance`
+  workflow runs the suites in two chained jobs, one share each, within
+  GitHub's six-hour job limit.
 
 ### Changed
 
@@ -816,6 +821,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `friendbot_funding_request` in the test-support testnet helpers returns
   `FriendbotRequestError`. Its `DeadlineElapsed` variant reports a deadline
   that expires before the first attempt, so no request starts.
+- A timelocked smart-account submission checks the simulation response after
+  the ledger witness, as the ordinary submission does. An erroring simulation
+  with an unreachable secondary RPC refuses with
+  `smart_account.ledger_witness_unavailable`, and one simulated above the
+  witnessed pair refuses with `simulation.divergence.ledger_skew`.
 
 ### Removed
 
@@ -877,6 +887,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Smart account signing checks both endpoints before it reads either ledger
   height. It reads the pair again when it is stale or disagrees, within the
   pre submit deadline. The two ledger tolerance and the expiry bound stay.
+- A smart-account submission whose simulation ran more than two ledgers below
+  the witnessed ledger pair re-simulates once, unsigned, on the same primary
+  RPC within the same pre-submit deadline. Only a replacement outside the
+  pair's range refuses with `simulation.divergence.ledger_skew`; a simulation
+  above the range refuses without a re-simulation.
 
 ### Security
 

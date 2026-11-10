@@ -590,17 +590,17 @@ impl Default for ResolvedFeePerOp {
 
 /// Return value from [`submit_signed_invoke`].
 ///
-/// Wraps the on-chain return `ScVal` from the submitted `InvokeHostFunction`
-/// operation and the confirmed-ledger / transaction-hash metadata from
+/// Wraps the predicted return `ScVal` from the accepted unsigned simulation
+/// and the confirmed-ledger / transaction-hash metadata from
 /// [`stellar_agent_network::submit::SubmissionResult`].
 ///
 /// Exposes the confirmed transaction hash, ledger, and predicted return value
-/// to callers.  The return value comes from the first `simulateTransaction`
-/// response; Soroban-RPC does not deliver a fresh post-confirmation `ScVal`.
+/// to callers. The accepted simulation supplies the prediction, including after
+/// recovery. Soroban-RPC does not deliver a fresh post-confirmation `ScVal`.
 #[derive(Debug)]
 pub struct SubmitInvokeResult {
-    /// The predicted return value from the first `simulateTransaction`
-    /// response for this `InvokeHostFunction`.
+    /// The predicted return value from the accepted unsigned simulation,
+    /// including its replacement after height recovery.
     ///
     /// Soroban-RPC submit/confirm does not return a fresh post-confirmation
     /// `ScVal`; callers use this value as the operation return payload after
@@ -1100,25 +1100,12 @@ pub async fn submit_signed_invoke(
     let primary_rpc_client = StellarRpcClient::new(args.primary_rpc_url)
         .map_err(|e| auth_payload_err(format!("StellarRpcClient construction failed: {e}")))?;
 
-    // Pre-submit deadline: a single absolute instant, armed once here, binds
-    // the collective wall-clock budget of the pre-submit stages: for the
-    // checked rules, the rule-lock wait (stage "rule_lock"), each baseline
-    // read ("baseline_read"), each pinned-hash drift check ("pin_check") and
-    // each signer-set comparison ("signer_set_compare"); then the FIVE
-    // unconditional stages this path always runs: the initial account fetch,
-    // the initial simulate, the ledger witness, and the re-fetch + re-simulate
-    // inside `resimulate_with_signed_auth` (see `PreSubmitBudget` /
-    // `bound_pre_submit_stage`). They share this SAME deadline rather than
-    // each re-arming a fresh `args.timeout` window, so the witness a signature
-    // rests on and the signed re-simulation answer to one freshness rule. The
-    // optional intervening
-    // checks (the rule-expiry check and the multicall cross-RPC verification,
-    // including its secondary-RPC simulate) are NOT bounded by this deadline:
-    // they run after it is armed and carry their own budgets. Every
-    // authorization signature, the envelope signature, the submission's steps
-    // before `sendTransaction` and the start of every send attempt, a resend
-    // included, answer to this deadline; an attempt in flight and the
-    // confirmation poll keep their own, separate `args.timeout` budget.
+    // One absolute deadline bounds rule checks, initial account and simulation
+    // reads, the ledger witness, optional unsigned recovery, signed re-simulation,
+    // every signature and all steps before each send attempt.
+    // Recovery consumes the remaining budget and keeps the same witness pair.
+    // Rule-expiry and multicall cross-RPC checks carry their own budgets.
+    // An in-flight send and confirmation polling use their separate timeout.
     let pre_submit_budget = PreSubmitBudget {
         deadline: tokio::time::Instant::now() + args.timeout,
         total: args.timeout,
@@ -1185,7 +1172,7 @@ pub async fn submit_signed_invoke(
     let sim_envelope = tx_for_simulate
         .to_envelope()
         .map_err(|e| auth_payload_err(format!("to_envelope failed: {e:?}")))?;
-    let sim_response = bound_pre_submit_stage(
+    let mut sim_response = bound_pre_submit_stage(
         pre_submit_budget,
         "simulate_initial",
         "auth_payload",
@@ -1206,6 +1193,22 @@ pub async fn submit_signed_invoke(
         budget: pre_submit_budget,
     };
     let simulation_witness = witness_signing_ledger(&witness_request).await?;
+    // A lagging simulation gets one unsigned retry against the same pair.
+    // All response validation below consumes the accepted response in full.
+    validate_latest_ledger(sim_response.latest_ledger)?;
+    if simulation_witness.is_behind(sim_response.latest_ledger) {
+        sim_response = bound_pre_submit_stage(
+            pre_submit_budget,
+            "simulate_recovery",
+            "auth_payload",
+            server.simulate_transaction_envelope(&sim_envelope, None),
+        )
+        .await?
+        .map_err(|e| auth_payload_err(format!("simulate_transaction_envelope failed: {e}")))?;
+        validate_latest_ledger(sim_response.latest_ledger)?;
+    }
+    simulation_witness.check_simulation_height(sim_response.latest_ledger)?;
+
     enforce_rule_ledger_checks(
         &args,
         &target_contract_scaddr,
@@ -1397,10 +1400,8 @@ pub async fn submit_signed_invoke(
     // (placeholder). Overwrite with the witnessed bound before signing.
     // Cross-reference: js-stellar-base auth.js:132.
     //
-    // The simulation's own height never reaches the preimage, and it must not
-    // contradict the observations taken right after it.
-    validate_latest_ledger(sim_response.latest_ledger)?;
-    simulation_witness.check_simulation_height(sim_response.latest_ledger)?;
+    // The accepted simulation satisfies the same observation pair, including
+    // after recovery. Its own height never reaches the preimage.
 
     // ── Signer keys: read before the last witness check ──────────────────────
     // A key lookup can reach a hardware device or a keyring and take any time.
@@ -3985,6 +3986,9 @@ mod tests {
         use crate::managers::auth_entry::{network_id_of, soroban_authorization_preimage};
         use crate::managers::authorization::{AuthorizationInfo, Combinator, SignerGroup};
         use crate::multicall::MULTICALL_WASM_SHA256;
+        use crate::signing::recovery_test_fixtures::{
+            REPLACEMENT_VALUE, RecoveryCase, recovery_response,
+        };
 
         const SEED: [u8; 32] = [0x61; 32];
         const WALLET: [u8; 32] = [0x62; 32];
@@ -4274,6 +4278,18 @@ mod tests {
             signer: &RecordingSigner,
             admission: stellar_agent_network::SigningAdmission<'_>,
         ) -> Outcome {
+            submit_with_options(path, primary, secondary, horizon, signer, admission, None).await
+        }
+
+        async fn submit_with_options(
+            path: SigningPath,
+            primary: &AuthTreeEndpoint,
+            secondary: Option<&str>,
+            horizon: Option<HorizonCheck>,
+            signer: &RecordingSigner,
+            admission: stellar_agent_network::SigningAdmission<'_>,
+            expected_return: Option<super::super::ExpectedReturn>,
+        ) -> Outcome {
             let target = wallet_strkey();
             let rule_ids = path.rule_ids();
             let declared = [nested_call()];
@@ -4310,6 +4326,7 @@ mod tests {
                     .required_checks(required_checks)
                     .maybe_multicall_check(multicall_check)
                     .maybe_horizon_check(horizon)
+                    .maybe_expected_return(expected_return)
                     .build(),
             )
             .await;
@@ -4772,6 +4789,147 @@ mod tests {
             }
         }
 
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn simulation_recovery_uses_one_retry_and_the_same_pair() {
+            stellar_agent_test_support::keyring_mock::install().unwrap();
+            for case in [
+                RecoveryCase::Valid,
+                RecoveryCase::Behind,
+                RecoveryCase::ReplacementAhead,
+                RecoveryCase::Ahead,
+            ] {
+                let primary = endpoint(LEDGER)
+                    .simulation_response(move |n, response| {
+                        recovery_response(case, n, response);
+                    })
+                    .start()
+                    .await;
+                let secondary = endpoint(LEDGER).start().await;
+                let outcome = submit_with(
+                    SigningPath::Single,
+                    &primary,
+                    Some(&second_loopback_host(&secondary.uri())),
+                    None,
+                )
+                .await;
+                if case == RecoveryCase::Valid {
+                    outcome.assert_every_signature_expires_at(
+                        LEDGER + 100,
+                        &SigningPath::Single.rule_ids(),
+                        &format!("{case:?}"),
+                    );
+                    assert_eq!(
+                        outcome.result.as_ref().unwrap().return_val,
+                        stellar_xdr::ScVal::U32(REPLACEMENT_VALUE)
+                    );
+                    let TransactionEnvelope::Tx(tx) = &outcome.sent[0] else {
+                        panic!("v1")
+                    };
+                    let OperationBody::InvokeHostFunction(op) = &tx.tx.operations[0].body else {
+                        panic!("invoke")
+                    };
+                    let SorobanCredentials::Address(creds) = &op.auth[0].credentials else {
+                        panic!("address")
+                    };
+                    assert_eq!(
+                        creds.nonce,
+                        i64::from(REPLACEMENT_VALUE),
+                        "replacement nonce reaches signing"
+                    );
+                } else {
+                    outcome.assert_refused(SKEW_CODE, &format!("{case:?}"));
+                }
+                assert_eq!(
+                    primary.simulations() - primary.signed_simulations(),
+                    if case == RecoveryCase::Ahead { 1 } else { 2 }
+                );
+                assert_eq!(primary.ledger_reads(), 1, "recovery keeps the pair");
+                assert_eq!(secondary.ledger_reads(), 1, "recovery keeps the pair");
+            }
+        }
+
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn simulation_recovery_keeps_the_absolute_deadline() {
+            stellar_agent_test_support::keyring_mock::install().unwrap();
+            let primary = endpoint(LEDGER)
+                .simulation_response(|n, response| {
+                    recovery_response(RecoveryCase::Valid, n, response);
+                })
+                .slow_simulations(1..3, Duration::from_secs(3))
+                .start()
+                .await;
+            let secondary = endpoint(LEDGER).start().await;
+            let outcome = submit_with(
+                SigningPath::Single,
+                &primary,
+                Some(&second_loopback_host(&secondary.uri())),
+                None,
+            )
+            .await;
+            assert_deadline_refusal(&outcome, "simulate_recovery");
+            outcome.assert_refused("sa.auth_entry_construction_failed", "recovery deadline");
+            assert_eq!(primary.simulations(), 2);
+        }
+
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn simulation_recovery_revalidates_the_whole_response() {
+            stellar_agent_test_support::keyring_mock::install().unwrap();
+            for case in [
+                RecoveryCase::Tree,
+                RecoveryCase::Credential,
+                RecoveryCase::Error,
+                RecoveryCase::Fee,
+                RecoveryCase::Data,
+                RecoveryCase::Decode,
+                RecoveryCase::Empty,
+                RecoveryCase::Cross,
+                RecoveryCase::Count,
+                RecoveryCase::Prediction,
+            ] {
+                let primary = endpoint(LEDGER)
+                    .simulation_response(move |n, response| {
+                        recovery_response(case, n, response);
+                    })
+                    .start()
+                    .await;
+                let secondary = endpoint(LEDGER)
+                    .simulation_response(move |_, response| {
+                        if case == RecoveryCase::Count {
+                            recovery_response(case, 2, response);
+                        }
+                    })
+                    .start()
+                    .await;
+                let path = if matches!(case, RecoveryCase::Cross | RecoveryCase::Count) {
+                    SigningPath::Multicall
+                } else {
+                    SigningPath::Single
+                };
+                let outcome = submit_with_options(
+                    path,
+                    &primary,
+                    Some(&second_loopback_host(&secondary.uri())),
+                    None,
+                    &RecordingSigner::new(),
+                    stellar_agent_network::SigningAdmission::NoValue(
+                        crate::signing::intent_test_helpers::no_value_admission(),
+                    ),
+                    Some(super::super::ExpectedReturn::U32),
+                )
+                .await;
+                let code = match case {
+                    RecoveryCase::Tree => "simulation.divergence.auth_contexts",
+                    RecoveryCase::Cross | RecoveryCase::Count => "sa.multicall_failed",
+                    _ => "sa.deployment_failed",
+                };
+                outcome.assert_refused(code, &format!("{case:?}"));
+                assert_eq!(primary.simulations(), 2, "{case:?}");
+            }
+        }
+
         /// A simulation that answers from a height the primary's own
         /// observation contradicts is not a base for a signature.
         #[tokio::test]
@@ -4792,14 +4950,21 @@ mod tests {
             stellar_agent_test_support::keyring_mock::install().unwrap();
             for simulated in [LEDGER - 2, LEDGER + 2] {
                 let path = SigningPath::Single;
-                let primary = endpoint(LEDGER).simulated_ledger(simulated);
-                submit_pair(path, primary, endpoint(LEDGER), None)
-                    .await
-                    .assert_every_signature_expires_at(
-                        LEDGER + 100,
-                        &path.rule_ids(),
-                        "a simulation within the tolerance",
-                    );
+                let primary = endpoint(LEDGER).simulated_ledger(simulated).start().await;
+                let secondary = endpoint(LEDGER).start().await;
+                submit_with(
+                    path,
+                    &primary,
+                    Some(&second_loopback_host(&secondary.uri())),
+                    None,
+                )
+                .await
+                .assert_every_signature_expires_at(
+                    LEDGER + 100,
+                    &path.rule_ids(),
+                    "a simulation within the tolerance",
+                );
+                assert_eq!(primary.simulations() - primary.signed_simulations(), 1);
             }
         }
 

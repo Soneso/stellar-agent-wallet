@@ -108,7 +108,7 @@ use stellar_agent_network::{
 /// across the timelock call sites.
 #[derive(Debug)]
 pub(crate) struct TimelockSubmitResult {
-    /// Predicted return `ScVal` from the first `simulateTransaction` response.
+    /// Predicted return `ScVal` from the accepted unsigned simulation, including recovery.
     pub(crate) return_val: ScVal,
     /// Confirmed transaction hash (64-character hex string).
     pub(crate) tx_hash: String,
@@ -378,7 +378,7 @@ pub(crate) async fn submit_timelock_invoke_with_g_key_auth(
             format!("{}: to_envelope failed: {e:?}", args.op_label),
         )
     })?;
-    let sim_response = server
+    let mut sim_response = server
         .simulate_transaction_envelope(&sim_envelope, None)
         .await
         .map_err(|e| {
@@ -391,48 +391,51 @@ pub(crate) async fn submit_timelock_invoke_with_g_key_auth(
             )
         })?;
 
-    if let Some(err) = &sim_response.error {
-        return Err(SaError::DeploymentFailed {
-            phase: "simulate",
-            redacted_reason: format!(
-                "{} simulation returned error: {}",
-                args.op_label,
-                SimulationErrorClass::of(err)
-            ),
-        });
-    }
-    if sim_response.min_resource_fee == 0 || sim_response.transaction_data.is_empty() {
-        return Err(SaError::DeploymentFailed {
-            phase: "simulate",
-            redacted_reason: format!(
-                "{}: simulate returned no min_resource_fee / transaction_data",
-                args.op_label
-            ),
-        });
-    }
+    let decode_simulation = |sim_response: &stellar_rpc_client::SimulateTransactionResponse| {
+        if let Some(err) = &sim_response.error {
+            return Err(SaError::DeploymentFailed {
+                phase: "simulate",
+                redacted_reason: format!(
+                    "{} simulation returned error: {}",
+                    args.op_label,
+                    SimulationErrorClass::of(err)
+                ),
+            });
+        }
+        if sim_response.min_resource_fee == 0 || sim_response.transaction_data.is_empty() {
+            return Err(SaError::DeploymentFailed {
+                phase: "simulate",
+                redacted_reason: format!(
+                    "{}: simulate returned no min_resource_fee / transaction_data",
+                    args.op_label
+                ),
+            });
+        }
 
-    let sim_first_result = sim_response
-        .results()
-        .map_err(|e| SaError::DeploymentFailed {
-            phase: "simulate",
-            redacted_reason: format!("{}: simulate results decode failed: {e}", args.op_label),
-        })?
-        .into_iter()
-        .next()
-        .ok_or_else(|| SaError::DeploymentFailed {
-            phase: "simulate",
-            redacted_reason: format!("{}: simulate returned no result entry", args.op_label),
-        })?;
-    let return_val = sim_first_result.xdr;
-    check_schedule_prediction(args.schedule_identity, &return_val)?;
-    let auth_entries = sim_first_result.auth;
+        let sim_first_result = sim_response
+            .results()
+            .map_err(|e| SaError::DeploymentFailed {
+                phase: "simulate",
+                redacted_reason: format!("{}: simulate results decode failed: {e}", args.op_label),
+            })?
+            .into_iter()
+            .next()
+            .ok_or_else(|| SaError::DeploymentFailed {
+                phase: "simulate",
+                redacted_reason: format!("{}: simulate returned no result entry", args.op_label),
+            })?;
+        let return_val = sim_first_result.xdr;
+        check_schedule_prediction(args.schedule_identity, &return_val)?;
+        Ok((return_val, sim_first_result.auth))
+    };
+    // The deadline starts after the initial response is decoded;
+    // recovery replaces the decoded result.
+    let mut decoded_simulation = decode_simulation(&sim_response);
 
-    // The primary answered the simulation, so its height decides nothing on
-    // its own: both endpoints observe the latest ledger before any credential
-    // is processed, and the expiry derives from the pair the first signature
-    // rests on. The witness, the source-account re-fetches, the signed
-    // re-simulation, every signature and the steps before `sendTransaction`
-    // answer to this one deadline.
+    // One absolute deadline starts after initial response validation.
+    // The witness, optional unsigned recovery, account re-fetches, signed
+    // re-simulation, signatures and pre-send steps share its remaining budget.
+    // Recovery uses this deadline and the same observation pair.
     let pre_submit_budget = PreSubmitBudget {
         deadline: tokio::time::Instant::now() + args.timeout,
         total: args.timeout,
@@ -445,7 +448,26 @@ pub(crate) async fn submit_timelock_invoke_with_g_key_auth(
     };
     let simulation_witness = witness_signing_ledger(&witness_request).await?;
     validate_latest_ledger(sim_response.latest_ledger)?;
+    if simulation_witness.is_behind(sim_response.latest_ledger) {
+        sim_response = bound_pre_submit_stage(
+            pre_submit_budget,
+            "simulate_recovery",
+            "auth_payload",
+            server.simulate_transaction_envelope(&sim_envelope, None),
+        )
+        .await?
+        .map_err(|e| {
+            auth_err(
+                "auth_payload",
+                format!("simulate_transaction_envelope failed: {e}"),
+            )
+        })?;
+        validate_latest_ledger(sim_response.latest_ledger)?;
+        decoded_simulation = decode_simulation(&sim_response);
+    }
+
     simulation_witness.check_simulation_height(sim_response.latest_ledger)?;
+    let (return_val, auth_entries) = decoded_simulation?;
     let network_id: [u8; 32] = Sha256::digest(args.network_passphrase.as_bytes()).into();
 
     // ── Step 4: Sign auth entries for the signer G-key ────────────────────────
@@ -972,9 +994,8 @@ fn set_envelope_max_ledger(
 /// The pair the first signature of a timelock call rests on.
 ///
 /// `bound` stands while it is fresh. A stale pair is read again as a pair,
-/// under the same deadline; the simulation height was checked against the
-/// pair read right after the simulation, and the expiry derives from the pair
-/// returned here. The pair must then be fresh and the deadline open.
+/// under the same deadline. The accepted simulation and its optional recovery
+/// satisfy the initial pair. Expiry derives from the fresh pair returned here.
 ///
 /// # Errors
 ///
@@ -1199,6 +1220,7 @@ mod tests {
         use super::super::{TimelockSubmitArgs, submit_timelock_invoke_with_g_key_auth};
         use crate::SaError;
         use crate::error::SimulationDivergenceSubCode;
+        use crate::signing::recovery_test_fixtures::{RecoveryCase, recovery_response};
 
         const SEED: [u8; 32] = [0x51; 32];
 
@@ -1281,6 +1303,9 @@ mod tests {
             passphrase: &'static str,
             ledger: u32,
             simulated_ledger: Option<u32>,
+            recovery_case: Option<RecoveryCase>,
+            recovery_delay: Option<std::time::Duration>,
+            witness_delay: Option<std::time::Duration>,
             malformed_ledger: bool,
             /// How long an account read after the signed re-simulation, the
             /// final fetch before the envelope is built, takes to answer.
@@ -1307,6 +1332,9 @@ mod tests {
                     passphrase: stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE,
                     ledger,
                     simulated_ledger: None,
+                    recovery_case: None,
+                    recovery_delay: None,
+                    witness_delay: None,
                     malformed_ledger: false,
                     final_fetch_delay: None,
                     resimulation_delay: None,
@@ -1341,6 +1369,7 @@ mod tests {
                         json!({"id": "ab".repeat(32), "sequence": "not-a-ledger", "protocolVersion": 27})
                     }
                     "getLatestLedger" => {
+                        delay = self.chain.witness_delay;
                         let reads = self.ledger_reads.fetch_add(1, Ordering::SeqCst);
                         let ledger = match self.chain.ledger_after_reads {
                             Some((after, later)) if reads >= after => later,
@@ -1435,7 +1464,7 @@ mod tests {
                                 .extend(op.auth.iter().cloned());
                             op.auth.to_vec()
                         };
-                        json!({
+                        let mut response = json!({
                             "latestLedger": self.chain.simulated_ledger.unwrap_or(ledger),
                             "minResourceFee": if self.chain.overflowing_final_fee && self.simulations.load(Ordering::SeqCst) >= 2 { "4294967296" } else { "1000" },
                             "transactionData": SorobanTransactionData::default()
@@ -1448,7 +1477,15 @@ mod tests {
                                     .collect::<Vec<_>>(),
                                 "xdr": value.to_xdr_base64(Limits::none()).unwrap(),
                             }],
-                        })
+                        });
+                        let number = self.simulations.load(Ordering::SeqCst);
+                        if let Some(case) = self.chain.recovery_case {
+                            recovery_response(case, number, &mut response);
+                            if number == 2 {
+                                delay = self.chain.recovery_delay;
+                            }
+                        }
+                        response
                     }
                     "sendTransaction" => {
                         let TransactionEnvelope::Tx(tx) = TransactionEnvelope::from_xdr_base64(
@@ -2247,6 +2284,7 @@ mod tests {
             };
             use super::{Chain, Rpc, SEED, assert_signed_at, leaf, schedule};
             use crate::SaError;
+            use crate::signing::recovery_test_fixtures::{REPLACEMENT_VALUE, RecoveryCase};
             use crate::timelock::{
                 TimelockCancelArgs, TimelockExecuteArgs, TimelockOperationId, TimelockScheduleArgs,
                 cancel, execute, schedule_upgrade,
@@ -2260,6 +2298,8 @@ mod tests {
             /// A mocked endpoint and the entries signed through it.
             struct Endpoint {
                 server: MockServer,
+                schedule_identity: bool,
+                simulations: Arc<AtomicUsize>,
                 ledger_reads: Arc<AtomicUsize>,
                 resimulated: Arc<Mutex<Vec<stellar_xdr::SorobanAuthorizationEntry>>>,
             }
@@ -2275,12 +2315,13 @@ mod tests {
                 ) -> Self {
                     let server = MockServer::start().await;
                     let ledger_reads = Arc::new(AtomicUsize::new(0));
+                    let simulations = Arc::new(AtomicUsize::new(0));
                     let resimulated = Arc::new(Mutex::new(Vec::new()));
                     Mock::given(method("POST"))
                         .respond_with(Rpc {
                             trees: Arc::new(|invoke| vec![leaf(invoke.clone())]),
                             entries,
-                            simulations: Arc::default(),
+                            simulations: Arc::clone(&simulations),
                             ledger_reads: Arc::clone(&ledger_reads),
                             resimulated: Arc::clone(&resimulated),
                             chain,
@@ -2288,7 +2329,9 @@ mod tests {
                         .mount(&server)
                         .await;
                     Self {
+                        schedule_identity: chain.recovery_case == Some(RecoveryCase::Schedule),
                         server,
+                        simulations,
                         ledger_reads,
                         resimulated,
                     }
@@ -2342,6 +2385,7 @@ mod tests {
                     }
                     assert_eq!(self.signs, 0, "{case}: nothing is signed");
                     assert!(self.resimulated.is_empty(), "{case}: nothing re-simulated");
+                    assert!(self.sent.is_none(), "{case}: nothing is sent");
                 }
             }
 
@@ -2365,8 +2409,11 @@ mod tests {
                 timeout: Duration,
             ) -> Outcome {
                 let (_dir, admission) = super::super::no_value_fixture();
+                let timelock = stellar_strkey::Contract([0x52; 32]).to_string().to_string();
                 let result = submit_timelock_invoke_with_g_key_auth(TimelockSubmitArgs {
-                    schedule_identity: None,
+                    schedule_identity: primary
+                        .schedule_identity
+                        .then_some((timelock.as_str(), [7; 32])),
                     host_function: HostFunction::InvokeContract(schedule()),
                     signer,
                     primary_rpc_url: &primary.uri(),
@@ -3065,6 +3112,120 @@ mod tests {
                     submit_at(primary, secondary)
                         .await
                         .assert_refused(SKEW_CODE, &format!("({primary}, {secondary})"));
+                }
+            }
+
+            #[tokio::test]
+            #[serial_test::serial]
+            async fn simulation_recovery_uses_one_retry_and_the_same_pair() {
+                for case in [
+                    RecoveryCase::Valid,
+                    RecoveryCase::Behind,
+                    RecoveryCase::ReplacementAhead,
+                    RecoveryCase::Ahead,
+                ] {
+                    let primary = Endpoint::start(Chain {
+                        recovery_case: Some(case),
+                        ..Chain::at(LEDGER)
+                    })
+                    .await;
+                    let secondary = Endpoint::start(Chain::at(LEDGER)).await;
+                    let outcome = submit(&primary, &secondary.witness_uri()).await;
+                    if case == RecoveryCase::Valid {
+                        assert_eq!(
+                            outcome.result.as_ref().unwrap().return_val,
+                            ScVal::U32(REPLACEMENT_VALUE)
+                        );
+                        let stellar_xdr::SorobanCredentials::Address(creds) =
+                            &outcome.resimulated[0].credentials
+                        else {
+                            panic!("address")
+                        };
+                        assert_eq!(
+                            creds.nonce,
+                            i64::from(REPLACEMENT_VALUE),
+                            "replacement nonce reaches signing"
+                        );
+                        assert_eq!(creds.signature_expiration_ledger, LEDGER + 100);
+                        assert_eq!(outcome.signs, 2);
+                        assert_eq!(primary.sends().await, 1);
+                    } else {
+                        outcome.assert_refused(SKEW_CODE, &format!("{case:?}"));
+                        assert_eq!(primary.sends().await, 0);
+                    }
+                    let unsigned = primary.simulations.load(Ordering::SeqCst)
+                        - usize::from(!outcome.resimulated.is_empty());
+                    assert_eq!(unsigned, if case == RecoveryCase::Ahead { 1 } else { 2 });
+                    assert_eq!(primary.ledger_reads(), 1, "recovery keeps the pair");
+                    assert_eq!(secondary.ledger_reads(), 1, "recovery keeps the pair");
+                }
+            }
+
+            #[tokio::test]
+            #[serial_test::serial]
+            async fn simulation_recovery_keeps_the_absolute_deadline() {
+                let primary = Endpoint::start(Chain {
+                    recovery_case: Some(RecoveryCase::Valid),
+                    witness_delay: Some(Duration::from_secs(3)),
+                    recovery_delay: Some(Duration::from_secs(3)),
+                    ..Chain::at(LEDGER)
+                })
+                .await;
+                let secondary = Endpoint::start(Chain::at(LEDGER)).await;
+                let outcome = submit(&primary, &secondary.witness_uri()).await;
+                assert_deadline_refusal(&outcome, "simulate_recovery");
+                outcome.assert_refused("sa.auth_entry_construction_failed", "recovery deadline");
+                assert_eq!(primary.sends().await, 0);
+                assert_eq!(primary.simulations.load(Ordering::SeqCst), 2);
+            }
+
+            #[tokio::test]
+            #[serial_test::serial]
+            async fn simulation_recovery_revalidates_the_whole_response() {
+                for case in [
+                    RecoveryCase::Tree,
+                    RecoveryCase::Credential,
+                    RecoveryCase::Error,
+                    RecoveryCase::Fee,
+                    RecoveryCase::Data,
+                    RecoveryCase::Decode,
+                    RecoveryCase::Empty,
+                    RecoveryCase::Schedule,
+                ] {
+                    let primary = Endpoint::start(Chain {
+                        recovery_case: Some(case),
+                        ..Chain::at(LEDGER)
+                    })
+                    .await;
+                    let secondary = Endpoint::start(Chain::at(LEDGER)).await;
+                    let outcome = submit(&primary, &secondary.witness_uri()).await;
+                    let code = match case {
+                        RecoveryCase::Tree => "simulation.divergence.auth_contexts",
+                        RecoveryCase::Credential => "sa.auth_entry_construction_failed",
+                        RecoveryCase::Schedule => "submission.intent_binding_mismatch",
+                        _ => "sa.deployment_failed",
+                    };
+                    outcome.assert_refused(code, &format!("{case:?}"));
+                    assert_eq!(primary.sends().await, 0);
+                    assert_eq!(primary.simulations.load(Ordering::SeqCst), 2);
+                }
+            }
+
+            #[tokio::test]
+            #[serial_test::serial]
+            async fn a_simulated_height_within_the_tolerance_of_the_pair_signs() {
+                for simulated in [LEDGER - 2, LEDGER + 2] {
+                    let primary = Endpoint::start(Chain {
+                        simulated_ledger: Some(simulated),
+                        ..Chain::at(LEDGER)
+                    })
+                    .await;
+                    let secondary = Endpoint::start(Chain::at(LEDGER)).await;
+                    let outcome = submit(&primary, &secondary.witness_uri()).await;
+                    assert!(outcome.result.is_ok(), "{:?}", outcome.result);
+                    assert_eq!(outcome.signs, 2);
+                    assert_eq!(primary.simulations.load(Ordering::SeqCst), 2);
+                    assert_eq!(primary.sends().await, 1);
                 }
             }
 

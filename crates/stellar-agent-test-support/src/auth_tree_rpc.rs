@@ -58,6 +58,9 @@ pub type TreeFn = dyn Fn(&InvokeContractArgs) -> Option<SorobanAuthorizedInvocat
 /// Builds the simulated return value for a host function.
 pub type ReturnFn = dyn Fn(&InvokeContractArgs) -> ScVal + Send + Sync;
 
+/// Edits a simulation response by its one-based request number.
+pub type SimulationResponseFn = dyn Fn(usize, &mut Value) + Send + Sync;
+
 /// Configuration of a mocked endpoint; [`Self::start`] mounts it.
 pub struct AuthTreeRpc {
     passphrase: String,
@@ -68,6 +71,7 @@ pub struct AuthTreeRpc {
     returns: Arc<ReturnFn>,
     latest_ledger: u32,
     simulated_ledger: Option<u32>,
+    simulation_response: Option<Arc<SimulationResponseFn>>,
     malformed_latest_ledger: bool,
     ledger_after_simulation: Option<(usize, u32)>,
     slow_simulations: Option<(Range<usize>, Duration)>,
@@ -89,6 +93,7 @@ impl AuthTreeRpc {
             returns: Arc::new(|_| ScVal::Void),
             latest_ledger: LATEST_LEDGER,
             simulated_ledger: None,
+            simulation_response: None,
             malformed_latest_ledger: false,
             ledger_after_simulation: None,
             slow_simulations: None,
@@ -108,6 +113,16 @@ impl AuthTreeRpc {
     #[must_use]
     pub fn simulated_ledger(mut self, simulated_ledger: u32) -> Self {
         self.simulated_ledger = Some(simulated_ledger);
+        self
+    }
+
+    /// Edits each simulation response before the endpoint returns it.
+    #[must_use]
+    pub fn simulation_response(
+        mut self,
+        edit: impl Fn(usize, &mut Value) + Send + Sync + 'static,
+    ) -> Self {
+        self.simulation_response = Some(Arc::new(edit));
         self
     }
 
@@ -212,6 +227,7 @@ impl AuthTreeRpc {
 /// What the mocked endpoint observed.
 #[derive(Default)]
 struct Record {
+    ledger_reads: AtomicUsize,
     simulations: AtomicUsize,
     signed_simulations: AtomicUsize,
     sent: Mutex<Vec<String>>,
@@ -228,6 +244,12 @@ impl AuthTreeEndpoint {
     #[must_use]
     pub fn uri(&self) -> String {
         self.server.uri()
+    }
+
+    /// The number of latest-ledger observations requested.
+    #[must_use]
+    pub fn ledger_reads(&self) -> usize {
+        self.record.ledger_reads.load(Ordering::SeqCst)
     }
 
     /// The number of `simulateTransaction` requests answered.
@@ -340,6 +362,7 @@ impl Respond for Responder {
 impl Responder {
     /// The height `getLatestLedger` reports at this point of the exchange.
     fn reported_latest_ledger(&self) -> u32 {
+        self.record.ledger_reads.fetch_add(1, Ordering::SeqCst);
         match self.config.ledger_after_simulation {
             Some((simulations, ledger))
                 if self.record.simulations.load(Ordering::SeqCst) >= simulations =>
@@ -400,7 +423,7 @@ impl Responder {
 
     /// Answers a simulation of the envelope's one `InvokeContract` operation.
     fn simulate(&self, body: &Value) -> Value {
-        self.record.simulations.fetch_add(1, Ordering::SeqCst);
+        let number = self.record.simulations.fetch_add(1, Ordering::SeqCst) + 1;
         let latest_ledger = self
             .config
             .simulated_ledger
@@ -433,7 +456,7 @@ impl Responder {
             .iter()
             .filter_map(|entry| entry.to_xdr_base64(Limits::none()).ok())
             .collect();
-        json!({
+        let mut response = json!({
             "transactionData": minimal_transaction_data(),
             "minResourceFee": "1000",
             "results": [{
@@ -443,7 +466,11 @@ impl Responder {
                     .unwrap_or_default()
             }],
             "latestLedger": latest_ledger
-        })
+        });
+        if let Some(edit) = &self.config.simulation_response {
+            edit(number, &mut response);
+        }
+        response
     }
 }
 

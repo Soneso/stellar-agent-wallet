@@ -1587,7 +1587,8 @@ impl PreSubmitBudget {
 /// the rule-lock acquisition, the signer-set baseline read of each checked
 /// rule, the pinned-hash drift check of each checked rule, the signer-set
 /// comparison of each checked rule, the initial fetch, the initial simulate,
-/// each authorization signature (see [`sign_within_budget`]), the re-fetch,
+/// the unsigned recovery simulate, each authorization signature (see
+/// [`sign_within_budget`]), the re-fetch,
 /// the re-simulate and the envelope signature. Time spent in an earlier
 /// stage shrinks the budget left for a later one. A stage can
 /// therefore elapse because earlier stages consumed the collective budget,
