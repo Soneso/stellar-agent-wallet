@@ -139,6 +139,7 @@ self-test:test-preflight.sh	bash .github/scripts/test-preflight.sh	-	install-sur
 self-test:test-publish-crates-check.sh	.github/scripts/test-publish-crates-check.sh	cargo	ci.yml	release-contracts	Self-test the publish tier check
 self-test:test-publish-crates-verify.sh	bash .github/scripts/test-publish-crates-verify.sh	cargo	ci.yml	release-contracts	Self-test the publish verification
 self-test:test-rebuild-vendored-wasm.sh	bash .github/scripts/test-rebuild-vendored-wasm.sh	shasum	vendored-wasm.yml	check	Self-test (bash 5, GNU tools)
+self-test:test-run-testnet-acceptance.sh	bash .github/scripts/test-run-testnet-acceptance.sh	-	ci.yml	release-contracts	Self-test the testnet acceptance driver
 self-test:test-sync-labels.py	python3 .github/scripts/test-sync-labels.py	yaml	ci.yml	release-contracts	Check the workflow structure and the label sync
 self-test:test-take-workflow.py	python3 .github/scripts/test-take-workflow.py	yaml,jq	ci.yml	release-contracts	Check the workflow structure and the label sync
 self-test:test-triage-workflow.py	python3 .github/scripts/test-triage-workflow.py	yaml,jq	ci.yml	release-contracts	Check the workflow structure and the label sync
@@ -337,6 +338,7 @@ select_self_tests() {
       select_gate self-test:test-publish-crates-verify.sh
       ;;
     .github/scripts/rebuild-vendored-wasm.sh) select_gate self-test:test-rebuild-vendored-wasm.sh ;;
+    .github/scripts/run-testnet-acceptance.sh) select_gate self-test:test-run-testnet-acceptance.sh ;;
     .github/scripts/sync-labels.py | .github/labels.yml | .github/workflows/labels.yml)
       select_gate self-test:test-sync-labels.py
       ;;
