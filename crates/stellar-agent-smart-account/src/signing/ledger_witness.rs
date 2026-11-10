@@ -142,20 +142,24 @@ impl WitnessedLedgerBound {
         self.capability.is_stale(now)
     }
 
+    /// Whether the height falls below the pair's lower bound minus the tolerance.
+    pub(crate) fn is_behind(&self, height: u32) -> bool {
+        height < self.lower().saturating_sub(MAX_SIGNING_LEDGER_SKEW)
+    }
+
     /// Requires the height the simulation ran at to lie within the skew
     /// tolerance of the pair.
     ///
-    /// The simulation answers from the primary, so a height outside that
-    /// range means the primary contradicts its own observation. Called with
-    /// the bound acquired right after the simulation.
+    /// The initial response and its optional unsigned replacement use the
+    /// same pair. Only an operational height below the lower bound minus the
+    /// tolerance permits one unsigned re-simulation; a height above the range refuses.
     ///
     /// # Errors
     ///
     /// [`SaError::LedgerWitnessMismatch`] when the height lies outside.
     pub(crate) fn check_simulation_height(&self, simulated: u32) -> Result<(), SaError> {
-        let floor = self.lower().saturating_sub(MAX_SIGNING_LEDGER_SKEW);
         let ceiling = self.higher().saturating_add(MAX_SIGNING_LEDGER_SKEW);
-        if (floor..=ceiling).contains(&simulated) {
+        if !self.is_behind(simulated) && simulated <= ceiling {
             Ok(())
         } else {
             Err(mismatch(reason::SIMULATED_HEIGHT))
@@ -472,15 +476,34 @@ mod tests {
 
     #[test]
     fn a_simulated_height_is_checked_against_the_range_of_the_pair() {
-        let bound = pair(1000, 1002).unwrap();
-        for inside in [998, 1000, 1002, 1004] {
-            bound.check_simulation_height(inside).unwrap();
+        for (primary, secondary) in [
+            (1000, 1002),
+            (1002, 1000),
+            (1, 1),
+            (u32::MAX - 1_000_100, u32::MAX - 1_000_100),
+        ] {
+            let bound = pair(primary, secondary).unwrap();
+            let lower = primary.min(secondary).saturating_sub(2);
+            let upper = primary.max(secondary).saturating_add(2);
+            for inside in lower..=upper {
+                bound.check_simulation_height(inside).unwrap();
+            }
+            for outside in [
+                lower.checked_sub(1),
+                Some(upper + 1),
+                Some(u32::MAX),
+                Some(1_000_000),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                let error = bound.check_simulation_height(outside).unwrap_err();
+                assert_eq!(error.wire_code(), "simulation.divergence.ledger_skew");
+                assert_eq!(reason_of(&error), reason::SIMULATED_HEIGHT);
+            }
         }
-        for outside in [997, 1005, 1_000_000] {
-            let error = bound.check_simulation_height(outside).unwrap_err();
-            assert_eq!(error.wire_code(), "simulation.divergence.ledger_skew");
-            assert_eq!(reason_of(&error), reason::SIMULATED_HEIGHT);
-        }
+        assert!(pair(0, 0).is_err());
+        assert!(pair(u32::MAX, u32::MAX).is_err());
     }
 
     #[test]

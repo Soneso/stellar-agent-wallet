@@ -14,6 +14,8 @@
 # would otherwise report a vacuous pass.
 #
 # Environment:
+#   SHARE           k/N selects registry indices i where i % N == k - 1.
+#                   Unset or empty selects all entries; FILTER applies within it.
 #   FILTER          only run suites whose "<crate>/<target>" contains this
 #                   substring (empty runs everything)
 #   STELLAR_AGENT_KEYRING_BACKEND
@@ -65,6 +67,7 @@ PACE="${PACE:-30}"
 RETRY_COOLDOWN="${RETRY_COOLDOWN:-60}"
 BROWSER_RETRY_COOLDOWN="${BROWSER_RETRY_COOLDOWN:-90}"
 FILTER="${FILTER:-}"
+SHARE="${SHARE:-}"
 # Unset means off; a value set to the empty string is refused like any other
 # value that is not on or off.
 MAINNET_WRITE="${MAINNET_WRITE-off}"
@@ -117,7 +120,7 @@ check_suite_completeness() {
   while IFS= read -r f; do
     local target
     target="$(basename "$f" .rs)"
-    if ! printf '%s\n' "${SUITES[@]}" | grep -q " ${target}$"; then
+    if ! printf '%s\n' "${SUITES[@]}" | grep " ${target}$" > /dev/null; then
       echo "ERROR: ${f} is not listed in SUITES; add it, or rename it away from the *testnet* and *_browser_acceptance patterns if it is not a live suite" >&2
       missing=1
     fi
@@ -218,6 +221,32 @@ SUITES=(
   "stellar-agent-approval-remote testnet-acceptance rule_proposal_remote_browser_testnet_acceptance"
 )
 
+# Validate decimal shares before any build. Length comparisons avoid overflow.
+check_share() {
+  [ -z "$SHARE" ] && return 0
+  if [[ "$SHARE" =~ ^[1-9][0-9]*/[1-9][0-9]*$ ]]; then
+    SHARE_K=${SHARE%/*}
+    SHARE_N=${SHARE#*/}
+    if [ "${#SHARE_K}" -lt "${#SHARE_N}" ] \
+      || { [ "${#SHARE_K}" -eq "${#SHARE_N}" ] && [[ "$SHARE_K" < "$SHARE_N" || "$SHARE_K" = "$SHARE_N" ]]; }; then
+      return 0
+    fi
+  fi
+  echo "SHARE must be k/N with 1 <= k <= N, got '$SHARE'" >&2
+  return 2
+}
+
+# Selection keeps registry order. A denominator beyond the registry selects at most one.
+in_share() {
+  [ -z "$SHARE" ] && return 0
+  local count=${#SUITES[@]}
+  if [ "${#SHARE_N}" -gt "${#count}" ] || [ "$SHARE_N" -gt "$count" ]; then
+    [ "$(( $1 + 1 ))" = "$SHARE_K" ]
+  else
+    [ "$(( $1 % SHARE_N ))" -eq "$(( SHARE_K - 1 ))" ]
+  fi
+}
+
 # Runs one suite; prints the cargo output as it streams. Returns 0 on a real
 # pass (at least one test executed), 1 on test failure, 2 on a vacuous pass
 # (the binary ran zero tests, which means the feature gating is broken), 3 on
@@ -281,7 +310,18 @@ format_result() {
 main() {
   local line crate feature target suite rc attempts suite_seconds outcome notes result leg_start leg_seconds i
   check_mainnet_write || exit 2
+  check_share || exit 2
   check_suite_completeness || exit 3
+
+  local matched=0 index
+  for line in "${SUITES[@]}"; do
+    read -r crate feature target <<< "$line"
+    if [[ "$crate/$target" == *"$FILTER"* ]]; then matched=1; fi
+  done
+  if [ "$matched" -eq 0 ]; then
+    echo "error: no suite matched FILTER='$FILTER'" >&2
+    exit 2
+  fi
 
   report_status=()
   report_suite=()
@@ -289,9 +329,11 @@ main() {
   failures=0
   ran=0
   leg_start=$SECONDS
-  echo "testnet acceptance: mainnet-write ${MAINNET_WRITE}"
+  echo "testnet acceptance: share ${SHARE:-all}, mainnet-write ${MAINNET_WRITE}"
 
-  for line in "${SUITES[@]}"; do
+  for index in "${!SUITES[@]}"; do
+    in_share "$index" || continue
+    line=${SUITES[$index]}
     read -r crate feature target <<< "$line"
     suite="$crate/$target"
     if [ -n "$FILTER" ] && [[ "$suite" != *"$FILTER"* ]]; then
@@ -357,14 +399,10 @@ ${BROWSER_RETRY_COOLDOWN}s cooldown"
     report_seconds+=("$suite_seconds")
   done
 
-  if [ "$ran" -eq 0 ]; then
-    echo "error: no suite matched FILTER='$FILTER'" >&2
-    exit 2
-  fi
   leg_seconds=$((SECONDS - leg_start))
 
   echo ""
-  echo "==== testnet acceptance summary ($ran suites, mainnet-write ${MAINNET_WRITE}) ===="
+  echo "==== testnet acceptance summary ($ran suites, share ${SHARE:-all}, mainnet-write ${MAINNET_WRITE}) ===="
   for i in "${!report_suite[@]}"; do
     printf '%-90s %s\n' "${report_suite[$i]}" "${report_status[$i]}"
   done
@@ -372,7 +410,7 @@ ${BROWSER_RETRY_COOLDOWN}s cooldown"
 
   if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
     {
-      echo "## Testnet acceptance ($ran suites, mainnet-write ${MAINNET_WRITE})"
+      echo "## Testnet acceptance ($ran suites, share ${SHARE:-all}, mainnet-write ${MAINNET_WRITE})"
       echo ""
       echo "| suite | result | seconds |"
       echo "| --- | --- | --- |"

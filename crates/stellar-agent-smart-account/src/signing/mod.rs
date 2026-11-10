@@ -7,6 +7,9 @@
 pub mod divergence;
 pub mod ledger_witness;
 
+#[cfg(test)]
+pub(crate) mod recovery_test_fixtures;
+
 pub mod gate;
 
 /// Checked admission fixtures for signing tests.

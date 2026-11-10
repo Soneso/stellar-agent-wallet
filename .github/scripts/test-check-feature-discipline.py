@@ -752,17 +752,51 @@ def testnet_inventory(m, tmp, driver, manifests=('a', 'b')):
         (tmp / 'crates' / crate).mkdir(parents=True, exist_ok=True)
         features = 'mainnet-write = []\n' if crate == 'a' else 'other = []\n'
         (tmp / 'crates' / crate / 'Cargo.toml').write_text('[features]\n' + features)
-    workflow = {'testnet.yml': {'jobs': {'acceptance': {'runs-on': 'ubuntu-24.04', 'steps': [
-        {'name': 'suites', 'run': 'bash ' + m.TESTNET_DRIVER}]}}}}
+    workflow = {'testnet.yml': {'jobs': {f'acceptance-{k}': {'runs-on': 'ubuntu-24.04',
+        'env': {'SHARE': f'{k}/2'}, 'steps': [{'name': 'suites', 'run': 'bash ' + m.TESTNET_DRIVER}]}
+        for k in (1, 2)}}}
     return m.inventory(tmp, workflow, {m.TESTNET_DRIVER: driver})
 
 
 @unit('testnet-driver-features')
 def case_testnet_driver_features(m, tmp, checker):
     rows = testnet_inventory(m, tmp, testnet_driver(m))
-    found = sorted((row['selection'][1], row['features'][-1], row['relied_on']) for row in rows)
-    assert found == [('a', 'mainnet-write,testnet-acceptance', 'on'), ('a', 'testnet-acceptance', 'off'),
-                     ('b', 'testnet-integration', 'off')], f'testnet-driver-features: {found}'
+    found = sorted((row['job'], row['selection'][1], row['features'][-1], row['relied_on']) for row in rows)
+    assert found == [('acceptance-1', 'a', 'mainnet-write,testnet-acceptance', 'on'),
+                     ('acceptance-1', 'a', 'testnet-acceptance', 'off'),
+                     ('acceptance-2', 'b', 'testnet-integration', 'off')], f'testnet-driver-features: {found}'
+
+
+@unit('testnet-driver-partitions')
+def case_testnet_driver_partitions(m, tmp, checker):
+    source = (ROOT / m.TESTNET_DRIVER).read_text()
+    full = list(m.testnet_suite_entries(source))
+    assert len(full) == 61
+    assert list(m.testnet_suite_entries(source, '')) == full
+    for denominator in (2, 3):
+        shares = [list(m.testnet_suite_entries(source, f'{k}/{denominator}'))
+                  for k in range(1, denominator + 1)]
+        assert sum(map(len, shares)) == 61
+        for index, share in enumerate(shares):
+            assert share == full[index::denominator], 'partition omits, duplicates or reorders a suite'
+    for share in ('0/2', '3/2', '1/0', 'a/b', '1/2/3'):
+        try:
+            list(m.testnet_suite_entries(source, share))
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'invalid share accepted: {share}')
+    workflows = {'testnet.yml': {'jobs': {f'acceptance-{k}': {
+        'runs-on': 'ubuntu-24.04', 'env': {'SHARE': f'{k}/2'},
+        'steps': [{'name': 'Run testnet acceptance suites', 'run': 'bash ' + m.TESTNET_DRIVER}]}
+        for k in (1, 2)}}}
+    rows = m.inventory(ROOT, workflows, {m.TESTNET_DRIVER: source})
+    reviewed = [row for row in m.INVOCATIONS if row['workflow'] == 'testnet.yml']
+    assert sorted(map(str, rows)) == sorted(map(str, reviewed)), 'reviewed share inventory differs'
+    for index in (1, 2):
+        targets = {re.search(r'--test "([^" ]+)"', row['command'])[1]
+                   for row in rows if row['job'] == f'acceptance-{index}'}
+        assert targets == {entry['target'] for entry in full[index - 1::2]}
 
 
 @unit('testnet-driver-reviewed-text')
@@ -795,7 +829,7 @@ def case_testnet_driver_activation(m, tmp, checker):
     root = live_root('D9', tmp / 'testnet-driver-activation')
     workflows, scripts = m.workflow_inputs(root)
     accepts(bare_checker(m, root, workflows, scripts), 'D9', 'testnet-driver-activation')
-    replace(root, '.github/workflows/testnet.yml', '  acceptance:\n', '  nightly:\n')
+    replace(root, '.github/workflows/testnet.yml', '  acceptance-1:\n', '  nightly:\n')
     workflows, scripts = m.workflow_inputs(root)
     c = bare_checker(m, root, workflows, scripts)
     c.D9()
@@ -1954,9 +1988,9 @@ MUTATIONS = {
         'if not manifest.is_file():', 'if False:',
         'testnet-driver-reviewed-text: missing manifest: FileNotFoundError'),
     'D9-testnet-allowance': ('testnet-driver-activation',
-        "TESTNET_ACTIVATION_ALLOWANCE = (('testnet.yml', 'acceptance', TESTNET_DRIVER),)",
+        "TESTNET_ACTIVATION_ALLOWANCE = tuple(\n    ('testnet.yml', job, TESTNET_DRIVER) for job in ('acceptance-1', 'acceptance-2'))",
         'TESTNET_ACTIVATION_ALLOWANCE = ()',
-        'testnet-driver-activation: accepted form rejected: [\'D9: testnet.yml:acceptance:'),
+        'testnet-driver-activation: accepted form rejected: [\'D9: testnet.yml:acceptance-1:'),
     'D9-testnet-detection': ('testnet-driver-activation',
         'if path.as_posix() == TESTNET_DRIVER:', 'if False:',
         'testnet-driver-activation: nightly fixture accepted or wrong failure: []'),

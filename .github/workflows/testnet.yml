@@ -42,8 +42,8 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  acceptance:
-    name: testnet acceptance (serialized)
+  acceptance-1:
+    name: testnet acceptance (share 1/2)
     runs-on: ubuntu-24.04
     timeout-minutes: 360
     # Setting the repository variable TESTNET_SCHEDULE to "off" disables the
@@ -106,6 +106,82 @@ jobs:
       # scheduled run has no inputs and builds with mainnet-write off.
       - name: Run testnet acceptance suites
         env:
+          SHARE: 1/2
+          FILTER: ${{ inputs.filter }}
+          MAINNET_WRITE: ${{ inputs.mainnet_write && 'on' || 'off' }}
+          STELLAR_AGENT_TESTNET_SECONDARY_RPC_URL: ${{ vars.TESTNET_SECONDARY_RPC_URL }}
+        run: |
+          dbus-run-session -- bash -c '
+            gnome-keyring-daemon --components=secrets --daemonize --unlock <<< "ci-headless-keyring-password"
+            exec .github/scripts/run-testnet-acceptance.sh
+          '
+
+  acceptance-2:
+    needs: acceptance-1
+    name: testnet acceptance (share 2/2)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    # Setting the repository variable TESTNET_SCHEDULE to "off" disables the
+    # weekly run without a commit; manual dispatch always runs.
+    if: ${{ !cancelled() && (github.event_name != 'schedule' || vars.TESTNET_SCHEDULE != 'off') }}
+    env:
+      CARGO_PROFILE_TEST_DEBUG: "0"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # The smart-account dependency closure plus every compiled test binary is
+      # large; reclaim space the build does not need.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force >/dev/null 2>&1 || true
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+      # stellar-ledger pulls hidapi, which links libudev on Linux for HID device
+      # enumeration. The runner ships pkg-config but not the libudev headers.
+      - name: Install libudev (Linux hidapi)
+        run: sudo apt-get update && sudo apt-get install -y libudev-dev pkg-config
+      # The WebAuthn suite launches a headless Chromium for the CDP
+      # virtual-authenticator ceremony (with --no-sandbox, so no userns
+      # provisioning is needed on the runner). Explicit major-version tag (not
+      # "stable") so the binary is deterministic across runs. Re-pin trigger:
+      # Chromium stable major-version bump. Current pin: Chrome 150 (stable as
+      # of 2026-07-02).
+      - name: Setup Chromium (WebAuthn suite)
+        uses: browser-actions/setup-chrome@48ad923757ca74d66703209fe939badbdf80f2f4 # v2.2.0
+        with:
+          chrome-version: 150
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          # The testnet feature set builds a different dependency graph from
+          # the offline jobs; keep it in its own cache.
+          prefix-key: testnet
+      # pay_policy_v1_testnet_acceptance (stellar-agent-cli) registers the
+      # platform keyring store before its policy gate and requires a
+      # functioning Secret Service; the runner has no login session or
+      # keyring by default. gnome-keyring provides the Secret Service
+      # implementation; dbus provides `dbus-run-session`, which brackets the
+      # whole driver invocation in a private D-Bus session bus so the keyring
+      # daemon and every `cargo test` / `stellar-agent` child process it
+      # spawns land on the same bus scope.
+      - name: Install gnome-keyring (Linux Secret Service for the CLI v1-policy suite)
+        run: sudo apt-get install -y gnome-keyring dbus
+      # The MPP and SEP-43 released-SDK interop suites assert the frozen Node
+      # version they were validated against; the runner image's default Node
+      # drifts, so the workflow pins it explicitly.
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "24.5.0"
+      # Serialization, inter-suite pacing, one-retry-with-cooldown, the
+      # zero-tests-executed guard, and the per-suite durations all live in the
+      # driver script so the same entrypoint runs locally and in CI. A
+      # scheduled run has no inputs and builds with mainnet-write off.
+      - name: Run testnet acceptance suites
+        env:
+          SHARE: 2/2
           FILTER: ${{ inputs.filter }}
           MAINNET_WRITE: ${{ inputs.mainnet_write && 'on' || 'off' }}
           STELLAR_AGENT_TESTNET_SECONDARY_RPC_URL: ${{ vars.TESTNET_SECONDARY_RPC_URL }}

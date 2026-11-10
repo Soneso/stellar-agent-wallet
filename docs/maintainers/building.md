@@ -706,8 +706,13 @@ Friendbot and the RPC load balancer are not hit back-to-back:
 ```bash
 .github/scripts/run-testnet-acceptance.sh                # everything
 FILTER=stellar-agent-dex .github/scripts/run-testnet-acceptance.sh   # one crate
+SHARE=1/2 .github/scripts/run-testnet-acceptance.sh          # first share
 MAINNET_WRITE=on .github/scripts/run-testnet-acceptance.sh   # mainnet-write build
 ```
+
+`SHARE=k/N` selects zero-based registry indices `i` where `i % N == k - 1`, preserving registry order. Unset or empty `SHARE` selects all suites. Other values require positive decimal integers with `k <= N`; invalid values refuse before any build.
+
+`FILTER` applies inside the selected share. A filter matching no registered suite refuses in every share. A share with no matching entries reports zero selected suites and succeeds.
 
 The driver enforces a completeness guard: it fails the run if any
 `tests/*testnet*.rs` or `tests/*_browser_acceptance.rs` file on disk is missing
@@ -720,9 +725,9 @@ job runs it.
 
 Each result line carries the wall seconds of the attempt that produced the
 result. A retried suite also carries the seconds of all its attempts, as in
-`pass (retry, 412 s, 830 s total)`. The summary header names the build,
-`mainnet-write off` or `mainnet-write on`, and the summary closes with the
-leg's wall time. In a workflow run the step summary table has a `seconds`
+`pass (retry, 412 s, 830 s total)`. Console and workflow summary headers name
+the share, selected suite count and build, `mainnet-write off` or `mainnet-write on`.
+The summary closes with the leg's wall time. In a workflow run the step summary table has a `seconds`
 column with each suite's seconds across its attempts.
 
 The same script backs the `Testnet acceptance` workflow
@@ -731,6 +736,13 @@ weekly schedule; it is deliberately not part of per-push CI. A dispatch takes
 an optional suite filter input and the boolean `mainnet_write` input, which
 runs every suite against the build with `mainnet-write` on. A scheduled run
 builds with `mainnet-write` off.
+
+The workflow chains `acceptance-1` with `SHARE=1/2` and `acceptance-2` with
+`SHARE=2/2`. Each job has a 360-minute limit. The second job waits for the first
+and runs after failure unless the workflow is cancelled. Both jobs honor
+`TESTNET_SCHEDULE=off` on scheduled events. Workflow concurrency serializes runs,
+and each driver serializes its selected suites. Both jobs use the filter,
+build selection, browser setup and secondary RPC environment.
 
 The browser suites need a Chromium binary on `PATH` (or the `CHROME` env var).
 Among them, the mainnet consent browser suite

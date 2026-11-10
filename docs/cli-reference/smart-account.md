@@ -52,7 +52,7 @@ After the last of those examples, run `unset WALLET_SK` to remove the seed from 
 
 ## Pre-submission checks
 
-Smart-account writes require a secondary RPC on the same network and on a host other than the primary's. The check compares normalized host names. Distinct names can resolve to the same machine; choose independently operated endpoints. Signing refuses unavailable or disagreeing ledger observations. The expiry bound assumes at least one independently operated endpoint reports the chain honestly. Ledger observations may differ by at most two in either order. Signature expiry is 100 ledgers beyond the lower observation.
+Smart-account writes require a secondary RPC on the same network and on a host other than the primary's. The check compares normalized host names. Distinct names can resolve to the same machine; choose independently operated endpoints. Signing refuses unavailable or disagreeing ledger observations. The expiry bound assumes at least one independently operated endpoint reports the chain honestly. Ledger observations may differ by at most two in either order. Signature expiry is 100 ledgers beyond the lower observation. The simulated ledger height must lie between the lower observation minus two and the higher observation plus two, inclusive. A height below this range permits one unsigned re-simulation against the same pair. A height above it, or a replacement outside it, refuses with `simulation.divergence.ledger_skew`. Recovery runs within the same pre-submit deadline.
 
 Every verb that signs a transaction authorized by a rule other than rule `0` checks each such rule before anything is simulated or signed: `smart-account execute`, `smart-account multicall`, the `smart-account rules` and `smart-account signers` write verbs, and `smart-account migrate-verifier` (see that verb). For each authorizing rule other than `0`, in ascending order, the wallet:
 
@@ -712,7 +712,7 @@ Flags:
 - `--smart-account <C_STRKEY>` (required): the smart-account executing the bundle.
 - `--rule-id <U32>` (required): the context rule authorizing the bundle.
 - `--invocation <TARGET:FN:JSON_ARGS>` (required, repeatable, 1 to 50): one invocation descriptor. More than 50 values are refused as `validation.bundle_too_large`.
-- `--secondary-rpc-url <URL>`: secondary RPC for cross-verification and the ledger witness. Resolved from the flag, else the profile's `secondary_rpc_url`, else `smart_account.ledger_witness_unavailable`. Ledger observations may differ by at most two in either order. Signature expiry is 100 ledgers beyond the lower observation.
+- `--secondary-rpc-url <URL>`: secondary RPC for cross-verification and the ledger witness. Resolved from the flag, else the profile's `secondary_rpc_url`, else `smart_account.ledger_witness_unavailable`. Ledger observations may differ by at most two in either order. Signature expiry is 100 ledgers beyond the lower observation. The simulated ledger height must lie between the lower observation minus two and the higher observation plus two, inclusive. A height below this range permits one unsigned re-simulation against the same pair. A height above it, or a replacement outside it, refuses with `simulation.divergence.ledger_skew`. Recovery runs within the same pre-submit deadline.
 - `--fee <STROOPS>`: per-op base fee in stroops (default 100). Unlike the deploy verb, `auto[:pNN]` is rejected here.
 - Signer-source flags are required (one of `--signer-secret-env` or `--sign-with-ledger`); `--account-index <INDEX>` defaults to `0`.
 - Shared: `--profile`, `--network`, `--rpc-url`, `--timeout-seconds`.
@@ -1002,7 +1002,7 @@ Schedule, cancel, execute, and list pending operations on an OpenZeppelin timelo
 
 Without `--secondary-rpc-url`, the profile secondary applies. A configured mainnet secondary requires its provider attestation and a host distinct from the primary. If neither source supplies a secondary, `list-pending` reads through the primary alone.
 
-Smart-account writes require a secondary RPC on the same network. Signing refuses unavailable or disagreeing ledger observations. The expiry bound assumes at least one independently operated endpoint reports the chain honestly. Ledger observations may differ by at most two in either order. Signature expiry is 100 ledgers beyond the lower observation.
+Smart-account writes require a secondary RPC on the same network. Signing refuses unavailable or disagreeing ledger observations. The expiry bound assumes at least one independently operated endpoint reports the chain honestly. Ledger observations may differ by at most two in either order. Signature expiry is 100 ledgers beyond the lower observation. The simulated ledger height must lie between the lower observation minus two and the higher observation plus two, inclusive. A height below this range permits one unsigned re-simulation against the same pair. A height above it, or a replacement outside it, refuses with `simulation.divergence.ledger_skew`. Recovery runs within the same pre-submit deadline.
 
 Timelock envelopes carry an exact maximum ledger before signing. The maximum ledger is exclusive.
 
