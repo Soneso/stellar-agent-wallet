@@ -118,6 +118,34 @@ Four approval kinds bind extra fields by hashing them into the 32-byte slot that
   The flag byte uses bit 0 for mutable verifiers and bit 1 for unknown verifiers.
 - `MppChargeSimulated`: the shared HMAC binds the prepared artifact hash. The store verifier also compares the stored profile and chain with the binding.
 
+The classic intent digest is separate from these four and binds no attestation yet.
+`approval::intent::ClassicIntent` binds lasting classic facts through
+`SHA256("stellar-agent-wallet/classic-intent/v1" || canonical_bytes)`.
+The label and canonical bytes have no outer length prefixes.
+The canonical layout encodes the base, then the payload, in declaration order:
+
+- Base: CAIP-2 chain string, source G strkey, BLAKE3 policy digest, fee bound, memo.
+- Pay (0): destination G or M strkey, asset, amount.
+- CreateAccount (1): destination G strkey, starting balance.
+- Trustline (2): issuer G strkey, code, limit.
+- Claim (3): lowercase hexadecimal XDR balance id, asset, amount, claimant G strkey.
+- Asset: Native (0), or Issued (1) followed by code and issuer.
+- Memo: None (0), Text (1), Id (2), Hash (3), Return (4), followed by each variant's value.
+
+Enum tags occupy one byte. Integers occupy eight big-endian bytes.
+Signed integers use two's complement; the u32 fee bound is zero-extended.
+UTF-8 strings and byte arrays carry a u32 big-endian byte length and their bytes.
+An option carries tag 0 for absence, or tag 1 and its value.
+The balance id has 72 lowercase hexadecimal characters, with XDR discriminator zero.
+The claimant equals the effective source. Amounts are positive; starting balances and limits are nonnegative.
+A zero limit removes a trustline; `i64::MAX` means unlimited.
+Memo text has at most 28 UTF-8 bytes. Strkeys re-encode to their exact input text.
+Account creation maps to `ApprovedKind::Payment`; pay, trustline, and claim map to their corresponding approval kinds.
+The claim adapter supplies asset and amount to policy evaluation as an inbound `ActionKind::Claim` leg.
+Asset allowlists check that identity; debit caps exclude the leg.
+`IntentView` shows the fee bound, typed memo, short policy digest, and operation facts.
+JSON uses snake_case variant tags, 64 lowercase hex characters for the policy digest and memo hashes, and decimal strings for amounts, limits, the fee bound, and memo ids.
+
 A matching grant names the current install identity, package version and package shasum. It requires a version 3 HMAC that verifies under the profile's attestation key and profile/chain binding. It must be unexpired, with a lifetime of at most 30 days, and issued no later than the current time and at or after the second following the current installation. An invalid install time honors no grant. Consent issued in the install second re-prompts once. A forged or edited grant suppresses nothing.
 
 The first-invoke grant suppresses only its re-prompt. Per-action `PaymentSimulated` approval fires on every toolset-routed payment and binds the executed envelope through `envelope_sha256`.

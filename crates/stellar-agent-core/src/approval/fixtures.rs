@@ -573,3 +573,40 @@ pub fn rule_proposal_pending() -> PendingApproval {
     )
     .expect("valid rule fixture")
 }
+
+#[cfg(test)]
+pub(crate) mod intent {
+    use super::super::intent::ClassicIntent;
+    use serde::Deserialize;
+
+    pub(crate) const VECTORS: [&str; 7] = [
+        include_str!("intent/vectors/pay_native_memo_none.json"),
+        include_str!("intent/vectors/pay_issued_muxed_memo_text.json"),
+        include_str!("intent/vectors/create_account_memo_id.json"),
+        include_str!("intent/vectors/trustline_removal_memo_hash.json"),
+        include_str!("intent/vectors/trustline_unlimited_memo_return.json"),
+        include_str!("intent/vectors/claim_native_memo_none.json"),
+        include_str!("intent/vectors/claim_issued_memo_text.json"),
+    ];
+
+    #[derive(Deserialize)]
+    pub(crate) struct Vector {
+        pub(crate) name: String,
+        pub(crate) intent: ClassicIntent,
+        pub(crate) canonical_hex: String,
+        pub(crate) digest_hex: String,
+    }
+    pub(crate) fn vectors() -> Vec<Vector> {
+        VECTORS
+            .iter()
+            .map(|text| serde_json::from_str(text).expect("valid named intent vector"))
+            .collect()
+    }
+    pub(crate) fn fixture(name: &str) -> ClassicIntent {
+        vectors()
+            .into_iter()
+            .find(|v| v.name == name)
+            .expect("valid named intent vector")
+            .intent
+    }
+}

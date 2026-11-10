@@ -334,6 +334,133 @@ pub fn format_trustline_limit(limit_stroops: Option<i64>) -> String {
     }
 }
 
+/// A view of validated lasting intent facts, serialized with a `kind` tag.
+/// Amounts and the fee bound use decimal stroop strings. The memo preserves
+/// its type, and the policy digest uses its first and last eight hex characters.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct IntentView {
+    #[serde(flatten)]
+    payload: IntentPayloadView,
+    chain_id: String,
+    source: String,
+    policy_digest_short: String,
+    memo: ClassicMemo,
+    #[serde(with = "crate::wire_stroops::u32")]
+    fee_at_most_stroops: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum IntentPayloadView {
+    Pay {
+        destination: String,
+        asset: String,
+        #[serde(with = "crate::wire_stroops::i64")]
+        amount_stroops: i64,
+    },
+    CreateAccount {
+        destination: String,
+        asset: String,
+        #[serde(with = "crate::wire_stroops::i64")]
+        starting_balance_stroops: i64,
+    },
+    Trustline {
+        issuer: String,
+        code: String,
+        #[serde(with = "crate::wire_stroops::i64")]
+        limit_stroops: i64,
+        limit: String,
+    },
+    Claim {
+        balance_id_strkey: String,
+        asset: String,
+        #[serde(with = "crate::wire_stroops::i64")]
+        amount_stroops: i64,
+        claimant: String,
+    },
+}
+
+impl IntentView {
+    /// Builds a display view from validated intent facts.
+    #[must_use]
+    pub fn new(intent: &super::intent::ClassicIntent) -> Self {
+        use super::intent::{IntentAsset, IntentPayload, MemoFact};
+        let asset_text = |asset: &IntentAsset| match asset {
+            IntentAsset::Native => "XLM".to_owned(),
+            IntentAsset::Issued { code, issuer } => format!("{code}:{issuer}"),
+        };
+        let payload = match intent.payload() {
+            IntentPayload::Pay {
+                destination,
+                asset,
+                amount_stroops,
+            } => IntentPayloadView::Pay {
+                destination: destination.clone(),
+                asset: asset_text(asset),
+                amount_stroops: *amount_stroops,
+            },
+            IntentPayload::CreateAccount {
+                destination,
+                starting_balance_stroops,
+            } => IntentPayloadView::CreateAccount {
+                destination: destination.clone(),
+                asset: "XLM".to_owned(),
+                starting_balance_stroops: *starting_balance_stroops,
+            },
+            IntentPayload::Trustline {
+                issuer,
+                code,
+                limit_stroops,
+            } => IntentPayloadView::Trustline {
+                issuer: issuer.clone(),
+                code: code.clone(),
+                limit_stroops: *limit_stroops,
+                limit: format_trustline_limit(
+                    (*limit_stroops != i64::MAX).then_some(*limit_stroops),
+                ),
+            },
+            IntentPayload::Claim {
+                balance_id,
+                asset,
+                amount_stroops,
+                claimant,
+            } => IntentPayloadView::Claim {
+                balance_id_strkey: intent_balance_strkey(balance_id),
+                asset: asset_text(asset),
+                amount_stroops: *amount_stroops,
+                claimant: claimant.clone(),
+            },
+        };
+        let base = intent.base();
+        let memo = match base.memo() {
+            MemoFact::None => ClassicMemo::None,
+            MemoFact::Text(text) => ClassicMemo::Text(text.clone()),
+            MemoFact::Id(id) => ClassicMemo::Id(*id),
+            MemoFact::Hash(hash) => ClassicMemo::Hash(*hash),
+            MemoFact::Return(hash) => ClassicMemo::Return(*hash),
+        };
+        Self {
+            payload,
+            chain_id: base.chain_id().to_owned(),
+            source: base.source().to_owned(),
+            policy_digest_short: crate::hex::redact_hex_first8_last8(&crate::hex::encode(
+                base.policy_digest(),
+            )),
+            memo,
+            fee_at_most_stroops: base.fee_bound_stroops(),
+        }
+    }
+}
+
+#[allow(
+    clippy::expect_used,
+    reason = "ClassicIntent validates the 72-character lowercase XDR id"
+)]
+fn intent_balance_strkey(balance_id: &str) -> String {
+    let hash = crate::hex::decode_hex32(&balance_id[8..]).expect("validated balance hash");
+    format!("{}", stellar_strkey::ClaimableBalance::V0(hash))
+}
+
 /// The summary of a classic entry, decoded from its envelope, or
 /// [`ApprovalSummaryView::Inconsistent`] when the entry fails
 /// [`classic_entry_summary`].
@@ -1016,6 +1143,111 @@ mod tests {
         let json = serde_json::to_value(&rejected).unwrap();
         assert_eq!(json["kind"], "rejected");
         assert_eq!(json["original_kind_name"], "PaymentSimulated");
+    }
+
+    #[test]
+    fn intent_views_match_their_golden_text() {
+        use super::super::fixtures::intent::fixture;
+        let cases = [
+            (
+                "pay_native_memo_none",
+                r#"{"kind":"pay","destination":"GBPXXOA5N4JYPESHAADMQKBPWZWQDQ64ZV6ZL2S3LAGW4SY7NTCMWIVL","asset":"XLM","amount_stroops":"10000000","chain_id":"stellar:testnet","source":"GAQAA5L65LSYH7CQ3VTJ7F3HHLGCL3DSLAR2Y47263D56MNNGHSQSTVY","policy_digest_short":"11111111...11111111","memo":{"kind":"none"},"fee_at_most_stroops":"100"}"#,
+            ),
+            (
+                "pay_issued_muxed_memo_text",
+                r#"{"kind":"pay","destination":"MA3D5KRYM6CB7OWQ6TWYRR3Z4T7GNZLKERYNZGGA5SOAOPIFY6YQGAAAAAAAAAPCICBKU","asset":"USDC:GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5","amount_stroops":"1","chain_id":"stellar:mainnet","source":"GAQAA5L65LSYH7CQ3VTJ7F3HHLGCL3DSLAR2Y47263D56MNNGHSQSTVY","policy_digest_short":"11111111...11111111","memo":{"kind":"text","value":"invoice 42"},"fee_at_most_stroops":"4294967295"}"#,
+            ),
+            (
+                "create_account_memo_id",
+                r#"{"kind":"create_account","destination":"GBPXXOA5N4JYPESHAADMQKBPWZWQDQ64ZV6ZL2S3LAGW4SY7NTCMWIVL","asset":"XLM","starting_balance_stroops":"15000000","chain_id":"stellar:mainnet","source":"GAQAA5L65LSYH7CQ3VTJ7F3HHLGCL3DSLAR2Y47263D56MNNGHSQSTVY","policy_digest_short":"11111111...11111111","memo":{"kind":"id","value":"18446744073709551615"},"fee_at_most_stroops":"100"}"#,
+            ),
+            (
+                "trustline_removal_memo_hash",
+                r#"{"kind":"trustline","issuer":"GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN","code":"USDC","limit_stroops":"0","limit":"0 stroops (removes the trustline)","chain_id":"stellar:mainnet","source":"GAQAA5L65LSYH7CQ3VTJ7F3HHLGCL3DSLAR2Y47263D56MNNGHSQSTVY","policy_digest_short":"11111111...11111111","memo":{"kind":"hash","value":[34,34,34,34,34,34,34,34,34,34,34,34,34,34,34,34,34,34,34,34,34,34,34,34,34,34,34,34,34,34,34,34]},"fee_at_most_stroops":"100"}"#,
+            ),
+            (
+                "claim_native_memo_none",
+                r#"{"kind":"claim","balance_id_strkey":"BAAAUCQKBIFAUCQKBIFAUCQKBIFAUCQKBIFAUCQKBIFAUCQKBIFAUCRKWE","asset":"XLM","amount_stroops":"5000000","claimant":"GAQAA5L65LSYH7CQ3VTJ7F3HHLGCL3DSLAR2Y47263D56MNNGHSQSTVY","chain_id":"stellar:mainnet","source":"GAQAA5L65LSYH7CQ3VTJ7F3HHLGCL3DSLAR2Y47263D56MNNGHSQSTVY","policy_digest_short":"11111111...11111111","memo":{"kind":"none"},"fee_at_most_stroops":"100"}"#,
+            ),
+            (
+                "claim_issued_memo_text",
+                r#"{"kind":"claim","balance_id_strkey":"BAAAWCYLBMFQWCYLBMFQWCYLBMFQWCYLBMFQWCYLBMFQWCYLBMFQWC4VWM","asset":"USDC:GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5","amount_stroops":"1","claimant":"GAQAA5L65LSYH7CQ3VTJ7F3HHLGCL3DSLAR2Y47263D56MNNGHSQSTVY","chain_id":"stellar:testnet","source":"GAQAA5L65LSYH7CQ3VTJ7F3HHLGCL3DSLAR2Y47263D56MNNGHSQSTVY","policy_digest_short":"11111111...11111111","memo":{"kind":"text","value":"claim"},"fee_at_most_stroops":"100"}"#,
+            ),
+        ];
+        for (name, expected) in cases {
+            let view = IntentView::new(&fixture(name));
+            let text = serde_json::to_string(&view).unwrap();
+            assert_eq!(text, expected, "{name}");
+            assert!(!text.contains("seq_num"));
+            assert!(!text.contains("fee_stroops"));
+        }
+    }
+
+    #[test]
+    fn intent_view_spells_out_removal_and_unlimited() {
+        use super::super::fixtures::intent::fixture;
+        for (name, expected) in [
+            (
+                "trustline_removal_memo_hash",
+                "0 stroops (removes the trustline)",
+            ),
+            ("trustline_unlimited_memo_return", "unlimited"),
+        ] {
+            let view = IntentView::new(&fixture(name));
+            assert_eq!(serde_json::to_value(view).unwrap()["limit"], expected);
+        }
+    }
+
+    #[test]
+    fn classic_summary_views_keep_their_wire_text() {
+        let entries = [
+            fixtures::payment_pending(
+                SOURCE,
+                DEST,
+                "XLM",
+                2_500_000,
+                Some("hello"),
+                100,
+                1,
+                uid(),
+                DEFAULT_TTL_MS,
+            ),
+            fixtures::trustline_pending(SOURCE, "USDC", OTHER, None, 100, 1, uid(), DEFAULT_TTL_MS),
+            fixtures::trustline_pending(
+                SOURCE,
+                "USDC",
+                OTHER,
+                Some(0),
+                100,
+                1,
+                uid(),
+                DEFAULT_TTL_MS,
+            ),
+            fixtures::claim_pending(
+                SOURCE,
+                [0x0a; 32],
+                Some(("XLM", 500)),
+                100,
+                1,
+                uid(),
+                DEFAULT_TTL_MS,
+            ),
+        ];
+        let expected = [
+            r#"{"kind":"payment","source":"GAQAA5L65LSYH7CQ3VTJ7F3HHLGCL3DSLAR2Y47263D56MNNGHSQSTVY","to":"GBPXXOA5N4JYPESHAADMQKBPWZWQDQ64ZV6ZL2S3LAGW4SY7NTCMWIVL","amount_stroops":"2500000","asset":"XLM","memo":{"kind":"text","value":"hello"},"fee_stroops":"100","seq_num":1}"#,
+            r#"{"kind":"trustline","holder":"GAQAA5L65LSYH7CQ3VTJ7F3HHLGCL3DSLAR2Y47263D56MNNGHSQSTVY","asset_code":"USDC","asset_issuer":"GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN","limit_stroops":null,"fee_stroops":"100","seq_num":1,"memo":{"kind":"none"}}"#,
+            r#"{"kind":"trustline","holder":"GAQAA5L65LSYH7CQ3VTJ7F3HHLGCL3DSLAR2Y47263D56MNNGHSQSTVY","asset_code":"USDC","asset_issuer":"GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN","limit_stroops":"0","fee_stroops":"100","seq_num":1,"memo":{"kind":"none"}}"#,
+            r#"{"kind":"claim","balance_id_strkey":"BAAAUCQKBIFAUCQKBIFAUCQKBIFAUCQKBIFAUCQKBIFAUCQKBIFAUCRKWE","source":"GAQAA5L65LSYH7CQ3VTJ7F3HHLGCL3DSLAR2Y47263D56MNNGHSQSTVY","fee_stroops":"100","seq_num":1,"memo":{"kind":"none"}}"#,
+        ];
+        for (entry, expected) in entries.into_iter().zip(expected) {
+            let dir = TempDir::new().unwrap();
+            let mut store = open_store(&dir);
+            store.insert(entry, TEST_NOW_MS).unwrap();
+            assert_eq!(
+                serde_json::to_string(&store.snapshot(TEST_NOW_MS)[0].summary).unwrap(),
+                expected
+            );
+        }
     }
 
     #[test]
