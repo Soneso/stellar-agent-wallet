@@ -24,6 +24,7 @@ use std::str::FromStr;
 use stellar_agent_core::error::{NetworkError, WalletError};
 use stellar_agent_core::profile::caip2::Caip2;
 pub(crate) use stellar_agent_core::profile::caip2::TESTNET_RPC_URL;
+use stellar_agent_network::operational::{OperationalReport, operational_check};
 use stellar_agent_network::{NetworkContext, StellarRpcClient};
 
 /// The network context of `profile` for a verb that reads its endpoints
@@ -213,6 +214,32 @@ pub(crate) async fn check_endpoint_identity(
         .endpoint_identity(context.network_passphrase(), deadline)
         .await?;
     Ok(())
+}
+
+/// Checks that the endpoint of `client` is healthy and current, under
+/// `deadline`.
+///
+/// A value verb runs this check after [`check_endpoint_identity`] on the same
+/// client and before the first account read, on every network, so the
+/// sequence, the fee, and the policy views it signs against come from an
+/// endpoint whose latest ledger closed within
+/// [`stellar_agent_network::operational::MAX_LEDGER_CLOSE_LAG`] of the host
+/// clock. A mainnet build reads the account it signs against under the same
+/// `deadline` through
+/// [`stellar_agent_network::operational::read_within_readiness_deadline`],
+/// and a mainnet write hands the report to its summary.
+///
+/// # Errors
+///
+/// Returns the refusal of
+/// [`stellar_agent_network::operational::operational_check`]:
+/// `network.endpoint_not_ready`, or `wallet.clock_error` when the host clock
+/// cannot be read.
+pub(crate) async fn check_endpoint_ready(
+    client: &StellarRpcClient,
+    deadline: tokio::time::Instant,
+) -> Result<OperationalReport, WalletError> {
+    operational_check(client, deadline).await
 }
 
 /// Parses an RPC URL flag without echoing credentials in errors.

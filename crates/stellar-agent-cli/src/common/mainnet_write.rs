@@ -8,8 +8,9 @@
 //!
 //! 1. the enrolled signer proof, which reads the identity record and never a
 //!    seed;
-//! 2. the typed-profile confirmation, whose pending-approval store is closed
-//!    again before any later step;
+//! 2. the typed-profile confirmation, whose summary names the latest ledger
+//!    of the operational check the build ran before its first account read,
+//!    and whose pending-approval store is closed again before any later step;
 //! 3. the consent drain, the audit readiness, and the recorder preparation;
 //! 4. the authorization mint;
 //! 5. the signer, the authorized attach, and the authorized submit.
@@ -34,6 +35,7 @@ use stellar_agent_network::mainnet::resolve::{
     InvalidationStage, TxSignRequest, invalidate_unconsumed, resolve_tx_sign,
 };
 use stellar_agent_network::mainnet::{AuthorizationId, MainnetAuthorizationError, MainnetConsumer};
+use stellar_agent_network::operational::OperationalReport;
 use stellar_agent_network::policy_state::PersistedWindowStore;
 use stellar_agent_network::signing::envelope_signing::attach_signature_authorized;
 use stellar_agent_network::submit::SubmissionResult;
@@ -190,6 +192,10 @@ pub(crate) struct MainnetWriteRequest<'a> {
     pub(crate) effective_cap: u32,
     /// The independent witness, when one was obtained.
     pub(crate) witness: Option<&'a CrossCheckWitness>,
+    /// What the operational check observed on `client`; the build runs the
+    /// check before its first account read, and the summary names the
+    /// ledger.
+    pub(crate) ledger: OperationalReport,
 }
 
 /// A mainnet write the network confirmed.
@@ -390,6 +396,7 @@ pub(crate) async fn authorize_and_submit(
         evaluation,
         effective_cap,
         witness,
+        ledger,
     } = req;
     let name = context.profile_name();
     let profile = context.profile();
@@ -425,7 +432,8 @@ pub(crate) async fn authorize_and_submit(
     // own reads and writes, never across the presence wait, so the
     // recorder's tombstone can open it after the submit.
     let summary = MainnetWriteSummary::from_envelope(unsigned_xdr, consumer, effective_cap)
-        .map_err(|e| Envelope::<()>::err(&e))?;
+        .map_err(|e| Envelope::<()>::err(&e))?
+        .with_ledger(ledger);
     let store_path = approval_store_dir()
         .map_err(|e| Envelope::<()>::err(&e))?
         .join(format!("{name}.toml"));

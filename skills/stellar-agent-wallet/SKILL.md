@@ -366,6 +366,12 @@ Drive installed toolsets with `stellar_toolset_list` and `stellar_toolset_invoke
   - `network.envelope_signature_unverifiable`: a signature does not verify.
   - `network.envelope_unsigned`: a required signature set is empty.
 
+  `network.endpoint_not_ready` reports an endpoint that is not healthy or whose
+  latest ledger closed more than 60 seconds from the host clock. The classic MCP
+  prepare tools and the CLI `pay`, `claim`, sponsored `accounts create`, and
+  `trustline` verbs check this before they sign, so nothing was sent. Report
+  the reason to the operator; do not switch to a different endpoint on your own.
+
   `network.witness_unavailable` separately reports an unavailable required oracle
   witness for all four classic MCP commits and CLI `pay`, `claim`, sponsored
   `accounts create`, `trustline`, and sending `pool init` paths. The x402
@@ -465,7 +471,9 @@ signing; stale startup bindings report the restart requirement.
 **The endpoint binds the network.** Prepare and commit probe the client before
 its first action read. Submission checks it again before send. A network
 mismatch uses `network.endpoint_network_mismatch`; unavailable identity uses
-`network.endpoint_identity_unavailable`. Credential refusals use
+`network.endpoint_identity_unavailable`. A prepare refuses an endpoint that is
+not healthy or not current with `network.endpoint_not_ready`, and its result
+names the observed ledger as `operational`. Credential refusals use
 `network.rpc_credential_refused`. Authorized mainnet operations require protocol 29 or 30.
 Signatures must verify under the endpoint network. See
 [network-binding codes](references/troubleshooting.md#network-binding-codes-submit-layer).

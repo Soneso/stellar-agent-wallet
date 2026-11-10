@@ -140,13 +140,14 @@ use crate::common::mainnet_write::{
     MainnetWriteRequest, authorize_and_submit, mainnet_context, mainnet_profiles_dir,
     require_v1_engine,
 };
-use crate::common::network::check_endpoint_identity;
+use crate::common::network::{check_endpoint_identity, check_endpoint_ready};
 use crate::common::profile_access::{
     ProfileAccessError, injected_profile_load, reconcile_loaded_profile,
 };
 use crate::common::render::{WithPreview, with_preview_detail, write_envelope};
 use crate::common::resolve_profile_name;
 use crate::common::signer_ceremony::MainnetSignerChoice;
+use stellar_agent_network::operational::read_within_readiness_deadline;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Argument types
@@ -355,10 +356,19 @@ where
         }
     };
 
-    // The endpoint check precedes the issuer read: the issuer flags feed the
-    // clawback gate, and every later read and the send use this client. It
-    // gets its own budget of the profile's submit timeout.
+    // The endpoint checks precede the issuer read: the issuer flags feed the
+    // clawback gate, and every later read and the send use this client. The
+    // identity check and the readiness check each get their own budget of the
+    // profile's submit timeout.
     if let Err(e) = check_endpoint_identity(&rpc_client, &context, profile.submit_timeout()).await {
+        return write_envelope(out, &Envelope::<()>::err(&e), 1);
+    }
+    if let Err(e) = check_endpoint_ready(
+        &rpc_client,
+        tokio::time::Instant::now() + profile.submit_timeout(),
+    )
+    .await
+    {
         return write_envelope(out, &Envelope::<()>::err(&e), 1);
     }
 
@@ -1261,6 +1271,14 @@ where
     if let Err(e) = check_endpoint_identity(&client, &net_context, profile.submit_timeout()).await {
         return write_envelope(out, &Envelope::<()>::err(&e), 1);
     }
+    // The check precedes the issuer and source reads, and the source read
+    // runs under the check's deadline; the summary names the ledger the
+    // check observed.
+    let readiness_deadline = tokio::time::Instant::now() + profile.submit_timeout();
+    let operational = match check_endpoint_ready(&client, readiness_deadline).await {
+        Ok(report) => report,
+        Err(e) => return write_envelope(out, &Envelope::<()>::err(&e), 1),
+    };
     let issuer_account_view = match fetch_account(&client, &asset.issuer, &[]).await {
         Ok(view) => Some(view),
         Err(WalletError::Network(NetworkError::AccountNotFound { .. })) => None,
@@ -1269,8 +1287,16 @@ where
     let issuer_flags: Option<AccountFlagsView> = issuer_account_view
         .as_ref()
         .and_then(|v| v.account_flags.clone());
-    let source_account_view = match fetch_account(&client, &args.from, &[]).await {
+    let source_account_view = match read_within_readiness_deadline(
+        readiness_deadline,
+        fetch_account(&client, &args.from, &[]),
+    )
+    .await
+    {
         Ok(view) => view,
+        Err(e @ WalletError::Network(NetworkError::EndpointNotReady { .. })) => {
+            return write_envelope(out, &Envelope::<()>::err(&e), 1);
+        }
         Err(e) => {
             return write_envelope(
                 out,
@@ -1410,6 +1436,7 @@ where
             evaluation: &evaluation,
             effective_cap,
             witness: cross_check.witness(),
+            ledger: operational,
         })
         .await?;
         let SubmissionResult {
@@ -1900,7 +1927,8 @@ mod tests {
                             stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE,
                         )
                     }
-                    _ => serde_json::json!({}),
+                    other => crate::test_rpc::operational_result(other)
+                        .unwrap_or_else(|| serde_json::json!({})),
                 };
                 wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
                     "jsonrpc": "2.0",
@@ -2256,6 +2284,101 @@ mod tests {
         );
     }
 
+    /// Runs a `USDC` trustline of the seeded profile `name` against `server`
+    /// and returns the exit code and the printed envelope.
+    async fn readiness_run(name: &str, server: &wiremock::MockServer) -> (i32, serde_json::Value) {
+        let (profile, from, _home, _home_guard) = seeded_trustline_profile(name, &server.uri());
+        let args = TrustlineArgs {
+            profile: Some(name.to_owned()),
+            from,
+            asset: format!("USDC:{ONE_ENVELOPE_ISSUER}"),
+            limit_stroops: None,
+            classic_base: None,
+        };
+        let mut out = Vec::new();
+        let loaded = profile.clone();
+        let code =
+            run_with_dependencies(&args, move |_| Ok(loaded.clone()), || Ok(()), &mut out).await;
+        (code, crate::common::render::single_json_document(&out))
+    }
+
+    /// A trustline checks the endpoint's identity, then its health and the
+    /// close time of its latest ledger, and reads the issuer only after both
+    /// checks.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_trustline_checks_readiness_before_the_issuer_read() {
+        let from = stellar_agent_test_support::signed_envelope::account_id_for_seed([0x5d; 32]);
+        let server = crate::test_rpc::ClassicRpc::testnet(&[&from, ONE_ENVELOPE_ISSUER])
+            .serve()
+            .await;
+
+        let (code, envelope) = readiness_run("trustline-readiness-order", &server).await;
+        let methods = crate::test_rpc::methods(&server).await;
+
+        assert_eq!(code, 0, "{envelope}");
+        assert_eq!(
+            methods[..4],
+            ["getNetwork", "getHealth", "getLedgers", "getLedgerEntries"],
+            "identity, then readiness, then the issuer read: {methods:?}"
+        );
+    }
+
+    /// An endpoint whose latest ledger closed beyond the readiness bound is
+    /// refused with `network.endpoint_not_ready` before the issuer read.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_stale_endpoint_is_refused_before_the_issuer_read() {
+        let from = stellar_agent_test_support::signed_envelope::account_id_for_seed([0x5d; 32]);
+        let endpoint = crate::test_rpc::ClassicRpc::testnet(&[&from, ONE_ENVELOPE_ISSUER]);
+        endpoint.close_ledgers_ago(120);
+        let server = endpoint.serve().await;
+
+        let (code, envelope) = readiness_run("trustline-readiness-stale", &server).await;
+
+        assert_eq!(code, 1, "{envelope}");
+        assert_eq!(
+            envelope["error"]["code"], "network.endpoint_not_ready",
+            "{envelope}"
+        );
+        assert_eq!(
+            crate::test_rpc::methods(&server).await,
+            ["getNetwork", "getHealth", "getLedgers"],
+            "a stale endpoint answers no issuer read"
+        );
+    }
+
+    /// An endpoint that reports a status other than healthy is refused with
+    /// `network.endpoint_not_ready` before its latest ledger and the issuer
+    /// are read.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn an_unhealthy_endpoint_is_refused_before_the_issuer_read() {
+        let from = stellar_agent_test_support::signed_envelope::account_id_for_seed([0x5d; 32]);
+        let endpoint = crate::test_rpc::ClassicRpc::testnet(&[&from, ONE_ENVELOPE_ISSUER]);
+        endpoint.report_health("unhealthy");
+        let server = endpoint.serve().await;
+
+        let (code, envelope) = readiness_run("trustline-readiness-unhealthy", &server).await;
+
+        assert_eq!(code, 1, "{envelope}");
+        assert_eq!(
+            envelope["error"]["code"], "network.endpoint_not_ready",
+            "{envelope}"
+        );
+        assert!(
+            envelope["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("status \"unhealthy\"")),
+            "the refusal names the status: {envelope}"
+        );
+        assert_eq!(
+            crate::test_rpc::methods(&server).await,
+            ["getNetwork", "getHealth"],
+            "an unhealthy endpoint answers no ledger or issuer read"
+        );
+    }
+
     /// An unset `submit_timeout_seconds` hands the submission the 60-second
     /// default, and a configured one hands it its own value.
     #[tokio::test]
@@ -2360,7 +2483,8 @@ mod tests {
                             )
                         }
                         "getFeeStats" => serde_json::json!({}),
-                        _ => serde_json::json!({}),
+                        other => crate::test_rpc::operational_result(other)
+                            .unwrap_or_else(|| serde_json::json!({})),
                     };
                     wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
                         "jsonrpc": "2.0",
@@ -2883,6 +3007,58 @@ mod tests {
                 "no confirmation entry"
             );
             assert!(fixture.sent_envelopes().await.is_empty(), "nothing is sent");
+        }
+
+        /// Operational check: the build checks the primary's identity, then
+        /// its health and latest ledger, and reads the issuer only after
+        /// both checks.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn the_endpoint_checks_precede_the_issuer_read() {
+            let fixture = Spec::new("mainnet-trustline-readiness-order")
+                .primary(ledger(true, 0))
+                .oracle(ledger(true, 0))
+                .build()
+                .await;
+
+            let _run = run(&fixture, &mainnet_args(&fixture)).await;
+
+            let methods = fixture.primary_methods().await;
+            assert_eq!(
+                methods.get(..4),
+                Some(
+                    ["getNetwork", "getHealth", "getLedgers", "getLedgerEntries"]
+                        .map(str::to_owned)
+                        .as_slice()
+                ),
+                "identity, then readiness, then the issuer read: {methods:?}"
+            );
+        }
+
+        /// Operational check: a primary whose latest ledger closed beyond the
+        /// readiness bound refuses with `network.endpoint_not_ready` before
+        /// any account read, before the summary is shown and before an entry
+        /// is parked.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn a_stale_endpoint_refuses_before_the_issuer_read() {
+            let primary = ledger(true, 0);
+            let fixture = Spec::new("mainnet-trustline-readiness-stale")
+                .primary(primary.clone())
+                .oracle(ledger(true, 0))
+                .build()
+                .await;
+            primary.close_ledgers_ago(120);
+
+            let run = run(&fixture, &mainnet_args(&fixture)).await;
+
+            assert_refused_before_confirmation(&fixture, &run, "network.endpoint_not_ready").await;
+            assert_eq!(
+                fixture.primary_methods().await,
+                ["getNetwork", "getHealth", "getLedgers"],
+                "a stale endpoint answers no account read"
+            );
+            fixture.assert_no_consent_ceremony();
         }
 
         /// Accept: the trustline is witnessed through the routed oracle,

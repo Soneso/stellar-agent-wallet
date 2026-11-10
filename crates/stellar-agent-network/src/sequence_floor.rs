@@ -20,10 +20,12 @@
 use std::time::Duration;
 
 use stellar_agent_core::error::WalletError;
+use tokio::time::Instant;
 
 use crate::account::{AccountView, fetch_account};
 use crate::builder::Asset;
 use crate::client::StellarRpcClient;
+use crate::operational::read_within_readiness_deadline;
 
 /// Bound on catch-up polls once a build-time fetch observes a sequence below
 /// the tracked floor.
@@ -98,7 +100,70 @@ pub async fn fetch_account_with_sequence_catchup_using(
     max_polls: u32,
     poll_interval: Duration,
 ) -> Result<AccountView, WalletError> {
-    let mut account = fetch_account(client, account_id, trustline_assets).await?;
+    catch_up(
+        hook,
+        client,
+        account_id,
+        trustline_assets,
+        max_polls,
+        poll_interval,
+        None,
+    )
+    .await
+}
+
+/// [`fetch_account_with_sequence_catchup`] for the account read that
+/// follows [`crate::operational::operational_check`], under the `deadline`
+/// the check ran under.
+///
+/// Every account read runs under `deadline`. The catch-up window ends at
+/// `deadline` as it ends after [`CATCHUP_MAX_POLLS`]: a poll that would
+/// start at or after `deadline` is not made, and the last-fetched value is
+/// returned as-is.
+///
+/// # Errors
+///
+/// - `network.endpoint_not_ready` when an account read is still running at
+///   `deadline`.
+/// - Any other [`WalletError`] `fetch_account` returns.
+pub async fn fetch_account_with_sequence_catchup_within(
+    hook: Option<&dyn SequenceFloorHook>,
+    client: &StellarRpcClient,
+    account_id: &str,
+    trustline_assets: &[Asset],
+    deadline: Instant,
+) -> Result<AccountView, WalletError> {
+    catch_up(
+        hook,
+        client,
+        account_id,
+        trustline_assets,
+        CATCHUP_MAX_POLLS,
+        CATCHUP_POLL_INTERVAL,
+        Some(deadline),
+    )
+    .await
+}
+
+/// The catch-up poll, every account read and the window bounded by
+/// `deadline` when there is one.
+async fn catch_up(
+    hook: Option<&dyn SequenceFloorHook>,
+    client: &StellarRpcClient,
+    account_id: &str,
+    trustline_assets: &[Asset],
+    max_polls: u32,
+    poll_interval: Duration,
+    deadline: Option<Instant>,
+) -> Result<AccountView, WalletError> {
+    let read = || async {
+        let read = fetch_account(client, account_id, trustline_assets);
+        match deadline {
+            Some(deadline) => read_within_readiness_deadline(deadline, read).await,
+            None => read.await,
+        }
+    };
+    let mut account = read().await?;
 
     let Some(hook) = hook else {
         return Ok(account);
@@ -111,8 +176,11 @@ pub async fn fetch_account_with_sequence_catchup_using(
     }
 
     for _ in 0..max_polls {
+        if deadline.is_some_and(|deadline| Instant::now() + poll_interval >= deadline) {
+            break;
+        }
         tokio::time::sleep(poll_interval).await;
-        account = fetch_account(client, account_id, trustline_assets).await?;
+        account = read().await?;
         if account.sequence_number >= floor {
             break;
         }
@@ -297,6 +365,80 @@ mod tests {
             account.sequence_number, 40,
             "must proceed with the fetched (stale) value rather than block indefinitely or invent a sequence"
         );
+    }
+
+    /// Under a deadline, the catch-up window ends at the deadline as it ends
+    /// after the last poll: no poll that would start at or after the
+    /// deadline is made, and the stale value is returned.
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_catchup_window_ends_at_the_deadline() {
+        let mock_server = wiremock::MockServer::start().await;
+        mount_account_at_sequence(&mock_server, TEST_ADDRESS, 40, u64::MAX).await;
+        let client = StellarRpcClient::new(&mock_server.uri()).expect("valid mock URL");
+        let hook = FakeHook::with_floor(TEST_ADDRESS, 50);
+        let poll_interval = Duration::from_millis(400);
+
+        let started = std::time::Instant::now();
+        let account = catch_up(
+            Some(&hook),
+            &client,
+            TEST_ADDRESS,
+            &[],
+            CATCHUP_MAX_POLLS,
+            poll_interval,
+            Some(Instant::now() + Duration::from_millis(1_000)),
+        )
+        .await
+        .expect("a window cut at the deadline returns the last-fetched value");
+
+        assert_eq!(account.sequence_number, 40);
+        assert!(
+            started.elapsed() < Duration::from_millis(1_000),
+            "no poll starts at or after the deadline: {:?}",
+            started.elapsed()
+        );
+        let requests = mock_server.received_requests().await.unwrap().len();
+        assert_eq!(requests, 3, "the first read and two polls fit the window");
+    }
+
+    /// Under a deadline, an account read still running at the deadline
+    /// refuses with `network.endpoint_not_ready`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_account_read_past_the_deadline_refuses() {
+        use stellar_agent_test_support::EchoIdResponder;
+        use wiremock::Mock;
+        use wiremock::matchers::method;
+
+        let mock_server = wiremock::MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(DelayedAnswer(
+                EchoIdResponder::new(serde_json::json!({"entries": [], "latestLedger": 100})),
+                Duration::from_secs(3),
+            ))
+            .mount(&mock_server)
+            .await;
+        let client = StellarRpcClient::new(&mock_server.uri()).expect("valid mock URL");
+
+        let error = fetch_account_with_sequence_catchup_within(
+            None,
+            &client,
+            TEST_ADDRESS,
+            &[],
+            Instant::now() + Duration::from_millis(300),
+        )
+        .await
+        .expect_err("a read past the deadline refuses");
+
+        assert_eq!(error.code(), "network.endpoint_not_ready", "{error:?}");
+    }
+
+    /// Answers as the inner responder does, after a delay.
+    struct DelayedAnswer(stellar_agent_test_support::EchoIdResponder, Duration);
+
+    impl wiremock::Respond for DelayedAnswer {
+        fn respond(&self, request: &wiremock::Request) -> wiremock::ResponseTemplate {
+            self.0.respond(request).set_delay(self.1)
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]

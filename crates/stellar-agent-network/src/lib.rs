@@ -58,6 +58,7 @@ pub mod intent_view_test_helpers;
 pub mod keyring;
 pub mod mainnet;
 pub mod memo;
+pub mod operational;
 pub mod policy_engine;
 pub mod policy_state;
 pub mod policy_view;

@@ -42,7 +42,9 @@ Fee refusals include `fees.percentile_exceeds_cap`,
 Resolver fee failures use `network.mainnet_authorization_refused`.
 Endpoint probes preserve `network.endpoint_network_mismatch`,
 `network.endpoint_identity_unavailable`, `network.unsupported_protocol_version`,
-and `network.rpc_credential_refused`.
+and `network.rpc_credential_refused`. `pay`, sponsored `accounts create`, and
+`trustline` refuse an endpoint that is not healthy or whose latest ledger closed
+more than 60 seconds from the host clock with `network.endpoint_not_ready`.
 
 ## Shared flags
 

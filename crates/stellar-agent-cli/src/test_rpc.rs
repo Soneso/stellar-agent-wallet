@@ -10,7 +10,9 @@
 //! confirmed spend counts in the current policy window. Every send it accepts
 //! advances the sequence number of the accounts it funds, as the network does
 //! for the source account. `getHealth` and `getLedgers` describe a ledger
-//! range that covers every submission the tests make.
+//! range that covers every submission the tests make; the latest ledger
+//! closed at the time of the request unless a test makes the endpoint stale
+//! or unhealthy.
 
 #![allow(
     clippy::unwrap_used,
@@ -67,6 +69,10 @@ pub(crate) struct ClassicRpc {
     /// `(method, first delayed index, delay)`: the answers to that method
     /// from that request on arrive after the delay.
     stall: Arc<Mutex<Option<(String, usize, std::time::Duration)>>>,
+    /// How many seconds before the request the latest ledger closed.
+    close_age_secs: Arc<Mutex<u64>>,
+    /// The status `getHealth` reports.
+    health_status: Arc<Mutex<String>>,
 }
 
 impl ClassicRpc {
@@ -93,6 +99,8 @@ impl ClassicRpc {
             script: None,
             counts: Arc::default(),
             stall: Arc::default(),
+            close_age_secs: Arc::default(),
+            health_status: Arc::new(Mutex::new("healthy".to_owned())),
             accounts: Arc::new(accounts.iter().map(|a| (*a).to_owned()).collect()),
             accepted_sends: Arc::default(),
             entries: Arc::new(
@@ -147,6 +155,17 @@ impl ClassicRpc {
     /// Reports `passphrase` from every later `getNetwork`.
     pub(crate) fn report(&self, passphrase: &str) {
         *self.network.lock().unwrap() = passphrase.to_owned();
+    }
+
+    /// Reports from every later `getLedgers` a latest ledger that closed
+    /// `seconds` before the request.
+    pub(crate) fn close_ledgers_ago(&self, seconds: u64) {
+        *self.close_age_secs.lock().unwrap() = seconds;
+    }
+
+    /// Reports `status` from every later `getHealth`.
+    pub(crate) fn report_health(&self, status: &str) {
+        *self.health_status.lock().unwrap() = status.to_owned();
     }
 
     /// Starts a server answering every `POST` with this endpoint.
@@ -254,20 +273,8 @@ impl Respond for ClassicRpc {
                 "latestLedger": 1006,
                 "oldestLedger": 1
             }),
-            "getHealth" => json!({
-                "status": "healthy",
-                "latestLedger": 2000,
-                "oldestLedger": 1,
-                "ledgerRetentionWindow": 1999
-            }),
-            "getLedgers" => json!({
-                "latestLedger": 2000,
-                "oldestLedger": 1,
-                "latestLedgerCloseTime": "1700000100",
-                "oldestLedgerCloseTime": 1,
-                "cursor": "2000",
-                "ledgers": []
-            }),
+            "getHealth" => health_result(&self.health_status.lock().unwrap()),
+            "getLedgers" => ledgers_result(now_secs() - *self.close_age_secs.lock().unwrap()),
             other => panic!("unexpected RPC method {other}"),
         };
         ResponseTemplate::new(200)
@@ -276,14 +283,52 @@ impl Respond for ClassicRpc {
     }
 }
 
+/// The answer of a healthy endpoint whose latest ledger closed at the time
+/// of the request, to the `getHealth` or `getLedgers` request of the
+/// operational check; `None` for every other method. The command tests' own
+/// mocks answer those two methods with it.
+pub(crate) fn operational_result(rpc_method: &str) -> Option<Value> {
+    match rpc_method {
+        "getHealth" => Some(health_result("healthy")),
+        "getLedgers" => Some(ledgers_result(now_secs())),
+        _ => None,
+    }
+}
+
+/// A `getHealth` answer reporting `status` with latest ledger 2000.
+fn health_result(status: &str) -> Value {
+    json!({
+        "status": status,
+        "latestLedger": 2000,
+        "oldestLedger": 1,
+        "ledgerRetentionWindow": 1999
+    })
+}
+
+/// A `getLedgers` answer whose latest ledger 2000 closed at `close_secs`.
+fn ledgers_result(close_secs: u64) -> Value {
+    json!({
+        "latestLedger": 2000,
+        "oldestLedger": 1,
+        "latestLedgerCloseTime": close_secs.to_string(),
+        "oldestLedgerCloseTime": 1,
+        "cursor": "2000",
+        "ledgers": []
+    })
+}
+
 /// The current Unix time in seconds as the decimal string `getTransaction`
 /// reports a ledger close time in.
 fn ledger_close_now() -> String {
+    now_secs().to_string()
+}
+
+/// The current Unix time in seconds.
+fn now_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs()
-        .to_string()
 }
 
 /// The G-strkey of the source account of the transaction a

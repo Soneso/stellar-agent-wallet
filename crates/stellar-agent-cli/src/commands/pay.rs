@@ -149,6 +149,7 @@ use stellar_agent_network::cross_check::{
     PayWitnessInputs, TrustlineObservation, obtain_classic_witness, obtain_classic_witness_bound,
 };
 use stellar_agent_network::fees::{check_classic_fee_cap_signed, classic_fee_source};
+use stellar_agent_network::operational::read_within_readiness_deadline;
 use stellar_agent_network::signing::Signer;
 use stellar_agent_network::signing::envelope_signing::attach_signature;
 use stellar_agent_network::signing::source::signer_from_ledger;
@@ -169,8 +170,8 @@ use crate::common::mainnet_write::{
     mainnet_write_build_refusal, require_v1_engine,
 };
 use crate::common::network::{
-    EndpointFlags, EndpointUrlFlag, TargetNetwork, check_endpoint_identity, mainnet_mode_refusal,
-    network_context_for_command,
+    EndpointFlags, EndpointUrlFlag, TargetNetwork, check_endpoint_identity, check_endpoint_ready,
+    mainnet_mode_refusal, network_context_for_command,
 };
 use crate::common::profile_access::{
     ProfileOrigin, injected_profile_load, load_profile_or_synthesize_testnet_with,
@@ -599,7 +600,7 @@ where
     }
 
     let built = match checked_client_and_build_inputs(context, args).await {
-        Ok((client, inputs)) => build_unsigned_envelope(&client, context, args, inputs).await,
+        Ok((client, inputs)) => build_unsigned_envelope(&client, context, args, inputs, None).await,
         Err(e) => Err(e),
     };
     match built {
@@ -1387,7 +1388,7 @@ where
 
     // 1. Build (includes SEP-29 check).
     let built = match build_inputs(args, asset, amount) {
-        Ok(inputs) => build_unsigned_envelope(&client, context, args, inputs).await,
+        Ok(inputs) => build_unsigned_envelope(&client, context, args, inputs, None).await,
         Err(e) => Err(e),
     };
     let built = match built {
@@ -1580,20 +1581,23 @@ fn build_inputs(
     })
 }
 
-/// Builds the client a stage reads and sends through, and checks that its
-/// endpoint serves the network of `context`, under a fresh budget of
+/// Builds the client a stage reads and sends through, checks that its
+/// endpoint serves the network of `context`, then checks that the endpoint
+/// is healthy and current. Each check gets a fresh budget of
 /// `--timeout-seconds`.
 ///
 /// # Errors
 ///
 /// Returns the construction failure or the refusal of
-/// [`check_endpoint_identity`].
+/// [`check_endpoint_identity`] or [`check_endpoint_ready`].
 async fn checked_client(
     context: &NetworkContext,
     args: &PayArgs,
 ) -> Result<StellarRpcClient, WalletError> {
     let client = context.primary_client()?;
-    check_endpoint_identity(&client, context, Duration::from_secs(args.timeout_seconds)).await?;
+    let timeout = Duration::from_secs(args.timeout_seconds);
+    check_endpoint_identity(&client, context, timeout).await?;
+    check_endpoint_ready(&client, tokio::time::Instant::now() + timeout).await?;
     Ok(client)
 }
 
@@ -1642,12 +1646,20 @@ fn parse_asset_and_amount(args: &PayArgs) -> Result<(Asset, StellarAmount), Wall
 ///
 /// Reads the fee, the source sequence, the SEP-29 data entry, and the
 /// destination view through `client`, whose endpoint the caller has checked.
-/// Runs SEP-29 memo-required check before building.
+/// Runs SEP-29 memo-required check before building. With
+/// `readiness_deadline`, the deadline the caller's readiness check ran
+/// under, the source account read runs under that deadline too.
+///
+/// # Errors
+///
+/// Returns the first read or build refusal, and `network.endpoint_not_ready`
+/// when the source account read is still running at `readiness_deadline`.
 async fn build_unsigned_envelope(
     client: &StellarRpcClient,
     context: &NetworkContext,
     args: &PayArgs,
     inputs: BuildInputs<'_>,
+    readiness_deadline: Option<tokio::time::Instant>,
 ) -> Result<BuiltPaymentEnvelope, WalletError> {
     let BuildInputs {
         source,
@@ -1661,7 +1673,11 @@ async fn build_unsigned_envelope(
     // Fetch source account to get sequence number and verify it exists.
     // Pass empty slice: pay only needs the account sequence number (native balance
     // is sufficient); no trustlines are queried here.
-    let source_account = stellar_agent_network::fetch_account(client, source, &[]).await?;
+    let source_read = stellar_agent_network::fetch_account(client, source, &[]);
+    let source_account = match readiness_deadline {
+        Some(deadline) => read_within_readiness_deadline(deadline, source_read).await?,
+        None => source_read.await?,
+    };
     // Pass the current on-chain sequence directly; `stellar_baselib::TransactionBuilder::build`
     // calls `Account::increment_sequence_number` internally. An explicit +1
     // here would produce CURRENT+2 → TxBadSeq.
@@ -2206,6 +2222,15 @@ where
     if let Err(e) = check_endpoint_identity(&client, &net_context, timeout).await {
         return fail(&Envelope::<()>::err(&e));
     }
+    // The check precedes every account read, so the sequence and the views
+    // the envelope is signed against come from a current endpoint; the
+    // source account read runs under the check's deadline, and the summary
+    // names the ledger the check observed.
+    let readiness_deadline = tokio::time::Instant::now() + timeout;
+    let operational = match check_endpoint_ready(&client, readiness_deadline).await {
+        Ok(report) => report,
+        Err(e) => return fail(&Envelope::<()>::err(&e)),
+    };
     let now_ms = match stellar_agent_core::timefmt::now_unix_ms() {
         Ok(v) => v,
         Err(e) => {
@@ -2230,7 +2255,15 @@ where
         Err(e) => return fail(&Envelope::<()>::err(&e)),
     };
     let source = inputs.source;
-    let built = match build_unsigned_envelope(&client, &net_context, args, inputs).await {
+    let built = match build_unsigned_envelope(
+        &client,
+        &net_context,
+        args,
+        inputs,
+        Some(readiness_deadline),
+    )
+    .await
+    {
         Ok(built) => built,
         Err(e) => return fail(&Envelope::<()>::err(&e)),
     };
@@ -2347,6 +2380,7 @@ where
         evaluation: &evaluation,
         effective_cap,
         witness: cross_check.witness(),
+        ledger: operational,
     })
     .await
     {
@@ -2446,7 +2480,8 @@ mod tests {
                         })
                     }
                 }
-                _ => serde_json::json!({}),
+                other => crate::test_rpc::operational_result(other)
+                    .unwrap_or_else(|| serde_json::json!({})),
             };
 
             ResponseTemplate::new(200)
@@ -2552,7 +2587,14 @@ mod tests {
     ) -> Result<BuiltPaymentEnvelope, WalletError> {
         let client = StellarRpcClient::new(&context.rpc_url)?;
         let (asset, amount) = parse_asset_and_amount(args)?;
-        build_unsigned_envelope(&client, context, args, build_inputs(args, asset, amount)?).await
+        build_unsigned_envelope(
+            &client,
+            context,
+            args,
+            build_inputs(args, asset, amount)?,
+            None,
+        )
+        .await
     }
 
     async fn mount_pay_build_rpc(p95: &str) -> MockServer {
@@ -3201,7 +3243,7 @@ mod tests {
         let (client, inputs) = checked_client_and_build_inputs(&context, &args)
             .await
             .expect("the context endpoint passes the endpoint check");
-        build_unsigned_envelope(&client, &context, &args, inputs)
+        build_unsigned_envelope(&client, &context, &args, inputs, None)
             .await
             .expect("context endpoint builds");
         let methods: Vec<String> = primary
@@ -5935,6 +5977,165 @@ mod tests {
             assert_eq!(entries[0].kind_name, "Consumed");
             assert!(fixture.oracle_methods().await.is_empty());
             assert_eq!(fixture.initializer_calls(), 1);
+        }
+
+        /// Operational check: a primary whose latest ledger closed beyond the
+        /// readiness bound refuses with `network.endpoint_not_ready` before
+        /// any account read, before the summary is shown and before an entry
+        /// is parked.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn a_stale_endpoint_refuses_before_the_summary() {
+            let primary = accounts();
+            let fixture = Spec::new("mainnet-pay-stale-endpoint")
+                .primary(primary.clone())
+                .build()
+                .await;
+            primary.close_ledgers_ago(120);
+
+            let run = run(&fixture, &memo_args(&fixture)).await;
+
+            assert_refused_before_confirmation(&fixture, &run, "network.endpoint_not_ready").await;
+            assert!(
+                run.message().contains("ledger 2000 closed"),
+                "{}",
+                run.envelope
+            );
+            assert_eq!(
+                fixture.primary_methods().await,
+                ["getNetwork", "getHealth", "getLedgers"],
+                "a stale endpoint answers no account read"
+            );
+            fixture.assert_no_consent_ceremony();
+        }
+
+        /// Operational check: a source account read still running at the
+        /// deadline the readiness check ran under refuses with
+        /// `network.endpoint_not_ready` before the summary is shown and
+        /// before an entry is parked, and the build sends no later request.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn an_account_read_past_the_readiness_deadline_refuses_before_the_summary() {
+            let primary = accounts();
+            let fixture = Spec::new("mainnet-pay-slow-account")
+                .primary(primary.clone())
+                .build()
+                .await;
+            let answer_delay = std::time::Duration::from_secs(3);
+            primary.stall_after("getLedgerEntries", 0, answer_delay);
+            let mut args = memo_args(&fixture);
+            args.timeout_seconds = 1;
+
+            let started = std::time::Instant::now();
+            let run = run(&fixture, &args).await;
+
+            assert!(
+                started.elapsed() < answer_delay,
+                "the deadline ends the read before its answer"
+            );
+            assert_refused_before_confirmation(&fixture, &run, "network.endpoint_not_ready").await;
+            assert!(
+                run.message()
+                    .ends_with("account read exceeded the readiness deadline"),
+                "{}",
+                run.envelope
+            );
+            assert_eq!(
+                fixture.primary_methods().await,
+                ["getNetwork", "getHealth", "getLedgers", "getLedgerEntries"],
+                "the refused read is the last request"
+            );
+            fixture.assert_no_consent_ceremony();
+        }
+
+        /// Operational check: the build checks the primary's identity, then its
+        /// readiness, then reads the account, and the write checks readiness
+        /// only once; the summary names the latest ledger and the close-time
+        /// lag after the fee lines.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn the_summary_names_the_ledger_of_a_current_endpoint() {
+            let fixture = Spec::new("mainnet-pay-summary-ledger").build().await;
+
+            let run = run(&fixture, &memo_args(&fixture)).await;
+
+            assert_eq!(run.code, 0, "{}", run.envelope);
+            let methods = fixture.primary_methods().await;
+            assert_eq!(
+                methods.get(..4),
+                Some(
+                    ["getNetwork", "getHealth", "getLedgers", "getLedgerEntries"]
+                        .map(str::to_owned)
+                        .as_slice()
+                ),
+                "identity, then readiness, then the account read: {methods:?}"
+            );
+            for read in ["getHealth", "getLedgers"] {
+                assert_eq!(
+                    methods.iter().filter(|method| *method == read).count(),
+                    1,
+                    "the write checks the endpoint once: {methods:?}"
+                );
+            }
+            let summaries = fixture.summaries();
+            assert_eq!(summaries.len(), 1, "{summaries:?}");
+            let lines: Vec<&str> = summaries[0].lines().collect();
+            let at = lines
+                .iter()
+                .position(|line| line.starts_with("Ledger "))
+                .unwrap_or_else(|| panic!("the summary names the ledger: {lines:?}"));
+            assert!(
+                lines[at - 1].starts_with("Fee cap: "),
+                "the ledger line follows the fee lines: {lines:?}"
+            );
+            assert_eq!(
+                lines[at + 1],
+                crate::common::mainnet_confirm::CONSENT_LINE,
+                "{lines:?}"
+            );
+            let lag: u64 = lines[at]
+                .strip_prefix("Ledger 2000, closed ")
+                .and_then(|rest| rest.strip_suffix(" s ago"))
+                .unwrap_or_else(|| panic!("unexpected ledger line: {}", lines[at]))
+                .parse()
+                .unwrap();
+            assert!(
+                lag <= stellar_agent_network::operational::MAX_LEDGER_CLOSE_LAG.as_secs(),
+                "{}",
+                lines[at]
+            );
+        }
+
+        /// Guard of the build's audit-writer preflight, which acquires the
+        /// writer after the policy evaluation and before the witness: a
+        /// writer another handle holds on the profile's log refuses with the
+        /// writer's code before the summary is shown and before an entry is
+        /// parked.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn the_writer_preflight_refuses_a_held_audit_writer_before_the_summary() {
+            let fixture = Spec::new("mainnet-pay-held-writer").build().await;
+            let profile = fixture.profile();
+            // The enrollment ceremony left this process's registry holding the
+            // writer; dropping that entry leaves the log to the handle below,
+            // as a writer of another process would hold it.
+            stellar_agent_core::audit_log::AuditWriterRegistry::remove_for_test(fixture.name);
+            let _held = crate::commands::value_audit::open_best_effort_audit_writer(
+                &profile,
+                fixture.name,
+                crate::common::profile_access::ProfileOrigin::Persisted,
+            )
+            .unwrap_or_else(|e| panic!("the test holds the keyed writer: {e}"));
+
+            let run = run(&fixture, &memo_args(&fixture)).await;
+
+            assert_refused_before_confirmation(&fixture, &run, "audit.chain_key_unavailable").await;
+            assert!(
+                run.message().contains("audit.writer_locked"),
+                "{}",
+                run.envelope
+            );
+            fixture.assert_no_consent_ceremony();
         }
 
         /// Accept: a memo-less payment reaches the oracle through the route

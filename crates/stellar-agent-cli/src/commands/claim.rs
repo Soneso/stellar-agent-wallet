@@ -151,6 +151,7 @@ use stellar_agent_network::cross_check::{
     CrossCheckView, TrustlineObservation, obtain_classic_witness, obtain_classic_witness_bound,
 };
 use stellar_agent_network::fees::{check_classic_fee_cap_signed, classic_fee_source};
+use stellar_agent_network::operational::OperationalReport;
 use stellar_agent_network::signing::Signer;
 use stellar_agent_network::signing::envelope_signing::attach_signature;
 use stellar_agent_network::signing::source::signer_from_ledger;
@@ -171,8 +172,8 @@ use crate::common::mainnet_write::{
     mainnet_write_build_refusal, require_v1_engine,
 };
 use crate::common::network::{
-    EndpointFlags, EndpointUrlFlag, TargetNetwork, check_endpoint_identity, mainnet_mode_refusal,
-    network_context_for_command,
+    EndpointFlags, EndpointUrlFlag, TargetNetwork, check_endpoint_identity, check_endpoint_ready,
+    mainnet_mode_refusal, network_context_for_command,
 };
 use crate::common::profile_access::{
     ProfileOrigin, injected_profile_load, load_profile_or_synthesize_testnet_with,
@@ -185,6 +186,7 @@ use crate::common::signer_ceremony::{
     resolve_software_signer_from_env,
 };
 use crate::common::{ResolvedProfileName, resolve_profile_name};
+use stellar_agent_network::operational::read_within_readiness_deadline;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Constants
@@ -257,6 +259,8 @@ struct BuiltClaimEnvelope {
     account_view: stellar_agent_network::AccountView,
     /// The typed preview the build stage computed before the guards ran.
     preview: ClaimPreview,
+    /// What the operational check observed before the first read.
+    operational: OperationalReport,
 }
 
 /// A build-stage failure, with the preview when the failure followed it.
@@ -1378,6 +1382,7 @@ async fn build_unsigned_envelope(
             trustline: guarded.trustline,
             account_view: previewed.account_view,
             preview: previewed.preview,
+            operational: previewed.operational,
         }),
         Err(error) => Err(ClaimBuildFailure {
             error,
@@ -1393,6 +1398,8 @@ struct PreviewedClaim {
     preview: ClaimPreview,
     /// The claimable-balance record the preview was built from.
     record: stellar_xdr::ClaimableBalanceEntry,
+    /// What the operational check observed before the entry read.
+    operational: OperationalReport,
 }
 
 /// Parses the balance id and validates the source G-strkey: the claim
@@ -1415,21 +1422,30 @@ fn claim_inputs(args: &ClaimArgs) -> Result<BalanceId, ClaimError> {
 /// Checks the endpoint of `client`, fetches the entry of the balance `id` and
 /// the source account, and builds the typed preview.
 ///
-/// The endpoint check gets a fresh budget of `--timeout-seconds`.
+/// The identity check gets a budget of `--timeout-seconds`. The readiness
+/// check gets a fresh one, and the source account read runs under the
+/// readiness check's deadline.
 async fn fetch_claim_preview(
     client: &StellarRpcClient,
     context: &NetworkContext,
     args: &ClaimArgs,
     id: BalanceId,
 ) -> Result<PreviewedClaim, ClaimError> {
-    check_endpoint_identity(client, context, Duration::from_secs(args.timeout_seconds)).await?;
+    let timeout = Duration::from_secs(args.timeout_seconds);
+    check_endpoint_identity(client, context, timeout).await?;
+    let readiness_deadline = tokio::time::Instant::now() + timeout;
+    let operational = check_endpoint_ready(client, readiness_deadline).await?;
 
     let entry = fetch_claimable_balance_entry(client, &id).await?;
 
     // Fetch the source account for the sequence number and native balance.
     // Empty trustline-request slice: the trustline guard fetch (below) is a
     // separate call keyed on the balance's own asset.
-    let account_view = fetch_account(client, &args.source, &[]).await?;
+    let account_view = read_within_readiness_deadline(
+        readiness_deadline,
+        fetch_account(client, &args.source, &[]),
+    )
+    .await?;
 
     let now_secs = current_unix_secs()?;
     let preview = ClaimPreview::build(&entry, &args.source, now_secs)?;
@@ -1438,6 +1454,7 @@ async fn fetch_claim_preview(
         account_view,
         preview,
         record: entry,
+        operational,
     })
 }
 
@@ -1665,20 +1682,23 @@ async fn sign_envelope(
 // Submit helper
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Builds the client a staged stage reads and sends through, and checks that
-/// its endpoint serves the network of `context`, under a fresh budget of
+/// Builds the client a staged stage reads and sends through, checks that its
+/// endpoint serves the network of `context`, then checks that the endpoint is
+/// healthy and current. Each check gets a fresh budget of
 /// `--timeout-seconds`.
 ///
 /// # Errors
 ///
 /// Returns the construction failure or the refusal of
-/// [`check_endpoint_identity`].
+/// [`check_endpoint_identity`] or [`check_endpoint_ready`].
 async fn checked_client(
     context: &NetworkContext,
     args: &ClaimArgs,
 ) -> Result<StellarRpcClient, WalletError> {
     let client = context.primary_client()?;
-    check_endpoint_identity(&client, context, Duration::from_secs(args.timeout_seconds)).await?;
+    let timeout = Duration::from_secs(args.timeout_seconds);
+    check_endpoint_identity(&client, context, timeout).await?;
+    check_endpoint_ready(&client, tokio::time::Instant::now() + timeout).await?;
     Ok(client)
 }
 
@@ -2005,6 +2025,7 @@ where
         evaluation: &evaluation,
         effective_cap,
         witness: cross_check.witness(),
+        ledger: built.operational.clone(),
     })
     .await
     {
@@ -3114,7 +3135,10 @@ mod tests {
                             "latestLedger": 1001,
                         })
                     }
-                    _ => serde_json::json!({}),
+                    _ => value["method"]
+                        .as_str()
+                        .and_then(crate::test_rpc::operational_result)
+                        .unwrap_or_else(|| serde_json::json!({})),
                 };
                 wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
                     "jsonrpc": "2.0",
@@ -3232,13 +3256,13 @@ mod tests {
         assert_eq!(preview["is_claimant"], true, "{envelope}");
         let methods = received_methods(&server).await;
         assert_eq!(
-            methods.first().map(String::as_str),
-            Some("getNetwork"),
-            "the endpoint check precedes every read: {methods:?}"
+            methods.get(..3),
+            Some(&["getNetwork", "getHealth", "getLedgers"].map(String::from)[..]),
+            "the identity and readiness checks precede every read: {methods:?}"
         );
         assert!(
-            methods.len() > 1 && methods[1..].iter().all(|m| m == "getLedgerEntries"),
-            "only ledger reads follow the endpoint check, and the fee parse \
+            methods.len() > 3 && methods[3..].iter().all(|m| m == "getLedgerEntries"),
+            "only ledger reads follow the endpoint checks, and the fee parse \
              fails before any later request: {methods:?}"
         );
     }
@@ -4522,6 +4546,58 @@ mod tests {
                 "no confirmation entry"
             );
             assert!(fixture.sent_envelopes().await.is_empty(), "nothing is sent");
+        }
+
+        /// Operational check: the build checks the primary's identity, then
+        /// its health and latest ledger, and reads the claim entry only after
+        /// both checks.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn the_endpoint_checks_precede_the_claim_entry_read() {
+            let fixture = Spec::new("mainnet-claim-readiness-order")
+                .primary(ledger(true, 100_000_000))
+                .oracle(ledger(true, 100_000_000))
+                .build()
+                .await;
+
+            let _run = run(&fixture, &mainnet_args(&fixture)).await;
+
+            let methods = fixture.primary_methods().await;
+            assert_eq!(
+                methods.get(..4),
+                Some(
+                    ["getNetwork", "getHealth", "getLedgers", "getLedgerEntries"]
+                        .map(str::to_owned)
+                        .as_slice()
+                ),
+                "identity, then readiness, then the claim entry read: {methods:?}"
+            );
+        }
+
+        /// Operational check: a primary whose latest ledger closed beyond the
+        /// readiness bound refuses with `network.endpoint_not_ready` before
+        /// any account read, before the summary is shown and before an entry
+        /// is parked.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn a_stale_endpoint_refuses_before_the_claim_entry_read() {
+            let primary = ledger(true, 100_000_000);
+            let fixture = Spec::new("mainnet-claim-readiness-stale")
+                .primary(primary.clone())
+                .oracle(ledger(true, 100_000_000))
+                .build()
+                .await;
+            primary.close_ledgers_ago(120);
+
+            let run = run(&fixture, &mainnet_args(&fixture)).await;
+
+            assert_refused_before_confirmation(&fixture, &run, "network.endpoint_not_ready").await;
+            assert_eq!(
+                fixture.primary_methods().await,
+                ["getNetwork", "getHealth", "getLedgers"],
+                "a stale endpoint answers no account read"
+            );
+            fixture.assert_no_consent_ceremony();
         }
 
         /// Signer choice: `--secret-env` on a mainnet profile refuses with

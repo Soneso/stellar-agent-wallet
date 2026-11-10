@@ -449,6 +449,7 @@ That request is not retried.
 The network layer reports a JSON-RPC error object from the primary endpoint as `network.rpc_unreachable` on a read before a submission is recorded.
 A command or tool that wraps such a read reports its own code instead, for example `trustline.source_account_fetch_failed` for the source account read of CLI `trustline`.
 On the endpoint identity check the network layer reports `network.endpoint_identity_unavailable`, and from the oracle `network.witness_unavailable`.
+On the readiness check before a classic write the network layer reports `network.endpoint_not_ready` when the endpoint is not healthy or its latest ledger closed more than 60 seconds from the host clock.
 The network layer reports a recorded send whose outcome it cannot determine as `submission.tx_timeout`.
 The confirmation poll retries a JSON-RPC error until the submit timeout, which reports the same code.
 The network layer reports a server hash that differs from the local one as `submission.hash_mismatch`.

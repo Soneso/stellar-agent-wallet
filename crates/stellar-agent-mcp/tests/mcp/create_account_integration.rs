@@ -154,7 +154,9 @@ impl Respond for CreateAccountFeeRpcResponder {
                     })
                 }
             }
-            _ => serde_json::json!({}),
+            other => {
+                crate::common::operational_result(other).unwrap_or_else(|| serde_json::json!({}))
+            }
         };
 
         ResponseTemplate::new(200)
@@ -380,8 +382,8 @@ async fn simulate_rejects_chain_id_mismatch() {
     );
     assert_eq!(
         crate::common::received_methods(&endpoint).await,
-        ["getNetwork", "getLedgerEntries"],
-        "the chain check runs after the endpoint check and the source read"
+        ["getNetwork", "getHealth", "getLedgers", "getLedgerEntries"],
+        "the chain check runs after the endpoint checks and the source read"
     );
 }
 
@@ -510,6 +512,7 @@ async fn simulate_create_account_fee_auto_selects_p95_and_binds_envelope_fee() {
         .and_then(serde_json::Value::as_str)
         .expect("envelope_xdr present");
     assert_eq!(tx_fee_from_envelope_xdr(envelope_xdr), 333);
+    crate::common::assert_operational_reported(data);
 }
 
 #[tokio::test]
@@ -1399,7 +1402,9 @@ impl wiremock::Respond for AccountOnlyResponder {
                     serde_json::json!({ "entries": [], "latestLedger": 1001 })
                 }
             }
-            _ => serde_json::json!({}),
+            other => {
+                crate::common::operational_result(other).unwrap_or_else(|| serde_json::json!({}))
+            }
         };
 
         wiremock::ResponseTemplate::new(200)
@@ -1491,7 +1496,9 @@ impl Respond for CreateAccountSubmitSuccessRpcResponder {
                 "ledger": 1005,
                 "txHash": crate::common::polled_tx_hash(request),
             }),
-            _ => serde_json::json!({}),
+            other => {
+                crate::common::operational_result(other).unwrap_or_else(|| serde_json::json!({}))
+            }
         };
 
         ResponseTemplate::new(200)

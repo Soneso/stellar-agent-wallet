@@ -401,6 +401,25 @@ async fn mainnet_commit_rejects_a_genuine_local_v4_attestation() {
     assert_classic_accepted("the presence-backed consent", &run, &result);
 }
 
+/// A mainnet preparation asks the primary which network it serves, then
+/// for its health and the close time of its latest ledger, and reads the
+/// account the envelope is built against only after both checks; the
+/// preparation reports what the readiness check observed.
+#[tokio::test]
+#[serial_test::serial(keyring)]
+async fn mainnet_prepare_checks_readiness_before_the_account_read() {
+    for tool in Tool::ALL {
+        let run = ClassicRun::new(tool).await;
+        let methods = run.control.methods();
+        assert!(methods.len() > 3, "{tool:?}: {methods:?}");
+        assert_eq!(
+            methods[..4],
+            ["getNetwork", "getHealth", "getLedgers", "getLedgerEntries"],
+            "{tool:?}: identity, then readiness, then the account read: {methods:?}"
+        );
+    }
+}
+
 /// Each commit kind refuses a version 5 record over an assertion the
 /// verifier refuses, with the uniform envelope and before any signing, and
 /// proceeds with the genuine assertion of the pinned credential: the four

@@ -305,7 +305,9 @@ impl Respond for ClaimRpcResponder {
                     empty_ledger_entries_result()
                 }
             }
-            _ => serde_json::json!({}),
+            other => {
+                crate::common::operational_result(other).unwrap_or_else(|| serde_json::json!({}))
+            }
         };
         json_rpc_response(&req_id, &result)
     }
@@ -344,7 +346,7 @@ impl Respond for EntryGoneResponder {
                 empty_ledger_entries_result()
             }
         } else {
-            serde_json::json!({})
+            crate::common::operational_result(&method).unwrap_or_else(|| serde_json::json!({}))
         };
         json_rpc_response(&req_id, &result)
     }
@@ -425,6 +427,7 @@ async fn simulate_happy_path_returns_envelope_nonce_and_preview() {
             .and_then(serde_json::Value::as_str),
         Some(CLAIM_AMOUNT_STROOPS.to_string().as_str())
     );
+    crate::common::assert_operational_reported(data);
 }
 
 /// Scenario 2: empty `entries` for the claimable-balance key →
@@ -964,7 +967,9 @@ impl Respond for ClaimSubmitSuccessRpcResponder {
                 "ledger": 1005,
                 "txHash": crate::common::polled_tx_hash(request),
             }),
-            _ => serde_json::json!({}),
+            other => {
+                crate::common::operational_result(other).unwrap_or_else(|| serde_json::json!({}))
+            }
         };
         json_rpc_response(&req_id, &result)
     }

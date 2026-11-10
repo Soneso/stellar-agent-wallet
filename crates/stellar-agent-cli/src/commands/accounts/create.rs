@@ -160,7 +160,7 @@ use crate::common::mainnet_write::{
     mainnet_write_build_refusal, require_v1_engine,
 };
 use crate::common::network::{
-    EndpointFlags, EndpointUrlFlag, TargetNetwork, check_endpoint_identity,
+    EndpointFlags, EndpointUrlFlag, TargetNetwork, check_endpoint_identity, check_endpoint_ready,
     network_context_for_command,
 };
 use crate::common::profile_access::{
@@ -172,6 +172,7 @@ use crate::common::signer_ceremony::{
     resolve_software_signer_from_env,
 };
 use crate::common::{ResolvedProfileName, resolve_profile_name};
+use stellar_agent_network::operational::read_within_readiness_deadline;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Constants
@@ -885,6 +886,15 @@ where
         print_error(&Envelope::<()>::err(&e), args.output);
         return 1;
     }
+    if let Err(e) = check_endpoint_ready(
+        &client,
+        tokio::time::Instant::now() + Duration::from_secs(args.timeout_seconds),
+    )
+    .await
+    {
+        print_error(&Envelope::<()>::err(&e), args.output);
+        return 1;
+    }
     let sponsor_account_view =
         match stellar_agent_network::fetch_account(&client, &sponsor, &[]).await {
             Ok(v) => v,
@@ -1398,11 +1408,22 @@ where
     if let Err(e) = check_endpoint_identity(&client, &net_context, timeout).await {
         return fail(&Envelope::<()>::err(&e));
     }
-    let sponsor_account_view =
-        match stellar_agent_network::fetch_account(&client, &sponsor, &[]).await {
-            Ok(view) => view,
-            Err(e) => return fail(&Envelope::<()>::err(&e)),
-        };
+    // The check precedes the sponsor read, which runs under the check's
+    // deadline; the summary names the ledger the check observed.
+    let readiness_deadline = tokio::time::Instant::now() + timeout;
+    let operational = match check_endpoint_ready(&client, readiness_deadline).await {
+        Ok(report) => report,
+        Err(e) => return fail(&Envelope::<()>::err(&e)),
+    };
+    let sponsor_account_view = match read_within_readiness_deadline(
+        readiness_deadline,
+        stellar_agent_network::fetch_account(&client, &sponsor, &[]),
+    )
+    .await
+    {
+        Ok(view) => view,
+        Err(e) => return fail(&Envelope::<()>::err(&e)),
+    };
     let now_ms = match stellar_agent_core::timefmt::now_unix_ms() {
         Ok(v) => v,
         Err(e) => {
@@ -1534,6 +1555,7 @@ where
         evaluation: &evaluation,
         effective_cap,
         witness: cross_check.witness(),
+        ledger: operational,
     })
     .await
     {
@@ -1636,7 +1658,8 @@ mod tests {
                         })
                     }
                 }
-                _ => serde_json::json!({}),
+                other => crate::test_rpc::operational_result(other)
+                    .unwrap_or_else(|| serde_json::json!({})),
             };
 
             ResponseTemplate::new(200)
@@ -2784,7 +2807,10 @@ mod tests {
             crate::test_rpc::last_rendered()["error"]["code"],
             "validation.signer_source_required",
         );
-        assert_eq!(methods, ["getNetwork", "getLedgerEntries"]);
+        assert_eq!(
+            methods,
+            ["getNetwork", "getHealth", "getLedgers", "getLedgerEntries"]
+        );
     }
 
     #[allow(unsafe_code, reason = "serialized test seed variable")]
@@ -2978,6 +3004,58 @@ mod tests {
             );
         }
     }
+
+    /// A sponsored creation checks the endpoint's identity, then its health
+    /// and the close time of its latest ledger, and reads the sponsor only
+    /// after both checks.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_sponsored_creation_checks_readiness_before_the_sponsor_read() {
+        let _zero_config = crate::test_rpc::zero_config();
+        let seed = [0x83; 32];
+        let sponsor = stellar_agent_test_support::signed_envelope::account_id_for_seed(seed);
+        let server = crate::test_rpc::ClassicRpc::testnet(&[&sponsor])
+            .serve()
+            .await;
+
+        let (code, _) = sponsored_run(seed, "CREATE_READINESS_ORDER_SK", &server, None).await;
+        let methods = crate::test_rpc::methods(&server).await;
+
+        assert_eq!(code, 0, "{methods:?}");
+        assert_eq!(
+            methods[..4],
+            ["getNetwork", "getHealth", "getLedgers", "getLedgerEntries"],
+            "identity, then readiness, then the sponsor read: {methods:?}"
+        );
+    }
+
+    /// An endpoint whose latest ledger closed beyond the readiness bound
+    /// refuses a sponsored creation with `network.endpoint_not_ready` before
+    /// the sponsor read.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_sponsored_creation_refuses_a_stale_endpoint_before_the_sponsor_read() {
+        let _zero_config = crate::test_rpc::zero_config();
+        let seed = [0x84; 32];
+        let sponsor = stellar_agent_test_support::signed_envelope::account_id_for_seed(seed);
+        let endpoint = crate::test_rpc::ClassicRpc::testnet(&[&sponsor]);
+        endpoint.close_ledgers_ago(120);
+        let server = endpoint.serve().await;
+
+        crate::common::render::take_rendered_for_test();
+        let (code, _) = sponsored_run(seed, "CREATE_READINESS_STALE_SK", &server, None).await;
+
+        assert_eq!(code, 1);
+        assert_eq!(
+            crate::test_rpc::last_rendered()["error"]["code"],
+            "network.endpoint_not_ready"
+        );
+        assert_eq!(
+            crate::test_rpc::methods(&server).await,
+            ["getNetwork", "getHealth", "getLedgers"],
+            "a stale endpoint answers no account read"
+        );
+    }
     #[test]
     fn sponsored_text_includes_the_witness() {
         let result: CreateAccountResult = serde_json::from_value(serde_json::json!({
@@ -3123,11 +3201,11 @@ mod tests {
                 Case::Unsigned => Some("validation.signer_source_required"),
                 _ => None,
             };
-            // Before signing, the primary answers the endpoint check and one
-            // sponsor read, which feeds the policy, the witness and the
-            // builder. A run that signs then reaches the submit layer, which
-            // checks the endpoint again and reads the signer set to verify the
-            // signature binding before the send.
+            // Before signing, the primary answers the endpoint identity and
+            // readiness checks and one sponsor read, which feeds the policy,
+            // the witness and the builder. A run that signs then reaches the
+            // submit layer, which checks the endpoint again and reads the
+            // signer set to verify the signature binding before the send.
             let primary_methods = methods(&primary).await;
             let signed = matches!(
                 case,
@@ -3135,9 +3213,11 @@ mod tests {
             );
             if signed {
                 assert_eq!(
-                    primary_methods[..5],
+                    primary_methods[..7],
                     [
                         "getNetwork",
+                        "getHealth",
+                        "getLedgers",
                         "getLedgerEntries",
                         "getNetwork",
                         "getLedgerEntries",
@@ -3146,14 +3226,14 @@ mod tests {
                     "the sponsor is read once before signing: {primary_methods:?}"
                 );
                 assert!(
-                    primary_methods.len() > 5
-                        && primary_methods[5..].iter().all(|m| m == "getTransaction"),
+                    primary_methods.len() > 7
+                        && primary_methods[7..].iter().all(|m| m == "getTransaction"),
                     "{primary_methods:?}"
                 );
             } else {
                 assert_eq!(
                     primary_methods,
-                    ["getNetwork", "getLedgerEntries"],
+                    ["getNetwork", "getHealth", "getLedgers", "getLedgerEntries"],
                     "the sponsor is read once and nothing is sent"
                 );
             }
@@ -3313,6 +3393,14 @@ mod tests {
         /// The starting balance of [`mainnet_args`]: 2 XLM.
         const STARTING_BALANCE: i64 = 20_000_000;
 
+        /// The fixture's default primary: an endpoint funding the agent, the
+        /// destination and the issuer.
+        fn sponsor_ledger() -> ClassicRpc {
+            let agent =
+                stellar_agent_test_support::signed_envelope::account_id_for_seed(AGENT_SEED);
+            ClassicRpc::mainnet(&[&agent, DESTINATION, ISSUER])
+        }
+
         /// A sponsored create of [`NEW_ACCOUNT`] with 2 XLM, sponsored by the
         /// agent, with no signer flag: a mainnet profile signs with the
         /// enrolled seed in the keyring.
@@ -3411,6 +3499,56 @@ mod tests {
                 "no confirmation entry"
             );
             assert!(fixture.sent_envelopes().await.is_empty(), "nothing is sent");
+        }
+
+        /// Operational check: the build checks the primary's identity, then
+        /// its health and latest ledger, and reads the sponsor only after
+        /// both checks.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn the_endpoint_checks_precede_the_sponsor_read() {
+            let fixture = Spec::new("mainnet-create-readiness-order")
+                .primary(sponsor_ledger())
+                .build()
+                .await;
+
+            let _run = run(&fixture, &mainnet_args(&fixture)).await;
+
+            let methods = fixture.primary_methods().await;
+            assert_eq!(
+                methods.get(..4),
+                Some(
+                    ["getNetwork", "getHealth", "getLedgers", "getLedgerEntries"]
+                        .map(str::to_owned)
+                        .as_slice()
+                ),
+                "identity, then readiness, then the sponsor read: {methods:?}"
+            );
+        }
+
+        /// Operational check: a primary whose latest ledger closed beyond the
+        /// readiness bound refuses with `network.endpoint_not_ready` before
+        /// any account read, before the summary is shown and before an entry
+        /// is parked.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn a_stale_endpoint_refuses_before_the_sponsor_read() {
+            let primary = sponsor_ledger();
+            let fixture = Spec::new("mainnet-create-readiness-stale")
+                .primary(primary.clone())
+                .build()
+                .await;
+            primary.close_ledgers_ago(120);
+
+            let run = run(&fixture, &mainnet_args(&fixture)).await;
+
+            assert_refused_before_confirmation(&fixture, &run, "network.endpoint_not_ready").await;
+            assert_eq!(
+                fixture.primary_methods().await,
+                ["getNetwork", "getHealth", "getLedgers"],
+                "a stale endpoint answers no account read"
+            );
+            fixture.assert_no_consent_ceremony();
         }
 
         /// Signer choice: `--secret-env` on a mainnet profile refuses with

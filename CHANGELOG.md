@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Every classic prepare on MCP and the CLI verbs `pay`, `claim`, sponsored
+  `accounts create`, and `trustline` check the endpoint's health, latest
+  ledger, and close-time lag before reading the account they sign against. A
+  failed check refuses with `network.endpoint_not_ready`
+  (`NetworkError::EndpointNotReady`). The bound is
+  `stellar_agent_network::operational::MAX_LEDGER_CLOSE_LAG`, 60 seconds. On
+  MCP and on the CLI mainnet path, an account read still running at the
+  check's deadline refuses the same way. The MCP prepare result carries the
+  observed ledger in `operational`, and the CLI mainnet summary names the
+  ledger.
+
 - `stellar_agent_network::signing::source::require_signer_key` compares a signer's public key with the expected signing account and names that account in the mismatch error.
 
 - `submission_accounting_expired` audit event and the

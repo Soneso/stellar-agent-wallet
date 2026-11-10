@@ -46,8 +46,8 @@ const DEST_G: &str = "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN";
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Reports `network` from `getNetwork` and answers every read the verbs make:
-/// the accounts in `accounts`, fee statistics, and a transaction the endpoint
-/// has no record of.
+/// the accounts in `accounts`, fee statistics, a transaction the endpoint has
+/// no record of, and the readiness reads of a healthy, current endpoint.
 #[derive(Clone)]
 struct Rpc {
     network: Arc<Mutex<String>>,
@@ -87,14 +87,9 @@ impl Respond for Rpc {
             "getTransaction" => json!({
                 "status": "NOT_FOUND", "latestLedger": 2000, "oldestLedger": 1
             }),
-            "getHealth" => json!({
-                "status": "healthy", "latestLedger": 2000, "oldestLedger": 1,
-                "ledgerRetentionWindow": 1999
-            }),
-            "getLedgers" => json!({
-                "latestLedger": 2000, "oldestLedger": 1, "latestLedgerCloseTime": "100",
-                "oldestLedgerCloseTime": 1, "cursor": "2000", "ledgers": []
-            }),
+            readiness @ ("getHealth" | "getLedgers") => {
+                crate::classic_ledger::readiness_result(readiness).unwrap()
+            }
             other => panic!("unexpected RPC method {other}"),
         };
         ResponseTemplate::new(200)
@@ -405,6 +400,12 @@ fn v1_profile_with_due_reservation(home: &Path, name: &str, rpc_url: &str, sourc
         .expect("the reservation is recorded");
 }
 
+/// The first requests of a stage that reconciles a due reservation on
+/// testnet: the endpoint's identity and readiness, then the reconcile's
+/// transaction lookup.
+const ENDPOINT_CHECK_THEN_RECONCILE: [&str; 4] =
+    ["getNetwork", "getHealth", "getLedgers", "getTransaction"];
+
 /// Mounts `rpc` on `server` again with an empty request trace.
 async fn remount(server: &MockServer, rpc: &Rpc) {
     server.reset().await;
@@ -436,8 +437,8 @@ async fn the_endpoint_check_precedes_the_reconcile_lookup_of_a_due_reservation()
         let (_code, _envelope) = run_cli(home.path(), &as_strs(&argv));
         let reached = methods(&server).await;
         assert_eq!(
-            reached.get(..2),
-            Some(["getNetwork".to_owned(), "getTransaction".to_owned()].as_slice()),
+            reached.get(..4),
+            Some(ENDPOINT_CHECK_THEN_RECONCILE.map(str::to_owned).as_slice()),
             "{label}: on testnet the reconcile looks the due reservation up right after \
              the endpoint check: {reached:?}"
         );
@@ -536,8 +537,8 @@ async fn a_malformed_fee_follows_the_endpoint_check_and_the_reconcile() {
         "on testnet the run refuses on the fee: {envelope}"
     );
     assert_eq!(
-        reached.get(..2),
-        Some(["getNetwork".to_owned(), "getTransaction".to_owned()].as_slice()),
+        reached.get(..4),
+        Some(ENDPOINT_CHECK_THEN_RECONCILE.map(str::to_owned).as_slice()),
         "the reconcile looks the due reservation up before the fee check: {reached:?}"
     );
 }

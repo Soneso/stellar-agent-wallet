@@ -432,7 +432,9 @@ their own `x402.*` code before the `chain_id` check.
 | `memo_return_hex` | string | no | 64 hex chars (32 bytes); mutually exclusive. |
 | `fee` | string | no | Classic fee selector: `<stroops>`, `auto`, `auto:pNN`. |
 
-Returns `{ envelope_xdr, nonce, expires_at_unix_ms, simulation }`. When the
+Returns `{ envelope_xdr, nonce, expires_at_unix_ms, simulation, operational }`.
+`operational` is `{ latest_ledger, close_time_unix, close_lag_seconds }`, the
+endpoint ledger the readiness check observed before the account read. When the
 policy requires approval for `stellar_pay` or `stellar_pay_commit`, the response
 includes an `approval` block carrying `approval_nonce` and `expires_at_unix_ms`.
 
@@ -533,7 +535,8 @@ from `envelope_xdr`, not from caller-supplied args.
 | `balance_id` | string | yes | A `B...` strkey, a canonical 72-hex id, or a bare 64-hex hash. |
 | `source_account` | string | no | G-strkey of the claiming account. Defaults to the profile's default MCP signer account when omitted. |
 
-Returns `{ envelope_xdr, nonce, expires_at_unix_ms, preview }`. `preview`
+Returns `{ envelope_xdr, nonce, expires_at_unix_ms, preview, operational }`,
+with `operational` as for `stellar_pay`. `preview`
 carries the balance id (both hex72 and strkey forms), asset code/issuer
 (absent for native XLM), `amount_stroops`, `amount_display`, the entry's
 claimants, whether `source_account` is a claimant, and the matched predicate
