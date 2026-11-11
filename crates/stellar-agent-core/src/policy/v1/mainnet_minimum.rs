@@ -69,6 +69,8 @@ requirements! {
     Thresholds => "thresholds",
     Ttl => "ttl",
     ApprovalCredentials => "approval_credentials",
+    CertPinWithoutOrigin => "approval.cert_pin_without_origin",
+    OriginWithoutCertPin => "approval.origin_without_cert_pin",
 }
 
 /// The detail of every `[mainnet]` table requirement when the table is absent.
@@ -282,6 +284,28 @@ pub fn evaluate(
                     _ => super::approval_credentials::DETAIL_MISSING.to_owned(),
                 }),
             );
+            let unpaired = super::approval_origin::validate_pair(
+                mainnet.contains_key("approval_origin"),
+                mainnet.contains_key("approval_cert_spki_sha256"),
+            )
+            .err();
+            for (requirement, detail) in [
+                (
+                    Requirement::CertPinWithoutOrigin,
+                    "mainnet.approval_cert_spki_sha256 requires mainnet.approval_origin",
+                ),
+                (
+                    Requirement::OriginWithoutCertPin,
+                    "mainnet.approval_origin requires mainnet.approval_cert_spki_sha256",
+                ),
+            ] {
+                let failed = matches!(
+                    &unpaired,
+                    Some(PolicyError::MainnetMinimumUnmet { requirement: name, .. })
+                        if REQUIREMENTS.get(requirement as usize) == Some(name)
+                );
+                findings.body(requirement, failed.then(|| detail.to_owned()));
+            }
         }
         None => {
             for requirement in [
@@ -289,6 +313,8 @@ pub fn evaluate(
                 Requirement::Thresholds,
                 Requirement::Ttl,
                 Requirement::ApprovalCredentials,
+                Requirement::CertPinWithoutOrigin,
+                Requirement::OriginWithoutCertPin,
             ] {
                 findings.body(requirement, Some(table_failure.to_owned()));
             }
@@ -490,5 +516,27 @@ pub fn validate(
     match failures(doc, profile, profile_name).into_iter().next() {
         Some(error) => Err(error),
         None => Ok(()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::policy::v1::approval_origin::{
+        REQUIREMENT_ORIGIN_WITHOUT_PIN, REQUIREMENT_PIN_WITHOUT_ORIGIN,
+    };
+
+    /// The pairing rows carry the names `validate_pair` reports, so a failed
+    /// pairing marks its own row.
+    #[test]
+    fn pairing_rows_name_the_pairing_requirements() {
+        assert_eq!(
+            REQUIREMENTS.get(Requirement::CertPinWithoutOrigin as usize),
+            Some(&REQUIREMENT_PIN_WITHOUT_ORIGIN)
+        );
+        assert_eq!(
+            REQUIREMENTS.get(Requirement::OriginWithoutCertPin as usize),
+            Some(&REQUIREMENT_ORIGIN_WITHOUT_PIN)
+        );
     }
 }

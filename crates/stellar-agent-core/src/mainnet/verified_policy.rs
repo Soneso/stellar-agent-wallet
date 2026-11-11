@@ -46,6 +46,7 @@ use std::sync::Arc;
 use super::fact::{FACT_LABEL_POLICY, FactDigest};
 use crate::approval::presence::MainnetApprovalCredential;
 use crate::policy::v1::PolicyEngineV1;
+use crate::policy::v1::approval_origin::ApprovalOrigin;
 
 /// The mainnet section of a signed policy document.
 ///
@@ -71,6 +72,11 @@ pub struct MainnetBody {
     /// The approval credentials the owner admits for mainnet consent, 1 to
     /// 16 entries with unique IDs, in ascending order of their raw IDs.
     pub approval_credentials: Vec<MainnetApprovalCredential>,
+    /// The canonical HTTPS approval origin, when the document sets one.
+    pub approval_origin: Option<ApprovalOrigin>,
+    /// The SHA-256 of the served leaf certificate's SPKI DER, when the
+    /// document sets one.
+    pub approval_cert_spki_sha256: Option<[u8; 32]>,
 }
 
 /// A signed policy the loader verified, with its engine.
@@ -235,8 +241,10 @@ impl VerifiedPolicy {
     /// the approval credentials: `u32be(count)`, then per credential in
     /// ascending ID order `lp(raw_id)` and the 65-byte SEC1 key. The policy
     /// parser bounds the list to 16 entries of at most 64-byte IDs, so every
-    /// length fits its `u32` prefix. The engine is not a fact: the digest
-    /// already names the document it was built from.
+    /// length fits its `u32` prefix. The approval origin and certificate pin
+    /// enter through the document digest, which covers their canonical bytes.
+    /// The engine is not a fact: the digest already names the document it
+    /// was built from.
     #[must_use]
     pub fn fact_digest(&self) -> [u8; 32] {
         let mut digest = FactDigest::new(FACT_LABEL_POLICY);
@@ -311,6 +319,8 @@ mod tests {
             authorization_ttl_seconds: Some(60),
             cross_check_thresholds: Some(thresholds),
             approval_credentials: vec![credential()],
+            approval_origin: None,
+            approval_cert_spki_sha256: None,
         }
     }
 

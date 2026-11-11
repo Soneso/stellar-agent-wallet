@@ -1221,6 +1221,20 @@ network-aware asset identity. A classic asset and its SAC count together;
 a SAC derived on another network does not match the classic identity.
 Claim legs have no asset and are not covered by the allowlist.
 
+The signed optional `mainnet.approval_origin` and
+`mainnet.approval_cert_spki_sha256` fields follow the credentials in canonical
+scalar order. Omitted fields emit no bytes; policy version remains 2.
+The document digest covers both fields, so the policy fact digest needs no
+additional markers or fields.
+
+The common body parser and verified projection share origin and pin grammar
+validation in every build. Closed-key checks precede signature verification;
+signature verification precedes semantic validation and pin advancement.
+The minimum and unsigned bootstrap extraction share the pairing check.
+Bootstrap extraction checks the closed mainnet key set without requiring
+credentials or a signature. Profile settings cannot supply or override these
+signed values. These fields describe accepted configuration only.
+
 Every build requires `mainnet.approval_credentials` with 1 to 16 credentials
 in any policy with a `[mainnet]` table; the loader, the minimum evaluator, the
 profile-body validator, and the canonicalizer share one parser, and the

@@ -88,6 +88,8 @@ fn policy_at(
             authorization_ttl_seconds: Some(60),
             cross_check_thresholds: None,
             approval_credentials: credentials.iter().map(|a| credential_of(a)).collect(),
+            approval_origin: None,
+            approval_cert_spki_sha256: None,
         }),
     )
 }

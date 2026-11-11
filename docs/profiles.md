@@ -1017,8 +1017,38 @@ reason = "review"
 | `[mainnet].classic_max_fee_per_op_stroops` | Required signed `u32` classic per-operation cap. |
 | `[mainnet].authorization_ttl_seconds` | Optional lifetime from 1 through 120 seconds, distinct from approval lifetime. |
 | `[mainnet].approval_credentials` | Required. 1 to 16 inline tables with exactly `credential_id_b64url` and `public_key_sec1_b64url`, placed in `[mainnet]` before any `[mainnet.*]` subtable. Both values are canonical unpadded base64url: an ID of 16 to 64 bytes and a 65-byte uncompressed SEC1 P-256 point. IDs are unique. The example entry is a placeholder; use the entry `approve credential enroll` prints. |
+| `[mainnet].approval_origin` | Optional canonical `https://<host>[:<port>]` origin. The RP ID is the entire host, excluding the port. |
+| `[mainnet].approval_cert_spki_sha256` | Optional SHA-256 of the served leaf certificate SPKI DER, encoded as 64 lowercase hexadecimal characters. |
 | `[mainnet.cross_check_thresholds]` | Optional signed thresholds, each a positive TOML integer or a positive decimal string within the i128 range, such as `native = "10000000000"`. |
 | Signature coverage | V2 signs sequence and mainnet fields. Match and criterion keys are sorted canonically. The approval credentials are signed sorted by raw credential ID, so reordering entries or their keys keeps the signed bytes. |
+
+#### Approval origin configuration
+
+The optional signed origin and certificate pin configure policy data.
+They grant no runtime remote approval support.
+Both absent preserve the local-only default.
+
+An origin contains exactly `https://<host>[:<port>]`.
+The host uses lowercase ASCII DNS labels of 1 through 63 characters,
+with at most 253 bytes across the complete host.
+Labels contain letters, digits, and internal hyphens.
+Empty labels, edge hyphens, IP literals, and non-ASCII characters refuse.
+A final label containing only decimal digits refuses.
+A final label of `0x` followed only by hexadecimal digits also refuses.
+
+Ports use ASCII decimal digits from 1 through 65535, without signs or
+leading zeros. Explicit `:443` refuses; omit the default HTTPS port.
+Paths, trailing slashes, userinfo, queries, fragments, whitespace, and
+other schemes refuse.
+The RP ID includes every host label; there is no separate signed RP key
+or parent-domain mapping.
+
+The pin names the leaf certificate's SPKI DER hash.
+A certificate path, certificate name, or whole-certificate fingerprint
+supplies no substitute. Syntax validation cannot identify which bytes an
+operator hashes; certificate extraction and comparison belong to consumers.
+Malformed fields refuse with `policy.policy_file_parse_failed` and fixed,
+input-free details in every build.
 
 #### Approval credentials
 
@@ -1081,6 +1111,14 @@ When either family cannot be held, the ceremony does not start.
 | `thresholds` | Signed thresholds use pinned identities and positive i128 values. The native threshold meets the floor. |
 | `ttl` | Authorization TTL is absent or from 1 through 120 seconds. |
 | `approval_credentials` | The `[mainnet]` table lists 1 to 16 approval credentials. Required in either build. |
+| `approval.cert_pin_without_origin` | A certificate pin requires an approval origin. |
+| `approval.origin_without_cert_pin` | An approval origin requires a certificate pin. |
+
+The two pairing requirements follow the existing table requirements.
+A singleton refuses with `policy.mainnet_minimum_unmet`, its requirement
+name, and no rule index. Both rows pass when neither field is present.
+Both rows fail with the missing-table detail when `[mainnet]` is absent.
+Pairing applies when the enabled-policy minimum is required.
 
 The minimum has no memo criterion. SEP-29 still refuses a missing memo when
 the destination's `config.memo_required` entry is `1`. The operator supplies

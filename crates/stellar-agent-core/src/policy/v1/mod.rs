@@ -92,6 +92,8 @@ pub mod loader;
 
 /// The signed approval credentials of a mainnet policy.
 pub mod approval_credentials;
+/// The signed approval origin and certificate pin.
+pub mod approval_origin;
 /// Network-aware classic and contract asset identities.
 pub mod asset_equivalence;
 /// Canonical-form serializer for owner-signature pre-image.

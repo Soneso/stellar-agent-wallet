@@ -147,6 +147,7 @@ fn parse_mainnet(doc: &DocumentMut, profile: &Profile) -> Result<Option<MainnetB
     let table = item
         .as_table_like()
         .ok_or_else(|| parse_error("mainnet must be a table"))?;
+    let (approval_origin, approval_cert_spki_sha256) = super::approval_origin::parse_fields(table)?;
     let text = |key| {
         table
             .get(key)
@@ -174,6 +175,8 @@ fn parse_mainnet(doc: &DocumentMut, profile: &Profile) -> Result<Option<MainnetB
     let installation_nonce_sha256 =
         crate::hex::decode_hex32(&nonce).map_err(|_| parse_error("invalid nonce digest"))?;
     Ok(Some(MainnetBody {
+        approval_origin,
+        approval_cert_spki_sha256,
         profile: text("profile")?,
         endpoint_host: text("endpoint_host")?,
         installation_nonce_sha256,
