@@ -30,6 +30,8 @@ pub(crate) const MAINNET_KEYS: &[&str] = &[
     "authorization_ttl_seconds",
     "cross_check_thresholds",
     "approval_credentials",
+    "approval_origin",
+    "approval_cert_spki_sha256",
 ];
 
 /// Keys of the previous owner's rotation statement, in canonical order.

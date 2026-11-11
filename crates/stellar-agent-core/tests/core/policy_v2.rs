@@ -1869,6 +1869,8 @@ fn minimum_report_lists_every_requirement_with_its_status() {
             "thresholds",
             "ttl",
             "approval_credentials",
+            "approval.cert_pin_without_origin",
+            "approval.origin_without_cert_pin",
         ]
         .contains(&outcome.requirement)
         {
@@ -1889,6 +1891,37 @@ fn minimum_report_lists_every_requirement_with_its_status() {
         "per_period_cap",
         "rate_limit",
     ];
+    for (field, unmet, detail) in [
+        (
+            "approval_cert_spki_sha256",
+            "approval.cert_pin_without_origin",
+            "mainnet.approval_cert_spki_sha256 requires mainnet.approval_origin",
+        ),
+        (
+            "approval_origin",
+            "approval.origin_without_cert_pin",
+            "mainnet.approval_origin requires mainnet.approval_cert_spki_sha256",
+        ),
+    ] {
+        let mut singleton = FULL.parse::<DocumentMut>().unwrap();
+        singleton["mainnet"][field] = value(if field == "approval_origin" {
+            "https://approve.example.invalid"
+        } else {
+            "abababababababababababababababababababababababababababababababab"
+        });
+        for outcome in evaluate(&singleton) {
+            let expected = if outcome.requirement == unmet {
+                RequirementStatus::Failed {
+                    rules: vec![],
+                    detail: detail.into(),
+                }
+            } else {
+                RequirementStatus::Passed
+            };
+            assert_eq!(outcome.status, expected, "{field}: {}", outcome.requirement);
+        }
+    }
+
     let mut read_only = FULL.parse::<DocumentMut>().unwrap();
     rule(&mut read_only)["match"]["tool"] = value("stellar_balances");
     rule(&mut read_only)["criteria"] = value(toml_edit::Array::new());
@@ -2028,5 +2061,594 @@ fn period_cap_coverage_is_checked_independently_of_the_transaction_cap() {
             }]
         ),
         "{failures:?}"
+    );
+}
+
+const REMOTE_CANONICAL: &str = r#"version = 2
+scope = "profile:operator"
+sequence = 7
+
+[mainnet]
+profile = "operator"
+endpoint_host = "rpc.example.invalid"
+installation_nonce_sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+classic_max_fee_per_op_stroops = 500
+authorization_ttl_seconds = 60
+approval_credentials = [{ credential_id_b64url = "WlpaWlpaWlpaWlpaWlpaWg", public_key_sec1_b64url = "BEYtuhrk_BqWi02s8gzdbb4frjSqlxUUpj00BcPRz9ODtYu7CMEzg0KMWFPHHEyFHhNLBWgh5Gj-Cpd6v0MT3eE" }]
+approval_origin = "https://approve.example.invalid:8443"
+approval_cert_spki_sha256 = "abababababababababababababababababababababababababababababababab"
+
+[mainnet.cross_check_thresholds]
+"USD:GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF" = "100"
+native = "10000000000"
+
+[[rules]]
+match = { chain = "stellar:mainnet", tool = "stellar_pay" }
+criteria = [{ assets = ["native"], kind = "asset_allowlist" }, { allowlist = ["GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF"], kind = "counterparty_allowlist", kinds = ["G_ACCOUNT"] }, { asset = "native", kind = "per_tx_cap", max_stroops = "100" }, { asset = "native", kind = "per_period_cap", max_stroops = "200", window = "1d" }, { kind = "rate_limit", max_calls = 10, window = "1d" }]
+decision = "require_approval"
+reason = "review"
+ttl_secs = 3600
+allow_opaque_signing = false
+"#;
+
+const REMOTE: &str = include_str!("../fixtures/policy-v2-remote-approval.toml");
+const ORIGIN: &str = "https://approve.example.invalid:8443";
+const CERT_PIN: &str = "abababababababababababababababababababababababababababababababab";
+
+fn approval_body(origin: Option<toml_edit::Item>, pin: Option<toml_edit::Item>) -> DocumentMut {
+    let mut doc = FULL.parse::<DocumentMut>().unwrap();
+    if let Some(origin) = origin {
+        doc["mainnet"]["approval_origin"] = origin;
+    }
+    if let Some(pin) = pin {
+        doc["mainnet"]["approval_cert_spki_sha256"] = pin;
+    }
+    doc
+}
+
+/// The origin and pin the bootstrap validator returns.
+type Bootstrap = Result<
+    (
+        Option<stellar_agent_core::policy::v1::approval_origin::ApprovalOrigin>,
+        Option<[u8; 32]>,
+    ),
+    PolicyError,
+>;
+
+fn bootstrap(doc: &DocumentMut) -> Bootstrap {
+    stellar_agent_core::policy::v1::approval_origin::validate_bootstrap(
+        doc["mainnet"].as_table_like().unwrap(),
+    )
+}
+
+/// Asserts that the grammar of `field` refused `result` with its fixed detail.
+fn assert_field_refused(result: &Bootstrap, field: &str, case: &str) {
+    assert!(result.is_err(), "{case}: {result:?}");
+    if let Err(error) = result {
+        assert_field_error(error, field, case);
+    }
+}
+
+/// Asserts that `error` is the fixed grammar refusal of `field`.
+fn assert_field_error(error: &PolicyError, field: &str, case: &str) {
+    let prefix = format!("mainnet.{field} must be");
+    assert!(
+        matches!(error, PolicyError::PolicyFileParseFailed { detail } if detail.starts_with(&prefix)),
+        "{case}: {error:?}"
+    );
+}
+
+fn assert_approval_parse_error(error: &PolicyError) {
+    assert!(
+        matches!(error, PolicyError::PolicyFileParseFailed { .. }),
+        "{error:?}"
+    );
+}
+
+#[test]
+fn approval_origin_grammar_matrix() {
+    let maximum_host = format!(
+        "{}.{}.{}.{}",
+        "a".repeat(63),
+        "b".repeat(63),
+        "c".repeat(63),
+        "d".repeat(61)
+    );
+    for host in [
+        "approve.example.invalid",
+        "a",
+        "a-b.invalid",
+        "0x.invalid",
+        "123.invalid",
+        maximum_host.as_str(),
+    ] {
+        for port in ["", ":1", ":442", ":444", ":8443", ":65535"] {
+            let origin = format!("https://{host}{port}");
+            let (parsed, pin) =
+                bootstrap(&approval_body(Some(value(&origin)), Some(value(CERT_PIN)))).unwrap();
+            assert_eq!(parsed.unwrap().as_str(), origin);
+            assert_eq!(pin, Some([0xab; 32]));
+        }
+    }
+    let long_label = format!("https://{}.invalid", "a".repeat(64));
+    let long_host = format!("https://{maximum_host}a");
+    for origin in [
+        "",
+        "approve.invalid",
+        "//approve.invalid",
+        "https:approve.invalid",
+        "https:/approve.invalid",
+        "http://approve.invalid",
+        "HTTPS://approve.invalid",
+        "ftp://approve.invalid",
+        "https://",
+        "https://approve.invalid/",
+        "https://approve.invalid/path",
+        "https://user@approve.invalid",
+        "https://user:pass@approve.invalid",
+        "https://approve.invalid?x",
+        "https://approve.invalid#x",
+        " https://approve.invalid",
+        "https://approve.invalid ",
+        "https://approve.\ninvalid",
+        "https://Approve.invalid",
+        "https://é.invalid",
+        "https://.invalid",
+        "https://a..invalid",
+        "https://a.invalid.",
+        "https://-a.invalid",
+        "https://a-.invalid",
+        "https://a_b.invalid",
+        "https://a%2einvalid",
+        "https://127.0.0.1",
+        "https://[::1]",
+        "https://::1",
+        "https://2130706433",
+        "https://a.123",
+        "https://a.0x7f",
+        "https://a.0x",
+        "https://0x",
+        "https://0x7f000001",
+        "https://0177.1",
+        "https://approve.invalid:0",
+        "https://approve.invalid:65536",
+        "https://approve.invalid:443",
+        "https://approve.invalid:0443",
+        "https://approve.invalid:08443",
+        "https://approve.invalid:+8443",
+        "https://approve.invalid:-1",
+        "https://approve.invalid:",
+        "https://approve.invalid:8a",
+        "https://approve.invalid:８",
+        "https://approve.invalid: 8443",
+        "https://approve.invalid:8443/",
+        long_label.as_str(),
+        long_host.as_str(),
+    ] {
+        let doc = approval_body(Some(value(origin)), Some(value(CERT_PIN)));
+        assert_field_refused(&bootstrap(&doc), "approval_origin", origin);
+    }
+    for pin in [
+        "".into(),
+        "ab".repeat(31),
+        "ab".repeat(33),
+        "AB".repeat(32),
+        "gg".repeat(32),
+        "cert.pem".into(),
+        "cert-name".into(),
+        format!("{} ", "a".repeat(63)),
+        "é".repeat(32),
+    ] {
+        assert_field_refused(
+            &bootstrap(&approval_body(Some(value(ORIGIN)), Some(value(&pin)))),
+            "approval_cert_spki_sha256",
+            &pin,
+        );
+    }
+    for item in [
+        value(42),
+        value(42.5),
+        value(true),
+        "v = 2000-01-01\n".parse::<DocumentMut>().unwrap()["v"].clone(),
+        value(toml_edit::InlineTable::new()),
+        toml_edit::Item::ArrayOfTables(toml_edit::ArrayOfTables::new()),
+        value(toml_edit::Array::new()),
+        toml_edit::Item::Table(toml_edit::Table::new()),
+    ] {
+        let case = format!("{item:?}");
+        assert_field_refused(
+            &bootstrap(&approval_body(Some(item.clone()), Some(value(CERT_PIN)))),
+            "approval_origin",
+            &case,
+        );
+        assert_field_refused(
+            &bootstrap(&approval_body(Some(value(ORIGIN)), Some(item.clone()))),
+            "approval_cert_spki_sha256",
+            &case,
+        );
+    }
+}
+
+#[test]
+fn approval_rp_id_is_origin_host() {
+    for (text, rp_id) in [
+        (
+            "https://sub.approve.example.invalid",
+            "sub.approve.example.invalid",
+        ),
+        (
+            "https://sub.approve.example.invalid:8443",
+            "sub.approve.example.invalid",
+        ),
+        (ORIGIN, "approve.example.invalid"),
+        ("https://a", "a"),
+    ] {
+        let (origin, _) =
+            bootstrap(&approval_body(Some(value(text)), Some(value(CERT_PIN)))).unwrap();
+        let origin = origin.unwrap();
+        assert_eq!(origin.as_str(), text);
+        assert_eq!(origin.rp_id(), rp_id, "{text}");
+    }
+}
+
+#[test]
+#[serial]
+fn remote_approval_fields_are_signed_and_canonical() {
+    let (dir, profile, key) = fixture();
+    let canonical = canonical_bytes(REMOTE).unwrap();
+    assert_eq!(canonical, REMOTE_CANONICAL.as_bytes());
+    assert_eq!(
+        blake3::hash(&canonical).to_hex().as_str(),
+        "da4a707e6f2542a1bb1cc0b9896e6e71385b3a9dc2eb6dff61e41e0901eb7658"
+    );
+    assert_eq!(
+        stellar_agent_core::hex::encode(&key.sign(blake3::hash(&canonical).as_bytes()).to_bytes()),
+        "6213ea93bf9c1a0228d5c9323268edf896fd40304cb11b30e9d45aba8aa749b52548cceb318db3584ee9f90ea2490fe40e4c12e6327ea239e4b964542610ee03"
+    );
+    let signed_remote = signed(REMOTE, &key);
+    let baseline = load(dir.path(), REMOTE, &profile, &key, PinMode::CompareOnly).unwrap();
+    assert_eq!(baseline.digest(), *blake3::hash(&canonical).as_bytes());
+    let mut neither = REMOTE.parse::<DocumentMut>().unwrap();
+    let table = neither["mainnet"].as_table_mut().unwrap();
+    table.remove("approval_origin").unwrap();
+    table.remove("approval_cert_spki_sha256").unwrap();
+    let local = load(
+        dir.path(),
+        &neither.to_string(),
+        &profile,
+        &key,
+        PinMode::CompareOnly,
+    )
+    .unwrap();
+    assert_ne!(local.digest(), baseline.digest());
+    assert_ne!(local.fact_digest(), baseline.fact_digest());
+    let mut reordered = REMOTE.parse::<DocumentMut>().unwrap();
+    let table = reordered["mainnet"].as_table_mut().unwrap();
+    let origin = table.remove("approval_origin").unwrap();
+    let pin = table.remove("approval_cert_spki_sha256").unwrap();
+    table.insert("approval_cert_spki_sha256", pin);
+    table.insert("approval_origin", origin);
+    assert_eq!(canonical_bytes(&reordered.to_string()).unwrap(), canonical);
+    for field in ["approval_origin", "approval_cert_spki_sha256"] {
+        for operation in ["add", "change", "remove"] {
+            let mut doc = signed_remote.parse::<DocumentMut>().unwrap();
+            if operation == "add" {
+                let mut absent = REMOTE.parse::<DocumentMut>().unwrap();
+                absent["mainnet"].as_table_mut().unwrap().remove(field);
+                doc["signature"] = signed(&absent.to_string(), &key)
+                    .parse::<DocumentMut>()
+                    .unwrap()["signature"]
+                    .clone();
+            } else if operation == "remove" {
+                doc["mainnet"].as_table_mut().unwrap().remove(field);
+            } else {
+                doc["mainnet"][field] = value(if field == "approval_origin" {
+                    "https://other.invalid"
+                } else {
+                    "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"
+                });
+            }
+            let error = stellar_agent_core::policy::v1::loader::load_signed_policy_text(
+                &doc.to_string(),
+                "operator",
+                &key.verifying_key().to_bytes(),
+                &profile.network_passphrase,
+            )
+            .unwrap_err();
+            assert!(
+                matches!(error, PolicyError::OwnerSignatureInvalid { .. }),
+                "{field} {operation}: {error:?}"
+            );
+            if operation == "change" {
+                let changed = load(
+                    dir.path(),
+                    &doc.to_string(),
+                    &profile,
+                    &key,
+                    PinMode::CompareOnly,
+                )
+                .unwrap();
+                assert_ne!(changed.digest(), baseline.digest());
+                assert_ne!(changed.fact_digest(), baseline.fact_digest());
+            }
+        }
+    }
+}
+
+#[test]
+fn mainnet_minimum_pairs_origin_and_pin() {
+    for (origin, pin, requirement) in [
+        (false, false, None),
+        (true, true, None),
+        (false, true, Some("approval.cert_pin_without_origin")),
+        (true, false, Some("approval.origin_without_cert_pin")),
+    ] {
+        let doc = approval_body(origin.then(|| value(ORIGIN)), pin.then(|| value(CERT_PIN)));
+        let failures = mainnet_minimum::failures(&doc, &profile(true), "operator");
+        if let Some(expected) = requirement {
+            assert_eq!(failures.len(), 1);
+            assert!(
+                matches!(&failures[0], PolicyError::MainnetMinimumUnmet { requirement, rule: None } if *requirement == expected)
+            );
+            assert_eq!(failures[0].wire_code(), "policy.mainnet_minimum_unmet");
+            assert!(
+                matches!(bootstrap(&doc), Err(PolicyError::MainnetMinimumUnmet { requirement, rule: None }) if requirement == expected)
+            );
+        } else {
+            assert!(failures.is_empty(), "{failures:?}");
+            bootstrap(&doc).unwrap();
+        }
+    }
+}
+
+#[test]
+#[serial]
+fn mainnet_body_exposes_signed_origin_and_pin() {
+    let (dir, mut profile, key) = fixture();
+    for remote_settings in [false, true] {
+        if remote_settings {
+            profile.remote_approval = Some(serde_json::from_value(serde_json::json!({
+                "enabled": true, "bind": "127.0.0.1:9443", "rp_id": "profile.invalid", "allowed_credentials": []
+            })).unwrap());
+        }
+        let local = load(dir.path(), FULL, &profile, &key, PinMode::CompareOnly).unwrap();
+        assert_eq!(local.mainnet().unwrap().approval_origin, None);
+        assert_eq!(local.mainnet().unwrap().approval_cert_spki_sha256, None);
+        let remote = load(dir.path(), REMOTE, &profile, &key, PinMode::CompareOnly).unwrap();
+        assert_eq!(
+            remote
+                .mainnet()
+                .unwrap()
+                .approval_origin
+                .as_ref()
+                .unwrap()
+                .as_str(),
+            ORIGIN
+        );
+        assert_eq!(
+            remote.mainnet().unwrap().approval_cert_spki_sha256,
+            Some([0xab; 32])
+        );
+    }
+}
+
+#[test]
+#[serial]
+fn approval_fields_validate_at_policy_boundaries() {
+    let (dir, profile, key) = fixture();
+    stellar_agent_core::policy::v1::validate_unsigned_policy(
+        REMOTE,
+        "operator",
+        &profile.network_passphrase,
+    )
+    .unwrap();
+    stellar_agent_core::policy::v1::verified::validate_profile_body(
+        &REMOTE.parse::<DocumentMut>().unwrap(),
+        &profile,
+    )
+    .unwrap();
+    for (field, bad) in [
+        ("approval_origin", "http://marker.invalid"),
+        ("approval_cert_spki_sha256", "marker-cert"),
+    ] {
+        let mut doc = REMOTE.parse::<DocumentMut>().unwrap();
+        doc["mainnet"][field] = value(bad);
+        let mut invalid_signature = signed(&doc.to_string(), &key)
+            .parse::<DocumentMut>()
+            .unwrap();
+        invalid_signature["signature"]["sig"] = value("00".repeat(64));
+        assert!(matches!(
+            stellar_agent_core::policy::v1::loader::load_signed_policy_text(
+                &invalid_signature.to_string(),
+                "operator",
+                &key.verifying_key().to_bytes(),
+                &profile.network_passphrase,
+            ),
+            Err(PolicyError::OwnerSignatureInvalid { .. })
+        ));
+        assert_field_error(
+            &load(
+                dir.path(),
+                &doc.to_string(),
+                &profile,
+                &key,
+                PinMode::CompareOnly,
+            )
+            .unwrap_err(),
+            field,
+            bad,
+        );
+        assert_field_error(
+            &stellar_agent_core::policy::v1::loader::load_signed_policy_text(
+                &signed(&doc.to_string(), &key),
+                "operator",
+                &key.verifying_key().to_bytes(),
+                &profile.network_passphrase,
+            )
+            .unwrap_err(),
+            field,
+            bad,
+        );
+        assert_field_error(
+            &stellar_agent_core::policy::v1::validate_unsigned_policy(
+                &doc.to_string(),
+                "operator",
+                &profile.network_passphrase,
+            )
+            .unwrap_err(),
+            field,
+            bad,
+        );
+        assert_field_error(
+            &stellar_agent_core::policy::v1::verified::validate_profile_body(&doc, &profile)
+                .unwrap_err(),
+            field,
+            bad,
+        );
+        assert_field_error(&bootstrap(&doc).unwrap_err(), field, bad);
+    }
+    let bootstrap_doc = format!(
+        "[mainnet]\napproval_origin = \"{ORIGIN}\"\napproval_cert_spki_sha256 = \"{CERT_PIN}\"\n"
+    )
+    .parse::<DocumentMut>()
+    .unwrap();
+    let (origin, pin) = bootstrap(&bootstrap_doc).unwrap();
+    assert_eq!(origin.unwrap().as_str(), ORIGIN);
+    assert_eq!(pin, Some([0xab; 32]));
+    let mut unknown = bootstrap_doc;
+    unknown["mainnet"]["mode"] = value("remote");
+    assert!(
+        matches!(bootstrap(&unknown), Err(PolicyError::PolicyFileParseFailed { ref detail }) if detail.starts_with("mainnet: unknown key"))
+    );
+}
+
+#[test]
+#[serial]
+fn malformed_approval_fields_preserve_policy_pin() {
+    for existing in [false, true] {
+        for (field, bad) in [
+            ("approval_origin", "http://marker.invalid"),
+            ("approval_cert_spki_sha256", "marker-cert"),
+        ] {
+            let (dir, profile, key) = fixture();
+            if existing {
+                load(dir.path(), FULL, &profile, &key, PinMode::Advance).unwrap();
+            }
+            let before = pinned(dir.path(), &profile);
+            let mut doc = REMOTE.parse::<DocumentMut>().unwrap();
+            doc["sequence"] = value(8);
+            doc["mainnet"][field] = value(bad);
+            assert_field_error(
+                &load(
+                    dir.path(),
+                    &doc.to_string(),
+                    &profile,
+                    &key,
+                    PinMode::Advance,
+                )
+                .unwrap_err(),
+                field,
+                bad,
+            );
+            assert_eq!(pinned(dir.path(), &profile), before);
+            // The same sequence-8 body, well formed, advances the pin.
+            let mut valid = REMOTE.parse::<DocumentMut>().unwrap();
+            valid["sequence"] = value(8);
+            load(
+                dir.path(),
+                &valid.to_string(),
+                &profile,
+                &key,
+                PinMode::Advance,
+            )
+            .unwrap();
+            assert!(
+                matches!(pinned(dir.path(), &profile), PinState::Present(pin) if pin.sequence() == 8)
+            );
+        }
+    }
+}
+
+#[test]
+fn approval_field_refusals_are_redacted() {
+    let marker = "SYNTHETIC_REJECTED_MARKER";
+    // Lowercase hex passes the pin's character check and refuses on length.
+    let hex_marker = "5eed".repeat(5);
+    let host = format!("https://{marker}.invalid");
+    let port = format!("https://approve.invalid:{marker}");
+    let key = SigningKey::from_bytes(&[11; 32]);
+    for (field, rejected, marker) in [
+        ("approval_origin", marker, marker),
+        ("approval_origin", host.as_str(), marker),
+        ("approval_origin", port.as_str(), marker),
+        ("approval_cert_spki_sha256", marker, marker),
+        (
+            "approval_cert_spki_sha256",
+            hex_marker.as_str(),
+            hex_marker.as_str(),
+        ),
+        (marker, marker, marker),
+    ] {
+        let mut doc = REMOTE.parse::<DocumentMut>().unwrap();
+        doc["mainnet"][field] = value(rejected);
+        for error in [
+            stellar_agent_core::policy::v1::loader::load_signed_policy_text(
+                &signed(&doc.to_string(), &key),
+                "operator",
+                &key.verifying_key().to_bytes(),
+                &profile(true).network_passphrase,
+            )
+            .unwrap_err(),
+            stellar_agent_core::policy::v1::validate_unsigned_policy(
+                &doc.to_string(),
+                "operator",
+                &profile(true).network_passphrase,
+            )
+            .unwrap_err(),
+            bootstrap(&doc).unwrap_err(),
+        ] {
+            assert!(!format!("{error}").contains(marker), "{rejected}");
+            assert!(!format!("{error:?}").contains(marker), "{rejected}");
+        }
+    }
+}
+
+#[test]
+fn approval_origin_closed_keys_precede_signature() {
+    let key = SigningKey::from_bytes(&[11; 32]);
+    for field in [
+        "mode",
+        "rp_id",
+        "approval_rp_id",
+        "certificate_path",
+        "approval_cert_path",
+        "approval_tls_cert",
+    ] {
+        let mut doc = signed(REMOTE, &key).parse::<DocumentMut>().unwrap();
+        doc["mainnet"][field] = value("synthetic");
+        doc["signature"]["sig"] = value("00".repeat(64));
+        let error = stellar_agent_core::policy::v1::loader::load_signed_policy_text(
+            &doc.to_string(),
+            "operator",
+            &key.verifying_key().to_bytes(),
+            &profile(true).network_passphrase,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(error, PolicyError::PolicyFileParseFailed { ref detail } if detail.starts_with("mainnet: unknown key")),
+            "{error:?}"
+        );
+    }
+    let mut v1 = signed(V1, &key).parse::<DocumentMut>().unwrap();
+    v1["mainnet"] = REMOTE.parse::<DocumentMut>().unwrap()["mainnet"].clone();
+    v1["signature"]["sig"] = value("00".repeat(64));
+    assert_approval_parse_error(
+        &stellar_agent_core::policy::v1::loader::load_signed_policy_text(
+            &v1.to_string(),
+            "operator",
+            &key.verifying_key().to_bytes(),
+            &profile(true).network_passphrase,
+        )
+        .unwrap_err(),
     );
 }

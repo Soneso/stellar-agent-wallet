@@ -644,6 +644,9 @@ fn parse_policy_body(
         super::verified::sequence(doc)?;
     }
     super::signature::parse_owner_rotation(doc)?;
+    if let Some(table) = doc.get("mainnet").and_then(Item::as_table_like) {
+        super::approval_origin::parse_fields(table)?;
+    }
     let scope = extract_scope(doc)?;
     reject_scope_profile_mismatch(&scope, profile_name)?;
     let rules = extract_rules(doc, network_passphrase, version)?;
