@@ -1249,6 +1249,7 @@ mod tests {
     /// profile name that is not a safe path component refuses, and a safe
     /// one names a file directly inside the directory.
     #[test]
+    #[serial_test::parallel]
     fn default_path_refuses_a_profile_name_that_escapes_the_directory() {
         for name in [
             "../escape",

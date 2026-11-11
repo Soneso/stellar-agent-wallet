@@ -216,6 +216,7 @@ mod tests {
 
     /// Bundle with sum under cap passes.
     #[test]
+    #[serial_test::parallel]
     fn sum_under_cap_passes() {
         let tool = make_tool();
         let profile = make_profile();
@@ -244,6 +245,7 @@ mod tests {
 
     /// Bundle with sum exactly at cap passes (strict > boundary).
     #[test]
+    #[serial_test::parallel]
     fn sum_exactly_at_cap_passes() {
         let tool = make_tool();
         let profile = make_profile();
@@ -269,6 +271,7 @@ mod tests {
 
     /// Bundle with sum over cap denies.
     #[test]
+    #[serial_test::parallel]
     fn sum_over_cap_denies() {
         let tool = make_tool();
         let profile = make_profile();
@@ -298,6 +301,7 @@ mod tests {
 
     /// Asset filter: different asset is not counted.
     #[test]
+    #[serial_test::parallel]
     fn asset_filter_excludes_other_assets() {
         let tool = make_tool();
         let profile = make_profile();
@@ -327,6 +331,7 @@ mod tests {
 
     /// Cross-asset cap (None) sums all TokenTransfer inners.
     #[test]
+    #[serial_test::parallel]
     fn cross_asset_cap_sums_all_transfer_inners() {
         let tool = make_tool();
         let profile = make_profile();
@@ -359,6 +364,7 @@ mod tests {
 
     /// Single-tx path (bundle=None) passes unconditionally.
     #[test]
+    #[serial_test::parallel]
     fn single_tx_bundle_none_passes() {
         let tool = make_tool();
         let profile = make_profile();
@@ -378,6 +384,7 @@ mod tests {
 
     /// Generic inners are not counted toward the cap.
     #[test]
+    #[serial_test::parallel]
     fn generic_inners_not_counted() {
         let tool = make_tool();
         let profile = make_profile();
@@ -406,6 +413,7 @@ mod tests {
 
     /// i128 overflow in sum returns CriterionEvaluationFailed.
     #[test]
+    #[serial_test::parallel]
     fn i128_overflow_returns_criterion_evaluation_failed() {
         let tool = make_tool();
         let profile = make_profile();

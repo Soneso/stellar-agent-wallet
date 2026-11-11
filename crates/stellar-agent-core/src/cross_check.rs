@@ -582,6 +582,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::parallel]
     fn requirement_direct_contract_and_native_sac_use_their_thresholds() {
         let asset =
             CanonicalAsset::contract(&stellar_strkey::Contract([9; 32]).to_string()).unwrap();

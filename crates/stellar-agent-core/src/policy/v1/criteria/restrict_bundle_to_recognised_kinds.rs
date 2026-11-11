@@ -185,6 +185,7 @@ mod tests {
 
     /// T-A: enabled + all TokenTransfer → Allow.
     #[test]
+    #[serial_test::parallel]
     fn enabled_all_token_transfer_passes() {
         let tool = make_tool();
         let profile = make_profile();
@@ -207,6 +208,7 @@ mod tests {
 
     /// T-B: enabled + 1 Generic → Deny with correct inner_index.
     #[test]
+    #[serial_test::parallel]
     fn enabled_with_generic_denies() {
         let tool = make_tool();
         let profile = make_profile();
@@ -233,6 +235,7 @@ mod tests {
 
     /// T-C: disabled + Generic → Allow.
     #[test]
+    #[serial_test::parallel]
     fn disabled_with_generic_passes() {
         let tool = make_tool();
         let profile = make_profile();
@@ -255,6 +258,7 @@ mod tests {
 
     /// Single-tx path (bundle=None) passes regardless of enabled state.
     #[test]
+    #[serial_test::parallel]
     fn single_tx_bundle_none_passes() {
         let tool = make_tool();
         let profile = make_profile();
@@ -271,6 +275,7 @@ mod tests {
 
     /// Reports the index of the FIRST Generic inner, not the last.
     #[test]
+    #[serial_test::parallel]
     fn reports_first_generic_index() {
         let tool = make_tool();
         let profile = make_profile();

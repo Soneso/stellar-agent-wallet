@@ -364,6 +364,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::parallel]
     fn bundle_level_criteria_short_circuit_on_single_tx_context() {
         let tool = ToolDescriptor::from_registration(&McpToolRegistration {
             name: "stellar_pay",
@@ -440,6 +441,7 @@ mod tests {
     /// criterion (which does not override `accumulate_overlay`) must leave the
     /// overlay unchanged after being called.
     #[test]
+    #[serial_test::parallel]
     fn default_accumulate_overlay_is_noop() {
         use crate::policy::v1::bundle::{BundleStateOverlay, InnerOpDescriptor};
 
@@ -570,6 +572,7 @@ mod tests {
         assert_send_sync::<PerTxCapCriterion>();
     }
     #[test]
+    #[serial_test::parallel]
     fn criterion_size_defaults_to_none() {
         let tool = ToolDescriptor::from_registration(&McpToolRegistration {
             name: "stellar_pay",

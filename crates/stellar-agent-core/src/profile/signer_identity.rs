@@ -388,6 +388,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[serial_test::parallel]
     fn a_bound_record_round_trips() {
         let profile = profile(&key(1));
         let owner = ed25519_dalek::SigningKey::from_bytes(&[11; 32]);
@@ -537,6 +538,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::parallel]
     fn testnet_placeholder_has_no_pin_and_accepts_any_signer() {
         let p = Profile::builder_testnet_named("identity", "s", "default", "n", "a").build();
         assert!(matches!(enrolled_signer_pin("identity", &p), Ok(None)));
@@ -544,6 +546,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::parallel]
     fn mainnet_placeholder_refuses() {
         assert!(matches!(
             check_enrolled_signer("identity", &profile("default"), &key(1)),
@@ -555,6 +558,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::parallel]
     fn mainnet_malformed_refuses() {
         assert!(matches!(
             check_enrolled_signer("identity", &profile("invalid"), &key(1)),
@@ -566,6 +570,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::parallel]
     fn mainnet_differing_key_refuses_with_both_keys() {
         let a = key(1);
         let b = key(2);
@@ -613,6 +618,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::parallel]
     fn mainnet_equal_key_passes() {
         let a = key(1);
         assert!(check_enrolled_signer("identity", &profile(&a), &a).is_ok());

@@ -84,6 +84,7 @@ mod tests {
     /// URL, even when it holds an oracle record, and the refusal carries the
     /// profile code.
     #[test]
+    #[serial_test::parallel]
     fn mainnet_oracle_required_refuses_a_profile_without_the_url() {
         for profile in [
             builder().build(),
@@ -104,6 +105,7 @@ mod tests {
     /// record is refused with the missing record, with and without other
     /// provider records.
     #[test]
+    #[serial_test::parallel]
     fn mainnet_oracle_required_refuses_a_url_without_its_record() {
         let bare = Profile::builder_mainnet_named(
             "operator",
@@ -136,6 +138,7 @@ mod tests {
 
     /// A profile with the URL and its record passes.
     #[test]
+    #[serial_test::parallel]
     fn mainnet_oracle_required_accepts_a_complete_oracle() {
         let profile = builder()
             .oracle_provider_url(oracle_url())

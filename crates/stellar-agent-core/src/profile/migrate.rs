@@ -467,6 +467,7 @@ account = "{name}"
 
     /// A v1 TOML migrates to v2; all new fields are present at expected defaults.
     #[test]
+    #[serial_test::parallel]
     fn migrate_v1_to_v2_round_trip() {
         let dir = tempfile::tempdir().unwrap();
         let name = write_v1_toml(dir.path(), "round-trip");
@@ -527,6 +528,7 @@ account = "{name}"
     /// Running migrate twice on a v1 profile: first run migrates (1→2), second
     /// run returns NoOp (already at v2).
     #[test]
+    #[serial_test::parallel]
     fn migrate_v1_to_v2_idempotent() {
         let dir = tempfile::tempdir().unwrap();
         let name = write_v1_toml(dir.path(), "idempotent");
@@ -555,6 +557,7 @@ account = "{name}"
 
     /// All v1 fields are unchanged after migration.
     #[test]
+    #[serial_test::parallel]
     fn migrate_v1_to_v2_preserves_existing_fields() {
         let dir = tempfile::tempdir().unwrap();
         let name = write_v1_toml(dir.path(), "preserve-fields");
@@ -582,6 +585,7 @@ account = "{name}"
     /// `cross_check_threshold_stroops`, and the migrated file on disk is
     /// written with the current key only (never the v1 wire key).
     #[test]
+    #[serial_test::parallel]
     fn migrate_v1_carries_explicit_usd_threshold_value() {
         let dir = tempfile::tempdir().unwrap();
         let name = "carry-threshold";
@@ -693,6 +697,7 @@ account = "{name}"
     /// userinfo refuses with the typed load error, and the file stays
     /// byte-identical. The error names no part of the URL.
     #[test]
+    #[serial_test::parallel]
     fn migrate_v1_mainnet_endpoint_refusals_leave_the_file_unchanged() {
         use crate::profile::schema::sentinel::{self, assert_no_sentinel};
         use crate::profile::schema::{EndpointUrlError, EndpointUrlRejection};
@@ -745,6 +750,7 @@ account = "{name}"
 
     /// A v1 testnet file without `rpc_url` migrates to the testnet default.
     #[test]
+    #[serial_test::parallel]
     fn migrate_v1_testnet_without_rpc_url_takes_the_testnet_default() {
         let dir = tempfile::tempdir().unwrap();
         write_v1_endpoint_toml(dir.path(), "testnet-v1", "stellar:testnet", None);
@@ -757,6 +763,7 @@ account = "{name}"
 
     /// A v1 mainnet file with an HTTPS endpoint migrates and keeps it.
     #[test]
+    #[serial_test::parallel]
     fn migrate_v1_mainnet_with_https_rpc_url_migrates() {
         let dir = tempfile::tempdir().unwrap();
         write_v1_endpoint_toml(
@@ -782,6 +789,7 @@ account = "{name}"
     /// A migrated profile must retain the mainnet gate until the operator
     /// explicitly opts in to V1.
     #[test]
+    #[serial_test::parallel]
     fn migrate_v1_to_v2_produces_noop_engine() {
         let dir = tempfile::tempdir().unwrap();
         let name = write_v1_toml(dir.path(), "noop-engine-asymmetry");
@@ -822,6 +830,7 @@ account = "a"
     }
 
     #[test]
+    #[serial_test::parallel]
     fn migration_leaves_provider_records_absent() {
         for chain in ["stellar:testnet", "stellar:mainnet"] {
             let dir = tempfile::tempdir().unwrap();

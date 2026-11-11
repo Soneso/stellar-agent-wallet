@@ -166,6 +166,7 @@ mod tests {
 
     /// count=5 vs cap=50 — should pass.
     #[test]
+    #[serial_test::parallel]
     fn count_under_cap_passes() {
         let tool = make_tool();
         let profile = make_profile();
@@ -186,6 +187,7 @@ mod tests {
 
     /// count=51 vs cap=50 — should deny.
     #[test]
+    #[serial_test::parallel]
     fn count_over_cap_denies() {
         let tool = make_tool();
         let profile = make_profile();
@@ -215,6 +217,7 @@ mod tests {
 
     /// single-tx path (bundle=None) passes regardless of max_count.
     #[test]
+    #[serial_test::parallel]
     fn single_tx_path_bundle_none_always_passes() {
         let tool = make_tool();
         let profile = make_profile();
@@ -233,6 +236,7 @@ mod tests {
 
     /// Exact cap boundary (count == max_count) must pass.
     #[test]
+    #[serial_test::parallel]
     fn count_exactly_at_cap_passes() {
         let tool = make_tool();
         let profile = make_profile();

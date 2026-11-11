@@ -1537,6 +1537,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::parallel]
     fn g_account_in_allowlist_passes() {
         let tool = make_tool("stellar_pay");
         let profile = make_profile();
@@ -1552,6 +1553,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::parallel]
     fn g_account_not_in_allowlist_denies() {
         let tool = make_tool("stellar_pay");
         let profile = make_profile();
@@ -1570,6 +1572,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::parallel]
     fn c_account_in_allowlist_passes() {
         let tool = make_tool("stellar_pay");
         let profile = make_profile();
@@ -1585,6 +1588,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::parallel]
     fn c_account_not_in_allowlist_denies() {
         let tool = make_tool("stellar_pay");
         let profile = make_profile();
@@ -1605,6 +1609,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::parallel]
     fn known_issuer_in_allowlist_passes() {
         let tool = make_tool("stellar_pay");
         let profile = make_profile();
@@ -1623,6 +1628,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::parallel]
     fn known_issuer_bare_g_strkey_allowlist_entry_passes() {
         let tool = make_tool("stellar_pay");
         let profile = make_profile();
@@ -1645,6 +1651,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::parallel]
     fn known_issuer_not_in_allowlist_denies() {
         let tool = make_tool("stellar_pay");
         let profile = make_profile();
@@ -1665,6 +1672,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::parallel]
     fn unsupported_kind_returns_counterparty_kind_unsupported() {
         let tool = make_tool("stellar_pay");
         let profile = make_profile();
@@ -1681,6 +1689,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::parallel]
     fn invalid_g_strkey_in_args_returns_evaluation_failed() {
         let tool = make_tool("stellar_pay");
         let profile = make_profile();
@@ -1699,6 +1708,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::parallel]
     fn native_asset_skips_known_issuer_check() {
         let tool = make_tool("stellar_pay");
         let profile = make_profile();
@@ -1717,6 +1727,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::parallel]
     fn known_issuer_debit_leg_with_no_asset_denies() {
         use crate::policy::v1::value::{ActionKind, ValueClass, ValueEffects, ValueLeg};
 
@@ -1746,6 +1757,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::parallel]
     fn approval_trustline_commit_known_issuer_gates_decoded_inflow() {
         let tool = make_tool("stellar_trustline_commit");
         let profile = make_profile();
@@ -1792,6 +1804,7 @@ mod tests {
     /// `gate_inflows` defaults to `false`: an inflow leg from an issuer NOT on
     /// the allowlist is allowed — pins today's debit-only scoping unchanged.
     #[test]
+    #[serial_test::parallel]
     fn gate_inflows_default_false_allows_unknown_issuer_inflow() {
         use crate::policy::v1::value::{ValueClass, ValueEffects};
 
@@ -1818,6 +1831,7 @@ mod tests {
     /// `gate_inflows = true`: an inflow leg from an issuer NOT on the
     /// allowlist denies, with a `value` detail distinct from a debit denial.
     #[test]
+    #[serial_test::parallel]
     fn gate_inflows_true_denies_unknown_issuer_inflow() {
         use crate::policy::v1::value::{ValueClass, ValueEffects};
 
@@ -1851,6 +1865,7 @@ mod tests {
 
     /// `gate_inflows = true`: an inflow leg from an ALLOWLISTED issuer passes.
     #[test]
+    #[serial_test::parallel]
     fn gate_inflows_true_allows_allowlisted_issuer_inflow() {
         use crate::policy::v1::value::{ValueClass, ValueEffects};
 
@@ -1877,6 +1892,7 @@ mod tests {
     /// fail-closed, the same posture as the existing asset-`None` debit
     /// handling.
     #[test]
+    #[serial_test::parallel]
     fn gate_inflows_true_asset_none_inflow_denies_fail_closed() {
         use crate::policy::v1::value::{ValueClass, ValueEffects};
 
@@ -1913,6 +1929,7 @@ mod tests {
     /// unlisted-issuer debit still denies with the plain (non-inflow) `value`
     /// shape, exactly as it does with `gate_inflows` unset.
     #[test]
+    #[serial_test::parallel]
     fn gate_inflows_true_debit_leg_behavior_unchanged() {
         use crate::policy::v1::value::{ActionKind, ValueClass, ValueEffects, ValueLeg};
 
@@ -2063,6 +2080,7 @@ mod tests {
     /// asserted domain is on the operator's allowlist — matching the domain
     /// on-chain proves nothing without cache verification.
     #[test]
+    #[serial_test::parallel]
     fn home_domain_self_asserted_only_with_no_cache_denies() {
         let tool = make_tool("stellar_pay");
         let profile = make_profile();
@@ -2097,6 +2115,7 @@ mod tests {
     /// in the counterparty cache, the counterparty account is listed in that
     /// domain's `ACCOUNTS`, and the domain is on the operator's allowlist.
     #[test]
+    #[serial_test::parallel]
     fn home_domain_cache_verified_and_allowlisted_passes() {
         let tool = make_tool("stellar_pay");
         let profile = make_profile();
@@ -2125,6 +2144,7 @@ mod tests {
     /// distinguishable from an unverified-domain deny (the operator can tell
     /// "verified but not on our allowlist" from "not verified at all").
     #[test]
+    #[serial_test::parallel]
     fn home_domain_cache_verified_but_not_allowlisted_denies() {
         let tool = make_tool("stellar_pay");
         let profile = make_profile();
@@ -2167,6 +2187,7 @@ mod tests {
     /// Cache absent entirely (`ctx.counterparty_cache = None`) denies as
     /// unverified, distinct from a populated-but-empty/miss cache.
     #[test]
+    #[serial_test::parallel]
     fn home_domain_cache_absent_denies() {
         let tool = make_tool("stellar_pay");
         let profile = make_profile();
@@ -2201,6 +2222,7 @@ mod tests {
     /// unverified, with a detail that names the missing live entry and the
     /// refresh command for that domain.
     #[test]
+    #[serial_test::parallel]
     fn home_domain_without_live_cache_entry_denies() {
         let tool = make_tool("stellar_pay");
         let profile = make_profile();
@@ -2241,6 +2263,7 @@ mod tests {
     /// anti-spoofing case #49 closes: an attacker account cannot borrow an
     /// already-cached, legitimate operator's `home_domain` string.
     #[test]
+    #[serial_test::parallel]
     fn home_domain_resolved_but_account_not_listed_denies() {
         let tool = make_tool("stellar_pay");
         let profile = make_profile();
@@ -2286,6 +2309,7 @@ mod tests {
     /// the allowlist entry `"circle.com"` because byte-equality comparison
     /// distinguishes `'1'` (0x31) from `'l'` (0x6C).
     #[test]
+    #[serial_test::parallel]
     fn home_domain_digit_one_homoglyph_denies() {
         let tool = make_tool("stellar_pay");
         let profile = make_profile();
@@ -2330,6 +2354,7 @@ mod tests {
     /// enforcement converts this to a `CounterpartyDenied` outcome with a
     /// REDACTED value.
     #[test]
+    #[serial_test::parallel]
     fn home_domain_cyrillic_non_ascii_denies_with_redacted_value() {
         let tool = make_tool("stellar_pay");
         let profile = make_profile();
@@ -2365,6 +2390,7 @@ mod tests {
     /// On-chain home_domain with mixed case must match a lowercase-normalised
     /// allowlist entry (RFC 4343 DNS case-insensitivity).
     #[test]
+    #[serial_test::parallel]
     fn home_domain_mixed_case_matches_lowercase_allowlist_entry() {
         let tool = make_tool("stellar_pay");
         let profile = make_profile();
@@ -2398,6 +2424,7 @@ mod tests {
     /// An account with no home domain cannot be matched against an allowlist of
     /// trusted operators.
     #[test]
+    #[serial_test::parallel]
     fn home_domain_none_denies() {
         let tool = make_tool("stellar_pay");
         let profile = make_profile();
@@ -2424,6 +2451,7 @@ mod tests {
     /// resolved.  `account_view` alone is not sufficient to unlock HOME_DOMAIN
     /// matching; `identity_view` must be set.
     #[test]
+    #[serial_test::parallel]
     fn home_domain_no_identity_view_denies() {
         let tool = make_tool("stellar_pay");
         let profile = make_profile();
@@ -2448,6 +2476,7 @@ mod tests {
     /// Mixed-kinds criterion: both `G_ACCOUNT` and `HOME_DOMAIN` are enabled.
     /// Verifies that both checks fire in order and that the first denial wins.
     #[test]
+    #[serial_test::parallel]
     fn mixed_kinds_g_account_and_home_domain_both_checked() {
         let tool = make_tool("stellar_pay");
         let profile = make_profile();
@@ -2477,6 +2506,7 @@ mod tests {
 
     /// Mixed-kinds: G_ACCOUNT denies first — HOME_DOMAIN check is never reached.
     #[test]
+    #[serial_test::parallel]
     fn mixed_kinds_g_account_denies_before_home_domain() {
         let tool = make_tool("stellar_pay");
         let profile = make_profile();
@@ -2524,6 +2554,7 @@ mod tests {
     /// (`derive_value_class` falls through to `ReadOnly` for any name outside
     /// its match arms) must deny fail-closed rather than passing silently.
     #[test]
+    #[serial_test::parallel]
     fn moves_value_tool_with_unpopulated_effects_denies_unsizable() {
         let tool = make_tool_with_kind(
             "stellar_dex_trade",
@@ -2546,6 +2577,7 @@ mod tests {
 
     /// An opaque-signing call on the single-tx path must deny fail-closed.
     #[test]
+    #[serial_test::parallel]
     fn opaque_sign_call_denies_unsizable_on_single_tx() {
         let tool = make_tool("stellar_sep43_sign_transaction");
         let profile = make_profile();
@@ -2567,6 +2599,7 @@ mod tests {
     /// single-leg pay/create call is checked identically to the raw-args
     /// path (byte-identical outcome for the existing pay tests above).
     #[test]
+    #[serial_test::parallel]
     fn g_account_over_effects_single_leg_matches_raw_args_outcome() {
         let tool = make_tool("stellar_pay");
         let profile = make_profile();
@@ -2590,6 +2623,7 @@ mod tests {
     /// (`CounterpartyDenied`) rather than erroring: a counterparty-bearing
     /// action with no resolvable counterparty cannot satisfy an allowlist.
     #[test]
+    #[serial_test::parallel]
     fn g_account_over_effects_missing_destination_denies() {
         use crate::policy::v1::value::{ActionKind, ValueClass, ValueEffects, ValueLeg};
 

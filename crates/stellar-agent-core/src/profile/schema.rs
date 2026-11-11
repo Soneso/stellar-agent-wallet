@@ -3651,6 +3651,7 @@ mod tests {
     /// exactly the wallet key reference fields, and `wallet_key_references`
     /// yields each field's value at that field's position.
     #[test]
+    #[serial_test::parallel]
     fn wallet_key_reference_fields_match_the_profile() {
         let distinct = |name: &str| KeyringEntryRef::new(name, format!("{name}-account"));
         let mut profile = make_testnet_profile();
@@ -3750,6 +3751,7 @@ mod tests {
 
     /// `role_url` returns each role's URL as the profile holds it.
     #[test]
+    #[serial_test::parallel]
     fn role_url_follows_the_role() {
         let mut profile = make_testnet_profile();
         profile.rpc_url = "https://primary.example/rpc".to_owned();
@@ -3772,6 +3774,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::parallel]
     fn testnet_builder_chain_id() {
         let p = make_testnet_profile();
         assert_eq!(p.chain_id, crate::profile::caip2::Caip2::Testnet);
@@ -3779,12 +3782,14 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::parallel]
     fn testnet_builder_passphrase_derived_from_chain_id() {
         let p = make_testnet_profile();
         assert_eq!(p.network_passphrase, TESTNET_PASSPHRASE);
     }
 
     #[test]
+    #[serial_test::parallel]
     fn mainnet_builder_passphrase_derived_from_chain_id() {
         let p = Profile::builder_mainnet(MAINNET_FIXTURE_RPC, "s", "a", "n", "a").build();
         assert_eq!(p.network_passphrase, MAINNET_PASSPHRASE);
@@ -3792,6 +3797,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::parallel]
     fn builder_testnet_named_derives_v2_keys_from_explicit_name() {
         let p = Profile::builder_testnet_named(
             "alice",
@@ -3819,6 +3825,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::parallel]
     fn builder_mainnet_named_derives_v2_keys_from_explicit_name() {
         let p = Profile::builder_mainnet_named(
             "bob",
@@ -3848,6 +3855,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::parallel]
     fn builder_testnet_named_matches_manual_with_profile_name_chain() {
         let named = Profile::builder_testnet_named(
             "alice",
@@ -3884,6 +3892,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::parallel]
     fn effective_cross_check_threshold_stroops_floor_on_zero() {
         let mut p = make_testnet_profile();
         p.cross_check_threshold_stroops = 0;
@@ -3891,6 +3900,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::parallel]
     fn effective_cross_check_threshold_stroops_floor_on_below_minimum() {
         let mut p = make_testnet_profile();
         p.cross_check_threshold_stroops = MINIMUM_FLOOR - 1;
@@ -3898,6 +3908,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::parallel]
     fn effective_cross_check_threshold_stroops_above_floor_passes_through() {
         let mut p = make_testnet_profile();
         p.cross_check_threshold_stroops = MINIMUM_FLOOR + 500;
@@ -3908,6 +3919,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::parallel]
     fn effective_cross_check_threshold_stroops_max_passthrough() {
         let mut p = make_testnet_profile();
         p.cross_check_threshold_stroops = u64::MAX;
@@ -3915,12 +3927,14 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::parallel]
     fn validate_endpoint_urls_valid() {
         let p = make_testnet_profile();
         assert_eq!(p.validate_endpoint_urls(), Ok(()));
     }
 
     #[test]
+    #[serial_test::parallel]
     fn validate_endpoint_urls_invalid() {
         let mut p = make_testnet_profile();
         p.rpc_url = "not-a-url".to_owned();
@@ -3936,6 +3950,7 @@ mod tests {
     /// `validate_endpoint_urls` reaches the two optional fields as well as
     /// `rpc_url`: `profile init` and `profile migrate` rely on it for all three.
     #[test]
+    #[serial_test::parallel]
     fn validate_endpoint_urls_checks_the_optional_fields() {
         let base = Profile::builder_mainnet(MAINNET_FIXTURE_RPC, "s", "a", "n", "a").build();
         assert_eq!(base.validate_endpoint_urls(), Ok(()));
@@ -4008,12 +4023,14 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::parallel]
     fn mcp_disabled_default_false() {
         let p = make_testnet_profile();
         assert!(!p.mcp_disabled);
     }
 
     #[test]
+    #[serial_test::parallel]
     fn mcp_disabled_builder() {
         let p = Profile::builder_testnet("s", "a", "n", "b")
             .mcp_disabled()
@@ -4022,12 +4039,14 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::parallel]
     fn classic_fee_per_op_default_none() {
         let p = make_testnet_profile();
         assert_eq!(p.classic_fee_per_op_stroops, None);
     }
 
     #[test]
+    #[serial_test::parallel]
     fn classic_fee_per_op_serde_round_trip() {
         let p = Profile::builder_testnet("s", "a", "n", "b")
             .classic_fee_per_op_stroops(Some(250))
@@ -4043,6 +4062,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::parallel]
     fn classic_fee_per_op_absent_deserializes_to_none() {
         let p = make_testnet_profile();
         let toml_str = toml::to_string(&p).unwrap();
@@ -4056,6 +4076,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::parallel]
     fn submit_timeout_seconds_defaults_to_none_when_absent() {
         let p = make_testnet_profile();
         let toml_str = toml::to_string(&p).unwrap();
@@ -4069,6 +4090,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::parallel]
     fn submit_timeout_seconds_round_trips() {
         let mut p = make_testnet_profile();
         p.submit_timeout_seconds = Some(120);
@@ -4085,6 +4107,7 @@ mod tests {
     /// An unset submit timeout resolves to the 60-second default and a
     /// configured one to its own value.
     #[test]
+    #[serial_test::parallel]
     fn submit_timeout_resolves_the_default_and_the_configured_value() {
         let mut p = make_testnet_profile();
         p.submit_timeout_seconds = None;
@@ -4096,12 +4119,14 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::parallel]
     fn version_is_2() {
         let p = make_testnet_profile();
         assert_eq!(p.version, 2);
     }
 
     #[test]
+    #[serial_test::parallel]
     fn audit_key_default_derived_name() {
         let p = make_testnet_profile();
         assert_eq!(
@@ -4112,6 +4137,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::parallel]
     fn default_audit_log_path_for_appends_profile_log_under_audit() {
         let path = default_audit_log_path_for("alice");
 
@@ -4120,6 +4146,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::parallel]
     fn default_audit_log_path_for_sanitises_profile_name() {
         let path = default_audit_log_path_for("../alice\\bob");
 
@@ -4128,6 +4155,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::parallel]
     fn default_audit_log_path_for_empty_profile_uses_default_stem() {
         let path = default_audit_log_path_for("");
 
@@ -4135,6 +4163,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::parallel]
     fn default_audit_log_path_for_prefixes_windows_reserved_stems() {
         let path = default_audit_log_path_for("CON");
 
@@ -4142,6 +4171,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::parallel]
     fn default_audit_log_path_for_uses_platform_project_dir_shape() {
         let path = default_audit_log_path_for("alice");
         let rendered = path.to_string_lossy();
@@ -4174,6 +4204,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::parallel]
     fn owner_key_default_derived_name() {
         let p = make_testnet_profile();
         assert_eq!(
@@ -4184,6 +4215,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::parallel]
     fn attestation_key_default_derived_name() {
         let p = make_testnet_profile();
         assert_eq!(
@@ -4194,6 +4226,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::parallel]
     fn counterparty_key_default_derived_name() {
         let p = make_testnet_profile();
         assert_eq!(
@@ -4204,6 +4237,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::parallel]
     fn oracle_provider_url_default_none() {
         let p = make_testnet_profile();
         assert_eq!(p.oracle_provider_url, None);
@@ -4213,6 +4247,7 @@ mod tests {
     /// retain `Noop` — see `migrate_v1_to_v2_produces_noop_engine` in
     /// `migrate.rs`.
     #[test]
+    #[serial_test::parallel]
     fn policy_engine_default_v1_for_new_profiles() {
         let p = make_testnet_profile();
         assert_eq!(
@@ -4224,6 +4259,7 @@ mod tests {
 
     /// Both testnet and mainnet builder-produced profiles default to `V1`.
     #[test]
+    #[serial_test::parallel]
     fn policy_engine_default_v1_for_new_mainnet_profiles() {
         let p = Profile::builder_mainnet(MAINNET_FIXTURE_RPC, "s", "a", "n", "a").build();
         assert_eq!(
@@ -4234,6 +4270,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::parallel]
     fn policy_engine_builder_sets_noop_for_testnet_profile() {
         let p = Profile::builder_testnet("s", "a", "n", "b")
             .policy_engine(PolicyEngineKind::Noop)
@@ -4243,6 +4280,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::parallel]
     fn policy_engine_builder_sets_v1_for_mainnet_profile() {
         let p = Profile::builder_mainnet(MAINNET_FIXTURE_RPC, "s", "a", "n", "b")
             .policy_engine(PolicyEngineKind::V1)
@@ -4252,6 +4290,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::parallel]
     fn policy_engine_builder_overrides_prior_noop_choice() {
         let p = Profile::builder_testnet("s", "a", "n", "b")
             .with_noop_engine()
@@ -4262,6 +4301,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::parallel]
     fn with_noop_engine_overrides_prior_policy_engine_choice() {
         let p = Profile::builder_testnet("s", "a", "n", "b")
             .policy_engine(PolicyEngineKind::V1)
@@ -4501,6 +4541,7 @@ mod tests {
     // ── Profile::Debug redaction ──────────────────────────────────────────────
 
     #[test]
+    #[serial_test::parallel]
     fn redacted_profile_hides_every_url_field() {
         let mut profile = Profile::builder_testnet("svc", "acct", "nonce", "acct")
             .rpc_url("https://user:SENTINEL-PRIMARY@primary.example:8443/v1/SENTINEL-PRIMARY-PATH?key=SENTINEL-PRIMARY-QUERY")
@@ -4555,6 +4596,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::parallel]
     fn profile_debug_redacts_rpc_url() {
         let mut p = Profile::builder_testnet(
             "stellar-agent-signer",
@@ -4591,6 +4633,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::parallel]
     fn profile_debug_secondary_rpc_url_none_shows_none() {
         let p = make_testnet_profile();
         // secondary_rpc_url is None on a freshly built profile.
@@ -4607,6 +4650,7 @@ mod tests {
     /// Neither `Display` nor `Debug` of an endpoint refusal echoes any part of
     /// the URL, for an unparseable value and for each mainnet refusal.
     #[test]
+    #[serial_test::parallel]
     fn endpoint_url_error_display_and_debug_omit_the_url() {
         let cases = [
             (sentinel::UNPARSEABLE, Caip2::Testnet),
@@ -4629,6 +4673,7 @@ mod tests {
     // ── ProfileBuilder setters not yet tested ─────────────────────────────────
 
     #[test]
+    #[serial_test::parallel]
     fn builder_rpc_url_override() {
         let custom_url = "https://custom-rpc.example.com";
         let p = Profile::builder_testnet("s", "a", "n", "b")
@@ -4638,6 +4683,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::parallel]
     fn builder_cross_check_threshold_stroops_override() {
         let p = Profile::builder_testnet("s", "a", "n", "b")
             .cross_check_threshold_stroops(999_999_999_999)
@@ -4646,6 +4692,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::parallel]
     fn builder_classic_max_fee_per_op_stroops_some_and_none() {
         let p_some = Profile::builder_testnet("s", "a", "n", "b")
             .classic_max_fee_per_op_stroops(Some(500))
@@ -4659,6 +4706,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::parallel]
     fn classic_max_fee_per_op_stroops_serde_round_trip() {
         let p = Profile::builder_testnet("s", "a", "n", "b")
             .classic_max_fee_per_op_stroops(Some(750))
@@ -4673,6 +4721,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::parallel]
     fn classic_max_fee_per_op_none_absent_from_toml() {
         let p = make_testnet_profile();
         let toml_str = toml::to_string(&p).unwrap();
@@ -4692,6 +4741,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::parallel]
     fn builder_oracle_provider_url_some_and_none() {
         use url::Url;
 
@@ -4708,6 +4758,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::parallel]
     fn oracle_provider_url_serde_round_trip() {
         use url::Url;
 
@@ -4725,6 +4776,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::parallel]
     fn builder_wallet_override() {
         let cfg = WalletConfig {
             mlock_required: crate::wallet::MlockRequired::False,
@@ -4738,6 +4790,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::parallel]
     fn wallet_config_serde_round_trip() {
         let p = Profile::builder_testnet("s", "a", "n", "b")
             .wallet(WalletConfig {
@@ -4755,12 +4808,14 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::parallel]
     fn wallet_config_default_unlock_ttl_is_30() {
         let p = make_testnet_profile();
         assert_eq!(p.wallet.unlock_ttl_seconds, 30);
     }
 
     #[test]
+    #[serial_test::parallel]
     fn builder_session_rule_max_horizon_ledgers_some_and_none() {
         let p_some = Profile::builder_testnet("s", "a", "n", "b")
             .session_rule_max_horizon_ledgers(Some(500))
@@ -4774,6 +4829,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::parallel]
     fn session_rule_max_horizon_ledgers_serde_round_trip() {
         let p = Profile::builder_testnet("s", "a", "n", "b")
             .session_rule_max_horizon_ledgers(Some(2000))
@@ -4788,6 +4844,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::parallel]
     fn builder_secondary_rpc_url_some_and_none() {
         let p_some = Profile::builder_testnet("s", "a", "n", "b")
             .secondary_rpc_url(Some("https://secondary.example.com".to_owned()))
@@ -4804,6 +4861,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::parallel]
     fn secondary_rpc_url_omitted_from_toml_when_none() {
         let p = make_testnet_profile();
         let toml_str = toml::to_string(&p).unwrap();
@@ -4814,6 +4872,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::parallel]
     fn secondary_rpc_url_serde_round_trip_when_set() {
         let p = Profile::builder_testnet("s", "a", "n", "b")
             .secondary_rpc_url("https://secondary.example.com".to_owned())
@@ -4829,6 +4888,7 @@ mod tests {
     // ── Pool fields are None in freshly built profiles ────────────────────────
 
     #[test]
+    #[serial_test::parallel]
     fn pool_fields_none_in_new_profile() {
         let p = make_testnet_profile();
         assert!(
@@ -4844,6 +4904,7 @@ mod tests {
     // ── remote_approval is None by default, and round-trips when set ─────────
 
     #[test]
+    #[serial_test::parallel]
     fn remote_approval_none_in_new_profile() {
         let p = make_testnet_profile();
         assert!(
@@ -4858,6 +4919,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::parallel]
     fn remote_approval_serde_round_trip_when_set() {
         let mut p = make_testnet_profile();
         p.remote_approval = Some(RemoteApprovalConfig {
@@ -4894,6 +4956,7 @@ mod tests {
     /// `[served_pages]` block: a deployment that asked for nothing gets no
     /// identity rather than the project's own.
     #[test]
+    #[serial_test::parallel]
     fn served_pages_none_in_new_profile() {
         let p = make_testnet_profile();
         assert!(
@@ -4908,6 +4971,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::parallel]
     fn served_pages_serde_round_trip_when_set() {
         let mut p = make_testnet_profile();
         p.served_pages = Some(ServedPagesConfig::new(Some("Acme Ops".to_owned()), true));
@@ -4967,6 +5031,7 @@ mod tests {
     /// field's contract documents — never a host-global shared file whose
     /// hash-chained rows would interleave across profiles.
     #[test]
+    #[serial_test::parallel]
     fn builder_unset_audit_log_path_resolves_per_profile() {
         let profile = Profile::builder_testnet("svc", "acct", "n-svc", "n-acct")
             .with_profile_name("alice")
@@ -4982,6 +5047,7 @@ mod tests {
     /// Without `with_profile_name`, the audit path derives from the same
     /// signer-account name base the v2 keyring references derive from.
     #[test]
+    #[serial_test::parallel]
     fn builder_unnamed_audit_path_derives_from_signer_account() {
         let profile = Profile::builder_testnet("svc", "acct", "n-svc", "n-acct").build();
         assert_eq!(profile.audit_log_path, default_audit_log_path_for("acct"));
@@ -5065,6 +5131,7 @@ mod tests {
     // ── audit_log_file_stem: Windows-reserved names (COM / LPT variants) ─────
 
     #[test]
+    #[serial_test::parallel]
     fn audit_log_file_stem_prefixes_all_com_variants() {
         for name in &[
             "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
@@ -5079,6 +5146,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::parallel]
     fn audit_log_file_stem_prefixes_all_lpt_variants() {
         for name in &[
             "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
@@ -5093,6 +5161,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::parallel]
     fn audit_log_file_stem_prefixes_prn_aux_nul() {
         for name in &["PRN", "AUX", "NUL"] {
             let path = default_audit_log_path_for(name);
@@ -5105,6 +5174,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::parallel]
     fn audit_log_file_stem_prefixes_reserved_names_case_insensitive() {
         // Lowercase forms must also be treated as reserved.
         for name in &["con", "prn", "aux", "nul", "com1", "lpt9"] {
@@ -5118,6 +5188,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::parallel]
     fn audit_log_file_stem_reduces_the_console_device_names_to_ordinary_stems() {
         // `$` is outside `[A-Za-z0-9_-]`, so `CONIN$` sanitises to `CONIN_`,
         // which names no device on any platform. The validator's exact-match
@@ -5135,6 +5206,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::parallel]
     fn audit_log_file_stem_allows_normal_names() {
         // Names that look similar but are not reserved must not be prefixed.
         for name in &[
@@ -5157,6 +5229,7 @@ mod tests {
     // ── ProfileBuilder::policy setter ─────────────────────────────────────────
 
     #[test]
+    #[serial_test::parallel]
     fn builder_policy_setter_overrides_default() {
         let cfg = PolicyConfig {
             engine: PolicyEngineKind::Noop,
@@ -5170,12 +5243,14 @@ mod tests {
     // ── smart_account_max_context_rule_scan_id ────────────────────────────────
 
     #[test]
+    #[serial_test::parallel]
     fn smart_account_max_scan_id_defaults_to_none() {
         let p = make_testnet_profile();
         assert_eq!(p.smart_account_max_context_rule_scan_id, None);
     }
 
     #[test]
+    #[serial_test::parallel]
     fn smart_account_max_scan_id_serde_round_trip() {
         let mut p = make_testnet_profile();
         p.smart_account_max_context_rule_scan_id = Some(200);
@@ -5298,6 +5373,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::parallel]
     fn provider_records_round_trip_and_omit_unset_roles() {
         let secondary = ProviderRecord::new("Secondary operator", "secondary.example", true);
         let oracle = ProviderRecord::new("Oracle operator", "oracle.example", false);
@@ -5395,6 +5471,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::parallel]
     fn provider_builder_sets_and_clears_three_roles() {
         let primary = PrimaryProviderRecord::new("Primary operator", "primary.example")
             .with_credential(
@@ -5491,6 +5568,7 @@ mod tests {
     /// The reference and the placement are public metadata and print in
     /// `Debug`, in the redacted view, and in its serialization.
     #[test]
+    #[serial_test::parallel]
     fn profile_debug_prints_credential_reference_and_placement() {
         let profile = Profile::builder_testnet("s", "a", "n", "a")
             .primary_provider(
@@ -5598,6 +5676,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::parallel]
     fn provider_metadata_is_visible_in_show_and_debug() {
         let profile = Profile::builder_testnet("s", "a", "n", "a")
             .rpc_url(concat!(
@@ -5647,6 +5726,7 @@ mod tests {
         }
     }
     #[test]
+    #[serial_test::parallel]
     fn cross_check_thresholds_are_visible_in_show_and_debug() {
         use crate::asset_id::CanonicalAsset;
         use crate::cross_check::CrossCheckThresholds;

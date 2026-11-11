@@ -2806,6 +2806,7 @@ mod tests {
     // ── PolicyEngineV1::evaluate — empty document → NoMatchingRule ──────────
 
     #[test]
+    #[serial_test::parallel]
     fn evaluate_empty_document_returns_no_matching_rule() {
         let doc = PolicyDocument {
             version: 1,
@@ -2834,6 +2835,7 @@ mod tests {
 
     /// A single allow-all rule with no criteria → Decision::Allow.
     #[test]
+    #[serial_test::parallel]
     fn evaluate_allow_rule_no_criteria_returns_allow() {
         let doc = PolicyDocument {
             version: 1,
@@ -2868,6 +2870,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::parallel]
     fn approval_above_escalates_only_above_threshold_and_preserves_hard_cap() {
         use criteria::{ApprovalAboveCriterion, PerTxCapCriterion};
 
@@ -2933,6 +2936,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::parallel]
     fn approval_above_preserves_non_allow_rule_decisions() {
         for decision in [
             Decision::Deny(DenyReason::ExplicitRuleDeny),
@@ -2987,6 +2991,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::parallel]
     fn approval_above_preserves_value_errors_and_asset_matching() {
         use criteria::ApprovalAboveCriterion;
         let engine = PolicyEngineV1::new(
@@ -3053,6 +3058,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::parallel]
     fn full_evaluations_carry_exact_effects_for_allow_and_approval_only() {
         let profile = testnet_profile();
         let td = tool("stellar_pay", "stellar:testnet");
@@ -3132,6 +3138,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::parallel]
     fn approval_above_bundle_escalation_yields_to_later_denial() {
         use criteria::{
             ApprovalAboveCriterion, InnerInvocationCountCapCriterion, PerTxCapCriterion,
@@ -3204,6 +3211,7 @@ mod tests {
     /// `InnerInvocationCountCapExceeded` directly — NOT wrapped in `BundleDenied`.
     ///
     #[test]
+    #[serial_test::parallel]
     fn evaluate_bundle_count_cap_fires_at_phase2_not_wrapped() {
         use crate::policy::v1::criteria::InnerInvocationCountCapCriterion;
 
@@ -3244,6 +3252,7 @@ mod tests {
     /// evaluate_bundle: all criteria pass → rule decision (Allow) is returned.
     ///
     #[test]
+    #[serial_test::parallel]
     fn evaluate_bundle_all_pass_runs_bundle_level_criteria() {
         use crate::policy::v1::criteria::InnerInvocationCountCapCriterion;
 
@@ -3281,6 +3290,7 @@ mod tests {
     /// Verifies the first-match stop-semantics when the rule's tool filter
     /// does not match the submitted tool.
     #[test]
+    #[serial_test::parallel]
     fn evaluate_bundle_no_matching_rule_denies() {
         // Rule only matches "stellar_pay"; submit "stellar_multicall".
         let doc = PolicyDocument {
@@ -3323,6 +3333,7 @@ mod tests {
     /// Confirms that a plain `evaluate()` call does not inject overlay state —
     /// the bundle field in EvalContext is None on the single-tx path.
     #[test]
+    #[serial_test::parallel]
     fn evaluate_bundle_overlay_zero_on_single_tx() {
         let doc = allow_all_doc_with_criteria(vec![]);
         let engine = PolicyEngineV1::new(doc, "alice".into());
@@ -3358,6 +3369,7 @@ mod tests {
     /// directly — NOT wrapped in `BundleDenied`.
     ///
     #[test]
+    #[serial_test::parallel]
     fn evaluate_bundle_aggregate_cap_denies_at_phase2_not_wrapped() {
         use crate::policy::v1::criteria::BundleAggregateCapCriterion;
 
@@ -3398,6 +3410,7 @@ mod tests {
     /// on the rule) still denies a bundle containing a `Generic` inner, with the
     /// restrict criterion's own deny code — the implicit coupling.
     #[test]
+    #[serial_test::parallel]
     fn evaluate_bundle_aggregate_cap_alone_denies_generic_inner() {
         use crate::policy::v1::criteria::BundleAggregateCapCriterion;
 
@@ -3433,6 +3446,7 @@ mod tests {
     /// inners, so without the coupling a Generic-decoding inner would escape
     /// it.
     #[test]
+    #[serial_test::parallel]
     fn evaluate_bundle_per_tx_cap_alone_denies_generic_inner() {
         use crate::policy::v1::criteria::BundlePerTxCapCriterion;
 
@@ -3468,6 +3482,7 @@ mod tests {
     /// inners, so without the coupling a Generic-decoding inner would escape
     /// it.
     #[test]
+    #[serial_test::parallel]
     fn evaluate_bundle_per_period_cap_alone_denies_generic_inner() {
         use crate::policy::v1::criteria::BundlePerPeriodCapCriterion;
         use crate::policy::v1::criteria::per_period_cap::Window;
@@ -3503,6 +3518,7 @@ mod tests {
     /// evaluate_bundle: `bundle_aggregate_cap` alone allows an all-recognised
     /// bundle within the cap — the implicit coupling does not over-deny.
     #[test]
+    #[serial_test::parallel]
     fn evaluate_bundle_aggregate_cap_alone_allows_recognised_within_cap() {
         use crate::policy::v1::criteria::BundleAggregateCapCriterion;
 
@@ -3536,6 +3552,7 @@ mod tests {
     /// `inner_index` as the cap-alone case — the implicit check and the
     /// explicit criterion cannot diverge in the deny shape an operator sees.
     #[test]
+    #[serial_test::parallel]
     fn evaluate_bundle_aggregate_cap_with_explicit_enabled_guard_single_deny() {
         use crate::policy::v1::criteria::{
             BundleAggregateCapCriterion, RestrictBundleToRecognisedKindsCriterion,
@@ -3575,6 +3592,7 @@ mod tests {
     /// `restrict_bundle_to_recognised_kinds` still denies — the implicit
     /// coupling wins over an explicit opt-out.
     #[test]
+    #[serial_test::parallel]
     fn evaluate_bundle_aggregate_cap_with_explicit_disabled_guard_still_denies() {
         use crate::policy::v1::criteria::{
             BundleAggregateCapCriterion, RestrictBundleToRecognisedKindsCriterion,
@@ -3613,6 +3631,7 @@ mod tests {
     /// evaluate_bundle: a per-call value criterion denies a Generic inner,
     /// whose value effect the wallet cannot size, at its index.
     #[test]
+    #[serial_test::parallel]
     fn evaluate_bundle_per_tx_cap_denies_an_unvalued_inner() {
         let result = evaluate_unvalued_inner(false);
         assert!(
@@ -3623,6 +3642,7 @@ mod tests {
     /// evaluate_bundle: `allow_opaque_signing` exempts the Generic inner from
     /// the rule's per-call value criteria, as it does for a single call.
     #[test]
+    #[serial_test::parallel]
     fn evaluate_bundle_allow_opaque_signing_admits_an_unvalued_inner() {
         assert_eq!(evaluate_unvalued_inner(true), Decision::Allow);
     }
@@ -3656,6 +3676,7 @@ mod tests {
     /// `restrict_bundle_to_recognised_kinds` on the rule — a Generic inner is
     /// allowed. Existing behavior is unchanged when the cap is absent.
     #[test]
+    #[serial_test::parallel]
     fn evaluate_bundle_no_cap_no_guard_allows_generic_inner() {
         let doc = allow_all_doc_with_criteria(vec![]);
         let engine = PolicyEngineV1::new(doc, "alice".into());
@@ -3685,6 +3706,7 @@ mod tests {
     /// The hard floor is applied before rule resolution and is unconditional —
     /// policy authors cannot raise it above 50.
     #[test]
+    #[serial_test::parallel]
     fn evaluate_bundle_hard_floor_denies_above_default_cap() {
         // No inner_invocation_count_cap criterion in the rule.
         let doc = allow_all_doc_with_criteria(vec![]);
@@ -3735,6 +3757,7 @@ mod tests {
     ///
     #[test]
     #[allow(clippy::unwrap_used)]
+    #[serial_test::parallel]
     fn evaluate_bundle_per_period_cap_overlay_accumulates() {
         use crate::policy::v1::criteria::per_period_cap::{PerPeriodCapCriterion, Window};
         use serde_json::json;
@@ -3787,6 +3810,7 @@ mod tests {
     ///
     #[test]
     #[allow(clippy::unwrap_used)]
+    #[serial_test::parallel]
     fn evaluate_bundle_per_period_cap_overlay_fires_with_1h_window() {
         use crate::policy::v1::criteria::per_period_cap::{PerPeriodCapCriterion, Window};
         use serde_json::json;
@@ -3840,6 +3864,7 @@ mod tests {
     ///
     #[test]
     #[allow(clippy::unwrap_used)]
+    #[serial_test::parallel]
     fn evaluate_bundle_rate_limit_overlay_accumulates_calls() {
         use crate::policy::v1::criteria::per_period_cap::Window;
         use crate::policy::v1::criteria::rate_limit::RateLimitCriterion;
@@ -3891,6 +3916,7 @@ mod tests {
     ///
     #[test]
     #[allow(clippy::unwrap_used)]
+    #[serial_test::parallel]
     fn evaluate_bundle_rate_limit_boundary_does_not_double_deny() {
         use crate::policy::v1::criteria::per_period_cap::Window;
         use crate::policy::v1::criteria::rate_limit::RateLimitCriterion;
@@ -3939,6 +3965,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::parallel]
     fn size_equals_record_confirmed() {
         use criteria::{
             per_period_cap::{PerPeriodCapCriterion, Window},
@@ -4018,6 +4045,7 @@ mod tests {
     /// second call is then DENIED because the accumulated total now exceeds
     /// the cap — pinning that recording actually feeds back into evaluation.
     #[test]
+    #[serial_test::parallel]
     fn record_confirmed_per_period_cap_accumulates_then_second_call_denies() {
         let _clock = criteria::state_store::set_query_time_for_test(TEST_NOW_MS);
         use crate::policy::v1::criteria::per_period_cap::{PerPeriodCapCriterion, Window};
@@ -4086,6 +4114,7 @@ mod tests {
     /// `rate_limit` counts calls: three confirmed calls under a cap of 3
     /// exhaust it; a fourth is denied.
     #[test]
+    #[serial_test::parallel]
     fn record_confirmed_rate_limit_accumulates_calls_until_cap() {
         let _clock = criteria::state_store::set_query_time_for_test(TEST_NOW_MS);
         use crate::policy::v1::criteria::per_period_cap::Window;
@@ -4145,6 +4174,7 @@ mod tests {
     /// `PerPeriodCapCriterion` when `value` is `ReadOnly` (e.g. the bundle
     /// path, which records via `record_confirmed_bundle` instead).
     #[test]
+    #[serial_test::parallel]
     fn record_confirmed_read_only_value_is_noop_for_per_period_cap() {
         use crate::policy::v1::criteria::per_period_cap::{PerPeriodCapCriterion, Window};
         use crate::policy::v1::value::ValueClass;
@@ -4166,6 +4196,7 @@ mod tests {
     /// inner for `BundlePerPeriodCapCriterion`, and the recorded total then
     /// denies a subsequent bundle that would tip the cap.
     #[test]
+    #[serial_test::parallel]
     fn record_confirmed_bundle_per_period_cap_accumulates_then_denies() {
         use crate::policy::v1::criteria::bundle_per_period_cap::BundlePerPeriodCapCriterion;
         use crate::policy::v1::criteria::per_period_cap::Window;
@@ -4225,6 +4256,7 @@ mod tests {
     /// record for a call that was never actually permitted under this
     /// engine's document).
     #[test]
+    #[serial_test::parallel]
     fn record_confirmed_no_matching_rule_returns_empty() {
         use crate::policy::v1::value::ValueClass;
 
@@ -4273,6 +4305,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::parallel]
     fn checked_unvalued_sizing_refuses_value_rules_and_keeps_count_charges() {
         let mut td = tool("stellar_smart_account_execute", "stellar:testnet");
         td.value_kind = crate::policy::ToolValueKind::OpaqueSign;
@@ -4331,6 +4364,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::parallel]
     fn checked_unvalued_sizing_preserves_existing_state_and_honors_exemptions() {
         use criteria::state_store::StateKey;
         let td = tool("stellar_smart_account_execute", "stellar:testnet");
@@ -4370,6 +4404,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::parallel]
     fn checked_no_value_sizing_only_carries_counts() {
         let td = tool("stellar_smart_account_rules", "stellar:testnet");
         let profile = testnet_profile();
@@ -4382,6 +4417,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::parallel]
     fn checked_recording_refuses_opaque_value_before_mutation() {
         let mut td = tool("stellar_smart_account_execute", "stellar:testnet");
         td.value_kind = crate::policy::ToolValueKind::OpaqueSign;
@@ -4439,6 +4475,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::parallel]
     fn checked_engine_defaults_refuse_and_noop_certifies_no_limit() {
         struct EvaluateOnly;
         impl PolicyEngine for EvaluateOnly {
@@ -4490,6 +4527,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::parallel]
     fn size_leaves_store_untouched() {
         use criteria::{
             per_period_cap::{PerPeriodCapCriterion, Window},
@@ -4539,6 +4577,7 @@ mod tests {
     /// detail that names the check, the expected form and the tool, and the
     /// asset text appears nowhere in the error.
     #[test]
+    #[serial_test::parallel]
     fn counterparty_asset_marker_is_not_echoed() {
         use crate::policy::v1::criteria::counterparty_allowlist::{
             CounterpartyAllowlistCriterion, CounterpartyKind,

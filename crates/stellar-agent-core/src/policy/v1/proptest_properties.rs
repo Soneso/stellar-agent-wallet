@@ -115,6 +115,7 @@ proptest! {
     #![proptest_config(ProptestConfig::with_cases(10_000))]
 
     #[test]
+    #[serial_test::parallel]
     fn prop_approval_above_bounds_and_determinism(
         (rule, threshold, cap) in arb_approval_above_rule(),
         amount in 1_i128..=300_000_000_000,
@@ -161,6 +162,7 @@ proptest! {
     /// Instead we evaluate the same engine twice, which is the stronger claim:
     /// the engine has no hidden mutation between calls.
     #[test]
+    #[serial_test::parallel]
     fn prop_per_tx_cap_evaluate_is_deterministic(
         rule in arb_per_tx_cap_rule(),
         tool in arb_tool_descriptor(),
@@ -181,6 +183,7 @@ proptest! {
     ///
     /// Same-engine re-evaluation must return the same `Decision`.
     #[test]
+    #[serial_test::parallel]
     fn prop_counterparty_allowlist_evaluate_is_deterministic(
         rule in arb_counterparty_allowlist_rule(),
         tool in arb_tool_descriptor(),
@@ -206,6 +209,7 @@ proptest! {
     /// is `None`.  The property test exercises this correctly by omitting the
     /// view — both evaluations return identical errors.
     #[test]
+    #[serial_test::parallel]
     fn prop_minimum_reserve_evaluate_is_deterministic(
         rule in arb_minimum_reserve_rule(),
         tool in arb_tool_descriptor(),
@@ -249,6 +253,7 @@ proptest! {
     /// stroops (at minimum 2 stroops), so the strict deny rule (cap = 1 stroop)
     /// always fires for `stellar_pay` and `stellar_create_account`.
     #[test]
+    #[serial_test::parallel]
     fn prop_adding_deny_rule_cannot_turn_allow_into_allow(
         base_rule in prop_oneof![arb_per_tx_cap_rule(), arb_approval_above_rule().prop_map(|(rule, _, _)| rule)],
         strict_deny_rule in arb_strict_deny_per_tx_rule(),

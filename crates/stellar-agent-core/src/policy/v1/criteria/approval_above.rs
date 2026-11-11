@@ -84,6 +84,7 @@ mod tests {
     use crate::profile::schema::Profile;
 
     #[test]
+    #[serial_test::parallel]
     fn deny_only_threshold_and_decision_escalation_agree() {
         let criterion = ApprovalAboveCriterion::new("native".into(), 100);
         let tool = ToolDescriptor::from_registration(&McpToolRegistration {

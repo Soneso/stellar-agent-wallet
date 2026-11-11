@@ -2766,6 +2766,7 @@ mod tests {
     };
 
     #[test]
+    #[serial_test::parallel]
     fn thresholds_refuse_native_key() {
         for key in ["native", "NATIVE", "xlm", "XlM"] {
             let input = format!(
@@ -2804,6 +2805,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::parallel]
     fn thresholds_invalid_inputs_never_reach_operator_text() {
         let issuer = stellar_strkey::ed25519::PublicKey([7; 32]).to_string();
         let key = format!("USD:{issuer}");
@@ -2854,6 +2856,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::parallel]
     fn thresholds_validate_values_and_sac_duplicates() {
         let issuer = stellar_strkey::ed25519::PublicKey([7; 32]).to_string();
         let classic = CanonicalAsset::classic("USD", &issuer).unwrap();
@@ -2934,6 +2937,7 @@ mod tests {
     /// A threshold entry whose key parses is still refused by its position:
     /// neither a refused value nor an identity conflict names the key.
     #[test]
+    #[serial_test::parallel]
     fn cross_check_threshold_marker_is_not_echoed() {
         let issuer = stellar_strkey::ed25519::PublicKey([7; 32]).to_string();
         let classic = CanonicalAsset::classic(CREDENTIAL_MARKER, &issuer).unwrap();
@@ -3298,6 +3302,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::parallel]
     fn testnet_secondary_rpc_url_overlay_loads() {
         let profile = provider_load(
             minimal_toml(),
@@ -3330,6 +3335,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::parallel]
     fn testnet_mcp_signer_default_overlay_loads() {
         let profile = provider_load(
             minimal_toml(),
@@ -3347,6 +3353,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::parallel]
     fn testnet_rpc_overlay_loads() {
         let profile = provider_load(
             minimal_toml(),
@@ -3402,6 +3409,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::parallel]
     fn testnet_oracle_provider_url_overlay_loads() {
         let profile = provider_load(
             minimal_toml(),
@@ -3416,6 +3424,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::parallel]
     fn mainnet_unprotected_overlay_loads() {
         let profile =
             provider_load(&mainnet_toml(), "mcp_disabled", serde_json::json!(true)).unwrap();
@@ -3526,6 +3535,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::parallel]
     fn testnet_only_overlays_load_on_testnet() {
         for (key, value) in testnet_only_overlays() {
             let profile = provider_load(minimal_toml(), key, value.clone())
@@ -3552,6 +3562,7 @@ mod tests {
     /// neither spelling, refused on mainnet whether the file uses the alias
     /// or neither spelling.
     #[test]
+    #[serial_test::parallel]
     fn usd_threshold_alias_follows_the_testnet_only_class() {
         assert!(!minimal_toml().contains("threshold"));
         let profile = provider_load(minimal_toml(), "usd_threshold", serde_json::json!(4_242))
@@ -3590,6 +3601,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::parallel]
     fn submit_timeout_overlay_loads_on_every_chain() {
         for file in [minimal_toml().to_owned(), mainnet_toml()] {
             let profile = provider_load(&file, "submit_timeout_seconds", serde_json::json!(47))
@@ -3599,6 +3611,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::parallel]
     fn mcp_disabled_overlay_may_only_tighten() {
         for file in [minimal_toml().to_owned(), mainnet_toml()] {
             let profile = provider_load(&file, "mcp_disabled", serde_json::json!(true))
@@ -3630,6 +3643,7 @@ mod tests {
     /// The keys `Env::prefixed` yields for the non-profile `STELLAR_AGENT_*`
     /// variables name no profile key, so the class check ignores them.
     #[test]
+    #[serial_test::parallel]
     fn non_profile_overlay_keys_are_ignored() {
         let (dir, name) = write_profile(&mainnet_toml());
         let overlay = HashMap::from([
@@ -3679,6 +3693,7 @@ mod tests {
 
     /// The programmatic overlay passes the same class check.
     #[test]
+    #[serial_test::parallel]
     fn programmatic_overlay_applies_the_class_table() {
         let (dir, name) = write_profile(minimal_toml());
         let refused = load_with_overlay_from_dir(
@@ -3888,6 +3903,7 @@ account = "default"
     }
 
     #[test]
+    #[serial_test::parallel]
     fn load_minimal_valid_profile() {
         let (dir, name) = write_profile(minimal_toml());
         let p = load_from_dir(&name, dir.path(), None).unwrap();
@@ -3921,6 +3937,7 @@ account = "default"
     /// A profile TOML that explicitly sets `[policy_window_state_key_id]`
     /// overrides the name-derived default.
     #[test]
+    #[serial_test::parallel]
     fn load_explicit_policy_window_state_key_id_overrides_derived_default() {
         let toml = format!(
             "{}\n[policy_window_state_key_id]\nservice = \"custom-window-service\"\naccount = \"custom-account\"\n",
@@ -3975,6 +3992,7 @@ account = "default"
     }
 
     #[test]
+    #[serial_test::parallel]
     fn load_accepts_v2_profile_with_explicit_noop_policy() {
         let toml = minimal_toml().replace("engine = \"v1\"", "engine = \"noop\"");
         let (dir, name) = write_profile(&toml);
@@ -3987,6 +4005,7 @@ account = "default"
     }
 
     #[test]
+    #[serial_test::parallel]
     fn load_accepts_v2_profile_with_v1_policy() {
         let (dir, name) = write_profile(minimal_toml());
         let p = load_from_dir(&name, dir.path(), None).unwrap();
@@ -3998,6 +4017,7 @@ account = "default"
     }
 
     #[test]
+    #[serial_test::parallel]
     fn load_rpc_url_defaults_from_chain_id() {
         use crate::profile::caip2::TESTNET_RPC_URL;
         let (dir, name) = write_profile(minimal_toml());
@@ -4079,6 +4099,7 @@ account = "default"
     /// fields, with the exact field and reason, and no sentinel component in
     /// the error's `Display`, its `Debug`, or the rendered envelope.
     #[test]
+    #[serial_test::parallel]
     fn endpoint_rule_refuses_each_field_with_its_exact_reason() {
         let mut rows: Vec<(&str, Endpoints<'_>, &str, EndpointUrlRejection)> = Vec::new();
         for field in ["rpc_url", "secondary_rpc_url", "oracle_provider_url"] {
@@ -4149,6 +4170,7 @@ account = "default"
     /// Testnet accepts a plaintext loopback endpoint and a URL with userinfo
     /// in all three fields, so the mainnet-only checks stay mainnet-only.
     #[test]
+    #[serial_test::parallel]
     fn endpoint_rule_accepts_testnet_plaintext_and_userinfo() {
         for value in [
             "http://127.0.0.1:8000",
@@ -4173,6 +4195,7 @@ account = "default"
     /// The loader reports the first broken field in the order `rpc_url`,
     /// `secondary_rpc_url`, `oracle_provider_url`.
     #[test]
+    #[serial_test::parallel]
     fn endpoint_rule_reports_the_first_broken_field() {
         for (rpc_url, expected) in [
             ("http://rpc.example.invalid", "rpc_url"),
@@ -4196,6 +4219,7 @@ account = "default"
     /// A mainnet file whose three endpoints pass the rule loads them as
     /// written, including an HTTPS loopback endpoint.
     #[test]
+    #[serial_test::parallel]
     fn endpoint_rule_accepts_mainnet_https_endpoints() {
         let endpoints = Endpoints {
             rpc_url: Some("https://127.0.0.1:8443"),
@@ -4225,6 +4249,7 @@ account = "default"
     }
 
     #[test]
+    #[serial_test::parallel]
     fn load_explicit_rpc_url_overrides_default() {
         let toml = r#"
 version = 2
@@ -4264,6 +4289,7 @@ engine = "v1"
     }
 
     #[test]
+    #[serial_test::parallel]
     fn load_explicit_oracle_provider_url_parses_url() {
         let toml = r#"
 version = 2
@@ -4338,6 +4364,7 @@ account = "a"
     }
 
     #[test]
+    #[serial_test::parallel]
     fn load_invalid_rpc_url_error() {
         let toml = r#"
 version = 2
@@ -4460,6 +4487,7 @@ account = "default"
     }
 
     #[test]
+    #[serial_test::parallel]
     fn cross_check_threshold_stroops_defaults_to_minimum_floor_on_load() {
         // A profile TOML with no cross_check_threshold_stroops field should
         // default to 0 (the serde default), and
@@ -4496,6 +4524,7 @@ account = "a"
     /// The fallback reports a synthesized profile as `Synthesized` and an existing
     /// `default.toml` as `Persisted`, with the binding check each origin implies.
     #[test]
+    #[serial_test::parallel]
     fn load_default_or_testnet_fallback_reports_the_origin() {
         let dir = tempfile::tempdir().unwrap();
         let (synthesized, origin) = load_default_or_testnet_fallback_from_dir(dir.path()).unwrap();
@@ -4541,6 +4570,7 @@ account = "a"
     /// to fail.  A tautology test that rebuilds the chain inline would survive
     /// such a deletion silently.
     #[test]
+    #[serial_test::parallel]
     fn load_default_or_testnet_fallback_synthesised_profile_retains_noop_engine() {
         use crate::profile::schema::PolicyEngineKind;
 
@@ -4581,6 +4611,7 @@ account = "a"
     /// profile has no `secondary_rpc_url`, `load_from_dir` must refuse with
     /// `ProfileLoadError::MulticallRequiresSecondaryRpc`.
     #[test]
+    #[serial_test::parallel]
     fn profile_load_refuses_when_multicall_registered_without_secondary_rpc_url() {
         // minimal_toml() has no secondary_rpc_url — it will trigger the guard.
         let (dir, name) = write_profile(minimal_toml());
@@ -4623,6 +4654,7 @@ account = "a"
     /// When a multicall registry entry exists AND the profile has a
     /// `secondary_rpc_url`, loading must succeed (the guard must not fire).
     #[test]
+    #[serial_test::parallel]
     fn profile_load_accepts_when_multicall_registered_with_secondary_rpc_url() {
         // Write a complete profile TOML that includes `secondary_rpc_url` at the
         // root level (before any `[section]` headers).  Building on `minimal_toml()`
@@ -4674,6 +4706,7 @@ engine = "v1"
     /// When no multicall registry entry exists (`NeverPresentHook`), the guard
     /// must not fire even when `secondary_rpc_url` is absent.
     #[test]
+    #[serial_test::parallel]
     fn profile_load_accepts_when_no_multicall_registry_entry() {
         let (dir, name) = write_profile(minimal_toml());
         let hook = NeverPresentHook;
@@ -4742,6 +4775,7 @@ engine = "v1"
     /// `smart_account_max_context_rule_scan_id` at exactly the upper bound
     /// (10_000) must be accepted.
     #[test]
+    #[serial_test::parallel]
     fn load_scan_id_at_upper_bound_is_accepted() {
         let toml = minimal_toml_with_extra("smart_account_max_context_rule_scan_id = 10000");
         let (dir, name) = write_profile(&toml);
@@ -4752,6 +4786,7 @@ engine = "v1"
     /// `smart_account_max_context_rule_scan_id` exceeding the upper bound
     /// (10_001) must be rejected with `ProfileLoadError::InvalidScanIdBound`.
     #[test]
+    #[serial_test::parallel]
     fn load_scan_id_above_upper_bound_is_rejected() {
         let toml = minimal_toml_with_extra("smart_account_max_context_rule_scan_id = 10001");
         let (dir, name) = write_profile(&toml);
@@ -4779,6 +4814,7 @@ engine = "v1"
 
     /// A large `smart_account_max_context_rule_scan_id` (u32::MAX) is rejected.
     #[test]
+    #[serial_test::parallel]
     fn load_scan_id_max_u32_is_rejected() {
         let toml = minimal_toml_with_extra(&format!(
             "smart_account_max_context_rule_scan_id = {}",
@@ -4795,6 +4831,7 @@ engine = "v1"
     /// `session_rule_max_horizon_ledgers` at exactly the upper bound (10_000)
     /// must be accepted.
     #[test]
+    #[serial_test::parallel]
     fn load_horizon_at_upper_bound_is_accepted() {
         let toml = minimal_toml_with_extra("session_rule_max_horizon_ledgers = 10000");
         let (dir, name) = write_profile(&toml);
@@ -4805,6 +4842,7 @@ engine = "v1"
     /// `session_rule_max_horizon_ledgers` exceeding the upper bound (10_001)
     /// must be rejected with `ProfileLoadError::InvalidHorizonBound`.
     #[test]
+    #[serial_test::parallel]
     fn load_horizon_above_upper_bound_is_rejected() {
         let toml = minimal_toml_with_extra("session_rule_max_horizon_ledgers = 10001");
         let (dir, name) = write_profile(&toml);
@@ -4828,6 +4866,7 @@ engine = "v1"
 
     /// A large `session_rule_max_horizon_ledgers` (u32::MAX) is rejected.
     #[test]
+    #[serial_test::parallel]
     fn load_horizon_max_u32_is_rejected() {
         let toml =
             minimal_toml_with_extra(&format!("session_rule_max_horizon_ledgers = {}", u32::MAX));
@@ -4845,6 +4884,7 @@ engine = "v1"
     /// identity: the pages render neutral rather than falling back to the
     /// project's own name and mark.
     #[test]
+    #[serial_test::parallel]
     fn load_without_served_pages_block_yields_no_identity() {
         let (dir, name) = write_profile(minimal_toml());
         let p = load_from_dir(&name, dir.path(), None).unwrap();
@@ -4852,6 +4892,7 @@ engine = "v1"
     }
 
     #[test]
+    #[serial_test::parallel]
     fn load_served_pages_block_carries_the_name_and_the_mark_flag() {
         let toml = minimal_toml_with_extra(
             "[served_pages]\ndisplay_name = \"Acme Ops\"\nshow_project_mark = true",
@@ -4865,6 +4906,7 @@ engine = "v1"
 
     /// A `display_name` at exactly the render bound is accepted.
     #[test]
+    #[serial_test::parallel]
     fn load_served_page_display_name_at_bound_is_accepted() {
         let toml = minimal_toml_with_extra(&format!(
             "[served_pages]\ndisplay_name = \"{}\"",
@@ -4883,6 +4925,7 @@ engine = "v1"
     /// A `display_name` past the render bound is refused rather than silently
     /// rendered as a prefix of what the operator wrote.
     #[test]
+    #[serial_test::parallel]
     fn load_served_page_display_name_above_bound_is_rejected() {
         let toml = minimal_toml_with_extra(&format!(
             "[served_pages]\ndisplay_name = \"{}\"",
@@ -4909,6 +4952,7 @@ engine = "v1"
     /// The bound counts characters, so a multi-byte name is measured the way
     /// the renderer truncates it.
     #[test]
+    #[serial_test::parallel]
     fn load_served_page_display_name_bound_counts_characters() {
         let toml = minimal_toml_with_extra(&format!(
             "[served_pages]\ndisplay_name = \"{}\"",
@@ -4924,6 +4968,7 @@ engine = "v1"
 
     /// When both bounds are at (or below) the limit, the profile loads successfully.
     #[test]
+    #[serial_test::parallel]
     fn load_both_bounds_within_limits_accepted() {
         let toml = minimal_toml_with_extra(
             "smart_account_max_context_rule_scan_id = 100\nsession_rule_max_horizon_ledgers = 1000",
@@ -5106,6 +5151,7 @@ engine = "v1"
     /// A second `set_pool_state_on_disk` (the `pool init --force` shape)
     /// replaces the previous pool bookkeeping wholesale.
     #[test]
+    #[serial_test::parallel]
     fn set_pool_state_on_disk_overwrites_previous_pool_state() {
         use crate::profile::schema::{KeyringEntryRef, PoolChannelRecord, PoolConfig};
         let (dir, name) = write_profile(minimal_toml());
@@ -5131,6 +5177,7 @@ engine = "v1"
     /// pool state as typed schema values (serde-shape parity with
     /// [`save`]'s full-profile serialisation).
     #[test]
+    #[serial_test::parallel]
     fn set_pool_state_on_disk_round_trips_through_load() {
         let (dir, name) = write_profile(minimal_toml());
         let (master_ref, cfg) = pool_state_fixture();
@@ -5146,6 +5193,7 @@ engine = "v1"
     /// the profile name the loader was asked for — never a host-global
     /// shared file.
     #[test]
+    #[serial_test::parallel]
     fn load_unset_audit_log_path_defaults_per_profile() {
         let (dir, name) = write_profile(minimal_toml());
         let loaded = load_from_dir(&name, dir.path(), None).unwrap();
@@ -5201,6 +5249,7 @@ engine = "v1"
     /// present in the TOML.  We use `mcp_disabled` which is a bool and
     /// straightforward to serialize via `serde_json::Value`.
     #[test]
+    #[serial_test::parallel]
     fn load_with_overlay_overrides_mcp_disabled() {
         let (dir, name) = write_profile(minimal_toml());
 
@@ -5313,6 +5362,7 @@ account = "a"
     /// When `multicall_hook` is `None`, the multicall guard is not evaluated
     /// regardless of profile content (no secondary_rpc_url required).
     #[test]
+    #[serial_test::parallel]
     fn multicall_guard_skipped_when_hook_is_none() {
         // minimal_toml has no secondary_rpc_url — would fail if guard fires.
         let (dir, name) = write_profile(minimal_toml());
@@ -5441,6 +5491,7 @@ account = "a"
     /// `policy_window_state_key_id`, explicit `rpc_url`) is materialised
     /// into the document.
     #[test]
+    #[serial_test::parallel]
     fn pin_signer_account_on_disk_patches_only_the_account() {
         const PINNED_G: &str = "GAQAA5L65LSYH7CQ3VTJ7F3HHLGCL3DSLAR2Y47263D56MNNGHSQSTVY";
         let toml = format!("future_key = \"kept\"\n{}", minimal_toml());
@@ -5509,6 +5560,7 @@ account = "a"
     /// loads via `#[serde(alias = "usd_threshold")]`, and the value populates
     /// `cross_check_threshold_stroops`.
     #[test]
+    #[serial_test::parallel]
     fn legacy_usd_threshold_key_alias_loads_into_cross_check_threshold_stroops() {
         let above_floor = MINIMUM_FLOOR + 7;
         let toml = minimal_toml_with_extra(&format!("usd_threshold = {above_floor}"));
@@ -5524,6 +5576,7 @@ account = "a"
     /// A v2 profile TOML written with the current `cross_check_threshold_stroops`
     /// key loads identically to the legacy-key form.
     #[test]
+    #[serial_test::parallel]
     fn current_cross_check_threshold_stroops_key_loads() {
         let above_floor = MINIMUM_FLOOR + 7;
         let toml =
@@ -5568,6 +5621,7 @@ account = "a"
     /// The `MulticallRequiresSecondaryRpc` error message contains the profile
     /// name and the network safe-name derived from the testnet passphrase.
     #[test]
+    #[serial_test::parallel]
     fn multicall_error_message_contains_profile_and_network() {
         let (dir, name) = write_profile(minimal_toml());
         let hook = AlwaysPresentHook;
@@ -5592,6 +5646,7 @@ account = "a"
     /// Tests that the constant used internally equals 2; if it drifts the
     /// VersionUnsupported tests above would need updating.
     #[test]
+    #[serial_test::parallel]
     fn supported_version_is_2() {
         // Proxy test via the loader: a v2 TOML loads, a v3 does not.
         let (dir, name) = write_profile(minimal_toml());
@@ -5654,6 +5709,7 @@ account = "a"
     }
 
     #[test]
+    #[serial_test::parallel]
     fn load_from_dir_accepts_an_ordinary_name() {
         // The guard must not refuse the names operators actually use.
         let (dir, name) = write_profile(minimal_toml());
@@ -5682,6 +5738,7 @@ account = "a"
     }
 
     #[test]
+    #[serial_test::parallel]
     fn save_to_dir_refuses_a_traversal_name_and_writes_nothing() {
         let root = tempfile::tempdir().unwrap();
         let profile_dir = root.path().join("profiles");
@@ -5700,6 +5757,7 @@ account = "a"
     }
 
     #[test]
+    #[serial_test::parallel]
     fn save_new_to_dir_refuses_a_traversal_name_and_writes_nothing() {
         let root = tempfile::tempdir().unwrap();
         let profile_dir = root.path().join("profiles");
@@ -5820,6 +5878,7 @@ account = "a"
     }
 
     #[test]
+    #[serial_test::parallel]
     fn mainnet_provider_records_are_required_per_configured_role() {
         for (role, field) in [
             ("secondary", "secondary_rpc_url"),
@@ -5834,6 +5893,7 @@ account = "a"
     }
 
     #[test]
+    #[serial_test::parallel]
     fn testnet_missing_provider_records_are_allowed() {
         for (secondary, oracle) in [
             (Some("https://primary.example/second"), None),
@@ -5859,6 +5919,7 @@ account = "a"
     }
 
     #[test]
+    #[serial_test::parallel]
     fn provider_operator_must_name_an_organization() {
         for chain in ["stellar:testnet", "stellar:mainnet"] {
             for role in ["secondary", "oracle"] {
@@ -5894,6 +5955,7 @@ account = "a"
     }
 
     #[test]
+    #[serial_test::parallel]
     fn provider_host_must_match_exactly() {
         for chain in ["stellar:testnet", "stellar:mainnet"] {
             for (role, url_field) in [
@@ -5947,6 +6009,7 @@ account = "a"
     }
 
     #[test]
+    #[serial_test::parallel]
     fn provider_host_requires_two_usable_hosts() {
         for chain in ["stellar:testnet", "stellar:mainnet"] {
             for (role, url_field) in [
@@ -5983,6 +6046,7 @@ account = "a"
     }
 
     #[test]
+    #[serial_test::parallel]
     fn mainnet_provider_independence_must_be_true() {
         for role in ["secondary", "oracle"] {
             for omitted in [false, true] {
@@ -6008,6 +6072,7 @@ account = "a"
     }
 
     #[test]
+    #[serial_test::parallel]
     fn testnet_provider_independence_may_be_false() {
         for role in ["secondary", "oracle"] {
             for omitted in [false, true] {
@@ -6032,6 +6097,7 @@ account = "a"
     }
 
     #[test]
+    #[serial_test::parallel]
     fn mainnet_provider_must_differ_from_primary() {
         for (role, field, record_field) in [
             ("secondary", "secondary_rpc_url", "providers.secondary"),
@@ -6062,6 +6128,7 @@ account = "a"
     }
 
     #[test]
+    #[serial_test::parallel]
     fn provider_true_attestation_refuses_on_the_primary_host() {
         for chain in ["stellar:testnet", "stellar:mainnet"] {
             for (role, field, record_field) in [
@@ -6083,6 +6150,7 @@ account = "a"
     }
 
     #[test]
+    #[serial_test::parallel]
     fn provider_records_accept_distinct_hosts() {
         for chain in ["stellar:testnet", "stellar:mainnet"] {
             for role in ["secondary", "oracle"] {
@@ -6102,6 +6170,7 @@ account = "a"
     }
 
     #[test]
+    #[serial_test::parallel]
     fn secondary_and_oracle_may_share_a_provider() {
         for chain in ["stellar:testnet", "stellar:mainnet"] {
             let record = provider_record("shared.example", true);
@@ -6117,6 +6186,7 @@ account = "a"
     }
 
     #[test]
+    #[serial_test::parallel]
     fn provider_url_absence_stays_optional() {
         for chain in ["stellar:testnet", "stellar:mainnet"] {
             for providers in [None, Some(serde_json::json!({}))] {
@@ -6135,6 +6205,7 @@ account = "a"
     }
 
     #[test]
+    #[serial_test::parallel]
     fn provider_record_requires_its_url() {
         for chain in ["stellar:testnet", "stellar:mainnet"] {
             for (role, url_field) in [
@@ -6157,6 +6228,7 @@ account = "a"
     }
 
     #[test]
+    #[serial_test::parallel]
     fn provider_shape_errors_name_fields_without_values() {
         for chain in ["stellar:testnet", "stellar:mainnet"] {
             for value in [
@@ -6198,6 +6270,7 @@ account = "a"
     }
 
     #[test]
+    #[serial_test::parallel]
     fn provider_checks_follow_endpoint_checks() {
         let file = provider_file(
             "stellar:mainnet",
@@ -6338,6 +6411,7 @@ account = "a"
     }
 
     #[test]
+    #[serial_test::parallel]
     fn testnet_url_overlay_revalidates_provider_host() {
         for (role, field) in [
             ("secondary", "secondary_rpc_url"),
@@ -6516,6 +6590,7 @@ account = "a"
         }
 
         #[test]
+        #[serial_test::parallel]
         fn primary_record_loads_on_both_chains() {
             for chain in CHAINS {
                 let file = provider_file(
@@ -6567,6 +6642,7 @@ account = "a"
         }
 
         #[test]
+        #[serial_test::parallel]
         fn primary_record_host_must_match_rpc_url() {
             let record =
                 serde_json::json!({"operator": "Primary RPC Ltd", "host": "primary.example"});
@@ -6649,6 +6725,7 @@ account = "a"
         }
 
         #[test]
+        #[serial_test::parallel]
         fn primary_record_requires_an_operator() {
             for chain in CHAINS {
                 for operator in [None, Some(""), Some(" \t\n")] {
@@ -6672,6 +6749,7 @@ account = "a"
         }
 
         #[test]
+        #[serial_test::parallel]
         fn primary_record_refuses_independent_of_primary() {
             for chain in CHAINS {
                 for value in [
@@ -6700,6 +6778,7 @@ account = "a"
         }
 
         #[test]
+        #[serial_test::parallel]
         fn primary_record_is_required_on_mainnet() {
             let secondary = provider_record("secondary.example", true);
             let oracle = provider_record("oracle.example", true);
@@ -6745,6 +6824,7 @@ account = "a"
         }
 
         #[test]
+        #[serial_test::parallel]
         fn provider_credential_and_placement_come_together() {
             for chain in CHAINS {
                 for role in ROLES {
@@ -6782,6 +6862,7 @@ account = "a"
         }
 
         #[test]
+        #[serial_test::parallel]
         fn provider_credential_reference_shape_is_exact() {
             for chain in CHAINS {
                 for role in ROLES {
@@ -6824,6 +6905,7 @@ account = "a"
         /// The reference bytes are printable ASCII without a leading or
         /// trailing space; a space inside is allowed.
         #[test]
+        #[serial_test::parallel]
         fn provider_credential_reference_is_printable_ascii() {
             for role in ROLES {
                 let url = format!("https://{}", role_host(role));
@@ -6866,6 +6948,7 @@ account = "a"
         }
 
         #[test]
+        #[serial_test::parallel]
         fn provider_placement_shapes_are_exact() {
             for chain in CHAINS {
                 for role in ROLES {
@@ -6949,6 +7032,7 @@ account = "a"
         }
 
         #[test]
+        #[serial_test::parallel]
         fn provider_header_names_follow_the_token_rule() {
             for name in [
                 "",
@@ -6973,6 +7057,7 @@ account = "a"
         }
 
         #[test]
+        #[serial_test::parallel]
         fn provider_header_names_refuse_transport_headers() {
             for name in [
                 "HOST",
@@ -6991,6 +7076,7 @@ account = "a"
         }
 
         #[test]
+        #[serial_test::parallel]
         fn provider_query_names_are_unreserved_characters() {
             for name in ["a b", "a&b", "=", "", "\u{e4}", "a+b", "a%20b", "a#b"] {
                 assert_placement_name(&query(name), true);
@@ -7003,6 +7089,7 @@ account = "a"
         /// A query placement repeats no parameter of the endpoint URL,
         /// compared byte for byte after decoding.
         #[test]
+        #[serial_test::parallel]
         fn query_placement_must_not_repeat_a_url_parameter() {
             for chain in CHAINS {
                 for role in ROLES {
@@ -7048,6 +7135,7 @@ account = "a"
         /// the host is a loopback address, from the file and from a testnet
         /// overlay alike.
         #[test]
+        #[serial_test::parallel]
         fn credential_endpoint_must_use_https() {
             for role in ROLES {
                 let role_url = format!("http://{}:8000/rpc", role_host(role));
@@ -7127,6 +7215,7 @@ account = "a"
         /// username or password: on testnet through this rule, on mainnet
         /// through the endpoint rule, which runs first.
         #[test]
+        #[serial_test::parallel]
         fn credential_endpoint_refuses_userinfo() {
             for role in ROLES {
                 let host = role_host(role);
@@ -7177,6 +7266,7 @@ account = "a"
         /// The service namespace of the wallet's own keys is reserved, in any
         /// ASCII case and in any `.`-separated part; the RPC namespace is not.
         #[test]
+        #[serial_test::parallel]
         fn provider_credentials_refuse_the_wallet_key_namespace() {
             for chain in CHAINS {
                 for role in ROLES {
@@ -7227,6 +7317,7 @@ account = "a"
         /// A credential with the service of a wallet key reference refuses,
         /// outside the wallet key namespace too and in any ASCII case.
         #[test]
+        #[serial_test::parallel]
         fn provider_credentials_refuse_a_wallet_key_service() {
             for chain in CHAINS {
                 for role in ROLES {
@@ -7266,6 +7357,7 @@ account = "a"
         /// refuses, so a store that joins the two with a `.` cannot be
         /// pointed at the wallet key under a dotted profile name.
         #[test]
+        #[serial_test::parallel]
         fn provider_credentials_refuse_a_dotted_alias_of_a_wallet_key() {
             for (signer_service, alias) in [
                 (
@@ -7307,6 +7399,7 @@ account = "a"
         /// the merged profile, so a testnet overlay of `mcp_signer_default`
         /// does not free the file's signer entry.
         #[test]
+        #[serial_test::parallel]
         fn provider_credentials_refuse_the_file_signer_under_an_overlay() {
             for role in ROLES {
                 let url = format!("https://{}", role_host(role));
@@ -7344,6 +7437,7 @@ account = "a"
         /// Default references load under dotted profile names and profile
         /// names with a space, and all three roles may name one entry.
         #[test]
+        #[serial_test::parallel]
         fn provider_credentials_allow_the_default_entries() {
             for name in ["a.b", "alice.main", "my prod", "Alice.Main"] {
                 let service = format!("stellar-agent-rpc-{name}");
@@ -7400,6 +7494,7 @@ account = "a"
         }
 
         #[test]
+        #[serial_test::parallel]
         fn mainnet_secondary_and_oracle_operators_differ_from_primary() {
             for role in ["secondary", "oracle"] {
                 for operator in ["Primary operator", "  primary OPERATOR\t"] {
@@ -7434,6 +7529,7 @@ account = "a"
         }
 
         #[test]
+        #[serial_test::parallel]
         fn provider_operator_comparison_trims_and_folds_case() {
             for (primary, other, shared) in [
                 ("  Example RPC ", "EXAMPLE rpc", true),
@@ -7466,6 +7562,7 @@ account = "a"
         }
 
         #[test]
+        #[serial_test::parallel]
         fn testnet_shared_operator_loads() {
             for role in ["secondary", "oracle"] {
                 let mut record = provider_record("other.example", true);
@@ -7486,6 +7583,7 @@ account = "a"
         /// userinfo, insecure endpoint, repeated query name, then the mainnet
         /// rules.
         #[test]
+        #[serial_test::parallel]
         fn provider_credential_checks_follow_record_checks() {
             use ProviderAttestationRejection as R;
             let reserved = entry("stellar-agent-signer-p", "default");
@@ -7611,6 +7709,7 @@ account = "a"
         /// service, account, operator, and URL parts stay out of every
         /// rendering, and the code stays the provider attestation code.
         #[test]
+        #[serial_test::parallel]
         fn provider_credential_errors_echo_no_file_value() {
             use ProviderAttestationRejection as R;
             for chain in CHAINS {
@@ -7772,6 +7871,7 @@ account = "a"
         /// refuses a missing record, or one that already names either key,
         /// without touching the file.
         #[test]
+        #[serial_test::parallel]
         fn set_provider_credential_patches_only_the_record() {
             let (head, record, tail) = oracle_record_fixture();
             let file = format!("{head}{record}\n{tail}");
@@ -7849,6 +7949,7 @@ account = "a"
         /// patch yields the original text with the two record lines
         /// inserted, each ending in CRLF, and the result loads.
         #[test]
+        #[serial_test::parallel]
         fn set_provider_credential_keeps_crlf_line_endings() {
             let (head, record, tail) = oracle_record_fixture();
             let crlf = |text: &str| text.replace('\n', "\r\n");
@@ -7893,6 +7994,7 @@ account = "a"
         /// that inline table, in the form the loader reads, and each
         /// placement kind is written in its serde form.
         #[test]
+        #[serial_test::parallel]
         fn set_provider_credential_patches_an_inline_record() {
             let base = endpoint_toml(
                 "stellar:testnet",
@@ -7956,6 +8058,7 @@ account = "a"
         /// The write-side check runs the loader's credential rules against
         /// the loaded profile and the file's own wallet key references.
         #[test]
+        #[serial_test::parallel]
         fn write_check_applies_the_loader_rules() {
             let file = with_signer(
                 &provider_file(
@@ -8061,6 +8164,7 @@ account = "a"
         /// All three placements serialize as tables with a `kind` key and
         /// load back equal.
         #[test]
+        #[serial_test::parallel]
         fn provider_credentials_round_trip_through_toml() {
             let providers = Providers {
                 primary: Some(
@@ -8132,6 +8236,7 @@ account = "a"
     }
 
     #[test]
+    #[serial_test::parallel]
     fn stored_endpoints_ignore_environment_and_overlay() {
         const CHILD: &str = "STORED_ENDPOINTS_CHILD";
         if std::env::var_os(CHILD).is_none() {
@@ -8244,6 +8349,7 @@ account = "a"
     }
 
     #[test]
+    #[serial_test::parallel]
     fn environment_signer_overlay_is_ephemeral() {
         const CHILD: &str = "MESSAGE_OVERLAY_TEST_CHILD";
         if std::env::var_os(CHILD).is_none() {
@@ -8300,6 +8406,7 @@ account = "a"
     /// A save under a refused name states the rule with the load half's
     /// message and never the name.
     #[test]
+    #[serial_test::parallel]
     fn a_refused_save_name_is_not_echoed() {
         let marker = seed_marker();
         let dir = tempfile::tempdir().unwrap();
@@ -8336,6 +8443,7 @@ account = "a"
     /// The version and bound refusals state the supported version or the cap,
     /// never the profile name or the stored value.
     #[test]
+    #[serial_test::parallel]
     fn version_and_bound_refusals_name_no_profile_or_value() {
         let marker = seed_marker();
         let dir = tempfile::tempdir().unwrap();
@@ -8397,6 +8505,7 @@ account = "a"
     }
 
     #[test]
+    #[serial_test::parallel]
     fn an_unknown_field_names_only_its_parent() {
         let (dir, name) = write_profile(&format!(
             "{}\n[providers.oracle]\nCREDMARKER7 = 1\n",
@@ -8444,6 +8553,7 @@ account = "a"
     }
 
     #[test]
+    #[serial_test::parallel]
     fn a_valid_profile_still_loads() {
         let (dir, name) = write_profile(minimal_toml());
         let profile = load_from_dir(&name, dir.path(), None).unwrap();

@@ -650,6 +650,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::parallel]
     fn mainnet_selection_flag_passes_for_both_chains_and_default_name() {
         use super::super::caip2::Caip2;
         for chain in [Caip2::Testnet, Caip2::Mainnet] {
@@ -665,6 +666,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::parallel]
     fn mainnet_selection_environment_refuses() {
         use super::super::caip2::Caip2;
         let resolved = resolve_from_parts(None, Some("alice".to_owned()));
@@ -684,6 +686,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::parallel]
     fn mainnet_selection_default_refuses() {
         use super::super::caip2::Caip2;
         let resolved = resolve_from_parts(None, None);
@@ -700,6 +703,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::parallel]
     fn testnet_selection_environment_and_default_pass() {
         use super::super::caip2::Caip2;
         for resolved in [
@@ -1087,12 +1091,14 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::parallel]
     fn matching_names_produce_no_refusal() {
         let profile = named_profile("alice");
         assert_eq!(profile_name_mismatch_refusal(&profile, "alice"), None);
     }
 
     #[test]
+    #[serial_test::parallel]
     fn copied_profile_file_refuses_and_names_the_field() {
         // The realistic path: `default.toml` copied to `alice.toml` without
         // re-deriving its keyring coordinates.
@@ -1132,6 +1138,7 @@ mod tests {
     /// A seed pasted into the owner-key coordinate or typed as the profile
     /// name never reaches the refusal, its `Debug`, or either layout's text.
     #[test]
+    #[serial_test::parallel]
     fn a_mismatch_never_repeats_the_service_or_the_name() {
         use stellar_agent_test_support::rejected_value::{assert_no_marker_in_text, seed_marker};
         let seed = seed_marker();
@@ -1159,6 +1166,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::parallel]
     fn each_layout_states_its_own_state_placement() {
         // The two surfaces do not key their per-profile state the same way, so
         // one message cannot be truthful for both. The MCP reads and writes all
@@ -1191,6 +1199,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::parallel]
     fn noop_engine_profile_is_checked_too() {
         // The check must not be attached to the V1 policy-engine derivation:
         // Noop profiles never reach it, yet the approval-store derivation —
@@ -1207,6 +1216,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::parallel]
     fn absent_owner_key_prefix_is_a_mismatch_not_a_default() {
         let mut profile = named_profile("alice");
         profile.policy_owner_key_id =
@@ -1234,6 +1244,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::parallel]
     fn a_prefixless_service_never_resolves_to_the_default_profile() {
         // The failure this guards: treating a prefix-less coordinate as
         // `"default"` would let a hand-written profile silently operate on the
@@ -1248,6 +1259,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::parallel]
     fn the_synthesised_first_run_profile_reconciles_as_default() {
         // The zero-config startup path loads or synthesises `default`; that
         // profile must pass the reconciliation check unchanged.
@@ -1256,6 +1268,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::parallel]
     fn the_display_rendering_carries_no_state_layout_claim() {
         // `Display` is layout-independent by construction: a caller that has
         // not chosen a `ProfileStateLayout` must not emit a claim about where
@@ -1269,6 +1282,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::parallel]
     fn the_derived_name_matches_the_constructor_it_inverts() {
         // The constructor and this inverse are the two halves of one contract;
         // pinning them against each other is what keeps the prefix single.
