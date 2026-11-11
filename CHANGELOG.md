@@ -261,7 +261,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   authority.
 
 - The mainnet window-state file moves to version 11 when it records an
-  operation or an authorization disposition; earlier versions load unchanged.
+  operation, an approval record or an authorization disposition; earlier versions load unchanged.
 
 - `MAINNET_CONFIRMATION_TTL_SECONDS` is renamed
   `MAINNET_POLICY_AUTHORITY_TTL_SECONDS`.

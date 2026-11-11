@@ -80,6 +80,10 @@ pub enum MainnetPrecondition {
     ApprovalKindMismatch,
     /// The approval has expired.
     ApprovalExpired,
+    /// The durable approval is revoked.
+    ApprovalRevoked,
+    /// The durable approval has no consent.
+    ApprovalConsentMissing,
     /// The approval lifetime exceeds the governing rule.
     ApprovalTtlExceedsRule,
     /// The approval was consented under another owner-signed policy than
@@ -281,6 +285,8 @@ impl MainnetPrecondition {
             Self::ApprovalSubjectMismatch => "approval_subject_mismatch",
             Self::ApprovalKindMismatch => "approval_kind_mismatch",
             Self::ApprovalExpired => "approval_expired",
+            Self::ApprovalRevoked => "approval_revoked",
+            Self::ApprovalConsentMissing => "approval_consent_missing",
             Self::ApprovalTtlExceedsRule => "approval_ttl_exceeds_rule",
             Self::ApprovalPolicyMismatch => "approval_policy_mismatch",
             Self::AuditProfileMismatch => "audit_profile_mismatch",
@@ -515,6 +521,8 @@ mod tests {
             P::ApprovalSubjectMismatch,
             P::ApprovalKindMismatch,
             P::ApprovalExpired,
+            P::ApprovalRevoked,
+            P::ApprovalConsentMissing,
             P::ApprovalTtlExceedsRule,
             P::ApprovalPolicyMismatch,
             P::AuditProfileMismatch,
@@ -625,6 +633,8 @@ mod tests {
                 | P::ApprovalSubjectMismatch
                 | P::ApprovalKindMismatch
                 | P::ApprovalExpired
+                | P::ApprovalRevoked
+                | P::ApprovalConsentMissing
                 | P::ApprovalTtlExceedsRule
                 | P::ApprovalPolicyMismatch
                 | P::AuditProfileMismatch
@@ -744,6 +754,8 @@ mod tests {
             "approval_subject_mismatch",
             "approval_kind_mismatch",
             "approval_expired",
+            "approval_revoked",
+            "approval_consent_missing",
             "approval_ttl_exceeds_rule",
             "approval_policy_mismatch",
             "audit_profile_mismatch",

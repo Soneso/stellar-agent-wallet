@@ -1354,7 +1354,17 @@ Stateful spending criteria read amounts and counts from `PolicyStateStore`. Conf
 `PersistedWindowStore` is one file per profile at `<canonical_data_root>/policy/<profile>.window`. It lives in `stellar-agent-network::policy_state`, not `stellar-agent-core`; see the crate-placement rationale in that module's rustdoc. The store needs the keyring primitives that live in `stellar-agent-network`, and `stellar-agent-core` must not depend on `stellar-agent-network`.
 
 - **Format**: `[32-byte HMAC-SHA256 tag] || [canonical JSON body]`, an embedded-tag layout mirroring the counterparty `stellar.toml` cache's v2 format. `i128` amounts serialise as decimal strings, never a bare JSON number.
-- **Versions**: Version 5 carries the authenticated network scope. A snapshot carrying any signing claim uses version 6, including a consumed or expired claim. The reader accepts both for current and prepared snapshots. A snapshot carrying an accounting expiry record uses version 8, which older builds refuse. Versions 1 to 4 decode for integrity checks and refuse with `policy.window_chain_unverifiable`, because they carry no scope. A snapshot carrying an operation record, an admissible floor, a chain observation, or an authorization's operation link, disposition or release row uses version 11. A file of an earlier version loads unchanged and moves to version 11 only with a commit that carries such content. Once a file is committed at version 11, every later commit stays at version 11, a reset included.
+- **Versions**: Version 5 carries the authenticated network scope. A snapshot
+  carrying any signing claim uses version 6, including a consumed or expired
+  claim. The reader accepts both for current and prepared snapshots. A
+  snapshot carrying an accounting expiry record uses version 8, which older
+  builds refuse. Versions 1 to 4 decode for integrity checks and refuse with
+  `policy.window_chain_unverifiable`, because they carry no scope. Version 11
+  carries operation and approval records, admissible floors, chain
+  observations, and authorization links, dispositions and release rows. A file
+  of an earlier version loads unchanged and moves to version 11 only with a
+  commit that carries such content. Once a file is committed at version 11,
+  every later commit stays at version 11, a reset included.
 - **Authorization ledger**: open and claimed records hold window capacity outside the bucket records. Hydration, reconciliation, confirmation, and release never see a hold. Expiry is measured on the store's own clock, and a transaction sweeps expired authorizations under the lock before it counts. Invalidation or expiry releases only unclaimed holds. A signing claim records its time before the signer runs. Expiry converts claimed holds to confirmed spend dated at the claim and bound to its chain. A consumed transaction authorization's holds become submission pending records; a consumed Soroban intent's become confirmed authorized spend. Settled history is pruned after the retention window once its approval ends; open and claimed records stay. A window state reset keeps every record whose approval can still be presented and settles a record that holds capacity as expired.
 - **Key**: the profile's `policy_window_state_key_id` keyring coordinate (`stellar-agent-policy-window-<profile>` by convention), lazily minted on first write.
 - **Lock**: `WindowStoreLock`, an OFD-advisory exclusive lock on a file in the policy-state directory named by the window-state keyring entry, serializes every read-modify-write (record, reset, resign, authorization transitions) across processes; every store handle and every pin operation over one entry takes the same lock, whatever store path it names. It lives in `stellar-agent-core::policy::state_lock`, and the policy pin at `(<window service>, <window account>-policy-pin)` is read and compared under it. The verified policy advance writes the pin under the same lock. Without `test-helpers`, no public function writes a pin the caller composes.
@@ -1595,6 +1605,49 @@ row, before the window write. A failed append refuses with
 `audit.append_failed` and commits nothing. Each try draws a fresh 16-byte
 random commit identifier. Evidence rows take contiguous sequence numbers from
 the record's watermark. A chain observation writes no audit row.
+
+### Approval records
+
+The window file authenticates one durable record per mainnet approval. Its
+identity hashes a domain label, the length-prefixed profile and the nonce. The
+record links one operation and its intent digest, and names the approval kind
+and subject binding. Opening a pending record links its prepared operation and
+records the awaiting-approval edge with its audit row in one generation
+commit. An identical open returns the same record; conflicting nonce or
+operation identities refuse.
+
+Stored states are `pending`, `consumed` and `revoked`. Expiry is derived from
+the clocks and never stored as a state. The waiting clock keeps the signed
+inbox creation and expiry times. Waiting expiry equals creation plus the rule
+lifetime, between 1 and 86,400,000 milliseconds. Consent records the receipt's
+verified time and fixes execution expiry at consent plus the smaller of
+900,000 milliseconds and the rule lifetime. Both windows exclude their expiry
+boundary. Consent before creation or at the waiting boundary refuses. The same
+receipt digest is idempotent; another consent refuses. Retries and remints
+extend neither clock.
+
+The first mint consumes the approval in the authorization's generation commit.
+Only the linked operation can remint within the execution window. A missing
+operation link or another operation refuses with `approval_nonce_reused`. The
+record protects single use independently of retained authorization history.
+Pending records without consent refuse with `approval_consent_missing`.
+Revocation records its time and refuses every later mint with
+`approval_revoked`. Revoking a revoked or expired record writes nothing.
+Revocation creates no operation transition or audit row.
+
+Consent retains the attestation, receipt and signed process identifier for
+reconstruction. The record supplies the signed nonce, kind, subject and
+lifetime; the authenticated file supplies the profile and chain. Pruning
+releases the payload when the operation becomes terminal or execution expires.
+Disposition, clocks and receipt digest remain. A record leaves after both
+windows end and seven days pass. The closed-record cap is 256, with the oldest
+eligible record removed first. A record inside either window remains
+protected. New records refuse at the operation store's file threshold with
+`operation.capacity`, detail `file_size`.
+
+Reset checks operations first, then refuses pending approvals inside their
+waiting windows with `reset.approvals_pending`. Every other approval survives
+reset unchanged. Status uses authenticated inspection and writes nothing.
 
 ### Operator authorization logs
 

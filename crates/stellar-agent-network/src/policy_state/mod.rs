@@ -196,7 +196,13 @@
 //! has no release row stays whatever its age, and so does that authorization.
 //! Removing an authorization with a ledger or close-time release bound raises
 //! the window's admissible floors in the same commit.
+//!
+//! Approval records retain consent payloads until the operation ends or execution expires.
+//! Identity, disposition, clocks and receipt digests remain for seven days after both windows end.
+//! At most 256 closed records stay; records inside either window remain protected.
+//! Reset refuses pending approvals inside their waiting windows and preserves every other approval record.
 
+pub mod approvals;
 pub mod ledger;
 pub mod lock;
 pub mod operations;
@@ -204,6 +210,11 @@ pub mod store;
 
 use lock::StateLockError;
 
+pub use approvals::{
+    APPROVAL_CLOSED_MAX, APPROVAL_EXECUTION_MAX_MS, APPROVAL_RECORD_MAX, APPROVAL_RULE_TTL_MAX_MS,
+    ApprovalRecorder, ApprovalState, ApprovalStatus, ApprovalView, Consent, ConsentPayload,
+    PendingApprovalFacts, WireApproval,
+};
 pub use ledger::{
     ClaimExpect, ConsumeExpect, ConsumeReceipt, ConsumptionBinding, DomainBinding, FeeBumpFacts,
     MAX_OPEN_AUTHORIZATIONS, MintAuthority, MintRequest, MintedRecord, OpenAuthorization,
@@ -575,6 +586,13 @@ pub enum WindowStoreError {
         open: usize,
     },
 
+    /// The reset refuses while approvals remain inside their waiting windows.
+    #[error("reset.approvals_pending: the spending window holds {pending} pending approval(s)")]
+    ApprovalsPending {
+        /// The number of pending approvals inside their waiting windows.
+        pending: usize,
+    },
+
     /// The audit row of an operation step could not be appended. The step
     /// is not committed.
     #[error("audit.append_failed: the operation step's audit row was not appended ({detail})")]
@@ -650,6 +668,9 @@ impl WindowStoreError {
             Self::AttemptLimit => SubmissionError::OperationAttemptLimit.into(),
             Self::OperationsOpen { open } => {
                 ValidationError::ResetOperationsOpen { open: *open }.into()
+            }
+            Self::ApprovalsPending { pending } => {
+                ValidationError::ResetApprovalsPending { pending: *pending }.into()
             }
             Self::AuditAppendFailed { detail } => ValidationError::AuditAppendFailed {
                 detail: detail.clone(),

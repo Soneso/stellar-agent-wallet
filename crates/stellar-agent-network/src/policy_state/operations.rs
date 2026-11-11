@@ -147,7 +147,7 @@ const PREPARED_DECISION_MAX: usize = 1_024;
 const HOLDS_MAX: usize = 4_096;
 
 /// The longest approval nonce an authority snapshot keeps, in bytes.
-const APPROVAL_NONCE_MAX: usize = 128;
+pub(super) const APPROVAL_NONCE_MAX: usize = 128;
 
 /// The longest error code or profile name a record keeps, in bytes.
 const NAME_MAX: usize = 64;
@@ -1759,7 +1759,7 @@ pub(super) fn check_mint_link(
 }
 
 /// Collects the audit rows one commit appends, before the window write.
-struct AuditBatch<'a> {
+pub(super) struct AuditBatch<'a> {
     request_id: &'a str,
     chain_id: &'static str,
     commit: CommitId,
@@ -2699,17 +2699,53 @@ impl std::fmt::Debug for OperationRecorder<'_> {
 
 /// One locked step: the store clock, the verified snapshot, its successor
 /// and the step's audit rows.
-struct Session<'s> {
-    profile: &'s Profile,
-    now: u64,
-    original: &'s WireFile,
-    wire: WireFile,
+pub(super) struct Session<'s> {
+    pub(super) profile: &'s Profile,
+    pub(super) now: u64,
+    pub(super) original: &'s WireFile,
+    pub(super) wire: WireFile,
     mint_expires: Option<u64>,
     audit: AuditBatch<'s>,
-    changed: bool,
+    pub(super) changed: bool,
 }
 
 impl Session<'_> {
+    /// Links the approval and records its waiting edge in this session.
+    pub(super) fn await_approval(
+        &mut self,
+        id: OperationId,
+        approval_id: [u8; 32],
+        intent_digest: [u8; 32],
+    ) -> Result<(), WindowStoreError> {
+        let index = record_index(&self.wire, id)?;
+        let record = &mut section_mut(&mut self.wire).records[index];
+        if record.state != OperationState::Prepared
+            || record
+                .approval_record_id
+                .is_some_and(|linked| linked != approval_id)
+            || record.intent.intent_digest() != intent_digest
+        {
+            return Err(unexpected(
+                "the approval requires a matching prepared operation",
+            ));
+        }
+        record.approval_record_id = Some(approval_id);
+        record.step(
+            OperationState::AwaitingApproval,
+            self.now,
+            None,
+            self.audit.commit,
+        )?;
+        self.audit.transition(
+            record,
+            None,
+            Some(OperationState::Prepared),
+            OperationState::AwaitingApproval.wire_name(),
+        );
+        self.changed = true;
+        Ok(())
+    }
+
     /// Sweeps expired authorizations, adopting the waiting records they
     /// link, then adopts waiting records whose linked authorization is
     /// open.
@@ -3407,7 +3443,7 @@ impl<'a> OperationRecorder<'a> {
     /// Runs one locked step and commits it when it changed the window. A
     /// mint's checks that precede the window key run under the lock before
     /// the read.
-    fn run<T>(
+    pub(super) fn run<T>(
         &mut self,
         mint: Option<&MintRequest>,
         step: impl FnOnce(&mut Session<'_>) -> Result<T, WindowStoreError>,
