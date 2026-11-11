@@ -18,6 +18,9 @@ mod classic_ledger;
 mod consent_drain_source_order;
 #[path = "cli/cross_check_witness.rs"]
 mod cross_check_witness;
+#[cfg(all(unix, feature = "test-helpers"))]
+#[path = "cli/dedicated_user.rs"]
+mod dedicated_user;
 #[path = "cli/endpoint_identity_ordering.rs"]
 mod endpoint_identity_ordering;
 #[path = "cli/fee_reserve_boundary.rs"]

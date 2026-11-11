@@ -65,8 +65,8 @@
 //! input is never consent. The summary is rendered for orientation, the
 //! pending store is released, and the command awaits a verified WebAuthn
 //! assertion from an approval credential in the owner-signed policy through
-//! [`acquire_mainnet_presence`]. It then reopens the store, reads the current
-//! policy again, and records a version 5 consent; the success envelope names
+//! [`acquire_mainnet_presence_with_mode`]. It then reopens the store, reads the
+//! current policy again, and records a version 5 consent. The success envelope names
 //! the ceremony in `presence` and carries its consent request ID.
 
 use std::io::{BufRead as _, Write};
@@ -95,7 +95,7 @@ use stellar_agent_core::timefmt;
 use stellar_agent_network::keyring::init_platform_keyring_store;
 
 use crate::common::consent::{OperatorRowSink, acquire_operator_row_sink};
-use crate::common::mainnet_presence::acquire_mainnet_presence;
+use crate::common::mainnet_presence::{OpenMode, acquire_mainnet_presence_with_mode};
 use crate::common::profile_access::{load_profile_reconciled, profile_access_envelope};
 use crate::common::{render, resolve_profile_name};
 
@@ -110,6 +110,9 @@ use crate::common::{render, resolve_profile_name};
 #[derive(Debug, Args)]
 #[non_exhaustive]
 pub struct RunArgs {
+    /// Print the local mainnet presence URL for the operator to open.
+    #[arg(long, conflicts_with = "yes")]
+    pub open_by_operator: bool,
     /// Approval nonce as printed in the MCP simulate response.
     #[arg(long = "id", value_name = "NONCE", allow_hyphen_values = true)]
     pub id: Option<String>,
@@ -235,6 +238,13 @@ pub async fn run(args: RunArgs) -> i32 {
         render::render_json(&envelope);
         return 1;
     }
+    if args.open_by_operator
+        && let Err(envelope) =
+            crate::commands::profile::policy_check::guard_operator_open(&profile_name, &profile)
+    {
+        render::render_json(&envelope);
+        return 1;
+    }
 
     let context =
         stellar_agent_core::approval::ApprovalContext::from_profile(&profile_name, &profile);
@@ -283,7 +293,16 @@ pub async fn run(args: RunArgs) -> i32 {
 
     // ── 5a. Mainnet: presence-gated consent, no prompt ───────────────────────
     if profile.chain_id.is_mainnet() {
-        return match approve_mainnet(store, &store_path, &entry, &context, &profile).await {
+        return match approve_mainnet(
+            store,
+            &store_path,
+            &entry,
+            &context,
+            &profile,
+            args.open_by_operator.into(),
+        )
+        .await
+        {
             Ok(approved) => {
                 let request_id = approved.presence.request_id.clone();
                 render::render_json(&Envelope::ok_with_request_id(
@@ -389,7 +408,7 @@ struct MainnetApproved {
 /// # Errors
 ///
 /// `approval.wrong_kind` for a kind without a mainnet consent path, the
-/// presence refusals of [`acquire_mainnet_presence`], and the policy, key,
+/// presence refusals of [`acquire_mainnet_presence_with_mode`], and the policy, key,
 /// sink and attester refusals.
 async fn approve_mainnet(
     store: PendingApprovalStore,
@@ -397,6 +416,7 @@ async fn approve_mainnet(
     entry: &PendingApproval,
     context: &ApprovalContext,
     profile: &Profile,
+    mode: OpenMode,
 ) -> Result<MainnetApproved, WalletError> {
     render_summary(entry, context);
     stellar_agent_core::approval::verify_entry_terms(&entry.kind)?;
@@ -411,7 +431,8 @@ async fn approve_mainnet(
         eprintln!("{}", crate::common::mainnet_confirm::CONSENT_LINE);
     }
     init_platform_keyring_store()?;
-    let presence = acquire_mainnet_presence(entry, context, &authority, store_path).await?;
+    let presence =
+        acquire_mainnet_presence_with_mode(entry, context, &authority, store_path, mode).await?;
     let data = PresenceData {
         method: "webauthn_uv",
         credential_fingerprint: presence.credential_fingerprint().to_owned(),
@@ -1417,6 +1438,7 @@ mod tests {
             id: Some("__stellar_agent_approve_test_not_found_nonce123".to_owned()),
             profile: Some("__stellar_agent_approve_test_no_pending".to_owned()),
             yes: true,
+            open_by_operator: false,
         };
         // Profile doesn't exist → profile load failure → exit 1
         let code = run(args).await;
@@ -1453,6 +1475,7 @@ mod tests {
             id: None,
             profile: None,
             yes: true,
+            open_by_operator: false,
         };
         let code = run(args).await;
         assert_eq!(code, 1, "missing --id must exit 1");
@@ -1468,6 +1491,7 @@ mod tests {
             id: Some(String::new()),
             profile: None,
             yes: true,
+            open_by_operator: false,
         };
         let code = run(args).await;
         assert_eq!(code, 1, "empty --id must exit 1");
@@ -1588,6 +1612,7 @@ mod tests {
             &entry,
             &context,
             fixture.profile(),
+            OpenMode::Private,
         )
         .await;
         assert!(matches!(
@@ -1663,6 +1688,7 @@ mod tests {
                 &entry,
                 &ApprovalContext::from_profile(fixture.name, &profile),
                 &profile,
+                OpenMode::Private,
             )
             .await;
             let (blob, presence) = if fail_audit {
@@ -3251,6 +3277,7 @@ mod tests {
                 id: Some("approval-nonce".to_owned()),
                 profile: Some(ABSENT_PROFILE_MARKER.to_owned()),
                 yes: false,
+                open_by_operator: false,
             })
         });
         assert_refusal_omits_requested_profile(code, &logs, "profile access refused");

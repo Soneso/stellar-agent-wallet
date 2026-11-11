@@ -458,6 +458,38 @@ startup binding refuses with `network.mainnet_write_forbidden` and
 names its missing prerequisite instead. A mainnet approval recorded under the
 previous policy needs fresh consent.
 
+### `profile policy-check`
+
+```bash
+stellar-agent profile policy-check --profile mainnet < policy.toml
+stellar-agent profile policy-check --origin --profile mainnet < policy.toml
+```
+
+Reads stdin and validates schema, scope, and network against the reconciled profile.
+It verifies no signature, reads no policy pin or keyring entry, and writes nothing.
+A present mainnet table receives bootstrap validation: origin and pin must appear together.
+Stdout carries one JSON envelope. Valid input exits 0.
+With `--origin`, valid input declaring an origin exits 3, signed or unsigned.
+Invalid input exits 65 with its policy code. Profile access and input errors exit 1.
+
+### `profile apply-fragment`
+
+```bash
+stellar-agent profile apply-fragment --profile mainnet < providers.toml
+```
+
+Accepts only `oracle_provider_url`, `providers`, and `remote_approval`.
+Each supplied value replaces the whole stored value; omitted top-level fields remain.
+The candidate passes the profile loader before an atomic rename.
+Unrelated fields, comments, and remote TLS paths stay in the document.
+The file is mode 0600. Runtime overlays never become stored fields.
+
+Success exits 0 with one JSON envelope. The last stderr line is
+`credential-roles:`, followed by credential-bearing roles in `primary secondary oracle` order.
+Refusal exits 65 with one stderr line `refused: <code>` and an error envelope.
+Loader refusals retain their validation codes. Protected keys use
+`profile.fragment_key_refused`. Profile access and I/O failures exit 1.
+
 ### `profile enable-mainnet`
 
 ```bash
@@ -1048,6 +1080,10 @@ Authentication, validation, and audit failures on approval paths carry their own
 
 State-changing (records an attestation or a grant in the on-disk pending-approval store).
 
+Operator-open requires a local-only body and preserves verified presence and expiry.
+A signed origin refuses before store access with `approval.origin_signed_remote`.
+
+- `--open-by-operator`: Mainnet only. Prints the presence URL once on stderr; conflicts with `--yes`.
 - `--id <NONCE>` (required in this form): the approval nonce printed in the agent surface's simulate response.
 - `--profile <NAME>`: the profile whose attestation key and pending-approval store to use. Optional; resolves from `--profile`, then `STELLAR_AGENT_PROFILE`, then `"default"`.
 - `--yes`: non-interactive auto-approve. Bypasses the stdin prompt; the wallet-controlled summary is still printed so there is a visible record. Intended for trusted automation and tests, not routine operator use.
@@ -1135,6 +1171,11 @@ code. (`approve --id <nonce> --profile <name>` answering `n` keeps its
 leave-to-expire behavior; only the inbox's Reject records an explicit
 rejection.)
 
+Operator-open requires no display and launches no browser or private handoff.
+The installed body is checked before keyring initialization and binding.
+A signed origin refuses with `approval.origin_signed_remote`; an invalid body retains its policy code.
+Shutdown prints one JSON envelope in operator-open mode.
+
 Each decision writes its audit row (`approval_attested` or `approval_rejected`)
 before it takes effect. A decision whose row cannot be written is refused with
 `unavailable` and the entry stays pending. A poisoned audit writer refuses
@@ -1144,7 +1185,7 @@ writer (`audit.writer_locked`).
 
 On a mainnet profile, Approve with passkey requests a fresh verified assertion.
 The terminal-style approve route refuses with `approval.presence_required`.
-Reject works. Mainnet refuses `--no-open` and browser-launch failures, and
+Reject works. Default mainnet mode refuses `--no-open` and browser-launch failures, and
 prints only a startup notice and the port. It keeps the private redirect file
 until shutdown. Testnet retains the manual URL handoff.
 
@@ -1175,6 +1216,7 @@ printed URL yourself. Until its first use or until the server stops, the
 printed URL grants an inbox session to whoever opens it, so keep it out of
 shared logs.
 
+- `--open-by-operator`: Mainnet only. Prints the bootstrap URL once on stderr; conflicts with `--remote` and `--no-open`.
 - `--port <PORT>`: fixed port (default: ephemeral). Use a fixed port when
   tunneling.
 - `--no-open`: print the URL instead of opening a browser (default on
@@ -1390,6 +1432,12 @@ or operator-credential store changes. The credential approves mainnet consent
 only after the owner adds the entry to `mainnet.approval_credentials` and signs
 the policy; see [Approval credentials](../profiles.md#approval-credentials).
 
+Operator-open retains the terminal code, timeout, cancellation, and credential export.
+Its installed-body guard refuses a signed origin before binding with `approval.origin_signed_remote`.
+All operator-open URL lines read `Open this URL in your browser: <url>`.
+Stdout remains one JSON envelope. The token is single-use; keep stderr private.
+
+- `--open-by-operator`: Prints the local mainnet enrollment URL once on stderr, with no browser launch or private handoff.
 - `--profile <NAME>` (required): a persisted mainnet profile. Neither an
   enabled installation nor a mainnet policy is required, so a credential can be
   enrolled before the policy that lists it.
@@ -1398,11 +1446,10 @@ the policy; see [Approval credentials](../profiles.md#approval-credentials).
 - `--timeout-seconds <SECS>`: one deadline for the browser registration and
   the terminal code, from 1 to 600 (default 300).
 
-The command needs a terminal on stdin and stderr and a local browser. It
-starts a one-shot server on `127.0.0.1` and `[::1]`, one port for both, and
-opens the page at `http://localhost:<port>` through a private redirect file;
-the bearer URL is never printed. When either address cannot be held, the
-command exits `1` with `approve.credential_enroll_unavailable`.
+The command needs a terminal on stdin and stderr. Default mode also needs a local browser.
+It starts a one-shot server on `127.0.0.1` and `[::1]`, one port for both.
+Default mode opens the page at `http://localhost:<port>` through a private redirect file and keeps the bearer URL out of terminal output.
+When either address cannot be held, the command exits `1` with `approve.credential_enroll_unavailable`.
 The page creates a passkey with relying-party ID `localhost`
 over the server's single-use challenge, and the server verifies the
 registration as `approve operator enroll --interactive` does, user presence
