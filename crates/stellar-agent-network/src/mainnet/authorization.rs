@@ -2222,6 +2222,7 @@ mod tests {
                 bindings: facts,
                 holds: holds.clone(),
                 parent: None,
+                operation: None,
             };
             let minted = store.mint_authorization(&profile, &request).unwrap();
             facts.reservation = minted

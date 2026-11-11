@@ -2056,6 +2056,78 @@ pub enum ValidationError {
         /// Selected profile name.
         profile: String,
     },
+
+    /// A mainnet value call names no business id.
+    ///
+    /// # Wire code
+    ///
+    /// `"validation.business_id_required"`.
+    #[error(
+        "business_id is required: name the operation with 1 to 64 printable ASCII bytes, \
+         without spaces"
+    )]
+    BusinessIdRequired,
+
+    /// The business id is longer than 64 bytes or holds a byte outside
+    /// printable ASCII without the space.
+    ///
+    /// # Wire code
+    ///
+    /// `"validation.business_id_invalid"`.
+    #[error(
+        "business_id must hold 1 to 64 printable ASCII bytes, without spaces; choose another id"
+    )]
+    BusinessIdInvalid,
+
+    /// The business id names a retained operation with another intent, or the
+    /// operation's envelope differs from the one it recorded.
+    ///
+    /// # Wire code
+    ///
+    /// `"operation.business_id_conflict"`.
+    #[error(
+        "business_id names a retained operation with another intent; choose another business_id"
+    )]
+    OperationBusinessIdConflict,
+
+    /// A commit repeats a business id other than the one its preparation
+    /// opened.
+    ///
+    /// # Wire code
+    ///
+    /// `"operation.business_id_mismatch"`.
+    #[error(
+        "business_id differs from the one the preparation returned; repeat the prepared business_id"
+    )]
+    OperationBusinessIdMismatch,
+
+    /// The window-state reset refused because an operation has not reached a
+    /// terminal state.
+    ///
+    /// # Wire code
+    ///
+    /// `"reset.operations_open"`.
+    #[error(
+        "the spending window holds {open} open operation(s); the reset refuses until each ends"
+    )]
+    ResetOperationsOpen {
+        /// Number of operations outside a terminal state.
+        open: usize,
+    },
+
+    /// The audit row of an operation step could not be appended, so the step
+    /// was not committed.
+    ///
+    /// # Wire code
+    ///
+    /// `"audit.append_failed"`.
+    #[error(
+        "the audit row of the operation step could not be appended ({detail}); nothing was recorded"
+    )]
+    AuditAppendFailed {
+        /// Non-secret writer failure detail.
+        detail: String,
+    },
 }
 
 /// What keeps a mainnet profile's oracle from being usable.
@@ -2306,6 +2378,14 @@ impl ValidationError {
             Self::ResetWindowStateOpenAuthorizations { .. } => {
                 "profile.reset_window_state_open_authorizations"
             }
+            Self::BusinessIdRequired => "validation.business_id_required",
+            Self::BusinessIdInvalid => "validation.business_id_invalid",
+            // Operation and reset taxonomy codes on validation-class variants:
+            // each names the store section that refuses the caller's request.
+            Self::OperationBusinessIdConflict => "operation.business_id_conflict",
+            Self::OperationBusinessIdMismatch => "operation.business_id_mismatch",
+            Self::ResetOperationsOpen { .. } => "reset.operations_open",
+            Self::AuditAppendFailed { .. } => "audit.append_failed",
         }
     }
 }
@@ -3823,6 +3903,39 @@ pub enum SubmissionError {
         /// The fixed mismatching field.
         field: &'static str,
     },
+
+    /// The spending window cannot hold another operation record, or an
+    /// attempt's envelope exceeds its allowance.
+    ///
+    /// `detail` names the exceeded limit: `envelope_size`, `file_size`,
+    /// `intent_size`, `record_size` or `waiting_operations`.
+    ///
+    /// # Wire code
+    ///
+    /// `"operation.capacity"`.
+    #[error(
+        "the operation exceeds the spending window's capacity ({detail}); nothing was recorded"
+    )]
+    OperationCapacity {
+        /// The fixed name of the exceeded limit.
+        detail: &'static str,
+    },
+
+    /// The operation already has an attempt in progress.
+    ///
+    /// # Wire code
+    ///
+    /// `"operation.attempt_open"`.
+    #[error("the operation already has an attempt in progress; wait for its outcome")]
+    OperationAttemptOpen,
+
+    /// The operation has used every attempt it may make.
+    ///
+    /// # Wire code
+    ///
+    /// `"operation.attempt_limit"`.
+    #[error("the operation has used all of its attempts; start a new operation")]
+    OperationAttemptLimit,
 }
 
 impl SubmissionError {
@@ -3842,6 +3955,11 @@ impl SubmissionError {
             Self::HashMismatch { .. } => "submission.hash_mismatch",
             Self::IntentRecordUnavailable { .. } => "submission.intent_record_unavailable",
             Self::IntentBindingMismatch { .. } => "submission.intent_binding_mismatch",
+            // Operation taxonomy codes on submission-class variants: the code
+            // names the operation store that refuses the attempt.
+            Self::OperationCapacity { .. } => "operation.capacity",
+            Self::OperationAttemptOpen => "operation.attempt_open",
+            Self::OperationAttemptLimit => "operation.attempt_limit",
         }
     }
 }
@@ -4365,6 +4483,32 @@ mod tests {
                 ValidationError::WindowChainUnverifiable,
                 "policy.window_chain_unverifiable",
             ),
+            (
+                ValidationError::BusinessIdRequired,
+                "validation.business_id_required",
+            ),
+            (
+                ValidationError::BusinessIdInvalid,
+                "validation.business_id_invalid",
+            ),
+            (
+                ValidationError::OperationBusinessIdConflict,
+                "operation.business_id_conflict",
+            ),
+            (
+                ValidationError::OperationBusinessIdMismatch,
+                "operation.business_id_mismatch",
+            ),
+            (
+                ValidationError::ResetOperationsOpen { open: 2 },
+                "reset.operations_open",
+            ),
+            (
+                ValidationError::AuditAppendFailed {
+                    detail: "the log is full".to_owned(),
+                },
+                "audit.append_failed",
+            ),
         ];
 
         for (variant, expected_code) in cases {
@@ -4671,6 +4815,22 @@ mod tests {
                     ValidationError::ResetWindowStateOpenAuthorizations {
                         profile: profile.clone(),
                         open: *open,
+                    }
+                }
+                ValidationError::BusinessIdRequired => ValidationError::BusinessIdRequired,
+                ValidationError::BusinessIdInvalid => ValidationError::BusinessIdInvalid,
+                ValidationError::OperationBusinessIdConflict => {
+                    ValidationError::OperationBusinessIdConflict
+                }
+                ValidationError::OperationBusinessIdMismatch => {
+                    ValidationError::OperationBusinessIdMismatch
+                }
+                ValidationError::ResetOperationsOpen { open } => {
+                    ValidationError::ResetOperationsOpen { open: *open }
+                }
+                ValidationError::AuditAppendFailed { detail } => {
+                    ValidationError::AuditAppendFailed {
+                        detail: detail.clone(),
                     }
                 }
             });
@@ -5298,6 +5458,20 @@ mod tests {
                 "submission.intent_binding_mismatch",
             ),
             (
+                SubmissionError::OperationCapacity {
+                    detail: "envelope_size",
+                },
+                "operation.capacity",
+            ),
+            (
+                SubmissionError::OperationAttemptOpen,
+                "operation.attempt_open",
+            ),
+            (
+                SubmissionError::OperationAttemptLimit,
+                "operation.attempt_limit",
+            ),
+            (
                 SubmissionError::SequenceNumberStale,
                 "submission.sequence_number_stale",
             ),
@@ -5463,6 +5637,83 @@ mod tests {
             detail: "test".to_owned(),
         });
         assert_eq!(wallet_err.category(), ErrorCategory::Internal);
+    }
+
+    /// Every operation store refusal keeps its code through the wallet error
+    /// envelope, and the store's defect code is the internal one.
+    #[test]
+    fn operation_codes_round_trip() {
+        let cases: Vec<(WalletError, &'static str, ErrorCategory)> = vec![
+            (
+                ValidationError::BusinessIdRequired.into(),
+                "validation.business_id_required",
+                ErrorCategory::Validation,
+            ),
+            (
+                ValidationError::BusinessIdInvalid.into(),
+                "validation.business_id_invalid",
+                ErrorCategory::Validation,
+            ),
+            (
+                ValidationError::OperationBusinessIdConflict.into(),
+                "operation.business_id_conflict",
+                ErrorCategory::Validation,
+            ),
+            (
+                ValidationError::OperationBusinessIdMismatch.into(),
+                "operation.business_id_mismatch",
+                ErrorCategory::Validation,
+            ),
+            (
+                ValidationError::ResetOperationsOpen { open: 1 }.into(),
+                "reset.operations_open",
+                ErrorCategory::Validation,
+            ),
+            (
+                ValidationError::AuditAppendFailed {
+                    detail: "disk full".to_owned(),
+                }
+                .into(),
+                "audit.append_failed",
+                ErrorCategory::Validation,
+            ),
+            (
+                SubmissionError::OperationCapacity {
+                    detail: "file_size",
+                }
+                .into(),
+                "operation.capacity",
+                ErrorCategory::Submission,
+            ),
+            (
+                SubmissionError::OperationAttemptOpen.into(),
+                "operation.attempt_open",
+                ErrorCategory::Submission,
+            ),
+            (
+                SubmissionError::OperationAttemptLimit.into(),
+                "operation.attempt_limit",
+                ErrorCategory::Submission,
+            ),
+            (
+                InternalError::UnexpectedState {
+                    detail: "a 37th commit id".to_owned(),
+                }
+                .into(),
+                "internal.unexpected_state",
+                ErrorCategory::Internal,
+            ),
+        ];
+        for (error, code, category) in cases {
+            assert_eq!(error.code(), code, "{error:?}");
+            assert_eq!(error.category(), category, "{error:?}");
+        }
+        let capacity = SubmissionError::OperationCapacity {
+            detail: "envelope_size",
+        };
+        assert!(capacity.to_string().contains("envelope_size"), "{capacity}");
+        let open = ValidationError::ResetOperationsOpen { open: 3 };
+        assert!(open.to_string().contains("3 open operation"), "{open}");
     }
 
     // ── WalletError::SmartAccount variant ────────────────────────────────────

@@ -36,6 +36,9 @@ use subtle::ConstantTimeEq as _;
 use crate::endpoint_identity::MainnetOracle;
 use crate::policy_state::ledger::{self, WireAuthorization, WireAuthorizationHold};
 use crate::policy_state::lock::WindowStoreLock;
+use crate::policy_state::operations::{
+    self, OperationsSection, WindowObservation, WindowSection as _,
+};
 use crate::policy_state::{NO_RECOVERY_NOTICE, WindowStoreError};
 use crate::signed_intent::IntentPurpose;
 use crate::signing::LedgerWitnessCapability;
@@ -346,7 +349,7 @@ pub(super) const WIRE_VERSION_LEDGER: u32 = 4;
 /// A file written by a newer build carries records this one cannot account
 /// for, so it is refused rather than read with the fields it happens to
 /// recognise.
-pub(super) const WIRE_VERSION_MAX: u32 = 10;
+pub(super) const WIRE_VERSION_MAX: u32 = 11;
 
 /// Wire version binding the accounting network on every snapshot.
 pub(super) const WIRE_VERSION_CHAIN: u32 = 5;
@@ -366,8 +369,21 @@ pub(super) const WIRE_VERSION_INTENT: u32 = 9;
 /// Wire version carrying authorizations minted under policy authority.
 pub(super) const WIRE_VERSION_POLICY_AUTHORITY: u32 = 10;
 
-fn select_wire_version(wire: &WireFile) -> u32 {
-    if wire
+/// Wire version carrying operation records, authorization links,
+/// dispositions and release rows, the admissible floors and the stored
+/// observation.
+pub(super) const WIRE_VERSION_OPERATIONS: u32 = 11;
+
+/// The version a successor is written under. `committed` is the version of
+/// the snapshot it replaces, absent on a first run. Version 11 content
+/// selects 11, and so does a committed version of 11 or more, so a version
+/// 11 file never moves back; below that the version follows the content.
+fn select_wire_version(wire: &WireFile, committed: Option<u32>) -> u32 {
+    if committed.is_some_and(|version| version >= WIRE_VERSION_OPERATIONS)
+        || operations::has_content(wire)
+    {
+        WIRE_VERSION_OPERATIONS
+    } else if wire
         .authorizations
         .iter()
         .any(|auth| auth.policy_authority.is_some())
@@ -1126,7 +1142,10 @@ pub(super) struct WireBucket {
 ///
 /// Version 5 binds the accounting network on every snapshot. Version 6 carries
 /// durable signing claims. Version 7 carries conservative exposure accounting,
-/// and version 8 carries accounting-expiry audit obligations. Optional fields
+/// and version 8 carries accounting-expiry audit obligations. Version 9
+/// carries signed intents, and version 10 policy authorities. Version 11
+/// carries operation records, authorization links, dispositions and release
+/// rows, the admissible floors and the stored observation. Optional fields
 /// preserve the serialized shape of legacy snapshots for integrity checks;
 /// missing network provenance refuses at the authenticated read boundary.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
@@ -1149,6 +1168,20 @@ pub(super) struct WireFile {
     pub(super) accounting_expiries: Vec<AccountingExpiryRecord>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(super) signed_intents: Vec<SignedIntentRecord>,
+    /// Operation records and tombstones; absent while none is retained.
+    #[serde(default, skip_serializing_if = "operations::section_absent")]
+    pub(super) operations: Option<OperationsSection>,
+    /// The lowest admissible observed ledger, raised when a release row
+    /// with a ledger bound is removed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) admissible_floor_ledger: Option<u32>,
+    /// The lowest admissible observed close time in Unix milliseconds,
+    /// raised when a release row with a close-time bound is removed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) admissible_floor_close_time_ms: Option<u64>,
+    /// The last chain observation an operation step stored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) last_observation: Option<WindowObservation>,
     /// Prepared next generation, authenticated with the current snapshot.
     /// The keyring counter selects exactly one side of the atomic commit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2076,6 +2109,7 @@ impl PersistedWindowStore {
         let gen_entry = generation_entry_ref(profile);
 
         let mut wire = self.read_verified(profile, &key, &gen_entry)?;
+        let committed = (wire.generation != 0).then_some(wire.version);
         let now_ms = now_ms()?;
         // Expiry retains claimed spend and releases unclaimed holds before
         // the window is counted; remaining holds count against it.
@@ -2094,7 +2128,7 @@ impl PersistedWindowStore {
         }
 
         prune_stale(&mut wire, now_ms);
-        wire.version = select_wire_version(&wire);
+        wire.version = select_wire_version(&wire, committed);
 
         // This debit may already be on chain, so it never goes through the
         // prepared image: the counter moves first, and a failed file write
@@ -3123,6 +3157,12 @@ impl PersistedWindowStore {
     /// projection is incomplete carry into the successor; they hold no
     /// exposure.
     ///
+    /// A window that holds an operation record that has not ended refuses with
+    /// [`WindowStoreError::OperationsOpen`] before either callback runs. The
+    /// successor keeps terminal operation records, tombstones and every
+    /// authorization an operation links without a release row. It clears the
+    /// admissible floors.
+    ///
     /// A mainnet profile in a build with mainnet writes also refuses while an
     /// effective open or claimed authorization remains. Expiry releases
     /// unclaimed holds and converts claimed holds to confirmed spend in memory;
@@ -3168,6 +3208,11 @@ impl PersistedWindowStore {
         )
         .map_err(|e| before_mint(e.into()))?;
         let snapshot = self.reset_snapshot(profile, now_ms).map_err(before_mint)?;
+        let retained_operations = operations::Operations::on_reset(
+            snapshot.original.as_ref(),
+            crate::policy_state::store::now_ms().map_err(before_mint)?,
+        )
+        .map_err(before_mint)?;
         let reason = bound_window_reset_reason(reason);
         let mut challenge = [0u8; 32];
         OsRng.fill_bytes(&mut challenge);
@@ -3208,6 +3253,7 @@ impl PersistedWindowStore {
                 chain_scope: Some(ChainScope::for_chain(profile.chain_id)),
                 accounting_expiries: snapshot.retained_expiries,
                 authorizations: snapshot.retained_authorizations,
+                operations: retained_operations,
                 ..WireFile::default()
             };
             let original = snapshot.original.unwrap_or_default();
@@ -3504,11 +3550,14 @@ impl PersistedWindowStore {
                     detail: "policy window-state generation counter overflow".to_owned(),
                 })?;
         next.prepared = None;
-        // The successor's version follows from its own content, before its
-        // commitment is hashed. The current snapshot keeps the version it was
-        // committed under, so its committed digest stays the same with the
-        // successor beside it.
-        next.version = select_wire_version(&next);
+        // The successor's version follows from its own content and the
+        // committed version's floor, before its commitment is hashed. The
+        // current snapshot keeps the version it was committed under, so its
+        // committed digest stays the same with the successor beside it.
+        next.version = select_wire_version(
+            &next,
+            (original.generation != 0).then_some(original.version),
+        );
         check_snapshot(&next)?;
         if !still_valid() {
             return Ok(false);
@@ -4665,13 +4714,15 @@ fn authenticated_scope(wire: &WireFile) -> Result<ChainScope, WindowStoreError> 
 /// Checks one snapshot's version, its authorization history and its
 /// accounting-expiry records.
 ///
-/// Versions 1 through 10 decode. Snapshots below version 4 carry no authorization
+/// Versions 1 through 11 decode. Snapshots below version 4 carry no authorization
 /// history; usable snapshots also require complete authenticated scope.
 /// Accounting-expiry records need version 8, the file's own scope, the
 /// accounting-expired disposition, a generation no later than the file's, and
 /// a unique identifier that recomputes from their fields.
 /// Signed intents and their links need version 9. An authorization under
-/// policy authority needs version 10.
+/// policy authority needs version 10. Operation records, authorization links,
+/// dispositions, release rows, floors and the stored observation need
+/// version 11.
 fn check_snapshot(wire: &WireFile) -> Result<(), WindowStoreError> {
     if wire.version > WIRE_VERSION_MAX {
         return Err(WindowStoreError::UnsupportedVersion);
@@ -4712,6 +4763,7 @@ fn check_snapshot(wire: &WireFile) -> Result<(), WindowStoreError> {
         });
     }
     validate_signed_intents(wire)?;
+    operations::Operations::validate(wire)?;
     ledger::validate(wire)
 }
 
@@ -5209,6 +5261,7 @@ pub(super) fn prune_stale(wire: &mut WireFile, now_ms: u64) {
     // approval expires; an open authorization stays whatever its age, until a
     // transaction's sweep settles it.
     ledger::prune_history(wire, cutoff, now_ms);
+    operations::Operations::prune(wire, now_ms);
 }
 
 /// Whether the receipt for `envelope_hash` already records an outcome the
@@ -12999,8 +13052,8 @@ mod tests {
         });
         let mut without = wire.clone();
         without.accounting_expiries.clear();
-        assert_eq!(select_wire_version(&without), WIRE_VERSION_EXPOSURE);
-        assert_eq!(select_wire_version(&wire), WIRE_VERSION_EXPIRY);
+        assert_eq!(select_wire_version(&without, None), WIRE_VERSION_EXPOSURE);
+        assert_eq!(select_wire_version(&wire, None), WIRE_VERSION_EXPIRY);
         let body = serde_json::to_string(&without).unwrap();
         assert!(!body.contains("accounting_expiries"), "{body}");
     }
@@ -14075,6 +14128,9 @@ mod tests {
             parent: None,
             consumption: None,
             invalidation: None,
+            operation: None,
+            disposition: None,
+            native_release: None,
         }
     }
 
@@ -14384,6 +14440,1010 @@ mod tests {
                 matches!(reopened.read_for_inspection(&profile), Err(WindowStoreError::Invalid { detail }) if detail == "signed intent purpose field is missing")
             );
         }
+    }
+
+    /// A committed version 10 testnet file over profile `intent`: an exposed
+    /// signed intent, an owed accounting expiry, a pending hold without a time
+    /// bound, an open authorization with its window hold and, with
+    /// `policy_authority`, a settled authorization under policy authority.
+    /// Without it the file is version 9. The clock stays at 1,000 ms while the
+    /// returned guard lives.
+    fn version_ten_store(
+        policy_authority: bool,
+    ) -> (
+        TempDir,
+        Profile,
+        PersistedWindowStore,
+        crate::mainnet::clock::TestClockGuard,
+    ) {
+        let (dir, profile, store, plan) = progress_fixture();
+        let clock = crate::mainnet::clock::set_now_ms_for_test(1000);
+        let _exposure = store.admit_signed_intent(&profile, &plan).unwrap().expose();
+        let mut expiring = reservation(&"e1".repeat(32), "GSOURCE", 9, 1000);
+        expiring.max_time = 61;
+        store
+            .record_pending(
+                &profile,
+                &[entry(key("intent", "native", 60), 1000, 300)],
+                &expiring,
+            )
+            .unwrap();
+        store
+            .expire_accounting(&profile, None, &expiring, 61 * 1000 + 60_001)
+            .unwrap()
+            .unwrap();
+        store
+            .record_pending(
+                &profile,
+                &[entry(key("intent", "native", 86_400), 1000, 40)],
+                &reservation(&"e2".repeat(32), "GSOURCE", 10, 1000),
+            )
+            .unwrap();
+        store
+            .record_and_persist(&profile, &[entry(key("intent", "native", 86_400), 1000, 7)])
+            .unwrap();
+        let hmac_key =
+            crate::keyring::load_hmac_key_32(&profile.policy_window_state_key_id).unwrap();
+        let gen_entry = generation_entry_ref(&profile);
+        let original = store.read_for_inspection(&profile).unwrap().unwrap();
+        let mut wire = original.clone();
+        let binding = ledger::DomainBinding::Transaction {
+            unsigned_envelope_sha256: [0x31; 32],
+            tx_hash: [0x32; 32],
+            source: "GSOURCE".to_owned(),
+            sequence: 11,
+        };
+        let open_id = crate::mainnet::AuthorizationId::from_bytes([0x33; 32]);
+        wire.authorizations.push(ledger::WireAuthorization {
+            id: open_id,
+            profile: "intent".to_owned(),
+            chain: Caip2::Testnet,
+            domain: crate::mainnet::AuthorizationDomain::Transaction,
+            consumer: crate::mainnet::MainnetConsumer::CliPay,
+            content_digest: binding.content_digest(),
+            binding,
+            state: ledger::AuthorizationState::Open,
+            minted_ms: 1000,
+            expires_ms: 1000 + RETENTION_MS,
+            settled_ms: None,
+            claimed_ms: None,
+            policy_sequence: 1,
+            policy_digest: [1; 32],
+            approval_nonce: Some("intent-open".to_owned()),
+            approval_expires_ms: Some(1000 + RETENTION_MS),
+            policy_authority: None,
+            bindings_digest: [2; 32],
+            entries_digest: [3; 32],
+            reservation: Some(open_id),
+            parent: None,
+            consumption: None,
+            invalidation: None,
+            operation: None,
+            disposition: None,
+            native_release: None,
+        });
+        wire.holds.push(WireAuthorizationHold {
+            kind: ledger::HoldKind::Value,
+            authorization_id: open_id,
+            ordinal: 0,
+            scope_specificity: 1,
+            bucket: "native".to_owned(),
+            window_secs: 60,
+            ts_ms: 1000,
+            amount: 5,
+        });
+        if policy_authority {
+            let mut settled = settled_authorization(0x34);
+            settled.profile = "intent".to_owned();
+            settled.chain = Caip2::Testnet;
+            settled.settled_ms = Some(1000);
+            settled.approval_nonce = None;
+            settled.approval_expires_ms = None;
+            settled.policy_authority = Some(
+                ledger::PolicyAuthorityBinding {
+                    policy_digest: settled.policy_digest,
+                    policy_sequence: settled.policy_sequence,
+                    rule_index: 2,
+                    evaluated_at_ms: 1000,
+                    governing_until_ms: 1000 + RETENTION_MS,
+                    scope: stellar_agent_core::mainnet::decision::AuthorityScope::Classic,
+                }
+                .into(),
+            );
+            wire.authorizations.push(settled);
+        }
+        store
+            .commit_generation(&hmac_key, &gen_entry, original, wire)
+            .unwrap();
+        let written = store.read_for_inspection(&profile).unwrap().unwrap();
+        assert_eq!(
+            written.version,
+            if policy_authority {
+                WIRE_VERSION_POLICY_AUTHORITY
+            } else {
+                WIRE_VERSION_INTENT
+            }
+        );
+        assert_eq!(written.signed_intents.len(), 1);
+        assert_eq!(written.accounting_expiries.len(), 1);
+        assert!(!written.accounting_expiries[0].audit_acknowledged);
+        assert_eq!(written.holds.len(), 1);
+        assert!(
+            written
+                .entries
+                .iter()
+                .flat_map(|bucket| &bucket.records)
+                .any(
+                    |record| record.id == "e2".repeat(32) && record.status == RecordStatus::Pending
+                )
+        );
+        (dir, profile, store, clock)
+    }
+
+    /// The committed body digest the keyring holds for `profile`.
+    fn committed_digest(profile: &Profile) -> String {
+        load_counter(&generation_entry_ref(profile))
+            .unwrap()
+            .unwrap()
+            .body_sha256
+            .unwrap()
+    }
+
+    /// Asserts that the stored bytes parse and reserialize to themselves, and
+    /// that their HMAC tag recomputes over the reserialized body.
+    fn assert_reserializes_byte_identically(store: &PersistedWindowStore, profile: &Profile) {
+        let key = crate::keyring::load_hmac_key_32(&profile.policy_window_state_key_id).unwrap();
+        let bytes = fs::read(store.path()).unwrap();
+        let (tag, body) = bytes.split_at(HMAC_TAG_LEN);
+        let parsed: WireFile = serde_json::from_slice(body).unwrap();
+        let reserialized = serde_json::to_vec(&parsed).unwrap();
+        assert_eq!(reserialized, body);
+        assert_eq!(compute_tag(key.as_ref(), &reserialized).unwrap(), tag);
+    }
+
+    /// A committed version 10 file with policy authority, window entries,
+    /// holds, an accounting expiry, a signed intent and a prepared image loads
+    /// and reserializes to its stored bytes. The body digest the keyring
+    /// commits and the HMAC tag stay identical on both sides of the prepared
+    /// commit.
+    #[test]
+    #[serial]
+    fn version_ten_file_reserializes_byte_identically() {
+        let (_dir, profile, store, _clock) = version_ten_store(true);
+        assert_reserializes_byte_identically(&store, &profile);
+        let current = store.read_for_inspection(&profile).unwrap().unwrap();
+        assert_eq!(body_digest(&current).unwrap(), committed_digest(&profile));
+
+        let key = crate::keyring::load_hmac_key_32(&profile.policy_window_state_key_id).unwrap();
+        let mut successor = current.clone();
+        successor.generation += 1;
+        successor.entries[0].records.push(WireRecord {
+            ts_ms: 1000,
+            amount: 3,
+            ..WireRecord::confirmed_defaults()
+        });
+        let mut container = current.clone();
+        container.prepared = Some(Box::new(successor.clone()));
+        store.write_atomic(&key, &container).unwrap();
+        assert_reserializes_byte_identically(&store, &profile);
+        let before = store.read_for_inspection(&profile).unwrap().unwrap();
+        assert_eq!(before.generation, current.generation);
+        assert_eq!(body_digest(&before).unwrap(), committed_digest(&profile));
+        assert_eq!(
+            body_digest(&before).unwrap(),
+            body_digest(&current).unwrap()
+        );
+
+        write_generation(&generation_entry_ref(&profile), &successor).unwrap();
+        assert_reserializes_byte_identically(&store, &profile);
+        let after = store.read_for_inspection(&profile).unwrap().unwrap();
+        assert_eq!(after.generation, successor.generation);
+        assert_eq!(after.version, WIRE_VERSION_POLICY_AUTHORITY);
+        assert_eq!(body_digest(&after).unwrap(), committed_digest(&profile));
+        assert_eq!(
+            body_digest(&after).unwrap(),
+            body_digest(&successor).unwrap()
+        );
+    }
+
+    /// The version pairs (9, 10) and (10, 10) are read on both sides of the
+    /// commit point at every commit seam: a stop after the prepared image
+    /// keeps the current snapshot, a stop after the counter selects the
+    /// successor, and a failed compaction leaves the successor readable
+    /// beside its parent. The window totals follow the selected side.
+    #[test]
+    #[serial]
+    fn version_ten_prepared_pairs_survive_both_sides_of_the_commit_point() {
+        for current_version in [WIRE_VERSION_INTENT, WIRE_VERSION_POLICY_AUTHORITY] {
+            for seam in [
+                COMMIT_FAULT_AFTER_PREPARED,
+                COMMIT_FAULT_AFTER_COUNTER,
+                COMMIT_FAULT_COMPACTION,
+            ] {
+                let pair = format!("{current_version}->10 at seam {seam}");
+                let (_dir, profile, store, _clock) =
+                    version_ten_store(current_version == WIRE_VERSION_POLICY_AUTHORITY);
+                let hmac_key =
+                    crate::keyring::load_hmac_key_32(&profile.policy_window_state_key_id).unwrap();
+                let gen_entry = generation_entry_ref(&profile);
+                let current = store.read_for_inspection(&profile).unwrap().unwrap();
+                assert_eq!(current.version, current_version, "{pair}");
+                let mut next = current.clone();
+                let mut settled = settled_authorization(0x35);
+                settled.profile = "intent".to_owned();
+                settled.chain = Caip2::Testnet;
+                settled.settled_ms = Some(1000);
+                settled.approval_nonce = None;
+                settled.approval_expires_ms = None;
+                settled.policy_authority = Some(
+                    ledger::PolicyAuthorityBinding {
+                        policy_digest: settled.policy_digest,
+                        policy_sequence: settled.policy_sequence,
+                        rule_index: 3,
+                        evaluated_at_ms: 1000,
+                        governing_until_ms: 1000 + RETENTION_MS,
+                        scope: stellar_agent_core::mainnet::decision::AuthorityScope::Classic,
+                    }
+                    .into(),
+                );
+                next.authorizations.push(settled);
+                let k = key("intent", "native", 86_400);
+                let memory = PolicyStateStore::new();
+                store.load_into("intent", &profile, &memory).unwrap();
+                let (total, calls) = memory.query_window(&k, 1000).unwrap();
+
+                let armed = arm_accounting_fault(seam);
+                let result = store.commit_generation(&hmac_key, &gen_entry, current.clone(), next);
+                drop(armed);
+                assert_eq!(result.is_ok(), seam == COMMIT_FAULT_COMPACTION, "{pair}");
+                let committed = seam != COMMIT_FAULT_AFTER_PREPARED;
+                let reopened = PersistedWindowStore::at_path(store.path().to_owned());
+                let selected = reopened.read_for_inspection(&profile).unwrap().unwrap();
+                assert_eq!(
+                    (selected.version, selected.generation),
+                    if committed {
+                        (WIRE_VERSION_POLICY_AUTHORITY, current.generation + 1)
+                    } else {
+                        (current_version, current.generation)
+                    },
+                    "{pair}"
+                );
+                assert_eq!(
+                    selected.authorizations.len(),
+                    current.authorizations.len() + usize::from(committed),
+                    "{pair}"
+                );
+                assert_eq!(
+                    serde_json::to_vec(&selected.signed_intents).unwrap(),
+                    serde_json::to_vec(&current.signed_intents).unwrap(),
+                    "{pair}"
+                );
+                assert_eq!(
+                    selected.accounting_expiries, current.accounting_expiries,
+                    "{pair}"
+                );
+                assert_eq!(selected.holds, current.holds, "{pair}");
+                let body: serde_json::Value =
+                    serde_json::from_slice(&fs::read(store.path()).unwrap()[HMAC_TAG_LEN..])
+                        .unwrap();
+                assert_eq!(
+                    body["prepared"]["version"],
+                    serde_json::json!(WIRE_VERSION_POLICY_AUTHORITY),
+                    "{pair}: the stop leaves the prepared image beside its parent"
+                );
+                assert_eq!(
+                    body["version"],
+                    serde_json::json!(current_version),
+                    "{pair}"
+                );
+                let memory = PolicyStateStore::new();
+                reopened.load_into("intent", &profile, &memory).unwrap();
+                assert_eq!(
+                    memory.query_window(&k, 1000).unwrap(),
+                    (total, calls),
+                    "{pair}"
+                );
+            }
+        }
+    }
+
+    /// An unrelated settled write to a version 10 file keeps its signed
+    /// intent, its owed accounting expiry and its pending hold byte for byte.
+    #[test]
+    #[serial]
+    fn unrelated_write_preserves_intents_obligations_and_pending_holds() {
+        let (_dir, profile, store, _clock) = version_ten_store(true);
+        let pending = |wire: &WireFile| {
+            wire.entries
+                .iter()
+                .flat_map(|bucket| &bucket.records)
+                .filter(|record| record.id == "e2".repeat(32))
+                .map(|record| serde_json::to_vec(record).unwrap())
+                .collect::<Vec<_>>()
+        };
+        let before = store.read_for_inspection(&profile).unwrap().unwrap();
+        store
+            .record_and_persist(&profile, &[entry(key("intent", "other", 3600), 1000, 9)])
+            .unwrap();
+        let after = store.read_for_inspection(&profile).unwrap().unwrap();
+        assert_eq!(after.generation, before.generation + 1);
+        assert_eq!(after.version, WIRE_VERSION_POLICY_AUTHORITY);
+        assert_eq!(
+            serde_json::to_vec(&after.signed_intents).unwrap(),
+            serde_json::to_vec(&before.signed_intents).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_vec(&after.accounting_expiries).unwrap(),
+            serde_json::to_vec(&before.accounting_expiries).unwrap()
+        );
+        assert_eq!(pending(&after), pending(&before));
+        assert_eq!(pending(&before).len(), 1);
+        assert!(
+            after
+                .entries
+                .iter()
+                .any(|bucket| bucket.bucket == "other" && bucket.records.len() == 1)
+        );
+    }
+
+    /// The clock of the operation fixtures.
+    const OPERATION_T0: u64 = 1_800_000_000_000;
+
+    /// Keeps every audit row an operation step appends.
+    #[derive(Default)]
+    struct OperationRows(Vec<stellar_agent_core::audit_log::AuditEntry>);
+
+    impl operations::OperationAudit for OperationRows {
+        fn append(
+            &mut self,
+            entry: stellar_agent_core::audit_log::AuditEntry,
+        ) -> Result<(), String> {
+            self.0.push(entry);
+            Ok(())
+        }
+    }
+
+    /// A mainnet store over profile `ops-store` whose pin names sequence 7
+    /// and digest `[7; 32]`. The clock stays at [`OPERATION_T0`] until the
+    /// returned guard moves it.
+    fn operation_store() -> (
+        TempDir,
+        Profile,
+        PersistedWindowStore,
+        crate::mainnet::clock::TestClockGuard,
+    ) {
+        keyring_mock::install().unwrap();
+        let dir = TempDir::new().unwrap();
+        let profile = mainnet_test_profile(dir.path(), "ops-store");
+        let store = PersistedWindowStore::at_path(dir.path().join("ops-store.window"));
+        let clock = crate::mainnet::clock::set_now_ms_for_test(OPERATION_T0);
+        let lock =
+            WindowStoreLock::acquire_for(&store.path, &profile.policy_window_state_key_id).unwrap();
+        pin::write_for_test(
+            &lock,
+            &PinScope::for_profile(&store.path, &profile),
+            &pin::Pin::new(7, [7; 32], [1; 32]).unwrap(),
+        )
+        .unwrap();
+        drop(lock);
+        (dir, profile, store, clock)
+    }
+
+    /// A pay operation over a canonical intent with digest `[n; 32]`.
+    fn operation_request(business_id: &str, n: u8) -> operations::OpenRequest {
+        operations::OpenRequest {
+            business_id: operations::BusinessId::parse(business_id).unwrap(),
+            tool: operations::OperationTool::CliPay,
+            kind: operations::OperationKind::Pay,
+            intent: operations::IntentSlot::Canonical {
+                intent_digest: [n; 32],
+                intent: serde_json::json!({ "op": "pay", "n": n }),
+            },
+            envelope_xdr: Some("AAAASTORED".to_owned()),
+            prepared_decision: None,
+            rule_ttl_ms: None,
+        }
+    }
+
+    /// Opens a new record for `business_id`.
+    fn open_operation(
+        store: &PersistedWindowStore,
+        profile: &Profile,
+        audit: &mut OperationRows,
+        business_id: &str,
+        n: u8,
+    ) -> operations::OperationHandle {
+        match operations::OperationRecorder::new(store, profile, audit, "ops-request")
+            .open(&operation_request(business_id, n))
+            .unwrap()
+        {
+            operations::OpenOutcome::New(handle) => handle,
+            other => panic!("expected a new record, got {other:?}"),
+        }
+    }
+
+    /// Moves `id` along the edge to `to` without evidence.
+    fn step_operation(
+        store: &PersistedWindowStore,
+        profile: &Profile,
+        audit: &mut OperationRows,
+        id: operations::OperationId,
+        attempt_index: Option<u32>,
+        to: operations::OperationState,
+    ) {
+        operations::OperationRecorder::new(store, profile, audit, "ops-request")
+            .transition(
+                id,
+                attempt_index,
+                to,
+                &operations::TransitionEvidence::default(),
+            )
+            .unwrap();
+    }
+
+    /// A mint of transaction `n` under the pinned policy's authority.
+    fn policy_mint(n: u8) -> ledger::MintRequest {
+        let now = now_ms().unwrap();
+        ledger::MintRequest {
+            chain: Caip2::Mainnet,
+            consumer: crate::mainnet::MainnetConsumer::CliPay,
+            binding: ledger::DomainBinding::Transaction {
+                unsigned_envelope_sha256: [n; 32],
+                tx_hash: [n ^ 0x80; 32],
+                source: "GAAQEAYEAUDAOCAJBIFQYDIOB4IBCEQTCQKRMFYYDENBWHA5DYPSABGM".to_owned(),
+                sequence: 100 + i64::from(n),
+            },
+            policy_sequence: 7,
+            policy_digest: [7; 32],
+            authority: ledger::MintAuthority::Policy(ledger::PolicyAuthorityBinding {
+                policy_digest: [7; 32],
+                policy_sequence: 7,
+                rule_index: 0,
+                evaluated_at_ms: now,
+                governing_until_ms: now + 600_000,
+                scope: stellar_agent_core::mainnet::decision::AuthorityScope::Classic,
+            }),
+            chain_deadline_ms: None,
+            authorization_ttl_ms: 120_000,
+            bindings: crate::mainnet::digest::BindingFacts {
+                endpoint: None,
+                signer: [2; 32],
+                policy: [3; 32],
+                enablement: [4; 32],
+                witness: None,
+                reservation: None,
+                authority: [7; 32],
+                audit: [8; 32],
+            },
+            holds: vec![],
+            parent: None,
+            operation: None,
+        }
+    }
+
+    /// A mainnet reset refuses while an operation is not terminal, before any
+    /// write. Once every operation ends, the successor keeps the terminal
+    /// records, the tombstones and the linked authorization whose authority
+    /// is live, with the release row the operator clear wrote, and clears
+    /// the floors.
+    #[test]
+    #[serial]
+    fn reset_refuses_open_operations_and_keeps_terminal_records() {
+        use operations::OperationState as S;
+        let (_dir, profile, store, clock) = operation_store();
+        let mut audit = OperationRows::default();
+        let compacted = open_operation(&store, &profile, &mut audit, "order-3", 3);
+        step_operation(
+            &store,
+            &profile,
+            &mut audit,
+            compacted.id(),
+            None,
+            S::Expired,
+        );
+        clock.set(OPERATION_T0 + operations::TERMINAL_RETENTION_MS);
+        let ended = open_operation(&store, &profile, &mut audit, "order-2", 2);
+        step_operation(&store, &profile, &mut audit, ended.id(), None, S::Expired);
+
+        let cancelled = open_operation(&store, &profile, &mut audit, "order-4", 4);
+        let mint = policy_mint(4);
+        let started =
+            operations::OperationRecorder::new(&store, &profile, &mut audit, "ops-request")
+                .begin_attempt(
+                    &cancelled,
+                    &operations::AttemptRequest {
+                        envelope: Some(operations::AttemptEnvelope {
+                            xdr: "AAAAENVELOPE".to_owned(),
+                            unsigned_envelope_sha256: [4; 32],
+                        }),
+                        authorization: operations::AttemptAuthorization::Mint(Box::new(
+                            mint.clone(),
+                        )),
+                        send_by_ms: u64::MAX,
+                    },
+                )
+                .unwrap();
+        let minted = started.minted.as_ref().unwrap();
+        store
+            .claim_authorization(
+                &profile,
+                minted.id,
+                &ledger::ClaimExpect {
+                    domain: mint.binding.domain(),
+                    consumer: mint.consumer,
+                    bindings_digest: minted.bindings_digest,
+                    policy_sequence: mint.policy_sequence,
+                    policy_digest: mint.policy_digest,
+                    authority: mint.authority.clone(),
+                },
+            )
+            .unwrap();
+        operations::OperationRecorder::new(&store, &profile, &mut audit, "ops-request")
+            .expose(
+                cancelled.id(),
+                1,
+                &operations::ExposureIdentity::Classic {
+                    envelope_sha256: [0x44; 32],
+                    tx_hash: [4 ^ 0x80; 32],
+                    sequence: 104,
+                    max_time: 0,
+                    receipt: stellar_agent_core::hex::encode(&[0x44; 32]),
+                },
+                Some(10),
+            )
+            .unwrap();
+        step_operation(
+            &store,
+            &profile,
+            &mut audit,
+            cancelled.id(),
+            Some(1),
+            S::SentOutcomeUnknown,
+        );
+        operations::OperationRecorder::new(&store, &profile, &mut audit, "ops-request")
+            .transition(
+                cancelled.id(),
+                Some(1),
+                S::Cancelled,
+                &operations::TransitionEvidence {
+                    clear: Some(operations::ClearForm::Untimed),
+                    ..operations::TransitionEvidence::default()
+                },
+            )
+            .unwrap();
+
+        let now = OPERATION_T0 + operations::TERMINAL_RETENTION_MS + 120_000;
+        clock.set(now);
+        let waiting = open_operation(&store, &profile, &mut audit, "order-1", 1);
+        let bytes = fs::read(&store.path).unwrap();
+        let gen_entry = generation_entry_ref(&profile);
+        let counter = get_raw(&gen_entry);
+        let refused = reset_unsigned(&store, &profile, now, |_| Ok::<_, ()>(()));
+        let Err(ResetError::Store {
+            error,
+            minted: false,
+        }) = refused
+        else {
+            panic!("expected the store refusal, got {refused:?}");
+        };
+        assert!(matches!(
+            error,
+            WindowStoreError::OperationsOpen { open: 1 }
+        ));
+        assert_eq!(
+            error.operation_error().map(|error| error.code()),
+            Some("reset.operations_open")
+        );
+        assert_eq!(fs::read(&store.path).unwrap(), bytes);
+        assert_eq!(get_raw(&gen_entry), counter);
+
+        step_operation(&store, &profile, &mut audit, waiting.id(), None, S::Expired);
+        let before = store.read_for_inspection(&profile).unwrap().unwrap();
+        reset_unsigned(&store, &profile, now, |_| Ok::<_, ()>(())).unwrap();
+        let after = store.read_for_inspection(&profile).unwrap().unwrap();
+        assert_eq!(after.generation, before.generation + 1);
+        assert_eq!(after.version, WIRE_VERSION_OPERATIONS);
+        assert_eq!(after.operations, before.operations);
+        let section = after.operations.as_ref().unwrap();
+        let mut kept: Vec<_> = section
+            .records
+            .iter()
+            .map(|record| (record.business_id.as_str().to_owned(), record.state))
+            .collect();
+        kept.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(
+            kept,
+            vec![
+                ("order-1".to_owned(), S::Expired),
+                ("order-2".to_owned(), S::Expired),
+                ("order-4".to_owned(), S::Cancelled),
+            ]
+        );
+        assert_eq!(
+            section
+                .tombstones
+                .iter()
+                .map(|tombstone| tombstone.id)
+                .collect::<Vec<_>>(),
+            vec![compacted.id()]
+        );
+        let linked = after
+            .authorizations
+            .iter()
+            .find(|auth| auth.id == minted.id)
+            .unwrap();
+        assert_eq!(
+            linked.operation,
+            Some(operations::OperationLink {
+                operation_id: cancelled.id(),
+                attempt_index: 1
+            })
+        );
+        assert_eq!(
+            linked
+                .native_release
+                .map(|row| (row.class, row.bound, row.observed_ledger)),
+            Some((
+                operations::ReleaseClass::Unknown,
+                operations::ReleaseBound::Always,
+                None
+            ))
+        );
+        assert_eq!(after.admissible_floor_ledger, None);
+        assert_eq!(after.admissible_floor_close_time_ms, None);
+    }
+
+    /// A version 10 file loads unchanged and moves to version 11 only with a
+    /// commit that carries version-11 content. Every earlier section keeps
+    /// its bytes, and the new file reserializes to itself.
+    #[test]
+    #[serial]
+    fn version_ten_file_migrates_to_eleven_preserving_every_section() {
+        let (_dir, profile, store, _clock) = version_ten_store(true);
+        let bytes = fs::read(&store.path).unwrap();
+        let current = store.read_for_inspection(&profile).unwrap().unwrap();
+        assert_eq!(current.version, WIRE_VERSION_POLICY_AUTHORITY);
+        let body: serde_json::Value = serde_json::from_slice(&bytes[HMAC_TAG_LEN..]).unwrap();
+        for field in [
+            "operations",
+            "admissible_floor_ledger",
+            "admissible_floor_close_time_ms",
+            "last_observation",
+        ] {
+            assert!(body.get(field).is_none(), "{field}");
+        }
+        let authorizations = body["authorizations"].as_array().unwrap();
+        assert_eq!(authorizations.len(), 2);
+        for auth in authorizations {
+            for field in ["operation", "disposition", "native_release"] {
+                assert!(auth.get(field).is_none(), "{field}");
+            }
+        }
+        store
+            .load_into("intent", &profile, &PolicyStateStore::new())
+            .unwrap();
+        assert_eq!(fs::read(&store.path).unwrap(), bytes);
+
+        let hmac_key =
+            crate::keyring::load_hmac_key_32(&profile.policy_window_state_key_id).unwrap();
+        let mut next = current.clone();
+        next.last_observation = Some(operations::WindowObservation {
+            ledger: 900,
+            close_time_floor_ms: 900,
+            observed_at_ms: 1000,
+        });
+        store
+            .commit_generation(
+                &hmac_key,
+                &generation_entry_ref(&profile),
+                current.clone(),
+                next,
+            )
+            .unwrap();
+        let after = store.read_for_inspection(&profile).unwrap().unwrap();
+        assert_eq!(after.version, WIRE_VERSION_OPERATIONS);
+        assert_eq!(after.generation, current.generation + 1);
+        assert_eq!(after.chain_scope, current.chain_scope);
+        assert_eq!(after.last_observation.map(|o| o.ledger), Some(900));
+        let sections = |wire: &WireFile| {
+            [
+                serde_json::to_vec(&wire.entries).unwrap(),
+                serde_json::to_vec(&wire.authorizations).unwrap(),
+                serde_json::to_vec(&wire.holds).unwrap(),
+                serde_json::to_vec(&wire.accounting_expiries).unwrap(),
+                serde_json::to_vec(&wire.signed_intents).unwrap(),
+            ]
+        };
+        assert_eq!(sections(&after), sections(&current));
+        assert_reserializes_byte_identically(&store, &profile);
+        assert_eq!(body_digest(&after).unwrap(), committed_digest(&profile));
+    }
+
+    /// A version 10 body as the version 10 writer committed it over profile
+    /// `intent`: an owed accounting expiry, a pending hold without a time
+    /// bound, an open authorization with its window hold, a settled
+    /// authorization under policy authority and an exposed signed intent.
+    const V10_BODY: &str = r#"{"chain_scope":{"chain":"stellar:testnet","network_passphrase_sha256":[206,224,48,45,89,132,77,50,189,202,145,92,130,3,221,68,179,63,187,126,220,25,5,30,163,122,190,223,40,236,212,114]},"version":10,"generation":6,"entries":[{"scope_specificity":1,"bucket":"native","window_secs":60,"records":[{"chain_scope":{"chain":"stellar:testnet","network_passphrase_sha256":[206,224,48,45,89,132,77,50,189,202,145,92,130,3,221,68,179,63,187,126,220,25,5,30,163,122,190,223,40,236,212,114]},"execution_bound":61000,"accounting_until_ms":121000,"admitted_window_ms":60000,"ts_ms":1000,"amount":"300","id":"e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1","status":"accounting_expired","tx_hash":"abababababababababababababababababababababababababababababababab","source":"GSOURCE","sequence":9,"max_time":61,"pending_since_ms":1000,"submission_ledger":1000,"operator_required":false}]},{"scope_specificity":1,"bucket":"native","window_secs":86400,"records":[{"chain_scope":{"chain":"stellar:testnet","network_passphrase_sha256":[206,224,48,45,89,132,77,50,189,202,145,92,130,3,221,68,179,63,187,126,220,25,5,30,163,122,190,223,40,236,212,114]},"admitted_window_ms":86400000,"ts_ms":1000,"amount":"40","id":"e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2","status":"pending","tx_hash":"abababababababababababababababababababababababababababababababab","source":"GSOURCE","sequence":10,"max_time":0,"pending_since_ms":1000,"submission_ledger":1000,"operator_required":false},{"ts_ms":1000,"amount":"7","id":"","status":"confirmed","tx_hash":"","source":"","sequence":0,"max_time":0,"pending_since_ms":0,"submission_ledger":0,"operator_required":false}]}],"authorizations":[{"id":"3333333333333333333333333333333333333333333333333333333333333333","profile":"intent","chain":"stellar:testnet","domain":"transaction","consumer":"cli_pay","content_digest":"56c7962e9f26b46fb66d793017822eee1603519e00a855341729cf18af15e3c4","binding":{"transaction":{"unsigned_envelope_sha256":"3131313131313131313131313131313131313131313131313131313131313131","tx_hash":"3232323232323232323232323232323232323232323232323232323232323232","source":"GSOURCE","sequence":11}},"state":"open","minted_ms":1000,"expires_ms":604801000,"policy_sequence":1,"policy_digest":"0101010101010101010101010101010101010101010101010101010101010101","approval_nonce":"intent-open","approval_expires_ms":604801000,"bindings_digest":"0202020202020202020202020202020202020202020202020202020202020202","entries_digest":"0303030303030303030303030303030303030303030303030303030303030303","reservation":"3333333333333333333333333333333333333333333333333333333333333333"},{"id":"3434343434343434343434343434343434343434343434343434343434343434","profile":"intent","chain":"stellar:testnet","domain":"soroban","consumer":"x402_create","content_digest":"f1b00da714f0136828d068f4e590ae41d9fb5c8a48c6a17d57e26ba3472470a9","binding":{"soroban":{"intent_digest":"3434343434343434343434343434343434343434343434343434343434343434"}},"state":"expired","minted_ms":1,"expires_ms":2,"settled_ms":1000,"policy_sequence":1,"policy_digest":"0101010101010101010101010101010101010101010101010101010101010101","policy_authority":{"policy_digest":"0101010101010101010101010101010101010101010101010101010101010101","policy_sequence":1,"rule_index":2,"evaluated_at_ms":1000,"governing_until_ms":604801000,"scope":{"kind":"classic"}},"bindings_digest":"0202020202020202020202020202020202020202020202020202020202020202","entries_digest":"0303030303030303030303030303030303030303030303030303030303030303"}],"holds":[{"kind":"value","authorization_id":"3333333333333333333333333333333333333333333333333333333333333333","ordinal":0,"scope_specificity":1,"bucket":"native","window_secs":60,"ts_ms":1000,"amount":"5"}],"accounting_expiries":[{"decision_id":"ea04d2a485346305476b280cb76a286baed3c8c9f17e009787d64f3f459ecb46","chain_scope":{"chain":"stellar:testnet","network_passphrase_sha256":[206,224,48,45,89,132,77,50,189,202,145,92,130,3,221,68,179,63,187,126,220,25,5,30,163,122,190,223,40,236,212,114]},"reservation_id":"e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1","tx_hash":"abababababababababababababababababababababababababababababababab","source":"GSOURCE","sequence":9,"max_time":61,"submission_ledger":1000,"generation":3,"disposition":"accounting_expired","observed_at_ms":121001,"accounting_until_ms":121000,"audit_acknowledged":false,"receipt_projected":false}],"signed_intents":[{"intent_id":"intent-79667c951988be5ebd0459cab17b3740b1760c626a00b90f7130e54f660af593","chain_scope":{"chain":"stellar:testnet","network_passphrase_sha256":[206,224,48,45,89,132,77,50,189,202,145,92,130,3,221,68,179,63,187,126,220,25,5,30,163,122,190,223,40,236,212,114]},"auth_address":"GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF","envelope_source":"GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF","envelope_sequence":1,"host_invocation_sha256":"0fa70075b4842d7358994728d5dba7bf6d1a96097a8d47c8f9e8619aa81253d7","subjects":[],"greatest_expiration_ledger":100,"purpose":"Invoke","envelope_max_ledger":100,"admitted_window_ms":60000,"legs":[{"scope_specificity":1,"bucket":"native","window_secs":60,"ts_ms":1000,"amount":"60"},{"scope_specificity":1,"bucket":"rate_limit","window_secs":60,"ts_ms":1000,"amount":"1"}],"admitted_at_ms":1000,"generation":1,"status":"Exposed","cancel_token_sha256":"6671ee70c5900cde7c80bcc619eda2cdf986367950c09541ffaa7cb47d2721ca"}]}"#;
+
+    /// The version 10 body loads, reserializes byte for byte, and moves to
+    /// version 11 with a commit that carries version 11 content, keeping every
+    /// earlier section byte for byte.
+    #[test]
+    #[serial]
+    fn a_version_ten_golden_body_migrates_to_eleven() {
+        let (_dir, profile, store, _plan) = progress_fixture();
+        let _clock = crate::mainnet::clock::set_now_ms_for_test(1000);
+        let (key, _) = store.load_or_mint_key(&profile).unwrap();
+        let body = V10_BODY.as_bytes();
+        let golden: WireFile = serde_json::from_slice(body).unwrap();
+        store
+            .write_atomic_raw(&compute_tag(key.as_ref(), body).unwrap(), body)
+            .unwrap();
+        write_generation(&generation_entry_ref(&profile), &golden).unwrap();
+        let bytes = fs::read(&store.path).unwrap();
+
+        let current = store.read_for_inspection(&profile).unwrap().unwrap();
+        assert_eq!(current.version, WIRE_VERSION_POLICY_AUTHORITY);
+        assert!(
+            current
+                .authorizations
+                .iter()
+                .any(|auth| auth.policy_authority.is_some())
+        );
+        assert_eq!(current.signed_intents.len(), 1);
+        assert_eq!(current.accounting_expiries.len(), 1);
+        assert_eq!(serde_json::to_vec(&current).unwrap(), body);
+        store
+            .load_into("intent", &profile, &PolicyStateStore::new())
+            .unwrap();
+        assert_eq!(fs::read(&store.path).unwrap(), bytes);
+        assert_reserializes_byte_identically(&store, &profile);
+
+        let mut next = current.clone();
+        next.last_observation = Some(operations::WindowObservation {
+            ledger: 900,
+            close_time_floor_ms: 900,
+            observed_at_ms: 1000,
+        });
+        store
+            .commit_generation(&key, &generation_entry_ref(&profile), current.clone(), next)
+            .unwrap();
+        let after = store.read_for_inspection(&profile).unwrap().unwrap();
+        assert_eq!(after.version, WIRE_VERSION_OPERATIONS);
+        assert_eq!(after.generation, current.generation + 1);
+        for (name, section) in [
+            ("chain_scope", serde_json::to_string(&after.chain_scope)),
+            ("entries", serde_json::to_string(&after.entries)),
+            (
+                "authorizations",
+                serde_json::to_string(&after.authorizations),
+            ),
+            ("holds", serde_json::to_string(&after.holds)),
+            (
+                "accounting_expiries",
+                serde_json::to_string(&after.accounting_expiries),
+            ),
+            (
+                "signed_intents",
+                serde_json::to_string(&after.signed_intents),
+            ),
+        ] {
+            let field = format!("\"{name}\":{}", section.unwrap());
+            assert!(V10_BODY.contains(&field), "{name}");
+        }
+        assert_reserializes_byte_identically(&store, &profile);
+    }
+
+    /// A mainnet file holding authenticated history moves to version 11 with
+    /// its first operation and keeps that history byte for byte. A file
+    /// without authenticated scope refuses the operation write and stays
+    /// unchanged.
+    #[test]
+    #[serial]
+    fn migration_to_eleven_preserves_authenticated_history() {
+        let (_dir, profile, store, _clock) = operation_store();
+        store
+            .record_and_persist(
+                &profile,
+                &[entry(key("ops-store", "native", 86_400), OPERATION_T0, 5)],
+            )
+            .unwrap();
+        let mut held = policy_mint(1);
+        held.holds = vec![entry(key("ops-store", "native", 86_400), OPERATION_T0, 9)];
+        store.mint_authorization(&profile, &held).unwrap();
+        let before = store.read_for_inspection(&profile).unwrap().unwrap();
+        assert_eq!(before.version, WIRE_VERSION_POLICY_AUTHORITY);
+        assert_eq!(before.holds.len(), 1);
+
+        let mut audit = OperationRows::default();
+        open_operation(&store, &profile, &mut audit, "order-1", 1);
+        let after = store.read_for_inspection(&profile).unwrap().unwrap();
+        assert_eq!(after.version, WIRE_VERSION_OPERATIONS);
+        assert_eq!(after.generation, before.generation + 1);
+        assert_eq!(after.chain_scope, before.chain_scope);
+        for (stored, kept) in [
+            (
+                serde_json::to_vec(&after.entries).unwrap(),
+                serde_json::to_vec(&before.entries).unwrap(),
+            ),
+            (
+                serde_json::to_vec(&after.authorizations).unwrap(),
+                serde_json::to_vec(&before.authorizations).unwrap(),
+            ),
+            (
+                serde_json::to_vec(&after.holds).unwrap(),
+                serde_json::to_vec(&before.holds).unwrap(),
+            ),
+        ] {
+            assert_eq!(stored, kept);
+        }
+        assert_reserializes_byte_identically(&store, &profile);
+        assert_eq!(audit.0.len(), 1);
+
+        let mut unscoped = before.clone();
+        unscoped.version = 4;
+        unscoped.chain_scope = None;
+        unscoped.authorizations.clear();
+        unscoped.holds.clear();
+        for record in unscoped
+            .entries
+            .iter_mut()
+            .flat_map(|bucket| &mut bucket.records)
+        {
+            record.chain_scope = None;
+        }
+        store.seal_unchecked_for_test(&profile, &unscoped);
+        let bytes = fs::read(&store.path).unwrap();
+        let counter = get_raw(&generation_entry_ref(&profile));
+        let refused =
+            operations::OperationRecorder::new(&store, &profile, &mut audit, "ops-request")
+                .open(&operation_request("order-2", 2));
+        assert!(
+            matches!(refused, Err(WindowStoreError::ChainUnverifiable)),
+            "{refused:?}"
+        );
+        assert_eq!(fs::read(&store.path).unwrap(), bytes);
+        assert_eq!(get_raw(&generation_entry_ref(&profile)), counter);
+        assert_eq!(audit.0.len(), 1);
+    }
+
+    /// The version pairs (10, 11) and (11, 11) are read on both sides of the
+    /// commit point at every commit seam, as the version 10 pairs are.
+    #[test]
+    #[serial]
+    fn version_eleven_prepared_pairs_survive_both_sides_of_the_commit_point() {
+        let observation = |ledger| operations::WindowObservation {
+            ledger,
+            close_time_floor_ms: 900,
+            observed_at_ms: 1000,
+        };
+        for current_version in [WIRE_VERSION_POLICY_AUTHORITY, WIRE_VERSION_OPERATIONS] {
+            for seam in [
+                COMMIT_FAULT_AFTER_PREPARED,
+                COMMIT_FAULT_AFTER_COUNTER,
+                COMMIT_FAULT_COMPACTION,
+            ] {
+                let pair = format!("{current_version}->11 at seam {seam}");
+                let (_dir, profile, store, _clock) = version_ten_store(true);
+                let hmac_key =
+                    crate::keyring::load_hmac_key_32(&profile.policy_window_state_key_id).unwrap();
+                let gen_entry = generation_entry_ref(&profile);
+                if current_version == WIRE_VERSION_OPERATIONS {
+                    let ten = store.read_for_inspection(&profile).unwrap().unwrap();
+                    let mut eleven = ten.clone();
+                    eleven.last_observation = Some(observation(800));
+                    store
+                        .commit_generation(&hmac_key, &gen_entry, ten, eleven)
+                        .unwrap();
+                }
+                let current = store.read_for_inspection(&profile).unwrap().unwrap();
+                assert_eq!(current.version, current_version, "{pair}");
+                let mut next = current.clone();
+                next.last_observation = Some(observation(900));
+                let k = key("intent", "native", 86_400);
+                let memory = PolicyStateStore::new();
+                store.load_into("intent", &profile, &memory).unwrap();
+                let (total, calls) = memory.query_window(&k, 1000).unwrap();
+
+                let armed = arm_accounting_fault(seam);
+                let result = store.commit_generation(&hmac_key, &gen_entry, current.clone(), next);
+                drop(armed);
+                assert_eq!(result.is_ok(), seam == COMMIT_FAULT_COMPACTION, "{pair}");
+                let committed = seam != COMMIT_FAULT_AFTER_PREPARED;
+                let reopened = PersistedWindowStore::at_path(store.path().to_owned());
+                let selected = reopened.read_for_inspection(&profile).unwrap().unwrap();
+                assert_eq!(
+                    (
+                        selected.version,
+                        selected.generation,
+                        selected.last_observation.map(|o| o.ledger)
+                    ),
+                    if committed {
+                        (WIRE_VERSION_OPERATIONS, current.generation + 1, Some(900))
+                    } else {
+                        (
+                            current_version,
+                            current.generation,
+                            current.last_observation.map(|o| o.ledger),
+                        )
+                    },
+                    "{pair}"
+                );
+                assert_eq!(selected.authorizations, current.authorizations, "{pair}");
+                assert_eq!(
+                    serde_json::to_vec(&selected.signed_intents).unwrap(),
+                    serde_json::to_vec(&current.signed_intents).unwrap(),
+                    "{pair}"
+                );
+                assert_eq!(
+                    selected.accounting_expiries, current.accounting_expiries,
+                    "{pair}"
+                );
+                assert_eq!(selected.holds, current.holds, "{pair}");
+                let body: serde_json::Value =
+                    serde_json::from_slice(&fs::read(store.path()).unwrap()[HMAC_TAG_LEN..])
+                        .unwrap();
+                assert_eq!(
+                    body["prepared"]["version"],
+                    serde_json::json!(WIRE_VERSION_OPERATIONS),
+                    "{pair}: the stop leaves the prepared image beside its parent"
+                );
+                assert_eq!(
+                    body["version"],
+                    serde_json::json!(current_version),
+                    "{pair}"
+                );
+                let memory = PolicyStateStore::new();
+                reopened.load_into("intent", &profile, &memory).unwrap();
+                assert_eq!(
+                    memory.query_window(&k, 1000).unwrap(),
+                    (total, calls),
+                    "{pair}"
+                );
+            }
+        }
+    }
+
+    /// Once a file is committed at version 11, a commit without version-11
+    /// content stays at 11 on both version selections.
+    #[test]
+    #[serial]
+    fn version_eleven_file_never_selects_ten() {
+        let (_dir, profile, store, _clock) = version_ten_store(true);
+        let hmac_key =
+            crate::keyring::load_hmac_key_32(&profile.policy_window_state_key_id).unwrap();
+        let gen_entry = generation_entry_ref(&profile);
+        let ten = store.read_for_inspection(&profile).unwrap().unwrap();
+        let mut eleven = ten.clone();
+        eleven.last_observation = Some(operations::WindowObservation {
+            ledger: 900,
+            close_time_floor_ms: 900,
+            observed_at_ms: 1000,
+        });
+        store
+            .commit_generation(&hmac_key, &gen_entry, ten, eleven)
+            .unwrap();
+        let committed = store.read_for_inspection(&profile).unwrap().unwrap();
+        assert_eq!(committed.version, WIRE_VERSION_OPERATIONS);
+
+        let mut plain = committed.clone();
+        plain.last_observation = None;
+        assert!(!operations::has_content(&plain));
+        store
+            .commit_generation(&hmac_key, &gen_entry, committed.clone(), plain)
+            .unwrap();
+        let after = store.read_for_inspection(&profile).unwrap().unwrap();
+        assert_eq!(after.generation, committed.generation + 1);
+        assert_eq!(after.last_observation, None);
+        assert_eq!(after.version, WIRE_VERSION_OPERATIONS);
+
+        store
+            .record_and_persist(&profile, &[entry(key("intent", "other", 3600), 1000, 9)])
+            .unwrap();
+        let settled = store.read_for_inspection(&profile).unwrap().unwrap();
+        assert_eq!(settled.generation, after.generation + 1);
+        assert_eq!(settled.version, WIRE_VERSION_OPERATIONS);
+        assert_reserializes_byte_identically(&store, &profile);
     }
 
     /// A successor above the versions this build writes, or a nested
@@ -14773,7 +15833,11 @@ mod tests {
             f.seal(&reset_wire());
             let key =
                 crate::keyring::load_hmac_key_32(&f.profile.policy_window_state_key_id).unwrap();
-            let body = br#"{"version":11,"future_authorities":[{"open":true}],"prepared":"future representation"}"#;
+            let body = format!(
+                r#"{{"version":{},"future_authorities":[{{"open":true}}],"prepared":"future representation"}}"#,
+                WIRE_VERSION_MAX + 1
+            );
+            let body = body.as_bytes();
             f.store
                 .write_atomic_raw(&compute_tag(key.as_ref(), body).unwrap(), body)
                 .unwrap();

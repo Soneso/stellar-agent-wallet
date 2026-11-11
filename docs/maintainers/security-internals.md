@@ -1354,7 +1354,7 @@ Stateful spending criteria read amounts and counts from `PolicyStateStore`. Conf
 `PersistedWindowStore` is one file per profile at `<canonical_data_root>/policy/<profile>.window`. It lives in `stellar-agent-network::policy_state`, not `stellar-agent-core`; see the crate-placement rationale in that module's rustdoc. The store needs the keyring primitives that live in `stellar-agent-network`, and `stellar-agent-core` must not depend on `stellar-agent-network`.
 
 - **Format**: `[32-byte HMAC-SHA256 tag] || [canonical JSON body]`, an embedded-tag layout mirroring the counterparty `stellar.toml` cache's v2 format. `i128` amounts serialise as decimal strings, never a bare JSON number.
-- **Versions**: Version 5 carries the authenticated network scope. A snapshot carrying any signing claim uses version 6, including a consumed or expired claim. The reader accepts both for current and prepared snapshots. A snapshot carrying an accounting expiry record uses version 8, which older builds refuse. Versions 1 to 4 decode for integrity checks and refuse with `policy.window_chain_unverifiable`, because they carry no scope.
+- **Versions**: Version 5 carries the authenticated network scope. A snapshot carrying any signing claim uses version 6, including a consumed or expired claim. The reader accepts both for current and prepared snapshots. A snapshot carrying an accounting expiry record uses version 8, which older builds refuse. Versions 1 to 4 decode for integrity checks and refuse with `policy.window_chain_unverifiable`, because they carry no scope. A snapshot carrying an operation record, an admissible floor, a chain observation, or an authorization's operation link, disposition or release row uses version 11. A file of an earlier version loads unchanged and moves to version 11 only with a commit that carries such content. Once a file is committed at version 11, every later commit stays at version 11, a reset included.
 - **Authorization ledger**: open and claimed records hold window capacity outside the bucket records. Hydration, reconciliation, confirmation, and release never see a hold. Expiry is measured on the store's own clock, and a transaction sweeps expired authorizations under the lock before it counts. Invalidation or expiry releases only unclaimed holds. A signing claim records its time before the signer runs. Expiry converts claimed holds to confirmed spend dated at the claim and bound to its chain. A consumed transaction authorization's holds become submission pending records; a consumed Soroban intent's become confirmed authorized spend. Settled history is pruned after the retention window once its approval ends; open and claimed records stay. A window state reset keeps every record whose approval can still be presented and settles a record that holds capacity as expired.
 - **Key**: the profile's `policy_window_state_key_id` keyring coordinate (`stellar-agent-policy-window-<profile>` by convention), lazily minted on first write.
 - **Lock**: `WindowStoreLock`, an OFD-advisory exclusive lock on a file in the policy-state directory named by the window-state keyring entry, serializes every read-modify-write (record, reset, resign, authorization transitions) across processes; every store handle and every pin operation over one entry takes the same lock, whatever store path it names. It lives in `stellar-agent-core::policy::state_lock`, and the policy pin at `(<window service>, <window account>-policy-pin)` is read and compared under it. The verified policy advance writes the pin under the same lock. Without `test-helpers`, no public function writes a pin the caller composes.
@@ -1439,6 +1439,17 @@ only as that window ages it out.
 Transaction consumption turns its holds into submission pending records.
 Authorization records and submission holds are distinct.
 
+An authorization can link one attempt of an operation record. The mint stores
+the link, and it refuses a link to an operation the window does not hold, to
+an ended operation, or to an attempt outside the allowance. Consumption marks a
+linked record `used`. Expiry of an unclaimed record marks it `unused` with an
+`Always` release row of class `proved_unspent`; a claimed record gets neither.
+A reset settles an unclaimed record that holds capacity the same way. A release
+row names its class (`proved_unspent`, `settled`, `unknown` or
+`retired_unused`), its bound (a ledger, a close time or `Always`), the ledger
+it observed, and the commit that wrote it. A linked record without a release
+row survives pruning and reset.
+
 Consumption rereads the policy pin under the lock and checks profile and chain.
 A second consume refuses without rewriting the store. Consumption accepts open
 and claimed records. Invalidation releases holds only before the signing claim;
@@ -1506,6 +1517,84 @@ reset with `profile.reset_window_state_newer_version`; use a build that
 understands it.
 
 Reset also refuses while a signed intent stands, with `submission.record_unavailable`, and changes nothing.
+
+### Operation records
+
+A mainnet operation record holds one value call under the caller's business
+id. A business id has 1 to 64 bytes, each from 0x21 to 0x7E. An empty id
+refuses with `validation.business_id_required` and any other malformed id
+with `validation.business_id_invalid`. The retained records and tombstones of
+a profile hold each business id at most once. A business id is reusable only
+after its tombstone leaves the window.
+
+The record stores the intent slot: an envelope hash, a canonical intent or an
+x402 intent, each with the caller's intent digest. The store compares the slot
+kind and the digest and never computes a digest itself. Opening a known
+business id returns the record to resume, the result of an ended record, or
+`Conflict` for another slot kind or digest. A record over an envelope keeps
+the stored envelope on retry, and another envelope for it refuses with
+`operation.business_id_conflict`.
+
+The states are `prepared`, `awaiting_approval`, `authorized`, `sending`,
+`not_sent`, `sent_outcome_unknown`, `payload_released`, `succeeded`, `failed`,
+`not_included`, `expired` and `cancelled`. One edge table admits each step,
+and every other edge refuses with `internal.unexpected_state`. `prepared` and
+`awaiting_approval` wait for authority; at most 16 records wait at once.
+`not_included` admits a further attempt, up to eight; an attempt while one is
+open refuses with `operation.attempt_open` and a ninth with
+`operation.attempt_limit`.
+
+An operation step expires a linked open authorization and adopts its waiting
+record into `authorized` in one commit. A writer that keeps no operation audit
+leaves every authorization linked to a record that has not ended untouched,
+holds included, until an operation step runs. An exposure needs its
+authorization claimed or used, and no releasing row is written for an
+authorization an exposure names. A `sending` attempt without an exposure moves
+to `not_sent` once its authorization has left `Open` without ever being claimed.
+A claimed attempt without an exposure stays `sending`. A remint retires an
+unused, unexposed authorization with a `retired_unused` row in the commit that
+mints its successor; an exposed authorization refuses retirement. An approval
+nonce carries a remint only while every earlier authorization under it was
+never claimed and no exposure names it. Once an operation ends, every linked
+authorization that was never claimed and is not exposed gets a
+`proved_unspent` row in that commit.
+
+The operator clear moves `sent_outcome_unknown` to `cancelled` and writes the
+last exposed attempt's release row of class `unknown` in the same commit: an
+`Always` row for an exposure without `max_time`, or a `CloseTime` row at
+`max_time` in milliseconds for one with it.
+
+A new record refuses with `operation.capacity` when its envelope, intent slot
+or record exceeds its bound, when 16 records wait, or when the committed file
+reached 1,179,648 bytes. One record stays within 184,365 bytes. Free text is
+measured in serialized bytes; an overlong text keeps its SHA-256 hex digest
+and `truncated: true`. A record keeps its first history entry and the latest
+31, up to eight evidence rows per attempt, and up to 36 commit identifiers.
+Later steps never refuse by size.
+
+An ended record stays for seven days, and at most 256 stay. A record whose
+linked authorizations lack a release row stays until each has one, beyond
+that cap. A compacted record leaves a tombstone with its business id, slot
+kind, digest and result for 30 days, at most 1,024. The oldest eligible entry
+leaves first.
+
+Every removal of a release row with a ledger or close-time bound raises the
+window's admissible floors to at least that bound in the same commit. An
+`Always` row raises nothing. Floors never decrease. A mainnet window reset
+clears both.
+
+Reset refuses with `reset.operations_open` while a record has not ended once
+the expiry edges apply at the store clock, before either callback and before
+any write. The successor keeps the records and tombstones as stored, so an
+expiry the reset counted is committed by the next operation step with its
+audit row. It also keeps every linked authorization without a release row.
+
+Each step appends an `operation_transition` audit row, and each commit that
+adds evidence or a first sequence release appends one `operation_evidence`
+row, before the window write. A failed append refuses with
+`audit.append_failed` and commits nothing. Each try draws a fresh 16-byte
+random commit identifier. Evidence rows take contiguous sequence numbers from
+the record's watermark. A chain observation writes no audit row.
 
 ### Operator authorization logs
 

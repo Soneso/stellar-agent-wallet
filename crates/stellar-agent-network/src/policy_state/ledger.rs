@@ -56,6 +56,9 @@ use stellar_agent_core::profile::caip2::Caip2;
 use stellar_agent_core::profile::schema::Profile;
 
 use super::WindowStoreError;
+use super::operations::{
+    self, CommitId, Disposition, OperationId, OperationLink, ReleaseClass, ReleaseRow,
+};
 use super::store::{
     PersistedWindowStore, RecordStatus, WIRE_VERSION_LEDGER, WireBucket, WireFile, WireRecord,
     admit, file_holds_id, find_or_insert_bucket, generation_entry_ref, i128_decimal_str, now_ms,
@@ -83,11 +86,16 @@ fn check(holds: bool, precondition: MainnetPrecondition) -> Result<(), WindowSto
     require(holds, precondition).map_err(|_| refused(precondition))
 }
 
-/// Serde adapter for an optional 32-byte value stored as lowercase hex.
-mod opt_hex32 {
+/// Serde adapter for an optional 32-byte value stored as lowercase hex,
+/// shared by the ledger and the operation records.
+pub(super) mod opt_hex32 {
     use serde::{Deserialize as _, Deserializer, Serializer};
 
-    pub(super) fn serialize<S: Serializer>(
+    #[allow(
+        clippy::ref_option,
+        reason = "serde's field adapter receives a reference to the field"
+    )]
+    pub(in crate::policy_state) fn serialize<S: Serializer>(
         value: &Option<[u8; 32]>,
         s: S,
     ) -> Result<S::Ok, S::Error> {
@@ -97,7 +105,7 @@ mod opt_hex32 {
         }
     }
 
-    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+    pub(in crate::policy_state) fn deserialize<'de, D: Deserializer<'de>>(
         d: D,
     ) -> Result<Option<[u8; 32]>, D::Error> {
         let text = Option::<String>::deserialize(d)?;
@@ -437,7 +445,7 @@ pub(super) enum AuthorizationState {
 }
 
 impl AuthorizationState {
-    fn holds(self) -> bool {
+    pub(super) fn holds(self) -> bool {
         matches!(self, Self::Open | Self::Claimed)
     }
 }
@@ -506,6 +514,15 @@ pub(super) struct WireAuthorization {
     pub(super) consumption: Option<ConsumptionBinding>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) invalidation: Option<String>,
+    /// The operation attempt the authorization was minted for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) operation: Option<OperationLink>,
+    /// How the authorization ended: used once, or ended unused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) disposition: Option<Disposition>,
+    /// The release row of the authorization's native reservation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) native_release: Option<ReleaseRow>,
 }
 
 impl WireAuthorization {
@@ -536,7 +553,7 @@ impl WireAuthorization {
     /// The end of the record's authority in Unix milliseconds: the
     /// approval's expiry or the policy authority's governing end. A record
     /// without a single authority has none and keeps nothing alive.
-    fn authority_end_ms(&self) -> u64 {
+    pub(super) fn authority_end_ms(&self) -> u64 {
         self.authority()
             .map_or(0, |authority| authority.expires_at_ms())
     }
@@ -760,38 +777,114 @@ pub(super) fn validate(wire: &WireFile) -> Result<(), WindowStoreError> {
     Ok(())
 }
 
-/// Expires open and claimed authorizations. A claim's holds become confirmed
-/// spend dated at the claim, so only window aging releases that spend.
+/// What one expiry sweep changed.
+#[derive(Debug, Default)]
+pub(super) struct SweepOutcome {
+    /// Whether any authorization expired.
+    pub(super) swept: bool,
+    /// The waiting operations the sweep adopted into `Authorized`.
+    pub(super) adopted: Vec<OperationId>,
+}
+
+/// Expires open and claimed authorizations for a writer that keeps no
+/// operation audit, under a fresh commit identifier. An authorization that
+/// links a retained operation which has not ended stays untouched, holds
+/// included, until an operation step sweeps it; see [`sweep_expired_with`].
 pub(super) fn sweep_expired(wire: &mut WireFile, now_ms: u64) -> bool {
+    sweep(
+        wire,
+        now_ms,
+        CommitId::random(),
+        SweepScope::OutsideLiveOperations,
+    )
+    .swept
+}
+
+/// Expires open and claimed authorizations. A claim's holds become confirmed
+/// spend dated at the claim, so only window aging releases that spend; a
+/// claimed authorization keeps that conversion and gets no disposition.
+///
+/// An authorization expiring from `Open` first adopts the waiting operation
+/// it links into `Authorized`, then becomes expired with disposition
+/// `unused` and an `Always` release row of class `proved_unspent` under
+/// `commit`, all in the caller's commit. An authorization a committed
+/// exposure names gets neither: its reservation stays counted, and its holds
+/// become confirmed spend as a claim's do.
+pub(super) fn sweep_expired_with(
+    wire: &mut WireFile,
+    now_ms: u64,
+    commit: CommitId,
+) -> SweepOutcome {
+    sweep(wire, now_ms, commit, SweepScope::All)
+}
+
+/// Which expired authorizations one sweep settles.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SweepScope {
+    /// Every expired authorization; the operation step that runs it audits
+    /// each adoption.
+    All,
+    /// Every expired authorization except those linking a retained
+    /// operation that has not ended.
+    OutsideLiveOperations,
+}
+
+fn sweep(wire: &mut WireFile, now_ms: u64, commit: CommitId, scope: SweepScope) -> SweepOutcome {
+    let live = match scope {
+        SweepScope::All => Vec::new(),
+        SweepScope::OutsideLiveOperations => operations::live_operations(wire),
+    };
+    let exposed = operations::exposed_authorizations(wire);
     let mut swept = Vec::new();
+    let mut adopted = Vec::new();
     for auth in &mut wire.authorizations {
-        if auth.state.holds() && auth.expires_ms <= now_ms {
-            if let Some(claimed_ms) = auth.claimed_ms {
-                for hold in wire
-                    .holds
-                    .iter()
-                    .filter(|hold| hold.authorization_id == auth.id)
-                {
-                    retain_hold(
-                        &mut wire.entries,
-                        hold,
-                        WireRecord {
-                            chain_scope: Some(super::store::ChainScope::for_chain(auth.chain)),
-                            ts_ms: claimed_ms,
-                            amount: hold.amount,
-                            ..WireRecord::confirmed_defaults()
-                        },
-                    );
-                }
-            }
-            auth.state = AuthorizationState::Expired;
-            auth.settled_ms = Some(now_ms);
-            swept.push(auth.id);
+        if !auth.state.holds() || auth.expires_ms > now_ms {
+            continue;
         }
+        if auth
+            .operation
+            .is_some_and(|link| live.contains(&link.operation_id))
+        {
+            continue;
+        }
+        let is_exposed = exposed.contains(&auth.id);
+        if auth.claimed_ms.is_none() && !is_exposed {
+            if operations::adopt_on_expiry(&mut wire.operations, auth, now_ms, commit)
+                && let Some(link) = auth.operation
+            {
+                adopted.push(link.operation_id);
+            }
+            auth.disposition = Some(Disposition::Unused);
+            auth.native_release = Some(ReleaseRow::always(ReleaseClass::ProvedUnspent, commit));
+        } else {
+            let spent_ms = auth.claimed_ms.unwrap_or(auth.minted_ms);
+            for hold in wire
+                .holds
+                .iter()
+                .filter(|hold| hold.authorization_id == auth.id)
+            {
+                retain_hold(
+                    &mut wire.entries,
+                    hold,
+                    WireRecord {
+                        chain_scope: Some(super::store::ChainScope::for_chain(auth.chain)),
+                        ts_ms: spent_ms,
+                        amount: hold.amount,
+                        ..WireRecord::confirmed_defaults()
+                    },
+                );
+            }
+        }
+        auth.state = AuthorizationState::Expired;
+        auth.settled_ms = Some(now_ms);
+        swept.push(auth.id);
     }
     wire.holds
         .retain(|hold| !swept.contains(&hold.authorization_id));
-    !swept.is_empty()
+    SweepOutcome {
+        swept: !swept.is_empty(),
+        adopted,
+    }
 }
 
 /// Records `record` as retained spend in the window bucket `hold` reserved.
@@ -805,38 +898,68 @@ fn retain_hold(entries: &mut Vec<WireBucket>, hold: &WireAuthorizationHold, reco
     find_or_insert_bucket(entries, &key).records.push(record);
 }
 
+/// Whether settled history ages out: settled before `cutoff`, with an
+/// authority that ends at or before `now_ms`. Open and claimed records never
+/// do.
+pub(super) fn prunable(auth: &WireAuthorization, cutoff: u64, now_ms: u64) -> bool {
+    !(auth.state.holds()
+        || auth.authority_end_ms() > now_ms
+        || auth.settled_ms.is_some_and(|t| t >= cutoff))
+}
+
 /// Drops settled authorization history older than `cutoff` whose authority
 /// ends at or before `now_ms`: the approval's expiry, or a policy authority's
-/// governing end. Open and claimed records stay whatever their age.
+/// governing end. Open and claimed records stay whatever their age, and so
+/// does an authorization an operation links until it has a release row. The
+/// removal raises the window's admissible floors.
 pub(super) fn prune_history(wire: &mut WireFile, cutoff: u64, now_ms: u64) {
-    wire.authorizations.retain(|auth| {
-        auth.state.holds()
-            || auth.authority_end_ms() > now_ms
-            || auth.settled_ms.is_some_and(|t| t >= cutoff)
+    operations::remove_authorizations(wire, |auth| {
+        prunable(auth, cutoff, now_ms) && !operations::unreleased_link(auth)
     });
 }
 
 /// The authorization records a window state reset keeps: every record whose
 /// authority can still be presented at `now_ms`, by the approval's expiry or
-/// a policy authority's governing end. The successor holds no holds, so a
-/// record that holds capacity becomes expired at `now_ms`.
+/// a policy authority's governing end, and every record an operation links
+/// that has no release row. The successor holds no holds, so a record that
+/// holds capacity becomes expired at `now_ms`. As in the sweep, a record that
+/// was never claimed and that no committed exposure names also becomes
+/// unused with an `Always` release row. A record linking a retained
+/// operation that has not ended stays as it is, since the reset keeps no
+/// operation audit.
 pub(super) fn reset_survivors(wire: &WireFile, now_ms: u64) -> Vec<WireAuthorization> {
+    let commit = CommitId::random();
+    let exposed = operations::exposed_authorizations(wire);
+    let live = operations::live_operations(wire);
     wire.authorizations
         .iter()
-        .filter(|auth| auth.authority_end_ms() > now_ms)
-        .map(|auth| {
+        .filter_map(|auth| {
+            if auth
+                .operation
+                .is_some_and(|link| live.contains(&link.operation_id))
+            {
+                return Some(auth.clone());
+            }
+            if auth.authority_end_ms() <= now_ms && !operations::unreleased_link(auth) {
+                return None;
+            }
             let mut kept = auth.clone();
             if kept.state.holds() {
+                if kept.claimed_ms.is_none() && !exposed.contains(&kept.id) {
+                    kept.disposition = Some(Disposition::Unused);
+                    kept.native_release =
+                        Some(ReleaseRow::always(ReleaseClass::ProvedUnspent, commit));
+                }
                 kept.state = AuthorizationState::Expired;
                 kept.settled_ms = Some(now_ms);
             }
-            kept
+            Some(kept)
         })
         .collect()
 }
 
 /// Whether `auth` is open or claimed and inside its lifetime at `now_ms`.
-fn effective(auth: &WireAuthorization, now_ms: u64) -> bool {
+pub(super) fn effective(auth: &WireAuthorization, now_ms: u64) -> bool {
     auth.state.holds() && auth.minted_ms <= now_ms && now_ms < auth.expires_ms
 }
 
@@ -884,6 +1007,20 @@ pub struct MintRequest {
     /// authenticated x402 intent, which shares its approval. Absent for every
     /// other record.
     pub parent: Option<AuthorizationId>,
+    /// The operation attempt the authorization serves; the operation must
+    /// be retained and open. Absent for a mint outside an operation.
+    pub operation: Option<OperationLink>,
+}
+
+/// How a mint inside an operation step relaxes the stand-alone rules.
+#[derive(Debug, Clone, Copy, Default)]
+pub(super) struct MintOptions {
+    /// A successor attempt's mint does not count against
+    /// [`MAX_OPEN_AUTHORIZATIONS`].
+    pub(super) exempt_cap: bool,
+    /// The operation whose earlier, unused authorizations may carry the
+    /// same approval nonce.
+    pub(super) lineage: Option<OperationId>,
 }
 
 /// The policy authority a record is minted under: the decision that allowed
@@ -1525,7 +1662,195 @@ fn apply_consumption(
         auth.state = AuthorizationState::Used;
         auth.settled_ms = Some(now);
         auth.consumption = Some(binding.clone());
+        if auth.operation.is_some() {
+            auth.disposition = Some(Disposition::Used);
+        }
     }
+}
+
+/// Records a checked mint in `wire`: the authorization, its holds and its
+/// reservation, expiring at `expires`, on the store clock `now`.
+///
+/// No open authorization may name the same domain and content; a
+/// continuation must continue a used parent of the same profile, chain,
+/// consumer, policy and authority that has no child yet; every other request
+/// under an approval carries a nonce that appears on no record within
+/// retention, except on earlier unused records of `options.lineage`'s
+/// operation; at most [`MAX_OPEN_AUTHORIZATIONS`] may be open unless
+/// `options.exempt_cap`; a link must name a retained, open operation; and
+/// the holds must be admitted against the window.
+///
+/// # Errors
+///
+/// [`WindowStoreError::AuthorizationRefused`] naming the broken
+/// precondition, [`WindowStoreError::PolicyDenied`] when the window cannot
+/// admit the holds, and [`WindowStoreError::UnexpectedState`] for a link to
+/// an operation the window does not hold open.
+pub(super) fn mint_into(
+    wire: &mut WireFile,
+    profile: &Profile,
+    request: &MintRequest,
+    now: u64,
+    expires: u64,
+    options: MintOptions,
+) -> Result<MintedRecord, WindowStoreError> {
+    use MainnetPrecondition as P;
+    let domain = request.binding.domain();
+    let content = request.binding.content_digest();
+    check(
+        !wire.authorizations.iter().any(|auth| {
+            auth.state.holds() && auth.domain == domain && auth.content_digest == content
+        }),
+        P::DuplicateOpen,
+    )?;
+    match request.parent {
+        Some(parent_id) => {
+            let parent = wire.authorizations.iter().find(|auth| auth.id == parent_id);
+            check(
+                parent.is_some_and(|parent| {
+                    parent.state == AuthorizationState::Used
+                        && Some(parent.domain) == parent_domain(domain)
+                        && parent.profile
+                            == stellar_agent_core::profile::name::profile_name_for_approval(profile)
+                        && parent.chain == request.chain
+                        && parent.consumer == request.consumer
+                        && parent.policy_sequence == request.policy_sequence
+                        && parent.policy_digest == request.policy_digest
+                        && parent
+                            .authority()
+                            .is_ok_and(|authority| authority == request.authority)
+                }),
+                P::IntentRecordMismatch,
+            )?;
+            check(
+                !wire
+                    .authorizations
+                    .iter()
+                    .any(|auth| auth.parent == Some(parent_id)),
+                P::IntentRecordMismatch,
+            )?;
+        }
+        None => {
+            if let MintAuthority::Approval { nonce, .. } = &request.authority {
+                let exposed = operations::exposed_authorizations(wire);
+                check(
+                    !wire.authorizations.iter().any(|auth| {
+                        auth.approval_nonce.as_ref() == Some(nonce)
+                            && !earlier_unused_carrier(auth, options.lineage, &exposed)
+                    }),
+                    P::ApprovalNonceReused,
+                )?;
+            }
+        }
+    }
+    if let Some(link) = request.operation {
+        operations::check_mint_link(wire, link)?;
+    }
+    check(
+        options.exempt_cap
+            || wire
+                .authorizations
+                .iter()
+                .filter(|auth| auth.state.holds())
+                .count()
+                < MAX_OPEN_AUTHORIZATIONS,
+        P::TooManyOpen,
+    )?;
+    admit(wire, &request.holds)?;
+
+    let id = loop {
+        let candidate = AuthorizationId::random();
+        if !wire.authorizations.iter().any(|auth| auth.id == candidate) {
+            break candidate;
+        }
+    };
+    let profile_name = stellar_agent_core::profile::name::profile_name_for_approval(profile);
+    let reservation = match HoldKind::of(domain) {
+        Some(kind) if !request.holds.is_empty() => {
+            for (ordinal, entry) in request.holds.iter().enumerate() {
+                let entry_key = entry.key();
+                wire.holds.push(WireAuthorizationHold {
+                    kind,
+                    authorization_id: id,
+                    ordinal: u32::try_from(ordinal).map_err(|_| refused(P::HoldsMismatch))?,
+                    scope_specificity: entry_key.scope_specificity(),
+                    bucket: entry_key.bucket().to_owned(),
+                    window_secs: entry_key.window_secs(),
+                    ts_ms: entry.timestamp_ms(),
+                    amount: entry.amount(),
+                });
+            }
+            Some(id)
+        }
+        _ => None,
+    };
+    let mut bindings = request.bindings;
+    bindings.reservation = reservation.map(|id| {
+        WindowReservation {
+            id,
+            profile: profile_name.clone(),
+        }
+        .fact_digest()
+    });
+    let bindings_digest = bindings_digest(&bindings);
+    let (approval_nonce, approval_expires_ms, policy_authority) =
+        wire_authority(&request.authority);
+    wire.authorizations.push(WireAuthorization {
+        id,
+        profile: profile_name.clone(),
+        chain: request.chain,
+        domain,
+        consumer: request.consumer,
+        content_digest: content,
+        binding: request.binding.clone(),
+        state: AuthorizationState::Open,
+        minted_ms: now,
+        expires_ms: expires,
+        settled_ms: None,
+        claimed_ms: None,
+        policy_sequence: request.policy_sequence,
+        policy_digest: request.policy_digest,
+        approval_nonce,
+        approval_expires_ms,
+        policy_authority,
+        bindings_digest,
+        entries_digest: entries_digest(&request.holds),
+        reservation,
+        parent: request.parent,
+        consumption: None,
+        invalidation: None,
+        operation: request.operation,
+        disposition: None,
+        native_release: None,
+    });
+    Ok(MintedRecord {
+        bindings_digest,
+        id,
+        issued_at_ms: now,
+        expires_at_ms: expires,
+        reservation: reservation.map(|id| WindowReservation {
+            id,
+            profile: profile_name,
+        }),
+    })
+}
+
+/// Whether `auth` is an earlier authorization of `lineage`'s operation that
+/// ended unused: never claimed, with disposition `unused`, and named by no
+/// committed exposure, so no transaction was signed under it and its
+/// approval nonce may carry a remint of the same operation.
+fn earlier_unused_carrier(
+    auth: &WireAuthorization,
+    lineage: Option<OperationId>,
+    exposed: &[AuthorizationId],
+) -> bool {
+    lineage.is_some_and(|operation| {
+        auth.operation
+            .is_some_and(|link| link.operation_id == operation)
+            && auth.claimed_ms.is_none()
+            && auth.disposition == Some(Disposition::Unused)
+            && !exposed.contains(&auth.id)
+    })
 }
 
 #[cfg(test)]
@@ -1586,8 +1911,52 @@ impl PersistedWindowStore {
         profile: &Profile,
         request: &MintRequest,
     ) -> Result<MintedRecord, WindowStoreError> {
-        use MainnetPrecondition as P;
         let lock = self.ledger_lock(profile)?;
+        let now = now_ms()?;
+        let expires = self.mint_prechecks(&lock, profile, request, now)?;
+
+        let (key, _mint) = self.load_or_mint_key(profile)?;
+        let gen_entry = generation_entry_ref(profile);
+        let original = self.read_verified(profile, &key, &gen_entry)?;
+        #[cfg(test)]
+        if let Some(hook) = MINT_AFTER_READ.with_borrow_mut(Option::take) {
+            hook();
+        }
+        let mut wire = original.clone();
+        sweep_expired(&mut wire, now);
+        let minted = mint_into(
+            &mut wire,
+            profile,
+            request,
+            now,
+            expires,
+            MintOptions::default(),
+        )?;
+        prune_stale(&mut wire, now);
+        self.commit_generation(&key, &gen_entry, original, wire)?;
+        drop(lock);
+        Ok(minted)
+    }
+
+    /// The mint checks that precede the window key, on the store clock
+    /// `now`, under `lock`: the chain, the bindings, the consumer, the holds,
+    /// the parent, the policy authority, the lifetime and the policy pin.
+    /// Returns the authorization's expiry: the earliest of `now` plus the
+    /// lifetime, the end of the authority, and the envelope's on-chain
+    /// deadline.
+    ///
+    /// # Errors
+    ///
+    /// [`WindowStoreError::AuthorizationRefused`] naming the broken
+    /// precondition, and the pin's keyring and integrity errors.
+    pub(super) fn mint_prechecks(
+        &self,
+        lock: &WindowStoreLock,
+        profile: &Profile,
+        request: &MintRequest,
+        now: u64,
+    ) -> Result<u64, WindowStoreError> {
+        use MainnetPrecondition as P;
         check(request.chain.is_mainnet(), P::ChainNotMainnet)?;
         check(request.chain == profile.chain_id, P::ChainMismatch)?;
         let domain = request.binding.domain();
@@ -1616,7 +1985,6 @@ impl PersistedWindowStore {
             request.parent.is_some() == requires_parent(domain, request.consumer),
             P::IntentRecordMismatch,
         )?;
-        let now = now_ms()?;
         check(
             request
                 .holds
@@ -1644,156 +2012,13 @@ impl PersistedWindowStore {
         check(expires > now, P::LifetimeInvalid)?;
 
         pin::compare(
-            &lock,
+            lock,
             &PinScope::for_profile(self.path(), profile),
             request.policy_sequence,
             &request.policy_digest,
         )
         .map_err(pin_refusal)?;
-
-        let (key, _mint) = self.load_or_mint_key(profile)?;
-        let gen_entry = generation_entry_ref(profile);
-        let original = self.read_verified(profile, &key, &gen_entry)?;
-        #[cfg(test)]
-        if let Some(hook) = MINT_AFTER_READ.with_borrow_mut(Option::take) {
-            hook();
-        }
-        let mut wire = original.clone();
-        sweep_expired(&mut wire, now);
-
-        let content = request.binding.content_digest();
-        check(
-            !wire.authorizations.iter().any(|auth| {
-                auth.state.holds() && auth.domain == domain && auth.content_digest == content
-            }),
-            P::DuplicateOpen,
-        )?;
-        match request.parent {
-            Some(parent_id) => {
-                let parent = wire.authorizations.iter().find(|auth| auth.id == parent_id);
-                check(
-                    parent.is_some_and(|parent| {
-                        parent.state == AuthorizationState::Used
-                            && Some(parent.domain) == parent_domain(domain)
-                            && parent.profile
-                                == stellar_agent_core::profile::name::profile_name_for_approval(
-                                    profile,
-                                )
-                            && parent.chain == request.chain
-                            && parent.consumer == request.consumer
-                            && parent.policy_sequence == request.policy_sequence
-                            && parent.policy_digest == request.policy_digest
-                            && parent
-                                .authority()
-                                .is_ok_and(|authority| authority == request.authority)
-                    }),
-                    P::IntentRecordMismatch,
-                )?;
-                check(
-                    !wire
-                        .authorizations
-                        .iter()
-                        .any(|auth| auth.parent == Some(parent_id)),
-                    P::IntentRecordMismatch,
-                )?;
-            }
-            None => {
-                if let MintAuthority::Approval { nonce, .. } = &request.authority {
-                    check(
-                        !wire
-                            .authorizations
-                            .iter()
-                            .any(|auth| auth.approval_nonce.as_ref() == Some(nonce)),
-                        P::ApprovalNonceReused,
-                    )?;
-                }
-            }
-        }
-        check(
-            wire.authorizations
-                .iter()
-                .filter(|auth| auth.state.holds())
-                .count()
-                < MAX_OPEN_AUTHORIZATIONS,
-            P::TooManyOpen,
-        )?;
-        admit(&wire, &request.holds)?;
-
-        let id = loop {
-            let candidate = AuthorizationId::random();
-            if !wire.authorizations.iter().any(|auth| auth.id == candidate) {
-                break candidate;
-            }
-        };
-        let profile_name = stellar_agent_core::profile::name::profile_name_for_approval(profile);
-        let reservation = match HoldKind::of(domain) {
-            Some(kind) if !request.holds.is_empty() => {
-                for (ordinal, entry) in request.holds.iter().enumerate() {
-                    let entry_key = entry.key();
-                    wire.holds.push(WireAuthorizationHold {
-                        kind,
-                        authorization_id: id,
-                        ordinal: u32::try_from(ordinal).map_err(|_| refused(P::HoldsMismatch))?,
-                        scope_specificity: entry_key.scope_specificity(),
-                        bucket: entry_key.bucket().to_owned(),
-                        window_secs: entry_key.window_secs(),
-                        ts_ms: entry.timestamp_ms(),
-                        amount: entry.amount(),
-                    });
-                }
-                Some(id)
-            }
-            _ => None,
-        };
-        let mut bindings = request.bindings;
-        bindings.reservation = reservation.map(|id| {
-            WindowReservation {
-                id,
-                profile: profile_name.clone(),
-            }
-            .fact_digest()
-        });
-        let bindings_digest = bindings_digest(&bindings);
-        let (approval_nonce, approval_expires_ms, policy_authority) =
-            wire_authority(&request.authority);
-        wire.authorizations.push(WireAuthorization {
-            id,
-            profile: profile_name.clone(),
-            chain: request.chain,
-            domain,
-            consumer: request.consumer,
-            content_digest: content,
-            binding: request.binding.clone(),
-            state: AuthorizationState::Open,
-            minted_ms: now,
-            expires_ms: expires,
-            settled_ms: None,
-            claimed_ms: None,
-            policy_sequence: request.policy_sequence,
-            policy_digest: request.policy_digest,
-            approval_nonce,
-            approval_expires_ms,
-            policy_authority,
-            bindings_digest,
-            entries_digest: entries_digest(&request.holds),
-            reservation,
-            parent: request.parent,
-            consumption: None,
-            invalidation: None,
-        });
-        prune_stale(&mut wire, now);
-        self.commit_generation(&key, &gen_entry, original, wire)?;
-        drop(lock);
-        Ok(MintedRecord {
-            bindings_digest,
-            id,
-            issued_at_ms: now,
-            expires_at_ms: expires,
-            reservation: reservation.map(|id| WindowReservation {
-                id,
-                profile: profile_name,
-            }),
-        })
+        Ok(expires)
     }
 
     /// Durably claims an open authorization before its signature is requested.
@@ -2216,6 +2441,7 @@ mod tests {
                 },
                 holds,
                 parent: None,
+                operation: None,
             }
         }
 
@@ -4276,8 +4502,12 @@ mod tests {
     enum Kept {
         /// Equal to the record before the reset.
         Unchanged,
-        /// Expired and settled at the store clock.
+        /// Expired and settled at the store clock, unused, with an `Always`
+        /// release row.
         Settled,
+        /// Expired and settled at the store clock after a claim, without a
+        /// disposition.
+        SettledClaimed,
     }
 
     /// A mint of another binding that copies `request`'s approval nonce.
@@ -4334,7 +4564,7 @@ mod tests {
             ),
             ("expired", open, T0 + TTL_MS, Kept::Settled, false),
             ("open", open, T0 + 10_000, Kept::Settled, true),
-            ("claimed", claimed, T0 + 10_000, Kept::Settled, true),
+            ("claimed", claimed, T0 + 10_000, Kept::SettledClaimed, true),
         ];
         for (name, setup, clock, kept, holds_capacity) in cases {
             let l = Ledger::new();
@@ -4366,6 +4596,16 @@ mod tests {
             let expected = match kept {
                 Kept::Unchanged => before,
                 Kept::Settled => WireAuthorization {
+                    state: AuthorizationState::Expired,
+                    settled_ms: Some(clock),
+                    disposition: Some(Disposition::Unused),
+                    native_release: Some(ReleaseRow::always(
+                        ReleaseClass::ProvedUnspent,
+                        wire.authorizations[0].native_release.unwrap().commit_id,
+                    )),
+                    ..before
+                },
+                Kept::SettledClaimed => WireAuthorization {
                     state: AuthorizationState::Expired,
                     settled_ms: Some(clock),
                     ..before
@@ -4651,6 +4891,9 @@ mod tests {
             parent: None,
             consumption: None,
             invalidation: None,
+            operation: None,
+            disposition: None,
+            native_release: None,
         }
     }
 
@@ -6513,5 +6756,92 @@ mod tests {
             );
             assert_eq!(survivors.len(), usize::from(kept));
         }
+    }
+
+    /// Discards every row, for a test that only reads the window.
+    struct NullAudit;
+
+    impl crate::policy_state::operations::OperationAudit for NullAudit {
+        fn append(
+            &mut self,
+            _entry: stellar_agent_core::audit_log::AuditEntry,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    /// A mint stores the operation link it names, and a link to an
+    /// operation the window does not hold, or to an attempt outside the
+    /// allowance, refuses without a write.
+    #[test]
+    #[serial]
+    fn mint_stores_the_operation_link() {
+        use crate::policy_state::operations::{
+            BusinessId, IntentSlot, OpenOutcome, OpenRequest, OperationKind, OperationRecorder,
+            OperationTool,
+        };
+        let l = Ledger::new();
+        let mut audit = NullAudit;
+        let opened = OperationRecorder::new(&l.store, &l.profile, &mut audit, "request-1")
+            .open(&OpenRequest {
+                business_id: BusinessId::parse("order-1").unwrap(),
+                tool: OperationTool::CliPay,
+                kind: OperationKind::Pay,
+                intent: IntentSlot::Canonical {
+                    intent_digest: [1; 32],
+                    intent: serde_json::json!({ "op": "pay" }),
+                },
+                envelope_xdr: Some("AAAASTORED".to_owned()),
+                prepared_decision: None,
+                rule_ttl_ms: None,
+            })
+            .unwrap();
+        let OpenOutcome::New(handle) = opened else {
+            panic!("expected a new record, got {opened:?}");
+        };
+        let link = OperationLink {
+            operation_id: handle.id(),
+            attempt_index: 1,
+        };
+        let before = l.bytes();
+        for stray in [
+            OperationLink {
+                operation_id: OperationId::random(),
+                attempt_index: 1,
+            },
+            OperationLink {
+                attempt_index: 0,
+                ..link
+            },
+            OperationLink {
+                attempt_index: 9,
+                ..link
+            },
+        ] {
+            let mut request = l.request(tx(1), vec![]);
+            request.operation = Some(stray);
+            assert!(
+                matches!(
+                    l.mint(&request),
+                    Err(WindowStoreError::UnexpectedState { .. })
+                ),
+                "{stray:?}"
+            );
+            assert_eq!(l.bytes(), before);
+        }
+        let mut request = l.request(tx(1), vec![]);
+        request.operation = Some(link);
+        let minted = l.mint(&request).unwrap();
+        assert_eq!(l.record(minted.id).operation, Some(link));
+        let reopened = PersistedWindowStore::at_path(l.store.path().to_owned());
+        let stored = reopened
+            .read_for_inspection(&l.profile)
+            .unwrap()
+            .unwrap()
+            .authorizations
+            .into_iter()
+            .find(|auth| auth.id == minted.id)
+            .unwrap();
+        assert_eq!(stored.operation, Some(link));
     }
 }

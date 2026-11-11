@@ -189,9 +189,17 @@
 //!
 //! A signed intent counts from its admission before the first signature.
 //! Envelope cancellation, unwinding and reconciliation never release it.
+//!
+//! Operation records follow [`operations`]: a terminal record keeps its full
+//! form for seven days, at most 256 such records stay, and older ones become
+//! tombstones kept for 30 days, at most 1,024. A record whose authorization
+//! has no release row stays whatever its age, and so does that authorization.
+//! Removing an authorization with a ledger or close-time release bound raises
+//! the window's admissible floors in the same commit.
 
 pub mod ledger;
 pub mod lock;
+pub mod operations;
 pub mod store;
 
 use lock::StateLockError;
@@ -200,6 +208,16 @@ pub use ledger::{
     ClaimExpect, ConsumeExpect, ConsumeReceipt, ConsumptionBinding, DomainBinding, FeeBumpFacts,
     MAX_OPEN_AUTHORIZATIONS, MintAuthority, MintRequest, MintedRecord, OpenAuthorization,
     PolicyAuthorityBinding, SubmissionBinding, WindowReservation,
+};
+pub use operations::{
+    AdmissibleFloors, AgreedOutcome, AttemptAuthorization, AttemptEnvelope, AttemptRequest,
+    AttemptStarted, BoundedText, BusinessId, CapacityDetail, ClearForm, CommitId, EndpointCoverage,
+    EvidenceAnswer, EvidenceAuditFacts, EvidenceClassification, EvidenceEndpoint, EvidenceInput,
+    EvidenceRowInput, EvidenceSequenceClass, EvidenceVerdict, ExposureIdentity, IntentSlot,
+    NotIncludedProof, OpenOutcome, OpenRequest, OperationAudit, OperationAuthority,
+    OperationHandle, OperationId, OperationKind, OperationLink, OperationRecorder, OperationResult,
+    OperationState, OperationStatus, OperationTool, OperationView, RecoveryUpdate,
+    SequenceReleaseInput, SlotKind, TransitionEvidence, WindowObservation, X402Intent,
 };
 pub use store::{
     AccountingDecision, ChainScope, DeliveryReport, MintOutcome, OwedAccountingExpiries,
@@ -512,6 +530,68 @@ pub enum WindowStoreError {
         defect: StateDefect,
     },
 
+    /// The business id names a retained operation or tombstone with another
+    /// intent digest or slot kind, or an attempt presents an envelope other
+    /// than the one its record holds. Nothing is written.
+    #[error(
+        "operation.business_id_conflict: the business id names a retained operation with \
+         another intent"
+    )]
+    BusinessIdConflict,
+
+    /// A commit presents a business id other than the one its preparation
+    /// opened. Nothing is written.
+    #[error(
+        "operation.business_id_mismatch: the business id differs from the one the \
+         preparation opened"
+    )]
+    BusinessIdMismatch,
+
+    /// A new operation record, its intent or its envelope exceeds an
+    /// allowance of the spending window, or an attempt's envelope does.
+    /// Nothing is written.
+    #[error("operation.capacity: the spending window cannot hold the operation ({detail})")]
+    OperationCapacity {
+        /// The exceeded limit.
+        detail: operations::CapacityDetail,
+    },
+
+    /// The operation already has an attempt in progress. Nothing is written.
+    #[error("operation.attempt_open: the operation already has an attempt in progress")]
+    AttemptOpen,
+
+    /// The operation has made every attempt it may make. Nothing is written.
+    #[error("operation.attempt_limit: the operation has made all of its attempts")]
+    AttemptLimit,
+
+    /// The reset refuses because an operation has not reached a terminal
+    /// state. The reset changes no window state.
+    #[error(
+        "reset.operations_open: the spending window holds {open} open operation(s); the reset \
+         refuses until each ends"
+    )]
+    OperationsOpen {
+        /// The number of operations outside a terminal state.
+        open: usize,
+    },
+
+    /// The audit row of an operation step could not be appended. The step
+    /// is not committed.
+    #[error("audit.append_failed: the operation step's audit row was not appended ({detail})")]
+    AuditAppendFailed {
+        /// The writer's failure. MUST NOT include key material.
+        detail: String,
+    },
+
+    /// An operation record reached a state its rules exclude: an edge
+    /// outside the state table, or a commit identifier beyond the record's
+    /// allowance. Nothing is written.
+    #[error("internal.unexpected_state: {detail}")]
+    UnexpectedState {
+        /// The broken rule.
+        detail: String,
+    },
+
     /// The reset of a mainnet profile's verifiable store refuses because a
     /// mainnet authorization is still open. The reset changes no window state.
     #[cfg(feature = "mainnet-write")]
@@ -553,10 +633,43 @@ impl WindowStoreError {
         }
     }
 
+    /// The wallet refusal an operation store failure names, when it names
+    /// one: the business id, capacity, attempt, reset, audit and state-rule
+    /// refusals of the operation section.
+    #[must_use]
+    pub fn operation_error(&self) -> Option<stellar_agent_core::error::WalletError> {
+        use stellar_agent_core::error::{InternalError, SubmissionError, ValidationError};
+        Some(match self {
+            Self::BusinessIdConflict => ValidationError::OperationBusinessIdConflict.into(),
+            Self::BusinessIdMismatch => ValidationError::OperationBusinessIdMismatch.into(),
+            Self::OperationCapacity { detail } => SubmissionError::OperationCapacity {
+                detail: detail.label(),
+            }
+            .into(),
+            Self::AttemptOpen => SubmissionError::OperationAttemptOpen.into(),
+            Self::AttemptLimit => SubmissionError::OperationAttemptLimit.into(),
+            Self::OperationsOpen { open } => {
+                ValidationError::ResetOperationsOpen { open: *open }.into()
+            }
+            Self::AuditAppendFailed { detail } => ValidationError::AuditAppendFailed {
+                detail: detail.clone(),
+            }
+            .into(),
+            Self::UnexpectedState { detail } => InternalError::UnexpectedState {
+                detail: detail.clone(),
+            }
+            .into(),
+            _ => return None,
+        })
+    }
+
     /// The business code for a state read or submission reservation refusal.
     #[must_use]
     pub fn submission_code(&self) -> &'static str {
-        self.chain_validation_error()
+        if let Some(error) = self.chain_validation_error() {
+            return error.code();
+        }
+        self.operation_error()
             .map_or("submission.record_unavailable", |error| error.code())
     }
 
