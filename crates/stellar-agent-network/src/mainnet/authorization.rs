@@ -2452,6 +2452,7 @@ mod tests {
                 authority: &authority,
                 audit: f.audit(),
                 store: &f.window,
+                operation: None,
             };
             let before = f.wire();
             policy_refusal(resolve_tx_sign(request(&other)).await.unwrap_err());

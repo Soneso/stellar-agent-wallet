@@ -17,8 +17,10 @@ use super::authorization::{
 use super::message::{MessageFacts, MessageUseReceipt};
 use super::{AuthorizationId, MainnetAuthorizationError, MainnetConsumer};
 use crate::{
-    MainnetWriteContext, StellarRpcClient, cross_check::CrossCheckWitness, keyring::EnrolledSigner,
-    policy_state::PersistedWindowStore,
+    MainnetWriteContext, StellarRpcClient,
+    cross_check::CrossCheckWitness,
+    keyring::EnrolledSigner,
+    policy_state::{OperationLink, PersistedWindowStore},
 };
 use std::time::Duration;
 use stellar_agent_core::approval::witness::ApprovedKind;
@@ -162,6 +164,12 @@ pub struct TxSignRequest<'a> {
     pub audit: AuditReadiness,
     /// Durable holds and authorization store.
     pub store: &'a PersistedWindowStore,
+    /// The operation attempt the authorization serves: `Some` when the
+    /// signing runs under an operation record, whose next attempt then
+    /// claims this authorization. The ledger stores the link with the
+    /// authorization, and the record admits only an authorization naming
+    /// its next attempt.
+    pub operation: Option<OperationLink>,
 }
 
 /// The network-bound invocation a Soroban payment authorizes.
@@ -209,6 +217,10 @@ pub struct SorobanIntentRequest<'a> {
     /// [`MainnetConsumer::X402Authenticated`] consumer, whose intent record
     /// names the used message record as its parent. Borrowed, not consumed.
     pub authenticated: Option<&'a MessageUseReceipt>,
+    /// The operation attempt the authorization serves: `Some` when the
+    /// payment runs under an operation record, whose next attempt then
+    /// claims this authorization.
+    pub operation: Option<OperationLink>,
 }
 
 /// Inputs for resolving one SEP-10 challenge signing for an authenticated
@@ -1131,7 +1143,7 @@ mod enabled {
             req.signer,
             now,
         )?;
-        let request = request(
+        let mut request = request(
             req.context,
             DomainBinding::Transaction {
                 unsigned_envelope_sha256: digest,
@@ -1151,6 +1163,7 @@ mod enabled {
             entries,
             Some(chain_deadline.saturating_mul(1000)),
         );
+        request.operation = req.operation;
         let minted = req
             .store
             .mint_authorization(req.context.profile(), &request)
@@ -1321,6 +1334,7 @@ mod enabled {
         // The ledger checks, under its lock, that the parent is the used
         // message record of the same approval.
         request.parent = authenticated.map(MessageUseReceipt::id);
+        request.operation = req.operation;
         let minted = req
             .store
             .mint_authorization(req.context.profile(), &request)
@@ -1690,6 +1704,7 @@ mod tests {
             authority,
             audit: f.audit(),
             store: &f.window,
+            operation: None,
         }
     }
 
@@ -2320,6 +2335,7 @@ mod tests {
             audit: f.audit(),
             store: &f.window,
             authenticated: None,
+            operation: None,
         }
     }
     async fn resolved_intent(
@@ -5490,6 +5506,7 @@ mod tests {
             audit: f.audit(),
             store: &f.window,
             authenticated: Some(&receipt),
+            operation: None,
         };
         match case {
             "no_receipt" => req.authenticated = None,

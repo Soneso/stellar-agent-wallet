@@ -38,6 +38,7 @@
 // vault, dex) and other i128-carrying wire fields.
 pub(crate) mod amount_wire;
 pub(crate) mod balances;
+pub(crate) mod business_entry;
 pub(crate) mod common;
 pub(crate) mod create_account;
 pub(crate) mod fee_stats;
@@ -97,6 +98,10 @@ mod x402_authenticated_mainnet_tests;
 // Mainnet consent at the commit boundary: presence-backed version 5 proofs only.
 #[cfg(all(test, feature = "mainnet-write"))]
 mod mainnet_presence_tests;
+
+// Business ids at the value tools: replay, conflict, mismatch and testnet echo.
+#[cfg(all(test, feature = "mainnet-write"))]
+mod operation_replay_tests;
 
 #[cfg(test)]
 pub(crate) mod identity_fixture;

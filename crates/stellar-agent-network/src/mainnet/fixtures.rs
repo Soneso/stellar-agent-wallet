@@ -12,6 +12,7 @@
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
+    clippy::panic,
     reason = "test fixtures; a failed setup is a failed test"
 )]
 #![cfg_attr(
@@ -50,7 +51,12 @@ use super::authorization::{
 use super::clock::{TestClockGuard, set_now_ms_for_test};
 use super::digest::{BindingFacts, approval_subject_classic};
 use super::{AuthorizationDomain, AuthorizationId, MainnetConsumer, SignerRole};
-use crate::policy_state::{DomainBinding, MintRequest, PersistedWindowStore};
+use crate::operation_entry;
+use crate::policy_state::{
+    BusinessId, DomainBinding, IntentSlot, MintRequest, OpenOutcome, OpenRequest, OperationKind,
+    OperationLink, OperationRecorder, OperationTool, PersistedWindowStore,
+};
+use crate::submission_record::OperationAttempt;
 use crate::submission_record::{AuditWriterHandle, SubmissionIntent, WalletSubmissionRecorder};
 use crate::submit::envelope_hash_hex;
 
@@ -497,6 +503,106 @@ impl LedgerFixture {
         nonce: &str,
         facts: VerifiedTipFacts,
     ) -> MainnetTxSignAuthorization {
+        self.mint_for(binding, holds, endpoint, nonce, facts, None)
+    }
+
+    /// An operation record binding the fixture's unsigned envelope under
+    /// `business_id`, as a mainnet verb sets it up before its signature. A
+    /// transaction authorization over `binding` holding `holds` links to the
+    /// record's first attempt, which is begun as `Sending`.
+    pub(crate) fn linked_attempt(
+        &self,
+        binding: DomainBinding,
+        holds: &[WindowEntry],
+        business_id: &str,
+    ) -> (OperationAttempt, MainnetTxSignAuthorization) {
+        let unsigned = unsigned_envelope();
+        let xdr = unsigned.envelope_xdr();
+        let handle = {
+            let mut guard = self.writer.lock().unwrap();
+            let opened =
+                OperationRecorder::new(&self.window, &self.profile, &mut *guard, "request")
+                    .open(&OpenRequest {
+                        business_id: BusinessId::parse(business_id).unwrap(),
+                        tool: OperationTool::CliPay,
+                        kind: OperationKind::Pay,
+                        intent: IntentSlot::Envelope {
+                            unsigned_envelope_sha256: operation_entry::unsigned_envelope_sha256(
+                                xdr,
+                            ),
+                            intent_digest: [7; 32],
+                            max_time: operation_entry::envelope_max_time(xdr).unwrap(),
+                        },
+                        envelope_xdr: Some(xdr.to_owned()),
+                        prepared_decision: None,
+                        rule_ttl_ms: None,
+                    })
+                    .unwrap();
+            let OpenOutcome::New(handle) = opened else {
+                panic!("a new business id opens a record: {opened:?}")
+            };
+            handle
+        };
+        let authorization = self.mint_for(
+            binding,
+            holds,
+            None,
+            "approval-1",
+            tip_facts(&self.writer),
+            Some(operation_entry::next_attempt_link(&handle)),
+        );
+        let attempt = operation_entry::begin_classic_attempt(
+            &self.window,
+            &self.profile,
+            &self.writer,
+            "request",
+            &handle,
+            xdr,
+        )
+        .unwrap();
+        (attempt, authorization)
+    }
+
+    /// The operation record `attempt` belongs to, as the window file holds
+    /// it.
+    pub(crate) fn operation_record(&self, attempt: OperationAttempt) -> serde_json::Value {
+        let bytes = std::fs::read(self.window.path()).unwrap();
+        let wire: serde_json::Value = serde_json::from_slice(&bytes[32..]).unwrap();
+        let id = serde_json::to_value(attempt.operation_id).unwrap();
+        wire["operations"]["records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|record| record["id"] == id)
+            .unwrap()
+            .clone()
+    }
+
+    /// The authorization record `id` as the window file holds it.
+    pub(crate) fn authorization_record(&self, id: AuthorizationId) -> serde_json::Value {
+        let bytes = std::fs::read(self.window.path()).unwrap();
+        let wire: serde_json::Value = serde_json::from_slice(&bytes[32..]).unwrap();
+        let id = serde_json::to_value(id).unwrap();
+        wire["authorizations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|record| record["id"] == id)
+            .unwrap()
+            .clone()
+    }
+
+    /// [`Self::mint_with_facts`] linked to the operation attempt `operation`
+    /// names, when one is given.
+    fn mint_for(
+        &self,
+        binding: DomainBinding,
+        holds: &[WindowEntry],
+        endpoint: Option<(String, u64)>,
+        nonce: &str,
+        facts: VerifiedTipFacts,
+        operation: Option<OperationLink>,
+    ) -> MainnetTxSignAuthorization {
         let mut header = header(
             self.claim_target(),
             &self.name,
@@ -533,7 +639,7 @@ impl LedgerFixture {
                     },
                     holds: holds.to_vec(),
                     parent: None,
-                    operation: None,
+                    operation,
                 },
             )
             .unwrap();

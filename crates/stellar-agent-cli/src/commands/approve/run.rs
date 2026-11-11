@@ -1664,7 +1664,8 @@ mod tests {
             )
             .unwrap();
             let mut args = serde_json::json!({"chain_id":"stellar:mainnet", "source":fixture.agent.g, "destination":DESTINATION,
-                "amount_in_stroops":"10", "asset":"native", "fee":"100"});
+                "amount_in_stroops":"10", "asset":"native", "fee":"100",
+                "business_id": crate::common::business_entry::fresh_business_id()});
             let response = server
                 .call_stellar_pay(serde_json::from_value(args.clone()).unwrap())
                 .await

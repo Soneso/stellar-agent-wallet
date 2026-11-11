@@ -137,6 +137,10 @@ use stellar_agent_stablecoin::{
     resolve::{DenominationInput, ResolvedAsset, resolve_denomination},
 };
 
+use crate::common::business_entry::{
+    BoundEnvelope, ClassicStart, bind_envelope, classic_start, entry_business_id,
+    mainnet_business_id, signing_envelope, write_replay,
+};
 use crate::common::mainnet_write::{
     MainnetWriteRequest, authorize_and_submit, mainnet_context, mainnet_profiles_dir,
     require_v1_engine,
@@ -149,6 +153,7 @@ use crate::common::render::{WithPreview, with_preview_detail, write_envelope};
 use crate::common::resolve_profile_name;
 use crate::common::signer_ceremony::MainnetSignerChoice;
 use stellar_agent_network::operational::read_within_readiness_deadline;
+use stellar_agent_network::policy_state::{OperationKind, OperationTool};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Argument types
@@ -219,6 +224,12 @@ pub struct TrustlineArgs {
     /// 30-second budget instead.
     #[arg(long, value_name = "SECONDS")]
     pub timeout_seconds: Option<u64>,
+    /// Business id naming this value operation: 1 to 64 printable ASCII
+    /// characters, no space. Required on mainnet, where a retry with the
+    /// same id prints the stored operation instead of doing new work; on
+    /// another network it is validated and echoed.
+    #[arg(long = "business-id", value_name = "ID")]
+    pub business_id: Option<String>,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -326,6 +337,11 @@ where
             ),
             1,
         );
+    }
+    // Off mainnet a supplied business id is validated and echoed, and no
+    // record exists.
+    if let Err(e) = entry_business_id(&profile, args.business_id.as_deref()) {
+        return write_envelope(out, &Envelope::<()>::err(&e), 1);
     }
 
     // ── GATE 1: resolve_denomination (D3 ordered refusal) ────────────────────
@@ -600,6 +616,10 @@ struct TrustlineSubmitted {
     ledger: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     cross_check: Option<CrossCheckView>,
+    /// The business id the run named, echoed off mainnet, where no record
+    /// exists. Absent when the run named none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    business_id: Option<String>,
 }
 
 /// Caps the built fee, obtains the cross-check witness of the source and the
@@ -749,6 +769,7 @@ where
         tx_hash,
         ledger,
         cross_check: Some(cross_check.view()),
+        business_id: args.business_id.clone(),
     })
 }
 
@@ -1335,6 +1356,57 @@ where
     )
     .await;
 
+    // The intent the business id binds needs the verified policy and the
+    // request facts only, so a retained operation answers before the
+    // envelope is built.
+    let policy = match load_mainnet_policy_engine(
+        "trustline",
+        "trustline.policy_engine_unavailable",
+        &context,
+        resolved.source,
+        &profiles_dir,
+    ) {
+        Ok(policy) => policy,
+        Err(envelope) => return write_envelope(out, &envelope, 1),
+    };
+    let fee_choice = match parse_classic_fee_choice(args.classic_base.as_deref()) {
+        Ok(choice) => choice,
+        Err(e) => {
+            return write_envelope(
+                out,
+                &Envelope::<()>::err_raw("trustline.invalid_fee", e.code().to_string()),
+                1,
+            );
+        }
+    };
+    // The id is checked where the run first needs it, after every refusal
+    // a run without one gives, so their codes stay.
+    let business_id = match mainnet_business_id(args.business_id.as_deref()) {
+        Ok(id) => id,
+        Err(e) => return write_envelope(out, &Envelope::<()>::err(&e), 1),
+    };
+    let operation = match classic_start(
+        &context,
+        &policy,
+        business_id,
+        &args.from,
+        fee_choice,
+        &stellar_xdr::Memo::None,
+        stellar_agent_network::operation_entry::IdentityFacts::Intent(
+            stellar_agent_core::approval::IntentPayload::Trustline {
+                issuer: asset.issuer.clone(),
+                code: asset.code.clone(),
+                limit_stroops: args.limit_stroops.unwrap_or(i64::MAX),
+            },
+        ),
+    ) {
+        Ok(ClassicStart::Proceed(operation)) => operation,
+        Ok(ClassicStart::Replay(view)) => {
+            return write_replay(out, stellar_agent_core::envelope::OutputFormat::Json, &view);
+        }
+        Err(e) => return write_envelope(out, &Envelope::<()>::err(&e), 1),
+    };
+
     let built = match build_change_trust(
         args,
         profile,
@@ -1348,17 +1420,26 @@ where
         Ok(built) => built,
         Err(envelope) => return write_envelope(out, &envelope, 1),
     };
-    let policy = match load_mainnet_policy_engine(
-        "trustline",
-        "trustline.policy_engine_unavailable",
+    // The record binds the envelope the run signs: a waiting record's
+    // stored envelope, or the one just built.
+    let handle = match bind_envelope(
         &context,
-        resolved.source,
-        &profiles_dir,
+        operation,
+        OperationTool::CliTrustline,
+        OperationKind::Trustline,
+        &built.envelope_xdr,
     ) {
-        Ok(policy) => policy,
-        Err(envelope) => return write_envelope(out, &envelope, 1),
+        Ok(BoundEnvelope::Sign(handle)) => handle,
+        Ok(BoundEnvelope::Replay(view)) => {
+            return write_replay(out, stellar_agent_core::envelope::OutputFormat::Json, &view);
+        }
+        Err(e) => return write_envelope(out, &Envelope::<()>::err(&e), 1),
     };
-    let total_fee = match envelope_total_fee(&built.envelope_xdr) {
+    let (unsigned_xdr, fee_per_op_stroops) = match signing_envelope(&handle) {
+        Ok(signing) => signing,
+        Err(e) => return write_envelope(out, &Envelope::<()>::err(&e), 1),
+    };
+    let total_fee = match envelope_total_fee(unsigned_xdr) {
         Ok(fee) => fee,
         Err(e) => return write_envelope(out, &Envelope::<()>::err(&e), 1),
     };
@@ -1381,7 +1462,7 @@ where
 
     let body = &policy.body;
     if let Err(e) = check_classic_fee_cap_signed(
-        built.fee_per_op,
+        fee_per_op_stroops,
         classic_fee_source(built.fee_choice, FeeSource::ProfileDefault),
         profile,
         Some(body.classic_max_fee_per_op_stroops),
@@ -1423,7 +1504,7 @@ where
                 source,
                 issuer: IssuerObservation::from_view(&asset.issuer, issuer_account_view.as_ref()),
             },
-            &built.envelope_xdr,
+            unsigned_xdr,
             &thresholds,
             "stellar_trustline",
         )
@@ -1435,7 +1516,7 @@ where
             verb: "trustline",
             tool: "stellar_trustline",
             consumer: MainnetConsumer::CliTrustline,
-            unsigned_xdr: &built.envelope_xdr,
+            unsigned_xdr,
             client: &client,
             probe_deadline: stellar_agent_network::PRE_SEND_BUDGET,
             submit_timeout: submit_timeout(args.timeout_seconds, profile),
@@ -1447,6 +1528,7 @@ where
             effective_cap,
             witness: cross_check.witness(),
             ledger: operational,
+            operation: Some(&handle),
         })
         .await?;
         let SubmissionResult {
@@ -1462,6 +1544,7 @@ where
             tx_hash,
             ledger,
             cross_check: Some(cross_check.view()),
+            business_id: None,
         })
     }
     .await;
@@ -1469,7 +1552,7 @@ where
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     #![allow(
         clippy::unwrap_used,
         clippy::expect_used,
@@ -1690,6 +1773,7 @@ mod tests {
             limit_stroops: None,
             classic_base: None,
             timeout_seconds: None,
+            business_id: None,
         };
         let code = run_with_dependencies(
             &args,
@@ -1743,6 +1827,7 @@ mod tests {
             limit_stroops: None,
             classic_base: None,
             timeout_seconds: None,
+            business_id: None,
         };
         let code = run_with_dependencies(
             &args,
@@ -1803,6 +1888,7 @@ mod tests {
             limit_stroops: None,
             classic_base: None,
             timeout_seconds: None,
+            business_id: None,
         };
 
         let code = run_with_dependencies(
@@ -1873,6 +1959,7 @@ mod tests {
             tx_hash: "ab".repeat(32),
             ledger: 7,
             cross_check: None,
+            business_id: None,
         }
     }
 
@@ -1972,6 +2059,7 @@ mod tests {
             limit_stroops: None,
             classic_base: Some(fee.to_owned()),
             timeout_seconds: None,
+            business_id: None,
         };
         let mut out = Vec::new();
         let loaded = profile.clone();
@@ -2099,6 +2187,7 @@ mod tests {
             limit_stroops: None,
             classic_base: None,
             timeout_seconds: flag,
+            business_id: None,
         };
         let resolved = resolve_denomination(
             DenominationInput::CodeAndIssuer {
@@ -2243,6 +2332,7 @@ mod tests {
             limit_stroops: None,
             classic_base: Some("auto".to_owned()),
             timeout_seconds: None,
+            business_id: None,
         };
         let mut out = Vec::new();
         let loaded = profile.clone();
@@ -2284,6 +2374,7 @@ mod tests {
             limit_stroops: None,
             classic_base: None,
             timeout_seconds: None,
+            business_id: None,
         };
         let mut out = Vec::new();
         let loaded = profile.clone();
@@ -2318,6 +2409,7 @@ mod tests {
             limit_stroops: None,
             classic_base: None,
             timeout_seconds: None,
+            business_id: None,
         };
         let mut out = Vec::new();
         let loaded = profile.clone();
@@ -2617,6 +2709,7 @@ mod tests {
                 limit_stroops: None,
                 classic_base: None,
                 timeout_seconds: None,
+                business_id: None,
             };
             let loaded = profile.clone();
             let code = run_with_dependencies(
@@ -2769,6 +2862,7 @@ mod tests {
                 limit_stroops: None,
                 classic_base: None,
                 timeout_seconds: None,
+                business_id: None,
             };
             let mut out = Vec::new();
             let rc =
@@ -2888,7 +2982,7 @@ mod tests {
     /// The mainnet pipeline over the fixture's stored profile, ceremony and
     /// routed endpoints.
     #[cfg(feature = "mainnet-write")]
-    mod mainnet_full {
+    pub(crate) mod mainnet_full {
         use super::*;
         use std::rc::Rc;
         use std::sync::Arc;
@@ -2915,7 +3009,8 @@ mod tests {
         /// The issuer flag that enables clawback on the assets it issues.
         const AUTH_CLAWBACK_ENABLED: u32 = 0x8;
         /// The testnet issuer the wallet pins for USDC.
-        const TESTNET_ISSUER: &str = "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5";
+        pub(crate) const TESTNET_ISSUER: &str =
+            "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5";
 
         fn agent() -> String {
             stellar_agent_test_support::signed_envelope::account_id_for_seed(AGENT_SEED)
@@ -2923,7 +3018,7 @@ mod tests {
 
         /// An endpoint funding the agent and the destination, and reporting
         /// the network's USDC issuer with `issuer_flags`.
-        fn ledger(mainnet: bool, issuer_flags: u32) -> ClassicRpc {
+        pub(crate) fn ledger(mainnet: bool, issuer_flags: u32) -> ClassicRpc {
             let agent = agent();
             let (rpc, issuer) = if mainnet {
                 (ClassicRpc::mainnet(&[&agent, DESTINATION]), ISSUER)
@@ -2936,7 +3031,7 @@ mod tests {
             )
         }
 
-        fn spec(name: &'static str) -> Spec {
+        pub(crate) fn spec(name: &'static str) -> Spec {
             Spec::new(name)
                 .primary(ledger(true, 0))
                 .oracle(ledger(true, 0))
@@ -2944,7 +3039,7 @@ mod tests {
 
         /// A trustline from the agent to [`TRUSTLINE_ASSET`] on the
         /// fixture's profile.
-        fn mainnet_args(fixture: &MainnetFixture) -> TrustlineArgs {
+        pub(crate) fn mainnet_args(fixture: &MainnetFixture) -> TrustlineArgs {
             TrustlineArgs {
                 profile: Some(fixture.name.to_owned()),
                 from: fixture.agent.g.clone(),
@@ -2952,12 +3047,13 @@ mod tests {
                 limit_stroops: None,
                 classic_base: None,
                 timeout_seconds: None,
+                business_id: Some(crate::common::business_entry::fresh_business_id()),
             }
         }
 
-        struct Run {
-            code: i32,
-            envelope: Value,
+        pub(crate) struct Run {
+            pub(crate) code: i32,
+            pub(crate) envelope: Value,
         }
 
         impl Run {
@@ -2969,7 +3065,7 @@ mod tests {
             }
         }
 
-        async fn run(fixture: &MainnetFixture, args: &TrustlineArgs) -> Run {
+        pub(crate) async fn run(fixture: &MainnetFixture, args: &TrustlineArgs) -> Run {
             let mut out = Vec::new();
             let code =
                 run_with_dependencies(args, fixture.loader(), fixture.initializer(), &mut out)
@@ -3519,6 +3615,7 @@ mod tests {
             limit_stroops: None,
             classic_base: Some("100".into()),
             timeout_seconds: None,
+            business_id: None,
         };
         for after in [false, false, true] {
             if after {

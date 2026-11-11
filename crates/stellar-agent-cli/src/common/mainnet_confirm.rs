@@ -1198,6 +1198,7 @@ mod tests {
             authority: &authority,
             audit: audit_readiness(context.profile(), context.profile_name()).unwrap(),
             store: &store,
+            operation: None,
         };
         assert_eq!(
             resolve_tx_sign(request(None))

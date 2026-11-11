@@ -164,6 +164,7 @@ pub(crate) fn build_recorder(
             nonce_id: None,
             now_ms: record.now_ms,
             provenance: None,
+            operation: None,
         },
         receipts,
         sizing,
@@ -290,13 +291,25 @@ pub(crate) fn prepare_mainnet_recorder<'a>(
 }
 
 impl<'a> PreparedMainnetRecorder<'a> {
+    /// The audit writer the readiness proof verified, which the operation
+    /// attempt's rows go through.
+    pub(crate) fn audit_writer(&self) -> &AuditWriterHandle {
+        &self.audit
+    }
+
+    /// The request id the recorder's rows carry.
+    pub(crate) fn request_id(&self) -> &str {
+        &self.request_id
+    }
+
     /// Binds the prepared recorder to the minted `authorization`, whose
-    /// window entries it records, with the witness and the confirmation's
-    /// tombstone.
+    /// window entries it records, with the witness, the confirmation's
+    /// tombstone, and the operation attempt the submission ends.
     #[must_use]
     pub(crate) fn bind_authorized(
         self,
         authorization: &MainnetTxSignAuthorization,
+        operation: Option<stellar_agent_network::OperationAttempt>,
     ) -> StageMarkedRecorder<'a> {
         let recorder = WalletSubmissionRecorder::new_authorized(
             self.profile,
@@ -314,7 +327,8 @@ impl<'a> PreparedMainnetRecorder<'a> {
             self.now_ms,
         )
         .with_witness(self.witness)
-        .with_approval(Some(self.tombstone));
+        .with_approval(Some(self.tombstone))
+        .with_operation(operation);
         StageMarkedRecorder::new(recorder)
     }
 }
@@ -406,6 +420,7 @@ pub(crate) async fn reconcile_open_reservations(
         oracle,
         receipts.as_ref(),
         now_ms,
+        || accounting_audit_writer(profile, profile_name, origin),
     )
     .await;
     let _ = submission_flow::finish_reconciliation(

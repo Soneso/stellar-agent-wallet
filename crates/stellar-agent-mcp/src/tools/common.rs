@@ -1571,6 +1571,13 @@ impl WalletServer {
                     oracle.as_ref(),
                     receipts.as_ref(),
                     now_ms,
+                    || {
+                        crate::tools::value_audit::require_value_audit_writer(
+                            self.security_profile(),
+                            &profile_name,
+                            self.audit_binding,
+                        )
+                    },
                 )
                 .await
             }
@@ -3045,6 +3052,11 @@ pub(crate) mod tests {
         atomic::{AtomicBool, AtomicU32, Ordering},
     };
     use stellar_agent_core::AuthError;
+
+    /// A business id no other call of the test process names.
+    pub(crate) fn fresh_business_id() -> String {
+        format!("test-{}", uuid::Uuid::new_v4())
+    }
 
     // ── presented_classic_deadline ──────────────────────────────────────────────
 
@@ -6895,7 +6907,8 @@ pub(crate) mod tests {
             row_before_signed_simulation: std::sync::Mutex<Vec<bool>>,
             /// `getNetwork` reports testnet once the seed was read.
             pub passphrase_after_seed: AtomicBool,
-            /// `getNetwork` reports testnet.
+            /// `getNetwork` reports testnet, and `sendTransaction` answers
+            /// the testnet hash of the envelope.
             pub testnet_passphrase: AtomicBool,
             /// `getLedgerEntries` answers a JSON-RPC error.
             pub accounts_unavailable: AtomicBool,
@@ -6905,6 +6918,9 @@ pub(crate) mod tests {
             pub transaction_failed: AtomicBool,
             /// `sendTransaction` answers a hash other than the envelope's.
             pub send_hash_mismatch: AtomicBool,
+            /// How long the `sendTransaction` answer is held back, in
+            /// milliseconds.
+            pub send_delay_ms: std::sync::atomic::AtomicU64,
             /// The unsigned `simulateTransaction` answers an error.
             pub first_simulation_error: AtomicBool,
             /// The signed `simulateTransaction` answers an error.
@@ -6979,6 +6995,11 @@ pub(crate) mod tests {
 
             pub(crate) fn sent(&self) -> Vec<String> {
                 self.sent.lock().unwrap().clone()
+            }
+
+            /// The ledger at each signed `simulateTransaction`.
+            pub(crate) fn state_at_signed_simulation(&self) -> Vec<serde_json::Value> {
+                self.state_at_signed_simulation.lock().unwrap().clone()
             }
 
             pub(crate) fn on_request(&self, callback: impl Fn(&str) + Send + Sync + 'static) {
@@ -7106,6 +7127,11 @@ pub(crate) mod tests {
                     .push(self.state());
                 let hash = if self.control.send_hash_mismatch.load(Ordering::SeqCst) {
                     "ab".repeat(32)
+                } else if self.control.testnet_passphrase.load(Ordering::SeqCst) {
+                    stellar_agent_test_support::send_transaction_hash_hex(
+                        body,
+                        stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE,
+                    )
                 } else {
                     stellar_agent_test_support::send_transaction_hash_hex(
                         body,
@@ -7175,7 +7201,11 @@ pub(crate) mod tests {
                             .to_string(),
                         "oldestLedgerCloseTime":1, "cursor":"100", "ledgers":[]
                     })),
-                    "sendTransaction" => answer(self.send(&body)),
+                    "sendTransaction" => {
+                        answer(self.send(&body)).set_delay(std::time::Duration::from_millis(
+                            self.control.send_delay_ms.load(Ordering::SeqCst),
+                        ))
+                    }
                     "getTransaction" if self.control.transaction_failed.load(Ordering::SeqCst) => {
                         use stellar_xdr::*;
                         let result = TransactionResult {
@@ -7209,7 +7239,7 @@ pub(crate) mod tests {
 
         /// The ledger entries the fixture's accounts, the trustline issuer and
         /// the claimable balance answer with.
-        fn fixture_entries(f: &Fixture) -> Vec<serde_json::Value> {
+        pub(crate) fn fixture_entries(f: &Fixture) -> Vec<serde_json::Value> {
             use stellar_xdr::*;
             let mut entries = f.envelope.ledger_entries_result()["entries"]
                 .as_array()
@@ -7290,7 +7320,7 @@ pub(crate) mod tests {
             }
 
             /// The preparation arguments of a below-threshold action.
-            fn prepare_args(self, f: &Fixture) -> serde_json::Value {
+            pub(crate) fn prepare_args(self, f: &Fixture) -> serde_json::Value {
                 let issuer =
                     stellar_agent_test_support::signed_envelope::account_id_for_seed([7; 32]);
                 let mut args = match self {
@@ -7308,10 +7338,12 @@ pub(crate) mod tests {
                     }
                 };
                 args["chain_id"] = serde_json::json!("stellar:mainnet");
+                args["business_id"] =
+                    serde_json::json!(crate::tools::common::tests::fresh_business_id());
                 args
             }
 
-            async fn prepare(
+            pub(crate) async fn prepare(
                 self,
                 server: &WalletServer,
                 args: &serde_json::Value,
@@ -7342,7 +7374,7 @@ pub(crate) mod tests {
                 .unwrap()
             }
 
-            async fn commit(
+            pub(crate) async fn commit(
                 self,
                 server: &WalletServer,
                 args: serde_json::Value,
@@ -7415,6 +7447,8 @@ pub(crate) mod tests {
             pub args: serde_json::Value,
             /// The pending approval the preparation stored.
             pub entry: stellar_agent_core::approval::PendingApproval,
+            /// The preparation's result data.
+            pub prepared: serde_json::Value,
         }
 
         impl ClassicRun {
@@ -7442,7 +7476,7 @@ pub(crate) mod tests {
                 let oracle_control = mount_rpc(&f, &oracle).await;
                 let mut args = tool.prepare_args(&f);
                 prepare(&mut args);
-                let (args, entry) = Self::prepared(&f, tool, args).await;
+                let (args, entry, prepared) = Self::prepared(&f, tool, args).await;
                 Self {
                     f,
                     _primary: primary,
@@ -7452,11 +7486,13 @@ pub(crate) mod tests {
                     tool,
                     args,
                     entry,
+                    prepared,
                 }
             }
 
             /// Prepares `args` through the tool's handler, attests the stored
-            /// approval, and returns the commit arguments and that approval.
+            /// approval, and returns the commit arguments, that approval and
+            /// the preparation's result data.
             async fn prepared(
                 f: &Fixture,
                 tool: Tool,
@@ -7464,10 +7500,11 @@ pub(crate) mod tests {
             ) -> (
                 serde_json::Value,
                 stellar_agent_core::approval::PendingApproval,
+                serde_json::Value,
             ) {
                 let prepared = wire(&tool.prepare(&f.server, &args).await);
                 assert_eq!(prepared["ok"], true, "{tool:?}: {prepared}");
-                let data = &prepared["data"];
+                let data = prepared["data"].clone();
                 let nonce = data["approval"]["approval_nonce"].as_str().unwrap();
                 let entry = stored_approval(f, nonce).unwrap();
                 let mut args = args;
@@ -7477,7 +7514,54 @@ pub(crate) mod tests {
                     args[field] = data[field].clone();
                 }
                 assert_eq!(f.seed_reads.load(Ordering::SeqCst), 0);
-                (args, entry)
+                (args, entry, data)
+            }
+
+            /// Opens a record under a new business id that binds the run's
+            /// envelope to the run's operation identity, and returns that id. A
+            /// second preparation that builds the same envelope bytes opens
+            /// such a record.
+            pub(crate) fn bind_new_business_id(&self) -> String {
+                self.bind_business_id_for(self.args["envelope_xdr"].as_str().unwrap())
+            }
+
+            /// Opens a record under a new business id that binds `xdr` to the
+            /// run's operation identity, and returns that id. A commit of `xdr`
+            /// under it passes the envelope binding and meets the checks that
+            /// follow it.
+            pub(crate) fn bind_business_id_for(&self, xdr: &str) -> String {
+                use stellar_agent_network::operation_entry::{self, OpenedEntry};
+                use stellar_agent_network::policy_state::{
+                    BusinessId, OpenRequest, OperationStatus,
+                };
+                let profile = self.f.server.security_profile();
+                let business_id =
+                    BusinessId::parse(self.args["business_id"].as_str().unwrap()).unwrap();
+                let view = OperationStatus::new(&self.f.server.window_store, profile)
+                    .view(&business_id)
+                    .unwrap()
+                    .unwrap();
+                let fresh = crate::tools::common::tests::fresh_business_id();
+                let request = OpenRequest {
+                    business_id: BusinessId::parse(&fresh).unwrap(),
+                    tool: view.tool.unwrap(),
+                    kind: view.kind.unwrap(),
+                    intent: operation_entry::envelope_slot(
+                        &view.intent_digest,
+                        xdr,
+                        operation_entry::envelope_max_time(xdr).unwrap(),
+                    ),
+                    envelope_xdr: Some(xdr.to_owned()),
+                    prepared_decision: None,
+                    rule_ttl_ms: None,
+                };
+                let opened = self
+                    .f
+                    .server
+                    .operation_step(|recorder| operation_entry::open_classic(recorder, &request))
+                    .unwrap();
+                assert!(matches!(opened, OpenedEntry::Resume(_)), "{opened:?}");
+                fresh
             }
 
             /// A second preparation of the same action on the same fixture.
@@ -7487,7 +7571,9 @@ pub(crate) mod tests {
                 serde_json::Value,
                 stellar_agent_core::approval::PendingApproval,
             ) {
-                Self::prepared(&self.f, self.tool, self.tool.prepare_args(&self.f)).await
+                let (args, entry, _) =
+                    Self::prepared(&self.f, self.tool, self.tool.prepare_args(&self.f)).await;
+                (args, entry)
             }
 
             /// Commits the run's arguments; the request history then holds
@@ -7537,7 +7623,7 @@ pub(crate) mod tests {
 
             /// A commit of the approved transaction changed by `change`, with
             /// its own attested approval and its own protocol nonce.
-            fn crafted(
+            pub(crate) fn crafted(
                 &self,
                 change: impl FnOnce(&mut stellar_xdr::Transaction),
             ) -> serde_json::Value {
@@ -7554,6 +7640,19 @@ pub(crate) mod tests {
                     .to_xdr_base64(Limits::none())
                     .unwrap();
                 self.approved(&xdr, 600_000)
+            }
+
+            /// The commit of [`Self::crafted`] under a new business id whose
+            /// record binds the changed envelope, so the commit meets the
+            /// checks after the envelope binding.
+            pub(crate) fn crafted_bound(
+                &self,
+                change: impl FnOnce(&mut stellar_xdr::Transaction),
+            ) -> serde_json::Value {
+                let mut args = self.crafted(change);
+                let xdr = args["envelope_xdr"].as_str().unwrap().to_owned();
+                args["business_id"] = serde_json::json!(self.bind_business_id_for(&xdr));
+                args
             }
 
             /// The run's commit arguments for `xdr` with a new approval of
@@ -7943,7 +8042,7 @@ pub(crate) mod tests {
             let _clock = stellar_agent_network::mainnet::clock::set_now_ms_for_test(now);
             for tool in Tool::ALL {
                 let run = ClassicRun::new(tool).await;
-                let args = run.crafted(|tx| tx.cond = stellar_xdr::Preconditions::None);
+                let args = run.crafted_bound(|tx| tx.cond = stellar_xdr::Preconditions::None);
                 let result = run.commit_with(args).await;
                 assert_refused_before_mint(&run, &result, "simulation.deadline_invalid");
                 assert!(
@@ -8425,14 +8524,14 @@ pub(crate) mod tests {
         async fn mainnet_classic_commits_refuse_signed_fee_and_rebuild_changes() {
             for tool in Tool::ALL {
                 let run = ClassicRun::new(tool).await;
-                let fee =
-                    run.crafted(|tx| tx.fee = 600 * u32::try_from(tx.operations.len()).unwrap());
+                let fee = run
+                    .crafted_bound(|tx| tx.fee = 600 * u32::try_from(tx.operations.len()).unwrap());
                 assert_refused_before_mint(
                     &run,
                     &run.commit_with(fee).await,
                     "fees.percentile_exceeds_cap",
                 );
-                let rebuild = run.crafted(|tx| tx.seq_num.0 += 1);
+                let rebuild = run.crafted_bound(|tx| tx.seq_num.0 += 1);
                 assert_refused_before_mint(
                     &run,
                     &run.commit_with(rebuild).await,
@@ -8654,7 +8753,7 @@ pub(crate) mod tests {
                 expiry["expires_at_unix_ms"] =
                     serde_json::json!(run.args["expires_at_unix_ms"].as_u64().unwrap() + 1);
                 assert_refused_before_mint(&run, &run.commit_with(expiry).await, "nonce.expired");
-                let mut foreign = run.crafted(|tx| tx.fee += 1);
+                let mut foreign = run.crafted_bound(|tx| tx.fee += 1);
                 foreign["nonce"] = run.args["nonce"].clone();
                 foreign["expires_at_unix_ms"] = run.args["expires_at_unix_ms"].clone();
                 assert_refused_before_mint(&run, &run.commit_with(foreign).await, "nonce.expired");
@@ -8666,11 +8765,30 @@ pub(crate) mod tests {
                 let first = run.commit().await;
                 assert_eq!(first["ok"], false, "{tool:?}: {first}");
                 seed.set_password(&stored).unwrap();
-                let replay = run.commit().await;
+                // A retry under another business id that binds the same
+                // envelope reaches the nonce check, which refuses the spent
+                // protocol nonce.
+                let mut other = run.args.clone();
+                other["business_id"] = serde_json::json!(run.bind_new_business_id());
+                let replay = run.commit_with(other).await;
                 assert_eq!(replay["ok"], false, "{tool:?}: {replay}");
                 assert_eq!(
                     replay["error"]["code"], "nonce.replayed",
                     "{tool:?}: {replay}"
+                );
+                assert_eq!(authorizations(&run.f).len(), 1, "{tool:?}: no second mint");
+                assert_eq!(run.control.count("sendTransaction"), 0, "{tool:?}");
+                // A retry under the ended operation's business id answers its
+                // stored outcome.
+                let stored = run.commit().await;
+                assert_eq!(stored["data"]["status"], "replayed", "{tool:?}: {stored}");
+                assert_eq!(
+                    stored["data"]["operation"]["state"], "not_sent",
+                    "{tool:?}: {stored}"
+                );
+                assert_eq!(
+                    stored["data"]["operation"]["error_code"], "auth.keyring_not_found",
+                    "{tool:?}: {stored}"
                 );
                 assert_eq!(authorizations(&run.f).len(), 1, "{tool:?}: no second mint");
                 assert_eq!(run.control.count("sendTransaction"), 0, "{tool:?}");
@@ -9082,7 +9200,11 @@ pub(crate) mod tests {
                 let mut retry_args = run.args.clone();
                 retry_args["nonce"] = retry["nonce"].clone();
                 retry_args["expires_at_unix_ms"] = retry["expires_at_unix_ms"].clone();
-                let result = run.commit_with(retry_args).await;
+                retry_args["business_id"] = serde_json::json!(run.bind_new_business_id());
+                // A retry under another business id that binds the same
+                // envelope reaches the authorization, and the ledger refuses
+                // the spent approval nonce.
+                let result = run.commit_with(retry_args.clone()).await;
                 assert_eq!(result["ok"], false, "{tool:?}: {result}");
                 assert_eq!(
                     result["error"]["code"], "network.mainnet_authorization_refused",
@@ -9096,6 +9218,23 @@ pub(crate) mod tests {
                 assert!(
                     reused,
                     "{tool:?}: the ledger refuses the spent approval nonce"
+                );
+                assert_eq!(authorizations(&run.f).len(), 1, "{tool:?}");
+                assert_eq!(run.control.count("sendTransaction"), 0, "{tool:?}");
+
+                // A retry under the ended operation's business id answers its
+                // stored outcome before any authorization is minted.
+                retry_args["business_id"] = run.args["business_id"].clone();
+                let result = run.commit_with(retry_args).await;
+                assert_eq!(result["ok"], true, "{tool:?}: {result}");
+                assert_eq!(result["data"]["status"], "replayed", "{tool:?}: {result}");
+                assert_eq!(
+                    result["data"]["operation"]["state"], "not_sent",
+                    "{tool:?}: {result}"
+                );
+                assert_eq!(
+                    result["data"]["operation"]["error_code"], "submission.record_unavailable",
+                    "{tool:?}: {result}"
                 );
                 assert_eq!(authorizations(&run.f).len(), 1, "{tool:?}");
                 assert_eq!(run.control.count("sendTransaction"), 0, "{tool:?}");
@@ -9192,11 +9331,25 @@ pub(crate) mod tests {
                     .find_by_approval_nonce(&run.entry.approval_nonce)
                     .unwrap();
                 assert!(held.is_some(), "{tool:?}: the receipt holds the approval");
-                let replay = run.commit().await;
+                // A commit under another business id that binds the same
+                // envelope reaches the approval gate, which refuses the
+                // approval the receipt holds.
+                let mut other = run.args.clone();
+                other["business_id"] = serde_json::json!(run.bind_new_business_id());
+                let replay = run.commit_with(other).await;
                 assert_eq!(replay["ok"], false, "{tool:?}: {replay}");
                 assert_eq!(
                     replay["error"]["code"], "policy.approval_consumed",
                     "{tool:?}: {replay}"
+                );
+                assert_eq!(run.control.count("sendTransaction"), 0, "{tool:?}");
+                assert_eq!(authorizations(&run.f).len(), 1, "{tool:?}");
+                // The identical commit answers with the stored operation.
+                let stored = run.commit().await;
+                assert_eq!(stored["data"]["status"], "replayed", "{tool:?}: {stored}");
+                assert_eq!(
+                    stored["data"]["operation"]["state"], "sent_outcome_unknown",
+                    "{tool:?}: {stored}"
                 );
                 assert_eq!(run.control.count("sendTransaction"), 0, "{tool:?}");
                 assert_eq!(authorizations(&run.f).len(), 1, "{tool:?}");
@@ -9283,6 +9436,7 @@ pub(crate) mod tests {
                 address: None,
                 approval_nonce: approval.map(|(nonce, _)| nonce.to_owned()),
                 approval_attestation: approval.map(|(_, attestation)| attestation.to_owned()),
+                business_id: Some(crate::tools::common::tests::fresh_business_id()),
             }
         }
 
@@ -9432,13 +9586,27 @@ pub(crate) mod tests {
                 .unwrap()
                 .join("operator.toml");
             let nonce = run.nonce.clone();
+            let child_window = run.f.server.window_store.path().to_path_buf();
             observe(&run.f.on_window_key_read, move || {
                 let consumed =
                     stellar_agent_core::approval::PendingApprovalStore::open(approvals.clone())
                         .ok()
                         .and_then(|store| store.get(&nonce).map(is_consumed))
                         .unwrap_or(false);
-                if consumed {
+                // A window operation after the tombstone, such as the
+                // operation record's release, finds both authorizations used.
+                let state: serde_json::Value = std::fs::read(&child_window)
+                    .map(|bytes| serde_json::from_slice(&bytes[32..]).unwrap())
+                    .unwrap_or_default();
+                let authorizations = state["authorizations"]
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default();
+                let child_used = authorizations.len() == 2
+                    && authorizations
+                        .iter()
+                        .all(|record| record["state"] == "used");
+                if consumed && !child_used {
                     early.store(true, Ordering::SeqCst);
                 }
             });
@@ -9873,6 +10041,7 @@ pub(crate) mod tests {
                     audit: self.audit(),
                     store: &self.store,
                     authenticated: None,
+                    operation: None,
                 })
                 .await
                 .unwrap()
@@ -10232,6 +10401,10 @@ pub(crate) mod tests {
                         detail: "audit gate refused".to_owned(),
                     })
                 },
+                stellar_agent_x402::exact::OperationHooks {
+                    before_sign: Box::new(|_| Ok(None)),
+                    expose: Box::new(|_| Ok(())),
+                },
             )
             .await;
             let error = match result {
@@ -10555,6 +10728,7 @@ pub(crate) mod tests {
                 ),
                 audit,
                 store: &store,
+                operation: None,
             })
             .await
             .unwrap_err();

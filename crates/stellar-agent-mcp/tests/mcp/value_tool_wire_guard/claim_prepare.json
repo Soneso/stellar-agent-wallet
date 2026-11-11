@@ -1,0 +1,33 @@
+{
+  "ok": true,
+  "data": {
+    "envelope_xdr": "AAAAAgAAAAC6RN/fcDuEq8f6AnjlKEzKsIDnW0wuJlLQVOB67ABTyQAAAGQAAAAAAAAAKwAAAAAAAAAAAAAAAQAAAAAAAAAPAAAAAO/v7+/v7+/v7+/v7+/v7+/v7+/v7+/v7+/v7+/v7+/vAAAAAAAAAAA=",
+    "expires_at_unix_ms": "EXPIRES_AT_UNIX_MS",
+    "nonce": "NONCE",
+    "operational": {
+      "close_lag_seconds": 0,
+      "close_time_unix": "CLOSE_TIME_UNIX",
+      "latest_ledger": 1001
+    },
+    "preview": {
+      "amount_display": "5.0000000",
+      "amount_stroops": "50000000",
+      "balance_id_hex72": "00000000efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef",
+      "balance_id_strkey": "BAAO737P57X6737P57X6737P57X6737P57X6737P57X6737P57X6737IBY",
+      "claimants": [
+        {
+          "destination": "GC5EJX67OA5YJK6H7IBHRZJIJTFLBAHHLNGC4JSS2BKOA6XMABJ4TOE5",
+          "predicate_kind": "Unconditional"
+        }
+      ],
+      "clawback_enabled": false,
+      "is_claimant": true,
+      "predicate_satisfied": true,
+      "window": {
+        "valid_from": null,
+        "valid_until": null
+      }
+    }
+  },
+  "request_id": "REQUEST_ID"
+}

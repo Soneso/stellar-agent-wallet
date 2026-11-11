@@ -1,0 +1,42 @@
+{
+  "ok": true,
+  "data": {
+    "envelope_xdr": "AAAAAgAAAADtVyHEE2m2xu8MuNaIxbjbkINdIr1MfqGIjabLQjKh9QAAAGQAAAAAAAAAKwAAAAAAAAAAAAAAAQAAAAAAAAAGAAAAAVVTREMAAAAAQj59BfLsr7/sGSshWj8b6WrtuNjnAlSr40E+AgfeVrIAAAAAO5rKAAAAAAAAAAAA",
+    "expires_at_unix_ms": "EXPIRES_AT_UNIX_MS",
+    "nonce": "NONCE",
+    "operational": {
+      "close_lag_seconds": 0,
+      "close_time_unix": "CLOSE_TIME_UNIX",
+      "latest_ledger": 1001
+    },
+    "preview": {
+      "code": "USDC",
+      "gate_decision": {
+        "kind": "proceed"
+      },
+      "is_pinned": true,
+      "issuer": "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5",
+      "issuer_flags": {
+        "auth_clawback_enabled": false,
+        "auth_immutable": false,
+        "auth_required": false,
+        "auth_revocable": false
+      },
+      "limit_stroops": "1000000000"
+    },
+    "simulation": {
+      "fee_stroops": "100",
+      "operation": {
+        "asset_code": "USDC",
+        "asset_issuer": "GBBD4...LFLA5",
+        "limit_stroops": "1000000000",
+        "type": "change_trust"
+      },
+      "selected_fee_per_op_stroops": "100",
+      "selected_fee_percentile": "profile_default",
+      "source_account_id": "GDWVOIOECNU3NRXPBS4NNCGFXDNZBA25EK6UY7VBRCG2NS2CGKQ7LPLQ",
+      "source_sequence": "42"
+    }
+  },
+  "request_id": "REQUEST_ID"
+}

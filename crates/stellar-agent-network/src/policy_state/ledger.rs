@@ -2109,6 +2109,39 @@ impl PersistedWindowStore {
         })
     }
 
+    /// Consumes one authorization and commits the exposure of the operation
+    /// attempt it serves in the same generation commit.
+    ///
+    /// The consumption runs as in [`Self::consume_authorizations`]. The
+    /// exposure follows it under the same lock, with the checks of
+    /// [`super::operations::OperationRecorder::expose`], and its audit row is
+    /// appended through `exposure.audit` before the window write. A refused
+    /// exposure or append commits neither.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`Self::consume_authorizations`];
+    /// `internal.unexpected_state` for an exposure the attempt does not
+    /// admit; [`WindowStoreError::AuditAppendFailed`] when the row cannot be
+    /// appended.
+    pub fn consume_authorization_exposing(
+        &self,
+        profile: &Profile,
+        id: AuthorizationId,
+        expect: &ConsumeExpect,
+        binding: &ConsumptionBinding,
+        exposure: super::operations::ConsumptionExposure<'_>,
+    ) -> Result<ConsumeReceipt, WindowStoreError> {
+        let mut receipts = self.consume_batch(
+            profile,
+            &[(id, expect.clone(), binding.clone())],
+            Some(exposure),
+        )?;
+        receipts.pop().ok_or_else(|| WindowStoreError::Invalid {
+            detail: "a consumption returned no receipt".to_owned(),
+        })
+    }
+
     /// Consumes every listed authorization in one transaction, all or
     /// nothing.
     ///
@@ -2140,6 +2173,18 @@ impl PersistedWindowStore {
         &self,
         profile: &Profile,
         batch: &[(AuthorizationId, ConsumeExpect, ConsumptionBinding)],
+    ) -> Result<Vec<ConsumeReceipt>, WindowStoreError> {
+        self.consume_batch(profile, batch, None)
+    }
+
+    /// The consumption of [`Self::consume_authorizations`], with the
+    /// exposure of [`Self::consume_authorization_exposing`] when one is
+    /// given.
+    fn consume_batch(
+        &self,
+        profile: &Profile,
+        batch: &[(AuthorizationId, ConsumeExpect, ConsumptionBinding)],
+        exposure: Option<super::operations::ConsumptionExposure<'_>>,
     ) -> Result<Vec<ConsumeReceipt>, WindowStoreError> {
         use MainnetPrecondition as P;
         let lock = self.ledger_lock(profile)?;
@@ -2175,6 +2220,10 @@ impl PersistedWindowStore {
                 .find(|auth| auth.id == *id)
                 .ok_or_else(|| refused(P::UnknownAuthorization))?;
             check(auth.state.holds(), P::NotOpen)?;
+            // The sweep above leaves an authorization that links a live
+            // operation to that operation's own step. Its lifetime is
+            // checked here: an authorization past its expiry is not open.
+            check(now < auth.expires_ms, P::NotOpen)?;
             check(auth.minted_ms <= now, P::NotYetValid)?;
             check_profile_handle(auth, profile)?;
             compare_expectation(auth, expect)?;
@@ -2189,6 +2238,17 @@ impl PersistedWindowStore {
                 consumed_at_ms: now,
             });
         }
+        if let Some(exposure) = exposure {
+            let rows = super::operations::expose_in_consumption(
+                &mut wire, profile, &original, now, &exposure,
+            )?;
+            for row in rows {
+                exposure
+                    .audit
+                    .append(row)
+                    .map_err(|detail| WindowStoreError::AuditAppendFailed { detail })?;
+            }
+        }
         prune_stale(&mut wire, now);
         self.commit_generation(&key, &gen_entry, original, wire)?;
         drop(lock);
@@ -2198,8 +2258,8 @@ impl PersistedWindowStore {
     /// Abandons an open authorization before its signing claim: marks it invalidated with a
     /// bounded `reason`, sets its settlement time, and drops its holds.
     ///
-    /// Returns `Ok(false)` for a claimed or settled record; this may still commit the
-    /// expiry sweep. A used record is never reopened.
+    /// Returns `Ok(false)` for a claimed, settled or expired record; this may still commit
+    /// the expiry sweep. A used record is never reopened.
     ///
     /// # Errors
     ///
@@ -2228,7 +2288,10 @@ impl PersistedWindowStore {
             .find(|auth| auth.id == id)
             .ok_or_else(|| refused(MainnetPrecondition::UnknownAuthorization))?;
         check_profile_handle(auth, profile)?;
-        let invalidated = auth.state == AuthorizationState::Open;
+        // An authorization past its expiry is settled by its expiry, never
+        // invalidated. The sweep above expires it, or, while it links a live
+        // operation, leaves it to that operation's step, which expires it.
+        let invalidated = auth.state == AuthorizationState::Open && now < auth.expires_ms;
         if invalidated {
             auth.state = AuthorizationState::Invalidated;
             auth.settled_ms = Some(now);

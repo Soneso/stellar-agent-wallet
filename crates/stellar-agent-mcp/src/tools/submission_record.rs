@@ -122,6 +122,7 @@ pub(crate) fn build_recorder<'a>(
             nonce_id: record.nonce_id,
             now_ms: record.now_ms,
             provenance: None,
+            operation: None,
         },
         receipts,
         Some(sizing),
@@ -236,6 +237,8 @@ impl<'a> PreparedRecorder<'a> {
         authorization: &stellar_agent_network::mainnet::authorization::MainnetTxSignAuthorization,
         floor: Option<&'a dyn SequenceFloorHook>,
         witness: Option<&'a stellar_agent_network::cross_check::CrossCheckWitness>,
+        operation: Option<stellar_agent_network::OperationAttempt>,
+        request_id: String,
     ) -> StageMarkedRecorder<'a> {
         let record = self.record;
         StageMarkedRecorder::new(
@@ -251,12 +254,13 @@ impl<'a> PreparedRecorder<'a> {
                 self.window,
                 Some(record.audit),
                 record.nonce_id,
-                uuid::Uuid::new_v4().to_string(),
+                request_id,
                 record.now_ms,
             )
             .with_sequence_floor(floor)
             .with_approval(self.approval)
-            .with_witness(witness),
+            .with_witness(witness)
+            .with_operation(operation),
         )
     }
 }
@@ -308,6 +312,10 @@ pub(crate) fn cleanup_authorization(
 }
 
 /// Signs and submits the approved bytes under the same client and consumer.
+///
+/// Under a mainnet guard with an operation record, the record's next attempt is
+/// committed as `Sending` after the mint and before the signature. Every
+/// refusal before any send ends it as `NotSent`.
 #[allow(
     clippy::too_many_arguments,
     reason = "one call owns the signing and submission lifecycle"
@@ -324,6 +332,7 @@ pub(crate) async fn sign_and_submit_classic(
     record: CommitRecord<'_>,
     witness: Option<&stellar_agent_network::cross_check::CrossCheckWitness>,
     floor: Option<&dyn SequenceFloorHook>,
+    operation: Option<&stellar_agent_network::policy_state::OperationHandle>,
 ) -> Result<stellar_agent_network::submit::SubmissionResult, CallToolResult> {
     use stellar_agent_network::{
         signing::envelope_signing::{attach_signature, attach_signature_authorized},
@@ -355,6 +364,9 @@ pub(crate) async fn sign_and_submit_classic(
         )
         .map_err(render)?;
         let store = server.window_store.clone();
+        let profile = record.profile;
+        let writer = Arc::clone(&record.audit);
+        let request_id = uuid::Uuid::new_v4().to_string();
         let prepared =
             prepare_authorized_recorder(record, server.window_store.clone()).map_err(render)?;
         let authorization = stellar_agent_network::mainnet::resolve::resolve_tx_sign(
@@ -371,11 +383,41 @@ pub(crate) async fn sign_and_submit_classic(
                 authority,
                 audit,
                 store: &prepared.window,
+                operation: operation.map(stellar_agent_network::operation_entry::next_attempt_link),
             },
         )
         .await
         .map_err(|error| render(error.into()))?;
         let id = authorization.id();
+        // The attempt is committed before the signature exists: a crash from
+        // here on leaves a `Sending` record that recovery reads.
+        let attempt = match operation {
+            Some(handle) => match stellar_agent_network::operation_entry::begin_classic_attempt(
+                &store,
+                profile,
+                &writer,
+                &request_id,
+                handle,
+                envelope,
+            ) {
+                Ok(attempt) => Some(attempt),
+                Err(error) => {
+                    cleanup_authorization(
+                        &store,
+                        guard.context,
+                        id,
+                        stellar_agent_network::mainnet::resolve::InvalidationStage::SignRefused,
+                    );
+                    return Err(render(error));
+                }
+            },
+            None => None,
+        };
+        let end_unsent = |code: &str| {
+            if let Some(attempt) = attempt {
+                end_unsent_attempt(&store, profile, &writer, &request_id, attempt, code);
+            }
+        };
         let signed = match attach_signature_authorized(
             envelope,
             &handle,
@@ -388,10 +430,11 @@ pub(crate) async fn sign_and_submit_classic(
             Ok(signed) => signed,
             Err(error) => {
                 cleanup_authorization(&store, guard.context, id, sign_failure_stage(&error));
+                end_unsent(error.code());
                 return Err(render(error));
             }
         };
-        let recorder = prepared.build(&authorization, floor, witness);
+        let recorder = prepared.build(&authorization, floor, witness, attempt, request_id.clone());
         let result = submit_authorized_transaction_and_wait(
             client,
             oracle.as_ref(),
@@ -404,13 +447,14 @@ pub(crate) async fn sign_and_submit_classic(
             MainnetSubmitGrant::Tx(authorization),
         )
         .await;
-        if result.is_err() {
+        if let Err(error) = &result {
             cleanup_authorization(
                 &store,
                 guard.context,
                 id,
                 submit_failure_stage(recorder.pre_send_entered()),
             );
+            recorder.end_refused_attempt(error.code());
         }
         result.map_err(|error| submission_error_result(&error, &signed))
     } else {
@@ -438,6 +482,34 @@ pub(crate) async fn sign_and_submit_classic(
         )
         .await
         .map_err(|error| submission_error_result(&error, &signed))
+    }
+}
+
+/// Ends `attempt` as `NotSent` after a refusal with wire code `code` before
+/// any send. The caller's refusal stands either way, so a failure is logged.
+fn end_unsent_attempt(
+    store: &PersistedWindowStore,
+    profile: &Profile,
+    writer: &stellar_agent_network::AuditWriterHandle,
+    request_id: &str,
+    attempt: stellar_agent_network::OperationAttempt,
+    code: &str,
+) {
+    if let Err(error) = stellar_agent_network::end_operation_attempt(
+        store,
+        profile,
+        writer,
+        request_id,
+        attempt,
+        &stellar_agent_network::AttemptEnd::NotSent {
+            code: code.to_owned(),
+        },
+    ) {
+        tracing::warn!(
+            code = error.code(),
+            "operation record: the unsent attempt's end was not recorded; it stays sending \
+             until recovery reads it"
+        );
     }
 }
 

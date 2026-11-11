@@ -105,6 +105,7 @@ These recur with the same meaning across groups:
 | `--secondary-rpc-url <URL>` | Testnet override; refused on mainnet; credentials refused; sends no keyring credential | profile secondary |
 | `--timeout-seconds <SECONDS>` | Bounds submission and simulation. On `pay`, `claim`, sponsored `accounts create`, and `trustline`, it bounds the send and the confirmation poll; the endpoint checks and the reads before the send run under a fixed 30-second pre-send budget | `60`; on those four, the profile's `submit_timeout_seconds`, then `60` |
 | `--output <FORMAT>` | `json` (default) or `table`; not accepted on every command | `json` |
+| `--business-id <ID>` | Names one value operation on `pay`, `claim`, `trustline` and `accounts create`; required on mainnet, validated and echoed elsewhere | none |
 
 ### Signer source
 
@@ -137,6 +138,17 @@ Select an explicit nondefault mainnet profile with matching stored configuration
 Enroll signer and owner identities, enable the installation, and sign a v2 policy.
 Valid pin and audit state, required witnesses, and per-action authorization remain
 necessary. [The policy guide](profiles-and-keys.md#mainnet-policy-body) lists the fields.
+
+On mainnet the four verbs require `--business-id <ID>`: 1 to 64 printable
+ASCII characters without a space. The run looks the id up before the
+confirmation ceremony. A retained operation prints its stored state and does
+no new work. Its `data` holds `status: "replayed"`, `business_id`, `operation`
+(`id`, `state`, `tx_hash`, `ledger`, `error_code`) and `next`.
+`--output table` prints one line, and `trustline` prints JSON only. The run
+exits `0` for a succeeded operation and `1` otherwise. A waiting record signs its stored envelope. Another intent
+under the same id refuses with `operation.business_id_conflict`. A claim names
+its balance id and claimant, so a rerun prints the stored claim after the
+balance left or its predicate expired.
 
 Mainnet consent requires a fresh WebAuthn assertion, with user presence and
 user verification, from an approval credential listed in the owner-signed

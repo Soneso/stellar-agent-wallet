@@ -163,6 +163,10 @@ use crate::commands::policy_engine::{
     evaluate_opaque_signing_policy, evaluate_value_moving_policy, load_mainnet_policy_engine,
     pay_policy_args, with_total_fee,
 };
+use crate::common::business_entry::{
+    BoundEnvelope, ClassicStart, bind_envelope, classic_start, entry_business_id,
+    mainnet_business_id, print_replay, signing_envelope,
+};
 use crate::common::mainnet_write::{
     MainnetWriteRequest, authorize_and_submit, mainnet_context, mainnet_profiles_dir,
     mainnet_write_build_refusal, require_v1_engine,
@@ -180,6 +184,7 @@ use crate::common::signer_ceremony::{
     resolve_software_signer_from_env,
 };
 use crate::common::{ResolvedProfileName, resolve_profile_name};
+use stellar_agent_network::policy_state::{OperationKind, OperationTool};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Constants
@@ -253,6 +258,11 @@ pub struct PayResult {
     /// Absent for `--build-only`, which neither signs nor sends.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cross_check: Option<CrossCheckView>,
+
+    /// The business id the run named, echoed off mainnet, where no record
+    /// exists. Absent when the run named none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub business_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -413,6 +423,12 @@ pub struct PayArgs {
     /// disclosure and declines the operation.
     #[arg(long, default_value_t = false)]
     pub use_oz_relayer: bool,
+    /// Business id naming this value operation: 1 to 64 printable ASCII
+    /// characters, no space. Required on mainnet, where a retry with the
+    /// same id prints the stored operation instead of doing new work; on
+    /// another network it is validated and echoed.
+    #[arg(long = "business-id", value_name = "ID")]
+    pub business_id: Option<String>,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -544,6 +560,12 @@ where
         print_error(&envelope, args.output);
         return 1;
     }
+    // Off mainnet a supplied business id is validated and echoed, and no
+    // record exists.
+    if let Err(e) = entry_business_id(profile, args.business_id.as_deref()) {
+        print_error(&Envelope::<()>::err(&e), args.output);
+        return 1;
+    }
 
     // Every gated stage reads the owner key from the keyring through
     // `build_v1_policy_engine` when the resolved profile is V1, including
@@ -633,6 +655,7 @@ where
                 selected_fee_per_op_stroops: Some(built.fee_selection.per_op_stroops),
                 selected_fee_percentile: Some(built.fee_selection.selected_fee_percentile),
                 cross_check: None,
+                business_id: args.business_id.clone(),
             };
             let envelope = Envelope::ok(result);
             print_success(&envelope, args.output);
@@ -724,6 +747,7 @@ where
                 selected_fee_per_op_stroops: None,
                 selected_fee_percentile: None,
                 cross_check: cross_check.as_ref().map(CrossCheckOutcome::view),
+                business_id: args.business_id.clone(),
             };
             let envelope = Envelope::ok(result);
             print_success(&envelope, args.output);
@@ -891,6 +915,7 @@ where
                 selected_fee_per_op_stroops: None,
                 selected_fee_percentile: None,
                 cross_check: cross_check.as_ref().map(CrossCheckOutcome::view),
+                business_id: args.business_id.clone(),
             };
             let envelope = Envelope::ok(result);
             print_success(&envelope, args.output);
@@ -1540,6 +1565,7 @@ where
                 selected_fee_per_op_stroops: Some(fee_selection.per_op_stroops),
                 selected_fee_percentile: Some(fee_selection.selected_fee_percentile),
                 cross_check: Some(cross_check.view()),
+                business_id: args.business_id.clone(),
             };
             let envelope = Envelope::ok(result);
             print_success(&envelope, args.output);
@@ -2150,6 +2176,9 @@ fn print_success(envelope: &Envelope<PayResult>, format: OutputFormat) {
                         }
                     }
                 }
+                if let Some(business_id) = &result.business_id {
+                    println!("business_id {business_id}");
+                }
             }
         }
         // Json and all unknown formats: delegate to shared render_json.
@@ -2284,10 +2313,53 @@ where
     )
     .await;
 
+    // The intent the business id binds needs the verified policy and the
+    // request facts only, so a retained operation answers before any
+    // account read.
     let inputs = match build_inputs(args, asset, amount) {
         Ok(inputs) => inputs,
         Err(e) => return fail(&Envelope::<()>::err(&e)),
     };
+    let policy = match load_mainnet_policy_engine(
+        "pay",
+        "policy.engine_unavailable",
+        &context,
+        resolved.source,
+        &profiles_dir,
+    ) {
+        Ok(policy) => policy,
+        Err(envelope) => return fail(&envelope),
+    };
+    let memo = match parse_memo(args) {
+        Ok(memo) => memo,
+        Err(e) => return fail(&Envelope::<()>::err(&e)),
+    };
+    // The id is checked where the run first needs it, after every refusal
+    // a run without one gives, so their codes stay.
+    let business_id = match mainnet_business_id(args.business_id.as_deref()) {
+        Ok(id) => id,
+        Err(e) => return fail(&Envelope::<()>::err(&e)),
+    };
+    let operation = match classic_start(
+        &context,
+        &policy,
+        business_id,
+        inputs.source,
+        inputs.fee_choice,
+        &memo,
+        stellar_agent_network::operation_entry::IdentityFacts::Intent(
+            stellar_agent_core::approval::IntentPayload::Pay {
+                destination: args.destination.clone(),
+                asset: stellar_agent_network::operation_entry::intent_asset(&inputs.asset),
+                amount_stroops: inputs.amount.as_stroops(),
+            },
+        ),
+    ) {
+        Ok(ClassicStart::Proceed(operation)) => operation,
+        Ok(ClassicStart::Replay(view)) => return print_replay(&view, args.output),
+        Err(e) => return fail(&Envelope::<()>::err(&e)),
+    };
+
     let source = inputs.source;
     let built = match build_unsigned_envelope(
         &client,
@@ -2301,18 +2373,24 @@ where
         Ok(built) => built,
         Err(e) => return fail(&Envelope::<()>::err(&e)),
     };
-
-    let policy = match load_mainnet_policy_engine(
-        "pay",
-        "policy.engine_unavailable",
+    // The record binds the envelope the run signs: a waiting record's
+    // stored envelope, or the one just built.
+    let handle = match bind_envelope(
         &context,
-        resolved.source,
-        &profiles_dir,
+        operation,
+        OperationTool::CliPay,
+        OperationKind::Pay,
+        &built.envelope_xdr,
     ) {
-        Ok(policy) => policy,
-        Err(envelope) => return fail(&envelope),
+        Ok(BoundEnvelope::Sign(handle)) => handle,
+        Ok(BoundEnvelope::Replay(view)) => return print_replay(&view, args.output),
+        Err(e) => return fail(&Envelope::<()>::err(&e)),
     };
-    let total_fee = match envelope_total_fee(&built.envelope_xdr) {
+    let (unsigned_xdr, fee_per_op_stroops) = match signing_envelope(&handle) {
+        Ok(signing) => signing,
+        Err(e) => return fail(&Envelope::<()>::err(&e)),
+    };
+    let total_fee = match envelope_total_fee(unsigned_xdr) {
         Ok(fee) => fee,
         Err(e) => return fail(&Envelope::<()>::err(&e)),
     };
@@ -2344,7 +2422,7 @@ where
 
     let body = &policy.body;
     if let Err(e) = check_classic_fee_cap_signed(
-        built.fee_selection.per_op_stroops,
+        fee_per_op_stroops,
         classic_fee_source(built.fee_choice, FeeSource::CommandDefault),
         profile,
         Some(body.classic_max_fee_per_op_stroops),
@@ -2387,7 +2465,7 @@ where
             base_units: witness.base_units,
         },
         witness.inputs,
-        &built.envelope_xdr,
+        unsigned_xdr,
         &thresholds,
         "stellar_pay",
     )
@@ -2403,7 +2481,7 @@ where
         verb: "pay",
         tool: "stellar_pay",
         consumer: MainnetConsumer::CliPay,
-        unsigned_xdr: &built.envelope_xdr,
+        unsigned_xdr,
         client: &client,
         probe_deadline: budget,
         submit_timeout: submit_timeout(args.timeout_seconds, profile),
@@ -2415,6 +2493,7 @@ where
         effective_cap,
         witness: cross_check.witness(),
         ledger: operational,
+        operation: Some(&handle),
     })
     .await
     {
@@ -2424,9 +2503,10 @@ where
                 tx_hash: Some(submitted.result.tx_hash.clone()),
                 ledger: Some(submitted.result.ledger),
                 stage: "build+sign+submit".to_owned(),
-                selected_fee_per_op_stroops: Some(built.fee_selection.per_op_stroops),
+                selected_fee_per_op_stroops: Some(fee_per_op_stroops),
                 selected_fee_percentile: Some(built.fee_selection.selected_fee_percentile),
                 cross_check: Some(cross_check.view()),
+                business_id: None,
             };
             print_success(&Envelope::ok(result), args.output);
             0
@@ -2440,7 +2520,7 @@ where
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     #![allow(clippy::panic, reason = "test spies reject keyring access")]
     #![allow(
         clippy::unwrap_used,
@@ -2921,6 +3001,7 @@ mod tests {
             timeout_seconds: None,
             rpc_url: None,
             use_oz_relayer: false,
+            business_id: None,
         };
         let exit = run_with_dependencies(
             &args,
@@ -2993,6 +3074,7 @@ mod tests {
             timeout_seconds: None,
             rpc_url: Some(guard_rpc.uri()),
             use_oz_relayer: false,
+            business_id: None,
         };
         let exit = run_with_dependencies(
             &args,
@@ -3232,6 +3314,7 @@ mod tests {
             selected_fee_per_op_stroops: Some(built.fee_selection.per_op_stroops),
             selected_fee_percentile: Some(built.fee_selection.selected_fee_percentile),
             cross_check: None,
+            business_id: None,
         };
         let json = serde_json::to_value(result).expect("PayResult serialises");
         assert_eq!(json["selected_fee_per_op_stroops"], "250");
@@ -3253,6 +3336,7 @@ mod tests {
             selected_fee_per_op_stroops: None,
             selected_fee_percentile: None,
             cross_check: None,
+            business_id: None,
         };
         let json = serde_json::to_value(&result).expect("PayResult serialises");
         assert!(json.get("selected_fee_per_op_stroops").is_none());
@@ -3274,6 +3358,7 @@ mod tests {
             selected_fee_per_op_stroops: Some(100),
             selected_fee_percentile: Some("profile_default".to_owned()),
             cross_check: None,
+            business_id: None,
         };
         let json = serde_json::to_value(&result).unwrap();
         assert!(json.get("cross_check").is_none(), "{json}");
@@ -3490,6 +3575,7 @@ mod tests {
             timeout_seconds: None,
             rpc_url: Some(crate::common::network::TESTNET_RPC_URL.to_owned()),
             use_oz_relayer: false,
+            business_id: None,
         }
     }
 
@@ -5858,7 +5944,7 @@ mod tests {
     /// The mainnet pipeline over the fixture's stored profile, ceremony and
     /// routed endpoints.
     #[cfg(feature = "mainnet-write")]
-    mod mainnet_full {
+    pub(crate) mod mainnet_full {
         use super::*;
         use std::rc::Rc;
         use std::sync::Arc;
@@ -5898,7 +5984,7 @@ mod tests {
         /// A 1 XLM payment from the agent to the allowlisted destination on
         /// the fixture's profile, with no signer flag: a mainnet profile
         /// signs with the enrolled seed in the keyring.
-        pub(super) fn mainnet_args(fixture: &MainnetFixture) -> PayArgs {
+        pub(crate) fn mainnet_args(fixture: &MainnetFixture) -> PayArgs {
             let mut args = minimal_args();
             args.profile = Some(fixture.name.to_owned());
             args.network = None;
@@ -5906,6 +5992,7 @@ mod tests {
             args.source = Some(fixture.agent.g.clone());
             args.destination = DESTINATION.to_owned();
             args.amount = "1 XLM".to_owned();
+            args.business_id = Some(crate::common::business_entry::fresh_business_id());
             args
         }
 
@@ -5918,9 +6005,9 @@ mod tests {
         }
 
         /// One run of the verb: its exit code and the envelope it printed.
-        pub(super) struct Run {
-            pub(super) code: i32,
-            pub(super) envelope: Value,
+        pub(crate) struct Run {
+            pub(crate) code: i32,
+            pub(crate) envelope: Value,
         }
 
         impl Run {
@@ -5932,13 +6019,19 @@ mod tests {
             }
         }
 
-        pub(super) async fn run(fixture: &MainnetFixture, args: &PayArgs) -> Run {
+        pub(crate) async fn run(fixture: &MainnetFixture, args: &PayArgs) -> Run {
             crate::common::render::take_rendered_for_test();
             let code = run_with_dependencies(args, fixture.loader(), fixture.initializer()).await;
             Run {
                 code,
                 envelope: last_rendered(),
             }
+        }
+
+        /// Runs `args` on the fixture and returns the exit code alone, for a
+        /// run whose output is not one JSON envelope.
+        pub(crate) async fn run_code(fixture: &MainnetFixture, args: &PayArgs) -> i32 {
+            run_with_dependencies(args, fixture.loader(), fixture.initializer()).await
         }
 
         fn now() -> u64 {
@@ -7603,11 +7696,13 @@ mod tests {
             .await;
         }
 
-        /// A testnet payment from the fixture's agent through its primary.
+        /// A testnet payment from the fixture's agent through its primary,
+        /// naming no business id.
         fn testnet_args(fixture: &MainnetFixture) -> PayArgs {
             let mut args = memo_args(fixture);
             args.network = None;
             args.secret_env = Some(AGENT_VAR.to_owned());
+            args.business_id = None;
             args
         }
 

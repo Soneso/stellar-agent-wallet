@@ -1614,6 +1614,51 @@ never claimed and no exposure names it. Once an operation ends, every linked
 authorization that was never claimed and is not exposed gets a
 `proved_unspent` row in that commit.
 
+The mainnet value paths open, advance and replay these records. The MCP
+tools `stellar_pay`, `stellar_create_account`, `stellar_claim` and
+`stellar_trustline` with their commits name each call with its business id.
+So do both x402 payment tools and the CLI verbs `pay`, `claim`, `trustline`
+and sponsored `accounts create`. A classic call builds its canonical intent from
+the chain, the source, the verified policy digest, the fee bound, the memo and
+the operation's own facts. The sequence, the time bounds and the exact fee
+stay out of it, so every rebuild of one request keeps its digest. A claim's
+operation identity binds the balance id and the claimant from the arguments
+and the profile instead, under its own label. The amount and the asset its
+build reads are execution facts. The lookup runs after the argument and
+endpoint refusals and before any build, and in the CLI before the
+confirmation ceremony. A claim looks its id up before the balance read and
+the predicate check. A retained record answers with its stored state and a
+waiting record yields its stored envelope. An unknown id opens an `Envelope`
+slot over the unsigned envelope just built, with the intent digest beside its
+hash.
+
+A classic commit reads its record before it verifies the approval, rebuilds
+the envelope or consumes the nonce. One window read yields the record under
+the id and every record that binds the supplied envelope's hash. An id
+without a record, or an envelope that only other ids bind, refuses with
+`operation.business_id_mismatch`. A record under the id that binds another
+envelope, or none, refuses with `operation.business_id_conflict`. A tombstone
+answers only when it holds an envelope slot whose digest is the identity of the
+intent the supplied envelope decodes to. That identity is computed under the
+current policy, with the envelope's fee or the cap bound as the fee bound. Any
+other tombstone refuses with that conflict. A retained record answers there
+without a lock or a write. A record that continues runs
+the gates and is decided again under the recorder.
+
+Each classic attempt begins before the signature: the mint carries the link to
+the next attempt, and the begin commits `authorized` and `sending` in one
+commit. The consumption commits the exposure with the attempt still `sending`.
+A refusal before any send ends the attempt as `not_sent` with its code and
+the `proved_unspent` row. A send ends it as `sent_outcome_unknown` with its
+transaction hash, and only recovery settles what the network did. An x402
+record holds an `X402` slot with the digest the x402 crate computes. Its
+attempt begins after the intent mint and before the signature. Its exposure
+names the intent authorization, the signed entries' digest and their
+expiration ledger. The exposure commits after the intent consumption and
+before the signed re-simulation. A returned payload ends it as `payload_released`. The
+dispatch-time reconciliation pass of both binaries applies the expiry edges
+once on a mainnet profile, before any work reads a record.
+
 The operator clear moves `sent_outcome_unknown` to `cancelled` and writes the
 last exposed attempt's release row of class `unknown` in the same commit: an
 `Always` row for an exposure without `max_time`, or a `CloseTime` row at

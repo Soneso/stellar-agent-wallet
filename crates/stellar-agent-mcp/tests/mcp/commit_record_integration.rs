@@ -218,6 +218,7 @@ async fn a_timed_out_claim_records_the_submission_and_reports_the_hash() {
             chain_id: "stellar:testnet".to_owned(),
             balance_id: "ab".repeat(32),
             source_account: Some(claimant_g.clone()),
+            business_id: None,
         })
         .await
         .expect("simulate must not error");
@@ -239,6 +240,7 @@ async fn a_timed_out_claim_records_the_submission_and_reports_the_hash() {
             envelope_xdr: data["envelope_xdr"].as_str().expect("envelope").to_owned(),
             approval_nonce: None,
             approval_attestation: None,
+            business_id: None,
         })
         .await
         .expect("commit must not error");
@@ -284,6 +286,7 @@ async fn a_timed_out_trustline_records_the_submission_and_reports_the_hash() {
         asset: "USDC".to_owned(),
         limit_stroops: Some("1000000000".to_owned()),
         classic_base: None,
+        business_id: None,
     };
     let sim = server
         .call_stellar_trustline(simulate_args.clone())
@@ -306,6 +309,7 @@ async fn a_timed_out_trustline_records_the_submission_and_reports_the_hash() {
             envelope_xdr: data["envelope_xdr"].as_str().expect("envelope").to_owned(),
             approval_nonce: None,
             approval_attestation: None,
+            business_id: None,
         })
         .await
         .expect("commit must not error");
@@ -348,6 +352,7 @@ async fn a_timed_out_create_account_records_the_submission_and_reports_the_hash(
             destination: destination_g.clone(),
             starting_balance: serde_json::from_str(r#""2 XLM""#).unwrap(),
             classic_base: None,
+            business_id: None,
         })
         .await
         .expect("simulate must not error");
@@ -370,6 +375,7 @@ async fn a_timed_out_create_account_records_the_submission_and_reports_the_hash(
             envelope_xdr: data["envelope_xdr"].as_str().expect("envelope").to_owned(),
             approval_nonce: None,
             approval_attestation: None,
+            business_id: None,
         })
         .await
         .expect("commit must not error");

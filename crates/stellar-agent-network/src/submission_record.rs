@@ -103,7 +103,9 @@ use crate::mainnet::consumed::AuthorizationConsumed;
 use crate::mainnet::refusal::AuthorizedPathError;
 use crate::mainnet::{AuditFacts, AuthorizationDomain, MainnetPrecondition, RecomputedFacts};
 use crate::policy_state::{
-    ConsumptionBinding, PersistedWindowStore, SubmissionBinding, SubmissionHold, WindowStoreError,
+    ConsumptionBinding, ConsumptionExposure, ExposureIdentity, OperationId, OperationRecorder,
+    OperationResult, OperationState, PersistedWindowStore, SubmissionBinding, SubmissionHold,
+    TransitionEvidence, WindowStoreError,
 };
 use crate::sequence_floor::SequenceFloorHook;
 use crate::submit::{MainnetSubmitGrant, redact_tx_hash};
@@ -371,6 +373,89 @@ pub struct ApprovalTombstone {
     pub approval_nonce: String,
 }
 
+/// The operation attempt a submission advances: the record and the attempt
+/// that `begin_attempt` opened before the signature.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OperationAttempt {
+    /// The operation the submission serves.
+    pub operation_id: OperationId,
+    /// The attempt the submission sends, starting at 1.
+    pub attempt_index: u32,
+}
+
+/// How an operation attempt ends at the submitter.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AttemptEnd {
+    /// No send of the attempt's payload started; `code` names the refusal.
+    NotSent {
+        /// The wire code of the refusal that stopped the attempt.
+        code: String,
+    },
+    /// The payload was exposed and may have reached the network.
+    SentOutcomeUnknown {
+        /// The network transaction hash, when the payload is a transaction.
+        tx_hash: Option<[u8; 32]>,
+    },
+}
+
+/// Records the end of `attempt` in the operation store of `profile`.
+///
+/// A `NotSent` end proves that no send started, so the attempt's
+/// authorization gets its `Always` release row of class `proved_unspent` in
+/// the same commit, also after a committed exposure. A `SentOutcomeUnknown`
+/// end needs the attempt's committed exposure. A repeated end in the same
+/// state writes nothing.
+///
+/// The writer lock is taken before the window lock.
+///
+/// # Errors
+///
+/// The operation store's refusals, rendered as
+/// [`crate::operation_entry::operation_refusal`] renders them, and
+/// `submission.record_unavailable` for a poisoned writer.
+pub fn end_operation_attempt(
+    window: &PersistedWindowStore,
+    profile: &Profile,
+    writer: &AuditWriterHandle,
+    request_id: &str,
+    attempt: OperationAttempt,
+    end: &AttemptEnd,
+) -> Result<(), WalletError> {
+    let (to, evidence) = match end {
+        AttemptEnd::NotSent { code } => (
+            OperationState::NotSent,
+            TransitionEvidence {
+                result: Some(OperationResult {
+                    error_code: Some(code.clone()),
+                    ..OperationResult::default()
+                }),
+                send_never_started: true,
+                ..TransitionEvidence::default()
+            },
+        ),
+        AttemptEnd::SentOutcomeUnknown { tx_hash } => (
+            OperationState::SentOutcomeUnknown,
+            TransitionEvidence {
+                result: Some(OperationResult {
+                    tx_hash: *tx_hash,
+                    ..OperationResult::default()
+                }),
+                ..TransitionEvidence::default()
+            },
+        ),
+    };
+    let mut guard = lock_audit(writer)?;
+    OperationRecorder::new(window, profile, &mut *guard, request_id)
+        .transition(
+            attempt.operation_id,
+            Some(attempt.attempt_index),
+            to,
+            &evidence,
+        )
+        .map(|_| ())
+        .map_err(crate::operation_entry::operation_refusal)
+}
+
 /// Everything the wallet's recorder needs that the submit layer does not know.
 ///
 /// Built by the verb that is about to submit. The optional halves are the
@@ -396,6 +481,7 @@ pub struct WalletSubmissionRecorder<'a> {
     sequence_floor: Option<&'a dyn SequenceFloorHook>,
     approval: Option<ApprovalTombstone>,
     provenance: Option<stellar_agent_core::mainnet::decision::MainnetProvenance>,
+    operation: Option<OperationAttempt>,
 }
 
 impl std::fmt::Debug for WalletSubmissionRecorder<'_> {
@@ -409,6 +495,7 @@ impl std::fmt::Debug for WalletSubmissionRecorder<'_> {
             .field("has_sequence_floor", &self.sequence_floor.is_some())
             .field("has_approval", &self.approval.is_some())
             .field("has_provenance", &self.provenance.is_some())
+            .field("operation", &self.operation)
             .finish()
     }
 }
@@ -491,6 +578,7 @@ impl<'a> WalletSubmissionRecorder<'a> {
             approval: None,
             witness: None,
             provenance: None,
+            operation: None,
         }
     }
 
@@ -545,6 +633,51 @@ impl<'a> WalletSubmissionRecorder<'a> {
     pub fn with_approval(mut self, approval: Option<ApprovalTombstone>) -> Self {
         self.approval = approval;
         self
+    }
+
+    /// Attaches the operation attempt this submission sends.
+    ///
+    /// The consumption of the grant then commits the attempt's exposure in its
+    /// own commit. Every end of the submission ends the attempt: `NotSent`
+    /// where no send started, `SentOutcomeUnknown` after the send.
+    #[must_use]
+    pub fn with_operation(mut self, operation: Option<OperationAttempt>) -> Self {
+        self.operation = operation;
+        self
+    }
+
+    /// Ends the operation attempt as `NotSent` for a submission the submit
+    /// layer refused before any pre-send record. Without an operation
+    /// attempt or an audit writer it does nothing.
+    pub fn end_unsent_attempt(&self, code: &str) {
+        self.end_attempt(&AttemptEnd::NotSent {
+            code: code.to_owned(),
+        });
+    }
+
+    /// Records `end` for the recorder's operation attempt. The submission's
+    /// own result stands either way, so a failure is logged; the attempt
+    /// then stays `Sending` until recovery reads it.
+    fn end_attempt(&self, end: &AttemptEnd) {
+        let (Some(attempt), Some(writer)) = (self.operation, self.audit.as_ref()) else {
+            return;
+        };
+        if let Err(error) = end_operation_attempt(
+            &self.window,
+            self.profile,
+            writer,
+            &self.request_id,
+            attempt,
+            end,
+        ) {
+            tracing::warn!(
+                profile = %self.profile_name,
+                tool = %self.tool,
+                code = error.code(),
+                "submission record: the operation attempt's end was not recorded; it stays \
+                 sending until recovery reads it"
+            );
+        }
     }
 
     fn reservation(&self, intent: &SubmissionIntent) -> SubmissionHold {
@@ -853,6 +986,7 @@ impl SubmissionRecorder for WalletSubmissionRecorder<'_> {
     ) -> Result<AuthorizationConsumed, WalletError> {
         self.consume_for_submission(intent, grant)
             .map_err(|error| error.report("pre_send_authorized"))
+            .inspect_err(|error| self.end_unsent_attempt(error.code()))
     }
 
     async fn outcome(&self, intent: &SubmissionIntent, outcome: &SubmissionOutcome) {
@@ -863,6 +997,7 @@ impl SubmissionRecorder for WalletSubmissionRecorder<'_> {
         }
         match outcome {
             SubmissionOutcome::Success { ledger, created_at } => {
+                self.end_sent_attempt(intent);
                 self.finalize_receipt(intent, ReceiptStatus::Success, Some(*ledger));
                 self.settle_window(intent, WindowSettlement::Confirm(*created_at));
                 self.record_floor(intent).await;
@@ -876,6 +1011,7 @@ impl SubmissionRecorder for WalletSubmissionRecorder<'_> {
                 // audit row and the reservation all stand. The reservation
                 // ends at its accounting horizon or, without an execution
                 // bound, at an operator clear.
+                self.end_sent_attempt(intent);
                 self.record_floor(intent).await;
                 self.tombstone_approval(intent);
             }
@@ -886,10 +1022,22 @@ impl SubmissionRecorder for WalletSubmissionRecorder<'_> {
                 // converted mainnet holds included, the pending row is closed
                 // with `code`, and the receipt that holds the sequence is
                 // removed. A used mainnet authorization stays used.
+                self.end_unsent_attempt(code);
                 self.close_unsent_records(intent, UnwoundAfter::Reservation, code);
                 self.remove_receipt(intent, ReceiptStore::abandon_unsent);
             }
         }
+    }
+}
+
+impl WalletSubmissionRecorder<'_> {
+    /// Ends the operation attempt of a sent submission as
+    /// `SentOutcomeUnknown` with its transaction hash: only the recovery
+    /// passes settle what the network did with the bytes.
+    fn end_sent_attempt(&self, intent: &SubmissionIntent) {
+        self.end_attempt(&AttemptEnd::SentOutcomeUnknown {
+            tx_hash: stellar_agent_core::hex::decode_hex32(&intent.tx_hash).ok(),
+        });
     }
 }
 
@@ -1335,10 +1483,41 @@ impl WalletSubmissionRecorder<'_> {
             submission_anchor: intent.submission_anchor.clone().map(Box::new),
         });
         let authorization_id = authorization.id();
-        if let Err(e) =
-            self.window
-                .consume_authorization(self.profile, authorization_id, &expect, &binding)
-        {
+        let consumed = match self.operation {
+            Some(attempt) => {
+                let mut guard = match lock_audit(writer) {
+                    Ok(guard) => guard,
+                    Err(error) => {
+                        self.unwind(intent, UnwoundAfter::PendingRow, error.code());
+                        return Err(AuthorizedPathError::Wallet(error));
+                    }
+                };
+                self.window.consume_authorization_exposing(
+                    self.profile,
+                    authorization_id,
+                    &expect,
+                    &binding,
+                    ConsumptionExposure {
+                        operation_id: attempt.operation_id,
+                        attempt_index: attempt.attempt_index,
+                        identity: ExposureIdentity::Classic {
+                            envelope_sha256: envelope_hash,
+                            tx_hash,
+                            sequence: intent.sequence,
+                            max_time: intent.max_time,
+                            receipt: intent.envelope_hash.clone(),
+                        },
+                        audit: &mut *guard,
+                        request_id: &self.request_id,
+                    },
+                )
+            }
+            None => {
+                self.window
+                    .consume_authorization(self.profile, authorization_id, &expect, &binding)
+            }
+        };
+        if let Err(e) = consumed {
             // A duplicate found under the lock is a resend of bytes another
             // submission reserved: its pending row names the same envelope
             // hash and stays open for that submission's settlement. A prior
@@ -1462,6 +1641,7 @@ impl WalletSubmissionRecorder<'_> {
     /// again, so no caller holds it here, and it is a plain append: it lands
     /// during an anchor outage too.
     fn unwind(&self, intent: &SubmissionIntent, reached: UnwoundAfter, code: &str) {
+        self.end_unsent_attempt(code);
         self.close_unsent_records(intent, reached, code);
         self.remove_receipt(intent, ReceiptStore::abandon_pre_submit);
     }
@@ -2806,6 +2986,7 @@ mod tests {
                         nonce_id: None,
                         now_ms: 1_000,
                         provenance: Some(test_provenance()),
+                        operation: None,
                     },
                     receipts,
                     None,
@@ -3311,6 +3492,192 @@ mod tests {
                     .expect("the receipt is claimed")
                     .submitted
             );
+        }
+
+        /// Asserts that the attempt ended as `NotSent` with `code`, and that
+        /// its authorization carries the `Always` release row of class
+        /// `proved_unspent`.
+        fn assert_not_sent(
+            fx: &LedgerFixture,
+            attempt: OperationAttempt,
+            authorization: AuthorizationId,
+            code: &str,
+        ) {
+            let record = fx.operation_record(attempt);
+            assert_eq!(record["state"], "not_sent", "{record}");
+            assert_eq!(record["attempts"][0]["outcome"], "not_sent", "{record}");
+            assert_eq!(record["result"]["error_code"], code, "{record}");
+            let auth = fx.authorization_record(authorization);
+            assert_eq!(auth["native_release"]["class"], "proved_unspent", "{auth}");
+            assert_eq!(auth["native_release"]["bound"], "always", "{auth}");
+        }
+
+        /// A signer refusal after the attempt began ends it as `NotSent` with
+        /// the refusal's code, and the attempt's authorization gets its
+        /// `Always` release row in the same commit. Once the pre-send hook
+        /// was entered the stage-marked recorder leaves the end to the hook.
+        #[tokio::test]
+        #[serial]
+        async fn sign_failure_records_not_sent_with_an_always_row() {
+            let fx = LedgerFixture::new("operation-sign-failure", NOW);
+            let sub = submission();
+            let (attempt, authorization) = fx.linked_attempt(sub.binding.clone(), &[], "order-1");
+            assert_eq!(fx.operation_record(attempt)["state"], "sending");
+            let staged = crate::submission_flow::StageMarkedRecorder::new(
+                fx.recorder(vec![], Some(Arc::clone(&fx.writer)))
+                    .with_operation(Some(attempt)),
+            );
+
+            staged.end_refused_attempt("auth.signer_unavailable");
+
+            assert_not_sent(&fx, attempt, authorization.id(), "auth.signer_unavailable");
+            assert!(
+                fx.audit_kinds()
+                    .iter()
+                    .any(|kind| kind == "operation_transition"),
+                "{:?}",
+                fx.audit_kinds()
+            );
+
+            let fx = LedgerFixture::new("operation-sign-failure-entered", NOW);
+            let (attempt, authorization) = fx.linked_attempt(sub.binding.clone(), &[], "order-2");
+            let staged = crate::submission_flow::StageMarkedRecorder::new(
+                fx.recorder(vec![], Some(Arc::clone(&fx.writer)))
+                    .with_operation(Some(attempt)),
+            );
+            staged
+                .pre_send_authorized(&sub.intent, MainnetSubmitGrant::Tx(authorization))
+                .await
+                .unwrap();
+            let before = fx.operation_record(attempt);
+            staged.end_refused_attempt("network.rpc_timeout");
+            assert_eq!(fx.operation_record(attempt), before);
+            assert_eq!(before["state"], "sending");
+        }
+
+        /// The recorder's outcome ends the attempt, after the exposure the
+        /// consumption committed. The `NotSent` arm ends it as `NotSent` with
+        /// an `Always` release row. Every other arm ends it as
+        /// `SentOutcomeUnknown` with the transaction hash.
+        #[tokio::test]
+        #[serial]
+        async fn outcome_maps_not_sent_and_every_other_arm() {
+            let sub = submission();
+            let tx_hash = sub.intent.tx_hash.clone();
+            let arms = [
+                (
+                    "operation-outcome-not-sent",
+                    SubmissionOutcome::NotSent {
+                        code: "network.rpc_timeout".to_owned(),
+                        error: "nothing was sent".to_owned(),
+                    },
+                ),
+                (
+                    "operation-outcome-success",
+                    SubmissionOutcome::Success {
+                        ledger: 1005,
+                        created_at: None,
+                    },
+                ),
+                (
+                    "operation-outcome-failed",
+                    SubmissionOutcome::OnChainFailed {
+                        code: "submission.tx_failed".to_owned(),
+                    },
+                ),
+                (
+                    "operation-outcome-rejected",
+                    SubmissionOutcome::Rejected {
+                        code: "submission.tx_rejected".to_owned(),
+                        error: "rejected".to_owned(),
+                    },
+                ),
+                (
+                    "operation-outcome-timeout",
+                    SubmissionOutcome::Timeout {
+                        tx_hash: tx_hash.clone(),
+                    },
+                ),
+                (
+                    "operation-outcome-transport",
+                    SubmissionOutcome::TransportAfterSend {
+                        error: "connection reset".to_owned(),
+                    },
+                ),
+            ];
+            for (label, outcome) in arms {
+                let fx = LedgerFixture::new(label, NOW);
+                let holds = holds(&fx, 100);
+                let (attempt, authorization) =
+                    fx.linked_attempt(sub.binding.clone(), &holds, "order-1");
+                let id = authorization.id();
+                let recorder = fx
+                    .recorder(holds, Some(Arc::clone(&fx.writer)))
+                    .with_operation(Some(attempt));
+                recorder
+                    .pre_send_authorized(&sub.intent, MainnetSubmitGrant::Tx(authorization))
+                    .await
+                    .unwrap();
+                assert!(
+                    fx.operation_record(attempt)["attempts"][0]["exposure"].is_object(),
+                    "{label}: the consumption commits the exposure"
+                );
+
+                recorder.outcome(&sub.intent, &outcome).await;
+
+                if let SubmissionOutcome::NotSent { code, .. } = &outcome {
+                    assert_not_sent(&fx, attempt, id, code);
+                } else {
+                    let record = fx.operation_record(attempt);
+                    assert_eq!(record["state"], "sent_outcome_unknown", "{label}: {record}");
+                    assert_eq!(record["result"]["tx_hash"], tx_hash.as_str(), "{label}");
+                    assert!(
+                        fx.authorization_record(id).get("native_release").is_none(),
+                        "{label}: the spend stays counted"
+                    );
+                }
+            }
+        }
+
+        /// A grant without holds, consumed by a recorder that sizes no window
+        /// entries, records both stages of its attempt. The consumption commits
+        /// the exposure with the attempt still `Sending`, and the outcome then
+        /// records `SentOutcomeUnknown`.
+        #[tokio::test]
+        #[serial]
+        async fn zero_entry_path_records_both_stages() {
+            let fx = LedgerFixture::new("operation-zero-entry", NOW);
+            let sub = submission();
+            let (attempt, authorization) = fx.linked_attempt(sub.binding.clone(), &[], "order-1");
+            let recorder = fx
+                .recorder(vec![], Some(Arc::clone(&fx.writer)))
+                .with_operation(Some(attempt));
+
+            recorder
+                .pre_send_authorized(&sub.intent, MainnetSubmitGrant::Tx(authorization))
+                .await
+                .unwrap();
+            let exposed = fx.operation_record(attempt);
+            assert_eq!(exposed["state"], "sending", "{exposed}");
+            assert_eq!(
+                exposed["attempts"][0]["exposure"]["identity"]["classic"]["tx_hash"],
+                sub.intent.tx_hash.as_str(),
+                "{exposed}"
+            );
+            assert_eq!(reservations(&fx), 0);
+
+            recorder
+                .outcome(
+                    &sub.intent,
+                    &SubmissionOutcome::Success {
+                        ledger: 1005,
+                        created_at: None,
+                    },
+                )
+                .await;
+            let ended = fx.operation_record(attempt);
+            assert_eq!(ended["state"], "sent_outcome_unknown", "{ended}");
+            assert_eq!(ended["attempts"][0]["outcome"], "sent_outcome_unknown");
         }
 
         /// An authorization minted without holds is consumed by a recorder

@@ -86,6 +86,8 @@ mod x402_audit_gate_integration;
 
 #[path = "mcp/transaction_status_wire_guard.rs"]
 mod transaction_status_wire_guard;
+#[path = "mcp/value_tool_wire_guard.rs"]
+mod value_tool_wire_guard;
 
 #[path = "mcp/proof_rows.rs"]
 mod proof_rows;

@@ -629,6 +629,7 @@ async fn remote_approval_browser_drives_real_payment_commit() {
             memo_hash_hex: None,
             memo_return_hex: None,
             classic_base: Some(FEE_STROOPS.to_string()),
+            business_id: None,
         })
         .await
         .expect("simulate must succeed against funded accounts");
@@ -921,6 +922,7 @@ async fn remote_approval_browser_drives_real_payment_commit() {
             envelope_xdr,
             approval_nonce: Some(approval_nonce),
             approval_attestation: Some(attestation_b64),
+            business_id: None,
         })
         .await
         .expect("commit must pass the gate and submit on-chain");

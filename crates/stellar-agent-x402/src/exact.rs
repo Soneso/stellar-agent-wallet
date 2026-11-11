@@ -187,6 +187,14 @@ pub struct AuthorizationToTransmit<'a> {
     /// The cross-check witness obtained before signing, when the payment's
     /// value required one.
     pub cross_check: Option<&'a CrossCheckWitness>,
+    /// The operation attempt the payment sends, when it runs under an
+    /// operation record.
+    pub operation: Option<stellar_agent_network::OperationAttempt>,
+    /// The intent authorization the entries were signed under; `None` for a
+    /// payment without mainnet authority.
+    pub authorization_id: Option<stellar_agent_network::mainnet::AuthorizationId>,
+    /// SHA-256 over the XDR of the signed authorization entries.
+    pub signed_entries_sha256: [u8; 32],
 }
 
 /// A signed payment and the cross-check outcome of its construction.
@@ -401,6 +409,7 @@ pub struct X402MainnetProofs<'a> {
     audit: Option<stellar_agent_network::mainnet::audit_readiness::AuditReadiness>,
     store: &'a stellar_agent_network::policy_state::PersistedWindowStore,
     authenticated: Option<stellar_agent_network::mainnet::message::MessageUseReceipt>,
+    operation: Option<stellar_agent_network::policy_state::OperationLink>,
 }
 
 #[cfg(feature = "mainnet-write")]
@@ -431,7 +440,20 @@ impl<'a> X402MainnetProofs<'a> {
             audit: Some(audit),
             store,
             authenticated: None,
+            operation: None,
         }
+    }
+
+    /// Links the intent authorization to the next attempt of an operation
+    /// record: the mint carries `link`, and that attempt alone can claim the
+    /// authorization.
+    #[must_use]
+    pub fn with_operation(
+        mut self,
+        link: stellar_agent_network::policy_state::OperationLink,
+    ) -> Self {
+        self.operation = Some(link);
+        self
     }
 
     /// Adds the receipt of the consumed message authorization that the
@@ -449,6 +471,43 @@ impl<'a> X402MainnetProofs<'a> {
     }
 }
 
+/// Runs after the intent authorization is minted and before the entry is
+/// signed. It returns the operation attempt it committed as `Sending`, or
+/// `None` for a payment without an operation record. An error returns at
+/// once and nothing is signed.
+#[cfg(feature = "mainnet-write")]
+pub type BeforeSign<'h> = Box<
+    dyn FnOnce(
+            stellar_agent_network::mainnet::AuthorizationId,
+        ) -> Result<Option<stellar_agent_network::OperationAttempt>, X402Error>
+        + Send
+        + 'h,
+>;
+
+/// Runs after the transmit gate and the intent consumption, immediately
+/// before the signed re-simulation first sends the signed entries. It
+/// commits the attempt's exposure and consumes nothing. An error returns at
+/// once and nothing is sent.
+#[cfg(feature = "mainnet-write")]
+pub type BeforeExposure<'h> =
+    Box<dyn FnOnce(&AuthorizationToTransmit<'_>) -> Result<(), X402Error> + Send + 'h>;
+
+/// The operation steps of an authorized payment.
+#[cfg(feature = "mainnet-write")]
+pub struct OperationHooks<'h> {
+    /// The step before the signature.
+    pub before_sign: BeforeSign<'h>,
+    /// The step before the first transmission of the signed entries.
+    pub expose: BeforeExposure<'h>,
+}
+
+#[cfg(feature = "mainnet-write")]
+impl std::fmt::Debug for OperationHooks<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OperationHooks").finish_non_exhaustive()
+    }
+}
+
 /// A payment whose child authorization must be consumed before payload release.
 #[cfg(feature = "mainnet-write")]
 pub struct AuthorizedPayment {
@@ -462,6 +521,11 @@ pub struct AuthorizedPayment {
 ///
 /// The context supplies the profile and all transports. The intent is consumed
 /// before signed simulation; the returned child remains open for payload release.
+///
+/// `hooks` carries the operation steps: `before_sign` runs after the mint and
+/// before the signature, and `expose` runs after the transmit gate and the
+/// intent consumption, before the signed re-simulation. The signed entries
+/// leave the wallet only after both returned `Ok`.
 ///
 /// The endpoint check is the context's mainnet probe, which returns no
 /// endpoint identity, so the ledger trace of this path carries no protocol
@@ -480,6 +544,7 @@ pub async fn create_payment_authorized(
     value: stellar_agent_core::cross_check::CrossCheckValue<'_>,
     identity_deadline: Instant,
     before_transmit: impl FnOnce(&AuthorizationToTransmit<'_>) -> Result<(), X402Error>,
+    hooks: OperationHooks<'_>,
 ) -> Result<AuthorizedPayment, X402Error> {
     validate_requirements_for_payment(requirements, proofs.context.network_passphrase())?;
     let client = proofs
@@ -497,6 +562,7 @@ pub async fn create_payment_authorized(
         identity_deadline,
         before_transmit,
         Some((&mut proofs, consumer, value)),
+        Some(hooks),
     )
     .await?;
     let authorization = authorization.ok_or_else(|| X402Error::TransactionBuildFailed {
@@ -748,6 +814,8 @@ pub async fn create_payment(
         before_transmit,
         #[cfg(feature = "mainnet-write")]
         None,
+        #[cfg(feature = "mainnet-write")]
+        None,
     )
     .await
     .map(|(payment, _)| payment)
@@ -783,6 +851,7 @@ async fn create_payment_inner(
         stellar_agent_network::mainnet::MainnetConsumer,
         stellar_agent_core::cross_check::CrossCheckValue<'_>,
     )>,
+    #[cfg(feature = "mainnet-write")] hooks: Option<OperationHooks<'_>>,
 ) -> Result<(CreatedPayment, ReleaseAuthorization), X402Error> {
     #[cfg(feature = "mainnet-write")]
     use stellar_agent_network::mainnet::resolve::{
@@ -1026,6 +1095,18 @@ async fn create_payment_inner(
     #[cfg(feature = "mainnet-write")]
     let mut open_intent = None;
     #[cfg(feature = "mainnet-write")]
+    let (before_sign, mut expose) = match hooks {
+        Some(OperationHooks {
+            before_sign,
+            expose,
+        }) => (Some(before_sign), Some(expose)),
+        None => (None, None),
+    };
+    #[cfg(feature = "mainnet-write")]
+    let mut operation = None;
+    #[cfg(feature = "mainnet-write")]
+    let mut intent_authorization_id = None;
+    #[cfg(feature = "mainnet-write")]
     let authorization = if let Some((proofs, _, _)) = mainnet.as_mut() {
         let audit = proofs
             .audit
@@ -1048,6 +1129,7 @@ async fn create_payment_inner(
             audit,
             store: proofs.store,
             authenticated: proofs.authenticated.as_ref(),
+            operation: proofs.operation,
         })
         .await?;
         open_intent = Some(OpenAuthorization {
@@ -1056,6 +1138,12 @@ async fn create_payment_inner(
             id: Some(authorization.id()),
             point: FailurePoint::Signing { unavailable: false },
         });
+        intent_authorization_id = Some(authorization.id());
+        // The attempt is committed before the signature exists; a refusal
+        // invalidates the open intent through the guard above.
+        if let Some(before_sign) = before_sign {
+            operation = before_sign(authorization.id())?;
+        }
         Some(authorization)
     } else {
         None
@@ -1140,6 +1228,13 @@ async fn create_payment_inner(
             .map_err(|e| X402Error::TransactionBuildFailed {
                 detail: format!("auth VecM for re-simulate construction failed: {e:?}"),
             })?;
+    let signed_entries_sha256: [u8; 32] =
+        Sha256::digest(auth_vecm.to_xdr(Limits::none()).map_err(|e| {
+            X402Error::TransactionBuildFailed {
+                detail: format!("signed auth entries to_xdr failed: {e}"),
+            }
+        })?)
+        .into();
 
     let resim_op = Operation {
         source_account: None,
@@ -1168,7 +1263,7 @@ async fn create_payment_inner(
     // The gate records the authorization before any signed transmission.
     // Mainnet also consumes the intent before the request. Either refusal keeps
     // the signature local.
-    before_transmit(&AuthorizationToTransmit {
+    let transmit = AuthorizationToTransmit {
         network: &requirements.network,
         scheme: &requirements.scheme,
         payer: &payer_strkey,
@@ -1177,7 +1272,17 @@ async fn create_payment_inner(
         amount,
         signature_expiration_ledger,
         cross_check: cross_check.witness(),
-    })?;
+        #[cfg(feature = "mainnet-write")]
+        operation,
+        #[cfg(not(feature = "mainnet-write"))]
+        operation: None,
+        #[cfg(feature = "mainnet-write")]
+        authorization_id: intent_authorization_id,
+        #[cfg(not(feature = "mainnet-write"))]
+        authorization_id: None,
+        signed_entries_sha256,
+    };
+    before_transmit(&transmit)?;
 
     #[cfg(feature = "mainnet-write")]
     let receipt = if let Some(signed) = signed_intent {
@@ -1197,6 +1302,12 @@ async fn create_payment_inner(
     } else {
         None
     };
+    // The exposure commits after the consumption and before the request
+    // below, the first that carries the signed entries.
+    #[cfg(feature = "mainnet-write")]
+    if let Some(expose) = expose.take() {
+        expose(&transmit)?;
+    }
 
     // ── Step 8: Re-simulate with signed auth (MANDATORY) ─────────────────────
     // Without re-simulation, submit traps with:

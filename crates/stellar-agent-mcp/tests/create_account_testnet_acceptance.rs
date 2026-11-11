@@ -195,6 +195,7 @@ async fn t1_sponsored_create_account_two_phase_happy_path() {
             starting_balance: serde_json::from_str(STARTING_BALANCE_XLM_JSON)
                 .expect("starting_balance parses as McpAmountArgument"),
             classic_base: Some(FEE_STROOPS.to_string()),
+            business_id: None,
         })
         .await
         .expect("simulate must not error");
@@ -229,6 +230,7 @@ async fn t1_sponsored_create_account_two_phase_happy_path() {
             envelope_xdr,
             approval_nonce: None,
             approval_attestation: None,
+            business_id: None,
         })
         .await
         .expect("commit must pass the gate and submit on-chain");

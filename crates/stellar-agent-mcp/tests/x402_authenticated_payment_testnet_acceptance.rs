@@ -526,6 +526,7 @@ async fn a6f_neg1_unreachable_domain_aborts_before_payment() {
             address: None,
             approval_nonce: None,
             approval_attestation: None,
+            business_id: None,
         })
         .await
         .expect("dispatch_gate must not raise ErrorData for a valid chain_id");
@@ -594,6 +595,7 @@ async fn a6f_neg2_invalid_home_domain_aborts_before_payment() {
             address: None,
             approval_nonce: None,
             approval_attestation: None,
+            business_id: None,
         })
         .await
         .expect("dispatch_gate must not raise ErrorData for a valid chain_id");
@@ -675,6 +677,7 @@ async fn a6f_positive_testanchor_sep10_authenticated_payment() {
             address: None,
             approval_nonce: None,
             approval_attestation: None,
+            business_id: None,
         })
         .await
         .expect("dispatch_gate must not raise ErrorData for a valid chain_id");

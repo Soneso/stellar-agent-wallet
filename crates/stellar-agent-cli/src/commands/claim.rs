@@ -166,6 +166,10 @@ use crate::commands::policy_engine::{
     evaluate_mainnet_policy, evaluate_opaque_signing_policy, evaluate_value_moving_policy,
     load_mainnet_policy_engine, with_total_fee,
 };
+use crate::common::business_entry::{
+    BoundEnvelope, ClassicStart, bind_envelope, classic_start, entry_business_id,
+    mainnet_business_id, signing_envelope, write_replay,
+};
 use crate::common::mainnet_write::{
     MainnetWriteRequest, authorize_and_submit, mainnet_context, mainnet_profiles_dir,
     mainnet_write_build_refusal, require_v1_engine,
@@ -186,6 +190,7 @@ use crate::common::signer_ceremony::{
 };
 use crate::common::{ResolvedProfileName, resolve_profile_name};
 use stellar_agent_network::operational::read_within_readiness_deadline;
+use stellar_agent_network::policy_state::{OperationKind, OperationTool, OperationView};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Constants
@@ -229,6 +234,11 @@ pub struct ClaimResult {
     /// Absent for `--build-only`, which neither signs nor sends.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cross_check: Option<CrossCheckView>,
+
+    /// The business id the run named, echoed off mainnet, where no record
+    /// exists. Absent when the run named none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub business_id: Option<String>,
 }
 
 /// The unsigned envelope plus the metadata produced by the build stage.
@@ -273,7 +283,16 @@ struct ClaimBuildFailure {
 /// Rendered once, by [`render_claim_outcome`].
 struct ClaimOutcome {
     preview: Option<ClaimPreview>,
-    result: Result<ClaimResult, Envelope<()>>,
+    result: ClaimEnd,
+}
+
+/// How a run ends: with its stage's result, or with the stored state of the
+/// operation its business id names.
+enum ClaimEnd {
+    /// The stage's result.
+    Stage(Result<ClaimResult, Envelope<()>>),
+    /// The operation needs no further work.
+    Replay(Box<OperationView>),
 }
 
 impl ClaimOutcome {
@@ -281,7 +300,7 @@ impl ClaimOutcome {
     fn failed(envelope: Envelope<()>) -> Self {
         Self {
             preview: None,
-            result: Err(envelope),
+            result: ClaimEnd::Stage(Err(envelope)),
         }
     }
 
@@ -289,7 +308,7 @@ impl ClaimOutcome {
     fn failed_after_preview(preview: ClaimPreview, envelope: Envelope<()>) -> Self {
         Self {
             preview: Some(preview),
-            result: Err(envelope),
+            result: ClaimEnd::Stage(Err(envelope)),
         }
     }
 
@@ -297,7 +316,7 @@ impl ClaimOutcome {
     fn succeeded(preview: Option<ClaimPreview>, result: ClaimResult) -> Self {
         Self {
             preview,
-            result: Ok(result),
+            result: ClaimEnd::Stage(Ok(result)),
         }
     }
 
@@ -306,7 +325,15 @@ impl ClaimOutcome {
     fn from_build_failure(failure: ClaimBuildFailure) -> Self {
         Self {
             preview: failure.preview.map(|preview| *preview),
-            result: Err(claim_error_envelope(&failure.error)),
+            result: ClaimEnd::Stage(Err(claim_error_envelope(&failure.error))),
+        }
+    }
+
+    /// The stored state of the operation the run's business id names.
+    fn replayed(view: OperationView) -> Self {
+        Self {
+            preview: None,
+            result: ClaimEnd::Replay(Box::new(view)),
         }
     }
 }
@@ -399,6 +426,12 @@ pub struct ClaimArgs {
     /// URL credentials are refused.
     #[arg(long, value_name = "URL", value_parser = EndpointUrlFlag)]
     pub rpc_url: Option<String>,
+    /// Business id naming this value operation: 1 to 64 printable ASCII
+    /// characters, no space. Required on mainnet, where a retry with the
+    /// same id prints the stored operation instead of doing new work; on
+    /// another network it is validated and echoed.
+    #[arg(long = "business-id", value_name = "ID")]
+    pub business_id: Option<String>,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -542,6 +575,11 @@ where
     if context.chain_id.is_mainnet() {
         return run_mainnet_pipeline(args, resolved, profile, init_keyring).await;
     }
+    // Off mainnet a supplied business id is validated and echoed, and no
+    // record exists.
+    if let Err(e) = entry_business_id(profile, args.business_id.as_deref()) {
+        return ClaimOutcome::failed(Envelope::<()>::err(&e));
+    }
 
     // Every gated stage reads the owner key from the keyring through
     // `build_v1_policy_engine` when the resolved profile is V1, including
@@ -637,6 +675,7 @@ where
             stage: "build".to_owned(),
             balance_id_hex72: Some(built.balance_id_hex72),
             cross_check: None,
+            business_id: args.business_id.clone(),
         },
     )
 }
@@ -700,6 +739,7 @@ where
                 stage: "sign".to_owned(),
                 balance_id_hex72: None,
                 cross_check: cross_check.as_ref().map(CrossCheckOutcome::view),
+                business_id: args.business_id.clone(),
             },
         ),
         Err(e) => ClaimOutcome::failed(Envelope::<()>::err(&e)),
@@ -842,6 +882,7 @@ where
                 stage: "submit".to_owned(),
                 balance_id_hex72: None,
                 cross_check: cross_check.as_ref().map(CrossCheckOutcome::view),
+                business_id: args.business_id.clone(),
             },
         ),
         Err(e) => ClaimOutcome::failed(Envelope::<()>::err(&e)),
@@ -1338,6 +1379,7 @@ where
                 stage: "build+sign+submit".to_owned(),
                 balance_id_hex72: Some(built.balance_id_hex72),
                 cross_check: Some(cross_check.view()),
+                business_id: args.business_id.clone(),
             },
         ),
         Err(e) => failed(crate::commands::submission_record::error_envelope(
@@ -1361,7 +1403,7 @@ where
 /// therefore sees the balance disclosure even when a guard refuses.
 ///
 /// `id` is the balance id [`claim_inputs`] parsed. Every read goes through
-/// `client`, whose endpoint [`fetch_claim_preview`] checks before the first
+/// `client`, whose endpoint [`check_claim_endpoint`] checks before the first
 /// of them.
 ///
 /// # Errors
@@ -1375,7 +1417,29 @@ async fn build_unsigned_envelope(
     args: &ClaimArgs,
     id: BalanceId,
 ) -> Result<BuiltClaimEnvelope, ClaimBuildFailure> {
-    let previewed = fetch_claim_preview(client, context, args, id)
+    let checked = check_claim_endpoint(client, context)
+        .await
+        .map_err(|error| ClaimBuildFailure {
+            error,
+            preview: None,
+        })?;
+    build_on_checked_endpoint(client, context, args, id, checked).await
+}
+
+/// [`build_unsigned_envelope`] through `client`, whose endpoint `checked`
+/// holds the passed identity and readiness checks of.
+///
+/// # Errors
+///
+/// As [`build_unsigned_envelope`], without the endpoint check.
+async fn build_on_checked_endpoint(
+    client: &StellarRpcClient,
+    context: &NetworkContext,
+    args: &ClaimArgs,
+    id: BalanceId,
+    checked: CheckedEndpoint,
+) -> Result<BuiltClaimEnvelope, ClaimBuildFailure> {
+    let previewed = fetch_claim_preview(client, args, id, checked)
         .await
         .map_err(|error| ClaimBuildFailure {
             error,
@@ -1429,23 +1493,45 @@ fn claim_inputs(args: &ClaimArgs) -> Result<BalanceId, ClaimError> {
     Ok(id)
 }
 
-/// Checks the endpoint of `client`, fetches the entry of the balance `id` and
-/// the source account, and builds the typed preview.
+/// The endpoint checks a claim's reads follow: what the readiness check
+/// observed, and its deadline, which bounds the source account read.
+struct CheckedEndpoint {
+    operational: OperationalReport,
+    readiness_deadline: tokio::time::Instant,
+}
+
+/// Checks the endpoint of `client` before the claim's first read.
 ///
 /// The identity check gets a
-/// [`PRE_SEND_BUDGET`](stellar_agent_network::PRE_SEND_BUDGET). The
-/// readiness check gets a fresh one, and the source account read runs under
-/// the readiness check's deadline.
-async fn fetch_claim_preview(
+/// [`PRE_SEND_BUDGET`](stellar_agent_network::PRE_SEND_BUDGET), and the
+/// readiness check gets a fresh one.
+async fn check_claim_endpoint(
     client: &StellarRpcClient,
     context: &NetworkContext,
-    args: &ClaimArgs,
-    id: BalanceId,
-) -> Result<PreviewedClaim, ClaimError> {
-    let budget = stellar_agent_network::PRE_SEND_BUDGET;
-    check_endpoint_identity(client, context, budget).await?;
+) -> Result<CheckedEndpoint, ClaimError> {
+    check_endpoint_identity(client, context, stellar_agent_network::PRE_SEND_BUDGET).await?;
     let readiness_deadline = stellar_agent_network::operational::readiness_deadline();
     let operational = check_endpoint_ready(client, readiness_deadline).await?;
+    Ok(CheckedEndpoint {
+        operational,
+        readiness_deadline,
+    })
+}
+
+/// Fetches the entry of the balance `id` and the source account through
+/// `client`, whose endpoint `checked` holds the checks of, and builds the
+/// typed preview. The source account read runs under the readiness check's
+/// deadline.
+async fn fetch_claim_preview(
+    client: &StellarRpcClient,
+    args: &ClaimArgs,
+    id: BalanceId,
+    checked: CheckedEndpoint,
+) -> Result<PreviewedClaim, ClaimError> {
+    let CheckedEndpoint {
+        operational,
+        readiness_deadline,
+    } = checked;
 
     let entry = fetch_claimable_balance_entry(client, &id).await?;
 
@@ -1772,6 +1858,10 @@ fn claim_error_envelope(err: &ClaimError) -> Envelope<()> {
 /// with the failure on stderr, whatever the outcome.
 fn render_claim_outcome(out: &mut dyn Write, format: OutputFormat, outcome: ClaimOutcome) -> i32 {
     let ClaimOutcome { preview, result } = outcome;
+    let result = match result {
+        ClaimEnd::Stage(result) => result,
+        ClaimEnd::Replay(view) => return write_replay(out, format, &view),
+    };
     let exit_code = if result.is_ok() { 0 } else { 1 };
     if format == OutputFormat::Table {
         return exit_code_after_output(
@@ -1835,6 +1925,10 @@ fn render_claim_table(
             preview.is_claimant
         ));
     }
+    let business_id = result
+        .as_ref()
+        .ok()
+        .and_then(|result| result.business_id.as_deref());
     match result {
         Ok(result) => match (&result.tx_hash, &result.ledger) {
             (Some(hash), Some(ledger)) => {
@@ -1862,6 +1956,9 @@ fn render_claim_table(
             }
         }
     }
+    if let Some(business_id) = business_id {
+        lines.push(format!("business_id {business_id}"));
+    }
     for line in &lines {
         writeln!(out, "{line}")?;
     }
@@ -1877,11 +1974,12 @@ fn render_claim_table(
 /// A build without mainnet writes refuses first. The signer choice from the
 /// flags follows and refuses `--secret-env` before anything else runs. The
 /// stored profile of the explicit selection replaces the merged one at the
-/// write context, and every later step reads it from the context. The claim
-/// builds before its reconcile, as on testnet, with the context's primary
-/// client; the probe runs inside the build. The verified policy with the
-/// built fee, the signed fee cap, the audit pre-flight and the bound witness
-/// follow, and [`authorize_and_submit`] runs the rest.
+/// write context, and every later step reads it from the context. The
+/// endpoint checks and the reconcile run with the context's primary client.
+/// The business id lookup follows under the verified policy, before the
+/// balance read and the build. The policy evaluation with the built fee, the
+/// signed fee cap, the audit pre-flight and the bound witness follow, and
+/// [`authorize_and_submit`] runs the rest.
 async fn run_mainnet_pipeline<InitKeyring>(
     args: &ClaimArgs,
     resolved: &ResolvedProfileName,
@@ -1940,17 +2038,17 @@ where
         Ok(client) => client,
         Err(e) => return ClaimOutcome::failed(Envelope::<()>::err(&e)),
     };
-    let built = match build_unsigned_envelope(&client, &net_context, args, id).await {
-        Ok(built) => built,
-        Err(failure) => return ClaimOutcome::from_build_failure(failure),
+    let checked = match check_claim_endpoint(&client, &net_context).await {
+        Ok(checked) => checked,
+        Err(error) => return ClaimOutcome::failed(claim_error_envelope(&error)),
     };
-    let preview = built.preview.clone();
-    let failed = |envelope: Envelope<()>| ClaimOutcome::failed_after_preview(preview, envelope);
-
     let now_ms = match stellar_agent_core::timefmt::now_unix_ms() {
         Ok(v) => v,
         Err(e) => {
-            return failed(Envelope::<()>::err_raw("wallet.clock_error", e.to_string()));
+            return ClaimOutcome::failed(Envelope::<()>::err_raw(
+                "wallet.clock_error",
+                e.to_string(),
+            ));
         }
     };
     crate::commands::submission_record::reconcile_open_reservations(
@@ -1963,6 +2061,9 @@ where
     )
     .await;
 
+    // The claim's identity is its balance and claimant, which the arguments
+    // name. A retained operation thus answers before the balance read and the
+    // claim guards, whose answers change once the claim ran.
     let policy = match load_mainnet_policy_engine(
         "claim",
         "policy.engine_unavailable",
@@ -1971,9 +2072,58 @@ where
         &profiles_dir,
     ) {
         Ok(policy) => policy,
-        Err(envelope) => return failed(envelope),
+        Err(envelope) => return ClaimOutcome::failed(envelope),
     };
-    let total_fee = match envelope_total_fee(&built.envelope_xdr) {
+    let fee_choice = match parse_classic_fee_choice(args.fee.as_deref()) {
+        Ok(fee_choice) => fee_choice,
+        Err(e) => return ClaimOutcome::failed(claim_error_envelope(&ClaimError::from(e))),
+    };
+    // The id is checked where the run first needs it, after every refusal
+    // a run without one gives, so their codes stay.
+    let business_id = match mainnet_business_id(args.business_id.as_deref()) {
+        Ok(id) => id,
+        Err(e) => return ClaimOutcome::failed(Envelope::<()>::err(&e)),
+    };
+    let operation = match classic_start(
+        &context,
+        &policy,
+        business_id,
+        &args.source,
+        fee_choice,
+        &stellar_xdr::Memo::None,
+        stellar_agent_network::operation_entry::IdentityFacts::Claim {
+            balance_id: id.to_hex72(),
+            claimant: args.source.clone(),
+        },
+    ) {
+        Ok(ClassicStart::Proceed(operation)) => operation,
+        Ok(ClassicStart::Replay(view)) => return ClaimOutcome::replayed(view),
+        Err(e) => return ClaimOutcome::failed(Envelope::<()>::err(&e)),
+    };
+
+    let built = match build_on_checked_endpoint(&client, &net_context, args, id, checked).await {
+        Ok(built) => built,
+        Err(failure) => return ClaimOutcome::from_build_failure(failure),
+    };
+    let preview = built.preview.clone();
+    let failed = |envelope: Envelope<()>| ClaimOutcome::failed_after_preview(preview, envelope);
+
+    let handle = match bind_envelope(
+        &context,
+        operation,
+        OperationTool::CliClaim,
+        OperationKind::Claim,
+        &built.envelope_xdr,
+    ) {
+        Ok(BoundEnvelope::Sign(handle)) => handle,
+        Ok(BoundEnvelope::Replay(view)) => return ClaimOutcome::replayed(view),
+        Err(e) => return failed(Envelope::<()>::err(&e)),
+    };
+    let (unsigned_xdr, fee_per_op_stroops) = match signing_envelope(&handle) {
+        Ok(signing) => signing,
+        Err(e) => return failed(Envelope::<()>::err(&e)),
+    };
+    let total_fee = match envelope_total_fee(unsigned_xdr) {
         Ok(fee) => fee,
         Err(e) => return failed(Envelope::<()>::err(&e)),
     };
@@ -1997,7 +2147,7 @@ where
 
     let body = &policy.body;
     if let Err(e) = check_classic_fee_cap_signed(
-        built.fee_selection.per_op_stroops,
+        fee_per_op_stroops,
         classic_fee_source(built.fee_choice, FeeSource::CommandDefault),
         profile,
         Some(body.classic_max_fee_per_op_stroops),
@@ -2025,7 +2175,7 @@ where
         &net_context,
         stellar_agent_core::cross_check::CrossCheckValue::Unvalued,
         inputs,
-        &built.envelope_xdr,
+        unsigned_xdr,
         &thresholds,
         "stellar_claim",
     )
@@ -2041,7 +2191,7 @@ where
         verb: "claim",
         tool: "stellar_claim",
         consumer: MainnetConsumer::CliClaim,
-        unsigned_xdr: &built.envelope_xdr,
+        unsigned_xdr,
         client: &client,
         probe_deadline: stellar_agent_network::PRE_SEND_BUDGET,
         submit_timeout: submit_timeout(args.timeout_seconds, profile),
@@ -2053,6 +2203,7 @@ where
         effective_cap,
         witness: cross_check.witness(),
         ledger: built.operational.clone(),
+        operation: Some(&handle),
     })
     .await
     {
@@ -2065,6 +2216,7 @@ where
                 stage: "build+sign+submit".to_owned(),
                 balance_id_hex72: Some(built.balance_id_hex72),
                 cross_check: Some(cross_check.view()),
+                business_id: None,
             },
         ),
         Err(envelope) => failed(envelope),
@@ -2076,7 +2228,7 @@ where
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     #![allow(
         clippy::unwrap_used,
         clippy::expect_used,
@@ -2207,6 +2359,7 @@ mod tests {
             output: OutputFormat::Json,
             timeout_seconds: None,
             rpc_url: Some(crate::common::network::TESTNET_RPC_URL.to_owned()),
+            business_id: None,
         }
     }
 
@@ -3402,6 +3555,7 @@ mod tests {
                     stage: "build".to_owned(),
                     balance_id_hex72: None,
                     cross_check: None,
+                    business_id: None,
                 },
             )
         };
@@ -3795,6 +3949,7 @@ mod tests {
             stage: "build+sign+submit".to_owned(),
             balance_id_hex72: Some("00".repeat(36)),
             cross_check: None,
+            business_id: None,
         };
         let json = serde_json::to_value(&result).unwrap();
         assert!(json.get("cross_check").is_none(), "{json}");
@@ -3843,6 +3998,7 @@ mod tests {
                     provider: Some("https://oracle.example".to_owned()),
                     ledger: Some(1001),
                 }),
+                business_id: None,
             },
         );
         let mut out = Vec::new();
@@ -3876,6 +4032,7 @@ mod tests {
                     provider: Some("https://oracle.example".to_owned()),
                     ledger: Some(1001),
                 }),
+                business_id: None,
             },
         );
         let mut out = Vec::new();
@@ -4499,7 +4656,7 @@ mod tests {
     /// The mainnet pipeline over the fixture's stored profile, ceremony and
     /// routed endpoints.
     #[cfg(feature = "mainnet-write")]
-    mod mainnet_full {
+    pub(crate) mod mainnet_full {
         use super::*;
         use std::rc::Rc;
 
@@ -4529,7 +4686,7 @@ mod tests {
 
         /// An endpoint on `passphrase` funding the agent and holding the
         /// agent's claimable balance of `amount` stroops.
-        fn ledger(mainnet: bool, amount: i64) -> ClassicRpc {
+        pub(crate) fn ledger(mainnet: bool, amount: i64) -> ClassicRpc {
             let agent = agent();
             let (key, entry) = claimable_entry_with(&agent, amount);
             let rpc = if mainnet {
@@ -4542,7 +4699,7 @@ mod tests {
 
         /// The fixture `name` whose endpoints hold the agent's 10 XLM
         /// claimable balance.
-        fn spec(name: &'static str) -> Spec {
+        pub(crate) fn spec(name: &'static str) -> Spec {
             Spec::new(name)
                 .primary(ledger(true, 100_000_000))
                 .oracle(ledger(true, 100_000_000))
@@ -4551,27 +4708,29 @@ mod tests {
         /// A claim of the agent's balance on the fixture's profile, with no
         /// signer flag: a mainnet profile signs with the enrolled seed in the
         /// keyring.
-        pub(super) fn mainnet_args(fixture: &MainnetFixture) -> ClaimArgs {
+        pub(crate) fn mainnet_args(fixture: &MainnetFixture) -> ClaimArgs {
             let mut args = minimal_args();
             args.profile = Some(fixture.name.to_owned());
             args.network = None;
             args.rpc_url = None;
             args.balance_id = CLAIM_RPC_BALANCE_HEX64.to_owned();
             args.source = fixture.agent.g.clone();
+            args.business_id = Some(crate::common::business_entry::fresh_business_id());
             args
         }
 
         /// [`mainnet_args`] on a testnet profile, which signs from the seed
-        /// in [`AGENT_VAR`].
+        /// in [`AGENT_VAR`] and names no business id.
         fn testnet_args(fixture: &MainnetFixture) -> ClaimArgs {
             let mut args = mainnet_args(fixture);
             args.secret_env = Some(AGENT_VAR.to_owned());
+            args.business_id = None;
             args
         }
 
-        struct Run {
-            code: i32,
-            envelope: Value,
+        pub(crate) struct Run {
+            pub(crate) code: i32,
+            pub(crate) envelope: Value,
         }
 
         impl Run {
@@ -4580,7 +4739,7 @@ mod tests {
             }
         }
 
-        async fn run(fixture: &MainnetFixture, args: &ClaimArgs) -> Run {
+        pub(crate) async fn run(fixture: &MainnetFixture, args: &ClaimArgs) -> Run {
             let mut out = Vec::new();
             let code =
                 run_with_dependencies(args, fixture.loader(), fixture.initializer(), &mut out)
@@ -4589,6 +4748,16 @@ mod tests {
                 code,
                 envelope: crate::common::render::single_json_document(&out),
             }
+        }
+
+        /// Runs `args` on the fixture and returns the exit code and the text
+        /// the run wrote.
+        pub(crate) async fn run_text(fixture: &MainnetFixture, args: &ClaimArgs) -> (i32, String) {
+            let mut out = Vec::new();
+            let code =
+                run_with_dependencies(args, fixture.loader(), fixture.initializer(), &mut out)
+                    .await;
+            (code, String::from_utf8(out).unwrap())
         }
 
         /// A real browser listener gates the signer, authorization, and submission.

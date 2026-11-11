@@ -936,6 +936,27 @@ struct Session<'a> {
     _lock: Option<ReceiptStoreLock>,
 }
 
+/// One attempt of an operation record, named by the signed envelope its
+/// exposure committed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttemptRef {
+    /// The signed envelope's hash: the bytes of the `envelope_hash` key a
+    /// [`SubmissionReceipt`] carries. One signed envelope names one attempt.
+    EnvelopeHash([u8; 32]),
+}
+
+/// Reads whether a committed proof released an attempt's sequence.
+///
+/// A receipt holds its source sequence until a release is proven. The
+/// window store that records operation attempts answers for them, and the
+/// caller holds that store's guard across the read.
+pub trait SequenceReleases {
+    /// Whether the attempt `attempt` names carries a committed sequence
+    /// release. An attempt the reader cannot find or read answers `false`,
+    /// so an unproven release keeps the sequence held.
+    fn sequence_released(&self, attempt: &AttemptRef) -> bool;
+}
+
 impl ReceiptStore {
     /// Opens (or creates) the receipt store for `profile_name` in the
     /// OS-conventional profile directory.

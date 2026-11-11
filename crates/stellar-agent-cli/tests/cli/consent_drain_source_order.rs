@@ -139,9 +139,10 @@ fn the_mainnet_signer_is_built_between_the_mint_and_the_attach() {
 #[test]
 fn each_mainnet_pipeline_reconciles_after_its_probe_and_before_its_policy() {
     for (file, source) in MAINNET_VERBS {
-        // The claim probe runs inside its envelope build.
+        // The claim probe is its endpoint check, which precedes the record
+        // lookup and the envelope build.
         let after = if *file == "commands/claim.rs" {
-            "build_unsigned_envelope("
+            "check_claim_endpoint("
         } else {
             "check_endpoint_identity("
         };

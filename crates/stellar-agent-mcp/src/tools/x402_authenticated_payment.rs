@@ -239,6 +239,12 @@ pub struct X402AuthenticatedPaymentArgs {
     /// every failure mode, so the modes stay indistinguishable.
     #[serde(default)]
     pub approval_attestation: Option<String>,
+    /// Business id naming this value operation: 1 to 64 printable ASCII
+    /// characters, no space. Required on `stellar:mainnet`, where a retry
+    /// with the same id returns the stored operation instead of new work;
+    /// on another chain it is validated and echoed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub business_id: Option<String>,
 }
 
 /// Prints every field but the attestation, which shows only whether it is
@@ -251,6 +257,7 @@ impl std::fmt::Debug for X402AuthenticatedPaymentArgs {
             .field("home_domain", &self.home_domain)
             .field("address", &self.address)
             .field("approval_nonce", &self.approval_nonce)
+            .field("business_id", &self.business_id)
             .field(
                 "approval_attestation",
                 &crate::tools::common::AttestationPresence(&self.approval_attestation),
@@ -479,6 +486,14 @@ impl WalletServer {
         ) {
             Ok(amount) => amount,
             Err(ref err) => return Ok(x402_error_to_tool_result(err)),
+        };
+        // Off mainnet a supplied id is validated here and echoed. A mainnet
+        // call takes its own path and checks its id at its record lookup,
+        // after every refusal a call without one gives.
+        let business_id = match self.echoed_business_id(&args.chain_id, args.business_id.as_deref())
+        {
+            Ok(id) => id,
+            Err(result) => return Ok(result),
         };
 
         // ── Build the value-carrying leg from the SAME decode ────────────────
@@ -772,6 +787,7 @@ impl WalletServer {
             &requirements,
             &session,
             &created.cross_check,
+            business_id.as_ref(),
         ))
     }
 }
@@ -785,10 +801,11 @@ fn payment_response(
     requirements: &stellar_agent_x402::wire::PaymentRequirements,
     session: &stellar_agent_x402_identity::VerifiedCounterpartySession,
     cross_check: &stellar_agent_network::cross_check::CrossCheckOutcome,
+    business_id: Option<&stellar_agent_network::policy_state::BusinessId>,
 ) -> CallToolResult {
     let payto_anchored = compute_payto_anchored(&requirements.pay_to, &session.accounts);
     let authorization = format!("Bearer {}", session.jwt);
-    let response = json!({
+    let mut response = json!({
         "paymentSignature": payment_signature,
         "authorization": authorization,
         "payer": payer,
@@ -800,6 +817,7 @@ fn payment_response(
         "payto_anchored": payto_anchored.as_str(),
         "cross_check": cross_check.view(),
     });
+    crate::tools::business_entry::echo_business_id(&mut response, business_id);
     let envelope = stellar_agent_core::envelope::Envelope::ok(response);
     let json_str = envelope
         .to_json_pretty()
@@ -943,6 +961,26 @@ impl WalletServer {
             Ok(digest) => digest,
             Err(error) => return Ok(x402_error_to_tool_result(&error)),
         };
+        // The payment names its operation; a retained one answers here with
+        // its stored state, and an unknown id opens its record.
+        let entry = match self.x402_entry(
+            &args.chain_id,
+            args.business_id.as_deref(),
+            stellar_agent_network::policy_state::OperationTool::X402AuthenticatedPayment,
+            stellar_agent_network::policy_state::OperationKind::X402AuthenticatedPayment,
+            digest,
+            stellar_agent_network::policy_state::X402Intent {
+                network: requirements.network.clone(),
+                asset: requirements.asset.clone(),
+                payer: payer.clone(),
+                pay_to: requirements.pay_to.clone(),
+                amount: requirements.amount.clone(),
+            },
+        ) {
+            Ok(entry) => entry,
+            Err(result) => return Ok(result),
+        };
+        let business_id = entry.as_ref().map(|handle| handle.business_id().clone());
         let value = ValueClass::single(x402_value_leg(&requirements, amount));
         let audit_leg = ValueLegRecord::from(&x402_value_leg(&requirements, amount));
         let dispatch = match self
@@ -1005,6 +1043,7 @@ impl WalletServer {
                 endpoint_host: guard.enablement.endpoint_host(),
                 signer: &payer,
                 requirements: &requirements,
+                business_id: business_id.as_ref(),
             }));
         }
         let approval = match verify_attestation_subject_gate(
@@ -1092,31 +1131,42 @@ impl WalletServer {
         };
         let mut audit = X402AuthorizationAudit::new(self, TOOL, &args.chain_id, audit_leg)
             .with_decision(PolicyDecision::RequireApproval);
+        let steps = crate::tools::business_entry::X402Steps::new(self, entry);
+        let proofs = X402MainnetProofs::new(
+            guard.context,
+            guard.policy,
+            guard.enablement,
+            &authority,
+            &signer,
+            &handle,
+            readiness,
+            &store,
+        )
+        .with_authenticated(receipt);
+        let proofs = match steps.link() {
+            Some(link) => proofs.with_operation(link),
+            None => proofs,
+        };
         let created = create_payment_authorized(
             &requirements,
             MainnetConsumer::X402Authenticated,
-            X402MainnetProofs::new(
-                guard.context,
-                guard.policy,
-                guard.enablement,
-                &authority,
-                &signer,
-                &handle,
-                readiness,
-                &store,
-            )
-            .with_authenticated(receipt),
+            proofs,
             CrossCheckValue::Amount {
                 asset: &asset,
                 base_units: amount,
             },
             tokio::time::Instant::now() + crate::tools::common::submit_timeout(profile),
             |authorization| audit.before_transmit(authorization),
+            steps.hooks(),
         )
         .await;
         let created = match created {
             Ok(created) => created,
             Err(error) => {
+                steps.failed(error.wire_code());
+                if let Some(result) = steps.refusal_result() {
+                    return Ok(result);
+                }
                 // An audit refusal at the transmit gate answers its own
                 // `audit.*` code.
                 if let Some(error) = audit.refusal.take() {
@@ -1141,6 +1191,7 @@ impl WalletServer {
         let id = created.authorization.id();
         let withhold = |failure: ReleaseFailure| {
             let decision = release_decision(failure);
+            steps.withheld();
             if let Some(stage) = decision.cleanup {
                 crate::tools::submission_record::cleanup_authorization(
                     &store,
@@ -1199,12 +1250,14 @@ impl WalletServer {
                 audit.transmitted_ledger(),
             ));
         }
+        steps.released();
         Ok(payment_response(
             &payment_signature,
             &payer,
             &requirements,
             &session,
             &created.payment.cross_check,
+            business_id.as_ref(),
         ))
     }
 
@@ -1626,6 +1679,7 @@ mod tests {
             address: None,
             approval_nonce: None,
             approval_attestation: None,
+            business_id: None,
         };
         let result = server
             .call_stellar_x402_authenticated_payment(args)
@@ -1666,6 +1720,7 @@ mod tests {
             address: None,
             approval_nonce: None,
             approval_attestation: None,
+            business_id: None,
         };
         let result = server.call_stellar_x402_authenticated_payment(args).await;
         let result = result.expect(
@@ -1712,6 +1767,7 @@ mod tests {
                             address: None,
                             approval_nonce: None,
                             approval_attestation: None,
+                            business_id: None,
                         },
                     )),
                 );
@@ -1759,6 +1815,7 @@ mod tests {
             address: None,
             approval_nonce: None,
             approval_attestation: None,
+            business_id: None,
         };
         let result = server
             .call_stellar_x402_authenticated_payment(args)
@@ -1788,6 +1845,7 @@ mod tests {
                 address: None,
                 approval_nonce: None,
                 approval_attestation: None,
+                business_id: Some(crate::tools::common::tests::fresh_business_id()),
             })
             .await
             .unwrap();
@@ -1832,6 +1890,7 @@ mod tests {
             address: None,
             approval_nonce: Some("nonce-1".to_owned()),
             approval_attestation: Some("attestation-secret".to_owned()),
+            business_id: Some(crate::tools::common::tests::fresh_business_id()),
         };
         let text = format!("{args:?}");
         assert!(text.contains("approval_attestation: Some(<set>)"), "{text}");

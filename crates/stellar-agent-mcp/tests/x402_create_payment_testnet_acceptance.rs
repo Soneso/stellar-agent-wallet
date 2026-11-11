@@ -507,6 +507,7 @@ async fn a6_create_payment_returns_signed_payload() {
             payment_required: native_requirements(&recipient, NATIVE_AMOUNT_STROOPS),
             chain_id: TESTNET_CHAIN_ID.to_owned(),
             address: None,
+            business_id: None,
         })
         .await
         .expect("dispatch_gate must not return ErrorData for a valid chain_id");
@@ -575,6 +576,7 @@ async fn a6_create_payment_with_witness_passes() {
             payment_required: native_requirements(&recipient, WITNESS_AMOUNT_STROOPS),
             chain_id: TESTNET_CHAIN_ID.to_owned(),
             address: None,
+            business_id: None,
         })
         .await
         .expect("dispatch_gate must not return ErrorData for a valid chain_id");
@@ -669,6 +671,7 @@ async fn a6_invalid_scheme_returns_error() {
             payment_required: bad_requirements,
             chain_id: TESTNET_CHAIN_ID.to_owned(),
             address: None,
+            business_id: None,
         })
         .await
         .expect("dispatch_gate must not raise ErrorData");
@@ -709,6 +712,7 @@ async fn a6_chain_id_mismatch_returns_error_data() {
             payment_required: requirements_json,
             chain_id: "stellar:pubnet".to_owned(), // mismatch: profile is testnet
             address: None,
+            business_id: None,
         })
         .await
         .expect_err("chain_id mismatch must return Err(ErrorData) from dispatch_gate");

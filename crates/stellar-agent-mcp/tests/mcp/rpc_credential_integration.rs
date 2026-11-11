@@ -142,6 +142,7 @@ async fn missing_primary_credential_reports_keyring_not_found() {
             memo_hash_hex: None,
             memo_return_hex: None,
             classic_base: None,
+            business_id: None,
         })
         .await
         .expect("a credential failure is a tool result, not a protocol error");

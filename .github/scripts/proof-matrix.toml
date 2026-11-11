@@ -355,6 +355,7 @@ id = "status.retry_returns_stored"
 family = "status"
 statement = "a retried call with the same business id returns the stored operation"
 applies = ["commit", "single", "verb"]
+builds = "feature-on"
 
 [[claim]]
 id = "notification.committed_transition"
@@ -386,10 +387,6 @@ builds = "feature-on"
 [[delivery]]
 key = "decision-authority"
 change = "the signed policy's Allow path signs without an approval request, and the CLI confirms per decision"
-
-[[delivery]]
-key = "operation-record"
-change = "a business id names one operation, and a retried call returns its stored state"
 
 [[delivery]]
 key = "recovery-transitions"
@@ -736,10 +733,22 @@ claim = "status.approval_view"
 rows = ["mcp.pay_commit", "mcp.create_account_commit", "mcp.claim_commit", "mcp.trustline_commit", "mcp.x402_create_payment", "mcp.x402_authenticated_payment", "cli.pay", "cli.claim", "cli.trustline", "cli.accounts_create"]
 pending = "status-views"
 
+# Cells: status.retry_returns_stored. Each test retries every kind its
+# surface admits under a retained business id.
+
 [[cell]]
 claim = "status.retry_returns_stored"
-rows = ["mcp.pay_commit", "mcp.create_account_commit", "mcp.claim_commit", "mcp.trustline_commit", "mcp.x402_create_payment", "mcp.x402_authenticated_payment", "cli.pay", "cli.claim", "cli.trustline", "cli.accounts_create"]
-pending = "operation-record"
+rows = ["mcp.pay_commit", "mcp.create_account_commit", "mcp.claim_commit", "mcp.trustline_commit", "mcp.x402_create_payment", "mcp.x402_authenticated_payment"]
+tests = [
+  { package = "stellar-agent-mcp", target = "lib", name = "tools::operation_replay_tests::retried_business_id_returns_the_stored_operation_for_every_kind", builds = "feature-on" },
+]
+
+[[cell]]
+claim = "status.retry_returns_stored"
+rows = ["cli.pay", "cli.claim", "cli.trustline", "cli.accounts_create"]
+tests = [
+  { package = "stellar-agent-cli", target = "bin:stellar-agent", name = "common::operation_replay_tests::every_value_verb_replays_its_business_id", builds = "feature-on" },
+]
 
 # Cells: notification.committed_transition.
 

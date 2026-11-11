@@ -311,6 +311,7 @@ async fn simulate_rejects_invalid_source_strkey() {
         destination: DEST_G.to_owned(),
         starting_balance: serde_json::from_str(r#""1 XLM""#).unwrap(),
         classic_base: None,
+        business_id: None,
     };
     let result = server.call_stellar_create_account(args).await;
     // Should be Err(invalid_params)
@@ -346,6 +347,7 @@ async fn simulate_rejects_invalid_destination_strkey() {
         destination: "NOT_A_VALID_STRKEY".to_owned(),
         starting_balance: serde_json::from_str(r#""1 XLM""#).unwrap(),
         classic_base: None,
+        business_id: None,
     };
     let result = server.call_stellar_create_account(args).await;
     assert!(result.is_err(), "invalid destination must return Err");
@@ -372,6 +374,7 @@ async fn simulate_rejects_chain_id_mismatch() {
         destination: DEST_G.to_owned(),
         starting_balance: serde_json::from_str(r#""1 XLM""#).unwrap(),
         classic_base: None,
+        business_id: None,
     };
     let result = server.call_stellar_create_account(args).await;
     assert!(result.is_err(), "chain_id mismatch must return Err");
@@ -396,6 +399,7 @@ fn simulate_args_on(chain_id: &str, classic_base: Option<&str>) -> StellarCreate
         destination: DEST_G.to_owned(),
         starting_balance: serde_json::from_str(r#""1 XLM""#).unwrap(),
         classic_base: classic_base.map(str::to_owned),
+        business_id: None,
     }
 }
 
@@ -490,6 +494,7 @@ async fn simulate_create_account_fee_auto_selects_p95_and_binds_envelope_fee() {
         destination: DEST_G.to_owned(),
         starting_balance: serde_json::from_str(r#""1 XLM""#).unwrap(),
         classic_base: Some("auto".to_owned()),
+        business_id: None,
     };
     let result = server
         .call_stellar_create_account(args)
@@ -541,6 +546,7 @@ async fn simulate_create_account_fee_auto_p99_selects_p99() {
         destination: DEST_G.to_owned(),
         starting_balance: serde_json::from_str(r#""1 XLM""#).unwrap(),
         classic_base: Some("auto:p99".to_owned()),
+        business_id: None,
     };
     let result = server
         .call_stellar_create_account(args)
@@ -590,6 +596,7 @@ async fn simulate_create_account_fee_explicit_above_profile_cap_fails() {
         destination: DEST_G.to_owned(),
         starting_balance: serde_json::from_str(r#""1 XLM""#).unwrap(),
         classic_base: Some("500".to_owned()),
+        business_id: None,
     };
     let result = server
         .call_stellar_create_account(args)
@@ -654,6 +661,7 @@ async fn mainnet_profile_commit_refuses_with_mainnet_write_forbidden() {
         envelope_xdr: valid_create_account_envelope_b64(),
         approval_nonce: None,
         approval_attestation: None,
+        business_id: None,
     };
     let result = server
         .call_stellar_create_account_commit(args)
@@ -709,6 +717,7 @@ async fn policy_v1_engine_allow_rule_passes_gate() {
         envelope_xdr: valid_create_account_envelope_b64(),
         approval_nonce: None,
         approval_attestation: None,
+        business_id: None,
     };
     let result = server
         .call_stellar_create_account_commit(args)
@@ -756,6 +765,7 @@ async fn policy_v1_engine_no_matching_rule_emits_wire_code() {
         envelope_xdr: valid_create_account_envelope_b64(),
         approval_nonce: None,
         approval_attestation: None,
+        business_id: None,
     };
     let result = server
         .call_stellar_create_account_commit(args)
@@ -800,6 +810,7 @@ async fn policy_v1_engine_explicit_deny_emits_wire_code() {
         envelope_xdr: valid_create_account_envelope_b64(),
         approval_nonce: None,
         approval_attestation: None,
+        business_id: None,
     };
     let result = server
         .call_stellar_create_account_commit(args)
@@ -840,6 +851,7 @@ async fn commit_returns_nonce_expired_on_bad_nonce() {
         envelope_xdr: valid_create_account_envelope_b64(),
         approval_nonce: None,
         approval_attestation: None,
+        business_id: None,
     };
     let result = server
         .call_stellar_create_account_commit(args)
@@ -879,6 +891,7 @@ async fn commit_returns_nonce_expired_on_wrong_length_nonce() {
         envelope_xdr: valid_create_account_envelope_b64(),
         approval_nonce: None,
         approval_attestation: None,
+        business_id: None,
     };
     let result = server
         .call_stellar_create_account_commit(args)
@@ -1150,6 +1163,7 @@ async fn commit_handles_rpc_error_during_rebuild() {
         envelope_xdr: valid_create_account_envelope_b64(),
         approval_nonce: None,
         approval_attestation: None,
+        business_id: None,
     };
     let result = server
         .call_stellar_create_account_commit(args)
@@ -1234,6 +1248,7 @@ async fn commit_indistinguishability_expired_vs_hmac_mismatch() {
         envelope_xdr: envelope_a.clone(),
         approval_nonce: None,
         approval_attestation: None,
+        business_id: None,
     };
     let result_a = server
         .call_stellar_create_account_commit(args_a)
@@ -1283,6 +1298,7 @@ async fn commit_indistinguishability_expired_vs_hmac_mismatch() {
         envelope_xdr: envelope_b.to_owned(),
         approval_nonce: None,
         approval_attestation: None,
+        business_id: None,
     };
     let result_b = server
         .call_stellar_create_account_commit(args_b)
@@ -1304,6 +1320,7 @@ async fn commit_indistinguishability_expired_vs_hmac_mismatch() {
         envelope_xdr: envelope_a.clone(),
         approval_nonce: None,
         approval_attestation: None,
+        business_id: None,
     };
     let result_c = server
         .call_stellar_create_account_commit(args_c)
@@ -1559,6 +1576,7 @@ async fn create_account_commit_full_round_trip_succeeds_with_string_encoded_amou
         destination: DEST_G.to_owned(),
         starting_balance: serde_json::from_str(r#""100 XLM""#).expect("parse amount"),
         classic_base: None,
+        business_id: None,
     };
     let (sim_result, simulate_clients) =
         crate::common::clients_built_by(server.call_stellar_create_account(simulate_args.clone()))
@@ -1601,6 +1619,7 @@ async fn create_account_commit_full_round_trip_succeeds_with_string_encoded_amou
         envelope_xdr,
         approval_nonce: None,
         approval_attestation: None,
+        business_id: None,
     };
     let (commit_result, commit_clients) =
         crate::common::clients_built_by(server.call_stellar_create_account_commit(commit_args))
@@ -1719,6 +1738,7 @@ async fn create_account_two_phase_round_trip_succeeds_under_satisfied_minimum_re
         destination: DEST_G.to_owned(),
         starting_balance: serde_json::from_str(r#""100 XLM""#).expect("parse amount"),
         classic_base: None,
+        business_id: None,
     };
     let sim_result = server
         .call_stellar_create_account(simulate_args.clone())
@@ -1758,6 +1778,7 @@ async fn create_account_two_phase_round_trip_succeeds_under_satisfied_minimum_re
         envelope_xdr,
         approval_nonce: None,
         approval_attestation: None,
+        business_id: None,
     };
     let commit_result = server
         .call_stellar_create_account_commit(commit_args)
@@ -1828,6 +1849,7 @@ async fn create_account_commit_denies_under_unsatisfied_minimum_reserve_rule() {
         envelope_xdr: valid_create_account_envelope_b64(),
         approval_nonce: None,
         approval_attestation: None,
+        business_id: None,
     };
     let result = server
         .call_stellar_create_account_commit(args)
@@ -1879,6 +1901,7 @@ async fn simulate_nonce_mint_failed_envelope_shape() {
         destination: DEST_G.to_owned(),
         starting_balance: serde_json::from_str(r#""1 XLM""#).unwrap(),
         classic_base: Some("auto".to_owned()),
+        business_id: None,
     };
     let result = server
         .call_stellar_create_account(args)
@@ -1982,6 +2005,7 @@ async fn commit_endpoint_network_mismatch_refuses_without_burning_nonce() {
         destination: DEST_G.to_owned(),
         starting_balance: serde_json::from_str(r#""100 XLM""#).expect("parse amount"),
         classic_base: None,
+        business_id: None,
     };
     let sim_result = server
         .call_stellar_create_account(simulate_args.clone())
@@ -2020,6 +2044,7 @@ async fn commit_endpoint_network_mismatch_refuses_without_burning_nonce() {
         envelope_xdr,
         approval_nonce: None,
         approval_attestation: None,
+        business_id: None,
     };
 
     // ── Commit against the wrong network ───────────────────────────────────
@@ -2098,6 +2123,7 @@ async fn prepare_and_commit_send_the_primary_credential() {
         destination: DEST_G.to_owned(),
         starting_balance: serde_json::from_str(r#""100 XLM""#).expect("parse amount"),
         classic_base: None,
+        business_id: None,
     };
     let sim_result = server
         .call_stellar_create_account(simulate_args.clone())
@@ -2123,6 +2149,7 @@ async fn prepare_and_commit_send_the_primary_credential() {
             .to_owned(),
         approval_nonce: None,
         approval_attestation: None,
+        business_id: None,
     };
     let committed = server
         .call_stellar_create_account_commit(commit_args.clone())
@@ -2226,6 +2253,7 @@ async fn witness_create_case(amount: &str, mode: &str, expected: &str) {
         envelope_xdr: data["envelope_xdr"].as_str().unwrap().into(),
         approval_nonce: None,
         approval_attestation: None,
+        business_id: None,
     };
     assert!(crate::common::received_methods(&oracle).await.is_empty());
     // The prepare ran without a cap; the commit runs on a server whose

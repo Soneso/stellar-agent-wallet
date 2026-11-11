@@ -89,6 +89,26 @@ invalid-params error whose message starts with the code, and
 followed by the code. `stellar_pay` returns the two memo codes in the result
 envelope; `stellar_pay_commit` reports a memo refusal as `nonce.expired`.
 
+## Business-id codes
+
+Every mainnet value call names its operation with a business id: the MCP
+`business_id` argument and the CLI `--business-id` flag.
+
+| Code | Meaning | Agent action |
+|---|---|---|
+| `validation.business_id_required` | A mainnet value call has no business id. | Resend with an id that names this operation, such as an invoice number. Keep it for every retry of the same operation. |
+| `validation.business_id_invalid` | The id is longer than 64 bytes or holds a character outside printable ASCII, a space included. | Resend with 1 to 64 printable ASCII characters and no space. |
+| `operation.business_id_conflict` | The id already names an operation with another intent, or a commit names an envelope that operation does not bind. Nothing signs or sends. | Use a new id for a new operation. Retry the earlier operation only with its original arguments. |
+| `operation.business_id_mismatch` | A commit names an id other than its preparation's. Nothing signs or sends. | Commit with the id the preparation used. |
+| `operation.capacity` | The profile's operation store holds no room for a new record. | Finish or reconcile waiting operations, then retry. |
+
+A retry under a retained id succeeds with `status: "replayed"` and the stored
+`operation` instead of new work. Follow its `next`. `none` means the
+operation ended, and `wait` means it is in flight or of unknown outcome:
+reconcile with `stellar_transaction_status` or `stellar-agent tx status`.
+`approve` means it awaits approval, and `retry` means a further attempt may
+run.
+
 ## Policy-engine codes
 
 The policy engine evaluates every gated call before any signing, returning

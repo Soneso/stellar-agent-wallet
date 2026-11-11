@@ -416,6 +416,24 @@ their own `x402.*` code before the `chain_id` check.
 
 `stellar_transaction_status` refuses with `submission.record_unavailable` when the spending-window file cannot be read.
 
+### Business ids
+
+On `stellar:mainnet` every value tool requires `business_id`: the four classic
+prepare tools, their commits, and both x402 payment tools. The id names one
+value operation and has 1 to 64 printable ASCII characters without a space.
+A missing id returns `validation.business_id_required` and a malformed one
+`validation.business_id_invalid`. A retry under a retained id answers with the
+stored operation and does no new work. Its `data` holds `status: "replayed"`,
+`business_id`, `operation` (`id`, `state`, `tx_hash`, `ledger`, `error_code`)
+and `next` (`none`, `wait`, `approve` or `retry`). A waiting record returns
+its stored envelope. Another intent under the same id returns
+`operation.business_id_conflict`, and so does a commit of an envelope the id's
+record does not bind. A commit under another id than its preparation's
+returns `operation.business_id_mismatch`. A sent attempt reads
+`sent_outcome_unknown` until reconciliation settles it. Every success result
+of a call with an id carries it in `data.business_id`. Off mainnet a supplied
+id is validated and echoed, and no record exists.
+
 ### stellar_pay (simulate) arguments
 
 | Field | Type | Required | Notes |
@@ -431,6 +449,7 @@ their own `x402.*` code before the `chain_id` check.
 | `memo_hash_hex` | string | no | 64 hex chars (32 bytes); mutually exclusive. |
 | `memo_return_hex` | string | no | 64 hex chars (32 bytes); mutually exclusive. |
 | `fee` | string | no | Classic fee selector: `<stroops>`, `auto`, `auto:pNN`. |
+| `business_id` | string | on mainnet | Names the operation; see [Business ids](#business-ids). |
 
 Returns `{ envelope_xdr, nonce, expires_at_unix_ms, simulation, operational }`.
 `operational` is `{ latest_ledger, close_time_unix, close_lag_seconds }`, the
@@ -451,6 +470,7 @@ the binding triple and the optional approval pair:
 | `envelope_xdr` | string | yes | Base64 envelope from simulate; byte-compared against a fresh rebuild. |
 | `approval_nonce` | string | when approval required | Wallet-issued approval nonce from the simulate-step `approval` block. |
 | `approval_attestation` | string | when approval required | HMAC-SHA256 attestation minted by the operator at approve time; constant-time verified alongside `approval_nonce`. |
+| `business_id` | string | on mainnet | The preparation's business id; another id returns `operation.business_id_mismatch`. |
 
 Example simulate then commit:
 
@@ -476,11 +496,12 @@ destination read with that read's own code.
 
 Simulate: `chain_id`, `source` (G-strkey funding account), `destination`
 (G-strkey new account, must not yet exist), `starting_balance` (decimal + unit,
-e.g. `"1 XLM"`), optional `fee`.
+e.g. `"1 XLM"`), optional `fee`, and `business_id` on mainnet.
 
 Commit: repeats `chain_id`, `source`, `destination`, `starting_balance`, plus the
-same binding triple (`nonce`, `expires_at_unix_ms`, `envelope_xdr`) and the
-optional `approval_nonce` / `approval_attestation` pair as `stellar_pay_commit`.
+same binding triple (`nonce`, `expires_at_unix_ms`, `envelope_xdr`), the
+optional `approval_nonce` / `approval_attestation` pair, and `business_id` as
+`stellar_pay_commit`.
 
 ### stellar_balances arguments
 
@@ -514,10 +535,11 @@ optional `approval_nonce` / `approval_attestation` pair as `stellar_pay_commit`.
 | `asset` | string | yes | `"USDC"` (bare code, pin-table resolved) or `"USDC:GISSUER"`. A 56-char `C...` SAC address is parsed but deferred and returns a typed error. |
 | `limit_stroops` | decimal string | no | Absent/null → protocol default (unlimited, `"9223372036854775807"`). `"0"` removes the trustline. Accepted range `0..=i64::MAX`. |
 | `fee` | string | no | Classic fee selector. |
+| `business_id` | string | on mainnet | Names the operation; see [Business ids](#business-ids). |
 
 Commit: `chain_id`, `from`, plus the binding triple (`nonce`,
-`expires_at_unix_ms`, `envelope_xdr`) and the optional `approval_nonce` /
-`approval_attestation` pair. The authoritative asset/issuer/limit are re-derived
+`expires_at_unix_ms`, `envelope_xdr`), the optional `approval_nonce` /
+`approval_attestation` pair, and the preparation's `business_id`. The authoritative asset/issuer/limit are re-derived
 from `envelope_xdr`, not from caller-supplied args.
 
 ## Claimable balances
@@ -534,6 +556,7 @@ from `envelope_xdr`, not from caller-supplied args.
 | `chain_id` | string | yes | CAIP-2; must match profile. |
 | `balance_id` | string | yes | A `B...` strkey, a canonical 72-hex id, or a bare 64-hex hash. |
 | `source_account` | string | no | G-strkey of the claiming account. Defaults to the profile's default MCP signer account when omitted. |
+| `business_id` | string | on mainnet | Names the operation; see [Business ids](#business-ids). The id names the balance and the claimant, so a retry answers with the stored claim after the balance left or its predicate expired. |
 
 Returns `{ envelope_xdr, nonce, expires_at_unix_ms, preview, operational }`,
 with `operational` as for `stellar_pay`. `preview`
@@ -565,6 +588,7 @@ pair:
 | `envelope_xdr` | string | yes | Base64 envelope from `stellar_claim`; byte-compared against a fresh rebuild. |
 | `approval_nonce` | string | when approval required | Wallet-issued approval nonce from the simulate-step `approval` block. |
 | `approval_attestation` | string | when approval required | HMAC-SHA256 attestation minted by the operator at approve time. |
+| `business_id` | string | on mainnet | The preparation's business id. |
 
 `stellar_claim_commit` re-fetches the claimable-balance entry and re-runs the
 claimant and predicate guards against fresh on-chain state (the trustline and
@@ -877,17 +901,18 @@ Arguments:
 Arguments:
 
 - `stellar_x402_create_payment`: required `payment_required` (base64
-  `PAYMENT-REQUIRED` header value OR raw JSON `PaymentRequirements`), required
+  `PAYMENT-REQUIRED` header value OR raw JSON `PaymentRequirements`) and
   `chain_id` (`stellar:testnet` or `stellar:mainnet`, checked after the
-  requirements); optional `address` (G-strkey signer; must match the enrolled
-  signer when supplied); optional `approval_nonce` and `approval_attestation`
-  (omit both for mainnet call 1, supply both for call 2).
+  requirements). Optional `address` (G-strkey signer; must match the enrolled
+  signer when supplied), `approval_nonce` and `approval_attestation`. On
+  mainnet `business_id` is required (see [Business ids](#business-ids)); omit
+  both approval fields for call 1 and supply both for call 2.
 - `stellar_x402_parse_receipt`: `payment_response` only (base64 / JSON). No
   `chain_id`.
-- `stellar_x402_authenticated_payment`: required `payment_required`, required
-  `chain_id` (as above), required `home_domain` (the SEP-10 counterparty
-  domain); optional `address`, `approval_nonce`, and `approval_attestation` (as
-  above).
+- `stellar_x402_authenticated_payment`: required `payment_required`, `chain_id`
+  (as above) and `home_domain` (the SEP-10 counterparty domain). Optional
+  `address`, `approval_nonce` and `approval_attestation`, and `business_id`, as
+  above.
 
 Both payment tools validate the requirements in full before the dispatch gate
 and consume no spending window on a refusal. They build one RPC client from
@@ -908,6 +933,11 @@ failure after admission keeps the admitted spend.
 On an admitted mainnet server, each x402 payment takes two calls. Supplying only
 one approval argument returns `policy.approval_required`. Mainnet call 2
 requires the CLI-issued attestation alongside its approval nonce.
+
+Under its `business_id`, call 2 records the attempt as `sending` before the
+signature and its exposure before the signed re-simulation. A returned payload
+ends it as `payload_released`; a failure before the exposure as `not_sent`,
+and a failure after it as `sent_outcome_unknown`.
 
 Call 1 omits both approval arguments. It runs the entry and startup checks, the
 requirements, `chain_id`, the approval pair, and, for the authenticated tool,

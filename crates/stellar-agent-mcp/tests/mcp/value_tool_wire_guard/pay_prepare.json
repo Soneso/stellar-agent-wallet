@@ -1,0 +1,33 @@
+{
+  "ok": true,
+  "data": {
+    "envelope_xdr": "AAAAAgAAAACZp6Rx4K1dDrZq8OEKuTKSuUPrgF3peRFjfbS+DAcuQgAAAGQAAAAAAAAAKwAAAAAAAAAAAAAAAQAAAAAAAAABAAAAAO+vxC9LGS5bRmMvy4+CFl9bWBuZO9ym0QAPmY+YjTnqAAAAAAAAAAAAmJaAAAAAAAAAAAA=",
+    "expires_at_unix_ms": "EXPIRES_AT_UNIX_MS",
+    "nonce": "NONCE",
+    "operational": {
+      "close_lag_seconds": 0,
+      "close_time_unix": "CLOSE_TIME_UNIX",
+      "latest_ledger": 1001
+    },
+    "simulation": {
+      "fee_stroops": "100",
+      "memo": {
+        "type": "none"
+      },
+      "operation": {
+        "amount_stroops": "10000000",
+        "asset": {
+          "type": "native"
+        },
+        "destination": "GDX27RBPJMMS4W2GMMX4XD4CCZPVWWA3TE55ZJWRAAHZTD4YRU46UVWZ",
+        "type": "payment"
+      },
+      "selected_fee_per_op_stroops": "100",
+      "selected_fee_percentile": "profile_default",
+      "source_account_id": "GCM2PJDR4CWV2DVWNLYOCCVZGKJLSQ7LQBO6S6IRMN63JPQMA4XEFLTP",
+      "source_native_balance_stroops": "500000000000",
+      "source_sequence": "42"
+    }
+  },
+  "request_id": "REQUEST_ID"
+}
