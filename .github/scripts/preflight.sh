@@ -132,6 +132,7 @@ self-test:test-check-docs-style.py	python3 .github/scripts/test-check-docs-style
 self-test:test-check-gate-tool-versions.sh	bash .github/scripts/test-check-gate-tool-versions.sh	-	install-surface.yml	install-surface	Self-test the gate tool version check
 self-test:test-check-install-surface.py	python3 .github/scripts/test-check-install-surface.py	-	install-surface.yml	install-surface	Self-test Python checks on Python 3.13
 self-test:test-check-no-direct-sasignersetbaselined-emit.sh	bash .github/scripts/test-check-no-direct-sasignersetbaselined-emit.sh	-	ci.yml	release-contracts	Self-test the signer-set baseline gate
+self-test:test-check-proof-matrix.py	python3 .github/scripts/test-check-proof-matrix.py	-	ci.yml	release-contracts	Self-test the proof matrix check
 self-test:test-check-ref-on-main.sh	bash .github/scripts/test-check-ref-on-main.sh	-	ci.yml	release-contracts	Self-test the ref-on-main check
 self-test:test-check-workflow-invariants.py	python3 .github/scripts/test-check-workflow-invariants.py	yaml	ci.yml	release-contracts	Check the workflow structure and the label sync
 self-test:test-compare-crate-sums.py	python3 .github/scripts/test-compare-crate-sums.py	-	ci.yml	release-contracts	Self-test the crate checksum comparison
@@ -155,10 +156,12 @@ fmt	cargo fmt --all -- --check	cargo	ci.yml	fmt	Check formatting
 clippy	cargo clippy --workspace --all-targets --no-default-features --features $FEATURES_EXCEPT_MAINNET_WRITE -- -D warnings	cargo	ci.yml	clippy	Run clippy
 rustdoc	RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --no-default-features --features $FEATURES_EXCEPT_MAINNET_WRITE	cargo	ci.yml	doc	Build the rustdoc
 test	cargo test --workspace --no-default-features --features $OFFLINE_FEATURES	cargo	ci.yml	test	Run the offline tests
+proof-matrix	python3 .github/scripts/check-proof-matrix.py --configuration feature-off --workspace	cargo	ci.yml	test	Check the proof matrix
 feature-on:clippy	cargo clippy --workspace --all-targets --features mainnet-write,$FEATURES_EXCEPT_MAINNET_WRITE -- -D warnings	cargo	ci.yml	feature-on-clippy	Run clippy
 feature-on:doc	RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --features mainnet-write,$FEATURES_EXCEPT_MAINNET_WRITE	cargo	ci.yml	feature-on-doc	Build the rustdoc
 feature-on:test	cargo test --workspace --features mainnet-write,$OFFLINE_FEATURES	cargo	ci.yml	feature-on-test	Run the offline tests
 feature-on:network	cargo check -p stellar-agent-network --features mainnet-write	cargo	ci.yml	feature-on-test	Check network feature forwarding in isolation
+proof-matrix:feature-on	python3 .github/scripts/check-proof-matrix.py --configuration feature-on --workspace	cargo	ci.yml	feature-on-test	Check the proof matrix
 release-shape	bash .github/scripts/release/check-host.sh	cargo,libudev	ci.yml	release-shape	Build and check the release binaries
 test-support-friendbot	cargo test -p $TEST_SUPPORT_CRATE --no-default-features --features testnet-helpers --lib	cargo	ci.yml	test	Run the test-support Friendbot unit tests
 test-vendored-release-cfg	cargo test -p $VENDORED_CRATE --test vendored_wasm_release_cfg	cargo	ci.yml	test	Test the vendored Wasm release configuration
@@ -329,6 +332,7 @@ select_self_tests() {
     .github/scripts/check-no-direct-sasignersetbaselined-emit.sh)
       select_gate self-test:test-check-no-direct-sasignersetbaselined-emit.sh
       ;;
+    .github/scripts/check-proof-matrix.py) select_gate self-test:test-check-proof-matrix.py ;;
     .github/scripts/check-ref-on-main.sh) select_gate self-test:test-check-ref-on-main.sh ;;
     .github/scripts/check-workflow-invariants.py) select_gate self-test:test-check-workflow-invariants.py ;;
     .github/scripts/compare-crate-sums.py) select_gate self-test:test-compare-crate-sums.py ;;
@@ -381,6 +385,7 @@ select_for_path() {
     .github/scripts/check-binary-marker.sh) select_gate self-test:test-check-binary-marker.sh; select_gate self-test:test-release-checks.sh ;;
     .github/scripts/check-packaged-markers.sh | .github/scripts/release/verify-*.sh | .github/scripts/release/sodium.sh) select_gate self-test:test-release-checks.sh ;;
     .github/scripts/check-provenance.py | .github/scripts/fixtures/*) select_gate self-test:test-check-provenance.py ;;
+    .github/scripts/proof-matrix.toml | .github/scripts/check-proof-matrix.py) select_gate proof-matrix; select_gate proof-matrix:feature-on ;;
   esac
   case "$path" in
     .github/workflows/*.yml | .github/actions/* | .github/labels.yml) select_gate actionlint ;;
@@ -438,6 +443,13 @@ select_for_path() {
       select_gate feature-on:test
       select_gate feature-on:network
       printf '%s\0' "$path" >>"$SCRATCH/rust"
+      ;;
+  esac
+  # A crate source or test can rename or remove a test the proof matrix names.
+  case "$path" in
+    crates/*/src/* | crates/*/tests/*)
+      select_gate proof-matrix
+      select_gate proof-matrix:feature-on
       ;;
   esac
 }

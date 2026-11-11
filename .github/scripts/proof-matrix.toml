@@ -1,0 +1,776 @@
+# The release proof matrix: for each claim the release proves and each value
+# tool on MCP and the CLI, the tests that prove it or the change that
+# delivers it. check-proof-matrix.py checks it against the test lists of
+# both builds, and a change that renames a named test or delivers a pending
+# claim updates it in the same pull request.
+#
+# The cell rule: a cell names a test only when the test asserts the claim
+# for every row the cell lists. A test that iterates every tool counts for
+# each row it reaches. Existing behavior without such a test for a row stays
+# pending on "row-test". Rows that share a test set share one cell, and each
+# (claim, row) pair a claim applies to has exactly one cell. A cell holds
+# not_applicable only when its rows cannot exhibit the claim, and its reason
+# says why that is safe.
+#
+# [[row]]: a value tool that mainnet admits; phase is prepare, commit or
+# single on MCP and verb on the CLI. [[excluded]]: a value tool that refuses
+# mainnet, with the tests of its refusal. [[claim]]: a claim, its family,
+# the phases it applies to, and the builds that can exhibit it.
+# [[delivery]]: the change a pending cell waits for. [[cell]]: the claim, its
+# rows, and exactly one of tests, pending (a delivery key) or not_applicable
+# (a reason).
+#
+# A claim's builds is both (the default), feature-off or feature-on, and a
+# proven cell names a ref that runs in each build the claim applies to and
+# no ref that runs in another.
+#
+# A ref names a package, a target (lib, bin:<name> or test:<name>), the
+# test's path in that target's list, and the builds that hold it: both (the
+# default), feature-off or feature-on.
+
+# Rows: MCP.
+
+[[row]]
+id = "mcp.pay"
+surface = "mcp"
+name = "stellar_pay"
+phase = "prepare"
+source = "crates/stellar-agent-mcp/src/tools/pay.rs"
+
+[[row]]
+id = "mcp.pay_commit"
+surface = "mcp"
+name = "stellar_pay_commit"
+phase = "commit"
+source = "crates/stellar-agent-mcp/src/tools/pay.rs"
+
+[[row]]
+id = "mcp.create_account"
+surface = "mcp"
+name = "stellar_create_account"
+phase = "prepare"
+source = "crates/stellar-agent-mcp/src/tools/create_account.rs"
+
+[[row]]
+id = "mcp.create_account_commit"
+surface = "mcp"
+name = "stellar_create_account_commit"
+phase = "commit"
+source = "crates/stellar-agent-mcp/src/tools/create_account.rs"
+
+[[row]]
+id = "mcp.claim"
+surface = "mcp"
+name = "stellar_claim"
+phase = "prepare"
+source = "crates/stellar-agent-mcp/src/tools/claim.rs"
+
+[[row]]
+id = "mcp.claim_commit"
+surface = "mcp"
+name = "stellar_claim_commit"
+phase = "commit"
+source = "crates/stellar-agent-mcp/src/tools/claim.rs"
+
+[[row]]
+id = "mcp.trustline"
+surface = "mcp"
+name = "stellar_trustline"
+phase = "prepare"
+source = "crates/stellar-agent-mcp/src/tools/trustline.rs"
+
+[[row]]
+id = "mcp.trustline_commit"
+surface = "mcp"
+name = "stellar_trustline_commit"
+phase = "commit"
+source = "crates/stellar-agent-mcp/src/tools/trustline.rs"
+
+[[row]]
+id = "mcp.x402_create_payment"
+surface = "mcp"
+name = "stellar_x402_create_payment"
+phase = "single"
+source = "crates/stellar-agent-mcp/src/tools/x402_create_payment.rs"
+
+[[row]]
+id = "mcp.x402_authenticated_payment"
+surface = "mcp"
+name = "stellar_x402_authenticated_payment"
+phase = "single"
+source = "crates/stellar-agent-mcp/src/tools/x402_authenticated_payment.rs"
+
+# Rows: CLI. The source is the file whose production code calls the mainnet
+# write pipeline.
+
+[[row]]
+id = "cli.pay"
+surface = "cli"
+name = "pay"
+phase = "verb"
+source = "crates/stellar-agent-cli/src/commands/pay.rs"
+
+[[row]]
+id = "cli.claim"
+surface = "cli"
+name = "claim"
+phase = "verb"
+source = "crates/stellar-agent-cli/src/commands/claim.rs"
+
+[[row]]
+id = "cli.trustline"
+surface = "cli"
+name = "trustline"
+phase = "verb"
+source = "crates/stellar-agent-cli/src/commands/trustline.rs"
+
+[[row]]
+id = "cli.accounts_create"
+surface = "cli"
+name = "accounts create"
+phase = "verb"
+source = "crates/stellar-agent-cli/src/commands/accounts/create.rs"
+
+# Excluded: testnet-only value tools.
+
+[[excluded]]
+id = "mcp.dex_trade"
+surface = "mcp"
+name = "stellar_dex_trade"
+reason = "testnet only: refuses a mainnet context at entry, before the policy gate, any key access and any request"
+refusal = [
+  { package = "stellar-agent-mcp", target = "lib", name = "tools::dex_trade::secondary_rule_tests::dex_trade_refuses_mainnet_at_entry_mainnet_profile" },
+]
+
+[[excluded]]
+id = "mcp.defindex_vault_deposit"
+surface = "mcp"
+name = "stellar_defindex_vault_deposit"
+reason = "testnet only: refuses a mainnet context at entry, before the policy gate, any key access and any request"
+refusal = [
+  { package = "stellar-agent-mcp", target = "lib", name = "tools::vault::secondary_rule_tests::defindex_vault_deposit_refuses_mainnet_at_entry_mainnet_profile" },
+]
+
+[[excluded]]
+id = "mcp.defindex_vault_withdraw"
+surface = "mcp"
+name = "stellar_defindex_vault_withdraw"
+reason = "testnet only: refuses a mainnet context at entry, before the policy gate, any key access and any request"
+refusal = [
+  { package = "stellar-agent-mcp", target = "lib", name = "tools::vault::secondary_rule_tests::defindex_vault_withdraw_refuses_mainnet_at_entry_mainnet_profile" },
+]
+
+[[excluded]]
+id = "mcp.mpp_charge_prepare"
+surface = "mcp"
+name = "stellar_mpp_charge_prepare"
+reason = "testnet only: every MPP tool refuses a mainnet profile before any state or key access"
+refusal = [
+  { package = "stellar-agent-mcp", target = "lib", name = "tools::mpp::tests::every_mpp_tool_refuses_mainnet_before_state_or_keyring_access" },
+]
+
+[[excluded]]
+id = "mcp.mpp_charge_commit"
+surface = "mcp"
+name = "stellar_mpp_charge_commit"
+reason = "testnet only: every MPP tool refuses a mainnet profile before any state or key access"
+refusal = [
+  { package = "stellar-agent-mcp", target = "lib", name = "tools::mpp::tests::every_mpp_tool_refuses_mainnet_before_state_or_keyring_access" },
+]
+
+[[excluded]]
+id = "cli.trade"
+surface = "cli"
+name = "trade"
+reason = "testnet only: refuses a mainnet profile before the keyring and any request"
+refusal = [
+  { package = "stellar-agent-cli", target = "bin:stellar-agent", name = "commands::trade::tests::run_refuses_mainnet_before_keyring_and_any_request" },
+]
+
+[[excluded]]
+id = "cli.vault_deposit"
+surface = "cli"
+name = "vault deposit"
+reason = "testnet only: refuses a mainnet profile before the keyring and any request"
+refusal = [
+  { package = "stellar-agent-cli", target = "bin:stellar-agent", name = "commands::vault::tests::run_deposit_refuses_mainnet_before_keyring_and_any_request" },
+]
+
+[[excluded]]
+id = "cli.vault_withdraw"
+surface = "cli"
+name = "vault withdraw"
+reason = "testnet only: refuses a mainnet profile before the keyring and any request"
+refusal = [
+  { package = "stellar-agent-cli", target = "bin:stellar-agent", name = "commands::vault::tests::run_withdraw_refuses_mainnet_before_keyring_and_any_request" },
+]
+
+[[excluded]]
+id = "cli.mpp"
+surface = "cli"
+name = "mpp"
+reason = "testnet only: every subcommand refuses a mainnet profile with the network error before any connection"
+refusal = [
+  { package = "stellar-agent-cli", target = "bin:stellar-agent", name = "commands::mpp::tests::testnet_context_refuses_mainnet_with_network_error" },
+  { package = "stellar-agent-cli", target = "test:cli", name = "proof_rows::every_mpp_subcommand_refuses_a_mainnet_profile_before_any_connection" },
+]
+
+[[excluded]]
+id = "cli.pool_init"
+surface = "cli"
+name = "pool init"
+reason = "testnet only: a fresh or resumed initialization refuses a mainnet profile before the keyring and any connection"
+refusal = [
+  { package = "stellar-agent-cli", target = "bin:stellar-agent", name = "commands::pool::init::tests::fresh_pool_init_refuses_mainnet_before_keyring_and_any_connection" },
+  { package = "stellar-agent-cli", target = "bin:stellar-agent", name = "commands::pool::init::tests::resumed_pool_init_refuses_mainnet_before_keyring_and_any_connection" },
+]
+
+# Claims.
+
+[[claim]]
+id = "approval.required_blocks_commit"
+family = "approval"
+statement = "a decision that requires approval refuses the commit without a valid attestation, before any key access"
+applies = ["commit", "single", "verb"]
+
+[[claim]]
+id = "approval.single_use"
+family = "approval"
+statement = "a consumed approval refuses a second commit"
+applies = ["commit", "single", "verb"]
+
+[[claim]]
+id = "approval.mainnet_presence"
+family = "approval"
+statement = "a mainnet commit needs a presence-verified approval bound to the signed policy"
+applies = ["commit", "single", "verb"]
+builds = "feature-on"
+
+[[claim]]
+id = "approval.follows_decision"
+family = "approval"
+statement = "an Allow decision signs without an approval request; an escalation requests one"
+applies = ["commit", "single", "verb"]
+
+[[claim]]
+id = "approval.durable"
+family = "approval"
+statement = "an approval keeps its state and its waiting and execution windows across a restart"
+applies = ["commit", "single", "verb"]
+
+[[claim]]
+id = "approval.binds_intent"
+family = "approval"
+statement = "the consent binds the canonical intent digest"
+applies = ["commit", "verb"]
+
+[[claim]]
+id = "approval.rebuild_from_intent"
+family = "approval"
+statement = "the commit rebuilds from the intent; only sequence, time bounds and a fee within the bound differ"
+applies = ["commit", "verb"]
+
+[[claim]]
+id = "sizing.caps_refuse"
+family = "sizing"
+statement = "a per-transaction or per-period cap of the policy refuses a call whose amount, alone or with the spend of its window, exceeds the cap, before signing"
+applies = ["commit", "single", "verb"]
+
+[[claim]]
+id = "sizing.reserve_refuses"
+family = "sizing"
+statement = "the minimum reserve criterion refuses a call that would leave the source balance below its reserve plus the margin, before signing"
+applies = ["commit", "single", "verb"]
+
+[[claim]]
+id = "sizing.accounting_inputs"
+family = "sizing"
+statement = "the unlisted counter, the budget epoch and the balance floor size the call from persisted accounting"
+applies = ["commit", "single", "verb"]
+
+[[claim]]
+id = "sizing.hold_follows_evidence"
+family = "sizing"
+statement = "the hold of a sent call is released only on evidence of non-inclusion or a confirmed outcome"
+applies = ["commit", "verb"]
+
+[[claim]]
+id = "audit.writer_before_signer"
+family = "audit"
+statement = "the audit writer is acquired before the signing key loads"
+applies = ["commit", "single", "verb"]
+
+[[claim]]
+id = "audit.outcome_row"
+family = "audit"
+statement = "every terminal outcome writes one audit row"
+applies = ["commit", "single", "verb"]
+
+[[claim]]
+id = "audit.outbox_at_shutdown"
+family = "audit"
+statement = "queued approval audit rows drain or persist at shutdown"
+applies = ["commit", "single", "verb"]
+
+[[claim]]
+id = "halt.refuses_first"
+family = "halt"
+statement = "a halted profile refuses the call before any key access or request"
+applies = ["prepare", "commit", "single", "verb"]
+
+[[claim]]
+id = "feature.off_build_refuses_mainnet"
+family = "feature-matrix"
+statement = "a build without mainnet-write refuses mainnet before any request"
+applies = ["prepare", "commit", "single", "verb"]
+builds = "feature-off"
+
+[[claim]]
+id = "feature.on_build_needs_signed_policy"
+family = "feature-matrix"
+statement = "a mainnet-write build refuses mainnet when the signed policy or its enablement is missing"
+applies = ["prepare", "commit", "single", "verb"]
+builds = "feature-on"
+
+[[claim]]
+id = "status.transaction_reconciles"
+family = "status"
+statement = "the transaction status reconciles the receipt and the hold of a sent call"
+applies = ["commit", "verb"]
+
+[[claim]]
+id = "status.operation_view"
+family = "status"
+statement = "the operation status reports state, attempts, recovery and the next safe step"
+applies = ["commit", "single", "verb"]
+
+[[claim]]
+id = "status.approval_view"
+family = "status"
+statement = "the approval status reports state and validity and consumes nothing"
+applies = ["commit", "single", "verb"]
+
+[[claim]]
+id = "status.retry_returns_stored"
+family = "status"
+statement = "a retried call with the same business id returns the stored operation"
+applies = ["commit", "single", "verb"]
+
+[[claim]]
+id = "notification.committed_transition"
+family = "notification"
+statement = "each committed transition emits one deduplicated, secret-free event that never gates progress"
+applies = ["commit", "single", "verb"]
+
+[[claim]]
+id = "revocation.refuses_commit"
+family = "revocation"
+statement = "a revoked approval refuses the commit and leaves an audit row"
+applies = ["commit", "single", "verb"]
+
+[[claim]]
+id = "remote.refused_without_signed_origin"
+family = "remote-approval"
+statement = "the remote listener refuses mainnet without the signed origin"
+applies = ["commit", "single", "verb"]
+
+[[claim]]
+id = "remote.consent_at_signed_origin"
+family = "remote-approval"
+statement = "a mainnet approval given at the signed HTTPS origin commits"
+applies = ["commit", "single", "verb"]
+builds = "feature-on"
+
+# Delivery keys.
+
+[[delivery]]
+key = "decision-authority"
+change = "the signed policy's Allow path signs without an approval request, and the CLI confirms per decision"
+
+[[delivery]]
+key = "operation-record"
+change = "a business id names one operation, and a retried call returns its stored state"
+
+[[delivery]]
+key = "recovery-transitions"
+change = "recovery settles sequence, outcome, hold and retry on the word of both endpoints, with an outcome audit row"
+
+[[delivery]]
+key = "accounting-counters"
+change = "accounting persists the unlisted counter, the budget epoch and the balance floor inputs"
+
+[[delivery]]
+key = "durable-approval"
+change = "a durable approval record with single use and two windows, read by every gate"
+
+[[delivery]]
+key = "intent-consent"
+change = "the consent page renders the intent, and the consent binds its digest"
+
+[[delivery]]
+key = "intent-commit"
+change = "the commit rebuilds the envelope from the intent"
+
+[[delivery]]
+key = "status-views"
+change = "approval status and operation status on MCP and the CLI"
+
+[[delivery]]
+key = "operation-notification"
+change = "operation-state notifications on MCP"
+
+[[delivery]]
+key = "approval-revocation"
+change = "revocation on the CLI and in the inbox, with its audit row"
+
+[[delivery]]
+key = "remote-mainnet-consent"
+change = "mainnet consent over HTTPS at the signed origin, with enrollment"
+
+[[delivery]]
+key = "audit-outbox-ownership"
+change = "the approval audit outbox ownership and the shutdown contract"
+
+[[delivery]]
+key = "row-test"
+change = "the behavior exists; a test for this row follows"
+
+# Cells: approval.required_blocks_commit.
+
+[[cell]]
+claim = "approval.required_blocks_commit"
+rows = ["mcp.pay_commit", "mcp.create_account_commit", "mcp.claim_commit", "mcp.trustline_commit", "mcp.x402_create_payment", "mcp.x402_authenticated_payment", "cli.pay", "cli.claim", "cli.trustline", "cli.accounts_create"]
+pending = "row-test"
+
+# Cells: approval.single_use.
+
+[[cell]]
+claim = "approval.single_use"
+rows = ["mcp.pay_commit"]
+tests = [
+  { package = "stellar-agent-mcp", target = "test:mcp", name = "approval_consumed_integration::a_timed_out_commit_consumes_its_approval_and_the_gate_refuses_a_second" },
+  { package = "stellar-agent-mcp", target = "test:mcp", name = "approval_consumed_integration::owed_approval_blocks_reuse_until_status_completes_consumption" },
+]
+
+[[cell]]
+claim = "approval.single_use"
+rows = ["mcp.create_account_commit", "mcp.claim_commit", "mcp.trustline_commit", "mcp.x402_create_payment", "mcp.x402_authenticated_payment", "cli.pay", "cli.claim", "cli.trustline", "cli.accounts_create"]
+pending = "row-test"
+
+# Cells: approval.mainnet_presence.
+
+[[cell]]
+claim = "approval.mainnet_presence"
+rows = ["mcp.pay_commit", "mcp.create_account_commit", "mcp.claim_commit", "mcp.trustline_commit", "mcp.x402_create_payment", "mcp.x402_authenticated_payment"]
+tests = [
+  { package = "stellar-agent-mcp", target = "lib", name = "tools::mainnet_presence_tests::mainnet_commit_requires_the_pinned_assertion_for_every_kind", builds = "feature-on" },
+]
+
+[[cell]]
+claim = "approval.mainnet_presence"
+rows = ["cli.pay", "cli.claim", "cli.trustline", "cli.accounts_create"]
+pending = "row-test"
+
+# Cells: the approval claims a later change delivers.
+
+[[cell]]
+claim = "approval.follows_decision"
+rows = ["mcp.pay_commit", "mcp.create_account_commit", "mcp.claim_commit", "mcp.trustline_commit", "mcp.x402_create_payment", "mcp.x402_authenticated_payment", "cli.pay", "cli.claim", "cli.trustline", "cli.accounts_create"]
+pending = "decision-authority"
+
+[[cell]]
+claim = "approval.durable"
+rows = ["mcp.pay_commit", "mcp.create_account_commit", "mcp.claim_commit", "mcp.trustline_commit", "mcp.x402_create_payment", "mcp.x402_authenticated_payment", "cli.pay", "cli.claim", "cli.trustline", "cli.accounts_create"]
+pending = "durable-approval"
+
+[[cell]]
+claim = "approval.binds_intent"
+rows = ["mcp.pay_commit", "mcp.create_account_commit", "mcp.claim_commit", "mcp.trustline_commit", "cli.pay", "cli.claim", "cli.trustline", "cli.accounts_create"]
+pending = "intent-consent"
+
+[[cell]]
+claim = "approval.rebuild_from_intent"
+rows = ["mcp.pay_commit", "mcp.create_account_commit", "mcp.claim_commit", "mcp.trustline_commit", "cli.pay", "cli.claim", "cli.trustline", "cli.accounts_create"]
+pending = "intent-commit"
+
+# Cells: sizing.caps_refuse.
+
+[[cell]]
+claim = "sizing.caps_refuse"
+rows = ["mcp.x402_create_payment"]
+tests = [
+  { package = "stellar-agent-mcp", target = "test:mcp", name = "mpp_audit_anchor_integration::x402_accounting_cap_refusal_withholds_the_payment_signature" },
+  { package = "stellar-agent-mcp", target = "test:mcp", name = "x402_audit_gate_integration::window_admission_refusal_precedes_signing" },
+]
+
+[[cell]]
+claim = "sizing.caps_refuse"
+rows = ["mcp.x402_authenticated_payment"]
+tests = [
+  { package = "stellar-agent-mcp", target = "test:mcp", name = "x402_audit_gate_integration::window_admission_refusal_precedes_signing" },
+]
+
+[[cell]]
+claim = "sizing.caps_refuse"
+rows = ["mcp.pay_commit", "mcp.create_account_commit", "mcp.claim_commit", "mcp.trustline_commit", "cli.pay", "cli.claim", "cli.trustline", "cli.accounts_create"]
+pending = "row-test"
+
+# Cells: sizing.reserve_refuses.
+
+[[cell]]
+claim = "sizing.reserve_refuses"
+rows = ["mcp.pay_commit"]
+tests = [
+  { package = "stellar-agent-mcp", target = "test:mcp", name = "pay_integration::pay_commit_denies_under_unsatisfied_minimum_reserve_rule" },
+]
+
+[[cell]]
+claim = "sizing.reserve_refuses"
+rows = ["mcp.create_account_commit"]
+tests = [
+  { package = "stellar-agent-mcp", target = "test:mcp", name = "create_account_integration::create_account_commit_denies_under_unsatisfied_minimum_reserve_rule" },
+]
+
+[[cell]]
+claim = "sizing.reserve_refuses"
+rows = ["mcp.claim_commit"]
+tests = [
+  { package = "stellar-agent-mcp", target = "test:mcp", name = "claim_integration::claim_commit_denies_under_unsatisfied_minimum_reserve_rule" },
+]
+
+[[cell]]
+claim = "sizing.reserve_refuses"
+rows = ["cli.pay"]
+tests = [
+  { package = "stellar-agent-cli", target = "test:cli", name = "fee_reserve_boundary::pay_counts_the_fee_toward_the_reserve" },
+  { package = "stellar-agent-cli", target = "test:cli", name = "fee_reserve_boundary::pay_refuses_the_margin_one_stroop_short_of_the_fee" },
+]
+
+[[cell]]
+claim = "sizing.reserve_refuses"
+rows = ["cli.claim"]
+tests = [
+  { package = "stellar-agent-cli", target = "test:cli", name = "fee_reserve_boundary::claim_counts_the_fee_toward_the_reserve" },
+  { package = "stellar-agent-cli", target = "test:cli", name = "fee_reserve_boundary::claim_refuses_the_margin_one_stroop_short_of_the_fee" },
+]
+
+[[cell]]
+claim = "sizing.reserve_refuses"
+rows = ["mcp.trustline_commit", "mcp.x402_create_payment", "mcp.x402_authenticated_payment", "cli.trustline", "cli.accounts_create"]
+pending = "row-test"
+
+# Cells: the sizing claims a later change delivers.
+
+[[cell]]
+claim = "sizing.accounting_inputs"
+rows = ["mcp.pay_commit", "mcp.create_account_commit", "mcp.claim_commit", "mcp.trustline_commit", "mcp.x402_create_payment", "mcp.x402_authenticated_payment", "cli.pay", "cli.claim", "cli.trustline", "cli.accounts_create"]
+pending = "accounting-counters"
+
+[[cell]]
+claim = "sizing.hold_follows_evidence"
+rows = ["mcp.pay_commit", "mcp.create_account_commit", "mcp.claim_commit", "mcp.trustline_commit", "cli.pay", "cli.claim", "cli.trustline", "cli.accounts_create"]
+pending = "recovery-transitions"
+
+# Cells: audit.writer_before_signer.
+
+[[cell]]
+claim = "audit.writer_before_signer"
+rows = ["mcp.pay_commit", "mcp.create_account_commit", "mcp.claim_commit", "mcp.trustline_commit", "mcp.x402_create_payment", "mcp.x402_authenticated_payment"]
+tests = [
+  { package = "stellar-agent-mcp", target = "test:mcp", name = "registry_walk::every_moves_value_commit_handler_calls_require_value_audit_writer" },
+  { package = "stellar-agent-mcp", target = "test:mcp", name = "registry_walk::every_approval_consumer_acquires_the_writer_between_the_approval_read_and_the_signer" },
+]
+
+[[cell]]
+claim = "audit.writer_before_signer"
+rows = ["cli.pay", "cli.claim", "cli.trustline", "cli.accounts_create"]
+pending = "row-test"
+
+# Cells: the audit claims a later change delivers.
+
+[[cell]]
+claim = "audit.outcome_row"
+rows = ["mcp.pay_commit", "mcp.create_account_commit", "mcp.claim_commit", "mcp.trustline_commit", "mcp.x402_create_payment", "mcp.x402_authenticated_payment", "cli.pay", "cli.claim", "cli.trustline", "cli.accounts_create"]
+pending = "recovery-transitions"
+
+[[cell]]
+claim = "audit.outbox_at_shutdown"
+rows = ["mcp.pay_commit", "mcp.create_account_commit", "mcp.claim_commit", "mcp.trustline_commit", "mcp.x402_create_payment", "mcp.x402_authenticated_payment", "cli.pay", "cli.claim", "cli.trustline", "cli.accounts_create"]
+pending = "audit-outbox-ownership"
+
+# Cells: halt.refuses_first.
+
+[[cell]]
+claim = "halt.refuses_first"
+rows = ["mcp.pay", "mcp.pay_commit", "mcp.create_account", "mcp.create_account_commit", "mcp.claim", "mcp.claim_commit", "mcp.trustline", "mcp.trustline_commit", "mcp.x402_create_payment", "mcp.x402_authenticated_payment"]
+tests = [
+  { package = "stellar-agent-mcp", target = "test:mcp", name = "halt_integration::every_tool_that_is_not_read_only_refuses_while_halted_without_signer_or_rpc" },
+]
+
+[[cell]]
+claim = "halt.refuses_first"
+rows = ["cli.pay", "cli.claim", "cli.trustline", "cli.accounts_create"]
+tests = [
+  { package = "stellar-agent-cli", target = "test:cli", name = "profile_halt::every_check_site_refuses_while_halted_and_proceeds_after_resume" },
+]
+
+# Cells: feature.off_build_refuses_mainnet.
+
+[[cell]]
+claim = "feature.off_build_refuses_mainnet"
+rows = ["mcp.pay", "mcp.create_account", "mcp.claim", "mcp.trustline"]
+not_applicable = "prepare signs and submits nothing and reads only network and ledger state; the matching commit refuses mainnet before any request"
+
+[[cell]]
+claim = "feature.off_build_refuses_mainnet"
+rows = ["mcp.pay_commit"]
+tests = [
+  { package = "stellar-agent-mcp", target = "lib", name = "tools::mainnet_entry_refusal_tests::pay_commit_refuses_mainnet_at_entry_on_noop_engine", builds = "feature-off" },
+  { package = "stellar-agent-mcp", target = "lib", name = "tools::mainnet_entry_refusal_tests::pay_commit_refuses_mainnet_at_entry_under_allow_all_engine", builds = "feature-off" },
+]
+
+[[cell]]
+claim = "feature.off_build_refuses_mainnet"
+rows = ["mcp.create_account_commit"]
+tests = [
+  { package = "stellar-agent-mcp", target = "lib", name = "tools::mainnet_entry_refusal_tests::create_account_commit_refuses_mainnet_at_entry_on_noop_engine", builds = "feature-off" },
+  { package = "stellar-agent-mcp", target = "lib", name = "tools::mainnet_entry_refusal_tests::create_account_commit_refuses_mainnet_at_entry_under_allow_all_engine", builds = "feature-off" },
+]
+
+[[cell]]
+claim = "feature.off_build_refuses_mainnet"
+rows = ["mcp.claim_commit"]
+tests = [
+  { package = "stellar-agent-mcp", target = "lib", name = "tools::mainnet_entry_refusal_tests::claim_commit_refuses_mainnet_at_entry_on_noop_engine", builds = "feature-off" },
+  { package = "stellar-agent-mcp", target = "lib", name = "tools::mainnet_entry_refusal_tests::claim_commit_refuses_mainnet_at_entry_under_allow_all_engine", builds = "feature-off" },
+]
+
+[[cell]]
+claim = "feature.off_build_refuses_mainnet"
+rows = ["mcp.trustline_commit"]
+tests = [
+  { package = "stellar-agent-mcp", target = "lib", name = "tools::mainnet_entry_refusal_tests::trustline_commit_refuses_mainnet_at_entry_on_noop_engine", builds = "feature-off" },
+  { package = "stellar-agent-mcp", target = "lib", name = "tools::mainnet_entry_refusal_tests::trustline_commit_refuses_mainnet_at_entry_under_allow_all_engine", builds = "feature-off" },
+]
+
+[[cell]]
+claim = "feature.off_build_refuses_mainnet"
+rows = ["mcp.x402_create_payment"]
+tests = [
+  { package = "stellar-agent-mcp", target = "lib", name = "tools::x402_create_payment::tests::mainnet_profile_refuses_before_signing_no_signature_produced", builds = "feature-off" },
+  { package = "stellar-agent-mcp", target = "test:mcp", name = "proof_rows::every_single_call_row_refuses_mainnet_before_any_request", builds = "feature-off" },
+]
+
+[[cell]]
+claim = "feature.off_build_refuses_mainnet"
+rows = ["mcp.x402_authenticated_payment"]
+tests = [
+  { package = "stellar-agent-mcp", target = "lib", name = "tools::x402_authenticated_payment::tests::mainnet_profile_refuses_before_signing_no_signature_produced", builds = "feature-off" },
+  { package = "stellar-agent-mcp", target = "test:mcp", name = "proof_rows::every_single_call_row_refuses_mainnet_before_any_request", builds = "feature-off" },
+]
+
+[[cell]]
+claim = "feature.off_build_refuses_mainnet"
+rows = ["cli.pay", "cli.claim", "cli.trustline", "cli.accounts_create"]
+tests = [
+  { package = "stellar-agent-cli", target = "test:cli", name = "profile_env_var_resolution::every_guarded_path_refuses_a_mainnet_profile_before_endpoint_contact", builds = "feature-off" },
+]
+
+# Cells: feature.on_build_needs_signed_policy. A cell names tests that prove
+# both halves, the signed policy missing and the enablement missing, through
+# the row's own tool or verb.
+
+[[cell]]
+claim = "feature.on_build_needs_signed_policy"
+rows = ["mcp.pay", "mcp.create_account", "mcp.claim", "mcp.trustline"]
+not_applicable = "prepare signs and submits nothing and reads only network and ledger state; the matching commit refuses mainnet without the signed policy and its enablement"
+
+[[cell]]
+claim = "feature.on_build_needs_signed_policy"
+rows = ["cli.pay"]
+tests = [
+  { package = "stellar-agent-cli", target = "test:cli", name = "profile_env_var_resolution::every_guarded_path_refuses_a_mainnet_profile_before_endpoint_contact", builds = "feature-on" },
+  { package = "stellar-agent-cli", target = "bin:stellar-agent", name = "commands::pay::tests::mainnet_full::a_policy_without_the_mainnet_table_refuses", builds = "feature-on" },
+  { package = "stellar-agent-cli", target = "bin:stellar-agent", name = "commands::pay::tests::mainnet_full::a_removed_enablement_nonce_refuses", builds = "feature-on" },
+]
+
+[[cell]]
+claim = "feature.on_build_needs_signed_policy"
+rows = ["mcp.pay_commit", "mcp.create_account_commit", "mcp.claim_commit", "mcp.trustline_commit", "mcp.x402_create_payment", "mcp.x402_authenticated_payment", "cli.claim", "cli.trustline", "cli.accounts_create"]
+pending = "row-test"
+
+# Cells: status.transaction_reconciles. The status tests seed the receipt
+# and the native hold of a sent payment.
+
+[[cell]]
+claim = "status.transaction_reconciles"
+rows = ["mcp.pay_commit"]
+tests = [
+  { package = "stellar-agent-mcp", target = "test:mcp", name = "transaction_status_wire_guard::reconciliation_releases_the_hold" },
+  { package = "stellar-agent-mcp", target = "test:mcp", name = "transaction_status_wire_guard::settled_receipt_and_open_reservation" },
+]
+
+[[cell]]
+claim = "status.transaction_reconciles"
+rows = ["cli.pay"]
+tests = [
+  { package = "stellar-agent-cli", target = "test:cli", name = "tx_status_wire_guard::reconciliation_releases_the_hold" },
+  { package = "stellar-agent-cli", target = "test:cli", name = "tx_status_wire_guard::settled_receipt_and_open_reservation" },
+  { package = "stellar-agent-cli", target = "test:cli", name = "tx_receipt_clear_integration::tx_status_completes_owed_approval_consumption_once" },
+]
+
+[[cell]]
+claim = "status.transaction_reconciles"
+rows = ["mcp.create_account_commit", "mcp.claim_commit", "mcp.trustline_commit", "cli.claim", "cli.trustline", "cli.accounts_create"]
+pending = "row-test"
+
+# Cells: the status claims a later change delivers.
+
+[[cell]]
+claim = "status.operation_view"
+rows = ["mcp.pay_commit", "mcp.create_account_commit", "mcp.claim_commit", "mcp.trustline_commit", "mcp.x402_create_payment", "mcp.x402_authenticated_payment", "cli.pay", "cli.claim", "cli.trustline", "cli.accounts_create"]
+pending = "status-views"
+
+[[cell]]
+claim = "status.approval_view"
+rows = ["mcp.pay_commit", "mcp.create_account_commit", "mcp.claim_commit", "mcp.trustline_commit", "mcp.x402_create_payment", "mcp.x402_authenticated_payment", "cli.pay", "cli.claim", "cli.trustline", "cli.accounts_create"]
+pending = "status-views"
+
+[[cell]]
+claim = "status.retry_returns_stored"
+rows = ["mcp.pay_commit", "mcp.create_account_commit", "mcp.claim_commit", "mcp.trustline_commit", "mcp.x402_create_payment", "mcp.x402_authenticated_payment", "cli.pay", "cli.claim", "cli.trustline", "cli.accounts_create"]
+pending = "operation-record"
+
+# Cells: notification.committed_transition.
+
+[[cell]]
+claim = "notification.committed_transition"
+rows = ["mcp.pay_commit", "mcp.create_account_commit", "mcp.claim_commit", "mcp.trustline_commit", "mcp.x402_create_payment", "mcp.x402_authenticated_payment"]
+pending = "operation-notification"
+
+[[cell]]
+claim = "notification.committed_transition"
+rows = ["cli.pay", "cli.claim", "cli.trustline", "cli.accounts_create"]
+not_applicable = "the CLI reports state through its status verb"
+
+# Cells: revocation.refuses_commit.
+
+[[cell]]
+claim = "revocation.refuses_commit"
+rows = ["mcp.pay_commit", "mcp.create_account_commit", "mcp.claim_commit", "mcp.trustline_commit", "mcp.x402_create_payment", "mcp.x402_authenticated_payment", "cli.pay", "cli.claim", "cli.trustline", "cli.accounts_create"]
+pending = "approval-revocation"
+
+# Cells: remote approval. The listener refuses to start for a mainnet
+# profile, so no row's approval reaches it.
+
+[[cell]]
+claim = "remote.refused_without_signed_origin"
+rows = ["mcp.pay_commit", "mcp.create_account_commit", "mcp.claim_commit", "mcp.trustline_commit", "mcp.x402_create_payment", "mcp.x402_authenticated_payment", "cli.pay", "cli.claim", "cli.trustline", "cli.accounts_create"]
+tests = [
+  { package = "stellar-agent-approval-remote", target = "lib", name = "mainnet_presence_tests::mainnet_remote_refuses_before_bind" },
+]
+
+[[cell]]
+claim = "remote.consent_at_signed_origin"
+rows = ["mcp.pay_commit", "mcp.create_account_commit", "mcp.claim_commit", "mcp.trustline_commit", "mcp.x402_create_payment", "mcp.x402_authenticated_payment", "cli.pay", "cli.claim", "cli.trustline", "cli.accounts_create"]
+pending = "remote-mainnet-consent"

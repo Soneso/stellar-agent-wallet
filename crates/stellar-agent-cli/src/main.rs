@@ -523,6 +523,50 @@ mod tests {
 
     use super::*;
 
+    /// The release proof matrix, read from beside its checker.
+    const PROOF_MATRIX: &str = include_str!("../../../.github/scripts/proof-matrix.toml");
+
+    /// Every CLI name of the release proof matrix, a row's verb or an excluded
+    /// entry's, is a subcommand path of the CLI's definition.
+    #[test]
+    fn every_proof_matrix_cli_name_is_a_subcommand() {
+        use clap::CommandFactory as _;
+
+        let matrix: toml::Table = toml::from_str(PROOF_MATRIX).expect("the matrix parses");
+        let mut names = Vec::new();
+        for table in ["row", "excluded"] {
+            let entries = matrix
+                .get(table)
+                .and_then(toml::Value::as_array)
+                .expect("the matrix holds the table");
+            for entry in entries {
+                if entry.get("surface").and_then(toml::Value::as_str) == Some("cli") {
+                    let name = entry.get("name").and_then(toml::Value::as_str);
+                    names.push(name.expect("a CLI entry has a name").to_owned());
+                }
+            }
+        }
+        assert!(!names.is_empty(), "the matrix names CLI entries");
+        let cli = Cli::command();
+        let unknown: Vec<&String> = names
+            .iter()
+            .filter(|name| {
+                let mut command = &cli;
+                for word in name.split(' ') {
+                    match command.find_subcommand(word) {
+                        Some(subcommand) => command = subcommand,
+                        None => return true,
+                    }
+                }
+                false
+            })
+            .collect();
+        assert!(
+            unknown.is_empty(),
+            "matrix CLI names that are no subcommand: {unknown:?}"
+        );
+    }
+
     #[test]
     #[serial_test::serial]
     fn startup_refusal_log_omits_the_requested_profile() {
