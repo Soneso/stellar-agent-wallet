@@ -785,10 +785,17 @@ boundary, a failed marker write, or a failed removal also stops the prune.
 Every stop logs a warning and keeps excess archives in place. Past 21 rotated
 files, open and verify refuse with `audit.too_many_rotated_files`.
 
-Settlement and receipt-clear lookups walk retained files newest first, and a
-match leaves older files unvisited. Each visited file's own chain is verified;
-in a log with no archives the first row must chain from the zero hash. The
-eleventh rotation deletes the oldest archive. Callers hold the writer guard
+Receipt-clear lookups walk retained files newest first, and a match leaves
+older files unvisited. Each visited file's own chain is verified; in a log
+with no archives the first row must chain from the zero hash. The settlement
+lookup answers from an index the writer keeps of each envelope hash's latest
+settlement row. With a complete index, an unchanged file listing, and an
+unchanged tip, fresh or settled bytes read no row file. An owed hash reads
+its one pending row. Building the index walks at most every retained file,
+newest first, and a keyed writer builds it from the verification walk of
+each acquisition. Any listing change outside the writer discards the index,
+and a missing, replaced, or shortened active file refuses through the walk.
+The eleventh rotation deletes the oldest archive. Callers hold the writer guard
 during settlement and clear lookups. Accounting delivery retains it through
 append and acknowledgement. `tx status` and `stellar_transaction_status`
 acquire the writer only to deliver an unacknowledged accounting event. A

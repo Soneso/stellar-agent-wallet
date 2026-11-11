@@ -261,8 +261,8 @@ impl AuditReadiness {
     }
 
     /// A proof over an arbitrary writer, for this crate's tests of the types
-    /// that hold one.
-    #[cfg(all(test, feature = "mainnet-write"))]
+    /// that hold one and for its test fixtures.
+    #[cfg(all(feature = "mainnet-write", any(test, feature = "test-helpers")))]
     pub(crate) fn for_crate_tests(
         profile: &str,
         facts: VerifiedTipFacts,

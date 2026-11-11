@@ -144,6 +144,7 @@ use super::{
     },
     entry::AuditEntry,
     lock::{AuditWriterLock, Carrier},
+    reader::{IndexedTip, RowSettlement, SettlementIndex},
     rotation::{
         MarkerNamesNoBoundary, PruneMarker, PruneMarkerData, PruneSeed, oldest_retained_seed,
         read_prune_marker,
@@ -457,8 +458,8 @@ pub struct AuditWriter {
     #[cfg(test)]
     binding_after_snapshot: Option<Box<dyn FnOnce() + Send>>,
     /// Test-only fault seam that stops a prune after its durable marker write,
-    /// modelling a crash before the archive's deletion.
-    #[cfg(test)]
+    /// modelling a crash or a failed removal before the archive's deletion.
+    #[cfg(any(test, feature = "test-helpers"))]
     skip_prune_removal: bool,
     /// Test-only fault seam: a chain-root sidecar repair fails before it
     /// writes the sidecar.
@@ -541,6 +542,10 @@ pub struct AuditWriter {
     /// exist. Left unset when the keyring rejected the write, so the next
     /// refused append retries it.
     owed_row_anchored: bool,
+    /// The latest settlement row of every envelope hash in the retained
+    /// history, as far as this writer has read or written it. See
+    /// [`super::reader::try_value_action_settlement`].
+    settlement_index: SettlementIndex,
 }
 
 /// Counts of permissions revoked before acknowledging an outbox loss.
@@ -1511,6 +1516,7 @@ impl AuditWriter {
             pending_tip_anchor: None,
             log_diverged: None,
             owed_row_anchored: false,
+            settlement_index: SettlementIndex::default(),
             unsettled_append: None,
             checked_open: tip_anchor.is_some()
                 && !matches!(
@@ -1531,7 +1537,7 @@ impl AuditWriter {
             drain_after_snapshot: None,
             #[cfg(test)]
             binding_after_snapshot: None,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-helpers"))]
             skip_prune_removal: false,
             #[cfg(test)]
             fail_root_sidecar_repair,
@@ -1703,6 +1709,16 @@ impl AuditWriter {
     #[must_use]
     pub(crate) fn segment_start_hash(&self) -> &[u8; 32] {
         &self.segment_start_hash
+    }
+
+    /// Returns the settlement index this writer maintains.
+    pub(super) fn settlement_index(&self) -> &SettlementIndex {
+        &self.settlement_index
+    }
+
+    /// Returns the handle of the active file this writer appends to.
+    pub(super) fn active_file(&self) -> &File {
+        &self.file
     }
 
     /// Returns the in-memory chain-tip hash as a raw 32-byte array.
@@ -2527,6 +2543,7 @@ impl AuditWriter {
 
         // Commit the durable chain state before either anchor-write attempt.
         // An anchor outage must leave the next append on this row's hash.
+        let before = IndexedTip::of(self);
         self.entry_count = self.entry_count.saturating_add(1);
         self.end_offset = self.entry_end_offset()?;
         self.checked_len = self.end_offset;
@@ -2535,6 +2552,14 @@ impl AuditWriter {
         // The append's own checks found the file ending where the writer left
         // it, so no earlier failed append left a row behind.
         self.unsettled_append = None;
+        // The settlement index takes the row only with the tip that covers it.
+        self.settlement_index.appended(
+            &before,
+            IndexedTip::of(self),
+            RowSettlement::of(&entry),
+            self.end_offset.saturating_sub(bytes),
+            bytes,
+        );
         let current = TipAnchor::new(self.entry_count, self.last_hash.clone(), self.end_offset);
         self.store_tip_anchor_best_effort(&current);
         Ok(())
@@ -2601,6 +2626,16 @@ impl AuditWriter {
     #[cfg(test)]
     pub(crate) fn set_skip_tip_anchor_write(&mut self, enabled: bool) {
         self.skip_tip_anchor_write = enabled;
+    }
+
+    /// For tests only: while `stopped` holds, every prune stops after its
+    /// durable marker write and keeps the archive it would delete, as a
+    /// failed removal does, so the retained history grows past
+    /// [`MAX_ROTATED_FILES`].
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn stop_prune_removal_for_test(&mut self, stopped: bool) {
+        self.skip_prune_removal = stopped;
     }
 
     /// Enables a test-only fault seam: `allowed` further appends succeed and
@@ -2794,9 +2829,21 @@ impl AuditWriter {
             Some(key) if self.carrier_binding || self.acknowledge_outbox => {
                 self.verify_retained_chain(key)
             }
-            key => super::verify::verify_log_within(&self.path, key, self.end_offset)
-                .map(|_| ())
-                .map_err(WriterError::RetainedHistoryUnverified),
+            key => {
+                // The walk's rows become the settlement index only when the
+                // whole walk verifies; a failure leaves no index behind.
+                self.settlement_index.clear();
+                let (ok, rows) =
+                    super::verify::verify_log_within_collecting(&self.path, key, self.end_offset)
+                        .map_err(WriterError::RetainedHistoryUnverified)?;
+                self.settlement_index.publish_verified(
+                    &self.path,
+                    IndexedTip::of(self),
+                    ok.active_tip.as_ref().map(|tip| tip.tip_hash.as_str()),
+                    &rows,
+                );
+                Ok(())
+            }
         }
     }
 
@@ -4240,6 +4287,7 @@ impl AuditWriter {
             )));
         }
         self.file.sync_data()?;
+        let before = IndexedTip::of(self);
         self.entry_count = self.entry_count.saturating_add(1);
         self.end_offset = self.entry_end_offset()?;
         self.checked_len = self.end_offset;
@@ -4251,6 +4299,14 @@ impl AuditWriter {
             hash: handoff_hash.clone(),
         });
         self.handoff_unsettled = false;
+        let len = line.len() as u64;
+        self.settlement_index.appended(
+            &before,
+            IndexedTip::of(self),
+            RowSettlement::Other,
+            self.end_offset.saturating_sub(len),
+            len,
+        );
 
         // Advance the anchor onto the handoff entry — the outgoing file's true
         // tip — BEFORE the renames.
@@ -4367,6 +4423,7 @@ impl AuditWriter {
         };
 
         // Atomic swap: the old handle is dropped here.
+        let before = IndexedTip::of(self);
         self.file = new_file;
         self.segment_start_hash = segment_start_hash;
         self.last_hash = handoff_hash;
@@ -4375,6 +4432,8 @@ impl AuditWriter {
         self.entry_count = 0;
         self.end_offset = 0;
         self.checked_len = 0;
+        self.settlement_index
+            .rotated(&before, rotated_path, IndexedTip::of(self));
 
         // The anchor is deliberately left naming the archive's handoff entry.
         // There is no anchor value for a file with no entries: offset 0 is a
@@ -4512,7 +4571,7 @@ impl AuditWriter {
             };
             next.write(&self.path, self.hmac_key.as_deref())
                 .map_err(io::Error::other)?;
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-helpers"))]
             if self.skip_prune_removal {
                 return Ok(());
             }
@@ -4524,6 +4583,7 @@ impl AuditWriter {
                 return Ok(());
             }
             let _ = fs::remove_file(hmac_sidecar_path(archive));
+            self.settlement_index.pruned(archive);
             marker = Some(next);
         }
         Ok(())
@@ -16000,6 +16060,481 @@ mod tests {
                 "tool_invocation"
             ]
         );
+    }
+
+    /// How the writer keeps the settlement index of
+    /// [`super::super::reader::try_value_action_settlement`] across appends,
+    /// rotations, prunes, acquisitions and listing changes.
+    mod settlement_index {
+        use super::*;
+        use crate::audit_log::reader::row_file_visits::{LOOKUP_WALK, VERIFY_WALK, observe};
+        use crate::audit_log::reader::{
+            ValueActionSettlement, settlement_walk, try_value_action_settlement,
+        };
+
+        const FRESH: &str = "ff";
+
+        fn owed_row(envelope_hash: &str) -> AuditEntry {
+            AuditEntry::new_value_action_pending(
+                "stellar_pay",
+                Some("stellar:testnet".to_owned()),
+                vec![],
+                "6ba7aaac...69060003",
+                "GAOTC...PZ6X4",
+                7,
+                PolicyDecision::Allow,
+                Some(envelope_hash.to_owned()),
+                Some(format!("nonce-{envelope_hash}")),
+                None,
+                format!("req-{envelope_hash}"),
+                None,
+            )
+        }
+
+        fn settled_row(envelope_hash: &str) -> AuditEntry {
+            AuditEntry::new_value_action_failed(
+                "stellar_pay",
+                Some("stellar:testnet".to_owned()),
+                vec![],
+                "6ba7aaac...69060003",
+                "submission.failed",
+                PolicyDecision::Allow,
+                Some(envelope_hash.to_owned()),
+                None,
+                None,
+                format!("req-settled-{envelope_hash}"),
+            )
+        }
+
+        fn is_owed(answer: &ValueActionSettlement) -> bool {
+            matches!(answer, ValueActionSettlement::Owed(_))
+        }
+
+        /// The index answers every hash as the bounded walk does, error text
+        /// included.
+        fn assert_index_matches_walk(writer: &AuditWriter, hashes: &[&str]) {
+            for hash in hashes {
+                assert_eq!(
+                    try_value_action_settlement(writer, hash).map_err(|e| e.to_string()),
+                    settlement_walk(writer, hash).map_err(|e| e.to_string()),
+                    "hash {hash}"
+                );
+            }
+        }
+
+        /// The lookups of `hashes` read no row file through a walk.
+        fn assert_no_lookup_walk(writer: &AuditWriter, hashes: &[&str]) {
+            for hash in hashes {
+                let (answer, visits) = observe(|| try_value_action_settlement(writer, hash));
+                answer.unwrap();
+                assert!(
+                    visits.iter().all(|visit| visit.source != LOOKUP_WALK),
+                    "hash {hash}: {visits:?}"
+                );
+            }
+        }
+
+        fn owed(writer: &AuditWriter, hash: &str) -> bool {
+            is_owed(&try_value_action_settlement(writer, hash).unwrap())
+        }
+
+        /// Rewrites the first occurrence of `from` in `file` with `to`, of
+        /// equal length.
+        fn edit_in_place(file: &Path, from: &str, to: &str) {
+            assert_eq!(from.len(), to.len());
+            let contents = fs::read_to_string(file).unwrap();
+            assert!(contents.contains(from), "{from} in {}", file.display());
+            fs::write(file, contents.replacen(from, to, 1)).unwrap();
+        }
+
+        /// Flips the first hexadecimal digit after `marker` in `file`.
+        fn flip_hex_after(file: &Path, marker: &str) {
+            let mut contents = fs::read_to_string(file).unwrap();
+            let at = contents.find(marker).unwrap() + marker.len();
+            let digit = &contents[at..=at];
+            let flipped = if digit == "0" { "1" } else { "0" };
+            contents.replace_range(at..=at, flipped);
+            fs::write(file, contents).unwrap();
+        }
+
+        #[test]
+        fn committed_appends_update_lookup_without_changing_audit_bytes() {
+            let dir = TempDir::new().unwrap();
+            let path = dir.path().join("audit.jsonl");
+            let (mut writer, store) = anchored_pruning_fixture(&path, 1);
+            let all = ["e1", "e2", "e3", "e4", FRESH];
+
+            writer.write_entry(owed_row("e1")).unwrap();
+            assert!(owed(&writer, "e1"));
+            writer.write_built(|_| settled_row("e1")).unwrap();
+            assert_eq!(
+                try_value_action_settlement(&writer, "e1").unwrap(),
+                ValueActionSettlement::Settled
+            );
+            super::super::super::outbox::AuditOutbox::for_log(
+                &path,
+                Arc::clone(&store) as Arc<dyn TipAnchorStore>,
+            )
+            .append(&AuditEntry::new_profile_halted(
+                "settlement-index",
+                "2026-10-31T12:00:00Z",
+                Some("drain"),
+                "req-drain",
+            ))
+            .unwrap();
+            writer.write_entry(owed_row("e2")).unwrap();
+            assert!(kinds(&path).contains(&"profile_halted".to_owned()));
+            assert!(owed(&writer, "e2"));
+            assert_no_lookup_walk(&writer, &all);
+            assert_index_matches_walk(&writer, &all);
+
+            // A lookup changes no audit byte.
+            let bytes = fs::read(&path).unwrap();
+            assert_index_matches_walk(&writer, &all);
+            assert_eq!(fs::read(&path).unwrap(), bytes);
+
+            // A row written but not synced is past the tip: it neither enters
+            // the index nor moves the tip the index ends at.
+            let tip = writer.end_offset();
+            writer.set_fail_sync_after_entry_write(true);
+            writer.write_entry(owed_row("e3")).unwrap_err();
+            writer.set_fail_sync_after_entry_write(false);
+            assert_eq!(writer.end_offset(), tip);
+            assert!(fs::read(&path).unwrap().len() as u64 > tip);
+            assert_eq!(
+                try_value_action_settlement(&writer, "e3").unwrap(),
+                ValueActionSettlement::OwedWithoutLegs
+            );
+            assert_no_lookup_walk(&writer, &all);
+            assert_index_matches_walk(&writer, &all);
+
+            // Reconciliation replays the row into the verified log, and the
+            // index follows.
+            writer.verify_tip_anchor().unwrap();
+            assert!(writer.end_offset() > tip);
+            assert!(owed(&writer, "e3"));
+            assert_index_matches_walk(&writer, &all);
+
+            // A refused append writes nothing and changes no answer.
+            let bytes = fs::read(&path).unwrap();
+            writer.set_appends_before_fault(Some(0));
+            writer.write_entry(owed_row("e4")).unwrap_err();
+            writer.set_appends_before_fault(None);
+            assert_eq!(fs::read(&path).unwrap(), bytes);
+            assert_eq!(
+                try_value_action_settlement(&writer, "e4").unwrap(),
+                ValueActionSettlement::OwedWithoutLegs
+            );
+            assert_no_lookup_walk(&writer, &all);
+            assert_index_matches_walk(&writer, &all);
+        }
+
+        #[test]
+        fn lookup_rotation_restart_and_pruning_preserve_retained_answers() {
+            let dir = TempDir::new().unwrap();
+            let path = dir.path().join("audit.jsonl");
+            let (mut writer, store) = anchored_pruning_fixture(&path, 0);
+            let all = ["r1", "r2", "r3", "r4", FRESH];
+            writer.write_entry(owed_row("r1")).unwrap();
+            writer.write_entry(owed_row("r2")).unwrap();
+            writer.write_entry(settled_row("r2")).unwrap();
+            rotate_pruning_fixture(&mut writer);
+            writer.write_entry(owed_row("r3")).unwrap();
+            for _ in 1..MAX_ROTATED_FILES {
+                rotate_pruning_fixture(&mut writer);
+                assert!(owed(&writer, "r1"), "a retained obligation survives");
+                assert!(owed(&writer, "r3"));
+                assert_no_lookup_walk(&writer, &all);
+                assert_index_matches_walk(&writer, &all);
+            }
+            assert_eq!(
+                rotated_archives_newest_first(&path).len(),
+                MAX_ROTATED_FILES
+            );
+
+            // The next rotation prunes the archive holding r1 and r2, and the
+            // index drops their rows with no walk.
+            rotate_pruning_fixture(&mut writer);
+            assert_eq!(
+                rotated_archives_newest_first(&path).len(),
+                MAX_ROTATED_FILES
+            );
+            assert_no_lookup_walk(&writer, &["r2", "r1", "r3", FRESH]);
+            for hash in ["r2", "r1"] {
+                assert_eq!(
+                    try_value_action_settlement(&writer, hash).unwrap(),
+                    ValueActionSettlement::OwedWithoutLegs,
+                    "{hash} left with its archive"
+                );
+            }
+            assert!(owed(&writer, "r3"));
+            assert_no_lookup_walk(&writer, &all);
+            assert_index_matches_walk(&writer, &all);
+
+            // A restart rebuilds the same answers from the verification walk.
+            drop(writer);
+            let mut writer =
+                AuditWriter::open(path.clone(), Some(retained_history_access(&store))).unwrap();
+            assert!(owed(&writer, "r3"));
+            assert_no_lookup_walk(&writer, &all);
+            assert_index_matches_walk(&writer, &all);
+
+            // A prune that stops keeps the excess archive, and its obligation.
+            writer.write_entry(owed_row("r4")).unwrap();
+            writer.skip_prune_removal = true;
+            rotate_pruning_fixture(&mut writer);
+            writer.skip_prune_removal = false;
+            assert_eq!(
+                rotated_archives_newest_first(&path).len(),
+                MAX_ROTATED_FILES + 1
+            );
+            assert!(owed(&writer, "r3"), "the excess archive keeps r3");
+            assert!(owed(&writer, "r4"));
+            assert_no_lookup_walk(&writer, &all);
+            assert_index_matches_walk(&writer, &all);
+            drop(writer);
+            let writer =
+                AuditWriter::open(path.clone(), Some(retained_history_access(&store))).unwrap();
+            assert!(owed(&writer, "r3"));
+            assert_no_lookup_walk(&writer, &all);
+            assert_index_matches_walk(&writer, &all);
+        }
+
+        /// A cached keyed writer whose middle archive holds an owed row and
+        /// whose active file holds another.
+        fn tamper_fixture(
+            path: &Path,
+            name: &str,
+            rotations: usize,
+        ) -> (Arc<Mutex<AuditWriter>>, Arc<InMemoryTipAnchorStore>) {
+            let (handle, store) = cached_history_fixture(path, name, rotations);
+            {
+                let mut writer = handle.lock().unwrap();
+                writer.write_entry(owed_row("t1")).unwrap();
+                rotate_pruning_fixture(&mut writer);
+                rotate_pruning_fixture(&mut writer);
+                writer.write_entry(owed_row("t2")).unwrap();
+                assert!(owed(&writer, "t1") && owed(&writer, "t2"));
+            }
+            (handle, store)
+        }
+
+        #[test]
+        fn every_keyed_acquisition_rechecks_tampered_history() {
+            type Damage = (&'static str, usize, fn(&Path));
+            let damages: [Damage; 5] = [
+                ("chain", 1, |path| {
+                    let archives = rotated_archives_newest_first(path);
+                    edit_in_place(
+                        &archives[1],
+                        "\"tool\":\"stellar_pay\"",
+                        "\"tool\":\"stellar_paY\"",
+                    );
+                }),
+                ("bridge", 1, |path| {
+                    let archives = rotated_archives_newest_first(path);
+                    let contents = fs::read_to_string(&archives[0]).unwrap();
+                    let handoff = contents.lines().last().unwrap();
+                    let marker = "\"request_id\":\"";
+                    let at = contents.rfind(handoff).unwrap() + handoff.find(marker).unwrap();
+                    let mut edited = contents.clone();
+                    let digit = at + marker.len();
+                    let flipped = if &contents[digit..=digit] == "0" {
+                        "1"
+                    } else {
+                        "0"
+                    };
+                    edited.replace_range(digit..=digit, flipped);
+                    fs::write(&archives[0], edited).unwrap();
+                }),
+                ("root tag", 1, |path| {
+                    let archives = rotated_archives_newest_first(path);
+                    let sidecar = hmac_sidecar_path(&archives[1]);
+                    let tag = fs::read_to_string(&sidecar).unwrap();
+                    let flipped = if tag.starts_with('0') { "1" } else { "0" };
+                    fs::write(&sidecar, format!("{flipped}{}", &tag[1..])).unwrap();
+                }),
+                ("entry tag", 1, |path| {
+                    let archives = rotated_archives_newest_first(path);
+                    flip_hex_after(&archives[1], "\"entry_tag\":\"");
+                }),
+                ("prune marker", 12, |path| {
+                    let mut marker = read_prune_marker(path).unwrap().unwrap();
+                    marker.tag = Some(ZERO_BLOCK_HASH.to_owned());
+                    fs::write(
+                        prune_marker_path(path),
+                        serde_json::to_vec(&marker).unwrap(),
+                    )
+                    .unwrap();
+                }),
+            ];
+            for (damage, rotations, apply) in damages {
+                for cached in [false, true] {
+                    let dir = TempDir::new().unwrap();
+                    let path = dir.path().join("audit.jsonl");
+                    let name = format!("settlement-tamper-{damage}-{cached}");
+                    let (handle, store) = tamper_fixture(&path, &name, rotations);
+                    if cached {
+                        apply(&path);
+                        let (acquired, visits) = observe(|| {
+                            AuditWriterRegistry::get_or_open_keyed(
+                                &name,
+                                &path,
+                                retained_history_access(&store),
+                            )
+                        });
+                        assert!(
+                            matches!(acquired, Err(WriterError::RetainedHistoryUnverified(_))),
+                            "{damage}, cached: {acquired:?}"
+                        );
+                        // The marker check refuses before any file is read.
+                        assert_eq!(
+                            visits.iter().any(|visit| visit.source == VERIFY_WALK),
+                            damage != "prune marker",
+                            "{damage}: {visits:?}"
+                        );
+                        // The held writer keeps no answer the failed walk would
+                        // have refreshed.
+                        let writer = handle.lock().unwrap();
+                        assert_index_matches_walk(&writer, &["t1", "t2", FRESH]);
+                    } else {
+                        drop(handle);
+                        AuditWriterRegistry::remove_for_test(&name);
+                        apply(&path);
+                        let opened =
+                            AuditWriter::open(path.clone(), Some(retained_history_access(&store)));
+                        // The open's own replay of the newest archive's
+                        // handoff refuses a broken bridge before the walk.
+                        assert!(
+                            matches!(
+                                opened,
+                                Err(WriterError::RetainedHistoryUnverified(_)
+                                    | WriterError::ChainBrokenAtOpen { .. })
+                            ),
+                            "{damage}, fresh: {:?}",
+                            opened.err()
+                        );
+                    }
+                    AuditWriterRegistry::remove_for_test(&name);
+                }
+            }
+        }
+
+        #[test]
+        fn failed_index_refresh_never_publishes_partial_answers() {
+            let dir = TempDir::new().unwrap();
+            let path = dir.path().join("audit.jsonl");
+            let name = "settlement-failed-refresh";
+            let (handle, store) = tamper_fixture(&path, name, 1);
+            {
+                let writer = handle.lock().unwrap();
+                let (answer, visits) = observe(|| try_value_action_settlement(&writer, FRESH));
+                assert_eq!(answer.unwrap(), ValueActionSettlement::OwedWithoutLegs);
+                assert!(visits.is_empty(), "the cached index is complete");
+            }
+            // The newest archive breaks, so the verification walk has read
+            // every older file's rows before it refuses.
+            let archives = rotated_archives_newest_first(&path);
+            edit_in_place(
+                &archives[0],
+                "\"tool\":\"stellar_pay_commit\"",
+                "\"tool\":\"stellar_pay_commiT\"",
+            );
+            let (acquired, visits) = observe(|| {
+                AuditWriterRegistry::get_or_open_keyed(name, &path, retained_history_access(&store))
+            });
+            assert!(matches!(
+                acquired,
+                Err(WriterError::RetainedHistoryUnverified(_))
+            ));
+            let verified = visits
+                .iter()
+                .filter(|visit| visit.source == VERIFY_WALK)
+                .count();
+            assert_eq!(verified, archives.len(), "every archive was read");
+            assert!(visits.iter().any(|visit| visit.rows > 0));
+
+            let writer = handle.lock().unwrap();
+            // The active file still answers t2; every lookup that reaches the
+            // broken archive refuses, as the walk does.
+            assert!(owed(&writer, "t2"));
+            for hash in ["t1", FRESH] {
+                assert!(
+                    try_value_action_settlement(&writer, hash).is_err(),
+                    "{hash} reaches the broken archive"
+                );
+            }
+            assert_index_matches_walk(&writer, &["t1", "t2", FRESH]);
+            drop(writer);
+            drop(handle);
+            AuditWriterRegistry::remove_for_test(name);
+        }
+
+        #[test]
+        fn changed_archive_listing_rebuilds_or_refuses_before_append() {
+            let all = ["l1", "l2", FRESH];
+            let fixture = |dir: &TempDir| {
+                let path = dir.path().join("audit.jsonl");
+                let (mut writer, store) = anchored_pruning_fixture(&path, 0);
+                writer.write_entry(owed_row("l1")).unwrap();
+                for _ in 0..MAX_ROTATED_FILES {
+                    rotate_pruning_fixture(&mut writer);
+                }
+                writer.write_entry(owed_row("l2")).unwrap();
+                assert!(owed(&writer, "l1") && owed(&writer, "l2"));
+                assert_no_lookup_walk(&writer, &all);
+                (path, writer, store)
+            };
+
+            // An archive-shaped directory refuses every lookup that reaches it.
+            let dir = TempDir::new().unwrap();
+            let (path, writer, _store) = fixture(&dir);
+            let bytes = fs::read(&path).unwrap();
+            let mut planted = path.clone().into_os_string();
+            planted.push(".20260428T123456");
+            fs::create_dir(&planted).unwrap();
+            assert!(owed(&writer, "l2"), "the active file answers first");
+            assert!(owed(&writer, "l1"), "a newer archive answers first");
+            assert!(try_value_action_settlement(&writer, FRESH).is_err());
+            assert_index_matches_walk(&writer, &all);
+            assert_eq!(fs::read(&path).unwrap(), bytes);
+            drop(writer);
+
+            // A removed middle archive breaks the bridge.
+            let dir = TempDir::new().unwrap();
+            let (path, writer, _store) = fixture(&dir);
+            let bytes = fs::read(&path).unwrap();
+            let archives = rotated_archives_newest_first(&path);
+            fs::remove_file(&archives[4]).unwrap();
+            assert!(owed(&writer, "l2"));
+            assert!(try_value_action_settlement(&writer, FRESH).is_err());
+            assert_index_matches_walk(&writer, &all);
+            assert_eq!(fs::read(&path).unwrap(), bytes);
+            drop(writer);
+
+            // A valid changed history, a prune finished outside the writer
+            // after its marker was written, refreshes the answers.
+            let dir = TempDir::new().unwrap();
+            let (path, mut writer, _store) = fixture(&dir);
+            writer.skip_prune_removal = true;
+            rotate_pruning_fixture(&mut writer);
+            writer.skip_prune_removal = false;
+            assert!(owed(&writer, "l1"), "the marked archive is still listed");
+            let oldest = rotated_archives_newest_first(&path).pop().unwrap();
+            fs::remove_file(&oldest).unwrap();
+            fs::remove_file(hmac_sidecar_path(&oldest)).unwrap();
+            assert_eq!(
+                try_value_action_settlement(&writer, "l1").unwrap(),
+                ValueActionSettlement::OwedWithoutLegs
+            );
+            assert!(owed(&writer, "l2"));
+            assert_eq!(
+                try_value_action_settlement(&writer, FRESH).unwrap(),
+                ValueActionSettlement::OwedWithoutLegs
+            );
+            assert_index_matches_walk(&writer, &all);
+            assert_no_lookup_walk(&writer, &all);
+        }
     }
 }
 

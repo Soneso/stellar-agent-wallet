@@ -86,6 +86,7 @@
 //!   most, the point at which a still-absent file is reported as a gap.
 
 use std::{
+    collections::HashMap,
     io::{BufRead, BufReader},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
@@ -93,13 +94,15 @@ use std::{
 
 use sha2::{Digest as _, Sha256};
 
+use crate::file_lock::FileIdentity;
+
 use super::{
     chain::compute_entry_hash,
     entry::AuditEntry,
     rotation::{oldest_retained_seed, read_prune_marker},
     schema::{EventKind, ExecutableRefPin, ExecutableRefPinFirst8, ValueLegRecord, WasmHashPin},
     signer_set::{ObservedSignerSet, SignerSetSnapshotV2, SignerSetView, SignerSetViewPayload},
-    verify::VerifyError,
+    verify::{VerifyError, WalkedRows},
     writer::{
         AuditWriter, is_rotated_sibling, prune_marker_path, wait_out_transient_rotation_window,
     },
@@ -1048,6 +1051,28 @@ struct BoundedFile {
     /// one-based lines, and without the entries an `audit_entries_quarantined`
     /// row covers.
     rows: Vec<(usize, AuditEntry)>,
+    /// Where every entry of the file lies, quarantined entries included,
+    /// ordered by line.
+    spans: Vec<RowSpan>,
+}
+
+impl BoundedFile {
+    /// Where the entry at one-based `line` lies in the file.
+    fn span(&self, line: usize) -> Option<RowSpan> {
+        self.spans
+            .binary_search_by_key(&line, |span| span.line)
+            .ok()
+            .map(|at| self.spans[at])
+    }
+}
+
+/// Where one entry lies in its file: its one-based line, the byte offset of
+/// its first byte, and its length with the newline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RowSpan {
+    line: usize,
+    offset: u64,
+    len: u64,
 }
 
 /// What the writer verified about the active file: where it ends, what its
@@ -1136,6 +1161,33 @@ fn walk_files<'k>(
     })
 }
 
+/// The writer-bounded walk of [`bounded_files`], resumed at the file
+/// `listing[covered]` of a listing the caller already read.
+///
+/// `expected_tip` is what the walk held after the newer files: the hash the
+/// next older file must end on. Every check runs as in an unbroken walk.
+fn resumed_bounded_files(
+    writer: &AuditWriter,
+    listing: &[PathBuf],
+    covered: usize,
+    expected_tip: Option<String>,
+) -> BoundedFiles<'static> {
+    let uncovered: Vec<PathBuf> = listing.iter().skip(covered).cloned().collect();
+    BoundedFiles {
+        log_path: writer.path().to_path_buf(),
+        has_rotated: listing.len() > 1,
+        files: uncovered.into_iter(),
+        bound: Some(WriterBound {
+            end_offset: writer.end_offset(),
+            segment_start: super::chain::encode_hash(writer.segment_start_hash()),
+            last_hash: writer.last_entry_hash().to_owned(),
+        }),
+        hmac_key: None,
+        expected_tip,
+        failed: false,
+    }
+}
+
 impl Iterator for BoundedFiles<'_> {
     type Item = Result<BoundedFile, AuditLogIntegrityError>;
 
@@ -1203,6 +1255,7 @@ impl BoundedFiles<'_> {
             return Ok(BoundedFile {
                 name,
                 rows: Vec::new(),
+                spans: Vec::new(),
             });
         }
         let limit = self.bound.as_ref().map(|bound| bound.end_offset);
@@ -1223,6 +1276,7 @@ impl BoundedFiles<'_> {
         Ok(BoundedFile {
             name,
             rows: drop_quarantined(read.rows),
+            spans: read.spans,
         })
     }
 
@@ -1244,6 +1298,7 @@ impl BoundedFiles<'_> {
         Ok(BoundedFile {
             name,
             rows: drop_quarantined(read.rows),
+            spans: read.spans,
         })
     }
 }
@@ -1252,6 +1307,8 @@ impl BoundedFiles<'_> {
 #[derive(Debug)]
 struct FileRows {
     rows: Vec<(usize, AuditEntry)>,
+    /// Where each entry of `rows` lies in the file, in the same order.
+    spans: Vec<RowSpan>,
     /// The first entry's `previous_entry_hash`.
     first_prev: Option<String>,
     /// The last entry's chain hash.
@@ -1277,24 +1334,29 @@ fn read_file_rows(
     use std::io::Read as _;
 
     let name = basename(path);
+    #[cfg(test)]
+    row_file_visits::record_open(&name, row_file_visits::LOOKUP_WALK);
     let file = open_regular_file(path)?;
     let mut reader = BufReader::new(file.take(limit.unwrap_or(u64::MAX)));
     let mut rows = Vec::new();
+    let mut spans = Vec::new();
     let mut expected_prev = first_prev.map(str::to_owned);
     let mut first = None;
     let mut last_hash = None;
     let mut last_line = 1;
     let mut raw = Vec::new();
     let mut line_number = 0usize;
+    let mut offset = 0u64;
     loop {
         raw.clear();
-        if reader
+        let read = reader
             .read_until(b'\n', &mut raw)
-            .map_err(AuditLogIntegrityError::Io)?
-            == 0
-        {
+            .map_err(AuditLogIntegrityError::Io)?;
+        if read == 0 {
             break;
         }
+        let start = offset;
+        offset = offset.saturating_add(read as u64);
         line_number += 1;
         if limit.is_some() && raw.last() != Some(&b'\n') {
             return Err(chain_broken(&name, line_number, TIP_MISMATCH_REASON));
@@ -1306,6 +1368,8 @@ fn read_file_rows(
             line: line_number,
             detail,
         };
+        #[cfg(test)]
+        row_file_visits::record_row();
         let entry: AuditEntry = serde_json::from_slice(&raw).map_err(|e| {
             parse_error(format!(
                 "the entry {}",
@@ -1337,9 +1401,15 @@ fn read_file_rows(
         last_hash = Some(hash);
         last_line = line_number;
         rows.push((line_number, entry));
+        spans.push(RowSpan {
+            line: line_number,
+            offset: start,
+            len: read as u64,
+        });
     }
     Ok(FileRows {
         rows,
+        spans,
         first_prev: first,
         last_hash,
         last_line,
@@ -1649,10 +1719,8 @@ pub enum ValueActionSettlement {
 ///
 /// A match is a `value_action_pending`, `value_action_submitted`, or
 /// `value_action_failed` row carrying the hash. Tool-invocation and
-/// operator-clear rows that carry it are skipped, so the walk never stops in a
-/// file that holds no settlement row. Files are visited newest first, and the
-/// walk stops at the first file holding a match, leaving older files
-/// unvisited. The last match in that file wins.
+/// operator-clear rows that carry it are skipped. The answer is the latest
+/// match: files newest first, the last match in the newest file holding one.
 ///
 /// `writer` is the caller's guard of the profile's writer, held across the
 /// lookup and the append that follows it. The lookup reads the writer's
@@ -1661,9 +1729,51 @@ pub enum ValueActionSettlement {
 /// appended outside the writer, past that tip, is never read. No key is read
 /// and no chain-root sidecar is checked.
 ///
+/// # The bound
+///
+/// The writer keeps an index of the latest match of every envelope hash in
+/// the files it covers. Let F be the active file plus every retained archive.
+/// Every lookup lists the log directory, with the rotation-window retries of
+/// the walk, and compares the listing and the writer's tip with the index.
+/// Every answer is given under the index lock, after the lookup opens the
+/// active file under that lock. When the file does not open as a regular
+/// file, is not the file the writer holds, or is shorter than the writer's
+/// verified tip, the lookup discards the index and answers through the walk,
+/// with the walk's refusal.
+///
+/// - Every lookup opens the active file under the lock and checks its
+///   identity and length. That open reads no row bytes.
+/// - With a complete index and both unchanged, an absent or settled answer
+///   reads no row bytes and parses no row. An owed answer opens the file
+///   holding its pending row and reads and parses that one row at the
+///   recorded offset.
+/// - Otherwise the lookup walks newest first from the first uncovered file,
+///   at most F files, and stops at the first file holding a match. The walk's
+///   errors propagate, and the files read before an error stay covered.
+/// - Memory: one entry per distinct envelope hash with a match in the covered
+///   history, holding the hash, a file number, and a row offset and length,
+///   plus one path per listed file.
+///
+/// A keyed checked writer that drains publishes a complete index from the
+/// verification walk of each acquisition and tip verification, which read
+/// all F files for their own checks. That walk applies the same tip bound
+/// and quarantine rule, and a failed walk leaves no index.
+///
+/// # Why the bound holds
+///
+/// The index holds only rows this walk reads under the writer's guard, up to
+/// its tip. A committed append, rotation, or prune of the writer updates it,
+/// and any other change of the listing or the tip discards it. A quarantine
+/// row discards it too, since it changes what earlier rows mean. An oldest
+/// retained obligation leaves the index only when the writer prunes its file.
+/// A recorded pending row that fails to read back as that row discards the
+/// index and answers from the walk. Content edits under unchanged names are refused by
+/// the next keyed acquisition, which verifies every retained file.
+///
 /// The eleventh rotation deletes the oldest archive, so a submission whose
 /// rows only that archive held reads as
-/// [`ValueActionSettlement::OwedWithoutLegs`].
+/// [`ValueActionSettlement::OwedWithoutLegs`]. A prune that stops keeps its
+/// archives, and their rows keep answering.
 ///
 /// # Errors
 ///
@@ -1673,29 +1783,692 @@ pub fn try_value_action_settlement(
     writer: &AuditWriter,
     envelope_hash: &str,
 ) -> Result<ValueActionSettlement, AuditLogIntegrityError> {
-    Ok(
-        find_latest_value_row(writer, envelope_hash, |entry| match &entry.event_kind {
-            EventKind::ValueActionSubmitted { .. } | EventKind::ValueActionFailed { .. } => {
-                Some(ValueActionSettlement::Settled)
+    writer.settlement_index().lookup(writer, envelope_hash)
+}
+
+/// The settlement answer one matching row gives, or `None` for a row that is
+/// not a match.
+fn settlement_of(entry: &AuditEntry) -> Option<ValueActionSettlement> {
+    match &entry.event_kind {
+        EventKind::ValueActionSubmitted { .. } | EventKind::ValueActionFailed { .. } => {
+            Some(ValueActionSettlement::Settled)
+        }
+        EventKind::ValueActionPending {
+            witness,
+            legs,
+            approval_nonce,
+            ..
+        } => Some(ValueActionSettlement::Owed(PendingValueAction {
+            witness: witness.clone(),
+            legs: legs.clone(),
+            tool: entry.tool.clone(),
+            chain_id: entry.chain_id.clone(),
+            nonce_id: entry.nonce_id.clone(),
+            policy_decision: entry.policy_decision.clone(),
+            approval_nonce: approval_nonce.clone(),
+        })),
+        _ => None,
+    }
+}
+
+/// The lookup of [`try_value_action_settlement`] as one walk of the writer's
+/// bounded files, with no index.
+pub(super) fn settlement_walk(
+    writer: &AuditWriter,
+    envelope_hash: &str,
+) -> Result<ValueActionSettlement, AuditLogIntegrityError> {
+    Ok(find_latest_value_row(writer, envelope_hash, settlement_of)?
+        .unwrap_or(ValueActionSettlement::OwedWithoutLegs))
+}
+
+// ── Settlement index ─────────────────────────────────────────────────────────
+
+/// What one row means to the settlement lookup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum RowSettlement {
+    /// A `value_action_pending` row carrying this envelope hash.
+    Pending(String),
+    /// A `value_action_submitted` or `value_action_failed` row carrying this
+    /// envelope hash.
+    Settled(String),
+    /// An `audit_entries_quarantined` row covering this many entries.
+    Quarantine(u64),
+    /// Any other row.
+    Other,
+}
+
+impl RowSettlement {
+    /// Classifies `entry` as the settlement lookup matches it.
+    pub(super) fn of(entry: &AuditEntry) -> Self {
+        match (&entry.event_kind, &entry.envelope_hash) {
+            (EventKind::AuditEntriesQuarantined { quarantined_count }, _) => {
+                Self::Quarantine(*quarantined_count)
             }
-            EventKind::ValueActionPending {
-                witness,
-                legs,
-                approval_nonce,
-                ..
-            } => Some(ValueActionSettlement::Owed(PendingValueAction {
-                witness: witness.clone(),
-                legs: legs.clone(),
-                tool: entry.tool.clone(),
-                chain_id: entry.chain_id.clone(),
-                nonce_id: entry.nonce_id.clone(),
-                policy_decision: entry.policy_decision.clone(),
-                approval_nonce: approval_nonce.clone(),
-            })),
+            (EventKind::ValueActionPending { .. }, Some(hash)) => Self::Pending(hash.clone()),
+            (
+                EventKind::ValueActionSubmitted { .. } | EventKind::ValueActionFailed { .. },
+                Some(hash),
+            ) => Self::Settled(hash.clone()),
+            _ => Self::Other,
+        }
+    }
+}
+
+/// The writer state an index view describes: the active file's verified end,
+/// the writer's tip hash, the hash the active file's first entry chains from,
+/// and the identity of the active file the writer holds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct IndexedTip {
+    end_offset: u64,
+    last_hash: String,
+    segment_start: [u8; 32],
+    /// `None` when the platform cannot identify the held file; such a tip
+    /// never serves a cached answer.
+    active: Option<FileIdentity>,
+}
+
+impl IndexedTip {
+    /// The tip `writer` holds now.
+    pub(super) fn of(writer: &AuditWriter) -> Self {
+        Self {
+            end_offset: writer.end_offset(),
+            last_hash: writer.last_entry_hash().to_owned(),
+            segment_start: *writer.segment_start_hash(),
+            active: file_identity(writer.active_file()).ok(),
+        }
+    }
+
+    /// Whether `file`, opened at the active path, is the file this tip names
+    /// and holds at least the bytes the tip covers.
+    fn names_opened(&self, file: &std::fs::File) -> bool {
+        self.active
+            .as_ref()
+            .is_some_and(|active| file_identity(file).is_ok_and(|opened| &opened == active))
+            && file
+                .metadata()
+                .is_ok_and(|metadata| metadata.len() >= self.end_offset)
+    }
+}
+
+/// The identity of the open file `file`, independent of any path.
+fn file_identity(file: &std::fs::File) -> std::io::Result<FileIdentity> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        let metadata = file.metadata()?;
+        Ok(FileIdentity::Unix {
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+        })
+    }
+    #[cfg(windows)]
+    {
+        let (volume_serial, file_index) =
+            stellar_agent_windows_identity::file_identity(file).map_err(std::io::Error::other)?;
+        Ok(FileIdentity::Windows {
+            volume_serial,
+            file_index,
+        })
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = file;
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "file identity unavailable",
+        ))
+    }
+}
+
+/// The latest matching row of one envelope hash: the file holding it and
+/// what it says.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LatestRow {
+    file: u64,
+    kind: LatestKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LatestKind {
+    /// A submitted or failed row.
+    Settled,
+    /// A pending row at `offset`, `len` bytes long.
+    Pending { offset: u64, len: u64 },
+}
+
+/// One file of an index view's listing.
+#[derive(Debug, Clone)]
+struct IndexedFile {
+    path: PathBuf,
+    id: u64,
+}
+
+/// The settlement facts of a newest-first prefix of one listing.
+#[derive(Debug)]
+struct IndexView {
+    /// The listing the view describes, newest first, the active file first.
+    files: Vec<IndexedFile>,
+    /// How many files, from the newest, the view covers.
+    covered: usize,
+    /// The hash the next uncovered file must end on, as the walk held it.
+    expected_tip: Option<String>,
+    /// The writer tip the covered rows end at.
+    tip: IndexedTip,
+    /// The latest matching row of every envelope hash a covered file holds.
+    latest: HashMap<String, LatestRow>,
+}
+
+impl IndexView {
+    fn complete(&self) -> bool {
+        self.covered == self.files.len()
+    }
+
+    fn describes(&self, listing: &[PathBuf], tip: &IndexedTip) -> bool {
+        self.tip == *tip
+            && self.files.len() == listing.len()
+            && self
+                .files
+                .iter()
+                .zip(listing)
+                .all(|(file, path)| file.path == *path)
+    }
+
+    /// Records the matches of one file older than every covered file: a hash
+    /// a newer file already answers keeps that answer, and otherwise the
+    /// file's last match wins.
+    fn absorb<'r>(
+        &mut self,
+        file: u64,
+        rows: impl DoubleEndedIterator<Item = (&'r RowSettlement, u64, u64)>,
+    ) {
+        let mut found = HashMap::new();
+        for (settlement, offset, len) in rows.rev() {
+            let (hash, kind) = match settlement {
+                RowSettlement::Pending(hash) => (hash, LatestKind::Pending { offset, len }),
+                RowSettlement::Settled(hash) => (hash, LatestKind::Settled),
+                RowSettlement::Quarantine(_) | RowSettlement::Other => continue,
+            };
+            if !self.latest.contains_key(hash) {
+                found
+                    .entry(hash.clone())
+                    .or_insert(LatestRow { file, kind });
+            }
+        }
+        self.latest.extend(found);
+    }
+
+    fn path_of(&self, file: u64) -> Option<&Path> {
+        self.files
+            .iter()
+            .find(|indexed| indexed.id == file)
+            .map(|indexed| indexed.path.as_path())
+    }
+}
+
+#[derive(Debug, Default)]
+struct IndexState {
+    view: Option<IndexView>,
+    next_id: u64,
+}
+
+impl IndexState {
+    fn fresh_view(&mut self, listing: Vec<PathBuf>, tip: IndexedTip) -> IndexView {
+        let files = listing
+            .into_iter()
+            .map(|path| {
+                self.next_id += 1;
+                IndexedFile {
+                    path,
+                    id: self.next_id,
+                }
+            })
+            .collect();
+        IndexView {
+            files,
+            covered: 0,
+            expected_tip: None,
+            tip,
+            latest: HashMap::new(),
+        }
+    }
+}
+
+/// The writer's in-memory index of the latest settlement row of every
+/// envelope hash in the retained history, which
+/// [`try_value_action_settlement`] answers from.
+///
+/// The index holds a view of a newest-first prefix of the retained files,
+/// the writer tip it ends at, and the listing it describes. A keyed
+/// verification walk publishes a complete view; a lookup without one extends
+/// the prefix through the bounded walk. Committed appends, rotations and
+/// prunes of the holding writer update the view; any other change of the tip
+/// or the listing discards it.
+#[derive(Debug, Default)]
+pub(super) struct SettlementIndex {
+    state: Mutex<IndexState>,
+}
+
+impl SettlementIndex {
+    fn state(&self) -> std::sync::MutexGuard<'_, IndexState> {
+        match self.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => {
+                let mut state = poisoned.into_inner();
+                state.view = None;
+                self.state.clear_poison();
+                state
+            }
+        }
+    }
+
+    /// Discards the view, so the next lookup walks the bounded files again.
+    pub(super) fn clear(&self) {
+        self.state().view = None;
+    }
+
+    /// Publishes the complete view a keyed verification walk of the writer's
+    /// bounded log produced, or discards the view when the walk does not
+    /// match what the bounded walk of the lookup reads.
+    ///
+    /// The walk matches when every line reads the same, its active file is
+    /// the writer's path, chains from the writer's segment start and ends on
+    /// the writer's tip.
+    pub(super) fn publish_verified(
+        &self,
+        log_path: &Path,
+        tip: IndexedTip,
+        walk_tip: Option<&str>,
+        rows: &WalkedRows,
+    ) {
+        let mut state = self.state();
+        state.view = None;
+        let segment_start = super::chain::encode_hash(&tip.segment_start);
+        let matches = rows.exact
+            && walk_tip == Some(tip.last_hash.as_str())
+            && rows.files.last().is_some_and(|active| {
+                active.path == log_path && active.initial_prev_hash == segment_start
+            });
+        if !matches {
+            return;
+        }
+        let listing = rows.files.iter().rev().map(|file| file.path.clone());
+        let mut view = state.fresh_view(listing.collect(), tip);
+        for (at, walked) in rows.files.iter().rev().enumerate() {
+            let id = view.files[at].id;
+            view.absorb(
+                id,
+                walked
+                    .rows
+                    .iter()
+                    .map(|row| (&row.settlement, row.offset, row.len)),
+            );
+        }
+        view.covered = view.files.len();
+        state.view = Some(view);
+    }
+
+    /// Records a row the writer committed at `offset`, `len` bytes long,
+    /// moving its tip from `before` to `after`.
+    ///
+    /// A view that does not end at `before` is discarded, and so is every
+    /// view when the row is a quarantine row, which can change what earlier
+    /// rows mean.
+    pub(super) fn appended(
+        &self,
+        before: &IndexedTip,
+        after: IndexedTip,
+        settlement: RowSettlement,
+        offset: u64,
+        len: u64,
+    ) {
+        let mut state = self.state();
+        let Some(view) = state.view.as_mut().filter(|view| view.tip == *before) else {
+            state.view = None;
+            return;
+        };
+        let Some(active) = view.files.first().map(|file| file.id) else {
+            state.view = None;
+            return;
+        };
+        let kind = match settlement {
+            RowSettlement::Pending(hash) => Some((hash, LatestKind::Pending { offset, len })),
+            RowSettlement::Settled(hash) => Some((hash, LatestKind::Settled)),
+            RowSettlement::Other => None,
+            RowSettlement::Quarantine(_) => {
+                state.view = None;
+                return;
+            }
+        };
+        if let Some((hash, kind)) = kind {
+            view.latest.insert(hash, LatestRow { file: active, kind });
+        }
+        view.tip = after;
+    }
+
+    /// Records a rotation that renamed the active file to `archive` and
+    /// started an empty active file, moving the writer's tip from `before`
+    /// to `after`.
+    pub(super) fn rotated(&self, before: &IndexedTip, archive: &Path, after: IndexedTip) {
+        let mut state = self.state();
+        let usable = state
+            .view
+            .as_ref()
+            .is_some_and(|view| view.tip == *before && view.covered > 0);
+        if !usable {
+            state.view = None;
+            return;
+        }
+        state.next_id += 1;
+        let id = state.next_id;
+        let Some(view) = state.view.as_mut() else {
+            return;
+        };
+        let active_path = view.files[0].path.clone();
+        view.files[0].path = archive.to_path_buf();
+        view.files.insert(
+            0,
+            IndexedFile {
+                path: active_path,
+                id,
+            },
+        );
+        view.covered += 1;
+        view.tip = after;
+    }
+
+    /// Records the writer's prune of `archive`, the oldest retained file:
+    /// the rows it held stop answering.
+    pub(super) fn pruned(&self, archive: &Path) {
+        let mut state = self.state();
+        let Some(view) = state.view.as_mut() else {
+            return;
+        };
+        if view.files.last().is_none_or(|file| file.path != archive) || view.files.len() < 2 {
+            state.view = None;
+            return;
+        }
+        let at = view.files.len() - 1;
+        let removed = view.files.remove(at);
+        if at < view.covered {
+            view.covered -= 1;
+            view.latest.retain(|_, latest| latest.file != removed.id);
+        }
+    }
+
+    /// Answers [`try_value_action_settlement`] for `envelope_hash` under the
+    /// caller's guard of `writer`.
+    fn lookup(
+        &self,
+        writer: &AuditWriter,
+        envelope_hash: &str,
+    ) -> Result<ValueActionSettlement, AuditLogIntegrityError> {
+        let listing = collect_files_newest_first(writer.path())?;
+        let tip = IndexedTip::of(writer);
+        let mut state = self.state();
+        #[cfg(test)]
+        lookup_hook::run_before_open();
+        // Every answer below is given under this lock, with the active file
+        // opened here. The bounded walk refuses a missing, non-regular,
+        // replaced, or shortened active file, so a file that does not open,
+        // is not the one the tip names, or is shorter than the tip discards
+        // the view, and the walk answers with its own refusal.
+        let opened = listing
+            .first()
+            .and_then(|active| open_regular_file(active).ok())
+            .filter(|opened| tip.names_opened(opened));
+        let Some(_active) = opened else {
+            state.view = None;
+            drop(state);
+            return settlement_walk(writer, envelope_hash);
+        };
+        // The validated handle stays open, and the lock held, through every
+        // answer below; a later change of the path reaches the next lookup.
+        #[cfg(test)]
+        lookup_hook::run_after_validation();
+        if !state
+            .view
+            .as_ref()
+            .is_some_and(|view| view.describes(&listing, &tip))
+        {
+            let view = state.fresh_view(listing.clone(), tip);
+            state.view = Some(view);
+        }
+        let Some(view) = state.view.as_mut() else {
+            return settlement_walk(writer, envelope_hash);
+        };
+        if !view.latest.contains_key(envelope_hash) && !view.complete() {
+            extend_view(view, writer, &listing, envelope_hash)?;
+        }
+        let Some(latest) = view.latest.get(envelope_hash).copied() else {
+            return Ok(ValueActionSettlement::OwedWithoutLegs);
+        };
+        let LatestKind::Pending { offset, len } = latest.kind else {
+            return Ok(ValueActionSettlement::Settled);
+        };
+        let pending = view
+            .path_of(latest.file)
+            .and_then(|path| read_pending_row(path, offset, len, envelope_hash));
+        match pending {
+            Some(pending) => Ok(ValueActionSettlement::Owed(pending)),
+            None => {
+                // The file lacks the row the view names, so the view does
+                // not describe the history on disk.
+                state.view = None;
+                drop(state);
+                settlement_walk(writer, envelope_hash)
+            }
+        }
+    }
+}
+
+/// Walks the files `view` does not cover yet, newest first, until one holds
+/// a match for `envelope_hash` or none is left. Each file read joins the
+/// view; the first error ends the walk and leaves the view at the files
+/// read before it.
+fn extend_view(
+    view: &mut IndexView,
+    writer: &AuditWriter,
+    listing: &[PathBuf],
+    envelope_hash: &str,
+) -> Result<(), AuditLogIntegrityError> {
+    let mut walk = resumed_bounded_files(writer, listing, view.covered, view.expected_tip.clone());
+    while let Some(file) = walk.next() {
+        let file = file?;
+        let id = view.files[view.covered].id;
+        let mut rows = Vec::with_capacity(file.rows.len());
+        for (line, entry) in &file.rows {
+            let settlement = RowSettlement::of(entry);
+            if matches!(
+                settlement,
+                RowSettlement::Pending(_) | RowSettlement::Settled(_)
+            ) {
+                let Some(span) = file.span(*line) else {
+                    return Err(AuditLogIntegrityError::ParseError {
+                        line: *line,
+                        detail: "the settlement index lost a row position".to_owned(),
+                    });
+                };
+                rows.push((settlement, span.offset, span.len));
+            }
+        }
+        view.absorb(
+            id,
+            rows.iter()
+                .map(|(settlement, offset, len)| (settlement, *offset, *len)),
+        );
+        view.covered += 1;
+        view.expected_tip.clone_from(&walk.expected_tip);
+        if view.latest.contains_key(envelope_hash) {
+            break;
+        }
+    }
+    Ok(())
+}
+
+/// Test-only seams that run once inside the next settlement lookup on this
+/// thread, both under the index lock: one before the lookup opens the active
+/// file, one after it validated the opened file and before any answer.
+#[cfg(test)]
+pub(super) mod lookup_hook {
+    use std::cell::RefCell;
+
+    type Hook = RefCell<Option<Box<dyn FnOnce()>>>;
+
+    thread_local! {
+        static BEFORE_OPEN: Hook = const { RefCell::new(None) };
+        static AFTER_VALIDATION: Hook = const { RefCell::new(None) };
+    }
+
+    /// Runs `hook` before the next lookup on this thread opens the active
+    /// file.
+    pub(crate) fn set(hook: impl FnOnce() + 'static) {
+        BEFORE_OPEN.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+    }
+
+    /// Runs `hook` after the next lookup on this thread validated the active
+    /// file and before it answers.
+    pub(crate) fn set_after_validation(hook: impl FnOnce() + 'static) {
+        AFTER_VALIDATION.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+    }
+
+    pub(crate) fn run_before_open() {
+        if let Some(hook) = BEFORE_OPEN.with(|slot| slot.borrow_mut().take()) {
+            hook();
+        }
+    }
+
+    pub(crate) fn run_after_validation() {
+        if let Some(hook) = AFTER_VALIDATION.with(|slot| slot.borrow_mut().take()) {
+            hook();
+        }
+    }
+}
+
+/// Reads back the pending row of `envelope_hash` at `offset` in `path`, or
+/// `None` when the bytes there are not that row.
+fn read_pending_row(
+    path: &Path,
+    offset: u64,
+    len: u64,
+    envelope_hash: &str,
+) -> Option<PendingValueAction> {
+    use std::io::{Read as _, Seek as _, SeekFrom};
+
+    #[cfg(test)]
+    row_file_visits::record_open(&basename(path), row_file_visits::LOOKUP_ROW);
+    let mut file = open_regular_file(path).ok()?;
+    file.seek(SeekFrom::Start(offset)).ok()?;
+    let mut raw = vec![0u8; usize::try_from(len).ok()?];
+    file.read_exact(&mut raw).ok()?;
+    #[cfg(test)]
+    row_file_visits::record_row();
+    let entry: AuditEntry = serde_json::from_slice(&raw).ok()?;
+    if entry.envelope_hash.as_deref() != Some(envelope_hash) {
+        return None;
+    }
+    match settlement_of(&entry)? {
+        ValueActionSettlement::Owed(pending) => Some(pending),
+        ValueActionSettlement::OwedWithoutLegs | ValueActionSettlement::Settled => None,
+    }
+}
+
+/// Test-only observation of row-file reads on the current thread: each open
+/// attempt of a log file, failed ones included, with the rows parsed from it.
+#[cfg(test)]
+pub(super) mod row_file_visits {
+    use std::cell::RefCell;
+
+    /// The settlement lookup's bounded walk.
+    pub(crate) const LOOKUP_WALK: &str = "lookup_walk";
+    /// The settlement lookup's read of one pending row.
+    pub(crate) const LOOKUP_ROW: &str = "lookup_row";
+    /// The verification walk.
+    pub(crate) const VERIFY_WALK: &str = "verify_walk";
+
+    /// One open attempt of a log file.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(crate) struct Visit {
+        /// The file's basename.
+        pub(crate) file: String,
+        /// The reader that opened it.
+        pub(crate) source: &'static str,
+        /// The rows parsed from it.
+        pub(crate) rows: usize,
+    }
+
+    thread_local! {
+        static VISITS: RefCell<Option<Vec<Visit>>> = const { RefCell::new(None) };
+    }
+
+    pub(crate) fn record_open(file: &str, source: &'static str) {
+        VISITS.with(|visits| {
+            if let Some(visits) = visits.borrow_mut().as_mut() {
+                visits.push(Visit {
+                    file: file.to_owned(),
+                    source,
+                    rows: 0,
+                });
+            }
+        });
+    }
+
+    pub(crate) fn record_row() {
+        VISITS.with(|visits| {
+            if let Some(visit) = visits.borrow_mut().as_mut().and_then(|v| v.last_mut()) {
+                visit.rows += 1;
+            }
+        });
+    }
+
+    /// Runs `f` and returns what it read.
+    pub(crate) fn observe<R>(f: impl FnOnce() -> R) -> (R, Vec<Visit>) {
+        let outer = VISITS.with(|visits| visits.borrow_mut().replace(Vec::new()));
+        let result = f();
+        let seen = VISITS.with(|visits| {
+            let mut visits = visits.borrow_mut();
+            let seen = visits.take().unwrap_or_default();
+            *visits = outer;
+            seen
+        });
+        (result, seen)
+    }
+
+    /// Runs `f` and returns what it read: the recorded open attempts, and the
+    /// bytes every `read` system call of this thread returned while `f` ran.
+    ///
+    /// The byte count is the kernel's per-thread `rchar` counter, so it
+    /// covers every read of every file, whichever code path issues it: the
+    /// writer's replay and tip reads, the verification walk, the lookup, and
+    /// any read added outside the recorded paths. A failed open reads no
+    /// byte; the open attempt itself is in the visits. The count is `None`
+    /// where the counter is unavailable.
+    pub(crate) fn observe_io<R>(f: impl FnOnce() -> R) -> (R, Vec<Visit>, Option<u64>) {
+        let before = thread_read_counter();
+        let (result, visits) = observe(f);
+        let after = thread_read_counter();
+        let bytes = match (before, after) {
+            // The first counter read itself returned `before_len` bytes, which
+            // the second reading includes.
+            (Some((before, before_len)), Some((after, _))) => {
+                Some(after.saturating_sub(before).saturating_sub(before_len))
+            }
             _ => None,
-        })?
-        .unwrap_or(ValueActionSettlement::OwedWithoutLegs),
-    )
+        };
+        (result, visits, bytes)
+    }
+
+    /// This thread's `rchar` counter and the length of the text it was read
+    /// from.
+    fn thread_read_counter() -> Option<(u64, u64)> {
+        let text = std::fs::read_to_string("/proc/thread-self/io").ok()?;
+        let rchar = text
+            .lines()
+            .find_map(|line| line.strip_prefix("rchar:"))?
+            .trim()
+            .parse()
+            .ok()?;
+        Some((rchar, text.len() as u64))
+    }
 }
 
 /// The settlement row that closes a submission's value action.
@@ -1716,9 +2489,11 @@ pub enum SettledValueAction {
 ///
 /// [`try_value_action_settlement`] answers whether a row is owed; this lookup
 /// tells a failed settlement from a submitted one where the caller decides on
-/// that difference. The walk, the writer guard and the limits are those of
-/// [`try_value_action_settlement`], with those two row kinds as the only
-/// matches.
+/// that difference. It holds the writer guard and reads the writer's bounded
+/// walk as [`try_value_action_settlement`] does, with those two row kinds as
+/// the only matches. It uses no index: each call walks the bounded files
+/// newest first and stops at the first file holding a match, so it reads up
+/// to every retained file and gets no index-based read bound.
 ///
 /// # Errors
 ///
@@ -1803,9 +2578,11 @@ pub fn audit_history_refusal(
 /// second row for one clear. This lookup is what makes the re-run complete the
 /// mark instead.
 ///
-/// The walk, the writer guard and the limits are those of
-/// [`try_value_action_settlement`], with a `submission_receipt_cleared` row as
-/// the only match.
+/// It holds the writer guard and reads the writer's bounded walk as
+/// [`try_value_action_settlement`] does, with a `submission_receipt_cleared`
+/// row as the only match. It uses no index: each call walks the bounded files
+/// newest first and stops at the first file holding a match, so it reads up
+/// to every retained file and gets no index-based read bound.
 ///
 /// # Errors
 ///
@@ -1830,9 +2607,12 @@ pub fn try_submission_receipt_cleared_exists(
 /// hold and marks the receipt, so a re-run after the release finishes the
 /// mark on it.
 ///
-/// The walk, the writer guard and the limits are those of
-/// [`try_value_action_settlement`], with such a `submission_receipt_cleared`
-/// row as the only match.
+/// It holds the writer guard and reads the writer's bounded walk as
+/// [`try_value_action_settlement`] does, with such a
+/// `submission_receipt_cleared` row as the only match. It uses no index: each
+/// call walks the bounded files newest first and stops at the first file
+/// holding a match, so it reads up to every retained file and gets no
+/// index-based read bound.
 ///
 /// # Errors
 ///
@@ -2356,10 +3136,9 @@ mod tests {
         guard.write_entry(cleared_row()).unwrap();
         guard.force_rotate_for_test().unwrap();
         guard.write_entry(pending_row(OTHER_ENVELOPE)).unwrap();
-        assert_eq!(
-            try_value_action_settlement(&guard, SETTLE_ENVELOPE).unwrap(),
-            ValueActionSettlement::Settled
-        );
+        // The oldest archive is corrupt before any lookup, so no earlier
+        // lookup has read it and the answer comes from stopping at the newer
+        // archive.
         let files = collect_files_newest_first(&path).unwrap();
         assert_eq!(files.len(), 3);
         std::fs::write(&files[2], "corrupt\n").unwrap();
@@ -6267,5 +7046,900 @@ mod tests {
             .write_all(b"{\"not\": \"an audit row\"}\n")
             .unwrap();
         assert_eq!(results(&reader), before, "a malformed line past the tip");
+    }
+
+    /// The settlement index behind [`try_value_action_settlement`], checked
+    /// against [`settlement_walk`] and by the row files each step reads.
+    mod settlement_index {
+        use super::*;
+        use crate::audit_log::reader::lookup_hook;
+        use crate::audit_log::reader::row_file_visits::{
+            LOOKUP_ROW, LOOKUP_WALK, VERIFY_WALK, Visit, observe, observe_io,
+        };
+        use crate::audit_log::schema::ValueActionKind;
+        use crate::audit_log::tip_anchor::InMemoryTipAnchorStore;
+        use std::io::Write as _;
+
+        const FRESH: &str = "ff";
+
+        /// A pending row whose every recorded field carries `tag`.
+        fn tagged_pending(envelope_hash: &str, tag: u8) -> AuditEntry {
+            AuditEntry::new_value_action_pending(
+                format!("tool-{tag}"),
+                Some(format!("stellar:chain-{tag}")),
+                vec![ValueLegRecord {
+                    action: ValueActionKind::Payment,
+                    amount: Some(i128::from(tag) * 1_000),
+                    asset: Some(format!("asset-{tag}")),
+                    destination_redacted: Some(format!("GDEST...{tag:05}")),
+                }],
+                "6ba7aaac...69060003",
+                "GAOTC...PZ6X4",
+                i64::from(tag),
+                if tag.is_multiple_of(2) {
+                    PolicyDecision::Allow
+                } else {
+                    PolicyDecision::RequireApproval
+                },
+                Some(envelope_hash.to_owned()),
+                Some(format!("nonce-{tag}")),
+                Some(format!("approval-{tag}")),
+                format!("req-{tag}"),
+                Some(tagged_witness(tag)),
+            )
+        }
+
+        /// The cross-check record of [`tagged_pending`].
+        fn tagged_witness(tag: u8) -> crate::audit_log::schema::CrossCheckRecord {
+            crate::audit_log::schema::CrossCheckRecord {
+                provider: format!("https://oracle-{tag}.example"),
+                ledger: 100 + u32::from(tag),
+                inputs_digest: format!("{tag:02x}").repeat(32),
+                kinds: vec![crate::cross_check::WitnessEntry::SourceAccount],
+            }
+        }
+
+        /// The answer for [`tagged_pending`] with `tag`, written out field by
+        /// field rather than read through the lookup's own extraction.
+        fn expected_owed(_envelope_hash: &str, tag: u8) -> ValueActionSettlement {
+            ValueActionSettlement::Owed(PendingValueAction {
+                witness: Some(crate::audit_log::schema::CrossCheckRecord {
+                    provider: format!("https://oracle-{tag}.example"),
+                    ledger: 100 + u32::from(tag),
+                    inputs_digest: format!("{tag:02x}").repeat(32),
+                    kinds: vec![crate::cross_check::WitnessEntry::SourceAccount],
+                }),
+                tool: format!("tool-{tag}"),
+                chain_id: Some(format!("stellar:chain-{tag}")),
+                legs: vec![ValueLegRecord {
+                    action: ValueActionKind::Payment,
+                    amount: Some(i128::from(tag) * 1_000),
+                    asset: Some(format!("asset-{tag}")),
+                    destination_redacted: Some(format!("GDEST...{tag:05}")),
+                }],
+                nonce_id: Some(format!("nonce-{tag}")),
+                policy_decision: if tag.is_multiple_of(2) {
+                    PolicyDecision::Allow
+                } else {
+                    PolicyDecision::RequireApproval
+                },
+                approval_nonce: Some(format!("approval-{tag}")),
+            })
+        }
+
+        /// Asserts each field of an owed answer against [`expected_owed`].
+        fn assert_owed_fields(actual: &ValueActionSettlement, tag: u8, context: &str) {
+            let ValueActionSettlement::Owed(actual) = actual else {
+                panic!("{context}: expected an owed answer, got {actual:?}");
+            };
+            let ValueActionSettlement::Owed(expected) = expected_owed("", tag) else {
+                unreachable!("expected_owed builds an owed answer");
+            };
+            assert_eq!(actual.witness, expected.witness, "{context}: witness");
+            assert_eq!(actual.tool, expected.tool, "{context}: tool");
+            assert_eq!(actual.chain_id, expected.chain_id, "{context}: chain_id");
+            assert_eq!(actual.legs, expected.legs, "{context}: legs");
+            assert_eq!(actual.nonce_id, expected.nonce_id, "{context}: nonce_id");
+            assert_eq!(
+                actual.policy_decision, expected.policy_decision,
+                "{context}: policy_decision"
+            );
+            assert_eq!(
+                actual.approval_nonce, expected.approval_nonce,
+                "{context}: approval_nonce"
+            );
+        }
+
+        fn same_hash_invocation(envelope_hash: &str) -> AuditEntry {
+            let mut invocation = AuditEntry::new_tool_invocation(NewToolInvocation::new(
+                "stellar_pay",
+                "stellar:testnet",
+                vec![],
+                PolicyDecision::Allow,
+                "req-invocation",
+            ));
+            invocation.envelope_hash = Some(envelope_hash.to_owned());
+            invocation
+        }
+
+        fn same_hash_clear(envelope_hash: &str) -> AuditEntry {
+            AuditEntry::new_submission_receipt_cleared(
+                "tx_receipt_clear",
+                Some("stellar:testnet".to_owned()),
+                "hash...tail",
+                "pending",
+                true,
+                false,
+                None,
+                Some(envelope_hash.to_owned()),
+                "clear",
+            )
+        }
+
+        /// Every visit of `source`.
+        fn of(visits: &[Visit], source: &str) -> Vec<(String, usize)> {
+            visits
+                .iter()
+                .filter(|visit| visit.source == source)
+                .map(|visit| (visit.file.clone(), visit.rows))
+                .collect()
+        }
+
+        /// The files of the log, newest first, by basename.
+        fn names(path: &Path) -> Vec<String> {
+            collect_files_newest_first(path)
+                .unwrap()
+                .iter()
+                .map(|file| basename(file))
+                .collect()
+        }
+
+        /// Asserts that the index answers every hash as the walk does.
+        fn assert_index_matches_walk(writer: &AuditWriter, hashes: &[&str]) {
+            for hash in hashes {
+                let indexed = try_value_action_settlement(writer, hash);
+                let walked = settlement_walk(writer, hash);
+                assert_eq!(
+                    indexed.map_err(|e| e.to_string()),
+                    walked.map_err(|e| e.to_string()),
+                    "hash {hash}"
+                );
+            }
+        }
+
+        /// A two-archive history: an owed row in the oldest archive, a settled
+        /// one in the newer archive, and an unrelated row in the active file.
+        fn two_archive_history(writer: &mut AuditWriter) {
+            writer.write_entry(tagged_pending("a1", 1)).unwrap();
+            writer.force_rotate_for_test().unwrap();
+            writer.write_entry(tagged_pending("b1", 2)).unwrap();
+            writer.write_entry(submitted_row("b1")).unwrap();
+            writer.force_rotate_for_test().unwrap();
+            writer.write_entry(same_hash_clear("c1")).unwrap();
+        }
+
+        /// Each step's open attempts and parsed rows, and on Linux every byte
+        /// its thread reads, through the kernel's per-thread `rchar` counter.
+        /// The test fails on Linux when that counter cannot be read. Other
+        /// platforms have no such counter, so they check the visit and row
+        /// assertions only.
+        #[test]
+        fn fresh_bytes_lookup_visits_only_the_documented_files() {
+            use crate::audit_log::writer::AuditWriterRegistry;
+
+            let dir = TempDir::new().unwrap();
+            let path = tmp_log(&dir);
+            let store = Arc::new(InMemoryTipAnchorStore::new());
+            let mut writer = open_keyed_writer(&path, &store);
+            two_archive_history(&mut writer);
+            drop(writer);
+            let files = names(&path);
+            assert_eq!(files.len(), 3);
+            let history = history_bytes(&path);
+            let owed_row_len = row_len(&path, "a1");
+
+            // Fresh open: the acquisition walks every file once; lookups of
+            // fresh or settled bytes then read no row file, and an owed hash
+            // reads its one row.
+            let (writer, opened, read) = observe_io(|| open_keyed_writer(&path, &store));
+            let verified: Vec<String> = of(&opened, VERIFY_WALK)
+                .into_iter()
+                .map(|(file, _)| file)
+                .collect();
+            assert_eq!(verified, files.iter().rev().cloned().collect::<Vec<_>>());
+            assert!(of(&opened, VERIFY_WALK).iter().all(|(_, rows)| *rows > 0));
+            assert!(of(&opened, LOOKUP_WALK).is_empty());
+            assert_reads_at_least(read, history, "fresh open");
+            for _ in 0..2 {
+                let (answer, visits, read) =
+                    observe_io(|| try_value_action_settlement(&writer, FRESH));
+                assert_eq!(answer.unwrap(), ValueActionSettlement::OwedWithoutLegs);
+                assert_eq!(visits, Vec::new(), "fresh bytes read no row file");
+                assert_reads(read, 0, "fresh lookup");
+            }
+            let (answer, visits, read) = observe_io(|| try_value_action_settlement(&writer, "b1"));
+            assert_eq!(answer.unwrap(), ValueActionSettlement::Settled);
+            assert_eq!(visits, Vec::new(), "a settled hash reads no row file");
+            assert_reads(read, 0, "settled lookup");
+            let (answer, visits, read) = observe_io(|| try_value_action_settlement(&writer, "a1"));
+            assert_eq!(answer.unwrap(), expected_owed("a1", 1));
+            assert_eq!(
+                visits,
+                vec![Visit {
+                    file: files[2].clone(),
+                    source: LOOKUP_ROW,
+                    rows: 1,
+                }],
+                "an owed hash reads its one pending row"
+            );
+            assert_reads(read, owed_row_len, "owed lookup");
+            drop(writer);
+
+            // Fresh registry acquisition, then a cache hit: each verifies the
+            // retained files, and neither leaves a lookup walk to do.
+            let name = "settlement-index-visits";
+            let access = || {
+                crate::audit_log::KeyedAuditAccess::new(
+                    zeroize::Zeroizing::new(KEYED_READER_KEY),
+                    Arc::clone(&store) as Arc<dyn crate::audit_log::TipAnchorStore>,
+                )
+            };
+            for acquisition in ["fresh", "cached"] {
+                let (handle, acquired, read) =
+                    observe_io(|| AuditWriterRegistry::get_or_open_keyed(name, &path, access()));
+                let handle = handle.unwrap();
+                assert_eq!(of(&acquired, VERIFY_WALK).len(), 3, "{acquisition}");
+                assert!(of(&acquired, LOOKUP_WALK).is_empty(), "{acquisition}");
+                assert_reads_at_least(read, history, acquisition);
+                let guard = handle.lock().unwrap();
+                let (answer, visits, read) =
+                    observe_io(|| try_value_action_settlement(&guard, FRESH));
+                assert_eq!(answer.unwrap(), ValueActionSettlement::OwedWithoutLegs);
+                assert_eq!(visits, Vec::new(), "{acquisition} lookup");
+                assert_reads(read, 0, acquisition);
+            }
+
+            // An append reads no row file and no retained history, and the
+            // lookup after it reads none.
+            let handle = AuditWriterRegistry::get_or_open_keyed(name, &path, access()).unwrap();
+            let mut guard = handle.lock().unwrap();
+            let archived = history - std::fs::metadata(&path).unwrap().len();
+            let (appended, visits, read) =
+                observe_io(|| guard.write_entry(tagged_pending("d1", 4)));
+            appended.unwrap();
+            assert!(of(&visits, LOOKUP_WALK).is_empty() && of(&visits, VERIFY_WALK).is_empty());
+            assert_reads_below(read, archived, "append");
+            let (answer, visits, read) = observe_io(|| try_value_action_settlement(&guard, FRESH));
+            assert_eq!(answer.unwrap(), ValueActionSettlement::OwedWithoutLegs);
+            assert_eq!(visits, Vec::new(), "lookup after an append");
+            assert_reads(read, 0, "lookup after an append");
+
+            // The post-append tip verification walks every file again; the
+            // lookup after it still reads none.
+            let (facts, visits, read) = observe_io(|| guard.verified_tip_facts());
+            facts.unwrap();
+            assert_eq!(of(&visits, VERIFY_WALK).len(), 3);
+            assert!(of(&visits, LOOKUP_WALK).is_empty());
+            assert_reads_at_least(read, history, "tip verification");
+            let (answer, visits, read) = observe_io(|| try_value_action_settlement(&guard, FRESH));
+            assert_eq!(answer.unwrap(), ValueActionSettlement::OwedWithoutLegs);
+            assert_eq!(visits, Vec::new(), "lookup after tip verification");
+            assert_reads(read, 0, "lookup after tip verification");
+            assert_index_matches_walk(&guard, &[FRESH, "a1", "b1", "c1", "d1"]);
+            drop(guard);
+            drop(handle);
+            AuditWriterRegistry::remove_for_test(name);
+
+            // Reopen: the open verifies again and the lookup reads nothing.
+            let (writer, opened, read) = observe_io(|| open_keyed_writer(&path, &store));
+            assert_eq!(of(&opened, VERIFY_WALK).len(), 3);
+            assert_reads_at_least(read, history, "reopen");
+            let (answer, visits, read) = observe_io(|| try_value_action_settlement(&writer, FRESH));
+            assert_eq!(answer.unwrap(), ValueActionSettlement::OwedWithoutLegs);
+            assert_eq!(visits, Vec::new(), "lookup after a reopen");
+            assert_reads(read, 0, "lookup after a reopen");
+        }
+
+        /// The bytes of every file of the log.
+        fn history_bytes(path: &Path) -> u64 {
+            collect_files_newest_first(path)
+                .unwrap()
+                .iter()
+                .map(|file| std::fs::metadata(file).map_or(0, |m| m.len()))
+                .sum()
+        }
+
+        /// The length, with its newline, of the one pending row of
+        /// `envelope_hash` in the log.
+        fn row_len(path: &Path, envelope_hash: &str) -> u64 {
+            let needle = format!("\"envelope_hash\":\"{envelope_hash}\"");
+            let lines: Vec<u64> = collect_files_newest_first(path)
+                .unwrap()
+                .iter()
+                .flat_map(|file| {
+                    std::fs::read_to_string(file)
+                        .unwrap_or_default()
+                        .lines()
+                        .filter(|line| {
+                            line.contains(&needle) && line.contains("value_action_pending")
+                        })
+                        .map(|line| line.len() as u64 + 1)
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+            assert_eq!(lines.len(), 1, "one pending row of {envelope_hash}");
+            lines[0]
+        }
+
+        /// The kernel's read count. On Linux the per-thread counter must be
+        /// readable, so a missing counter fails the test there; elsewhere no
+        /// counter exists and the byte assertions do not run.
+        fn counted(read: Option<u64>, context: &str) -> Option<u64> {
+            if cfg!(target_os = "linux") {
+                Some(read.unwrap_or_else(|| {
+                    panic!("{context}: /proc/thread-self/io must be readable on Linux")
+                }))
+            } else {
+                None
+            }
+        }
+
+        /// The kernel's read count is exactly `expected`.
+        fn assert_reads(read: Option<u64>, expected: u64, context: &str) {
+            if let Some(read) = counted(read, context) {
+                assert_eq!(read, expected, "{context}: bytes read");
+            }
+        }
+
+        fn assert_reads_at_least(read: Option<u64>, minimum: u64, context: &str) {
+            if let Some(read) = counted(read, context) {
+                assert!(read >= minimum, "{context}: read {read} of {minimum} bytes");
+            }
+        }
+
+        fn assert_reads_below(read: Option<u64>, limit: u64, context: &str) {
+            if let Some(read) = counted(read, context) {
+                assert!(read < limit, "{context}: read {read}, limit {limit} bytes");
+            }
+        }
+
+        #[test]
+        fn lazy_lookup_builds_on_first_miss_and_reuses_complete_index() {
+            let dir = TempDir::new().unwrap();
+            let path = tmp_log(&dir);
+            let mut writer = AuditWriter::open(path.clone(), None).unwrap();
+            two_archive_history(&mut writer);
+            drop(writer);
+            let files = names(&path);
+
+            // A first miss walks every retained file, newest first.
+            let writer = AuditWriter::open(path.clone(), None).unwrap();
+            let (answer, visits) = observe(|| try_value_action_settlement(&writer, FRESH));
+            assert_eq!(answer.unwrap(), ValueActionSettlement::OwedWithoutLegs);
+            let walked = of(&visits, LOOKUP_WALK);
+            assert_eq!(
+                walked
+                    .iter()
+                    .map(|(file, _)| file.clone())
+                    .collect::<Vec<_>>(),
+                files
+            );
+            assert!(walked.iter().all(|(_, rows)| *rows > 0));
+            assert_eq!(visits.len(), 3);
+            // The complete index answers every later miss with no read.
+            for _ in 0..2 {
+                let (answer, visits) = observe(|| try_value_action_settlement(&writer, FRESH));
+                assert_eq!(answer.unwrap(), ValueActionSettlement::OwedWithoutLegs);
+                assert_eq!(visits, Vec::new());
+            }
+            let (answer, visits) = observe(|| try_value_action_settlement(&writer, "b1"));
+            assert_eq!(answer.unwrap(), ValueActionSettlement::Settled);
+            assert_eq!(visits, Vec::new());
+            let (answer, visits) = observe(|| try_value_action_settlement(&writer, "a1"));
+            assert_eq!(answer.unwrap(), expected_owed("a1", 1));
+            assert_eq!(of(&visits, LOOKUP_ROW), vec![(files[2].clone(), 1)]);
+            assert_eq!(visits.len(), 1);
+            drop(writer);
+
+            // A match in a newer file leaves the older file unread; the
+            // unfinished index is not complete, so the next query resumes at
+            // the first unread file.
+            let writer = AuditWriter::open(path.clone(), None).unwrap();
+            let (answer, visits) = observe(|| try_value_action_settlement(&writer, "b1"));
+            assert_eq!(answer.unwrap(), ValueActionSettlement::Settled);
+            assert_eq!(
+                of(&visits, LOOKUP_WALK)
+                    .into_iter()
+                    .map(|(file, _)| file)
+                    .collect::<Vec<_>>(),
+                files[..2].to_vec()
+            );
+            let (answer, visits) = observe(|| try_value_action_settlement(&writer, "a1"));
+            assert_eq!(answer.unwrap(), expected_owed("a1", 1));
+            assert_eq!(
+                of(&visits, LOOKUP_WALK)
+                    .into_iter()
+                    .map(|(file, _)| file)
+                    .collect::<Vec<_>>(),
+                vec![files[2].clone()],
+                "the resumed walk reads only the unread file"
+            );
+            let (answer, visits) = observe(|| try_value_action_settlement(&writer, FRESH));
+            assert_eq!(answer.unwrap(), ValueActionSettlement::OwedWithoutLegs);
+            assert_eq!(visits, Vec::new(), "the index is now complete");
+            assert_index_matches_walk(&writer, &[FRESH, "a1", "b1", "c1"]);
+        }
+
+        /// Every matching history, under a keyed writer the verification walk
+        /// feeds and under an unkeyed writer that builds at its first lookup.
+        #[test]
+        fn latest_matching_value_row_preserves_every_pending_field() {
+            for keyed in [true, false] {
+                let dir = TempDir::new().unwrap();
+                let path = tmp_log(&dir);
+                let store = Arc::new(InMemoryTipAnchorStore::new());
+                let open = || {
+                    if keyed {
+                        open_keyed_writer(&path, &store)
+                    } else {
+                        AuditWriter::open(path.clone(), None).unwrap()
+                    }
+                };
+                let mut writer = open();
+                // Oldest file.
+                writer.write_entry(tagged_pending("h1", 1)).unwrap();
+                writer.write_entry(tagged_pending("h1", 2)).unwrap();
+                writer.write_entry(tagged_pending("h2", 3)).unwrap();
+                writer.write_entry(tagged_pending("h3", 4)).unwrap();
+                writer.write_entry(submitted_row("h3")).unwrap();
+                writer.write_entry(tagged_pending("h5", 5)).unwrap();
+                writer.write_entry(tagged_pending("h6", 6)).unwrap();
+                writer.force_rotate_for_test().unwrap();
+                // Newer file.
+                writer.write_entry(tagged_pending("h2", 7)).unwrap();
+                writer.write_entry(tagged_pending("h3", 8)).unwrap();
+                writer.write_entry(failed_row("h4")).unwrap();
+                writer.write_entry(tagged_pending("h4", 9)).unwrap();
+                writer.write_entry(same_hash_invocation("h5")).unwrap();
+                writer.write_entry(same_hash_clear("h5")).unwrap();
+                writer.write_entry(failed_row("h6")).unwrap();
+                writer.force_rotate_for_test().unwrap();
+                // Active file.
+                writer.write_entry(same_hash_invocation("h1")).unwrap();
+                drop(writer);
+
+                let writer = open();
+                let expected = [
+                    ("h1", expected_owed("h1", 2)),
+                    ("h2", expected_owed("h2", 7)),
+                    ("h3", expected_owed("h3", 8)),
+                    ("h4", expected_owed("h4", 9)),
+                    ("h5", expected_owed("h5", 5)),
+                    ("h6", ValueActionSettlement::Settled),
+                    (FRESH, ValueActionSettlement::OwedWithoutLegs),
+                ];
+                for (hash, answer) in &expected {
+                    assert_eq!(
+                        &try_value_action_settlement(&writer, hash).unwrap(),
+                        answer,
+                        "keyed {keyed}, hash {hash}"
+                    );
+                }
+                for (hash, tag) in [("h1", 2), ("h2", 7), ("h3", 8), ("h4", 9), ("h5", 5)] {
+                    assert_owed_fields(
+                        &try_value_action_settlement(&writer, hash).unwrap(),
+                        tag,
+                        &format!("keyed {keyed}, hash {hash}"),
+                    );
+                }
+                assert_index_matches_walk(
+                    &writer,
+                    &expected.iter().map(|(hash, _)| *hash).collect::<Vec<_>>(),
+                );
+            }
+        }
+
+        #[test]
+        fn effective_quarantine_preserves_only_uncovered_settlement_rows() {
+            let dir = TempDir::new().unwrap();
+            let path = tmp_log(&dir);
+            let store = Arc::new(InMemoryTipAnchorStore::new());
+            {
+                let mut writer = open_keyed_writer(&path, &store);
+                writer.write_entry(tagged_pending("q1", 1)).unwrap();
+                writer.write_entry(tagged_pending("q2", 2)).unwrap();
+                writer.write_entry(tagged_pending("q3", 3)).unwrap();
+                writer.write_entry(submitted_row("q3")).unwrap();
+            }
+            // Forged closing rows that a genuine quarantine covers settle
+            // nothing.
+            forge(&path, failed_row("q1"));
+            forge(&path, submitted_row("q2"));
+            assert_eq!(reanchor_quarantining(&path, &store), 2);
+
+            check_lazy_and_verified(&path, &store, |writer| {
+                assert_eq!(
+                    try_value_action_settlement(writer, "q1").unwrap(),
+                    expected_owed("q1", 1)
+                );
+                assert_eq!(
+                    try_value_action_settlement(writer, "q2").unwrap(),
+                    expected_owed("q2", 2)
+                );
+                assert_eq!(
+                    try_value_action_settlement(writer, "q3").unwrap(),
+                    ValueActionSettlement::Settled,
+                    "an uncovered settled row still settles"
+                );
+                assert_index_matches_walk(writer, &["q1", "q2", "q3", FRESH]);
+            });
+        }
+
+        /// A forged quarantine row reaching back over an owed row, which the
+        /// operator's re-anchor then quarantines, hides nothing.
+        #[test]
+        fn a_covered_forged_quarantine_directive_hides_no_settlement_row() {
+            let dir = TempDir::new().unwrap();
+            let path = tmp_log(&dir);
+            let store = Arc::new(InMemoryTipAnchorStore::new());
+            open_keyed_writer(&path, &store)
+                .write_entry(tagged_pending("f1", 1))
+                .unwrap();
+            forge(
+                &path,
+                AuditEntry::new_audit_entries_quarantined(1_000, "req-forged-quarantine"),
+            );
+            assert_eq!(reanchor_quarantining(&path, &store), 1);
+
+            check_lazy_and_verified(&path, &store, |writer| {
+                assert_eq!(
+                    try_value_action_settlement(writer, "f1").unwrap(),
+                    expected_owed("f1", 1),
+                    "the covered directive takes no effect"
+                );
+                assert_index_matches_walk(writer, &["f1", FRESH]);
+            });
+        }
+
+        /// Runs `check` on a writer whose index the lookup builds, on two
+        /// keyed reopens whose verification walk builds it, and on a second
+        /// lazily built writer.
+        fn check_lazy_and_verified(
+            path: &Path,
+            store: &Arc<InMemoryTipAnchorStore>,
+            check: impl Fn(&AuditWriter),
+        ) {
+            // A keyed writer without an anchor store runs no verification
+            // walk, so its index comes from the lookup's own walk.
+            let lazy = || {
+                AuditWriter::open_keyed_unanchored_for_test(
+                    path.to_path_buf(),
+                    zeroize::Zeroizing::new(KEYED_READER_KEY),
+                )
+                .unwrap()
+            };
+            let writer = lazy();
+            check(&writer);
+            drop(writer);
+            for _reopen in 0..2 {
+                let writer = open_keyed_writer(path, store);
+                let (answer, visits) = observe(|| try_value_action_settlement(&writer, FRESH));
+                assert_eq!(answer.unwrap(), ValueActionSettlement::OwedWithoutLegs);
+                assert_eq!(visits, Vec::new(), "the verified index applies quarantine");
+                check(&writer);
+            }
+            let writer = lazy();
+            check(&writer);
+        }
+
+        #[test]
+        fn rows_past_end_offset_never_change_settlement() {
+            for keyed in [true, false] {
+                let dir = TempDir::new().unwrap();
+                let path = tmp_log(&dir);
+                let store = Arc::new(InMemoryTipAnchorStore::new());
+                let mut writer = if keyed {
+                    open_keyed_writer(&path, &store)
+                } else {
+                    AuditWriter::open(path.clone(), None).unwrap()
+                };
+                writer.write_entry(tagged_pending("p1", 1)).unwrap();
+                writer.force_rotate_for_test().unwrap();
+                writer.write_entry(tagged_pending("p2", 2)).unwrap();
+                let tip = writer.end_offset();
+                let before = [
+                    try_value_action_settlement(&writer, "p1").unwrap(),
+                    try_value_action_settlement(&writer, "p2").unwrap(),
+                    try_value_action_settlement(&writer, FRESH).unwrap(),
+                ];
+
+                forge(&path, failed_row("p1"));
+                forge(&path, submitted_row("p2"));
+                forge(&path, tagged_pending(FRESH, 3));
+                std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&path)
+                    .unwrap()
+                    .write_all(b"{\"not\": \"an audit row\"}\nunterminated")
+                    .unwrap();
+
+                for hash in ["p1", "p2", FRESH] {
+                    // A fresh lazy walk and the kept index see the same bound.
+                    writer.settlement_index().clear();
+                    let rebuilt = try_value_action_settlement(&writer, hash).unwrap();
+                    let (kept, visits) =
+                        observe(|| try_value_action_settlement(&writer, hash).unwrap());
+                    assert_eq!(rebuilt, kept, "keyed {keyed}, hash {hash}");
+                    assert!(of(&visits, LOOKUP_WALK).is_empty());
+                }
+                assert_eq!(
+                    [
+                        try_value_action_settlement(&writer, "p1").unwrap(),
+                        try_value_action_settlement(&writer, "p2").unwrap(),
+                        try_value_action_settlement(&writer, FRESH).unwrap(),
+                    ],
+                    before,
+                    "keyed {keyed}"
+                );
+                assert_eq!(writer.end_offset(), tip);
+                let state = writer.settlement_index().state();
+                let view = state.view.as_ref().unwrap();
+                assert_eq!(view.tip.end_offset, tip, "no forged row enters the index");
+                assert!(view.complete());
+            }
+        }
+
+        /// A keyed writer whose verification walk left a complete index over
+        /// two archives, after its active file is removed: `w1` owed and `w2`
+        /// settled in the archives, nothing for fresh bytes.
+        fn warm_index_without_active_file() -> (TempDir, AuditWriter) {
+            let (dir, path, writer) = warm_index();
+            std::fs::remove_file(&path).unwrap();
+            (dir, writer)
+        }
+
+        /// Removes the active file at `path`.
+        fn delete_active(path: &Path) {
+            std::fs::remove_file(path).unwrap();
+        }
+
+        /// Replaces the active file at `path` with a file of the same length
+        /// whose last row is edited, through a rename, so the path names a
+        /// new file the bounded walk refuses.
+        fn replace_active(path: &Path) {
+            let contents = std::fs::read_to_string(path).unwrap();
+            let edited =
+                contents.replacen("\"request_id\":\"clear\"", "\"request_id\":\"cleaR\"", 1);
+            assert_ne!(edited, contents, "the active file holds the clear row");
+            let staged = path.with_extension("staged");
+            std::fs::write(&staged, edited).unwrap();
+            std::fs::rename(&staged, path).unwrap();
+        }
+
+        /// Changes the active file with `change` inside the lookup of `hash`,
+        /// after the lookup takes the index lock, and asserts the lookup
+        /// refuses exactly as the bounded walk then does.
+        fn assert_change_under_the_lock_refuses(hash: &str, change: fn(&Path)) {
+            let (_dir, path, writer) = warm_index();
+            let at_hook = path.clone();
+            lookup_hook::set(move || change(&at_hook));
+            let indexed = try_value_action_settlement(&writer, hash)
+                .expect_err("a changed active file refuses");
+            let walked = settlement_walk(&writer, hash).expect_err("the walk refuses");
+            assert_eq!(format!("{indexed:?}"), format!("{walked:?}"), "{hash}");
+            assert_eq!(indexed.to_string(), walked.to_string(), "{hash}");
+            assert_eq!(indexed.wire_code(), walked.wire_code(), "{hash}");
+        }
+
+        /// Changes the active file with `change` after the lookup validated
+        /// the opened file: that lookup answers from the validated handle,
+        /// and the next lookup on the same writer refuses as the walk does.
+        fn assert_change_after_validation_reaches_the_next_lookup(change: fn(&Path)) {
+            let (_dir, path, writer) = warm_index();
+            let before = try_value_action_settlement(&writer, FRESH).unwrap();
+            let at_hook = path.clone();
+            lookup_hook::set_after_validation(move || change(&at_hook));
+            assert_eq!(
+                try_value_action_settlement(&writer, FRESH).unwrap(),
+                before,
+                "the validated handle answers the current lookup"
+            );
+            let next =
+                try_value_action_settlement(&writer, FRESH).expect_err("the next lookup refuses");
+            let walked = settlement_walk(&writer, FRESH).expect_err("the walk refuses");
+            assert_eq!(format!("{next:?}"), format!("{walked:?}"));
+            assert_eq!(next.to_string(), walked.to_string());
+            assert_eq!(next.wire_code(), walked.wire_code());
+        }
+
+        #[test]
+        fn an_active_file_replaced_after_validation_still_answers_from_the_validated_handle_and_the_next_lookup_refuses()
+         {
+            assert_change_after_validation_reaches_the_next_lookup(replace_active);
+        }
+
+        #[test]
+        fn an_active_file_deleted_after_validation_still_answers_from_the_validated_handle_and_the_next_lookup_refuses()
+         {
+            assert_change_after_validation_reaches_the_next_lookup(delete_active);
+        }
+
+        #[test]
+        fn an_active_file_deleted_under_the_lock_refuses_an_absent_hash() {
+            assert_change_under_the_lock_refuses(FRESH, delete_active);
+        }
+
+        #[test]
+        fn an_active_file_deleted_under_the_lock_refuses_a_settled_hash() {
+            assert_change_under_the_lock_refuses("w2", delete_active);
+        }
+
+        #[test]
+        fn an_active_file_deleted_under_the_lock_refuses_an_owed_hash() {
+            assert_change_under_the_lock_refuses("w1", delete_active);
+        }
+
+        #[test]
+        fn an_active_file_replaced_under_the_lock_refuses_an_absent_hash() {
+            assert_change_under_the_lock_refuses(FRESH, replace_active);
+        }
+
+        #[test]
+        fn an_active_file_replaced_under_the_lock_refuses_a_settled_hash() {
+            assert_change_under_the_lock_refuses("w2", replace_active);
+        }
+
+        #[test]
+        fn an_active_file_replaced_under_the_lock_refuses_an_owed_hash() {
+            assert_change_under_the_lock_refuses("w1", replace_active);
+        }
+
+        /// A keyed writer whose verification walk left a complete index over
+        /// two archives, as [`warm_index_without_active_file`] describes,
+        /// with its active file in place.
+        fn warm_index() -> (TempDir, PathBuf, AuditWriter) {
+            let dir = TempDir::new().unwrap();
+            let path = tmp_log(&dir);
+            let store = Arc::new(InMemoryTipAnchorStore::new());
+            {
+                let mut writer = open_keyed_writer(&path, &store);
+                writer.write_entry(tagged_pending("w1", 1)).unwrap();
+                writer.force_rotate_for_test().unwrap();
+                writer.write_entry(tagged_pending("w2", 2)).unwrap();
+                writer.write_entry(submitted_row("w2")).unwrap();
+                writer.force_rotate_for_test().unwrap();
+                writer.write_entry(same_hash_clear("w3")).unwrap();
+            }
+            let writer = open_keyed_writer(&path, &store);
+            for hash in ["w1", "w2", FRESH] {
+                let (answer, visits) = observe(|| try_value_action_settlement(&writer, hash));
+                answer.unwrap();
+                assert!(of(&visits, LOOKUP_WALK).is_empty(), "the index is warm");
+            }
+            (dir, path, writer)
+        }
+
+        /// The lookup of `hash` refuses as the bounded walk does.
+        fn assert_refuses_like_the_walk(writer: &AuditWriter, hash: &str) {
+            let indexed = try_value_action_settlement(writer, hash).unwrap_err();
+            let walked = settlement_walk(writer, hash).unwrap_err();
+            assert!(
+                matches!(indexed, AuditLogIntegrityError::RotationGap { .. }),
+                "{hash}: {indexed:?}"
+            );
+            assert_eq!(indexed.wire_code(), walked.wire_code(), "{hash}");
+            assert_eq!(indexed.to_string(), walked.to_string(), "{hash}");
+        }
+
+        #[test]
+        fn a_warm_index_refuses_an_owed_hash_once_the_active_file_is_gone() {
+            let (_dir, writer) = warm_index_without_active_file();
+            assert_refuses_like_the_walk(&writer, "w1");
+        }
+
+        #[test]
+        fn a_warm_index_refuses_a_settled_hash_once_the_active_file_is_gone() {
+            let (_dir, writer) = warm_index_without_active_file();
+            assert_refuses_like_the_walk(&writer, "w2");
+        }
+
+        #[test]
+        fn a_warm_index_refuses_an_absent_hash_once_the_active_file_is_gone() {
+            let (_dir, writer) = warm_index_without_active_file();
+            assert_refuses_like_the_walk(&writer, FRESH);
+        }
+
+        /// A pending row of `envelope_hash` carrying `legs` large legs.
+        fn large_pending(envelope_hash: &str, legs: usize) -> AuditEntry {
+            let mut entry = tagged_pending(envelope_hash, 1);
+            if let EventKind::ValueActionPending { legs: recorded, .. } = &mut entry.event_kind {
+                *recorded = (0..legs)
+                    .map(|at| ValueLegRecord {
+                        action: ValueActionKind::Payment,
+                        amount: Some(i128::try_from(at).unwrap()),
+                        asset: Some("x".repeat(200)),
+                        destination_redacted: Some("y".repeat(200)),
+                    })
+                    .collect();
+            }
+            entry
+        }
+
+        /// The bytes the index retains: each key, each entry, each listed
+        /// path and file record.
+        fn retained_bytes(writer: &AuditWriter) -> usize {
+            let state = writer.settlement_index().state();
+            let view = state.view.as_ref().unwrap();
+            view.latest.keys().map(String::len).sum::<usize>()
+                + view.latest.len() * std::mem::size_of::<LatestRow>()
+                + view
+                    .files
+                    .iter()
+                    .map(|file| file.path.as_os_str().len())
+                    .sum::<usize>()
+                + view.files.len() * std::mem::size_of::<IndexedFile>()
+        }
+
+        /// The index's distinct hashes and listed files.
+        fn cardinalities(writer: &AuditWriter) -> (usize, usize) {
+            let state = writer.settlement_index().state();
+            let view = state.view.as_ref().unwrap();
+            assert!(view.complete());
+            (view.latest.len(), view.files.len())
+        }
+
+        /// The index holds one fixed-size entry per distinct hash and one
+        /// path per listed file, however many rows match and however large
+        /// the pending rows are.
+        #[test]
+        fn the_index_keeps_one_compact_entry_per_hash_and_one_path_per_file() {
+            assert!(std::mem::size_of::<LatestRow>() <= 32);
+            let dir = TempDir::new().unwrap();
+            let path = tmp_log(&dir);
+            let store = Arc::new(InMemoryTipAnchorStore::new());
+            {
+                let mut writer = open_keyed_writer(&path, &store);
+                for _ in 0..5 {
+                    writer.write_entry(large_pending("m1", 200)).unwrap();
+                }
+                for _ in 0..3 {
+                    writer.write_entry(large_pending("m2", 200)).unwrap();
+                }
+                writer.write_entry(submitted_row("m2")).unwrap();
+            }
+            let mut writer = open_keyed_writer(&path, &store);
+            let logged = history_bytes(&path);
+            assert!(logged > 500_000, "the pending rows are large: {logged}");
+            assert_eq!(cardinalities(&writer), (2, 1), "repeated matches");
+            let bound = |hashes: usize, files: usize| {
+                hashes * (2 + std::mem::size_of::<LatestRow>())
+                    + files * (path.as_os_str().len() + 32 + std::mem::size_of::<IndexedFile>())
+            };
+            assert!(retained_bytes(&writer) <= bound(2, 1));
+
+            writer.write_entry(large_pending("m3", 200)).unwrap();
+            assert_eq!(cardinalities(&writer), (3, 1), "an append");
+            assert!(retained_bytes(&writer) <= bound(3, 1));
+
+            writer.force_rotate_for_test().unwrap();
+            assert_eq!(cardinalities(&writer), (3, 2), "a rotation");
+            writer.write_entry(large_pending("m4", 200)).unwrap();
+            // The prune proves each archive it deletes, so every archive
+            // holds a row before its handoff.
+            for _ in 0..super::super::super::rotation::MAX_ROTATED_FILES {
+                writer.force_rotate_for_test().unwrap();
+                writer.write_entry(same_hash_clear("filler")).unwrap();
+            }
+            let listed = collect_files_newest_first(&path).unwrap().len();
+            assert_eq!(listed, super::super::super::rotation::MAX_ROTATED_FILES + 1);
+            assert_eq!(
+                cardinalities(&writer),
+                (1, listed),
+                "the prune drops m1, m2 and m3 with their archive"
+            );
+            assert!(retained_bytes(&writer) <= bound(1, listed));
+            assert!(retained_bytes(&writer) * 100 < logged as usize);
+            assert_index_matches_walk(&writer, &["m1", "m2", "m3", "m4", FRESH]);
+        }
     }
 }
