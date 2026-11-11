@@ -4,10 +4,107 @@
 //! storage key and landing path from the bootstrap island, admits only the
 //! pair `session-bootstrap.js` admits for the listener it expects, and loads
 //! that landing path. It never chooses the first page itself.
-use crate::auth::SessionPurpose;
+//!
+//! [`HttpsSessionGate`] is the session gate of tests that drive the
+//! signed-origin consent routes.
+use super::ConsentSessionGate;
+use crate::auth::{AuthState, OpaqueToken, SessionPurpose, SessionState, compute_csrf};
 use crate::operator_enroll::test_support::{HttpReply, island, request};
+use axum::{http::HeaderMap, response::Response};
 use serde_json::{Value, json};
-use std::{io, net::SocketAddr};
+use std::{io, net::SocketAddr, sync::Mutex};
+
+/// A session gate over one session of a page served over HTTPS.
+/// It applies the loopback listeners' cookie, CSRF and session proof checks.
+/// The session cookie carries `Secure`.
+pub struct HttpsSessionGate(Mutex<AuthState>);
+
+/// The browser side of the session an [`HttpsSessionGate`] admits.
+pub struct HttpsSession {
+    set_cookie: String,
+    proof: String,
+    csrf_key: [u8; 32],
+}
+
+impl HttpsSessionGate {
+    /// A gate whose one session the browser has already opened, and that
+    /// browser's side of it.
+    ///
+    /// # Panics
+    ///
+    /// Never: the bootstrap token is exchanged once, right after it is made.
+    #[must_use]
+    pub fn open() -> (Self, HttpsSession) {
+        let token = OpaqueToken::generate();
+        let hex = token.to_hex();
+        let mut auth = AuthState::new(token, SessionPurpose::Inbox).with_secure_cookie();
+        let now = auth.now();
+        #[allow(
+            clippy::expect_used,
+            reason = "test support; a fresh token exchanges exactly once"
+        )]
+        let session = auth
+            .exchange_bootstrap(&hex, now)
+            .expect("a fresh bootstrap token exchanges");
+        let browser = HttpsSession {
+            set_cookie: auth.set_cookie_value(&session),
+            proof: session.session_proof.to_hex(),
+            csrf_key: session.csrf_key,
+        };
+        (Self(Mutex::new(auth)), browser)
+    }
+}
+
+/// A live session an [`HttpsSessionGate`] admitted.
+pub struct HttpsGateSession(SessionState);
+
+impl ConsentSessionGate for HttpsSessionGate {
+    type Session = HttpsGateSession;
+
+    fn session(&self, headers: &HeaderMap) -> Result<HttpsGateSession, Response> {
+        self.0.session(headers).map(HttpsGateSession)
+    }
+
+    fn authorize_mutation(&self, headers: &HeaderMap, csrf_nonce: &str) -> Result<(), Response> {
+        self.0.authorize_mutation(headers, csrf_nonce)
+    }
+
+    fn session_key(&self, session: &HttpsGateSession) -> String {
+        self.0.session_key(&session.0)
+    }
+
+    fn csrf(&self, session: &HttpsGateSession, nonce: &str) -> String {
+        self.0.csrf(&session.0, nonce)
+    }
+}
+
+impl HttpsSession {
+    /// The `Set-Cookie` value the session was opened with.
+    #[must_use]
+    pub fn set_cookie(&self) -> &str {
+        &self.set_cookie
+    }
+
+    /// The headers a page of this session sends with a request about the
+    /// entry `nonce`: the cookie, the session proof and the CSRF value.
+    #[must_use]
+    pub fn headers(&self, nonce: &str) -> Vec<(&'static str, String)> {
+        let cookie = self
+            .set_cookie
+            .split(';')
+            .next()
+            .unwrap_or_default()
+            .to_owned();
+        vec![
+            ("cookie", cookie),
+            ("x-session-proof", self.proof.clone()),
+            (
+                "x-stellar-approval-csrf",
+                compute_csrf(&self.csrf_key, nonce),
+            ),
+        ]
+    }
+}
 
 /// A bootstrapped browser session on a real loopback presence listener.
 pub struct PresenceClient {

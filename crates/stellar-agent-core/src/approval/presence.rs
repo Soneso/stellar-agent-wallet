@@ -1546,6 +1546,62 @@ impl VerifiedMainnetPresence {
         &self.entry.approval_nonce
     }
 
+    /// The canonical unpadded base64url credential ID of the assertion.
+    #[must_use]
+    pub fn credential_id_b64url(&self) -> String {
+        self.receipt.credential_id_b64url()
+    }
+
+    /// Rechecks a rejection against the locked entry and current verified policy.
+    ///
+    /// The caller holds the pending-store and audit-writer locks through the
+    /// rejection row and tombstone. Both challenge deadlines must remain live.
+    ///
+    /// # Errors
+    /// Returns the approval path's binding, entry, listener, policy, assertion,
+    /// and deadline refusals before any rejection row or tombstone.
+    pub fn revalidate_rejection(
+        &self,
+        store: &super::PendingApprovalStore,
+        binding: &AttestationBinding<'_>,
+        policy: &VerifiedPolicy,
+    ) -> Result<(), WalletError> {
+        if binding.chain_id != MAINNET_CHAIN_ID
+            || self.profile_name != binding.profile_name
+            || self.chain_id != binding.chain_id
+        {
+            return Err(WalletError::Approval(ApprovalFailure::BindingMismatch {
+                detail: "this request belongs to another profile or network".to_owned(),
+            }));
+        }
+        let now_ms =
+            crate::timefmt::now_unix_ms().map_err(|e| super::attest::map_clock_error(&e))?;
+        super::attest::refuse_unless_still_pending(store, &self.entry, now_ms)?;
+        let current = store
+            .get(&self.entry.approval_nonce)
+            .ok_or_else(|| super::attest::record_error(&super::ApprovalError::NotFound))?;
+        let (pin, listener_digest) = self.receipt.identity().ok_or_else(presence_invalid)?;
+        let current_pin = policy
+            .mainnet()
+            .and_then(|body| body.approval_cert_spki_sha256);
+        if listener_digest != policy.digest() || current_pin != Some(pin) {
+            return Err(WalletError::Approval(ApprovalFailure::ListenerPolicyStale));
+        }
+        if !super::presence_policy::same_policy(policy, &self.policy) {
+            return Err(policy_unavailable());
+        }
+        verify_receipt(current, &self.receipt, binding, policy, now_ms)?;
+        let row_ms =
+            crate::timefmt::now_unix_ms().map_err(|e| super::attest::map_clock_error(&e))?;
+        if Instant::now() >= self.deadline
+            || row_ms < self.receipt.issued_at_unix_ms()
+            || row_ms >= self.receipt.expires_at_unix_ms()
+        {
+            return Err(presence_expired());
+        }
+        Ok(())
+    }
+
     pub(crate) fn into_parts(self) -> VerifiedPresenceParts {
         VerifiedPresenceParts {
             entry: self.entry,
@@ -1816,7 +1872,7 @@ impl MainnetPresenceReceipt {
     }
 
     /// The decoded certificate pin and listener policy digest, when present.
-    fn identity(&self) -> Option<([u8; 32], [u8; 32])> {
+    pub(crate) fn identity(&self) -> Option<([u8; 32], [u8; 32])> {
         Some((
             decode_lower_hex32(self.cert_spki_sha256.as_deref()?)?,
             decode_lower_hex32(self.listener_policy_digest.as_deref()?)?,

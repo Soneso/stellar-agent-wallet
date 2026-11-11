@@ -361,6 +361,7 @@ fn enroll_remote_credential() {
         label: "device".to_owned(),
         registered_at_unix_ms: 1,
         sign_count: None,
+        source: stellar_agent_core::approval::OperatorCredentialSource::Enrolled,
     })
     .unwrap();
 }

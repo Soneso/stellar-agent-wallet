@@ -1792,8 +1792,17 @@ impl AuditWriter {
         self.append_checked(entry)
     }
 
-    /// Completes drain, state and rotation waits before a consent is checked.
-    pub(crate) fn prepare_entry(&mut self) -> Result<PreparedAuditEntry<'_>, WriterError> {
+    /// Prepares one append before the caller checks its authorization and deadlines.
+    ///
+    /// Completes the outbox drain for a draining writer, state checks, anchor
+    /// repair attempts, and any required rotation. The returned handle borrows
+    /// the writer exclusively until it writes one row or is dropped.
+    /// [`PreparedAuditEntry::write`] appends with no further drain or rotation.
+    ///
+    /// # Errors
+    /// Returns the drain, state-check, and rotation errors of [`Self::write_entry`].
+    /// Anchor repair remains best-effort, as in [`Self::write_entry`].
+    pub fn prepare_entry(&mut self) -> Result<PreparedAuditEntry<'_>, WriterError> {
         if self.drains {
             self.drain_outbox()?;
         }
@@ -7147,14 +7156,26 @@ fn classify_last_line(
 /// smart-account contracts have no audit-log surface.
 pub struct AuditWriterRegistry;
 
-/// One row whose writer completes all pre-row acquisition and state work.
-pub(crate) struct PreparedAuditEntry<'a> {
+/// An exclusive writer borrow with its drain, state checks, and rotation complete.
+///
+/// Obtained through [`AuditWriter::prepare_entry`]. Dropping this handle releases
+/// the borrow without appending its row. Preparation's drain and rotation remain durable.
+pub struct PreparedAuditEntry<'a> {
     writer: &'a mut AuditWriter,
 }
 
 impl PreparedAuditEntry<'_> {
-    /// Writes the row and runs the writer's post-row durability steps.
-    pub(crate) fn write(self, entry: AuditEntry) -> Result<(), WriterError> {
+    /// Appends one row with no further drain or rotation, then completes durability steps.
+    ///
+    /// Applies argument-key truncation, hashing, tagging, and the serialized row-size
+    /// limit before writing. The row is flushed and synced before its anchor advances.
+    ///
+    /// # Errors
+    /// Returns [`WriterError::RowTooLarge`] without writing an oversized row.
+    /// Returns [`WriterError::Io`], [`WriterError::Serialise`], or [`WriterError::Hash`]
+    /// if the row cannot be serialized, hashed, or written.
+    /// Anchor writes retry once and remain best-effort after the row is durable.
+    pub fn write(self, entry: AuditEntry) -> Result<(), WriterError> {
         self.writer.commit_append(entry)
     }
 }

@@ -1137,6 +1137,8 @@ fn refusal_statuses_follow_the_variant() {
         (F::PresenceBrowserRequired, StatusCode::FORBIDDEN),
         (F::PresenceCanceled, StatusCode::FORBIDDEN),
         (F::MainnetRemoteUnsupported, StatusCode::FORBIDDEN),
+        (F::ListenerPolicyStale, StatusCode::FORBIDDEN),
+        (F::OriginSignedRemote, StatusCode::FORBIDDEN),
         (F::PresenceExpired, StatusCode::CONFLICT),
         (F::PresenceConsumed, StatusCode::CONFLICT),
         (F::PresenceChanged, StatusCode::CONFLICT),
@@ -1601,4 +1603,546 @@ async fn mainnet_page_binds_the_rendered_intent() {
         "{outcome:?}"
     );
     h.no_consent();
+}
+
+// ── Signed origin ───────────────────────────────────────────────────────────
+
+use stellar_agent_core::approval::mainnet_fixtures::{
+    SIGNED_CERT_SPKI_SHA256, SIGNED_ORIGIN, SIGNED_RP_ID,
+};
+use stellar_agent_loopback_http::signed_origin::{SignedHostLayer, SignedOriginLayer};
+use test_support::{HttpsSession, HttpsSessionGate};
+
+/// The `Host` a browser sends to [`SIGNED_ORIGIN`].
+const SIGNED_AUTHORITY: &str = "approve.example.invalid:8443";
+
+/// The inbox consent routes of a signed-origin listener over a fixture whose
+/// policy signs [`SIGNED_ORIGIN`], behind the signed-origin layers, with one
+/// pending payment and one HTTPS session.
+struct SignedOrigin {
+    fixture: MainnetConsentFixture,
+    entry: PendingApproval,
+    context: Arc<DecisionContext>,
+    router: Router,
+    session: HttpsSession,
+}
+
+impl SignedOrigin {
+    fn new(name: &str) -> Self {
+        let mut fixture = MainnetConsentFixture::new(name);
+        fixture.sign_signed_origin_policy(&[&fixture_authenticator()], &SIGNED_CERT_SPKI_SHA256);
+        let entry = fixture.payment(600_000);
+        let mut store = PendingApprovalStore::open(fixture.store_path()).unwrap();
+        store.insert(entry.clone(), now_ms().unwrap()).unwrap();
+        drop(store);
+        let identity = ListenerIdentity::capture(&fixture.current_policy()).unwrap();
+        let (gate, session) = HttpsSessionGate::open();
+        let context = Arc::new(Harness::context_of(&fixture));
+        let (router, completion) = signed_origin_consent(
+            SignedOriginMode::Inbox {
+                context: context.clone(),
+                page_identity: PageIdentity::neutral(),
+            },
+            identity,
+            SIGNED_ORIGIN,
+            Arc::new(gate),
+        )
+        .unwrap()
+        .into_parts();
+        assert!(completion.is_none());
+        let router = router
+            .layer(SignedOriginLayer::new(SIGNED_ORIGIN))
+            .layer(SignedHostLayer::new(SIGNED_ORIGIN));
+        Self {
+            fixture,
+            entry,
+            context,
+            router,
+            session,
+        }
+    }
+
+    fn nonce(&self) -> &str {
+        &self.entry.approval_nonce
+    }
+
+    /// One request about the entry from this session's page.
+    async fn send(&self, method: &str, path: &str, body: Option<&serde_json::Value>) -> Response {
+        let mut request = Request::builder()
+            .method(method)
+            .uri(path)
+            .header("host", SIGNED_AUTHORITY)
+            .header("origin", SIGNED_ORIGIN)
+            .header("content-type", "application/json");
+        for (name, value) in self.session.headers(self.nonce()) {
+            request = request.header(name, value);
+        }
+        let body = body.map_or_else(Body::empty, |body| Body::from(body.to_string()));
+        self.router
+            .clone()
+            .oneshot(request.body(body).unwrap())
+            .await
+            .unwrap()
+    }
+
+    async fn post(
+        &self,
+        action: &str,
+        body: &serde_json::Value,
+    ) -> (StatusCode, serde_json::Value) {
+        let response = self
+            .send(
+                "POST",
+                &format!("/approval/{}/{action}", self.nonce()),
+                Some(body),
+            )
+            .await;
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), 16384).await.unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap_or_default())
+    }
+
+    /// The island of the entry's consent page.
+    async fn page(&self) -> serde_json::Value {
+        let response = self
+            .send("GET", &format!("/approval/{}", self.nonce()), None)
+            .await;
+        let (status, html) = page_text(response).await;
+        assert_eq!(status, StatusCode::OK, "{html}");
+        crate::operator_enroll::test_support::island(&html, "presence-data").unwrap()
+    }
+
+    /// A challenge for the page's consent view.
+    async fn challenge(&self) -> serde_json::Value {
+        let page = self.page().await;
+        let (status, options) = self
+            .post(
+                "challenge",
+                &json!({"consent_view_digest": page["consent_view_digest"]}),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{options}");
+        options
+    }
+
+    /// The fixture credential's assertion over `options` at the signed
+    /// origin and relying party.
+    fn signed(options: &serde_json::Value, counter: u32) -> serde_json::Value {
+        let challenge = URL_SAFE_NO_PAD
+            .decode(options["challenge"].as_str().unwrap())
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let assertion = fixture_authenticator().assert(
+            challenge,
+            SIGNED_ORIGIN,
+            SIGNED_RP_ID,
+            stellar_agent_test_support::webauthn::FLAG_UP
+                | stellar_agent_test_support::webauthn::FLAG_UV,
+            counter,
+        );
+        json!({"request_id": options["request_id"], "credential_id_b64url": URL_SAFE_NO_PAD.encode(assertion.credential_id),
+            "authenticator_data_b64url": URL_SAFE_NO_PAD.encode(assertion.authenticator_data), "client_data_json_b64url": URL_SAFE_NO_PAD.encode(assertion.client_data_json), "signature_der_b64url": URL_SAFE_NO_PAD.encode(assertion.signature_der)})
+    }
+
+    fn stored(&self) -> PendingApproval {
+        PendingApprovalStore::open(self.fixture.store_path())
+            .unwrap()
+            .get(self.nonce())
+            .unwrap()
+            .clone()
+    }
+
+    /// The rows of `kind` in the fixture's audit log.
+    fn rows(&self, kind: &str) -> Vec<serde_json::Value> {
+        std::fs::read_to_string(self.fixture.audit_path())
+            .unwrap_or_default()
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .filter(|row| row["kind"] == kind)
+            .collect()
+    }
+}
+
+/// The signed-origin inbox issues at the signed relying party and origin.
+/// It records consent on the remote surface with a mainnet passkey approver
+/// and a receipt naming the listener.
+#[tokio::test]
+#[serial_test::serial]
+async fn signed_origin_consent_attributes_the_remote_surface() {
+    let so = SignedOrigin::new("signed-surface");
+    let page = so.page().await;
+    assert_eq!(page["mode"], "inbox");
+    assert_eq!(page["signed_origin"], true);
+    let options = so.challenge().await;
+    assert_eq!(options["rp_id"], SIGNED_RP_ID);
+    let (status, body) = so
+        .post("assertion", &SignedOrigin::signed(&options, 3))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["status"], "attested");
+    let entry = so.stored();
+    assert!(entry.attestation_blob_b64.is_some());
+    assert!(matches!(
+        entry.attested_approver,
+        Some(stellar_agent_core::approval::AttestedApprover::MainnetPasskey { .. })
+    ));
+    let receipt = entry.mainnet_presence.unwrap();
+    assert_eq!(receipt.expected_origin(), SIGNED_ORIGIN);
+    assert_eq!(
+        receipt.cert_spki_sha256_hex(),
+        Some(hex::encode(SIGNED_CERT_SPKI_SHA256).as_str())
+    );
+    let rows = so.rows("approval_attested");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["origin"], "serve-remote");
+    assert_eq!(rows[0]["mainnet_presence"]["rp_id"], SIGNED_RP_ID);
+    assert_eq!(
+        rows[0]["mainnet_presence"]["webauthn_origin"],
+        SIGNED_ORIGIN
+    );
+}
+
+/// A signed-origin ceremony completes for its selected entry without consent persistence.
+#[tokio::test]
+#[serial_test::serial]
+async fn signed_origin_one_shot_completes_without_persisting_consent() {
+    let mut so = SignedOrigin::new("signed-one-shot");
+    let identity = ListenerIdentity::capture(&so.fixture.current_policy()).unwrap();
+    let (gate, session) = HttpsSessionGate::open();
+    let (router, completion) = signed_origin_consent(
+        SignedOriginMode::OneShot(Box::new(MainnetPresenceConfig {
+            entry: so.entry.clone(),
+            context: ApprovalContext::from_profile(so.fixture.name(), so.fixture.profile()),
+            authority: so.fixture.authority(),
+            store_path: so.fixture.store_path(),
+            page_identity: PageIdentity::neutral(),
+        })),
+        identity,
+        SIGNED_ORIGIN,
+        Arc::new(gate),
+    )
+    .unwrap()
+    .into_parts();
+    so.router = router
+        .layer(SignedOriginLayer::new(SIGNED_ORIGIN))
+        .layer(SignedHostLayer::new(SIGNED_ORIGIN));
+    so.session = session;
+    let page = so.page().await;
+    assert_eq!(page["mode"], "one_shot");
+    assert_eq!(page["signed_origin"], true);
+    let options = so.challenge().await;
+    assert_eq!(options["rp_id"], SIGNED_RP_ID);
+    let (status, body) = so
+        .post("assertion", &SignedOrigin::signed(&options, 3))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["status"], "presence_verified");
+    assert_eq!(body["request_id"], options["request_id"]);
+    let presence = completion
+        .unwrap()
+        .await_presence(Instant::now() + std::time::Duration::from_secs(1))
+        .await
+        .unwrap();
+    assert_eq!(presence.approval_nonce(), so.nonce());
+    assert_eq!(
+        presence.request_id(),
+        options["request_id"].as_str().unwrap()
+    );
+    assert!(so.stored().attestation_blob_b64.is_none());
+    assert!(so.stored().mainnet_presence.is_none());
+    assert!(so.rows("approval_attested").is_empty());
+    assert!(so.rows("approval_rejected").is_empty());
+}
+
+/// A policy signed again with another pin for the same origin, before a
+/// fresh challenge, refuses the challenge as stale and mints nothing.
+#[tokio::test]
+#[serial_test::serial]
+async fn signed_origin_resign_before_challenge_refuses_stale_listener() {
+    let mut so = SignedOrigin::new("signed-stale");
+    so.fixture
+        .sign_signed_origin_policy(&[&fixture_authenticator()], &[0xcd; 32]);
+    let page = so.page().await;
+    assert_eq!(page["signed_origin"], true);
+    let (status, body) = so
+        .post(
+            "challenge",
+            &json!({"consent_view_digest": page["consent_view_digest"]}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body["error"], "approval.listener_policy_stale");
+    assert_eq!(
+        body["message"],
+        "The approval listener serves an earlier owner-signed mainnet policy; restart it under the current policy."
+    );
+    assert!(body.get("challenge").is_none());
+    let (status, body) = so
+        .post(
+            "assertion",
+            &json!({"request_id": "00000000-0000-4000-8000-000000000000", "credential_id_b64url": "AA",
+                "authenticator_data_b64url": "AA", "client_data_json_b64url": "AA", "signature_der_b64url": "AA"}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"], "approval.presence_consumed");
+    assert!(so.stored().attestation_blob_b64.is_none());
+    assert!(so.rows("approval_attested").is_empty());
+}
+
+/// Under a policy that names an approval origin, the local inbox and the
+/// command ceremony refuse to start. A loopback challenge after a policy
+/// re-sign also refuses. Each refusal carries `approval.origin_signed_remote`
+/// and its message.
+#[tokio::test]
+#[serial_test::serial]
+async fn local_inbox_refuses_consent_under_signed_origin() {
+    const MESSAGE: &str =
+        "The owner-signed policy serves mainnet consent at its approval origin; approve there.";
+    {
+        let mut fixture = MainnetConsentFixture::new("local-refusal-start");
+        let entry = fixture.payment(600_000);
+        let mut store = PendingApprovalStore::open(fixture.store_path()).unwrap();
+        store.insert(entry.clone(), now_ms().unwrap()).unwrap();
+        drop(store);
+        fixture.sign_signed_origin_policy(&[&fixture_authenticator()], &SIGNED_CERT_SPKI_SHA256);
+
+        let start = crate::start_serve(crate::ServeConfig::new(
+            "127.0.0.1:0".parse().unwrap(),
+            Harness::context_of(&fixture),
+            tokio::sync::mpsc::unbounded_channel().0,
+            false,
+        ))
+        .await;
+        let Err(error) = start else {
+            panic!("the local inbox started under a signed origin");
+        };
+        assert_eq!(
+            error.presence_failure().map(|failure| failure.code()),
+            Some("approval.origin_signed_remote")
+        );
+        assert_eq!(error.to_string(), MESSAGE);
+
+        let start = start_mainnet_presence(MainnetPresenceConfig {
+            entry: entry.clone(),
+            context: ApprovalContext::from_profile(fixture.name(), fixture.profile()),
+            authority: fixture.authority(),
+            store_path: fixture.store_path(),
+            page_identity: PageIdentity::neutral(),
+        })
+        .await;
+        let Err(ServeStartError::Presence(refusal)) = start else {
+            panic!("the command ceremony started under a signed origin");
+        };
+        assert_eq!(refusal, PresenceStartRefusal::OriginSignedRemote);
+        assert_eq!(refusal.failure().code(), "approval.origin_signed_remote");
+        assert_eq!(refusal.failure().to_string(), MESSAGE);
+        assert_eq!(refusal_status(&refusal.failure()), StatusCode::FORBIDDEN);
+        assert!(
+            PendingApprovalStore::open(fixture.store_path())
+                .unwrap()
+                .get(&entry.approval_nonce)
+                .unwrap()
+                .attestation_blob_b64
+                .is_none()
+        );
+    }
+
+    let mut h = Harness::named("local-refusal");
+    assert_eq!(h.challenge().await["rp_id"], "localhost");
+    h.fixture
+        .sign_signed_origin_policy(&[&fixture_authenticator()], &SIGNED_CERT_SPKI_SHA256);
+    h.state.challenges.lock().unwrap().clear();
+    let (status, body) = h
+        .post("challenge", json!({"consent_view_digest": h.digest()}), "")
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body["error"], "approval.origin_signed_remote");
+    assert_eq!(body["message"], MESSAGE);
+    assert!(h.state.challenges.lock().unwrap().is_empty());
+    let (status, page) = page_text(detail(&h.state, &h.session, &h.entry.approval_nonce)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{page}");
+    assert!(page.contains("approval.origin_signed_remote"), "{page}");
+    h.no_consent();
+}
+
+/// A signed presence for another nonce refuses direct rejection and leaves both entries pending.
+#[test]
+#[serial_test::serial]
+fn signed_origin_reject_nonce_mismatch_is_binding_mismatch() {
+    let so = SignedOrigin::new("signed-reject-nonce");
+    let other = so.fixture.payment(600_000);
+    assert_ne!(other.approval_nonce, so.nonce());
+    let mut store = PendingApprovalStore::open(so.fixture.store_path()).unwrap();
+    store.insert(other.clone(), now_ms().unwrap()).unwrap();
+    drop(store);
+    let policy = so.fixture.current_policy();
+    let identity = ListenerIdentity::capture(&policy).unwrap();
+    let pending = issue_mainnet_intent_presence(
+        &other,
+        &so.fixture.binding(),
+        &policy,
+        PresenceListener::SignedOrigin(&identity),
+        None,
+        now_ms().unwrap(),
+        Instant::now(),
+    )
+    .unwrap();
+    let assertion = MainnetConsentFixture::sign_issued(&fixture_authenticator(), &pending);
+    let presence = verify_mainnet_presence(
+        pending,
+        MainnetConsentFixture::input(&assertion),
+        now_ms().unwrap(),
+        Instant::now(),
+    )
+    .unwrap();
+    assert_eq!(
+        apply_decision(
+            &so.context,
+            Decision::Reject {
+                nonce: so.nonce().to_owned(),
+            },
+            RequestIdentity::SignedOrigin(presence),
+        ),
+        crate::Outcome::BindingMismatch
+    );
+    let store = PendingApprovalStore::open(so.fixture.store_path()).unwrap();
+    for expected in [&so.entry, &other] {
+        let entry = store.get(&expected.approval_nonce).unwrap();
+        assert_eq!(entry.kind, expected.kind);
+        assert!(entry.attestation_blob_b64.is_none());
+        assert!(entry.mainnet_presence.is_none());
+    }
+    assert!(so.rows("approval_rejected").is_empty());
+    assert!(so.rows("approval_rejected_remote").is_empty());
+    assert!(so.rows("approval_attested").is_empty());
+}
+
+/// Revoking the challenge credential refuses both decisions without a row or tombstone.
+#[tokio::test]
+#[serial_test::serial]
+async fn signed_origin_reject_refuses_a_revoked_credential() {
+    for action in ["reject", "approve"] {
+        let mut so = SignedOrigin::new("signed-revoked");
+        let options = so.challenge().await;
+        let policy = so.fixture.current_policy();
+        let identity = ListenerIdentity::capture(&policy).unwrap();
+        let pending = issue_mainnet_intent_presence(
+            &so.entry,
+            &so.fixture.binding(),
+            &policy,
+            PresenceListener::SignedOrigin(&identity),
+            None,
+            now_ms().unwrap(),
+            Instant::now(),
+        )
+        .unwrap();
+        let assertion = MainnetConsentFixture::sign_issued(&fixture_authenticator(), &pending);
+        let presence = verify_mainnet_presence(
+            pending,
+            MainnetConsentFixture::input(&assertion),
+            now_ms().unwrap(),
+            Instant::now(),
+        )
+        .unwrap();
+        let other = stellar_agent_test_support::webauthn::TestAuthenticator::from_seed(
+            [0x33; 32],
+            vec![0x44; 16],
+        );
+        so.fixture
+            .sign_signed_origin_policy(&[&other], &SIGNED_CERT_SPKI_SHA256);
+        let (status, body) = if action == "reject" {
+            so.post(action, &SignedOrigin::signed(&options, 4)).await
+        } else {
+            let response = outcome_to_response(apply_decision(
+                &so.context,
+                Decision::Approve {
+                    nonce: so.nonce().to_owned(),
+                    shown_view_digest: Some(
+                        approval_view_digest(&so.entry, &so.fixture.binding()).unwrap(),
+                    ),
+                },
+                RequestIdentity::SignedOrigin(presence),
+            ));
+            let status = response.status();
+            let bytes = to_bytes(response.into_body(), 16384).await.unwrap();
+            (status, serde_json::from_slice(&bytes).unwrap())
+        };
+        assert_eq!(status, StatusCode::FORBIDDEN, "{action}: {body}");
+        assert_eq!(body["error"], "approval.listener_policy_stale");
+        assert!(!matches!(
+            so.stored().kind,
+            stellar_agent_core::approval::ApprovalKind::Rejected { .. }
+        ));
+        assert!(so.stored().attestation_blob_b64.is_none());
+        assert!(so.rows("approval_rejected").is_empty());
+        assert!(so.rows("approval_attested").is_empty());
+    }
+}
+
+/// A pin change after challenge issuance refuses rejection without a row or tombstone.
+#[tokio::test]
+#[serial_test::serial]
+async fn signed_origin_reject_refuses_after_a_pin_change() {
+    let mut so = SignedOrigin::new("signed-reject-pin");
+    let options = so.challenge().await;
+    so.fixture
+        .sign_signed_origin_policy(&[&fixture_authenticator()], &[0xcd; 32]);
+    let (status, body) = so.post("reject", &SignedOrigin::signed(&options, 4)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body["error"], "approval.listener_policy_stale");
+    assert!(!matches!(
+        so.stored().kind,
+        stellar_agent_core::approval::ApprovalKind::Rejected { .. }
+    ));
+    assert!(so.stored().attestation_blob_b64.is_none());
+    assert!(so.rows("approval_rejected").is_empty());
+    assert!(so.rows("approval_attested").is_empty());
+}
+
+/// A signed-origin rejection with the session and CSRF value but no
+/// assertion refuses and leaves the entry pending. An assertion verified
+/// under the policy key rejects, records no consent and drops the challenge.
+#[tokio::test]
+#[serial_test::serial]
+async fn signed_origin_reject_requires_an_action_assertion() {
+    let so = SignedOrigin::new("signed-reject");
+    for body in [json!({}), json!({"reason": "operator_cancel"})] {
+        let (status, refused) = so.post("reject", &body).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{refused}");
+        assert_eq!(refused["error"], "approval.presence_invalid");
+    }
+    let options = so.challenge().await;
+    let mut wrong = SignedOrigin::signed(&options, 4);
+    wrong["request_id"] = json!("00000000-0000-4000-8000-000000000000");
+    let (status, refused) = so.post("reject", &wrong).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{refused}");
+    assert_eq!(refused["error"], "approval.presence_consumed");
+    let entry = so.stored();
+    assert!(!matches!(
+        entry.kind,
+        stellar_agent_core::approval::ApprovalKind::Rejected { .. }
+    ));
+    assert!(so.rows("approval_rejected").is_empty());
+
+    let options = so.challenge().await;
+    let assertion = SignedOrigin::signed(&options, 5);
+    let (status, body) = so.post("reject", &assertion).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["status"], "rejected");
+    let entry = so.stored();
+    assert!(matches!(
+        entry.kind,
+        stellar_agent_core::approval::ApprovalKind::Rejected { .. }
+    ));
+    assert!(entry.attestation_blob_b64.is_none());
+    let rows = so.rows("approval_rejected");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["origin"], "serve-remote");
+    assert!(so.rows("approval_attested").is_empty());
+    let (status, late) = so.post("assertion", &assertion).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{late}");
+    assert_eq!(late["error"], "approval.presence_consumed");
 }

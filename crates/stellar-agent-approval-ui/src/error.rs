@@ -83,6 +83,9 @@ pub enum PresenceStartRefusal {
     /// The pending store or the process identity cannot be read:
     /// `approval.presence_unavailable`.
     Unavailable,
+    /// The current owner-signed policy names an approval origin, so mainnet
+    /// consent runs only at that origin: `approval.origin_signed_remote`.
+    OriginSignedRemote,
 }
 
 impl PresenceStartRefusal {
@@ -95,6 +98,7 @@ impl PresenceStartRefusal {
             Self::PolicyUnavailable => F::PresencePolicyUnavailable,
             Self::Changed => F::PresenceChanged,
             Self::Unavailable => F::PresenceUnavailable,
+            Self::OriginSignedRemote => F::OriginSignedRemote,
         }
     }
 }

@@ -750,6 +750,7 @@ async fn remote_approval_browser_drives_real_payment_commit() {
             label: "test-browser-authenticator".to_owned(),
             registered_at_unix_ms: timefmt::now_unix_ms().expect("clock read"),
             sign_count: None,
+            source: stellar_agent_core::approval::OperatorCredentialSource::Enrolled,
         })
         .expect("operator credential enrollment must succeed with the page-displayed values");
 

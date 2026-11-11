@@ -341,6 +341,7 @@ async fn run_enroll_args(profile_name: String, args: EnrollArgs) -> i32 {
         label,
         registered_at_unix_ms,
         sign_count: args.sign_count,
+        source: stellar_agent_core::approval::OperatorCredentialSource::Enrolled,
     };
 
     match store.enroll(credential) {
@@ -1223,6 +1224,7 @@ mod tests {
             label: "laptop".to_owned(),
             registered_at_unix_ms: 1,
             sign_count: None,
+            source: stellar_agent_core::approval::OperatorCredentialSource::Enrolled,
         };
         let first = OperatorApprovalCredentialStore::new(dir.path().join("first.toml"));
         let second = OperatorApprovalCredentialStore::new(dir.path().join("second.toml"));
@@ -1282,6 +1284,7 @@ mod tests {
             label: "laptop".to_owned(),
             registered_at_unix_ms: 1,
             sign_count: None,
+            source: stellar_agent_core::approval::OperatorCredentialSource::Enrolled,
         }
     }
 

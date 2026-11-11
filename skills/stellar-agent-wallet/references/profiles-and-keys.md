@@ -898,7 +898,7 @@ reason = "review"
 The optional signed origin and certificate pin configure policy data.
 They grant no runtime remote approval support.
 Under a policy that signs both, mainnet presence binds the origin's host as the relying-party ID, the origin, and the pin.
-The localhost passkey page then refuses with `approval.presence_invalid`, and no listener in this release serves the signed origin.
+The local inbox and the localhost passkey page then refuse with `approval.origin_signed_remote`, and no listener in this release serves the signed origin.
 Both absent preserve the local-only default.
 
 An origin contains exactly `https://<host>[:<port>]`.

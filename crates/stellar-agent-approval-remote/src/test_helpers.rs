@@ -8,6 +8,9 @@
 //! arbitrary sign counter) share one signing implementation instead of
 //! hand-rolled byte arrays per test.
 //!
+//! [`pinned_leaf`] generates the certificate files of a pinned TLS load
+//! together with their pin.
+//!
 //! Compiled only under `#[cfg(any(test, feature = "test-helpers"))]` — never
 //! present in a production binary.
 
@@ -155,5 +158,66 @@ impl SoftwareAuthenticator {
         sign_count: u32,
     ) -> AssertionWire {
         self.sign_assertion(challenge, rp_id, origin, FLAG_UP | FLAG_UV, sign_count)
+    }
+}
+
+/// A leaf certificate for a pinned TLS load, the certificate that issued
+/// it, the leaf's private key, and the pin of the leaf.
+///
+/// The pin is SHA-256 of the SubjectPublicKeyInfo DER that `rcgen` encodes
+/// from the leaf's key pair, so it does not depend on reading the
+/// certificate back.
+pub struct PinnedLeaf {
+    /// The leaf certificate, one PEM `CERTIFICATE` block.
+    pub cert_pem: String,
+    /// The issuing certificate, one PEM `CERTIFICATE` block.
+    pub issuer_pem: String,
+    /// The leaf's private key, PKCS#8 PEM.
+    pub key_pem: String,
+    /// SHA-256 of the leaf key's SubjectPublicKeyInfo DER.
+    pub pin: [u8; 32],
+}
+
+impl PinnedLeaf {
+    /// The chain file a server presents: the leaf, then its issuer.
+    #[must_use]
+    pub fn chain_pem(&self) -> String {
+        format!("{}{}", self.cert_pem, self.issuer_pem)
+    }
+}
+
+/// Generates a certificate authority and a leaf for `host` it signs, both
+/// with fresh keys of `algorithm`.
+///
+/// # Panics
+///
+/// Panics when `rcgen` cannot generate a key of `algorithm` or sign a
+/// certificate for `host`, which no supported algorithm and DNS name does.
+#[must_use]
+pub fn pinned_leaf(host: &str, algorithm: &'static rcgen::SignatureAlgorithm) -> PinnedLeaf {
+    use rcgen::PublicKeyData as _;
+    #[allow(
+        clippy::expect_used,
+        reason = "test-only; generation with a supported algorithm and a DNS name succeeds"
+    )]
+    let (issuer_pem, leaf, leaf_key) = {
+        let issuer_key = rcgen::KeyPair::generate_for(algorithm).expect("issuer key");
+        let mut issuer_params =
+            rcgen::CertificateParams::new(Vec::<String>::new()).expect("issuer parameters");
+        issuer_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let issuer_cert = issuer_params.self_signed(&issuer_key).expect("issuer");
+        let issuer = rcgen::Issuer::new(issuer_params, issuer_key);
+        let leaf_key = rcgen::KeyPair::generate_for(algorithm).expect("leaf key");
+        let leaf = rcgen::CertificateParams::new(vec![host.to_owned()])
+            .expect("leaf parameters")
+            .signed_by(&leaf_key, &issuer)
+            .expect("leaf");
+        (issuer_cert.pem(), leaf, leaf_key)
+    };
+    PinnedLeaf {
+        cert_pem: leaf.pem(),
+        issuer_pem,
+        key_pem: leaf_key.serialize_pem(),
+        pin: Sha256::digest(leaf_key.subject_public_key_info()).into(),
     }
 }

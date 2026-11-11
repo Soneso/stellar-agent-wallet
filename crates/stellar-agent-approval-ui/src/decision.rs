@@ -43,7 +43,14 @@
 //! local approve reaches the shared attester, which refuses the standard
 //! authorization on a mainnet binding with `approval.presence_required`
 //! before any row or attestation. Both answer [`Outcome::PresenceRefused`]
-//! with the store unchanged. A reject needs no presence and is unchanged.
+//! with the store unchanged. A loopback reject needs no presence.
+//!
+//! The listener of an owner-signed approval origin decides as
+//! [`RequestIdentity::SignedOrigin`]. Its approve carries verified presence
+//! as authorization, attributed to [`Surface::ServeRemote`] with a mainnet
+//! passkey approver. Its reject carries verified presence for the same entry.
+//! The entry binding is the
+//! process UID, as for the local inbox.
 //!
 //! # What the page showed
 //!
@@ -97,6 +104,12 @@ pub const REJECT_TOMBSTONE_TTL_MS: u64 = 3_600_000;
 pub enum RequestIdentity {
     /// Verified consent from the owner-signed mainnet policy.
     Mainnet(stellar_agent_core::approval::VerifiedMainnetPresence),
+    /// Verified consent from the owner-signed mainnet policy, at the listener
+    /// of its signed approval origin. The decision is attributed to
+    /// [`Surface::ServeRemote`] with a mainnet passkey approver; the entry
+    /// binding is `ApproverIdentity::OsUid(process_uid_for_attestation())`.
+    /// A reject requires the presence to name the rejected entry.
+    SignedOrigin(stellar_agent_core::approval::VerifiedMainnetPresence),
     /// The loopback approval-inbox server: derive
     /// `ApproverIdentity::OsUid(process_uid_for_attestation())` internally.
     /// The remote-approval allowlist is never consulted, and the attestation
@@ -319,6 +332,14 @@ pub(crate) fn presence_refusal(error: &WalletError) -> Option<Outcome> {
             "Mainnet consent uses the local passkey page; remote approval is \
              unavailable for mainnet."
         }
+        F::ListenerPolicyStale => {
+            "The approval listener serves an earlier owner-signed mainnet policy; restart it \
+             under the current policy."
+        }
+        F::OriginSignedRemote => {
+            "The owner-signed policy serves mainnet consent at its approval origin; approve \
+             there."
+        }
         _ => return None,
     };
     Some(Outcome::PresenceRefused {
@@ -368,7 +389,7 @@ pub fn shown_view_digest(body: &[u8]) -> Option<[u8; 32]> {
 
 /// The mainnet presence refusals, each with the stable code
 /// [`presence_refusal`] answers it with.
-fn presence_refusals() -> [stellar_agent_core::ApprovalFailure; 10] {
+fn presence_refusals() -> [stellar_agent_core::ApprovalFailure; 12] {
     use stellar_agent_core::ApprovalFailure as F;
     [
         F::PresenceRequired,
@@ -381,6 +402,8 @@ fn presence_refusals() -> [stellar_agent_core::ApprovalFailure; 10] {
         F::PresenceUnavailable,
         F::PresenceCanceled,
         F::MainnetRemoteUnsupported,
+        F::ListenerPolicyStale,
+        F::OriginSignedRemote,
     ]
 }
 
@@ -474,34 +497,47 @@ impl Resolved {
 /// Resolves `requester` into the identity and allowlist to gate with, the
 /// surface to attribute the action to, and the approver to attest.
 ///
-/// For [`RequestIdentity::Local`] this derives
-/// `ApproverIdentity::OsUid(process_uid_for_attestation())`. For
+/// For [`RequestIdentity::Local`] and [`RequestIdentity::Mainnet`] this
+/// derives `ApproverIdentity::OsUid(process_uid_for_attestation())`, on the
+/// loopback surface. [`RequestIdentity::SignedOrigin`] derives the same
+/// identity on [`Surface::ServeRemote`] with the presence's mainnet passkey
+/// approver; its verified presence is the authorization. For
 /// [`RequestIdentity::Remote`] it reads the current authorization through
 /// [`authorize_remote`].
 ///
 /// # Errors
 ///
 /// Returns `Err(Outcome::Unavailable)` if process-UID derivation fails for
-/// `RequestIdentity::Local`, and `Err(Outcome::Unauthorized)` for a remote
+/// a requester bound by it, and `Err(Outcome::Unauthorized)` for a remote
 /// requester the current authorization does not admit.
 #[allow(
     clippy::result_large_err,
     reason = "the Err variant is the ready-to-return Outcome for a derivation failure"
 )]
 fn resolve_requester(requester: &RequestIdentity) -> Result<Resolved, Outcome> {
-    match requester {
-        RequestIdentity::Local | RequestIdentity::Mainnet(_) => {
-            let uid = process_uid_for_attestation().map_err(|e| {
+    let process_identity = || {
+        process_uid_for_attestation()
+            .map(ApproverIdentity::OsUid)
+            .map_err(|e| {
                 tracing::warn!(error = %e, "decision: process uid derivation failed");
                 Outcome::Unavailable
-            })?;
-            Ok(Resolved {
-                identity: ApproverIdentity::OsUid(uid),
-                allowed_credentials: Vec::new(),
-                surface: Surface::Serve,
-                approver: AttestedApprover::Local,
             })
-        }
+    };
+    match requester {
+        RequestIdentity::Local | RequestIdentity::Mainnet(_) => Ok(Resolved {
+            identity: process_identity()?,
+            allowed_credentials: Vec::new(),
+            surface: Surface::Serve,
+            approver: AttestedApprover::Local,
+        }),
+        RequestIdentity::SignedOrigin(presence) => Ok(Resolved {
+            identity: process_identity()?,
+            allowed_credentials: Vec::new(),
+            surface: Surface::ServeRemote,
+            approver: AttestedApprover::MainnetPasskey {
+                credential_id_b64url: presence.credential_id_b64url(),
+            },
+        }),
         RequestIdentity::Remote { identity, .. } => {
             let (credential_id, allowed_credentials) = authorize_remote(requester)?;
             Ok(Resolved {
@@ -563,9 +599,9 @@ fn authorize_remote(requester: &RequestIdentity) -> Result<(String, Vec<String>)
 pub(crate) mod wait_hook {
     //! Runs a test action where a decision waits: right after approve's
     //! attestation key loads, standing in for an interactive keyring prompt,
-    //! and right after reject takes the audit-writer lock, before its final
-    //! authorization read, standing in for a revocation while another
-    //! decision held the writer.
+    //! and after reject prepares its audit row, before its final authorization
+    //! read. A revocation during writer acquisition, drain, or rotation must
+    //! refuse the rejection.
 
     use std::cell::RefCell;
 
@@ -624,8 +660,11 @@ fn apply_approve(
         ))
         .unwrap_or(Outcome::Unavailable);
     }
-    if ctx.context.chain_id == MAINNET_CHAIN_ID && !matches!(requester, RequestIdentity::Mainnet(_))
-    {
+    let presence_bearing = matches!(
+        requester,
+        RequestIdentity::Mainnet(_) | RequestIdentity::SignedOrigin(_)
+    );
+    if ctx.context.chain_id == MAINNET_CHAIN_ID && !presence_bearing {
         return presence_refusal(&WalletError::Approval(
             stellar_agent_core::ApprovalFailure::PresenceRequired,
         ))
@@ -738,7 +777,7 @@ fn apply_approve(
 
     let grant_override = ctx.grant_store_path_override.clone();
     let profile_name = ctx.context.profile_name.as_str();
-    let current = if matches!(requester, RequestIdentity::Mainnet(_)) {
+    let current = if presence_bearing {
         let loaded = ctx
             .mainnet_authority
             .as_ref()
@@ -756,7 +795,7 @@ fn apply_approve(
         None
     };
     let authorization = match requester {
-        RequestIdentity::Mainnet(presence) => {
+        RequestIdentity::Mainnet(presence) | RequestIdentity::SignedOrigin(presence) => {
             let Some(current) = &current else {
                 return Outcome::Unavailable;
             };
@@ -857,6 +896,16 @@ fn audit_event_kind(operator_credential_id: Option<&str>, approve: bool) -> &'st
 }
 
 fn apply_reject(ctx: &DecisionContext, nonce: &str, requester: &RequestIdentity) -> Outcome {
+    // A signed-origin reject stands on the assertion that verified for this
+    // entry; one for another entry or off mainnet decides nothing.
+    if let RequestIdentity::SignedOrigin(presence) = requester {
+        if ctx.context.chain_id != MAINNET_CHAIN_ID {
+            return Outcome::BindingMismatch;
+        }
+        if presence.approval_nonce() != nonce {
+            return Outcome::BindingMismatch;
+        }
+    }
     let mut store = match open_store(ctx, "reject") {
         Ok(s) => s,
         Err(outcome) => return outcome,
@@ -935,15 +984,42 @@ fn apply_reject(ctx: &DecisionContext, nonce: &str, requester: &RequestIdentity)
         return Outcome::Unavailable;
     };
 
-    // The writer lock may have waited on other decisions: read the
-    // authorization again before the rejection row. `write_entry` may still
-    // drain queued rows, repair the anchor or rotate the log before the row
-    // lands, so a revocation during that work does not stop this rejection;
-    // a rejection only denies the pending action.
+    let prepared = match writer.prepare_entry() {
+        Ok(prepared) => prepared,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                event_kind,
+                "reject: the rejection row was not written; the entry stays pending"
+            );
+            return Outcome::Unavailable;
+        }
+    };
+
+    // Writer acquisition, drain, anchor repair, and rotation precede revalidation.
+    // Current authorization, listener pin, credential, and both signed-presence
+    // deadlines must hold before the row, with no intervening drain or rotation.
     #[cfg(test)]
     wait_hook::fire();
     if let Err(outcome) = authorize_remote(requester) {
         return outcome;
+    }
+    if let RequestIdentity::SignedOrigin(presence) = requester {
+        let checked = ctx
+            .mainnet_authority
+            .as_ref()
+            .ok_or(WalletError::Approval(
+                stellar_agent_core::ApprovalFailure::PresencePolicyUnavailable,
+            ))
+            .and_then(
+                stellar_agent_core::approval::MainnetApprovalAuthority::load_current_compare_only,
+            )
+            .and_then(|current| {
+                presence.revalidate_rejection(&store, &ctx.context.binding(), current.policy())
+            });
+        if let Err(error) = checked {
+            return presence_refusal(&error).unwrap_or_else(|| entry_outcome(&error));
+        }
     }
     let kind_name = original_kind_name.unwrap_or_else(|| "unknown".to_owned());
     let audit_entry = match operator_credential_id {
@@ -960,7 +1036,7 @@ fn apply_reject(ctx: &DecisionContext, nonce: &str, requester: &RequestIdentity)
             uuid::Uuid::new_v4().to_string(),
         ),
     };
-    if let Err(e) = writer.write_entry(audit_entry) {
+    if let Err(e) = prepared.write(audit_entry) {
         tracing::warn!(
             error = %e,
             event_kind,
@@ -1400,6 +1476,8 @@ mod tests {
             F::PresenceUnavailable,
             F::PresenceCanceled,
             F::MainnetRemoteUnsupported,
+            F::ListenerPolicyStale,
+            F::OriginSignedRemote,
         ] {
             let expected = Outcome::PresenceRefused {
                 code: failure.code(),
@@ -1947,6 +2025,73 @@ mod tests {
             && entry.attestation_blob_b64.is_none()
     }
 
+    /// The rejection revalidates only after the queued row is durable and the outbox is empty.
+    #[test]
+    #[serial]
+    fn reject_drains_the_outbox_before_revalidation() {
+        use stellar_agent_core::audit_log::test_helpers::verified_audit_entries_from_path;
+        use stellar_agent_core::audit_log::{AuditOutbox, BindingHistory, inspect_outbox};
+
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        let mut fx = fixture("reject-drain");
+        let nonce = insert(&fx.ctx, payment_entry(DEFAULT_TTL_MS));
+        let path = fx.ctx.store_path.parent().unwrap().join("draining.log");
+        let anchor = Arc::new(MemAnchor::default()) as Arc<dyn TipAnchorStore>;
+        let writer = AuditWriter::open_with_tip_anchor(
+            path.clone(),
+            None,
+            Arc::clone(&anchor),
+            BindingHistory::NotRecorded,
+        )
+        .unwrap();
+        fx.ctx.audit_writer = Arc::new(Mutex::new(writer));
+        let outbox = AuditOutbox::for_log(&path, anchor);
+        outbox
+            .append(&AuditEntry::new_approval_attested(
+                "PaymentSimulated",
+                "stellar_pay_commit",
+                None,
+                "AAAAAAAAAAAAAAAAAAAAAA",
+                "serve",
+                "queued-consent",
+            ))
+            .unwrap();
+        assert_eq!(inspect_outbox(&path).unwrap().pending, 1);
+        assert_eq!(rows_of_kind(&path, "approval_rejected"), 0);
+
+        let fired = std::rc::Rc::new(std::cell::Cell::new(false));
+        let hook_fired = std::rc::Rc::clone(&fired);
+        let hook_path = path.clone();
+        wait_hook::install(move || {
+            hook_fired.set(true);
+            assert_eq!(inspect_outbox(&hook_path).unwrap().pending, 0);
+            let rows = verified_audit_entries_from_path(&hook_path);
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].request_id, "queued-consent");
+        });
+        assert_eq!(
+            apply_decision(
+                &fx.ctx,
+                Decision::Reject {
+                    nonce: nonce.clone(),
+                },
+                RequestIdentity::Local,
+            ),
+            Outcome::Rejected
+        );
+        assert!(fired.get());
+        assert_eq!(inspect_outbox(&path).unwrap().pending, 0);
+        let rows = verified_audit_entries_from_path(&path);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].request_id, "queued-consent");
+        assert_eq!(rows_of_kind(&path, "approval_attested"), 1);
+        assert_eq!(rows_of_kind(&path, "approval_rejected"), 1);
+        let store = PendingApprovalStore::open(fx.ctx.store_path.clone()).unwrap();
+        let entry = store.get(&nonce).unwrap();
+        assert!(matches!(entry.kind, ApprovalKind::Rejected { .. }));
+        assert!(entry.attestation_blob_b64.is_none());
+    }
+
     /// Another handle attests the entry after the inbox validated it and
     /// before it attests: the inbox answers with the stored attestation and
     /// writes no row.
@@ -2250,6 +2395,7 @@ mod tests {
                 label: "device".to_owned(),
                 registered_at_unix_ms: 1,
                 sign_count: None,
+                source: stellar_agent_core::approval::OperatorCredentialSource::Enrolled,
             })
             .unwrap();
     }

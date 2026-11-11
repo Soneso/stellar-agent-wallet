@@ -6,14 +6,17 @@
 //
 // The #presence-data island names the entry, its CSRF value, the digest of the
 // rendered consent view, the sessionStorage key of the session proof, and the
-// listener's mode. Nothing runs on page load: a ceremony starts only on a
-// trusted click of "Approve with passkey", asks for user verification from the
-// credentials and for the relying-party ID the server's challenge names, and
-// posts the authenticator's raw response bytes. In the inbox a successful
-// assertion records the consent and the page shows the attestation; in a
-// command's ceremony the command records it, and the page says so. A response
-// without a JSON body means the session has ended. Once every handler is
-// wired, the root element carries data-presence="ready".
+// listener's mode. It marks a page served at a signed approval origin.
+// Nothing runs on page load. A ceremony starts only on a trusted click of
+// "Approve with passkey". It asks for user verification with the credentials
+// and relying-party ID the server's challenge names. It posts the authenticator's
+// raw response bytes. In the inbox a successful assertion records the consent
+// and the page shows the attestation; in a command's ceremony the command
+// records it, and the page says so. At a signed origin a Reject click runs the
+// same ceremony and posts its assertion with the rejection; the loopback inbox
+// posts the rejection alone. A response without a JSON body means the session
+// has ended. Once every handler is wired, the root element carries
+// data-presence="ready".
 
 (function () {
   'use strict';
@@ -22,6 +25,7 @@
   var UNAVAILABLE = 'The consent request cannot complete. Reload the page.';
   var data = JSON.parse(document.getElementById('presence-data').textContent);
   var inbox = data.mode === 'inbox';
+  var signedOrigin = data.signed_origin === true;
   var approve = document.getElementById('presence-approve');
   var cancel = document.getElementById('presence-cancel');
   var reject = document.getElementById('presence-reject');
@@ -76,36 +80,45 @@
       ? 'Mainnet consent requires a local browser with WebAuthn user verification; no approval is recorded.'
       : 'Mainnet consent is canceled; no approval is recorded.';
   }
+  // Runs one ceremony: a challenge for the rendered consent view and an
+  // assertion with user verification over it. Resolves to the raw response
+  // bytes to post, or to null once the ceremony has ended and the result shows
+  // why.
+  async function ceremony() {
+    if (!window.isSecureContext || !window.PublicKeyCredential || !navigator.credentials || !navigator.credentials.get) {
+      await end('browser_unavailable'); return null;
+    }
+    var options = await post('challenge', { consent_view_digest: data.consent_view_digest });
+    if (typeof options.challenge !== 'string' || typeof options.rp_id !== 'string') {
+      shared.renderRefusal(result, options, UNAVAILABLE); return null;
+    }
+    var credential;
+    try {
+      credential = await navigator.credentials.get({ publicKey: {
+        challenge: decode(options.challenge), rpId: options.rp_id,
+        allowCredentials: options.allow_credentials.map(function (id) { return { type: 'public-key', id: decode(id) }; }),
+        userVerification: 'required', timeout: options.timeout_ms
+      } });
+    } catch (error) {
+      await end(error && error.name === 'NotAllowedError' ? 'authenticator_canceled' : 'browser_unavailable');
+      return null;
+    }
+    if (!credential) { await end('authenticator_canceled'); return null; }
+    return {
+      request_id: options.request_id, credential_id_b64url: encode(credential.rawId),
+      authenticator_data_b64url: encode(credential.response.authenticatorData),
+      client_data_json_b64url: encode(credential.response.clientDataJSON),
+      signature_der_b64url: encode(credential.response.signature)
+    };
+  }
   approve.addEventListener('click', async function (event) {
     if (!event.isTrusted || busy || done) { return; }
     busy = true;
     approve.disabled = true;
     try {
-      if (!window.isSecureContext || !window.PublicKeyCredential || !navigator.credentials || !navigator.credentials.get) {
-        await end('browser_unavailable'); return;
-      }
-      var options = await post('challenge', { consent_view_digest: data.consent_view_digest });
-      if (typeof options.challenge !== 'string' || typeof options.rp_id !== 'string') {
-        shared.renderRefusal(result, options, UNAVAILABLE); return;
-      }
-      var credential;
-      try {
-        credential = await navigator.credentials.get({ publicKey: {
-          challenge: decode(options.challenge), rpId: options.rp_id,
-          allowCredentials: options.allow_credentials.map(function (id) { return { type: 'public-key', id: decode(id) }; }),
-          userVerification: 'required', timeout: options.timeout_ms
-        } });
-      } catch (error) {
-        await end(error && error.name === 'NotAllowedError' ? 'authenticator_canceled' : 'browser_unavailable');
-        return;
-      }
-      if (!credential) { await end('authenticator_canceled'); return; }
-      var response = await post('assertion', {
-        request_id: options.request_id, credential_id_b64url: encode(credential.rawId),
-        authenticator_data_b64url: encode(credential.response.authenticatorData),
-        client_data_json_b64url: encode(credential.response.clientDataJSON),
-        signature_der_b64url: encode(credential.response.signature)
-      });
+      var signed = await ceremony();
+      if (!signed) { return; }
+      var response = await post('assertion', signed);
       if (inbox) {
         shared.renderResult(result, response);
         done = response.status === 'attested' || response.status === 'grant_active';
@@ -134,7 +147,12 @@
       if (!event.isTrusted || busy || done) { return; }
       busy = true;
       try {
-        var reply = await send('reject', {});
+        var body = {};
+        if (signedOrigin) {
+          body = await ceremony();
+          if (!body) { return; }
+        }
+        var reply = await send('reject', body);
         shared.renderRefusal(result, reply.value, 'HTTP ' + reply.status);
         if (reply.ok) { done = true; approve.disabled = true; }
       } catch (error) {
