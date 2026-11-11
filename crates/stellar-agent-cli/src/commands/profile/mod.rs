@@ -28,6 +28,7 @@
 //! enum.  The top-level [`crate::main`] function routes `Commands::Profile(args)`
 //! to [`run`], which delegates to the appropriate subcommand handler.
 
+pub mod apply_fragment;
 pub mod audit_emit;
 pub mod bind_signer;
 pub mod enable_mainnet;
@@ -40,6 +41,7 @@ pub mod key_ops;
 pub mod list;
 pub mod migrate;
 pub(super) mod owner_seed;
+pub mod policy_check;
 pub mod reset_mpp_state;
 pub mod reset_window_state;
 pub mod rotate_attestation_key;
@@ -65,6 +67,10 @@ pub struct ProfileArgs {
 #[derive(Debug, Subcommand)]
 #[non_exhaustive]
 pub enum ProfileSubcommand {
+    /// Validate a policy body from standard input without checking its signature.
+    PolicyCheck(policy_check::PolicyCheckArgs),
+    /// Replace allowed profile fields with a validated standard-input fragment.
+    ApplyFragment(apply_fragment::ApplyFragmentArgs),
     /// Bind the enrolled mainnet signer to the profile and established owner.
     BindSigner(bind_signer::BindSignerArgs),
     /// Bind a named mainnet profile to this installation and signed policy.
@@ -209,6 +215,8 @@ pub enum ProfileSubcommand {
 /// Never panics.
 pub async fn run(args: &ProfileArgs) -> i32 {
     match &args.subcommand {
+        ProfileSubcommand::PolicyCheck(a) => policy_check::run(a),
+        ProfileSubcommand::ApplyFragment(a) => apply_fragment::run(a),
         ProfileSubcommand::BindSigner(a) => bind_signer::run(a).await,
         ProfileSubcommand::EnableMainnet(a) => enable_mainnet::run(a),
         ProfileSubcommand::Init(a) => init::run(a).await,
@@ -246,6 +254,8 @@ impl ProfileArgs {
     /// `required`, so their accessor is returned directly.
     pub(crate) fn profile_flag(&self) -> Option<&str> {
         match &self.subcommand {
+            ProfileSubcommand::PolicyCheck(a) => Some(&a.profile),
+            ProfileSubcommand::ApplyFragment(a) => Some(&a.profile),
             ProfileSubcommand::BindSigner(a) => Some(&a.profile),
             ProfileSubcommand::EnableMainnet(a) => a.profile.as_deref(),
             ProfileSubcommand::Init(a) => a.profile.as_deref(),

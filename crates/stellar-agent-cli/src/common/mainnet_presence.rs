@@ -18,6 +18,49 @@ use stellar_agent_core::approval::{
 };
 use stellar_agent_core::error::{ApprovalFailure, WalletError};
 
+/// How the operator receives a mainnet ceremony URL.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OpenMode {
+    Private,
+    Operator,
+}
+
+impl From<bool> for OpenMode {
+    fn from(operator: bool) -> Self {
+        if operator {
+            Self::Operator
+        } else {
+            Self::Private
+        }
+    }
+}
+
+impl OpenMode {
+    /// Delivers the URL once, retaining a private handoff only in the default mode.
+    #[allow(clippy::print_stderr, reason = "CLI operator URL handoff")]
+    pub(crate) fn open(
+        self,
+        url: &str,
+        opener: impl FnOnce(&str) -> std::io::Result<()>,
+    ) -> std::io::Result<Option<crate::common::private_open::PrivateOpen>> {
+        match self {
+            Self::Operator => {
+                eprintln!("Open this URL in your browser: {url}");
+                Ok(None)
+            }
+            Self::Private => {
+                // Binary tests observe an attempted launch before the platform browser runs.
+                #[cfg(all(feature = "test-helpers", not(test)))]
+                if std::env::var_os(TEST_NO_BROWSER_ENV).is_some() {
+                    eprintln!("Browser launch attempted in test mode.");
+                    return Err(std::io::Error::other("test browser unavailable"));
+                }
+                crate::common::private_open::open_private(url, opener).map(Some)
+            }
+        }
+    }
+}
+
 /// The verified presence of the operator for `entry`.
 ///
 /// `store_path` is the pending store `entry` lives in, which the caller has
@@ -33,16 +76,28 @@ pub(crate) async fn acquire_mainnet_presence(
     authority: &MainnetApprovalAuthority,
     store_path: &Path,
 ) -> Result<VerifiedMainnetPresence, WalletError> {
+    acquire_mainnet_presence_with_mode(entry, context, authority, store_path, OpenMode::Private)
+        .await
+}
+
+/// Obtains verified presence with the selected URL delivery mode.
+pub(crate) async fn acquire_mainnet_presence_with_mode(
+    entry: &PendingApproval,
+    context: &ApprovalContext,
+    authority: &MainnetApprovalAuthority,
+    store_path: &Path,
+    mode: OpenMode,
+) -> Result<VerifiedMainnetPresence, WalletError> {
     #[cfg(test)]
     if let Some(result) = driver::drive(entry, context, authority) {
         return result;
     }
     let current = authority.load_current()?;
     #[cfg(test)]
-    let browser_driver = listener_driver::is_installed();
+    let browser_driver = mode == OpenMode::Private && listener_driver::is_installed();
     #[cfg(not(test))]
     let browser_driver = false;
-    if !browser_available() && !browser_driver {
+    if mode == OpenMode::Private && !browser_available() && !browser_driver {
         return Err(WalletError::Approval(
             ApprovalFailure::PresenceBrowserRequired,
         ));
@@ -68,10 +123,18 @@ pub(crate) async fn acquire_mainnet_presence(
         })?;
     #[cfg(test)]
     if let Some(flags) = listener_driver::take() {
-        return listener_driver::drive(handle, &entry.approval_nonce, flags).await;
+        return listener_driver::drive(
+            handle,
+            &entry.approval_nonce,
+            flags,
+            mode,
+            entry.expires_at_unix_ms,
+        )
+        .await;
     }
     presence_until_done(
         handle,
+        mode,
         entry.expires_at_unix_ms,
         crate::common::private_open::browser_opener,
         tokio::signal::ctrl_c(),
@@ -98,11 +161,12 @@ fn browser_available() -> bool {
 
 async fn presence_until_done(
     mut handle: stellar_agent_approval_ui::MainnetPresenceHandle,
+    mode: OpenMode,
     expires_at: u64,
     opener: impl FnOnce(&str) -> std::io::Result<()>,
     interrupt: impl std::future::Future<Output = std::io::Result<()>>,
 ) -> Result<VerifiedMainnetPresence, WalletError> {
-    let handoff = match crate::common::private_open::open_private(handle.bootstrap_url(), opener) {
+    let handoff = match mode.open(handle.bootstrap_url(), opener) {
         Ok(handoff) => handoff,
         Err(_) => {
             let _ = handle.shutdown().await;
@@ -123,7 +187,8 @@ async fn presence_until_done(
     };
     let stopped = handle.shutdown().await;
     let closed = handoff
-        .close()
+        .map(crate::common::private_open::PrivateOpen::close)
+        .transpose()
         .map_err(|_| WalletError::Approval(ApprovalFailure::PresenceUnavailable));
     stopped?;
     closed?;
@@ -135,15 +200,12 @@ pub(crate) mod listener_driver {
     use super::*;
     use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
     thread_local! { static FLAGS: std::cell::Cell<Option<u8>> = const { std::cell::Cell::new(None) }; }
-    #[cfg(feature = "mainnet-write")]
     pub(crate) struct Guard;
-    #[cfg(feature = "mainnet-write")]
     impl Drop for Guard {
         fn drop(&mut self) {
             FLAGS.set(None);
         }
     }
-    #[cfg(feature = "mainnet-write")]
     pub(crate) fn install(flags: u8) -> Guard {
         FLAGS.set(Some(flags));
         Guard
@@ -158,7 +220,31 @@ pub(crate) mod listener_driver {
         mut handle: stellar_agent_approval_ui::MainnetPresenceHandle,
         nonce: &str,
         flags: u8,
+        mode: OpenMode,
+        expires_at: u64,
     ) -> Result<VerifiedMainnetPresence, WalletError> {
+        if mode == OpenMode::Operator {
+            let url = handle.bootstrap_url().to_owned();
+            let unavailable = || WalletError::Approval(ApprovalFailure::PresenceUnavailable);
+            let port = url::Url::parse(&url)
+                .map_err(|_| unavailable())?
+                .port()
+                .ok_or_else(unavailable)?;
+            let ceremony = presence_until_done(
+                handle,
+                mode,
+                expires_at,
+                |_| Err(std::io::Error::other("operator-open launches no browser")),
+                std::future::pending(),
+            );
+            let browser = submit(&url, nonce, flags);
+            let (presence, sent) = tokio::join!(ceremony, browser);
+            sent?;
+            if std::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port)).is_ok() {
+                return Err(unavailable());
+            }
+            return presence;
+        }
         let result = async {
             submit(handle.bootstrap_url(), nonce, flags).await?;
             handle
@@ -175,6 +261,21 @@ pub(crate) mod listener_driver {
             stellar_agent_approval_ui::presence::test_support::PresenceClient::connect(url, nonce)
                 .await
                 .map_err(|_| unavailable())?;
+        let parsed = url::Url::parse(url).map_err(|_| unavailable())?;
+        let addr =
+            std::net::SocketAddr::from(([127, 0, 0, 1], parsed.port().ok_or_else(unavailable)?));
+        let second = stellar_agent_approval_ui::operator_enroll::test_support::request(
+            addr,
+            "GET",
+            parsed.path(),
+            &[],
+            None,
+        )
+        .await
+        .map_err(|_| unavailable())?;
+        if second.status != 404 {
+            return Err(unavailable());
+        }
         let options = client.challenge().await.map_err(|_| unavailable())?.json();
         let challenge = options["challenge"]
             .as_str()
@@ -396,7 +497,12 @@ pub(crate) mod driver {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used, reason = "test assertions")]
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        reason = "test assertions"
+    )]
 
     use serial_test::serial;
     use stellar_agent_core::approval::mainnet_fixtures::MainnetConsentFixture;
@@ -407,12 +513,239 @@ mod tests {
         ApprovalContext::from_profile(fixture.name(), fixture.profile())
     }
 
+    async fn operator_presence(name: &str) {
+        use crate::common::render::take_rendered_for_test;
+        use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+        use clap::Parser as _;
+
+        struct KeepMock;
+        impl Drop for KeepMock {
+            fn drop(&mut self) {
+                stellar_agent_network::keyring::KEEP_REGISTERED_STORE
+                    .store(false, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        stellar_agent_network::keyring::KEEP_REGISTERED_STORE
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let _mock = KeepMock;
+        let fixture = MainnetConsentFixture::new(name);
+        let key = &fixture.profile().audit_log_hash_chain_key_id;
+        keyring_core::Entry::new(&key.service, &key.account)
+            .unwrap()
+            .set_password(&URL_SAFE_NO_PAD.encode([0xAB; 32]))
+            .unwrap();
+        let entry = fixture.payment(600_000);
+        let mut store =
+            stellar_agent_core::approval::PendingApprovalStore::open(fixture.store_path()).unwrap();
+        store
+            .insert(
+                entry.clone(),
+                stellar_agent_core::timefmt::now_unix_ms().unwrap(),
+            )
+            .unwrap();
+        drop(store);
+        let _driver = listener_driver::install(5);
+        let cli = crate::Cli::try_parse_from([
+            "stellar-agent",
+            "approve",
+            "--id",
+            &entry.approval_nonce,
+            "--profile",
+            name,
+            "--open-by-operator",
+        ])
+        .unwrap();
+        let crate::Commands::Approve(args) = cli.command else {
+            panic!("approval command")
+        };
+        take_rendered_for_test();
+        let code = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            crate::commands::approve::dispatch(args),
+        )
+        .await
+        .unwrap();
+        let envelopes = take_rendered_for_test();
+        assert_eq!(code, 0, "{envelopes:?}");
+        assert_eq!(envelopes.len(), 1);
+        assert_eq!(envelopes[0]["data"]["approval_nonce"], entry.approval_nonce);
+        assert_eq!(envelopes[0]["data"]["presence"]["method"], "webauthn_uv");
+        assert_eq!(envelopes[0]["data"]["attested"], true);
+        let store =
+            stellar_agent_core::approval::PendingApprovalStore::open(fixture.store_path()).unwrap();
+        let saved = store.get(&entry.approval_nonce).unwrap();
+        assert!(saved.mainnet_presence.is_some());
+        assert!(saved.attestation_blob_b64.is_some());
+    }
+
+    async fn presence_handle(
+        fixture: &MainnetConsentFixture,
+        entry: &PendingApproval,
+    ) -> stellar_agent_approval_ui::MainnetPresenceHandle {
+        let mut store =
+            stellar_agent_core::approval::PendingApprovalStore::open(fixture.store_path()).unwrap();
+        store
+            .insert(
+                entry.clone(),
+                stellar_agent_core::timefmt::now_unix_ms().unwrap(),
+            )
+            .unwrap();
+        drop(store);
+        stellar_agent_approval_ui::start_mainnet_presence(
+            stellar_agent_approval_ui::MainnetPresenceConfig {
+                entry: entry.clone(),
+                context: context(fixture),
+                authority: fixture.authority(),
+                store_path: fixture.store_path(),
+                page_identity: stellar_agent_approval_ui::PageIdentity::neutral(),
+            },
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn approve_open_by_operator_prints_url_once() {
+        use crate::common::test_support::{assert_url_output, capture};
+        if let Some((stdout, stderr)) = capture("approve_open_by_operator_prints_url_once") {
+            assert_url_output(&stdout, &stderr);
+            return;
+        }
+        operator_presence("operator-approve-print").await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn approve_open_by_operator_launches_no_browser() {
+        use crate::common::test_support::capture;
+        if capture("approve_open_by_operator_launches_no_browser").is_some() {
+            return;
+        }
+        operator_presence("operator-approve-no-browser").await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn open_by_operator_keeps_presence_and_expiry() {
+        for cancel in [false, true] {
+            let fixture = MainnetConsentFixture::new("main");
+            let entry = fixture.payment(if cancel { 60_000 } else { 250 });
+            let handle = presence_handle(&fixture, &entry).await;
+            let url = handle.bootstrap_url().to_owned();
+            let addr = url::Url::parse(&url)
+                .unwrap()
+                .socket_addrs(|| None)
+                .unwrap()[0];
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                presence_until_done(
+                    handle,
+                    OpenMode::Operator,
+                    entry.expires_at_unix_ms,
+                    |_| panic!("no browser"),
+                    async {
+                        if cancel {
+                            Ok(())
+                        } else {
+                            std::future::pending().await
+                        }
+                    },
+                ),
+            )
+            .await
+            .expect("expiry and interruption bound the ceremony")
+            .unwrap_err();
+            assert_eq!(
+                result.code(),
+                if cancel {
+                    "approval.presence_canceled"
+                } else {
+                    "approval.presence_expired"
+                }
+            );
+            assert!(std::net::TcpStream::connect(addr).is_err());
+            let store =
+                stellar_agent_core::approval::PendingApprovalStore::open(fixture.store_path())
+                    .unwrap();
+            assert!(
+                store
+                    .get(&entry.approval_nonce)
+                    .unwrap()
+                    .mainnet_presence
+                    .is_none()
+            );
+        }
+        let fixture = MainnetConsentFixture::new("main");
+        let entry = fixture.payment(60_000);
+        let handle = presence_handle(&fixture, &entry).await;
+        let url = handle.bootstrap_url().to_owned();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let browser = async {
+            let error = listener_driver::submit(&url, &entry.approval_nonce, 1)
+                .await
+                .unwrap_err();
+            assert_eq!(error.code(), "approval.presence_invalid");
+            tx.send(()).unwrap();
+        };
+        let ceremony = presence_until_done(
+            handle,
+            OpenMode::Operator,
+            entry.expires_at_unix_ms,
+            |_| Ok(()),
+            async {
+                rx.await.unwrap();
+                Ok(())
+            },
+        );
+        let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            tokio::join!(ceremony, browser)
+        })
+        .await
+        .unwrap();
+        assert_eq!(result.unwrap_err().code(), "approval.presence_canceled");
+        crate::commands::approve::credential::tests::operator_expiry_and_cancellation().await;
+    }
+
+    #[test]
+    fn open_by_operator_keeps_stdout_one_envelope() {
+        use crate::common::test_support::{assert_url_output, capture};
+        for name in [
+            "serve_open_by_operator_prints_url_once",
+            "credential_open_by_operator_prints_url_once",
+            "approve_open_by_operator_prints_url_once",
+        ] {
+            let (stdout, stderr) = capture(name).unwrap();
+            assert_url_output(&stdout, &stderr);
+        }
+    }
+
     /// The private opener completes real assertions and refuses failed launches.
     #[tokio::test]
     #[serial]
     async fn mainnet_browser_open_and_no_browser_refusal() {
+        if crate::common::test_support::capture(
+            "common::mainnet_presence::tests::mainnet_browser_open_and_no_browser_refusal",
+        )
+        .is_some()
+        {
+            return;
+        }
         let fixture = MainnetConsentFixture::new("main");
         let entry = fixture.payment(600_000);
+        let error = acquire_mainnet_presence(
+            &entry,
+            &context(&fixture),
+            &fixture.authority(),
+            &fixture.store_path(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            error.code(),
+            "approval.presence_browser_required",
+            "default mode requires a display"
+        );
         let mut store =
             stellar_agent_core::approval::PendingApprovalStore::open(fixture.store_path()).unwrap();
         store
@@ -434,6 +767,7 @@ mod tests {
             .unwrap();
         let error = presence_until_done(
             handle,
+            OpenMode::Private,
             entry.expires_at_unix_ms,
             |_| Err(std::io::Error::other("synthetic opener refusal")),
             std::future::pending(),
@@ -469,6 +803,7 @@ mod tests {
         let mut browser = None;
         let presence = presence_until_done(
             handle,
+            OpenMode::Private,
             entry.expires_at_unix_ms,
             |file_url| {
                 assert!(file_url.starts_with("file://"));
@@ -530,6 +865,7 @@ mod tests {
             ttl + std::time::Duration::from_secs(3),
             presence_until_done(
                 handle,
+                OpenMode::Private,
                 entry.expires_at_unix_ms,
                 |_| Ok(()),
                 std::future::pending(),

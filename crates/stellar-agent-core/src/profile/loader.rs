@@ -1576,7 +1576,8 @@ pub fn pin_signer_account_on_disk(
     );
 
     let toml_str = toml::to_string_pretty(&doc).map_err(ProfileSaveError::Serialize)?;
-    write_profile_document_atomically(dir, &dest, &toml_str)?;
+    write_profile_document_atomically(dir, &dest, &toml_str, |_| Ok::<_, std::io::Error>(()))
+        .map_err(ProfileSaveError::Io)?;
     Ok(dest)
 }
 
@@ -1639,7 +1640,8 @@ pub fn set_pool_state_on_disk(
     );
 
     let toml_str = toml::to_string_pretty(&doc).map_err(ProfileSaveError::Serialize)?;
-    write_profile_document_atomically(dir, &dest, &toml_str)?;
+    write_profile_document_atomically(dir, &dest, &toml_str, |_| Ok::<_, std::io::Error>(()))
+        .map_err(ProfileSaveError::Io)?;
     Ok(dest)
 }
 
@@ -1763,7 +1765,8 @@ pub fn set_provider_credential_on_disk(
     } else {
         rendered
     };
-    write_profile_document_atomically(dir, &dest, &text)?;
+    write_profile_document_atomically(dir, &dest, &text, |_| Ok::<_, std::io::Error>(()))
+        .map_err(ProfileSaveError::Io)?;
     Ok(dest)
 }
 
@@ -1808,26 +1811,114 @@ fn placement_inline_table(placement: &RpcCredentialPlacement) -> toml_edit::Inli
 }
 
 /// Writes `text` to the profile file `dest` in the directory `dir`
-/// atomically.
+/// atomically after validating the candidate.
 ///
 /// The text goes into a temporary file in `dir`, which is flushed to disk and
 /// renamed over `dest`, so a reader sees either the old file or the new one.
 /// On Unix the directory is flushed as well, so the rename survives a crash.
-fn write_profile_document_atomically(
+fn write_profile_document_atomically<T, E: From<std::io::Error>>(
     dir: &Path,
     dest: &Path,
     text: &str,
-) -> Result<(), ProfileSaveError> {
-    let mut tmp = tempfile::NamedTempFile::new_in(dir).map_err(ProfileSaveError::Io)?;
-    std::io::Write::write_all(&mut tmp, text.as_bytes()).map_err(ProfileSaveError::Io)?;
-    tmp.as_file().sync_all().map_err(ProfileSaveError::Io)?;
-    tmp.persist(dest)
-        .map_err(|e| ProfileSaveError::Io(e.error))?;
+    validate: impl FnOnce(&Path) -> Result<T, E>,
+) -> Result<T, E> {
+    let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
+    std::io::Write::write_all(&mut tmp, text.as_bytes())?;
+    tmp.as_file().sync_all()?;
+    let validated = validate(tmp.path())?;
+    tmp.persist(dest).map_err(|e| e.error)?;
     #[cfg(unix)]
-    std::fs::File::open(dir)
-        .and_then(|file| file.sync_all())
-        .map_err(ProfileSaveError::Io)?;
-    Ok(())
+    std::fs::File::open(dir)?.sync_all()?;
+    Ok(validated)
+}
+
+/// A refusal or I/O failure while applying a profile fragment.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum ProfileFragmentError {
+    /// The fragment contains a key outside the allowed set.
+    #[error("the fragment names a protected profile field")]
+    KeyRefused,
+    /// The fragment or stored document is not valid TOML.
+    #[error("the profile fragment is not valid TOML")]
+    Syntax,
+    /// The candidate fails the profile loader.
+    #[error("the candidate profile fails validation: {0}")]
+    Load(#[from] ProfileLoadError),
+    /// Reading or persisting the profile fails.
+    #[error("the profile fragment cannot be persisted: {0}")]
+    Io(#[from] std::io::Error),
+}
+
+/// Replaces allowed fields with a fragment and validates before atomic persistence.
+///
+/// Only `oracle_provider_url`, `providers`, and `remote_approval` are accepted.
+/// Each supplied field replaces its whole stored value. Other text stays intact.
+/// The returned profile includes permitted runtime overlays; the file contains only stored text.
+///
+/// # Errors
+/// Refuses malformed TOML, protected keys, loader failures, and filesystem errors.
+pub fn apply_fragment_on_disk(
+    name: &str,
+    dir: &Path,
+    fragment: &str,
+    multicall_hook: Option<&dyn MulticallRegistryHook>,
+) -> Result<Profile, ProfileFragmentError> {
+    let dest = stored_profile_path(name, dir)?;
+    let raw = std::fs::read_to_string(&dest)?;
+    let mut doc = raw
+        .parse::<toml_edit::DocumentMut>()
+        .map_err(|_| ProfileFragmentError::Syntax)?;
+    let fragment = fragment
+        .parse::<toml_edit::DocumentMut>()
+        .map_err(|_| ProfileFragmentError::Syntax)?;
+    if fragment
+        .iter()
+        .any(|(key, _)| !matches!(key, "oracle_provider_url" | "providers" | "remote_approval"))
+    {
+        return Err(ProfileFragmentError::KeyRefused);
+    }
+    let mut trailing = if fragment.iter().any(|(_, value)| value.is_table()) {
+        let trailing = doc.trailing().as_str().unwrap_or_default().to_owned();
+        doc.set_trailing("");
+        Some(trailing)
+    } else {
+        None
+    };
+    for (key, value) in fragment.iter() {
+        let mut replacement = value.clone();
+        place_fragment_tables(&mut replacement, &mut trailing);
+        doc[key] = replacement;
+    }
+    let rendered = doc.to_string();
+    let text = if uses_crlf_throughout(&raw) {
+        rendered.replace("\r\n", "\n").replace('\n', "\r\n")
+    } else {
+        rendered
+    };
+    write_profile_document_atomically(dir, &dest, &text, |candidate| {
+        load_from_path(name, candidate, multicall_hook).map_err(ProfileFragmentError::Load)
+    })
+}
+
+fn place_fragment_tables(item: &mut toml_edit::Item, trailing: &mut Option<String>) {
+    if let Some(table) = item.as_table_mut() {
+        table.set_position(None);
+        if !table.is_implicit()
+            && let Some(trailing) = trailing.take()
+        {
+            let prefix = table
+                .decor()
+                .prefix()
+                .and_then(toml_edit::RawString::as_str)
+                .unwrap_or_default();
+            let prefix = format!("{trailing}{prefix}");
+            table.decor_mut().set_prefix(prefix);
+        }
+        for (_, child) in table.iter_mut() {
+            place_fragment_tables(child, trailing);
+        }
+    }
 }
 
 /// Errors produced when saving a profile.
@@ -5524,6 +5615,136 @@ account = "a"
         let loaded = load_from_dir(&name, dir.path(), None).unwrap();
         assert_eq!(loaded.mcp_signer_default.account, PINNED_G);
         assert_eq!(loaded.mcp_signer_default.service, "stellar-agent-signer");
+    }
+
+    const PROVIDERS_FRAGMENT: &str = "oracle_provider_url = \"https://oracle.example.invalid\"\n\n[providers.primary]\noperator = \"primary\"\nhost = \"file.example\"\n\n[providers.oracle]\noperator = \"oracle\"\nhost = \"oracle.example.invalid\"\nindependent_of_primary = true\n";
+
+    #[test]
+    fn apply_fragment_merges_allowed_keys_through_the_loader() {
+        for crlf in [false, true] {
+            let raw = format!(
+                "# retained comment\nfuture_key = 'retained' # retained suffix\n{}",
+                mainnet_toml()
+            );
+            let raw = if crlf { raw.replace('\n', "\r\n") } else { raw };
+            let (dir, name) = write_profile(&raw);
+            let loaded =
+                apply_fragment_on_disk(&name, dir.path(), PROVIDERS_FRAGMENT, None).unwrap();
+            assert_eq!(
+                loaded.oracle_provider_url.as_ref().map(url::Url::as_str),
+                Some("https://oracle.example.invalid/")
+            );
+            let path = dir.path().join(format!("{name}.toml"));
+            let written = std::fs::read_to_string(&path).unwrap();
+            for line in raw.lines() {
+                assert!(
+                    written.lines().any(|stored| stored == line),
+                    "unchanged stored line: {line}"
+                );
+            }
+            assert!(!written.contains("network_passphrase"));
+            if crlf {
+                assert!(uses_crlf_throughout(&written));
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                assert_eq!(
+                    std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                    0o600
+                );
+            }
+            let with_credential = PROVIDERS_FRAGMENT.replace("[providers.primary]", "[providers.primary]\ncredential = { service = 'provider', account = 'key' }\nplacement = { kind = 'header', name = 'X-Provider-Key' }");
+            apply_fragment_on_disk(&name, dir.path(), &with_credential, None).unwrap();
+            let loaded =
+                apply_fragment_on_disk(&name, dir.path(), PROVIDERS_FRAGMENT, None).unwrap();
+            assert!(
+                loaded
+                    .providers
+                    .unwrap()
+                    .primary
+                    .unwrap()
+                    .credential
+                    .is_none(),
+                "whole providers replacement removes stale fields"
+            );
+        }
+    }
+
+    #[test]
+    fn apply_fragment_refuses_loader_failures_unchanged() {
+        let (dir, name) = write_profile(&mainnet_toml());
+        let path = dir.path().join(format!("{name}.toml"));
+        let before = std::fs::read(&path).unwrap();
+        let cases = [
+            PROVIDERS_FRAGMENT.replace(
+                "oracle_provider_url = \"https://oracle.example.invalid\"\n",
+                "",
+            ),
+            PROVIDERS_FRAGMENT.replace("https://oracle", "http://oracle"),
+            PROVIDERS_FRAGMENT.replace("operator = \"oracle\"", "operator = \"\""),
+            PROVIDERS_FRAGMENT.replace(
+                "host = \"oracle.example.invalid\"",
+                "host = \"wrong.example.invalid\"",
+            ),
+            PROVIDERS_FRAGMENT.replace("independent_of_primary = true\n", ""),
+            PROVIDERS_FRAGMENT.replace("oracle.example.invalid", "file.example"),
+            PROVIDERS_FRAGMENT.replace("operator = \"oracle\"", "operator = \"primary\""),
+        ];
+        for fragment in cases {
+            let error = apply_fragment_on_disk(&name, dir.path(), &fragment, None).unwrap_err();
+            assert!(matches!(error, ProfileFragmentError::Load(_)), "{error}");
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+            assert_eq!(
+                std::fs::read_dir(dir.path()).unwrap().count(),
+                1,
+                "no candidate remains"
+            );
+        }
+    }
+
+    #[test]
+    fn apply_fragment_refuses_other_keys() {
+        let (dir, name) = write_profile(&mainnet_toml());
+        let path = dir.path().join(format!("{name}.toml"));
+        let before = std::fs::read(&path).unwrap();
+        for key in [
+            "rpc_url",
+            "network_passphrase",
+            "mcp_signer_default",
+            "audit_log_path",
+        ] {
+            let error =
+                apply_fragment_on_disk(&name, dir.path(), &format!("{key} = 'protected'\n"), None)
+                    .unwrap_err();
+            assert!(matches!(error, ProfileFragmentError::KeyRefused), "{error}");
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+        }
+        assert!(matches!(
+            apply_fragment_on_disk(&name, dir.path(), "[", None),
+            Err(ProfileFragmentError::Syntax)
+        ));
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn apply_fragment_remote_approval_keeps_path_fields() {
+        let raw = mainnet_toml();
+        let (dir, name) = write_profile(&raw);
+        let fragment = "[remote_approval]\nenabled = true\nbind = \"0.0.0.0:8443\"\nrp_id = \"approve.example.invalid\"\ncert_path = \"remote/cert.pem\"\nkey_path = \"remote/key.pem\"\n";
+        let loaded = apply_fragment_on_disk(&name, dir.path(), fragment, None).unwrap();
+        assert!(loaded.chain_id.is_mainnet());
+        assert!(loaded.remote_approval.unwrap().enabled);
+        let written = std::fs::read_to_string(dir.path().join(format!("{name}.toml"))).unwrap();
+        assert!(
+            written.contains(fragment),
+            "path fields and fragment formatting survive: {written}"
+        );
+        assert!(
+            written.starts_with(&raw),
+            "raw: {raw:?}; written: {written:?}"
+        );
     }
 
     /// Pinning against a missing profile file errors instead of creating one.

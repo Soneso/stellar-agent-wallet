@@ -53,6 +53,8 @@ pub(crate) mod refusal_log_fixture;
 pub mod render;
 pub mod served_pages;
 pub mod signer_ceremony;
+#[cfg(test)]
+pub(crate) mod test_support;
 pub(crate) mod tty;
 
 /// Returns `true` when a graphical display is available for a browser launch.

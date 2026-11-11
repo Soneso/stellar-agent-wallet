@@ -15,6 +15,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   script per host. CI tests them with an offline harness on Linux and macOS,
   and runs a Secret Service keyring round trip on Linux.
 - `profile enable-mainnet --state` reports nonce presence with classified exits. Signing permits complete mainnet content without installation bindings while the nonce is absent. Initial pinning verifies that signed content without granting runtime authority.
+- `profile policy-check` validates stdin policy bodies, and `profile apply-fragment`
+  validates provisioning edits. Operator-open approval includes a guard against
+  signed origins. The dedicated-user page documents deployment and validation.
 
 - Version 2 policies accept optional signed `[mainnet]` fields `approval_origin`, a canonical HTTPS DNS origin, and `approval_cert_spki_sha256`, the lowercase hex SHA-256 of a leaf certificate's SPKI DER. The mainnet minimum requires both or neither. Under a policy that signs them, mainnet presence binds the origin's host as the relying-party ID, the origin, and the pin. The local inbox and the localhost passkey page then refuse with `approval.origin_signed_remote`, and no listener in this release serves the signed origin.
 

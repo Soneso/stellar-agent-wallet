@@ -107,6 +107,9 @@ pub enum CredentialSubcommand {
 #[derive(Debug, Args)]
 #[non_exhaustive]
 pub struct EnrollApprovalCredentialArgs {
+    /// Print the local ceremony URL for the operator to open.
+    #[arg(long)]
+    pub open_by_operator: bool,
     /// The persisted mainnet profile the credential is for.
     #[arg(long = "profile", value_name = "NAME")]
     pub profile: String,
@@ -160,8 +163,8 @@ async fn run_enroll(args: EnrollApprovalCredentialArgs) -> i32 {
         return refuse(PROFILE_REQUIRED);
     }
     let resolved = ResolvedProfileName::from_flag(args.profile.clone());
-    let page_identity = match load_profile_reconciled(&resolved) {
-        Ok(profile) if profile.chain_id.is_mainnet() => page_identity_for(&profile),
+    let profile = match load_profile_reconciled(&resolved) {
+        Ok(profile) if profile.chain_id.is_mainnet() => profile,
         Ok(_) => return refuse(PROFILE_REQUIRED),
         Err(error) if error.requires_refusal() => {
             render_json(&Envelope::<()>::err(&error.to_wallet_error()));
@@ -169,7 +172,15 @@ async fn run_enroll(args: EnrollApprovalCredentialArgs) -> i32 {
         }
         Err(_) => return refuse(PROFILE_REQUIRED),
     };
-    if !display_available() {
+    if args.open_by_operator
+        && let Err(envelope) =
+            crate::commands::profile::policy_check::guard_operator_open(&args.profile, &profile)
+    {
+        render_json(&envelope);
+        return 1;
+    }
+    let page_identity = page_identity_for(&profile);
+    if !args.open_by_operator && !display_available() {
         return report(EnrollmentEnd::BrowserRequired, &args.profile);
     }
     let handle = match start_mainnet_approval_enroll(
@@ -188,9 +199,10 @@ async fn run_enroll(args: EnrollApprovalCredentialArgs) -> i32 {
             return refuse(UNAVAILABLE);
         }
     };
-    print_startup(&args.profile);
+    print_startup(&args.profile, args.open_by_operator);
     let end = enroll_until_done(
         handle,
+        args.open_by_operator.into(),
         private_open::browser_opener,
         Duration::from_secs(args.timeout_seconds),
         tokio::signal::ctrl_c(),
@@ -218,17 +230,15 @@ enum EnrollmentEnd {
     Unavailable,
 }
 
-/// Opens the started ceremony in the browser through a private redirect
-/// file, waits for a verified registration, then asks for the page's code.
+/// Delivers the ceremony URL, waits for registration, then asks for the page's code.
 ///
-/// `opener` receives only the redirect file's URL; when it fails the server
-/// stops and nothing else happens. One deadline, `timeout` after the open,
-/// bounds the registration wait and the prompt. The server stops and the
-/// redirect file and its directory are removed as soon as the browser phase
-/// ends. `interrupt` is watched across both phases, and `read_code` runs
-/// only once a registration is staged.
+/// Private mode gives `opener` a redirect file's URL; operator mode prints the
+/// ceremony URL on stderr. One deadline bounds registration and the prompt.
+/// The server stops and any private handoff closes when the browser phase ends.
+/// `interrupt` covers both phases; `read_code` runs after registration is staged.
 async fn enroll_until_done<Code>(
     mut handle: OperatorEnrollHandle,
+    mode: crate::common::mainnet_presence::OpenMode,
     opener: impl FnOnce(&str) -> io::Result<()>,
     timeout: Duration,
     interrupt: impl Future<Output = io::Result<()>>,
@@ -237,7 +247,7 @@ async fn enroll_until_done<Code>(
 where
     Code: Future<Output = io::Result<Option<String>>>,
 {
-    let handoff = match private_open::open_private(&handle.enroll_url(), opener) {
+    let handoff = match mode.open(&handle.enroll_url(), opener) {
         Ok(handoff) => handoff,
         Err(error) => {
             tracing::debug!(
@@ -256,7 +266,7 @@ where
         () = &mut interrupt => None,
     };
     stop(handle).await;
-    if let Err(error) = handoff.close() {
+    if let Err(error) = handoff.map(private_open::PrivateOpen::close).transpose() {
         tracing::debug!(
             error.kind = ?error.kind(),
             "approval credential enrollment: redirect file cleanup failed"
@@ -359,8 +369,12 @@ fn startup_notice(profile: &str) -> String {
     clippy::print_stderr,
     reason = "CLI binary intentional guidance; stdout stays JSON-only"
 )]
-fn print_startup(profile: &str) {
-    eprintln!("{}", startup_notice(profile));
+fn print_startup(profile: &str, open_by_operator: bool) {
+    if open_by_operator {
+        eprintln!("Create the passkey in your browser, then type the code the page shows here.");
+    } else {
+        eprintln!("{}", startup_notice(profile));
+    }
 }
 
 #[allow(
@@ -372,14 +386,14 @@ fn print_note(note: &str) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     #![allow(
         clippy::unwrap_used,
         clippy::expect_used,
         clippy::panic,
         reason = "test-only; panics acceptable in unit tests"
     )]
-    use std::path::{Path, PathBuf};
+    use crate::common::test_support::tree;
 
     use clap::Parser;
     use stellar_agent_approval_ui::operator_enroll::test_support::{
@@ -431,6 +445,19 @@ mod tests {
     /// asserting that the server stopped and the redirect file and its
     /// directory are gone.
     async fn case(typing: Typing, timeout: Duration) -> (EnrollmentEnd, SoftwareRegistrar, String) {
+        case_with_mode(
+            typing,
+            timeout,
+            crate::common::mainnet_presence::OpenMode::Private,
+        )
+        .await
+    }
+
+    async fn case_with_mode(
+        typing: Typing,
+        timeout: Duration,
+        mode: crate::common::mainnet_presence::OpenMode,
+    ) -> (EnrollmentEnd, SoftwareRegistrar, String) {
         let (handle, url, token) = start().await;
         let addr = handle.local_addr();
         let registrar = SoftwareRegistrar::new([0x21; 32], vec![0x5a; 20]);
@@ -448,6 +475,16 @@ mod tests {
             let token = token.clone();
             async move {
                 let client = EnrollmentClient::connect(addr, &token).await.unwrap();
+                let second = stellar_agent_approval_ui::operator_enroll::test_support::request(
+                    addr,
+                    "GET",
+                    &format!("/bootstrap/{token}"),
+                    &[],
+                    None,
+                )
+                .await
+                .unwrap();
+                assert_eq!(second.status, 404);
                 let (reply, builder) = client.register_response(registrar, "laptop").await.unwrap();
                 assert_eq!(reply.status, 200, "{reply:?}");
                 let code = builder.confirmation_code_for(EnrollmentPurpose::MainnetApproval);
@@ -469,7 +506,15 @@ mod tests {
         };
         let ceremony = enroll_until_done(
             handle,
-            probe.opener(Ok(())),
+            mode,
+            |url| {
+                assert_eq!(
+                    mode,
+                    crate::common::mainnet_presence::OpenMode::Private,
+                    "operator-open launches no browser"
+                );
+                probe.opener(Ok(()))(url)
+            },
             timeout,
             std::future::pending(),
             read_code,
@@ -483,31 +528,99 @@ mod tests {
             std::net::TcpStream::connect(addr).is_err(),
             "the server stopped"
         );
-        let file = probe.redirect_file();
-        assert!(!probe.launched()[0].contains(&token));
+        if mode == crate::common::mainnet_presence::OpenMode::Private {
+            let file = probe.redirect_file();
+            assert!(!probe.launched()[0].contains(&token));
+            assert!(!file.exists() && !file.parent().unwrap().exists());
+        } else {
+            assert!(probe.launched().is_empty());
+        }
         assert!(!url.is_empty());
-        assert!(!file.exists() && !file.parent().unwrap().exists());
         (end, registrar, code_rx.await.unwrap())
     }
 
-    /// Every path under `root` with its bytes, sorted.
-    fn tree(root: &Path) -> Vec<(PathBuf, Vec<u8>)> {
-        fn walk(root: &Path, dir: &Path, out: &mut Vec<(PathBuf, Vec<u8>)>) {
-            for entry in std::fs::read_dir(dir).unwrap() {
-                let path = entry.unwrap().path();
-                if path.is_dir() {
-                    out.push((path.strip_prefix(root).unwrap().to_path_buf(), Vec::new()));
-                    walk(root, &path, out);
-                } else {
-                    let bytes = std::fs::read(&path).unwrap();
-                    out.push((path.strip_prefix(root).unwrap().to_path_buf(), bytes));
-                }
-            }
+    async fn operator_enrollment() {
+        let (end, registrar, _) = case_with_mode(
+            Typing::PageCode,
+            Duration::from_secs(5),
+            crate::common::mainnet_presence::OpenMode::Operator,
+        )
+        .await;
+        let (exit, envelope) = rendered(end);
+        assert_eq!(exit, 0);
+        assert_eq!(
+            envelope["data"]["credential_id_b64url"],
+            registrar.credential_id_b64url()
+        );
+        assert!(
+            envelope["data"]["policy_entry_toml"]
+                .as_str()
+                .unwrap()
+                .contains("credential_id_b64url")
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn credential_open_by_operator_prints_url_once() {
+        use crate::common::test_support::{assert_url_output, capture};
+        if let Some((stdout, stderr)) = capture("credential_open_by_operator_prints_url_once") {
+            assert_url_output(&stdout, &stderr);
+            return;
         }
-        let mut out = Vec::new();
-        walk(root, root, &mut out);
-        out.sort();
-        out
+        operator_enrollment().await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn credential_open_by_operator_launches_no_browser() {
+        operator_enrollment().await;
+    }
+
+    pub(crate) async fn operator_expiry_and_cancellation() {
+        use crate::common::mainnet_presence::OpenMode;
+        let (end, _, _) = case_with_mode(
+            Typing::Nothing,
+            Duration::from_millis(200),
+            OpenMode::Operator,
+        )
+        .await;
+        assert!(matches!(end, EnrollmentEnd::Expired));
+        let (end, _, _) = case_with_mode(
+            Typing::OtherCode,
+            Duration::from_secs(5),
+            OpenMode::Operator,
+        )
+        .await;
+        assert!(matches!(end, EnrollmentEnd::Mismatch));
+        for cancel in [false, true] {
+            let (handle, _, _) = start().await;
+            let addr = handle.local_addr();
+            let result = tokio::time::timeout(
+                Duration::from_secs(2),
+                enroll_until_done(
+                    handle,
+                    OpenMode::Operator,
+                    |_| panic!("no opener"),
+                    Duration::from_millis(200),
+                    async {
+                        if cancel {
+                            Ok(())
+                        } else {
+                            std::future::pending().await
+                        }
+                    },
+                    || async { panic!("no terminal prompt before registration") },
+                ),
+            )
+            .await
+            .expect("enrollment deadline and interruption remain bounded");
+            assert!(matches!(
+                (cancel, result),
+                (true, EnrollmentEnd::Canceled) | (false, EnrollmentEnd::Expired)
+            ));
+            assert!(std::net::TcpStream::connect(addr).is_err());
+        }
     }
 
     /// The rendered envelope of `end`, with the exit code.
@@ -717,6 +830,7 @@ mod tests {
             Duration::from_secs(30),
             enroll_until_done(
                 handle,
+                crate::common::mainnet_presence::OpenMode::Private,
                 probe.opener(Ok(())),
                 Duration::from_secs(3600),
                 probe.interrupt(),
@@ -742,6 +856,7 @@ mod tests {
             Duration::from_secs(30),
             enroll_until_done(
                 handle,
+                crate::common::mainnet_presence::OpenMode::Private,
                 probe.opener(Err(io::Error::other("no browser"))),
                 Duration::from_secs(3600),
                 std::future::pending(),

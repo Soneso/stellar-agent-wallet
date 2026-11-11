@@ -35,6 +35,8 @@ shipping a `stellar-agent` CLI and a `stellar-agent-mcp` MCP server.
   key-rotation runbook.
 - [Remote approval](remote-approval.md): approving or rejecting pending
   actions from another device over TLS with a passkey, without SSH.
+- [Dedicated wallet user](dedicated-user.md): account isolation, provisioning,
+  operator-open approval, and deployment validation.
 - [Agent delegation](agent-delegation.md): scoping an autonomous agent to one
   contract under a spending cap, with its own revocable Ed25519 key.
 

@@ -105,6 +105,31 @@ data carries the `approval_nonce`.
 Wire codes are stable and closed-set. Treat the code as the contract; the message
 is human-facing detail and may change.
 
+## Dedicated wallet user
+
+A non-admin wallet account separates its files and platform keyring from
+operator processes. Root-owned wrappers constrain delegated commands and
+construct a clean environment. The fixed profile is `mainnet`.
+Wallet-user code can read keys while the keyring is unlocked.
+Unlock lasts until reboot or explicit lock; the operator unlocks after each boot.
+macOS behavior is validated by the real-host run.
+
+`profile policy-check` validates unsigned stdin without keyring or pin access.
+`--origin` exits 0 for local-only, 3 for a declared origin, and 65 for invalid input.
+Origin and certificate pin must appear together, including before signing.
+`profile apply-fragment` replaces allowed provisioning fields only after loader validation.
+Its final stderr line lists credential roles; refusal preserves the profile bytes.
+
+Mainnet approval offers `--open-by-operator` on serve, credential enrollment,
+and one-shot approval. It prints one single-use URL on stderr and creates
+no browser handoff. Presence verification, expiry, and enrollment codes remain required.
+An installed body declaring a signed origin refuses before ceremony resources
+with `approval.origin_signed_remote`, even before signing.
+Use the signed-origin deployment forms only with integrated listener support.
+
+See the public dedicated-user deployment page and its host validation record
+before granting the wrappers through sudoers.
+
 ## Self-custody and the platform keyring
 
 Keys are never stored in configuration. A profile is a per-environment TOML

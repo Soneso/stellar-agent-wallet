@@ -742,6 +742,38 @@ Mainnet setup runs `enroll-signer`, `enroll-owner-key`, `sign-policy`,
 `bind-signer`, then `enable-mainnet`. Existing mainnet enrollments need
 `bind-signer` once before signing or starting an enabled MCP server.
 
+### `profile policy-check`
+
+```bash
+stellar-agent profile policy-check --profile mainnet < policy.toml
+stellar-agent profile policy-check --origin --profile mainnet < policy.toml
+```
+
+Reads stdin and validates schema, scope, and network against the reconciled profile.
+It verifies no signature, reads no policy pin or keyring entry, and writes nothing.
+A present mainnet table receives bootstrap validation: origin and pin must appear together.
+Stdout carries one JSON envelope. Valid input exits 0.
+With `--origin`, valid input declaring an origin exits 3, signed or unsigned.
+Invalid input exits 65 with its policy code. Profile access and input errors exit 1.
+
+### `profile apply-fragment`
+
+```bash
+stellar-agent profile apply-fragment --profile mainnet < providers.toml
+```
+
+Accepts only `oracle_provider_url`, `providers`, and `remote_approval`.
+Each supplied value replaces the whole stored value; omitted top-level fields remain.
+The candidate passes the profile loader before an atomic rename.
+Unrelated fields, comments, and remote TLS paths stay in the document.
+The file is mode 0600. Runtime overlays never become stored fields.
+
+Success exits 0 with one JSON envelope. The last stderr line is
+`credential-roles:`, followed by credential-bearing roles in `primary secondary oracle` order.
+Refusal exits 65 with one stderr line `refused: <code>` and an error envelope.
+Loader refusals retain their validation codes. Protected keys use
+`profile.fragment_key_refused`. Profile access and I/O failures exit 1.
+
 ### `profile enable-mainnet`
 
 ```bash
@@ -1046,8 +1078,12 @@ The operator-side half of the approval spine. When a signing-adjacent action nee
 
 State-changing (records an HMAC attestation, or for a toolset first-invoke gate mints a toolset grant and consumes the entry).
 
+Operator-open requires a local-only body and preserves verified presence and expiry.
+A signed origin refuses before store access with `approval.origin_signed_remote`.
+
 | Flag | Meaning |
 |---|---|
+| `--open-by-operator` | Mainnet only. Prints the presence URL once on stderr; conflicts with `--yes`. |
 | `--id <NONCE>` (required in this form) | Approval nonce from the agent surface's simulate response |
 | `--profile <NAME>` | Profile whose attestation key + pending-approval store to use (resolves `--profile` → env → `default`) |
 | `--yes` | Non-interactive auto-approve on a testnet profile; the summary is still printed. A mainnet profile refuses it before store access with `approve.yes_refused_on_mainnet` |
@@ -1094,8 +1130,14 @@ stellar-agent approve list --profile default --output table
 
 Binds a loopback-only HTTP server with a local web UI for the pending-approval queue. The operator can review and approve or reject entries in a browser. Runs until Ctrl-C.
 
+Operator-open requires no display and launches no browser or private handoff.
+The installed body is checked before keyring initialization and binding.
+A signed origin refuses with `approval.origin_signed_remote`; an invalid body retains its policy code.
+Shutdown prints one JSON envelope in operator-open mode.
+
 | Flag | Meaning | Default |
 |---|---|---|
+| `--open-by-operator` | Mainnet only. Prints the bootstrap URL once on stderr; conflicts with `--remote` and `--no-open`. | `false` |
 | `--profile <NAME>` | Profile whose store and attestation key to use | `STELLAR_AGENT_PROFILE`, else `default` |
 | `--port <PORT>` | TCP port to bind on `127.0.0.1`, and on `[::1]` too for a mainnet profile; `0` picks an OS-assigned port | `0` |
 | `--no-open` | Print the bootstrap URL instead of opening a browser | `false` |
@@ -1173,10 +1215,23 @@ To revoke a credential, remove its id from `[remote_approval] allowed_credential
 
 ### `approve credential enroll`
 
-Enrolls a WebAuthn approval credential for the owner-signed mainnet policy and prints its `mainnet.approval_credentials` entry. Writes nothing: the credential approves mainnet consent only after the owner adds the entry and signs the policy with `profile sign-policy` (see [Approval credentials](profiles-and-keys.md#approval-credentials)). Needs a terminal on stdin and stderr and a local browser; the profile must be a persisted mainnet profile, enabled or not. The page at `http://localhost:<port>` creates a passkey with relying-party ID `localhost`, user presence and user verification, and shows a 16-hex-digit code; type it at the terminal before the deadline. The bearer URL is never printed.
+Enrolls a WebAuthn approval credential for the owner-signed mainnet policy and prints its `mainnet.approval_credentials` entry.
+The command writes nothing. Add the entry and sign the policy with `profile sign-policy` before using the credential for consent.
+See [Approval credentials](profiles-and-keys.md#approval-credentials).
+The command needs a terminal on stdin and stderr. Default mode also needs a local browser.
+The profile must be a persisted mainnet profile, enabled or not.
+The page at `http://localhost:<port>` creates a passkey with relying-party ID `localhost`, user presence, and user verification.
+Type its 16-hex-digit code at the terminal before the deadline.
+Default mode keeps the bearer URL out of terminal output.
+
+Operator-open retains the terminal code, timeout, cancellation, and credential export.
+Its installed-body guard refuses a signed origin before binding with `approval.origin_signed_remote`.
+All operator-open URL lines read `Open this URL in your browser: <url>`.
+Stdout remains one JSON envelope. The token is single-use; keep stderr private.
 
 | Flag | Meaning |
 |---|---|
+| `--open-by-operator` | Prints the local mainnet enrollment URL once on stderr, with no browser launch or private handoff. |
 | `--profile <NAME>` | Required. The persisted mainnet profile |
 | `--label <LABEL>` | Page label pre-fill; absent from the output |
 | `--timeout-seconds <SECS>` | Deadline for registration and code, 1 to 600 (default 300) |
