@@ -578,6 +578,51 @@ the approval / toolset-grant store persistence tests, scoped to
 `audit_log`, the approval store, or file-locking behavior should expect this
 job to be the deciding signal.
 
+### Platform keyring and deployment scripts (CI-only)
+
+CI runs a `platform-keyring` job on an Ubuntu runner. It starts GNOME Keyring
+in a private D-Bus session and runs `keyring_platform_roundtrip` in
+`stellar-agent-network`. The test writes, reads, and deletes one entry through
+the Secret Service store that the binaries register. It is ignored by default,
+because a local run writes to the keyring of the person at the machine, so a
+local check only builds it:
+
+```sh
+cargo test -p stellar-agent-network --test keyring_platform --no-run
+```
+
+A `deploy-scripts` job runs on Ubuntu and on macOS. Its Linux leg runs
+shellcheck on the scripts in `scripts/deploy/`, and both legs run the
+deployment harness:
+
+```sh
+bash scripts/deploy/test-deploy.sh
+```
+
+The harness renders the wrapper and sudoers templates into a temporary root
+and runs them against logging stubs. It needs bash, python3, and perl, and no
+root, sudo, or network. Each host checks the wrappers against its own `stat`,
+`ls`, and `pgrep`. The preflight runs shellcheck and the harness when a file
+under `scripts/deploy/` changes.
+
+The `providers` form of `provision` reads a TOML fragment on standard input.
+It accepts `oracle_provider_url` only on one top-level line, in double quotes
+without a backslash or in single quotes, optionally followed by a comment:
+
+```toml
+oracle_provider_url = "https://oracle.example/v1" # production oracle
+```
+
+A multi-line string refuses with the reason that the value is a multi-line
+string. An escape sequence refuses with the reason that the value holds an
+escape sequence. Both reasons say how to write the value.
+
+On macOS, `cli-launch keychain-access-lists` runs
+`security dump-keychain -a` on the wallet account's login keychain. It is a
+tier B form, which accepts the profile absent or account-owned, is exempt
+from the mainnet state check, and refuses any further token with exit 64. The command prints item attributes and access
+lists, never secret data.
+
 ## Test tiers
 
 Tests fall into two tiers, selected by per-crate Cargo features.

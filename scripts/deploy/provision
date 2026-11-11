@@ -1,0 +1,561 @@
+#!/bin/bash -p
+# Runs the provisioning forms of the wallet CLI as the dedicated wallet
+# account.
+#
+# The operator calls it through sudo:
+#   sudo -n -u @ACCOUNT@ @PREFIX@/provision <form>
+#
+# Forms (tier, eligibility; S marks a secret prompt):
+#   profile init --network mainnet --rpc-url <url>   B, exempt
+#   profile rotate-audit-key                         P, Y
+#   profile enroll-owner-key                         P, Y, S
+#   profile enroll-signer                            P, N, S
+#   profile bind-signer                              P, N, S
+#   profile rotate-nonce-key                         P, Y
+#   profile rotate-attestation-key                   P, Y
+#   providers                                        P, N
+#   provider-credential --role <role>                P, Y
+#   remote-config --bind <addr> --rp-id <host>       P, Y
+#   remote-cert                                      P, Y
+#   remote-key                                       P, Y
+#   policy-install                                   P, Y
+#   profile sign-policy                              P, Y, S
+#   profile enable-mainnet                           P, N
+#
+# providers, remote-cert, remote-key, and policy-install read their input on
+# standard input, so the wallet account needs no read access to operator
+# files. Prompts read from the operator's terminal without echo.
+#
+# A providers fragment sets oracle_provider_url on one top-level line, as
+#   oracle_provider_url = "https://oracle.example/v1"
+# or in single quotes, optionally with a trailing comment. A multi-line
+# string or an escape sequence in the value refuses.
+#
+# This file is a template. bootstrap.sh renders it into a self-contained
+# installed file and fills each placeholder with a fixed value. The
+# installed file reads no path, root, or switch from the environment.
+
+WRAPPER=provision
+PREFIX='@PREFIX@'
+
+# --- shared wrapper checks: begin ---
+# The text up to the end marker is identical in the three wrappers.
+
+# Privileged mode (-p) ignores BASH_ENV, SHELLOPTS, and exported functions.
+# A wrapper whose environment holds anything beyond what bash itself sets
+# runs itself again under an empty environment.
+ENV_TOOL='@ENV@'
+IFS=$' \t\n'
+for exported in $(compgen -e); do
+  case "$exported" in
+    PWD | SHLVL | _) ;;
+    *) exec "$ENV_TOOL" -i /bin/bash -p "$PREFIX/$WRAPPER" ${1+"$@"} ;;
+  esac
+done
+unset exported
+export -n PWD SHLVL
+unset OLDPWD
+set -euo pipefail
+umask 077
+
+PLATFORM='@PLATFORM@'
+ACCOUNT='@ACCOUNT@'
+ACCOUNT_HOME='@HOME@'
+DATA_ROOT='@DATA_ROOT@'
+PROFILE='@PROFILE@'
+PROJECT_FILE='@PROJECT_FILE@'
+TTY='@TTY@'
+# shellcheck disable=SC2034 # Each wrapper uses a subset of these names.
+{
+  CLI="$PREFIX/bin/stellar-agent"
+  MCP="$PREFIX/bin/stellar-agent-mcp"
+  CLI_PATTERN='^@PREFIX_RE@/bin/stellar-agent( |$)'
+  MCP_PATTERN='^@PREFIX_RE@/bin/stellar-agent-mcp( |$)'
+  PROFILE_FILE="$DATA_ROOT/profiles/$PROFILE.toml"
+  POLICY_FILE="$DATA_ROOT/policies/$PROFILE.toml"
+  RUN_DIR="$ACCOUNT_HOME/run"
+}
+# shellcheck disable=SC2123 # The wrapper sets its own search path.
+PATH='@PATH@'
+export PATH
+
+# Prints one refusal line from the fixed reason list and exits with $1.
+# A reason never holds a caller token.
+refuse() {
+  printf 'stellar-agent-wrapper: refused: %s\n' "$2" >&2
+  exit "$1"
+}
+
+# Succeeds when the arguments after the first equal the space-separated
+# words of the first, one by one.
+form_is() {
+  local IFS=' ' want word index=0
+  set -f
+  # shellcheck disable=SC2206 # The form words split on spaces by design.
+  want=($1)
+  set +f
+  shift
+  [ "$#" -eq "${#want[@]}" ] || return 1
+  for word in "$@"; do
+    [ "$word" = "${want[index]}" ] || return 1
+    index=$((index + 1))
+  done
+}
+
+# Succeeds when $1 is a project name: one or more characters without
+# whitespace, quotes, or control characters.
+valid_project() {
+  local pattern='^[^[:space:][:cntrl:]"'"'"']+$'
+  [[ "$1" =~ $pattern ]]
+}
+
+# Prints the owner UID and permission bits of $1, as "<uid> <octal mode>".
+owner_and_mode() {
+  case "$PLATFORM" in
+    macos) stat -f '%u %Lp' "$1" ;;
+    linux) stat -c '%u %a' "$1" ;;
+  esac
+}
+
+# Succeeds when $1 carries an extended ACL entry. Only macOS checks ACLs.
+has_acl() {
+  local listing first
+  [ "$PLATFORM" = macos ] || return 1
+  listing=$(ls -lde "$1") || return 0
+  first=${listing%%$'\n'*}
+  first=${first%% *}
+  case "$first" in
+    *+*) return 0 ;;
+  esac
+  [ "$listing" != "${listing%%$'\n'*}" ]
+}
+
+# Refuses unless $1 exists, is no symlink, belongs to the wallet account,
+# has mode $2, and carries no extended ACL. $3 names it in the refusal.
+require_private() {
+  local facts
+  if [ -L "$1" ]; then
+    refuse 65 "$3 is a symlink"
+  fi
+  if [ ! -e "$1" ]; then
+    refuse 65 "$3 is missing"
+  fi
+  facts=$(owner_and_mode "$1") || refuse 65 "$3 cannot be inspected"
+  if [ "${facts%% *}" != "$ACCOUNT_UID" ]; then
+    refuse 65 "$3 is not owned by the wallet account"
+  fi
+  if [ "${facts#* }" != "$2" ]; then
+    refuse 65 "$3 does not have mode 0$2"
+  fi
+  if has_acl "$1"; then
+    refuse 65 "$3 carries an access control list"
+  fi
+}
+
+# Runs the ownership checks of tier $1: B accepts the profile absent or
+# account-owned; P and R require it account-owned with mode 0600.
+require_tier() {
+  local facts
+  require_private "$ACCOUNT_HOME" 700 "the home directory"
+  require_private "$DATA_ROOT" 700 "the data root"
+  case "$1" in
+    B)
+      if [ -L "$PROFILE_FILE" ]; then
+        refuse 65 "the profile is a symlink"
+      fi
+      if [ -e "$PROFILE_FILE" ]; then
+        facts=$(owner_and_mode "$PROFILE_FILE") || refuse 65 "the profile cannot be inspected"
+        if [ "${facts%% *}" != "$ACCOUNT_UID" ]; then
+          refuse 65 "the profile is not owned by the wallet account"
+        fi
+      fi
+      ;;
+    P | R) require_private "$PROFILE_FILE" 600 "the profile" ;;
+  esac
+}
+
+# Runs a native command with the built environment only: env drops the
+# variables bash adds for a child.
+native() {
+  "$ENV_TOOL" -u _ -u SHLVL "$@"
+}
+
+# Replaces the wrapper with a native command, so its signals and exit code
+# are the native command's.
+exec_native() {
+  exec "$ENV_TOOL" -u _ -u SHLVL "$@"
+}
+
+# Runs the eligibility predicate for eligibility $1: E skips it, Y admits
+# both states, N admits only the absent state.
+require_eligible() {
+  local rc=0 state
+  [ "$1" != E ] || return 0
+  native "$CLI" profile enable-mainnet --profile "$PROFILE" --state </dev/null >/dev/null 2>&1 || rc=$?
+  case "$rc" in
+    0) state=enabled ;;
+    3) state=absent ;;
+    *) refuse 65 "the mainnet state is unreadable; run cli-launch profile enable-mainnet --state" ;;
+  esac
+  if [ "$1" = N ] && [ "$state" = enabled ]; then
+    refuse 65 "mainnet is enabled, and this form runs only before enablement"
+  fi
+}
+
+# Refuses with 66 while a wallet-account process whose command line starts
+# with the installed binary of pattern $1 runs. $2 names it.
+refuse_while_running() {
+  local rc=0
+  pgrep -u "$ACCOUNT" -f "$1" >/dev/null 2>&1 || rc=$?
+  case "$rc" in
+    0) refuse 66 "$2 is running" ;;
+    1) ;;
+    *) refuse 66 "the process check failed" ;;
+  esac
+}
+
+# Reads one line from the operator's terminal without echo into SECRET.
+# $1 is the prompt, which names no caller token. The prompt and the line
+# break after the answer go to the terminal, so standard error carries no
+# more than the one refusal line.
+prompt_secret() {
+  if [ ! -e "$TTY" ] || ! { : <"$TTY" && : >>"$TTY"; } 2>/dev/null; then
+    refuse 65 "no terminal is available for the prompt"
+  fi
+  if ! { printf '%s: ' "$1" >>"$TTY"; } 2>/dev/null; then
+    refuse 65 "the terminal does not take the prompt"
+  fi
+  SECRET=""
+  IFS= read -r -s SECRET <"$TTY" || true
+  if ! { printf '\n' >>"$TTY"; } 2>/dev/null; then
+    refuse 65 "the terminal does not take the prompt"
+  fi
+  if [ -z "$SECRET" ]; then
+    refuse 65 "the prompt received no value"
+  fi
+}
+
+# Refuses unless the wrapper runs as the wallet account with a valid project
+# file, then exports the built environment and enters the home directory.
+prepare_account() {
+  local project
+  if [ "$(id -un)" != "$ACCOUNT" ]; then
+    refuse 65 "the wrapper does not run as the wallet account"
+  fi
+  ACCOUNT_UID=$(id -u)
+  if [ -L "$PROJECT_FILE" ] || [ ! -f "$PROJECT_FILE" ]; then
+    refuse 65 "the project file is missing"
+  fi
+  project=$(cat "$PROJECT_FILE") || refuse 65 "the project file is unreadable"
+  if ! valid_project "$project"; then
+    refuse 65 "the project file does not hold one project name"
+  fi
+  HOME=$ACCOUNT_HOME
+  TMPDIR="$ACCOUNT_HOME/tmp"
+  STELLAR_AGENT_PROJECT=$project
+  export HOME TMPDIR STELLAR_AGENT_PROJECT
+  if [ "$PLATFORM" = linux ]; then
+    DBUS_SESSION_BUS_ADDRESS="unix:path=$RUN_DIR/bus"
+    GNOME_KEYRING_CONTROL="$RUN_DIR/keyring"
+    export DBUS_SESSION_BUS_ADDRESS GNOME_KEYRING_CONTROL
+  fi
+  cd "$ACCOUNT_HOME" 2>/dev/null || refuse 65 "the home directory is not accessible"
+}
+# --- shared wrapper checks: end ---
+
+# The one variable that carries a prompted secret to a native verb. The
+# shell exports it after the clean start, so the value never becomes a
+# process argument.
+SECRET_VARIABLE=STELLAR_AGENT_PROVISION_SECRET
+REMOTE_DIR="$DATA_ROOT/remote"
+POLICY_DIR="$DATA_ROOT/policies"
+# The argument grammars of the forms.
+URL_PATTERN='^https://[^"[:space:][:cntrl:]'"'"'\\]+$'
+ADDRESS_PATTERN='^[][0-9A-Fa-f.:]+:[0-9]{1,5}$'
+HOST_PATTERN='^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*$'
+STAGED=""
+trap 'if [ -n "$STAGED" ]; then rm -f "$STAGED"; fi' EXIT
+
+# Prompts for a secret and replaces the wrapper with native verb "$@",
+# which reads it from SECRET_VARIABLE.
+exec_with_secret() {
+  prompt_secret "$1"
+  shift
+  export STELLAR_AGENT_PROVISION_SECRET="$SECRET"
+  SECRET=""
+  exec_native "$@"
+}
+
+# Writes standard input to a new private file in directory $1 and sets
+# STAGED to its path. $2 names the directory in a refusal.
+stage_stdin() {
+  if [ ! -e "$1" ] && [ ! -L "$1" ]; then
+    mkdir -m 700 "$1"
+  fi
+  require_private "$1" 700 "$2"
+  STAGED=$(mktemp "$1/.incoming.XXXXXX") || refuse 65 "a temporary file cannot be created"
+  if ! cat >"$STAGED"; then
+    refuse 65 "standard input cannot be read"
+  fi
+  chmod 600 "$STAGED"
+  if [ ! -s "$STAGED" ]; then
+    refuse 65 "standard input is empty"
+  fi
+}
+
+# Renames the staged file to $1, replacing any installed file at once. $2
+# names the destination in a refusal. A destination that is a directory,
+# or a symlink to one, refuses before the rename. The rename is a plain
+# rename(2) through perl, which replaces a symlink itself and never
+# descends into a directory. A directory that appears after the check
+# fails the rename, and the exit trap removes the staged file.
+install_staged() {
+  if [ -d "$1" ]; then
+    refuse 65 "$2 is a directory"
+  fi
+  if ! perl -e 'rename($ARGV[0], $ARGV[1]) or exit 1' "$STAGED" "$1" 2>/dev/null; then
+    refuse 65 "$2 was not replaced, and the installed file is unchanged"
+  fi
+  STAGED=""
+}
+
+# Sets OPEN to the delimiter of a multi-line string that TOML line $1
+# opens and leaves open, or to nothing. A comment line opens none.
+multiline_opened() {
+  local delimiter rest count
+  local comment='^[[:space:]]*#'
+  OPEN=""
+  if [[ "$1" =~ $comment ]]; then
+    return 0
+  fi
+  for delimiter in '"""' "'''"; do
+    rest=$1
+    count=0
+    while [[ "$rest" == *"$delimiter"* ]]; do
+      rest=${rest#*"$delimiter"}
+      count=$((count + 1))
+    done
+    if [ $((count % 2)) -eq 1 ]; then
+      OPEN=$delimiter
+      return 0
+    fi
+  done
+}
+
+# Refuses unless TOML fragment $1 sets the top-level key
+# oracle_provider_url to an https URL. The accepted value is one line: a
+# basic string in double quotes without a backslash, or a literal string
+# in single quotes, optionally followed by a comment. The key is bare or
+# quoted. A multi-line string and an escape sequence refuse with their own
+# reasons, since only the one-line form shows the scheme as written. The
+# top level ends at the first table header; lines inside a multi-line
+# string of another key are no keys.
+require_https_oracle() {
+  local line rest found=0 OPEN=""
+  local header='^[[:space:]]*\[\[?[[:space:]]*[A-Za-z0-9_"'"'"'-][^][]*\]\]?[[:space:]]*(#.*)?$'
+  local key='^[[:space:]]*(oracle_provider_url|"oracle_provider_url"|'"'"'oracle_provider_url'"'"')[[:space:]]*='
+  local basic='^[[:space:]]*"https://[^"[:space:][:cntrl:]\\]+"[[:space:]]*(#.*)?$'
+  local literal='^[[:space:]]*'"'"'https://[^'"'"'[:space:][:cntrl:]\\]+'"'"'[[:space:]]*(#.*)?$'
+  local multiline='^[[:space:]]*("""|'"'''"')'
+  local escaped='^[[:space:]]*"[^"]*[\]'
+  while IFS= read -r line; do
+    if [ -n "$OPEN" ]; then
+      case "$line" in
+        *"$OPEN"*) OPEN="" ;;
+      esac
+      continue
+    fi
+    if [[ "$line" =~ $header ]]; then
+      break
+    fi
+    if [[ "$line" =~ $key ]]; then
+      rest=${line#*=}
+      if [[ "$rest" =~ $multiline ]]; then
+        refuse 65 "the fragment's oracle_provider_url is a multi-line string; write it on one line in double or single quotes"
+      fi
+      if [[ "$rest" =~ $escaped ]]; then
+        refuse 65 "the fragment's oracle_provider_url holds an escape sequence; write the URL without backslashes"
+      fi
+      if [[ ! "$rest" =~ $basic ]] && [[ ! "$rest" =~ $literal ]]; then
+        refuse 65 "the fragment's oracle_provider_url is not an https URL"
+      fi
+      found=1
+      continue
+    fi
+    multiline_opened "$line"
+  done < <(printf '%s\n' "$1")
+  if [ "$found" -ne 1 ]; then
+    refuse 65 "the fragment has no top-level https oracle_provider_url"
+  fi
+}
+
+# Hands fragment $1 to native apply-fragment on standard input and reads
+# only its last standard error line; its other output stays with the
+# wrapper. Sets ROLES to the credential roles of an applied fragment.
+apply_fragment() {
+  local output rc=0 last
+  local applied='^credential-roles:(( (primary|secondary|oracle))*)$'
+  output=$(native "$CLI" profile apply-fragment --profile "$PROFILE" < <(printf '%s\n' "$1") 2>&1 >/dev/null) || rc=$?
+  last=${output##*$'\n'}
+  case "$rc" in
+    0)
+      if [[ ! "$last" =~ $applied ]]; then
+        refuse 65 "profile apply-fragment reported no credential roles"
+      fi
+      ROLES=${BASH_REMATCH[1]}
+      ;;
+    65) refuse 65 "the fragment was refused, and the profile is unchanged" ;;
+    *) refuse 65 "profile apply-fragment failed" ;;
+  esac
+}
+
+# Prompts for the credential of role $1 and enrolls it through native
+# enroll-rpc-credential, which reads it on standard input. With $2 set to
+# last, the wrapper becomes the native verb; an earlier call keeps its
+# output, so a failure shows only the refusal line.
+enroll_credential() {
+  local rc=0
+  prompt_secret "RPC credential for the $1 provider"
+  if [ "${2-}" = last ]; then
+    exec_native "$CLI" profile enroll-rpc-credential --role "$1" --stdin --force --profile "$PROFILE" \
+      < <(printf '%s\n' "$SECRET")
+  fi
+  native "$CLI" profile enroll-rpc-credential --role "$1" --stdin --force --profile "$PROFILE" \
+    < <(printf '%s\n' "$SECRET") >/dev/null 2>&1 || rc=$?
+  SECRET=""
+  if [ "$rc" -ne 0 ]; then
+    refuse 65 "the provider credential was not enrolled"
+  fi
+}
+
+FORM=""
+TIER=""
+ELIGIBILITY=""
+ARGUMENT=""
+SECOND_ARGUMENT=""
+if [ "$#" -eq 6 ] && form_is "profile init --network mainnet --rpc-url" "$1" "$2" "$3" "$4" "$5"; then
+  if [[ ! "$6" =~ $URL_PATTERN ]]; then
+    refuse 64 "the RPC URL is not an https URL without whitespace, quotes, or backslashes"
+  fi
+  FORM=init TIER=B ELIGIBILITY=E ARGUMENT=$6
+elif form_is "profile rotate-audit-key" "$@"; then
+  FORM=rotate-audit-key TIER=P ELIGIBILITY=Y
+elif form_is "profile enroll-owner-key" "$@"; then
+  FORM=enroll-owner-key TIER=P ELIGIBILITY=Y
+elif form_is "profile enroll-signer" "$@"; then
+  FORM=enroll-signer TIER=P ELIGIBILITY=N
+elif form_is "profile bind-signer" "$@"; then
+  FORM=bind-signer TIER=P ELIGIBILITY=N
+elif form_is "profile rotate-nonce-key" "$@"; then
+  FORM=rotate-nonce-key TIER=P ELIGIBILITY=Y
+elif form_is "profile rotate-attestation-key" "$@"; then
+  FORM=rotate-attestation-key TIER=P ELIGIBILITY=Y
+elif form_is providers "$@"; then
+  FORM=providers TIER=P ELIGIBILITY=N
+elif [ "$#" -eq 3 ] && form_is "provider-credential --role" "$1" "$2"; then
+  case "$3" in
+    primary | secondary | oracle) ;;
+    *) refuse 64 "the role is not primary, secondary, or oracle" ;;
+  esac
+  FORM=provider-credential TIER=P ELIGIBILITY=Y ARGUMENT=$3
+elif [ "$#" -eq 5 ] && form_is "remote-config --bind" "$1" "$2" && [ "$4" = --rp-id ]; then
+  if [[ ! "$3" =~ $ADDRESS_PATTERN ]]; then
+    refuse 64 "the bind address does not match the address grammar"
+  fi
+  if [ "${#5}" -gt 253 ] || [[ ! "$5" =~ $HOST_PATTERN ]]; then
+    refuse 64 "the relying party id is not a lowercase DNS name"
+  fi
+  FORM=remote-config TIER=P ELIGIBILITY=Y ARGUMENT=$3 SECOND_ARGUMENT=$5
+elif form_is remote-cert "$@"; then
+  FORM=remote-cert TIER=P ELIGIBILITY=Y
+elif form_is remote-key "$@"; then
+  FORM=remote-key TIER=P ELIGIBILITY=Y
+elif form_is policy-install "$@"; then
+  FORM=policy-install TIER=P ELIGIBILITY=Y
+elif form_is "profile sign-policy" "$@"; then
+  FORM=sign-policy TIER=P ELIGIBILITY=Y
+elif form_is "profile enable-mainnet" "$@"; then
+  FORM=enable-mainnet TIER=P ELIGIBILITY=N
+fi
+if [ -z "$FORM" ]; then
+  refuse 64 "the form is not one of the listed forms"
+fi
+
+prepare_account
+require_tier "$TIER"
+require_eligible "$ELIGIBILITY"
+case "$FORM" in
+  init) exec_native "$CLI" profile init --network mainnet --rpc-url "$ARGUMENT" --profile "$PROFILE" ;;
+  rotate-audit-key) exec_native "$CLI" profile rotate-audit-key --profile "$PROFILE" ;;
+  enroll-owner-key)
+    exec_with_secret "Owner secret key" \
+      "$CLI" profile enroll-owner-key --secret-env "$SECRET_VARIABLE" --profile "$PROFILE"
+    ;;
+  enroll-signer)
+    exec_with_secret "Signer secret key" \
+      "$CLI" profile enroll-signer --secret-env "$SECRET_VARIABLE" --profile "$PROFILE"
+    ;;
+  bind-signer)
+    exec_with_secret "Owner secret key" \
+      "$CLI" profile bind-signer --owner-secret-env "$SECRET_VARIABLE" --profile "$PROFILE"
+    ;;
+  rotate-nonce-key) exec_native "$CLI" profile rotate-nonce-key --profile "$PROFILE" ;;
+  rotate-attestation-key) exec_native "$CLI" profile rotate-attestation-key --profile "$PROFILE" ;;
+  providers)
+    FRAGMENT=$(cat) || refuse 65 "standard input cannot be read"
+    if [ -z "$FRAGMENT" ]; then
+      refuse 65 "standard input is empty"
+    fi
+    require_https_oracle "$FRAGMENT"
+    apply_fragment "$FRAGMENT"
+    set -f
+    # shellcheck disable=SC2086 # The roles split on spaces by design.
+    set -- $ROLES
+    set +f
+    while [ "$#" -gt 1 ]; do
+      enroll_credential "$1"
+      shift
+    done
+    if [ "$#" -eq 1 ]; then
+      enroll_credential "$1" last
+    fi
+    exit 0
+    ;;
+  provider-credential) enroll_credential "$ARGUMENT" last ;;
+  remote-config)
+    apply_fragment "$(printf '%s\n' "[remote_approval]" "enabled = true" "bind = \"$ARGUMENT\"" \
+      "rp_id = \"$SECOND_ARGUMENT\"" "cert_path = \"$REMOTE_DIR/cert.pem\"" "key_path = \"$REMOTE_DIR/key.pem\"")"
+    exit 0
+    ;;
+  remote-cert)
+    stage_stdin "$REMOTE_DIR" "the remote directory"
+    if ! grep -q -e '-----BEGIN CERTIFICATE-----' "$STAGED"; then
+      refuse 65 "standard input is not a PEM certificate"
+    fi
+    install_staged "$REMOTE_DIR/cert.pem" "the remote certificate path"
+    exit 0
+    ;;
+  remote-key)
+    stage_stdin "$REMOTE_DIR" "the remote directory"
+    if ! grep -q -E -e '-----BEGIN ([A-Z]+ )?PRIVATE KEY-----' "$STAGED"; then
+      refuse 65 "standard input is not a PEM private key"
+    fi
+    install_staged "$REMOTE_DIR/key.pem" "the remote key path"
+    exit 0
+    ;;
+  policy-install)
+    stage_stdin "$POLICY_DIR" "the policy directory"
+    # policy-check speaks only through its exit code here; its diagnostics
+    # would carry text from the operator's file.
+    if ! native "$CLI" profile policy-check --profile "$PROFILE" <"$STAGED" >/dev/null 2>&1; then
+      refuse 65 "the policy did not pass profile policy-check, and the installed policy is unchanged"
+    fi
+    install_staged "$POLICY_FILE" "the installed policy path"
+    exit 0
+    ;;
+  sign-policy)
+    exec_with_secret "Policy signing secret key" \
+      "$CLI" profile sign-policy --secret-env "$SECRET_VARIABLE" --profile "$PROFILE"
+    ;;
+  enable-mainnet) exec_native "$CLI" profile enable-mainnet --profile "$PROFILE" ;;
+esac

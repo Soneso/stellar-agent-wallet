@@ -1,0 +1,355 @@
+#!/bin/bash
+# Records the dedicated-account deployment on a Linux host.
+#
+# Usage: validate-linux.sh --record <dir> [--rpc-url <url>] [--providers <file>]
+#          [--policy <file>] [--cert <file>] [--key <file>] [--bind <addr>]
+#          [--rp-id <host>]
+#
+# Runs as an unprivileged operator account after bootstrap.sh. It reaches
+# the wallet account only through "sudo -n -u stellar-agent <wrapper>" and
+# reads no secret itself: the wrappers prompt on the terminal. The record
+# directory must not exist; each measurement writes one entry file there.
+#
+# Entries: account, ownership, refusal-64, refusal-65, keychain-unlock,
+# keychain-lock, keychain-unlock-again, provisioning-order,
+# platform-read-write, refusal-66, mcp-stdio, cross-user-file-denial,
+# cross-user-keyring-denial, approval-round-trip, and daemon-reuse.
+#
+# Each entry holds the commands, their exit codes, their output, and a
+# status: ok, refused, failed, skipped, or "not available" when a command
+# or a native verb or option is missing. A read attempt on the wallet
+# account's keyring records failed when the read succeeds. It records
+# denied only on an access-denial error of D-Bus or the Secret Service on
+# the wallet account's bus, after this run enrolled the signer item. Any
+# other failure, such as a missing socket, an authentication error, or a
+# D-Bus autolaunch failure, records inconclusive with its text.
+set -euo pipefail
+
+# Fixed values.
+ACCOUNT=stellar-agent
+PREFIX=/usr/local/libexec/stellar-agent
+HOME_DIR=/var/lib/stellar-agent
+PROJECT_FILE=/usr/local/etc/stellar-agent/project
+SUDOERS_FILE=/etc/sudoers.d/stellar-agent
+SUDO=/usr/bin/sudo
+TTY_PATH=/dev/tty
+SETTLE_SECONDS=3
+RESPONSE_SECONDS=5
+SIGNER_SERVICE=stellar-agent-signer-mainnet
+# The texts with which the wallet account's bus or its Secret Service
+# refuses the asking account access.
+DENIAL_TEXT='Permission denied|org\.freedesktop\.DBus\.Error\.AccessDenied'
+# The texts of an authentication failure on the bus. A failed or
+# exhausted authentication can stem from mechanism negotiation, so it
+# shows no access denial.
+AUTH_ERROR_TEXT='org\.freedesktop\.DBus\.Error\.AuthFailed|Exhausted all available authentication mechanisms|[Aa]uthentication'
+
+DATA_ROOT="$HOME_DIR/.local/share/stellar-agent"
+BUS_ARGUMENT="--address=unix:path=$HOME_DIR/run/bus"
+RECORD="" RPC_URL="" PROVIDERS="" POLICY="" CERT="" KEY="" BIND="" RP_ID=""
+ENTRY_INDEX=0
+ENTRY=""
+SIGNER_PRESENT=no
+SIGNER_ENROLL_RC=""
+
+usage() {
+  echo "usage: validate-linux.sh --record <dir> [--rpc-url <url>] [--providers <file>] [--policy <file>] [--cert <file>] [--key <file>] [--bind <addr>] [--rp-id <host>]" >&2
+  exit 64
+}
+
+while [ "$#" -gt 0 ]; do
+  [ "$#" -ge 2 ] || usage
+  case "$1" in
+    --record) RECORD=$2 ;;
+    --rpc-url) RPC_URL=$2 ;;
+    --providers) PROVIDERS=$2 ;;
+    --policy) POLICY=$2 ;;
+    --cert) CERT=$2 ;;
+    --key) KEY=$2 ;;
+    --bind) BIND=$2 ;;
+    --rp-id) RP_ID=$2 ;;
+    *) usage ;;
+  esac
+  shift 2
+done
+[ -n "$RECORD" ] || usage
+if [ -e "$RECORD" ]; then
+  echo "validate-linux.sh: $RECORD exists; name a new record directory" >&2
+  exit 64
+fi
+mkdir -m 700 "$RECORD"
+
+# Starts entry $1: the next numbered file of the record directory.
+entry() {
+  ENTRY_INDEX=$((ENTRY_INDEX + 1))
+  ENTRY=$(printf '%s/%02d-%s.txt' "$RECORD" "$ENTRY_INDEX" "$1")
+  printf 'entry: %s\nhost: Linux\nstarted: %s\n' "$1" "$(date '+%Y-%m-%d %H:%M:%S')" >"$ENTRY"
+  printf '== %s\n' "$1"
+}
+
+# Appends a line to the current entry.
+note() {
+  printf '%s\n' "$*" >>"$ENTRY"
+}
+
+# Prints the status of a finished step from its exit code $1 and output
+# file $2. "not available" needs a positive sign that a native piece is
+# missing: the shell found no command, or the wallet binary reported the
+# verb or option unknown. Any other failure is refused or failed, and the
+# record keeps its text.
+status_of() {
+  if [ "$1" -eq 0 ]; then
+    echo ok
+  elif [ "$1" -eq 127 ] || grep -qE 'command not found|unrecognized subcommand|unexpected argument' "$2"; then
+    echo "not available"
+  elif grep -q '^stellar-agent-wrapper: refused: ' "$2"; then
+    echo refused
+  else
+    echo failed
+  fi
+}
+
+# Runs "$@", a read attempt of the operator account on the wallet
+# account's keyring, and records its exit code and standard error. With $1
+# set to keep, the record also holds its standard output; with discard,
+# the output never reaches the record or the terminal, since a read that
+# succeeds prints the secret. A nonzero exit is a denial only with the
+# denial text in standard error and SIGNER_PRESENT set to yes; a missing
+# item, an unreachable bus, an authentication error, or any other error
+# leaves the result inconclusive.
+read_attempt() {
+  local keep=$1 errors output rc=0
+  shift
+  errors=$(mktemp "$RECORD/.step.XXXXXX")
+  output=$(mktemp "$RECORD/.step.XXXXXX")
+  note "command: $*"
+  if [ "$keep" = keep ]; then
+    "$@" >"$output" 2>"$errors" || rc=$?
+  else
+    "$@" >/dev/null 2>"$errors" || rc=$?
+  fi
+  note "exit: $rc"
+  if [ "$rc" -eq 0 ]; then
+    note "status: failed (the read succeeded)"
+  elif [ "$rc" -eq 127 ] || grep -q 'command not found' "$errors"; then
+    note "status: not available"
+  elif ! grep -qE "$DENIAL_TEXT" "$errors" && grep -qE "$AUTH_ERROR_TEXT" "$errors"; then
+    note "status: inconclusive (authentication error without an access denial)"
+  elif ! grep -qE "$DENIAL_TEXT" "$errors"; then
+    note "status: inconclusive (no access-denial text in standard error)"
+  elif [ "$SIGNER_PRESENT" != yes ]; then
+    note "status: inconclusive (the signer item is not shown present)"
+  else
+    note "status: denied"
+  fi
+  note "standard error:"
+  sed 's/^/  /' "$errors" >>"$ENTRY"
+  if [ "$keep" = keep ]; then
+    note "standard output:"
+    sed 's/^/  /' "$output" >>"$ENTRY"
+  fi
+  rm -f "$errors" "$output"
+  printf 'read attempt exit %s\n' "$rc"
+}
+
+# Runs one step, "$@", and records its command, exit code, status, and
+# output. The output also reaches the terminal, so prompts stay visible.
+# Sets STEP_RC.
+step() {
+  local output
+  output=$(mktemp "$RECORD/.step.XXXXXX")
+  note "command: $*"
+  set +e
+  "$@" 2>&1 | tee "$output"
+  STEP_RC=${PIPESTATUS[0]}
+  set -e
+  note "exit: $STEP_RC"
+  note "status: $(status_of "$STEP_RC" "$output")"
+  note "output:"
+  sed 's/^/  /' "$output" >>"$ENTRY"
+  rm -f "$output"
+}
+
+# Runs wrapper $1 with arguments $2... as the wallet account.
+wallet() {
+  local wrapper=$1
+  shift
+  "$SUDO" -n -u "$ACCOUNT" "$PREFIX/$wrapper" "$@"
+}
+
+# Runs wrapper $2... with standard input from file $1. The shell opens the
+# file for the wrapper; the script never reads its content.
+wallet_from() {
+  local input=$1
+  shift
+  wallet "$@" <"$input"
+}
+
+# Records a skipped step that needs option $1.
+skipped() {
+  note "command: $2"
+  note "status: skipped (no $1 given)"
+}
+
+# Asks the operator a question on the terminal and sets ANSWER. The answer
+# is never a secret.
+ask() {
+  ANSWER=""
+  printf '%s ' "$1" >&2
+  IFS= read -r ANSWER <"$TTY_PATH" || true
+}
+
+# Prints the PIDs of the wallet account's session bus daemon.
+bus_daemons() {
+  pgrep -u "$ACCOUNT" -f -- "$BUS_ARGUMENT" || true
+}
+
+entry account
+step id "$ACCOUNT"
+step getent passwd "$ACCOUNT"
+
+entry ownership
+step ls -ld "$HOME_DIR"
+step ls -ld "$PREFIX" "$PREFIX/bin"
+step ls -l "$PREFIX" "$PREFIX/bin"
+step ls -l "$PROJECT_FILE" "$SUDOERS_FILE"
+
+entry refusal-64
+step wallet cli-launch profile show --profile other
+
+entry refusal-65
+step wallet cli-launch profile show
+
+entry keychain-unlock
+step wallet cli-launch keychain-unlock
+
+entry keychain-lock
+step wallet cli-launch keychain-lock
+
+entry keychain-unlock-again
+step wallet cli-launch keychain-unlock
+
+entry provisioning-order
+if [ -n "$RPC_URL" ]; then
+  step wallet provision profile init --network mainnet --rpc-url "$RPC_URL"
+else
+  skipped --rpc-url "provision profile init"
+fi
+step wallet provision profile rotate-audit-key
+step wallet provision profile enroll-owner-key
+step wallet provision profile enroll-signer
+SIGNER_ENROLL_RC=$STEP_RC
+step wallet provision profile bind-signer
+step wallet provision profile rotate-nonce-key
+step wallet provision profile rotate-attestation-key
+if [ -n "$PROVIDERS" ]; then
+  step wallet_from "$PROVIDERS" provision providers
+else
+  skipped --providers "provision providers"
+fi
+if [ -n "$BIND" ] && [ -n "$RP_ID" ]; then
+  step wallet provision remote-config --bind "$BIND" --rp-id "$RP_ID"
+else
+  skipped "--bind and --rp-id" "provision remote-config"
+fi
+if [ -n "$CERT" ]; then
+  step wallet_from "$CERT" provision remote-cert
+else
+  skipped --cert "provision remote-cert"
+fi
+if [ -n "$KEY" ]; then
+  step wallet_from "$KEY" provision remote-key
+else
+  skipped --key "provision remote-key"
+fi
+if [ -n "$POLICY" ]; then
+  step wallet_from "$POLICY" provision policy-install
+else
+  skipped --policy "provision policy-install"
+fi
+step wallet provision profile sign-policy
+step wallet cli-launch approve credential enroll --origin-from-installed
+step wallet provision profile enable-mainnet
+step wallet cli-launch profile enable-mainnet --state
+step wallet cli-launch profile enable-mainnet --check
+
+entry platform-read-write
+step wallet provision profile rotate-nonce-key
+step wallet cli-launch audit verify
+step wallet cli-launch profile show
+
+entry refusal-66
+# The MCP server runs while this script holds its standard input open.
+MCP_HOLD=$(mktemp "$RECORD/.mcp.XXXXXX")
+MCP_INPUT="$RECORD/.mcp-input"
+mkfifo -m 600 "$MCP_INPUT"
+wallet mcp-launch <"$MCP_INPUT" >"$MCP_HOLD" 2>&1 &
+MCP_JOB=$!
+exec 7>"$MCP_INPUT"
+sleep "$SETTLE_SECONDS"
+step wallet cli-launch approve serve --open-by-operator
+exec 7>&-
+wait "$MCP_JOB" 2>/dev/null || true
+note "mcp-launch output while held:"
+sed 's/^/  /' "$MCP_HOLD" >>"$ENTRY"
+rm -f "$MCP_HOLD" "$MCP_INPUT"
+
+entry mcp-stdio
+REQUEST='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"validate-linux","version":"1"}}}'
+MCP_OUT=$(mktemp "$RECORD/.mcp.XXXXXX")
+note "command: printf <initialize> | $SUDO -n -u $ACCOUNT $PREFIX/mcp-launch"
+set +e
+{ printf '%s\n' "$REQUEST"; sleep "$RESPONSE_SECONDS"; } | wallet mcp-launch >"$MCP_OUT" 2>/dev/null
+MCP_RC=$?
+set -e
+note "exit: $MCP_RC"
+if head -n 1 "$MCP_OUT" | grep -q '"jsonrpc"'; then
+  note "status: ok (the first standard output line is a JSON-RPC message)"
+else
+  note "status: failed (no JSON-RPC message on standard output)"
+fi
+note "first line: $(head -n 1 "$MCP_OUT")"
+rm -f "$MCP_OUT"
+
+entry cross-user-file-denial
+step cat "$DATA_ROOT/profiles/mainnet.toml"
+step ls "$HOME_DIR"
+
+entry cross-user-keyring-denial
+# The wallet account's enroll-signer step of this run shows whether the
+# signer item exists. The operator account then asks the wallet account's
+# session bus for it through secret-tool, which prints the secret when
+# the read succeeds; read_attempt discards that output.
+if [ "$SIGNER_ENROLL_RC" = 0 ]; then
+  SIGNER_PRESENT=yes
+  note "signer item: present (provision profile enroll-signer exited 0 in this run)"
+else
+  note "signer item: not shown present (provision profile enroll-signer exited $SIGNER_ENROLL_RC in this run)"
+fi
+step ls -ld "$HOME_DIR/run"
+read_attempt discard env "DBUS_SESSION_BUS_ADDRESS=unix:path=$HOME_DIR/run/bus" \
+  secret-tool lookup service "$SIGNER_SERVICE"
+
+entry approval-round-trip
+ask "Create a pending approval through the MCP client, then enter its approval id (empty skips):"
+if [ -n "$ANSWER" ]; then
+  step wallet cli-launch approve --id "$ANSWER" --open-by-operator
+  if [ "$STEP_RC" -ne 0 ]; then
+    step wallet cli-launch approve --id "$ANSWER"
+  fi
+else
+  skipped "approval id" "cli-launch approve --id <id> --open-by-operator"
+fi
+
+entry daemon-reuse
+step bus_daemons
+BEFORE=$(bus_daemons)
+step wallet cli-launch keychain-unlock
+AFTER=$(bus_daemons)
+if [ -n "$BEFORE" ] && [ "$BEFORE" = "$AFTER" ]; then
+  note "result: the repeated unlock kept the session bus daemon $BEFORE"
+else
+  note "result: the session bus daemons changed from '$BEFORE' to '$AFTER'"
+fi
+
+printf 'validate-linux.sh: %s entries in %s\n' "$ENTRY_INDEX" "$RECORD"

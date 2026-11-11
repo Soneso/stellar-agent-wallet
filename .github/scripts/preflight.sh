@@ -148,6 +148,8 @@ self-test:test-validate-unsigned-archive.py	python3 .github/scripts/test-validat
 self-test:test-welcome-workflow.py	python3 .github/scripts/test-welcome-workflow.py	jq	ci.yml	release-contracts	Check the workflow structure and the label sync
 shellcheck-preflight	shellcheck -s bash .github/scripts/preflight.sh .github/scripts/test-preflight.sh	shellcheck	install-surface.yml	install-surface	Shellcheck the preflight
 shellcheck-changed	shellcheck -s bash	shellcheck	-	-	-
+deploy-shellcheck	shellcheck -s bash scripts/deploy/bootstrap.sh scripts/deploy/mcp-launch scripts/deploy/cli-launch scripts/deploy/provision scripts/deploy/validate-macos.sh scripts/deploy/validate-linux.sh scripts/deploy/test-deploy.sh	shellcheck	ci.yml	deploy-scripts	Shellcheck the deployment scripts
+deploy-harness	bash scripts/deploy/test-deploy.sh	perl	ci.yml	deploy-scripts	Run the deployment harness
 package-skill	.github/scripts/package-skill.sh --check	zip,unzip,zipinfo,shasum	ci.yml	release-contracts	Check the skill archive
 vendored-tree-check	bash .github/scripts/rebuild-vendored-wasm.sh --check-tree --repo-root .	shasum	vendored-wasm.yml	check	Tree check
 publish-check	.github/scripts/publish-crates.sh --check	cargo	ci.yml	release-contracts	Check the publish tiers
@@ -417,6 +419,10 @@ select_for_path() {
   select_self_tests "$path"
   case "$path" in
     .github/scripts/preflight.sh | .github/scripts/test-preflight.sh) select_gate shellcheck-preflight ;;
+    scripts/deploy/*)
+      select_gate deploy-shellcheck
+      select_gate deploy-harness
+      ;;
     .github/scripts/*.sh | .github/actions/*.sh)
       if [ -f "$path" ]; then
         printf '%s\0' "$path" >>"$SCRATCH/shell"
@@ -795,7 +801,7 @@ install_hint() {
     jq | zip) echo "brew install $1 or apt-get install $1" ;;
     libudev) echo "apt-get install libudev-dev pkg-config" ;;
     unzip | zipinfo) echo "brew install unzip or apt-get install unzip" ;;
-    shasum) echo "brew install perl or apt-get install perl" ;;
+    shasum | perl) echo "brew install perl or apt-get install perl" ;;
     node) echo "install Node $(version_or_file "$(node_version)" "$ci")" ;;
     corepack) echo "npm install --global corepack" ;;
   esac

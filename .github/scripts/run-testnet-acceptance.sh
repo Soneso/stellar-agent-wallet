@@ -22,6 +22,13 @@
 #                   keyring backend for the spawned binary. Unset selects the
 #                   encrypted headless store with a key generated for this
 #                   run, so no suite reaches the machine's own keyring.
+#   STELLAR_AGENT_TEST_KEYRING
+#                   platform or unset. With platform, the driver unsets
+#                   STELLAR_AGENT_KEYRING_BACKEND and
+#                   STELLAR_AGENT_HEADLESS_KEYRING_KEY and skips the headless
+#                   default, so the spawned binary uses the platform keyring
+#                   of the session. Any other value, the empty one included,
+#                   fails the run before the first suite.
 #   MAINNET_WRITE   on or off (default off). With on, every suite of a crate
 #                   that declares a mainnet-write feature builds with that
 #                   feature beside the suite's own, which is the build the
@@ -78,8 +85,11 @@ MAINNET_WRITE="${MAINNET_WRITE-off}"
 # Keychain has not seen before, so it asks the person at the machine for
 # access, once per item per build, and waits for an answer that an unattended
 # run never gives. The encrypted headless store needs no such permission.
-# An environment that already selects a backend keeps it.
-if [ -z "${STELLAR_AGENT_KEYRING_BACKEND:-}" ]; then
+# An environment that already selects a backend keeps it, and
+# STELLAR_AGENT_TEST_KEYRING=platform selects the platform keyring instead.
+if [ "${STELLAR_AGENT_TEST_KEYRING-}" = platform ]; then
+  unset STELLAR_AGENT_KEYRING_BACKEND STELLAR_AGENT_HEADLESS_KEYRING_KEY
+elif [ -z "${STELLAR_AGENT_KEYRING_BACKEND:-}" ]; then
   export STELLAR_AGENT_KEYRING_BACKEND=headless-env
   # 32 random bytes, URL-safe base64, unpadded: the key format the headless
   # store requires. The store decodes the value strictly, as the encoding of
@@ -136,6 +146,17 @@ check_mainnet_write() {
     on | off) return 0 ;;
   esac
   echo "error: MAINNET_WRITE must be on or off, not '${MAINNET_WRITE}'" >&2
+  return 1
+}
+
+# Refuses a set STELLAR_AGENT_TEST_KEYRING other than platform, so a
+# misspelled value never runs the leg against a keyring the caller did not
+# ask for.
+check_test_keyring() {
+  if [ -z "${STELLAR_AGENT_TEST_KEYRING+set}" ] || [ "$STELLAR_AGENT_TEST_KEYRING" = platform ]; then
+    return 0
+  fi
+  echo "error: STELLAR_AGENT_TEST_KEYRING must be platform or unset, not '${STELLAR_AGENT_TEST_KEYRING}'" >&2
   return 1
 }
 
@@ -310,6 +331,7 @@ format_result() {
 main() {
   local line crate feature target suite rc attempts suite_seconds outcome notes result leg_start leg_seconds i
   check_mainnet_write || exit 2
+  check_test_keyring || exit 2
   check_share || exit 2
   check_suite_completeness || exit 3
 

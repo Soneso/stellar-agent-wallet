@@ -1,0 +1,251 @@
+#!/bin/bash -p
+# Starts the wallet MCP server as the dedicated wallet account.
+#
+# MCP clients run it as their server command:
+#   sudo -n -u @ACCOUNT@ @PREFIX@/mcp-launch
+#
+# It takes no argument (tier R, eligibility Y). Standard input and output
+# belong to the MCP protocol: the wrapper reads nothing from standard input
+# and writes nothing to standard output before it becomes the server.
+#
+# This file is a template. bootstrap.sh renders it into a self-contained
+# installed file and fills each placeholder with a fixed value. The
+# installed file reads no path, root, or switch from the environment.
+
+WRAPPER=mcp-launch
+PREFIX='@PREFIX@'
+
+# --- shared wrapper checks: begin ---
+# The text up to the end marker is identical in the three wrappers.
+
+# Privileged mode (-p) ignores BASH_ENV, SHELLOPTS, and exported functions.
+# A wrapper whose environment holds anything beyond what bash itself sets
+# runs itself again under an empty environment.
+ENV_TOOL='@ENV@'
+IFS=$' \t\n'
+for exported in $(compgen -e); do
+  case "$exported" in
+    PWD | SHLVL | _) ;;
+    *) exec "$ENV_TOOL" -i /bin/bash -p "$PREFIX/$WRAPPER" ${1+"$@"} ;;
+  esac
+done
+unset exported
+export -n PWD SHLVL
+unset OLDPWD
+set -euo pipefail
+umask 077
+
+PLATFORM='@PLATFORM@'
+ACCOUNT='@ACCOUNT@'
+ACCOUNT_HOME='@HOME@'
+DATA_ROOT='@DATA_ROOT@'
+PROFILE='@PROFILE@'
+PROJECT_FILE='@PROJECT_FILE@'
+TTY='@TTY@'
+# shellcheck disable=SC2034 # Each wrapper uses a subset of these names.
+{
+  CLI="$PREFIX/bin/stellar-agent"
+  MCP="$PREFIX/bin/stellar-agent-mcp"
+  CLI_PATTERN='^@PREFIX_RE@/bin/stellar-agent( |$)'
+  MCP_PATTERN='^@PREFIX_RE@/bin/stellar-agent-mcp( |$)'
+  PROFILE_FILE="$DATA_ROOT/profiles/$PROFILE.toml"
+  POLICY_FILE="$DATA_ROOT/policies/$PROFILE.toml"
+  RUN_DIR="$ACCOUNT_HOME/run"
+}
+# shellcheck disable=SC2123 # The wrapper sets its own search path.
+PATH='@PATH@'
+export PATH
+
+# Prints one refusal line from the fixed reason list and exits with $1.
+# A reason never holds a caller token.
+refuse() {
+  printf 'stellar-agent-wrapper: refused: %s\n' "$2" >&2
+  exit "$1"
+}
+
+# Succeeds when the arguments after the first equal the space-separated
+# words of the first, one by one.
+form_is() {
+  local IFS=' ' want word index=0
+  set -f
+  # shellcheck disable=SC2206 # The form words split on spaces by design.
+  want=($1)
+  set +f
+  shift
+  [ "$#" -eq "${#want[@]}" ] || return 1
+  for word in "$@"; do
+    [ "$word" = "${want[index]}" ] || return 1
+    index=$((index + 1))
+  done
+}
+
+# Succeeds when $1 is a project name: one or more characters without
+# whitespace, quotes, or control characters.
+valid_project() {
+  local pattern='^[^[:space:][:cntrl:]"'"'"']+$'
+  [[ "$1" =~ $pattern ]]
+}
+
+# Prints the owner UID and permission bits of $1, as "<uid> <octal mode>".
+owner_and_mode() {
+  case "$PLATFORM" in
+    macos) stat -f '%u %Lp' "$1" ;;
+    linux) stat -c '%u %a' "$1" ;;
+  esac
+}
+
+# Succeeds when $1 carries an extended ACL entry. Only macOS checks ACLs.
+has_acl() {
+  local listing first
+  [ "$PLATFORM" = macos ] || return 1
+  listing=$(ls -lde "$1") || return 0
+  first=${listing%%$'\n'*}
+  first=${first%% *}
+  case "$first" in
+    *+*) return 0 ;;
+  esac
+  [ "$listing" != "${listing%%$'\n'*}" ]
+}
+
+# Refuses unless $1 exists, is no symlink, belongs to the wallet account,
+# has mode $2, and carries no extended ACL. $3 names it in the refusal.
+require_private() {
+  local facts
+  if [ -L "$1" ]; then
+    refuse 65 "$3 is a symlink"
+  fi
+  if [ ! -e "$1" ]; then
+    refuse 65 "$3 is missing"
+  fi
+  facts=$(owner_and_mode "$1") || refuse 65 "$3 cannot be inspected"
+  if [ "${facts%% *}" != "$ACCOUNT_UID" ]; then
+    refuse 65 "$3 is not owned by the wallet account"
+  fi
+  if [ "${facts#* }" != "$2" ]; then
+    refuse 65 "$3 does not have mode 0$2"
+  fi
+  if has_acl "$1"; then
+    refuse 65 "$3 carries an access control list"
+  fi
+}
+
+# Runs the ownership checks of tier $1: B accepts the profile absent or
+# account-owned; P and R require it account-owned with mode 0600.
+require_tier() {
+  local facts
+  require_private "$ACCOUNT_HOME" 700 "the home directory"
+  require_private "$DATA_ROOT" 700 "the data root"
+  case "$1" in
+    B)
+      if [ -L "$PROFILE_FILE" ]; then
+        refuse 65 "the profile is a symlink"
+      fi
+      if [ -e "$PROFILE_FILE" ]; then
+        facts=$(owner_and_mode "$PROFILE_FILE") || refuse 65 "the profile cannot be inspected"
+        if [ "${facts%% *}" != "$ACCOUNT_UID" ]; then
+          refuse 65 "the profile is not owned by the wallet account"
+        fi
+      fi
+      ;;
+    P | R) require_private "$PROFILE_FILE" 600 "the profile" ;;
+  esac
+}
+
+# Runs a native command with the built environment only: env drops the
+# variables bash adds for a child.
+native() {
+  "$ENV_TOOL" -u _ -u SHLVL "$@"
+}
+
+# Replaces the wrapper with a native command, so its signals and exit code
+# are the native command's.
+exec_native() {
+  exec "$ENV_TOOL" -u _ -u SHLVL "$@"
+}
+
+# Runs the eligibility predicate for eligibility $1: E skips it, Y admits
+# both states, N admits only the absent state.
+require_eligible() {
+  local rc=0 state
+  [ "$1" != E ] || return 0
+  native "$CLI" profile enable-mainnet --profile "$PROFILE" --state </dev/null >/dev/null 2>&1 || rc=$?
+  case "$rc" in
+    0) state=enabled ;;
+    3) state=absent ;;
+    *) refuse 65 "the mainnet state is unreadable; run cli-launch profile enable-mainnet --state" ;;
+  esac
+  if [ "$1" = N ] && [ "$state" = enabled ]; then
+    refuse 65 "mainnet is enabled, and this form runs only before enablement"
+  fi
+}
+
+# Refuses with 66 while a wallet-account process whose command line starts
+# with the installed binary of pattern $1 runs. $2 names it.
+refuse_while_running() {
+  local rc=0
+  pgrep -u "$ACCOUNT" -f "$1" >/dev/null 2>&1 || rc=$?
+  case "$rc" in
+    0) refuse 66 "$2 is running" ;;
+    1) ;;
+    *) refuse 66 "the process check failed" ;;
+  esac
+}
+
+# Reads one line from the operator's terminal without echo into SECRET.
+# $1 is the prompt, which names no caller token. The prompt and the line
+# break after the answer go to the terminal, so standard error carries no
+# more than the one refusal line.
+prompt_secret() {
+  if [ ! -e "$TTY" ] || ! { : <"$TTY" && : >>"$TTY"; } 2>/dev/null; then
+    refuse 65 "no terminal is available for the prompt"
+  fi
+  if ! { printf '%s: ' "$1" >>"$TTY"; } 2>/dev/null; then
+    refuse 65 "the terminal does not take the prompt"
+  fi
+  SECRET=""
+  IFS= read -r -s SECRET <"$TTY" || true
+  if ! { printf '\n' >>"$TTY"; } 2>/dev/null; then
+    refuse 65 "the terminal does not take the prompt"
+  fi
+  if [ -z "$SECRET" ]; then
+    refuse 65 "the prompt received no value"
+  fi
+}
+
+# Refuses unless the wrapper runs as the wallet account with a valid project
+# file, then exports the built environment and enters the home directory.
+prepare_account() {
+  local project
+  if [ "$(id -un)" != "$ACCOUNT" ]; then
+    refuse 65 "the wrapper does not run as the wallet account"
+  fi
+  ACCOUNT_UID=$(id -u)
+  if [ -L "$PROJECT_FILE" ] || [ ! -f "$PROJECT_FILE" ]; then
+    refuse 65 "the project file is missing"
+  fi
+  project=$(cat "$PROJECT_FILE") || refuse 65 "the project file is unreadable"
+  if ! valid_project "$project"; then
+    refuse 65 "the project file does not hold one project name"
+  fi
+  HOME=$ACCOUNT_HOME
+  TMPDIR="$ACCOUNT_HOME/tmp"
+  STELLAR_AGENT_PROJECT=$project
+  export HOME TMPDIR STELLAR_AGENT_PROJECT
+  if [ "$PLATFORM" = linux ]; then
+    DBUS_SESSION_BUS_ADDRESS="unix:path=$RUN_DIR/bus"
+    GNOME_KEYRING_CONTROL="$RUN_DIR/keyring"
+    export DBUS_SESSION_BUS_ADDRESS GNOME_KEYRING_CONTROL
+  fi
+  cd "$ACCOUNT_HOME" 2>/dev/null || refuse 65 "the home directory is not accessible"
+}
+# --- shared wrapper checks: end ---
+
+if [ "$#" -ne 0 ]; then
+  refuse 64 "the form is not one of the listed forms"
+fi
+prepare_account
+require_tier R
+refuse_while_running "$CLI_PATTERN" "a wallet CLI process"
+require_eligible Y
+# Mainnet requires the explicit profile selection.
+exec_native "$MCP" --profile "$PROFILE"
