@@ -10,13 +10,15 @@
 //! `profile.enable_mainnet_default_refused`, `profile.enable_mainnet_not_mainnet`,
 //! `profile.mainnet_oracle_required`, `profile.enable_mainnet_precondition`,
 //! `profile.enable_mainnet_nonce_exists`, and `policy.pin_absent`. The pin
-//! step returns the `policy.*` code of its verified load, such as
-//! `policy.owner_signature_invalid`, `policy.sequence_rollback`, or
-//! `policy.state_lock_busy`, and strict audit errors retain their own codes.
+//! step returns its `policy.*` verification error, such as
+//! `policy.owner_signature_invalid` or `policy.state_lock_busy`.
+//! Strict audit errors retain their own codes.
 //! A process on a headless keyring backend is refused with
-//! `network.mainnet_keyring_backend_unsupported` in both modes, before any
-//! keyring entry is read. A profile without a usable oracle is refused with
-//! `profile.mainnet_oracle_required` before any keyring entry is read.
+//! `network.mainnet_keyring_backend_unsupported` in every mode before any keyring read.
+//! The ceremony requires a usable oracle before it reads keyring entries.
+//! `--state` reads only nonce presence after profile and backend checks.
+//! It exits 0 for enabled, 3 for absent, and 1 for unreadable.
+//! It exposes no nonce bytes or backend error text.
 //! `--check` reports every check as `passed`, `failed`, or `not_evaluated`,
 //! reads the prerequisite state, keyring entries included, and writes no
 //! nonce, pin, policy change, or audit row; a missing oracle is a failed check
@@ -80,6 +82,9 @@ pub struct EnableMainnetArgs {
     /// Check all bindings and restrictions without changing persisted state.
     #[arg(long, conflicts_with = "rotate")]
     check: bool,
+    /// Inspect installation nonce presence without changing persisted state.
+    #[arg(long, conflicts_with_all = ["check", "rotate"])]
+    state: bool,
     /// Replace the installation nonce and bind the policy to it. A policy
     /// without a `[mainnet]` table is bound in full.
     #[arg(long)]
@@ -235,10 +240,14 @@ fn run_with_keyring(
     status
 }
 
-/// The exit code of a run: 1 for a refusal and for an inspection with a
-/// failed check, 0 otherwise.
+/// 1 for a refusal, a failed check, or an unreadable nonce; 3 for an absent nonce; 0 otherwise.
 fn exit_code(result: &Result<serde_json::Value, Failure>) -> i32 {
     match result {
+        Ok(data) if data.get("state").is_some() => match data["state"].as_str() {
+            Some("enabled") => 0,
+            Some("absent") => 3,
+            _ => 1,
+        },
         Ok(data) => i32::from(
             !data
                 .get("valid")
@@ -281,6 +290,23 @@ pub(super) fn execute(
     }
     stellar_agent_network::mainnet::audit_readiness::refuse_headless_keyring_backend()
         .map_err(|e| (e.code(), e.to_string()))?;
+    if args.state {
+        let coordinate = mainnet_enablement_entry_ref(&profile.policy_window_state_key_id);
+        let (state, code) = match has_enablement_nonce(profile) {
+            Ok(true) => ("enabled", None),
+            Ok(false) => ("absent", None),
+            Err(_) => ("unreadable", Some("profile.mainnet_enablement_invalid")),
+        };
+        let mut data = serde_json::json!({
+            "profile": name,
+            "state": state,
+            "nonce_entry": {"service": coordinate.service, "account": coordinate.account},
+        });
+        if let Some(code) = code {
+            data["code"] = code.into();
+        }
+        return Ok(data);
+    }
     if !args.check {
         require_mainnet_oracle(profile).map_err(|e| (e.code(), e.to_string()))?;
     }
@@ -422,7 +448,7 @@ pub(super) fn execute(
     let nonce = zeroize::Zeroizing::new(stellar_agent_core::hex::encode(random.as_ref()));
     let digest = stellar_agent_core::hex::encode(&sha2::Sha256::digest(nonce.as_bytes()));
     let rewritten = rewrite_policy(&body, name, &host, &digest, args.rotate)?;
-    ensure_policy_pin(name, profile, policy_path, window.path())?;
+    ensure_policy_pin(name, profile, policy_path, window.path(), &body)?;
     let mut audit = AuditEntry::new_tool_invocation(NewToolInvocation::new(
         "mainnet_enablement_minted",
         "stellar:mainnet",
@@ -524,18 +550,18 @@ fn missing_pin_lock_detail(name: &str) -> String {
     )
 }
 
-/// Preserves an existing pin, or establishes one from the installed signed
-/// v2 policy before a nonce is written. The caller has refused an
-/// installation that holds a nonce but no pin, and the verified load refuses
-/// that state again under the lock.
+/// Preserves an existing pin or pins a signed v2 body before storing a nonce.
+/// The caller refuses installations with a nonce and no pin.
+/// Provisioning verification repeats that refusal under the lock.
 fn ensure_policy_pin(
     name: &str,
     profile: &Profile,
     policy_path: &Path,
     window_path: &Path,
+    body: &toml_edit::DocumentMut,
 ) -> Result<(), Failure> {
     use stellar_agent_core::policy::v1::verified::{
-        PinMode, load_verified_policy, read_pin_without_creating,
+        pin_provisioning_policy, read_pin_without_creating,
     };
     let error = |e: PolicyError| (e.wire_code(), e.to_string());
     if let PinState::Present(_) = read_pin_without_creating(window_path, profile).map_err(error)? {
@@ -546,7 +572,17 @@ fn ensure_policy_pin(
             .map_err(|e| precondition(format!("policy state directory: {e}")))?;
     }
     let owner = read_owner_key(&KeyringEntryRef::default_owner_key(name)).map_err(precondition)?;
-    let verified = load_verified_policy(
+    if body.get("version").and_then(toml_edit::Item::as_integer) != Some(2) {
+        stellar_agent_core::policy::v1::loader::load_signed_policy_text(
+            &body.to_string(),
+            name,
+            &owner,
+            &profile.network_passphrase,
+        )
+        .map_err(error)?;
+        return Err(precondition("sign a v2 policy before enabling mainnet"));
+    }
+    pin_provisioning_policy(
         &PolicyLoad {
             path: policy_path,
             profile,
@@ -555,14 +591,9 @@ fn ensure_policy_pin(
             owner_source: OwnerKeySource::Keyring,
             window_path,
         },
-        PolicyStateStore::new(),
-        PinMode::Advance,
+        body,
     )
-    .map_err(error)?;
-    if verified.sequence() == 0 {
-        return Err(precondition("sign a v2 policy before enabling mainnet"));
-    }
-    Ok(())
+    .map_err(error)
 }
 
 /// The checks a compare-only inspection yields: the verified policy, the pin
@@ -909,6 +940,7 @@ mod tests {
                 args: EnableMainnetArgs {
                     profile: Some("operator".into()),
                     check: false,
+                    state: false,
                     rotate: false,
                 },
                 owner,
@@ -2321,6 +2353,7 @@ mod tests {
                 &EnableMainnetArgs {
                     profile: Some("default".into()),
                     check: false,
+                    state: false,
                     rotate: false
                 },
                 "default",
@@ -2382,8 +2415,938 @@ mod tests {
         let args = EnableMainnetArgs {
             profile: Some(name.to_owned()),
             check: false,
+            state: false,
             rotate: true,
         };
         fixture.assert_rendered_refusal(run_with_keyring(&args, || fixture.init()));
+    }
+
+    #[test]
+    #[serial]
+    fn check_output_unchanged() {
+        let mut fixture = Fixture::new();
+        fixture.run().unwrap();
+        fixture.signed_body(7);
+        fixture.args.check = true;
+        let expected = [
+            r#"{"ok":true,"data":{"checks":[{"item":"chain_id","status":"passed"},{"item":"rpc_url","status":"passed"},{"item":"engine","status":"passed"},{"item":"owner_key","status":"passed"},{"item":"enrolled_signer","status":"passed"},{"item":"key_scope","status":"passed"},{"item":"verified_policy","status":"passed"},{"detail":"sequence 1","item":"pin","status":"passed"},{"item":"enablement","status":"passed"},{"item":"body_version","status":"passed"},{"item":"mainnet_table","status":"passed"},{"item":"rules_empty","status":"passed"},{"item":"scope","status":"passed"},{"item":"chain","status":"passed"},{"item":"tool","status":"passed"},{"item":"opaque","status":"passed"},{"item":"rule_ttl","status":"passed"},{"item":"asset_allowlist","status":"passed"},{"item":"destination","status":"passed"},{"item":"home_domain","status":"passed"},{"item":"per_tx_cap","status":"passed"},{"item":"per_period_cap","status":"passed"},{"item":"rate_limit","status":"passed"},{"item":"fee_cap","status":"passed"},{"item":"thresholds","status":"passed"},{"item":"ttl","status":"passed"},{"item":"approval_credentials","status":"passed"},{"item":"approval.cert_pin_without_origin","status":"passed"},{"item":"approval.origin_without_cert_pin","status":"passed"},{"item":"oracle_provider_url","status":"passed"}],"profile":"operator","valid":true},"request_id":"fixed-id"}"#,
+            r#"{"ok":true,"data":{"checks":[{"item":"chain_id","status":"passed"},{"item":"rpc_url","status":"passed"},{"item":"engine","status":"passed"},{"item":"owner_key","status":"passed"},{"item":"enrolled_signer","status":"passed"},{"item":"key_scope","status":"passed"},{"detail":"policy.sequence_rollback","item":"verified_policy","status":"failed"},{"detail":"policy.sequence_rollback; pinned sequence 9","item":"pin","status":"failed"},{"detail":"the verified policy did not load","item":"enablement","status":"not_evaluated"},{"item":"body_version","status":"passed"},{"item":"mainnet_table","status":"passed"},{"item":"rules_empty","status":"passed"},{"item":"scope","status":"passed"},{"item":"chain","status":"passed"},{"item":"tool","status":"passed"},{"item":"opaque","status":"passed"},{"item":"rule_ttl","status":"passed"},{"item":"asset_allowlist","status":"passed"},{"item":"destination","status":"passed"},{"item":"home_domain","status":"passed"},{"item":"per_tx_cap","status":"passed"},{"item":"per_period_cap","status":"passed"},{"item":"rate_limit","status":"passed"},{"item":"fee_cap","status":"passed"},{"item":"thresholds","status":"passed"},{"item":"ttl","status":"passed"},{"item":"approval_credentials","status":"passed"},{"item":"approval.cert_pin_without_origin","status":"passed"},{"item":"approval.origin_without_cert_pin","status":"passed"},{"item":"oracle_provider_url","status":"passed"}],"profile":"operator","valid":false},"request_id":"fixed-id"}"#,
+        ];
+        for (failed, expected) in [false, true].into_iter().zip(expected) {
+            if failed {
+                fixture.put_pin(9);
+            }
+            let before = persisted(&fixture);
+            let pin = fixture.pin();
+            let nonce = get(&fixture.nonce_ref());
+            let result = fixture.run();
+            assert_eq!(exit_code(&result), i32::from(failed));
+            let envelope = Envelope::ok_with_request_id(result.unwrap(), "fixed-id".into());
+            let mut bytes = Vec::new();
+            render::render_json_to(&mut bytes, &envelope).unwrap();
+            assert_eq!(bytes, format!("{expected}\n").as_bytes());
+            assert_eq!(persisted(&fixture), before);
+            assert_eq!(fixture.pin(), pin);
+            assert_eq!(get(&fixture.nonce_ref()), nonce);
+        }
+    }
+    fn unbound_body(remote: bool) -> String {
+        let raw = if remote {
+            include_str!(
+                "../../../../stellar-agent-core/tests/fixtures/policy-v2-remote-approval.toml"
+            )
+        } else {
+            FULL
+        };
+        let mut doc = raw.parse::<toml_edit::DocumentMut>().unwrap();
+        let table = doc["mainnet"].as_table_like_mut().unwrap();
+        for field in ["profile", "endpoint_host", "installation_nonce_sha256"] {
+            table.remove(field);
+        }
+        doc.to_string()
+    }
+
+    fn persisted(fixture: &Fixture) -> Vec<(std::path::PathBuf, Vec<u8>)> {
+        fixture
+            .listing()
+            .into_iter()
+            .filter(|path| fixture.dir.path().join(path).is_file())
+            .map(|path| {
+                let bytes = std::fs::read(fixture.dir.path().join(&path)).unwrap();
+                (path, bytes)
+            })
+            .collect()
+    }
+
+    #[test]
+    #[serial]
+    fn state_envelope_and_exit_codes() {
+        use clap::Parser;
+        #[derive(Debug, Parser)]
+        struct Command {
+            #[command(flatten)]
+            args: EnableMainnetArgs,
+        }
+        for conflict in ["--check", "--rotate"] {
+            assert_eq!(
+                Command::try_parse_from(["command", "--state", conflict])
+                    .unwrap_err()
+                    .kind(),
+                clap::error::ErrorKind::ArgumentConflict
+            );
+        }
+        for (state, status) in [("absent", 3), ("enabled", 0), ("unreadable", 1)] {
+            let mut fixture = Fixture::new();
+            let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(fixture.dir.path());
+            fixture.profile.oracle_provider_url = None;
+            fixture.profile.providers.as_mut().unwrap().oracle = None;
+            fixture.profile.policy.engine = PolicyEngineKind::Noop;
+            loader::save_to_dir(
+                "operator",
+                &fixture.profile,
+                &fixture.dir.path().join("profiles"),
+            )
+            .unwrap();
+            let pin = stellar_agent_core::profile::schema::policy_pin_entry_ref(
+                &fixture.profile.policy_window_state_key_id,
+            );
+            let owner = KeyringEntryRef::default_owner_key("operator");
+            let forbid_pin = Arc::new(std::sync::atomic::AtomicBool::new(true));
+            let pin_probe = forbid_pin.clone();
+            keyring_mock::install_with_read_hooks(vec![
+                keyring_mock::ReadHook::new(
+                    &pin.service,
+                    &pin.account,
+                    Arc::new(move || {
+                        assert!(
+                            !pin_probe.load(std::sync::atomic::Ordering::SeqCst),
+                            "state reads a pin"
+                        )
+                    }),
+                ),
+                keyring_mock::ReadHook::new(
+                    &owner.service,
+                    &owner.account,
+                    Arc::new(|| panic!("state reads an owner")),
+                ),
+            ])
+            .unwrap();
+            put(&pin, "unchanged-pin");
+            std::fs::write(fixture.path(), "unparseable policy").unwrap();
+            std::fs::write(fixture.dir.path().join("audit.jsonl"), "unchanged-audit").unwrap();
+            if state != "absent" {
+                put(&fixture.nonce_ref(), "unchanged-nonce");
+            }
+            let before = persisted(&fixture);
+            let listing = fixture.listing();
+            fixture.args.state = true;
+            if state == "unreadable" {
+                let coordinate = fixture.nonce_ref();
+                keyring_mock::inject_no_logon_session(&coordinate.service, &coordinate.account)
+                    .unwrap();
+            }
+            render::take_rendered_for_test();
+            assert_eq!(run_with_keyring(&fixture.args, || Ok(())), status);
+            let mut output = render::take_rendered_for_test();
+            assert_eq!(output.len(), 1);
+            output[0]["request_id"] = "fixed-id".into();
+            let mut data = serde_json::json!({
+                "profile": "operator", "state": state,
+                "nonce_entry": {"service": "stellar-agent-policy-window-operator", "account": "default-mainnet-enablement"},
+            });
+            if state == "unreadable" {
+                data["code"] = "profile.mainnet_enablement_invalid".into();
+            }
+            assert_eq!(
+                output[0],
+                serde_json::to_value(Envelope::ok_with_request_id(data, "fixed-id".into()))
+                    .unwrap()
+            );
+            forbid_pin.store(false, std::sync::atomic::Ordering::SeqCst);
+            assert_eq!(get(&pin).as_deref(), Some("unchanged-pin"));
+            forbid_pin.store(true, std::sync::atomic::Ordering::SeqCst);
+            assert_eq!(persisted(&fixture), before);
+            assert_eq!(fixture.listing(), listing);
+            assert_eq!(
+                get(&fixture.nonce_ref()),
+                (state != "absent").then(|| "unchanged-nonce".to_owned())
+            );
+            render::take_rendered_for_test();
+            assert_eq!(
+                run_with_keyring(&fixture.args, || Err(
+                    stellar_agent_core::error::ValidationError::MainnetEnablementInvalid {
+                        binding: "nonce"
+                    }
+                    .into()
+                )),
+                1
+            );
+            let output = render::take_rendered_for_test();
+            assert_eq!(output[0]["ok"], false);
+            assert_eq!(
+                output[0]["error"]["code"],
+                "profile.enable_mainnet_precondition"
+            );
+            assert!(output[0].get("data").is_none());
+            fixture.args.profile = Some("missing-profile".into());
+            let mut failures = Vec::new();
+            for state in [false, true] {
+                fixture.args.state = state;
+                render::take_rendered_for_test();
+                assert_eq!(
+                    run_with_keyring(&fixture.args, || panic!(
+                        "profile load must precede initialization"
+                    )),
+                    1
+                );
+                let mut rendered = render::take_rendered_for_test().remove(0);
+                rendered["request_id"] = "fixed-id".into();
+                assert_eq!(rendered["ok"], false);
+                assert_eq!(
+                    rendered["error"]["code"],
+                    "profile.enable_mainnet_precondition"
+                );
+                failures.push(rendered);
+            }
+            assert_eq!(failures[0], failures[1]);
+            fixture.args.profile = Some("operator".into());
+            fixture.args.state = true;
+            fixture.profile.policy_window_state_key_id =
+                KeyringEntryRef::new("configured-window", "configured");
+            if state != "absent" {
+                put(&fixture.nonce_ref(), "configured-nonce");
+            }
+            if state == "unreadable" {
+                let coordinate = fixture.nonce_ref();
+                keyring_mock::inject_no_logon_session(&coordinate.service, &coordinate.account)
+                    .unwrap();
+            }
+            let result = fixture.run_with(
+                |_| panic!("state emits audit"),
+                |_, _| panic!("state writes policy"),
+            );
+            assert_eq!(exit_code(&result), status);
+            let output = result.unwrap();
+            assert_eq!(output["state"], state);
+            assert_eq!(
+                output["nonce_entry"],
+                serde_json::json!({"service": "configured-window", "account": "configured-mainnet-enablement"})
+            );
+            assert_eq!(persisted(&fixture), before);
+            assert_eq!(
+                get(&fixture.nonce_ref()),
+                (state != "absent").then(|| "configured-nonce".to_owned())
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn initial_pin_accepts_binding_free_body() {
+        let fixture = Fixture::new();
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(fixture.dir.path());
+        let mut profile = fixture.profile.clone();
+        profile.wallet.mlock_required = stellar_agent_core::wallet::MlockRequired::Warn;
+        std::fs::write(fixture.path(), unbound_body(false)).unwrap();
+        let (status, output) =
+            super::super::sign_policy::tests::native_sign(&profile, &fixture.path(), false).await;
+        assert_eq!(status, 0, "{output}");
+        let signed = std::fs::read_to_string(fixture.path()).unwrap();
+        let canonical =
+            stellar_agent_core::policy::v1::canonical::canonical_bytes(&signed).unwrap();
+        let expected = Pin::new(
+            8,
+            stellar_agent_core::policy::v1::signature::digest(&canonical),
+            fixture.owner.verifying_key().to_bytes(),
+        )
+        .unwrap();
+        assert!(
+            stellar_agent_core::policy::v1::verified::validate_profile_body(
+                &signed.parse().unwrap(),
+                &profile
+            )
+            .is_err()
+        );
+        let load = PolicyLoad {
+            path: &fixture.path(),
+            profile: &profile,
+            profile_name: "operator",
+            owner_pubkey: &fixture.owner.verifying_key().to_bytes(),
+            owner_source: OwnerKeySource::Keyring,
+            window_path: &fixture.window,
+        };
+        assert!(
+            load_verified_policy(&load, PolicyStateStore::new(), PinMode::CompareOnly).is_err()
+        );
+        fixture.run().unwrap();
+        assert_eq!(fixture.pin(), PinState::Present(expected));
+        let before = fixture.pin();
+        std::fs::write(fixture.path(), "invalid policy").unwrap();
+        ensure_policy_pin(
+            "operator",
+            &fixture.profile,
+            &fixture.path(),
+            &fixture.window,
+            &toml_edit::DocumentMut::new(),
+        )
+        .unwrap();
+        assert_eq!(fixture.pin(), before);
+        assert_eq!(
+            std::fs::read_to_string(fixture.path()).unwrap(),
+            "invalid policy"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn initial_pin_verifies_signature_sequence_and_owner() {
+        for defect in [
+            "unsigned",
+            "tampered",
+            "wrong-owner",
+            "v1",
+            "missing-sequence",
+            "zero",
+            "negative",
+        ] {
+            let fixture = Fixture::new();
+            let mut doc = unbound_body(false)
+                .parse::<toml_edit::DocumentMut>()
+                .unwrap();
+            match defect {
+                "v1" => {
+                    doc.remove("mainnet");
+                    doc.remove("sequence");
+                    doc["version"] = toml_edit::value(1);
+                }
+                "zero" => doc["sequence"] = toml_edit::value(0),
+                "negative" => doc["sequence"] = toml_edit::value(-1),
+                _ => (),
+            }
+            fixture.sign(&doc.to_string());
+            match defect {
+                "missing-sequence" => {
+                    let mut signed = std::fs::read_to_string(fixture.path())
+                        .unwrap()
+                        .parse::<toml_edit::DocumentMut>()
+                        .unwrap();
+                    signed.remove("sequence");
+                    std::fs::write(fixture.path(), signed.to_string()).unwrap();
+                }
+                "unsigned" => std::fs::write(fixture.path(), doc.to_string()).unwrap(),
+                "tampered" => {
+                    let raw = std::fs::read_to_string(fixture.path())
+                        .unwrap()
+                        .replace("review", "altered");
+                    std::fs::write(fixture.path(), raw).unwrap();
+                }
+                "wrong-owner" => {
+                    let other = SigningKey::from_bytes(&[12; 32]);
+                    put(
+                        &KeyringEntryRef::default_owner_key("operator"),
+                        &stellar_strkey::ed25519::PublicKey(other.verifying_key().to_bytes())
+                            .to_string(),
+                    );
+                    put(
+                        &signer_identity_entry_ref(&fixture.profile.mcp_signer_default),
+                        &SignerIdentityRecord::signed_for_test(
+                            [2; 32],
+                            "operator",
+                            &fixture.profile,
+                            &other,
+                        )
+                        .render()
+                        .unwrap(),
+                    );
+                }
+                _ => (),
+            }
+            let before = std::fs::read(fixture.path()).unwrap();
+            let error = fixture.run().unwrap_err();
+            let expected = match defect {
+                "tampered" | "wrong-owner" => "policy.owner_signature_invalid",
+                "v1" => "profile.enable_mainnet_precondition",
+                _ => "policy.policy_file_parse_failed",
+            };
+            assert_eq!(error.0, expected, "{defect}: {error:?}");
+            assert_eq!(std::fs::read(fixture.path()).unwrap(), before);
+            assert_eq!(fixture.pin(), PinState::Absent);
+            assert!(get(&fixture.nonce_ref()).is_none());
+            assert!(!fixture.dir.path().join("audit.jsonl").exists());
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn initial_pin_loader_refuses_v1_and_nonpositive_sequence() {
+        use stellar_agent_core::policy::v1::verified::pin_provisioning_policy;
+
+        for defect in ["v1", "zero", "negative"] {
+            let fixture = Fixture::new();
+            let mut body = unbound_body(false)
+                .parse::<toml_edit::DocumentMut>()
+                .unwrap();
+            match defect {
+                "v1" => {
+                    body.remove("mainnet");
+                    body.remove("sequence");
+                    body["version"] = toml_edit::value(1);
+                }
+                "zero" => body["sequence"] = toml_edit::value(0),
+                "negative" => body["sequence"] = toml_edit::value(-1),
+                _ => unreachable!(),
+            }
+            fixture.sign(&body.to_string());
+            let bytes = std::fs::read_to_string(fixture.path()).unwrap();
+            let error = pin_provisioning_policy(
+                &PolicyLoad {
+                    path: &fixture.path(),
+                    profile: &fixture.profile,
+                    profile_name: "operator",
+                    owner_pubkey: &fixture.owner.verifying_key().to_bytes(),
+                    owner_source: OwnerKeySource::Keyring,
+                    window_path: &fixture.window,
+                },
+                &bytes.parse().unwrap(),
+            )
+            .unwrap_err();
+            assert_eq!(error.wire_code(), "policy.policy_file_parse_failed");
+            assert!(
+                error.to_string().contains(if defect == "v1" {
+                    "initial pin requires a v2 policy"
+                } else {
+                    "v2 sequence must be an integer in 1..=i64::MAX"
+                }),
+                "{defect}: {error}"
+            );
+            assert_eq!(fixture.pin(), PinState::Absent);
+            assert_eq!(std::fs::read_to_string(fixture.path()).unwrap(), bytes);
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn unsigned_v1_reports_signature_error_before_version_refusal() {
+        let fixture = Fixture::new();
+        let mut body = unbound_body(false)
+            .parse::<toml_edit::DocumentMut>()
+            .unwrap();
+        body.remove("mainnet");
+        body.remove("sequence");
+        body["version"] = toml_edit::value(1);
+        let bytes = body.to_string();
+        std::fs::write(fixture.path(), &bytes).unwrap();
+        let error = fixture.run().unwrap_err();
+        assert_eq!(error.0, "policy.policy_file_parse_failed");
+        assert!(error.1.contains("no `[signature]` table"), "{error:?}");
+        assert_eq!(fixture.pin(), PinState::Absent);
+        assert_eq!(std::fs::read_to_string(fixture.path()).unwrap(), bytes);
+        assert!(get(&fixture.nonce_ref()).is_none());
+        assert!(!fixture.dir.path().join("audit.jsonl").exists());
+    }
+
+    #[test]
+    #[serial]
+    fn initial_pin_uses_the_supplied_body() {
+        let fixture = Fixture::new();
+        fixture.sign(&unbound_body(false));
+        let raw = std::fs::read_to_string(fixture.path()).unwrap();
+        let body = raw.parse().unwrap();
+        let canonical = stellar_agent_core::policy::v1::canonical::canonical_bytes(&raw).unwrap();
+        std::fs::write(fixture.path(), "invalid policy").unwrap();
+        ensure_policy_pin(
+            "operator",
+            &fixture.profile,
+            &fixture.path(),
+            &fixture.window,
+            &body,
+        )
+        .unwrap();
+        assert_eq!(
+            fixture.pin(),
+            PinState::Present(
+                Pin::new(
+                    7,
+                    stellar_agent_core::policy::v1::signature::digest(&canonical),
+                    fixture.owner.verifying_key().to_bytes(),
+                )
+                .unwrap()
+            )
+        );
+        assert_eq!(
+            std::fs::read_to_string(fixture.path()).unwrap(),
+            "invalid policy"
+        );
+        assert!(get(&fixture.nonce_ref()).is_none());
+        assert!(!fixture.dir.path().join("audit.jsonl").exists());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn partial_binding_fields_refuse() {
+        let fields = ["profile", "endpoint_host", "installation_nonce_sha256"];
+        for mask in 1_u8..7 {
+            for nonce in ["absent", "present", "unreadable"] {
+                let present = nonce == "present";
+                let fixture = Fixture::new();
+                let _home =
+                    stellar_agent_test_support::StellarAgentHomeGuard::new(fixture.dir.path());
+                let mut doc = FULL.parse::<toml_edit::DocumentMut>().unwrap();
+                for (index, field) in fields.iter().enumerate() {
+                    if mask & (1 << index) == 0 {
+                        doc["mainnet"].as_table_like_mut().unwrap().remove(field);
+                    }
+                }
+                let strict = stellar_agent_core::policy::v1::verified::validate_profile_body(
+                    &doc,
+                    &fixture.profile,
+                )
+                .unwrap_err();
+                let body = doc.to_string();
+                std::fs::write(fixture.path(), &body).unwrap();
+                if present {
+                    put(&fixture.nonce_ref(), "fixture-nonce");
+                }
+                if nonce == "unreadable" {
+                    let coordinate = fixture.nonce_ref();
+                    keyring_mock::inject_no_logon_session(&coordinate.service, &coordinate.account)
+                        .unwrap();
+                }
+                let (status, output) = super::super::sign_policy::tests::native_sign(
+                    &fixture.profile,
+                    &fixture.path(),
+                    false,
+                )
+                .await;
+                assert_eq!(status, 1);
+                assert_eq!(output["error"]["code"], strict.wire_code());
+                assert!(
+                    output["error"]["message"]
+                        .as_str()
+                        .unwrap()
+                        .contains(&strict.to_string())
+                );
+                assert_eq!(std::fs::read_to_string(fixture.path()).unwrap(), body);
+                assert_eq!(fixture.pin(), PinState::Absent);
+                fixture.sign(&body);
+                let signed = std::fs::read(fixture.path()).unwrap();
+                let error = ensure_policy_pin(
+                    "operator",
+                    &fixture.profile,
+                    &fixture.path(),
+                    &fixture.window,
+                    &std::str::from_utf8(&signed).unwrap().parse().unwrap(),
+                )
+                .unwrap_err();
+                assert_eq!(error.0, strict.wire_code());
+                assert_eq!(error.1, strict.to_string());
+                assert_eq!(std::fs::read(fixture.path()).unwrap(), signed);
+                assert_eq!(fixture.pin(), PinState::Absent);
+                assert_eq!(
+                    get(&fixture.nonce_ref()),
+                    present.then(|| "fixture-nonce".to_owned())
+                );
+                assert!(!fixture.dir.path().join("audit.jsonl").exists());
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn provisioning_nonbinding_checks_remain_strict() {
+        for defect in [
+            "scope",
+            "keys",
+            "fee",
+            "credentials",
+            "ttl",
+            "thresholds",
+            "origin",
+            "certificate",
+            "minimum",
+        ] {
+            let fixture = Fixture::new();
+            let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(fixture.dir.path());
+            let mut doc = unbound_body(false)
+                .parse::<toml_edit::DocumentMut>()
+                .unwrap();
+            match defect {
+                "scope" => doc["scope"] = toml_edit::value("profile:other"),
+                "keys" => doc["mainnet"]["unknown"] = toml_edit::value(true),
+                "fee" => doc["mainnet"]["classic_max_fee_per_op_stroops"] = toml_edit::value(-1),
+                "credentials" => {
+                    doc["mainnet"]
+                        .as_table_like_mut()
+                        .unwrap()
+                        .remove("approval_credentials");
+                }
+                "ttl" => doc["mainnet"]["authorization_ttl_seconds"] = toml_edit::value(-1),
+                "thresholds" => {
+                    doc["mainnet"]["cross_check_thresholds"]["native"] = toml_edit::value("-1")
+                }
+                "origin" => {
+                    doc["mainnet"]["approval_origin"] =
+                        toml_edit::value("http://approve.example.invalid")
+                }
+                "certificate" => {
+                    doc["mainnet"]["approval_cert_spki_sha256"] = toml_edit::value("invalid-pin")
+                }
+                "minimum" => {
+                    doc["rules"]
+                        .as_array_of_tables_mut()
+                        .unwrap()
+                        .get_mut(0)
+                        .unwrap()["ttl_secs"] = toml_edit::value(86401)
+                }
+                _ => unreachable!(),
+            }
+            let body = doc.to_string();
+            let applicable = defect != "minimum" || cfg!(feature = "mainnet-write");
+            let core_code = match defect {
+                "credentials" => "policy.mainnet_minimum_unmet",
+                "fee" | "ttl" | "thresholds" | "minimum" if cfg!(feature = "mainnet-write") => {
+                    "policy.mainnet_minimum_unmet"
+                }
+                _ => "policy.policy_file_parse_failed",
+            };
+            let signing_code = match defect {
+                "scope" | "origin" | "certificate" => "sign_policy.policy_body_invalid",
+                "keys" => "sign_policy.canonicalization_failed",
+                _ => core_code,
+            };
+            let mut profile = fixture.profile.clone();
+            profile.wallet.mlock_required = stellar_agent_core::wallet::MlockRequired::Warn;
+            std::fs::write(fixture.path(), &body).unwrap();
+            let (status, output) =
+                super::super::sign_policy::tests::native_sign(&profile, &fixture.path(), false)
+                    .await;
+            if applicable {
+                assert_eq!(status, 1, "{defect}: {output}");
+                assert_eq!(output["error"]["code"], signing_code, "{defect}: {output}");
+                assert_eq!(std::fs::read_to_string(fixture.path()).unwrap(), body);
+                assert_eq!(fixture.pin(), PinState::Absent);
+            } else {
+                assert_eq!(status, 0, "{output}");
+            }
+            if defect == "keys" {
+                std::fs::write(
+                    fixture.path(),
+                    format!(
+                        "{body}\n[signature]\nowner_id = \"{}\"\nsig = \"{}\"\n",
+                        stellar_strkey::ed25519::PublicKey(
+                            fixture.owner.verifying_key().to_bytes()
+                        ),
+                        "00".repeat(64)
+                    ),
+                )
+                .unwrap();
+            } else {
+                fixture.sign(&body);
+            }
+            let signed = std::fs::read(fixture.path()).unwrap();
+            let result = fixture.run();
+            if applicable {
+                assert_eq!(result.unwrap_err().0, core_code, "{defect}");
+                assert_eq!(std::fs::read(fixture.path()).unwrap(), signed);
+                assert_eq!(fixture.pin(), PinState::Absent);
+                assert!(get(&fixture.nonce_ref()).is_none());
+                assert!(!fixture.dir.path().join("audit.jsonl").exists());
+            } else {
+                result.unwrap();
+            }
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn initial_pin_concurrent_pin_returns_unchanged() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let profile = Fixture::profile();
+        let owner_coordinate = KeyringEntryRef::default_owner_key("operator");
+        let hook_path = Arc::new(Mutex::new(None::<std::path::PathBuf>));
+        let hook_path_copy = hook_path.clone();
+        let armed = Arc::new(AtomicBool::new(false));
+        let hook_armed = armed.clone();
+        let hook_profile = profile.clone();
+        let concurrent = Pin::new(12, [12; 32], [12; 32]).unwrap();
+        let hook_pin = concurrent.clone();
+        keyring_mock::install_with_read_hooks(vec![keyring_mock::ReadHook::new(
+            &owner_coordinate.service,
+            &owner_coordinate.account,
+            Arc::new(move || {
+                if hook_armed.swap(false, Ordering::SeqCst) {
+                    let path = hook_path_copy.lock().unwrap().clone().unwrap();
+                    let lock = WindowStoreLock::acquire_for(
+                        &path,
+                        &hook_profile.policy_window_state_key_id,
+                    )
+                    .unwrap();
+                    pin::write_for_test(
+                        &lock,
+                        &PinScope::for_profile(&path, &hook_profile),
+                        &hook_pin,
+                    )
+                    .unwrap();
+                }
+            }),
+        )])
+        .unwrap();
+        let fixture = Fixture::seeded(profile);
+        fixture.sign(&unbound_body(false));
+        let mut other_profile = fixture.profile.clone();
+        other_profile.policy_window_state_key_id =
+            KeyringEntryRef::default_policy_window_state_key("other");
+        let other_window = fixture.dir.path().join("other.window");
+        let other_pin = Pin::new(4, [4; 32], [4; 32]).unwrap();
+        let other_lock =
+            WindowStoreLock::acquire_for(&other_window, &other_profile.policy_window_state_key_id)
+                .unwrap();
+        pin::write_for_test(
+            &other_lock,
+            &PinScope::for_profile(&other_window, &other_profile),
+            &other_pin,
+        )
+        .unwrap();
+        drop(other_lock);
+        *hook_path.lock().unwrap() = Some(fixture.window.clone());
+        armed.store(true, Ordering::SeqCst);
+        let bytes = std::fs::read(fixture.path()).unwrap();
+        ensure_policy_pin(
+            "operator",
+            &fixture.profile,
+            &fixture.path(),
+            &fixture.window,
+            &std::str::from_utf8(&bytes).unwrap().parse().unwrap(),
+        )
+        .unwrap();
+        assert!(!armed.load(Ordering::SeqCst));
+        assert_eq!(fixture.pin(), PinState::Present(concurrent.clone()));
+        assert_eq!(
+            read_pin_without_creating(&other_window, &other_profile).unwrap(),
+            PinState::Present(other_pin.clone())
+        );
+        assert_eq!(std::fs::read(fixture.path()).unwrap(), bytes);
+        assert!(get(&fixture.nonce_ref()).is_none());
+        assert!(!fixture.dir.path().join("audit.jsonl").exists());
+        fixture.run().unwrap();
+        assert_eq!(fixture.pin(), PinState::Present(concurrent));
+        assert_eq!(
+            read_pin_without_creating(&other_window, &other_profile).unwrap(),
+            PinState::Present(other_pin)
+        );
+        assert!(get(&fixture.nonce_ref()).is_some());
+    }
+
+    #[test]
+    #[serial]
+    fn initial_pin_nonce_guard_holds_the_lock() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        for unreadable in [false, true] {
+            let profile = Fixture::profile();
+            let coordinate = mainnet_enablement_entry_ref(&profile.policy_window_state_key_id);
+            let hook_coordinate = coordinate.clone();
+            let hook_profile = profile.clone();
+            let hook_path = Arc::new(Mutex::new(None::<std::path::PathBuf>));
+            let path_copy = hook_path.clone();
+            let probes = Arc::new(AtomicUsize::new(0));
+            let count = probes.clone();
+            keyring_mock::install_with_read_hooks(vec![keyring_mock::ReadHook::new(
+                &coordinate.service, &coordinate.account, Arc::new(move || {
+                    if count.fetch_add(1, Ordering::SeqCst) == 1 {
+                        let path = path_copy.lock().unwrap().clone().unwrap();
+                        assert!(matches!(WindowStoreLock::acquire_for(&path, &hook_profile.policy_window_state_key_id),
+                            Err(stellar_agent_core::policy::state_lock::StateLockError::WriterLocked)), "nonce recheck holds the state lock");
+                        if unreadable {
+                            keyring_mock::inject_no_logon_session(&hook_coordinate.service, &hook_coordinate.account).unwrap();
+                        } else { put(&hook_coordinate, "concurrent-nonce"); }
+                    }
+                }),
+            )]).unwrap();
+            let fixture = Fixture::seeded(profile);
+            *hook_path.lock().unwrap() = Some(fixture.window.clone());
+            fixture.sign(&unbound_body(false));
+            let bytes = std::fs::read(fixture.path()).unwrap();
+            let error = fixture.run().unwrap_err();
+            assert_eq!(probes.load(Ordering::SeqCst), 2);
+            assert_eq!(
+                error.0,
+                if unreadable {
+                    "policy.pin_unusable"
+                } else {
+                    "policy.pin_absent"
+                }
+            );
+            assert_eq!(fixture.pin(), PinState::Absent);
+            assert_eq!(std::fs::read(fixture.path()).unwrap(), bytes);
+            assert!(!fixture.dir.path().join("audit.jsonl").exists());
+        }
+    }
+
+    fn cycle_fixture() -> (Fixture, stellar_agent_test_support::StellarAgentHomeGuard) {
+        let mut fixture = Fixture::new();
+        let home = stellar_agent_test_support::StellarAgentHomeGuard::new(fixture.dir.path());
+        fixture.profile.wallet.mlock_required = stellar_agent_core::wallet::MlockRequired::Warn;
+        fixture.window =
+            stellar_agent_core::profile::schema::default_policy_window_state_path_for("operator");
+        (fixture, home)
+    }
+
+    async fn enable_native_body(fixture: &Fixture, remote: bool) -> serde_json::Value {
+        std::fs::write(fixture.path(), unbound_body(remote)).unwrap();
+        let (status, output) =
+            super::super::sign_policy::tests::native_sign(&fixture.profile, &fixture.path(), false)
+                .await;
+        assert_eq!(status, 0, "{output}");
+        assert_eq!(output["data"]["sequence"], 8);
+        assert_eq!(fixture.pin(), PinState::Absent);
+        fixture.run().unwrap()
+    }
+
+    async fn sign_bound_body(fixture: &Fixture) -> (i32, serde_json::Value) {
+        super::super::sign_policy::tests::native_sign(&fixture.profile, &fixture.path(), false)
+            .await
+    }
+
+    fn check_native_body(fixture: &mut Fixture) -> Result<serde_json::Value, Failure> {
+        fixture.args.check = true;
+        let result = fixture.run();
+        fixture.args.check = false;
+        result
+    }
+
+    fn native_state(fixture: &mut Fixture) -> Result<serde_json::Value, Failure> {
+        fixture.args.state = true;
+        let result = fixture.run();
+        fixture.args.state = false;
+        result
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn enablement_persists_while_check_fails() {
+        let (mut fixture, _home) = cycle_fixture();
+        enable_native_body(&fixture, false).await;
+        let snapshot = persisted(&fixture);
+        let nonce = get(&fixture.nonce_ref());
+        assert!(nonce.is_some());
+        let stale = check_native_body(&mut fixture);
+        assert_eq!(exit_code(&stale), 1);
+        assert_eq!(stale.unwrap()["valid"], false);
+        let state = native_state(&mut fixture);
+        assert_eq!(exit_code(&state), 0);
+        assert_eq!(state.unwrap()["state"], "enabled");
+        assert_eq!(
+            fixture.run().unwrap_err().0,
+            "profile.enable_mainnet_nonce_exists"
+        );
+        assert_eq!(persisted(&fixture), snapshot);
+        assert_eq!(get(&fixture.nonce_ref()), nonce);
+    }
+
+    fn assert_enabled_bindings(fixture: &Fixture, enabled: &serde_json::Value) -> PinState {
+        assert_eq!(enabled["policy_needs_signature"], true);
+        let pin = fixture.pin();
+        assert!(matches!(&pin, PinState::Present(pin) if pin.sequence() == 8));
+        let rewritten = std::fs::read_to_string(fixture.path()).unwrap();
+        let body = rewritten.parse::<toml_edit::DocumentMut>().unwrap();
+        assert_eq!(body["mainnet"]["profile"].as_str(), Some("operator"));
+        assert_eq!(
+            body["mainnet"]["endpoint_host"].as_str(),
+            Some("rpc.example.invalid")
+        );
+        assert_eq!(
+            body["mainnet"]["installation_nonce_sha256"].as_str(),
+            enabled["installation_nonce_sha256"].as_str()
+        );
+        pin
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn post_enable_resign() {
+        let (fixture, _home) = cycle_fixture();
+        let enabled = enable_native_body(&fixture, false).await;
+        let pin = assert_enabled_bindings(&fixture, &enabled);
+        let (status, signed) = sign_bound_body(&fixture).await;
+        assert_eq!(status, 0, "{signed}");
+        assert_eq!(signed["data"]["sequence"], 9);
+        assert_eq!(signed["data"]["previous_sequence"], 8);
+        assert_eq!(fixture.pin(), pin);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn final_check_after_bound_signing() {
+        let (mut fixture, _home) = cycle_fixture();
+        enable_native_body(&fixture, false).await;
+        let (status, signed) = sign_bound_body(&fixture).await;
+        assert_eq!(status, 0, "{signed}");
+        let snapshot = persisted(&fixture);
+        let pin = fixture.pin();
+        let nonce = get(&fixture.nonce_ref());
+        let final_check = check_native_body(&mut fixture);
+        assert_eq!(exit_code(&final_check), 0, "{final_check:?}");
+        assert_eq!(final_check.unwrap()["valid"], true);
+        let state = native_state(&mut fixture);
+        assert_eq!(exit_code(&state), 0);
+        assert_eq!(state.unwrap()["state"], "enabled");
+        assert_eq!(persisted(&fixture), snapshot);
+        assert_eq!(fixture.pin(), pin);
+        assert_eq!(get(&fixture.nonce_ref()), nonce);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn local_cycle_completes() {
+        let (mut fixture, _home) = cycle_fixture();
+        enable_native_body(&fixture, false).await;
+        let (status, signed) = sign_bound_body(&fixture).await;
+        assert_eq!(status, 0, "{signed}");
+        assert_eq!(signed["data"]["sequence"], 9);
+        let checked = check_native_body(&mut fixture);
+        assert_eq!(exit_code(&checked), 0, "{checked:?}");
+        assert_eq!(checked.unwrap()["valid"], true);
+        let state = native_state(&mut fixture);
+        assert_eq!(exit_code(&state), 0);
+        assert_eq!(state.unwrap()["state"], "enabled");
+        assert!(matches!(fixture.pin(), PinState::Present(pin) if pin.sequence() == 8));
+        assert!(get(&fixture.nonce_ref()).is_some());
+    }
+    #[tokio::test]
+    #[serial]
+    async fn remote_bootstrap_cycle() {
+        let (mut fixture, _home) = cycle_fixture();
+        let enabled = enable_native_body(&fixture, true).await;
+        let pin = assert_enabled_bindings(&fixture, &enabled);
+        let snapshot = persisted(&fixture);
+        let nonce = get(&fixture.nonce_ref());
+        assert!(nonce.is_some());
+        let stale = check_native_body(&mut fixture);
+        assert_eq!(exit_code(&stale), 1);
+        assert_eq!(stale.unwrap()["valid"], false);
+        let state = native_state(&mut fixture);
+        assert_eq!(exit_code(&state), 0);
+        assert_eq!(state.unwrap()["state"], "enabled");
+        assert_eq!(
+            fixture.run().unwrap_err().0,
+            "profile.enable_mainnet_nonce_exists"
+        );
+        assert_eq!(persisted(&fixture), snapshot);
+        assert_eq!(get(&fixture.nonce_ref()), nonce);
+        let (status, signed) = sign_bound_body(&fixture).await;
+        assert_eq!(status, 0, "{signed}");
+        assert_eq!(signed["data"]["sequence"], 9);
+        assert_eq!(signed["data"]["previous_sequence"], 8);
+        assert_eq!(fixture.pin(), pin);
+        let snapshot = persisted(&fixture);
+        let checked = check_native_body(&mut fixture);
+        assert_eq!(exit_code(&checked), 0, "{checked:?}");
+        assert_eq!(checked.unwrap()["valid"], true);
+        let state = native_state(&mut fixture);
+        assert_eq!(exit_code(&state), 0);
+        assert_eq!(state.unwrap()["state"], "enabled");
+        assert_eq!(persisted(&fixture), snapshot);
+        assert_eq!(fixture.pin(), pin);
+        assert_eq!(get(&fixture.nonce_ref()), nonce);
     }
 }

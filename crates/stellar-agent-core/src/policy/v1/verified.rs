@@ -138,6 +138,14 @@ pub(crate) fn parse_thresholds(
 }
 
 fn parse_mainnet(doc: &DocumentMut, profile: &Profile) -> Result<Option<MainnetBody>, PolicyError> {
+    parse_mainnet_fields(doc, profile, false)
+}
+
+fn parse_mainnet_fields(
+    doc: &DocumentMut,
+    profile: &Profile,
+    allow_unbound: bool,
+) -> Result<Option<MainnetBody>, PolicyError> {
     let Some(item) = doc.get("mainnet") else {
         return Ok(None);
     };
@@ -162,37 +170,51 @@ fn parse_mainnet(doc: &DocumentMut, profile: &Profile) -> Result<Option<MainnetB
             .and_then(|v| u32::try_from(v).ok())
             .ok_or_else(|| parse_error(format!("mainnet.{key} must be a u32")))
     };
-    let nonce = text("installation_nonce_sha256")?;
-    if nonce.len() != 64
-        || !nonce
-            .bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-    {
-        return Err(parse_error(
-            "installation_nonce_sha256 must be 64 lowercase hex characters",
-        ));
-    }
-    let installation_nonce_sha256 =
-        crate::hex::decode_hex32(&nonce).map_err(|_| parse_error("invalid nonce digest"))?;
-    Ok(Some(MainnetBody {
-        approval_origin,
-        approval_cert_spki_sha256,
-        profile: text("profile")?,
-        endpoint_host: text("endpoint_host")?,
-        installation_nonce_sha256,
-        classic_max_fee_per_op_stroops: integer("classic_max_fee_per_op_stroops")?,
-        authorization_ttl_seconds: table
-            .get("authorization_ttl_seconds")
-            .map(|_| integer("authorization_ttl_seconds"))
-            .transpose()?,
-        cross_check_thresholds: parse_thresholds(
-            table.get("cross_check_thresholds"),
-            &profile.network_passphrase,
-        )?,
-        approval_credentials: super::approval_credentials::parse_approval_credentials(
-            table.get("approval_credentials"),
-        )?,
-    }))
+    let unbound = allow_unbound
+        && ["profile", "endpoint_host", "installation_nonce_sha256"]
+            .iter()
+            .all(|key| table.get(key).is_none());
+    let bindings = if unbound {
+        None
+    } else {
+        let nonce = text("installation_nonce_sha256")?;
+        if nonce.len() != 64
+            || !nonce
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
+            return Err(parse_error(
+                "installation_nonce_sha256 must be 64 lowercase hex characters",
+            ));
+        }
+        let digest =
+            crate::hex::decode_hex32(&nonce).map_err(|_| parse_error("invalid nonce digest"))?;
+        Some((text("profile")?, text("endpoint_host")?, digest))
+    };
+    let classic_max_fee_per_op_stroops = integer("classic_max_fee_per_op_stroops")?;
+    let authorization_ttl_seconds = table
+        .get("authorization_ttl_seconds")
+        .map(|_| integer("authorization_ttl_seconds"))
+        .transpose()?;
+    let cross_check_thresholds = parse_thresholds(
+        table.get("cross_check_thresholds"),
+        &profile.network_passphrase,
+    )?;
+    let approval_credentials =
+        super::approval_credentials::parse_approval_credentials(table.get("approval_credentials"))?;
+    Ok(bindings.map(
+        |(profile, endpoint_host, installation_nonce_sha256)| MainnetBody {
+            approval_origin,
+            approval_cert_spki_sha256,
+            profile,
+            endpoint_host,
+            installation_nonce_sha256,
+            classic_max_fee_per_op_stroops,
+            authorization_ttl_seconds,
+            cross_check_thresholds,
+            approval_credentials,
+        },
+    ))
 }
 
 /// Validates profile-dependent fields before a policy is signed.
@@ -205,6 +227,65 @@ fn parse_mainnet(doc: &DocumentMut, profile: &Profile) -> Result<Option<MainnetB
 /// credentials, or a mainnet table on testnet.
 pub fn validate_profile_body(doc: &DocumentMut, profile: &Profile) -> Result<(), PolicyError> {
     parse_mainnet(doc, profile).map(|_| ())
+}
+
+/// Validates mainnet content for signing before installation enablement.
+/// All binding fields may be absent together. Partial bindings remain invalid.
+/// This validation grants no runtime authority.
+///
+/// # Errors
+/// Refuses malformed content, partial bindings, or a mainnet table on testnet.
+pub fn validate_provisioning_body(doc: &DocumentMut, profile: &Profile) -> Result<(), PolicyError> {
+    parse_mainnet_fields(doc, profile, true).map(|_| ())
+}
+
+/// Verifies and establishes an absent pin before installation enablement.
+/// A concurrent pin stays unchanged. The nonce check and write hold the state lock.
+/// This operation constructs no runtime policy or proof.
+/// The supplied body comes through `read_signed`, whose provisioning path refuses
+/// non-v2 bodies and whose loader refuses nonpositive sequences.
+///
+/// # Errors
+/// Refuses invalid signatures, scopes, sequences, content, owner sources, locks,
+/// or nonce state. Binding fields may be absent together.
+pub fn pin_provisioning_policy(
+    load: &PolicyLoad<'_>,
+    body: &DocumentMut,
+) -> Result<(), PolicyError> {
+    let signed = read_signed(load, Some(body))?;
+    // The loader validates the v2 sequence before this extraction.
+    let sequence = signed
+        .doc
+        .get("sequence")
+        .and_then(Item::as_integer)
+        .unwrap_or_default();
+    if mainnet_minimum::required(&signed.doc, load.profile) {
+        if load.owner_source == OwnerKeySource::TestFile {
+            return Err(PolicyError::TestOwnerKeyRefused);
+        }
+        mainnet_minimum::validate(&signed.doc, load.profile, load.profile_name)?;
+    }
+    validate_provisioning_body(&signed.doc, load.profile)?;
+    let canonical = canonical_bytes(&signed.raw)?;
+    let digest = crate::mainnet::verified_policy::policy_digest(&canonical);
+    let lock = acquire_state_lock(load.window_path, load.profile)?;
+    let scope = PinScope::for_profile(load.window_path, load.profile);
+    let state = pin::read(&lock, &scope).map_err(PolicyError::from)?;
+    if let PinState::Present(_) = state {
+        return Ok(());
+    }
+    if advances(
+        &state,
+        sequence,
+        digest,
+        *load.owner_pubkey,
+        &signed.raw,
+        load.profile,
+    )? {
+        let pin = Pin::new(sequence, digest, *load.owner_pubkey).map_err(PolicyError::from)?;
+        pin::write(&lock, &scope, &pin).map_err(PolicyError::from)?;
+    }
+    Ok(())
 }
 
 /// Acquires the policy-state lock, retrying contention as
@@ -343,7 +424,7 @@ pub fn check_owner_enrollment(load: &PolicyLoad<'_>, pin: &Pin) -> Result<(), Po
     if *load.owner_pubkey == pin.owner() {
         return Ok(());
     }
-    let signed = read_signed(load)?;
+    let signed = read_signed(load, None)?;
     let body = check_body(load, &signed)?;
     advances(
         &PinState::Present(pin.clone()),
@@ -371,19 +452,31 @@ struct CheckedBody {
     mainnet: Option<MainnetBody>,
 }
 
-/// Reads the file once and verifies its signature. Every later check runs on
-/// the document parsed from these bytes.
-fn read_signed(load: &PolicyLoad<'_>) -> Result<SignedPolicy, PolicyError> {
-    let raw = read_policy_file(load.path)?;
+/// Verifies a supplied provisioning body or reads a runtime policy file once.
+/// Provisioning requires v2 after signature verification; runtime loading also accepts v1.
+fn read_signed(
+    load: &PolicyLoad<'_>,
+    provisioning_body: Option<&DocumentMut>,
+) -> Result<SignedPolicy, PolicyError> {
+    let raw = match provisioning_body {
+        Some(body) => body.to_string(),
+        None => read_policy_file(load.path)?,
+    };
     let document = load_signed_policy_text(
         &raw,
         load.profile_name,
         load.owner_pubkey,
         &load.profile.network_passphrase,
     )?;
-    let doc = raw
-        .parse::<DocumentMut>()
-        .map_err(|e| PolicyError::toml_syntax(&raw, &e))?;
+    if provisioning_body.is_some() && document.version != 2 {
+        return Err(parse_error("initial pin requires a v2 policy"));
+    }
+    let doc = match provisioning_body {
+        Some(body) => body.clone(),
+        None => raw
+            .parse::<DocumentMut>()
+            .map_err(|e| PolicyError::toml_syntax(&raw, &e))?,
+    };
     Ok(SignedPolicy { raw, document, doc })
 }
 
@@ -452,7 +545,7 @@ pub fn load_verified_policy(
     window_state: PolicyStateStore,
     pin_mode: PinMode,
 ) -> Result<VerifiedPolicy, PolicyError> {
-    let signed = read_signed(load)?;
+    let signed = read_signed(load, None)?;
     let body = check_body(load, &signed)?;
     let owner = *load.owner_pubkey;
     match pin_mode {
@@ -498,7 +591,7 @@ pub fn inspect_verified_policy(
     load: &PolicyLoad<'_>,
     window_state: PolicyStateStore,
 ) -> PolicyInspection {
-    let signed = match read_signed(load) {
+    let signed = match read_signed(load, None) {
         Ok(signed) => signed,
         Err(error) => {
             return PolicyInspection {

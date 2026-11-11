@@ -2652,3 +2652,139 @@ fn approval_origin_closed_keys_precede_signature() {
         .unwrap_err(),
     );
 }
+
+#[test]
+#[serial]
+fn runtime_binding_requirements_unchanged() {
+    use stellar_agent_core::policy::v1::verified::{check_owner_enrollment, validate_profile_body};
+    for source in [FULL, REMOTE] {
+        for removed in [
+            vec!["profile"],
+            vec!["endpoint_host"],
+            vec!["installation_nonce_sha256"],
+            vec!["profile", "endpoint_host", "installation_nonce_sha256"],
+        ] {
+            let (dir, profile, key) = fixture();
+            let mut body = source.parse::<DocumentMut>().unwrap();
+            let table = body["mainnet"].as_table_like_mut().unwrap();
+            for field in &removed {
+                table.remove(field);
+            }
+            let invalid = body.to_string();
+            let strict = validate_profile_body(&body, &profile).unwrap_err();
+            assert_eq!(strict.wire_code(), "policy.policy_file_parse_failed");
+            let missing = if removed.contains(&"installation_nonce_sha256") {
+                "installation_nonce_sha256"
+            } else {
+                removed[0]
+            };
+            assert_eq!(
+                strict.to_string(),
+                PolicyError::PolicyFileParseFailed {
+                    detail: format!("mainnet.{missing} must be a string"),
+                }
+                .to_string()
+            );
+            for present in [false, true] {
+                if present {
+                    load(dir.path(), source, &profile, &key, PinMode::Advance).unwrap();
+                }
+                let before = pinned(dir.path(), &profile);
+                for mode in [PinMode::CompareOnly, PinMode::Advance] {
+                    assert_eq!(
+                        load(dir.path(), &invalid, &profile, &key, mode)
+                            .unwrap_err()
+                            .to_string(),
+                        strict.to_string()
+                    );
+                    assert_eq!(pinned(dir.path(), &profile), before);
+                }
+                let signed_bytes = std::fs::read(dir.path().join("policy.toml")).unwrap();
+                let request = PolicyLoad {
+                    path: &dir.path().join("policy.toml"),
+                    profile: &profile,
+                    profile_name: "operator",
+                    owner_pubkey: &key.verifying_key().to_bytes(),
+                    owner_source: OwnerKeySource::Keyring,
+                    window_path: &dir.path().join("state.window"),
+                };
+                let inspection = inspect_verified_policy(&request, PolicyStateStore::new());
+                assert_eq!(
+                    inspection.verified.unwrap_err().to_string(),
+                    strict.to_string()
+                );
+                assert_eq!(pinned(dir.path(), &profile), before);
+                assert_eq!(std::fs::read(request.path).unwrap(), signed_bytes);
+            }
+            let owner = SigningKey::from_bytes(&[12; 32]);
+            let pinned_owner = match pinned(dir.path(), &profile) {
+                PinState::Present(pin) => pin,
+                _ => unreachable!(),
+            };
+            body["sequence"] = value(8);
+            body["owner_rotation"] = toml_edit::Item::Table(
+                stellar_agent_core::policy::v1::signature::build_owner_rotation(
+                    &body.to_string(),
+                    &key,
+                    &owner.verifying_key().to_bytes(),
+                )
+                .unwrap(),
+            );
+            std::fs::write(
+                dir.path().join("policy.toml"),
+                signed(&body.to_string(), &owner),
+            )
+            .unwrap();
+            let request = PolicyLoad {
+                path: &dir.path().join("policy.toml"),
+                profile: &profile,
+                profile_name: "operator",
+                owner_pubkey: &owner.verifying_key().to_bytes(),
+                owner_source: OwnerKeySource::Keyring,
+                window_path: &dir.path().join("state.window"),
+            };
+            assert_eq!(
+                check_owner_enrollment(&request, &pinned_owner)
+                    .unwrap_err()
+                    .to_string(),
+                strict.to_string()
+            );
+            assert_eq!(
+                pinned(dir.path(), &profile),
+                PinState::Present(pinned_owner.clone())
+            );
+            let mut bound = source.parse::<DocumentMut>().unwrap();
+            bound["sequence"] = value(8);
+            bound["owner_rotation"] = toml_edit::Item::Table(
+                stellar_agent_core::policy::v1::signature::build_owner_rotation(
+                    &bound.to_string(),
+                    &key,
+                    &owner.verifying_key().to_bytes(),
+                )
+                .unwrap(),
+            );
+            validate_profile_body(&bound, &profile).unwrap();
+            std::fs::write(request.path, signed(&bound.to_string(), &owner)).unwrap();
+            check_owner_enrollment(&request, &pinned_owner).unwrap();
+            assert_eq!(
+                pinned(dir.path(), &profile),
+                PinState::Present(pinned_owner)
+            );
+            assert_eq!(
+                inspect_verified_policy(&request, PolicyStateStore::new())
+                    .verified
+                    .unwrap()
+                    .sequence(),
+                8
+            );
+            for mode in [PinMode::CompareOnly, PinMode::Advance] {
+                assert_eq!(
+                    load_verified_policy(&request, PolicyStateStore::new(), mode)
+                        .unwrap()
+                        .sequence(),
+                    8
+                );
+            }
+        }
+    }
+}
