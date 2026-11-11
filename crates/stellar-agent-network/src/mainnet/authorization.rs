@@ -1102,8 +1102,8 @@ impl MainnetTxSignAuthorization {
     shared_methods!();
 
     /// An authorization over directly assembled facts, for this crate's tests
-    /// of the paths that consume one.
-    #[cfg(all(test, feature = "mainnet-write"))]
+    /// of the paths that consume one and for its test fixtures.
+    #[cfg(all(feature = "mainnet-write", any(test, feature = "test-helpers")))]
     pub(crate) fn for_crate_tests(inner: TxSignInner) -> Self {
         Self(inner)
     }
@@ -1189,8 +1189,8 @@ impl MainnetSorobanIntentAuthorization {
     shared_methods!();
 
     /// An authorization over directly assembled facts, for this crate's tests
-    /// of the paths that consume one.
-    #[cfg(all(test, feature = "mainnet-write"))]
+    /// of the paths that consume one and for its test fixtures.
+    #[cfg(all(feature = "mainnet-write", any(test, feature = "test-helpers")))]
     pub(crate) fn for_crate_tests(inner: SorobanIntentInner) -> Self {
         Self(inner)
     }

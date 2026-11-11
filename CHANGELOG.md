@@ -234,6 +234,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- The audit settlement lookup before an authorized submission answers from an
+  index the audit writer keeps. Fresh or settled bytes read no audit row file
+  while the file listing and the writer's tip are unchanged, and an owed
+  original reads one row. A keyed writer builds the index from the
+  verification walk of each acquisition. Answers, refusal codes, and audit
+  rows are unchanged.
+
 - The reads before a send of `pay`, `claim`, sponsored `accounts create` and
   `trustline` on both binaries run under a fixed 30-second pre-send budget,
   `PRE_SEND_BUDGET`, and a submit-layer read that outlasts it refuses with

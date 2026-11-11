@@ -28,7 +28,7 @@ pub mod authorization;
 pub mod clock;
 pub mod consumed;
 pub mod digest;
-#[cfg(all(test, feature = "mainnet-write"))]
+#[cfg(all(feature = "mainnet-write", any(test, feature = "test-helpers")))]
 pub(crate) mod fixtures;
 pub mod message;
 #[cfg(feature = "mainnet-write")]
@@ -36,6 +36,9 @@ pub(crate) mod mint;
 pub(crate) mod refusal;
 pub mod resolve;
 pub mod soroban;
+#[cfg(all(feature = "mainnet-write", feature = "test-helpers"))]
+#[doc(hidden)]
+pub mod test_support;
 pub(crate) mod types;
 
 pub use refusal::{MainnetAuthorizationError, MainnetPrecondition};

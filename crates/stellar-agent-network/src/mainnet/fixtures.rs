@@ -14,6 +14,13 @@
     clippy::expect_used,
     reason = "test fixtures; a failed setup is a failed test"
 )]
+#![cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "outside this crate's tests only the test-support facade uses these fixtures"
+    )
+)]
 
 use std::sync::{Arc, Mutex};
 
@@ -1076,6 +1083,7 @@ impl ResolverFixture {
         )
     }
 
+    #[cfg(any(test, feature = "test-hooks"))]
     pub(crate) fn context_with_routes(
         &self,
         routes: &[(&str, &str)],

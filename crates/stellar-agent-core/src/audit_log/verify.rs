@@ -67,6 +67,7 @@ use super::{
         derive_entry_tag_key, verify_chain_root,
     },
     entry::AuditEntry,
+    reader::RowSettlement,
     rotation::{MarkerNamesNoBoundary, oldest_retained_seed, read_prune_marker},
     schema::{EntryTagsRekeyCause, EventKind},
     tip_anchor::{PriorAnchoring, TipAnchor},
@@ -303,7 +304,13 @@ pub enum VerifyWarning {
 /// # }
 /// ```
 pub fn verify_log(log_path: &Path, hmac_key: Option<&[u8; 32]>) -> Result<VerifyOk, VerifyError> {
-    verify_walk(log_path, hmac_key, hmac_key.map(derive_entry_tag_key), None)
+    verify_walk(
+        log_path,
+        hmac_key,
+        hmac_key.map(derive_entry_tag_key),
+        None,
+        None,
+    )
 }
 
 /// [`verify_log`] with the active file read only up to `active_end_offset`,
@@ -327,7 +334,67 @@ pub(super) fn verify_log_within(
         hmac_key,
         hmac_key.map(derive_entry_tag_key),
         Some(active_end_offset),
+        None,
     )
+}
+
+/// [`verify_log_within`], also collecting the settlement rows of every walked
+/// file for the writer's settlement index.
+///
+/// The rows are those the walk parsed and checked; they come back only with a
+/// successful result, so a failed walk yields none.
+///
+/// # Errors
+///
+/// Every error of [`verify_log_within`].
+pub(super) fn verify_log_within_collecting(
+    log_path: &Path,
+    hmac_key: Option<&[u8; 32]>,
+    active_end_offset: u64,
+) -> Result<(VerifyOk, WalkedRows), VerifyError> {
+    let mut rows = WalkedRows {
+        files: Vec::new(),
+        exact: true,
+    };
+    let ok = verify_walk(
+        log_path,
+        hmac_key,
+        hmac_key.map(derive_entry_tag_key),
+        Some(active_end_offset),
+        Some(&mut rows),
+    )?;
+    Ok((ok, rows))
+}
+
+/// The settlement rows a verification walk read, oldest file first.
+pub(super) struct WalkedRows {
+    /// One entry per walked file, oldest first, the active file last.
+    pub(super) files: Vec<WalkedFile>,
+    /// `false` when a walked line holds bytes the settlement lookup reads
+    /// differently: a blank line with a non-ASCII space, or a bounded line
+    /// with no newline.
+    pub(super) exact: bool,
+}
+
+/// One walked file's settlement rows.
+pub(super) struct WalkedFile {
+    /// The file's path as the listing named it.
+    pub(super) path: PathBuf,
+    /// The hash the file's first entry chains from.
+    pub(super) initial_prev_hash: String,
+    /// The file's pending, submitted and failed rows that no quarantine row
+    /// of the file covers, oldest first.
+    pub(super) rows: Vec<WalkedRow>,
+}
+
+/// One settlement row of a walked file, with where it lies.
+pub(super) struct WalkedRow {
+    /// Byte offset of the row's first byte.
+    pub(super) offset: u64,
+    /// The row's length with its newline.
+    pub(super) len: u64,
+    /// What the row means to the settlement lookup.
+    pub(super) settlement: RowSettlement,
 }
 
 /// Verifies the chain and the entry tags of the log at `log_path` under
@@ -342,18 +409,20 @@ pub(super) fn verify_log_within(
 ///
 /// Every error of [`verify_log`] except the sidecar and marker tag failures.
 pub fn verify_entry_tags(log_path: &Path, key: &[u8; 32]) -> Result<VerifyOk, VerifyError> {
-    verify_walk(log_path, None, Some(derive_entry_tag_key(key)), None)
+    verify_walk(log_path, None, Some(derive_entry_tag_key(key)), None, None)
 }
 
 /// The walk behind [`verify_log`], [`verify_log_within`] and
 /// [`verify_entry_tags`]: `sidecar_key` checks the chain-root sidecars and
 /// the prune marker, `tag_key` the entry tags, and `active_limit`, when
-/// given, is where the walk stops reading the active file.
+/// given, is where the walk stops reading the active file. `collect`, when
+/// given, receives the settlement rows of every walked file.
 fn verify_walk(
     log_path: &Path,
     sidecar_key: Option<&[u8; 32]>,
     tag_key: Option<EntryTagKey>,
     active_limit: Option<u64>,
+    mut collect: Option<&mut WalkedRows>,
 ) -> Result<VerifyOk, VerifyError> {
     let hmac_key = sidecar_key;
     let mut tag_walk = EntryTagWalk::new(tag_key);
@@ -481,6 +550,7 @@ fn verify_walk(
                 byte_limit: if is_last_file { active_limit } else { None },
             },
             &mut tag_walk,
+            collect.as_deref_mut(),
         )?;
 
         let SingleFileResult {
@@ -942,9 +1012,15 @@ pub(super) fn collect_file_chain(log_path: &Path) -> Result<Vec<PathBuf>, Verify
 fn verify_single_file(
     ctx: VerifySingleFileContext<'_>,
     tag_walk: &mut EntryTagWalk,
+    mut collect: Option<&mut WalkedRows>,
 ) -> Result<SingleFileResult, VerifyError> {
     let path = ctx.path;
     let file_basename = basename_lossy(path);
+    #[cfg(test)]
+    super::reader::row_file_visits::record_open(
+        &file_basename,
+        super::reader::row_file_visits::VERIFY_WALK,
+    );
     let file = open_regular_file(path)?;
     let mut reader = BufReader::new(file.take(ctx.byte_limit.unwrap_or(u64::MAX)));
 
@@ -952,6 +1028,13 @@ fn verify_single_file(
     // For subsequent files, it is the last_hash of the preceding file.
     let initial_prev_hash = ctx.expected_initial_prev_hash.unwrap_or(ZERO_BLOCK_HASH);
     let mut prev_hash = initial_prev_hash.to_owned();
+    if let Some(collect) = collect.as_deref_mut() {
+        collect.files.push(WalkedFile {
+            path: path.to_path_buf(),
+            initial_prev_hash: initial_prev_hash.to_owned(),
+            rows: Vec::new(),
+        });
+    }
 
     let mut entries = 0usize;
     let mut end_offset = 0u64;
@@ -966,6 +1049,10 @@ fn verify_single_file(
     // in `warnings`; only a directive no later one covers reports it.
     let mut directives: Vec<Option<u64>> = Vec::new();
     let mut quarantine_warnings: Vec<(usize, usize, VerifyWarning)> = Vec::new();
+    // For the settlement lookup: every row's quarantine count, and the
+    // settlement rows with their row positions.
+    let mut lookup_quarantine: Vec<Option<u64>> = Vec::new();
+    let mut settlement_rows: Vec<(usize, WalkedRow)> = Vec::new();
 
     // Read through `read_until` rather than `BufRead::lines` so the byte offset
     // of the verified prefix stays exact: the tip anchor records where the chain
@@ -981,6 +1068,7 @@ fn verify_single_file(
         if read == 0 {
             break;
         }
+        let row_start = consumed;
         consumed = consumed.saturating_add(read as u64);
         let line_number = line_index + 1;
         line_index += 1;
@@ -992,9 +1080,17 @@ fn verify_single_file(
             }
         })?;
 
+        if let Some(collect) = collect.as_deref_mut()
+            && ((ctx.byte_limit.is_some() && raw.last() != Some(&b'\n'))
+                || (line.trim().is_empty() && !raw.iter().all(u8::is_ascii_whitespace)))
+        {
+            collect.exact = false;
+        }
         if line.trim().is_empty() {
             continue;
         }
+        #[cfg(test)]
+        super::reader::row_file_visits::record_row();
 
         // Parse the entry.
         let entry: AuditEntry =
@@ -1336,6 +1432,26 @@ fn verify_single_file(
             }
         }
 
+        if collect.is_some() {
+            let settlement = RowSettlement::of(&entry);
+            lookup_quarantine.push(match settlement {
+                RowSettlement::Quarantine(count) => Some(count),
+                _ => None,
+            });
+            if matches!(
+                settlement,
+                RowSettlement::Pending(_) | RowSettlement::Settled(_)
+            ) {
+                settlement_rows.push((
+                    row,
+                    WalkedRow {
+                        offset: row_start,
+                        len: read as u64,
+                        settlement,
+                    },
+                ));
+            }
+        }
         prev_hash = current_hash;
         entries += 1;
         end_offset = consumed;
@@ -1344,6 +1460,16 @@ fn verify_single_file(
     // A quarantine is reported only for a directive that takes effect: one
     // that no later directive of the file covers. Inserted from the last so
     // every earlier position stays where it was recorded.
+    // The settlement lookup drops the rows every quarantine row covers, tag
+    // or no tag, as the reader's walk does.
+    if let Some(file) = collect.and_then(|collect| collect.files.last_mut()) {
+        let lookup_covered = quarantine_coverage(&lookup_quarantine);
+        file.rows = settlement_rows
+            .into_iter()
+            .filter(|(row, _)| !lookup_covered[*row])
+            .map(|(_, walked)| walked)
+            .collect();
+    }
     let covered = quarantine_coverage(&directives);
     for (row, at, warning) in quarantine_warnings.into_iter().rev() {
         if !covered[row] {

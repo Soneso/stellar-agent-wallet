@@ -309,17 +309,48 @@ The `EventKind` match in the verifier is exhaustive with no wildcard arm, so add
 
 A backward timestamp jump larger than `BACKWARD_TS_WARN_THRESHOLD_MS` (60000 ms) is reported as a warning, not a failure, because NTP corrections can move wall-clock time backward.
 
-Settlement and receipt-clear lookups visit retained files newest first and
-stop after the first file with a matching row. Each visited file's in-file
-chain is verified, and in a log with no archives the first row must chain from
-the zero hash. The eleventh rotation deletes the oldest archive. Callers hold
-the writer guard during settlement and clear lookups. Accounting delivery
-retains it through append and acknowledgement. Writer-managed history holds at
-most eleven files of about 10 MiB each when pruning succeeds. A prune that
-stops leaves excess archives, for the causes listed above.
-Each lookup parses JSON and computes SHA-256 once per row visited. The
+Receipt-clear lookups visit retained files newest first and stop after the
+first file with a matching row. The settlement lookup answers from the
+writer's settlement index, which the same walk builds. Each visited file's
+in-file chain is verified, and in a log with no archives the first row must
+chain from the zero hash. The eleventh rotation deletes the oldest archive.
+Callers hold the writer guard during settlement and clear lookups. Accounting
+delivery retains it through append and acknowledgement. Writer-managed history
+holds at most eleven files of about 10 MiB each when pruning succeeds. A prune
+that stops leaves excess archives, for the causes listed above.
+Each walk parses JSON and computes SHA-256 once per row visited. The
 accounting-expiry lookup visits every retained file for its decision
-identifier. `tx status` and `stellar_transaction_status` acquire the writer
+identifier.
+
+The settlement index records the latest pending, submitted, or failed row of
+each envelope hash. Let F be the active file plus every retained archive.
+Every settlement lookup lists the directory, with the walk's rotation-window
+retries, and compares the listing and the writer's tip with the index:
+
+- With a complete index and both unchanged, fresh or settled bytes read no
+  row file. An owed hash reads one file and parses its one pending row.
+- A first lookup, or one after the index is discarded, walks at most F files
+  newest first. It stops at the first file with a match and keeps the files
+  it read; only a walk through all F files completes the index.
+- Memory holds one entry per distinct hash with a match, plus one path per
+  listed file.
+- Each answer is given under the index lock. Under that lock the lookup opens
+  the active file. A file that fails to open, is not the file the writer
+  holds, or is shorter than its verified tip discards the index. The lookup
+  then refuses through the walk with the walk's error.
+
+Receipt-clear lookups and the settled-row lookup use no index. Each call walks
+the bounded files newest first, so it reads up to F files.
+
+A keyed writer with an anchor store builds the complete index from the
+verification walk of each acquisition and tip verification. Those walks still
+read all F files, so they stay proportional to the retained history. A failed
+walk leaves no index.
+Committed appends, rotations, and prunes of the holding writer update the
+index. Any other listing or tip change, a quarantine row, or a pending row
+that fails to read back discards it. An obligation in the oldest retained
+archive keeps answering until the writer prunes that archive. Content edits
+under unchanged names are refused by the next keyed acquisition. `tx status` and `stellar_transaction_status` acquire the writer
 only to deliver an unacknowledged accounting event. A receipt projection that
 is owed alone completes without the writer. When the writer cannot be acquired
 or the retained history does not verify, both still render their answer. The
