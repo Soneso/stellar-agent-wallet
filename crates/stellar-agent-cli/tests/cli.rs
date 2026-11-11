@@ -101,3 +101,6 @@ mod profile_window_reset;
 
 #[path = "cli/tx_status_wire_guard.rs"]
 mod tx_status_wire_guard;
+
+#[path = "cli/proof_rows.rs"]
+mod proof_rows;

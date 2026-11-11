@@ -136,6 +136,8 @@ jobs:
       # enable it by default.
       - name: Run the offline tests
         run: cargo test --workspace --no-default-features --features test-helpers,test-hooks,test-loopback,verifier-registry
+      - name: Check the proof matrix
+        run: python3 .github/scripts/check-proof-matrix.py --configuration feature-off --workspace
       # The Friendbot helper tests run against loopback listeners only; `testnet-helpers` compiles the live client without reaching the network.
       - name: Run the test-support Friendbot unit tests
         run: cargo test -p stellar-agent-test-support --no-default-features --features testnet-helpers --lib
@@ -235,6 +237,8 @@ jobs:
         run: cargo test --workspace --features mainnet-write,test-helpers,test-hooks,test-loopback,verifier-registry
       - name: Check network feature forwarding in isolation
         run: cargo check -p stellar-agent-network --features mainnet-write
+      - name: Check the proof matrix
+        run: python3 .github/scripts/check-proof-matrix.py --configuration feature-on --workspace
 
   feature-discipline:
     name: feature-discipline
@@ -359,6 +363,8 @@ jobs:
         run: python3 .github/scripts/test-compare-crate-sums.py
       - name: Self-test the coverage floor gate
         run: python3 .github/scripts/test-check-coverage.py
+      - name: Self-test the proof matrix check
+        run: python3 .github/scripts/test-check-proof-matrix.py
       - name: Self-test the unsigned archive validation
         run: python3 .github/scripts/test-validate-unsigned-archive.py
       # The runner image documents no PyYAML for its system Python, so the

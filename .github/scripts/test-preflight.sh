@@ -53,10 +53,10 @@ FIXTURE="$TMP/fixture"
 CASES="docs-only upstream-base origin-base synced-fork-base install-surface-doc deleted-install-surface-doc welcome-workflow release-workflow
 release-rehearsal-workflow vendored-wasm-workflow
 triage-workflow triage-review-workflow triage-sweep-workflow
-ci-yml-only python-check-script shell-check-script testnet-driver-script skill inbox-web enroll-web bridge-web one-crate two-owners
+ci-yml-only python-check-script proof-matrix-only shell-check-script testnet-driver-script skill inbox-web enroll-web bridge-web one-crate two-owners
 target-specific-edge dev-dependency-edge optional-dependency-edge root-manifest lockfile toolchain
 unowned-rust-path
-wallet-manifest removed-member untracked-test-file fixture-markdown
+wallet-manifest removed-member untracked-test-file fixture-markdown crate-sources-select-proof-matrix
 committed-cross-scope-rename staged-rename-record spaces-and-an-apostrophe
 full vendored contracts action-script invariants-helper release-build-scripts duplicate-triggers changed-self-test
 deleted-shell-script deleted-self-test unavailable-tool missing-pyyaml
@@ -95,6 +95,7 @@ self-test:test-check-docs-style.py	python3 .github/scripts/test-check-docs-style
 self-test:test-check-gate-tool-versions.sh	bash .github/scripts/test-check-gate-tool-versions.sh
 self-test:test-check-install-surface.py	python3 .github/scripts/test-check-install-surface.py
 self-test:test-check-no-direct-sasignersetbaselined-emit.sh	bash .github/scripts/test-check-no-direct-sasignersetbaselined-emit.sh
+self-test:test-check-proof-matrix.py	python3 .github/scripts/test-check-proof-matrix.py
 self-test:test-check-ref-on-main.sh	bash .github/scripts/test-check-ref-on-main.sh
 self-test:test-check-workflow-invariants.py	python3 .github/scripts/test-check-workflow-invariants.py
 self-test:test-compare-crate-sums.py	python3 .github/scripts/test-compare-crate-sums.py
@@ -117,10 +118,12 @@ fmt	cargo fmt --all -- --check
 clippy	cargo clippy --workspace --all-targets --no-default-features --features deploy-cli,operator-enroll-browser-acceptance,test-helpers,test-hooks,test-loopback,testnet-acceptance,testnet-helpers,testnet-integration,verifier-registry,wiremock-helpers -- -D warnings
 rustdoc	RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --no-default-features --features deploy-cli,operator-enroll-browser-acceptance,test-helpers,test-hooks,test-loopback,testnet-acceptance,testnet-helpers,testnet-integration,verifier-registry,wiremock-helpers
 test	cargo test --workspace --no-default-features --features test-helpers,test-hooks,test-loopback,verifier-registry
+proof-matrix	python3 .github/scripts/check-proof-matrix.py --configuration feature-off --workspace
 feature-on:clippy	cargo clippy --workspace --all-targets --features mainnet-write,deploy-cli,operator-enroll-browser-acceptance,test-helpers,test-hooks,test-loopback,testnet-acceptance,testnet-helpers,testnet-integration,verifier-registry,wiremock-helpers -- -D warnings
 feature-on:doc	RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --features mainnet-write,deploy-cli,operator-enroll-browser-acceptance,test-helpers,test-hooks,test-loopback,testnet-acceptance,testnet-helpers,testnet-integration,verifier-registry,wiremock-helpers
 feature-on:test	cargo test --workspace --features mainnet-write,test-helpers,test-hooks,test-loopback,verifier-registry
 feature-on:network	cargo check -p stellar-agent-network --features mainnet-write
+proof-matrix:feature-on	python3 .github/scripts/check-proof-matrix.py --configuration feature-on --workspace
 release-shape	bash .github/scripts/release/check-host.sh
 test-support-friendbot	cargo test -p stellar-agent-test-support --no-default-features --features testnet-helpers --lib
 test-vendored-release-cfg	cargo test -p stellar-agent-smart-account --test vendored_wasm_release_cfg
@@ -313,7 +316,7 @@ expect_list() {
   fi
   local extra=() argument
   case "$CASE_NAME" in
-    deleted-install-surface-doc | welcome-workflow | release-workflow | release-rehearsal-workflow | vendored-wasm-workflow | triage-workflow | triage-review-workflow | triage-sweep-workflow | ci-yml-only | python-check-script | shell-check-script | one-crate | two-owners | target-specific-edge | dev-dependency-edge | optional-dependency-edge | root-manifest | lockfile | wallet-manifest | removed-member | untracked-test-file | staged-rename-record | spaces-and-an-apostrophe | action-script | invariants-helper | release-build-scripts | duplicate-triggers | changed-self-test | deleted-shell-script | deleted-self-test | the-preflight-itself)
+    deleted-install-surface-doc | welcome-workflow | release-workflow | release-rehearsal-workflow | vendored-wasm-workflow | triage-workflow | triage-review-workflow | triage-sweep-workflow | ci-yml-only | python-check-script | proof-matrix-only | shell-check-script | one-crate | two-owners | target-specific-edge | dev-dependency-edge | optional-dependency-edge | root-manifest | lockfile | wallet-manifest | removed-member | untracked-test-file | crate-sources-select-proof-matrix | staged-rename-record | spaces-and-an-apostrophe | action-script | invariants-helper | release-build-scripts | duplicate-triggers | changed-self-test | deleted-shell-script | deleted-self-test | the-preflight-itself)
       extra+=(feature-discipline self-test:test-check-feature-discipline.py)
       ;;
   esac
@@ -1103,6 +1106,13 @@ case_python_check_script() {
   expect_list "${ALWAYS[@]}" self-test:test-check-docs-style.py
 }
 
+# A change to the proof matrix alone selects both matrix checks.
+case_proof_matrix_only() {
+  start_case
+  edit .github/scripts/proof-matrix.toml
+  expect_list "${ALWAYS[@]}" proof-matrix proof-matrix:feature-on
+}
+
 case_shell_check_script() {
   start_case
   edit .github/scripts/check-gate-tool-versions.sh
@@ -1133,7 +1143,7 @@ case_inbox_web() {
   edit crates/stellar-agent-approval-ui/src/web/app_shared.js
   pin_packages "stellar-agent-approval-ui stellar-agent-approval-remote stellar-agent-cli stellar-agent-mcp stellar-agent-webauthn-bridge" test-helpers \
     crates/stellar-agent-approval-ui/src/web/app_shared.js
-  expect_list "${ALWAYS[@]}" "${PACKAGE_GATES[@]}" inbox-js mainnet-presence-js
+  expect_list "${ALWAYS[@]}" "${PACKAGE_GATES[@]}" proof-matrix proof-matrix:feature-on inbox-js mainnet-presence-js
 }
 
 case_enroll_web() {
@@ -1142,7 +1152,7 @@ case_enroll_web() {
   edit crates/stellar-agent-approval-ui/src/operator_enroll/web/operator-enroll.js
   pin_packages "stellar-agent-approval-ui stellar-agent-approval-remote stellar-agent-cli stellar-agent-mcp stellar-agent-webauthn-bridge" test-helpers \
     crates/stellar-agent-approval-ui/src/operator_enroll/web/operator-enroll.js
-  expect_list "${ALWAYS[@]}" "${PACKAGE_GATES[@]}" inbox-js mainnet-presence-js
+  expect_list "${ALWAYS[@]}" "${PACKAGE_GATES[@]}" proof-matrix proof-matrix:feature-on inbox-js mainnet-presence-js
 }
 
 case_bridge_web() {
@@ -1151,7 +1161,7 @@ case_bridge_web() {
   edit crates/stellar-agent-webauthn-bridge/src/web/glue.js
   pin_packages "stellar-agent-webauthn-bridge stellar-agent-approval-remote stellar-agent-cli stellar-agent-smart-account-acceptance" test-helpers \
     crates/stellar-agent-webauthn-bridge/src/web/glue.js
-  expect_list "${ALWAYS[@]}" "${PACKAGE_GATES[@]}" inbox-js
+  expect_list "${ALWAYS[@]}" "${PACKAGE_GATES[@]}" proof-matrix proof-matrix:feature-on inbox-js
 }
 
 # The MCP manifest inherits stellar-agent-sep7 from [workspace.dependencies].
@@ -1159,7 +1169,7 @@ case_one_crate() {
   start_case
   edit crates/stellar-agent-sep7/src/lib.rs
   pin_packages "stellar-agent-sep7 stellar-agent-mcp" test-helpers crates/stellar-agent-sep7/src/lib.rs
-  expect_list "${ALWAYS[@]}" "${PACKAGE_GATES[@]}"
+  expect_list "${ALWAYS[@]}" "${PACKAGE_GATES[@]}" proof-matrix proof-matrix:feature-on
 }
 
 case_two_owners() {
@@ -1167,7 +1177,7 @@ case_two_owners() {
   edit crates/stellar-agent-sep7/src/lib.rs crates/stellar-agent-sep5/src/lib.rs
   pin_packages "stellar-agent-sep5 stellar-agent-sep7 stellar-agent-cli stellar-agent-mcp stellar-agent-pool" \
     test-helpers,test-hooks crates/stellar-agent-sep7/src/lib.rs crates/stellar-agent-sep5/src/lib.rs
-  expect_list "${ALWAYS[@]}" "${PACKAGE_GATES[@]}"
+  expect_list "${ALWAYS[@]}" "${PACKAGE_GATES[@]}" proof-matrix proof-matrix:feature-on
 }
 
 # Core, headless-keyring and the CLI depend on windows-identity only in their
@@ -1177,7 +1187,7 @@ case_target_specific_edge() {
   edit crates/stellar-agent-windows-identity/src/lib.rs
   pin_packages "stellar-agent-windows-identity stellar-agent-cli stellar-agent-core stellar-agent-headless-keyring" test-helpers \
     crates/stellar-agent-windows-identity/src/lib.rs
-  expect_list "${ALWAYS[@]}" "${PACKAGE_GATES[@]}" test-policy-pin-release-cfg
+  expect_list "${ALWAYS[@]}" "${PACKAGE_GATES[@]}" proof-matrix proof-matrix:feature-on test-policy-pin-release-cfg
 }
 
 # Most members reach test-support through a dev-dependency path; the
@@ -1193,7 +1203,7 @@ stellar-agent-network stellar-agent-nonce stellar-agent-pool stellar-agent-sep43
 stellar-agent-sep53 stellar-agent-sep7 stellar-agent-smart-account stellar-agent-smart-account-acceptance \
 stellar-agent-stablecoin stellar-agent-toolsets-install stellar-agent-toolsets-runtime stellar-agent-x402" \
     test-helpers,test-hooks,test-loopback,verifier-registry crates/stellar-agent-test-support/src/lib.rs
-  expect_list "${ALWAYS[@]}" "${PACKAGE_GATES[@]}" test-support-friendbot test-vendored-release-cfg \
+  expect_list "${ALWAYS[@]}" "${PACKAGE_GATES[@]}" proof-matrix proof-matrix:feature-on test-support-friendbot test-vendored-release-cfg \
     test-policy-pin-release-cfg
 }
 
@@ -1205,7 +1215,7 @@ case_optional_dependency_edge() {
   edit crates/stellar-agent-sep48/src/lib.rs
   pin_packages "stellar-agent-sep48 stellar-agent-mcp stellar-agent-smart-account-acceptance" test-helpers \
     crates/stellar-agent-sep48/src/lib.rs
-  expect_list "${ALWAYS[@]}" "${PACKAGE_GATES[@]}"
+  expect_list "${ALWAYS[@]}" "${PACKAGE_GATES[@]}" proof-matrix proof-matrix:feature-on
 }
 
 case_root_manifest() {
@@ -1260,7 +1270,7 @@ case_untracked_test_file() {
   printf '#[test]\nfn new_case() {}\n' >crates/stellar-agent-sep7/tests/new_case.rs
   assert_changed crates/stellar-agent-sep7/tests/new_case.rs
   pin_packages "stellar-agent-sep7 stellar-agent-mcp" test-helpers crates/stellar-agent-sep7/tests/new_case.rs
-  expect_list "${ALWAYS[@]}" "${PACKAGE_GATES[@]}"
+  expect_list "${ALWAYS[@]}" "${PACKAGE_GATES[@]}" proof-matrix proof-matrix:feature-on
 }
 
 # Markdown under the test fixtures of a crate is outside the surface scope.
@@ -1271,7 +1281,18 @@ case_fixture_markdown() {
   assert_changed crates/stellar-agent-sep7/tests/fixtures/notes.md
   pin_packages "stellar-agent-sep7 stellar-agent-mcp" test-helpers \
     crates/stellar-agent-sep7/tests/fixtures/notes.md
-  expect_list "${ALWAYS[@]}" "${PACKAGE_GATES[@]}"
+  expect_list "${ALWAYS[@]}" "${PACKAGE_GATES[@]}" proof-matrix proof-matrix:feature-on
+}
+
+# A crate source and a crate test each select both proof-matrix checks.
+case_crate_sources_select_proof_matrix() {
+  start_case
+  edit crates/stellar-agent-sep7/src/lib.rs
+  printf '#[test]\nfn renamed_case() {}\n' >crates/stellar-agent-sep7/tests/renamed_case.rs
+  assert_changed crates/stellar-agent-sep7/tests/renamed_case.rs
+  pin_packages "stellar-agent-sep7 stellar-agent-mcp" test-helpers crates/stellar-agent-sep7/src/lib.rs \
+    crates/stellar-agent-sep7/tests/renamed_case.rs
+  expect_list "${ALWAYS[@]}" "${PACKAGE_GATES[@]}" proof-matrix proof-matrix:feature-on
 }
 
 case_committed_cross_scope_rename() {
@@ -1330,8 +1351,8 @@ case_full() {
   start_case
   edit CONTRIBUTING.md
   read -r -a ids <<<"$(printf '%s\n' "$EXPECTED_REGISTRY" | awk -F '\t' '{ printf "%s ", $1 }')"
-  if [ "${#ids[@]}" -ne 56 ]; then
-    fail "the expected registry holds ${#ids[@]} rows, expected 56"
+  if [ "${#ids[@]}" -ne 59 ]; then
+    fail "the expected registry holds ${#ids[@]} rows, expected 59"
   fi
   expect_list --full "${ids[@]}"
 }
