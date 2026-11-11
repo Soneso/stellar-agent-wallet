@@ -9,6 +9,9 @@
 //! statistics, and the reconcile's transaction lookups. A check placed after
 //! any of those reads would leave the read in the trace, so a refusal whose
 //! trace is exactly `["getNetwork"]` shows the check came first.
+//!
+//! The endpoint checks run under the pre-send budget, not under
+//! `--timeout-seconds`, which bounds only the send and the confirmation poll.
 
 #![allow(
     clippy::unwrap_used,
@@ -134,8 +137,14 @@ async fn methods(server: &MockServer) -> Vec<String> {
 /// Runs the binary with `args` against an isolated home and returns
 /// `(exit_code, stdout_envelope)`.
 fn run_cli(home: &Path, args: &[&str]) -> (i32, Value) {
+    run_cli_with(home, args, &[])
+}
+
+/// Runs the binary as [`run_cli`] does, with the variables `envs` set.
+fn run_cli_with(home: &Path, args: &[&str], envs: &[(&str, &str)]) -> (i32, Value) {
     let output = Command::new(env!("CARGO_BIN_EXE_stellar-agent"))
         .args(args)
+        .envs(envs.iter().copied())
         .env("STELLAR_AGENT_HOME", home)
         .env_remove("STELLAR_AGENT_PROFILE")
         .env_remove("STELLAR_AGENT_RPC_URL")
@@ -541,6 +550,112 @@ async fn a_malformed_fee_follows_the_endpoint_check_and_the_reconcile() {
         Some(ENDPOINT_CHECK_THEN_RECONCILE.map(str::to_owned).as_slice()),
         "the reconcile looks the due reservation up before the fee check: {reached:?}"
     );
+}
+
+/// Answers as a [`crate::classic_ledger::ClassicLedger`] does, with every
+/// `getNetwork` answer held back by `delay`.
+struct SlowIdentity {
+    ledger: crate::classic_ledger::ClassicLedger,
+    delay: std::time::Duration,
+}
+
+impl Respond for SlowIdentity {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        let body: Value = serde_json::from_slice(&request.body).unwrap();
+        let answer = self.ledger.respond(request);
+        if body["method"] == "getNetwork" {
+            answer.set_delay(self.delay)
+        } else {
+            answer
+        }
+    }
+}
+
+/// With `--timeout-seconds 1`, an endpoint whose identity probe answers after
+/// two seconds still passes the endpoint check, and the payment is sent and
+/// confirmed: the check runs under the pre-send budget.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pay_identity_check_outlasts_a_short_timeout() {
+    const SEED: [u8; 32] = [0x37; 32];
+    let source = account_id_for_seed(SEED);
+    let ledger = crate::classic_ledger::ClassicLedger::new(&[&source, DEST_G], &[]);
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(SlowIdentity {
+            ledger: ledger.clone(),
+            delay: std::time::Duration::from_secs(2),
+        })
+        .mount(&server)
+        .await;
+    let home = tempfile::tempdir().unwrap();
+    let argv = pay_argv(
+        SEED,
+        &server.uri(),
+        &[
+            "--fee",
+            "100",
+            "--secret-env",
+            "SLOW_IDENTITY_SIGNER",
+            "--timeout-seconds",
+            "1",
+        ],
+    );
+    let secret = stellar_strkey::ed25519::PrivateKey(SEED)
+        .as_unredacted()
+        .to_string();
+
+    let (code, envelope) = run_cli_with(
+        home.path(),
+        &as_strs(&argv),
+        &[("SLOW_IDENTITY_SIGNER", secret.as_str())],
+    );
+
+    assert_eq!(code, 0, "the payment is sent: {envelope}");
+    assert_eq!(ledger.sends(), 1, "{envelope}");
+    let reached = methods(&server).await;
+    assert_eq!(
+        reached.first().map(String::as_str),
+        Some("getNetwork"),
+        "{reached:?}"
+    );
+    assert!(
+        reached.iter().any(|m| m == "getTransaction"),
+        "the confirmation poll runs: {reached:?}"
+    );
+}
+
+/// The rendered help of each value verb says `--timeout-seconds` bounds the
+/// send and the confirmation poll, falls back to the profile setting, and
+/// leaves the endpoint checks and reads to the pre-send budget.
+#[test]
+fn timeout_flag_help_names_the_send_and_poll() {
+    for verb in [
+        vec!["pay"],
+        vec!["claim"],
+        vec!["accounts", "create"],
+        vec!["trustline"],
+    ] {
+        let mut argv = verb.clone();
+        argv.push("--help");
+        let output = Command::new(env!("CARGO_BIN_EXE_stellar-agent"))
+            .args(&argv)
+            .env_remove("STELLAR_AGENT_PROFILE")
+            .output()
+            .expect("stellar-agent binary must run");
+        let help = String::from_utf8(output.stdout).expect("help is UTF-8");
+        let flag = help
+            .split_once("--timeout-seconds <SECONDS>")
+            .map(|(_, rest)| rest.split("\n      --").next().unwrap_or(rest))
+            .unwrap_or_else(|| panic!("{verb:?} help names --timeout-seconds: {help}"));
+        let flag = flag.split_whitespace().collect::<Vec<_>>().join(" ");
+        for phrase in [
+            "Timeout in seconds for the send and the confirmation poll",
+            "Default: the profile's `submit_timeout_seconds`, then 60",
+            "The endpoint checks and the reads before the send run under a fixed 30-second budget instead",
+        ] {
+            assert!(flag.contains(phrase), "{verb:?} help: {flag}");
+        }
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

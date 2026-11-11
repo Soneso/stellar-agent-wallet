@@ -843,9 +843,11 @@ const RETENTION_POLL_INTERVAL: Duration = Duration::from_secs(2);
 /// Runs every refusal that must precede the send, and returns the decoded
 /// envelope when all of them pass.
 ///
-/// The endpoint identity probe and the signer-set fetch are bounded by
-/// `send_deadline`, the caller's own submission deadline, so the timeout
-/// covers these two reads as well as the send and the confirmation poll.
+/// The endpoint identity probe and the signer-set fetch run under `budget`,
+/// the [`PRE_SEND_BUDGET`](crate::submit::PRE_SEND_BUDGET) of the
+/// submission, never under its timeout, which bounds only the send and the
+/// confirmation poll. A read the budget cuts refuses with
+/// `network.pre_send_timeout`.
 ///
 /// Grouped into one fallible step so the caller has a single place to withdraw
 /// the receipt it was reached with: each of these refusals means nothing was
@@ -859,7 +861,7 @@ async fn pre_send_checks(
     client: &StellarRpcClient,
     envelope_xdr: &str,
     network_passphrase: &str,
-    send_deadline: tokio::time::Instant,
+    budget: &crate::submit::UnboundedPreSendBudget,
 ) -> Result<TransactionEnvelope, WalletError> {
     // Mainnet guard (shared with `submit_transaction_and_wait`): the
     // passphrase comparison is the primary check; the URL heuristic is the
@@ -896,18 +898,23 @@ async fn pre_send_checks(
 
     // The endpoint decides which network this lands on, so it is asked, on the
     // client instance that will send, together with the protocol it runs.
-    client
-        .endpoint_identity(network_passphrase, send_deadline)
+    budget
+        .read(crate::submit::IDENTITY_PROBE_READ, |deadline| {
+            client.endpoint_identity(network_passphrase, deadline)
+        })
         .await?;
 
     // Every signature must have been produced for that network.
-    crate::signing::verify_binding::verify_signature_network_binding(
-        client,
-        &envelope,
-        network_passphrase,
-        send_deadline,
-    )
-    .await?;
+    budget
+        .read(crate::submit::SIGNER_SET_READ, |deadline| {
+            crate::signing::verify_binding::verify_signature_network_binding(
+                client,
+                &envelope,
+                network_passphrase,
+                deadline,
+            )
+        })
+        .await?;
 
     Ok(envelope)
 }
@@ -915,11 +922,13 @@ async fn pre_send_checks(
 /// Submits `envelope_xdr` via `sendTransaction`, then polls `getTransaction`
 /// with retention awareness, finalising the receipt on completion.
 ///
-/// `timeout` is one budget for the whole submission: the endpoint identity
-/// probe and the signer-set fetch that precede the send are bounded by the
-/// same deadline as the send and the confirmation poll. The poll returns
-/// within that deadline plus [`FINAL_RETENTION_CHECK_TIMEOUT`], the bound on
-/// its one request past the deadline; see [`poll_with_retention`].
+/// `timeout` bounds the send and the confirmation poll. The endpoint
+/// identity probe and the signer-set fetch that precede the send run under
+/// [`PRE_SEND_BUDGET`](crate::submit::PRE_SEND_BUDGET), and the send deadline
+/// is armed when the send phase begins, right before the first send attempt.
+/// The poll returns within that deadline plus
+/// [`FINAL_RETENTION_CHECK_TIMEOUT`], the bound on its one request past the
+/// deadline; see [`poll_with_retention`].
 ///
 /// Owns the poll loop directly — the upstream poller does not provide
 /// retention/reorg/Ambiguous semantics — and calls `get_health()` on every
@@ -957,8 +966,6 @@ pub(crate) async fn submit_with_retention_poll(
 ) -> Result<SubmissionResult, WalletError> {
     use stellar_xdr::Hash;
 
-    let redacted = redact_envelope_hash(envelope_hash);
-
     // This function sends via send_transaction directly (rather than through
     // submit_transaction_and_wait) because it owns a retention-aware poll
     // loop: NOT_FOUND iterations are intercepted to call get_health so ledger
@@ -966,45 +973,141 @@ pub(crate) async fn submit_with_retention_poll(
     // not do. Owning the send step is why both mainnet guard layers, the
     // endpoint identity probe, and signature-network binding are enforced
     // explicitly here.
+    retention_submission(
+        store,
+        envelope_hash,
+        timeout,
+        |budget| async move {
+            let envelope =
+                pre_send_checks(client, envelope_xdr, network_passphrase, &budget).await?;
+            // The transaction hash is a property of the envelope: computing it
+            // here means the poll handle, the receipt and every diagnostic name
+            // the transaction the wallet signed.
+            let tx_hash_hex =
+                crate::submit::compute_local_tx_hash_hex(&envelope, network_passphrase)?;
+            let local_tx_hash_bytes =
+                stellar_agent_core::hex::decode_hex32(&tx_hash_hex).map_err(|e| {
+                    WalletError::Protocol(ProtocolError::XdrCodecFailed {
+                        detail: format!(
+                            "computed transaction hash is not 32 hex-encoded bytes: {e}"
+                        ),
+                    })
+                })?;
+            Ok((envelope, tx_hash_hex, local_tx_hash_bytes))
+        },
+        |(envelope, tx_hash_hex, local_tx_hash_bytes), send_deadline| async move {
+            // Send the transaction, with bounded exponential-backoff retry for
+            // transient transport errors.
+            //
+            // Safety: retrying the same signed envelope is safe ONLY because the
+            // idempotency gate (try_begin + envelope_hash) ensures at most one
+            // concurrent sender owns this path.  A retried send that already
+            // landed is idempotent at the network level (DUPLICATE).
+            //
+            // TransactionSubmissionFailed is NOT retried.
+            let retry_policy = RetryPolicy::default();
+            let server_tx_hash = {
+                let inner = &client.inner;
+                let url = &client.url;
+                retry_with_backoff(
+                    &retry_policy,
+                    send_deadline,
+                    is_retryable_send_error,
+                    || async { inner.send_transaction(&envelope).await },
+                )
+                .await
+                .map_err(|e| transport_failure(url, &e))?
+            };
 
-    let send_deadline = tokio::time::Instant::now() + timeout;
-
-    // Callers reach this function with a Pending receipt already written for
-    // `envelope_hash`. Nothing below has touched the network yet, so a refusal
-    // here means the transaction was never sent and the receipt must be
-    // withdrawn: leaving it would make every later attempt on the same
-    // envelope wait out the loser poll and then fail, for a transaction that
-    // does not exist. `abandon_pre_submit` is a no-op when no receipt exists,
-    // which is how a direct caller with no store entry stays unaffected, and
-    // it refuses to withdraw a receipt already marked submitted, so it can
-    // never drop one for a transaction that may have reached the network.
-    let envelope =
-        match pre_send_checks(client, envelope_xdr, network_passphrase, send_deadline).await {
-            Ok(envelope) => envelope,
-            Err(refusal) => {
-                if let Err(e) = store.abandon_pre_submit(envelope_hash) {
-                    tracing::warn!(
-                        envelope_hash = %redacted,
-                        error = %e,
-                        "submit_with_retention_poll: abandon_pre_submit failed after a \
-                         pre-send refusal; a stale Pending receipt may remain"
-                    );
-                }
-                return Err(refusal);
+            // The hash polled and recorded is the one computed from the bytes
+            // that were sent. An endpoint reporting a different one is not
+            // describing this transaction; the receipt stays keyed on the local
+            // hash and stays pending, because what the endpoint did with the
+            // bytes is unknown.
+            let server_tx_hash_hex = crate::submit::bytes_to_hex(&server_tx_hash.0);
+            if server_tx_hash_hex != tx_hash_hex {
+                return Err(WalletError::Submission(SubmissionError::HashMismatch {
+                    local: tx_hash_hex,
+                    server: server_tx_hash_hex,
+                }));
             }
-        };
 
-    // The transaction hash is a property of the envelope: computing it here
-    // means the poll handle, the receipt and every diagnostic name the
-    // transaction the wallet signed.
-    let tx_hash_hex = crate::submit::compute_local_tx_hash_hex(&envelope, network_passphrase)?;
-    let local_tx_hash_bytes = stellar_agent_core::hex::decode_hex32(&tx_hash_hex).map_err(|e| {
-        WalletError::Protocol(ProtocolError::XdrCodecFailed {
-            detail: format!("computed transaction hash is not 32 hex-encoded bytes: {e}"),
-        })
-    })?;
+            let redacted_tx = redact_tx_hash(&tx_hash_hex);
+            tracing::info!(
+                envelope_hash = %redact_envelope_hash(envelope_hash),
+                tx_hash = %redacted_tx,
+                "submit_with_retention_poll: sendTransaction accepted"
+            );
 
-    // Mark the receipt as submitted BEFORE calling send_transaction.
+            let tx_hash_obj = Hash(local_tx_hash_bytes);
+
+            poll_with_retention(
+                || client.get_transaction_record(&tx_hash_obj),
+                || client.get_health(),
+                RetentionPoll {
+                    store,
+                    url: &client.url,
+                    envelope_hash,
+                    tx_hash_hex,
+                    recorded_at_ledger,
+                    max_time,
+                    send_deadline,
+                    timeout,
+                },
+            )
+            .await
+        },
+    )
+    .await
+}
+
+/// Runs one idempotent submission around its send: `pre_send` takes the reads
+/// under an [`UnboundedPreSendBudget`](crate::submit::UnboundedPreSendBudget)
+/// and prepares the send, the receipt is marked submitted, and `send_phase`
+/// then sends and polls under the send deadline.
+///
+/// The caller reaches this with a Pending receipt written for
+/// `envelope_hash`. A `pre_send` refusal means nothing was sent, so the
+/// receipt is withdrawn. The send deadline is armed after the receipt is
+/// marked, so `timeout` bounds exactly the send and the confirmation poll:
+/// neither the reads nor the record spend it.
+async fn retention_submission<T, Pre, PreFut, Phase, PhaseFut>(
+    store: &ReceiptStore,
+    envelope_hash: &str,
+    timeout: Duration,
+    pre_send: Pre,
+    send_phase: Phase,
+) -> Result<SubmissionResult, WalletError>
+where
+    Pre: FnOnce(crate::submit::UnboundedPreSendBudget) -> PreFut,
+    PreFut: std::future::Future<Output = Result<T, WalletError>>,
+    Phase: FnOnce(T, tokio::time::Instant) -> PhaseFut,
+    PhaseFut: std::future::Future<Output = Result<SubmissionResult, WalletError>>,
+{
+    // `pre_send` only reads, so its refusal means the transaction was never
+    // sent and the receipt must be withdrawn: leaving it would make every
+    // later attempt on the same envelope wait out the loser poll and then
+    // fail, for a transaction that does not exist.
+    // `abandon_pre_submit` is a no-op when no receipt exists, which is how a
+    // direct caller with no store entry stays unaffected, and it refuses to
+    // withdraw a receipt already marked submitted, so it can never drop one
+    // for a transaction that may have reached the network.
+    let prepared = match pre_send(crate::submit::UnboundedPreSendBudget::new()).await {
+        Ok(prepared) => prepared,
+        Err(refusal) => {
+            if let Err(e) = store.abandon_pre_submit(envelope_hash) {
+                tracing::warn!(
+                    envelope_hash = %redact_envelope_hash(envelope_hash),
+                    error = %e,
+                    "submit_with_retention_poll: abandon_pre_submit failed after a \
+                     pre-send refusal; a stale Pending receipt may remain"
+                );
+            }
+            return Err(refusal);
+        }
+    };
+
+    // Mark the receipt as submitted BEFORE the send.
     //
     // This sets `submitted = true` on the Pending receipt so that
     // `abandon_pre_submit` will refuse to remove it: once send_transaction is
@@ -1013,7 +1116,7 @@ pub(crate) async fn submit_with_retention_poll(
     //
     // A persist failure here is logged at warn and NOT returned as an error: the
     // mark_submitted write is a best-effort durability hint.  The primary
-    // safety invariant — the Pending entry exists — was established by
+    // safety invariant (the Pending entry exists) was established by
     // try_begin's sync_all persist.  A receipt whose `submitted` field is
     // absent deserialises as `true` (`#[serde(default)]` on the field), so a
     // crash that loses this write leaves the receipt un-abandonable rather
@@ -1028,66 +1131,10 @@ pub(crate) async fn submit_with_retention_poll(
         );
     }
 
-    // Send the transaction, with bounded exponential-backoff retry for transient
-    // transport errors.
-    //
-    // Safety: retrying the same signed envelope is safe ONLY because the
-    // idempotency gate above (try_begin + envelope_hash) ensures at most one
-    // concurrent sender owns this path.  A retried send that already landed is
-    // idempotent at the network level (DUPLICATE).
-    //
-    // TransactionSubmissionFailed is NOT retried.
-    let retry_policy = RetryPolicy::default();
-
-    let server_tx_hash = {
-        let inner = &client.inner;
-        let url = &client.url;
-        retry_with_backoff(
-            &retry_policy,
-            send_deadline,
-            is_retryable_send_error,
-            || async { inner.send_transaction(&envelope).await },
-        )
-        .await
-        .map_err(|e| transport_failure(url, &e))?
-    };
-
-    // The hash polled and recorded is the one computed from the bytes that
-    // were sent. An endpoint reporting a different one is not describing this
-    // transaction; the receipt stays keyed on the local hash and stays
-    // pending, because what the endpoint did with the bytes is unknown.
-    let server_tx_hash_hex = crate::submit::bytes_to_hex(&server_tx_hash.0);
-    if server_tx_hash_hex != tx_hash_hex {
-        return Err(WalletError::Submission(SubmissionError::HashMismatch {
-            local: tx_hash_hex,
-            server: server_tx_hash_hex,
-        }));
-    }
-
-    let redacted_tx = redact_tx_hash(&tx_hash_hex);
-    tracing::info!(
-        envelope_hash = %redacted,
-        tx_hash = %redacted_tx,
-        "submit_with_retention_poll: sendTransaction accepted"
-    );
-
-    let tx_hash_obj = Hash(local_tx_hash_bytes);
-
-    poll_with_retention(
-        || client.get_transaction_record(&tx_hash_obj),
-        || client.get_health(),
-        RetentionPoll {
-            store,
-            url: &client.url,
-            envelope_hash,
-            tx_hash_hex,
-            recorded_at_ledger,
-            max_time,
-            send_deadline,
-            timeout,
-        },
-    )
-    .await
+    // The send phase begins here: `timeout` bounds the send and the
+    // confirmation poll, and nothing before them.
+    let send_deadline = tokio::time::Instant::now() + timeout;
+    send_phase(prepared, send_deadline).await
 }
 
 /// The bound on the one retention check that runs after the submission
@@ -2864,5 +2911,62 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn no_poll_starts_after_the_transient_sleep_reaches_the_deadline() {
         assert_no_poll_after_deadline(true).await;
+    }
+
+    /// A pre-send read slower than the timeout runs under the pre-send budget
+    /// and still reaches the send: the read's deadline is the budget's end,
+    /// the receipt is marked submitted before the send phase, and the send
+    /// deadline is armed after the record, `timeout` past the read's answer.
+    #[tokio::test(start_paused = true)]
+    async fn a_pre_send_read_slower_than_the_timeout_still_reaches_the_send() {
+        const ENVELOPE_HASH: &str =
+            "5151515151515151515151515151515151515151515151515151515151515151";
+        let (_dir, store) = open_temp_store();
+        store
+            .try_begin(ENVELOPE_HASH, &"cd".repeat(32), "", 0, 0, 100)
+            .unwrap();
+        let timeout = Duration::from_secs(5);
+        let read_time = Duration::from_secs(20);
+        assert!(read_time > timeout && read_time < crate::submit::PRE_SEND_BUDGET);
+        let start = tokio::time::Instant::now();
+        let store = &store;
+
+        let result = retention_submission(
+            store,
+            ENVELOPE_HASH,
+            timeout,
+            |budget| async move {
+                budget
+                    .read(crate::submit::IDENTITY_PROBE_READ, |deadline| {
+                        assert_eq!(deadline, start + crate::submit::PRE_SEND_BUDGET);
+                        async move {
+                            tokio::time::sleep(read_time).await;
+                            Ok(())
+                        }
+                    })
+                    .await
+            },
+            |(), send_deadline| async move {
+                assert_eq!(tokio::time::Instant::now(), start + read_time);
+                assert!(
+                    store.get(ENVELOPE_HASH).unwrap().unwrap().submitted,
+                    "the receipt is marked submitted before the send"
+                );
+                assert_eq!(send_deadline, start + read_time + timeout);
+                Ok(SubmissionResult {
+                    tx_hash: "cd".repeat(32),
+                    ledger: 7,
+                    signer_kind: None,
+                })
+            },
+        )
+        .await
+        .expect("the slow read reaches the send");
+
+        assert_eq!(result.ledger, 7);
+        assert_eq!(
+            store.get(ENVELOPE_HASH).unwrap().unwrap().status,
+            ReceiptStatus::Pending
+        );
     }
 }

@@ -20,6 +20,11 @@
 //! [`crate::sequence_floor::fetch_account_with_sequence_catchup_within`]
 //! bounds every read of its catch-up the same way and ends its wait at the
 //! deadline.
+//!
+//! Under either test feature, and in this crate's own tests,
+//! `set_readiness_budget_for_test` replaces the budget of
+//! [`readiness_deadline`] for every caller in the process until its guard
+//! drops; tests that use it run serially.
 
 use std::future::Future;
 use std::time::Duration;
@@ -179,6 +184,63 @@ async fn operational_check_at(
         close_time_unix,
         close_lag_seconds,
     })
+}
+
+/// The deadline a value ceremony's readiness check, and the account read
+/// after it, run under: [`PRE_SEND_BUDGET`](crate::PRE_SEND_BUDGET) from now.
+#[must_use]
+pub fn readiness_deadline() -> Instant {
+    Instant::now() + readiness_budget()
+}
+
+/// The budget of [`readiness_deadline`].
+fn readiness_budget() -> Duration {
+    #[cfg(any(test, feature = "test-hooks", feature = "test-helpers"))]
+    if let Some(budget) = *budget_override::lock() {
+        return budget;
+    }
+    crate::PRE_SEND_BUDGET
+}
+
+#[cfg(any(test, feature = "test-hooks", feature = "test-helpers"))]
+mod budget_override {
+    use std::sync::{Mutex, MutexGuard, PoisonError};
+    use std::time::Duration;
+
+    static OVERRIDE: Mutex<Option<Duration>> = Mutex::new(None);
+
+    pub(super) fn lock() -> MutexGuard<'static, Option<Duration>> {
+        OVERRIDE.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+/// Holds the budget set by [`set_readiness_budget_for_test`]; dropping it
+/// restores [`PRE_SEND_BUDGET`](crate::PRE_SEND_BUDGET).
+///
+/// Available only with `test-hooks`, `test-helpers`, or this crate's tests.
+#[cfg(any(test, feature = "test-hooks", feature = "test-helpers"))]
+#[doc(hidden)]
+#[derive(Debug)]
+#[must_use = "the override lasts only while the guard lives"]
+pub struct TestReadinessBudgetGuard(());
+
+#[cfg(any(test, feature = "test-hooks", feature = "test-helpers"))]
+impl Drop for TestReadinessBudgetGuard {
+    fn drop(&mut self) {
+        *budget_override::lock() = None;
+    }
+}
+
+/// Sets the budget of [`readiness_deadline`] to `budget` for every caller
+/// until the guard drops.
+///
+/// Available only with `test-hooks`, `test-helpers`, or this crate's tests.
+/// Production and release builds exclude both test features.
+#[cfg(any(test, feature = "test-hooks", feature = "test-helpers"))]
+#[doc(hidden)]
+pub fn set_readiness_budget_for_test(budget: Duration) -> TestReadinessBudgetGuard {
+    *budget_override::lock() = Some(budget);
+    TestReadinessBudgetGuard(())
 }
 
 /// Runs `read`, the account read that follows [`operational_check`] on the
@@ -537,5 +599,19 @@ mod tests {
             })
             .await;
         assert_eq!(in_time.unwrap(), 7);
+    }
+
+    /// The readiness deadline is the pre-send budget from now; the test
+    /// override replaces that budget while its guard lives, and the budget
+    /// returns when the guard drops.
+    #[tokio::test(start_paused = true)]
+    #[serial_test::serial]
+    async fn the_readiness_deadline_is_the_budget_from_now() {
+        let now = Instant::now();
+        assert_eq!(readiness_deadline(), now + crate::PRE_SEND_BUDGET);
+        let guard = set_readiness_budget_for_test(Duration::from_secs(2));
+        assert_eq!(readiness_deadline(), now + Duration::from_secs(2));
+        drop(guard);
+        assert_eq!(readiness_deadline(), now + crate::PRE_SEND_BUDGET);
     }
 }

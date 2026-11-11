@@ -1845,6 +1845,47 @@ impl ReceiptStore {
         Ok(())
     }
 
+    /// Removes a `Pending` receipt marked submitted whose transaction no
+    /// `sendTransaction` attempt carried.
+    ///
+    /// The submit layer marks a receipt submitted immediately before the first
+    /// send attempt. When the send-by instant has passed by then, no attempt
+    /// starts and the bytes never leave the wallet, so the receipt holds a
+    /// sequence for a transaction that does not exist. Only a receipt with
+    /// `status == Pending`, `submitted == true` and no recorded approval
+    /// consumption is removed; every other entry, and an unknown hash, is a
+    /// clean no-op. [`Self::abandon_pre_submit`] remains the removal for a
+    /// receipt not yet marked submitted.
+    ///
+    /// The caller is the only party that knows no attempt started; a receipt
+    /// whose transaction may have reached the network must never be passed
+    /// here.
+    ///
+    /// # Errors
+    ///
+    /// - [`ReceiptStoreError::MutexPoisoned`] if the lock is poisoned.
+    /// - [`ReceiptStoreError::Io`] or [`ReceiptStoreError::Json`] on persist failure.
+    ///
+    /// # Panics
+    ///
+    /// Never panics.
+    pub fn abandon_unsent(&self, envelope_hash: &str) -> Result<(), ReceiptStoreError> {
+        let mut session = self.write_session()?;
+
+        let should_remove = matches!(
+            session.guard.map.get(envelope_hash),
+            Some(r) if r.status == ReceiptStatus::Pending && r.submitted && !r.approval_consumed
+        );
+
+        if should_remove {
+            session.guard.map.remove(envelope_hash);
+            session.guard.rebuild_indexes();
+            persist_locked(&mut session.guard)?;
+        }
+
+        Ok(())
+    }
+
     /// Records the RPC `latest_ledger` at which the first `NOT_FOUND` re-org
     /// check was observed for a `Success` receipt.
     ///
@@ -2644,6 +2685,86 @@ mod tests {
         // Receipt must still be present.
         let r = store.get(HASH_A).unwrap().unwrap();
         assert_eq!(r.status, ReceiptStatus::Success);
+    }
+
+    // ── abandon_unsent ────────────────────────────────────────────────────────
+
+    /// `abandon_unsent` removes a Pending receipt marked submitted, persists
+    /// the removal, and frees its source and sequence for a new receipt.
+    #[test]
+    fn abandon_unsent_removes_a_submitted_pending_receipt() {
+        let (dir, store) = open_temp_store();
+        store
+            .try_begin(HASH_A, TX_HASH_A, SOURCE_A, SEQ_A, 0, 100)
+            .unwrap();
+        store.mark_submitted(HASH_A).unwrap();
+
+        store.abandon_unsent(HASH_A).unwrap();
+
+        assert!(store.get(HASH_A).unwrap().is_none());
+        let reopened = ReceiptStore::open_at(dir.path(), "test").unwrap();
+        assert!(
+            reopened.get(HASH_A).unwrap().is_none(),
+            "the removal is persisted"
+        );
+        assert!(matches!(
+            store
+                .begin_submission(HASH_B, TX_HASH_B, SOURCE_A, SEQ_A, 0, 100)
+                .unwrap(),
+            BeginSubmissionOutcome::Recorded
+        ));
+    }
+
+    /// `abandon_unsent` keeps a receipt not marked submitted, a terminal one,
+    /// and one whose approval consumption is recorded, and ignores an unknown
+    /// hash; the submitted Pending receipt without that record is removed.
+    #[test]
+    fn abandon_unsent_keeps_every_other_receipt() {
+        let (_dir, store) = open_temp_store();
+        store.abandon_unsent(HASH_A).unwrap();
+        assert!(store.get(HASH_A).unwrap().is_none());
+
+        store
+            .try_begin(HASH_A, TX_HASH_A, SOURCE_A, SEQ_A, 0, 100)
+            .unwrap();
+        store.abandon_unsent(HASH_A).unwrap();
+        assert!(
+            store.get(HASH_A).unwrap().is_some(),
+            "an unsubmitted receipt is abandon_pre_submit's"
+        );
+
+        store.mark_submitted(HASH_A).unwrap();
+        store
+            .finalize(HASH_A, ReceiptStatus::Success, Some(1))
+            .unwrap();
+        store.abandon_unsent(HASH_A).unwrap();
+        assert_eq!(
+            store.get(HASH_A).unwrap().unwrap().status,
+            ReceiptStatus::Success
+        );
+
+        store
+            .try_begin(HASH_B, TX_HASH_B, SOURCE_A, SEQ_B, 0, 100)
+            .unwrap();
+        store.mark_submitted(HASH_B).unwrap();
+        store.mark_approval_consumed(HASH_B).unwrap();
+        store.abandon_unsent(HASH_B).unwrap();
+        let kept = store.get(HASH_B).unwrap().unwrap();
+        assert_eq!(kept.status, ReceiptStatus::Pending);
+        assert!(
+            kept.submitted && kept.approval_consumed,
+            "a receipt whose approval consumption is recorded is kept"
+        );
+
+        store
+            .try_begin(HASH_C, TX_HASH_C, SOURCE_A, SEQ_A, 0, 100)
+            .unwrap();
+        store.mark_submitted(HASH_C).unwrap();
+        store.abandon_unsent(HASH_C).unwrap();
+        assert!(
+            store.get(HASH_C).unwrap().is_none(),
+            "the same submitted Pending receipt without a recorded consumption is removed"
+        );
     }
 
     /// After `abandon_pre_submit`, a new `try_begin` for the same key wins again

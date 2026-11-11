@@ -73,7 +73,7 @@ A configured mainnet secondary requires `providers.secondary`, a host distinct f
 
 ### Timeout
 
-`--timeout-seconds <SECONDS>` bounds submission and simulation. On `pay`, `claim`, sponsored `accounts create`, and `pool init`, it also bounds the [endpoint identity check](#endpoint-identity-before-the-first-read), which gets a budget of its own. The default is `60`, and `120` on `pool init`.
+`--timeout-seconds <SECONDS>` bounds submission and simulation. On `pay`, `claim`, sponsored `accounts create`, and `trustline`, it bounds the send and the confirmation poll; without the flag the profile's `submit_timeout_seconds` applies, then `60`. The [endpoint checks](#endpoint-identity-before-the-first-read) and the reads before the send run under a fixed 30-second pre-send budget instead. On `pool init` the flag also bounds the endpoint identity check, which gets a budget of its own, and the default is `120`.
 
 ### Output format
 
@@ -228,7 +228,7 @@ Read-only commands, `pay --build-only`, `claim --build-only`, `smart-account mig
 
 Checks that need no request come first: argument, keyring, and profile validation, the structural mainnet refusal, and the relayer refusal. `pool init` also runs its audit pre-flight before the check. An endpoint refusal precedes every refusal that follows a read. These include a missing account or claim entry, a policy denial, the audit pre-flight of the other commands, and the amount, asset, and fee checks. It also precedes the reservation reconcile and its settlement. A `claim` or `trustline` refused at this early check carries no preview.
 
-Each check gets a budget of its own: `--timeout-seconds` on `pay`, `claim`, `accounts create`, and `pool init`, and the profile's `submit_timeout_seconds` on `trustline`. The submit layer's check starts a fresh budget.
+Each check gets a budget of its own: the 30-second pre-send budget on `pay`, `claim`, `accounts create`, and `trustline`, and `--timeout-seconds` on `pool init`. A readiness check that outlasts its budget refuses with `network.endpoint_not_ready`. The submit layer's check starts a fresh budget.
 
 ## Submit-layer network binding
 
@@ -236,11 +236,12 @@ The submit layer does not take the declared network on trust. Before sending, it
 
 - the ordinary submit path sees mainnet: `network.mainnet_write_forbidden`;
 - the endpoint reports a different network than the one declared: `network.endpoint_network_mismatch`;
-- the endpoint's identity cannot be established within the submission timeout: `network.endpoint_identity_unavailable`;
+- the endpoint's identity cannot be established: `network.endpoint_identity_unavailable`;
+- the identity probe or the signer-set read does not answer within the 30-second pre-send budget: `network.pre_send_timeout`, whose message names the read; nothing is sent;
 - the endpoint answers the identity request with HTTP 401 or 403: `network.rpc_credential_refused`, which is not retried;
 - a mainnet endpoint runs a protocol version outside the supported range: `network.unsupported_protocol_version`.
 
-The probe is retried with bounded exponential backoff inside the caller's own timeout and is fail-closed: it never falls back to the declared network. An answer that does not parse, for example one without `protocolVersion`, is not retried and reports `network.endpoint_identity_unavailable`. The endpoint check uses an RPC round trip. Authorized paths verify mainnet identity against their bound context. [Retries, deadlines, and failover](../maintainers/security-internals.md#retries-deadlines-and-failover) gives the retry numbers and the deadlines.
+The probe is retried with bounded exponential backoff inside the pre-send budget and is fail-closed: it never falls back to the declared network. An answer that does not parse, for example one without `protocolVersion`, is not retried and reports `network.endpoint_identity_unavailable`. The endpoint check uses an RPC round trip. Authorized paths verify mainnet identity against their bound context. [Retries, deadlines, and failover](../maintainers/security-internals.md#retries-deadlines-and-failover) gives the retry numbers and the deadlines.
 
 After the identity check, `pay`, `claim`, sponsored `accounts create`, and `trustline` check that the endpoint reports a healthy status and that its latest ledger closed within 60 seconds of the host clock. An endpoint that fails the check is refused with `network.endpoint_not_ready`, and the message names the reason. The check runs before the first account read, and the summary of a mainnet write names the ledger the check observed.
 
@@ -272,8 +273,7 @@ An `--rpc-url` pointing at a different network than `--network` is refused befor
 either check runs. The check also reads the endpoint's protocol version and
 applies the protocol rule of
 [Submit-layer network binding](#submit-layer-network-binding). It runs under
-its own `--timeout-seconds` deadline, and the submission that follows starts a
-fresh one.
+its own pre-send budget, and the submission that follows starts a fresh one.
 
 This pre-flight fails closed for persisted `<name>.toml` profiles. `pay`,
 `claim`, and `accounts create` synthesize an in-memory testnet profile when no

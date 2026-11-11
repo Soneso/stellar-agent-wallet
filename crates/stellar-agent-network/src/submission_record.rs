@@ -182,6 +182,16 @@ pub struct SubmissionIntent {
     pub submission_ledger: u32,
     /// Independent provenance bound to this submission.
     pub submission_anchor: Option<crate::policy_state::SubmissionAnchor>,
+
+    /// The instant after which no `sendTransaction` attempt of this
+    /// submission starts, in Unix milliseconds on the clock of
+    /// [`crate::mainnet::clock::now_ms`]; `None` when the attempt has no
+    /// send-by instant.
+    ///
+    /// A mainnet submission derives it from the envelope's `maxTime` less the
+    /// send margin. Another submission carries the send-by instant its caller
+    /// passed, converted at the moment the intent is built.
+    pub send_by_ms: Option<u64>,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -238,6 +248,18 @@ pub enum SubmissionOutcome {
     /// confirms: a send refusal, and a `FAILED` confirmation the oracle does
     /// not report as `FAILED` itself.
     TransportAfterSend {
+        /// Non-secret diagnostic detail naming the condition.
+        error: String,
+    },
+
+    /// No `sendTransaction` attempt started: the send-by instant passed after
+    /// the pre-send record and before the first attempt. The bytes never left
+    /// the wallet, so the transaction cannot apply.
+    ///
+    /// Reported only for a submission without a bound signed intent.
+    NotSent {
+        /// Stable wire code of the refusal the caller receives.
+        code: String,
         /// Non-secret diagnostic detail naming the condition.
         error: String,
     },
@@ -324,9 +346,10 @@ pub trait SubmissionRecorder: Send + Sync {
 
     /// Settles the record against what the network said.
     ///
-    /// Runs at every exit after the send. It cannot fail the caller: the
-    /// transaction is already beyond recall, so a failure here is logged and
-    /// the record stands.
+    /// Runs at every exit after the pre-send record: after the send, and with
+    /// [`SubmissionOutcome::NotSent`] when no send attempt started. It cannot
+    /// fail the caller: a sent transaction is already beyond recall, so a
+    /// failure here is logged and the record stands.
     async fn outcome(&self, intent: &SubmissionIntent, outcome: &SubmissionOutcome);
 }
 
@@ -855,6 +878,16 @@ impl SubmissionRecorder for WalletSubmissionRecorder<'_> {
                 // bound, at an operator clear.
                 self.record_floor(intent).await;
                 self.tombstone_approval(intent);
+            }
+            SubmissionOutcome::NotSent { code, .. } => {
+                // No attempt carried the bytes, so nothing can apply: the
+                // sequence is not consumed and no floor is recorded, and the
+                // approval stays unspent. The window records are released,
+                // converted mainnet holds included, the pending row is closed
+                // with `code`, and the receipt that holds the sequence is
+                // removed. A used mainnet authorization stays used.
+                self.close_unsent_records(intent, UnwoundAfter::Reservation, code);
+                self.remove_receipt(intent, ReceiptStore::abandon_unsent);
             }
         }
     }
@@ -1429,6 +1462,13 @@ impl WalletSubmissionRecorder<'_> {
     /// again, so no caller holds it here, and it is a plain append: it lands
     /// during an anchor outage too.
     fn unwind(&self, intent: &SubmissionIntent, reached: UnwoundAfter, code: &str) {
+        self.close_unsent_records(intent, reached, code);
+        self.remove_receipt(intent, ReceiptStore::abandon_pre_submit);
+    }
+
+    /// The release and the closing row of [`Self::unwind`], for the stages
+    /// `reached` names.
+    fn close_unsent_records(&self, intent: &SubmissionIntent, reached: UnwoundAfter, code: &str) {
         if reached == UnwoundAfter::Reservation {
             self.settle_window(intent, WindowSettlement::Release);
         }
@@ -1440,7 +1480,16 @@ impl WalletSubmissionRecorder<'_> {
             // back, so it is closed out instead.
             self.write_failed_row(intent, code);
         }
-        if let Err(e) = self.receipts.abandon_pre_submit(&intent.envelope_hash) {
+    }
+
+    /// Removes the receipt of an unsent submission through `abandon`, which
+    /// decides which receipt states it removes.
+    fn remove_receipt(
+        &self,
+        intent: &SubmissionIntent,
+        abandon: fn(&ReceiptStore, &str) -> Result<(), ReceiptStoreError>,
+    ) {
+        if let Err(e) = abandon(&self.receipts, &intent.envelope_hash) {
             tracing::warn!(
                 profile = %self.profile_name,
                 tool = %self.tool,
@@ -1698,6 +1747,7 @@ mod tests {
                 max_time: 0,
                 submission_ledger: 1,
                 submission_anchor: None,
+                send_by_ms: None,
             };
             let binding = crate::IntentBinding::new(&exposure, &changed);
             let error = recorder
@@ -1879,6 +1929,7 @@ mod tests {
                 max_time: 0,
                 submission_ledger: 1,
                 submission_anchor: None,
+                send_by_ms: None,
             }
         };
         let intent = make_intent(&envelope);
@@ -2147,6 +2198,7 @@ mod tests {
             max_time: 0,
             submission_ledger: 1,
             submission_anchor: None,
+            send_by_ms: None,
         };
         recorder
             .pre_send_bound(&intent, &crate::IntentBinding::new(&exposure, &envelope))
@@ -2466,6 +2518,7 @@ mod tests {
                 max_time: 0,
                 submission_ledger: 1,
                 submission_anchor: None,
+                send_by_ms: None,
             };
             let result = recorder
                 .pre_send_bound(&intent, &crate::IntentBinding::new(&exposure, &envelope))
@@ -2566,6 +2619,7 @@ mod tests {
             max_time: 0,
             submission_ledger: 123,
             submission_anchor: None,
+            send_by_ms: None,
         };
         let audit_before = std::fs::read(&profile.audit_log_path).unwrap();
         let window_before = std::fs::read(dir.path().join("state.window")).unwrap();
@@ -2679,6 +2733,7 @@ mod tests {
             max_time: 0,
             submission_ledger: 123,
             submission_anchor: None,
+            send_by_ms: None,
         };
         recorder.pre_send(&intent).await.unwrap();
         recorder
@@ -2787,6 +2842,7 @@ mod tests {
                 max_time: 0,
                 submission_ledger: 123,
                 submission_anchor: None,
+                send_by_ms: None,
             };
             recorder.pre_send(&intent).await.unwrap();
             recorder
@@ -2811,6 +2867,114 @@ mod tests {
             );
             assert_row_carries_test_provenance(&rows[0]);
         }
+    }
+
+    /// An unsent outcome unwinds the record of a submission whose send never
+    /// started: the reservation is released, the pending row is settled by
+    /// its closing row, no receipt remains, and a new record at the same
+    /// source and sequence passes.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn an_unsent_outcome_unwinds_the_record() {
+        use stellar_agent_core::policy::v1::criteria::state_store::{
+            StateKey, WindowEntry, WindowLimit,
+        };
+
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut profile = Profile::builder_testnet("unsent", "s", "n", "a").build();
+        profile.audit_log_path = dir.path().join("audit.jsonl");
+        let audit = Arc::new(Mutex::new(
+            AuditWriter::open(profile.audit_log_path.clone(), None).unwrap(),
+        ));
+        let now = stellar_agent_core::timefmt::now_unix_ms().unwrap();
+        let receipts = ReceiptStore::open_at(dir.path(), "unsent").unwrap();
+        let window = PersistedWindowStore::at_path(dir.path().join("unsent.window"));
+        let recorder = WalletSubmissionRecorder::new(
+            &profile,
+            "unsent",
+            "stellar_pay_commit",
+            Some("stellar:testnet".to_owned()),
+            PolicyDecision::Allow,
+            vec![],
+            vec![WindowEntry::new(
+                StateKey::new("unsent", 1, "native", 86_400),
+                now,
+                10,
+                WindowLimit::Amount {
+                    asset: "native".to_owned(),
+                    window: "1d".to_owned(),
+                    max_stroops: 1_000,
+                },
+            )],
+            receipts.clone(),
+            window.clone(),
+            Some(audit.clone()),
+            None,
+            "request",
+            now,
+        );
+        let intent = |envelope_hash: &str, tx_hash: &str| SubmissionIntent {
+            chain_scope: crate::policy_state::ChainScope::for_chain(
+                stellar_agent_core::profile::caip2::Caip2::Testnet,
+            ),
+            envelope_hash: envelope_hash.repeat(32),
+            tx_hash: tx_hash.repeat(32),
+            source: format!("{}", stellar_strkey::ed25519::PublicKey([7; 32])),
+            sequence: 7,
+            max_time: 0,
+            submission_ledger: 123,
+            submission_anchor: None,
+            send_by_ms: Some(now + 1_000),
+        };
+        let unsent = intent("7a", "8b");
+        recorder.pre_send(&unsent).await.unwrap();
+        assert!(
+            receipts
+                .get(&unsent.envelope_hash)
+                .unwrap()
+                .unwrap()
+                .submitted
+        );
+        assert_eq!(window.pending_reservations(&profile).unwrap().len(), 1);
+
+        recorder
+            .outcome(
+                &unsent,
+                &SubmissionOutcome::NotSent {
+                    code: "network.rpc_timeout".to_owned(),
+                    error: "nothing was sent".to_owned(),
+                },
+            )
+            .await;
+
+        assert!(
+            window.pending_reservations(&profile).unwrap().is_empty(),
+            "the reservation is released"
+        );
+        assert!(matches!(
+            try_value_action_settlement(&audit.lock().unwrap(), &unsent.envelope_hash).unwrap(),
+            ValueActionSettlement::Settled
+        ));
+        assert!(
+            receipts.get(&unsent.envelope_hash).unwrap().is_none(),
+            "no receipt remains"
+        );
+        let rows: Vec<serde_json::Value> = std::fs::read_to_string(&profile.audit_log_path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert_eq!(rows[0]["kind"], "value_action_pending");
+        assert_eq!(rows[1]["kind"], "value_action_failed");
+        assert_eq!(rows[1]["code"], "network.rpc_timeout");
+
+        let rebuilt = intent("9c", "ad");
+        recorder
+            .pre_send(&rebuilt)
+            .await
+            .expect("the source and sequence are free again");
     }
 
     /// Runs the in-lock duplicate backstop: a first submission reserves the
@@ -2877,6 +3041,7 @@ mod tests {
             max_time: 0,
             submission_ledger: 123,
             submission_anchor: None,
+            send_by_ms: None,
         };
         recorder.pre_send(&intent).await.unwrap();
         std::fs::remove_file(receipts.file_path().unwrap()).unwrap();

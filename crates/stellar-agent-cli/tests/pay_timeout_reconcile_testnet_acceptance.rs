@@ -75,10 +75,10 @@ const OWNER_KEY_SERVICE_PREFIX: &str = "stellar-agent-owner-";
 /// spending-window reservation.
 const CAP_STROOPS: i64 = 1_000_000_000;
 
-/// Submission timeout, in seconds. Below testnet's ledger-close interval, so
-/// the confirmation poll can expire on a transaction that then lands, and
-/// above the round trips the submit layer makes before the send, so the send
-/// itself is never cut off.
+/// Submission timeout, in seconds. It bounds the send and the confirmation
+/// poll, while the reads before the send run under the pre-send budget. Below
+/// testnet's ledger-close interval, so the confirmation poll can expire on a
+/// transaction that then lands.
 const SUBMIT_TIMEOUT_SECONDS: &str = "3";
 
 /// Delays, in milliseconds, applied after an observed ledger close before a

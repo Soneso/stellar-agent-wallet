@@ -50,6 +50,10 @@ mod pay_live;
 mod payload_fixtures;
 #[path = "network/policy_engine.rs"]
 mod policy_engine;
+#[path = "network/pre_send_budget.rs"]
+mod pre_send_budget;
+#[path = "network/pre_send_guards.rs"]
+mod pre_send_guards;
 #[path = "network/redaction_audit.rs"]
 mod redaction_audit;
 #[path = "network/retention_poll_deadline.rs"]

@@ -30,13 +30,22 @@ pub const MAINNET_AUTHORIZATION_TTL_SECONDS_DEFAULT: u32 = 120;
 /// On-chain lifetime of a classic mainnet envelope, counted from its build time.
 /// This equals the authorization ceiling that `authorization_ttl_seconds` may not exceed.
 pub const MAINNET_CLASSIC_DEADLINE_SECONDS: u64 = MAINNET_AUTHORIZATION_TTL_SECONDS_DEFAULT as u64;
+/// The time a classic mainnet envelope must still have before its deadline
+/// for a send to start, in seconds.
+///
+/// The resolver, the MCP commit check and the submit path each refuse an
+/// envelope whose deadline lies within this margin, so a send that starts
+/// still has time to reach the network before the deadline.
+pub const MAINNET_SEND_MARGIN_SECONDS: u64 = 30;
 
 /// Checks the on-chain deadline of a classic mainnet envelope and returns its Unix seconds.
 ///
 /// # Errors
 ///
-/// Refuses missing or nonzero minimum bounds, elapsed deadlines, and deadlines
-/// beyond the authorization ceiling.
+/// Refuses missing or nonzero minimum bounds, elapsed deadlines, deadlines
+/// within [`MAINNET_SEND_MARGIN_SECONDS`] of `now_ms`
+/// ([`MainnetPrecondition::DeadlineWithinMargin`]), and deadlines beyond the
+/// authorization ceiling.
 pub fn check_classic_deadline(
     cond: &Preconditions,
     now_ms: u64,
@@ -51,6 +60,9 @@ pub fn check_classic_deadline(
     let deadline_ms = max_time.saturating_mul(1000);
     if now_ms >= deadline_ms {
         return Err(P::DeadlineElapsed);
+    }
+    if now_ms.saturating_add(MAINNET_SEND_MARGIN_SECONDS.saturating_mul(1000)) >= deadline_ms {
+        return Err(P::DeadlineWithinMargin);
     }
     if deadline_ms > now_ms.saturating_add(MAINNET_CLASSIC_DEADLINE_SECONDS.saturating_mul(1000)) {
         return Err(P::DeadlineTooFar);
@@ -6075,7 +6087,7 @@ mod deadline_tests {
             check_classic_deadline(&time(0, 1), 1000),
             Err(P::DeadlineElapsed)
         );
-        assert_eq!(check_classic_deadline(&time(0, 2), 1000), Ok(2));
+        assert_eq!(check_classic_deadline(&time(0, 32), 1000), Ok(32));
         assert_eq!(check_classic_deadline(&time(0, 121), 1000), Ok(121));
         assert_eq!(
             check_classic_deadline(&time(0, 122), 1000),
@@ -6088,6 +6100,37 @@ mod deadline_tests {
         assert_eq!(
             check_classic_deadline(&time(0, u64::MAX), u64::MAX),
             Err(P::DeadlineElapsed)
+        );
+    }
+
+    /// A deadline the send margin reaches refuses with its own label: at
+    /// exactly the margin before the deadline, and anywhere inside it, while
+    /// one millisecond earlier the envelope passes.
+    #[test]
+    fn classic_deadline_refuses_inside_the_margin() {
+        let deadline_s: u64 = 1_800_000_090;
+        let deadline_ms = deadline_s * 1000;
+        let margin_ms = MAINNET_SEND_MARGIN_SECONDS * 1000;
+        let cond = Preconditions::Time(stellar_xdr::TimeBounds {
+            min_time: stellar_xdr::TimePoint(0),
+            max_time: stellar_xdr::TimePoint(deadline_s),
+        });
+        assert_eq!(MAINNET_SEND_MARGIN_SECONDS, 30);
+        for now_ms in [
+            deadline_ms - margin_ms,
+            deadline_ms - margin_ms / 2,
+            deadline_ms - 1,
+        ] {
+            assert_eq!(
+                check_classic_deadline(&cond, now_ms),
+                Err(P::DeadlineWithinMargin),
+                "{now_ms}"
+            );
+        }
+        assert_eq!(P::DeadlineWithinMargin.label(), "deadline_within_margin");
+        assert_eq!(
+            check_classic_deadline(&cond, deadline_ms - margin_ms - 1),
+            Ok(deadline_s)
         );
     }
 }

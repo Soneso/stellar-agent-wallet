@@ -187,7 +187,11 @@ pub(crate) fn mainnet_mode_refusal(chain: Caip2, full_mode: bool) -> Option<Wall
 /// this check on that client before the first such read, so an endpoint
 /// serving another network never supplies a value the verb signs. The submit
 /// layer checks the sending client again before the send. Each check gets its
-/// own budget, `timeout` from the moment it starts.
+/// own budget, `timeout` from the moment it starts. The value verbs `pay`,
+/// `claim`, `accounts create` and `trustline` pass
+/// [`PRE_SEND_BUDGET`](stellar_agent_network::PRE_SEND_BUDGET), so their
+/// `--timeout-seconds` bounds only the send and the confirmation poll; `pool
+/// init` passes its own flag.
 ///
 /// On mainnet the check is the mainnet probe, which requires the mainnet
 /// passphrase and a supported protocol; on every other chain it is the
@@ -227,7 +231,10 @@ pub(crate) async fn check_endpoint_identity(
 /// clock. A mainnet build reads the account it signs against under the same
 /// `deadline` through
 /// [`stellar_agent_network::operational::read_within_readiness_deadline`],
-/// and a mainnet write hands the report to its summary.
+/// and a mainnet write hands the report to its summary. The value verbs set
+/// `deadline` a fresh
+/// [`PRE_SEND_BUDGET`](stellar_agent_network::PRE_SEND_BUDGET) ahead; a check
+/// that outlasts it refuses with `network.endpoint_not_ready`.
 ///
 /// # Errors
 ///
@@ -240,6 +247,20 @@ pub(crate) async fn check_endpoint_ready(
     deadline: tokio::time::Instant,
 ) -> Result<OperationalReport, WalletError> {
     operational_check(client, deadline).await
+}
+
+/// The submission timeout of a value verb: `flag`, the verb's
+/// `--timeout-seconds`, when given, else the profile's
+/// `submit_timeout_seconds`, else 60 seconds.
+///
+/// It bounds the send and the confirmation poll. The endpoint checks and the
+/// reads before the send run under
+/// [`PRE_SEND_BUDGET`](stellar_agent_network::PRE_SEND_BUDGET) instead.
+pub(crate) fn submit_timeout(
+    flag: Option<u64>,
+    profile: &stellar_agent_core::profile::Profile,
+) -> std::time::Duration {
+    flag.map_or_else(|| profile.submit_timeout(), std::time::Duration::from_secs)
 }
 
 /// Parses an RPC URL flag without echoing credentials in errors.
@@ -294,6 +315,32 @@ mod tests {
     )]
 
     use super::*;
+
+    /// The flag wins; without it the profile's `submit_timeout_seconds`
+    /// applies, then 60 seconds.
+    #[test]
+    fn submit_timeout_prefers_the_flag_then_the_profile_then_sixty() {
+        let mut profile =
+            stellar_agent_core::profile::Profile::builder_testnet("timeout", "s", "n", "a").build();
+        profile.submit_timeout_seconds = Some(17);
+        assert_eq!(
+            submit_timeout(Some(5), &profile),
+            std::time::Duration::from_secs(5)
+        );
+        assert_eq!(
+            submit_timeout(None, &profile),
+            std::time::Duration::from_secs(17)
+        );
+        profile.submit_timeout_seconds = None;
+        assert_eq!(
+            submit_timeout(Some(5), &profile),
+            std::time::Duration::from_secs(5)
+        );
+        assert_eq!(
+            submit_timeout(None, &profile),
+            std::time::Duration::from_secs(60)
+        );
+    }
 
     #[test]
     fn target_network_from_str_round_trips() {

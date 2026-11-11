@@ -2541,6 +2541,27 @@ pub enum NetworkError {
         url: String,
     },
 
+    /// A read before the send did not answer within the pre-send budget.
+    ///
+    /// The reads that precede a send, the endpoint identity probe and the
+    /// signer-set read among them, share one fixed budget that starts with
+    /// the first of them. The submission's own timeout bounds only the send
+    /// and the confirmation poll. A read the budget cuts, or one that fails
+    /// at or after the budget's end, refuses with this error, and nothing is
+    /// sent.
+    ///
+    /// `read` is the wallet's fixed name for the read and never carries
+    /// endpoint text.
+    #[error(
+        "the {read} did not answer within the pre-send budget of {budget_secs} s; nothing was sent"
+    )]
+    PreSendTimeout {
+        /// The wallet's fixed name for the read.
+        read: String,
+        /// The pre-send budget in seconds.
+        budget_secs: u64,
+    },
+
     /// The RPC endpoint is not ready for a transaction: it reports a status
     /// other than healthy, it does not supply a valid close time for its
     /// latest ledger, or that close time lies too far from the host clock.
@@ -2851,6 +2872,7 @@ impl NetworkError {
             Self::EndpointNetworkMismatch { .. } => "network.endpoint_network_mismatch",
             Self::EndpointIdentityUnavailable { .. } => "network.endpoint_identity_unavailable",
             Self::EndpointNotReady { .. } => "network.endpoint_not_ready",
+            Self::PreSendTimeout { .. } => "network.pre_send_timeout",
             Self::UnsupportedProtocolVersion { .. } => "network.unsupported_protocol_version",
             Self::EnvelopeSignedForMainnet => "network.envelope_signed_for_mainnet",
             Self::EnvelopeSignatureUnverifiable { .. } => "network.envelope_signature_unverifiable",
@@ -4843,6 +4865,13 @@ mod tests {
                 "network.endpoint_not_ready",
             ),
             (
+                NetworkError::PreSendTimeout {
+                    read: "endpoint identity probe".to_owned(),
+                    budget_secs: 30,
+                },
+                "network.pre_send_timeout",
+            ),
+            (
                 NetworkError::UnsupportedProtocolVersion {
                     protocol_version: 31,
                     supported_min: 28,
@@ -5647,6 +5676,10 @@ mod tests {
                 reason: "ledger 100 closed 61 s ago; the endpoint or the host clock is behind"
                     .to_owned(),
             }),
+            WalletError::Network(NetworkError::PreSendTimeout {
+                read: "signer-set read".to_owned(),
+                budget_secs: 30,
+            }),
             WalletError::Network(NetworkError::UnsupportedProtocolVersion {
                 protocol_version: 31,
                 supported_min: 28,
@@ -5676,6 +5709,22 @@ mod tests {
         assert_eq!(
             err.message(),
             "account 'GABCDEFGHIJKLMNOPQR' already holds the Friendbot starting balance; Friendbot funds only an account below it"
+        );
+    }
+
+    /// The pre-send budget refusal names the read and the budget, says that
+    /// nothing was sent, and carries the `network.pre_send_timeout` code.
+    #[test]
+    fn pre_send_timeout_names_the_read_and_the_budget() {
+        let err = WalletError::Network(NetworkError::PreSendTimeout {
+            read: "endpoint identity probe".to_owned(),
+            budget_secs: 30,
+        });
+        assert_eq!(err.code(), "network.pre_send_timeout");
+        assert_eq!(
+            err.message(),
+            "the endpoint identity probe did not answer within the pre-send budget of 30 s; \
+             nothing was sent"
         );
     }
 

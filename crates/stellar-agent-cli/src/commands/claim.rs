@@ -126,7 +126,6 @@
 //! writes before the send.
 
 use std::io::Write;
-use std::time::Duration;
 
 use clap::{ArgGroup, Args};
 use stellar_agent_core::envelope::{Envelope, OutputFormat};
@@ -173,7 +172,7 @@ use crate::common::mainnet_write::{
 };
 use crate::common::network::{
     EndpointFlags, EndpointUrlFlag, TargetNetwork, check_endpoint_identity, check_endpoint_ready,
-    mainnet_mode_refusal, network_context_for_command,
+    mainnet_mode_refusal, network_context_for_command, submit_timeout,
 };
 use crate::common::profile_access::{
     ProfileOrigin, injected_profile_load, load_profile_or_synthesize_testnet_with,
@@ -194,9 +193,6 @@ use stellar_agent_network::operational::read_within_readiness_deadline;
 
 /// Default fee per operation in stroops (100 stroops × 1 op = 100 stroops).
 const DEFAULT_FEE_STROOPS: u32 = 100;
-
-/// Default submission timeout in seconds.
-const DEFAULT_TIMEOUT_SECONDS: u64 = 60;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // ClaimResult — the structured success payload
@@ -390,10 +386,12 @@ pub struct ClaimArgs {
     #[arg(long, default_value_t = OutputFormat::DEFAULT, value_name = "FORMAT")]
     pub output: OutputFormat,
 
-    /// Timeout in seconds for the endpoint check and, separately, for the
-    /// submission. Default: 60.
-    #[arg(long, default_value_t = DEFAULT_TIMEOUT_SECONDS, value_name = "SECONDS")]
-    pub timeout_seconds: u64,
+    /// Timeout in seconds for the send and the confirmation poll.
+    /// Default: the profile's `submit_timeout_seconds`, then 60.
+    /// The endpoint checks and the reads before the send run under a fixed
+    /// 30-second budget instead.
+    #[arg(long, value_name = "SECONDS")]
+    pub timeout_seconds: Option<u64>,
 
     /// The RPC endpoint comes from the profile when absent.
     /// On testnet, this flag overrides the profile endpoint.
@@ -658,19 +656,13 @@ where
     if let Err(envelope) = init_keyring_for_origin(resolved, origin, init_keyring) {
         return ClaimOutcome::failed(envelope);
     }
-    let gate = match evaluate_staged_claim_policy(
-        None,
-        context,
-        args,
-        unsigned_xdr,
-        profile,
-        &resolved.name,
-    )
-    .await
-    {
-        Ok(gate) => gate,
-        Err(envelope) => return ClaimOutcome::failed(envelope),
-    };
+    let gate =
+        match evaluate_staged_claim_policy(None, context, unsigned_xdr, profile, &resolved.name)
+            .await
+        {
+            Ok(gate) => gate,
+            Err(envelope) => return ClaimOutcome::failed(envelope),
+        };
     // A decoded claim's fee is checked against the cap and the oracle
     // re-reads the source the gate read, before the audit pre-flight and the
     // signer. An opaque envelope reads nothing and has no witness.
@@ -736,7 +728,7 @@ where
     // from `--network`, so that flag has to describe the endpoint the
     // envelope will reach. The check makes it so, and a mismatch refuses here
     // rather than after a policy decision taken for the wrong chain.
-    let client = match checked_client(context, args).await {
+    let client = match checked_client(context).await {
         Ok(client) => client,
         Err(e) => return ClaimOutcome::failed(Envelope::<()>::err(&e)),
     };
@@ -770,7 +762,6 @@ where
     let gate = match evaluate_staged_claim_policy(
         Some(&client),
         context,
-        args,
         signed_xdr,
         profile,
         &resolved.name,
@@ -831,7 +822,17 @@ where
         }
     };
 
-    match submit_envelope(&client, context, args, signed_xdr, Some(&recorder)).await {
+    match submit_envelope(
+        &client,
+        context,
+        args,
+        profile,
+        signed_xdr,
+        Some(&recorder),
+        submit_transaction_and_wait,
+    )
+    .await
+    {
         Ok((signed_xdr, sub_result)) => ClaimOutcome::succeeded(
             None,
             ClaimResult {
@@ -923,7 +924,6 @@ where
 async fn evaluate_staged_claim_policy(
     sending_client: Option<&StellarRpcClient>,
     context: &NetworkContext,
-    args: &ClaimArgs,
     envelope_xdr: &str,
     profile: &Profile,
     profile_name: &str,
@@ -947,7 +947,7 @@ async fn evaluate_staged_claim_policy(
         let client = match sending_client {
             Some(client) => client,
             None => {
-                checked = checked_client(context, args)
+                checked = checked_client(context)
                     .await
                     .map_err(|e| Envelope::<()>::err(&e))?;
                 &checked
@@ -1318,7 +1318,17 @@ where
         }
     };
 
-    match submit_envelope(&client, context, args, &signed_xdr, Some(&recorder)).await {
+    match submit_envelope(
+        &client,
+        context,
+        args,
+        profile,
+        &signed_xdr,
+        Some(&recorder),
+        submit_transaction_and_wait,
+    )
+    .await
+    {
         Ok((xdr, sub_result)) => ClaimOutcome::succeeded(
             Some(built.preview),
             ClaimResult {
@@ -1422,18 +1432,19 @@ fn claim_inputs(args: &ClaimArgs) -> Result<BalanceId, ClaimError> {
 /// Checks the endpoint of `client`, fetches the entry of the balance `id` and
 /// the source account, and builds the typed preview.
 ///
-/// The identity check gets a budget of `--timeout-seconds`. The readiness
-/// check gets a fresh one, and the source account read runs under the
-/// readiness check's deadline.
+/// The identity check gets a
+/// [`PRE_SEND_BUDGET`](stellar_agent_network::PRE_SEND_BUDGET). The
+/// readiness check gets a fresh one, and the source account read runs under
+/// the readiness check's deadline.
 async fn fetch_claim_preview(
     client: &StellarRpcClient,
     context: &NetworkContext,
     args: &ClaimArgs,
     id: BalanceId,
 ) -> Result<PreviewedClaim, ClaimError> {
-    let timeout = Duration::from_secs(args.timeout_seconds);
-    check_endpoint_identity(client, context, timeout).await?;
-    let readiness_deadline = tokio::time::Instant::now() + timeout;
+    let budget = stellar_agent_network::PRE_SEND_BUDGET;
+    check_endpoint_identity(client, context, budget).await?;
+    let readiness_deadline = stellar_agent_network::operational::readiness_deadline();
     let operational = check_endpoint_ready(client, readiness_deadline).await?;
 
     let entry = fetch_claimable_balance_entry(client, &id).await?;
@@ -1684,36 +1695,53 @@ async fn sign_envelope(
 
 /// Builds the client a staged stage reads and sends through, checks that its
 /// endpoint serves the network of `context`, then checks that the endpoint is
-/// healthy and current. Each check gets a fresh budget of
-/// `--timeout-seconds`.
+/// healthy and current. Each check gets a fresh
+/// [`PRE_SEND_BUDGET`](stellar_agent_network::PRE_SEND_BUDGET).
 ///
 /// # Errors
 ///
 /// Returns the construction failure or the refusal of
 /// [`check_endpoint_identity`] or [`check_endpoint_ready`].
-async fn checked_client(
-    context: &NetworkContext,
-    args: &ClaimArgs,
-) -> Result<StellarRpcClient, WalletError> {
+async fn checked_client(context: &NetworkContext) -> Result<StellarRpcClient, WalletError> {
     let client = context.primary_client()?;
-    let timeout = Duration::from_secs(args.timeout_seconds);
-    check_endpoint_identity(&client, context, timeout).await?;
-    check_endpoint_ready(&client, tokio::time::Instant::now() + timeout).await?;
+    let budget = stellar_agent_network::PRE_SEND_BUDGET;
+    check_endpoint_identity(&client, context, budget).await?;
+    check_endpoint_ready(
+        &client,
+        stellar_agent_network::operational::readiness_deadline(),
+    )
+    .await?;
     Ok(client)
 }
 
 /// Submits `signed_xdr` through `client`, the client the stage checked and
-/// read through, under a fresh budget of `--timeout-seconds`.
-async fn submit_envelope(
+/// read through, with the send and the confirmation poll under
+/// [`submit_timeout`].
+///
+/// `submit_and_wait` is the submission step, with the signature of
+/// [`submit_transaction_and_wait`], which production passes.
+async fn submit_envelope<S>(
     client: &StellarRpcClient,
     context: &NetworkContext,
     args: &ClaimArgs,
+    profile: &Profile,
     signed_xdr: &str,
     recorder: Option<&dyn stellar_agent_network::SubmissionRecorder>,
-) -> Result<(String, SubmissionResult), WalletError> {
-    let timeout = Duration::from_secs(args.timeout_seconds);
+    submit_and_wait: S,
+) -> Result<(String, SubmissionResult), WalletError>
+where
+    S: AsyncFnOnce(
+        &StellarRpcClient,
+        &str,
+        std::time::Duration,
+        &str,
+        Option<SubmissionSignerKind>,
+        Option<&dyn stellar_agent_network::SubmissionRecorder>,
+    ) -> Result<SubmissionResult, WalletError>,
+{
+    let timeout = submit_timeout(args.timeout_seconds, profile);
     let passphrase = context.network_passphrase();
-    let result = submit_transaction_and_wait(
+    let result = submit_and_wait(
         client,
         signed_xdr,
         timeout,
@@ -2007,7 +2035,6 @@ where
         Err(e) => return failed(Envelope::<()>::err(&e)),
     };
 
-    let timeout = Duration::from_secs(args.timeout_seconds);
     match authorize_and_submit(MainnetWriteRequest {
         context: &context,
         profiles_dir: &profiles_dir,
@@ -2016,8 +2043,8 @@ where
         consumer: MainnetConsumer::CliClaim,
         unsigned_xdr: &built.envelope_xdr,
         client: &client,
-        probe_deadline: timeout,
-        submit_timeout: timeout,
+        probe_deadline: stellar_agent_network::PRE_SEND_BUDGET,
+        submit_timeout: submit_timeout(args.timeout_seconds, profile),
         source: &args.source,
         source_flag: "--source",
         signer,
@@ -2078,6 +2105,79 @@ mod tests {
         ]
     }
 
+    /// The timeout the verb's submit step hands the submission for `flag`,
+    /// with the profile's `submit_timeout_seconds` set to `configured`.
+    async fn forwarded_submit_timeout(
+        flag: Option<u64>,
+        configured: Option<u64>,
+    ) -> std::time::Duration {
+        let mut profile = Profile::builder_testnet("claim-timeout", "s", "n", "a").build();
+        profile.submit_timeout_seconds = configured;
+        let mut args = minimal_args();
+        args.timeout_seconds = flag;
+        let context = NetworkContext::from_profile(&profile);
+        let client = StellarRpcClient::new("http://127.0.0.1:9").unwrap();
+        let seen = std::sync::Mutex::new(None);
+        let outcome = submit_envelope(
+            &client,
+            &context,
+            &args,
+            &profile,
+            "AAAA",
+            None,
+            async |_client: &StellarRpcClient,
+                   _envelope: &str,
+                   timeout: std::time::Duration,
+                   _passphrase: &str,
+                   _signer_kind: Option<SubmissionSignerKind>,
+                   _recorder: Option<&dyn stellar_agent_network::SubmissionRecorder>| {
+                *seen.lock().unwrap() = Some(timeout);
+                Err(WalletError::Network(
+                    stellar_agent_core::error::NetworkError::EndpointIdentityUnavailable {
+                        url: "http://127.0.0.1:9".to_owned(),
+                    },
+                ))
+            },
+        )
+        .await;
+        assert!(outcome.is_err(), "the submission step refused");
+        seen.into_inner()
+            .unwrap()
+            .expect("the submit step reaches the submission")
+    }
+
+    /// `--timeout-seconds` sets the timeout the submit step hands the
+    /// submission; without it the profile's `submit_timeout_seconds` applies,
+    /// then 60 seconds.
+    #[tokio::test]
+    async fn timeout_flag_falls_back_to_the_profile_then_sixty() {
+        assert_eq!(
+            try_parse_claim(
+                &[
+                    base_args(),
+                    vec!["--timeout-seconds".to_owned(), "5".to_owned()]
+                ]
+                .concat()
+            )
+            .unwrap()
+            .timeout_seconds,
+            Some(5)
+        );
+        assert_eq!(try_parse_claim(&base_args()).unwrap().timeout_seconds, None);
+        assert_eq!(
+            forwarded_submit_timeout(Some(5), Some(17)).await,
+            std::time::Duration::from_secs(5)
+        );
+        assert_eq!(
+            forwarded_submit_timeout(None, Some(17)).await,
+            std::time::Duration::from_secs(17)
+        );
+        assert_eq!(
+            forwarded_submit_timeout(None, None).await,
+            std::time::Duration::from_secs(60)
+        );
+    }
+
     fn try_parse_claim(args: &[String]) -> Result<ClaimArgs, clap::Error> {
         use clap::Parser;
         #[derive(Debug, clap::Parser)]
@@ -2105,7 +2205,7 @@ mod tests {
             submit_only: None,
             network: Some(TargetNetwork::Testnet),
             output: OutputFormat::Json,
-            timeout_seconds: DEFAULT_TIMEOUT_SECONDS,
+            timeout_seconds: None,
             rpc_url: Some(crate::common::network::TESTNET_RPC_URL.to_owned()),
         }
     }
@@ -5169,7 +5269,6 @@ mod tests {
                     let result = evaluate_staged_claim_policy(
                         None,
                         &NetworkContext::from_profile(&profile),
-                        &args,
                         &claim_envelope_b64(),
                         &profile,
                         name,

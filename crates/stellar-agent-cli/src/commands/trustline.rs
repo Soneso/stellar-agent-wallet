@@ -8,7 +8,8 @@
 //! 1. `resolve_denomination` — USDT hard-refusal + known-lookalike denylist +
 //!    pinned-issuer-mismatch + unpinned-bare-code.
 //! 2. Endpoint identity check on the one client that every later read and the
-//!    send use, under the profile's [`Profile::submit_timeout`]. An endpoint
+//!    send use, under the pre-send budget
+//!    [`PRE_SEND_BUDGET`](stellar_agent_network::PRE_SEND_BUDGET). An endpoint
 //!    serving another network is refused before it answers any read.
 //! 3. Live issuer account fetch via `fetch_account` → `AccountFlagsView`
 //!    (for the clawback gate).
@@ -140,7 +141,7 @@ use crate::common::mainnet_write::{
     MainnetWriteRequest, authorize_and_submit, mainnet_context, mainnet_profiles_dir,
     require_v1_engine,
 };
-use crate::common::network::{check_endpoint_identity, check_endpoint_ready};
+use crate::common::network::{check_endpoint_identity, check_endpoint_ready, submit_timeout};
 use crate::common::profile_access::{
     ProfileAccessError, injected_profile_load, reconcile_loaded_profile,
 };
@@ -211,6 +212,13 @@ pub struct TrustlineArgs {
     /// Absent → profile's `classic_fee_per_op_stroops` value.
     #[arg(long = "fee")]
     pub classic_base: Option<String>,
+
+    /// Timeout in seconds for the send and the confirmation poll.
+    /// Default: the profile's `submit_timeout_seconds`, then 60.
+    /// The endpoint checks and the reads before the send run under a fixed
+    /// 30-second budget instead.
+    #[arg(long, value_name = "SECONDS")]
+    pub timeout_seconds: Option<u64>,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -358,14 +366,15 @@ where
 
     // The endpoint checks precede the issuer read: the issuer flags feed the
     // clawback gate, and every later read and the send use this client. The
-    // identity check and the readiness check each get their own budget of the
-    // profile's submit timeout.
-    if let Err(e) = check_endpoint_identity(&rpc_client, &context, profile.submit_timeout()).await {
+    // identity check and the readiness check each get their own pre-send
+    // budget.
+    let budget = stellar_agent_network::PRE_SEND_BUDGET;
+    if let Err(e) = check_endpoint_identity(&rpc_client, &context, budget).await {
         return write_envelope(out, &Envelope::<()>::err(&e), 1);
     }
     if let Err(e) = check_endpoint_ready(
         &rpc_client,
-        tokio::time::Instant::now() + profile.submit_timeout(),
+        stellar_agent_network::operational::readiness_deadline(),
     )
     .await
     {
@@ -597,8 +606,8 @@ struct TrustlineSubmitted {
 /// issuer, then signs, records, and submits the built `ChangeTrust` envelope.
 ///
 /// `submit_and_wait` is the submission step, with the signature of
-/// [`submit_transaction_and_wait`], which production passes. It receives the
-/// profile's [`Profile::submit_timeout`].
+/// [`submit_transaction_and_wait`], which production passes. It receives
+/// `--timeout-seconds`, else the profile's [`Profile::submit_timeout`].
 ///
 /// Renders nothing: the caller reports the returned payload or failure
 /// envelope in the one envelope that carries the preview.
@@ -711,7 +720,7 @@ where
     } = submit_and_wait(
         rpc_client,
         &signed_xdr,
-        profile.submit_timeout(),
+        submit_timeout(args.timeout_seconds, profile),
         network_passphrase,
         Some(SubmissionSignerKind::Keyring),
         Some(&recorder),
@@ -1268,13 +1277,14 @@ where
             );
         }
     };
-    if let Err(e) = check_endpoint_identity(&client, &net_context, profile.submit_timeout()).await {
+    let budget = stellar_agent_network::PRE_SEND_BUDGET;
+    if let Err(e) = check_endpoint_identity(&client, &net_context, budget).await {
         return write_envelope(out, &Envelope::<()>::err(&e), 1);
     }
     // The check precedes the issuer and source reads, and the source read
     // runs under the check's deadline; the summary names the ledger the
     // check observed.
-    let readiness_deadline = tokio::time::Instant::now() + profile.submit_timeout();
+    let readiness_deadline = stellar_agent_network::operational::readiness_deadline();
     let operational = match check_endpoint_ready(&client, readiness_deadline).await {
         Ok(report) => report,
         Err(e) => return write_envelope(out, &Envelope::<()>::err(&e), 1),
@@ -1427,8 +1437,8 @@ where
             consumer: MainnetConsumer::CliTrustline,
             unsigned_xdr: &built.envelope_xdr,
             client: &client,
-            probe_deadline: profile.submit_timeout(),
-            submit_timeout: profile.submit_timeout(),
+            probe_deadline: stellar_agent_network::PRE_SEND_BUDGET,
+            submit_timeout: submit_timeout(args.timeout_seconds, profile),
             source: &args.from,
             source_flag: "--from",
             signer: MainnetSignerChoice::Keyring,
@@ -1679,6 +1689,7 @@ mod tests {
             asset: "USDC".to_owned(),
             limit_stroops: None,
             classic_base: None,
+            timeout_seconds: None,
         };
         let code = run_with_dependencies(
             &args,
@@ -1731,6 +1742,7 @@ mod tests {
             asset: "USDC".to_owned(),
             limit_stroops: None,
             classic_base: None,
+            timeout_seconds: None,
         };
         let code = run_with_dependencies(
             &args,
@@ -1790,6 +1802,7 @@ mod tests {
             asset: String::new(),
             limit_stroops: None,
             classic_base: None,
+            timeout_seconds: None,
         };
 
         let code = run_with_dependencies(
@@ -1958,6 +1971,7 @@ mod tests {
             asset: format!("USDC:{ONE_ENVELOPE_ISSUER}"),
             limit_stroops: None,
             classic_base: Some(fee.to_owned()),
+            timeout_seconds: None,
         };
         let mut out = Vec::new();
         let loaded = profile.clone();
@@ -2032,14 +2046,20 @@ mod tests {
     // ── Submit timeout ────────────────────────────────────────────────────────
 
     /// Runs the stages after the preview for a `USDC` trustline of profile
-    /// `name` from a seeded keyring signer, with a submission step that
-    /// records the timeout it is handed and refuses, and returns that timeout.
+    /// `name`, whose `submit_timeout_seconds` is `configured`, from a seeded
+    /// keyring signer with `--timeout-seconds` set to `flag`. The submission
+    /// step records the timeout it is handed and refuses, and the helper
+    /// returns that timeout.
     ///
     /// The fee comes from the profile default, so no request reaches the
     /// unroutable endpoint the client names. Each call takes its own profile
     /// name: the process-wide audit registry and the keyring tip anchor bind a
     /// profile name to one audit log.
-    async fn forwarded_submit_timeout(name: &str, configured: Option<u64>) -> std::time::Duration {
+    async fn forwarded_submit_timeout(
+        name: &str,
+        configured: Option<u64>,
+        flag: Option<u64>,
+    ) -> std::time::Duration {
         const SEED: [u8; 32] = [0x5c; 32];
 
         let home = tempfile::tempdir().unwrap();
@@ -2078,6 +2098,7 @@ mod tests {
             asset: format!("USDC:{ONE_ENVELOPE_ISSUER}"),
             limit_stroops: None,
             classic_base: None,
+            timeout_seconds: flag,
         };
         let resolved = resolve_denomination(
             DenominationInput::CodeAndIssuer {
@@ -2221,6 +2242,7 @@ mod tests {
             asset: format!("USDC:{ONE_ENVELOPE_ISSUER}"),
             limit_stroops: None,
             classic_base: Some("auto".to_owned()),
+            timeout_seconds: None,
         };
         let mut out = Vec::new();
         let loaded = profile.clone();
@@ -2261,6 +2283,7 @@ mod tests {
             asset: format!("USDC:{ONE_ENVELOPE_ISSUER}"),
             limit_stroops: None,
             classic_base: None,
+            timeout_seconds: None,
         };
         let mut out = Vec::new();
         let loaded = profile.clone();
@@ -2294,6 +2317,7 @@ mod tests {
             asset: format!("USDC:{ONE_ENVELOPE_ISSUER}"),
             limit_stroops: None,
             classic_base: None,
+            timeout_seconds: None,
         };
         let mut out = Vec::new();
         let loaded = profile.clone();
@@ -2379,18 +2403,22 @@ mod tests {
         );
     }
 
-    /// An unset `submit_timeout_seconds` hands the submission the 60-second
-    /// default, and a configured one hands it its own value.
+    /// `--timeout-seconds` sets the submission timeout; without it the
+    /// profile's `submit_timeout_seconds` applies, then 60 seconds.
     #[tokio::test]
     #[serial_test::serial]
-    async fn sign_and_submit_forwards_the_profile_submit_timeout() {
+    async fn timeout_flag_falls_back_to_the_profile_then_sixty() {
         assert_eq!(
-            forwarded_submit_timeout("trustline-timeout-unset", None).await,
-            std::time::Duration::from_secs(60)
+            forwarded_submit_timeout("trustline-timeout-flag", Some(17), Some(5)).await,
+            std::time::Duration::from_secs(5)
         );
         assert_eq!(
-            forwarded_submit_timeout("trustline-timeout-set", Some(17)).await,
+            forwarded_submit_timeout("trustline-timeout-set", Some(17), None).await,
             std::time::Duration::from_secs(17)
+        );
+        assert_eq!(
+            forwarded_submit_timeout("trustline-timeout-unset", None, None).await,
+            std::time::Duration::from_secs(60)
         );
     }
 
@@ -2588,6 +2616,7 @@ mod tests {
                 asset: format!("USDC:{ISSUER}"),
                 limit_stroops: None,
                 classic_base: None,
+                timeout_seconds: None,
             };
             let loaded = profile.clone();
             let code = run_with_dependencies(
@@ -2739,6 +2768,7 @@ mod tests {
                 asset: format!("USDC:{ONE_ENVELOPE_ISSUER}"),
                 limit_stroops: None,
                 classic_base: None,
+                timeout_seconds: None,
             };
             let mut out = Vec::new();
             let rc =
@@ -2921,6 +2951,7 @@ mod tests {
                 asset: TRUSTLINE_ASSET.to_owned(),
                 limit_stroops: None,
                 classic_base: None,
+                timeout_seconds: None,
             }
         }
 
@@ -3487,6 +3518,7 @@ mod tests {
             asset: format!("USD:{issuer}"),
             limit_stroops: None,
             classic_base: Some("100".into()),
+            timeout_seconds: None,
         };
         for after in [false, false, true] {
             if after {

@@ -148,8 +148,8 @@ pub use submission_record::{
     WalletSubmissionRecorder,
 };
 pub use submit::{
-    MainnetSubmitGrant, PreSendStage, SentByError, SubmissionResult, SubmissionSignerKind,
-    envelope_hash_hex, redact_tx_hash, refuse_mainnet_write,
+    MainnetSubmitGrant, PRE_SEND_BUDGET, PreSendStage, SentByError, SubmissionResult,
+    SubmissionSignerKind, envelope_hash_hex, redact_tx_hash, refuse_mainnet_write,
     submit_authorized_transaction_and_wait, submit_transaction_and_wait,
     submit_transaction_and_wait_sent_by,
 };

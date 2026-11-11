@@ -50,6 +50,10 @@ pub enum MainnetPrecondition {
     DeadlineElapsed,
     /// The classic envelope's deadline exceeds the authorization ceiling.
     DeadlineTooFar,
+    /// The classic envelope's deadline lies within the send margin: too
+    /// little time remains for a send before it. A fresh simulation builds an
+    /// envelope with a new deadline.
+    DeadlineWithinMargin,
     /// The envelope fee exceeds its effective cap.
     FeeAboveCap,
     /// The source account cannot be read.
@@ -263,6 +267,7 @@ impl MainnetPrecondition {
             Self::DeadlineMissing => "deadline_missing",
             Self::DeadlineElapsed => "deadline_elapsed",
             Self::DeadlineTooFar => "deadline_too_far",
+            Self::DeadlineWithinMargin => "deadline_within_margin",
             Self::FeeAboveCap => "fee_above_cap",
             Self::AccountUnavailable => "account_unavailable",
             Self::PolicyEvaluationFailed => "policy_evaluation_failed",
@@ -496,6 +501,7 @@ mod tests {
             P::DeadlineMissing,
             P::DeadlineElapsed,
             P::DeadlineTooFar,
+            P::DeadlineWithinMargin,
             P::FeeAboveCap,
             P::AccountUnavailable,
             P::PolicyEvaluationFailed,
@@ -604,6 +610,7 @@ mod tests {
                 | P::DeadlineMissing
                 | P::DeadlineElapsed
                 | P::DeadlineTooFar
+                | P::DeadlineWithinMargin
                 | P::EnvelopePreSigned
                 | P::FeeAboveCap
                 | P::AccountUnavailable
@@ -723,6 +730,7 @@ mod tests {
             "deadline_missing",
             "deadline_elapsed",
             "deadline_too_far",
+            "deadline_within_margin",
             "fee_above_cap",
             "account_unavailable",
             "policy_evaluation_failed",
