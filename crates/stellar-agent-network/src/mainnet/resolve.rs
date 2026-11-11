@@ -998,6 +998,7 @@ mod enabled {
             },
             holds,
             parent: None,
+            operation: None,
         }
     }
     /// The key of an unmuxed source; a muxed source names no G-strkey and
@@ -1442,6 +1443,7 @@ mod enabled {
             },
             holds: vec![],
             parent: None,
+            operation: None,
         };
         let minted = req
             .store
@@ -1602,6 +1604,7 @@ mod enabled {
             bindings: req.receipt.facts,
             holds: vec![],
             parent: Some(parent),
+            operation: None,
         };
         let minted = req
             .store

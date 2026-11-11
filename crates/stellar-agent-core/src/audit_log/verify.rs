@@ -1242,6 +1242,8 @@ fn verify_single_file(
             | EventKind::ValueActionPending { .. }
             | EventKind::ValueActionFailed { .. }
             | EventKind::SubmissionAccountingExpired { .. }
+            | EventKind::OperationTransition { .. }
+            | EventKind::OperationEvidence { .. }
             | EventKind::SubmissionReceiptCleared { .. }
             | EventKind::X402PaymentAuthorized { .. }
             | EventKind::X402AuthorizationWithheld { .. }
@@ -2428,6 +2430,8 @@ mod tests {
             EventKind::ValueActionPending { .. } => "value_action_pending",
             EventKind::ValueActionFailed { .. } => "value_action_failed",
             EventKind::SubmissionAccountingExpired { .. } => "submission_accounting_expired",
+            EventKind::OperationTransition { .. } => "operation_transition",
+            EventKind::OperationEvidence { .. } => "operation_evidence",
             EventKind::SubmissionReceiptCleared { .. } => "submission_receipt_cleared",
             EventKind::X402PaymentAuthorized { .. } => "x402_payment_authorized",
             EventKind::X402AuthorizationWithheld { .. } => "x402_authorization_withheld",
@@ -2947,6 +2951,31 @@ mod tests {
                 code: "submission.accounting_expired".to_owned(),
                 chain_outcome: "unknown".to_owned(),
             },
+            EventKind::OperationTransition {
+                operation_id: "0a".repeat(16),
+                attempt_index: Some(1),
+                from_state: Some("authorized".to_owned()),
+                step: "sending".to_owned(),
+                commit_id: "0b".repeat(16),
+            },
+            EventKind::OperationEvidence {
+                operation_id: "0a".repeat(16),
+                attempt_index: 1,
+                evidence_seqs: Some(crate::audit_log::schema::EvidenceSeqRange {
+                    first: 1,
+                    last: 1,
+                }),
+                rows: vec![crate::audit_log::schema::OperationEvidenceRow {
+                    evidence_seq: 1,
+                    digest: "0c".repeat(32),
+                    observed_ledger: 100,
+                }],
+                sequence_released: false,
+                primary_ledger: None,
+                witness_ledger: None,
+                min_close_time_ms: None,
+                commit_id: "0d".repeat(16),
+            },
             EventKind::SubmissionReceiptCleared {
                 transaction_hash_redacted: "abcd1234...5678efgh".to_owned(),
                 cleared_from: "ambiguous".to_owned(),
@@ -3436,6 +3465,8 @@ mod tests {
                 "value_action_pending",
                 "value_action_failed",
                 "submission_accounting_expired",
+                "operation_transition",
+                "operation_evidence",
                 "submission_receipt_cleared",
                 "x402_payment_authorized",
                 "x402_authorization_withheld",

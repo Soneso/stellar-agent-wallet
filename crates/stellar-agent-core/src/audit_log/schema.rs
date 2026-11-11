@@ -782,6 +782,30 @@ pub struct WipedBucket {
     pub pending_total: i128,
 }
 
+/// The contiguous evidence sequence numbers one
+/// [`EventKind::OperationEvidence`] row adds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EvidenceSeqRange {
+    /// The first added sequence number.
+    pub first: u64,
+    /// The last added sequence number, at least `first`.
+    pub last: u64,
+}
+
+/// One evidence row an [`EventKind::OperationEvidence`] row adds: its
+/// sequence number, its digest and the ledger its endpoint reported.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OperationEvidenceRow {
+    /// The row's evidence sequence number.
+    pub evidence_seq: u64,
+    /// The row's SHA-256 digest as lowercase hexadecimal.
+    pub digest: String,
+    /// The ledger the endpoint reported for the observation.
+    pub observed_ledger: u32,
+}
+
 /// One leg of a value-moving action, in audit-wire form.
 ///
 /// Built at emission time from the SAME `ValueEffects` the policy gate sized
@@ -3347,6 +3371,75 @@ pub enum EventKind {
         chain_outcome: String,
     },
 
+    /// A mainnet operation committed a state step or its exposure.
+    ///
+    /// The operation store appends this row before it commits the step. The
+    /// row names the operation, the attempt, the state left, the step taken
+    /// and the commit identifier the record retains, so a verifier matches
+    /// the row against the retained transition. A step whose commit fails
+    /// leaves a row without a retained commit identifier. The outer
+    /// [`AuditEntry`](super::entry::AuditEntry) carries `request_id`.
+    ///
+    /// # Schema additivity
+    ///
+    /// Additive under `#[non_exhaustive]`; hash-chain integrity preserved.
+    OperationTransition {
+        /// The operation identifier: 16 bytes as lowercase hexadecimal.
+        operation_id: String,
+        /// The attempt the step belongs to, starting at 1; absent for a
+        /// step before the first attempt.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        attempt_index: Option<u32>,
+        /// The state the operation left; absent for its creation.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        from_state: Option<String>,
+        /// The state the operation entered, or `"expose"` for the commit
+        /// that establishes an attempt's exposure.
+        step: String,
+        /// The commit identifier: 16 random bytes as lowercase hexadecimal.
+        commit_id: String,
+    },
+
+    /// A mainnet operation committed recovery evidence or its first
+    /// sequence release.
+    ///
+    /// The operation store appends one row per commit that adds evidence
+    /// rows or first records a sequence release, before it commits. Each
+    /// added row takes its own sequence number; `evidence_seqs` names the
+    /// contiguous range the commit adds, or is `null` for a release without
+    /// new rows. The row carries digests and ledger numbers only, never an
+    /// endpoint URL or a secret. The outer
+    /// [`AuditEntry`](super::entry::AuditEntry) carries `request_id`.
+    ///
+    /// # Schema additivity
+    ///
+    /// Additive under `#[non_exhaustive]`; hash-chain integrity preserved.
+    OperationEvidence {
+        /// The operation identifier: 16 bytes as lowercase hexadecimal.
+        operation_id: String,
+        /// The attempt the evidence belongs to, starting at 1.
+        attempt_index: u32,
+        /// The evidence sequence numbers the commit adds, or `null`.
+        evidence_seqs: Option<EvidenceSeqRange>,
+        /// The digest and observed ledger of each added row, in sequence
+        /// order.
+        rows: Vec<OperationEvidenceRow>,
+        /// Whether the commit records the attempt's first sequence release.
+        sequence_released: bool,
+        /// The primary endpoint's release ledger, with a release.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        primary_ledger: Option<u32>,
+        /// The witness endpoint's release ledger, with a release.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        witness_ledger: Option<u32>,
+        /// The release's minimum close time in Unix milliseconds, with a
+        /// release.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        min_close_time_ms: Option<u64>,
+        /// The commit identifier: 16 random bytes as lowercase hexadecimal.
+        commit_id: String,
+    },
+
     /// An operator acknowledges a submission and clears its receipt.
     ///
     /// Written by `tx receipt clear --acknowledge` after the command has
@@ -3839,7 +3932,7 @@ pub enum EventKind {
 /// the test stays green, leaving the new variant unpinned by any tag assertion.
 /// Closing that would need the count derived from the enum itself, which needs a
 /// derive macro this workspace does not carry.
-pub const EVENT_KIND_VARIANT_COUNT: usize = 81;
+pub const EVENT_KIND_VARIANT_COUNT: usize = 83;
 
 /// Why an [`EventKind::AuditTipAnchored`] row was written.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

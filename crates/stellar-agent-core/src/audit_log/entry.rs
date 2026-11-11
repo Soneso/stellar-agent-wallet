@@ -2543,6 +2543,108 @@ impl AuditEntry {
         }
     }
 
+    /// Constructs an `OperationTransition` audit entry.
+    ///
+    /// Emitted by the operation store before it commits a state step or an
+    /// attempt's exposure. `operation_id` and `commit_id` are lowercase
+    /// hexadecimal; `step` is the entered state's wire name or `"expose"`.
+    /// `request_id` stays on the outer entry.
+    #[must_use]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the row names the step and the outer entry's identity"
+    )]
+    pub fn new_operation_transition(
+        tool: impl Into<String>,
+        chain_id: impl IntoOptionalChainId,
+        operation_id: impl Into<String>,
+        attempt_index: Option<u32>,
+        from_state: Option<String>,
+        step: impl Into<String>,
+        commit_id: impl Into<String>,
+        request_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            ts: current_iso8601_utc(),
+            tool: tool.into(),
+            chain_id: chain_id.into_optional_chain_id(),
+            arg_keys: vec![],
+            arg_keys_truncated: None,
+            truncated: false,
+            envelope_hash: None,
+            nonce_id: None,
+            policy_decision: PolicyDecision::Allow,
+            decision_reason: None,
+            request_id: request_id.into(),
+            event_kind: EventKind::OperationTransition {
+                operation_id: operation_id.into(),
+                attempt_index,
+                from_state,
+                step: step.into(),
+                commit_id: commit_id.into(),
+            },
+            previous_entry_hash: String::new(),
+            entry_tag: None,
+        }
+    }
+
+    /// Constructs an `OperationEvidence` audit entry.
+    ///
+    /// Emitted by the operation store before it commits evidence rows or an
+    /// attempt's first sequence release. `release` carries the primary and
+    /// witness release ledgers and the minimum close time when the commit
+    /// records the release. Digests are lowercase hexadecimal; the row holds
+    /// no endpoint URL. `request_id` stays on the outer entry.
+    #[must_use]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the row names the evidence range, the release and the outer entry's identity"
+    )]
+    pub fn new_operation_evidence(
+        tool: impl Into<String>,
+        chain_id: impl IntoOptionalChainId,
+        operation_id: impl Into<String>,
+        attempt_index: u32,
+        rows: Vec<super::schema::OperationEvidenceRow>,
+        release: Option<(u32, u32, u64)>,
+        commit_id: impl Into<String>,
+        request_id: impl Into<String>,
+    ) -> Self {
+        let evidence_seqs = match (rows.first(), rows.last()) {
+            (Some(first), Some(last)) => Some(super::schema::EvidenceSeqRange {
+                first: first.evidence_seq,
+                last: last.evidence_seq,
+            }),
+            _ => None,
+        };
+        Self {
+            ts: current_iso8601_utc(),
+            tool: tool.into(),
+            chain_id: chain_id.into_optional_chain_id(),
+            arg_keys: vec![],
+            arg_keys_truncated: None,
+            truncated: false,
+            envelope_hash: None,
+            nonce_id: None,
+            policy_decision: PolicyDecision::Allow,
+            decision_reason: None,
+            request_id: request_id.into(),
+            event_kind: EventKind::OperationEvidence {
+                operation_id: operation_id.into(),
+                attempt_index,
+                evidence_seqs,
+                rows,
+                sequence_released: release.is_some(),
+                primary_ledger: release.map(|(primary, _, _)| primary),
+                witness_ledger: release.map(|(_, witness, _)| witness),
+                min_close_time_ms: release.map(|(_, _, close)| close),
+                commit_id: commit_id.into(),
+            },
+            previous_entry_hash: String::new(),
+            entry_tag: None,
+        }
+    }
+
     /// Constructs a `SubmissionReceiptCleared` audit entry.
     ///
     /// Emitted by `tx receipt clear --acknowledge`. `cleared_from` names the receipt status the
