@@ -484,6 +484,67 @@ jobs:
         shell: bash
         run: "timeout 600 cargo test -p stellar-agent-mcp --no-default-features --lib -- tools::rules:: tools::rule_create::"
 
+  platform-keyring:
+    name: platform-keyring
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    # Mainnet wallet processes store their keys in the platform keyring, so
+    # this job runs one write, read, and delete through the store the
+    # binaries register: the Secret Service of GNOME Keyring. dbus-run-session
+    # gives the keyring daemon and the test one private session bus. The
+    # keyring lives for this job only, so a random password unlocks it.
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+      - name: Install libudev (Linux hidapi)
+        run: sudo apt-get update && sudo apt-get install -y libudev-dev pkg-config
+      - name: Install gnome-keyring and dbus
+        run: sudo apt-get install -y gnome-keyring dbus
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          prefix-key: platform-keyring
+      - name: Build the platform keyring test
+        run: cargo test -p stellar-agent-network --test keyring_platform --no-run
+      # The round trip is an ignored test, so a run that executes no test
+      # fails on the count check.
+      - name: Run the platform keyring round trip
+        run: |
+          set -o pipefail
+          dbus-run-session -- bash -c '
+            openssl rand -hex 16 | gnome-keyring-daemon --components=secrets --daemonize --unlock >/dev/null
+            cargo test -p stellar-agent-network --test keyring_platform -- --ignored --exact keyring_platform_roundtrip
+          ' 2>&1 | tee keyring-platform.log
+          grep -q 'test result: ok. 1 passed' keyring-platform.log
+
+  deploy-scripts:
+    name: deploy-scripts (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    # The wrappers read stat, ls, and pgrep output, whose forms differ
+    # between macOS and Linux, so the harness runs on each host against its
+    # real tools and stubs the other platform's.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-26]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - if: runner.os == 'Linux'
+        uses: taiki-e/install-action@c509219cf42fba86913069efd0ade2458c59337b # v2.90.1
+        with:
+          tool: shellcheck@0.11.0
+      - name: Shellcheck the deployment scripts
+        if: runner.os == 'Linux'
+        run: shellcheck -s bash scripts/deploy/bootstrap.sh scripts/deploy/mcp-launch scripts/deploy/cli-launch scripts/deploy/provision scripts/deploy/validate-macos.sh scripts/deploy/validate-linux.sh scripts/deploy/test-deploy.sh
+      - name: Run the deployment harness
+        run: bash scripts/deploy/test-deploy.sh
+
   machete:
     name: unused-deps
     runs-on: ubuntu-24.04

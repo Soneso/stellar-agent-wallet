@@ -4,7 +4,8 @@
 # Builds a scratch Git repository with one commit on main. It holds copies of
 # the root manifest, lockfile, toolchain, every crates/*/Cargo.toml, four crate
 # sources, and the cap85-beacon record of the smart-account crate. It also
-# holds .github, CHANGELOG.md, CONTRIBUTING.md, the building guide, and the skill.
+# holds .github, scripts/deploy, CHANGELOG.md, CONTRIBUTING.md, the building
+# guide, and the skill.
 # Each case copies that repository, changes it on a branch, and runs
 # preflight.sh against main, or against the default base in the base cases.
 #
@@ -53,7 +54,7 @@ FIXTURE="$TMP/fixture"
 CASES="docs-only upstream-base origin-base synced-fork-base install-surface-doc deleted-install-surface-doc welcome-workflow release-workflow
 release-rehearsal-workflow vendored-wasm-workflow
 triage-workflow triage-review-workflow triage-sweep-workflow
-ci-yml-only python-check-script proof-matrix-only shell-check-script testnet-driver-script skill inbox-web enroll-web bridge-web one-crate two-owners
+ci-yml-only python-check-script proof-matrix-only shell-check-script testnet-driver-script deploy-scripts deploy-scripts-run skill inbox-web enroll-web bridge-web one-crate two-owners
 target-specific-edge dev-dependency-edge optional-dependency-edge root-manifest lockfile toolchain
 unowned-rust-path
 wallet-manifest removed-member untracked-test-file fixture-markdown crate-sources-select-proof-matrix
@@ -110,6 +111,8 @@ self-test:test-triage-workflow.py	python3 .github/scripts/test-triage-workflow.p
 self-test:test-validate-unsigned-archive.py	python3 .github/scripts/test-validate-unsigned-archive.py
 self-test:test-welcome-workflow.py	python3 .github/scripts/test-welcome-workflow.py
 shellcheck-preflight	shellcheck -s bash .github/scripts/preflight.sh .github/scripts/test-preflight.sh
+deploy-shellcheck	shellcheck -s bash scripts/deploy/bootstrap.sh scripts/deploy/mcp-launch scripts/deploy/cli-launch scripts/deploy/provision scripts/deploy/validate-macos.sh scripts/deploy/validate-linux.sh scripts/deploy/test-deploy.sh
+deploy-harness	bash scripts/deploy/test-deploy.sh
 package-skill	.github/scripts/package-skill.sh --check
 vendored-tree-check	bash .github/scripts/rebuild-vendored-wasm.sh --check-tree --repo-root .
 publish-check	.github/scripts/publish-crates.sh --check
@@ -212,6 +215,8 @@ build_fixture() {
     cp "$ROOT/$file" "$dir/$file"
   done
   cp -R "$ROOT/.github" "$dir/.github"
+  mkdir -p "$dir/scripts"
+  cp -R "$ROOT/scripts/deploy" "$dir/scripts/deploy"
   if [ -n "${2:-}" ]; then
     apply_mutation "$2" "$dir/.github/scripts/preflight.sh"
     bash -n "$dir/.github/scripts/preflight.sh"
@@ -445,11 +450,11 @@ PYDECLARED
     feature-on:network)
 }
 
-# Prints the .github/scripts/ paths that EXPECTED_REGISTRY runs with
-# interpreter $1, one per line.
+# Prints the .github/scripts/ and scripts/deploy/ paths that
+# EXPECTED_REGISTRY runs with interpreter $1, one per line.
 registry_scripts() {
   printf '%s\n' "$EXPECTED_REGISTRY" | awk -F '\t' -v interpreter="$1" '
-    split($2, words, " ") >= 2 && words[1] == interpreter && words[2] ~ /^\.github\/scripts\// { print words[2] }
+    split($2, words, " ") >= 2 && words[1] == interpreter && words[2] ~ /^(\.github\/scripts|scripts\/deploy)\// { print words[2] }
   '
 }
 
@@ -1131,6 +1136,31 @@ case_testnet_driver_script() {
     "shellcheck-changed=shellcheck -s bash .github/scripts/run-testnet-acceptance.sh"
 }
 
+# A change below scripts/deploy/ selects the shellcheck of those scripts and
+# the deployment harness, in that order.
+case_deploy_scripts() {
+  start_case
+  edit scripts/deploy/cli-launch
+  expect_list "${ALWAYS[@]}" deploy-shellcheck deploy-harness
+}
+
+# The deployment gates run shellcheck, then the harness; a failing harness
+# fails the run.
+case_deploy_scripts_run() {
+  start_run_case
+  edit scripts/deploy/provision
+  write_shim "$BIN/shellcheck" shellcheck plain
+  write_shim "$BIN/perl" perl plain
+  echo "scripts/deploy/test-deploy.sh=1" >>"$STATE/status"
+  run_preflight
+  expect_line "- \`$(registry_row deploy-harness | cut -f 2)\`: exit 1"
+  expect_end 1 "preflight: 5 gates run, 1 failed, 0 unavailable"
+  expect_calls "python3 .github/scripts/check-docs-style.py" "python3 .github/scripts/check-install-surface.py" \
+    "bash .github/scripts/check-gate-tool-versions.sh" "$(registry_row deploy-shellcheck | cut -f 2)" \
+    "bash scripts/deploy/test-deploy.sh"
+  assert_clean_calls
+}
+
 case_skill() {
   start_case
   edit skills/stellar-agent-wallet/SKILL.md
@@ -1351,8 +1381,8 @@ case_full() {
   start_case
   edit CONTRIBUTING.md
   read -r -a ids <<<"$(printf '%s\n' "$EXPECTED_REGISTRY" | awk -F '\t' '{ printf "%s ", $1 }')"
-  if [ "${#ids[@]}" -ne 59 ]; then
-    fail "the expected registry holds ${#ids[@]} rows, expected 59"
+  if [ "${#ids[@]}" -ne 61 ]; then
+    fail "the expected registry holds ${#ids[@]} rows, expected 61"
   fi
   expect_list --full "${ids[@]}"
 }

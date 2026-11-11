@@ -12,7 +12,11 @@
 # (d) a MAINNET_WRITE value other than on or off fails the run before the
 #     first suite, with a message that names the variable; (d2) the empty
 #     value is such a value;
-# (e) run_suite passes the feature list of suite_features to cargo.
+# (e) run_suite passes the feature list of suite_features to cargo;
+# (i) STELLAR_AGENT_TEST_KEYRING: unset keeps the headless default with a
+#     fresh key and a preset backend; platform leaves both keyring variables
+#     unset; any other value fails the run before the first suite, with a
+#     message that names the variable.
 set -uo pipefail
 
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
@@ -296,6 +300,72 @@ assert '    if: ${{ !cancelled() && (' + condition + ') }}\n' in jobs[1][1]
 CHECK_WORKFLOW
 then pass '(h) shares, timeouts, chaining, schedule, concurrency and environments';
 else fail '(h) workflow structure'; fi
+# (i) The keyring selection, read after sourcing the driver in a fresh shell
+# whose keyring variables are the given assignments only. Prints the exported
+# backend and key, each "unset" when absent.
+keyring_env() {
+  # shellcheck disable=SC2016 # The inner shell expands its own arguments.
+  env -u STELLAR_AGENT_KEYRING_BACKEND -u STELLAR_AGENT_HEADLESS_KEYRING_KEY \
+    -u STELLAR_AGENT_TEST_KEYRING "$@" bash -c '
+      . "$1"
+      printf "%s|%s\n" "$(printenv STELLAR_AGENT_KEYRING_BACKEND || echo unset)" \
+        "$(printenv STELLAR_AGENT_HEADLESS_KEYRING_KEY || echo unset)"
+    ' keyring "$DRIVER"
+}
+first=$(keyring_env)
+second=$(keyring_env)
+if [[ "$first" =~ ^headless-env\|[A-Za-z0-9_-]{43}$ ]] && [[ "$second" =~ ^headless-env\|[A-Za-z0-9_-]{43}$ ]] \
+  && [ "$first" != "$second" ]; then
+  pass '(i) unset STELLAR_AGENT_TEST_KEYRING selects headless-env with a fresh key per run'
+else
+  fail "(i) unset STELLAR_AGENT_TEST_KEYRING: '$first' then '$second'"
+fi
+got=$(keyring_env STELLAR_AGENT_KEYRING_BACKEND=headless-dpapi)
+if [ "$got" = 'headless-dpapi|unset' ]; then
+  pass '(i) a preset STELLAR_AGENT_KEYRING_BACKEND stays'
+else
+  fail "(i) a preset STELLAR_AGENT_KEYRING_BACKEND gave '$got'"
+fi
+got=$(keyring_env STELLAR_AGENT_TEST_KEYRING=platform)
+if [ "$got" = 'unset|unset' ]; then
+  pass '(i) STELLAR_AGENT_TEST_KEYRING=platform leaves both keyring variables unset'
+else
+  fail "(i) STELLAR_AGENT_TEST_KEYRING=platform gave '$got'"
+fi
+got=$(keyring_env STELLAR_AGENT_TEST_KEYRING=platform STELLAR_AGENT_KEYRING_BACKEND=headless-env \
+  STELLAR_AGENT_HEADLESS_KEYRING_KEY=preset-key)
+if [ "$got" = 'unset|unset' ]; then
+  pass '(i) STELLAR_AGENT_TEST_KEYRING=platform unsets a preset backend and key'
+else
+  fail "(i) STELLAR_AGENT_TEST_KEYRING=platform with a preset backend gave '$got'"
+fi
+# The value check runs before the first suite, as in (d).
+run_keyring_driver() {
+  env -u STELLAR_AGENT_KEYRING_BACKEND -u STELLAR_AGENT_HEADLESS_KEYRING_KEY \
+    STELLAR_AGENT_TEST_KEYRING="$1" MAINNET_WRITE=off FILTER="$NO_MATCH" PACE=0 RETRY_COOLDOWN=0 \
+    BROWSER_RETRY_COOLDOWN=0 bash "$DRIVER" 2>&1
+}
+for value in headless ''; do
+  out=$(run_keyring_driver "$value")
+  rc=$?
+  if [ "$rc" -ne 0 ] \
+    && printf '%s\n' "$out" | grep -qF "STELLAR_AGENT_TEST_KEYRING must be platform or unset, not '$value'" \
+    && ! printf '%s\n' "$out" | grep -qE '^::group::|no suite matched'; then
+    pass "(i) STELLAR_AGENT_TEST_KEYRING='$value' fails before the first suite (exit $rc)"
+  else
+    fail "(i) STELLAR_AGENT_TEST_KEYRING='$value': exit $rc, output:"
+    printf '%s\n' "$out" >&2
+  fi
+done
+out=$(run_keyring_driver platform)
+rc=$?
+if [ "$rc" -ne 0 ] && printf '%s\n' "$out" | grep -q 'no suite matched' \
+  && ! printf '%s\n' "$out" | grep -q 'STELLAR_AGENT_TEST_KEYRING'; then
+  pass "(i) control: STELLAR_AGENT_TEST_KEYRING=platform reaches the suite loop (exit $rc)"
+else
+  fail "(i) control: STELLAR_AGENT_TEST_KEYRING=platform: exit $rc, output:"
+  printf '%s\n' "$out" >&2
+fi
 rm -f "$STUB/sleep" "$STUB/sleeps" "$STUB/summary"
 rm -f "$STUB/cargo" "$STUB/args"
 rmdir "$STUB"

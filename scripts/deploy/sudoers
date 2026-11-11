@@ -1,0 +1,4 @@
+@OPERATOR@ ALL=(@ACCOUNT@) NOPASSWD: @PREFIX@/mcp-launch, @PREFIX@/cli-launch, @PREFIX@/provision
+Defaults!@PREFIX@/mcp-launch !requiretty
+Defaults!@PREFIX@/cli-launch !requiretty
+Defaults!@PREFIX@/provision !requiretty
