@@ -2115,6 +2115,17 @@ pub enum ValidationError {
         open: usize,
     },
 
+    /// The reset refuses while approvals remain inside their waiting windows.
+    ///
+    /// # Wire code
+    ///
+    /// `"reset.approvals_pending"`.
+    #[error("the spending window holds {pending} pending approval(s)")]
+    ResetApprovalsPending {
+        /// Number of pending approvals inside their waiting windows.
+        pending: usize,
+    },
+
     /// The audit row of an operation step could not be appended, so the step
     /// was not committed.
     ///
@@ -2385,6 +2396,7 @@ impl ValidationError {
             Self::OperationBusinessIdConflict => "operation.business_id_conflict",
             Self::OperationBusinessIdMismatch => "operation.business_id_mismatch",
             Self::ResetOperationsOpen { .. } => "reset.operations_open",
+            Self::ResetApprovalsPending { .. } => "reset.approvals_pending",
             Self::AuditAppendFailed { .. } => "audit.append_failed",
         }
     }
@@ -4504,6 +4516,10 @@ mod tests {
                 "reset.operations_open",
             ),
             (
+                ValidationError::ResetApprovalsPending { pending: 2 },
+                "reset.approvals_pending",
+            ),
+            (
                 ValidationError::AuditAppendFailed {
                     detail: "the log is full".to_owned(),
                 },
@@ -4827,6 +4843,9 @@ mod tests {
                 }
                 ValidationError::ResetOperationsOpen { open } => {
                     ValidationError::ResetOperationsOpen { open: *open }
+                }
+                ValidationError::ResetApprovalsPending { pending } => {
+                    ValidationError::ResetApprovalsPending { pending: *pending }
                 }
                 ValidationError::AuditAppendFailed { detail } => {
                     ValidationError::AuditAppendFailed {
@@ -5667,6 +5686,11 @@ mod tests {
             (
                 ValidationError::ResetOperationsOpen { open: 1 }.into(),
                 "reset.operations_open",
+                ErrorCategory::Validation,
+            ),
+            (
+                ValidationError::ResetApprovalsPending { pending: 1 }.into(),
+                "reset.approvals_pending",
                 ErrorCategory::Validation,
             ),
             (

@@ -83,6 +83,17 @@ pub fn approval_subject_classic(unsigned_envelope_b64: &str) -> [u8; 32] {
     Sha256::digest(unsigned_envelope_b64.as_bytes()).into()
 }
 
+/// The binding convention of an approval subject.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SubjectKind {
+    /// SHA-256 of the unsigned envelope's base64 text.
+    #[default]
+    EnvelopeText,
+    /// The canonical intent digest.
+    IntentDigest,
+}
+
 /// The approval subject of an x402 payment whose intent digest is
 /// `intent_digest`.
 #[must_use]

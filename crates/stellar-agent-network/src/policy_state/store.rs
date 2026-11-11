@@ -381,6 +381,7 @@ pub(super) const WIRE_VERSION_OPERATIONS: u32 = 11;
 fn select_wire_version(wire: &WireFile, committed: Option<u32>) -> u32 {
     if committed.is_some_and(|version| version >= WIRE_VERSION_OPERATIONS)
         || operations::has_content(wire)
+        || super::approvals::has_content(wire)
     {
         WIRE_VERSION_OPERATIONS
     } else if wire
@@ -1171,6 +1172,9 @@ pub(super) struct WireFile {
     /// Operation records and tombstones; absent while none is retained.
     #[serde(default, skip_serializing_if = "operations::section_absent")]
     pub(super) operations: Option<OperationsSection>,
+    /// Durable approvals; absent while none is retained.
+    #[serde(default, skip_serializing_if = "super::approvals::section_absent")]
+    pub(super) approvals: Option<super::approvals::ApprovalsSection>,
     /// The lowest admissible observed ledger, raised when a release row
     /// with a ledger bound is removed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3213,6 +3217,11 @@ impl PersistedWindowStore {
             crate::policy_state::store::now_ms().map_err(before_mint)?,
         )
         .map_err(before_mint)?;
+        let retained_approvals = super::approvals::Approvals::on_reset(
+            snapshot.original.as_ref(),
+            crate::policy_state::store::now_ms().map_err(before_mint)?,
+        )
+        .map_err(before_mint)?;
         let reason = bound_window_reset_reason(reason);
         let mut challenge = [0u8; 32];
         OsRng.fill_bytes(&mut challenge);
@@ -3254,6 +3263,7 @@ impl PersistedWindowStore {
                 accounting_expiries: snapshot.retained_expiries,
                 authorizations: snapshot.retained_authorizations,
                 operations: retained_operations,
+                approvals: retained_approvals,
                 ..WireFile::default()
             };
             let original = snapshot.original.unwrap_or_default();
@@ -4764,6 +4774,7 @@ fn check_snapshot(wire: &WireFile) -> Result<(), WindowStoreError> {
     }
     validate_signed_intents(wire)?;
     operations::Operations::validate(wire)?;
+    super::approvals::Approvals::validate(wire)?;
     ledger::validate(wire)
 }
 
@@ -5262,6 +5273,7 @@ pub(super) fn prune_stale(wire: &mut WireFile, now_ms: u64) {
     // transaction's sweep settles it.
     ledger::prune_history(wire, cutoff, now_ms);
     operations::Operations::prune(wire, now_ms);
+    super::approvals::Approvals::prune(wire, now_ms);
 }
 
 /// Whether the receipt for `envelope_hash` already records an outcome the
@@ -14601,6 +14613,38 @@ mod tests {
         assert_eq!(compute_tag(key.as_ref(), &reserialized).unwrap(), tag);
     }
 
+    #[test]
+    #[serial]
+    fn version_eleven_file_reserializes_byte_identically() {
+        let (_dir, profile, store, _clock) = operation_store();
+        let mut audit = OperationRows::default();
+        let handle = open_operation(&store, &profile, &mut audit, "order-1", 1);
+        let current = store.read_for_inspection(&profile).unwrap().unwrap();
+        let mut next = current.clone();
+        let legacy: WireFile = serde_json::from_str(V10_BODY).unwrap();
+        let mut auth = legacy.authorizations[1].clone();
+        auth.profile = "ops-store".to_owned();
+        auth.chain = Caip2::Mainnet;
+        auth.operation = Some(operations::OperationLink {
+            operation_id: handle.id(),
+            attempt_index: 1,
+        });
+        auth.disposition = Some(operations::Disposition::Unused);
+        next.authorizations.push(auth);
+        let key = crate::keyring::load_hmac_key_32(&profile.policy_window_state_key_id).unwrap();
+        store
+            .commit_generation(&key, &generation_entry_ref(&profile), current, next)
+            .unwrap();
+        let bytes = fs::read(store.path()).unwrap();
+        let loaded = store.read_for_inspection(&profile).unwrap().unwrap();
+        assert_eq!(loaded.version, WIRE_VERSION_OPERATIONS);
+        assert_eq!(body_digest(&loaded).unwrap(), committed_digest(&profile));
+        assert_reserializes_byte_identically(&store, &profile);
+        assert_eq!(fs::read(store.path()).unwrap(), bytes);
+        let body: serde_json::Value = serde_json::from_slice(&bytes[HMAC_TAG_LEN..]).unwrap();
+        assert!(body.get("approvals").is_none());
+    }
+
     /// A committed version 10 file with policy authority, window entries,
     /// holds, an accounting expiry, a signed intent and a prepared image loads
     /// and reserializes to its stored bytes. The body digest the keyring
@@ -15444,6 +15488,276 @@ mod tests {
         assert_eq!(settled.generation, after.generation + 1);
         assert_eq!(settled.version, WIRE_VERSION_OPERATIONS);
         assert_reserializes_byte_identically(&store, &profile);
+    }
+
+    #[test]
+    #[serial]
+    fn a_mint_that_fails_to_commit_leaves_the_record_pending() {
+        use super::super::approvals::{ApprovalState, tests::Fx};
+        for seam in [
+            COMMIT_FAULT_AFTER_PREPARED,
+            COMMIT_FAULT_AFTER_COUNTER,
+            COMMIT_FAULT_COMPACTION,
+        ] {
+            let mut fx = Fx::new(300_000);
+            fx.open();
+            fx.consent();
+            let before = fx.wire();
+            let request = fx.mint_request();
+            let armed = arm_accounting_fault(seam);
+            let result = fx.store.mint_authorization(fx.fixture.profile(), &request);
+            drop(armed);
+            assert_eq!(result.is_ok(), seam == COMMIT_FAULT_COMPACTION);
+            let after = fx.wire();
+            let committed = seam != COMMIT_FAULT_AFTER_PREPARED;
+            assert_eq!(after.generation, before.generation + u64::from(committed));
+            assert_eq!(after.authorizations.len(), usize::from(committed));
+            let record = &after.approvals.as_ref().unwrap().records[0];
+            assert_eq!(
+                record.state,
+                if committed {
+                    ApprovalState::Consumed
+                } else {
+                    ApprovalState::Pending
+                }
+            );
+            assert_eq!(record.consumed_at_ms.is_some(), committed);
+            assert_eq!(
+                record.consent,
+                before.approvals.as_ref().unwrap().records[0].consent
+            );
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn a_rolled_back_file_cannot_restore_a_pending_record() {
+        use super::super::approvals::{ApprovalState, tests::Fx};
+        let mut fx = Fx::new(300_000);
+        fx.open();
+        fx.consent();
+        let pending = fx.bytes();
+        fx.store
+            .mint_authorization(fx.fixture.profile(), &fx.mint_request())
+            .unwrap();
+        assert_eq!(fx.view().record.state, ApprovalState::Consumed);
+        let counter = get_raw(&generation_entry_ref(fx.fixture.profile()));
+        fs::write(fx.store.path(), pending).unwrap();
+        let reopened = PersistedWindowStore::at_path(fx.store.path().to_owned());
+        assert!(matches!(
+            reopened.read_for_inspection_once(fx.fixture.profile()),
+            Err(WindowStoreError::GenerationMismatch)
+        ));
+        let error = reopened
+            .read_for_inspection(fx.fixture.profile())
+            .unwrap_err();
+        #[cfg(feature = "mainnet-write")]
+        assert!(matches!(
+            error,
+            WindowStoreError::MainnetStateUnverifiable { .. }
+        ));
+        #[cfg(not(feature = "mainnet-write"))]
+        assert!(matches!(error, WindowStoreError::GenerationMismatch));
+        assert_eq!(
+            get_raw(&generation_entry_ref(fx.fixture.profile())),
+            counter
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn reset_refuses_pending_approvals_and_keeps_terminal_history() {
+        use super::super::approvals::{ApprovalState, tests::Fx};
+        let mut fx = Fx::new(300_000);
+        fx.open();
+        fx.consent();
+        operations::OperationRecorder::new(
+            &fx.store,
+            fx.fixture.profile(),
+            &mut fx.rows,
+            "request",
+        )
+        .transition(
+            fx.operation,
+            None,
+            operations::OperationState::Expired,
+            &operations::TransitionEvidence::default(),
+        )
+        .unwrap();
+        let now = now_ms().unwrap();
+        let bytes = fx.bytes();
+        let counter = get_raw(&generation_entry_ref(fx.fixture.profile()));
+        let refused = reset_unsigned(&fx.store, fx.fixture.profile(), now, |_| Ok::<_, ()>(()));
+        assert!(matches!(
+            refused,
+            Err(ResetError::Store {
+                error: WindowStoreError::ApprovalsPending { pending: 1 },
+                minted: false
+            })
+        ));
+        assert_eq!(fx.bytes(), bytes);
+        assert_eq!(
+            get_raw(&generation_entry_ref(fx.fixture.profile())),
+            counter
+        );
+        let mut wire = fx.wire();
+        let pending = wire.approvals.as_ref().unwrap().records[0].clone();
+        for (n, state) in [(1u8, ApprovalState::Consumed), (2, ApprovalState::Revoked)] {
+            let mut r = pending.clone();
+            r.id = [n; 32];
+            r.nonce = format!("history-{n}");
+            r.operation_id = operations::OperationId::random();
+            r.state = state;
+            if state == ApprovalState::Consumed {
+                r.consumed_at_ms = Some(r.consent.as_ref().unwrap().consent_at_ms);
+            } else {
+                r.revoked_at_ms = Some(now);
+            }
+            wire.approvals.as_mut().unwrap().records.push(r);
+        }
+        let mut expired = pending.clone();
+        expired.id = [3; 32];
+        expired.nonce = "history-3".to_owned();
+        expired.operation_id = operations::OperationId::random();
+        expired.created_at_ms -= 600_000;
+        expired.waiting_expires_at_ms -= 600_000;
+        let consent = expired.consent.as_mut().unwrap();
+        consent.consent_at_ms -= 600_000;
+        consent.execution_expires_at_ms -= 600_000;
+        consent.payload = None;
+        expired.closed_at_ms = Some(
+            expired
+                .waiting_expires_at_ms
+                .max(consent.execution_expires_at_ms),
+        );
+        assert!(now > expired.waiting_expires_at_ms);
+        assert!(now > consent.execution_expires_at_ms);
+        let expired_bytes = serde_json::to_vec(&expired).unwrap();
+        wire.approvals.as_mut().unwrap().records.push(expired);
+        fx.clock.set(pending.waiting_expires_at_ms);
+        let key =
+            crate::keyring::load_hmac_key_32(&fx.fixture.profile().policy_window_state_key_id)
+                .unwrap();
+        fx.store
+            .commit_generation(
+                &key,
+                &generation_entry_ref(fx.fixture.profile()),
+                fx.wire(),
+                wire,
+            )
+            .unwrap();
+        let before = fx.wire();
+        fx.store
+            .reset(
+                fx.fixture.profile(),
+                fx.fixture.name(),
+                now_ms().unwrap(),
+                "repair",
+                "reset-request",
+                |row| Ok::<_, ()>(signed_by(11, row)),
+                |_, _| Ok(()),
+            )
+            .unwrap();
+        let after = fx.wire();
+        assert_eq!(after.approvals, before.approvals);
+        let records = &after.approvals.as_ref().unwrap().records;
+        assert_eq!(records.len(), 4);
+        assert_eq!(
+            serde_json::to_vec(records.iter().find(|r| r.id == [3; 32]).unwrap()).unwrap(),
+            expired_bytes
+        );
+        assert_eq!(after.generation, before.generation + 1);
+    }
+
+    #[test]
+    #[serial]
+    fn approvals_select_wire_version_eleven() {
+        use super::super::approvals::tests::Fx;
+        let mut fx = Fx::new(300_000);
+        let approval = fx.open().record;
+        let mut ten = fx.wire();
+        ten.version = WIRE_VERSION_POLICY_AUTHORITY;
+        ten.operations = None;
+        ten.approvals = None;
+        fx.store.seal_unchecked_for_test(fx.fixture.profile(), &ten);
+        let current = fx.wire();
+        assert_eq!(current.version, 10);
+        let mut next = current.clone();
+        next.approvals = Some(super::super::approvals::ApprovalsSection {
+            records: vec![approval],
+        });
+        let key =
+            crate::keyring::load_hmac_key_32(&fx.fixture.profile().policy_window_state_key_id)
+                .unwrap();
+        fx.store
+            .commit_generation(
+                &key,
+                &generation_entry_ref(fx.fixture.profile()),
+                current,
+                next,
+            )
+            .unwrap();
+        assert_eq!(fx.wire().version, 11);
+        assert!(fx.view().record.consent.is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn approvals_section_survives_both_sides_of_the_commit_point() {
+        use super::super::approvals::{ApprovalsSection, tests::Fx};
+        for version in [10, 11] {
+            for seam in [
+                COMMIT_FAULT_AFTER_PREPARED,
+                COMMIT_FAULT_AFTER_COUNTER,
+                COMMIT_FAULT_COMPACTION,
+            ] {
+                let mut fx = Fx::new(300_000);
+                let pending = fx.open().record;
+                let consented = fx.consent().record;
+                let mut current = fx.wire();
+                current.operations = None;
+                current.version = version;
+                current.approvals = (version == 11).then(|| ApprovalsSection {
+                    records: vec![pending],
+                });
+                fx.store
+                    .seal_unchecked_for_test(fx.fixture.profile(), &current);
+                let mut next = current.clone();
+                next.approvals = Some(ApprovalsSection {
+                    records: vec![consented],
+                });
+                let expected = next.approvals.clone();
+                let key = crate::keyring::load_hmac_key_32(
+                    &fx.fixture.profile().policy_window_state_key_id,
+                )
+                .unwrap();
+                let armed = arm_accounting_fault(seam);
+                let result = fx.store.commit_generation(
+                    &key,
+                    &generation_entry_ref(fx.fixture.profile()),
+                    current.clone(),
+                    next,
+                );
+                drop(armed);
+                assert_eq!(result.is_ok(), seam == COMMIT_FAULT_COMPACTION);
+                let after = fx.wire();
+                let committed = seam != COMMIT_FAULT_AFTER_PREPARED;
+                assert_eq!(after.version, if committed { 11 } else { version });
+                assert_eq!(
+                    after.approvals,
+                    if committed {
+                        expected
+                    } else {
+                        current.approvals
+                    }
+                );
+                assert_reserializes_byte_identically(&fx.store, fx.fixture.profile());
+                assert_eq!(
+                    body_digest(&after).unwrap(),
+                    committed_digest(fx.fixture.profile())
+                );
+            }
+        }
     }
 
     /// A successor above the versions this build writes, or a nested

@@ -1740,6 +1740,7 @@ pub(super) fn mint_into(
                     }),
                     P::ApprovalNonceReused,
                 )?;
+                super::approvals::consume(wire, nonce, request.operation, now)?;
             }
         }
     }
@@ -3333,6 +3334,28 @@ mod tests {
             MainnetPrecondition::ApprovalNonceReused,
             "a settled record keeps its nonce spent"
         );
+    }
+
+    #[test]
+    #[serial]
+    fn approval_mint_without_a_record_keeps_its_body() {
+        let l = Ledger::new();
+        let request = l.request(tx(1), vec![]);
+        let minted = l.mint(&request).unwrap();
+        for consumed in [false, true] {
+            if consumed {
+                l.consume(&request, &minted, &consumption_of(&request.binding))
+                    .unwrap();
+            }
+            let wire = l.store.read_for_inspection(&l.profile).unwrap().unwrap();
+            assert_eq!(wire.version, 5);
+            let body = serde_json::to_value(&wire).unwrap();
+            assert!(body.get("approvals").is_none());
+            assert_eq!(
+                body["authorizations"][0]["state"],
+                if consumed { "used" } else { "open" }
+            );
+        }
     }
 
     #[test]
@@ -6760,6 +6783,250 @@ mod tests {
 
     /// Discards every row, for a test that only reads the window.
     struct NullAudit;
+
+    #[test]
+    #[serial]
+    fn first_mint_consumes_the_record_for_its_operation() {
+        use super::super::approvals::{ApprovalState, tests::Fx};
+        let mut fx = Fx::new(86_400_000);
+        fx.open();
+        fx.consent();
+        let before = fx.wire();
+        let request = fx.mint_request();
+        let minted = fx
+            .store
+            .mint_authorization(fx.fixture.profile(), &request)
+            .unwrap();
+        let after = fx.wire();
+        assert_eq!(after.generation, before.generation + 1);
+        let record = &after.approvals.as_ref().unwrap().records[0];
+        assert_eq!(record.state, ApprovalState::Consumed);
+        assert_eq!(
+            record.consumed_at_ms,
+            Some(fx.payload.receipt.verified_at_unix_ms())
+        );
+        assert!(record.consent.as_ref().unwrap().payload.is_some());
+        assert_eq!(after.authorizations[0].id, minted.id);
+        assert_eq!(after.authorizations[0].operation, request.operation);
+    }
+
+    #[test]
+    #[serial]
+    fn remint_under_the_same_operation_passes() {
+        use super::super::approvals::tests::Fx;
+        let mut fx = Fx::new(300_000);
+        fx.open();
+        fx.consent();
+        let request = fx.mint_request();
+        let now = fx.payload.receipt.verified_at_unix_ms();
+        let mut wire = fx.wire();
+        mint_into(
+            &mut wire,
+            fx.fixture.profile(),
+            &request,
+            now,
+            now + 1,
+            MintOptions::default(),
+        )
+        .unwrap();
+        let before = wire.approvals.clone();
+        let first = &mut wire.authorizations[0];
+        first.state = AuthorizationState::Expired;
+        first.settled_ms = Some(now + 1);
+        first.disposition = Some(Disposition::Unused);
+        let options = MintOptions {
+            exempt_cap: true,
+            lineage: Some(fx.operation),
+        };
+        mint_into(
+            &mut wire,
+            fx.fixture.profile(),
+            &request,
+            now + 1,
+            now + 100,
+            options,
+        )
+        .unwrap();
+        assert_eq!(wire.approvals, before);
+        assert_eq!(wire.authorizations.len(), 2);
+    }
+
+    #[test]
+    #[serial]
+    fn mint_without_an_operation_link_refuses_under_a_record() {
+        use super::super::approvals::tests::Fx;
+        let mut fx = Fx::new(300_000);
+        fx.open();
+        fx.consent();
+        let before = fx.bytes();
+        let mut request = fx.mint_request();
+        request.operation = None;
+        assert_eq!(
+            refusal(fx.store.mint_authorization(fx.fixture.profile(), &request)),
+            MainnetPrecondition::ApprovalNonceReused
+        );
+        assert_eq!(fx.bytes(), before);
+    }
+
+    #[test]
+    #[serial]
+    fn a_second_operation_cannot_mint_under_a_consumed_record() {
+        use super::super::approvals::{ApprovalState, tests::Fx};
+        let mut fx = Fx::new(86_400_000);
+        fx.open();
+        let expiry = fx.consent().record.consent.unwrap().execution_expires_at_ms;
+        let request = fx.mint_request();
+        let now = fx.payload.receipt.verified_at_unix_ms();
+        let mut wire = fx.wire();
+        mint_into(
+            &mut wire,
+            fx.fixture.profile(),
+            &request,
+            now,
+            now + 1,
+            MintOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            wire.approvals.as_ref().unwrap().records[0].state,
+            ApprovalState::Consumed
+        );
+        let auth = &mut wire.authorizations[0];
+        auth.state = AuthorizationState::Expired;
+        auth.settled_ms = Some(now + 1);
+        auth.disposition = Some(Disposition::Unused);
+        auth.approval_expires_ms = Some(expiry);
+        auth.native_release = Some(ReleaseRow::always(
+            ReleaseClass::RetiredUnused,
+            CommitId::random(),
+        ));
+        let mut other = request.clone();
+        other.operation.as_mut().unwrap().operation_id = OperationId::random();
+        for at in [now + 2, expiry + RETENTION_MS + 1] {
+            let mut next = wire.clone();
+            prune_history(&mut next, at.saturating_sub(RETENTION_MS), at);
+            if at > expiry {
+                assert!(next.authorizations.is_empty());
+            } else {
+                // Isolate the consumed record's operation check inside its execution window.
+                next.authorizations.clear();
+            }
+            let result = mint_into(
+                &mut next,
+                fx.fixture.profile(),
+                &other,
+                at,
+                at + 100,
+                MintOptions::default(),
+            );
+            assert!(
+                matches!(
+                    result,
+                    Err(WindowStoreError::AuthorizationRefused {
+                        precondition: MainnetPrecondition::ApprovalNonceReused
+                    })
+                ),
+                "mint at {at}, execution expiry {expiry}: {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn revoked_record_refuses_every_mint() {
+        use super::super::approvals::{ApprovalState, tests::Fx};
+        for consumed in [false, true] {
+            let mut fx = Fx::new(300_000);
+            fx.open();
+            fx.consent();
+            let request = fx.mint_request();
+            let now = fx.payload.receipt.verified_at_unix_ms();
+            if consumed {
+                fx.store
+                    .mint_authorization(fx.fixture.profile(), &request)
+                    .unwrap();
+            }
+            let id = fx.id();
+            let revoked = fx.recorder().revoke(id).unwrap();
+            assert_eq!(revoked.record.state, ApprovalState::Revoked);
+            assert_eq!(revoked.record.revoked_at_ms, Some(now));
+            let mut wire = fx.wire();
+            if consumed {
+                wire.authorizations[0].state = AuthorizationState::Expired;
+                wire.authorizations[0].disposition = Some(Disposition::Unused);
+            }
+            let options = MintOptions {
+                exempt_cap: false,
+                lineage: Some(fx.operation),
+            };
+            assert_eq!(
+                refusal(mint_into(
+                    &mut wire,
+                    fx.fixture.profile(),
+                    &request,
+                    now + 1,
+                    now + 100,
+                    options
+                )),
+                MainnetPrecondition::ApprovalRevoked
+            );
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn pending_record_without_consent_refuses_the_mint() {
+        use super::super::approvals::tests::Fx;
+        let mut fx = Fx::new(300_000);
+        fx.open();
+        let before = fx.bytes();
+        assert_eq!(
+            refusal(
+                fx.store
+                    .mint_authorization(fx.fixture.profile(), &fx.mint_request())
+            ),
+            MainnetPrecondition::ApprovalConsentMissing
+        );
+        assert_eq!(fx.bytes(), before);
+    }
+
+    #[test]
+    #[serial]
+    fn execution_boundary_is_exclusive() {
+        use super::super::approvals::tests::Fx;
+        for (ttl, duration) in [(86_400_000, 900_000), (300_000, 300_000)] {
+            let mut fx = Fx::new(ttl);
+            fx.open();
+            fx.consent();
+            let expiry = fx.payload.receipt.verified_at_unix_ms() + duration;
+            let request = fx.mint_request();
+            for (at, accepted) in [(expiry - 1, true), (expiry, false), (expiry + 1, false)] {
+                fx.clock.set(at);
+                let before = fx.bytes();
+                let result = fx.store.mint_authorization(fx.fixture.profile(), &request);
+                if accepted {
+                    assert!(result.is_ok(), "{result:?}");
+                } else {
+                    // Remove the earlier carrier in memory to isolate the durable clock check.
+                    let mut wire = fx.wire();
+                    wire.authorizations.clear();
+                    assert_eq!(
+                        refusal(mint_into(
+                            &mut wire,
+                            fx.fixture.profile(),
+                            &request,
+                            at,
+                            at + 100,
+                            MintOptions::default()
+                        )),
+                        MainnetPrecondition::ApprovalExpired
+                    );
+                    assert!(result.is_err());
+                    assert_eq!(fx.bytes(), before);
+                }
+            }
+        }
+    }
 
     impl crate::policy_state::operations::OperationAudit for NullAudit {
         fn append(
