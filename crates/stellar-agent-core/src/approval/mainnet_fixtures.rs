@@ -61,6 +61,15 @@ pub const ENABLEMENT_NONCE: &str = "mainnet-consent-fixture-nonce";
 /// The account the fixture policy allows payments to.
 pub const ALLOWED_DESTINATION: &str = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF";
 
+/// The signed approval origin of the fixture's signed-origin policies.
+pub const SIGNED_ORIGIN: &str = "https://approve.example.invalid:8443";
+
+/// The RP ID of [`SIGNED_ORIGIN`].
+pub const SIGNED_RP_ID: &str = "approve.example.invalid";
+
+/// The certificate pin of the fixture's signed-origin policies.
+pub const SIGNED_CERT_SPKI_SHA256: [u8; 32] = [0xab; 32];
+
 /// An enabled mainnet profile with a signed policy, under a temporary home.
 pub struct MainnetConsentFixture {
     home: tempfile::TempDir,
@@ -98,6 +107,25 @@ pub fn policy_body_for(
     sequence: i64,
     credentials: &[&TestAuthenticator],
 ) -> String {
+    policy_body_with_origin(name, endpoint_host, sequence, credentials, None)
+}
+
+/// [`policy_body_for`] with `approval_origin` and
+/// `approval_cert_spki_sha256` set to `origin` and its pin when given.
+#[must_use]
+pub fn policy_body_with_origin(
+    name: &str,
+    endpoint_host: &str,
+    sequence: i64,
+    credentials: &[&TestAuthenticator],
+    origin: Option<(&str, &[u8; 32])>,
+) -> String {
+    let signed_origin = origin.map_or_else(String::new, |(origin, pin)| {
+        format!(
+            "approval_origin = \"{origin}\"\napproval_cert_spki_sha256 = \"{}\"\n",
+            crate::hex::encode(pin)
+        )
+    });
     let digest = crate::hex::encode(&sha2::Sha256::digest(ENABLEMENT_NONCE.as_bytes()));
     let entries: String = credentials
         .iter()
@@ -132,7 +160,7 @@ pub fn policy_body_for(
          endpoint_host = \"{endpoint_host}\"\nprofile = \"{name}\"\n\
          installation_nonce_sha256 = \"{digest}\"\n\
          classic_max_fee_per_op_stroops = 500\nauthorization_ttl_seconds = 60\n\
-         approval_credentials = [\n{entries}]\n\
+         approval_credentials = [\n{entries}]\n{signed_origin}\
          [mainnet.cross_check_thresholds]\nnative = \"10000000000\"\n\n{rules}\n"
     )
 }
@@ -361,6 +389,24 @@ impl MainnetConsentFixture {
         self.write_signed(&body);
     }
 
+    /// Signs a policy at the next sequence that admits `credentials` with
+    /// [`SIGNED_ORIGIN`] and `pin`, and writes it.
+    pub fn sign_signed_origin_policy(
+        &mut self,
+        credentials: &[&TestAuthenticator],
+        pin: &[u8; 32],
+    ) {
+        self.sequence += 1;
+        let body = policy_body_with_origin(
+            &self.name,
+            ENDPOINT_HOST,
+            self.sequence,
+            credentials,
+            Some((SIGNED_ORIGIN, pin)),
+        );
+        self.write_signed(&body);
+    }
+
     /// An unattested payment of 10 stroops to [`ALLOWED_DESTINATION`] that
     /// lives `ttl_ms` from now.
     ///
@@ -432,6 +478,22 @@ impl MainnetConsentFixture {
             Self::challenge_bytes(pending),
             &Self::origin(),
             super::presence::MAINNET_APPROVAL_RP_ID,
+            FLAG_UP | FLAG_UV,
+            1,
+        )
+    }
+
+    /// `authenticator`'s assertion with UP and UV over `pending`'s challenge,
+    /// at the RP ID its options name and the origin it binds.
+    #[must_use]
+    pub fn sign_issued(
+        authenticator: &TestAuthenticator,
+        pending: &PendingMainnetPresence,
+    ) -> TestAssertion {
+        authenticator.assert(
+            Self::challenge_bytes(pending),
+            pending.expected_origin(),
+            &pending.options().rp_id,
             FLAG_UP | FLAG_UV,
             1,
         )

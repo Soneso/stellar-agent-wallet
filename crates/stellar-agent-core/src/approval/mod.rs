@@ -119,11 +119,12 @@ pub use operator_credentials::{
     default_operator_approval_credentials_path,
 };
 pub use presence::{
-    ApprovalCredentialError, MAINNET_APPROVAL_RP_ID, MainnetApprovalCredential,
-    MainnetAssertionWire, MainnetPresenceOptions, MainnetPresenceReceipt, PendingMainnetPresence,
-    VerifiedMainnetPresence, approval_view_digest, approval_view_subject, issue_mainnet_presence,
-    mainnet_consent_subject, mainnet_consent_view_digest, mainnet_presence_origin,
-    verify_mainnet_presence,
+    ApprovalCredentialError, INTENT_CHALLENGE_DOMAIN, ListenerIdentity, MAINNET_APPROVAL_RP_ID,
+    MainnetApprovalCredential, MainnetAssertionWire, MainnetPresenceOptions,
+    MainnetPresenceReceipt, PendingMainnetPresence, PresenceListener, VerifiedMainnetPresence,
+    approval_view_digest, approval_view_subject, issue_mainnet_intent_presence,
+    issue_mainnet_presence, mainnet_consent_subject, mainnet_consent_view_digest,
+    mainnet_intent_consent_view_digest, mainnet_presence_origin, verify_mainnet_presence,
 };
 pub use presence_policy::{CurrentMainnetApprovalPolicy, MainnetApprovalAuthority};
 pub use registration_input::RegistrationInput;
@@ -151,7 +152,7 @@ pub use toolset_grant::{
     build_attested_grant, default_toolset_grants_path,
 };
 pub use user_id::{ApproverIdentity, VerifiedPasskeyAssertion, process_uid_for_attestation};
-pub use view::{ApprovalSummaryView, IntentView, PendingApprovalView};
+pub use view::{ApprovalSummaryView, IntentPayloadView, IntentView, PendingApprovalView};
 
 /// Checks that displayed approval terms agree with their authorization binding.
 ///

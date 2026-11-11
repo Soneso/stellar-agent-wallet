@@ -831,10 +831,31 @@ misleading local page remains a risk. The owner seed admits approval
 credentials, so signing the policy on a host where same-user code runs
 exposes that seed.
 
-The ceremony issues one challenge per pending entry from
-`issue_mainnet_presence`, under the policy that `MainnetApprovalAuthority`
-loads from the persisted profile's owner key, signed policy, pin, and
-enablement, never from a request:
+The relying party comes from the signed `[mainnet]` section of the verified
+policy, never from a request or a profile setting. A policy without
+`approval_origin` selects the relying-party ID `localhost` and the origin
+`http://localhost:<port>` of the bound listener. A policy that signs
+`approval_origin` and `approval_cert_spki_sha256` selects the origin's host as
+the relying-party ID, exactly that origin, and the signed pin. One selection
+feeds the challenge, the relying-party hash check, the origin check, the
+`rp_id` of the challenge reply, and the `rp_id` of the audit row. The page
+script passes that `rp_id` to the browser. No origin maps to another
+relying-party ID, and no policy admits both forms.
+
+The ceremony issues one challenge per pending entry under the policy that
+`MainnetApprovalAuthority` loads from the persisted profile's owner key,
+signed policy, pin, and enablement. `issue_mainnet_presence` serves a
+localhost listener and refuses under a signed origin with
+`approval.presence_invalid`. `issue_mainnet_intent_presence` takes the
+listener and an optional classic intent. Issue and verification refuse an
+intent for another chain or another record kind with
+`approval.presence_invalid`. A localhost listener names its bound origin. A signed-origin listener names a `ListenerIdentity`, the policy
+digest and pin captured from the policy it serves. When the current policy's
+digest or pin differs, issue refuses with `approval.listener_policy_stale`. No
+listener in this release serves a signed origin, and remote mainnet approval
+still refuses.
+
+A ceremony without an intent under a localhost policy uses the legacy layout:
 
 ```text
 challenge = SHA-256(
@@ -849,13 +870,40 @@ challenge = SHA-256(
 )
 ```
 
-`lp(x)` is `u32be(len(x)) || x`. The subject is the classic envelope subject,
-the x402 subject with its home domain, or the trustline clawback opt-in digest;
-other kinds have no mainnet consent path. The challenge lives for the shorter
-of 120 seconds and the entry's remaining life, on the monotonic and the wall
-clock, and verifies at most once. The relying-party ID is `localhost`; the
-expected origin is exactly `http://localhost:<port>` from the bound listener,
-`crossOrigin` must be absent or false, and `topOrigin` absent.
+A ceremony with an intent, or any ceremony under a signed origin, uses the
+intent layout. It keeps the consent fields, adds the tagged intent digest and
+the tagged pin, and binds the selected relying-party ID:
+
+```text
+challenge = SHA-256(
+  b"stellar-agent-wallet/intent-challenge/v1" ||
+  random32 || lp(consent_request_id) || lp(approval_nonce) ||
+  lp(profile_name) || lp(chain_caip2) || lp(kind_name) ||
+  subject32 || lp(process_uid) ||
+  u64be(entry_created_at_ms) || u64be(entry_expires_at_ms) ||
+  i64be(policy_sequence) || policy_digest32 || policy_owner32 ||
+  tag(intent_digest32) || lp(rp_id) || lp(expected_origin) ||
+  tag(cert_spki_sha256_32) ||
+  u64be(challenge_issued_at_ms) || u64be(challenge_expires_at_ms)
+)
+```
+
+`lp(x)` is `u32be(len(x)) || x`. `tag(x)` is `0x00` when `x` is absent and
+`0x01 || x` when present. The intent digest is `ClassicIntent::digest()`. The
+subject is the classic envelope subject, the x402 subject with its home
+domain, or the trustline clawback opt-in digest; other kinds have no mainnet
+consent path. The challenge lives for the shorter of 120 seconds and the
+entry's remaining life, on the monotonic and the wall clock, and verifies at
+most once. `crossOrigin` must be absent or false, and `topOrigin` absent.
+
+The consent page binds a view digest over the same consent fields. The legacy
+layout hashes them under `stellar-agent-mainnet-consent-view:v1`. The intent
+layout hashes them under `stellar-agent-wallet/intent-consent-view/v1`,
+followed by `tag(intent_digest32)`. Given an intent, the page shows the intent
+view in place of the envelope summary: the kind, the network, the source, the
+payment, account, trustline or claim fields, the memo, the fee bound, and the
+short policy digest. It shows no sequence number and no exact fee. The inbox
+and the command's ceremony pass no intent and keep the legacy page.
 
 Verification runs the shared assertion primitive in
 `stellar-agent-core::approval::webauthn`, beside the DER-to-compact low-S
@@ -872,6 +920,26 @@ verification times, and the raw assertion. Its digest is SHA-256 of
 `lp(request_id)`, the random bytes, `i64(policy_sequence)`, the policy digest
 and owner bytes, `lp(expected_origin)`, the three times as `u64`, then `lp` of
 the credential ID, authenticator data, `clientDataJSON`, and compact signature.
+
+A legacy ceremony records receipt version 1, whose bytes and digest are the
+layout above. An intent-layout ceremony records version 2. Version 2 adds
+optional `cert_spki_sha256` and `listener_policy_digest` fields, lowercase
+hex, both or neither, present exactly when the origin is HTTPS. Its digest
+inserts `0x00`, or `0x01 || cert_spki_sha256_32 || listener_policy_digest32`,
+after `lp(expected_origin)`. The stored origin is at most 267 bytes, the
+length of `https://`, a 253-byte host, and `:65535`. Loading a receipt checks
+its shape only: the version, the field pairing, and the origin form. A
+version other than 1 or 2 refuses there.
+
+A receipt verifies only under its own version's layout, and nothing converts
+one version into the other. Verification derives the version from the policy
+and the intent it is given and refuses a mismatch with
+`approval.presence_invalid`. A version 1 receipt therefore refuses under a
+policy that signs an origin. A version 2 receipt must name the current
+policy's pin and digest, and its challenge is recomputed with the selected
+relying-party ID and origin. `verify_receipt` passes no intent;
+`verify_receipt_for_intent` names the intent a version 2 receipt binds.
+
 The version 5 HMAC is the version 4 preimage under the tag
 `stellar-agent-approval-attestation:v5`, with the approver tag `0x02` and the
 length-prefixed credential ID, followed by the 32-byte receipt digest. The
@@ -1235,7 +1303,9 @@ signature verification precedes semantic validation and pin advancement.
 The minimum and unsigned bootstrap extraction share the pairing check.
 Bootstrap extraction checks the closed mainnet key set without requiring
 credentials or a signature. Profile settings cannot supply or override these
-signed values. These fields describe accepted configuration only.
+signed values. Mainnet presence reads them: both fields select the
+relying-party ID, the exact origin, and the certificate pin that a ceremony
+binds, and their absence selects `localhost`.
 
 Every build requires `mainnet.approval_credentials` with 1 to 16 credentials
 in any policy with a `[mainnet]` table; the loader, the minimum evaluator, the

@@ -753,6 +753,16 @@ pub enum ApprovalFailure {
         "The current owner-signed mainnet approval policy cannot be verified; restore a valid policy and start a new approval ceremony."
     )]
     PresencePolicyUnavailable,
+    /// A signed-origin listener's identity names a policy digest or
+    /// certificate pin other than the current owner-signed policy's.
+    ///
+    /// # Wire code
+    ///
+    /// `"approval.listener_policy_stale"`.
+    #[error(
+        "The approval listener serves an earlier owner-signed mainnet policy; restart it under the current policy."
+    )]
+    ListenerPolicyStale,
     /// No local browser with WebAuthn user verification can run the
     /// ceremony.
     ///
@@ -828,6 +838,7 @@ impl ApprovalFailure {
             Self::PresenceExpired => "approval.presence_expired",
             Self::PresenceConsumed => "approval.presence_consumed",
             Self::PresencePolicyUnavailable => "approval.presence_policy_unavailable",
+            Self::ListenerPolicyStale => "approval.listener_policy_stale",
             Self::PresenceBrowserRequired => "approval.presence_browser_required",
             Self::PresenceUnavailable => "approval.presence_unavailable",
             Self::PresenceCanceled => "approval.presence_canceled",
@@ -6164,6 +6175,11 @@ mod tests {
                 ApprovalFailure::PresencePolicyUnavailable,
                 "approval.presence_policy_unavailable",
                 "The current owner-signed mainnet approval policy cannot be verified; restore a valid policy and start a new approval ceremony.",
+            ),
+            (
+                ApprovalFailure::ListenerPolicyStale,
+                "approval.listener_policy_stale",
+                "The approval listener serves an earlier owner-signed mainnet policy; restart it under the current policy.",
             ),
             (
                 ApprovalFailure::PresenceBrowserRequired,
