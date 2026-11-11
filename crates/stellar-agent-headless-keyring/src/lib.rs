@@ -309,8 +309,9 @@ mod tests {
         );
     }
 
-    /// RAII env-var guard; `#[serial]` on every test using it prevents
-    /// concurrent env access.
+    /// RAII env-var guard that removes each recorded variable on drop.
+    /// Every test that uses this guard or reads a guarded variable holds
+    /// `#[serial]`, so no two of them touch the environment concurrently.
     struct EnvGuard {
         vars: Vec<String>,
     }
@@ -325,6 +326,21 @@ mod tests {
                 // SAFETY: serialised by #[serial]; no concurrent env access.
                 unsafe {
                     std::env::set_var(k, v);
+                }
+            }
+            Self { vars }
+        }
+
+        #[allow(
+            unsafe_code,
+            reason = "test-only env mutation; #[serial] prevents concurrent access"
+        )]
+        fn unset(names: &[&str]) -> Self {
+            let vars = names.iter().map(|k| (*k).to_owned()).collect();
+            for k in names {
+                // SAFETY: serialised by #[serial]; no concurrent env access.
+                unsafe {
+                    std::env::remove_var(k);
                 }
             }
             Self { vars }
@@ -432,7 +448,9 @@ mod tests {
     /// Guards against the two independently-maintained derivations silently
     /// drifting apart (see `headless_keyring_path`'s rustdoc).
     #[test]
+    #[serial]
     fn canonical_data_root_matches_stellar_agent_core() {
+        let _env = EnvGuard::unset(&["STELLAR_AGENT_HOME"]);
         let local = canonical_data_root().expect("local derivation must resolve");
         let core = stellar_agent_core::profile::schema::canonical_data_root()
             .expect("stellar-agent-core derivation must resolve");
