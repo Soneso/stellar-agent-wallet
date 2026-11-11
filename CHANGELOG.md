@@ -234,6 +234,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- The reads before a send of `pay`, `claim`, sponsored `accounts create` and
+  `trustline` on both binaries run under a fixed 30-second pre-send budget,
+  `PRE_SEND_BUDGET`, and a submit-layer read that outlasts it refuses with
+  `network.pre_send_timeout`.
+
+- A mainnet classic submission must be sent at least 30 seconds before the
+  envelope's time bound closes; a deadline inside that margin refuses before
+  any request.
+
+- A submission whose send-by instant passes before the first send sends
+  nothing, removes its receipt, closes its pending row and releases its
+  reservation, unless it is bound to a signed intent.
+
+- A `TRY_AGAIN_LATER` answer to `sendTransaction` resends the same bytes under
+  the backoff until the send-by instant or the send deadline.
+
+- Without `--timeout-seconds`, CLI `pay`, `claim`, sponsored `accounts create`
+  and `trustline` use the profile's `submit_timeout_seconds`, then 60 seconds,
+  for the send and the confirmation poll; `trustline` accepts the flag.
+
 - Policy evaluation reads one clock instant per evaluation; a clock failure
   before an evaluation refuses with `wallet.clock_error`.
 

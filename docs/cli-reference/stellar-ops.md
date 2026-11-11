@@ -54,7 +54,7 @@ Several flags recur across the commands on this page with the same meaning. Thei
 - `--network <NETWORK>`: optional assertion of the loaded profile's chain; a mismatch refuses before signing.
 - `--rpc-url <URL>`: optional testnet endpoint override; mainnet profiles refuse its presence. Without it, the profile endpoint applies. Credentials are refused. An overriding URL gets the keyring credential only when it equals the profile's `rpc_url`.
 - `--output <FORMAT>`: `json` (default) or `table`.
-- `--timeout-seconds <SECONDS>`: bounds submission. On sponsored `accounts create`, `pay`, and `claim`, it also bounds the [endpoint identity check](index.md#endpoint-identity-before-the-first-read), which gets a budget of its own. Default `60`.
+- `--timeout-seconds <SECONDS>`: bounds submission. On sponsored `accounts create`, `pay`, `claim`, and `trustline`, it bounds the send and the confirmation poll, and the [endpoint checks](index.md#endpoint-identity-before-the-first-read) and the reads before the send run under a fixed 30-second pre-send budget. Default: the profile's `submit_timeout_seconds` on those four commands, then `60`.
 - Signer source: `--secret-env <VAR>` / `--deployer-secret-env <VAR>` (an env-var name, never the secret) or `--sign-with-ledger`, with `--account-index <INDEX>` for the Ledger derivation path (default `0`).
 - `--fee <STROOPS|auto[:pNN]>`: the classic per-operation fee. An integer sets
   an explicit stroop value; `auto` selects the p95 percentile from
@@ -104,7 +104,7 @@ Argument groups (enforced by the parser):
 | `--friendbot-url <URL>` | Friendbot endpoint URL (Friendbot mode) | optional | `https://friendbot.stellar.org` |
 | `--network <NETWORK>` | Must match the profile chain | optional | profile chain |
 | `--fee <STROOPS\|auto[:pNN]>` | Sponsored per-op fee | optional | command default (100) |
-| `--timeout-seconds <SECONDS>` | Endpoint check and submission timeout, each its own budget (sponsored mode) | optional | `60` |
+| `--timeout-seconds <SECONDS>` | Send and confirmation poll timeout (sponsored mode) | optional | profile `submit_timeout_seconds`, else `60` |
 | `--rpc-url <URL>` | Testnet RPC override; refused on mainnet | optional | profile endpoint |
 | `--output <FORMAT>` | `json` or `table` | optional | `json` |
 
@@ -287,7 +287,7 @@ Argument groups (enforced by the parser):
 | `--submit-only <BASE64_XDR>` | Submit the given signed XDR | stage group | none |
 | `--fee <STROOPS\|auto[:pNN]>` | Classic per-op fee | optional | command default (100 stroops) |
 | `--network <NETWORK>` | Must match the profile chain | optional | profile chain |
-| `--timeout-seconds <SECONDS>` | Endpoint check and submission timeout, each its own budget | optional | `60` |
+| `--timeout-seconds <SECONDS>` | Send and confirmation poll timeout | optional | profile `submit_timeout_seconds`, else `60` |
 | `--rpc-url <URL>` | Testnet RPC override; refused on mainnet | optional | profile endpoint |
 | `--output <FORMAT>` | `json` or `table` | optional | `json` |
 | `--use-oz-relayer` | Opt into the OZ Relayer path (not implemented; declines) | optional | `false` |
@@ -401,7 +401,7 @@ The respective refusals are `claim.not_claimant`, `claim.predicate_not_satisfied
 | `--submit-only <BASE64_XDR>` | Submit the given signed XDR | stage group | none |
 | `--fee <STROOPS\|auto[:pNN]>` | Classic per-op fee | optional | command default (100 stroops) |
 | `--network <NETWORK>` | Must match the profile chain | optional | profile chain |
-| `--timeout-seconds <SECONDS>` | Endpoint check and submission timeout, each its own budget | optional | `60` |
+| `--timeout-seconds <SECONDS>` | Send and confirmation poll timeout | optional | profile `submit_timeout_seconds`, else `60` |
 | `--rpc-url <URL>` | Testnet RPC override; refused on mainnet | optional | profile endpoint |
 | `--output <FORMAT>` | `json` or `table` | optional | `json` |
 
@@ -447,7 +447,7 @@ stellar-agent balances \
 Creates or removes a classic trustline (`ChangeTrust`) behind an ordered trust gate: operator policy evaluation, denomination resolution (USDT hard-refusal plus a known-lookalike denylist and pinned-issuer checks), a live issuer-flag fetch that fail-closes on error, a clawback gate, and a typed preview, before the envelope is built, signed, and submitted.
 
 - **Signing.** Signs via the profile's keyring signer; builds, signs, submits, and waits atomically. There is no staged pipeline.
-- **Timeout.** The profile's `submit_timeout_seconds`, 60 seconds when the field is unset, bounds two things, each with a budget of its own. The first is the endpoint identity check ahead of the issuer read. The second is the submission, from the submit layer's endpoint check to the last confirmation poll. There is no `--timeout-seconds` flag.
+- **Timeout.** `--timeout-seconds`, else the profile's `submit_timeout_seconds`, else 60 seconds, bounds the send and the confirmation poll. The endpoint checks ahead of the issuer read and the submit layer's reads before the send each run under a fixed 30-second pre-send budget.
 - **Network.** Derived from the loaded profile (`rpc_url`, `network_passphrase`, `chain_id`). The profile file supplies the chain identity. There is no `--network` flag: the network comes from the profile configuration. The command goes through the same submit layer as every other verb, so it gets the same binding. The endpoint is asked which network it serves and that answer is authoritative. The envelope's signatures are verified against it. Builds from this repository and releases from v0.1.0-alpha.14 on carry `mainnet-write`. These builds admit configured mainnet trustline actions through authorized signing and submission. With the feature off, a mainnet profile refuses with `network.mainnet_write_forbidden` before the keyring store, the signer, and any RPC request. See [Submit-layer network binding](index.md#submit-layer-network-binding) for the wire codes.
 - **USDT is hard-refused.** The denomination resolver rejects USDT outright; the command cannot create a USDT trustline.
 - **Limit.** `--limit-stroops 0` removes the trustline. When absent the Stellar default (`i64::MAX`, unlimited) applies.
@@ -474,6 +474,7 @@ witness.
 | `--limit-stroops <I64>` | Explicit trustline limit; `0` removes the trustline | optional | unlimited (`i64::MAX`) |
 | `--profile <NAME>` | Profile to load | optional | `STELLAR_AGENT_PROFILE`, else `default` |
 | `--fee <STROOPS\|auto[:pNN]>` | Classic per-op fee | optional | profile `classic_fee_per_op_stroops` |
+| `--timeout-seconds <SECONDS>` | Send and confirmation poll timeout | optional | profile `submit_timeout_seconds`, else `60` |
 
 Example: establish a USDC trustline:
 

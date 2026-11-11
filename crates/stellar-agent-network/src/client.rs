@@ -33,6 +33,11 @@ use crate::retry::{RetryPolicy, is_retryable_identity_error, rejected_status, re
 use crate::submit::MAINNET_PASSPHRASE;
 use crate::transaction_record::TransactionRecord;
 
+/// The XDR depth limit `stellar-rpc-client` encodes a `sendTransaction`
+/// envelope and decodes a refused send's result under; the wallet's own send
+/// request and its status read use the same one.
+const SEND_XDR_DEPTH_LIMIT: u32 = 500;
+
 /// The text that replaces a credential in an error or log text.
 const REDACTED_CREDENTIAL: &str = "[redacted]";
 
@@ -650,6 +655,44 @@ impl StellarRpcClient {
         Ok(TransactionRecord::from_raw(raw))
     }
 
+    /// Issues `sendTransaction` for `envelope` through the RPC client's
+    /// JSON-RPC transport and returns the endpoint's answer as received, its
+    /// status included.
+    ///
+    /// The request is the one `stellar_rpc_client::Client::send_transaction`
+    /// builds: the envelope as base64 XDR at the client's depth limit, under
+    /// the `transaction` parameter. A request that produced no answer is
+    /// reported the way that method reports it,
+    /// `TransactionSubmissionFailed` prefixed with `No status yet:`, so the
+    /// submit layer's classification of a failure without an answer holds
+    /// for both. The caller reads the status.
+    #[allow(
+        clippy::result_large_err,
+        reason = "the send retry classifies this error with is_retryable_send_error, which takes the RPC client's own error type"
+    )]
+    pub(crate) async fn send_transaction_response(
+        &self,
+        envelope: &TransactionEnvelope,
+    ) -> Result<stellar_rpc_client::SendTransactionResponse, stellar_rpc_client::Error> {
+        let mut params = ObjectParams::new();
+        params.insert(
+            "transaction",
+            stellar_xdr::WriteXdr::to_xdr_base64(
+                envelope,
+                stellar_xdr::Limits::depth(SEND_XDR_DEPTH_LIMIT),
+            )?,
+        )?;
+        self.inner
+            .client()
+            .request("sendTransaction", params)
+            .await
+            .map_err(|err| {
+                stellar_rpc_client::Error::TransactionSubmissionFailed(format!(
+                    "No status yet:\n {err:#?}"
+                ))
+            })
+    }
+
     /// Asks the endpoint which network it serves and which protocol it runs,
     /// and returns that identity once it passes every check.
     ///
@@ -879,6 +922,58 @@ impl StellarRpcClient {
     fn redacted_url(&self) -> String {
         self.url.authority()
     }
+}
+
+/// The transaction hash of an accepted `sendTransaction` answer, read as
+/// `stellar_rpc_client::Client::send_transaction` reads it, with
+/// `TRY_AGAIN_LATER` kept apart.
+///
+/// # Errors
+///
+/// - `TransactionSubmissionFailed` carrying the decoded result for an
+///   `ERROR` answer, `MissingError` when it carries no result, and
+///   `InvalidResponse` when that result does not decode.
+/// - `UnexpectedTransactionStatus("TRY_AGAIN_LATER")` for a
+///   `TRY_AGAIN_LATER` answer: the endpoint did not take the transaction, and
+///   [`is_retryable_send_error`](crate::retry::is_retryable_send_error) resends it.
+/// - `Xdr` when the hash of an accepted answer does not parse.
+#[allow(
+    clippy::result_large_err,
+    reason = "the send retry classifies this error with is_retryable_send_error, which takes the RPC client's own error type"
+)]
+pub(crate) fn accepted_hash(
+    answer: stellar_rpc_client::SendTransactionResponse,
+) -> Result<stellar_xdr::Hash, stellar_rpc_client::Error> {
+    use std::str::FromStr as _;
+    let stellar_rpc_client::SendTransactionResponse {
+        hash,
+        status,
+        error_result_xdr,
+        ..
+    } = answer;
+    if status == "ERROR" {
+        let result = error_result_xdr
+            .ok_or(stellar_rpc_client::Error::MissingError)
+            .and_then(|xdr| {
+                <stellar_xdr::TransactionResult as stellar_xdr::ReadXdr>::read_xdr_base64(
+                    &mut stellar_xdr::Limited::new(
+                        xdr.as_bytes(),
+                        stellar_xdr::Limits::depth(SEND_XDR_DEPTH_LIMIT),
+                    ),
+                )
+                .map_err(|_| stellar_rpc_client::Error::InvalidResponse)
+            })
+            .map(|result| result.result)?;
+        return Err(stellar_rpc_client::Error::TransactionSubmissionFailed(
+            format!("{result:#?}"),
+        ));
+    }
+    if status == crate::retry::SEND_TRY_AGAIN_LATER {
+        return Err(stellar_rpc_client::Error::UnexpectedTransactionStatus(
+            status,
+        ));
+    }
+    Ok(stellar_xdr::Hash::from_str(&hash)?)
 }
 
 /// An endpoint identity checked for a signing path, bound to the client it

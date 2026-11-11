@@ -1897,6 +1897,12 @@ impl WalletServer {
         }
     }
 
+    /// Checks the endpoint of `client` before the first read of a write tool,
+    /// under `deadline`.
+    ///
+    /// The classic value tools pass a deadline
+    /// [`PRE_SEND_BUDGET`](stellar_agent_network::PRE_SEND_BUDGET) ahead, so a
+    /// short profile submit timeout never cuts the probe.
     pub(crate) async fn probe_write_endpoint(
         &self,
         client: &stellar_agent_network::StellarRpcClient,

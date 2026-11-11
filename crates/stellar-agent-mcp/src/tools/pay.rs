@@ -17,8 +17,8 @@ use crate::tools::common::{
     APPROVAL_TTL_MS, CLASSIC_SINGLE_OPERATION_COUNT, DEFAULT_NONCE_TTL_MS, DispatchOutcome,
     commit_envelope_and_verify_nonce, commit_path_error_result, hash_to_lower_hex,
     ledger_err_result, nonce_id_prefix, redacted_wallet_error_envelope,
-    resolve_classic_fee_per_op_stroops, submit_timeout, total_classic_fee_stroops,
-    validate_g_strkey, verify_attestation_gate,
+    resolve_classic_fee_per_op_stroops, total_classic_fee_stroops, validate_g_strkey,
+    verify_attestation_gate,
 };
 use stellar_agent_core::amount::McpMemoTextArgument;
 use stellar_agent_core::amount::StellarAmount;
@@ -627,9 +627,11 @@ impl WalletServer {
         &self,
         Parameters(args): Parameters<StellarPayArgs>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        // Starting at entry bounds the primary identity check by the action budget.
-        let pay_deadline: tokio::time::Instant =
-            tokio::time::Instant::now() + submit_timeout(self.security_profile());
+        // Starting at entry bounds the primary identity check, the readiness
+        // check and the reads before the send by one pre-send budget; the
+        // profile's submit timeout bounds only the send and the confirmation
+        // poll.
+        let pay_deadline = stellar_agent_network::operational::readiness_deadline();
         // ── Parse asset and amount ────────────────────────────────────────────
         let (asset, payment_amount) = parse_asset_and_amount(
             &args.asset,
@@ -1324,8 +1326,7 @@ impl WalletServer {
         if let Err(e) = self
             .probe_write_endpoint(
                 &client,
-                tokio::time::Instant::now()
-                    + crate::tools::common::submit_timeout(self.security_profile()),
+                tokio::time::Instant::now() + stellar_agent_network::PRE_SEND_BUDGET,
             )
             .await
         {

@@ -352,11 +352,14 @@ Drive installed toolsets with `stellar_toolset_list` and `stellar_toolset_invoke
   ask the same question earlier, before the first read whose answer they sign
   or gate on. They ask on the client that sends, and the MCP simulate tools ask
   on their own client.
-  Seven codes carry those refusals:
+  Eight codes carry those refusals:
   - `network.endpoint_network_mismatch`: the endpoint serves a different
     network than declared.
   - `network.endpoint_identity_unavailable`: the endpoint identity cannot be
     established in time.
+  - `network.pre_send_timeout`: the submit layer's identity probe or
+    signer-set read did not answer within the 30-second pre-send budget, and
+    nothing was sent.
   - `network.rpc_credential_refused`: the endpoint answered a
     request with HTTP 401 or 403, or the stored RPC credential is unusable.
   - `network.unsupported_protocol_version`: a mainnet endpoint reports a version
@@ -471,7 +474,9 @@ signing; stale startup bindings report the restart requirement.
 **The endpoint binds the network.** Prepare and commit probe the client before
 its first action read. Submission checks it again before send. A network
 mismatch uses `network.endpoint_network_mismatch`; unavailable identity uses
-`network.endpoint_identity_unavailable`. A prepare refuses an endpoint that is
+`network.endpoint_identity_unavailable`. A read before the send that outlasts
+the 30-second pre-send budget uses `network.pre_send_timeout`, and nothing is
+sent. A prepare refuses an endpoint that is
 not healthy or not current with `network.endpoint_not_ready`, and its result
 names the observed ledger as `operational`. Credential refusals use
 `network.rpc_credential_refused`. Authorized mainnet operations require protocol 29 or 30.

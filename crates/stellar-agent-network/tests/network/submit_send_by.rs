@@ -3,7 +3,7 @@
 //! The identity probe and signer-set read end at the send-by instant. The
 //! instant is checked again after the pre-send record, and before every
 //! resend of the same bytes. A record written for a submission that is not
-//! sent is reported as rejected; a resend refused after a send leaves the
+//! sent is reported as unsent; a resend refused after a send leaves the
 //! record unresolved. The confirmation poll runs past the instant, under the
 //! submission's own timeout.
 
@@ -104,12 +104,15 @@ struct Recorder {
     pre_send_delay: Duration,
     pre_sends: AtomicUsize,
     outcomes: Mutex<Vec<SubmissionOutcome>>,
+    /// The send-by instant of every recorded intent.
+    send_bys: Mutex<Vec<Option<u64>>>,
 }
 
 #[async_trait::async_trait]
 impl SubmissionRecorder for Recorder {
-    async fn pre_send(&self, _intent: &SubmissionIntent) -> Result<(), WalletError> {
+    async fn pre_send(&self, intent: &SubmissionIntent) -> Result<(), WalletError> {
         self.pre_sends.fetch_add(1, Ordering::SeqCst);
+        self.send_bys.lock().unwrap().push(intent.send_by_ms);
         tokio::time::sleep(self.pre_send_delay).await;
         Ok(())
     }
@@ -233,10 +236,10 @@ async fn a_signer_set_read_past_the_send_by_instant_sends_nothing() {
 }
 
 /// The instant is checked immediately before `sendTransaction`: a pre-send
-/// record that outlasts it sends nothing and is reported as rejected under
-/// the timeout code.
+/// record that outlasts it sends nothing and is reported as unsent under the
+/// timeout code.
 #[tokio::test]
-async fn a_record_past_the_send_by_instant_sends_nothing_and_is_reported_as_rejected() {
+async fn a_record_past_the_send_by_instant_sends_nothing_and_is_reported_as_unsent() {
     let recorder = Recorder {
         pre_send_delay: PAST_SEND_BY,
         ..Recorder::default()
@@ -257,10 +260,34 @@ async fn a_record_past_the_send_by_instant_sends_nothing_and_is_reported_as_reje
     assert_eq!(run.sends, 0, "nothing is sent");
     assert_eq!(recorder.pre_sends.load(Ordering::SeqCst), 1);
     let outcomes = recorder.outcomes.lock().unwrap();
-    let [SubmissionOutcome::Rejected { code, .. }] = outcomes.as_slice() else {
-        panic!("one rejected outcome: {outcomes:?}")
+    let [SubmissionOutcome::NotSent { code, .. }] = outcomes.as_slice() else {
+        panic!("one unsent outcome: {outcomes:?}")
     };
     assert_eq!(code, "network.rpc_timeout");
+}
+
+/// The recorded intent carries the caller's send-by instant in Unix
+/// milliseconds.
+#[tokio::test]
+async fn the_intent_carries_the_callers_send_by() {
+    let recorder = Recorder::default();
+    let before = stellar_agent_core::timefmt::now_unix_ms().unwrap();
+
+    let run = submit(None, 0, &recorder).await;
+
+    assert!(run.result.is_ok(), "{:?}", run.result.err());
+    let after = stellar_agent_core::timefmt::now_unix_ms().unwrap();
+    let send_by = u64::try_from(SEND_BY.as_millis()).unwrap();
+    let send_bys = recorder.send_bys.lock().unwrap();
+    let [Some(send_by_ms)] = send_bys.as_slice() else {
+        panic!("one intent with a send-by instant: {send_bys:?}")
+    };
+    // The conversion reads the clock and the remaining duration in whole
+    // milliseconds, so it may fall a few milliseconds short of the instant.
+    assert!(
+        (before + send_by - 5..=after + send_by).contains(send_by_ms),
+        "{send_by_ms} lies {SEND_BY:?} ahead of the call, between {before} and {after}"
+    );
 }
 
 /// A send that starts before the instant and whose answer is lost to a

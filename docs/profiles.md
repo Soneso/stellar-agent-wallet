@@ -286,7 +286,7 @@ message signing on every chain refuses a binding to another profile or chain.
 | `[cross_check_thresholds]` | table | no | empty | Asset thresholds; testnet-only overlay. |
 | `classic_fee_per_op_stroops` | integer | no | unset (`100`) | Per-operation fee, in stroops, when no fee is passed. MCP `stellar_pay`, `stellar_create_account`, and `stellar_trustline` use it without `classic_base`. MCP `stellar_claim` takes no `classic_base` and always uses it. CLI `trustline` uses it without `--fee`, and `pool init` uses it. CLI `pay`, `claim`, and sponsored `accounts create` do not read it and use their command default of 100. When unset, the readers use 100. |
 | `classic_max_fee_per_op_stroops` | integer | mainnet, at action time | unset (no cap) | Per-operation fee cap, in stroops; see below. |
-| `submit_timeout_seconds` | integer | no | `60` | How long the wallet polls for transaction confirmation. |
+| `submit_timeout_seconds` | integer | no | `60` | How long the wallet waits for the send and the confirmation poll. CLI `pay`, `claim`, sponsored `accounts create`, and `trustline` use it without `--timeout-seconds`. The endpoint checks and the reads before the send run under a fixed 30-second pre-send budget instead. |
 
 CLI `pay` and `claim` check the cap in the full pipeline, `--build-only`,
 `--sign-only`, and `--submit-only`. MCP pay, create-account, trustline, and

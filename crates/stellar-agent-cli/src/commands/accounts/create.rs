@@ -118,8 +118,6 @@
 //! - The `--secret-env` path holds the seed only inside an mlock-protected
 //!   signing window.
 
-use std::time::Duration;
-
 use clap::{ArgGroup, Args};
 use rand_core::OsRng;
 use stellar_agent_core::StellarAmount;
@@ -161,7 +159,7 @@ use crate::common::mainnet_write::{
 };
 use crate::common::network::{
     EndpointFlags, EndpointUrlFlag, TargetNetwork, check_endpoint_identity, check_endpoint_ready,
-    network_context_for_command,
+    network_context_for_command, submit_timeout,
 };
 use crate::common::profile_access::{
     ProfileOrigin, injected_profile_load, load_profile_or_synthesize_testnet_with,
@@ -180,9 +178,6 @@ use stellar_agent_network::operational::read_within_readiness_deadline;
 
 /// Default fee per operation in stroops.
 const DEFAULT_FEE_STROOPS: u32 = 100;
-
-/// Default submission timeout in seconds.
-const DEFAULT_TIMEOUT_SECONDS: u64 = 60;
 
 /// Default Friendbot URL for testnet (SDF operated).
 const DEFAULT_FRIENDBOT_URL: &str = "https://friendbot.stellar.org";
@@ -426,10 +421,12 @@ pub struct CreateArgs {
     #[arg(long, default_value_t = OutputFormat::DEFAULT, value_name = "FORMAT")]
     pub output: OutputFormat,
 
-    /// Timeout in seconds for the endpoint check and, separately, for the
-    /// submission (sponsored mode). Default: 60.
-    #[arg(long, default_value_t = DEFAULT_TIMEOUT_SECONDS, value_name = "SECONDS")]
-    pub timeout_seconds: u64,
+    /// Timeout in seconds for the send and the confirmation poll (sponsored
+    /// mode). Default: the profile's `submit_timeout_seconds`, then 60.
+    /// The endpoint checks and the reads before the send run under a fixed
+    /// 30-second budget instead.
+    #[arg(long, value_name = "SECONDS")]
+    pub timeout_seconds: Option<u64>,
 
     /// The RPC endpoint comes from the profile when absent.
     /// On testnet, this flag overrides the profile endpoint.
@@ -880,15 +877,14 @@ where
             return 1;
         }
     };
-    if let Err(e) =
-        check_endpoint_identity(&client, context, Duration::from_secs(args.timeout_seconds)).await
-    {
+    let budget = stellar_agent_network::PRE_SEND_BUDGET;
+    if let Err(e) = check_endpoint_identity(&client, context, budget).await {
         print_error(&Envelope::<()>::err(&e), args.output);
         return 1;
     }
     if let Err(e) = check_endpoint_ready(
         &client,
-        tokio::time::Instant::now() + Duration::from_secs(args.timeout_seconds),
+        stellar_agent_network::operational::readiness_deadline(),
     )
     .await
     {
@@ -1189,23 +1185,56 @@ async fn sponsored_create(
     } = signed_by;
     let signed_xdr =
         sign_envelope(context, args, envelope_xdr, sponsor, profile, profile_name).await?;
-    let passphrase = context.network_passphrase();
-
-    // Submit and wait for confirmation.
-    let timeout = Duration::from_secs(args.timeout_seconds);
-    submit_transaction_and_wait(
+    submit_signed(
         client,
+        context,
+        args,
+        profile,
         &signed_xdr,
-        timeout,
-        passphrase,
-        Some(SubmissionSignerKind::Software),
         recorder,
+        submit_transaction_and_wait,
     )
     .await
     .map_err(|error| SponsoredCreateFailure {
         error,
         signed_xdr: Some(signed_xdr),
     })
+}
+
+/// Submits the signed sponsored creation through `client` and waits for its
+/// confirmation, with the send and the poll under [`submit_timeout`].
+///
+/// `submit_and_wait` is the submission step, with the signature of
+/// [`submit_transaction_and_wait`], which production passes.
+async fn submit_signed<S>(
+    client: &StellarRpcClient,
+    context: &NetworkContext,
+    args: &CreateArgs,
+    profile: &Profile,
+    signed_xdr: &str,
+    recorder: Option<&dyn stellar_agent_network::SubmissionRecorder>,
+    submit_and_wait: S,
+) -> Result<SubmissionResult, WalletError>
+where
+    S: AsyncFnOnce(
+        &StellarRpcClient,
+        &str,
+        std::time::Duration,
+        &str,
+        Option<SubmissionSignerKind>,
+        Option<&dyn stellar_agent_network::SubmissionRecorder>,
+    ) -> Result<SubmissionResult, WalletError>,
+{
+    let timeout = submit_timeout(args.timeout_seconds, profile);
+    submit_and_wait(
+        client,
+        signed_xdr,
+        timeout,
+        context.network_passphrase(),
+        Some(SubmissionSignerKind::Software),
+        recorder,
+    )
+    .await
 }
 
 /// Resolves the command's fee choice before the cap and witness.
@@ -1404,13 +1433,13 @@ where
         Ok(client) => client,
         Err(e) => return fail(&Envelope::<()>::err(&e)),
     };
-    let timeout = Duration::from_secs(args.timeout_seconds);
-    if let Err(e) = check_endpoint_identity(&client, &net_context, timeout).await {
+    let budget = stellar_agent_network::PRE_SEND_BUDGET;
+    if let Err(e) = check_endpoint_identity(&client, &net_context, budget).await {
         return fail(&Envelope::<()>::err(&e));
     }
     // The check precedes the sponsor read, which runs under the check's
     // deadline; the summary names the ledger the check observed.
-    let readiness_deadline = tokio::time::Instant::now() + timeout;
+    let readiness_deadline = stellar_agent_network::operational::readiness_deadline();
     let operational = match check_endpoint_ready(&client, readiness_deadline).await {
         Ok(report) => report,
         Err(e) => return fail(&Envelope::<()>::err(&e)),
@@ -1546,8 +1575,8 @@ where
         consumer: MainnetConsumer::CliCreateAccount,
         unsigned_xdr: &envelope_xdr,
         client: &client,
-        probe_deadline: timeout,
-        submit_timeout: timeout,
+        probe_deadline: budget,
+        submit_timeout: submit_timeout(args.timeout_seconds, profile),
         source: &sponsor,
         source_flag: "--sponsor",
         signer,
@@ -1784,6 +1813,76 @@ mod tests {
         TestCreate::try_parse_from(args).map(|t| t.args)
     }
 
+    /// The timeout the verb's submit step hands the submission for `flag`,
+    /// with the profile's `submit_timeout_seconds` set to `configured`.
+    async fn forwarded_submit_timeout(
+        flag: Option<u64>,
+        configured: Option<u64>,
+    ) -> std::time::Duration {
+        let mut profile = Profile::builder_testnet("create-timeout", "s", "n", "a").build();
+        profile.submit_timeout_seconds = configured;
+        let mut args = minimal_sponsored_args();
+        args.timeout_seconds = flag;
+        let context = NetworkContext::from_profile(&profile);
+        let client = StellarRpcClient::new("http://127.0.0.1:9").unwrap();
+        let seen = std::sync::Mutex::new(None);
+        let outcome = submit_signed(
+            &client,
+            &context,
+            &args,
+            &profile,
+            "AAAA",
+            None,
+            async |_client: &StellarRpcClient,
+                   _envelope: &str,
+                   timeout: std::time::Duration,
+                   _passphrase: &str,
+                   _signer_kind: Option<SubmissionSignerKind>,
+                   _recorder: Option<&dyn stellar_agent_network::SubmissionRecorder>| {
+                *seen.lock().unwrap() = Some(timeout);
+                Err(WalletError::Network(
+                    stellar_agent_core::error::NetworkError::EndpointIdentityUnavailable {
+                        url: "http://127.0.0.1:9".to_owned(),
+                    },
+                ))
+            },
+        )
+        .await;
+        assert!(outcome.is_err(), "the submission step refused");
+        seen.into_inner()
+            .unwrap()
+            .expect("the submit step reaches the submission")
+    }
+
+    /// `--timeout-seconds` sets the timeout the submit step hands the
+    /// submission; without it the profile's `submit_timeout_seconds` applies,
+    /// then 60 seconds.
+    #[tokio::test]
+    async fn timeout_flag_falls_back_to_the_profile_then_sixty() {
+        assert_eq!(
+            try_parse_create(&[sponsored_args(), vec!["--timeout-seconds", "5"]].concat())
+                .unwrap()
+                .timeout_seconds,
+            Some(5)
+        );
+        assert_eq!(
+            try_parse_create(&sponsored_args()).unwrap().timeout_seconds,
+            None
+        );
+        assert_eq!(
+            forwarded_submit_timeout(Some(5), Some(17)).await,
+            std::time::Duration::from_secs(5)
+        );
+        assert_eq!(
+            forwarded_submit_timeout(None, Some(17)).await,
+            std::time::Duration::from_secs(17)
+        );
+        assert_eq!(
+            forwarded_submit_timeout(None, None).await,
+            std::time::Duration::from_secs(60)
+        );
+    }
+
     /// Helper: a minimal valid friendbot invocation arg list.
     fn friendbot_args() -> Vec<&'static str> {
         vec![
@@ -1930,7 +2029,7 @@ mod tests {
             // Non-routable, so no request leaves the host.
             friendbot_url: "http://127.0.0.1:1".to_owned(),
             output: OutputFormat::Json,
-            timeout_seconds: DEFAULT_TIMEOUT_SECONDS,
+            timeout_seconds: None,
             rpc_url: None,
             fee: None,
         };
@@ -1991,7 +2090,7 @@ mod tests {
             // Non-routable, so no request leaves the host.
             friendbot_url: "http://127.0.0.1:1".to_owned(),
             output: OutputFormat::Json,
-            timeout_seconds: DEFAULT_TIMEOUT_SECONDS,
+            timeout_seconds: None,
             rpc_url: Some(guard_rpc.uri()),
             fee: None,
         };
@@ -2045,7 +2144,7 @@ mod tests {
             network: Some(TargetNetwork::Mainnet),
             friendbot_url: "http://127.0.0.1:1".to_owned(),
             output: OutputFormat::Json,
-            timeout_seconds: DEFAULT_TIMEOUT_SECONDS,
+            timeout_seconds: None,
             rpc_url: None,
             fee: None,
         };
@@ -2113,7 +2212,7 @@ mod tests {
             network: Some(TargetNetwork::Mainnet),
             friendbot_url: "http://127.0.0.1:1".to_owned(),
             output: OutputFormat::Json,
-            timeout_seconds: DEFAULT_TIMEOUT_SECONDS,
+            timeout_seconds: None,
             rpc_url: Some(guard_rpc.uri()),
             fee: None,
         };
@@ -2152,7 +2251,7 @@ mod tests {
             network: None,
             friendbot_url: "http://127.0.0.1:1".to_owned(),
             output: OutputFormat::Json,
-            timeout_seconds: DEFAULT_TIMEOUT_SECONDS,
+            timeout_seconds: None,
             rpc_url: None,
             fee: None,
         }
@@ -2396,7 +2495,7 @@ mod tests {
             network: Some(TargetNetwork::Testnet),
             friendbot_url: DEFAULT_FRIENDBOT_URL.to_owned(),
             output: OutputFormat::Json,
-            timeout_seconds: DEFAULT_TIMEOUT_SECONDS,
+            timeout_seconds: None,
             rpc_url: Some(crate::common::network::TESTNET_RPC_URL.to_owned()),
             fee: None,
         };
@@ -2442,7 +2541,7 @@ mod tests {
             network: Some(TargetNetwork::Testnet),
             friendbot_url: DEFAULT_FRIENDBOT_URL.to_owned(),
             output: OutputFormat::Json,
-            timeout_seconds: DEFAULT_TIMEOUT_SECONDS,
+            timeout_seconds: None,
             rpc_url: Some(crate::common::network::TESTNET_RPC_URL.to_owned()),
             fee: None,
         };
@@ -2480,7 +2579,7 @@ mod tests {
             network: Some(TargetNetwork::Testnet),
             friendbot_url: DEFAULT_FRIENDBOT_URL.to_owned(),
             output: OutputFormat::Json,
-            timeout_seconds: DEFAULT_TIMEOUT_SECONDS,
+            timeout_seconds: None,
             rpc_url: Some(crate::common::network::TESTNET_RPC_URL.to_owned()),
             fee: None,
         };
@@ -2514,7 +2613,7 @@ mod tests {
             network: Some(TargetNetwork::Testnet),
             friendbot_url: DEFAULT_FRIENDBOT_URL.to_owned(),
             output: OutputFormat::Json,
-            timeout_seconds: DEFAULT_TIMEOUT_SECONDS,
+            timeout_seconds: None,
             rpc_url: Some(crate::common::network::TESTNET_RPC_URL.to_owned()),
             fee: None,
         };
@@ -2590,7 +2689,7 @@ mod tests {
             network: Some(TargetNetwork::Testnet),
             friendbot_url: DEFAULT_FRIENDBOT_URL.to_owned(),
             output: OutputFormat::Json,
-            timeout_seconds: DEFAULT_TIMEOUT_SECONDS,
+            timeout_seconds: None,
             rpc_url: Some(crate::common::network::TESTNET_RPC_URL.to_owned()),
             fee: None,
         }
@@ -3165,7 +3264,7 @@ mod tests {
                 args.secret_env = None;
             }
             if matches!(case, Case::Timeout) {
-                args.timeout_seconds = 1;
+                args.timeout_seconds = Some(1);
                 Mock::given(method("POST"))
                     .and(wiremock::matchers::body_partial_json(serde_json::json!({
                         "method": "getTransaction"
@@ -3418,7 +3517,7 @@ mod tests {
                 network: None,
                 friendbot_url: "http://127.0.0.1:1".to_owned(),
                 output: OutputFormat::Json,
-                timeout_seconds: DEFAULT_TIMEOUT_SECONDS,
+                timeout_seconds: None,
                 rpc_url: None,
                 fee: None,
             }
@@ -3929,7 +4028,7 @@ mod tests {
             network: Some(TargetNetwork::Testnet),
             friendbot_url: DEFAULT_FRIENDBOT_URL.to_owned(),
             output: OutputFormat::Json,
-            timeout_seconds: DEFAULT_TIMEOUT_SECONDS,
+            timeout_seconds: None,
             rpc_url: Some(crate::common::network::TESTNET_RPC_URL.to_owned()),
             fee: None,
         };

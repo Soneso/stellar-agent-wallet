@@ -391,14 +391,19 @@ async fn simulate_refuses_a_stale_endpoint_before_any_account_read() {
 }
 
 /// An account read still running at the deadline the readiness check ran
-/// under refuses the prepare with `network.endpoint_not_ready` and no
-/// prepare token, and the prepare sends no later request.
+/// under, the pre-send budget, refuses the prepare with
+/// `network.endpoint_not_ready` and no prepare token, and the prepare sends
+/// no later request. A one-second submit timeout does not shorten it. The
+/// budget is set to two seconds, longer than the timeout.
 #[tokio::test]
 #[serial]
 async fn simulate_refuses_an_account_read_past_the_readiness_deadline() {
     let _data_root = crate::common::isolated_data_root();
     keyring_mock::install().expect("mock keyring store init");
     install_test_nonce_key(24);
+    let budget = std::time::Duration::from_secs(2);
+    let _budget = stellar_agent_network::operational::set_readiness_budget_for_test(budget);
+    let answer_delay = budget + std::time::Duration::from_secs(3);
     let endpoint = funded_accounts_endpoint().await;
     Mock::given(method("POST"))
         .and(wiremock::matchers::body_partial_json(
@@ -409,7 +414,7 @@ async fn simulate_refuses_an_account_read_past_the_readiness_deadline() {
                 account_ledger_key_xdr(SOURCE_G),
                 account_entry_xdr_with_balance(SOURCE_G, 100_000_000_000_000),
             )])
-            .with_delay(std::time::Duration::from_secs(3)),
+            .with_delay(answer_delay),
         )
         .with_priority(1)
         .mount(&endpoint)
@@ -422,8 +427,12 @@ async fn simulate_refuses_an_account_read_past_the_readiness_deadline() {
     let result = server.call_stellar_pay(ten_xlm_args()).await;
 
     assert!(
-        started.elapsed() < std::time::Duration::from_secs(3),
+        started.elapsed() < answer_delay,
         "the deadline ends the read before its answer"
+    );
+    assert!(
+        started.elapsed() >= budget,
+        "the read runs under the budget, not the submit timeout"
     );
     let json = assert_not_ready_before_any_read(
         result,
@@ -437,6 +446,50 @@ async fn simulate_refuses_an_account_read_past_the_readiness_deadline() {
             .unwrap()
             .ends_with("account read exceeded the readiness deadline"),
         "{json}"
+    );
+}
+
+/// With a one-second submit timeout, an identity probe that answers after
+/// two seconds still passes, and the prepare reads the accounts and returns
+/// its token: the probe runs under the pre-send budget.
+#[tokio::test]
+#[serial]
+async fn prepare_probe_outlasts_a_short_submit_timeout() {
+    let _data_root = crate::common::isolated_data_root();
+    keyring_mock::install().expect("mock keyring store init");
+    install_test_nonce_key(25);
+    let endpoint = funded_accounts_endpoint().await;
+    Mock::given(method("POST"))
+        .and(wiremock::matchers::body_partial_json(
+            serde_json::json!({ "method": "getNetwork" }),
+        ))
+        .respond_with(
+            crate::common::TimeoutRpc::new(Vec::new())
+                .with_delay(std::time::Duration::from_secs(2)),
+        )
+        .with_priority(1)
+        .mount(&endpoint)
+        .await;
+    let mut profile = testnet_profile_with_rpc(&endpoint.uri());
+    profile.submit_timeout_seconds = Some(1);
+    let server = WalletServer::new(profile).expect("WalletServer::new");
+
+    let result = server
+        .call_stellar_pay(ten_xlm_args())
+        .await
+        .expect("prepare must not error");
+
+    assert_ne!(result.is_error, Some(true), "{}", call_result_text(&result));
+    let json = call_result_json(&result);
+    assert!(
+        json["data"].is_object(),
+        "the prepare returns its token: {json}"
+    );
+    let methods = crate::common::received_methods(&endpoint).await;
+    assert_eq!(methods.first().map(String::as_str), Some("getNetwork"));
+    assert!(
+        methods.iter().any(|m| m == "getLedgerEntries"),
+        "the prepare reads the accounts: {methods:?}"
     );
 }
 

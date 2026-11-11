@@ -495,11 +495,16 @@ pub(crate) fn ledger_err_result(
 ///
 /// `simulation.deadline_invalid` naming `envelope_shape` for an envelope that
 /// does not decode as a classic `Tx` envelope, and naming the deadline's own
-/// label (`deadline_missing`, `deadline_elapsed` or `deadline_too_far`) for an
-/// envelope whose deadline [`check_classic_deadline`] refuses; the wallet error
-/// of a mainnet clock that cannot be read.
+/// label (`deadline_missing`, `deadline_elapsed`, `deadline_within_margin` or
+/// `deadline_too_far`) for an envelope whose deadline
+/// [`check_classic_deadline`] refuses; the wallet error of a mainnet clock
+/// that cannot be read. A deadline within
+/// [`MAINNET_SEND_MARGIN_SECONDS`] of the clock is refused as
+/// `deadline_within_margin`, before any signature or record, because a send
+/// that starts then may not reach the network before the deadline.
 ///
 /// [`check_classic_deadline`]: stellar_agent_network::mainnet::resolve::check_classic_deadline
+/// [`MAINNET_SEND_MARGIN_SECONDS`]: stellar_agent_network::mainnet::resolve::MAINNET_SEND_MARGIN_SECONDS
 pub(crate) fn presented_classic_deadline(
     envelope_xdr: &str,
 ) -> Result<u64, rmcp::model::CallToolResult> {
@@ -3131,6 +3136,32 @@ pub(crate) mod tests {
         assert_eq!(
             presented_classic_deadline(&timed_envelope(0, now_s + 120)).unwrap(),
             now_s + 120
+        );
+    }
+
+    /// A deadline the send margin reaches refuses naming
+    /// `deadline_within_margin`; one just outside the margin passes.
+    #[test]
+    #[serial_test::serial(keyring)]
+    fn a_presented_deadline_refuses_inside_the_margin() {
+        use stellar_agent_network::mainnet::resolve::MAINNET_SEND_MARGIN_SECONDS;
+        let now = stellar_agent_core::timefmt::now_unix_ms().unwrap() + CLOCK_LEAD_MS;
+        let now = now - now % 1000;
+        let clock = stellar_agent_network::mainnet::clock::set_now_ms_for_test(now);
+        let now_s = now / 1000;
+        for deadline_s in [now_s + 1, now_s + MAINNET_SEND_MARGIN_SECONDS] {
+            let (code, message) = deadline_refusal(&timed_envelope(0, deadline_s));
+            assert_eq!(code, "simulation.deadline_invalid", "{deadline_s}");
+            assert!(
+                message.contains("(deadline_within_margin)"),
+                "{deadline_s}: {message}"
+            );
+        }
+        clock.set(now - 1);
+        assert_eq!(
+            presented_classic_deadline(&timed_envelope(0, now_s + MAINNET_SEND_MARGIN_SECONDS))
+                .unwrap(),
+            now_s + MAINNET_SEND_MARGIN_SECONDS
         );
     }
 

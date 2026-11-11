@@ -319,6 +319,7 @@ pub(crate) fn intent(envelope: &SignedTestEnvelope) -> SubmissionIntent {
         max_time: crate::idempotent_submit::extract_max_time(&decoded),
         submission_ledger: 100,
         submission_anchor: None,
+        send_by_ms: None,
     }
 }
 

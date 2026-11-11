@@ -519,8 +519,10 @@ impl WalletServer {
         // on this client. The values read here feed the envelope the commit
         // signs and the policy gate, so an endpoint serving another network
         // answers none of them.
-        let deadline = tokio::time::Instant::now()
-            + crate::tools::common::submit_timeout(self.security_profile());
+        // The probe, the readiness check and the reads before the send share
+        // one pre-send budget from here; the profile's submit timeout bounds
+        // only the send and the confirmation poll.
+        let deadline = stellar_agent_network::operational::readiness_deadline();
         if let Err(e) = self.probe_write_endpoint(&client, deadline).await {
             return Ok(crate::tools::common::endpoint_refusal_result(&e));
         }
@@ -1162,8 +1164,7 @@ impl WalletServer {
         if let Err(e) = self
             .probe_write_endpoint(
                 &client,
-                tokio::time::Instant::now()
-                    + crate::tools::common::submit_timeout(self.security_profile()),
+                tokio::time::Instant::now() + stellar_agent_network::PRE_SEND_BUDGET,
             )
             .await
         {

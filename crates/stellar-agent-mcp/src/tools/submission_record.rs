@@ -363,7 +363,7 @@ pub(crate) async fn sign_and_submit_classic(
                 consumer,
                 unsigned_envelope_xdr: envelope,
                 client,
-                probe_deadline: timeout,
+                probe_deadline: stellar_agent_network::PRE_SEND_BUDGET,
                 witness,
                 signer: &signer,
                 policy: guard.policy,

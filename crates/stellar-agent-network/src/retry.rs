@@ -112,6 +112,12 @@ impl Default for RetryPolicy {
 // Per-call-site retryable classifiers
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// The `sendTransaction` status with which an endpoint declines to take a
+/// transaction for now. The submit layer's status read reports it as
+/// `stellar_rpc_client::Error::UnexpectedTransactionStatus` carrying this
+/// text, which [`is_retryable_send_error`] retries.
+pub(crate) const SEND_TRY_AGAIN_LATER: &str = "TRY_AGAIN_LATER";
+
 /// Returns `true` if a `sendTransaction` RPC error is worth retrying.
 ///
 /// # Classification rationale
@@ -126,12 +132,17 @@ impl Default for RetryPolicy {
 /// on-chain rejection would be retried, wasting attempts.  The
 /// Transport-429-on-send is not currently honoured; blind backoff is used instead.
 ///
-/// Only `TransactionSubmissionTimeout` and `JsonRpc(_)` are retried:
+/// Only `TransactionSubmissionTimeout`, `JsonRpc(_)` and a
+/// `TRY_AGAIN_LATER` answer are retried:
 /// - `TransactionSubmissionTimeout`: the RPC call timed out at the transport
 ///   layer (no on-chain decision was made); safe to retry.
 /// - `JsonRpc(_)`: raw transport error (connection reset, server-side error,
 ///   or 429 surfacing through the jsonrpsee layer before `send_transaction`
 ///   gets a chance to inspect the response body); safe to retry.
+/// - `UnexpectedTransactionStatus("TRY_AGAIN_LATER")`: the
+///   submit layer's own `sendTransaction` status read reports the endpoint's
+///   `TRY_AGAIN_LATER` this way. The endpoint did not take the transaction
+///   for inclusion, so resending the same bytes is safe.
 ///
 /// # Errors
 ///
@@ -163,7 +174,11 @@ pub fn is_retryable_send_error(e: &stellar_rpc_client::Error) -> bool {
         // The RPC client found a transaction-level failure after submission.
         E::TransactionFailed(_) => false,
 
-        // An unexpected status string came back.  Non-transient protocol error.
+        // The endpoint answered `TRY_AGAIN_LATER`: it did not take the
+        // transaction now, and the same bytes may be sent again.
+        E::UnexpectedTransactionStatus(status) if status == SEND_TRY_AGAIN_LATER => true,
+
+        // Any other unexpected status string.  Non-transient protocol error.
         E::UnexpectedTransactionStatus(_) => false,
 
         // XDR decode failure: the payload is structurally wrong; retry
@@ -785,6 +800,18 @@ mod tests {
     fn send_transaction_failed_is_not_retryable() {
         assert!(!is_retryable_send_error(
             &stellar_rpc_client::Error::TransactionFailed("some failure".to_owned())
+        ));
+    }
+
+    /// A `TRY_AGAIN_LATER` answer is resent; any other unexpected status is
+    /// not.
+    #[test]
+    fn send_try_again_later_is_retryable() {
+        assert!(is_retryable_send_error(
+            &stellar_rpc_client::Error::UnexpectedTransactionStatus(SEND_TRY_AGAIN_LATER.into())
+        ));
+        assert!(!is_retryable_send_error(
+            &stellar_rpc_client::Error::UnexpectedTransactionStatus("DUPLICATE".into())
         ));
     }
 

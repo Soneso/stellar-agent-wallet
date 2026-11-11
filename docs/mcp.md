@@ -471,16 +471,20 @@ authoritative. Ordinary submission refuses a mainnet endpoint with
 `network.mainnet_write_forbidden`. Authorized submission verifies the bound
 mainnet context. One reporting a different network than the profile declares
 is refused with `network.endpoint_network_mismatch`. One whose
-identity cannot be established within the submission timeout is refused with
-`network.endpoint_identity_unavailable`. One that answers the identity request
-with HTTP 401 or 403 is refused with `network.rpc_credential_refused`. The
-probe is retried with bounded exponential backoff inside the caller's timeout
-and never falls back to the declaration; an answer that does not parse, and a
-401 or 403 answer, is not retried. Every classic prepare then checks, on the
-same client and before it reads the account it signs against, that the
-endpoint reports a healthy status and that its latest ledger closed within 60
-seconds of the host clock; a failed check is refused with
-`network.endpoint_not_ready`.
+identity cannot be established is refused with
+`network.endpoint_identity_unavailable`, and one that does not answer within
+the 30-second pre-send budget with `network.pre_send_timeout`. One that answers
+the identity request with HTTP 401 or 403 is refused with
+`network.rpc_credential_refused`. The probe is retried with bounded exponential
+backoff inside the pre-send budget and never falls back to the declaration; an
+answer that does not parse, and a 401 or 403 answer, is not retried. Every
+classic prepare then checks, on the same client and before it reads the account
+it signs against, that the endpoint reports a healthy status and that its
+latest ledger closed within 60 seconds of the host clock; a failed check is
+refused with `network.endpoint_not_ready`. The classic prepares and commits run
+the probe, the readiness check and the reads before the send under the
+pre-send budget, and the profile's `submit_timeout_seconds` bounds only the
+send and the confirmation poll.
 [Retries, deadlines, and failover](maintainers/security-internals.md#retries-deadlines-and-failover)
 gives the numbers. This release supports protocol versions 29 and 30. On testnet and
 other networks, a version outside that range is logged as a warning. On mainnet
