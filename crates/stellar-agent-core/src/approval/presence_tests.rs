@@ -694,6 +694,7 @@ fn presence_uses_the_signed_key_for_the_selected_id() {
                 label: "unlisted".to_owned(),
                 registered_at_unix_ms: now_ms(),
                 sign_count: None,
+                source: crate::approval::OperatorCredentialSource::Enrolled,
             },
         )
         .unwrap();
@@ -3390,4 +3391,232 @@ fn receipt_version_2_requires_both_identity_fields() {
             "{label}"
         );
     }
+}
+
+// ── The remote surface at a signed origin ───────────────────────────────────
+
+/// The remote surface records a mainnet consent only for a receipt of a
+/// signed-origin ceremony. Such consent is a version 5 attestation with
+/// the mainnet passkey approver and a `serve-remote` row. A loopback
+/// receipt refuses as unsupported with no row.
+#[test]
+#[serial]
+fn serve_remote_admits_only_signed_origin_receipts() {
+    let mut fixture = MainnetConsentFixture::new(PROFILE);
+    let attempt = |fixture: &MainnetConsentFixture,
+                   entry: &PendingApproval,
+                   presence: VerifiedMainnetPresence,
+                   policy: &VerifiedPolicy| {
+        let mut store = PendingApprovalStore::open(fixture.store_path()).unwrap();
+        store.insert(entry.clone(), now_ms()).unwrap();
+        let mut writer = fixture.audit_writer();
+        attest_and_persist(
+            &mut store,
+            entry,
+            &ATTESTATION_KEY,
+            &fixture.binding(),
+            Surface::ServeRemote,
+            ConsentAudit::Writer(&mut writer),
+            ConsentAuthorization::Mainnet { presence, policy },
+            |_, _| panic!("no grant"),
+        )
+    };
+    let local = fixture.current_policy();
+    let loopback_entry = fixture.payment(DEFAULT_TTL_MS);
+    let presence = fixture.presence(&loopback_entry, &local);
+    assert_eq!(
+        code(attempt(&fixture, &loopback_entry, presence, &local)),
+        "approval.mainnet_remote_unsupported"
+    );
+    assert!(consent_rows(&fixture.audit_path()).is_empty());
+
+    fixture.sign_signed_origin_policy(&[&fixture_authenticator()], &SIGNED_CERT_SPKI_SHA256);
+    let policy = fixture.current_policy();
+    let identity = ListenerIdentity::capture(&policy).unwrap();
+    let entry = fixture.payment(DEFAULT_TTL_MS);
+    let pending = issue_mainnet_intent_presence(
+        &entry,
+        &fixture.binding(),
+        &policy,
+        PresenceListener::SignedOrigin(&identity),
+        None,
+        now_ms(),
+        Instant::now(),
+    )
+    .unwrap();
+    let presence = verify_issued(pending).unwrap();
+    let surfaced = attempt(&fixture, &entry, presence, &policy)
+        .unwrap()
+        .unwrap();
+
+    let store = PendingApprovalStore::open(fixture.store_path()).unwrap();
+    let stored = store.get(&entry.approval_nonce).unwrap();
+    let receipt = stored.mainnet_presence.clone().unwrap();
+    assert_eq!(receipt.version(), MAINNET_PRESENCE_RECEIPT_VERSION_2);
+    assert_eq!(receipt.expected_origin(), SIGNED_ORIGIN);
+    let approver = AttestedApprover::MainnetPasskey {
+        credential_id_b64url: receipt.credential_id_b64url(),
+    };
+    assert_eq!(stored.attested_approver.as_ref(), Some(&approver));
+    let blob: [u8; 32] = URL_SAFE_NO_PAD
+        .decode(stored.attestation_blob_b64.as_ref().unwrap())
+        .unwrap()
+        .try_into()
+        .unwrap();
+    assert_eq!(URL_SAFE_NO_PAD.encode(blob), surfaced);
+    let lifetime = entry.attested_lifetime();
+    let scope = AttestationScope::pending(5, lifetime, Some(&approver), Some(&receipt)).unwrap();
+    assert!(verify_attestation(
+        &ATTESTATION_KEY,
+        &fixture.binding(),
+        &entry.approval_nonce,
+        &mainnet_consent_subject(&entry, &fixture.binding()).unwrap(),
+        &entry.process_uid,
+        &scope,
+        &blob
+    ));
+    let rows = consent_rows(&fixture.audit_path());
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["origin"], "serve-remote");
+    assert_eq!(rows[0]["mainnet_presence"]["rp_id"], SIGNED_RP_ID);
+    assert_eq!(
+        rows[0]["mainnet_presence"]["webauthn_origin"],
+        SIGNED_ORIGIN
+    );
+}
+
+/// A policy re-sign with the same pin refuses persistence by its listener digest.
+#[test]
+#[serial]
+fn signed_origin_persistence_refuses_a_same_pin_resign() {
+    let mut fixture = MainnetConsentFixture::new(PROFILE);
+    fixture.sign_signed_origin_policy(&[&fixture_authenticator()], &SIGNED_CERT_SPKI_SHA256);
+    let policy = fixture.current_policy();
+    let identity = ListenerIdentity::capture(&policy).unwrap();
+    let verified = |entry: &PendingApproval| {
+        let pending = issue_mainnet_intent_presence(
+            entry,
+            &fixture.binding(),
+            &policy,
+            PresenceListener::SignedOrigin(&identity),
+            None,
+            now_ms(),
+            Instant::now(),
+        )
+        .unwrap();
+        verify_issued(pending).unwrap()
+    };
+    let cases: Vec<(Surface, PendingApproval, VerifiedMainnetPresence)> =
+        [Surface::ServeRemote, Surface::Cli]
+            .into_iter()
+            .map(|surface| {
+                let entry = fixture.payment(DEFAULT_TTL_MS);
+                let presence = verified(&entry);
+                (surface, entry, presence)
+            })
+            .collect();
+    fixture.sign_signed_origin_policy(&[&fixture_authenticator()], &SIGNED_CERT_SPKI_SHA256);
+    let current = fixture.current_policy();
+    assert_ne!(current.digest(), policy.digest());
+    assert_eq!(
+        current.mainnet().unwrap().approval_cert_spki_sha256,
+        policy.mainnet().unwrap().approval_cert_spki_sha256
+    );
+    assert_eq!(
+        fixture.current_policy().mainnet().unwrap().approval_origin,
+        policy.mainnet().unwrap().approval_origin
+    );
+    for (surface, entry, presence) in cases {
+        let mut store = PendingApprovalStore::open(fixture.store_path()).unwrap();
+        store.insert(entry.clone(), now_ms()).unwrap();
+        let mut writer = fixture.audit_writer();
+        let result = attest_and_persist(
+            &mut store,
+            &entry,
+            &ATTESTATION_KEY,
+            &fixture.binding(),
+            surface,
+            ConsentAudit::Writer(&mut writer),
+            ConsentAuthorization::Mainnet {
+                presence,
+                policy: &policy,
+            },
+            |_, _| panic!("no grant"),
+        );
+        assert_eq!(
+            code(result),
+            "approval.listener_policy_stale",
+            "{surface:?}"
+        );
+        let stored = store.get(&entry.approval_nonce).unwrap();
+        assert!(stored.attestation_blob_b64.is_none(), "{surface:?}");
+        assert!(stored.mainnet_presence.is_none(), "{surface:?}");
+    }
+    assert!(consent_rows(&fixture.audit_path()).is_empty());
+}
+
+/// A pin change for the same origin between verification and persistence
+/// refuses signed-origin consent as stale. Both the remote and local surfaces
+/// write no row and leave the entry unattested.
+#[test]
+#[serial]
+fn signed_origin_persistence_refuses_a_stale_listener() {
+    let mut fixture = MainnetConsentFixture::new(PROFILE);
+    fixture.sign_signed_origin_policy(&[&fixture_authenticator()], &SIGNED_CERT_SPKI_SHA256);
+    let policy = fixture.current_policy();
+    let identity = ListenerIdentity::capture(&policy).unwrap();
+    let verified = |entry: &PendingApproval| {
+        let pending = issue_mainnet_intent_presence(
+            entry,
+            &fixture.binding(),
+            &policy,
+            PresenceListener::SignedOrigin(&identity),
+            None,
+            now_ms(),
+            Instant::now(),
+        )
+        .unwrap();
+        verify_issued(pending).unwrap()
+    };
+    let cases: Vec<(Surface, PendingApproval, VerifiedMainnetPresence)> =
+        [Surface::ServeRemote, Surface::Cli]
+            .into_iter()
+            .map(|surface| {
+                let entry = fixture.payment(DEFAULT_TTL_MS);
+                let presence = verified(&entry);
+                (surface, entry, presence)
+            })
+            .collect();
+    fixture.sign_signed_origin_policy(&[&fixture_authenticator()], &[0xcd; 32]);
+    assert_eq!(
+        fixture.current_policy().mainnet().unwrap().approval_origin,
+        policy.mainnet().unwrap().approval_origin
+    );
+    for (surface, entry, presence) in cases {
+        let mut store = PendingApprovalStore::open(fixture.store_path()).unwrap();
+        store.insert(entry.clone(), now_ms()).unwrap();
+        let mut writer = fixture.audit_writer();
+        let result = attest_and_persist(
+            &mut store,
+            &entry,
+            &ATTESTATION_KEY,
+            &fixture.binding(),
+            surface,
+            ConsentAudit::Writer(&mut writer),
+            ConsentAuthorization::Mainnet {
+                presence,
+                policy: &policy,
+            },
+            |_, _| panic!("no grant"),
+        );
+        assert_eq!(
+            code(result),
+            "approval.listener_policy_stale",
+            "{surface:?}"
+        );
+        let stored = store.get(&entry.approval_nonce).unwrap();
+        assert!(stored.attestation_blob_b64.is_none(), "{surface:?}");
+        assert!(stored.mainnet_presence.is_none(), "{surface:?}");
+    }
+    assert!(consent_rows(&fixture.audit_path()).is_empty());
 }

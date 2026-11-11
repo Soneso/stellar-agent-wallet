@@ -1003,6 +1003,7 @@ async fn rule_proposal_remote_browser_drives_real_rule_install() {
             label: "test-browser-authenticator".to_owned(),
             registered_at_unix_ms: timefmt::now_unix_ms().expect("clock read"),
             sign_count: None,
+            source: stellar_agent_core::approval::OperatorCredentialSource::Enrolled,
         })
         .expect("operator credential enrollment must succeed with the page-displayed values");
 

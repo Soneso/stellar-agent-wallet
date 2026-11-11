@@ -32,11 +32,14 @@
 //! [`ConsentAuthorization::Standard`] approver refuses with
 //! `approval.presence_required` before the key is read, a row is written or
 //! anything is persisted, in every build. The mainnet path rechecks the
-//! locked entry against the challenged snapshot, reloads the current policy,
-//! verifies the receipt again, checks both challenge deadlines immediately
-//! before the row, and records a version 5 attestation with its receipt.
+//! locked entry against the challenged snapshot and reloads the current policy.
+//! It refuses a receipt whose signed-origin listener serves another policy.
+//! It verifies the receipt again and checks both challenge deadlines immediately
+//! before the row. It records a version 5 attestation with its receipt. The
+//! remote surface records mainnet consent only from the signed-origin
+//! listener.
 //! After the row is durable, the keyring anchor advance and store record can
-//! wait on the keyring, and every consumer rechecks the entry's expiry and
+//! wait on the keyring. Every consumer rechecks the entry's expiry and
 //! the current policy at consumption.
 
 use base64::Engine as _;
@@ -88,7 +91,9 @@ pub enum Surface {
     /// A resident, server-driven approve surface reachable from beyond
     /// loopback, authenticated by a passkey-authenticated
     /// [`super::user_id::ApproverIdentity::PasskeyCredential`] identity
-    /// rather than the OS process boundary.
+    /// rather than the OS process boundary. On mainnet it is the listener of
+    /// the owner-signed approval origin, and a consent from it carries a
+    /// receipt that names that listener's identity.
     ServeRemote,
 }
 
@@ -222,7 +227,7 @@ pub fn load_and_validate_entry(
     Ok(entry)
 }
 
-fn map_clock_error(err: &crate::wallet::WalletLifecycleError) -> WalletError {
+pub(crate) fn map_clock_error(err: &crate::wallet::WalletLifecycleError) -> WalletError {
     WalletError::Approval(ApprovalFailure::ClockError {
         detail: format!("system clock error: {err}"),
     })
@@ -512,9 +517,11 @@ pub enum ConsentAuthorization<'a> {
 /// pairing refuses with `approval.user_mismatch` before anything is written.
 /// A mainnet binding refuses `Standard` with `approval.presence_required`
 /// before anything else. [`ConsentAuthorization::Mainnet`] is admitted on a
-/// mainnet binding only, from every surface but [`Surface::ServeRemote`],
-/// for a payment, claim, trustline, x402 payment or trustline clawback
-/// opt-in; the module documentation describes its checks.
+/// mainnet binding only, for a payment, claim, trustline, x402 payment or
+/// trustline clawback opt-in; the module documentation describes its checks.
+/// From [`Surface::ServeRemote`] it is admitted only for a receipt that names
+/// a signed-origin listener's identity. Every receipt that names one must
+/// name the current policy's digest and certificate pin.
 ///
 /// # Errors
 ///
@@ -537,10 +544,14 @@ pub enum ConsentAuthorization<'a> {
 /// - A refused consent row, with the `audit.*` code of the refusal.
 /// - A store or `persist_toolset_grant` failure after the row.
 /// - On mainnet: `approval.presence_required` for a standard approver,
-///   `approval.mainnet_remote_unsupported` from the remote surface,
-///   `approval.presence_policy_unavailable` when the current policy cannot be
-///   loaded or differs from the challenged one, `approval.presence_expired`
-///   past a challenge deadline, and `approval.presence_invalid` for a receipt
+///   `approval.mainnet_remote_unsupported` from the remote surface with a
+///   receipt of a loopback ceremony.
+///   `approval.listener_policy_stale` applies to a
+///   receipt whose listener identity names a policy digest or certificate
+///   pin other than the current policy's.
+///   `approval.presence_policy_unavailable` applies when the current policy cannot be
+///   loaded or differs from the challenged one. `approval.presence_expired`
+///   applies past a challenge deadline, and `approval.presence_invalid` for a receipt
 ///   that does not verify again. A mainnet authorization on another chain
 ///   refuses with `approval.binding_mismatch`.
 #[allow(
@@ -981,7 +992,7 @@ fn prepare_attestation<'k>(
 /// the `process_uid`, and both lifetime fields are equal. Each refusal carries the code
 /// [`record_attestation_on_store`] gives for the same condition, so a caller
 /// maps both the same way. No row is written for a refused entry.
-fn refuse_unless_still_pending(
+pub(crate) fn refuse_unless_still_pending(
     store: &PendingApprovalStore,
     validated: &PendingApproval,
     now_ms: u64,
@@ -1087,14 +1098,18 @@ fn mainnet_gated_tool(kind: &ApprovalKind) -> Result<&'static str, WalletError> 
 ///
 /// In order, all before the row:
 ///
-/// 1. The surface is local, the binding is mainnet and names the profile and
-///    chain the challenge bound, and `entry` is the challenged entry.
+/// 1. The surface is local or [`Surface::ServeRemote`] with a signed-origin receipt.
+///    The mainnet binding matches the challenged profile and chain.
+///    The entry matches the challenged entry.
 /// 2. The key is 32 bytes, and the audit sink completes its acquisition,
-///    drain and state waits; the locked store still holds the challenged
+///    drain and state waits. The locked store still holds the challenged
 ///    snapshot: same nonce, kind, process UID and both lifetime fields,
 ///    unattested and live.
-/// 3. The current owner-signed policy, loaded again without advancing the
-///    pin, is `policy` and is the policy the challenge bound.
+/// 3. The current owner-signed policy is loaded again without advancing the
+///    pin. A receipt that names a listener identity must name that policy's
+///    digest and certificate pin, else the listener serves an earlier
+///    policy. The loaded policy is `policy` and is the policy the challenge
+///    bound.
 /// 4. The receipt verifies again over the locked entry: the recomputed
 ///    subject and challenge, the raw assertion under the signed key.
 /// 5. Both challenge deadlines are still live, checked immediately before
@@ -1117,7 +1132,11 @@ fn attest_mainnet_presence(
     policy: &VerifiedPolicy,
     gated_tool: &str,
 ) -> Result<Option<String>, WalletError> {
-    if surface == Surface::ServeRemote {
+    let parts = presence.into_parts();
+    // A remote surface records mainnet consent only from the listener of the
+    // signed origin, whose receipts carry its identity.
+    let listener = parts.receipt.identity();
+    if surface == Surface::ServeRemote && listener.is_none() {
         return Err(WalletError::Approval(
             ApprovalFailure::MainnetRemoteUnsupported,
         ));
@@ -1130,7 +1149,6 @@ fn attest_mainnet_presence(
     if binding.chain_id != MAINNET_CHAIN_ID {
         return Err(mismatch());
     }
-    let parts = presence.into_parts();
     if parts.profile_name != binding.profile_name
         || parts.chain_id != binding.chain_id
         || parts.entry.approval_nonce != entry.approval_nonce
@@ -1155,6 +1173,15 @@ fn attest_mainnet_presence(
     let loaded =
         super::presence_policy::MainnetApprovalAuthority::for_profile(binding.profile_name)?
             .load_current_compare_only()?;
+    if let Some((pin, listener_digest)) = listener {
+        let current = loaded.policy();
+        let current_pin = current
+            .mainnet()
+            .and_then(|body| body.approval_cert_spki_sha256);
+        if listener_digest != current.digest() || current_pin != Some(pin) {
+            return Err(WalletError::Approval(ApprovalFailure::ListenerPolicyStale));
+        }
+    }
     if !loaded.is(policy) || !super::presence_policy::same_policy(policy, &parts.policy) {
         return Err(WalletError::Approval(
             ApprovalFailure::PresencePolicyUnavailable,

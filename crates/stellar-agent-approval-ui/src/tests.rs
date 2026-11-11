@@ -1975,6 +1975,32 @@ async fn bootstrap_sets_max_age_and_distinct_cookie_names() {
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
 
+/// The secure form of a session cookie is the loopback cookie of the same
+/// session followed by `; Secure`. The loopback
+/// cookie keeps its exact bytes and carries no `Secure`.
+#[test]
+fn secure_session_cookie_adds_only_secure() {
+    for purpose in [SessionPurpose::Inbox, SessionPurpose::MainnetPresence] {
+        let token = OpaqueToken::generate();
+        let hex = token.to_hex();
+        let mut auth = AuthState::new(token, purpose);
+        let now = auth.now();
+        let session = auth.exchange_bootstrap(&hex, now).unwrap();
+        let loopback = auth.set_cookie_value(&session);
+        assert_eq!(
+            loopback,
+            format!(
+                "{}={}; HttpOnly; SameSite=Strict; Path=/; Max-Age=28800",
+                auth.cookie_name(),
+                session.session_id.to_hex()
+            )
+        );
+        assert!(!loopback.contains("Secure"), "{loopback}");
+        let secure = auth.with_secure_cookie().set_cookie_value(&session);
+        assert_eq!(secure, format!("{loopback}; Secure"));
+    }
+}
+
 /// The router holds a session one tick before the idle limit and refuses it
 /// exactly at the limit, on every route, for good.
 #[tokio::test]

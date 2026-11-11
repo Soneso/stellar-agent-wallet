@@ -882,9 +882,23 @@ listener and an optional classic intent. Issue and verification refuse an
 intent for another chain or another record kind with
 `approval.presence_invalid`. A localhost listener names its bound origin. A signed-origin listener names a `ListenerIdentity`, the policy
 digest and pin captured from the policy it serves. When the current policy's
-digest or pin differs, issue refuses with `approval.listener_policy_stale`. No
-listener in this release serves a signed origin, and remote mainnet approval
-still refuses.
+digest or pin differs, issue refuses with `approval.listener_policy_stale`.
+
+Under a policy that signs `approval_origin`, the local inbox and a command's
+consent page refuse to start, and every loopback challenge, page and assertion
+refuses, with `approval.origin_signed_remote`. The consent routes of a
+signed-origin listener load the current policy for each challenge and issue
+it under the listener's `ListenerIdentity`. A policy re-sign after capture
+refuses with `approval.listener_policy_stale` and mints nothing.
+They attribute an inbox consent to the `serve-remote` surface with the mainnet
+passkey approver. A rejection there needs a fresh assertion over the entry's
+challenge, verified as a consent assertion is; the session cookie and the
+CSRF value alone decide nothing. The attester admits the `serve-remote`
+surface only for a receipt that names a listener identity. After it reloads
+the policy and before the row, it refuses every receipt whose listener
+identity names a policy digest or pin other than the current policy's with
+`approval.listener_policy_stale`. No listener in this release serves a signed
+origin, and remote mainnet approval still refuses.
 
 A ceremony without an intent under a localhost policy uses the legacy layout:
 

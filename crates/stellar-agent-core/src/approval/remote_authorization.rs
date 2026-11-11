@@ -304,6 +304,7 @@ mod tests {
                     label: "device".to_owned(),
                     registered_at_unix_ms: 1,
                     sign_count: None,
+                    source: crate::approval::OperatorCredentialSource::Enrolled,
                 })
                 .unwrap();
         }

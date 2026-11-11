@@ -146,6 +146,7 @@ fn rejected_input_operator_public_key() {
                 label: "test".to_owned(),
                 registered_at_unix_ms: 1,
                 sign_count: None,
+                source: stellar_agent_core::approval::OperatorCredentialSource::Enrolled,
             })
             .expect_err("invalid SEC1 prefix");
         assert!(matches!(

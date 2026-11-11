@@ -261,6 +261,7 @@ impl ConfirmedOperatorEnrollment {
             label: registration.label().to_owned(),
             registered_at_unix_ms,
             sign_count: Some(registration.sign_count()),
+            source: stellar_agent_core::approval::OperatorCredentialSource::Enrolled,
         };
         store.enroll(credential.clone())?;
         Ok(credential)

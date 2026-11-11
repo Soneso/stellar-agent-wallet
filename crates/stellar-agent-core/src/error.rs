@@ -763,6 +763,46 @@ pub enum ApprovalFailure {
         "The approval listener serves an earlier owner-signed mainnet policy; restart it under the current policy."
     )]
     ListenerPolicyStale,
+    /// The leaf certificate a signed-origin listener would serve does not
+    /// match the certificate pin of the owner-signed policy.
+    ///
+    /// # Wire code
+    ///
+    /// `"approval.cert_pin_mismatch"`.
+    #[error(
+        "The served certificate does not match the owner-signed pin; install the pinned certificate or sign a new pin."
+    )]
+    CertPinMismatch,
+    /// The profile's remote approval `rp_id` is not the host of the
+    /// owner-signed approval origin.
+    ///
+    /// # Wire code
+    ///
+    /// `"approval.origin_profile_mismatch"`.
+    #[error(
+        "The profile's remote approval rp_id is not the host of the owner-signed approval origin."
+    )]
+    OriginProfileMismatch,
+    /// A local consent page or command ceremony reached a mainnet consent
+    /// whose owner-signed policy names an approval origin, where only the
+    /// signed origin serves consent.
+    ///
+    /// # Wire code
+    ///
+    /// `"approval.origin_signed_remote"`.
+    #[error(
+        "The owner-signed policy serves mainnet consent at its approval origin; approve there."
+    )]
+    OriginSignedRemote,
+    /// Another approval listener holds the remote approval socket.
+    ///
+    /// # Wire code
+    ///
+    /// `"approval.listener_busy"`.
+    #[error(
+        "Another approval listener holds the remote approval socket; approve in the running inbox."
+    )]
+    ListenerBusy,
     /// No local browser with WebAuthn user verification can run the
     /// ceremony.
     ///
@@ -839,6 +879,10 @@ impl ApprovalFailure {
             Self::PresenceConsumed => "approval.presence_consumed",
             Self::PresencePolicyUnavailable => "approval.presence_policy_unavailable",
             Self::ListenerPolicyStale => "approval.listener_policy_stale",
+            Self::CertPinMismatch => "approval.cert_pin_mismatch",
+            Self::OriginProfileMismatch => "approval.origin_profile_mismatch",
+            Self::OriginSignedRemote => "approval.origin_signed_remote",
+            Self::ListenerBusy => "approval.listener_busy",
             Self::PresenceBrowserRequired => "approval.presence_browser_required",
             Self::PresenceUnavailable => "approval.presence_unavailable",
             Self::PresenceCanceled => "approval.presence_canceled",
@@ -6455,6 +6499,26 @@ mod tests {
                 ApprovalFailure::ListenerPolicyStale,
                 "approval.listener_policy_stale",
                 "The approval listener serves an earlier owner-signed mainnet policy; restart it under the current policy.",
+            ),
+            (
+                ApprovalFailure::CertPinMismatch,
+                "approval.cert_pin_mismatch",
+                "The served certificate does not match the owner-signed pin; install the pinned certificate or sign a new pin.",
+            ),
+            (
+                ApprovalFailure::OriginProfileMismatch,
+                "approval.origin_profile_mismatch",
+                "The profile's remote approval rp_id is not the host of the owner-signed approval origin.",
+            ),
+            (
+                ApprovalFailure::OriginSignedRemote,
+                "approval.origin_signed_remote",
+                "The owner-signed policy serves mainnet consent at its approval origin; approve there.",
+            ),
+            (
+                ApprovalFailure::ListenerBusy,
+                "approval.listener_busy",
+                "Another approval listener holds the remote approval socket; approve in the running inbox.",
             ),
             (
                 ApprovalFailure::PresenceBrowserRequired,

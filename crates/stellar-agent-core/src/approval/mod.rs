@@ -115,7 +115,7 @@ pub use intent::{
     IntentPayload, MemoFact,
 };
 pub use operator_credentials::{
-    OperatorApprovalCredential, OperatorApprovalCredentialStore,
+    OperatorApprovalCredential, OperatorApprovalCredentialStore, OperatorCredentialSource,
     default_operator_approval_credentials_path,
 };
 pub use presence::{

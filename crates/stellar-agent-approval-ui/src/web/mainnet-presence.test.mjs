@@ -113,14 +113,17 @@ function bareReply(status) {
   return Promise.resolve({ ok: false, status, json: () => Promise.reject(new SyntaxError("Unexpected token N in JSON at position 0")) });
 }
 // The consent page of `mode`: the ceremony of one command ("one_shot", with
-// Cancel) or the inbox ("inbox", with Reject). `replies` maps the action a
-// POST names to its reply.
-function consentPage({ webauthn = true, failure, mode = "one_shot", replies = {} } = {}) {
+// Cancel) or the inbox ("inbox", with Reject), served at a signed approval
+// origin when `signedOrigin` is set. `replies` maps the action a POST names to
+// its reply.
+function consentPage({ webauthn = true, failure, mode = "one_shot", replies = {}, signedOrigin = false } = {}) {
   const raw = Uint8Array.of(1, 2, 3).buffer;
   const storageKey = mode === "inbox" ? INBOX_KEY : CONSENT_KEY;
+  const island = { nonce: "nonce", csrf: "csrf", consent_view_digest: "digest", storageKey, mode };
+  if (signedOrigin) island.signed_origin = true;
   const page = browser({
     webauthn,
-    islands: { "presence-data": { nonce: "nonce", csrf: "csrf", consent_view_digest: "digest", storageKey, mode } },
+    islands: { "presence-data": island },
     elements: ["presence-approve", mode === "inbox" ? "presence-reject" : "presence-cancel", "presence-result"],
     storage: { [storageKey]: PROOF },
     reply: (url) => {
@@ -250,4 +253,33 @@ test("a challenge reply that carries an entry outcome is rendered as not recorde
   await page.byId["presence-approve"].listeners.click[0]({ isTrusted: true });
   assert.equal(page.credentialCalls.length, 0);
   assert.equal(page.byId["presence-result"].children[0].textContent, "Not recorded: expired");
+});
+test("a signed-origin Reject runs the ceremony and posts its assertion with the rejection", async () => {
+  const signed = { ...CHALLENGE_REPLY, rp_id: "approve.example.invalid" };
+  const page = consentPage({ mode: "inbox", signedOrigin: true, replies: { challenge: () => jsonReply(200, signed), reject: () => jsonReply(200, { status: "rejected" }) } });
+  page.run("./mainnet-presence.js");
+  await page.byId["presence-reject"].listeners.click[0]({ isTrusted: false });
+  assert.equal(page.fetches.length, 0);
+  await page.byId["presence-reject"].listeners.click[0]({ isTrusted: true });
+  assert.equal(page.credentialCalls.length, 1);
+  assert.equal(page.credentialCalls[0].publicKey.rpId, "approve.example.invalid");
+  assert.equal(page.credentialCalls[0].publicKey.userVerification, "required");
+  assert.deepEqual(page.fetches.map(({ url }) => url), ["/approval/nonce/challenge", "/approval/nonce/reject"]);
+  const [challenge, posted] = page.fetches;
+  assert.deepEqual(JSON.parse(challenge.init.body), { consent_view_digest: "digest" });
+  assert.deepEqual(JSON.parse(posted.init.body), { request_id: "request", credential_id_b64url: "AQID", authenticator_data_b64url: "AQID", client_data_json_b64url: "AQID", signature_der_b64url: "AQID" });
+  assert.equal(posted.init.headers["X-Stellar-Approval-CSRF"], "csrf");
+  assert.equal(posted.init.headers["X-Session-Proof"], PROOF);
+  const result = page.byId["presence-result"];
+  assert.equal(result.className, "result refused");
+  assert.equal(result.children[0].textContent, "Not recorded: rejected");
+  assert.equal(page.byId["presence-approve"].disabled, true);
+});
+test("a signed-origin Reject whose ceremony is canceled posts no rejection", async () => {
+  const page = consentPage({ mode: "inbox", signedOrigin: true, failure: "NotAllowedError" });
+  page.run("./mainnet-presence.js");
+  await page.byId["presence-reject"].listeners.click[0]({ isTrusted: true });
+  assert.ok(page.fetches.every(({ url }) => !url.endsWith("/reject")));
+  assert.equal(JSON.parse(page.fetches.at(-1).init.body).reason, "authenticator_canceled");
+  assert.notEqual(page.byId["presence-approve"].disabled, true);
 });

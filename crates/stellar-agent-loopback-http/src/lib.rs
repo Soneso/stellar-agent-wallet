@@ -42,6 +42,10 @@
 //! serves over TLS on a private network rather than loopback; it uses the same
 //! response headers and the same brand surface, so it depends on this crate
 //! too.
+//!
+//! [`signed_origin`] holds the `Host` and `Origin` layers of a listener served
+//! at one owner-signed HTTPS origin, which admit that origin's exact bytes in
+//! place of the loopback forms.
 
 #![forbid(unsafe_code)]
 
@@ -52,7 +56,9 @@ pub mod loopback_pair;
 pub mod origin_header;
 pub mod request_trace;
 pub mod security_headers;
+pub mod signed_origin;
 
 pub use loopback_pair::{
     LoopbackFamily, LoopbackPair, PAIR_BIND_ATTEMPTS, PairBindError, PairServer,
 };
+pub use signed_origin::{SignedHostLayer, SignedOriginLayer};

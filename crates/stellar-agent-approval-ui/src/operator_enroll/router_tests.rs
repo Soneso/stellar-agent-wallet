@@ -965,6 +965,7 @@ async fn post_duplicate_credential_id_is_refused_without_consuming_the_latch() {
         label: "existing".to_owned(),
         registered_at_unix_ms: 1,
         sign_count: None,
+        source: stellar_agent_core::approval::OperatorCredentialSource::Enrolled,
     });
     let (cookie, csrf) = h.establish_session().await;
     let challenge = h.challenge(&cookie, &csrf).await;

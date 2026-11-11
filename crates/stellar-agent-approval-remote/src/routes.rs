@@ -378,7 +378,7 @@ async fn login_assertion_post(
         return assertion_invalid();
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "test-helpers"))]
     login_hook::fire();
     if !authorize(&state, &credential_id) {
         return assertion_invalid();
@@ -400,7 +400,7 @@ async fn login_assertion_post(
     resp
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "test-helpers"))]
 pub(crate) mod login_hook {
     //! Runs a test action after a login assertion verified and its counter
     //! was recorded, right before the final authorization read, standing in
@@ -988,6 +988,7 @@ mod tests {
                 label: "second-device".to_owned(),
                 registered_at_unix_ms: 1_750_000_000_000,
                 sign_count: None,
+                source: stellar_agent_core::approval::OperatorCredentialSource::Enrolled,
             })
             .unwrap();
             second
@@ -1050,6 +1051,7 @@ mod tests {
                 label: "test-device".to_owned(),
                 registered_at_unix_ms: 1_750_000_000_000,
                 sign_count: None,
+                source: stellar_agent_core::approval::OperatorCredentialSource::Enrolled,
             })
             .unwrap();
 
@@ -2405,6 +2407,7 @@ mod tests {
                 label: "test-device".to_owned(),
                 registered_at_unix_ms: 1_750_000_000_000,
                 sign_count: None,
+                source: stellar_agent_core::approval::OperatorCredentialSource::Enrolled,
             })
             .unwrap();
     }

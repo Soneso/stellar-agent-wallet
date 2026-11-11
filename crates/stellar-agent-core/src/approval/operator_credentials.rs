@@ -21,6 +21,18 @@
 //! and the sign counter (for cloned-authenticator detection); it does not
 //! itself decide who may attest.
 //!
+//! # Policy counter rows
+//!
+//! A credential the owner-signed mainnet policy lists is authorized by that
+//! signature alone. [`OperatorApprovalCredentialStore::check_policy_sign_count`]
+//! keeps its sign counter in a row whose [`OperatorApprovalCredential::source`]
+//! is [`OperatorCredentialSource::Policy`], created at the first verified
+//! assertion. Such a row grants no trust: [`OperatorApprovalCredentialStore::list`]
+//! and [`OperatorApprovalCredentialStore::find_by_credential_id`] skip it, and
+//! only the counter method reads it. Every other method acts on enrolled rows
+//! alone, so an enrolled row and a policy row of one credential ID are two
+//! independent records.
+//!
 //! # On-disk format
 //!
 //! Stored as `<dir>/<profile>.toml` with mode `0o600` on Unix, written
@@ -31,13 +43,13 @@
 //! # Write serialization
 //!
 //! Every mutation ([`OperatorApprovalCredentialStore::enroll`],
-//! [`OperatorApprovalCredentialStore::update_sign_count`] and
+//! [`OperatorApprovalCredentialStore::update_sign_count`],
+//! [`OperatorApprovalCredentialStore::check_policy_sign_count`] and
 //! [`OperatorApprovalCredentialStore::remove`]) holds an exclusive advisory
-//! lock on the sidecar `<profile>.toml.lock` file from before it loads the
-//! registry until after the replacement file is renamed into place. The
-//! sidecar is never deleted and never replaced, so every writer locks the
-//! same inode; the TOML file itself is replaced on each write and is never
-//! the lock target. Two concurrent writers therefore always see each other's
+//! lock on the sidecar `<profile>.toml.lock` file. The lock covers the registry
+//! load through the replacement file rename. The sidecar stays at the same
+//! inode, so every writer locks that inode. The TOML file is replaced on each
+//! write and is never the lock target. Two concurrent writers therefore always see each other's
 //! successful writes: an enrollment is never lost, a removal is never
 //! undone, and a stored sign counter never decreases. A writer that cannot
 //! take the lock within a short bounded retry refuses with
@@ -54,6 +66,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde::{Deserialize, Serialize};
 
 use super::error::{ApprovalError, toml_error_position};
+use super::presence::MainnetApprovalCredential;
 use super::store::{LockHandle, lock_path};
 use crate::redact_first5_last5;
 
@@ -92,7 +105,9 @@ const WRITE_LOCK_BACKOFF: Duration = Duration::from_millis(20);
 /// `registered_at_unix_ms` are always required for a non-corrupt registry
 /// entry. `sign_count` is additive (`#[serde(default)]`): absent in registry
 /// entries written before sign-counter tracking existed, treated as "counter
-/// unsupported or not yet observed" on load.
+/// unsupported or not yet observed" on load. `source` is additive too:
+/// absent means [`OperatorCredentialSource::Enrolled`], and an enrolled row
+/// is written without it, so every enrolled row keeps its bytes.
 ///
 /// # Debug redaction
 ///
@@ -177,7 +192,38 @@ pub struct OperatorApprovalCredential {
     /// refused (never silently accepted), and the operator re-enrolls.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sign_count: Option<u32>,
+
+    /// Where the row comes from: an enrollment, or the sign counter of a
+    /// credential the owner-signed mainnet policy lists. A policy row grants
+    /// no trust (see the module documentation).
+    #[serde(default, skip_serializing_if = "OperatorCredentialSource::is_enrolled")]
+    pub source: OperatorCredentialSource,
 }
+
+/// The origin of an [`OperatorApprovalCredential`] row.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+#[non_exhaustive]
+pub enum OperatorCredentialSource {
+    /// An operator enrollment, the only source the allowlist checks consult.
+    #[default]
+    Enrolled,
+    /// The sign counter of a credential the owner-signed mainnet policy
+    /// lists; written only by
+    /// [`OperatorApprovalCredentialStore::check_policy_sign_count`].
+    Policy,
+}
+
+impl OperatorCredentialSource {
+    /// Whether this is [`Self::Enrolled`], which a serialized row omits.
+    #[must_use]
+    pub fn is_enrolled(&self) -> bool {
+        *self == Self::Enrolled
+    }
+}
+
+/// The label of a policy counter row.
+const POLICY_ROW_LABEL: &str = "policy-credential";
 
 impl std::fmt::Debug for OperatorApprovalCredential {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -191,6 +237,7 @@ impl std::fmt::Debug for OperatorApprovalCredential {
             .field("label", &self.label)
             .field("registered_at_unix_ms", &self.registered_at_unix_ms)
             .field("sign_count", &self.sign_count)
+            .field("source", &self.source)
             .finish()
     }
 }
@@ -436,17 +483,23 @@ impl OperatorApprovalCredentialStore {
         Ok(value)
     }
 
-    /// Returns all enrolled operator-approval credentials.
+    /// Returns all enrolled operator-approval credentials. Policy counter
+    /// rows are not enrollments and are never returned.
     ///
     /// # Errors
     ///
     /// Returns [`ApprovalError`] on registry I/O or parse failure.
     pub fn list(&self) -> Result<Vec<OperatorApprovalCredential>, ApprovalError> {
-        Ok(self.load()?.credentials)
+        Ok(self
+            .load()?
+            .credentials
+            .into_iter()
+            .filter(|c| c.source.is_enrolled())
+            .collect())
     }
 
     /// Returns the enrolled credential matching `credential_id_b64url`, if
-    /// any.
+    /// any. A policy counter row under that ID is never returned.
     ///
     /// # Errors
     ///
@@ -459,7 +512,7 @@ impl OperatorApprovalCredentialStore {
             .load()?
             .credentials
             .into_iter()
-            .find(|c| c.credential_id_b64url == credential_id_b64url))
+            .find(|c| c.source.is_enrolled() && c.credential_id_b64url == credential_id_b64url))
     }
 
     /// Enrolls a new operator-approval credential and persists the store.
@@ -481,9 +534,11 @@ impl OperatorApprovalCredentialStore {
     /// # Errors
     ///
     /// - [`ApprovalError::Invalid`] if `credential.credential_id_b64url` or
-    ///   `credential.public_key_sec1_b64` fails format validation, or if
-    ///   `credential.label` holds a control character. The check runs before
-    ///   the write lock is taken; nothing is created or written.
+    ///   `credential.public_key_sec1_b64` fails format validation, if
+    ///   `credential.label` holds a control character, or if
+    ///   `credential.source` is not [`OperatorCredentialSource::Enrolled`].
+    ///   The check runs before the write lock is taken; nothing is created
+    ///   or written.
     /// - [`ApprovalError::DuplicateCredentialId`] if a credential with the
     ///   same `credential_id_b64url` is already enrolled. [`Self::remove`] it
     ///   first to re-enroll under the same ID.
@@ -501,13 +556,16 @@ impl OperatorApprovalCredentialStore {
                 reason: "the label holds a control character".to_owned(),
             });
         }
+        if !credential.source.is_enrolled() {
+            return Err(ApprovalError::Invalid {
+                reason: "an enrollment records an enrolled credential".to_owned(),
+            });
+        }
 
         self.with_write_lock(|file| {
-            if file
-                .credentials
-                .iter()
-                .any(|c| c.credential_id_b64url == credential.credential_id_b64url)
-            {
+            if file.credentials.iter().any(|c| {
+                c.source.is_enrolled() && c.credential_id_b64url == credential.credential_id_b64url
+            }) {
                 return Err(ApprovalError::duplicate_credential_id(
                     &credential.credential_id_b64url,
                 ));
@@ -555,7 +613,7 @@ impl OperatorApprovalCredentialStore {
             let record = file
                 .credentials
                 .iter_mut()
-                .find(|c| c.credential_id_b64url == credential_id_b64url)
+                .find(|c| c.source.is_enrolled() && c.credential_id_b64url == credential_id_b64url)
                 .ok_or(ApprovalError::NotFound)?;
 
             if let Some(stored) = record.sign_count
@@ -574,6 +632,71 @@ impl OperatorApprovalCredentialStore {
         })
     }
 
+    /// Checks and records the sign counter of an assertion `credential`, a
+    /// credential the owner-signed mainnet policy lists, verified at the
+    /// relying party `rp_id`.
+    ///
+    /// Under the store's write lock, a credential without a policy row gets
+    /// one: its ID and key, `rp_id`, the label `policy-credential`, the
+    /// current time as `registered_at_unix_ms`, `presented_counter` and
+    /// [`OperatorCredentialSource::Policy`]. A credential with a policy row
+    /// runs the regression check of [`Self::update_sign_count`] against that
+    /// row and stores the presented counter. Enrolled rows are neither read
+    /// nor written. The row authorizes nothing; the signed policy is the
+    /// whole authority.
+    ///
+    /// # Errors
+    ///
+    /// - [`ApprovalError::SignCounterRegression`] when the presented counter
+    ///   does not strictly exceed a stored counter and either of them is not
+    ///   `0`; nothing is written.
+    /// - [`ApprovalError::Io`] when the clock cannot be read.
+    /// - [`ApprovalError::WriterLocked`] if another writer holds the store's
+    ///   write lock; nothing is written.
+    /// - [`ApprovalError::Io`] / [`ApprovalError::Toml`] on persistence
+    ///   failure.
+    pub fn check_policy_sign_count(
+        &self,
+        credential: &MainnetApprovalCredential,
+        rp_id: &str,
+        presented_counter: u32,
+    ) -> Result<(), ApprovalError> {
+        let now_ms = crate::timefmt::now_unix_ms().map_err(|e| ApprovalError::Io {
+            kind: std::io::ErrorKind::Other,
+            source: std::io::Error::other(format!("system clock error: {e}")),
+        })?;
+        let credential_id_b64url = credential.credential_id_b64url();
+        self.with_write_lock(|file| {
+            let Some(record) = file.credentials.iter_mut().find(|c| {
+                c.source == OperatorCredentialSource::Policy
+                    && c.credential_id_b64url == credential_id_b64url
+            }) else {
+                file.credentials.push(OperatorApprovalCredential {
+                    credential_id_b64url,
+                    public_key_sec1_b64: credential.public_key_sec1_b64url(),
+                    rp_id: rp_id.to_owned(),
+                    label: POLICY_ROW_LABEL.to_owned(),
+                    registered_at_unix_ms: now_ms,
+                    sign_count: Some(presented_counter),
+                    source: OperatorCredentialSource::Policy,
+                });
+                return Ok(());
+            };
+            if let Some(stored) = record.sign_count
+                && (stored != 0 || presented_counter != 0)
+                && presented_counter <= stored
+            {
+                return Err(ApprovalError::sign_counter_regression(
+                    &credential_id_b64url,
+                    presented_counter,
+                    stored,
+                ));
+            }
+            record.sign_count = Some(presented_counter);
+            Ok(())
+        })
+    }
+
     /// Removes the enrolled credential `credential_id_b64url`.
     ///
     /// Returns `true` when a record was removed and `false` when none was
@@ -584,7 +707,7 @@ impl OperatorApprovalCredentialStore {
     /// Removal deletes the enrollment only. The profile's
     /// `RemoteApprovalConfig::allowed_credentials` list is a separate file
     /// this method never edits; an allowlisted ID with no enrolled record
-    /// authorizes nothing.
+    /// authorizes nothing. A policy counter row under the ID stays.
     ///
     /// # Errors
     ///
@@ -597,7 +720,7 @@ impl OperatorApprovalCredentialStore {
         let mut file = self.load()?;
         let before = file.credentials.len();
         file.credentials
-            .retain(|c| c.credential_id_b64url != credential_id_b64url);
+            .retain(|c| !c.source.is_enrolled() || c.credential_id_b64url != credential_id_b64url);
         if file.credentials.len() == before {
             return Ok(false);
         }
@@ -735,6 +858,7 @@ mod tests {
             label: label.to_owned(),
             registered_at_unix_ms: 1_750_000_000_000,
             sign_count: None,
+            source: OperatorCredentialSource::Enrolled,
         }
     }
 
@@ -1042,6 +1166,214 @@ mod tests {
         let second_result = second.join().unwrap();
         test_hooks::clear(path);
         (first_result, second_result)
+    }
+
+    // ── Policy counter rows ─────────────────────────────────────────────────
+
+    /// The relying party the policy counter tests record.
+    const SIGNED_HOST: &str = "approve.example.invalid";
+
+    /// A policy credential: the test-support authenticator's key under
+    /// `credential_id`.
+    fn policy_credential(credential_id: &[u8]) -> MainnetApprovalCredential {
+        let authenticator = stellar_agent_test_support::webauthn::fixture_authenticator();
+        MainnetApprovalCredential::from_raw(credential_id, &authenticator.public_key_sec1())
+            .unwrap()
+    }
+
+    /// Every row of the file at `path`, policy rows included.
+    fn all_rows(path: &Path) -> Vec<OperatorApprovalCredential> {
+        OperatorApprovalCredentialStore::new(path.to_path_buf())
+            .load()
+            .unwrap()
+            .credentials
+    }
+
+    /// An absent policy row is created with its metadata. A regression, an
+    /// equal nonzero counter and zero after nonzero refuse and write nothing.
+    /// Zero after zero passes, and two overlapping checks lose no update.
+    #[test]
+    fn sign_counter_create_check_update_matrix() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("default.toml");
+        let store = OperatorApprovalCredentialStore::new(path.clone());
+        let credential = policy_credential(&[0x31; 16]);
+        let before = crate::timefmt::now_unix_ms().unwrap();
+        store
+            .check_policy_sign_count(&credential, SIGNED_HOST, 5)
+            .unwrap();
+        let after = crate::timefmt::now_unix_ms().unwrap();
+        let rows = all_rows(&path);
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row.credential_id_b64url, credential.credential_id_b64url());
+        assert_eq!(row.public_key_sec1_b64, credential.public_key_sec1_b64url());
+        assert_eq!(row.rp_id, SIGNED_HOST);
+        assert_eq!(row.label, "policy-credential");
+        assert!((before..=after).contains(&row.registered_at_unix_ms));
+        assert_eq!(row.sign_count, Some(5));
+        assert_eq!(row.source, OperatorCredentialSource::Policy);
+
+        for presented in [4, 5, 0] {
+            let bytes = fs::read(&path).unwrap();
+            assert!(
+                matches!(
+                    store.check_policy_sign_count(&credential, SIGNED_HOST, presented),
+                    Err(ApprovalError::SignCounterRegression { .. })
+                ),
+                "{presented}"
+            );
+            assert_eq!(fs::read(&path).unwrap(), bytes, "{presented}");
+        }
+        store
+            .check_policy_sign_count(&credential, "another.example.invalid", 6)
+            .unwrap();
+        let rows = all_rows(&path);
+        assert_eq!(rows[0].sign_count, Some(6));
+        assert_eq!(rows[0].rp_id, SIGNED_HOST);
+        assert_eq!(rows[0].registered_at_unix_ms, row.registered_at_unix_ms);
+
+        let zero = policy_credential(&[0x32; 16]);
+        for _ in 0..2 {
+            store
+                .check_policy_sign_count(&zero, SIGNED_HOST, 0)
+                .unwrap();
+        }
+        store
+            .check_policy_sign_count(&zero, SIGNED_HOST, 1)
+            .unwrap();
+        let rows = all_rows(&path);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[1].sign_count, Some(1));
+
+        for (first_counter, second_counter) in [(7_u32, 5_u32), (5, 7)] {
+            let dir = tempfile::TempDir::new().unwrap();
+            let path = dir.path().join("default.toml");
+            let first_store = OperatorApprovalCredentialStore::new(path.clone());
+            let second_store = OperatorApprovalCredentialStore::new(path.clone());
+            let (first, second) = interleave(
+                &path,
+                move || {
+                    first_store.check_policy_sign_count(
+                        &policy_credential(&[0x33; 16]),
+                        SIGNED_HOST,
+                        first_counter,
+                    )
+                },
+                move || {
+                    second_store.check_policy_sign_count(
+                        &policy_credential(&[0x33; 16]),
+                        SIGNED_HOST,
+                        second_counter,
+                    )
+                },
+            );
+            first.unwrap();
+            if second_counter < first_counter {
+                assert!(
+                    matches!(second, Err(ApprovalError::SignCounterRegression { .. })),
+                    "{second:?}"
+                );
+            } else {
+                second.unwrap();
+            }
+            let rows = all_rows(&path);
+            assert_eq!(rows.len(), 1, "one row for one credential");
+            assert_eq!(rows[0].sign_count, Some(first_counter.max(second_counter)));
+        }
+    }
+
+    /// A policy row grants no trust: `list` and `find_by_credential_id` never
+    /// return it, and the enrollment methods never act on it. Enrolled rows
+    /// keep their bytes, written without the source field.
+    #[test]
+    fn policy_counter_row_grants_no_trust() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("default.toml");
+        let store = OperatorApprovalCredentialStore::new(path.clone());
+        let enrolled = make_credential(50, "laptop");
+        store.enroll(enrolled.clone()).unwrap();
+        let stored = fs::read_to_string(&path).unwrap();
+        assert!(!stored.contains("source"), "{stored}");
+        store.with_write_lock(|_| Ok(())).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), stored);
+        let reloaded = store.list().unwrap();
+        assert_eq!(reloaded, vec![enrolled.clone()]);
+        assert_eq!(reloaded[0].source, OperatorCredentialSource::Enrolled);
+
+        let policy_only = policy_credential(&[0x41; 16]);
+        let shared = policy_credential(&[0x42; 16]);
+        let enrolled_shared = OperatorApprovalCredential {
+            credential_id_b64url: shared.credential_id_b64url(),
+            public_key_sec1_b64: shared.public_key_sec1_b64url(),
+            rp_id: "wallet.internal".to_owned(),
+            label: "phone".to_owned(),
+            registered_at_unix_ms: 1_750_000_000_000,
+            sign_count: Some(100),
+            source: OperatorCredentialSource::Enrolled,
+        };
+        store
+            .check_policy_sign_count(&policy_only, SIGNED_HOST, 3)
+            .unwrap();
+        store
+            .check_policy_sign_count(&shared, SIGNED_HOST, 4)
+            .unwrap();
+        store.enroll(enrolled_shared.clone()).unwrap();
+        assert_eq!(all_rows(&path).len(), 4);
+        let written = fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            written.matches("source = \"policy\"").count(),
+            2,
+            "{written}"
+        );
+        store.with_write_lock(|_| Ok(())).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), written);
+
+        assert_eq!(
+            store.list().unwrap(),
+            vec![enrolled.clone(), enrolled_shared.clone()]
+        );
+        assert!(
+            store
+                .find_by_credential_id(&policy_only.credential_id_b64url())
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            store
+                .find_by_credential_id(&shared.credential_id_b64url())
+                .unwrap(),
+            Some(enrolled_shared.clone())
+        );
+        assert!(matches!(
+            store.update_sign_count(&policy_only.credential_id_b64url(), 9),
+            Err(ApprovalError::NotFound)
+        ));
+        assert!(!store.remove(&policy_only.credential_id_b64url()).unwrap());
+        assert!(store.remove(&shared.credential_id_b64url()).unwrap());
+        store
+            .check_policy_sign_count(&shared, SIGNED_HOST, 5)
+            .unwrap();
+        let policy_rows: Vec<_> = all_rows(&path)
+            .into_iter()
+            .filter(|row| row.source == OperatorCredentialSource::Policy)
+            .map(|row| (row.credential_id_b64url, row.sign_count))
+            .collect();
+        assert_eq!(
+            policy_rows,
+            vec![
+                (policy_only.credential_id_b64url(), Some(3)),
+                (shared.credential_id_b64url(), Some(5)),
+            ]
+        );
+
+        let mut forged = make_credential(51, "forged");
+        forged.source = OperatorCredentialSource::Policy;
+        assert!(matches!(
+            store.enroll(forged),
+            Err(ApprovalError::Invalid { .. })
+        ));
+        assert_eq!(store.list().unwrap(), vec![enrolled]);
     }
 
     /// Two enrollments that overlap in time both survive: the second writer

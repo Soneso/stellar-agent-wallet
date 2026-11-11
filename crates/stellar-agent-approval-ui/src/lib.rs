@@ -76,7 +76,10 @@ pub mod decision;
 pub mod error;
 pub mod operator_enroll;
 pub mod presence;
-pub use presence::{MainnetPresenceConfig, MainnetPresenceHandle, start_mainnet_presence};
+pub use presence::{
+    ConsentSessionGate, MainnetPresenceConfig, MainnetPresenceHandle, PresenceCompletion,
+    SignedOriginConsent, SignedOriginMode, signed_origin_consent, start_mainnet_presence,
+};
 
 mod auth;
 mod routes;
@@ -324,6 +327,11 @@ impl ServeHandle {
 ///   (port in use, permission, etc.).
 /// - [`ServeStartError::LoopbackPair`]: a mainnet inbox could not hold both
 ///   loopback addresses on the port.
+/// - [`ServeStartError::Presence`]: the current owner-signed policy of a
+///   mainnet inbox cannot be verified
+///   ([`PresenceStartRefusal::PolicyUnavailable`]) or names an approval
+///   origin, where alone mainnet consent runs
+///   ([`PresenceStartRefusal::OriginSignedRemote`]).
 ///
 /// # Panics
 ///
@@ -364,13 +372,23 @@ pub async fn start_serve(config: ServeConfig) -> Result<ServeHandle, ServeStartE
 
     if mainnet {
         let refused = || ServeStartError::Presence(PresenceStartRefusal::PolicyUnavailable);
-        config
+        let current = config
             .context
             .mainnet_authority
             .as_ref()
             .ok_or_else(refused)?
             .load_current()
             .map_err(|_| refused())?;
+        // A policy with an approval origin serves mainnet consent only there.
+        if current
+            .policy()
+            .mainnet()
+            .is_some_and(|body| body.approval_origin.is_some())
+        {
+            return Err(ServeStartError::Presence(
+                PresenceStartRefusal::OriginSignedRemote,
+            ));
+        }
     }
     let store_path = config.context.store_path.clone();
     let ctx = Arc::new(config.context);

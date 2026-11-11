@@ -685,6 +685,7 @@ async fn post_duplicate_credential_id_is_refused_over_real_server() {
         label: "pre-existing".to_owned(),
         registered_at_unix_ms: 1,
         sign_count: None,
+        source: stellar_agent_core::approval::OperatorCredentialSource::Enrolled,
     };
     store.enroll(seeded.clone()).expect("pre-seed must succeed");
 

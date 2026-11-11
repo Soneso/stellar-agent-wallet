@@ -257,6 +257,9 @@ pub(crate) struct AuthState {
     purpose: SessionPurpose,
     /// The monotonic time source for expiry.
     clock: SessionClock,
+    /// Whether the session cookie carries `Secure`, for a page served over
+    /// HTTPS.
+    secure_cookie: bool,
 }
 
 impl AuthState {
@@ -279,7 +282,22 @@ impl AuthState {
             cookie_name: format!("{}{}", purpose.cookie_name_prefix(), hex::encode(suffix)),
             purpose,
             clock,
+            secure_cookie: false,
         }
+    }
+
+    /// This state with a session cookie that carries `Secure`, for a page
+    /// served over HTTPS; every other attribute is unchanged.
+    #[cfg_attr(
+        not(any(test, feature = "test-helpers")),
+        allow(
+            dead_code,
+            reason = "set only by a listener served over HTTPS; the loopback listeners keep the plain cookie"
+        )
+    )]
+    pub(crate) fn with_secure_cookie(mut self) -> Self {
+        self.secure_cookie = true;
+        self
     }
 
     /// The current monotonic time from this state's clock.
@@ -367,13 +385,19 @@ impl AuthState {
     }
 
     /// The `Set-Cookie` value for `session`: `HttpOnly; SameSite=Strict;
-    /// Path=/` and a `Max-Age` of the absolute limit.
+    /// Path=/` and a `Max-Age` of the absolute limit, then `; Secure` for a
+    /// state made with [`Self::with_secure_cookie`].
     pub(crate) fn set_cookie_value(&self, session: &SessionState) -> String {
-        format!(
+        let cookie = format!(
             "{}={}; HttpOnly; SameSite=Strict; Path=/; Max-Age={SESSION_COOKIE_MAX_AGE_SECS}",
             self.cookie_name,
             session.session_id.to_hex()
-        )
+        );
+        if self.secure_cookie {
+            format!("{cookie}; Secure")
+        } else {
+            cookie
+        }
     }
 }
 
