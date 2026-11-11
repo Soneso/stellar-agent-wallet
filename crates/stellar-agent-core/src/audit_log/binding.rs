@@ -250,6 +250,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::parallel]
     fn the_wire_form_is_the_documented_json() {
         let binding = AuditBinding::for_profile(&profile("/var/log/alice.jsonl"));
         let value: serde_json::Value =
@@ -276,6 +277,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::parallel]
     fn the_digest_follows_the_lexically_normalized_path() {
         let plain = AuditBinding::for_profile(&profile("/var/log/alice.jsonl"));
         let dotted = AuditBinding::for_profile(&profile("/var/log/./x/../alice.jsonl"));
@@ -285,6 +287,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::parallel]
     fn parsing_is_strict() {
         let good = AuditBinding::for_profile(&profile("/a.jsonl")).to_keyring_value();
         assert!(AuditBinding::parse(&good).is_ok());
@@ -318,6 +321,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::parallel]
     fn classification_covers_every_record() {
         let expected = AuditBinding::for_profile(&profile("/a.jsonl"));
         let other = AuditBinding::for_profile(&profile("/b.jsonl"));

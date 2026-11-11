@@ -1154,6 +1154,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::parallel]
     fn claim_leg_outside_the_asset_allowlist_is_a_criterion_denial() {
         use crate::policy::{Decision, DenyReason};
         let intent = fixture("claim_native_memo_none");
@@ -1174,6 +1175,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::parallel]
     fn claim_leg_counts_toward_no_debit_cap() {
         let mut raw = wire(5);
         raw["payload"]["claim"]["amount_stroops"] = json!("1000000000");

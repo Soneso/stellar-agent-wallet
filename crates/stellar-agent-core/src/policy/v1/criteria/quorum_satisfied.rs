@@ -212,6 +212,7 @@ mod tests {
 
     /// Criterion passes when all groups are satisfied.
     #[test]
+    #[serial_test::parallel]
     fn passes_when_quorum_satisfied() {
         let criterion = QuorumSatisfiedCriterion::new();
         let tool = make_tool();
@@ -229,6 +230,7 @@ mod tests {
     /// Criterion returns QuorumNotSatisfied with And combinator when groups
     /// are short.
     #[test]
+    #[serial_test::parallel]
     fn denies_when_and_groups_unsatisfied() {
         let criterion = QuorumSatisfiedCriterion::new();
         let tool = make_tool();
@@ -257,6 +259,7 @@ mod tests {
     /// Criterion returns QuorumNotSatisfied with Or combinator when no group
     /// is satisfied.
     #[test]
+    #[serial_test::parallel]
     fn denies_when_or_no_group_satisfied() {
         let criterion = QuorumSatisfiedCriterion::new();
         let tool = make_tool();
@@ -285,6 +288,7 @@ mod tests {
     /// Criterion returns CriterionEvaluationFailed (fail-closed) when quorum
     /// view is absent.
     #[test]
+    #[serial_test::parallel]
     fn fails_closed_when_quorum_view_absent() {
         let criterion = QuorumSatisfiedCriterion::new();
         let tool = make_tool();

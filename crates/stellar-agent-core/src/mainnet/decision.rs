@@ -470,6 +470,7 @@ mod tests {
     /// both evaluation paths, through escalation and denial; the default-deny
     /// names no rule.
     #[test]
+    #[serial_test::parallel]
     fn mainnet_decision_carries_the_document_ordinal() {
         let policy = policy();
         for valued in [false, true] {
@@ -514,6 +515,7 @@ mod tests {
     /// profile, the caller's chain and scope, the supplied instant, and the
     /// governing lifetime of its decision kind.
     #[test]
+    #[serial_test::parallel]
     fn mainnet_decision_records_its_provenance() {
         let policy = policy();
         let allowed = evaluate(&policy, "stellar_pay", 50, false).unwrap();
@@ -579,6 +581,7 @@ mod tests {
 
     /// An engine failure is `Engine`, never a decision.
     #[test]
+    #[serial_test::parallel]
     fn an_engine_failure_is_an_engine_refusal() {
         let policy = policy();
         let descriptor = tool("stellar_pay");

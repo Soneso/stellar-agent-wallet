@@ -237,6 +237,7 @@ mod tests {
 
     /// Single-tx path passes unconditionally.
     #[test]
+    #[serial_test::parallel]
     fn single_tx_bundle_none_passes() {
         let tool = make_tool();
         let profile = make_profile();
@@ -248,6 +249,7 @@ mod tests {
 
     /// Inner under cap passes.
     #[test]
+    #[serial_test::parallel]
     fn inner_under_cap_passes() {
         let tool = make_tool();
         let profile = make_profile();
@@ -265,6 +267,7 @@ mod tests {
 
     /// Inner exactly at cap passes (strict > boundary).
     #[test]
+    #[serial_test::parallel]
     fn inner_exactly_at_cap_passes() {
         let tool = make_tool();
         let profile = make_profile();
@@ -285,6 +288,7 @@ mod tests {
 
     /// First over-cap inner is denied at correct index.
     #[test]
+    #[serial_test::parallel]
     fn first_over_cap_inner_denied_at_correct_index() {
         let tool = make_tool();
         let profile = make_profile();
@@ -322,6 +326,7 @@ mod tests {
 
     /// Asset mismatch inners are skipped.
     #[test]
+    #[serial_test::parallel]
     fn asset_mismatch_inners_skipped() {
         let tool = make_tool();
         let profile = make_profile();

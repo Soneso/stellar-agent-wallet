@@ -334,6 +334,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::parallel]
     fn current_list_and_enrollment_admit_a_credential() {
         let f = fixture();
         f.allow(&[credential_id(1)]);
@@ -349,6 +350,7 @@ mod tests {
     /// Removing one ID from the list refuses that credential at the next
     /// check and leaves a credential still listed admitted.
     #[test]
+    #[serial_test::parallel]
     fn unaffected_credential_survives_allowlist_edit() {
         let f = fixture();
         f.allow(&[credential_id(1), credential_id(2)]);
@@ -374,6 +376,7 @@ mod tests {
 
     /// An allowlisted ID whose enrollment was removed refuses.
     #[test]
+    #[serial_test::parallel]
     fn removed_enrollment_refuses_an_allowlisted_credential() {
         let f = fixture();
         f.allow(&[credential_id(1)]);
@@ -395,6 +398,7 @@ mod tests {
     /// Every read failure and every configuration change refuses after a
     /// successful read; none returns the earlier authorization.
     #[test]
+    #[serial_test::parallel]
     fn authorization_read_failure_never_uses_startup_copy() {
         let id = credential_id(1);
         let check = |f: &Fixture, chain: Caip2| {

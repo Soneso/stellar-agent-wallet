@@ -2740,6 +2740,7 @@ criteria = []
     }
 
     #[test]
+    #[serial_test::parallel]
     fn criterion_per_tx_cap_allows_zero_max_stroops() {
         let (sk, pk) = make_keypair();
         let dir = TempDir::new().unwrap();
@@ -2821,6 +2822,7 @@ garbage = "not-a-number"
     }
 
     #[test]
+    #[serial_test::parallel]
     fn criterion_per_period_cap_allows_zero_max_stroops() {
         let (sk, pk) = make_keypair();
         let dir = TempDir::new().unwrap();
@@ -2906,6 +2908,7 @@ garbage = "not-a-number"
     /// allowed, pinning that existing policy files (authored before this
     /// flag existed) parse and behave unchanged.
     #[test]
+    #[serial_test::parallel]
     fn criterion_counterparty_allowlist_gate_inflows_absent_defaults_false() {
         let (sk, pk) = make_keypair();
         let dir = TempDir::new().unwrap();
@@ -2930,6 +2933,7 @@ garbage = "not-a-number"
     /// `gate_inflows = true` round-trips through the TOML parser: an inflow
     /// leg from an issuer not on the allowlist now denies.
     #[test]
+    #[serial_test::parallel]
     fn criterion_counterparty_allowlist_gate_inflows_true_round_trips() {
         let (sk, pk) = make_keypair();
         let dir = TempDir::new().unwrap();
@@ -2984,6 +2988,7 @@ garbage = "not-a-number"
     }
 
     #[test]
+    #[serial_test::parallel]
     fn criterion_minimum_reserve_allows_zero_margin_stroops() {
         let (sk, pk) = make_keypair();
         let dir = TempDir::new().unwrap();

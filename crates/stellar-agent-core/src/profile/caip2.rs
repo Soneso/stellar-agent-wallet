@@ -396,6 +396,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::parallel]
     fn validate_chain_id_testnet_matches_testnet_profile() {
         assert!(
             validate_chain_id_matches_profile("stellar:testnet", &testnet_profile()).is_ok(),
@@ -404,6 +405,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::parallel]
     fn validate_chain_id_mainnet_matches_mainnet_profile() {
         assert!(
             validate_chain_id_matches_profile("stellar:mainnet", &mainnet_profile()).is_ok(),
@@ -412,6 +414,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::parallel]
     fn validate_chain_id_mismatch_testnet_arg_mainnet_profile() {
         let result = validate_chain_id_matches_profile("stellar:testnet", &mainnet_profile());
         assert!(
@@ -421,6 +424,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::parallel]
     fn validate_chain_id_mismatch_mainnet_arg_testnet_profile() {
         let result = validate_chain_id_matches_profile("stellar:mainnet", &testnet_profile());
         assert!(
@@ -430,6 +434,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::parallel]
     fn validate_chain_id_invalid_caip2_string() {
         let result = validate_chain_id_matches_profile("invalid-caip2", &testnet_profile());
         assert!(
@@ -439,6 +444,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::parallel]
     fn validate_chain_id_mismatch_error_message_contains_both_values() {
         let result = validate_chain_id_matches_profile("stellar:testnet", &mainnet_profile());
         let msg = result.unwrap_err().to_string();

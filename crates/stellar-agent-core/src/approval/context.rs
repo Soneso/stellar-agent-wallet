@@ -62,6 +62,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::parallel]
     fn context_uses_profile_and_redacts_endpoint() {
         let mut profile = Profile::builder_testnet("svc", "default", "nonce", "default").build();
         profile.rpc_url = "https://user:secret@rpc.example:8443/private?token=secret".to_owned();

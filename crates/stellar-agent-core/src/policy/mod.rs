@@ -2073,6 +2073,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::parallel]
     fn testnet_destructive_tool_allowed() {
         let engine = NoopPolicyEngine;
         let result = engine.evaluate(
@@ -2090,6 +2091,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::parallel]
     fn testnet_read_tool_allowed() {
         let engine = NoopPolicyEngine;
         let result = engine.evaluate(
@@ -2107,6 +2109,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::parallel]
     fn mainnet_read_tool_allowed() {
         let engine = NoopPolicyEngine;
         let result = engine.evaluate(
@@ -2124,6 +2127,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::parallel]
     fn mainnet_destructive_tool_not_implemented() {
         let engine = NoopPolicyEngine;
         let result = engine.evaluate(

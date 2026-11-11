@@ -612,6 +612,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::parallel]
     fn profile_strategy_outputs_expected_non_empty_names() {
         let mut runner = seeded_runner();
 

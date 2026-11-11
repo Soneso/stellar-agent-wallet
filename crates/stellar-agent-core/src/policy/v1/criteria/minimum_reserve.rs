@@ -375,6 +375,7 @@ mod tests {
     /// Verifies fail-closed behaviour: absent account_view returns an Err rather
     /// than silently passing.
     #[test]
+    #[serial_test::parallel]
     fn absent_account_view_fails_closed() {
         let store = PolicyStateStore::new();
         let criterion = MinimumReserveCriterion::new(5_0000000);
@@ -391,6 +392,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::parallel]
     fn post_balance_above_reserve_passes() {
         let store = PolicyStateStore::new();
         let criterion = MinimumReserveCriterion::new(5_0000000); // 0.5 XLM margin
@@ -414,6 +416,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::parallel]
     fn post_balance_below_reserve_breaches() {
         let store = PolicyStateStore::new();
         let criterion = MinimumReserveCriterion::new(5_0000000); // 0.5 XLM margin
@@ -437,6 +440,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::parallel]
     fn saturating_sub_on_amount_exceeding_balance_still_catches_breach() {
         let store = PolicyStateStore::new();
         let criterion = MinimumReserveCriterion::new(0); // no margin
@@ -459,6 +463,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::parallel]
     fn margin_adds_to_reserve_requirement() {
         let store = PolicyStateStore::new();
         // Large margin to test it's correctly added.
@@ -480,6 +485,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::parallel]
     fn exact_reserve_boundary_passes() {
         let store = PolicyStateStore::new();
         let criterion = MinimumReserveCriterion::new(5_000_000);
@@ -508,6 +514,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::parallel]
     fn create_account_starting_balance_participates_in_reserve_check() {
         let store = PolicyStateStore::new();
         let criterion = MinimumReserveCriterion::new(5_000_000);
@@ -528,6 +535,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::parallel]
     fn total_fee_stroops_can_push_post_balance_below_reserve() {
         let store = PolicyStateStore::new();
         let criterion = MinimumReserveCriterion::new(5_000_000);
@@ -556,6 +564,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::parallel]
     fn extract_total_fee_stroops_reads_the_decoder_key() {
         let store = PolicyStateStore::new();
         let args = json!({
@@ -571,6 +580,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::parallel]
     fn minimum_reserve_counts_the_envelope_fee() {
         use stellar_xdr::{
             Asset, Limits, Memo, MuxedAccount, Operation, OperationBody, PaymentOp, Preconditions,
@@ -638,6 +648,7 @@ mod tests {
     /// A commit-time `stellar_pay_commit` authoritative_args shape that breaches
     /// the reserve on its native debit is denied.
     #[test]
+    #[serial_test::parallel]
     fn pay_commit_authoritative_args_shape_breach_is_caught() {
         let store = PolicyStateStore::new();
         let criterion = MinimumReserveCriterion::new(5_000_000);
@@ -672,6 +683,7 @@ mod tests {
     /// `starting_balance_stroops`, never the legacy `starting_balance` key)
     /// breaches the reserve on the real debit.
     #[test]
+    #[serial_test::parallel]
     fn create_account_simulate_resolved_only_shape_breach_is_now_caught() {
         let store = PolicyStateStore::new();
         let criterion = MinimumReserveCriterion::new(5_000_000);
@@ -698,6 +710,7 @@ mod tests {
 
     /// Commit-time `stellar_create_account_commit` authoritative_args shape.
     #[test]
+    #[serial_test::parallel]
     fn create_account_commit_authoritative_args_shape_breach_is_now_caught() {
         let store = PolicyStateStore::new();
         let criterion = MinimumReserveCriterion::new(5_000_000);
@@ -725,6 +738,7 @@ mod tests {
     /// Regression: the legacy unit-string-only shape must still evaluate to
     /// the identical verdict as before this re-point.
     #[test]
+    #[serial_test::parallel]
     fn legacy_starting_balance_only_shape_still_evaluates_identically() {
         let store = PolicyStateStore::new();
         let criterion = MinimumReserveCriterion::new(5_000_000);
@@ -747,6 +761,7 @@ mod tests {
     /// Version-crossing: a resolved key carrying a legacy JSON number must
     /// still parse correctly.
     #[test]
+    #[serial_test::parallel]
     fn version_crossing_numeric_amount_stroops_still_parses() {
         let store = PolicyStateStore::new();
         let criterion = MinimumReserveCriterion::new(5_000_000);
@@ -770,6 +785,7 @@ mod tests {
     /// posture (the reserve check fires on the fee alone, via
     /// `extract_total_fee_stroops`, not on a fabricated amount).
     #[test]
+    #[serial_test::parallel]
     fn genuinely_amount_less_tool_still_defaults_amount_to_zero() {
         let store = PolicyStateStore::new();
         let criterion = MinimumReserveCriterion::new(5_000_000);
@@ -793,6 +809,7 @@ mod tests {
     /// 0 debit: a native-XLM debit leg whose amount cannot be resolved denies
     /// fail-closed rather than bypassing the reserve guard.
     #[test]
+    #[serial_test::parallel]
     fn malformed_resolved_key_amount_is_refused_not_silently_zeroed() {
         let store = PolicyStateStore::new();
         let criterion = MinimumReserveCriterion::new(5_000_000);
@@ -842,6 +859,7 @@ mod tests {
     /// (`derive_value_class` falls through to `ReadOnly` for any name outside
     /// its match arms) must deny fail-closed rather than passing silently.
     #[test]
+    #[serial_test::parallel]
     fn moves_value_tool_with_unpopulated_effects_denies_unsizable() {
         let store = PolicyStateStore::new();
         let criterion = MinimumReserveCriterion::new(5_000_000);
@@ -864,6 +882,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::parallel]
     fn an_unsizable_value_denies_before_the_account_view() {
         let store = PolicyStateStore::new();
         let criterion = MinimumReserveCriterion::new(5_000_000);
@@ -886,6 +905,7 @@ mod tests {
 
     /// An opaque-signing call on the single-tx path must deny fail-closed.
     #[test]
+    #[serial_test::parallel]
     fn opaque_sign_call_denies_unsizable_on_single_tx() {
         let store = PolicyStateStore::new();
         let criterion = MinimumReserveCriterion::new(5_000_000);
@@ -909,6 +929,7 @@ mod tests {
     /// would otherwise breach if the token amount were (incorrectly) counted
     /// as a native debit.
     #[test]
+    #[serial_test::parallel]
     fn token_only_non_native_debit_leg_does_not_reduce_native_reserve() {
         use crate::policy::v1::value::{ActionKind, ValueClass, ValueEffects, ValueLeg};
 

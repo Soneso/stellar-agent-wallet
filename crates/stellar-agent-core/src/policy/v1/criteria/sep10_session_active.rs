@@ -235,6 +235,7 @@ mod tests {
     /// When the dispatch site has not wired a session view, the criterion MUST
     /// error rather than silently passing.
     #[test]
+    #[serial_test::parallel]
     fn missing_view_fails_closed() {
         let criterion = Sep10SessionActiveCriterion::new();
         let tool = make_tool();
@@ -282,6 +283,7 @@ mod tests {
     /// A session the view holds active at the evaluation instant passes: one
     /// millisecond before expiry, `ctx.now_ms` names the second before it.
     #[test]
+    #[serial_test::parallel]
     fn active_session_passes() {
         let criterion = Sep10SessionActiveCriterion::new();
         let tool = make_tool();
@@ -319,6 +321,7 @@ mod tests {
     /// At the expiry instant `ctx.now_ms`, the session is inactive and the
     /// criterion denies with `Sep10SessionMissing`.
     #[test]
+    #[serial_test::parallel]
     fn inactive_session_denies() {
         let criterion = Sep10SessionActiveCriterion::new();
         let tool = make_tool();
@@ -363,6 +366,7 @@ mod tests {
     /// to the session view.  Verified by an `AccountCheckingView` that only
     /// returns `true` for the exact profile account.
     #[test]
+    #[serial_test::parallel]
     fn passes_profile_account_to_view() {
         let criterion = Sep10SessionActiveCriterion::new();
         let tool = make_tool();
