@@ -226,7 +226,8 @@ async fn mainnet_challenge_requires_session_csrf_and_proof() {
         assert_eq!(status.as_u16(), expected, "{header}");
         assert!(h.state.challenges.lock().unwrap().is_empty());
     }
-    h.challenge().await;
+    let options = h.challenge().await;
+    assert_eq!(options["rp_id"], "localhost");
     h.no_consent();
     for timeout in [
         crate::auth::SESSION_IDLE_TIMEOUT,
@@ -1494,4 +1495,110 @@ impl MainnetInbox {
             .unwrap()
             .clone()
     }
+}
+
+/// A payment intent of `amount_stroops` to the fixture destination.
+fn payment_intent(amount_stroops: &str) -> stellar_agent_core::approval::ClassicIntent {
+    serde_json::from_value(json!({
+        "base": {
+            "chain_id": "stellar:mainnet",
+            "source": "GAQAA5L65LSYH7CQ3VTJ7F3HHLGCL3DSLAR2Y47263D56MNNGHSQSTVY",
+            "policy_digest": "11".repeat(32),
+            "fee_bound_stroops": "300",
+            "memo": "none",
+        },
+        "payload": {"pay": {
+            "destination": stellar_agent_core::approval::mainnet_fixtures::ALLOWED_DESTINATION,
+            "asset": "native",
+            "amount_stroops": amount_stroops,
+        }},
+    }))
+    .unwrap()
+}
+
+/// The intent-aware page builder renders the intent and carries the intent
+/// consent view digest in its island; a page for a changed intent carries
+/// another digest; the consent verifies only through the intent-aware path;
+/// and the inbox handlers pass no intent and keep their legacy page.
+#[tokio::test]
+#[serial_test::serial]
+async fn mainnet_page_binds_the_rendered_intent() {
+    use stellar_agent_core::approval::{
+        PresenceListener, issue_mainnet_intent_presence, mainnet_intent_consent_view_digest,
+    };
+    let h = Harness::new();
+    let nonce = h.entry.approval_nonce.clone();
+    let policy = h.fixture.current_policy();
+    let binding = h.fixture.binding();
+    let intent = payment_intent("10");
+    let changed = payment_intent("11");
+    let (status, html) =
+        page_text(render_detail(&h.state, &h.session, &nonce, Some(&intent)).unwrap()).await;
+    assert_eq!(status, StatusCode::OK);
+    let island = crate::operator_enroll::test_support::island(&html, "presence-data").unwrap();
+    let digest = hex::encode(
+        mainnet_intent_consent_view_digest(&h.entry, &binding, &policy, Some(&intent)).unwrap(),
+    );
+    assert_eq!(island["consent_view_digest"], digest);
+    assert_ne!(digest, h.digest());
+    assert!(html.contains("<dt>Fee at most (stroops)</dt><dd>300</dd>"));
+    assert!(!html.contains("Simulated seq num"));
+
+    let (_, changed_html) =
+        page_text(render_detail(&h.state, &h.session, &nonce, Some(&changed)).unwrap()).await;
+    let changed_island =
+        crate::operator_enroll::test_support::island(&changed_html, "presence-data").unwrap();
+    assert_ne!(changed_island["consent_view_digest"], digest);
+    let (status, body) = h
+        .post("challenge", json!({"consent_view_digest": digest}), "")
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"], "approval.presence_changed");
+    assert!(h.state.challenges.lock().unwrap().is_empty());
+
+    let (status, legacy) = page_text(detail(&h.state, &h.session, &nonce)).await;
+    assert_eq!(status, StatusCode::OK);
+    let legacy_island =
+        crate::operator_enroll::test_support::island(&legacy, "presence-data").unwrap();
+    assert_eq!(legacy_island["consent_view_digest"], h.digest());
+    assert!(legacy.contains("Simulated seq num"));
+    assert!(!legacy.contains("Fee at most"));
+
+    let pending = issue_mainnet_intent_presence(
+        &h.entry,
+        &binding,
+        &policy,
+        PresenceListener::Loopback(&h.state.origin),
+        Some(&intent),
+        now_ms().unwrap(),
+        Instant::now(),
+    )
+    .unwrap();
+    let assertion = MainnetConsentFixture::sign_issued(&fixture_authenticator(), &pending);
+    let presence = verify_mainnet_presence(
+        pending,
+        MainnetConsentFixture::input(&assertion),
+        now_ms().unwrap(),
+        Instant::now(),
+    )
+    .unwrap();
+    let outcome = apply_decision(
+        &h.decision(),
+        Decision::Approve {
+            nonce,
+            shown_view_digest: Some(approval_view_digest(&h.entry, &binding).unwrap()),
+        },
+        RequestIdentity::Mainnet(presence),
+    );
+    assert!(
+        matches!(
+            outcome,
+            crate::Outcome::PresenceRefused {
+                code: "approval.presence_invalid",
+                ..
+            }
+        ),
+        "{outcome:?}"
+    );
+    h.no_consent();
 }

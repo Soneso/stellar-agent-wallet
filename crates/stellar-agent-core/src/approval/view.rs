@@ -349,33 +349,53 @@ pub struct IntentView {
     fee_at_most_stroops: u32,
 }
 
+/// The operation facts of an [`IntentView`]. Assets read `XLM` or
+/// `CODE:ISSUER`.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-enum IntentPayloadView {
+pub enum IntentPayloadView {
+    /// A classic payment.
     Pay {
+        /// The destination account.
         destination: String,
+        /// The asset sent.
         asset: String,
+        /// The amount, in stroops.
         #[serde(with = "crate::wire_stroops::i64")]
         amount_stroops: i64,
     },
+    /// The creation of an account.
     CreateAccount {
+        /// The new account.
         destination: String,
+        /// The starting balance asset, always `XLM`.
         asset: String,
+        /// The starting balance, in stroops.
         #[serde(with = "crate::wire_stroops::i64")]
         starting_balance_stroops: i64,
     },
+    /// A trustline change.
     Trustline {
+        /// The issuer account.
         issuer: String,
+        /// The asset code.
         code: String,
+        /// The limit, in stroops.
         #[serde(with = "crate::wire_stroops::i64")]
         limit_stroops: i64,
+        /// The limit as text, which spells out removal and unlimited.
         limit: String,
     },
+    /// An inbound claim.
     Claim {
+        /// The claimable balance ID as a `B` strkey.
         balance_id_strkey: String,
+        /// The asset claimed.
         asset: String,
+        /// The amount, in stroops.
         #[serde(with = "crate::wire_stroops::i64")]
         amount_stroops: i64,
+        /// The claimant account.
         claimant: String,
     },
 }
@@ -449,6 +469,42 @@ impl IntentView {
             memo,
             fee_at_most_stroops: base.fee_bound_stroops(),
         }
+    }
+
+    /// The operation facts.
+    #[must_use]
+    pub fn payload(&self) -> &IntentPayloadView {
+        &self.payload
+    }
+
+    /// The CAIP-2 chain.
+    #[must_use]
+    pub fn chain_id(&self) -> &str {
+        &self.chain_id
+    }
+
+    /// The effective source account.
+    #[must_use]
+    pub fn source(&self) -> &str {
+        &self.source
+    }
+
+    /// The first and last eight hex characters of the policy digest.
+    #[must_use]
+    pub fn policy_digest_short(&self) -> &str {
+        &self.policy_digest_short
+    }
+
+    /// The typed memo.
+    #[must_use]
+    pub fn memo(&self) -> &ClassicMemo {
+        &self.memo
+    }
+
+    /// The fee bound, in stroops.
+    #[must_use]
+    pub fn fee_at_most_stroops(&self) -> u32 {
+        self.fee_at_most_stroops
     }
 }
 

@@ -971,6 +971,7 @@ These failures carry `approval.*` codes: `approval.not_found`, `approval.expired
 `approval.presence_unavailable`: The presence ceremony cannot complete; check the local browser and authenticator.
 `approval.presence_canceled`: The presence ceremony is canceled; no approval is recorded.
 `approval.presence_browser_required`: The ceremony requires a local browser; no approval is recorded.
+`approval.listener_policy_stale`: The approval listener serves an earlier owner-signed mainnet policy; restart it under the current policy.
 `approval.gc_failed` reports a collection failure from `approve gc`.
 `approval.operator_credential_revoked` reports a remote approval whose operator credential is missing from the profile's `allowed_credentials` list or from the operator-credential store; `approval.remote_authorization_unavailable` reports that the profile's remote-approval authorization or the operator-credential store could not be read, or that the profile does not enable remote approval for that chain.
 `approval.spent_record_unavailable` reports, from `stellar_rule_create_commit`, that the platform keyring record of spent rule approvals cannot be read or written, does not parse, is busy, holds 16 live approvals, or is past this approval's expiry. The commit installs nothing.

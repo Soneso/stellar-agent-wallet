@@ -38,13 +38,13 @@ use std::{
 use stellar_agent_core::{
     ApprovalFailure as Failure, WalletError,
     approval::{
-        ApprovalContext, ApprovalKind, ApprovalSummaryView, ApproverIdentity,
-        CurrentMainnetApprovalPolicy, DEFAULT_RETRY_ATTEMPTS, DEFAULT_RETRY_BACKOFF,
+        ApprovalContext, ApprovalKind, ApprovalSummaryView, ApproverIdentity, ClassicIntent,
+        CurrentMainnetApprovalPolicy, DEFAULT_RETRY_ATTEMPTS, DEFAULT_RETRY_BACKOFF, IntentView,
         MainnetApprovalAuthority, MainnetAssertionWire, PendingApproval, PendingApprovalStore,
         PendingApprovalView, PendingMainnetPresence, VerifiedMainnetPresence, approval_view_digest,
         issue_mainnet_presence, load_and_validate_entry, mainnet_consent_view_digest,
-        mainnet_presence_origin, open_with_retry, process_uid_for_attestation,
-        verify_mainnet_presence,
+        mainnet_intent_consent_view_digest, mainnet_presence_origin, open_with_retry,
+        process_uid_for_attestation, verify_mainnet_presence,
     },
 };
 use stellar_agent_loopback_http::{LoopbackPair, PairBindError, PairServer};
@@ -598,16 +598,24 @@ async fn detail_get(
 /// card. A recorded consent's attestation is shown only after its receipt
 /// verifies against the current signed policy.
 pub(crate) fn detail(state: &PresenceState, session: &SessionState, nonce: &str) -> Response {
-    match render_detail(state, session, nonce) {
+    match render_detail(state, session, nonce, None) {
         Ok(response) => response,
         Err(error) => error_response(&error),
     }
 }
 
+/// The detail page of `nonce`, showing `intent` in place of the envelope
+/// summary when one is given.
+///
+/// The island carries the consent view digest of the entry with that
+/// intent, [`mainnet_intent_consent_view_digest`], so the page stands for
+/// the intent it renders and for no other. The inbox and the ceremony of
+/// one command pass no intent and render the legacy page.
 fn render_detail(
     state: &PresenceState,
     session: &SessionState,
     nonce: &str,
+    intent: Option<&ClassicIntent>,
 ) -> Result<Response, WalletError> {
     if !state.mode.serves(nonce) {
         return Err(failure(Failure::PresenceChanged));
@@ -650,8 +658,12 @@ fn render_detail(
         return Ok(state.settled_page(&view, session, None));
     }
     let consent = state.live_entry(&store, nonce).and_then(|entry| {
-        let digest =
-            mainnet_consent_view_digest(&entry, &state.context.binding(), current.policy())?;
+        let digest = mainnet_intent_consent_view_digest(
+            &entry,
+            &state.context.binding(),
+            current.policy(),
+            intent,
+        )?;
         Ok((entry, digest))
     });
     drop(store);
@@ -670,15 +682,17 @@ fn render_detail(
             Mode::OneShot { .. } => "one_shot",
         },
     });
-    let intent = match &entry.kind {
+    let x402_intent = match &entry.kind {
         ApprovalKind::X402Payment { intent_digest, .. } => Some(hex::encode(intent_digest)),
         _ => None,
     };
+    let intent_view = intent.map(IntentView::new);
     Ok(Html(render_mainnet_consent_page(
         &view,
         &state.context,
         &data,
-        intent.as_deref(),
+        x402_intent.as_deref(),
+        intent_view.as_ref(),
         state.mode.page_mode(),
         &state.identity,
     ))

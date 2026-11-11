@@ -8,12 +8,12 @@
 // rendered consent view, the sessionStorage key of the session proof, and the
 // listener's mode. Nothing runs on page load: a ceremony starts only on a
 // trusted click of "Approve with passkey", asks for user verification from the
-// credentials the server's challenge names, and posts the authenticator's raw
-// response bytes. In the inbox a successful assertion records the consent and
-// the page shows the attestation; in a command's ceremony the command records
-// it, and the page says so. A response without a JSON body means the session
-// has ended. Once every handler is wired, the root element carries
-// data-presence="ready".
+// credentials and for the relying-party ID the server's challenge names, and
+// posts the authenticator's raw response bytes. In the inbox a successful
+// assertion records the consent and the page shows the attestation; in a
+// command's ceremony the command records it, and the page says so. A response
+// without a JSON body means the session has ended. Once every handler is
+// wired, the root element carries data-presence="ready".
 
 (function () {
   'use strict';
@@ -85,13 +85,13 @@
         await end('browser_unavailable'); return;
       }
       var options = await post('challenge', { consent_view_digest: data.consent_view_digest });
-      if (typeof options.challenge !== 'string') {
+      if (typeof options.challenge !== 'string' || typeof options.rp_id !== 'string') {
         shared.renderRefusal(result, options, UNAVAILABLE); return;
       }
       var credential;
       try {
         credential = await navigator.credentials.get({ publicKey: {
-          challenge: decode(options.challenge), rpId: 'localhost',
+          challenge: decode(options.challenge), rpId: options.rp_id,
           allowCredentials: options.allow_credentials.map(function (id) { return { type: 'public-key', id: decode(id) }; }),
           userVerification: 'required', timeout: options.timeout_ms
         } });

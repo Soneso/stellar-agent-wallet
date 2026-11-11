@@ -106,7 +106,7 @@ const INBOX_KEY = "stellar-agent-approval-session-proof";
 const SESSION_ENDED = "The consent session has ended. Restart the command for a new link.";
 const ASSERTION_REPLY = { status: "presence_verified" };
 const CHALLENGE_REPLY = {
-  challenge: b64url(VECTOR_CHALLENGE), request_id: "request", allow_credentials: [b64url(VECTOR_ID)], timeout_ms: 120000
+  challenge: b64url(VECTOR_CHALLENGE), request_id: "request", rp_id: "localhost", allow_credentials: [b64url(VECTOR_ID)], timeout_ms: 120000
 };
 // A reply whose body is not JSON, as the bare 404 of an ended session is.
 function bareReply(status) {
@@ -152,6 +152,23 @@ test("the consent page requests pinned UV only on a trusted click and posts raw 
   assert.deepEqual(JSON.parse(page.fetches[0].init.body), { consent_view_digest: "digest" });
   assert.deepEqual(JSON.parse(page.fetches[1].init.body), { request_id: "request", credential_id_b64url: "AQID", authenticator_data_b64url: "AQID", client_data_json_b64url: "AQID", signature_der_b64url: "AQID" });
   assert.equal(page.byId["presence-result"].textContent, "Presence verified. Check the command result.");
+});
+test("the consent page asks for the relying-party ID the challenge names", async () => {
+  const signed = { ...CHALLENGE_REPLY, rp_id: "approve.example.invalid" };
+  const page = consentPage({ replies: { challenge: () => jsonReply(200, signed) } });
+  page.run("./mainnet-presence.js");
+  await page.byId["presence-approve"].listeners.click[0]({ isTrusted: true });
+  assert.equal(page.credentialCalls.length, 1);
+  assert.equal(page.credentialCalls[0].publicKey.rpId, "approve.example.invalid");
+});
+test("a challenge reply without a relying-party ID opens no ceremony", async () => {
+  const unnamed = { ...CHALLENGE_REPLY };
+  delete unnamed.rp_id;
+  const page = consentPage({ replies: { challenge: () => jsonReply(200, unnamed) } });
+  page.run("./mainnet-presence.js");
+  await page.byId["presence-approve"].listeners.click[0]({ isTrusted: true });
+  assert.equal(page.credentialCalls.length, 0);
+  assert.ok(page.fetches.every(({url}) => !url.endsWith("assertion")));
 });
 for (const [setup, reason] of [[{ webauthn: false }, "browser_unavailable"], [{ failure: "NotAllowedError" }, "authenticator_canceled"], [{ failure: "SecurityError" }, "browser_unavailable"]]) {
   test(`the consent page cancels safely with ${reason} ${JSON.stringify(setup)}`, async () => {

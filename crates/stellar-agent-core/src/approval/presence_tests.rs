@@ -188,7 +188,9 @@ impl Facts {
             binding: &binding,
             subject: &self.subject,
             policy: &self.policy,
+            rp_id: MAINNET_APPROVAL_RP_ID,
             expected_origin: &self.origin,
+            layout: ChallengeLayout::Legacy,
             issued_at_unix_ms: self.issued,
             expires_at_unix_ms: self.expires,
         })
@@ -1669,7 +1671,7 @@ fn mainnet_presence_audit_is_correlated_and_redacted() {
         crate::hex::encode(&receipt.digest().unwrap())
     );
     let challenge = receipt
-        .challenge(&entry, &fixture.binding(), &policy)
+        .challenge_for(&entry, &fixture.binding(), &policy, None)
         .unwrap();
     assert_eq!(
         presence["challenge_sha256_hex"],
@@ -1752,7 +1754,7 @@ fn mainnet_presence_store_round_trip_and_partial_record_refusal() {
             t["mainnet_presence"]["extra"] = toml_edit::value(1);
         }),
         ("receipt version", |t| {
-            t["mainnet_presence"]["version"] = toml_edit::value(2);
+            t["mainnet_presence"]["version"] = toml_edit::value(3);
         }),
     ];
     for (label, edit) in edits {
@@ -1971,7 +1973,9 @@ fn mainnet_opt_in_reverifies_the_assertion() {
 }
 
 /// The receipt digest and the version 5 attestation follow their documented
-/// layouts, computed here independently of the production builders.
+/// layouts, computed here independently of the production builders: the
+/// version 1 receipt of a payment, and the version 2 receipts of a payment
+/// at a loopback origin with an intent and at the signed origin.
 #[test]
 fn version_5_layout_matches_independent_hmac() {
     use hmac::{Hmac, KeyInit as _, Mac as _};
@@ -1980,31 +1984,67 @@ fn version_5_layout_matches_independent_hmac() {
         out.extend(u32::try_from(bytes.len()).unwrap().to_be_bytes());
         out.extend(bytes);
     };
+    let independent_digest =
+        |receipt: &MainnetPresenceReceipt, policy: &VerifiedPolicy, origin: &str| {
+            let mut preimage = b"stellar-agent-mainnet-presence-receipt:v1".to_vec();
+            preimage.extend(receipt.version.to_be_bytes());
+            lp(&mut preimage, receipt.request_id.as_bytes());
+            preimage.extend(URL_SAFE_NO_PAD.decode(&receipt.random_b64url).unwrap());
+            preimage.extend(7_i64.to_be_bytes());
+            preimage.extend(policy.digest());
+            preimage.extend([9; 32]);
+            lp(&mut preimage, origin.as_bytes());
+            if receipt.version == 2 {
+                match &policy.mainnet().unwrap().approval_cert_spki_sha256 {
+                    Some(pin) => {
+                        preimage.push(1);
+                        preimage.extend(pin);
+                        preimage.extend(policy.digest());
+                    }
+                    None => preimage.push(0),
+                }
+            }
+            preimage.extend(receipt.issued_at_unix_ms.to_be_bytes());
+            preimage.extend(receipt.expires_at_unix_ms.to_be_bytes());
+            preimage.extend(receipt.verified_at_unix_ms.to_be_bytes());
+            for field in [
+                &receipt.assertion.credential_id,
+                &receipt.assertion.authenticator_data,
+                &receipt.assertion.client_data_json,
+                &receipt.assertion.signature_compact,
+            ] {
+                lp(&mut preimage, field);
+            }
+            <[u8; 32]>::from(Sha256::digest(&preimage))
+        };
     let policy = policy_with(&[&fixture_authenticator()]);
     let entry = payment();
     let receipt = verified_receipt(&policy, &entry);
-
-    let mut preimage = b"stellar-agent-mainnet-presence-receipt:v1".to_vec();
-    preimage.extend(1_u32.to_be_bytes());
-    lp(&mut preimage, receipt.request_id.as_bytes());
-    preimage.extend(URL_SAFE_NO_PAD.decode(&receipt.random_b64url).unwrap());
-    preimage.extend(7_i64.to_be_bytes());
-    preimage.extend(policy.digest());
-    preimage.extend([9; 32]);
-    lp(&mut preimage, ORIGIN.as_bytes());
-    preimage.extend(receipt.issued_at_unix_ms.to_be_bytes());
-    preimage.extend(receipt.expires_at_unix_ms.to_be_bytes());
-    preimage.extend(receipt.verified_at_unix_ms.to_be_bytes());
-    for field in [
-        &receipt.assertion.credential_id,
-        &receipt.assertion.authenticator_data,
-        &receipt.assertion.client_data_json,
-        &receipt.assertion.signature_compact,
-    ] {
-        lp(&mut preimage, field);
-    }
-    let digest: [u8; 32] = Sha256::digest(&preimage).into();
+    assert_eq!(receipt.version(), 1);
+    let digest = independent_digest(&receipt, &policy, ORIGIN);
     assert_eq!(receipt.digest(), Some(digest));
+
+    let signed = signed_policy();
+    for (receipt, policy, origin) in [
+        (
+            receipt_on(
+                &entry,
+                &policy,
+                PresenceListener::Loopback(ORIGIN),
+                Some(&intent_a()),
+            ),
+            &policy,
+            ORIGIN,
+        ),
+        (signed_receipt(&entry, &signed), &signed, SIGNED_ORIGIN),
+    ] {
+        assert_eq!(receipt.version(), 2);
+        assert_eq!(
+            receipt.digest(),
+            Some(independent_digest(&receipt, policy, origin)),
+            "{origin}"
+        );
+    }
 
     let subject = mainnet_consent_subject(&entry, &binding()).unwrap();
     let mut mac = Hmac::<Sha256>::new_from_slice(&ATTESTATION_KEY).unwrap();
@@ -2041,4 +2081,1313 @@ fn version_5_layout_matches_independent_hmac() {
         ),
         expected
     );
+}
+
+// ── Legacy layout guards ────────────────────────────────────────────────────
+
+/// `entry` with the fixed nonce, process UID and lifetime of the frozen
+/// vectors.
+fn frozen(mut entry: PendingApproval) -> PendingApproval {
+    "bm9uY2U".clone_into(&mut entry.approval_nonce);
+    "1000".clone_into(&mut entry.process_uid);
+    entry.created_at_unix_ms = 1_000;
+    entry.expires_at_unix_ms = 2_000_000;
+    entry
+}
+
+/// An x402 transfer of 10 base units on mainnet.
+fn x402_entry() -> PendingApproval {
+    use sha2::Digest as _;
+    use stellar_xdr::{
+        AccountId, ContractId, Hash, InvokeContractArgs, PublicKey, ScAddress, ScVal,
+        SorobanAuthorizedFunction, SorobanAuthorizedInvocation, Uint256,
+    };
+    let account = |byte| {
+        ScVal::Address(ScAddress::Account(AccountId(
+            PublicKey::PublicKeyTypeEd25519(Uint256([byte; 32])),
+        )))
+    };
+    let root = SorobanAuthorizedInvocation {
+        function: SorobanAuthorizedFunction::ContractFn(InvokeContractArgs {
+            contract_address: ScAddress::Contract(ContractId(Hash([3; 32]))),
+            function_name: "transfer".try_into().unwrap(),
+            args: vec![account(4), account(5), ScVal::from(10_i128)]
+                .try_into()
+                .unwrap(),
+        }),
+        sub_invocations: vec![].try_into().unwrap(),
+    };
+    PendingApproval::new_x402_pending(
+        &sha2::Sha256::digest(Caip2::Mainnet.network_passphrase().as_bytes()).into(),
+        &root,
+        None,
+        process_uid_for_attestation().unwrap(),
+        DEFAULT_TTL_MS,
+    )
+    .unwrap()
+}
+
+/// An unvalued claim of the balance `[9; 32]`.
+fn claim_entry() -> PendingApproval {
+    let source = stellar_strkey::ed25519::PublicKey([1; 32]).to_string();
+    fixtures::claim_pending(
+        &source,
+        [9; 32],
+        None,
+        100,
+        7,
+        process_uid_for_attestation().unwrap(),
+        DEFAULT_TTL_MS,
+    )
+}
+
+/// The legacy challenge of `entry` under `policy` from the fixed facts of
+/// the frozen vectors.
+fn legacy_challenge(entry: &PendingApproval, policy: &VerifiedPolicy) -> [u8; 32] {
+    Facts {
+        random: [1; 32],
+        request_id: "00000000-0000-4000-8000-000000000001".to_owned(),
+        entry: entry.clone(),
+        profile: PROFILE.to_owned(),
+        chain: MAINNET_CHAIN_ID.to_owned(),
+        subject: mainnet_consent_subject(entry, &binding()).unwrap(),
+        policy: policy.clone(),
+        origin: ORIGIN.to_owned(),
+        issued: 5_000,
+        expires: 65_000,
+    }
+    .challenge()
+}
+
+/// The legacy challenge and consent view layouts keep their bytes for an
+/// x402 and a claim entry, and the legacy challenge and approval view digest
+/// of a payment keep theirs.
+#[test]
+fn legacy_challenge_vectors_hold() {
+    let policy = policy_with(&[&fixture_authenticator()]);
+    for (label, entry, challenge, view) in [
+        (
+            "x402",
+            frozen(x402_entry()),
+            "a7a61700602fec8e766297f45765e445679ef77b62909c9cb71947c5dcf710b7",
+            "dd0d3d2c3e3525aac912231105fa605499b41453ea0b3d45493fc9c8e67e1731",
+        ),
+        (
+            "claim",
+            frozen(claim_entry()),
+            "7a9213f4a3cb0846cfe8a8df511ff4d94cf3432d8b7b8257d8f810355f8acfed",
+            "f4bd9576165b7a398da002724d02f66027056bf2d26bbf39c00661d158e9710e",
+        ),
+    ] {
+        assert_eq!(
+            crate::hex::encode(&legacy_challenge(&entry, &policy)),
+            challenge,
+            "{label} challenge"
+        );
+        assert_eq!(
+            crate::hex::encode(&mainnet_consent_view_digest(&entry, &binding(), &policy).unwrap()),
+            view,
+            "{label} consent view"
+        );
+    }
+    let payment = frozen(payment());
+    assert_eq!(
+        crate::hex::encode(&legacy_challenge(&payment, &policy)),
+        "6df8e1b662779865fd60d8fcf5a9a5f76bdadfb874482ea6c5c0fae006b4f10a",
+        "payment challenge"
+    );
+    assert_eq!(
+        crate::hex::encode(&approval_view_digest(&payment, &binding()).unwrap()),
+        "5cf19c471688ef2213dc551a743dfe70178093fe42cbac7c757b12d699135d99",
+        "payment approval view"
+    );
+}
+
+/// A version 1 receipt from fixed inputs keeps its JSON and TOML text and
+/// its digest.
+#[test]
+fn localhost_receipt_version_1_bytes_unchanged() {
+    let policy = policy_with(&[&fixture_authenticator()]);
+    let assertion = fixture_authenticator().assert(
+        [7; 32],
+        ORIGIN,
+        MAINNET_APPROVAL_RP_ID,
+        FLAG_UP | FLAG_UV,
+        1,
+    );
+    let receipt: MainnetPresenceReceipt = serde_json::from_value(serde_json::json!({
+        "version": 1,
+        "request_id": "00000000-0000-4000-8000-000000000001",
+        "random_b64url": URL_SAFE_NO_PAD.encode([1; 32]),
+        "policy_sequence": 7,
+        "policy_digest_hex": crate::hex::encode(&policy.digest()),
+        "policy_owner_hex": crate::hex::encode(&[9; 32]),
+        "expected_origin": ORIGIN,
+        "issued_at_unix_ms": 5_000,
+        "expires_at_unix_ms": 65_000,
+        "verified_at_unix_ms": 6_000,
+        "assertion": {
+            "credential_id": assertion.credential_id,
+            "authenticator_data": assertion.authenticator_data,
+            "client_data_json": assertion.client_data_json,
+            "signature_compact": assertion.signature_compact,
+        },
+    }))
+    .unwrap();
+    assert_eq!(
+        serde_json::to_string(&receipt).unwrap(),
+        "{\"version\":1,\"request_id\":\"00000000-0000-4000-8000-000000000001\",\"random_b64url\":\"AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE\",\"policy_sequence\":7,\"policy_digest_hex\":\"af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262\",\"policy_owner_hex\":\"0909090909090909090909090909090909090909090909090909090909090909\",\"expected_origin\":\"http://localhost:4100\",\"issued_at_unix_ms\":5000,\"expires_at_unix_ms\":65000,\"verified_at_unix_ms\":6000,\"assertion\":{\"credential_id\":[90,90,90,90,90,90,90,90,90,90,90,90,90,90,90,90],\"authenticator_data\":[73,150,13,229,136,14,140,104,116,52,23,15,100,118,96,91,143,228,174,185,162,134,50,199,153,92,243,186,131,29,151,99,5,0,0,0,1],\"client_data_json\":[123,34,99,104,97,108,108,101,110,103,101,34,58,34,66,119,99,72,66,119,99,72,66,119,99,72,66,119,99,72,66,119,99,72,66,119,99,72,66,119,99,72,66,119,99,72,66,119,99,72,66,119,99,72,66,119,99,34,44,34,99,114,111,115,115,79,114,105,103,105,110,34,58,102,97,108,115,101,44,34,111,114,105,103,105,110,34,58,34,104,116,116,112,58,47,47,108,111,99,97,108,104,111,115,116,58,52,49,48,48,34,44,34,116,121,112,101,34,58,34,119,101,98,97,117,116,104,110,46,103,101,116,34,125],\"signature_compact\":[238,214,76,215,82,35,85,137,210,69,45,43,111,89,146,26,126,69,205,146,118,244,150,86,37,62,143,50,208,232,115,251,33,95,41,208,156,255,238,190,252,249,203,151,140,179,139,63,9,181,143,144,48,56,42,152,0,93,229,90,6,50,234,193]}}",
+        "json"
+    );
+    assert_eq!(
+        toml::to_string(&receipt).unwrap(),
+        "version = 1\nrequest_id = \"00000000-0000-4000-8000-000000000001\"\nrandom_b64url = \"AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE\"\npolicy_sequence = 7\npolicy_digest_hex = \"af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262\"\npolicy_owner_hex = \"0909090909090909090909090909090909090909090909090909090909090909\"\nexpected_origin = \"http://localhost:4100\"\nissued_at_unix_ms = 5000\nexpires_at_unix_ms = 65000\nverified_at_unix_ms = 6000\n\n[assertion]\ncredential_id = [90, 90, 90, 90, 90, 90, 90, 90, 90, 90, 90, 90, 90, 90, 90, 90]\nauthenticator_data = [73, 150, 13, 229, 136, 14, 140, 104, 116, 52, 23, 15, 100, 118, 96, 91, 143, 228, 174, 185, 162, 134, 50, 199, 153, 92, 243, 186, 131, 29, 151, 99, 5, 0, 0, 0, 1]\nclient_data_json = [123, 34, 99, 104, 97, 108, 108, 101, 110, 103, 101, 34, 58, 34, 66, 119, 99, 72, 66, 119, 99, 72, 66, 119, 99, 72, 66, 119, 99, 72, 66, 119, 99, 72, 66, 119, 99, 72, 66, 119, 99, 72, 66, 119, 99, 72, 66, 119, 99, 72, 66, 119, 99, 72, 66, 119, 99, 34, 44, 34, 99, 114, 111, 115, 115, 79, 114, 105, 103, 105, 110, 34, 58, 102, 97, 108, 115, 101, 44, 34, 111, 114, 105, 103, 105, 110, 34, 58, 34, 104, 116, 116, 112, 58, 47, 47, 108, 111, 99, 97, 108, 104, 111, 115, 116, 58, 52, 49, 48, 48, 34, 44, 34, 116, 121, 112, 101, 34, 58, 34, 119, 101, 98, 97, 117, 116, 104, 110, 46, 103, 101, 116, 34, 125]\nsignature_compact = [238, 214, 76, 215, 82, 35, 85, 137, 210, 69, 45, 43, 111, 89, 146, 26, 126, 69, 205, 146, 118, 244, 150, 86, 37, 62, 143, 50, 208, 232, 115, 251, 33, 95, 41, 208, 156, 255, 238, 190, 252, 249, 203, 151, 140, 179, 139, 63, 9, 181, 143, 144, 48, 56, 42, 152, 0, 93, 229, 90, 6, 50, 234, 193]\n",
+        "toml"
+    );
+    assert_eq!(
+        crate::hex::encode(&receipt.digest().unwrap()),
+        "212f2382d6b609761f915885d431ca4e34487812d965e8d2e4f64e2e37ccd00a",
+        "digest"
+    );
+}
+
+// ── Intent layout and signed origin ─────────────────────────────────────────
+
+use crate::approval::fixtures::intent::fixture as intent_fixture;
+use crate::approval::mainnet_fixtures::{SIGNED_CERT_SPKI_SHA256, SIGNED_ORIGIN, SIGNED_RP_ID};
+
+/// The signed approval origin `text`, parsed as the policy loader parses it.
+fn approval_origin(text: &str) -> ApprovalOrigin {
+    let table: toml_edit::DocumentMut = format!("approval_origin = \"{text}\"").parse().unwrap();
+    crate::policy::v1::approval_origin::parse_fields(table.as_table())
+        .unwrap()
+        .0
+        .unwrap()
+}
+
+/// A verified policy for [`PROFILE`] at `sequence` with the signed `origin`
+/// and `pin`, whose canonical bytes are the three fields' text.
+fn signed_policy_at(
+    sequence: i64,
+    origin: &str,
+    pin: [u8; 32],
+    credentials: &[&TestAuthenticator],
+) -> VerifiedPolicy {
+    VerifiedPolicy::from_verified(
+        sequence,
+        signed_canonical(sequence, origin, &pin).as_bytes(),
+        [9; 32],
+        engine(),
+        Some(MainnetBody {
+            profile: PROFILE.to_owned(),
+            endpoint_host: "rpc.example.invalid".to_owned(),
+            installation_nonce_sha256: [3; 32],
+            classic_max_fee_per_op_stroops: 500,
+            authorization_ttl_seconds: Some(60),
+            cross_check_thresholds: None,
+            approval_credentials: credentials.iter().map(|a| credential_of(a)).collect(),
+            approval_origin: Some(approval_origin(origin)),
+            approval_cert_spki_sha256: Some(pin),
+        }),
+    )
+}
+
+/// The canonical bytes of [`signed_policy_at`].
+fn signed_canonical(sequence: i64, origin: &str, pin: &[u8; 32]) -> String {
+    format!("{sequence}{origin}{}", crate::hex::encode(pin))
+}
+
+/// A verified signed-origin policy at sequence 7 for [`SIGNED_ORIGIN`].
+fn signed_policy() -> VerifiedPolicy {
+    signed_policy_at(
+        7,
+        SIGNED_ORIGIN,
+        SIGNED_CERT_SPKI_SHA256,
+        &[&fixture_authenticator()],
+    )
+}
+
+/// A mainnet payment-kind intent vector: an account creation.
+fn intent_a() -> ClassicIntent {
+    intent_fixture("create_account_memo_id")
+}
+
+/// Another mainnet payment-kind intent vector: an issued-asset payment.
+fn intent_b() -> ClassicIntent {
+    intent_fixture("pay_issued_muxed_memo_text")
+}
+
+/// A challenge for `entry` under `policy` on `listener` with `intent`,
+/// issued now.
+fn issue_on(
+    entry: &PendingApproval,
+    policy: &VerifiedPolicy,
+    listener: PresenceListener<'_>,
+    intent: Option<&ClassicIntent>,
+) -> Result<PendingMainnetPresence, WalletError> {
+    issue_mainnet_intent_presence(
+        entry,
+        &binding(),
+        policy,
+        listener,
+        intent,
+        now_ms(),
+        Instant::now(),
+    )
+}
+
+/// `pending` signed at its own RP ID and origin, then verified now.
+fn verify_issued(pending: PendingMainnetPresence) -> Result<VerifiedMainnetPresence, WalletError> {
+    let assertion = MainnetConsentFixture::sign_issued(&fixture_authenticator(), &pending);
+    verify_mainnet_presence(pending, input(&assertion), now_ms(), Instant::now())
+}
+
+/// The receipt of a verified ceremony for `entry` under `policy` on
+/// `listener` with `intent`.
+fn receipt_on(
+    entry: &PendingApproval,
+    policy: &VerifiedPolicy,
+    listener: PresenceListener<'_>,
+    intent: Option<&ClassicIntent>,
+) -> MainnetPresenceReceipt {
+    verify_issued(issue_on(entry, policy, listener, intent).unwrap())
+        .unwrap()
+        .into_parts()
+        .receipt
+}
+
+/// The receipt of a signed-origin ceremony for `entry` without an intent.
+fn signed_receipt(entry: &PendingApproval, policy: &VerifiedPolicy) -> MainnetPresenceReceipt {
+    let identity = ListenerIdentity::capture(policy).unwrap();
+    receipt_on(
+        entry,
+        policy,
+        PresenceListener::SignedOrigin(&identity),
+        None,
+    )
+}
+
+/// One named change to a single challenge input.
+type FactChange = (&'static str, Box<dyn Fn(&mut IntentFacts)>);
+
+/// The intent-layout facts of one challenge, so each field can be varied
+/// alone.
+#[derive(Clone)]
+struct IntentFacts {
+    facts: Facts,
+    rp_id: String,
+    intent: Option<[u8; 32]>,
+    pin: Option<[u8; 32]>,
+}
+
+impl IntentFacts {
+    fn challenge(&self) -> [u8; 32] {
+        let facts = &self.facts;
+        let binding = AttestationBinding::new(&facts.profile, &facts.chain);
+        mainnet_presence_challenge(&ChallengeFacts {
+            random: &facts.random,
+            request_id: &facts.request_id,
+            entry: &facts.entry,
+            binding: &binding,
+            subject: &facts.subject,
+            policy: &facts.policy,
+            rp_id: &self.rp_id,
+            expected_origin: &facts.origin,
+            layout: ChallengeLayout::Intent {
+                intent: self.intent.as_ref(),
+                pin: self.pin.as_ref(),
+            },
+            issued_at_unix_ms: facts.issued,
+            expires_at_unix_ms: facts.expires,
+        })
+        .unwrap()
+    }
+}
+
+/// The signed-origin facts of a frozen opt-in with intent A.
+fn intent_facts() -> IntentFacts {
+    let policy = signed_policy();
+    let entry = frozen(opt_in(MAINNET_CHAIN_ID));
+    IntentFacts {
+        facts: Facts {
+            random: [1; 32],
+            request_id: "00000000-0000-4000-8000-000000000001".to_owned(),
+            subject: mainnet_consent_subject(&entry, &binding()).unwrap(),
+            entry,
+            profile: PROFILE.to_owned(),
+            chain: MAINNET_CHAIN_ID.to_owned(),
+            policy,
+            origin: SIGNED_ORIGIN.to_owned(),
+            issued: 5_000,
+            expires: 65_000,
+        },
+        rp_id: SIGNED_RP_ID.to_owned(),
+        intent: Some(*intent_a().digest().as_bytes()),
+        pin: Some(SIGNED_CERT_SPKI_SHA256),
+    }
+}
+
+/// `u32be(len(bytes)) || bytes`.
+fn lp(out: &mut Vec<u8>, bytes: &[u8]) {
+    out.extend(u32::try_from(bytes.len()).unwrap().to_be_bytes());
+    out.extend(bytes);
+}
+
+/// `0x00` for an absent value, `0x01 || value` for a present one.
+fn tag(out: &mut Vec<u8>, value: Option<&[u8; 32]>) {
+    match value {
+        Some(bytes) => {
+            out.push(1);
+            out.extend(bytes);
+        }
+        None => out.push(0),
+    }
+}
+
+/// The intent challenge is SHA-256 over the documented layout, typed out
+/// here with its domain literal, with the intent and pin tags present and
+/// absent.
+#[test]
+fn intent_challenge_matches_independent_preimage() {
+    use sha2::{Digest as _, Sha256};
+    let base = intent_facts();
+    let mut bare = base.clone();
+    bare.intent = None;
+    bare.pin = None;
+    for facts in [base, bare] {
+        let f = &facts.facts;
+        let mut preimage = b"stellar-agent-wallet/intent-challenge/v1".to_vec();
+        preimage.extend(f.random);
+        lp(&mut preimage, f.request_id.as_bytes());
+        lp(&mut preimage, f.entry.approval_nonce.as_bytes());
+        lp(&mut preimage, f.profile.as_bytes());
+        lp(&mut preimage, f.chain.as_bytes());
+        lp(&mut preimage, b"TrustlineClawbackOptIn");
+        preimage.extend(f.subject);
+        lp(&mut preimage, f.entry.process_uid.as_bytes());
+        preimage.extend(1_000_u64.to_be_bytes());
+        preimage.extend(2_000_000_u64.to_be_bytes());
+        preimage.extend(7_i64.to_be_bytes());
+        preimage.extend(f.policy.digest());
+        preimage.extend([9; 32]);
+        tag(&mut preimage, facts.intent.as_ref());
+        lp(&mut preimage, b"approve.example.invalid");
+        lp(&mut preimage, b"https://approve.example.invalid:8443");
+        tag(&mut preimage, facts.pin.as_ref());
+        preimage.extend(5_000_u64.to_be_bytes());
+        preimage.extend(65_000_u64.to_be_bytes());
+        let independent: [u8; 32] = Sha256::digest(&preimage).into();
+        assert_eq!(facts.challenge(), independent);
+        assert_ne!(
+            facts.facts.challenge(),
+            independent,
+            "the legacy layout differs"
+        );
+    }
+}
+
+/// Every consent field of the legacy layout, and the intent digest, the RP
+/// ID, the origin and the pin, change the intent challenge.
+#[test]
+fn intent_challenge_binds_every_consent_field() {
+    let base = intent_facts();
+    let signed = |sequence, canonical: &str, owner| {
+        VerifiedPolicy::from_verified(
+            sequence,
+            canonical.as_bytes(),
+            owner,
+            engine(),
+            signed_policy().mainnet().cloned(),
+        )
+    };
+    let canonical = signed_canonical(7, SIGNED_ORIGIN, &SIGNED_CERT_SPKI_SHA256);
+    assert_eq!(
+        signed(7, &canonical, [9; 32]).digest(),
+        signed_policy().digest()
+    );
+    let variants: Vec<FactChange> = vec![
+        ("random", Box::new(|f| f.facts.random[0] ^= 1)),
+        ("request id", Box::new(|f| f.facts.request_id.push('0'))),
+        (
+            "nonce",
+            Box::new(|f| f.facts.entry.approval_nonce.push('A')),
+        ),
+        ("profile", Box::new(|f| f.facts.profile.push('x'))),
+        (
+            "chain",
+            Box::new(|f| "stellar:testnet".clone_into(&mut f.facts.chain)),
+        ),
+        ("kind", Box::new(|f| f.facts.entry.kind = payment().kind)),
+        ("subject", Box::new(|f| f.facts.subject[0] ^= 1)),
+        (
+            "process uid",
+            Box::new(|f| f.facts.entry.process_uid.push('1')),
+        ),
+        (
+            "created",
+            Box::new(|f| f.facts.entry.created_at_unix_ms += 1),
+        ),
+        (
+            "expires",
+            Box::new(|f| f.facts.entry.expires_at_unix_ms += 1),
+        ),
+        (
+            "policy sequence",
+            Box::new(move |f| f.facts.policy = signed(8, &canonical, [9; 32])),
+        ),
+        (
+            "policy digest",
+            Box::new(move |f| f.facts.policy = signed(7, "other", [9; 32])),
+        ),
+        (
+            "policy owner",
+            Box::new(move |f| {
+                f.facts.policy = signed(
+                    7,
+                    &signed_canonical(7, SIGNED_ORIGIN, &SIGNED_CERT_SPKI_SHA256),
+                    [10; 32],
+                );
+            }),
+        ),
+        ("issued", Box::new(|f| f.facts.issued += 1)),
+        ("challenge expiry", Box::new(|f| f.facts.expires += 1)),
+        (
+            "intent digest",
+            Box::new(|f| f.intent = Some(*intent_b().digest().as_bytes())),
+        ),
+        ("intent absent", Box::new(|f| f.intent = None)),
+        (
+            "rp id",
+            Box::new(|f| "other.example.invalid".clone_into(&mut f.rp_id)),
+        ),
+        (
+            "origin",
+            Box::new(|f| "https://approve.example.invalid:8444".clone_into(&mut f.facts.origin)),
+        ),
+        ("pin", Box::new(|f| f.pin = Some([0xac; 32]))),
+        ("pin absent", Box::new(|f| f.pin = None)),
+    ];
+    let reference = base.challenge();
+    for (label, vary) in variants {
+        let mut varied = base.clone();
+        vary(&mut varied);
+        assert_ne!(varied.challenge(), reference, "{label}");
+    }
+}
+
+/// The intent consent view digest follows its documented layout with a
+/// frozen vector, binds the intent, and leaves the legacy vectors intact.
+#[test]
+fn consent_view_digest_binds_the_intent() {
+    use sha2::{Digest as _, Sha256};
+    let local = policy_with(&[&fixture_authenticator()]);
+    let signed = signed_policy();
+    let entry = frozen(opt_in(MAINNET_CHAIN_ID));
+    let view = |policy: &VerifiedPolicy, intent: Option<&ClassicIntent>| {
+        mainnet_intent_consent_view_digest(&entry, &binding(), policy, intent).unwrap()
+    };
+    assert_eq!(
+        crate::hex::encode(&view(&local, None)),
+        "9292abb6c68083708af06c1d8cf9795593bbe968206e6897d314ac3c0870c4f9",
+        "the legacy view without an intent"
+    );
+    assert_eq!(
+        view(&local, None),
+        mainnet_consent_view_digest(&entry, &binding(), &local).unwrap()
+    );
+
+    let subject = mainnet_consent_subject(&entry, &binding()).unwrap();
+    let independent = |policy: &VerifiedPolicy, intent: Option<&ClassicIntent>| {
+        let mut preimage = b"stellar-agent-wallet/intent-consent-view/v1".to_vec();
+        lp(&mut preimage, b"bm9uY2U");
+        lp(&mut preimage, PROFILE.as_bytes());
+        lp(&mut preimage, MAINNET_CHAIN_ID.as_bytes());
+        lp(&mut preimage, b"TrustlineClawbackOptIn");
+        preimage.extend(subject);
+        lp(&mut preimage, b"1000");
+        preimage.extend(1_000_u64.to_be_bytes());
+        preimage.extend(2_000_000_u64.to_be_bytes());
+        preimage.extend(7_i64.to_be_bytes());
+        preimage.extend(policy.digest());
+        preimage.extend([9; 32]);
+        tag(
+            &mut preimage,
+            intent.map(|intent| *intent.digest().as_bytes()).as_ref(),
+        );
+        <[u8; 32]>::from(Sha256::digest(&preimage))
+    };
+    for (policy, intent) in [
+        (&local, Some(&intent_a())),
+        (&signed, Some(&intent_a())),
+        (&signed, None),
+    ] {
+        assert_eq!(view(policy, intent), independent(policy, intent));
+    }
+    assert_eq!(
+        crate::hex::encode(&view(&local, Some(&intent_a()))),
+        "df0cc45076e94a9fd26245e3dd3a9fa469f221930af7f863ecddba7d5b3c7ad3",
+        "the intent view"
+    );
+    assert_ne!(
+        view(&local, Some(&intent_a())),
+        view(&local, Some(&intent_b()))
+    );
+    assert_ne!(view(&local, Some(&intent_a())), view(&local, None));
+    assert_ne!(
+        view(&signed, Some(&intent_a())),
+        view(&signed, Some(&intent_b()))
+    );
+    assert_ne!(view(&signed, Some(&intent_a())), view(&signed, None));
+}
+
+/// A mainnet policy for [`PROFILE`] at sequence 7 with the given signed
+/// origin and pin, whose canonical bytes and owner are those of
+/// [`policy_with`], so a receipt under that policy names it.
+fn policy_with_site(origin: Option<ApprovalOrigin>, pin: Option<[u8; 32]>) -> VerifiedPolicy {
+    VerifiedPolicy::from_verified(
+        7,
+        b"",
+        [9; 32],
+        engine(),
+        Some(MainnetBody {
+            profile: PROFILE.to_owned(),
+            endpoint_host: "rpc.example.invalid".to_owned(),
+            installation_nonce_sha256: [3; 32],
+            classic_max_fee_per_op_stroops: 500,
+            authorization_ttl_seconds: Some(60),
+            cross_check_thresholds: None,
+            approval_credentials: vec![credential_of(&fixture_authenticator())],
+            approval_origin: origin,
+            approval_cert_spki_sha256: pin,
+        }),
+    )
+}
+
+/// An origin without a pin, or a pin without an origin, is never served as
+/// the localhost relying party: issue and listener capture refuse with
+/// `approval.presence_policy_unavailable`, and a localhost receipt under
+/// such a policy refuses with `approval.presence_invalid`.
+#[test]
+fn an_unpaired_origin_or_pin_refuses() {
+    let entry = payment();
+    let local = policy_with(&[&fixture_authenticator()]);
+    let legacy = verified_receipt(&local, &entry);
+    assert!(verify_receipt(&entry, &legacy, &binding(), &local, now_ms()).is_ok());
+    for (label, policy) in [
+        (
+            "an origin without a pin",
+            policy_with_site(Some(approval_origin(SIGNED_ORIGIN)), None),
+        ),
+        (
+            "a pin without an origin",
+            policy_with_site(None, Some(SIGNED_CERT_SPKI_SHA256)),
+        ),
+    ] {
+        assert_eq!(policy.digest(), local.digest(), "{label}");
+        assert_eq!(
+            code(issue_on(
+                &entry,
+                &policy,
+                PresenceListener::Loopback(ORIGIN),
+                None
+            )),
+            "approval.presence_policy_unavailable",
+            "{label}: issue"
+        );
+        assert_eq!(
+            code(ListenerIdentity::capture(&policy)),
+            "approval.presence_policy_unavailable",
+            "{label}: capture"
+        );
+        assert_eq!(
+            code(verify_receipt(
+                &entry,
+                &legacy,
+                &binding(),
+                &policy,
+                now_ms()
+            )),
+            "approval.presence_invalid",
+            "{label}: verify"
+        );
+    }
+}
+
+/// Intents that do not describe a payment entry on mainnet: one for another
+/// chain and one for another record kind.
+fn foreign_intents() -> [(&'static str, ClassicIntent); 2] {
+    [
+        ("another chain", intent_fixture("pay_native_memo_none")),
+        (
+            "another kind",
+            intent_fixture("trustline_removal_memo_hash"),
+        ),
+    ]
+}
+
+/// Issue refuses an intent whose chain is not the binding's or whose
+/// operation is not the entry's record kind, and an intent for an entry kind
+/// without a classic intent form.
+#[test]
+fn issue_refuses_an_intent_for_another_chain_or_kind() {
+    let local = policy_with(&[&fixture_authenticator()]);
+    let signed = signed_policy();
+    let identity = ListenerIdentity::capture(&signed).unwrap();
+    let entry = payment();
+    assert_eq!(intent_a().base().chain_id(), MAINNET_CHAIN_ID);
+    assert!(
+        issue_on(
+            &entry,
+            &local,
+            PresenceListener::Loopback(ORIGIN),
+            Some(&intent_a())
+        )
+        .is_ok()
+    );
+    for (label, intent) in foreign_intents() {
+        for (policy, listener) in [
+            (&local, PresenceListener::Loopback(ORIGIN)),
+            (&signed, PresenceListener::SignedOrigin(&identity)),
+        ] {
+            assert_eq!(
+                code(issue_on(&entry, policy, listener, Some(&intent))),
+                "approval.presence_invalid",
+                "{label}"
+            );
+        }
+    }
+    assert_eq!(
+        code(issue_on(
+            &opt_in(MAINNET_CHAIN_ID),
+            &local,
+            PresenceListener::Loopback(ORIGIN),
+            Some(&intent_a())
+        )),
+        "approval.presence_invalid",
+        "an opt-in"
+    );
+}
+
+/// A ceremony whose challenge binds `intent` for `entry` under `policy` at
+/// the loopback origin, then signed and verified: the issuer is asked for
+/// intent A and the challenge is rebuilt over `intent`, so the receipt binds
+/// an intent the issuer would refuse.
+fn receipt_binding(
+    entry: &PendingApproval,
+    policy: &VerifiedPolicy,
+    intent: &ClassicIntent,
+) -> MainnetPresenceReceipt {
+    let mut pending = issue_on(
+        entry,
+        policy,
+        PresenceListener::Loopback(ORIGIN),
+        Some(&intent_a()),
+    )
+    .unwrap();
+    let digest = *intent.digest().as_bytes();
+    pending.challenge = mainnet_presence_challenge(&ChallengeFacts {
+        random: &pending.random,
+        request_id: &pending.request_id,
+        entry,
+        binding: &binding(),
+        subject: &mainnet_consent_subject(entry, &binding()).unwrap(),
+        policy,
+        rp_id: &pending.rp_id,
+        expected_origin: &pending.expected_origin,
+        layout: ChallengeLayout::Intent {
+            intent: Some(&digest),
+            pin: None,
+        },
+        issued_at_unix_ms: pending.issued_at_unix_ms,
+        expires_at_unix_ms: pending.expires_at_unix_ms,
+    })
+    .unwrap();
+    verify_issued(pending).unwrap().into_parts().receipt
+}
+
+/// Verification refuses a receipt whose challenge binds an intent for
+/// another chain or record kind, although the challenge recomputes over
+/// that intent; the same construction over intent A verifies.
+#[test]
+fn verification_refuses_an_intent_for_another_chain_or_kind() {
+    let local = policy_with(&[&fixture_authenticator()]);
+    let entry = payment();
+    let verify = |receipt: &MainnetPresenceReceipt, intent: &ClassicIntent| {
+        verify_receipt_for_intent(&entry, receipt, &binding(), &local, Some(intent), now_ms())
+    };
+    let own = receipt_binding(&entry, &local, &intent_a());
+    assert!(verify(&own, &intent_a()).is_ok());
+    for (label, intent) in foreign_intents() {
+        let receipt = receipt_binding(&entry, &local, &intent);
+        assert_eq!(
+            code(verify(&receipt, &intent)),
+            "approval.presence_invalid",
+            "{label}"
+        );
+    }
+}
+
+/// A receipt for intent A verifies only through the intent-aware path with
+/// intent A: intent B and the legacy path recompute another challenge. The
+/// attester verifies through the legacy path, so it records nothing for a
+/// presence that bound an intent.
+#[test]
+#[serial]
+fn a_receipt_for_one_intent_refuses_another() {
+    for policy in [policy_with(&[&fixture_authenticator()]), signed_policy()] {
+        let entry = payment();
+        let identity = ListenerIdentity::capture(&policy).ok();
+        let listener = identity.as_ref().map_or(
+            PresenceListener::Loopback(ORIGIN),
+            PresenceListener::SignedOrigin,
+        );
+        let receipt = receipt_on(&entry, &policy, listener, Some(&intent_a()));
+        assert_eq!(receipt.version(), MAINNET_PRESENCE_RECEIPT_VERSION_2);
+        let verify = |intent: Option<&ClassicIntent>| {
+            verify_receipt_for_intent(&entry, &receipt, &binding(), &policy, intent, now_ms())
+        };
+        assert!(verify(Some(&intent_a())).is_ok());
+        assert_eq!(code(verify(Some(&intent_b()))), "approval.presence_invalid");
+        assert_eq!(code(verify(None)), "approval.presence_invalid");
+        assert_eq!(
+            code(verify_receipt(
+                &entry,
+                &receipt,
+                &binding(),
+                &policy,
+                now_ms()
+            )),
+            "approval.presence_invalid"
+        );
+    }
+
+    let fixture = MainnetConsentFixture::new(PROFILE);
+    let policy = fixture.current_policy();
+    let entry = fixture.payment(DEFAULT_TTL_MS);
+    let pending = issue_mainnet_intent_presence(
+        &entry,
+        &fixture.binding(),
+        &policy,
+        PresenceListener::Loopback(&MainnetConsentFixture::origin()),
+        Some(&intent_a()),
+        now_ms(),
+        Instant::now(),
+    )
+    .unwrap();
+    let presence = verify_issued(pending).unwrap();
+    let mut store = PendingApprovalStore::open(fixture.store_path()).unwrap();
+    store.insert(entry.clone(), now_ms()).unwrap();
+    let mut writer = fixture.audit_writer();
+    let error = attest_and_persist(
+        &mut store,
+        &entry,
+        &ATTESTATION_KEY,
+        &fixture.binding(),
+        Surface::Cli,
+        ConsentAudit::Writer(&mut writer),
+        ConsentAuthorization::Mainnet {
+            presence,
+            policy: &policy,
+        },
+        |_, _| panic!("no grant"),
+    )
+    .unwrap_err();
+    assert_eq!(error.code(), "approval.presence_invalid", "the attester");
+    let stored = store.get(&entry.approval_nonce).unwrap();
+    assert!(stored.attestation_blob_b64.is_none());
+    assert!(stored.mainnet_presence.is_none());
+    assert!(consent_rows(&fixture.audit_path()).is_empty());
+}
+
+/// An assertion carries the RP-ID hash its policy selects: a `localhost`
+/// assertion refuses under a signed policy, and a signed-host assertion
+/// refuses under a local policy.
+#[test]
+fn a_receipt_for_one_rp_refuses_another() {
+    fn attempt(
+        policy: &VerifiedPolicy,
+        listener: PresenceListener<'_>,
+        origin: &str,
+        rp_id: &str,
+    ) -> Result<VerifiedMainnetPresence, WalletError> {
+        let pending = issue_on(&payment(), policy, listener, None).unwrap();
+        let assertion =
+            fixture_authenticator().assert(pending.challenge, origin, rp_id, FLAG_UP | FLAG_UV, 1);
+        verify_mainnet_presence(pending, input(&assertion), now_ms(), Instant::now())
+    }
+    let signed = signed_policy();
+    let identity = ListenerIdentity::capture(&signed).unwrap();
+    let signed_listener = PresenceListener::SignedOrigin(&identity);
+    assert!(attempt(&signed, signed_listener, SIGNED_ORIGIN, SIGNED_RP_ID).is_ok());
+    assert_eq!(
+        code(attempt(
+            &signed,
+            signed_listener,
+            SIGNED_ORIGIN,
+            "localhost"
+        )),
+        "approval.presence_invalid"
+    );
+    let local = policy_with(&[&fixture_authenticator()]);
+    let loopback = PresenceListener::Loopback(ORIGIN);
+    assert!(attempt(&local, loopback, ORIGIN, "localhost").is_ok());
+    assert_eq!(
+        code(attempt(&local, loopback, ORIGIN, SIGNED_RP_ID)),
+        "approval.presence_invalid"
+    );
+
+    let entry = payment();
+    let receipt = signed_receipt(&entry, &signed);
+    assert!(verify_receipt(&entry, &receipt, &binding(), &signed, now_ms()).is_ok());
+    let mut relying = receipt.clone();
+    relying.assertion = input(
+        &fixture_authenticator().assert(
+            receipt
+                .challenge_for(&entry, &binding(), &signed, None)
+                .unwrap(),
+            SIGNED_ORIGIN,
+            "localhost",
+            FLAG_UP | FLAG_UV,
+            1,
+        ),
+    );
+    assert_eq!(
+        code(verify_receipt(
+            &entry,
+            &relying,
+            &binding(),
+            &signed,
+            now_ms()
+        )),
+        "approval.presence_invalid",
+        "a stored localhost assertion under a signed policy"
+    );
+}
+
+/// A ceremony binds one origin: another caller origin refuses at issue,
+/// another `clientDataJSON` origin at verify, and an edited receipt origin
+/// at the stored verification.
+#[test]
+fn a_receipt_for_one_origin_refuses_another() {
+    let authenticator = fixture_authenticator();
+    let signed = signed_policy();
+    let local = policy_with(&[&authenticator]);
+    let entry = payment();
+    for (policy, origin) in [
+        (&signed, ORIGIN),
+        (&signed, SIGNED_ORIGIN),
+        (&local, SIGNED_ORIGIN),
+    ] {
+        assert_eq!(
+            code(issue_mainnet_presence(
+                &entry,
+                &binding(),
+                policy,
+                origin,
+                now_ms(),
+                Instant::now()
+            )),
+            "approval.presence_invalid",
+            "{origin}"
+        );
+        assert_eq!(
+            code(issue_on(
+                &entry,
+                policy,
+                PresenceListener::Loopback(origin),
+                Some(&intent_a())
+            )),
+            "approval.presence_invalid",
+            "{origin} with an intent"
+        );
+    }
+
+    let identity = ListenerIdentity::capture(&signed).unwrap();
+    for origin in [
+        "https://approve.example.invalid:8444",
+        "https://approve.example.invalid",
+        "http://approve.example.invalid:8443",
+        ORIGIN,
+    ] {
+        let pending = issue_on(
+            &entry,
+            &signed,
+            PresenceListener::SignedOrigin(&identity),
+            None,
+        )
+        .unwrap();
+        let assertion = authenticator.assert(
+            pending.challenge,
+            origin,
+            SIGNED_RP_ID,
+            FLAG_UP | FLAG_UV,
+            1,
+        );
+        assert_eq!(
+            code(verify_mainnet_presence(
+                pending,
+                input(&assertion),
+                now_ms(),
+                Instant::now()
+            )),
+            "approval.presence_invalid",
+            "client data origin {origin}"
+        );
+    }
+
+    let receipt = signed_receipt(&entry, &signed);
+    assert!(verify_receipt(&entry, &receipt, &binding(), &signed, now_ms()).is_ok());
+    for origin in ["https://approve.example.invalid:8444", ORIGIN] {
+        let mut edited = receipt.clone();
+        origin.clone_into(&mut edited.expected_origin);
+        assert_eq!(
+            code(verify_receipt(
+                &entry,
+                &edited,
+                &binding(),
+                &signed,
+                now_ms()
+            )),
+            "approval.presence_invalid",
+            "receipt origin {origin}"
+        );
+    }
+}
+
+/// A signed-origin listener's challenge names the signed host and origin
+/// and binds the pin; an identity of another policy refuses as stale.
+#[test]
+fn signed_origin_issue_takes_rp_and_origin_from_policy() {
+    let policy = signed_policy();
+    let identity = ListenerIdentity::capture(&policy).unwrap();
+    assert_eq!(identity.policy_digest(), policy.digest());
+    assert_eq!(identity.cert_spki_sha256(), SIGNED_CERT_SPKI_SHA256);
+    let entry = frozen(opt_in(MAINNET_CHAIN_ID));
+    let mut current = entry.clone();
+    current.created_at_unix_ms = now_ms() - 1_000;
+    current.expires_at_unix_ms = now_ms() + DEFAULT_TTL_MS;
+    let pending = issue_on(
+        &current,
+        &policy,
+        PresenceListener::SignedOrigin(&identity),
+        None,
+    )
+    .unwrap();
+    let options = pending.options();
+    assert_eq!(options.rp_id, SIGNED_RP_ID);
+    assert_eq!(pending.expected_origin(), SIGNED_ORIGIN);
+    let expected = IntentFacts {
+        facts: Facts {
+            random: pending.random,
+            request_id: pending.request_id.clone(),
+            subject: mainnet_consent_subject(&current, &binding()).unwrap(),
+            entry: current.clone(),
+            profile: PROFILE.to_owned(),
+            chain: MAINNET_CHAIN_ID.to_owned(),
+            policy: policy.clone(),
+            origin: SIGNED_ORIGIN.to_owned(),
+            issued: pending.issued_at_unix_ms,
+            expires: pending.expires_at_unix_ms,
+        },
+        rp_id: SIGNED_RP_ID.to_owned(),
+        intent: None,
+        pin: Some(SIGNED_CERT_SPKI_SHA256),
+    };
+    assert_eq!(pending.challenge, expected.challenge());
+    let receipt = verify_issued(pending).unwrap().into_parts().receipt;
+    assert_eq!(receipt.version(), MAINNET_PRESENCE_RECEIPT_VERSION_2);
+    assert_eq!(receipt.expected_origin(), SIGNED_ORIGIN);
+    assert_eq!(
+        receipt.cert_spki_sha256_hex(),
+        Some(crate::hex::encode(&SIGNED_CERT_SPKI_SHA256).as_str())
+    );
+    assert_eq!(
+        receipt.listener_policy_digest_hex(),
+        Some(crate::hex::encode(&policy.digest()).as_str())
+    );
+
+    for (label, current) in [
+        (
+            "a later sequence",
+            signed_policy_at(
+                8,
+                SIGNED_ORIGIN,
+                SIGNED_CERT_SPKI_SHA256,
+                &[&fixture_authenticator()],
+            ),
+        ),
+        (
+            "another policy digest, from another signed pin",
+            signed_policy_at(7, SIGNED_ORIGIN, [0xac; 32], &[&fixture_authenticator()]),
+        ),
+        ("a local policy", policy_with(&[&fixture_authenticator()])),
+    ] {
+        assert_eq!(
+            code(issue_on(
+                &payment(),
+                &current,
+                PresenceListener::SignedOrigin(&identity),
+                None
+            )),
+            "approval.listener_policy_stale",
+            "{label}"
+        );
+    }
+    assert_eq!(
+        code(ListenerIdentity::capture(&policy_with(&[
+            &fixture_authenticator()
+        ]))),
+        "approval.presence_policy_unavailable"
+    );
+}
+
+/// The consent row names the RP ID its policy selects and the receipt's
+/// origin: `localhost` and the loopback origin, or the signed host and the
+/// signed origin.
+#[test]
+#[serial]
+fn presence_audit_names_the_policy_rp() {
+    let mut fixture = MainnetConsentFixture::new(PROFILE);
+    let local = fixture.payment(DEFAULT_TTL_MS);
+    let (store, _) = fixture.consent(&local);
+    drop(store);
+    fixture.sign_signed_origin_policy(&[&fixture_authenticator()], &SIGNED_CERT_SPKI_SHA256);
+    let policy = fixture.current_policy();
+    let identity = ListenerIdentity::capture(&policy).unwrap();
+    let entry = fixture.payment(DEFAULT_TTL_MS);
+    let pending = issue_mainnet_intent_presence(
+        &entry,
+        &fixture.binding(),
+        &policy,
+        PresenceListener::SignedOrigin(&identity),
+        None,
+        now_ms(),
+        Instant::now(),
+    )
+    .unwrap();
+    let presence = verify_issued(pending).unwrap();
+    let mut store = PendingApprovalStore::open(fixture.store_path()).unwrap();
+    store.insert(entry.clone(), now_ms()).unwrap();
+    let mut writer = fixture.audit_writer();
+    attest_and_persist(
+        &mut store,
+        &entry,
+        &ATTESTATION_KEY,
+        &fixture.binding(),
+        Surface::Cli,
+        ConsentAudit::Writer(&mut writer),
+        ConsentAuthorization::Mainnet {
+            presence,
+            policy: &policy,
+        },
+        |_, _| panic!("no grant"),
+    )
+    .unwrap();
+    let receipt = store
+        .get(&entry.approval_nonce)
+        .unwrap()
+        .mainnet_presence
+        .clone()
+        .unwrap();
+    assert_eq!(receipt.version(), MAINNET_PRESENCE_RECEIPT_VERSION_2);
+    let rows = consent_rows(&fixture.audit_path());
+    assert_eq!(rows.len(), 2);
+    for (row, rp_id, origin) in [
+        (
+            &rows[0],
+            MAINNET_APPROVAL_RP_ID,
+            MainnetConsentFixture::origin(),
+        ),
+        (&rows[1], SIGNED_RP_ID, SIGNED_ORIGIN.to_owned()),
+    ] {
+        assert_eq!(row["mainnet_presence"]["rp_id"], rp_id);
+        assert_eq!(row["mainnet_presence"]["webauthn_origin"], origin);
+    }
+    assert_eq!(rows[1]["request_id"], receipt.request_id());
+}
+
+/// Each receipt version verifies under its own layout only: relabeled
+/// receipts refuse, version 1 refuses under a signed policy, a version 2
+/// receipt naming another pin or listener policy digest refuses, and version
+/// 3 refuses to load.
+#[test]
+fn receipt_versions_verify_under_their_own_layout() {
+    let local = policy_with(&[&fixture_authenticator()]);
+    let signed = signed_policy();
+    let entry = payment();
+    let verify = |receipt: &MainnetPresenceReceipt,
+                  policy: &VerifiedPolicy,
+                  intent: Option<&ClassicIntent>| {
+        verify_receipt_for_intent(&entry, receipt, &binding(), policy, intent, now_ms())
+    };
+
+    let legacy = verified_receipt(&local, &entry);
+    assert_eq!(legacy.version(), MAINNET_PRESENCE_RECEIPT_VERSION);
+    assert!(verify(&legacy, &local, None).is_ok());
+    let intent_bound = receipt_on(
+        &entry,
+        &local,
+        PresenceListener::Loopback(ORIGIN),
+        Some(&intent_a()),
+    );
+    assert_eq!(intent_bound.version(), MAINNET_PRESENCE_RECEIPT_VERSION_2);
+    assert!(verify(&intent_bound, &local, Some(&intent_a())).is_ok());
+    let at_signed = signed_receipt(&entry, &signed);
+    assert_eq!(at_signed.version(), MAINNET_PRESENCE_RECEIPT_VERSION_2);
+    assert!(verify(&at_signed, &signed, None).is_ok());
+
+    let mut relabeled = legacy.clone();
+    relabeled.version = MAINNET_PRESENCE_RECEIPT_VERSION_2;
+    assert!(relabeled.is_well_formed());
+    assert_eq!(
+        code(verify(&relabeled, &local, None)),
+        "approval.presence_invalid",
+        "version 1 relabeled as 2"
+    );
+    let mut relabeled = intent_bound.clone();
+    relabeled.version = MAINNET_PRESENCE_RECEIPT_VERSION;
+    assert!(relabeled.is_well_formed());
+    assert_eq!(
+        code(verify(&relabeled, &local, Some(&intent_a()))),
+        "approval.presence_invalid",
+        "an intent-bound version 2 relabeled as 1"
+    );
+    let mut relabeled = at_signed.clone();
+    relabeled.version = MAINNET_PRESENCE_RECEIPT_VERSION;
+    relabeled.cert_spki_sha256 = None;
+    relabeled.listener_policy_digest = None;
+    ORIGIN.clone_into(&mut relabeled.expected_origin);
+    assert!(relabeled.is_well_formed());
+    assert_eq!(
+        code(verify(&relabeled, &signed, None)),
+        "approval.presence_invalid",
+        "version 1 under a signed policy"
+    );
+    for (label, pin, listener) in [
+        (
+            "another pin",
+            Some("cd".repeat(32)),
+            at_signed.listener_policy_digest.clone(),
+        ),
+        (
+            "another listener policy digest",
+            at_signed.cert_spki_sha256.clone(),
+            Some("cd".repeat(32)),
+        ),
+    ] {
+        let mut edited = at_signed.clone();
+        edited.cert_spki_sha256 = pin;
+        edited.listener_policy_digest = listener;
+        assert!(edited.is_well_formed(), "{label}");
+        assert_eq!(
+            code(verify_receipt(
+                &entry,
+                &edited,
+                &binding(),
+                &signed,
+                now_ms()
+            )),
+            "approval.presence_invalid",
+            "{label}"
+        );
+    }
+
+    let mut wire = serde_json::to_value(&legacy).unwrap();
+    assert!(serde_json::from_value::<MainnetPresenceReceipt>(wire.clone()).is_ok());
+    wire["version"] = serde_json::json!(3);
+    assert!(serde_json::from_value::<MainnetPresenceReceipt>(wire).is_err());
+}
+
+/// The receipt origin bound admits `https://`, a 253-byte host and
+/// `:65535`, and refuses one byte more at the wire.
+#[test]
+fn receipt_origin_bound_admits_267_bytes() {
+    let receipt = signed_receipt(&payment(), &signed_policy());
+    let host = format!(
+        "{}.{}.{}.{}",
+        "a".repeat(63),
+        "b".repeat(63),
+        "c".repeat(63),
+        "d".repeat(61)
+    );
+    assert_eq!(host.len(), 253);
+    let longest = format!("https://{host}:65535");
+    assert_eq!(longest.len(), 267);
+    let mut wire = serde_json::to_value(&receipt).unwrap();
+    wire["expected_origin"] = serde_json::json!(longest);
+    let loaded: MainnetPresenceReceipt = serde_json::from_value(wire.clone()).unwrap();
+    assert_eq!(loaded.expected_origin(), longest);
+    wire["expected_origin"] = serde_json::json!(format!("https://{host}e:65535"));
+    let error = serde_json::from_value::<MainnetPresenceReceipt>(wire)
+        .err()
+        .unwrap();
+    assert!(
+        error.to_string().contains("string exceeds its byte bound"),
+        "{error}"
+    );
+}
+
+/// A version 2 receipt carries the certificate pin and the listener policy
+/// digest both or neither, as lowercase hex, and both exactly with an HTTPS
+/// origin; version 1 carries neither.
+#[test]
+fn receipt_version_2_requires_both_identity_fields() {
+    let signed = serde_json::to_value(signed_receipt(&payment(), &signed_policy())).unwrap();
+    assert!(serde_json::from_value::<MainnetPresenceReceipt>(signed.clone()).is_ok());
+    let local = serde_json::to_value(verified_receipt(
+        &policy_with(&[&fixture_authenticator()]),
+        &payment(),
+    ))
+    .unwrap();
+    let pin = signed["cert_spki_sha256"].clone();
+    let listener = signed["listener_policy_digest"].clone();
+    let edits: Vec<(&str, serde_json::Value)> = vec![
+        ("pin alone", {
+            let mut wire = signed.clone();
+            wire.as_object_mut()
+                .unwrap()
+                .remove("listener_policy_digest");
+            wire
+        }),
+        ("listener digest alone", {
+            let mut wire = signed.clone();
+            wire.as_object_mut().unwrap().remove("cert_spki_sha256");
+            wire
+        }),
+        ("an HTTPS origin without either", {
+            let mut wire = signed.clone();
+            let object = wire.as_object_mut().unwrap();
+            object.remove("cert_spki_sha256");
+            object.remove("listener_policy_digest");
+            wire
+        }),
+        ("uppercase pin", {
+            let mut wire = signed.clone();
+            wire["cert_spki_sha256"] =
+                serde_json::json!(pin.as_str().unwrap().to_ascii_uppercase());
+            wire
+        }),
+        ("a loopback origin with both", {
+            let mut wire = signed.clone();
+            wire["expected_origin"] = serde_json::json!(ORIGIN);
+            wire
+        }),
+        ("version 1 with both", {
+            let mut wire = local.clone();
+            wire["cert_spki_sha256"] = pin.clone();
+            wire["listener_policy_digest"] = listener.clone();
+            wire
+        }),
+        ("version 1 with the pin alone", {
+            let mut wire = local.clone();
+            wire["cert_spki_sha256"] = pin.clone();
+            wire
+        }),
+    ];
+    for (label, wire) in edits {
+        assert!(
+            serde_json::from_value::<MainnetPresenceReceipt>(wire).is_err(),
+            "{label}"
+        );
+    }
 }

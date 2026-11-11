@@ -37,8 +37,9 @@
 use stellar_agent_core::amount::StellarAmount;
 use stellar_agent_core::approval::view::format_trustline_limit;
 use stellar_agent_core::approval::{
-    ApprovalSummaryView, ContextRuleProposalSnapshot, PendingApprovalView, RuleProposalContextType,
-    RuleProposalSignerKind, try_decode_spending_limit_params,
+    ApprovalSummaryView, ContextRuleProposalSnapshot, IntentPayloadView, IntentView,
+    PendingApprovalView, RuleProposalContextType, RuleProposalSignerKind,
+    try_decode_spending_limit_params,
 };
 use stellar_agent_core::observability::redact::escape_untrusted_text;
 use stellar_agent_loopback_http::brand::{BRAND_STYLE, PageIdentity, TRUST_LINE_LOOPBACK};
@@ -529,7 +530,10 @@ pub(crate) enum ConsentPageMode {
 ///
 /// The card is the detail page's: the kind pill, the serving profile, the
 /// server-rendered summary and the expiry line, under the same stylesheet.
-/// For an x402 payment the authoritative intent digest follows the summary.
+/// With an `intent`, [`render_intent_html`] replaces the summary, so the page
+/// shows the lasting intent facts and the fee bound rather than the
+/// simulated fee and sequence. For an x402 payment the authoritative intent
+/// digest follows the summary.
 /// `data` rides in the `#presence-data` island for
 /// `/static/mainnet-presence.js`, which starts a WebAuthn ceremony only on a
 /// trusted click of the passkey button; nothing runs on page load.
@@ -539,12 +543,16 @@ pub(crate) fn render_mainnet_consent_page(
     context: &stellar_agent_core::approval::ApprovalContext,
     data: &serde_json::Value,
     intent_digest_hex: Option<&str>,
+    intent: Option<&IntentView>,
     mode: ConsentPageMode,
     identity: &PageIdentity,
 ) -> String {
     let kind_head = kind_head_html(view);
     let context_html = render_context_header_html(context);
-    let summary_html = render_summary_html(view);
+    let summary_html = intent.map_or_else(
+        || render_summary_html(view),
+        |intent| render_intent_html(&view.approval_nonce, intent),
+    );
     let intent_html = intent_digest_hex.map_or_else(String::new, |digest| {
         format!(
             "<dl class=\"facts\">\n<dt>Intent digest</dt><dd><code>{}</code></dd>\n</dl>",
@@ -787,6 +795,134 @@ pub fn render_context_header_html(
     html
 }
 
+/// One summary row; the value passes through [`escape_value`].
+fn fact_row(label: &str, value: &str) -> String {
+    format!(
+        "        <dt>{}</dt><dd>{}</dd>\n",
+        html_escape(label),
+        escape_value(value)
+    )
+}
+
+/// The facts grid of a summary: the nonce row, then `rows`.
+fn facts_block(nonce: &str, rows: &str) -> String {
+    format!(
+        "      <dl class=\"facts\">\n{}{rows}      </dl>\n",
+        fact_row("Nonce", nonce)
+    )
+}
+
+/// The amount headline for a stroop-denominated (classic Stellar) amount.
+///
+/// `StellarAmount` owns the stroop-to-decimal conversion, including the
+/// protocol's seven-decimal quantisation; the asset code is only ever
+/// appended to it and never rescales it.
+fn amount_headline(amount_stroops: i64, asset: &str) -> String {
+    format!(
+        "      <div class=\"d-amount\">{} {} <small>{} stroops</small></div>\n",
+        html_escape(&StellarAmount::from_stroops(amount_stroops).as_xlm_decimal_string()),
+        escape_value(asset_code(asset)),
+        amount_stroops
+    )
+}
+
+/// A labeled, untruncated address.
+fn address_block(label: &str, value: &str) -> String {
+    format!(
+        "      <div class=\"addr-label\">{}</div>\n      <div class=\"addr\">{}</div>\n",
+        html_escape(label),
+        escape_value(value)
+    )
+}
+
+/// Renders the intent an entry is approved under: the amount headline, the
+/// untruncated primary address, and rows for the kind, network, source, the
+/// operation fields, the typed memo, the fee bound and the short policy
+/// digest.
+///
+/// The view holds the lasting intent facts only, so no sequence number and
+/// no simulated fee appear. A trustline limit spells out removal and
+/// unlimited. Every value passes through [`escape_value`].
+pub(crate) fn render_intent_html(nonce: &str, intent: &IntentView) -> String {
+    let (kind, headline, address, operation) = match intent.payload() {
+        IntentPayloadView::Pay {
+            destination,
+            asset,
+            amount_stroops,
+        } => (
+            "Payment",
+            amount_headline(*amount_stroops, asset),
+            address_block("Destination", destination),
+            [
+                fact_row("Asset", asset),
+                fact_row("Amount (stroops)", &amount_stroops.to_string()),
+            ]
+            .concat(),
+        ),
+        IntentPayloadView::CreateAccount {
+            destination,
+            asset,
+            starting_balance_stroops,
+        } => (
+            "Create account",
+            amount_headline(*starting_balance_stroops, asset),
+            address_block("New account", destination),
+            [
+                fact_row("Asset", asset),
+                fact_row(
+                    "Starting balance (stroops)",
+                    &starting_balance_stroops.to_string(),
+                ),
+            ]
+            .concat(),
+        ),
+        IntentPayloadView::Trustline {
+            issuer,
+            code,
+            limit,
+            ..
+        } => (
+            "Trustline",
+            format!(
+                "      <div class=\"d-amount\">{}</div>\n",
+                escape_value(&format!("{code}:{issuer}"))
+            ),
+            address_block("Issuer", issuer),
+            [fact_row("Asset code", code), fact_row("Limit", limit)].concat(),
+        ),
+        IntentPayloadView::Claim {
+            balance_id_strkey,
+            asset,
+            amount_stroops,
+            claimant,
+        } => (
+            "Claim",
+            amount_headline(*amount_stroops, asset),
+            address_block("Balance id", balance_id_strkey),
+            [
+                fact_row("Asset", asset),
+                fact_row("Amount (stroops)", &amount_stroops.to_string()),
+                fact_row("Claimant", claimant),
+            ]
+            .concat(),
+        ),
+    };
+    let rows = [
+        fact_row("Kind", kind),
+        fact_row("Network", intent.chain_id()),
+        fact_row("Source", intent.source()),
+        operation,
+        fact_row("Memo", &intent.memo().display()),
+        fact_row(
+            "Fee at most (stroops)",
+            &intent.fee_at_most_stroops().to_string(),
+        ),
+        fact_row("Policy digest", intent.policy_digest_short()),
+    ]
+    .concat();
+    format!("{headline}{address}{}", facts_block(nonce, &rows))
+}
+
 /// Renders the amount headline, the untruncated primary address, and the summary
 /// rows of an entry. The amount shows both denominations so the operator can
 /// match the stroop count against the CLI and the audit record. The nonce
@@ -799,42 +935,7 @@ pub fn render_context_header_html(
 /// [`PendingApprovalView`]; an entry that fails that decode is an
 /// [`ApprovalSummaryView::Inconsistent`] view and renders its reason.
 pub fn render_summary_html(view: &PendingApprovalView) -> String {
-    fn row(label: &str, value: &str) -> String {
-        format!(
-            "        <dt>{}</dt><dd>{}</dd>\n",
-            html_escape(label),
-            escape_value(value)
-        )
-    }
-
-    /// The amount headline for a stroop-denominated (classic Stellar) amount.
-    ///
-    /// `StellarAmount` owns the stroop-to-decimal conversion, including the
-    /// protocol's seven-decimal quantisation; the asset code is only ever
-    /// appended to it, never used to rescale it.
-    fn amount_headline(amount_stroops: i64, asset: &str) -> String {
-        format!(
-            "      <div class=\"d-amount\">{} {} <small>{} stroops</small></div>\n",
-            html_escape(&StellarAmount::from_stroops(amount_stroops).as_xlm_decimal_string()),
-            escape_value(asset_code(asset)),
-            amount_stroops
-        )
-    }
-
-    fn address_block(label: &str, value: &str) -> String {
-        format!(
-            "      <div class=\"addr-label\">{}</div>\n      <div class=\"addr\">{}</div>\n",
-            html_escape(label),
-            escape_value(value)
-        )
-    }
-
-    let facts = |rows: &str| {
-        format!(
-            "      <dl class=\"facts\">\n{}{rows}      </dl>\n",
-            row("Nonce", &view.approval_nonce)
-        )
-    };
+    let facts = |rows: &str| facts_block(&view.approval_nonce, rows);
 
     match &view.summary {
         ApprovalSummaryView::X402Payment {
@@ -843,15 +944,15 @@ pub fn render_summary_html(view: &PendingApprovalView) -> String {
             asset,
             home_domain,
         } => {
-            let mut rows = row(
+            let mut rows = fact_row(
                 "Amount (token base units)",
                 amount.as_deref().unwrap_or("Unknown"),
             );
-            rows.push_str(&row(
+            rows.push_str(&fact_row(
                 "Token contract",
                 asset.as_deref().unwrap_or("Unknown"),
             ));
-            rows.push_str(&row(
+            rows.push_str(&fact_row(
                 "Home domain",
                 home_domain.as_deref().unwrap_or("Unauthenticated"),
             ));
@@ -873,22 +974,25 @@ pub fn render_summary_html(view: &PendingApprovalView) -> String {
             seq_num,
         } => {
             let mut rows = String::new();
-            rows.push_str(&row("Asset", asset));
+            rows.push_str(&fact_row("Asset", asset));
             if let (Some(dest_asset), Some(dest_amount)) = (dest_asset, dest_amount_stroops) {
-                rows.push_str(&row(
+                rows.push_str(&fact_row(
                     "Path payment",
                     "the source pays at most the amount above",
                 ));
-                rows.push_str(&row("Destination receives asset", dest_asset));
-                rows.push_str(&row(
+                rows.push_str(&fact_row("Destination receives asset", dest_asset));
+                rows.push_str(&fact_row(
                     "Destination receives at least (stroops)",
                     &dest_amount.to_string(),
                 ));
             }
-            rows.push_str(&row("Source", source));
-            rows.push_str(&row("Memo", &memo.display()));
-            rows.push_str(&row("Simulated fee (stroops)", &fee_stroops.to_string()));
-            rows.push_str(&row("Simulated seq num", &seq_num.to_string()));
+            rows.push_str(&fact_row("Source", source));
+            rows.push_str(&fact_row("Memo", &memo.display()));
+            rows.push_str(&fact_row(
+                "Simulated fee (stroops)",
+                &fee_stroops.to_string(),
+            ));
+            rows.push_str(&fact_row("Simulated seq num", &seq_num.to_string()));
             format!(
                 "{}{}{}",
                 amount_headline(*amount_stroops, asset),
@@ -907,11 +1011,14 @@ pub fn render_summary_html(view: &PendingApprovalView) -> String {
         } => {
             let asset = format!("{asset_code}:{asset_issuer}");
             let limit = format_trustline_limit(*limit_stroops);
-            let mut rows = row("Limit", &limit);
-            rows.push_str(&row("Source", holder));
-            rows.push_str(&row("Memo", &memo.display()));
-            rows.push_str(&row("Simulated fee (stroops)", &fee_stroops.to_string()));
-            rows.push_str(&row("Simulated seq num", &seq_num.to_string()));
+            let mut rows = fact_row("Limit", &limit);
+            rows.push_str(&fact_row("Source", holder));
+            rows.push_str(&fact_row("Memo", &memo.display()));
+            rows.push_str(&fact_row(
+                "Simulated fee (stroops)",
+                &fee_stroops.to_string(),
+            ));
+            rows.push_str(&fact_row("Simulated seq num", &seq_num.to_string()));
             format!(
                 "      <div class=\"d-amount\">{}</div>\n{}{}",
                 escape_value(&asset),
@@ -927,14 +1034,17 @@ pub fn render_summary_html(view: &PendingApprovalView) -> String {
             memo,
         } => {
             let mut rows = String::new();
-            rows.push_str(&row("Asset", CLAIM_VALUE_NOTE));
-            rows.push_str(&row("Source", source));
-            rows.push_str(&row("Memo", &memo.display()));
-            rows.push_str(&row("Simulated fee (stroops)", &fee_stroops.to_string()));
-            rows.push_str(&row("Simulated seq num", &seq_num.to_string()));
+            rows.push_str(&fact_row("Asset", CLAIM_VALUE_NOTE));
+            rows.push_str(&fact_row("Source", source));
+            rows.push_str(&fact_row("Memo", &memo.display()));
+            rows.push_str(&fact_row(
+                "Simulated fee (stroops)",
+                &fee_stroops.to_string(),
+            ));
+            rows.push_str(&fact_row("Simulated seq num", &seq_num.to_string()));
             format!(
                 "{}{}{}",
-                row("Amount", CLAIM_VALUE_NOTE),
+                fact_row("Amount", CLAIM_VALUE_NOTE),
                 address_block("Balance id", balance_id_strkey),
                 facts(&rows)
             )
@@ -943,8 +1053,8 @@ pub fn render_summary_html(view: &PendingApprovalView) -> String {
             original_kind_name,
             reason,
         } => {
-            let mut rows = row("Kind", original_kind_name);
-            rows.push_str(&row("Reason", reason));
+            let mut rows = fact_row("Kind", original_kind_name);
+            rows.push_str(&fact_row("Reason", reason));
             facts(&rows)
         }
         ApprovalSummaryView::SignWithPasskey {
@@ -953,8 +1063,8 @@ pub fn render_summary_html(view: &PendingApprovalView) -> String {
             rp_id,
         } => {
             let mut rows = String::new();
-            rows.push_str(&row("Rule ids", &format!("{rule_ids:?}")));
-            rows.push_str(&row("RP id", rp_id));
+            rows.push_str(&fact_row("Rule ids", &format!("{rule_ids:?}")));
+            rows.push_str(&fact_row("RP id", rp_id));
             format!(
                 "{}{}",
                 address_block("Smart account", smart_account_redacted),
@@ -967,8 +1077,8 @@ pub fn render_summary_html(view: &PendingApprovalView) -> String {
             rp_id,
         } => {
             let mut rows = String::new();
-            rows.push_str(&row("Rule ids", &format!("{rule_ids:?}")));
-            rows.push_str(&row("RP id", rp_id));
+            rows.push_str(&fact_row("Rule ids", &format!("{rule_ids:?}")));
+            rows.push_str(&fact_row("RP id", rp_id));
             format!(
                 "{}{}",
                 address_block("Smart account", smart_account_redacted),
@@ -987,17 +1097,17 @@ pub fn render_summary_html(view: &PendingApprovalView) -> String {
             amount_max_stroops,
         } => {
             let mut rows = String::new();
-            rows.push_str(&row("Toolset", toolset_name));
-            rows.push_str(&row("Version", package_version));
-            rows.push_str(&row("Package SHA-256", package_shasum_short));
-            rows.push_str(&row("Install identity", install_id));
-            rows.push_str(&row("Capability", capability));
-            rows.push_str(&row("Asset", asset));
-            rows.push_str(&row(
+            rows.push_str(&fact_row("Toolset", toolset_name));
+            rows.push_str(&fact_row("Version", package_version));
+            rows.push_str(&fact_row("Package SHA-256", package_shasum_short));
+            rows.push_str(&fact_row("Install identity", install_id));
+            rows.push_str(&fact_row("Capability", capability));
+            rows.push_str(&fact_row("Asset", asset));
+            rows.push_str(&fact_row(
                 "Amount min (stroops)",
                 &amount_min_stroops.to_string(),
             ));
-            rows.push_str(&row(
+            rows.push_str(&fact_row(
                 "Amount max (stroops)",
                 &amount_max_stroops.to_string(),
             ));
@@ -1013,8 +1123,8 @@ pub fn render_summary_html(view: &PendingApprovalView) -> String {
             issuer_redacted,
         } => {
             let mut rows = String::new();
-            rows.push_str(&row("Network", network));
-            rows.push_str(&row("Asset code", code));
+            rows.push_str(&fact_row("Network", network));
+            rows.push_str(&fact_row("Asset code", code));
             format!(
                 "{}{}",
                 address_block("Issuer", issuer_redacted),
@@ -1033,8 +1143,8 @@ pub fn render_summary_html(view: &PendingApprovalView) -> String {
             // and inserted by the caller AFTER this block, keeping the HTML
             // validly nested.
             let mut rows = String::new();
-            rows.push_str(&row("Chain ID", chain_id));
-            rows.push_str(&row("Proposal digest", proposal_sha256_hex));
+            rows.push_str(&fact_row("Chain ID", chain_id));
+            rows.push_str(&fact_row("Proposal digest", proposal_sha256_hex));
             format!(
                 "{}{}",
                 address_block("Smart account", smart_account_redacted),
@@ -1059,18 +1169,18 @@ pub fn render_summary_html(view: &PendingApprovalView) -> String {
             // the wallet does not have here, and a seven-decimal reading of it
             // would state a value the operator is not actually authorising.
             let mut rows = String::new();
-            rows.push_str(&row("Profile", profile));
-            rows.push_str(&row("Network", chain_id));
-            rows.push_str(&row("Payer", payer_redacted));
-            rows.push_str(&row("Transport", transport));
-            rows.push_str(&row("Authority", authority));
-            rows.push_str(&row("Target", target));
-            rows.push_str(&row("Token contract", currency));
-            rows.push_str(&row(
+            rows.push_str(&fact_row("Profile", profile));
+            rows.push_str(&fact_row("Network", chain_id));
+            rows.push_str(&fact_row("Payer", payer_redacted));
+            rows.push_str(&fact_row("Transport", transport));
+            rows.push_str(&fact_row("Authority", authority));
+            rows.push_str(&fact_row("Target", target));
+            rows.push_str(&fact_row("Token contract", currency));
+            rows.push_str(&fact_row(
                 "Challenge expires (Unix)",
                 &challenge_expires_at_unix.to_string(),
             ));
-            rows.push_str(&row(
+            rows.push_str(&fact_row(
                 &format!("Simulated fee (stroops, {SIMULATED_FEE_NOTE})"),
                 &simulated_fee_stroops.to_string(),
             ));
@@ -1082,7 +1192,7 @@ pub fn render_summary_html(view: &PendingApprovalView) -> String {
             )
         }
         ApprovalSummaryView::Rejected { original_kind_name } => {
-            facts(&row("Rejected kind", original_kind_name))
+            facts(&fact_row("Rejected kind", original_kind_name))
         }
         // `ApprovalSummaryView` is `#[non_exhaustive]`; a future variant renders
         // a minimal placeholder rather than failing to build.
@@ -1517,8 +1627,15 @@ mod tests {
                 "presence-reject",
             ),
         ] {
-            let html =
-                render_mainnet_consent_page(&view, &context, &data, Some("ab12"), mode, &marked());
+            let html = render_mainnet_consent_page(
+                &view,
+                &context,
+                &data,
+                Some("ab12"),
+                None,
+                mode,
+                &marked(),
+            );
             assert_eq!(html.matches(BRAND_STYLE).count(), 1, "{mode:?}");
             assert!(html.contains(DETAIL_STYLE), "{mode:?}");
             assert!(html.contains(&render_summary_html(&view)), "{mode:?}");
@@ -1555,10 +1672,134 @@ mod tests {
             &context,
             &data,
             None,
+            None,
             ConsentPageMode::OneShot,
             &neutral(),
         );
         assert!(!html.contains("Intent digest"));
+    }
+
+    /// A classic intent from its JSON transport form, as the intent module
+    /// validates it.
+    fn intent_of(value: serde_json::Value) -> stellar_agent_core::approval::ClassicIntent {
+        serde_json::from_value(value).unwrap()
+    }
+
+    /// The intent base of the tests, with `memo`.
+    fn intent_base(memo: &serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "chain_id": "stellar:mainnet",
+            "source": "GAQAA5L65LSYH7CQ3VTJ7F3HHLGCL3DSLAR2Y47263D56MNNGHSQSTVY",
+            "policy_digest": "11".repeat(32),
+            "fee_bound_stroops": "300",
+            "memo": memo,
+        })
+    }
+
+    /// With an intent, the consent page shows the intent's rows and fee
+    /// bound in place of the envelope summary: no sequence and no simulated
+    /// fee, the memo escaped, trustline removal and unlimited spelled out,
+    /// and a claim's balance, asset, amount and claimant. The card around it
+    /// stays.
+    #[test]
+    fn mainnet_consent_page_renders_the_intent() {
+        use stellar_agent_core::approval::IntentView;
+        let dir = TempDir::new().unwrap();
+        let view = payment_view(&dir, false, NOW_MS);
+        let context = test_context();
+        let data = serde_json::json!({"nonce": view.approval_nonce});
+        let render = |intent: &stellar_agent_core::approval::ClassicIntent| {
+            render_mainnet_consent_page(
+                &view,
+                &context,
+                &data,
+                Some("ab12"),
+                Some(&IntentView::new(intent)),
+                ConsentPageMode::Inbox,
+                &neutral(),
+            )
+        };
+        let pay = intent_of(serde_json::json!({
+            "base": intent_base(&serde_json::json!({"text": "<b>&\"x"})),
+            "payload": {"pay": {
+                "destination": "GBPXXOA5N4JYPESHAADMQKBPWZWQDQ64ZV6ZL2S3LAGW4SY7NTCMWIVL",
+                "asset": "native",
+                "amount_stroops": "25000000",
+            }},
+        }));
+        let html = render(&pay);
+        for expected in [
+            "<dt>Nonce</dt>",
+            "<dt>Kind</dt><dd>Payment</dd>",
+            "<dt>Network</dt><dd>stellar:mainnet</dd>",
+            "<dt>Source</dt><dd>GAQAA5L65LSYH7CQ3VTJ7F3HHLGCL3DSLAR2Y47263D56MNNGHSQSTVY</dd>",
+            "<div class=\"addr\">GBPXXOA5N4JYPESHAADMQKBPWZWQDQ64ZV6ZL2S3LAGW4SY7NTCMWIVL</div>",
+            "<dt>Asset</dt><dd>XLM</dd>",
+            "<dt>Amount (stroops)</dt><dd>25000000</dd>",
+            "<small>25000000 stroops</small>",
+            "<dt>Memo</dt><dd>text &quot;&lt;b&gt;&amp;&quot;x&quot;</dd>",
+            "<dt>Fee at most (stroops)</dt><dd>300</dd>",
+            "<dt>Policy digest</dt><dd>11111111...11111111</dd>",
+            "<dt>Intent digest</dt><dd><code>ab12</code></dd>",
+            r#"id="presence-approve""#,
+            r#"id="presence-reject""#,
+        ] {
+            assert!(html.contains(expected), "{expected}");
+        }
+        assert!(html.contains(&kind_head_html(&view)));
+        assert!(html.contains(&render_context_header_html(&context)));
+        assert!(html.contains(&expiry_line_html(&view, true)));
+        assert!(!html.contains(&render_summary_html(&view)));
+        assert!(!html.contains("<b>&"));
+        for absent in ["seq num", "Simulated fee", "Sequence"] {
+            assert!(!html.contains(absent), "{absent}");
+        }
+
+        for (limit, expected) in [
+            ("0", "0 stroops (removes the trustline)"),
+            ("9223372036854775807", "unlimited"),
+        ] {
+            let html = render(&intent_of(serde_json::json!({
+                "base": intent_base(&serde_json::json!("none")),
+                "payload": {"trustline": {
+                    "issuer": "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN",
+                    "code": "USDC",
+                    "limit_stroops": limit,
+                }},
+            })));
+            assert!(html.contains("<dt>Kind</dt><dd>Trustline</dd>"));
+            assert!(html.contains("<dt>Asset code</dt><dd>USDC</dd>"));
+            assert!(
+                html.contains(&format!("<dt>Limit</dt><dd>{expected}</dd>")),
+                "{limit}"
+            );
+            assert!(html.contains("<dt>Memo</dt><dd>none</dd>"));
+            assert!(!html.contains("seq num"));
+        }
+
+        let html = render(&intent_of(serde_json::json!({
+            "base": intent_base(&serde_json::json!({"id": "7"})),
+            "payload": {"claim": {
+                "balance_id": format!("00000000{}", "0b".repeat(32)),
+                "asset": {"issued": {
+                    "code": "USDC",
+                    "issuer": "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5",
+                }},
+                "amount_stroops": "1",
+                "claimant": "GAQAA5L65LSYH7CQ3VTJ7F3HHLGCL3DSLAR2Y47263D56MNNGHSQSTVY",
+            }},
+        })));
+        for expected in [
+            "<dt>Kind</dt><dd>Claim</dd>",
+            "<div class=\"addr\">BAAAWCYLBMFQWCYLBMFQWCYLBMFQWCYLBMFQWCYLBMFQWCYLBMFQWC4VWM</div>",
+            "<dt>Asset</dt><dd>USDC:GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5</dd>",
+            "<dt>Amount (stroops)</dt><dd>1</dd>",
+            "<dt>Claimant</dt><dd>GAQAA5L65LSYH7CQ3VTJ7F3HHLGCL3DSLAR2Y47263D56MNNGHSQSTVY</dd>",
+            "<dt>Memo</dt><dd>id 7</dd>",
+        ] {
+            assert!(html.contains(expected), "{expected}");
+        }
+        assert!(!html.contains("seq num"));
     }
 
     #[test]

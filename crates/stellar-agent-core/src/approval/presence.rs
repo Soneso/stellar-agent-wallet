@@ -8,9 +8,10 @@
 //!
 //! # Ceremony
 //!
-//! 1. [`issue_mainnet_presence`] snapshots a live, unattested pending entry
-//!    with the verified policy and an expected origin, draws 32 random bytes
-//!    and a consent request ID, and computes the challenge. The returned
+//! 1. [`issue_mainnet_presence`] or [`issue_mainnet_intent_presence`]
+//!    snapshots a live, unattested pending entry with the verified policy, an
+//!    expected origin and an optional intent, draws 32 random bytes and a
+//!    consent request ID, and computes the challenge. The returned
 //!    [`PendingMainnetPresence`] is single use: it has no `Clone`, and
 //!    [`verify_mainnet_presence`] consumes it.
 //! 2. The authenticator signs the challenge. [`MainnetPresenceOptions`] tells
@@ -28,6 +29,9 @@
 //!
 //! # Challenge
 //!
+//! A ceremony that binds no intent under a policy without
+//! `approval_origin` uses the legacy layout:
+//!
 //! ```text
 //! SHA-256(
 //!   b"stellar-agent-mainnet-presence:v1" ||
@@ -41,15 +45,49 @@
 //! )
 //! ```
 //!
+//! A ceremony that binds a [`ClassicIntent`], or runs under a policy with
+//! `approval_origin`, uses the intent layout under
+//! [`INTENT_CHALLENGE_DOMAIN`]:
+//!
+//! ```text
+//! SHA-256(
+//!   b"stellar-agent-wallet/intent-challenge/v1" ||
+//!   random32 || lp(consent_request_id) || lp(approval_nonce) ||
+//!   lp(profile_name) || lp(chain_caip2) || lp(kind_name) ||
+//!   subject32 || lp(process_uid) ||
+//!   u64be(entry_created_at_ms) || u64be(entry_expires_at_ms) ||
+//!   i64be(policy_sequence) || policy_digest32 || policy_owner32 ||
+//!   tag(intent_digest32) || lp(rp_id) || lp(expected_origin) ||
+//!   tag(cert_spki_sha256) ||
+//!   u64be(challenge_issued_at_ms) || u64be(challenge_expires_at_ms)
+//! )
+//! ```
+//!
 //! `lp(x)` is `u32be(len(x)) || x`; a length beyond `u32::MAX` refuses.
+//! `tag(x)` is the byte `0x00` when `x` is absent and `0x01 || x` when it is
+//! present. The intent digest is [`ClassicIntent::digest`]; the pin is the
+//! signed `approval_cert_spki_sha256`, present exactly under a signed origin.
 //!
 //! # Origin and relying party
 //!
-//! The relying-party ID is [`MAINNET_APPROVAL_RP_ID`]. The expected origin is
-//! exactly `http://localhost:<port>` with a canonical decimal port in
-//! `1..=65535`, chosen by the caller from its bound listener; no request
-//! header selects it. `clientDataJSON.origin` must equal it, `crossOrigin`
-//! must be absent or `false`, and `topOrigin` must be absent.
+//! The verified policy selects the relying party and the origin, and every
+//! check reads that one selection. Without `approval_origin`, the RP ID is
+//! [`MAINNET_APPROVAL_RP_ID`] and the expected origin is exactly
+//! `http://localhost:<port>` with a canonical decimal port in `1..=65535`,
+//! chosen by the caller from its bound listener; no request header selects
+//! it. With `approval_origin`, the RP ID is the origin's host and the
+//! expected origin is the signed origin itself, and only
+//! [`issue_mainnet_intent_presence`] with a [`ListenerIdentity`] issues a
+//! challenge. `clientDataJSON.origin` must equal the expected origin,
+//! `crossOrigin` must be absent or `false`, and `topOrigin` must be absent.
+//!
+//! # Receipt versions
+//!
+//! A legacy-layout ceremony writes receipt version 1; an intent-layout
+//! ceremony writes version 2, which carries the certificate pin and the
+//! listener's policy digest exactly when its origin is HTTPS. A receipt
+//! verifies only when its version is the one the verifying policy and intent
+//! select, and no version converts into another.
 //!
 //! # Counters
 //!
@@ -126,10 +164,13 @@ use sha2::{Digest as _, Sha256};
 
 use super::AssertionInput;
 use super::attestation::AttestationBinding;
+use super::intent::ClassicIntent;
 use super::store::{ApprovalKind, PendingApproval};
+use super::witness::ApprovedKind;
 use crate::audit_log::schema::MainnetPresenceAudit;
 use crate::error::{ApprovalFailure, WalletError};
 use crate::mainnet::verified_policy::VerifiedPolicy;
+use crate::policy::v1::approval_origin::ApprovalOrigin;
 use crate::profile::caip2::Caip2;
 
 /// The relying-party ID of every mainnet approval credential.
@@ -168,17 +209,27 @@ pub(crate) const MAINNET_PRESENCE_RECEIPT_MAX_BYTES: usize = 16 * 1024;
 const RECEIPT_REQUEST_ID_MAX_BYTES: usize = 36;
 const RECEIPT_RANDOM_MAX_BYTES: usize = 43;
 const RECEIPT_HEX_MAX_BYTES: usize = 64;
-const RECEIPT_ORIGIN_MAX_BYTES: usize = "http://localhost:65535".len();
+/// The longest receipt origin: `https://`, a 253-byte host and `:65535`.
+const RECEIPT_ORIGIN_MAX_BYTES: usize = "https://".len() + 253 + ":65535".len();
 const RECEIPT_SIGNATURE_BYTES: usize = 64;
 
 /// The SEC1 uncompressed P-256 point length.
 const SEC1_UNCOMPRESSED_BYTES: usize = super::registration_input::PUBLIC_KEY_UNCOMPRESSED_SEC1_LEN;
 
-/// The version of the receipt layout this build writes and reads.
+/// The receipt version of a ceremony under the legacy challenge layout.
 pub const MAINNET_PRESENCE_RECEIPT_VERSION: u32 = 1;
 
+/// The receipt version of a ceremony under the intent challenge layout: one
+/// that binds an intent or runs at a signed origin.
+pub const MAINNET_PRESENCE_RECEIPT_VERSION_2: u32 = 2;
+
 const CHALLENGE_DOMAIN: &[u8] = b"stellar-agent-mainnet-presence:v1";
+
+/// The domain of the intent challenge layout.
+pub const INTENT_CHALLENGE_DOMAIN: &[u8] = b"stellar-agent-wallet/intent-challenge/v1";
+
 const VIEW_DOMAIN: &[u8] = b"stellar-agent-mainnet-consent-view:v1";
+const INTENT_VIEW_DOMAIN: &[u8] = b"stellar-agent-wallet/intent-consent-view/v1";
 const APPROVAL_VIEW_DOMAIN: &[u8] = b"stellar-agent-approval-view:v1";
 const RECEIPT_DOMAIN: &[u8] = b"stellar-agent-mainnet-presence-receipt:v1";
 const CREDENTIAL_FINGERPRINT_DOMAIN: &[u8] = b"stellar-agent-mainnet-approval-credential:v1";
@@ -262,6 +313,18 @@ impl Preimage {
         self
     }
 
+    /// `0x00` for an absent value, `0x01 || value` for a present one.
+    fn tagged(&mut self, value: Option<&[u8; 32]>) -> &mut Self {
+        match value {
+            Some(bytes) => {
+                self.hasher.update([1]);
+                self.hasher.update(bytes);
+            }
+            None => self.hasher.update([0]),
+        }
+        self
+    }
+
     fn finish(self) -> Option<[u8; 32]> {
         (!self.overflow).then(|| self.hasher.finalize().into())
     }
@@ -285,6 +348,88 @@ pub fn is_mainnet_presence_origin(origin: &str) -> bool {
 #[must_use]
 pub fn mainnet_presence_origin(port: u16) -> String {
     format!("http://{MAINNET_APPROVAL_RP_ID}:{port}")
+}
+
+/// Whether `origin` has the shape of a signed HTTPS origin: `https://`
+/// followed by lowercase ASCII letters, digits, `-`, `.` and `:`, within the
+/// receipt bound. The grammar of the signed origin itself is the policy
+/// parser's; a verification compares the origin with the signed one.
+fn is_https_origin_shape(origin: &str) -> bool {
+    origin.len() <= RECEIPT_ORIGIN_MAX_BYTES
+        && origin.strip_prefix("https://").is_some_and(|authority| {
+            !authority.is_empty()
+                && authority.bytes().all(|b| {
+                    b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'-' | b'.' | b':')
+                })
+        })
+}
+
+/// The relying party and origin rule a verified policy selects for its
+/// mainnet consent.
+///
+/// A policy without `approval_origin` selects [`MAINNET_APPROVAL_RP_ID`] and
+/// the loopback origins of [`is_mainnet_presence_origin`]. A policy with it
+/// selects the origin's host as the RP ID, exactly that origin, and the
+/// signed certificate pin. No origin maps to another RP ID, and no policy
+/// admits both forms.
+#[derive(Clone, Copy)]
+enum PresenceSite<'a> {
+    Loopback,
+    Signed {
+        origin: &'a ApprovalOrigin,
+        pin: &'a [u8; 32],
+    },
+}
+
+impl<'a> PresenceSite<'a> {
+    /// The selection of `policy`. A policy without a mainnet section selects
+    /// the loopback form; the issuer refuses it separately.
+    ///
+    /// # Errors
+    ///
+    /// `approval.presence_policy_unavailable` for an origin without a pin or
+    /// a pin without an origin, which the policy loader never produces.
+    fn of(policy: &'a VerifiedPolicy) -> Result<Self, WalletError> {
+        let Some(body) = policy.mainnet() else {
+            return Ok(Self::Loopback);
+        };
+        match (&body.approval_origin, &body.approval_cert_spki_sha256) {
+            (None, None) => Ok(Self::Loopback),
+            (Some(origin), Some(pin)) => Ok(Self::Signed { origin, pin }),
+            _ => Err(policy_unavailable()),
+        }
+    }
+
+    fn rp_id(self) -> &'a str {
+        match self {
+            Self::Loopback => MAINNET_APPROVAL_RP_ID,
+            Self::Signed { origin, .. } => origin.rp_id(),
+        }
+    }
+
+    fn admits(self, expected_origin: &str) -> bool {
+        match self {
+            Self::Loopback => is_mainnet_presence_origin(expected_origin),
+            Self::Signed { origin, .. } => expected_origin == origin.as_str(),
+        }
+    }
+
+    fn pin(self) -> Option<&'a [u8; 32]> {
+        match self {
+            Self::Loopback => None,
+            Self::Signed { pin, .. } => Some(pin),
+        }
+    }
+
+    /// The receipt version of a ceremony at this site, with or without an
+    /// intent.
+    fn version(self, intent_bound: bool) -> u32 {
+        if intent_bound || matches!(self, Self::Signed { .. }) {
+            MAINNET_PRESENCE_RECEIPT_VERSION_2
+        } else {
+            MAINNET_PRESENCE_RECEIPT_VERSION
+        }
+    }
 }
 
 /// Whether `value` is the canonical lowercase hyphenated form of a version 4
@@ -322,6 +467,10 @@ fn presence_expired() -> WalletError {
 
 fn policy_unavailable() -> WalletError {
     WalletError::Approval(ApprovalFailure::PresencePolicyUnavailable)
+}
+
+fn listener_policy_stale() -> WalletError {
+    WalletError::Approval(ApprovalFailure::ListenerPolicyStale)
 }
 
 fn unsupported_kind() -> WalletError {
@@ -707,6 +856,9 @@ pub fn approval_view_digest(
 
 /// The digest of the consent details a page renders, for a stale-view check.
 ///
+/// [`mainnet_intent_consent_view_digest`] with no intent: under a policy
+/// without `approval_origin` it is the legacy layout
+///
 /// ```text
 /// SHA-256(
 ///   b"stellar-agent-mainnet-consent-view:v1" || lp(approval_nonce) ||
@@ -723,17 +875,75 @@ pub fn approval_view_digest(
 ///
 /// # Errors
 ///
-/// The errors of [`mainnet_consent_subject`], and
-/// `approval.presence_invalid` for a field longer than `u32::MAX` bytes.
+/// The errors of [`mainnet_intent_consent_view_digest`].
 pub fn mainnet_consent_view_digest(
     entry: &PendingApproval,
     binding: &AttestationBinding<'_>,
     policy: &VerifiedPolicy,
 ) -> Result<[u8; 32], WalletError> {
+    mainnet_intent_consent_view_digest(entry, binding, policy, None)
+}
+
+/// The digest of the consent details a page renders for `entry` with an
+/// optional `intent`, for a stale-view check.
+///
+/// A view without an intent under a policy without `approval_origin` uses
+/// the legacy layout of [`mainnet_consent_view_digest`]. Every other view
+/// appends the tagged intent digest under its own domain:
+///
+/// ```text
+/// SHA-256(
+///   b"stellar-agent-wallet/intent-consent-view/v1" || lp(approval_nonce) ||
+///   lp(profile_name) || lp(chain_caip2) || lp(kind_name) || subject32 ||
+///   lp(process_uid) || u64be(entry_created_at_ms) ||
+///   u64be(entry_expires_at_ms) || i64be(policy_sequence) ||
+///   policy_digest32 || policy_owner32 || tag(intent_digest32)
+/// )
+/// ```
+///
+/// A page that shows an intent renders this digest, and the challenge of its
+/// ceremony binds the same intent digest, so a page for one intent never
+/// stands for another.
+///
+/// # Errors
+///
+/// The errors of [`mainnet_consent_subject`],
+/// `approval.presence_policy_unavailable` for a policy whose origin and pin
+/// are not paired, and `approval.presence_invalid` for a field longer than
+/// `u32::MAX` bytes.
+pub fn mainnet_intent_consent_view_digest(
+    entry: &PendingApproval,
+    binding: &AttestationBinding<'_>,
+    policy: &VerifiedPolicy,
+    intent: Option<&ClassicIntent>,
+) -> Result<[u8; 32], WalletError> {
     let subject = mainnet_consent_subject(entry, binding)?;
-    let mut preimage = Preimage::new(VIEW_DOMAIN);
+    let site = PresenceSite::of(policy)?;
+    let intent_digest = intent.map(|intent| *intent.digest().as_bytes());
+    let legacy = site.version(intent_digest.is_some()) == MAINNET_PRESENCE_RECEIPT_VERSION;
+    let mut preimage = Preimage::new(if legacy {
+        VIEW_DOMAIN
+    } else {
+        INTENT_VIEW_DOMAIN
+    });
     consent_fields(&mut preimage, entry, binding, &subject, policy);
+    if !legacy {
+        preimage.tagged(intent_digest.as_ref());
+    }
     preimage.finish().ok_or_else(presence_invalid)
+}
+
+/// Which challenge layout a ceremony uses, with what the intent layout adds.
+#[derive(Clone, Copy)]
+pub(crate) enum ChallengeLayout<'a> {
+    /// The legacy layout under `stellar-agent-mainnet-presence:v1`.
+    Legacy,
+    /// The intent layout under [`INTENT_CHALLENGE_DOMAIN`], with the optional
+    /// intent digest and certificate pin.
+    Intent {
+        intent: Option<&'a [u8; 32]>,
+        pin: Option<&'a [u8; 32]>,
+    },
 }
 
 /// Every input of one challenge.
@@ -744,15 +954,21 @@ pub(crate) struct ChallengeFacts<'a> {
     pub(crate) binding: &'a AttestationBinding<'a>,
     pub(crate) subject: &'a [u8; 32],
     pub(crate) policy: &'a VerifiedPolicy,
+    pub(crate) rp_id: &'a str,
     pub(crate) expected_origin: &'a str,
+    pub(crate) layout: ChallengeLayout<'a>,
     pub(crate) issued_at_unix_ms: u64,
     pub(crate) expires_at_unix_ms: u64,
 }
 
-/// The challenge of the module documentation; `None` for a field longer
-/// than `u32::MAX` bytes.
+/// The challenge of the module documentation in the layout `facts` names;
+/// `None` for a field longer than `u32::MAX` bytes.
 pub(crate) fn mainnet_presence_challenge(facts: &ChallengeFacts<'_>) -> Option<[u8; 32]> {
-    let mut preimage = Preimage::new(CHALLENGE_DOMAIN);
+    let (domain, extension) = match facts.layout {
+        ChallengeLayout::Legacy => (CHALLENGE_DOMAIN, None),
+        ChallengeLayout::Intent { intent, pin } => (INTENT_CHALLENGE_DOMAIN, Some((intent, pin))),
+    };
+    let mut preimage = Preimage::new(domain);
     preimage.fixed(facts.random).lp(facts.request_id.as_bytes());
     consent_fields(
         &mut preimage,
@@ -761,9 +977,16 @@ pub(crate) fn mainnet_presence_challenge(facts: &ChallengeFacts<'_>) -> Option<[
         facts.subject,
         facts.policy,
     );
+    if let Some((intent, _)) = extension {
+        preimage.tagged(intent);
+    }
     preimage
-        .lp(MAINNET_APPROVAL_RP_ID.as_bytes())
-        .lp(facts.expected_origin.as_bytes())
+        .lp(facts.rp_id.as_bytes())
+        .lp(facts.expected_origin.as_bytes());
+    if let Some((_, pin)) = extension {
+        preimage.tagged(pin);
+    }
+    preimage
         .u64(facts.issued_at_unix_ms)
         .u64(facts.expires_at_unix_ms);
     preimage.finish()
@@ -796,15 +1019,17 @@ pub(crate) struct AssertionFacts {
 /// Verifies `assertion` as a mainnet consent to `challenge` at
 /// `expected_origin`, under the key `policy` signs for its credential ID.
 ///
-/// The original bytes are checked; no JSON is rebuilt before the signature
-/// check. Every refusal is `approval.presence_invalid`.
+/// `policy` selects the RP ID and the admitted origin. The original bytes
+/// are checked; no JSON is rebuilt before the signature check. Every refusal
+/// is `approval.presence_invalid`.
 pub(crate) fn check_assertion(
     policy: &VerifiedPolicy,
     challenge: &[u8; 32],
     expected_origin: &str,
     assertion: &AssertionInput,
 ) -> Result<AssertionFacts, WalletError> {
-    if !is_mainnet_presence_origin(expected_origin) {
+    let site = PresenceSite::of(policy).map_err(|_| presence_invalid())?;
+    if !site.admits(expected_origin) {
         return Err(presence_invalid());
     }
     if !(CREDENTIAL_ID_MIN_BYTES..=CREDENTIAL_ID_MAX_BYTES).contains(&assertion.credential_id.len())
@@ -841,7 +1066,7 @@ pub(crate) fn check_assertion(
         .as_slice()
         .try_into()
         .map_err(|_| presence_invalid())?;
-    let rp_id_hash: [u8; 32] = Sha256::digest(MAINNET_APPROVAL_RP_ID.as_bytes()).into();
+    let rp_id_hash: [u8; 32] = Sha256::digest(site.rp_id().as_bytes()).into();
     super::webauthn::pre_verify_assertion(
         challenge,
         credential.public_key_sec1(),
@@ -949,7 +1174,8 @@ pub struct MainnetPresenceOptions {
     pub challenge: String,
     /// The consent request ID the assertion POST names.
     pub request_id: String,
-    /// The relying-party ID, [`MAINNET_APPROVAL_RP_ID`].
+    /// The relying-party ID the policy selects: [`MAINNET_APPROVAL_RP_ID`],
+    /// or the host of the signed origin.
     pub rp_id: String,
     /// The signed policy's credential IDs, canonical base64url.
     pub allow_credentials: Vec<String>,
@@ -960,12 +1186,13 @@ pub struct MainnetPresenceOptions {
 }
 
 /// One outstanding presence challenge: the consent snapshot it binds, the
-/// random value, the request ID, the expected origin and both deadlines.
+/// random value, the request ID, the RP ID, the expected origin, the intent
+/// and listener it binds, and both deadlines.
 ///
-/// Only [`issue_mainnet_presence`] constructs one, and only
-/// [`verify_mainnet_presence`] consumes it. It cannot be cloned or
-/// serialized, so a challenge verifies at most once and cannot be recovered
-/// from a browser, a disk file, or its inputs.
+/// Only [`issue_mainnet_intent_presence`] constructs one, also on behalf of
+/// [`issue_mainnet_presence`], and only [`verify_mainnet_presence`] consumes
+/// it. It cannot be cloned or serialized, so a challenge verifies at most
+/// once and cannot be recovered from a browser, a disk file, or its inputs.
 pub struct PendingMainnetPresence {
     entry: PendingApproval,
     profile_name: String,
@@ -973,7 +1200,10 @@ pub struct PendingMainnetPresence {
     policy: VerifiedPolicy,
     random: [u8; 32],
     request_id: String,
+    rp_id: String,
     expected_origin: String,
+    version: u32,
+    listener: Option<ListenerIdentity>,
     issued_at_unix_ms: u64,
     expires_at_unix_ms: u64,
     deadline: Instant,
@@ -1002,7 +1232,7 @@ impl PendingMainnetPresence {
         MainnetPresenceOptions {
             challenge: URL_SAFE_NO_PAD.encode(self.challenge),
             request_id: self.request_id.clone(),
-            rp_id: MAINNET_APPROVAL_RP_ID.to_owned(),
+            rp_id: self.rp_id.clone(),
             allow_credentials: credentials
                 .iter()
                 .map(MainnetApprovalCredential::credential_id_b64url)
@@ -1038,28 +1268,126 @@ impl PendingMainnetPresence {
     }
 }
 
-/// Issues a presence challenge for `entry` under `policy`.
+/// The identity a signed-origin listener serves under: the digest of the
+/// verified policy it started with and that policy's certificate pin.
 ///
-/// Requires a mainnet `binding`, a `policy` whose mainnet section names the
-/// binding's profile and lists approval credentials, a live and unattested
-/// `entry` of a supported kind, and an `expected_origin` of the form
-/// `http://localhost:<port>`. The challenge lives for the shorter of 120
-/// seconds and the entry's remaining life, on the monotonic and the wall
-/// clock alike.
+/// Only [`ListenerIdentity::capture`] constructs one, from a verified policy
+/// with `approval_origin`, so an identity always names a signed origin.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListenerIdentity {
+    policy_digest: [u8; 32],
+    cert_spki_sha256: [u8; 32],
+}
+
+impl ListenerIdentity {
+    /// Captures the identity of `policy`: its digest and its signed
+    /// certificate pin.
+    ///
+    /// # Errors
+    ///
+    /// `approval.presence_policy_unavailable` for a policy without a mainnet
+    /// section, without `approval_origin`, or with an unpaired origin or pin.
+    pub fn capture(policy: &VerifiedPolicy) -> Result<Self, WalletError> {
+        match PresenceSite::of(policy)? {
+            PresenceSite::Signed { pin, .. } => Ok(Self {
+                policy_digest: policy.digest(),
+                cert_spki_sha256: *pin,
+            }),
+            PresenceSite::Loopback => Err(policy_unavailable()),
+        }
+    }
+
+    /// The BLAKE3 digest of the policy the listener captured.
+    #[must_use]
+    pub fn policy_digest(&self) -> [u8; 32] {
+        self.policy_digest
+    }
+
+    /// The signed SHA-256 of the served leaf certificate's SPKI DER.
+    #[must_use]
+    pub fn cert_spki_sha256(&self) -> [u8; 32] {
+        self.cert_spki_sha256
+    }
+}
+
+/// The listener a ceremony runs on, which selects its expected origin.
+#[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
+pub enum PresenceListener<'a> {
+    /// A loopback listener with the expected origin
+    /// `http://localhost:<port>`, under a policy without `approval_origin`.
+    Loopback(&'a str),
+    /// The HTTPS listener of the signed origin, by the identity it captured
+    /// at startup.
+    SignedOrigin(&'a ListenerIdentity),
+}
+
+/// Issues a presence challenge for `entry` under `policy` at the loopback
+/// `expected_origin`.
+///
+/// [`issue_mainnet_intent_presence`] with a [`PresenceListener::Loopback`]
+/// listener and no intent: under a policy without `approval_origin` the
+/// challenge has the legacy layout and the receipt version 1. Under a policy
+/// with `approval_origin` the ceremony runs only at the signed origin, so
+/// this entry point refuses.
 ///
 /// # Errors
 ///
-/// - `approval.binding_mismatch` for another chain.
-/// - `approval.presence_policy_unavailable` for a policy without a mainnet
-///   section for the binding's profile or without credentials.
-/// - `approval.presence_invalid` for an origin of another shape.
-/// - `approval.expired`, `approval.already_attested` for the entry's state.
-/// - The errors of [`mainnet_consent_subject`].
+/// The errors of [`issue_mainnet_intent_presence`].
 pub fn issue_mainnet_presence(
     entry: &PendingApproval,
     binding: &AttestationBinding<'_>,
     policy: &VerifiedPolicy,
     expected_origin: &str,
+    now_ms: u64,
+    now: Instant,
+) -> Result<PendingMainnetPresence, WalletError> {
+    issue_mainnet_intent_presence(
+        entry,
+        binding,
+        policy,
+        PresenceListener::Loopback(expected_origin),
+        None,
+        now_ms,
+        now,
+    )
+}
+
+/// Issues a presence challenge for `entry` under `policy` on `listener`,
+/// binding `intent` when one is given.
+///
+/// Requires a mainnet `binding`, a `policy` whose mainnet section names the
+/// binding's profile and lists approval credentials, and a live and unattested
+/// `entry` of a supported kind. An `intent` must name the binding's chain and
+/// the entry's record kind. A loopback listener requires a policy without
+/// `approval_origin` and an `expected_origin` of the form
+/// `http://localhost:<port>`. A signed-origin listener requires a policy with
+/// `approval_origin` whose digest and pin equal the listener's identity; its
+/// expected origin is the signed origin and its RP ID the origin's host. A
+/// ceremony with an intent or at a signed origin uses the intent layout and
+/// writes receipt version 2; every other uses the legacy layout and version 1.
+/// The challenge lives for the shorter of 120 seconds and the entry's remaining
+/// life, on the monotonic and the wall clock alike.
+///
+/// # Errors
+///
+/// - `approval.binding_mismatch` for another chain.
+/// - `approval.presence_policy_unavailable` for a policy without a mainnet
+///   section for the binding's profile, without credentials, or with an
+///   unpaired origin or pin.
+/// - `approval.listener_policy_stale` for a listener identity whose policy
+///   digest or pin differs from `policy`.
+/// - `approval.presence_invalid` for a loopback origin of another shape or
+///   under a signed origin, and for an intent of another chain or record
+///   kind.
+/// - `approval.expired`, `approval.already_attested` for the entry's state.
+/// - The errors of [`mainnet_consent_subject`].
+pub fn issue_mainnet_intent_presence(
+    entry: &PendingApproval,
+    binding: &AttestationBinding<'_>,
+    policy: &VerifiedPolicy,
+    listener: PresenceListener<'_>,
+    intent: Option<&ClassicIntent>,
     now_ms: u64,
     now: Instant,
 ) -> Result<PendingMainnetPresence, WalletError> {
@@ -1070,9 +1398,29 @@ pub fn issue_mainnet_presence(
     if body.profile != binding.profile_name || body.approval_credentials.is_empty() {
         return Err(policy_unavailable());
     }
-    if !is_mainnet_presence_origin(expected_origin) {
+    let site = PresenceSite::of(policy)?;
+    if !intent_describes(entry, binding, intent) {
         return Err(presence_invalid());
     }
+    let (expected_origin, listener) = match listener {
+        PresenceListener::Loopback(origin) => {
+            if !is_mainnet_presence_origin(origin) || !site.admits(origin) {
+                return Err(presence_invalid());
+            }
+            (origin, None)
+        }
+        PresenceListener::SignedOrigin(identity) => match site {
+            // The version 2 policy digest covers the signed pin; the pin
+            // comparison restates that binding.
+            PresenceSite::Signed { origin, pin }
+                if identity.policy_digest == policy.digest()
+                    && *pin == identity.cert_spki_sha256 =>
+            {
+                (origin.as_str(), Some(identity.clone()))
+            }
+            _ => return Err(listener_policy_stale()),
+        },
+    };
     if entry.created_at_unix_ms > now_ms || now_ms >= entry.expires_at_unix_ms {
         return Err(WalletError::Approval(ApprovalFailure::Expired {
             detail: "this pending approval is outside its lifetime".to_owned(),
@@ -1097,6 +1445,16 @@ pub fn issue_mainnet_presence(
     let mut random = [0u8; 32];
     OsRng.fill_bytes(&mut random);
     let request_id = uuid::Uuid::new_v4().hyphenated().to_string();
+    let intent_digest = intent.map(|intent| *intent.digest().as_bytes());
+    let version = site.version(intent_digest.is_some());
+    let layout = if version == MAINNET_PRESENCE_RECEIPT_VERSION {
+        ChallengeLayout::Legacy
+    } else {
+        ChallengeLayout::Intent {
+            intent: intent_digest.as_ref(),
+            pin: site.pin(),
+        }
+    };
     let challenge = mainnet_presence_challenge(&ChallengeFacts {
         random: &random,
         request_id: &request_id,
@@ -1104,7 +1462,9 @@ pub fn issue_mainnet_presence(
         binding,
         subject: &subject,
         policy,
+        rp_id: site.rp_id(),
         expected_origin,
+        layout,
         issued_at_unix_ms: now_ms,
         expires_at_unix_ms,
     })
@@ -1116,7 +1476,10 @@ pub fn issue_mainnet_presence(
         policy: policy.clone(),
         random,
         request_id,
+        rp_id: site.rp_id().to_owned(),
         expected_origin: expected_origin.to_owned(),
+        version,
+        listener,
         issued_at_unix_ms: now_ms,
         expires_at_unix_ms,
         deadline,
@@ -1222,13 +1585,21 @@ pub fn verify_mainnet_presence(
         &assertion,
     )?;
     let receipt = MainnetPresenceReceipt {
-        version: MAINNET_PRESENCE_RECEIPT_VERSION,
+        version: pending.version,
         request_id: pending.request_id,
         random_b64url: URL_SAFE_NO_PAD.encode(pending.random),
         policy_sequence: pending.policy.sequence(),
         policy_digest_hex: crate::hex::encode(&pending.policy.digest()),
         policy_owner_hex: crate::hex::encode(&pending.policy.owner()),
         expected_origin: pending.expected_origin,
+        cert_spki_sha256: pending
+            .listener
+            .as_ref()
+            .map(|identity| crate::hex::encode(&identity.cert_spki_sha256)),
+        listener_policy_digest: pending
+            .listener
+            .as_ref()
+            .map(|identity| crate::hex::encode(&identity.policy_digest)),
         issued_at_unix_ms: pending.issued_at_unix_ms,
         expires_at_unix_ms: pending.expires_at_unix_ms,
         verified_at_unix_ms: now_ms,
@@ -1252,10 +1623,13 @@ pub fn verify_mainnet_presence(
 /// The record of one verified ceremony, stored with the version 5
 /// attestation it is bound into.
 ///
-/// It keeps the raw assertion, so the commit witness verifies the signature
-/// again. Counters, UP and UV are read from the signed authenticator data,
-/// never from a separate field. Decoding checks every field's shape and
-/// bounds; `Debug` shows no assertion bytes.
+/// Version 1 records a legacy-layout ceremony at a loopback origin. Version
+/// 2 records an intent-layout ceremony; at an HTTPS origin it also carries
+/// the certificate pin and the listener's policy digest. It keeps the raw
+/// assertion, so the commit witness verifies the signature again. Counters,
+/// UP and UV are read from the signed authenticator data, never from a
+/// separate field. Decoding checks every field's shape and bounds; `Debug`
+/// shows no assertion bytes.
 #[derive(Clone)]
 pub struct MainnetPresenceReceipt {
     version: u32,
@@ -1265,6 +1639,8 @@ pub struct MainnetPresenceReceipt {
     policy_digest_hex: String,
     policy_owner_hex: String,
     expected_origin: String,
+    cert_spki_sha256: Option<String>,
+    listener_policy_digest: Option<String>,
     issued_at_unix_ms: u64,
     expires_at_unix_ms: u64,
     verified_at_unix_ms: u64,
@@ -1280,6 +1656,8 @@ impl PartialEq for MainnetPresenceReceipt {
             && self.policy_digest_hex == other.policy_digest_hex
             && self.policy_owner_hex == other.policy_owner_hex
             && self.expected_origin == other.expected_origin
+            && self.cert_spki_sha256 == other.cert_spki_sha256
+            && self.listener_policy_digest == other.listener_policy_digest
             && self.issued_at_unix_ms == other.issued_at_unix_ms
             && self.expires_at_unix_ms == other.expires_at_unix_ms
             && self.verified_at_unix_ms == other.verified_at_unix_ms
@@ -1307,6 +1685,13 @@ impl std::fmt::Debug for MainnetPresenceReceipt {
 }
 
 impl MainnetPresenceReceipt {
+    /// The receipt version: [`MAINNET_PRESENCE_RECEIPT_VERSION`] or
+    /// [`MAINNET_PRESENCE_RECEIPT_VERSION_2`].
+    #[must_use]
+    pub fn version(&self) -> u32 {
+        self.version
+    }
+
     /// The consent request ID.
     #[must_use]
     pub fn request_id(&self) -> &str {
@@ -1337,6 +1722,20 @@ impl MainnetPresenceReceipt {
         &self.expected_origin
     }
 
+    /// The lowercase hex certificate pin the challenge bound, present exactly
+    /// for a version 2 receipt at an HTTPS origin.
+    #[must_use]
+    pub fn cert_spki_sha256_hex(&self) -> Option<&str> {
+        self.cert_spki_sha256.as_deref()
+    }
+
+    /// The lowercase hex digest of the policy the listener captured, present
+    /// exactly beside [`Self::cert_spki_sha256_hex`].
+    #[must_use]
+    pub fn listener_policy_digest_hex(&self) -> Option<&str> {
+        self.listener_policy_digest.as_deref()
+    }
+
     /// When the challenge was issued, in Unix milliseconds.
     #[must_use]
     pub fn issued_at_unix_ms(&self) -> u64 {
@@ -1361,18 +1760,38 @@ impl MainnetPresenceReceipt {
         URL_SAFE_NO_PAD.encode(&self.assertion.credential_id)
     }
 
-    /// Whether every field has its shape: version 1, a canonical UUIDv4
-    /// request ID, a canonical 32-byte random value, a lowercase hex policy
-    /// digest and owner, an expected origin of the mainnet form, and an assertion
-    /// within the mainnet bounds.
+    /// Whether every field has its shape: a canonical UUIDv4 request ID, a
+    /// canonical 32-byte random value, a lowercase hex policy digest and
+    /// owner, an assertion within the mainnet bounds, and the origin and
+    /// identity fields of the version.
+    ///
+    /// Version 1 has a loopback origin and no identity fields. Version 2 has
+    /// either a loopback origin and no identity fields, or an HTTPS origin
+    /// with both a lowercase hex certificate pin and a listener policy
+    /// digest. The check is of shape only: whether the policy admits the
+    /// origin and the identity is decided at verification.
     #[must_use]
     pub fn is_well_formed(&self) -> bool {
-        self.version == MAINNET_PRESENCE_RECEIPT_VERSION
+        let identity = match (&self.cert_spki_sha256, &self.listener_policy_digest) {
+            (None, None) => false,
+            (Some(pin), Some(digest)) if is_lower_hex32(pin) && is_lower_hex32(digest) => true,
+            _ => return false,
+        };
+        let origin = match self.version {
+            MAINNET_PRESENCE_RECEIPT_VERSION => {
+                !identity && is_mainnet_presence_origin(&self.expected_origin)
+            }
+            MAINNET_PRESENCE_RECEIPT_VERSION_2 if identity => {
+                is_https_origin_shape(&self.expected_origin)
+            }
+            MAINNET_PRESENCE_RECEIPT_VERSION_2 => is_mainnet_presence_origin(&self.expected_origin),
+            _ => false,
+        };
+        origin
             && is_canonical_uuid_v4(&self.request_id)
             && decode_canonical_b64url(&self.random_b64url, 32, 32).is_some()
             && is_lower_hex32(&self.policy_digest_hex)
             && is_lower_hex32(&self.policy_owner_hex)
-            && is_mainnet_presence_origin(&self.expected_origin)
             && (CREDENTIAL_ID_MIN_BYTES..=CREDENTIAL_ID_MAX_BYTES)
                 .contains(&self.assertion.credential_id.len())
             && self.assertion.authenticator_data.len() == MAINNET_AUTHENTICATOR_DATA_BYTES
@@ -1396,6 +1815,14 @@ impl MainnetPresenceReceipt {
         decode_lower_hex32(&self.policy_owner_hex)
     }
 
+    /// The decoded certificate pin and listener policy digest, when present.
+    fn identity(&self) -> Option<([u8; 32], [u8; 32])> {
+        Some((
+            decode_lower_hex32(self.cert_spki_sha256.as_deref()?)?,
+            decode_lower_hex32(self.listener_policy_digest.as_deref()?)?,
+        ))
+    }
+
     /// Whether the receipt names `policy`: its sequence, digest and owner.
     #[must_use]
     pub fn names_policy(&self, policy: &VerifiedPolicy) -> bool {
@@ -1409,11 +1836,13 @@ impl MainnetPresenceReceipt {
     /// SHA-256 of `b"stellar-agent-mainnet-presence-receipt:v1"` followed by
     /// `u32(version)`, `lp(request_id)`, the 32 decoded random bytes,
     /// `i64(policy_sequence)`, the 32 decoded policy digest bytes, the 32
-    /// decoded owner bytes,
-    /// `lp(expected_origin)`, `u64(issued)`, `u64(expires)`, `u64(verified)`,
-    /// then `lp` of the raw credential ID, authenticator data,
-    /// `clientDataJSON` and compact signature. All integers are big endian;
-    /// no TOML or JSON enters the digest.
+    /// decoded owner bytes, `lp(expected_origin)`, for version 2 only the
+    /// identity tag, `u64(issued)`, `u64(expires)`, `u64(verified)`, then
+    /// `lp` of the raw credential ID, authenticator data, `clientDataJSON`
+    /// and compact signature. The identity tag is `0x00` without identity
+    /// fields and `0x01` followed by the 32 decoded pin bytes and the 32
+    /// decoded listener policy digest bytes with them. All integers are big
+    /// endian; no TOML or JSON enters the digest.
     ///
     /// `None` for a receipt that is not well formed.
     #[must_use]
@@ -1429,7 +1858,14 @@ impl MainnetPresenceReceipt {
             .i64(self.policy_sequence)
             .fixed(&self.policy_digest()?)
             .fixed(&self.policy_owner()?)
-            .lp(self.expected_origin.as_bytes())
+            .lp(self.expected_origin.as_bytes());
+        if self.version == MAINNET_PRESENCE_RECEIPT_VERSION_2 {
+            match self.identity() {
+                Some((pin, listener)) => preimage.fixed(&[1]).fixed(&pin).fixed(&listener),
+                None => preimage.fixed(&[0]),
+            };
+        }
+        preimage
             .u64(self.issued_at_unix_ms)
             .u64(self.expires_at_unix_ms)
             .u64(self.verified_at_unix_ms)
@@ -1440,16 +1876,31 @@ impl MainnetPresenceReceipt {
         preimage.finish()
     }
 
-    /// Recomputes the challenge of this receipt over `entry`, `binding` and
-    /// `policy`, after checking `entry` is a supported kind.
-    fn challenge(
+    /// Recomputes the challenge of this receipt over `entry`, `binding`,
+    /// `policy` and `intent`, after checking `entry` is a supported kind.
+    ///
+    /// The layout, the RP ID and the pin are those `policy` and `intent`
+    /// select, never the receipt's version, so a receipt verifies only after
+    /// its version is checked against that selection.
+    fn challenge_for(
         &self,
         entry: &PendingApproval,
         binding: &AttestationBinding<'_>,
         policy: &VerifiedPolicy,
+        intent: Option<&ClassicIntent>,
     ) -> Result<[u8; 32], WalletError> {
         let subject = mainnet_consent_subject(entry, binding)?;
+        let site = PresenceSite::of(policy)?;
         let random = self.random().ok_or_else(presence_invalid)?;
+        let intent_digest = intent.map(|intent| *intent.digest().as_bytes());
+        let layout = if site.version(intent_digest.is_some()) == MAINNET_PRESENCE_RECEIPT_VERSION {
+            ChallengeLayout::Legacy
+        } else {
+            ChallengeLayout::Intent {
+                intent: intent_digest.as_ref(),
+                pin: site.pin(),
+            }
+        };
         mainnet_presence_challenge(&ChallengeFacts {
             random: &random,
             request_id: &self.request_id,
@@ -1457,7 +1908,9 @@ impl MainnetPresenceReceipt {
             binding,
             subject: &subject,
             policy,
+            rp_id: site.rp_id(),
             expected_origin: &self.expected_origin,
+            layout,
             issued_at_unix_ms: self.issued_at_unix_ms,
             expires_at_unix_ms: self.expires_at_unix_ms,
         })
@@ -1485,6 +1938,16 @@ fn bounded_string<'de, D: serde::Deserializer<'de>, const MAX: usize>(
         }
     }
     deserializer.deserialize_str(BoundedString::<MAX>)
+}
+
+/// Decodes an optional lowercase hex field without copying an overlong value.
+fn bounded_optional_hex<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(transparent)]
+    struct Hex(#[serde(deserialize_with = "bounded_string::<_, RECEIPT_HEX_MAX_BYTES>")] String);
+    Ok(Option::<Hex>::deserialize(deserializer)?.map(|hex| hex.0))
 }
 
 /// Decodes at most the field's byte bound, without trusting a size hint.
@@ -1537,6 +2000,18 @@ struct ReceiptWire {
     policy_owner_hex: String,
     #[serde(deserialize_with = "bounded_string::<_, RECEIPT_ORIGIN_MAX_BYTES>")]
     expected_origin: String,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "bounded_optional_hex"
+    )]
+    cert_spki_sha256: Option<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "bounded_optional_hex"
+    )]
+    listener_policy_digest: Option<String>,
     issued_at_unix_ms: u64,
     expires_at_unix_ms: u64,
     verified_at_unix_ms: u64,
@@ -1567,6 +2042,8 @@ impl Serialize for MainnetPresenceReceipt {
             policy_digest_hex: self.policy_digest_hex.clone(),
             policy_owner_hex: self.policy_owner_hex.clone(),
             expected_origin: self.expected_origin.clone(),
+            cert_spki_sha256: self.cert_spki_sha256.clone(),
+            listener_policy_digest: self.listener_policy_digest.clone(),
             issued_at_unix_ms: self.issued_at_unix_ms,
             expires_at_unix_ms: self.expires_at_unix_ms,
             verified_at_unix_ms: self.verified_at_unix_ms,
@@ -1599,6 +2076,8 @@ impl<'de> Deserialize<'de> for MainnetPresenceReceipt {
             policy_digest_hex: wire.policy_digest_hex,
             policy_owner_hex: wire.policy_owner_hex,
             expected_origin: wire.expected_origin,
+            cert_spki_sha256: wire.cert_spki_sha256,
+            listener_policy_digest: wire.listener_policy_digest,
             issued_at_unix_ms: wire.issued_at_unix_ms,
             expires_at_unix_ms: wire.expires_at_unix_ms,
             verified_at_unix_ms: wire.verified_at_unix_ms,
@@ -1620,14 +2099,39 @@ impl<'de> Deserialize<'de> for MainnetPresenceReceipt {
 pub(crate) struct StoredPresence {
     pub(crate) challenge: [u8; 32],
     pub(crate) receipt_digest: [u8; 32],
+    pub(crate) rp_id: String,
     pub(crate) facts: AssertionFacts,
 }
 
-/// Verifies `receipt` as the consent to `entry` under `policy`.
+/// Verifies `receipt` as the consent to `entry` under `policy`, with no
+/// intent.
 ///
-/// Recomputes the challenge from the receipt, the entry, the binding and
-/// the policy, and checks the raw assertion under the key `policy` signs for
-/// its credential ID. The receipt must name `policy`, its times must satisfy
+/// [`verify_receipt_for_intent`] without an intent, so a receipt whose
+/// ceremony bound an intent refuses here.
+///
+/// # Errors
+///
+/// The errors of [`verify_receipt_for_intent`].
+pub(crate) fn verify_receipt(
+    entry: &PendingApproval,
+    receipt: &MainnetPresenceReceipt,
+    binding: &AttestationBinding<'_>,
+    policy: &VerifiedPolicy,
+    now_ms: u64,
+) -> Result<StoredPresence, WalletError> {
+    verify_receipt_for_intent(entry, receipt, binding, policy, None, now_ms)
+}
+
+/// Verifies `receipt` as the consent to `entry` and `intent` under `policy`.
+///
+/// The receipt version must be the one `policy` and `intent` select: version
+/// 1 without an intent under a policy without `approval_origin`, version 2
+/// otherwise. Under a signed origin the receipt's certificate pin must be the
+/// policy's and its listener policy digest the policy's digest. Then the
+/// challenge is recomputed from the receipt, the entry, the binding, the
+/// policy and the intent, and the raw assertion is checked under the key
+/// `policy` signs for its credential ID, at the RP ID and origin the policy
+/// selects. The receipt must name `policy`, its times must satisfy
 /// `issued <= verified < challenge_expires`, `challenge_expires <=
 /// entry_expires`, `challenge_expires - issued <= 120000` and
 /// `verified <= now_ms`. Never returns a live [`VerifiedMainnetPresence`].
@@ -1635,13 +2139,15 @@ pub(crate) struct StoredPresence {
 /// # Errors
 ///
 /// `approval.presence_policy_unavailable` for a receipt bound to another
-/// policy, `approval.presence_invalid` for every other defect, and the
-/// subject errors of [`mainnet_consent_subject`].
-pub(crate) fn verify_receipt(
+/// policy, `approval.presence_invalid` for every other defect, including a
+/// policy whose origin and pin are not paired and an intent for another
+/// chain or record kind, and the subject errors of [`mainnet_consent_subject`].
+pub(crate) fn verify_receipt_for_intent(
     entry: &PendingApproval,
     receipt: &MainnetPresenceReceipt,
     binding: &AttestationBinding<'_>,
     policy: &VerifiedPolicy,
+    intent: Option<&ClassicIntent>,
     now_ms: u64,
 ) -> Result<StoredPresence, WalletError> {
     if !receipt.is_well_formed() {
@@ -1662,7 +2168,18 @@ pub(crate) fn verify_receipt(
     {
         return Err(presence_invalid());
     }
-    let challenge = receipt.challenge(entry, binding, policy)?;
+    let site = PresenceSite::of(policy).map_err(|_| presence_invalid())?;
+    if receipt.version != site.version(intent.is_some()) {
+        return Err(presence_invalid());
+    }
+    if !intent_describes(entry, binding, intent) {
+        return Err(presence_invalid());
+    }
+    let identity = site.pin().map(|pin| (*pin, policy.digest()));
+    if receipt.identity() != identity {
+        return Err(presence_invalid());
+    }
+    let challenge = receipt.challenge_for(entry, binding, policy, intent)?;
     let facts = check_assertion(
         policy,
         &challenge,
@@ -1672,11 +2189,34 @@ pub(crate) fn verify_receipt(
     Ok(StoredPresence {
         challenge,
         receipt_digest: receipt.digest().ok_or_else(presence_invalid)?,
+        rp_id: site.rp_id().to_owned(),
         facts,
     })
 }
 
-/// The audit object of a verified ceremony.
+/// Whether `intent` describes `entry` under `binding`: its chain is the
+/// binding's chain and its operation maps to the entry's record kind. An
+/// absent intent describes every entry; an entry kind without a classic
+/// intent form has no intent.
+fn intent_describes(
+    entry: &PendingApproval,
+    binding: &AttestationBinding<'_>,
+    intent: Option<&ClassicIntent>,
+) -> bool {
+    let Some(intent) = intent else {
+        return true;
+    };
+    let kind = match entry.kind {
+        ApprovalKind::PaymentSimulated { .. } => ApprovedKind::Payment,
+        ApprovalKind::ClaimSimulated { .. } => ApprovedKind::Claim,
+        ApprovalKind::TrustlineSimulated { .. } => ApprovedKind::Trustline,
+        _ => return false,
+    };
+    intent.base().chain_id() == binding.chain_id && intent.approved_kind() == kind
+}
+
+/// The audit object of a verified ceremony: the RP ID the verifying policy
+/// selected and the origin the receipt bound.
 pub(crate) fn presence_audit(
     stored: &StoredPresence,
     receipt: &MainnetPresenceReceipt,
@@ -1687,7 +2227,7 @@ pub(crate) fn presence_audit(
         receipt_sha256_hex: crate::hex::encode(&stored.receipt_digest),
         policy_digest_hex: receipt.policy_digest_hex.clone(),
         policy_sequence: receipt.policy_sequence,
-        rp_id: MAINNET_APPROVAL_RP_ID.to_owned(),
+        rp_id: stored.rp_id.clone(),
         webauthn_origin: receipt.expected_origin.clone(),
         user_present: stored.facts.user_present,
         user_verified: stored.facts.user_verified,
