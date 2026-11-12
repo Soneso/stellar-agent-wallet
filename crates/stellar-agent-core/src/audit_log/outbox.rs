@@ -10,9 +10,8 @@
 //!
 //! Three files sit beside `<audit_log_path>`:
 //!
-//! - `<audit_log_path>.outbox`: JSON lines, one serialized [`AuditEntry`] per
-//!   line, mode `0600` on Unix. Each entry is built when the operator acts
-//!   and keeps its own timestamp.
+//! - `<audit_log_path>.outbox`: JSON lines, mode `0600` on Unix. A line holds
+//!   a serialized [`AuditEntry`] or a tagged row. Each entry keeps its timestamp.
 //! - `<audit_log_path>.outbox.lock`: the lock every append and every drain
 //!   holds while it touches the outbox.
 //! - `<audit_log_path>.drain.lock`: held for its whole life by every writer
@@ -48,6 +47,15 @@
 //!
 //! # Append
 //!
+//! A keyed append writes `{"k":"row","g":G,"s":S,"r":R,"body":B,"tag":"T"}`.
+//! The body is the entry's canonical JSON. The tag is lowercase hex HMAC-SHA256
+//! over `stellar-agent-outbox-row:v2`, big-endian u64 generation and sequence,
+//! one evidence byte, and the exact body bytes, without separators or newline.
+//! In the legacy state, generation and evidence are zero. The sequence is the
+//! one-based line number, including untagged lines, assigned under the outbox lock.
+//! An unkeyed append writes the serialized entry. The v1 commitment covers every
+//! line's bytes in file order, and its stored representation stays v1.
+//!
 //! Under the outbox lock an append first checks the keyring commitment against
 //! the complete lines as read, so a committed line that lost its newline or
 //! its tail refuses the append with the file unchanged. Only then does it
@@ -74,6 +82,11 @@
 //! tail before either refusal.
 //!
 //! # Drain
+//!
+//! The legacy state accepts tagged and untagged lines in file order. Tagged rows
+//! require exact layout, authentication, canonical body bytes, matching position,
+//! and an operator kind, in that order. Recognition under a zero commitment
+//! decodes lines before the commitment check to identify a delivered batch.
 //!
 //! [`AuditWriter::drain_outbox`](super::writer::AuditWriter::drain_outbox)
 //! takes the outbox lock, reads the file, discards a torn final segment,
@@ -116,12 +129,14 @@
 //! the prior head, and the line bytes without the newline, in that order.
 
 use super::tip_anchor::{TipAnchorStore, TipAnchorStoreError};
+use hmac::{Hmac, KeyInit, Mac};
 use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use zeroize::Zeroizing;
 
 use super::entry::AuditEntry;
 use super::lock::{AuditWriterLock, BoundCarrierLock, Carrier};
@@ -246,25 +261,175 @@ fn is_operator_row(entry: &AuditEntry) -> bool {
 /// [`WriterError::OutboxUnusable`] for a line that does not parse as an
 /// [`AuditEntry`], and [`WriterError::OutboxRowKindRefused`] for one that
 /// holds another kind of row.
-fn parse_operator_rows(lines: &[&[u8]]) -> Result<Vec<AuditEntry>, WriterError> {
+fn parse_operator_rows(
+    lines: &[&[u8]],
+    key: Option<&[u8; 32]>,
+) -> Result<Vec<AuditEntry>, WriterError> {
     lines
         .iter()
         .enumerate()
-        .map(|(index, line)| {
-            let entry = serde_json::from_slice::<AuditEntry>(line).map_err(|e| {
-                WriterError::OutboxUnusable {
-                    line: index + 1,
-                    column: e.column(),
-                    reason: parse_failure_class(&e),
-                }
-            })?;
-            if is_operator_row(&entry) {
-                Ok(entry)
-            } else {
-                Err(WriterError::OutboxRowKindRefused { line: index + 1 })
-            }
-        })
+        .map(|(index, line)| decode_line(line, index + 1, key))
         .collect()
+}
+
+fn row_prefix(g: u64, s: u64, r: u8) -> Vec<u8> {
+    format!(r#"{{"k":"row","g":{g},"s":{s},"r":{r},"body":"#).into_bytes()
+}
+
+/// The tag binds the exact coordinates, evidence flag, and body bytes.
+#[allow(
+    clippy::expect_used,
+    reason = "HMAC-SHA256 accepts a key of any length"
+)]
+fn row_mac(key: &[u8; 32], g: u64, s: u64, r: u8, body: &[u8]) -> Hmac<Sha256> {
+    let mut mac =
+        Hmac::<Sha256>::new_from_slice(key).expect("HMAC-SHA256 accepts a key of any length");
+    mac.update(b"stellar-agent-outbox-row:v2");
+    mac.update(&g.to_be_bytes());
+    mac.update(&s.to_be_bytes());
+    mac.update(&[r]);
+    mac.update(body);
+    mac
+}
+
+fn encode_tagged_row(
+    key: &[u8; 32],
+    g: u64,
+    s: u64,
+    r: u8,
+    entry: &AuditEntry,
+) -> Result<Vec<u8>, serde_json::Error> {
+    let body = entry.canonical_json_body()?;
+    let tag = row_mac(key, g, s, r, &body).finalize().into_bytes();
+    let mut line = row_prefix(g, s, r);
+    line.extend_from_slice(&body);
+    line.extend_from_slice(b",\"tag\":\"");
+    line.extend_from_slice(crate::hex::encode(&tag).as_bytes());
+    line.extend_from_slice(b"\"}");
+    Ok(line)
+}
+
+#[cfg(test)]
+fn row_digest(g: u64, s: u64, r: u8, entry: &AuditEntry) -> Result<[u8; 32], serde_json::Error> {
+    let mut digest = Sha256::new();
+    digest.update(row_prefix(g, s, r));
+    digest.update(entry.canonical_json_body()?);
+    digest.update(b"}");
+    Ok(digest.finalize().into())
+}
+
+fn is_tagged(line: &[u8]) -> bool {
+    serde_json::from_slice::<serde_json::Value>(line)
+        .ok()
+        .is_some_and(|value| {
+            value
+                .as_object()
+                .is_some_and(|object| object.contains_key("k"))
+        })
+}
+
+struct TaggedRow<'a> {
+    g: u64,
+    s: u64,
+    r: u8,
+    body: &'a [u8],
+    tag: [u8; 32],
+}
+
+fn take_decimal(input: &mut &[u8]) -> Option<u64> {
+    let end = input.iter().position(|byte| *byte == b',')?;
+    let (digits, rest) = input.split_at(end);
+    if digits.is_empty()
+        || (digits.len() > 1 && digits[0] == b'0')
+        || !digits.iter().all(u8::is_ascii_digit)
+    {
+        return None;
+    }
+    let value = std::str::from_utf8(digits).ok()?.parse().ok()?;
+    *input = rest;
+    Some(value)
+}
+
+fn tagged_layout(line: &[u8]) -> Option<TaggedRow<'_>> {
+    let mut rest = line.strip_prefix(b"{\"k\":\"row\",\"g\":")?;
+    let g = take_decimal(&mut rest)?;
+    rest = rest.strip_prefix(b",\"s\":")?;
+    let s = take_decimal(&mut rest)?;
+    rest = rest.strip_prefix(b",\"r\":")?;
+    let r = match rest.first()? {
+        b'0' => 0,
+        b'1' => 1,
+        _ => return None,
+    };
+    rest = rest.get(1..)?.strip_prefix(b",\"body\":")?;
+    rest = rest.strip_suffix(b"\"}")?;
+    let (body, tag) = rest.split_at(rest.len().checked_sub(64)?);
+    if !tag
+        .iter()
+        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
+    {
+        return None;
+    }
+    let body = body.strip_suffix(b",\"tag\":\"")?;
+    serde_json::from_slice::<serde::de::IgnoredAny>(body).ok()?;
+    Some(TaggedRow {
+        g,
+        s,
+        r,
+        body,
+        tag: crate::hex::decode_hex32(std::str::from_utf8(tag).ok()?).ok()?,
+    })
+}
+
+fn tagged_refusal(number: usize, reason: &'static str) -> WriterError {
+    WriterError::OutboxUnusable {
+        line: number,
+        column: 1,
+        reason,
+    }
+}
+
+fn canonical_entry(body: &[u8], number: usize) -> Result<AuditEntry, WriterError> {
+    let refused = || tagged_refusal(number, "tagged record that is not canonical");
+    let entry = serde_json::from_slice::<AuditEntry>(body).map_err(|_| refused())?;
+    if entry.canonical_json_body().map_err(|_| refused())? != body {
+        return Err(refused());
+    }
+    Ok(entry)
+}
+
+fn decode_line(
+    line: &[u8],
+    number: usize,
+    key: Option<&[u8; 32]>,
+) -> Result<AuditEntry, WriterError> {
+    let entry = if is_tagged(line) {
+        let row = tagged_layout(line)
+            .ok_or_else(|| tagged_refusal(number, "tagged record that does not parse"))?;
+        let key =
+            key.ok_or_else(|| tagged_refusal(number, "tagged record without an audit key"))?;
+        row_mac(key, row.g, row.s, row.r, row.body)
+            .verify_slice(&row.tag)
+            .map_err(|_| tagged_refusal(number, "tagged record whose tag does not verify"))?;
+        let entry = canonical_entry(row.body, number)?;
+        if row.g != 0 || row.s != number as u64 {
+            return Err(WriterError::OutboxRowsMissing {
+                recorded: number as u64,
+                found: row.s,
+            });
+        }
+        entry
+    } else {
+        serde_json::from_slice::<AuditEntry>(line).map_err(|error| WriterError::OutboxUnusable {
+            line: number,
+            column: error.column(),
+            reason: parse_failure_class(&error),
+        })?
+    };
+    if !is_operator_row(&entry) {
+        return Err(WriterError::OutboxRowKindRefused { line: number });
+    }
+    Ok(entry)
 }
 
 /// Whether `bytes` are exactly the rows `state` commits: complete lines only,
@@ -482,11 +647,22 @@ pub(crate) fn lock_outbox(
 /// draining writer in another process holds the log.
 ///
 /// Every append takes the outbox lock for its own duration.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct AuditOutbox {
     path: PathBuf,
     lock_path: PathBuf,
     state: Arc<dyn TipAnchorStore>,
+    key: Option<Zeroizing<[u8; 32]>>,
+}
+
+impl std::fmt::Debug for AuditOutbox {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuditOutbox")
+            .field("path", &self.path)
+            .field("lock_path", &self.lock_path)
+            .field("state", &self.state)
+            .finish_non_exhaustive()
+    }
 }
 
 impl AuditOutbox {
@@ -503,6 +679,23 @@ impl AuditOutbox {
             path: outbox_path(log_path),
             lock_path: outbox_lock_path(log_path),
             state,
+            key: None,
+        }
+    }
+
+    /// The outbox of `log_path`, with rows authenticated under the audit MAC key.
+    ///
+    /// `state` is the log's own commitment store, as required by [`Self::for_log`].
+    /// The key stays in zeroizing storage and clones with the outbox.
+    #[must_use]
+    pub fn for_log_keyed(
+        log_path: &Path,
+        state: Arc<dyn TipAnchorStore>,
+        key: Zeroizing<[u8; 32]>,
+    ) -> Self {
+        Self {
+            key: Some(key),
+            ..Self::for_log(log_path, state)
         }
     }
 
@@ -625,7 +818,11 @@ impl PreparedOutboxAppend<'_> {
             });
         }
         refuse_undeliverable_row(entry)?;
-        let mut line = serde_json::to_vec(entry).map_err(WriterError::Serialise)?;
+        let mut line = match self.outbox.key.as_deref() {
+            Some(key) => encode_tagged_row(key, 0, self.committed.pending + 1, 0, entry),
+            None => serde_json::to_vec(entry),
+        }
+        .map_err(WriterError::Serialise)?;
         line.push(b'\n');
         self.committed.push(&line[..line.len() - 1]);
         // The append that created the file also makes the creation durable,
@@ -718,6 +915,8 @@ fn create_private_dir(dir: &Path) -> io::Result<()> {
 
 /// Syncs the directory holding `path`, so the creation of `path` is durable.
 pub(super) fn sync_parent_dir(path: &Path) -> io::Result<()> {
+    #[cfg(any(test, feature = "test-helpers"))]
+    test_seam::check_sync(path, test_seam::SyncStep::Directory)?;
     #[cfg(unix)]
     if let Some(parent) = path.parent() {
         File::open(parent)?.sync_all()?;
@@ -764,10 +963,17 @@ fn write_line(file: &mut File, path: &Path, line: &[u8]) -> Result<(), WriterErr
             "test fault: partial outbox write",
         )));
     }
-    #[cfg(not(any(test, feature = "test-helpers")))]
-    let _ = path;
     file.write_all(line)?;
     file.flush()?;
+    sync_outbox_file(file, path)?;
+    Ok(())
+}
+
+fn sync_outbox_file(file: &File, path: &Path) -> io::Result<()> {
+    #[cfg(any(test, feature = "test-helpers"))]
+    test_seam::check_sync(path, test_seam::SyncStep::File)?;
+    #[cfg(not(any(test, feature = "test-helpers")))]
+    let _ = path;
     file.sync_data()?;
     Ok(())
 }
@@ -1005,7 +1211,7 @@ impl OutboxBatch {
     /// A drain resets the commitment after its appends and truncates the
     /// outbox after that, so a crash between the two leaves exactly this
     /// shape. The caller decides whether the entries are the log's last rows.
-    pub(crate) fn uncommitted_entries(&self) -> Option<Vec<AuditEntry>> {
+    pub(crate) fn uncommitted_entries(&self, key: Option<&[u8; 32]>) -> Option<Vec<AuditEntry>> {
         if self.state.pending != 0 {
             return None;
         }
@@ -1013,10 +1219,7 @@ impl OutboxBatch {
         if lines.is_empty() {
             return None;
         }
-        lines
-            .iter()
-            .map(|line| serde_json::from_slice::<AuditEntry>(line).ok())
-            .collect()
+        parse_operator_rows(&lines, key).ok()
     }
 
     /// The committed prefix as operator rows, when it is intact, or `None`
@@ -1025,10 +1228,13 @@ impl OutboxBatch {
     /// # Errors
     ///
     /// Every error of the operator-row parse, for a line of the intact prefix.
-    pub(crate) fn committed_entries(&self) -> Result<Option<Vec<AuditEntry>>, WriterError> {
+    pub(crate) fn committed_entries(
+        &self,
+        key: Option<&[u8; 32]>,
+    ) -> Result<Option<Vec<AuditEntry>>, WriterError> {
         let lines = parse_lines(&self.bytes).lines;
         committed_prefix(&lines, &self.state)
-            .map(parse_operator_rows)
+            .map(|prefix| parse_operator_rows(prefix, key))
             .transpose()
     }
 
@@ -1057,7 +1263,10 @@ impl OutboxBatch {
     /// [`WriterError::OutboxUnusable`] when a complete line does not parse as
     /// an [`AuditEntry`], and [`WriterError::OutboxRowKindRefused`] when it
     /// holds a row other than an operator row. The file is left unchanged.
-    pub(crate) fn parse_entries(&self) -> Result<Vec<AuditEntry>, WriterError> {
+    pub(crate) fn parse_entries(
+        &self,
+        key: Option<&[u8; 32]>,
+    ) -> Result<Vec<AuditEntry>, WriterError> {
         let parsed = parse_lines(&self.bytes);
         if parsed.torn_bytes > 0 {
             tracing::warn!(
@@ -1067,7 +1276,7 @@ impl OutboxBatch {
                  completed"
             );
         }
-        parse_operator_rows(&parsed.lines)
+        parse_operator_rows(&parsed.lines, key)
     }
 
     /// Truncates the outbox to zero and syncs it, then releases the lock.
@@ -1127,12 +1336,16 @@ pub struct OutboxInspection {
     pub pending: usize,
     /// Size of a final segment with no terminating newline, or zero.
     pub torn_bytes: usize,
-    /// One-based numbers of complete lines that do not parse as an
-    /// [`AuditEntry`].
+    /// One-based numbers of complete lines that fail entry deserialization
+    /// or tagged layout and canonical-body checks.
     pub unparseable_lines: Vec<usize>,
 }
 
 /// Inspects the outbox of the log at `log_path` without taking its lock.
+///
+/// Tagged rows receive layout and canonical-body checks only. Inspection never
+/// authenticates tags or checks coordinates, row kinds, or the commitment.
+/// Untagged rows receive only the entry deserialization check.
 ///
 /// A missing outbox reports nothing pending. The result describes the file
 /// as read and may already be stale when it returns: a drain or an append in
@@ -1152,7 +1365,15 @@ pub fn inspect_outbox(log_path: &Path) -> io::Result<OutboxInspection> {
         .lines
         .iter()
         .enumerate()
-        .filter(|(_, line)| serde_json::from_slice::<AuditEntry>(line).is_err())
+        .filter(|(index, line)| {
+            if is_tagged(line) {
+                tagged_layout(line)
+                    .and_then(|row| canonical_entry(row.body, index + 1).ok())
+                    .is_none()
+            } else {
+                serde_json::from_slice::<AuditEntry>(line).is_err()
+            }
+        })
         .map(|(index, _)| index + 1)
         .collect();
     Ok(OutboxInspection {
@@ -1173,6 +1394,39 @@ pub mod test_seam {
     use std::sync::Mutex;
 
     static PARTIAL_WRITES: Mutex<Vec<(PathBuf, usize)>> = Mutex::new(Vec::new());
+
+    /// The durability operation whose next call refuses.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum SyncStep {
+        /// The appended file's data sync.
+        File,
+        /// The creating append's parent directory sync.
+        Directory,
+    }
+
+    static SYNC_FAILURES: Mutex<Vec<(PathBuf, SyncStep)>> = Mutex::new(Vec::new());
+
+    /// Fails the next matching sync for `outbox_path`, consuming this arm.
+    pub fn arm_sync_failure(outbox_path: &Path, step: SyncStep) {
+        if let Ok(mut armed) = SYNC_FAILURES.lock() {
+            armed.retain(|(path, _)| path != outbox_path);
+            armed.push((outbox_path.to_path_buf(), step));
+        }
+    }
+
+    pub(super) fn check_sync(path: &Path, step: SyncStep) -> std::io::Result<()> {
+        let fail = SYNC_FAILURES.lock().is_ok_and(|mut armed| {
+            armed
+                .iter()
+                .position(|(p, s)| p == path && *s == step)
+                .map(|index| armed.swap_remove(index))
+                .is_some()
+        });
+        if fail {
+            return Err(std::io::Error::other("test fault: outbox sync"));
+        }
+        Ok(())
+    }
 
     /// Arms the seam for `outbox_path`: the next append to that outbox writes
     /// `bytes` bytes of its line and returns an I/O error. The arm is consumed
@@ -1302,6 +1556,495 @@ mod tests {
         let store = Arc::new(InMemoryTipAnchorStore::new());
         drop(open_draining(path, &store));
         store
+    }
+
+    const ROW_KEY: [u8; 32] = [0x42; 32];
+    const VECTOR_BODY: &str = r#"{"ts":"2026-01-01T00:00:00.000Z","tool":"approval.attested","arg_keys":[],"policy_decision":"allow","request_id":"vector","kind":"approval_attested","approval_kind":"PaymentSimulated","gated_tool":"stellar_pay_commit","nonce_prefix":"ABCDEFGH","origin":"cli","previous_entry_hash":""}"#;
+
+    fn fixed_row() -> AuditEntry {
+        let mut entry = row("vector");
+        entry.ts = "2026-01-01T00:00:00.000Z".to_owned();
+        entry
+    }
+
+    fn keyed_fixture() -> (TempDir, PathBuf, Arc<InMemoryTipAnchorStore>, AuditWriter) {
+        let dir = TempDir::new().unwrap();
+        let path = log_path(&dir);
+        let store = Arc::new(InMemoryTipAnchorStore::new());
+        let writer = AuditWriter::open(
+            path.clone(),
+            Some(KeyedAuditAccess::new(
+                Zeroizing::new(ROW_KEY),
+                store.clone(),
+            )),
+        )
+        .unwrap();
+        (dir, path, store, writer)
+    }
+
+    fn keyed_outbox(path: &Path, store: &Arc<InMemoryTipAnchorStore>) -> AuditOutbox {
+        AuditOutbox::for_log_keyed(path, store.clone(), Zeroizing::new(ROW_KEY))
+    }
+
+    fn replace_tagged_line(path: &Path, store: &Arc<InMemoryTipAnchorStore>, line: &[u8]) {
+        let mut bytes = line.to_vec();
+        bytes.push(b'\n');
+        fs::write(outbox_path(path), bytes).unwrap();
+        commit_every_line(path, store);
+    }
+
+    fn assert_tagged_refusal(line: &[u8], expected: &WriterError) {
+        let (_dir, path, store, mut writer) = keyed_fixture();
+        keyed_outbox(&path, &store).append(&fixed_row()).unwrap();
+        replace_tagged_line(&path, &store, line);
+        let before = fs::read(&path).unwrap();
+        let queued = outbox_bytes(&path);
+        let committed = store.load_outbox_state(1).unwrap();
+        let error = writer.drain_outbox().unwrap_err();
+        assert_eq!(format!("{error:?}"), format!("{expected:?}"));
+        assert_eq!(fs::read(&path).unwrap(), before, "nothing is appended");
+        assert_eq!(outbox_bytes(&path), queued);
+        assert_eq!(store.load_outbox_state(1).unwrap(), committed);
+    }
+
+    fn unusable(reason: &'static str) -> WriterError {
+        WriterError::OutboxUnusable {
+            line: 1,
+            column: 1,
+            reason,
+        }
+    }
+
+    /// Signs exact test body bytes independently of the row encoder.
+    fn signed_body(body: &[u8], label: &[u8]) -> Vec<u8> {
+        let mut mac = Hmac::<Sha256>::new_from_slice(&ROW_KEY).unwrap();
+        mac.update(label);
+        mac.update(&0_u64.to_be_bytes());
+        mac.update(&1_u64.to_be_bytes());
+        mac.update(&[0]);
+        mac.update(body);
+        format!(
+            "{{\"k\":\"row\",\"g\":0,\"s\":1,\"r\":0,\"body\":{},\"tag\":\"{}\"}}",
+            std::str::from_utf8(body).unwrap(),
+            crate::hex::encode(&mac.finalize().into_bytes())
+        )
+        .into_bytes()
+    }
+
+    #[test]
+    fn tagged_row_vector_keeps_its_bytes() {
+        for (r, tag, digest) in [
+            (
+                0,
+                "4755e2961e64664d1128941005b83a280081bc92046d8ec4678db3e6e6b9aaa0",
+                "3962b94979c479ada6680fb1ba13e8ef106378b0dc32f7c3e5cfd53c3320b846",
+            ),
+            (
+                1,
+                "a3216b84e5b09e4ea4c63f9d21a934eb688865967c63621e52ff2c08cfc8276b",
+                "237b3f7c4f7e8e4003d6e59375649405bc21810fb12dedd4973d309887412435",
+            ),
+        ] {
+            let (_dir, path, store, mut writer) = keyed_fixture();
+            let outbox = keyed_outbox(&path, &store);
+            outbox.clone().append(&fixed_row()).unwrap();
+            assert_eq!(
+                format!("{outbox:?}"),
+                format!(
+                    "AuditOutbox {{ path: {:?}, lock_path: {:?}, state: {store:?}, .. }}",
+                    outbox_path(&path),
+                    outbox_lock_path(&path)
+                )
+            );
+            if r == 1 {
+                let line = encode_tagged_row(&ROW_KEY, 0, 1, r, &fixed_row()).unwrap();
+                replace_tagged_line(&path, &store, &line);
+            }
+            let expected = format!(
+                "{{\"k\":\"row\",\"g\":0,\"s\":1,\"r\":{r},\"body\":{VECTOR_BODY},\"tag\":\"{tag}\"}}\n"
+            );
+            assert_eq!(outbox_bytes(&path), expected.as_bytes(), "wire vector");
+            assert_eq!(
+                crate::hex::encode(&row_digest(0, 1, r, &fixed_row()).unwrap()),
+                digest
+            );
+            assert_eq!(writer.drain_outbox().unwrap(), 1);
+            let entry: AuditEntry = serde_json::from_value(log_rows(&path).pop().unwrap()).unwrap();
+            assert_eq!(entry.canonical_json_body().unwrap(), VECTOR_BODY.as_bytes());
+        }
+    }
+
+    #[test]
+    fn tagged_rows_bind_body_sequence_generation_evidence_and_domain() {
+        let (_dir, path, store, mut writer) = keyed_fixture();
+        keyed_outbox(&path, &store).append(&fixed_row()).unwrap();
+        let line = String::from_utf8(outbox_bytes(&path)).unwrap();
+        assert_eq!(
+            line.trim_end().as_bytes(),
+            signed_body(VECTOR_BODY.as_bytes(), b"stellar-agent-outbox-row:v2"),
+            "the row binds every component under its domain"
+        );
+        assert_eq!(
+            writer.drain_outbox().unwrap(),
+            1,
+            "the untouched row drains"
+        );
+        for (from, to) in [
+            ("vector", "sector"),
+            ("\"g\":0", "\"g\":1"),
+            ("\"s\":1", "\"s\":2"),
+            ("\"r\":0", "\"r\":1"),
+            ("\"tag\":\"4", "\"tag\":\"5"),
+        ] {
+            assert!(line.contains(from));
+            assert_tagged_refusal(
+                line.trim_end().replace(from, to).as_bytes(),
+                &unusable("tagged record whose tag does not verify"),
+            );
+        }
+        assert_tagged_refusal(
+            &signed_body(VECTOR_BODY.as_bytes(), b"another-row-domain"),
+            &unusable("tagged record whose tag does not verify"),
+        );
+    }
+
+    #[test]
+    fn classification_and_refusal_precedence_are_pinned() {
+        let line =
+            String::from_utf8(encode_tagged_row(&ROW_KEY, 0, 1, 0, &fixed_row()).unwrap()).unwrap();
+        assert_tagged_refusal(
+            line.replace("\"g\":0", "\"g\":00").as_bytes(),
+            &WriterError::OutboxUnusable {
+                line: 1,
+                column: 17,
+                reason: "invalid JSON",
+            },
+        );
+        let body = VECTOR_BODY.replacen("{", "{ ", 1);
+        let valid = signed_body(body.as_bytes(), b"stellar-agent-outbox-row:v2");
+        assert_tagged_refusal(&valid, &unusable("tagged record that is not canonical"));
+        let invalid = signed_body(body.as_bytes(), b"another-row-domain");
+        assert_tagged_refusal(
+            &invalid,
+            &unusable("tagged record whose tag does not verify"),
+        );
+        let raw = format!("{},\"k\":\"row\"}}", &VECTOR_BODY[..VECTOR_BODY.len() - 1]);
+        assert_tagged_refusal(
+            raw.as_bytes(),
+            &unusable("tagged record that does not parse"),
+        );
+        let prefixed_raw = format!("{{\"k\":\"row\",{}", &VECTOR_BODY[1..]);
+        assert_tagged_refusal(
+            prefixed_raw.as_bytes(),
+            &unusable("tagged record that does not parse"),
+        );
+        assert_tagged_refusal(
+            line.replacen("\"k\"", "\"\\u006b\"", 1).as_bytes(),
+            &unusable("tagged record that does not parse"),
+        );
+    }
+
+    #[test]
+    fn noncanonical_tagged_records_refuse_after_authentication() {
+        let line =
+            String::from_utf8(encode_tagged_row(&ROW_KEY, 0, 1, 0, &fixed_row()).unwrap()).unwrap();
+        for changed in [
+            line.replacen("{", "{ ", 1),
+            line.replace("\"g\":0,\"s\":1", "\"s\":1,\"g\":0"),
+            line.replace("4755e", "4755E"),
+            line.replace("\"g\":0", "\"g\":-0"),
+            line.replace("\"s\":1", "\"s\":1.0"),
+            line.replace("\"r\":0", "\"r\":2"),
+            line.replace("\"r\":0", "\"r\":false"),
+            line.replace("\"s\":1", "\"s\":18446744073709551616"),
+            line.replace("\"k\":\"row\"", "\"k\":\"gen\""),
+        ] {
+            assert_tagged_refusal(
+                changed.as_bytes(),
+                &unusable("tagged record that does not parse"),
+            );
+        }
+        assert_tagged_refusal(
+            line.replace("\"s\":1", "\"s\":01").as_bytes(),
+            &WriterError::OutboxUnusable {
+                line: 1,
+                column: 23,
+                reason: "invalid JSON",
+            },
+        );
+        let reordered =
+            serde_json::to_vec(&serde_json::from_str::<serde_json::Value>(VECTOR_BODY).unwrap())
+                .unwrap();
+        for body in [
+            VECTOR_BODY.replacen("{", "{ ", 1).into_bytes(),
+            reordered,
+            b"{}".to_vec(),
+        ] {
+            assert_tagged_refusal(
+                &signed_body(&body, b"stellar-agent-outbox-row:v2"),
+                &unusable("tagged record that is not canonical"),
+            );
+        }
+    }
+
+    #[test]
+    fn a_tagged_row_out_of_position_refuses_rows_missing() {
+        for (g, s) in [(0, 2), (1, 1), (u64::MAX, u64::MAX)] {
+            assert_tagged_refusal(
+                &encode_tagged_row(&ROW_KEY, g, s, 0, &fixed_row()).unwrap(),
+                &WriterError::OutboxRowsMissing {
+                    recorded: 1,
+                    found: s,
+                },
+            );
+        }
+    }
+
+    #[test]
+    fn tagged_rows_of_every_operator_kind_drain() {
+        let (_dir, path, store, mut writer) = keyed_fixture();
+        let outbox = keyed_outbox(&path, &store);
+        let entries = [
+            row("local"),
+            AuditEntry::new_approval_attested_remote(
+                "PaymentSimulated",
+                "stellar_pay_commit",
+                None,
+                "ABCDEFGHIJKLMNOPQRSTUV",
+                "credential",
+                "remote",
+            ),
+            AuditEntry::new_profile_halted(
+                "fixture",
+                "2026-01-01T00:00:00Z",
+                Some("incident"),
+                "halt",
+            ),
+            AuditEntry::new_profile_resumed("fixture", true, "resume"),
+        ];
+        for entry in &entries {
+            outbox.append(entry).unwrap();
+        }
+        assert_eq!(writer.drain_outbox().unwrap(), entries.len());
+        let ids = request_ids(&path);
+        assert_eq!(&ids[ids.len() - 4..], ["local", "remote", "halt", "resume"]);
+        outbox.append(&own_row("refused")).unwrap();
+        let before = fs::read(&path).unwrap();
+        assert!(matches!(
+            writer.drain_outbox(),
+            Err(WriterError::OutboxRowKindRefused { line: 1 })
+        ));
+        assert_eq!(fs::read(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn a_tagged_line_without_a_key_refuses_and_inspects() {
+        let dir = TempDir::new().unwrap();
+        let path = log_path(&dir);
+        let store = bound_store(&path);
+        let mut writer = open_draining(&path, &store);
+        keyed_outbox(&path, &store).append(&fixed_row()).unwrap();
+        assert!(matches!(
+            writer.drain_outbox(),
+            Err(WriterError::OutboxUnusable {
+                line: 1,
+                column: 1,
+                reason: "tagged record without an audit key"
+            })
+        ));
+        assert!(log_rows(&path).is_empty());
+        assert_eq!(
+            inspect_outbox(&path).unwrap(),
+            OutboxInspection {
+                pending: 1,
+                torn_bytes: 0,
+                unparseable_lines: vec![],
+            }
+        );
+    }
+
+    #[test]
+    fn keyed_appends_take_the_line_number_under_the_lock() {
+        use std::sync::Barrier;
+        let (_dir, path, store, mut writer) = keyed_fixture();
+        let admitted = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let waiting = Arc::new(Barrier::new(3));
+        let (a, r) = (admitted.clone(), release.clone());
+        test_seam::on_admitted(&outbox_path(&path), move || {
+            a.wait();
+            r.wait();
+        });
+        std::thread::scope(|scope| {
+            let raw =
+                scope.spawn(|| AuditOutbox::for_log(&path, store.clone()).append(&row("raw")));
+            admitted.wait();
+            for _ in 0..2 {
+                let waiting = waiting.clone();
+                test_seam::on_contended(&outbox_lock_path(&path), move || {
+                    waiting.wait();
+                });
+            }
+            let first = scope.spawn(|| keyed_outbox(&path, &store).append(&row("first")));
+            let second = scope.spawn(|| keyed_outbox(&path, &store).append(&row("second")));
+            waiting.wait();
+            release.wait();
+            raw.join().unwrap().unwrap();
+            first.join().unwrap().unwrap();
+            second.join().unwrap().unwrap();
+        });
+        let bytes = outbox_bytes(&path);
+        let lines = parse_lines(&bytes).lines;
+        assert_eq!(lines.len(), 3);
+        for (index, line) in lines.iter().enumerate().skip(1) {
+            let record: serde_json::Value = serde_json::from_slice(line).unwrap();
+            assert_eq!(record["g"], 0);
+            assert_eq!(record["r"], 0);
+            assert_eq!(record["s"], index + 1);
+        }
+        assert_eq!(writer.drain_outbox().unwrap(), 3);
+        keyed_outbox(&path, &store).append(&row("reset")).unwrap();
+        let record: serde_json::Value = serde_json::from_slice(&outbox_bytes(&path)).unwrap();
+        assert_eq!(record["s"], 1);
+        assert_eq!(writer.drain_outbox().unwrap(), 1);
+    }
+
+    #[test]
+    fn a_refused_keyed_append_leaves_the_outbox_byte_identical() {
+        for fault in 0..4 {
+            let (_dir, path, store, _writer) = keyed_fixture();
+            let outbox = keyed_outbox(&path, &store);
+            if fault != 2 {
+                outbox.append(&row("kept")).unwrap();
+            }
+            let before = outbox_bytes(&path);
+            let state = store.load_outbox_state(1).unwrap();
+            match fault {
+                0 => test_seam::arm_partial_write(outbox.path(), 17),
+                1 => test_seam::arm_sync_failure(outbox.path(), test_seam::SyncStep::File),
+                2 => test_seam::arm_sync_failure(outbox.path(), test_seam::SyncStep::Directory),
+                _ => store.set_outbox_failing(false, true),
+            }
+            let error = outbox.append(&row("refused")).unwrap_err();
+            assert!(
+                matches!(
+                    (&error, fault),
+                    (WriterError::Io(_), 0..=2) | (WriterError::TipAnchorStore(_), 3)
+                ),
+                "{error:?}"
+            );
+            assert_eq!(outbox_bytes(&path), before, "fault {fault} preserves bytes");
+            assert_eq!(
+                store.load_outbox_state(1).unwrap(),
+                state,
+                "fault {fault} preserves commitment"
+            );
+            store.set_outbox_failing(false, false);
+            outbox.append(&row("accepted")).unwrap();
+        }
+    }
+
+    #[test]
+    fn tagged_and_untagged_rows_deliver_identical_log_rows() {
+        let mut logs = Vec::new();
+        for keyed in [false, true] {
+            let dir = TempDir::new().unwrap();
+            let path = log_path(&dir);
+            let store = bound_store(&path);
+            let outbox = if keyed {
+                keyed_outbox(&path, &store)
+            } else {
+                AuditOutbox::for_log(&path, store.clone())
+            };
+            outbox.append(&fixed_row()).unwrap();
+            let mut writer =
+                AuditWriter::open_for_reanchor(path.clone(), Some(Zeroizing::new(ROW_KEY)), store)
+                    .unwrap();
+            assert_eq!(writer.drain_outbox().unwrap(), 1);
+            logs.push(fs::read(&path).unwrap());
+        }
+        assert!(!logs[0].is_empty());
+        assert_eq!(
+            logs[0], logs[1],
+            "delivery bytes match under one key and timestamp"
+        );
+    }
+
+    #[test]
+    fn mixed_lines_drain_in_file_order() {
+        let (_dir, path, store, mut writer) = keyed_fixture();
+        let raw = AuditOutbox::for_log(&path, store.clone());
+        let keyed = keyed_outbox(&path, &store);
+        let mut expected = Vec::new();
+        for (index, sink) in [&raw, &keyed, &raw].into_iter().enumerate() {
+            let mut entry = fixed_row();
+            entry.request_id = format!("queued-{index}");
+            entry.ts = format!("2026-01-01T00:00:0{index}.000Z");
+            sink.append(&entry).unwrap();
+            expected.push(entry.canonical_json_body().unwrap());
+        }
+        assert_eq!(writer.drain_outbox().unwrap(), 3);
+        let rows = log_rows(&path);
+        let actual: Vec<_> = rows[rows.len() - 3..]
+            .iter()
+            .map(|value| {
+                serde_json::from_value::<AuditEntry>(value.clone())
+                    .unwrap()
+                    .canonical_json_body()
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn recognition_after_reset_covers_tagged_batches() {
+        let (_dir, path, store, mut writer) = keyed_fixture();
+        let outbox = keyed_outbox(&path, &store);
+        outbox.append(&row("one")).unwrap();
+        outbox.append(&row("two")).unwrap();
+        writer.set_skip_outbox_truncate(true);
+        assert_eq!(writer.drain_outbox().unwrap(), 2);
+        assert_eq!(
+            store.load_outbox_state(1).unwrap(),
+            Some(OutboxState::default())
+        );
+        assert!(!outbox_bytes(&path).is_empty());
+        let before = fs::read(&path).unwrap();
+        drop(writer);
+        let mut writer = AuditWriter::open(
+            path.clone(),
+            Some(KeyedAuditAccess::new(Zeroizing::new(ROW_KEY), store)),
+        )
+        .unwrap();
+        assert_eq!(writer.drain_outbox().unwrap(), 0);
+        assert_eq!(fs::read(&path).unwrap(), before);
+        assert!(outbox_bytes(&path).is_empty());
+    }
+
+    #[test]
+    fn inspection_counts_tagged_rows_without_the_key() {
+        let (_dir, path, store, _writer) = keyed_fixture();
+        let raw = AuditOutbox::for_log(&path, store.clone());
+        raw.append(&row("raw")).unwrap();
+        keyed_outbox(&path, &store).append(&row("tagged")).unwrap();
+        let mut bytes = outbox_bytes(&path);
+        let mut forged = encode_tagged_row(&ROW_KEY, 9, 17, 1, &own_row("forged")).unwrap();
+        let end = forged.len();
+        forged[end - 3] = if forged[end - 3] == b'0' { b'1' } else { b'0' };
+        bytes.extend_from_slice(&forged);
+        bytes.extend_from_slice(b"\nnot JSON\n{\"k\":\"row\"}\n");
+        bytes.extend_from_slice(&signed_body(b"{}", b"stellar-agent-outbox-row:v2"));
+        bytes.extend_from_slice(b"\ntorn");
+        fs::write(outbox_path(&path), bytes).unwrap();
+        assert_eq!(
+            inspect_outbox(&path).unwrap(),
+            OutboxInspection {
+                pending: 6,
+                torn_bytes: 4,
+                unparseable_lines: vec![4, 5, 6],
+            }
+        );
     }
 
     /// A consent-shaped row with a fixed request id.
