@@ -1845,6 +1845,90 @@ mod tests {
 
     use super::*;
 
+    /// Collecting the consumed inbox row before the receipt acknowledges it
+    /// leaves the repair successful and idempotent: no inbox row reappears,
+    /// and the receipt keeps holding the spent nonce.
+    #[test]
+    fn repair_after_gc_acknowledges_without_recreating_the_entry() {
+        use stellar_agent_core::approval::{
+            ConsumedOutcome, PendingApproval, PendingApprovalStore,
+        };
+        use stellar_agent_core::profile::receipt::BeginSubmissionOutcome;
+        let dir = tempfile::tempdir().unwrap();
+        let receipts = ReceiptStore::open_at(dir.path(), "repair").unwrap();
+        let approvals = dir.path().join("approvals");
+        let entry = PendingApproval::new_payment_pending(
+            "b64xdr".to_owned(),
+            b"repair-envelope",
+            stellar_strkey::ed25519::PublicKey([0x21; 32])
+                .to_string()
+                .to_string(),
+            1_000_000,
+            "XLM".to_owned(),
+            None,
+            100,
+            7,
+            "1000".to_owned(),
+            600_000,
+        )
+        .unwrap();
+        let nonce = entry.approval_nonce.clone();
+        let tx_hash = "a".repeat(64);
+        assert!(matches!(
+            receipts
+                .begin_submission_with_approval(
+                    "envelope",
+                    &tx_hash,
+                    "source",
+                    1,
+                    0,
+                    100,
+                    Some(&nonce)
+                )
+                .unwrap(),
+            BeginSubmissionOutcome::Recorded
+        ));
+        receipts.mark_submitted("envelope").unwrap();
+        {
+            let mut inbox = PendingApprovalStore::open(approvals.join("repair.toml")).unwrap();
+            let now = entry.created_at_unix_ms;
+            inbox.insert(entry, now).unwrap();
+            assert!(
+                inbox
+                    .consume(&nonce, &tx_hash, ConsumedOutcome::Unknown)
+                    .unwrap()
+            );
+            assert_eq!(inbox.gc_expired_and_consumed(now).unwrap(), 1);
+        }
+        for attempt in 0..2 {
+            repair_approval_consumption(&receipts, "envelope", &approvals, "repair").unwrap();
+            let inbox = PendingApprovalStore::open(approvals.join("repair.toml")).unwrap();
+            assert!(
+                inbox.get(&nonce).is_none(),
+                "attempt {attempt}: no entry reappears"
+            );
+            assert_eq!(inbox.len(), 0, "attempt {attempt}");
+            let receipt = receipts.get("envelope").unwrap().unwrap();
+            assert!(receipt.approval_consumed, "attempt {attempt}");
+            assert_eq!(receipt.approval_nonce.as_deref(), Some(nonce.as_str()));
+        }
+        assert!(receipts.find_by_approval_nonce(&nonce).unwrap().is_some());
+        assert!(matches!(
+            receipts
+                .begin_submission_with_approval(
+                    "again",
+                    &"b".repeat(64),
+                    "source",
+                    2,
+                    0,
+                    100,
+                    Some(&nonce)
+                )
+                .unwrap(),
+            BeginSubmissionOutcome::DuplicateApproval(_)
+        ));
+    }
+
     #[tokio::test]
     #[serial_test::serial]
     async fn bound_mismatch_refuses_at_gate_and_bind() {

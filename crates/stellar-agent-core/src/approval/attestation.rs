@@ -68,6 +68,18 @@
 //! reverse, so a local or remote approval cannot stand for a mainnet
 //! consent.
 //!
+//! # Version 6: mainnet consent to a canonical intent
+//!
+//! A mainnet consent to a record whose subject kind is the canonical intent
+//! digest is recorded under version 6
+//! ([`MAINNET_INTENT_ATTESTATION_VERSION`]). [`compute_attestation_v6`]
+//! produces version 5's preimage under the tag
+//! `stellar-agent-approval-attestation:v6`, with the 32-byte intent digest
+//! in the subject slot. The record's subject kind selects the layout:
+//! version 5 only for the envelope text, version 6 only for the intent
+//! digest. Neither blob verifies as the other, and an edited subject kind
+//! verifies nothing.
+//!
 //! Lengths count UTF-8 bytes, encoded as big-endian u32 with saturation.
 //! The tags and the 32-byte digest have no prefix or NUL terminator.
 //! The tag separates this HMAC from every other use of the key.
@@ -91,6 +103,7 @@ use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
 use super::presence::MainnetPresenceReceipt;
+use super::subject::SubjectKind;
 
 /// Profile and chain that mint or verify an approval.
 ///
@@ -148,13 +161,33 @@ pub const MAINNET_ATTESTATION_VERSION: u32 = 5;
 /// HMAC domain tag of version 5.
 const ATTESTATION_TAG_V5: &[u8] = b"stellar-agent-approval-attestation:v5";
 
+/// The attestation layout of a mainnet consent to a canonical intent:
+/// version 5's fields under its own tag, with the intent digest as the
+/// subject.
+pub const MAINNET_INTENT_ATTESTATION_VERSION: u32 = 6;
+
+/// HMAC domain tag of version 6.
+const ATTESTATION_TAG_V6: &[u8] = b"stellar-agent-approval-attestation:v6";
+
+/// The mainnet consent layout a record of `subject_kind` is attested under:
+/// [`MAINNET_ATTESTATION_VERSION`] for the envelope text and
+/// [`MAINNET_INTENT_ATTESTATION_VERSION`] for the intent digest.
+#[must_use]
+pub fn mainnet_attestation_version(subject_kind: SubjectKind) -> u32 {
+    match subject_kind {
+        SubjectKind::EnvelopeText => MAINNET_ATTESTATION_VERSION,
+        SubjectKind::IntentDigest => MAINNET_INTENT_ATTESTATION_VERSION,
+    }
+}
+
 /// The approver byte of a local approval in the version 4 layout.
 const APPROVER_TAG_LOCAL: u8 = 0x00;
 
 /// The approver byte of a remote approval in the version 4 layout.
 const APPROVER_TAG_REMOTE: u8 = 0x01;
 
-/// The approver byte of a mainnet passkey approval in the version 5 layout.
+/// The approver byte of a mainnet passkey approval in the version 5 and 6
+/// layouts.
 const APPROVER_TAG_MAINNET_PASSKEY: u8 = 0x02;
 
 /// Who approved a pending approval, as its version 4 attestation
@@ -177,7 +210,8 @@ pub enum AttestedApprover {
     },
     /// An approval credential of the owner-signed mainnet policy whose
     /// assertion, with user presence and user verification, the wallet
-    /// verified. Valid only in the version 5 layout.
+    /// verified. Valid only in the version 5 layout on an envelope-text
+    /// record and in the version 6 layout on an intent-digest record.
     MainnetPasskey {
         /// The canonical base64url ID of the credential that signed.
         credential_id_b64url: String,
@@ -290,6 +324,14 @@ pub enum AttestationScope<'a> {
         &'a AttestedApprover,
         &'a MainnetPresenceReceipt,
     ),
+    /// Version 6: version 5's fields under the version 6 tag, over the
+    /// canonical intent digest as the subject. A mainnet consent to an
+    /// intent-digest record verifies under it.
+    V6(
+        AttestedLifetime<'a>,
+        &'a AttestedApprover,
+        &'a MainnetPresenceReceipt,
+    ),
 }
 
 impl<'a> AttestationScope<'a> {
@@ -317,6 +359,9 @@ impl<'a> AttestationScope<'a> {
     /// or malformed approver, a mainnet passkey approver under version 4, a
     /// local or remote approver under version 5, a receipt under version 4,
     /// and version 5 without a receipt or with another credential's.
+    ///
+    /// The record's subject kind is the envelope text; a record with another
+    /// subject kind selects with [`Self::pending_for_subject`].
     #[must_use]
     pub fn pending(
         version: u32,
@@ -324,23 +369,51 @@ impl<'a> AttestationScope<'a> {
         approver: Option<&'a AttestedApprover>,
         receipt: Option<&'a MainnetPresenceReceipt>,
     ) -> Option<Self> {
+        Self::pending_for_subject(
+            version,
+            lifetime,
+            approver,
+            receipt,
+            SubjectKind::EnvelopeText,
+        )
+    }
+
+    /// Selects a pending approval's layout from its stored version and its
+    /// subject kind, under the approver and receipt rules of
+    /// [`Self::pending`].
+    ///
+    /// Versions 4 and 5 belong to the envelope text and version 6 to the
+    /// intent digest. Every other pairing verifies nothing, so no record
+    /// falls back to the layout of another subject kind.
+    #[must_use]
+    pub fn pending_for_subject(
+        version: u32,
+        lifetime: AttestedLifetime<'a>,
+        approver: Option<&'a AttestedApprover>,
+        receipt: Option<&'a MainnetPresenceReceipt>,
+        subject_kind: SubjectKind,
+    ) -> Option<Self> {
         let approver = approver.filter(|approver| approver.is_well_formed())?;
         match (version, approver, receipt) {
             (
                 PENDING_ATTESTATION_VERSION,
                 AttestedApprover::Local | AttestedApprover::Remote { .. },
                 None,
-            ) => Some(Self::V4(lifetime, approver)),
+            ) if subject_kind == SubjectKind::EnvelopeText => Some(Self::V4(lifetime, approver)),
             (
-                MAINNET_ATTESTATION_VERSION,
+                MAINNET_ATTESTATION_VERSION | MAINNET_INTENT_ATTESTATION_VERSION,
                 AttestedApprover::MainnetPasskey {
                     credential_id_b64url,
                 },
                 Some(receipt),
-            ) if receipt.is_well_formed()
+            ) if version == mainnet_attestation_version(subject_kind)
+                && receipt.is_well_formed()
                 && receipt.credential_id_b64url() == *credential_id_b64url =>
             {
-                Some(Self::V5(lifetime, approver, receipt))
+                Some(match subject_kind {
+                    SubjectKind::EnvelopeText => Self::V5(lifetime, approver, receipt),
+                    SubjectKind::IntentDigest => Self::V6(lifetime, approver, receipt),
+                })
             }
             _ => None,
         }
@@ -354,6 +427,7 @@ impl<'a> AttestationScope<'a> {
             Self::V3(_) => ATTESTATION_VERSION,
             Self::V4(..) => PENDING_ATTESTATION_VERSION,
             Self::V5(..) => MAINNET_ATTESTATION_VERSION,
+            Self::V6(..) => MAINNET_INTENT_ATTESTATION_VERSION,
         }
     }
 }
@@ -840,11 +914,52 @@ pub fn compute_attestation_v5(
     )
 }
 
+/// Computes a version 6 attestation of a mainnet consent to a canonical
+/// intent.
+///
+/// The preimage is version 5's under the version 6 domain tag, with
+/// `intent_digest` in the subject slot that version 5 fills with the
+/// envelope digest:
+///
+/// ```text
+/// mac.update(b"stellar-agent-approval-attestation:v6")
+/// (profile_name, chain_id, approval_nonce, intent_digest, process_uid,
+///  kind, created_at_unix_ms, expires_at_unix_ms, approver, receipt_digest,
+///  as version 5 lays them out)
+/// ```
+///
+/// Same key discipline as [`compute_attestation`].
+#[must_use]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "each argument is a distinct field of the attested preimage"
+)]
+pub fn compute_attestation_v6(
+    key: &[u8; 32],
+    binding: &AttestationBinding<'_>,
+    approval_nonce: &str,
+    intent_digest: &[u8; 32],
+    process_uid: &str,
+    lifetime: &AttestedLifetime<'_>,
+    approver: &AttestedApprover,
+    receipt: &MainnetPresenceReceipt,
+) -> [u8; 32] {
+    compute_with_scope(
+        key,
+        binding,
+        approval_nonce,
+        intent_digest,
+        process_uid,
+        &AttestationScope::V6(*lifetime, approver, receipt),
+    )
+}
+
 /// Computes the blob of `scope`'s layout. [`compute_attestation`] produces
-/// version 3 for toolset grants, [`compute_attestation_v4`] version 4 for
-/// pending testnet approvals and [`compute_attestation_v5`] version 5 for
-/// mainnet consents; verification recomputes version 2 for grants stored
-/// under it.
+/// version 3 for toolset grants, and [`compute_attestation_v4`] version 4
+/// for pending testnet approvals. [`compute_attestation_v5`] produces
+/// version 5 for mainnet consents, and [`compute_attestation_v6`] version 6
+/// for mainnet consents to an intent. Verification recomputes version 2 for
+/// grants stored under it.
 fn compute_with_scope(
     key: &[u8; 32],
     binding: &AttestationBinding<'_>,
@@ -873,6 +988,7 @@ fn compute_with_scope(
         AttestationScope::V3(_) => ATTESTATION_TAG_V3,
         AttestationScope::V4(..) => ATTESTATION_TAG_V4,
         AttestationScope::V5(..) => ATTESTATION_TAG_V5,
+        AttestationScope::V6(..) => ATTESTATION_TAG_V6,
     });
     length_prefixed(&mut mac, binding.profile_name.as_bytes());
     length_prefixed(&mut mac, binding.chain_id.as_bytes());
@@ -882,13 +998,17 @@ fn compute_with_scope(
     length_prefixed(&mut mac, process_uid.as_bytes());
     if let AttestationScope::V3(lifetime)
     | AttestationScope::V4(lifetime, _)
-    | AttestationScope::V5(lifetime, ..) = scope
+    | AttestationScope::V5(lifetime, ..)
+    | AttestationScope::V6(lifetime, ..) = scope
     {
         length_prefixed(&mut mac, lifetime.kind.as_bytes());
         mac.update(&lifetime.created_at_unix_ms.to_be_bytes());
         mac.update(&lifetime.expires_at_unix_ms.to_be_bytes());
     }
-    if let AttestationScope::V4(_, approver) | AttestationScope::V5(_, approver, _) = scope {
+    if let AttestationScope::V4(_, approver)
+    | AttestationScope::V5(_, approver, _)
+    | AttestationScope::V6(_, approver, _) = scope
+    {
         match approver {
             AttestedApprover::Local => mac.update(&[APPROVER_TAG_LOCAL]),
             AttestedApprover::Remote {
@@ -905,7 +1025,7 @@ fn compute_with_scope(
             }
         }
     }
-    if let AttestationScope::V5(_, _, receipt) = scope {
+    if let AttestationScope::V5(_, _, receipt) | AttestationScope::V6(_, _, receipt) = scope {
         // A receipt that is not well formed has no digest; its blob then
         // matches no recordable receipt, and `pending` never selects it.
         match receipt.digest() {
@@ -1841,6 +1961,110 @@ mod tests {
         }
         let debug = format!("{passkey:?}");
         assert!(!debug.contains("BwcHBwcHBwcHBwcHBwcHBw"), "{debug}");
+    }
+
+    /// The subject kind selects exactly one mainnet layout: version 5 for
+    /// the envelope text and version 6 for the intent digest. A crossed pair
+    /// selects nothing, and neither blob verifies as the other.
+    #[test]
+    fn subject_kind_selects_one_layout_without_fallback() {
+        let receipt = super::super::fixtures::fixed_presence_receipt(1_000);
+        let passkey = AttestedApprover::MainnetPasskey {
+            credential_id_b64url: receipt.credential_id_b64url(),
+        };
+        let select = |version, kind| {
+            AttestationScope::pending_for_subject(
+                version,
+                LIFETIME,
+                Some(&passkey),
+                Some(&receipt),
+                kind,
+            )
+        };
+        assert_eq!(
+            select(5, SubjectKind::EnvelopeText),
+            Some(AttestationScope::V5(LIFETIME, &passkey, &receipt))
+        );
+        assert_eq!(
+            select(6, SubjectKind::IntentDigest),
+            Some(AttestationScope::V6(LIFETIME, &passkey, &receipt))
+        );
+        assert_eq!(select(5, SubjectKind::IntentDigest), None);
+        assert_eq!(select(6, SubjectKind::EnvelopeText), None);
+        for version in [0, 1, 2, 3, 4, 7] {
+            assert_eq!(
+                select(version, SubjectKind::IntentDigest),
+                None,
+                "{version}"
+            );
+        }
+        let local = AttestedApprover::Local;
+        assert!(
+            AttestationScope::pending_for_subject(
+                4,
+                LIFETIME,
+                Some(&local),
+                None,
+                SubjectKind::EnvelopeText
+            )
+            .is_some()
+        );
+        assert!(
+            AttestationScope::pending_for_subject(
+                4,
+                LIFETIME,
+                Some(&local),
+                None,
+                SubjectKind::IntentDigest
+            )
+            .is_none()
+        );
+        assert!(
+            AttestationScope::pending_for_subject(
+                6,
+                LIFETIME,
+                Some(&local),
+                None,
+                SubjectKind::IntentDigest
+            )
+            .is_none()
+        );
+        assert_eq!(
+            AttestationScope::pending(5, LIFETIME, Some(&passkey), Some(&receipt)),
+            select(5, SubjectKind::EnvelopeText)
+        );
+        assert_eq!(
+            AttestationScope::pending(6, LIFETIME, Some(&passkey), Some(&receipt)),
+            None
+        );
+        assert_eq!(select(6, SubjectKind::IntentDigest).unwrap().version(), 6);
+        assert_eq!(mainnet_attestation_version(SubjectKind::EnvelopeText), 5);
+        assert_eq!(mainnet_attestation_version(SubjectKind::IntentDigest), 6);
+
+        let key = [0x42; 32];
+        let binding = AttestationBinding::new("main", "stellar:mainnet");
+        let subject = [0x11; 32];
+        let v5 = compute_attestation_v5(
+            &key, &binding, "n", &subject, "1000", &LIFETIME, &passkey, &receipt,
+        );
+        let v6 = compute_attestation_v6(
+            &key, &binding, "n", &subject, "1000", &LIFETIME, &passkey, &receipt,
+        );
+        assert_ne!(v5, v6);
+        let as_v5 = AttestationScope::V5(LIFETIME, &passkey, &receipt);
+        let as_v6 = AttestationScope::V6(LIFETIME, &passkey, &receipt);
+        assert!(verify_attestation(
+            &key, &binding, "n", &subject, "1000", &as_v5, &v5
+        ));
+        assert!(verify_attestation(
+            &key, &binding, "n", &subject, "1000", &as_v6, &v6
+        ));
+        assert!(!verify_attestation(
+            &key, &binding, "n", &subject, "1000", &as_v6, &v5
+        ));
+        assert!(!verify_attestation(
+            &key, &binding, "n", &subject, "1000", &as_v5, &v6
+        ));
     }
 
     /// The version 4 layout of a local and a remote approval is frozen.

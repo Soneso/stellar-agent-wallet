@@ -33,13 +33,17 @@ use stellar_agent_test_support::webauthn::{
 use super::AssertionInput;
 use super::attest::{ConsentAudit, ConsentAuthorization, Surface, attest_and_persist};
 use super::attestation::AttestationBinding;
+use super::intent::{ClassicIntent, IntentAsset, IntentBase, IntentPayload, MemoFact};
 use super::presence::{
-    PendingMainnetPresence, VerifiedMainnetPresence, issue_mainnet_presence,
-    mainnet_presence_origin, verify_mainnet_presence,
+    PendingMainnetPresence, PresenceListener, VerifiedMainnetPresence,
+    issue_mainnet_intent_presence, issue_mainnet_presence, mainnet_presence_origin,
+    verify_mainnet_presence,
 };
 use super::presence_policy::MainnetApprovalAuthority;
 use super::store::{PendingApproval, PendingApprovalStore};
+use super::subject::SubjectKind;
 use crate::audit_log::writer::AuditWriter;
+use crate::mainnet::decision::{AuthorityScope, MainnetDecision};
 use crate::mainnet::verified_policy::VerifiedPolicy;
 use crate::profile::schema::{KeyringEntryRef, Profile};
 
@@ -429,6 +433,116 @@ impl MainnetConsentFixture {
         )
     }
 
+    /// An unattested intent-digest payment of 10 stroops to
+    /// [`ALLOWED_DESTINATION`] that lives `ttl_ms` from now, with the
+    /// canonical intent it binds under the current policy.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the process UID cannot be read or the intent is refused.
+    #[must_use]
+    pub fn intent_payment(&self, ttl_ms: u64) -> (PendingApproval, ClassicIntent) {
+        let mut entry = self.payment(ttl_ms);
+        entry.subject_kind = SubjectKind::IntentDigest;
+        let intent = ClassicIntent::new(
+            IntentBase::new(
+                super::presence::MAINNET_CHAIN_ID.to_owned(),
+                stellar_strkey::ed25519::PublicKey([1; 32])
+                    .to_string()
+                    .to_string(),
+                self.current_policy().digest(),
+                100,
+                MemoFact::Text("approved".to_owned()),
+            )
+            .expect("fixture intent base"),
+            IntentPayload::Pay {
+                destination: ALLOWED_DESTINATION.to_owned(),
+                asset: IntentAsset::Native,
+                amount_stroops: 10,
+            },
+        )
+        .expect("fixture intent");
+        (entry, intent)
+    }
+
+    /// A verified presence for `entry` and `intent` under `policy`: an
+    /// intent challenge issued now at the fixture origin, signed by the
+    /// fixture credential, and verified.
+    ///
+    /// # Panics
+    ///
+    /// Panics when any step refuses.
+    #[must_use]
+    pub fn intent_presence(
+        &self,
+        entry: &PendingApproval,
+        policy: &VerifiedPolicy,
+        intent: &ClassicIntent,
+    ) -> VerifiedMainnetPresence {
+        let origin = Self::origin();
+        let pending = issue_mainnet_intent_presence(
+            entry,
+            &self.binding(),
+            policy,
+            PresenceListener::Loopback(&origin),
+            Some(intent),
+            crate::timefmt::now_unix_ms().expect("clock"),
+            Instant::now(),
+        )
+        .expect("issue an intent challenge");
+        let assertion = Self::sign(&fixture_authenticator(), &pending);
+        verify_mainnet_presence(
+            pending,
+            Self::input(&assertion),
+            crate::timefmt::now_unix_ms().expect("clock"),
+            Instant::now(),
+        )
+        .expect("verified intent presence")
+    }
+
+    /// Inserts `entry` into the fixture store and consents to it and
+    /// `intent` through the production attester. The consent uses a verified
+    /// intent presence under the current policy. Returns the store and the
+    /// surfaced attestation.
+    ///
+    /// # Panics
+    ///
+    /// Panics when any step refuses.
+    #[must_use]
+    pub fn intent_consent(
+        &self,
+        entry: &PendingApproval,
+        intent: &ClassicIntent,
+    ) -> (PendingApprovalStore, Option<String>) {
+        self.consent_with(entry, |policy| self.intent_presence(entry, policy, intent))
+    }
+
+    /// The `RequireApproval` decision the current policy records for the
+    /// fixture profile on mainnet, governing `governing_ttl_ms`.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the policy does not load or the clock is unavailable.
+    #[must_use]
+    pub fn decision(&self, governing_ttl_ms: u64) -> MainnetDecision {
+        let policy = self.current_policy();
+        MainnetDecision::for_test(
+            crate::policy::Decision::RequireApproval(crate::policy::ApprovalRequest::new(
+                "fixture-decision".to_owned(),
+                u32::try_from(governing_ttl_ms / 1_000).unwrap_or(u32::MAX),
+            )),
+            None,
+            policy.digest(),
+            policy.sequence(),
+            0,
+            &self.name,
+            super::presence::MAINNET_CHAIN_ID,
+            crate::timefmt::now_unix_ms().expect("clock"),
+            governing_ttl_ms,
+            AuthorityScope::Classic,
+        )
+    }
+
     /// A challenge for `entry` under `policy`, issued now at the fixture
     /// origin.
     ///
@@ -559,12 +673,23 @@ impl MainnetConsentFixture {
     /// Panics when any step refuses.
     #[must_use]
     pub fn consent(&self, entry: &PendingApproval) -> (PendingApprovalStore, Option<String>) {
+        self.consent_with(entry, |policy| self.presence(entry, policy))
+    }
+
+    /// Inserts `entry` into the fixture store and consents to it through the
+    /// production attester. `presence_for` verifies the presence under the
+    /// current policy. Returns the store and the surfaced attestation.
+    fn consent_with(
+        &self,
+        entry: &PendingApproval,
+        presence_for: impl FnOnce(&VerifiedPolicy) -> VerifiedMainnetPresence,
+    ) -> (PendingApprovalStore, Option<String>) {
         let mut store = PendingApprovalStore::open(self.store_path()).expect("fixture store");
         store
             .insert(entry.clone(), crate::timefmt::now_unix_ms().expect("clock"))
             .expect("insert entry");
         let policy = self.current_policy();
-        let presence = self.presence(entry, &policy);
+        let presence = presence_for(&policy);
         let mut writer = self.audit_writer();
         let surfaced = attest_and_persist(
             &mut store,

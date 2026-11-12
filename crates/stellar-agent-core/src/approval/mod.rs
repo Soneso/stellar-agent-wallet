@@ -54,11 +54,14 @@
 //!   then collapses any error to `policy.approval_required`.
 //! - **Mainnet consent**: [`presence`](crate::approval::presence) issues a WebAuthn challenge for a
 //!   pending entry and verifies the assertion against the credential keys of
-//!   the owner-signed mainnet policy; the attester records a version 5
-//!   attestation bound to the retained receipt.
+//!   the owner-signed mainnet policy. The attester records a version 5
+//!   attestation on an envelope-text record and a version 6 attestation on
+//!   an intent-digest record, each bound to the retained receipt.
 //! - **Mainnet proof**: [`witness::verify_approval`](crate::approval::witness::verify_approval)
-//!   loads the record and the key itself, accepts only a version 5
-//!   attestation with a mainnet passkey approver, reads the current signed
+//!   accepts only a version 5 attestation, and
+//!   [`witness::verify_intent_approval`](crate::approval::witness::verify_intent_approval)
+//!   only a version 6 attestation, each with a mainnet passkey approver.
+//!   Each loads the record and the key itself, reads the current signed
 //!   policy through [`presence_policy`](crate::approval::presence_policy), and verifies the stored assertion
 //!   again under it.
 //! - **Bridge POST handler**: calls
@@ -102,11 +105,11 @@ pub use attest::{
 pub use attestation::AttestationBinding;
 pub use attestation::{
     ATTESTATION_VERSION, ATTESTATION_VERSION_V2, AttestationScope, AttestedApprover,
-    AttestedLifetime, MAINNET_ATTESTATION_VERSION, PENDING_ATTESTATION_VERSION,
-    TOOLSET_GATE_DOMAIN_TAG, TRUSTLINE_CLAWBACK_OPT_IN_DOMAIN_TAG, compute_attestation,
-    compute_attestation_v4, compute_attestation_v5, compute_toolset_gate_digest,
-    compute_trustline_clawback_opt_in_digest, envelope_sha256, verify_attestation,
-    verify_toolset_gate_attestation,
+    AttestedLifetime, MAINNET_ATTESTATION_VERSION, MAINNET_INTENT_ATTESTATION_VERSION,
+    PENDING_ATTESTATION_VERSION, TOOLSET_GATE_DOMAIN_TAG, TRUSTLINE_CLAWBACK_OPT_IN_DOMAIN_TAG,
+    compute_attestation, compute_attestation_v4, compute_attestation_v5, compute_attestation_v6,
+    compute_toolset_gate_digest, compute_trustline_clawback_opt_in_digest, envelope_sha256,
+    mainnet_attestation_version, verify_attestation, verify_toolset_gate_attestation,
 };
 pub use context::{ApprovalContext, approve_hint};
 pub use error::ApprovalError;

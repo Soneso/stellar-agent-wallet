@@ -991,6 +991,27 @@ length-prefixed credential ID, followed by the 32-byte receipt digest. The
 store records version, approver, receipt, and blob together; the version 4
 record methods refuse a mainnet passkey approver.
 
+The version 6 HMAC is the version 5 preimage under the tag
+`stellar-agent-approval-attestation:v6`, with the canonical intent digest in
+the subject slot. An inbox entry records its subject kind: `envelope-text`,
+the default that the file omits, or `intent-digest` on a payment, claim or
+trustline. Version 5 verifies only an `envelope-text` entry, and version 6
+only an `intent-digest` entry. No layout falls back to another, so an edited
+kind selects no layout or a tag that the stored blob fails. An intent ceremony
+on an envelope entry, or an envelope ceremony on an intent entry, refuses with
+`approval.presence_invalid`.
+
+An intent witness verifies the version 6 blob over the intent digest, the
+governing decision, and the receipt that binds the intent. The decision
+requires approval for the profile, the chain, and the current policy digest.
+Its governing lifetime equals the signed lifetime. Consent is the receipt's
+verified time. Execution expiry is consent plus the smaller of 900,000
+milliseconds and the governing lifetime. The witness requires
+`created <= consent < waiting_expires` and `consent <= now < execution_expires`,
+and applies no pending-expiry check. Restarts recompute both clocks from
+signed inputs. An envelope witness reports its signed expiry as execution
+expiry.
+
 Before the row, the attester rechecks the locked entry's nonce, kind, uid, and
 both lifetime fields against the challenged snapshot, recomputes subject and
 challenge, requires the current policy to equal the challenge's policy by
@@ -1728,7 +1749,9 @@ Revocation creates no operation transition or audit row.
 
 Consent retains the attestation, receipt and signed process identifier for
 reconstruction. The record supplies the signed nonce, kind, subject and
-lifetime; the authenticated file supplies the profile and chain. Pruning
+lifetime; the authenticated file supplies the profile and chain.
+Reconstruction selects the layout from the record's subject kind: version 5
+for envelope text and version 6 for an intent digest. Pruning
 releases the payload when the operation becomes terminal or execution expires.
 Disposition, clocks and receipt digest remain. A record leaves after both
 windows end and seven days pass. The closed-record cap is 256, with the oldest

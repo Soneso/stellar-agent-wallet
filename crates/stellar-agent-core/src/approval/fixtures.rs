@@ -574,6 +574,43 @@ pub fn rule_proposal_pending() -> PendingApproval {
     .expect("valid rule fixture")
 }
 
+/// A well-formed version 1 presence receipt with fixed bytes. It holds the
+/// fixture credential's assertion over a fixed challenge at the loopback
+/// origin. It is issued 5 s after `base_ms`, verified at 6 s and expires at
+/// 65 s.
+#[cfg(test)]
+pub(crate) fn fixed_presence_receipt(base_ms: u64) -> super::presence::MainnetPresenceReceipt {
+    use base64::Engine as _;
+    use stellar_agent_test_support::webauthn::{FLAG_UP, FLAG_UV, fixture_authenticator};
+    let origin = super::presence::mainnet_presence_origin(4100);
+    let assertion = fixture_authenticator().assert(
+        [7; 32],
+        &origin,
+        super::presence::MAINNET_APPROVAL_RP_ID,
+        FLAG_UP | FLAG_UV,
+        1,
+    );
+    serde_json::from_value(serde_json::json!({
+        "version": 1,
+        "request_id": "00000000-0000-4000-8000-000000000001",
+        "random_b64url": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([1; 32]),
+        "policy_sequence": 7,
+        "policy_digest_hex": "ab".repeat(32),
+        "policy_owner_hex": "09".repeat(32),
+        "expected_origin": origin,
+        "issued_at_unix_ms": base_ms + 5_000,
+        "expires_at_unix_ms": base_ms + 65_000,
+        "verified_at_unix_ms": base_ms + 6_000,
+        "assertion": {
+            "credential_id": assertion.credential_id,
+            "authenticator_data": assertion.authenticator_data,
+            "client_data_json": assertion.client_data_json,
+            "signature_compact": assertion.signature_compact,
+        },
+    }))
+    .expect("fixed presence receipt")
+}
+
 #[cfg(test)]
 pub(crate) mod intent {
     use super::super::intent::ClassicIntent;

@@ -5664,6 +5664,108 @@ pub(crate) mod tests {
         drop(held);
     }
 
+    /// After the consumed inbox row is collected, the receipt hold alone
+    /// answers `policy.approval_consumed`: with the entry absent, with the
+    /// store locked, and with the store malformed. A missing or malformed
+    /// attestation keeps `policy.approval_required`.
+    #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial(keyring)]
+    async fn consumed_receipt_refuses_after_gc_without_the_inbox() {
+        use stellar_agent_core::approval::{ConsumedOutcome, PendingApprovalStore};
+        use stellar_agent_core::profile::receipt::ReceiptStore;
+
+        let dir = tempfile::tempdir().unwrap();
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(dir.path());
+        let server = envelope_gate_server(dir.path());
+        let entry = envelope_gate_entry(GatedApprovalKind::Payment);
+        let blob = park_gate_entry(&server, dir.path(), &entry);
+        let receipts = ReceiptStore::open(&server.profile_name_for_approval()).unwrap();
+        receipts
+            .begin_submission_with_approval(
+                "hash",
+                &"ab".repeat(32),
+                "source",
+                1,
+                0,
+                100,
+                Some(&entry.approval_nonce),
+            )
+            .unwrap();
+        receipts.mark_submitted("hash").unwrap();
+        receipts.mark_approval_consumed("hash").unwrap();
+        let inbox_path = dir
+            .path()
+            .join(format!("{}.toml", server.profile_name_for_approval()));
+        {
+            let mut inbox = PendingApprovalStore::open(inbox_path.clone()).unwrap();
+            assert!(
+                inbox
+                    .consume(
+                        &entry.approval_nonce,
+                        &"ab".repeat(32),
+                        ConsumedOutcome::Confirmed
+                    )
+                    .unwrap()
+            );
+            let now = stellar_agent_core::timefmt::now_unix_ms().unwrap();
+            assert_eq!(inbox.gc_expired_and_consumed(now).unwrap(), 1);
+            assert!(inbox.get(&entry.approval_nonce).is_none());
+        }
+        let dispatch = DispatchOutcome::RequireApproval(
+            ApprovalRequest::new(entry.approval_nonce.clone(), 120).into(),
+        );
+        async fn gate_code(
+            server: &WalletServer,
+            dispatch: &DispatchOutcome,
+            nonce: &str,
+            attestation: Option<&str>,
+        ) -> String {
+            let refusal = verify_attestation_gate(
+                server,
+                dispatch,
+                GatedApprovalKind::Payment,
+                "AAAA",
+                Some(nonce),
+                attestation,
+                "stellar_pay_commit",
+            )
+            .await
+            .unwrap_err();
+            assert_business_envelope(&refusal).0
+        }
+        let nonce = entry.approval_nonce.as_str();
+        for attestation in [None, Some("invalid-attestation")] {
+            assert_eq!(
+                gate_code(&server, &dispatch, nonce, attestation).await,
+                "policy.approval_required"
+            );
+        }
+        assert_eq!(
+            gate_code(&server, &dispatch, nonce, Some(&blob)).await,
+            "policy.approval_consumed",
+            "the entry is absent"
+        );
+        let held = PendingApprovalStore::open(inbox_path.clone()).unwrap();
+        assert_eq!(
+            gate_code(&server, &dispatch, nonce, Some(&blob)).await,
+            "policy.approval_consumed",
+            "the store is locked"
+        );
+        drop(held);
+        std::fs::write(&inbox_path, "not = [valid").unwrap();
+        assert_eq!(
+            gate_code(&server, &dispatch, nonce, Some(&blob)).await,
+            "policy.approval_consumed",
+            "the store is malformed"
+        );
+        for attestation in [None, Some("invalid-attestation")] {
+            assert_eq!(
+                gate_code(&server, &dispatch, nonce, attestation).await,
+                "policy.approval_required"
+            );
+        }
+    }
+
     /// An unreadable receipt store refuses even a valid, unspent approval.
     #[tokio::test(flavor = "current_thread")]
     #[serial_test::serial(keyring)]

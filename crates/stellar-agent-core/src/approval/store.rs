@@ -123,6 +123,7 @@ use super::registration_input::{
     validate_registration_input_invariants,
 };
 use super::rule_proposal::{ContextRuleProposalSnapshot, validate_context_rule_proposal_snapshot};
+use super::subject::SubjectKind;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // TTL constant
@@ -196,10 +197,12 @@ pub const MPP_APPROVAL_MAX_TTL_MS: u64 = 5 * 60 * 1_000;
 pub const EXPECTED_NONCE_LEN: usize = 22;
 
 /// Hard cap on the number of pending approvals held in a single store at one
-/// time.  `insert` prunes expired entries before checking this limit, so in
-/// practice the cap is only reached when a single-user wallet accumulates more
-/// than 4 096 simultaneous live (non-expired) approvals, which is not a
-/// plausible legitimate scenario.
+/// time. `insert` prunes expired entries before checking this limit. The cap
+/// is therefore reached only when a single-user wallet holds more than 4 096
+/// simultaneous live (non-expired) approvals, which is not a plausible
+/// legitimate scenario. Consumed tombstones count until they
+/// expire; [`PendingApprovalStore::gc_expired_and_consumed`] frees them
+/// earlier.
 const MAX_PENDING_APPROVALS: usize = 4_096;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -797,10 +800,13 @@ pub enum ApprovalKind {
     /// was already spent and on which transaction, instead of seeing the
     /// same shape as "no decision yet".
     ///
-    /// The entry keeps its `attestation_blob_b64` — the evidence of the
-    /// operator decision the submission was made under — and keeps the
-    /// original entry's expiry, so the existing GC sweeps it on the same
-    /// schedule as any other entry. A `Consumed` entry can never be attested.
+    /// The entry keeps its `attestation_blob_b64`, the evidence of the
+    /// operator decision behind the submission. It also keeps the original
+    /// entry's expiry, so expiry collection sweeps it on the same schedule as
+    /// any other entry. [`PendingApprovalStore::gc_expired_and_consumed`]
+    /// removes it earlier.
+    /// Replay protection does not depend on it: the submission receipt holds
+    /// the spent nonce. A `Consumed` entry can never be attested.
     ///
     /// Summary data from the original entry does not survive: only the kind
     /// name it replaced, the value it was spent on, and what is known about
@@ -920,11 +926,26 @@ impl ApprovalKind {
             other => MAINNET_CONSENT_KINDS.contains(&other.kind_name()),
         }
     }
+
+    /// Whether a record of this kind can bind the canonical intent digest:
+    /// a classic payment, claim or trustline, or the consumed tombstone of
+    /// one.
+    #[must_use]
+    pub(crate) fn admits_intent_subject(&self) -> bool {
+        const INTENT_KINDS: &[&str] = &["PaymentSimulated", "ClaimSimulated", "TrustlineSimulated"];
+        match self {
+            Self::Consumed {
+                original_kind_name, ..
+            } => INTENT_KINDS.contains(&original_kind_name.as_str()),
+            other => INTENT_KINDS.contains(&other.kind_name()),
+        }
+    }
 }
 
 /// Refuses an approver the version 4 record paths cannot store: a malformed
-/// credential ID, or a mainnet passkey approver, which only the mainnet
-/// attester records, with its receipt, under version 5.
+/// credential ID, or a mainnet passkey approver. Only the mainnet attester
+/// records a mainnet passkey approver, with its receipt: under version 5 on
+/// an envelope-text record and under version 6 on an intent-digest record.
 fn refuse_version_4_approver(approver: &AttestedApprover) -> Result<(), ApprovalError> {
     if matches!(approver, AttestedApprover::MainnetPasskey { .. }) {
         return Err(ApprovalError::Invalid {
@@ -1570,12 +1591,16 @@ struct PendingApprovalOnDisk {
     // An absent version decodes as version 2.
     #[serde(default = "legacy_attestation_version")]
     attestation_version: u32,
+    // The subject's binding convention; absent reads as the envelope text,
+    // which is also omitted on write so envelope records keep their bytes.
+    #[serde(default, skip_serializing_if = "is_envelope_text")]
+    subject_kind: SubjectKind,
     // The approver a version 4 attestation authenticates; absent on an
     // unattested record and on every record written under version 2 or 3.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     attested_approver: Option<AttestedApproverWire>,
-    // The presence receipt a version 5 attestation binds; present only with
-    // a mainnet passkey approver.
+    // The presence receipt a version 5 or 6 attestation binds; present only
+    // with a mainnet passkey approver.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     mainnet_presence: Option<MainnetPresenceReceipt>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1650,6 +1675,15 @@ struct PendingApprovalOnDisk {
     passkey_assertion: Option<AssertionInput>,
     #[serde(default)]
     registration_input: Option<RegistrationInput>,
+}
+
+/// Whether `kind` is the default subject kind, which the inbox omits.
+#[allow(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde's skip_serializing_if passes the field by reference"
+)]
+fn is_envelope_text(kind: &SubjectKind) -> bool {
+    *kind == SubjectKind::EnvelopeText
 }
 
 /// The layout of an attestation stored before records named theirs.
@@ -1909,12 +1943,23 @@ pub struct PendingApproval {
 
     /// The WebAuthn presence receipt of a mainnet consent.
     ///
-    /// Present only with a version 5 attestation and a
-    /// [`AttestedApprover::MainnetPasskey`] approver, all three written in
-    /// one store replacement by the mainnet attester. Distinct from
+    /// Present only with a version 5 or 6 attestation and a
+    /// [`AttestedApprover::MainnetPasskey`] approver. The mainnet attester
+    /// writes all three in one store replacement: version 5 on an
+    /// envelope-text record, version 6 on an intent-digest record. Distinct from
     /// [`Self::passkey_assertion`], which belongs to `SignWithPasskey`. A
     /// consumed tombstone retains it with the blob it is bound into.
     pub mainnet_presence: Option<MainnetPresenceReceipt>,
+
+    /// The binding convention of the approved subject.
+    ///
+    /// [`SubjectKind::EnvelopeText`] for every record a constructor writes,
+    /// and [`SubjectKind::IntentDigest`] for a payment, claim or trustline
+    /// whose consent binds the canonical intent digest. The attestation
+    /// layout follows it (see [`Self::attestation_scope`]), so an edited
+    /// value selects no layout or one the stored blob fails. A consumed
+    /// tombstone keeps it; a rejected tombstone writes the default.
+    pub subject_kind: SubjectKind,
 }
 
 impl std::fmt::Debug for PendingApproval {
@@ -1954,6 +1999,7 @@ impl std::fmt::Debug for PendingApproval {
             .field("attestation_version", &self.attestation_version)
             .field("attested_approver", &self.attested_approver)
             .field("mainnet_presence", &self.mainnet_presence)
+            .field("subject_kind", &self.subject_kind)
             .finish()
     }
 }
@@ -2422,6 +2468,7 @@ impl Serialize for PendingApproval {
             created_at_unix_ms: self.created_at_unix_ms,
             expires_at_unix_ms: self.expires_at_unix_ms,
             attestation_version: self.attestation_version,
+            subject_kind: self.subject_kind,
             attested_approver: self
                 .attested_approver
                 .as_ref()
@@ -2518,6 +2565,7 @@ impl<'de> Deserialize<'de> for PendingApproval {
         D: Deserializer<'de>,
     {
         let mut raw = PendingApprovalOnDisk::deserialize(deserializer)?;
+        let subject_kind = raw.subject_kind;
 
         // An approver is recorded together with the blob it authenticates;
         // one without the other is a hand-edited record.
@@ -2531,15 +2579,20 @@ impl<'de> Deserialize<'de> for PendingApproval {
             Some(wire) => Some(wire.into_approver().map_err(serde::de::Error::custom)?),
         };
         // A presence receipt, a mainnet passkey approver for the receipt's
-        // credential and version 5 are recorded together; any one without
-        // the others is a hand-edited or cross-version record.
+        // credential and a mainnet consent version (5 or 6) are recorded
+        // together. Any one without the others marks a hand-edited or
+        // cross-version record. Which of the two versions belongs to the
+        // record's subject kind is the attestation scope's decision.
         let mainnet_presence = raw.mainnet_presence.take();
         let passkey_approver = matches!(
             attested_approver,
             Some(AttestedApprover::MainnetPasskey { .. })
         );
-        let mainnet_version =
-            raw.attestation_version == super::attestation::MAINNET_ATTESTATION_VERSION;
+        let mainnet_version = matches!(
+            raw.attestation_version,
+            super::attestation::MAINNET_ATTESTATION_VERSION
+                | super::attestation::MAINNET_INTENT_ATTESTATION_VERSION
+        );
         let same_credential = match (&attested_approver, &mainnet_presence) {
             (
                 Some(AttestedApprover::MainnetPasskey {
@@ -2559,8 +2612,8 @@ impl<'de> Deserialize<'de> for PendingApproval {
             || !same_credential
         {
             return Err(serde::de::Error::custom(
-                "mainnet_presence, a mainnet_passkey approver and attestation version 5 are \
-                 recorded together",
+                "mainnet_presence, a mainnet_passkey approver and a mainnet attestation version \
+                 are recorded together",
             ));
         }
 
@@ -3337,6 +3390,11 @@ impl<'de> Deserialize<'de> for PendingApproval {
                 "mainnet_presence is present on a kind without a mainnet consent",
             ));
         }
+        if subject_kind == SubjectKind::IntentDigest && !kind.admits_intent_subject() {
+            return Err(serde::de::Error::custom(
+                "subject_kind intent-digest is recorded only on a payment, claim or trustline",
+            ));
+        }
 
         Ok(PendingApproval {
             approval_nonce: raw.approval_nonce,
@@ -3350,6 +3408,7 @@ impl<'de> Deserialize<'de> for PendingApproval {
             attestation_version: raw.attestation_version,
             attested_approver,
             mainnet_presence,
+            subject_kind,
         })
     }
 }
@@ -3376,22 +3435,26 @@ impl PendingApproval {
         )
     }
 
-    /// The layout this record's attestation is verified under: version 4
-    /// with a recorded local or remote approver, version 5 with a mainnet
-    /// passkey approver and its presence receipt, or `None`, which verifies
-    /// nothing.
+    /// The layout this record's attestation is verified under, or `None`,
+    /// which verifies nothing. Version 4 needs a recorded local or remote
+    /// approver. Version 5 needs a mainnet passkey approver and its presence
+    /// receipt, and version 6 needs both on an intent-digest record.
     ///
-    /// A record under version 2 or 3, one without a well-formed approver, or
-    /// one whose version, approver and receipt do not belong together returns
-    /// `None`, so editing a record's version or deleting its approver or
-    /// receipt never selects a layout that ignores who approved it.
+    /// A record under version 2 or 3 returns `None`. So does one without a
+    /// well-formed approver, or one whose version, approver and receipt do
+    /// not belong together. Editing a record's version or deleting its
+    /// approver or receipt therefore never selects a layout that ignores who
+    /// approved it. The
+    /// record's [`Self::subject_kind`] selects among the layouts, so a
+    /// version that belongs to the other subject kind also returns `None`.
     #[must_use]
     pub fn attestation_scope(&self) -> Option<super::attestation::AttestationScope<'_>> {
-        super::attestation::AttestationScope::pending(
+        super::attestation::AttestationScope::pending_for_subject(
             self.attestation_version,
             self.attested_lifetime(),
             self.attested_approver.as_ref(),
             self.mainnet_presence.as_ref(),
+            self.subject_kind,
         )
     }
 
@@ -3510,6 +3573,7 @@ impl PendingApproval {
             attestation_version: super::attestation::PENDING_ATTESTATION_VERSION,
             attested_approver: None,
             mainnet_presence: None,
+            subject_kind: SubjectKind::EnvelopeText,
         })
     }
 
@@ -3656,6 +3720,7 @@ impl PendingApproval {
             attestation_version: super::attestation::PENDING_ATTESTATION_VERSION,
             attested_approver: None,
             mainnet_presence: None,
+            subject_kind: SubjectKind::EnvelopeText,
         })
     }
 
@@ -3779,6 +3844,7 @@ impl PendingApproval {
             attestation_version: super::attestation::PENDING_ATTESTATION_VERSION,
             attested_approver: None,
             mainnet_presence: None,
+            subject_kind: SubjectKind::EnvelopeText,
         })
     }
 
@@ -3896,6 +3962,7 @@ impl PendingApproval {
             attestation_version: super::attestation::PENDING_ATTESTATION_VERSION,
             attested_approver: None,
             mainnet_presence: None,
+            subject_kind: SubjectKind::EnvelopeText,
         })
     }
 
@@ -3972,6 +4039,7 @@ impl PendingApproval {
             attestation_version: super::attestation::PENDING_ATTESTATION_VERSION,
             attested_approver: None,
             mainnet_presence: None,
+            subject_kind: SubjectKind::EnvelopeText,
         })
     }
 
@@ -4026,6 +4094,7 @@ impl PendingApproval {
             attestation_version: super::attestation::PENDING_ATTESTATION_VERSION,
             attested_approver: None,
             mainnet_presence: None,
+            subject_kind: SubjectKind::EnvelopeText,
         })
     }
 
@@ -4179,6 +4248,7 @@ impl PendingApproval {
             attestation_version: super::attestation::PENDING_ATTESTATION_VERSION,
             attested_approver: None,
             mainnet_presence: None,
+            subject_kind: SubjectKind::EnvelopeText,
         })
     }
 
@@ -4242,6 +4312,7 @@ impl PendingApproval {
             attestation_version: super::attestation::PENDING_ATTESTATION_VERSION,
             attested_approver: None,
             mainnet_presence: None,
+            subject_kind: SubjectKind::EnvelopeText,
         })
     }
 
@@ -4326,6 +4397,7 @@ impl PendingApproval {
             attestation_version: super::attestation::PENDING_ATTESTATION_VERSION,
             attested_approver: None,
             mainnet_presence: None,
+            subject_kind: SubjectKind::EnvelopeText,
         })
     }
 
@@ -4470,6 +4542,7 @@ impl PendingApproval {
             attestation_version: super::attestation::PENDING_ATTESTATION_VERSION,
             attested_approver: None,
             mainnet_presence: None,
+            subject_kind: SubjectKind::EnvelopeText,
         })
     }
 
@@ -5378,8 +5451,10 @@ impl PendingApprovalStore {
     /// Returns the total number of pending approvals currently in the store.
     ///
     /// Expired entries are removed automatically on each successful `insert`
-    /// call.  Any entries that expired since the last `insert` are still
-    /// counted here until pruned by `insert` or an explicit `gc_expired` call.
+    /// call. Entries that expire after the last `insert` count here until
+    /// `insert` or an explicit `gc_expired` call prunes them. Consumed
+    /// tombstones count until they expire or `gc_expired_and_consumed`
+    /// removes them.
     ///
     /// Useful for assertions in integration tests.
     #[must_use]
@@ -5676,6 +5751,7 @@ impl PendingApprovalStore {
             attestation_version: super::attestation::PENDING_ATTESTATION_VERSION,
             attested_approver: None,
             mainnet_presence: None,
+            subject_kind: SubjectKind::EnvelopeText,
         };
 
         self.persist()?;
@@ -5695,9 +5771,10 @@ impl PendingApprovalStore {
     /// rule proposal, whose outcome stays `unknown`.
     ///
     /// The entry keeps its `attestation_blob_b64` and its original
-    /// `created_at_unix_ms` / `expires_at_unix_ms`, so it is swept by the
-    /// existing [`Self::gc_expired`] / [`Self::insert`]-time pruning on the
-    /// schedule the original entry already had.
+    /// `created_at_unix_ms` / `expires_at_unix_ms`. [`Self::gc_expired`] and
+    /// [`Self::insert`]-time pruning therefore sweep it on the original
+    /// entry's schedule, and [`Self::gc_expired_and_consumed`] sweeps it at
+    /// once.
     ///
     /// A `Consumed` tombstone can never be attested: it is not one of the
     /// kinds any attestation path dispatches on, so an attest attempt against
@@ -5747,6 +5824,7 @@ impl PendingApprovalStore {
             attestation_version: existing.attestation_version,
             attested_approver: existing.attested_approver.clone(),
             mainnet_presence: existing.mainnet_presence.clone(),
+            subject_kind: existing.subject_kind,
         };
 
         self.persist()?;
@@ -6032,9 +6110,9 @@ impl PendingApprovalStore {
         }))
     }
 
-    /// Records a mainnet consent: the version 5 blob, the mainnet passkey
-    /// approver, and the presence receipt the blob binds, in one store
-    /// replacement.
+    /// Records a mainnet consent in one store replacement. It stores the
+    /// blob under the version the subject kind selects, 5 or 6, with the
+    /// mainnet passkey approver and the presence receipt the blob binds.
     ///
     /// Only the mainnet attester calls it, after verifying the assertion and
     /// rechecking the locked entry and the current policy. Expiry and an
@@ -6096,7 +6174,8 @@ impl PendingApprovalStore {
             return Err(ApprovalError::AlreadyAttested);
         }
         entry.attestation_blob_b64 = Some(URL_SAFE_NO_PAD.encode(attestation_blob));
-        entry.attestation_version = super::attestation::MAINNET_ATTESTATION_VERSION;
+        entry.attestation_version =
+            super::attestation::mainnet_attestation_version(entry.subject_kind);
         entry.attested_approver = Some(approver);
         entry.mainnet_presence = Some(receipt);
         self.persist()
@@ -6113,6 +6192,31 @@ impl PendingApprovalStore {
     pub fn gc_expired(&mut self, now_unix_ms: u64) -> Result<usize, ApprovalError> {
         let before = self.entries.len();
         self.entries.retain(|e| !e.is_expired(now_unix_ms));
+        let removed = before - self.entries.len();
+        if removed > 0 {
+            self.persist()?;
+        }
+        Ok(removed)
+    }
+
+    /// Removes every entry that is expired at `now_unix_ms` or is a
+    /// [`ApprovalKind::Consumed`] tombstone, and persists once when it
+    /// removed one.
+    ///
+    /// Returns the count of removed entries; an expired tombstone counts
+    /// once. Live pending, attested and rejected entries keep their bytes.
+    /// Replay protection never depends on a tombstone: the submission
+    /// receipt holds the spent nonce, and the durable approval record admits
+    /// only its own operation.
+    ///
+    /// # Errors
+    ///
+    /// - [`ApprovalError::Io`] / [`ApprovalError::Toml`] on persistence failure.
+    pub fn gc_expired_and_consumed(&mut self, now_unix_ms: u64) -> Result<usize, ApprovalError> {
+        let before = self.entries.len();
+        self.entries.retain(|e| {
+            !(e.is_expired(now_unix_ms) || matches!(e.kind, ApprovalKind::Consumed { .. }))
+        });
         let removed = before - self.entries.len();
         if removed > 0 {
             self.persist()?;
@@ -6371,6 +6475,8 @@ impl PendingApprovalStore {
     /// persists (renames) to the store path, then fsyncs the file and (on
     /// Unix only) the parent directory.  File mode is `0o600` on Unix.
     fn persist(&self) -> Result<(), ApprovalError> {
+        #[cfg(test)]
+        tests::count_persist();
         let parent = self.path.parent().ok_or_else(|| {
             ApprovalError::from_io_detail(
                 io::ErrorKind::InvalidInput,
@@ -6530,6 +6636,24 @@ mod tests {
 
     use super::*;
     use tempfile::TempDir;
+
+    thread_local! {
+        /// The persists the stores on this thread have performed.
+        static PERSISTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    /// Counts one persist on this thread.
+    pub(super) fn count_persist() {
+        PERSISTS.set(PERSISTS.get() + 1);
+    }
+
+    /// Runs `run` and returns its value with the persists it performed on
+    /// this thread.
+    fn persists_during<T>(run: impl FnOnce() -> T) -> (T, usize) {
+        let before = PERSISTS.get();
+        let value = run();
+        (value, PERSISTS.get() - before)
+    }
 
     /// A fixed "current time" used in tests that call `insert`.
     ///
@@ -12973,5 +13097,505 @@ asset = "CADQOBYHA4DQOBYHA4DQOBYHA4DQOBYHA4DQOBYHA4DQOBYHA4DQP5KR"
         assert!(PendingApprovalStore::open(path.clone()).is_err());
         std::fs::write(&path, &original).unwrap();
         assert!(PendingApprovalStore::open(path).is_ok());
+    }
+
+    /// The creation time of every entry in the base inbox vector.
+    const BASE_INBOX_CREATED_MS: u64 = 1_700_000_000_000;
+
+    /// The entries of the base inbox vector: every inbox kind, and each
+    /// attestable kind under attestation versions 2 to 5, with fixed nonces
+    /// and times.
+    fn base_inbox_entries() -> Vec<PendingApproval> {
+        use super::super::fixtures;
+        let receipt = fixtures::fixed_presence_receipt(BASE_INBOX_CREATED_MS);
+        let passkey = AttestedApprover::MainnetPasskey {
+            credential_id_b64url: receipt.credential_id_b64url(),
+        };
+        let remote = AttestedApprover::Remote {
+            credential_id_b64url: "AAECAw".to_owned(),
+        };
+        let source = stellar_strkey::ed25519::PublicKey([1; 32]).to_string();
+        let destination = stellar_strkey::ed25519::PublicKey([2; 32]).to_string();
+        let uid = "1000".to_owned();
+        let layouts: [(
+            u32,
+            Option<AttestedApprover>,
+            Option<MainnetPresenceReceipt>,
+        ); 5] = [
+            (2, None, None),
+            (3, None, None),
+            (4, Some(AttestedApprover::Local), None),
+            (4, Some(remote), None),
+            (5, Some(passkey), Some(receipt)),
+        ];
+        let attest = |entry: &PendingApproval,
+                      (version, approver, receipt): &(
+            u32,
+            Option<AttestedApprover>,
+            Option<MainnetPresenceReceipt>,
+        )| {
+            let mut attested = entry.clone();
+            attested.attestation_blob_b64 =
+                Some(URL_SAFE_NO_PAD.encode([u8::try_from(*version).unwrap(); 32]));
+            attested.attestation_version = *version;
+            attested.attested_approver.clone_from(approver);
+            attested.mainnet_presence.clone_from(receipt);
+            attested
+        };
+        let mainnet_kinds = [
+            fixtures::payment_pending(
+                &source,
+                &destination,
+                "XLM",
+                10,
+                Some("base"),
+                100,
+                7,
+                uid.clone(),
+                DEFAULT_TTL_MS,
+            ),
+            fixtures::claim_pending(
+                &source,
+                [9; 32],
+                Some(("XLM", 5)),
+                100,
+                7,
+                uid.clone(),
+                DEFAULT_TTL_MS,
+            ),
+            fixtures::trustline_pending(
+                &source,
+                "USDC",
+                TESTNET_USDC_ISSUER,
+                Some(100),
+                100,
+                7,
+                uid.clone(),
+                DEFAULT_TTL_MS,
+            ),
+            x402_entry(None),
+            PendingApproval::new_trustline_clawback_opt_in_pending(
+                "stellar:mainnet".to_owned(),
+                "USDC".to_owned(),
+                TESTNET_USDC_ISSUER.to_owned(),
+                uid.clone(),
+                DEFAULT_TTL_MS,
+            )
+            .unwrap(),
+        ];
+        let mut entries = Vec::new();
+        for entry in &mainnet_kinds {
+            entries.push(entry.clone());
+            entries.extend(layouts.iter().map(|layout| attest(entry, layout)));
+        }
+        let testnet_attested = [
+            make_rule_proposal_entry(DEFAULT_TTL_MS),
+            fixtures::bind_mpp_entry(
+                PendingApproval::new_mpp_charge_pending_at(
+                    [0; 32],
+                    [0x22; 32],
+                    "a".to_owned(),
+                    "stellar:testnet".to_owned(),
+                    VALID_SUMMARY_TO.to_owned(),
+                    "mcp".to_owned(),
+                    "merchant".to_owned(),
+                    "tools/charge".to_owned(),
+                    "1000000".to_owned(),
+                    "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM".to_owned(),
+                    VALID_SUMMARY_TO.to_owned(),
+                    BASE_INBOX_CREATED_MS / 1_000 + 3_600,
+                    1_100,
+                    uid.clone(),
+                    60_000,
+                    BASE_INBOX_CREATED_MS,
+                )
+                .unwrap(),
+            ),
+        ];
+        for entry in &testnet_attested {
+            entries.push(entry.clone());
+            entries.push(attest(entry, &layouts[2]));
+        }
+        let mut register = make_register_passkey_entry(DEFAULT_TTL_MS);
+        let ApprovalKind::RegisterPasskey {
+            registration_challenge,
+            ..
+        } = &mut register.kind
+        else {
+            panic!("register passkey kind required")
+        };
+        *registration_challenge = Some([0x33; 32]);
+        entries.extend([
+            make_passkey_entry(DEFAULT_TTL_MS),
+            register,
+            make_toolset_gate_entry(DEFAULT_TTL_MS),
+        ]);
+        let tombstones = [
+            attest(&mainnet_kinds[0], &layouts[4]),
+            attest(&mainnet_kinds[1], &layouts[2]),
+            mainnet_kinds[2].clone(),
+        ];
+        let first_tombstone = entries.len();
+        entries.extend(tombstones);
+        for (index, entry) in entries.iter_mut().enumerate() {
+            entry.approval_nonce = format!("baseinboxnonce{index:08}");
+            entry.created_at_unix_ms = BASE_INBOX_CREATED_MS;
+            entry.expires_at_unix_ms = BASE_INBOX_CREATED_MS + DEFAULT_TTL_MS;
+        }
+        let dir = TempDir::new().unwrap();
+        let mut store = open_store(&dir);
+        store.entries.clone_from(&entries);
+        let nonce = |index: usize| format!("baseinboxnonce{index:08}");
+        let hash = "ab".repeat(32);
+        assert!(
+            store
+                .consume(&nonce(first_tombstone), &hash, ConsumedOutcome::Confirmed)
+                .unwrap()
+        );
+        assert!(
+            store
+                .consume(&nonce(first_tombstone + 1), &hash, ConsumedOutcome::Unknown)
+                .unwrap()
+        );
+        assert!(
+            store
+                .reject(
+                    &nonce(first_tombstone + 2),
+                    BASE_INBOX_CREATED_MS,
+                    DEFAULT_TTL_MS
+                )
+                .unwrap()
+        );
+        store.entries.clone()
+    }
+
+    /// The TOML text of one entry, for byte comparisons of single rows.
+    fn entry_toml(entry: &PendingApproval) -> String {
+        toml::to_string_pretty(entry).unwrap()
+    }
+
+    /// Combined collection drops expired rows and both consumed outcomes,
+    /// and keeps live pending, attested and rejected rows byte for byte. It
+    /// persists exactly once when it removed a row and never otherwise.
+    #[test]
+    fn gc_with_consumed_removes_consumed_and_keeps_live_rows() {
+        let now = BASE_INBOX_CREATED_MS + 1_000;
+        let mut entries = base_inbox_entries();
+        let mut expired = entries[0].clone();
+        expired.approval_nonce = "baseinboxexpired000000".to_owned();
+        expired.expires_at_unix_ms = now;
+        entries.push(expired);
+        let removed_nonces: Vec<String> = entries
+            .iter()
+            .filter(|e| {
+                matches!(e.kind, ApprovalKind::Consumed { .. }) || e.expires_at_unix_ms <= now
+            })
+            .map(|e| e.approval_nonce.clone())
+            .collect();
+        assert_eq!(
+            removed_nonces.len(),
+            3,
+            "two consumed outcomes and one expiry"
+        );
+        assert!(entries.iter().any(|e| matches!(
+            e.kind,
+            ApprovalKind::Consumed {
+                outcome: ConsumedOutcome::Confirmed,
+                ..
+            }
+        )));
+        assert!(entries.iter().any(|e| matches!(
+            e.kind,
+            ApprovalKind::Consumed {
+                outcome: ConsumedOutcome::Unknown,
+                ..
+            }
+        )));
+        let kept: Vec<String> = entries
+            .iter()
+            .filter(|e| !removed_nonces.contains(&e.approval_nonce))
+            .map(entry_toml)
+            .collect();
+        assert!(
+            entries
+                .iter()
+                .any(|e| matches!(e.kind, ApprovalKind::Rejected { .. })),
+            "a rejected row is among the kept rows"
+        );
+        assert!(
+            entries.iter().any(|e| e.attestation_blob_b64.is_some()
+                && !matches!(e.kind, ApprovalKind::Consumed { .. })),
+            "an attested row is among the kept rows"
+        );
+
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("default.toml");
+        let mut store = PendingApprovalStore::open(path.clone()).unwrap();
+        store.entries.clone_from(&entries);
+        store.persist().unwrap();
+
+        let (removed, persists) = persists_during(|| store.gc_expired_and_consumed(now).unwrap());
+        assert_eq!(removed, 3);
+        assert_eq!(persists, 1, "a collection that removes rows persists once");
+        let in_memory: Vec<String> = store.entries.iter().map(entry_toml).collect();
+        assert_eq!(in_memory, kept, "kept rows keep their bytes in memory");
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            written,
+            toml::to_string_pretty(&StoreFile {
+                pending: store.entries.clone(),
+            })
+            .unwrap(),
+            "the collection is written"
+        );
+
+        let marked = format!("{written}# unchanged\n");
+        std::fs::write(&path, &marked).unwrap();
+        let (removed, persists) = persists_during(|| store.gc_expired_and_consumed(now).unwrap());
+        assert_eq!(removed, 0);
+        assert_eq!(
+            persists, 0,
+            "a collection that removes nothing persists nothing"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            marked,
+            "a collection that removes nothing writes nothing"
+        );
+        drop(store);
+
+        let reopened = PendingApprovalStore::open(path).unwrap();
+        let on_disk: Vec<String> = reopened.entries.iter().map(entry_toml).collect();
+        assert_eq!(on_disk, kept, "kept rows keep their bytes on disk");
+    }
+
+    /// A consumed tombstone of `entry` under a fresh nonce.
+    fn consumed_row(entry: &PendingApproval, nonce: String) -> PendingApproval {
+        let mut row = entry.clone();
+        row.approval_nonce = nonce;
+        row.kind = ApprovalKind::Consumed {
+            original_kind_name: "PaymentSimulated".to_owned(),
+            tx_hash: "ab".repeat(32),
+            outcome: ConsumedOutcome::Confirmed,
+        };
+        row
+    }
+
+    /// An expired consumed row counts once, and collecting a store full of
+    /// consumed rows frees its capacity durably.
+    #[test]
+    fn gc_with_consumed_counts_once_and_frees_capacity() {
+        let now = 1_000_000;
+        let template = make_payment_entry(DEFAULT_TTL_MS);
+        let mut expired = consumed_row(&template, "consumedexpired0000000".to_owned());
+        expired.created_at_unix_ms = 1;
+        expired.expires_at_unix_ms = now;
+        let mut live = consumed_row(&template, "consumedlive0000000000".to_owned());
+        live.created_at_unix_ms = 1;
+        live.expires_at_unix_ms = now + DEFAULT_TTL_MS;
+        let dir = TempDir::new().unwrap();
+        let mut store = open_store(&dir);
+        store.entries = vec![expired, live];
+        assert_eq!(
+            store.gc_expired_and_consumed(now).unwrap(),
+            2,
+            "an expired consumed row counts once"
+        );
+        assert_eq!(store.len(), 0);
+        drop(store);
+
+        let path = dir.path().join("full.toml");
+        let mut store = PendingApprovalStore::open(path.clone()).unwrap();
+        for index in 0..MAX_PENDING_APPROVALS {
+            let mut row = consumed_row(&template, format!("consumedfull{index:010}"));
+            row.created_at_unix_ms = 1;
+            row.expires_at_unix_ms = now + DEFAULT_TTL_MS;
+            store.entries.push(row);
+        }
+        store.persist().unwrap();
+        let mut fresh = make_payment_entry(DEFAULT_TTL_MS);
+        fresh.created_at_unix_ms = now;
+        fresh.expires_at_unix_ms = now + DEFAULT_TTL_MS;
+        assert!(matches!(
+            store.insert(fresh.clone(), now).unwrap_err(),
+            ApprovalError::PendingStoreFull {
+                max: MAX_PENDING_APPROVALS
+            }
+        ));
+        assert_eq!(
+            store.gc_expired_and_consumed(now).unwrap(),
+            MAX_PENDING_APPROVALS
+        );
+        drop(store);
+
+        let mut reopened = PendingApprovalStore::open(path.clone()).unwrap();
+        assert_eq!(reopened.len(), 0, "reopening keeps the removal");
+        let nonce = fresh.approval_nonce.clone();
+        reopened.insert(fresh, now).unwrap();
+        drop(reopened);
+        let reopened = PendingApprovalStore::open(path).unwrap();
+        assert_eq!(reopened.len(), 1);
+        assert!(
+            reopened.get(&nonce).is_some(),
+            "the freed store accepts an insert"
+        );
+    }
+
+    /// An absent subject kind reads as the envelope text and is omitted on
+    /// write. `intent-digest` persists on a classic kind and its consumed
+    /// tombstone. It refuses on any other kind, and so does an unknown value.
+    #[test]
+    fn subject_kind_defaults_omits_and_round_trips() {
+        const BASE_INBOX: &str = include_str!("inbox_vectors/base_inbox.toml");
+        assert!(!BASE_INBOX.contains("subject_kind"));
+        let legacy: StoreFile = toml::from_str(BASE_INBOX).unwrap();
+        assert!(
+            legacy
+                .pending
+                .iter()
+                .all(|e| e.subject_kind == SubjectKind::EnvelopeText),
+            "an absent subject kind reads as the envelope text"
+        );
+        let explicit = BASE_INBOX.replacen(
+            "attestation_version = 4\n",
+            "attestation_version = 4\nsubject_kind = \"envelope-text\"\n",
+            1,
+        );
+        assert_ne!(explicit, BASE_INBOX);
+        let explicit: StoreFile = toml::from_str(&explicit).unwrap();
+        assert_eq!(
+            toml::to_string_pretty(&explicit).unwrap(),
+            BASE_INBOX,
+            "the default is omitted on write"
+        );
+
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("default.toml");
+        let mut store = PendingApprovalStore::open(path.clone()).unwrap();
+        let classic = base_inbox_entries();
+        let mut kept = classic[0].clone();
+        kept.subject_kind = SubjectKind::IntentDigest;
+        let mut consumed = classic[6].clone();
+        consumed.approval_nonce = "intentconsumed00000000".to_owned();
+        consumed.subject_kind = SubjectKind::IntentDigest;
+        let mut rejected = classic[12].clone();
+        rejected.approval_nonce = "intentrejected00000000".to_owned();
+        rejected.subject_kind = SubjectKind::IntentDigest;
+        for entry in [&kept, &consumed, &rejected] {
+            assert!(matches!(
+                entry.kind,
+                ApprovalKind::PaymentSimulated { .. }
+                    | ApprovalKind::ClaimSimulated { .. }
+                    | ApprovalKind::TrustlineSimulated { .. }
+            ));
+            assert!(entry_toml(entry).contains("subject_kind = \"intent-digest\"\n"));
+        }
+        store.entries = vec![kept.clone(), consumed.clone(), rejected.clone()];
+        store.persist().unwrap();
+        assert!(
+            store
+                .consume(
+                    "intentconsumed00000000",
+                    &"cd".repeat(32),
+                    ConsumedOutcome::Confirmed
+                )
+                .unwrap()
+        );
+        assert!(
+            store
+                .reject(
+                    "intentrejected00000000",
+                    BASE_INBOX_CREATED_MS,
+                    DEFAULT_TTL_MS
+                )
+                .unwrap()
+        );
+        drop(store);
+        let reopened = PendingApprovalStore::open(path).unwrap();
+        assert_eq!(
+            reopened.get(&kept.approval_nonce).unwrap().subject_kind,
+            SubjectKind::IntentDigest,
+            "intent-digest persists"
+        );
+        let tombstone = reopened.get("intentconsumed00000000").unwrap();
+        assert!(matches!(tombstone.kind, ApprovalKind::Consumed { .. }));
+        assert_eq!(
+            tombstone.subject_kind,
+            SubjectKind::IntentDigest,
+            "consume keeps the kind"
+        );
+        let rejection = reopened.get("intentrejected00000000").unwrap();
+        assert!(matches!(rejection.kind, ApprovalKind::Rejected { .. }));
+        assert_eq!(
+            rejection.subject_kind,
+            SubjectKind::EnvelopeText,
+            "reject writes the default"
+        );
+        assert!(!entry_toml(rejection).contains("subject_kind"));
+
+        let unknown = entry_toml(&kept).replace(
+            "subject_kind = \"intent-digest\"",
+            "subject_kind = \"intent-text\"",
+        );
+        assert!(
+            toml::from_str::<PendingApproval>(&unknown).is_err(),
+            "unknown value"
+        );
+        for (index, entry) in classic.iter().enumerate() {
+            let mut edited = entry.clone();
+            edited.subject_kind = SubjectKind::IntentDigest;
+            let admitted = match &entry.kind {
+                ApprovalKind::PaymentSimulated { .. }
+                | ApprovalKind::ClaimSimulated { .. }
+                | ApprovalKind::TrustlineSimulated { .. } => true,
+                ApprovalKind::Consumed {
+                    original_kind_name, ..
+                } => matches!(
+                    original_kind_name.as_str(),
+                    "PaymentSimulated" | "ClaimSimulated" | "TrustlineSimulated"
+                ),
+                _ => false,
+            };
+            assert_eq!(
+                toml::from_str::<PendingApproval>(&entry_toml(&edited)).is_ok(),
+                admitted,
+                "entry {index} of kind {}",
+                entry.kind.kind_name()
+            );
+        }
+        assert!(classic.iter().any(|e| !matches!(
+            e.kind,
+            ApprovalKind::PaymentSimulated { .. }
+                | ApprovalKind::ClaimSimulated { .. }
+                | ApprovalKind::TrustlineSimulated { .. }
+                | ApprovalKind::Consumed { .. }
+        )));
+    }
+
+    /// An inbox without subject kinds keeps its bytes. The vector loads, and
+    /// a rewrite reproduces it byte for byte. The same entries built by the
+    /// constructors serialize to it.
+    #[test]
+    fn legacy_inbox_rewrite_keeps_base_bytes() {
+        const BASE_INBOX: &str = include_str!("inbox_vectors/base_inbox.toml");
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("default.toml");
+        std::fs::write(&path, BASE_INBOX).unwrap();
+        let store = PendingApprovalStore::open(path.clone()).unwrap();
+        assert_eq!(store.entries.len(), 40, "every vector entry loads");
+        store.persist().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            BASE_INBOX,
+            "a rewrite keeps the bytes"
+        );
+        assert_eq!(
+            toml::to_string_pretty(&StoreFile {
+                pending: base_inbox_entries(),
+            })
+            .unwrap(),
+            BASE_INBOX,
+            "the constructors serialize the entries to the vector"
+        );
     }
 }

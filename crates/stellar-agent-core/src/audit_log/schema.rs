@@ -912,7 +912,8 @@ pub struct MainnetPresenceAudit {
     pub credential_fingerprint: String,
     /// The lowercase hex challenge, itself a SHA-256 digest of the consent.
     pub challenge_sha256_hex: String,
-    /// The lowercase hex receipt digest the version 5 attestation binds.
+    /// The lowercase hex receipt digest the attestation binds: version 5 on
+    /// an envelope-text record, version 6 on an intent-digest record.
     pub receipt_sha256_hex: String,
     /// The lowercase hex BLAKE3 digest of the signed policy.
     pub policy_digest_hex: String,
