@@ -59,9 +59,12 @@ pub(crate) fn build_router() -> Router<ServeState> {
         .route("/approval/{nonce}", get(approval_detail_get))
         .route("/approval/{nonce}/approve", post(approve_post))
         .route("/approval/{nonce}/reject", post(reject_post))
+        .route("/approval/{nonce}/revoke", post(revoke_post))
         .route("/session/activity", post(session_activity_post))
         .route("/static/app-shared.js", get(app_shared_js))
         .route("/static/app.js", get(app_js))
+        .route("/static/revoke.js", get(revoke_js))
+        .route("/static/revoke.css", get(revoke_css))
         .route("/static/session-bootstrap.js", get(session_bootstrap_js))
 }
 
@@ -388,11 +391,21 @@ async fn approval_detail_get(
         .get(&nonce)
         .and_then(|entry| approval_view_digest(entry, &state.ctx.context.binding()).ok())
         .map(|digest| stellar_agent_core::hex::encode(&digest));
+    let revocation_identity = stellar_agent_core::approval::process_uid_for_attestation()
+        .is_ok_and(|uid| {
+            stellar_agent_core::approval::load_and_validate_entry(
+                &store,
+                &nonce,
+                &stellar_agent_core::approval::ApproverIdentity::OsUid(uid),
+                &[],
+            )
+            .is_ok()
+        });
     drop(store);
 
     let csrf = crate::auth::compute_csrf(&session.csrf_key, &nonce);
     let activity_csrf = crate::auth::compute_csrf(&session.csrf_key, SESSION_ACTIVITY_NONCE);
-    Html(render_detail_page(
+    let page = render_detail_page(
         &view,
         &state.ctx.context,
         &csrf,
@@ -400,8 +413,69 @@ async fn approval_detail_get(
         attestation_blob.as_deref(),
         view_digest.as_deref(),
         &state.identity,
+    );
+    let page = if revocation_identity
+        && !view.attested
+        && !view.expired
+        && !matches!(
+            view.summary,
+            stellar_agent_core::approval::ApprovalSummaryView::Consumed { .. }
+                | stellar_agent_core::approval::ApprovalSummaryView::Rejected { .. }
+        ) {
+        crate::templates::with_revocation_control(
+            page,
+            &state.ctx,
+            &nonce,
+            &json!({
+                "nonce": nonce, "csrf": csrf,
+                "storageKey": crate::auth::SessionPurpose::Inbox.proof_storage_key(),
+            }),
+        )
+    } else {
+        page
+    };
+    Html(page).into_response()
+}
+
+async fn revoke_post(
+    State(state): State<ServeState>,
+    headers: HeaderMap,
+    Path(nonce): Path<String>,
+) -> Response {
+    if let Err(response) = authorize_mutation(&state.auth, &headers, &nonce) {
+        return response;
+    }
+    outcome_to_response(apply_decision(
+        &state.ctx,
+        Decision::Revoke { nonce },
+        RequestIdentity::Local,
     ))
-    .into_response()
+}
+
+async fn revoke_js(State(state): State<ServeState>, headers: HeaderMap) -> Response {
+    session_asset(
+        &state,
+        &headers,
+        "application/javascript; charset=utf-8",
+        web::REVOKE_JS,
+    )
+}
+
+async fn revoke_css(State(state): State<ServeState>, headers: HeaderMap) -> Response {
+    session_asset(&state, &headers, "text/css; charset=utf-8", web::REVOKE_CSS)
+}
+
+/// Serves `body` with `content_type` to a request that holds a session.
+fn session_asset(
+    state: &ServeState,
+    headers: &HeaderMap,
+    content_type: &'static str,
+    body: &'static [u8],
+) -> Response {
+    if let Err(response) = require_session(&state.auth, headers) {
+        return response;
+    }
+    ([(header::CONTENT_TYPE, content_type)], body).into_response()
 }
 
 /// `POST /approval/{nonce}/approve` — attest / record consent for the approval.
@@ -516,6 +590,14 @@ async fn app_js(State(state): State<ServeState>, headers: HeaderMap) -> Response
 /// Maps an [`Outcome`] onto the wire JSON response.
 pub(crate) fn outcome_to_response(outcome: Outcome) -> Response {
     let (status, body) = match outcome {
+        Outcome::Revocation(view) => (
+            StatusCode::OK,
+            json!({"status": "revocation", "view": view}),
+        ),
+        Outcome::RevocationRefused(error) => (
+            StatusCode::CONFLICT,
+            json!({"error": error.code, "message": error.message}),
+        ),
         Outcome::Attested {
             attestation: Some(blob),
             expires_at_unix_ms,

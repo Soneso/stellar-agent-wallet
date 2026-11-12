@@ -214,16 +214,20 @@ pub async fn run(args: ServeArgs) -> i32 {
         }
     };
 
-    let mut context = DecisionContext::new(
-        stellar_agent_core::approval::ApprovalContext::from_profile(&profile_name, &profile),
-        store_path,
-        profile.attestation_key_id.clone(),
-        stellar_agent_core::profile::owner_key::OwnerKeyContext::for_profile(
-            &profile_name,
-            &profile,
+    let mut context = install_revocation(
+        DecisionContext::new(
+            stellar_agent_core::approval::ApprovalContext::from_profile(&profile_name, &profile),
+            store_path,
+            profile.attestation_key_id.clone(),
+            stellar_agent_core::profile::owner_key::OwnerKeyContext::for_profile(
+                &profile_name,
+                &profile,
+            ),
+            audit_writer,
+            None,
         ),
-        audit_writer,
-        None,
+        &profile_name,
+        &profile,
     );
 
     if mainnet {
@@ -309,6 +313,16 @@ pub async fn run(args: ServeArgs) -> i32 {
 
     notice_task.abort();
     0
+}
+
+pub(super) fn install_revocation(
+    context: DecisionContext,
+    name: &str,
+    profile: &stellar_agent_core::profile::Profile,
+) -> DecisionContext {
+    let access =
+        super::revoke::DurableRevocations::new(name, profile, context.audit_writer.clone());
+    context.with_revocation_access(std::sync::Arc::new(access))
 }
 
 fn mainnet_browser_refusal(
@@ -853,6 +867,71 @@ mod tests {
             std::net::TcpStream::connect(addr).is_err(),
             "listener shuts down"
         );
+    }
+
+    /// Revoking a consumed record inside execution leaves a child mint under
+    /// its used parent authorization unaffected; the child mint reads no
+    /// durable record.
+    #[cfg(feature = "mainnet-write")]
+    #[test]
+    #[serial_test::serial]
+    fn surface_revocation_preserves_child_mint_under_used_parent() {
+        use stellar_agent_approval_ui::decision::RevocationAccess as _;
+        use stellar_agent_network::mainnet::{MainnetConsumer, MessageDomain};
+        use stellar_agent_network::policy_state::approvals::ApprovalState;
+        use stellar_agent_network::policy_state::{ConsumptionBinding, DomainBinding};
+        let mut f = super::super::revoke::tests::Fixture::new();
+        f.consent();
+        let domain = MessageDomain {
+            home_domain: "example.invalid".to_owned(),
+            web_auth_domain: "auth.example.invalid".to_owned(),
+            server_key: [3; 32],
+        };
+        let mut parent = f.mint();
+        parent.consumer = MainnetConsumer::X402Authenticated;
+        parent.binding = DomainBinding::Message {
+            domain: domain.clone(),
+            content_digest: [4; 32],
+            ephemeral_public_key: [5; 32],
+        };
+        parent.holds = vec![];
+        parent.authorization_ttl_ms = 300_000;
+        let minted = f
+            .store
+            .mint_authorization(f.core.profile(), &parent)
+            .unwrap();
+        stellar_agent_network::mainnet::test_support::consume_minted(
+            &f.store,
+            f.core.profile(),
+            &parent,
+            &minted,
+            &ConsumptionBinding::Message {
+                domain,
+                content_digest: [4; 32],
+                ephemeral_public_key: [5; 32],
+            },
+        )
+        .unwrap();
+        assert_eq!(f.view().record.state, ApprovalState::Consumed);
+        assert!(!f.view().expired);
+        let view = f
+            .access()
+            .revoke(
+                &f.entry.approval_nonce,
+                stellar_agent_core::approval::Surface::Cli,
+                None,
+            )
+            .unwrap();
+        assert_eq!(view.state, "revoked");
+        let mut child = parent.clone();
+        child.binding = DomainBinding::Soroban {
+            intent_digest: [6; 32],
+        };
+        child.parent = Some(minted.id);
+        child.operation = None;
+        let result = f.store.mint_authorization(f.core.profile(), &child);
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(f.view().record.state, ApprovalState::Revoked);
     }
 
     #[tokio::test]

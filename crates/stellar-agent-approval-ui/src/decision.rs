@@ -155,6 +155,76 @@ pub enum Decision {
         /// The approval nonce from the URL path.
         nonce: String,
     },
+    /// Revoke the existing durable approval selected by this nonce.
+    Revoke {
+        /// The approval nonce from the URL path.
+        nonce: String,
+    },
+}
+
+/// A secret-free projection of an authenticated durable approval.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct RevocationView {
+    /// The displayed state; revocation takes precedence over expiry.
+    pub state: String,
+    /// Whether the applicable exclusive window has ended.
+    pub expired: bool,
+    /// The exclusive waiting boundary.
+    pub waiting_expires_at_ms: u64,
+    /// The exclusive execution boundary, when consent exists.
+    pub execution_expires_at_ms: Option<u64>,
+    /// The immutable consent time.
+    pub consent_at_ms: Option<u64>,
+    /// The revocation time, when revoked.
+    pub revoked_at_ms: Option<u64>,
+    /// The durable record's closure time, when closed.
+    pub closed_at_ms: Option<u64>,
+}
+
+impl RevocationView {
+    /// Whether an eligible inbox entry can change this durable record.
+    #[must_use]
+    pub fn permits_inbox_revocation(&self) -> bool {
+        self.state == "pending"
+            && !self.expired
+            && self.consent_at_ms.is_none()
+            && self.closed_at_ms.is_none()
+    }
+
+    /// Whether revocation returns this view without another write.
+    #[must_use]
+    pub fn is_noop(&self) -> bool {
+        self.state == "revoked" || self.expired || self.closed_at_ms.is_some()
+    }
+}
+
+/// A surface refusal with no consent material or underlying storage diagnostic.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RevocationFailure {
+    /// The mapped error code.
+    pub code: String,
+    /// A secret-free diagnostic, including whether revocation succeeds before an audit failure.
+    pub message: String,
+}
+
+/// Access to authenticated durable approvals, supplied by the serving binary.
+pub trait RevocationAccess: Send + Sync {
+    /// Reads an existing record through its nonce.
+    ///
+    /// # Errors
+    /// Returns a mapped lookup refusal, including `approval.not_found`.
+    fn lookup(&self, nonce: &str) -> Result<RevocationView, RevocationFailure>;
+
+    /// Revokes an existing record and appends its surface audit row.
+    ///
+    /// # Errors
+    /// Returns a mapped facade refusal or an audit failure stating that the record is revoked.
+    fn revoke(
+        &self,
+        nonce: &str,
+        origin: Surface,
+        attribution: Option<&str>,
+    ) -> Result<RevocationView, RevocationFailure>;
 }
 
 /// The immutable inputs [`apply_decision`] needs to act on the store.
@@ -164,6 +234,7 @@ pub enum Decision {
 /// mock) before the first [`apply_decision`] call.
 #[non_exhaustive]
 pub struct DecisionContext {
+    revocation: Option<Arc<dyn RevocationAccess>>,
     /// Current signed authority for mainnet consent.
     pub mainnet_authority: Option<stellar_agent_core::approval::MainnetApprovalAuthority>,
     /// Serving profile context: the store name, the chain id, the endpoint host and
@@ -190,6 +261,23 @@ pub struct DecisionContext {
 }
 
 impl DecisionContext {
+    /// Installs authenticated durable approval access for inbox revocation.
+    #[must_use]
+    pub fn with_revocation_access(mut self, access: Arc<dyn RevocationAccess>) -> Self {
+        self.revocation = Some(access);
+        self
+    }
+
+    /// Whether an authenticated pending page offers revocation.
+    #[must_use]
+    pub fn permits_revocation(&self, nonce: &str) -> bool {
+        self.revocation.as_ref().is_some_and(|access| {
+            access
+                .lookup(nonce)
+                .is_ok_and(|view| view.permits_inbox_revocation())
+        })
+    }
+
     /// Supplies the authority that mainnet decisions reload before persistence.
     #[must_use]
     pub fn with_mainnet_authority(
@@ -213,6 +301,7 @@ impl DecisionContext {
         grant_store_path_override: Option<PathBuf>,
     ) -> Self {
         Self {
+            revocation: None,
             mainnet_authority: None,
             context,
             store_path,
@@ -232,6 +321,10 @@ impl DecisionContext {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Outcome {
+    /// The durable record's secret-free revocation result, including a successful no-op.
+    Revocation(RevocationView),
+    /// A durable revocation or audit refusal.
+    RevocationRefused(RevocationFailure),
     /// The approval was attested (or, for gate/consent kinds, consent was
     /// recorded). `attestation` is `Some` for payment-style kinds and `None`
     /// for `ToolsetFirstInvokeGate` / `TrustlineClawbackOptIn`.
@@ -466,6 +559,75 @@ pub fn apply_decision(
             shown_view_digest,
         } => apply_approve(ctx, &nonce, shown_view_digest, requester),
         Decision::Reject { nonce } => apply_reject(ctx, &nonce, &requester),
+        Decision::Revoke { nonce } => apply_revoke(ctx, &nonce, &requester),
+    }
+}
+
+fn apply_revoke(ctx: &DecisionContext, nonce: &str, requester: &RequestIdentity) -> Outcome {
+    let Some(access) = &ctx.revocation else {
+        return Outcome::Unavailable;
+    };
+    if !matches!(
+        requester,
+        RequestIdentity::Local | RequestIdentity::SignedOrigin(_)
+    ) {
+        return Outcome::Unauthorized;
+    }
+    let resolved = match resolve_requester(requester) {
+        Ok(value) => value,
+        Err(outcome) => return outcome,
+    };
+    let store = match open_store(ctx, "revoke") {
+        Ok(store) => store,
+        Err(outcome) => return outcome,
+    };
+    // The inbox entry gates authority; only the adapter selects the durable record.
+    let entry = match load_and_validate_entry(&store, nonce, &resolved.identity, &[]) {
+        Ok(entry) => entry,
+        Err(error) => return entry_outcome(&error),
+    };
+    if matches!(
+        entry.kind,
+        ApprovalKind::Consumed { .. } | ApprovalKind::Rejected { .. }
+    ) {
+        return Outcome::Unauthorized;
+    }
+    let attribution = if let RequestIdentity::SignedOrigin(presence) = requester {
+        if ctx.context.chain_id != MAINNET_CHAIN_ID || presence.approval_nonce() != nonce {
+            return Outcome::BindingMismatch;
+        }
+        let checked = ctx
+            .mainnet_authority
+            .as_ref()
+            .ok_or(WalletError::Approval(
+                stellar_agent_core::ApprovalFailure::PresencePolicyUnavailable,
+            ))
+            .and_then(
+                stellar_agent_core::approval::MainnetApprovalAuthority::load_current_compare_only,
+            )
+            .and_then(|current| {
+                presence.revalidate_rejection(&store, &ctx.context.binding(), current.policy())
+            });
+        if let Err(error) = checked {
+            return presence_refusal(&error).unwrap_or_else(|| entry_outcome(&error));
+        }
+        Some(presence.credential_id_b64url())
+    } else {
+        None
+    };
+    let view = match access.lookup(nonce) {
+        Ok(view) => view,
+        Err(error) => return Outcome::RevocationRefused(error),
+    };
+    if view.is_noop() {
+        return Outcome::Revocation(view);
+    }
+    if !view.permits_inbox_revocation() {
+        return Outcome::Unauthorized;
+    }
+    match access.revoke(nonce, resolved.surface, attribution.as_deref()) {
+        Ok(view) => Outcome::Revocation(view),
+        Err(error) => Outcome::RevocationRefused(error),
     }
 }
 
@@ -1134,6 +1296,47 @@ mod tests {
 
     fn uid() -> String {
         process_uid_for_attestation().expect("uid available on test host")
+    }
+
+    #[test]
+    #[serial]
+    fn revocation_adapter_default_refuses() {
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        let f = fixture("revocation-default");
+        let entry = fixtures::payment_pending(
+            SOURCE_G,
+            DEST_G,
+            "XLM",
+            10,
+            None,
+            100,
+            7,
+            uid(),
+            DEFAULT_TTL_MS,
+        );
+        let nonce = insert(&f.ctx, entry);
+        let before = std::fs::read(&f.ctx.store_path).unwrap();
+        let audit = std::fs::read(f._dir.path().join("audit.log")).unwrap();
+        assert!(!f.ctx.permits_revocation(&nonce));
+        let page = "<body>pending</body>".to_owned();
+        assert_eq!(
+            crate::templates::with_revocation_control(
+                page.clone(),
+                &f.ctx,
+                &nonce,
+                &serde_json::json!({})
+            ),
+            page
+        );
+        assert_eq!(
+            apply_decision(&f.ctx, Decision::Revoke { nonce }, RequestIdentity::Local),
+            Outcome::Unavailable
+        );
+        assert_eq!(std::fs::read(&f.ctx.store_path).unwrap(), before);
+        assert_eq!(
+            std::fs::read(f._dir.path().join("audit.log")).unwrap(),
+            audit
+        );
     }
 
     fn insert(ctx: &DecisionContext, entry: PendingApproval) -> String {

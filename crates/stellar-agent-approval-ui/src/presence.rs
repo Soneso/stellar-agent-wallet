@@ -741,10 +741,15 @@ pub fn signed_origin_consent<G: ConsentSessionGate>(
                 challenges: Mutex::new(HashMap::new()),
                 mode: Mode::Inbox(context),
             });
-            let router = signed_origin_routes(state.clone()).route(
-                "/approval/{nonce}/reject",
-                post(signed_reject::<G>).with_state(state),
-            );
+            let router = signed_origin_routes(state.clone())
+                .route(
+                    "/approval/{nonce}/revoke",
+                    post(signed_revoke::<G>).with_state(state.clone()),
+                )
+                .route(
+                    "/approval/{nonce}/reject",
+                    post(signed_reject::<G>).with_state(state),
+                );
             Ok(SignedOriginConsent {
                 router,
                 completion: None,
@@ -779,7 +784,16 @@ pub fn signed_origin_consent<G: ConsentSessionGate>(
 
 /// The consent routes and the detail route of a signed-origin listener.
 fn signed_origin_routes<G: ConsentSessionGate>(state: Arc<PresenceState<G>>) -> Router {
-    routes(state.clone()).route("/approval/{nonce}", get(detail_get::<G>).with_state(state))
+    routes(state.clone())
+        .route(
+            "/static/revoke.js",
+            get(revoke_script::<G>).with_state(state.clone()),
+        )
+        .route(
+            "/static/revoke.css",
+            get(revoke_style::<G>).with_state(state.clone()),
+        )
+        .route("/approval/{nonce}", get(detail_get::<G>).with_state(state))
 }
 
 pub(crate) fn layers(router: Router, address: SocketAddr) -> Router {
@@ -993,7 +1007,7 @@ fn render_detail<G: ConsentSessionGate>(
         _ => None,
     };
     let intent_view = intent.map(IntentView::new);
-    Ok(Html(render_mainnet_consent_page(
+    let page = render_mainnet_consent_page(
         &view,
         &state.context,
         &data,
@@ -1001,8 +1015,78 @@ fn render_detail<G: ConsentSessionGate>(
         intent_view.as_ref(),
         state.mode.page_mode(),
         &state.identity,
-    ))
-    .into_response())
+    );
+    let page = match &state.mode {
+        Mode::Inbox(context) => {
+            crate::templates::with_revocation_control(page, context, nonce, &data)
+        }
+        Mode::OneShot { .. } => page,
+    };
+    Ok(Html(page).into_response())
+}
+
+async fn signed_revoke<G: ConsentSessionGate>(
+    State(state): State<Arc<PresenceState<G>>>,
+    headers: HeaderMap,
+    Path(nonce): Path<String>,
+    body: Bytes,
+) -> Response {
+    signed_action(&state, &headers, nonce, &body, |nonce| Decision::Revoke {
+        nonce,
+    })
+}
+
+/// Applies `decision` for `nonce` after the session, its per-nonce CSRF and
+/// a fresh action assertion verify on the signed-origin inbox.
+fn signed_action<G: ConsentSessionGate>(
+    state: &PresenceState<G>,
+    headers: &HeaderMap,
+    nonce: String,
+    body: &[u8],
+    decision: impl FnOnce(String) -> Decision,
+) -> Response {
+    if let Err(response) = state.auth.authorize_mutation(headers, &nonce) {
+        return response;
+    }
+    let result = (|| {
+        let Mode::Inbox(context) = &state.mode else {
+            return Err(failure(Failure::PresenceChanged));
+        };
+        let session = state
+            .auth
+            .session(headers)
+            .map_err(|_| failure(Failure::PresenceConsumed))?;
+        let (presence, _) = verified_presence(state, &session, &nonce, body)?;
+        state.discard(&nonce);
+        Ok(outcome_to_response(apply_decision(
+            context,
+            decision(nonce),
+            RequestIdentity::SignedOrigin(presence),
+        )))
+    })();
+    match result {
+        Ok(response) => response,
+        Err(error) => error_response(&error),
+    }
+}
+
+async fn revoke_script<G: ConsentSessionGate>(
+    State(state): State<Arc<PresenceState<G>>>,
+    headers: HeaderMap,
+) -> Response {
+    session_script(&state, &headers, crate::web::REVOKE_JS)
+}
+
+async fn revoke_style<G: ConsentSessionGate>(
+    State(state): State<Arc<PresenceState<G>>>,
+    headers: HeaderMap,
+) -> Response {
+    session_asset(
+        &state,
+        &headers,
+        "text/css; charset=utf-8",
+        crate::web::REVOKE_CSS,
+    )
 }
 
 /// The stored attestation of `nonce`, after its receipt verifies against
@@ -1393,29 +1477,9 @@ async fn signed_reject<G: ConsentSessionGate>(
     Path(nonce): Path<String>,
     body: Bytes,
 ) -> Response {
-    if let Err(response) = state.auth.authorize_mutation(&headers, &nonce) {
-        return response;
-    }
-    let result = (|| {
-        let Mode::Inbox(context) = &state.mode else {
-            return Err(failure(Failure::PresenceChanged));
-        };
-        let session = state
-            .auth
-            .session(&headers)
-            .map_err(|_| failure(Failure::PresenceConsumed))?;
-        let (presence, _) = verified_presence(&state, &session, &nonce, &body)?;
-        state.discard(&nonce);
-        Ok(outcome_to_response(apply_decision(
-            context,
-            Decision::Reject { nonce },
-            RequestIdentity::SignedOrigin(presence),
-        )))
-    })();
-    match result {
-        Ok(response) => response,
-        Err(error) => error_response(&error),
-    }
+    signed_action(&state, &headers, nonce, &body, |nonce| Decision::Reject {
+        nonce,
+    })
 }
 
 async fn stale_approve(
@@ -1434,17 +1498,25 @@ fn session_script<G: ConsentSessionGate>(
     headers: &HeaderMap,
     source: &'static [u8],
 ) -> Response {
+    session_asset(
+        state,
+        headers,
+        "application/javascript; charset=utf-8",
+        source,
+    )
+}
+
+/// Serves `source` with `content_type` to a request that holds a session.
+fn session_asset<G: ConsentSessionGate>(
+    state: &PresenceState<G>,
+    headers: &HeaderMap,
+    content_type: &'static str,
+    source: &'static [u8],
+) -> Response {
     if let Err(response) = state.auth.session(headers) {
         return response;
     }
-    (
-        [(
-            header::CONTENT_TYPE,
-            "application/javascript; charset=utf-8",
-        )],
-        source,
-    )
-        .into_response()
+    ([(header::CONTENT_TYPE, content_type)], source).into_response()
 }
 
 async fn script<G: ConsentSessionGate>(

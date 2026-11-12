@@ -4281,6 +4281,40 @@ impl AuditEntry {
         }
     }
 
+    /// Records revocation with a nonce prefix and optional signed-origin attribution.
+    #[must_use]
+    pub fn new_approval_revoked(
+        approval_kind: impl Into<String>,
+        approval_nonce: &str,
+        origin: crate::approval::Surface,
+        operator_credential_id: Option<&str>,
+        request_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            ts: current_iso8601_utc(),
+            tool: "approval.revoked".to_owned(),
+            chain_id: None,
+            arg_keys: vec![],
+            arg_keys_truncated: None,
+            truncated: false,
+            envelope_hash: None,
+            nonce_id: None,
+            policy_decision: PolicyDecision::Allow,
+            decision_reason: None,
+            request_id: request_id.into(),
+            event_kind: EventKind::ApprovalRevoked {
+                approval_kind: approval_kind.into(),
+                nonce_prefix: nonce_prefix8(approval_nonce),
+                origin: origin.as_str().to_owned(),
+                operator_credential_id_redacted: operator_credential_id
+                    .filter(|_| origin == crate::approval::Surface::ServeRemote)
+                    .map(pseudonymize_credential_id),
+            },
+            previous_entry_hash: String::new(),
+            entry_tag: None,
+        }
+    }
+
     /// Constructs an `ApprovalAttestedRemote` audit entry.
     ///
     /// Emitted after a remote-approval-surface attestation (or recorded
@@ -4747,6 +4781,43 @@ mod tests {
             std::str::from_utf8(&body).unwrap_or("<invalid utf8>"),
             std::str::from_utf8(&expected).unwrap_or("<invalid utf8>"),
         );
+    }
+
+    #[test]
+    fn revocation_constructor_redacts_the_nonce_and_credential() {
+        use crate::approval::Surface;
+        for origin in [Surface::Cli, Surface::Serve, Surface::ServeRemote] {
+            let entry = AuditEntry::new_approval_revoked(
+                "PaymentSimulated",
+                "abcdefgh-secret",
+                origin,
+                Some("fixture-credential"),
+                "request",
+            );
+            let value = serde_json::to_value(&entry).unwrap();
+            assert_eq!(value["tool"], "approval.revoked");
+            assert_eq!(value["nonce_prefix"], "abcdefgh");
+            if origin == Surface::ServeRemote {
+                assert_eq!(
+                    value["operator_credential_id_redacted"],
+                    pseudonymize_credential_id("fixture-credential")
+                );
+            } else {
+                assert!(value.get("operator_credential_id_redacted").is_none());
+            }
+            for field in [
+                "attestation",
+                "assertion",
+                "nonce_id",
+                "envelope_hash",
+                "chain_id",
+            ] {
+                assert!(
+                    value.get(field).is_none_or(serde_json::Value::is_null),
+                    "{field}"
+                );
+            }
+        }
     }
 
     /// Known-answer tests (KATs) pinning exact canonical body bytes for every
