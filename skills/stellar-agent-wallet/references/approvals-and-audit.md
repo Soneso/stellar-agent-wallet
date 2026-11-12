@@ -105,7 +105,9 @@ passkey ceremony. RequireApproval runs a ceremony with its rule lifetime.
 The presence challenge retains its separate 120-second bound.
 Classic MCP approvals expire at the shorter prepare/commit
 lifetime, with Allow contributing 600 seconds. Both names need matching rules.
-All four classic pairs require approval even under Allow.
+On a mainnet MCP server, Allow signs without an approval, and RequireApproval
+needs a verified approval. A commit evaluates both names, and the stricter
+decision governs.
 
 Authorization defaults to 120 seconds, bounded by approval expiry.
 Minted authorization holds count against window headroom. Consumption,

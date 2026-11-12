@@ -248,6 +248,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - On mainnet, CLI `pay`, `claim`, `trustline`, and sponsored `accounts create`
   sign actions the signed policy allows without a passkey ceremony. An approval
   rule requires a passkey ceremony.
+- On an admitted mainnet MCP server, a value call under an Allow rule signs
+  without an approval request. A commit also evaluates its preparation's
+  rule, and a RequireApproval rule of either still needs a verified approval.
 
 - The audit settlement lookup before an authorized submission answers from an
   index the audit writer keeps. Fresh or settled bytes read no audit row file

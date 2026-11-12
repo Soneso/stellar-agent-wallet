@@ -1,0 +1,375 @@
+=== Pay prepared
+Some(false)
+{
+  "ok": true,
+  "data": {
+    "approval": {
+      "approval_nonce": "<volatile>",
+      "chain_id": "stellar:mainnet",
+      "expires_at_unix_ms": "<volatile>",
+      "profile": "operator",
+      "reason": "operator review",
+      "summary": {
+        "amount_stroops": "10",
+        "asset": "XLM",
+        "memo": null,
+        "simulated_fee_stroops": "100",
+        "simulated_seq_num": 2,
+        "to": "GBPXXOA5N4JYPESHAADMQKBPWZWQDQ64ZV6ZL2S3LAGW4SY7NTCMWIVL"
+      }
+    },
+    "business_id": "<volatile>",
+    "envelope_xdr": "<volatile>",
+    "expires_at_unix_ms": "<volatile>",
+    "nonce": "<volatile>",
+    "operational": {
+      "close_lag_seconds": 0,
+      "close_time_unix": "<volatile>",
+      "latest_ledger": 100
+    },
+    "simulation": {
+      "fee_stroops": "100",
+      "memo": {
+        "type": "none"
+      },
+      "operation": {
+        "amount_stroops": "10",
+        "asset": {
+          "type": "native"
+        },
+        "destination": "GBPXXOA5N4JYPESHAADMQKBPWZWQDQ64ZV6ZL2S3LAGW4SY7NTCMWIVL",
+        "type": "payment"
+      },
+      "selected_fee_per_op_stroops": "100",
+      "selected_fee_percentile": "explicit",
+      "source_account_id": "GAMX62ZD4FWIKMWGVPEDR6WNL2TYTPQMO2ZJEAZUAON7VCZ5G2GWDF7W",
+      "source_native_balance_stroops": "100000000000",
+      "source_sequence": "1"
+    }
+  },
+  "request_id": "<volatile>"
+}
+=== Pay unproven
+Some(true)
+{
+  "ok": false,
+  "error": {
+    "code": "policy.approval_required",
+    "message": "approval attestation absent, invalid, or expired; run `stellar-agent approve --id <nonce> --profile operator` then re-submit with attestation"
+  },
+  "request_id": "<volatile>"
+}
+=== Pay partial
+Some(true)
+{
+  "ok": false,
+  "error": {
+    "code": "policy.approval_required",
+    "message": "approval attestation absent, invalid, or expired; run `stellar-agent approve --id <nonce> --profile operator` then re-submit with attestation"
+  },
+  "request_id": "<volatile>"
+}
+=== Claim prepared
+Some(false)
+{
+  "ok": true,
+  "data": {
+    "approval": {
+      "approval_nonce": "<volatile>",
+      "chain_id": "stellar:mainnet",
+      "expires_at_unix_ms": "<volatile>",
+      "profile": "operator",
+      "reason": "operator review",
+      "summary": {
+        "amount_stroops": "10",
+        "asset": "XLM",
+        "balance_id_hex72": "00000000abababababababababababababababababababababababababababababababab",
+        "balance_id_strkey": "BAAKXK5LVOV2XK5LVOV2XK5LVOV2XK5LVOV2XK5LVOV2XK5LVOV2XK6UVM",
+        "simulated_fee_stroops": "100",
+        "simulated_seq_num": 2,
+        "source": "GAMX62ZD4FWIKMWGVPEDR6WNL2TYTPQMO2ZJEAZUAON7VCZ5G2GWDF7W"
+      }
+    },
+    "business_id": "<volatile>",
+    "envelope_xdr": "<volatile>",
+    "expires_at_unix_ms": "<volatile>",
+    "nonce": "<volatile>",
+    "operational": {
+      "close_lag_seconds": 0,
+      "close_time_unix": "<volatile>",
+      "latest_ledger": 100
+    },
+    "preview": {
+      "amount_display": "0.0000010",
+      "amount_stroops": "10",
+      "balance_id_hex72": "00000000abababababababababababababababababababababababababababababababab",
+      "balance_id_strkey": "BAAKXK5LVOV2XK5LVOV2XK5LVOV2XK5LVOV2XK5LVOV2XK5LVOV2XK6UVM",
+      "claimants": [
+        {
+          "destination": "GAMX62ZD4FWIKMWGVPEDR6WNL2TYTPQMO2ZJEAZUAON7VCZ5G2GWDF7W",
+          "predicate_kind": "Unconditional"
+        }
+      ],
+      "clawback_enabled": false,
+      "is_claimant": true,
+      "predicate_satisfied": true,
+      "window": {
+        "valid_from": null,
+        "valid_until": null
+      }
+    }
+  },
+  "request_id": "<volatile>"
+}
+=== Claim unproven
+Some(true)
+{
+  "ok": false,
+  "error": {
+    "code": "policy.approval_required",
+    "message": "approval attestation absent, invalid, or expired; run `stellar-agent approve --id <nonce> --profile operator` then re-submit with attestation"
+  },
+  "request_id": "<volatile>"
+}
+=== Claim partial
+Some(true)
+{
+  "ok": false,
+  "error": {
+    "code": "policy.approval_required",
+    "message": "approval attestation absent, invalid, or expired; run `stellar-agent approve --id <nonce> --profile operator` then re-submit with attestation"
+  },
+  "request_id": "<volatile>"
+}
+=== CreateAccount prepared
+Some(false)
+{
+  "ok": true,
+  "data": {
+    "approval": {
+      "approval_nonce": "<volatile>",
+      "chain_id": "stellar:mainnet",
+      "expires_at_unix_ms": "<volatile>",
+      "profile": "operator",
+      "reason": "operator review",
+      "summary": {
+        "amount_stroops": "10000000",
+        "asset": "XLM",
+        "memo": null,
+        "simulated_fee_stroops": "100",
+        "simulated_seq_num": 2,
+        "to": "GBPXXOA5N4JYPESHAADMQKBPWZWQDQ64ZV6ZL2S3LAGW4SY7NTCMWIVL"
+      }
+    },
+    "business_id": "<volatile>",
+    "envelope_xdr": "<volatile>",
+    "expires_at_unix_ms": "<volatile>",
+    "nonce": "<volatile>",
+    "operational": {
+      "close_lag_seconds": 0,
+      "close_time_unix": "<volatile>",
+      "latest_ledger": 100
+    },
+    "simulation": {
+      "fee_stroops": "100",
+      "operation": {
+        "destination": "GBPXXOA5N4JYPESHAADMQKBPWZWQDQ64ZV6ZL2S3LAGW4SY7NTCMWIVL",
+        "starting_balance_stroops": "10000000",
+        "type": "create_account"
+      },
+      "selected_fee_per_op_stroops": "100",
+      "selected_fee_percentile": "explicit",
+      "source_account_id": "GAMX62ZD4FWIKMWGVPEDR6WNL2TYTPQMO2ZJEAZUAON7VCZ5G2GWDF7W",
+      "source_native_balance_stroops": "100000000000",
+      "source_sequence": "1"
+    }
+  },
+  "request_id": "<volatile>"
+}
+=== CreateAccount unproven
+Some(true)
+{
+  "ok": false,
+  "error": {
+    "code": "policy.approval_required",
+    "message": "approval attestation absent, invalid, or expired; run `stellar-agent approve --id <nonce> --profile operator` then re-submit with attestation"
+  },
+  "request_id": "<volatile>"
+}
+=== CreateAccount partial
+Some(true)
+{
+  "ok": false,
+  "error": {
+    "code": "policy.approval_required",
+    "message": "approval attestation absent, invalid, or expired; run `stellar-agent approve --id <nonce> --profile operator` then re-submit with attestation"
+  },
+  "request_id": "<volatile>"
+}
+=== Trustline prepared
+Some(false)
+{
+  "ok": true,
+  "data": {
+    "approval": {
+      "approval_nonce": "<volatile>",
+      "chain_id": "stellar:mainnet",
+      "expires_at_unix_ms": "<volatile>",
+      "profile": "operator",
+      "reason": "operator review",
+      "summary": {
+        "asset_code": "USD",
+        "asset_issuer": "GDVEU...CZA57",
+        "limit_stroops": "10",
+        "simulated_fee_stroops": "100",
+        "simulated_seq_num": 2
+      }
+    },
+    "business_id": "<volatile>",
+    "envelope_xdr": "<volatile>",
+    "expires_at_unix_ms": "<volatile>",
+    "nonce": "<volatile>",
+    "operational": {
+      "close_lag_seconds": 0,
+      "close_time_unix": "<volatile>",
+      "latest_ledger": 100
+    },
+    "preview": {
+      "code": "USD",
+      "gate_decision": {
+        "kind": "proceed"
+      },
+      "is_pinned": false,
+      "issuer": "GDVEU3DD4KOFECV66VIHWEZOYX4ZKR3WV27L464SIIPOU2IUI3JCZA57",
+      "issuer_flags": {
+        "auth_clawback_enabled": false,
+        "auth_immutable": false,
+        "auth_required": false,
+        "auth_revocable": false
+      },
+      "limit_stroops": "10"
+    },
+    "simulation": {
+      "fee_stroops": "100",
+      "operation": {
+        "asset_code": "USD",
+        "asset_issuer": "GDVEU...CZA57",
+        "limit_stroops": "10",
+        "type": "change_trust"
+      },
+      "selected_fee_per_op_stroops": "100",
+      "selected_fee_percentile": "explicit",
+      "source_account_id": "GAMX62ZD4FWIKMWGVPEDR6WNL2TYTPQMO2ZJEAZUAON7VCZ5G2GWDF7W",
+      "source_sequence": "1"
+    }
+  },
+  "request_id": "<volatile>"
+}
+=== Trustline unproven
+Some(true)
+{
+  "ok": false,
+  "error": {
+    "code": "policy.approval_required",
+    "message": "approval attestation absent, invalid, or expired; run `stellar-agent approve --id <nonce> --profile operator` then re-submit with attestation"
+  },
+  "request_id": "<volatile>"
+}
+=== Trustline partial
+Some(true)
+{
+  "ok": false,
+  "error": {
+    "code": "policy.approval_required",
+    "message": "approval attestation absent, invalid, or expired; run `stellar-agent approve --id <nonce> --profile operator` then re-submit with attestation"
+  },
+  "request_id": "<volatile>"
+}
+=== X402 prepared
+Some(false)
+{
+  "ok": true,
+  "data": {
+    "approval": {
+      "approval_nonce": "<volatile>",
+      "chain_id": "stellar:mainnet",
+      "endpoint_host": "rpc.example.invalid",
+      "expires_at_unix_ms": "<volatile>",
+      "instructions": "Run stellar-agent approve --id <volatile> --profile operator in a terminal, then repeat this call with approval_nonce and approval_attestation",
+      "profile": "operator",
+      "reason": "operator review",
+      "signer": "GAMX62ZD4FWIKMWGVPEDR6WNL2TYTPQMO2ZJEAZUAON7VCZ5G2GWDF7W",
+      "summary": {
+        "amount": "10",
+        "asset": "CABQGAYDAMBQGAYDAMBQGAYDAMBQGAYDAMBQGAYDAMBQGAYDAMBQGCK3",
+        "payTo": "GBPXXOA5N4JYPESHAADMQKBPWZWQDQ64ZV6ZL2S3LAGW4SY7NTCMWIVL"
+      }
+    },
+    "business_id": "<volatile>"
+  },
+  "request_id": "<volatile>"
+}
+=== X402 unproven
+Some(true)
+{
+  "ok": false,
+  "error": {
+    "code": "policy.approval_required",
+    "message": "approval attestation absent, invalid, or expired; run `stellar-agent approve --id <nonce> --profile operator` then re-submit with attestation"
+  },
+  "request_id": "<volatile>"
+}
+=== X402 partial
+Some(true)
+{
+  "ok": false,
+  "error": {
+    "code": "policy.approval_required",
+    "message": "approval attestation absent, invalid, or expired; run `stellar-agent approve --id <nonce> --profile operator` then re-submit with attestation"
+  },
+  "request_id": "<volatile>"
+}
+=== AuthenticatedX402 prepared
+Some(false)
+{
+  "ok": true,
+  "data": {
+    "approval": {
+      "approval_nonce": "<volatile>",
+      "chain_id": "stellar:mainnet",
+      "endpoint_host": "rpc.example.invalid",
+      "expires_at_unix_ms": "<volatile>",
+      "instructions": "Run stellar-agent approve --id <volatile> --profile operator in a terminal, then repeat this call with approval_nonce and approval_attestation",
+      "profile": "operator",
+      "reason": "operator review",
+      "signer": "GAMX62ZD4FWIKMWGVPEDR6WNL2TYTPQMO2ZJEAZUAON7VCZ5G2GWDF7W",
+      "summary": {
+        "amount": "10",
+        "asset": "CABQGAYDAMBQGAYDAMBQGAYDAMBQGAYDAMBQGAYDAMBQGAYDAMBQGCK3",
+        "payTo": "GBPXXOA5N4JYPESHAADMQKBPWZWQDQ64ZV6ZL2S3LAGW4SY7NTCMWIVL"
+      }
+    },
+    "business_id": "<volatile>"
+  },
+  "request_id": "<volatile>"
+}
+=== AuthenticatedX402 unproven
+Some(true)
+{
+  "ok": false,
+  "error": {
+    "code": "policy.approval_required",
+    "message": "approval attestation absent, invalid, or expired; run `stellar-agent approve --id <nonce> --profile operator` then re-submit with attestation"
+  },
+  "request_id": "<volatile>"
+}
+=== AuthenticatedX402 partial
+Some(true)
+{
+  "ok": false,
+  "error": {
+    "code": "policy.approval_required",
+    "message": "approval attestation absent, invalid, or expired; run `stellar-agent approve --id <nonce> --profile operator` then re-submit with attestation"
+  },
+  "request_id": "<volatile>"
+}

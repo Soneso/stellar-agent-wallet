@@ -1643,7 +1643,7 @@ mod tests {
         // registers for a profile name stays bound to that run's log path for
         // the life of the process.
         for (fail_audit, name) in [(false, "mcp-browser-cli"), (true, "mcp-browser-cli-audit")] {
-            let rule = pay_rule("allow", "");
+            let rule = pay_rule("require_approval", "");
             let mut fixture = Spec::new(name)
                 .rules(vec![
                     rule.clone(),

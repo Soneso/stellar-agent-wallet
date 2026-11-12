@@ -459,6 +459,7 @@ impl WalletServer {
                 approval_nonce: None,
                 approval_dir: None,
                 now_ms,
+                provenance: None,
             },
             Some(&sequence_floor_hook),
         ) {

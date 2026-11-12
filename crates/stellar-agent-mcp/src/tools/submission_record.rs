@@ -66,6 +66,9 @@ pub(crate) struct CommitRecord<'a> {
     pub approval_dir: Option<std::path::PathBuf>,
     /// The caller's clock in unix milliseconds.
     pub now_ms: u64,
+    /// The provenance of the governing mainnet decision, which the pending
+    /// audit row records; `None` off mainnet.
+    pub provenance: Option<stellar_agent_core::mainnet::decision::MainnetProvenance>,
 }
 
 /// Builds the recorder for one submission.
@@ -198,11 +201,40 @@ pub(crate) struct PreparedRecorder<'a> {
     pub window: PersistedWindowStore,
 }
 
-pub(crate) fn prepare_authorized_recorder(
-    record: CommitRecord<'_>,
+/// The tombstone a mainnet submission under `authority` owes: the verified
+/// approval nonce under `Approval`, and none under `Policy`.
+///
+/// # Errors
+///
+/// `submission.record_unavailable` for an approval without a store.
+fn authority_tombstone(
+    record: &CommitRecord<'_>,
+    authority: &stellar_agent_network::mainnet::authority::MainnetAuthority<'_>,
+) -> Result<Option<ApprovalTombstone>, WalletError> {
+    use stellar_agent_network::mainnet::authority::MainnetAuthority;
+    let MainnetAuthority::Approval(witness) = authority else {
+        return Ok(None);
+    };
+    let Some(store_dir) = record.approval_dir.clone() else {
+        return Err(WalletError::Submission(
+            SubmissionError::RecordUnavailable {
+                detail: "the approved submission has no approval store".to_owned(),
+            },
+        ));
+    };
+    Ok(Some(ApprovalTombstone {
+        store_dir,
+        profile_name: record.profile_name.clone(),
+        approval_nonce: witness.nonce().to_owned(),
+    }))
+}
+
+pub(crate) fn prepare_authorized_recorder<'a>(
+    record: CommitRecord<'a>,
     window: PersistedWindowStore,
-) -> Result<PreparedRecorder<'_>, WalletError> {
-    let approval = approval_binding(&record)?;
+    authority: &stellar_agent_network::mainnet::authority::MainnetAuthority<'_>,
+) -> Result<PreparedRecorder<'a>, WalletError> {
+    let approval = authority_tombstone(&record, authority)?;
     profile_bound_descriptor(record.registry, record.profile, record.tool).ok_or_else(|| {
         WalletError::Submission(SubmissionError::RecordUnavailable {
             detail: format!("the submission tool {} has no registry entry", record.tool),
@@ -241,27 +273,30 @@ impl<'a> PreparedRecorder<'a> {
         request_id: String,
     ) -> StageMarkedRecorder<'a> {
         let record = self.record;
-        StageMarkedRecorder::new(
-            WalletSubmissionRecorder::new_authorized(
-                record.profile,
-                record.profile_name,
-                record.tool,
-                Some(record.chain_id),
-                record.policy_decision,
-                record.legs,
-                authorization,
-                self.receipts,
-                self.window,
-                Some(record.audit),
-                record.nonce_id,
-                request_id,
-                record.now_ms,
-            )
-            .with_sequence_floor(floor)
-            .with_approval(self.approval)
-            .with_witness(witness)
-            .with_operation(operation),
+        let recorder = WalletSubmissionRecorder::new_authorized(
+            record.profile,
+            record.profile_name,
+            record.tool,
+            Some(record.chain_id),
+            record.policy_decision,
+            record.legs,
+            authorization,
+            self.receipts,
+            self.window,
+            Some(record.audit),
+            record.nonce_id,
+            request_id,
+            record.now_ms,
         )
+        .with_sequence_floor(floor)
+        .with_approval(self.approval)
+        .with_witness(witness)
+        .with_operation(operation);
+        // Both authority variants record the governing decision's provenance.
+        StageMarkedRecorder::new(match record.provenance {
+            Some(provenance) => recorder.with_provenance(provenance),
+            None => recorder,
+        })
     }
 }
 
@@ -367,8 +402,8 @@ pub(crate) async fn sign_and_submit_classic(
         let profile = record.profile;
         let writer = Arc::clone(&record.audit);
         let request_id = uuid::Uuid::new_v4().to_string();
-        let prepared =
-            prepare_authorized_recorder(record, server.window_store.clone()).map_err(render)?;
+        let prepared = prepare_authorized_recorder(record, server.window_store.clone(), authority)
+            .map_err(render)?;
         let authorization = stellar_agent_network::mainnet::resolve::resolve_tx_sign(
             stellar_agent_network::mainnet::resolve::TxSignRequest {
                 context: guard.context,
@@ -853,6 +888,7 @@ mod tests {
                     approval_nonce: None,
                     approval_dir: None,
                     now_ms: now,
+                    provenance: None,
                 },
                 None,
             );
@@ -1180,6 +1216,7 @@ mod tests {
                 approval_nonce: None,
                 approval_dir: None,
                 now_ms: 0,
+                provenance: None,
             },
             None,
         )
@@ -1211,6 +1248,7 @@ mod tests {
                 approval_nonce: Some("approval-binding".to_owned()),
                 approval_dir: None,
                 now_ms: 0,
+                provenance: None,
             },
             None,
         )
@@ -1241,6 +1279,7 @@ mod tests {
                 approval_nonce: None,
                 approval_dir: Some(dir.path().to_path_buf()),
                 now_ms: 0,
+                provenance: None,
             },
             None,
         )
@@ -1249,14 +1288,19 @@ mod tests {
         assert!(error.message().contains("approval nonce"));
     }
 
+    /// A mainnet recorder refuses each defect before any authorization: an
+    /// approval without a store, an unregistered tool, unreadable receipts,
+    /// an unreadable window and a window of another chain. Policy authority
+    /// owes no tombstone, so it needs no approval store.
     #[cfg(feature = "mainnet-write")]
-    #[test]
+    #[tokio::test]
     #[serial_test::serial(keyring)]
-    fn mainnet_recorder_preparation_refuses_before_authorization() {
-        use crate::tools::common::tests::mainnet::Fixture;
+    async fn mainnet_recorder_preparation_refuses_before_authorization() {
+        use crate::tools::common::tests::mainnet::{Fixture, payment_witness};
+        use stellar_agent_network::mainnet::authority::MainnetAuthority;
         for defect in [
             "none",
-            "nonce",
+            "policy",
             "approval_dir",
             "registry",
             "receipts",
@@ -1264,6 +1308,24 @@ mod tests {
             "window_chain",
         ] {
             let f = Fixture::new(|raw| raw);
+            let witness = payment_witness(&f).await;
+            let decision = stellar_agent_core::mainnet::decision::MainnetDecision::for_test(
+                stellar_agent_core::policy::Decision::Allow,
+                None,
+                [4; 32],
+                7,
+                0,
+                "operator",
+                "stellar:mainnet",
+                stellar_agent_core::timefmt::now_unix_ms().unwrap(),
+                600_000,
+                stellar_agent_core::mainnet::decision::AuthorityScope::Classic,
+            );
+            let authority = if defect == "policy" {
+                MainnetAuthority::from_decision(&decision, None).unwrap()
+            } else {
+                MainnetAuthority::Approval(&witness)
+            };
             let profile = f.server.security_profile();
             let readiness = stellar_agent_network::mainnet::audit_readiness::audit_readiness(
                 profile, "operator",
@@ -1305,14 +1367,16 @@ mod tests {
                     value_class: ValueClass::ReadOnly,
                     audit: Arc::clone(readiness.writer()),
                     nonce_id: None,
-                    approval_nonce: (defect != "nonce").then(|| "approval-binding".to_owned()),
-                    approval_dir: (defect != "approval_dir")
+                    approval_nonce: Some("approval-binding".to_owned()),
+                    approval_dir: (!matches!(defect, "approval_dir" | "policy"))
                         .then(|| f.server.resolve_approval_dir().unwrap()),
                     now_ms: stellar_agent_core::timefmt::now_unix_ms().unwrap(),
+                    provenance: Some(decision.provenance()),
                 },
                 f.server.window_store.clone(),
+                &authority,
             );
-            if defect == "none" {
+            if matches!(defect, "none" | "policy") {
                 assert!(result.is_ok());
             } else {
                 let error = match result {

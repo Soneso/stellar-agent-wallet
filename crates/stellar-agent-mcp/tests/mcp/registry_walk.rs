@@ -1850,14 +1850,18 @@ fn every_approval_consumer_acquires_the_writer_between_the_approval_read_and_the
             "async fn stellar_trustline_commit(",
         ),
     ] {
-        assert_called_between(
-            file,
-            source,
-            function,
-            "verify_attestation_gate(",
-            ".write_audit()",
-            "sign_and_submit_classic(",
-        );
+        // The mainnet wrapper, then the testnet gate, read the approval
+        // before the writer is acquired.
+        for read in ["mainnet_authority(", "verify_attestation_gate("] {
+            assert_called_between(
+                file,
+                source,
+                function,
+                read,
+                ".write_audit()",
+                "sign_and_submit_classic(",
+            );
+        }
         assert_not_called(
             file,
             source,
@@ -1885,7 +1889,7 @@ fn every_approval_consumer_acquires_the_writer_between_the_approval_read_and_the
         include_str!("../../src/tools/x402_create_payment.rs"),
         "async fn mainnet_x402_payment(",
         &[
-            "verify_attestation_subject_gate(",
+            "mainnet_authority(",
             "audit_readiness(",
             "x402_mainnet_signing_handle(",
             "create_payment_authorized(",
@@ -1896,7 +1900,7 @@ fn every_approval_consumer_acquires_the_writer_between_the_approval_read_and_the
         include_str!("../../src/tools/x402_authenticated_payment.rs"),
         "async fn mainnet_authenticated_payment(",
         &[
-            "verify_attestation_subject_gate(",
+            "mainnet_authority(",
             "audit_readiness(",
             ".verify_x402_counterparty_authorized(",
             "x402_mainnet_signing_handle(",
@@ -1926,6 +1930,23 @@ fn every_approval_consumer_acquires_the_writer_between_the_approval_read_and_the
             source,
             function,
             &["lazy_signer_from_keyring(", "enrolled_keyring_signer("],
+        );
+    }
+}
+
+/// The mainnet authority wrapper verifies a presented proof through the
+/// subject gate and derives every authority through `from_decision`.
+#[test]
+fn every_mainnet_authority_wrapper_calls_its_subject_gate() {
+    let body = stellar_agent_test_support::source_order::function_body(
+        "common.rs",
+        include_str!("../../src/tools/common.rs"),
+        "pub(crate) async fn mainnet_authority<",
+    );
+    for call in ["verify_attestation_subject_gate(", "from_decision("] {
+        assert!(
+            body.contains(call),
+            "common.rs: `mainnet_authority` must call `{call}`"
         );
     }
 }

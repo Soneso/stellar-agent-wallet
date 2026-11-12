@@ -33,14 +33,16 @@ use stellar_agent_test_support::webauthn::{
 
 use super::common::tests::mainnet::{
     ClassicRun, Fixture, REMOTE_CREDENTIAL, Tool, X402Run, approval_for, assert_no_pre_send_entry,
-    assert_x402_refused_before_intent, authorizations, is_consumed, remote_approval,
+    assert_x402_refused_before_intent, authorizations, is_consumed, remote_approval, rule_index_of,
     stored_approval, wire, x402_args,
 };
 use super::common::{
     DispatchOutcome, GatedApprovalKind, approval_required_indistinguishable,
     verify_attestation_gate,
 };
-use super::x402_authenticated_mainnet_tests::{HOME, Run as AuthenticatedRun, signings};
+use super::x402_authenticated_mainnet_tests::{
+    HOME, Run as AuthenticatedRun, authenticated_policy_with, signings,
+};
 
 /// The profile every fixture consents for.
 const PROFILE: &str = "operator";
@@ -740,6 +742,496 @@ async fn mainnet_presence_failures_are_indistinguishable() {
     let uniform = normalized(wire(&approval_required_indistinguishable(PROFILE)));
     for (context, result) in &refusals {
         assert_eq!(normalized(result.clone()), uniform, "{context}: {result}");
+    }
+}
+
+/// The policy `raw` with every rule of `tools` requiring approval for 600
+/// seconds under the reason `operator review`.
+fn require_approval_for(raw: &str, tools: &[&str]) -> String {
+    let mut doc = raw.parse::<toml_edit::DocumentMut>().unwrap();
+    for rule in doc["rules"].as_array_of_tables_mut().unwrap().iter_mut() {
+        if rule["match"]["tool"]
+            .as_str()
+            .is_some_and(|tool| tools.contains(&tool))
+        {
+            require_approval_rule(rule);
+        }
+    }
+    doc.to_string()
+}
+
+/// Makes `rule` require approval for 600 seconds under the reason
+/// `operator review`.
+fn require_approval_rule(rule: &mut toml_edit::Table) {
+    rule["decision"] = toml_edit::value("require_approval");
+    rule["ttl_secs"] = toml_edit::value(600);
+    rule["reason"] = toml_edit::value("operator review");
+}
+
+/// The preparation and commit names of `tool`.
+fn classic_names(tool: Tool) -> [&'static str; 2] {
+    match tool {
+        Tool::Pay => ["stellar_pay", "stellar_pay_commit"],
+        Tool::Claim => ["stellar_claim", "stellar_claim_commit"],
+        Tool::CreateAccount => ["stellar_create_account", "stellar_create_account_commit"],
+        Tool::Trustline => ["stellar_trustline", "stellar_trustline_commit"],
+    }
+}
+
+/// The keys whose values change from call to call: nonces, envelopes,
+/// instants, business ids and request ids.
+const VOLATILE_KEYS: [&str; 7] = [
+    "approval_nonce",
+    "business_id",
+    "close_time_unix",
+    "envelope_xdr",
+    "expires_at_unix_ms",
+    "nonce",
+    "request_id",
+];
+
+/// The original text of `result` after its error flag, with only the
+/// volatile spans replaced.
+///
+/// Each `"<key>": <value>` span of a [`VOLATILE_KEYS`] key becomes
+/// `"<key>": "<volatile>"`, and each other occurrence of such a string value
+/// becomes `<volatile>`. Every other byte stays as the server wrote it, so a
+/// change of whitespace, key order or escaping changes the result.
+fn masked(result: &rmcp::model::CallToolResult) -> String {
+    fn collect(value: &serde_json::Value, spans: &mut Vec<(String, String)>) {
+        match value {
+            serde_json::Value::Object(map) => {
+                for (key, item) in map {
+                    if VOLATILE_KEYS.contains(&key.as_str()) {
+                        spans.push((key.clone(), serde_json::to_string(item).unwrap()));
+                    } else {
+                        collect(item, spans);
+                    }
+                }
+            }
+            serde_json::Value::Array(items) => items.iter().for_each(|item| collect(item, spans)),
+            _ => {}
+        }
+    }
+    let text = &result.content[0].as_text().unwrap().text;
+    let mut spans = Vec::new();
+    collect(&wire(result), &mut spans);
+    let mut masked = text.clone();
+    for (key, raw) in &spans {
+        masked = masked.replace(
+            &format!("\"{key}\": {raw}"),
+            &format!("\"{key}\": \"<volatile>\""),
+        );
+    }
+    for (_, raw) in &spans {
+        if let Some(inner) = raw.strip_prefix('"').and_then(|raw| raw.strip_suffix('"')) {
+            masked = masked.replace(inner, "<volatile>");
+        }
+    }
+    format!("{:?}\n{masked}", result.is_error)
+}
+
+/// The masked results of one tool: the preparation or first call, the
+/// commit or second call without a proof, and the partial proof.
+struct Results {
+    prepared: String,
+    unproven: String,
+    partial: String,
+}
+
+/// The classic commit arguments of the preparation `args` that returned
+/// `data`, under its business id and without a proof.
+fn unproven_commit_args(args: &serde_json::Value, data: &serde_json::Value) -> serde_json::Value {
+    let mut args = args.clone();
+    for field in ["envelope_xdr", "nonce", "expires_at_unix_ms"] {
+        args[field] = data[field].clone();
+    }
+    args
+}
+
+/// The results of `tool`. The preparation runs under a fresh business id,
+/// and both commits repeat it, as a commit must.
+async fn classic_results(tool: Tool) -> Results {
+    let run = ClassicRun::with(
+        tool,
+        |raw| require_approval_for(&raw, &classic_names(tool)),
+        |_| {},
+        |_| {},
+    )
+    .await;
+    let args = run.tool.prepare_args(&run.f);
+    let prepared = tool.prepare(&run.f.server, &args).await;
+    let data = wire(&prepared)["data"].clone();
+    let unproven = tool
+        .commit(&run.f.server, unproven_commit_args(&args, &data))
+        .await
+        .unwrap();
+    let mut partial_args = unproven_commit_args(&args, &data);
+    partial_args["approval_nonce"] = data["approval"]["approval_nonce"].clone();
+    let partial = tool.commit(&run.f.server, partial_args).await.unwrap();
+    assert_eq!(run.control.count("sendTransaction"), 0, "{tool:?}");
+    Results {
+        prepared: masked(&prepared),
+        unproven: masked(&unproven),
+        partial: masked(&partial),
+    }
+}
+
+/// An attestation of the right form that no consent recorded.
+fn unrecorded_attestation() -> String {
+    "A".repeat(43)
+}
+
+async fn x402_results() -> Results {
+    let run =
+        X402Run::with(|raw| require_approval_for(&raw, &["stellar_x402_create_payment"])).await;
+    let call = |args| async {
+        run.f
+            .server
+            .call_stellar_x402_create_payment(args)
+            .await
+            .unwrap()
+    };
+    let prepared = call(x402_args(&run.f, None)).await;
+    let nonce = wire(&prepared)["data"]["approval"]["approval_nonce"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let unproven = call(x402_args(&run.f, Some((&nonce, &unrecorded_attestation())))).await;
+    let mut partial_args = x402_args(&run.f, None);
+    partial_args.approval_nonce = Some(nonce.clone());
+    let partial = call(partial_args).await;
+    assert!(authorizations(&run.f).is_empty(), "x402");
+    Results {
+        prepared: masked(&prepared),
+        unproven: masked(&unproven),
+        partial: masked(&partial),
+    }
+}
+
+async fn authenticated_results() -> Results {
+    let run =
+        AuthenticatedRun::with(|raw| authenticated_policy_with(&raw, require_approval_rule)).await;
+    let call = |args| async {
+        run.f
+            .server
+            .call_stellar_x402_authenticated_payment(args)
+            .await
+            .unwrap()
+    };
+    let prepared = call(run.args(HOME, None)).await;
+    let nonce = wire(&prepared)["data"]["approval"]["approval_nonce"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let unproven = call(run.args(HOME, Some((&nonce, &unrecorded_attestation())))).await;
+    let mut partial_args = run.args(HOME, None);
+    partial_args.approval_nonce = Some(nonce.clone());
+    let partial = call(partial_args).await;
+    assert!(signings().is_empty(), "authenticated x402");
+    assert!(authorizations(&run.f).is_empty(), "authenticated x402");
+    Results {
+        prepared: masked(&prepared),
+        unproven: masked(&unproven),
+        partial: masked(&partial),
+    }
+}
+
+/// Expected masked responses under RequireApproval.
+const EXPECTED: &str = include_str!("require_approval_results.txt");
+
+/// Under a `RequireApproval` rule for both names, every mainnet tool answers
+/// its preparation or first call, its proof-free commit or second call, and
+/// its partial proof with the same texts.
+#[tokio::test]
+#[serial_test::serial(keyring)]
+async fn require_approval_mainnet_results_stay_byte_identical() {
+    let mut actual = Vec::new();
+    for tool in Tool::ALL {
+        actual.push((format!("{tool:?}"), classic_results(tool).await));
+    }
+    actual.push(("X402".to_owned(), x402_results().await));
+    actual.push((
+        "AuthenticatedX402".to_owned(),
+        authenticated_results().await,
+    ));
+    let mut text = String::new();
+    for (name, results) in &actual {
+        for (call, result) in [
+            ("prepared", &results.prepared),
+            ("unproven", &results.unproven),
+            ("partial", &results.partial),
+        ] {
+            text.push_str(&format!("=== {name} {call}\n{result}\n"));
+        }
+    }
+    if text != EXPECTED {
+        let path = std::env::temp_dir().join("require_approval_results.actual.txt");
+        std::fs::write(&path, &text).unwrap();
+        panic!(
+            "the results differ; the actual texts are in {}",
+            path.display()
+        );
+    }
+}
+
+/// The audit rows of `f` whose kind is `kind`.
+fn rows_of(f: &Fixture, kind: &str) -> Vec<serde_json::Value> {
+    std::fs::read_to_string(&f.server.security_profile().audit_log_path)
+        .unwrap_or_default()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .filter(|row| row["kind"] == kind)
+        .collect()
+}
+
+/// The commit arguments of `run` without either proof field.
+fn proof_free(run: &ClassicRun) -> serde_json::Value {
+    let mut args = run.args.clone();
+    let fields = args.as_object_mut().unwrap();
+    fields.remove("approval_nonce");
+    fields.remove("approval_attestation");
+    args
+}
+
+/// The bytes of the approval store of `f`; `None` before its first write.
+fn store_bytes(f: &Fixture) -> Option<Vec<u8>> {
+    std::fs::read(store_path(f)).ok()
+}
+
+/// Asserts that the one pending row of `run` records `decision` with the
+/// verified policy's digest and the deciding rule's index.
+/// The deciding rule is the rule of `governing`, the name whose decision
+/// governs.
+fn assert_pending_row(context: &str, run: &ClassicRun, decision: &str, governing: &str) {
+    let rows = rows_of(&run.f, "value_action_pending");
+    assert_eq!(rows.len(), 1, "{context}: {rows:?}");
+    assert_eq!(rows[0]["policy_decision"], decision, "{context}: {rows:?}");
+    let policy = run.f.server.verified_policy.as_deref().unwrap();
+    assert_eq!(
+        rows[0]["policy_digest"],
+        stellar_agent_core::hex::encode(&policy.digest()),
+        "{context}: {rows:?}"
+    );
+    assert_eq!(
+        rows[0]["rule_index"],
+        rule_index_of(&run.f, governing),
+        "{context}: {rows:?}"
+    );
+}
+
+/// The policy `raw` with every rule of `tools` allowing.
+fn allow_rules(raw: &str, tools: &[&str]) -> String {
+    let mut doc = raw.parse::<toml_edit::DocumentMut>().unwrap();
+    for rule in doc["rules"].as_array_of_tables_mut().unwrap().iter_mut() {
+        if rule["match"]["tool"]
+            .as_str()
+            .is_some_and(|tool| tools.contains(&tool))
+        {
+            rule["decision"] = toml_edit::value("allow");
+            rule.remove("ttl_secs");
+            rule.remove("reason");
+        }
+    }
+    doc.to_string()
+}
+
+/// Under `Allow` for both names, each classic preparation carries no
+/// approval block and leaves the approval store bytes unchanged.
+#[tokio::test]
+#[serial_test::serial(keyring)]
+async fn allow_prepare_records_no_pending_approval_for_every_kind() {
+    for tool in Tool::ALL {
+        let run = ClassicRun::allowed(tool).await;
+        assert!(
+            run.prepared.get("approval").is_none(),
+            "{tool:?}: {}",
+            run.prepared
+        );
+        let before = store_bytes(&run.f);
+        let prepared = wire(
+            &tool
+                .prepare(&run.f.server, &tool.prepare_args(&run.f))
+                .await,
+        );
+        assert_eq!(prepared["ok"], true, "{tool:?}: {prepared}");
+        assert!(
+            prepared["data"].get("approval").is_none(),
+            "{tool:?}: {prepared}"
+        );
+        assert_eq!(
+            store_bytes(&run.f),
+            before,
+            "{tool:?}: the store is unchanged"
+        );
+    }
+}
+
+/// Under `Allow` for both names, each classic commit signs without a proof:
+/// one send under one policy authorization record, no tombstone and no
+/// consent row; the pending row records `allow` with its provenance.
+#[tokio::test]
+#[serial_test::serial(keyring)]
+async fn allow_commit_signs_without_an_approval_for_every_kind() {
+    for tool in Tool::ALL {
+        let context = format!("{tool:?}");
+        let run = ClassicRun::allowed(tool).await;
+        let result = run.commit().await;
+        assert_eq!(result["ok"], true, "{context}: {result}");
+        assert_eq!(run.control.count("sendTransaction"), 1, "{context}");
+        assert_eq!(run.seed_reads(), 1, "{context}: one signature");
+        let records = authorizations(&run.f);
+        assert_eq!(records.len(), 1, "{context}: {records:?}");
+        assert!(
+            records[0]["approval_nonce"].is_null(),
+            "{context}: {records:?}"
+        );
+        assert_eq!(
+            records[0]["policy_authority"]["scope"],
+            serde_json::json!({"kind":"classic"}),
+            "{context}: {records:?}"
+        );
+        assert_eq!(
+            store_bytes(&run.f),
+            None,
+            "{context}: no approval is written"
+        );
+        for kind in ["approval_attested", "approval_attested_remote"] {
+            assert!(
+                rows_of(&run.f, kind).is_empty(),
+                "{context}: no consent row"
+            );
+        }
+        assert_pending_row(&context, &run, "allow", tool.commit_name());
+    }
+}
+
+/// Under a `RequireApproval` rule, each classic preparation returns its
+/// approval block, and the commit without a proof refuses
+/// `policy.approval_required` before anything is minted or signed.
+#[tokio::test]
+#[serial_test::serial(keyring)]
+async fn require_approval_commit_without_proof_refuses_for_every_kind() {
+    for tool in Tool::ALL {
+        let context = format!("{tool:?}");
+        let run = ClassicRun::new(tool).await;
+        assert!(
+            run.prepared["approval"]["approval_nonce"].is_string(),
+            "{context}: {}",
+            run.prepared
+        );
+        let result = run.commit_with(proof_free(&run)).await;
+        assert_eq!(
+            result["error"]["code"], "policy.approval_required",
+            "{context}: {result}"
+        );
+        assert_classic_unsigned(&context, &run, &run.entry);
+    }
+}
+
+/// A commit is governed by the stricter decision of its own name and its
+/// preparation's name. With one of them requiring approval, in either
+/// order, the commit without a proof refuses and nothing signs; the proven
+/// commit signs under its approval and records `require_approval`.
+#[tokio::test]
+#[serial_test::serial(keyring)]
+async fn commit_requires_approval_when_either_name_requires_it() {
+    for tool in Tool::ALL {
+        for (order, allowed, governing) in [
+            (
+                "preparation requires",
+                tool.commit_name(),
+                tool.prepare_name(),
+            ),
+            ("commit requires", tool.prepare_name(), tool.commit_name()),
+        ] {
+            let context = format!("{tool:?} {order}");
+            let run =
+                ClassicRun::with(tool, |raw| allow_rules(&raw, &[allowed]), |_| {}, |_| {}).await;
+            let result = run.commit_with(proof_free(&run)).await;
+            assert_eq!(
+                result["error"]["code"], "policy.approval_required",
+                "{context}: {result}"
+            );
+            assert_classic_unsigned(&context, &run, &run.entry);
+            let result = run.commit().await;
+            assert_classic_accepted(&context, &run, &result);
+            let records = authorizations(&run.f);
+            assert_eq!(records.len(), 1, "{context}: {records:?}");
+            assert_eq!(
+                records[0]["approval_nonce"], run.entry.approval_nonce,
+                "{context}: {records:?}"
+            );
+            assert!(records[0]["policy_authority"].is_null(), "{context}");
+            assert_pending_row(&context, &run, "require_approval", governing);
+        }
+    }
+}
+
+/// Under `Allow`, a complete proof of an attested approval verifies, signs
+/// under that approval and spends it, and the pending row records `allow`
+/// with its provenance. A forged attestation refuses with the uniform
+/// envelope before anything signs.
+#[tokio::test]
+#[serial_test::serial(keyring)]
+async fn allow_with_supplied_proof_verifies_and_spends_it() {
+    for tool in Tool::ALL {
+        let context = format!("{tool:?}");
+        let run = ClassicRun::allowed(tool).await;
+        let xdr = run.args["envelope_xdr"].as_str().unwrap().to_owned();
+        let forged = approval_for(tool, &run.f, &xdr, 600_000);
+        run.f.attest(&forged);
+        let blob = forge(&run.f, &forged.approval_nonce, Forged::BadSignature);
+        let result = run
+            .commit_with(run.commit_args_for(&xdr, &forged.approval_nonce, &blob))
+            .await;
+        assert_uniform(&format!("{context} forged"), &result);
+        assert_classic_unsigned(&context, &run, &forged);
+
+        let blob = run.f.attest(&run.entry);
+        let result = run
+            .commit_with(run.commit_args_for(&xdr, &run.entry.approval_nonce, &blob))
+            .await;
+        assert_classic_accepted(&context, &run, &result);
+        let records = authorizations(&run.f);
+        assert_eq!(records.len(), 1, "{context}: {records:?}");
+        assert_eq!(
+            records[0]["approval_nonce"], run.entry.approval_nonce,
+            "{context}: {records:?}"
+        );
+        assert!(records[0]["policy_authority"].is_null(), "{context}");
+        assert_pending_row(&context, &run, "allow", tool.commit_name());
+    }
+}
+
+/// A nonce without an attestation, and an attestation without a nonce,
+/// refuse `policy.approval_required` for every kind under both decisions,
+/// and nothing is minted.
+#[tokio::test]
+#[serial_test::serial(keyring)]
+async fn partial_proof_refuses_under_both_decisions() {
+    for tool in Tool::ALL {
+        for require in [false, true] {
+            let run = if require {
+                ClassicRun::new(tool).await
+            } else {
+                ClassicRun::allowed(tool).await
+            };
+            for (field, value) in [
+                ("approval_nonce", run.entry.approval_nonce.clone()),
+                ("approval_attestation", unrecorded_attestation()),
+            ] {
+                let context = format!("{tool:?} require={require} {field} only");
+                let mut args = proof_free(&run);
+                args[field] = serde_json::json!(value);
+                let result = run.commit_with(args).await;
+                assert_eq!(
+                    result["error"]["code"], "policy.approval_required",
+                    "{context}: {result}"
+                );
+                assert_classic_unsigned(&context, &run, &run.entry);
+            }
+        }
     }
 }
 

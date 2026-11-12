@@ -1046,27 +1046,73 @@ impl WalletServer {
             Ok(o) => o,
             Err(e) => return e.into_result(),
         };
-
+        // On mainnet the stricter decision of this commit and its
+        // preparation governs.
         let dispatch_outcome = match self
-            .force_mainnet_confirmation("stellar_create_account_commit", dispatch_outcome)
+            .commit_governing_outcome(
+                dispatch_outcome,
+                "stellar_create_account",
+                &authoritative_args,
+                &args.chain_id,
+                Some(&source_adapter),
+                None,
+            )
+            .await
         {
             Ok(outcome) => outcome,
             Err(error) => return error.into_result(),
         };
-        let approval_witness = match verify_attestation_gate(
-            self,
-            &dispatch_outcome,
-            super::common::GatedApprovalKind::Payment,
-            &args.envelope_xdr,
-            args.approval_nonce.as_deref(),
-            args.approval_attestation.as_deref(),
-            "stellar_create_account_commit",
-        )
-        .await
-        {
-            Ok(witness) => witness,
-            Err(result) => return Ok(result),
+
+        // On mainnet the authority wrapper runs in place of the gate: an
+        // `Allow` without a proof signs under policy authority.
+        let mut witness: Option<stellar_agent_core::approval::witness::ApprovalWitness> = None;
+        let authority = if mainnet.is_some() {
+            match super::common::mainnet_authority(
+                self,
+                &dispatch_outcome,
+                super::common::GatedApprovalKind::Payment.expectation(
+                    stellar_agent_core::approval::subject::approval_subject_classic(
+                        &args.envelope_xdr,
+                    ),
+                ),
+                &super::common::SuppliedProof {
+                    nonce: args.approval_nonce.clone(),
+                    attestation: args.approval_attestation.clone(),
+                },
+                "stellar_create_account_commit",
+                &mut witness,
+            )
+            .await
+            {
+                Ok(authority) => Some(authority),
+                Err(refusal) => {
+                    return Ok(super::common::authority_refusal_result(self, refusal));
+                }
+            }
+        } else {
+            match verify_attestation_gate(
+                self,
+                &dispatch_outcome,
+                super::common::GatedApprovalKind::Payment,
+                &args.envelope_xdr,
+                args.approval_nonce.as_deref(),
+                args.approval_attestation.as_deref(),
+                "stellar_create_account_commit",
+            )
+            .await
+            {
+                Ok(verified) => {
+                    witness = verified;
+                    witness
+                        .as_ref()
+                        .map(stellar_agent_network::mainnet::authority::MainnetAuthority::Approval)
+                }
+                Err(result) => return Ok(result),
+            }
         };
+        let provenance = dispatch_outcome
+            .mainnet_decision()
+            .map(stellar_agent_core::mainnet::decision::MainnetDecision::provenance);
 
         // Syntax parsing follows the policy gate; it consumes no nonce.
         let nonce = match stellar_agent_nonce::Nonce::from_base64(&args.nonce) {
@@ -1265,9 +1311,6 @@ impl WalletServer {
             .map(stellar_agent_core::policy::v1::ValueClass::Value)
             .unwrap_or(stellar_agent_core::policy::v1::ValueClass::ReadOnly);
         let floor_hook = crate::sequence_floor::hook(&self.sequence_floor);
-        let authority = approval_witness
-            .as_ref()
-            .map(stellar_agent_network::mainnet::authority::MainnetAuthority::Approval);
         match crate::tools::submission_record::sign_and_submit_classic(
             self,
             mainnet.as_ref(),
@@ -1292,6 +1335,7 @@ impl WalletServer {
                 approval_nonce: args.approval_nonce.clone(),
                 approval_dir: self.resolve_approval_dir().ok(),
                 now_ms,
+                provenance,
             },
             cross_check.witness(),
             Some(&floor_hook),
