@@ -1565,11 +1565,17 @@ impl WalletServer {
     /// Every owed accounting obligation is then drained, also after a pass
     /// that was skipped or refused, so obligations of earlier passes are
     /// delivered too.
-    async fn reconcile_open_reservations(&self) {
+    ///
+    /// A call whose `business_id` is already stored replays or conflicts
+    /// before it builds anything, so its pass runs no recovery stage. The
+    /// stored-id read is local and sends no request.
+    async fn reconcile_open_reservations(&self, business_id: Option<&str>) {
         use stellar_agent_network::submission_flow::{self, ReconcilePass};
         let profile_name = self.profile_name_for_approval();
         let receipts = submission_flow::open_receipts(&profile_name).ok();
         let window = self.window_store.clone();
+        let stored =
+            submission_flow::business_id_is_stored(self.security_profile(), &window, business_id);
         let pass = match (
             stellar_agent_core::timefmt::now_unix_ms(),
             self.context.primary_client(),
@@ -1578,22 +1584,36 @@ impl WalletServer {
             (Ok(_), Err(_)) => ReconcilePass::ClientUnavailable,
             (Ok(now_ms), Ok(client)) => {
                 let oracle = self.settlement_oracle();
-                submission_flow::reconcile_pass(
-                    self.security_profile(),
-                    &window,
-                    &client,
-                    oracle.as_ref(),
-                    receipts.as_ref(),
-                    now_ms,
-                    || {
-                        crate::tools::value_audit::require_value_audit_writer(
-                            self.security_profile(),
-                            &profile_name,
-                            self.audit_binding,
-                        )
-                    },
-                )
-                .await
+                let writer = || {
+                    crate::tools::value_audit::require_value_audit_writer(
+                        self.security_profile(),
+                        &profile_name,
+                        self.audit_binding,
+                    )
+                };
+                if stored {
+                    submission_flow::reconcile_legacy_pass(
+                        self.security_profile(),
+                        &window,
+                        &client,
+                        oracle.as_ref(),
+                        receipts.as_ref(),
+                        now_ms,
+                        writer,
+                    )
+                    .await
+                } else {
+                    submission_flow::reconcile_pass(
+                        self.security_profile(),
+                        &window,
+                        &client,
+                        oracle.as_ref(),
+                        receipts.as_ref(),
+                        now_ms,
+                        writer,
+                    )
+                    .await
+                }
             }
         };
         let _ = submission_flow::finish_reconciliation(
@@ -2006,7 +2026,12 @@ impl WalletServer {
             && descriptor.value_kind != stellar_agent_core::policy::ToolValueKind::ReadOnly
             && self.policy_engine.window_state_store().is_some()
         {
-            self.reconcile_open_reservations().await;
+            self.reconcile_open_reservations(
+                args_value
+                    .get("business_id")
+                    .and_then(serde_json::Value::as_str),
+            )
+            .await;
             self.window_store
                 .observe_before_policy(self.security_profile())
                 .await;

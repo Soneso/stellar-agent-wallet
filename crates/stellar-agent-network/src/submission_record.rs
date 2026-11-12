@@ -482,6 +482,8 @@ pub struct WalletSubmissionRecorder<'a> {
     approval: Option<ApprovalTombstone>,
     provenance: Option<stellar_agent_core::mainnet::decision::MainnetProvenance>,
     operation: Option<OperationAttempt>,
+    pre_exposure_ledger: Option<u32>,
+    observation: Option<crate::policy_state::WindowObservation>,
 }
 
 impl std::fmt::Debug for WalletSubmissionRecorder<'_> {
@@ -579,6 +581,8 @@ impl<'a> WalletSubmissionRecorder<'a> {
             witness: None,
             provenance: None,
             operation: None,
+            pre_exposure_ledger: None,
+            observation: None,
         }
     }
 
@@ -643,6 +647,23 @@ impl<'a> WalletSubmissionRecorder<'a> {
     #[must_use]
     pub fn with_operation(mut self, operation: Option<OperationAttempt>) -> Self {
         self.operation = operation;
+        self
+    }
+
+    /// Attaches the independent lower bound committed with exposure.
+    #[must_use]
+    pub fn with_pre_exposure_ledger(mut self, ledger: Option<u32>) -> Self {
+        self.pre_exposure_ledger = ledger;
+        self
+    }
+
+    /// Attaches the primary observation persisted under the audit writer guard.
+    #[must_use]
+    pub fn with_observation(
+        mut self,
+        observation: Option<crate::policy_state::WindowObservation>,
+    ) -> Self {
+        self.observation = observation;
         self
     }
 
@@ -1297,19 +1318,48 @@ impl WalletSubmissionRecorder<'_> {
     /// another receipt holds, and `submission.record_unavailable` when the
     /// receipt store fails. Nothing of this attempt exists then.
     fn claim_receipt(&self, intent: &SubmissionIntent) -> Result<(), WalletError> {
-        // `begin_submission` answers the replay identity and the
-        // envelope-hash gate under one lock hold, in that order: the second
-        // check writes this submission's own receipt, which carries this
-        // submission's `(source, sequence)`.
-        match self.receipts.begin_submission_with_approval(
-            &intent.envelope_hash,
-            &intent.tx_hash,
-            &intent.source,
-            intent.sequence,
-            intent.max_time,
-            intent.submission_ledger,
-            self.approval.as_ref().map(|a| a.approval_nonce.as_str()),
-        ) {
+        let claim = |releases: &dyn stellar_agent_core::profile::receipt::SequenceReleases| {
+            self.receipts.begin_submission_releasing(
+                &intent.envelope_hash,
+                &intent.tx_hash,
+                &intent.source,
+                intent.sequence,
+                intent.max_time,
+                intent.submission_ledger,
+                self.approval.as_ref().map(|a| a.approval_nonce.as_str()),
+                releases,
+            )
+        };
+        let outcome = if self.profile.chain_id.is_mainnet() {
+            let writer = self
+                .audit
+                .as_ref()
+                .ok_or_else(|| record_unavailable("the receipt claim requires its audit writer"))?;
+            let mut writer = lock_audit(writer)?;
+            if let Some(observation) = self.observation {
+                OperationRecorder::new(&self.window, self.profile, &mut *writer, &self.request_id)
+                    .record_observation(observation)
+                    .map_err(crate::operation_entry::operation_refusal)?;
+            }
+            crate::policy_state::recovery::with_sequence_releases(
+                &self.window,
+                self.profile,
+                &writer,
+                claim,
+            )
+            .map_err(crate::operation_entry::operation_refusal)?
+        } else {
+            self.receipts.begin_submission_with_approval(
+                &intent.envelope_hash,
+                &intent.tx_hash,
+                &intent.source,
+                intent.sequence,
+                intent.max_time,
+                intent.submission_ledger,
+                self.approval.as_ref().map(|a| a.approval_nonce.as_str()),
+            )
+        };
+        match outcome {
             Ok(BeginSubmissionOutcome::Recorded) => Ok(()),
             Ok(
                 BeginSubmissionOutcome::DuplicateSequence(existing)
@@ -1404,8 +1454,8 @@ impl WalletSubmissionRecorder<'_> {
     /// The wallet's consumption of a mainnet grant for one submission.
     ///
     /// Without an audit writer nothing is recorded or consumed: the audit
-    /// facts the ledger compares cannot be read. Otherwise the receipt claim and
-    /// window check precede the writer guard. The settlement lookup, pending-row
+    /// facts the ledger compares cannot be read. The receipt claim drops its guards
+    /// before consumption takes the writer guard. The settlement lookup, pending-row
     /// append, and fresh audit facts share that guard, so rotation cannot hide
     /// an owed row between the lookup and the append.
     ///
@@ -1507,6 +1557,7 @@ impl WalletSubmissionRecorder<'_> {
                             max_time: intent.max_time,
                             receipt: intent.envelope_hash.clone(),
                         },
+                        pre_exposure_ledger: self.pre_exposure_ledger,
                         audit: &mut *guard,
                         request_id: &self.request_id,
                     },
@@ -3074,6 +3125,8 @@ mod tests {
                         now_ms: 1_000,
                         provenance: Some(test_provenance()),
                         operation: None,
+                        pre_exposure_ledger: None,
+                        observation: None,
                     },
                     receipts,
                     None,

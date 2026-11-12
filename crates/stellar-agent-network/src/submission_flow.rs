@@ -85,6 +85,10 @@ pub struct RecorderInputs<'a> {
     /// The operation attempt the submission sends, opened before the
     /// signature; `None` for a submission without an operation record.
     pub operation: Option<OperationAttempt>,
+    /// The independently observed lower bound before exposure.
+    pub pre_exposure_ledger: Option<u32>,
+    /// The primary readiness observation persisted by the recorder.
+    pub observation: Option<crate::policy_state::WindowObservation>,
 }
 
 /// Assembles the stores, window entries and signing sizing for a recorder.
@@ -117,7 +121,9 @@ pub fn assemble_recorder(
         Some(provenance) => recorder.with_provenance(provenance),
         None => recorder,
     }
-    .with_operation(inputs.operation);
+    .with_operation(inputs.operation)
+    .with_pre_exposure_ledger(inputs.pre_exposure_ledger)
+    .with_observation(inputs.observation);
     match sizing {
         Some(sizing) => recorder.with_signing_sizing(sizing),
         None => recorder,
@@ -301,6 +307,13 @@ pub enum ReconcilePass {
     ClientUnavailable,
     /// The pass refuses; every open reservation stands.
     Failed(WindowStoreError),
+    /// The legacy stage completes and the recovery stage then refuses.
+    RecoveryFailed {
+        /// The completed legacy report.
+        legacy: ReconcileReport,
+        /// The recovery refusal; no recovery commit applies.
+        error: crate::policy_state::RecoveryError,
+    },
 }
 
 /// Logs the outcome of a dispatch-time reconciliation pass, then drains every
@@ -322,12 +335,16 @@ pub fn finish_reconciliation(
     writer: impl FnOnce() -> Result<Arc<Mutex<AuditWriter>>, WalletError>,
 ) -> Result<DeliveryReport, WalletError> {
     match pass {
-        ReconcilePass::Completed(report) if report.receipt_write_failed > 0 => tracing::warn!(
-            profile = %profile_name,
-            receipt_write_failed = report.receipt_write_failed,
-            "window reconcile: receipt writes stay owed"
-        ),
-        ReconcilePass::Completed(_) => {}
+        ReconcilePass::Completed(report) | ReconcilePass::RecoveryFailed { legacy: report, .. }
+            if report.receipt_write_failed > 0 =>
+        {
+            tracing::warn!(
+                profile = %profile_name,
+                receipt_write_failed = report.receipt_write_failed,
+                "window reconcile: receipt writes stay owed"
+            );
+        }
+        ReconcilePass::Completed(_) | ReconcilePass::RecoveryFailed { .. } => {}
         ReconcilePass::ClockUnavailable => {
             tracing::debug!("window reconcile: system clock unavailable; reservations stand");
         }
@@ -339,6 +356,14 @@ pub fn finish_reconciliation(
             error = ?error,
             "window reconcile: pass failed; open reservations stand"
         ),
+    }
+    if let ReconcilePass::RecoveryFailed { error, .. } = pass {
+        tracing::warn!(
+            profile = %profile_name,
+            code = error.code(),
+            error = %error,
+            "recovery: the stage refused; every sequence stays held"
+        );
     }
     drain_accounting_obligations(window, profile, profile_name, receipts, writer)
 }
@@ -362,15 +387,134 @@ pub async fn reconcile_pass(
     now_ms: u64,
     operations_writer: impl FnOnce() -> Result<Arc<Mutex<AuditWriter>>, WalletError>,
 ) -> ReconcilePass {
-    if profile.chain_id.is_mainnet() {
-        expire_due_operations(profile, window, now_ms, operations_writer);
-    }
-    match window
+    reconcile_stages(
+        profile,
+        window,
+        client,
+        oracle,
+        receipts,
+        now_ms,
+        operations_writer,
+        true,
+    )
+    .await
+}
+
+/// Runs [`reconcile_pass`] without its recovery stage.
+///
+/// An invocation whose business id is already stored replays or conflicts
+/// before it builds anything, so it sends no recovery request and changes no
+/// recovery state. The expiry edges and the legacy stage run unchanged.
+pub async fn reconcile_legacy_pass(
+    profile: &Profile,
+    window: &PersistedWindowStore,
+    client: &StellarRpcClient,
+    oracle: Option<&StellarRpcClient>,
+    receipts: Option<&ReceiptStore>,
+    now_ms: u64,
+    operations_writer: impl FnOnce() -> Result<Arc<Mutex<AuditWriter>>, WalletError>,
+) -> ReconcilePass {
+    reconcile_stages(
+        profile,
+        window,
+        client,
+        oracle,
+        receipts,
+        now_ms,
+        operations_writer,
+        false,
+    )
+    .await
+}
+
+/// Whether `business_id` names a record or tombstone in the verified window.
+///
+/// The read sends no request, so the caller's request order stays as it is.
+/// An absent, unparsable or unreadable id reads as not stored.
+#[must_use]
+pub fn business_id_is_stored(
+    profile: &Profile,
+    window: &PersistedWindowStore,
+    business_id: Option<&str>,
+) -> bool {
+    let Some(Ok(business_id)) = business_id.map(crate::policy_state::BusinessId::parse) else {
+        return false;
+    };
+    crate::policy_state::OperationStatus::new(window, profile)
+        .view(&business_id)
+        .is_ok_and(|view| view.is_some())
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the pass arguments plus the stage selection"
+)]
+async fn reconcile_stages(
+    profile: &Profile,
+    window: &PersistedWindowStore,
+    client: &StellarRpcClient,
+    oracle: Option<&StellarRpcClient>,
+    receipts: Option<&ReceiptStore>,
+    now_ms: u64,
+    operations_writer: impl FnOnce() -> Result<Arc<Mutex<AuditWriter>>, WalletError>,
+    recovery: bool,
+) -> ReconcilePass {
+    #[cfg(test)]
+    RECOVERY_STAGE_TRACE.with_borrow_mut(|trace| trace.push("expire"));
+    let writer = if profile.chain_id.is_mainnet() {
+        expire_due_operations(profile, window, now_ms, operations_writer)
+    } else {
+        None
+    };
+    #[cfg(test)]
+    RECOVERY_STAGE_TRACE.with_borrow_mut(|trace| trace.push("legacy"));
+    let legacy = match window
         .reconcile_due(profile, client, oracle, receipts, now_ms, RECONCILE_BUDGET)
         .await
     {
         Ok(report) => ReconcilePass::Completed(report),
         Err(error) => ReconcilePass::Failed(error),
+    };
+    if !recovery {
+        return legacy;
+    }
+    #[cfg(test)]
+    RECOVERY_STAGE_TRACE.with_borrow_mut(|trace| trace.push("recovery"));
+    if let Some(writer) = writer
+        && let ReconcilePass::Completed(report) = &legacy
+        && let Err(error) = crate::policy_state::recover_sequences(
+            window,
+            profile,
+            crate::policy_state::EndpointPair::from_clients(client, oracle),
+            &writer,
+            None,
+        )
+        .await
+    {
+        return ReconcilePass::RecoveryFailed {
+            legacy: report.clone(),
+            error,
+        };
+    }
+    legacy
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static RECOVERY_STAGE_TRACE: std::cell::RefCell<Vec<&'static str>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// Turns the status lookup's recovery stage off for a control run.
+    pub(crate) static STATUS_RECOVERY_DISABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether the status lookup runs its recovery stage; always outside tests.
+fn status_recovery_enabled() -> bool {
+    #[cfg(test)]
+    {
+        !STATUS_RECOVERY_DISABLED.get()
+    }
+    #[cfg(not(test))]
+    {
+        true
     }
 }
 
@@ -384,7 +528,7 @@ fn expire_due_operations(
     window: &PersistedWindowStore,
     now_ms: u64,
     writer: impl FnOnce() -> Result<Arc<Mutex<AuditWriter>>, WalletError>,
-) {
+) -> Option<Arc<Mutex<AuditWriter>>> {
     let writer = match writer() {
         Ok(writer) => writer,
         Err(error) => {
@@ -392,12 +536,12 @@ fn expire_due_operations(
                 code = error.code(),
                 "operation expiry: no audit writer; expiry edges wait for the next step"
             );
-            return;
+            return None;
         }
     };
     let Ok(mut guard) = writer.lock() else {
         tracing::warn!("operation expiry: the audit writer mutex is poisoned; expiry skipped");
-        return;
+        return None;
     };
     let request_id = uuid::Uuid::new_v4().to_string();
     match OperationRecorder::new(window, profile, &mut *guard, request_id).expire_due(now_ms) {
@@ -408,6 +552,8 @@ fn expire_due_operations(
             "operation expiry: the expiry edges could not be applied; records stand"
         ),
     }
+    drop(guard);
+    Some(writer)
 }
 
 /// Inputs for reconciling and displaying one transaction.
@@ -466,7 +612,7 @@ pub enum StatusFailure {
 }
 
 /// Reconciles one transaction and reads its resulting receipt and reservation.
-/// The writer is acquired only when accounting delivery needs it.
+/// Mainnet recovery and accounting delivery use the caller's audit writer.
 ///
 /// # Errors
 /// Returns the typed failure at the step that refuses the status lookup.
@@ -534,6 +680,28 @@ pub async fn transaction_status(
                 return Err(StatusFailure::ReconcileRefused(error));
             }
         }
+    }
+    if profile.chain_id.is_mainnet()
+        && status_recovery_enabled()
+        && let Ok(hash) = stellar_agent_core::hex::decode_hex32(tx_hash)
+        && let Ok(writer) = writer()
+        && let Err(error) = crate::policy_state::recover_sequences(
+            window,
+            profile,
+            crate::policy_state::EndpointPair::from_clients(client, oracle),
+            &writer,
+            Some(&hash),
+        )
+        .await
+    {
+        // The status answer stands; the drain below runs as on the refused
+        // reconciliation path.
+        tracing::warn!(
+            profile = %profile_name,
+            code = error.code(),
+            error = %error,
+            "transaction status: recovery refused; every sequence stays held"
+        );
     }
     // The status answer does not depend on the drain: a refusal is logged by
     // the drain and leaves the obligations owed for a later call.

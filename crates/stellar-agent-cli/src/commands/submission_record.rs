@@ -166,6 +166,8 @@ pub(crate) fn build_recorder(
             now_ms: record.now_ms,
             provenance: None,
             operation: None,
+            pre_exposure_ledger: None,
+            observation: None,
         },
         receipts,
         sizing,
@@ -314,6 +316,7 @@ impl<'a> PreparedMainnetRecorder<'a> {
         self,
         authorization: &MainnetTxSignAuthorization,
         operation: Option<stellar_agent_network::OperationAttempt>,
+        observation: stellar_agent_network::policy_state::SubmissionObservation,
     ) -> StageMarkedRecorder<'a> {
         let recorder = WalletSubmissionRecorder::new_authorized(
             self.profile,
@@ -333,7 +336,9 @@ impl<'a> PreparedMainnetRecorder<'a> {
         .with_witness(self.witness)
         .with_approval(self.tombstone)
         .with_provenance(self.provenance)
-        .with_operation(operation);
+        .with_operation(operation)
+        .with_pre_exposure_ledger(observation.pre_exposure_ledger)
+        .with_observation(observation.observation);
         StageMarkedRecorder::new(recorder)
     }
 }
@@ -398,6 +403,15 @@ pub(crate) fn settlement_oracle_in(
 /// check of `origin`, so a synthesized profile records no binding. The drain
 /// runs whatever the pass reported, also after a refused pass, so obligations
 /// of earlier passes are delivered too.
+///
+/// A mainnet run passes the `business_id` it names, before its business-id
+/// lookup. A run whose id is already stored replays or conflicts before it
+/// builds anything, so its pass runs the legacy stage alone and no recovery
+/// stage. The stored-id read is local and sends no request.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the reconciliation arguments plus the run's business id"
+)]
 pub(crate) async fn reconcile_open_reservations(
     profile: &Profile,
     profile_name: &str,
@@ -405,6 +419,7 @@ pub(crate) async fn reconcile_open_reservations(
     client: &StellarRpcClient,
     oracle: Option<&StellarRpcClient>,
     now_ms: u64,
+    business_id: Option<&str>,
 ) {
     let receipts = match open_receipts(profile_name) {
         Ok(store) => Some(store),
@@ -418,16 +433,30 @@ pub(crate) async fn reconcile_open_reservations(
         }
     };
     let window = PersistedWindowStore::for_profile(profile_name);
-    let pass = submission_flow::reconcile_pass(
-        profile,
-        &window,
-        client,
-        oracle,
-        receipts.as_ref(),
-        now_ms,
-        || accounting_audit_writer(profile, profile_name, origin),
-    )
-    .await;
+    let writer = || accounting_audit_writer(profile, profile_name, origin);
+    let pass = if submission_flow::business_id_is_stored(profile, &window, business_id) {
+        submission_flow::reconcile_legacy_pass(
+            profile,
+            &window,
+            client,
+            oracle,
+            receipts.as_ref(),
+            now_ms,
+            writer,
+        )
+        .await
+    } else {
+        submission_flow::reconcile_pass(
+            profile,
+            &window,
+            client,
+            oracle,
+            receipts.as_ref(),
+            now_ms,
+            writer,
+        )
+        .await
+    };
     let _ = submission_flow::finish_reconciliation(
         profile,
         profile_name,
@@ -700,6 +729,269 @@ mod tests {
     use stellar_agent_core::profile::receipt::{ReceiptStatus, ReleaseEvidence};
     use stellar_agent_network::envelope_hash_hex;
     use stellar_agent_network::policy_state::DeliveryReport;
+
+    #[cfg(feature = "mainnet-write")]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn recovery_cli_bind_stores_the_minimum_bound_behind_the_primary() {
+        cli_bind_stores_the_bound("recovery-bound-behind", Some(600)).await;
+    }
+
+    #[cfg(feature = "mainnet-write")]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn recovery_cli_bind_stores_the_minimum_bound_ahead_of_the_primary() {
+        cli_bind_stores_the_bound("recovery-bound-ahead", Some(2100)).await;
+    }
+
+    #[cfg(feature = "mainnet-write")]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn recovery_cli_bind_stores_no_bound_without_the_oracle() {
+        cli_bind_stores_the_bound("recovery-bound-none", None).await;
+    }
+
+    /// A signer that refuses ends the run before the bound read, so the
+    /// oracle receives no request of it.
+    #[cfg(feature = "mainnet-write")]
+    #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial]
+    async fn recovery_refused_signer_sends_no_bound_read() {
+        use crate::commands::pay::tests::mainnet_full as pay;
+        use crate::common::mainnet_write_fixture::{Spec, install_ledger_double, pay_rule};
+        let fixture = Spec::new("recovery-signer-refused")
+            .rules(vec![pay_rule("allow", "")])
+            .build()
+            .await;
+        let (_ledger, _calls) = install_ledger_double(
+            || {
+                Err(WalletError::WalletState(
+                    stellar_agent_core::error::WalletStateError::HardwareNotFound,
+                ))
+            },
+            || Ok(()),
+        );
+        let mut args = pay::mainnet_args(&fixture);
+        args.sign_with_ledger = true;
+        let run = pay::run(&fixture, &args).await;
+        assert_ne!(run.code, 0, "{}", run.envelope);
+        let oracle = fixture.oracle_methods().await;
+        assert!(
+            !oracle
+                .iter()
+                .any(|method| method == "getLatestLedger" || method == "getLedgers"),
+            "{oracle:?}"
+        );
+    }
+
+    /// An oracle slower than a short authorization lifetime cannot delay the
+    /// run past it. The bound read stops at its deadline, stores no bound,
+    /// and the payment succeeds.
+    #[cfg(feature = "mainnet-write")]
+    #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial]
+    async fn recovery_slow_oracle_leaves_a_short_authorization_its_lifetime() {
+        use crate::commands::pay::tests::mainnet_full as pay;
+        use crate::common::mainnet_write_fixture::{Spec, pay_rule};
+        use wiremock::{Mock, ResponseTemplate, matchers::body_partial_json};
+        let fixture = Spec::new("recovery-slow-oracle")
+            .rules(vec![pay_rule("allow", "")])
+            .authorization_ttl(10)
+            .build()
+            .await;
+        Mock::given(body_partial_json(
+            serde_json::json!({"method":"getLatestLedger"}),
+        ))
+        .respond_with(move |request: &wiremock::Request| {
+            let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({
+                    "jsonrpc":"2.0", "id":body["id"],
+                    "result":{"id":"00".repeat(32), "protocolVersion":23, "sequence":2000}
+                }))
+                .set_delay(std::time::Duration::from_secs(12))
+        })
+        .with_priority(1)
+        .mount(&fixture.oracle)
+        .await;
+        let run = pay::run(&fixture, &pay::mainnet_args(&fixture)).await;
+        assert_eq!(run.code, 0, "{}", run.envelope);
+        let state = fixture.window_body();
+        assert_eq!(
+            state["operations"]["records"][0]["attempts"][0]["pre_exposure_ledger"],
+            serde_json::Value::Null
+        );
+    }
+
+    /// A full mainnet write of each value verb family sends the primary the
+    /// requests it sends without recovery. The oracle gets only the added
+    /// bound read: its latest ledger, then one ledger from there.
+    #[cfg(feature = "mainnet-write")]
+    #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial]
+    async fn recovery_value_verbs_add_only_the_oracle_bound_read() {
+        use crate::commands::accounts::create::tests::mainnet_full as create;
+        use crate::commands::claim::tests::mainnet_full as claim;
+        use crate::commands::pay::tests::mainnet_full as pay;
+        use crate::commands::trustline::tests::mainnet_full as trustline;
+        use crate::common::mainnet_write_fixture::{Spec, pay_rule};
+        const BOUND: [&str; 2] = ["getLatestLedger", "getLedgers"];
+        let mut lists = Vec::new();
+        let fixture = Spec::new("recovery-guard-pay")
+            .rules(vec![pay_rule("allow", "")])
+            .build()
+            .await;
+        pay::run(&fixture, &pay::mainnet_args(&fixture)).await;
+        lists.push((
+            "pay",
+            fixture.primary_methods().await,
+            fixture.oracle_methods().await,
+        ));
+        let fixture = claim::spec("recovery-guard-claim").build().await;
+        claim::run(&fixture, &claim::mainnet_args(&fixture)).await;
+        lists.push((
+            "claim",
+            fixture.primary_methods().await,
+            fixture.oracle_methods().await,
+        ));
+        let fixture = trustline::spec("recovery-guard-trustline").build().await;
+        trustline::run(&fixture, &trustline::mainnet_args(&fixture)).await;
+        lists.push((
+            "trustline",
+            fixture.primary_methods().await,
+            fixture.oracle_methods().await,
+        ));
+        let fixture = Spec::new("recovery-guard-create").build().await;
+        create::run(&fixture, &create::mainnet_args(&fixture)).await;
+        lists.push((
+            "create",
+            fixture.primary_methods().await,
+            fixture.oracle_methods().await,
+        ));
+        // Identity and readiness once, the verb's reads and probes, the send.
+        let probes = [
+            "getNetwork",
+            "getLedgerEntries",
+            "getNetwork",
+            "getLedgerEntries",
+            "sendTransaction",
+            "getTransaction",
+        ];
+        let start = ["getNetwork", "getHealth", "getLedgers"];
+        let primary_of = |reads: &[&str]| -> Vec<String> {
+            start
+                .iter()
+                .chain(reads)
+                .chain(&probes)
+                .map(|method| (*method).to_owned())
+                .collect()
+        };
+        let cross_check = ["getNetwork", "getLedgerEntries"];
+        let oracle_of = |base: &[&str]| -> Vec<String> {
+            base.iter()
+                .chain(&BOUND)
+                .map(|method| (*method).to_owned())
+                .collect()
+        };
+        let expected = [
+            (
+                "pay",
+                primary_of(&["getLedgerEntries", "getLedgerEntries", "getLedgerEntries"]),
+                oracle_of(&cross_check),
+            ),
+            (
+                "claim",
+                primary_of(&["getLedgerEntries", "getLedgerEntries"]),
+                oracle_of(&cross_check),
+            ),
+            (
+                "trustline",
+                primary_of(&["getLedgerEntries", "getLedgerEntries"]),
+                oracle_of(&cross_check),
+            ),
+            ("create", primary_of(&["getLedgerEntries"]), oracle_of(&[])),
+        ];
+        for ((verb, primary, oracle), (expected_verb, base, bound)) in lists.iter().zip(&expected) {
+            assert_eq!(verb, expected_verb);
+            assert_eq!(primary, base, "{verb}: the primary sees the base requests");
+            assert_eq!(oracle, bound, "{verb}: the oracle adds only the bound read");
+        }
+    }
+
+    /// Runs a mainnet payment whose primary report is older than the
+    /// submission and whose oracle stands at `oracle_ledger`. The exposure
+    /// stores `min(primary, oracle)`, or `None` when the oracle read fails.
+    #[cfg(feature = "mainnet-write")]
+    async fn cli_bind_stores_the_bound(name: &'static str, oracle_ledger: Option<u32>) {
+        use crate::commands::pay::tests::mainnet_full::{mainnet_args, run};
+        use crate::common::mainnet_write_fixture::{Spec, pay_rule};
+        use wiremock::{Mock, ResponseTemplate, matchers::body_partial_json};
+        let fixture = Spec::new(name)
+            .rules(vec![pay_rule("allow", "")])
+            .build()
+            .await;
+        for method in ["getHealth", "getLedgers"] {
+            let calls = std::sync::atomic::AtomicUsize::new(0);
+            Mock::given(body_partial_json(serde_json::json!({"method":method})))
+                .respond_with(move |request: &wiremock::Request| {
+                    let latest = if calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 { 700 } else { 2000 };
+                    let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                    let result = if method == "getHealth" {
+                        serde_json::json!({"status":"healthy", "latestLedger":latest, "oldestLedger":1, "ledgerRetentionWindow":2000})
+                    } else {
+                        serde_json::json!({"latestLedger":latest, "oldestLedger":1,
+                            "latestLedgerCloseTime":(stellar_agent_core::timefmt::now_unix_ms().unwrap()/1000).to_string(),
+                            "oldestLedgerCloseTime":1, "cursor":latest.to_string(), "ledgers":[]})
+                    };
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!({"jsonrpc":"2.0", "id":body["id"], "result":result}))
+                }).with_priority(1).mount(&fixture.primary).await;
+        }
+        Mock::given(body_partial_json(
+            serde_json::json!({"method":"getLatestLedger"}),
+        ))
+        .respond_with(move |request: &wiremock::Request| {
+            let Some(latest) = oracle_ledger else {
+                return ResponseTemplate::new(500);
+            };
+            let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "jsonrpc":"2.0", "id":body["id"],
+                "result":{"id":"00".repeat(32), "protocolVersion":23, "sequence":latest}
+            }))
+        })
+        .with_priority(1)
+        .mount(&fixture.oracle)
+        .await;
+        // The oracle refuses a start beyond its latest ledger, as an RPC endpoint does.
+        Mock::given(body_partial_json(serde_json::json!({"method":"getLedgers"})))
+            .respond_with(move |request: &wiremock::Request| {
+                let Some(latest) = oracle_ledger else { return ResponseTemplate::new(500); };
+                let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                if body["params"]["startLedger"].as_u64() > Some(u64::from(latest)) {
+                    return ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "jsonrpc":"2.0", "id":body["id"],
+                        "error":{"code":-32600, "message":"startLedger must be at most the latest ledger"}
+                    }));
+                }
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "jsonrpc":"2.0", "id":body["id"], "result":{
+                        "latestLedger":latest, "oldestLedger":1,
+                        "latestLedgerCloseTime":(stellar_agent_core::timefmt::now_unix_ms().unwrap()/1000).to_string(),
+                        "oldestLedgerCloseTime":1, "cursor":latest.to_string(), "ledgers":[]
+                    }
+                }))
+            }).with_priority(1).mount(&fixture.oracle).await;
+        let result = run(&fixture, &mainnet_args(&fixture)).await;
+        assert_eq!(result.code, 0, "{}", result.envelope);
+        let state = fixture.window_body();
+        let exposure = &state["operations"]["records"][0]["attempts"][0];
+        assert_eq!(
+            exposure["pre_exposure_ledger"],
+            serde_json::json!(oracle_ledger.map(|value| value.min(700)))
+        );
+        // The submission reuses the readiness report and reads the primary once.
+        assert_eq!(state["last_observation"]["ledger"], 700);
+    }
 
     #[test]
     fn submission_error_wire_guard_timeout() {
@@ -1710,6 +2002,7 @@ mod tests {
                 &client,
                 None,
                 stellar_agent_core::timefmt::now_unix_ms().unwrap(),
+                None,
             )
             .await;
         };

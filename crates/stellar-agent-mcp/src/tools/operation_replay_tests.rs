@@ -603,16 +603,144 @@ async fn a_retained_claim_replays_after_its_predicate_expires() {
     );
     assert_eq!(Effects::of(&run.f), before);
 
+    let fresh = fresh_business_id();
+    let pass_from = stellar_agent_network::mainnet::clock::now_ms().unwrap();
     let other = wire(
         &Tool::Claim
-            .prepare(&run.f.server, &prepare_args(&run, &fresh_business_id()))
+            .prepare(&run.f.server, &prepare_args(&run, &fresh))
             .await,
     );
+    let pass_to = stellar_agent_network::mainnet::clock::now_ms().unwrap();
     assert_eq!(
         other["error"]["code"], "claim.predicate_not_satisfied",
         "{other}"
     );
-    assert_eq!(Effects::of(&run.f), before, "no record opens");
+    let after = Effects::of(&run.f);
+    assert_eq!(after.seed_reads, before.seed_reads);
+    assert_eq!(after.authorizations, before.authorizations);
+    assert_eq!(
+        after.audit, before.audit,
+        "the recovery state appends no row"
+    );
+    assert_only_recovery_state_changes(
+        &after.operations,
+        &before.operations,
+        &fresh,
+        pass_from..=pass_to,
+    );
+}
+
+/// A call under the fresh id `fresh` refuses after the reconciliation pass.
+/// That pass evaluates the stored attempt, which waits in
+/// `sent_outcome_unknown` with no sequence release.
+///
+/// No record or tombstone opens and the record count stays. The whole
+/// operations object keeps its earlier value apart from the stored attempt's
+/// recovery state, which is its first. The fixture's ledger pages hold no
+/// entries, so the state is `evidence_pending` with detail
+/// `malformed_history`. Both cursors stay at the attempt's lower bound,
+/// ledger 100, and the pass time falls inside `pass_ms`.
+fn assert_only_recovery_state_changes(
+    after: &Value,
+    before: &Value,
+    fresh: &str,
+    pass_ms: std::ops::RangeInclusive<u64>,
+) {
+    assert_only_stored_recovery_changes(after, before, fresh, pass_ms, 100);
+}
+
+/// The check of [`assert_only_recovery_state_changes`] with the attempt's
+/// lower bound `cursor`.
+fn assert_only_stored_recovery_changes(
+    after: &Value,
+    before: &Value,
+    fresh: &str,
+    pass_ms: std::ops::RangeInclusive<u64>,
+    cursor: u64,
+) {
+    let count = |operations: &Value| operations["records"].as_array().map(Vec::len);
+    assert_eq!(count(after), count(before), "the record count stays");
+    for section in ["records", "tombstones"] {
+        assert!(
+            after[section]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .all(|entry| entry["business_id"] != fresh),
+            "nothing opens under {fresh} in {section}"
+        );
+    }
+    assert!(
+        before["records"][0]["attempts"][0]
+            .get("recovery")
+            .is_none()
+    );
+    let mut unchanged = after.clone();
+    let mut recovery = unchanged["records"][0]["attempts"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("recovery")
+        .unwrap();
+    assert_eq!(
+        &unchanged, before,
+        "only the stored attempt's recovery state changes"
+    );
+    let pass_at = recovery
+        .as_object_mut()
+        .unwrap()
+        .remove("last_pass_at_ms")
+        .and_then(|value| value.as_u64())
+        .unwrap();
+    assert!(pass_ms.contains(&pass_at), "{pass_at} in {pass_ms:?}");
+    assert_eq!(
+        recovery,
+        json!({
+            "diagnostic": {"text": "malformed_history"},
+            "disagreements": 0,
+            "last_outcome": "evidence_pending",
+            "primary_cursor": cursor,
+            "witness_cursor": cursor,
+        })
+    );
+}
+
+/// The recovery check refuses a tombstone under the fresh id, a changed
+/// tombstone under another id and a changed record field; the designed
+/// change alone passes.
+#[test]
+fn the_recovery_check_refuses_every_change_outside_the_recovery_state() {
+    let before = json!({
+        "records": [{"business_id": "stored", "state": "sent_outcome_unknown", "attempts": [{"index": 1}]}],
+        "tombstones": [{"business_id": "old", "state": "succeeded"}],
+    });
+    let mut after = before.clone();
+    after["records"][0]["attempts"][0]["recovery"] = json!({
+        "diagnostic": {"text": "malformed_history"},
+        "disagreements": 0,
+        "last_outcome": "evidence_pending",
+        "last_pass_at_ms": 5,
+        "primary_cursor": 7,
+        "witness_cursor": 7,
+    });
+    let check = |after: &Value| {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            assert_only_stored_recovery_changes(after, &before, "fresh", 0..=10, 7);
+        }))
+        .is_ok()
+    };
+    assert!(check(&after));
+    let mut fresh_tombstone = after.clone();
+    fresh_tombstone["tombstones"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"business_id": "fresh", "state": "failed"}));
+    let mut changed_tombstone = after.clone();
+    changed_tombstone["tombstones"][0]["state"] = json!("failed");
+    let mut changed_record = after.clone();
+    changed_record["records"][0]["state"] = json!("failed");
+    for altered in [fresh_tombstone, changed_tombstone, changed_record] {
+        assert!(!check(&altered), "{altered}");
+    }
 }
 
 /// A retry while the first commit waits for its send to answer finds the

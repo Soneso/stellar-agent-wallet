@@ -459,6 +459,7 @@ where
         &rpc_client,
         crate::commands::submission_record::settlement_oracle(&profile).as_ref(),
         now_ms,
+        None,
     )
     .await;
 
@@ -1353,6 +1354,7 @@ where
         &client,
         crate::commands::submission_record::settlement_oracle_in(profile, &net_context).as_ref(),
         now_ms,
+        args.business_id.as_deref(),
     )
     .await;
 

@@ -53,6 +53,7 @@ enum Row {
     Required,
     Testnet,
     Ceremony,
+    Delayed,
 }
 
 /// What a run asks for.
@@ -103,6 +104,10 @@ impl Verb {
             (Row::Ceremony, Self::Claim) => "ceremony-claim",
             (Row::Ceremony, Self::CreateAccount) => "ceremony-create",
             (Row::Ceremony, Self::Trustline) => "ceremony-trustline",
+            (Row::Delayed, Self::Pay) => "delayed-pay",
+            (Row::Delayed, Self::Claim) => "delayed-claim",
+            (Row::Delayed, Self::CreateAccount) => "delayed-create",
+            (Row::Delayed, Self::Trustline) => "delayed-trustline",
         }
     }
 
@@ -464,9 +469,12 @@ async fn a_claim_rerun_after_its_balance_left_replays_the_stored_claim() {
     assert_eq!(retried.code, replay_exit_code_of(&stored));
     assert_eq!(Effects::of(&fixture).await, before);
 
+    let fresh = fresh_business_id();
+    let pass_from = stellar_agent_network::mainnet::clock::now_ms().unwrap();
     let other = Verb::Claim
-        .run(&fixture, Some(&fresh_business_id()), Intent::Default, false)
+        .run(&fixture, Some(&fresh), Intent::Default, false)
         .await;
+    let pass_to = stellar_agent_network::mainnet::clock::now_ms().unwrap();
     assert_eq!(other.code, 1, "{}", other.envelope);
     assert_eq!(
         other.error_code(),
@@ -476,7 +484,125 @@ async fn a_claim_rerun_after_its_balance_left_replays_the_stored_claim() {
     );
     assert_eq!(fixture.ceremonies().len(), before.ceremonies);
     assert_eq!(fixture.sent_envelopes().await.len(), before.sent);
-    assert_eq!(operations(&fixture), before.operations, "no record opens");
+    assert_only_recovery_state_changes(
+        &operations(&fixture),
+        &before.operations,
+        &fresh,
+        pass_from..=pass_to,
+    );
+}
+
+/// A run under the fresh id `fresh` refuses after the reconciliation pass.
+/// That pass evaluates the stored attempt, which waits in
+/// `sent_outcome_unknown` with no sequence release.
+///
+/// No record or tombstone opens and the record count stays. The whole
+/// operations object keeps its earlier value apart from the stored attempt's
+/// recovery state, which is its first. The fixture's ledger pages hold no
+/// entries, so the state is `evidence_pending` with detail
+/// `malformed_history`. Both cursors stay at the attempt's lower bound,
+/// ledger 2000, and the pass time falls inside `pass_ms`.
+fn assert_only_recovery_state_changes(
+    after: &Value,
+    before: &Value,
+    fresh: &str,
+    pass_ms: std::ops::RangeInclusive<u64>,
+) {
+    assert_only_stored_recovery_changes(after, before, fresh, pass_ms, 2000);
+}
+
+/// The check of [`assert_only_recovery_state_changes`] with the attempt's
+/// lower bound `cursor`.
+fn assert_only_stored_recovery_changes(
+    after: &Value,
+    before: &Value,
+    fresh: &str,
+    pass_ms: std::ops::RangeInclusive<u64>,
+    cursor: u64,
+) {
+    let count = |operations: &Value| operations["records"].as_array().map(Vec::len);
+    assert_eq!(count(after), count(before), "the record count stays");
+    for section in ["records", "tombstones"] {
+        assert!(
+            after[section]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .all(|entry| entry["business_id"] != fresh),
+            "nothing opens under {fresh} in {section}"
+        );
+    }
+    assert!(
+        before["records"][0]["attempts"][0]
+            .get("recovery")
+            .is_none()
+    );
+    let mut unchanged = after.clone();
+    let mut recovery = unchanged["records"][0]["attempts"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("recovery")
+        .unwrap();
+    assert_eq!(
+        &unchanged, before,
+        "only the stored attempt's recovery state changes"
+    );
+    let pass_at = recovery
+        .as_object_mut()
+        .unwrap()
+        .remove("last_pass_at_ms")
+        .and_then(|value| value.as_u64())
+        .unwrap();
+    assert!(pass_ms.contains(&pass_at), "{pass_at} in {pass_ms:?}");
+    assert_eq!(
+        recovery,
+        json!({
+            "diagnostic": {"text": "malformed_history"},
+            "disagreements": 0,
+            "last_outcome": "evidence_pending",
+            "primary_cursor": cursor,
+            "witness_cursor": cursor,
+        })
+    );
+}
+
+/// The recovery check refuses a tombstone under the fresh id, a changed
+/// tombstone under another id and a changed record field; the designed
+/// change alone passes.
+#[test]
+fn the_recovery_check_refuses_every_change_outside_the_recovery_state() {
+    let before = json!({
+        "records": [{"business_id": "stored", "state": "sent_outcome_unknown", "attempts": [{"index": 1}]}],
+        "tombstones": [{"business_id": "old", "state": "succeeded"}],
+    });
+    let mut after = before.clone();
+    after["records"][0]["attempts"][0]["recovery"] = json!({
+        "diagnostic": {"text": "malformed_history"},
+        "disagreements": 0,
+        "last_outcome": "evidence_pending",
+        "last_pass_at_ms": 5,
+        "primary_cursor": 7,
+        "witness_cursor": 7,
+    });
+    let check = |after: &Value| {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            assert_only_stored_recovery_changes(after, &before, "fresh", 0..=10, 7);
+        }))
+        .is_ok()
+    };
+    assert!(check(&after));
+    let mut fresh_tombstone = after.clone();
+    fresh_tombstone["tombstones"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"business_id": "fresh", "state": "failed"}));
+    let mut changed_tombstone = after.clone();
+    changed_tombstone["tombstones"][0]["state"] = json!("failed");
+    let mut changed_record = after.clone();
+    changed_record["records"][0]["state"] = json!("failed");
+    for altered in [fresh_tombstone, changed_tombstone, changed_record] {
+        assert!(!check(&altered), "{altered}");
+    }
 }
 
 /// An endpoint holding the agent's claimable balance, whose claimant
@@ -564,9 +690,12 @@ async fn claim_replays_its_business_id_after_the_predicate_expires() {
     );
     assert_eq!(Effects::of(&fixture).await, before);
 
+    let fresh = fresh_business_id();
+    let pass_from = stellar_agent_network::mainnet::clock::now_ms().unwrap();
     let other = Verb::Claim
-        .run(&fixture, Some(&fresh_business_id()), Intent::Default, false)
+        .run(&fixture, Some(&fresh), Intent::Default, false)
         .await;
+    let pass_to = stellar_agent_network::mainnet::clock::now_ms().unwrap();
     assert_eq!(other.code, 1, "{}", other.envelope);
     assert_eq!(
         other.error_code(),
@@ -575,7 +704,12 @@ async fn claim_replays_its_business_id_after_the_predicate_expires() {
         other.envelope
     );
     assert_eq!(fixture.ceremonies().len(), before.ceremonies);
-    assert_eq!(operations(&fixture), before.operations, "no record opens");
+    assert_only_recovery_state_changes(
+        &operations(&fixture),
+        &before.operations,
+        &fresh,
+        pass_from..=pass_to,
+    );
 }
 
 /// The exit code a replay of the stored record `stored` returns.
@@ -695,5 +829,48 @@ fn replay_exit_codes_follow_the_state() {
         };
         let expected = i32::from(state != OperationState::Succeeded);
         assert_eq!(replay_exit_code(&view), expected, "{state:?}");
+    }
+}
+
+/// A replay runs no recovery stage at any age of the stored attempt. The run
+/// stores a time bound 120 seconds ahead. A replay 61 seconds later and one
+/// past the bound each send both endpoints the base requests of a replay.
+#[tokio::test(flavor = "current_thread")]
+#[serial_test::serial]
+async fn a_delayed_replay_runs_no_recovery_stage() {
+    for verb in Verb::ALL {
+        let fixture = verb.mainnet(Row::Delayed).await;
+        let id = fresh_business_id();
+        let started_ms = stellar_agent_network::mainnet::clock::now_ms().unwrap();
+        let first = verb.run(&fixture, Some(&id), Intent::Default, false).await;
+        assert_eq!(first.code, 0, "{verb:?}: {}", first.envelope);
+        let stored = record(&fixture, &id);
+        let max_time = stored["attempts"][0]["exposure"]["identity"]["classic"]["max_time"]
+            .as_u64()
+            .unwrap();
+        assert!(
+            max_time.abs_diff(started_ms / 1_000 + 120) <= 5,
+            "{verb:?}: {max_time}"
+        );
+        // One replay inside the bound, then one past it.
+        for delay_ms in [61_000, 200_000] {
+            let requests = (
+                fixture.primary_methods().await.len(),
+                fixture.oracle_methods().await.len(),
+            );
+            let _clock =
+                stellar_agent_network::mainnet::clock::set_now_ms_for_test(started_ms + delay_ms);
+            verb.run(&fixture, Some(&id), Intent::Default, false).await;
+            assert_eq!(
+                fixture.primary_methods().await[requests.0..],
+                methods_before_lookup(verb),
+                "{verb:?} after {delay_ms} ms: the primary sees a replay's base requests"
+            );
+            assert!(
+                fixture.oracle_methods().await[requests.1..].is_empty(),
+                "{verb:?} after {delay_ms} ms: the oracle sees no request"
+            );
+            assert_eq!(record(&fixture, &id), stored, "{verb:?}: no recovery state");
+        }
     }
 }

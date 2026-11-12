@@ -126,6 +126,8 @@ pub(crate) fn build_recorder<'a>(
             now_ms: record.now_ms,
             provenance: None,
             operation: None,
+            pre_exposure_ledger: None,
+            observation: None,
         },
         receipts,
         Some(sizing),
@@ -271,6 +273,7 @@ impl<'a> PreparedRecorder<'a> {
         witness: Option<&'a stellar_agent_network::cross_check::CrossCheckWitness>,
         operation: Option<stellar_agent_network::OperationAttempt>,
         request_id: String,
+        observation: stellar_agent_network::policy_state::SubmissionObservation,
     ) -> StageMarkedRecorder<'a> {
         let record = self.record;
         let recorder = WalletSubmissionRecorder::new_authorized(
@@ -291,7 +294,9 @@ impl<'a> PreparedRecorder<'a> {
         .with_sequence_floor(floor)
         .with_approval(self.approval)
         .with_witness(witness)
-        .with_operation(operation);
+        .with_operation(operation)
+        .with_pre_exposure_ledger(observation.pre_exposure_ledger)
+        .with_observation(observation.observation);
         // Both authority variants record the governing decision's provenance.
         StageMarkedRecorder::new(match record.provenance {
             Some(provenance) => recorder.with_provenance(provenance),
@@ -392,6 +397,13 @@ pub(crate) async fn sign_and_submit_classic(
         // the send; a client that cannot be built refuses before the signer
         // loads.
         let oracle = guard.context.oracle_client().map_err(render)?;
+        let observation = stellar_agent_network::policy_state::submission_observation(
+            client,
+            oracle.as_ref(),
+            None,
+            stellar_agent_network::operational::readiness_deadline(),
+        )
+        .await;
         let signer = server.mainnet_enrolled_signer(guard).map_err(render)?;
         let handle = stellar_agent_network::keyring::lazy_signer_from_keyring(
             signer.seed_entry(),
@@ -469,7 +481,14 @@ pub(crate) async fn sign_and_submit_classic(
                 return Err(render(error));
             }
         };
-        let recorder = prepared.build(&authorization, floor, witness, attempt, request_id.clone());
+        let recorder = prepared.build(
+            &authorization,
+            floor,
+            witness,
+            attempt,
+            request_id.clone(),
+            observation,
+        );
         let result = submit_authorized_transaction_and_wait(
             client,
             oracle.as_ref(),
@@ -723,6 +742,93 @@ mod tests {
     use stellar_agent_network::policy_state::{DeliveryReport, ReconcileReport};
     use stellar_agent_network::submission_flow::{ReconcilePass, finish_reconciliation};
     use stellar_agent_network::{envelope_hash_hex, submission_flow::submission_details};
+
+    #[cfg(feature = "mainnet-write")]
+    #[tokio::test]
+    #[serial_test::serial(keyring)]
+    async fn recovery_mcp_build_stores_the_minimum_bound_or_none() {
+        use crate::tools::common::tests::mainnet::{ClassicRun, Tool, ledger, mount_rpc};
+        use wiremock::MockServer;
+        for oracle_ledger in [Some(90_u32), Some(110), None] {
+            let mut run = ClassicRun::allowed(Tool::Pay).await;
+            let primary = MockServer::start().await;
+            let oracle = MockServer::start().await;
+            mount_rpc(&run.f, &primary).await;
+            mount_rpc(&run.f, &oracle).await;
+            mount_oracle_ledger(&oracle, oracle_ledger).await;
+            run.f.server = crate::server::WalletServer::new_with_selection_and_routes_for_test(
+                (*run.f.server.profile).clone(),
+                stellar_agent_core::profile::name::ProfileNameSource::Flag,
+                &stellar_agent_core::profile::schema::default_profile_dir().unwrap(),
+                &[
+                    ("rpc.example.invalid", &primary.uri()),
+                    ("oracle.example.invalid", &oracle.uri()),
+                ],
+            )
+            .unwrap();
+            let result = run.commit().await;
+            assert_eq!(result["ok"], true, "{result}");
+            let state = ledger(&run.f).unwrap();
+            let exposure = &state["operations"]["records"][0]["attempts"][0];
+            assert_eq!(
+                exposure["pre_exposure_ledger"],
+                serde_json::json!(oracle_ledger.map(|value| value.min(100)))
+            );
+            assert_eq!(state["last_observation"]["ledger"], 100);
+        }
+    }
+
+    /// Mounts an oracle at `latest`, or a failing one for `None`. Its
+    /// `getLedgers` refuses a start beyond `latest`, as an RPC endpoint does.
+    #[cfg(feature = "mainnet-write")]
+    async fn mount_oracle_ledger(oracle: &wiremock::MockServer, latest: Option<u32>) {
+        use wiremock::{Mock, ResponseTemplate, matchers::body_partial_json};
+        let answer = move |request: &wiremock::Request, result: serde_json::Value| {
+            let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({"jsonrpc":"2.0", "id":body["id"], "result":result}),
+            )
+        };
+        Mock::given(body_partial_json(
+            serde_json::json!({"method":"getLatestLedger"}),
+        ))
+        .respond_with(move |request: &wiremock::Request| {
+            let Some(latest) = latest else {
+                return ResponseTemplate::new(500);
+            };
+            answer(
+                request,
+                serde_json::json!({"id":"00".repeat(32), "protocolVersion":23, "sequence":latest}),
+            )
+        })
+        .with_priority(1)
+        .mount(oracle)
+        .await;
+        Mock::given(body_partial_json(serde_json::json!({"method":"getLedgers"})))
+            .respond_with(move |request: &wiremock::Request| {
+                let Some(latest) = latest else {
+                    return ResponseTemplate::new(500);
+                };
+                let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                if body["params"]["startLedger"].as_u64() > Some(u64::from(latest)) {
+                    return ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "jsonrpc":"2.0", "id":body["id"],
+                        "error":{"code":-32600, "message":"startLedger must be at most the latest ledger"}
+                    }));
+                }
+                answer(
+                    request,
+                    serde_json::json!({
+                        "latestLedger":latest, "oldestLedger":1,
+                        "latestLedgerCloseTime":(stellar_agent_core::timefmt::now_unix_ms().unwrap()/1000).to_string(),
+                        "oldestLedgerCloseTime":1, "cursor":latest.to_string(), "ledgers":[]
+                    }),
+                )
+            })
+            .with_priority(1)
+            .mount(oracle)
+            .await;
+    }
 
     #[test]
     fn submission_error_wire_guard_timeout() {

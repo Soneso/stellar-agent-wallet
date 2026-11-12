@@ -584,6 +584,7 @@ pub async fn run(args: &ExecuteArgs) -> i32 {
             &reconcile_client,
             crate::commands::submission_record::settlement_oracle(&profile).as_ref(),
             now_ms,
+            None,
         )
         .await;
     }

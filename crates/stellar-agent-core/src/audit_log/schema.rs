@@ -804,6 +804,27 @@ pub struct OperationEvidenceRow {
     pub digest: String,
     /// The ledger the endpoint reported for the observation.
     pub observed_ledger: u32,
+    /// The endpoint and answer kind, when the writer records them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<EvidenceKind>,
+}
+
+/// The endpoint and answer kind of recovery evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvidenceKind {
+    /// The primary endpoint's transaction answer.
+    PrimaryOutcome,
+    /// The oracle's transaction answer.
+    OracleOutcome,
+    /// The primary endpoint's ledger answer.
+    PrimaryLedger,
+    /// The oracle's ledger answer.
+    OracleLedger,
+    /// The primary endpoint's account answer.
+    PrimaryAccount,
+    /// The oracle's account answer.
+    OracleAccount,
 }
 
 /// One leg of a value-moving action, in audit-wire form.
@@ -3995,6 +4016,30 @@ impl std::fmt::Display for TipAnchorReason {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::panic, reason = "test-only")]
     use super::*;
+
+    #[test]
+    fn evidence_row_kind_is_optional_and_old_rows_keep_their_bytes() {
+        use sha2::{Digest, Sha256};
+        let bytes = br#"{"evidence_seq":1,"digest":"abcd","observed_ledger":42}"#;
+        let row: OperationEvidenceRow = serde_json::from_slice(bytes).unwrap();
+        assert_eq!(row.kind, None);
+        let encoded = serde_json::to_vec(&row).unwrap();
+        assert_eq!(encoded, bytes);
+        assert_eq!(Sha256::digest(&encoded), Sha256::digest(bytes));
+        let row = OperationEvidenceRow {
+            kind: Some(EvidenceKind::PrimaryLedger),
+            ..row
+        };
+        assert_eq!(
+            serde_json::to_value(&row).unwrap()["kind"],
+            "primary_ledger"
+        );
+        assert_eq!(
+            serde_json::from_slice::<OperationEvidenceRow>(&serde_json::to_vec(&row).unwrap())
+                .unwrap(),
+            row
+        );
+    }
 
     /// A stored decimal that fails its parse is named by the rule alone.
     #[test]

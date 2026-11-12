@@ -33,6 +33,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   It reads the origin and pin from an unsigned bootstrap policy body and serves the page over TLS from the explicit `[remote_approval]` paths.
   A single-use eight-digit enrollment code opens the page session, and the page's confirmation code at the terminal exports the entry.
   The signed consent listener serves no enrollment helper page.
+- Mainnet recovery releases expired source sequences on fresh two-endpoint
+  ledger evidence while retaining each operation's unknown outcome and budget
+  hold.
 - `scripts/deploy/` holds the scripts that run the mainnet wallet as a
   dedicated `stellar-agent` account with its platform keyring. They are a root
   bootstrap, three `sudo -u` wrappers, a sudoers source, and one validation

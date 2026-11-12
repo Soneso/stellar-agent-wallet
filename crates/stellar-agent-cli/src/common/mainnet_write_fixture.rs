@@ -285,6 +285,12 @@ impl Spec {
         self
     }
 
+    /// Sets the signed policy's authorization lifetime in seconds.
+    pub(crate) fn authorization_ttl(mut self, seconds: i64) -> Self {
+        self.authorization_ttl_seconds = seconds;
+        self
+    }
+
     /// Stops the ceremony before `profile enable-mainnet`, so the signed
     /// policy has no `[mainnet]` table.
     pub(crate) fn pre_enable(mut self) -> Self {
