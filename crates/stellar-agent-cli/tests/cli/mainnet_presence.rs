@@ -13,9 +13,12 @@
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use serial_test::serial;
+#[cfg(feature = "test-helpers")]
 use std::io::Write as _;
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::Command;
+#[cfg(feature = "test-helpers")]
+use std::process::Stdio;
 use std::sync::Arc;
 use stellar_agent_core::{
     approval::{
@@ -245,6 +248,7 @@ fn mainnet_home(home: &std::path::Path) -> (Profile, String) {
 
 /// Runs `approve --id <nonce> --profile <NAME>` with `extra` arguments and
 /// `typed` on stdin, and returns the exit code, the envelope and stderr.
+#[cfg(feature = "test-helpers")]
 fn approve(
     home: &std::path::Path,
     nonce: &str,

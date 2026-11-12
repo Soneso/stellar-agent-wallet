@@ -153,6 +153,11 @@ Add its exported entry to the complete policy body, then use `provision policy-i
 For a signed origin, first use `provision remote-config`, `remote-cert`, and `remote-key`.
 Install the unsigned bootstrap policy with `approval_origin` and `approval_cert_spki_sha256` together.
 Run `cli-launch approve credential enroll --origin-from-installed`.
+The wrapper runs `approve credential enroll --origin-from <installed policy file>` in the provisioning tier.
+The command reads the unsigned bootstrap body without a signature check and loads the explicit TLS paths before it binds.
+The approving device must trust the certificate through a public CA or an installed private CA.
+Open the printed URL there and type the enrollment code from the terminal.
+Then type the page's confirmation code at the terminal before the timeout; only that exports the entry.
 Add the exported entry and install the complete policy body again.
 
 Finish either order with `provision profile sign-policy` for the binding-free body,

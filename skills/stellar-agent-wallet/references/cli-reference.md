@@ -1300,6 +1300,7 @@ Stdout remains one JSON envelope. The token is single-use; keep stderr private.
 | Flag | Meaning |
 |---|---|
 | `--open-by-operator` | Prints the local mainnet enrollment URL once on stderr, with no browser launch or private handoff. |
+| `--origin-from <PATH>` | Enrolls at the signed approval origin of an unsigned policy body; conflicts with `--open-by-operator` |
 | `--profile <NAME>` | Required. The persisted mainnet profile |
 | `--label <LABEL>` | Page label pre-fill; absent from the output |
 | `--timeout-seconds <SECS>` | Deadline for registration and code, 1 to 600 (default 300) |
@@ -1312,7 +1313,23 @@ stellar-agent approve credential enroll --profile operator --label laptop
 {"ok":true,"data":{"profile":"operator","rp_id":"localhost","credential_id_b64url":"<id>","public_key_sec1_b64url":"<key>","credential_fingerprint":"sha256:<hex>","policy_entry_toml":"{ credential_id_b64url = \"<id>\", public_key_sec1_b64url = \"<key>\" }"},"request_id":"..."}
 ```
 
-Refusals (exit `1`, nothing exported): `approve.credential_enroll_tty_required`, `approve.credential_enroll_profile_required`, `approval.presence_browser_required` (no display or the browser did not open), `approve.credential_enroll_confirmation_mismatch`, `approve.credential_enroll_expired`, `approve.credential_enroll_canceled`, `approve.credential_enroll_unavailable`. This is an operator command: an agent never enrolls a credential or approves its own request. To revoke an approval credential, remove its policy entry and sign the policy at a higher sequence.
+Signed-origin mode: `--origin-from <PATH>` reads an unsigned bootstrap policy body, installed or not, with `approval_origin` and `approval_cert_spki_sha256` together.
+It validates the body as `profile policy-check` does, checks no signature and needs no approval credential.
+The origin supplies the page origin, its host the RP ID, and the pin the expected leaf certificate.
+The profile needs an enabled `[remote_approval]` table with the signed host as `rp_id` and explicit `cert_path` and `key_path`.
+The command loads and pins the TLS pair before it binds and never generates a certificate.
+The approving device must trust the certificate through a public CA or an installed private CA.
+Stderr shows `Open this URL in your browser: <signed-origin>/enroll` and an eight-digit enrollment code; the URL carries no secret.
+The enrollment code opens the page session once, admits five attempts and lives the timeout, at most 600 seconds.
+The page's confirmation code still goes to the terminal, and only that match exports the entry with `rp_id` set to the signed host.
+This mode needs no display or browser opener; it still needs a terminal.
+Enrollment is a provisioning-tier step, like the `[remote_approval]` setup, and never runs as a runtime service.
+
+```bash
+stellar-agent approve credential enroll --origin-from bootstrap.toml --profile mainnet
+```
+
+Refusals (exit `1`, nothing exported): `approve.credential_enroll_tty_required`, `approve.credential_enroll_profile_required`, `approval.presence_browser_required` (no display, or the browser does not open), `approve.credential_enroll_confirmation_mismatch`, `approve.credential_enroll_expired`, `approve.credential_enroll_canceled`, `approve.credential_enroll_unavailable`. Signed-origin mode adds `approve.credential_enroll_code_exhausted` for the enrollment code attempt limit. It adds `approve.credential_enroll_origin_missing` when the body lacks `approval_origin` and `approval_cert_spki_sha256`. Signed-origin startup keeps `policy.*`, `approval.origin_profile_mismatch`, `approval.listener_busy`, `approval.cert_pin_mismatch`, `approve.remote_tls_unavailable`, and `internal.unexpected_state` with `approve.remote_not_configured`. This is an operator command: an agent never enrolls a credential or approves its own request. To revoke an approval credential, remove its policy entry and sign the policy at a higher sequence.
 
 ---
 

@@ -60,8 +60,9 @@ p256 = { workspace = true, optional = true, features = ["pkcs8"] }
 # Exposes the software-authenticator test helper (p256 keypair signing
 # authenticatorData || SHA-256(clientDataJSON)) to produce valid and
 # adversarial WebAuthn assertions in tests, without a real platform
-# authenticator. Never compiled into a production binary.
-test-helpers = ["dep:p256"]
+# authenticator. Never compiled into a production binary. It also enables the
+# enrollment test inspection of the approval UI crate.
+test-helpers = ["dep:p256", "stellar-agent-approval-ui/test-helpers"]
 # Gate end-to-end testnet acceptance tests that require a live Friendbot +
 # RPC, a headless Chromium, and TLS-terminated loopback HTTP. NOT run under
 # default `cargo test`; invoke with:

@@ -84,8 +84,8 @@ fn json_data_island(value: &serde_json::Value) -> String {
 /// # Parameters
 ///
 /// - `profile`: the wallet profile this credential is being enrolled for,
-///   shown for operator orientation only — it plays no role in the
-///   credential itself (which is always recorded with `rp_id: "localhost"`).
+///   shown for operator orientation only; it plays no role in the
+///   credential itself, which is recorded with `rp_id`.
 /// - `csrf_hex`: the 64-character hex-encoded session CSRF token the page
 ///   echoes back in the `X-Stellar-Approval-CSRF` header on
 ///   `POST /enroll/challenge` and `POST /enroll/credential`.
@@ -96,13 +96,16 @@ fn json_data_island(value: &serde_json::Value) -> String {
 ///   from which the page derives its confirmation-code domain and session
 ///   proof key; the heading and the closing note name what the credential is
 ///   for.
+/// - `rp_id`: the relying-party ID the page names and registers for.
+/// - `signed_origin`: the signed HTTPS origin the page runs at, or `None`
+///   on loopback. The page names it in place of the loopback trust line.
 ///
 /// # rp-id binding
 ///
 /// A WebAuthn credential is bound to its `rp.id` at creation time, and a
 /// loopback HTTP origin can only claim `"localhost"` as an effective domain
-/// (WebAuthn Level 2 §5.1.3) — this server therefore always registers
-/// against `"localhost"`; there is no rp-id override.
+/// (WebAuthn Level 2 §5.1.3). A loopback server therefore registers against
+/// `"localhost"`, and a signed-origin server against the signed host.
 #[must_use]
 pub(super) fn render_enroll_page(
     profile: &str,
@@ -110,8 +113,12 @@ pub(super) fn render_enroll_page(
     label_prefill: Option<&str>,
     identity: &PageIdentity,
     purpose: EnrollmentPurpose,
+    rp_id: &str,
+    signed_origin: Option<&str>,
 ) -> String {
     let profile_escaped = html_escape(profile);
+    let rp_id_escaped = html_escape(rp_id);
+    let trust_line = trust_line(signed_origin);
     let (heading, note) = match purpose {
         EnrollmentPurpose::RemoteOperator => (
             "Enroll operator passkey",
@@ -137,7 +144,7 @@ pub(super) fn render_enroll_page(
         .map(|l| format!(r#" value="{}""#, html_escape(l)))
         .unwrap_or_default();
     let data_island = json_data_island(&serde_json::json!({
-        "rpId": "localhost",
+        "rpId": rp_id,
         "profile": profile,
         "csrfToken": csrf_hex,
     }));
@@ -157,7 +164,7 @@ pub(super) fn render_enroll_page(
 {card_header}
       <h1>{heading}</h1>
       <p class="lead">Profile <code class="chip">{profile_escaped}</code>, registering
-         against <code class="chip">localhost</code>. Name this device, confirm
+         against <code class="chip">{rp_id_escaped}</code>. Name this device, confirm
          with Touch&nbsp;ID, Windows&nbsp;Hello, or your security key, then type
          the code this page shows at the terminal that started the enrollment.</p>
       <div class="field">
@@ -168,11 +175,69 @@ pub(super) fn render_enroll_page(
       <p class="confirmation-code" id="confirmation-code" hidden></p>
       <button class="enroll-btn" id="enroll-btn" type="button">Create passkey</button>
       <p class="help">{note}</p>
-{TRUST_LINE_LOOPBACK}
+{trust_line}
     </div>
   </main>
   <script type="application/json" id="enroll-data" data-purpose="{purpose_value}">{data_island}</script>
   <script src="/static/operator-enroll.js"></script>
+</body>
+</html>"#
+    )
+}
+
+/// The page's trust line: the loopback line on loopback, and a line naming
+/// `signed_origin` at a signed origin.
+fn trust_line(signed_origin: Option<&str>) -> String {
+    match signed_origin {
+        None => TRUST_LINE_LOOPBACK.to_owned(),
+        Some(origin) => format!(
+            r#"      <div class="foot">Served by your wallet at <code>{}</code>, the approval origin of this profile's policy.</div>"#,
+            html_escape(origin)
+        ),
+    }
+}
+
+/// Renders the enrollment code form a signed-origin ceremony serves at
+/// `GET /enroll` before a session exists.
+///
+/// The page carries no secret and no data island. Its script,
+/// `/static/operator-enroll-code.js`, posts the typed code to
+/// `POST /enroll/code` with fetch, since the CSP sets `form-action 'none'`.
+#[must_use]
+pub(super) fn render_code_page(profile: &str, origin: &str, identity: &PageIdentity) -> String {
+    let heading = "Enter the enrollment code";
+    let title = identity.page_title(heading);
+    let card_header = identity.card_header_html();
+    let profile_escaped = html_escape(profile);
+    let trust_line = trust_line(Some(origin));
+    format!(
+        r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="referrer" content="no-referrer">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{title}</title>
+  <style>{BRAND_STYLE}{ENROLL_STYLE}</style>
+</head>
+<body>
+  <main class="page">
+    <div class="card">
+{card_header}
+      <h1>{heading}</h1>
+      <p class="lead">Profile <code class="chip">{profile_escaped}</code>. Type the
+         eight-digit enrollment code the terminal shows. The code works once,
+         admits five attempts and expires with the enrollment.</p>
+      <div class="field">
+        <label for="code-input">Enrollment code</label>
+        <input type="text" id="code-input" maxlength="8" inputmode="numeric" autocomplete="off">
+      </div>
+      <div class="status" id="status">Enter the code from the terminal.</div>
+      <button class="enroll-btn" id="code-btn" type="button">Continue</button>
+{trust_line}
+    </div>
+  </main>
+  <script src="/static/operator-enroll-code.js"></script>
 </body>
 </html>"#
     )
@@ -191,6 +256,65 @@ mod tests {
         reason = "test-only; panics acceptable in unit tests"
     )]
     use super::*;
+
+    /// The loopback page, as a loopback server renders it.
+    fn render_enroll_page(
+        profile: &str,
+        csrf_hex: &str,
+        label_prefill: Option<&str>,
+        identity: &PageIdentity,
+        purpose: EnrollmentPurpose,
+    ) -> String {
+        super::render_enroll_page(
+            profile,
+            csrf_hex,
+            label_prefill,
+            identity,
+            purpose,
+            "localhost",
+            None,
+        )
+    }
+
+    /// Both signed-origin pages name the signed origin and the signed host,
+    /// and neither carries the loopback trust line.
+    #[test]
+    fn signed_enrollment_page_names_the_signed_origin() {
+        const SIGNED: &str = "https://approve.example.invalid:8443";
+        let registration = super::render_enroll_page(
+            "main",
+            &"c".repeat(64),
+            None,
+            &neutral(),
+            EnrollmentPurpose::MainnetApproval,
+            "approve.example.invalid",
+            Some(SIGNED),
+        );
+        let code = render_code_page("main", SIGNED, &neutral());
+        for html in [&registration, &code] {
+            assert!(html.contains(&format!("<code>{SIGNED}</code>")), "{html}");
+            assert!(!html.contains(TRUST_LINE_LOOPBACK), "{html}");
+            assert!(!html.contains("loopback"), "{html}");
+        }
+        assert_eq!(
+            parse_island(&registration)["rpId"],
+            "approve.example.invalid"
+        );
+        assert!(registration.contains(r#"<code class="chip">approve.example.invalid</code>"#));
+        assert!(!registration.contains(r#"<code class="chip">localhost</code>"#));
+        assert!(code.contains(r#"<script src="/static/operator-enroll-code.js"></script>"#));
+        assert!(code.contains(r#"id="code-input""#));
+        assert!(!code.contains("<form"));
+        assert!(!code.contains("application/json"));
+        let loopback = render_enroll_page(
+            "main",
+            &"c".repeat(64),
+            None,
+            &neutral(),
+            EnrollmentPurpose::MainnetApproval,
+        );
+        assert!(loopback.contains(TRUST_LINE_LOOPBACK));
+    }
 
     /// The identity a deployment that configured nothing serves.
     fn neutral() -> PageIdentity {

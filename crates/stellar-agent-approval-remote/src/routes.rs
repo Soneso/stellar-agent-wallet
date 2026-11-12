@@ -40,15 +40,17 @@
 //!
 //! `/static/login.js` is deliberately ungated: it runs the passkey login
 //! ceremony, which IS the authentication step, so no session can exist yet
-//! for it to run behind. `/enroll` and `/static/enroll.js` are pre-auth for
-//! the same reason: a WebAuthn credential is bound to its rp.id at creation,
-//! so enrollment must run from this origin before any session exists.
-//! `/enroll` (the page load, the only work this pre-auth surface does)
-//! shares the SAME token bucket `/login/challenge` uses — it never accepts
-//! or persists a credential; it only runs `navigator.credentials.create()`
-//! client-side and displays the result for manual entry into the
-//! loopback-only `approve operator enroll` CLI command. `/static/app.js` —
-//! the inbox, detail, and per-action ceremony glue — is gated behind the
+//! for it to run behind. On testnet, `/enroll` and `/static/enroll.js` are
+//! pre-auth for the same reason. A WebAuthn credential is bound to its rp.id
+//! at creation, so enrollment must run from this origin before any session
+//! exists. `/enroll` (the page load, the only work this pre-auth surface
+//! does) shares the SAME token bucket `/login/challenge` uses. It never
+//! accepts or persists a credential; it only runs
+//! `navigator.credentials.create()` client-side and displays the result for
+//! manual entry into the loopback-only `approve operator enroll` CLI
+//! command. The signed router mounts neither path; signed-origin enrollment
+//! runs on its own listener, [`crate::enroll_listener`].
+//! `/static/app.js`, the inbox, detail, and per-action ceremony glue, is gated behind the
 //! session cookie, mirroring the loopback approval-inbox server's own
 //! `/static/app.js` gating.
 
@@ -637,20 +639,21 @@ fn base64_url(bytes: &[u8]) -> String {
 // Handlers — enrollment helper page
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// `GET /enroll` — the passkey-enrollment helper page. No session required:
-/// a WebAuthn credential is bound to its `rp.id` at creation, so enrollment
-/// must run from this origin before any session can exist.
+/// `GET /enroll`: the testnet passkey-enrollment helper page. No session
+/// required: a WebAuthn credential is bound to its `rp.id` at creation, so
+/// enrollment must run from this origin before any session can exist. The
+/// signed router does not mount it.
 ///
 /// Shares the SAME token-bucket rate limiter `/login/challenge` uses — this
 /// is the only other pre-authentication endpoint that does real work before
 /// any WebAuthn assertion is checked.
 ///
-/// Never accepts or persists a credential: the rendered page only runs
-/// `navigator.credentials.create()` client-side (in `/static/enroll.js`) and
-/// displays the resulting credential id and public key for the operator to
-/// copy into the loopback-only `approve operator enroll` CLI command — see
-/// the crate-level "Enrollment stays loopback-only" note. There is no
-/// corresponding write endpoint on this surface.
+/// Never accepts or persists a credential. The rendered page only runs
+/// `navigator.credentials.create()` client-side (in `/static/enroll.js`).
+/// It displays the resulting credential id and public key for the operator to
+/// copy into the loopback-only `approve operator enroll` CLI command, as the
+/// crate documentation states. There is no corresponding write endpoint on
+/// this surface; signed-origin enrollment runs on [`crate::enroll_listener`].
 async fn enroll_page_get(State(state): State<RemoteServeState>) -> Response {
     let allowed = {
         let mut limiter = match state.login_rate_limiter.lock() {
@@ -3040,6 +3043,40 @@ mod tests {
     // ─────────────────────────────────────────────────────────────────────
     // Tests — enrollment helper page
     // ─────────────────────────────────────────────────────────────────────
+
+    /// The signed-origin router mounts neither enrollment helper path,
+    /// while the testnet router keeps serving both.
+    #[test]
+    #[serial]
+    fn signed_origin_listener_serves_no_enroll_helper() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let fx = fixture("enroll-signed-absent");
+            for (path, testnet_status) in [
+                ("/enroll", StatusCode::OK),
+                ("/static/enroll.js", StatusCode::OK),
+            ] {
+                let request = || {
+                    Request::builder()
+                        .method("GET")
+                        .uri(path)
+                        .body(Body::empty())
+                        .unwrap()
+                };
+                let signed = crate::layer_router(signed_router().with_state(fx.state.clone()))
+                    .oneshot(request())
+                    .await
+                    .unwrap();
+                assert_eq!(signed.status(), StatusCode::NOT_FOUND, "{path}");
+                let testnet = build_router(fx.state.ctx.decision.clone().unwrap())
+                    .with_state(fx.state.clone())
+                    .oneshot(request())
+                    .await
+                    .unwrap();
+                assert_eq!(testnet.status(), testnet_status, "{path}");
+            }
+        });
+    }
 
     #[test]
     #[serial]

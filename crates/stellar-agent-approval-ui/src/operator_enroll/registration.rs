@@ -5,15 +5,17 @@
 //! `navigator.credentials.create()` over it, and posts the credential ID, the
 //! uncompressed SEC1 public key, the label, and the authenticator's
 //! `clientDataJSON` and `attestationObject`. [`verify_operator_registration`]
-//! accepts the response only when the challenge has not expired, the label
-//! passes [`normalized_label`], and the response verifies under
-//! [`verify_registration_response`] with the issued challenge, the origin
-//! `http://localhost:<bound port>` and the relying-party ID
-//! [`REGISTRATION_RP_ID`]. The verifier's module documentation lists every
-//! rule it applies and states what a verified `none` registration does and
-//! does not establish; the operator's terminal confirmation (see
-//! [`super::PendingOperatorEnrollment::confirm`]) is what binds the
-//! credential to the operator.
+//! accepts the response only when the challenge has not expired and the
+//! label passes [`normalized_label`]. The response must also verify under
+//! [`verify_registration_response`] with the issued challenge, the page
+//! origin and the relying-party ID of the server's state. A loopback server
+//! expects `http://localhost:<bound port>` and [`REGISTRATION_RP_ID`]; a
+//! signed-origin server expects the origin and host of its unsigned policy
+//! body. The verifier's module documentation lists every rule it applies.
+//! It also states what a verified `none` registration does and does not
+//! establish. The operator's terminal confirmation (see
+//! [`super::PendingOperatorEnrollment::confirm`]) binds the credential to
+//! the operator.
 
 use std::time::{Duration, Instant};
 
@@ -28,7 +30,8 @@ use stellar_agent_core::approval::webauthn_registration::{
     decode_b64url_capped, verify_registration_response,
 };
 
-/// The relying-party ID every credential this server registers is bound to.
+/// The relying-party ID every credential a loopback server registers is
+/// bound to.
 pub(crate) const REGISTRATION_RP_ID: &str = "localhost";
 
 /// How long an issued challenge stays acceptable, on the session clock.
@@ -176,7 +179,7 @@ pub(crate) enum OperatorRegistrationError {
 }
 
 /// Verifies `request` as the response to `challenge`, produced at
-/// `expected_origin`, at `now` on the session clock.
+/// `expected_origin` for `rp_id`, at `now` on the session clock.
 ///
 /// `request.label` must pass [`normalized_label`], which also trims it; the route
 /// checks it first so that it can answer `label_invalid`.
@@ -192,6 +195,7 @@ pub(crate) fn verify_operator_registration(
     request: &EnrollCredentialRequest,
     challenge: &RegistrationChallenge,
     expected_origin: &str,
+    rp_id: &str,
     now: Instant,
 ) -> Result<VerifiedOperatorRegistration, OperatorRegistrationError> {
     use OperatorRegistrationError::Invalid;
@@ -225,7 +229,7 @@ pub(crate) fn verify_operator_registration(
         &RegistrationExpectation {
             challenge: challenge.bytes(),
             origin: expected_origin,
-            rp_id: REGISTRATION_RP_ID,
+            rp_id,
         },
     )
     .map_err(|_| Invalid)?;
@@ -288,7 +292,14 @@ mod tests {
     }
 
     fn verify(request: &EnrollCredentialRequest) -> Result<(), OperatorRegistrationError> {
-        verify_operator_registration(request, &challenge(), ORIGIN, Instant::now()).map(|_| ())
+        verify_operator_registration(
+            request,
+            &challenge(),
+            ORIGIN,
+            REGISTRATION_RP_ID,
+            Instant::now(),
+        )
+        .map(|_| ())
     }
 
     fn valid() -> RegistrationBuilder {
@@ -303,8 +314,14 @@ mod tests {
             .sign_count(7)
             .request();
         request.label = "  laptop ".to_owned();
-        let verified =
-            verify_operator_registration(&request, &challenge(), ORIGIN, Instant::now()).unwrap();
+        let verified = verify_operator_registration(
+            &request,
+            &challenge(),
+            ORIGIN,
+            REGISTRATION_RP_ID,
+            Instant::now(),
+        )
+        .unwrap();
         assert_eq!(verified.credential_id(), [0xa5; 16].as_slice());
         assert_eq!(
             verified.credential_id_b64url(),
@@ -329,8 +346,14 @@ mod tests {
                 let mut request = valid().request();
                 request.label = label.clone();
                 assert_eq!(
-                    verify_operator_registration(&request, &challenge(), ORIGIN, Instant::now())
-                        .unwrap_err(),
+                    verify_operator_registration(
+                        &request,
+                        &challenge(),
+                        ORIGIN,
+                        REGISTRATION_RP_ID,
+                        Instant::now()
+                    )
+                    .unwrap_err(),
                     OperatorRegistrationError::Invalid,
                     "{label:?}"
                 );
@@ -338,8 +361,14 @@ mod tests {
         }
         let mut request = valid().request();
         request.label = " laptop ".to_owned();
-        let verified =
-            verify_operator_registration(&request, &challenge(), ORIGIN, Instant::now()).unwrap();
+        let verified = verify_operator_registration(
+            &request,
+            &challenge(),
+            ORIGIN,
+            REGISTRATION_RP_ID,
+            Instant::now(),
+        )
+        .unwrap();
         assert_eq!(verified.label(), "laptop");
     }
 
@@ -664,18 +693,33 @@ mod tests {
                 &request,
                 &challenge,
                 ORIGIN,
+                REGISTRATION_RP_ID,
                 at_expiry - Duration::from_millis(1)
             )
             .is_ok()
         );
         assert_eq!(
-            verify_operator_registration(&request, &challenge, ORIGIN, at_expiry).unwrap_err(),
+            verify_operator_registration(
+                &request,
+                &challenge,
+                ORIGIN,
+                REGISTRATION_RP_ID,
+                at_expiry
+            )
+            .unwrap_err(),
             OperatorRegistrationError::Expired
         );
         let mut garbage = valid().request();
         garbage.attestation_object = "!!".to_owned();
         assert_eq!(
-            verify_operator_registration(&garbage, &challenge, ORIGIN, at_expiry).unwrap_err(),
+            verify_operator_registration(
+                &garbage,
+                &challenge,
+                ORIGIN,
+                REGISTRATION_RP_ID,
+                at_expiry
+            )
+            .unwrap_err(),
             OperatorRegistrationError::Expired
         );
     }

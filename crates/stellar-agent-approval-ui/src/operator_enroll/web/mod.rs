@@ -7,12 +7,23 @@
 //! registration ceremony over it, POSTs the response to
 //! `POST /enroll/credential`, and shows the confirmation code of the
 //! credential it created.
+//!
+//! A signed-origin listener also serves `operator-enroll-code.js` before a
+//! session exists. It posts the terminal's enrollment code to
+//! `POST /enroll/code`, stores the session proof of the reply and opens
+//! `/enroll`.
 
 /// Wallet-authored operator-enrollment browser glue served at
 /// `GET /static/operator-enroll.js`.
 ///
 /// Source-of-truth: `src/operator_enroll/web/operator-enroll.js`.
 pub(crate) const OPERATOR_ENROLL_JS: &[u8] = include_bytes!("operator-enroll.js");
+
+/// The enrollment code form's script, served at
+/// `GET /static/operator-enroll-code.js` by a signed-origin listener only.
+///
+/// Source-of-truth: `src/operator_enroll/web/operator-enroll-code.js`.
+pub(crate) const OPERATOR_ENROLL_CODE_JS: &[u8] = include_bytes!("operator-enroll-code.js");
 
 #[cfg(test)]
 mod tests {
@@ -23,6 +34,16 @@ mod tests {
         reason = "test-only; panics acceptable in unit tests"
     )]
     use super::*;
+
+    /// The loopback ceremony script keeps its base bytes.
+    #[test]
+    fn loopback_enroll_asset_keeps_base_bytes() {
+        use sha2::{Digest as _, Sha256};
+        assert_eq!(
+            hex::encode(Sha256::digest(OPERATOR_ENROLL_JS)),
+            "15166ed844f390b525c6582adce8d2432258d484d9a899eea302337d35d3395f"
+        );
+    }
 
     #[test]
     fn operator_enroll_js_is_valid_utf8() {

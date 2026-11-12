@@ -1,4 +1,5 @@
-//! Interactive WebAuthn operator-enrollment server (loopback, one-shot).
+//! Interactive WebAuthn enrollment server (one-shot), served on loopback or
+//! at a signed HTTPS origin.
 //!
 //! `approve operator enroll --interactive` starts this server instead of
 //! reading `--credential-id` / `--public-key` / `--rp-id` / `--label`
@@ -16,11 +17,14 @@
 //!
 //! WebAuthn binds a credential to its `rp.id` at creation, and a loopback
 //! HTTP origin can only claim `"localhost"` as an effective domain (WebAuthn
-//! Level 2 §5.1.3). This server therefore always registers against
-//! `rp_id: "localhost"` — correct for the SSH-tunnel / loopback approval
-//! surfaces, and USELESS for a domain-configured remote listener (which
-//! needs the argument-mode import path from its own `/enroll` page instead;
-//! see `stellar-agent-approval-remote`'s crate docs).
+//! Level 2 §5.1.3). The loopback servers therefore register against
+//! `rp_id: "localhost"`, which suits the SSH-tunnel and loopback approval
+//! surfaces. A testnet remote listener with its own domain uses the
+//! argument-mode import path from its own `/enroll` page instead; see
+//! `stellar-agent-approval-remote`'s crate docs.
+//! [`signed_mainnet_approval_enroll`] registers a mainnet approval
+//! credential for the host of a signed approval origin instead, at that
+//! origin, behind a TLS listener its caller runs.
 //!
 //! # Enrollment never authorizes anything
 //!
@@ -106,8 +110,24 @@
 //! The page requests the `none` attestation format, so no statement about
 //! the authenticator's make or certification is verified, and the response
 //! is no standalone proof of key possession. Verification binds the response
-//! to this server's challenge, the exact page origin and `localhost`; the
-//! session boundary and the terminal code bind it to the operator.
+//! to this server's challenge, the exact page origin and the server's RP:
+//! `localhost` on loopback, the signed host at a signed origin. The session
+//! boundary and the terminal code bind it to the operator.
+//!
+//! # Signed-origin enrollment
+//!
+//! [`signed_mainnet_approval_enroll`] builds the mainnet approval ceremony for
+//! one signed HTTPS origin and returns its router without binding a socket.
+//! The origin, its host as RP and nothing else come from the caller's
+//! validated policy body; no header or port supplies them. The caller binds
+//! the socket, terminates TLS and installs the signed Host and Origin layers.
+//!
+//! No bootstrap token is served. Without a session, `GET /enroll` renders a
+//! form that posts the terminal's single-use enrollment code to
+//! `POST /enroll/code` (see `enrollment_code`). A match sets the session
+//! cookie, with `Secure`, and returns the proof page the loopback bootstrap
+//! returns; with that session `GET /enroll` renders the registration page.
+//! Exhausting or outliving the code ends the ceremony without a session.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -116,10 +136,11 @@ use std::time::{Duration, Instant};
 
 use axum::{Router, extract::DefaultBodyLimit};
 use stellar_agent_loopback_http::{LoopbackPair, PairServer};
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, watch};
 use tower_http::{limit::RequestBodyLimitLayer, trace::TraceLayer};
 
 use stellar_agent_core::approval::operator_credentials::OperatorApprovalCredentialStore;
+use stellar_agent_core::policy::v1::approval_origin::ApprovalOrigin;
 
 use stellar_agent_loopback_http::brand::PageIdentity;
 
@@ -128,6 +149,7 @@ use crate::{HostHeaderAllowlistLayer, OriginHeaderAllowlistLayer, SecurityHeader
 use confirmation::{MAINNET_APPROVAL_CODE_DOMAIN, OPERATOR_CODE_DOMAIN};
 
 mod confirmation;
+mod enrollment_code;
 mod error;
 mod registration;
 mod routes;
@@ -145,7 +167,8 @@ pub use confirmation::{
 pub use error::{OperatorEnrollAwaitError, OperatorEnrollShutdownError, OperatorEnrollStartError};
 
 use confirmation::StagedEnrollment;
-use registration::RegistrationChallenge;
+use enrollment_code::EnrollmentCode;
+use registration::{REGISTRATION_RP_ID, RegistrationChallenge};
 
 /// Maximum request body size accepted by this server, in bytes (16 KiB) —
 /// the same cap the approval-inbox server and the WebAuthn bridge apply.
@@ -208,9 +231,17 @@ struct OperatorEnrollState {
     /// it, to refuse an already-enrolled ID before staging;
     /// [`ConfirmedOperatorEnrollment::persist`] is the only writer.
     store: Option<OperatorApprovalCredentialStore>,
-    /// The exact origin the page runs at, `http://localhost:<bound port>`,
-    /// which a registration's `clientDataJSON` must name.
+    /// The exact origin the page runs at, which a registration's
+    /// `clientDataJSON` must name: `http://localhost:<bound port>` on
+    /// loopback, the signed origin otherwise.
     expected_origin: String,
+    /// The relying-party ID the page registers for and a registration's RP
+    /// ID hash must match: `localhost` on loopback, the signed host
+    /// otherwise.
+    rp_id: String,
+    /// The enrollment code gate of a signed-origin ceremony; `None` on
+    /// loopback.
+    signed: Option<SignedState>,
     /// Optional label to pre-populate the `/enroll` page's label input with
     /// (from `--label` in interactive mode). `None` leaves the field empty
     /// for the operator to fill in.
@@ -224,6 +255,28 @@ struct OperatorEnrollState {
     /// guard is held only across synchronous work, never across an `.await`
     /// point, and never while the `auth` lock is held.
     ceremony: StdMutex<Ceremony>,
+}
+
+/// Where the enrollment code of a signed-origin ceremony stands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CodePhase {
+    /// No session yet; the code still admits attempts.
+    Waiting,
+    /// The code opens the session.
+    Exchanged,
+    /// The attempt limit ends the ceremony.
+    Exhausted,
+}
+
+/// The code gate of a signed-origin ceremony.
+struct SignedState {
+    /// The session token the code exchange spends. It never leaves the
+    /// process; the code stands in for it.
+    session_token_hex: String,
+    /// The single-use enrollment code.
+    code: StdMutex<EnrollmentCode>,
+    /// Tells the handle when the code opens a session or runs out of attempts.
+    phase: watch::Sender<CodePhase>,
 }
 
 /// The mutable state of the one ceremony a server runs.
@@ -289,9 +342,9 @@ impl OperatorEnrollHandle {
     ///
     /// # rp-id binding
     ///
-    /// Always uses `localhost:<port>` — NEVER `local_addr`'s bind IP — so the
-    /// browser's origin (`http://localhost:<port>`) matches this server's
-    /// hard-coded `rp_id: "localhost"` per WebAuthn Level 2 §5.1.2.
+    /// Always uses `localhost:<port>`, never `local_addr`'s bind IP, so the
+    /// browser's origin (`http://localhost:<port>`) matches this loopback
+    /// server's `rp_id: "localhost"` per WebAuthn Level 2 §5.1.2.
     /// `local_addr.ip()` is `127.0.0.1` in the common case, but
     /// `http://127.0.0.1:<port>` and `http://localhost:<port>` are DIFFERENT
     /// origins to the browser even though both resolve to the loopback
@@ -388,7 +441,7 @@ impl OperatorEnrollHandle {
 /// filesystem access happens here); the server only reads it, to refuse an
 /// already-enrolled credential ID before staging. `profile` is shown on the
 /// page for operator orientation only and has no bearing on the credential,
-/// which is always recorded with `rp_id: "localhost"`.
+/// which this loopback server records with `rp_id: "localhost"`.
 /// `label_prefill` pre-populates the page's label input (from
 /// `--label <L>` in interactive mode); the operator can still edit it, and
 /// `None` leaves the field empty. `page_identity` is the identity the page
@@ -482,6 +535,8 @@ async fn start(
         auth: StdMutex::new(AuthState::new(bootstrap, purpose.session_purpose())),
         store,
         expected_origin: expected_origin(local_addr),
+        rp_id: REGISTRATION_RP_ID.to_owned(),
+        signed: None,
         label_prefill,
         identity: page_identity,
         ceremony: StdMutex::new(Ceremony {
@@ -503,10 +558,197 @@ async fn start(
     })
 }
 
-/// The origin the enrollment page runs at: always `localhost` with the bound
-/// port, the form [`OperatorEnrollHandle::enroll_url`] opens.
+/// The origin the loopback enrollment page runs at: always `localhost` with
+/// the bound port, the form [`OperatorEnrollHandle::enroll_url`] opens.
 fn expected_origin(local_addr: SocketAddr) -> String {
     format!("http://localhost:{}", local_addr.port())
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Signed-origin ceremony
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The mainnet approval ceremony for one signed HTTPS origin, without a
+/// socket.
+///
+/// Returns the ceremony's router and its handle. The router carries tracing,
+/// both body limits and the security headers, and no loopback Host or Origin
+/// layer. The caller binds the socket, terminates TLS, and installs the
+/// signed Host and Origin layers for `origin`.
+///
+/// `origin` is the validated `approval_origin` of an unsigned policy body;
+/// the page origin is `origin` and the RP is its host. No request header,
+/// profile value or port changes them. The session cookie carries `Secure`.
+/// The enrollment code lives `min(600 seconds, timeout)` and admits five
+/// attempts. `profile`, `label_prefill` and `page_identity` are as for
+/// [`start_mainnet_approval_enroll`].
+pub fn signed_mainnet_approval_enroll(
+    origin: &ApprovalOrigin,
+    profile: String,
+    label_prefill: Option<String>,
+    page_identity: PageIdentity,
+    timeout: Duration,
+) -> (Router, SignedEnrollmentCeremony) {
+    signed_ceremony(
+        origin.as_str(),
+        origin.rp_id(),
+        profile,
+        label_prefill,
+        page_identity,
+        timeout,
+    )
+}
+
+/// [`signed_mainnet_approval_enroll`] for the validated `origin` and its
+/// host `rp_id`.
+pub(crate) fn signed_ceremony(
+    origin: &str,
+    rp_id: &str,
+    profile: String,
+    label_prefill: Option<String>,
+    page_identity: PageIdentity,
+    timeout: Duration,
+) -> (Router, SignedEnrollmentCeremony) {
+    let purpose = EnrollmentPurpose::MainnetApproval;
+    let session_token = OpaqueToken::generate();
+    let session_token_hex = session_token.to_hex();
+    let auth = AuthState::new(session_token, purpose.session_purpose()).with_secure_cookie();
+    let code_lifetime = enrollment_code::code_lifetime(timeout);
+    let code = EnrollmentCode::generate(auth.now(), code_lifetime);
+    let code_digits = code.digits().to_owned();
+    let code_expires_at = code.expires_at();
+    let (phase_tx, phase_rx) = watch::channel(CodePhase::Waiting);
+    let (completion_tx, completion_rx) = oneshot::channel::<StagedEnrollment>();
+    let state = Arc::new(OperatorEnrollState {
+        purpose,
+        profile,
+        auth: StdMutex::new(auth),
+        store: None,
+        expected_origin: origin.to_owned(),
+        rp_id: rp_id.to_owned(),
+        signed: Some(SignedState {
+            session_token_hex,
+            code: StdMutex::new(code),
+            phase: phase_tx,
+        }),
+        label_prefill,
+        identity: page_identity,
+        ceremony: StdMutex::new(Ceremony {
+            challenge: None,
+            completion: Some(completion_tx),
+        }),
+    });
+    let ceremony = SignedEnrollmentCeremony {
+        enroll_url: format!("{origin}/enroll"),
+        code_digits,
+        #[cfg(feature = "test-helpers")]
+        code_lifetime,
+        code_expires_at,
+        completion_rx: Some(completion_rx),
+        phase_rx,
+    };
+    (build_signed_router(state), ceremony)
+}
+
+/// Handle to a signed-origin ceremony built by
+/// [`signed_mainnet_approval_enroll`].
+///
+/// `Debug` shows neither the enrollment code nor the session state.
+pub struct SignedEnrollmentCeremony {
+    enroll_url: String,
+    code_digits: String,
+    #[cfg(feature = "test-helpers")]
+    code_lifetime: Duration,
+    code_expires_at: Instant,
+    completion_rx: Option<oneshot::Receiver<StagedEnrollment>>,
+    phase_rx: watch::Receiver<CodePhase>,
+}
+
+impl std::fmt::Debug for SignedEnrollmentCeremony {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SignedEnrollmentCeremony")
+            .field("enroll_url", &self.enroll_url)
+            .finish_non_exhaustive()
+    }
+}
+
+impl SignedEnrollmentCeremony {
+    /// The page URL: the signed origin and `/enroll`. It carries no secret.
+    #[must_use]
+    pub fn enroll_url(&self) -> &str {
+        &self.enroll_url
+    }
+
+    /// The eight-digit enrollment code, for the terminal only.
+    #[must_use]
+    pub fn enrollment_code(&self) -> &str {
+        &self.code_digits
+    }
+
+    /// How long the enrollment code lives: the ceremony timeout, at most ten
+    /// minutes.
+    #[cfg(feature = "test-helpers")]
+    #[must_use]
+    pub fn code_lifetime(&self) -> Duration {
+        self.code_lifetime
+    }
+
+    /// Await the verified registration the page posts, until `deadline`.
+    ///
+    /// Before the code opens a session the wait also ends when the code
+    /// expires or is exhausted. The code exchange never moves `deadline`.
+    ///
+    /// # Errors
+    ///
+    /// - [`OperatorEnrollAwaitError::AlreadyAwaited`] on a second call.
+    /// - [`OperatorEnrollAwaitError::Timeout`] when `deadline` passes, or the
+    ///   code expires before a session opens.
+    /// - [`OperatorEnrollAwaitError::CodeExhausted`] when the attempt limit
+    ///   ends the ceremony.
+    /// - [`OperatorEnrollAwaitError::SenderDropped`] when the router state
+    ///   is gone without a verified registration.
+    pub async fn await_completion_until(
+        &mut self,
+        deadline: Instant,
+    ) -> Result<PendingOperatorEnrollment, OperatorEnrollAwaitError> {
+        let Some(mut rx) = self.completion_rx.take() else {
+            return Err(OperatorEnrollAwaitError::AlreadyAwaited);
+        };
+        let deadline_at = tokio::time::Instant::from_std(deadline);
+        let code_at = tokio::time::Instant::from_std(self.code_expires_at.min(deadline));
+        let mut phase_open = true;
+        loop {
+            let phase = *self.phase_rx.borrow_and_update();
+            if phase == CodePhase::Exhausted {
+                return Err(OperatorEnrollAwaitError::CodeExhausted);
+            }
+            let until = if phase == CodePhase::Waiting {
+                code_at
+            } else {
+                deadline_at
+            };
+            tokio::select! {
+                received = &mut rx => {
+                    return match received {
+                        Ok(staged) => Ok(staged.with_deadline(deadline)),
+                        Err(_recv_error) => Err(OperatorEnrollAwaitError::SenderDropped),
+                    };
+                }
+                changed = self.phase_rx.changed(), if phase_open => {
+                    phase_open = changed.is_ok();
+                }
+                () = tokio::time::sleep_until(until) => {
+                    return Err(OperatorEnrollAwaitError::Timeout);
+                }
+            }
+        }
+    }
+}
+
+/// The router of a signed-origin ceremony: tracing, both body limits and the
+/// security headers, without the loopback Host and Origin layers.
+fn build_signed_router(state: Arc<OperatorEnrollState>) -> Router {
+    inner_layers(routes::build_signed_router().with_state(state)).layer(SecurityHeadersLayer::new())
 }
 
 /// Build the axum `Router` with state and the full Clone-compatible
@@ -524,6 +766,14 @@ fn expected_origin(local_addr: SocketAddr) -> String {
 ///   → handler
 /// ```
 fn build_router(state: Arc<OperatorEnrollState>, local_addr: SocketAddr) -> Router {
+    inner_layers(routes::build_router().with_state(state))
+        .layer(OriginHeaderAllowlistLayer::new(local_addr))
+        .layer(SecurityHeadersLayer::new())
+        .layer(HostHeaderAllowlistLayer::new(local_addr))
+}
+
+/// The trace layer and both body limits, innermost first.
+fn inner_layers(router: Router) -> Router {
     // The span records the matched route template, never the request path:
     // the bootstrap path carries the single-use token.
     let trace_layer = TraceLayer::new_for_http().make_span_with(
@@ -536,14 +786,10 @@ fn build_router(state: Arc<OperatorEnrollState>, local_addr: SocketAddr) -> Rout
         },
     );
 
-    routes::build_router()
-        .with_state(state)
+    router
         .layer(trace_layer)
         .layer(DefaultBodyLimit::max(BODY_LIMIT_BYTES))
         .layer(RequestBodyLimitLayer::new(BODY_LIMIT_BYTES))
-        .layer(OriginHeaderAllowlistLayer::new(local_addr))
-        .layer(SecurityHeadersLayer::new())
-        .layer(HostHeaderAllowlistLayer::new(local_addr))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

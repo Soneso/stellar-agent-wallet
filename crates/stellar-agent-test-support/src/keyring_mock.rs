@@ -289,6 +289,163 @@ impl keyring_core::api::CredentialApi for HookedCred {
     }
 }
 
+/// One keyring write, deletion or attribute update in a [`MutationLog`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KeyringMutation {
+    /// `set`, `delete` or `update_attributes`.
+    pub operation: &'static str,
+    /// The service of the entry.
+    pub service: String,
+    /// The account of the entry.
+    pub account: String,
+}
+
+/// The keyring mutations made through entries built after
+/// [`record_mutations`].
+#[derive(Clone, Debug, Default)]
+pub struct MutationLog(Arc<std::sync::Mutex<Vec<KeyringMutation>>>);
+
+impl MutationLog {
+    /// Every mutation recorded so far, in order.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the log is poisoned by a panic in a recording thread.
+    #[must_use]
+    pub fn mutations(&self) -> Vec<KeyringMutation> {
+        #[allow(
+            clippy::expect_used,
+            reason = "test support; a poisoned log is a test failure"
+        )]
+        self.0.lock().expect("mutation log").clone()
+    }
+
+    fn push(&self, operation: &'static str, service: &str, account: &str) {
+        if let Ok(mut log) = self.0.lock() {
+            log.push(KeyringMutation {
+                operation,
+                service: service.to_owned(),
+                account: account.to_owned(),
+            });
+        }
+    }
+}
+
+/// Wraps the installed default store so that every write, deletion and
+/// attribute update through an entry built from now on is recorded.
+///
+/// The credentials already in the store stay; reads behave as before. A test
+/// calls this after its fixture setup and asserts on the log it returns.
+///
+/// # Errors
+///
+/// Returns [`keyring_core::Error::NoDefaultStore`] when no store is
+/// installed.
+pub fn record_mutations() -> Result<MutationLog, keyring_core::Error> {
+    let inner = keyring_core::get_default_store().ok_or(keyring_core::Error::NoDefaultStore)?;
+    let log = MutationLog::default();
+    let store: Arc<keyring_core::CredentialStore> = Arc::new(RecordingStore {
+        inner,
+        log: log.clone(),
+    });
+    keyring_core::set_default_store(store);
+    Ok(log)
+}
+
+/// The store [`record_mutations`] installs.
+struct RecordingStore {
+    inner: Arc<keyring_core::CredentialStore>,
+    log: MutationLog,
+}
+
+impl std::fmt::Debug for RecordingStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RecordingStore").finish_non_exhaustive()
+    }
+}
+
+impl keyring_core::api::CredentialStoreApi for RecordingStore {
+    fn vendor(&self) -> String {
+        "stellar-agent-test-support recording mock store".to_owned()
+    }
+
+    fn id(&self) -> String {
+        self.inner.id()
+    }
+
+    fn build(
+        &self,
+        service: &str,
+        user: &str,
+        modifiers: Option<&std::collections::HashMap<&str, &str>>,
+    ) -> keyring_core::Result<keyring_core::Entry> {
+        let entry = self.inner.build(service, user, modifiers)?;
+        Ok(keyring_core::Entry::new_with_credential(Arc::new(
+            RecordingCred {
+                entry,
+                service: service.to_owned(),
+                account: user.to_owned(),
+                log: self.log.clone(),
+            },
+        )))
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+/// A credential whose mutations land in a [`MutationLog`].
+struct RecordingCred {
+    entry: keyring_core::Entry,
+    service: String,
+    account: String,
+    log: MutationLog,
+}
+
+impl std::fmt::Debug for RecordingCred {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RecordingCred").finish_non_exhaustive()
+    }
+}
+
+impl keyring_core::api::CredentialApi for RecordingCred {
+    fn set_secret(&self, secret: &[u8]) -> keyring_core::Result<()> {
+        self.log.push("set", &self.service, &self.account);
+        self.entry.set_secret(secret)
+    }
+
+    fn get_secret(&self) -> keyring_core::Result<Vec<u8>> {
+        self.entry.get_secret()
+    }
+
+    fn update_attributes(
+        &self,
+        attributes: &std::collections::HashMap<&str, &str>,
+    ) -> keyring_core::Result<()> {
+        self.log
+            .push("update_attributes", &self.service, &self.account);
+        self.entry.update_attributes(attributes)
+    }
+
+    fn delete_credential(&self) -> keyring_core::Result<()> {
+        self.log.push("delete", &self.service, &self.account);
+        self.entry.delete_credential()
+    }
+
+    fn get_credential(&self) -> keyring_core::Result<Option<Arc<keyring_core::api::Credential>>> {
+        Ok(None)
+    }
+
+    fn get_specifiers(&self) -> Option<(String, String)> {
+        self.entry.get_specifiers()
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
 /// Canonical `Display` text of the `windows-native-keyring-store` platform
 /// error for Win32 `ERROR_NO_SUCH_LOGON_SESSION` (1312), as rendered inside
 /// `keyring_core::Error::NoStorageAccess`.

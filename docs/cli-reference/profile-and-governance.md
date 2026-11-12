@@ -1493,6 +1493,7 @@ All operator-open URL lines read `Open this URL in your browser: <url>`.
 Stdout remains one JSON envelope. The token is single-use; keep stderr private.
 
 - `--open-by-operator`: Prints the local mainnet enrollment URL once on stderr, with no browser launch or private handoff.
+- `--origin-from <PATH>`: enrolls at the signed approval origin of an unsigned policy body; see [Signed-origin enrollment](#signed-origin-enrollment). It conflicts with `--open-by-operator`.
 - `--profile <NAME>` (required): a persisted mainnet profile. Neither an
   enabled installation nor a mainnet policy is required, so a credential can be
   enrolled before the policy that lists it.
@@ -1521,6 +1522,35 @@ stderr a reminder to add the entry, review the key, and sign the policy:
 `credential_fingerprint` is the SHA-256 of a domain tag, the length-prefixed
 credential ID, and the public key; mainnet audit rows name a credential by it.
 
+#### Signed-origin enrollment
+
+```bash
+stellar-agent approve credential enroll --origin-from bootstrap.toml --profile mainnet
+```
+
+`--origin-from` enrolls the credential for the RP of a signed approval origin.
+The file is an unsigned bootstrap policy body, installed or not, with `approval_origin` and `approval_cert_spki_sha256` together.
+The command validates it as `profile policy-check` does: closed keys, the origin grammar, and the origin and pin pairing.
+It checks no signature and needs no approval credential; an installed signed policy plays no role.
+The origin supplies the page origin, its host the RP ID, and the pin the expected leaf certificate.
+No request header, profile value or bind port supplies them.
+
+The profile needs an enabled `[remote_approval]` table whose `rp_id` is the signed host.
+Its `bind` names the backend socket, and its explicit `cert_path` and `key_path` name the TLS pair.
+Before it binds, the command loads that pair and compares the leaf SPKI with the pin; it never generates a certificate.
+The approving device must trust the certificate through a public CA or an installed private CA.
+
+The command prints `Open this URL in your browser: <signed-origin>/enroll` and an eight-digit enrollment code on stderr.
+The URL carries no secret. Type the enrollment code on the page; it opens the page session once.
+The enrollment code lives the timeout, at most 600 seconds, and admits five attempts.
+Four wrong codes followed by the right one succeed; the sixth attempt after five wrong codes ends the command.
+The page then registers the passkey and shows its confirmation code, which you type at the terminal as in local mode.
+One deadline covers the enrollment code, the registration and the terminal confirmation.
+This mode needs no display and opens no browser. It still needs a terminal.
+On success the envelope carries the same fields, with `rp_id` set to the signed host.
+Nothing is written; add the exported entry to the policy and sign it.
+Enrollment is a provisioning-tier step, like the `[remote_approval]` setup, and never runs as a runtime service.
+
 Exits `1` on refusal, and exports nothing:
 
 | Code | Message |
@@ -1532,6 +1562,13 @@ Exits `1` on refusal, and exports nothing:
 | `approve.credential_enroll_expired` | `The approval credential enrollment deadline has passed; no policy credential is exported.` |
 | `approve.credential_enroll_canceled` | `Approval credential enrollment is canceled; no policy credential is exported.` Ctrl-C, or the prompt ended without a code. |
 | `approve.credential_enroll_unavailable` | `The approval credential enrollment cannot start or complete; no policy credential is exported.` |
+| `approve.credential_enroll_code_exhausted` | `The enrollment code attempt limit is exhausted; no policy credential is exported.` Signed-origin mode only. |
+| `approve.credential_enroll_origin_missing` | `The policy body requires approval_origin and approval_cert_spki_sha256 for signed-origin enrollment.` Signed-origin mode only. |
+
+In signed-origin mode an invalid body keeps its `policy.*` refusal.
+The listener keeps its startup refusals: `approval.origin_profile_mismatch`, `approval.listener_busy`, `approval.cert_pin_mismatch` and `approve.remote_tls_unavailable`.
+An absent or disabled `[remote_approval]` table reports `internal.unexpected_state` with `approve.remote_not_configured`.
+An expired enrollment code reports `approve.credential_enroll_expired`.
 
 A profile that does not load for a safety reason keeps the loader's refusal.
 To revoke an approval credential, remove its entry from the policy and sign

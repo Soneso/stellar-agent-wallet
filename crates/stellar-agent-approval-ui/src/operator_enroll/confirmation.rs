@@ -400,6 +400,7 @@ mod tests {
             &request,
             &challenge,
             "http://localhost:9999",
+            super::super::registration::REGISTRATION_RP_ID,
             Instant::now(),
         )
         .unwrap();

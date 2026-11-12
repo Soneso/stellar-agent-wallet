@@ -288,13 +288,6 @@ impl AuthState {
 
     /// This state with a session cookie that carries `Secure`, for a page
     /// served over HTTPS; every other attribute is unchanged.
-    #[cfg_attr(
-        not(any(test, feature = "test-helpers")),
-        allow(
-            dead_code,
-            reason = "set only by a listener served over HTTPS; the loopback listeners keep the plain cookie"
-        )
-    )]
     pub(crate) fn with_secure_cookie(mut self) -> Self {
         self.secure_cookie = true;
         self
@@ -540,6 +533,42 @@ mod tests {
         reason = "test-only; panics acceptable in unit tests"
     )]
     use super::*;
+
+    /// The code exchange of a signed-origin enrollment sets the loopback
+    /// cookie form of its session followed by `; Secure`, and only that.
+    #[tokio::test]
+    async fn https_enrollment_cookie_is_secure() {
+        use tower::ServiceExt as _;
+        let (router, ceremony) = crate::operator_enroll::signed_ceremony(
+            "https://approve.example.invalid:8443",
+            "approve.example.invalid",
+            "main".to_owned(),
+            None,
+            stellar_agent_loopback_http::brand::PageIdentity::neutral(),
+            std::time::Duration::from_secs(300),
+        );
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/enroll/code")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(axum::body::Body::from(
+                serde_json::json!({ "code": ceremony.enrollment_code() }).to_string(),
+            ))
+            .unwrap();
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let cookie = response.headers()[header::SET_COOKIE].to_str().unwrap();
+        let (name, rest) = cookie.split_once('=').unwrap();
+        let value = rest.split(';').next().unwrap();
+        assert!(name.starts_with(SessionPurpose::MainnetApprovalEnroll.cookie_name_prefix()));
+        assert_eq!(
+            cookie,
+            format!(
+                "{name}={value}; HttpOnly; SameSite=Strict; Path=/; \
+                 Max-Age={SESSION_COOKIE_MAX_AGE_SECS}; Secure"
+            )
+        );
+    }
 
     #[test]
     fn opaque_token_hex_roundtrip() {

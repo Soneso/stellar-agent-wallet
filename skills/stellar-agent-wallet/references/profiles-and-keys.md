@@ -988,6 +988,11 @@ nothing.
    host, create the passkey in the local browser, and type the code the page
    shows. The command prints the credential and its `policy_entry_toml`; see
    [`approve credential enroll`](cli-reference.md#approve-credential-enroll).
+   For a signed approval origin, run it with `--origin-from <unsigned body>` instead.
+   The unsigned bootstrap body supplies the origin, the RP and the certificate pin.
+   The command serves the page over TLS from the explicit `[remote_approval]` paths, and the approving device must trust the certificate.
+   It prints an enrollment code for the page and still asks for the page's confirmation code at the terminal.
+   The operator runs it in the provisioning tier.
 2. Review the credential and add the entry to `approval_credentials` in the
    `[mainnet]` table.
 3. Sign the policy with `profile sign-policy`, which assigns a higher sequence,

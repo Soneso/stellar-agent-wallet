@@ -77,14 +77,26 @@ thiserror = { workspace = true }
 # request_id generation for the ApprovalRejected audit event.
 uuid = { workspace = true }
 
+# The HTTPS client of `operator_enroll::test_support`, which trusts only a
+# signed-origin listener's leaf certificate. Enabled only by `test-helpers`,
+# with the ring provider the remote listener uses.
+rustls = { workspace = true, optional = true, features = ["ring", "std", "tls12"] }
+tokio-rustls = { workspace = true, optional = true, features = ["ring", "tls12"] }
+rustls-pki-types = { workspace = true, optional = true, features = ["std"] }
+
 [features]
 # Exposes `operator_enroll::test_support`: a software registrar producing real
 # `none`-attestation registration responses, and a loopback client that drives
 # a running enrollment server. Enabled for tests and by the explicit
 # `test-helpers` feature; the release binaries are built without it. It turns
 # on core's test helpers for the display form of the confirmation code the
-# registrar reports.
-test-helpers = ["stellar-agent-core/test-helpers"]
+# registrar reports, and adds the HTTPS client for signed-origin listeners.
+test-helpers = [
+    "stellar-agent-core/test-helpers",
+    "dep:rustls",
+    "dep:tokio-rustls",
+    "dep:rustls-pki-types",
+]
 
 [dev-dependencies]
 # ServiceExt::oneshot for in-process router tests.
