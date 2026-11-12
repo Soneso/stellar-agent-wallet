@@ -2412,12 +2412,15 @@ where
         stellar_agent_core::policy::ToolValueKind::MovesValue,
         chain_id,
         &policy_args,
-        "pay",
         Some(&source_adapter),
         dest_adapter.as_ref().map(|a| a as &dyn AccountIdentityView),
     ) {
         Ok(evaluation) => evaluation,
-        Err(envelope) => return fail(&envelope),
+        Err(refusal) => {
+            return fail(&crate::common::mainnet_confirm::render_authority_refusal(
+                "pay", refusal,
+            ));
+        }
     };
 
     let body = &policy.body;
@@ -6677,6 +6680,52 @@ pub(crate) mod tests {
             assert_eq!(fixture.summaries().len(), 1, "the summary is shown");
         }
 
+        /// Policy and browser refusals preserve the complete stdout envelope.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn pay_mainnet_refusals_render_exact_envelopes() {
+            for (case, name) in [
+                ("cap", "pay-exact-cap"),
+                ("clock", "pay-exact-clock"),
+                ("browser", "pay-exact-browser"),
+            ] {
+                let rule = pay_rule("require_approval", "");
+                let rule = if case == "cap" {
+                    rule.replace("max_stroops = \"1000000000\"", "max_stroops = \"1\"")
+                } else {
+                    rule
+                };
+                let mut fixture = Spec::new(name).rules(vec![rule]).build().await;
+                fixture.present_with(|_| {
+                    Err(WalletError::Approval(
+                        ApprovalFailure::PresenceBrowserRequired,
+                    ))
+                });
+                let _clock = (case == "clock").then(
+                    stellar_agent_core::policy::v1::criteria::state_store::set_policy_clock_error_for_test,
+                );
+                crate::common::render::take_rendered_for_test();
+                let exit = run_code(&fixture, &memo_args(&fixture)).await;
+                let documents = crate::common::render::take_rendered_for_test();
+                assert_eq!(exit, 1, "{documents:?}");
+                assert_eq!(documents.len(), 1, "one stdout envelope");
+                let mut envelope = documents.into_iter().next().unwrap();
+                envelope["request_id"] = json!("guard");
+                let expected = match case {
+                    "cap" => {
+                        r#"{"ok":false,"error":{"code":"policy.deny.per_tx_cap_exceeded","message":"pay operation denied by operator policy"},"request_id":"guard"}"#
+                    }
+                    "clock" => {
+                        r#"{"ok":false,"error":{"code":"wallet.clock_error","message":"system clock error: wallet clock error: policy clock unavailable (test injection)"},"request_id":"guard"}"#
+                    }
+                    _ => {
+                        r#"{"ok":false,"error":{"code":"approval.presence_browser_required","message":"Mainnet consent requires a local browser with WebAuthn user verification; no approval is recorded."},"request_id":"guard"}"#
+                    }
+                };
+                assert_eq!(envelope, serde_json::from_str::<Value>(expected).unwrap());
+            }
+        }
+
         /// Confirmation: an assertion over another challenge refuses as
         /// invalid.
         #[tokio::test(flavor = "current_thread")]
@@ -6754,7 +6803,7 @@ pub(crate) mod tests {
                 fixture.present_in_browser(flags);
                 let before = signer_resolutions_on_this_thread();
                 let result = run(&fixture, &memo_args(&fixture)).await;
-                if flags == 1 {
+                if verdict == "require_approval" && flags == 1 {
                     assert_eq!(
                         result.code(),
                         "approval.presence_invalid",
@@ -6767,8 +6816,14 @@ pub(crate) mod tests {
                     assert_eq!(signer_resolutions_on_this_thread(), before);
                 } else {
                     assert_eq!(result.code, 0, "{}", result.envelope);
-                    assert!(signer_resolutions_on_this_thread() > before);
                     assert_eq!(fixture.sent_envelopes().await.len(), 1);
+                    assert_eq!(signer_resolutions_on_this_thread(), before + 1);
+                    crate::common::mainnet_authority_tests::assert_authorized(
+                        &fixture,
+                        verdict == "require_approval",
+                        0,
+                    )
+                    .await;
                 }
             }
         }
@@ -7059,7 +7114,7 @@ pub(crate) mod tests {
         #[serial_test::serial]
         async fn the_resolver_policy_denial_keeps_the_deny_code() {
             let fixture = Spec::new("mainnet-pay-resolver-deny")
-                .rules(vec![pay_rule("allow", &minimum_reserve(0))])
+                .rules(vec![pay_rule("require_approval", &minimum_reserve(0))])
                 .primary(accounts().with_script(|method, index, _| {
                     (method == "getLedgerEntries" && index == 2)
                         .then(|| agent_entries(RESERVE + AMOUNT))
@@ -7081,6 +7136,43 @@ pub(crate) mod tests {
             assert!(fixture.open_authorizations(now()).is_empty());
             assert!(records(&fixture).is_empty());
             assert!(invalidations_on_this_thread().is_empty());
+        }
+
+        /// A resolver denial under policy authority logs its precondition
+        /// and withholds the signature.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn the_resolver_policy_denial_under_allow_refuses_authorization() {
+            let fixture = Spec::new("mainnet-pay-resolver-deny-allow")
+                .rules(vec![pay_rule("allow", &minimum_reserve(0))])
+                .primary(accounts().with_script(|method, index, _| {
+                    (method == "getLedgerEntries" && index == 2)
+                        .then(|| agent_entries(RESERVE + AMOUNT))
+                }))
+                .build()
+                .await;
+            let (capture, _guard) = WarningCapture::capture(None);
+            let before = signer_resolutions_on_this_thread();
+
+            let run = run(&fixture, &memo_args(&fixture)).await;
+
+            assert_eq!(run.code, 1, "{}", run.envelope);
+            assert_eq!(run.code(), "network.mainnet_authorization_refused");
+            assert_eq!(
+                run.message(),
+                "the mainnet write was refused; the signature was withheld and nothing was sent"
+            );
+            assert_eq!(signer_resolutions_on_this_thread(), before);
+            assert!(fixture.sent_envelopes().await.is_empty());
+            assert!(fixture.pending_entries().is_empty());
+            fixture.assert_no_consent_ceremony();
+            assert!(fixture.open_authorizations(now()).is_empty());
+            assert!(records(&fixture).is_empty());
+            assert!(invalidations_on_this_thread().is_empty());
+            assert_eq!(
+                refusal_warnings(&capture, "resolve_tx_sign"),
+                vec!["\"fresh_decision_requires_approval\"".to_owned()]
+            );
         }
 
         /// [`memo_args`] signing with the Ledger at index 0.
@@ -7148,7 +7240,7 @@ pub(crate) mod tests {
         #[serial_test::serial]
         async fn a_ledger_user_refusal_is_sign_refused() {
             let fixture = Spec::new("mainnet-pay-ledger-refused")
-                .rules(vec![pay_rule_capped(AMOUNT, 100)])
+                .rules(vec![pay_rule_capped("require_approval", AMOUNT, 100)])
                 .build()
                 .await;
             let (_ledger, _calls) = install_ledger_double(
@@ -7242,7 +7334,7 @@ pub(crate) mod tests {
         #[serial_test::serial]
         async fn an_expiry_inside_the_signer_is_the_attach_refusal() {
             let fixture = Spec::new("mainnet-pay-gate-expiry")
-                .rules(vec![pay_rule_capped(AMOUNT, 100)])
+                .rules(vec![pay_rule_capped("require_approval", AMOUNT, 100)])
                 .build()
                 .await;
             let clock = Arc::new(stellar_agent_network::mainnet::clock::set_now_ms_for_test(
@@ -7294,7 +7386,7 @@ pub(crate) mod tests {
             // so it holds the clock weakly: the override ends with `clock`.
             let advance = Arc::downgrade(&clock);
             let fixture = Spec::new("mainnet-pay-hook-expiry")
-                .rules(vec![pay_rule_capped(AMOUNT, 100)])
+                .rules(vec![pay_rule_capped("require_approval", AMOUNT, 100)])
                 .primary(accounts().with_script(move |method, index, _| {
                     if method == "getNetwork"
                         && index == 2
@@ -7337,7 +7429,7 @@ pub(crate) mod tests {
         #[serial_test::serial]
         async fn another_network_at_the_submit_probe_is_the_gate_refusal() {
             let fixture = Spec::new("mainnet-pay-submit-probe")
-                .rules(vec![pay_rule_capped(AMOUNT, 100)])
+                .rules(vec![pay_rule_capped("require_approval", AMOUNT, 100)])
                 .primary(accounts().with_script(|method, index, _| {
                     (method == "getNetwork" && index == 2)
                         .then(|| get_network_result(TESTNET_PASSPHRASE))
@@ -7369,7 +7461,7 @@ pub(crate) mod tests {
         #[serial_test::serial]
         async fn a_claimed_receipt_is_the_pre_send_refusal() {
             let fixture = Spec::new("mainnet-pay-claimed-receipt")
-                .rules(vec![pay_rule_capped(AMOUNT, 100)])
+                .rules(vec![pay_rule_capped("require_approval", AMOUNT, 100)])
                 .build()
                 .await;
             let receipts =
@@ -7489,7 +7581,7 @@ pub(crate) mod tests {
         #[serial_test::serial]
         async fn a_refused_send_keeps_its_window_rows() {
             let fixture = Spec::new("mainnet-pay-refused-held")
-                .rules(vec![pay_rule_capped(AMOUNT, 100)])
+                .rules(vec![pay_rule_capped("require_approval", AMOUNT, 100)])
                 .primary(accounts().with_script(|method, index, body| {
                     (method == "sendTransaction" && index == 0).then(|| refused_send(body))
                 }))
@@ -7605,33 +7697,38 @@ pub(crate) mod tests {
         #[tokio::test(flavor = "current_thread")]
         #[serial_test::serial]
         async fn the_amount_cap_counts_each_payment_once() {
-            let fixture = Spec::new("mainnet-pay-amount-cap")
-                .rules(vec![pay_rule_capped(2 * AMOUNT, 100)])
-                .build()
-                .await;
+            for (name, decision) in [
+                ("mainnet-pay-amount-cap", "require_approval"),
+                ("mainnet-pay-amount-cap-allow", "allow"),
+            ] {
+                let fixture = Spec::new(name)
+                    .rules(vec![pay_rule_capped(decision, 2 * AMOUNT, 100)])
+                    .build()
+                    .await;
 
-            let first = run(&fixture, &memo_args(&fixture)).await;
-            assert_eq!(first.code, 0, "{}", first.envelope);
-            assert_eq!(
-                fixture.pending_reservations(),
-                1,
-                "the first payment stays reserved"
-            );
-            let second = run(&fixture, &memo_args(&fixture)).await;
-            assert_eq!(second.code, 0, "{}", second.envelope);
-            assert_eq!(
-                fixture.pending_reservations(),
-                2,
-                "both payments stay reserved"
-            );
-            let third = run(&fixture, &memo_args(&fixture)).await;
+                let first = run(&fixture, &memo_args(&fixture)).await;
+                assert_eq!(first.code, 0, "{}", first.envelope);
+                assert_eq!(
+                    fixture.pending_reservations(),
+                    1,
+                    "the first payment stays reserved"
+                );
+                let second = run(&fixture, &memo_args(&fixture)).await;
+                assert_eq!(second.code, 0, "{}", second.envelope);
+                assert_eq!(
+                    fixture.pending_reservations(),
+                    2,
+                    "both payments stay reserved"
+                );
+                let third = run(&fixture, &memo_args(&fixture)).await;
 
-            assert_eq!(
-                third.code(),
-                "policy.deny.per_period_cap_exceeded",
-                "{}",
-                third.envelope
-            );
+                assert_eq!(
+                    third.code(),
+                    "policy.deny.per_period_cap_exceeded",
+                    "{}",
+                    third.envelope
+                );
+            }
         }
 
         /// Sizing: the rate limit counts each reported payment once, so the
@@ -7640,33 +7737,38 @@ pub(crate) mod tests {
         #[tokio::test(flavor = "current_thread")]
         #[serial_test::serial]
         async fn the_rate_limit_counts_each_payment_once() {
-            let fixture = Spec::new("mainnet-pay-rate-limit")
-                .rules(vec![pay_rule_capped(100 * AMOUNT, 2)])
-                .build()
-                .await;
+            for (name, decision) in [
+                ("mainnet-pay-rate-limit", "require_approval"),
+                ("mainnet-pay-rate-limit-allow", "allow"),
+            ] {
+                let fixture = Spec::new(name)
+                    .rules(vec![pay_rule_capped(decision, 100 * AMOUNT, 2)])
+                    .build()
+                    .await;
 
-            let first = run(&fixture, &memo_args(&fixture)).await;
-            assert_eq!(first.code, 0, "{}", first.envelope);
-            assert_eq!(
-                fixture.pending_reservations(),
-                1,
-                "the first payment stays reserved"
-            );
-            let second = run(&fixture, &memo_args(&fixture)).await;
-            assert_eq!(second.code, 0, "{}", second.envelope);
-            assert_eq!(
-                fixture.pending_reservations(),
-                2,
-                "both payments stay reserved"
-            );
-            let third = run(&fixture, &memo_args(&fixture)).await;
+                let first = run(&fixture, &memo_args(&fixture)).await;
+                assert_eq!(first.code, 0, "{}", first.envelope);
+                assert_eq!(
+                    fixture.pending_reservations(),
+                    1,
+                    "the first payment stays reserved"
+                );
+                let second = run(&fixture, &memo_args(&fixture)).await;
+                assert_eq!(second.code, 0, "{}", second.envelope);
+                assert_eq!(
+                    fixture.pending_reservations(),
+                    2,
+                    "both payments stay reserved"
+                );
+                let third = run(&fixture, &memo_args(&fixture)).await;
 
-            assert_eq!(
-                third.code(),
-                "policy.deny.rate_limit_exceeded",
-                "{}",
-                third.envelope
-            );
+                assert_eq!(
+                    third.code(),
+                    "policy.deny.rate_limit_exceeded",
+                    "{}",
+                    third.envelope
+                );
+            }
         }
 
         /// The margin at which the 1 XLM debit alone passes the reserve and

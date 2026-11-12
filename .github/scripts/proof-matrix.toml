@@ -251,6 +251,7 @@ id = "approval.follows_decision"
 family = "approval"
 statement = "an Allow decision signs without an approval request; an escalation requests one"
 applies = ["commit", "single", "verb"]
+builds = "feature-on"
 
 [[claim]]
 id = "approval.durable"
@@ -472,8 +473,15 @@ pending = "row-test"
 
 [[cell]]
 claim = "approval.follows_decision"
-rows = ["mcp.pay_commit", "mcp.create_account_commit", "mcp.claim_commit", "mcp.trustline_commit", "mcp.x402_create_payment", "mcp.x402_authenticated_payment", "cli.pay", "cli.claim", "cli.trustline", "cli.accounts_create"]
+rows = ["mcp.pay_commit", "mcp.create_account_commit", "mcp.claim_commit", "mcp.trustline_commit", "mcp.x402_create_payment", "mcp.x402_authenticated_payment"]
 pending = "decision-authority"
+
+[[cell]]
+claim = "approval.follows_decision"
+rows = ["cli.pay", "cli.claim", "cli.trustline", "cli.accounts_create"]
+tests = [
+  { package = "stellar-agent-cli", target = "bin:stellar-agent", name = "common::mainnet_authority_tests::every_value_verb_follows_the_decision", builds = "feature-on" },
+]
 
 [[cell]]
 claim = "approval.durable"

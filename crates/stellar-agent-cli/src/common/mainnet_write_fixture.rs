@@ -122,6 +122,18 @@ pub(crate) const TRUSTLINE_ASSET: &str =
 /// may not undercut: the 1 XLM payment and the 2 XLM create stay below it.
 pub(crate) const NATIVE_THRESHOLD_STROOPS: i64 = 10_000_000_000;
 
+/// The size of the window store's authenticated prefix.
+pub(crate) const WINDOW_HMAC_TAG_BYTES: usize = 32;
+
+/// The rule-lifetime line an approval rule needs; empty for other decisions.
+fn decision_lines(decision: &str) -> &'static str {
+    if decision == "require_approval" {
+        "ttl_secs = 300\n"
+    } else {
+        ""
+    }
+}
+
 /// The minimal valid native-pay rule: one pinned asset, an allowlisted
 /// destination, both caps and a rate limit, with `decision`.
 pub(crate) fn pay_rule(decision: &str, extra: &str) -> String {
@@ -134,16 +146,12 @@ pub(crate) fn pay_rule(decision: &str, extra: &str) -> String {
          {{ kind = \"per_period_cap\", window = \"1d\", asset = \"native\", max_stroops = \"10000000000\" }},\n\
          {{ kind = \"rate_limit\", window = \"1d\", max_calls = 100 }},\n\
          {extra}]\ndecision = \"{decision}\"\n{}",
-        if decision == "require_approval" {
-            "ttl_secs = 300\n"
-        } else {
-            ""
-        }
+        decision_lines(decision)
     )
 }
 
 /// The native-pay rule with the amount cap and the call cap given.
-pub(crate) fn pay_rule_capped(period_cap_stroops: i64, max_calls: u32) -> String {
+pub(crate) fn pay_rule_capped(decision: &str, period_cap_stroops: i64, max_calls: u32) -> String {
     format!(
         "[[rules]]\nmatch = {{ tool = \"stellar_pay\", chain = \"stellar:mainnet\" }}\n\
          criteria = [\n\
@@ -152,12 +160,13 @@ pub(crate) fn pay_rule_capped(period_cap_stroops: i64, max_calls: u32) -> String
          {{ kind = \"per_tx_cap\", asset = \"native\", max_stroops = \"1000000000\" }},\n\
          {{ kind = \"per_period_cap\", window = \"1d\", asset = \"native\", max_stroops = \"{period_cap_stroops}\" }},\n\
          {{ kind = \"rate_limit\", window = \"1d\", max_calls = {max_calls} }},\n\
-         ]\ndecision = \"allow\"\n"
+         ]\ndecision = \"{decision}\"\n{}",
+        decision_lines(decision)
     )
 }
 
 /// The minimal valid sponsored-create rule, with `extra` criteria.
-pub(crate) fn create_rule(extra: &str) -> String {
+pub(crate) fn create_rule(decision: &str, extra: &str) -> String {
     format!(
         "[[rules]]\nmatch = {{ tool = \"stellar_create_account\", chain = \"stellar:mainnet\" }}\n\
          criteria = [\n\
@@ -166,30 +175,33 @@ pub(crate) fn create_rule(extra: &str) -> String {
          {{ kind = \"per_tx_cap\", asset = \"native\", max_stroops = \"1000000000\" }},\n\
          {{ kind = \"per_period_cap\", window = \"1d\", asset = \"native\", max_stroops = \"10000000000\" }},\n\
          {{ kind = \"rate_limit\", window = \"1d\", max_calls = 100 }},\n\
-         {extra}]\ndecision = \"allow\"\n"
+         {extra}]\ndecision = \"{decision}\"\n{}",
+        decision_lines(decision)
     )
 }
 
 /// The claim rule whose one window criterion is a rate limit, with `extra`
 /// criteria.
-pub(crate) fn claim_rule(extra: &str) -> String {
+pub(crate) fn claim_rule(decision: &str, extra: &str) -> String {
     format!(
         "[[rules]]\nmatch = {{ tool = \"stellar_claim\", chain = \"stellar:mainnet\" }}\n\
          criteria = [\n\
          {{ kind = \"rate_limit\", window = \"1d\", max_calls = 100 }},\n\
-         {extra}]\ndecision = \"allow\"\n"
+         {extra}]\ndecision = \"{decision}\"\n{}",
+        decision_lines(decision)
     )
 }
 
 /// The trustline rule pinning [`TRUSTLINE_ASSET`] under a rate limit, with
 /// `extra` criteria.
-pub(crate) fn trustline_rule(extra: &str) -> String {
+pub(crate) fn trustline_rule(decision: &str, extra: &str) -> String {
     format!(
         "[[rules]]\nmatch = {{ tool = \"stellar_trustline\", chain = \"stellar:mainnet\" }}\n\
          criteria = [\n\
          {{ kind = \"asset_allowlist\", assets = [\"{TRUSTLINE_ASSET}\"] }},\n\
          {{ kind = \"rate_limit\", window = \"1d\", max_calls = 100 }},\n\
-         {extra}]\ndecision = \"allow\"\n"
+         {extra}]\ndecision = \"{decision}\"\n{}",
+        decision_lines(decision)
     )
 }
 
@@ -216,18 +228,17 @@ pub(crate) struct Spec {
 }
 
 impl Spec {
-    /// The default fixture of the profile `name`: one allowing rule per verb,
-    /// the full ceremony, a profile fee cap of 1000 stroops, a signed cap of
-    /// 500, a 60-second authorization lifetime and the native threshold of
-    /// [`NATIVE_THRESHOLD_STROOPS`].
+    /// The default fixture requires approval for every verb and supplies a ceremony.
+    /// The profile fee cap is 1000 stroops, and the signed cap is 500 stroops.
+    /// Authorization lasts 60 seconds, and the native threshold is [`NATIVE_THRESHOLD_STROOPS`].
     pub(crate) fn new(name: &'static str) -> Self {
         Self {
             name,
             rules: vec![
-                pay_rule("allow", ""),
-                create_rule(""),
-                claim_rule(""),
-                trustline_rule(""),
+                pay_rule("require_approval", ""),
+                create_rule("require_approval", ""),
+                claim_rule("require_approval", ""),
+                trustline_rule("require_approval", ""),
             ],
             enable: true,
             engine: PolicyEngineKind::V1,
@@ -845,7 +856,7 @@ impl MainnetFixture {
     /// The window store's JSON body after its 32-byte HMAC tag.
     pub(crate) fn window_body(&self) -> Value {
         let bytes = std::fs::read(self.window_path()).unwrap();
-        serde_json::from_slice(&bytes[32..]).unwrap()
+        serde_json::from_slice(&bytes[WINDOW_HMAC_TAG_BYTES..]).unwrap()
     }
 
     /// The audit rows of `kind`, oldest first.

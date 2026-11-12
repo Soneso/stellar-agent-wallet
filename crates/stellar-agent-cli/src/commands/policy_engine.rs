@@ -530,7 +530,7 @@ pub(crate) use stellar_agent_network::fees::effective_classic_fee_cap;
 /// A mainnet policy verdict: the decisions a mainnet write proceeds under.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MainnetVerdict {
-    /// The policy allows the write; the confirmation lives its default TTL.
+    /// The policy allows the write without a confirmation ceremony.
     Allow,
     /// The policy requires approval; the confirmation lives `ttl_ms`.
     RequireApproval {
@@ -567,9 +567,8 @@ pub(crate) struct MainnetEvaluation {
 /// Evaluates operator policy for a mainnet write, with the inputs of
 /// [`evaluate_value_moving_policy`].
 ///
-/// An allow and an approval requirement both proceed: the mainnet
-/// confirmation serves the requirement, under the TTL the evaluated rule
-/// permits. A deny is refused before any TTL is asked for.
+/// Allow grants policy authority. An approval requirement runs confirmation
+/// under the rule's lifetime. A denial grants no authority.
 ///
 /// The evaluation reads one instant, sampled through [`policy_now_ms`], and
 /// covers the [`EvaluationScope::Classic`] scope of a write whose authority
@@ -577,14 +576,15 @@ pub(crate) struct MainnetEvaluation {
 ///
 /// # Errors
 ///
-/// The deny reason's wire code on a deny, `policy.unexpected_decision` on a
-/// decision this build does not know, `policy.engine_required` when the
-/// evaluator fails, and `wallet.clock_error` when the evaluation instant
-/// cannot be read.
+/// Typed denial, engine, and clock refusals travel to the CLI boundary.
+/// An unknown decision returns an internal authority error.
+#[allow(
+    clippy::result_large_err,
+    reason = "the shared authority refusal preserves typed gate errors"
+)]
 #[allow(
     clippy::too_many_arguments,
-    reason = "the parameter set of evaluate_value_moving_policy, whose per-verb view contract \
-              the mainnet evaluation shares"
+    reason = "the evaluation requires the policy, tool, arguments, and account views"
 )]
 pub(crate) fn evaluate_mainnet_policy(
     policy: &VerifiedPolicy,
@@ -593,10 +593,13 @@ pub(crate) fn evaluate_mainnet_policy(
     value_kind: ToolValueKind,
     chain_id: &str,
     policy_args: &serde_json::Value,
-    verb: &str,
     account_view: Option<&dyn AccountReservesView>,
     identity_view: Option<&dyn AccountIdentityView>,
-) -> Result<MainnetEvaluation, Envelope<()>> {
+) -> Result<
+    MainnetEvaluation,
+    stellar_agent_network::mainnet::authority::AuthorityRefusal<WalletError>,
+> {
+    use stellar_agent_network::mainnet::authority::{AuthorityRefusal, MainnetAuthority};
     let tool_descriptor = value_descriptor(tool_name, value_kind, chain_id);
     let decision = policy_now_ms()
         .map_err(MainnetRefusal::Clock)
@@ -619,33 +622,26 @@ pub(crate) fn evaluate_mainnet_policy(
                 },
             )
         })
-        .map_err(|refusal| mainnet_refusal(refusal, verb))?;
+        .map_err(AuthorityRefusal::Refusal)?;
     let verdict = match decision.decision() {
         Decision::Allow => MainnetVerdict::Allow,
         Decision::RequireApproval(_) => MainnetVerdict::RequireApproval {
             ttl_ms: decision.governing_ttl_ms(),
         },
-        _ => return Err(unexpected_decision()),
+        _ => {
+            #[allow(
+                clippy::unwrap_used,
+                reason = "the factory rejects every decision except Allow and RequireApproval, which are matched above"
+            )]
+            let error = MainnetAuthority::from_decision(&decision, None).unwrap_err();
+            return Err(AuthorityRefusal::Internal(error));
+        }
     };
     Ok(MainnetEvaluation { verdict, decision })
 }
 
-/// The refusal envelope of a mainnet evaluation that produced no decision.
-fn mainnet_refusal(refusal: MainnetRefusal, verb: &str) -> Envelope<()> {
-    match refusal {
-        MainnetRefusal::Denied { reason, .. } => Envelope::<()>::err_raw(
-            reason.wire_code(),
-            format!("{verb} operation denied by operator policy"),
-        ),
-        MainnetRefusal::Engine(e) => {
-            Envelope::<()>::err_raw("policy.engine_required", format!("{e}"))
-        }
-        MainnetRefusal::Clock(error) => clock_refusal(&error),
-    }
-}
-
 /// The refusal of a policy evaluation whose instant cannot be read.
-fn clock_refusal(error: &WalletLifecycleError) -> Envelope<()> {
+pub(crate) fn clock_refusal(error: &WalletLifecycleError) -> Envelope<()> {
     Envelope::<()>::err(&WalletError::WalletState(WalletStateError::clock_error(
         error,
     )))
@@ -3120,10 +3116,15 @@ decision = "allow"
         let dir = tempfile::TempDir::new().expect("tempdir");
         let profile = make_profile(PolicyEngineKind::V1, "stellar-agent-owner-guard");
         let verified = refusal_guard_policy(dir.path(), &profile);
-        let render = |result: Result<MainnetEvaluation, Envelope<()>>| {
-            let Err(mut envelope) = result else {
+        let render = |result: Result<
+            MainnetEvaluation,
+            stellar_agent_network::mainnet::authority::AuthorityRefusal<WalletError>,
+        >| {
+            let Err(refusal) = result else {
                 panic!("the evaluation must refuse");
             };
+            let mut envelope =
+                crate::common::mainnet_confirm::render_authority_refusal("pay", refusal);
             envelope.request_id = "guard".to_owned();
             serde_json::to_string(&envelope).expect("envelope JSON")
         };
@@ -3134,7 +3135,6 @@ decision = "allow"
             ToolValueKind::MovesValue,
             "stellar:testnet",
             &pay_policy_args(1_000, "native", PARITY_DEST_G),
-            "pay",
             None,
             None,
         );
@@ -3149,7 +3149,6 @@ decision = "allow"
             ToolValueKind::MovesValue,
             "stellar:testnet",
             &claim_policy_args("00000000"),
-            "claim",
             None,
             None,
         );
@@ -3181,13 +3180,18 @@ decision = "allow"
             ToolValueKind::MovesValue,
             "stellar:mainnet",
             &claim_policy_args("00000000"),
-            "claim",
             None,
             None,
         ) else {
             panic!("an evaluator error must refuse");
         };
-        assert_eq!(envelope.error.unwrap().code, "policy.engine_required");
+        assert_eq!(
+            crate::common::mainnet_confirm::render_authority_refusal("claim", envelope)
+                .error
+                .unwrap()
+                .code,
+            "policy.engine_required"
+        );
     }
 
     /// A mainnet evaluation whose instant cannot be read refuses with
@@ -3195,6 +3199,10 @@ decision = "allow"
     /// allows once the clock reads again.
     #[test]
     #[serial_test::serial]
+    #[allow(
+        clippy::result_large_err,
+        reason = "the closure preserves the typed evaluation result"
+    )]
     fn mainnet_gate_clock_failure_renders_wallet_clock_error() {
         let dir = tempfile::TempDir::new().expect("tempdir");
         let profile = make_profile(PolicyEngineKind::V1, "stellar-agent-owner-guard");
@@ -3207,7 +3215,6 @@ decision = "allow"
                 ToolValueKind::MovesValue,
                 "stellar:mainnet",
                 &pay_policy_args(50, "native", PARITY_DEST_G),
-                "pay",
                 None,
                 None,
             )
@@ -3218,7 +3225,7 @@ decision = "allow"
         let Err(envelope) = evaluate() else {
             panic!("a clock failure must refuse");
         };
-        let error = envelope
+        let error = crate::common::mainnet_confirm::render_authority_refusal("pay", envelope)
             .error
             .expect("refusal envelope must carry an error block");
         assert_eq!(error.code, "wallet.clock_error");

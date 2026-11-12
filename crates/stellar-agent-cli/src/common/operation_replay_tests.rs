@@ -31,8 +31,8 @@ use crate::common::business_entry::{
     fresh_business_id, replay_exit_code, take_printed_replays_for_test,
 };
 use crate::common::mainnet_write_fixture::{
-    AGENT_SEED, AGENT_VAR, DESTINATION, ISSUER, MainnetFixture, Spec, TRUSTLINE_ASSET,
-    trustline_rule,
+    AGENT_SEED, AGENT_VAR, DESTINATION, ISSUER, MainnetFixture, Spec, TRUSTLINE_ASSET, claim_rule,
+    create_rule, pay_rule, trustline_rule,
 };
 use crate::test_rpc::ClassicRpc;
 
@@ -121,7 +121,12 @@ impl Verb {
     /// The testnet fixture of the verb, its rules on `stellar:testnet`.
     async fn testnet(self) -> MainnetFixture {
         let agent = stellar_agent_test_support::signed_envelope::account_id_for_seed(AGENT_SEED);
-        let spec = Spec::new(self.name(Row::Testnet)).testnet();
+        let spec = Spec::new(self.name(Row::Testnet)).testnet().rules(vec![
+            pay_rule("allow", ""),
+            create_rule("allow", ""),
+            claim_rule("allow", ""),
+            trustline_rule("allow", ""),
+        ]);
         match self {
             Self::Pay => spec.primary(ClassicRpc::testnet(&[&agent, DESTINATION])),
             Self::CreateAccount => {
@@ -129,7 +134,7 @@ impl Verb {
             }
             Self::Claim => spec.primary(claim::ledger(false, 100_000_000)),
             Self::Trustline => spec.primary(trustline::ledger(false, 0)).rules(vec![
-                trustline_rule("").replace(TRUSTLINE_ASSET, &testnet_asset()),
+                trustline_rule("allow", "").replace(TRUSTLINE_ASSET, &testnet_asset()),
             ]),
         }
         .build()

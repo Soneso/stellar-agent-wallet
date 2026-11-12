@@ -16,10 +16,11 @@ decisions with `policy.approval_required`, directing callers to MCP. Sponsored
 account creation, trustline, trade, and vault commands use the same refusal.
 On testnet these commands create no pending policy approval. On mainnet, trade
 and vault commands refuse with `network.mainnet_write_forbidden`. Full-mode
-payment, claim, sponsored creation, and trustline commands insert a pending
-entry and ask for passkey confirmation in the local browser, for `Allow` and
-`RequireApproval` alike. Use their MCP tools for agent
-actions; DeFi tools also refuse policy approval decisions without a pending loop.
+payment, claim, sponsored creation, and trustline commands sign `Allow` without
+a passkey ceremony. `RequireApproval` creates a pending entry and runs the
+local passkey ceremony. Setup, signed policy minimums, and sealed authorization
+remain required. Use their MCP tools for agent actions; DeFi tools also refuse
+policy approval decisions without a pending loop.
 
 Other CLI signing paths have these checks:
 

@@ -6,7 +6,9 @@ Stellar Agent Wallet is a self-custodial Stellar wallet for AI agents, with keys
 An agent uses the `stellar-agent` command-line interface or `stellar-agent-mcp`, which speaks the Model Context Protocol (MCP), a tool-call protocol, over standard input and output.
 The operator configures policy and approves requests, while the host's keyring stores enrolled signing keys and integrity keys, secrets that authenticate records.
 Payment handlers connect policy checks, required approvals, signing, and audit records to Stellar RPC, the network's remote request interface.
-Testnet is the default. Builds from this repository and releases from v0.1.0-alpha.14 on carry `mainnet-write`. These builds admit only the mainnet operations in [Mainnet configurations and scope](getting-started.md#mainnet-configurations-and-scope), after operator setup and approval for each action. A build with the feature off refuses every mainnet write.
+Testnet is the default. Builds from this repository and releases from v0.1.0-alpha.14 on carry `mainnet-write`. These builds admit only the mainnet operations in [Mainnet configurations and scope](getting-started.md#mainnet-configurations-and-scope), after operator setup.
+CLI mainnet value operations follow the governing decision: `allow` grants policy authority without a ceremony; `require_approval` requires passkey consent.
+Every MCP mainnet write requires approval. A build with the feature off refuses every mainnet write.
 
 ## Actors and trust boundaries
 

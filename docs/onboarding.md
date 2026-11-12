@@ -90,7 +90,9 @@ Nothing is asked of you on faith. The alpha is deliberately conservative:
 - **Testnet first.** Testnet is the default network, and you experiment with
   test funds from the free Friendbot faucet; nothing real is at stake while
   you learn. A mainnet write needs an explicit mainnet profile, operator
-  setup, and approval for each action; [Mainnet configurations and
+  setup, and a governing policy decision. CLI `allow` grants policy authority
+  without a ceremony; `require_approval` requires passkey consent.
+  Every MCP mainnet write requires approval. [Mainnet configurations and
   scope](getting-started.md#mainnet-configurations-and-scope) lists the
   admitted operations.
 - **Guardrails scale with you.** Running without a profile on testnet is

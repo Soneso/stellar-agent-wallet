@@ -8,9 +8,8 @@
 //!
 //! 1. the enrolled signer proof, which reads the identity record and never a
 //!    seed;
-//! 2. the typed-profile confirmation, whose summary names the latest ledger
-//!    of the operational check the build ran before its first account read,
-//!    and whose pending-approval store is closed again before any later step;
+//! 2. decision authority, with passkey confirmation for approval rules;
+//!    its summary names the latest ledger from the operational check;
 //! 3. the consent drain, the audit readiness, and the recorder preparation;
 //! 4. the authorization mint, then the operation attempt, committed as
 //!    `Sending` before any signature;
@@ -24,6 +23,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use stellar_agent_core::approval::witness::ApprovalWitness;
 use stellar_agent_core::envelope::Envelope;
 use stellar_agent_core::error::{InternalError, ValidationError, WalletError};
 use stellar_agent_core::mainnet::oracle::require_mainnet_oracle;
@@ -32,7 +32,6 @@ use stellar_agent_core::profile::name::ResolvedProfileName;
 use stellar_agent_network::cross_check::CrossCheckWitness;
 use stellar_agent_network::keyring::{EnrolledRole, enrolled_signer};
 use stellar_agent_network::mainnet::audit_readiness::audit_readiness;
-use stellar_agent_network::mainnet::authority::MainnetAuthority;
 use stellar_agent_network::mainnet::resolve::{
     InvalidationStage, TxSignRequest, invalidate_unconsumed, resolve_tx_sign,
 };
@@ -51,7 +50,9 @@ use crate::commands::approve::approval_store_dir;
 use crate::commands::policy_engine::{MainnetEvaluation, MainnetPolicy, MainnetVerdict};
 use crate::commands::submission_record::{error_envelope, prepare_mainnet_recorder};
 use crate::commands::value_audit::drain_consent_rows_before_signing;
-use crate::common::mainnet_confirm::{ConfirmDecision, MainnetWriteSummary, confirm_mainnet_write};
+use crate::common::mainnet_confirm::{
+    ConfirmDecision, MainnetWriteSummary, cli_mainnet_authority, render_authority_refusal,
+};
 use crate::common::signer_ceremony::{MainnetSignerChoice, mainnet_signer};
 
 /// The message of `network.mainnet_authorization_refused` when the signature
@@ -409,7 +410,7 @@ pub(crate) async fn authorize_and_submit(
         policy,
         evaluation,
         effective_cap,
-        witness,
+        witness: cross_check_witness,
         ledger,
         operation,
     } = req;
@@ -442,26 +443,26 @@ pub(crate) async fn authorize_and_submit(
     )
     .map_err(|e| enrollment_refusal(&e, &choice))?;
 
-    // The operator consents to the decoded envelope with a verified passkey
-    // assertion. The confirmation opens the pending store only around its
-    // own reads and writes, never across the presence wait, so the
-    // recorder's tombstone can open it after the submit.
+    // Both decisions require a valid summary. Approval rules present it
+    // during the passkey ceremony, whose store closes before recorder use.
     let summary = MainnetWriteSummary::from_envelope(unsigned_xdr, consumer, effective_cap)
         .map_err(|e| Envelope::<()>::err(&e))?
         .with_ledger(ledger);
     let store_path = approval_store_dir()
         .map_err(|e| Envelope::<()>::err(&e))?
         .join(format!("{name}.toml"));
-    let approval = confirm_mainnet_write(
-        &summary,
+    let mut witness: Option<ApprovalWitness> = None;
+    let authority = cli_mainnet_authority(
+        &evaluation.decision,
         confirm_decision(evaluation.verdict),
+        &summary,
         context,
         &policy.verified,
         &store_path,
+        &mut witness,
     )
     .await
-    .map_err(|e| Envelope::<()>::err(&e))?;
-    let authority = MainnetAuthority::Approval(&approval);
+    .map_err(|r| render_authority_refusal(verb, r))?;
 
     drain_consent_rows_before_signing(profile, name)
         .map_err(|e| refused(PipelineStep::ConsentDrain, &e, "", verb, None))?;
@@ -471,9 +472,10 @@ pub(crate) async fn authorize_and_submit(
         context,
         tool,
         evaluation.verdict.audit_decision(),
+        evaluation.decision.provenance(),
         evaluation.decision.value_effects(),
         &readiness,
-        witness,
+        cross_check_witness,
         &authority,
     )
     .map_err(|e| refused(PipelineStep::RecorderPreparation, &e, "", verb, None))?;
@@ -485,7 +487,7 @@ pub(crate) async fn authorize_and_submit(
         unsigned_envelope_xdr: unsigned_xdr,
         client,
         probe_deadline,
-        witness,
+        witness: cross_check_witness,
         signer: &enrolled,
         policy: &policy.verified,
         enablement: &policy.enablement,
@@ -741,6 +743,125 @@ mod tests {
     use stellar_agent_core::policy::DenyReason;
     use stellar_agent_network::mainnet::MainnetPrecondition;
     use stellar_agent_test_support::WarningCapture;
+
+    /// Summary validation precedes authority selection under either decision.
+    #[cfg(feature = "mainnet-write")]
+    #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial]
+    async fn summary_validation_refuses_before_authority_for_both_decisions() {
+        use crate::commands::policy_engine::load_mainnet_policy_engine;
+        use crate::common::mainnet_write_fixture::{AGENT_SEED, Spec};
+        use crate::common::signer_ceremony::signer_resolutions_on_this_thread;
+        use stellar_agent_core::mainnet::decision::{AuthorityScope, MainnetDecision};
+        use stellar_agent_core::policy::{ApprovalRequest, Decision};
+        use stellar_agent_core::profile::name::ProfileNameSource;
+        use stellar_xdr::*;
+        for (name, approval) in [("summary-policy", false), ("summary-approval", true)] {
+            let fixture = Spec::new(name).build().await;
+            let context = mainnet_context(
+                &fixture.profile(),
+                &ResolvedProfileName::from_flag(name),
+                MainnetEndpointFlags::default(),
+            )
+            .unwrap();
+            let profiles = mainnet_profiles_dir().unwrap();
+            let policy = load_mainnet_policy_engine(
+                "trustline",
+                "policy.engine_unavailable",
+                &context,
+                ProfileNameSource::Flag,
+                &profiles,
+            )
+            .unwrap();
+            let envelope = stellar_agent_test_support::SignedTestEnvelope::builder(AGENT_SEED)
+                .unsigned()
+                .build();
+            let TransactionEnvelope::Tx(mut tx) =
+                TransactionEnvelope::from_xdr_base64(envelope.envelope_xdr(), Limits::none())
+                    .unwrap()
+            else {
+                panic!("transaction")
+            };
+            tx.tx.operations = vec![Operation {
+                source_account: None,
+                body: OperationBody::ChangeTrust(ChangeTrustOp {
+                    line: ChangeTrustAsset::CreditAlphanum4(AlphaNum4 {
+                        asset_code: AssetCode4([b'U', 0x1b, b'[', 0x07]),
+                        issuer: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([7; 32]))),
+                    }),
+                    limit: 31,
+                }),
+            }]
+            .try_into()
+            .unwrap();
+            let encoded = TransactionEnvelope::Tx(tx)
+                .to_xdr_base64(Limits::none())
+                .unwrap();
+            let decision = MainnetDecision::for_test(
+                if approval {
+                    Decision::RequireApproval(ApprovalRequest::new("fixture".to_owned(), 300))
+                } else {
+                    Decision::Allow
+                },
+                None,
+                policy.verified.digest(),
+                policy.verified.sequence(),
+                3,
+                name,
+                context.chain().caip2_str(),
+                stellar_agent_core::timefmt::now_unix_ms().unwrap(),
+                if approval { 300_000 } else { 600_000 },
+                AuthorityScope::Classic,
+            );
+            let evaluation = MainnetEvaluation {
+                verdict: if approval {
+                    MainnetVerdict::RequireApproval { ttl_ms: 300_000 }
+                } else {
+                    MainnetVerdict::Allow
+                },
+                decision,
+            };
+            let before = signer_resolutions_on_this_thread();
+            let client = context.primary_client().unwrap();
+            let result = authorize_and_submit(MainnetWriteRequest {
+                context: &context,
+                profiles_dir: &profiles,
+                verb: "trustline",
+                tool: "stellar_trustline",
+                consumer: MainnetConsumer::CliTrustline,
+                unsigned_xdr: &encoded,
+                client: &client,
+                probe_deadline: std::time::Duration::from_secs(2),
+                submit_timeout: std::time::Duration::from_secs(2),
+                source: &fixture.agent.g,
+                source_flag: "--from",
+                signer: MainnetSignerChoice::Keyring,
+                policy: &policy,
+                evaluation: &evaluation,
+                effective_cap: 500,
+                witness: None,
+                ledger: OperationalReport {
+                    latest_ledger: 2000,
+                    close_time_unix: 1_900_000_000,
+                    close_lag_seconds: 0,
+                },
+                operation: None,
+            })
+            .await;
+            let Err(envelope) = result else {
+                panic!("invalid summary must refuse")
+            };
+            assert_eq!(envelope.error.unwrap().code, "protocol.xdr_codec_failed");
+            fixture.assert_no_consent_ceremony();
+            assert_eq!(signer_resolutions_on_this_thread(), before);
+            assert!(
+                fixture
+                    .open_authorizations(stellar_agent_core::timefmt::now_unix_ms().unwrap())
+                    .is_empty()
+            );
+            assert!(fixture.sent_envelopes().await.is_empty());
+        }
+    }
 
     /// Every pipeline step selects the render stage and the invalidation
     /// stage the step's place relative to the mint and the send gives it.
