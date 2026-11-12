@@ -1281,21 +1281,25 @@ pub struct RemoteApprovalConfig {
     /// WebAuthn Relying Party ID: a DNS hostname, never an IP literal.
     ///
     /// The operator must give the wallet host a resolvable name from the
-    /// approving device and reach it as `https://<rp_id>:<port>`.
+    /// approving device. Testnet uses `https://<rp_id>:<port>`.
+    /// Mainnet requires the signed origin's host and uses its public port.
     pub rp_id: String,
 
-    /// Base64url WebAuthn credential IDs authorized to consent to pending
-    /// approvals over the remote surface.
-    ///
-    /// Defaults to an empty list when omitted — fail-closed: no credential
-    /// is authorized until the operator explicitly lists one.
-    ///
-    /// The running listener and the mainnet commit read this list from the
-    /// stored profile at every login, decision and commit
-    /// ([`crate::approval::remote_authorization::RemoteApprovalAuthority`]),
-    /// so removing an id revokes the credential at once, including the
-    /// uncommitted approvals it made. The revocation procedure removes the id
-    /// here first, then the enrollment with `approve operator remove`.
+    /// PEM certificate chain, with the served leaf first. Mainnet requires this path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cert_path: Option<PathBuf>,
+
+    /// PEM private key. Mainnet requires this path and private file permissions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_path: Option<PathBuf>,
+
+    /// Base64url WebAuthn credential IDs admitted by testnet remote approval.
+    /// An omitted list is empty and admits no testnet credentials.
+    /// Testnet reads this list and enrollment at each login, decision and commit.
+    /// Removing an ID revokes its uncommitted approvals.
+    /// Revoke here before removing enrollment with `approve operator remove`.
+    /// Signed-origin mainnet consent trusts only current policy credentials.
+    /// This list and enrollment rows neither grant nor withhold that trust.
     #[serde(default)]
     pub allowed_credentials: Vec<String>,
 }
@@ -4567,6 +4571,8 @@ mod tests {
         });
         profile.remote_approval = Some(RemoteApprovalConfig {
             enabled: false,
+            cert_path: None,
+            key_path: None,
             bind: "127.0.0.1:8443".to_owned(),
             rp_id: "wallet.example".to_owned(),
             allowed_credentials: vec![],
@@ -4919,11 +4925,32 @@ mod tests {
     }
 
     #[test]
+    fn remote_approval_without_tls_paths_loads_unchanged() {
+        let text = "enabled = true\nbind = \"0.0.0.0:8443\"\nrp_id = \"wallet.internal\"\nallowed_credentials = [\"credential\"]\n";
+        let config: RemoteApprovalConfig = toml::from_str(text).unwrap();
+        assert!(config.cert_path.is_none());
+        assert!(config.key_path.is_none());
+        assert_eq!(toml::to_string(&config).unwrap(), text);
+    }
+
+    #[test]
+    fn remote_tls_paths_round_trip_when_set() {
+        let text = "enabled = true\nbind = \"0.0.0.0:8443\"\nrp_id = \"wallet.internal\"\ncert_path = \"remote/cert.pem\"\nkey_path = \"remote/key.pem\"\n";
+        let config: RemoteApprovalConfig = toml::from_str(text).unwrap();
+        let restored: RemoteApprovalConfig =
+            toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+        assert_eq!(restored.cert_path, Some(PathBuf::from("remote/cert.pem")));
+        assert_eq!(restored.key_path, Some(PathBuf::from("remote/key.pem")));
+    }
+
+    #[test]
     #[serial_test::parallel]
     fn remote_approval_serde_round_trip_when_set() {
         let mut p = make_testnet_profile();
         p.remote_approval = Some(RemoteApprovalConfig {
             enabled: true,
+            cert_path: None,
+            key_path: None,
             bind: "0.0.0.0:8443".to_owned(),
             rp_id: "wallet.internal".to_owned(),
             allowed_credentials: vec!["AABBCCDDEEFFGGHHIIJJKK".to_owned()],
@@ -4999,6 +5026,8 @@ mod tests {
     fn remote_approval_config_debug_redacts_credential_ids() {
         let cfg = RemoteApprovalConfig {
             enabled: true,
+            cert_path: None,
+            key_path: None,
             bind: "0.0.0.0:8443".to_owned(),
             rp_id: "wallet.internal".to_owned(),
             allowed_credentials: vec!["AABBCCDDEEFFGGHHIIJJKK".to_owned()],

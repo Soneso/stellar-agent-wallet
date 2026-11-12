@@ -337,7 +337,11 @@ or `trustline.policy_engine_unavailable`.
 | `approval.presence_policy_unavailable` | The current owner-signed mainnet policy cannot be verified, lists no approval credential, or changed since the consent was recorded. |
 | `approval.listener_policy_stale` | The approval listener serves an earlier owner-signed mainnet policy; restart it under the current policy. |
 | `approval.origin_signed_remote` | The owner-signed policy serves mainnet consent at its approval origin; approve there. |
-| `approval.mainnet_remote_unsupported` | The remote approval listener does not approve mainnet requests. |
+| `approval.mainnet_remote_unsupported` | Remote mainnet approval requires a signed approval origin. |
+| `approve.remote_tls_unavailable` | Configure both TLS paths and a readable, matching PEM pair; the message names the field. |
+| `approval.cert_pin_mismatch` | The served leaf key differs from the policy's SPKI pin. |
+| `approval.origin_profile_mismatch` | The profile RP differs from the signed origin's host. |
+| `approval.listener_busy` | The configured socket is occupied; use the running inbox. |
 | `approve.yes_refused_on_mainnet` | On mainnet, `--yes` refuses before store access in either build. |
 | `accounts.create.generate_refused_on_mainnet` | Mainnet creation requires a destination public key. Generated-key creation is a testnet convenience. |
 | `approval.presence_invalid` | The passkey assertion fails verification; start a fresh consent. |

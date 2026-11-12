@@ -1016,7 +1016,9 @@ The recorded process uid must match the approving local user.
 Consent records an HMAC attestation, or persists a toolset grant and consumes its pending request.
 The versioned HMAC binds the profile name, CAIP-2 chain id, approval nonce, digest, and process uid.
 The agent verifies it before executing.
-On a mainnet profile, consent also requires a verified passkey assertion from an approval credential in the owner-signed policy, and the operator approves on the local passkey page; see [Mainnet write behavior](index.md#mainnet-write-behavior).
+Mainnet consent requires a verified passkey assertion from an approval credential in the owner-signed policy.
+The operator approves on the local passkey page or at the signed approval origin.
+See [Mainnet write behavior](index.md#mainnet-write-behavior).
 See [concepts](../concepts.md) for the attestation model and [toolsets](../toolsets.md) for first-invoke grants.
 
 A `require_approval` rule's `ttl_secs` sets the pending entry's lifetime,
@@ -1089,7 +1091,8 @@ A signed origin refuses before store access with `approval.origin_signed_remote`
 - `--yes`: non-interactive auto-approve. Bypasses the stdin prompt; the wallet-controlled summary is still printed so there is a visible record. Intended for trusted automation and tests, not routine operator use.
   It applies to a testnet profile only: a mainnet profile refuses it before store access with `approve.yes_refused_on_mainnet`.
 
-On a mainnet profile the command prints the summary and opens the local passkey page; it reads no terminal input. On a testnet profile, interactively, the command prints the summary and prompts `Approve? [y/N]:`; anything other than `y`/`yes` denies. It exits `1` when the nonce is unknown, expired, already attested, created by a different local user, inconsistent, denied at the prompt, or on an I/O error.
+On mainnet the command prints the summary and reads no terminal input.
+It opens the local passkey page, or prints the signed-origin approval link to stderr when policy configures that origin. On a testnet profile, interactively, the command prints the summary and prompts `Approve? [y/N]:`; anything other than `y`/`yes` denies. It exits `1` when the nonce is unknown, expired, already attested, created by a different local user, inconsistent, denied at the prompt, or on an I/O error.
 
 The `approval_attested` audit row is written before the approval is persisted. When an MCP server or `approve serve` inbox holds that profile's audit writer, the row is queued in the audit outbox. The running process appends it to the log before any process loads a signing key for the approved action. The envelope's `audit` field says which happened: `"written"` or `"queued"`. The command refuses, persists nothing, and exits `1` when the writer is held by a process that does not drain the outbox (`audit.writer_locked`). It does the same on any other audit failure. Examples are a missing audit key, a rolled-back log (`audit.tip_anchor_mismatch`), and a busy outbox (`audit.outbox_busy`).
 
@@ -1262,10 +1265,17 @@ host, without an SSH tunnel. Requires the profile's `[remote_approval]` block
 with `enabled = true` AND `--confirm-remote-exposure` as a separate, explicit
 consent flag; either alone refuses to start. See
 [Remote approval](../remote-approval.md) for the full setup, trust model, and
-walkthrough. The remote listener serves testnet profiles only: on a mainnet
-profile it refuses to start with `approval.mainnet_remote_unsupported`. Approve
-or reject a mainnet request in the local inbox (`approve serve` without
-`--remote`).
+walkthrough. Mainnet requires an origin and SPKI pin in the verified policy.
+Without them, startup refuses with `approval.mainnet_remote_unsupported`.
+
+Use absolute paths for `cert_path` and `key_path`; relative values resolve against the process working directory.
+Signed-origin serving requires explicit `cert_path` and `key_path`, enabled remote configuration, and a profile RP matching the signed host.
+The listener trusts current policy credentials and enforces their counters once per login or decision.
+Restart it after policy signing or TLS replacement.
+Persistent serve requires `--confirm-remote-exposure`, accepts `--no-open`, and uses no display or browser opener.
+One-shot consent needs no exposure flag and prints `<signed-origin>/approvals/<id>` to stderr without a token.
+Login continues to that id; completion, cancellation, expiry and interruption close the listener.
+An occupied configured socket reports `approval.listener_busy`; use the running inbox.
 
 ### `approve operator enroll`
 

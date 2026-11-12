@@ -147,11 +147,11 @@ policy ([approval credentials](../profiles.md#approval-credentials)). Terminal i
 pseudo-terminal, `--yes`, and the local process identity supply no mainnet
 consent.
 
-Mainnet approve, the local inbox, and direct CLI confirmation open a localhost
-passkey page. The operator reviews the authoritative transaction and approves
-with an owner-pinned credential. Headless consent, `--yes`, `--no-open` on the
-mainnet inbox, and remote mainnet approval refuse. Ledger signing also requires
-this passkey ceremony when the CLI policy requires approval.
+Without a signed approval origin, mainnet consent uses the localhost passkey page.
+Headless consent, `--yes`, `--no-open` on the local inbox, and remote mainnet approval then refuse.
+With a signed approval origin, the HTTPS listener serves consent using an owner-pinned credential.
+The CLI prints the signed approval link without opening a browser or requiring a display.
+Ledger signing also requires this passkey ceremony when the CLI policy requires approval.
 
 A localhost ceremony binds `127.0.0.1` and `[::1]` on one port before it
 creates any token, serves the same session on both, and closes both together.

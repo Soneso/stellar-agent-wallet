@@ -19,6 +19,9 @@
 /// `GET /static/login.js`. Source-of-truth: `src/web/login.js`.
 pub(crate) const LOGIN_JS: &[u8] = include_bytes!("login.js");
 
+/// Login navigation for a server-validated signed-origin destination.
+pub(crate) const SIGNED_LOGIN_JS: &[u8] = include_bytes!("signed-login.js");
+
 /// Pre-authentication enrollment-page browser glue served ungated at
 /// `GET /static/enroll.js`. Source-of-truth: `src/web/enroll.js`.
 pub(crate) const ENROLL_JS: &[u8] = include_bytes!("enroll.js");

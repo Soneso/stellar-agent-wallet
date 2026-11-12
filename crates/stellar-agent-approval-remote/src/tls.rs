@@ -1,13 +1,13 @@
 //! TLS certificate provisioning for the remote-approval listener.
 //!
-//! [`provision_or_load`] serves a profile without configured certificate
+//! [`provision_or_load`] serves a testnet profile without configured certificate
 //! files. [`load_pinned`] serves a certificate pinned by its SubjectPublicKeyInfo
 //! hash, as an owner-signed approval origin names it, and never generates
 //! one.
 //!
 //! # Generated certificates
 //!
-//! On first `--remote` start for a given profile, generates a self-signed
+//! On first testnet start without configured TLS paths, generates a self-signed
 //! `rcgen` key + certificate for the configured `rp_id` under the profile
 //! state directory (private key mode `0600` on Unix; the process refuses to
 //! start if an existing key file has looser permissions). Subsequent starts
@@ -40,6 +40,11 @@
 //! lengths within their enclosing element and the expected tag at each step,
 //! and no byte after the certificate. A missing or unreadable file names its
 //! field, and nothing is generated in its place.
+//! Mainnet always requires both configured paths, even when default files exist.
+//! The SPKI pin differs from a fingerprint of the complete certificate.
+//! Browsers separately trust a public CA or an installed private CA.
+//! Policy signing and certificate replacement require restart; TLS never reloads in place.
+//! Issuance, renewal automation and TLS-terminating proxies are outside this module's scope.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -87,7 +92,7 @@ pub enum TlsProvisionError {
     #[error("could not determine the remote-approval TLS state directory")]
     StateDirUnavailable,
 
-    /// A configured certificate or key file of a pinned load cannot be used.
+    /// A configured certificate or key file cannot be used.
     /// Nothing is generated in its place.
     #[error("remote-approval TLS {field} {problem}")]
     FileUnavailable {
@@ -104,6 +109,23 @@ pub enum TlsProvisionError {
 }
 
 impl TlsProvisionError {
+    /// Renders configuration refusals while retaining the provisioning permission mapping.
+    #[must_use]
+    pub fn wallet_error(&self) -> stellar_agent_core::WalletError {
+        use stellar_agent_core::{WalletError, error::InternalError};
+        match self {
+            Self::CertPinMismatch => WalletError::Approval(ApprovalFailure::CertPinMismatch),
+            Self::FileUnavailable { .. } => {
+                WalletError::Approval(ApprovalFailure::RemoteTlsUnavailable {
+                    detail: self.to_string(),
+                })
+            }
+            _ => WalletError::Internal(InternalError::UnexpectedState {
+                detail: format!("approve.remote_tls_provision_failed: {self}"),
+            }),
+        }
+    }
+
     fn from_io(e: std::io::Error) -> Self {
         Self::Io {
             kind: e.kind(),
@@ -123,7 +145,7 @@ impl TlsProvisionError {
     }
 }
 
-/// The configuration field that names a file of a pinned TLS load.
+/// The configuration field that names a TLS file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum TlsFileField {
@@ -150,7 +172,7 @@ impl std::fmt::Display for TlsFileField {
     }
 }
 
-/// Why a file of a pinned TLS load cannot be used.
+/// Why a configured TLS file cannot be used.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum TlsFileProblem {
@@ -162,6 +184,8 @@ pub enum TlsFileProblem {
     NoCertificate,
     /// The first `CERTIFICATE` block is not a certificate the walk reads.
     MalformedCertificate,
+    /// The certificate and key cannot form a TLS server configuration.
+    InvalidPair,
 }
 
 impl std::fmt::Display for TlsFileProblem {
@@ -171,6 +195,7 @@ impl std::fmt::Display for TlsFileProblem {
             Self::Unreadable => "names a file that cannot be read",
             Self::NoCertificate => "names a file without a CERTIFICATE block",
             Self::MalformedCertificate => "names a file whose first certificate is malformed",
+            Self::InvalidPair => "contains malformed PEM or does not match cert_path",
         })
     }
 }
@@ -300,25 +325,88 @@ pub fn load_pinned(
     key_path: &Path,
     pin: &[u8; 32],
 ) -> Result<ProvisionedTls, TlsProvisionError> {
+    let tls = load_configured(cert_path, key_path)?;
+    verify_pin(&tls, pin)?;
+    Ok(tls)
+}
+
+/// Loads an explicit PEM pair without generating files.
+///
+/// # Errors
+/// Returns the configured field refusal or private-key permission refusal.
+fn load_configured(cert_path: &Path, key_path: &Path) -> Result<ProvisionedTls, TlsProvisionError> {
     let cert_pem = read_configured(cert_path, TlsFileField::CertPath)?;
     let cert_text = std::str::from_utf8(&cert_pem)
         .map_err(|_| file_problem(TlsFileField::CertPath, TlsFileProblem::NoCertificate))?;
     let leaf = pem_decode_first_block(cert_text)
         .ok_or_else(|| file_problem(TlsFileField::CertPath, TlsFileProblem::NoCertificate))?;
-    let spki = leaf_spki(&leaf).ok_or_else(|| {
+    leaf_spki(&leaf).ok_or_else(|| {
         file_problem(TlsFileField::CertPath, TlsFileProblem::MalformedCertificate)
     })?;
-    fs::metadata(key_path).map_err(|e| file_error(TlsFileField::KeyPath, &e))?;
+    let metadata = fs::metadata(key_path).map_err(|e| file_error(TlsFileField::KeyPath, &e))?;
+    if !metadata.is_file() {
+        return Err(file_problem(
+            TlsFileField::KeyPath,
+            TlsFileProblem::Unreadable,
+        ));
+    }
     enforce_key_permissions(key_path)?;
     let key_pem = read_configured(key_path, TlsFileField::KeyPath)?;
-    if Sha256::digest(spki).as_slice() != pin.as_slice() {
-        return Err(TlsProvisionError::CertPinMismatch);
-    }
     Ok(ProvisionedTls {
         fingerprint_sha256_hex: hex_sha256(&leaf),
         cert_pem,
         key_pem,
     })
+}
+
+/// Checks the actual served leaf against the startup pin.
+pub(crate) fn verify_pin(tls: &ProvisionedTls, pin: &[u8; 32]) -> Result<(), TlsProvisionError> {
+    let leaf = std::str::from_utf8(&tls.cert_pem)
+        .ok()
+        .and_then(pem_decode_first_block)
+        .ok_or_else(|| file_problem(TlsFileField::CertPath, TlsFileProblem::NoCertificate))?;
+    let spki = leaf_spki(&leaf).ok_or_else(|| {
+        file_problem(TlsFileField::CertPath, TlsFileProblem::MalformedCertificate)
+    })?;
+    if Sha256::digest(spki).as_slice() != pin.as_slice() {
+        return Err(TlsProvisionError::CertPinMismatch);
+    }
+    Ok(())
+}
+
+/// Selects explicit files, or testnet provisioning when both paths are absent.
+///
+/// A signed pin requires both paths. An incomplete pair always refuses.
+///
+/// # Errors
+/// Returns missing-field, file, permission, provisioning, or pin refusals.
+pub async fn select_tls(
+    profile_name: &str,
+    config: &stellar_agent_core::profile::schema::RemoteApprovalConfig,
+    pin: Option<&[u8; 32]>,
+) -> Result<(ProvisionedTls, axum_server::tls_rustls::RustlsConfig), TlsProvisionError> {
+    let tls = match (&config.cert_path, &config.key_path) {
+        (Some(cert), Some(key)) => match pin {
+            Some(pin) => load_pinned(cert, key, pin),
+            None => load_configured(cert, key),
+        },
+        (None, None) if pin.is_none() => provision_or_load(profile_name, &config.rp_id),
+        (None, _) => Err(file_problem(
+            TlsFileField::CertPath,
+            TlsFileProblem::Missing,
+        )),
+        (_, None) => Err(file_problem(TlsFileField::KeyPath, TlsFileProblem::Missing)),
+    }?;
+    let server = server_config(&tls).await?;
+    Ok((tls, server))
+}
+
+pub(crate) async fn server_config(
+    tls: &ProvisionedTls,
+) -> Result<axum_server::tls_rustls::RustlsConfig, TlsProvisionError> {
+    axum_server::tls_rustls::RustlsConfig::from_pem(tls.cert_pem.clone(), tls.key_pem.clone())
+        .await
+        .map_err(|_| file_problem(TlsFileField::KeyPath, TlsFileProblem::InvalidPair))
 }
 
 /// The bytes of the configured file at `path`, refusing with `field`.

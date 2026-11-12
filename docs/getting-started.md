@@ -860,11 +860,11 @@ the owner-signed policy as an approval credential:
 3. Sign the policy with `profile sign-policy`, which assigns a higher sequence.
 4. Restart the MCP server and every `approve serve` inbox of the profile.
 
-Mainnet approve, the local inbox, and direct CLI confirmation open a localhost
-passkey page. The operator reviews the authoritative transaction and approves
-with an owner-pinned credential. Headless consent, `--yes`, `--no-open` on the
-mainnet inbox, and remote mainnet approval refuse. Ledger signing also requires
-this passkey ceremony.
+Without a signed approval origin, mainnet consent uses the localhost passkey page.
+Headless consent, `--yes`, `--no-open` on the local inbox, and remote mainnet approval then refuse.
+With a signed approval origin, the HTTPS listener serves consent using an owner-pinned credential.
+The CLI prints the signed approval link without opening a browser or requiring a display.
+Ledger signing also requires this passkey ceremony.
 
 See [Mainnet write behavior](cli-reference/index.md#mainnet-write-behavior),
 [Mainnet policy body](profiles.md#mainnet-policy-body), and

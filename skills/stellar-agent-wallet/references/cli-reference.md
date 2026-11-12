@@ -157,11 +157,11 @@ policy ([approval credentials](profiles-and-keys.md#approval-credentials)). Term
 pseudo-terminal, `--yes`, and the local process identity supply no mainnet
 consent.
 
-Mainnet approve, the local inbox, and direct CLI confirmation open a localhost
-passkey page. The operator reviews the authoritative transaction and approves
-with an owner-pinned credential. Headless consent, `--yes`, `--no-open` on the
-mainnet inbox, and remote mainnet approval refuse. Ledger signing also requires
-this passkey ceremony.
+Without a signed approval origin, mainnet consent uses the localhost passkey page.
+Headless consent, `--yes`, `--no-open` on the local inbox, and remote mainnet approval then refuse.
+With a signed approval origin, the HTTPS listener serves consent using an owner-pinned credential.
+The CLI prints the signed approval link without opening a browser or requiring a display.
+Ledger signing also requires this passkey ceremony.
 
 An MCP mainnet commit accepts only a version 5 approval with its verified
 presence receipt. An invalid proof refuses with `policy.approval_required`.
@@ -1176,7 +1176,18 @@ Binds a TLS-protected, passkey-authenticated remote-approval surface instead of 
 | `--remote` | Bind the remote surface instead of the loopback inbox |
 | `--confirm-remote-exposure` | Required explicit consent, separate from the profile's `enabled` flag |
 
-Every approve or reject on this surface requires a fresh WebAuthn passkey assertion bound to the exact pending entry, in addition to the session login. The remote surface serves testnet profiles only: on a mainnet profile it refuses to start with `approval.mainnet_remote_unsupported`. Approve or reject a mainnet request in the local inbox (`approve serve` without `--remote`). See `docs/remote-approval.md` in the wallet repository for the full setup guide (the `[remote_approval]` profile block, DNS/hosts-file requirements for `rp_id`, and the login/approve walkthrough).
+Every approve or reject on this surface requires a fresh WebAuthn passkey assertion bound to the exact pending entry, in addition to the session login. Mainnet requires an origin and SPKI pin in the verified policy.
+Without them, startup refuses with `approval.mainnet_remote_unsupported`.
+
+Use absolute paths for `cert_path` and `key_path`; relative values resolve against the process working directory.
+Signed-origin serving requires explicit `cert_path` and `key_path`, enabled remote configuration, and a profile RP matching the signed host.
+The listener trusts current policy credentials and enforces their counters once per login or decision.
+Restart it after policy signing or TLS replacement.
+Persistent serve requires `--confirm-remote-exposure`, accepts `--no-open`, and uses no display or browser opener.
+One-shot consent needs no exposure flag and prints `<signed-origin>/approvals/<id>` to stderr without a token.
+Login continues to that id; completion, cancellation, expiry and interruption close the listener.
+An occupied configured socket reports `approval.listener_busy`; use the running inbox.
+See `docs/remote-approval.md` in the wallet repository for the full setup guide (the `[remote_approval]` profile block, DNS/hosts-file requirements for `rp_id`, and the login/approve walkthrough).
 
 ```bash
 stellar-agent approve serve --remote --confirm-remote-exposure --profile default

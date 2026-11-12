@@ -897,11 +897,19 @@ reason = "review"
 
 #### Approval origin configuration
 
-The optional signed origin and certificate pin configure policy data.
-They grant no runtime remote approval support.
-Under a policy that signs both, mainnet presence binds the origin's host as the relying-party ID, the origin, and the pin.
-The local inbox and the localhost passkey page then refuse with `approval.origin_signed_remote`, and no listener in this release serves the signed origin.
-Both absent preserve the local-only default.
+The signed origin and certificate pin authorize mainnet consent through the HTTPS listener.
+The origin's host is the relying-party ID; the profile's `rp_id` must match it.
+Configure `enabled = true`, `cert_path` and `key_path` in `[remote_approval]`.
+Use absolute paths for both TLS files.
+Relative `cert_path` and `key_path` values resolve against the process working directory.
+The pin hashes the leaf certificate's SPKI DER, not the complete certificate.
+Login and decisions trust only credentials in the current verified policy.
+The operator store supplies counters; enrollment and the profile allowlist grant no mainnet trust.
+Counters advance once per verified login or decision, except that zero may follow zero.
+Receipt verification and commit do not update counters.
+Restart the listener after policy signing or certificate replacement; running listeners never reload TLS.
+The local inbox refuses with `approval.origin_signed_remote`.
+Both signed fields absent preserve the local-only default.
 
 An origin contains exactly `https://<host>[:<port>]`.
 The host uses lowercase ASCII DNS labels of 1 through 63 characters,
@@ -954,11 +962,11 @@ sequence. An approval recorded under an earlier policy needs fresh consent,
 also when its credential stays listed. The `[remote_approval]` allowlist and
 `approve operator remove` do not change the approval credentials.
 
-Mainnet approve, the local inbox, and direct CLI confirmation open a localhost
-passkey page. The operator reviews the authoritative transaction and approves
-with an owner-pinned credential. Headless consent, `--yes`, `--no-open` on the
-mainnet inbox, and remote mainnet approval refuse. Ledger signing also requires
-this passkey ceremony.
+Without a signed approval origin, mainnet consent uses the localhost passkey page.
+Headless consent, `--yes`, `--no-open` on the local inbox, and remote mainnet approval then refuse.
+With a signed approval origin, the HTTPS listener serves consent using an owner-pinned credential.
+The CLI prints the signed approval link without opening a browser or requiring a display.
+Ledger signing also requires this passkey ceremony.
 
 #### Enabled-policy minimum
 

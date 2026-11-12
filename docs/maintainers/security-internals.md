@@ -897,8 +897,15 @@ CSRF value alone decide nothing. The attester admits the `serve-remote`
 surface only for a receipt that names a listener identity. After it reloads
 the policy and before the row, it refuses every receipt whose listener
 identity names a policy digest or pin other than the current policy's with
-`approval.listener_policy_stale`. No listener in this release serves a signed
-origin, and remote mainnet approval still refuses.
+`approval.listener_policy_stale`.
+The HTTPS listener verifies the served leaf SPKI against the startup identity before binding.
+Signed Host and Origin checks use the public authority, never forwarded headers or the backend port.
+Policy credentials alone authorize login and actions; enrolled keys and profile allowlists grant no trust.
+The store checks counters under its lock once after each verified login, approval or rejection.
+Zero may follow zero; equal nonzero and lower login counts refuse with `webauthn_assertion_invalid`.
+Approval and rejection counter failures use `approval.presence_invalid`.
+Receipt re-verification and commit never update counters.
+Policy signing and TLS replacement require a listener restart.
 
 A ceremony without an intent under a localhost policy uses the legacy layout:
 
@@ -1034,15 +1041,17 @@ held.
 The `approval_attested` row of a mainnet consent carries `mainnet_presence`:
 the credential fingerprint, the challenge and receipt digests, the policy
 digest and sequence, the relying-party ID and origin, the UP and UV flags, the
-signature counter, and the verification time. The counter is recorded only; no
-durable counter is kept and no clone is detected.
+signature counter, and the verification time.
+Localhost receipts record counters without enforcing them.
+Signed-origin login and decisions enforce durable counters; zero may follow zero.
+Counter enforcement does not guarantee clone detection.
 
-Mainnet approve, the local inbox, and direct CLI confirmation open a localhost
-passkey page. The operator reviews the authoritative transaction and approves
-with an owner-pinned credential. Headless consent, `--yes`, `--no-open` on the
-mainnet inbox, and remote mainnet approval refuse. Direct CLI confirmation runs
-only for RequireApproval, including Ledger signing. Allow signs under policy
-authority without a summary, pending approval, or consent row.
+Without a signed approval origin, mainnet consent uses the localhost passkey page.
+Headless consent, `--yes`, `--no-open` on the local inbox, and remote mainnet approval then refuse.
+With a signed approval origin, the HTTPS listener serves consent using an owner-pinned credential.
+The CLI prints the signed approval link without opening a browser or requiring a display.
+Direct CLI confirmation runs only for RequireApproval, including Ledger signing.
+Allow signs under policy authority without a summary, pending approval, or consent row.
 The page binds its rendered view digest to the current entry and signed policy
 before issuing a challenge. Challenge and assertion requests require the
 session cookie, per-nonce CSRF header, and origin-scoped session proof.
@@ -1050,7 +1059,8 @@ A challenge is consumed before assertion decoding, including on failure.
 The one-shot listener returns a sealed proof to the command; the inbox consumes
 it through the shared decision path. Both paths reload authority after waits.
 The command waits until pending expiry; each challenge lasts at most 120 seconds.
-The listener uses the exact bound localhost port as its assertion origin.
+The localhost listener uses its exact bound port as the assertion origin.
+The signed-origin listener uses the canonical policy origin and its explicit TLS paths.
 
 
 ### Endpoint identity before the first signed read

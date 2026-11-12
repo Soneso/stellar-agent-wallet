@@ -397,13 +397,16 @@ Mainnet consent uses version 5, under the tag `stellar-agent-approval-attestatio
 The receipt holds a consent request ID, the random challenge input, the policy sequence, digest, and owner, the expected origin, the issue, expiry, and verification times, and the raw WebAuthn assertion.
 The consent request ID names one ceremony; the approval nonce names the pending action.
 The commit witness verifies the receipt again: it recomputes the challenge from the stored record and binding, checks the raw assertion under the credential key of the current signed policy, and requires that policy to be the one the receipt names.
-A version 4 blob never verifies as version 5, so a local or remote approval cannot stand for a mainnet consent.
-The authenticator's signature counter is recorded and not enforced: fresh single-use challenges provide replay protection, and the wallet does not detect cloned credentials.
-Mainnet approve, the local inbox, and direct CLI confirmation open a localhost
-passkey page. The operator reviews the authoritative transaction and approves
-with an owner-pinned credential. Headless consent, `--yes`, `--no-open` on the
-mainnet inbox, and remote mainnet approval refuse. Ledger signing also requires
-this passkey ceremony.
+A version 4 blob never verifies as version 5.
+Signed-origin mainnet consent persists version 5 with a version 2 presence receipt and the listener's verified policy identity.
+Localhost ceremonies record signature counters without enforcing them.
+Signed-origin login and decisions enforce counters once per assertion; equal nonzero or lower counts refuse, while zero may follow zero.
+Receipt re-verification and commit do not update counters.
+Without a signed approval origin, mainnet consent uses the localhost passkey page.
+Headless consent, `--yes`, `--no-open` on the local inbox, and remote mainnet approval then refuse.
+With a signed approval origin, the HTTPS listener serves consent using an owner-pinned credential.
+The CLI prints the signed approval link without opening a browser or requiring a display.
+Ledger signing also requires this passkey ceremony.
 
 The length prefixes on the variable fields prevent boundary-collision attacks (two different nonce/uid pairs cannot collide into the same input). The `envelope_sha256` slot binds the attestation to the exact transaction envelope that will be signed. The `process_uid` (numeric OS uid on Unix) gives cross-account-on-host non-replay: a tag minted by one local user cannot be replayed by another.
 

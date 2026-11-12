@@ -1,12 +1,25 @@
 # stellar-agent-approval-remote
 
-TLS-protected, passkey-authenticated remote approval HTTP surface for the stellar-agent-wallet.
+TLS-protected, passkey-authenticated approval from another device.
 
-This crate lets an operator approve or reject pending agent actions from a device other than the wallet host, without SSH access. TLS is mandatory: there is no plaintext remote path. Every approve or reject action requires a fresh WebAuthn passkey assertion computed over a challenge cryptographically bound to the exact pending approval, so an assertion verified for one entry can never authorize a different entry.
+Testnet authorization checks the live profile allowlist and enrolled operator key.
+Mainnet requires a signed approval origin and leaf SPKI pin from the verified policy.
+Mainnet login and decisions trust policy credentials alone; the operator store supplies counters.
+Each verified login, approval or rejection enforces the counter once, allowing zero after zero.
+Receipt verification and commit do not update counters.
 
-Two independent authorization layers guard each action: the HTTP layer verifies the fresh assertion, and the core approval gate independently re-checks allowlist membership and the witness's entry binding. Enrollment of a new operator credential stays loopback-only and is never accepted over the network. The attestation this listener produces is byte-identical to the local loopback path's; the distinction between local and remote approval lives only in the audit log.
+Configure explicit `cert_path` and `key_path` for mainnet.
+The SPKI pin hashes the leaf key structure, not the full certificate fingerprint.
+The browser separately trusts a public CA or an installed private CA.
+Restart after policy signing or certificate replacement; running listeners never reload TLS.
+Issuance, renewal automation and TLS-terminating proxies are outside this crate's scope.
 
-It is part of the stellar-agent-wallet workspace. The listener is bound by the `stellar-agent-cli` `approve serve --remote` flow rather than used directly.
+Persistent serving uses `approve serve --remote --confirm-remote-exposure`.
+Signed-origin serving accepts `--no-open` and needs no display or browser opener.
+One-shot consent requires enabled remote configuration and prints the signed approval link without a token.
+It scopes every route to one entry and closes on completion, cancellation, expiry or interruption.
+An occupied socket reports `approval.listener_busy` and directs the operator to the running inbox.
+See the repository's remote approval guide for setup and refusal codes.
 
 ## Status
 

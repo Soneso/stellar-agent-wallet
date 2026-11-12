@@ -95,10 +95,37 @@ fn kind_is_approvable(summary: &ApprovalSummaryView) -> bool {
     )
 }
 
-/// Renders the login page (`GET /`) — no session required; this IS the
-/// pre-authentication surface. Loads the ungated `/static/login.js`.
+/// Selects the login script and its validated continuation.
+#[derive(Clone, Copy)]
+pub(crate) enum LoginMode<'a> {
+    Testnet,
+    Signed { destination: &'a str },
+}
+
+/// Renders the public login page with the script for its listener mode.
 #[must_use]
-pub(crate) fn render_login_page(rp_id: &str, identity: &PageIdentity) -> String {
+pub(crate) fn render_login_page(
+    rp_id: &str,
+    identity: &PageIdentity,
+    mode: LoginMode<'_>,
+) -> String {
+    let (credential, status, script, destination) = match mode {
+        LoginMode::Testnet => (
+            "the passkey you enrolled for this wallet",
+            "registered",
+            "login.js",
+            String::new(),
+        ),
+        LoginMode::Signed { destination } => (
+            "a passkey admitted by the signed policy",
+            "policy",
+            "signed-login.js",
+            format!(
+                "<script type=\"application/json\" id=\"login-destination\">{}</script>\n",
+                json_data_island(&serde_json::json!({"destination": destination}))
+            ),
+        ),
+    };
     let rp_id = html_escape(rp_id);
     let title = identity.page_title("Sign in to approve");
     let card_header = identity.card_header_html();
@@ -117,17 +144,17 @@ pub(crate) fn render_login_page(rp_id: &str, identity: &PageIdentity) -> String 
 {card_header}
       <h1>Sign in to approve</h1>
       <p class="lead">Connecting to <code class="chip">{rp_id}</code>. Confirm with
-         the passkey you enrolled for this wallet to see the requests waiting for
+         {credential} to see the requests waiting for
          your decision.</p>
-      <div class="status" id="status">Sign in with your registered passkey to view pending approvals.</div>
+      <div class="status" id="status">Sign in with your {status} passkey to view pending approvals.</div>
       <button class="card-btn" id="login-btn" type="button">Sign in with passkey</button>
       <p class="help">Only a passkey this wallet already allows can sign in. A
          failed attempt reveals nothing about what is pending.</p>
 {TRUST_LINE_SELF_HOSTED}
     </div>
   </main>
-  <script src="/static/login.js"></script>
-</body>
+  <script src="/static/{script}"></script>
+{destination}</body>
 </html>"#
     )
 }
@@ -655,7 +682,7 @@ mod tests {
 
     #[test]
     fn login_page_has_rp_id_and_login_js() {
-        let html = render_login_page("wallet.internal", &neutral());
+        let html = render_login_page("wallet.internal", &neutral(), LoginMode::Testnet);
         assert!(html.contains("wallet.internal"));
         assert!(html.contains(r#"src="/static/login.js""#));
         assert!(!html.contains("<script>"), "no inline script allowed");
@@ -663,7 +690,7 @@ mod tests {
 
     #[test]
     fn login_page_escapes_rp_id() {
-        let html = render_login_page("<script>x</script>", &neutral());
+        let html = render_login_page("<script>x</script>", &neutral(), LoginMode::Testnet);
         assert!(!html.contains("<script>x</script>"));
         assert!(html.contains("&lt;script&gt;"));
     }
@@ -1015,7 +1042,10 @@ mod tests {
     fn every_page(dir: &TempDir, identity: &PageIdentity) -> Vec<(&'static str, String)> {
         let view = payment_view(dir, false, NOW_MS);
         vec![
-            ("login", render_login_page("wallet.internal", identity)),
+            (
+                "login",
+                render_login_page("wallet.internal", identity, LoginMode::Testnet),
+            ),
             ("enroll", render_enroll_page("wallet.internal", identity)),
             (
                 "message",
@@ -1198,7 +1228,7 @@ mod tests {
     #[test]
     fn card_pages_claim_self_hosting_and_never_loopback() {
         for html in [
-            render_login_page("wallet.internal", &neutral()),
+            render_login_page("wallet.internal", &neutral(), LoginMode::Testnet),
             render_enroll_page("wallet.internal", &neutral()),
             render_message_page("Too many requests", "Wait and retry.", &neutral()),
             render_not_found_page(&neutral()),

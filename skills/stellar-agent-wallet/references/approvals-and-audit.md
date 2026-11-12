@@ -90,11 +90,11 @@ owner-signed policy. `approval.attestation_invalid` covers missing coverage or
 a mismatched subject. MCP reports failed approval proofs as
 `policy.approval_required`.
 
-Mainnet approve, the local inbox, and direct CLI confirmation open a localhost
-passkey page. The operator reviews the authoritative transaction and approves
-with an owner-pinned credential. Headless consent, `--yes`, `--no-open` on the
-mainnet inbox, and remote mainnet approval refuse. Ledger signing also requires
-this passkey ceremony.
+Without a signed approval origin, mainnet consent uses the localhost passkey page.
+Headless consent, `--yes`, `--no-open` on the local inbox, and remote mainnet approval then refuse.
+With a signed approval origin, the HTTPS listener serves consent using an owner-pinned credential.
+The CLI prints the signed approval link without opening a browser or requiring a display.
+Ledger signing also requires this passkey ceremony.
 
 A localhost ceremony binds `127.0.0.1` and `[::1]` on one port before it
 creates any token, serves the same session on both, and closes both together.
