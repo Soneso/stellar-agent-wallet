@@ -1591,6 +1591,20 @@ pub enum ValidationError {
         detail: String,
     },
 
+    /// The audit outbox holds its cap of queued rows. Nothing is queued.
+    #[error("{detail}")]
+    AuditOutboxFull {
+        /// Diagnostic led by the outbox-capacity code.
+        detail: String,
+    },
+
+    /// A queued row would exceed the audit log's row cap. Nothing is queued.
+    #[error("{detail}")]
+    AuditOutboxRowTooLarge {
+        /// Diagnostic led by the row-size code.
+        detail: String,
+    },
+
     /// An outbox-loss acknowledgement finds no committed loss.
     #[error("{detail}")]
     AuditOutboxLossNotFound {
@@ -2393,6 +2407,8 @@ impl ValidationError {
             // `AuditLogNotFound` above for the same rationale.
             Self::AuditTipAnchorMissing { .. } => "audit.tip_anchor_missing",
             Self::AuditOutboxRowsMissing { .. } => "audit.outbox_rows_missing",
+            Self::AuditOutboxFull { .. } => "audit.outbox_full",
+            Self::AuditOutboxRowTooLarge { .. } => "audit.outbox_row_too_large",
             Self::AuditOutboxLossNotFound { .. } => "audit.outbox_loss_not_found",
             // Same wire code as the two variants above by design — see this
             // variant's doc comment for why the code stays unified while the
@@ -4418,6 +4434,18 @@ mod tests {
                 "audit.outbox_rows_missing",
             ),
             (
+                ValidationError::AuditOutboxFull {
+                    detail: "queue at its cap".to_owned(),
+                },
+                "audit.outbox_full",
+            ),
+            (
+                ValidationError::AuditOutboxRowTooLarge {
+                    detail: "row over the cap".to_owned(),
+                },
+                "audit.outbox_row_too_large",
+            ),
+            (
                 ValidationError::AuditOutboxLossNotFound {
                     detail: "no queued-row loss".to_owned(),
                 },
@@ -4772,6 +4800,14 @@ mod tests {
                 }
                 ValidationError::AuditOutboxRowsMissing { detail } => {
                     ValidationError::AuditOutboxRowsMissing {
+                        detail: detail.clone(),
+                    }
+                }
+                ValidationError::AuditOutboxFull { detail } => ValidationError::AuditOutboxFull {
+                    detail: detail.clone(),
+                },
+                ValidationError::AuditOutboxRowTooLarge { detail } => {
+                    ValidationError::AuditOutboxRowTooLarge {
                         detail: detail.clone(),
                     }
                 }

@@ -4716,6 +4716,7 @@ dependencies = [
  "proptest",
  "rand_core 0.6.4",
  "region",
+ "rustix",
  "same-file",
  "schemars 1.2.1",
  "serde",
