@@ -2610,6 +2610,180 @@ mod tests {
         }
     }
 
+    /// An outbox for the log at `log`, with its carriers enrolled and `rows`
+    /// consent rows queued.
+    fn outbox_with_rows(log: &std::path::Path, rows: usize) -> AuditOutbox {
+        let store =
+            std::sync::Arc::new(crate::audit_log::tip_anchor::InMemoryTipAnchorStore::new());
+        crate::audit_log::test_helpers::enroll_carriers(log, store.as_ref()).unwrap();
+        let outbox = AuditOutbox::for_log(log, store);
+        for index in 0..rows {
+            outbox
+                .append(&AuditEntry::new_approval_attested(
+                    "PaymentSimulated",
+                    "stellar_pay_commit",
+                    None,
+                    "ABCDEFGHIJKLMNOPQRSTUV",
+                    "cli",
+                    format!("queued-{index}"),
+                ))
+                .unwrap();
+        }
+        outbox
+    }
+
+    /// A refused outbox enqueue stores no consent. On the standard path, a
+    /// full outbox refuses every kind. On the prepared mainnet path, a full
+    /// outbox and an oversized row each refuse. No attestation, receipt, or
+    /// grant is stored, and the outbox keeps its bytes.
+    #[test]
+    #[serial_test::serial]
+    fn a_refused_outbox_enqueue_stores_no_attestation_receipt_or_grant() {
+        use crate::approval::mainnet_fixtures::MainnetConsentFixture;
+        use crate::audit_log::outbox::MAX_OUTBOX_ROWS;
+
+        for (kind, entry) in every_attestable_kind() {
+            let dir = TempDir::new().unwrap();
+            let store_path = dir.path().join("a.toml");
+            let mut store = PendingApprovalStore::open(store_path.clone()).unwrap();
+            let nonce = entry.approval_nonce.clone();
+            store
+                .insert(entry.clone(), timefmt::now_unix_ms().unwrap())
+                .unwrap();
+            let outbox = outbox_with_rows(&dir.path().join("audit").join("audit.jsonl"), 64);
+            assert_eq!(MAX_OUTBOX_ROWS, 64);
+            let queued = std::fs::read(outbox.path()).unwrap();
+            let mut grant_persisted = false;
+            let err = attest_and_persist(
+                &mut store,
+                &entry,
+                &[0x42; 32],
+                &binding(),
+                Surface::Cli,
+                ConsentAudit::Outbox(&outbox),
+                ConsentAuthorization::Standard(&AttestedApprover::Local),
+                |_, _| {
+                    grant_persisted = true;
+                    Ok(())
+                },
+            )
+            .unwrap_err();
+            assert_eq!(err.code(), "audit.outbox_full", "{kind}: {err}");
+            let stored = store.get(&nonce).unwrap();
+            assert!(stored.mainnet_presence.is_none(), "{kind}: no receipt");
+            drop(store);
+            assert!(still_pending(&store_path, &nonce), "{kind}: no attestation");
+            assert!(!grant_persisted, "{kind}: no grant persisted");
+            assert_eq!(std::fs::read(outbox.path()).unwrap(), queued, "{kind}");
+        }
+
+        let fixture = MainnetConsentFixture::new("outbox-bounds");
+        refused_mainnet_enqueues_store_nothing(&fixture);
+    }
+
+    /// On the standard path an oversized refusal at the outbox stores no
+    /// consent for any kind. Validated standard rows stay far below the byte
+    /// cap, so the refusal is injected at the outbox the production path
+    /// calls. No attestation, receipt, or grant is stored, and nothing is
+    /// queued.
+    #[test]
+    fn an_oversized_standard_enqueue_stores_no_attestation_receipt_or_grant() {
+        for (kind, entry) in every_attestable_kind() {
+            let dir = TempDir::new().unwrap();
+            let store_path = dir.path().join("a.toml");
+            let mut store = PendingApprovalStore::open(store_path.clone()).unwrap();
+            let nonce = entry.approval_nonce.clone();
+            store
+                .insert(entry.clone(), timefmt::now_unix_ms().unwrap())
+                .unwrap();
+            let outbox = outbox_with_rows(&dir.path().join("audit").join("audit.jsonl"), 0);
+            crate::audit_log::outbox::test_seam::arm_oversized(outbox.path());
+            let mut grant_persisted = false;
+            let err = attest_and_persist(
+                &mut store,
+                &entry,
+                &[0x42; 32],
+                &binding(),
+                Surface::Cli,
+                ConsentAudit::Outbox(&outbox),
+                ConsentAuthorization::Standard(&AttestedApprover::Local),
+                |_, _| {
+                    grant_persisted = true;
+                    Ok(())
+                },
+            )
+            .unwrap_err();
+            assert_eq!(err.code(), "audit.outbox_row_too_large", "{kind}: {err}");
+            let stored = store.get(&nonce).unwrap();
+            assert!(stored.mainnet_presence.is_none(), "{kind}: no receipt");
+            drop(store);
+            assert!(still_pending(&store_path, &nonce), "{kind}: no attestation");
+            assert!(!grant_persisted, "{kind}: no grant persisted");
+            assert!(
+                std::fs::read(outbox.path()).unwrap().is_empty(),
+                "{kind}: nothing is queued"
+            );
+        }
+    }
+
+    /// Through the prepared mainnet sink write, a full outbox and an
+    /// oversized row each refuse. No attestation or receipt is stored, and
+    /// the store and the outbox keep their bytes.
+    fn refused_mainnet_enqueues_store_nothing(
+        fixture: &crate::approval::mainnet_fixtures::MainnetConsentFixture,
+    ) {
+        use crate::approval::mainnet_fixtures::ATTESTATION_KEY;
+        use crate::audit_log::writer::MAX_ROW_BYTES;
+
+        let policy = fixture.current_policy();
+        let (_, entry) = classic_entries().remove(0);
+        for (case, rows, gated_tool, expected) in [
+            ("full", 64, "stellar_pay".to_owned(), "audit.outbox_full"),
+            (
+                "oversized",
+                0,
+                "x".repeat(usize::try_from(MAX_ROW_BYTES).unwrap()),
+                "audit.outbox_row_too_large",
+            ),
+        ] {
+            let dir = TempDir::new().unwrap();
+            let store_path = dir.path().join("pending.toml");
+            let mut store = PendingApprovalStore::open(store_path.clone()).unwrap();
+            store
+                .insert(entry.clone(), entry.created_at_unix_ms)
+                .unwrap();
+            let stored_before = std::fs::read(&store_path).unwrap();
+            let outbox = outbox_with_rows(&dir.path().join("audit").join("audit.jsonl"), rows);
+            let queued = std::fs::read(outbox.path()).unwrap_or_default();
+            let presence = fixture.presence(&entry, &policy);
+            let err = attest_mainnet_confirmation(
+                &mut store,
+                &entry,
+                &ATTESTATION_KEY,
+                &fixture.binding(),
+                ConsentAudit::Outbox(&outbox),
+                &gated_tool,
+                &policy,
+                presence,
+            )
+            .unwrap_err();
+            assert_eq!(err.code(), expected, "{case}: {err}");
+            let stored = store.get(&entry.approval_nonce).unwrap();
+            assert!(
+                stored.attestation_blob_b64.is_none(),
+                "{case}: no attestation"
+            );
+            assert!(stored.mainnet_presence.is_none(), "{case}: no receipt");
+            drop(store);
+            assert_eq!(std::fs::read(&store_path).unwrap(), stored_before, "{case}");
+            assert_eq!(
+                std::fs::read(outbox.path()).unwrap_or_default(),
+                queued,
+                "{case}"
+            );
+        }
+    }
+
     /// The row is durable before the persist runs: a persist that fails after
     /// it leaves the row and returns the failure.
     #[cfg(unix)]

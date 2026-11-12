@@ -465,6 +465,61 @@ fn an_appender_paused_before_opening_the_file_refuses_a_new_generation() {
     assert_eq!(store.load_outbox_state(2).unwrap(), state);
 }
 
+/// Another process takes the chosen retired name after the binding records
+/// it. The binding records the next free name before it moves the outbox
+/// there, and then fails. The rerun finds the outbox under the recorded name
+/// and installs the stage. The foreign file keeps its bytes, and no stage or
+/// unnamed retired file remains.
+#[test]
+fn a_taken_retired_name_is_recorded_before_the_move_and_a_rerun_converges() {
+    let (_dir, path, store) = fixture();
+    let outbox = AuditOutbox::for_log(&path, store.clone());
+    outbox.append(&row("R")).unwrap();
+    let queued = fs::read(outbox.path()).unwrap();
+    let foreign = path.with_file_name("audit.jsonl.outbox.retired-g1");
+    let taken = foreign.clone();
+
+    let mut binding = AuditWriter::open_for_carrier_binding(path.clone(), access(&store)).unwrap();
+    binding.binding_before_retire = Some(Box::new(move || {
+        fs::write(&taken, b"another process\n").unwrap();
+    }));
+    binding.binding_fail_after_retire = true;
+    assert!(binding.bind_carriers().is_err());
+    drop(binding);
+
+    let record = store.load_carrier_record().unwrap().unwrap();
+    assert_eq!(record.generation, 2);
+    let recorded = record.retired.unwrap().file.unwrap();
+    assert_eq!(recorded, "audit.jsonl.outbox.retired-g1.1");
+    assert_eq!(fs::read(path.with_file_name(&recorded)).unwrap(), queued);
+    assert!(!outbox_path(&path).exists());
+
+    let mut rerun = AuditWriter::open_for_carrier_binding(path.clone(), access(&store)).unwrap();
+    let report = rerun.bind_carriers().unwrap();
+    drop(rerun);
+    assert_eq!(report.generation, 2);
+    assert_eq!(report.retired_file.as_deref(), Some(recorded.as_str()));
+    assert_eq!(fs::read(outbox_path(&path)).unwrap(), queued);
+    assert_eq!(fs::read(path.with_file_name(&recorded)).unwrap(), queued);
+    assert_eq!(fs::read(&foreign).unwrap(), b"another process\n");
+    assert!(
+        super::super::carriers::staged_files(&path)
+            .unwrap()
+            .is_empty()
+    );
+    let mut retired_files: Vec<String> = fs::read_dir(path.parent().unwrap())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with("audit.jsonl.outbox.retired"))
+        .collect();
+    retired_files.sort();
+    assert_eq!(
+        retired_files,
+        ["audit.jsonl.outbox.retired-g1", recorded.as_str()],
+        "the recorded file and the foreign file, nothing else"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn a_retired_write_during_binding_is_not_adopted() {

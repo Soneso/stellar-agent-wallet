@@ -62,6 +62,17 @@
 //! always in place: the writer refuses to open beside a `*.tmp` file in the
 //! audit directory.
 //!
+//! # Bounds
+//!
+//! An append admits at most [`MAX_OUTBOX_ROWS`] queued rows and refuses the
+//! next with [`WriterError::OutboxFull`]; it never evicts a queued row. It
+//! measures the row as a keyed writer appends it, entry tag included, and
+//! refuses a row over [`MAX_ROW_BYTES`](super::writer::MAX_ROW_BYTES) with
+//! [`WriterError::OutboxRowTooLarge`]. Neither refusal appends the candidate
+//! row or stores its consent, and every admitted row fits the writer's byte
+//! cap. The append's preparation can still create the file or repair a torn
+//! tail before either refusal.
+//!
 //! # Drain
 //!
 //! [`AuditWriter::drain_outbox`](super::writer::AuditWriter::drain_outbox)
@@ -452,6 +463,8 @@ pub(crate) fn lock_outbox(
                 }
                 if !waiting {
                     waiting = true;
+                    #[cfg(test)]
+                    test_seam::run_contended(lock_path);
                     tracing::debug!(
                         lock = %basename(lock_path),
                         wait_ms = wait.as_millis(),
@@ -518,6 +531,9 @@ impl AuditOutbox {
     /// - [`WriterError::OutboxRowsMissing`] when committed rows are lost or
     ///   changed, a missing file included, or when a complete line follows
     ///   them. The file is neither created nor changed.
+    /// - [`WriterError::OutboxFull`] when the outbox holds [`MAX_OUTBOX_ROWS`]
+    ///   rows, and [`WriterError::OutboxRowTooLarge`] when the row exceeds the
+    ///   writer's row cap. Neither appends the candidate row.
     /// - [`WriterError::TipAnchorStore`] when the commitment cannot be read or
     ///   stored.
     /// - [`WriterError::Serialise`] when the entry cannot be serialized.
@@ -562,7 +578,17 @@ impl AuditOutbox {
         let bytes = read_all(&mut file)?;
         let lines = parse_lines(&bytes).lines;
         check_committed_prefix(&lines, &state)?;
+        // Admission counts every queued row, delivered or not, and never
+        // evicts one: a full outbox refuses before the approval storage.
+        if lines.len() >= MAX_OUTBOX_ROWS {
+            return Err(WriterError::OutboxFull {
+                queued: lines.len() as u64,
+                cap: MAX_OUTBOX_ROWS as u64,
+            });
+        }
         repair_torn_tail(&file, &self.path, &bytes)?;
+        #[cfg(test)]
+        test_seam::run_admitted(&self.path);
 
         Ok(PreparedOutboxAppend {
             outbox: self,
@@ -590,6 +616,15 @@ pub(crate) struct PreparedOutboxAppend<'a> {
 impl PreparedOutboxAppend<'_> {
     /// Writes one row and commits it while retaining the acquired lock.
     pub(crate) fn append(mut self, entry: &AuditEntry) -> Result<(), WriterError> {
+        #[cfg(test)]
+        if test_seam::take_oversized(&self.outbox.path) {
+            use super::writer::MAX_ROW_BYTES;
+            return Err(WriterError::OutboxRowTooLarge {
+                bytes: MAX_ROW_BYTES + 1,
+                cap: MAX_ROW_BYTES,
+            });
+        }
+        refuse_undeliverable_row(entry)?;
         let mut line = serde_json::to_vec(entry).map_err(WriterError::Serialise)?;
         line.push(b'\n');
         self.committed.push(&line[..line.len() - 1]);
@@ -616,6 +651,28 @@ impl PreparedOutboxAppend<'_> {
             return Err(error);
         }
         Ok(())
+    }
+}
+
+/// The most rows one outbox holds.
+///
+/// A queued row counts until a drain clears it. An append to a full outbox
+/// refuses with [`WriterError::OutboxFull`] and never evicts a queued row.
+pub const MAX_OUTBOX_ROWS: usize = 64;
+
+/// Refuses `entry` with [`WriterError::OutboxRowTooLarge`] when the row a
+/// draining writer appends for it would be longer than
+/// [`super::writer::MAX_ROW_BYTES`].
+///
+/// The measure is the writer's own, with an entry tag counted, so every
+/// admitted row fits the byte cap of whichever draining writer delivers it.
+fn refuse_undeliverable_row(entry: &AuditEntry) -> Result<(), WriterError> {
+    let mut measured = entry.clone();
+    match super::writer::refuse_oversized_row(&mut measured, true) {
+        Err(WriterError::RowTooLarge { bytes, cap }) => {
+            Err(WriterError::OutboxRowTooLarge { bytes, cap })
+        }
+        other => other,
     }
 }
 
@@ -1141,6 +1198,84 @@ pub mod test_seam {
             .position(|(armed_path, _)| armed_path == path)?;
         Some(armed.swap_remove(index).1)
     }
+
+    /// Outboxes whose next append refuses its row as oversized.
+    #[cfg(test)]
+    static OVERSIZED: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+    /// Arms the seam for `outbox_path`: its next append refuses with
+    /// [`super::WriterError::OutboxRowTooLarge`] before writing, as a row over
+    /// the byte cap does. The arm is consumed by that append.
+    #[cfg(test)]
+    pub(crate) fn arm_oversized(outbox_path: &Path) {
+        if let Ok(mut armed) = OVERSIZED.lock() {
+            armed.push(outbox_path.to_path_buf());
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn take_oversized(path: &Path) -> bool {
+        OVERSIZED.lock().is_ok_and(|mut armed| {
+            armed
+                .iter()
+                .position(|armed_path| armed_path == path)
+                .map(|index| armed.swap_remove(index))
+                .is_some()
+        })
+    }
+
+    /// A hook one append runs once, keyed by a path.
+    #[cfg(test)]
+    type Hook = Box<dyn FnOnce() + Send>;
+
+    /// Hooks run by the next admission of an append to an outbox.
+    #[cfg(test)]
+    static ADMITTED: Mutex<Vec<(PathBuf, Hook)>> = Mutex::new(Vec::new());
+
+    /// Hooks run by the first contended attempt on an outbox lock.
+    #[cfg(test)]
+    static CONTENDED: Mutex<Vec<(PathBuf, Hook)>> = Mutex::new(Vec::new());
+
+    /// Runs `hook` once, under the outbox lock, after the next append to
+    /// `outbox_path` passes its admission checks.
+    #[cfg(test)]
+    pub(crate) fn on_admitted(outbox_path: &Path, hook: impl FnOnce() + Send + 'static) {
+        if let Ok(mut armed) = ADMITTED.lock() {
+            armed.push((outbox_path.to_path_buf(), Box::new(hook)));
+        }
+    }
+
+    /// Runs `hook` once when an acquisition of the lock at `lock_path` first
+    /// finds it held.
+    #[cfg(test)]
+    pub(crate) fn on_contended(lock_path: &Path, hook: impl FnOnce() + Send + 'static) {
+        if let Ok(mut armed) = CONTENDED.lock() {
+            armed.push((lock_path.to_path_buf(), Box::new(hook)));
+        }
+    }
+
+    #[cfg(test)]
+    fn run(hooks: &Mutex<Vec<(PathBuf, Hook)>>, path: &Path) {
+        let hook = hooks.lock().ok().and_then(|mut armed| {
+            let index = armed
+                .iter()
+                .position(|(armed_path, _)| armed_path == path)?;
+            Some(armed.swap_remove(index).1)
+        });
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn run_admitted(outbox_path: &Path) {
+        run(&ADMITTED, outbox_path);
+    }
+
+    #[cfg(test)]
+    pub(super) fn run_contended(lock_path: &Path) {
+        run(&CONTENDED, lock_path);
+    }
 }
 
 #[cfg(test)]
@@ -1638,6 +1773,241 @@ mod tests {
         expected.push("queued-after-open".to_owned());
         assert_eq!(request_ids(&path), expected);
         assert!(outbox_bytes(&path).is_empty());
+    }
+
+    /// Sixty-four queued rows fit. Row 65 refuses with `audit.outbox_full`,
+    /// leaves the outbox and its commitment byte for byte, and evicts nothing.
+    /// After a drain the next row queues again.
+    #[test]
+    fn sixty_four_rows_fit_and_the_next_refuses_without_eviction() {
+        let dir = TempDir::new().unwrap();
+        let path = log_path(&dir);
+        let store = bound_store(&path);
+        let outbox = AuditOutbox::for_log(&path, store.clone());
+        for index in 1..=MAX_OUTBOX_ROWS {
+            outbox
+                .append(&row(&format!("row-{index}")))
+                .unwrap_or_else(|e| panic!("row {index} fits: {e:?}"));
+        }
+        assert_eq!(MAX_OUTBOX_ROWS, 64);
+        let before = outbox_bytes(&path);
+        let committed = store.load_outbox_state(1).unwrap();
+
+        let refused = outbox.append(&row("row-65")).unwrap_err();
+        assert!(
+            matches!(
+                refused,
+                WriterError::OutboxFull {
+                    queued: 64,
+                    cap: 64
+                }
+            ),
+            "{refused:?}"
+        );
+        assert!(refused.to_string().starts_with("audit.outbox_full: "));
+        let refusal = crate::audit_log::audit_writer_refusal("fixture", &refused);
+        assert_eq!(refusal.code(), "audit.outbox_full");
+        assert_eq!(outbox_bytes(&path), before, "nothing is queued or evicted");
+        assert_eq!(store.load_outbox_state(1).unwrap(), committed);
+
+        let mut writer = AuditWriter::open_for_reanchor(path.clone(), None, store.clone()).unwrap();
+        assert_eq!(writer.drain_outbox().unwrap(), 64);
+        let expected: Vec<String> = (1..=64).map(|index| format!("row-{index}")).collect();
+        assert_eq!(request_ids(&path), expected, "row 1 is delivered first");
+        drop(writer);
+        outbox.append(&row("row-65")).unwrap();
+    }
+
+    /// With 63 rows queued, two appends race for the last slot. The first
+    /// pauses after its admission, under the outbox lock, until the second
+    /// is observed waiting on that lock. Exactly one row is admitted, the
+    /// other append refuses with `audit.outbox_full`, and the outbox holds
+    /// 64 rows.
+    #[test]
+    fn the_last_slot_goes_to_exactly_one_of_two_racing_appends() {
+        use std::sync::mpsc::channel;
+        use std::time::Duration;
+
+        let dir = TempDir::new().unwrap();
+        let path = log_path(&dir);
+        let store = bound_store(&path);
+        let outbox = AuditOutbox::for_log(&path, store.clone());
+        for index in 1..MAX_OUTBOX_ROWS {
+            outbox.append(&row(&format!("row-{index}"))).unwrap();
+        }
+
+        let (admitted, first_admitted) = channel();
+        let (contended, second_waits) = channel();
+        test_seam::on_admitted(outbox.path(), move || {
+            admitted.send(()).unwrap();
+            second_waits
+                .recv_timeout(Duration::from_secs(30))
+                .expect("the second append waits on the outbox lock");
+        });
+        test_seam::on_contended(&outbox_lock_path(&path), move || {
+            contended.send(()).unwrap();
+        });
+
+        let (first, second) = std::thread::scope(|scope| {
+            let first = scope.spawn(|| outbox.append(&row("first")));
+            first_admitted
+                .recv_timeout(Duration::from_secs(30))
+                .expect("the first append passes admission");
+            let second = scope.spawn(|| outbox.append(&row("second")));
+            (first.join().unwrap(), second.join().unwrap())
+        });
+
+        assert!(first.is_ok(), "the first append takes the slot: {first:?}");
+        let refused = second.unwrap_err();
+        assert!(
+            matches!(
+                refused,
+                WriterError::OutboxFull {
+                    queued: 64,
+                    cap: 64
+                }
+            ),
+            "{refused:?}"
+        );
+        assert_eq!(
+            crate::audit_log::audit_writer_refusal("fixture", &refused).code(),
+            "audit.outbox_full"
+        );
+        assert_eq!(inspect_outbox(&path).unwrap().pending, 64);
+    }
+
+    /// A consent row whose line, measured as a keyed writer appends it, is
+    /// exactly `len` bytes with its newline.
+    fn consent_row_of_len(request_id: &str, len: u64) -> AuditEntry {
+        let mut entry = row(request_id);
+        entry.arg_keys.clear();
+        entry.truncated = true;
+        entry.chain_id = Some(String::new());
+        let measured = |entry: &AuditEntry| {
+            let mut probe = entry.clone();
+            probe.previous_entry_hash = crate::audit_log::chain::ZERO_BLOCK_HASH.to_owned();
+            probe.entry_tag = Some(crate::audit_log::chain::ZERO_BLOCK_HASH.to_owned());
+            serde_json::to_vec(&probe).unwrap().len() as u64 + 1
+        };
+        let pad = usize::try_from(len - measured(&entry)).unwrap();
+        entry.chain_id = Some("x".repeat(pad));
+        assert_eq!(measured(&entry), len);
+        entry
+    }
+
+    /// The outbox measures a row as the keyed writer appends it. A row at
+    /// the one-MiB cap queues and drains through a keyed writer. A row one
+    /// byte over refuses with `audit.outbox_row_too_large`, although its own
+    /// outbox line is shorter than the cap, and queues nothing.
+    #[test]
+    fn one_mib_writer_row_boundary_refuses_before_approval_storage() {
+        use super::super::writer::MAX_ROW_BYTES;
+        let dir = TempDir::new().unwrap();
+        let path = log_path(&dir);
+        let store = bound_store(&path);
+        let outbox = AuditOutbox::for_log(&path, store.clone());
+
+        let over = consent_row_of_len("over", MAX_ROW_BYTES + 1);
+        let over_line = serde_json::to_vec(&over).unwrap().len() as u64 + 1;
+        assert!(
+            over_line <= MAX_ROW_BYTES,
+            "the outbox line alone fits the cap: {over_line}"
+        );
+        let refused = outbox.append(&over).unwrap_err();
+        assert!(
+            matches!(
+                refused,
+                WriterError::OutboxRowTooLarge { bytes, cap: MAX_ROW_BYTES }
+                    if bytes == MAX_ROW_BYTES + 1
+            ),
+            "{refused:?}"
+        );
+        let refusal = crate::audit_log::audit_writer_refusal("fixture", &refused);
+        assert_eq!(refusal.code(), "audit.outbox_row_too_large");
+        assert!(outbox_bytes(&path).is_empty(), "nothing is queued");
+
+        // An admitted row at the cap drains through a keyed writer, an
+        // unkeyed writer, and a keyed writer that rotates before every row.
+        // The keyed line is exactly the cap; the unkeyed line omits the tag.
+        for (state, keyed, rotating) in [
+            ("keyed", true, false),
+            ("unkeyed", false, false),
+            ("keyed across rotation", true, true),
+        ] {
+            let dir = TempDir::new().unwrap();
+            let path = log_path(&dir);
+            let store = bound_store(&path);
+            let outbox = AuditOutbox::for_log(&path, store.clone());
+            outbox
+                .append(&consent_row_of_len("at-cap", MAX_ROW_BYTES))
+                .unwrap();
+            outbox.append(&row("after")).unwrap();
+            let _threshold = rotating
+                .then(|| super::super::rotation::test_seam::set_rotation_threshold(&path, 1));
+            let writer = if keyed {
+                let access = KeyedAuditAccess::new(Zeroizing::new([0x42; 32]), store.clone());
+                AuditWriter::open(path.clone(), Some(access)).unwrap()
+            } else {
+                open_draining(&path, &store)
+            };
+            drop(writer);
+            let lines = every_log_line(&path);
+            let delivered_ids: Vec<String> = lines
+                .iter()
+                .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                .filter_map(|row| row["request_id"].as_str().map(str::to_owned))
+                .filter(|id| ["at-cap", "after"].contains(&id.as_str()))
+                .collect();
+            assert_eq!(delivered_ids, ["at-cap", "after"], "{state}: both drain");
+            let at_cap = lines
+                .iter()
+                .find(|line| line.contains(r#""request_id":"at-cap""#))
+                .unwrap();
+            let length = at_cap.len() as u64 + 1;
+            if keyed {
+                assert_eq!(length, MAX_ROW_BYTES, "{state}");
+            } else {
+                assert!(length < MAX_ROW_BYTES, "{state}: {length}");
+            }
+            if rotating {
+                assert!(
+                    !fs::read_to_string(&path)
+                        .unwrap()
+                        .contains(r#""request_id":"at-cap""#),
+                    "{state}: a rotation follows the row"
+                );
+            }
+            assert!(outbox_bytes(&path).is_empty(), "{state}");
+        }
+    }
+
+    /// Every line of the active file and of its numbered archives, archives
+    /// first in name order.
+    fn every_log_line(path: &Path) -> Vec<String> {
+        let name = path.file_name().unwrap().to_str().unwrap().to_owned();
+        let mut archives: Vec<PathBuf> = fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|candidate| {
+                let file = candidate.file_name().unwrap().to_str().unwrap();
+                file.strip_prefix(&format!("{name}."))
+                    .is_some_and(|suffix| suffix.starts_with(|c: char| c.is_ascii_digit()))
+                    && !file.ends_with(".root_hmac")
+            })
+            .collect();
+        archives.sort();
+        archives.push(path.to_path_buf());
+        archives
+            .iter()
+            .flat_map(|file| {
+                fs::read_to_string(file)
+                    .unwrap_or_default()
+                    .lines()
+                    .filter(|line| !line.trim().is_empty())
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            })
+            .collect()
     }
 
     #[test]

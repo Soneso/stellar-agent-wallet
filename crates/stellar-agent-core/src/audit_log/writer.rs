@@ -457,6 +457,14 @@ pub struct AuditWriter {
     /// stages the next generation.
     #[cfg(test)]
     binding_after_snapshot: Option<Box<dyn FnOnce() + Send>>,
+    /// Test-only seam run by a binding once, after it records a retired name
+    /// and before it moves the outbox there.
+    #[cfg(test)]
+    binding_before_retire: Option<Box<dyn FnOnce() + Send>>,
+    /// Test-only fault seam: a binding stops with an error right after it
+    /// moves the outbox to a retired name.
+    #[cfg(test)]
+    binding_fail_after_retire: bool,
     /// Test-only fault seam that stops a prune after its durable marker write,
     /// modelling a crash or a failed removal before the archive's deletion.
     #[cfg(any(test, feature = "test-helpers"))]
@@ -1537,6 +1545,10 @@ impl AuditWriter {
             drain_after_snapshot: None,
             #[cfg(test)]
             binding_after_snapshot: None,
+            #[cfg(test)]
+            binding_before_retire: None,
+            #[cfg(test)]
+            binding_fail_after_retire: false,
             #[cfg(any(test, feature = "test-helpers"))]
             skip_prune_removal: false,
             #[cfg(test)]
@@ -2145,6 +2157,9 @@ impl AuditWriter {
         if let Some(hook) = self.binding_after_snapshot.take() {
             hook();
         }
+        // A name this binding picks is free at its search. Only such a name
+        // gives way to the next suffix when another process takes it first.
+        let fresh = retired.is_none();
         let retired = match retired {
             Some(retired) => retired,
             None => RetiredOutbox {
@@ -2181,6 +2196,11 @@ impl AuditWriter {
             retired: Some(retired.clone()),
         })?;
         fault(4)?;
+        let retired = if fresh {
+            self.retire_recorded(held, store, from, next, retired)?
+        } else {
+            retired
+        };
         carriers::finish(&self.path, next, retired.file.as_deref())?;
         fault(5)?;
         Ok(carriers::CarrierBindingReport {
@@ -2188,6 +2208,49 @@ impl AuditWriter {
             carried_rows,
             retired_file: retired.file,
         })
+    }
+
+    /// Moves the outbox of generation `from` to the retired name the stored
+    /// record of `next` names, and returns the retired entry that holds it.
+    ///
+    /// The record always names its candidate before the move. A candidate
+    /// another process takes refuses the move, and the next free name is
+    /// recorded before the next move. A rerun after a crash or a failed
+    /// store therefore finds the recorded name absent or holding the outbox.
+    fn retire_recorded(
+        &mut self,
+        held: &BindingCarriers,
+        store: &dyn TipAnchorStore,
+        from: u64,
+        next: u64,
+        mut retired: RetiredOutbox,
+    ) -> Result<RetiredOutbox, WriterError> {
+        loop {
+            let Some(name) = retired.file.clone() else {
+                return Ok(retired);
+            };
+            #[cfg(test)]
+            if let Some(hook) = self.binding_before_retire.take() {
+                hook();
+            }
+            if carriers::retire_to(&self.path, &name)? {
+                #[cfg(test)]
+                if self.binding_fail_after_retire {
+                    return Err(WriterError::Io(io::Error::other(
+                        "carrier binding interrupted after the retirement",
+                    )));
+                }
+                return Ok(retired);
+            }
+            retired.file = carriers::retired_name(&self.path, from)?;
+            store.store_carrier_record(&CarrierRecord {
+                generation: next,
+                writer: held.writer.clone(),
+                drain: held.drain.clone(),
+                outbox_lock: held.outbox_lock.clone(),
+                retired: Some(retired.clone()),
+            })?;
+        }
     }
 
     /// Reads the outbox under its lock: through the carrier record for an
@@ -5265,7 +5328,7 @@ const REPLAYED_FILE: &str = "<active file>";
 /// tag of the same length as every tag. It runs before the append's checks,
 /// rotation, or drain, so an oversized row changes nothing. Bytes are
 /// counted, not buffered.
-fn refuse_oversized_row(entry: &mut AuditEntry, keyed: bool) -> Result<(), WriterError> {
+pub(super) fn refuse_oversized_row(entry: &mut AuditEntry, keyed: bool) -> Result<(), WriterError> {
     /// Counts the bytes serialized into it.
     struct ByteCount(u64);
     impl Write for ByteCount {
@@ -6569,6 +6632,37 @@ pub enum WriterError {
         /// Number of complete lines found.
         found: u64,
     },
+    /// The outbox already holds [`super::outbox::MAX_OUTBOX_ROWS`] queued rows.
+    ///
+    /// The append refuses without appending the candidate row, and every
+    /// queued row stays queued. Nothing is queued. The next drain of the
+    /// writer that holds the log makes room.
+    #[error(
+        "audit.outbox_full: the audit outbox holds {queued} queued rows, its {cap}-row cap; \
+         nothing was queued; the next drain by the process holding the audit log makes room"
+    )]
+    OutboxFull {
+        /// Number of rows the outbox holds.
+        queued: u64,
+        /// The cap, [`super::outbox::MAX_OUTBOX_ROWS`].
+        cap: u64,
+    },
+    /// The row, measured as a keyed writer appends it, is longer than
+    /// [`MAX_ROW_BYTES`].
+    ///
+    /// The append refuses without appending the candidate row. Nothing is
+    /// queued, so every admitted row fits the byte cap of every draining
+    /// writer.
+    #[error(
+        "audit.outbox_row_too_large: the queued row would be {bytes} bytes in the audit log, \
+         over the {cap}-byte cap; nothing was queued"
+    )]
+    OutboxRowTooLarge {
+        /// Length of the row as the writer appends it, newline included.
+        bytes: u64,
+        /// The cap, [`MAX_ROW_BYTES`].
+        cap: u64,
+    },
     /// No committed outbox loss remains to acknowledge.
     #[error(
         "audit.outbox_loss_not_found: no committed outbox loss was found; nothing was acknowledged"
@@ -6687,6 +6781,8 @@ pub fn audit_log_unusable_detail(e: &WriterError) -> Option<String> {
         | WriterError::OutboxUnusable { .. }
         | WriterError::RowTooLarge { .. }
         | WriterError::OutboxRowsMissing { .. }
+        | WriterError::OutboxFull { .. }
+        | WriterError::OutboxRowTooLarge { .. }
         | WriterError::OutboxLossNotFound
         | WriterError::OutboxRowKindRefused { .. }
         | WriterError::KeyedLogNeedsKey { .. }
@@ -6729,13 +6825,18 @@ pub fn audit_log_unusable_detail(e: &WriterError) -> Option<String> {
 /// condition, for a caller that refuses because a required audit row cannot
 /// be written.
 ///
-/// Three outcomes, because three different things are wrong and three
+/// Four outcomes, because four different things are wrong and four
 /// different things fix them:
 ///
 /// - A tip-anchor mismatch is [`ValidationError::AuditTipAnchorMismatch`], and
 ///   an absent anchor the log shows was written is
 ///   [`ValidationError::AuditTipAnchorMissing`]: the log may have been rolled
 ///   back or truncated, and only `audit reanchor` addresses that.
+/// - A full outbox is [`ValidationError::AuditOutboxFull`], code
+///   `audit.outbox_full`. An outbox row over the writer's byte cap is
+///   [`ValidationError::AuditOutboxRowTooLarge`], code
+///   `audit.outbox_row_too_large`. The queue refuses the row; the next drain
+///   or a smaller row addresses that.
 /// - A condition about the log, as [`audit_log_unusable_detail`] names it, is
 ///   [`ValidationError::AuditLogUnusable`], led by its `audit.*` sub-code.
 /// - Everything left is a registry path or key registration conflict, which
@@ -6744,6 +6845,8 @@ pub fn audit_log_unusable_detail(e: &WriterError) -> Option<String> {
 /// [`WalletError`]: crate::error::WalletError
 /// [`ValidationError::AuditTipAnchorMismatch`]: crate::error::ValidationError::AuditTipAnchorMismatch
 /// [`ValidationError::AuditTipAnchorMissing`]: crate::error::ValidationError::AuditTipAnchorMissing
+/// [`ValidationError::AuditOutboxFull`]: crate::error::ValidationError::AuditOutboxFull
+/// [`ValidationError::AuditOutboxRowTooLarge`]: crate::error::ValidationError::AuditOutboxRowTooLarge
 /// [`ValidationError::AuditLogUnusable`]: crate::error::ValidationError::AuditLogUnusable
 /// [`ValidationError::AuditWriterOpenFailed`]: crate::error::ValidationError::AuditWriterOpenFailed
 #[must_use]
@@ -6760,6 +6863,16 @@ pub fn audit_writer_refusal(profile: &str, e: &WriterError) -> crate::error::Wal
         return WalletError::Validation(ValidationError::AuditTipAnchorMissing {
             profile: profile.to_owned(),
             evidence: evidence.describe().to_owned(),
+        });
+    }
+    if matches!(e, WriterError::OutboxFull { .. }) {
+        return WalletError::Validation(ValidationError::AuditOutboxFull {
+            detail: e.to_string(),
+        });
+    }
+    if matches!(e, WriterError::OutboxRowTooLarge { .. }) {
+        return WalletError::Validation(ValidationError::AuditOutboxRowTooLarge {
+            detail: e.to_string(),
         });
     }
     if let Some(detail) = audit_log_unusable_detail(e) {
