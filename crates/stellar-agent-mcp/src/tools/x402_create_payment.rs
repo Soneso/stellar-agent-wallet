@@ -1920,7 +1920,10 @@ mod tests {
         server
     }
 
+    /// A Noop-engine mainnet server over a fresh mock keyring store; callers
+    /// hold the `keyring` serial key.
     fn make_mainnet_server() -> crate::server::WalletServer {
+        stellar_agent_test_support::keyring_mock::install().expect("mock keyring");
         crate::server::WalletServer::new(
             Profile::builder_mainnet(
                 "https://rpc.example.invalid",
@@ -2780,7 +2783,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(keyring)]
     async fn x402_requirements_marker_is_not_echoed() {
+        stellar_agent_test_support::keyring_mock::install().unwrap();
         let capture = stellar_agent_test_support::log_capture::CaptureWriter::new();
         let subscriber = tracing_subscriber::fmt()
             .without_time()

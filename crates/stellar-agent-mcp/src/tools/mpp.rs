@@ -882,7 +882,9 @@ mod tests {
     ];
 
     #[test]
+    #[serial_test::serial(keyring)]
     fn registry_and_router_expose_closed_mpp_surface() {
+        stellar_agent_test_support::keyring_mock::install().expect("mock keyring");
         let server = WalletServer::new(
             Profile::builder_testnet("svc", "acct", "nonce-svc", "nonce-acct")
                 .with_noop_engine()
@@ -969,7 +971,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(keyring)]
     async fn every_mpp_tool_refuses_mainnet_before_state_or_keyring_access() {
+        stellar_agent_test_support::keyring_mock::install().expect("mock keyring");
         let server = WalletServer::new(
             Profile::builder_mainnet(
                 "https://rpc.example.invalid",

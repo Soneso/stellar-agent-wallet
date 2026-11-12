@@ -317,7 +317,10 @@ mod tests {
         server
     }
 
+    /// A Noop-engine mainnet server over a fresh mock keyring store; callers
+    /// hold the `keyring` serial key.
     fn make_mainnet_server() -> crate::server::WalletServer {
+        stellar_agent_test_support::keyring_mock::install().expect("mock keyring");
         crate::server::WalletServer::new(
             Profile::builder_mainnet(
                 "https://rpc.example.invalid",
@@ -370,8 +373,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(keyring)]
     async fn sign_message_mainnet_refusal_reads_context() {
         use crate::tools::common::{assert_business_envelope, mainnet_signing_forbidden_result};
+        stellar_agent_test_support::keyring_mock::install().unwrap();
         let profile = Profile::builder_testnet_named("context", "s", "a", "n", "a")
             .with_noop_engine()
             .build();

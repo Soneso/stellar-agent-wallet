@@ -265,7 +265,12 @@ mod tests {
     use super::*;
     use stellar_agent_core::profile::schema::Profile;
 
+    /// A Noop-engine testnet server over a fresh mock keyring store.
+    ///
+    /// Construction reads the keyring and registers the platform store when
+    /// none is registered, so every caller holds the `keyring` serial key.
     fn make_server() -> crate::server::WalletServer {
+        stellar_agent_test_support::keyring_mock::install().unwrap();
         crate::server::WalletServer::new(
             Profile::builder_testnet("svc", "acct", "n-svc", "n-acct")
                 .with_noop_engine()
@@ -278,6 +283,7 @@ mod tests {
     /// successfully, and the result carries the documented `{ ok: true,
     /// data: { valid: true }, request_id }` envelope.
     #[tokio::test]
+    #[serial_test::serial(keyring)]
     async fn valid_signature_verifies_under_normalised_envelope() {
         let signing_key = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
         let verifying_key = signing_key.verifying_key();
@@ -322,6 +328,7 @@ mod tests {
     /// A malformed G-strkey public key is a business refusal
     /// (`sep53.invalid_public_key`), not a JSON-RPC protocol error.
     #[tokio::test]
+    #[serial_test::serial(keyring)]
     async fn invalid_public_key_is_business_error() {
         let server = make_server();
         let args = Sep53VerifyMessageArgs {
@@ -342,6 +349,7 @@ mod tests {
     /// A signature that fails ed25519 verification against the supplied
     /// public key is `sep53.verify_failed`, not a JSON-RPC protocol error.
     #[tokio::test]
+    #[serial_test::serial(keyring)]
     async fn wrong_signature_is_verify_failed_business_error() {
         let signing_key = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
         let verifying_key = signing_key.verifying_key();
@@ -368,6 +376,7 @@ mod tests {
     /// base64 signature are refused by the field and the expected form, and
     /// no refusal repeats the argument or the byte the decoder stopped at.
     #[tokio::test]
+    #[serial_test::serial(keyring)]
     async fn sep53_verify_marker_is_not_echoed() {
         use stellar_agent_test_support::rejected_value::{
             CREDENTIAL_MARKER, assert_no_marker_in_text,

@@ -251,7 +251,10 @@ mod tests {
     use super::*;
     use stellar_agent_core::profile::schema::Profile;
 
+    /// A Noop-engine testnet server over a fresh mock keyring store; callers
+    /// hold the `keyring` serial key.
     fn make_testnet_server() -> crate::server::WalletServer {
+        stellar_agent_test_support::keyring_mock::install().expect("mock keyring");
         crate::server::WalletServer::new(
             Profile::builder_testnet("svc", "acct", "n-svc", "n-acct")
                 .with_noop_engine()
