@@ -245,6 +245,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- On mainnet, CLI `pay`, `claim`, `trustline`, and sponsored `accounts create`
+  sign actions the signed policy allows without a passkey ceremony. An approval
+  rule requires a passkey ceremony.
+
 - The audit settlement lookup before an authorized submission answers from an
   index the audit writer keeps. Fresh or settled bytes read no audit row file
   while the file listing and the writer's tip are unchanged, and an owed

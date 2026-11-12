@@ -7,12 +7,160 @@
 //! confirmation, then the drain, then the readiness proof, the recorder and
 //! the mint, and the signer only after the mint.
 
-#![allow(clippy::panic, reason = "source scan assertions")]
+#![allow(clippy::panic, clippy::unwrap_used, reason = "source scan assertions")]
 
 use stellar_agent_test_support::source_order::{assert_called_between, production_half};
 
 /// The shared mainnet steps, from the signer choice to the submit.
 const MAINNET_WRITE: &str = include_str!("../../src/common/mainnet_write.rs");
+
+#[test]
+fn confirm_mainnet_write_has_one_production_caller() {
+    use syn::visit::Visit as _;
+    #[derive(Default)]
+    struct Calls {
+        caller: String,
+        found: Vec<String>,
+    }
+    fn test_only(attrs: &[syn::Attribute]) -> bool {
+        attrs.iter().any(|attr| {
+            let syn::Meta::List(list) = &attr.meta else {
+                return false;
+            };
+            let tokens = list.tokens.to_string();
+            list.path.is_ident("cfg") && (tokens == "test" || tokens.starts_with("all (test ,"))
+        })
+    }
+    impl<'ast> syn::visit::Visit<'ast> for Calls {
+        fn visit_item_mod(&mut self, node: &'ast syn::ItemMod) {
+            if !test_only(&node.attrs) {
+                syn::visit::visit_item_mod(self, node);
+            }
+        }
+        fn visit_item_fn(&mut self, node: &'ast syn::ItemFn) {
+            if test_only(&node.attrs) {
+                return;
+            }
+            let outer = std::mem::replace(&mut self.caller, node.sig.ident.to_string());
+            syn::visit::visit_item_fn(self, node);
+            self.caller = outer;
+        }
+        fn visit_expr_call(&mut self, node: &'ast syn::ExprCall) {
+            if let syn::Expr::Path(path) = &*node.func
+                && path
+                    .path
+                    .segments
+                    .last()
+                    .is_some_and(|s| s.ident == "confirm_mainnet_write")
+            {
+                self.found.push(self.caller.clone());
+            }
+            syn::visit::visit_expr_call(self, node);
+        }
+    }
+    let mut calls = Calls::default();
+    let mut dirs = vec![std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src")];
+    while let Some(dir) = dirs.pop() {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                dirs.push(path);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                let source = std::fs::read_to_string(path).unwrap();
+                calls.visit_file(&syn::parse_file(&source).unwrap());
+            }
+        }
+    }
+    assert_eq!(calls.found, ["cli_mainnet_authority"]);
+}
+
+#[test]
+fn the_wrapper_calls_the_ceremony_only_under_require_approval() {
+    use syn::visit::Visit as _;
+    #[derive(Default)]
+    struct Calls {
+        ceremonies: usize,
+        insertions: usize,
+        borrowed_slots: usize,
+    }
+    fn path_is(expr: &syn::Expr, name: &str) -> bool {
+        matches!(expr, syn::Expr::Path(path) if path.path.is_ident(name))
+    }
+    impl<'ast> syn::visit::Visit<'ast> for Calls {
+        fn visit_expr_call(&mut self, node: &'ast syn::ExprCall) {
+            if let syn::Expr::Path(path) = &*node.func {
+                if path
+                    .path
+                    .segments
+                    .last()
+                    .is_some_and(|s| s.ident == "confirm_mainnet_write")
+                {
+                    self.ceremonies += 1;
+                }
+                if path.path.is_ident("Some")
+                    && let Some(syn::Expr::Reference(reference)) = node.args.first()
+                    && reference.mutability.is_none()
+                    && let syn::Expr::Unary(unary) = &*reference.expr
+                    && matches!(unary.op, syn::UnOp::Deref(_))
+                    && path_is(&unary.expr, "slot")
+                {
+                    self.borrowed_slots += 1;
+                }
+            }
+            syn::visit::visit_expr_call(self, node);
+        }
+        fn visit_expr_method_call(&mut self, node: &'ast syn::ExprMethodCall) {
+            if node.method == "insert" && path_is(&node.receiver, "witness") {
+                self.insertions += 1;
+            }
+            syn::visit::visit_expr_method_call(self, node);
+        }
+    }
+    let parsed = syn::parse_file(include_str!("../../src/common/mainnet_confirm.rs")).unwrap();
+    let wrapper = parsed
+        .items
+        .iter()
+        .find_map(|item| match item {
+            syn::Item::Fn(function) if function.sig.ident == "cli_mainnet_authority" => {
+                Some(function)
+            }
+            _ => None,
+        })
+        .unwrap();
+    let [syn::Stmt::Expr(syn::Expr::Match(branches), _)] = wrapper.block.stmts.as_slice() else {
+        panic!("the wrapper selects authority with one decision match");
+    };
+    let syn::Expr::MethodCall(selector) = &*branches.expr else {
+        panic!("the match reads the governing decision");
+    };
+    assert!(path_is(&selector.receiver, "decision"));
+    assert_eq!(selector.method, "decision");
+    assert!(selector.args.is_empty());
+    let mut total = 0;
+    for arm in &branches.arms {
+        let mut calls = Calls::default();
+        calls.visit_arm(arm);
+        if calls.ceremonies > 0 {
+            let syn::Pat::TupleStruct(pattern) = &arm.pat else {
+                panic!("only the approval pattern calls the ceremony");
+            };
+            let segments: Vec<_> = pattern
+                .path
+                .segments
+                .iter()
+                .map(|s| s.ident.to_string())
+                .collect();
+            assert_eq!(segments, ["Decision", "RequireApproval"]);
+            assert!(matches!(pattern.elems.first(), Some(syn::Pat::Wild(_))));
+            assert_eq!(pattern.elems.len(), 1);
+            assert!(arm.guard.is_none());
+            assert_eq!(calls.insertions, 1);
+            assert_eq!(calls.borrowed_slots, 1);
+        }
+        total += calls.ceremonies;
+    }
+    assert_eq!(total, 1);
+}
 
 /// The verb sources that carry a mainnet pipeline.
 const MAINNET_VERBS: &[(&str, &str)] = &[
@@ -95,7 +243,7 @@ fn the_mainnet_confirmation_follows_the_enrolled_proof() {
         MAINNET_WRITE,
         "async fn authorize_and_submit(",
         "enrolled_signer(",
-        "confirm_mainnet_write(",
+        "cli_mainnet_authority(",
         "drain_consent_rows_before_signing(",
     );
 }
@@ -106,7 +254,7 @@ fn the_mainnet_drain_sits_between_the_confirmation_and_the_readiness_proof() {
         "common/mainnet_write.rs",
         MAINNET_WRITE,
         "async fn authorize_and_submit(",
-        "confirm_mainnet_write(",
+        "cli_mainnet_authority(",
         "drain_consent_rows_before_signing(",
         "audit_readiness(",
     );

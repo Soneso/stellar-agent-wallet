@@ -1597,12 +1597,16 @@ where
         stellar_agent_core::policy::ToolValueKind::MovesValue,
         context.chain().caip2_str(),
         &policy_args,
-        "accounts create",
         Some(&sponsor_adapter),
         None,
     ) {
         Ok(evaluation) => evaluation,
-        Err(envelope) => return fail(&envelope),
+        Err(refusal) => {
+            return fail(&crate::common::mainnet_confirm::render_authority_refusal(
+                "accounts create",
+                refusal,
+            ));
+        }
     };
 
     let body = &policy.body;
@@ -3649,12 +3653,20 @@ pub(crate) mod tests {
         #[tokio::test(flavor = "current_thread")]
         #[serial_test::serial]
         async fn direct_mainnet_confirmation_requires_uv_before_signing() {
-            for (name, flags) in [("create-browser-no-uv", 1), ("create-browser-uv", 5)] {
-                let mut fixture = Spec::new(name).build().await;
+            for (name, flags, verdict) in [
+                ("create-browser-no-uv", 1, "allow"),
+                ("create-browser-uv", 5, "allow"),
+                ("create-browser-required-no-uv", 1, "require_approval"),
+                ("create-browser-required-uv", 5, "require_approval"),
+            ] {
+                let mut fixture = Spec::new(name)
+                    .rules(vec![create_rule(verdict, "")])
+                    .build()
+                    .await;
                 fixture.present_in_browser(flags);
                 let before = signer_resolutions_on_this_thread();
                 let result = run(&fixture, &mainnet_args(&fixture)).await;
-                if flags == 1 {
+                if verdict == "require_approval" && flags == 1 {
                     assert_eq!(
                         result.code(),
                         "approval.presence_invalid",
@@ -3668,7 +3680,13 @@ pub(crate) mod tests {
                 } else {
                     assert_eq!(result.code, 0, "{}", result.envelope);
                     assert_eq!(fixture.sent_envelopes().await.len(), 1);
-                    assert_eq!(fixture.audit_rows("approval_attested").len(), 1);
+                    assert_eq!(signer_resolutions_on_this_thread(), before + 1);
+                    crate::common::mainnet_authority_tests::assert_authorized(
+                        &fixture,
+                        verdict == "require_approval",
+                        0,
+                    )
+                    .await;
                 }
             }
         }
@@ -4069,7 +4087,10 @@ pub(crate) mod tests {
         #[serial_test::serial]
         async fn the_fee_counts_toward_the_reserve_on_mainnet() {
             let fixture = Spec::new("mainnet-create-fee-reserve")
-                .rules(vec![create_rule(&minimum_reserve(FEE_CROSSING_MARGIN))])
+                .rules(vec![create_rule(
+                    "require_approval",
+                    &minimum_reserve(FEE_CROSSING_MARGIN),
+                )])
                 .build()
                 .await;
 
@@ -4092,7 +4113,10 @@ pub(crate) mod tests {
             let fixture = Spec::new("testnet-create-fee-reserve")
                 .testnet()
                 .primary(ClassicRpc::testnet(&[&agent, DESTINATION, ISSUER]))
-                .rules(vec![create_rule(&minimum_reserve(FEE_CROSSING_MARGIN))])
+                .rules(vec![create_rule(
+                    "allow",
+                    &minimum_reserve(FEE_CROSSING_MARGIN),
+                )])
                 .build()
                 .await;
             let mut args = mainnet_args(&fixture);

@@ -13,6 +13,7 @@ use super::mainnet_presence::acquire_mainnet_presence;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use std::io::Write;
 use std::path::Path;
+use stellar_agent_core::envelope::Envelope;
 use stellar_agent_core::{
     approval::{
         ApprovalContext, AttestationBinding, ConsentAudit, DEFAULT_RETRY_ATTEMPTS,
@@ -26,11 +27,18 @@ use stellar_agent_core::{
         witness::{ApprovalExpectation, ApprovalWitness, ApprovedKind, verify_approval},
     },
     envelope_decode::decode_authoritative_args,
-    error::{ApprovalFailure, ProtocolError, ValidationError, WalletError},
-    mainnet::verified_policy::VerifiedPolicy,
-    policy::v1::value::{ValueClass, derive_value_class},
+    error::{ApprovalFailure, InternalError, ProtocolError, ValidationError, WalletError},
+    mainnet::{
+        decision::{MainnetDecision, MainnetRefusal},
+        verified_policy::VerifiedPolicy,
+    },
+    policy::{
+        Decision,
+        v1::value::{ValueClass, derive_value_class},
+    },
     profile::owner_key::OwnerKeyContext,
 };
+use stellar_agent_network::mainnet::authority::{AuthorityRefusal, MainnetAuthority};
 use stellar_agent_network::{
     MainnetWriteContext,
     mainnet::{MainnetConsumer, resolve::classic_consumer_tools},
@@ -289,6 +297,71 @@ impl MainnetWriteSummary {
             _ => return Err(wrong_kind("unsupported confirmation consumer")),
         }
         .map_err(store_error)
+    }
+}
+
+/// Selects the authority the governing decision grants.
+/// An approval rule runs the passkey ceremony and stores its witness in the
+/// caller's `witness` slot.
+///
+/// # Errors
+///
+/// Ceremony refusals retain their gate errors. Factory errors remain internal.
+#[allow(
+    clippy::result_large_err,
+    reason = "the shared authority refusal preserves typed gate errors"
+)]
+pub(crate) async fn cli_mainnet_authority<'w>(
+    decision: &MainnetDecision,
+    confirmation: ConfirmDecision,
+    summary: &MainnetWriteSummary,
+    context: &MainnetWriteContext,
+    policy: &VerifiedPolicy,
+    store_path: &Path,
+    witness: &'w mut Option<ApprovalWitness>,
+) -> Result<MainnetAuthority<'w>, AuthorityRefusal<WalletError>> {
+    match decision.decision() {
+        Decision::RequireApproval(_) => {
+            let w = confirm_mainnet_write(summary, confirmation, context, policy, store_path)
+                .await
+                .map_err(AuthorityRefusal::Gate)?;
+            let slot = witness.insert(w);
+            MainnetAuthority::from_decision(decision, Some(&*slot))
+                .map_err(AuthorityRefusal::Internal)
+        }
+        _ => MainnetAuthority::from_decision(decision, None).map_err(AuthorityRefusal::Internal),
+    }
+}
+
+/// Converts a typed authority refusal at the CLI boundary.
+pub(crate) fn render_authority_refusal(
+    verb: &str,
+    refusal: AuthorityRefusal<WalletError>,
+) -> Envelope<()> {
+    match refusal {
+        AuthorityRefusal::Gate(e) => Envelope::<()>::err(&e),
+        AuthorityRefusal::Refusal(MainnetRefusal::Denied { reason, .. }) => {
+            Envelope::<()>::err_raw(
+                reason.wire_code(),
+                format!("{verb} operation denied by operator policy"),
+            )
+        }
+        AuthorityRefusal::Refusal(MainnetRefusal::Engine(e)) => {
+            Envelope::<()>::err_raw("policy.engine_required", format!("{e}"))
+        }
+        AuthorityRefusal::Refusal(MainnetRefusal::Clock(e)) => {
+            crate::commands::policy_engine::clock_refusal(&e)
+        }
+        AuthorityRefusal::Internal(e) => {
+            Envelope::<()>::err(&WalletError::Internal(InternalError::UnexpectedState {
+                detail: e.to_string(),
+            }))
+        }
+        AuthorityRefusal::ApprovalRequired { .. } => {
+            Envelope::<()>::err(&WalletError::Internal(InternalError::UnexpectedState {
+                detail: "the CLI authority wrapper requires a completed approval".to_owned(),
+            }))
+        }
     }
 }
 
@@ -857,6 +930,194 @@ mod tests {
         .await
     }
 
+    /// Authority keeps the governing facts and borrows the caller's consent slot.
+    #[cfg(feature = "mainnet-write")]
+    #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial]
+    async fn cli_mainnet_authority_follows_the_decision() {
+        use stellar_agent_core::mainnet::decision::AuthorityScope;
+        use stellar_agent_core::policy::ApprovalRequest;
+        let (fixture, context, envelope) = confirmation_fixture("authority-wrapper");
+        clear_shown_summaries();
+        let _presence = driver::install(driver::fixture_credential());
+        let summary =
+            MainnetWriteSummary::from_envelope(&envelope, MainnetConsumer::CliPay, 500).unwrap();
+        let policy = fixture.current_policy();
+        let decision = MainnetDecision::for_test(
+            Decision::Allow,
+            None,
+            policy.digest(),
+            policy.sequence(),
+            7,
+            context.profile_name(),
+            context.chain().caip2_str(),
+            1_900_000_000_000,
+            600_000,
+            AuthorityScope::Classic,
+        );
+        let mut witness = None;
+        let authority = cli_mainnet_authority(
+            &decision,
+            ConfirmDecision::Allow,
+            &summary,
+            &context,
+            &policy,
+            &fixture.store_path(),
+            &mut witness,
+        )
+        .await
+        .unwrap();
+        let MainnetAuthority::Policy(authority) = authority else {
+            panic!("Allow requires policy authority")
+        };
+        assert_eq!(authority.policy_digest(), decision.policy_digest());
+        assert_eq!(authority.policy_sequence(), decision.policy_sequence());
+        assert_eq!(authority.rule_index(), decision.rule_index());
+        assert_eq!(authority.profile(), decision.profile());
+        assert_eq!(authority.chain_id(), decision.chain_id());
+        assert_eq!(authority.evaluated_at_ms(), decision.evaluated_at_ms());
+        assert_eq!(
+            authority.governing_until_ms(),
+            decision.evaluated_at_ms() + decision.governing_ttl_ms()
+        );
+        assert_eq!(authority.scope(), decision.scope());
+        assert!(witness.is_none());
+        assert!(driver::ceremonies().is_empty());
+        assert!(shown_summaries().is_empty());
+        assert_eq!(pending_store(&fixture).len(), 0);
+        assert_eq!(consent_rows(&context), 0);
+
+        let decision = MainnetDecision::for_test(
+            Decision::RequireApproval(ApprovalRequest::new("fixture".to_owned(), 300)),
+            None,
+            policy.digest(),
+            policy.sequence(),
+            7,
+            context.profile_name(),
+            context.chain().caip2_str(),
+            1_900_000_000_000,
+            300_000,
+            AuthorityScope::Classic,
+        );
+        let authority = cli_mainnet_authority(
+            &decision,
+            ConfirmDecision::RequireApproval { ttl_ms: 300_000 },
+            &summary,
+            &context,
+            &policy,
+            &fixture.store_path(),
+            &mut witness,
+        )
+        .await
+        .unwrap();
+        let MainnetAuthority::Approval(borrowed) = authority else {
+            panic!("approval authority")
+        };
+        let address = std::ptr::from_ref(borrowed);
+        assert_eq!(borrowed.expires_at_ms() - borrowed.created_at_ms(), 300_000);
+        assert_eq!(address, std::ptr::from_ref(witness.as_ref().unwrap()));
+        assert_eq!(driver::ceremonies().len(), 1);
+        assert_eq!(shown_summaries().len(), 1);
+        assert_eq!(pending_store(&fixture).len(), 1);
+        assert_eq!(consent_rows(&context), 1);
+
+        let _browser = driver::install(Box::new(|_| {
+            Err(WalletError::Approval(
+                ApprovalFailure::PresenceBrowserRequired,
+            ))
+        }));
+        let mut slot = None;
+        let refusal = cli_mainnet_authority(
+            &decision,
+            ConfirmDecision::RequireApproval { ttl_ms: 300_000 },
+            &summary,
+            &context,
+            &policy,
+            &fixture.store_path(),
+            &mut slot,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            refusal,
+            AuthorityRefusal::Gate(WalletError::Approval(
+                ApprovalFailure::PresenceBrowserRequired
+            ))
+        ));
+        assert!(slot.is_none());
+    }
+
+    /// Every typed refusal has one stable JSON envelope at the CLI boundary.
+    #[test]
+    fn render_authority_refusal_matches_todays_cli_output() {
+        use stellar_agent_core::{
+            policy::{DenyReason, PolicyError},
+            wallet::WalletLifecycleError,
+        };
+        use stellar_agent_network::mainnet::authority::AuthorityError;
+        let cases = [
+            (
+                AuthorityRefusal::Gate(WalletError::Approval(
+                    ApprovalFailure::PresenceBrowserRequired,
+                )),
+                "approval.presence_browser_required",
+                "Mainnet consent requires a local browser with WebAuthn user verification; no approval is recorded.",
+            ),
+            (
+                AuthorityRefusal::Refusal(MainnetRefusal::Denied {
+                    rule_index: Some(2),
+                    reason: DenyReason::ExplicitRuleDeny,
+                }),
+                "policy.deny.explicit_rule_deny",
+                "pay operation denied by operator policy",
+            ),
+            (
+                AuthorityRefusal::Refusal(MainnetRefusal::Engine(PolicyError::Internal {
+                    detail: "fixture".to_owned(),
+                })),
+                "policy.engine_required",
+                "policy internal error: fixture",
+            ),
+            (
+                AuthorityRefusal::Refusal(MainnetRefusal::Clock(
+                    WalletLifecycleError::ClockError {
+                        detail: "policy clock unavailable (test injection)".to_owned(),
+                        source: None,
+                    },
+                )),
+                "wallet.clock_error",
+                "system clock error: wallet clock error: policy clock unavailable (test injection)",
+            ),
+            (
+                AuthorityRefusal::Internal(AuthorityError::Internal {
+                    detail: "fixture".to_owned(),
+                }),
+                "internal.unexpected_state",
+                "unexpected internal state: mainnet authority internal error: fixture",
+            ),
+            (
+                AuthorityRefusal::ApprovalRequired {
+                    expectation: ApprovalExpectation {
+                        kind: ApprovedKind::Payment,
+                        subject: [3; 32],
+                    },
+                },
+                "internal.unexpected_state",
+                "unexpected internal state: the CLI authority wrapper requires a completed approval",
+            ),
+        ];
+        for (refusal, code, message) in cases {
+            let mut envelope = render_authority_refusal("pay", refusal);
+            envelope.request_id = "guard".to_owned();
+            assert_eq!(
+                serde_json::to_string(&envelope).unwrap(),
+                format!(
+                    "{{\"ok\":false,\"error\":{{\"code\":\"{code}\",\"message\":\"{message}\"}},\"request_id\":\"guard\"}}"
+                )
+            );
+        }
+    }
+
     /// The pending store of the fixture profile.
     #[cfg(feature = "mainnet-write")]
     fn pending_store(fixture: &MainnetConsentFixture) -> PendingApprovalStore {
@@ -996,6 +1257,18 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn confirmed_claim_witness_resolves() {
+        claim_authority_resolves(true).await;
+    }
+
+    #[cfg(feature = "mainnet-write")]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn allow_claim_resolves_without_confirmation() {
+        claim_authority_resolves(false).await;
+    }
+
+    #[cfg(feature = "mainnet-write")]
+    async fn claim_authority_resolves(approval_required: bool) {
         use sha2::Digest as _;
         use stellar_agent_core::approval::mainnet_fixtures::ENABLEMENT_NONCE;
         use stellar_agent_core::cross_check::{CrossCheckValue, ThresholdSet};
@@ -1022,8 +1295,13 @@ mod tests {
             EchoIdResponder, SignedTestEnvelope, signed_envelope::get_network_result,
         };
         use stellar_xdr::*;
-        let (fixture, context, encoded) =
-            confirmation_fixture_with("confirm-claim-resolve", |profile| {
+        let (fixture, context, encoded) = confirmation_fixture_with(
+            if approval_required {
+                "confirm-claim-resolve"
+            } else {
+                "allow-claim-resolve"
+            },
+            |profile| {
                 use stellar_agent_core::profile::schema::{PrimaryProviderRecord, ProviderRecord};
                 let providers = profile.providers.get_or_insert_with(Default::default);
                 providers.primary =
@@ -1035,7 +1313,9 @@ mod tests {
                 ));
                 profile.oracle_provider_url =
                     Some("https://oracle.example.invalid".parse().unwrap());
-            });
+            },
+        );
+        clear_shown_summaries();
         let _presence = driver::install(driver::fixture_credential());
         let TransactionEnvelope::Tx(mut tx) =
             TransactionEnvelope::from_xdr_base64(&encoded, Limits::none()).unwrap()
@@ -1074,24 +1354,58 @@ mod tests {
                 "",
             )
             .replace(&"0".repeat(64), &nonce_digest)
-            .replace("decision = \"require_approval\"", "decision = \"allow\"")
-            .replace("ttl_secs = 3600", "")
+            .replace("ttl_secs = 3600", "ttl_secs = 300")
             .replace("reason = \"review\"", "")
             .replace(
                 "sequence = 7",
                 &format!("sequence = {}", fixture.sequence() + 1),
             );
+        let raw = if approval_required {
+            raw
+        } else {
+            raw.replace("decision = \"require_approval\"", "decision = \"allow\"")
+                .replace("ttl_secs = 300", "")
+        };
         fixture.write_signed(&raw);
         let policy = fixture.current_policy();
-        let approval = confirm_mainnet_write(
+        let decision = MainnetDecision::for_test(
+            if approval_required {
+                Decision::RequireApproval(stellar_agent_core::policy::ApprovalRequest::new(
+                    "fixture".to_owned(),
+                    300,
+                ))
+            } else {
+                Decision::Allow
+            },
+            None,
+            policy.digest(),
+            policy.sequence(),
+            0,
+            name,
+            context.chain().caip2_str(),
+            stellar_agent_core::timefmt::now_unix_ms().unwrap(),
+            if approval_required { 300_000 } else { 600_000 },
+            stellar_agent_core::mainnet::decision::AuthorityScope::Classic,
+        );
+        let mut slot = None;
+        let authority = cli_mainnet_authority(
+            &decision,
+            ConfirmDecision::RequireApproval { ttl_ms: 300_000 },
             &summary,
-            ConfirmDecision::Allow,
             &context,
             &policy,
             &fixture.store_path(),
+            &mut slot,
         )
         .await
         .unwrap();
+        if !approval_required {
+            assert!(matches!(authority, MainnetAuthority::Policy(_)));
+            assert!(shown_summaries().is_empty());
+            assert!(driver::ceremonies().is_empty());
+            assert_eq!(pending_store(&fixture).len(), 0);
+            assert_eq!(consent_rows(&context), 0);
+        }
         let public = ed25519_dalek::SigningKey::from_bytes(&[8; 32])
             .verifying_key()
             .to_bytes();
@@ -1183,8 +1497,6 @@ mod tests {
         assert_eq!(witness.authority(), "https://oracle.example.invalid");
         assert!(!oracle.received_requests().await.unwrap().is_empty());
         let store = PersistedWindowStore::for_profile(name);
-        let authority =
-            stellar_agent_network::mainnet::authority::MainnetAuthority::Approval(&approval);
         let request = |witness| TxSignRequest {
             context: &context,
             consumer: MainnetConsumer::CliClaim,
@@ -1211,6 +1523,18 @@ mod tests {
         );
         let auth = resolve_tx_sign(request(Some(&witness))).await.unwrap();
         auth.check_consumer(MainnetConsumer::CliClaim).unwrap();
+        let path = stellar_agent_core::profile::schema::default_policy_window_state_path_for(name);
+        let bytes = std::fs::read(path).unwrap();
+        let body: serde_json::Value = serde_json::from_slice(
+            &bytes[crate::common::mainnet_write_fixture::WINDOW_HMAC_TAG_BYTES..],
+        )
+        .unwrap();
+        let rows = body["authorizations"].as_array().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].get("policy_authority").is_some(),
+            !approval_required
+        );
         assert_eq!(
             store
                 .open_authorizations(

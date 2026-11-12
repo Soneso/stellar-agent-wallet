@@ -327,9 +327,9 @@ Drive installed toolsets with `stellar_toolset_list` and `stellar_toolset_invoke
   run `stellar-agent profile resume` yourself, and do not retry under another
   profile; the halt is the operator's decision.
 - Builds from this repository and releases from v0.1.0-alpha.14 on carry
-  `mainnet-write`. These builds admit the four classic full-mode CLI
-  operations and classic MCP commits after operator setup and approval for
-  each action. See
+  `mainnet-write`. The four classic full-mode CLI operations sign `Allow` without
+  a passkey ceremony; `RequireApproval` runs one. Setup and policy minimums remain required.
+  Classic MCP commits require operator setup and approval for each action. See
   [profiles and keys](references/profiles-and-keys.md#mainnet-policy-body) and
   [classic MCP authorization](references/mcp-tools.md#classic-mainnet-authorization).
   Mainnet reads retain selection, key-scope, and policy requirements.

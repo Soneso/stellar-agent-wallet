@@ -792,8 +792,10 @@ Until this is done, a migrated profile continues to run under `noop`, which
 refuses mainnet destructive operations with `policy.engine_required`. Opting in
 to `v1` changes policy evaluation.
 Builds from this repository and releases from v0.1.0-alpha.14 on carry
-`mainnet-write`. Mainnet writes also require enablement, a signed v2 policy,
-and approval for each action.
+`mainnet-write`. Mainnet writes also require enablement and a signed v2 policy.
+CLI value operations follow the governing decision: `allow` grants policy
+authority without a ceremony; `require_approval` requires passkey consent.
+Every MCP mainnet write requires approval.
 
 ### Mainnet policy body
 

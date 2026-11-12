@@ -15,7 +15,9 @@ For the concepts referenced below (profiles, the policy engine, the approval spi
 
 Only full-mode `pay`, `claim`, sponsored `accounts create`, and `trustline`
 enter the authorized mainnet pipeline. Staged modes remain excluded.
-[Confirmation and setup](index.md#mainnet-write-behavior) apply to every action.
+[Setup and sealed authorization](index.md#mainnet-write-behavior) apply to every action.
+CLI `Allow` signs without a passkey ceremony; `RequireApproval` runs one.
+Signed policy minimums remain required.
 On a mainnet profile `pay`, `claim` and `accounts create` refuse `--secret-env`
 with `validation.mainnet_secret_env_refused` before the write context, any
 keyring read or any request, and without a signer flag they sign with the

@@ -8,7 +8,7 @@ for build configuration, admitted operations, and exclusions.
 
 This document describes the cryptographic primitives behind the Stellar Agent Wallet guardrail spine: the approval attestation, the hash-chained audit log, the wallet unlock window, the nonce scheme, the V1 policy evaluator, and the smart-account auth digest. It is written for a maintainer or security reviewer who needs the byte-level detail, not the operator-facing model. For the model itself see [Concepts](../concepts.md); for how the crates fit together see [Architecture](architecture.md).
 
-The CLI and MCP server share attestation, audit, nonce, policy, and auth-digest primitives. The unlock window protects CLI `--secret-env` seeds. MCP signs through keyring handles without `Wallet::unlock`. Testnet is the default. Mainnet operation admission depends on build configuration and installation setup. Policy evaluation, sealed authorization, signing checks, and submit checks are independent boundaries. The wallet's own signing paths sign mainnet payloads only under mainnet authorization. The library signers enforce it too: every `Signer`, the public keyring handle included, signs a mainnet transaction or Soroban authorization payload only under a mainnet authorization. Code running as the same OS user with access to a keyring entry can read its seed directly. The keyring entry is the custody boundary. Ordinary submission refuses the declared mainnet passphrase or known mainnet host before RPC. Authorized consumers bind each action to its endpoint, signer, policy, approval, audit state, and window reservation.
+The CLI and MCP server share attestation, audit, nonce, policy, and auth-digest primitives. The unlock window protects CLI `--secret-env` seeds. MCP signs through keyring handles without `Wallet::unlock`. Testnet is the default. Mainnet operation admission depends on build configuration and installation setup. Policy evaluation, sealed authorization, signing checks, and submit checks are independent boundaries. The wallet's own signing paths sign mainnet payloads only under mainnet authorization. The library signers enforce it too: every `Signer`, the public keyring handle included, signs a mainnet transaction or Soroban authorization payload only under a mainnet authorization. Code running as the same OS user with access to a keyring entry can read its seed directly. The keyring entry is the custody boundary. Ordinary submission refuses the declared mainnet passphrase or known mainnet host before RPC. Authorized consumers bind each action to its endpoint, signer, policy, authority, audit state, and window reservation. CLI Allow uses policy authority without a passkey ceremony. CLI RequireApproval uses verified passkey consent. Both retain setup, signed policy minimums, and sealed authorization.
 
 ## Two sessions on one profile
 
@@ -1019,8 +1019,9 @@ durable counter is kept and no clone is detected.
 Mainnet approve, the local inbox, and direct CLI confirmation open a localhost
 passkey page. The operator reviews the authoritative transaction and approves
 with an owner-pinned credential. Headless consent, `--yes`, `--no-open` on the
-mainnet inbox, and remote mainnet approval refuse. Ledger signing also requires
-this passkey ceremony.
+mainnet inbox, and remote mainnet approval refuse. Direct CLI confirmation runs
+only for RequireApproval, including Ledger signing. Allow signs under policy
+authority without a summary, pending approval, or consent row.
 The page binds its rendered view digest to the current entry and signed policy
 before issuing a challenge. Challenge and assertion requests require the
 session cookie, per-nonce CSRF header, and origin-scoped session proof.

@@ -100,8 +100,10 @@ A localhost ceremony binds `127.0.0.1` and `[::1]` on one port before it
 creates any token, serves the same session on both, and closes both together.
 When either family cannot be held, the ceremony does not start.
 
-Allow supplies a 600-second confirmation lifetime. RequireApproval supplies its
-configured lifetime. Classic MCP approvals expire at the shorter prepare/commit
+CLI Allow grants policy authority for 600 seconds from evaluation, without a
+passkey ceremony. RequireApproval runs a ceremony with its rule lifetime.
+The presence challenge retains its separate 120-second bound.
+Classic MCP approvals expire at the shorter prepare/commit
 lifetime, with Allow contributing 600 seconds. Both names need matching rules.
 All four classic pairs require approval even under Allow.
 
