@@ -544,6 +544,8 @@ pub enum PolicyEngineKindParseError {
 #[non_exhaustive]
 pub struct PolicyConfig {
     /// Active policy engine for this profile.
+    /// With an enrolled owner, this matches the verified signed policy selector.
+    /// An omitted signed selector means `v1`; explicit selectors require policy version 2.
     ///
     /// Default for newly-minted profiles is `V1`.  Profiles migrated from
     /// schema v1 have `Noop` set explicitly by `migrate_v1_to_v2`; they

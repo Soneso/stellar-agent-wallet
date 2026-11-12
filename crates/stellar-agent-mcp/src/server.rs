@@ -588,7 +588,13 @@ fn build_policy_engine(
         };
         (name, owner, Some(policy_dir))
     } else {
-        (String::new(), [0; 32], None)
+        (
+            stellar_agent_core::profile::name::derive_profile_name_from_owner_key(profile)
+                .unwrap_or_default()
+                .to_owned(),
+            [0; 32],
+            policy_dir_override.map(Path::to_path_buf),
+        )
     };
     let built = build_engine(
         profile,
@@ -603,6 +609,11 @@ fn build_policy_engine(
         OwnerKeySource::Keyring,
     )
     .map_err(|error| match error {
+        PolicyEngineBuildError::OwnerKeyring(error) => BuildRegistryError::OwnerKeyringReadFailed {
+            profile: name.clone(),
+            code: error.code(),
+            detail: error.to_string(),
+        },
         PolicyEngineBuildError::Policy(source) => BuildRegistryError::PolicyFileLoadFailed {
             profile: name.clone(),
             source,
@@ -622,7 +633,7 @@ fn build_policy_engine(
             &name,
         );
     }
-    let policy_path = policy_dir.map(|dir| dir.join(format!("{name}.toml")));
+    let policy_path = built.policy_path.clone();
     Ok((built, policy_path))
 }
 

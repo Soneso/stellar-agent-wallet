@@ -57,6 +57,47 @@ pub fn decode_owner_public_key(raw: &str) -> Result<[u8; 32], OwnerKeyDecodeErro
     Err(OwnerKeyDecodeError::Undecodable)
 }
 
+/// Reads an enrolled owner, distinguishing absence from unusable state.
+///
+/// No registered keyring backend reads as absent; a registered backend's failures refuse.
+///
+/// Reset callers hold the window guard across this read.
+///
+/// # Errors
+/// Refuses entry construction, access errors, and malformed owner keys.
+pub fn read_enrolled_owner(profile: &Profile) -> Result<Option<[u8; 32]>, WalletError> {
+    let coordinate = &profile.policy_owner_key_id;
+    let entry = match KeyringEntry::new(&coordinate.service, &coordinate.account) {
+        Ok(entry) => entry,
+        Err(keyring_core::Error::NoDefaultStore) if keyring_core::get_default_store().is_none() => {
+            return Ok(None);
+        }
+        Err(error) => {
+            return Err(map_keyring_operation_error(
+                &error,
+                KeyringOperation::Construct,
+                &coordinate.service,
+            ));
+        }
+    };
+    let raw = match entry.get_password() {
+        Ok(raw) => zeroize::Zeroizing::new(raw),
+        Err(keyring_core::Error::NoEntry) => return Ok(None),
+        Err(error) => {
+            return Err(map_keyring_operation_error(
+                &error,
+                KeyringOperation::Read,
+                &coordinate.service,
+            ));
+        }
+    };
+    decode_owner_public_key(&raw).map(Some).map_err(|error| {
+        WalletError::WalletState(crate::error::WalletStateError::KeyringCorrupted {
+            detail: error.to_string(),
+        })
+    })
+}
+
 /// Reads either form for symmetric-key comparisons.
 fn owner_key_bytes_in_either_form(raw: &str) -> Option<[u8; 32]> {
     let trimmed = raw.trim();

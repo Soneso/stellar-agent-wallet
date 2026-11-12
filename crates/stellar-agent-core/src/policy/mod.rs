@@ -1234,6 +1234,19 @@ pub const TRANSACTION_STATUS_UNMATCHED_ADVISORY_CODE: &str = "policy.transaction
 #[derive(Debug, Clone, thiserror::Error)]
 #[non_exhaustive]
 pub enum PolicyError {
+    /// The latest reset already consumes this request id.
+    #[error(
+        "policy.reset_consent_replayed: the latest reset consent already consumes this request id"
+    )]
+    ResetConsentReplayed,
+    /// The profile engine differs from the verified signed selection.
+    #[error(
+        "policy.engine_selection_unsigned: the engine selection '{selection}' lacks matching owner authorization in the signed policy"
+    )]
+    EngineSelectionUnsigned {
+        /// The engine selected by the profile.
+        selection: &'static str,
+    },
     /// A mainnet binding appeared on a testnet policy.
     #[error("policy.mainnet_table_on_testnet")]
     MainnetTableOnTestnet,
@@ -1465,6 +1478,8 @@ impl PolicyError {
     pub fn wire_code(&self) -> &'static str {
         match self {
             Self::MainnetTableOnTestnet => "policy.mainnet_table_on_testnet",
+            Self::EngineSelectionUnsigned { .. } => "policy.engine_selection_unsigned",
+            Self::ResetConsentReplayed => "policy.reset_consent_replayed",
             Self::SequenceRollback => "policy.sequence_rollback",
             Self::PinAbsent => "policy.pin_absent",
             Self::OwnerRotationRequired => "policy.owner_rotation_required",
@@ -2199,6 +2214,8 @@ mod tests {
         // guard makes the test driver's full-coverage dependency explicit.
         fn _exhaustiveness_guard(e: &PolicyError) {
             match e {
+                PolicyError::EngineSelectionUnsigned { .. } => {}
+                PolicyError::ResetConsentReplayed => {}
                 PolicyError::MainnetTableOnTestnet => {}
                 PolicyError::SequenceRollback => {}
                 PolicyError::PinAbsent => {}
@@ -2223,6 +2240,8 @@ mod tests {
 
         vec![
             PolicyError::MainnetTableOnTestnet,
+            PolicyError::EngineSelectionUnsigned { selection: "noop" },
+            PolicyError::ResetConsentReplayed,
             PolicyError::SequenceRollback,
             PolicyError::PinAbsent,
             PolicyError::OwnerRotationRequired,
@@ -2268,6 +2287,8 @@ mod tests {
 
     fn expected_policy_error_wire_code(err: &PolicyError) -> &'static str {
         match err {
+            PolicyError::EngineSelectionUnsigned { .. } => "policy.engine_selection_unsigned",
+            PolicyError::ResetConsentReplayed => "policy.reset_consent_replayed",
             PolicyError::MainnetTableOnTestnet => "policy.mainnet_table_on_testnet",
             PolicyError::SequenceRollback => "policy.sequence_rollback",
             PolicyError::PinAbsent => "policy.pin_absent",

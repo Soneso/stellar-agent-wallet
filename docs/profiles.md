@@ -575,6 +575,31 @@ built from it holds it. A testnet environment signer keeps it for its command.
 
 ### `[policy]` block
 
+With an enrolled owner, the profile's `[policy] engine` must match the verified
+signed policy's top-level `engine`. An omitted signed selector means `v1`.
+Policy version 2 accepts `engine = "v1"` and `engine = "noop"`.
+Version 1 rejects an explicit selector.
+
+To switch from `v1` to `noop`, stop MCP and edit the version 2 policy file.
+Set top-level `engine = "noop"`, outside every table. Load the owner seed into
+`WALLET_OWNER_SK`, then sign:
+
+```bash
+stellar-agent profile sign-policy --profile <NAME> --secret-env WALLET_OWNER_SK
+unset WALLET_OWNER_SK
+```
+
+Set `engine = "noop"` in the profile's `[policy]` table, then restart MCP.
+To switch back, set the signed policy's top-level `engine = "v1"`, run the
+same signing command, set the profile selector to `v1`, and restart MCP.
+Each re-sign assigns a higher sequence from the body and pin.
+Signing writes the policy atomically and never advances the pin.
+Intermediate mismatches refuse with `policy.engine_selection_unsigned`;
+the message names the engine selection. Selection refusal never advances the pin.
+Both CLI and MCP verify the signature, scope, sequence, pin, and owner rotation.
+Authorized Noop supplies no runtime proofs and grants no mainnet write authority.
+Ownerless profiles keep their engine behavior; unreadable owner state refuses.
+
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
 | `engine` | string | yes (in v2) | none | `"noop"` or `"v1"`. `noop`: testnet allow-all; mainnet read-only allowed; mainnet destructive operations refused with `policy.engine_required`; `smart-account multicall` refused on testnet with `policy.engine_required`, since mainnet refuses it earlier with `network.mainnet_write_forbidden`. `v1`: signature-verified typed-criteria engine, first-match default-deny. Newly minted profiles default to `v1`; a profile migrated from v1 is set to `noop` explicitly. |
@@ -776,7 +801,7 @@ on error.
 | `stellar-agent profile rotate-counterparty-key <name>` | `counterparty_cache_key_id` | Fresh 32-byte HMAC key. Cached `stellar.toml` entries read as absent until a refresh rewrites them. `counterparty refresh <domain>` rewrites the entry for that domain. `counterparty warm-up` refreshes only the `HOME_DOMAIN` entries of the policy allowlist. |
 | `stellar-agent profile rotate-nonce-key <name>` | `mcp_nonce_key_alias` | Fresh 32-byte HMAC key. Outstanding nonces minted with the old key are invalidated. |
 | `stellar-agent profile rotate-policy-state-key <name>` | `policy_window_state_key_id` | Fresh 32-byte HMAC key. Unlike the other rotations, the accumulated window-state store is re-signed under the new key, so `per_period_cap` / `rate_limit` history is preserved, not invalidated. |
-| `stellar-agent profile reset-window-state <name> --reason <reason>` | `policy_window_state_key_id` (mints if absent) | Clears verified policy-window history. An absent file with no protected generation establishes an empty store. A tampered, unparseable, or rolled-back store refuses, as does missing authenticated network provenance. No verb recovers such state in this release; create a profile under a new name. File I/O failures refuse without changing state; retry after access is restored. Discards history only after its audit row is written under the audit writer and store lock. Stop the MCP server first. An enablement nonce requires `--owner-secret-env VAR` matching the pinned owner in every build. The audit row records the owner signature. Keeps every authorization record whose approval can still be presented. |
+| `stellar-agent profile reset-window-state <name> --reason <reason>` | `policy_window_state_key_id` (mints if absent) | Clears verified ordinary accrual and preserves stored total-budget entries exactly. Reset creates no epoch. A pin or enrolled owner requires `--owner-secret-env VAR`, including without mainnet enablement. The pin takes precedence; absent pins use the enrolled owner. Only genuine ownerless state permits unsigned reset. Unreadable authority and unverifiable state refuse. Stop MCP before reset. The audit row records authorization before mutation. Terminal history and unreleased reservations survive; protected open work still refuses. |
 
 ### Enroll the MCP signer
 
@@ -839,9 +864,9 @@ on `noop`; after completing these steps, set the engine in the profile TOML:
 engine = "v1"
 ```
 
-Until this is done, a migrated profile continues to run under `noop`, which
-refuses mainnet destructive operations with `policy.engine_required`. Opting in
-to `v1` changes policy evaluation.
+After owner enrollment, a mismatched engine selection refuses through CLI and MCP.
+Complete the signed engine ceremony above before using the profile.
+Noop refuses mainnet destructive operations with `policy.engine_required`.
 Builds from this repository and releases from v0.1.0-alpha.14 on carry
 `mainnet-write`. Mainnet writes also need enablement and a signed v2 body.
 CLI value operations follow the governing decision: `allow` grants policy
@@ -1161,8 +1186,9 @@ sorted canonically. After signing or enablement, restart the MCP server.
 ### Policy and setup diagnostics
 
 These are policy-library and setup codes. CLI engine construction preserves
-enablement errors but wraps other build failures as `policy.engine_unavailable`
-or `trustline.policy_engine_unavailable`.
+enablement errors and `policy.engine_selection_unsigned`.
+Enrolled Noop owner discovery preserves keyring codes.
+Other build failures use `policy.engine_unavailable` or `trustline.policy_engine_unavailable`.
 
 | Code | Meaning or remedy |
 |---|---|
@@ -1186,8 +1212,9 @@ or `trustline.policy_engine_unavailable`.
 | `enroll_signer.repair_unpinned` | Identity repair requires the stored public-key pin. |
 | `enroll_signer.identity_conflict` | The stored identity conflicts with the enrolled signer. |
 | `auth.enrolled_identity_unusable` | The enrolled identity cannot establish the signer proof. Ledger enrollment is unavailable. |
-| `profile.reset_window_state_owner_required` | Supply `--owner-secret-env VAR` with the pinned owner's seed on an enabled installation. |
-| `profile.reset_window_state_owner_mismatch` | The supplied seed must derive to the pinned owner. |
+| `profile.reset_window_state_owner_required` | A pin or enrolled owner requires `--owner-secret-env VAR`, including without an enablement nonce. Use the pinned owner's seed, or the enrolled owner's seed when no pin exists. |
+| `profile.reset_window_state_owner_mismatch` | The supplied seed must derive to the selected owner. The pin takes precedence over the enrolled key. |
+| `policy.engine_selection_unsigned` | Sign the V2 engine selector with the owner seed, set the matching profile selector, and restart MCP. Both switch directions require authorization. |
 | `profile.reset_window_state_signature_invalid` | The owner's signature must verify over this reset's statement. |
 | `sign_policy.owner_key_older_form` | Enroll the owner public key again with `profile enroll-owner-key --force`. |
 | `profile.reset_window_state_newer_version` | This build cannot reset an unsupported newer state format. |

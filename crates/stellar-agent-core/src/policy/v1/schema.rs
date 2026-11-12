@@ -178,6 +178,7 @@ pub fn validate_policy_keys(doc: &DocumentMut) -> Result<(), PolicyError> {
             "version",
             "scope",
             "sequence",
+            "engine",
             "mainnet",
             "rules",
             "signature",
@@ -187,6 +188,7 @@ pub fn validate_policy_keys(doc: &DocumentMut) -> Result<(), PolicyError> {
         ROOT_KEYS
     };
     reject_unknown_keys(doc.as_table(), root, None, "the policy file")?;
+    signed_engine(doc)?;
     if let Some(mainnet) = doc.get("mainnet").and_then(Item::as_table_like) {
         reject_unknown_keys(mainnet, MAINNET_KEYS, Some("mainnet"), "the mainnet table")?;
         super::approval_credentials::reject_unknown_fields(mainnet.get("approval_credentials"))?;
@@ -243,6 +245,28 @@ pub fn validate_policy_keys(doc: &DocumentMut) -> Result<(), PolicyError> {
     }
 
     Ok(())
+}
+
+/// Reads the optional signed engine selector without inserting a default field.
+pub(super) fn signed_engine(
+    doc: &DocumentMut,
+) -> Result<crate::profile::schema::PolicyEngineKind, PolicyError> {
+    use crate::profile::schema::PolicyEngineKind;
+    match doc.get("engine") {
+        None => Ok(PolicyEngineKind::V1),
+        Some(item) if doc.get("version").and_then(Item::as_integer) == Some(2) => {
+            match item.as_str() {
+                Some("v1") => Ok(PolicyEngineKind::V1),
+                Some("noop") => Ok(PolicyEngineKind::Noop),
+                _ => Err(PolicyError::PolicyFileParseFailed {
+                    detail: "engine selection must be the string 'v1' or 'noop'".into(),
+                }),
+            }
+        }
+        Some(_) => Err(PolicyError::PolicyFileParseFailed {
+            detail: "engine selection requires policy version 2".into(),
+        }),
+    }
 }
 
 /// Checks the keys of the rule at index `idx`, its `match` table, and its

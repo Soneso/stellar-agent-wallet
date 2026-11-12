@@ -133,6 +133,148 @@ fn without_mainnet() -> String {
 }
 
 #[test]
+fn engine_selection_signature_binds_kind() {
+    use stellar_agent_core::policy::v1::loader::load_signed_policy_text;
+    let key = SigningKey::from_bytes(&[11; 32]);
+    let body = V1.replace("version = 1", "version = 2\nsequence = 1");
+    let absent = canonical_bytes(&body).unwrap();
+    for kind in ["v1", "noop"] {
+        let selected = body.replace(
+            "sequence = 1",
+            &format!("sequence = 1\nengine = \"{kind}\""),
+        );
+        let canonical = canonical_bytes(&selected).unwrap();
+        assert_ne!(canonical, absent);
+        assert!(
+            String::from_utf8(canonical)
+                .unwrap()
+                .contains(&format!("sequence = 1\nengine = \"{kind}\""))
+        );
+        let text = signed(&selected, &key);
+        let load_text = |raw: &str| {
+            load_signed_policy_text(
+                raw,
+                "operator",
+                &key.verifying_key().to_bytes(),
+                stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE,
+            )
+        };
+        load_text(&text).unwrap();
+        for changed in [
+            text.replace(&format!("engine = \"{kind}\"\n"), ""),
+            text.replace(
+                &format!("engine = \"{kind}\""),
+                &format!("engine = \"{}\"", if kind == "v1" { "noop" } else { "v1" }),
+            ),
+        ] {
+            assert!(matches!(
+                load_text(&changed),
+                Err(PolicyError::OwnerSignatureInvalid { .. })
+            ));
+        }
+    }
+    for value in ["\"other\"", "1", "true", "[]", "{}"] {
+        let raw = body.replace("sequence = 1", &format!("sequence = 1\nengine = {value}"));
+        assert!(
+            stellar_agent_core::policy::v1::validate_unsigned_policy(
+                &raw,
+                "operator",
+                stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE
+            )
+            .is_err()
+        );
+    }
+    assert!(canonical_bytes(&V1.replace("version = 1", "version = 1\nengine = \"v1\"")).is_err());
+    assert_eq!(canonical_bytes(&body).unwrap(), absent);
+}
+
+#[test]
+#[serial]
+fn engine_selection_reuses_sequence_and_pin_freshness() {
+    use stellar_agent_core::profile::schema::PolicyEngineKind;
+    keyring_mock::install().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let mut profile = profile(false);
+    let owner = SigningKey::from_bytes(&[11; 32]);
+    let body = V1.replace("version = 1", "version = 2\nsequence = 1");
+    load(dir.path(), &body, &profile, &owner, PinMode::Advance).unwrap();
+    let before = pinned(dir.path(), &profile);
+    profile.policy.engine = PolicyEngineKind::Noop;
+    for mode in [PinMode::CompareOnly, PinMode::Advance] {
+        let error = load(dir.path(), &body, &profile, &owner, mode)
+            .err()
+            .unwrap();
+        assert_eq!(error.wire_code(), "policy.engine_selection_unsigned");
+        assert!(error.to_string().contains("engine selection"));
+        assert_eq!(pinned(dir.path(), &profile), before);
+    }
+    let noop = body.replace("sequence = 1", "sequence = 2\nengine = \"noop\"");
+    let inspection = inspect_verified_policy(
+        &PolicyLoad {
+            path: &dir.path().join("policy.toml"),
+            profile: &profile,
+            profile_name: "operator",
+            owner_pubkey: &owner.verifying_key().to_bytes(),
+            owner_source: OwnerKeySource::Keyring,
+            window_path: &dir.path().join("state.window"),
+        },
+        PolicyStateStore::new(),
+    );
+    assert_eq!(
+        inspection.verified.err().unwrap().wire_code(),
+        "policy.engine_selection_unsigned"
+    );
+    load(dir.path(), &noop, &profile, &owner, PinMode::Advance).unwrap();
+    let before = pinned(dir.path(), &profile);
+    for mode in [PinMode::CompareOnly, PinMode::Advance] {
+        for (raw, key, code) in [
+            (
+                noop.replace("sequence = 2", "sequence = 1"),
+                owner.clone(),
+                "policy.sequence_rollback",
+            ),
+            (
+                noop.replace("decision = \"allow\"", "decision = \"deny\""),
+                owner.clone(),
+                "policy.sequence_fork",
+            ),
+            (
+                noop.replace("sequence = 2", "sequence = 3"),
+                SigningKey::from_bytes(&[12; 32]),
+                "policy.owner_rotation_required",
+            ),
+        ] {
+            assert_eq!(
+                load(dir.path(), &raw, &profile, &key, mode)
+                    .err()
+                    .unwrap()
+                    .wire_code(),
+                code
+            );
+            assert_eq!(pinned(dir.path(), &profile), before);
+        }
+    }
+    profile.policy.engine = PolicyEngineKind::V1;
+    let next = noop.replace("sequence = 2", "sequence = 3");
+    assert_eq!(
+        load(dir.path(), &next, &profile, &owner, PinMode::Advance)
+            .err()
+            .unwrap()
+            .wire_code(),
+        "policy.engine_selection_unsigned"
+    );
+    assert_eq!(pinned(dir.path(), &profile), before);
+    load(
+        dir.path(),
+        &next.replace("engine = \"noop\"", "engine = \"v1\""),
+        &profile,
+        &owner,
+        PinMode::Advance,
+    )
+    .unwrap();
+}
+
+#[test]
 fn v2_canonical_full_literal() {
     const EXPECTED: &str = r#"version = 2
 scope = "profile:operator"
@@ -162,6 +304,72 @@ allow_opaque_signing = false
         String::from_utf8(canonical_bytes(FULL).unwrap()).unwrap(),
         EXPECTED
     );
+}
+
+#[test]
+fn public_docs_cover_both_owner_ceremonies() {
+    const CLI: &str = include_str!("../../../../docs/cli-reference/profile-and-governance.md");
+    const AGENTS: &str = include_str!("../../../../docs/agents.md");
+    const PROFILES: &str = include_str!("../../../../docs/profiles.md");
+    for (document, sentence) in [
+        (
+            CLI,
+            "A profile with a policy pin or an enrolled owner requires the owner's signature, including testnet and mainnet profiles without an enablement nonce.",
+        ),
+        (
+            AGENTS,
+            "`profile reset-window-state` requires the owner's signature whenever a pin or enrolled owner exists, including testnet and nonce-free mainnet profiles.",
+        ),
+    ] {
+        let normalized = document.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            normalized.contains(sentence),
+            "reset requires owner authorization"
+        );
+    }
+    for document in [CLI, AGENTS] {
+        for rule in [
+            "--owner-secret-env",
+            "enrolled owner",
+            "pin",
+            "signature",
+            "testnet",
+            "nonce",
+            "ownerless",
+        ] {
+            assert!(document.contains(rule), "reset guidance: {rule}");
+        }
+        assert!(!document.contains("requires no owner signature until"));
+    }
+    for document in [CLI, PROFILES] {
+        let normalized = document.split_whitespace().collect::<Vec<_>>().join(" ");
+        for sentence in [
+            "Set `engine = \"noop\"` in the profile's `[policy]` table, then restart MCP.",
+            "To switch back, set the signed policy's top-level `engine = \"v1\"`, run the same signing command, set the profile selector to `v1`, and restart MCP.",
+            "Load the owner seed into `WALLET_OWNER_SK`, then sign:",
+        ] {
+            assert!(
+                normalized.contains(sentence),
+                "complete owner ceremony: {sentence}"
+            );
+        }
+        for rule in [
+            "signed policy's top-level `engine`",
+            "omitted signed selector means `v1`",
+            "engine = \"noop\"",
+            "engine = \"v1\"",
+            "stellar-agent profile sign-policy --profile <NAME> --secret-env WALLET_OWNER_SK",
+            "unset WALLET_OWNER_SK",
+            "To switch back",
+            "restart MCP",
+            "higher sequence",
+            "never advances the pin",
+            "policy.engine_selection_unsigned",
+            "no mainnet write authority",
+        ] {
+            assert!(document.contains(rule), "selection ceremony: {rule}");
+        }
+    }
 }
 
 macro_rules! minimum {

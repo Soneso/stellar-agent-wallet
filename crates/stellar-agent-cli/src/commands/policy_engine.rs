@@ -24,7 +24,8 @@
 //!
 //! # Invariants preserved
 //!
-//! - `PolicyEngineKind::Noop` → `NoopPolicyEngine` (permissive; no key fetch).
+//! - `PolicyEngineKind::Noop` checks enrollment and verifies the signed engine
+//!   selection when an owner exists. Genuine ownerless profiles remain permissive.
 //! - `PolicyEngineKind::V1` → [`load_v1_policy_engine`]: full owner-key fetch,
 //!   G-strkey decode, OS-state-dir resolve, window-state
 //!   hydration, and the verified signed-policy load with its pin comparison;
@@ -51,8 +52,7 @@ use stellar_agent_core::mainnet::decision::{
 };
 use stellar_agent_core::policy::v1::{AccountIdentityView, AccountReservesView, PolicyEngineV1};
 use stellar_agent_core::policy::{
-    Decision, McpToolRegistration, NoopPolicyEngine, PolicyEngine, ToolDescriptor, ToolValueKind,
-    policy_now_ms,
+    Decision, McpToolRegistration, PolicyEngine, ToolDescriptor, ToolValueKind, policy_now_ms,
 };
 use stellar_agent_core::wallet::WalletLifecycleError;
 // `OWNER_KEY_SERVICE_PREFIX` and the strip that inverts it are owned by
@@ -117,7 +117,7 @@ impl std::fmt::Display for EngineLoadError {
 /// `STELLAR_AGENT_PROFILE`, or the fallback), already resolved. It selects the
 /// policy-window-state FILE, and nothing else; see [`load_v1_policy_engine`].
 ///
-/// - [`PolicyEngineKind::Noop`] → [`NoopPolicyEngine`].
+/// - [`PolicyEngineKind::Noop`] returns the authorized Noop engine.
 /// - [`PolicyEngineKind::V1`] → [`load_v1_policy_engine`], shared through `Arc`.
 /// - Any failure for `V1` → `Err(human-readable message)`. The caller MUST
 ///   refuse the value-moving operation (render the error, exit non-zero).
@@ -136,7 +136,27 @@ pub(crate) fn build_v1_policy_engine(
     requested_profile_name: &str,
 ) -> Result<Arc<dyn PolicyEngine>, EngineLoadError> {
     match kind {
-        PolicyEngineKind::Noop => Ok(Arc::new(NoopPolicyEngine)),
+        PolicyEngineKind::Noop => build_policy_engine(
+            profile,
+            None,
+            requested_profile_name,
+            None,
+            [0; 32],
+            OwnerKeySource::Keyring,
+        )
+        .map(|built| built.engine)
+        .map_err(|error| EngineLoadError {
+            code: match &error {
+                PolicyEngineBuildError::OwnerKeyring(error) => error.code(),
+                PolicyEngineBuildError::Policy(
+                    error @ stellar_agent_core::policy::PolicyError::EngineSelectionUnsigned {
+                        ..
+                    },
+                ) => error.wire_code(),
+                _ => "policy.engine_unavailable",
+            },
+            message: format!("{error}; {verb} refuses (fail closed)"),
+        }),
         PolicyEngineKind::V1 => Ok(load_v1_policy_engine(
             verb,
             profile,
@@ -233,6 +253,10 @@ pub(crate) fn load_v1_policy_engine(
     )
     .map_err(|error| {
         let code = match &error {
+            PolicyEngineBuildError::OwnerKeyring(error) => error.code(),
+            PolicyEngineBuildError::Policy(
+                error @ stellar_agent_core::policy::PolicyError::EngineSelectionUnsigned { .. },
+            ) => error.wire_code(),
             PolicyEngineBuildError::WindowState { source, .. }
                 if source.chain_validation_error().is_some() =>
             {
@@ -416,6 +440,10 @@ pub(crate) fn load_mainnet_policy_engine(
         owner.source,
     )
     .map_err(|error| match error {
+        PolicyEngineBuildError::OwnerKeyring(error) => Envelope::<()>::err(&error),
+        PolicyEngineBuildError::Policy(
+            error @ stellar_agent_core::policy::PolicyError::EngineSelectionUnsigned { .. },
+        ) => Envelope::<()>::err_raw(error.wire_code(), error.to_string()),
         PolicyEngineBuildError::WindowState { source, .. }
             if source.chain_validation_error().is_some() =>
         {
@@ -447,6 +475,7 @@ fn mainnet_policy_from(
         engine: _,
         verified,
         enablement,
+        policy_path: _,
     } = built;
     let Some((verified, body)) = verified.and_then(|verified| {
         let body = verified.mainnet()?.clone();
@@ -1148,9 +1177,11 @@ mod tests {
 
     // ── Noop path ────────────────────────────────────────────────────────────
 
-    /// `PolicyEngineKind::Noop` always succeeds — no keyring or file I/O.
+    /// A Noop profile without an enrolled owner allows every testnet verb.
     #[test]
+    #[serial_test::serial]
     fn noop_engine_succeeds_for_all_verbs() {
+        stellar_agent_test_support::keyring_mock::install().unwrap();
         for verb in ["lend", "vault", "trade", "bridge", "trustline"] {
             let profile = make_profile(
                 PolicyEngineKind::Noop,
@@ -1161,6 +1192,118 @@ mod tests {
                 "Noop engine must succeed for verb '{verb}'"
             );
         }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn engine_selection_refuses_unreadable_owner_state() {
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        let profile = make_profile(PolicyEngineKind::Noop, "stellar-agent-owner-unreadable");
+        let entry = &profile.policy_owner_key_id;
+        stellar_agent_test_support::keyring_mock::inject_error(
+            &entry.service,
+            &entry.account,
+            keyring_core::Error::NoStorageAccess(Box::new(std::io::Error::other("locked"))),
+        )
+        .unwrap();
+        let error = build_v1_policy_engine("pay", &profile.policy.engine, &profile, "unreadable")
+            .err()
+            .unwrap();
+        assert_eq!(error.code(), "auth.keyring_platform_error");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn unsigned_engine_selection_refuses_before_payment() {
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        let home = tempfile::TempDir::new().unwrap();
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
+        let name = "engine-selection";
+        let key = ed25519_dalek::SigningKey::from_bytes(&[11; 32]);
+        let public = key.verifying_key().to_bytes();
+        put_owner_entry(
+            name,
+            &stellar_agent_core::profile::owner_key::encode_owner_public_key(&public),
+        );
+        let body = format!(
+            "version = 2\nsequence = 1\nscope = \"profile:{name}\"\n[[rules]]\nmatch = {{tool = \"stellar_pay\", chain = \"*\"}}\ncriteria = [{{kind = \"per_tx_cap\", asset = \"native\", max_stroops = \"1\"}}]\ndecision = \"allow\"\n"
+        );
+        let digest = stellar_agent_core::policy::v1::signature::digest(
+            &stellar_agent_core::policy::v1::canonical::canonical_bytes(&body).unwrap(),
+        );
+        let signature = stellar_agent_core::policy::v1::signature::sign(&digest, &key);
+        let directory = stellar_agent_core::profile::schema::default_policy_dir().unwrap();
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(
+            directory.join(format!("{name}.toml")),
+            format!(
+                "{body}\n[signature]\nowner_id = \"{}\"\nsig = \"{}\"\n",
+                stellar_strkey::ed25519::PublicKey(public),
+                stellar_agent_core::hex::encode(&signature)
+            ),
+        )
+        .unwrap();
+        let mut profile = make_profile(
+            PolicyEngineKind::V1,
+            &format!("{OWNER_KEY_SERVICE_PREFIX}{name}"),
+        );
+        build_v1_policy_engine("pay", &profile.policy.engine, &profile, name).unwrap();
+        profile.policy.engine = PolicyEngineKind::Noop;
+        let error = build_v1_policy_engine("pay", &profile.policy.engine, &profile, name)
+            .err()
+            .unwrap();
+        assert_eq!(error.code(), "policy.engine_selection_unsigned");
+        assert!(error.to_string().contains("engine selection 'noop'"));
+        assert!(
+            !stellar_agent_core::profile::schema::default_policy_window_state_path_for(name)
+                .exists()
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn engine_selection_refusal_preserves_typed_code() {
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        let home = tempfile::TempDir::new().unwrap();
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
+        let name = "typed-selection";
+        let key = ed25519_dalek::SigningKey::from_bytes(&[11; 32]);
+        let public = key.verifying_key().to_bytes();
+        put_owner_entry(
+            name,
+            &stellar_agent_core::profile::owner_key::encode_owner_public_key(&public),
+        );
+        let body = format!(
+            "version = 2\nengine = \"noop\"\nsequence = 1\nscope = \"profile:{name}\"\n[[rules]]\nmatch = {{tool = \"stellar_pay\", chain = \"*\"}}\ncriteria = [{{kind = \"per_tx_cap\", asset = \"native\", max_stroops = \"1\"}}]\ndecision = \"allow\"\n"
+        );
+        let digest = stellar_agent_core::policy::v1::signature::digest(
+            &stellar_agent_core::policy::v1::canonical::canonical_bytes(&body).unwrap(),
+        );
+        let signature = stellar_agent_core::policy::v1::signature::sign(&digest, &key);
+        let directory = stellar_agent_core::profile::schema::default_policy_dir().unwrap();
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(
+            directory.join(format!("{name}.toml")),
+            format!(
+                "{body}\n[signature]\nowner_id = \"{}\"\nsig = \"{}\"\n",
+                stellar_strkey::ed25519::PublicKey(public),
+                stellar_agent_core::hex::encode(&signature)
+            ),
+        )
+        .unwrap();
+        let profile = make_profile(
+            PolicyEngineKind::V1,
+            &format!("{OWNER_KEY_SERVICE_PREFIX}{name}"),
+        );
+        let error = build_v1_policy_engine("pay", &profile.policy.engine, &profile, name)
+            .err()
+            .unwrap();
+        assert_eq!(error.code(), "policy.engine_selection_unsigned");
+        assert!(error.to_string().contains("engine selection 'v1'"));
+        assert!(
+            !stellar_agent_core::profile::schema::default_policy_window_state_path_for(name)
+                .exists()
+        );
     }
 
     // ── Fail-closed: service prefix mismatch ─────────────────────────────────

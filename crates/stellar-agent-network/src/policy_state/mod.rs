@@ -206,6 +206,7 @@ pub mod approvals;
 pub mod ledger;
 pub mod lock;
 pub mod operations;
+mod reset_consent;
 pub mod store;
 
 use lock::StateLockError;
@@ -456,21 +457,24 @@ pub enum WindowStoreError {
     #[error("the window state reset names a profile other than the one the profile file names")]
     ResetProfileMismatch,
 
-    /// The installation holds a mainnet enablement nonce and the reset presents
-    /// no owner signature. The reset changes no window state.
-    #[error(
-        "the installation has mainnet enabled; the window state reset requires the pinned \
-         policy owner's signature"
-    )]
+    /// The reset requires the policy owner's signature and presents none.
+    #[error("the window state reset requires the policy owner's signature")]
     ResetOwnerRequired,
 
-    /// The reset is signed by a key other than the pinned policy owner. The
+    /// The enrolled owner cannot be read or decoded under the reset guard.
+    #[error("the enrolled owner cannot be read for the window state reset: {0}")]
+    ResetOwnerUnreadable(
+        /// The classified owner entry failure.
+        stellar_agent_core::error::WalletError,
+    ),
+
+    /// The reset is signed by a key other than the selected policy owner. The
     /// reset changes no window state.
-    #[error("the window state reset signature names an owner other than the pinned policy owner")]
+    #[error("the window state reset signature names an owner other than the selected policy owner")]
     ResetOwnerMismatch {
         /// The owner public key the presented signature names.
         presented: [u8; 32],
-        /// The owner public key the policy pin names.
+        /// The owner public key selected from the pin or enrollment.
         pinned: [u8; 32],
     },
 
@@ -499,6 +503,10 @@ pub enum WindowStoreError {
     /// reset changes no window state.
     #[error("the owner's signature does not verify over this window state reset")]
     ResetSignatureInvalid,
+
+    /// The latest reset already consumes this request id.
+    #[error("{0}", stellar_agent_core::policy::PolicyError::ResetConsentReplayed)]
+    ResetConsentReplayed,
 
     /// The file already holds a record under the reservation's id.
     ///
@@ -704,6 +712,32 @@ impl WindowStoreError {
             format!("{refusal}. {NO_RECOVERY_NOTICE}")
         } else {
             refusal
+        }
+    }
+}
+
+#[cfg(test)]
+pub(super) mod reset_test {
+    use super::store::{OwnerResetSignature, ResetConsent, ResetRecord};
+
+    /// The owner public key for the fixture seed.
+    pub(super) fn owner_of(seed: u8) -> [u8; 32] {
+        ed25519_dalek::SigningKey::from_bytes(&[seed; 32])
+            .verifying_key()
+            .to_bytes()
+    }
+
+    /// Signs the exact reset statement with the fixture seed.
+    pub(super) fn signed_by(seed: u8, row: &ResetRecord<'_>) -> ResetConsent {
+        let key = ed25519_dalek::SigningKey::from_bytes(&[seed; 32]);
+        ResetConsent {
+            owner_signature: Some(OwnerResetSignature {
+                owner: owner_of(seed),
+                signature: stellar_agent_core::policy::v1::signature::sign(
+                    &row.statement_digest(),
+                    &key,
+                ),
+            }),
         }
     }
 }

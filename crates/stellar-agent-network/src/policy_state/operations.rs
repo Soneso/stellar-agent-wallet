@@ -4347,6 +4347,7 @@ mod tests {
     use stellar_agent_test_support::keyring_mock;
     use tempfile::TempDir;
 
+    use super::super::reset_test::{owner_of, signed_by};
     use super::*;
     use crate::mainnet::clock::{TestClockGuard, set_now_ms_for_test};
     use crate::mainnet::digest::BindingFacts;
@@ -4420,7 +4421,7 @@ mod tests {
             pin::write_for_test(
                 &lock,
                 &PinScope::for_profile(fx.store.path(), &fx.profile),
-                &Pin::new(7, [7; 32], [1; 32]).unwrap(),
+                &Pin::new(7, [7; 32], owner_of(11)).unwrap(),
             )
             .unwrap();
             fx
@@ -6159,7 +6160,7 @@ mod tests {
                 fx.now(),
                 "repair",
                 "reset-request",
-                |_| Ok::<_, ()>(ResetConsent::default()),
+                |row| Ok::<_, ()>(signed_by(11, row)),
                 |_, _| Ok(()),
             )
             .unwrap();
@@ -7349,7 +7350,7 @@ mod tests {
                 now,
                 "repair",
                 "reset-request",
-                |_| Ok::<_, ()>(ResetConsent::default()),
+                |row| Ok::<_, ()>(signed_by(11, row)),
                 |_, _| Ok(()),
             )
             .unwrap();
@@ -7423,7 +7424,7 @@ mod tests {
                 now,
                 "repair",
                 "reset-request",
-                |_| Ok::<_, ()>(ResetConsent::default()),
+                |row| Ok::<_, ()>(signed_by(11, row)),
                 |_, _| Ok(()),
             )
             .unwrap();
@@ -7571,7 +7572,7 @@ mod tests {
                 now,
                 "repair",
                 "reset-request",
-                |_| Ok::<_, ()>(ResetConsent::default()),
+                |row| Ok::<_, ()>(signed_by(11, row)),
                 |_, _| Ok(()),
             )
             .unwrap();

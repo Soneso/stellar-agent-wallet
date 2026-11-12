@@ -64,7 +64,7 @@ use crate::policy::PolicyError;
 ///
 /// The `[signature]` table is excluded and a present `[owner_rotation]`
 /// table is included. Version 1 signs `version`, `scope`, and `[[rules]]` in
-/// declaration order. Version 2 also signs `sequence` and `[mainnet]`, and
+/// declaration order. Version 2 also signs `sequence`, optional `engine`, and `[mainnet]`, and
 /// sorts keys in match and criterion tables.  Each rule
 /// carries `match`, `criteria` and `decision`, then whichever of `reason`,
 /// `ttl_secs` and `allow_opaque_signing` it holds, in that order.  All
@@ -139,6 +139,7 @@ pub(crate) const OPTIONAL_RULE_KEYS: [&str; 3] = ["reason", "ttl_secs", "allow_o
 /// their fixed order, then emits via `to_string()`.
 fn build_canonical_document(doc: &DocumentMut) -> Result<String, PolicyError> {
     let mut out = DocumentMut::new();
+    super::schema::signed_engine(doc)?;
 
     // ── version ──────────────────────────────────────────────────────────────
     let version_item = doc
@@ -166,6 +167,9 @@ fn build_canonical_document(doc: &DocumentMut) -> Result<String, PolicyError> {
                 detail: "policy v2 requires `sequence`".into(),
             })?;
         out.insert("sequence", Item::Value(canonical_scalar(sequence)?));
+        if let Some(engine) = doc.get("engine") {
+            out.insert("engine", Item::Value(canonical_scalar(engine)?));
+        }
         if let Some(mainnet) = doc.get("mainnet") {
             // The canonical form requires `mainnet` to be a table.
             let mainnet =

@@ -52,7 +52,9 @@
 //! An enablement nonce requires `--owner-secret-env VAR` holding the pinned
 //! owner's seed in every build. The store reads the nonce and pin under its lock
 //! and verifies the owner's signature over the reset statement before the row.
-//! With the flag, the seed must match the pin even without a nonce.
+//! Without a nonce, a pin or enrolled owner still requires consent.
+//! The pin takes precedence; absent pins use the verified enrolled owner key.
+//! Only genuinely ownerless state permits unsigned reset.
 //! Owner, pin and signature refusals write no row and change no store,
 //! generation or key. The row records the owner's signature over the profile,
 //! chain, store digest, generation pair, reason bounded to 50 Unicode
@@ -66,7 +68,8 @@
 //! # Output (JSON envelope)
 //!
 //! The success envelope reports the wiped accrual. The audit row also carries
-//! `owner_authorization` when `--owner-secret-env` supplies the pinned seed.
+//! `owner_authorization` when `--owner-secret-env` supplies the selected owner's seed.
+//! Reset preserves stored total-budget entries and creates no epoch.
 //!
 //! On success:
 //!
@@ -89,8 +92,8 @@
 //! # Errors
 //!
 //! Returns exit code `1` when the profile cannot be loaded or the store reset
-//! fails. It also returns `1` when an enabled profile lacks the owner seed, the
-//! seed is invalid or names another owner, the pin is absent or unreadable, or
+//! fails. It also returns `1` when an owner-protected profile lacks the seed, the
+//! seed is invalid or names another owner, authority is absent or unreadable, or
 //! the signature does not verify.
 
 use super::owner_seed::{OwnerSeedError, with_owner_seed};
@@ -154,7 +157,7 @@ pub(crate) struct ResetWindowStateArgs {
     #[arg(long)]
     pub(crate) reason: String,
 
-    /// Environment variable containing the pinned policy owner's S-strkey.
+    /// Environment variable containing the selected policy owner's S-strkey.
     /// Supply the variable name, never the secret itself.
     #[arg(long, value_name = "VAR")]
     pub(crate) owner_secret_env: Option<String>,
@@ -459,8 +462,12 @@ fn reset_refusal(name: &str, error: WindowStoreError) -> ResetRefusal {
             ResetRefusal::Policy(PolicyError::from(error))
         }
         WindowStoreError::ResetEnablementUnreadable(error) => ResetRefusal::Validation(error),
+        WindowStoreError::ResetOwnerUnreadable(error) => ResetRefusal::Wallet(error),
         WindowStoreError::ResetSignatureInvalid => {
             ResetRefusal::Validation(ValidationError::ResetWindowStateSignatureInvalid { profile })
+        }
+        WindowStoreError::ResetConsentReplayed => {
+            ResetRefusal::Policy(PolicyError::ResetConsentReplayed)
         }
         error => ResetRefusal::Wallet(store_refusal(name, error)),
     }
@@ -641,7 +648,7 @@ mod tests {
 
     #[test]
     #[serial]
-    fn an_anchor_refusal_preserves_window_state_and_generation() {
+    fn owner_reset_audit_failure_changes_no_state() {
         use std::sync::Arc;
         use stellar_agent_core::audit_log::KeyedAuditAccess;
         use stellar_agent_core::audit_log::tip_anchor::InMemoryTipAnchorStore;
@@ -689,14 +696,31 @@ mod tests {
         )
         .unwrap();
         anchor.set_failing(true);
+        let owner = ed25519_dalek::SigningKey::from_bytes(&[0x51; 32]);
+        let coordinate = &profile.policy_owner_key_id;
+        keyring_core::Entry::new(&coordinate.service, &coordinate.account)
+            .unwrap()
+            .set_password(&encode_owner_public_key(&owner.verifying_key().to_bytes()))
+            .unwrap();
+        let consent = |record: &ResetRecord<'_>| {
+            Ok(ResetConsent {
+                owner_signature: Some(stellar_agent_network::policy_state::OwnerResetSignature {
+                    owner: owner.verifying_key().to_bytes(),
+                    signature: stellar_agent_core::policy::v1::signature::sign(
+                        &record.statement_digest(),
+                        &owner,
+                    ),
+                }),
+            })
+        };
         let result = store.reset(
             &profile,
             "reset-anchor",
             100_000,
             "repair",
             "reset-request",
-            |_| Ok(ResetConsent::default()),
-            |record, _| {
+            consent,
+            |record, consent| {
                 record_window_reset(
                     &mut writer,
                     "reset-anchor",
@@ -704,7 +728,7 @@ mod tests {
                     record.request_id,
                     record.chain_id,
                     record.accrual,
-                    None,
+                    owner_authorization(record, consent),
                 )
             },
         );
@@ -726,15 +750,15 @@ mod tests {
                     100_000,
                     "repair",
                     "reset-request",
-                    |_| Ok(ResetConsent::default()),
-                    |record, _| record_window_reset(
+                    consent,
+                    |record, consent| record_window_reset(
                         &mut writer,
                         "reset-anchor",
                         record.reason,
                         record.request_id,
                         record.chain_id,
                         record.accrual,
-                        None,
+                        owner_authorization(record, consent),
                     ),
                 )
                 .is_err()
@@ -867,6 +891,10 @@ mod tests {
             (
                 WindowStoreError::ResetSignatureInvalid,
                 "profile.reset_window_state_signature_invalid",
+            ),
+            (
+                WindowStoreError::ResetConsentReplayed,
+                "policy.reset_consent_replayed",
             ),
             (
                 WindowStoreError::ResetProfileMismatch,

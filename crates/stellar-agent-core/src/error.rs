@@ -2041,9 +2041,9 @@ pub enum ValidationError {
     )]
     WindowChainUnverifiable,
 
-    /// An enabled installation needs its pinned owner's seed for a reset.
+    /// The window reset requires the policy owner's signature.
     #[error(
-        "profile '{profile}' has mainnet enabled; reset-window-state requires the pinned owner's seed in --owner-secret-env; the reset changes no window state"
+        "profile '{profile}' reset-window-state requires the policy owner's signature through --owner-secret-env; the reset changes no window state"
     )]
     ResetWindowStateOwnerRequired {
         /// Selected profile name.

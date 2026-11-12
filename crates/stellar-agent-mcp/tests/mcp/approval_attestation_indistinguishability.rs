@@ -972,15 +972,10 @@ async fn an_attestation_under_the_owner_public_key_returns_the_uniform_error() {
     // 32 bytes, the owner entry in the older form.
     let owner_key = [0x22u8; 32];
     let older_form = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(owner_key);
-    for (service, account) in [
-        ("stellar-agent-attestation-acct", "default"),
-        ("stellar-agent-owner-acct", "default"),
-    ] {
-        keyring_core::Entry::new(service, account)
-            .expect("Entry::new")
-            .set_password(&older_form)
-            .expect("set_password");
-    }
+    keyring_core::Entry::new("stellar-agent-attestation-acct", "default")
+        .expect("Entry::new")
+        .set_password(&older_form)
+        .expect("set_password");
 
     let temp = TempDir::new().expect("TempDir::new");
     let mock = MockServer::start().await;
@@ -997,6 +992,10 @@ async fn an_attestation_under_the_owner_public_key_returns_the_uniform_error() {
     profile.rpc_url = mock.uri();
     let (server, envelope_xdr, nonce_b64, expiry_ms) =
         build_scaffold(profile, temp.path().to_path_buf()).await;
+    keyring_core::Entry::new("stellar-agent-owner-acct", "default")
+        .expect("Entry::new")
+        .set_password(&older_form)
+        .expect("set_password");
 
     let uid =
         stellar_agent_core::approval::user_id::process_uid_for_attestation().expect("process uid");

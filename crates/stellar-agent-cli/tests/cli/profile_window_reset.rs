@@ -33,6 +33,10 @@ struct Fixture {
 
 impl Fixture {
     fn new(existing: bool) -> Self {
+        Self::for_chain(existing, true)
+    }
+
+    fn for_chain(existing: bool, mainnet: bool) -> Self {
         let home = tempfile::tempdir().unwrap();
         let guard = StellarAgentHomeGuard::new(home.path());
         keyring_core::set_default_store(Arc::new(
@@ -54,6 +58,11 @@ impl Fixture {
         .with_noop_engine()
         .audit_log_path(home.path().join("audit/reset.jsonl"))
         .build();
+        if !mainnet {
+            profile.chain_id = stellar_agent_core::profile::caip2::Caip2::Testnet;
+            profile.network_passphrase =
+                stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE.into();
+        }
         profile.wallet.mlock_required = stellar_agent_core::wallet::MlockRequired::Warn;
         std::fs::create_dir_all(profile.audit_log_path.parent().unwrap()).unwrap();
         std::fs::write(&profile.audit_log_path, b"").unwrap();
@@ -559,21 +568,152 @@ fn an_owner_seed_without_a_pin_refuses() {
 
 #[test]
 #[serial]
-fn a_reset_without_a_nonce_needs_no_seed() {
-    let f = Fixture::new(true);
-    f.pin([0x51; 32]);
-    assert_eq!(f.run()["ok"], true);
-    let rows = verified_audit_entries_from_path(&f.profile.audit_log_path);
-    let row = rows
-        .iter()
-        .find(|row| matches!(row.event_kind, EventKind::PolicyWindowStateReset { .. }))
-        .unwrap();
-    assert!(
-        serde_json::to_value(row)
-            .unwrap()
-            .get("owner_authorization")
-            .is_none()
-    );
+fn mainnet_pinned_reset_without_nonce_requires_signature() {
+    for existing in [false, true] {
+        let f = Fixture::new(existing);
+        f.pin([0x51; 32]);
+        f.assert_refusal(None, "profile.reset_window_state_owner_required");
+        let output = f.run();
+        let message = output["error"]["message"].as_str().unwrap();
+        assert!(message.contains("owner's signature"));
+        assert!(!message.contains("mainnet enabled"));
+    }
+}
+
+#[test]
+#[serial]
+fn owner_reset_without_nonce_requires_signature() {
+    for existing in [false, true] {
+        for pinned in [false, true] {
+            let f = Fixture::for_chain(existing, false);
+            let owner = ed25519_dalek::SigningKey::from_bytes(&[0x51; 32])
+                .verifying_key()
+                .to_bytes();
+            put(
+                &f.profile.policy_owner_key_id,
+                &stellar_agent_core::profile::owner_key::encode_owner_public_key(&owner),
+            );
+            if pinned {
+                f.pin([0x51; 32]);
+            }
+            f.assert_refusal(None, "profile.reset_window_state_owner_required");
+            let output = f.run();
+            let message = output["error"]["message"].as_str().unwrap();
+            assert!(message.contains("owner's signature"));
+            assert!(!message.contains("mainnet enabled"));
+        }
+    }
+}
+
+#[test]
+#[serial]
+fn owner_reset_without_nonce_records_verified_signature() {
+    use sha2::Digest as _;
+    use stellar_agent_core::policy::v1::signature::{
+        WindowResetStatement, verify, window_reset_digest,
+    };
+    for mainnet in [false, true] {
+        for pinned in [false, true] {
+            let f = Fixture::for_chain(true, mainnet);
+            let owner = ed25519_dalek::SigningKey::from_bytes(&[0x51; 32])
+                .verifying_key()
+                .to_bytes();
+            put(
+                &f.profile.policy_owner_key_id,
+                &stellar_agent_core::profile::owner_key::encode_owner_public_key(&owner),
+            );
+            if pinned {
+                f.pin([0x51; 32]);
+            }
+            let pin_ref = stellar_agent_core::profile::schema::policy_pin_entry_ref(
+                &f.profile.policy_window_state_key_id,
+            );
+            let nonce_ref = stellar_agent_core::profile::schema::mainnet_enablement_entry_ref(
+                &f.profile.policy_window_state_key_id,
+            );
+            let raw = |entry: &KeyringEntryRef| {
+                keyring_core::Entry::new(&entry.service, &entry.account)
+                    .unwrap()
+                    .get_password()
+                    .ok()
+            };
+            let pin = raw(&pin_ref);
+            let nonce = raw(&nonce_ref);
+            let profile_path = f.home.path().join("profiles").join(format!("{NAME}.toml"));
+            let profile_bytes = std::fs::read(&profile_path).unwrap();
+            let policy_path = f.home.path().join("policies").join(format!("{NAME}.toml"));
+            std::fs::create_dir_all(policy_path.parent().unwrap()).unwrap();
+            let policy_body = format!(
+                "version = 2\nsequence = 1\nscope = \"profile:{NAME}\"\n[[rules]]\nmatch = {{tool = \"stellar_pay\", chain = \"*\"}}\ncriteria = [{{kind = \"per_tx_cap\", asset = \"native\", max_stroops = \"1\"}}]\ndecision = \"allow\"\n"
+            );
+            let canonical =
+                stellar_agent_core::policy::v1::canonical::canonical_bytes(&policy_body).unwrap();
+            let signature = stellar_agent_core::policy::v1::signature::sign(
+                &stellar_agent_core::policy::v1::signature::digest(&canonical),
+                &ed25519_dalek::SigningKey::from_bytes(&[0x51; 32]),
+            );
+            let policy = format!(
+                "{policy_body}\n[signature]\nowner_id = \"{}\"\nsig = \"{}\"\n",
+                stellar_strkey::ed25519::PublicKey(owner),
+                stellar_agent_core::hex::encode(&signature)
+            )
+            .into_bytes();
+            std::fs::write(&policy_path, &policy).unwrap();
+            let hash = Sha256::digest(f.state().0.unwrap()).into();
+            assert_eq!(f.run_owner(Some([0x51; 32]), "repair")["ok"], true);
+            let rows = verified_audit_entries_from_path(&f.profile.audit_log_path);
+            let row = rows
+                .iter()
+                .find(|row| matches!(row.event_kind, EventKind::PolicyWindowStateReset { .. }))
+                .unwrap();
+            let EventKind::PolicyWindowStateReset {
+                profile,
+                reason,
+                wiped: Some(wiped),
+                owner_authorization: Some(auth),
+            } = &row.event_kind
+            else {
+                panic!("missing signed reset");
+            };
+            let decode = |value: &str| {
+                value
+                    .as_bytes()
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
+                    .collect::<Vec<_>>()
+            };
+            let digest = window_reset_digest(&WindowResetStatement {
+                profile,
+                chain_id: row.chain_id.as_deref().unwrap(),
+                store_sha256: Some(hash),
+                generation_before: wiped.generation_before,
+                generation_after: wiped.generation_after,
+                reason,
+                request_id: &row.request_id,
+                challenge: decode(&auth.challenge).try_into().unwrap(),
+            });
+            verify(
+                &digest,
+                &decode(&auth.signature).try_into().unwrap(),
+                &owner,
+                NAME,
+            )
+            .unwrap();
+            let body: serde_json::Value =
+                serde_json::from_slice(&f.state().0.unwrap()[32..]).unwrap();
+            assert_eq!(
+                body["reset_consent"]["statement_digest"],
+                stellar_agent_core::hex::encode(&digest)
+            );
+            assert_eq!(body["reset_consent"]["request_id"], row.request_id);
+            assert_eq!(raw(&pin_ref), pin);
+            assert_eq!(raw(&nonce_ref), nonce);
+            assert_eq!(std::fs::read(profile_path).unwrap(), profile_bytes);
+            assert_eq!(std::fs::read(policy_path).unwrap(), policy);
+        }
+    }
 }
 
 #[test]
@@ -682,4 +822,65 @@ fn an_enabled_reset_by_the_pinned_owner_records_the_signature() {
         challenges[0], challenges[1],
         "each reset draws its own challenge"
     );
+}
+
+#[test]
+#[serial]
+fn owner_seed_engine_ceremony_output_excludes_secrets() {
+    let f = Fixture::for_chain(false, false);
+    let key = ed25519_dalek::SigningKey::from_bytes(&[0x51; 32]);
+    put(
+        &f.profile.policy_owner_key_id,
+        &stellar_agent_core::profile::owner_key::encode_owner_public_key(
+            &key.verifying_key().to_bytes(),
+        ),
+    );
+    let directory = f.home.path().join("policies");
+    std::fs::create_dir_all(&directory).unwrap();
+    let path = directory.join(format!("{NAME}.toml"));
+    for kind in ["noop", "v1"] {
+        let body = format!(
+            "version = 2\nsequence = 1\nengine = \"{kind}\"\nscope = \"profile:{NAME}\"\n[[rules]]\nmatch = {{tool = \"stellar_pay\", chain = \"*\"}}\ncriteria = []\ndecision = \"deny\"\n"
+        );
+        std::fs::write(&path, &body).unwrap();
+        for seed in [[0x52; 32], [0x51; 32]] {
+            let secret = stellar_strkey::ed25519::PrivateKey(seed)
+                .as_unredacted()
+                .to_string();
+            let output = Command::new(env!("CARGO_BIN_EXE_stellar-agent"))
+                .args([
+                    "profile",
+                    "sign-policy",
+                    "--profile",
+                    NAME,
+                    "--secret-env",
+                    "CEREMONY_OWNER",
+                ])
+                .env("STELLAR_AGENT_HOME", f.home.path())
+                .env("STELLAR_AGENT_KEYRING_BACKEND", "headless-env")
+                .env(
+                    "STELLAR_AGENT_HEADLESS_KEYRING_KEY",
+                    URL_SAFE_NO_PAD.encode(HEADLESS_KEY),
+                )
+                .env("CEREMONY_OWNER", secret.as_str())
+                .env_remove("STELLAR_AGENT_PROFILE")
+                .env_remove("STELLAR_AGENT_RPC_URL")
+                .output()
+                .unwrap();
+            for bytes in [&output.stdout, &output.stderr] {
+                assert!(!String::from_utf8_lossy(bytes).contains(secret.as_str()));
+                assert!(
+                    !String::from_utf8_lossy(bytes)
+                        .contains(&stellar_agent_core::hex::encode(&seed))
+                );
+            }
+            assert_eq!(
+                output.status.code(),
+                Some(if seed == [0x51; 32] { 0 } else { 1 })
+            );
+            if seed != [0x51; 32] {
+                assert_eq!(std::fs::read_to_string(&path).unwrap(), body);
+            }
+        }
+    }
 }

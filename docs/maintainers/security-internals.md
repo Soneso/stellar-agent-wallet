@@ -1300,6 +1300,15 @@ Every signature must pass, and each signature set must have at least one. Hash-x
 
 `PolicyEngineV1` (`crates/stellar-agent-core/src/policy/v1/mod.rs`) is the signature-verified typed-criteria engine, active when `profile.policy.engine = V1` (the default for newly-minted profiles). The alternative, `NoopPolicyEngine` (`policy/mod.rs`), is selected by `engine = "noop"`. It supplies one policy boundary alongside entry, signing, and submit checks. Testnet allows all tools. Mainnet read-only (`destructive_hint = false`) allows. Mainnet destructive returns `Err(PolicyError::NotImplemented)`, surfaced as `policy.engine_required`.
 
+An enrolled owner authorizes the engine selection through the signed V2
+policy's optional top-level `engine`. It accepts `v1` or `noop`; omission means
+`v1`. V1 rejects the field. Canonical bytes place it after `sequence`.
+CLI, MCP and the shared builder verify signature, scope, sequence and owner
+continuity before returning either engine. A profile mismatch refuses with
+`policy.engine_selection_unsigned` before pin advancement. Authorized Noop
+returns no runtime proofs and grants no mainnet write authority.
+Only genuine absent enrollment retains ownerless behavior; unreadable state refuses.
+
 ### First-match default-deny
 
 `PolicyEngineV1` wraps one `PolicyDocument` whose owner ed25519 signature is verified at load. `evaluate` resolves the rules whose `ScopeId` matches `(profile_name, project_id)`, then walks them in declaration order. The first rule whose `RuleMatch` (tool name + chain-id filter) matches is selected. Its criteria run in order through `Criterion::evaluate_decision`. The first denial returns `Decision::Deny`. An escalation requires approval only if no criterion denies. If every criterion passes, the rule's `decision` is returned. If no rule matches, the engine returns `Decision::Deny(DenyReason::NoMatchingRule)`, default-deny.
@@ -1437,7 +1446,7 @@ Stateful spending criteria read amounts and counts from `PolicyStateStore`. Conf
   snapshot carrying an accounting expiry record uses version 8, which older
   builds refuse. Versions 1 to 4 decode for integrity checks and refuse with
   `policy.window_chain_unverifiable`, because they carry no scope. Version 11
-  carries operation and approval records, admissible floors, chain
+  carries optional latest reset consent, operation and approval records, admissible floors, chain
   observations, and authorization links, dispositions and release rows. A file
   of an earlier version loads unchanged and moves to version 11 only with a
   commit that carries such content. Once a file is committed at version 11,
@@ -1832,11 +1841,25 @@ The policy loader (`policy/v1/loader.rs`) is fail closed at parse time. An unkno
 `profile reset-window-state` writes its `policy_window_state_reset` audit row,
 with the wiped accrual, before it mints a key, advances the generation or
 replaces the store. A reset whose row cannot be written does not happen.
-With an owner seed, the row records the pinned owner's signature over the
+A pin or enrolled owner requires consent on every network, including without
+an enablement nonce. Authority comes from the pin first, then the enrolled key
+when no pin exists. A nonce always requires a pin. Malformed or unreadable
+authority refuses; only genuine ownerless state permits unsigned reset.
+With an owner seed, the row records the selected owner's signature over the
 profile, chain, store SHA-256, generation pair, bounded reason, request id and
 the store's challenge. The store verifies that signature under its lock before
 the row is written. Owner, pin and signature refusals write no row and change no
 window state.
+The successor stores one latest `reset_consent` record: `request_id`,
+`statement_digest`, `owner_key_fingerprint` and `consumed_at_ms` from the store clock.
+Each authorized reset replaces it; pruning preserves it.
+A request id matching the latest record refuses.
+Absent consent remains omitted and preserves existing serialization.
+Reset preserves stored total-budget entries exactly and creates no epoch.
+Ordinary accrual clears, and wiped-accrual reporting excludes preserved totals.
+Operation, approval, authorization, intent and accounting barriers remain in force.
+Terminal history and unreleased reservations survive. Both floors remain until
+commit; a successful mainnet reset clears them.
 The [CLI reference](../cli-reference/profile-and-governance.md#reset-window-state-name---reason-reason)
 describes the row, the refusals and the failure windows.
 

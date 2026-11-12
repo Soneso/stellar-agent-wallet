@@ -643,6 +643,7 @@ fn parse_policy_body(
     if version == 2 {
         super::verified::sequence(doc)?;
     }
+    super::schema::signed_engine(doc)?;
     super::signature::parse_owner_rotation(doc)?;
     if let Some(table) = doc.get("mainnet").and_then(Item::as_table_like) {
         super::approval_origin::parse_fields(table)?;
