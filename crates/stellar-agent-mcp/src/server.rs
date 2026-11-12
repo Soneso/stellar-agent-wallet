@@ -1995,8 +1995,13 @@ mod tests {
         .build()
     }
 
+    /// Server construction reads the keyring and registers the platform
+    /// store when none is registered, so the test holds the keyring key and
+    /// installs a fresh mock store first.
     #[test]
+    #[serial_test::serial(keyring)]
     fn server_context_copies_mainnet_profile() {
+        stellar_agent_test_support::keyring_mock::install().unwrap();
         let profile = Profile::builder_mainnet_named(
             "context",
             "https://mainnet.example",

@@ -1824,12 +1824,14 @@ mod tests {
     /// by rule and expected form, and neither the envelope nor the refusal
     /// event carries the asset or the chain id the caller supplied.
     #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial(keyring)]
     async fn trustline_asset_marker_is_not_echoed() {
         use stellar_agent_test_support::CaptureWriter;
         use stellar_agent_test_support::rejected_value::{
             CREDENTIAL_MARKER, assert_no_marker_in_text,
         };
 
+        stellar_agent_test_support::keyring_mock::install().unwrap_or_else(|e| panic!("{e}"));
         let profile = stellar_agent_core::profile::schema::Profile::builder_testnet(
             "svc", "acct", "n-svc", "n-acct",
         )

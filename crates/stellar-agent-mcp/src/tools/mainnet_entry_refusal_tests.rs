@@ -4,9 +4,11 @@
 //! Each case runs on the Noop engine and, as a separate test, on an engine
 //! that allows every call, so the refusal is shown to precede the policy gate
 //! whatever its verdict. The profile endpoint is a mock server that must
-//! receive no request. No keyring mock is installed: the refusal precedes
-//! every key access. The envelopes are well formed, so a call that passed the
-//! refusal would reach the policy gate and beyond.
+//! receive no request. The tool refusal precedes every key access. Server
+//! construction reads the keyring and registers the platform store when none
+//! is registered, so each test installs a fresh, empty mock store and holds
+//! the `keyring` serial key. The envelopes are well formed, so a call that
+//! passed the refusal would reach the policy gate and beyond.
 
 #![allow(
     clippy::unwrap_used,
@@ -33,8 +35,9 @@ const SOURCE_G: &str = "GBZXN7PIRZGNMHGA7MUUUF4GWPY5AYPV6LY4UV2GL6VJGIQRXFDNMADI
 const DEST_G: &str = "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN";
 
 /// A mainnet server on the Noop engine whose endpoint is `rpc`, or on an
-/// allow-all engine when `allow_all` holds.
+/// allow-all engine when `allow_all` holds, over a fresh mock keyring store.
 fn mainnet_server(rpc: &str, allow_all: bool) -> WalletServer {
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let profile = Profile::builder_mainnet_named("refusal", rpc, "s", "default", "n", "a")
         .with_noop_engine()
         .build();
@@ -118,11 +121,13 @@ async fn pay_commit_case(allow_all: bool) {
 }
 
 #[tokio::test]
+#[serial_test::serial(keyring)]
 async fn pay_commit_refuses_mainnet_at_entry_on_noop_engine() {
     pay_commit_case(false).await;
 }
 
 #[tokio::test]
+#[serial_test::serial(keyring)]
 async fn pay_commit_refuses_mainnet_at_entry_under_allow_all_engine() {
     pay_commit_case(true).await;
 }
@@ -149,11 +154,13 @@ async fn create_account_commit_case(allow_all: bool) {
 }
 
 #[tokio::test]
+#[serial_test::serial(keyring)]
 async fn create_account_commit_refuses_mainnet_at_entry_on_noop_engine() {
     create_account_commit_case(false).await;
 }
 
 #[tokio::test]
+#[serial_test::serial(keyring)]
 async fn create_account_commit_refuses_mainnet_at_entry_under_allow_all_engine() {
     create_account_commit_case(true).await;
 }
@@ -181,11 +188,13 @@ async fn trustline_commit_case(allow_all: bool) {
 }
 
 #[tokio::test]
+#[serial_test::serial(keyring)]
 async fn trustline_commit_refuses_mainnet_at_entry_on_noop_engine() {
     trustline_commit_case(false).await;
 }
 
 #[tokio::test]
+#[serial_test::serial(keyring)]
 async fn trustline_commit_refuses_mainnet_at_entry_under_allow_all_engine() {
     trustline_commit_case(true).await;
 }
@@ -211,11 +220,13 @@ async fn claim_commit_case(allow_all: bool) {
 }
 
 #[tokio::test]
+#[serial_test::serial(keyring)]
 async fn claim_commit_refuses_mainnet_at_entry_on_noop_engine() {
     claim_commit_case(false).await;
 }
 
 #[tokio::test]
+#[serial_test::serial(keyring)]
 async fn claim_commit_refuses_mainnet_at_entry_under_allow_all_engine() {
     claim_commit_case(true).await;
 }
@@ -237,8 +248,10 @@ async fn rule_create_commit_case(allow_all: bool) {
 /// the entry refusal keys on the caller's `chain_id` and passes here, so this
 /// case pins the refusal that keys on the context.
 #[tokio::test]
+#[serial_test::serial(keyring)]
 async fn rule_create_commit_refuses_a_mainnet_context_over_a_testnet_argument() {
     let rpc = wiremock::MockServer::start().await;
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let profile = Profile::builder_testnet_named("refusal", "s", "default", "n", "a")
         .rpc_url(rpc.uri())
         .with_noop_engine()
@@ -258,11 +271,13 @@ async fn rule_create_commit_refuses_a_mainnet_context_over_a_testnet_argument() 
 }
 
 #[tokio::test]
+#[serial_test::serial(keyring)]
 async fn rule_create_commit_refuses_mainnet_at_entry_on_noop_engine() {
     rule_create_commit_case(false).await;
 }
 
 #[tokio::test]
+#[serial_test::serial(keyring)]
 async fn rule_create_commit_refuses_mainnet_at_entry_under_allow_all_engine() {
     rule_create_commit_case(true).await;
 }
@@ -282,11 +297,13 @@ async fn sep43_sign_and_submit_case(allow_all: bool) {
 }
 
 #[tokio::test]
+#[serial_test::serial(keyring)]
 async fn sep43_sign_and_submit_refuses_mainnet_at_entry_on_noop_engine() {
     sep43_sign_and_submit_case(false).await;
 }
 
 #[tokio::test]
+#[serial_test::serial(keyring)]
 async fn sep43_sign_and_submit_refuses_mainnet_at_entry_under_allow_all_engine() {
     sep43_sign_and_submit_case(true).await;
 }

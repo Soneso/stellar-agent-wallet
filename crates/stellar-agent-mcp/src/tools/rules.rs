@@ -797,7 +797,12 @@ mod tests {
 
     /// A testnet server whose context carries `secondary` as its secondary
     /// endpoint.
+    ///
+    /// Construction reads the keyring and registers the platform store when
+    /// none is registered, so the helper installs a fresh mock store and
+    /// every caller holds the `keyring` serial key.
     fn server_with_secondary(secondary: Option<&str>) -> WalletServer {
+        stellar_agent_test_support::keyring_mock::install().unwrap();
         let profile = stellar_agent_core::profile::Profile::builder_testnet_named(
             "manager-config",
             "s",
@@ -838,6 +843,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(keyring)]
     fn manager_configs_carry_a_distinct_context_secondary() {
         let server = server_with_secondary(Some(SECONDARY));
         let (signers, rules) = manager_configs(&server);
@@ -848,6 +854,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(keyring)]
     fn manager_configs_without_a_secondary_fall_back_to_the_primary() {
         let server = server_with_secondary(None);
         let (signers, rules) = manager_configs(&server);

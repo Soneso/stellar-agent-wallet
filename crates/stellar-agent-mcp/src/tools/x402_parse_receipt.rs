@@ -346,7 +346,9 @@ mod tests {
     /// escaped, and the long reason cut at the bound. A 64-hex transaction
     /// hash passes unchanged.
     #[tokio::test]
+    #[serial_test::serial(keyring)]
     async fn receipt_fields_are_escaped_and_bounded() {
+        stellar_agent_test_support::keyring_mock::install().unwrap();
         let profile = stellar_agent_core::profile::schema::Profile::builder_testnet(
             "stellar-agent-signer-receipt",
             "default",

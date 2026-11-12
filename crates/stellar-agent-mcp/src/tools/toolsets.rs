@@ -1397,7 +1397,9 @@ mod tests {
     /// untagged format, both refuse with `toolset.pin_unverifiable` before
     /// any routing.
     #[tokio::test]
+    #[serial_test::serial(keyring)]
     async fn toolset_invoke_refuses_an_unverifiable_pin() {
+        stellar_agent_test_support::keyring_mock::install().unwrap();
         let toolsets = tempfile::TempDir::new().unwrap();
         stellar_agent_toolsets_install::write_toolset_for_test(
             toolsets.path(),
@@ -1452,7 +1454,9 @@ mod tests {
     /// resolver reads any record: the toolset here is not installed, and the
     /// refusal is the policy code, not `toolset.not_installed`.
     #[tokio::test]
+    #[serial_test::serial(keyring)]
     async fn toolset_invoke_is_refused_on_mainnet_under_the_default_engine() {
+        stellar_agent_test_support::keyring_mock::install().unwrap();
         let toolsets = tempfile::TempDir::new().unwrap();
         let profile = Profile::builder_mainnet(
             "https://rpc.example.invalid",
@@ -1479,7 +1483,9 @@ mod tests {
     /// are refused by the tool and the error class, and the refusal repeats
     /// none of the argument values the deserialiser quotes.
     #[tokio::test]
+    #[serial_test::serial(keyring)]
     async fn toolset_args_marker_is_not_echoed() {
+        stellar_agent_test_support::keyring_mock::install().unwrap();
         let capture = stellar_agent_test_support::log_capture::CaptureWriter::new();
         let subscriber = tracing_subscriber::fmt()
             .without_time()
@@ -1603,7 +1609,9 @@ mod tests {
         }
     }
     #[tokio::test]
+    #[serial_test::serial(keyring)]
     async fn toolset_name_and_action_marker_is_not_echoed() {
+        stellar_agent_test_support::keyring_mock::install().unwrap();
         let capture = stellar_agent_test_support::log_capture::CaptureWriter::new();
         let subscriber = tracing_subscriber::fmt()
             .without_time()

@@ -810,7 +810,12 @@ mod secondary_rule_tests {
 
     /// A server on a mainnet or testnet profile whose context is forced to
     /// mainnet, with the file secondary `https://file-secondary.example`.
+    ///
+    /// Construction reads the keyring and registers the platform store when
+    /// none is registered, so the helper installs a fresh mock store and
+    /// every caller holds the `keyring` serial key.
     fn server(mainnet: bool, rpc: &str) -> WalletServer {
+        stellar_agent_test_support::keyring_mock::install().unwrap();
         let profile = if mainnet {
             Profile::builder_mainnet_named("secondary", rpc, "s", "default", "n", "a")
         } else {
@@ -825,6 +830,7 @@ mod secondary_rule_tests {
     }
 
     #[test]
+    #[serial_test::serial(keyring)]
     fn secondary_override_reads_context_and_preserves_defaults() {
         let mut server = server(false, "https://primary.example");
         let err = server
@@ -865,8 +871,10 @@ mod secondary_rule_tests {
         server
     }
 
-    /// A testnet server whose context comes from its profile.
+    /// A testnet server whose context comes from its profile, over a fresh
+    /// mock keyring store, as [`server`] installs it.
     fn testnet_server(rpc: &str) -> WalletServer {
+        stellar_agent_test_support::keyring_mock::install().unwrap();
         let profile = Profile::builder_testnet_named("secondary", "s", "default", "n", "a")
             .rpc_url(rpc)
             .with_noop_engine()
@@ -885,6 +893,7 @@ mod secondary_rule_tests {
     /// code: the refusal keys on the context, not on the profile or the
     /// argument.
     #[tokio::test]
+    #[serial_test::serial(keyring)]
     async fn dex_trade_refuses_mainnet_at_entry_divergent_context() {
         let rpc = wiremock::MockServer::start().await;
         let server = mock_server(false, &rpc.uri());
@@ -898,6 +907,7 @@ mod secondary_rule_tests {
     /// A mainnet profile on the Noop engine refuses with the canonical code
     /// ahead of the secondary-endpoint refusal and the router lookup.
     #[tokio::test]
+    #[serial_test::serial(keyring)]
     async fn dex_trade_refuses_mainnet_at_entry_mainnet_profile() {
         let rpc = wiremock::MockServer::start().await;
         let server = mock_server(true, &rpc.uri());
@@ -911,6 +921,7 @@ mod secondary_rule_tests {
     /// The refusal precedes the policy gate: an engine that allows every call
     /// changes nothing.
     #[tokio::test]
+    #[serial_test::serial(keyring)]
     async fn dex_trade_refuses_mainnet_under_allow_all_engine() {
         let rpc = wiremock::MockServer::start().await;
         let mut server = mock_server(true, &rpc.uri());
@@ -925,6 +936,7 @@ mod secondary_rule_tests {
     /// On testnet the handler still resolves the caller's secondary endpoint:
     /// a credentialed URL is refused before any lookup or RPC.
     #[tokio::test]
+    #[serial_test::serial(keyring)]
     async fn dex_trade_refuses_credentialed_secondary_on_testnet() {
         let rpc = wiremock::MockServer::start().await;
         let server = testnet_server(&rpc.uri());
@@ -945,6 +957,7 @@ mod secondary_rule_tests {
     /// and the expected form, and none of the three refusals repeats the
     /// argument.
     #[tokio::test]
+    #[serial_test::serial(keyring)]
     async fn dex_trade_marker_is_not_echoed() {
         use stellar_agent_test_support::rejected_value::{
             CREDENTIAL_MARKER, assert_no_marker_in_text,
@@ -999,6 +1012,7 @@ mod secondary_rule_tests {
     /// The quote tool refuses a `chain_id` without a pinned router by the
     /// accepted values, without the argument.
     #[tokio::test]
+    #[serial_test::serial(keyring)]
     async fn dex_quote_chain_marker_is_not_echoed() {
         use stellar_agent_test_support::rejected_value::{
             CREDENTIAL_MARKER, assert_no_marker_in_text,

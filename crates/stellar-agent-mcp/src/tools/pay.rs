@@ -2458,12 +2458,14 @@ mod tests {
     /// class, and neither the result nor the debug event of the refusal names
     /// the symbol the base64 decoder stopped at.
     #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial(keyring)]
     async fn pay_commit_envelope_marker_is_not_echoed() {
         use stellar_agent_test_support::CaptureWriter;
         use stellar_agent_test_support::rejected_value::{
             CREDENTIAL_MARKER, assert_no_marker_in_text,
         };
 
+        stellar_agent_test_support::keyring_mock::install().unwrap_or_else(|e| panic!("{e}"));
         let profile = stellar_agent_core::profile::schema::Profile::builder_testnet(
             "svc", "acct", "n-svc", "n-acct",
         )

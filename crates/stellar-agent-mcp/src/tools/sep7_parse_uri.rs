@@ -278,7 +278,12 @@ mod tests {
     use super::*;
     use stellar_agent_core::profile::schema::Profile;
 
+    /// A Noop-engine testnet server over a fresh mock keyring store.
+    ///
+    /// Construction reads the keyring and registers the platform store when
+    /// none is registered, so every caller holds the `keyring` serial key.
     fn make_server() -> crate::server::WalletServer {
+        stellar_agent_test_support::keyring_mock::install().unwrap();
         crate::server::WalletServer::new(
             Profile::builder_testnet("svc", "acct", "n-svc", "n-acct")
                 .with_noop_engine()
@@ -290,6 +295,7 @@ mod tests {
     /// A well-formed `pay` URI with no `origin_domain` parses successfully
     /// under the documented `{ ok: true, data: {...}, request_id }` envelope.
     #[tokio::test]
+    #[serial_test::serial(keyring)]
     async fn valid_pay_uri_parses_under_normalised_envelope() {
         let server = make_server();
         let args = Sep7ParseUriArgs {
@@ -326,6 +332,7 @@ mod tests {
     /// A malformed `web+stellar:` URI is a business refusal
     /// (`sep7.malformed_uri`), not a JSON-RPC protocol error.
     #[tokio::test]
+    #[serial_test::serial(keyring)]
     async fn malformed_uri_is_business_error() {
         let server = make_server();
         let args = Sep7ParseUriArgs {
@@ -342,6 +349,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(keyring)]
     async fn appended_parameter_after_signature_is_business_error() {
         let server = make_server();
         let args = Sep7ParseUriArgs {
@@ -369,6 +377,7 @@ mod tests {
     /// An unsupported operation in the URI path is `sep7.unknown_operation`,
     /// not a JSON-RPC protocol error.
     #[tokio::test]
+    #[serial_test::serial(keyring)]
     async fn unknown_operation_is_business_error() {
         let server = make_server();
         let args = Sep7ParseUriArgs {
@@ -388,6 +397,7 @@ mod tests {
     /// unknown memo_type names the rule and the accepted values, and the
     /// result repeats no text of the URI.
     #[tokio::test]
+    #[serial_test::serial(keyring)]
     async fn sep7_parse_uri_marker_is_not_echoed() {
         let capture = stellar_agent_test_support::log_capture::CaptureWriter::new();
         let subscriber = tracing_subscriber::fmt()
