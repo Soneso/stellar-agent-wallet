@@ -24,6 +24,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `profile policy-check` validates stdin policy bodies, and `profile apply-fragment`
   validates provisioning edits. Operator-open approval includes a guard against
   signed origins. The dedicated-user page documents deployment and validation.
+- On Windows, `stellar-agent-mcp` drains its cached audit outboxes on
+  Ctrl-Break and on console close, as it does on Ctrl-C. A listener that
+  cannot be registered logs a warning and leaves the others active.
+- A second shutdown signal or console event during the shutdown wait or the
+  exit drain ends `stellar-agent-mcp` at once with exit code 3. Undelivered
+  rows stay queued, and the next draining writer appends them in order.
+- The MCP exit drain waits at most two seconds for each cached audit writer's
+  mutex. A writer still held then is logged with its profile and keeps its
+  queued rows and commitment. The bound covers the mutex wait only.
 
 - Version 2 policies accept optional signed `[mainnet]` fields `approval_origin`, a canonical HTTPS DNS origin, and `approval_cert_spki_sha256`, the lowercase hex SHA-256 of a leaf certificate's SPKI DER. The mainnet minimum requires both or neither. Under a policy that signs them, mainnet presence binds the origin's host as the relying-party ID, the origin, and the pin. The local inbox and the localhost passkey page then refuse with `approval.origin_signed_remote`, and no listener in this release serves the signed origin.
 - A business id names one mainnet value operation, and a retry with it returns the stored state of that operation instead of doing new work.

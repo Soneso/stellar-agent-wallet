@@ -20,6 +20,10 @@
 //! same `serial_test` key as every other test in its binary that touches the
 //! store or the process environment (`STELLAR_AGENT_HOME`).
 //!
+//! A test that supplies a store of its own, such as a file-backed one, installs
+//! it through [`DefaultStoreGuard`], which restores the previous default store
+//! when it drops.
+//!
 //! # Per-test call vs process-wide setup
 //!
 //! A per-test call (rather than a `#[ctor]` hook or `Once`-guarded global) is
@@ -85,6 +89,50 @@ pub fn install() -> Result<(), keyring_core::Error> {
     let store: Arc<keyring_core::CredentialStore> = keyring_core::mock::Store::new()?;
     keyring_core::set_default_store(store);
     Ok(())
+}
+
+/// Makes a supplied store the process-global default for the guard's
+/// lifetime.
+///
+/// [`DefaultStoreGuard::install`] saves the current default store, or its
+/// absence, and installs the supplied one. Dropping the guard restores the
+/// saved store, or clears the default when none was set, including during an
+/// unwind. Guards nest: each restores the store that was the default when it
+/// was created, so they drop in reverse creation order.
+///
+/// The guard changes process-global state, as [`install`] does. A test that
+/// holds it holds the same `serial_test` key as every other test in its
+/// binary that touches the store.
+#[must_use = "dropping the guard restores the previous default store at once"]
+pub struct DefaultStoreGuard {
+    previous: Option<Arc<keyring_core::CredentialStore>>,
+}
+
+impl DefaultStoreGuard {
+    /// Installs `store` as the process-global default and returns the guard
+    /// that restores the previous default.
+    pub fn install(store: Arc<keyring_core::CredentialStore>) -> Self {
+        let previous = keyring_core::unset_default_store();
+        keyring_core::set_default_store(store);
+        Self { previous }
+    }
+}
+
+impl std::fmt::Debug for DefaultStoreGuard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DefaultStoreGuard")
+            .field("restores_a_store", &self.previous.is_some())
+            .finish()
+    }
+}
+
+impl Drop for DefaultStoreGuard {
+    fn drop(&mut self) {
+        keyring_core::unset_default_store();
+        if let Some(previous) = self.previous.take() {
+            keyring_core::set_default_store(previous);
+        }
+    }
 }
 
 /// A callback the hooked mock store runs before a secret read at one keyring
@@ -539,5 +587,90 @@ mod tests {
         assert_eq!(reads.load(Ordering::SeqCst), 1, "the hook runs first");
         assert_eq!(entry.get_password().expect("single-shot"), "value");
         assert_eq!(reads.load(Ordering::SeqCst), 2);
+    }
+
+    /// A fresh mock store as the store type the default holds.
+    fn mock_store() -> std::sync::Arc<keyring_core::CredentialStore> {
+        keyring_core::mock::Store::new().expect("mock store")
+    }
+
+    /// Whether the current default store is `store` itself.
+    fn default_is(store: &std::sync::Arc<keyring_core::CredentialStore>) -> bool {
+        keyring_core::get_default_store()
+            .is_some_and(|current| std::sync::Arc::ptr_eq(&current, store))
+    }
+
+    /// The guard restores the store that was the default before it, with the
+    /// credentials that store holds, and the supplied store is the default
+    /// only while the guard lives.
+    #[test]
+    #[serial]
+    fn default_store_guard_restores_the_previous_store() {
+        let original = mock_store();
+        keyring_core::set_default_store(std::sync::Arc::clone(&original));
+        keyring_core::Entry::new("guard-svc", "guard-user")
+            .expect("entry")
+            .set_password("kept")
+            .expect("set");
+
+        let supplied = mock_store();
+        let guard = super::DefaultStoreGuard::install(std::sync::Arc::clone(&supplied));
+        assert!(default_is(&supplied), "the supplied store is the default");
+        assert!(
+            keyring_core::Entry::new("guard-svc", "guard-user")
+                .expect("entry")
+                .get_password()
+                .is_err(),
+            "the supplied store does not hold the original credential"
+        );
+        drop(guard);
+
+        assert!(default_is(&original), "the original store is restored");
+        assert_eq!(
+            keyring_core::Entry::new("guard-svc", "guard-user")
+                .expect("entry")
+                .get_password()
+                .expect("the restored store keeps its credential"),
+            "kept"
+        );
+        keyring_core::unset_default_store();
+    }
+
+    /// With no default store set, the guard clears the default again on drop.
+    /// Nested guards restore in reverse order, and an unwind through a guard
+    /// restores as a normal drop does.
+    #[test]
+    #[serial]
+    fn default_store_guard_restores_absence_and_unwinds() {
+        keyring_core::unset_default_store();
+        let outer_store = mock_store();
+        let inner_store = mock_store();
+        {
+            let _outer = super::DefaultStoreGuard::install(std::sync::Arc::clone(&outer_store));
+            {
+                let _inner = super::DefaultStoreGuard::install(std::sync::Arc::clone(&inner_store));
+                assert!(default_is(&inner_store), "the inner store is the default");
+            }
+            assert!(
+                default_is(&outer_store),
+                "dropping the inner guard restores the outer store"
+            );
+        }
+        assert!(
+            keyring_core::get_default_store().is_none(),
+            "dropping the outer guard restores the absence of a default store"
+        );
+
+        let unwinding_store = mock_store();
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = super::DefaultStoreGuard::install(std::sync::Arc::clone(&unwinding_store));
+            assert!(default_is(&unwinding_store));
+            std::panic::resume_unwind(Box::new("unwinding through the guard"));
+        }));
+        assert!(unwound.is_err(), "the closure unwinds");
+        assert!(
+            keyring_core::get_default_store().is_none(),
+            "an unwind through the guard restores the absence of a default store"
+        );
     }
 }

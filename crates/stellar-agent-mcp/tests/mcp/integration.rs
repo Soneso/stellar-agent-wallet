@@ -1,8 +1,10 @@
 //! Integration tests for the MCP stdio server.
 //!
-//! These tests spawn `stellar-agent-mcp` as a subprocess with piped stdin/stdout
-//! and exercise the MCP JSON-RPC protocol.  Each test sends a message and
-//! validates the response without requiring a live Stellar network connection.
+//! These tests spawn `stellar-agent-mcp` as a subprocess under the shared
+//! child-process driver and exercise the MCP JSON-RPC protocol. Each test
+//! sends a message and validates the response with its id, within the
+//! driver's response deadline, without requiring a live Stellar network
+//! connection.
 //!
 //! # Test isolation
 //!
@@ -36,10 +38,11 @@
     reason = "test-only; panics acceptable in integration tests"
 )]
 
-use std::io::{BufRead, BufReader, Write};
-use std::process::{Command, Stdio};
+use std::process::Command;
 
 use serial_test::serial;
+
+use crate::common::child_process::ChildDriver;
 
 /// Returns the path to the `stellar-agent-mcp` binary built by Cargo.
 ///
@@ -51,67 +54,16 @@ fn mcp_binary() -> std::path::PathBuf {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Helper: simpler process management using explicit read-write channels
+// Helper: the binary under the shared child-process driver
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Simplified integration driver: spawns the binary, sends JSON lines,
-/// collects responses.  Terminates after `timeout_ms` or when `n_responses`
-/// responses have been received.
-struct McpDriver {
-    child: std::process::Child,
-    writer: std::io::BufWriter<std::process::ChildStdin>,
-    reader: BufReader<std::process::ChildStdout>,
-}
-
-impl McpDriver {
-    fn spawn() -> Self {
-        let binary = mcp_binary();
-        let mut child = Command::new(&binary)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .env("STELLAR_AGENT_LOG", "off")
-            .spawn()
-            .expect("stellar-agent-mcp binary must spawn");
-        let writer =
-            std::io::BufWriter::new(child.stdin.take().expect("child stdin must be piped"));
-        let reader = BufReader::new(child.stdout.take().expect("child stdout must be piped"));
-        Self {
-            child,
-            writer,
-            reader,
-        }
-    }
-
-    fn send(&mut self, msg: &serde_json::Value) {
-        let line = serde_json::to_string(msg).expect("json serialisation");
-        writeln!(self.writer, "{}", line).expect("write to child stdin must succeed");
-        self.writer
-            .flush()
-            .expect("flush to child stdin must succeed");
-    }
-
-    /// Reads the next JSON-RPC response line.
-    ///
-    /// Panics if the server does not respond with a valid JSON-RPC message.
-    fn recv(&mut self) -> serde_json::Value {
-        let mut line = String::new();
-        self.reader
-            .read_line(&mut line)
-            .expect("server must write a response line");
-        assert!(
-            !line.trim().is_empty(),
-            "server must respond with a non-empty JSON-RPC message"
-        );
-        serde_json::from_str(line.trim())
-            .expect("server must respond with a valid JSON-RPC message")
-    }
-}
-
-impl Drop for McpDriver {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-    }
+/// Spawns the binary with logging off under the shared driver. The driver
+/// sends JSON lines, waits a bounded time for each response by id, and kills
+/// the child on drop.
+fn spawn_server() -> ChildDriver {
+    let mut command = Command::new(mcp_binary());
+    command.env("STELLAR_AGENT_LOG", "off");
+    ChildDriver::spawn(command)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -122,7 +74,7 @@ impl Drop for McpDriver {
 #[test]
 #[serial]
 fn initialize_returns_capabilities() {
-    let mut driver = McpDriver::spawn();
+    let mut driver = spawn_server();
 
     driver.send(&serde_json::json!({
         "jsonrpc": "2.0",
@@ -135,7 +87,7 @@ fn initialize_returns_capabilities() {
         }
     }));
 
-    let response = driver.recv();
+    let response = driver.response(1);
 
     // Response must have the expected fields.
     assert_eq!(response["jsonrpc"], "2.0", "unexpected jsonrpc version");
@@ -151,7 +103,7 @@ fn initialize_returns_capabilities() {
 #[test]
 #[serial]
 fn notifications_initialized_processed() {
-    let mut driver = McpDriver::spawn();
+    let mut driver = spawn_server();
 
     // First: do the handshake.
     driver.send(&serde_json::json!({
@@ -164,7 +116,7 @@ fn notifications_initialized_processed() {
             "clientInfo": { "name": "test-client", "version": "0.1.0" }
         }
     }));
-    let _init_response = driver.recv();
+    let _init_response = driver.response(1);
 
     // Notifications have no id and expect no response.
     driver.send(&serde_json::json!({
@@ -180,7 +132,7 @@ fn notifications_initialized_processed() {
         "params": {}
     }));
 
-    let list_response = driver.recv();
+    let list_response = driver.response(2);
     assert_eq!(list_response["id"], 2, "unexpected tools/list response id");
 }
 
@@ -188,7 +140,7 @@ fn notifications_initialized_processed() {
 #[test]
 #[serial]
 fn tools_list_includes_stellar_balances() {
-    let mut driver = McpDriver::spawn();
+    let mut driver = spawn_server();
 
     driver.send(&serde_json::json!({
         "jsonrpc": "2.0",
@@ -200,7 +152,7 @@ fn tools_list_includes_stellar_balances() {
             "clientInfo": { "name": "test-client", "version": "0.1.0" }
         }
     }));
-    let _init_response = driver.recv();
+    let _init_response = driver.response(1);
 
     driver.send(&serde_json::json!({
         "jsonrpc": "2.0",
@@ -209,7 +161,7 @@ fn tools_list_includes_stellar_balances() {
         "params": {}
     }));
 
-    let list_response = driver.recv();
+    let list_response = driver.response(2);
 
     let tools = &list_response["result"]["tools"];
     assert!(
@@ -241,7 +193,7 @@ fn tools_list_includes_stellar_balances() {
 #[test]
 #[serial]
 fn tools_call_stellar_balances_unknown_account_returns_tool_error() {
-    let mut driver = McpDriver::spawn();
+    let mut driver = spawn_server();
 
     driver.send(&serde_json::json!({
         "jsonrpc": "2.0",
@@ -253,7 +205,7 @@ fn tools_call_stellar_balances_unknown_account_returns_tool_error() {
             "clientInfo": { "name": "test-client", "version": "0.1.0" }
         }
     }));
-    let _init_response = driver.recv();
+    let _init_response = driver.response(1);
 
     // A valid G-strkey that is unlikely to exist on testnet.
     // The server must route the call to the network layer and respond with a
@@ -271,7 +223,7 @@ fn tools_call_stellar_balances_unknown_account_returns_tool_error() {
         }
     }));
 
-    let response = driver.recv();
+    let response = driver.response(3);
     // The server must return a response (either a tool error or a network error).
     // The response id must match the request.
     assert_eq!(
@@ -284,7 +236,7 @@ fn tools_call_stellar_balances_unknown_account_returns_tool_error() {
 #[test]
 #[serial]
 fn tools_call_stellar_balances_invalid_strkey_returns_invalid_params() {
-    let mut driver = McpDriver::spawn();
+    let mut driver = spawn_server();
 
     driver.send(&serde_json::json!({
         "jsonrpc": "2.0",
@@ -296,7 +248,7 @@ fn tools_call_stellar_balances_invalid_strkey_returns_invalid_params() {
             "clientInfo": { "name": "test-client", "version": "0.1.0" }
         }
     }));
-    let _init_response = driver.recv();
+    let _init_response = driver.response(1);
 
     driver.send(&serde_json::json!({
         "jsonrpc": "2.0",
@@ -311,7 +263,7 @@ fn tools_call_stellar_balances_invalid_strkey_returns_invalid_params() {
         }
     }));
 
-    let response = driver.recv();
+    let response = driver.response(3);
 
     // Invalid params should return an error at the JSON-RPC or tool level.
     let has_error =
@@ -326,7 +278,7 @@ fn tools_call_stellar_balances_invalid_strkey_returns_invalid_params() {
 #[test]
 #[serial]
 fn tools_call_unknown_tool_returns_error() {
-    let mut driver = McpDriver::spawn();
+    let mut driver = spawn_server();
 
     driver.send(&serde_json::json!({
         "jsonrpc": "2.0",
@@ -338,7 +290,7 @@ fn tools_call_unknown_tool_returns_error() {
             "clientInfo": { "name": "test-client", "version": "0.1.0" }
         }
     }));
-    let _init_response = driver.recv();
+    let _init_response = driver.response(1);
 
     driver.send(&serde_json::json!({
         "jsonrpc": "2.0",
@@ -350,7 +302,7 @@ fn tools_call_unknown_tool_returns_error() {
         }
     }));
 
-    let response = driver.recv();
+    let response = driver.response(4);
 
     // The response must have either an error field (protocol error) or
     // is_error=true in the result (tool-level error).

@@ -7369,8 +7369,9 @@ impl AuditWriterRegistry {
     /// Drains the audit outbox of every keyed writer this process caches, and
     /// returns the number of writers whose shutdown check passed.
     ///
-    /// The MCP server calls this when it exits: on client EOF, on SIGINT, and on
-    /// SIGTERM on Unix. An operator row queued by `profile halt`, `profile resume`,
+    /// The MCP server calls this when it exits: on client EOF, on SIGINT, on
+    /// SIGTERM on Unix, and on Ctrl-Break and console close on Windows. An
+    /// operator row queued by `profile halt`, `profile resume`,
     /// or `approve --id` while the server held the writer then reaches the log
     /// before the process ends. Until a draining writer runs, `audit verify`
     /// reports such a row as `outbox_pending`, and a halted profile may see no
@@ -7385,7 +7386,11 @@ impl AuditWriterRegistry {
     ///
     /// Each writer runs [`AuditWriter::verify_tip_anchor`] under its own guard,
     /// the check [`AuditWriterRegistry::get_or_open_keyed`] applies on a cache
-    /// hit. A refusal of the drain itself (`audit.outbox_busy`,
+    /// hit. The drain waits at most [`EXIT_DRAIN_LOCK_WAIT`] for each writer's
+    /// mutex. The bound covers the mutex wait only, not the filesystem or
+    /// keyring work of the check. A writer whose mutex stays held is logged
+    /// with its profile and keeps its queued rows and commitment unchanged.
+    /// Other entry points keep the blocking acquisition. A refusal of the drain itself (`audit.outbox_busy`,
     /// `audit.outbox_unusable`, `audit.outbox_rows_missing`, a tip-anchor
     /// mismatch) leaves the outbox unchanged. A failure after the drain, such as a
     /// retained history that does not verify, is reported the same way although
@@ -7608,8 +7613,24 @@ impl AuditWriterRegistry {
     }
 }
 
+/// How long the exit drain waits for each cached writer's mutex.
+///
+/// The bound equals [`super::outbox::OUTBOX_LOCK_WAIT`]. It covers only the
+/// wait for the mutex. The anchor check, the drain, and their filesystem and
+/// keyring work run unbounded once the mutex is held.
+pub const EXIT_DRAIN_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// The pause between two attempts on a held writer mutex during the exit
+/// drain.
+const EXIT_DRAIN_LOCK_STEP: std::time::Duration = std::time::Duration::from_millis(10);
+
 /// Drains keyed, non-evicted writers in `registry`, releasing the registry
 /// lock before taking any writer lock.
+///
+/// Each writer's mutex is awaited for at most [`EXIT_DRAIN_LOCK_WAIT`]. A
+/// writer whose mutex stays held is logged at `warn` with its profile and
+/// skipped. Its queued rows and commitment stay as they are for the next
+/// draining writer. The remaining writers are still checked.
 fn drain_cached_outboxes_in(registry: &Mutex<HashMap<String, RegistryEntry>>) -> usize {
     let cached: Vec<(String, Arc<Mutex<AuditWriter>>)> = {
         let Ok(map) = registry.lock() else {
@@ -7625,7 +7646,20 @@ fn drain_cached_outboxes_in(registry: &Mutex<HashMap<String, RegistryEntry>>) ->
     };
     let mut drained = 0;
     for (profile_name, handle) in cached {
-        match lock_for_verification(&handle).and_then(|mut writer| writer.verify_tip_anchor()) {
+        let checked = match lock_for_exit_drain(&handle, EXIT_DRAIN_LOCK_WAIT) {
+            Ok(Some(mut writer)) => writer.verify_tip_anchor(),
+            Ok(None) => {
+                tracing::warn!(
+                    profile = %profile_name,
+                    wait_ms = EXIT_DRAIN_LOCK_WAIT.as_millis(),
+                    "the cached audit writer stayed locked for the exit drain's wait; \
+                     its queued rows stay queued for the next draining writer"
+                );
+                continue;
+            }
+            Err(e) => Err(e),
+        };
+        match checked {
             Ok(()) => {
                 drained += 1;
                 tracing::debug!(
@@ -7677,11 +7711,39 @@ fn reconcile_cached_tip_anchor(
 fn lock_for_verification(
     handle: &Arc<Mutex<AuditWriter>>,
 ) -> Result<std::sync::MutexGuard<'_, AuditWriter>, WriterError> {
-    handle.lock().map_err(|_| {
-        WriterError::Io(io::Error::other(
-            "audit writer mutex poisoned; cannot reconcile the tip anchor",
-        ))
-    })
+    handle.lock().map_err(|_| poisoned_writer_error())
+}
+
+/// Takes `handle`'s mutex for the exit drain, waiting at most `wait` while
+/// another holder keeps it.
+///
+/// Returns `Ok(None)` when the mutex stays held for the whole wait. A poisoned
+/// mutex yields the error [`lock_for_verification`] returns.
+fn lock_for_exit_drain(
+    handle: &Arc<Mutex<AuditWriter>>,
+    wait: std::time::Duration,
+) -> Result<Option<std::sync::MutexGuard<'_, AuditWriter>>, WriterError> {
+    let deadline = std::time::Instant::now() + wait;
+    loop {
+        match handle.try_lock() {
+            Ok(guard) => return Ok(Some(guard)),
+            Err(std::sync::TryLockError::Poisoned(_)) => return Err(poisoned_writer_error()),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                if std::time::Instant::now() >= deadline {
+                    return Ok(None);
+                }
+                std::thread::sleep(EXIT_DRAIN_LOCK_STEP);
+            }
+        }
+    }
+}
+
+/// The error a poisoned writer mutex yields: a writer whose state cannot be
+/// read has a log that cannot be proved current.
+fn poisoned_writer_error() -> WriterError {
+    WriterError::Io(io::Error::other(
+        "audit writer mutex poisoned; cannot reconcile the tip anchor",
+    ))
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -8192,6 +8254,262 @@ mod tests {
         );
 
         drop(registry);
+        drop(handle);
+        AuditWriterRegistry::remove_for_test(name);
+    }
+
+    /// A registry entry for a keyed, cached writer, as the exit drain selects.
+    fn keyed_registry_entry(path: &Path, handle: &Arc<Mutex<AuditWriter>>) -> RegistryEntry {
+        RegistryEntry {
+            log_path: path.to_path_buf(),
+            hmac_key_fingerprint: Some([0x11; 32]),
+            handle: Arc::clone(handle),
+            evicted: None,
+        }
+    }
+
+    /// Queues one `profile_halted` row for `name` in the outbox beside `path`.
+    fn queue_exit_drain_row(path: &Path, name: &str, store: &Arc<InMemoryTipAnchorStore>) {
+        super::super::outbox::AuditOutbox::for_log(path, store.clone())
+            .append(&AuditEntry::new_profile_halted(
+                name,
+                "2026-10-31T12:00:00Z",
+                Some("exit drain"),
+                "exit-drain-lock-bound",
+            ))
+            .unwrap();
+    }
+
+    fn pending_rows(path: &Path) -> usize {
+        super::super::outbox::inspect_outbox(path).unwrap().pending
+    }
+
+    /// Runs `f` with a subscriber that captures every event on this thread and
+    /// returns the captured text with `f`'s result.
+    fn capture_logs<T>(f: impl FnOnce() -> T) -> (T, String) {
+        let capture = stellar_agent_test_support::CaptureWriter::new();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer(capture.clone())
+            .finish();
+        let result = tracing::subscriber::with_default(subscriber, || {
+            tracing::callsite::rebuild_interest_cache();
+            f()
+        });
+        (result, capture.captured_str())
+    }
+
+    /// Another thread holds a cached writer's mutex for longer than the exit
+    /// drain's bound. The drain returns within the bound plus a margin, warns
+    /// with the profile, and leaves the queued bytes and the commitment as
+    /// they were. Once the holder releases, a later drain delivers the row.
+    #[test]
+    fn exit_drain_does_not_wait_indefinitely_for_a_held_writer() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let name = "exit-drain-held-writer";
+        let (handle, store) = cached_history_fixture(&path, name, 0);
+        let registry = Mutex::new(HashMap::from([(
+            name.to_owned(),
+            keyed_registry_entry(&path, &handle),
+        )]));
+        queue_exit_drain_row(&path, name, &store);
+        assert_eq!(pending_rows(&path), 1);
+        let queued_bytes = fs::read(super::super::outbox::outbox_path(&path)).unwrap();
+        let commitments = || {
+            (0..4)
+                .map(|generation| store.load_outbox_state(generation).unwrap())
+                .collect::<Vec<_>>()
+        };
+        let commitment = commitments();
+        assert!(
+            commitment.iter().any(Option::is_some),
+            "the queued row has a commitment"
+        );
+
+        // The holder releases on request, or on its own well past the bound so
+        // a drain that blocks on the mutex returns late instead of hanging.
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let holder = {
+            let handle = Arc::clone(&handle);
+            std::thread::spawn(move || {
+                let guard = handle.lock().unwrap();
+                held_tx.send(()).unwrap();
+                let _ = release_rx.recv_timeout(EXIT_DRAIN_LOCK_WAIT * 6);
+                drop(guard);
+            })
+        };
+        held_rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("the holder takes the writer mutex");
+
+        let started = std::time::Instant::now();
+        let (drained, logs) = capture_logs(|| drain_cached_outboxes_in(&registry));
+        let elapsed = started.elapsed();
+        let holder_still_holds = !holder.is_finished();
+
+        assert_eq!(drained, 0, "the held writer is not counted as drained");
+        assert!(
+            elapsed >= EXIT_DRAIN_LOCK_WAIT,
+            "the drain waits the bound for the held mutex: {elapsed:?}"
+        );
+        assert!(
+            elapsed < EXIT_DRAIN_LOCK_WAIT * 3,
+            "the drain returns within the bound plus a margin: {elapsed:?}"
+        );
+        assert!(
+            holder_still_holds,
+            "the holder kept the mutex for the drain"
+        );
+        assert!(
+            logs.contains("WARN")
+                && logs.contains("stayed locked for the exit drain's wait")
+                && logs.contains(name),
+            "the drain warns with the profile: {logs}"
+        );
+        assert_eq!(pending_rows(&path), 1, "the row stays queued");
+        assert_eq!(
+            fs::read(super::super::outbox::outbox_path(&path)).unwrap(),
+            queued_bytes,
+            "the queued bytes are unchanged"
+        );
+        assert_eq!(commitments(), commitment, "the commitment is unchanged");
+
+        release_tx.send(()).unwrap();
+        holder.join().unwrap();
+        assert_eq!(drain_cached_outboxes_in(&registry), 1);
+        assert_eq!(pending_rows(&path), 0, "a later drain delivers the row");
+
+        drop(registry);
+        drop(handle);
+        AuditWriterRegistry::remove_for_test(name);
+    }
+
+    /// A poisoned writer mutex keeps its error, and the drain still checks and
+    /// drains the other cached writer. The registry is rebuilt until the
+    /// poisoned entry is the first the drain visits.
+    #[test]
+    fn exit_drain_keeps_poison_errors_and_checks_other_writers() {
+        let dir = TempDir::new().unwrap();
+        let poisoned_path = dir.path().join("poisoned.jsonl");
+        let healthy_path = dir.path().join("healthy.jsonl");
+        let poisoned_name = "exit-drain-poisoned-writer";
+        let healthy_name = "exit-drain-healthy-writer";
+        let (poisoned, poisoned_store) = cached_history_fixture(&poisoned_path, poisoned_name, 0);
+        let (healthy, healthy_store) = cached_history_fixture(&healthy_path, healthy_name, 0);
+        queue_exit_drain_row(&poisoned_path, poisoned_name, &poisoned_store);
+        queue_exit_drain_row(&healthy_path, healthy_name, &healthy_store);
+
+        let unwound = {
+            let poisoned = Arc::clone(&poisoned);
+            std::thread::spawn(move || {
+                let _guard = poisoned.lock().unwrap();
+                std::panic::resume_unwind(Box::new("poison the writer mutex"));
+            })
+            .join()
+        };
+        assert!(unwound.is_err(), "the holder unwinds");
+        assert!(poisoned.is_poisoned(), "the writer mutex is poisoned");
+
+        let registry = (0..256)
+            .map(|_| {
+                HashMap::from([
+                    (
+                        poisoned_name.to_owned(),
+                        keyed_registry_entry(&poisoned_path, &poisoned),
+                    ),
+                    (
+                        healthy_name.to_owned(),
+                        keyed_registry_entry(&healthy_path, &healthy),
+                    ),
+                ])
+            })
+            .find(|map| map.keys().next().map(String::as_str) == Some(poisoned_name))
+            .map(Mutex::new)
+            .expect("a registry whose first entry is the poisoned writer");
+
+        let (drained, logs) = capture_logs(|| drain_cached_outboxes_in(&registry));
+        assert_eq!(drained, 1, "the healthy writer drains: {logs}");
+        assert_eq!(pending_rows(&healthy_path), 0, "the healthy writer drained");
+        assert_eq!(
+            pending_rows(&poisoned_path),
+            1,
+            "the poisoned writer's row stays queued"
+        );
+        assert!(
+            logs.lines().any(|line| line.contains("WARN")
+                && line.contains(poisoned_name)
+                && line.contains("audit writer mutex poisoned; cannot reconcile the tip anchor")
+                && line.contains("shutdown check failed")),
+            "the poisoned writer reports its existing error: {logs}"
+        );
+
+        drop(registry);
+        drop(poisoned);
+        drop(healthy);
+        AuditWriterRegistry::remove_for_test(poisoned_name);
+        AuditWriterRegistry::remove_for_test(healthy_name);
+    }
+
+    /// A keyed acquisition outside the exit drain keeps the blocking lock: it
+    /// waits past the exit drain's bound and succeeds after the holder
+    /// releases.
+    #[test]
+    fn ordinary_writer_acquisition_waits_for_the_guard_release() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let name = "exit-drain-ordinary-acquisition";
+        let (handle, store) = cached_history_fixture(&path, name, 0);
+
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (acquiring_tx, acquiring_rx) = std::sync::mpsc::channel::<()>();
+        let (released_tx, released_rx) = std::sync::mpsc::channel();
+        let holder = {
+            let handle = Arc::clone(&handle);
+            std::thread::spawn(move || {
+                let guard = handle.lock().unwrap();
+                held_tx.send(()).unwrap();
+                acquiring_rx
+                    .recv_timeout(std::time::Duration::from_secs(30))
+                    .unwrap();
+                // The hold outlasts the exit drain's bound; it proves no stage.
+                std::thread::sleep(EXIT_DRAIN_LOCK_WAIT + std::time::Duration::from_millis(500));
+                released_tx.send(std::time::Instant::now()).unwrap();
+                drop(guard);
+            })
+        };
+        held_rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("the holder takes the writer mutex");
+
+        acquiring_tx.send(()).unwrap();
+        let started = std::time::Instant::now();
+        let acquired =
+            AuditWriterRegistry::get_or_open_keyed(name, &path, retained_history_access(&store));
+        let returned_at = std::time::Instant::now();
+        let released_at = released_rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("the holder reports its release");
+        holder.join().unwrap();
+
+        let acquired = acquired.expect("the ordinary acquisition succeeds after the release");
+        assert!(
+            Arc::ptr_eq(&acquired, &handle),
+            "the cached writer is returned"
+        );
+        assert!(
+            returned_at >= released_at,
+            "the acquisition returns after the observed release"
+        );
+        assert!(
+            returned_at.duration_since(started) > EXIT_DRAIN_LOCK_WAIT,
+            "the acquisition waits past the exit drain's bound: {:?}",
+            returned_at.duration_since(started)
+        );
+
+        drop(acquired);
         drop(handle);
         AuditWriterRegistry::remove_for_test(name);
     }
