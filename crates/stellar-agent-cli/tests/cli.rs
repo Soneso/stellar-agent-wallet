@@ -1,5 +1,10 @@
 //! Offline integration tests for the Stellar agent CLI.
 
+#[path = "cli/unified_dispatch.rs"]
+mod unified_dispatch;
+#[path = "cli/unified_protocol.rs"]
+mod unified_protocol;
+
 #[path = "cli/advisory_no_network_deps.rs"]
 mod advisory_no_network_deps;
 #[path = "cli/approval_attestation_binding.rs"]

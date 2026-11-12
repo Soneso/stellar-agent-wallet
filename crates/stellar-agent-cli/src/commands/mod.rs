@@ -11,6 +11,7 @@ pub mod counterparty;
 pub mod credentials;
 pub mod fees;
 pub mod friendbot;
+pub mod mcp;
 pub mod mpp;
 pub mod pay;
 pub(crate) mod policy_engine;

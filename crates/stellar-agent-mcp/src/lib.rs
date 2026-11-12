@@ -1,8 +1,7 @@
 //! Stellar agent wallet MCP server library.
 //!
-//! Re-exports the server module for integration-test access.  The `main.rs`
-//! binary entry point re-uses this crate's logic; integration tests (in
-//! `tests/`) import from `stellar_agent_mcp::*` directly.
+//! Provides the process entry point and server modules for both executables.
+//! Integration tests import from `stellar_agent_mcp::*` directly.
 //!
 //! # Module layout
 //!
@@ -27,7 +26,7 @@
 //!
 //! # Primary consumers
 //!
-//! - `main.rs` — binary entry point that starts the server process.
+//! - The CLI and compatibility executable — start the server through [`entry`].
 //! - `tests/mcp/resource_no_secrets.rs` — verifies resource generator output
 //!   contains no secret-shaped bytes (runtime gate).
 //! - `tests/mcp/integration.rs` — end-to-end MCP JSON-RPC protocol tests.
@@ -42,6 +41,13 @@
 /// Mitigation for the `rmcp` default `usize::MAX` line-length DoS surface.
 pub const STELLAR_AGENT_MCP_MAX_LINE_BYTES: usize = 1024 * 1024;
 
+/// Registry iteration for consumers testing their linked server tool set.
+#[cfg(feature = "test-helpers")]
+pub use inventory;
+
+/// MCP server process startup, argument parsing, and shutdown.
+pub mod entry;
+
 /// MCP resource content generators (usage.md).
 ///
 /// Crate-internal: external consumers reach `usage_md_content` via the
@@ -53,8 +59,7 @@ pub mod server;
 
 /// Bounded stdio transport and server startup.
 ///
-/// Public so the binary `main.rs` can build the server and serve it as two
-/// steps, matching the typed construction error in between.
+/// Separates construction from serving so callers can match typed build errors.
 pub mod transport;
 
 /// Bridges `stellar_agent_network::AccountView` to the

@@ -424,9 +424,10 @@ rm -f "$MCP_HOLD" "$MCP_INPUT"
 entry mcp-stdio
 REQUEST='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"validate-macos","version":"1"}}}'
 MCP_OUT=$(mktemp "$RECORD/.mcp.XXXXXX")
+MCP_ERR=$(mktemp "$RECORD/.mcp-stderr.XXXXXX")
 note "command: printf <initialize> | $SUDO -n -u $ACCOUNT $PREFIX/mcp-launch"
 set +e
-{ printf '%s\n' "$REQUEST"; sleep "$RESPONSE_SECONDS"; } | wallet mcp-launch >"$MCP_OUT" 2>/dev/null
+{ printf '%s\n' "$REQUEST"; sleep "$RESPONSE_SECONDS"; } | wallet mcp-launch >"$MCP_OUT" 2>"$MCP_ERR"
 MCP_RC=$?
 set -e
 note "exit: $MCP_RC"
@@ -436,7 +437,9 @@ else
   note "status: failed (no JSON-RPC message on standard output)"
 fi
 note "first line: $(head -n 1 "$MCP_OUT")"
-rm -f "$MCP_OUT"
+note "mcp-launch standard error:"
+sed 's/^/  /' "$MCP_ERR" >>"$ENTRY"
+rm -f "$MCP_OUT" "$MCP_ERR"
 
 entry cross-user-file-denial
 step cat "$DATA_ROOT/profiles/mainnet.toml"

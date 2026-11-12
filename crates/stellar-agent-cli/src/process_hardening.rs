@@ -53,6 +53,7 @@ pub(crate) struct HardeningError {
 /// [`HardeningError`] with the reported `errno` when `prctl` fails.
 #[cfg(target_os = "linux")]
 pub(crate) fn harden_process() -> Result<(), HardeningError> {
+    stellar_agent_core::test_trace::record("hardening");
     let disabled: libc::c_ulong = 0;
     let unused: libc::c_ulong = 0;
     // SAFETY: prctl(2) with PR_SET_DUMPABLE changes only the process's own
@@ -80,6 +81,7 @@ pub(crate) fn harden_process() -> Result<(), HardeningError> {
 /// None on this target.
 #[cfg(not(target_os = "linux"))]
 pub(crate) fn harden_process() -> Result<(), HardeningError> {
+    stellar_agent_core::test_trace::record("hardening");
     Ok(())
 }
 

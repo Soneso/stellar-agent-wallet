@@ -71,6 +71,9 @@ rustix = { workspace = true }
 [target.'cfg(target_os = "windows")'.dependencies]
 stellar-agent-windows-identity = { workspace = true }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = { workspace = true }
+
 [features]
 # Mainnet write support: the minimum mainnet policy for a mainnet profile's
 # v2 policy with a [mainnet] table, the mainnet window-state and reset errors,

@@ -490,6 +490,12 @@ fn unknown_flag_is_refused() {
     let output = run_with_initialize(home.command(&["--profil", "mainnet-prod"]));
     let stderr = assert_refused_with(&output, 2);
     assert!(
+        stderr
+            .lines()
+            .any(|line| line == "Usage: stellar-agent-mcp [OPTIONS]"),
+        "the refusal must name the compatibility executable: {stderr}"
+    );
+    assert!(
         stderr.contains("unrecognised command-line argument"),
         "the refusal must identify the argument class: {stderr}"
     );

@@ -2374,6 +2374,9 @@ write_validation_wrapper() {
 MODE=$(cat "$MODE_FILE")
 case "$NAME ${1-}" in
   "mcp-launch ")
+    if [ "$MODE" = h ]; then
+      echo "mcp-startup-status-marker (OS status -25293)" >&2
+    fi
     IFS= read -r line || true
     printf '{"jsonrpc":"2.0","id":1,"result":{}}\n'
     ;;
@@ -2836,6 +2839,15 @@ case_validation_read_needs_denial_evidence() {
       if grep -rqF -- "$MARKER" "$record" "$root/out-g" "$root/err-g"; then
         fail "validate-macos.sh recorded the key material or the keyring secret in mode g"
       fi
+
+      run_validation "$script" "$root" h
+      record="$root/record-h"
+      [ "$RC" -eq 0 ] || fail "validate-macos.sh in mode h exited $RC: $(cat "$root/err-h")"
+      file=$(entry_file "$record" mcp-stdio)
+      grep -qx '  mcp-startup-status-marker (OS status -25293)' "$file" ||
+        fail "macos drops MCP startup stderr: $(cat "$file")"
+      grep -qx 'status: ok (the first standard output line is a JSON-RPC message)' "$file" ||
+        fail "macos mixes MCP stderr into stdout: $(cat "$file")"
     else
       file=$(entry_file "$record" cross-user-keyring-denial)
       [ "$(status_after "$file" "$read_line")" = "status: inconclusive (authentication error without an access denial)" ] ||

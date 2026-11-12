@@ -4719,6 +4719,7 @@ dependencies = [
  "rustix",
  "same-file",
  "schemars 1.2.1",
+ "security-framework",
  "serde",
  "serde_json",
  "serial_test",
