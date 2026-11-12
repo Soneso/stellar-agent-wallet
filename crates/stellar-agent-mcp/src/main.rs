@@ -280,45 +280,344 @@ fn resolve_and_validate_profile_name(requested: Option<&str>) -> ResolvedProfile
     resolved
 }
 
-/// Resolves when the process receives SIGINT, or SIGTERM on Unix.
+/// Exit code of a second shutdown event during the shutdown wait or the exit
+/// drain.
 ///
-/// The server races this against the stdio session. When it resolves, the
-/// transport cancels the session and returns, and `main` drains the audit
-/// outboxes of the writers this process cached before it exits. Handling these
-/// signals lets that drain run before the process ends.
-async fn shutdown_signal() {
-    let ctrl_c = async {
-        if let Err(error) = tokio::signal::ctrl_c().await {
-            tracing::warn!(
+/// No other outcome of the binary uses it: `0` is help, version, and a clean
+/// shutdown, `1` a startup or server failure, and `2` a usage refusal.
+const EXIT_SECOND_SIGNAL: i32 = 3;
+
+/// Environment variable that names shutdown listeners whose registration
+/// fails, as a comma-separated list of [`ShutdownEvent::name`] values.
+///
+/// Compiled only with the `test-helpers` feature, so a release binary always
+/// registers every listener. A subprocess test sets it to observe the warning
+/// and the listeners that stay active.
+#[cfg(feature = "test-helpers")]
+const LISTENER_FAILURE_ENV: &str = "STELLAR_AGENT_TEST_SHUTDOWN_LISTENER_FAILURE";
+
+/// An event that starts a graceful shutdown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShutdownEvent {
+    /// SIGINT on Unix, Ctrl-C on Windows.
+    Interrupt,
+    /// SIGTERM on Unix.
+    #[cfg(unix)]
+    Terminate,
+    /// A Ctrl-Break event on Windows.
+    #[cfg(windows)]
+    CtrlBreak,
+    /// A console close event on Windows.
+    #[cfg(windows)]
+    ConsoleClose,
+}
+
+impl ShutdownEvent {
+    /// The event's name in logs and in the test-only failure variable.
+    fn name(self) -> &'static str {
+        match self {
+            #[cfg(unix)]
+            Self::Interrupt => "sigint",
+            #[cfg(not(unix))]
+            Self::Interrupt => "ctrl-c",
+            #[cfg(unix)]
+            Self::Terminate => "sigterm",
+            #[cfg(windows)]
+            Self::CtrlBreak => "ctrl-break",
+            #[cfg(windows)]
+            Self::ConsoleClose => "ctrl-close",
+        }
+    }
+
+    /// Logs that the event's listener is not registered, so that event ends
+    /// the process without the exit drain.
+    fn warn_unregistered(self, error: &std::io::Error) {
+        match self {
+            #[cfg(unix)]
+            Self::Interrupt => tracing::warn!(
                 error = %error,
                 "stellar-agent-mcp: cannot listen for SIGINT; the server will not drain on Ctrl-C"
-            );
-            std::future::pending::<()>().await;
+            ),
+            #[cfg(not(unix))]
+            Self::Interrupt => tracing::warn!(
+                error = %error,
+                "stellar-agent-mcp: cannot listen for Ctrl-C; the server does not drain on Ctrl-C"
+            ),
+            #[cfg(unix)]
+            Self::Terminate => tracing::warn!(
+                error = %error,
+                "stellar-agent-mcp: cannot listen for SIGTERM; the server will not drain on \
+                 SIGTERM"
+            ),
+            #[cfg(windows)]
+            Self::CtrlBreak => tracing::warn!(
+                error = %error,
+                "stellar-agent-mcp: cannot listen for Ctrl-Break; the server does not drain on \
+                 Ctrl-Break"
+            ),
+            #[cfg(windows)]
+            Self::ConsoleClose => tracing::warn!(
+                error = %error,
+                "stellar-agent-mcp: cannot listen for console close; the server does not drain \
+                 when its console closes"
+            ),
         }
-    };
+    }
 
-    #[cfg(unix)]
-    let terminate = async {
-        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
-            Ok(mut signal) => {
-                signal.recv().await;
+    /// The registration failure the test-only variable names for this event.
+    fn injected_registration_failure(self) -> Option<std::io::Error> {
+        #[cfg(feature = "test-helpers")]
+        if std::env::var(LISTENER_FAILURE_ENV)
+            .is_ok_and(|names| names.split(',').any(|name| name.trim() == self.name()))
+        {
+            return Some(std::io::Error::other(
+                "the listener registration failure the test requested",
+            ));
+        }
+        None
+    }
+}
+
+/// Registers one listener and forwards each of its events to `$events`, and
+/// evaluates to whether the listener is registered.
+///
+/// A failed registration logs a warning and leaves that listener inactive;
+/// every other listener stays registered. The task skips an event that the
+/// native console close handler forwards itself.
+macro_rules! listen {
+    ($events:expr, $event:expr, $register:expr) => {{
+        let event: ShutdownEvent = $event;
+        let registered = match event.injected_registration_failure() {
+            Some(error) => Err(error),
+            None => $register,
+        };
+        match registered {
+            Ok(mut listener) => {
+                let events = $events.clone();
+                tokio::spawn(async move {
+                    while listener.recv().await.is_some() {
+                        if forwarded_natively(event) {
+                            continue;
+                        }
+                        if events.send(event).is_err() {
+                            break;
+                        }
+                    }
+                });
+                true
             }
             Err(error) => {
-                tracing::warn!(
-                    error = %error,
-                    "stellar-agent-mcp: cannot listen for SIGTERM; the server will not drain on \
-                     SIGTERM"
-                );
-                std::future::pending::<()>().await;
+                event.warn_unregistered(&error);
+                false
             }
         }
-    };
-    #[cfg(not(unix))]
-    let terminate = std::future::pending::<()>();
+    }};
+}
 
-    tokio::select! {
-        () = ctrl_c => {}
-        () = terminate => {}
+/// Whether the native console close handler forwards `event` itself.
+#[cfg(unix)]
+fn forwarded_natively(_event: ShutdownEvent) -> bool {
+    false
+}
+
+/// Whether the native console close handler forwards `event` itself.
+#[cfg(windows)]
+fn forwarded_natively(event: ShutdownEvent) -> bool {
+    event == ShutdownEvent::ConsoleClose && console_close::forwarded()
+}
+
+/// The native console close handler on Windows.
+///
+/// Windows ends the process when a `CTRL_CLOSE_EVENT` handler returns, and
+/// asynchronous forwarding alone cannot keep the process alive until the
+/// supervisor logs the event and the exit drain runs.
+#[cfg(windows)]
+mod console_close {
+    #![allow(
+        unsafe_code,
+        reason = "SetConsoleCtrlHandler registration and its callback"
+    )]
+
+    use std::sync::OnceLock;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use tokio::sync::mpsc::UnboundedSender;
+    use windows_sys::Win32::Foundation::{FALSE, TRUE};
+    use windows_sys::Win32::System::Console::{CTRL_CLOSE_EVENT, SetConsoleCtrlHandler};
+    use windows_sys::core::BOOL;
+
+    use super::ShutdownEvent;
+
+    /// The supervisor channel the handler sends the close event to.
+    static EVENTS: OnceLock<UnboundedSender<ShutdownEvent>> = OnceLock::new();
+
+    /// Set while the handler sends the close event, and cleared when the
+    /// send fails.
+    ///
+    /// A successful send parks the handler thread, so Tokio's handler never
+    /// sees that event. A failed send means the supervisor's receiver is
+    /// closed. The handler then clears the flag and returns `FALSE`. A send
+    /// of the Tokio listener's task fails the same way, because it uses the
+    /// same channel.
+    ///
+    /// A close that Tokio receives before this handler is installed reaches
+    /// that task. The task forwards it while the flag is clear and drops it
+    /// once the flag is set.
+    ///
+    /// The flag holds no event identity. It merges a notification that
+    /// awaits forwarding from before installation with a later native
+    /// notification, and identifies neither. Two distinct closes can then
+    /// reach the supervisor as one.
+    static FORWARDED: AtomicBool = AtomicBool::new(false);
+
+    /// Whether the flag is set: the handler's send of the close event is
+    /// underway or complete.
+    pub(super) fn forwarded() -> bool {
+        FORWARDED.load(Ordering::SeqCst)
+    }
+
+    /// Registers [`on_console_event`] after the Tokio listeners, so Windows
+    /// calls it first: the last registered handler runs first.
+    ///
+    /// # Errors
+    ///
+    /// When the handler is already installed or the registration fails.
+    pub(super) fn install(events: &UnboundedSender<ShutdownEvent>) -> std::io::Result<()> {
+        EVENTS
+            .set(events.clone())
+            .map_err(|_| std::io::Error::other("the console close handler is already installed"))?;
+        // SAFETY: the handler is a `'static` function with the signature
+        // `PHANDLER_ROUTINE` requires, and the call reads no other memory.
+        let registered = unsafe { SetConsoleCtrlHandler(Some(on_console_event), TRUE) };
+        if registered == FALSE {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    /// Sends [`ShutdownEvent::ConsoleClose`] to the supervisor on
+    /// `CTRL_CLOSE_EVENT` and blocks until the process ends.
+    ///
+    /// Invariant: the handler blocks until the process ends, because Windows
+    /// ends the process when it returns. The supervisor's exit drain ends the
+    /// process through its own exit; otherwise Windows ends it at its
+    /// close deadline. Windows runs each handler on a thread of its own, so
+    /// the blocked thread holds up no runtime work. Every other event kind
+    /// returns `FALSE`, so Windows calls the next handler. A close event whose
+    /// send fails on a closed channel returns `FALSE` as well.
+    unsafe extern "system" fn on_console_event(kind: u32) -> BOOL {
+        if kind != CTRL_CLOSE_EVENT {
+            return FALSE;
+        }
+        let Some(events) = EVENTS.get() else {
+            return FALSE;
+        };
+        FORWARDED.store(true, Ordering::SeqCst);
+        if events.send(ShutdownEvent::ConsoleClose).is_err() {
+            FORWARDED.store(false, Ordering::SeqCst);
+            return FALSE;
+        }
+        loop {
+            std::thread::park();
+        }
+    }
+}
+
+/// Registers the platform's shutdown listeners, each forwarding to `events`.
+#[cfg(unix)]
+fn register_shutdown_listeners(events: &tokio::sync::mpsc::UnboundedSender<ShutdownEvent>) {
+    use tokio::signal::unix::{SignalKind, signal};
+    listen!(
+        events,
+        ShutdownEvent::Interrupt,
+        signal(SignalKind::interrupt())
+    );
+    listen!(
+        events,
+        ShutdownEvent::Terminate,
+        signal(SignalKind::terminate())
+    );
+}
+
+/// Registers the platform's shutdown listeners, each forwarding to `events`.
+#[cfg(windows)]
+fn register_shutdown_listeners(events: &tokio::sync::mpsc::UnboundedSender<ShutdownEvent>) {
+    listen!(
+        events,
+        ShutdownEvent::Interrupt,
+        tokio::signal::windows::ctrl_c()
+    );
+    listen!(
+        events,
+        ShutdownEvent::CtrlBreak,
+        tokio::signal::windows::ctrl_break()
+    );
+    let close_listened = listen!(
+        events,
+        ShutdownEvent::ConsoleClose,
+        tokio::signal::windows::ctrl_close()
+    );
+    // The native handler is registered after the Tokio listeners, so it runs
+    // first. A failed installation leaves the console close listener above.
+    if close_listened && let Err(error) = console_close::install(events) {
+        tracing::warn!(
+            error = %error,
+            "stellar-agent-mcp: cannot install the native console close handler; console \
+             close reaches the supervisor through its listener only"
+        );
+    }
+}
+
+/// Starts the shutdown supervisor and returns a future that resolves on the
+/// first shutdown event.
+///
+/// The events are SIGINT and SIGTERM on Unix, and Ctrl-C, Ctrl-Break, and
+/// console close on Windows. The server races the returned future against the
+/// stdio session. When it resolves, the transport cancels the session and
+/// returns, and `main` drains the audit outboxes of the writers this process
+/// cached before it exits.
+///
+/// The supervisor is a task of its own that counts the events it receives.
+/// The exit drain runs on a blocking thread, so the supervisor stays
+/// responsive during it. A second event during the shutdown wait or the drain
+/// exits the process at once with [`EXIT_SECOND_SIGNAL`]. Client EOF is not an
+/// event: after EOF the first signal still starts no forced exit.
+///
+/// When no listener can be registered, the returned future never resolves.
+fn shutdown_signal() -> impl std::future::Future<Output = ()> {
+    let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
+    register_shutdown_listeners(&events_tx);
+    drop(events_tx);
+    let (first_tx, first_rx) = tokio::sync::oneshot::channel::<()>();
+    tokio::spawn(async move {
+        let mut first = Some(first_tx);
+        while let Some(event) = events_rx.recv().await {
+            if let Some(first) = first.take() {
+                tracing::info!(
+                    event = event.name(),
+                    "stellar-agent-mcp: shutdown event received; stopping the session and \
+                     draining the audit outboxes"
+                );
+                // A dropped receiver means the session already ended, so the
+                // drain is running or done and nothing awaits the event.
+                first.send(()).ok();
+            } else {
+                // A forced exit is a crash for the outbox: rows it did not
+                // drain stay queued, and a later draining writer delivers them.
+                tracing::warn!(
+                    event = event.name(),
+                    exit_code = EXIT_SECOND_SIGNAL,
+                    "stellar-agent-mcp: second shutdown event received; exiting at once, and \
+                     undrained audit rows stay queued for the next draining writer"
+                );
+                std::process::exit(EXIT_SECOND_SIGNAL);
+            }
+        }
+    });
+    async move {
+        if first_rx.await.is_err() {
+            std::future::pending::<()>().await;
+        }
     }
 }
 
@@ -513,13 +812,32 @@ async fn main() {
     let result = transport::serve_until(server, shutdown_signal()).await;
 
     // ── 7. Drain the audit outboxes this process cached ───────────────────────
-    // The transport returns on client EOF and on SIGINT/SIGTERM. Either way a
-    // `profile halt` or `profile resume` row queued while this server held the
-    // writer must reach the log now: a halted profile may see no further keyed
-    // command for a long time. A failed check is logged by the registry; a
+    // The transport returns on client EOF and on the first shutdown event:
+    // SIGINT or SIGTERM on Unix, Ctrl-C, Ctrl-Break, or console close on
+    // Windows. Either way a `profile halt` or `profile resume` row queued while
+    // this server held the writer must reach the log now. A halted profile may
+    // see no further keyed command for a long time. The drain waits at most two
+    // seconds for each cached writer's mutex; a writer still held then keeps
+    // its queued rows. The bound covers the mutex wait only, not the drain's
+    // filesystem or keyring work. A failed check is logged by the registry; a
     // refused drain leaves the outbox unchanged, so delivery stays at least
-    // once. The exit code is unaffected.
-    let drained = stellar_agent_core::audit_log::AuditWriterRegistry::drain_cached_outboxes();
+    // once. The exit code is unaffected. The drain runs on a blocking thread,
+    // so the shutdown supervisor still exits with code 3 on a second event.
+    let drained = match tokio::task::spawn_blocking(
+        stellar_agent_core::audit_log::AuditWriterRegistry::drain_cached_outboxes,
+    )
+    .await
+    {
+        Ok(drained) => drained,
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                "stellar-agent-mcp: the exit drain did not finish; undrained audit rows stay \
+                 queued for the next draining writer"
+            );
+            0
+        }
+    };
     tracing::info!(
         writers = drained,
         "stellar-agent-mcp: drained cached audit outboxes at exit"

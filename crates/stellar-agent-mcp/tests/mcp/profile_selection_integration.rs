@@ -24,10 +24,12 @@
     reason = "test-only; panics acceptable in integration tests"
 )]
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::Write;
 use std::process::{Command, Output, Stdio};
 
 use stellar_agent_core::profile::caip2::{MAINNET_PASSPHRASE, TESTNET_PASSPHRASE};
+
+use crate::common::child_process::ChildDriver;
 
 /// A profile name for which no file is ever written.
 const MISSING_PROFILE: &str = "__issue105_missing_profile__";
@@ -166,50 +168,16 @@ fn assert_refused(output: &Output) -> String {
     stderr
 }
 
-/// A live server bound to a profile home, driven over stdio.
-struct McpSession {
-    child: std::process::Child,
-    writer: std::io::BufWriter<std::process::ChildStdin>,
-    reader: BufReader<std::process::ChildStdout>,
-}
-
-impl McpSession {
-    fn start(mut command: Command) -> Self {
-        let mut child = command
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("stellar-agent-mcp binary must spawn");
-        let writer =
-            std::io::BufWriter::new(child.stdin.take().expect("child stdin must be piped"));
-        let reader = BufReader::new(child.stdout.take().expect("child stdout must be piped"));
-        Self {
-            child,
-            writer,
-            reader,
-        }
-    }
-
-    fn call(&mut self, message: &serde_json::Value) -> serde_json::Value {
-        let line = serde_json::to_string(message).expect("json serialisation");
-        writeln!(self.writer, "{line}").expect("write to child stdin must succeed");
-        self.writer.flush().expect("flush must succeed");
-        let mut response = String::new();
-        self.reader
-            .read_line(&mut response)
-            .expect("server must write a response line");
-        assert!(
-            !response.trim().is_empty(),
-            "server must respond with a non-empty JSON-RPC message"
-        );
-        serde_json::from_str(response.trim()).expect("server must respond with valid JSON-RPC")
-    }
-
+/// The profile-selection exchange on a live server under the shared driver.
+trait ActiveNetwork {
     /// Completes the handshake and returns the active network passphrase the
     /// server reports, which is derived from the loaded profile's `chain_id`.
+    fn active_network_passphrase(&mut self) -> String;
+}
+
+impl ActiveNetwork for ChildDriver {
     fn active_network_passphrase(&mut self) -> String {
-        let init = self.call(&serde_json::json!({
+        let init = self.exchange(&serde_json::json!({
             "jsonrpc": "2.0",
             "id": 1,
             "method": "initialize",
@@ -224,7 +192,7 @@ impl McpSession {
             "initialize must succeed: {init}"
         );
 
-        let called = self.call(&serde_json::json!({
+        let called = self.exchange(&serde_json::json!({
             "jsonrpc": "2.0",
             "id": 2,
             "method": "tools/call",
@@ -239,12 +207,6 @@ impl McpSession {
             .as_str()
             .unwrap_or_else(|| panic!("getNetwork must report a passphrase: {envelope}"))
             .to_owned()
-    }
-}
-
-impl Drop for McpSession {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
     }
 }
 
@@ -273,7 +235,7 @@ fn profile_flag_serves_the_named_profile() {
         ),
     );
 
-    let mut session = McpSession::start(home.command(&["--profile", "alice"]));
+    let mut session = ChildDriver::spawn(home.command(&["--profile", "alice"]));
     assert_eq!(
         session.active_network_passphrase(),
         MAINNET_PASSPHRASE,
@@ -302,7 +264,7 @@ fn profile_equals_form_serves_the_named_profile() {
         ),
     );
 
-    let mut session = McpSession::start(home.command(&["--profile=alice"]));
+    let mut session = ChildDriver::spawn(home.command(&["--profile=alice"]));
     assert_eq!(session.active_network_passphrase(), MAINNET_PASSPHRASE);
 }
 
@@ -335,7 +297,7 @@ fn environment_variable_selects_the_profile_file() {
 
     let mut command = home.command(&[]);
     command.env("STELLAR_AGENT_PROFILE", "alice");
-    let mut session = McpSession::start(command);
+    let mut session = ChildDriver::spawn(command);
     assert_eq!(session.active_network_passphrase(), TESTNET_PASSPHRASE);
 }
 
@@ -362,7 +324,7 @@ fn profile_flag_beats_the_environment_variable() {
 
     let mut command = home.command(&["--profile", "default"]);
     command.env("STELLAR_AGENT_PROFILE", "alice");
-    let mut session = McpSession::start(command);
+    let mut session = ChildDriver::spawn(command);
     assert_eq!(
         session.active_network_passphrase(),
         TESTNET_PASSPHRASE,
@@ -377,7 +339,7 @@ fn profile_flag_beats_the_environment_variable() {
 #[test]
 fn no_name_and_no_profile_file_falls_back_to_the_synthesised_testnet_profile() {
     let home = ProfileHome::new();
-    let mut session = McpSession::start(home.command(&[]));
+    let mut session = ChildDriver::spawn(home.command(&[]));
     assert_eq!(session.active_network_passphrase(), TESTNET_PASSPHRASE);
 }
 
@@ -666,7 +628,7 @@ fn profile_flag_serves_a_mainnet_profile() {
             "https://mainnet.example.invalid",
         ),
     );
-    let mut session = McpSession::start(home.command(&["--profile", "mainnet"]));
+    let mut session = ChildDriver::spawn(home.command(&["--profile", "mainnet"]));
     assert_eq!(session.active_network_passphrase(), MAINNET_PASSPHRASE);
 }
 
@@ -690,7 +652,7 @@ fn a_mainnet_default_profile_needs_the_flag() {
         stderr.contains("stellar-agent-mcp --profile <name>"),
         "{stderr}"
     );
-    let mut session = McpSession::start(home.command(&["--profile", "default"]));
+    let mut session = ChildDriver::spawn(home.command(&["--profile", "default"]));
     assert_eq!(session.active_network_passphrase(), MAINNET_PASSPHRASE);
 }
 

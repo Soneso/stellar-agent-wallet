@@ -28,6 +28,7 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::Mutex as TokioMutex;
 use tokio_util::codec::{FramedRead, FramedWrite};
+use tokio_util::sync::CancellationToken;
 
 use crate::STELLAR_AGENT_MCP_MAX_LINE_BYTES;
 use crate::server::WalletServer;
@@ -375,6 +376,12 @@ pub const SHUTDOWN_WAIT: Duration = Duration::from_secs(5);
 /// Runs `server` on `transport` until the client disconnects or `shutdown`
 /// resolves.
 ///
+/// One cancellation token reaches rmcp for the whole session: the handshake
+/// and the running service observe it. A `shutdown` that resolves during the
+/// handshake cancels the token, lets the handshake return, and yields
+/// `Ok(())`. A `shutdown` on a running session cancels the same token and
+/// waits at most [`SHUTDOWN_WAIT`] for the session to stop.
+///
 /// # Errors
 ///
 /// [`SessionStartError`] when the session does not start, or the join error of
@@ -390,20 +397,29 @@ where
     F: std::future::Future<Output = ()>,
 {
     tokio::pin!(shutdown);
-    let starting = server.serve(transport);
+    let cancellation = CancellationToken::new();
+    let starting = server.serve_with_ct(transport, cancellation.clone());
     tokio::pin!(starting);
-    let service = tokio::select! {
-        result = &mut starting => result.map_err(SessionStartError::from)?,
-        () = &mut shutdown => {
+    let started = tokio::select! {
+        result = &mut starting => Some(result),
+        () = &mut shutdown => None,
+    };
+    let service = match started {
+        Some(result) => result.map_err(SessionStartError::from)?,
+        None => {
             tracing::info!(
                 "stellar-agent-mcp: shutdown signal received before the session started"
             );
+            cancellation.cancel();
+            // The handshake observes the cancelled token and returns, so it
+            // ends through rmcp's own cancellation path. Its outcome is the
+            // shutdown's, not a startup failure.
+            drop(starting.await);
             return Ok(());
         }
     };
 
     tracing::info!("stellar-agent-mcp: MCP server ready");
-    let cancellation = service.cancellation_token();
     let waiting = service.waiting();
     tokio::pin!(waiting);
     tokio::select! {
