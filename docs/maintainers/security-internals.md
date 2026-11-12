@@ -1353,6 +1353,12 @@ class. The evaluation carries the class of the matched rule on its
 `ValueEffects`, and budget sizing reads it there instead of classifying again.
 A budget entry uses the key `unlisted:<asset>` at the window's length, shared
 by every rule. A bundle accumulates unlisted transfers in its overlay.
+The loader admits at most one table per rule and requires every table of a
+policy to equal the first as parsed: mode, asset after its `native` default,
+both bounds, and window. Equal budget tables share one counter per asset
+across the rules that carry them. A rule without a table, its allow list, and
+its caps are unaffected. `validate_unlisted` checks each table against the hard caps of its
+own rule.
 
 `total_budget` entries carry the policy digest as their epoch, use the key
 `total:<asset>` with a zero window, and count regardless of age.
