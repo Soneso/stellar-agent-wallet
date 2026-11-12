@@ -66,6 +66,7 @@ keyring-core = { workspace = true }
 # FIFO or symlink beside the log never blocks or redirects a read.
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
+rustix = { workspace = true }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 stellar-agent-windows-identity = { workspace = true }

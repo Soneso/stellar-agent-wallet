@@ -1876,6 +1876,31 @@ mod tests {
         assert_eq!(kept["result"]["id"], 2, "{kept}");
     }
 
+    /// A wait for an id no kept response carries, after stdout has closed,
+    /// returns the deadline error when the deadline passes during the search.
+    /// The check after the search precedes the closed check.
+    #[test]
+    fn driver_reports_the_deadline_before_a_closed_stdout_on_a_cache_miss() {
+        let mut driver = ChildDriver::spawn(sh(&format!(
+            "read line; {}; {}; read line",
+            response_line(2),
+            response_line(1)
+        )));
+        driver.send(&json!({ "jsonrpc": "2.0", "id": 1, "method": "ping" }));
+        let first = driver.response(1);
+        assert_eq!(first["result"]["id"], 1, "{first}");
+        assert_eq!(driver.unclaimed.len(), 1, "only response 2 is kept");
+
+        driver.stdout_closed = true;
+        // Reading 2 is the check after the search of the kept responses.
+        driver.set_clock(scripted_clock(Instant::now(), usize::MAX, &[2]));
+        assert_eq!(
+            driver.response_within(3, Duration::from_secs(1)),
+            Err(ResponseError::Deadline),
+            "a deadline that passes during the search wins over the closed stdout"
+        );
+    }
+
     /// The pause is keyed to its response: the reader delivers the response
     /// before the designated one, then the designated one, and only then
     /// parks.
