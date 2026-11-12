@@ -830,4 +830,141 @@ mod tests {
             "an unwind through the guard restores the absence of a default store"
         );
     }
+
+    /// Puts back the default store a test found, also when it panics.
+    struct RestoreDefaultStore(Option<std::sync::Arc<keyring_core::CredentialStore>>);
+
+    impl RestoreDefaultStore {
+        fn capture() -> Self {
+            Self(keyring_core::get_default_store())
+        }
+    }
+
+    impl Drop for RestoreDefaultStore {
+        fn drop(&mut self) {
+            match self.0.take() {
+                Some(store) => keyring_core::set_default_store(store),
+                None => {
+                    let _ = keyring_core::unset_default_store();
+                }
+            }
+        }
+    }
+
+    fn mutation(operation: &'static str, service: &str, account: &str) -> super::KeyringMutation {
+        super::KeyringMutation {
+            operation,
+            service: service.to_owned(),
+            account: account.to_owned(),
+        }
+    }
+
+    /// Without an installed store there is nothing to wrap.
+    #[test]
+    #[serial]
+    fn record_mutations_requires_an_installed_store() {
+        let _restore = RestoreDefaultStore::capture();
+        keyring_core::unset_default_store();
+        assert!(matches!(
+            super::record_mutations(),
+            Err(keyring_core::Error::NoDefaultStore)
+        ));
+    }
+
+    /// A write, an attribute update and a deletion through entries built
+    /// after the call each record one mutation with their coordinates, in
+    /// order. Reads pass through and record nothing.
+    #[test]
+    #[serial]
+    fn record_mutations_logs_writes_updates_and_deletions_in_order() {
+        let _restore = RestoreDefaultStore::capture();
+        super::install().expect("mock store install");
+        let log = super::record_mutations().expect("recording store");
+        assert_eq!(log.mutations(), []);
+
+        let entry = keyring_core::Entry::new("rec-svc", "rec-user").expect("entry");
+        entry.set_password("value").expect("set");
+        assert_eq!(entry.get_password().expect("read"), "value");
+        assert_eq!(entry.get_secret().expect("secret read"), b"value");
+        assert_eq!(log.mutations(), [mutation("set", "rec-svc", "rec-user")]);
+
+        let attributes = std::collections::HashMap::from([("label", "laptop")]);
+        let _ = entry.update_attributes(&attributes);
+        let other = keyring_core::Entry::new("rec-svc", "other-user").expect("entry");
+        other.set_password("second").expect("set");
+        other.delete_credential().expect("delete");
+        assert_eq!(
+            log.mutations(),
+            [
+                mutation("set", "rec-svc", "rec-user"),
+                mutation("update_attributes", "rec-svc", "rec-user"),
+                mutation("set", "rec-svc", "other-user"),
+                mutation("delete", "rec-svc", "other-user"),
+            ]
+        );
+        assert!(
+            other.get_password().is_err(),
+            "the deletion reaches the store"
+        );
+        let clone = log.clone();
+        assert_eq!(clone.mutations().len(), 4, "clones share one log");
+    }
+
+    /// Credentials stored before the call stay readable through entries
+    /// built afterwards, and reading them records nothing.
+    #[test]
+    #[serial]
+    fn record_mutations_keeps_earlier_credentials_readable() {
+        let _restore = RestoreDefaultStore::capture();
+        super::install().expect("mock store install");
+        keyring_core::Entry::new("seed-svc", "seed-user")
+            .expect("entry")
+            .set_password("seeded")
+            .expect("seed");
+        let log = super::record_mutations().expect("recording store");
+        let entry = keyring_core::Entry::new("seed-svc", "seed-user").expect("entry");
+        assert_eq!(entry.get_password().expect("read"), "seeded");
+        assert_eq!(log.mutations(), []);
+    }
+
+    /// The recording store and its credentials name themselves and keep
+    /// the inner store's identity and the entry's coordinates.
+    #[test]
+    #[serial]
+    fn record_mutations_store_and_credential_identify_themselves() {
+        let _restore = RestoreDefaultStore::capture();
+        super::install().expect("mock store install");
+        let inner_id = keyring_core::get_default_store().expect("inner store").id();
+        let _log = super::record_mutations().expect("recording store");
+        let store = keyring_core::get_default_store().expect("recording store");
+        assert_eq!(
+            store.vendor(),
+            "stellar-agent-test-support recording mock store"
+        );
+        assert_eq!(store.id(), inner_id);
+        let recording = store
+            .as_any()
+            .downcast_ref::<super::RecordingStore>()
+            .expect("the default store is the recording store");
+        assert_eq!(format!("{recording:?}"), "RecordingStore { .. }");
+
+        let entry = keyring_core::Entry::new("id-svc", "id-user").expect("entry");
+        let credential = entry
+            .as_any()
+            .downcast_ref::<super::RecordingCred>()
+            .expect("entries built afterwards wrap a recording credential");
+        assert_eq!(format!("{credential:?}"), "RecordingCred { .. }");
+        assert_eq!(
+            entry.get_specifiers(),
+            Some(("id-svc".to_owned(), "id-user".to_owned()))
+        );
+        assert!(
+            entry
+                .get_credential()
+                .expect("credential")
+                .as_any()
+                .is::<super::RecordingCred>(),
+            "a wrapper credential stands for itself"
+        );
+    }
 }
