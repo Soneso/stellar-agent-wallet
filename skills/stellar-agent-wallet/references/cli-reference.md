@@ -1117,8 +1117,11 @@ stellar-agent approve --id ABCxyzNonce --profile <name>
 
 State-changing. Evicts every expired entry from the pending-approval store and reports the count (`evicted_count`). When `gc` is present, `--id` is ignored. Evicting zero is a success. `--profile <NAME>` selects the store.
 
+`--include-consumed` also evicts consumed entries before their TTL ends; without it, only expired entries go. `evicted_count` counts each removed entry once. The submission receipt holds the spent nonce, so reusing it still fails with `policy.approval_consumed`.
+
 ```bash
 stellar-agent approve gc --profile default
+stellar-agent approve gc --profile default --include-consumed
 ```
 
 ### `approve list`

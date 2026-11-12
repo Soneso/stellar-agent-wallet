@@ -1114,6 +1114,10 @@ stellar-agent approve gc --profile default
 State-changing (removes expired entries). Opens the pending-approval store and evicts every entry whose TTL has elapsed, then reports the count.
 
 - `--profile <NAME>`: the profile whose store to garbage-collect. Optional; same resolution as above.
+- `--include-consumed`: also evicts consumed entries before their TTL ends. Optional; without it, `approve gc` removes expired entries only.
+
+`evicted_count` counts each removed entry once, so an expired consumed entry counts one.
+Removing a consumed entry keeps replay protection. The submission receipt holds the spent nonce, so a commit that reuses it still fails with `policy.approval_consumed`.
 
 When the `gc` subcommand is present, any `--id` is ignored. Evicting zero entries is a success.
 The report names `profile` only when the name resolves to a saved profile.

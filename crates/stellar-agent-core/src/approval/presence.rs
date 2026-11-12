@@ -20,8 +20,10 @@
 //!    snapshot's challenge, origin and signed credential key, and returns a
 //!    [`VerifiedMainnetPresence`]. That type has no other producer.
 //! 4. The attester consumes the verified presence, rechecks the locked entry
-//!    and the current policy, and records a version 5 attestation with the
-//!    [`MainnetPresenceReceipt`].
+//!    and the current policy, and records a version 5 or 6 attestation with
+//!    the [`MainnetPresenceReceipt`]. The record's subject kind selects the
+//!    version: version 5 for an envelope-text record, version 6 for an
+//!    intent-digest record.
 //!
 //! The commit witness verifies the stored receipt again: the raw assertion
 //! under the current signed key, over the challenge recomputed from the
@@ -1204,6 +1206,7 @@ pub struct PendingMainnetPresence {
     expected_origin: String,
     version: u32,
     listener: Option<ListenerIdentity>,
+    intent: Option<ClassicIntent>,
     issued_at_unix_ms: u64,
     expires_at_unix_ms: u64,
     deadline: Instant,
@@ -1480,6 +1483,7 @@ pub fn issue_mainnet_intent_presence(
         expected_origin: expected_origin.to_owned(),
         version,
         listener,
+        intent: intent.cloned(),
         issued_at_unix_ms: now_ms,
         expires_at_unix_ms,
         deadline,
@@ -1495,13 +1499,15 @@ pub fn issue_mainnet_intent_presence(
 /// credential, over the challenge of one consent snapshot.
 ///
 /// [`verify_mainnet_presence`] is its only producer. Surfaces read the
-/// request ID and the credential fingerprint; the attester consumes it.
+/// request ID and the credential fingerprint; the attester consumes it,
+/// with the canonical intent the challenge bound, when it bound one.
 pub struct VerifiedMainnetPresence {
     entry: PendingApproval,
     profile_name: String,
     chain_id: String,
     policy: VerifiedPolicy,
     receipt: MainnetPresenceReceipt,
+    intent: Option<ClassicIntent>,
     deadline: Instant,
     credential_fingerprint: String,
 }
@@ -1523,6 +1529,7 @@ pub(crate) struct VerifiedPresenceParts {
     pub(crate) chain_id: String,
     pub(crate) policy: VerifiedPolicy,
     pub(crate) receipt: MainnetPresenceReceipt,
+    pub(crate) intent: Option<ClassicIntent>,
     pub(crate) deadline: Instant,
 }
 
@@ -1609,6 +1616,7 @@ impl VerifiedMainnetPresence {
             chain_id: self.chain_id,
             policy: self.policy,
             receipt: self.receipt,
+            intent: self.intent,
             deadline: self.deadline,
         }
     }
@@ -1667,6 +1675,7 @@ pub fn verify_mainnet_presence(
         chain_id: pending.chain_id,
         policy: pending.policy,
         receipt,
+        intent: pending.intent,
         deadline: pending.deadline,
         credential_fingerprint: facts.credential.fingerprint(),
     })
@@ -1676,7 +1685,7 @@ pub fn verify_mainnet_presence(
 // Receipt
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// The record of one verified ceremony, stored with the version 5
+/// The record of one verified ceremony, stored with the version 5 or 6
 /// attestation it is bound into.
 ///
 /// Version 1 records a legacy-layout ceremony at a loopback origin. Version
@@ -1887,7 +1896,7 @@ impl MainnetPresenceReceipt {
             && self.policy_owner() == Some(policy.owner())
     }
 
-    /// The receipt digest a version 5 attestation binds.
+    /// The receipt digest a version 5 or 6 attestation binds.
     ///
     /// SHA-256 of `b"stellar-agent-mainnet-presence-receipt:v1"` followed by
     /// `u32(version)`, `lp(request_id)`, the 32 decoded random bytes,

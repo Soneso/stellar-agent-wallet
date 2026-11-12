@@ -1,7 +1,13 @@
 //! `stellar-agent approve gc` — garbage-collect expired pending approvals.
 //!
 //! Opens the pending-approvals store for the specified (or default) profile
-//! and removes all entries whose TTL has elapsed.
+//! and removes all entries whose TTL has elapsed. With `--include-consumed`
+//! it also removes every consumed entry, whatever its TTL; an expired
+//! consumed entry counts once.
+//!
+//! Removing a consumed entry keeps replay protection: the submission receipt
+//! holds the spent approval nonce, and the commit gate reads it before it
+//! opens the pending-approvals store.
 //!
 //! # Output (JSON envelope)
 //!
@@ -44,6 +50,7 @@ use crate::common::{render, resolve_profile_name, validate_path_component_ascii_
 /// ```text
 /// stellar-agent approve gc
 /// stellar-agent approve gc --profile myprofile
+/// stellar-agent approve gc --profile myprofile --include-consumed
 /// ```
 #[derive(Debug, Args)]
 #[non_exhaustive]
@@ -51,6 +58,10 @@ pub struct GcArgs {
     /// Profile name (default: `"default"` or `STELLAR_AGENT_PROFILE` env var).
     #[arg(long = "profile", value_name = "NAME")]
     pub profile: Option<String>,
+
+    /// Also remove consumed entries before their TTL elapses.
+    #[arg(long = "include-consumed")]
+    pub include_consumed: bool,
 }
 
 /// Success payload for the `approve gc` JSON envelope.
@@ -60,13 +71,15 @@ struct GcData {
     /// resolves to no saved profile.
     #[serde(skip_serializing_if = "Option::is_none")]
     profile: Option<String>,
-    /// Number of expired entries that were evicted.
+    /// Number of entries that were evicted: expired ones, and with
+    /// `--include-consumed` also consumed ones, each counted once.
     evicted_count: usize,
 }
 
 /// Runs `stellar-agent approve gc`.
 ///
-/// Evicts all expired entries from the pending-approvals store.
+/// Evicts all expired entries from the pending-approvals store, and every
+/// consumed entry when `include_consumed` is set.
 /// Returns `0` on success, `1` if the store cannot be opened.
 ///
 /// # Errors
@@ -122,8 +135,13 @@ pub async fn run(args: GcArgs) -> i32 {
         }
     };
 
-    // ── 5. GC expired entries ─────────────────────────────────────────────────
-    let evicted_count = match store.gc_expired(now_ms) {
+    // ── 5. GC expired (and, when asked, consumed) entries ────────────────────
+    let collected = if args.include_consumed {
+        store.gc_expired_and_consumed(now_ms)
+    } else {
+        store.gc_expired(now_ms)
+    };
+    let evicted_count = match collected {
         Ok(n) => n,
         Err(e) => {
             let err = WalletError::Approval(ApprovalFailure::GcFailed {
@@ -247,6 +265,7 @@ mod tests {
         // GC on an empty store evicts 0 entries and returns exit 0.
         let args = GcArgs {
             profile: Some("__stellar_agent_approve_test_gc_empty".to_owned()),
+            include_consumed: false,
         };
         let code = run(args).await;
         assert_eq!(code, 0, "gc on an empty store must succeed");
@@ -279,6 +298,7 @@ mod tests {
 
         let args = GcArgs {
             profile: Some(profile.to_owned()),
+            include_consumed: false,
         };
         let code = run(args).await;
         assert_eq!(code, 0, "gc run must exit 0 when store is accessible");
@@ -289,5 +309,65 @@ mod tests {
         // We can't easily introspect the count from the outside without re-running gc,
         // so we just assert that the test didn't panic and the code was 0.
         drop(store);
+    }
+
+    // ── --include-consumed selects the combined collection ───────────────────
+
+    /// `GcArgs` as the command line parses it.
+    #[derive(Debug, clap::Parser)]
+    struct GcCommand {
+        #[command(flatten)]
+        args: GcArgs,
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn flag_selects_the_combined_collection() {
+        use clap::Parser as _;
+        use stellar_agent_core::approval::{ApprovalKind, ConsumedOutcome};
+        let home = TempDir::new().unwrap();
+        let _home_guard = StellarAgentHomeGuard::new(home.path());
+        let profile = "__stellar_agent_approve_test_gc_consumed";
+        let path = default_approval_dir()
+            .unwrap()
+            .join(format!("{profile}.toml"));
+        let entry = make_entry(DEFAULT_TTL_MS);
+        let nonce = entry.approval_nonce.clone();
+        {
+            let mut store = PendingApprovalStore::open(path.clone()).unwrap();
+            store
+                .insert(entry, approval_gc_now_unix_ms().unwrap())
+                .unwrap();
+            assert!(
+                store
+                    .consume(&nonce, &"ab".repeat(32), ConsumedOutcome::Confirmed)
+                    .unwrap()
+            );
+        }
+
+        let default = GcCommand::try_parse_from(["gc", "--profile", profile]).unwrap();
+        assert!(!default.args.include_consumed);
+        assert_eq!(run(default.args).await, 0);
+        assert!(
+            matches!(
+                PendingApprovalStore::open(path.clone())
+                    .unwrap()
+                    .get(&nonce)
+                    .map(|e| &e.kind),
+                Some(ApprovalKind::Consumed { .. })
+            ),
+            "without the flag the consumed entry stays"
+        );
+
+        let flagged =
+            GcCommand::try_parse_from(["gc", "--profile", profile, "--include-consumed"]).unwrap();
+        assert!(flagged.args.include_consumed);
+        assert_eq!(run(flagged.args).await, 0);
+        let store = PendingApprovalStore::open(path).unwrap();
+        assert!(
+            store.get(&nonce).is_none(),
+            "the flag removes the consumed entry"
+        );
+        assert_eq!(store.len(), 0);
     }
 }

@@ -8,8 +8,8 @@ use std::collections::HashSet;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use stellar_agent_core::approval::{
-    AttestationBinding, AttestationScope, AttestedApprover, AttestedLifetime,
-    MAINNET_ATTESTATION_VERSION, load_attestation_key,
+    AttestationBinding, AttestationScope, AttestedApprover, AttestedLifetime, load_attestation_key,
+    mainnet_attestation_version,
     presence::MainnetPresenceReceipt,
     subject::{SubjectKind, length_prefixed},
     verify_attestation,
@@ -27,8 +27,10 @@ use super::operations::{
 use super::store::{PersistedWindowStore, RETENTION_MS, WIRE_VERSION_OPERATIONS, WireFile, now_ms};
 use crate::mainnet::{MainnetPrecondition, types::hex32};
 
-/// The longest execution window after consent, in milliseconds.
-pub const APPROVAL_EXECUTION_MAX_MS: u64 = 900_000;
+/// The longest execution window after consent, in milliseconds: the
+/// witness's own bound, so the record and the witness agree on it.
+pub const APPROVAL_EXECUTION_MAX_MS: u64 =
+    stellar_agent_core::approval::witness::APPROVAL_EXECUTION_MAX_MS;
 /// The longest approval rule lifetime, in milliseconds.
 pub const APPROVAL_RULE_TTL_MAX_MS: u64 = 86_400_000;
 /// The closed-record cap; records inside either window remain protected.
@@ -71,7 +73,8 @@ pub struct PendingApprovalFacts {
     pub rule_ttl_ms: u64,
 }
 
-/// The retained inputs for reconstructing the version 5 attestation.
+/// The retained inputs for reconstructing the consent attestation, under the
+/// version the record's subject kind selects.
 // The other inputs are the record's identity, subject, kind and signed times.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -665,8 +668,8 @@ fn verify_payload(
     let approver = AttestedApprover::MainnetPasskey {
         credential_id_b64url: payload.receipt.credential_id_b64url(),
     };
-    let scope = AttestationScope::pending(
-        MAINNET_ATTESTATION_VERSION,
+    let scope = AttestationScope::pending_for_subject(
+        mainnet_attestation_version(record.subject_kind),
         AttestedLifetime::new(
             inbox_kind(record.kind)?,
             record.created_at_ms,
@@ -674,6 +677,7 @@ fn verify_payload(
         ),
         Some(&approver),
         Some(&payload.receipt),
+        record.subject_kind,
     )
     .ok_or_else(|| unexpected("the approval attestation scope is invalid"))?;
     if !verify_attestation(
@@ -805,7 +809,7 @@ pub(in crate::policy_state) mod tests {
         mainnet_fixtures::{ATTESTATION_KEY, MainnetConsentFixture},
         store::{PendingApproval, PendingApprovalStore},
         subject::approval_subject_classic,
-        witness::{ApprovalExpectation, verify_approval},
+        witness::{ApprovalExpectation, verify_approval, verify_intent_approval},
     };
     use stellar_agent_core::audit_log::AuditEntry;
 
@@ -1231,6 +1235,130 @@ pub(in crate::policy_state) mod tests {
                 .record_consent(id, &fx.witness, &fx.payload)
                 .is_err()
         );
+    }
+
+    /// The durable record reconstructs an intent-digest consent under
+    /// version 6: the intent witness's genuine consent verifies and stores,
+    /// and a version 5 blob over the same facts refuses.
+    #[test]
+    #[serial]
+    fn durable_consent_selects_the_layout_by_subject_kind() {
+        let ttl = 300_000;
+        let fixture = MainnetConsentFixture::new("approvals");
+        let policy = fixture.current_policy();
+        let (mut entry, intent) = fixture.intent_payment(ttl);
+        entry.process_uid = "1000".to_owned();
+        let (inbox, surfaced) = fixture.intent_consent(&entry, &intent);
+        let attestation: [u8; 32] = URL_SAFE_NO_PAD
+            .decode(surfaced.unwrap())
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let receipt = inbox
+            .get(&entry.approval_nonce)
+            .unwrap()
+            .mainnet_presence
+            .clone()
+            .unwrap();
+        let witness = verify_intent_approval(
+            &inbox,
+            fixture.profile(),
+            fixture.name(),
+            &entry.approval_nonce,
+            &attestation,
+            &intent,
+            &fixture.decision(ttl),
+            &policy,
+            receipt.verified_at_unix_ms(),
+        )
+        .unwrap();
+        drop(inbox);
+        let _clock = set_now_ms_for_test(receipt.verified_at_unix_ms());
+        let store = PersistedWindowStore::at_path(
+            stellar_agent_core::profile::schema::default_policy_window_state_path_for(
+                fixture.name(),
+            ),
+        );
+        let digest = *intent.digest().as_bytes();
+        let mut rows = Rows::default();
+        let opened = OperationRecorder::new(&store, fixture.profile(), &mut rows, "request")
+            .open(&OpenRequest {
+                business_id: BusinessId::parse("order-6").unwrap(),
+                tool: OperationTool::CliPay,
+                kind: OperationKind::Pay,
+                intent: IntentSlot::Canonical {
+                    intent_digest: digest,
+                    intent: serde_json::json!({"op":"pay"}),
+                },
+                envelope_xdr: Some("AAAA".to_owned()),
+                prepared_decision: None,
+                rule_ttl_ms: Some(ttl),
+            })
+            .unwrap();
+        let OpenOutcome::New(handle) = opened else {
+            panic!("expected new operation")
+        };
+        let facts = PendingApprovalFacts {
+            nonce: witness.nonce().to_owned(),
+            kind: witness.kind(),
+            subject_kind: SubjectKind::IntentDigest,
+            subject: witness.subject(),
+            intent_digest: digest,
+            created_at_ms: witness.created_at_ms(),
+            waiting_expires_at_ms: witness.expires_at_ms(),
+            rule_ttl_ms: ttl,
+        };
+        assert_eq!(witness.subject(), digest);
+        let record = ApprovalRecorder::new(&store, fixture.profile(), &mut rows, "request")
+            .open_pending(handle.id(), &facts)
+            .unwrap()
+            .record;
+        let id = record.id;
+        let version_5 = stellar_agent_core::approval::compute_attestation_v5(
+            &ATTESTATION_KEY,
+            &fixture.binding(),
+            &record.nonce,
+            &record.subject,
+            &entry.process_uid,
+            &AttestedLifetime::new(
+                inbox_kind(record.kind).unwrap(),
+                record.created_at_ms,
+                record.waiting_expires_at_ms,
+            ),
+            &AttestedApprover::MainnetPasskey {
+                credential_id_b64url: receipt.credential_id_b64url(),
+            },
+            &receipt,
+        );
+        let before = std::fs::read(store.path()).unwrap();
+        let refused = ConsentPayload {
+            attestation: version_5,
+            receipt: receipt.clone(),
+            process_uid: entry.process_uid.clone(),
+        };
+        assert!(
+            ApprovalRecorder::new(&store, fixture.profile(), &mut rows, "request")
+                .record_consent(id, &witness, &refused)
+                .is_err(),
+            "a version 5 blob on an intent record"
+        );
+        assert_eq!(std::fs::read(store.path()).unwrap(), before);
+        let payload = ConsentPayload {
+            attestation,
+            receipt: receipt.clone(),
+            process_uid: entry.process_uid.clone(),
+        };
+        let view = ApprovalRecorder::new(&store, fixture.profile(), &mut rows, "request")
+            .record_consent(id, &witness, &payload)
+            .unwrap();
+        let consent = view.record.consent.unwrap();
+        assert_eq!(consent.consent_at_ms, receipt.verified_at_unix_ms());
+        assert_eq!(consent.execution_expires_at_ms, consent.consent_at_ms + ttl);
+        assert_eq!(
+            consent.execution_expires_at_ms,
+            witness.execution_expires_at_ms()
+        );
+        assert_eq!(consent.payload, Some(payload));
     }
 
     #[test]

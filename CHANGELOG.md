@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Pending approvals record a subject kind, `envelope-text` by default or
+  `intent-digest` for a payment, claim or trustline. Attestation version 6
+  binds a canonical intent digest, and each kind verifies under its own layout
+  only. The intent witness takes consent from the receipt's verified time and
+  ends execution at consent plus the smaller of 15 minutes and the governing
+  rule lifetime.
 - `scripts/deploy/` holds the scripts that run the mainnet wallet as a
   dedicated `stellar-agent` account with its platform keyring. They are a root
   bootstrap, three `sudo -u` wrappers, a sudoers source, and one validation
@@ -938,6 +944,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `approve gc --include-consumed` also removes consumed approval entries
+  before their TTL ends, so they stop counting toward the store's entry cap.
+  Plain `approve gc` removes expired entries only. The submission receipt keeps
+  refusing a spent nonce after its entry is gone.
 - The MCP server drains the audit outbox of every keyed writer it holds when
   it exits on client EOF, on SIGINT, or on SIGTERM on Unix. A consent, halt,
   or resume row queued while the server held the writer reaches the log at

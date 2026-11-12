@@ -6994,6 +6994,105 @@ mod tests {
         }
     }
 
+    /// Collecting the consumed inbox row leaves the durable approval record
+    /// untouched: the window file keeps its bytes and generation, another
+    /// operation still refuses, and so does a revoked record.
+    #[test]
+    #[serial]
+    fn inbox_gc_leaves_the_durable_approval_record() {
+        use super::super::approvals::{ApprovalState, tests::Fx};
+        use stellar_agent_core::approval::store::{
+            ApprovalKind, ConsumedOutcome, PendingApprovalStore,
+        };
+        let mut fx = Fx::new(300_000);
+        fx.open();
+        fx.consent();
+        let request = fx.mint_request();
+        let now = fx.payload.receipt.verified_at_unix_ms();
+        fx.store
+            .mint_authorization(fx.fixture.profile(), &request)
+            .unwrap();
+        let wire = fx.wire();
+        assert_eq!(
+            wire.approvals.as_ref().unwrap().records[0].state,
+            ApprovalState::Consumed
+        );
+        let before = fx.bytes();
+        let generation = wire.generation;
+
+        let inbox_path = fx.fixture.home().join("first.toml");
+        let mut inbox = PendingApprovalStore::open(inbox_path.clone()).unwrap();
+        assert!(
+            inbox
+                .consume(
+                    &fx.facts.nonce,
+                    &"ab".repeat(32),
+                    ConsumedOutcome::Confirmed
+                )
+                .unwrap()
+        );
+        assert!(matches!(
+            inbox.get(&fx.facts.nonce).unwrap().kind,
+            ApprovalKind::Consumed { .. }
+        ));
+        assert_eq!(inbox.gc_expired_and_consumed(now).unwrap(), 1);
+        drop(inbox);
+        assert!(
+            PendingApprovalStore::open(inbox_path)
+                .unwrap()
+                .get(&fx.facts.nonce)
+                .is_none(),
+            "the inbox row is gone"
+        );
+        assert_eq!(fx.bytes(), before, "the window file keeps its bytes");
+        assert_eq!(fx.wire().generation, generation);
+
+        // Isolate the consumed record's operation check from the live
+        // authorization of the first operation.
+        let mut other = request.clone();
+        other.operation.as_mut().unwrap().operation_id = OperationId::random();
+        let mut isolated = fx.wire();
+        isolated.authorizations.clear();
+        assert_eq!(
+            refusal(mint_into(
+                &mut isolated,
+                fx.fixture.profile(),
+                &other,
+                now + 1,
+                now + 100,
+                MintOptions::default()
+            )),
+            MainnetPrecondition::ApprovalNonceReused,
+            "another operation still refuses"
+        );
+        assert_eq!(fx.bytes(), before);
+
+        let id = fx.id();
+        assert_eq!(
+            fx.recorder().revoke(id).unwrap().record.state,
+            ApprovalState::Revoked
+        );
+        let mut wire = fx.wire();
+        wire.authorizations[0].state = AuthorizationState::Expired;
+        wire.authorizations[0].disposition = Some(Disposition::Unused);
+        let options = MintOptions {
+            exempt_cap: false,
+            lineage: Some(fx.operation),
+        };
+        assert_eq!(
+            refusal(mint_into(
+                &mut wire,
+                fx.fixture.profile(),
+                &request,
+                now + 1,
+                now + 100,
+                options
+            )),
+            MainnetPrecondition::ApprovalRevoked,
+            "a revoked record still refuses"
+        );
+    }
+
     #[test]
     #[serial]
     fn revoked_record_refuses_every_mint() {

@@ -1,16 +1,22 @@
-//! The approval witness: proof that a pending mainnet approval record,
-//! attested under version 5 with a verified WebAuthn presence, approves one
-//! subject, is live, and is still authorized by the current owner-signed
-//! policy when the witness is produced.
+//! The approval witness proves that a pending mainnet approval record
+//! approves one subject. The record carries a version 5 or 6 attestation
+//! with a verified WebAuthn presence: version 5 on an envelope-text record,
+//! version 6 on an intent-digest record. When the witness is produced, the
+//! record is live and the current owner-signed policy still authorizes it.
 //!
-//! [`verify_approval`] is the only producer. It reads the record from the
-//! pending store by nonce, the attestation key from the keyring, and the
-//! current signed policy from the wallet's own locations itself, derives the
-//! key coordinate and the owner context from the profile exactly as the
-//! approve path does, and accepts nothing else from its caller but the
-//! nonce, the presented attestation, the binding, the expectation, the
-//! policy the caller authorizes under, and the time. A witness therefore
-//! records facts the producer established, and its fields are private:
+//! [`verify_approval`] produces it for an envelope-text record, and
+//! [`verify_intent_approval`] for an intent-digest record. Each producer
+//! reads the record from the pending store by nonce. It reads the
+//! attestation key from the keyring and the current signed policy from the
+//! wallet's own locations. It derives the key coordinate and the owner
+//! context from the profile exactly as the approve path does.
+//!
+//! From its caller, each producer takes only the store, the profile, the
+//! nonce, the presented attestation, the policy the caller authorizes under,
+//! and the time. The envelope producer also takes the expected kind and
+//! subject. The intent producer also requires a canonical intent and a
+//! governing decision. A witness therefore records facts the producer
+//! establishes, and its fields are private:
 //!
 //! ```compile_fail,E0451
 //! use stellar_agent_core::approval::witness::ApprovalWitness;
@@ -52,13 +58,28 @@
 //! need::<ApprovalWitness>();
 //! ```
 //!
-//! # Mainnet only, version 5 only
+//! # Mainnet only, versions 5 and 6 only
 //!
-//! A witness is mainnet proof, and [`verify_approval`] refuses every binding
-//! that is not mainnet. The record must carry a version 5 attestation with a
-//! mainnet passkey approver and its presence receipt: a version 4 local or
-//! remote approval, which a terminal, a same-user process or the remote
-//! allowlist can produce, is no proof, however genuine its HMAC.
+//! A witness is mainnet proof, and both producers refuse every binding that
+//! is not mainnet. The record must carry a mainnet passkey approver and its
+//! presence receipt under the layout its subject kind selects. That is
+//! version 5 for the envelope text and version 6 for the intent digest. A
+//! version 4 local or remote approval, which a terminal, a same-user process
+//! or the remote allowlist can produce, is no proof, however genuine its
+//! HMAC. Each producer refuses the other subject kind with
+//! `approval.wrong_kind`.
+//!
+//! # Clocks
+//!
+//! A witness keeps the signed pending times, which its fact digest covers.
+//! It also reports the consent time, the receipt's verified time, and the
+//! exclusive execution expiry. An envelope witness has the signed expiry as
+//! its execution expiry and requires the pending lifetime to be live.
+//!
+//! An intent witness requires `created <= consent < waiting expiry` and
+//! `consent <= now < consent + min(900 s, governing TTL)`. It applies no
+//! pending-expiry check. A restart or a retry recomputes the same clocks
+//! from signed inputs, and nothing extends either one.
 //!
 //! # The current policy decides
 //!
@@ -74,13 +95,16 @@
 
 use super::attest::{decode_sha256_hex, load_attestation_key};
 use super::attestation::{AttestationBinding, AttestationScope, verify_attestation};
+use super::intent::ClassicIntent;
 use super::presence::MAINNET_CHAIN_ID;
 use super::presence_policy::{CurrentMainnetApprovalPolicy, MainnetApprovalAuthority};
-use super::store::{ApprovalKind, PendingApprovalStore};
-use super::subject::approval_subject_classic;
+use super::store::{ApprovalKind, PendingApproval, PendingApprovalStore};
+use super::subject::{SubjectKind, approval_subject_classic};
 use crate::error::{ApprovalFailure, WalletError};
+use crate::mainnet::decision::{AuthorityScope, MainnetDecision};
 use crate::mainnet::fact::{FACT_LABEL_APPROVAL, FactDigest};
 use crate::mainnet::verified_policy::VerifiedPolicy;
+use crate::policy::Decision;
 use crate::profile::caip2::Caip2;
 use crate::profile::owner_key::OwnerKeyContext;
 use crate::profile::schema::Profile;
@@ -126,9 +150,11 @@ pub struct ApprovalExpectation {
     pub subject: [u8; 32],
 }
 
-/// Proof that a version 5 attestation with a verified presence approves
-/// `subject`, was live at the time [`verify_approval`] checked it, and is
-/// authorized by the current owner-signed policy at that time.
+/// Proof that a version 5 or 6 attestation with a verified presence
+/// approves `subject`. [`verify_approval`] produces it for an envelope-text
+/// record under version 5, and [`verify_intent_approval`] for an
+/// intent-digest record under version 6. At production time, the record is
+/// live and the current owner-signed policy authorizes it.
 ///
 /// See the module documentation for the producer and the sealing.
 /// The `profile` field cannot be projected outside this crate.
@@ -222,6 +248,46 @@ pub struct ApprovalExpectation {
 /// need(None);
 /// ```
 ///
+/// The `subject_kind` field cannot be projected outside this crate.
+///
+/// ```compile_fail,E0616
+/// use stellar_agent_core::approval::witness::ApprovalWitness;
+/// fn inspect(p: &ApprovalWitness) { let _ = &p.subject_kind; }
+/// ```
+///
+/// ```
+/// use stellar_agent_core::approval::witness::ApprovalWitness;
+/// fn need(_: Option<ApprovalWitness>) {}
+/// need(None);
+/// ```
+///
+/// The `consent_at_ms` field cannot be projected outside this crate.
+///
+/// ```compile_fail,E0616
+/// use stellar_agent_core::approval::witness::ApprovalWitness;
+/// fn inspect(p: &ApprovalWitness) { let _ = &p.consent_at_ms; }
+/// ```
+///
+/// ```
+/// use stellar_agent_core::approval::witness::ApprovalWitness;
+/// fn need(_: Option<ApprovalWitness>) {}
+/// need(None);
+/// ```
+///
+/// The `execution_expires_at_ms` field cannot be projected outside this
+/// crate.
+///
+/// ```compile_fail,E0616
+/// use stellar_agent_core::approval::witness::ApprovalWitness;
+/// fn inspect(p: &ApprovalWitness) { let _ = &p.execution_expires_at_ms; }
+/// ```
+///
+/// ```
+/// use stellar_agent_core::approval::witness::ApprovalWitness;
+/// fn need(_: Option<ApprovalWitness>) {}
+/// need(None);
+/// ```
+///
 pub struct ApprovalWitness {
     profile: String,
     chain: Caip2,
@@ -232,7 +298,15 @@ pub struct ApprovalWitness {
     expires_at_ms: u64,
     presence_receipt_digest: [u8; 32],
     policy_digest: [u8; 32],
+    subject_kind: SubjectKind,
+    consent_at_ms: u64,
+    execution_expires_at_ms: u64,
 }
+
+/// The longest execution window after consent, in milliseconds. An intent
+/// witness expires at the consent time plus the shorter of this and the
+/// governing lifetime.
+pub const APPROVAL_EXECUTION_MAX_MS: u64 = 900_000;
 
 impl std::fmt::Debug for ApprovalWitness {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -241,6 +315,9 @@ impl std::fmt::Debug for ApprovalWitness {
             .field("chain", &self.chain.caip2_str())
             .field("kind", &self.kind)
             .field("expires_at_ms", &self.expires_at_ms)
+            .field("subject_kind", &self.subject_kind)
+            .field("consent_at_ms", &self.consent_at_ms)
+            .field("execution_expires_at_ms", &self.execution_expires_at_ms)
             .finish_non_exhaustive()
     }
 }
@@ -277,17 +354,41 @@ impl ApprovalWitness {
     }
 
     /// When the record was created, in Unix milliseconds, as the version 5
-    /// attestation covers it.
+    /// or 6 attestation covers it.
     #[must_use]
     pub fn created_at_ms(&self) -> u64 {
         self.created_at_ms
     }
 
-    /// When the approval expires, in Unix milliseconds: the stored expiry the
-    /// version 5 attestation covers.
+    /// When the pending record expires, in Unix milliseconds: the stored
+    /// expiry the version 5 or 6 attestation covers.
     #[must_use]
     pub fn expires_at_ms(&self) -> u64 {
         self.expires_at_ms
+    }
+
+    /// The binding convention of [`Self::subject`]: the envelope text for a
+    /// [`verify_approval`] witness, the canonical intent digest for a
+    /// [`verify_intent_approval`] witness.
+    #[must_use]
+    pub fn subject_kind(&self) -> SubjectKind {
+        self.subject_kind
+    }
+
+    /// When the operator consented, in Unix milliseconds: the verified time
+    /// of the presence receipt the attestation binds.
+    #[must_use]
+    pub fn consent_at_ms(&self) -> u64 {
+        self.consent_at_ms
+    }
+
+    /// The exclusive execution boundary, in Unix milliseconds. An envelope
+    /// witness reports its signed expiry. An intent witness reports the
+    /// consent time plus the shorter of [`APPROVAL_EXECUTION_MAX_MS`] and the
+    /// governing lifetime.
+    #[must_use]
+    pub fn execution_expires_at_ms(&self) -> u64 {
+        self.execution_expires_at_ms
     }
 
     /// The digest of the presence receipt the attestation binds.
@@ -339,8 +440,9 @@ fn invalid(detail: &str) -> WalletError {
 ///
 /// 1. `profile` must be a mainnet profile; every other chain refuses.
 /// 2. The record is read from `pending` by `nonce`. A rejected or consumed
-///    record refuses, and so does a kind other than the [`ApprovedKind`]s or
-///    other than `expected.kind`.
+///    record refuses. So does a kind other than the [`ApprovedKind`]s or
+///    other than `expected.kind`, and a record whose subject kind is not the
+///    envelope text.
 /// 3. The record must store attestation version 5 with a mainnet passkey
 ///    approver and a presence receipt for the same credential.
 /// 4. The subject is recomputed from the record; it must equal the stored
@@ -358,9 +460,11 @@ fn invalid(detail: &str) -> WalletError {
 ///    signs for the credential, over the challenge recomputed from the
 ///    record and the binding.
 ///
-/// The witness's expiry is the stored expiry. A caller that governs the
-/// approval by a shorter lifetime compares [`ApprovalWitness::created_at_ms`]
-/// and [`ApprovalWitness::expires_at_ms`] with it.
+/// The witness's expiry is the stored expiry, which is also its execution
+/// expiry, and its consent time is the receipt's verified time. A caller
+/// that governs the approval by a shorter lifetime compares
+/// [`ApprovalWitness::created_at_ms`] and [`ApprovalWitness::expires_at_ms`]
+/// with it.
 ///
 /// # Errors
 ///
@@ -421,6 +525,300 @@ pub(crate) fn verify_approval_with(
     now_ms: u64,
     current: impl FnOnce(&str) -> Result<CurrentMainnetApprovalPolicy, WalletError>,
 ) -> Result<ApprovalWitness, WalletError> {
+    let RecordFacts {
+        binding,
+        record,
+        kind,
+        subject,
+        stored_digest,
+    } = read_mainnet_record(pending, profile, profile_name, nonce)?;
+    if kind != expected.kind {
+        return Err(WalletError::Approval(ApprovalFailure::WrongKind {
+            detail: "the approval is for another kind of action".to_owned(),
+        }));
+    }
+    if record.subject_kind != SubjectKind::EnvelopeText {
+        return Err(WalletError::Approval(ApprovalFailure::WrongKind {
+            detail: "the approval binds a canonical intent".to_owned(),
+        }));
+    }
+    let Some(scope @ AttestationScope::V5(_, _, receipt)) = record.attestation_scope() else {
+        return Err(WalletError::Approval(ApprovalFailure::PresenceRequired));
+    };
+    if stored_digest != subject || subject != expected.subject {
+        return Err(invalid("the approval approves another transaction"));
+    }
+    let key = attestation_key(profile, profile_name)?;
+    if !verify_attestation(
+        &key,
+        &binding,
+        &record.approval_nonce,
+        &subject,
+        &record.process_uid,
+        &scope,
+        attestation,
+    ) {
+        return Err(invalid("the attestation does not verify"));
+    }
+    if record.created_at_unix_ms > now_ms || now_ms >= record.expires_at_unix_ms {
+        return Err(WalletError::Approval(ApprovalFailure::Expired {
+            detail: "the approval is outside its lifetime".to_owned(),
+        }));
+    }
+    let current = current(profile_name)?;
+    if current.profile().chain_id != profile.chain_id || !current.is(policy) {
+        return Err(WalletError::Approval(
+            ApprovalFailure::PresencePolicyUnavailable,
+        ));
+    }
+    let stored = verify_stored_mainnet_presence(record, receipt, &binding, policy, now_ms)?;
+    Ok(ApprovalWitness {
+        profile: profile_name.to_owned(),
+        chain: profile.chain_id,
+        nonce: record.approval_nonce.clone(),
+        kind,
+        subject,
+        created_at_ms: record.created_at_unix_ms,
+        expires_at_ms: record.expires_at_unix_ms,
+        presence_receipt_digest: stored.receipt_digest,
+        policy_digest: policy.digest(),
+        subject_kind: SubjectKind::EnvelopeText,
+        consent_at_ms: receipt.verified_at_unix_ms(),
+        execution_expires_at_ms: record.expires_at_unix_ms,
+    })
+}
+
+/// Verifies the approval `nonce` as mainnet proof for the canonical
+/// `intent` governed by `decision` under `policy`, and returns its witness.
+///
+/// In order:
+///
+/// 1. The first steps of [`verify_approval`] run unchanged: a mainnet
+///    profile, the record by `nonce`, its summary consistency, and a
+///    rejected, consumed or unsupported kind. An x402 record refuses.
+/// 2. The record's subject kind must be the intent digest, and its kind
+///    must be `intent`'s [`ClassicIntent::approved_kind`].
+/// 3. The record must store attestation version 6 with a mainnet passkey
+///    approver and its receipt. The stored envelope digest must equal the
+///    digest recomputed from the record. The attestation key loads as for
+///    [`verify_approval`], and the attestation must verify under version 6
+///    over `intent`'s digest.
+/// 4. `decision` must be `RequireApproval` with classic scope for this
+///    profile, the mainnet chain and `policy`'s digest, which `intent` must
+///    also name. Its governing lifetime must equal the signed lifetime.
+/// 5. The clocks of [`intent_clocks`] must hold at `now_ms`, with the
+///    receipt's verified time as the consent time. No pending-expiry check
+///    applies.
+/// 6. The current owner-signed policy is loaded again as for
+///    [`verify_approval`], and the receipt must verify again with `intent`.
+///
+/// The witness subject is `intent`'s digest. Its signed times are the
+/// record's, and its execution expiry is the consent time plus the shorter
+/// of [`APPROVAL_EXECUTION_MAX_MS`] and the governing lifetime.
+///
+/// # Errors
+///
+/// - The errors of [`verify_approval`]'s first steps.
+/// - `approval.wrong_kind` for an x402 record, an envelope-text record, or a
+///   record of another kind than `intent`'s.
+/// - `approval.presence_required` for a record without a version 6
+///   attestation, a mainnet passkey approver and its receipt.
+/// - `approval.attestation_invalid` for a subject mismatch, an attestation
+///   that does not verify, or a decision that does not govern this
+///   approval.
+/// - `approval.expired` when the consent or execution clock fails.
+/// - `approval.presence_policy_unavailable` and `approval.presence_invalid`
+///   as for [`verify_approval`].
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the producer takes each input it does not derive itself"
+)]
+pub fn verify_intent_approval(
+    pending: &PendingApprovalStore,
+    profile: &Profile,
+    profile_name: &str,
+    nonce: &str,
+    attestation: &[u8; 32],
+    intent: &ClassicIntent,
+    decision: &MainnetDecision,
+    policy: &VerifiedPolicy,
+    now_ms: u64,
+) -> Result<ApprovalWitness, WalletError> {
+    verify_intent_approval_with(
+        pending,
+        profile,
+        profile_name,
+        nonce,
+        attestation,
+        intent,
+        decision,
+        policy,
+        now_ms,
+        |name| MainnetApprovalAuthority::for_profile(name)?.load_current_compare_only(),
+    )
+}
+
+/// [`verify_intent_approval`] with the current policy read by `current`
+/// from the profile name.
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "the producer takes each input it does not derive itself, in its documented order"
+)]
+pub(crate) fn verify_intent_approval_with(
+    pending: &PendingApprovalStore,
+    profile: &Profile,
+    profile_name: &str,
+    nonce: &str,
+    attestation: &[u8; 32],
+    intent: &ClassicIntent,
+    decision: &MainnetDecision,
+    policy: &VerifiedPolicy,
+    now_ms: u64,
+    current: impl FnOnce(&str) -> Result<CurrentMainnetApprovalPolicy, WalletError>,
+) -> Result<ApprovalWitness, WalletError> {
+    let RecordFacts {
+        binding,
+        record,
+        kind,
+        subject,
+        stored_digest,
+    } = read_mainnet_record(pending, profile, profile_name, nonce)?;
+    if kind == ApprovedKind::X402Payment {
+        return Err(WalletError::Approval(ApprovalFailure::WrongKind {
+            detail: "an x402 approval binds no canonical intent".to_owned(),
+        }));
+    }
+    if record.subject_kind != SubjectKind::IntentDigest || kind != intent.approved_kind() {
+        return Err(WalletError::Approval(ApprovalFailure::WrongKind {
+            detail: "the approval does not bind this kind of intent".to_owned(),
+        }));
+    }
+    let Some(scope @ AttestationScope::V6(_, _, receipt)) = record.attestation_scope() else {
+        return Err(WalletError::Approval(ApprovalFailure::PresenceRequired));
+    };
+    if stored_digest != subject {
+        return Err(invalid("the approval approves another transaction"));
+    }
+    let key = attestation_key(profile, profile_name)?;
+    let intent_digest = *intent.digest().as_bytes();
+    if !verify_attestation(
+        &key,
+        &binding,
+        &record.approval_nonce,
+        &intent_digest,
+        &record.process_uid,
+        &scope,
+        attestation,
+    ) {
+        return Err(invalid("the attestation does not verify"));
+    }
+    let signed_lifetime = record
+        .expires_at_unix_ms
+        .checked_sub(record.created_at_unix_ms);
+    if !matches!(decision.decision(), Decision::RequireApproval(_))
+        || *decision.scope() != AuthorityScope::Classic
+        || decision.profile() != profile_name
+        || decision.chain_id() != binding.chain_id
+        || decision.policy_digest() != policy.digest()
+        || *intent.base().policy_digest() != policy.digest()
+        || signed_lifetime != Some(decision.governing_ttl_ms())
+    {
+        return Err(invalid("the decision does not govern this approval"));
+    }
+    let consent_at_ms = receipt.verified_at_unix_ms();
+    let execution_expires_at_ms = intent_clocks(
+        record.created_at_unix_ms,
+        record.expires_at_unix_ms,
+        consent_at_ms,
+        decision.governing_ttl_ms(),
+        now_ms,
+    )?;
+    let current = current(profile_name)?;
+    if current.profile().chain_id != profile.chain_id || !current.is(policy) {
+        return Err(WalletError::Approval(
+            ApprovalFailure::PresencePolicyUnavailable,
+        ));
+    }
+    let stored = super::presence::verify_receipt_for_intent(
+        record,
+        receipt,
+        &binding,
+        policy,
+        Some(intent),
+        now_ms,
+    )?;
+    Ok(ApprovalWitness {
+        profile: profile_name.to_owned(),
+        chain: profile.chain_id,
+        nonce: record.approval_nonce.clone(),
+        kind,
+        subject: intent_digest,
+        created_at_ms: record.created_at_unix_ms,
+        expires_at_ms: record.expires_at_unix_ms,
+        presence_receipt_digest: stored.receipt_digest,
+        policy_digest: policy.digest(),
+        subject_kind: SubjectKind::IntentDigest,
+        consent_at_ms,
+        execution_expires_at_ms,
+    })
+}
+
+/// The clocks of an intent approval, from signed inputs only.
+///
+/// Consent must fall in the waiting window, `created <= consent_at <
+/// waiting_expires`, and `now` in the execution window, `consent_at <= now <
+/// consent_at + min(APPROVAL_EXECUTION_MAX_MS, governing_ttl_ms)`. Both
+/// upper boundaries are exclusive. Returns the execution expiry, the same
+/// value at every call for the same inputs.
+///
+/// # Errors
+///
+/// `approval.expired` when either window fails or the arithmetic overflows.
+pub fn intent_clocks(
+    created: u64,
+    waiting_expires: u64,
+    consent_at: u64,
+    governing_ttl_ms: u64,
+    now: u64,
+) -> Result<u64, WalletError> {
+    let expired = |detail: &str| {
+        WalletError::Approval(ApprovalFailure::Expired {
+            detail: detail.to_owned(),
+        })
+    };
+    if consent_at < created || consent_at >= waiting_expires {
+        return Err(expired("the consent is outside the waiting window"));
+    }
+    let execution_expires = consent_at
+        .checked_add(APPROVAL_EXECUTION_MAX_MS.min(governing_ttl_ms))
+        .ok_or_else(|| expired("the execution clock overflows"))?;
+    if now < consent_at || now >= execution_expires {
+        return Err(expired("the approval is outside its execution window"));
+    }
+    Ok(execution_expires)
+}
+
+/// The facts every producer reads from the record before its own checks.
+struct RecordFacts<'a> {
+    binding: AttestationBinding<'a>,
+    record: &'a PendingApproval,
+    kind: ApprovedKind,
+    subject: [u8; 32],
+    stored_digest: [u8; 32],
+}
+
+/// The shared first steps of both producers, in order: a mainnet profile,
+/// the record by `nonce`, its summary consistency, and its kind. A rejected
+/// or consumed record and a kind that is no mainnet proof refuse. The
+/// subject is recomputed from the record: the envelope text's digest for a
+/// classic kind, the verified x402 subject for an x402 payment.
+fn read_mainnet_record<'a>(
+    pending: &'a PendingApprovalStore,
+    profile: &'a Profile,
+    profile_name: &'a str,
+    nonce: &str,
+) -> Result<RecordFacts<'a>, WalletError> {
     let chain_id = profile.chain_id.caip2_str();
     if chain_id != MAINNET_CHAIN_ID || !profile.chain_id.is_mainnet() {
         return Err(WalletError::Approval(ApprovalFailure::BindingMismatch {
@@ -494,17 +892,21 @@ pub(crate) fn verify_approval_with(
             }));
         }
     };
-    if kind != expected.kind {
-        return Err(WalletError::Approval(ApprovalFailure::WrongKind {
-            detail: "the approval is for another kind of action".to_owned(),
-        }));
-    }
-    let Some(scope @ AttestationScope::V5(_, _, receipt)) = record.attestation_scope() else {
-        return Err(WalletError::Approval(ApprovalFailure::PresenceRequired));
-    };
-    if stored_digest != subject || subject != expected.subject {
-        return Err(invalid("the approval approves another transaction"));
-    }
+    Ok(RecordFacts {
+        binding,
+        record,
+        kind,
+        subject,
+        stored_digest,
+    })
+}
+
+/// The attestation key of `profile`, refused when it is or may be the owner
+/// public key of `profile_name`.
+fn attestation_key(
+    profile: &Profile,
+    profile_name: &str,
+) -> Result<zeroize::Zeroizing<[u8; 32]>, WalletError> {
     let key = load_attestation_key(
         &profile.attestation_key_id,
         &OwnerKeyContext::for_profile(profile_name, profile),
@@ -514,41 +916,7 @@ pub(crate) fn verify_approval_with(
             detail: format!("attestation key must be 32 bytes, got {}", key.len()),
         })
     })?;
-    let key = zeroize::Zeroizing::new(key);
-    if !verify_attestation(
-        &key,
-        &binding,
-        &record.approval_nonce,
-        &subject,
-        &record.process_uid,
-        &scope,
-        attestation,
-    ) {
-        return Err(invalid("the attestation does not verify"));
-    }
-    if record.created_at_unix_ms > now_ms || now_ms >= record.expires_at_unix_ms {
-        return Err(WalletError::Approval(ApprovalFailure::Expired {
-            detail: "the approval is outside its lifetime".to_owned(),
-        }));
-    }
-    let current = current(profile_name)?;
-    if current.profile().chain_id != profile.chain_id || !current.is(policy) {
-        return Err(WalletError::Approval(
-            ApprovalFailure::PresencePolicyUnavailable,
-        ));
-    }
-    let stored = verify_stored_mainnet_presence(record, receipt, &binding, policy, now_ms)?;
-    Ok(ApprovalWitness {
-        profile: profile_name.to_owned(),
-        chain: profile.chain_id,
-        nonce: record.approval_nonce.clone(),
-        kind,
-        subject,
-        created_at_ms: record.created_at_unix_ms,
-        expires_at_ms: record.expires_at_unix_ms,
-        presence_receipt_digest: stored.receipt_digest,
-        policy_digest: policy.digest(),
-    })
+    Ok(zeroize::Zeroizing::new(key))
 }
 
 /// Verifies a stored presence receipt as the consent to `record` under
@@ -1275,5 +1643,696 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A mainnet consent to an intent-digest record through the production
+    /// attester, with the intent it binds and the signed entry.
+    struct IntentConsented {
+        store: PendingApprovalStore,
+        entry: PendingApproval,
+        intent: ClassicIntent,
+        blob: [u8; 32],
+        policy: VerifiedPolicy,
+    }
+
+    /// Consents to an intent payment that lives `ttl_ms`, after `edit`
+    /// adjusts the entry before it is inserted.
+    fn intent_consent(
+        fixture: &MainnetConsentFixture,
+        ttl_ms: u64,
+        edit: impl FnOnce(&mut PendingApproval),
+    ) -> IntentConsented {
+        let policy = fixture.current_policy();
+        let (mut entry, intent) = fixture.intent_payment(ttl_ms);
+        edit(&mut entry);
+        let (store, surfaced) = fixture.intent_consent(&entry, &intent);
+        let blob = URL_SAFE_NO_PAD
+            .decode(surfaced.expect("an intent consent surfaces its blob"))
+            .unwrap()
+            .try_into()
+            .unwrap();
+        IntentConsented {
+            store,
+            entry,
+            intent,
+            blob,
+            policy,
+        }
+    }
+
+    fn verify_intent(
+        fixture: &MainnetConsentFixture,
+        consented: &IntentConsented,
+        intent: &ClassicIntent,
+        decision: &MainnetDecision,
+        now_ms: u64,
+    ) -> Result<ApprovalWitness, WalletError> {
+        verify_intent_approval(
+            &consented.store,
+            fixture.profile(),
+            fixture.name(),
+            &consented.entry.approval_nonce,
+            &consented.blob,
+            intent,
+            decision,
+            &consented.policy,
+            now_ms,
+        )
+    }
+
+    /// The fixture store file with `edit` applied to the record `nonce`,
+    /// opened as a store at another path.
+    fn edited_store(
+        fixture: &MainnetConsentFixture,
+        nonce: &str,
+        name: &str,
+        edit: impl FnOnce(&mut toml_edit::Table),
+    ) -> PendingApprovalStore {
+        let text = std::fs::read_to_string(fixture.store_path()).unwrap();
+        let mut doc: toml_edit::DocumentMut = text.parse().unwrap();
+        let table = doc["pending"]
+            .as_array_of_tables_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|t| t["approval_nonce"].as_str() == Some(nonce))
+            .unwrap();
+        edit(table);
+        let path = fixture.home().join(name);
+        std::fs::write(&path, doc.to_string()).unwrap();
+        PendingApprovalStore::open(path).unwrap()
+    }
+
+    /// Editing the stored subject kind, with or without the version, makes
+    /// both producers refuse, for an envelope record and an intent record.
+    #[test]
+    #[serial]
+    fn a_flipped_subject_kind_refuses_in_both_directions() {
+        let fixture = MainnetConsentFixture::new(NAME);
+        let entry = fixture.payment(DEFAULT_TTL_MS);
+        let envelope = consent(&fixture, &entry);
+        assert!(
+            verify(
+                &fixture,
+                &envelope,
+                &payment_expectation(&entry),
+                &envelope.policy,
+                now()
+            )
+            .is_ok()
+        );
+        let Consented {
+            store,
+            blob: envelope_blob,
+            ..
+        } = envelope;
+        drop(store);
+        let intents = intent_consent(&fixture, 3_600_000, |_| {});
+        let decision = fixture.decision(3_600_000);
+        assert!(verify_intent(&fixture, &intents, &intents.intent, &decision, now()).is_ok());
+
+        /// A label, the record it edits, the edit, and the codes the envelope
+        /// and intent producers answer.
+        type FlipCase = (
+            &'static str,
+            &'static str,
+            fn(&mut toml_edit::Table),
+            &'static str,
+            &'static str,
+        );
+        let cases: [FlipCase; 4] = [
+            (
+                "envelope to intent",
+                "envelope",
+                |t| {
+                    t["subject_kind"] = toml_edit::value("intent-digest");
+                },
+                "approval.wrong_kind",
+                "approval.presence_required",
+            ),
+            (
+                "envelope to intent with version 6",
+                "envelope",
+                |t| {
+                    t["subject_kind"] = toml_edit::value("intent-digest");
+                    t["attestation_version"] = toml_edit::value(6);
+                },
+                "approval.wrong_kind",
+                "approval.attestation_invalid",
+            ),
+            (
+                "intent to envelope",
+                "intent",
+                |t| {
+                    assert!(t.remove("subject_kind").is_some());
+                },
+                "approval.presence_required",
+                "approval.wrong_kind",
+            ),
+            (
+                "intent to envelope with version 5",
+                "intent",
+                |t| {
+                    assert!(t.remove("subject_kind").is_some());
+                    t["attestation_version"] = toml_edit::value(5);
+                },
+                "approval.attestation_invalid",
+                "approval.wrong_kind",
+            ),
+        ];
+        for (index, (label, record, edit, envelope_code, intent_code)) in
+            cases.into_iter().enumerate()
+        {
+            let (record, blob) = match record {
+                "envelope" => (&entry, envelope_blob),
+                _ => (&intents.entry, intents.blob),
+            };
+            let nonce = record.approval_nonce.as_str();
+            let store = edited_store(&fixture, nonce, &format!("flip{index}.toml"), edit);
+            let envelope_result = verify_approval(
+                &store,
+                fixture.profile(),
+                fixture.name(),
+                nonce,
+                &blob,
+                &payment_expectation(record),
+                &intents.policy,
+                now(),
+            );
+            assert_eq!(
+                envelope_result.unwrap_err().code(),
+                envelope_code,
+                "{label}"
+            );
+            let intent_result = verify_intent_approval(
+                &store,
+                fixture.profile(),
+                fixture.name(),
+                nonce,
+                &blob,
+                &intents.intent,
+                &decision,
+                &intents.policy,
+                now(),
+            );
+            assert_eq!(intent_result.unwrap_err().code(), intent_code, "{label}");
+        }
+    }
+
+    /// An intent witness takes its consent time from the receipt, 60 s
+    /// after the record's creation. Its execution expiry is the consent plus
+    /// the capped governing lifetime. Its signed times stay the record's, and
+    /// its subject is the intent digest.
+    #[test]
+    #[serial]
+    fn intent_witness_uses_receipt_time_and_governing_ttl() {
+        for (ttl_ms, window_ms) in [(86_400_000, 900_000), (300_000, 300_000)] {
+            let fixture = MainnetConsentFixture::new(NAME);
+            let consented = intent_consent(&fixture, ttl_ms, |entry| {
+                entry.created_at_unix_ms -= 60_000;
+                entry.expires_at_unix_ms -= 60_000;
+            });
+            let receipt = receipt_of(&consented.store, &consented.entry.approval_nonce);
+            let consent_at = receipt.verified_at_unix_ms();
+            assert!(
+                consent_at >= consented.entry.created_at_unix_ms + 60_000,
+                "consent follows creation by at least 60 s"
+            );
+            let witness = verify_intent(
+                &fixture,
+                &consented,
+                &consented.intent,
+                &fixture.decision(ttl_ms),
+                consent_at,
+            )
+            .unwrap();
+            assert_eq!(witness.subject_kind(), SubjectKind::IntentDigest);
+            assert_eq!(witness.consent_at_ms(), consent_at, "{ttl_ms}");
+            assert_eq!(
+                witness.execution_expires_at_ms(),
+                consent_at + window_ms,
+                "{ttl_ms}"
+            );
+            assert_eq!(witness.created_at_ms(), consented.entry.created_at_unix_ms);
+            assert_eq!(witness.expires_at_ms(), consented.entry.expires_at_unix_ms);
+            assert_eq!(
+                witness.expires_at_ms() - witness.created_at_ms(),
+                ttl_ms,
+                "the signed lifetime is the rule lifetime"
+            );
+            assert_eq!(witness.subject(), *consented.intent.digest().as_bytes());
+            assert_eq!(witness.kind(), ApprovedKind::Payment);
+            assert_eq!(witness.nonce(), consented.entry.approval_nonce);
+            assert_eq!(witness.presence_receipt_digest(), receipt.digest().unwrap());
+            assert_eq!(witness.policy_digest(), consented.policy.digest());
+        }
+    }
+
+    /// An intent consented 60 s after its creation under a 300 s rule
+    /// verifies after a reopen and twice past its waiting expiry. The clocks
+    /// stay the same, and the witness refuses at its execution expiry.
+    #[test]
+    #[serial]
+    fn intent_witness_restarts_after_waiting_expiry() {
+        let fixture = MainnetConsentFixture::new(NAME);
+        let consented = intent_consent(&fixture, 300_000, |entry| {
+            entry.created_at_unix_ms -= 60_000;
+            entry.expires_at_unix_ms -= 60_000;
+        });
+        let decision = fixture.decision(300_000);
+        let nonce = consented.entry.approval_nonce.clone();
+        let consent_at = receipt_of(&consented.store, &nonce).verified_at_unix_ms();
+        let waiting = consented.entry.expires_at_unix_ms;
+        let execution = consent_at + 300_000;
+        assert!(consent_at >= consented.entry.created_at_unix_ms + 60_000);
+        assert!(execution > waiting + 59_000);
+        let IntentConsented {
+            store,
+            entry,
+            intent,
+            blob,
+            policy,
+        } = consented;
+        drop(store);
+        let reopened = IntentConsented {
+            store: PendingApprovalStore::open(fixture.store_path()).unwrap(),
+            entry,
+            intent,
+            blob,
+            policy,
+        };
+        let mut clocks = Vec::new();
+        for at in [waiting, waiting + 59_000] {
+            let witness =
+                verify_intent(&fixture, &reopened, &reopened.intent, &decision, at).unwrap();
+            clocks.push((
+                witness.created_at_ms(),
+                witness.expires_at_ms(),
+                witness.consent_at_ms(),
+                witness.execution_expires_at_ms(),
+            ));
+        }
+        assert_eq!(clocks[0], clocks[1], "a retry recomputes identical clocks");
+        assert_eq!(
+            clocks[0],
+            (
+                reopened.entry.created_at_unix_ms,
+                waiting,
+                consent_at,
+                execution
+            )
+        );
+        assert_eq!(
+            verify_intent(&fixture, &reopened, &reopened.intent, &decision, execution)
+                .unwrap_err()
+                .code(),
+            "approval.expired"
+        );
+    }
+
+    /// The pure clocks refuse at both exclusive boundaries and before the
+    /// lower ones, for an uncapped and a capped governing lifetime.
+    #[test]
+    fn intent_clocks_check_both_exclusive_boundaries() {
+        let created = 1_000_000;
+        for (ttl, window) in [(86_400_000, 900_000), (300_000, 300_000)] {
+            let waiting = created + ttl;
+            let expired = |result: Result<u64, WalletError>| {
+                assert_eq!(result.unwrap_err().code(), "approval.expired", "{ttl}");
+            };
+            expired(intent_clocks(created, waiting, waiting, ttl, waiting));
+            expired(intent_clocks(created, waiting, created - 1, ttl, created));
+            assert_eq!(
+                intent_clocks(created, waiting, waiting - 1, ttl, waiting - 1).unwrap(),
+                waiting - 1 + window
+            );
+            assert_eq!(
+                intent_clocks(created, waiting, created, ttl, created).unwrap(),
+                created + window
+            );
+            let consent = created + 10_000;
+            let execution = consent + window;
+            expired(intent_clocks(created, waiting, consent, ttl, consent - 1));
+            assert_eq!(
+                intent_clocks(created, waiting, consent, ttl, execution - 1).unwrap(),
+                execution,
+                "{ttl}"
+            );
+            expired(intent_clocks(created, waiting, consent, ttl, execution));
+            expired(intent_clocks(created, waiting, consent, ttl, execution + 1));
+        }
+        assert_eq!(
+            intent_clocks(1, u64::MAX, u64::MAX - 1, 300_000, u64::MAX - 1)
+                .unwrap_err()
+                .code(),
+            "approval.expired",
+            "an overflowing execution clock refuses"
+        );
+    }
+
+    /// The intent witness reverifies the intent, the decision and the
+    /// stored receipt: each mismatch refuses on its own, and the matching
+    /// set yields the witness.
+    #[test]
+    #[serial]
+    #[allow(clippy::too_many_lines, reason = "one case per refused input")]
+    fn intent_witness_reverifies_intent_decision_and_receipt() {
+        use crate::approval::intent::{IntentAsset, IntentBase, IntentPayload};
+        use crate::policy::{ApprovalRequest, Decision};
+        let fixture = MainnetConsentFixture::new(NAME);
+        let decision = fixture.decision(3_600_000);
+        let (_, any_intent) = fixture.intent_payment(3_600_000);
+        let envelope_entry = fixture.payment(DEFAULT_TTL_MS);
+        let envelope = consent(&fixture, &envelope_entry);
+        assert_eq!(
+            verify_intent_approval(
+                &envelope.store,
+                fixture.profile(),
+                fixture.name(),
+                &envelope.nonce,
+                &envelope.blob,
+                &any_intent,
+                &decision,
+                &envelope.policy,
+                now(),
+            )
+            .unwrap_err()
+            .code(),
+            "approval.wrong_kind",
+            "an envelope-text record"
+        );
+        drop(envelope);
+        let consented = intent_consent(&fixture, 3_600_000, |_| {});
+        let at = now();
+        assert!(verify_intent(&fixture, &consented, &consented.intent, &decision, at).is_ok());
+        let base = consented.intent.base();
+        let intent_with = |payload: IntentPayload, policy_digest: [u8; 32]| {
+            ClassicIntent::new(
+                IntentBase::new(
+                    base.chain_id().to_owned(),
+                    base.source().to_owned(),
+                    policy_digest,
+                    base.fee_bound_stroops(),
+                    base.memo().clone(),
+                )
+                .unwrap(),
+                payload,
+            )
+            .unwrap()
+        };
+        let other_amount = intent_with(
+            IntentPayload::Pay {
+                destination: crate::approval::mainnet_fixtures::ALLOWED_DESTINATION.to_owned(),
+                asset: IntentAsset::Native,
+                amount_stroops: 11,
+            },
+            consented.policy.digest(),
+        );
+        let trustline = intent_with(
+            IntentPayload::Trustline {
+                issuer: crate::approval::mainnet_fixtures::ALLOWED_DESTINATION.to_owned(),
+                code: "USDC".to_owned(),
+                limit_stroops: 0,
+            },
+            consented.policy.digest(),
+        );
+        for (label, intent, code) in [
+            (
+                "another intent",
+                &other_amount,
+                "approval.attestation_invalid",
+            ),
+            ("another kind", &trustline, "approval.wrong_kind"),
+        ] {
+            assert_eq!(
+                verify_intent(&fixture, &consented, intent, &decision, at)
+                    .unwrap_err()
+                    .code(),
+                code,
+                "{label}"
+            );
+        }
+
+        let decided = |decision: Decision,
+                       policy_digest: [u8; 32],
+                       profile: &str,
+                       chain: &str,
+                       ttl: u64,
+                       scope: AuthorityScope| {
+            MainnetDecision::for_test(
+                decision,
+                None,
+                policy_digest,
+                consented.policy.sequence(),
+                0,
+                profile,
+                chain,
+                at,
+                ttl,
+                scope,
+            )
+        };
+        let require = || Decision::RequireApproval(ApprovalRequest::new("d".to_owned(), 3_600));
+        let digest = consented.policy.digest();
+        let decisions = [
+            (
+                "allow",
+                decided(
+                    Decision::Allow,
+                    digest,
+                    NAME,
+                    MAINNET_CHAIN_ID,
+                    3_600_000,
+                    AuthorityScope::Classic,
+                ),
+            ),
+            (
+                "another profile",
+                decided(
+                    require(),
+                    digest,
+                    "other",
+                    MAINNET_CHAIN_ID,
+                    3_600_000,
+                    AuthorityScope::Classic,
+                ),
+            ),
+            (
+                "another chain",
+                decided(
+                    require(),
+                    digest,
+                    NAME,
+                    "stellar:testnet",
+                    3_600_000,
+                    AuthorityScope::Classic,
+                ),
+            ),
+            (
+                "another policy",
+                decided(
+                    require(),
+                    [0x77; 32],
+                    NAME,
+                    MAINNET_CHAIN_ID,
+                    3_600_000,
+                    AuthorityScope::Classic,
+                ),
+            ),
+            (
+                "another governing lifetime",
+                decided(
+                    require(),
+                    digest,
+                    NAME,
+                    MAINNET_CHAIN_ID,
+                    3_599_999,
+                    AuthorityScope::Classic,
+                ),
+            ),
+            (
+                "another scope",
+                decided(
+                    require(),
+                    digest,
+                    NAME,
+                    MAINNET_CHAIN_ID,
+                    3_600_000,
+                    AuthorityScope::X402Authenticated {
+                        home_domain: "example.com".to_owned(),
+                        tool: "stellar_x402_create_payment".to_owned(),
+                    },
+                ),
+            ),
+        ];
+        for (label, other) in &decisions {
+            assert_eq!(
+                verify_intent(&fixture, &consented, &consented.intent, other, at)
+                    .unwrap_err()
+                    .code(),
+                "approval.attestation_invalid",
+                "{label}"
+            );
+        }
+
+        // A record whose blob the key holder recomputed over an intent that
+        // names another policy, or over a receipt whose assertion fails,
+        // refuses although its attestation verifies.
+        let genuine = receipt_of(&consented.store, &consented.entry.approval_nonce);
+        let mut wire = serde_json::to_value(&genuine).unwrap();
+        let client = wire["assertion"]["client_data_json"]
+            .as_array_mut()
+            .unwrap();
+        assert_eq!(client.pop().unwrap(), serde_json::json!(b'}'));
+        client.extend(b",\"extra\":1}".iter().map(|b| serde_json::json!(b)));
+        let altered: MainnetPresenceReceipt = serde_json::from_value(wire).unwrap();
+        assert!(altered.is_well_formed());
+        let foreign_policy = intent_with(consented.intent.payload().clone(), [0x77; 32]);
+        for (index, (label, receipt, intent, code)) in [
+            (
+                "an invalid stored assertion",
+                altered,
+                &consented.intent,
+                "approval.presence_invalid",
+            ),
+            (
+                "an intent of another policy",
+                genuine.clone(),
+                &foreign_policy,
+                "approval.attestation_invalid",
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let entry = &consented.entry;
+            let approver = AttestedApprover::MainnetPasskey {
+                credential_id_b64url: receipt.credential_id_b64url(),
+            };
+            let blob = crate::approval::attestation::compute_attestation_v6(
+                &ATTESTATION_KEY,
+                &fixture.binding(),
+                &entry.approval_nonce,
+                intent.digest().as_bytes(),
+                &entry.process_uid,
+                &entry.attested_lifetime(),
+                &approver,
+                &receipt,
+            );
+            let mut store =
+                PendingApprovalStore::open(fixture.home().join(format!("forged{index}.toml")))
+                    .unwrap();
+            store.insert(entry.clone(), now()).unwrap();
+            store
+                .record_mainnet_attestation_at(
+                    &entry.approval_nonce,
+                    blob,
+                    approver,
+                    receipt,
+                    now(),
+                )
+                .unwrap();
+            assert_eq!(
+                store
+                    .get(&entry.approval_nonce)
+                    .unwrap()
+                    .attestation_version,
+                6
+            );
+            let forged = IntentConsented {
+                store,
+                entry: entry.clone(),
+                intent: intent.clone(),
+                blob,
+                policy: consented.policy.clone(),
+            };
+            assert_eq!(
+                verify_intent(&fixture, &forged, intent, &decision, now())
+                    .unwrap_err()
+                    .code(),
+                code,
+                "{label}"
+            );
+        }
+        assert!(verify_intent(&fixture, &consented, &consented.intent, &decision, now()).is_ok());
+    }
+
+    /// Producing an intent witness and reopening the store leave the inbox
+    /// bytes unchanged, and the fact digest follows the documented layout
+    /// over the signed times.
+    #[test]
+    #[serial]
+    fn intent_witness_keeps_signed_bytes_and_fact_digest_layout() {
+        let fixture = MainnetConsentFixture::new(NAME);
+        let consented = intent_consent(&fixture, 3_600_000, |_| {});
+        let decision = fixture.decision(3_600_000);
+        let before = std::fs::read(fixture.store_path()).unwrap();
+        let witness =
+            verify_intent(&fixture, &consented, &consented.intent, &decision, now()).unwrap();
+        assert_eq!(std::fs::read(fixture.store_path()).unwrap(), before);
+        let IntentConsented {
+            store,
+            entry,
+            intent,
+            blob,
+            policy,
+        } = consented;
+        drop(store);
+        let reopened = IntentConsented {
+            store: PendingApprovalStore::open(fixture.store_path()).unwrap(),
+            entry,
+            intent,
+            blob,
+            policy,
+        };
+        let again = verify_intent(&fixture, &reopened, &reopened.intent, &decision, now()).unwrap();
+        assert_eq!(std::fs::read(fixture.store_path()).unwrap(), before);
+        assert_eq!(again.fact_digest(), witness.fact_digest());
+
+        let receipt = receipt_of(&reopened.store, &reopened.entry.approval_nonce);
+        let mut preimage = FACT_LABEL_APPROVAL.to_vec();
+        for field in [
+            NAME.as_bytes(),
+            b"stellar:mainnet",
+            reopened.entry.approval_nonce.as_bytes(),
+        ] {
+            preimage.extend(u32::try_from(field.len()).unwrap().to_be_bytes());
+            preimage.extend(field);
+        }
+        preimage.push(1);
+        preimage.extend(reopened.intent.digest().as_bytes());
+        preimage.extend(reopened.entry.created_at_unix_ms.to_be_bytes());
+        preimage.extend(reopened.entry.expires_at_unix_ms.to_be_bytes());
+        preimage.extend(receipt.digest().unwrap());
+        preimage.extend(reopened.policy.digest());
+        let independent: [u8; 32] = sha2::Sha256::digest(&preimage).into();
+        assert_eq!(witness.fact_digest(), independent);
+        assert_eq!(witness.created_at_ms(), reopened.entry.created_at_unix_ms);
+        assert_eq!(witness.expires_at_ms(), reopened.entry.expires_at_unix_ms);
+        assert_ne!(
+            witness.expires_at_ms(),
+            witness.execution_expires_at_ms(),
+            "the signed expiry and the execution expiry differ here"
+        );
+    }
+
+    /// An envelope witness reports the envelope text, the receipt's verified
+    /// time as consent, and the signed expiry as its execution expiry.
+    #[test]
+    #[serial]
+    fn envelope_witness_reports_its_pending_lifetime() {
+        let fixture = MainnetConsentFixture::new(NAME);
+        let entry = fixture.payment(DEFAULT_TTL_MS);
+        let consented = consent(&fixture, &entry);
+        let expected = payment_expectation(&entry);
+        let witness = verify(&fixture, &consented, &expected, &consented.policy, now()).unwrap();
+        let receipt = receipt_of(&consented.store, &consented.nonce);
+        assert_eq!(witness.subject_kind(), SubjectKind::EnvelopeText);
+        assert_eq!(witness.consent_at_ms(), receipt.verified_at_unix_ms());
+        assert_eq!(witness.execution_expires_at_ms(), entry.expires_at_unix_ms);
+        assert_eq!(witness.expires_at_ms(), entry.expires_at_unix_ms);
+        assert!(
+            witness.execution_expires_at_ms() - witness.consent_at_ms() > APPROVAL_EXECUTION_MAX_MS,
+            "the execution cap does not apply to an envelope witness"
+        );
     }
 }

@@ -35,7 +35,9 @@
 //! locked entry against the challenged snapshot and reloads the current policy.
 //! It refuses a receipt whose signed-origin listener serves another policy.
 //! It verifies the receipt again and checks both challenge deadlines immediately
-//! before the row. It records a version 5 attestation with its receipt. The
+//! before the row. It records a version 5 attestation on an envelope-text
+//! record and a version 6 attestation on an intent-digest record, each with
+//! its receipt. The
 //! remote surface records mainnet consent only from the signed-origin
 //! listener.
 //! After the row is durable, the keyring anchor advance and store record can
@@ -60,13 +62,13 @@ use crate::timefmt;
 use crate::envelope_decode::{ClassicSummary, ClassicTransactionKind, classic_summary};
 
 use super::attestation::{
-    AttestedApprover, compute_attestation_v4, compute_attestation_v5,
+    AttestedApprover, compute_attestation_v4, compute_attestation_v5, compute_attestation_v6,
     compute_trustline_clawback_opt_in_digest,
 };
 use super::error::ApprovalError;
 use super::presence::{MAINNET_CHAIN_ID, VerifiedMainnetPresence};
 use super::store::{ApprovalKind, PendingApproval, PendingApprovalStore};
-use super::subject::approval_subject_classic;
+use super::subject::{SubjectKind, approval_subject_classic};
 use super::user_id::ApproverIdentity;
 use crate::mainnet::verified_policy::VerifiedPolicy;
 
@@ -989,7 +991,7 @@ fn prepare_attestation<'k>(
 /// The caller validated `validated` earlier, possibly through another store
 /// handle, and another process may have attested, rejected, consumed, or
 /// replaced it since. The same pending entry means the whole `kind` value,
-/// the `process_uid`, and both lifetime fields are equal. Each refusal carries the code
+/// the subject kind, the `process_uid`, and both lifetime fields are equal. Each refusal carries the code
 /// [`record_attestation_on_store`] gives for the same condition, so a caller
 /// maps both the same way. No row is written for a refused entry.
 pub(crate) fn refuse_unless_still_pending(
@@ -1001,6 +1003,7 @@ pub(crate) fn refuse_unless_still_pending(
         return Err(record_error(&ApprovalError::NotFound));
     };
     if current.kind != validated.kind
+        || current.subject_kind != validated.subject_kind
         || current.process_uid != validated.process_uid
         || current.created_at_unix_ms != validated.created_at_unix_ms
         || current.expires_at_unix_ms != validated.expires_at_unix_ms
@@ -1032,9 +1035,11 @@ pub(crate) fn refuse_unless_still_pending(
 /// Attests a direct mainnet confirmation of a classic transaction with its
 /// verified presence, after rechecking the pending record.
 ///
-/// The consent is the version 5 attestation [`attest_and_persist`] records
-/// for [`ConsentAuthorization::Mainnet`], under [`Surface::CliMainnetConfirm`]
-/// and `gated_tool`; the row is durable before the attestation is persisted.
+/// The consent is the attestation [`attest_and_persist`] records for
+/// [`ConsentAuthorization::Mainnet`], under [`Surface::CliMainnetConfirm`]
+/// and `gated_tool`. It is version 5 on an envelope-text record and version
+/// 6 on an intent-digest record. The row is durable before the attestation
+/// is persisted.
 ///
 /// # Errors
 /// `approval.wrong_kind` for a kind other than a payment, claim or trustline;
@@ -1111,12 +1116,15 @@ fn mainnet_gated_tool(kind: &ApprovalKind) -> Result<&'static str, WalletError> 
 ///    policy. The loaded policy is `policy` and is the policy the challenge
 ///    bound.
 /// 4. The receipt verifies again over the locked entry: the recomputed
-///    subject and challenge, the raw assertion under the signed key.
+///    subject and challenge, the raw assertion under the signed key. The
+///    locked entry's subject kind selects the consent. The envelope text
+///    signs under version 5 with no intent. The canonical intent digest
+///    signs under version 6 and needs a classic kind and the bound intent.
 /// 5. Both challenge deadlines are still live, checked immediately before
 ///    the row because the keyring, policy and audit waits can cross them.
 ///
-/// Then the row, then one store replacement with the version 5 blob, the
-/// mainnet passkey approver and the receipt.
+/// Then the row, then one store replacement with the blob, the mainnet
+/// passkey approver and the receipt.
 #[allow(
     clippy::too_many_arguments,
     reason = "the store, entry, key, binding, surface, sink, proof, policy and tool are each explicit"
@@ -1188,22 +1196,62 @@ fn attest_mainnet_presence(
         ));
     }
 
-    let subject = super::presence::mainnet_consent_subject(&current, binding)?;
-    let stored =
-        super::presence::verify_receipt(&current, &parts.receipt, binding, policy, now_ms)?;
     let approver = AttestedApprover::MainnetPasskey {
         credential_id_b64url: parts.receipt.credential_id_b64url(),
     };
-    let attestation_blob = compute_attestation_v5(
-        key,
-        binding,
-        &current.approval_nonce,
-        &subject,
-        &current.process_uid,
-        &current.attested_lifetime(),
-        &approver,
-        &parts.receipt,
-    );
+    let (subject, stored, attestation_blob) = match current.subject_kind {
+        SubjectKind::EnvelopeText => {
+            let subject = super::presence::mainnet_consent_subject(&current, binding)?;
+            let stored =
+                super::presence::verify_receipt(&current, &parts.receipt, binding, policy, now_ms)?;
+            let attestation_blob = compute_attestation_v5(
+                key,
+                binding,
+                &current.approval_nonce,
+                &subject,
+                &current.process_uid,
+                &current.attested_lifetime(),
+                &approver,
+                &parts.receipt,
+            );
+            (subject, stored, attestation_blob)
+        }
+        SubjectKind::IntentDigest => {
+            if !matches!(
+                current.kind,
+                ApprovalKind::PaymentSimulated { .. }
+                    | ApprovalKind::ClaimSimulated { .. }
+                    | ApprovalKind::TrustlineSimulated { .. }
+            ) {
+                return Err(WalletError::Approval(ApprovalFailure::WrongKind {
+                    detail: "an intent consent requires a classic transaction".to_owned(),
+                }));
+            }
+            let Some(intent) = parts.intent.as_ref() else {
+                return Err(WalletError::Approval(ApprovalFailure::PresenceInvalid));
+            };
+            let subject = *intent.digest().as_bytes();
+            let stored = super::presence::verify_receipt_for_intent(
+                &current,
+                &parts.receipt,
+                binding,
+                policy,
+                Some(intent),
+                now_ms,
+            )?;
+            let attestation_blob = compute_attestation_v6(
+                key,
+                binding,
+                &current.approval_nonce,
+                &subject,
+                &current.process_uid,
+                &current.attested_lifetime(),
+                &approver,
+                &parts.receipt,
+            );
+            (subject, stored, attestation_blob)
+        }
+    };
     let envelope_sha256_hex = match &current.kind {
         ApprovalKind::PaymentSimulated {
             envelope_sha256_hex,
@@ -3013,6 +3061,101 @@ mod tests {
                     "{kind} case {case}"
                 );
                 assert!(consent_rows(&dir).is_empty(), "{kind} case {case}");
+            }
+        }
+    }
+
+    /// An intent ceremony on an intent-digest record stores version 6. An
+    /// intent ceremony on an envelope record, an envelope ceremony on an
+    /// intent record, and a subject-kind edit before the attest each refuse
+    /// with no row and no attestation.
+    #[test]
+    #[serial_test::serial]
+    fn intent_consent_records_version_6_only_for_intent_records() {
+        use crate::approval::mainnet_fixtures::{ATTESTATION_KEY, MainnetConsentFixture};
+        use crate::approval::subject::SubjectKind;
+        let fixture = MainnetConsentFixture::new("confirm");
+        let policy = fixture.current_policy();
+        let (intent_entry, intent) = fixture.intent_payment(DEFAULT_TTL_MS);
+        let envelope_entry = fixture.payment(DEFAULT_TTL_MS);
+        assert_eq!(envelope_entry.subject_kind, SubjectKind::EnvelopeText);
+        let flipped = |entry: &PendingApproval| {
+            let mut edited = entry.clone();
+            edited.subject_kind = match entry.subject_kind {
+                SubjectKind::EnvelopeText => SubjectKind::IntentDigest,
+                SubjectKind::IntentDigest => SubjectKind::EnvelopeText,
+            };
+            edited
+        };
+        let cases = [
+            (
+                "intent ceremony on an intent record",
+                intent_entry.clone(),
+                intent_entry.clone(),
+                Some(&intent),
+                None,
+            ),
+            (
+                "intent ceremony on an envelope record",
+                envelope_entry.clone(),
+                envelope_entry.clone(),
+                Some(&intent),
+                Some("approval.presence_invalid"),
+            ),
+            (
+                "envelope ceremony on an intent record",
+                intent_entry.clone(),
+                intent_entry.clone(),
+                None,
+                Some("approval.presence_invalid"),
+            ),
+            (
+                "intent record edited to the envelope text",
+                intent_entry.clone(),
+                flipped(&intent_entry),
+                Some(&intent),
+                Some("approval.wrong_kind"),
+            ),
+            (
+                "envelope record edited to the intent digest",
+                envelope_entry.clone(),
+                flipped(&envelope_entry),
+                None,
+                Some("approval.wrong_kind"),
+            ),
+        ];
+        for (label, challenged, stored, ceremony, refusal) in cases {
+            let dir = TempDir::new().unwrap();
+            let mut store = PendingApprovalStore::open(dir.path().join("pending.toml")).unwrap();
+            store.insert(stored, challenged.created_at_unix_ms).unwrap();
+            let presence = match ceremony {
+                Some(intent) => fixture.intent_presence(&challenged, &policy, intent),
+                None => fixture.presence(&challenged, &policy),
+            };
+            let mut writer = test_audit_writer(&dir);
+            let result = attest_mainnet_confirmation(
+                &mut store,
+                &challenged,
+                &ATTESTATION_KEY,
+                &fixture.binding(),
+                ConsentAudit::Writer(&mut writer),
+                "stellar_pay_commit",
+                &policy,
+                presence,
+            );
+            let recorded = store.get(&challenged.approval_nonce).unwrap();
+            match refusal {
+                None => {
+                    result.unwrap();
+                    assert_eq!(recorded.attestation_version, 6, "{label}");
+                    assert_eq!(recorded.subject_kind, SubjectKind::IntentDigest, "{label}");
+                    assert_eq!(consent_rows(&dir).len(), 1, "{label}");
+                }
+                Some(code) => {
+                    assert_eq!(result.unwrap_err().code(), code, "{label}");
+                    assert!(recorded.attestation_blob_b64.is_none(), "{label}");
+                    assert!(consent_rows(&dir).is_empty(), "{label}");
+                }
             }
         }
     }

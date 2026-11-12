@@ -11,6 +11,8 @@
 //!   in trusted automation flows.
 //! - `stellar-agent approve gc`: evict expired pending approvals.
 //! - `stellar-agent approve gc --profile <name>`: per-profile gc.
+//! - `stellar-agent approve gc --include-consumed`: also evict consumed
+//!   approvals before their TTL elapses.
 //! - `stellar-agent approve list`: enumerate pending approvals (read-only).
 //! - `stellar-agent approve serve`: local web UI for the pending-approval
 //!   queue (loopback HTTP; approve/reject in a browser).
@@ -36,6 +38,7 @@
 //! stellar-agent approve --id ABCnonce --profile <name> --yes
 //! stellar-agent approve gc
 //! stellar-agent approve gc --profile <name>
+//! stellar-agent approve gc --profile <name> --include-consumed
 //! stellar-agent approve list
 //! stellar-agent approve list --profile <name> --output table
 //! stellar-agent approve serve
@@ -88,7 +91,8 @@ pub struct ApproveArgs {
 pub enum ApproveSubcommand {
     /// Garbage-collect expired pending approvals.
     ///
-    /// Removes entries whose TTL has elapsed from the pending-approvals store.
+    /// Removes entries whose TTL has elapsed from the pending-approvals store,
+    /// and with `--include-consumed` also every consumed entry.
     /// On success prints a JSON envelope with the count of evicted entries.
     Gc(gc::GcArgs),
 

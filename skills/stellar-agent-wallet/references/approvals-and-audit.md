@@ -463,9 +463,15 @@ ignored. Evicting zero entries is a success.
 | Flag | Required | Meaning |
 |---|---|---|
 | `--profile <NAME>` | no | Profile whose store to garbage-collect (same resolution as above). |
+| `--include-consumed` | no | Also evicts consumed entries before their TTL ends. Without it, only expired entries go. |
+
+`evicted_count` counts each removed entry once. Removing a consumed entry
+keeps replay protection: the submission receipt holds the spent nonce, so a
+commit that reuses it still fails with `policy.approval_consumed`.
 
 ```bash
 stellar-agent approve gc --profile default
+stellar-agent approve gc --profile default --include-consumed
 ```
 ```json
 {"ok":true,"data":{"profile":"default","evicted_count":3},"request_id":"..."}

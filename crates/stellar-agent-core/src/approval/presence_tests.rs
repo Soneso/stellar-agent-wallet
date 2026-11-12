@@ -1235,6 +1235,65 @@ fn stored_receipt_times_are_bounded() {
     }
 }
 
+/// A receipt whose assertion is signed again over its edited times and
+/// entry refuses on the stored time bounds alone. The cases are a window
+/// above the challenge life and a challenge that outlives the entry. The
+/// same signing over the unedited receipt verifies.
+#[test]
+fn resigned_receipt_refuses_on_the_stored_bounds() {
+    let policy = policy_with(&[&fixture_authenticator()]);
+    let entry = payment();
+    let receipt = verified_receipt(&policy, &entry);
+    let resigned = |entry: &PendingApproval, mut receipt: MainnetPresenceReceipt| {
+        let challenge = receipt
+            .challenge_for(entry, &binding(), &policy, None)
+            .unwrap();
+        receipt.assertion = input(&fixture_authenticator().assert(
+            challenge,
+            ORIGIN,
+            MAINNET_APPROVAL_RP_ID,
+            FLAG_UP | FLAG_UV,
+            1,
+        ));
+        receipt
+    };
+    assert!(
+        verify_receipt(
+            &entry,
+            &resigned(&entry, receipt.clone()),
+            &binding(),
+            &policy,
+            now_ms()
+        )
+        .is_ok(),
+        "the signing reproduces a valid receipt"
+    );
+    let mut long = receipt.clone();
+    long.issued_at_unix_ms = long.expires_at_unix_ms - MAINNET_PRESENCE_CHALLENGE_TTL_MS - 1;
+    let mut short = entry.clone();
+    short.expires_at_unix_ms = receipt.expires_at_unix_ms - 1;
+    for (label, entry, receipt) in [
+        ("window too long", &entry, resigned(&entry, long)),
+        (
+            "challenge outlives the entry",
+            &short,
+            resigned(&short, receipt.clone()),
+        ),
+    ] {
+        assert_eq!(
+            code(verify_receipt(
+                entry,
+                &receipt,
+                &binding(),
+                &policy,
+                now_ms()
+            )),
+            "approval.presence_invalid",
+            "{label}"
+        );
+    }
+}
+
 // ── The attester's mainnet path ─────────────────────────────────────────────
 
 fn consent_rows(path: &std::path::Path) -> Vec<serde_json::Value> {
@@ -2081,6 +2140,62 @@ fn version_5_layout_matches_independent_hmac() {
             &receipt,
         ),
         expected
+    );
+}
+
+/// The attester's version 6 blob equals an independent HMAC under the
+/// version 6 tag with the intent digest in the subject slot.
+#[test]
+#[serial]
+fn version_6_layout_matches_independent_hmac() {
+    use hmac::{Hmac, KeyInit as _, Mac as _};
+    use sha2::Sha256;
+    let lp = |out: &mut Vec<u8>, bytes: &[u8]| {
+        out.extend(u32::try_from(bytes.len()).unwrap().to_be_bytes());
+        out.extend(bytes);
+    };
+    let fixture = MainnetConsentFixture::new("versionsix");
+    let (entry, intent) = fixture.intent_payment(3_600_000);
+    let (store, surfaced) = fixture.intent_consent(&entry, &intent);
+    let blob = URL_SAFE_NO_PAD.decode(surfaced.unwrap()).unwrap();
+    let record = store.get(&entry.approval_nonce).unwrap();
+    assert_eq!(record.attestation_version, 6);
+    let receipt = record.mainnet_presence.as_ref().unwrap();
+    let mut message = b"stellar-agent-approval-attestation:v6".to_vec();
+    for field in [
+        fixture.name().as_bytes(),
+        MAINNET_CHAIN_ID.as_bytes(),
+        record.approval_nonce.as_bytes(),
+    ] {
+        lp(&mut message, field);
+    }
+    message.extend(intent.digest().as_bytes());
+    lp(&mut message, record.process_uid.as_bytes());
+    lp(&mut message, b"PaymentSimulated");
+    message.extend(record.created_at_unix_ms.to_be_bytes());
+    message.extend(record.expires_at_unix_ms.to_be_bytes());
+    message.push(0x02);
+    lp(&mut message, receipt.credential_id_b64url().as_bytes());
+    message.extend(receipt.digest().unwrap());
+    let mut mac = Hmac::<Sha256>::new_from_slice(&ATTESTATION_KEY).unwrap();
+    mac.update(&message);
+    let expected: [u8; 32] = mac.finalize().into_bytes().into();
+    assert_eq!(blob, expected, "the production blob");
+    assert_eq!(
+        crate::approval::attestation::compute_attestation_v6(
+            &ATTESTATION_KEY,
+            &fixture.binding(),
+            &record.approval_nonce,
+            intent.digest().as_bytes(),
+            &record.process_uid,
+            &record.attested_lifetime(),
+            &AttestedApprover::MainnetPasskey {
+                credential_id_b64url: receipt.credential_id_b64url(),
+            },
+            receipt,
+        ),
+        expected,
+        "the layout function"
     );
 }
 
