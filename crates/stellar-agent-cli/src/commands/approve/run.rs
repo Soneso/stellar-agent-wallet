@@ -1372,6 +1372,55 @@ mod tests {
         )
     }
 
+    /// SHA-256 of each operator summary block from fixed inputs.
+    fn rendered_summary_outputs() -> Vec<String> {
+        use sha2::{Digest as _, Sha256};
+        [
+            fixtures::payment_pending(
+                SOURCE_G,
+                DEST_G,
+                "XLM",
+                2_500_000,
+                Some("hi"),
+                100,
+                1_234_567,
+                "1000".to_owned(),
+                600_000,
+            ),
+            fixtures::trustline_pending(
+                SOURCE_G,
+                "USDC",
+                USDC_ISSUER_G,
+                None,
+                100,
+                42,
+                "1000".to_owned(),
+                600_000,
+            ),
+        ]
+        .into_iter()
+        .map(|mut entry| {
+            entry.approval_nonce = "A".repeat(22);
+            entry.created_at_unix_ms = 1_700_000_000_000;
+            entry.expires_at_unix_ms = 1_700_000_600_000;
+            let mut sink = Vec::new();
+            write_summary(&entry, &test_context(), &mut sink).unwrap();
+            stellar_agent_core::hex::encode(&Sha256::digest(&sink))
+        })
+        .collect()
+    }
+
+    /// The digests of [`rendered_summary_outputs`] as the base tree renders them.
+    const BASE_SUMMARY_OUTPUTS: &[&str] = &[
+        "8aa1cf42b63bd46b38a8d78e1279e6428c45d7f6f73c9a236f3217f41703caed",
+        "622bccf2ba6a6725e8f305014a3285a4cf2845d9069dbba7aa55a027c04c92e1",
+    ];
+
+    #[test]
+    fn summary_renderer_keeps_base_bytes() {
+        assert_eq!(rendered_summary_outputs(), BASE_SUMMARY_OUTPUTS);
+    }
+
     // ── Decode sha256 hex ────────────────────────────────────────────────────
 
     #[test]

@@ -917,4 +917,65 @@ mod tests {
         )));
         assert!(!line.contains(&"d".repeat(13)));
     }
+
+    /// SHA-256 of each pending row and summary line from fixed inputs.
+    fn rendered_list_outputs() -> Vec<String> {
+        use sha2::{Digest as _, Sha256};
+        const NOW: u64 = 1_700_000_000_000;
+        let dir = TempDir::new().unwrap();
+        let mut store = PendingApprovalStore::open(dir.path().join("rows.toml")).unwrap();
+        let entries = [
+            fixtures::payment_pending(
+                SOURCE_G,
+                DEST_G,
+                "XLM",
+                1_000_000,
+                Some("hi"),
+                100,
+                1,
+                "1000".to_owned(),
+                600_000,
+            ),
+            fixtures::trustline_pending(
+                SOURCE_G,
+                "USDC",
+                USDC_ISSUER_G,
+                Some(5),
+                100,
+                42,
+                "1000".to_owned(),
+                600_000,
+            ),
+        ];
+        for (index, mut entry) in entries.into_iter().enumerate() {
+            entry.approval_nonce = format!("{index}").repeat(22);
+            entry.created_at_unix_ms = NOW;
+            entry.expires_at_unix_ms = NOW + 600_000;
+            store.insert(entry, NOW).unwrap();
+        }
+        store
+            .snapshot(NOW)
+            .iter()
+            .flat_map(|view| {
+                [
+                    render_pending_row(view, NOW + 1_000),
+                    render_summary_line(view),
+                ]
+            })
+            .map(|text| stellar_agent_core::hex::encode(&Sha256::digest(text.as_bytes())))
+            .collect()
+    }
+
+    /// The digests of [`rendered_list_outputs`] as the base tree renders them.
+    const BASE_LIST_OUTPUTS: &[&str] = &[
+        "187b3d08ab53185bbff73e3a0a7efd228db1acd34e48dbfceb787558b46b5778",
+        "e1be7985f1ecc8301ee9de9a756558519304e597c3e484e2cac0926fa0d94919",
+        "84709417b1bc89d97f0644226f85ad0b64b72fc6ad24735451468e0c0a24f36d",
+        "5c369cfacd99f2d6e5757faed755e35a931e9d00858bd2a2eb5328687bd7b042",
+    ];
+
+    #[test]
+    fn list_renderers_keep_base_bytes() {
+        assert_eq!(rendered_list_outputs(), BASE_LIST_OUTPUTS);
+    }
 }

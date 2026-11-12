@@ -227,6 +227,398 @@ fn uid() -> String {
     process_uid_for_attestation().expect("uid on test host")
 }
 
+pub(crate) struct CountingRevocations {
+    pub(crate) calls: std::sync::atomic::AtomicUsize,
+}
+impl CountingRevocations {
+    pub(crate) fn new() -> Self {
+        Self {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+}
+impl crate::decision::RevocationAccess for CountingRevocations {
+    fn lookup(
+        &self,
+        _: &str,
+    ) -> Result<crate::decision::RevocationView, crate::decision::RevocationFailure> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(crate::decision::RevocationView {
+            state: "pending".to_owned(),
+            expired: false,
+            waiting_expires_at_ms: u64::MAX,
+            execution_expires_at_ms: None,
+            consent_at_ms: None,
+            revoked_at_ms: None,
+            closed_at_ms: None,
+        })
+    }
+    fn revoke(
+        &self,
+        nonce: &str,
+        _: stellar_agent_core::approval::Surface,
+        _: Option<&str>,
+    ) -> Result<crate::decision::RevocationView, crate::decision::RevocationFailure> {
+        let mut view = self.lookup(nonce)?;
+        view.state = "revoked".to_owned();
+        view.revoked_at_ms = Some(1);
+        Ok(view)
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn revocation_control_matches_record_eligibility() {
+    let mut h = Harness::new("revoke-controls");
+    let ctx = Arc::try_unwrap(h.state.ctx).ok().unwrap();
+    h.state.ctx = Arc::new(ctx.with_revocation_access(Arc::new(CountingRevocations::new())));
+    let cookie = h.bootstrap().await;
+    for eligible in [true, false] {
+        let mut entry = payment_entry(DEFAULT_TTL_MS);
+        if !eligible {
+            entry.process_uid = "4294967294".to_owned();
+        }
+        let nonce = h.insert(entry);
+        let response = h
+            .router()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/approval/{nonce}"))
+                    .header("host", HOST)
+                    .header("cookie", &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let html = String::from_utf8(
+            axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        for marker in [
+            "id=\"revoke-btn\"",
+            "id=\"revoke-data\"",
+            "/static/revoke.js",
+            "/static/revoke.css",
+        ] {
+            assert_eq!(html.contains(marker), eligible, "{marker}");
+        }
+    }
+    for (path, content) in [
+        ("/static/revoke.js", crate::web::REVOKE_JS),
+        ("/static/revoke.css", crate::web::REVOKE_CSS),
+    ] {
+        let response = h
+            .router()
+            .oneshot(
+                Request::builder()
+                    .uri(path)
+                    .header("host", HOST)
+                    .header("cookie", &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .as_ref(),
+            content
+        );
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn revocation_authentication_matrix() {
+    use std::sync::atomic::Ordering;
+    let mut h = Harness::new("revoke-auth");
+    let access = Arc::new(CountingRevocations::new());
+    let ctx = Arc::try_unwrap(h.state.ctx).ok().unwrap();
+    h.state.ctx = Arc::new(ctx.with_revocation_access(access.clone()));
+    let nonce = h.insert(payment_entry(DEFAULT_TTL_MS));
+    let cookie = h.bootstrap().await;
+    let csrf = h.csrf_for(&nonce);
+    let before = std::fs::read(&h.store_path).unwrap();
+    for omitted in ["cookie", "x-stellar-approval-csrf", "x-session-proof"] {
+        for invalid in [false, true] {
+            let mut request = Request::builder()
+                .method("POST")
+                .uri(format!("/approval/{nonce}/revoke"))
+                .header("host", HOST)
+                .header("origin", ORIGIN);
+            for (name, value) in [
+                ("cookie", cookie.clone()),
+                ("x-stellar-approval-csrf", csrf.clone()),
+                ("x-session-proof", h.proof()),
+            ] {
+                if name != omitted {
+                    request = request.header(name, value);
+                } else if invalid {
+                    request = request.header(name, "invalid");
+                }
+            }
+            let response = h
+                .router()
+                .oneshot(request.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                if omitted == "cookie" {
+                    StatusCode::NOT_FOUND
+                } else {
+                    StatusCode::FORBIDDEN
+                }
+            );
+            assert_eq!(access.calls.load(Ordering::SeqCst), 0);
+            assert_eq!(std::fs::read(&h.store_path).unwrap(), before);
+        }
+    }
+    let request = Request::builder()
+        .method("POST")
+        .uri(format!("/approval/{nonce}/revoke"))
+        .header("host", HOST)
+        .header("origin", ORIGIN)
+        .header("cookie", &cookie)
+        .header("x-stellar-approval-csrf", csrf)
+        .header("x-session-proof", h.proof())
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(
+        body_json(h.router().oneshot(request).await.unwrap()).await["view"]["state"],
+        "revoked"
+    );
+    assert_eq!(access.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(std::fs::read(&h.store_path).unwrap(), before);
+}
+
+/// SHA-256 of each unaffected page fragment and asset, rendered from fixed
+/// inputs.
+pub(crate) fn unaffected_outputs() -> Vec<(&'static str, String)> {
+    use sha2::{Digest as _, Sha256};
+    let hash = |bytes: &[u8]| stellar_agent_core::hex::encode(&Sha256::digest(bytes));
+    const NOW: u64 = 1_700_000_000_000;
+    let dir = TempDir::new().unwrap();
+    let mut entry = fixtures::payment_pending(
+        SOURCE_G,
+        DEST_G,
+        "XLM",
+        10,
+        Some("memo"),
+        100,
+        7,
+        "1000".to_owned(),
+        600_000,
+    );
+    entry.approval_nonce = "AAAAAAAAAAAAAAAAAAAAAA".to_owned();
+    entry.created_at_unix_ms = NOW;
+    entry.expires_at_unix_ms = NOW + 600_000;
+    let mut store = PendingApprovalStore::open(dir.path().join("base.toml")).unwrap();
+    store.insert(entry, NOW).unwrap();
+    let view = store.snapshot(NOW).remove(0);
+    let profile = stellar_agent_core::profile::schema::Profile::builder_mainnet_named(
+        "base",
+        "https://rpc.example.invalid",
+        "base-signer",
+        "default",
+        "base-nonce",
+        "default",
+    )
+    .build();
+    let mut context = stellar_agent_core::approval::ApprovalContext::from_profile("base", &profile);
+    context.endpoint_host = "rpc.example.invalid".to_owned();
+    context.signer_account = Some(SOURCE_G.to_owned());
+    let identity = PageIdentity::neutral();
+    let data = serde_json::json!({
+        "nonce": view.approval_nonce, "csrf": "00", "consent_view_digest": "11",
+        "storageKey": "key", "mode": "inbox",
+    });
+    let base = |memo: serde_json::Value| {
+        serde_json::json!({
+            "chain_id": "stellar:mainnet",
+            "source": SOURCE_G,
+            "policy_digest": "11".repeat(32),
+            "fee_bound_stroops": "300",
+            "memo": memo,
+        })
+    };
+    let trustline = |limit: &str| {
+        serde_json::json!({"base": base(serde_json::json!("none")), "payload": {"trustline": {
+            "issuer": "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN",
+            "code": "USDC", "limit_stroops": limit,
+        }}})
+    };
+    let intents: Vec<_> = [
+        serde_json::json!({"base": base(serde_json::json!({"text": "<b>&\"x"})), "payload": {"pay": {
+            "destination": DEST_G, "asset": "native", "amount_stroops": "25000000",
+        }}}),
+        trustline("0"),
+        trustline("9223372036854775807"),
+        serde_json::json!({"base": base(serde_json::json!({"id": "7"})), "payload": {"claim": {
+            "balance_id": format!("00000000{}", "0b".repeat(32)),
+            "asset": {"issued": {
+                "code": "USDC", "issuer": "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5",
+            }},
+            "amount_stroops": "1", "claimant": SOURCE_G,
+        }}}),
+    ]
+    .into_iter()
+    .map(|value| {
+        let intent: stellar_agent_core::approval::ClassicIntent =
+            serde_json::from_value(value).unwrap();
+        stellar_agent_core::approval::IntentView::new(&intent)
+    })
+    .collect();
+    vec![
+        (
+            "summary",
+            hash(crate::templates::render_summary_html(&view).as_bytes()),
+        ),
+        (
+            "context",
+            hash(crate::templates::render_context_header_html(&context).as_bytes()),
+        ),
+        (
+            "detail",
+            hash(
+                crate::templates::render_detail_page(
+                    &view, &context, "00", "11", None, None, &identity,
+                )
+                .as_bytes(),
+            ),
+        ),
+        (
+            "consent",
+            hash(
+                crate::templates::render_mainnet_consent_page(
+                    &view,
+                    &context,
+                    &data,
+                    None,
+                    None,
+                    crate::templates::ConsentPageMode::Inbox,
+                    &identity,
+                )
+                .as_bytes(),
+            ),
+        ),
+        (
+            "intent_pay",
+            hash(
+                crate::templates::render_intent_html(&view.approval_nonce, &intents[0]).as_bytes(),
+            ),
+        ),
+        (
+            "intent_trustline",
+            hash(
+                crate::templates::render_intent_html(&view.approval_nonce, &intents[1]).as_bytes(),
+            ),
+        ),
+        (
+            "intent_unlimited",
+            hash(
+                crate::templates::render_intent_html(&view.approval_nonce, &intents[2]).as_bytes(),
+            ),
+        ),
+        (
+            "intent_claim",
+            hash(
+                crate::templates::render_intent_html(&view.approval_nonce, &intents[3]).as_bytes(),
+            ),
+        ),
+        (
+            "consent_intent",
+            hash(
+                crate::templates::render_mainnet_consent_page(
+                    &view,
+                    &context,
+                    &data,
+                    Some("ab12"),
+                    Some(&intents[0]),
+                    crate::templates::ConsentPageMode::Inbox,
+                    &identity,
+                )
+                .as_bytes(),
+            ),
+        ),
+        ("app.js", hash(crate::web::APP_JS)),
+        ("app_shared.js", hash(crate::web::APP_SHARED_JS)),
+        (
+            "mainnet-presence.js",
+            hash(include_bytes!("web/mainnet-presence.js")),
+        ),
+    ]
+}
+
+/// The digests of [`unaffected_outputs`] as the base tree renders them.
+const BASE_OUTPUTS: &[(&str, &str)] = &[
+    (
+        "summary",
+        "affc57a44007272a557beb87cabc27e32ec05d116b057a8c8e23c0f562a32ea2",
+    ),
+    (
+        "context",
+        "8248314bbad2eba5d026d559772dbba2590287227c32f6d83aa8dd0b41a9b9d2",
+    ),
+    (
+        "detail",
+        "a59bf288a513244185344d675fce9d3ab07c44fa3b482df292b94062b4ac2d86",
+    ),
+    (
+        "consent",
+        "6829ab444be1ddd7ad083356454b9112812a29023ac82f940d9ca1eaad4c9408",
+    ),
+    (
+        "intent_pay",
+        "2b69abbb981631315b2e35f6ad25b6a8470eb986c3d7d37aee1d2af2d6132b78",
+    ),
+    (
+        "intent_trustline",
+        "ff84b352ccf0413f14cde7214cb29da686eebddc936ab1b8cc8a78cb2220afb0",
+    ),
+    (
+        "intent_unlimited",
+        "4267b34b56da7ce91534a65378fd25627ee48917184830d10f2605c91c01f5f6",
+    ),
+    (
+        "intent_claim",
+        "15e21d04edbb5bc75fc48af96499bbc49175c7237d933af7d8641563e6d9d826",
+    ),
+    (
+        "consent_intent",
+        "84508618c3bd269118a1328917d49e1e855d50724d09a7961c35235399d0f708",
+    ),
+    (
+        "app.js",
+        "d9d9539353991cf5f404b8c05555530f91eed203747afaca0ee2bc54aab1d18d",
+    ),
+    (
+        "app_shared.js",
+        "f9c45adf5967b8c9d4dcc542e2a8ce19adde305ea3425d7727b97cdfb370eee5",
+    ),
+    (
+        "mainnet-presence.js",
+        "cf6feb17fa9ad5bfe87722a5145898b35af4533e487957e5b21233dd69402478",
+    ),
+];
+
+#[test]
+fn unaffected_approval_outputs_keep_base_bytes() {
+    let outputs = unaffected_outputs();
+    assert_eq!(outputs.len(), BASE_OUTPUTS.len());
+    for ((label, digest), (base_label, base)) in outputs.iter().zip(BASE_OUTPUTS) {
+        assert_eq!((*label, digest.as_str()), (*base_label, *base));
+    }
+}
+
 fn payment_entry(ttl_ms: u64) -> PendingApproval {
     fixtures::payment_pending(
         SOURCE_G,

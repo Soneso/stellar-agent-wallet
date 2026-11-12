@@ -138,6 +138,17 @@ impl ApprovedKind {
             Self::X402Payment => 4,
         }
     }
+
+    /// The inbox kind name of the record kind, as approval audit rows carry it.
+    #[must_use]
+    pub fn kind_name(self) -> &'static str {
+        match self {
+            Self::Payment => "PaymentSimulated",
+            Self::Claim => "ClaimSimulated",
+            Self::Trustline => "TrustlineSimulated",
+            Self::X402Payment => "X402Payment",
+        }
+    }
 }
 
 /// What the caller requires the approval to approve.
