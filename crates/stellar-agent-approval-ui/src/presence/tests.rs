@@ -1629,6 +1629,13 @@ struct SignedOrigin {
 
 impl SignedOrigin {
     fn new(name: &str) -> Self {
+        Self::with_revocation(name, None)
+    }
+
+    fn with_revocation(
+        name: &str,
+        access: Option<Arc<dyn crate::decision::RevocationAccess>>,
+    ) -> Self {
         let mut fixture = MainnetConsentFixture::new(name);
         fixture.sign_signed_origin_policy(&[&fixture_authenticator()], &SIGNED_CERT_SPKI_SHA256);
         let entry = fixture.payment(600_000);
@@ -1637,7 +1644,11 @@ impl SignedOrigin {
         drop(store);
         let identity = ListenerIdentity::capture(&fixture.current_policy()).unwrap();
         let (gate, session) = HttpsSessionGate::open();
-        let context = Arc::new(Harness::context_of(&fixture));
+        let context = Harness::context_of(&fixture);
+        let context = Arc::new(match access {
+            Some(access) => context.with_revocation_access(access),
+            None => context,
+        });
         let (router, completion) = signed_origin_consent(
             SignedOriginMode::Inbox {
                 context: context.clone(),
@@ -1763,6 +1774,81 @@ impl SignedOrigin {
             .filter(|row| row["kind"] == kind)
             .collect()
     }
+}
+
+/// An attested entry shows no revocation control, although its durable
+/// lookup reports a live, unconsented record.
+#[tokio::test]
+#[serial_test::serial]
+async fn signed_revocation_control_requires_a_pending_entry() {
+    let access = Arc::new(crate::tests::CountingRevocations::new());
+    let so = SignedOrigin::with_revocation("revoke-attested", Some(access));
+    let options = so.challenge().await;
+    let (status, body) = so
+        .post("assertion", &SignedOrigin::signed(&options, 1))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(so.stored().attestation_blob_b64.is_some());
+    let (status, page) = page_text(
+        so.send("GET", &format!("/approval/{}", so.nonce()), None)
+            .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    for marker in [
+        "id=\"revoke-btn\"",
+        "id=\"revoke-data\"",
+        "/static/revoke.js",
+    ] {
+        assert!(!page.contains(marker), "{marker}");
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn revocation_authentication_matrix() {
+    use std::sync::atomic::Ordering;
+    let access = Arc::new(crate::tests::CountingRevocations::new());
+    let so = SignedOrigin::with_revocation("revoke-proof", Some(access.clone()));
+    let (_, page) = page_text(
+        so.send("GET", &format!("/approval/{}", so.nonce()), None)
+            .await,
+    )
+    .await;
+    for marker in [
+        "id=\"revoke-btn\"",
+        "id=\"revoke-data\"",
+        "/static/revoke.js",
+        "/static/revoke.css",
+    ] {
+        assert!(page.contains(marker), "{marker}");
+    }
+    for (path, content) in [
+        ("/static/revoke.js", crate::web::REVOKE_JS),
+        ("/static/revoke.css", crate::web::REVOKE_CSS),
+    ] {
+        let (status, body) = page_text(so.send("GET", path, None).await).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body.as_bytes(), content);
+    }
+    let before = std::fs::read(so.fixture.store_path()).unwrap();
+    let initial = access.calls.load(Ordering::SeqCst);
+    let (status, _) = so.post("revoke", &json!({})).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(access.calls.load(Ordering::SeqCst), initial);
+    let options = so.challenge().await;
+    let assertion = SignedOrigin::signed(&options, 1);
+    let initial = access.calls.load(Ordering::SeqCst);
+    let (status, body) = so.post("revoke", &assertion).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["view"]["state"], "revoked");
+    assert_eq!(access.calls.load(Ordering::SeqCst), initial + 2);
+    let (status, _) = so.post("revoke", &assertion).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(access.calls.load(Ordering::SeqCst), initial + 2);
+    assert_eq!(std::fs::read(so.fixture.store_path()).unwrap(), before);
+    assert!(so.rows("approval_rejected").is_empty());
+    assert!(so.rows("approval_attested").is_empty());
 }
 
 /// The signed-origin inbox issues at the signed relying party and origin.

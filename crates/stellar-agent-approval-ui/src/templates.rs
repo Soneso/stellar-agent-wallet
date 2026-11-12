@@ -610,6 +610,31 @@ pub(crate) fn render_mainnet_consent_page(
     )
 }
 
+/// Adds a revocation control when authenticated durable lookup permits it.
+pub(crate) fn with_revocation_control(
+    page: String,
+    context: &crate::decision::DecisionContext,
+    nonce: &str,
+    data: &serde_json::Value,
+) -> String {
+    if !context.permits_revocation(nonce) {
+        return page;
+    }
+    let island = json_data_island(data);
+    let control = format!(
+        r#"<section class="revocation">
+  <button class="btn" id="revoke-btn" type="button">Revoke approval</button>
+  <p>Revoking blocks any new signature under this approval.</p>
+  <div id="revoke-result" role="status"></div>
+</section>
+<script type="application/json" id="revoke-data">{island}</script>
+<link rel="stylesheet" href="/static/revoke.css">
+<script src="/static/revoke.js"></script>
+"#
+    );
+    page.replace("</body>", &format!("{control}</body>"))
+}
+
 /// The kind pill and the requester line every decision card opens with.
 fn kind_head_html(view: &PendingApprovalView) -> String {
     let (kind_label, kind_is_passkey) = kind_pill(view);

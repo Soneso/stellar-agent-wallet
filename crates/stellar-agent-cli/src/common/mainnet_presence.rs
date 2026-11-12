@@ -184,12 +184,34 @@ async fn acquire_signed_presence(
 #[cfg(feature = "test-helpers")]
 #[allow(clippy::print_stderr, reason = "binary test readiness")]
 pub(crate) async fn remote_test_ready(handle: &stellar_agent_approval_remote::RemoteServeHandle) {
+    #[cfg(test)]
+    bound_listener::record(handle.local_addr());
     if std::env::var_os(TEST_REMOTE_READY_ENV).is_none() {
         return;
     }
     eprintln!("Test listener: https://{}/", handle.local_addr());
     // This yield lets the native harness interrupt immediately after readiness.
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+}
+
+/// The address the newest remote listener of this test process holds.
+#[cfg(test)]
+pub(crate) mod bound_listener {
+    static ADDRESS: std::sync::Mutex<Option<std::net::SocketAddr>> = std::sync::Mutex::new(None);
+
+    pub(super) fn record(address: std::net::SocketAddr) {
+        *ADDRESS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(address);
+    }
+
+    /// Takes the recorded address, leaving none.
+    pub(crate) fn take() -> Option<std::net::SocketAddr> {
+        ADDRESS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+    }
 }
 
 /// Polls the signal future before binding so startup cannot expose an unhandled interrupt.
@@ -211,6 +233,11 @@ pub(crate) async fn register_interrupt() -> impl std::future::Future<Output = st
     }
 }
 
+/// The token-free page link of `nonce` at the signed `origin`.
+pub(crate) fn signed_approval_link(origin: &str, nonce: &str) -> String {
+    format!("{origin}/approvals/{nonce}")
+}
+
 async fn signed_presence_until_done(
     mut handle: stellar_agent_approval_remote::RemoteServeHandle,
     nonce: &str,
@@ -224,8 +251,8 @@ async fn signed_presence_until_done(
         #[allow(clippy::print_stderr, reason = "CLI signed-origin approval link")]
         {
             eprintln!(
-                "Approve at the signed origin: {}/approvals/{nonce}",
-                handle.public_origin()
+                "Approve at the signed origin: {}",
+                signed_approval_link(handle.public_origin(), nonce)
             );
         }
         let now = stellar_agent_core::timefmt::now_unix_ms().unwrap_or(u64::MAX);

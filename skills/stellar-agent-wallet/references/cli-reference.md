@@ -1154,6 +1154,26 @@ stellar-agent approve --id ABCxyzNonce --profile <name>
 {"ok":true,"data":{"approval_nonce":"ABCxyzNonce","attested":true,"process_uid":"501","expires_at_unix_ms":1717000000000,"approval_attestation":"q83vEjRWeJq83v...","audit":"written"},"request_id":"..."}
 ```
 
+### `approve revoke`
+
+```sh
+stellar-agent approve revoke --id <nonce> --profile default
+stellar-agent approve revoke --id <nonce> --profile default --output table
+```
+
+Revokes an existing durable approval by nonce in the selected profile.
+Approval preparation creates no durable records, so the command acts only on records that already exist.
+The profile owner can revoke consumed records inside execution, including after inbox collection.
+The inbox action requires an eligible pending entry and an unconsented pending durable record.
+Signed-origin revocation requires a fresh current-policy passkey assertion.
+Revoked, expired and closed records return a view without writes or audit rows.
+The result excludes consent payloads and includes state, expiry, both deadlines and consent, revoked and closed times.
+Unknown nonces return `approval.not_found` and exit 1; successful views exit 0.
+Revocation blocks later first mints and unused-carrier remints, preserving clocks and operation state.
+Child mints under used parents and submissions already sent retain their behavior.
+The `approval_revoked` audit event follows the state commit and names the durable record's approval kind.
+If its append fails, the error states that the record is revoked. Retrying does not repair that row.
+
 ### `approve gc`
 
 State-changing. Evicts every expired entry from the pending-approval store and reports the count (`evicted_count`). When `gc` is present, `--id` is ignored. Evicting zero is a success. `--profile <NAME>` selects the store.

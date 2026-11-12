@@ -462,6 +462,24 @@ stellar-agent approve --id ABCxyzNonce --profile <name>
 stellar-agent approve --id ABCxyzNonce --profile myprofile --yes
 ```
 
+`stellar-agent approve revoke --id <nonce> --profile default` revokes an existing durable record.
+Approval preparation creates no durable records, so the command acts only on records that already exist.
+The profile owner can revoke consumed records inside execution, including after inbox collection.
+The inbox's "Revoke approval" action accepts eligible pending entries and unconsented durable records only.
+Local actions require a session, per-entry CSRF, session proof and matching entry identity.
+Signed-origin actions also require a fresh assertion from a current-policy credential.
+Revoked, expired and closed records return their view without writes or rows.
+Revocation preserves consent, both clocks, operation history and accounting.
+It prevents later first mints and unused-carrier remints at the durable check.
+It does not affect child mints under used parents or submissions already sent.
+
+The state commits before the `approval.revoked` row with event kind `approval_revoked`.
+Rows contain the durable record's kind, nonce prefix and origin; signed-origin rows add a credential pseudonym.
+Results contain no consent payload. Unknown nonces return `approval.not_found` and exit 1.
+Success exits 0. The optional `--output table` prints escaped fields on separate lines.
+Append failure states: "The approval record is revoked, but its audit row cannot be appended. Retrying does not repair the audit row."
+Retrying returns the revoked view without another facade call or audit append.
+
 `stellar-agent approve gc`: state-changing. Evicts every pending entry whose
 TTL has elapsed and reports the count. When `gc` is present, any `--id` is
 ignored. Evicting zero entries is a success.

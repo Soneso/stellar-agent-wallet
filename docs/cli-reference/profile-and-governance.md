@@ -1149,6 +1149,36 @@ stellar-agent approve --id ABCxyzNonce --profile <name>
 {"ok":true,"data":{"approval_nonce":"ABCxyzNonce","attested":true,"process_uid":"501","expires_at_unix_ms":1717000000000,"approval_attestation":"q83vEjRWeJq83v...","audit":"written"},"request_id":"..."}
 ```
 
+### `approve revoke`
+
+```sh
+stellar-agent approve revoke --id <nonce> --profile default
+stellar-agent approve revoke --id <nonce> --profile default --output table
+```
+
+Revokes an existing authenticated durable approval selected by its inbox nonce.
+Approval preparation creates no durable records, so the command acts only on records that already exist.
+The profile owner can revoke pending or consumed records inside their active window,
+including consumed records whose inbox entries are collected.
+The inbox's distinct "Revoke approval" action covers eligible pending, unconsented records only.
+Local actions require the session, per-entry CSRF, session proof and matching entry identity.
+Signed-origin actions also require a fresh assertion from a current-policy passkey.
+
+The result contains state, expiry, both window deadlines, consent time, revoked time and closed time.
+JSON uses the standard envelope; `--output table` prints escaped fields on separate lines.
+Unknown nonces return `approval.not_found` and exit 1. Other failures retain their mapped code.
+Success exits 0. Revoked, expired and closed records return their view without a write or audit row.
+Both windows exclude their expiry boundary. Revocation preserves consent, clocks, operation history and accounting.
+
+Revocation prevents later first mints and unused-carrier remints that reach the durable check.
+It does not affect child mints under used parents or submissions already sent.
+After revocation commits, `approval.revoked` appends an `approval_revoked` audit event.
+It carries the durable record's approval kind, eight-character nonce prefix and origin, also after inbox collection.
+Only signed-origin rows carry a credential pseudonym.
+An append failure returns exit 1 and this message:
+"The approval record is revoked, but its audit row cannot be appended. Retrying does not repair the audit row."
+The state remains revoked. Retrying returns the view without another revocation or append.
+
 ### `approve gc`
 
 ```bash

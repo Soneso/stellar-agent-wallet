@@ -25,6 +25,12 @@
 /// Source-of-truth: `src/web/app_shared.js`.
 pub const APP_SHARED_JS: &[u8] = include_bytes!("app_shared.js");
 
+/// The authenticated revocation action on eligible inbox pages.
+pub(crate) const REVOKE_JS: &[u8] = include_bytes!("revoke.js");
+
+/// The revocation control's stylesheet.
+pub(crate) const REVOKE_CSS: &[u8] = include_bytes!("revoke.css");
+
 /// Wallet-authored approval-inbox browser glue served at `GET /static/app.js`.
 ///
 /// Loaded after [`APP_SHARED_JS`], whose `stellarAgentApproval` namespace it

@@ -3112,6 +3112,19 @@ pub enum EventKind {
         origin: String,
     },
 
+    /// An existing durable approval is revoked through an authenticated surface.
+    ApprovalRevoked {
+        /// The durable approval's kind.
+        approval_kind: String,
+        /// The first eight characters of the approval nonce.
+        nonce_prefix: String,
+        /// The deciding surface: `cli`, `serve`, or `serve-remote`.
+        origin: String,
+        /// The signed-origin credential's pseudonym; local rows omit it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        operator_credential_id_redacted: Option<String>,
+    },
+
     /// A pending approval was attested (approved) by an operator
     /// authenticated over the remote-approval HTTP surface via a WebAuthn
     /// passkey assertion, rather than the OS process boundary.
@@ -3933,7 +3946,7 @@ pub enum EventKind {
 /// the test stays green, leaving the new variant unpinned by any tag assertion.
 /// Closing that would need the count derived from the enum itself, which needs a
 /// derive macro this workspace does not carry.
-pub const EVENT_KIND_VARIANT_COUNT: usize = 83;
+pub const EVENT_KIND_VARIANT_COUNT: usize = 84;
 
 /// Why an [`EventKind::AuditTipAnchored`] row was written.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -6605,6 +6618,41 @@ mod tests {
     }
 
     // ── #21 / #34 audit records ──────────────────────────────────────────────
+
+    #[test]
+    fn revocation_audit_round_trips_and_redacts() {
+        use crate::approval::Surface;
+        use crate::audit_log::AuditEntry;
+        for origin in [Surface::Cli, Surface::Serve, Surface::ServeRemote] {
+            let entry = AuditEntry::new_approval_revoked(
+                "PaymentSimulated",
+                "abcdefgh-secret",
+                origin,
+                Some("fixture-credential"),
+                "revocation-request",
+            );
+            let text = serde_json::to_string(&entry).unwrap();
+            assert_eq!(text.matches("\"request_id\"").count(), 1);
+            let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(value["kind"], "approval_revoked");
+            assert_eq!(value["approval_kind"], "PaymentSimulated");
+            assert_eq!(value["nonce_prefix"], "abcdefgh");
+            assert_eq!(value["origin"], origin.as_str());
+            let back: AuditEntry = serde_json::from_str(&text).unwrap();
+            assert_eq!(back.event_kind, entry.event_kind);
+            assert_eq!(back.request_id, "revocation-request");
+            for field in ["approval_kind", "nonce_prefix", "origin"] {
+                let mut missing = value.clone();
+                missing.as_object_mut().unwrap().remove(field);
+                assert!(
+                    serde_json::from_value::<AuditEntry>(missing).is_err(),
+                    "{field}"
+                );
+            }
+            assert!(!text.contains("abcdefgh-secret"));
+            assert!(!text.contains("fixture-credential"));
+        }
+    }
 
     #[test]
     fn event_kind_value_action_submitted_round_trip() {

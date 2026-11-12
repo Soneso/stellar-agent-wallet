@@ -1762,9 +1762,27 @@ Only the linked operation can remint within the execution window. A missing
 operation link or another operation refuses with `approval_nonce_reused`. The
 record protects single use independently of retained authorization history.
 Pending records without consent refuse with `approval_consent_missing`.
-Revocation records its time and refuses every later mint with
-`approval_revoked`. Revoking a revoked or expired record writes nothing.
-Revocation creates no operation transition or audit row.
+Revocation records its time and refuses later first mints and unused-carrier
+remints at the durable check with `approval_revoked`, before expiry refusal.
+Child mints under used parents and submissions already sent retain their behavior.
+The recorder creates no operation transition or audit row.
+
+`approve revoke --id <nonce> --profile <name>` resolves the nonce through authenticated status.
+Only `ApprovalRecorder::revoke` changes the durable record.
+The profile owner can revoke consumed records inside execution, including after inbox collection.
+Inbox actions require an authenticated, eligible pending entry and a live unconsented durable record.
+Signed-origin actions reuse current-policy assertion verification, counter updates and listener identity checks.
+Revoked, expired and closed records return secret-free views without a facade call or audit row.
+Expiry between lookup and revoke succeeds without an audit row.
+Consent, both clocks, consumption identity, holds and operation history remain intact.
+
+The surface appends `approval_revoked` through tool `approval.revoked` after the state commit.
+The row carries the durable record's approval kind, nonce prefix and origin, plus a credential pseudonym for signed-origin requests only.
+Every surface names the kind from the authenticated record, so inbox collection leaves the row's kind intact.
+The operator outbox refuses this event. No operation notification accompanies revocation.
+If append fails, the error states that the record is revoked. A retry neither appends nor repairs the row.
+Concurrent calls can each append because the recorder returns no changed flag.
+Approval preparation creates no durable records, so every surface acts only on records that already exist.
 
 Consent retains the attestation, receipt and signed process identifier for
 reconstruction. The record supplies the signed nonce, kind, subject and

@@ -53,6 +53,7 @@ pub mod credential;
 pub mod gc;
 pub mod list;
 pub mod operator;
+pub mod revoke;
 pub mod run;
 pub mod serve;
 
@@ -89,6 +90,8 @@ pub struct ApproveArgs {
 #[derive(Debug, Subcommand)]
 #[non_exhaustive]
 pub enum ApproveSubcommand {
+    /// Revoke an existing durable approval selected by its inbox nonce.
+    Revoke(revoke::RevokeArgs),
     /// Garbage-collect expired pending approvals.
     ///
     /// Removes entries whose TTL has elapsed from the pending-approvals store,
@@ -135,6 +138,7 @@ pub enum ApproveSubcommand {
 /// Never panics.
 pub async fn dispatch(args: ApproveArgs) -> i32 {
     match args.subcommand {
+        Some(ApproveSubcommand::Revoke(args)) => revoke::run(args).await,
         Some(ApproveSubcommand::Gc(gc_args)) => gc::run(gc_args).await,
         Some(ApproveSubcommand::List(list_args)) => list::run(list_args).await,
         Some(ApproveSubcommand::Serve(serve_args)) => serve::run(serve_args).await,
@@ -157,6 +161,7 @@ impl ApproveArgs {
     /// the audit log of the profile the command uses.
     pub(crate) fn profile_flag(&self) -> Option<&str> {
         match &self.subcommand {
+            Some(ApproveSubcommand::Revoke(a)) => a.profile.as_deref(),
             Some(ApproveSubcommand::Gc(a)) => a.profile.as_deref(),
             Some(ApproveSubcommand::List(a)) => a.profile.as_deref(),
             Some(ApproveSubcommand::Serve(a)) => a.profile.as_deref(),

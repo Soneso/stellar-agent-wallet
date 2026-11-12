@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `approve revoke` and authenticated inbox actions revoke existing durable approvals without changing consent, clocks or operation state.
+  The `approval_revoked` audit event follows the state commit and excludes consent payloads.
 - Pending approvals record a subject kind, `envelope-text` by default or
   `intent-digest` for a payment, claim or trustline. Attestation version 6
   binds a canonical intent digest, and each kind verifies under its own layout

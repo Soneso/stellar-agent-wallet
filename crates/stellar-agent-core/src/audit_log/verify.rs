@@ -1328,6 +1328,7 @@ fn verify_single_file(
             }
             EventKind::ApprovalAttested { .. }
             | EventKind::ApprovalRejected { .. }
+            | EventKind::ApprovalRevoked { .. }
             | EventKind::ApprovalAttestedRemote { .. }
             | EventKind::ApprovalRejectedRemote { .. } => {
                 // Approval lifecycle events. No rotation-handoff tracking
@@ -2550,6 +2551,7 @@ mod tests {
             EventKind::SubmissionAuthMismatch { .. } => "submission_auth_mismatch",
             EventKind::ApprovalAttested { .. } => "approval_attested",
             EventKind::ApprovalRejected { .. } => "approval_rejected",
+            EventKind::ApprovalRevoked { .. } => "approval_revoked",
             EventKind::ApprovalAttestedRemote { .. } => "approval_attested_remote",
             EventKind::ApprovalRejectedRemote { .. } => "approval_rejected_remote",
             EventKind::ValueActionSubmitted { .. } => "value_action_submitted",
@@ -3016,6 +3018,12 @@ mod tests {
                 approval_kind: "PaymentSimulated".to_owned(),
                 nonce_prefix: "BBBBBBBB".to_owned(),
                 origin: "cli".to_owned(),
+            },
+            EventKind::ApprovalRevoked {
+                approval_kind: "payment".to_owned(),
+                nonce_prefix: "BBBBBBBB".to_owned(),
+                origin: "cli".to_owned(),
+                operator_credential_id_redacted: None,
             },
             EventKind::ApprovalAttestedRemote {
                 approval_kind: "PaymentSimulated".to_owned(),
@@ -3525,6 +3533,48 @@ mod tests {
     }
 
     #[test]
+    fn revocation_row_verifies_in_a_shared_log() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("revocation.jsonl");
+        let other = dir.path().join("other.jsonl");
+        for (path, label) in [(&path, "first"), (&other, "other")] {
+            let mut writer = AuditWriter::open(path.clone(), None).unwrap();
+            writer
+                .write_entry(AuditEntry::new_approval_rejected(
+                    "PaymentSimulated",
+                    "abcdefgh-secret",
+                    "cli",
+                    label,
+                ))
+                .unwrap();
+            writer
+                .write_entry(AuditEntry::new_approval_revoked(
+                    "PaymentSimulated",
+                    "abcdefgh-secret",
+                    crate::approval::Surface::Cli,
+                    None,
+                    "revoke",
+                ))
+                .unwrap();
+            writer
+                .write_entry(AuditEntry::new_approval_rejected(
+                    "PaymentSimulated",
+                    "ijklmnop-secret",
+                    "serve",
+                    "last",
+                ))
+                .unwrap();
+        }
+        assert_eq!(verify_log(&path, None).unwrap().entries_verified, 3);
+        let original = fs::read_to_string(&path).unwrap();
+        let foreign = fs::read_to_string(&other).unwrap();
+        let mut lines: Vec<_> = original.lines().collect();
+        lines[1] = foreign.lines().nth(1).unwrap();
+        fs::write(&path, format!("{}\n", lines.join("\n"))).unwrap();
+        assert!(verify_log(&path, None).is_err());
+    }
+
+    #[test]
     fn verify_event_kind_policy_covers_all_current_variants() {
         let labels: Vec<&'static str> = current_event_kind_fixtures()
             .iter()
@@ -3585,6 +3635,7 @@ mod tests {
                 "sa_context_rule_valid_until_updated",
                 "approval_attested",
                 "approval_rejected",
+                "approval_revoked",
                 "approval_attested_remote",
                 "approval_rejected_remote",
                 "value_action_submitted",

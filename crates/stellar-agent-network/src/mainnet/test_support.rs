@@ -44,6 +44,53 @@ impl std::fmt::Debug for AuthorizedSubmissionFixture {
     }
 }
 
+/// Consumes `minted`, the window store's mint record for `request`, with
+/// `binding`, as its consumer does.
+///
+/// The recorded and fresh audit facts are equal, so only the store's own
+/// consumption checks decide.
+///
+/// # Errors
+///
+/// Every refusal of
+/// [`crate::policy_state::PersistedWindowStore::consume_authorization`].
+pub fn consume_minted(
+    store: &crate::policy_state::PersistedWindowStore,
+    profile: &stellar_agent_core::profile::schema::Profile,
+    request: &crate::policy_state::MintRequest,
+    minted: &crate::policy_state::MintedRecord,
+    binding: &crate::policy_state::ConsumptionBinding,
+) -> Result<(), crate::policy_state::WindowStoreError> {
+    let audit = super::types::AuditFacts {
+        segment: [0; 32],
+        log_path_digest: [0; 32],
+        anchored_count: 0,
+    };
+    let expect = crate::policy_state::ConsumeExpect::new(
+        stellar_agent_core::profile::name::profile_name_for_approval(profile),
+        request.chain,
+        request.consumer,
+        request.binding.clone(),
+        request.policy_sequence,
+        request.policy_digest,
+        request.authority.clone(),
+        minted
+            .reservation
+            .as_ref()
+            .map(crate::policy_state::WindowReservation::id),
+        minted.bindings_digest,
+        audit,
+        &super::types::RecomputedFacts {
+            content_digest: request.binding.content_digest(),
+            entries_digest: super::digest::entries_digest(&request.holds),
+            audit,
+        },
+    );
+    store
+        .consume_authorization(profile, minted.id, &expect, binding)
+        .map(|_| ())
+}
+
 /// The signed envelope a test submits and the unsigned envelope a grant
 /// binds, built from the fixture's source and sequence.
 #[derive(Debug)]

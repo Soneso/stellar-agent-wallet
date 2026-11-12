@@ -1995,6 +1995,34 @@ mod tests {
         assert_eq!(store.load_outbox_state(1).unwrap(), state);
     }
 
+    #[test]
+    fn revocation_row_refuses_operator_outbox() {
+        let dir = TempDir::new().unwrap();
+        let path = log_path(&dir);
+        let store = bound_store(&path);
+        let mut writer = open_draining(&path, &store);
+        let entry = AuditEntry::new_approval_revoked(
+            "PaymentSimulated",
+            "abcdefgh-secret",
+            crate::approval::Surface::Cli,
+            None,
+            "revoke",
+        );
+        AuditOutbox::for_log(&path, store.clone())
+            .append(&entry)
+            .unwrap();
+        let outbox = outbox_bytes(&path);
+        let log = fs::read(&path).unwrap();
+        let state = store.load_outbox_state(1).unwrap();
+        assert!(matches!(
+            writer.drain_outbox(),
+            Err(WriterError::OutboxRowKindRefused { line: 1 })
+        ));
+        assert_eq!(outbox_bytes(&path), outbox);
+        assert_eq!(fs::read(&path).unwrap(), log);
+        assert_eq!(store.load_outbox_state(1).unwrap(), state);
+    }
+
     /// A committed line of a kind other than an operator row refuses the drain
     /// at its line; a remote consent row drains.
     #[test]
