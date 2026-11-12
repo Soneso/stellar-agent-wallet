@@ -947,6 +947,7 @@ where
         &client,
         crate::commands::submission_record::settlement_oracle(profile).as_ref(),
         now_ms,
+        None,
     )
     .await;
 
@@ -1502,6 +1503,7 @@ where
         &client,
         crate::commands::submission_record::settlement_oracle_in(profile, &net_context).as_ref(),
         now_ms,
+        args.business_id.as_deref(),
     )
     .await;
 
@@ -3864,7 +3866,10 @@ pub(crate) mod tests {
             assert_eq!(data["ledger"], 1005);
             assert_eq!(data["cross_check"]["status"], "not_required");
             assert!(data.get("secret_key").is_none_or(Value::is_null));
-            assert!(fixture.oracle_methods().await.is_empty());
+            assert_eq!(
+                fixture.oracle_methods().await,
+                ["getLatestLedger", "getLedgers"]
+            );
             assert!(fixture.open_authorizations(now()).is_empty());
             assert!(invalidations_on_this_thread().is_empty());
             let entries = fixture.pending_entries();

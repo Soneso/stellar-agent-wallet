@@ -3103,6 +3103,7 @@ mod tests {
                     evidence_seq: 1,
                     digest: "0c".repeat(32),
                     observed_ledger: 100,
+                    kind: None,
                 }],
                 sequence_released: false,
                 primary_ledger: None,

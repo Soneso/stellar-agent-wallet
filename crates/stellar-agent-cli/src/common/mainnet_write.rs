@@ -447,7 +447,7 @@ pub(crate) async fn authorize_and_submit(
     // during the passkey ceremony, whose store closes before recorder use.
     let summary = MainnetWriteSummary::from_envelope(unsigned_xdr, consumer, effective_cap)
         .map_err(|e| Envelope::<()>::err(&e))?
-        .with_ledger(ledger);
+        .with_ledger(ledger.clone());
     let store_path = approval_store_dir()
         .map_err(|e| Envelope::<()>::err(&e))?
         .join(format!("{name}.toml"));
@@ -530,12 +530,9 @@ pub(crate) async fn authorize_and_submit(
         ),
         None => None,
     };
-    let recorder = prepared.bind_authorized(&auth, attempt);
-    record_bound_recorder(&recorder);
-
-    let signer = mainnet_signer(&choice, &enrolled, source, source_flag)
-        .await
-        .map_err(|e| {
+    let signer = match mainnet_signer(&choice, &enrolled, source, source_flag).await {
+        Ok(signer) => signer,
+        Err(e) => {
             let envelope = refused(
                 PipelineStep::SignerConstruction,
                 &e,
@@ -543,9 +540,25 @@ pub(crate) async fn authorize_and_submit(
                 verb,
                 Some(&minted),
             );
+            let recorder = prepared.bind_authorized(&auth, attempt, Default::default());
+            record_bound_recorder(&recorder);
             recorder.end_refused_attempt(e.code());
-            envelope
-        })?;
+            return Err(envelope);
+        }
+    };
+    // The oracle bound read follows the last refusal before signing and
+    // reuses the readiness report, so the primary sees no added request. Its
+    // deadline leaves the authorization most of its lifetime. A failed or
+    // late read stores no bound and changes no outcome.
+    let observation = stellar_agent_network::policy_state::submission_observation(
+        client,
+        oracle.as_ref(),
+        Some(&ledger),
+        stellar_agent_network::policy_state::recovery::bound_read_deadline(&auth),
+    )
+    .await;
+    let recorder = prepared.bind_authorized(&auth, attempt, observation);
+    record_bound_recorder(&recorder);
     let signed_xdr = attach_signature_authorized(
         unsigned_xdr,
         signer.signer(),

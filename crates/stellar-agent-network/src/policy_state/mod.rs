@@ -206,6 +206,7 @@ pub mod approvals;
 pub mod ledger;
 pub mod lock;
 pub mod operations;
+pub mod recovery;
 mod reset_consent;
 pub mod store;
 
@@ -231,6 +232,10 @@ pub use operations::{
     OperationHandle, OperationId, OperationKind, OperationLink, OperationRecorder, OperationResult,
     OperationState, OperationStatus, OperationTool, OperationView, RecoveryUpdate,
     SequenceReleaseInput, SlotKind, TransitionEvidence, WindowObservation, X402Intent,
+};
+pub use recovery::{
+    EndpointPair, LedgerAnswer, RecoveryError, RecoveryReport, RecoveryRequests,
+    SubmissionObservation, recover_sequences, submission_observation,
 };
 pub use store::{
     AccountingDecision, ChainScope, DeliveryReport, MintOutcome, OwedAccountingExpiries,

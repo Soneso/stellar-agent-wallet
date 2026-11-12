@@ -52,7 +52,7 @@ use rand_core::{OsRng, RngCore as _};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use stellar_agent_core::audit_log::AuditEntry;
-use stellar_agent_core::audit_log::schema::OperationEvidenceRow;
+use stellar_agent_core::audit_log::schema::{EvidenceKind, OperationEvidenceRow};
 use stellar_agent_core::policy::state_lock::WindowStoreLock;
 use stellar_agent_core::profile::caip2::Caip2;
 use stellar_agent_core::profile::receipt::{AttemptRef, SequenceReleases};
@@ -1065,9 +1065,32 @@ pub(super) struct WireEvidenceRow {
 }
 
 impl WireEvidenceRow {
-    /// The duplicate key: the endpoint, the answer's kind and the digest.
-    fn key(&self) -> (EvidenceEndpoint, u8, [u8; 32]) {
-        (self.endpoint, self.answer.kind(), self.digest)
+    /// The duplicate key is the endpoint, answer kind and observed ledger.
+    fn key(&self) -> (EvidenceEndpoint, u8, u32) {
+        (self.endpoint, self.answer.kind(), self.observed_ledger)
+    }
+
+    fn audit_kind(&self) -> EvidenceKind {
+        match (&self.answer, self.endpoint) {
+            (WireEvidenceAnswer::Ledger { .. }, EvidenceEndpoint::Primary) => {
+                EvidenceKind::PrimaryLedger
+            }
+            (WireEvidenceAnswer::Ledger { .. }, EvidenceEndpoint::Witness) => {
+                EvidenceKind::OracleLedger
+            }
+            (WireEvidenceAnswer::Account { .. }, EvidenceEndpoint::Primary) => {
+                EvidenceKind::PrimaryAccount
+            }
+            (WireEvidenceAnswer::Account { .. }, EvidenceEndpoint::Witness) => {
+                EvidenceKind::OracleAccount
+            }
+            (WireEvidenceAnswer::Outcome { .. }, EvidenceEndpoint::Primary) => {
+                EvidenceKind::PrimaryOutcome
+            }
+            (WireEvidenceAnswer::Outcome { .. }, EvidenceEndpoint::Witness) => {
+                EvidenceKind::OracleOutcome
+            }
+        }
     }
 }
 
@@ -1127,6 +1150,20 @@ fn outcome_class_ok(name: &str) -> bool {
 }
 
 impl WireRecovery {
+    fn snapshot(&self) -> RecoveryUpdate {
+        RecoveryUpdate {
+            primary_cursor: self.primary_cursor,
+            witness_cursor: self.witness_cursor,
+            primary_upper: self.primary_upper,
+            witness_upper: self.witness_upper,
+            disagreements: self.disagreements,
+            last_pass_at_ms: self.last_pass_at_ms,
+            last_outcome: self.last_outcome.clone(),
+            history_incomplete: self.history_incomplete,
+            diagnostic: self.diagnostic.as_ref().map(|text| text.text.clone()),
+        }
+    }
+
     /// Applies `update`. `history_incomplete` only ever becomes set.
     fn apply(&mut self, update: &RecoveryUpdate) -> Result<(), WindowStoreError> {
         if let Some(name) = &update.last_outcome
@@ -2498,6 +2535,8 @@ pub struct SequenceReleaseInput {
 /// What [`OperationRecorder::record_evidence`] commits.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct EvidenceInput {
+    /// The attempt snapshot required before applying a network evaluation.
+    pub expected_attempt: Option<RecoveryAttempt>,
     /// New rows, at most [`MAX_EVIDENCE_ROWS`]; a duplicate is a no-op.
     pub rows: Vec<EvidenceRowInput>,
     /// The first sequence release; a later one is ignored.
@@ -3424,6 +3463,26 @@ impl Session<'_> {
         }
         self.sweep_and_adopt()?;
         let index = record_index(&self.wire, id)?;
+        if let Some(expected) = &input.expected_attempt {
+            let record = &records(&self.wire)[index];
+            let attempt = record
+                .attempts
+                .iter()
+                .find(|attempt| attempt.index == attempt_index)
+                .ok_or_else(|| invalid("recovery snapshot names an unknown attempt"))?;
+            if expected.operation_id != id
+                || expected.attempt_index != attempt_index
+                || record.state != OperationState::SentOutcomeUnknown
+                || attempt.outcome != Some(OperationState::SentOutcomeUnknown)
+                || attempt.exposure.as_ref().map(|exposure| &exposure.identity)
+                    != Some(&expected.exposure)
+                || attempt.pre_exposure_ledger != expected.pre_exposure_ledger
+                || attempt.sequence_released.is_some() != expected.sequence_released
+                || attempt.recovery.clone().unwrap_or_default().snapshot() != expected.recovery
+            {
+                return Err(invalid("recovery snapshot is stale"));
+            }
+        }
         let commit = self.audit.commit;
         let now = self.now;
         let mut record = records(&self.wire)[index].clone();
@@ -3449,6 +3508,7 @@ impl Session<'_> {
                 evidence_seq: seq,
                 digest: stellar_agent_core::hex::encode(&row.digest),
                 observed_ledger: row.observed_ledger,
+                kind: Some(wire_row.audit_kind()),
             });
             attempt.evidence.push(wire_row);
         }
@@ -3520,6 +3580,8 @@ pub struct ConsumptionExposure<'a> {
     pub attempt_index: u32,
     /// The signed identity the attempt is about to send.
     pub identity: ExposureIdentity,
+    /// The independently observed lower bound before exposure.
+    pub pre_exposure_ledger: Option<u32>,
     /// The writer the exposure row is appended to, before the window write.
     pub audit: &'a mut dyn OperationAudit,
     /// The caller's request identifier on the exposure row.
@@ -3566,7 +3628,7 @@ pub(super) fn expose_in_consumption(
         exposure.operation_id,
         exposure.attempt_index,
         &exposure.identity,
-        None,
+        exposure.pre_exposure_ledger,
     );
     *wire = session.wire;
     exposed?;
@@ -3810,7 +3872,7 @@ impl<'a> OperationRecorder<'a> {
     ///
     /// # Errors
     ///
-    /// `internal.unexpected_state` for an unknown attempt,
+    /// `internal.unexpected_state` for an unknown attempt; a stale snapshot refuses before writing;
     /// `audit.append_failed`, and every store error.
     pub fn record_evidence(
         &mut self,
@@ -3930,6 +3992,29 @@ pub struct OperationStatus<'a> {
     profile: &'a Profile,
 }
 
+/// An authenticated classic attempt eligible for recovery.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecoveryAttempt {
+    /// The owning operation.
+    pub operation_id: OperationId,
+    /// The exposed attempt's index.
+    pub attempt_index: u32,
+    /// The signed identity committed before transmission.
+    pub exposure: ExposureIdentity,
+    /// The attempt's opening time in Unix milliseconds.
+    pub started_at_ms: u64,
+    /// The exclusive send deadline in Unix milliseconds.
+    pub send_by_ms: u64,
+    /// The independent lower bound observed before exposure.
+    pub pre_exposure_ledger: Option<u32>,
+    /// Both cursors, upper bounds and mutable recovery facts.
+    pub recovery: RecoveryUpdate,
+    /// Whether the immutable sequence release exists; a commit refuses when it changes.
+    pub sequence_released: bool,
+    /// Whether the attempt's authorization names a window reservation.
+    pub reservation_present: bool,
+}
+
 impl<'a> OperationStatus<'a> {
     /// A status reader for `profile`'s window in `store`.
     #[must_use]
@@ -3944,6 +4029,68 @@ impl<'a> OperationStatus<'a> {
         };
         prune_stale(&mut wire, now_ms()?);
         Ok(Some(wire))
+    }
+
+    /// Reads the four oldest exposed classic attempts with unknown outcomes
+    /// and no sequence release. A transaction hash selects only its matching attempt.
+    ///
+    /// # Errors
+    /// Returns every integrity, keyring and I/O error of the verified window read.
+    pub fn recovery_snapshot(
+        &self,
+        tx_hash: Option<&[u8; 32]>,
+    ) -> Result<Vec<RecoveryAttempt>, WindowStoreError> {
+        let Some(wire) = self.read()? else {
+            return Ok(Vec::new());
+        };
+        let mut attempts = Vec::new();
+        for record in records(&wire) {
+            if record.state != OperationState::SentOutcomeUnknown || record.kind.is_x402() {
+                continue;
+            }
+            for attempt in &record.attempts {
+                let Some(exposure) = &attempt.exposure else {
+                    continue;
+                };
+                let ExposureIdentity::Classic {
+                    tx_hash: stored_hash,
+                    ..
+                } = &exposure.identity
+                else {
+                    continue;
+                };
+                // A released attempt never takes a slot again.
+                if attempt.outcome != Some(OperationState::SentOutcomeUnknown)
+                    || attempt.sequence_released.is_some()
+                    || tx_hash.is_some_and(|hash| hash != stored_hash)
+                {
+                    continue;
+                }
+                let recovery = attempt.recovery.clone().unwrap_or_default();
+                attempts.push(RecoveryAttempt {
+                    operation_id: record.id,
+                    attempt_index: attempt.index,
+                    exposure: exposure.identity.clone(),
+                    started_at_ms: attempt.started_at_ms,
+                    send_by_ms: attempt.send_by_ms,
+                    pre_exposure_ledger: attempt.pre_exposure_ledger,
+                    recovery: recovery.snapshot(),
+                    sequence_released: attempt.sequence_released.is_some(),
+                    reservation_present: wire.authorizations.iter().any(|auth| {
+                        auth.id == attempt.authorization_id && auth.reservation.is_some()
+                    }),
+                });
+            }
+        }
+        attempts.sort_by_key(|attempt| {
+            (
+                attempt.started_at_ms,
+                attempt.operation_id.to_hex(),
+                attempt.attempt_index,
+            )
+        });
+        attempts.truncate(if tx_hash.is_some() { 1 } else { 4 });
+        Ok(attempts)
     }
 
     /// The record or tombstone `business_id` names.
@@ -4326,7 +4473,7 @@ fn classify(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     #![allow(
         clippy::unwrap_used,
         clippy::expect_used,
@@ -4365,9 +4512,9 @@ mod tests {
 
     /// An audit sink that keeps its rows, or refuses every append.
     #[derive(Default)]
-    struct Sink {
-        entries: Vec<AuditEntry>,
-        fail: bool,
+    pub(crate) struct Sink {
+        pub(crate) entries: Vec<AuditEntry>,
+        pub(crate) fail: bool,
     }
 
     impl OperationAudit for Sink {
@@ -4380,18 +4527,18 @@ mod tests {
         }
     }
 
-    struct Fx {
+    pub(crate) struct Fx {
         _dir: TempDir,
-        profile: Profile,
-        store: PersistedWindowStore,
-        clock: TestClockGuard,
-        sink: Sink,
+        pub(crate) profile: Profile,
+        pub(crate) store: PersistedWindowStore,
+        pub(crate) clock: TestClockGuard,
+        pub(crate) sink: Sink,
         nonces: Cell<u32>,
     }
 
     impl Fx {
         /// A mainnet profile whose policy pin names sequence 7, digest `[7; 32]`.
-        fn new() -> Self {
+        pub(crate) fn new() -> Self {
             keyring_mock::install().unwrap();
             let dir = TempDir::new().unwrap();
             let mut profile = Profile::builder_mainnet_named(
@@ -4427,7 +4574,7 @@ mod tests {
             fx
         }
 
-        fn recorder(&mut self) -> OperationRecorder<'_> {
+        pub(crate) fn recorder(&mut self) -> OperationRecorder<'_> {
             OperationRecorder::new(&self.store, &self.profile, &mut self.sink, REQUEST_ID)
         }
 
@@ -4435,7 +4582,7 @@ mod tests {
             crate::mainnet::clock::now_ms().unwrap()
         }
 
-        fn wire(&self) -> WireFile {
+        pub(in crate::policy_state) fn wire(&self) -> WireFile {
             self.store
                 .read_for_inspection(&self.profile)
                 .unwrap()
@@ -4449,7 +4596,7 @@ mod tests {
                 .map_or(0, |wire| wire.generation)
         }
 
-        fn record(&self, id: OperationId) -> WireOperation {
+        pub(in crate::policy_state) fn record(&self, id: OperationId) -> WireOperation {
             records(&self.wire())
                 .iter()
                 .find(|record| record.id == id)
@@ -4478,7 +4625,7 @@ mod tests {
 
         /// Rewrites the committed window through the generation commit,
         /// without pruning.
-        fn rewrite(&self, change: impl FnOnce(&mut WireFile)) {
+        pub(in crate::policy_state) fn rewrite(&self, change: impl FnOnce(&mut WireFile)) {
             let lock = WindowStoreLock::acquire_for(
                 self.store.path(),
                 &self.profile.policy_window_state_key_id,
@@ -4774,19 +4921,206 @@ mod tests {
         }
     }
 
+    fn ledger_row(endpoint: EvidenceEndpoint, ledger: u32) -> EvidenceRowInput {
+        EvidenceRowInput {
+            endpoint,
+            observed_ledger: ledger,
+            answer: EvidenceAnswer::Ledger {
+                expiry_ledger: ledger,
+                close_time: T0 / 1_000,
+                latest_ledger: ledger,
+            },
+            digest: Sha256::digest(ledger.to_be_bytes()).into(),
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn recovery_emitted_kinds_survive_eviction() {
+        let mut fx = Fx::new();
+        let handle = unknown_outcome(&mut fx);
+        fx.sink.entries.clear();
+        for ledger in 1..=9 {
+            fx.recorder()
+                .record_evidence(
+                    handle.id(),
+                    1,
+                    &EvidenceInput {
+                        rows: vec![
+                            ledger_row(EvidenceEndpoint::Primary, ledger),
+                            ledger_row(EvidenceEndpoint::Witness, ledger),
+                        ],
+                        ..EvidenceInput::default()
+                    },
+                )
+                .unwrap();
+        }
+        assert!(
+            fx.record(handle.id()).attempts[0]
+                .evidence
+                .iter()
+                .all(|row| row.observed_ledger > 1)
+        );
+        assert_eq!(fx.sink.entries.len(), 9);
+        for entry in &fx.sink.entries {
+            let EventKind::OperationEvidence { rows, .. } = &entry.event_kind else {
+                panic!("evidence row required")
+            };
+            assert_eq!(
+                rows.iter().map(|row| row.kind).collect::<Vec<_>>(),
+                vec![
+                    Some(EvidenceKind::PrimaryLedger),
+                    Some(EvidenceKind::OracleLedger)
+                ]
+            );
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn evidence_key_is_kind_and_observed_ledger() {
+        let mut fx = Fx::new();
+        let handle = unknown_outcome(&mut fx);
+        let row = ledger_row(EvidenceEndpoint::Primary, 10);
+        fx.recorder()
+            .record_evidence(
+                handle.id(),
+                1,
+                &EvidenceInput {
+                    rows: vec![row.clone()],
+                    ..EvidenceInput::default()
+                },
+            )
+            .unwrap();
+        let audit_count = fx.sink.entries.len();
+        let mut duplicate = row.clone();
+        duplicate.digest = [0x42; 32];
+        assert_eq!(
+            fx.recorder()
+                .record_evidence(
+                    handle.id(),
+                    1,
+                    &EvidenceInput {
+                        rows: vec![duplicate],
+                        recovery: Some(RecoveryUpdate {
+                            primary_cursor: Some(11),
+                            ..RecoveryUpdate::default()
+                        }),
+                        ..EvidenceInput::default()
+                    }
+                )
+                .unwrap(),
+            None
+        );
+        assert_eq!(fx.sink.entries.len(), audit_count);
+        assert_eq!(
+            fx.record(handle.id()).attempts[0]
+                .recovery
+                .as_ref()
+                .unwrap()
+                .primary_cursor,
+            Some(11)
+        );
+        let mut later = row;
+        later.observed_ledger = 11;
+        fx.recorder()
+            .record_evidence(
+                handle.id(),
+                1,
+                &EvidenceInput {
+                    rows: vec![
+                        later,
+                        outcome_row(1, 10),
+                        ledger_row(EvidenceEndpoint::Witness, 10),
+                    ],
+                    ..EvidenceInput::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(fx.record(handle.id()).evidence_committed_seq, 4);
+    }
+
+    #[test]
+    #[serial]
+    fn recovery_evidence_eviction_tie_breaks_on_sequence() {
+        let mut fx = Fx::new();
+        let handle = unknown_outcome(&mut fx);
+        let release = SequenceReleaseInput {
+            primary_ledger: 1,
+            witness_ledger: 2,
+            min_close_time_ms: T0,
+        };
+        fx.recorder()
+            .record_evidence(
+                handle.id(),
+                1,
+                &EvidenceInput {
+                    rows: (1..=4)
+                        .flat_map(|ledger| {
+                            [
+                                ledger_row(EvidenceEndpoint::Primary, ledger),
+                                ledger_row(EvidenceEndpoint::Witness, ledger),
+                            ]
+                        })
+                        .collect(),
+                    sequence_released: Some(release),
+                    ..EvidenceInput::default()
+                },
+            )
+            .unwrap();
+        let proof = fx.record(handle.id()).attempts[0].sequence_released.clone();
+        fx.recorder()
+            .record_evidence(
+                handle.id(),
+                1,
+                &EvidenceInput {
+                    rows: vec![ledger_row(EvidenceEndpoint::Primary, 5)],
+                    ..EvidenceInput::default()
+                },
+            )
+            .unwrap();
+        let record = fx.record(handle.id());
+        assert_eq!(record.evidence_committed_seq, 9);
+        assert_eq!(
+            record.attempts[0]
+                .evidence
+                .iter()
+                .map(|row| row.evidence_seq)
+                .collect::<Vec<_>>(),
+            (2..=9).collect::<Vec<_>>()
+        );
+        assert_eq!(record.attempts[0].sequence_released, proof);
+    }
+
     /// An exposed classic attempt in `SentOutcomeUnknown`.
     fn unknown_outcome(fx: &mut Fx) -> OperationHandle {
-        let handle = fx.open_new(&request("order-1", canonical(1)));
-        let mint = fx.mint_request(tx(1), fx.policy(), vec![]);
+        unknown_named(fx, 1)
+    }
+
+    pub(crate) fn unknown_named(fx: &mut Fx, n: u8) -> OperationHandle {
+        unknown_with(fx, n, 0, vec![])
+    }
+
+    /// An exposed classic attempt in `SentOutcomeUnknown` with `max_time` and `holds`.
+    pub(crate) fn unknown_with(
+        fx: &mut Fx,
+        n: u8,
+        max_time: u64,
+        holds: Vec<WindowEntry>,
+    ) -> OperationHandle {
+        let handle = fx.open_new(&request(&format!("order-{n}"), canonical(n)));
+        let mint = fx.mint_request(tx(n), fx.policy(), holds);
         let started = fx.begin_mint(&handle, &mint).unwrap();
         fx.claim(&mint, started.minted.as_ref().unwrap());
+        let mut exposure = classic_exposure(n);
+        if let ExposureIdentity::Classic {
+            max_time: bound, ..
+        } = &mut exposure
+        {
+            *bound = max_time;
+        }
         fx.recorder()
-            .expose(
-                handle.id(),
-                started.attempt_index,
-                &classic_exposure(1),
-                None,
-            )
+            .expose(handle.id(), started.attempt_index, &exposure, None)
             .unwrap();
         fx.recorder()
             .transition(
@@ -4797,6 +5131,87 @@ mod tests {
             )
             .unwrap();
         handle
+    }
+
+    #[test]
+    #[serial]
+    fn recovery_snapshot_selects_oldest_eligible_and_targets_by_hash() {
+        let mut fx = Fx::new();
+        let mut ids = Vec::new();
+        for n in 1..=5 {
+            fx.clock.set(T0 + u64::from(n));
+            let holds = if n == 3 { vec![hold(10)] } else { vec![] };
+            ids.push(unknown_with(&mut fx, n, T0 / 1_000 - 10, holds).id());
+        }
+        let snapshot = OperationStatus::new(&fx.store, &fx.profile)
+            .recovery_snapshot(None)
+            .unwrap();
+        assert_eq!(
+            snapshot
+                .iter()
+                .map(|attempt| attempt.operation_id)
+                .collect::<Vec<_>>(),
+            ids[..4]
+        );
+        assert_eq!(
+            snapshot
+                .iter()
+                .map(|attempt| attempt.reservation_present)
+                .collect::<Vec<_>>(),
+            [false, false, true, false]
+        );
+        let ExposureIdentity::Classic { tx_hash, .. } = classic_exposure(5) else {
+            unreachable!()
+        };
+        let targeted = OperationStatus::new(&fx.store, &fx.profile)
+            .recovery_snapshot(Some(&tx_hash))
+            .unwrap();
+        assert_eq!(targeted.len(), 1);
+        assert_eq!(targeted[0].operation_id, ids[4]);
+        fx.rewrite(|wire| {
+            let first = &mut section_mut(wire).records[0];
+            first.kind = OperationKind::X402Payment;
+        });
+        let snapshot = OperationStatus::new(&fx.store, &fx.profile)
+            .recovery_snapshot(None)
+            .unwrap();
+        assert_eq!(
+            snapshot
+                .iter()
+                .map(|attempt| attempt.operation_id)
+                .collect::<Vec<_>>(),
+            ids[1..]
+        );
+        let targeted = |fx: &Fx, n: u8| {
+            let ExposureIdentity::Classic { tx_hash, .. } = classic_exposure(n) else {
+                unreachable!()
+            };
+            OperationStatus::new(&fx.store, &fx.profile)
+                .recovery_snapshot(Some(&tx_hash))
+                .unwrap()
+                .len()
+        };
+        unknown_with(&mut fx, 6, T0 / 1_000 + 120, vec![]);
+        unknown_with(&mut fx, 7, 0, vec![]);
+        // A bound far ahead and a zero bound are both evaluated.
+        assert_eq!((targeted(&fx, 6), targeted(&fx, 7)), (1, 1));
+        let mut bytes = fs::read(fx.store.path()).unwrap();
+        let at = bytes
+            .windows(7)
+            .rposition(|window| window == b"order-2")
+            .unwrap();
+        bytes[at + 6] = b'9';
+        fs::write(fx.store.path(), bytes).unwrap();
+        let error = OperationStatus::new(&fx.store, &fx.profile)
+            .recovery_snapshot(None)
+            .unwrap_err();
+        // Mainnet builds report the authentication mismatch as an unverifiable state.
+        let expected = if cfg!(feature = "mainnet-write") {
+            "MainnetStateUnverifiable { defect: HmacInvalid }"
+        } else {
+            "HmacMismatch"
+        };
+        assert_eq!(format!("{error:?}"), expected);
     }
 
     #[test]

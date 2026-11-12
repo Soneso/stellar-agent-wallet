@@ -957,6 +957,14 @@ pub trait SequenceReleases {
     fn sequence_released(&self, attempt: &AttemptRef) -> bool;
 }
 
+struct NoSequenceReleases;
+
+impl SequenceReleases for NoSequenceReleases {
+    fn sequence_released(&self, _attempt: &AttemptRef) -> bool {
+        false
+    }
+}
+
 impl ReceiptStore {
     /// Opens (or creates) the receipt store for `profile_name` in the
     /// OS-conventional profile directory.
@@ -1284,6 +1292,39 @@ impl ReceiptStore {
         recorded_at_ledger: u32,
         approval_nonce: Option<&str>,
     ) -> Result<BeginSubmissionOutcome, ReceiptStoreError> {
+        self.begin_submission_releasing(
+            envelope_hash,
+            tx_hash,
+            source,
+            sequence,
+            max_time,
+            recorded_at_ledger,
+            approval_nonce,
+            &NoSequenceReleases,
+        )
+    }
+
+    /// Claims a receipt when every pending claimant at its pair has a committed sequence release.
+    /// Envelope and approval replay protection applies to released receipts too.
+    /// The caller holds the window guard before this method acquires the receipt guard.
+    ///
+    /// # Errors
+    /// Returns a receipt-store error when the claim cannot be read or persisted.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the receipt identity and its release reader are one atomic claim"
+    )]
+    pub fn begin_submission_releasing(
+        &self,
+        envelope_hash: &str,
+        tx_hash: &str,
+        source: &str,
+        sequence: i64,
+        max_time: u64,
+        recorded_at_ledger: u32,
+        approval_nonce: Option<&str>,
+        releases: &dyn SequenceReleases,
+    ) -> Result<BeginSubmissionOutcome, ReceiptStoreError> {
         let mut session = self.write_session()?;
         if let Some(nonce) = approval_nonce
             && let Some(existing) = session
@@ -1295,8 +1336,16 @@ impl ReceiptStore {
             return Ok(BeginSubmissionOutcome::DuplicateApproval(existing.clone()));
         }
 
-        if let Some(pending) = find_pending_for_pair(&session.guard, source, sequence) {
-            return Ok(BeginSubmissionOutcome::DuplicateSequence(pending));
+        if let Some(pending) = session.guard.map.values().find(|receipt| {
+            !source.is_empty()
+                && receipt.source == source
+                && receipt.sequence == sequence
+                && receipt.status == ReceiptStatus::Pending
+                && !crate::hex::decode_hex32(&receipt.envelope_hash)
+                    .ok()
+                    .is_some_and(|hash| releases.sequence_released(&AttemptRef::EnvelopeHash(hash)))
+        }) {
+            return Ok(BeginSubmissionOutcome::DuplicateSequence(pending.clone()));
         }
 
         if let Some(existing) = session.guard.map.get(envelope_hash) {
@@ -3537,6 +3586,115 @@ mod tests {
             store.get(HASH_B).unwrap().is_none(),
             "a refused submission writes no receipt"
         );
+    }
+
+    #[test]
+    fn recovery_receipt_claim_honors_sequence_release() {
+        struct Releases([u8; 32]);
+        impl SequenceReleases for Releases {
+            fn sequence_released(&self, attempt: &AttemptRef) -> bool {
+                *attempt == AttemptRef::EnvelopeHash(self.0)
+            }
+        }
+        for (first, second) in [([1; 32], [2; 32]), ([2; 32], [1; 32])] {
+            let (dir, store) = open_temp_store();
+            let first_text = crate::hex::encode(&first);
+            let second_text = crate::hex::encode(&second);
+            store
+                .begin_submission_with_approval(
+                    &first_text,
+                    TX_HASH_A,
+                    SOURCE_A,
+                    SEQ_A,
+                    10,
+                    1,
+                    Some("nonce"),
+                )
+                .unwrap();
+            let releases = Releases(first);
+            assert!(matches!(
+                store
+                    .begin_submission_releasing(
+                        &second_text,
+                        TX_HASH_B,
+                        SOURCE_A,
+                        SEQ_A,
+                        20,
+                        2,
+                        None,
+                        &releases
+                    )
+                    .unwrap(),
+                BeginSubmissionOutcome::Recorded
+            ));
+            let path = store.file_path().unwrap();
+            let name = path.file_stem().unwrap().to_str().unwrap();
+            let reopened = ReceiptStore::open_at(dir.path(), name).unwrap();
+            assert!(matches!(
+                reopened
+                    .begin_submission_releasing(
+                        &"03".repeat(32),
+                        TX_HASH_B,
+                        SOURCE_A,
+                        SEQ_A,
+                        20,
+                        2,
+                        None,
+                        &releases
+                    )
+                    .unwrap(),
+                BeginSubmissionOutcome::DuplicateSequence(_)
+            ));
+            assert!(matches!(
+                reopened
+                    .begin_submission_releasing(
+                        &first_text,
+                        TX_HASH_A,
+                        SOURCE_A,
+                        SEQ_A + 1,
+                        20,
+                        2,
+                        None,
+                        &releases
+                    )
+                    .unwrap(),
+                BeginSubmissionOutcome::AlreadyPresent(_)
+            ));
+            assert!(matches!(
+                reopened
+                    .begin_submission_releasing(
+                        &"04".repeat(32),
+                        TX_HASH_A,
+                        SOURCE_A,
+                        SEQ_A + 1,
+                        20,
+                        2,
+                        Some("nonce"),
+                        &releases
+                    )
+                    .unwrap(),
+                BeginSubmissionOutcome::DuplicateApproval(_)
+            ));
+        }
+        let (_dir, store) = open_temp_store();
+        store
+            .begin_submission("undecodable", TX_HASH_A, SOURCE_A, SEQ_A, 10, 1)
+            .unwrap();
+        assert!(matches!(
+            store
+                .begin_submission_releasing(
+                    HASH_B,
+                    TX_HASH_B,
+                    SOURCE_A,
+                    SEQ_A,
+                    20,
+                    2,
+                    None,
+                    &Releases([0; 32])
+                )
+                .unwrap(),
+            BeginSubmissionOutcome::DuplicateSequence(_)
+        ));
     }
 
     /// A settled receipt does not block a fresh submission at the same

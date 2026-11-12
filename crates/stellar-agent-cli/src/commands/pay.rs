@@ -812,6 +812,7 @@ where
         &client,
         crate::commands::submission_record::settlement_oracle(profile).as_ref(),
         now_ms,
+        None,
     )
     .await;
 
@@ -1415,6 +1416,7 @@ where
         &client,
         crate::commands::submission_record::settlement_oracle(profile).as_ref(),
         now_ms,
+        None,
     )
     .await;
 
@@ -2310,6 +2312,7 @@ where
         &client,
         crate::commands::submission_record::settlement_oracle_in(profile, &net_context).as_ref(),
         now_ms,
+        args.business_id.as_deref(),
     )
     .await;
 
@@ -6172,7 +6175,10 @@ pub(crate) mod tests {
             let entries = fixture.pending_entries();
             assert_eq!(entries.len(), 1, "{entries:?}");
             assert_eq!(entries[0].kind_name, "Consumed");
-            assert!(fixture.oracle_methods().await.is_empty());
+            assert_eq!(
+                fixture.oracle_methods().await,
+                ["getLatestLedger", "getLedgers"]
+            );
             assert_eq!(fixture.initializer_calls(), 1);
         }
 

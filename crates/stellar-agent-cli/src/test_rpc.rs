@@ -275,6 +275,11 @@ impl Respond for ClassicRpc {
             }),
             "getHealth" => health_result(&self.health_status.lock().unwrap()),
             "getLedgers" => ledgers_result(now_secs() - *self.close_age_secs.lock().unwrap()),
+            "getLatestLedger" => json!({
+                "id": "00".repeat(32),
+                "protocolVersion": 23,
+                "sequence": 2000
+            }),
             other => panic!("unexpected RPC method {other}"),
         };
         ResponseTemplate::new(200)

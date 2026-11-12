@@ -53,6 +53,9 @@ const HEALTHY_STATUS: &str = "healthy";
 /// The refusal reason of a `getLedgers` answer the check cannot use.
 const INVALID_CLOSE_TIME: &str = "getLedgers answered without a valid ledger close time";
 
+/// The readiness refusal when the caller's request allowance is spent.
+const REQUEST_ALLOWANCE_SPENT: &str = "the request allowance of this pass is spent";
+
 /// The refusal reason of an account read still running at the deadline the
 /// check ran under.
 const ACCOUNT_READ_PAST_DEADLINE: &str = "account read exceeded the readiness deadline";
@@ -67,6 +70,51 @@ pub struct OperationalReport {
     /// The host clock's Unix seconds minus [`Self::close_time_unix`],
     /// saturating at zero.
     pub close_lag_seconds: u64,
+}
+
+impl OperationalReport {
+    /// Validates shared health and ledger observations without sending requests.
+    ///
+    /// # Errors
+    /// Returns `network.endpoint_not_ready` for unhealthy, inconsistent or stale observations.
+    /// A clock failure retains `wallet.clock_error`.
+    pub fn from_ledger_observation(
+        health: &stellar_rpc_client::GetHealthResponse,
+        ledger: &stellar_rpc_client::GetLedgersResponse,
+        now_unix: Result<u64, WalletError>,
+    ) -> Result<Self, WalletError> {
+        let now_unix = now_unix?;
+        if health.status != HEALTHY_STATUS {
+            return Err(not_ready("endpoint reports an unhealthy status".to_owned()));
+        }
+        if ledger.latest_ledger_close_time <= 0
+            || ledger.latest_ledger_close_time < ledger.oldest_ledger_close_time
+            || ledger.latest_ledger < health.latest_ledger
+            || ledger.oldest_ledger > ledger.latest_ledger
+        {
+            return Err(not_ready(INVALID_CLOSE_TIME.to_owned()));
+        }
+        let close_time_unix = ledger.latest_ledger_close_time.unsigned_abs();
+        let latest_ledger = ledger.latest_ledger;
+        let bound = MAX_LEDGER_CLOSE_LAG.as_secs();
+        if close_time_unix > now_unix.saturating_add(bound) {
+            return Err(not_ready(format!(
+                "ledger {latest_ledger} closed {} s in the future of the host clock",
+                close_time_unix - now_unix
+            )));
+        }
+        let close_lag_seconds = now_unix.saturating_sub(close_time_unix);
+        if close_lag_seconds > bound {
+            return Err(not_ready(format!(
+                "ledger {latest_ledger} closed {close_lag_seconds} s ago; the endpoint or the host clock is behind"
+            )));
+        }
+        Ok(Self {
+            latest_ledger,
+            close_time_unix,
+            close_lag_seconds,
+        })
+    }
 }
 
 /// Checks that `client`'s endpoint is healthy and current before a value
@@ -93,6 +141,57 @@ pub async fn operational_check(
     operational_check_at(client, deadline, host_clock_unix).await
 }
 
+/// Checks readiness with one health request and one ledger request.
+///
+/// # Errors
+/// Returns the readiness and clock errors of [`operational_check`].
+pub async fn operational_check_single(
+    client: &StellarRpcClient,
+    deadline: Instant,
+) -> Result<OperationalReport, WalletError> {
+    single_readiness(client, deadline, None, host_clock_unix, &mut || true)
+        .await
+        .map(|read| read.report)
+}
+
+/// The answers behind one readiness report.
+pub(crate) struct ReadinessRead {
+    /// The health answer the report checks.
+    pub(crate) health: stellar_rpc_client::GetHealthResponse,
+    /// The oldest ledger the endpoint retains.
+    pub(crate) oldest_ledger: u32,
+    /// The validated report.
+    pub(crate) report: OperationalReport,
+}
+
+/// Reads readiness with one health request and one ledger request.
+/// A supplied `health` answer replaces the health request.
+/// `charge` runs before each request; `false` refuses that request.
+///
+/// # Errors
+/// Returns the readiness and clock errors of [`operational_check`].
+pub(crate) async fn single_readiness(
+    client: &StellarRpcClient,
+    deadline: Instant,
+    health: Option<stellar_rpc_client::GetHealthResponse>,
+    now_unix: impl FnOnce() -> Result<u64, WalletError>,
+    charge: &mut (dyn FnMut() -> bool + Send),
+) -> Result<ReadinessRead, WalletError> {
+    let health = match health {
+        Some(health) => health,
+        None => {
+            if !charge() {
+                return Err(not_ready(REQUEST_ALLOWANCE_SPENT.to_owned()));
+            }
+            tokio::time::timeout_at(deadline, client.get_health())
+                .await
+                .map_err(|_| not_ready("health read exceeded the readiness deadline".to_owned()))?
+                .map_err(|error| not_ready(network_failure_reason(error)))?
+        }
+    };
+    readiness_after_health(client, deadline, health, now_unix, charge).await
+}
+
 /// The host clock in Unix seconds, mapped to the wallet's clock error.
 fn host_clock_unix() -> Result<u64, WalletError> {
     stellar_agent_core::timefmt::now_unix_ms()
@@ -115,6 +214,19 @@ async fn operational_check_at(
         .get_health_within(deadline)
         .await
         .map_err(|error| not_ready(network_failure_reason(error)))?;
+    readiness_after_health(client, deadline, health, now_unix, &mut || true)
+        .await
+        .map(|read| read.report)
+}
+
+/// Checks `health`, then reads and validates one ledger.
+async fn readiness_after_health(
+    client: &StellarRpcClient,
+    deadline: Instant,
+    health: stellar_rpc_client::GetHealthResponse,
+    now_unix: impl FnOnce() -> Result<u64, WalletError>,
+    charge: &mut (dyn FnMut() -> bool + Send),
+) -> Result<ReadinessRead, WalletError> {
     if health.status != HEALTHY_STATUS {
         return Err(not_ready(format!(
             "endpoint reports status {}",
@@ -122,6 +234,9 @@ async fn operational_check_at(
         )));
     }
 
+    if !charge() {
+        return Err(not_ready(REQUEST_ALLOWANCE_SPENT.to_owned()));
+    }
     let own = Instant::now() + LEDGER_READ_TIMEOUT;
     let answer = tokio::time::timeout_at(
         deadline.min(own),
@@ -132,19 +247,8 @@ async fn operational_check_at(
         ),
     )
     .await;
-    let (latest_ledger, close_time_unix) = match answer {
-        Ok(Ok(answer))
-            if answer.latest_ledger_close_time > 0
-                && answer.latest_ledger_close_time >= answer.oldest_ledger_close_time
-                && answer.latest_ledger >= health.latest_ledger
-                && answer.oldest_ledger <= answer.latest_ledger =>
-        {
-            (
-                answer.latest_ledger,
-                answer.latest_ledger_close_time.unsigned_abs(),
-            )
-        }
-        Ok(Ok(_)) => return Err(not_ready(INVALID_CLOSE_TIME.to_owned())),
+    let ledger = match answer {
+        Ok(Ok(answer)) => answer,
         Ok(Err(error)) => {
             return Err(not_ready(format!(
                 "getLedgers failed: {}",
@@ -164,25 +268,11 @@ async fn operational_check_at(
         }
     };
 
-    let now_unix = now_unix()?;
-    let bound = MAX_LEDGER_CLOSE_LAG.as_secs();
-    if close_time_unix > now_unix.saturating_add(bound) {
-        return Err(not_ready(format!(
-            "ledger {latest_ledger} closed {} s in the future of the host clock",
-            close_time_unix - now_unix
-        )));
-    }
-    let close_lag_seconds = now_unix.saturating_sub(close_time_unix);
-    if close_lag_seconds > bound {
-        return Err(not_ready(format!(
-            "ledger {latest_ledger} closed {close_lag_seconds} s ago; the endpoint or the host \
-             clock is behind"
-        )));
-    }
-    Ok(OperationalReport {
-        latest_ledger,
-        close_time_unix,
-        close_lag_seconds,
+    let report = OperationalReport::from_ledger_observation(&health, &ledger, now_unix())?;
+    Ok(ReadinessRead {
+        health,
+        oldest_ledger: ledger.oldest_ledger,
+        report,
     })
 }
 
@@ -294,6 +384,56 @@ mod tests {
 
     /// The fixed host clock of these tests, in Unix seconds.
     const NOW: u64 = 1_800_000_000;
+
+    #[test]
+    fn recovery_oracle_report_applies_readiness_rules() {
+        let healthy: stellar_rpc_client::GetHealthResponse =
+            serde_json::from_value(health("healthy", 100)).unwrap();
+        let valid: stellar_rpc_client::GetLedgersResponse =
+            serde_json::from_value(ledgers(100, NOW)).unwrap();
+        let check = |health: &_, ledger: &_| {
+            OperationalReport::from_ledger_observation(health, ledger, Ok(NOW))
+        };
+        assert!(check(&healthy, &valid).is_ok());
+        let mut unhealthy = healthy.clone();
+        unhealthy.status = "unhealthy".to_owned();
+        assert!(check(&unhealthy, &valid).is_err());
+        let mut zero = valid.clone();
+        zero.latest_ledger_close_time = 0;
+        zero.oldest_ledger_close_time = 0;
+        assert!(OperationalReport::from_ledger_observation(&healthy, &zero, Ok(0)).is_err());
+        for (key, value) in [
+            ("latestLedgerCloseTime", json!("0")),
+            ("oldestLedgerCloseTime", json!(NOW + 1)),
+            ("latestLedger", json!(99)),
+            ("oldestLedger", json!(101)),
+            ("latestLedgerCloseTime", json!((NOW - 61).to_string())),
+            ("latestLedgerCloseTime", json!((NOW + 61).to_string())),
+        ] {
+            let mut answer = ledgers(100, NOW);
+            answer[key] = value;
+            let answer = serde_json::from_value(answer).unwrap();
+            assert!(check(&healthy, &answer).is_err(), "{key}");
+        }
+        for close in [NOW - 60, NOW + 60] {
+            assert!(
+                check(
+                    &healthy,
+                    &serde_json::from_value(ledgers(100, close)).unwrap()
+                )
+                .is_ok()
+            );
+        }
+        let error = WalletError::WalletState(WalletStateError::ClockError {
+            detail: "clock unavailable".to_owned(),
+        });
+        assert_eq!(
+            OperationalReport::from_ledger_observation(&healthy, &valid, Err(error))
+                .unwrap_err()
+                .code(),
+            "wallet.clock_error"
+        );
+    }
 
     fn health(status: &str, latest: u32) -> serde_json::Value {
         json!({

@@ -462,6 +462,7 @@ where
         &primary_rpc,
         crate::commands::submission_record::settlement_oracle(&profile).as_ref(),
         now_ms,
+        None,
     )
     .await;
 
@@ -884,6 +885,7 @@ where
         &primary_rpc,
         crate::commands::submission_record::settlement_oracle(&profile).as_ref(),
         now_ms,
+        None,
     )
     .await;
 

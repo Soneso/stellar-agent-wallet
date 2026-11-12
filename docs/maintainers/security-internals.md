@@ -1739,6 +1739,10 @@ row, before the window write. A failed append refuses with
 random commit identifier. Evidence rows take contiguous sequence numbers from
 the record's watermark. A chain observation writes no audit row.
 
+Recovery releases a classic source sequence only when both independent endpoints observe a ledger closing strictly after its positive time bound in one pass.
+The operation keeps its unknown outcome and budget hold.
+Missing pre-exposure provenance or pruned history sets a persistent history-incomplete flag; pruning alone proves no expiry.
+
 ### Approval records
 
 The window file authenticates one durable record per mainnet approval. Its
