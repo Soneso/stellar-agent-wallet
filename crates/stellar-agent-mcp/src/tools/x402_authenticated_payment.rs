@@ -852,29 +852,31 @@ impl WalletServer {
 #[cfg(feature = "mainnet-write")]
 impl WalletServer {
     /// The authenticated payment on a server holding the mainnet write
-    /// context, in two calls.
+    /// context, in one call under an `Allow` rule and in two calls under a
+    /// `RequireApproval` rule.
     ///
-    /// Both calls decode and validate the requirements, check the chain, the
-    /// approval pair and the home domain, obtain the enrolled payer, check
-    /// the optional address, recompute the payment root and intent digest,
-    /// and run the dispatch gate with the forced mainnet confirmation. The
-    /// first call, without approval arguments, writes a pending x402
-    /// approval for the intent and the home domain, and sends no request.
-    /// The second call checks that the startup proofs are unchanged,
-    /// verifies the approval of the intent for the home domain, runs the
-    /// authorized identity gate, which signs the SEP-10 challenge under a
-    /// consumed message authorization, and builds the payment as the intent
-    /// that continues the message receipt. It releases the payload only
-    /// after the submission authorization is consumed and the approval is
-    /// tombstoned.
+    /// Every call decodes and validates the requirements and checks the
+    /// chain, the approval pair and the home domain. It obtains the enrolled
+    /// payer, checks the optional address, recomputes the payment root and
+    /// intent digest, and runs the dispatch gate. Under an approval requirement, a
+    /// call without approval arguments writes a pending x402 approval for the
+    /// intent and the home domain, and sends no request. A call that pays
+    /// checks that the startup proofs are unchanged and, with approval
+    /// arguments, verifies the approval of the intent for the home domain.
+    /// It runs the authorized identity gate, which signs the SEP-10
+    /// challenge under a consumed message authorization, and builds the
+    /// payment as the intent that continues the message receipt. It releases
+    /// the payload only after the submission authorization is consumed and
+    /// any approval is tombstoned.
     async fn mainnet_authenticated_payment(
         &self,
         args: X402AuthenticatedPaymentArgs,
         guard: crate::server::MainnetWriteGuard<'_>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         use crate::tools::common::{
-            DispatchOutcome, GatedApprovalKind, approval_required_indistinguishable,
-            business_error_result, endpoint_refusal_result, verify_attestation_subject_gate,
+            DispatchOutcome, GatedApprovalKind, SuppliedProof, approval_required_indistinguishable,
+            authority_refusal_result, business_error_result, endpoint_refusal_result,
+            mainnet_authority,
         };
         use crate::tools::x402_create_payment::{
             ApprovalView, ReleaseFailure, approval_response, mainnet_x402_error, release_decision,
@@ -882,9 +884,9 @@ impl WalletServer {
         };
         use stellar_agent_core::approval::subject::approval_subject_x402_authenticated;
         use stellar_agent_core::approval::{PendingApproval, user_id::process_uid_for_attestation};
-        use stellar_agent_core::audit_log::PolicyDecision;
         use stellar_agent_network::mainnet::MainnetConsumer;
         use stellar_agent_network::mainnet::audit_readiness::audit_readiness;
+        use stellar_agent_network::mainnet::authority::{AuthorityRefusal, MainnetAuthority};
         use stellar_agent_x402::exact::{
             X402MainnetProofs, create_payment_authorized, intent_digest, payment_root,
             validate_requirements_for_payment,
@@ -999,72 +1001,84 @@ impl WalletServer {
             Ok(outcome) => outcome,
             Err(error) => return error.into_result(),
         };
-        let dispatch = match self.force_mainnet_confirmation(TOOL, dispatch) {
-            Ok(outcome) => outcome,
-            Err(error) => return error.into_result(),
-        };
         let network_id: [u8; 32] = {
             use sha2::{Digest, Sha256};
             Sha256::digest(guard.context.network_passphrase().as_bytes()).into()
         };
-        if !call_two {
-            let DispatchOutcome::RequireApproval(approval) = &dispatch else {
-                return Ok(approval_required_indistinguishable(name));
-            };
-            let entry = (|| {
-                let uid = process_uid_for_attestation()
-                    .map_err(|error| stellar_agent_core::approval::attest::record_error(&error))?;
-                let entry = PendingApproval::new_x402_pending(
-                    &network_id,
-                    &root,
-                    Some(args.home_domain.clone()),
-                    uid,
-                    approval.governing_ttl_ms,
-                )
-                .map_err(|error| stellar_agent_core::approval::attest::record_error(&error))?
-                .with_policy_request(&approval.request);
-                let mut store = self.x402_approval_store()?;
-                store
-                    .insert(
-                        entry.clone(),
-                        stellar_agent_network::mainnet::clock::now_ms()?,
-                    )
-                    .map_err(|error| stellar_agent_core::approval::attest::record_error(&error))?;
-                Ok::<_, stellar_agent_core::WalletError>(entry)
-            })();
-            let entry = match entry {
-                Ok(entry) => entry,
-                Err(error) => return Ok(business_error_result(error.code(), error.message())),
-            };
-            return Ok(approval_response(&ApprovalView {
-                entry: &entry,
-                profile: name,
-                chain_id: &args.chain_id,
-                endpoint_host: guard.enablement.endpoint_host(),
-                signer: &payer,
-                requirements: &requirements,
-                business_id: business_id.as_ref(),
-            }));
-        }
-        let approval = match verify_attestation_subject_gate(
+        // An `Allow` without a proof pays in this call under policy
+        // authority. An approval requirement without a proof writes the
+        // pending approval and returns it. A proof verifies through the gate.
+        let mut witness: Option<stellar_agent_core::approval::witness::ApprovalWitness> = None;
+        let authority = match mainnet_authority(
             self,
             &dispatch,
             GatedApprovalKind::X402.expectation(approval_subject_x402_authenticated(
                 &digest,
                 &args.home_domain,
             )),
-            args.approval_nonce.as_deref(),
-            args.approval_attestation.as_deref(),
+            &SuppliedProof {
+                nonce: args.approval_nonce.clone(),
+                attestation: args.approval_attestation.clone(),
+            },
             TOOL,
+            &mut witness,
         )
         .await
         {
-            Ok(Some(approval)) => approval,
-            Ok(None) => return Ok(approval_required_indistinguishable(name)),
-            Err(result) => return Ok(result),
+            Ok(authority) => authority,
+            Err(AuthorityRefusal::ApprovalRequired { .. }) => {
+                let DispatchOutcome::RequireApproval(approval) = &dispatch else {
+                    return Ok(approval_required_indistinguishable(name));
+                };
+                let entry = (|| {
+                    let uid = process_uid_for_attestation().map_err(|error| {
+                        stellar_agent_core::approval::attest::record_error(&error)
+                    })?;
+                    let entry = PendingApproval::new_x402_pending(
+                        &network_id,
+                        &root,
+                        Some(args.home_domain.clone()),
+                        uid,
+                        approval.governing_ttl_ms,
+                    )
+                    .map_err(|error| stellar_agent_core::approval::attest::record_error(&error))?
+                    .with_policy_request(&approval.request);
+                    let mut store = self.x402_approval_store()?;
+                    store
+                        .insert(
+                            entry.clone(),
+                            stellar_agent_network::mainnet::clock::now_ms()?,
+                        )
+                        .map_err(|error| {
+                            stellar_agent_core::approval::attest::record_error(&error)
+                        })?;
+                    Ok::<_, stellar_agent_core::WalletError>(entry)
+                })();
+                let entry = match entry {
+                    Ok(entry) => entry,
+                    Err(error) => {
+                        return Ok(business_error_result(error.code(), error.message()));
+                    }
+                };
+                return Ok(approval_response(&ApprovalView {
+                    entry: &entry,
+                    profile: name,
+                    chain_id: &args.chain_id,
+                    endpoint_host: guard.enablement.endpoint_host(),
+                    signer: &payer,
+                    requirements: &requirements,
+                    business_id: business_id.as_ref(),
+                }));
+            }
+            Err(refusal) => return Ok(authority_refusal_result(self, refusal)),
         };
-        let authority =
-            stellar_agent_network::mainnet::authority::MainnetAuthority::Approval(&approval);
+        // Policy authority pays in this call, so the startup proofs are
+        // checked here, before any preparation.
+        if matches!(authority, MainnetAuthority::Policy(_))
+            && let Err(result) = self.verify_mainnet_freshness(&guard)
+        {
+            return Ok(result);
+        }
         // ── Audit pre-flight (fail-closed) ────────────────────────────────────
         // A log that cannot take a row refuses before the SEP-10 exchange
         // spends the approval.
@@ -1130,7 +1144,12 @@ impl WalletServer {
             Err(result) => return Ok(result),
         };
         let mut audit = X402AuthorizationAudit::new(self, TOOL, &args.chain_id, audit_leg)
-            .with_decision(PolicyDecision::RequireApproval);
+            .with_decision(dispatch.audit_decision())
+            .with_provenance(
+                dispatch
+                    .mainnet_decision()
+                    .map(stellar_agent_core::mainnet::decision::MainnetDecision::provenance),
+            );
         let steps = crate::tools::business_entry::X402Steps::new(self, entry);
         let proofs = X402MainnetProofs::new(
             guard.context,
@@ -1230,25 +1249,28 @@ impl WalletServer {
                 audit.transmitted_ledger(),
             ));
         }
-        let final_digest = stellar_agent_core::hex::encode(
-            &stellar_agent_core::approval::subject::approval_subject_classic(envelope),
-        );
-        let terminal = self.x402_approval_store().and_then(|mut pending| {
-            pending
-                .consume(
-                    approval.nonce(),
-                    &final_digest,
-                    stellar_agent_core::approval::ConsumedOutcome::Unknown,
-                )
-                .map_err(|error| stellar_agent_core::approval::attest::record_error(&error))
-        });
-        if let Err(error) = require_terminal_consumption(terminal) {
-            let withheld = withhold(ReleaseFailure::TerminalApproval);
-            return Ok(terminal_payment_error(
-                &error,
-                withheld,
-                audit.transmitted_ledger(),
-            ));
+        // Only an approval is spent; policy authority holds no approval.
+        if let MainnetAuthority::Approval(approval) = &authority {
+            let final_digest = stellar_agent_core::hex::encode(
+                &stellar_agent_core::approval::subject::approval_subject_classic(envelope),
+            );
+            let terminal = self.x402_approval_store().and_then(|mut pending| {
+                pending
+                    .consume(
+                        approval.nonce(),
+                        &final_digest,
+                        stellar_agent_core::approval::ConsumedOutcome::Unknown,
+                    )
+                    .map_err(|error| stellar_agent_core::approval::attest::record_error(&error))
+            });
+            if let Err(error) = require_terminal_consumption(terminal) {
+                let withheld = withhold(ReleaseFailure::TerminalApproval);
+                return Ok(terminal_payment_error(
+                    &error,
+                    withheld,
+                    audit.transmitted_ledger(),
+                ));
+            }
         }
         steps.released();
         Ok(payment_response(

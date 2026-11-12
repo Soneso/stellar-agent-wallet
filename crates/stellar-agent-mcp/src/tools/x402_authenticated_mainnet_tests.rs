@@ -49,7 +49,7 @@ use crate::server::{WalletServer, X402AuthenticatedPaymentArgs};
 use crate::tools::common::tests::mainnet::{
     Fixture, HookGuard, ReadOnlyDir, RpcControl, assert_cleanup_found_the_claim,
     assert_names_the_transmitted_ledger, authorizations, ledger, mount_rpc, observe, put, refusals,
-    routed_fixture_with, stored_approval, wire, x402_authorized_rows,
+    require_approval_rules, routed_fixture_with, stored_approval, wire, x402_authorized_rows,
 };
 use crate::tools::common::{GatedApprovalKind, verify_attestation_subject_gate, x402_value_leg};
 
@@ -371,7 +371,10 @@ impl Sep10Double {
 
 /// Adds a rule for the authenticated tool, a copy of the x402 create rule,
 /// edited by `edit`.
-fn authenticated_policy_with(raw: &str, edit: impl FnOnce(&mut toml_edit::Table)) -> String {
+pub(super) fn authenticated_policy_with(
+    raw: &str,
+    edit: impl FnOnce(&mut toml_edit::Table),
+) -> String {
     let mut doc = raw.parse::<toml_edit::DocumentMut>().unwrap();
     let rules = doc["rules"].as_array_of_tables_mut().unwrap();
     let mut rule = rules
@@ -464,7 +467,7 @@ pub(super) struct Run {
     _primary: wiremock::MockServer,
     _oracle: wiremock::MockServer,
     pub(super) control: Arc<RpcControl>,
-    oracle_control: Arc<RpcControl>,
+    pub(super) oracle_control: Arc<RpcControl>,
     pub(super) double: Sep10Double,
 }
 
@@ -473,7 +476,18 @@ impl Run {
         Self::with(|raw| authenticated_policy(&raw)).await
     }
 
-    async fn with(policy: impl FnOnce(String) -> String) -> Self {
+    /// A run whose authenticated rule, which `policy` adds, requires approval
+    /// for 600 seconds.
+    pub(super) async fn with(policy: impl FnOnce(String) -> String) -> Self {
+        Self::build(|raw| require_approval_rules(&policy(raw), &[TOOL], 600)).await
+    }
+
+    /// A run whose authenticated rule allows: a call without a proof pays.
+    pub(super) async fn allowed() -> Self {
+        Self::build(|raw| authenticated_policy(&raw)).await
+    }
+
+    async fn build(policy: impl FnOnce(String) -> String) -> Self {
         let primary = wiremock::MockServer::start().await;
         let oracle = wiremock::MockServer::start().await;
         let mut f = routed_fixture_with(policy, |_| {}, &primary, &oracle);
@@ -648,11 +662,13 @@ async fn call_one_writes_the_pending_approval_without_a_request() {
         )
         .await
         .unwrap();
-    let outcome = run
-        .f
-        .server
-        .force_mainnet_confirmation(TOOL, outcome)
-        .unwrap();
+    assert!(
+        matches!(
+            outcome,
+            crate::tools::common::DispatchOutcome::RequireApproval(_)
+        ),
+        "the run's rule requires approval"
+    );
     assert_eq!(
         entry.expires_at_unix_ms - entry.created_at_unix_ms,
         outcome.governing_ttl_ms()
@@ -1124,8 +1140,44 @@ struct Boundary {
 }
 
 impl Boundary {
+    /// The boundary under an authenticated rule that requires approval for
+    /// 600 seconds.
     async fn new() -> Self {
-        let f = Fixture::new(|raw| authenticated_policy(&raw));
+        Self::with(|raw| require_approval_rules(&authenticated_policy(&raw), &[TOOL], 600)).await
+    }
+
+    /// The boundary under an allowing authenticated rule.
+    async fn allowed() -> Self {
+        Self::with(|raw| authenticated_policy(&raw)).await
+    }
+
+    /// The `Allow` decision of the authenticated rule for `HOME`, from the
+    /// tool's gate.
+    async fn allow_decision(&self) -> stellar_agent_core::mainnet::decision::MainnetDecision {
+        let outcome = self
+            .f
+            .server
+            .dispatch_preparation(
+                TOOL,
+                &serde_json::json!({"chain_id":"stellar:mainnet", "home_domain":HOME}),
+                "stellar:mainnet",
+                ValueClass::single(x402_value_leg(&self.requirements, 10)),
+                stellar_agent_core::mainnet::decision::EvaluationScope::X402Authenticated {
+                    home_domain: HOME.to_owned(),
+                    tool: TOOL.to_owned(),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            crate::tools::common::DispatchOutcome::Allow(_)
+        ));
+        outcome.mainnet_decision().unwrap().clone()
+    }
+
+    async fn with(policy: impl FnOnce(String) -> String) -> Self {
+        let f = Fixture::new(policy);
         let double = Sep10Double::start().await;
         let requirements = f.requirements();
         let root =
@@ -1167,11 +1219,6 @@ impl Boundary {
                 },
             )
             .await
-            .unwrap();
-        let outcome = self
-            .f
-            .server
-            .force_mainnet_confirmation(TOOL, outcome)
             .unwrap();
         let digest =
             stellar_agent_x402::exact::intent_digest(&self.requirements, self.f.envelope.source())
@@ -1225,6 +1272,19 @@ impl Boundary {
     /// Mints and consumes the message authorization of `facts` under
     /// `approval`, through the public resolver and consume.
     fn receipt(&self, facts: &MessageFacts, approval: &ApprovalWitness) -> MessageUseReceipt {
+        self.receipt_under(
+            facts,
+            &stellar_agent_network::mainnet::authority::MainnetAuthority::Approval(approval),
+        )
+    }
+
+    /// Mints and consumes the message authorization of `facts` under
+    /// `authority`, through the public resolver and consume.
+    fn receipt_under(
+        &self,
+        facts: &MessageFacts,
+        authority: &stellar_agent_network::mainnet::authority::MainnetAuthority<'_>,
+    ) -> MessageUseReceipt {
         use stellar_agent_network::mainnet::resolve::{
             MessageSignRequest, consume_message_sign, resolve_message_sign,
         };
@@ -1247,9 +1307,7 @@ impl Boundary {
             message: facts,
             policy: guard.policy,
             enablement: guard.enablement,
-            authority: &stellar_agent_network::mainnet::authority::MainnetAuthority::Approval(
-                approval,
-            ),
+            authority,
             audit,
             store: &store,
         })
@@ -1308,19 +1366,40 @@ impl Boundary {
     }
 }
 
-/// The completion refuses a receipt whose record expired before it signs.
+/// The completion refuses a receipt whose record expired before it signs,
+/// under an approval and under policy authority.
 #[tokio::test]
 #[serial_test::serial(keyring)]
 async fn the_sibling_refuses_an_expired_authorization() {
-    let b = Boundary::new().await;
-    let (prepared, receipt) = b.prepared_with_receipt().await;
-    let expires = used_message_record(&b.f)["expires_ms"].as_u64().unwrap();
-    let _clock = stellar_agent_network::mainnet::clock::set_now_ms_for_test(expires + 1);
-    let (capture, _guard) =
-        stellar_agent_test_support::WarningCapture::capture(Some("stellar_agent"));
-    let error = b.complete(prepared, &receipt).await;
-    b.assert_refused_before_signing(&error, &capture, "expired")
-        .await;
+    for policy in [false, true] {
+        let (b, prepared, receipt) = if policy {
+            let b = Boundary::allowed().await;
+            let prepared = b.prepare(&Boundary::client(MAINNET_PASSPHRASE)).await;
+            let decision = b.allow_decision().await;
+            let authority =
+                stellar_agent_network::mainnet::authority::MainnetAuthority::from_decision(
+                    &decision, None,
+                )
+                .unwrap();
+            let receipt = b.receipt_under(&prepared.message_facts(), &authority);
+            assert!(
+                used_message_record(&b.f)["policy_authority"].is_object(),
+                "the record binds the policy authority"
+            );
+            (b, prepared, receipt)
+        } else {
+            let b = Boundary::new().await;
+            let (prepared, receipt) = b.prepared_with_receipt().await;
+            (b, prepared, receipt)
+        };
+        let expires = used_message_record(&b.f)["expires_ms"].as_u64().unwrap();
+        let _clock = stellar_agent_network::mainnet::clock::set_now_ms_for_test(expires + 1);
+        let (capture, _guard) =
+            stellar_agent_test_support::WarningCapture::capture(Some("stellar_agent"));
+        let error = b.complete(prepared, &receipt).await;
+        b.assert_refused_before_signing(&error, &capture, "expired")
+            .await;
+    }
 }
 
 /// The completion refuses a challenge that was validated under testnet, even
@@ -1510,6 +1589,57 @@ async fn the_identity_gate_refuses_a_future_created_approval() {
     assert_eq!(b.double.posts().await, 0);
 }
 
+/// The identity gate refuses policy authority whose governing end has passed
+/// before anything is minted or signed.
+#[tokio::test]
+#[serial_test::serial(keyring)]
+async fn the_identity_gate_refuses_an_ended_policy_authority() {
+    let b = Boundary::allowed().await;
+    let decision = b.allow_decision().await;
+    let authority =
+        stellar_agent_network::mainnet::authority::MainnetAuthority::from_decision(&decision, None)
+            .unwrap();
+    let stellar_agent_network::mainnet::authority::MainnetAuthority::Policy(policy) = &authority
+    else {
+        panic!("an allowed decision without a witness is policy authority")
+    };
+    let _clock =
+        stellar_agent_network::mainnet::clock::set_now_ms_for_test(policy.governing_until_ms());
+    let guard =
+        b.f.server
+            .mainnet_write_admission(MainnetConsumer::X402Authenticated)
+            .unwrap();
+    let store = b.store();
+    let intent = b.intent();
+    let audit = stellar_agent_network::mainnet::audit_readiness::audit_readiness(
+        guard.context.profile(),
+        "operator",
+    )
+    .unwrap();
+    let error = stellar_agent_x402_identity::resolve_and_verify_counterparty_authorized_at(
+        HOME,
+        &b.double.server.uri(),
+        &Sep10Double::http(),
+        Some(&b.double.endpoint()),
+        stellar_agent_x402_identity::MainnetIdentityInputs {
+            context: guard.context,
+            intent: &intent,
+            policy: guard.policy,
+            enablement: guard.enablement,
+            authority: &authority,
+            audit,
+            store: &store,
+        },
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.wire_code(), "identity.mainnet_authorization_refused");
+    assert_eq!(error.to_string(), SEP10_REFUSAL);
+    assert!(authorizations(&b.f).is_empty());
+    assert!(signings().is_empty());
+    assert_eq!(b.double.posts().await, 0);
+}
+
 /// The identity inputs print the profile only: nothing of the approval, the
 /// policy, the enablement, the audit or the store.
 #[tokio::test]
@@ -1548,6 +1678,53 @@ async fn the_identity_inputs_print_the_profile_only() {
         )
     );
     assert!(!printed.contains(&entry.approval_nonce), "{printed}");
+
+    // Policy authority prints nothing of its provenance either.
+    let verified = b.f.server.verified_policy.as_deref().unwrap();
+    let decision = stellar_agent_core::mainnet::decision::MainnetDecision::for_test(
+        stellar_agent_core::policy::Decision::Allow,
+        None,
+        verified.digest(),
+        verified.sequence(),
+        0,
+        "operator",
+        "stellar:mainnet",
+        stellar_agent_core::timefmt::now_unix_ms().unwrap(),
+        600_000,
+        stellar_agent_core::mainnet::decision::AuthorityScope::X402Authenticated {
+            home_domain: HOME.to_owned(),
+            tool: TOOL.to_owned(),
+        },
+    );
+    let authority =
+        stellar_agent_network::mainnet::authority::MainnetAuthority::from_decision(&decision, None)
+            .unwrap();
+    let audit = stellar_agent_network::mainnet::audit_readiness::audit_readiness(
+        guard.context.profile(),
+        "operator",
+    )
+    .unwrap();
+    let inputs = stellar_agent_x402_identity::MainnetIdentityInputs {
+        context: guard.context,
+        intent: &intent,
+        policy: guard.policy,
+        enablement: guard.enablement,
+        authority: &authority,
+        audit,
+        store: &store,
+    };
+    let printed = format!("{inputs:?}");
+    assert_eq!(
+        printed,
+        format!(
+            "MainnetIdentityInputs {{ profile: {:?}, .. }}",
+            guard.context.profile_name()
+        )
+    );
+    assert!(
+        !printed.contains(&stellar_agent_core::hex::encode(&decision.policy_digest())),
+        "{printed}"
+    );
 }
 
 /// The verified mainnet session prints the redacted session and the
@@ -1610,4 +1787,59 @@ async fn the_mainnet_session_prints_no_jwt_and_no_envelope() {
     for hidden in [jwt, envelope, digest, entry.approval_nonce] {
         assert!(!printed.contains(&hidden), "{printed} holds {hidden}");
     }
+}
+
+/// The session verified under policy authority prints the redacted session
+/// and receipt too, and its message record binds the home-domain scope.
+#[tokio::test]
+#[serial_test::serial(keyring)]
+async fn the_policy_session_prints_no_jwt_and_no_envelope() {
+    let b = Boundary::allowed().await;
+    let decision = b.allow_decision().await;
+    let authority =
+        stellar_agent_network::mainnet::authority::MainnetAuthority::from_decision(&decision, None)
+            .unwrap();
+    let guard =
+        b.f.server
+            .mainnet_write_admission(MainnetConsumer::X402Authenticated)
+            .unwrap();
+    let store = b.store();
+    let intent = b.intent();
+    let audit = stellar_agent_network::mainnet::audit_readiness::audit_readiness(
+        guard.context.profile(),
+        "operator",
+    )
+    .unwrap();
+    let session = stellar_agent_x402_identity::resolve_and_verify_counterparty_authorized_at(
+        HOME,
+        &b.double.server.uri(),
+        &Sep10Double::http(),
+        Some(&b.double.endpoint()),
+        stellar_agent_x402_identity::MainnetIdentityInputs {
+            context: guard.context,
+            intent: &intent,
+            policy: guard.policy,
+            enablement: guard.enablement,
+            authority: &authority,
+            audit,
+            store: &store,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(session.session().home_domain, HOME);
+    let printed = format!("{session:?}");
+    let (verified, receipt) = session.into_parts();
+    assert_eq!(
+        printed,
+        format!("MainnetCounterpartySession {{ session: {verified:?}, receipt: {receipt:?} }}")
+    );
+    let envelope = b.double.control.last_served().envelope;
+    for hidden in [verified.jwt.clone(), envelope] {
+        assert!(!printed.contains(&hidden), "{printed} holds {hidden}");
+    }
+    assert_eq!(
+        used_message_record(&b.f)["policy_authority"]["scope"],
+        serde_json::json!({"kind":"x402_authenticated", "home_domain": HOME, "tool": TOOL})
+    );
 }

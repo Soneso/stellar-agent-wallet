@@ -380,20 +380,24 @@ Builds from this repository and releases from v0.1.0-alpha.14 on carry
 `mainnet-write`. The MCP server in these builds admits `stellar_pay_commit`,
 `stellar_claim_commit`, `stellar_create_account_commit`, and
 `stellar_trustline_commit` after setup.
-Both prepare and commit policy names need matching rules. The four pairs require
-approval even under Allow. A pending approval uses the shorter lifetime from
-the prepare and commit evaluations. Allow contributes 600 seconds;
-RequireApproval supplies its configured lifetime. Authorization defaults to
-120 seconds and cannot outlive approval.
+Both prepare and commit policy names need matching rules. Under Allow, a
+mainnet commit signs without an approval. Under RequireApproval, it needs a
+verified approval. A commit evaluates both its own name and its preparation's
+name, and the stricter decision governs.
+A pending approval uses the shorter lifetime from the two evaluations. Allow
+contributes 600 seconds; RequireApproval supplies its configured lifetime.
+Authorization defaults to 120 seconds and cannot outlive the governing
+decision.
 
-On an admitted mainnet server, both x402 payment tools require approval even
-when their matching rule allows the action. [x402](#x402) describes their two
-calls.
+On an admitted mainnet server, an x402 payment under Allow returns the payment
+in one call. Under RequireApproval it takes two calls. [x402](#x402) describes
+both.
 
 Paired preparation refuses an undecodable envelope with `simulation.divergence`.
 A denied rule retains `policy.deny.*`; an unknown decision uses
 `policy.unexpected_decision`. None of these refusals persists an approval.
-Each commit forces confirmation before attestation validation.
+Each commit evaluates both names before attestation validation. A proof
+supplied under Allow is verified and spent like a required one.
 
 Classic mainnet previews carry an on-chain deadline 120 seconds after they are
 built, bound into consent and the protocol nonce. Commits copy this deadline
@@ -972,9 +976,9 @@ that `stellar_sep24_interactive_url` consumes; it has no standalone tool. See
 
 | Tool | Purpose | Gating |
 | --- | --- | --- |
-| `stellar_x402_create_payment` | Construct and sign an x402 v2 Exact Stellar `PAYMENT-SIGNATURE` from a `PaymentRequirements` object; obtain the cross-check witness before signing; return the payment signature, its fields, and `cross_check`. The wallet does not submit. On an admitted mainnet server, call 1 returns approval instructions. Call 2 verifies approval and releases the authorized payment payload. | Signs the payment authorization entry; does not submit. |
+| `stellar_x402_create_payment` | Construct and sign an x402 v2 Exact Stellar `PAYMENT-SIGNATURE` from a `PaymentRequirements` object; obtain the cross-check witness before signing; return the payment signature, its fields, and `cross_check`. The wallet does not submit. On an admitted mainnet server, an Allow rule releases the authorized payment payload in one call. Under RequireApproval, call 1 returns approval instructions, and call 2 verifies approval and releases the payload. | Signs the payment authorization entry; does not submit. |
 | `stellar_x402_parse_receipt` | Decode an x402 v2 `PAYMENT-RESPONSE` into a structured settlement receipt. Text fields are escaped and cut at 200 characters. | Read-only; no keyring, no network. No `chain_id`. |
-| `stellar_x402_authenticated_payment` | Run a SEP-10 identity gate against a `home_domain` (stellar.toml, SSRF bind, ephemeral challenge/response, JWT), then construct the `PAYMENT-SIGNATURE` with the cross-check witness. Any identity failure aborts before payment. On an admitted mainnet server, call 1 returns approval instructions. Call 2 verifies approval and releases the authorized payment payload. Call 2 signs and submits the bound SEP-10 challenge before payment construction. | Signs the payment authorization entry; does not submit. |
+| `stellar_x402_authenticated_payment` | Run a SEP-10 identity gate against a `home_domain` (stellar.toml, SSRF bind, ephemeral challenge/response, JWT), then construct the `PAYMENT-SIGNATURE` with the cross-check witness. Any identity failure aborts before payment. On an admitted mainnet server, an Allow rule releases the authorized payment payload in one call. Under RequireApproval, call 1 returns approval instructions, and call 2 verifies approval and releases the payload. The signing call signs and submits the bound SEP-10 challenge before payment construction. | Signs the payment authorization entry; does not submit. |
 
 The `chain_id` argument of both payment tools takes the wallet's spelling,
 `stellar:testnet` or `stellar:mainnet`. The x402 requirement `network` spells
@@ -1046,12 +1050,17 @@ an oracle.
 
 #### Mainnet x402 calls
 
-On an admitted mainnet server, each x402 payment takes two calls. Both tools
-take the optional `approval_nonce` and `approval_attestation` arguments.
+On an admitted mainnet server, an x402 payment under Allow takes one call
+without approval arguments, and that call signs and pays. Under
+RequireApproval it takes two calls: call 1 stores the pending approval, and
+call 2 presents it and pays. The call that pays is the signing call. For the
+authenticated tool it also runs the SEP-10 exchange. Each authorization the
+signing call mints lasts at most 120 seconds. Both tools take the optional
+`approval_nonce` and `approval_attestation` arguments.
 
 Each call opens the payment's operation record under its `business_id` once
 the requirements and the payer are known, so a retained payment answers with
-its stored state. Call 2 commits the attempt as `sending` after the intent
+its stored state. The signing call commits the attempt as `sending` after the intent
 mint and before the signature. The exposure commits after the intent
 consumption and before the signed re-simulation, the first request that
 carries the signed entries. A returned payload ends the attempt as
@@ -1059,11 +1068,12 @@ carries the signed entries. A returned payload ends the attempt as
 the failure's code. A failure after it, or a withheld payload, ends it as
 `sent_outcome_unknown`.
 `approval_nonce` is optional in the schema. Omit it with `approval_attestation`
-for mainnet call 1, and supply both for call 2. Mainnet call 2 requires the
-CLI-issued attestation alongside its approval nonce. Supplying only one approval
-argument returns `policy.approval_required`.
+for mainnet call 1. Under RequireApproval, supply both for call 2, which
+requires the CLI-issued attestation alongside its approval nonce. Supplying
+only one approval argument returns `policy.approval_required`.
 
-Call 1 runs these checks and stores the pending approval:
+Call 1 runs these checks. Under Allow it pays, and under RequireApproval it
+stores the pending approval:
 
 1. The entry and startup checks refuse with `network.mainnet_write_forbidden`.
    They require the server's mainnet context, an admitted tool, the V1 engine,
@@ -1083,12 +1093,13 @@ Call 1 runs these checks and stores the pending approval:
 8. Local policy evaluation runs without an account-reserve view. A matching
    `minimum_reserve` criterion refuses with `policy.engine_required` before
    approval is stored.
-9. Forced approval turns an Allow verdict into a required approval.
-10. The pending approval is stored and returned.
+9. An Allow verdict makes this call the signing call. It continues with
+   the signing call's step 2 and skips the attestation step.
+10. Under RequireApproval, the pending approval is stored and returned.
 
-Call 1 reads enrollment and local policy state. It sends no payment RPC or
-SEP-10 request and performs no signing. Call 1 returns `data.approval` without a
-payment payload. Its fields are `approval_nonce`, `profile`, `chain_id`,
+Under RequireApproval, call 1 reads enrollment and local policy state. It
+sends no payment RPC or SEP-10 request and performs no signing. It returns
+`data.approval` without a payment payload. Its fields are `approval_nonce`, `profile`, `chain_id`,
 `expires_at_unix_ms`, `reason`, `endpoint_host`, `signer`, `summary`, and
 `instructions`. `summary` contains `payTo`, `amount`, and `asset`.
 
@@ -1101,18 +1112,21 @@ and a `Home domain:` line that reads `none` for the plain tool.
 The authenticated approval subject binds the payment intent digest and home
 domain. Changing the home domain requires a matching approval.
 
-Call 2 repeats the request with both approval arguments and runs these steps:
+The signing call runs these steps. Under Allow it is call 1 without approval
+arguments. Under RequireApproval it is call 2, which repeats the request with
+both approval arguments:
 
 1. The entry checks, the requirements, `chain_id`, the approval pair, and the
    home domain run as in call 1.
 2. Startup freshness compares the current policy and enablement with the
    startup binding. A changed binding returns `network.mainnet_write_forbidden`
    with `enablement or policy changed, restart the server`.
-3. Enrollment and address, local policy evaluation, and forced approval run as
-   in call 1.
-4. The attestation and its bound subject are verified. A missing, invalid, or
-   mismatched approval returns `policy.approval_required`. A live rejection
-   returns `policy.approval_rejected`.
+3. Enrollment and address and local policy evaluation run as in call 1.
+4. With approval arguments, the attestation and its bound subject are
+   verified, under Allow as under RequireApproval. A call without them skips
+   this step under Allow. A missing, invalid, or mismatched approval returns
+   `policy.approval_required`. A live rejection returns
+   `policy.approval_rejected`.
 5. The authenticated tool checks audit readiness, then runs the identity
    exchange. It fetches `stellar.toml`, prepares and validates the SEP-10
    challenge, and consumes its message authorization. It then signs and submits
@@ -1131,14 +1145,14 @@ Call 2 repeats the request with both approval arguments and runs these steps:
 11. The payment intent is consumed, and the signed re-simulation follows.
 12. The release authorization is minted for the final envelope, and the payload
     is encoded.
-13. The release authorization is consumed, then the pending approval.
+13. The release authorization is consumed, then any pending approval.
 14. The payload is released.
 
-Call 2 verifies approval before the identity exchange. The authenticated tool
-completes SEP-10 authentication before the payment endpoint check, witness, and
-payer signature.
+The signing call verifies any approval before the identity exchange. The
+authenticated tool completes SEP-10 authentication before the payment endpoint
+check, witness, and payer signature.
 
-The plain tool's call 2 returns `data` with `paymentSignature`, `payer`,
+The plain tool's signing call returns `data` with `paymentSignature`, `payer`,
 `asset`, `amount`, `payTo`, `network`, and `cross_check`. The authenticated
 tool returns the plain fields plus `authorization`, `home_domain`, and
 `payto_anchored`. `authorization` contains the Bearer JWT companion.

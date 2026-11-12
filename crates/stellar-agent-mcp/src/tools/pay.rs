@@ -1545,6 +1545,22 @@ impl WalletServer {
                 }
             }
         };
+        // On mainnet the stricter decision of this commit and its
+        // preparation governs.
+        let dispatch_outcome = match self
+            .commit_governing_outcome(
+                dispatch_outcome,
+                "stellar_pay",
+                &authoritative_args,
+                &args.chain_id,
+                Some(&source_adapter),
+                identity_view,
+            )
+            .await
+        {
+            Ok(outcome) => outcome,
+            Err(error) => return error.into_result(),
+        };
 
         // ── Attestation verification gate ────────────────────────────────────
         //
@@ -1560,28 +1576,59 @@ impl WalletServer {
         //       regardless of policy, so tests can verify the gate fires without
         //       needing a live RPC.
         //
-        // This is a no-op when `dispatch_outcome` is `DispatchOutcome::Allow`.
-        // For the toolset-gated path, `forced_dispatch_outcome = Some(RequireApproval)`
-        // makes it ALWAYS active.
-        let dispatch_outcome =
-            match self.force_mainnet_confirmation("stellar_pay_commit", dispatch_outcome) {
-                Ok(outcome) => outcome,
-                Err(error) => return error.into_result(),
-            };
-        let approval_witness = match verify_attestation_gate(
-            self,
-            &dispatch_outcome,
-            super::common::GatedApprovalKind::Payment,
-            &args.envelope_xdr,
-            args.approval_nonce.as_deref(),
-            args.approval_attestation.as_deref(),
-            "stellar_pay_commit",
-        )
-        .await
-        {
-            Ok(witness) => witness,
-            Err(result) => return Ok(result),
+        // Off mainnet this is a no-op when `dispatch_outcome` is
+        // `DispatchOutcome::Allow`. For the toolset-gated path,
+        // `forced_dispatch_outcome = Some(RequireApproval)` makes it ALWAYS
+        // active. On mainnet the authority wrapper runs in its place: an
+        // `Allow` without a proof signs under policy authority.
+        let mut witness: Option<stellar_agent_core::approval::witness::ApprovalWitness> = None;
+        let authority = if mainnet.is_some() {
+            match super::common::mainnet_authority(
+                self,
+                &dispatch_outcome,
+                super::common::GatedApprovalKind::Payment.expectation(
+                    stellar_agent_core::approval::subject::approval_subject_classic(
+                        &args.envelope_xdr,
+                    ),
+                ),
+                &super::common::SuppliedProof {
+                    nonce: args.approval_nonce.clone(),
+                    attestation: args.approval_attestation.clone(),
+                },
+                "stellar_pay_commit",
+                &mut witness,
+            )
+            .await
+            {
+                Ok(authority) => Some(authority),
+                Err(refusal) => {
+                    return Ok(super::common::authority_refusal_result(self, refusal));
+                }
+            }
+        } else {
+            match verify_attestation_gate(
+                self,
+                &dispatch_outcome,
+                super::common::GatedApprovalKind::Payment,
+                &args.envelope_xdr,
+                args.approval_nonce.as_deref(),
+                args.approval_attestation.as_deref(),
+                "stellar_pay_commit",
+            )
+            .await
+            {
+                Ok(verified) => {
+                    witness = verified;
+                    witness
+                        .as_ref()
+                        .map(stellar_agent_network::mainnet::authority::MainnetAuthority::Approval)
+                }
+                Err(result) => return Ok(result),
+            }
         };
+        let provenance = dispatch_outcome
+            .mainnet_decision()
+            .map(stellar_agent_core::mainnet::decision::MainnetDecision::provenance);
 
         // Extract the gate-sized legs for the post-submit audit row: the SAME
         // ValueEffects the policy gate evaluated (single-derivation invariant),
@@ -1823,9 +1870,6 @@ impl WalletServer {
             .map(stellar_agent_core::policy::v1::ValueClass::Value)
             .unwrap_or(stellar_agent_core::policy::v1::ValueClass::ReadOnly);
         let floor_hook = crate::sequence_floor::hook(&self.sequence_floor);
-        let authority = approval_witness
-            .as_ref()
-            .map(stellar_agent_network::mainnet::authority::MainnetAuthority::Approval);
         match crate::tools::submission_record::sign_and_submit_classic(
             self,
             mainnet.as_ref(),
@@ -1850,6 +1894,7 @@ impl WalletServer {
                 approval_nonce: args.approval_nonce.clone(),
                 approval_dir: self.resolve_approval_dir().ok(),
                 now_ms,
+                provenance,
             },
             cross_check.witness(),
             Some(&floor_hook),

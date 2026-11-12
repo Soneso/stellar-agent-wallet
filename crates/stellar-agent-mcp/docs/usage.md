@@ -20,16 +20,20 @@ audit writer, and the reset refuses while that writer is held.
 
 A feature-enabled server admits `stellar_pay_commit`, `stellar_claim_commit`,
 `stellar_create_account_commit`, and `stellar_trustline_commit` after setup.
-Both prepare and commit policy names need matching rules. The four pairs require
-approval even under Allow. A pending approval uses the shorter lifetime from
-the prepare and commit evaluations. Allow contributes 600 seconds;
-RequireApproval supplies its configured lifetime. Authorization defaults to
-120 seconds and cannot outlive approval.
+Both prepare and commit policy names need matching rules. Under Allow, a
+mainnet commit signs without an approval. Under RequireApproval, it needs a
+verified approval. A commit evaluates both its own name and its preparation's
+name, and the stricter decision governs.
+A pending approval uses the shorter lifetime from the two evaluations. Allow
+contributes 600 seconds; RequireApproval supplies its configured lifetime.
+Authorization defaults to 120 seconds and cannot outlive the governing
+decision.
 
 Paired preparation refuses an undecodable envelope with `simulation.divergence`.
 A denied rule retains `policy.deny.*`; an unknown decision uses
 `policy.unexpected_decision`. None of these refusals persists an approval.
-Each commit forces confirmation before attestation validation.
+Each commit evaluates both names before attestation validation. A proof
+supplied under Allow is verified and spent like a required one.
 
 Feature-on startup loads the mainnet write context for a verified enabled
 profile. Failed enablement or policy checks abort startup. Admission refusals

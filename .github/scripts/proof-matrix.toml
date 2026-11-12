@@ -386,10 +386,6 @@ builds = "feature-on"
 # Delivery keys.
 
 [[delivery]]
-key = "decision-authority"
-change = "the signed policy's Allow path signs without an approval request, and the CLI confirms per decision"
-
-[[delivery]]
 key = "recovery-transitions"
 change = "recovery settles sequence, outcome, hold and retry on the word of both endpoints, with an outcome audit row"
 
@@ -473,8 +469,19 @@ pending = "row-test"
 
 [[cell]]
 claim = "approval.follows_decision"
-rows = ["mcp.pay_commit", "mcp.create_account_commit", "mcp.claim_commit", "mcp.trustline_commit", "mcp.x402_create_payment", "mcp.x402_authenticated_payment"]
-pending = "decision-authority"
+rows = ["mcp.pay_commit", "mcp.create_account_commit", "mcp.claim_commit", "mcp.trustline_commit"]
+tests = [
+  { package = "stellar-agent-mcp", target = "lib", name = "tools::mainnet_presence_tests::allow_commit_signs_without_an_approval_for_every_kind", builds = "feature-on" },
+  { package = "stellar-agent-mcp", target = "lib", name = "tools::mainnet_presence_tests::require_approval_commit_without_proof_refuses_for_every_kind", builds = "feature-on" },
+]
+
+[[cell]]
+claim = "approval.follows_decision"
+rows = ["mcp.x402_create_payment", "mcp.x402_authenticated_payment"]
+tests = [
+  { package = "stellar-agent-mcp", target = "lib", name = "tools::common::tests::mainnet::x402_allow_pays_in_one_call_with_nothing_pending", builds = "feature-on" },
+  { package = "stellar-agent-mcp", target = "lib", name = "tools::common::tests::mainnet::x402_require_approval_records_its_decision_and_provenance", builds = "feature-on" },
+]
 
 [[cell]]
 claim = "approval.follows_decision"
