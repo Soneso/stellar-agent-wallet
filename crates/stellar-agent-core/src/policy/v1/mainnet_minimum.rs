@@ -24,7 +24,9 @@ pub const MAINNET_READ_ONLY_TOOLS: &[&str] = &[
     "stellar_transaction_status",
     "stellar_signed_intents_list",
 ];
-const VALUE_OUT: &[&str] = &[
+/// Registry tools that move value out of the account: payments, native
+/// account funding, and x402 payments.
+pub const MAINNET_VALUE_OUT_TOOLS: &[&str] = &[
     "stellar_pay",
     "stellar_pay_commit",
     "stellar_create_account",
@@ -32,8 +34,10 @@ const VALUE_OUT: &[&str] = &[
     "stellar_x402_create_payment",
     "stellar_x402_authenticated_payment",
 ];
-const TRUSTLINE: &[&str] = &["stellar_trustline", "stellar_trustline_commit"];
-const CLAIM: &[&str] = &["stellar_claim", "stellar_claim_commit"];
+/// Registry tools that change a trust line.
+pub const MAINNET_TRUSTLINE_TOOLS: &[&str] = &["stellar_trustline", "stellar_trustline_commit"];
+/// Registry tools that claim a claimable balance.
+pub const MAINNET_CLAIM_TOOLS: &[&str] = &["stellar_claim", "stellar_claim_commit"];
 
 /// Declares the requirement enum and the public name list from one table, so
 /// a requirement's discriminant is its index in [`REQUIREMENTS`].
@@ -356,9 +360,9 @@ fn evaluate_rule(findings: &mut Findings, index: usize, rule: &dyn TableLike, pr
     findings.rule(
         Requirement::Tool,
         index,
-        VALUE_OUT.contains(&tool)
-            || TRUSTLINE.contains(&tool)
-            || CLAIM.contains(&tool)
+        MAINNET_VALUE_OUT_TOOLS.contains(&tool)
+            || MAINNET_TRUSTLINE_TOOLS.contains(&tool)
+            || MAINNET_CLAIM_TOOLS.contains(&tool)
             || MAINNET_READ_ONLY_TOOLS.contains(&tool),
     );
     findings.rule(
@@ -404,20 +408,23 @@ fn evaluate_rule(findings: &mut Findings, index: usize, rule: &dyn TableLike, pr
         .iter()
         .filter(|c| kind(c) == "asset_allowlist")
         .collect();
-    if CLAIM.contains(&tool) {
+    if MAINNET_CLAIM_TOOLS.contains(&tool) {
         findings.rule(Requirement::AssetAllowlist, index, allowlists.is_empty());
     }
     if decision == Some("deny") {
         return;
     }
-    if VALUE_OUT.contains(&tool) || TRUSTLINE.contains(&tool) || CLAIM.contains(&tool) {
+    if MAINNET_VALUE_OUT_TOOLS.contains(&tool)
+        || MAINNET_TRUSTLINE_TOOLS.contains(&tool)
+        || MAINNET_CLAIM_TOOLS.contains(&tool)
+    {
         findings.rule(
             Requirement::RateLimit,
             index,
             criteria.iter().any(|c| kind(c) == "rate_limit"),
         );
     }
-    if !(VALUE_OUT.contains(&tool) || TRUSTLINE.contains(&tool)) {
+    if !(MAINNET_VALUE_OUT_TOOLS.contains(&tool) || MAINNET_TRUSTLINE_TOOLS.contains(&tool)) {
         return;
     }
     let assets: Vec<_> = allowlists
@@ -435,7 +442,7 @@ fn evaluate_rule(findings: &mut Findings, index: usize, rule: &dyn TableLike, pr
             && !assets.is_empty()
             && assets.iter().all(|asset| pinned_asset(asset).is_ok()),
     );
-    if !VALUE_OUT.contains(&tool) {
+    if !MAINNET_VALUE_OUT_TOOLS.contains(&tool) {
         return;
     }
     findings.rule(
