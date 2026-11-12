@@ -10,6 +10,8 @@
 //!
 //! The local page obtains a signed assertion through WebAuthn user verification.
 //! Terminal input and the process identity supply no presence.
+//! A signed approval origin selects HTTPS before the local browser check.
+//! The command prints a secret-free link to stderr and closes the listener on every completion path.
 
 use std::path::Path;
 
@@ -93,6 +95,13 @@ pub(crate) async fn acquire_mainnet_presence_with_mode(
         return result;
     }
     let current = authority.load_current()?;
+    if current
+        .policy()
+        .mainnet()
+        .is_some_and(|body| body.approval_origin.is_some())
+    {
+        return acquire_signed_presence(entry, context, authority, store_path, &current).await;
+    }
     #[cfg(test)]
     let browser_driver = mode == OpenMode::Private && listener_driver::is_installed();
     #[cfg(not(test))]
@@ -142,12 +151,113 @@ pub(crate) async fn acquire_mainnet_presence_with_mode(
     .await
 }
 
+async fn acquire_signed_presence(
+    entry: &PendingApproval,
+    context: &ApprovalContext,
+    authority: &MainnetApprovalAuthority,
+    store_path: &Path,
+    current: &stellar_agent_core::approval::CurrentMainnetApprovalPolicy,
+) -> Result<VerifiedMainnetPresence, WalletError> {
+    let interrupt = register_interrupt().await;
+    let config = stellar_agent_approval_ui::MainnetPresenceConfig {
+        entry: entry.clone(),
+        context: context.clone(),
+        authority: authority.clone(),
+        store_path: store_path.to_path_buf(),
+        page_identity: crate::common::served_pages::page_identity_for(current.profile()),
+    };
+    let handle = stellar_agent_approval_remote::start_remote_presence(config)
+        .await
+        .map_err(|error| error.into_wallet_error())?;
+    #[cfg(feature = "test-helpers")]
+    remote_test_ready(&handle).await;
+    signed_presence_until_done(
+        handle,
+        &entry.approval_nonce,
+        entry.expires_at_unix_ms,
+        interrupt,
+    )
+    .await
+}
+
+/// Reports the bound test endpoint.
+#[cfg(feature = "test-helpers")]
+#[allow(clippy::print_stderr, reason = "binary test readiness")]
+pub(crate) async fn remote_test_ready(handle: &stellar_agent_approval_remote::RemoteServeHandle) {
+    if std::env::var_os(TEST_REMOTE_READY_ENV).is_none() {
+        return;
+    }
+    eprintln!("Test listener: https://{}/", handle.local_addr());
+    // This yield lets the native harness interrupt immediately after readiness.
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+}
+
+/// Polls the signal future before binding so startup cannot expose an unhandled interrupt.
+pub(crate) async fn register_interrupt() -> impl std::future::Future<Output = std::io::Result<()>> {
+    use std::future::Future as _;
+    let mut signal = Box::pin(tokio::signal::ctrl_c());
+    let ready = std::future::poll_fn(|cx| {
+        std::task::Poll::Ready(match signal.as_mut().poll(cx) {
+            std::task::Poll::Ready(result) => Some(result),
+            std::task::Poll::Pending => None,
+        })
+    })
+    .await;
+    async move {
+        match ready {
+            Some(result) => result,
+            None => signal.await,
+        }
+    }
+}
+
+async fn signed_presence_until_done(
+    mut handle: stellar_agent_approval_remote::RemoteServeHandle,
+    nonce: &str,
+    expires_at: u64,
+    interrupt: impl std::future::Future<Output = std::io::Result<()>>,
+) -> Result<VerifiedMainnetPresence, WalletError> {
+    let result = async {
+        let completion = handle
+            .take_completion()
+            .ok_or(WalletError::Approval(ApprovalFailure::PresenceUnavailable))?;
+        #[allow(clippy::print_stderr, reason = "CLI signed-origin approval link")]
+        {
+            eprintln!(
+                "Approve at the signed origin: {}/approvals/{nonce}",
+                handle.public_origin()
+            );
+        }
+        let now = stellar_agent_core::timefmt::now_unix_ms().unwrap_or(u64::MAX);
+        let deadline = std::time::Instant::now()
+            .checked_add(std::time::Duration::from_millis(
+                expires_at.saturating_sub(now),
+            ))
+            .ok_or(WalletError::Approval(ApprovalFailure::PresenceUnavailable))?;
+        tokio::select! {
+            result = completion.await_presence(deadline) => result,
+            _ = interrupt => Err(WalletError::Approval(ApprovalFailure::PresenceCanceled)),
+        }
+    }
+    .await;
+    handle
+        .shutdown()
+        .await
+        .map_err(|_| WalletError::Approval(ApprovalFailure::PresenceUnavailable))?;
+    result
+}
+
 /// The environment variable that, in a build with the `test-helpers`
 /// feature, reports the local browser unavailable to every ceremony, so a
 /// binary-level test reaches the browser boundary without launching one. The
 /// release build never reads it.
 #[cfg(feature = "test-helpers")]
 pub(crate) const TEST_NO_BROWSER_ENV: &str = "STELLAR_AGENT_TEST_PRESENCE_NO_BROWSER";
+
+/// The variable that makes a `test-helpers` build report its bound remote endpoint.
+/// The release build never reads it.
+#[cfg(feature = "test-helpers")]
+pub(crate) const TEST_REMOTE_READY_ENV: &str = "STELLAR_AGENT_TEST_REMOTE_READY";
 
 /// Whether a local browser can take the ceremony: a graphical session, and
 /// in a `test-helpers` build no `TEST_NO_BROWSER_ENV`.
@@ -511,6 +621,172 @@ mod tests {
 
     fn context(fixture: &MainnetConsentFixture) -> ApprovalContext {
         ApprovalContext::from_profile(fixture.name(), fixture.profile())
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn signed_origin_shutdown_completes_before_returning() {
+        use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD as B64};
+        use serde_json::{Value, json};
+        use stellar_agent_approval_remote::session::{SESSION_COOKIE_NAME, SessionState};
+        use stellar_agent_core::approval::{
+            PendingApprovalStore,
+            mainnet_fixtures::{SIGNED_ORIGIN, SIGNED_RP_ID},
+        };
+        for action in ["consent", "cancel", "expiry", "interrupt"] {
+            let files = tempfile::tempdir().unwrap();
+            let leaf = stellar_agent_approval_remote::signed_origin_test_leaf(SIGNED_RP_ID);
+            let cert = files.path().join("cert.pem");
+            let key = files.path().join("key.pem");
+            std::fs::write(&cert, leaf.chain_pem()).unwrap();
+            std::fs::write(&key, &leaf.key_pem).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).unwrap();
+            }
+            let mut fixture = MainnetConsentFixture::with_profile("signed-shutdown", |profile| {
+                profile.remote_approval = Some(serde_json::from_value(json!({
+                    "enabled":true,"bind":"127.0.0.1:0","rp_id":SIGNED_RP_ID,"cert_path":cert,"key_path":key
+                })).unwrap());
+            });
+            let auth = stellar_agent_test_support::webauthn::fixture_authenticator();
+            fixture.sign_signed_origin_policy(&[&auth], &leaf.pin);
+            let entry = fixture.payment(60_000);
+            PendingApprovalStore::open(fixture.store_path())
+                .unwrap()
+                .insert(
+                    entry.clone(),
+                    stellar_agent_core::timefmt::now_unix_ms().unwrap(),
+                )
+                .unwrap();
+            let handle = stellar_agent_approval_remote::start_remote_presence(
+                stellar_agent_approval_ui::MainnetPresenceConfig {
+                    entry: entry.clone(),
+                    context: context(&fixture),
+                    authority: fixture.authority(),
+                    store_path: fixture.store_path(),
+                    page_identity: stellar_agent_approval_ui::PageIdentity::neutral(),
+                },
+            )
+            .await
+            .unwrap();
+            let address = handle.local_addr();
+            let session = SessionState::generate(auth.credential_id_b64url());
+            let cookie = format!("{SESSION_COOKIE_NAME}={}", session.session_id.to_hex());
+            *handle.session_for_test().lock().unwrap() = Some(session);
+            let client = reqwest::Client::builder()
+                .danger_accept_invalid_certs(true)
+                .no_proxy()
+                .build()
+                .unwrap();
+            let request = |method: &str, suffix: &str| {
+                client
+                    .request(
+                        method.parse().unwrap(),
+                        format!(
+                            "https://{address}/approval/{}{suffix}",
+                            entry.approval_nonce
+                        ),
+                    )
+                    .header("host", SIGNED_ORIGIN.trim_start_matches("https://"))
+                    .header("origin", SIGNED_ORIGIN)
+                    .header("cookie", &cookie)
+            };
+            let drive = async {
+                if !matches!(action, "consent" | "cancel") {
+                    return;
+                }
+                let html = request("GET", "")
+                    .send()
+                    .await
+                    .unwrap()
+                    .text()
+                    .await
+                    .unwrap();
+                let page: Value = serde_json::from_str(
+                    html.split("id=\"presence-data\"")
+                        .nth(1)
+                        .unwrap()
+                        .split_once('>')
+                        .unwrap()
+                        .1
+                        .split("</script>")
+                        .next()
+                        .unwrap(),
+                )
+                .unwrap();
+                let csrf = page["csrf"].as_str().unwrap();
+                if action == "cancel" {
+                    assert_eq!(
+                        request("POST", "/cancel")
+                            .header("x-stellar-approval-csrf", csrf)
+                            .json(&json!({"reason":"operator_cancel"}))
+                            .send()
+                            .await
+                            .unwrap()
+                            .status(),
+                        200
+                    );
+                    return;
+                }
+                let options: Value = request("POST", "/challenge")
+                    .header("x-stellar-approval-csrf", csrf)
+                    .json(&json!({"consent_view_digest":page["consent_view_digest"]}))
+                    .send()
+                    .await
+                    .unwrap()
+                    .json()
+                    .await
+                    .unwrap();
+                let assertion = auth.assert(
+                    B64.decode(options["challenge"].as_str().unwrap())
+                        .unwrap()
+                        .try_into()
+                        .unwrap(),
+                    SIGNED_ORIGIN,
+                    SIGNED_RP_ID,
+                    5,
+                    1,
+                );
+                let response = request("POST", "/assertion").header("x-stellar-approval-csrf", csrf).json(&json!({
+                    "request_id":options["request_id"],"credential_id_b64url":B64.encode(assertion.credential_id),
+                    "authenticator_data_b64url":B64.encode(assertion.authenticator_data),"client_data_json_b64url":B64.encode(assertion.client_data_json),
+                    "signature_der_b64url":B64.encode(assertion.signature_der)
+                })).send().await.unwrap();
+                assert_eq!(response.status(), 200);
+            };
+            let interrupt = async {
+                if action == "interrupt" {
+                    Ok(())
+                } else {
+                    std::future::pending().await
+                }
+            };
+            let expires = if action == "expiry" {
+                0
+            } else {
+                entry.expires_at_unix_ms
+            };
+            let (result, ()) = tokio::join!(
+                signed_presence_until_done(handle, &entry.approval_nonce, expires, interrupt),
+                drive
+            );
+            if action == "consent" {
+                assert!(result.is_ok());
+            } else {
+                assert_eq!(
+                    result.unwrap_err().code(),
+                    if action == "expiry" {
+                        "approval.presence_expired"
+                    } else {
+                        "approval.presence_canceled"
+                    }
+                );
+            }
+            std::net::TcpListener::bind(address)
+                .expect("shutdown releases the socket before the adapter returns");
+        }
     }
 
     async fn operator_presence(name: &str) {

@@ -8,6 +8,11 @@
 //!
 //! # Flow
 //!
+//! The following bootstrap flow applies to local serving.
+//! Signed-origin remote mode loads the verified policy and explicit TLS paths.
+//! It requires exposure consent, prints the signed origin, and uses no browser opener.
+//! Redundant `--no-open` is accepted for signed-origin remote serving.
+//!
 //! On start the server mints a single-use bootstrap token and prints the
 //! bootstrap URL: `http://127.0.0.1:<port>/bootstrap/<token>` for a testnet
 //! profile, `http://localhost:<port>/bootstrap/<token>` for a mainnet one.
@@ -166,9 +171,14 @@ pub async fn run(args: ServeArgs) -> i32 {
     };
 
     let mainnet = profile.chain_id.is_mainnet();
-    if let Some(failure) =
-        mainnet_browser_refusal(mainnet, &args, crate::common::display_available())
-    {
+    let signed_remote = mainnet
+        && args.remote
+        && crate::commands::profile::policy_check::has_signed_origin(&profile_name, &profile);
+    if let Some(failure) = mainnet_browser_refusal(
+        mainnet && !signed_remote,
+        &args,
+        crate::common::display_available(),
+    ) {
         render_json(&Envelope::<()>::err(&WalletError::Approval(failure)));
         return 1;
     }
@@ -220,7 +230,9 @@ pub async fn run(args: ServeArgs) -> i32 {
         let authority =
             stellar_agent_core::approval::MainnetApprovalAuthority::for_profile(&profile_name)
                 .and_then(|authority| {
-                    authority.load_current()?;
+                    if !args.remote {
+                        authority.load_current()?;
+                    }
                     Ok(authority)
                 });
         match authority {
@@ -423,6 +435,7 @@ async fn run_remote(
     context: DecisionContext,
     page_identity: PageIdentity,
 ) -> i32 {
+    let interrupt = crate::common::mainnet_presence::register_interrupt().await;
     let Some(remote_config) = remote_config.filter(|c| c.enabled) else {
         let err = WalletError::Internal(InternalError::UnexpectedState {
             detail: "approve.remote_not_configured: profile has no enabled [remote_approval] \
@@ -457,23 +470,10 @@ async fn run_remote(
         }
     };
 
-    let tls = match stellar_agent_approval_remote::provision_or_load(
-        profile_name,
-        &remote_config.rp_id,
-    ) {
-        Ok(tls) => tls,
-        Err(e) => {
-            let err = WalletError::Internal(InternalError::UnexpectedState {
-                detail: format!("approve.remote_tls_provision_failed: {e}"),
-            });
-            render_json(&Envelope::<()>::err(&err));
-            return 1;
-        }
-    };
+    let signed = context.mainnet_authority.is_some();
 
-    // The listener reads the profile's allowlist and the operator-credential
-    // store from these locations at every check; the `[remote_approval]`
-    // block loaded above only configures the bind address and RP ID.
+    // Testnet reads the live allowlist and enrollment from this authority.
+    // Signed mode uses the operator store only for policy credential counters.
     let authority =
         match stellar_agent_core::approval::RemoteApprovalAuthority::for_profile(profile_name) {
             Ok(authority) => authority,
@@ -486,34 +486,45 @@ async fn run_remote(
             }
         };
 
-    let fingerprint = tls.fingerprint_sha256_hex.clone();
-    let config = stellar_agent_approval_remote::RemoteServeConfig::new(
+    let config = match stellar_agent_approval_remote::RemoteServeConfig::from_profile(
         bind_addr,
-        remote_config.rp_id.clone(),
+        remote_config,
         authority,
         context,
-        tls,
     )
-    .with_page_identity(page_identity);
+    .await
+    {
+        Ok(config) => config.with_page_identity(page_identity),
+        Err(error) => {
+            render_json(&Envelope::<()>::err(&error.into_wallet_error()));
+            return 1;
+        }
+    };
+    let fingerprint = config.tls.fingerprint_sha256_hex.clone();
 
     let handle = match stellar_agent_approval_remote::start_remote_serve(config).await {
         Ok(h) => h,
         Err(e) => {
-            let err = WalletError::Internal(InternalError::UnexpectedState {
-                detail: format!("approve.remote_serve_start_failed: {e}"),
-            });
+            let err = e.into_wallet_error();
             render_json(&Envelope::<()>::err(&err));
             return 1;
         }
     };
 
-    print_remote_startup(
-        &remote_config.rp_id,
-        handle.local_addr().port(),
-        &fingerprint,
-    );
+    #[cfg(feature = "test-helpers")]
+    crate::common::mainnet_presence::remote_test_ready(&handle).await;
 
-    if let Err(e) = tokio::signal::ctrl_c().await {
+    if signed {
+        print_signed_remote_startup(handle.public_origin());
+    } else {
+        print_remote_startup(
+            &remote_config.rp_id,
+            handle.local_addr().port(),
+            &fingerprint,
+        );
+    }
+
+    if let Err(e) = interrupt.await {
         tracing::debug!(error = %e, "approve serve --remote: ctrl-c wait failed; shutting down");
     }
 
@@ -521,6 +532,11 @@ async fn run_remote(
         tracing::debug!(error = %e, "approve serve --remote: shutdown did not complete cleanly");
     }
     0
+}
+
+#[allow(clippy::print_stdout, reason = "CLI signed-origin startup notice")]
+fn print_signed_remote_startup(origin: &str) {
+    println!("Remote approval inbox: {origin}/");
 }
 
 /// Prints the remote-approval startup banner: the HTTPS URL and the

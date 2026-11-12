@@ -182,6 +182,14 @@ pub trait ConsentSessionGate: Send + Sync + 'static {
     /// The CSRF value of `nonce` in `session`, which the page sends back in
     /// `X-Stellar-Approval-CSRF`.
     fn csrf(&self, session: &Self::Session, nonce: &str) -> String;
+
+    /// Checks verified action facts before approval or rejection proceeds.
+    ///
+    /// # Errors
+    /// Returns a refusal when the listener cannot accept the verified assertion.
+    fn verified(&self, _presence: &VerifiedMainnetPresence) -> Result<(), WalletError> {
+        Ok(())
+    }
 }
 
 /// The loopback gate: the cookie, CSRF and session proof checks of the
@@ -285,6 +293,17 @@ impl<G: ConsentSessionGate> PresenceState<G> {
                 .is_some_and(|body| body.approval_origin.is_some())
         {
             return Err(failure(Failure::OriginSignedRemote));
+        }
+        if advance
+            && let Site::Signed(listener) = &self.site
+            && (listener.policy_digest() != current.policy().digest()
+                || current
+                    .policy()
+                    .mainnet()
+                    .and_then(|body| body.approval_cert_spki_sha256)
+                    != Some(listener.cert_spki_sha256()))
+        {
+            return Err(failure(Failure::ListenerPolicyStale));
         }
         Ok((store, current))
     }
@@ -1216,6 +1235,7 @@ fn verified_presence<G: ConsentSessionGate>(
     .decode()?;
     let presence =
         verify_mainnet_presence(challenge.pending, assertion, now_ms()?, Instant::now())?;
+    state.auth.verified(&presence)?;
     Ok((presence, challenge.view_digest))
 }
 
@@ -1227,6 +1247,9 @@ async fn assertion<G: ConsentSessionGate>(
 ) -> Response {
     if let Err(response) = state.auth.authorize_mutation(&headers, &nonce) {
         return response;
+    }
+    if matches!(state.site, Site::Signed(_)) && !state.mode.serves(&nonce) {
+        return error_response(&failure(Failure::PresenceChanged));
     }
     let result = (|| {
         let session = state

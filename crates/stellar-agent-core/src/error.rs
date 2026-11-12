@@ -803,6 +803,12 @@ pub enum ApprovalFailure {
         "Another approval listener holds the remote approval socket; approve in the running inbox."
     )]
     ListenerBusy,
+    /// A configured TLS field is absent or unusable.
+    #[error("Remote approval TLS configuration is unavailable: {detail}")]
+    RemoteTlsUnavailable {
+        /// The affected configuration field and its non-secret problem.
+        detail: String,
+    },
     /// No local browser with WebAuthn user verification can run the
     /// ceremony.
     ///
@@ -883,6 +889,7 @@ impl ApprovalFailure {
             Self::OriginProfileMismatch => "approval.origin_profile_mismatch",
             Self::OriginSignedRemote => "approval.origin_signed_remote",
             Self::ListenerBusy => "approval.listener_busy",
+            Self::RemoteTlsUnavailable { .. } => "approve.remote_tls_unavailable",
             Self::PresenceBrowserRequired => "approval.presence_browser_required",
             Self::PresenceUnavailable => "approval.presence_unavailable",
             Self::PresenceCanceled => "approval.presence_canceled",
@@ -6282,6 +6289,16 @@ mod tests {
 
     #[test]
     fn approval_failure_wire_codes_and_messages() {
+        let tls = WalletError::Approval(ApprovalFailure::RemoteTlsUnavailable {
+            detail: "cert_path is absent".to_owned(),
+        });
+        assert_eq!(tls.code(), "approve.remote_tls_unavailable");
+        assert_eq!(tls.category(), ErrorCategory::Approval);
+        assert_eq!(
+            tls.to_string(),
+            "Remote approval TLS configuration is unavailable: cert_path is absent"
+        );
+        assert_eq!(tls.message(), tls.to_string());
         let cases = [
             (
                 ApprovalFailure::NotFound {

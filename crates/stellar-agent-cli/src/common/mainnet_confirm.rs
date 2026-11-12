@@ -62,6 +62,8 @@ impl ConfirmDecision {
 /// The last line of the rendered summary: what records consent to it.
 pub(crate) const CONSENT_LINE: &str =
     "Review this transaction in the local browser and approve with a pinned passkey.";
+pub(crate) const SIGNED_CONSENT_LINE: &str =
+    "Review this transaction at the signed approval origin and approve with a policy passkey.";
 
 pub(crate) struct MainnetWriteSummary {
     envelope: String,
@@ -393,6 +395,12 @@ pub(crate) async fn confirm_mainnet_write(
     summary
         .render(context, &mut rendered)
         .map_err(|_| WalletError::Approval(ApprovalFailure::PresenceUnavailable))?;
+    if crate::commands::profile::policy_check::has_signed_origin(name, profile) {
+        rendered = String::from_utf8(rendered)
+            .map_err(|_| WalletError::Approval(ApprovalFailure::PresenceUnavailable))?
+            .replace(CONSENT_LINE, SIGNED_CONSENT_LINE)
+            .into_bytes();
+    }
     show_summary(&rendered)?;
     let uid = process_uid_for_attestation().map_err(store_error)?;
     let entry = summary.pending(uid, decision.ttl_ms())?;

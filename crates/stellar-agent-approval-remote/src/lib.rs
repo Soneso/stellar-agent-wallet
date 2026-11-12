@@ -1,60 +1,20 @@
 //! TLS-protected, passkey-authenticated remote approval HTTP surface.
 //!
-//! Lets an operator approve or reject pending agent actions from a device
-//! other than the wallet host, without SSH access. `approve serve --remote`
-//! binds this listener beyond loopback behind TLS, authenticates the
-//! operator with a registered passkey, and requires a fresh passkey
-//! assertion — computed over a challenge cryptographically bound to the
-//! exact pending approval — for every approve/reject action.
+//! Every approval and rejection requires a fresh assertion bound to the entry.
+//! Testnet trusts the live profile allowlist and enrolled operator keys.
+//! Mainnet requires an origin and leaf SPKI pin from the verified owner-signed policy.
+//! Its login and consent trust policy credentials alone; the store supplies counters.
+//! Each verified login or decision checks the counter once under the store lock.
+//! Receipt verification and commit do not update counters.
 //!
-//! # What does NOT change
+//! Signed-origin startup loads explicit PEM paths and checks the served leaf pin.
+//! Host and Origin checks use the signed public authority, independent of backend ports.
+//! The secure session cookie and page CSRF header protect consent routes and assets.
+//! A policy re-sign requires restart, and running listeners never reload TLS.
 //!
-//! Signing keys, the keyring, the attestation key, the audit hash-chain, the
-//! two-phase commit, and every existing wire contract are untouched. This
-//! crate is additive: a new TLS listener, a new identity path
-//! (`ApproverIdentity::PasskeyCredential`, from `stellar-agent-core`), and
-//! two opt-in CLI flags gated behind explicit operator consent
-//! (`stellar-agent-cli`). The attestation this listener produces uses the
-//! same key and layout as the loopback path's, and names the operator
-//! credential that approved; the audit log records the remote decision as
-//! `EventKind::ApprovalAttestedRemote` / `ApprovalRejectedRemote`.
-//!
-//! # Security posture
-//!
-//! - **TLS is mandatory.** There is no plaintext remote path; `--remote`
-//!   without a provisioned or provisionable certificate is a hard start
-//!   error (see [`tls`]).
-//! - **Two independent authorization layers.** The HTTP layer verifies a
-//!   fresh WebAuthn assertion over a challenge bound to the specific pending
-//!   entry (see [`challenge_store`], [`verify`]); the core gate
-//!   (`ApproverIdentity::is_authorized_for_entry`, `stellar-agent-core`)
-//!   independently re-checks allowlist membership and the witness's
-//!   entry-binding. Either layer refuses alone even if the other is
-//!   mis-wired.
-//! - **Authorization is read at every check.** The listener keeps no copy of
-//!   the profile's `allowed_credentials` list. Every login, every
-//!   authenticated request and every decision reads the current list and
-//!   the current operator-credential store through a
-//!   `stellar_agent_core::approval::RemoteApprovalAuthority`, so a
-//!   credential removed from either stops logging in, its session stops
-//!   being served, and its decisions refuse, without a restart. A read that
-//!   fails refuses.
-//! - **What-you-see-is-what-you-sign.** The detail page carries the view
-//!   digest of the entry it renders, and an approve posts it to the challenge
-//!   route. The listener mints only while it is the digest of the current
-//!   entry, binds `SHA-256(rand32 || view_digest || approval_nonce)` and stores
-//!   the digest with the challenge. The decision compares the stored digest
-//!   with the entry it attests, so an assertion verified for one entry or one
-//!   set of terms never authorizes another.
-//! - **Enrollment stays loopback-only.** This crate never accepts or
-//!   persists a new operator credential over the network. `GET /enroll`
-//!   serves a helper page that runs `navigator.credentials.create()`
-//!   client-side and displays the resulting credential id and public key —
-//!   there is no corresponding write endpoint; the operator copies those
-//!   values into `stellar-agent-cli`'s `approve operator enroll`, which
-//!   writes the credential store from the local host only. The page must be
-//!   served from this listener (rather than run from a local file) because
-//!   a WebAuthn credential is bound to its `rp.id` at creation time.
+//! Persistent serving requires exposure consent at the CLI.
+//! One-shot serving prints a secret-free signed link and scopes routes to one entry.
+//! Testnet enrollment writes remain local; its remote helper only displays registration data.
 
 // `deny` (not `forbid`): the test-only `STELLAR_AGENT_HOME` env-var override
 // helper in `tls.rs` needs a narrowly-scoped `#[allow(unsafe_code)]` for
@@ -87,6 +47,17 @@ mod web;
 #[cfg(feature = "test-helpers")]
 pub mod test_helpers;
 
+/// Generates an independent P-256 leaf and its SPKI pin for listener clients.
+///
+/// # Panics
+///
+/// Panics if certificate generation fails for the supplied DNS host.
+#[cfg(feature = "test-helpers")]
+#[must_use]
+pub fn signed_origin_test_leaf(host: &str) -> test_helpers::PinnedLeaf {
+    test_helpers::pinned_leaf(host, &rcgen::PKCS_ECDSA_P256_SHA256)
+}
+
 pub use config_validate::{RemoteConfigValidationError, validate_remote_config};
 pub use stellar_agent_loopback_http::brand::PageIdentity;
 pub use tls::{ProvisionedTls, TlsProvisionError, provision_or_load};
@@ -101,10 +72,15 @@ use axum_server::tls_rustls::RustlsConfig;
 /// [`axum_server::Handle`] specialised to a plain socket-address listener.
 type ServerHandle = axum_server::Handle<SocketAddr>;
 use stellar_agent_approval_ui::DecisionContext;
+use stellar_agent_approval_ui::presence::{
+    MainnetPresenceConfig, PresenceCompletion, SignedOriginMode, signed_origin_consent,
+};
+use stellar_agent_core::approval::ListenerIdentity;
 use stellar_agent_core::approval::RemoteApprovalAuthority;
 use stellar_agent_core::approval::error::ApprovalError;
 use stellar_agent_core::approval::operator_credentials::OperatorApprovalCredentialStore;
 use stellar_agent_core::profile::caip2::Caip2;
+use stellar_agent_core::{ApprovalFailure, WalletError};
 use tokio::task::JoinHandle;
 
 use challenge_store::{ActionChallengeStore, LoginChallengeStore};
@@ -145,6 +121,8 @@ pub struct RemoteServeConfig {
     /// that configured nothing serves pages with a plain title, no name, and
     /// no mark.
     pub page_identity: PageIdentity,
+    prepared: Option<PreparedStartup>,
+    one_shot: Option<MainnetPresenceConfig>,
 }
 
 impl RemoteServeConfig {
@@ -167,7 +145,36 @@ impl RemoteServeConfig {
             decision_context,
             tls,
             page_identity: PageIdentity::neutral(),
+            prepared: None,
+            one_shot: None,
         }
+    }
+
+    /// Loads the profile policy and TLS pair once for startup.
+    ///
+    /// # Errors
+    /// Returns policy, configuration, permission, or pin refusals before binding.
+    pub async fn from_profile(
+        bind_addr: SocketAddr,
+        remote: &stellar_agent_core::profile::schema::RemoteApprovalConfig,
+        authority: RemoteApprovalAuthority,
+        decision_context: DecisionContext,
+    ) -> Result<Self, RemoteServeStartError> {
+        let current = decision_context
+            .mainnet_authority
+            .as_ref()
+            .map(stellar_agent_core::approval::MainnetApprovalAuthority::load_current)
+            .transpose()?;
+        let pin = current
+            .as_ref()
+            .map(|current| ListenerIdentity::capture(current.policy()))
+            .transpose()?
+            .map(|identity| identity.cert_spki_sha256());
+        let (tls, server) =
+            tls::select_tls(&decision_context.context.profile_name, remote, pin.as_ref()).await?;
+        let mut config = Self::new(bind_addr, &remote.rp_id, authority, decision_context, tls);
+        config.prepared = Some(PreparedStartup { current, server });
+        Ok(config)
     }
 
     /// Sets the identity the served pages announce.
@@ -176,11 +183,20 @@ impl RemoteServeConfig {
         self.page_identity = page_identity;
         self
     }
+
+    /// Restricts this listener to one entry and returns presence to its command.
+    #[must_use]
+    pub fn with_one_shot(mut self, config: MainnetPresenceConfig) -> Self {
+        self.one_shot = Some(config);
+        self
+    }
 }
 
 /// Shared axum state for all handlers.
 #[derive(Clone)]
 pub(crate) struct RemoteServeState {
+    pub(crate) listener_identity: Option<ListenerIdentity>,
+    pub(crate) selected_nonce: Option<std::sync::Arc<str>>,
     pub(crate) rp_id: std::sync::Arc<str>,
     /// The exact `https://<rp_id>[:<port>]` origin every WebAuthn
     /// assertion's `clientDataJSON.origin` must match (see
@@ -192,7 +208,7 @@ pub(crate) struct RemoteServeState {
     /// The chain the served profile is on; a profile whose current chain
     /// differs is no authorization.
     pub(crate) chain: Caip2,
-    pub(crate) ctx: std::sync::Arc<DecisionContext>,
+    pub(crate) ctx: std::sync::Arc<RemoteContext>,
     pub(crate) operator_credentials: std::sync::Arc<OperatorApprovalCredentialStore>,
     pub(crate) login_challenges: std::sync::Arc<StdMutex<LoginChallengeStore>>,
     pub(crate) action_challenges: std::sync::Arc<StdMutex<ActionChallengeStore>>,
@@ -205,11 +221,49 @@ pub(crate) struct RemoteServeState {
     pub(crate) identity: std::sync::Arc<PageIdentity>,
 }
 
+pub(crate) struct RemoteContext {
+    pub(crate) context: stellar_agent_core::approval::ApprovalContext,
+    pub(crate) store_path: std::path::PathBuf,
+    pub(crate) mainnet_authority: Option<stellar_agent_core::approval::MainnetApprovalAuthority>,
+    pub(crate) decision: Option<std::sync::Arc<DecisionContext>>,
+}
+
+impl From<DecisionContext> for RemoteContext {
+    fn from(context: DecisionContext) -> Self {
+        Self {
+            context: context.context.clone(),
+            store_path: context.store_path.clone(),
+            mainnet_authority: context.mainnet_authority.clone(),
+            decision: Some(std::sync::Arc::new(context)),
+        }
+    }
+}
+
+struct PreparedStartup {
+    current: Option<stellar_agent_core::approval::CurrentMainnetApprovalPolicy>,
+    server: RustlsConfig,
+}
+
+struct ListenerConfig {
+    bind_addr: SocketAddr,
+    rp_id: String,
+    authority: RemoteApprovalAuthority,
+    decision_context: RemoteContext,
+    tls: ProvisionedTls,
+    prepared: Option<PreparedStartup>,
+    page_identity: PageIdentity,
+    one_shot: Option<MainnetPresenceConfig>,
+}
+
 /// Handle to a running remote-approval server.
 pub struct RemoteServeHandle {
     local_addr: SocketAddr,
     axum_handle: ServerHandle,
     server_join: JoinHandle<()>,
+    public_origin: String,
+    completion: Option<PresenceCompletion>,
+    #[cfg(feature = "test-helpers")]
+    test_session: std::sync::Arc<StdMutex<Option<SessionState>>>,
 }
 
 impl std::fmt::Debug for RemoteServeHandle {
@@ -221,6 +275,24 @@ impl std::fmt::Debug for RemoteServeHandle {
 }
 
 impl RemoteServeHandle {
+    /// Exposes session timing and CSRF state to adversarial listener tests.
+    #[cfg(feature = "test-helpers")]
+    #[must_use]
+    pub fn session_for_test(&self) -> std::sync::Arc<StdMutex<Option<SessionState>>> {
+        self.test_session.clone()
+    }
+
+    /// The public origin of this listener, including the signed canonical port.
+    #[must_use]
+    pub fn public_origin(&self) -> &str {
+        &self.public_origin
+    }
+
+    /// Takes the completion channel of a one-shot ceremony once.
+    pub fn take_completion(&mut self) -> Option<PresenceCompletion> {
+        self.completion.take()
+    }
+
     /// The actual bound socket address.
     #[must_use]
     pub fn local_addr(&self) -> SocketAddr {
@@ -248,7 +320,13 @@ impl RemoteServeHandle {
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum RemoteServeStartError {
-    /// Remote origins cannot authorize mainnet consent.
+    /// A verified-policy or configuration refusal before binding.
+    #[error("{0}")]
+    Policy(#[from] WalletError),
+    /// A TLS file or served-leaf pin refusal before binding.
+    #[error("{0}")]
+    Tls(#[from] TlsProvisionError),
+    /// Mainnet remote consent requires a signed approval origin.
     #[error(
         "Mainnet consent uses the local passkey page; remote approval is unavailable for mainnet."
     )]
@@ -274,6 +352,36 @@ pub enum RemoteServeStartError {
     },
 }
 
+impl RemoteServeStartError {
+    /// Converts startup errors to their CLI envelope codes.
+    #[must_use]
+    pub fn into_wallet_error(self) -> WalletError {
+        match self {
+            Self::Policy(error) => error,
+            Self::Tls(error) => error.wallet_error(),
+            error => {
+                WalletError::Internal(stellar_agent_core::error::InternalError::UnexpectedState {
+                    detail: format!("approve.remote_serve_start_failed: {error}"),
+                })
+            }
+        }
+    }
+}
+
+/// Requires an enabled remote configuration for either signed listener mode.
+///
+/// # Errors
+/// Returns the disabled-remote refusal when the configuration is absent or disabled.
+pub(crate) fn enabled_remote_config(
+    profile: &stellar_agent_core::profile::schema::Profile,
+) -> Result<&stellar_agent_core::profile::schema::RemoteApprovalConfig, WalletError> {
+    profile.remote_approval.as_ref().filter(|config| config.enabled).ok_or_else(|| {
+        WalletError::Internal(stellar_agent_core::error::InternalError::UnexpectedState {
+            detail: "approve.remote_not_configured: profile has no enabled [remote_approval] block; enable it before starting signed-origin consent".to_owned(),
+        })
+    })
+}
+
 /// Starts the remote-approval HTTPS server.
 ///
 /// # Errors
@@ -282,17 +390,111 @@ pub enum RemoteServeStartError {
 pub async fn start_remote_serve(
     config: RemoteServeConfig,
 ) -> Result<RemoteServeHandle, RemoteServeStartError> {
-    if config.decision_context.context.chain_id
+    start_listener(ListenerConfig {
+        bind_addr: config.bind_addr,
+        rp_id: config.rp_id,
+        authority: config.authority,
+        decision_context: config.decision_context.into(),
+        tls: config.tls,
+        prepared: config.prepared,
+        page_identity: config.page_identity,
+        one_shot: config.one_shot,
+    })
+    .await
+}
+
+/// Starts the signed-origin TLS ceremony for one command without holding its audit writer.
+///
+/// # Errors
+/// Returns policy, disabled-remote, TLS, bind, or presented-entry refusals.
+pub async fn start_remote_presence(
+    config: MainnetPresenceConfig,
+) -> Result<RemoteServeHandle, RemoteServeStartError> {
+    let current = config.authority.load_current()?;
+    let identity = ListenerIdentity::capture(current.policy())?;
+    let remote = enabled_remote_config(current.profile())?;
+    let bind_addr = validate_remote_config(&remote.bind, &remote.rp_id).map_err(|error| {
+        WalletError::Internal(stellar_agent_core::error::InternalError::UnexpectedState {
+            detail: format!("approve.remote_config_invalid: {error}"),
+        })
+    })?;
+    let (tls, server) = tls::select_tls(
+        &config.context.profile_name,
+        remote,
+        Some(&identity.cert_spki_sha256()),
+    )
+    .await?;
+    let context = RemoteContext {
+        context: config.context.clone(),
+        store_path: config.store_path.clone(),
+        mainnet_authority: Some(config.authority.clone()),
+        decision: None,
+    };
+    start_listener(ListenerConfig {
+        bind_addr,
+        rp_id: remote.rp_id.clone(),
+        prepared: Some(PreparedStartup {
+            current: Some(current.clone()),
+            server,
+        }),
+        authority: RemoteApprovalAuthority::for_profile(&config.context.profile_name)?,
+        decision_context: context,
+        tls,
+        page_identity: config.page_identity.clone(),
+        one_shot: Some(config),
+    })
+    .await
+}
+
+async fn start_listener(
+    mut config: ListenerConfig,
+) -> Result<RemoteServeHandle, RemoteServeStartError> {
+    let mut prepared = config.prepared.take();
+    let signed = if config.decision_context.context.chain_id
         == stellar_agent_core::approval::presence::MAINNET_CHAIN_ID
     {
+        let Some(authority) = config.decision_context.mainnet_authority.as_ref() else {
+            return Err(RemoteServeStartError::MainnetPresenceUnsupported);
+        };
+        let current = match prepared
+            .as_mut()
+            .and_then(|prepared| prepared.current.take())
+        {
+            Some(current) => current,
+            None => authority.load_current()?,
+        };
+        let Some(origin) = current
+            .policy()
+            .mainnet()
+            .and_then(|body| body.approval_origin.clone())
+        else {
+            return Err(RemoteServeStartError::MainnetPresenceUnsupported);
+        };
+        let identity = ListenerIdentity::capture(current.policy())?;
+        let remote = enabled_remote_config(current.profile())?;
+        if config.rp_id != origin.rp_id() || remote.rp_id != origin.rp_id() {
+            return Err(WalletError::Approval(ApprovalFailure::OriginProfileMismatch).into());
+        }
+        if authority.profile_name() != config.decision_context.context.profile_name {
+            return Err(WalletError::Approval(ApprovalFailure::PresencePolicyUnavailable).into());
+        }
+        tls::verify_pin(&config.tls, &identity.cert_spki_sha256())?;
+        Some((origin, identity))
+    } else {
+        None
+    };
+    if config.one_shot.is_some() && signed.is_none() {
         return Err(RemoteServeStartError::MainnetPresenceUnsupported);
     }
-    let rustls_config =
-        RustlsConfig::from_pem(config.tls.cert_pem.clone(), config.tls.key_pem.clone())
+    let rustls_config = match prepared {
+        Some(prepared) => prepared.server,
+        None if signed.is_some() => tls::server_config(&config.tls).await?,
+        None => RustlsConfig::from_pem(config.tls.cert_pem.clone(), config.tls.key_pem.clone())
             .await
-            .map_err(|e| RemoteServeStartError::TlsConfigLoad {
-                detail: e.to_string(),
-            })?;
+            .map_err(|error| RemoteServeStartError::TlsConfigLoad {
+                detail: error.to_string(),
+            })?,
+    };
 
     let chain: Caip2 = config.decision_context.context.chain_id.parse().map_err(
         |e: stellar_agent_core::profile::caip2::Caip2ParseError| {
@@ -304,16 +506,15 @@ pub async fn start_remote_serve(
     let operator_credentials =
         OperatorApprovalCredentialStore::new(config.authority.credentials_path().to_path_buf());
 
-    // Bind synchronously, before constructing anything origin-dependent: the
-    // requested `config.bind_addr` may specify port 0 (OS-assigned ephemeral
-    // port), in which case the REAL port is only known once the socket is
-    // actually bound. The expected-origin string (used both by the
-    // `clientDataJSON.origin` check and the `Origin`-header allowlist layer)
-    // MUST use the real bound port — computing it from `config.bind_addr`'s
-    // requested port would bake in port `0` and reject every WebAuthn
-    // ceremony against an ephemeral-port listener.
-    let std_listener = std::net::TcpListener::bind(config.bind_addr)
-        .map_err(|e| RemoteServeStartError::Bind { kind: e.kind() })?;
+    // Testnet derives its origin from the actual bound port, including ephemeral ports.
+    // Signed listeners retain the public authority from the verified policy.
+    let std_listener = std::net::TcpListener::bind(config.bind_addr).map_err(|e| {
+        if config.one_shot.is_some() && e.kind() == std::io::ErrorKind::AddrInUse {
+            RemoteServeStartError::Policy(WalletError::Approval(ApprovalFailure::ListenerBusy))
+        } else {
+            RemoteServeStartError::Bind { kind: e.kind() }
+        }
+    })?;
     std_listener
         .set_nonblocking(true)
         .map_err(|e| RemoteServeStartError::Bind { kind: e.kind() })?;
@@ -321,10 +522,21 @@ pub async fn start_remote_serve(
         .local_addr()
         .map_err(|e| RemoteServeStartError::Bind { kind: e.kind() })?;
 
-    let expected_origin: std::sync::Arc<str> =
-        remote_origin::expected_https_origin(&config.rp_id, local_addr.port()).into();
+    let expected_origin: std::sync::Arc<str> = signed
+        .as_ref()
+        .map_or_else(
+            || remote_origin::expected_https_origin(&config.rp_id, local_addr.port()),
+            |(origin, _)| origin.as_str().to_owned(),
+        )
+        .into();
+    let public_origin = expected_origin.to_string();
 
     let state = RemoteServeState {
+        listener_identity: signed.as_ref().map(|(_, identity)| identity.clone()),
+        selected_nonce: config
+            .one_shot
+            .as_ref()
+            .map(|one| one.entry.approval_nonce.clone().into()),
         rp_id: config.rp_id.clone().into(),
         expected_origin,
         authority: std::sync::Arc::new(config.authority),
@@ -338,7 +550,60 @@ pub async fn start_remote_serve(
         identity: std::sync::Arc::new(config.page_identity),
     };
 
-    let router = build_router(state, &config.rp_id, local_addr.port());
+    #[cfg(feature = "test-helpers")]
+    let test_session = state.session.clone();
+    let (router, completion) = if let Some((origin, identity)) = signed {
+        let mode = match config.one_shot {
+            Some(one) => SignedOriginMode::OneShot(Box::new(one)),
+            None => SignedOriginMode::Inbox {
+                context: state
+                    .ctx
+                    .decision
+                    .clone()
+                    .ok_or(WalletError::Approval(ApprovalFailure::PresenceUnavailable))?,
+                page_identity: (*state.identity).clone(),
+            },
+        };
+        let consent = signed_origin_consent(
+            mode,
+            identity,
+            origin.as_str(),
+            std::sync::Arc::new(state.clone()),
+        )
+        .map_err(|error| {
+            RemoteServeStartError::Policy(WalletError::Approval(
+                error
+                    .presence_failure()
+                    .unwrap_or(ApprovalFailure::PresenceUnavailable),
+            ))
+        })?;
+        let (consent, completion) = consent.into_parts();
+        (
+            layer_router(routes::signed_router().with_state(state).merge(consent))
+                .layer(
+                    stellar_agent_loopback_http::signed_origin::SignedOriginLayer::new(
+                        origin.as_str(),
+                    ),
+                )
+                .layer(
+                    stellar_agent_loopback_http::signed_origin::SignedHostLayer::new(
+                        origin.as_str(),
+                    ),
+                )
+                .layer(stellar_agent_loopback_http::security_headers::SecurityHeadersLayer::new()),
+            completion,
+        )
+    } else {
+        let decision = state
+            .ctx
+            .decision
+            .clone()
+            .ok_or(WalletError::Approval(ApprovalFailure::PresenceUnavailable))?;
+        (
+            build_router(state, decision, &config.rp_id, local_addr.port()),
+            None,
+        )
+    };
 
     let axum_handle = ServerHandle::new();
     let server_handle_for_task = axum_handle.clone();
@@ -360,9 +625,13 @@ pub async fn start_remote_serve(
     tracing::info!(local_addr = %local_addr, rp_id = %config.rp_id, "remote-approval server started");
 
     Ok(RemoteServeHandle {
+        #[cfg(feature = "test-helpers")]
+        test_session,
         local_addr,
         axum_handle,
         server_join,
+        public_origin,
+        completion,
     })
 }
 
@@ -384,7 +653,18 @@ pub(crate) fn open_store(
 /// Visible within the crate (not only this module) so tests can exercise the
 /// real, fully-layered response a browser receives — in particular the CSP
 /// contract, which only the layer stack applied here enforces.
-pub(crate) fn build_router(state: RemoteServeState, rp_id: &str, port: u16) -> Router {
+pub(crate) fn build_router(
+    state: RemoteServeState,
+    context: std::sync::Arc<DecisionContext>,
+    rp_id: &str,
+    port: u16,
+) -> Router {
+    layer_router(routes::build_router(context).with_state(state))
+        .layer(remote_origin::RemoteOriginAllowlistLayer::new(rp_id, port))
+        .layer(stellar_agent_loopback_http::security_headers::SecurityHeadersLayer::new())
+}
+
+fn layer_router(router: Router) -> Router {
     use axum::extract::DefaultBodyLimit;
     use tower_http::{limit::RequestBodyLimitLayer, trace::TraceLayer};
 
@@ -398,13 +678,10 @@ pub(crate) fn build_router(state: RemoteServeState, rp_id: &str, port: u16) -> R
         },
     );
 
-    routes::build_router()
-        .with_state(state)
+    router
         .layer(trace_layer)
         .layer(DefaultBodyLimit::max(BODY_LIMIT_BYTES))
         .layer(RequestBodyLimitLayer::new(BODY_LIMIT_BYTES))
-        .layer(remote_origin::RemoteOriginAllowlistLayer::new(rp_id, port))
-        .layer(stellar_agent_loopback_http::security_headers::SecurityHeadersLayer::new())
 }
 
 #[cfg(test)]

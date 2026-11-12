@@ -123,7 +123,13 @@ libc = { workspace = true }
 # (common/private_open.rs).
 stellar-agent-windows-identity = { workspace = true }
 
+[target.'cfg(unix)'.dev-dependencies]
+# Native child cleanup sends SIGINT on Unix.
+libc = { workspace = true }
+
 [dev-dependencies]
+# Independent TLS fixtures for signed-origin binary ceremonies.
+stellar-agent-approval-remote = { path = "../stellar-agent-approval-remote", features = ["test-helpers"] }
 # test-helpers exposes the enrollment test support: a software registrar and
 # a loopback client that drives the interactive enrollment server.
 stellar-agent-approval-ui = { path = "../stellar-agent-approval-ui", features = ["test-helpers"] }

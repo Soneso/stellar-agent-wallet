@@ -106,7 +106,8 @@ mainnet the attestation HMAC key alone mints no consent: a mainnet approval also
 a verified passkey assertion from an approval credential in the owner-signed policy.
 Two residues remain. A same-user process that holds the HMAC key can wrap a version 5
 record around a user-verified assertion that its own localhost page obtained, so a
-misleading local page is a residue. The owner seed admits approval credentials, so
+misleading local page is a residue.
+Signed-origin receipts instead bind the verified policy, HTTPS origin and served leaf SPKI pin. The owner seed admits approval credentials, so
 signing the policy on a host where same-user code runs exposes that seed.
 
 For code running as the same OS user, the owner of an enabled mainnet profile
@@ -141,7 +142,10 @@ verification ceremony succeeds. It does not prove that a human reads or understa
 the transaction. The browser displays the transaction; the authenticator need not
 display it. Credential enrollment verifies a registration response and a terminal code,
 and the owner admits the public key by signing the policy. The wallet does not certify
-authenticator hardware or detect credential clones from signature counters.
+authenticator hardware.
+Localhost ceremonies record counters without enforcing them.
+Signed-origin login and decisions enforce increasing counters, allowing zero after zero.
+This check does not guarantee clone detection.
 
 These checks constrain actions through the wallet. Same-user code with an extracted
 signing seed can sign outside those paths. Protection of authenticator private keys,
@@ -152,11 +156,11 @@ page outside the wallet, or an operator approving an unwanted request can defeat
 intended consent. The wallet requires the signed proof and does not claim an
 operating-system security boundary against all same-user code.
 
-Mainnet approve, the local inbox, and direct CLI confirmation open a localhost
-passkey page. The operator reviews the authoritative transaction and approves
-with an owner-pinned credential. Headless consent, `--yes`, `--no-open` on the
-mainnet inbox, and remote mainnet approval refuse. Ledger signing also requires
-this passkey ceremony.
+Without a signed approval origin, mainnet consent uses the localhost passkey page.
+Headless consent, `--yes`, `--no-open` on the local inbox, and remote mainnet approval then refuse.
+With a signed approval origin, the HTTPS listener serves consent using an owner-pinned credential.
+The CLI prints the signed approval link without opening a browser or requiring a display.
+Ledger signing also requires this passkey ceremony.
 
 A localhost ceremony binds `127.0.0.1` and `[::1]` on one port before it
 creates any token, serves the same session on both, and closes both together.

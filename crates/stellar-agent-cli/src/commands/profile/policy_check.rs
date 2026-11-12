@@ -62,6 +62,16 @@ pub(crate) fn classify(body: &str, name: &str, passphrase: &str) -> Classificati
     }
 }
 
+/// Classifies the installed body for routing; admission still verifies its signature.
+pub(crate) fn has_signed_origin(name: &str, profile: &Profile) -> bool {
+    default_policy_dir()
+        .ok()
+        .and_then(|directory| std::fs::read_to_string(directory.join(format!("{name}.toml"))).ok())
+        .is_some_and(|body| {
+            classify(&body, name, &profile.network_passphrase) == Classification::SignedOrigin
+        })
+}
+
 fn report(body: &str, args: &PolicyCheckArgs, profile: &Profile) -> i32 {
     match classify(body, &args.profile, &profile.network_passphrase) {
         Classification::Invalid(code) => {

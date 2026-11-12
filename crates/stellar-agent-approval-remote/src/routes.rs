@@ -1,5 +1,11 @@
 //! HTTP router and handlers for the remote-approval server.
 //!
+//! The table describes testnet routes. Signed mode mounts the shared consent router.
+//! Signed login uses current verified policy credentials and the signed RP and origin.
+//! The store supplies counters only, checked once per verified login or decision.
+//! Signed consent uses the page CSRF header; testnet retains its remote header.
+//! One-shot links preserve the selected nonce through login and restrict every listing.
+//!
 //! | Method | Path | Handler | Auth |
 //! |--------|------|---------|------|
 //! | `GET`  | `/` | [`login_page_get`] | none (pre-auth) |
@@ -22,7 +28,7 @@
 //!
 //! # Authorization is read again at every check
 //!
-//! A login reads the profile's current authorization (see [`authorize`])
+//! A login reads the network's current authorization (see [`authorize`])
 //! before it verifies the assertion and again immediately before it creates
 //! the session. Every authenticated request reads it in
 //! [`require_session`]; a session whose credential the current files do
@@ -80,7 +86,9 @@ use crate::wire::{ActionAssertionRequest, LoginAssertionRequest};
 
 /// Build the router (without the outer middleware stack, applied by
 /// [`crate::build_router`]).
-pub(crate) fn build_router() -> Router<RemoteServeState> {
+pub(crate) fn build_router(
+    context: std::sync::Arc<stellar_agent_approval_ui::DecisionContext>,
+) -> Router<RemoteServeState> {
     Router::new()
         .route("/", get(login_page_get))
         .route("/static/login.js", get(login_js_get))
@@ -92,9 +100,95 @@ pub(crate) fn build_router() -> Router<RemoteServeState> {
         .route("/pending.json", get(pending_json))
         .route("/approval/{nonce}", get(approval_detail_get))
         .route("/approval/{nonce}/challenge", post(action_challenge_post))
-        .route("/approval/{nonce}/decision", post(action_decision_post))
+        .route(
+            "/approval/{nonce}/decision",
+            post(action_decision_post).layer(axum::Extension(context)),
+        )
         .route("/static/app-shared.js", get(app_shared_js_get))
         .route("/static/app.js", get(app_js_get))
+}
+
+/// Login, listings, and assets shared with signed consent routes.
+pub(crate) fn signed_router() -> Router<RemoteServeState> {
+    Router::new()
+        .route("/", get(login_page_get))
+        .route("/static/signed-login.js", get(signed_login_js_get))
+        .route("/login/challenge", post(login_challenge_post))
+        .route("/login/assertion", post(login_assertion_post))
+        .route("/approvals/{nonce}", get(approval_link_get))
+        .route("/inbox", get(inbox_get))
+        .route("/pending.json", get(pending_json))
+        .route("/static/app-shared.js", get(app_shared_js_get))
+        .route("/static/app.js", get(app_js_get))
+}
+
+impl stellar_agent_approval_ui::presence::ConsentSessionGate for RemoteServeState {
+    type Session = SessionState;
+
+    fn session(&self, headers: &HeaderMap) -> Result<SessionState, Response> {
+        require_session(self, headers)
+    }
+
+    fn authorize_mutation(&self, headers: &HeaderMap, nonce: &str) -> Result<(), Response> {
+        let session = require_session(self, headers)?;
+        let value = headers
+            .get("x-stellar-approval-csrf")
+            .and_then(|value| value.to_str().ok());
+        if value.is_some_and(|value| verify_csrf(&session.csrf_key, nonce, value)) {
+            Ok(())
+        } else {
+            Err(csrf_rejected())
+        }
+    }
+
+    fn session_key(&self, session: &SessionState) -> String {
+        session.session_id.to_hex()
+    }
+
+    fn csrf(&self, session: &SessionState, nonce: &str) -> String {
+        compute_csrf(&session.csrf_key, nonce)
+    }
+
+    fn verified(
+        &self,
+        presence: &stellar_agent_core::approval::VerifiedMainnetPresence,
+    ) -> Result<(), stellar_agent_core::WalletError> {
+        use stellar_agent_core::{ApprovalFailure, WalletError};
+        let invalid = || WalletError::Approval(ApprovalFailure::PresenceInvalid);
+        if policy_credential(self, &presence.credential_id_b64url()).as_ref()
+            != Some(presence.credential())
+        {
+            return Err(invalid());
+        }
+        self.operator_credentials
+            .check_policy_sign_count(presence.credential(), &self.rp_id, presence.sign_count())
+            .map_err(|error| match error {
+                ApprovalError::SignCounterRegression { .. } => invalid(),
+                _ => WalletError::Approval(ApprovalFailure::PresenceUnavailable),
+            })
+    }
+}
+
+fn policy_credential(
+    state: &RemoteServeState,
+    id: &str,
+) -> Option<stellar_agent_core::approval::MainnetApprovalCredential> {
+    let current = state
+        .ctx
+        .mainnet_authority
+        .as_ref()?
+        .load_current_compare_only()
+        .ok()?;
+    crate::enabled_remote_config(current.profile()).ok()?;
+    let body = current.policy().mainnet()?;
+    let origin = body.approval_origin.as_ref()?;
+    if origin.as_str() != state.expected_origin.as_ref() || origin.rp_id() != state.rp_id.as_ref() {
+        return None;
+    }
+    body.approval_credentials
+        .iter()
+        .find(|credential| credential.credential_id_b64url() == id)
+        .cloned()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -147,10 +241,9 @@ fn store_unavailable() -> Response {
 /// dropped from `state.session` so the next login starts clean rather than
 /// leaving a dead entry around indefinitely.
 ///
-/// The session's credential must also be authorized now (see
-/// [`authorize`]): a session whose credential the profile's current list or
-/// the operator-credential store does not admit, or whose authorization
-/// cannot be read, is dropped and answered with the same `404`.
+/// The session's credential must also pass current authorization through [`authorize`].
+/// Signed-origin sessions require a current policy credential; testnet sessions require allowlisting and enrollment.
+/// A failed authorization drops the session and returns the same `404`.
 #[allow(
     clippy::result_large_err,
     reason = "the Err variant is the ready-to-return Response for the auth-boundary rejection"
@@ -196,12 +289,13 @@ fn require_session(
     Ok(session)
 }
 
-/// Whether the served profile's current authorization admits
-/// `credential_id_b64url`: its `allowed_credentials` list names it, the
-/// operator-credential store holds it, remote approval is enabled, and the
-/// profile's chain and relying-party ID are the listener's. Reads both
-/// files now; a read failure refuses.
+/// Checks current policy credentials for signed-origin consent.
+/// Testnet requires a current allowlist entry and enrollment with matching chain and RP.
+/// A read failure refuses either mode.
 fn authorize(state: &RemoteServeState, credential_id_b64url: &str) -> bool {
+    if state.listener_identity.is_some() {
+        return policy_credential(state, credential_id_b64url).is_some();
+    }
     match state
         .authority
         .require_credential(credential_id_b64url, state.chain, Some(&state.rp_id))
@@ -234,10 +328,82 @@ fn require_csrf(session: &SessionState, headers: &HeaderMap, nonce: &str) -> Res
 // Handlers — login
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// `GET /` — the login page. No session required; this IS the
-/// pre-authentication surface. Loads the ungated `/static/login.js`.
+/// `GET /` serves the public login page with the asset for its listener mode.
 async fn login_page_get(State(state): State<RemoteServeState>) -> Response {
-    Html(render_login_page(&state.rp_id, &state.identity)).into_response()
+    if state.listener_identity.is_some() {
+        let destination = match state.selected_nonce.as_ref() {
+            None => "/inbox".to_owned(),
+            Some(nonce) => match approval_destination(nonce) {
+                Some(destination) => destination,
+                None => return not_found(),
+            },
+        };
+        return Html(render_login_page(
+            &state.rp_id,
+            &state.identity,
+            crate::templates::LoginMode::Signed {
+                destination: &destination,
+            },
+        ))
+        .into_response();
+    }
+    Html(render_login_page(
+        &state.rp_id,
+        &state.identity,
+        crate::templates::LoginMode::Testnet,
+    ))
+    .into_response()
+}
+
+fn approval_destination(nonce: &str) -> Option<String> {
+    if nonce.is_empty()
+        || nonce.len() > 64
+        || !nonce
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+    {
+        return None;
+    }
+    Some(format!("/approval/{nonce}"))
+}
+
+async fn approval_link_get(
+    State(state): State<RemoteServeState>,
+    headers: HeaderMap,
+    Path(nonce): Path<String>,
+) -> Response {
+    let Some(destination) = approval_destination(&nonce) else {
+        return not_found();
+    };
+    if state
+        .selected_nonce
+        .as_ref()
+        .is_some_and(|selected| selected.as_ref() != nonce)
+    {
+        return not_found();
+    }
+    if require_session(&state, &headers).is_ok() {
+        return axum::response::Redirect::temporary(&destination).into_response();
+    }
+    Html(render_login_page(
+        &state.rp_id,
+        &state.identity,
+        crate::templates::LoginMode::Signed {
+            destination: &destination,
+        },
+    ))
+    .into_response()
+}
+
+async fn signed_login_js_get() -> Response {
+    (
+        [(
+            header::CONTENT_TYPE,
+            "application/javascript; charset=utf-8",
+        )],
+        web::SIGNED_LOGIN_JS,
+    )
+        .into_response()
 }
 
 /// `GET /static/login.js` — the pre-authentication login-ceremony browser
@@ -275,6 +441,11 @@ async fn login_challenge_post(State(state): State<RemoteServeState>) -> Response
         );
     }
 
+    if let Some(authority) = &state.ctx.mainnet_authority
+        && authority.load_current().is_err()
+    {
+        return assertion_invalid();
+    }
     let challenge = {
         let mut store = match state.login_challenges.lock() {
             Ok(g) => g,
@@ -301,12 +472,9 @@ async fn login_challenge_post(State(state): State<RemoteServeState>) -> Response
 /// `POST /login/assertion` — verifies a login assertion and establishes a
 /// session.
 ///
-/// Reads the profile's current authorization for the presented credential
-/// id before verifying (see [`authorize`]) and again immediately before
-/// creating the session, so a credential removed during the verification is
-/// refused; a credential that is enrolled but not allowlisted (or vice
-/// versa) is refused identically to an unknown credential; see the
-/// module-level error-indistinguishability note in `crate::verify`.
+/// Reads current authorization before verification and before creating the session.
+/// Signed mode verifies with the policy key; testnet requires enrollment and allowlisting.
+/// Unknown and removed credentials receive the same refusal.
 async fn login_assertion_post(
     State(state): State<RemoteServeState>,
     body: axum::body::Bytes,
@@ -320,21 +488,34 @@ async fn login_assertion_post(
         return assertion_invalid();
     }
 
-    let Ok(Some(record)) = state
-        .operator_credentials
-        .find_by_credential_id(&credential_id)
-    else {
-        return assertion_invalid();
+    let policy_key = if state.listener_identity.is_some() {
+        match policy_credential(&state, &credential_id) {
+            Some(credential) => Some(credential),
+            None => return assertion_invalid(),
+        }
+    } else {
+        None
     };
+    let pubkey = if let Some(credential) = &policy_key {
+        *credential.public_key_sec1()
+    } else {
+        let Ok(Some(record)) = state
+            .operator_credentials
+            .find_by_credential_id(&credential_id)
+        else {
+            return assertion_invalid();
+        };
 
-    let Ok(pubkey_bytes) = base64::Engine::decode(
-        &base64::engine::general_purpose::URL_SAFE_NO_PAD,
-        &record.public_key_sec1_b64,
-    ) else {
-        return assertion_invalid();
-    };
-    let Ok(pubkey): Result<[u8; 65], _> = pubkey_bytes.try_into() else {
-        return assertion_invalid();
+        let Ok(pubkey_bytes) = base64::Engine::decode(
+            &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+            &record.public_key_sec1_b64,
+        ) else {
+            return assertion_invalid();
+        };
+        let Ok(pubkey): Result<[u8; 65], _> = pubkey_bytes.try_into() else {
+            return assertion_invalid();
+        };
+        pubkey
     };
 
     // The challenge is embedded in clientDataJSON; recover the raw bytes by
@@ -370,17 +551,28 @@ async fn login_assertion_post(
 
     // Sign-counter regression check: a cloned-authenticator signal refuses
     // the login even though the signature itself verified.
-    if state
-        .operator_credentials
-        .update_sign_count(&credential_id, verified.sign_count)
-        .is_err()
-    {
+    let counter = match &policy_key {
+        Some(credential) => state.operator_credentials.check_policy_sign_count(
+            credential,
+            &state.rp_id,
+            verified.sign_count,
+        ),
+        None => state
+            .operator_credentials
+            .update_sign_count(&credential_id, verified.sign_count),
+    };
+    if counter.is_err() {
         return assertion_invalid();
     }
 
     #[cfg(all(test, feature = "test-helpers"))]
     login_hook::fire();
     if !authorize(&state, &credential_id) {
+        return assertion_invalid();
+    }
+    if let Some(credential) = &policy_key
+        && policy_credential(&state, &credential_id).as_ref() != Some(credential)
+    {
         return assertion_invalid();
     }
     let session = SessionState::generate(credential_id);
@@ -530,7 +722,8 @@ async fn inbox_get(State(state): State<RemoteServeState>, headers: HeaderMap) ->
         return resp;
     }
     match take_snapshot(&state.ctx.store_path) {
-        SnapshotResult::Ok(pending) => {
+        SnapshotResult::Ok(mut pending) => {
+            scope_snapshot(&state, &mut pending);
             Html(render_inbox_page(&pending, &state.identity)).into_response()
         }
         // The shell still renders on a transient store failure; the
@@ -549,12 +742,21 @@ async fn pending_json(State(state): State<RemoteServeState>, headers: HeaderMap)
         return resp;
     }
     match take_snapshot(&state.ctx.store_path) {
-        SnapshotResult::Ok(pending) => json_response(
-            StatusCode::OK,
-            &json!({ "pending": stellar_agent_approval_ui::pending_json_value(&pending) }),
-        ),
+        SnapshotResult::Ok(mut pending) => {
+            scope_snapshot(&state, &mut pending);
+            json_response(
+                StatusCode::OK,
+                &json!({ "pending": stellar_agent_approval_ui::pending_json_value(&pending) }),
+            )
+        }
         SnapshotResult::Busy => store_busy(),
         SnapshotResult::Unavailable => store_unavailable(),
+    }
+}
+
+fn scope_snapshot(state: &RemoteServeState, pending: &mut Vec<PendingApprovalView>) {
+    if let Some(nonce) = &state.selected_nonce {
+        pending.retain(|entry| entry.approval_nonce == nonce.as_ref());
     }
 }
 
@@ -726,6 +928,9 @@ async fn action_challenge_post(
 /// applies the decision.
 async fn action_decision_post(
     State(state): State<RemoteServeState>,
+    axum::Extension(context): axum::Extension<
+        std::sync::Arc<stellar_agent_approval_ui::DecisionContext>,
+    >,
     headers: HeaderMap,
     Path(nonce): Path<String>,
     body: axum::body::Bytes,
@@ -845,7 +1050,7 @@ async fn action_decision_post(
         Decision::Reject { nonce }
     };
 
-    let outcome = apply_decision(&state.ctx, decision, requester);
+    let outcome = apply_decision(&context, decision, requester);
     outcome_to_response(outcome)
 }
 
@@ -1070,6 +1275,8 @@ mod tests {
         );
 
         let state = RemoteServeState {
+            listener_identity: None,
+            selected_nonce: None,
             rp_id: RP_ID.into(),
             expected_origin: ORIGIN.into(),
             authority: Arc::new(
@@ -1081,7 +1288,7 @@ mod tests {
                 .unwrap(),
             ),
             chain: stellar_agent_core::profile::caip2::Caip2::Testnet,
-            ctx: Arc::new(ctx),
+            ctx: Arc::new(ctx.into()),
             operator_credentials: Arc::new(OperatorApprovalCredentialStore::new(
                 operator_credentials_path,
             )),
@@ -1122,6 +1329,78 @@ mod tests {
             .insert(entry, stellar_agent_core::timefmt::now_unix_ms().unwrap())
             .unwrap();
         nonce
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn testnet_remote_transcript_keeps_base_bytes() {
+        let fixture = fixture("transcript");
+        let router = crate::build_router(
+            fixture.state.clone(),
+            fixture.state.ctx.decision.clone().unwrap(),
+            RP_ID,
+            8443,
+        );
+        let mut transcript = Vec::new();
+        for (method, path, origin) in [
+            ("GET", "/", None),
+            ("GET", "/static/login.js", None),
+            ("GET", "/static/enroll.js", None),
+            ("GET", "/inbox", None),
+            ("GET", "/pending.json", None),
+            ("GET", "/static/app.js", None),
+            ("POST", "/login/assertion", None),
+            ("POST", "/login/challenge", Some("https://foreign.example")),
+        ] {
+            let mut request = Request::builder().method(method).uri(path);
+            if let Some(origin) = origin {
+                request = request.header(header::ORIGIN, origin);
+            }
+            let response = router
+                .clone()
+                .oneshot(request.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            transcript.extend_from_slice(response.status().as_str().as_bytes());
+            for name in [header::CONTENT_TYPE, header::CONTENT_SECURITY_POLICY] {
+                if let Some(value) = response.headers().get(name) {
+                    transcript.extend_from_slice(value.as_bytes());
+                }
+            }
+            transcript
+                .extend_from_slice(&to_bytes(response.into_body(), 128 * 1024).await.unwrap());
+        }
+        assert_transcript_fixture("testnet-transcript.txt", &transcript);
+    }
+
+    fn assert_transcript_fixture(name: &str, actual: &[u8]) {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures")
+            .join(name);
+        // A final framing newline keeps the captured bytes in a text fixture.
+        let actual = format!("{}\n", String::from_utf8(actual.to_vec()).unwrap());
+        if std::env::var("UPDATE_FIXTURES").as_deref() == Ok("1") {
+            std::fs::write(&path, &actual).unwrap();
+        }
+        assert_eq!(
+            actual,
+            std::fs::read_to_string(path).unwrap(),
+            "captured response bytes"
+        );
+    }
+
+    #[test]
+    fn signed_login_template_keeps_fixture_bytes() {
+        let page = render_login_page(
+            "wallet.internal",
+            &PageIdentity::neutral(),
+            crate::templates::LoginMode::Signed {
+                destination: "/approval/selected",
+            },
+        );
+        assert!(page.contains("/static/signed-login.js"));
+        assert!(!page.contains("/static/login.js"));
+        assert_transcript_fixture("signed-login.html", page.as_bytes());
     }
 
     async fn body_json(resp: axum::response::Response) -> serde_json::Value {
@@ -1199,7 +1478,7 @@ mod tests {
     #[serial]
     async fn served_shared_app_js_is_the_approval_ui_bytes_verbatim() {
         let f = fixture("shared-js");
-        let router = build_router();
+        let router = build_router(f.state.ctx.decision.clone().unwrap());
         let cookie = login(&router, &f.state, &f.authenticator).await;
 
         let resp = router
@@ -1230,7 +1509,7 @@ mod tests {
     #[serial]
     async fn shared_app_js_without_cookie_is_not_found() {
         let f = fixture("shared-js-nocookie");
-        let resp = build_router()
+        let resp = build_router(f.state.ctx.decision.clone().unwrap())
             .with_state(f.state.clone())
             .oneshot(
                 Request::builder()
@@ -1249,7 +1528,7 @@ mod tests {
     #[serial]
     async fn unknown_approval_page_holds_no_nonce() {
         let f = fixture("unknown-nonce");
-        let router = build_router();
+        let router = build_router(f.state.ctx.decision.clone().unwrap());
         let cookie = login(&router, &f.state, &f.authenticator).await;
         let resp = router
             .clone()
@@ -1503,7 +1782,7 @@ mod tests {
             let fx = fixture("swap-before-challenge");
             let store_path = fx.state.ctx.store_path.clone();
             let nonce = insert_payment_entry(&store_path);
-            let router = build_router();
+            let router = build_router(fx.state.ctx.decision.clone().unwrap());
             let cookie = login(&router, &fx.state, &fx.authenticator).await;
             let csrf = get_csrf(&router, &fx.state, &cookie, &nonce).await;
             let shown = get_view_digest(&router, &fx.state, &cookie, &nonce)
@@ -1548,7 +1827,7 @@ mod tests {
             let fx = fixture("swap-after-challenge");
             let store_path = fx.state.ctx.store_path.clone();
             let nonce = insert_payment_entry(&store_path);
-            let router = build_router();
+            let router = build_router(fx.state.ctx.decision.clone().unwrap());
             let cookie = login(&router, &fx.state, &fx.authenticator).await;
             let csrf = get_csrf(&router, &fx.state, &cookie, &nonce).await;
             let challenge = mint_action_challenge(&router, &fx.state, &cookie, &csrf, &nonce).await;
@@ -1604,7 +1883,7 @@ mod tests {
             let fx = fixture("digest-less-challenge");
             let store_path = fx.state.ctx.store_path.clone();
             let nonce = insert_payment_entry(&store_path);
-            let router = build_router();
+            let router = build_router(fx.state.ctx.decision.clone().unwrap());
             let cookie = login(&router, &fx.state, &fx.authenticator).await;
             let csrf = get_csrf(&router, &fx.state, &cookie, &nonce).await;
 
@@ -1695,7 +1974,7 @@ mod tests {
                     .insert(entry, stellar_agent_core::timefmt::now_unix_ms().unwrap())
                     .unwrap();
             }
-            let router = build_router();
+            let router = build_router(fx.state.ctx.decision.clone().unwrap());
             let cookie = login(&router, &fx.state, &fx.authenticator).await;
             let csrf = get_csrf(&router, &fx.state, &cookie, &nonce).await;
             let challenge = mint_action_challenge(&router, &fx.state, &cookie, &csrf, &nonce).await;
@@ -1733,7 +2012,7 @@ mod tests {
         rt.block_on(async {
             let fx = fixture("happy");
             let nonce = insert_payment_entry(&fx.state.ctx.store_path);
-            let router = build_router();
+            let router = build_router(fx.state.ctx.decision.clone().unwrap());
 
             let cookie = login(&router, &fx.state, &fx.authenticator).await;
             let csrf = get_csrf(&router, &fx.state, &cookie, &nonce).await;
@@ -1811,7 +2090,7 @@ mod tests {
             let fx = fixture("wysiwys");
             let nonce_a = insert_payment_entry(&fx.state.ctx.store_path);
             let nonce_b = insert_payment_entry(&fx.state.ctx.store_path);
-            let router = build_router();
+            let router = build_router(fx.state.ctx.decision.clone().unwrap());
 
             let cookie = login(&router, &fx.state, &fx.authenticator).await;
             let csrf_a = get_csrf(&router, &fx.state, &cookie, &nonce_a).await;
@@ -1854,7 +2133,7 @@ mod tests {
         rt.block_on(async {
             let fx = fixture("unminted");
             let nonce = insert_payment_entry(&fx.state.ctx.store_path);
-            let router = build_router();
+            let router = build_router(fx.state.ctx.decision.clone().unwrap());
 
             let cookie = login(&router, &fx.state, &fx.authenticator).await;
             let csrf = get_csrf(&router, &fx.state, &cookie, &nonce).await;
@@ -1892,7 +2171,7 @@ mod tests {
         rt.block_on(async {
             let fx = fixture("replay");
             let nonce = insert_payment_entry(&fx.state.ctx.store_path);
-            let router = build_router();
+            let router = build_router(fx.state.ctx.decision.clone().unwrap());
 
             let cookie = login(&router, &fx.state, &fx.authenticator).await;
             let csrf = get_csrf(&router, &fx.state, &cookie, &nonce).await;
@@ -1961,7 +2240,7 @@ mod tests {
         rt.block_on(async {
             let fx = fixture("wrong-origin");
             let nonce = insert_payment_entry(&fx.state.ctx.store_path);
-            let router = build_router();
+            let router = build_router(fx.state.ctx.decision.clone().unwrap());
 
             let cookie = login(&router, &fx.state, &fx.authenticator).await;
             let csrf = get_csrf(&router, &fx.state, &cookie, &nonce).await;
@@ -2004,7 +2283,7 @@ mod tests {
         rt.block_on(async {
             let fx = fixture("origin-port-mismatch");
             let nonce = insert_payment_entry(&fx.state.ctx.store_path);
-            let router = build_router();
+            let router = build_router(fx.state.ctx.decision.clone().unwrap());
 
             let cookie = login(&router, &fx.state, &fx.authenticator).await;
             let csrf = get_csrf(&router, &fx.state, &cookie, &nonce).await;
@@ -2047,7 +2326,7 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let fx = fixture("expired-session");
-            let router = build_router();
+            let router = build_router(fx.state.ctx.decision.clone().unwrap());
 
             let cookie = login(&router, &fx.state, &fx.authenticator).await;
 
@@ -2133,7 +2412,7 @@ mod tests {
                 .unwrap()
                 .insert(entry, stellar_agent_core::timefmt::now_unix_ms().unwrap())
                 .unwrap();
-            let router = build_router();
+            let router = build_router(fx.state.ctx.decision.clone().unwrap());
             let cookie = login(&router, &fx.state, &fx.authenticator).await;
             let get = |uri: &'static str| {
                 router.clone().with_state(fx.state.clone()).oneshot(
@@ -2173,7 +2452,7 @@ mod tests {
         rt.block_on(async {
             let fx = fixture("wrong-rp-id");
             let nonce = insert_payment_entry(&fx.state.ctx.store_path);
-            let router = build_router();
+            let router = build_router(fx.state.ctx.decision.clone().unwrap());
 
             let cookie = login(&router, &fx.state, &fx.authenticator).await;
             let csrf = get_csrf(&router, &fx.state, &cookie, &nonce).await;
@@ -2210,7 +2489,7 @@ mod tests {
         rt.block_on(async {
             let fx = fixture("uv-absent");
             let nonce = insert_payment_entry(&fx.state.ctx.store_path);
-            let router = build_router();
+            let router = build_router(fx.state.ctx.decision.clone().unwrap());
 
             let cookie = login(&router, &fx.state, &fx.authenticator).await;
             let csrf = get_csrf(&router, &fx.state, &cookie, &nonce).await;
@@ -2250,7 +2529,7 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let fx = fixture("not-allowlisted");
-            let router = build_router();
+            let router = build_router(fx.state.ctx.decision.clone().unwrap());
 
             // A DIFFERENT authenticator/credential, never allowlisted (and
             // never enrolled).
@@ -2356,7 +2635,7 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let fx = fixture("revoked-login");
-            let router = build_router();
+            let router = build_router(fx.state.ctx.decision.clone().unwrap());
             let id = fx.authenticator.credential_id_b64url().to_owned();
             assert_eq!(
                 try_login(&router, &fx.state, &fx.authenticator, 1).await,
@@ -2442,7 +2721,7 @@ mod tests {
         rt.block_on(async {
             for revoke in ["allowlist", "enrollment"] {
                 let fx = fixture(&format!("login-verify-{revoke}"));
-                let router = build_router();
+                let router = build_router(fx.state.ctx.decision.clone().unwrap());
                 let id = fx.authenticator.credential_id_b64url().to_owned();
                 let fired = std::rc::Rc::new(std::cell::Cell::new(false));
                 let hook_fired = std::rc::Rc::clone(&fired);
@@ -2516,7 +2795,7 @@ mod tests {
                     let tag = route.replace(['/', '{', '}', '.'], "-");
                     let fx = fixture(&format!("revoked-get-{revoke}{tag}"));
                     let nonce = insert_payment_entry(&fx.state.ctx.store_path);
-                    let router = build_router();
+                    let router = build_router(fx.state.ctx.decision.clone().unwrap());
                     let cookie = login(&router, &fx.state, &fx.authenticator).await;
                     let uri = route.replace("{nonce}", &nonce);
                     assert_eq!(
@@ -2550,7 +2829,7 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let fx = fixture("unaffected-login");
-            let router = build_router();
+            let router = build_router(fx.state.ctx.decision.clone().unwrap());
             let second = fx.enroll_second();
             let first_id = fx.authenticator.credential_id_b64url().to_owned();
             let second_id = second.credential_id_b64url().to_owned();
@@ -2587,7 +2866,7 @@ mod tests {
             ] {
                 let fx = fixture(&format!("revoked-session-{decision}-{revoke}"));
                 let nonce = insert_payment_entry(&fx.state.ctx.store_path);
-                let router = build_router();
+                let router = build_router(fx.state.ctx.decision.clone().unwrap());
                 let cookie = login(&router, &fx.state, &fx.authenticator).await;
                 let csrf = get_csrf(&router, &fx.state, &cookie, &nonce).await;
                 let challenge =
@@ -2680,7 +2959,7 @@ mod tests {
         rt.block_on(async {
             let fx = fixture("counter-regression");
             let nonce = insert_payment_entry(&fx.state.ctx.store_path);
-            let router = build_router();
+            let router = build_router(fx.state.ctx.decision.clone().unwrap());
 
             // First login advances the counter to 5.
             let challenge_resp = router
@@ -2768,7 +3047,7 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let fx = fixture("enroll-reachable");
-            let router = build_router();
+            let router = build_router(fx.state.ctx.decision.clone().unwrap());
 
             let resp = router
                 .clone()
@@ -2802,7 +3081,7 @@ mod tests {
             const CAPACITY: usize = 3;
             // A non-refilling bucket isolates the routes' shared capacity.
             *fx.state.login_rate_limiter.lock().unwrap() = TokenBucket::new(CAPACITY as f64, 0.0);
-            let router = build_router();
+            let router = build_router(fx.state.ctx.decision.clone().unwrap());
 
             for attempt in 0..=CAPACITY {
                 let resp = router
@@ -2851,7 +3130,7 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let fx = fixture("enroll-no-side-effect");
-            let router = build_router();
+            let router = build_router(fx.state.ctx.decision.clone().unwrap());
 
             let before = fx.state.operator_credentials.list().unwrap();
 
@@ -2900,7 +3179,7 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let fx = fixture("enroll-no-inline-handlers");
-            let router = build_router();
+            let router = build_router(fx.state.ctx.decision.clone().unwrap());
 
             let resp = router
                 .clone()
@@ -2961,7 +3240,12 @@ mod tests {
             // module's unlayered `build_router`) is the only one that applies
             // `SecurityHeadersLayer` — the CSP contract only holds through
             // that stack, exactly as a real browser experiences it.
-            let layered_router = crate::build_router(fx.state.clone(), RP_ID, 8443);
+            let layered_router = crate::build_router(
+                fx.state.clone(),
+                fx.state.ctx.decision.clone().unwrap(),
+                RP_ID,
+                8443,
+            );
 
             // Pre-auth: GET / (the login page).
             let resp = layered_router
@@ -2996,7 +3280,7 @@ mod tests {
             // juggling is required here) using the unlayered router the
             // `login` helper expects, then reuse the resulting cookie
             // against the layered router.
-            let unlayered = build_router();
+            let unlayered = build_router(fx.state.ctx.decision.clone().unwrap());
             let cookie = login(&unlayered, &fx.state, &fx.authenticator).await;
 
             let resp = layered_router
@@ -3102,7 +3386,7 @@ mod tests {
             let mut store = PendingApprovalStore::open(fx.state.ctx.store_path.clone()).unwrap();
             store.insert(entry, stellar_agent_core::timefmt::now_unix_ms().unwrap()).unwrap();
             drop(store);
-            let router = build_router();
+            let router = build_router(fx.state.ctx.decision.clone().unwrap());
             let cookie = login(&router, &fx.state, &fx.authenticator).await;
             let response = router.with_state(fx.state).oneshot(Request::builder().uri(format!("/approval/{nonce}")).header(header::COOKIE, cookie).body(Body::empty()).unwrap()).await.unwrap();
             assert_eq!(response.status(), StatusCode::OK);
@@ -3139,7 +3423,7 @@ mod tests {
                 .insert(entry, stellar_agent_core::timefmt::now_unix_ms().unwrap())
                 .unwrap();
             drop(store);
-            let router = build_router();
+            let router = build_router(fx.state.ctx.decision.clone().unwrap());
             let cookie = login(&router, &fx.state, &fx.authenticator).await;
             let csrf = get_csrf(&router, &fx.state, &cookie, &nonce).await;
             let response = router

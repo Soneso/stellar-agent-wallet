@@ -15,6 +15,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   only. The intent witness takes consent from the receipt's verified time and
   ends execution at consent plus the smaller of 15 minutes and the governing
   rule lifetime.
+- Mainnet HTTPS consent serves an owner-signed approval origin with explicit TLS paths and a matching leaf SPKI pin.
+  Policy credentials authorize login and decisions; counters update once per verified assertion.
+  One-shot consent prints a secret-free signed link, needs no display, and closes synchronously.
+  Policy signing and certificate replacement require a listener restart.
 - `scripts/deploy/` holds the scripts that run the mainnet wallet as a
   dedicated `stellar-agent` account with its platform keyring. They are a root
   bootstrap, three `sudo -u` wrappers, a sudoers source, and one validation
@@ -34,7 +38,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   mutex. A writer still held then is logged with its profile and keeps its
   queued rows and commitment. The bound covers the mutex wait only.
 
-- Version 2 policies accept optional signed `[mainnet]` fields `approval_origin`, a canonical HTTPS DNS origin, and `approval_cert_spki_sha256`, the lowercase hex SHA-256 of a leaf certificate's SPKI DER. The mainnet minimum requires both or neither. Under a policy that signs them, mainnet presence binds the origin's host as the relying-party ID, the origin, and the pin. The local inbox and the localhost passkey page then refuse with `approval.origin_signed_remote`, and no listener in this release serves the signed origin.
+- Version 2 policies accept the optional signed `[mainnet]` field `approval_origin`, a canonical HTTPS DNS origin.
+  The paired `approval_cert_spki_sha256` field contains the lowercase hex SHA-256 of a leaf certificate's SPKI DER.
+  The mainnet minimum requires both or neither.
+  Mainnet presence binds the signed origin's host as the relying-party ID, the origin, and the pin.
+  The local inbox and localhost passkey page refuse with `approval.origin_signed_remote`.
+  The HTTPS listener serves consent at the signed origin.
 - A business id names one mainnet value operation, and a retry with it returns the stored state of that operation instead of doing new work.
 
 - A CI check verifies the release proof matrix: each claim for each value tool on MCP and the CLI names its proving tests or its delivering change.

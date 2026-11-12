@@ -93,11 +93,10 @@
 //!
 //! # Counters
 //!
-//! The signature counter in authenticator bytes 33..37 is recorded and
-//! audited only. A zero, repeated or decreasing counter neither waives a
-//! check nor refuses an otherwise valid fresh assertion. Replay defense is
-//! the random single-use challenge and the pending entry's lifecycle; the
-//! wallet does not detect cloned credentials.
+//! Localhost ceremonies record and audit the signature counter without enforcing it.
+//! Signed-origin listeners enforce counters once after login or action verification.
+//! Policy counter rows require strict increase, except for zero following zero.
+//! Receipt verification and commit perform no counter writes.
 //!
 //! # Sealing
 //!
@@ -1510,6 +1509,7 @@ pub struct VerifiedMainnetPresence {
     intent: Option<ClassicIntent>,
     deadline: Instant,
     credential_fingerprint: String,
+    facts: AssertionFacts,
 }
 
 impl std::fmt::Debug for VerifiedMainnetPresence {
@@ -1534,6 +1534,18 @@ pub(crate) struct VerifiedPresenceParts {
 }
 
 impl VerifiedMainnetPresence {
+    /// The policy credential whose key verifies this assertion.
+    #[must_use]
+    pub fn credential(&self) -> &MainnetApprovalCredential {
+        &self.facts.credential
+    }
+
+    /// The signature counter from the verified authenticator data.
+    #[must_use]
+    pub fn sign_count(&self) -> u32 {
+        self.facts.sign_count
+    }
+
     /// The consent request ID of the ceremony.
     #[must_use]
     pub fn request_id(&self) -> &str {
@@ -1678,6 +1690,7 @@ pub fn verify_mainnet_presence(
         intent: pending.intent,
         deadline: pending.deadline,
         credential_fingerprint: facts.credential.fingerprint(),
+        facts,
     })
 }
 

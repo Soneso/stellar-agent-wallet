@@ -428,7 +428,18 @@ async fn approve_mainnet(
     drop(store);
     #[allow(clippy::print_stderr, reason = "CLI operator consent instructions")]
     {
-        eprintln!("{}", crate::common::mainnet_confirm::CONSENT_LINE);
+        let signed = crate::commands::profile::policy_check::has_signed_origin(
+            &context.profile_name,
+            profile,
+        );
+        eprintln!(
+            "{}",
+            if signed {
+                crate::common::mainnet_confirm::SIGNED_CONSENT_LINE
+            } else {
+                crate::common::mainnet_confirm::CONSENT_LINE
+            }
+        );
     }
     init_platform_keyring_store()?;
     let presence =

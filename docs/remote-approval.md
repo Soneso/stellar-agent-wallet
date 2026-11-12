@@ -26,12 +26,15 @@ MPP terms and the network are checked against the authorization fingerprint befo
 The simulated fee reads `not bound to this approval`.
 A request whose stored digest is not the digest of its stored envelope, whose envelope does not decode, whose MPP terms do not match its fingerprint, or whose rule proposal digest does not match what it shows appears as `INCONSISTENT` and offers only Reject; an approve of it is refused with the status `inconsistent` and attests nothing.
 Each pending approval records who approved it: the local operator, or the operator credential the remote listener verified. The HMAC covers that approver, so an edited or deleted approver invalidates the approval.
-The remote listener serves testnet profiles only. On a mainnet profile, `approve serve --remote` refuses to start with `approval.mainnet_remote_unsupported` and binds nothing: mainnet consent requires a verified passkey assertion from an approval credential in the owner-signed policy (see [Approval credentials](profiles.md#approval-credentials)), recorded under attestation version 5 with its receipt, and the listener's allowlist and operator-credential store do not supply one. The approval gate also refuses a remote approve of a mainnet request with HTTP 403 and the same code, and records nothing. Approve or reject a mainnet request in the local inbox (`approve serve` without `--remote`).
+Mainnet remote consent requires an approval origin and leaf SPKI pin in the current verified owner-signed policy.
+Without them, startup refuses with `approval.mainnet_remote_unsupported` before binding.
+Ordinary remote authorization never supplies mainnet presence.
+Signed-origin consent records attestation version 5 with a version 2 presence receipt and a mainnet passkey approver.
+The receipt binds the signed origin, policy digest and served leaf pin.
 The audit log distinguishes remote `ApprovalAttestedRemote` / `ApprovalRejectedRemote` events from loopback `ApprovalAttested` / `ApprovalRejected` events.
 Each row is written before the decision takes effect; a decision whose row cannot be written is refused and the entry stays pending.
 
-Two independent layers must both hold for a remote approve or reject to take
-effect:
+On testnet, two independent layers must hold for an approve or reject to take effect:
 
 - The HTTP layer verifies a fresh WebAuthn passkey assertion, computed over a
   challenge cryptographically bound to the exact pending entry you are
@@ -71,7 +74,12 @@ allowed_credentials = ["c9k3JGxPq1c_..."]
   that resolves to the wallet host from the device you will approve from. An
   IP address is not a valid Relying Party ID per WebAuthn Level 2 §5.1.2 and
   is refused outright, not silently accepted. See the worked example below.
-- **`allowed_credentials`**: the base64url WebAuthn credential IDs permitted
+- **`cert_path` and `key_path`**: explicit PEM files, both required on mainnet.
+  Use absolute paths for both files.
+  Relative values resolve against the process working directory.
+  Testnet loads an explicit pair or provisions its default pair when both fields are absent.
+  An incomplete pair refuses on every network; configured files never trigger generation.
+- **`allowed_credentials`** (testnet only): the base64url WebAuthn credential IDs permitted
   to approve or reject. A credential enrolled (see below) but absent from
   this list is refused exactly like an unrecognized credential. Enrollment
   and authorization are two separate, both-required steps. The running
@@ -105,13 +113,52 @@ ways, depending on your setup:
 Either way, `rp_id` is never an IP literal. WebAuthn binds credentials to a
 domain, not an address, and a browser will not run the ceremony against one.
 
-## Starting the listener
+## Signed-origin mainnet consent
+
+Sign `approval_origin` and `approval_cert_spki_sha256` in the policy.
+The pin is SHA-256 over the leaf certificate's SPKI DER.
+It differs from the complete certificate fingerprint printed by testnet startup.
+Set the profile's `rp_id` to the signed host, including every host label.
+Configure the backend `bind`, `enabled = true`, `cert_path` and `key_path`.
+The public origin may use a different port from the backend socket.
+
+Only credentials in the current verified policy authorize login, approval and rejection.
+The profile allowlist and enrolled public keys grant no mainnet trust.
+The operator store supplies counters only; missing rows are created with policy metadata.
+Each verified login or decision updates the counter once under the store lock.
+Equal nonzero and lower counts refuse; zero may follow zero.
+Receipt verification and commit make no counter update.
+Rejection requires a fresh action assertion; a session cookie and CSRF value alone cannot reject.
+
+The browser must trust the certificate independently of the wallet's SPKI pin.
+Use a public-CA certificate or install the issuing private CA on the approving device.
+Certificate issuance, renewal automation and TLS-terminating proxies are outside this listener's scope.
+Replace files and restart after TLS rotation.
+Running listeners never reload TLS.
+Restart after policy signing, including a same-pin re-sign.
+Fresh challenges and persistence reject a stale policy identity with `approval.listener_policy_stale`.
+
+Missing, unreadable, malformed or mismatched PEM files report `approve.remote_tls_unavailable`, naming the field.
+A loose private-key permission keeps the existing TLS provisioning refusal.
+A different leaf key reports `approval.cert_pin_mismatch`.
+A profile RP mismatch reports `approval.origin_profile_mismatch`.
+Foreign Host or Origin headers refuse; forwarded headers supply no authority.
+
+Signed-origin serving requires explicit `cert_path` and `key_path`, enabled remote configuration, and a profile RP matching the signed host.
+The listener trusts current policy credentials and enforces their counters once per login or decision.
+Restart it after policy signing or TLS replacement.
+Persistent serve requires `--confirm-remote-exposure`, accepts `--no-open`, and uses no display or browser opener.
+One-shot consent needs no exposure flag and prints `<signed-origin>/approvals/<id>` to stderr without a token.
+Login continues to that id; completion, cancellation, expiry and interruption close the listener.
+An occupied configured socket reports `approval.listener_busy`; use the running inbox.
+
+## Starting the testnet listener
 
 ```bash
 stellar-agent approve serve --remote --confirm-remote-exposure --profile default
 ```
 
-On first start the wallet provisions a self-signed TLS certificate (via
+When both TLS paths are absent, testnet provisions a self-signed TLS certificate (via
 `rcgen`) for `rp_id` and prints:
 
 ```
@@ -131,7 +178,7 @@ Do this before enrolling a passkey: the enrollment page below runs entirely
 over this same TLS connection, so the certificate must already be trusted
 before you point a browser at it.
 
-## Enrolling a passkey credential
+## Enrolling a testnet operator credential
 
 `approve operator enroll` has two modes, and which one applies here comes
 down to one fact: a WebAuthn credential is bound to the origin that created
