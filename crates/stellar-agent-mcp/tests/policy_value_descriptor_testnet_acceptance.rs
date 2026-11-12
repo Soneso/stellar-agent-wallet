@@ -270,6 +270,7 @@ async fn simulate_self_payment_envelope(server: &WalletServer, g_strkey: &str) -
             memo_hash_hex: None,
             memo_return_hex: None,
             classic_base: Some(FEE_STROOPS.to_string()),
+            business_id: None,
         })
         .await
         .expect("Noop-engine simulate must succeed against a funded account");
@@ -332,6 +333,7 @@ async fn value_gate_allow_per_tx_cap_commits_on_testnet() {
             memo_hash_hex: None,
             memo_return_hex: None,
             classic_base: Some(FEE_STROOPS.to_string()),
+            business_id: None,
         })
         .await
         .expect("simulate under an allowing per_tx_cap value rule must succeed");
@@ -369,6 +371,7 @@ async fn value_gate_allow_per_tx_cap_commits_on_testnet() {
             envelope_xdr,
             approval_nonce: None,
             approval_attestation: None,
+            business_id: None,
         })
         .await
         .expect(
@@ -430,6 +433,7 @@ async fn value_gate_deny_per_tx_cap_exceeded_blocks_before_submit() {
             memo_hash_hex: None,
             memo_return_hex: None,
             classic_base: Some(FEE_STROOPS.to_string()),
+            business_id: None,
         })
         .await
         .expect("a policy deny must return the business-error envelope, not a protocol error");

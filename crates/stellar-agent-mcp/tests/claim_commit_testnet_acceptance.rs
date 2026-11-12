@@ -381,6 +381,7 @@ async fn t1_claim_two_phase_happy_path() {
             chain_id: TESTNET_CHAIN_ID.to_owned(),
             balance_id: balance_id_hex72.clone(),
             source_account: Some(claimant_g.clone()),
+            business_id: None,
         })
         .await
         .expect("simulate must succeed against a live, claimable balance");
@@ -487,6 +488,7 @@ async fn t1_claim_two_phase_happy_path() {
             envelope_xdr,
             approval_nonce: Some(approval_nonce),
             approval_attestation: Some(blob_b64),
+            business_id: None,
         })
         .await
         .expect("commit must pass the gate and submit on-chain");
@@ -615,6 +617,7 @@ async fn t2_predicate_expired_refused() {
             chain_id: TESTNET_CHAIN_ID.to_owned(),
             balance_id: balance_id_hex72,
             source_account: Some(claimant_g.clone()),
+            business_id: None,
         })
         .await
         .expect("the claim guard must return a tool-level error result, not an ErrorData");

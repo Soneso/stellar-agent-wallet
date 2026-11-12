@@ -153,6 +153,10 @@ use crate::commands::policy_engine::{
     evaluate_mainnet_policy, evaluate_value_moving_policy, load_mainnet_policy_engine,
     with_total_fee,
 };
+use crate::common::business_entry::{
+    BoundEnvelope, ClassicStart, bind_envelope, classic_start, entry_business_id,
+    mainnet_business_id, print_replay, signing_envelope,
+};
 use crate::common::mainnet_write::{
     MainnetWriteRequest, authorize_and_submit, mainnet_context, mainnet_profiles_dir,
     mainnet_write_build_refusal, require_v1_engine,
@@ -171,6 +175,7 @@ use crate::common::signer_ceremony::{
 };
 use crate::common::{ResolvedProfileName, resolve_profile_name};
 use stellar_agent_network::operational::read_within_readiness_deadline;
+use stellar_agent_network::policy_state::{OperationKind, OperationTool};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Constants
@@ -288,6 +293,11 @@ pub struct CreateAccountResult {
     /// Transaction-specific cross-check outcome for sponsored creation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cross_check: Option<CrossCheckView>,
+
+    /// The business id the run named, echoed off mainnet, where no record
+    /// exists. Absent when the run named none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub business_id: Option<String>,
 }
 
 /// A failed sponsored create. `signed_xdr` is `Some` only once the envelope
@@ -434,6 +444,12 @@ pub struct CreateArgs {
     /// URL credentials are refused.
     #[arg(long, value_name = "URL", value_parser = EndpointUrlFlag)]
     pub rpc_url: Option<String>,
+    /// Business id naming this value operation: 1 to 64 printable ASCII
+    /// characters, no space. Required on mainnet, where a retry with the
+    /// same id prints the stored operation instead of doing new work; on
+    /// another network it is validated and echoed.
+    #[arg(long = "business-id", value_name = "ID")]
+    pub business_id: Option<String>,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -518,6 +534,14 @@ where
         }
     };
     tracing::debug!(profile = %resolved.name, profile_source = resolved.source.as_str(), "accounts create: profile resolved");
+    // Off mainnet a supplied business id is validated and echoed, and no
+    // record exists.
+    if !context.chain_id.is_mainnet()
+        && let Err(e) = entry_business_id(&profile, args.business_id.as_deref())
+    {
+        print_error(&Envelope::<()>::err(&e), args.output);
+        return 1;
+    }
     if args.fund_with_friendbot {
         run_friendbot(&context, args).await
     } else if context.chain_id.is_mainnet() {
@@ -640,7 +664,8 @@ async fn run_friendbot(context: &NetworkContext, args: &CreateArgs) -> i32 {
     .await
     {
         Ok(fb_result) => {
-            let result = build_friendbot_result(&new_account, &fb_result);
+            let mut result = build_friendbot_result(&new_account, &fb_result);
+            result.business_id.clone_from(&args.business_id);
             let envelope = Envelope::ok(result);
             print_success(&envelope, args.output);
             0
@@ -670,6 +695,7 @@ fn build_friendbot_result(new_account: &NewAccount, fb: &FriendbotResult) -> Cre
         selected_fee_per_op_stroops: None,
         selected_fee_percentile: None,
         cross_check: None,
+        business_id: None,
     }
 }
 
@@ -1080,6 +1106,7 @@ where
                 selected_fee_per_op_stroops: Some(fee_selection.per_op_stroops),
                 selected_fee_percentile: Some(fee_selection.selected_fee_percentile),
                 cross_check: Some(cross_check.view()),
+                business_id: args.business_id.clone(),
             };
             let envelope = Envelope::ok(result);
             print_success(&envelope, args.output);
@@ -1294,6 +1321,9 @@ fn sponsored_success_lines(result: &CreateAccountResult) -> Vec<String> {
     if let Some(cross_check) = &result.cross_check {
         lines.push(cross_check.text_line());
     }
+    if let Some(business_id) = &result.business_id {
+        lines.push(format!("business_id {business_id}"));
+    }
     lines
 }
 
@@ -1317,6 +1347,9 @@ fn print_success(envelope: &Envelope<CreateAccountResult>, format: OutputFormat)
                             "Account created (friendbot): {}  tx_hash {}",
                             result.account_id, hash
                         );
+                        if let Some(business_id) = &result.business_id {
+                            println!("business_id {business_id}");
+                        }
                         // secret_key is NEVER emitted in table mode.
                     } // `CreateMode` is `#[non_exhaustive]` but defined same-crate;
                       // the compiler enforces exhaustiveness here without a `_` arm.
@@ -1472,10 +1505,52 @@ where
     )
     .await;
 
-    let (fee_choice, fee_selection) = match select_create_fee(&client, args).await {
+    let (_, fee_selection) = match select_create_fee(&client, args).await {
         Ok(selection) => selection,
         Err(e) => return fail(&Envelope::<()>::err(&e)),
     };
+    // The intent the business id binds needs the verified policy and the
+    // request facts only, so a retained operation answers before the
+    // envelope is built.
+    let policy = match load_mainnet_policy_engine(
+        "accounts create",
+        "policy.engine_unavailable",
+        &context,
+        resolved.source,
+        &profiles_dir,
+    ) {
+        Ok(policy) => policy,
+        Err(envelope) => return fail(&envelope),
+    };
+    let fee_choice = match parse_classic_fee_choice(args.fee.as_deref()) {
+        Ok(choice) => choice,
+        Err(e) => return fail(&Envelope::<()>::err(&e)),
+    };
+    // The id is checked where the run first needs it, after every refusal
+    // a run without one gives, so their codes stay.
+    let business_id = match mainnet_business_id(args.business_id.as_deref()) {
+        Ok(id) => id,
+        Err(e) => return fail(&Envelope::<()>::err(&e)),
+    };
+    let operation = match classic_start(
+        &context,
+        &policy,
+        business_id,
+        &sponsor,
+        fee_choice,
+        &stellar_xdr::Memo::None,
+        stellar_agent_network::operation_entry::IdentityFacts::Intent(
+            stellar_agent_core::approval::IntentPayload::CreateAccount {
+                destination: new_account.g_strkey.clone(),
+                starting_balance_stroops: starting_balance.as_stroops(),
+            },
+        ),
+    ) {
+        Ok(ClassicStart::Proceed(operation)) => operation,
+        Ok(ClassicStart::Replay(view)) => return print_replay(&view, args.output),
+        Err(e) => return fail(&Envelope::<()>::err(&e)),
+    };
+
     let envelope_xdr = match build_sponsored_unsigned_envelope(
         &net_context,
         &sponsor,
@@ -1487,18 +1562,24 @@ where
         Ok(xdr) => xdr,
         Err(e) => return fail(&Envelope::<()>::err(&e)),
     };
-
-    let policy = match load_mainnet_policy_engine(
-        "accounts create",
-        "policy.engine_unavailable",
+    // The record binds the envelope the run signs: a waiting record's
+    // stored envelope, or the one just built.
+    let handle = match bind_envelope(
         &context,
-        resolved.source,
-        &profiles_dir,
+        operation,
+        OperationTool::CliAccountsCreate,
+        OperationKind::CreateAccount,
+        &envelope_xdr,
     ) {
-        Ok(policy) => policy,
-        Err(envelope) => return fail(&envelope),
+        Ok(BoundEnvelope::Sign(handle)) => handle,
+        Ok(BoundEnvelope::Replay(view)) => return print_replay(&view, args.output),
+        Err(e) => return fail(&Envelope::<()>::err(&e)),
     };
-    let total_fee = match envelope_total_fee(&envelope_xdr) {
+    let (unsigned_xdr, fee_per_op_stroops) = match signing_envelope(&handle) {
+        Ok(signing) => signing,
+        Err(e) => return fail(&Envelope::<()>::err(&e)),
+    };
+    let total_fee = match envelope_total_fee(unsigned_xdr) {
         Ok(fee) => fee,
         Err(e) => return fail(&Envelope::<()>::err(&e)),
     };
@@ -1526,7 +1607,7 @@ where
 
     let body = &policy.body;
     if let Err(e) = check_classic_fee_cap_signed(
-        fee_selection.per_op_stroops,
+        fee_per_op_stroops,
         classic_fee_source(fee_choice, FeeSource::CommandDefault),
         profile,
         Some(body.classic_max_fee_per_op_stroops),
@@ -1557,7 +1638,7 @@ where
             base_units: i128::from(starting_balance_stroops),
         },
         CreateAccountWitnessInputs { source },
-        &envelope_xdr,
+        unsigned_xdr,
         &thresholds,
         "stellar_create_account",
     )
@@ -1573,7 +1654,7 @@ where
         verb: "accounts create",
         tool: "stellar_create_account",
         consumer: MainnetConsumer::CliCreateAccount,
-        unsigned_xdr: &envelope_xdr,
+        unsigned_xdr,
         client: &client,
         probe_deadline: budget,
         submit_timeout: submit_timeout(args.timeout_seconds, profile),
@@ -1585,6 +1666,7 @@ where
         effective_cap,
         witness: cross_check.witness(),
         ledger: operational,
+        operation: Some(&handle),
     })
     .await
     {
@@ -1596,9 +1678,10 @@ where
                 tx_hash: Some(submitted.result.tx_hash.clone()),
                 ledger: Some(submitted.result.ledger),
                 friendbot_url_used: None,
-                selected_fee_per_op_stroops: Some(fee_selection.per_op_stroops),
+                selected_fee_per_op_stroops: Some(fee_per_op_stroops),
                 selected_fee_percentile: Some(fee_selection.selected_fee_percentile),
                 cross_check: Some(cross_check.view()),
+                business_id: None,
             };
             print_success(&Envelope::ok(result), args.output);
             0
@@ -1612,7 +1695,7 @@ where
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     #![allow(clippy::panic, reason = "test spies reject keyring access")]
     #![allow(
         clippy::unwrap_used,
@@ -2032,6 +2115,7 @@ mod tests {
             timeout_seconds: None,
             rpc_url: None,
             fee: None,
+            business_id: None,
         };
         let exit = run_with_dependencies(
             &args,
@@ -2093,6 +2177,7 @@ mod tests {
             timeout_seconds: None,
             rpc_url: Some(guard_rpc.uri()),
             fee: None,
+            business_id: None,
         };
         let exit = run_with_dependencies(
             &args,
@@ -2147,6 +2232,7 @@ mod tests {
             timeout_seconds: None,
             rpc_url: None,
             fee: None,
+            business_id: None,
         };
         let exit = run_with_dependencies(
             &args,
@@ -2215,6 +2301,7 @@ mod tests {
             timeout_seconds: None,
             rpc_url: Some(guard_rpc.uri()),
             fee: None,
+            business_id: None,
         };
         let exit = run_with_dependencies(
             &args,
@@ -2254,6 +2341,7 @@ mod tests {
             timeout_seconds: None,
             rpc_url: None,
             fee: None,
+            business_id: None,
         }
     }
 
@@ -2359,6 +2447,7 @@ mod tests {
             selected_fee_per_op_stroops: Some(selection.per_op_stroops),
             selected_fee_percentile: Some(selection.selected_fee_percentile),
             cross_check: None,
+            business_id: None,
         };
         let json = serde_json::to_value(result).expect("CreateAccountResult serialises");
         assert_eq!(json["selected_fee_per_op_stroops"], "250");
@@ -2382,6 +2471,7 @@ mod tests {
             selected_fee_per_op_stroops: None,
             selected_fee_percentile: None,
             cross_check: None,
+            business_id: None,
         };
         let json = serde_json::to_value(&result).expect("CreateAccountResult serialises");
         assert!(json.get("selected_fee_per_op_stroops").is_none());
@@ -2498,6 +2588,7 @@ mod tests {
             timeout_seconds: None,
             rpc_url: Some(crate::common::network::TESTNET_RPC_URL.to_owned()),
             fee: None,
+            business_id: None,
         };
         let acc = resolve_new_account(&args).expect("generate must succeed");
 
@@ -2544,6 +2635,7 @@ mod tests {
             timeout_seconds: None,
             rpc_url: Some(crate::common::network::TESTNET_RPC_URL.to_owned()),
             fee: None,
+            business_id: None,
         };
         let result = resolve_new_account(&args);
         assert!(result.is_err(), "invalid G-strkey must return an error");
@@ -2582,6 +2674,7 @@ mod tests {
             timeout_seconds: None,
             rpc_url: Some(crate::common::network::TESTNET_RPC_URL.to_owned()),
             fee: None,
+            business_id: None,
         };
         let acc = resolve_new_account(&args).expect("positional G-strkey must resolve");
         assert!(
@@ -2616,6 +2709,7 @@ mod tests {
             timeout_seconds: None,
             rpc_url: Some(crate::common::network::TESTNET_RPC_URL.to_owned()),
             fee: None,
+            business_id: None,
         };
         let acc = resolve_new_account(&args).expect("--generate must succeed");
         assert!(
@@ -2692,6 +2786,7 @@ mod tests {
             timeout_seconds: None,
             rpc_url: Some(crate::common::network::TESTNET_RPC_URL.to_owned()),
             fee: None,
+            business_id: None,
         }
     }
 
@@ -3467,7 +3562,7 @@ mod tests {
     /// The mainnet pipeline over the fixture's stored profile, ceremony and
     /// routed endpoints.
     #[cfg(feature = "mainnet-write")]
-    mod mainnet_full {
+    pub(crate) mod mainnet_full {
         use super::*;
         use std::rc::Rc;
 
@@ -3503,7 +3598,7 @@ mod tests {
         /// A sponsored create of [`NEW_ACCOUNT`] with 2 XLM, sponsored by the
         /// agent, with no signer flag: a mainnet profile signs with the
         /// enrolled seed in the keyring.
-        fn mainnet_args(fixture: &MainnetFixture) -> CreateArgs {
+        pub(crate) fn mainnet_args(fixture: &MainnetFixture) -> CreateArgs {
             CreateArgs {
                 profile: Some(fixture.name.to_owned()),
                 new_account: Some(NEW_ACCOUNT.to_owned()),
@@ -3520,12 +3615,13 @@ mod tests {
                 timeout_seconds: None,
                 rpc_url: None,
                 fee: None,
+                business_id: Some(crate::common::business_entry::fresh_business_id()),
             }
         }
 
-        struct Run {
-            code: i32,
-            envelope: Value,
+        pub(crate) struct Run {
+            pub(crate) code: i32,
+            pub(crate) envelope: Value,
         }
 
         impl Run {
@@ -3534,13 +3630,19 @@ mod tests {
             }
         }
 
-        async fn run(fixture: &MainnetFixture, args: &CreateArgs) -> Run {
+        pub(crate) async fn run(fixture: &MainnetFixture, args: &CreateArgs) -> Run {
             crate::common::render::take_rendered_for_test();
             let code = run_with_dependencies(args, fixture.loader(), fixture.initializer()).await;
             Run {
                 code,
                 envelope: last_rendered(),
             }
+        }
+
+        /// Runs `args` on the fixture and returns the exit code alone, for a
+        /// run whose output is not one JSON envelope.
+        pub(crate) async fn run_code(fixture: &MainnetFixture, args: &CreateArgs) -> i32 {
+            run_with_dependencies(args, fixture.loader(), fixture.initializer()).await
         }
 
         /// A real browser listener gates the signer, authorization, and submission.
@@ -4031,6 +4133,7 @@ mod tests {
             timeout_seconds: None,
             rpc_url: Some(crate::common::network::TESTNET_RPC_URL.to_owned()),
             fee: None,
+            business_id: None,
         };
         let result = resolve_new_account(&args);
         assert!(result.is_err(), "invalid G-strkey must return an error");

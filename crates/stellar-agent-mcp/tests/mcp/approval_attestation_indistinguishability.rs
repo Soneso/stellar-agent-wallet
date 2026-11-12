@@ -378,6 +378,7 @@ async fn property4_all_failure_modes_produce_byte_identical_wire_error() {
             // Both absent.
             approval_nonce: None,
             approval_attestation: None,
+            business_id: None,
         })
         .await
         .expect("case a: absent attestation must return Ok(is_error) envelope");
@@ -414,6 +415,7 @@ async fn property4_all_failure_modes_produce_byte_identical_wire_error() {
             approval_attestation: Some(
                 base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0xFFu8; 32]),
             ),
+            business_id: None,
         })
         .await
         .expect("case b: forged attestation must return Ok(is_error) envelope");
@@ -483,6 +485,7 @@ async fn property4_all_failure_modes_produce_byte_identical_wire_error() {
             // Reference the expired entry.
             approval_nonce: Some(approval_nonce_id),
             approval_attestation: Some(fake_attestation),
+            business_id: None,
         })
         .await
         .expect("case c: expired entry must return Ok(is_error) envelope");
@@ -598,6 +601,7 @@ async fn property4a_absent_attestation_returns_approval_required() {
             envelope_xdr,
             approval_nonce: None,
             approval_attestation: None,
+            business_id: None,
         }),
     )
     .await
@@ -676,6 +680,7 @@ async fn property4b_forged_attestation_returns_approval_required() {
             approval_attestation: Some(
                 base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0xFFu8; 32]),
             ),
+            business_id: None,
         }),
     )
     .await
@@ -780,6 +785,7 @@ async fn property4c_expired_approval_entry_returns_approval_required() {
             envelope_xdr,
             approval_nonce: Some(approval_nonce_id),
             approval_attestation: Some(fake_attestation),
+            business_id: None,
         }),
     )
     .await
@@ -926,6 +932,7 @@ async fn valid_attestation_passes_gate() {
             envelope_xdr,
             approval_nonce: Some(approval_nonce_id),
             approval_attestation: Some(blob_b64),
+            business_id: None,
         })
         .await;
 
@@ -1054,6 +1061,7 @@ async fn an_attestation_under_the_owner_public_key_returns_the_uniform_error() {
             approval_attestation: Some(
                 base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(blob),
             ),
+            business_id: None,
         }),
     )
     .await

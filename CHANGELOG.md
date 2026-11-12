@@ -20,6 +20,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   signed origins. The dedicated-user page documents deployment and validation.
 
 - Version 2 policies accept optional signed `[mainnet]` fields `approval_origin`, a canonical HTTPS DNS origin, and `approval_cert_spki_sha256`, the lowercase hex SHA-256 of a leaf certificate's SPKI DER. The mainnet minimum requires both or neither. Under a policy that signs them, mainnet presence binds the origin's host as the relying-party ID, the origin, and the pin. The local inbox and the localhost passkey page then refuse with `approval.origin_signed_remote`, and no listener in this release serves the signed origin.
+- A business id names one mainnet value operation, and a retry with it returns the stored state of that operation instead of doing new work.
 
 - A CI check verifies the release proof matrix: each claim for each value tool on MCP and the CLI names its proving tests or its delivering change.
 - `stellar_agent_core::approval::intent` defines the classic intent, its canonical bytes and digest, and its claim value leg; `stellar_agent_core::approval::IntentView` shows it.

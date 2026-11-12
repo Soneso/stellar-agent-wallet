@@ -770,12 +770,72 @@ Other non-ASCII text is accepted.
 
 A v1 rule set that names tools explicitly must include `stellar_transaction_status` to reconcile timed-out submissions through that server; the server logs `policy.transaction_status_unmatched` at startup when neither that tool nor `*` appears.
 
+#### Business ids
+
+On `stellar:mainnet` every value tool requires `business_id`: `stellar_pay`,
+`stellar_create_account`, `stellar_claim`, `stellar_trustline`, their commit
+tools, and both x402 payment tools. The id names one value operation and has
+1 to 64 printable ASCII characters without a space. A missing id refuses with
+`validation.business_id_required` and a malformed one with
+`validation.business_id_invalid`, after the argument and endpoint refusals of
+the call.
+
+The preparation looks the id up once the endpoint is known to serve the
+profile's network and before it builds anything. An unknown id builds the
+envelope and opens the operation record. A record that still waits returns
+the envelope it stores. A retained operation answers with its stored state
+and does no new work: no signature, mint, send or audit row. The same id with
+another intent refuses with `operation.business_id_conflict` and leaves the
+record unchanged. A new record past the store's bounds refuses with
+`operation.capacity`. The commit takes the preparation's id; another id
+refuses with `operation.business_id_mismatch` before anything signs or sends.
+The commit looks the id up before it verifies the approval, rebuilds the
+envelope or consumes the nonce. A commit of an envelope that the id's record
+does not bind refuses there with `operation.business_id_conflict`. A retried
+commit of a retained operation thus answers with its stored state. A claim names its balance id and claimant. A
+retry answers with the stored claim after the balance left the ledger or its
+predicate expired, and another balance under the id refuses as a conflict.
+
+A replay is a success result:
+
+```json
+{
+  "ok": true,
+  "data": {
+    "status": "replayed",
+    "business_id": "invoice-42",
+    "operation": {
+      "id": "<32 hex characters>",
+      "state": "sent_outcome_unknown",
+      "tx_hash": "<64 hex characters>",
+      "ledger": null,
+      "error_code": null
+    },
+    "next": "wait"
+  }
+}
+```
+
+`next` is `none` once the operation ended and `wait` while it is prepared,
+sending or of unknown outcome. It is `approve` while it awaits approval and
+`retry` while it is authorized or not included. A sent attempt reads
+`sent_outcome_unknown` with its transaction hash until reconciliation settles
+it.
+
+Every success result of a call that names an id carries it in
+`data.business_id`. On mainnet these are each preparation, commit and payment.
+On another chain a supplied id is validated and echoed, and no record exists.
+Without an id the result is unchanged.
+
 ### Trustline
 
 | Tool | Purpose | Gating |
 | --- | --- | --- |
 | `stellar_trustline` | Simulate a trustline change: build the ChangeTrust envelope, run the issuer clawback-flag gate, mint a single-use nonce. | No signing; no submission. Not annotated read-only (mints the single-use nonce the commit step consumes). |
 | `stellar_trustline_commit` | Recheck issuer, witness, sign, submit. | Signs and submits. Two-phase verb; approval spine. |
+
+Both trustline tools take `business_id` as described under
+[Business ids](#business-ids).
 
 ### Fees
 
@@ -920,6 +980,9 @@ The `chain_id` argument of both payment tools takes the wallet's spelling,
 `stellar:testnet` or `stellar:mainnet`. The x402 requirement `network` spells
 mainnet `stellar:pubnet`; that spelling is not a valid `chain_id`.
 
+Both payment tools take `business_id` as described under
+[Business ids](#business-ids).
+
 Both payment tools run in this order:
 
 1. The remaining steps describe a testnet profile. A mainnet profile refuses
@@ -985,6 +1048,16 @@ an oracle.
 
 On an admitted mainnet server, each x402 payment takes two calls. Both tools
 take the optional `approval_nonce` and `approval_attestation` arguments.
+
+Each call opens the payment's operation record under its `business_id` once
+the requirements and the payer are known, so a retained payment answers with
+its stored state. Call 2 commits the attempt as `sending` after the intent
+mint and before the signature. The exposure commits after the intent
+consumption and before the signed re-simulation, the first request that
+carries the signed entries. A returned payload ends the attempt as
+`payload_released`. A failure before the exposure ends it as `not_sent` with
+the failure's code. A failure after it, or a withheld payload, ends it as
+`sent_outcome_unknown`.
 `approval_nonce` is optional in the schema. Omit it with `approval_attestation`
 for mainnet call 1, and supply both for call 2. Mainnet call 2 requires the
 CLI-issued attestation alongside its approval nonce. Supplying only one approval

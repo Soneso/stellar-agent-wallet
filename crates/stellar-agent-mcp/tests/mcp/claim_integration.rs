@@ -229,6 +229,7 @@ fn simulate_args() -> StellarClaimArgs {
         chain_id: "stellar:testnet".to_owned(),
         balance_id: "ab".repeat(32),
         source_account: Some(SOURCE_G.to_owned()),
+        business_id: None,
     }
 }
 
@@ -677,6 +678,7 @@ fn commit_args(
         envelope_xdr,
         approval_nonce: None,
         approval_attestation: None,
+        business_id: None,
     }
 }
 
@@ -1032,6 +1034,7 @@ async fn claim_commit_full_round_trip_succeeds_with_string_encoded_amount() {
         chain_id: "stellar:testnet".to_owned(),
         balance_id: "ab".repeat(32),
         source_account: Some(claimant_g.clone()),
+        business_id: None,
     };
     let (sim_result, simulate_clients) =
         crate::common::clients_built_by(server.call_stellar_claim(simulate_args)).await;
@@ -1059,6 +1062,7 @@ async fn claim_commit_full_round_trip_succeeds_with_string_encoded_amount() {
         envelope_xdr,
         approval_nonce: None,
         approval_attestation: None,
+        business_id: None,
     };
     let (commit_result, commit_clients) =
         crate::common::clients_built_by(server.call_stellar_claim_commit(commit_args)).await;
@@ -1182,6 +1186,7 @@ async fn claim_two_phase_round_trip_succeeds_under_satisfied_minimum_reserve_rul
         chain_id: "stellar:testnet".to_owned(),
         balance_id: "ab".repeat(32),
         source_account: Some(claimant_g.clone()),
+        business_id: None,
     };
     let sim_result = server
         .call_stellar_claim(simulate_args)
@@ -1206,6 +1211,7 @@ async fn claim_two_phase_round_trip_succeeds_under_satisfied_minimum_reserve_rul
         envelope_xdr,
         approval_nonce: None,
         approval_attestation: None,
+        business_id: None,
     };
     let commit_result = server
         .call_stellar_claim_commit(commit_args)
@@ -1297,6 +1303,7 @@ async fn claim_commit_denies_under_unsatisfied_minimum_reserve_rule() {
         envelope_xdr,
         approval_nonce: None,
         approval_attestation: None,
+        business_id: None,
     };
     let commit_result = server
         .call_stellar_claim_commit(commit_args)
@@ -1434,6 +1441,7 @@ async fn commit_endpoint_network_mismatch_refuses_without_burning_nonce() {
             chain_id: "stellar:testnet".to_owned(),
             balance_id: "ab".repeat(32),
             source_account: Some(claimant_g.clone()),
+            business_id: None,
         })
         .await
         .expect("simulate must not error");
@@ -1449,6 +1457,7 @@ async fn commit_endpoint_network_mismatch_refuses_without_burning_nonce() {
         envelope_xdr,
         approval_nonce: None,
         approval_attestation: None,
+        business_id: None,
     };
 
     // ── Commit against the wrong network ───────────────────────────────────
@@ -1538,6 +1547,7 @@ async fn prepare_and_commit_send_the_primary_credential() {
         chain_id: "stellar:testnet".to_owned(),
         balance_id: "ab".repeat(32),
         source_account: Some(claimant_g.clone()),
+        business_id: None,
     };
     let sim_result = server
         .call_stellar_claim(simulate_args.clone())
@@ -1559,6 +1569,7 @@ async fn prepare_and_commit_send_the_primary_credential() {
         envelope_xdr,
         approval_nonce: None,
         approval_attestation: None,
+        business_id: None,
     };
     let committed = server
         .call_stellar_claim_commit(commit_args.clone())
@@ -1624,6 +1635,7 @@ async fn simulate_refuses_an_endpoint_serving_another_network_before_any_read() 
             chain_id: "stellar:testnet".to_owned(),
             balance_id: "ab".repeat(32),
             source_account: Some(claimant_g),
+            business_id: None,
         }))
         .await;
     let result = result.expect("the refusal is a tool result, not a protocol error");
@@ -1689,6 +1701,7 @@ async fn claim_prepare_fee_above_cap_refuses() {
             chain_id: "stellar:testnet".to_owned(),
             balance_id: "ab".repeat(32),
             source_account: Some(claimant_g),
+            business_id: None,
         })
         .await
         .unwrap();
@@ -1731,6 +1744,7 @@ async fn claim_commit_fee_above_cap_refuses() {
             chain_id: "stellar:testnet".to_owned(),
             balance_id: "ab".repeat(32),
             source_account: Some(claimant_g.clone()),
+            business_id: None,
         })
         .await
         .unwrap();
@@ -1756,6 +1770,7 @@ async fn claim_commit_fee_above_cap_refuses() {
             envelope_xdr,
             approval_nonce: None,
             approval_attestation: None,
+            business_id: None,
         })
         .await
         .unwrap();
@@ -1904,6 +1919,7 @@ async fn witness_claim_case(case: ClaimCase, expected: &str) {
             chain_id: "stellar:testnet".to_owned(),
             balance_id: "ab".repeat(32),
             source_account: Some(source.clone()),
+            business_id: None,
         })
         .await
         .unwrap();
@@ -1943,6 +1959,7 @@ async fn witness_claim_case(case: ClaimCase, expected: &str) {
         envelope_xdr,
         approval_nonce: None,
         approval_attestation: None,
+        business_id: None,
     };
     let server = if case == ClaimCase::Cap {
         profile.classic_max_fee_per_op_stroops = Some(50);

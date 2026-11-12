@@ -600,6 +600,7 @@ async fn call(fixture: &Fixture, tool: Tool) -> rmcp::model::CallToolResult {
                 chain_id: "stellar:testnet".into(),
                 address: None,
                 payment_required: payment_required(),
+                business_id: None,
             })
             .await
             .expect("no protocol error"),
@@ -612,6 +613,7 @@ async fn call(fixture: &Fixture, tool: Tool) -> rmcp::model::CallToolResult {
                 approval_attestation: None,
                 home_domain: "merchant.example".into(),
                 payment_required: payment_required(),
+                business_id: None,
             })
             .await
             .expect("no protocol error"),
@@ -886,6 +888,7 @@ async fn testnet_create_payment_ignores_supplied_approval_arguments() {
                 chain_id: "stellar:testnet".into(),
                 address: None,
                 payment_required: payment_required(),
+                business_id: None,
             })
             .await
             .expect("no protocol error");
@@ -1549,6 +1552,7 @@ async fn call_on_chain(
                     chain_id: chain_id.into(),
                     address: None,
                     payment_required: payment_required.to_owned(),
+                    business_id: None,
                 })
                 .await
         }
@@ -1562,6 +1566,7 @@ async fn call_on_chain(
                     approval_attestation: None,
                     home_domain: "merchant.example".into(),
                     payment_required: payment_required.to_owned(),
+                    business_id: None,
                 })
                 .await
         }
@@ -2144,6 +2149,7 @@ async fn x402_chain_arguments_preserve_refusal_order() {
             chain_id: "stellar:pubnet".into(),
             address: None,
             payment_required: invalid.clone(),
+            business_id: None,
         })
         .await
         .expect("the structural refusal is a business envelope");
@@ -2159,6 +2165,7 @@ async fn x402_chain_arguments_preserve_refusal_order() {
             approval_attestation: None,
             home_domain: "merchant.example".into(),
             payment_required: invalid,
+            business_id: None,
         })
         .await
         .expect("the structural refusal is a business envelope");

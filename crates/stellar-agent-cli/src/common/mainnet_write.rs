@@ -12,7 +12,8 @@
 //!    of the operational check the build ran before its first account read,
 //!    and whose pending-approval store is closed again before any later step;
 //! 3. the consent drain, the audit readiness, and the recorder preparation;
-//! 4. the authorization mint;
+//! 4. the authorization mint, then the operation attempt, committed as
+//!    `Sending` before any signature;
 //! 5. the signer, the authorized attach, and the authorized submit.
 //!
 //! No step before the mint touches a seed or a device, and no refusal there
@@ -36,8 +37,9 @@ use stellar_agent_network::mainnet::resolve::{
     InvalidationStage, TxSignRequest, invalidate_unconsumed, resolve_tx_sign,
 };
 use stellar_agent_network::mainnet::{AuthorizationId, MainnetAuthorizationError, MainnetConsumer};
+use stellar_agent_network::operation_entry::{begin_classic_attempt, next_attempt_link};
 use stellar_agent_network::operational::OperationalReport;
-use stellar_agent_network::policy_state::PersistedWindowStore;
+use stellar_agent_network::policy_state::{OperationHandle, PersistedWindowStore};
 use stellar_agent_network::signing::envelope_signing::attach_signature_authorized;
 use stellar_agent_network::submit::SubmissionResult;
 use stellar_agent_network::{
@@ -197,6 +199,10 @@ pub(crate) struct MainnetWriteRequest<'a> {
     /// check before its first account read, and the summary names the
     /// ledger.
     pub(crate) ledger: OperationalReport,
+    /// The operation record the run signs under, opened before the
+    /// confirmation; its next attempt opens after the mint and commits
+    /// `Sending` before the signature.
+    pub(crate) operation: Option<&'a OperationHandle>,
 }
 
 /// A mainnet write the network confirmed.
@@ -229,6 +235,8 @@ enum PipelineStep {
     RecorderPreparation,
     /// The authorization resolver.
     Resolver,
+    /// The operation attempt after the mint.
+    Attempt,
     /// The signer constructor after the mint.
     SignerConstruction,
     /// The authorized attach.
@@ -245,9 +253,10 @@ enum PipelineStep {
 
 /// The render stage and the invalidation stage of a refusal at `step`.
 ///
-/// The steps before the mint invalidate nothing. A failure of the signer
-/// constructor, or of the keyring handle inside the attach, means the signer
-/// was unavailable; every other attach refusal means signing was refused. A
+/// The steps before the mint invalidate nothing. A refused operation
+/// attempt means signing was refused. A failure of the signer constructor,
+/// or of the keyring handle inside the attach, means the signer was
+/// unavailable; every other attach refusal means signing was refused. A
 /// submit refusal before the pre-send hook is the submit gate's, and one
 /// inside it the hook's. No stage is derived from an error code.
 #[must_use]
@@ -257,6 +266,10 @@ fn refusal_stage(step: PipelineStep) -> (RenderStage, Option<InvalidationStage>)
         | PipelineStep::Readiness
         | PipelineStep::RecorderPreparation
         | PipelineStep::Resolver => (RenderStage::SignatureWithheld, None),
+        PipelineStep::Attempt => (
+            RenderStage::SignatureWithheld,
+            Some(InvalidationStage::SignRefused),
+        ),
         PipelineStep::SignerConstruction => (
             RenderStage::SignatureWithheld,
             Some(InvalidationStage::SignerUnavailable),
@@ -398,6 +411,7 @@ pub(crate) async fn authorize_and_submit(
         effective_cap,
         witness,
         ledger,
+        operation,
     } = req;
     let name = context.profile_name();
     let profile = context.profile();
@@ -478,6 +492,7 @@ pub(crate) async fn authorize_and_submit(
         authority: &authority,
         audit: readiness,
         store: &window_store,
+        operation: operation.map(next_attempt_link),
     })
     .await
     .map_err(|e: MainnetAuthorizationError| {
@@ -496,19 +511,38 @@ pub(crate) async fn authorize_and_submit(
         id,
     };
 
-    let recorder = prepared.bind_authorized(&auth);
+    // The attempt commits `Sending` under the minted authorization before
+    // any signature, so a crash from here on never reads as a run that
+    // signed nothing.
+    let attempt = match operation {
+        Some(handle) => Some(
+            begin_classic_attempt(
+                &window_store,
+                profile,
+                prepared.audit_writer(),
+                prepared.request_id(),
+                handle,
+                unsigned_xdr,
+            )
+            .map_err(|e| refused(PipelineStep::Attempt, &e, "", verb, Some(&minted)))?,
+        ),
+        None => None,
+    };
+    let recorder = prepared.bind_authorized(&auth, attempt);
     record_bound_recorder(&recorder);
 
     let signer = mainnet_signer(&choice, &enrolled, source, source_flag)
         .await
         .map_err(|e| {
-            refused(
+            let envelope = refused(
                 PipelineStep::SignerConstruction,
                 &e,
                 "",
                 verb,
                 Some(&minted),
-            )
+            );
+            recorder.end_refused_attempt(e.code());
+            envelope
         })?;
     let signed_xdr = attach_signature_authorized(
         unsigned_xdr,
@@ -519,7 +553,7 @@ pub(crate) async fn authorize_and_submit(
     )
     .await
     .map_err(|e| {
-        refused(
+        let envelope = refused(
             PipelineStep::Attach {
                 handle_failed: signer.handle_failed(),
             },
@@ -527,7 +561,9 @@ pub(crate) async fn authorize_and_submit(
             "",
             verb,
             Some(&minted),
-        )
+        );
+        recorder.end_refused_attempt(e.code());
+        envelope
     })?;
 
     let signer_kind = choice.submission_kind();
@@ -545,7 +581,7 @@ pub(crate) async fn authorize_and_submit(
     )
     .await
     .map_err(|e| {
-        refused(
+        let envelope = refused(
             PipelineStep::Submit {
                 pre_send_entered: recorder.pre_send_entered(),
             },
@@ -553,7 +589,9 @@ pub(crate) async fn authorize_and_submit(
             &signed_xdr,
             verb,
             Some(&minted),
-        )
+        );
+        recorder.end_refused_attempt(e.code());
+        envelope
     })?;
     Ok(MainnetSubmitted { signed_xdr, result })
 }

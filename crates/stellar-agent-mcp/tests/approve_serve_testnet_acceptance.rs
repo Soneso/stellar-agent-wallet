@@ -383,6 +383,7 @@ async fn t1_serve_approve_then_commit_on_testnet() {
             memo_hash_hex: None,
             memo_return_hex: None,
             classic_base: Some(FEE_STROOPS.to_string()),
+            business_id: None,
         })
         .await
         .expect("simulate must succeed against funded accounts");
@@ -556,6 +557,7 @@ async fn t1_serve_approve_then_commit_on_testnet() {
             envelope_xdr,
             approval_nonce: Some(approval_nonce),
             approval_attestation: Some(attestation_b64),
+            business_id: None,
         })
         .await
         .expect("commit must pass the gate and submit on-chain");
@@ -632,6 +634,7 @@ async fn t2_serve_reject_then_commit_refused() {
             memo_hash_hex: None,
             memo_return_hex: None,
             classic_base: Some(FEE_STROOPS.to_string()),
+            business_id: None,
         })
         .await
         .expect("simulate must succeed against funded accounts");
@@ -736,6 +739,7 @@ async fn t2_serve_reject_then_commit_refused() {
             envelope_xdr,
             approval_nonce: Some(approval_nonce),
             approval_attestation: Some(bogus_attestation_b64),
+            business_id: None,
         })
         .await
         .expect("a refused commit surfaces as a business-error result, not a protocol error");

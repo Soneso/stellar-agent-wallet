@@ -238,6 +238,7 @@ async fn t1_classic_trustline_add_two_phase_happy_path_under_minimum_reserve_rul
             asset: "USDC".to_owned(),
             limit_stroops: Some(LIMIT_STROOPS.to_owned()),
             classic_base: Some(FEE_STROOPS.to_string()),
+            business_id: None,
         })
         .await
         .expect("simulate must not error");
@@ -271,6 +272,7 @@ async fn t1_classic_trustline_add_two_phase_happy_path_under_minimum_reserve_rul
             envelope_xdr,
             approval_nonce: None,
             approval_attestation: None,
+            business_id: None,
         })
         .await
         .expect("commit must not error");

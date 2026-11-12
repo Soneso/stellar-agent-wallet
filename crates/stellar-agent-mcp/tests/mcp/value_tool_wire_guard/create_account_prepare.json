@@ -1,0 +1,27 @@
+{
+  "ok": true,
+  "data": {
+    "envelope_xdr": "AAAAAgAAAABOYAiwG3TknjjYsROSv6zMe1v/hsogSMuw94NjOmHi3QAAAGQAAAAAAAAAKwAAAAAAAAAAAAAAAQAAAAAAAAAAAAAAAHhmrnehXtNZjOeArKoT28MoDxcWpSCp8zhKpPcByZ5uAAAAAAExLQAAAAAAAAAAAA==",
+    "expires_at_unix_ms": "EXPIRES_AT_UNIX_MS",
+    "nonce": "NONCE",
+    "operational": {
+      "close_lag_seconds": 0,
+      "close_time_unix": "CLOSE_TIME_UNIX",
+      "latest_ledger": 1001
+    },
+    "simulation": {
+      "fee_stroops": "100",
+      "operation": {
+        "destination": "GB4GNLTXUFPNGWMM46AKZKQT3PBSQDYXC2SSBKPTHBFKJ5YBZGPG42TA",
+        "starting_balance_stroops": "20000000",
+        "type": "create_account"
+      },
+      "selected_fee_per_op_stroops": "100",
+      "selected_fee_percentile": "profile_default",
+      "source_account_id": "GBHGACFQDN2OJHRY3CYRHEV7VTGHWW77Q3FCASGLWD3YGYZ2MHRN3EJ4",
+      "source_native_balance_stroops": "500000000000",
+      "source_sequence": "42"
+    }
+  },
+  "request_id": "REQUEST_ID"
+}

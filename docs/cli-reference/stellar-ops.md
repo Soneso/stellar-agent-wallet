@@ -23,6 +23,30 @@ enrolled seed in the keyring. A Ledger signer requires an enrolled identity.
 Enrollment takes `--secret-env` only, so a Ledger key cannot be enrolled for
 mainnet.
 
+On a mainnet profile these four verbs require `--business-id <ID>`, which
+names one value operation. The id has 1 to 64 printable ASCII characters
+without a space. A missing id refuses with `validation.business_id_required`
+and a malformed one with `validation.business_id_invalid`, after the argument
+and endpoint checks and before the envelope is built. The run looks the id up before the confirmation ceremony. An unknown
+id builds the envelope and opens the operation record. A record that still
+waits signs the envelope it stores. A retained operation prints its stored
+state and does no new work: no confirmation, signature, send or audit row.
+The same id with another intent refuses with `operation.business_id_conflict`
+and leaves the record unchanged. A claim names its balance id and claimant. A
+rerun prints the stored claim after the balance left the ledger or its
+predicate expired, and another balance under the id refuses as a conflict.
+
+A replay prints one JSON envelope whose `data` holds `status: "replayed"`,
+`business_id`, `operation` (`id`, `state`, `tx_hash`, `ledger`, `error_code`)
+and `next`. With `--output table` it prints one line instead. `next` is `none`
+once the operation ended and `wait` while it is prepared, sending or of unknown
+outcome. It is `approve` while it awaits approval and `retry` while it is
+authorized or not included. A sent attempt reads `sent_outcome_unknown` with
+its transaction hash until reconciliation settles it. The run exits `0` for a
+succeeded operation and `1` otherwise. On another network a supplied id is
+validated and echoed in `data.business_id`, and no record exists; without an
+id the output is unchanged.
+
 The four full-mode verbs include numeric `total_fee_stroops`, equal to unsigned
 `tx.fee`, in policy arguments on both networks. `pay --build-only` and
 `claim --build-only` include it too, so `minimum_reserve` counts the fee of the
@@ -54,6 +78,7 @@ Several flags recur across the commands on this page with the same meaning. Thei
 - `--network <NETWORK>`: optional assertion of the loaded profile's chain; a mismatch refuses before signing.
 - `--rpc-url <URL>`: optional testnet endpoint override; mainnet profiles refuse its presence. Without it, the profile endpoint applies. Credentials are refused. An overriding URL gets the keyring credential only when it equals the profile's `rpc_url`.
 - `--output <FORMAT>`: `json` (default) or `table`.
+- `--business-id <ID>`: names one value operation on `pay`, `claim`, `trustline` and `accounts create`. Required on mainnet; see [Mainnet actions](#mainnet-actions).
 - `--timeout-seconds <SECONDS>`: bounds submission. On sponsored `accounts create`, `pay`, `claim`, and `trustline`, it bounds the send and the confirmation poll, and the [endpoint checks](index.md#endpoint-identity-before-the-first-read) and the reads before the send run under a fixed 30-second pre-send budget. Default: the profile's `submit_timeout_seconds` on those four commands, then `60`.
 - Signer source: `--secret-env <VAR>` / `--deployer-secret-env <VAR>` (an env-var name, never the secret) or `--sign-with-ledger`, with `--account-index <INDEX>` for the Ledger derivation path (default `0`).
 - `--fee <STROOPS|auto[:pNN]>`: the classic per-operation fee. An integer sets
@@ -104,6 +129,7 @@ Argument groups (enforced by the parser):
 | `--friendbot-url <URL>` | Friendbot endpoint URL (Friendbot mode) | optional | `https://friendbot.stellar.org` |
 | `--network <NETWORK>` | Must match the profile chain | optional | profile chain |
 | `--fee <STROOPS\|auto[:pNN]>` | Sponsored per-op fee | optional | command default (100) |
+| `--business-id <ID>` | Business id naming the operation; validated and echoed off mainnet, also in Friendbot mode | mainnet | none |
 | `--timeout-seconds <SECONDS>` | Send and confirmation poll timeout (sponsored mode) | optional | profile `submit_timeout_seconds`, else `60` |
 | `--rpc-url <URL>` | Testnet RPC override; refused on mainnet | optional | profile endpoint |
 | `--output <FORMAT>` | `json` or `table` | optional | `json` |
@@ -286,6 +312,7 @@ Argument groups (enforced by the parser):
 | `--sign-only <BASE64_XDR>` | Sign the given XDR, emit signed XDR | stage group | none |
 | `--submit-only <BASE64_XDR>` | Submit the given signed XDR | stage group | none |
 | `--fee <STROOPS\|auto[:pNN]>` | Classic per-op fee | optional | command default (100 stroops) |
+| `--business-id <ID>` | Business id naming the operation; see [Mainnet actions](#mainnet-actions) | mainnet | none |
 | `--network <NETWORK>` | Must match the profile chain | optional | profile chain |
 | `--timeout-seconds <SECONDS>` | Send and confirmation poll timeout | optional | profile `submit_timeout_seconds`, else `60` |
 | `--rpc-url <URL>` | Testnet RPC override; refused on mainnet | optional | profile endpoint |
@@ -400,6 +427,7 @@ The respective refusals are `claim.not_claimant`, `claim.predicate_not_satisfied
 | `--sign-only <BASE64_XDR>` | Sign the given XDR, emit signed XDR | stage group | none |
 | `--submit-only <BASE64_XDR>` | Submit the given signed XDR | stage group | none |
 | `--fee <STROOPS\|auto[:pNN]>` | Classic per-op fee | optional | command default (100 stroops) |
+| `--business-id <ID>` | Business id naming the operation; see [Mainnet actions](#mainnet-actions) | mainnet | none |
 | `--network <NETWORK>` | Must match the profile chain | optional | profile chain |
 | `--timeout-seconds <SECONDS>` | Send and confirmation poll timeout | optional | profile `submit_timeout_seconds`, else `60` |
 | `--rpc-url <URL>` | Testnet RPC override; refused on mainnet | optional | profile endpoint |
@@ -474,6 +502,7 @@ witness.
 | `--limit-stroops <I64>` | Explicit trustline limit; `0` removes the trustline | optional | unlimited (`i64::MAX`) |
 | `--profile <NAME>` | Profile to load | optional | `STELLAR_AGENT_PROFILE`, else `default` |
 | `--fee <STROOPS\|auto[:pNN]>` | Classic per-op fee | optional | profile `classic_fee_per_op_stroops` |
+| `--business-id <ID>` | Business id naming the operation; see [Mainnet actions](#mainnet-actions). A replay prints JSON. | mainnet | none |
 | `--timeout-seconds <SECONDS>` | Send and confirmation poll timeout | optional | profile `submit_timeout_seconds`, else `60` |
 
 Example: establish a USDC trustline:

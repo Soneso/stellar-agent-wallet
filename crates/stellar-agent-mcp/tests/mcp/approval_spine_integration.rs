@@ -282,6 +282,7 @@ async fn stellar_pay_commit_require_approval_no_attestation_is_blocked() {
         envelope_xdr,
         approval_nonce: None,
         approval_attestation: None,
+        business_id: None,
     };
 
     let result = server
@@ -326,6 +327,7 @@ async fn stellar_create_account_commit_require_approval_no_attestation_is_blocke
         envelope_xdr,
         approval_nonce: None,
         approval_attestation: None,
+        business_id: None,
     };
 
     let result = server
@@ -379,6 +381,7 @@ async fn stellar_pay_commit_allow_engine_no_attestation_gate() {
         envelope_xdr: minimal_payment_envelope_b64(source, dest),
         approval_nonce: None,
         approval_attestation: None,
+        business_id: None,
     };
 
     let result = server
@@ -649,6 +652,7 @@ async fn commit_with_valid_nonce_but_no_attestation_returns_indistinguishable_ap
         // Attestation fields absent — attestation gate must fire before nonce HMAC.
         approval_nonce: None,
         approval_attestation: None,
+        business_id: None,
     };
 
     let result = server

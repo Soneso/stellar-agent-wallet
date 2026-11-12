@@ -156,6 +156,12 @@ pub struct StellarTrustlineArgs {
     /// Classic fee per operation: `<stroops>`, `auto`, or `auto:pNN`.
     #[serde(default, rename = "fee", skip_serializing_if = "Option::is_none")]
     pub classic_base: Option<String>,
+    /// Business id naming this value operation: 1 to 64 printable ASCII
+    /// characters, no space. Required on `stellar:mainnet`, where a retry
+    /// with the same id returns the stored operation instead of new work;
+    /// on another chain it is validated and echoed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub business_id: Option<String>,
 }
 
 /// Arguments for the `stellar_trustline_commit` (commit) MCP tool.
@@ -227,6 +233,11 @@ pub struct StellarTrustlineCommitArgs {
     /// requires approval.
     #[serde(default)]
     pub approval_attestation: Option<String>,
+    /// The business id the preparation named. Required on
+    /// `stellar:mainnet`; an id other than the preparation's refuses with
+    /// `operation.business_id_mismatch`.
+    #[serde(default)]
+    pub business_id: Option<String>,
 }
 
 /// Prints every field but the attestation, which shows only whether it is
@@ -240,6 +251,7 @@ impl std::fmt::Debug for StellarTrustlineCommitArgs {
             .field("expires_at_unix_ms", &self.expires_at_unix_ms)
             .field("envelope_xdr", &self.envelope_xdr)
             .field("approval_nonce", &self.approval_nonce)
+            .field("business_id", &self.business_id)
             .field(
                 "approval_attestation",
                 &crate::tools::common::AttestationPresence(&self.approval_attestation),
@@ -526,6 +538,51 @@ impl WalletServer {
         if let Err(e) = self.probe_write_endpoint(&client, deadline).await {
             return Ok(crate::tools::common::endpoint_refusal_result(&e));
         }
+
+        // ── Business id ───────────────────────────────────────────────────────
+        // A mainnet call names its operation; the id is checked after the
+        // argument and endpoint refusals above, so their codes stay.
+        let business_id = match self.entry_business_id(&args.chain_id, args.business_id.as_deref())
+        {
+            Ok(id) => id,
+            Err(result) => return Ok(result),
+        };
+
+        // A retained operation answers here with its stored state, once
+        // the endpoint is known to serve the profile's network and before
+        // any account read.
+        let operation = match business_id
+            .clone()
+            .filter(|_| self.context.chain_id.is_mainnet())
+        {
+            Some(id) => {
+                let fee_choice =
+                    parse_classic_fee_choice(args.classic_base.as_deref()).map_err(|err| {
+                        rmcp::ErrorData::invalid_params(
+                            format!("invalid fee: {}", err.code()),
+                            None,
+                        )
+                    })?;
+                match self.classic_prepare_entry(
+                    id,
+                    stellar_agent_network::mainnet::MainnetConsumer::McpTrustline,
+                    &args.from,
+                    fee_choice,
+                    &stellar_xdr::Memo::None,
+                    stellar_agent_network::operation_entry::IdentityFacts::Intent(
+                        stellar_agent_core::approval::IntentPayload::Trustline {
+                            issuer: resolved.issuer.clone(),
+                            code: resolved.code.clone(),
+                            limit_stroops: limit_stroops.unwrap_or(i64::MAX),
+                        },
+                    ),
+                ) {
+                    Ok(operation) => Some(operation),
+                    Err(result) => return Ok(result),
+                }
+            }
+            None => None,
+        };
 
         // The endpoint must be healthy and current before the first account
         // read: the account state read below comes through the same client
@@ -842,30 +899,59 @@ impl WalletServer {
             )
         })?;
 
-        let mut builder = ClassicOpBuilder::new(
-            &args.from,
-            source_sequence,
-            self.context.network_passphrase(),
-            fee_per_op_stroops,
-        );
-        if let Err(err) = builder.change_trust(&asset, limit_stroops) {
-            return Err(rmcp::ErrorData::internal_error(
-                format!("envelope_build_error: change_trust: {err}"),
-                None,
-            ));
-        }
-        builder.with_mainnet_deadline().map_err(|err| {
-            rmcp::ErrorData::internal_error(format!("envelope_build_error: {err}"), None)
-        })?;
-        let envelope_xdr = match builder.build() {
-            Ok(xdr) => xdr,
-            Err(err) => {
-                return Err(rmcp::ErrorData::internal_error(
-                    format!("envelope_build_error: {err}"),
-                    None,
-                ));
+        let envelope_xdr = match operation
+            .as_ref()
+            .and_then(crate::tools::business_entry::ClassicOperation::stored_envelope)
+        {
+            Some(stored) => stored.to_owned(),
+            None => {
+                let mut builder = ClassicOpBuilder::new(
+                    &args.from,
+                    source_sequence,
+                    self.context.network_passphrase(),
+                    fee_per_op_stroops,
+                );
+                if let Err(err) = builder.change_trust(&asset, limit_stroops) {
+                    return Err(rmcp::ErrorData::internal_error(
+                        format!("envelope_build_error: change_trust: {err}"),
+                        None,
+                    ));
+                }
+                builder.with_mainnet_deadline().map_err(|err| {
+                    rmcp::ErrorData::internal_error(format!("envelope_build_error: {err}"), None)
+                })?;
+                match builder.build() {
+                    Ok(xdr) => xdr,
+                    Err(err) => {
+                        return Err(rmcp::ErrorData::internal_error(
+                            format!("envelope_build_error: {err}"),
+                            None,
+                        ));
+                    }
+                }
             }
         };
+
+        let prepared = match self.prepared_envelope(
+            operation.as_ref(),
+            stellar_agent_network::policy_state::OperationTool::StellarTrustline,
+            stellar_agent_network::policy_state::OperationKind::Trustline,
+            envelope_xdr,
+        ) {
+            Ok(prepared) => prepared,
+            Err(result) => return Ok(result),
+        };
+        let envelope_xdr = prepared.xdr;
+        let (source_sequence, fee_per_op_stroops, total_fee_stroops) = prepared.stored.map_or(
+            (source_sequence, fee_per_op_stroops, total_fee_stroops),
+            |facts| {
+                (
+                    facts.source_sequence,
+                    facts.fee_per_op_stroops,
+                    facts.total_fee_stroops,
+                )
+            },
+        );
 
         // ── Step 10: Mint nonce ───────────────────────────────────────────────
         let expiry_unix_ms = now_ms.saturating_add(DEFAULT_NONCE_TTL_MS);
@@ -992,6 +1078,7 @@ impl WalletServer {
         if let Some(approval) = approval_block {
             view["approval"] = approval;
         }
+        crate::tools::business_entry::echo_business_id(&mut view, business_id.as_ref());
         let envelope = stellar_agent_core::envelope::Envelope::ok(view);
         let json_out = envelope
             .to_json_pretty()
@@ -1169,6 +1256,27 @@ impl WalletServer {
             .await
         {
             return Ok(crate::tools::common::endpoint_refusal_result(&e));
+        }
+
+        // ── Business id ───────────────────────────────────────────────────────
+        // A mainnet call names its operation; the id is checked after the
+        // argument and endpoint refusals above, so their codes stay. A
+        // retained operation answers here with its stored state, before the
+        // approval verification, the envelope rebuild and the nonce
+        // consumption. A commit retried after a lost reply thus does no new
+        // work.
+        let business_id = match self.entry_business_id(&args.chain_id, args.business_id.as_deref())
+        {
+            Ok(id) => id,
+            Err(result) => return Ok(result),
+        };
+        if let Err(result) = self.classic_commit_lookup(
+            mainnet.as_ref().map(|guard| guard.policy),
+            stellar_agent_network::policy_state::OperationKind::Trustline,
+            business_id.as_ref(),
+            &args.envelope_xdr,
+        ) {
+            return Ok(result);
         }
 
         let source_account_view = match crate::sequence_floor::fetch_account_with_sequence_catchup(
@@ -1384,6 +1492,18 @@ impl WalletServer {
             return e.into_result();
         }
 
+        // The record the preparation opened; a retained operation answers
+        // here with its stored state.
+        let operation = match self.classic_commit_entry(
+            mainnet.as_ref().map(|guard| guard.policy),
+            stellar_agent_network::policy_state::OperationKind::Trustline,
+            business_id.as_ref(),
+            &args.envelope_xdr,
+        ) {
+            Ok(operation) => operation,
+            Err(result) => return Ok(result),
+        };
+
         let nonce_id_prefix = nonce_id_prefix(&nonce);
         let gate_value_effects: Option<stellar_agent_core::policy::v1::ValueEffects> =
             match &dispatch_outcome {
@@ -1430,6 +1550,7 @@ impl WalletServer {
             },
             cross_check.witness(),
             Some(&floor_hook),
+            operation.as_ref(),
         )
         .await
         {
@@ -1447,11 +1568,12 @@ impl WalletServer {
                     "ChangeTrust tx submitted"
                 );
 
-                let view = json!({
+                let mut view = json!({
                     "tx_hash": tx_hash,
                     "ledger": ledger,
                     "cross_check": cross_check.view(),
                 });
+                crate::tools::business_entry::echo_business_id(&mut view, business_id.as_ref());
                 let envelope = stellar_agent_core::envelope::Envelope::ok(view);
                 let json_out = envelope
                     .to_json_pretty()

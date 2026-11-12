@@ -35,6 +35,7 @@
 //! - [`validate_path_component_ascii_safe`] — validates that a string is safe
 //!   to use as a path component (no path traversal, no special characters).
 
+pub(crate) mod business_entry;
 pub(crate) mod consent;
 #[cfg(test)]
 pub(crate) mod identity_fixture;
@@ -46,6 +47,8 @@ pub(crate) mod mainnet_write;
 #[cfg(all(test, feature = "mainnet-write"))]
 pub(crate) mod mainnet_write_fixture;
 pub mod network;
+#[cfg(all(test, feature = "mainnet-write"))]
+mod operation_replay_tests;
 pub(crate) mod private_open;
 pub mod profile_access;
 #[cfg(test)]

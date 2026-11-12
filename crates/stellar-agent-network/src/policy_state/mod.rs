@@ -222,9 +222,10 @@ pub use ledger::{
 };
 pub use operations::{
     AdmissibleFloors, AgreedOutcome, AttemptAuthorization, AttemptEnvelope, AttemptRequest,
-    AttemptStarted, BoundedText, BusinessId, CapacityDetail, ClearForm, CommitId, EndpointCoverage,
-    EvidenceAnswer, EvidenceAuditFacts, EvidenceClassification, EvidenceEndpoint, EvidenceInput,
-    EvidenceRowInput, EvidenceSequenceClass, EvidenceVerdict, ExposureIdentity, IntentSlot,
+    AttemptStarted, BoundedText, BusinessId, CapacityDetail, ClearForm, CommitBinding, CommitId,
+    CommitTarget, ConsumptionExposure, EndpointCoverage, EvidenceAnswer, EvidenceAuditFacts,
+    EvidenceClassification, EvidenceEndpoint, EvidenceInput, EvidenceRowInput,
+    EvidenceSequenceClass, EvidenceVerdict, ExposureIdentity, IntentSlot, LookupOutcome,
     NotIncludedProof, OpenOutcome, OpenRequest, OperationAudit, OperationAuthority,
     OperationHandle, OperationId, OperationKind, OperationLink, OperationRecorder, OperationResult,
     OperationState, OperationStatus, OperationTool, OperationView, RecoveryUpdate,

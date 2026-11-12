@@ -239,6 +239,7 @@ async fn trustline_commit_full_round_trip_succeeds_with_string_encoded_limit() {
         asset: "USDC".to_owned(),
         limit_stroops: Some("1000000000".to_owned()), // 100 USDC at 7 decimals
         classic_base: None,
+        business_id: None,
     };
     let (sim_result, simulate_clients) =
         crate::common::clients_built_by(server.call_stellar_trustline(simulate_args.clone())).await;
@@ -284,6 +285,7 @@ async fn trustline_commit_full_round_trip_succeeds_with_string_encoded_limit() {
         envelope_xdr,
         approval_nonce: None,
         approval_attestation: None,
+        business_id: None,
     };
     let (commit_result, commit_clients) =
         crate::common::clients_built_by(server.call_stellar_trustline_commit(commit_args)).await;
@@ -384,6 +386,7 @@ async fn trustline_simulate_echoes_canonical_limit_stroops_not_raw_caller_string
         asset: "USDC".to_owned(),
         limit_stroops: Some("+0001000000000".to_owned()),
         classic_base: None,
+        business_id: None,
     };
     let sim_result = server
         .call_stellar_trustline(simulate_args)
@@ -460,6 +463,7 @@ async fn simulate_nonce_mint_failed_envelope_shape() {
         asset: "USDC".to_owned(),
         limit_stroops: Some("1000000000".to_owned()),
         classic_base: None,
+        business_id: None,
     };
     let result = server
         .call_stellar_trustline(simulate_args)
@@ -535,6 +539,7 @@ async fn commit_rejects_invalid_from_strkey_before_any_rpc_call() {
             asset: "USDC".to_owned(),
             limit_stroops: Some("1000000000".to_owned()),
             classic_base: None,
+            business_id: None,
         })
         .await
         .expect("simulate must not error");
@@ -569,6 +574,7 @@ async fn commit_rejects_invalid_from_strkey_before_any_rpc_call() {
         envelope_xdr,
         approval_nonce: None,
         approval_attestation: None,
+        business_id: None,
     };
     let result = commit_server
         .call_stellar_trustline_commit(commit_args)
@@ -649,6 +655,7 @@ async fn commit_endpoint_network_mismatch_refuses_without_burning_nonce() {
             asset: "USDC".to_owned(),
             limit_stroops: Some("1000000000".to_owned()),
             classic_base: None,
+            business_id: None,
         })
         .await
         .expect("simulate must not error");
@@ -683,6 +690,7 @@ async fn commit_endpoint_network_mismatch_refuses_without_burning_nonce() {
         envelope_xdr,
         approval_nonce: None,
         approval_attestation: None,
+        business_id: None,
     };
 
     // ── Commit against the wrong network ───────────────────────────────────
@@ -763,6 +771,7 @@ async fn prepare_and_commit_send_the_primary_credential() {
         asset: "USDC".to_owned(),
         limit_stroops: Some("1000000000".to_owned()),
         classic_base: None,
+        business_id: None,
     };
     let sim_result = server
         .call_stellar_trustline(simulate_args.clone())
@@ -786,6 +795,7 @@ async fn prepare_and_commit_send_the_primary_credential() {
             .to_owned(),
         approval_nonce: None,
         approval_attestation: None,
+        business_id: None,
     };
     let committed = server
         .call_stellar_trustline_commit(commit_args.clone())
@@ -846,6 +856,7 @@ async fn simulate_refuses_an_endpoint_serving_another_network_before_any_read() 
                 asset: "USDC".to_owned(),
                 limit_stroops: None,
                 classic_base: classic_base.map(str::to_owned),
+                business_id: None,
             }))
             .await;
         let result = result.expect("the refusal is a tool result, not a protocol error");
@@ -896,6 +907,7 @@ fn trustline_args(source_g: &str) -> StellarTrustlineArgs {
         asset: "USDC".to_owned(),
         limit_stroops: Some("1000000000".to_owned()),
         classic_base: None,
+        business_id: None,
     }
 }
 
@@ -975,6 +987,7 @@ async fn trustline_commit_fee_above_cap_refuses() {
             envelope_xdr: data["envelope_xdr"].as_str().unwrap().to_owned(),
             approval_nonce: None,
             approval_attestation: None,
+            business_id: None,
         })
         .await
         .unwrap();
@@ -1300,6 +1313,7 @@ async fn witness_trustline_case(case: TrustlineCase, expected: &str) {
         envelope_xdr: data["envelope_xdr"].as_str().unwrap().to_owned(),
         approval_nonce: None,
         approval_attestation: None,
+        business_id: None,
     };
     let path = approval
         .path()

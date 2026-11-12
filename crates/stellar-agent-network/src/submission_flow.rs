@@ -16,13 +16,13 @@ use stellar_agent_core::wallet::WalletLifecycleError;
 
 use crate::mainnet::consumed::AuthorizationConsumed;
 use crate::policy_state::{
-    DeliveryReport, PersistedWindowStore, RECONCILE_BUDGET, ReconcileReport, SubmissionHold,
-    WindowStoreError, drain_accounting_obligations,
+    DeliveryReport, OperationRecorder, PersistedWindowStore, RECONCILE_BUDGET, ReconcileReport,
+    SubmissionHold, WindowStoreError, drain_accounting_obligations,
 };
 use crate::submission_record::repair_approval_consumption;
 use crate::{
-    IntentBinding, IntentProof, MainnetSubmitGrant, NetworkContext, SignedIntentPlan,
-    StellarRpcClient, SubmissionIntent, SubmissionOutcome, SubmissionRecorder,
+    IntentBinding, IntentProof, MainnetSubmitGrant, NetworkContext, OperationAttempt,
+    SignedIntentPlan, StellarRpcClient, SubmissionIntent, SubmissionOutcome, SubmissionRecorder,
     WalletSubmissionRecorder, envelope_hash_hex,
 };
 
@@ -82,6 +82,9 @@ pub struct RecorderInputs<'a> {
     /// The mainnet policy provenance the pending row records, when the
     /// submission proceeds under a mainnet decision.
     pub provenance: Option<stellar_agent_core::mainnet::decision::MainnetProvenance>,
+    /// The operation attempt the submission sends, opened before the
+    /// signature; `None` for a submission without an operation record.
+    pub operation: Option<OperationAttempt>,
 }
 
 /// Assembles the stores, window entries and signing sizing for a recorder.
@@ -113,7 +116,8 @@ pub fn assemble_recorder(
     let recorder = match inputs.provenance {
         Some(provenance) => recorder.with_provenance(provenance),
         None => recorder,
-    };
+    }
+    .with_operation(inputs.operation);
     match sizing {
         Some(sizing) => recorder.with_signing_sizing(sizing),
         None => recorder,
@@ -142,6 +146,16 @@ impl<'a> StageMarkedRecorder<'a> {
     #[must_use]
     pub fn pre_send_entered(&self) -> bool {
         self.pre_send_entered.load(Ordering::SeqCst)
+    }
+
+    /// Ends the operation attempt as `NotSent` after a refusal with wire
+    /// code `code` that came before the authorized pre-send hook: a signer,
+    /// attach or submit refusal. Inside the hook the recorder ends the
+    /// attempt itself.
+    pub fn end_refused_attempt(&self, code: &str) {
+        if !self.pre_send_entered() {
+            self.inner.end_unsent_attempt(code);
+        }
     }
 }
 
@@ -331,6 +345,11 @@ pub fn finish_reconciliation(
 
 /// Runs the bounded dispatch-time reconciliation pass.
 ///
+/// On a mainnet profile the pass first applies the operation store's expiry
+/// edges once, through the writer `operations_writer` acquires. A record
+/// past its window ends before any work reads it. A failure there is logged
+/// and the pass continues.
+///
 /// A completed pass maps to [`ReconcilePass::Completed`]; a refusal of the
 /// window store maps to [`ReconcilePass::Failed`] and leaves every open
 /// reservation in place.
@@ -341,13 +360,53 @@ pub async fn reconcile_pass(
     oracle: Option<&StellarRpcClient>,
     receipts: Option<&ReceiptStore>,
     now_ms: u64,
+    operations_writer: impl FnOnce() -> Result<Arc<Mutex<AuditWriter>>, WalletError>,
 ) -> ReconcilePass {
+    if profile.chain_id.is_mainnet() {
+        expire_due_operations(profile, window, now_ms, operations_writer);
+    }
     match window
         .reconcile_due(profile, client, oracle, receipts, now_ms, RECONCILE_BUDGET)
         .await
     {
         Ok(report) => ReconcilePass::Completed(report),
         Err(error) => ReconcilePass::Failed(error),
+    }
+}
+
+/// Applies the operation store's expiry edges at `now_ms`.
+///
+/// The writer is acquired before the window lock, the order every operation
+/// step takes. Every refusal is logged: the records stay as they are, and the
+/// next pass or step applies the same edges.
+fn expire_due_operations(
+    profile: &Profile,
+    window: &PersistedWindowStore,
+    now_ms: u64,
+    writer: impl FnOnce() -> Result<Arc<Mutex<AuditWriter>>, WalletError>,
+) {
+    let writer = match writer() {
+        Ok(writer) => writer,
+        Err(error) => {
+            tracing::debug!(
+                code = error.code(),
+                "operation expiry: no audit writer; expiry edges wait for the next step"
+            );
+            return;
+        }
+    };
+    let Ok(mut guard) = writer.lock() else {
+        tracing::warn!("operation expiry: the audit writer mutex is poisoned; expiry skipped");
+        return;
+    };
+    let request_id = uuid::Uuid::new_v4().to_string();
+    match OperationRecorder::new(window, profile, &mut *guard, request_id).expire_due(now_ms) {
+        Ok(0) => {}
+        Ok(ended) => tracing::debug!(ended, "operation expiry: records ended"),
+        Err(error) => tracing::warn!(
+            code = error.submission_code(),
+            "operation expiry: the expiry edges could not be applied; records stand"
+        ),
     }
 }
 
@@ -536,6 +595,39 @@ mod tests {
     )]
 
     use super::*;
+
+    /// A reconciliation pass on a mainnet profile applies the operation store's
+    /// expiry edges before its other work. A `Sending` attempt whose
+    /// authorization expired unused, never claimed and never exposed, ends as
+    /// `NotSent`.
+    #[cfg(feature = "mainnet-write")]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn reconcile_pass_runs_expire_due() {
+        use crate::mainnet::fixtures::{self, LedgerFixture, TTL_MS};
+        const NOW: u64 = 1_800_000_000_000;
+        let fx = LedgerFixture::new("reconcile-expire", NOW);
+        let unsigned = fixtures::unsigned_envelope();
+        let binding = fixtures::tx_binding(unsigned.envelope_xdr(), unsigned.tx_hash_hex());
+        let (attempt, authorization) = fx.linked_attempt(binding, &[], "order-1");
+        assert_eq!(fx.operation_record(attempt)["state"], "sending");
+        let later = NOW + TTL_MS + 1;
+        fx.clock.set(later);
+        let client = StellarRpcClient::new("http://127.0.0.1:1").unwrap();
+
+        let pass = reconcile_pass(&fx.profile, &fx.window, &client, None, None, later, || {
+            Ok(Arc::clone(&fx.writer))
+        })
+        .await;
+
+        assert!(matches!(pass, ReconcilePass::Completed(_)), "{pass:?}");
+        let record = fx.operation_record(attempt);
+        assert_eq!(record["state"], "not_sent", "{record}");
+        assert_eq!(
+            fx.authorization_record(authorization.id())["state"],
+            "expired"
+        );
+    }
 
     #[test]
     fn checked_sizing_maps_refused_to_policy_denied() {

@@ -265,6 +265,7 @@ fn simulate_args() -> StellarPayArgs {
         memo_hash_hex: None,
         memo_return_hex: None,
         classic_base: None,
+        business_id: None,
     }
 }
 

@@ -241,6 +241,7 @@ async fn pay_commit_with_create_account_xdr_returns_simulation_divergence() {
         envelope_xdr,
         approval_nonce: None,
         approval_attestation: None,
+        business_id: None,
     };
 
     let result = server
@@ -301,6 +302,7 @@ async fn pay_commit_policy_engine_sees_xdr_destination_not_caller_destination() 
         envelope_xdr,
         approval_nonce: None,
         approval_attestation: None,
+        business_id: None,
     };
 
     let result = server
@@ -372,6 +374,7 @@ async fn pay_commit_hash_memo_xdr_reaches_nonce_check() {
         envelope_xdr,
         approval_nonce: None,
         approval_attestation: None,
+        business_id: None,
     };
 
     // The Hash memo does not fail at decode.  The call proceeds past decode and

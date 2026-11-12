@@ -294,6 +294,7 @@ fn ten_xlm_args() -> StellarPayArgs {
         memo_hash_hex: None,
         memo_return_hex: None,
         classic_base: None,
+        business_id: None,
     }
 }
 
@@ -606,6 +607,7 @@ async fn simulate_rejects_invalid_source_strkey() {
         memo_hash_hex: None,
         memo_return_hex: None,
         classic_base: None,
+        business_id: None,
     };
     let result = server.call_stellar_pay(args).await;
     assert!(result.is_err(), "invalid source must return Err");
@@ -637,6 +639,7 @@ async fn simulate_rejects_invalid_destination_strkey() {
         memo_hash_hex: None,
         memo_return_hex: None,
         classic_base: None,
+        business_id: None,
     };
     let result = server.call_stellar_pay(args).await;
     assert!(result.is_err(), "invalid destination must return Err");
@@ -669,6 +672,7 @@ async fn simulate_rejects_chain_id_mismatch() {
         memo_hash_hex: None,
         memo_return_hex: None,
         classic_base: None,
+        business_id: None,
     };
     let result = server.call_stellar_pay(args).await;
     assert!(result.is_err(), "chain_id mismatch must return Err");
@@ -711,6 +715,7 @@ async fn simulate_rejects_bad_asset_format() {
         memo_hash_hex: None,
         memo_return_hex: None,
         classic_base: None,
+        business_id: None,
     };
     let result = server.call_stellar_pay(args).await;
     assert!(result.is_err(), "invalid asset must return Err");
@@ -745,6 +750,7 @@ async fn simulate_rejects_multiple_memo_variants() {
         memo_hash_hex: None,
         memo_return_hex: None,
         classic_base: None,
+        business_id: None,
     };
     let result = server.call_stellar_pay(args).await;
     // Multiple memo variants produce a tool-level error (is_error=true), not
@@ -801,6 +807,7 @@ async fn simulate_invalid_memo_hash_does_not_log_memo_content() {
                     memo_hash_hex: Some(invalid_hash.to_owned()),
                     memo_return_hex: None,
                     classic_base: None,
+                    business_id: None,
                 };
 
                 server.call_stellar_pay(args).await
@@ -841,6 +848,7 @@ fn simulate_args_on(chain_id: &str, classic_base: Option<&str>) -> StellarPayArg
         memo_hash_hex: None,
         memo_return_hex: None,
         classic_base: classic_base.map(str::to_owned),
+        business_id: None,
     }
 }
 
@@ -1013,6 +1021,7 @@ async fn simulate_rejects_native_payment_on_insufficient_balance() {
         memo_hash_hex: None,
         memo_return_hex: None,
         classic_base: None,
+        business_id: None,
     };
     let result = server.call_stellar_pay(args).await;
 
@@ -1182,6 +1191,7 @@ async fn simulate_rejects_non_native_bad_issuer() {
         memo_hash_hex: None,
         memo_return_hex: None,
         classic_base: None,
+        business_id: None,
     };
     let result = server.call_stellar_pay(args).await;
     assert!(result.is_err(), "invalid issuer must return Err");
@@ -1234,6 +1244,7 @@ async fn simulate_sep29_memo_required_no_memo_fails() {
         memo_hash_hex: None,
         memo_return_hex: None,
         classic_base: None,
+        business_id: None,
     };
     let result = server.call_stellar_pay(args).await;
     // With a non-routable RPC the source account fetch fails; we get
@@ -1284,6 +1295,7 @@ async fn simulate_sep29_memo_present_bypasses_check() {
         memo_hash_hex: None,
         memo_return_hex: None,
         classic_base: None,
+        business_id: None,
     };
     let result = server.call_stellar_pay(args).await;
     // Should fail at the source account fetch (non-routable), not at SEP-29.
@@ -1361,6 +1373,7 @@ async fn simulate_reaches_rpc_with_valid_inputs() {
         memo_hash_hex: None,
         memo_return_hex: None,
         classic_base: None,
+        business_id: None,
     };
     let result = server.call_stellar_pay(args).await;
     // Either a tool-level error (is_error=true) or an internal JSON-RPC error.
@@ -1418,6 +1431,7 @@ async fn simulate_fee_auto_selects_p95_and_binds_envelope_fee() {
         memo_hash_hex: None,
         memo_return_hex: None,
         classic_base: Some("auto".to_owned()),
+        business_id: None,
     };
     let result = server
         .call_stellar_pay(args)
@@ -1474,6 +1488,7 @@ async fn simulate_fee_auto_p99_selects_p99() {
         memo_hash_hex: None,
         memo_return_hex: None,
         classic_base: Some("auto:p99".to_owned()),
+        business_id: None,
     };
     let result = server
         .call_stellar_pay(args)
@@ -1529,6 +1544,7 @@ async fn simulate_fee_explicit_above_profile_cap_fails() {
         memo_hash_hex: None,
         memo_return_hex: None,
         classic_base: Some("500".to_owned()),
+        business_id: None,
     };
     let result = server
         .call_stellar_pay(args)
@@ -1581,6 +1597,7 @@ async fn simulate_fee_auto_above_profile_cap_names_the_percentile() {
         memo_hash_hex: None,
         memo_return_hex: None,
         classic_base: Some("auto:p99".to_owned()),
+        business_id: None,
     };
     let result = server.call_stellar_pay(args).await.unwrap();
     let (code, message, _text) = crate::common::assert_business_envelope(&result);
@@ -1644,6 +1661,7 @@ async fn mainnet_profile_commit_refuses_with_mainnet_write_forbidden() {
         envelope_xdr: valid_payment_envelope_b64(),
         approval_nonce: None,
         approval_attestation: None,
+        business_id: None,
     };
     let result = server
         .call_stellar_pay_commit(args)
@@ -1705,6 +1723,7 @@ async fn policy_v1_engine_allow_rule_passes_gate() {
         envelope_xdr: valid_payment_envelope_b64(),
         approval_nonce: None,
         approval_attestation: None,
+        business_id: None,
     };
     let result = server
         .call_stellar_pay_commit(args)
@@ -1758,6 +1777,7 @@ async fn policy_v1_engine_no_matching_rule_emits_wire_code() {
         envelope_xdr: valid_payment_envelope_b64(),
         approval_nonce: None,
         approval_attestation: None,
+        business_id: None,
     };
     let result = server
         .call_stellar_pay_commit(args)
@@ -1808,6 +1828,7 @@ async fn policy_v1_engine_explicit_deny_emits_wire_code() {
         envelope_xdr: valid_payment_envelope_b64(),
         approval_nonce: None,
         approval_attestation: None,
+        business_id: None,
     };
     let result = server
         .call_stellar_pay_commit(args)
@@ -1853,6 +1874,7 @@ async fn commit_returns_nonce_expired_on_bad_nonce() {
         envelope_xdr: valid_payment_envelope_b64(),
         approval_nonce: None,
         approval_attestation: None,
+        business_id: None,
     };
     let result = server
         .call_stellar_pay_commit(args)
@@ -1896,6 +1918,7 @@ async fn commit_returns_nonce_expired_on_wrong_length_nonce() {
         envelope_xdr: valid_payment_envelope_b64(),
         approval_nonce: None,
         approval_attestation: None,
+        business_id: None,
     };
     let result = server
         .call_stellar_pay_commit(args)
@@ -1989,6 +2012,7 @@ async fn commit_handles_rpc_error_during_rebuild() {
         envelope_xdr: valid_payment_envelope_b64(),
         approval_nonce: None,
         approval_attestation: None,
+        business_id: None,
     };
     let result = server
         .call_stellar_pay_commit(args)
@@ -2046,6 +2070,7 @@ async fn indistinguishability_expired_and_parse_fail_produce_same_wire_code() {
         envelope_xdr: valid_payment_envelope_b64(),
         approval_nonce: None,
         approval_attestation: None,
+        business_id: None,
     };
 
     use base64::Engine;
@@ -2120,6 +2145,7 @@ async fn commit_invalid_memo_parse_matches_nonce_hmac_wire_response() {
         envelope_xdr: valid_payment_envelope_b64(),
         approval_nonce: None,
         approval_attestation: None,
+        business_id: None,
     };
 
     let nonce_result = server
@@ -2274,6 +2300,7 @@ async fn timing_expired_rebuild_vs_hmac_mismatch_rebuild() {
             envelope_xdr: valid_payment_envelope_b64(),
             approval_nonce: None,
             approval_attestation: None,
+            business_id: None,
         };
         let t0 = Instant::now();
         let _ = server.call_stellar_pay_commit(args_a).await;
@@ -2301,6 +2328,7 @@ async fn timing_expired_rebuild_vs_hmac_mismatch_rebuild() {
             envelope_xdr: valid_payment_envelope_b64(),
             approval_nonce: None,
             approval_attestation: None,
+            business_id: None,
         };
         let t0 = Instant::now();
         let _ = server.call_stellar_pay_commit(args_b).await;
@@ -2625,6 +2653,7 @@ async fn pay_commit_full_round_trip_succeeds_with_string_encoded_amounts() {
         memo_hash_hex: None,
         memo_return_hex: None,
         classic_base: None,
+        business_id: None,
     };
     let sim_result = server
         .call_stellar_pay(simulate_args.clone())
@@ -2672,6 +2701,7 @@ async fn pay_commit_full_round_trip_succeeds_with_string_encoded_amounts() {
         envelope_xdr,
         approval_nonce: None,
         approval_attestation: None,
+        business_id: None,
     };
     let commit_result = server
         .call_stellar_pay_commit(commit_args)
@@ -2768,6 +2798,7 @@ async fn pay_two_phase_round_trip_succeeds_under_satisfied_minimum_reserve_rule(
         memo_hash_hex: None,
         memo_return_hex: None,
         classic_base: None,
+        business_id: None,
     };
     let sim_result = server
         .call_stellar_pay(simulate_args.clone())
@@ -2813,6 +2844,7 @@ async fn pay_two_phase_round_trip_succeeds_under_satisfied_minimum_reserve_rule(
         envelope_xdr,
         approval_nonce: None,
         approval_attestation: None,
+        business_id: None,
     };
     let commit_result = server
         .call_stellar_pay_commit(commit_args)
@@ -2888,6 +2920,7 @@ async fn pay_commit_denies_under_unsatisfied_minimum_reserve_rule() {
         envelope_xdr: valid_payment_envelope_b64(),
         approval_nonce: None,
         approval_attestation: None,
+        business_id: None,
     };
     let result = server
         .call_stellar_pay_commit(args)
@@ -2946,6 +2979,7 @@ async fn simulate_nonce_mint_failed_envelope_shape() {
         memo_hash_hex: None,
         memo_return_hex: None,
         classic_base: Some("auto".to_owned()),
+        business_id: None,
     };
     let result = server
         .call_stellar_pay(args)
@@ -3432,6 +3466,7 @@ async fn pay_two_phase_per_period_cap_second_call_denied_by_persisted_window() {
         memo_hash_hex: None,
         memo_return_hex: None,
         classic_base: None,
+        business_id: None,
     };
 
     // ── Call 1: simulate → commit → submit succeeds, recording 60 XLM ────────
@@ -3481,6 +3516,7 @@ async fn pay_two_phase_per_period_cap_second_call_denied_by_persisted_window() {
             envelope_xdr: envelope1,
             approval_nonce: None,
             approval_attestation: None,
+            business_id: None,
         })
         .await
         .expect("first commit must not error");
@@ -3576,6 +3612,7 @@ async fn pay_commit_refuses_with_audit_chain_key_unavailable_when_key_unminted()
         memo_hash_hex: None,
         memo_return_hex: None,
         classic_base: None,
+        business_id: None,
     };
     let sim_result = server
         .call_stellar_pay(pay_args.clone())
@@ -3621,6 +3658,7 @@ async fn pay_commit_refuses_with_audit_chain_key_unavailable_when_key_unminted()
             envelope_xdr,
             approval_nonce: None,
             approval_attestation: None,
+            business_id: None,
         })
         .await
         .expect("commit must not error at the protocol layer");
@@ -3684,6 +3722,7 @@ async fn pay_simulate_unaffected_by_missing_audit_key() {
             memo_hash_hex: None,
             memo_return_hex: None,
             classic_base: None,
+            business_id: None,
         })
         .await
         .expect("simulate must not error");
@@ -3755,6 +3794,7 @@ async fn pay_commit_refuses_tip_anchor_mismatch_when_the_log_is_rolled_back() {
         memo_hash_hex: None,
         memo_return_hex: None,
         classic_base: None,
+        business_id: None,
     };
 
     // Round one: a commit that succeeds, leaving the anchor naming the log.
@@ -3834,6 +3874,7 @@ async fn commit_once(
             envelope_xdr,
             approval_nonce: None,
             approval_attestation: None,
+            business_id: None,
         })
         .await
         .expect("commit must not error at the protocol layer")
@@ -3904,6 +3945,7 @@ async fn commit_endpoint_network_mismatch_refuses_without_burning_nonce() {
         memo_hash_hex: None,
         memo_return_hex: None,
         classic_base: None,
+        business_id: None,
     };
     let sim_result = server
         .call_stellar_pay(simulate_args.clone())
@@ -3948,6 +3990,7 @@ async fn commit_endpoint_network_mismatch_refuses_without_burning_nonce() {
         envelope_xdr,
         approval_nonce: None,
         approval_attestation: None,
+        business_id: None,
     };
 
     // ── Commit against the wrong network ───────────────────────────────────
@@ -4145,6 +4188,7 @@ async fn simulate_then_commit(
             envelope_xdr: data["envelope_xdr"].as_str().expect("envelope").to_owned(),
             approval_nonce: None,
             approval_attestation: None,
+            business_id: None,
         })
         .await
         .expect("commit must not error")
@@ -4163,6 +4207,7 @@ fn pay_args(source: &str, stroops: &str) -> StellarPayArgs {
         memo_hash_hex: None,
         memo_return_hex: None,
         classic_base: None,
+        business_id: None,
     }
 }
 
@@ -5135,6 +5180,7 @@ async fn pay_commit_refused_at_the_reservation_reports_the_gate_code_and_sends_n
         memo_hash_hex: None,
         memo_return_hex: None,
         classic_base: None,
+        business_id: None,
     };
 
     let sim = server
@@ -5182,6 +5228,7 @@ async fn pay_commit_refused_at_the_reservation_reports_the_gate_code_and_sends_n
             envelope_xdr,
             approval_nonce: None,
             approval_attestation: None,
+            business_id: None,
         })
         .await
         .expect("the commit must return a business-error result, not a protocol error");
@@ -5275,6 +5322,7 @@ fn simulated_commit_args(
         envelope_xdr: data["envelope_xdr"].as_str().expect("envelope").to_owned(),
         approval_nonce: None,
         approval_attestation: None,
+        business_id: None,
     }
 }
 
@@ -5665,6 +5713,7 @@ async fn prepare_and_commit_send_the_primary_credential() {
         memo_hash_hex: None,
         memo_return_hex: None,
         classic_base: None,
+        business_id: None,
     };
     let sim_result = server
         .call_stellar_pay(simulate_args.clone())
@@ -5696,6 +5745,7 @@ async fn prepare_and_commit_send_the_primary_credential() {
             .to_owned(),
         approval_nonce: None,
         approval_attestation: None,
+        business_id: None,
     };
     let committed = server
         .call_stellar_pay_commit(commit_args.clone())
@@ -5740,6 +5790,7 @@ fn unverifiable_commit() -> StellarPayCommitArgs {
         envelope_xdr: valid_payment_envelope_b64(),
         approval_nonce: None,
         approval_attestation: None,
+        business_id: None,
     }
 }
 

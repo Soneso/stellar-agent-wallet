@@ -38,6 +38,7 @@ fn x402_args() -> X402CreatePaymentArgs {
             "extra": { "areFeesSponsored": true }
         })
         .to_string(),
+        business_id: None,
     }
 }
 

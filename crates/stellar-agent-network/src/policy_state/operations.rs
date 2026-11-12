@@ -55,6 +55,7 @@ use stellar_agent_core::audit_log::AuditEntry;
 use stellar_agent_core::audit_log::schema::OperationEvidenceRow;
 use stellar_agent_core::policy::state_lock::WindowStoreLock;
 use stellar_agent_core::profile::caip2::Caip2;
+use stellar_agent_core::profile::receipt::{AttemptRef, SequenceReleases};
 use stellar_agent_core::profile::schema::Profile;
 
 use super::WindowStoreError;
@@ -393,6 +394,18 @@ impl OperationState {
     #[must_use]
     pub fn is_waiting(self) -> bool {
         matches!(self, Self::Prepared | Self::AwaitingApproval)
+    }
+
+    /// Whether a call under the operation's business id continues it: a
+    /// waiting operation, and one whose authority stands with no attempt
+    /// in progress. Every other state answers a retry with its stored
+    /// state.
+    #[must_use]
+    pub fn resumes(self) -> bool {
+        matches!(
+            self,
+            Self::Prepared | Self::AwaitingApproval | Self::Authorized | Self::NotIncluded
+        )
     }
 
     /// Every state, in table order.
@@ -1588,11 +1601,15 @@ fn release_linked_unused(
     unused.len()
 }
 
-/// Writes the `proved_unspent` row of an attempt that ended unsent: its
-/// authorization `auth_id`, when it has no row and no committed exposure
-/// names it.
-fn release_unsent_attempt(wire: &mut WireFile, auth_id: AuthorizationId, commit: CommitId) {
-    if exposed(wire, auth_id) {
+/// Writes an unsent attempt's missing `proved_unspent` row. This requires no
+/// committed exposure or proof that no send starts.
+fn release_unsent_attempt(
+    wire: &mut WireFile,
+    auth_id: AuthorizationId,
+    commit: CommitId,
+    send_never_started: bool,
+) {
+    if exposed(wire, auth_id) && !send_never_started {
         return;
     }
     if let Some(auth) = wire
@@ -1877,7 +1894,7 @@ fn expire_records(
         if from == S::Sending
             && let Some(auth_id) = attempt_auth
         {
-            release_unsent_attempt(wire, auth_id, audit.commit);
+            release_unsent_attempt(wire, auth_id, audit.commit, false);
         }
         ended += 1;
     }
@@ -2349,6 +2366,28 @@ pub enum OpenOutcome {
     Conflict,
 }
 
+/// The result of [`OperationRecorder::lookup`]: what a retained business id
+/// names, before any comparison with a request's intent.
+#[derive(Debug)]
+pub enum LookupOutcome {
+    /// A record or tombstone in a state that does no further work.
+    Replay(OperationView),
+    /// A waiting record inside its window, or an `Authorized` or
+    /// `NotIncluded` record inside its execution window.
+    Resumable(OperationHandle),
+}
+
+impl LookupOutcome {
+    /// The slot kind and intent digest the business id is bound to.
+    #[must_use]
+    pub fn binding(&self) -> (SlotKind, [u8; 32]) {
+        match self {
+            Self::Replay(view) => (view.slot_kind, view.intent_digest),
+            Self::Resumable(handle) => (handle.intent().kind(), handle.intent().intent_digest()),
+        }
+    }
+}
+
 /// The envelope an attempt signs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AttemptEnvelope {
@@ -2413,6 +2452,11 @@ pub struct TransitionEvidence {
     /// The acknowledged operator clear that `SentOutcomeUnknown` to
     /// `Cancelled` requires.
     pub clear: Option<ClearForm>,
+    /// The submitter proved that no send of the attempt's payload started.
+    /// A `Sending` to `NotSent` transition then writes the attempt's `Always`
+    /// row of class `proved_unspent` also after a committed exposure; every
+    /// other transition ignores it.
+    pub send_never_started: bool,
 }
 
 /// How an operator clear of an unknown outcome releases the native
@@ -2573,6 +2617,34 @@ impl OperationHandle {
     pub fn execution_expires_at_ms(&self) -> Option<u64> {
         self.execution_expires_at_ms
     }
+}
+
+/// What a classic commit's business id names, read with the envelope's
+/// owners in [`OperationStatus::commit_binding`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CommitTarget {
+    /// A retained record and the digest of the unsigned envelope it binds;
+    /// `None` for an x402 record, which binds no envelope.
+    Record {
+        /// The record.
+        view: OperationView,
+        /// The digest of the unsigned envelope the record binds.
+        envelope_sha256: Option<[u8; 32]>,
+    },
+    /// A tombstone, which keeps its slot kind and intent digest but no
+    /// envelope binding.
+    Tombstone(OperationView),
+}
+
+/// The facts of one window read a classic commit compares.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CommitBinding {
+    /// The record or tombstone under the commit's business id.
+    pub target: Option<CommitTarget>,
+    /// Every retained record that binds the commit's envelope. Two records
+    /// under different ids bind the same bytes when two preparations of one
+    /// intent build at the same sequence and second.
+    pub owners: Vec<OperationView>,
 }
 
 /// A read-only view of one retained record or tombstone.
@@ -2769,35 +2841,52 @@ impl Session<'_> {
         Ok(ended)
     }
 
-    fn open(&mut self, request: &OpenRequest) -> Result<OpenOutcome, WindowStoreError> {
-        use OperationState as S;
+    /// Sweeps and adopts, applies the expiry edges at the store clock and
+    /// prunes, so a lookup reads the states a write would act on.
+    fn settle(&mut self) -> Result<(), WindowStoreError> {
         self.sweep_and_adopt()?;
         self.expire(self.now)?;
         prune_stale(&mut self.wire, self.now);
-        let digest = request.intent.intent_digest();
-        let kind = request.intent.kind();
+        Ok(())
+    }
+
+    /// The record or tombstone `business_id` names, with its slot kind and
+    /// intent digest.
+    fn retained(&self, business_id: &BusinessId) -> Option<(SlotKind, [u8; 32], LookupOutcome)> {
         if let Some(record) = records(&self.wire)
             .iter()
-            .find(|record| record.business_id == request.business_id)
+            .find(|record| &record.business_id == business_id)
         {
-            if record.intent.kind() != kind || record.intent.intent_digest() != digest {
-                return Ok(OpenOutcome::Conflict);
-            }
-            return Ok(match record.state {
-                S::Prepared | S::AwaitingApproval | S::Authorized | S::NotIncluded => {
-                    OpenOutcome::Resumable(OperationHandle::of(record))
-                }
-                _ => OpenOutcome::Replay(OperationView::of_record(record)),
-            });
+            let found = if record.state.resumes() {
+                LookupOutcome::Resumable(OperationHandle::of(record))
+            } else {
+                LookupOutcome::Replay(OperationView::of_record(record))
+            };
+            return Some((record.intent.kind(), record.intent.intent_digest(), found));
         }
-        if let Some(tombstone) = tombstones(&self.wire)
+        tombstones(&self.wire)
             .iter()
-            .find(|tombstone| tombstone.business_id == request.business_id)
-        {
-            if tombstone.slot_kind != kind || tombstone.intent_digest != digest {
+            .find(|tombstone| &tombstone.business_id == business_id)
+            .map(|tombstone| {
+                (
+                    tombstone.slot_kind,
+                    tombstone.intent_digest,
+                    LookupOutcome::Replay(OperationView::of_tombstone(tombstone)),
+                )
+            })
+    }
+
+    fn open(&mut self, request: &OpenRequest) -> Result<OpenOutcome, WindowStoreError> {
+        use OperationState as S;
+        self.settle()?;
+        if let Some((kind, digest, found)) = self.retained(&request.business_id) {
+            if kind != request.intent.kind() || digest != request.intent.intent_digest() {
                 return Ok(OpenOutcome::Conflict);
             }
-            return Ok(OpenOutcome::Replay(OperationView::of_tombstone(tombstone)));
+            return Ok(match found {
+                LookupOutcome::Resumable(handle) => OpenOutcome::Resumable(handle),
+                LookupOutcome::Replay(view) => OpenOutcome::Replay(view),
+            });
         }
         let record = self.new_record(request)?;
         let handle = OperationHandle::of(&record);
@@ -3148,6 +3237,17 @@ impl Session<'_> {
         pre_exposure_ledger: Option<u32>,
     ) -> Result<CommitId, WindowStoreError> {
         self.sweep_and_adopt()?;
+        self.expose_swept(id, attempt_index, identity, pre_exposure_ledger)
+    }
+
+    /// The exposure step after the caller's own sweep.
+    fn expose_swept(
+        &mut self,
+        id: OperationId,
+        attempt_index: u32,
+        identity: &ExposureIdentity,
+        pre_exposure_ledger: Option<u32>,
+    ) -> Result<CommitId, WindowStoreError> {
         if !identity.well_formed() {
             return Err(invalid(
                 "an exposure's receipt reference is not a reference",
@@ -3304,7 +3404,8 @@ impl Session<'_> {
         if matches!(to, S::NotSent | S::Expired)
             && let Some(auth_id) = attempt_auth
         {
-            release_unsent_attempt(&mut self.wire, auth_id, commit);
+            let unsent = from == S::Sending && to == S::NotSent && evidence.send_never_started;
+            release_unsent_attempt(&mut self.wire, auth_id, commit, unsent);
         }
         self.changed = true;
         Ok(commit)
@@ -3408,6 +3509,68 @@ impl Session<'_> {
         self.changed |= audited || mutable;
         Ok(audited.then_some(commit))
     }
+}
+
+/// What a consumption commit exposes beside the consumption: one attempt's
+/// signed identity, and the writer its row is appended to.
+pub struct ConsumptionExposure<'a> {
+    /// The operation the consumed authorization serves.
+    pub operation_id: OperationId,
+    /// The attempt the consumed authorization serves.
+    pub attempt_index: u32,
+    /// The signed identity the attempt is about to send.
+    pub identity: ExposureIdentity,
+    /// The writer the exposure row is appended to, before the window write.
+    pub audit: &'a mut dyn OperationAudit,
+    /// The caller's request identifier on the exposure row.
+    pub request_id: &'a str,
+}
+
+impl std::fmt::Debug for ConsumptionExposure<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConsumptionExposure")
+            .field("operation_id", &self.operation_id)
+            .field("attempt_index", &self.attempt_index)
+            .field("request_id", &self.request_id)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Commits `exposure` into `wire`, the successor of `original` that one
+/// consumption commit writes after its own sweep, and returns the rows to
+/// append before that commit. The exposure checks are those of
+/// [`OperationRecorder::expose`]: the attempt is open and unexposed in
+/// `Sending`, and its authorization is claimed or used.
+pub(super) fn expose_in_consumption(
+    wire: &mut WireFile,
+    profile: &Profile,
+    original: &WireFile,
+    now_ms: u64,
+    exposure: &ConsumptionExposure<'_>,
+) -> Result<Vec<AuditEntry>, WindowStoreError> {
+    let mut session = Session {
+        profile,
+        now: now_ms,
+        original,
+        wire: std::mem::take(wire),
+        mint_expires: None,
+        audit: AuditBatch {
+            request_id: exposure.request_id,
+            chain_id: profile.chain_id.caip2_str(),
+            commit: CommitId::random(),
+            entries: Vec::new(),
+        },
+        changed: false,
+    };
+    let exposed = session.expose_swept(
+        exposure.operation_id,
+        exposure.attempt_index,
+        &exposure.identity,
+        None,
+    );
+    *wire = session.wire;
+    exposed?;
+    Ok(session.audit.entries)
 }
 
 /// Stores `observation` unless the window holds one of a later ledger.
@@ -3517,6 +3680,29 @@ impl<'a> OperationRecorder<'a> {
     /// - Every integrity, keyring, lock and I/O error of the store.
     pub fn open(&mut self, request: &OpenRequest) -> Result<OpenOutcome, WindowStoreError> {
         self.run(None, |session| session.open(request))
+    }
+
+    /// Looks up the record or tombstone `business_id` names without opening
+    /// one.
+    ///
+    /// Under the lock it runs the sweep, the adoption and the expiry edges
+    /// [`Self::open`] runs. The state it reports is thus the state an open or
+    /// an attempt would act on. It compares no intent: the caller compares
+    /// [`LookupOutcome::binding`] with its own. `None` for an unknown id.
+    ///
+    /// # Errors
+    ///
+    /// - `audit.append_failed` when an adoption or expiry row cannot be
+    ///   appended; nothing is committed.
+    /// - Every integrity, keyring, lock and I/O error of the store.
+    pub fn lookup(
+        &mut self,
+        business_id: &BusinessId,
+    ) -> Result<Option<LookupOutcome>, WindowStoreError> {
+        self.run(None, |session| {
+            session.settle()?;
+            Ok(session.retained(business_id).map(|(_, _, found)| found))
+        })
     }
 
     /// Opens the next attempt of `handle`'s operation and commits it with
@@ -3698,6 +3884,39 @@ impl<'a> OperationRecorder<'a> {
             session.expire(now_ms.min(session.now))
         })
     }
+
+    /// Compacts the window at the store clock and stores `slot_kind` on the
+    /// tombstone `business_id` names, keeping its intent digest. Returns
+    /// whether such a tombstone exists.
+    ///
+    /// Test fixtures only: a compaction takes the slot kind from the record,
+    /// so no production step stores a tombstone whose slot kind and digest
+    /// come from different intents.
+    ///
+    /// # Errors
+    ///
+    /// Every integrity, keyring, lock and I/O error of the store.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn set_tombstone_slot_kind_for_test(
+        &mut self,
+        business_id: &BusinessId,
+        slot_kind: SlotKind,
+    ) -> Result<bool, WindowStoreError> {
+        self.run(None, |session| {
+            prune_stale(&mut session.wire, session.now);
+            let Some(tombstone) = session.wire.operations.as_mut().and_then(|section| {
+                section
+                    .tombstones
+                    .iter_mut()
+                    .find(|tombstone| &tombstone.business_id == business_id)
+            }) else {
+                return Ok(false);
+            };
+            tombstone.slot_kind = slot_kind;
+            session.changed = true;
+            Ok(true)
+        })
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -3749,6 +3968,75 @@ impl<'a> OperationStatus<'a> {
                     .find(|tombstone| &tombstone.business_id == business_id)
                     .map(OperationView::of_tombstone)
             }))
+    }
+
+    /// The facts a classic commit of the unsigned envelope with digest
+    /// `unsigned_envelope_sha256` under `business_id` compares, from one read
+    /// of the window, so the target and the envelope's owners agree.
+    ///
+    /// # Errors
+    ///
+    /// Every integrity, keyring and I/O error of the store's reads.
+    pub fn commit_binding(
+        &self,
+        business_id: &BusinessId,
+        unsigned_envelope_sha256: &[u8; 32],
+    ) -> Result<CommitBinding, WindowStoreError> {
+        let Some(wire) = self.read()? else {
+            return Ok(CommitBinding::default());
+        };
+        let records = records(&wire);
+        let owners = records
+            .iter()
+            .filter(|record| bound_envelope(record) == Some(*unsigned_envelope_sha256))
+            .map(OperationView::of_record)
+            .collect();
+        let target = match records
+            .iter()
+            .find(|record| &record.business_id == business_id)
+        {
+            Some(record) => Some(CommitTarget::Record {
+                view: OperationView::of_record(record),
+                envelope_sha256: bound_envelope(record),
+            }),
+            None => tombstones(&wire)
+                .iter()
+                .find(|tombstone| &tombstone.business_id == business_id)
+                .map(|tombstone| CommitTarget::Tombstone(OperationView::of_tombstone(tombstone))),
+        };
+        Ok(CommitBinding { target, owners })
+    }
+
+    /// Whether the attempt `attempt` names carries a committed sequence
+    /// release. The attempt is the one whose committed classic exposure
+    /// names that signed envelope hash; an x402 attempt and an attempt
+    /// before its exposure name none.
+    ///
+    /// The read takes no lock: the caller holds the window guard across it,
+    /// so no writer advances the file between the read and the caller's use
+    /// of the answer.
+    ///
+    /// # Errors
+    ///
+    /// Every integrity, keyring and I/O error of the store's reads.
+    pub fn sequence_released_unlocked(
+        &self,
+        attempt: &AttemptRef,
+    ) -> Result<bool, WindowStoreError> {
+        let AttemptRef::EnvelopeHash(signed) = attempt;
+        let Some(wire) = self.store.read_for_inspection(self.profile)? else {
+            return Ok(false);
+        };
+        Ok(records(&wire)
+            .iter()
+            .flat_map(|record| record.attempts.iter())
+            .filter(|stored| {
+                matches!(
+                    stored.exposure.as_ref().map(|exposure| &exposure.identity),
+                    Some(ExposureIdentity::Classic { envelope_sha256, .. }) if envelope_sha256 == signed
+                )
+            })
+            .any(|stored| stored.sequence_released.is_some()))
     }
 
     /// Every open record, and every record or tombstone closed at or after
@@ -3811,6 +4099,36 @@ impl<'a> OperationStatus<'a> {
             .iter()
             .any(|tombstone| tombstone.id == operation_id);
         Ok(classify(record, compacted, rows, now_ms))
+    }
+}
+
+impl SequenceReleases for OperationStatus<'_> {
+    fn sequence_released(&self, attempt: &AttemptRef) -> bool {
+        self.sequence_released_unlocked(attempt)
+            .unwrap_or_else(|error| {
+                tracing::warn!(
+                    code = error.submission_code(),
+                    "operation store: a sequence release could not be read; the sequence stays held"
+                );
+                false
+            })
+    }
+}
+
+/// The digest of the unsigned envelope `record`'s intent binds: an
+/// `Envelope` slot's digest, or the digest of a `Canonical` record's stored
+/// envelope text. `None` for x402.
+fn bound_envelope(record: &WireOperation) -> Option<[u8; 32]> {
+    match &record.intent {
+        IntentSlot::Envelope {
+            unsigned_envelope_sha256,
+            ..
+        } => Some(*unsigned_envelope_sha256),
+        IntentSlot::Canonical { .. } => record
+            .envelope_xdr
+            .as_ref()
+            .map(|xdr| Sha256::digest(xdr.as_bytes()).into()),
+        IntentSlot::X402 { .. } => None,
     }
 }
 
@@ -5534,6 +5852,111 @@ mod tests {
         assert_eq!(fx.generation(), before);
         assert_eq!(fx.record(handle.id()).state, OperationState::Sending);
         assert_eq!(fx.auth(started.authorization_id).native_release, None);
+    }
+
+    /// Commits a sequence release for attempt 1 of `handle`.
+    fn release_sequence(fx: &mut Fx, handle: &OperationHandle) {
+        fx.recorder()
+            .record_evidence(
+                handle.id(),
+                1,
+                &EvidenceInput {
+                    sequence_released: Some(SequenceReleaseInput {
+                        primary_ledger: 300,
+                        witness_ledger: 301,
+                        min_close_time_ms: T0 + 5,
+                    }),
+                    ..EvidenceInput::default()
+                },
+            )
+            .unwrap()
+            .unwrap();
+    }
+
+    /// The sequence-release read finds an attempt by the signed envelope
+    /// hash its committed exposure names, for a canonical and for an
+    /// envelope record. It answers `true` only once that attempt's release
+    /// commits, and `false` for the unsigned envelope digests the records
+    /// bind and for a hash no exposure names.
+    #[test]
+    #[serial]
+    fn sequence_releases_reads_by_envelope_hash() {
+        let signed = |exposure: ExposureIdentity| match exposure {
+            ExposureIdentity::Classic {
+                envelope_sha256, ..
+            } => AttemptRef::EnvelopeHash(envelope_sha256),
+            ExposureIdentity::X402 { .. } => panic!("a classic exposure"),
+        };
+        let mut fx = Fx::new();
+        let canonical_record = unknown_outcome(&mut fx);
+        let stored_xdr = fx.record(canonical_record.id()).envelope_xdr.unwrap();
+        let stored_text: [u8; 32] = Sha256::digest(stored_xdr.as_bytes()).into();
+        let canonical_attempt = signed(classic_exposure(1));
+
+        let envelope_record = fx.open_new(&request("order-2", envelope(9, 2, 0)));
+        let mint = fx.mint_request(tx(2), fx.policy(), vec![]);
+        let started = fx.begin_mint(&envelope_record, &mint).unwrap();
+        fx.claim(&mint, started.minted.as_ref().unwrap());
+        fx.recorder()
+            .expose(envelope_record.id(), 1, &classic_exposure(2), None)
+            .unwrap();
+        step(
+            &mut fx,
+            &envelope_record,
+            Some(1),
+            OperationState::SentOutcomeUnknown,
+        );
+        let envelope_attempt = signed(classic_exposure(2));
+        let unsigned = [
+            AttemptRef::EnvelopeHash(stored_text),
+            AttemptRef::EnvelopeHash([9; 32]),
+            AttemptRef::EnvelopeHash([0x77; 32]),
+        ];
+
+        let status = OperationStatus::new(&fx.store, &fx.profile);
+        assert!(!status.sequence_released(&canonical_attempt));
+        assert!(!status.sequence_released(&envelope_attempt));
+
+        release_sequence(&mut fx, &canonical_record);
+        let status = OperationStatus::new(&fx.store, &fx.profile);
+        assert!(status.sequence_released(&canonical_attempt));
+        assert!(
+            !status.sequence_released(&envelope_attempt),
+            "a release names its own attempt"
+        );
+
+        release_sequence(&mut fx, &envelope_record);
+        let status = OperationStatus::new(&fx.store, &fx.profile);
+        assert!(status.sequence_released(&canonical_attempt));
+        assert!(status.sequence_released(&envelope_attempt));
+        for other in unsigned {
+            assert!(!status.sequence_released(&other), "{other:?}");
+        }
+    }
+
+    /// An exposed `Sending` attempt never ends as `NotSent` at the expiry
+    /// edges, even when its authorization reads as ended unused and never
+    /// claimed. The committed exposure means its bytes may have reached the
+    /// network.
+    #[test]
+    #[serial]
+    fn an_exposed_sending_attempt_never_recovers_as_not_sent() {
+        let mut fx = Fx::new();
+        let handle = fx.open_new(&request("order-1", canonical(1)));
+        let auth_id = exposed_attempt(&mut fx, &handle, 1, &classic_exposure(1));
+        let now = fx.now();
+        rewrite_auth(&fx, auth_id, |auth| {
+            auth.state = AuthorizationState::Invalidated;
+            auth.claimed_ms = None;
+            auth.settled_ms = Some(now);
+            auth.disposition = Some(Disposition::Unused);
+        });
+        fx.clock.set(T0 + TTL_MS);
+        assert_eq!(fx.recorder().expire_due(u64::MAX).unwrap(), 0);
+        let record = fx.record(handle.id());
+        assert_eq!(record.state, OperationState::Sending);
+        assert_eq!(record.attempts[0].outcome, None);
+        assert!(record.attempts[0].exposure.is_some());
     }
 
     #[test]

@@ -1,0 +1,12 @@
+{
+  "ok": true,
+  "data": {
+    "cross_check": {
+      "reason": "oracle_not_configured",
+      "status": "skipped"
+    },
+    "ledger": 1005,
+    "tx_hash": "47fc8d8d2423b5c963b7fe8eae7b7679e0f2497fc404ac90e7c1d65feb303fae"
+  },
+  "request_id": "REQUEST_ID"
+}

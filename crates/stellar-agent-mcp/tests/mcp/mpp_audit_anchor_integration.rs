@@ -736,6 +736,7 @@ async fn x402_accounting_cap_refusal_withholds_the_payment_signature() {
                 "extra": { "areFeesSponsored": true }
             })
             .to_string(),
+            business_id: None,
         })
         .await
         .unwrap();
@@ -1294,6 +1295,7 @@ async fn profile_chain_x402_accounting_persists_cap() {
             "extra": { "areFeesSponsored": true }
         })
         .to_string(),
+        business_id: None,
     };
     let first = fixture
         .server

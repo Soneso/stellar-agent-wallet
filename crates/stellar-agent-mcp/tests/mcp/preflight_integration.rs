@@ -260,6 +260,7 @@ async fn run_create_account_preflight(
             // 1 XLM starting balance = 10_000_000 stroops.
             starting_balance: serde_json::from_str(r#""1 XLM""#).unwrap(),
             classic_base: None,
+            business_id: None,
         })
         .await
 }
@@ -406,6 +407,7 @@ fn make_non_native_pay_args(amount_str: &str) -> StellarPayArgs {
         memo_hash_hex: None,
         memo_return_hex: None,
         classic_base: None,
+        business_id: None,
     }
 }
 
@@ -651,6 +653,7 @@ async fn run_pay_native_preflight(
             memo_hash_hex: None,
             memo_return_hex: None,
             classic_base: None,
+            business_id: None,
         })
         .await
 }
@@ -716,6 +719,7 @@ async fn run_pay_native_preflight_with_profile_fee(
                 memo_hash_hex: None,
                 memo_return_hex: None,
                 classic_base: None,
+                business_id: None,
             })
             .await,
     )

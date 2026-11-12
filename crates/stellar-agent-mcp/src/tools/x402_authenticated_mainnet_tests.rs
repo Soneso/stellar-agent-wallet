@@ -492,7 +492,11 @@ impl Run {
         }
     }
 
-    fn args(&self, home: &str, approval: Option<(&str, &str)>) -> X402AuthenticatedPaymentArgs {
+    pub(super) fn args(
+        &self,
+        home: &str,
+        approval: Option<(&str, &str)>,
+    ) -> X402AuthenticatedPaymentArgs {
         X402AuthenticatedPaymentArgs {
             payment_required: serde_json::to_string(&self.f.requirements()).unwrap(),
             chain_id: "stellar:mainnet".to_owned(),
@@ -500,6 +504,7 @@ impl Run {
             address: None,
             approval_nonce: approval.map(|(nonce, _)| nonce.to_owned()),
             approval_attestation: approval.map(|(_, attestation)| attestation.to_owned()),
+            business_id: Some(crate::tools::common::tests::fresh_business_id()),
         }
     }
 
@@ -511,7 +516,7 @@ impl Run {
             .unwrap()
     }
 
-    async fn call(&self, args: X402AuthenticatedPaymentArgs) -> serde_json::Value {
+    pub(super) async fn call(&self, args: X402AuthenticatedPaymentArgs) -> serde_json::Value {
         wire(&self.call_raw(args).await)
     }
 
@@ -600,10 +605,17 @@ async fn call_one_writes_the_pending_approval_without_a_request() {
     let run = Run::new().await;
     let requirements = run.f.requirements();
     let clients = stellar_agent_network::client::constructions_on_this_thread();
-    let result = run.call(run.args(HOME, None)).await;
+    let args = run.args(HOME, None);
+    let business_id = args.business_id.clone().unwrap();
+    let result = run.call(args).await;
     assert_eq!(result["ok"], true, "{result}");
     let data = result["data"].as_object().unwrap();
-    assert_eq!(data.keys().collect::<Vec<_>>(), ["approval"], "{result}");
+    assert_eq!(
+        data.keys().collect::<Vec<_>>(),
+        ["approval", "business_id"],
+        "{result}"
+    );
+    assert_eq!(result["data"]["business_id"], business_id.as_str());
     let approval = &result["data"]["approval"];
     assert_eq!(approval["profile"], "operator");
     assert_eq!(approval["chain_id"], "stellar:mainnet");

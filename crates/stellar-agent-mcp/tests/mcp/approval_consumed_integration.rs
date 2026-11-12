@@ -249,6 +249,7 @@ fn commit_args(
         envelope_xdr: envelope_xdr.to_owned(),
         approval_nonce: Some(approval.to_owned()),
         approval_attestation: Some(attestation.to_owned()),
+        business_id: None,
     }
 }
 

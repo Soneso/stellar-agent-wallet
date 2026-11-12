@@ -729,6 +729,7 @@ mod tests {
                 }),
             ))
         }));
+        let business_id = crate::common::business_entry::fresh_business_id();
         let command = PayCommand::parse_from([
             "pay",
             DESTINATION,
@@ -738,6 +739,8 @@ mod tests {
             "--source",
             &fixture.agent.g,
             "--sign-with-ledger",
+            "--business-id",
+            &business_id,
         ]);
         assert_eq!(crate::commands::pay::run(&command.args).await, 1);
         assert!(

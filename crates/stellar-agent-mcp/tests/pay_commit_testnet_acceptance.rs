@@ -265,6 +265,7 @@ async fn pay_with_approval_commits_and_submits_on_testnet() {
             memo_hash_hex: None,
             memo_return_hex: None,
             classic_base: Some(FEE_STROOPS.to_string()),
+            business_id: None,
         })
         .await
         .expect("simulate must succeed against funded account");
@@ -360,6 +361,7 @@ async fn pay_with_approval_commits_and_submits_on_testnet() {
             envelope_xdr,
             approval_nonce: Some(approval_nonce),
             approval_attestation: Some(blob_b64),
+            business_id: None,
         })
         .await
         .expect("commit must pass the gate and submit on-chain");
@@ -482,6 +484,7 @@ async fn pay_v1_engine_commit_records_matching_leg_content_on_testnet() {
             memo_hash_hex: None,
             memo_return_hex: None,
             classic_base: Some(FEE_STROOPS.to_string()),
+            business_id: None,
         })
         .await
         .expect("simulate must not error");
@@ -520,6 +523,7 @@ async fn pay_v1_engine_commit_records_matching_leg_content_on_testnet() {
             envelope_xdr,
             approval_nonce: None,
             approval_attestation: None,
+            business_id: None,
         })
         .await
         .expect("commit must pass the gate and submit on-chain");
@@ -681,6 +685,7 @@ async fn pay_v1_per_period_cap_second_payment_denied_by_persisted_window_on_test
         memo_hash_hex: None,
         memo_return_hex: None,
         classic_base: Some(FEE_STROOPS.to_string()),
+        business_id: None,
     };
 
     // ── Payment 1: simulate -> commit -> submit succeeds on-chain ────────────
@@ -730,6 +735,7 @@ async fn pay_v1_per_period_cap_second_payment_denied_by_persisted_window_on_test
             envelope_xdr: envelope1,
             approval_nonce: None,
             approval_attestation: None,
+            business_id: None,
         })
         .await
         .expect("first commit must not error");

@@ -617,13 +617,15 @@ async fn mainnet_commit_rechecks_consent_after_policy_change() {
             .to_xdr_base64(Limits::none())
             .unwrap()
     };
-    let result = run
-        .commit_with(run.commit_args_for(
-            &changed,
-            &run.entry.approval_nonce,
-            run.args["approval_attestation"].as_str().unwrap(),
-        ))
-        .await;
+    // The changed envelope commits under an id whose record binds it, so the
+    // commit passes the envelope binding and meets the attestation check.
+    let mut args = run.commit_args_for(
+        &changed,
+        &run.entry.approval_nonce,
+        run.args["approval_attestation"].as_str().unwrap(),
+    );
+    args["business_id"] = serde_json::json!(run.bind_business_id_for(&changed));
+    let result = run.commit_with(args).await;
     assert_uniform("changed envelope", &result);
     diagnostics.assert_refused_with("changed envelope", "approval.attestation_invalid");
     assert_classic_unsigned("changed envelope", &run, &run.entry);
@@ -725,11 +727,11 @@ async fn mainnet_presence_failures_are_indistinguishable() {
 
     let result = run.commit().await;
     assert_classic_accepted("the genuine consent", &run, &result);
-    let result = refused_commit(
-        &run,
-        run.commit_args_for(&xdr, &run.entry.approval_nonce, &genuine),
-    )
-    .await;
+    // A commit under another business id that binds the same envelope
+    // reaches the approval gate, which refuses the consumed approval.
+    let mut consumed = run.commit_args_for(&xdr, &run.entry.approval_nonce, &genuine);
+    consumed["business_id"] = serde_json::json!(run.bind_new_business_id());
+    let result = refused_commit(&run, consumed).await;
     assert_eq!(
         result["error"]["code"], "policy.approval_consumed",
         "{result}"

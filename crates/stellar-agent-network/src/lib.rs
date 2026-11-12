@@ -58,6 +58,7 @@ pub mod intent_view_test_helpers;
 pub mod keyring;
 pub mod mainnet;
 pub mod memo;
+pub mod operation_entry;
 pub mod operational;
 pub mod policy_engine;
 pub mod policy_state;
@@ -144,8 +145,8 @@ pub use signed_intent::{
     SignerDescriptor, SigningAdmission, SigningPayload, SubjectKind, intent_xdr_hash,
 };
 pub use submission_record::{
-    ApprovalTombstone, AuditWriterHandle, SubmissionIntent, SubmissionOutcome, SubmissionRecorder,
-    WalletSubmissionRecorder,
+    ApprovalTombstone, AttemptEnd, AuditWriterHandle, OperationAttempt, SubmissionIntent,
+    SubmissionOutcome, SubmissionRecorder, WalletSubmissionRecorder, end_operation_attempt,
 };
 pub use submit::{
     MainnetSubmitGrant, PRE_SEND_BUDGET, PreSendStage, SentByError, SubmissionResult,
