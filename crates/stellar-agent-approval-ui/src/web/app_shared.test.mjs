@@ -353,6 +353,77 @@ test("a page without a proof sends no activity", () => {
   assert.equal(page.fetches.length, 0);
 });
 
+const MAINNET_ENROLL_PROOF_KEY = "stellar-agent-mainnet-approval-enroll-session-proof";
+const CODE_SCRIPT = "../operator_enroll/web/operator-enroll-code.js";
+
+function proofPage(island) {
+  return `<!DOCTYPE html><html><body><p id="bootstrap-status">Opening</p>` +
+    `<script type="application/json" id="session-bootstrap-data">${JSON.stringify(island)}</script>` +
+    `<script src="/static/session-bootstrap.js"></script><script>throw new Error("never run");</script></body></html>`;
+}
+
+function codePage(reply) {
+  const page = browser({ elements: ["code-input", "code-btn", "status"], reply });
+  page.run(CODE_SCRIPT);
+  return page;
+}
+
+test("the code form posts the code, stores the proof of the reply and opens /enroll", async () => {
+  const page = codePage(() => Promise.resolve({
+    ok: true,
+    status: 200,
+    text: () => Promise.resolve(proofPage({ proof: PROOF, storageKey: MAINNET_ENROLL_PROOF_KEY, next: "/enroll" })),
+  }));
+  page.byId["code-input"].value = " 1234 5678 ";
+  page.byId["code-btn"].listeners.click[0]();
+  await until(() => page.log.some(([kind]) => kind === "replace"), "the navigation to /enroll");
+  assert.equal(page.fetches.length, 1);
+  const [post] = page.fetches;
+  assert.equal(post.url, "/enroll/code");
+  assert.equal(post.init.method, "POST");
+  assert.equal(post.init.headers["content-type"], "application/json");
+  assert.deepEqual(JSON.parse(post.init.body), { code: "12345678" });
+  assert.equal(page.stored.get(MAINNET_ENROLL_PROOF_KEY), PROOF);
+  assert.deepEqual(page.log, [["setItem", MAINNET_ENROLL_PROOF_KEY], ["replace", "/enroll"]]);
+});
+
+for (const [name, island] of [
+  ["another storage key", { proof: PROOF, storageKey: ENROLL_PROOF_KEY, next: "/enroll" }],
+  ["another landing", { proof: PROOF, storageKey: MAINNET_ENROLL_PROOF_KEY, next: "/inbox" }],
+  ["no proof", { storageKey: MAINNET_ENROLL_PROOF_KEY, next: "/enroll" }],
+]) {
+  test(`the code form stores nothing and stays for ${name}`, async () => {
+    const page = codePage(() => Promise.resolve({ ok: true, status: 200, text: () => Promise.resolve(proofPage(island)) }));
+    page.byId["code-input"].value = "12345678";
+    page.byId["code-btn"].listeners.click[0]();
+    await until(() => /did not keep/.test(page.byId.status.textContent), "the storage refusal");
+    assert.equal(page.stored.size, 0);
+    assert.deepEqual(page.log, []);
+  });
+}
+
+test("a refused code shows the refusal, stores nothing and does not navigate", async () => {
+  const page = codePage(() => jsonReply(403, { error: "code_exhausted" }));
+  page.byId["code-input"].value = "12345678";
+  page.byId["code-btn"].listeners.click[0]();
+  await until(() => /attempt limit/.test(page.byId.status.textContent), "the exhaustion message");
+  assert.equal(page.byId["code-btn"].disabled, true);
+  assert.equal(page.stored.size, 0);
+  assert.deepEqual(page.log, []);
+  page.byId["code-input"].value = "1234";
+  const before = page.fetches.length;
+  page.byId["code-btn"].listeners.click[0]();
+  assert.equal(page.fetches.length, before, "a malformed code sends nothing");
+});
+
+test("the code script runs under the unchanged CSP: no inline code, eval or HTML injection", () => {
+  const body = readFileSync(new URL(CODE_SCRIPT, import.meta.url), "utf8");
+  for (const forbidden of ["innerHTML", "outerHTML", "eval(", "new Function", "document.write", "<form", "action="]) {
+    assert.ok(!body.includes(forbidden), forbidden);
+  }
+  assert.ok(body.includes('fetch("/enroll/code"'));
+});
+
 function enrollPage(storage, options = {}) {
   const page = browser({
     islands: { "enroll-data": { csrfToken: "e".repeat(64), rpId: "localhost" } },

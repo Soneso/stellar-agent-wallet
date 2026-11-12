@@ -2,6 +2,11 @@
 //! produces real WebAuthn registration responses, and a loopback HTTP client
 //! that drives a running enrollment server the way the page does.
 //!
+//! With the `test-helpers` feature, [`signed_origin_request`] and
+//! [`EnrollmentClient::connect_signed`] drive a signed-origin listener over
+//! HTTPS. They connect to `127.0.0.1`, send the signed host as SNI and the
+//! signed authority as `Host`, and trust only the given leaf certificate.
+//!
 //! Enabled for tests and by the explicit `test-helpers` feature; the
 //! release binaries are built without it.
 
@@ -115,6 +120,7 @@ pub fn cose_es256_key(public_key_sec1: &[u8; 65], alg: i64, crv: i64) -> Vec<u8>
 pub struct SoftwareRegistrar {
     public_key_sec1: [u8; 65],
     credential_id: Vec<u8>,
+    rp_id: String,
 }
 
 impl SoftwareRegistrar {
@@ -138,7 +144,15 @@ impl SoftwareRegistrar {
         Self {
             public_key_sec1,
             credential_id,
+            rp_id: REGISTRATION_RP_ID.to_owned(),
         }
+    }
+
+    /// This registrar registering for `rp_id` instead of `localhost`.
+    #[must_use]
+    pub fn with_rp_id(mut self, rp_id: &str) -> Self {
+        rp_id.clone_into(&mut self.rp_id);
+        self
     }
 
     /// The uncompressed SEC1 public key.
@@ -169,7 +183,7 @@ impl SoftwareRegistrar {
             client_type: "webauthn.create".to_owned(),
             cross_origin: None,
             client_data_raw: None,
-            rp_id_hash: Sha256::digest(REGISTRATION_RP_ID.as_bytes()).into(),
+            rp_id_hash: Sha256::digest(self.rp_id.as_bytes()).into(),
             flags: FLAG_UP | FLAG_UV | FLAG_AT,
             sign_count: 0,
             attested_credential_id: self.credential_id.clone(),
@@ -436,6 +450,8 @@ pub struct HttpReply {
     pub status: u16,
     /// The `Set-Cookie` header value, when present.
     pub set_cookie: Option<String>,
+    /// Every response header, the name in lowercase, in arrival order.
+    pub headers: Vec<(String, String)>,
     /// The body as text.
     pub body: String,
 }
@@ -455,6 +471,22 @@ pub struct EnrollmentClient {
     cookie: String,
     csrf: String,
     proof: String,
+    page_rp_id: Option<String>,
+    transport: Transport,
+}
+
+/// How an [`EnrollmentClient`] reaches its server.
+enum Transport {
+    /// Plain HTTP at `http://localhost:<port>`.
+    Loopback,
+    /// HTTPS at a signed origin, trusting only `leaf_pem`, with `extra`
+    /// headers on every request.
+    #[cfg(feature = "test-helpers")]
+    Signed {
+        origin: String,
+        leaf_pem: String,
+        extra: Vec<(String, String)>,
+    },
 }
 
 impl EnrollmentClient {
@@ -489,7 +521,9 @@ impl EnrollmentClient {
             .and_then(|island| island["proof"].as_str().map(str::to_owned))
             .ok_or_else(|| invalid("no session proof"))?;
         let page = request(addr, "GET", "/enroll", &[("cookie", &cookie)], None).await?;
-        let csrf = island(&page.body, "enroll-data")
+        let data = island(&page.body, "enroll-data");
+        let csrf = data
+            .as_ref()
             .and_then(|island| island["csrfToken"].as_str().map(str::to_owned))
             .ok_or_else(|| invalid("no CSRF value"))?;
         Ok(Self {
@@ -497,31 +531,156 @@ impl EnrollmentClient {
             cookie,
             csrf,
             proof,
+            page_rp_id: data.and_then(|island| island["rpId"].as_str().map(str::to_owned)),
+            transport: Transport::Loopback,
         })
+    }
+
+    /// Exchanges `code` at the signed-origin listener on `addr`, the way the
+    /// code form does, and reads the session cookie, the session proof and
+    /// the registration page's CSRF value.
+    ///
+    /// # Errors
+    ///
+    /// Any transport error, or [`std::io::ErrorKind::InvalidData`] when the
+    /// exchange is refused or a response lacks what the page reads from it.
+    #[cfg(feature = "test-helpers")]
+    pub async fn connect_signed(
+        addr: SocketAddr,
+        origin: &str,
+        leaf_pem: &str,
+        code: &str,
+    ) -> std::io::Result<Self> {
+        Self::connect_signed_with_headers(addr, origin, leaf_pem, code, &[]).await
+    }
+
+    /// [`Self::connect_signed`], sending `extra` headers on the exchange, the
+    /// page and every later request.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::connect_signed`].
+    #[cfg(feature = "test-helpers")]
+    pub async fn connect_signed_with_headers(
+        addr: SocketAddr,
+        origin: &str,
+        leaf_pem: &str,
+        code: &str,
+        extra: &[(&str, &str)],
+    ) -> std::io::Result<Self> {
+        let invalid =
+            |what: &str| std::io::Error::new(std::io::ErrorKind::InvalidData, what.to_owned());
+        let with_extra = |headers: &[(&'static str, &str)]| -> Vec<(String, String)> {
+            headers
+                .iter()
+                .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+                .chain(
+                    extra
+                        .iter()
+                        .map(|(name, value)| ((*name).to_owned(), (*value).to_owned())),
+                )
+                .collect()
+        };
+        let exchange_headers =
+            with_extra(&[("origin", origin), ("content-type", "application/json")]);
+        let exchange = signed_origin_request(
+            addr,
+            origin,
+            leaf_pem,
+            "POST",
+            "/enroll/code",
+            &borrowed(&exchange_headers),
+            Some(&serde_json::json!({ "code": code }).to_string()),
+        )
+        .await?;
+        if exchange.status != 200 {
+            return Err(invalid("code refused"));
+        }
+        let cookie = exchange
+            .set_cookie
+            .as_deref()
+            .and_then(|value| value.split(';').next())
+            .ok_or_else(|| invalid("no session cookie"))?
+            .to_owned();
+        let proof = island(&exchange.body, "session-bootstrap-data")
+            .and_then(|island| island["proof"].as_str().map(str::to_owned))
+            .ok_or_else(|| invalid("no session proof"))?;
+        let page_headers = with_extra(&[("cookie", &cookie)]);
+        let page = signed_origin_request(
+            addr,
+            origin,
+            leaf_pem,
+            "GET",
+            "/enroll",
+            &borrowed(&page_headers),
+            None,
+        )
+        .await?;
+        let data = island(&page.body, "enroll-data");
+        let csrf = data
+            .as_ref()
+            .and_then(|island| island["csrfToken"].as_str().map(str::to_owned))
+            .ok_or_else(|| invalid("no CSRF value"))?;
+        Ok(Self {
+            addr,
+            cookie,
+            csrf,
+            proof,
+            page_rp_id: data.and_then(|island| island["rpId"].as_str().map(str::to_owned)),
+            transport: Transport::Signed {
+                origin: origin.to_owned(),
+                leaf_pem: leaf_pem.to_owned(),
+                extra: with_extra(&[]),
+            },
+        })
+    }
+
+    /// The `rpId` the registration page's data island names.
+    #[must_use]
+    pub fn page_rp_id(&self) -> Option<&str> {
+        self.page_rp_id.as_deref()
     }
 
     /// The origin the page runs at.
     #[must_use]
     pub fn origin(&self) -> String {
-        format!("http://localhost:{}", self.addr.port())
+        match &self.transport {
+            Transport::Loopback => format!("http://localhost:{}", self.addr.port()),
+            #[cfg(feature = "test-helpers")]
+            Transport::Signed { origin, .. } => origin.clone(),
+        }
+    }
+
+    /// The session cookie, `name=value`.
+    #[must_use]
+    pub fn cookie(&self) -> &str {
+        &self.cookie
     }
 
     async fn post(&self, path: &str, body: &serde_json::Value) -> std::io::Result<HttpReply> {
         let origin = self.origin();
-        request(
-            self.addr,
-            "POST",
-            path,
-            &[
-                ("cookie", &self.cookie),
-                ("origin", &origin),
-                ("x-stellar-approval-csrf", &self.csrf),
-                ("x-session-proof", &self.proof),
-                ("content-type", "application/json"),
-            ],
-            Some(&body.to_string()),
-        )
-        .await
+        let headers = [
+            ("cookie", self.cookie.as_str()),
+            ("origin", origin.as_str()),
+            ("x-stellar-approval-csrf", self.csrf.as_str()),
+            ("x-session-proof", self.proof.as_str()),
+            ("content-type", "application/json"),
+        ];
+        let body = body.to_string();
+        match &self.transport {
+            Transport::Loopback => request(self.addr, "POST", path, &headers, Some(&body)).await,
+            #[cfg(feature = "test-helpers")]
+            Transport::Signed {
+                origin,
+                leaf_pem,
+                extra,
+            } => {
+                let mut all = headers.to_vec();
+                all.extend(borrowed(extra));
+                signed_origin_request(self.addr, origin, leaf_pem, "POST", path, &all, Some(&body))
+                    .await
+            }
+        }
     }
 
     /// `POST /enroll/challenge`.
@@ -623,6 +782,172 @@ pub async fn request(
     parse_reply(&raw)
 }
 
+/// Sends one HTTP/1.1 request over HTTPS to the listener on `addr`, as a
+/// browser at the signed `origin` does, and reads the response to the end.
+///
+/// Connects to `127.0.0.1` at the port of `addr`, sends the host of `origin`
+/// as SNI and trusts only the leaf certificate `leaf_pem` for that name. The
+/// `Host` header is the authority of `origin`, the origin without
+/// `https://`, unless `headers` names one.
+///
+/// # Errors
+/// Returns a TLS or transport error, a refusal of the served certificate, or
+/// an invalid HTTP response.
+#[cfg(feature = "test-helpers")]
+pub async fn signed_origin_request(
+    addr: SocketAddr,
+    origin: &str,
+    leaf_pem: &str,
+    method: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+    body: Option<&str>,
+) -> std::io::Result<HttpReply> {
+    use std::sync::Arc;
+
+    let invalid =
+        |what: &str| std::io::Error::new(std::io::ErrorKind::InvalidInput, what.to_owned());
+    let authority = origin
+        .strip_prefix("https://")
+        .ok_or_else(|| invalid("origin without https"))?;
+    let host = authority.split(':').next().unwrap_or(authority);
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let verifier = LeafOnly {
+        leaf: pem_first_certificate(leaf_pem).ok_or_else(|| invalid("no leaf certificate"))?,
+        host: host.to_owned(),
+        provider: Arc::clone(&provider),
+    };
+    let config = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .map_err(std::io::Error::other)?
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(verifier))
+        .with_no_client_auth();
+    let server_name = rustls_pki_types::ServerName::try_from(host.to_owned())
+        .map_err(|_| invalid("signed host is no DNS name"))?;
+    let loopback = SocketAddr::new(
+        std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+        addr.port(),
+    );
+    let tcp = tokio::net::TcpStream::connect(loopback).await?;
+    let mut stream = tokio_rustls::TlsConnector::from(Arc::new(config))
+        .connect(server_name, tcp)
+        .await?;
+    let host_header = headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("host"))
+        .map_or(authority, |(_, value)| *value);
+    let mut head =
+        format!("{method} {path} HTTP/1.1\r\nhost: {host_header}\r\nconnection: close\r\n");
+    for (name, value) in headers {
+        if !name.eq_ignore_ascii_case("host") {
+            head.push_str(&format!("{name}: {value}\r\n"));
+        }
+    }
+    let body = body.unwrap_or_default();
+    head.push_str(&format!("content-length: {}\r\n\r\n", body.len()));
+    head.push_str(body);
+    stream.write_all(head.as_bytes()).await?;
+    let mut raw = Vec::new();
+    match stream.read_to_end(&mut raw).await {
+        Ok(_) => {}
+        // A server that closes without close_notify still delivers the whole
+        // response before the close.
+        Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof && !raw.is_empty() => {}
+        Err(error) => return Err(error),
+    }
+    parse_reply(&raw)
+}
+
+/// `headers` as borrowed pairs.
+#[cfg(feature = "test-helpers")]
+fn borrowed(headers: &[(String, String)]) -> Vec<(&str, &str)> {
+    headers
+        .iter()
+        .map(|(name, value)| (name.as_str(), value.as_str()))
+        .collect()
+}
+
+/// The DER of the first `CERTIFICATE` block of `pem`.
+#[cfg(feature = "test-helpers")]
+fn pem_first_certificate(pem: &str) -> Option<Vec<u8>> {
+    let begin = "-----BEGIN CERTIFICATE-----";
+    let start = pem.find(begin)? + begin.len();
+    let end = start + pem[start..].find("-----END CERTIFICATE-----")?;
+    let encoded: String = pem[start..end].split_whitespace().collect();
+    base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .ok()
+}
+
+/// Trusts exactly one leaf certificate for one host and checks handshake
+/// signatures with the ring provider.
+#[cfg(feature = "test-helpers")]
+#[derive(Debug)]
+struct LeafOnly {
+    leaf: Vec<u8>,
+    host: String,
+    provider: std::sync::Arc<rustls::crypto::CryptoProvider>,
+}
+
+#[cfg(feature = "test-helpers")]
+impl rustls::client::danger::ServerCertVerifier for LeafOnly {
+    fn verify_server_cert(
+        &self,
+        end_entity: &rustls_pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls_pki_types::CertificateDer<'_>],
+        server_name: &rustls_pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls_pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        let name_matches = matches!(
+            server_name,
+            rustls_pki_types::ServerName::DnsName(name) if name.as_ref() == self.host
+        );
+        if name_matches && end_entity.as_ref() == self.leaf.as_slice() {
+            Ok(rustls::client::danger::ServerCertVerified::assertion())
+        } else {
+            Err(rustls::Error::InvalidCertificate(
+                rustls::CertificateError::UnknownIssuer,
+            ))
+        }
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls_pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls_pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.provider
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
 fn parse_reply(raw: &[u8]) -> std::io::Result<HttpReply> {
     let invalid =
         || std::io::Error::new(std::io::ErrorKind::InvalidData, "malformed HTTP response");
@@ -639,11 +964,13 @@ fn parse_reply(raw: &[u8]) -> std::io::Result<HttpReply> {
         .ok_or_else(invalid)?;
     let mut set_cookie = None;
     let mut chunked = false;
+    let mut headers = Vec::new();
     for line in lines {
         let Some((name, value)) = line.split_once(':') else {
             continue;
         };
         let value = value.trim();
+        headers.push((name.to_ascii_lowercase(), value.to_owned()));
         if name.eq_ignore_ascii_case("set-cookie") {
             set_cookie = Some(value.to_owned());
         }
@@ -658,6 +985,7 @@ fn parse_reply(raw: &[u8]) -> std::io::Result<HttpReply> {
     Ok(HttpReply {
         status,
         set_cookie,
+        headers,
         body: String::from_utf8(body).map_err(|_| invalid())?,
     })
 }

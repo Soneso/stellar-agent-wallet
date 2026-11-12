@@ -27,6 +27,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Enrolled profiles require a matching signed selection through CLI and MCP.
   Sign each switch with the owner seed, update the profile, and restart MCP.
   Omission means `v1`; mismatches refuse with `policy.engine_selection_unsigned`.
+- `approve credential enroll --origin-from <PATH>` enrolls a mainnet approval credential for the RP of a signed approval origin.
+  It reads the origin and pin from an unsigned bootstrap policy body and serves the page over TLS from the explicit `[remote_approval]` paths.
+  A single-use eight-digit enrollment code opens the page session, and the page's confirmation code at the terminal exports the entry.
+  The signed consent listener serves no enrollment helper page.
 - `scripts/deploy/` holds the scripts that run the mainnet wallet as a
   dedicated `stellar-agent` account with its platform keyring. They are a root
   bootstrap, three `sudo -u` wrappers, a sudoers source, and one validation

@@ -152,6 +152,31 @@ One-shot consent needs no exposure flag and prints `<signed-origin>/approvals/<i
 Login continues to that id; completion, cancellation, expiry and interruption close the listener.
 An occupied configured socket reports `approval.listener_busy`; use the running inbox.
 
+### Enrolling a mainnet approval credential at the signed origin
+
+The signed consent listener serves no `/enroll` page and no `/static/enroll.js` helper.
+Enroll a mainnet approval credential for the signed RP with its own listener instead:
+
+```bash
+stellar-agent approve credential enroll --origin-from bootstrap.toml --profile mainnet
+```
+
+The bootstrap file is the unsigned policy body with `approval_origin` and `approval_cert_spki_sha256` together.
+It needs no signature and no approval credential, and it need not be installed.
+The command validates it as `profile policy-check` does and takes the origin, the RP and the pin from it.
+It uses the same `bind`, `rp_id`, `cert_path` and `key_path` as signed consent, with the same startup refusals.
+The approving device must already trust the certificate, as for consent.
+
+The terminal prints the URL, `<signed-origin>/enroll`, and an eight-digit enrollment code.
+On the approving device, open the URL and type the enrollment code.
+The code works once, admits five attempts and lives the timeout, at most ten minutes.
+Then create the passkey; the page shows a confirmation code.
+Type that confirmation code at the terminal before the timeout.
+Only that match exports the credential entry, with `rp_id` set to the signed host.
+The command writes no profile, policy, store or keyring item.
+Add the entry to `approval_credentials`, sign the policy and restart the listener.
+Run enrollment and the `[remote_approval]` setup in the provisioning tier, never as a runtime service.
+
 ## Starting the testnet listener
 
 ```bash
@@ -202,8 +227,10 @@ Relying Party ID at creation time.
 
 ### Argument-import mode: enrolling via this listener's `/enroll` page
 
-The wallet serves exactly the page this mode needs. On the approving device,
-after verifying the certificate fingerprint above:
+The testnet listener serves exactly the page this mode needs. A signed-origin
+listener does not; see
+[Enrolling a mainnet approval credential at the signed origin](#enrolling-a-mainnet-approval-credential-at-the-signed-origin).
+On the approving device, after verifying the certificate fingerprint above:
 
 1. Open `https://<rp_id>:<port>/enroll`.
 2. Click "Create passkey" and complete your platform's passkey prompt.

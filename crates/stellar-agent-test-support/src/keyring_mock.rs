@@ -289,6 +289,163 @@ impl keyring_core::api::CredentialApi for HookedCred {
     }
 }
 
+/// One keyring write, deletion or attribute update in a [`MutationLog`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KeyringMutation {
+    /// `set`, `delete` or `update_attributes`.
+    pub operation: &'static str,
+    /// The service of the entry.
+    pub service: String,
+    /// The account of the entry.
+    pub account: String,
+}
+
+/// The keyring mutations made through entries built after
+/// [`record_mutations`].
+#[derive(Clone, Debug, Default)]
+pub struct MutationLog(Arc<std::sync::Mutex<Vec<KeyringMutation>>>);
+
+impl MutationLog {
+    /// Every mutation recorded so far, in order.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the log is poisoned by a panic in a recording thread.
+    #[must_use]
+    pub fn mutations(&self) -> Vec<KeyringMutation> {
+        #[allow(
+            clippy::expect_used,
+            reason = "test support; a poisoned log is a test failure"
+        )]
+        self.0.lock().expect("mutation log").clone()
+    }
+
+    fn push(&self, operation: &'static str, service: &str, account: &str) {
+        if let Ok(mut log) = self.0.lock() {
+            log.push(KeyringMutation {
+                operation,
+                service: service.to_owned(),
+                account: account.to_owned(),
+            });
+        }
+    }
+}
+
+/// Wraps the installed default store so that every write, deletion and
+/// attribute update through an entry built from now on is recorded.
+///
+/// The credentials already in the store stay; reads behave as before. A test
+/// calls this after its fixture setup and asserts on the log it returns.
+///
+/// # Errors
+///
+/// Returns [`keyring_core::Error::NoDefaultStore`] when no store is
+/// installed.
+pub fn record_mutations() -> Result<MutationLog, keyring_core::Error> {
+    let inner = keyring_core::get_default_store().ok_or(keyring_core::Error::NoDefaultStore)?;
+    let log = MutationLog::default();
+    let store: Arc<keyring_core::CredentialStore> = Arc::new(RecordingStore {
+        inner,
+        log: log.clone(),
+    });
+    keyring_core::set_default_store(store);
+    Ok(log)
+}
+
+/// The store [`record_mutations`] installs.
+struct RecordingStore {
+    inner: Arc<keyring_core::CredentialStore>,
+    log: MutationLog,
+}
+
+impl std::fmt::Debug for RecordingStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RecordingStore").finish_non_exhaustive()
+    }
+}
+
+impl keyring_core::api::CredentialStoreApi for RecordingStore {
+    fn vendor(&self) -> String {
+        "stellar-agent-test-support recording mock store".to_owned()
+    }
+
+    fn id(&self) -> String {
+        self.inner.id()
+    }
+
+    fn build(
+        &self,
+        service: &str,
+        user: &str,
+        modifiers: Option<&std::collections::HashMap<&str, &str>>,
+    ) -> keyring_core::Result<keyring_core::Entry> {
+        let entry = self.inner.build(service, user, modifiers)?;
+        Ok(keyring_core::Entry::new_with_credential(Arc::new(
+            RecordingCred {
+                entry,
+                service: service.to_owned(),
+                account: user.to_owned(),
+                log: self.log.clone(),
+            },
+        )))
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+/// A credential whose mutations land in a [`MutationLog`].
+struct RecordingCred {
+    entry: keyring_core::Entry,
+    service: String,
+    account: String,
+    log: MutationLog,
+}
+
+impl std::fmt::Debug for RecordingCred {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RecordingCred").finish_non_exhaustive()
+    }
+}
+
+impl keyring_core::api::CredentialApi for RecordingCred {
+    fn set_secret(&self, secret: &[u8]) -> keyring_core::Result<()> {
+        self.log.push("set", &self.service, &self.account);
+        self.entry.set_secret(secret)
+    }
+
+    fn get_secret(&self) -> keyring_core::Result<Vec<u8>> {
+        self.entry.get_secret()
+    }
+
+    fn update_attributes(
+        &self,
+        attributes: &std::collections::HashMap<&str, &str>,
+    ) -> keyring_core::Result<()> {
+        self.log
+            .push("update_attributes", &self.service, &self.account);
+        self.entry.update_attributes(attributes)
+    }
+
+    fn delete_credential(&self) -> keyring_core::Result<()> {
+        self.log.push("delete", &self.service, &self.account);
+        self.entry.delete_credential()
+    }
+
+    fn get_credential(&self) -> keyring_core::Result<Option<Arc<keyring_core::api::Credential>>> {
+        Ok(None)
+    }
+
+    fn get_specifiers(&self) -> Option<(String, String)> {
+        self.entry.get_specifiers()
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
 /// Canonical `Display` text of the `windows-native-keyring-store` platform
 /// error for Win32 `ERROR_NO_SUCH_LOGON_SESSION` (1312), as rendered inside
 /// `keyring_core::Error::NoStorageAccess`.
@@ -671,6 +828,143 @@ mod tests {
         assert!(
             keyring_core::get_default_store().is_none(),
             "an unwind through the guard restores the absence of a default store"
+        );
+    }
+
+    /// Puts back the default store a test found, also when it panics.
+    struct RestoreDefaultStore(Option<std::sync::Arc<keyring_core::CredentialStore>>);
+
+    impl RestoreDefaultStore {
+        fn capture() -> Self {
+            Self(keyring_core::get_default_store())
+        }
+    }
+
+    impl Drop for RestoreDefaultStore {
+        fn drop(&mut self) {
+            match self.0.take() {
+                Some(store) => keyring_core::set_default_store(store),
+                None => {
+                    let _ = keyring_core::unset_default_store();
+                }
+            }
+        }
+    }
+
+    fn mutation(operation: &'static str, service: &str, account: &str) -> super::KeyringMutation {
+        super::KeyringMutation {
+            operation,
+            service: service.to_owned(),
+            account: account.to_owned(),
+        }
+    }
+
+    /// Without an installed store there is nothing to wrap.
+    #[test]
+    #[serial]
+    fn record_mutations_requires_an_installed_store() {
+        let _restore = RestoreDefaultStore::capture();
+        keyring_core::unset_default_store();
+        assert!(matches!(
+            super::record_mutations(),
+            Err(keyring_core::Error::NoDefaultStore)
+        ));
+    }
+
+    /// A write, an attribute update and a deletion through entries built
+    /// after the call each record one mutation with their coordinates, in
+    /// order. Reads pass through and record nothing.
+    #[test]
+    #[serial]
+    fn record_mutations_logs_writes_updates_and_deletions_in_order() {
+        let _restore = RestoreDefaultStore::capture();
+        super::install().expect("mock store install");
+        let log = super::record_mutations().expect("recording store");
+        assert_eq!(log.mutations(), []);
+
+        let entry = keyring_core::Entry::new("rec-svc", "rec-user").expect("entry");
+        entry.set_password("value").expect("set");
+        assert_eq!(entry.get_password().expect("read"), "value");
+        assert_eq!(entry.get_secret().expect("secret read"), b"value");
+        assert_eq!(log.mutations(), [mutation("set", "rec-svc", "rec-user")]);
+
+        let attributes = std::collections::HashMap::from([("label", "laptop")]);
+        let _ = entry.update_attributes(&attributes);
+        let other = keyring_core::Entry::new("rec-svc", "other-user").expect("entry");
+        other.set_password("second").expect("set");
+        other.delete_credential().expect("delete");
+        assert_eq!(
+            log.mutations(),
+            [
+                mutation("set", "rec-svc", "rec-user"),
+                mutation("update_attributes", "rec-svc", "rec-user"),
+                mutation("set", "rec-svc", "other-user"),
+                mutation("delete", "rec-svc", "other-user"),
+            ]
+        );
+        assert!(
+            other.get_password().is_err(),
+            "the deletion reaches the store"
+        );
+        let clone = log.clone();
+        assert_eq!(clone.mutations().len(), 4, "clones share one log");
+    }
+
+    /// Credentials stored before the call stay readable through entries
+    /// built afterwards, and reading them records nothing.
+    #[test]
+    #[serial]
+    fn record_mutations_keeps_earlier_credentials_readable() {
+        let _restore = RestoreDefaultStore::capture();
+        super::install().expect("mock store install");
+        keyring_core::Entry::new("seed-svc", "seed-user")
+            .expect("entry")
+            .set_password("seeded")
+            .expect("seed");
+        let log = super::record_mutations().expect("recording store");
+        let entry = keyring_core::Entry::new("seed-svc", "seed-user").expect("entry");
+        assert_eq!(entry.get_password().expect("read"), "seeded");
+        assert_eq!(log.mutations(), []);
+    }
+
+    /// The recording store and its credentials name themselves and keep
+    /// the inner store's identity and the entry's coordinates.
+    #[test]
+    #[serial]
+    fn record_mutations_store_and_credential_identify_themselves() {
+        let _restore = RestoreDefaultStore::capture();
+        super::install().expect("mock store install");
+        let inner_id = keyring_core::get_default_store().expect("inner store").id();
+        let _log = super::record_mutations().expect("recording store");
+        let store = keyring_core::get_default_store().expect("recording store");
+        assert_eq!(
+            store.vendor(),
+            "stellar-agent-test-support recording mock store"
+        );
+        assert_eq!(store.id(), inner_id);
+        let recording = store
+            .as_any()
+            .downcast_ref::<super::RecordingStore>()
+            .expect("the default store is the recording store");
+        assert_eq!(format!("{recording:?}"), "RecordingStore { .. }");
+
+        let entry = keyring_core::Entry::new("id-svc", "id-user").expect("entry");
+        let credential = entry
+            .as_any()
+            .downcast_ref::<super::RecordingCred>()
+            .expect("entries built afterwards wrap a recording credential");
+        assert_eq!(format!("{credential:?}"), "RecordingCred { .. }");
+        assert_eq!(
+            entry.get_specifiers(),
+            Some(("id-svc".to_owned(), "id-user".to_owned()))
+        );
+        assert!(
+            entry
+                .get_credential()
+                .expect("credential")
+                .as_any()
+                .is::<super::RecordingCred>(),
+            "a wrapper credential stands for itself"
         );
     }
 }

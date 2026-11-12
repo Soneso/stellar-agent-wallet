@@ -15,6 +15,7 @@
 //! Persistent serving requires exposure consent at the CLI.
 //! One-shot serving prints a secret-free signed link and scopes routes to one entry.
 //! Testnet enrollment writes remain local; its remote helper only displays registration data.
+//! Signed consent mounts no enrollment helper; [`enroll_listener`] serves signed-origin enrollment.
 
 // `deny` (not `forbid`): the test-only `STELLAR_AGENT_HOME` env-var override
 // helper in `tls.rs` needs a narrowly-scoped `#[allow(unsafe_code)]` for
@@ -24,6 +25,7 @@
 
 pub mod challenge_store;
 pub mod config_validate;
+pub mod enroll_listener;
 pub mod rate_limit;
 pub mod remote_origin;
 pub mod session;

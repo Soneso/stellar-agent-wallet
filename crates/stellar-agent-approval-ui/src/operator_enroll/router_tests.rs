@@ -70,6 +70,8 @@ impl Harness {
             auth: StdMutex::new(auth),
             store: Some(OperatorApprovalCredentialStore::new(store_path.clone())),
             expected_origin: expected_origin(local_addr),
+            rp_id: super::REGISTRATION_RP_ID.to_owned(),
+            signed: None,
             label_prefill,
             identity: PageIdentity::neutral(),
             ceremony: StdMutex::new(Ceremony {
@@ -1450,5 +1452,484 @@ async fn bootstrap_trace_redacts_token() {
         assert!(!line.contains(&h.bootstrap_hex), "token in trace: {line}");
         assert!(!line.contains(stray_nonce), "nonce in trace: {line}");
         assert!(!line.contains(&proof), "proof in trace: {line}");
+    }
+}
+
+const SIGNED_ORIGIN: &str = "https://approve.example.invalid:8443";
+const SIGNED_RP_ID: &str = "approve.example.invalid";
+const MAINNET_PROOF_KEY: &str = "stellar-agent-mainnet-approval-enroll-session-proof";
+
+/// A signed-origin ceremony's router, without the signed Host and Origin
+/// layers its listener installs.
+fn signed() -> (Router, super::SignedEnrollmentCeremony) {
+    super::signed_ceremony(
+        SIGNED_ORIGIN,
+        SIGNED_RP_ID,
+        "main".to_owned(),
+        None,
+        PageIdentity::neutral(),
+        std::time::Duration::from_secs(300),
+    )
+}
+
+/// One in-process request to `router`.
+async fn send(
+    router: &Router,
+    method: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+    body: Option<String>,
+) -> (StatusCode, HeaderMap, String) {
+    let mut builder = Request::builder().method(method).uri(path);
+    for (name, value) in headers {
+        builder = builder.header(*name, *value);
+    }
+    let req = builder
+        .body(body.map_or_else(Body::empty, Body::from))
+        .unwrap();
+    let resp = router.clone().oneshot(req).await.unwrap();
+    let status = resp.status();
+    let headers = resp.headers().clone();
+    let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+    (status, headers, String::from_utf8(bytes.to_vec()).unwrap())
+}
+
+/// `POST /enroll/code` with `code`.
+async fn post_code(router: &Router, code: &str) -> (StatusCode, HeaderMap, String) {
+    send(
+        router,
+        "POST",
+        "/enroll/code",
+        &[("content-type", "application/json")],
+        Some(json!({ "code": code }).to_string()),
+    )
+    .await
+}
+
+/// A different eight-digit code than `code`.
+fn other_code(code: &str) -> String {
+    let mut digits = code.as_bytes().to_vec();
+    digits[0] = if digits[0] == b'0' { b'1' } else { b'0' };
+    String::from_utf8(digits).unwrap()
+}
+
+/// The signed router selects the page by session: the code form and its
+/// pre-auth asset without one, the registration page with one. Only the
+/// terminal's code, once, yields the cookie and the proof page; a wrong or
+/// replayed code yields neither. The loopback router serves no code asset
+/// and no code route.
+#[tokio::test]
+async fn signed_enrollment_code_form_and_exchange() {
+    let (router, ceremony) = signed();
+    let code = ceremony.enrollment_code().to_owned();
+    assert_eq!(code.len(), 8);
+
+    let (status, headers, form) = send(&router, "GET", "/enroll", &[], None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(form.contains(r#"id="code-input""#), "{form}");
+    assert!(form.contains(r#"<script src="/static/operator-enroll-code.js"></script>"#));
+    assert!(!form.contains("enroll-data"));
+    assert!(!form.contains(&code));
+    let csp = headers[header::CONTENT_SECURITY_POLICY]
+        .to_str()
+        .unwrap()
+        .to_owned();
+    assert!(csp.contains("form-action 'none'"), "{csp}");
+
+    let (status, _, asset) =
+        send(&router, "GET", "/static/operator-enroll-code.js", &[], None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(asset.as_bytes(), super::web::OPERATOR_ENROLL_CODE_JS);
+    for path in [
+        "/static/operator-enroll.js".to_owned(),
+        format!("/bootstrap/{}", "ab".repeat(32)),
+        "/static/session-bootstrap.js".to_owned(),
+    ] {
+        assert_eq!(
+            send(&router, "GET", &path, &[], None).await.0,
+            StatusCode::NOT_FOUND,
+            "{path}"
+        );
+    }
+
+    let (status, headers, body) = post_code(&router, &other_code(&code)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(body, r#"{"error":"code_invalid"}"#);
+    assert!(headers.get(header::SET_COOKIE).is_none());
+
+    let (status, headers, page) = post_code(&router, &code).await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    let cookie = headers[header::SET_COOKIE].to_str().unwrap().to_owned();
+    assert!(cookie.ends_with("; Secure"), "{cookie}");
+    let island = extract_island(&page, "session-bootstrap-data");
+    assert_eq!(island["storageKey"], MAINNET_PROOF_KEY);
+    assert_eq!(island["next"], "/enroll");
+    let proof = island["proof"].as_str().unwrap().to_owned();
+    assert_eq!(proof.len(), 64);
+    assert!(!page.contains(&code));
+
+    let (status, headers, body) = post_code(&router, &code).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a spent code never matches again"
+    );
+    assert!(headers.get(header::SET_COOKIE).is_none());
+    assert!(!body.contains(&proof));
+
+    let session_cookie = cookie.split(';').next().unwrap().to_owned();
+    let (status, headers, registration) = send(
+        &router,
+        "GET",
+        "/enroll",
+        &[("cookie", &session_cookie)],
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        headers[header::CONTENT_SECURITY_POLICY].to_str().unwrap(),
+        csp
+    );
+    assert!(!registration.contains(r#"id="code-input""#));
+    assert_eq!(
+        extract_island(&registration, "enroll-data")["rpId"],
+        SIGNED_RP_ID
+    );
+    assert!(registration.contains(r#"<script src="/static/operator-enroll.js"></script>"#));
+    let (status, _, script) = send(
+        &router,
+        "GET",
+        "/static/operator-enroll.js",
+        &[("cookie", &session_cookie)],
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(script.as_bytes(), super::web::OPERATOR_ENROLL_JS);
+
+    let loopback = Harness::new();
+    let cookie = loopback.bootstrap().await;
+    assert_eq!(
+        loopback
+            .get("/static/operator-enroll-code.js", &cookie)
+            .await
+            .0,
+        StatusCode::NOT_FOUND
+    );
+    let (status, _) = loopback
+        .post("/enroll/code", Some(&cookie), None, json!({"code": code}))
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+/// A signed ceremony verifies registrations against the origin and RP of
+/// the body it starts from. A foreign `Host` and forwarded headers change
+/// neither the challenge RP nor the expected origin: a registration for the
+/// signed origin passes, one for the header's origin fails.
+#[tokio::test]
+async fn signed_registration_origin_uses_body_state() {
+    let (router, mut ceremony) = signed();
+    let code = ceremony.enrollment_code().to_owned();
+    let (_, headers, page) = post_code(&router, &code).await;
+    let cookie = headers[header::SET_COOKIE]
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_owned();
+    let proof = extract_island(&page, "session-bootstrap-data")["proof"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let foreign = [
+        ("host", "evil.example:9443"),
+        ("x-forwarded-host", "evil.example"),
+        ("x-forwarded-proto", "http"),
+        ("forwarded", "host=evil.example;proto=http"),
+    ];
+    let mut get_headers = foreign.to_vec();
+    get_headers.push(("cookie", &cookie));
+    let (_, _, registration) = send(&router, "GET", "/enroll", &get_headers, None).await;
+    let csrf = extract_csrf(&registration);
+    assert_eq!(
+        extract_island(&registration, "enroll-data")["rpId"],
+        SIGNED_RP_ID
+    );
+    let mut post_headers = get_headers.clone();
+    post_headers.extend([
+        ("origin", "https://evil.example:9443"),
+        ("x-stellar-approval-csrf", csrf.as_str()),
+        ("x-session-proof", proof.as_str()),
+        ("content-type", "application/json"),
+    ]);
+    let (status, _, options) = send(
+        &router,
+        "POST",
+        "/enroll/challenge",
+        &post_headers,
+        Some("{}".to_owned()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{options}");
+    let options: serde_json::Value = serde_json::from_str(&options).unwrap();
+    assert_eq!(options["rp_id"], SIGNED_RP_ID);
+    let challenge: [u8; 32] = URL_SAFE_NO_PAD
+        .decode(options["challenge"].as_str().unwrap())
+        .unwrap()
+        .try_into()
+        .unwrap();
+    let registrar = SoftwareRegistrar::new([0x31; 32], vec![0x7c; 16]).with_rp_id(SIGNED_RP_ID);
+    for (origin, rp_id) in [
+        ("https://evil.example:9443", SIGNED_RP_ID),
+        ("https://approve.example.invalid", SIGNED_RP_ID),
+        (SIGNED_ORIGIN, "evil.example"),
+        (SIGNED_ORIGIN, "localhost"),
+    ] {
+        let builder = SoftwareRegistrar::new([0x31; 32], vec![0x7c; 16])
+            .with_rp_id(rp_id)
+            .builder(&challenge, origin);
+        let (status, _, body) = send(
+            &router,
+            "POST",
+            "/enroll/credential",
+            &post_headers,
+            Some(builder.json().to_string()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{origin} {rp_id}");
+        assert_eq!(body, r#"{"error":"registration_invalid"}"#);
+    }
+    let valid = registrar.builder(&challenge, SIGNED_ORIGIN);
+    let (status, _, body) = send(
+        &router,
+        "POST",
+        "/enroll/credential",
+        &post_headers,
+        Some(valid.json().to_string()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let pending = ceremony
+        .await_completion_until(std::time::Instant::now() + std::time::Duration::from_secs(5))
+        .await
+        .unwrap();
+    let confirmed = pending
+        .confirm(
+            &valid.confirmation_code_for(super::EnrollmentPurpose::MainnetApproval),
+            std::time::Instant::now(),
+        )
+        .unwrap();
+    let credential = confirmed.into_mainnet_policy_credential().unwrap();
+    assert_eq!(credential.credential_id(), registrar.credential_id());
+}
+
+/// The handle of a signed ceremony ends with the typed exhaustion outcome
+/// after the sixth attempt and with a timeout when the code expires, both
+/// without a staged registration.
+#[tokio::test]
+async fn signed_enrollment_code_exhaustion_and_expiry_end_the_wait() {
+    let (router, mut ceremony) = signed();
+    let wrong = other_code(ceremony.enrollment_code());
+    for _ in 0..5 {
+        assert_eq!(post_code(&router, &wrong).await.0, StatusCode::FORBIDDEN);
+    }
+    let (status, headers, body) = post_code(&router, ceremony.enrollment_code()).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(body, r#"{"error":"code_exhausted"}"#);
+    assert!(headers.get(header::SET_COOKIE).is_none());
+    let ended = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        ceremony
+            .await_completion_until(std::time::Instant::now() + std::time::Duration::from_secs(60)),
+    )
+    .await
+    .expect("exhaustion ends the wait");
+    assert!(matches!(
+        ended,
+        Err(super::OperatorEnrollAwaitError::CodeExhausted)
+    ));
+
+    let (_router, mut ceremony) = super::signed_ceremony(
+        SIGNED_ORIGIN,
+        SIGNED_RP_ID,
+        "main".to_owned(),
+        None,
+        PageIdentity::neutral(),
+        std::time::Duration::from_millis(200),
+    );
+    let ended = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        ceremony
+            .await_completion_until(std::time::Instant::now() + std::time::Duration::from_secs(60)),
+    )
+    .await
+    .expect("expiry ends the wait without a request");
+    assert!(matches!(
+        ended,
+        Err(super::OperatorEnrollAwaitError::Timeout)
+    ));
+    assert!(!format!("{ceremony:?}").contains(ceremony.enrollment_code()));
+}
+
+/// One raw HTTP/1.1 exchange with a loopback enrollment server: the response
+/// head without its `date` and `content-length` lines, then the body.
+async fn raw_exchange(
+    addr: SocketAddr,
+    method: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+) -> String {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let mut head = format!(
+        "{method} {path} HTTP/1.1\r\nhost: localhost:{}\r\nconnection: close\r\n",
+        addr.port()
+    );
+    for (name, value) in headers {
+        head.push_str(&format!("{name}: {value}\r\n"));
+    }
+    let body = if method == "POST" { "{}" } else { "" };
+    head.push_str(&format!("content-length: {}\r\n\r\n{body}", body.len()));
+    stream.write_all(head.as_bytes()).await.unwrap();
+    let mut raw = Vec::new();
+    stream.read_to_end(&mut raw).await.unwrap();
+    let text = String::from_utf8(raw).unwrap();
+    let (response_head, response_body) = text.split_once("\r\n\r\n").unwrap();
+    let mut kept: Vec<&str> = response_head
+        .split("\r\n")
+        .filter(|line| {
+            let lower = line.to_ascii_lowercase();
+            !lower.starts_with("date:") && !lower.starts_with("content-length:")
+        })
+        .collect();
+    kept[1..].sort_unstable();
+    format!("{method} {path}\n{}\n\n{response_body}\n", kept.join("\n"))
+}
+
+/// The loopback transcript of one purpose, with the port, the bootstrap
+/// token, the cookie, the proof, the CSRF value, the challenge and its
+/// remaining time replaced by fixed names.
+async fn loopback_transcript(purpose: super::EnrollmentPurpose) -> String {
+    let dir = TempDir::new().unwrap();
+    let handle = match purpose {
+        super::EnrollmentPurpose::RemoteOperator => super::start_operator_enroll_server(
+            dir.path().join("default.toml"),
+            "default",
+            SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 0),
+            Some("laptop".to_owned()),
+            PageIdentity::neutral(),
+        )
+        .await
+        .unwrap(),
+        super::EnrollmentPurpose::MainnetApproval => {
+            super::start_mainnet_approval_enroll("main".to_owned(), None, PageIdentity::neutral())
+                .await
+                .unwrap()
+        }
+    };
+    let addr = handle.local_addr();
+    let token = handle.bootstrap_token_hex().to_owned();
+    let mut transcript = format!("url {}\n", handle.enroll_url());
+    let bootstrap = raw_exchange(addr, "GET", &format!("/bootstrap/{token}"), &[]).await;
+    let set_cookie = bootstrap
+        .lines()
+        .find_map(|line| line.strip_prefix("set-cookie: "))
+        .unwrap()
+        .to_owned();
+    let cookie = set_cookie.split(';').next().unwrap().to_owned();
+    let proof = extract_island(&bootstrap, "session-bootstrap-data")["proof"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    transcript.push_str(&bootstrap);
+    transcript.push_str(&raw_exchange(addr, "GET", &format!("/bootstrap/{token}"), &[]).await);
+    let page = raw_exchange(addr, "GET", "/enroll", &[("cookie", &cookie)]).await;
+    let csrf = extract_csrf(&page);
+    transcript.push_str(&page);
+    transcript.push_str(&raw_exchange(addr, "GET", "/enroll", &[]).await);
+    for asset in [
+        "/static/operator-enroll.js",
+        "/static/session-bootstrap.js",
+        "/static/operator-enroll-code.js",
+    ] {
+        transcript.push_str(&raw_exchange(addr, "GET", asset, &[("cookie", &cookie)]).await);
+    }
+    transcript.push_str(&raw_exchange(addr, "GET", "/static/operator-enroll.js", &[]).await);
+    let origin = format!("http://localhost:{}", addr.port());
+    let post_headers = [
+        ("cookie", cookie.as_str()),
+        ("origin", origin.as_str()),
+        ("x-stellar-approval-csrf", csrf.as_str()),
+        ("x-session-proof", proof.as_str()),
+        ("content-type", "application/json"),
+    ];
+    let challenge = raw_exchange(addr, "POST", "/enroll/challenge", &post_headers).await;
+    let challenge_json: serde_json::Value =
+        serde_json::from_str(challenge.rsplit("\n\n").next().unwrap().trim()).unwrap();
+    let challenge_b64 = challenge_json["challenge"].as_str().unwrap().to_owned();
+    let remaining = challenge_json["timeout_ms"].to_string();
+    transcript.push_str(&challenge.replace(
+        &format!("\"timeout_ms\":{remaining}"),
+        "\"timeout_ms\":{remaining}",
+    ));
+    transcript.push_str(&raw_exchange(addr, "POST", "/enroll/code", &post_headers).await);
+    handle.shutdown().await.unwrap();
+    let cookie_value = cookie.split_once('=').unwrap().1.to_owned();
+    let cookie_name = cookie.split_once('=').unwrap().0.to_owned();
+    // Only the random 16-hex-digit suffix of the cookie name varies; the
+    // purpose prefix stays in the transcript.
+    let (cookie_prefix, cookie_suffix) = cookie_name.split_at(cookie_name.len() - 16);
+    assert!(cookie_suffix.bytes().all(|b| b.is_ascii_hexdigit()));
+    transcript
+        .replace(&token, "{token}")
+        .replace(&proof, "{proof}")
+        .replace(&cookie_value, "{cookie}")
+        .replace(&cookie_name, &format!("{cookie_prefix}{{cookie_suffix}}"))
+        .replace(&csrf, "{csrf}")
+        .replace(&challenge_b64, "{challenge}")
+        .replace(&format!("localhost:{}", addr.port()), "localhost:{port}")
+}
+
+/// Both loopback purposes keep their base transcript: URLs, pages, data
+/// islands, cookies, assets, challenge options and 404 answers, including
+/// 404 for the signed code asset and the code route.
+#[tokio::test]
+async fn loopback_enrollment_transcript_keeps_base_bytes() {
+    use sha2::{Digest as _, Sha256};
+    // `whole_name` is the hash the base tree yields with the whole cookie
+    // name replaced; it ties this transcript to the base bytes. `expected`
+    // keeps the purpose prefix of the cookie name.
+    for (purpose, expected, whole_name) in [
+        (
+            super::EnrollmentPurpose::RemoteOperator,
+            "ece062491853771fc8e1b3da36c34d18cd6cabbcff6a83d0a9b3da3d3bf09bab",
+            "f6df8795002c881b6ba786017514c45ec3e104b76840820eb5e4529bad2891cc",
+        ),
+        (
+            super::EnrollmentPurpose::MainnetApproval,
+            "3c87a65a9eee4608a0206a58c593451e2a967c43b461ace7d47c13fe288ee803",
+            "9c69bcc0ac07ba80c6083f4ebe8e8013e1e183485988d54b038a969c72cf7322",
+        ),
+    ] {
+        let transcript = loopback_transcript(purpose).await;
+        let prefix = match purpose {
+            super::EnrollmentPurpose::RemoteOperator => "stellar_agent_operator_enroll_session_",
+            super::EnrollmentPurpose::MainnetApproval => {
+                "stellar_agent_mainnet_approval_enroll_session_"
+            }
+        };
+        let whole = transcript.replace(&format!("{prefix}{{cookie_suffix}}"), "{cookie_name}");
+        assert_eq!(
+            hex::encode(Sha256::digest(whole.as_bytes())),
+            whole_name,
+            "{purpose:?} transcript against the base value:\n{transcript}"
+        );
+        assert_eq!(
+            hex::encode(Sha256::digest(transcript.as_bytes())),
+            expected,
+            "{purpose:?} transcript:\n{transcript}"
+        );
     }
 }
