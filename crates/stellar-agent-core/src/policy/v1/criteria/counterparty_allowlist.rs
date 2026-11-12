@@ -128,9 +128,12 @@
 //!
 //! # Unlisted recipients
 //!
-//! A version 2 policy can give one criterion an `unlisted` table. It decides a
-//! call whose only failure is a debit recipient that is well-formed, verified,
-//! and outside this criterion's own list ([`RecipientClass::Unlisted`]):
+//! A version 2 policy can give one criterion per rule an `unlisted` table,
+//! and every table of the policy equals the first. Equal budget tables share
+//! one counter per asset across the rules that carry them. A rule without a
+//! table, its allow list, and its caps are unaffected. A table decides a call
+//! whose only failure is a debit recipient that is well-formed, verified, and
+//! outside this criterion's own list ([`RecipientClass::Unlisted`]):
 //!
 //! ```toml
 //! { kind = "counterparty_allowlist", kinds = ["G_ACCOUNT"], allowlist = ["GABC..."], unlisted = { mode = "approval" } }

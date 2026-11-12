@@ -852,8 +852,8 @@ fn parse_scope_string(s: &str) -> Result<ScopeId, PolicyError> {
 ///
 /// Returns an empty vec when no `rules` key is present. `version` is the
 /// document's policy version; criteria and keys of version 2 refuse in a
-/// version 1 document. At most one criterion of the policy carries an
-/// `unlisted` table.
+/// version 1 document. A rule carries at most one `unlisted` table, and
+/// every table of the policy equals the first.
 fn extract_rules(
     doc: &DocumentMut,
     network_passphrase: &str,
@@ -877,35 +877,52 @@ fn extract_rules(
     for (i, table) in aot.iter().enumerate() {
         rules.push(parse_rule(table, i, network_passphrase, version)?);
     }
-    reject_second_unlisted(&rules)?;
+    reject_unequal_unlisted(&rules)?;
     Ok(rules)
 }
 
-/// Refuses a policy in which more than one criterion carries an `unlisted`
-/// table, in one rule or across rules.
+/// Refuses a policy whose `unlisted` tables differ, or whose rule carries
+/// more than one table.
 ///
-/// One table keeps the treatment of an unlisted recipient unambiguous for
-/// every call the policy governs.
-fn reject_second_unlisted(rules: &[PolicyRule]) -> Result<(), PolicyError> {
-    let mut first: Option<(usize, usize)> = None;
+/// The tables are walked in document order. A rule carries at most one
+/// table. Every table equals the policy's first table as parsed: mode,
+/// asset after its default, both bounds, and window. Equal budget tables
+/// share one counter per asset across the rules that carry them. A rule
+/// without a table, its allow list, and its caps are unaffected.
+fn reject_unequal_unlisted(rules: &[PolicyRule]) -> Result<(), PolicyError> {
+    let mut first: Option<(usize, usize, &UnlistedMode)> = None;
     for (rule_idx, rule) in rules.iter().enumerate() {
+        let mut rule_first: Option<usize> = None;
         for (criterion_idx, criterion) in rule.criteria.iter().enumerate() {
-            let carries = (criterion.as_ref() as &dyn std::any::Any)
+            let Some(mode) = (criterion.as_ref() as &dyn std::any::Any)
                 .downcast_ref::<CounterpartyAllowlistCriterion>()
-                .is_some_and(|c| c.unlisted().is_some());
-            if !carries {
+                .and_then(CounterpartyAllowlistCriterion::unlisted)
+            else {
                 continue;
-            }
-            if let Some((first_rule, first_criterion)) = first {
+            };
+            if let Some(rule_first_criterion) = rule_first {
                 return Err(PolicyError::PolicyFileParseFailed {
                     detail: format!(
                         "rule[{rule_idx}].criteria[{criterion_idx}]: a policy carries at most \
-                         one `unlisted` table; rule[{first_rule}].criteria[{first_criterion}] \
+                         one `unlisted` table; rule[{rule_idx}].criteria[{rule_first_criterion}] \
                          carries the first"
                     ),
                 });
             }
-            first = Some((rule_idx, criterion_idx));
+            rule_first = Some(criterion_idx);
+            match first {
+                Some((first_rule, first_criterion, first_mode)) if first_mode != mode => {
+                    return Err(PolicyError::PolicyFileParseFailed {
+                        detail: format!(
+                            "rule[{rule_idx}].criteria[{criterion_idx}]: every `unlisted` table \
+                             of a policy must equal the first; \
+                             rule[{first_rule}].criteria[{first_criterion}] carries the first"
+                        ),
+                    });
+                }
+                Some(_) => {}
+                None => first = Some((rule_idx, criterion_idx, mode)),
+            }
         }
     }
     Ok(())
