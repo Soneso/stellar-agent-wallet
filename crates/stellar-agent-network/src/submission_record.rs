@@ -1796,11 +1796,14 @@ static UNCOVERED_AUTHORIZED_TIP: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
 /// Whether the recorder checks for held bytes before writing its pending row.
+#[cfg(feature = "test-hooks")]
 fn window_precheck_enabled() -> bool {
-    #[cfg(feature = "test-hooks")]
-    if SKIP_WINDOW_PRECHECK.load(std::sync::atomic::Ordering::Acquire) {
-        return false;
-    }
+    !SKIP_WINDOW_PRECHECK.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// Whether the recorder checks for held bytes before writing its pending row.
+#[cfg(not(feature = "test-hooks"))]
+fn window_precheck_enabled() -> bool {
     true
 }
 

@@ -26,7 +26,7 @@
 //! | 4 | UP (`flags & 0x01`) set |
 //! | 5 | UV (`flags & 0x04`) set, unconditionally |
 //! | 6 | not BE=0 with BS=1 |
-//! | 7 | ES256 over `authenticator_data || SHA-256(client_data_json)` |
+//! | 7 | ES256 over `authenticator_data \|\| SHA-256(client_data_json)` |
 //!
 //! Error values name the failed step and carry no input bytes.
 
