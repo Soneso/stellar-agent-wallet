@@ -507,6 +507,50 @@ it. A testnet environment signer keeps it for its command.
 
 ### `[policy]` block
 
+With an enrolled owner, the profile's `[policy] engine` must match the verified
+signed policy's top-level `engine`. An omitted signed selector means `v1`.
+Policy version 2 accepts `engine = "v1"` and `engine = "noop"`.
+Version 1 rejects an explicit selector.
+
+To switch from `v1` to `noop`, stop MCP and edit the version 2 policy file.
+Set top-level `engine = "noop"`, outside every table. Load the owner seed into
+`WALLET_OWNER_SK`, then sign:
+
+```bash
+stellar-agent profile sign-policy --profile <NAME> --secret-env WALLET_OWNER_SK
+unset WALLET_OWNER_SK
+```
+
+Set `engine = "noop"` in the profile's `[policy]` table, then restart MCP.
+To switch back, set the signed policy's top-level `engine = "v1"`, run the
+same signing command, set the profile selector to `v1`, and restart MCP.
+Each re-sign assigns a higher sequence from the body and pin.
+Signing writes the policy atomically and never advances the pin.
+Intermediate mismatches refuse with `policy.engine_selection_unsigned`;
+the message names the engine selection. Selection refusal never advances the pin.
+Both CLI and MCP verify the signature, scope, sequence, pin, and owner rotation.
+Authorized Noop supplies no runtime proofs and grants no mainnet write authority.
+Ownerless profiles keep their engine behavior; unreadable owner state refuses.
+
+Window reset requires the owner's signature whenever a pin or enrolled owner
+exists, including testnet and mainnet without an enablement nonce.
+The pin selects the owner first; absent pins use the verified enrolled owner.
+Only genuine ownerless state permits unsigned reset. Unreadable authority refuses.
+Stop MCP and load that owner's seed into `WALLET_OWNER_SK`, then run:
+
+```bash
+stellar-agent profile reset-window-state <NAME> --reason "clear ordinary accrual" --owner-secret-env WALLET_OWNER_SK
+unset WALLET_OWNER_SK
+```
+
+Restart MCP after the reset. Missing consent reports
+`profile.reset_window_state_owner_required`. The audit row records the verified
+signature before mutation. One latest consent record survives pruning and
+refuses a request id matching that record.
+Reset preserves stored total-budget entries exactly and creates no epoch.
+Wiped-accrual reporting excludes preserved totals. Protected open work still refuses;
+terminal history and unreleased reservations survive.
+
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
 | `engine` | string | yes (in v2) | — | `"noop"` or `"v1"`. `noop`: testnet allow-all; mainnet read-only allowed; mainnet destructive operations refused with `policy.engine_required`; `smart-account multicall` refused on testnet with `policy.engine_required`, since mainnet refuses it earlier with `network.mainnet_write_forbidden`. `v1`: signature-verified typed-criteria engine, first-match default-deny. Newly minted profiles default to `v1`; a profile migrated from v1 is set to `noop` explicitly. |
@@ -788,9 +832,9 @@ its policy and key prerequisites. A profile migrated from schema v1 stays on
 engine = "v1"
 ```
 
-Until this is done, a migrated profile continues to run under `noop`, which
-refuses mainnet destructive operations with `policy.engine_required`. Opting in
-to `v1` changes policy evaluation.
+After owner enrollment, a mismatched engine selection refuses through CLI and MCP.
+Complete the signed engine ceremony above before using the profile.
+Noop refuses mainnet destructive operations with `policy.engine_required`.
 Builds from this repository and releases from v0.1.0-alpha.14 on carry
 `mainnet-write`. Mainnet writes also require enablement and a signed v2 policy.
 CLI value operations follow the governing decision: `allow` grants policy

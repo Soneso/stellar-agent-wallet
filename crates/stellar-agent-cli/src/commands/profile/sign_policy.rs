@@ -1017,6 +1017,110 @@ pub(super) mod tests {
         }
     }
 
+    #[tokio::test]
+    #[serial]
+    async fn owner_seed_engine_ceremony_has_cli_mcp_parity() {
+        use crate::commands::policy_engine::build_v1_policy_engine;
+        use stellar_agent_core::profile::schema::PolicyEngineKind;
+        use stellar_agent_mcp::server::WalletServer;
+        keyring_mock::install().unwrap();
+        let home = TempDir::new().unwrap();
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
+        let (secret, public, _) = seed_material([0x51; 32]);
+        enroll_owner_pubkey(PROFILE_NAME, &public);
+        let var = unique_var("ENGINE_SELECTION");
+        let _secret = EnvGuard::set(var.clone(), &secret);
+        let mut profile = profile_for(PROFILE_NAME);
+        let directory = stellar_agent_core::profile::schema::default_policy_dir().unwrap();
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join(format!("{PROFILE_NAME}.toml"));
+        let body = policy_body(PROFILE_NAME).replace("version = 1", "version = 2\nsequence = 1");
+        std::fs::write(&path, body).unwrap();
+        assert_eq!(
+            run_with_dependencies(&args(&path, &var), |_| Ok(profile.clone()), || Ok(())).await,
+            0
+        );
+        build_v1_policy_engine("pay", &profile.policy.engine, &profile, PROFILE_NAME).unwrap();
+        WalletServer::new_with_policy_dir_for_test(profile.clone(), &directory).unwrap();
+        for (name, kind) in [
+            ("noop", PolicyEngineKind::Noop),
+            ("v1", PolicyEngineKind::V1),
+        ] {
+            let window = stellar_agent_core::profile::schema::default_policy_window_state_path_for(
+                PROFILE_NAME,
+            );
+            let pin_before = stellar_agent_core::policy::v1::verified::read_pin_without_creating(
+                &window, &profile,
+            )
+            .unwrap();
+            let mut document = std::fs::read_to_string(&path)
+                .unwrap()
+                .parse::<toml_edit::DocumentMut>()
+                .unwrap();
+            document["engine"] = toml_edit::value(name);
+            std::fs::write(&path, document.to_string()).unwrap();
+            let unsigned = std::fs::read(&path).unwrap();
+            let (wrong, _, _) = seed_material([0x52; 32]);
+            {
+                let _wrong = EnvGuard::set(var.clone(), &wrong);
+                assert_eq!(
+                    run_with_dependencies(&args(&path, &var), |_| Ok(profile.clone()), || Ok(()))
+                        .await,
+                    1
+                );
+                assert_eq!(std::fs::read(&path).unwrap(), unsigned);
+            }
+            let _secret = EnvGuard::set(var.clone(), &secret);
+            assert_eq!(
+                run_with_dependencies(&args(&path, &var), |_| Ok(profile.clone()), || Ok(())).await,
+                0
+            );
+            assert_eq!(
+                stellar_agent_core::policy::v1::verified::read_pin_without_creating(
+                    &window, &profile
+                )
+                .unwrap(),
+                pin_before
+            );
+            let error =
+                build_v1_policy_engine("pay", &profile.policy.engine, &profile, PROFILE_NAME)
+                    .err()
+                    .unwrap();
+            assert_eq!(error.code(), "policy.engine_selection_unsigned");
+            assert!(error.to_string().contains("engine selection"));
+            let error = WalletServer::new_with_policy_dir_for_test(profile.clone(), &directory)
+                .err()
+                .unwrap();
+            assert!(
+                error
+                    .to_string()
+                    .contains("policy.engine_selection_unsigned")
+            );
+            assert_eq!(
+                stellar_agent_core::policy::v1::verified::read_pin_without_creating(
+                    &window, &profile
+                )
+                .unwrap(),
+                pin_before
+            );
+            profile.policy.engine = kind;
+            build_v1_policy_engine("pay", &kind, &profile, PROFILE_NAME).unwrap();
+            WalletServer::new_with_policy_dir_for_test(profile.clone(), &directory).unwrap();
+            assert!(!std::fs::read_to_string(&path).unwrap().contains(&secret));
+            let pin = stellar_agent_core::policy::v1::verified::read_pin_without_creating(
+                &window, &profile,
+            )
+            .unwrap();
+            let stellar_agent_core::policy::pin::PinState::Present(pin) = pin else {
+                panic!("missing pin");
+            };
+            let stellar_agent_core::policy::pin::PinState::Present(before) = pin_before else {
+                panic!("missing first pin");
+            };
+            assert!(pin.sequence() > before.sequence());
+        }
+    }
+
     /// Owner-key absence keeps the outward not-enrolled contract.
     #[test]
     #[serial]

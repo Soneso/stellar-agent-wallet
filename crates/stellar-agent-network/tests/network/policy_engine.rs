@@ -71,6 +71,11 @@ fn noop_has_no_proofs_and_v1_is_verified() {
     let dir = tempfile::tempdir().unwrap();
     let _home = StellarAgentHomeGuard::new(dir.path());
     let mut profile = profile(false);
+    assert!(
+        stellar_agent_core::profile::owner_key::read_enrolled_owner(&profile)
+            .unwrap()
+            .is_none()
+    );
     profile.policy.engine = stellar_agent_core::profile::schema::PolicyEngineKind::Noop;
     let pk = write_policy(V1);
     let noop = build_policy_engine(
@@ -100,6 +105,248 @@ fn noop_has_no_proofs_and_v1_is_verified() {
     let concrete: std::sync::Arc<dyn stellar_agent_core::policy::PolicyEngine> = verified.engine();
     assert!(std::sync::Arc::ptr_eq(&v1.engine, &concrete));
     assert!(v1.enablement.is_none());
+}
+
+#[test]
+#[serial]
+fn unsigned_engine_selection_refuses_before_payment() {
+    use stellar_agent_core::{policy::PolicyError, profile::schema::PolicyEngineKind};
+    use stellar_agent_network::policy_engine::PolicyEngineBuildError;
+    keyring_mock::install().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let _home = StellarAgentHomeGuard::new(dir.path());
+    let mut profile = profile(false);
+    let body = V1
+        .replace("version = 1", "version = 2\nsequence = 1")
+        .replace("stellar_balances", "stellar_pay")
+        .replace(
+            "criteria = []",
+            "criteria = [{kind = \"per_tx_cap\", asset = \"native\", max_stroops = \"1\"}]",
+        );
+    let pk = write_policy(&body);
+    let entry = &profile.policy_owner_key_id;
+    keyring_core::Entry::new(&entry.service, &entry.account)
+        .unwrap()
+        .set_password(&stellar_agent_core::profile::owner_key::encode_owner_public_key(&pk))
+        .unwrap();
+    build_policy_engine(
+        &profile,
+        None,
+        "operator",
+        None,
+        pk,
+        OwnerKeySource::Keyring,
+    )
+    .unwrap();
+    profile.policy.engine = PolicyEngineKind::Noop;
+    let error = build_policy_engine(
+        &profile,
+        None,
+        "operator",
+        None,
+        pk,
+        OwnerKeySource::Keyring,
+    )
+    .err()
+    .unwrap();
+    assert!(matches!(
+        error,
+        PolicyEngineBuildError::Policy(PolicyError::EngineSelectionUnsigned { selection: "noop" })
+    ));
+    assert!(error.to_string().contains("engine selection"));
+    let path =
+        stellar_agent_core::profile::schema::default_policy_window_state_path_for("operator");
+    assert!(!path.exists());
+    write_policy(&body.replace("sequence = 1", "sequence = 2\nengine = \"noop\""));
+    let built = build_policy_engine(
+        &profile,
+        None,
+        "operator",
+        None,
+        pk,
+        OwnerKeySource::Keyring,
+    )
+    .unwrap();
+    assert!(built.verified.is_none());
+    assert!(built.enablement.is_none());
+}
+
+#[test]
+#[serial]
+fn engine_selection_refuses_unreadable_owner_state() {
+    for malformed in [false, true] {
+        keyring_mock::install().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let _home = StellarAgentHomeGuard::new(dir.path());
+        let mut profile = profile(false);
+        profile.policy.engine = stellar_agent_core::profile::schema::PolicyEngineKind::Noop;
+        let pin = stellar_agent_core::profile::schema::policy_pin_entry_ref(
+            &profile.policy_window_state_key_id,
+        );
+        assert!(
+            !stellar_agent_core::profile::schema::default_policy_window_state_path_for("operator")
+                .parent()
+                .unwrap()
+                .exists()
+        );
+        if malformed {
+            keyring_core::Entry::new(&pin.service, &pin.account)
+                .unwrap()
+                .set_password("malformed pin")
+                .unwrap();
+        } else {
+            keyring_mock::inject_error(
+                &pin.service,
+                &pin.account,
+                keyring_core::Error::NoStorageAccess(Box::new(std::io::Error::other("locked pin"))),
+            )
+            .unwrap();
+        }
+        assert!(
+            build_policy_engine(
+                &profile,
+                None,
+                "operator",
+                None,
+                [0; 32],
+                OwnerKeySource::Keyring
+            )
+            .is_err()
+        );
+    }
+    for failure in 0..3 {
+        keyring_mock::install().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let _home = StellarAgentHomeGuard::new(dir.path());
+        let mut profile = profile(false);
+        profile.policy.engine = stellar_agent_core::profile::schema::PolicyEngineKind::Noop;
+        let entry = &profile.policy_owner_key_id;
+        if failure == 0 {
+            keyring_core::Entry::new(&entry.service, &entry.account)
+                .unwrap()
+                .set_password("invalid owner")
+                .unwrap();
+        } else {
+            keyring_mock::inject_error(
+                &entry.service,
+                &entry.account,
+                if failure == 1 {
+                    keyring_core::Error::NoDefaultStore
+                } else {
+                    keyring_core::Error::NoStorageAccess(Box::new(std::io::Error::other("locked")))
+                },
+            )
+            .unwrap();
+        }
+        let error = build_policy_engine(
+            &profile,
+            None,
+            "operator",
+            None,
+            [0; 32],
+            OwnerKeySource::Keyring,
+        )
+        .err()
+        .unwrap();
+        assert!(
+            matches!(
+                error,
+                stellar_agent_network::policy_engine::PolicyEngineBuildError::OwnerKeyring(_)
+            ),
+            "{error}"
+        );
+    }
+}
+
+#[test]
+#[serial]
+fn engine_authorization_keeps_unrelated_behavior() {
+    const EXPECTED: &str = r#"version = 1
+scope = "profile:operator"
+
+[[rules]]
+match = { tool = "stellar_balances", chain = "*" }
+criteria = []
+decision = "allow"
+"#;
+    assert_eq!(
+        String::from_utf8(canonical_bytes(V1).unwrap()).unwrap(),
+        EXPECTED
+    );
+    noop_has_no_proofs_and_v1_is_verified();
+    for mainnet in [false, true] {
+        keyring_mock::install().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let _home = StellarAgentHomeGuard::new(dir.path());
+        let mut profile = profile(mainnet);
+        profile.policy.engine = stellar_agent_core::profile::schema::PolicyEngineKind::Noop;
+        let pk = write_policy(&V1.replace(
+            "version = 1",
+            "version = 2\nsequence = 1\nengine = \"noop\"",
+        ));
+        let entry = &profile.policy_owner_key_id;
+        keyring_core::Entry::new(&entry.service, &entry.account)
+            .unwrap()
+            .set_password(&stellar_agent_core::profile::owner_key::encode_owner_public_key(&pk))
+            .unwrap();
+        let built = build_policy_engine(
+            &profile,
+            None,
+            "operator",
+            None,
+            pk,
+            OwnerKeySource::Keyring,
+        )
+        .unwrap();
+        assert!(built.verified.is_none());
+        assert!(built.enablement.is_none());
+        let destructive = stellar_agent_core::policy::ToolDescriptor::from_registration(
+            &stellar_agent_core::policy::McpToolRegistration {
+                name: "stellar_pay",
+                destructive_hint: true,
+                read_only_hint: false,
+                chain_id_required: false,
+                value_kind: stellar_agent_core::policy::ToolValueKind::ReadOnly,
+            },
+        );
+        let decision = built.engine.evaluate(
+            &destructive,
+            &serde_json::Value::Null,
+            &profile,
+            None,
+            None,
+            None,
+            None,
+            None,
+            1_800_000_000_000,
+        );
+        if mainnet {
+            assert!(matches!(
+                decision,
+                Err(stellar_agent_core::policy::PolicyError::NotImplemented)
+            ));
+        } else {
+            assert_eq!(
+                decision.unwrap(),
+                stellar_agent_core::policy::Decision::Allow
+            );
+        }
+        let path = default_policy_dir().unwrap().join("operator.toml");
+        for malformed in ["", "version = 2\nengine = \"noop\"\n"] {
+            std::fs::write(&path, malformed).unwrap();
+            assert!(
+                build_policy_engine(
+                    &profile,
+                    None,
+                    "operator",
+                    None,
+                    pk,
+                    OwnerKeySource::Keyring
+                )
+                .is_err()
+            );
+        }
+    }
 }
 #[test]
 #[serial]

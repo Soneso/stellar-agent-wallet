@@ -1,7 +1,10 @@
 //! Shared construction of hydrated, verified policy engines.
 
 use crate::policy_state::{PersistedWindowStore, WindowStoreError};
-use std::{path::Path, sync::Arc};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 use stellar_agent_core::{
     mainnet::{
         enablement::{EnablementRecord, read_enablement_nonce, verify_enablement},
@@ -28,6 +31,8 @@ pub struct BuiltPolicyEngine {
     pub verified: Option<VerifiedPolicy>,
     /// Installation proof, present only for a fully enabled mainnet selection.
     pub enablement: Option<EnablementRecord>,
+    /// The verified policy's path, absent for an ownerless Noop engine.
+    pub policy_path: Option<PathBuf>,
 }
 
 /// The operator's explicit profile selection, which installation verification
@@ -54,6 +59,9 @@ pub enum PolicyEngineBuildError {
     /// Policy parsing, signature, restrictions, or freshness failed.
     #[error("{code}: {0}", code = .0.wire_code())]
     Policy(PolicyError),
+    /// Enrolled owner discovery failed in the registered keyring backend.
+    #[error("{code}: {0}", code = .0.code())]
+    OwnerKeyring(stellar_agent_core::error::WalletError),
     /// The persisted window state could not be hydrated.
     #[error("policy-window-state store for profile '{store_name}' failed to load ({source})")]
     WindowState {
@@ -73,7 +81,7 @@ pub enum PolicyEngineBuildError {
 /// Hydrates the window state, verifies the policy, and verifies installation
 /// binding.
 ///
-/// A Noop engine returns before any owner key, directory, or file is used.
+/// An enrolled owner authorizes either engine through the signed policy.
 /// `selection` is the operator's explicit profile selection; `None` omits
 /// installation verification for readers that do not select a profile, and
 /// then no profile directory is resolved.
@@ -102,13 +110,37 @@ pub fn build_policy_engine(
     owner_key: [u8; 32],
     owner_source: OwnerKeySource,
 ) -> Result<BuiltPolicyEngine, PolicyEngineBuildError> {
+    let mut owner_key = owner_key;
     match profile.policy.engine {
         PolicyEngineKind::Noop => {
-            return Ok(BuiltPolicyEngine {
-                engine: Arc::new(NoopPolicyEngine),
-                verified: None,
-                enablement: None,
-            });
+            // A host with no registered backend holds no owner entry and serves read-only;
+            // a registered backend's failures refuse in `read_enrolled_owner`.
+            let _ = crate::keyring::ensure_platform_keyring_store();
+            let enrolled = stellar_agent_core::profile::owner_key::read_enrolled_owner(profile)
+                .map_err(PolicyEngineBuildError::OwnerKeyring)?;
+            match enrolled {
+                Some(owner) => owner_key = owner,
+                None => {
+                    if keyring_core::get_default_store().is_some()
+                        && stellar_agent_core::policy::pin::entry_present(
+                            &profile.policy_window_state_key_id,
+                        )
+                        .map_err(|error| PolicyEngineBuildError::Policy(error.into()))?
+                    {
+                        return Err(PolicyEngineBuildError::Policy(
+                            PolicyError::MissingOwnerKey {
+                                profile: store_name.to_owned(),
+                            },
+                        ));
+                    }
+                    return Ok(BuiltPolicyEngine {
+                        engine: Arc::new(NoopPolicyEngine),
+                        verified: None,
+                        enablement: None,
+                        policy_path: None,
+                    });
+                }
+            }
         }
         PolicyEngineKind::V1 => {}
         kind => return Err(PolicyEngineBuildError::UnsupportedEngineKind { kind }),
@@ -147,6 +179,14 @@ pub fn build_policy_engine(
         PinMode::Advance,
     )
     .map_err(PolicyEngineBuildError::Policy)?;
+    if profile.policy.engine == PolicyEngineKind::Noop {
+        return Ok(BuiltPolicyEngine {
+            engine: Arc::new(NoopPolicyEngine),
+            verified: None,
+            enablement: None,
+            policy_path: Some(path),
+        });
+    }
     let enablement = if cfg!(feature = "mainnet-write")
         && profile.chain_id.is_mainnet()
         && verified.mainnet().is_some()
@@ -171,5 +211,6 @@ pub fn build_policy_engine(
         engine: verified.engine(),
         verified: Some(verified),
         enablement,
+        policy_path: Some(path),
     })
 }

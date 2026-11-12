@@ -91,8 +91,8 @@ impl ProfileHome {
             .env_remove("STELLAR_AGENT_PROFILE")
             .env_remove("STELLAR_AGENT_CHAIN_ID")
             .env_remove("STELLAR_AGENT_RPC_URL")
-            // Keep the subprocess away from the login keychain. A Noop profile
-            // never reads a key, but the store is still registered at startup.
+            // Keep the subprocess away from the login keychain. The invalid
+            // headless key leaves no backend registered for this read-only host.
             .env("STELLAR_AGENT_KEYRING_BACKEND", "headless-env")
             .env(
                 "STELLAR_AGENT_HEADLESS_KEYRING_KEY",

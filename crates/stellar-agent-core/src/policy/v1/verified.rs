@@ -553,14 +553,16 @@ pub fn load_verified_policy(
             let lock = acquire_state_lock(load.window_path, load.profile)?;
             let scope = PinScope::for_profile(load.window_path, load.profile);
             let state = pin::read(&lock, &scope).map_err(PolicyError::from)?;
-            if advances(
+            let advance = advances(
                 &state,
                 body.sequence,
                 body.digest,
                 owner,
                 &signed.raw,
                 load.profile,
-            )? {
+            )?;
+            check_engine_selection(load, &signed.doc)?;
+            if advance {
                 let pin = Pin::new(body.sequence, body.digest, owner).map_err(PolicyError::from)?;
                 pin::write(&lock, &scope, &pin).map_err(PolicyError::from)?;
             }
@@ -574,11 +576,26 @@ pub fn load_verified_policy(
                     owner,
                     &signed.raw,
                     load.profile,
-                )
+                )?;
+                check_engine_selection(load, &signed.doc)
             })??;
         }
     }
     Ok(into_verified(load, signed.document, body, window_state))
+}
+
+/// Checks selection after freshness and before any pin advancement.
+fn check_engine_selection(load: &PolicyLoad<'_>, doc: &DocumentMut) -> Result<(), PolicyError> {
+    use crate::profile::schema::PolicyEngineKind;
+    if super::schema::signed_engine(doc)? != load.profile.policy.engine {
+        return Err(PolicyError::EngineSelectionUnsigned {
+            selection: match load.profile.policy.engine {
+                PolicyEngineKind::Noop => "noop",
+                PolicyEngineKind::V1 => "v1",
+            },
+        });
+    }
+    Ok(())
 }
 
 /// Runs a compare-only verified load and reports what it read: the verified
@@ -617,6 +634,7 @@ pub fn inspect_verified_policy(
             })?;
         pin = Some(state);
         checked?;
+        check_engine_selection(load, &signed.doc)?;
         Ok(body)
     });
     let SignedPolicy { document, doc, .. } = signed;

@@ -686,6 +686,31 @@ a positional name or `--profile`, without a default.
 | `resume <NAME>` | `profile resume default` | State-changing (writes one audit row and removes the halt marker). Operator-only. |
 | `sign-policy` | `profile sign-policy --profile default --secret-env WALLET_OWNER_SK` | State-changing (writes the policy file, atomic). Signs `<state_dir>/policies/<profile>.toml` (or `--file`) with the owner seed and writes the `[signature]` table. Older base64 entries refuse with `sign_policy.owner_key_older_form`; enroll the owner public key again. Mismatch errors identify enrolled bytes by fingerprint. Requires the enrolled seed, or `--previous-owner-secret-env VAR` to authorize the new owner with the previous seed, which must match the pinned owner, or the enrolled owner when no pin exists. |
 
+With an enrolled owner, the profile's `[policy] engine` must match the verified
+signed policy's top-level `engine`. An omitted signed selector means `v1`.
+Policy version 2 accepts `engine = "v1"` and `engine = "noop"`.
+Version 1 rejects an explicit selector.
+
+To switch from `v1` to `noop`, stop MCP and edit the version 2 policy file.
+Set top-level `engine = "noop"`, outside every table. Load the owner seed into
+`WALLET_OWNER_SK`, then sign:
+
+```bash
+stellar-agent profile sign-policy --profile <NAME> --secret-env WALLET_OWNER_SK
+unset WALLET_OWNER_SK
+```
+
+Set `engine = "noop"` in the profile's `[policy]` table, then restart MCP.
+To switch back, set the signed policy's top-level `engine = "v1"`, run the
+same signing command, set the profile selector to `v1`, and restart MCP.
+Each re-sign assigns a higher sequence from the body and pin.
+Signing writes the policy atomically and never advances the pin.
+Intermediate mismatches refuse with `policy.engine_selection_unsigned`;
+the message names the engine selection. Selection refusal never advances the pin.
+Both CLI and MCP verify the signature, scope, sequence, pin, and owner rotation.
+Authorized Noop supplies no runtime proofs and grants no mainnet write authority.
+Ownerless profiles keep their engine behavior; unreadable owner state refuses.
+
 `profile init` writes a new profile TOML with per-profile keyring references.
 The signer and nonce accounts start as `"default"` placeholders. It reports
 enrollment next steps, mints no key material, and emits no audit row.
@@ -955,26 +980,36 @@ The policy-file owner key is NOT rotated here — it is an ed25519 key enrolled 
 stellar-agent profile rotate-attestation-key default
 ```
 
-`profile reset-window-state` clears verified persisted policy-window history.
+`profile reset-window-state` clears verified ordinary accrual and preserves stored total-budget entries.
 Stop the MCP server and repair the audit log first. The command requires a usable keyed audit writer on every network,
 including testnet. It acquires that writer before the window-store lock and
 writes the reset row before minting a key, advancing the generation or replacing
 the store. A reset whose row cannot be written does not happen.
 
-An installation with a mainnet enablement nonce requires `--owner-secret-env <VAR>`
-in every build, whatever chain the profile file names. The variable holds the
-pinned policy owner's `S...` strkey; the flag takes its name, never the secret.
-The seed is unlocked before audit acquisition. The store reads the nonce and pin
-under its lock and verifies the owner's signature over the reset statement, so
-the requirement holds for every caller of the store. A pin alone does not
-require the flag.
-When supplied, the seed must match the pin even without an enablement nonce.
+A profile with a policy pin or an enrolled owner requires the owner's signature,
+including testnet and mainnet profiles without an enablement nonce.
+Supply `--owner-secret-env <VAR>`; the variable holds the owner's `S...` strkey.
+The flag takes the variable name, never the secret.
+The present pin selects the owner; without a pin, the enrolled owner authorizes
+a nonce-free reset. An enablement nonce always requires the pinned owner.
+Unreadable or malformed authority refuses. Only genuinely ownerless profiles
+retain unsigned resets.
+
+The seed is unlocked before audit acquisition. Under the window lock, the store
+reads authority and verifies the signature before the audit row or any mutation.
+Stop MCP before the ceremony, load the owner seed into `WALLET_OWNER_SK`, then run:
+
+```bash
+stellar-agent profile reset-window-state <NAME> --reason "clear ordinary accrual" --owner-secret-env WALLET_OWNER_SK
+unset WALLET_OWNER_SK
+```
 
 Missing owner authorization refuses with `profile.reset_window_state_owner_required`.
 A different seed refuses with `profile.reset_window_state_owner_mismatch`.
-A supplied seed without a pin refuses with `policy.pin_absent`; an unreadable
-pin refuses with `policy.pin_unusable`. A signature that does not verify over
+A supplied seed without a pin or enrolled owner refuses with `policy.pin_absent`.
+An unreadable pin refuses with `policy.pin_unusable`. A signature that does not verify over
 the reset statement refuses with `profile.reset_window_state_signature_invalid`.
+A request id matching the latest reset refuses with `policy.reset_consent_replayed`; run the reset again, and each run uses a fresh request id.
 These refusals write no reset row and change no store, generation or key.
 Owed accounting events the command delivers before the reset keep their rows
 and acknowledgements when the reset refuses. Seed input errors report
@@ -984,13 +1019,19 @@ and acknowledgements when the reset refuses. Seed input errors report
 With the flag, the row adds `owner_authorization`: a redacted owner,
 `store_sha256` (lowercase hex, or null for a missing file), `challenge` (64
 lowercase hex characters) and a signature of 128 lowercase hex characters. The
-pinned owner signs `window_reset_digest` over the profile, chain, store digest,
+selected owner signs `window_reset_digest` over the profile, chain, store digest,
 generation pair, bounded recorded reason, request id and challenge. The store
 draws a new challenge of 32 bytes under its lock for every reset, so a
 signature authorizes one reset of one store. The recorded reason is bounded to
 50 Unicode characters before signing, and the signed and recorded bytes are
 identical.
-A reset without the nonce or flag omits this field.
+An ownerless reset without the flag omits this field.
+The authenticated store retains one latest `reset_consent` record: request id,
+statement digest, owner key fingerprint, and store-clock consumption time.
+Each authorized reset replaces it; pruning retains it.
+A request id matching the latest record refuses.
+Reset preserves the total-budget entries the store holds and creates no epoch.
+The wiped-accrual report counts only removed ordinary entries.
 
 The reset requires a current tip anchor before and after its row. If repair
 fails, `audit.chain_key_unavailable` carries `audit.tip_anchor_unavailable`,

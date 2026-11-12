@@ -2361,6 +2361,7 @@ mod tests {
     use stellar_agent_test_support::keyring_mock;
     use tempfile::TempDir;
 
+    use super::super::reset_test::{owner_of, signed_by};
     use super::super::store::{
         RETENTION_MS, ResetConsent, ResetError, ResetOutcome, Settlement, SubmissionHold,
         WIRE_VERSION_POLICY_AUTHORITY, deliver_accounting_expiries,
@@ -2463,7 +2464,7 @@ mod tests {
             pin::write_for_test(
                 &lock,
                 &PinScope::for_profile(self.store.path(), &self.profile),
-                &Pin::new(sequence, digest, [1; 32]).unwrap(),
+                &Pin::new(sequence, digest, owner_of(11)).unwrap(),
             )
             .unwrap();
         }
@@ -2589,8 +2590,7 @@ mod tests {
             fs::read(self.store.path()).unwrap()
         }
 
-        /// Resets under the fixture's name without an owner signature; the
-        /// pin names an owner and no enablement nonce exists.
+        /// Resets under the fixture's name with its pinned owner's signature.
         fn reset(&self, now_ms: u64) -> Result<ResetOutcome, ResetError<()>> {
             self.store.reset(
                 &self.profile,
@@ -2598,7 +2598,7 @@ mod tests {
                 now_ms,
                 "repair",
                 "reset-request",
-                |_| Ok(ResetConsent::default()),
+                |row| Ok(signed_by(11, row)),
                 |_, _| Ok(()),
             )
         }

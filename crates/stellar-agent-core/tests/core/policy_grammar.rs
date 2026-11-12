@@ -61,6 +61,26 @@ fn instant() -> u64 {
 /// One week in milliseconds.
 const WEEK_MS: u64 = 7 * 86_400_000;
 
+#[test]
+fn window_grammar_keeps_five_values_and_rejects_30d() {
+    use stellar_agent_core::policy::v1::criteria::per_period_cap::Window;
+    for (name, seconds) in [
+        ("1m", 60),
+        ("5m", 300),
+        ("1h", 3600),
+        ("1d", 86400),
+        ("1w", 604800),
+    ] {
+        assert_eq!(Window::parse(name).unwrap().as_secs(), seconds);
+    }
+    assert!(Window::parse("30d").is_err());
+    for zero in ["0", "0s", "0m", "0h", "0d", "0w"] {
+        assert!(Window::parse(zero).is_err());
+    }
+    let total = StateKey::new("operator", 1, "total:native", 0);
+    assert_eq!(total.window_secs(), 0);
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Documents
 // ─────────────────────────────────────────────────────────────────────────────

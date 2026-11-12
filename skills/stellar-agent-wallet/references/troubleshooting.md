@@ -134,6 +134,7 @@ operation, or unavailable admitted context. CLI missing engine, verified policy,
 or enablement is an entry refusal with the prerequisite named.
 CLI engine construction preserves `profile.mainnet_enablement_invalid`,
 `policy.window_chain_mismatch` and `policy.window_chain_unverifiable`.
+Enrolled Noop owner discovery preserves keyring codes.
 Other failures use `policy.engine_unavailable` or `trustline.policy_engine_unavailable`.
 Evaluation failure uses `policy.engine_required`; unknown decisions use
 `policy.unexpected_decision`. Policy denials retain `policy.deny.*`.
@@ -296,12 +297,15 @@ Setup and policy cannot admit excluded signing surfaces.
 ### Policy and setup diagnostics
 
 These are policy-library and setup codes. CLI engine construction preserves
-`profile.mainnet_enablement_invalid`, `policy.window_chain_mismatch` and
-`policy.window_chain_unverifiable`. Other build failures use `policy.engine_unavailable`
-or `trustline.policy_engine_unavailable`.
+`policy.engine_selection_unsigned`, `profile.mainnet_enablement_invalid`,
+`policy.window_chain_mismatch` and
+`policy.window_chain_unverifiable`. Enrolled Noop owner discovery preserves keyring codes.
+Other build failures use `policy.engine_unavailable` or `trustline.policy_engine_unavailable`.
 
 | Code | Meaning or remedy |
 |---|---|
+| `policy.engine_selection_unsigned` | The profile engine selection lacks matching owner authorization. Sign the V2 `engine` selector with `profile sign-policy --profile <NAME> --secret-env <VAR>`, then set the matching profile selector and restart MCP. Both `v1` and `noop` require this ceremony. |
+| `profile.reset_window_state_owner_required` | A pin or enrolled owner requires an owner signature, including without mainnet enablement. Run reset with `--owner-secret-env <VAR>`. Use the pinned owner, or the enrolled owner when no pin exists. |
 | `policy.engine_required` | Noop refuses destructive mainnet policy decisions. Surface entry checks can refuse earlier. |
 | `policy.engine_unavailable` | The policy engine cannot be built. Enabled mainnet refuses `test_owner_key` before pin advancement. |
 | `policy.mainnet_table_on_testnet` | The policy contains `[mainnet]` on a testnet profile. |
@@ -332,7 +336,8 @@ or `trustline.policy_engine_unavailable`.
 | `policy.window_chain_mismatch` | The profile network disagrees with authenticated spending state. Restore the profile's network, or create a profile under a new name. |
 | `policy.window_chain_unverifiable` | Spending state lacks complete authenticated network provenance. No verb recovers such state in this release; create a profile under a new name. |
 | `profile.reset_window_state_open_authorizations` | Effective open authorizations prevent reset. |
-| `profile.reset_window_state_signature_invalid` | The owner's signature does not verify over this reset. Run the reset again with the pinned owner's seed in `--owner-secret-env`. |
+| `profile.reset_window_state_signature_invalid` | The owner's signature does not verify over this reset. Run the reset again with the selected owner's seed in `--owner-secret-env`. |
+| `policy.reset_consent_replayed` | The latest reset already consumes this request id. Run the reset again; each run signs a fresh reset statement with a fresh request id. |
 | `approval.presence_required` | Mainnet consent requires a verified assertion from an approval credential in the owner-signed policy; use the local passkey approval page. |
 | `approval.presence_policy_unavailable` | The current owner-signed mainnet policy cannot be verified, lists no approval credential, or changed since the consent was recorded. |
 | `approval.listener_policy_stale` | The approval listener serves an earlier owner-signed mainnet policy; restart it under the current policy. |

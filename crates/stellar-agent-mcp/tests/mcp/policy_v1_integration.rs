@@ -99,6 +99,171 @@ fn balances_args_value() -> serde_json::Value {
     })
 }
 
+#[test]
+#[serial]
+fn keyringless_profiles_serve_reads_and_refuse_signing() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::process::{Command, Stdio};
+
+    for named in [false, true] {
+        let home = TempDir::new().unwrap();
+        let mut command = Command::new(env!("CARGO_BIN_EXE_stellar-agent-mcp"));
+        if named {
+            std::fs::create_dir(home.path().join("profiles")).unwrap();
+            std::fs::write(
+                home.path().join("profiles/readonly.toml"),
+                stellar_agent_test_support::profile_fixtures::noop_profile_toml(
+                    "readonly",
+                    "stellar:testnet",
+                    "https://testnet.example.invalid",
+                ),
+            )
+            .unwrap();
+            command.args(["--profile", "readonly"]);
+        }
+        let mut child = command
+            .env("STELLAR_AGENT_HOME", home.path())
+            .env_remove("STELLAR_AGENT_PROFILE")
+            .env_remove("STELLAR_AGENT_CHAIN_ID")
+            .env_remove("STELLAR_AGENT_RPC_URL")
+            .env("STELLAR_AGENT_KEYRING_BACKEND", "headless-env")
+            .env("STELLAR_AGENT_HEADLESS_KEYRING_KEY", "invalid-key")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+        let mut stdout = BufReader::new(child.stdout.take().unwrap());
+        let mut call = |message: serde_json::Value| {
+            writeln!(stdin, "{message}").unwrap();
+            stdin.flush().unwrap();
+            let mut line = String::new();
+            assert!(
+                stdout.read_line(&mut line).unwrap() > 0,
+                "server starts without a backend"
+            );
+            serde_json::from_str::<serde_json::Value>(&line).unwrap()
+        };
+        let init = call(serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": { "protocolVersion": "2024-11-05", "capabilities": {},
+                "clientInfo": {"name": "readonly-test", "version": "1"} }
+        }));
+        assert!(
+            init["result"]["capabilities"]["tools"].is_object(),
+            "{init}"
+        );
+        let read = call(serde_json::json!({
+            "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": { "name": "stellar_sep43_get_network", "arguments": {} }
+        }));
+        let envelope: serde_json::Value =
+            serde_json::from_str(read["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(envelope["data"]["networkPassphrase"], TESTNET_PASSPHRASE);
+        let signed = call(serde_json::json!({
+            "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+            "params": { "name": "stellar_sep43_sign_message",
+                "arguments": { "chain_id": "stellar:testnet", "message": "read-only host" } }
+        }));
+        let envelope: serde_json::Value =
+            serde_json::from_str(signed["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            envelope["error"]["code"], "auth.keyring_platform_error",
+            "{envelope}"
+        );
+        drop(stdin);
+        assert!(child.wait_with_output().unwrap().status.success());
+    }
+}
+
+#[test]
+#[serial]
+fn engine_selection_refuses_unreadable_owner_state() {
+    stellar_agent_test_support::keyring_mock::install().unwrap();
+    let mut profile = build_v1_profile("unreadable_selection");
+    profile.policy.engine = PolicyEngineKind::Noop;
+    let entry = &profile.policy_owner_key_id;
+    stellar_agent_test_support::keyring_mock::inject_error(
+        &entry.service,
+        &entry.account,
+        keyring_core::Error::NoStorageAccess(Box::new(std::io::Error::other("locked"))),
+    )
+    .unwrap();
+    let error = WalletServer::new_with_policy_dir_for_test(profile, TempDir::new().unwrap().path())
+        .err()
+        .unwrap();
+    let stellar_agent_core::policy::BuildRegistryError::OwnerKeyringReadFailed { code, .. } = error
+    else {
+        panic!("typed keyring error required: {error}");
+    };
+    assert_eq!(code, "auth.keyring_platform_error");
+}
+
+#[test]
+#[serial]
+fn unsigned_engine_selection_refuses_before_payment() {
+    let home = TempDir::new().unwrap();
+    let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
+    let suffix = "engine_selection";
+    let name = test_profile_name(suffix);
+    let (key, owner) = fresh_keypair();
+    install_owner_key_in_mock_keyring(suffix, &owner);
+    let mut profile = build_v1_profile(suffix);
+    let dir = TempDir::new().unwrap();
+    let body = format!(
+        "version = 2\nscope = \"profile:{name}\"\nsequence = 1\n[[rules]]\nmatch = {{tool = \"stellar_pay\", chain = \"*\"}}\ncriteria = [{{kind = \"per_tx_cap\", asset = \"native\", max_stroops = \"1\"}}]\ndecision = \"allow\"\n"
+    );
+    write_policy_file(
+        &dir,
+        &format!("{name}.toml"),
+        &sign_policy_toml(&body, &key, "owner"),
+    );
+    WalletServer::new_with_policy_dir_for_test(profile.clone(), dir.path()).unwrap();
+    profile.policy.engine = PolicyEngineKind::Noop;
+    let error = WalletServer::new_with_policy_dir_for_test(profile.clone(), dir.path())
+        .err()
+        .unwrap();
+    let stellar_agent_core::policy::BuildRegistryError::PolicyFileLoadFailed { source, .. } = error
+    else {
+        panic!("typed policy error required");
+    };
+    assert_eq!(source.wire_code(), "policy.engine_selection_unsigned");
+    assert!(source.to_string().contains("engine selection"));
+    assert!(
+        !stellar_agent_core::profile::schema::default_policy_window_state_path_for(&name).exists()
+    );
+    let authorized = body.replace("sequence = 1", "sequence = 2\nengine = \"noop\"");
+    write_policy_file(
+        &dir,
+        &format!("{name}.toml"),
+        &sign_policy_toml(&authorized, &key, "owner"),
+    );
+    WalletServer::new_with_policy_dir_for_test(profile, dir.path()).unwrap();
+}
+
+#[test]
+#[serial]
+fn engine_selection_refusal_preserves_typed_code() {
+    unsigned_engine_selection_refuses_before_payment();
+}
+
+#[test]
+#[serial]
+fn engine_authorization_keeps_unrelated_behavior() {
+    stellar_agent_test_support::keyring_mock::install().unwrap();
+    let mut profile = Profile::builder_testnet("svc", "acct", "n-svc", "n-acct")
+        .with_noop_engine()
+        .build();
+    profile.policy_owner_key_id.service = "custom-owner-coordinate".into();
+    assert!(
+        stellar_agent_core::profile::owner_key::read_enrolled_owner(&profile)
+            .unwrap()
+            .is_none()
+    );
+    WalletServer::new(profile).unwrap();
+}
+
 /// Builds a testnet `WalletServer` with its policy engine swapped for the
 /// supplied [`PolicyEngineV1`].  Substitution uses the feature-gated
 /// `set_policy_engine_for_test` helper.

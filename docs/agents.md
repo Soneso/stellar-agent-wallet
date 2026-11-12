@@ -183,8 +183,9 @@ A stale startup binding reports `network.mainnet_write_forbidden` with
 instead names its missing prerequisite. Unsupported tools and contexts use the
 same wire code. The version marker reports compiled state, not setup completion.
 
-CLI engine construction preserves enablement errors and wraps other failures as
-`policy.engine_unavailable` or `trustline.policy_engine_unavailable`.
+CLI engine construction preserves enablement errors and
+`policy.engine_selection_unsigned`. Enrolled Noop owner discovery preserves keyring codes.
+Other failures use `policy.engine_unavailable` or `trustline.policy_engine_unavailable`.
 Evaluation failure uses `policy.engine_required`; unknown decisions use
 `policy.unexpected_decision`. Policy denials retain `policy.deny.*`.
 
@@ -305,11 +306,18 @@ Current limits of the OS-user boundary:
   no owner continuity records. Replacing an owner protected by these records
   requires a policy signed by the new owner with a rotation statement signed by
   the pinned owner.
-- The profile's `[policy] engine` and `policy_owner_key_id` fields are unsigned.
+- The profile's `[policy] engine` must match its owner-signed V2 policy selector
+  when an owner is enrolled. An omitted signed selector means `v1`.
+  Switching either direction requires `profile sign-policy --secret-env <VAR>`,
+  followed by the matching profile edit and an MCP restart.
+  A mismatch refuses with `policy.engine_selection_unsigned`.
+  The profile's `policy_owner_key_id` field remains unsigned.
 - The halt marker has no MAC.
-- `profile reset-window-state` requires no owner signature until
-  `profile enable-mainnet` has run. An enabled installation requires the pinned
-  owner's authorization through `--owner-secret-env`.
+- `profile reset-window-state` requires the owner's signature whenever a pin
+  or enrolled owner exists, including testnet and nonce-free mainnet profiles.
+  Supply `--owner-secret-env <VAR>` with the pinned owner's seed, or the
+  enrolled owner's seed when no pin exists. Only genuine ownerless state
+  permits unsigned reset. Unreadable authority refuses.
 - These rules bind the wallet's commands. Deleting or rewriting the pin, the
   enablement nonce, or the owner entry outside the wallet rests on the platform
   keyring.

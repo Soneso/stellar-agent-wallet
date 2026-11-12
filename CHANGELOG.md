@@ -19,6 +19,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Policy credentials authorize login and decisions; counters update once per verified assertion.
   One-shot consent prints a secret-free signed link, needs no display, and closes synchronously.
   Policy signing and certificate replacement require a listener restart.
+- Window reset requires owner consent whenever a pin or enrolled owner exists,
+  including testnet and nonce-free mainnet profiles. It records the verified
+  signature and retains one latest consent record. Stored total-budget entries
+  survive reset exactly; reset creates no epoch.
+- V2 policies accept a signed top-level `engine` selector, `v1` or `noop`.
+  Enrolled profiles require a matching signed selection through CLI and MCP.
+  Sign each switch with the owner seed, update the profile, and restart MCP.
+  Omission means `v1`; mismatches refuse with `policy.engine_selection_unsigned`.
 - `scripts/deploy/` holds the scripts that run the mainnet wallet as a
   dedicated `stellar-agent` account with its platform keyring. They are a root
   bootstrap, three `sudo -u` wrappers, a sudoers source, and one validation

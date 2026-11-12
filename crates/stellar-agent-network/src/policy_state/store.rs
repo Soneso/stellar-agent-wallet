@@ -382,6 +382,7 @@ fn select_wire_version(wire: &WireFile, committed: Option<u32>) -> u32 {
     if committed.is_some_and(|version| version >= WIRE_VERSION_OPERATIONS)
         || operations::has_content(wire)
         || super::approvals::has_content(wire)
+        || wire.reset_consent.is_some()
     {
         WIRE_VERSION_OPERATIONS
     } else if wire
@@ -1175,6 +1176,9 @@ pub(super) struct WireFile {
     /// Durable approvals; absent while none is retained.
     #[serde(default, skip_serializing_if = "super::approvals::section_absent")]
     pub(super) approvals: Option<super::approvals::ApprovalsSection>,
+    /// The latest verified owner authorization consumed by a reset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) reset_consent: Option<super::reset_consent::ResetConsentRecord>,
     /// The lowest admissible observed ledger, raised when a release row
     /// with a ledger bound is removed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1547,7 +1551,7 @@ impl ResetRecord<'_> {
         pin::read(self.guard, &self.scope)
     }
 
-    /// The digest the pinned owner signs to authorize this reset.
+    /// The digest the selected owner signs to authorize this reset.
     #[must_use]
     pub fn statement_digest(&self) -> [u8; 32] {
         window_reset_digest(&WindowResetStatement {
@@ -1565,33 +1569,36 @@ impl ResetRecord<'_> {
 
 /// Verifies the consent a reset presents, under the reset's held lock.
 ///
-/// The enablement nonce is read once. Without a signature, a nonce refuses
-/// and its absence admits the reset. A presented signature is verified with
-/// or without a nonce: the pin must name the signing owner, and strict
-/// Ed25519 verification must accept the signature over the statement digest.
+/// A nonce requires the pinned owner. Without a nonce, the pin takes
+/// precedence over the enrolled owner. Only absent authority permits unsigned consent.
 fn verify_reset_consent(
     profile: &Profile,
     record: &ResetRecord<'_>,
     consent: &ResetConsent,
-) -> Result<(), WindowStoreError> {
+) -> Result<Option<super::reset_consent::VerifiedResetConsent>, WindowStoreError> {
     let enabled = stellar_agent_core::mainnet::enablement::has_enablement_nonce(profile)
         .map_err(WindowStoreError::ResetEnablementUnreadable)?;
+    if enabled && consent.owner_signature.is_none() {
+        return Err(WindowStoreError::ResetOwnerRequired);
+    }
+    let authority = match record.pin().map_err(WindowStoreError::ResetPinUnreadable)? {
+        PinState::Present(pin) => Some(pin.owner()),
+        PinState::Absent if enabled => return Err(WindowStoreError::ResetPinAbsent),
+        PinState::Absent => stellar_agent_core::profile::owner_key::read_enrolled_owner(profile)
+            .map_err(WindowStoreError::ResetOwnerUnreadable)?,
+    };
     let Some(owner_signature) = consent.owner_signature else {
-        return if enabled {
+        return if authority.is_some() {
             Err(WindowStoreError::ResetOwnerRequired)
         } else {
-            Ok(())
+            Ok(None)
         };
     };
-    let pin = match record.pin().map_err(WindowStoreError::ResetPinUnreadable)? {
-        PinState::Present(pin) => pin,
-        PinState::Absent => return Err(WindowStoreError::ResetPinAbsent),
-    };
-    let pinned = pin.owner();
-    if pinned != owner_signature.owner {
+    let owner = authority.ok_or(WindowStoreError::ResetPinAbsent)?;
+    if owner != owner_signature.owner {
         return Err(WindowStoreError::ResetOwnerMismatch {
             presented: owner_signature.owner,
-            pinned,
+            pinned: owner,
         });
     }
     stellar_agent_core::policy::v1::signature::verify(
@@ -1600,7 +1607,10 @@ fn verify_reset_consent(
         &owner_signature.owner,
         record.profile_name,
     )
-    .map_err(|_| WindowStoreError::ResetSignatureInvalid)
+    .map_err(|_| WindowStoreError::ResetSignatureInvalid)?;
+    Ok(Some(super::reset_consent::VerifiedResetConsent::new(
+        record, owner,
+    )))
 }
 
 /// Failure of the recorded reset ceremony.
@@ -3237,7 +3247,13 @@ impl PersistedWindowStore {
             scope: PinScope::for_profile(&self.path, profile),
         };
         let consent = authorize(&statement).map_err(ResetError::Recorder)?;
-        verify_reset_consent(profile, &statement, &consent).map_err(before_mint)?;
+        let verified = verify_reset_consent(profile, &statement, &consent).map_err(before_mint)?;
+        let reset_consent = super::reset_consent::ResetConsents::on_reset(
+            snapshot.original.as_ref(),
+            verified,
+            crate::policy_state::store::now_ms().map_err(before_mint)?,
+        )
+        .map_err(before_mint)?;
         record(&statement, &consent).map_err(ResetError::Recorder)?;
         let accrual = snapshot.accrual;
         let mut minted = false;
@@ -3260,6 +3276,18 @@ impl PersistedWindowStore {
             };
             let successor = WireFile {
                 chain_scope: Some(ChainScope::for_chain(profile.chain_id)),
+                entries: snapshot
+                    .original
+                    .as_ref()
+                    .map(|wire| {
+                        wire.entries
+                            .iter()
+                            .filter(|bucket| is_total_budget_bucket(bucket))
+                            .cloned()
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                reset_consent,
                 accounting_expiries: snapshot.retained_expiries,
                 authorizations: snapshot.retained_authorizations,
                 operations: retained_operations,
@@ -4775,6 +4803,7 @@ fn check_snapshot(wire: &WireFile) -> Result<(), WindowStoreError> {
     validate_signed_intents(wire)?;
     operations::Operations::validate(wire)?;
     super::approvals::Approvals::validate(wire)?;
+    super::reset_consent::ResetConsents::validate(wire)?;
     ledger::validate(wire)
 }
 
@@ -5274,6 +5303,7 @@ pub(super) fn prune_stale(wire: &mut WireFile, now_ms: u64) {
     ledger::prune_history(wire, cutoff, now_ms);
     operations::Operations::prune(wire, now_ms);
     super::approvals::Approvals::prune(wire, now_ms);
+    super::reset_consent::ResetConsents::prune(wire, now_ms);
 }
 
 /// Whether the receipt for `envelope_hash` already records an outcome the
@@ -6201,8 +6231,15 @@ fn bounded_reset_bucket(bucket: &str) -> String {
         .collect()
 }
 
+fn is_total_budget_bucket(bucket: &WireBucket) -> bool {
+    bucket.window_secs == 0 && bucket.bucket.starts_with("total:")
+}
+
 fn snapshot_accrual(wire: &WireFile, now_ms: u64, accrual: &mut WipedAccrualRecord) {
     for bucket in &wire.entries {
+        if is_total_budget_bucket(bucket) {
+            continue;
+        }
         let mut snapshot = WipedBucket {
             scope_specificity: bucket.scope_specificity,
             bucket: bounded_reset_bucket(&bucket.bucket),
@@ -10905,29 +10942,7 @@ mod tests {
         }
     }
 
-    /// The owner signing key for `seed`.
-    fn owner_key(seed: u8) -> ed25519_dalek::SigningKey {
-        ed25519_dalek::SigningKey::from_bytes(&[seed; 32])
-    }
-
-    /// The owner public key for `seed`.
-    fn owner_of(seed: u8) -> [u8; 32] {
-        owner_key(seed).verifying_key().to_bytes()
-    }
-
-    /// A consent signed by the owner of `seed` over `row`'s statement.
-    fn signed_by(seed: u8, row: &ResetRecord<'_>) -> ResetConsent {
-        let key = owner_key(seed);
-        ResetConsent {
-            owner_signature: Some(OwnerResetSignature {
-                owner: key.verifying_key().to_bytes(),
-                signature: stellar_agent_core::policy::v1::signature::sign(
-                    &row.statement_digest(),
-                    &key,
-                ),
-            }),
-        }
-    }
+    use super::super::reset_test::{owner_of, signed_by};
 
     /// The statement fields a reset presents to its callbacks.
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -11291,7 +11306,7 @@ mod tests {
         f.pin_owner(owner_of(0xa1));
         f.seal(&reset_wire());
         let mut challenges = Vec::new();
-        for _ in 0..2 {
+        for request in ["reset-first", "reset-second"] {
             let mut returned = None;
             let mut received = Vec::new();
             let outcome = f
@@ -11301,7 +11316,7 @@ mod tests {
                     owner_name(&f.profile),
                     100_000,
                     "repair",
-                    "reset-request",
+                    request,
                     |row| {
                         let consent = signed_by(0xa1, row);
                         returned = Some(consent);
@@ -11351,6 +11366,973 @@ mod tests {
                 }],
             }],
             ..WireFile::default()
+        }
+    }
+
+    fn enrolled_reset_owner(f: &ResetFixture, seed: u8) {
+        put_raw(
+            &f.profile.policy_owner_key_id,
+            &stellar_agent_core::profile::owner_key::encode_owner_public_key(&owner_of(seed)),
+        );
+    }
+
+    fn authorized_reset(
+        f: &ResetFixture,
+        request: &str,
+        recorder: impl FnOnce(&ResetRecord<'_>, &ResetConsent) -> Result<(), ()>,
+    ) -> Result<ResetOutcome, ResetError<()>> {
+        f.store.reset(
+            &f.profile,
+            owner_name(&f.profile),
+            100_000,
+            "repair",
+            request,
+            |row| Ok(signed_by(0xa1, row)),
+            recorder,
+        )
+    }
+
+    #[test]
+    #[serial]
+    fn owner_reset_without_nonce_requires_signature() {
+        for present_pin in [false, true] {
+            for populated in [false, true] {
+                let f = ResetFixture::new();
+                if populated {
+                    f.seal(&reset_wire());
+                }
+                enrolled_reset_owner(&f, 0xa1);
+                if present_pin {
+                    f.pin_owner(owner_of(0xa1));
+                }
+                let (error, _) =
+                    refused_reset(&f.store, &f.profile, owner_name(&f.profile), unsigned);
+                assert!(matches!(error, WindowStoreError::ResetOwnerRequired));
+                assert_eq!(
+                    error.to_string(),
+                    "the window state reset requires the policy owner's signature"
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn mainnet_pinned_reset_without_nonce_requires_signature() {
+        for populated in [false, true] {
+            let f = ResetFixture::mainnet();
+            if populated {
+                f.seal(&reset_wire());
+            }
+            f.pin_owner(owner_of(0xa1));
+            let (error, _) = refused_reset(&f.store, &f.profile, owner_name(&f.profile), unsigned);
+            assert!(matches!(error, WindowStoreError::ResetOwnerRequired));
+            assert!(error.to_string().contains("owner's signature"));
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn owner_reset_selects_pin_then_enrolled_owner_and_refuses_unreadable_state() {
+        for pinned in [false, true] {
+            let f = ResetFixture::new();
+            enrolled_reset_owner(&f, if pinned { 0xb2 } else { 0xa1 });
+            if pinned {
+                f.pin_owner(owner_of(0xa1));
+            }
+            authorized_reset(&f, "selected-owner", |_, _| Ok(())).unwrap();
+        }
+        let f = ResetFixture::new();
+        f.reset();
+        assert!(
+            f.store
+                .read_for_inspection(&f.profile)
+                .unwrap()
+                .unwrap()
+                .reset_consent
+                .is_none()
+        );
+        for bad_pin in [false, true] {
+            for malformed in [false, true] {
+                let f = ResetFixture::new();
+                let coordinate = if bad_pin {
+                    PinScope::for_profile(&f.store.path, &f.profile).pin_entry_ref()
+                } else {
+                    f.profile.policy_owner_key_id.clone()
+                };
+                if malformed {
+                    put_raw(&coordinate, "malformed authority");
+                } else {
+                    keyring_mock::inject_error(
+                        &coordinate.service,
+                        &coordinate.account,
+                        keyring_core::Error::NoStorageAccess(Box::new(std::io::Error::other(
+                            "locked",
+                        ))),
+                    )
+                    .unwrap();
+                }
+                let (error, _) =
+                    refused_reset(&f.store, &f.profile, owner_name(&f.profile), unsigned);
+                assert!(matches!(
+                    error,
+                    WindowStoreError::ResetOwnerUnreadable(_)
+                        | WindowStoreError::ResetPinUnreadable(_)
+                ));
+            }
+        }
+        let f = ResetFixture::new();
+        enrolled_reset_owner(&f, 0xa1);
+        f.enable();
+        let (error, _) = refused_reset(&f.store, &f.profile, owner_name(&f.profile), |row| {
+            signed_by(0xa1, row)
+        });
+        assert!(matches!(error, WindowStoreError::ResetPinAbsent));
+    }
+
+    #[test]
+    #[serial]
+    fn owner_reset_rejects_wrong_key_invalid_signature_and_replay() {
+        reset_consent_refusals_change_nothing();
+        a_consent_does_not_transfer_between_first_use_stores();
+        let f = ResetFixture::new();
+        enrolled_reset_owner(&f, 0xa1);
+        authorized_reset(&f, "reset-request", |_, _| Ok(())).unwrap();
+        let (error, _) = refused_reset(&f.store, &f.profile, owner_name(&f.profile), |row| {
+            signed_by(0xa1, row)
+        });
+        assert!(matches!(error, WindowStoreError::ResetConsentReplayed));
+        assert!(
+            error
+                .to_string()
+                .starts_with("policy.reset_consent_replayed:")
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn reset_consent_replaces_latest_record_and_survives_pruning() {
+        let clock = crate::mainnet::clock::set_now_ms_for_test(100_000);
+        for mainnet in [false, true] {
+            let f = if mainnet {
+                ResetFixture::mainnet()
+            } else {
+                ResetFixture::new()
+            };
+            enrolled_reset_owner(&f, 0xa1);
+            for (request, time) in [("first-reset", 100_000), ("next-reset", 200_000)] {
+                clock.set(time);
+                let mut digest = None;
+                authorized_reset(&f, request, |row, consent| {
+                    digest = Some(row.statement_digest());
+                    assert_eq!(consent.owner_signature.unwrap().owner, owner_of(0xa1));
+                    Ok(())
+                })
+                .unwrap();
+                let mut wire = f.store.read_for_inspection(&f.profile).unwrap().unwrap();
+                let record = wire.reset_consent.clone().unwrap();
+                assert_eq!(record.request_id, request);
+                assert_eq!(
+                    record.statement_digest,
+                    stellar_agent_core::hex::encode(&digest.unwrap())
+                );
+                assert_eq!(
+                    record.owner_key_fingerprint,
+                    stellar_agent_core::profile::owner_key::owner_key_fingerprint(&owner_of(0xa1))
+                );
+                assert_eq!(record.consumed_at_ms, time);
+                assert_eq!(wire.version, 11);
+                prune_stale(&mut wire, u64::MAX);
+                assert_eq!(wire.reset_consent, Some(record));
+                assert!(serde_json::to_value(&wire).unwrap()["reset_consent"].is_object());
+            }
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn owner_reset_audit_failure_changes_no_state() {
+        for mainnet in [false, true] {
+            for populated in [false, true] {
+                let f = if mainnet {
+                    ResetFixture::mainnet()
+                } else {
+                    ResetFixture::new()
+                };
+                if populated {
+                    let mut wire = reset_wire();
+                    wire.admissible_floor_ledger = Some(500);
+                    wire.admissible_floor_close_time_ms = Some(600);
+                    f.seal(&wire);
+                }
+                enrolled_reset_owner(&f, 0xa1);
+                let before = fs::read(&f.store.path).ok();
+                let key = get_raw(&f.profile.policy_window_state_key_id);
+                let generation = get_raw(&generation_entry_ref(&f.profile));
+                let result = authorized_reset(&f, "failed-audit", |_, _| {
+                    assert_eq!(fs::read(&f.store.path).ok(), before);
+                    assert_eq!(get_raw(&f.profile.policy_window_state_key_id), key);
+                    assert_eq!(get_raw(&generation_entry_ref(&f.profile)), generation);
+                    Err(())
+                });
+                assert!(matches!(result, Err(ResetError::Recorder(()))));
+                assert_eq!(fs::read(&f.store.path).ok(), before);
+                assert_eq!(get_raw(&f.profile.policy_window_state_key_id), key);
+                assert_eq!(get_raw(&generation_entry_ref(&f.profile)), generation);
+                authorized_reset(&f, "first-committed", |_, _| Ok(())).unwrap();
+                let committed = fs::read(&f.store.path).unwrap();
+                let result = authorized_reset(&f, "next-failed", |_, _| Err(()));
+                assert!(matches!(result, Err(ResetError::Recorder(()))));
+                assert_eq!(fs::read(&f.store.path).unwrap(), committed);
+            }
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn owner_reset_serializes_authority_and_mutation() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        let f = ResetFixture::new();
+        let seen = Arc::new(AtomicBool::new(false));
+        let observed = seen.clone();
+        let path = f.store.path.clone();
+        let entry = f.profile.policy_window_state_key_id.clone();
+        let coordinate = &f.profile.policy_owner_key_id;
+        keyring_mock::install_with_read_hooks(vec![keyring_mock::ReadHook::new(
+            &coordinate.service,
+            &coordinate.account,
+            Arc::new(move || {
+                assert!(WindowStoreLock::acquire_for(&path, &entry).is_err());
+                observed.store(true, Ordering::SeqCst);
+            }),
+        )])
+        .unwrap();
+        enrolled_reset_owner(&f, 0xa1);
+        authorized_reset(&f, "locked-authority", |_, _| {
+            assert!(
+                WindowStoreLock::acquire_for(&f.store.path, &f.profile.policy_window_state_key_id)
+                    .is_err()
+            );
+            assert!(!f.store.path.exists());
+            Ok(())
+        })
+        .unwrap();
+        assert!(seen.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    #[serial]
+    fn owner_reset_preserves_stored_totals_and_creates_no_epoch() {
+        for mainnet in [false, true] {
+            let f = if mainnet {
+                ResetFixture::mainnet()
+            } else {
+                ResetFixture::new()
+            };
+            let mut wire = reset_wire();
+            let mut ordinary = wire.entries[0].clone();
+            ordinary.bucket =
+                "total:GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF".into();
+            wire.entries.push(ordinary.clone());
+            let mut total = wire.entries[0].clone();
+            total.bucket = "total:native".into();
+            total.window_secs = 0;
+            total.records[0].ts_ms = 1;
+            total.records[0].amount = 91;
+            total.records.push(WireRecord {
+                ts_ms: 100_000,
+                amount: 93,
+                ..total.records[0].clone()
+            });
+            wire.entries.push(total.clone());
+            f.seal(&wire);
+            enrolled_reset_owner(&f, 0xa1);
+            let outcome = authorized_reset(&f, "preserve-total", |row, _| {
+                assert_eq!(row.accrual.entry_count, 2);
+                assert_eq!(row.accrual.buckets.len(), 2);
+                assert_eq!(row.accrual.buckets[0].confirmed_total, 7);
+                assert!(row.accrual.buckets.iter().any(|bucket| {
+                    bucket.bucket == ordinary.bucket && bucket.window_secs == ordinary.window_secs
+                }));
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(outcome.accrual.buckets[0].bucket, "native");
+            let key =
+                crate::keyring::load_hmac_key_32(&f.profile.policy_window_state_key_id).unwrap();
+            let bytes = fs::read(&f.store.path).unwrap();
+            let committed = f.store.verify_with_key(&key, &bytes).unwrap();
+            assert_eq!(
+                serde_json::to_value(&committed.entries).unwrap(),
+                serde_json::to_value(vec![total]).unwrap()
+            );
+            assert!(
+                !serde_json::to_value(committed)
+                    .unwrap()
+                    .to_string()
+                    .contains("epoch")
+            );
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn owner_reset_preserves_all_reset_barriers() {
+        let refuse = |store: &PersistedWindowStore, profile: &Profile| {
+            put_raw(
+                &profile.policy_owner_key_id,
+                &stellar_agent_core::profile::owner_key::encode_owner_public_key(&owner_of(11)),
+            );
+            let (error, authorized) = refused_reset(store, profile, owner_name(profile), |row| {
+                signed_by(11, row)
+            });
+            assert_eq!(authorized, 0, "the barrier precedes signed consent");
+            error
+        };
+        {
+            let (_dir, profile, store, _clock) = operation_store();
+            open_operation(
+                &store,
+                &profile,
+                &mut OperationRows::default(),
+                "blocked",
+                1,
+            );
+            assert!(matches!(
+                refuse(&store, &profile),
+                WindowStoreError::OperationsOpen { open: 1 }
+            ));
+        }
+        {
+            let mut fx = super::super::approvals::tests::Fx::new(300_000);
+            fx.open();
+            fx.consent();
+            operations::OperationRecorder::new(
+                &fx.store,
+                fx.fixture.profile(),
+                &mut fx.rows,
+                "barrier",
+            )
+            .transition(
+                fx.operation,
+                None,
+                operations::OperationState::Expired,
+                &operations::TransitionEvidence::default(),
+            )
+            .unwrap();
+            assert!(matches!(
+                refuse(&fx.store, fx.fixture.profile()),
+                WindowStoreError::ApprovalsPending { pending: 1 }
+            ));
+        }
+        {
+            let (_dir, profile, store, plan) = progress_fixture();
+            let clock = crate::mainnet::clock::set_now_ms_for_test(1000);
+            let _exposure = store.admit_signed_intent(&profile, &plan).unwrap().expose();
+            assert!(matches!(
+                refuse(&store, &profile),
+                WindowStoreError::SignedIntentLive { exposed: 1, .. }
+            ));
+            clock.set(2000);
+            store
+                .observe_signed_intents(&profile, &progress_witness([101, 102], 2000))
+                .unwrap();
+            clock.set(2000 + RETENTION_MS);
+            assert!(matches!(
+                refuse(&store, &profile),
+                WindowStoreError::SignedIntentLive { .. }
+            ));
+        }
+        {
+            let clock = crate::mainnet::clock::set_now_ms_for_test(1000);
+            let fx = expiring_hold("signed-reset-expiry", "c9", 1000);
+            fx.store
+                .expire_accounting(&fx.profile, None, &fx.hold, fx.expire_at)
+                .unwrap();
+            clock.set(fx.expire_at);
+            assert!(matches!(
+                refuse(&fx.store, &fx.profile),
+                WindowStoreError::AccountingAuditOwed
+            ));
+        }
+        for mainnet in [false, true] {
+            for defect in DEFECTS {
+                let (_dir, profile, store) = broken("signed-reset-defect", mainnet, defect);
+                let error = refuse(&store, &profile);
+                #[cfg(feature = "mainnet-write")]
+                if mainnet {
+                    assert!(
+                        matches!(error, WindowStoreError::MainnetStateUnverifiable { defect: found } if found == defect)
+                    );
+                    continue;
+                }
+                assert!(
+                    match defect {
+                        StateDefect::MissingKey | StateDefect::BadKey =>
+                            matches!(error, WindowStoreError::Keyring { .. }),
+                        _ => defect_of(&error, !store.path.exists()) == Some(defect),
+                    },
+                    "{defect}: {error}"
+                );
+            }
+        }
+        {
+            let mut f = ResetFixture::mainnet();
+            f.seal(&reset_wire());
+            put_raw(&generation_entry_ref(&f.profile), "2");
+            f.profile.chain_id = Caip2::Testnet;
+            assert!(matches!(
+                refuse(&f.store, &f.profile),
+                WindowStoreError::ChainMismatch
+            ));
+        }
+        #[cfg(feature = "mainnet-write")]
+        for claimed in [false, true] {
+            let f = ResetFixture::mainnet();
+            let now = 100_000;
+            let _clock = crate::mainnet::clock::set_now_ms_for_test(now);
+            let mut open = settled_authorization(1);
+            open.profile = owner_name(&f.profile).to_owned();
+            open.state = if claimed {
+                ledger::AuthorizationState::Claimed
+            } else {
+                ledger::AuthorizationState::Open
+            };
+            open.claimed_ms = claimed.then_some(now);
+            open.settled_ms = None;
+            open.minted_ms = now;
+            open.expires_ms = now + 60_000;
+            f.seal(&WireFile {
+                version: WIRE_VERSION_OPERATIONS,
+                authorizations: vec![open],
+                ..WireFile::default()
+            });
+            let error = refuse(&f.store, &f.profile);
+            assert!(
+                matches!(error, WindowStoreError::OpenAuthorizations { open: 1 }),
+                "{error:?}, claimed={claimed}"
+            );
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn owner_reset_preserves_terminal_history_and_unreleased_reservations() {
+        {
+            use operations::OperationState as S;
+            let (_dir, profile, store, clock) = operation_store();
+            put_raw(
+                &profile.policy_owner_key_id,
+                &stellar_agent_core::profile::owner_key::encode_owner_public_key(&owner_of(11)),
+            );
+            let mut audit = OperationRows::default();
+            let compacted = open_operation(&store, &profile, &mut audit, "order-3", 3);
+            step_operation(
+                &store,
+                &profile,
+                &mut audit,
+                compacted.id(),
+                None,
+                S::Expired,
+            );
+            clock.set(OPERATION_T0 + operations::TERMINAL_RETENTION_MS);
+            let ended = open_operation(&store, &profile, &mut audit, "order-2", 2);
+            step_operation(&store, &profile, &mut audit, ended.id(), None, S::Expired);
+
+            let cancelled = open_operation(&store, &profile, &mut audit, "order-4", 4);
+            let mint = policy_mint(4);
+            let started =
+                operations::OperationRecorder::new(&store, &profile, &mut audit, "ops-request")
+                    .begin_attempt(
+                        &cancelled,
+                        &operations::AttemptRequest {
+                            envelope: Some(operations::AttemptEnvelope {
+                                xdr: "AAAAENVELOPE".to_owned(),
+                                unsigned_envelope_sha256: [4; 32],
+                            }),
+                            authorization: operations::AttemptAuthorization::Mint(Box::new(
+                                mint.clone(),
+                            )),
+                            send_by_ms: u64::MAX,
+                        },
+                    )
+                    .unwrap();
+            let minted = started.minted.as_ref().unwrap();
+            store
+                .claim_authorization(
+                    &profile,
+                    minted.id,
+                    &ledger::ClaimExpect {
+                        domain: mint.binding.domain(),
+                        consumer: mint.consumer,
+                        bindings_digest: minted.bindings_digest,
+                        policy_sequence: mint.policy_sequence,
+                        policy_digest: mint.policy_digest,
+                        authority: mint.authority.clone(),
+                    },
+                )
+                .unwrap();
+            operations::OperationRecorder::new(&store, &profile, &mut audit, "ops-request")
+                .expose(
+                    cancelled.id(),
+                    1,
+                    &operations::ExposureIdentity::Classic {
+                        envelope_sha256: [0x44; 32],
+                        tx_hash: [4 ^ 0x80; 32],
+                        sequence: 104,
+                        max_time: 0,
+                        receipt: stellar_agent_core::hex::encode(&[0x44; 32]),
+                    },
+                    Some(10),
+                )
+                .unwrap();
+            step_operation(
+                &store,
+                &profile,
+                &mut audit,
+                cancelled.id(),
+                Some(1),
+                S::SentOutcomeUnknown,
+            );
+            operations::OperationRecorder::new(&store, &profile, &mut audit, "ops-request")
+                .transition(
+                    cancelled.id(),
+                    Some(1),
+                    S::Cancelled,
+                    &operations::TransitionEvidence {
+                        clear: Some(operations::ClearForm::Untimed),
+                        ..operations::TransitionEvidence::default()
+                    },
+                )
+                .unwrap();
+
+            let now = OPERATION_T0 + operations::TERMINAL_RETENTION_MS + 120_000;
+            clock.set(now);
+            let waiting = open_operation(&store, &profile, &mut audit, "order-1", 1);
+            step_operation(&store, &profile, &mut audit, waiting.id(), None, S::Expired);
+            let before = store.read_for_inspection(&profile).unwrap().unwrap();
+            store
+                .reset(
+                    &profile,
+                    owner_name(&profile),
+                    now,
+                    "repair",
+                    "reset-request",
+                    |row| Ok::<_, ()>(signed_by(11, row)),
+                    |_, _| Ok(()),
+                )
+                .unwrap();
+            let after = store.read_for_inspection(&profile).unwrap().unwrap();
+            assert_eq!(after.generation, before.generation + 1);
+            assert_eq!(after.version, WIRE_VERSION_OPERATIONS);
+            assert_eq!(
+                serde_json::to_vec(&after.operations).unwrap(),
+                serde_json::to_vec(&before.operations).unwrap()
+            );
+            assert!(after.reset_consent.is_some());
+            let section = after.operations.as_ref().unwrap();
+            let mut kept: Vec<_> = section
+                .records
+                .iter()
+                .map(|record| (record.business_id.as_str().to_owned(), record.state))
+                .collect();
+            kept.sort_by(|a, b| a.0.cmp(&b.0));
+            assert_eq!(
+                kept,
+                vec![
+                    ("order-1".to_owned(), S::Expired),
+                    ("order-2".to_owned(), S::Expired),
+                    ("order-4".to_owned(), S::Cancelled),
+                ]
+            );
+            assert_eq!(
+                section
+                    .tombstones
+                    .iter()
+                    .map(|tombstone| tombstone.id)
+                    .collect::<Vec<_>>(),
+                vec![compacted.id()]
+            );
+            let linked = after
+                .authorizations
+                .iter()
+                .find(|auth| auth.id == minted.id)
+                .unwrap();
+            assert_eq!(
+                linked.operation,
+                Some(operations::OperationLink {
+                    operation_id: cancelled.id(),
+                    attempt_index: 1
+                })
+            );
+            assert_eq!(
+                linked
+                    .native_release
+                    .map(|row| (row.class, row.bound, row.observed_ledger)),
+                Some((
+                    operations::ReleaseClass::Unknown,
+                    operations::ReleaseBound::Always,
+                    None
+                ))
+            );
+            assert_eq!(after.admissible_floor_ledger, None);
+            assert_eq!(after.admissible_floor_close_time_ms, None);
+            let mut unreleased = after.clone();
+            unreleased
+                .authorizations
+                .iter_mut()
+                .find(|auth| auth.id == minted.id)
+                .unwrap()
+                .native_release = None;
+            let section = unreleased.operations.as_mut().unwrap();
+            let template = section
+                .records
+                .iter()
+                .find(|record| record.id == waiting.id())
+                .unwrap()
+                .clone();
+            for n in section.records.len()..=operations::TERMINAL_RECORDS_MAX + 1 {
+                let mut extra = template.clone();
+                extra.id = operations::OperationId::random();
+                extra.business_id =
+                    operations::BusinessId::parse(&format!("capacity-{n}")).unwrap();
+                section.records.push(extra);
+            }
+            operations::Operations::prune(&mut unreleased, now);
+            assert_eq!(
+                unreleased.operations.as_ref().unwrap().records.len(),
+                operations::TERMINAL_RECORDS_MAX
+            );
+            assert!(
+                unreleased
+                    .operations
+                    .as_ref()
+                    .unwrap()
+                    .records
+                    .iter()
+                    .any(|record| record.id == cancelled.id())
+            );
+            let key =
+                crate::keyring::load_hmac_key_32(&profile.policy_window_state_key_id).unwrap();
+            store
+                .commit_generation(&key, &generation_entry_ref(&profile), after, unreleased)
+                .unwrap();
+            let now = OPERATION_T0 + operations::TERMINAL_RETENTION_MS + 600_001;
+            clock.set(now);
+            let before = store.read_for_inspection(&profile).unwrap().unwrap();
+            assert!(before.authorizations.iter().any(|auth| {
+                auth.id == minted.id
+                    && auth.authority_end_ms() < now
+                    && auth.native_release.is_none()
+            }));
+            store
+                .reset(
+                    &profile,
+                    owner_name(&profile),
+                    now,
+                    "repair",
+                    "preserve-unreleased",
+                    |row| Ok::<_, ()>(signed_by(11, row)),
+                    |_, _| Ok(()),
+                )
+                .unwrap();
+            let after = store.read_for_inspection(&profile).unwrap().unwrap();
+            assert_eq!(
+                serde_json::to_vec(&after.operations).unwrap(),
+                serde_json::to_vec(&before.operations).unwrap()
+            );
+            assert!(after.reset_consent.is_some());
+            assert_eq!(
+                serde_json::to_vec(&after.authorizations).unwrap(),
+                serde_json::to_vec(&before.authorizations).unwrap()
+            );
+            assert!(
+                after
+                    .authorizations
+                    .iter()
+                    .any(|auth| auth.id == minted.id && auth.native_release.is_none())
+            );
+            let reused =
+                operations::OperationRecorder::new(&store, &profile, &mut audit, "reuse-business")
+                    .open(&operation_request("order-4", 99));
+            assert!(
+                matches!(reused, Ok(operations::OpenOutcome::Conflict)),
+                "{reused:?}"
+            );
+        }
+        {
+            use super::super::approvals::{ApprovalState, tests::Fx};
+            let mut fx = Fx::new(300_000);
+            put_raw(
+                &fx.fixture.profile().policy_owner_key_id,
+                &stellar_agent_core::profile::owner_key::encode_owner_public_key(&owner_of(11)),
+            );
+            fx.open();
+            fx.consent();
+            operations::OperationRecorder::new(
+                &fx.store,
+                fx.fixture.profile(),
+                &mut fx.rows,
+                "request",
+            )
+            .transition(
+                fx.operation,
+                None,
+                operations::OperationState::Expired,
+                &operations::TransitionEvidence::default(),
+            )
+            .unwrap();
+            let now = now_ms().unwrap();
+            let mut wire = fx.wire();
+            let pending = wire.approvals.as_ref().unwrap().records[0].clone();
+            for (n, state) in [(1u8, ApprovalState::Consumed), (2, ApprovalState::Revoked)] {
+                let mut r = pending.clone();
+                r.id = [n; 32];
+                r.nonce = format!("history-{n}");
+                r.operation_id = operations::OperationId::random();
+                r.state = state;
+                if state == ApprovalState::Consumed {
+                    r.consumed_at_ms = Some(r.consent.as_ref().unwrap().consent_at_ms);
+                } else {
+                    r.revoked_at_ms = Some(now);
+                }
+                wire.approvals.as_mut().unwrap().records.push(r);
+            }
+            let mut expired = pending.clone();
+            expired.id = [3; 32];
+            expired.nonce = "history-3".to_owned();
+            expired.operation_id = operations::OperationId::random();
+            expired.created_at_ms -= 600_000;
+            expired.waiting_expires_at_ms -= 600_000;
+            let consent = expired.consent.as_mut().unwrap();
+            consent.consent_at_ms -= 600_000;
+            consent.execution_expires_at_ms -= 600_000;
+            consent.payload = None;
+            expired.closed_at_ms = Some(
+                expired
+                    .waiting_expires_at_ms
+                    .max(consent.execution_expires_at_ms),
+            );
+            assert!(now > expired.waiting_expires_at_ms);
+            assert!(now > consent.execution_expires_at_ms);
+            let expired_bytes = serde_json::to_vec(&expired).unwrap();
+            wire.approvals.as_mut().unwrap().records.push(expired);
+            fx.clock.set(pending.waiting_expires_at_ms);
+            let key =
+                crate::keyring::load_hmac_key_32(&fx.fixture.profile().policy_window_state_key_id)
+                    .unwrap();
+            fx.store
+                .commit_generation(
+                    &key,
+                    &generation_entry_ref(fx.fixture.profile()),
+                    fx.wire(),
+                    wire,
+                )
+                .unwrap();
+            let before = fx.wire();
+            fx.store
+                .reset(
+                    fx.fixture.profile(),
+                    fx.fixture.name(),
+                    now_ms().unwrap(),
+                    "repair",
+                    "reset-request",
+                    |row| Ok::<_, ()>(signed_by(11, row)),
+                    |_, _| Ok(()),
+                )
+                .unwrap();
+            let after = fx.wire();
+            assert_eq!(
+                serde_json::to_vec(&after.approvals).unwrap(),
+                serde_json::to_vec(&before.approvals).unwrap()
+            );
+            assert!(after.reset_consent.is_some());
+            let records = &after.approvals.as_ref().unwrap().records;
+            assert_eq!(records.len(), 4);
+            assert_eq!(
+                serde_json::to_vec(records.iter().find(|r| r.id == [3; 32]).unwrap()).unwrap(),
+                expired_bytes
+            );
+            assert_eq!(after.generation, before.generation + 1);
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn reset_consent_validates_current_and_prepared_images() {
+        let f = ResetFixture::new();
+        enrolled_reset_owner(&f, 0xa1);
+        authorized_reset(&f, "valid-reset", |_, _| Ok(())).unwrap();
+        let key = crate::keyring::load_hmac_key_32(&f.profile.policy_window_state_key_id).unwrap();
+        let bytes = fs::read(&f.store.path).unwrap();
+        let mut tampered = bytes.clone();
+        let position = tampered.iter().rposition(|byte| *byte == b'v').unwrap();
+        tampered[position] = b'x';
+        assert!(matches!(
+            f.store.verify_with_key(&key, &tampered),
+            Err(WindowStoreError::HmacMismatch)
+        ));
+        let good = f.store.verify_with_key(&key, &bytes).unwrap();
+        for prepared in [false, true] {
+            for field in [
+                "request_id",
+                "statement_digest",
+                "owner_key_fingerprint",
+                "consumed_at_ms",
+                "unknown",
+            ] {
+                for missing in [false, true] {
+                    let mut value = serde_json::to_value(&good).unwrap();
+                    if prepared {
+                        value["prepared"] = serde_json::to_value(&good).unwrap();
+                    }
+                    let section = if prepared {
+                        &mut value["prepared"]["reset_consent"]
+                    } else {
+                        &mut value["reset_consent"]
+                    };
+                    if missing && field != "unknown" {
+                        section.as_object_mut().unwrap().remove(field);
+                    } else {
+                        section[field] = if field == "consumed_at_ms" {
+                            serde_json::json!(0)
+                        } else {
+                            serde_json::json!("")
+                        };
+                    }
+                    let body = serde_json::to_vec(&value).unwrap();
+                    let tag = compute_tag(key.as_ref(), &body).unwrap();
+                    let encoded = [tag.as_slice(), body.as_slice()].concat();
+                    assert!(
+                        f.store.verify_with_key(&key, &encoded).is_err(),
+                        "{prepared} {field} {missing}"
+                    );
+                }
+            }
+            let mut invalid = good.clone();
+            invalid.version = 10;
+            if prepared {
+                let mut parent = good.clone();
+                parent.prepared = Some(Box::new(invalid));
+                invalid = parent;
+            }
+            let body = serde_json::to_vec(&invalid).unwrap();
+            let tag = compute_tag(key.as_ref(), &body).unwrap();
+            assert!(
+                f.store
+                    .verify_with_key(&key, &[tag.as_slice(), body.as_slice()].concat())
+                    .is_err()
+            );
+        }
+        assert_eq!(fs::read(&f.store.path).unwrap(), bytes);
+    }
+
+    #[test]
+    #[serial]
+    fn reset_consent_preserves_bytes_versions_and_crash_recovery() {
+        for version in [10, 11] {
+            for seam in [
+                COMMIT_FAULT_AFTER_PREPARED,
+                COMMIT_FAULT_AFTER_COUNTER,
+                COMMIT_FAULT_COMPACTION,
+            ] {
+                let f = ResetFixture::mainnet();
+                let mut initial = reset_wire();
+                initial.version = version;
+                f.seal(&initial);
+                let key = crate::keyring::load_hmac_key_32(&f.profile.policy_window_state_key_id)
+                    .unwrap();
+                let bytes = fs::read(&f.store.path).unwrap();
+                let original = f.store.verify_with_key(&key, &bytes).unwrap();
+                assert!(
+                    serde_json::to_value(&original)
+                        .unwrap()
+                        .get("reset_consent")
+                        .is_none()
+                );
+                let digest = body_digest(&original).unwrap();
+                enrolled_reset_owner(&f, 0xa1);
+                let fault = arm_accounting_fault(seam);
+                let result = authorized_reset(&f, "crash-reset", |_, _| Ok(()));
+                drop(fault);
+                assert_eq!(result.is_ok(), seam == COMMIT_FAULT_COMPACTION);
+                let raw = fs::read(&f.store.path).unwrap();
+                let mut pair = f.store.verify_with_key(&key, &raw).unwrap();
+                assert_eq!(pair.version, version);
+                assert_eq!(pair.prepared.as_ref().unwrap().version, 11);
+                pair.prepared = None;
+                assert_eq!(serde_json::to_vec(&pair).unwrap(), bytes[HMAC_TAG_LEN..]);
+                assert_eq!(body_digest(&pair).unwrap(), digest);
+                let selected = f.store.read_for_inspection(&f.profile).unwrap().unwrap();
+                let committed = seam != COMMIT_FAULT_AFTER_PREPARED;
+                assert_eq!(selected.reset_consent.is_some(), committed);
+                assert_eq!(
+                    selected.generation,
+                    original.generation + u64::from(committed)
+                );
+                assert_eq!(selected.version, if committed { 11 } else { version });
+                let mut no_content = selected.clone();
+                no_content.reset_consent = None;
+                assert_eq!(select_wire_version(&no_content, Some(11)), 11);
+                assert_eq!(fs::read(&f.store.path).unwrap(), raw);
+            }
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn reset_consent_load_is_write_free() {
+        let f = ResetFixture::new();
+        enrolled_reset_owner(&f, 0xa1);
+        authorized_reset(&f, "read-only", |_, _| Ok(())).unwrap();
+        let before = fs::read(&f.store.path).unwrap();
+        let key = get_raw(&f.profile.policy_window_state_key_id);
+        let generation = get_raw(&generation_entry_ref(&f.profile));
+        let mut wire = f.store.read_for_inspection(&f.profile).unwrap().unwrap();
+        let consent = wire.reset_consent.clone();
+        f.store
+            .load_into(owner_name(&f.profile), &f.profile, &PolicyStateStore::new())
+            .unwrap();
+        prune_stale(&mut wire, u64::MAX);
+        assert_eq!(wire.reset_consent, consent);
+        assert_eq!(fs::read(&f.store.path).unwrap(), before);
+        assert_eq!(get_raw(&f.profile.policy_window_state_key_id), key);
+        assert_eq!(get_raw(&generation_entry_ref(&f.profile)), generation);
+    }
+
+    #[test]
+    #[serial]
+    fn owner_reset_clears_floors_only_after_commit() {
+        for seam in [
+            COMMIT_FAULT_AFTER_PREPARED,
+            COMMIT_FAULT_AFTER_COUNTER,
+            COMMIT_FAULT_COMPACTION,
+        ] {
+            let f = ResetFixture::mainnet();
+            let mut wire = reset_wire();
+            wire.admissible_floor_ledger = Some(77);
+            wire.admissible_floor_close_time_ms = Some(88);
+            f.seal(&wire);
+            enrolled_reset_owner(&f, 0xa1);
+            let (error, _) = refused_reset(&f.store, &f.profile, owner_name(&f.profile), unsigned);
+            assert!(matches!(error, WindowStoreError::ResetOwnerRequired));
+            let fault = arm_accounting_fault(seam);
+            let result = authorized_reset(&f, "floor-reset", |_, _| Ok(()));
+            drop(fault);
+            assert_eq!(result.is_ok(), seam == COMMIT_FAULT_COMPACTION);
+            let selected = f.store.read_for_inspection(&f.profile).unwrap().unwrap();
+            let committed = seam != COMMIT_FAULT_AFTER_PREPARED;
+            assert_eq!(
+                selected.admissible_floor_ledger,
+                if committed { None } else { Some(77) }
+            );
+            assert_eq!(
+                selected.admissible_floor_close_time_ms,
+                if committed { None } else { Some(88) }
+            );
         }
     }
 
@@ -14653,6 +15635,8 @@ mod tests {
     #[test]
     #[serial]
     fn version_ten_file_reserializes_byte_identically() {
+        let golden: WireFile = serde_json::from_str(V10_BODY).unwrap();
+        assert_eq!(serde_json::to_vec(&golden).unwrap(), V10_BODY.as_bytes());
         let (_dir, profile, store, _clock) = version_ten_store(true);
         assert_reserializes_byte_identically(&store, &profile);
         let current = store.read_for_inspection(&profile).unwrap().unwrap();
@@ -14866,7 +15850,7 @@ mod tests {
         pin::write_for_test(
             &lock,
             &PinScope::for_profile(&store.path, &profile),
-            &pin::Pin::new(7, [7; 32], [1; 32]).unwrap(),
+            &pin::Pin::new(7, [7; 32], owner_of(11)).unwrap(),
         )
         .unwrap();
         drop(lock);
@@ -15083,7 +16067,17 @@ mod tests {
 
         step_operation(&store, &profile, &mut audit, waiting.id(), None, S::Expired);
         let before = store.read_for_inspection(&profile).unwrap().unwrap();
-        reset_unsigned(&store, &profile, now, |_| Ok::<_, ()>(())).unwrap();
+        store
+            .reset(
+                &profile,
+                owner_name(&profile),
+                now,
+                "repair",
+                "reset-request",
+                |row| Ok::<_, ()>(signed_by(11, row)),
+                |_, _| Ok(()),
+            )
+            .unwrap();
         let after = store.read_for_inspection(&profile).unwrap().unwrap();
         assert_eq!(after.generation, before.generation + 1);
         assert_eq!(after.version, WIRE_VERSION_OPERATIONS);
@@ -15135,6 +16129,75 @@ mod tests {
         );
         assert_eq!(after.admissible_floor_ledger, None);
         assert_eq!(after.admissible_floor_close_time_ms, None);
+        let mut unreleased = after.clone();
+        unreleased
+            .authorizations
+            .iter_mut()
+            .find(|auth| auth.id == minted.id)
+            .unwrap()
+            .native_release = None;
+        let section = unreleased.operations.as_mut().unwrap();
+        let template = section
+            .records
+            .iter()
+            .find(|record| record.id == waiting.id())
+            .unwrap()
+            .clone();
+        for n in section.records.len()..=operations::TERMINAL_RECORDS_MAX + 1 {
+            let mut extra = template.clone();
+            extra.id = operations::OperationId::random();
+            extra.business_id = operations::BusinessId::parse(&format!("capacity-{n}")).unwrap();
+            section.records.push(extra);
+        }
+        operations::Operations::prune(&mut unreleased, now);
+        assert_eq!(
+            unreleased.operations.as_ref().unwrap().records.len(),
+            operations::TERMINAL_RECORDS_MAX
+        );
+        assert!(
+            unreleased
+                .operations
+                .as_ref()
+                .unwrap()
+                .records
+                .iter()
+                .any(|record| record.id == cancelled.id())
+        );
+        let key = crate::keyring::load_hmac_key_32(&profile.policy_window_state_key_id).unwrap();
+        store
+            .commit_generation(&key, &generation_entry_ref(&profile), after, unreleased)
+            .unwrap();
+        let before = store.read_for_inspection(&profile).unwrap().unwrap();
+        store
+            .reset(
+                &profile,
+                owner_name(&profile),
+                now,
+                "repair",
+                "preserve-unreleased",
+                |row| Ok::<_, ()>(signed_by(11, row)),
+                |_, _| Ok(()),
+            )
+            .unwrap();
+        let after = store.read_for_inspection(&profile).unwrap().unwrap();
+        assert_eq!(after.operations, before.operations);
+        assert_eq!(
+            serde_json::to_vec(&after.authorizations).unwrap(),
+            serde_json::to_vec(&before.authorizations).unwrap()
+        );
+        assert!(
+            after
+                .authorizations
+                .iter()
+                .any(|auth| auth.id == minted.id && auth.native_release.is_none())
+        );
+        let reused =
+            operations::OperationRecorder::new(&store, &profile, &mut audit, "reuse-business")
+                .open(&operation_request("order-4", 99));
+        assert!(
+            matches!(reused, Ok(operations::OpenOutcome::Conflict)),
+            "{reused:?}"
+        );
     }
 
     /// A version 10 file loads unchanged and moves to version 11 only with a
