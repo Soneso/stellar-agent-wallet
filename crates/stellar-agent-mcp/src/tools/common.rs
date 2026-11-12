@@ -1471,7 +1471,31 @@ impl WalletServer {
             None,
             None,
             EvaluationScope::Classic,
-            false,
+            GateMode::Strict,
+        )
+        .await
+    }
+
+    /// Evaluates a toolset payment's effects before the routed account read.
+    /// Account reserve and balance floor checks run strictly at the routed
+    /// gate. This gate records no spending and supplies no account views.
+    /// Its only caller passes a value on a server without mainnet context.
+    pub(crate) async fn dispatch_gate_provisional(
+        &self,
+        tool: &'static str,
+        args: &Value,
+        chain: &str,
+        value: stellar_agent_core::policy::v1::ValueClass,
+    ) -> Result<DispatchOutcome, ToolError> {
+        self.dispatch_gate_inner(
+            tool,
+            args,
+            chain,
+            Some(value),
+            None,
+            None,
+            EvaluationScope::Classic,
+            GateMode::Provisional,
         )
         .await
     }
@@ -1502,7 +1526,7 @@ impl WalletServer {
             account_view,
             identity_view,
             EvaluationScope::Classic,
-            false,
+            GateMode::Strict,
         )
         .await
     }
@@ -1539,7 +1563,7 @@ impl WalletServer {
             account_view,
             identity_view,
             EvaluationScope::Classic,
-            false,
+            GateMode::Strict,
         )
         .await
     }
@@ -1715,6 +1739,7 @@ impl WalletServer {
             identity_view,
             EvaluationScope::Classic,
             now_ms,
+            GateMode::Strict,
         )
         .await
     }
@@ -1760,6 +1785,7 @@ impl WalletServer {
         identity_view: Option<&dyn stellar_agent_core::policy::v1::AccountIdentityView>,
         scope: EvaluationScope,
         now_ms: u64,
+        mode: GateMode,
     ) -> Result<GateEvaluation, ToolError> {
         let counterparty_cache =
             match stellar_agent_network::CounterpartyCacheSnapshot::from_resolver(
@@ -1824,6 +1850,20 @@ impl WalletServer {
         // gate sized on the allow path, threaded into `DispatchOutcome::Allow` so
         // the value-verb handlers record exactly what the gate evaluated.
         let evaluation = match value {
+            Some(value) if mode == GateMode::Provisional => {
+                self.policy_engine.evaluate_provisional(
+                    descriptor,
+                    args_value,
+                    self.security_profile(),
+                    value,
+                    None,
+                    None,
+                    counterparty_view,
+                    None,
+                    None,
+                    now_ms,
+                )
+            }
             Some(value) => self.policy_engine.evaluate_with_value_full(
                 descriptor,
                 args_value,
@@ -1970,8 +2010,17 @@ impl WalletServer {
         value: stellar_agent_core::policy::v1::ValueClass,
         scope: EvaluationScope,
     ) -> Result<DispatchOutcome, ToolError> {
-        self.dispatch_gate_inner(tool, args, chain, Some(value), None, None, scope, true)
-            .await
+        self.dispatch_gate_inner(
+            tool,
+            args,
+            chain,
+            Some(value),
+            None,
+            None,
+            scope,
+            GateMode::Preparation,
+        )
+        .await
     }
 
     /// Shared gate core. `value` is `Some` for the value-carrying path
@@ -1984,7 +2033,7 @@ impl WalletServer {
     /// `wallet.clock_error`.
     #[allow(
         clippy::too_many_arguments,
-        reason = "dispatch carries independent checked views, the scope and preparation mode"
+        reason = "dispatch carries independent checked views, the scope and the gate mode"
     )]
     async fn dispatch_gate_inner(
         &self,
@@ -1995,7 +2044,7 @@ impl WalletServer {
         account_view: Option<&dyn stellar_agent_core::policy::v1::AccountReservesView>,
         identity_view: Option<&dyn stellar_agent_core::policy::v1::AccountIdentityView>,
         scope: EvaluationScope,
-        preparation: bool,
+        mode: GateMode,
     ) -> Result<DispatchOutcome, ToolError> {
         let descriptor = self.checked_policy_descriptor(tool_name, args_value, chain_id)?;
 
@@ -2022,7 +2071,7 @@ impl WalletServer {
         // A read-only tool spends none, so settling before it would buy two
         // keyring reads, an HMAC verify and a receipt-store read per call for
         // an answer nothing in that call uses.
-        if !preparation
+        if mode != GateMode::Preparation
             && descriptor.value_kind != stellar_agent_core::policy::ToolValueKind::ReadOnly
             && self.policy_engine.window_state_store().is_some()
         {
@@ -2095,6 +2144,7 @@ impl WalletServer {
                 identity_view,
                 scope,
                 now_ms,
+                mode,
             )
             .await?;
         let outcome = match decision {
@@ -2144,6 +2194,19 @@ impl WalletServer {
 
         Ok(outcome)
     }
+}
+
+/// How the shared gate core settles reservations and evaluates a dispatch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GateMode {
+    /// Settles reservations before a value-moving dispatch and evaluates
+    /// every criterion.
+    Strict,
+    /// Skips the reservation pass and evaluates every criterion.
+    Preparation,
+    /// Settles reservations like `Strict` and defers `minimum_reserve` and
+    /// `balance_floor` to a later strict gate with a live account read.
+    Provisional,
 }
 
 /// Which side of a pair is the commit name's. Its approval requirement
@@ -3219,7 +3282,11 @@ mod signed_intent_observation_tests {
                     None,
                     None,
                     EvaluationScope::Classic,
-                    case == "preparation",
+                    if case == "preparation" {
+                        GateMode::Preparation
+                    } else {
+                        GateMode::Strict
+                    },
                 )
                 .await;
             if matches!(case, "corrupt" | "deleted") {

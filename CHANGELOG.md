@@ -287,6 +287,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `counterparty_allowlist` treats `G_ACCOUNT` and `C_ACCOUNT` as
+  alternatives. An unchanged signed policy admits these calls:
+  - A raw M destination matches its exact entry or its base G.
+  - A `G_ACCOUNT` plus `C_ACCOUNT` list admits either listed form.
+  - An unlisted G debit under both kinds reaches the approval or budget mode.
+  - An unlisted issuer under both kinds and `KNOWN_ISSUER` reaches the mode.
+  - Both kinds with `HOME_DOMAIN` reach the mode only with a verified domain
+    binding.
+  - Mixed G and C debits and transfer bundles run one address check, and the
+    budget accumulates each unlisted transfer.
+  - A C x402 recipient under `G_ACCOUNT` alone reaches the mode.
+  - On testnet, the toolset sign-payment and `stellar_pay` actions carry their
+    payment effects through the outer gate. They reach the routed approval and
+    record once at confirmation.
+  - A per-transaction cap on a rule naming `stellar_toolset_invoke`
+    refuses a payment action above it.
+  Missing destinations, unverified domains, reserved kinds, gated-inflow
+  failures, and opaque signing keep their refusals in every mode.
+
 - On mainnet, CLI `pay`, `claim`, `trustline`, and sponsored `accounts create`
   sign actions the signed policy allows without a passkey ceremony. An approval
   rule requires a passkey ceremony.
