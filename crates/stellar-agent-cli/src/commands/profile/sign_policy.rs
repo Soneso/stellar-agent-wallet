@@ -6,6 +6,8 @@
 //! command produces that `[signature]` table: it reads the owner seed from an
 //! environment variable, computes the same canonical digest the loader
 //! computes, signs it, and writes `owner_id` + `sig` back into the file.
+//! The authoring guard holds the sibling `.authoring.lock` file from read through replacement.
+//! The lock file persists after success or refusal and binds no earlier preview.
 //!
 //! # Signing pre-image
 //!
@@ -279,6 +281,14 @@ where
         },
     };
 
+    let _authoring = match super::policy_authoring::acquire(&policy_path) {
+        Ok(guard) => guard,
+        Err((code, detail)) => {
+            render::render_json(&Envelope::<()>::err_raw(code, detail));
+            return 1;
+        }
+    };
+
     // ── Read the policy TOML ──────────────────────────────────────────────────
     let raw = match std::fs::read_to_string(&policy_path) {
         Ok(s) => s,
@@ -487,10 +497,10 @@ pub(super) struct PreparedPolicy {
     /// The body signing signs, `[signature]` aside.
     pub(super) raw: String,
     /// The owner the installation's pin names, when a pin exists.
-    pinned_owner: Option<[u8; 32]>,
-    sequence: Option<i64>,
-    previous_sequence: Option<i64>,
-    warnings: Vec<String>,
+    pub(super) pinned_owner: Option<[u8; 32]>,
+    pub(super) sequence: Option<i64>,
+    pub(super) previous_sequence: Option<i64>,
+    pub(super) warnings: Vec<String>,
 }
 
 /// Checks the policy text at `policy_path` in the order the loader applies
@@ -673,7 +683,7 @@ pub(super) fn prepare_policy(
 ///
 /// The profile reaching this point has already been reconciled against the
 /// requested name, so the derived name equals the name the operator selected.
-fn engine_profile_name(profile: &Profile) -> Result<String, String> {
+pub(super) fn engine_profile_name(profile: &Profile) -> Result<String, String> {
     derive_profile_name_from_owner_key(profile)
         .map(ToOwned::to_owned)
         .ok_or_else(|| {
@@ -687,7 +697,7 @@ fn engine_profile_name(profile: &Profile) -> Result<String, String> {
 
 /// A value-free failure to read the enrolled owner.
 #[derive(Debug)]
-enum OwnerReadError {
+pub(super) enum OwnerReadError {
     OlderForm,
     Unavailable(String),
 }
@@ -699,7 +709,7 @@ impl From<String> for OwnerReadError {
 }
 
 impl OwnerReadError {
-    fn message(self) -> String {
+    pub(super) fn message(self) -> String {
         match self {
             Self::OlderForm => "the owner key entry is in the older base64 form; \
                 enroll the owner public key again with \
@@ -713,7 +723,7 @@ impl OwnerReadError {
 /// Reads the enrolled owner public key (32 bytes) from the keyring coordinate.
 ///
 /// Accepts only the stored G-strkey; the older form requires enrollment again.
-fn read_owner_pubkey(coord: &KeyringEntryRef) -> Result<[u8; 32], OwnerReadError> {
+pub(super) fn read_owner_pubkey(coord: &KeyringEntryRef) -> Result<[u8; 32], OwnerReadError> {
     let entry = KeyringEntry::new(&coord.service, &coord.account).map_err(|e| {
         let classified =
             map_keyring_operation_error(&e, KeyringOperation::Construct, &coord.service);
@@ -760,7 +770,7 @@ fn read_owner_pubkey(coord: &KeyringEntryRef) -> Result<[u8; 32], OwnerReadError
 }
 
 /// Failure modes of the owner signing ceremony.
-enum OwnerSignError {
+pub(super) enum OwnerSignError {
     /// The policy cannot be canonicalized.
     Policy(stellar_agent_core::policy::PolicyError),
     /// The env var is unset or does not hold a valid `S...` strkey.
@@ -893,6 +903,8 @@ pub(crate) fn atomic_write_string(path: &std::path::Path, contents: &str) -> std
     let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
     tmp.write_all(contents.as_bytes())?;
     tmp.as_file().sync_all()?;
+    #[cfg(test)]
+    tests::observe_replace(path);
     tmp.persist(path).map_err(|e| e.error)?;
     Ok(())
 }
@@ -904,7 +916,7 @@ pub(crate) fn atomic_write_string(path: &std::path::Path, contents: &str) -> std
 /// `[signature]` table is written.  Because
 /// [`canonical_bytes`] excludes the `[signature]` table, replacing it never
 /// changes the signed pre-image.
-fn render_with_signature(
+pub(super) fn render_with_signature(
     raw: &str,
     owner_id: &str,
     sig_hex: &str,
@@ -933,7 +945,7 @@ fn render_with_signature(
 }
 
 /// Lower-case hex-encodes `bytes` (the encoding the loader hex-decodes).
-fn to_hex(bytes: &[u8]) -> String {
+pub(super) fn to_hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
@@ -960,6 +972,102 @@ pub(super) mod tests {
     use super::*;
 
     const PROFILE_NAME: &str = "sign-policy-test";
+
+    thread_local! {
+        static WATCH_REPLACE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        static REPLACE_SEEN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    pub(super) fn observe_replace(path: &std::path::Path) {
+        if WATCH_REPLACE.get() {
+            REPLACE_SEEN.set(true);
+            assert_eq!(
+                super::super::policy_authoring::acquire(path)
+                    .err()
+                    .map(|e| e.0),
+                Some("sign_policy.authoring_lock_busy")
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn sign_policy_takes_the_guard() {
+        keyring_mock::install().unwrap();
+        let dir = TempDir::new().unwrap();
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(dir.path());
+        let profile = provisioning_profile();
+        let (_, owner, _) = seed_material([11; 32]);
+        enroll_owner_pubkey("operator", &owner);
+        let path = dir.path().join("policy.toml");
+        let before = provisioning_body(false);
+        std::fs::write(&path, &before).unwrap();
+        let _guard = super::super::policy_authoring::acquire(&path).unwrap();
+        let (status, output) = native_sign(&profile, &path, false).await;
+        assert_eq!(status, 1);
+        assert_eq!(output["error"]["code"], "sign_policy.authoring_lock_busy");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn guard_spans_read_to_replace() {
+        keyring_mock::install().unwrap();
+        let dir = TempDir::new().unwrap();
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(dir.path());
+        let profile = provisioning_profile();
+        let (_, owner, _) = seed_material([11; 32]);
+        enroll_owner_pubkey("operator", &owner);
+        let path = dir.path().join("policy.toml");
+        std::fs::write(&path, provisioning_body(false)).unwrap();
+        WATCH_REPLACE.set(true);
+        REPLACE_SEEN.set(false);
+        let (status, output) = native_sign(&profile, &path, false).await;
+        WATCH_REPLACE.set(false);
+        assert_eq!(status, 0, "{output}");
+        assert!(REPLACE_SEEN.get());
+        assert!(super::super::policy_authoring::acquire(&path).is_ok());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn guard_released_after_refusal() {
+        keyring_mock::install().unwrap();
+        let dir = TempDir::new().unwrap();
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(dir.path());
+        let profile = provisioning_profile();
+        let (_, owner, _) = seed_material([11; 32]);
+        enroll_owner_pubkey("operator", &owner);
+        let path = dir.path().join("policy.toml");
+        std::fs::write(&path, "[").unwrap();
+        assert_eq!(native_sign(&profile, &path, false).await.0, 1);
+        assert!(super::super::policy_authoring::acquire(&path).is_ok());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn sign_policy_missing_directory_keeps_unreadable_code() {
+        keyring_mock::install().unwrap();
+        let dir = TempDir::new().unwrap();
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(dir.path());
+        let profile = provisioning_profile();
+        let (_, owner, _) = seed_material([11; 32]);
+        enroll_owner_pubkey("operator", &owner);
+        let (status, output) =
+            native_sign(&profile, &dir.path().join("missing/policy.toml"), false).await;
+        assert_eq!(status, 1);
+        assert_eq!(
+            output["error"]["code"],
+            "sign_policy.policy_file_unreadable"
+        );
+        assert!(
+            output["error"]["message"]
+                .as_str()
+                .unwrap()
+                .starts_with("could not read the policy file --file names: ")
+        );
+        assert!(!dir.path().join("missing").exists());
+    }
 
     /// `(S-strkey, pubkey bytes, G-strkey)` for a fixed 32-byte seed.
     fn seed_material(seed: [u8; 32]) -> (String, [u8; 32], String) {

@@ -684,7 +684,7 @@ a positional name or `--profile`, without a default.
 | `enroll-owner-key` | `profile enroll-owner-key --profile default --secret-env WALLET_OWNER_SK` | State-changing (keyring). Derives the owner ed25519 PUBLIC key from an operator `S...` seed and stores it at `policy_owner_key_id` (the key the V1 engine verifies against) as its G-strkey, a form no 32-byte symmetric-key loader accepts. Owner readers refuse older base64 entries; enroll the owner public key again after upgrading. The seed is never stored. `--expected-address`, `--force`. When an enablement nonce or a policy pin exists at the profile's window-state entry, or an enablement nonce exists at its default entry, whatever chain the profile file names, a key other than the pinned owner requires an installed policy carrying a valid previous-owner rotation statement; re-enrolling the pinned owner's key needs none. |
 | `halt <NAME>` | `profile halt default --reason "agent sent unexpected payments"` | State-changing (writes the halt marker and one audit row). Operator-only. See [Profile halt and resume](#profile-halt-and-resume). |
 | `resume <NAME>` | `profile resume default` | State-changing (writes one audit row and removes the halt marker). Operator-only. |
-| `sign-policy` | `profile sign-policy --profile default --secret-env WALLET_OWNER_SK` | State-changing (writes the policy file, atomic). Signs `<state_dir>/policies/<profile>.toml` (or `--file`) with the owner seed and writes the `[signature]` table. Older base64 entries refuse with `sign_policy.owner_key_older_form`; enroll the owner public key again. Mismatch errors identify enrolled bytes by fingerprint. Requires the enrolled seed, or `--previous-owner-secret-env VAR` to authorize the new owner with the previous seed, which must match the pinned owner, or the enrolled owner when no pin exists. |
+| `sign-policy` | `profile sign-policy --profile default --secret-env WALLET_OWNER_SK` | State-changing (writes the policy file, atomic). Signs `<state_dir>/policies/<profile>.toml` (or `--file`) with the owner seed and writes the `[signature]` table. The authoring guard holds `<policy_path>.authoring.lock` from read through replacement and binds no earlier preview. Lock refusals use `sign_policy.authoring_lock_busy` or `sign_policy.authoring_lock_io`. Older base64 entries refuse with `sign_policy.owner_key_older_form`; enroll the owner public key again. Mismatch errors identify enrolled bytes by fingerprint. Requires the enrolled seed, or `--previous-owner-secret-env VAR` to authorize the new owner with the previous seed. That seed must match the pinned owner, or the enrolled owner when no pin exists. |
 
 With an enrolled owner, the profile's `[policy] engine` must match the verified
 signed policy's top-level `engine`. An omitted signed selector means `v1`.
@@ -843,6 +843,11 @@ Loader refusals retain their validation codes. Protected keys use
 `profile.fragment_key_refused`. Profile access and I/O failures exit 1.
 
 ### `profile enable-mainnet`
+
+The authoring guard starts after the preview and stays through the pin, audit row, nonce, and policy replacement.
+Changed bodies or authority state refuse with `profile.enable_mainnet_precondition`, carrying the preview.
+The details are `policy_file: changed during enablement` and `policy_state: changed during enablement`.
+The pin step can still refuse after the preview. `--check` and `--state` take no guard.
 
 ```bash
 stellar-agent profile enable-mainnet --profile operator

@@ -41,6 +41,7 @@ pub mod key_ops;
 pub mod list;
 pub mod migrate;
 pub(super) mod owner_seed;
+mod policy_authoring;
 pub mod policy_check;
 pub mod reset_mpp_state;
 pub mod reset_window_state;
