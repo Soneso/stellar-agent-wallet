@@ -20,6 +20,7 @@ mod commands;
 pub mod common;
 mod process_hardening;
 mod render;
+mod role;
 #[cfg(test)]
 mod test_rpc;
 
@@ -62,6 +63,9 @@ struct Cli {
 /// Top-level subcommands.
 #[derive(Debug, Subcommand)]
 enum Commands {
+    /// Run the MCP stdio server.
+    Mcp(commands::mcp::McpArgs),
+
     /// Wallet-owned approval spine — interactive y/n for pending approvals.
     ///
     /// Provides:
@@ -277,6 +281,7 @@ impl Commands {
     /// parsed value through the same resolver.
     fn profile_flag(&self) -> Option<&str> {
         match self {
+            Self::Mcp(_) => None,
             Self::Approve(a) => a.profile_flag(),
             Self::Audit(a) => a.profile_flag(),
             Self::Tx(a) => a.profile_flag(),
@@ -301,17 +306,19 @@ impl Commands {
     }
 }
 
-/// Hardens the process, then runs the command on a multi-thread runtime and
-/// exits with its code.
+/// Selects the process role before either role initializes its runtime.
 ///
-/// The hardening runs before the runtime exists, so the process is still
-/// single-threaded when it becomes non-dumpable, and a failed hardening ends
-/// the process before any command code runs.
+/// The tool hardens while still single-threaded and exits if hardening fails.
 fn main() {
-    std::process::exit(process_hardening::guarded_start(
-        process_hardening::harden_process,
-        run,
-    ));
+    match role::select(&std::env::args_os().collect::<Vec<_>>(), cfg!(windows)) {
+        role::Role::Server { skip, display_name } => {
+            stellar_agent_mcp::entry::run_server_process(display_name, std::env::args().skip(skip))
+        }
+        role::Role::Tool => std::process::exit(process_hardening::guarded_start(
+            process_hardening::harden_process,
+            run,
+        )),
+    }
 }
 
 /// Builds the multi-thread runtime and runs [`async_main`] on it, returning
@@ -320,6 +327,7 @@ fn main() {
 /// The runtime is shut down without waiting for its remaining tasks, so a
 /// task still blocked on a terminal or socket read does not hold the exit.
 fn run() -> i32 {
+    stellar_agent_core::test_trace::record("runtime");
     match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -378,6 +386,13 @@ async fn async_main() -> i32 {
     });
 
     match cli.command {
+        Commands::Mcp(_) => {
+            common::render::render_json(&stellar_agent_core::envelope::Envelope::<()>::err_raw(
+                "validation.usage_error",
+                "use stellar-agent mcp serve [--profile <NAME>]",
+            ));
+            1
+        }
         Commands::Vault(args) => commands::vault::run(&args).await,
         Commands::Trade(args) => commands::trade::run(&args).await,
         Commands::Trustline(args) => commands::trustline::run(&args).await,

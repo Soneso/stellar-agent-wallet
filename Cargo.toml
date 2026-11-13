@@ -21,7 +21,7 @@ hex = { version = "=0.4.3", default-features = false, features = ["std"] }
 hmac = { version = "=0.13.0", default-features = false, features = ["zeroize"] }
 secrecy = { version = "0.10.3", default-features = false }
 sha2 = { version = "0.11.0", features = ["zeroize"] }
-stellar-strkey = { version = "0.0.18", default-features = false }
+stellar-strkey = { version = "1.0.0", default-features = false }
 serde = { version = "1", default-features = false, features = ["std"] }
 serde_json = { version = "1", default-features = false, features = ["std"] }
 serde_json_canonicalizer = "=0.3.2"
@@ -30,7 +30,7 @@ thiserror = "2.0.21"
 yaml-rust2 = { version = "=0.11.0", default-features = false }
 zeroize = { version = "=1.9.0", default-features = false }
 chacha20poly1305 = "=0.11.0"
-stellar-xdr = { version = "28.0.0", features = ["base64"] }
+stellar-xdr = { version = "30.0.0", features = ["base64"] }
 reqwest = { version = "0.12.28", default-features = false, features = ["json", "rustls-tls"] }
 base64 = { version = "=0.22.1", default-features = false, features = ["std"] }
 rand_core = { version = "=0.6.4", default-features = false, features = ["getrandom"] }
@@ -76,12 +76,13 @@ stellar-agent-sep53 = { path = "crates/stellar-agent-sep53", version = "0.1.0-al
 stellar-agent-sep43 = { path = "crates/stellar-agent-sep43", version = "0.1.0-alpha.13" }
 stellar-agent-xdr-limits = { path = "crates/stellar-agent-xdr-limits", version = "0.1.0-alpha.13" }
 stellar-agent-soroban-auth = { path = "crates/stellar-agent-soroban-auth", version = "0.1.0-alpha.13" }
-soroban-spec-tools = { version = "=28.0.0", default-features = false }
+soroban-spec-tools = { version = "=30.0.1", default-features = false }
 wasmparser = { version = "=0.116.1", default-features = false }
-stellar-rpc-client = "=28.0.0"
-stellar-baselib = "=0.6.0"
-stellar-ledger = { version = "=28.0.0", default-features = false }
+stellar-rpc-client = "=30.0.0"
+stellar-baselib = "=0.7.1"
+stellar-ledger = { version = "=30.0.1", default-features = false }
 apple-native-keyring-store = { version = "=1.0.0", default-features = false }
+security-framework = { version = "=3.7.0", default-features = false }
 dbus-secret-service-keyring-store = { version = "=1.0.0", default-features = false }
 windows-native-keyring-store = { version = "=1.1.0", default-features = false }
 # Toolset-package extraction.

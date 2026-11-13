@@ -45,6 +45,75 @@
 
 pub use crate::echo_id_responder::EchoIdResponder;
 
+/// A CAP-84 destination with a fixed contract and mux id.
+#[must_use]
+pub fn muxed_contract_address() -> stellar_xdr::ScAddress {
+    stellar_xdr::ScAddress::MuxedContract(stellar_xdr::MuxedContract {
+        contract_id: stellar_xdr::ContractId(stellar_xdr::Hash([3; 32])),
+        id: 7,
+    })
+}
+
+/// A token transfer to the supplied destination.
+///
+/// # Panics
+/// Panics if the fixed fixture fields cannot be encoded.
+#[must_use]
+#[allow(clippy::unwrap_used, reason = "fixed test fixture fields")]
+pub fn destination_transfer(
+    destination: stellar_xdr::ScAddress,
+) -> stellar_xdr::SorobanAuthorizedInvocation {
+    use stellar_xdr::*;
+    SorobanAuthorizedInvocation {
+        function: SorobanAuthorizedFunction::ContractFn(InvokeContractArgs {
+            contract_address: ScAddress::Contract(ContractId(Hash([8; 32]))),
+            function_name: "transfer".try_into().unwrap(),
+            args: vec![
+                ScVal::Address(ScAddress::Account(AccountId(
+                    PublicKey::PublicKeyTypeEd25519(Uint256([1; 32])),
+                ))),
+                ScVal::Address(destination),
+                ScVal::from(6_i128),
+            ]
+            .try_into()
+            .unwrap(),
+        }),
+        sub_invocations: Default::default(),
+    }
+}
+
+/// An envelope whose transfer argument contains a W address.
+///
+/// # Panics
+/// Panics if the fixed fixture fields cannot be encoded.
+#[must_use]
+#[allow(clippy::unwrap_used, reason = "fixed test fixture fields")]
+pub fn muxed_contract_envelope() -> String {
+    use stellar_xdr::*;
+    let SorobanAuthorizedFunction::ContractFn(call) =
+        destination_transfer(muxed_contract_address()).function
+    else {
+        unreachable!()
+    };
+    TransactionEnvelope::Tx(TransactionV1Envelope {
+        tx: Transaction {
+            operations: vec![Operation {
+                source_account: None,
+                body: OperationBody::InvokeHostFunction(InvokeHostFunctionOp {
+                    host_function: HostFunction::InvokeContract(call),
+                    auth: Default::default(),
+                }),
+            }]
+            .try_into()
+            .unwrap(),
+            ..Default::default()
+        },
+        signatures: Default::default(),
+    })
+    .to_xdr_base64(Limits::none())
+    .unwrap()
+}
+
 fn public_key_bytes(label: &str, value: &str) -> [u8; 32] {
     match stellar_strkey::ed25519::PublicKey::from_string(value) {
         Ok(pk) => pk.0,

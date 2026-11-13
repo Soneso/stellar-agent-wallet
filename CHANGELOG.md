@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- CAP-84 W destinations decode, retain their mux id in approval displays,
+  and redact to five leading and five trailing characters in audit text.
+  C allowlist entries cover their W destinations; a W entry covers only itself.
+  Signing, submission and execution refuse W before storing a request.
+  SEP-43 addresses report that a muxed contract address (W) is not a signer.
+
 - `approve revoke` and authenticated inbox actions revoke existing durable approvals without changing consent, clocks or operation state.
   The `approval_revoked` audit event follows the state commit and excludes consent payloads.
 - Pending approvals record a subject kind, `envelope-text` by default or
@@ -286,6 +292,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   GitHub's six-hour job limit.
 
 ### Changed
+
+- Multicall transfers to M retain the full destination and count toward payment
+  limits. Policies that require recognized transfers or record spending admit
+  them when the asset, counterparty and limits pass, or request approval.
+  With `allow_opaque_signing`, M transfers obey asset and value limits
+  and counterparty restrictions. A rule without value criteria follows its configured decision.
+- `stellar-xdr` 30 decodes CAP-84 muxed contract addresses without a feature flag.
+  The wallet uses strkey 1.0.0, RPC client 30.0.0, Ledger 30.0.1, baselib 0.7.1
+  and spec-tools 30.0.1. The spec-tools 30 line pins the prerelease
+  `soroban-spec 30.0.0-rc.1`.
 
 - `counterparty_allowlist` treats `G_ACCOUNT` and `C_ACCOUNT` as
   alternatives. An unchanged signed policy admits these calls:
@@ -1008,6 +1024,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Concurrent remote approval sign-ins wait up to two seconds for the credential
+  store instead of failing as invalid assertions.
+  A busy store returns a retriable response, and the page retries with fresh
+  challenges up to three times.
 - `approve gc --include-consumed` also removes consumed approval entries
   before their TTL ends, so they stop counting toward the store's entry cap.
   Plain `approve gc` removes expired entries only. The submission receipt keeps

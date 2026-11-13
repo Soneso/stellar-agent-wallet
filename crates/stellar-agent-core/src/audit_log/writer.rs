@@ -6585,7 +6585,7 @@ pub enum WriterError {
     )]
     OutboxBusy,
 
-    /// A complete line of the audit outbox does not parse as an audit entry.
+    /// A complete line or queue generation of the audit outbox is unusable.
     ///
     /// The drain refused and left the outbox unchanged. The variant names the
     /// line, the column, and the class of the parse failure, never the line's
@@ -6593,19 +6593,21 @@ pub enum WriterError {
     /// content, and this error reaches agent and CLI envelopes. Recovery is in
     /// `docs/maintainers/audit-log-recovery.md`.
     #[error(
-        "audit.outbox_unusable: line {line} of the audit outbox does not parse as an \
-         audit entry ({reason} at column {column}); the outbox is left unchanged"
+        "audit.outbox_unusable: line {line} of the audit outbox is unusable \
+         ({reason} at column {column}); the outbox is left unchanged"
     )]
     OutboxUnusable {
-        /// One-based number of the first line that does not parse.
+        /// Physical line of the unusable record; generation overflow uses one.
         line: usize,
-        /// One-based column of that line at which parsing stopped.
+        /// One-based failure column; tagged records and generation overflow use one.
         column: usize,
-        /// Class of the parse failure, from a closed set.
+        /// Class of the refusal, from a closed set.
         /// Legacy reasons are `invalid JSON`, `JSON that is not an audit entry`, and `truncated JSON`.
         /// Tagged layout uses `tagged record that does not parse`.
         /// Key refusals use `tagged record without an audit key` or `tagged record whose tag does not verify`.
         /// Canonical form uses `tagged record that is not canonical`.
+        /// Generation placement uses `generation line out of place`.
+        /// Checked advancement uses `queue generation overflows`.
         reason: &'static str,
     },
 
@@ -7905,6 +7907,66 @@ mod tests {
     }
 
     const PRUNE_TEST_KEY: [u8; 32] = [0x63; 32];
+
+    #[test]
+    fn generation_and_owner_diagnostics_are_exact() {
+        use crate::audit_log::outbox::{OutboxOwnerState, test_seam};
+        let key = [0x42; 32];
+        let header = test_seam::generation_line(&key, 7);
+        let line = header.strip_suffix(b"\n").unwrap();
+        for (error, number, reason) in [
+            (
+                test_seam::queue_generation(&[line, line], Some(&key)).unwrap_err(),
+                2,
+                "generation line out of place",
+            ),
+            (
+                test_seam::queue_generation(&[b"{\"k\":\"gen\",\"private-marker\":0}"], None)
+                    .unwrap_err(),
+                1,
+                "tagged record that does not parse",
+            ),
+            (
+                test_seam::queue_generation(&[line], None).unwrap_err(),
+                1,
+                "tagged record without an audit key",
+            ),
+            (
+                test_seam::queue_generation(&[line], Some(&[0; 32])).unwrap_err(),
+                1,
+                "tagged record whose tag does not verify",
+            ),
+            (
+                test_seam::next_generation(u64::MAX).unwrap_err(),
+                1,
+                "queue generation overflows",
+            ),
+        ] {
+            assert!(
+                matches!(error, WriterError::OutboxUnusable { line, column: 1, reason: actual } if line == number && actual == reason)
+            );
+            let expected = format!(
+                "audit.outbox_unusable: line {number} of the audit outbox is unusable ({reason} at column 1); the outbox is left unchanged"
+            );
+            assert_eq!(error.to_string(), expected);
+            assert_eq!(
+                audit_log_unusable_detail(&error).as_deref(),
+                Some(expected.as_str())
+            );
+            assert!(!format!("{error:?}").contains("private-marker"));
+        }
+        let error =
+            WriterError::TipAnchorStore(OutboxOwnerState::parse("private-marker").unwrap_err());
+        assert_eq!(
+            error.to_string(),
+            "audit.tip_anchor_unavailable: audit log tip anchor unavailable: audit tip anchor store: outbox owner state is unusable"
+        );
+        assert_eq!(
+            audit_log_unusable_detail(&error).unwrap(),
+            "audit.tip_anchor_unavailable: the tip anchor could not be read or written (audit tip anchor store: outbox owner state is unusable); the keyring must be reachable before a value-moving verb can prove the log has not been rolled back"
+        );
+        assert!(!format!("{error:?}").contains("private-marker"));
+    }
 
     /// Hashes an archive's final entry, which must be a handoff naming it.
     fn archive_handoff_hash(archive: &Path) -> Result<String, WriterError> {

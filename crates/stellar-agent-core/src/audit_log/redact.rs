@@ -27,7 +27,7 @@ pub(crate) fn redact_account_strkeys_first5_last5(input: &str) -> (String, bool)
 
     'scan: while pos < len {
         let first = bytes[pos];
-        if matches!(first, b'G' | b'C' | b'T' | b'M' | b'P') {
+        if matches!(first, b'G' | b'C' | b'T' | b'M' | b'W' | b'P') {
             for &candidate_len in account_strkey_candidate_lengths(first) {
                 if pos + candidate_len > len {
                     continue;
@@ -48,6 +48,7 @@ pub(crate) fn redact_account_strkeys_first5_last5(input: &str) -> (String, bool)
                         | Strkey::Contract(_)
                         | Strkey::PreAuthTx(_)
                         | Strkey::MuxedAccountEd25519(_)
+                        | Strkey::MuxedContract(_)
                         | Strkey::SignedPayloadEd25519(_))
                 ) {
                     output.push_str(&candidate[..5]);
@@ -79,7 +80,7 @@ pub(crate) fn redact_account_strkeys_first5_last5_string(input: &str) -> String 
 fn account_strkey_candidate_lengths(first: u8) -> &'static [usize] {
     match first {
         b'G' | b'C' | b'T' => &[56],
-        b'M' => &[69],
+        b'M' | b'W' => &[69],
         // SignedPayloadEd25519 (`P`) is variable length in stellar-strkey.
         // The on-wire binary form is `1 + 32 + 4 + padded_payload + 2`
         // bytes, where `padded_payload ∈ {4, 8, ..., 64}` (inner payload
@@ -102,6 +103,23 @@ pub(crate) mod tests {
     #![allow(clippy::unwrap_used, reason = "test-only")]
 
     use super::*;
+
+    #[test]
+    fn muxed_contract_text_is_redacted() {
+        let w = stellar_strkey::MuxedContract {
+            contract_id: [9; 32],
+            id: 7,
+        }
+        .to_string();
+        let input = format!("destination={w}");
+        assert_eq!(
+            redact_account_strkeys_first5_last5(&input),
+            (
+                format!("destination={}...{}", &w[..5], &w[w.len() - 5..]),
+                true
+            )
+        );
+    }
 
     const ACCOUNT: &str = "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN";
     const MUXED_ACCOUNT: &str =

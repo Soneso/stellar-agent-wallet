@@ -3256,6 +3256,30 @@ mod tests {
         store.snapshot(NOW_MS).remove(0)
     }
 
+    #[test]
+    fn muxed_destinations_keep_their_full_page_summary() {
+        use stellar_agent_test_support::xdr_fixtures::{
+            destination_transfer, muxed_contract_address,
+        };
+        for destination in [
+            muxed_contract_address(),
+            stellar_xdr::ScAddress::MuxedAccount(stellar_xdr::MuxedEd25519Account {
+                id: 7,
+                ed25519: stellar_xdr::Uint256([1; 32]),
+            }),
+        ] {
+            let entry = PendingApproval::new_x402_pending(
+                &[1; 32],
+                &destination_transfer(destination.clone()),
+                None,
+                "1000".into(),
+                DEFAULT_TTL_MS,
+            )
+            .unwrap();
+            assert!(render_summary_html(&view_of(entry)).contains(&destination.to_string()));
+        }
+    }
+
     /// The inbox data island and the detail page carry the envelope's amount
     /// and destination when the stored summary fields name another payment.
     #[test]

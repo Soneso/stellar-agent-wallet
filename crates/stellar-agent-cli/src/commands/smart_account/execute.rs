@@ -340,7 +340,18 @@ fn validate_execute_inputs(
                 len: raw.len(),
             },
         ) {
-            Ok(v) => sc_args.push(v),
+            Ok(v) => {
+                if stellar_agent_core::sc_address::scval_has_muxed_contract(&v) {
+                    return Err(WalletError::Validation(
+                        ValidationError::XdrArgumentMalformed {
+                            arg: format!("arg[{idx}]"),
+                            reason: stellar_agent_core::sc_address::MUXED_CONTRACT_REFUSAL
+                                .to_owned(),
+                        },
+                    ));
+                }
+                sc_args.push(v);
+            }
             Err(_) => {
                 return Err(WalletError::Validation(
                     ValidationError::XdrArgumentMalformed {
@@ -1419,6 +1430,24 @@ mod tests {
         assert!(
             err.to_string().contains("--arg[1]"),
             "message must name the failing index --arg[1]; got: {err}"
+        );
+    }
+
+    #[test]
+    fn muxed_contract_execute_argument_refuses() {
+        use stellar_xdr::{ContractId, Hash, MuxedContract, ScAddress, WriteXdr};
+        let value = ScVal::Address(ScAddress::MuxedContract(MuxedContract {
+            contract_id: ContractId(Hash([3; 32])),
+            id: 7,
+        }));
+        let mut args = minimal_args();
+        args.arg = vec![value.to_xdr_base64(Limits::none()).unwrap()];
+        let error = validate_execute_inputs(&args, &flag_context(&args)).unwrap_err();
+        assert_eq!(error.code(), "validation.xdr_argument_malformed");
+        assert!(
+            error
+                .to_string()
+                .ends_with("a muxed contract address (W) is not accepted on this path")
         );
     }
 

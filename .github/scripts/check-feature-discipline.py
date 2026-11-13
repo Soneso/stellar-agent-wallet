@@ -112,7 +112,7 @@ PACKAGES = tuple('stellar-agent-' + name for name in (
 DECLARATIONS = {
     PACKAGES[0]: [],
     PACKAGES[1]: [PACKAGES[0] + '/' + FEATURE],
-    PACKAGES[2]: [PACKAGES[0] + '/' + FEATURE, PACKAGES[1] + '/' + FEATURE],
+    PACKAGES[2]: [PACKAGES[index] + '/' + FEATURE for index in (0, 1, 3)],
     PACKAGES[3]: [PACKAGES[index] + '/' + FEATURE for index in (0, 1, 5, 6, 7)],
     PACKAGES[4]: [PACKAGES[0] + '/' + FEATURE, PACKAGES[1] + '/' + FEATURE],
     PACKAGES[5]: [PACKAGES[0] + '/' + FEATURE, PACKAGES[1] + '/' + FEATURE],
@@ -133,13 +133,13 @@ RUNNER_TARGETS = {
 # The declaring packages a single-package on record resolves with the
 # feature: the package and every package its declaration forwards to,
 # transitively. The network-only forwarding tripwire reaches core and
-# network, the CLI alone core, network and the CLI, the MCP server alone
+# network, the CLI alone every declaring package, the MCP server alone
 # every declaring package except the CLI, and each library the testnet
 # acceptance driver builds with the feature its own closure. Every other on
 # record selects them all.
 POSITIVE_CONTROLS = {
     ('-p', PACKAGES[1]): PACKAGES[:2],
-    ('-p', PACKAGES[2]): PACKAGES[:3],
+    ('-p', PACKAGES[2]): PACKAGES,
     ('-p', PACKAGES[3]): tuple(name for name in PACKAGES if name != PACKAGES[2]),
     ('-p', PACKAGES[4]): (PACKAGES[0], PACKAGES[1], PACKAGES[4]),
     ('-p', PACKAGES[5]): (PACKAGES[0], PACKAGES[1], PACKAGES[5]),

@@ -414,6 +414,8 @@ pub(crate) async fn authorize_and_submit(
         ledger,
         operation,
     } = req;
+    stellar_agent_network::signing::envelope_signing::check_envelope_address_forms(unsigned_xdr)
+        .map_err(|e| Envelope::<()>::err(&e))?;
     let name = context.profile_name();
     let profile = context.profile();
 

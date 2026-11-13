@@ -56,6 +56,7 @@ tokio = { workspace = true, features = ["time"] }
 proptest = { workspace = true, optional = true }
 stellar-agent-test-support = { workspace = true, optional = true }
 stellar-agent-xdr-limits = { workspace = true }
+stellar-agent-soroban-auth = { workspace = true }
 # Reads the attestation-key entry from whichever platform backend the host
 # process (CLI, MCP server) has already registered as the default keyring
 # store via `stellar_agent_network::keyring::init_platform_keyring_store`.
@@ -70,6 +71,9 @@ rustix = { workspace = true }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 stellar-agent-windows-identity = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = { workspace = true }
 
 [features]
 # Mainnet write support: the minimum mainnet policy for a mainnet profile's

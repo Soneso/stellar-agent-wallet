@@ -992,9 +992,31 @@ impl KeyringTipAnchorStore {
             format!("{}-g{generation}", self.outbox_ref.account),
         )
     }
+
+    fn owner_entry(&self, carrier_generation: u64) -> KeyringEntryRef {
+        let entry = self.generation_entry(carrier_generation);
+        KeyringEntryRef::new(&entry.service, format!("{}-owner", entry.account))
+    }
 }
 
 impl TipAnchorStore for KeyringTipAnchorStore {
+    fn load_outbox_owner_state(
+        &self,
+        carrier_generation: u64,
+    ) -> Result<Option<String>, TipAnchorStoreError> {
+        read_keyring_string(&self.owner_entry(carrier_generation))
+            .map_err(|e| anchor_store_error("outbox owner state read failed", &e))
+    }
+
+    fn store_outbox_owner_state(
+        &self,
+        carrier_generation: u64,
+        value: &str,
+    ) -> Result<(), TipAnchorStoreError> {
+        write_keyring_string(&self.owner_entry(carrier_generation), value)
+            .map_err(|e| anchor_store_error("outbox owner state write failed", &e))
+    }
+
     fn load_carrier_record(
         &self,
     ) -> Result<Option<stellar_agent_core::audit_log::tip_anchor::CarrierRecord>, TipAnchorStoreError>
@@ -2977,6 +2999,102 @@ mod tests {
 
     fn audit_ref() -> KeyringEntryRef {
         KeyringEntryRef::new("stellar-agent-audit-anchor-test", "default")
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn owner_keyring_coordinates_are_generation_scoped() {
+        use stellar_agent_core::audit_log::OutboxState;
+        keyring_mock::install().unwrap();
+        let store = KeyringTipAnchorStore::new(&audit_ref(), Path::new("owner.jsonl"));
+        for g in [0, 1, 2, u64::MAX] {
+            let suffix = if g == 0 {
+                "-owner".to_owned()
+            } else {
+                format!("-g{g}-owner")
+            };
+            let entry = store.owner_entry(g);
+            assert_eq!(entry.service, store.outbox_ref.service);
+            assert_eq!(
+                entry.account,
+                format!("{}{suffix}", store.outbox_ref.account)
+            );
+            assert_eq!(store.load_outbox_owner_state(g).unwrap(), None);
+            store
+                .store_outbox_state(g, &OutboxState::default())
+                .unwrap();
+            store
+                .store_outbox_owner_state(g, &format!("raw owner {g}"))
+                .unwrap();
+        }
+        for g in [0, 1, 2, u64::MAX] {
+            assert_eq!(
+                store.load_outbox_owner_state(g).unwrap(),
+                Some(format!("raw owner {g}"))
+            );
+            assert_eq!(
+                read_keyring_string(&store.generation_entry(g)).unwrap(),
+                Some(OutboxState::default().to_keyring_value())
+            );
+        }
+        let entry = store.owner_entry(2);
+        keyring_mock::inject_error(
+            &entry.service,
+            &entry.account,
+            keyring_core::Error::NoStorageAccess(Box::new(std::io::Error::other("unavailable"))),
+        )
+        .unwrap();
+        assert!(store.load_outbox_owner_state(2).is_err());
+        keyring_mock::inject_error(
+            &entry.service,
+            &entry.account,
+            keyring_core::Error::NoStorageAccess(Box::new(std::io::Error::other("unavailable"))),
+        )
+        .unwrap();
+        assert!(store.store_outbox_owner_state(2, "value").is_err());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn owner_keyring_round_trip_keeps_both_constructors() {
+        use stellar_agent_core::audit_log::{log_path_sha256, outbox::OutboxOwnerState};
+        keyring_mock::install().unwrap();
+        let key = audit_ref();
+        let path = Path::new("owner-round-trip.jsonl");
+        let digest = log_path_sha256(path);
+        let by_path = KeyringTipAnchorStore::new(&key, path);
+        let by_digest = KeyringTipAnchorStore::for_path_digest(&key, &digest);
+        let other = KeyringTipAnchorStore::new(&key, Path::new("other-owner.jsonl"));
+        let raw = " \n{\"recent\":[],\"legacy\":null,\"closed\":null,\"g\":99,\"v\":1}\t";
+        let expected = format!(
+            "{}-tip-{}-outbox-g3-owner",
+            key.account,
+            &stellar_agent_core::hex::encode(&digest)[..16]
+        );
+        assert_eq!(by_path.owner_entry(3).account, expected);
+        assert_eq!(by_digest.owner_entry(3).account, expected);
+        by_path.store_outbox_owner_state(3, raw).unwrap();
+        assert_eq!(
+            by_digest.load_outbox_owner_state(3).unwrap().as_deref(),
+            Some(raw)
+        );
+        assert_eq!(
+            OutboxOwnerState::parse(&by_digest.load_outbox_owner_state(3).unwrap().unwrap())
+                .unwrap_err()
+                .detail,
+            "outbox owner state is unusable"
+        );
+        assert_eq!(other.load_outbox_owner_state(3).unwrap(), None);
+        assert_eq!(by_path.load_outbox_state(3).unwrap(), None);
+        by_digest
+            .store_outbox_owner_state(3, "unvalidated owner bytes")
+            .unwrap();
+        assert_eq!(
+            by_path.load_outbox_owner_state(3).unwrap().as_deref(),
+            Some("unvalidated owner bytes")
+        );
+        assert_eq!(format!("{by_path:?}"), format!("{by_digest:?}"));
+        assert!(!format!("{by_path:?}").contains(raw));
     }
 
     #[test]

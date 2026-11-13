@@ -130,6 +130,10 @@ pub fn classify_keyring_operation_error(
 }
 
 fn os_cause(cause: &str, inner: &keyring_core::error::PlatformError) -> String {
+    #[cfg(target_os = "macos")]
+    if let Some(error) = inner.downcast_ref::<security_framework::base::Error>() {
+        return format!("{cause} (OS status {})", error.code());
+    }
     match inner
         .downcast_ref::<std::io::Error>()
         .and_then(std::io::Error::raw_os_error)
@@ -402,6 +406,23 @@ mod tests {
             &Error::PlatformFailure(Box::new(std::io::Error::from_raw_os_error(123))),
             "credential store operation failed (OS error 123)",
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[serial]
+    fn macos_platform_failure_keeps_status() {
+        let status = security_framework::base::Error::from_code(-25293);
+        let display = status.to_string();
+        let error = Error::PlatformFailure(Box::new(status));
+        assert_platform(
+            &error,
+            "credential store operation failed (OS status -25293)",
+        );
+        let classified = classify_keyring_operation_error(&error, KeyringOperation::Read, ACCOUNT);
+        let text = classified.to_string();
+        assert!(text.contains("(OS status -25293)"), "{text}");
+        assert!(!text.contains(&display), "{text}");
     }
 
     #[test]

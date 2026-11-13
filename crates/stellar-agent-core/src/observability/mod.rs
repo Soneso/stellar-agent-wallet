@@ -1670,6 +1670,7 @@ impl std::fmt::Debug for SubscriberConfig {
 /// }
 /// ```
 pub fn init_subscriber(log_format_override: Option<&str>) -> Result<(), InitError> {
+    crate::test_trace::record("subscriber");
     let format_override = log_format_override.map(FormatChoice::parse_format_str);
     init_subscriber_with(SubscriberConfig::default().with_format_override(format_override))
 }
@@ -2029,6 +2030,7 @@ const SPEC_TOOLS_PANIC_MESSAGE: &str = "a contract argument does not match its s
 /// disabled backtrace that formats as a short placeholder string.  No
 /// stack frames reach stderr unredacted.
 fn install_panic_hook() {
+    crate::test_trace::record("panic-hook");
     std::panic::set_hook(Box::new(|info| {
         let payload: &str = if let Some(s) = info.payload().downcast_ref::<&str>() {
             s
