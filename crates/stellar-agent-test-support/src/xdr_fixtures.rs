@@ -114,7 +114,8 @@ pub fn muxed_contract_envelope() -> String {
     .unwrap()
 }
 
-/// An authorization preimage whose transfer argument contains a W address.
+/// A testnet `HashIdPreimage::SorobanAuthorization` whose transfer argument
+/// contains a W address.
 ///
 /// # Panics
 /// Panics if the fixed fixture fields cannot be encoded.
@@ -123,14 +124,12 @@ pub fn muxed_contract_envelope() -> String {
 pub fn muxed_contract_preimage() -> String {
     use sha2::{Digest, Sha256};
     use stellar_xdr::*;
-    stellar_agent_soroban_auth::build_auth_preimage(
-        stellar_agent_soroban_auth::AuthCredentialsVersion::V1,
-        Sha256::digest(b"Test SDF Network ; September 2015").into(),
-        7,
-        100,
-        &muxed_contract_address(),
-        destination_transfer(muxed_contract_address()),
-    )
+    HashIdPreimage::SorobanAuthorization(HashIdPreimageSorobanAuthorization {
+        network_id: Hash(Sha256::digest(b"Test SDF Network ; September 2015").into()),
+        nonce: 7,
+        signature_expiration_ledger: 100,
+        invocation: destination_transfer(muxed_contract_address()),
+    })
     .to_xdr_base64(Limits::none())
     .unwrap()
 }

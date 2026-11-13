@@ -23,7 +23,6 @@ base64 = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
 stellar-strkey = { workspace = true, optional = true }
 stellar-xdr = { workspace = true, optional = true }
-stellar-agent-soroban-auth = { workspace = true, optional = true }
 tempfile = { workspace = true, optional = true }
 tokio = { workspace = true, features = ["io-util", "net", "rt-multi-thread", "time"], optional = true }
 wiremock = { workspace = true, optional = true }
@@ -63,7 +62,6 @@ test-helpers = [
     "dep:sha2",
     "dep:stellar-strkey",
     "dep:stellar-xdr",
-    "dep:stellar-agent-soroban-auth",
     "dep:tokio",
     "dep:wiremock",
     "wiremock-helpers",
