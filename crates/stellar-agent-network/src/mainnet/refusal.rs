@@ -99,6 +99,8 @@ pub enum MainnetPrecondition {
     StoreUnavailable,
     /// The intent has an unsupported invocation shape.
     IntentShape,
+    /// The endpoint protocol does not support the intent's muxed contract payee.
+    IntentPayeeProtocolUnsupported,
     /// The intent names another network.
     IntentNetworkMismatch,
     /// The intent payer differs from the signer.
@@ -294,6 +296,7 @@ impl MainnetPrecondition {
             Self::SignerCoordinateMismatch => "signer_coordinate_mismatch",
             Self::StoreUnavailable => "store_unavailable",
             Self::IntentShape => "intent_shape",
+            Self::IntentPayeeProtocolUnsupported => "intent_payee_protocol_unsupported",
             Self::IntentNetworkMismatch => "intent_network_mismatch",
             Self::IntentPayerMismatch => "intent_payer_mismatch",
             Self::DerivationMismatch => "derivation_mismatch",
@@ -530,6 +533,7 @@ mod tests {
             P::SignerCoordinateMismatch,
             P::StoreUnavailable,
             P::IntentShape,
+            P::IntentPayeeProtocolUnsupported,
             P::IntentNetworkMismatch,
             P::IntentPayerMismatch,
             P::DerivationMismatch,
@@ -642,6 +646,7 @@ mod tests {
                 | P::SignerCoordinateMismatch
                 | P::StoreUnavailable
                 | P::IntentShape
+                | P::IntentPayeeProtocolUnsupported
                 | P::IntentNetworkMismatch
                 | P::IntentPayerMismatch
                 | P::DerivationMismatch
@@ -763,6 +768,7 @@ mod tests {
             "signer_coordinate_mismatch",
             "store_unavailable",
             "intent_shape",
+            "intent_payee_protocol_unsupported",
             "intent_network_mismatch",
             "intent_payer_mismatch",
             "derivation_mismatch",

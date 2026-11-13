@@ -580,6 +580,218 @@ async fn submit_to_testnet_reaches_ledger() {
 // Signature verification
 // ─────────────────────────────────────────────────────────────────────────────
 
+async fn sac_balance(
+    rpc: &StellarRpcClient,
+    template: &TransactionEnvelope,
+    owner: &ScAddress,
+) -> i128 {
+    let mut envelope = template.clone();
+    let TransactionEnvelope::Tx(tx) = &mut envelope else {
+        panic!("transaction");
+    };
+    tx.tx.ext = TransactionExt::V0;
+    let mut operations = tx.tx.operations.to_vec();
+    let OperationBody::InvokeHostFunction(op) = &mut operations[0].body else {
+        panic!("invocation");
+    };
+    let stellar_xdr::HostFunction::InvokeContract(call) = &mut op.host_function else {
+        panic!("contract");
+    };
+    call.function_name = "balance".try_into().unwrap();
+    call.args = vec![ScVal::Address(owner.clone())].try_into().unwrap();
+    op.auth = Default::default();
+    tx.tx.operations = operations.try_into().unwrap();
+    let response = rpc.simulate_transaction_envelope(&envelope).await.unwrap();
+    assert!(response.error.is_none(), "{:?}", response.error);
+    let ScVal::I128(ref balance) = response.results().unwrap()[0].xdr else {
+        panic!("balance");
+    };
+    (i128::from(balance.hi) << 64) | i128::from(balance.lo)
+}
+
+#[tokio::test]
+#[serial]
+async fn muxed_payees_settle_with_ids_and_balance_deltas() {
+    use ed25519_dalek::Signer as _;
+    use sha2::{Digest as _, Sha256};
+    use stellar_xdr::{
+        DecoratedSignature, SignatureHint, TransactionSignaturePayload,
+        TransactionSignaturePayloadTaggedTransaction,
+    };
+    for contract in [false, true] {
+        let payer = Funded::new("payer").await;
+        let facilitator = Funded::new("facilitator").await;
+        let (payee, expected, base) = if contract {
+            let id = SigningKey::generate(&mut OsRng).verifying_key().to_bytes();
+            (
+                stellar_strkey::MuxedContract {
+                    contract_id: id,
+                    id: 7,
+                }
+                .to_string()
+                .as_str()
+                .to_owned(),
+                ScAddress::MuxedContract(stellar_xdr::MuxedContract {
+                    contract_id: ContractId(Hash(id)),
+                    id: 7,
+                }),
+                ScAddress::Contract(ContractId(Hash(id))),
+            )
+        } else {
+            let recipient = Funded::new("recipient").await;
+            (
+                stellar_strkey::ed25519::MuxedAccount {
+                    ed25519: recipient.public_key(),
+                    id: 7,
+                }
+                .to_string()
+                .as_str()
+                .to_owned(),
+                ScAddress::MuxedAccount(stellar_xdr::MuxedEd25519Account {
+                    ed25519: Uint256(recipient.public_key()),
+                    id: 7,
+                }),
+                recipient.sc_address(),
+            )
+        };
+        let rpc = StellarRpcClient::new(TESTNET_RPC_URL).unwrap();
+        let identity = rpc
+            .endpoint_identity(
+                TESTNET_PASSPHRASE,
+                tokio::time::Instant::now() + IDENTITY_TIMEOUT,
+            )
+            .await
+            .unwrap();
+        assert!(identity.admits_muxed_contract());
+        let payload = create_payment(
+            &native_testnet_requirements(&payee),
+            &payer.signer(),
+            &rpc,
+            &SorobanCrossCheck::NotRequired,
+            TESTNET_PASSPHRASE,
+            tokio::time::Instant::now() + IDENTITY_TIMEOUT,
+            |_| Ok(()),
+        )
+        .await
+        .unwrap()
+        .payload;
+        let mut envelope = payment_envelope(&payload);
+        let base_address =
+            stellar_agent_core::sc_address::scaddress_destination_strkey(&base).unwrap();
+        let before = if contract {
+            sac_balance(&rpc, &envelope, &base).await
+        } else {
+            i128::from(native_balance(&rpc, &base_address).await)
+        };
+        let entries = auth_entries(&envelope);
+        let SorobanAuthorizedFunction::ContractFn(call) = &entries[0].root_invocation.function
+        else {
+            panic!("authorization");
+        };
+        assert_eq!(call.args[1], ScVal::Address(expected.clone()));
+        assert!(verify_auth_entry_signature(
+            &entries[0],
+            &payer.public_key(),
+            TESTNET_PASSPHRASE
+        ));
+        let view = fetch_account(&rpc, &facilitator.address, &[])
+            .await
+            .unwrap();
+        let TransactionEnvelope::Tx(tx) = &mut envelope else {
+            panic!("transaction");
+        };
+        tx.tx.source_account = MuxedAccount::Ed25519(Uint256(facilitator.public_key()));
+        tx.tx.seq_num = SequenceNumber(view.sequence_number + 1);
+        let response = rpc.simulate_transaction_envelope(&envelope).await.unwrap();
+        assert!(response.error.is_none(), "{:?}", response.error);
+        let TransactionEnvelope::Tx(tx) = &mut envelope else {
+            panic!("transaction");
+        };
+        tx.tx.ext = TransactionExt::V1(response.transaction_data().unwrap());
+        tx.tx.fee = SETTLEMENT_BASE_FEE + u32::try_from(response.min_resource_fee).unwrap();
+        if contract {
+            let signing = TransactionSignaturePayload {
+                network_id: Hash(Sha256::digest(TESTNET_PASSPHRASE.as_bytes()).into()),
+                tagged_transaction: TransactionSignaturePayloadTaggedTransaction::Tx(tx.tx.clone()),
+            };
+            let digest: [u8; 32] = Sha256::digest(signing.to_xdr(Limits::none()).unwrap()).into();
+            let key = SigningKey::from_bytes(&facilitator.seed);
+            tx.signatures = vec![DecoratedSignature {
+                hint: SignatureHint(facilitator.public_key()[28..].try_into().unwrap()),
+                signature: key.sign(&digest).to_bytes().to_vec().try_into().unwrap(),
+            }]
+            .try_into()
+            .unwrap();
+        } else {
+            let signed = attach_signature(
+                &envelope.to_xdr_base64(Limits::none()).unwrap(),
+                &facilitator.signer(),
+                TESTNET_PASSPHRASE,
+            )
+            .await
+            .unwrap();
+            envelope = TransactionEnvelope::from_xdr_base64(signed, Limits::none()).unwrap();
+        }
+        let TransactionEnvelope::Tx(tx) = &envelope else {
+            panic!("transaction");
+        };
+        let OperationBody::InvokeHostFunction(op) = &tx.tx.operations[0].body else {
+            panic!("invocation");
+        };
+        let stellar_xdr::HostFunction::InvokeContract(call) = &op.host_function else {
+            panic!("contract");
+        };
+        assert_eq!(call.args[1], ScVal::Address(expected));
+        assert_eq!(auth_entries(&envelope), entries);
+        let settlement = stellar_rpc_client::Client::new(TESTNET_RPC_URL).unwrap();
+        let hash = settlement.send_transaction(&envelope).await.unwrap();
+        let included = settlement
+            .get_transaction_polling(&hash, Some(Duration::from_secs(60)))
+            .await
+            .unwrap();
+        let ledger = included.ledger.unwrap();
+        assert!(ledger > 0);
+        let after = if contract {
+            sac_balance(&rpc, &envelope, &base).await
+        } else {
+            i128::from(native_balance(&rpc, &base_address).await)
+        };
+        assert_eq!(after - before, i128::from(TRANSFER_AMOUNT_STROOPS));
+        let transfer = included
+            .events
+            .contract_events
+            .iter()
+            .flatten()
+            .find(|event| {
+                let stellar_xdr::ContractEventBody::V0(body) = &event.body;
+                body.topics.first() == Some(&ScVal::Symbol("transfer".try_into().unwrap()))
+                    && body.topics.get(2) == Some(&ScVal::Address(base.clone()))
+            })
+            .expect("transfer event to the base address");
+        let stellar_xdr::ContractEventBody::V0(body) = &transfer.body;
+        let ScVal::Map(Some(data)) = &body.data else {
+            panic!("muxed transfer data");
+        };
+        let field = |name: &str| {
+            data.iter()
+                .find(|entry| entry.key == ScVal::Symbol(name.try_into().unwrap()))
+                .map(|entry| entry.val.clone())
+        };
+        assert_eq!(field("to_muxed_id"), Some(ScVal::U64(7)));
+        assert_eq!(
+            field("amount"),
+            Some(ScVal::from(i128::from(TRANSFER_AMOUNT_STROOPS)))
+        );
+        eprintln!(
+            "payee={payee} protocol={} tx_hash={} ledger={ledger} balance_delta={} event={}",
+            identity.protocol_version(),
+            stellar_agent_core::hex::encode(&hash.0),
+            after - before,
+            transfer.to_xdr_base64(Limits::none()).unwrap()
+        );
+    }
+}
+
 /// Verifies that an `Address`-credentialled auth entry carries a valid ed25519
 /// signature over its reconstructed `HashIdPreimage::SorobanAuthorization`.
 fn verify_auth_entry_signature(

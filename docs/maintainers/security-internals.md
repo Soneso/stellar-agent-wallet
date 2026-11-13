@@ -1343,12 +1343,15 @@ Each criterion is a `Box<dyn Criterion>` (`Send + Sync`) with a snake_case kind 
 | `memo_binding` | Required memo per bound `G...` destination, v2 only |
 
 W addresses decode for inspection and display. Envelope signing, submission,
-SEP-43 auth signing, multicall arguments and CLI execute arguments refuse W
+plain SEP-43 auth signing, multicall arguments and CLI execute arguments refuse W
 before signing, sending or persistence. Staged pay and claim refuse W before
 keyring access, policy evaluation and audit preparation. These paths identify
 the unsupported W address form. The MCP SEP-43 transaction and auth-entry tools
 answer `sep43.invalid_xdr`. Network-layer envelope signing and submission answer
 `protocol.xdr_codec_failed`.
+x402 payee signing admits W only under an admission from an endpoint identity
+at protocol 30 or later; plain SEP-43 signing, envelope signing and submission
+keep refusing W.
 
 Recipient classes govern the `unlisted` table. Each debit leg is `Listed`,
 `Unlisted` (well-formed, verified, outside the criterion's own list), or

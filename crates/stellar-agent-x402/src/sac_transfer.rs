@@ -22,7 +22,7 @@ use stellar_xdr::{ContractId, InvokeContractArgs, ScAddress};
 use crate::X402Error;
 
 const ASSET_ADDRESS_FORM: &str = "sac_contract must be a C-strkey";
-const RECIPIENT_ADDRESS_FORM: &str = "pay_to must be a G-, C-, or M-strkey";
+const RECIPIENT_ADDRESS_FORM: &str = "pay_to must be a G-, C-, M-, or W-strkey";
 const PAYER_ADDRESS_FORM: &str = "payer must be a G-strkey";
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -32,7 +32,7 @@ const PAYER_ADDRESS_FORM: &str = "payer must be a G-strkey";
 /// Converts a G- or C-strkey to [`ScAddress`] for the SAC asset contract.
 ///
 /// Accepts G-strkeys (classic accounts, `PublicKeyEd25519`) and C-strkeys
-/// (contract addresses). Muxed (M) strkeys are rejected here; the recipient
+/// (contract addresses). Muxed (M and W) strkeys are rejected here; the recipient
 /// converter [`strkey_to_recipient_sc_address`] is the one that accepts muxed
 /// addresses.
 ///
@@ -62,16 +62,16 @@ fn strkey_to_sc_address(strkey: &str) -> Result<ScAddress, X402Error> {
     }
 }
 
-/// Converts a recipient strkey (G-, C-, or M-strkey) to [`ScAddress`].
+/// Converts a recipient strkey (G-, C-, M-, or W-strkey) to [`ScAddress`].
 ///
-/// The x402 `pay_to` recipient may be a classic account (G), a contract (C), or
-/// a muxed account (M); the `@x402/stellar` scheme accepts all three. A muxed
-/// recipient's `id` is preserved in the on-chain `ScAddress::MuxedAccount`.
+/// The x402 `pay_to` recipient may be a classic account (G), a contract (C),
+/// a muxed account (M), or a muxed contract (W). Muxed recipients retain
+/// their ids in the on-chain address. W requires protocol 30 or later.
 ///
 /// # Errors
 ///
 /// - [`X402Error::InvalidRecipientAddress`] if the strkey is malformed or is not
-///   a G-, C-, or M-strkey.
+///   a G-, C-, M-, or W-strkey.
 pub(crate) fn strkey_to_recipient_sc_address(strkey: &str) -> Result<ScAddress, X402Error> {
     use stellar_xdr::{AccountId, ContractId, Hash, MuxedEd25519Account, PublicKey, Uint256};
 
@@ -87,6 +87,10 @@ pub(crate) fn strkey_to_recipient_sc_address(strkey: &str) -> Result<ScAddress, 
             id: m.id,
             ed25519: Uint256(m.ed25519),
         })),
+        Strkey::MuxedContract(m) => Ok(ScAddress::MuxedContract(stellar_xdr::MuxedContract {
+            id: m.id,
+            contract_id: ContractId(Hash(m.contract_id)),
+        })),
         _ => Err(X402Error::InvalidRecipientAddress {
             detail: RECIPIENT_ADDRESS_FORM.to_owned(),
         }),
@@ -95,7 +99,7 @@ pub(crate) fn strkey_to_recipient_sc_address(strkey: &str) -> Result<ScAddress, 
 
 /// Converts the payer's G-strkey to its `ScAddress::Account` representation.
 ///
-/// The payer of a SAC `transfer` must be a classic account; C- and M-strkeys
+/// The payer of a SAC `transfer` must be a classic account; C-, M-, and W-strkeys
 /// are rejected.
 ///
 /// # Errors
@@ -125,17 +129,17 @@ pub(crate) fn g_strkey_to_account_address(g_strkey: &str) -> Result<ScAddress, X
 ///
 /// # Arguments
 ///
-/// - `sac_contract` — C-strkey of the SAC contract address.
-/// - `from` — G-strkey of the sender (the payer; signs the auth entry).
-/// - `to` — G-, C-, or M-strkey of the recipient (`payTo`).
-/// - `amount` — atomic token units (e.g. 7-decimal USDC: 1 USDC = 10_000_000).
+/// - `sac_contract`: C-strkey of the SAC contract address.
+/// - `from`: G-strkey of the sender (the payer; signs the auth entry).
+/// - `to`: G-, C-, M-, or W-strkey of the recipient (`payTo`).
+/// - `amount`: atomic token units (e.g. 7-decimal USDC: 1 USDC = 10_000_000).
 ///
 /// # Errors
 ///
 /// - [`X402Error::InvalidAssetAddress`] if `sac_contract` fails to parse.
 /// - [`X402Error::InvalidPayerAddress`] if `from` is not a valid G-strkey.
-/// - [`X402Error::InvalidRecipientAddress`] if `to` is not a valid G-, C-, or
-///   M-strkey.
+/// - [`X402Error::InvalidRecipientAddress`] if `to` is not a valid G-, C-, M-, or
+///   W-strkey.
 /// - [`X402Error::TransactionBuildFailed`] if the arg-list `VecM` construction
 ///   fails (only if arg count exceeds `VecM` capacity, which cannot occur here).
 ///
@@ -183,6 +187,49 @@ mod tests {
     )]
 
     use super::*;
+
+    #[test]
+    fn muxed_contract_vectors_preserve_id_and_contract() {
+        let contract_id = [
+            0x3f, 0x0c, 0x34, 0xbf, 0x93, 0xad, 0x0d, 0x99, 0x71, 0xd0, 0x4c, 0xcc, 0x90, 0xf7,
+            0x05, 0x51, 0x1c, 0x83, 0x8a, 0xad, 0x97, 0x34, 0xa4, 0xa2, 0xfb, 0x0d, 0x7a, 0x03,
+            0xfc, 0x7f, 0xe8, 0x9a,
+        ];
+        for (encoded, id) in [
+            (
+                "WA7QYNF7SOWQ3GLR2BGMZEHXAVIRZA4KVWLTJJFC7MGXUA74P7UJUAAAAAAAAAAAAAWWC",
+                0,
+            ),
+            (
+                "WA7QYNF7SOWQ3GLR2BGMZEHXAVIRZA4KVWLTJJFC7MGXUA74P7UJVAAAAAAAAAAAACWJY",
+                1_u64 << 63,
+            ),
+        ] {
+            let ScAddress::MuxedContract(actual) = strkey_to_recipient_sc_address(encoded).unwrap()
+            else {
+                panic!("muxed contract recipient");
+            };
+            assert_eq!(actual.id, id);
+            assert_eq!(actual.contract_id.0.0, contract_id);
+        }
+    }
+
+    #[test]
+    fn muxed_contract_asset_and_payer_refuse() {
+        let encoded = stellar_strkey::MuxedContract {
+            contract_id: [3; 32],
+            id: 7,
+        }
+        .to_string();
+        assert!(matches!(
+            strkey_to_sc_address(&encoded),
+            Err(X402Error::InvalidAssetAddress { .. })
+        ));
+        assert!(matches!(
+            g_strkey_to_account_address(&encoded),
+            Err(X402Error::InvalidPayerAddress { .. })
+        ));
+    }
 
     // ── g_strkey_to_account_address ────────────────────────────────────────────
 

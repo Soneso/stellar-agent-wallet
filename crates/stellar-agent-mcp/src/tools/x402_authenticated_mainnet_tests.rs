@@ -55,10 +55,512 @@ use crate::tools::common::{GatedApprovalKind, verify_attestation_subject_gate, x
 
 const TOOL: &str = "stellar_x402_authenticated_payment";
 
+fn muxed_payee(contract: bool, id: u64) -> (String, stellar_xdr::ScAddress) {
+    if contract {
+        (
+            stellar_strkey::MuxedContract {
+                contract_id: [6; 32],
+                id,
+            }
+            .to_string()
+            .as_str()
+            .to_owned(),
+            stellar_xdr::ScAddress::MuxedContract(stellar_xdr::MuxedContract {
+                contract_id: stellar_xdr::ContractId(Hash([6; 32])),
+                id,
+            }),
+        )
+    } else {
+        (
+            stellar_strkey::ed25519::MuxedAccount {
+                ed25519: [6; 32],
+                id,
+            }
+            .to_string()
+            .as_str()
+            .to_owned(),
+            stellar_xdr::ScAddress::MuxedAccount(stellar_xdr::MuxedEd25519Account {
+                ed25519: Uint256([6; 32]),
+                id,
+            }),
+        )
+    }
+}
+
+fn muxed_policy(raw: &str, payee: &str, contract: bool) -> String {
+    let mut doc = authenticated_policy_with(raw, |_| {})
+        .parse::<toml_edit::DocumentMut>()
+        .unwrap();
+    for rule in doc["rules"].as_array_of_tables_mut().unwrap().iter_mut() {
+        if !rule["match"]["tool"]
+            .as_str()
+            .unwrap()
+            .starts_with("stellar_x402_")
+        {
+            continue;
+        }
+        for criterion in rule["criteria"].as_array_mut().unwrap().iter_mut() {
+            let criterion = criterion.as_inline_table_mut().unwrap();
+            if criterion.get("kind").and_then(toml_edit::Value::as_str)
+                == Some("counterparty_allowlist")
+            {
+                criterion.insert(
+                    "kinds",
+                    toml_edit::Value::Array(
+                        [if contract { "C_ACCOUNT" } else { "G_ACCOUNT" }]
+                            .into_iter()
+                            .collect(),
+                    ),
+                );
+                criterion.insert(
+                    "allowlist",
+                    toml_edit::Value::Array([payee].into_iter().collect()),
+                );
+            }
+        }
+    }
+    require_approval_rules(
+        &doc.to_string(),
+        &[TOOL, "stellar_x402_create_payment"],
+        600,
+    )
+}
+
+async fn call_muxed(
+    run: &Run,
+    authenticated: bool,
+    args: X402AuthenticatedPaymentArgs,
+) -> serde_json::Value {
+    if authenticated {
+        run.call(args).await
+    } else {
+        wire(
+            &run.f
+                .server
+                .call_stellar_x402_create_payment(crate::server::X402CreatePaymentArgs {
+                    payment_required: args.payment_required,
+                    chain_id: args.chain_id,
+                    address: args.address,
+                    business_id: args.business_id,
+                    approval_nonce: args.approval_nonce,
+                    approval_attestation: args.approval_attestation,
+                })
+                .await
+                .unwrap(),
+        )
+    }
+}
+
+fn assert_muxed_envelope(encoded: &str, expected: &stellar_xdr::ScAddress, signed: bool) {
+    let TransactionEnvelope::Tx(tx) =
+        TransactionEnvelope::from_xdr_base64(encoded, Limits::none()).unwrap()
+    else {
+        panic!("transaction");
+    };
+    let OperationBody::InvokeHostFunction(op) = &tx.tx.operations[0].body else {
+        panic!("invocation");
+    };
+    let stellar_xdr::HostFunction::InvokeContract(call) = &op.host_function else {
+        panic!("transfer");
+    };
+    assert_eq!(call.args[1], stellar_xdr::ScVal::Address(expected.clone()));
+    assert_eq!(!op.auth.is_empty(), signed);
+    if signed {
+        let stellar_xdr::SorobanAuthorizedFunction::ContractFn(call) =
+            &op.auth[0].root_invocation.function
+        else {
+            panic!("authorization");
+        };
+        assert_eq!(call.args[1], stellar_xdr::ScVal::Address(expected.clone()));
+    }
+}
+
+pub(super) async fn assert_muxed_approval_path(authenticated: bool) {
+    for contract in [false, true] {
+        let (payee, expected) = muxed_payee(contract, 7);
+        let run = Run::with(|raw| muxed_policy(&raw, &payee, contract)).await;
+        run.control.protocol.store(30, Ordering::SeqCst);
+        run.oracle_control.protocol.store(30, Ordering::SeqCst);
+        let mut requirements = run.f.requirements();
+        requirements.pay_to = payee.clone();
+        let mut args = run.args(HOME, None);
+        args.payment_required = serde_json::to_string(&requirements).unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&args.payment_required).unwrap()["payTo"],
+            payee
+        );
+        assert_eq!(
+            x402_value_leg(&requirements, 10).destination.as_deref(),
+            Some(payee.as_str())
+        );
+        let mut first_args = run.args(HOME, None);
+        first_args.payment_required = args.payment_required.clone();
+        first_args.business_id = args.business_id.clone();
+        let first = call_muxed(&run, authenticated, first_args).await;
+        assert_eq!(first["ok"], true, "{first}");
+        assert_eq!(first["data"]["approval"]["summary"]["payTo"], payee);
+        let nonce = first["data"]["approval"]["approval_nonce"]
+            .as_str()
+            .unwrap();
+        let pending = stored_approval(&run.f, nonce).unwrap();
+        let stellar_agent_core::approval::ApprovalKind::X402Payment {
+            payee: stored,
+            root_invocation_xdr,
+            ..
+        } = &pending.kind
+        else {
+            panic!("payment approval");
+        };
+        assert_eq!(stored, &payee);
+        let root = stellar_xdr::SorobanAuthorizedInvocation::from_xdr_base64(
+            root_invocation_xdr,
+            Limits::none(),
+        )
+        .unwrap();
+        let stellar_xdr::SorobanAuthorizedFunction::ContractFn(call) = root.function else {
+            panic!("transfer");
+        };
+        assert_eq!(call.args[1], stellar_xdr::ScVal::Address(expected.clone()));
+        let state = ledger(&run.f).unwrap();
+        let operations = state["operations"]["records"].as_array().unwrap();
+        assert_eq!(operations.len(), 1);
+        assert_eq!(operations[0]["intent"]["x402"]["intent"]["pay_to"], payee);
+        args.approval_nonce = Some(nonce.to_owned());
+        args.approval_attestation = Some(run.f.attest(&pending));
+        if contract {
+            run.control.protocol.store(29, Ordering::SeqCst);
+            for business_id in [None, args.business_id.clone()] {
+                let mut retry = run.args(HOME, None);
+                retry.payment_required = args.payment_required.clone();
+                retry.business_id = business_id;
+                retry.approval_nonce = args.approval_nonce.clone();
+                retry.approval_attestation = args.approval_attestation.clone();
+                let before = ledger(&run.f);
+                let rows = audit_rows(&run.f);
+                let result = call_muxed(&run, authenticated, retry).await;
+                assert_eq!(
+                    result["error"]["code"],
+                    "x402.muxed_contract_protocol_unsupported"
+                );
+                assert_eq!(ledger(&run.f), before);
+                assert_eq!(audit_rows(&run.f), rows);
+                assert_eq!(run.f.seed_reads.load(Ordering::SeqCst), 0);
+                assert_eq!(run.control.count("simulateTransaction"), 0);
+                assert!(run.double.control.served.lock().unwrap().is_empty());
+                assert_eq!(stored_approval(&run.f, nonce).unwrap().kind, pending.kind);
+            }
+            run.control.protocol.store(30, Ordering::SeqCst);
+        }
+        let result = call_muxed(&run, authenticated, args).await;
+        assert_eq!(result["ok"], true, "{result}");
+        assert_eq!(result["data"]["payTo"], payee);
+        if authenticated {
+            assert_eq!(result["data"]["payto_anchored"], "unknown");
+        }
+        let simulations = run.control.simulations.lock().unwrap();
+        assert_eq!(simulations.len(), 2);
+        assert_muxed_envelope(&simulations[0], &expected, false);
+        assert_muxed_envelope(&simulations[1], &expected, true);
+        assert_muxed_envelope(&released_transaction(&result), &expected, true);
+        let rows = x402_authorized_rows(&run.f);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0]["legs"][0]["destination_redacted"],
+            stellar_agent_core::observability::redact_strkey_first5_last5(&payee)
+        );
+    }
+    for contract in [false, true] {
+        assert_muxed_approval_id_binding(authenticated, contract).await;
+    }
+}
+
+/// A base allowlist entry lets both ids reach the approval and retry checks.
+async fn assert_muxed_approval_id_binding(authenticated: bool, contract: bool) {
+    let (payee, expected) = muxed_payee(contract, 7);
+    let base = if contract {
+        stellar_strkey::Contract([6; 32]).to_string().to_string()
+    } else {
+        stellar_strkey::ed25519::PublicKey([6; 32])
+            .to_string()
+            .to_string()
+    };
+    let run = Run::with(|raw| muxed_policy(&raw, &base, contract)).await;
+    run.control.protocol.store(30, Ordering::SeqCst);
+    run.oracle_control.protocol.store(30, Ordering::SeqCst);
+    let mut requirements = run.f.requirements();
+    requirements.pay_to = payee;
+    let mut args = run.args(HOME, None);
+    args.payment_required = serde_json::to_string(&requirements).unwrap();
+    let mut first_args = run.args(HOME, None);
+    first_args.payment_required = args.payment_required.clone();
+    first_args.business_id = args.business_id.clone();
+    let first = call_muxed(&run, authenticated, first_args).await;
+    assert_eq!(first["ok"], true, "{first}");
+    let nonce = first["data"]["approval"]["approval_nonce"]
+        .as_str()
+        .unwrap();
+    let pending = stored_approval(&run.f, nonce).unwrap();
+    args.approval_nonce = Some(nonce.to_owned());
+    args.approval_attestation = Some(run.f.attest(&pending));
+    for business_id in [None, args.business_id.clone()] {
+        let mut changed = run.args(HOME, None);
+        let mut altered = requirements.clone();
+        altered.pay_to = muxed_payee(contract, 8).0;
+        changed.payment_required = serde_json::to_string(&altered).unwrap();
+        changed.business_id = business_id
+            .clone()
+            .or_else(|| run.args(HOME, None).business_id);
+        changed.approval_nonce = args.approval_nonce.clone();
+        changed.approval_attestation = args.approval_attestation.clone();
+        let result = call_muxed(&run, authenticated, changed).await;
+        assert_eq!(
+            result["error"]["code"],
+            if business_id.is_some() {
+                "operation.business_id_conflict"
+            } else {
+                "policy.approval_required"
+            },
+            "{result}"
+        );
+        assert_eq!(run.f.seed_reads.load(Ordering::SeqCst), 0);
+        assert_eq!(run.control.count("simulateTransaction"), 0);
+        assert!(run.double.control.served.lock().unwrap().is_empty());
+    }
+    let result = call_muxed(&run, authenticated, args).await;
+    assert_eq!(result["ok"], true, "{result}");
+    assert_muxed_envelope(&released_transaction(&result), &expected, true);
+}
+
+#[tokio::test]
+#[serial_test::serial(keyring)]
+async fn muxed_unlisted_budget_pays_unattended_and_refuses_exhaustion() {
+    for authenticated in [false, true] {
+        let (payee, expected) = muxed_payee(false, 7);
+        let run = Run::build(|raw| {
+            let mut doc = authenticated_policy(&raw).parse::<toml_edit::DocumentMut>().unwrap();
+            for rule in doc["rules"].as_array_of_tables_mut().unwrap().iter_mut() {
+                if !rule["match"]["tool"].as_str().unwrap().starts_with("stellar_x402_") {
+                    continue;
+                }
+                for criterion in rule["criteria"].as_array_mut().unwrap().iter_mut() {
+                    let criterion = criterion.as_inline_table_mut().unwrap();
+                    if criterion.get("kind").and_then(toml_edit::Value::as_str) == Some("counterparty_allowlist") {
+                        criterion.insert("unlisted", format!(
+                            "{{ mode = \"budget\", asset = \"{}\", per_tx_stroops = 10, per_period_stroops = 10, window = \"1d\" }}",
+                            stellar_strkey::Contract([3; 32])
+                        ).parse::<toml_edit::Value>().unwrap());
+                    }
+                }
+            }
+            doc.to_string()
+        }).await;
+        let policy_path = stellar_agent_core::profile::schema::default_policy_dir()
+            .unwrap()
+            .join("operator.toml");
+        let policy_bytes = std::fs::read(&policy_path).unwrap();
+        let mut requirements = run.f.requirements();
+        assert_ne!(requirements.pay_to, payee);
+        requirements.pay_to = payee.clone();
+        let mut args = run.args(HOME, None);
+        args.payment_required = serde_json::to_string(&requirements).unwrap();
+        let result = call_muxed(&run, authenticated, args).await;
+        assert_eq!(result["ok"], true, "{result}");
+        assert!(result["data"]["approval"].is_null(), "{result}");
+        assert_eq!(result["data"]["payTo"], payee);
+        assert_eq!(result["data"]["amount"], "10");
+        assert_muxed_envelope(&released_transaction(&result), &expected, true);
+        let rows = x402_authorized_rows(&run.f);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["policy_decision"], "allow");
+        assert_eq!(rows[0]["legs"][0]["amount"], "10");
+        assert_eq!(
+            rows[0]["legs"][0]["destination_redacted"],
+            stellar_agent_core::observability::redact_strkey_first5_last5(&payee)
+        );
+        let state = ledger(&run.f).unwrap();
+        let records = authorizations(&run.f);
+        assert_eq!(records.len(), if authenticated { 3 } else { 2 });
+        for record in &records {
+            assert!(record["approval_nonce"].is_null());
+            assert!(record["policy_authority"].is_object());
+        }
+        let simulations = run.control.count("simulateTransaction");
+        assert_eq!(simulations, 2);
+        let mut next = run.args(HOME, None);
+        next.payment_required = serde_json::to_string(&requirements).unwrap();
+        let denied = call_muxed(&run, authenticated, next).await;
+        assert_eq!(
+            denied["error"]["code"], "policy.deny.unlisted_budget_exceeded",
+            "{denied}"
+        );
+        assert_eq!(run.control.count("simulateTransaction"), simulations);
+        assert_eq!(ledger(&run.f).unwrap()["entries"], state["entries"]);
+        assert_eq!(ledger(&run.f).unwrap()["holds"], state["holds"]);
+        assert_eq!(authorizations(&run.f), records);
+        assert_eq!(x402_authorized_rows(&run.f), rows);
+        assert_eq!(std::fs::read(&policy_path).unwrap(), policy_bytes);
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial(keyring)]
+async fn muxed_approval_preserves_full_destination() {
+    assert_muxed_approval_path(true).await;
+}
+
+#[tokio::test]
+#[serial_test::serial(keyring)]
+async fn muxed_protocol_refuses_before_mainnet_state() {
+    for authenticated in [false, true] {
+        for require_approval in [false, true] {
+            for protocol in [28, 29, 31] {
+                let (payee, _) = muxed_payee(true, 7);
+                let run = Run::build(|raw| {
+                    let policy = muxed_policy(&raw, &payee, true);
+                    if require_approval {
+                        policy
+                    } else {
+                        let mut doc = policy.parse::<toml_edit::DocumentMut>().unwrap();
+                        for rule in doc["rules"].as_array_of_tables_mut().unwrap().iter_mut() {
+                            if rule["match"]["tool"]
+                                .as_str()
+                                .unwrap()
+                                .starts_with("stellar_x402_")
+                            {
+                                rule["decision"] = toml_edit::value("allow");
+                                rule.remove("ttl_secs");
+                                rule.remove("reason");
+                            }
+                        }
+                        doc.to_string()
+                    }
+                })
+                .await;
+                run.control.protocol.store(protocol, Ordering::SeqCst);
+                let mut args = run.args(HOME, None);
+                let mut requirements = run.f.requirements();
+                requirements.pay_to = payee;
+                args.payment_required = serde_json::to_string(&requirements).unwrap();
+                let before = ledger(&run.f);
+                let rows = audit_rows(&run.f);
+                let result = call_muxed(&run, authenticated, args).await;
+                assert_eq!(
+                    result["error"]["code"],
+                    if protocol == 29 {
+                        "x402.muxed_contract_protocol_unsupported"
+                    } else {
+                        "network.unsupported_protocol_version"
+                    }
+                );
+                assert_eq!(ledger(&run.f), before);
+                assert!(!approval_file_exists(&run.f));
+                assert_eq!(audit_rows(&run.f), rows);
+                assert_eq!(run.control.count("simulateTransaction"), 0);
+                assert_eq!(run.f.seed_reads.load(Ordering::SeqCst), 0);
+                assert!(run.double.control.served.lock().unwrap().is_empty());
+            }
+        }
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial(keyring)]
+async fn muxed_protocol_library_mapping_preserves_code() {
+    let (payee, _) = muxed_payee(true, 7);
+    let run = Run::with(|raw| muxed_policy(&raw, &payee, true)).await;
+    run.control.protocol.store(30, Ordering::SeqCst);
+    let mut requirements = run.f.requirements();
+    requirements.pay_to = payee;
+    let mut args = run.args(HOME, None);
+    args.payment_required = serde_json::to_string(&requirements).unwrap();
+    let first = run.call(args).await;
+    assert_eq!(first["ok"], true, "{first}");
+    let nonce = first["data"]["approval"]["approval_nonce"]
+        .as_str()
+        .unwrap();
+    let pending = stored_approval(&run.f, nonce).unwrap();
+    let attestation = run.f.attest(&pending);
+    let mut args = run.args(HOME, Some((nonce, &attestation)));
+    args.payment_required = serde_json::to_string(&requirements).unwrap();
+    run.control.clear();
+    let control = Arc::clone(&run.control);
+    let weak = Arc::downgrade(&control);
+    *run.control.on_request.lock().unwrap() = Some(Arc::new(move |method| {
+        if method == "getNetwork"
+            && let Some(control) = weak.upgrade()
+            && control.count("getNetwork") > 1
+        {
+            control.protocol.store(29, Ordering::SeqCst);
+        }
+    }));
+    let result = run.call(args).await;
+    assert_eq!(
+        result["error"]["code"], "x402.muxed_contract_protocol_unsupported",
+        "{result}"
+    );
+    assert_eq!(run.control.count("simulateTransaction"), 0);
+}
+
+#[tokio::test]
+#[serial_test::serial(keyring)]
+async fn muxed_id_substitutions_refuse_at_policy_and_simulations() {
+    for authenticated in [false, true] {
+        for contract in [false, true] {
+            for boundary in ["policy", "first", "resimulation"] {
+                let (payee, _) = muxed_payee(contract, 7);
+                let listed = if boundary == "policy" {
+                    muxed_payee(contract, 8).0
+                } else {
+                    payee.clone()
+                };
+                let run = Run::with(|raw| muxed_policy(&raw, &listed, contract)).await;
+                run.control.protocol.store(30, Ordering::SeqCst);
+                run.oracle_control.protocol.store(30, Ordering::SeqCst);
+                let mut requirements = run.f.requirements();
+                requirements.pay_to = payee;
+                let mut args = run.args(HOME, None);
+                args.payment_required = serde_json::to_string(&requirements).unwrap();
+                let first = call_muxed(&run, authenticated, args).await;
+                if boundary == "policy" {
+                    assert_eq!(
+                        first["error"]["code"], "policy.deny.counterparty_denied",
+                        "{first}"
+                    );
+                    continue;
+                }
+                assert_eq!(first["ok"], true, "{first}");
+                let nonce = first["data"]["approval"]["approval_nonce"]
+                    .as_str()
+                    .unwrap();
+                let pending = stored_approval(&run.f, nonce).unwrap();
+                let attestation = run.f.attest(&pending);
+                let mut args = run.args(HOME, Some((nonce, &attestation)));
+                args.payment_required = serde_json::to_string(&requirements).unwrap();
+                run.control
+                    .first_simulation_mux_id
+                    .store(boundary == "first", Ordering::SeqCst);
+                run.control
+                    .resimulation_mux_id
+                    .store(boundary == "resimulation", Ordering::SeqCst);
+                let result = call_muxed(&run, authenticated, args).await;
+                let code = if authenticated {
+                    "x402.payment_build_failed"
+                } else {
+                    "x402.unexpected_auth_entries"
+                };
+                assert_eq!(result["error"]["code"], code, "{boundary}: {result}");
+                assert!(result["data"].get("paymentSignature").is_none());
+            }
+        }
+    }
+}
+
 #[tokio::test]
 #[serial_test::serial(keyring)]
 async fn muxed_contract_mainnet_payment_refuses_before_state() {
-    let f = Fixture::new(|raw| raw);
+    let rpc = wiremock::MockServer::start().await;
+    let f = crate::tools::common::tests::mainnet::routed_fixture(|raw| raw, &rpc);
+    let control = mount_rpc(&f, &rpc).await;
     let mut requirements = f.requirements();
     requirements.pay_to =
         stellar_agent_test_support::xdr_fixtures::muxed_contract_address().to_string();
@@ -76,11 +578,12 @@ async fn muxed_contract_mainnet_payment_refuses_before_state() {
         .await
         .unwrap();
     let (code, message, _) = crate::tools::common::assert_business_envelope(&result);
-    assert_eq!(code, "x402.invalid_recipient_address");
+    assert_eq!(code, "x402.muxed_contract_protocol_unsupported");
     assert_eq!(
         message,
-        "invalid recipient address: pay_to must be a G-, C-, or M-strkey"
+        "a W (muxed contract) payee requires Stellar protocol 30 or later; the network reports protocol 29"
     );
+    assert_eq!(control.count("simulateTransaction"), 0);
     assert_eq!(f.seed_reads.load(Ordering::SeqCst), 0);
     assert!(authorizations(&f).is_empty());
 }

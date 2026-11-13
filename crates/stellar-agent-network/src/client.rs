@@ -902,9 +902,21 @@ impl StellarRpcClient {
     /// Returns the identity probe errors, or `network.mainnet_write_forbidden`
     /// without a request when mainnet writes are disabled.
     pub async fn check_mainnet_endpoint(&self, deadline: Instant) -> Result<(), WalletError> {
+        self.mainnet_endpoint(deadline).await.map(|_| ())
+    }
+
+    /// Returns the checked identity of the mainnet endpoint.
+    ///
+    /// # Errors
+    /// Returns the identity probe errors, or `network.mainnet_write_forbidden`
+    /// without a request when mainnet writes are disabled.
+    pub async fn mainnet_endpoint(
+        &self,
+        deadline: Instant,
+    ) -> Result<EndpointIdentity, WalletError> {
         #[cfg(feature = "mainnet-write")]
         {
-            self.mainnet_endpoint_identity(deadline).await.map(|_| ())
+            self.mainnet_endpoint_identity(deadline).await
         }
         #[cfg(not(feature = "mainnet-write"))]
         {
@@ -1829,12 +1841,12 @@ mod tests {
     fn check_mainnet_endpoint_refuses_feature_off_without_request() {
         let client = StellarRpcClient::new("http://127.0.0.1:1").unwrap();
         let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_time()
+            .enable_all()
             .build()
             .unwrap();
         let result = runtime.block_on(async {
             client
-                .check_mainnet_endpoint(Instant::now() + std::time::Duration::ZERO)
+                .mainnet_endpoint(Instant::now() + std::time::Duration::from_secs(1))
                 .await
         });
         assert_eq!(

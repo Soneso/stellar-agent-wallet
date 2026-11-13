@@ -481,6 +481,8 @@ rows = ["mcp.x402_create_payment", "mcp.x402_authenticated_payment"]
 tests = [
   { package = "stellar-agent-mcp", target = "lib", name = "tools::common::tests::mainnet::x402_allow_pays_in_one_call_with_nothing_pending", builds = "feature-on" },
   { package = "stellar-agent-mcp", target = "lib", name = "tools::common::tests::mainnet::x402_require_approval_records_its_decision_and_provenance", builds = "feature-on" },
+  { package = "stellar-agent-mcp", target = "lib", name = "tools::common::tests::mainnet::muxed_approval_preserves_full_destination", builds = "feature-on" },
+  { package = "stellar-agent-mcp", target = "lib", name = "tools::x402_authenticated_mainnet_tests::muxed_approval_preserves_full_destination", builds = "feature-on" },
 ]
 
 [[cell]]

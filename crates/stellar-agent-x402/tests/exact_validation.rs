@@ -238,7 +238,7 @@ async fn non_integer_amount_rejected() {
     );
 }
 
-/// A `payTo` that is not a G-, C-, or M-strkey is rejected with
+/// A `payTo` that is not a G-, C-, M-, or W-strkey is rejected with
 /// `InvalidRecipientAddress`.
 #[tokio::test]
 async fn invalid_recipient_rejected() {
@@ -253,8 +253,8 @@ async fn invalid_recipient_rejected() {
     );
 }
 
-#[tokio::test]
-async fn muxed_contract_recipient_refuses_before_gate() {
+#[test]
+fn muxed_contract_recipient_validates() {
     let mut req = requirements_with("exact", X402_STELLAR_TESTNET, AMOUNT, true.into());
     req.pay_to = stellar_strkey::MuxedContract {
         contract_id: [3; 32],
@@ -263,15 +263,44 @@ async fn muxed_contract_recipient_refuses_before_gate() {
     .to_string()
     .as_str()
     .to_owned();
-    let called = AtomicBool::new(false);
-    let result = pay(&req, UNUSED_RPC_URL, TESTNET_PASSPHRASE, &called).await;
-    assert_gate_never_ran(&called);
-    let error = result.unwrap_err();
     assert_eq!(
-        error.to_string(),
-        "invalid recipient address: pay_to must be a G-, C-, or M-strkey"
+        validate_requirements(&req, TESTNET_PASSPHRASE, UNUSED_RPC_URL).unwrap(),
+        AMOUNT.parse::<i128>().unwrap()
     );
-    assert!(matches!(error, X402Error::InvalidRecipientAddress { .. }));
+}
+
+#[test]
+fn invalid_muxed_contract_vectors_refuse() {
+    for pay_to in [
+        "WA7QYNF7SOWQ3GLR2BGMZEHXAVIRZA4KVWLTJJFC7MGXUA74P7UJUAAAAAAAAAAAAAAIOUI",
+        "WA7QYNF7SOWQ3GLR2BGMZEHXAVIRZA4KVWLTJJFC7MGXUA74P7UJUAAAAAAAAAAAUCCQ",
+        "WA7QYNF7SOWQ3GLR2BGMZEHXAVIRZA4KVWLTJJFC7MGXUA74P7UJUAAAAAAAAAAAAAWWD",
+        "WA7QYNF7SOWQ3GLR2BGMZEHXAVIRZA4KVWLTJJFC7MGXUA74P7UJUAAAAAAAAAAAAAWWCA",
+        "WA7QYNF7SOWQ3GLR2BGMZEHXAVIRZA4KVWLTJJFC7MGXUA74P7UJUAAAAAAAAAAAAAWWA",
+    ] {
+        let mut req = requirements_with("exact", X402_STELLAR_TESTNET, AMOUNT, true.into());
+        req.pay_to = pay_to.to_owned();
+        let error = validate_requirements(&req, TESTNET_PASSPHRASE, UNUSED_RPC_URL).unwrap_err();
+        assert_eq!(
+            error.wire_code(),
+            "x402.invalid_recipient_address",
+            "{pay_to}"
+        );
+    }
+}
+
+#[test]
+fn muxed_contract_asset_refuses() {
+    let mut req = requirements_with("exact", X402_STELLAR_TESTNET, AMOUNT, true.into());
+    req.asset = stellar_strkey::MuxedContract {
+        contract_id: [3; 32],
+        id: 7,
+    }
+    .to_string()
+    .as_str()
+    .to_owned();
+    let error = validate_requirements(&req, TESTNET_PASSPHRASE, UNUSED_RPC_URL).unwrap_err();
+    assert!(matches!(error, X402Error::InvalidAssetAddress { .. }));
 }
 
 /// `maxTimeoutSeconds` of zero is rejected with `InvalidPaymentRequired`.
@@ -466,7 +495,7 @@ fn requirements_marker_is_not_echoed() {
         (
             "pay_to",
             "x402.invalid_recipient_address",
-            "invalid recipient address: pay_to must be a G-, C-, or M-strkey",
+            "invalid recipient address: pay_to must be a G-, C-, M-, or W-strkey",
         ),
         (
             "scheme",
@@ -547,7 +576,7 @@ fn pay_to_values_are_not_echoed() {
     );
     assert_eq!(
         err.to_string(),
-        "invalid recipient address: pay_to must be a G-, C-, or M-strkey"
+        "invalid recipient address: pay_to must be a G-, C-, M-, or W-strkey"
     );
     stellar_agent_test_support::rejected_value::assert_no_marker(&err, "CREDMARKER7");
 
@@ -560,7 +589,7 @@ fn pay_to_values_are_not_echoed() {
     let err = validate_requirements(&req, TESTNET_PASSPHRASE, UNUSED_RPC_URL).unwrap_err();
     assert_eq!(
         err.to_string(),
-        "invalid recipient address: pay_to must be a G-, C-, or M-strkey"
+        "invalid recipient address: pay_to must be a G-, C-, M-, or W-strkey"
     );
     stellar_agent_test_support::rejected_value::assert_no_marker(&err, &pre_auth);
 }

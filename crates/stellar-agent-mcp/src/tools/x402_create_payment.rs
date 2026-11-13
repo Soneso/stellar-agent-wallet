@@ -201,7 +201,7 @@ impl std::fmt::Debug for X402CreatePaymentArgs {
 ///   - the `asset` is not a C-strkey;
 ///   - `extra.areFeesSponsored` is not `true`;
 ///   - the `amount` is not a positive `i128`;
-///   - the `payTo` is not a G-, C-, or M-strkey;
+///   - the `payTo` is not a G-, C-, M-, or W-strkey;
 ///   - `maxTimeoutSeconds` is zero.
 /// - The keyring entry for the signer cannot be loaded.
 /// - A Soroban RPC simulation, its answer, the health read, or the ledger and
@@ -305,6 +305,15 @@ impl WalletServer {
             Ok(amount) => amount,
             Err(ref err) => return Ok(x402_error_to_tool_result(err)),
         };
+        if let Err(result) = crate::tools::common::check_x402_payee_protocol(
+            &requirements.pay_to,
+            &self.profile,
+            || self.context.primary_client(),
+        )
+        .await
+        {
+            return Ok(result);
+        }
         // Off mainnet a supplied id is validated here and echoed. A mainnet
         // call takes its own path and checks its id at its record lookup,
         // after every refusal a call without one gives.
@@ -323,9 +332,6 @@ impl WalletServer {
         // Capture the gate-derived leg as an audit record before it moves into
         // the value descriptor, so the row carries exactly what the gate sized.
         let audit_leg = ValueLegRecord::from(&value_leg);
-        // Also retain an owned clone for the window-state record after
-        // authorization (single-derivation invariant on the recording side
-        // too) — `value_leg` itself moves into `ValueClass::single` below.
         let value_leg_for_record = value_leg.clone();
 
         // ── Telemetry preamble (redaction) ───────────────────────────────────
@@ -354,12 +360,14 @@ impl WalletServer {
             Ok(o) => o,
             Err(e) => return e.into_result(),
         };
-        match dispatch_outcome {
-            crate::tools::common::DispatchOutcome::Allow(_) => {}
+        let value_for_record = match dispatch_outcome {
+            crate::tools::common::DispatchOutcome::Allow(outcome) => outcome
+                .value_effects
+                .map_or(ValueClass::single(value_leg_for_record), ValueClass::Value),
             crate::tools::common::DispatchOutcome::RequireApproval(_) => {
                 return Ok(crate::tools::common::single_shot_require_approval_error());
             }
-        }
+        };
 
         // ── Audit pre-flight (fail-closed) ────────────────────────────────────
         // Runs AFTER the dispatch gate: a policy denial or approval escalation
@@ -470,7 +478,7 @@ impl WalletServer {
         if let Err(refusal) = crate::tools::x402_create_payment::record_x402_authorization(
             self,
             "stellar_x402_create_payment",
-            &stellar_agent_core::policy::v1::ValueClass::single(value_leg_for_record),
+            &value_for_record,
         ) {
             return Ok(refusal);
         }
@@ -560,6 +568,14 @@ impl WalletServer {
             Ok(amount) => amount,
             Err(error) => return Ok(x402_error_to_tool_result(&error)),
         };
+        if let Err(result) =
+            crate::tools::common::check_x402_payee_protocol(&requirements.pay_to, profile, || {
+                guard.context.primary_client()
+            })
+            .await
+        {
+            return Ok(result);
+        }
         stellar_agent_core::profile::caip2::validate_chain_id_matches_profile(
             &args.chain_id,
             profile,
@@ -1428,6 +1444,7 @@ fn classify_x402_error(err: &stellar_agent_x402::X402Error) -> &'static str {
         X402Error::NetworkPassphraseMismatch => "network_passphrase_mismatch",
         X402Error::MainnetSigningForbidden { .. } => "mainnet_signing_forbidden",
         X402Error::InvalidAssetAddress { .. } => "invalid_asset_address",
+        X402Error::MuxedContractProtocolUnsupported { .. } => "muxed_contract_protocol_unsupported",
         X402Error::FeesNotSponsored => "fees_not_sponsored",
         X402Error::AmountConversion { .. } => "amount_conversion",
         X402Error::AuthEntrySignFailed { .. } => "auth_entry_sign_failed",
@@ -1496,7 +1513,19 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
         stellar_agent_test_support::keyring_mock::install().unwrap();
-        let server = make_require_approval_server();
+        let rpc = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(stellar_agent_test_support::EchoIdResponder::new(
+                serde_json::json!({
+                    "passphrase": stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE,
+                    "protocolVersion": 29
+                }),
+            ))
+            .mount(&rpc)
+            .await;
+        let mut server = make_require_approval_server();
+        server.context =
+            stellar_agent_network::NetworkContext::new(server.profile.chain_id, rpc.uri());
         let mut requirements: serde_json::Value =
             serde_json::from_str(&sample_requirements_json()).unwrap();
         requirements["payTo"] = serde_json::json!(
@@ -1515,10 +1544,10 @@ mod tests {
             .await
             .unwrap();
         let (code, message, text) = crate::tools::common::assert_business_envelope(&result);
-        assert_eq!(code, "x402.invalid_recipient_address");
+        assert_eq!(code, "x402.muxed_contract_protocol_unsupported");
         assert_eq!(
             message,
-            "invalid recipient address: pay_to must be a G-, C-, or M-strkey"
+            "a W (muxed contract) payee requires Stellar protocol 30 or later; the network reports protocol 29"
         );
         assert!(!text.contains("paymentSignature"));
         assert_eq!(std::fs::read_dir(home.path()).unwrap().count(), before);
@@ -1528,8 +1557,12 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial(keyring)]
     async fn muxed_contract_mainnet_payment_refuses_before_state() {
-        use crate::tools::common::tests::mainnet::{Fixture, authorizations, x402_args};
-        let f = Fixture::new(|raw| raw);
+        use crate::tools::common::tests::mainnet::{
+            authorizations, mount_rpc, routed_fixture, x402_args,
+        };
+        let rpc = wiremock::MockServer::start().await;
+        let f = routed_fixture(|raw| raw, &rpc);
+        let control = mount_rpc(&f, &rpc).await;
         let mut args = x402_args(&f, None);
         let mut requirements = f.requirements();
         requirements.pay_to =
@@ -1541,11 +1574,12 @@ mod tests {
             .await
             .unwrap();
         let (code, message, _) = crate::tools::common::assert_business_envelope(&result);
-        assert_eq!(code, "x402.invalid_recipient_address");
+        assert_eq!(code, "x402.muxed_contract_protocol_unsupported");
         assert_eq!(
             message,
-            "invalid recipient address: pay_to must be a G-, C-, or M-strkey"
+            "a W (muxed contract) payee requires Stellar protocol 30 or later; the network reports protocol 29"
         );
+        assert_eq!(control.count("simulateTransaction"), 0);
         assert_eq!(f.seed_reads.load(std::sync::atomic::Ordering::SeqCst), 0);
         assert!(authorizations(&f).is_empty());
     }
@@ -2868,7 +2902,7 @@ mod tests {
             (
                 "payTo",
                 "x402.invalid_recipient_address",
-                "invalid recipient address: pay_to must be a G-, C-, or M-strkey",
+                "invalid recipient address: pay_to must be a G-, C-, M-, or W-strkey",
             ),
             (
                 "scheme",

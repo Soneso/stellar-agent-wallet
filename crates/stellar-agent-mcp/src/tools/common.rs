@@ -374,6 +374,36 @@ pub(crate) async fn probe_endpoint_network(
     Ok(())
 }
 
+/// Checks W eligibility before a payment enters policy or persistent state.
+/// Other payee forms need no additional endpoint request.
+pub(crate) async fn check_x402_payee_protocol(
+    pay_to: &str,
+    profile: &Profile,
+    primary_client: impl FnOnce() -> Result<
+        stellar_agent_network::StellarRpcClient,
+        stellar_agent_core::error::WalletError,
+    >,
+) -> Result<(), rmcp::model::CallToolResult> {
+    if !matches!(
+        stellar_strkey::Strkey::from_string(pay_to),
+        Ok(stellar_strkey::Strkey::MuxedContract(_))
+    ) {
+        return Ok(());
+    }
+    let client = primary_client().map_err(|error| endpoint_refusal_result(&error))?;
+    let deadline = tokio::time::Instant::now() + submit_timeout(profile);
+    let identity = if profile.chain_id.is_mainnet() {
+        client.mainnet_endpoint(deadline).await
+    } else {
+        client
+            .endpoint_identity(profile.chain_id.network_passphrase(), deadline)
+            .await
+    }
+    .map_err(|error| endpoint_refusal_result(&error))?;
+    stellar_agent_x402::exact::check_payee_protocol(pay_to, &identity)
+        .map_err(|error| x402_error_to_tool_result(&error))
+}
+
 /// Renders an endpoint identity refusal of a prepare or commit tool as an
 /// error tool result.
 ///
@@ -3350,6 +3380,33 @@ pub(crate) mod tests {
         atomic::{AtomicBool, AtomicU32, Ordering},
     };
     use stellar_agent_core::AuthError;
+
+    #[tokio::test]
+    async fn g_c_m_payees_do_not_build_an_eligibility_client() {
+        let profile = Profile::builder_testnet_named("muxed", "s", "a", "n", "a").build();
+        let attempts = std::cell::Cell::new(0);
+        for payee in [
+            stellar_strkey::ed25519::PublicKey([1; 32])
+                .to_string()
+                .to_string(),
+            stellar_strkey::Contract([3; 32]).to_string().to_string(),
+            stellar_strkey::ed25519::MuxedAccount {
+                ed25519: [1; 32],
+                id: 7,
+            }
+            .to_string()
+            .to_string(),
+        ] {
+            let result = check_x402_payee_protocol(&payee, &profile, || {
+                attempts.set(attempts.get() + 1);
+                Err(stellar_agent_core::error::NetworkError::MainnetWriteForbidden.into())
+            })
+            .await;
+            assert_eq!(attempts.get(), 0);
+            result.unwrap();
+        }
+        assert_eq!(attempts.get(), 0);
+    }
 
     /// A business id no other call of the test process names.
     pub(crate) fn fresh_business_id() -> String {
@@ -7591,6 +7648,10 @@ pub(crate) mod tests {
         /// What the RPC double answers, switched by a test, and what it saw.
         #[derive(Default)]
         pub(crate) struct RpcControl {
+            /// Protocol override; zero uses the fixture's supported default.
+            pub protocol: AtomicU32,
+            /// Every simulation envelope, including the unsigned request.
+            pub simulations: std::sync::Mutex<Vec<String>>,
             /// Every request method, in order.
             methods: std::sync::Mutex<Vec<String>>,
             /// Every envelope a `sendTransaction` carried.
@@ -7621,6 +7682,10 @@ pub(crate) mod tests {
             pub send_delay_ms: std::sync::atomic::AtomicU64,
             /// The unsigned `simulateTransaction` answers an error.
             pub first_simulation_error: AtomicBool,
+            /// The first simulation substitutes the payee id.
+            pub first_simulation_mux_id: AtomicBool,
+            /// The re-simulation substitutes only the signed payee id.
+            pub resimulation_mux_id: AtomicBool,
             /// The signed `simulateTransaction` answers an error.
             pub resimulation_error: AtomicBool,
             /// The signed `simulateTransaction` answers another authorization.
@@ -7729,6 +7794,11 @@ pub(crate) mod tests {
                     Limits::none(),
                 )
                 .unwrap();
+                self.control
+                    .simulations
+                    .lock()
+                    .unwrap()
+                    .push(body["params"]["transaction"].as_str().unwrap().to_owned());
                 let TransactionEnvelope::Tx(envelope) = envelope else {
                     panic!("transaction expected")
                 };
@@ -7776,6 +7846,16 @@ pub(crate) mod tests {
                     panic!("payer expected")
                 };
                 let unsigned_entry = |nonce: i64| {
+                    let mut invoke = invoke.clone();
+                    if self.control.first_simulation_mux_id.load(Ordering::SeqCst) {
+                        let mut args = invoke.args.to_vec();
+                        match &mut args[1] {
+                            ScVal::Address(ScAddress::MuxedAccount(m)) => m.id = 8,
+                            ScVal::Address(ScAddress::MuxedContract(w)) => w.id = 8,
+                            _ => panic!("muxed payee"),
+                        }
+                        invoke.args = args.try_into().unwrap();
+                    }
                     SorobanAuthorizationEntry {
                         credentials: SorobanCredentials::Address(SorobanAddressCredentials {
                             address: payer.clone(),
@@ -7793,6 +7873,21 @@ pub(crate) mod tests {
                 };
                 let auth = if !signed {
                     vec![unsigned_entry(7)]
+                } else if self.control.resimulation_mux_id.load(Ordering::SeqCst) {
+                    let mut entry = op.auth[0].clone();
+                    let SorobanAuthorizedFunction::ContractFn(call) =
+                        &mut entry.root_invocation.function
+                    else {
+                        panic!("transfer");
+                    };
+                    let mut args = call.args.to_vec();
+                    match &mut args[1] {
+                        ScVal::Address(ScAddress::MuxedAccount(m)) => m.id = 8,
+                        ScVal::Address(ScAddress::MuxedContract(w)) => w.id = 8,
+                        _ => panic!("muxed payee"),
+                    }
+                    call.args = args.try_into().unwrap();
+                    vec![entry.to_xdr_base64(Limits::none()).unwrap()]
                 } else if self.control.resimulation_other_auth.load(Ordering::SeqCst) {
                     vec![unsigned_entry(8)]
                 } else {
@@ -7865,18 +7960,24 @@ pub(crate) mod tests {
                     )
                 };
                 match method {
-                    "getNetwork" => answer(
-                        stellar_agent_test_support::signed_envelope::get_network_result(
-                            if self.control.testnet_passphrase.load(Ordering::SeqCst)
-                                || (self.control.passphrase_after_seed.load(Ordering::SeqCst)
-                                    && self.seed_reads.load(Ordering::SeqCst) != 0)
-                            {
-                                stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE
-                            } else {
-                                stellar_agent_core::profile::caip2::MAINNET_PASSPHRASE
-                            },
-                        ),
-                    ),
+                    "getNetwork" => {
+                        let mut result =
+                            stellar_agent_test_support::signed_envelope::get_network_result(
+                                if self.control.testnet_passphrase.load(Ordering::SeqCst)
+                                    || (self.control.passphrase_after_seed.load(Ordering::SeqCst)
+                                        && self.seed_reads.load(Ordering::SeqCst) != 0)
+                                {
+                                    stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE
+                                } else {
+                                    stellar_agent_core::profile::caip2::MAINNET_PASSPHRASE
+                                },
+                            );
+                        let protocol = self.control.protocol.load(Ordering::SeqCst);
+                        if protocol != 0 {
+                            result["protocolVersion"] = protocol.into();
+                        }
+                        answer(result)
+                    }
                     "getLedgerEntries" => {
                         if self.control.accounts_unavailable.load(Ordering::SeqCst) {
                             return wiremock::ResponseTemplate::new(200).set_body_json(
@@ -10892,6 +10993,12 @@ pub(crate) mod tests {
                 replay["error"]["code"], "policy.approval_consumed",
                 "{replay}"
             );
+        }
+
+        #[tokio::test]
+        #[serial_test::serial(keyring)]
+        async fn muxed_approval_preserves_full_destination() {
+            crate::tools::x402_authenticated_mainnet_tests::assert_muxed_approval_path(false).await;
         }
 
         /// A policy-authority payment checks the startup proofs before any
