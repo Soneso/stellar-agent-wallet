@@ -9,10 +9,21 @@ dispatch.
 
 ## Cut a release tag
 
-1. Merge the release preparation into `main` through a pull request. It bumps
-   the workspace version and every internal dependency pin (see
-   [Building and testing](building.md)) and adds a `## [<version>]` heading to
-   `CHANGELOG.md`.
+1. Prepare the release in a pull request to `main`.
+   Bump the workspace version, every internal dependency pin, and documentation pins as [Building and testing](building.md) describes.
+   Put the existing Unreleased body under a dated `## [<version>] - YYYY-MM-DD` heading.
+   Leave a fresh `## [Unreleased]` heading above it and update the comparison definitions separately.
+   Keep existing entries in place within the new version section.
+   Run the fragment fold with the version string without `v`:
+
+   ```bash
+   python3 .github/scripts/changelog.py check
+   python3 .github/scripts/changelog.py release --version VERSION
+   ```
+
+   Review the compiled entries and fragment deletions, then merge the preparation pull request.
+   Rerun release mode when pending fragments remain, including fragments that arrive during preparation.
+   Resolve a fragment modify/delete conflict in favor of deletion; the release section contains that entry.
 2. Wait for CI to pass on that `main` commit.
 3. From a checkout of that commit, check the workspace members on crates.io:
 
@@ -50,10 +61,16 @@ these holds:
 - A workspace member's version differs from the tag.
 - A workspace member's `repository` differs from this repository's URL.
 - `CHANGELOG.md` has no heading for the version.
+- `changelog.d/` contains any entry other than `README.md`, including hidden files or directories.
 - The documented install surface fails
   `.github/scripts/check-install-surface.py`.
 - `cargo deny check` fails.
 - The checkout has uncommitted or untracked files.
+
+`Verify no pending changelog fragments` reads the tagged tree immediately after the version header check.
+When it fails, rerun release mode during preparation, review the fold, and merge the prepared version before tagging.
+Release preparation is the only procedure that changes the compiled changelog.
+The release workflow reads the folded entries and leaves the tagged tree unchanged.
 
 A tag push runs the `release.yml` of the tagged commit. These checks therefore
 bind only tags whose commit carries them. The settings in
@@ -185,6 +202,7 @@ them before the next release.
 
 - A tag ruleset on `refs/tags/v*` that restricts creations, updates, and
   deletions, with a bypass list of release maintainers only.
+- The rulesets for `main` and `mainnet-write` require the `changelog` check.
 - The `release-signing` environment:
   - The five secrets `APPLE_DEVELOPER_ID_P12`,
     `APPLE_DEVELOPER_ID_P12_PASSWORD`, `APPLE_ASC_API_KEY_P8`,

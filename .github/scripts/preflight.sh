@@ -75,7 +75,7 @@ POLICY_PIN_CRATE=stellar-agent-core
 TEST_SUPPORT_CRATE=stellar-agent-test-support
 # The workflows that check-workflow-invariants.py reads, as its docstring
 # names them.
-INVARIANT_WORKFLOWS="release publish notarize-smoke labels stale triage triage-review triage-sweep welcome coverage release-rehearsal ci vendored-wasm"
+INVARIANT_WORKFLOWS="release publish notarize-smoke labels stale triage triage-review triage-sweep welcome coverage release-rehearsal ci vendored-wasm changelog"
 
 die() {
   echo "preflight: $*" >&2
@@ -119,6 +119,8 @@ PYFEATURES
 docs-style	python3 .github/scripts/check-docs-style.py	-	install-surface.yml	install-surface	Check the docs style
 install-surface	python3 .github/scripts/check-install-surface.py	-	install-surface.yml	install-surface	Check the install surface
 gate-tool-versions	bash .github/scripts/check-gate-tool-versions.sh	-	install-surface.yml	install-surface	Check the gate tool versions
+changelog	python3 .github/scripts/changelog.py check	-	changelog.yml	changelog	Check changelog fragments
+self-test:test-changelog.py	python3 .github/scripts/test-changelog.py	-	changelog.yml	changelog	Test changelog fragments
 actionlint	actionlint	actionlint	install-surface.yml	install-surface	Check workflows
 feature-discipline	cargo fetch --locked && python3 .github/scripts/check-feature-discipline.py	cargo,yaml	ci.yml	feature-discipline	Check feature discipline and assertions
 self-test:test-check-feature-discipline.py	python3 .github/scripts/test-check-feature-discipline.py --mutations	cargo,yaml	ci.yml	feature-discipline	Check feature discipline and assertions
@@ -326,6 +328,7 @@ is_invariant_script() {
 # that still exists.
 select_self_tests() {
   case "$1" in
+    changelog.d/* | .github/scripts/changelog.py) select_gate self-test:test-changelog.py ;;
     .github/scripts/check-coverage.py) select_gate self-test:test-check-coverage.py ;;
     .github/scripts/check-crates-exist.sh) select_gate self-test:test-check-crates-exist.sh ;;
     .github/scripts/check-docs-style.py) select_gate self-test:test-check-docs-style.py ;;
@@ -377,6 +380,9 @@ select_invariant_gates() {
 # $SCRATCH/shell as an operand of the shellcheck-changed gate.
 select_for_path() {
   local path=$1 name
+  case "$path" in
+    changelog.d/* | .github/scripts/changelog.py | .github/scripts/test-changelog.py) select_gate changelog ;;
+  esac
   case "$path" in
     Cargo.toml | */Cargo.toml | Cargo.lock | .github/workflows/* | .github/actions/* | .github/scripts/* | Cross.toml | .cargo/config* | */.cargo/config* | */build.rs | crates/*.rs | docs/maintainers/building.md)
       select_gate feature-discipline

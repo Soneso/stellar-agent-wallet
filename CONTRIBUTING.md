@@ -247,6 +247,28 @@ The file may live outside the checkout.
 Commit messages and pull request descriptions follow the same rules except for
 tense, which the next section sets.
 
+## Changelog entries
+
+A fragment is a pending changelog entry under `changelog.d/`.
+It supplies the entry that source compatibility policies require.
+Add one `<slug>.<category>.md` file for each category your change needs.
+Use a descriptive branch name as the slug, replacing slashes with hyphens.
+Use a topic slug for generic branch names such as `main` or `patch-1`.
+Use lowercase letters, digits, and hyphens; omit the pull request number.
+Categories are `added`, `changed`, `deprecated`, `removed`, `fixed`, and `security`.
+Each top-level entry starts with `- ` and contains text.
+Indented continuations and nested lists follow an entry; headings and metadata are invalid.
+
+Keep `CHANGELOG.md` and the fragment README unchanged in contributing pull requests.
+An open pull request with a changelog hunk moves its entries into fragments and drops that hunk.
+The integration guard permits changelog changes from commits that `main` holds.
+Distinct fragment filenames avoid changelog conflicts between pull requests.
+Rename one fragment when two files share a filename and produce an add/add conflict.
+
+Run `python3 .github/scripts/changelog.py check` to validate your fragments.
+Run `python3 .github/scripts/changelog.py preview` to read the folded Unreleased section without changing files.
+See [Fragment format](changelog.d/README.md) and [Release preparation](docs/maintainers/releasing.md#cut-a-release-tag).
+
 ## Commit and pull request conventions
 
 - The subject line of a commit and the title of a pull request are one imperative

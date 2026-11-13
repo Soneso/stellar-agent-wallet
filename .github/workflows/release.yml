@@ -124,6 +124,13 @@ jobs:
         env:
           TAG_VERSION: ${{ steps.version.outputs.version }}
 
+      - name: Verify no pending changelog fragments
+        shell: bash
+        run: |
+          set -euo pipefail
+          PENDING=$(find changelog.d -mindepth 1 -maxdepth 1 ! -name README.md -print)
+          test -z "$PENDING"
+
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.13"

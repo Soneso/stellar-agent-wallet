@@ -299,6 +299,8 @@ matches:
   copies of those files. A deleted path counts too.
 - Any other docs file adds no gates beyond the three always gates. Directory
   scopes also apply to Markdown files.
+- A fragment under `changelog.d/`, the changelog utility, or its test selects `changelog` and `self-test:test-changelog.py`.
+  The changelog workflow selects both workflow invariant gates.
 - A workflow under `.github/workflows/`, a file under `.github/actions/`, or
   `.github/labels.yml` selects `actionlint`.
 - A file under `.github/scripts/` selects the self-test of the script it
@@ -684,6 +686,11 @@ the post-bump verification.
 
 Release preparation also bumps the version pins in the documentation and the
 crate READMEs, which a CI check compares with the workspace version.
+
+Release preparation creates the dated version section below a fresh Unreleased heading and runs `python3 .github/scripts/changelog.py release --version VERSION`.
+Review the folded entries and fragment deletions before merging the preparation pull request to `main`.
+Rerun release mode when pending fragments remain. Tag only the merged, passing commit with no pending fragments.
+See [Releasing](releasing.md#cut-a-release-tag) for the full sequence.
 
 MPP storage uses the same cross-platform locking contract as the approval and
 policy stores. Windows CI must cover MPP state lock contention, atomic replace,

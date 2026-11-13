@@ -4,7 +4,7 @@
 Usage: check-install-surface.py [ROOT]
 
 ROOT defaults to the current directory and must be a git work tree. The check
-reads the Markdown files `git ls-files '*.md'` lists, except `CHANGELOG.md`,
+reads the Markdown files `git ls-files '*.md'` lists, except `CHANGELOG.md`, `changelog.d/**`,
 `crates/*/vendor/**`, `crates/*/tests/fixtures/**`, and
 `.github/scripts/fixtures/**`, which describe recorded artifacts rather than
 the install surface, plus the root `Cargo.toml` and the manifests of the two
@@ -251,6 +251,8 @@ def is_scanned(path: str) -> bool:
     if not path.endswith(".md") or path == "CHANGELOG.md":
         return False
     parts = path.split("/")
+    if parts[0] == "changelog.d":
+        return False
     if len(parts) > 3 and parts[0] == "crates" and parts[2] == "vendor":
         return False
     if len(parts) > 3 and parts[:3] == [".github", "scripts", "fixtures"]:
