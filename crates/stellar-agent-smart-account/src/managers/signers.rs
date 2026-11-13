@@ -134,8 +134,8 @@ use crate::error::{
 use crate::managers::auth_entry::{PreSubmitBudget, bound_pre_submit_stage};
 use crate::managers::migration::PendingAddStep;
 use crate::managers::rules::{
-    BASE_FEE_STROOPS, ExpectedInstallState, ExpiryCheck, contract_instance_key,
-    read_only_simulation_reason, scaddress_to_strkey,
+    BASE_FEE_STROOPS, ExpectedInstallState, ExpiryCheck, SimulationFailure, contract_instance_key,
+    read_only_refusal, scaddress_to_strkey,
 };
 use crate::managers::verifiers::{PinnedKind, PlannedPinUpdate};
 use crate::signers::policy_identification::THRESHOLD_POLICY_WASM_HASHES;
@@ -4230,7 +4230,7 @@ impl SignersManager {
 
         let invoke_args = vec![ScVal::U32(rule_id), ScVal::Address(smart_account)];
 
-        let sim_result = simulate_read_only_with_ledger(
+        let sim_result = simulate_read_only_described(
             self.primary_rpc_client.url(),
             policy,
             "get_spending_limit_data",
@@ -4250,14 +4250,18 @@ impl SignersManager {
         // maps to a typed error rather than `Ok(None)`.
         let (scval, as_of_ledger) = match sim_result {
             Ok(v) => v,
-            Err(SaError::DeploymentFailed {
-                phase,
-                redacted_reason,
-            }) if phase == "simulate"
-                && (redacted_reason.contains("SmartAccountNotInstalled")
-                    // Exact bracketed form only: a bare "#3220" substring
-                    // would prefix-over-match hypothetical codes 3220x.
-                    || redacted_reason.contains("Error(Contract, #3220)")) =>
+            Err(failure)
+                if matches!(
+                    failure.text_error(),
+                    SaError::DeploymentFailed {
+                        phase,
+                        redacted_reason,
+                    } if *phase == "simulate"
+                        && (redacted_reason.contains("SmartAccountNotInstalled")
+                            // Exact bracketed form only: a bare "#3220" substring
+                            // would prefix-over-match hypothetical codes 3220x.
+                            || redacted_reason.contains("Error(Contract, #3220)"))
+                ) =>
             {
                 return Err(SaError::SpendingLimitNotInstalled {
                     rule_id,
@@ -4267,7 +4271,7 @@ impl SignersManager {
                     request_id,
                 });
             }
-            Err(other) => return Err(other),
+            Err(other) => return Err(other.into_shown()),
         };
 
         let data = crate::managers::spending_limit_data::decode_spending_limit_data(&scval)?;
@@ -4521,7 +4525,7 @@ impl SignersManager {
         let smart_account_redacted = redact_strkey_first5_last5(&smart_account_strkey);
 
         let threshold_args = vec![ScVal::U32(rule_id), ScVal::Address(smart_account.clone())];
-        let threshold_sim = simulate_read_only_with_ledger(
+        let threshold_sim = simulate_read_only_described(
             self.primary_rpc_client.url(),
             policy.clone(),
             "get_threshold",
@@ -4534,12 +4538,16 @@ impl SignersManager {
 
         let (threshold_scval, _as_of_ledger) = match threshold_sim {
             Ok(v) => v,
-            Err(SaError::DeploymentFailed {
-                phase,
-                redacted_reason,
-            }) if phase == "simulate"
-                && (redacted_reason.contains("SmartAccountNotInstalled")
-                    || redacted_reason.contains("Error(Contract, #3210)")) =>
+            Err(failure)
+                if matches!(
+                    failure.text_error(),
+                    SaError::DeploymentFailed {
+                        phase,
+                        redacted_reason,
+                    } if *phase == "simulate"
+                        && (redacted_reason.contains("SmartAccountNotInstalled")
+                            || redacted_reason.contains("Error(Contract, #3210)"))
+                ) =>
             {
                 return Err(SaError::WeightedThresholdNotInstalled {
                     rule_id,
@@ -4549,7 +4557,7 @@ impl SignersManager {
                     request_id,
                 });
             }
-            Err(other) => return Err(other),
+            Err(other) => return Err(other.into_shown()),
         };
 
         let threshold = extract_u32_return(&threshold_scval, "get_threshold")?;
@@ -6093,7 +6101,7 @@ impl SignersManager {
                 continue;
             }
             return Ok(EndpointRead {
-                rule: decode_context_rule_scval(outcome?)?,
+                rule: decode_context_rule_scval(outcome.map_err(SimulationFailure::into_shown)?)?,
                 ledger,
                 threshold: None,
             });
@@ -6229,7 +6237,7 @@ impl SignersManager {
                 ))),
                 ledger,
             )),
-            Ok((Err(e), ledger)) => Ok((Err(refused(e.to_string())), ledger)),
+            Ok((Err(e), ledger)) => Ok((Err(refused(e.into_shown().to_string())), ledger)),
             Err(e) => Err(refused(e.to_string())),
         }
     }
@@ -9113,6 +9121,30 @@ pub(crate) async fn simulate_read_only_with_ledger(
     network_passphrase: &str,
     timeout: Duration,
 ) -> Result<(ScVal, u32), SaError> {
+    simulate_read_only_described(
+        rpc_url,
+        smart_account,
+        entrypoint,
+        invoke_args,
+        source_account_strkey,
+        network_passphrase,
+        timeout,
+    )
+    .await
+    .map_err(SimulationFailure::into_shown)
+}
+
+/// [`simulate_read_only_with_ledger`] whose refusal keeps the text error a
+/// caller's decision reads beside the error the wallet shows.
+pub(crate) async fn simulate_read_only_described(
+    rpc_url: &str,
+    smart_account: ScAddress,
+    entrypoint: &'static str,
+    invoke_args: Vec<ScVal>,
+    source_account_strkey: Option<&str>,
+    network_passphrase: &str,
+    timeout: Duration,
+) -> Result<(ScVal, u32), SimulationFailure> {
     let (outcome, latest_ledger) = simulate_read_only_at_ledger(
         rpc_url,
         smart_account,
@@ -9147,7 +9179,7 @@ async fn simulate_read_only_at_ledger(
     source_account_strkey: Option<&str>,
     network_passphrase: &str,
     timeout: Duration,
-) -> Result<(Result<ScVal, SaError>, u32), SaError> {
+) -> Result<(Result<ScVal, SimulationFailure>, u32), SaError> {
     let auth_payload_err = |reason: String| SaError::AuthEntryConstructionFailed {
         stage: "auth_payload",
         redacted_reason: reason,
@@ -9221,10 +9253,12 @@ async fn simulate_read_only_at_ledger(
     let latest_ledger = sim.latest_ledger;
     if let Some(err) = &sim.error {
         return Ok((
-            Err(SaError::DeploymentFailed {
-                phase: "simulate",
-                redacted_reason: read_only_simulation_reason(entrypoint, err),
-            }),
+            Err(read_only_refusal(
+                entrypoint,
+                err,
+                &sim.events,
+                &sim_envelope,
+            )),
             latest_ledger,
         ));
     }
@@ -9244,7 +9278,7 @@ async fn simulate_read_only_at_ledger(
                 )
             });
 
-    Ok((return_val, latest_ledger))
+    Ok((return_val.map_err(SimulationFailure::from), latest_ledger))
 }
 
 // ── OnChainContextRule ────────────────────────────────────────────────────────
@@ -14005,5 +14039,134 @@ pub(crate) mod tests {
                 .map(drop)
         })
         .await;
+    }
+
+    /// A signers manager reading from `rpc_url`, with its audit log in `dir`.
+    fn read_manager(rpc_url: &str, dir: &tempfile::TempDir) -> SignersManager {
+        let audit_log_path = dir.path().join("audit.jsonl");
+        let audit_writer = Arc::new(Mutex::new(
+            AuditWriter::open(audit_log_path.clone(), None).unwrap(),
+        ));
+        SignersManager::new(SignersManagerConfig::new(
+            rpc_url.to_owned(),
+            rpc_url.to_owned(),
+            audit_writer,
+            audit_log_path,
+            "Test SDF Network ; September 2015".to_owned(),
+            "test-profile".to_owned(),
+            Duration::from_secs(5),
+            "stellar:testnet".to_owned(),
+        ))
+        .unwrap()
+    }
+
+    /// A mock endpoint refusing every simulation with `error` and an event of
+    /// the policy carrying `code`, or with `error` alone when `code` is `None`.
+    async fn policy_refusal(error: &str, code: Option<u32>) -> wiremock::MockServer {
+        use crate::managers::rules::event_reason_tests::{
+            POLICY, error_event, read_only_server, refusal_result,
+        };
+        let events: Vec<String> = code
+            .map(|code| error_event(POLICY, code))
+            .into_iter()
+            .collect();
+        let source = stellar_strkey::ed25519::PublicKey([7; 32]).to_string();
+        read_only_server(&source, refusal_result(error, &events)).await
+    }
+
+    /// The spending-limit read shows the policy's event code and decides
+    /// `SpendingLimitNotInstalled` only from the error text.
+    #[tokio::test]
+    async fn spending_limit_read_ignores_events() {
+        use crate::managers::rules::event_reason_tests::{
+            POLICY, RPC30_ERROR, SMART_ACCOUNT, address,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let server = policy_refusal(RPC30_ERROR, Some(3220)).await;
+        let result = read_manager(&server.uri(), &dir)
+            .get_spending_limit_data(
+                address(POLICY),
+                1,
+                address(SMART_ACCOUNT),
+                None,
+                "req".to_owned(),
+            )
+            .await;
+        match result {
+            Err(SaError::DeploymentFailed {
+                phase: "simulate",
+                redacted_reason,
+            }) => assert!(
+                redacted_reason.starts_with(
+                    "get_spending_limit_data simulation error: Error(Contract, #3220)"
+                ),
+                "{redacted_reason}"
+            ),
+            other => panic!("expected the simulate refusal, got {other:?}"),
+        }
+
+        let server = policy_refusal("HostError: Error(Contract, #3220)", None).await;
+        let result = read_manager(&server.uri(), &dir)
+            .get_spending_limit_data(
+                address(POLICY),
+                1,
+                address(SMART_ACCOUNT),
+                None,
+                "req".to_owned(),
+            )
+            .await;
+        assert!(
+            matches!(result, Err(SaError::SpendingLimitNotInstalled { .. })),
+            "{result:?}"
+        );
+    }
+
+    /// The threshold read shows the policy's event code and decides
+    /// `WeightedThresholdNotInstalled` only from the error text.
+    #[tokio::test]
+    async fn weighted_threshold_read_ignores_events() {
+        use crate::managers::rules::event_reason_tests::{
+            POLICY, RPC30_ERROR, SMART_ACCOUNT, address,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let server = policy_refusal(RPC30_ERROR, Some(3210)).await;
+        let result = read_manager(&server.uri(), &dir)
+            .get_weighted_threshold_view(
+                address(POLICY),
+                1,
+                address(SMART_ACCOUNT),
+                ScVal::Void,
+                None,
+                "req".to_owned(),
+            )
+            .await;
+        match result {
+            Err(SaError::DeploymentFailed {
+                phase: "simulate",
+                redacted_reason,
+            }) => assert_eq!(
+                redacted_reason,
+                "get_threshold simulation error: Error(Contract, #3210)"
+            ),
+            Err(other) => panic!("expected the simulate refusal, got {other:?}"),
+            Ok(_) => panic!("expected the simulate refusal, got a view"),
+        }
+
+        let server = policy_refusal("HostError: Error(Contract, #3210)", None).await;
+        let result = read_manager(&server.uri(), &dir)
+            .get_weighted_threshold_view(
+                address(POLICY),
+                1,
+                address(SMART_ACCOUNT),
+                ScVal::Void,
+                None,
+                "req".to_owned(),
+            )
+            .await;
+        assert!(
+            matches!(result, Err(SaError::WeightedThresholdNotInstalled { .. })),
+            "{:?}",
+            result.err()
+        );
     }
 }

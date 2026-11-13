@@ -83,11 +83,11 @@ use crate::error::{
 };
 use crate::managers::credentials::AuditWriterPoisonContext;
 use crate::managers::rules::{
-    BASE_FEE_STROOPS, SimulationErrorClass, augment_with_oz_error_name,
-    parse_c_strkey_to_smart_account,
+    BASE_FEE_STROOPS, augment_with_oz_error_name, parse_c_strkey_to_smart_account, refusal_text,
 };
 use crate::signing::ledger_witness::checked_secondary_rpc_url;
 use crate::submit::refuse_mainnet_sa;
+use crate::timelock_submit::TimelockSubmitFailure;
 
 // ── OZ Timelock error codes ───────────────────────────────────────────────────
 // Referenced as `OzTimelockError::Variant as u32`.
@@ -488,18 +488,30 @@ fn keeps_its_wire_code(e: &SaError) -> bool {
 ///
 /// Mainnet, policy, intent, and ledger witness refusals keep their codes.
 /// Every other error becomes
-/// [`SaError::TimelockScheduleFailed`], classified from its text.
-fn schedule_submit_error(e: SaError, request_id: &str) -> SaError {
-    if keeps_its_wire_code(&e) {
-        return e;
+/// [`SaError::TimelockScheduleFailed`], classified from its text error.
+fn schedule_submit_error(e: impl Into<TimelockSubmitFailure>, request_id: &str) -> SaError {
+    let f = e.into();
+    if keeps_its_wire_code(f.text_error()) {
+        return f.into_shown();
     }
 
-    let reason = format!("{e}");
+    let reason = format!("{}", f.text_error());
     let classified = classify_schedule_error(&reason);
     SaError::TimelockScheduleFailed {
         failure_reason: classified,
-        redacted_reason: augment_with_oz_error_name(&reason),
+        redacted_reason: shown_reason(f, &reason),
         request_id: request_id.to_owned(),
+    }
+}
+
+/// The reason a timelock failure shows: the shown error's rendering
+/// unchanged when the failure is described, and the text error's rendering
+/// `reason` with its OZ name otherwise.
+fn shown_reason(f: TimelockSubmitFailure, reason: &str) -> String {
+    if f.is_described() {
+        format!("{}", f.into_shown())
+    } else {
+        augment_with_oz_error_name(reason)
     }
 }
 
@@ -507,13 +519,14 @@ fn schedule_submit_error(e: SaError, request_id: &str) -> SaError {
 ///
 /// Mainnet, policy, intent, and ledger witness refusals keep their codes.
 /// Every other error becomes
-/// [`SaError::TimelockCancelFailed`], classified from its text.
-fn cancel_submit_error(e: SaError, request_id: &str) -> SaError {
-    if keeps_its_wire_code(&e) {
-        return e;
+/// [`SaError::TimelockCancelFailed`], classified from its text error.
+fn cancel_submit_error(e: impl Into<TimelockSubmitFailure>, request_id: &str) -> SaError {
+    let f = e.into();
+    if keeps_its_wire_code(f.text_error()) {
+        return f.into_shown();
     }
 
-    let reason = format!("{e}");
+    let reason = format!("{}", f.text_error());
     let classified = classify_cancel_error(&reason);
     // OZ `cancel_operation` fires `InvalidOperationState` (4002) for any
     // non-pending op (including never-scheduled ones). Code 4006
@@ -522,7 +535,7 @@ fn cancel_submit_error(e: SaError, request_id: &str) -> SaError {
     // `classify_cancel_error` which extracts the OZ code internally.
     SaError::TimelockCancelFailed {
         failure_reason: classified,
-        redacted_reason: augment_with_oz_error_name(&reason),
+        redacted_reason: shown_reason(f, &reason),
         request_id: request_id.to_owned(),
     }
 }
@@ -531,17 +544,20 @@ fn cancel_submit_error(e: SaError, request_id: &str) -> SaError {
 ///
 /// Unresolved submissions, mainnet, policy, intent, and ledger witness refusals
 /// keep their codes. Every other error becomes [`SaError::TimelockExecuteFailed`],
-/// classified from its text.
-fn execute_submit_error(e: SaError, request_id: &str) -> SaError {
-    if matches!(e, SaError::SubmissionUnresolved { .. }) || keeps_its_wire_code(&e) {
-        return e;
+/// classified from its text error.
+fn execute_submit_error(e: impl Into<TimelockSubmitFailure>, request_id: &str) -> SaError {
+    let f = e.into();
+    if matches!(f.text_error(), SaError::SubmissionUnresolved { .. })
+        || keeps_its_wire_code(f.text_error())
+    {
+        return f.into_shown();
     }
 
-    let reason = format!("{e}");
+    let reason = format!("{}", f.text_error());
     let classified = classify_execute_error(&reason);
     SaError::TimelockExecuteFailed {
         failure_reason: classified,
-        redacted_reason: augment_with_oz_error_name(&reason),
+        redacted_reason: shown_reason(f, &reason),
         request_id: request_id.to_owned(),
     }
 }
@@ -1642,7 +1658,7 @@ pub async fn schedule_upgrade(
         },
         other => other,
     })?;
-    let result = crate::timelock_submit::submit_timelock_invoke_with_g_key_auth(
+    let result = crate::timelock_submit::submit_timelock_invoke_described(
         crate::timelock_submit::TimelockSubmitArgs {
             schedule_identity: Some((timelock_contract_strkey, operation_id.inner)),
             host_function,
@@ -1857,7 +1873,7 @@ pub async fn cancel(args: TimelockCancelArgs<'_>) -> Result<(), SaError> {
     // The OZ TimelockController is NOT a smart-account; `cancel` calls
     // `canceller.require_auth()` on the G-key Address argument.
     // OZ mod.rs:292 (SHA a9c4216): `canceller.require_auth()`.
-    let result = crate::timelock_submit::submit_timelock_invoke_with_g_key_auth(
+    let result = crate::timelock_submit::submit_timelock_invoke_described(
         crate::timelock_submit::TimelockSubmitArgs {
             schedule_identity: None,
             host_function,
@@ -2300,7 +2316,7 @@ pub async fn execute(args: TimelockExecuteArgs<'_>) -> Result<String, SaError> {
     // `executor.require_auth()` on the G-key Address argument (only when an
     // explicit executor is supplied; open execution passes None).
     // OZ mod.rs:244-245 (SHA a9c4216): `if let Some(ref exec) = executor { exec.require_auth() }`.
-    let result = crate::timelock_submit::submit_timelock_invoke_with_g_key_auth(
+    let result = crate::timelock_submit::submit_timelock_invoke_described(
         crate::timelock_submit::TimelockSubmitArgs {
             schedule_identity: None,
             host_function,
@@ -2767,7 +2783,7 @@ async fn simulate_hash_operation(
             failure_reason: TimelockExecuteFailureReason::SimulationFailed,
             redacted_reason: format!(
                 "primary simulation error: {}",
-                SimulationErrorClass::of(err)
+                refusal_text(err, &primary_sim.events, &sim_envelope)
             ),
             request_id: request_id.to_owned(),
         });
@@ -2777,7 +2793,7 @@ async fn simulate_hash_operation(
             failure_reason: TimelockExecuteFailureReason::SimulationFailed,
             redacted_reason: format!(
                 "secondary simulation error: {}",
-                SimulationErrorClass::of(err)
+                refusal_text(err, &secondary_sim.events, &sim_envelope)
             ),
             request_id: request_id.to_owned(),
         });
@@ -3894,5 +3910,213 @@ mod tests {
             matches!(wrapped, SaError::TimelockExecuteFailed { ref request_id, .. } if request_id == "req-3"),
             "another error must still be wrapped, got {wrapped:?}"
         );
+    }
+
+    /// A refusal of the timelock with `label`, whose text is the RPC 30.0.1
+    /// host error and whose event carries `code`.
+    fn described_refusal(label: &str, code: u32) -> TimelockSubmitFailure {
+        use crate::managers::rules::event_reason_tests::{encode, error_topics, invoke_envelope};
+        let envelope = invoke_envelope(
+            &ScAddress::Contract(stellar_xdr::ContractId(stellar_xdr::Hash([0x52; 32]))),
+            vec![],
+            vec![],
+        );
+        crate::managers::rules::simulation_refusal(
+            crate::managers::rules::event_reason_tests::RPC30_ERROR,
+            &encode(&[(Some([0x52; 32]), error_topics(code), ScVal::Void)]),
+            &envelope,
+            |class| SaError::DeploymentFailed {
+                phase: "simulate",
+                redacted_reason: format!("{label} simulation returned error: {class}"),
+            },
+        )
+    }
+
+    /// The rendering of the shown error of [`described_refusal`].
+    fn shown_text(label: &str, code: u32) -> String {
+        format!("{}", described_refusal(label, code).into_shown())
+    }
+
+    /// Asserts that `reason` is `expected` with exactly one OZ annotation.
+    fn assert_one_annotation(reason: &str, expected: &str) {
+        assert_eq!(reason, expected);
+        assert_eq!(reason.matches("[OZ:").count(), 1, "{reason}");
+    }
+
+    /// The failure labels and wire codes come from the text error; the
+    /// reason is the shown error's rendering, passed unchanged.
+    #[test]
+    fn timelock_labels_ignore_event_reasons() {
+        let text_only = |label: &str| SaError::DeploymentFailed {
+            phase: "simulate",
+            redacted_reason: format!(
+                "{label} simulation returned error: Error(Auth, InvalidAction)"
+            ),
+        };
+        for code in [4004, 4002, 4005] {
+            let schedule = schedule_submit_error(described_refusal("schedule", code), "req");
+            assert_eq!(
+                schedule.wire_code(),
+                schedule_submit_error(text_only("schedule"), "req").wire_code()
+            );
+            match schedule {
+                SaError::TimelockScheduleFailed {
+                    failure_reason: TimelockScheduleFailureReason::SimulationFailed,
+                    redacted_reason,
+                    ..
+                } => assert_one_annotation(&redacted_reason, &shown_text("schedule", code)),
+                other => panic!("schedule keeps the simulation label, got {other:?}"),
+            }
+            let cancel = cancel_submit_error(described_refusal("cancel", code), "req");
+            assert_eq!(
+                cancel.wire_code(),
+                cancel_submit_error(text_only("cancel"), "req").wire_code()
+            );
+            match cancel {
+                SaError::TimelockCancelFailed {
+                    failure_reason: TimelockCancelFailureReason::SimulationFailed,
+                    redacted_reason,
+                    ..
+                } => assert_one_annotation(&redacted_reason, &shown_text("cancel", code)),
+                other => panic!("cancel keeps the simulation label, got {other:?}"),
+            }
+            let execute = execute_submit_error(described_refusal("execute", code), "req");
+            assert_eq!(
+                execute.wire_code(),
+                execute_submit_error(text_only("execute"), "req").wire_code()
+            );
+            match execute {
+                SaError::TimelockExecuteFailed {
+                    failure_reason: TimelockExecuteFailureReason::SimulationFailed,
+                    redacted_reason,
+                    ..
+                } => assert_one_annotation(&redacted_reason, &shown_text("execute", code)),
+                other => panic!("execute keeps the simulation label, got {other:?}"),
+            }
+        }
+
+        let old = |code: u32| SaError::DeploymentFailed {
+            phase: "simulate",
+            redacted_reason: format!("simulation returned error: Error(Contract, #{code})"),
+        };
+        assert!(matches!(
+            schedule_submit_error(old(4004), "req"),
+            SaError::TimelockScheduleFailed {
+                failure_reason: TimelockScheduleFailureReason::Unauthorized,
+                ..
+            }
+        ));
+        assert!(matches!(
+            cancel_submit_error(old(4004), "req"),
+            SaError::TimelockCancelFailed {
+                failure_reason: TimelockCancelFailureReason::Unauthorized,
+                ..
+            }
+        ));
+        assert!(matches!(
+            cancel_submit_error(old(4002), "req"),
+            SaError::TimelockCancelFailed {
+                failure_reason: TimelockCancelFailureReason::InvalidOperationState,
+                ..
+            }
+        ));
+        assert!(matches!(
+            execute_submit_error(old(4002), "req"),
+            SaError::TimelockExecuteFailed {
+                failure_reason: TimelockExecuteFailureReason::InvalidOperationState,
+                ..
+            }
+        ));
+    }
+
+    /// A checked hash endpoint that refuses with the RPC 30.0.1 host error and
+    /// a timelock event carrying 4004 when `refuses`, and answers a hash
+    /// otherwise.
+    async fn hash_endpoint(refuses: bool) -> wiremock::MockServer {
+        use crate::managers::rules::event_reason_tests::{
+            RPC30_ERROR, encode, error_topics, refusal_result,
+        };
+        use stellar_agent_test_support::signed_envelope::get_network_result;
+        use stellar_xdr::WriteXdr as _;
+        let server = wiremock::MockServer::start().await;
+        let refusal = refusal_result(
+            RPC30_ERROR,
+            &encode(&[(
+                Some(
+                    stellar_strkey::Contract::from_string(ZERO_CONTRACT)
+                        .unwrap()
+                        .0,
+                ),
+                error_topics(4004),
+                ScVal::Void,
+            )]),
+        );
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(move |request: &wiremock::Request| {
+                let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                let result = match body["method"].as_str().unwrap() {
+                    "getNetwork" => {
+                        get_network_result(stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE)
+                    }
+                    "simulateTransaction" if refuses => refusal.clone(),
+                    "simulateTransaction" => serde_json::json!({
+                        "latestLedger": 1000,
+                        "minResourceFee": "100",
+                        "transactionData": stellar_xdr::SorobanTransactionData::default()
+                            .to_xdr_base64(stellar_xdr::Limits::none())
+                            .unwrap(),
+                        "results": [{
+                            "auth": [],
+                            "xdr": ScVal::Bytes(vec![7; 32].try_into().unwrap())
+                                .to_xdr_base64(stellar_xdr::Limits::none())
+                                .unwrap(),
+                        }],
+                    }),
+                    other => panic!("unexpected method {other}"),
+                };
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": body["id"],
+                    "result": result,
+                }))
+            })
+            .mount(&server)
+            .await;
+        server
+    }
+
+    /// Both `hash_operation` refusals show the timelock's event code and keep
+    /// the fixed simulation label.
+    #[tokio::test]
+    async fn hash_operation_refusal_shows_the_event_code() {
+        for (primary_refuses, prefix) in [(true, "primary"), (false, "secondary")] {
+            let primary = hash_endpoint(primary_refuses).await;
+            let secondary = hash_endpoint(!primary_refuses).await;
+            let result = simulate_hash_operation(
+                ZERO_CONTRACT,
+                ZERO_CONTRACT,
+                "upgrade",
+                &[ScVal::U32(9)],
+                &[2; 32],
+                &[3; 32],
+                &primary.uri(),
+                &stellar_agent_test_support::second_loopback_host(&secondary.uri()),
+                stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE,
+                "hash-refusal",
+                false,
+            )
+            .await;
+            match result {
+                Err(SaError::TimelockExecuteFailed {
+                    failure_reason: TimelockExecuteFailureReason::SimulationFailed,
+                    redacted_reason,
+                    ..
+                }) => assert_eq!(
+                    redacted_reason,
+                    format!("{prefix} simulation error: Error(Contract, #4004) [OZ:Unauthorized]")
+                ),
+                other => panic!("{prefix}: expected the simulation refusal, got {other:?}"),
+            }
+        }
     }
 }

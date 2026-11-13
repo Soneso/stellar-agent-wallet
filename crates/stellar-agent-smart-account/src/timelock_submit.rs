@@ -17,7 +17,7 @@
 //! encodes `rule_ids` and calls `__check_auth`). That path is incompatible with
 //! the OZ TimelockController.
 //!
-//! This module provides [`submit_timelock_invoke_with_g_key_auth`], which:
+//! This module provides [`submit_timelock_invoke_described`], which:
 //! 1. Builds and simulates the wallet's timelock invocation.
 //! 2. Obtains the ledger witness and validates every authorization credential
 //!    against that invocation, without sub-invocations.
@@ -34,6 +34,10 @@
 //! refuses and cancels an unexposed admission. Every failure after the first
 //! successful gate authorization retains the charge. Confirmation polling
 //! uses the submission timeout.
+//!
+//! A simulation refusal fails with a [`TimelockSubmitFailure`]: its text
+//! error feeds every classifier, and its shown error carries the reason the
+//! response's events confirm.
 //!
 //! # Auth preimage shape
 //!
@@ -83,8 +87,8 @@ use stellar_xdr::{
 use crate::SaError;
 use crate::managers::auth_entry::{PreSubmitBudget, bound_pre_submit_stage};
 use crate::managers::rules::{
-    BASE_FEE_STROOPS, SimulationErrorClass, fingerprint_invocation, parse_min_resource_fee,
-    validate_latest_ledger,
+    BASE_FEE_STROOPS, SimulationFailure, fingerprint_invocation, parse_min_resource_fee,
+    simulation_refusal, validate_latest_ledger,
 };
 use crate::signing::gate::{SignerMatch, SigningGate, SigningRequest};
 use crate::signing::ledger_witness::{
@@ -102,7 +106,11 @@ use stellar_agent_network::{
 
 // ── Public result type ────────────────────────────────────────────────────────
 
-/// Result returned by [`submit_timelock_invoke_with_g_key_auth`].
+/// A failed timelock submission: the text error every classifier reads and
+/// the error the wallet shows.
+pub(crate) type TimelockSubmitFailure = SimulationFailure;
+
+/// Result returned by [`submit_timelock_invoke_described`].
 ///
 /// Mirrors the shape of `SubmitInvokeResult` from `submit.rs` for consistency
 /// across the timelock call sites.
@@ -125,7 +133,7 @@ pub(crate) struct TimelockSubmitResult {
 
 // ── Arguments struct ──────────────────────────────────────────────────────────
 
-/// Arguments for [`submit_timelock_invoke_with_g_key_auth`].
+/// Arguments for [`submit_timelock_invoke_described`].
 ///
 /// Bundles all inputs required by the direct G-key auth submit path.
 /// Separate from `SubmitInvokeArgs` so the two paths remain independent.
@@ -274,15 +282,16 @@ fn validate_timelock_auth_entries(
 ///
 /// Schedule, cancel, and execute preserve mainnet, policy, intent, and witness
 /// refusals. Execute also preserves unresolved submissions. The wrappers map
-/// other errors to their operation-specific variants.
+/// other errors to their operation-specific variants. They classify the
+/// failure's text error and show its shown error.
 #[allow(
     clippy::too_many_lines,
     reason = "seven-stage direct G-key auth flow; collapsing would obscure the sequential \
               invariant ordering required for Soroban auth-entry construction"
 )]
-pub(crate) async fn submit_timelock_invoke_with_g_key_auth(
+pub(crate) async fn submit_timelock_invoke_described(
     args: TimelockSubmitArgs<'_>,
-) -> Result<TimelockSubmitResult, SaError> {
+) -> Result<TimelockSubmitResult, TimelockSubmitFailure> {
     refuse_mainnet_sa(args.network_passphrase, args.primary_rpc_url)?;
     crate::submit::check_invoke_address_forms(&args.host_function)?;
 
@@ -336,7 +345,8 @@ pub(crate) async fn submit_timelock_invoke_with_g_key_auth(
                     "{}: expected InvokeContract host function, got {:?}",
                     args.op_label, other
                 ),
-            ));
+            )
+            .into());
         }
     };
 
@@ -394,14 +404,18 @@ pub(crate) async fn submit_timelock_invoke_with_g_key_auth(
 
     let decode_simulation = |sim_response: &stellar_rpc_client::SimulateTransactionResponse| {
         if let Some(err) = &sim_response.error {
-            return Err(SaError::DeploymentFailed {
-                phase: "simulate",
-                redacted_reason: format!(
-                    "{} simulation returned error: {}",
-                    args.op_label,
-                    SimulationErrorClass::of(err)
-                ),
-            });
+            return Err(simulation_refusal(
+                err,
+                &sim_response.events,
+                &sim_envelope,
+                |class| SaError::DeploymentFailed {
+                    phase: "simulate",
+                    redacted_reason: format!(
+                        "{} simulation returned error: {class}",
+                        args.op_label
+                    ),
+                },
+            ));
         }
         if sim_response.min_resource_fee == 0 || sim_response.transaction_data.is_empty() {
             return Err(SaError::DeploymentFailed {
@@ -410,7 +424,8 @@ pub(crate) async fn submit_timelock_invoke_with_g_key_auth(
                     "{}: simulate returned no min_resource_fee / transaction_data",
                     args.op_label
                 ),
-            });
+            }
+            .into());
         }
 
         let sim_first_result = sim_response
@@ -742,14 +757,18 @@ pub(crate) async fn submit_timelock_invoke_with_g_key_auth(
         })?;
 
         if let Some(err) = &resim_response.error {
-            return Err(SaError::DeploymentFailed {
-                phase: "simulate",
-                redacted_reason: format!(
-                    "{} re-simulate returned error: {}",
-                    args.op_label,
-                    SimulationErrorClass::of(err)
-                ),
-            });
+            return Err(simulation_refusal(
+                err,
+                &resim_response.events,
+                &resim_envelope,
+                |class| SaError::DeploymentFailed {
+                    phase: "simulate",
+                    redacted_reason: format!(
+                        "{} re-simulate returned error: {class}",
+                        args.op_label
+                    ),
+                },
+            ));
         }
         if args.schedule_identity.is_some() {
             let prediction = resim_response
@@ -768,7 +787,8 @@ pub(crate) async fn submit_timelock_invoke_with_g_key_auth(
                     "{}: re-simulate returned no min_resource_fee / transaction_data",
                     args.op_label
                 ),
-            });
+            }
+            .into());
         }
 
         // ── Step 6: Build final transaction envelope ──────────────────────────────
@@ -794,7 +814,8 @@ pub(crate) async fn submit_timelock_invoke_with_g_key_auth(
         if signs_entries && source_view3.sequence_number.checked_add(1) != Some(frozen_sequence) {
             return Err(SaError::IntentBindingMismatch {
                 field: "envelope_sequence",
-            });
+            }
+            .into());
         }
         let mut source_account3 = BaselibAccount::new(
             &source_pubkey_strkey,
@@ -908,7 +929,7 @@ pub(crate) async fn submit_timelock_invoke_with_g_key_auth(
             redacted_reason: format!("{} envelope signing failed: {e}", args.op_label),
         })?;
 
-        Ok::<_, SaError>(final_signed_xdr)
+        Ok::<_, TimelockSubmitFailure>(final_signed_xdr)
     }
     .await;
     let final_signed_xdr = match signing_result {
@@ -953,6 +974,17 @@ pub(crate) async fn submit_timelock_invoke_with_g_key_auth(
         tx_hash: submission.tx_hash,
         ledger: submission.ledger,
     })
+}
+
+/// Runs [`submit_timelock_invoke_described`] and returns a failure's shown
+/// error.
+#[cfg(test)]
+pub(crate) async fn submit_timelock_invoke_with_g_key_auth(
+    args: TimelockSubmitArgs<'_>,
+) -> Result<TimelockSubmitResult, SaError> {
+    submit_timelock_invoke_described(args)
+        .await
+        .map_err(TimelockSubmitFailure::into_shown)
 }
 
 /// Sets the exact exclusive ledger bound while preserving other preconditions.
@@ -1391,6 +1423,9 @@ mod tests {
             /// The height `getLatestLedger` reports once this many reads
             /// were answered.
             ledger_after_reads: Option<(usize, u32)>,
+            /// The simulation, counted from 1, that refuses with the RPC
+            /// 30.0.1 host error and a timelock event carrying 4004.
+            refused_simulation: Option<usize>,
         }
 
         impl Chain {
@@ -1411,6 +1446,7 @@ mod tests {
                     overflowing_final_fee: false,
                     schedule_predictions: None,
                     ledger_after_reads: None,
+                    refused_simulation: None,
                 }
             }
         }
@@ -1546,6 +1582,17 @@ mod tests {
                             }],
                         });
                         let number = self.simulations.load(Ordering::SeqCst);
+                        if self.chain.refused_simulation == Some(number) {
+                            use crate::managers::rules::event_reason_tests::{
+                                RPC30_ERROR, encode, error_topics,
+                            };
+                            response["error"] = json!(RPC30_ERROR);
+                            response["events"] = json!(encode(&[(
+                                Some([0x52; 32]),
+                                error_topics(4004),
+                                ScVal::Void
+                            )]));
+                        }
                         if let Some(case) = self.chain.recovery_case {
                             recovery_response(case, number, &mut response);
                             if number == 2 {
@@ -2497,6 +2544,92 @@ mod tests {
                     signs: counter.sign_calls(),
                     resimulated: primary.resimulated(),
                 }
+            }
+
+            /// Submits the `schedule` call through the described helper with
+            /// the primary refusing simulation `simulation`. Returns the
+            /// failure, the signatures and the sends.
+            async fn refusal_at(
+                simulation: usize,
+            ) -> (crate::timelock_submit::TimelockSubmitFailure, usize, usize) {
+                let primary = Endpoint::start(Chain {
+                    refused_simulation: Some(simulation),
+                    ..Chain::at(LEDGER)
+                })
+                .await;
+                let secondary = Endpoint::start(Chain::at(LEDGER)).await;
+                let (_dir, admission) = super::super::no_value_fixture();
+                let signer = CountingSigner::new(SEED);
+                let result =
+                    super::super::super::submit_timelock_invoke_described(TimelockSubmitArgs {
+                        schedule_identity: None,
+                        host_function: HostFunction::InvokeContract(schedule()),
+                        signer: &signer,
+                        primary_rpc_url: &primary.uri(),
+                        secondary_rpc_url: &secondary.witness_uri(),
+                        network_passphrase: TESTNET_PASSPHRASE,
+                        timeout: DEADLINE,
+                        op_label: "schedule",
+                        admission: stellar_agent_network::SigningAdmission::NoValue(&admission),
+                    })
+                    .await;
+                let Err(failure) = result else {
+                    panic!("the refusal stops the submission");
+                };
+                (failure, signer.sign_calls(), primary.sends().await)
+            }
+
+            /// Asserts that `failure` keeps the host class in its text error
+            /// and shows the event code with the same variant and phase.
+            fn assert_described(
+                failure: crate::timelock_submit::TimelockSubmitFailure,
+                prefix: &str,
+            ) {
+                match failure.text_error() {
+                    SaError::DeploymentFailed {
+                        phase: "simulate",
+                        redacted_reason,
+                    } => assert_eq!(
+                        redacted_reason,
+                        &format!("{prefix}: Error(Auth, InvalidAction)")
+                    ),
+                    other => panic!("expected the simulate refusal, got {other:?}"),
+                }
+                assert!(failure.is_described());
+                let shown = failure.into_shown();
+                assert_eq!(shown.wire_code(), "sa.deployment_failed");
+                match shown {
+                    SaError::DeploymentFailed {
+                        phase: "simulate",
+                        redacted_reason,
+                    } => assert_eq!(
+                        redacted_reason,
+                        format!("{prefix}: Error(Contract, #4004) [OZ:Unauthorized]")
+                    ),
+                    other => panic!("expected the simulate refusal, got {other:?}"),
+                }
+            }
+
+            /// The initial refusal shows the code the timelock's event
+            /// confirms, before any signature.
+            #[tokio::test]
+            #[serial_test::serial]
+            async fn initial_timelock_refusal_uses_response_events() {
+                let (failure, signs, sends) = refusal_at(1).await;
+                assert_described(failure, "schedule simulation returned error");
+                assert_eq!(signs, 0);
+                assert_eq!(sends, 0);
+            }
+
+            /// The signed re-simulation refusal shows the code the timelock's
+            /// event confirms, without sending.
+            #[tokio::test]
+            #[serial_test::serial]
+            async fn signed_timelock_refusal_uses_response_events() {
+                let (failure, signs, sends) = refusal_at(2).await;
+                assert_described(failure, "schedule re-simulate returned error");
+                assert!(signs >= 1, "the entries are signed before re-simulation");
+                assert_eq!(sends, 0);
             }
 
             /// A counting signer whose envelope signature takes
