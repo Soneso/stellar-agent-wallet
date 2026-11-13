@@ -118,6 +118,12 @@ impl BoundCarrierLock {
     pub(crate) fn into_lock(self) -> AuditWriterLock {
         self.lock
     }
+
+    /// A carrier whose identity the caller just recorded under the record of
+    /// `generation` while holding `lock`.
+    pub(crate) fn enrolled(lock: AuditWriterLock, generation: u64) -> Self {
+        Self { lock, generation }
+    }
 }
 
 /// An exclusive OFD/handle advisory lock over an audit-log writer's sidecar
@@ -247,12 +253,38 @@ impl AuditWriterLock {
         carrier: Carrier,
         store: &dyn TipAnchorStore,
     ) -> Result<BoundCarrierLock, WriterError> {
+        Self::acquire_checked(path, carrier, store, carrier == Carrier::Outbox)
+    }
+
+    /// Locks the outbox carrier for a keyed queue append and checks its
+    /// identity under that lock, without the retired watch.
+    ///
+    /// A keyed append reads and writes no commitment, so the retired watch
+    /// belongs to the drain, which runs it on every acquisition.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`AuditWriterLock::acquire_bound`] except
+    /// [`WriterError::RetiredOutboxChanged`].
+    pub(crate) fn acquire_queue_bound(
+        path: &Path,
+        store: &dyn TipAnchorStore,
+    ) -> Result<BoundCarrierLock, WriterError> {
+        Self::acquire_checked(path, Carrier::Outbox, store, false)
+    }
+
+    fn acquire_checked(
+        path: &Path,
+        carrier: Carrier,
+        store: &dyn TipAnchorStore,
+        watch_retired: bool,
+    ) -> Result<BoundCarrierLock, WriterError> {
         let lock = Self::acquire(path)?;
         let record = store
             .load_carrier_record()?
             .ok_or(WriterError::CarriersUnbound)?;
         lock.check_identity(carrier, &record)?;
-        if carrier == Carrier::Outbox {
+        if watch_retired {
             check_retired(store, &record)?;
         }
         Ok(BoundCarrierLock {

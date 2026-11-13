@@ -474,6 +474,32 @@ pub trait TipAnchorStore: std::any::Any + std::fmt::Debug + Send + Sync {
         ))
     }
 
+    /// Reads the audit MAC key again from the coordinate the store was built
+    /// for, without writing anything.
+    ///
+    /// A keyed queue append calls this once when the queue's generation line
+    /// does not verify under the key it holds, because a key rotation re-signs
+    /// that line. Every keyed writer open calls it once to compare its key
+    /// with the stored key. The default reports no key.
+    ///
+    /// # Errors
+    /// Returns an error when the backend cannot read the key.
+    fn reload_audit_key(&self) -> Result<Option<Zeroizing<[u8; 32]>>, TipAnchorStoreError> {
+        Ok(None)
+    }
+
+    /// Whether [`Self::reload_audit_key`] reads the profile's stored audit
+    /// key.
+    ///
+    /// Every keyed writer open on such a store compares its key with that
+    /// read before its first write, and refuses a key that differs or a key
+    /// that is absent. The default is `true`, so a store that keeps the
+    /// default reload refuses every keyed open. Only a store without a key
+    /// coordinate, such as a test store, returns `false`.
+    fn reads_audit_key(&self) -> bool {
+        true
+    }
+
     /// Reads the anchor. `Ok(None)` means no anchor has ever been written for
     /// this path — the adoption path.
     ///
@@ -898,6 +924,17 @@ struct InMemoryAnchorState {
     carriers: Option<CarrierRecord>,
     outbox_fail_reads: bool,
     outbox_fail_writes: bool,
+    owner_fail_reads: bool,
+    owner_fail_writes: bool,
+    /// Refuses every commitment and owner-state call while set.
+    items_forbidden: bool,
+    /// Commitment and owner-state calls, refused ones included.
+    item_accesses: usize,
+    /// Successful commitment and owner-state writes, in order.
+    item_writes: Vec<(&'static str, u64)>,
+    /// The scripted result of the next audit-key reloads.
+    reload: Option<Result<Option<[u8; 32]>, String>>,
+    reloads: usize,
     anchor: Option<TipAnchor>,
     reanchors: u64,
     fail: bool,
@@ -906,6 +943,19 @@ struct InMemoryAnchorState {
     /// A raw value planted by a test, so the repair path can be exercised
     /// against something `load_anchor` refuses.
     raw: Option<String>,
+}
+
+#[cfg(any(test, feature = "test-helpers"))]
+impl InMemoryAnchorState {
+    /// Counts one commitment or owner-state call and refuses it while items
+    /// are forbidden.
+    fn item_access(&mut self) -> Result<(), TipAnchorStoreError> {
+        self.item_accesses += 1;
+        if self.items_forbidden {
+            return Err(TipAnchorStoreError::new("outbox item access forbidden"));
+        }
+        Ok(())
+    }
 }
 
 #[cfg(any(test, feature = "test-helpers"))]
@@ -925,6 +975,81 @@ impl InMemoryTipAnchorStore {
         let mut state = self.state.lock().expect("in-memory anchor store mutex");
         state.outbox_fail_reads = reads;
         state.outbox_fail_writes = writes;
+    }
+
+    /// Sets independent owner-state read and write faults.
+    ///
+    /// # Panics
+    /// Panics if the internal mutex is poisoned.
+    pub fn set_owner_failing(&self, reads: bool, writes: bool) {
+        #[allow(clippy::expect_used, reason = "test seam; poison means a failed test")]
+        let mut state = self.state.lock().expect("in-memory anchor store mutex");
+        state.owner_fail_reads = reads;
+        state.owner_fail_writes = writes;
+    }
+
+    /// Refuses every commitment and owner-state read and write while
+    /// `forbidden` holds. Refused calls still count as accesses.
+    ///
+    /// # Panics
+    /// Panics if the internal mutex is poisoned.
+    pub fn forbid_outbox_items(&self, forbidden: bool) {
+        #[allow(clippy::expect_used, reason = "test seam; poison means a failed test")]
+        let mut state = self.state.lock().expect("in-memory anchor store mutex");
+        state.items_forbidden = forbidden;
+    }
+
+    /// Returns the number of commitment and owner-state calls so far.
+    ///
+    /// # Panics
+    /// Panics if the internal mutex is poisoned.
+    #[must_use]
+    pub fn outbox_item_accesses(&self) -> usize {
+        #[allow(clippy::expect_used, reason = "test seam; poison means a failed test")]
+        self.state
+            .lock()
+            .expect("in-memory anchor store mutex")
+            .item_accesses
+    }
+
+    /// Returns the successful item writes in order: `"legacy"` for a
+    /// commitment and `"owner"` for an owner state, with the carrier
+    /// generation.
+    ///
+    /// # Panics
+    /// Panics if the internal mutex is poisoned.
+    #[must_use]
+    pub fn outbox_item_writes(&self) -> Vec<(&'static str, u64)> {
+        #[allow(clippy::expect_used, reason = "test seam; poison means a failed test")]
+        self.state
+            .lock()
+            .expect("in-memory anchor store mutex")
+            .item_writes
+            .clone()
+    }
+
+    /// Scripts every later audit-key reload: `Ok(Some(key))`, `Ok(None)` for
+    /// an absent key, or `Err(detail)` for a backend failure.
+    ///
+    /// # Panics
+    /// Panics if the internal mutex is poisoned.
+    pub fn set_reload(&self, result: Result<Option<[u8; 32]>, &str>) {
+        #[allow(clippy::expect_used, reason = "test seam; poison means a failed test")]
+        let mut state = self.state.lock().expect("in-memory anchor store mutex");
+        state.reload = Some(result.map_err(str::to_owned));
+    }
+
+    /// Returns the number of audit-key reloads so far.
+    ///
+    /// # Panics
+    /// Panics if the internal mutex is poisoned.
+    #[must_use]
+    pub fn reload_count(&self) -> usize {
+        #[allow(clippy::expect_used, reason = "test seam; poison means a failed test")]
+        self.state
+            .lock()
+            .expect("in-memory anchor store mutex")
+            .reloads
     }
 
     /// Returns the currently stored anchor, if any.
@@ -1017,10 +1142,14 @@ impl TipAnchorStore for InMemoryTipAnchorStore {
         &self,
         carrier_generation: u64,
     ) -> Result<Option<String>, TipAnchorStoreError> {
-        let state = self
+        let mut state = self
             .state
             .lock()
             .map_err(|_| TipAnchorStoreError::new("store mutex"))?;
+        state.item_access()?;
+        if state.owner_fail_reads {
+            return Err(TipAnchorStoreError::new("owner read fault"));
+        }
         Ok(state.outbox_owner.get(&carrier_generation).cloned())
     }
 
@@ -1033,10 +1162,36 @@ impl TipAnchorStore for InMemoryTipAnchorStore {
             .state
             .lock()
             .map_err(|_| TipAnchorStoreError::new("store mutex"))?;
+        state.item_access()?;
+        if state.owner_fail_writes {
+            return Err(TipAnchorStoreError::new("owner write fault"));
+        }
         state
             .outbox_owner
             .insert(carrier_generation, value.to_owned());
+        state.item_writes.push(("owner", carrier_generation));
         Ok(())
+    }
+
+    fn reload_audit_key(&self) -> Result<Option<Zeroizing<[u8; 32]>>, TipAnchorStoreError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| TipAnchorStoreError::new("store mutex"))?;
+        state.reloads += 1;
+        match state.reload.clone() {
+            None => Ok(None),
+            Some(Ok(key)) => Ok(key.map(Zeroizing::new)),
+            Some(Err(detail)) => Err(TipAnchorStoreError::new(detail)),
+        }
+    }
+
+    /// The store holds a key coordinate once a test scripts the reload with
+    /// [`Self::set_reload`]. A poisoned mutex counts as one.
+    fn reads_audit_key(&self) -> bool {
+        self.state
+            .lock()
+            .map_or(true, |state| state.reload.is_some())
     }
 
     fn load_carrier_record(&self) -> Result<Option<CarrierRecord>, TipAnchorStoreError> {
@@ -1060,7 +1215,8 @@ impl TipAnchorStore for InMemoryTipAnchorStore {
         generation: u64,
     ) -> Result<Option<OutboxState>, TipAnchorStoreError> {
         #[allow(clippy::expect_used, reason = "test seam; poison means a failed test")]
-        let state = self.state.lock().expect("in-memory anchor store mutex");
+        let mut state = self.state.lock().expect("in-memory anchor store mutex");
+        state.item_access()?;
         if state.outbox_fail_reads {
             return Err(TipAnchorStoreError::new("outbox read fault"));
         }
@@ -1074,10 +1230,12 @@ impl TipAnchorStore for InMemoryTipAnchorStore {
     ) -> Result<(), TipAnchorStoreError> {
         #[allow(clippy::expect_used, reason = "test seam; poison means a failed test")]
         let mut state = self.state.lock().expect("in-memory anchor store mutex");
+        state.item_access()?;
         if state.outbox_fail_writes {
             return Err(TipAnchorStoreError::new("outbox write fault"));
         }
         state.outbox.insert(generation, outbox.clone());
+        state.item_writes.push(("legacy", generation));
         Ok(())
     }
 
@@ -1161,6 +1319,9 @@ mod tests {
     struct LegacyStore(InMemoryTipAnchorStore);
 
     impl TipAnchorStore for LegacyStore {
+        fn reads_audit_key(&self) -> bool {
+            false
+        }
         fn load_carrier_record(&self) -> Result<Option<CarrierRecord>, TipAnchorStoreError> {
             self.0.load_carrier_record()
         }

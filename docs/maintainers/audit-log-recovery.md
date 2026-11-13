@@ -294,7 +294,7 @@ The retired watch reads the account selected by `retired.generation` using the s
 Every append checks the committed prefix, syncs its new line, then stores the updated commitment.
 A failed state write truncates the line back and refuses the append.
 
-**Drain points.** A draining writer checks the commitment, appends the committed queued rows, stores zero state, then truncates the outbox. Only operator rows (`approval_attested`, `approval_attested_remote`, `profile_halted`, `profile_resumed`) drain; a committed row of any other kind refuses with `audit.outbox_unusable` (section 8.1). Drains run:
+**Drain points.** For a queue without owner state, a draining writer checks the commitment, appends the committed queued rows, stores zero state, then truncates the outbox. Section 8.6 describes the drain of a queue under owner state. Only operator rows (`approval_attested`, `approval_attested_remote`, `profile_halted`, `profile_resumed`) drain; a committed row of any other kind refuses with `audit.outbox_unusable` (section 8.1). Drains run:
 
 - when it opens, right after the tip-anchor check;
 - on every keyed acquisition in a running process, under the same lock as that check;
@@ -329,7 +329,8 @@ It reports `outbox_pending` separately and warns about torn, unparseable, or unr
 
 **What it means.** A committed line of `<log>.outbox` does not parse as an audit entry, or holds a row that is not an operator row. Every drain refuses, so every keyed acquisition refuses too, and the outbox is left unchanged. `audit verify` lists unparseable line numbers under an `outbox_unparseable` warning.
 
-**Recovery.**
+**Recovery.** These steps apply to a queue without owner state.
+When the first line of `<log>.outbox` is a generation line, follow section 8.6 instead.
 
 1. Stop the processes that use the profile: the MCP server, `approve serve`, and any CLI verb.
 2. Inspect the file: `cat -n <log>.outbox`. Each intact line is one operator row, with its `kind`, `ts`, and `request_id`; a consent row also carries `nonce_prefix`.
@@ -349,6 +350,9 @@ The saved file can hold consent rows whose approvals may already have taken effe
 ### 8.3 Lost or changed committed rows
 
 **Detail sub-code:** `audit.outbox_rows_missing`
+
+This section applies to a queue without owner state.
+Under owner state the acknowledgement refuses, and section 8.6 says what to do.
 
 The keyring records a committed prefix that the outbox does not hold unchanged and in order.
 Every keyed writer acquisition and every draining write refuses.
@@ -386,6 +390,7 @@ It reports `expected_rows` from the commitment recorded at retirement and `found
 It revokes as above, appends the intact active queue, and resets the retired watch to the commitment it observed.
 When active and retired losses coexist, `expected_rows` and `found_rows` describe the active queue.
 The same acknowledgement also resets the retired watch to the observed commitment; it leaves no second acknowledgement pending.
+Under owner state, the acknowledgement records only the retired loss and resets the watch; the active queue stays for the owner drain (section 8.6).
 
 ### 8.4 Carrier identities and generations
 
@@ -486,6 +491,36 @@ A changed retired commitment also skips the drain and reports
 the value it acknowledges. Neither verb records carrier identities; run
 `audit bind-carriers` afterward.
 
+### 8.6 Queue under owner state
+
+A keyed writer's first drain of a queue that holds a tagged row cuts the queue over.
+The keyring then holds owner state at the active commitment's account with the suffix `-owner`.
+The first line of `<log>.outbox` is then a generation line, `{"k":"gen",...}`.
+Each later row carries its queue generation, its position, and a tag under the audit key.
+
+**What refuses.** `audit acknowledge-outbox-loss` refuses with `audit.outbox_unusable` and the reason `queue held by owner state`.
+It refuses before it revokes a permission or writes anything.
+A changed retired commitment is still acknowledged.
+The verb then records it and resets the retired watch, and the active queue and its commitment stay as they are.
+A drain refuses a queue whose generation line, positions, or closed batch the owner state does not hold.
+It reports `audit.outbox_rows_missing` or `audit.outbox_unusable` and leaves the queue unchanged.
+
+**Recovery.** Keep `<log>.outbox` in place, and keep the keyring entries.
+Do not move, truncate, or edit the file: owner state stays, the acknowledgement still refuses, and a moved queue is not delivered.
+Fix the cause the refusal names, then run a keyed CLI verb or start the MCP server.
+Its drain delivers the queued rows at least once and publishes the next generation line.
+A repeated row keeps its `request_id`.
+
+**Rotation fence.** `profile rotate-audit-key` replaces the drained queue with a fence before it writes the new key.
+The fence is a generation line whose tag is all zeros, which no key verifies.
+While it stands, every keyed append refuses with `audit.outbox_unusable`.
+The rotation then publishes the line under the new key.
+When a rotation stops after the fence, the next keyed acquisition signs the line again under the key the keyring holds.
+Rerun `profile rotate-audit-key` when it reported a failure.
+Every keyed writer open compares its key with the key the keyring holds before it writes anything.
+An open that holds the replaced key refuses with `audit.key_replaced`.
+Run the verb again, or let the MCP server acquire the writer again: each acquisition loads the stored key.
+
 ## 9. Tip anchor unavailable
 
 **Detail sub-code:** `audit.tip_anchor_unavailable`
@@ -541,8 +576,9 @@ read as "nothing queued".
    unaffected: unless the watch recorded no commitment at retirement, the next
    acquisition refuses as a retired-watch change, which section 8.3 describes;
    acknowledge it there and skip the steps below.
-4. When the outbox holds complete lines, every one of them now lies past the
-   commitment: keyed acquisitions and drains refuse with
+4. Under owner state, keep the outbox in place and follow section 8.6; steps 4
+   and 5 apply to a queue without owner state. When the outbox holds complete
+   lines, every one of them now lies past the commitment: keyed acquisitions and drains refuse with
    `audit.outbox_rows_missing`, and nothing is drained. Run
    `stellar-agent audit acknowledge-outbox-loss --profile <name> --reason
    <text>` (section 8.3). It records the loss, revokes every decided approval
@@ -572,7 +608,7 @@ record; keep it with the incident record.
 1. Restore the trusted key from a copy of that keyring entry, such as a keychain backup, to the entry the profile's `audit_log_hash_chain_key_id` names. The log, its anchor, and its entry tags then verify as before, and `audit verify --profile <name>` confirms it.
 2. Without a copy, the existing log stays evidence that only its hash chain checks. Stop the processes that use the profile, then move every file of the log out of the audit directory with the incident record: the active file, its rotated files, their `.root_hmac` sidecars, `<log>.pruned` and its sidecar, and `<log>.outbox`. `stellar-agent audit verify <saved-log>` without `--profile` still walks the moved chain.
 3. Remove the corrupt keyring entry with the platform keyring tool, such as Keychain Access on macOS, Seahorse on Linux, or Credential Manager on Windows.
-4. Run `stellar-agent audit reanchor --profile <name> --acknowledge-rollback`. The stored anchor still names the moved log, so the new, empty log is refused with `audit.tip_anchor_mismatch` until this re-anchor acknowledges it. When the keyring still commits queued operator rows of the moved outbox, the repair stands and the envelope's `warnings` list `audit.outbox_rows_missing`; acknowledge that loss as in section 8.3 before the next step.
+4. Run `stellar-agent audit reanchor --profile <name> --acknowledge-rollback`. The stored anchor still names the moved log, so the new, empty log is refused with `audit.tip_anchor_mismatch` until this re-anchor acknowledges it. When the keyring still commits queued operator rows of the moved outbox, the repair stands and the envelope's `warnings` list `audit.outbox_rows_missing`; acknowledge that loss as in section 8.3 before the next step. That acknowledgement applies to a queue without owner state; under owner state it refuses (section 8.6).
 5. Run `stellar-agent profile rotate-audit-key <name>` to mint a new key. Its first keyed acquisition puts entry tags in force on the new log.
 
 On a log without entry tags, steps 3 and 5 alone apply: the rotation opens the log under its anchor, or adopts it as section 5 describes, mints the key, and re-signs the log's chain-root sidecars under it.
@@ -599,6 +635,8 @@ It permits root and marker tags to be re-signed, including tags an interrupted
 rotation leaves under the prior key.
 If rotation refuses unbound carriers or missing outbox rows, first run
 `audit bind-carriers` or `audit acknowledge-outbox-loss`, respectively.
+For a queue under owner state, section 8.6 applies instead of the
+acknowledgement.
 Those recovery opens check chains and entry tags while root and marker tags
 await re-signing.
 Re-signing a forged marker authenticates the shortened history, so a marker

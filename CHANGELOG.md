@@ -350,6 +350,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Missing destinations, unverified domains, reserved kinds, gated-inflow
   failures, and opaque signing keep their refusals in every mode.
 
+- A keyed audit outbox starts with a generation line, tags each queued row, and
+  keeps owner state in the keyring. `audit acknowledge-outbox-loss` refuses
+  such a queue with `audit.outbox_unusable` (`queue held by owner state`)
+  before it revokes or writes anything. The next keyed acquisition delivers
+  the queue instead.
+- `profile rotate-audit-key` fences the audit outbox before it writes the new
+  key, so no row is queued under the replaced key. Every keyed audit writer
+  open compares its key with the stored key before it writes anything. A
+  replaced key refuses with `audit.key_replaced`, and opening again loads the
+  stored key.
 - On mainnet, CLI `pay`, `claim`, `trustline`, and sponsored `accounts create`
   sign actions the signed policy allows without a passkey ceremony. An approval
   rule requires a passkey ceremony.
