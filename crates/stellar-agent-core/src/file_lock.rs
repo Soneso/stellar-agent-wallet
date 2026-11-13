@@ -1,4 +1,4 @@
-//! An exclusive file lock ends when its guard drops.
+//! An exclusive or shared file lock ends when its guard drops.
 //!
 //! A `flock` belongs to the open file description, so closing one descriptor
 //! ends it only when the last copy of that descriptor closes. A spawned child
@@ -78,7 +78,7 @@ impl<'de> serde::Deserialize<'de> for FileIdentity {
     }
 }
 
-/// An exclusive advisory file lock released on drop.
+/// An exclusive or shared advisory file lock released on drop.
 #[must_use]
 pub struct HeldFileLock {
     file: File,
@@ -92,6 +92,18 @@ impl HeldFileLock {
     /// Returns [`TryLockError::WouldBlock`] on contention, or the underlying I/O error.
     pub fn try_lock(file: File) -> Result<Self, TryLockError> {
         file.try_lock()?;
+        Ok(Self { file })
+    }
+
+    /// Takes a shared advisory lock without blocking. Shared locks on one
+    /// file coexist, and an exclusive lock excludes them.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TryLockError::WouldBlock`] while an exclusive lock is held,
+    /// or the underlying I/O error.
+    pub fn try_lock_shared(file: File) -> Result<Self, TryLockError> {
+        file.try_lock_shared()?;
         Ok(Self { file })
     }
 

@@ -329,8 +329,9 @@ impl ServeHandle {
 ///   loopback addresses on the port.
 /// - [`ServeStartError::Presence`]: the current owner-signed policy of a
 ///   mainnet inbox cannot be verified
-///   ([`PresenceStartRefusal::PolicyUnavailable`]) or names an approval
-///   origin, where alone mainnet consent runs
+///   ([`PresenceStartRefusal::PolicyUnavailable`]), its policy-state lock
+///   stays busy through the retries ([`PresenceStartRefusal::PolicyBusy`]),
+///   or it names an approval origin, where alone mainnet consent runs
 ///   ([`PresenceStartRefusal::OriginSignedRemote`]).
 ///
 /// # Panics
@@ -378,7 +379,12 @@ pub async fn start_serve(config: ServeConfig) -> Result<ServeHandle, ServeStartE
             .as_ref()
             .ok_or_else(refused)?
             .load_current()
-            .map_err(|_| refused())?;
+            .map_err(|error| match error {
+                stellar_agent_core::WalletError::Approval(
+                    stellar_agent_core::ApprovalFailure::PresencePolicyBusy,
+                ) => ServeStartError::Presence(PresenceStartRefusal::PolicyBusy),
+                _ => refused(),
+            })?;
         // A policy with an approval origin serves mainnet consent only there.
         if current
             .policy()

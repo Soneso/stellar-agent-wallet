@@ -12,7 +12,7 @@ use std::{
     path::Path,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
 };
 use stellar_agent_core::{
@@ -29,8 +29,8 @@ use stellar_agent_core::{
             canonical::canonical_bytes,
             mainnet_minimum::{self, RequirementStatus},
             verified::{
-                OwnerKeySource, PinMode, PolicyLoad, acquire_state_lock, inspect_verified_policy,
-                load_verified_policy, with_pin_without_creating,
+                self, OwnerKeySource, PinMode, PolicyLoad, acquire_state_lock,
+                inspect_verified_policy, load_verified_policy, with_pin_without_creating,
             },
         },
     },
@@ -908,6 +908,122 @@ fn pin_read_is_guarded_against_interleaving() {
     assert!(
         !wrote.load(Ordering::SeqCst),
         "pin reads must hold the state lock"
+    );
+}
+/// An advance compares the pin again under the exclusive lock it writes
+/// under. A pin that another writer advanced after the shared comparison
+/// refuses the older policy as a rollback and stays as that writer left it.
+#[test]
+#[serial]
+fn advance_compares_the_pin_again_before_it_writes() {
+    let (dir, profile, key) = fixture();
+    let coordinate = policy_pin_entry_ref(&profile.policy_window_state_key_id);
+    let newer = format!(
+        "{{\"v\":1,\"sequence\":9,\"digest\":\"{}\",\"owner\":\"{}\"}}",
+        "09".repeat(32),
+        stellar_strkey::ed25519::PublicKey(key.verifying_key().to_bytes())
+    );
+    let reads = Arc::new(AtomicUsize::new(0));
+    let counted = reads.clone();
+    let entry = coordinate.clone();
+    keyring_mock::install_with_read_hooks(vec![ReadHook::new(
+        &coordinate.service,
+        &coordinate.account,
+        Arc::new(move || {
+            // The second read is the one under the exclusive lock: the pin
+            // a writer stored after the shared comparison is visible to it.
+            if counted.fetch_add(1, Ordering::SeqCst) == 1 {
+                keyring_core::Entry::new(&entry.service, &entry.account)
+                    .unwrap()
+                    .set_password(&newer)
+                    .unwrap();
+            }
+        }),
+    )])
+    .unwrap();
+    put_pin(
+        dir.path(),
+        &profile,
+        6,
+        [6; 32],
+        key.verifying_key().to_bytes(),
+    );
+    let result = load(dir.path(), FULL, &profile, &key, PinMode::Advance);
+    assert!(
+        matches!(result, Err(PolicyError::SequenceRollback)),
+        "{:?}",
+        result.map(|verified| verified.sequence())
+    );
+    assert_eq!(reads.load(Ordering::SeqCst), 2);
+    assert!(matches!(pinned(dir.path(), &profile), PinState::Present(pin) if pin.sequence() == 9));
+}
+/// A second writer thread runs in the gap between the shared release and the
+/// exclusive acquisition of an advance. It takes the exclusive lock itself, so
+/// the advance holds no guard there. A newer pin it writes refuses the stale
+/// advance as a rollback and stays; an equal pin it writes is left unwritten.
+#[test]
+#[serial]
+fn a_writer_in_the_advance_gap_is_compared_before_the_write() {
+    let (dir, profile, key) = fixture();
+    let owner = key.verifying_key().to_bytes();
+    put_pin(dir.path(), &profile, 6, [6; 32], owner);
+    let root = dir.path().to_path_buf();
+    let writer_profile = profile.clone();
+    let wrote = Arc::new(AtomicBool::new(false));
+    let observed = wrote.clone();
+    verified::advance_gap_hook::install(move || {
+        std::thread::spawn(move || {
+            let path = root.join("state.window");
+            let lock =
+                WindowStoreLock::acquire_for(&path, &writer_profile.policy_window_state_key_id)
+                    .expect("the advance holds no guard in the gap");
+            pin::write_for_test(
+                &lock,
+                &PinScope::for_profile(&path, &writer_profile),
+                &Pin::new(9, [9; 32], owner).unwrap(),
+            )
+            .unwrap();
+            observed.store(true, Ordering::SeqCst);
+        })
+        .join()
+        .unwrap();
+    });
+    let result = load(dir.path(), FULL, &profile, &key, PinMode::Advance);
+    verified::advance_gap_hook::clear();
+    assert!(wrote.load(Ordering::SeqCst), "the writer ran in the gap");
+    assert!(
+        matches!(result, Err(PolicyError::SequenceRollback)),
+        "{:?}",
+        result.map(|verified| verified.sequence())
+    );
+    assert!(
+        matches!(pinned(dir.path(), &profile), PinState::Present(pin) if pin.sequence() == 9 && pin.digest() == [9; 32])
+    );
+
+    put_pin(dir.path(), &profile, 6, [6; 32], owner);
+    let root = dir.path().to_path_buf();
+    let writer_profile = profile.clone();
+    let writer_key = key.clone();
+    verified::advance_gap_hook::install(move || {
+        std::thread::spawn(move || {
+            load_file(
+                &root,
+                &writer_profile,
+                &writer_key,
+                OwnerKeySource::Keyring,
+                PinMode::Advance,
+            )
+            .map(|verified| verified.sequence())
+        })
+        .join()
+        .unwrap()
+        .expect("the second writer advances the pin to the same policy");
+    });
+    let result = load(dir.path(), FULL, &profile, &key, PinMode::Advance);
+    verified::advance_gap_hook::clear();
+    assert_eq!(result.unwrap().sequence(), 7);
+    assert!(
+        matches!(pinned(dir.path(), &profile), PinState::Present(pin) if pin.sequence() == 7 && pin.digest() != [6; 32])
     );
 }
 #[test]

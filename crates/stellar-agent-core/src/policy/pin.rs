@@ -26,6 +26,10 @@
 //! the lock itself. The crate-internal `write` runs only inside the verified
 //! advance, under the same guard as the read and comparison. The store's
 //! authorization transitions read the pin under the guard they already hold.
+//! A reader that writes nothing reads through
+//! [`read_shared`](crate::policy::pin::read_shared) under a
+//! [`WindowStoreReadLock`](crate::policy::state_lock::WindowStoreReadLock),
+//! which other readers hold at the same time and every writer excludes.
 //!
 //! The raw writer is private to the crate:
 //!
@@ -61,7 +65,7 @@ use keyring_core::Entry as KeyringEntry;
 use serde::{Deserialize, Serialize};
 
 use crate::keyring_errors::{KeyringOperation, map_keyring_operation_error};
-use crate::policy::state_lock::WindowStoreLock;
+use crate::policy::state_lock::{WindowStoreLock, WindowStoreReadLock};
 use crate::profile::schema::{KeyringEntryRef, Profile, policy_pin_entry_ref};
 
 /// The only pin value version this build reads and writes.
@@ -263,6 +267,24 @@ fn render(pin: &Pin) -> Result<String, PinError> {
 /// - [`PinError::Keyring`] when the entry cannot be read.
 pub fn read(lock: &WindowStoreLock, scope: &PinScope<'_>) -> Result<PinState, PinError> {
     check_guard(lock, scope)?;
+    read_entry(scope)
+}
+
+/// Reads the pin of `scope` under the shared `lock` of a reader that writes
+/// nothing.
+///
+/// # Errors
+///
+/// The errors of [`read`].
+pub fn read_shared(lock: &WindowStoreReadLock, scope: &PinScope<'_>) -> Result<PinState, PinError> {
+    if !lock.guards(scope.window_path, scope.window_key) {
+        return Err(PinError::WrongGuard);
+    }
+    read_entry(scope)
+}
+
+/// Reads the pin entry of `scope`; the caller has checked its guard.
+fn read_entry(scope: &PinScope<'_>) -> Result<PinState, PinError> {
     let entry_ref = scope.pin_entry_ref();
     let entry = open(&entry_ref)?;
     match entry.get_password() {
@@ -458,7 +480,16 @@ mod tests {
             Err(PinError::WrongGuard)
         );
         assert_eq!(read(&wrong_guard, &scope), Err(PinError::WrongGuard));
-        assert_eq!(read(&lock, &scope).unwrap(), PinState::Present(pin));
+        assert_eq!(read(&lock, &scope).unwrap(), PinState::Present(pin.clone()));
+        drop((lock, wrong_guard));
+
+        let shared = WindowStoreReadLock::acquire_for_with_retry(&window, &key).unwrap();
+        assert_eq!(
+            read_shared(&shared, &scope).unwrap(),
+            PinState::Present(pin)
+        );
+        let foreign = WindowStoreReadLock::acquire_for_with_retry(&window, &other_key).unwrap();
+        assert_eq!(read_shared(&foreign, &scope), Err(PinError::WrongGuard));
     }
 
     /// The comparison refuses each component on its own.

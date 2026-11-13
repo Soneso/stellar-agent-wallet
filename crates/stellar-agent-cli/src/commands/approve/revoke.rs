@@ -7,6 +7,7 @@ use stellar_agent_approval_ui::decision::{RevocationAccess, RevocationFailure, R
 use stellar_agent_core::approval::Surface;
 use stellar_agent_core::audit_log::{AuditEntry, AuditWriter};
 use stellar_agent_core::envelope::{Envelope, OutputFormat};
+use stellar_agent_core::policy::state_lock::WindowStoreLock;
 use stellar_agent_core::profile::Profile;
 use stellar_agent_network::policy_state::approvals::{
     ApprovalRecorder, ApprovalState, ApprovalStatus, ApprovalView,
@@ -185,6 +186,49 @@ impl RevocationAccess for DurableRevocations {
         attribution: Option<&str>,
     ) -> Result<RevocationView, RevocationFailure> {
         revoke_with(&mut &*self, nonce, origin, attribution)
+    }
+
+    fn revoke_held(
+        &self,
+        nonce: &str,
+        origin: Surface,
+        attribution: Option<&str>,
+        lock: &WindowStoreLock,
+    ) -> Result<RevocationView, RevocationFailure> {
+        revoke_with(
+            &mut HeldRevocations { inner: self, lock },
+            nonce,
+            origin,
+            attribution,
+        )
+    }
+}
+
+/// The durable calls of a request that holds the exclusive policy-state
+/// guard `lock`: the write runs under it and takes no lock.
+struct HeldRevocations<'a> {
+    inner: &'a DurableRevocations,
+    lock: &'a WindowStoreLock,
+}
+
+impl RevocationCalls for HeldRevocations<'_> {
+    fn lookup(&mut self, nonce: &str) -> Result<ApprovalView, RevocationFailure> {
+        RevocationCalls::lookup(&mut self.inner, nonce)
+    }
+
+    fn revoke(&mut self, id: [u8; 32]) -> Result<ApprovalView, RevocationFailure> {
+        ApprovalRecorder::new(
+            &self.inner.store,
+            &self.inner.profile,
+            &mut NoOperationRows,
+            uuid::Uuid::new_v4().to_string(),
+        )
+        .revoke_held(self.lock, id)
+        .map_err(|error| store_failure(&error))
+    }
+
+    fn append(&mut self, entry: AuditEntry) -> Result<(), RevocationFailure> {
+        RevocationCalls::append(&mut self.inner, entry)
     }
 }
 
@@ -1824,6 +1868,137 @@ pub(super) mod tests {
             () = browser => {}
         }
         assert_eq!(f.view().record.state, ApprovalState::Revoked);
+    }
+
+    /// The exclusive policy-state guard of `f`'s window-state entry, as a
+    /// writer takes it.
+    fn window_writer(
+        f: &Fixture,
+    ) -> impl Fn() -> Result<WindowStoreLock, stellar_agent_core::policy::state_lock::StateLockError>
+    + Send
+    + 'static {
+        let path = f.store.path().to_path_buf();
+        let key = f.core.profile().policy_window_state_key_id.clone();
+        move || WindowStoreLock::acquire_for(&path, &key)
+    }
+
+    /// A writer that holds the policy-state lock before a signed-origin
+    /// revocation makes it answer the retriable busy body. The challenge,
+    /// the counter, the session, the pending store and the durable record
+    /// stay byte-identical, and the same body then revokes.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_busy_revocation_changes_nothing_and_retries() {
+        use stellar_agent_core::approval::mainnet_fixtures::SIGNED_RP_ID;
+        let (f, _files) = signed_fixture();
+        let (listener, browser) = Browser::start(&f, true).await;
+        let Listener::Signed(handle) = &listener else {
+            panic!("a signed listener")
+        };
+        let nonce = f.entry.approval_nonce.clone();
+        let (csrf, body) = browser.assertion(&nonce, 1, SIGNED_RP_ID).await;
+        let credentials =
+            stellar_agent_core::approval::RemoteApprovalAuthority::for_profile(f.core.name())
+                .unwrap()
+                .credentials_path()
+                .to_owned();
+        let snapshot = || {
+            (
+                f.bytes(),
+                std::fs::read(f.core.store_path()).unwrap(),
+                std::fs::read(&credentials).ok(),
+                handle
+                    .session_for_test()
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .map(|session| session.session_id.to_hex()),
+            )
+        };
+        let before = snapshot();
+
+        let writer = window_writer(&f)().unwrap();
+        let response = browser
+            .action(&nonce, &csrf, "revoke", &body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 503);
+        assert_eq!(
+            response.json::<Value>().await.unwrap(),
+            json!({"error": "store_busy", "retriable": true})
+        );
+        assert_eq!(snapshot(), before);
+        drop(writer);
+
+        let response = browser
+            .action(&nonce, &csrf, "revoke", &body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        assert_eq!(
+            response.json::<Value>().await.unwrap()["view"]["state"],
+            "revoked"
+        );
+        assert_eq!(f.view().record.state, ApprovalState::Revoked);
+        listener.shutdown().await;
+    }
+
+    /// A writer that tries the policy-state lock after a signed-origin
+    /// revocation consumed its challenge and recorded its counter cannot
+    /// take it. When it takes the lock after the response, the durable
+    /// record is already revoked.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_writer_waits_for_the_durable_revocation() {
+        use std::sync::mpsc;
+        use stellar_agent_approval_ui::decision::revoke_hook;
+        use stellar_agent_core::approval::mainnet_fixtures::SIGNED_RP_ID;
+        use stellar_agent_core::policy::state_lock::StateLockError;
+        let (f, _files) = signed_fixture();
+        let (listener, browser) = Browser::start(&f, true).await;
+        let nonce = f.entry.approval_nonce.clone();
+        let (csrf, body) = browser.assertion(&nonce, 1, SIGNED_RP_ID).await;
+        let (go, start) = mpsc::channel::<()>();
+        let (report, attempt) = mpsc::channel::<Result<(), StateLockError>>();
+        let (release, released) = mpsc::channel::<()>();
+        let writer = window_writer(&f);
+        let (name, profile, record) = (
+            f.core.name().to_owned(),
+            f.core.profile().clone(),
+            nonce.clone(),
+        );
+        let thread = std::thread::spawn(move || {
+            start.recv().unwrap();
+            report.send(writer().map(drop)).unwrap();
+            released.recv().unwrap();
+            let lock = writer().unwrap();
+            let state = ApprovalStatus::new(&PersistedWindowStore::for_profile(&name), &profile)
+                .find_by_nonce(&record)
+                .unwrap()
+                .unwrap()
+                .record
+                .state;
+            drop(lock);
+            state
+        });
+        let (seen, observed) = mpsc::channel();
+        revoke_hook::install(move || {
+            go.send(()).unwrap();
+            seen.send(attempt.recv().unwrap()).unwrap();
+        });
+
+        let response = browser
+            .action(&nonce, &csrf, "revoke", &body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        assert_eq!(observed.recv().unwrap(), Err(StateLockError::WriterLocked));
+        release.send(()).unwrap();
+        assert_eq!(thread.join().unwrap(), ApprovalState::Revoked);
+        listener.shutdown().await;
     }
 
     #[tokio::test]

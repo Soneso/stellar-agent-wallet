@@ -4247,9 +4247,37 @@ impl<'a> OperationRecorder<'a> {
             store.path(),
             &profile.policy_window_state_key_id,
         )?;
+        self.run_held(&lock, mint, step)
+    }
+
+    /// [`Self::run`] under `lock`, a guard the caller already holds and
+    /// keeps after the step, so the lock is taken once per request.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`Self::run`]; a guard of another window-state entry
+    /// refuses as `Invalid` and changes nothing.
+    pub(super) fn run_held<T>(
+        &mut self,
+        lock: &WindowStoreLock,
+        mint: Option<&MintRequest>,
+        step: impl FnOnce(&mut Session<'_>) -> Result<T, WindowStoreError>,
+    ) -> Result<T, WindowStoreError> {
+        let store = self.store;
+        let profile = self.profile;
+        if !profile.chain_id.is_mainnet() {
+            return Err(WindowStoreError::AuthorizationRefused {
+                precondition: MainnetPrecondition::ChainNotMainnet,
+            });
+        }
+        if !lock.guards(store.path(), &profile.policy_window_state_key_id) {
+            return Err(WindowStoreError::Invalid {
+                detail: "the held guard does not cover this window state".to_owned(),
+            });
+        }
         let now = now_ms()?;
         let mint_expires = match mint {
-            Some(request) => Some(store.mint_prechecks(&lock, profile, request, now)?),
+            Some(request) => Some(store.mint_prechecks(lock, profile, request, now)?),
             None => None,
         };
         let (key, _minted) = store.load_or_mint_key(profile)?;
@@ -4283,7 +4311,6 @@ impl<'a> OperationRecorder<'a> {
             prune_stale(&mut next, now);
             store.commit_generation(&key, &gen_entry, original, next)?;
         }
-        drop(lock);
         Ok(value)
     }
 

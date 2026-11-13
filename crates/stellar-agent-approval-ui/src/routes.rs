@@ -651,6 +651,13 @@ pub(crate) fn outcome_to_response(outcome: Outcome) -> Response {
             StatusCode::SERVICE_UNAVAILABLE,
             json!({ "status": "unavailable", "retriable": false }),
         ),
+        // A busy policy-state lock answers the retriable busy body of a busy
+        // credential store.
+        Outcome::PresenceRefused { code, .. }
+            if code == stellar_agent_core::ApprovalFailure::PresencePolicyBusy.code() =>
+        {
+            return store_busy();
+        }
         Outcome::PresenceRefused { code, message } => (
             crate::presence::refusal_status_of_code(code),
             json!({ "error": code, "message": message }),

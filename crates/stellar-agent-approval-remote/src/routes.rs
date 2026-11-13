@@ -38,6 +38,10 @@
 //! the same as a bad assertion, so no response tells an unknown, removed or
 //! unlisted credential apart.
 //! Credential-store contention answers `503` `store_busy` after a bounded wait.
+//! A policy-state lock that a writer holds through the final retry answers the
+//! same `503` `store_busy` at every policy read, and a live session survives it.
+//! A signed-origin login holds the lock shared from before it consumes its
+//! challenge until it publishes the session.
 //!
 //! `/static/login.js` is deliberately ungated: it runs the passkey login
 //! ceremony, which IS the authentication step, so no session can exist yet
@@ -71,6 +75,7 @@ use stellar_agent_approval_ui::{
 };
 use stellar_agent_core::approval::error::ApprovalError;
 use stellar_agent_core::approval::operator_credentials::OperatorApprovalCredentialStore;
+use stellar_agent_core::approval::presence_policy::PolicyAdmission;
 use stellar_agent_core::approval::user_id::{ApproverIdentity, VerifiedPasskeyAssertion};
 use stellar_agent_core::approval::{
     ApprovalKind, MainnetApprovalCredential, PendingApprovalView, approval_view_digest,
@@ -164,32 +169,155 @@ impl stellar_agent_approval_ui::presence::ConsentSessionGate for RemoteServeStat
         &self,
         presence: &stellar_agent_core::approval::VerifiedMainnetPresence,
     ) -> Result<(), stellar_agent_core::WalletError> {
-        use stellar_agent_core::{ApprovalFailure, WalletError};
-        let invalid = || WalletError::Approval(ApprovalFailure::PresenceInvalid);
-        if policy_credential(self, &presence.credential_id_b64url()).as_ref()
-            != Some(presence.credential())
-        {
-            return Err(invalid());
+        verified_under(self, presence, None)
+    }
+
+    fn admitted_mutation(
+        &self,
+        headers: &HeaderMap,
+        nonce: &str,
+        admit: &dyn Fn() -> Result<PolicyAdmission, Response>,
+    ) -> Result<(SessionState, PolicyAdmission), Response> {
+        let session = live_session(self, headers)?;
+        let value = headers
+            .get("x-stellar-approval-csrf")
+            .and_then(|value| value.to_str().ok());
+        if !value.is_some_and(|value| verify_csrf(&session.csrf_key, nonce, value)) {
+            return Err(csrf_rejected());
         }
-        self.operator_credentials
-            .check_policy_sign_count(presence.credential(), &self.rp_id, presence.sign_count())
-            .map_err(|error| match error {
-                ApprovalError::SignCounterRegression { .. } => invalid(),
-                _ => WalletError::Approval(ApprovalFailure::PresenceUnavailable),
-            })
+        let admission = admit()?;
+        match authorize(self, &session.credential_id_b64url, Some(&admission)) {
+            Authorization::Admitted => Ok((session, admission)),
+            Authorization::Busy => Err(store_busy()),
+            Authorization::Refused => {
+                drop_session(self, &session);
+                Err(not_found())
+            }
+        }
+    }
+
+    fn verified_admitted(
+        &self,
+        presence: &stellar_agent_core::approval::VerifiedMainnetPresence,
+        admission: &PolicyAdmission,
+    ) -> Result<(), stellar_agent_core::WalletError> {
+        verified_under(self, presence, Some(admission))
     }
 }
 
+/// The consent gate's check of a verified presence, with the policy read
+/// through `admission` when the request holds one.
+fn verified_under(
+    state: &RemoteServeState,
+    presence: &stellar_agent_core::approval::VerifiedMainnetPresence,
+    admission: Option<&PolicyAdmission>,
+) -> Result<(), stellar_agent_core::WalletError> {
+    use stellar_agent_core::{ApprovalFailure, WalletError};
+    let invalid = || WalletError::Approval(ApprovalFailure::PresenceInvalid);
+    match policy_credential(state, &presence.credential_id_b64url(), admission) {
+        PolicyCredential::Listed(credential) if &credential == presence.credential() => {}
+        PolicyCredential::Busy => {
+            return Err(WalletError::Approval(ApprovalFailure::PresencePolicyBusy));
+        }
+        PolicyCredential::Listed(_) | PolicyCredential::Unlisted => return Err(invalid()),
+    }
+    state
+        .operator_credentials
+        .check_policy_sign_count(presence.credential(), &state.rp_id, presence.sign_count())
+        .map_err(|error| match error {
+            ApprovalError::SignCounterRegression { .. } => invalid(),
+            _ => WalletError::Approval(ApprovalFailure::PresenceUnavailable),
+        })
+}
+
+/// What the current owner-signed policy says about one credential.
+enum PolicyCredential {
+    /// The policy lists the credential for this listener's origin.
+    Listed(MainnetApprovalCredential),
+    /// The policy does not list it, or cannot be loaded and verified.
+    Unlisted,
+    /// The policy-state lock stays held by a writer through the final retry.
+    Busy,
+}
+
+/// The outcome of a current authorization read.
+enum Authorization {
+    /// The current files admit the credential.
+    Admitted,
+    /// The current files do not admit it, or cannot be read.
+    Refused,
+    /// The policy-state lock stays held by a writer through the final retry.
+    Busy,
+}
+
+/// Whether `error` is a policy-state lock that stayed busy.
+fn is_policy_busy(error: &stellar_agent_core::WalletError) -> bool {
+    matches!(
+        error,
+        stellar_agent_core::WalletError::Approval(
+            stellar_agent_core::ApprovalFailure::PresencePolicyBusy
+        )
+    )
+}
+
+/// Reads the current policy and looks up the credential `id` in it. A busy
+/// policy-state lock is [`PolicyCredential::Busy`], never a missing
+/// credential. A request that holds `admission` reads through its guard and
+/// takes no lock.
 fn policy_credential(
     state: &RemoteServeState,
     id: &str,
-) -> Option<stellar_agent_core::approval::MainnetApprovalCredential> {
-    let current = state
-        .ctx
-        .mainnet_authority
-        .as_ref()?
-        .load_current_compare_only()
-        .ok()?;
+    admission: Option<&PolicyAdmission>,
+) -> PolicyCredential {
+    let Some(authority) = state.ctx.mainnet_authority.as_ref() else {
+        return PolicyCredential::Unlisted;
+    };
+    let loaded = match admission {
+        Some(admission) => authority.load_admitted(admission),
+        None => authority.load_current_compare_only(),
+    };
+    match loaded {
+        Ok(current) => listed_credential(state, &current, id)
+            .map_or(PolicyCredential::Unlisted, |listed| {
+                PolicyCredential::Listed(listed)
+            }),
+        Err(error) if is_policy_busy(&error) => PolicyCredential::Busy,
+        Err(_) => PolicyCredential::Unlisted,
+    }
+}
+
+/// The shared policy-state guard of a signed-origin login, taken before the
+/// login consumes its challenge. `None` on testnet, which reads no policy.
+///
+/// The guard covers the policy loads, the counter commit, and the session
+/// publication, so no writer changes the pin between them. Every policy read
+/// of the login goes through it, so the login takes the lock once. A writer
+/// that arrives later waits for the release.
+#[allow(
+    clippy::result_large_err,
+    reason = "the Err variant is the ready-to-return Response for the refusal"
+)]
+fn signed_admission(state: &RemoteServeState) -> Result<Option<PolicyAdmission>, Response> {
+    if state.listener_identity.is_none() {
+        return Ok(None);
+    }
+    let Some(authority) = state.ctx.mainnet_authority.as_ref() else {
+        return Err(assertion_invalid());
+    };
+    match authority.admit() {
+        Ok(admission) => Ok(Some(admission)),
+        Err(error) if is_policy_busy(&error) => Err(store_busy()),
+        Err(_) => Err(assertion_invalid()),
+    }
+}
+
+/// The credential `id` of the loaded policy `current`, when the policy serves
+/// this listener's origin and relying party.
+fn listed_credential(
+    state: &RemoteServeState,
+    current: &stellar_agent_core::approval::CurrentMainnetApprovalPolicy,
+    id: &str,
+) -> Option<MainnetApprovalCredential> {
     crate::enabled_remote_config(current.profile()).ok()?;
     let body = current.policy().mainnet()?;
     let origin = body.approval_origin.as_ref()?;
@@ -284,6 +412,7 @@ fn store_unavailable() -> Response {
 /// The session's credential must also pass current authorization through [`authorize`].
 /// Signed-origin sessions require a current policy credential; testnet sessions require allowlisting and enrollment.
 /// A failed authorization drops the session and returns the same `404`.
+/// A busy policy-state lock keeps the session and returns `503` `store_busy`.
 #[allow(
     clippy::result_large_err,
     reason = "the Err variant is the ready-to-return Response for the auth-boundary rejection"
@@ -292,58 +421,83 @@ fn require_session(
     state: &RemoteServeState,
     headers: &HeaderMap,
 ) -> Result<SessionState, Response> {
-    let session = {
-        let mut guard = match state.session.lock() {
-            Ok(g) => g,
-            Err(poison) => poison.into_inner(),
-        };
-
-        let expired = guard.as_ref().is_some_and(SessionState::is_expired);
-        if expired {
-            *guard = None;
+    let session = live_session(state, headers)?;
+    match authorize(state, &session.credential_id_b64url, None) {
+        Authorization::Admitted => Ok(session),
+        Authorization::Busy => Err(store_busy()),
+        Authorization::Refused => {
+            drop_session(state, &session);
+            Err(not_found())
         }
+    }
+}
 
-        let session = guard.as_ref().ok_or_else(not_found)?;
-
-        let cookie = session_cookie_value(headers).ok_or_else(not_found)?;
-        let submitted = crate::session::OpaqueToken::from_hex(&cookie).ok_or_else(not_found)?;
-        if !session.session_id.ct_eq(&submitted) {
-            return Err(not_found());
-        }
-        session.clone()
+/// The live, unexpired session the request's cookie names, read under the
+/// session mutex alone, before any policy read.
+#[allow(
+    clippy::result_large_err,
+    reason = "the Err variant is the ready-to-return Response for the auth-boundary rejection"
+)]
+fn live_session(state: &RemoteServeState, headers: &HeaderMap) -> Result<SessionState, Response> {
+    let mut guard = match state.session.lock() {
+        Ok(g) => g,
+        Err(poison) => poison.into_inner(),
     };
 
-    if !authorize(state, &session.credential_id_b64url) {
-        let mut guard = match state.session.lock() {
-            Ok(g) => g,
-            Err(poison) => poison.into_inner(),
-        };
-        if guard
-            .as_ref()
-            .is_some_and(|live| live.session_id.ct_eq(&session.session_id))
-        {
-            *guard = None;
-        }
+    let expired = guard.as_ref().is_some_and(SessionState::is_expired);
+    if expired {
+        *guard = None;
+    }
+
+    let session = guard.as_ref().ok_or_else(not_found)?;
+
+    let cookie = session_cookie_value(headers).ok_or_else(not_found)?;
+    let submitted = crate::session::OpaqueToken::from_hex(&cookie).ok_or_else(not_found)?;
+    if !session.session_id.ct_eq(&submitted) {
         return Err(not_found());
     }
-    Ok(session)
+    Ok(session.clone())
+}
+
+/// Drops `session` when it is still the live one.
+fn drop_session(state: &RemoteServeState, session: &SessionState) {
+    let mut guard = match state.session.lock() {
+        Ok(g) => g,
+        Err(poison) => poison.into_inner(),
+    };
+    if guard
+        .as_ref()
+        .is_some_and(|live| live.session_id.ct_eq(&session.session_id))
+    {
+        *guard = None;
+    }
 }
 
 /// Checks current policy credentials for signed-origin consent.
 /// Testnet requires a current allowlist entry and enrollment with matching chain and RP.
-/// A read failure refuses either mode.
-fn authorize(state: &RemoteServeState, credential_id_b64url: &str) -> bool {
+/// A read failure refuses either mode. A busy policy-state lock is
+/// [`Authorization::Busy`]; testnet reads no policy and never answers it.
+/// A request that holds `admission` reads the policy through its guard.
+fn authorize(
+    state: &RemoteServeState,
+    credential_id_b64url: &str,
+    admission: Option<&PolicyAdmission>,
+) -> Authorization {
     if state.listener_identity.is_some() {
-        return policy_credential(state, credential_id_b64url).is_some();
+        return match policy_credential(state, credential_id_b64url, admission) {
+            PolicyCredential::Listed(_) => Authorization::Admitted,
+            PolicyCredential::Unlisted => Authorization::Refused,
+            PolicyCredential::Busy => Authorization::Busy,
+        };
     }
     match state
         .authority
         .require_credential(credential_id_b64url, state.chain, Some(&state.rp_id))
     {
-        Ok(_) => true,
+        Ok(_) => Authorization::Admitted,
         Err(error) => {
             tracing::warn!(code = %error.code(), "remote approval: credential not authorized");
-            false
+            Authorization::Refused
         }
     }
 }
@@ -422,8 +576,10 @@ async fn approval_link_get(
     {
         return not_found();
     }
-    if require_session(&state, &headers).is_ok() {
-        return axum::response::Redirect::temporary(&destination).into_response();
+    match require_session(&state, &headers) {
+        Ok(_) => return axum::response::Redirect::temporary(&destination).into_response(),
+        Err(busy) if busy.status() == StatusCode::SERVICE_UNAVAILABLE => return busy,
+        Err(_) => {}
     }
     Html(render_login_page(
         &state.rp_id,
@@ -481,10 +637,12 @@ async fn login_challenge_post(State(state): State<RemoteServeState>) -> Response
         );
     }
 
-    if let Some(authority) = &state.ctx.mainnet_authority
-        && authority.load_current().is_err()
-    {
-        return assertion_invalid();
+    if let Some(authority) = &state.ctx.mainnet_authority {
+        match authority.load_current() {
+            Ok(_) => {}
+            Err(error) if is_policy_busy(&error) => return store_busy(),
+            Err(_) => return assertion_invalid(),
+        }
     }
     let challenge = {
         let mut store = match state.login_challenges.lock() {
@@ -515,6 +673,10 @@ async fn login_challenge_post(State(state): State<RemoteServeState>) -> Response
 /// Reads current authorization before verification and before creating the session.
 /// Signed mode verifies with the policy key; testnet requires enrollment and allowlisting.
 /// Unknown and removed credentials receive the same refusal.
+///
+/// Signed mode first takes the policy admission of [`signed_admission`]. It
+/// holds it through the challenge, the counter and the session publication.
+/// A busy lock therefore answers `503` `store_busy` before anything changes.
 async fn login_assertion_post(
     State(state): State<RemoteServeState>,
     body: axum::body::Bytes,
@@ -524,14 +686,21 @@ async fn login_assertion_post(
     };
 
     let credential_id = request.assertion.id.clone();
-    if !authorize(&state, &credential_id) {
-        return assertion_invalid();
+    let admission = match signed_admission(&state) {
+        Ok(admission) => admission,
+        Err(response) => return response,
+    };
+    match authorize(&state, &credential_id, admission.as_ref()) {
+        Authorization::Admitted => {}
+        Authorization::Busy => return store_busy(),
+        Authorization::Refused => return assertion_invalid(),
     }
 
     let policy_key = if state.listener_identity.is_some() {
-        match policy_credential(&state, &credential_id) {
-            Some(credential) => Some(credential),
-            None => return assertion_invalid(),
+        match policy_credential(&state, &credential_id, admission.as_ref()) {
+            PolicyCredential::Listed(credential) => Some(credential),
+            PolicyCredential::Busy => return store_busy(),
+            PolicyCredential::Unlisted => return assertion_invalid(),
         }
     } else {
         None
@@ -589,6 +758,8 @@ async fn login_assertion_post(
         Err(_) => return assertion_invalid(),
     };
 
+    #[cfg(all(test, feature = "test-helpers"))]
+    login_hook::fire(login_hook::Point::Verified);
     // Sign-counter regression check: a cloned-authenticator signal refuses
     // the login even though the signature itself verified.
     if let Err(response) = record_counter(
@@ -603,14 +774,20 @@ async fn login_assertion_post(
     }
 
     #[cfg(all(test, feature = "test-helpers"))]
-    login_hook::fire();
-    if !authorize(&state, &credential_id) {
-        return assertion_invalid();
+    login_hook::fire(login_hook::Point::Counted);
+    match authorize(&state, &credential_id, admission.as_ref()) {
+        Authorization::Admitted => {}
+        Authorization::Busy => return store_busy(),
+        Authorization::Refused => return assertion_invalid(),
     }
-    if let Some(credential) = &policy_key
-        && policy_credential(&state, &credential_id).as_ref() != Some(credential)
-    {
-        return assertion_invalid();
+    if let Some(credential) = &policy_key {
+        match policy_credential(&state, &credential_id, admission.as_ref()) {
+            PolicyCredential::Listed(current) if current == *credential => {}
+            PolicyCredential::Busy => return store_busy(),
+            PolicyCredential::Listed(_) | PolicyCredential::Unlisted => {
+                return assertion_invalid();
+            }
+        }
     }
     let session = SessionState::generate(credential_id);
     let cookie_value = session.session_id.to_hex();
@@ -621,6 +798,7 @@ async fn login_assertion_post(
         };
         *guard = Some(session);
     }
+    drop(admission);
 
     let mut resp = json_response(StatusCode::OK, &json!({"status": "logged_in"}));
     if let Ok(hv) = HeaderValue::from_str(&session_set_cookie_header(&cookie_value)) {
@@ -631,23 +809,42 @@ async fn login_assertion_post(
 
 #[cfg(all(test, feature = "test-helpers"))]
 pub(crate) mod login_hook {
-    //! Runs a test action after a login assertion verified and its counter
-    //! was recorded, right before the final authorization read, standing in
-    //! for an operator who revokes the credential during the verification.
+    //! Runs a test action at two points of a verified login, standing in for
+    //! a writer or an operator that acts during the verification.
 
     use std::cell::RefCell;
 
+    /// Where the login runs the action.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum Point {
+        /// The assertion verified; the counter is not yet recorded.
+        Verified,
+        /// The counter is recorded; the final authorization read follows.
+        Counted,
+    }
+
+    type Action = (Point, Box<dyn FnOnce()>);
+
     thread_local! {
-        static HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+        static HOOK: RefCell<Option<Action>> = const { RefCell::new(None) };
     }
 
-    /// Installs `action` for the next verified login on this thread.
-    pub(crate) fn install(action: impl FnOnce() + 'static) {
-        HOOK.with(|hook| *hook.borrow_mut() = Some(Box::new(action)));
+    /// Installs `action` for the next login on this thread that reaches
+    /// `point`.
+    pub(crate) fn install(point: Point, action: impl FnOnce() + 'static) {
+        HOOK.with(|hook| *hook.borrow_mut() = Some((point, Box::new(action))));
     }
 
-    pub(super) fn fire() {
-        if let Some(action) = HOOK.with(|hook| hook.borrow_mut().take()) {
+    pub(super) fn fire(point: Point) {
+        let action = HOOK.with(|hook| {
+            let mut slot = hook.borrow_mut();
+            if slot.as_ref().is_some_and(|(at, _)| *at == point) {
+                slot.take().map(|(_, action)| action)
+            } else {
+                None
+            }
+        });
+        if let Some(action) = action {
             action();
         }
     }
@@ -1135,6 +1332,11 @@ fn outcome_to_response(outcome: stellar_agent_approval_ui::Outcome) -> Response 
         // like an invalid assertion, so the response does not tell a
         // removed credential from a bad signature.
         Outcome::Unauthorized => return assertion_invalid(),
+        Outcome::PresenceRefused { code, .. }
+            if code == stellar_agent_core::ApprovalFailure::PresencePolicyBusy.code() =>
+        {
+            return store_busy();
+        }
         Outcome::PresenceRefused { code, message } => (
             stellar_agent_approval_ui::presence::refusal_status_of_code(code),
             json!({"error": code, "message": message}),
@@ -2884,7 +3086,7 @@ mod tests {
                 let profile_dir = fx.profile_dir();
                 let credentials_path = fx.state.authority.credentials_path().to_path_buf();
                 let revoked_id = id.clone();
-                login_hook::install(move || {
+                login_hook::install(login_hook::Point::Counted, move || {
                     hook_fired.set(true);
                     revoke_fixture_credential(&profile_dir, &credentials_path, &revoked_id, revoke);
                 });

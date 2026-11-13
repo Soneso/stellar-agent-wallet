@@ -77,6 +77,9 @@ pub enum PresenceStartRefusal {
     /// The current owner-signed approval policy cannot be verified, or names
     /// another profile or network: `approval.presence_policy_unavailable`.
     PolicyUnavailable,
+    /// The policy-state lock stays held by a writer through the final retry:
+    /// `approval.presence_policy_busy`.
+    PolicyBusy,
     /// The stored pending entry differs from the one the command presents:
     /// `approval.presence_changed`.
     Changed,
@@ -96,6 +99,7 @@ impl PresenceStartRefusal {
         use stellar_agent_core::ApprovalFailure as F;
         match self {
             Self::PolicyUnavailable => F::PresencePolicyUnavailable,
+            Self::PolicyBusy => F::PresencePolicyBusy,
             Self::Changed => F::PresenceChanged,
             Self::Unavailable => F::PresenceUnavailable,
             Self::OriginSignedRemote => F::OriginSignedRemote,

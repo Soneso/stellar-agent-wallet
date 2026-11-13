@@ -753,6 +753,17 @@ pub enum ApprovalFailure {
         "The current owner-signed mainnet approval policy cannot be verified; restore a valid policy and start a new approval ceremony."
     )]
     PresencePolicyUnavailable,
+    /// The policy-state lock that the current owner-signed mainnet approval
+    /// policy load requires stays busy through the final retry. The pin
+    /// freshness check has not run, so retrying the operation can succeed.
+    ///
+    /// # Wire code
+    ///
+    /// `"approval.presence_policy_busy"`.
+    #[error(
+        "The owner-signed mainnet approval policy is in use by another request; retry the request."
+    )]
+    PresencePolicyBusy,
     /// A signed-origin listener's identity names a policy digest or
     /// certificate pin other than the current owner-signed policy's.
     ///
@@ -884,6 +895,7 @@ impl ApprovalFailure {
             Self::PresenceExpired => "approval.presence_expired",
             Self::PresenceConsumed => "approval.presence_consumed",
             Self::PresencePolicyUnavailable => "approval.presence_policy_unavailable",
+            Self::PresencePolicyBusy => "approval.presence_policy_busy",
             Self::ListenerPolicyStale => "approval.listener_policy_stale",
             Self::CertPinMismatch => "approval.cert_pin_mismatch",
             Self::OriginProfileMismatch => "approval.origin_profile_mismatch",
@@ -6667,6 +6679,11 @@ mod tests {
                 ApprovalFailure::PresencePolicyUnavailable,
                 "approval.presence_policy_unavailable",
                 "The current owner-signed mainnet approval policy cannot be verified; restore a valid policy and start a new approval ceremony.",
+            ),
+            (
+                ApprovalFailure::PresencePolicyBusy,
+                "approval.presence_policy_busy",
+                "The owner-signed mainnet approval policy is in use by another request; retry the request.",
             ),
             (
                 ApprovalFailure::ListenerPolicyStale,

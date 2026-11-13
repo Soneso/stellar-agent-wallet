@@ -129,6 +129,10 @@ Each verified login or decision updates the counter once under the store lock.
 Login waits up to two seconds for the credential store lock.
 If the store stays busy, the listener returns HTTP 503 with `{"error":"store_busy","retriable":true}`.
 The page retries with a fresh challenge up to three times, then shows "Wallet is busy. Try again."
+A policy-state lock that stays busy through its retries returns the same 503 response on login, session and consent requests.
+A login, consent assertion, or rejection takes the lock shared, and a revocation takes it exclusively, before it consumes its challenge.
+Each holds that one guard until it answers, and a revocation writes its durable record under it.
+Its busy answer changes no challenge, counter, session, or entry, so the same request succeeds once the lock is free.
 A login with an equal nonzero or lower counter returns HTTP 400 `webauthn_assertion_invalid`.
 A signed decision with an equal nonzero or lower counter returns HTTP 403 `approval.presence_invalid`.
 Zero may follow zero.

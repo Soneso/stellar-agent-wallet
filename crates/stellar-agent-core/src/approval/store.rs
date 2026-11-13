@@ -6056,6 +6056,46 @@ impl PendingApprovalStore {
         policy: &crate::mainnet::verified_policy::VerifiedPolicy,
         now_ms: u64,
     ) -> Result<bool, crate::error::WalletError> {
+        self.opt_in_under(key, binding, code, issuer, policy, now_ms, None)
+    }
+
+    /// [`Self::verify_mainnet_trustline_clawback_opt_in`] for a caller that
+    /// holds `admission`: the current policy is read through its guard.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::verify_mainnet_trustline_clawback_opt_in`].
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the opt-in inputs and the admission the read runs under"
+    )]
+    pub fn verify_mainnet_trustline_clawback_opt_in_admitted(
+        &self,
+        key: &[u8; 32],
+        binding: &super::AttestationBinding<'_>,
+        code: &str,
+        issuer: &str,
+        policy: &crate::mainnet::verified_policy::VerifiedPolicy,
+        now_ms: u64,
+        admission: &super::presence_policy::PolicyAdmission,
+    ) -> Result<bool, crate::error::WalletError> {
+        self.opt_in_under(key, binding, code, issuer, policy, now_ms, Some(admission))
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the opt-in inputs and the admission the read runs under"
+    )]
+    fn opt_in_under(
+        &self,
+        key: &[u8; 32],
+        binding: &super::AttestationBinding<'_>,
+        code: &str,
+        issuer: &str,
+        policy: &crate::mainnet::verified_policy::VerifiedPolicy,
+        now_ms: u64,
+        admission: Option<&super::presence_policy::PolicyAdmission>,
+    ) -> Result<bool, crate::error::WalletError> {
         use super::attestation::{
             AttestationScope, compute_trustline_clawback_opt_in_digest, verify_attestation,
         };
@@ -6063,9 +6103,12 @@ impl PendingApprovalStore {
         if binding.chain_id != super::presence::MAINNET_CHAIN_ID {
             return Ok(false);
         }
-        let current =
-            super::presence_policy::MainnetApprovalAuthority::for_profile(binding.profile_name)?
-                .load_current_compare_only()?;
+        let authority =
+            super::presence_policy::MainnetApprovalAuthority::for_profile(binding.profile_name)?;
+        let current = match admission {
+            Some(admission) => authority.load_admitted(admission)?,
+            None => authority.load_current_compare_only()?,
+        };
         if !current.is(policy) {
             return Err(crate::error::WalletError::Approval(
                 crate::error::ApprovalFailure::PresencePolicyUnavailable,

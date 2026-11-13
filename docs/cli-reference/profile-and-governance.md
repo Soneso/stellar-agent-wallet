@@ -1220,7 +1220,7 @@ Nothing is attested for it on any surface.
 
 The `approve`, `approve gc`, `approve list`, and `approve serve` commands return failures with `error.code` and a plain diagnostic message.
 These failures carry `approval.*` codes: `approval.not_found`, `approval.expired`, `approval.already_attested`, `approval.user_mismatch`, `approval.clock_error`, `approval.sha256_hex_error`, `approval.key_decode_failed`, `approval.key_length_error`, `approval.binding_mismatch`, `approval.grant_persist`, `approval.wrong_kind`, `approval.rejected`, `approval.consumed`, `approval.record_failed`, `approval.uid_unavailable`, `approval.denied`, `approval.store_dir_error`, `approval.permission_denied`, `approval.invalid_nonce_length`.
-Other codes include `approval.writer_locked`, `approval.store_open_failed`, `approval.gc_failed`, `approval.entry_inconsistent`, `approval.operator_credential_revoked`, `approval.remote_authorization_unavailable`, `approval.presence_required`, `approval.presence_policy_unavailable`, `approval.mainnet_remote_unsupported`, `approval.origin_signed_remote`.
+Other codes include `approval.writer_locked`, `approval.store_open_failed`, `approval.gc_failed`, `approval.entry_inconsistent`, `approval.operator_credential_revoked`, `approval.remote_authorization_unavailable`, `approval.presence_required`, `approval.presence_policy_unavailable`, `approval.presence_policy_busy`, `approval.mainnet_remote_unsupported`, `approval.origin_signed_remote`.
 `approval.presence_invalid`: The passkey assertion fails verification; start a fresh consent.
 `approval.presence_changed`: The pending request or policy differs from the displayed consent; reload it.
 `approval.presence_expired`: The presence deadline expires; start a fresh consent.
