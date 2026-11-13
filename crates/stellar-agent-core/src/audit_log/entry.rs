@@ -2582,10 +2582,41 @@ impl AuditEntry {
                 from_state,
                 step: step.into(),
                 commit_id: commit_id.into(),
+                evidence_digest: None,
+                primary_ledger: None,
+                witness_ledger: None,
+                release_code: None,
             },
             previous_entry_hash: String::new(),
             entry_tag: None,
         }
+    }
+
+    /// Adds the deciding facts of a recovery transition to an
+    /// `OperationTransition` entry: the evidence digest as lowercase
+    /// hexadecimal, both deciding ledgers and the projected release code.
+    /// Every other entry is returned unchanged.
+    #[must_use]
+    pub fn with_recovery_decision(
+        mut self,
+        digest: impl Into<String>,
+        ledgers: (u32, u32),
+        code: Option<&str>,
+    ) -> Self {
+        if let EventKind::OperationTransition {
+            evidence_digest,
+            primary_ledger,
+            witness_ledger,
+            release_code,
+            ..
+        } = &mut self.event_kind
+        {
+            *evidence_digest = Some(digest.into());
+            *primary_ledger = Some(ledgers.0);
+            *witness_ledger = Some(ledgers.1);
+            *release_code = code.map(str::to_owned);
+        }
+        self
     }
 
     /// Constructs an `OperationEvidence` audit entry.

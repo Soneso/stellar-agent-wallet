@@ -330,6 +330,9 @@ pub const TIME_BOUND_PASSED_CODE: &str = "submission.time_bound_passed";
 /// The conservative accounting horizon elapsed with the chain outcome unknown.
 pub const ACCOUNTING_EXPIRED_CODE: &str = "submission.accounting_expired";
 
+/// Committed two-endpoint evidence proves that the transaction never applies.
+pub const RELEASED_ON_EVIDENCE_CODE: &str = "accounting.released_on_evidence";
+
 /// Observations and accounting dispositions attached to an ambiguous receipt.
 ///
 /// Sequence and time claims do not prove failure or authorize capacity release.
@@ -349,18 +352,23 @@ pub enum ReleaseEvidence {
     /// All affected accounting windows end after the signed execution deadline.
     #[serde(rename = "submission.accounting_expired")]
     AccountingExpired,
+    /// Committed two-endpoint non-inclusion evidence released the hold.
+    /// The transaction never executes, so nothing it reserved is spent.
+    #[serde(rename = "accounting.released_on_evidence")]
+    ReleasedOnEvidence,
 }
 
 impl ReleaseEvidence {
     /// Returns the stable wire code for this evidence:
-    /// [`SEQUENCE_CONSUMED_CODE`], [`TIME_BOUND_PASSED_CODE`], or
-    /// [`ACCOUNTING_EXPIRED_CODE`].
+    /// [`SEQUENCE_CONSUMED_CODE`], [`TIME_BOUND_PASSED_CODE`],
+    /// [`ACCOUNTING_EXPIRED_CODE`], or [`RELEASED_ON_EVIDENCE_CODE`].
     #[must_use]
     pub fn code(self) -> &'static str {
         match self {
             Self::SequenceConsumed => SEQUENCE_CONSUMED_CODE,
             Self::TimeBoundPassed => TIME_BOUND_PASSED_CODE,
             Self::AccountingExpired => ACCOUNTING_EXPIRED_CODE,
+            Self::ReleasedOnEvidence => RELEASED_ON_EVIDENCE_CODE,
         }
     }
 }
@@ -4361,6 +4369,28 @@ mod tests {
                 serde_json::from_str::<ReleaseEvidence>(&json).unwrap(),
                 evidence
             );
+        }
+    }
+
+    /// The evidenced release keeps its own wire code through serialization,
+    /// distinct from every observation and from accounting expiry.
+    #[test]
+    fn released_on_evidence_code_round_trips() {
+        let evidence = ReleaseEvidence::ReleasedOnEvidence;
+        assert_eq!(evidence.code(), "accounting.released_on_evidence");
+        assert_eq!(evidence.code(), RELEASED_ON_EVIDENCE_CODE);
+        let json = serde_json::to_string(&evidence).unwrap();
+        assert_eq!(json, "\"accounting.released_on_evidence\"");
+        assert_eq!(
+            serde_json::from_str::<ReleaseEvidence>(&json).unwrap(),
+            evidence
+        );
+        for other in [
+            ReleaseEvidence::SequenceConsumed,
+            ReleaseEvidence::TimeBoundPassed,
+            ReleaseEvidence::AccountingExpired,
+        ] {
+            assert_ne!(other.code(), evidence.code());
         }
     }
 

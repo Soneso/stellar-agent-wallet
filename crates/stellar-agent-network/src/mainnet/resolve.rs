@@ -638,7 +638,9 @@ mod enabled {
         account::fetch_account,
         endpoint_identity::EndpointIdentity,
         keyring::EnrolledRole,
-        policy_state::{ConsumptionBinding, DomainBinding, MintAuthority, MintRequest},
+        policy_state::{
+            ConsumptionBinding, DomainBinding, MintAuthority, MintRequest, NativeReservation,
+        },
         policy_view::AccountViewAdapter,
     };
     use sha2::{Digest as _, Sha256};
@@ -1011,6 +1013,7 @@ mod enabled {
             holds,
             parent: None,
             operation: None,
+            native_reservation: None,
         }
     }
     /// The key of an unmuxed source; a muxed source names no G-strkey and
@@ -1164,6 +1167,16 @@ mod enabled {
             Some(chain_deadline.saturating_mul(1000)),
         );
         request.operation = req.operation;
+        // The native debit is the action's native amount, zero for another
+        // asset; the fee is the envelope's own fee cap.
+        request.native_reservation = Some(NativeReservation {
+            debit_stroops: if asset == Some(CanonicalAsset::Native) {
+                i64::try_from(amount).map_err(|_| refused(P::EnvelopeShape))?
+            } else {
+                0
+            },
+            fee_stroops: i64::from(tx.tx.fee),
+        });
         let minted = req
             .store
             .mint_authorization(req.context.profile(), &request)
@@ -1330,6 +1343,9 @@ mod enabled {
         // message record of the same approval.
         request.parent = authenticated.map(MessageUseReceipt::id);
         request.operation = req.operation;
+        // An x402 authorization moves a contract token and pays no envelope
+        // fee from the account, so it reserves no native amount.
+        request.native_reservation = Some(NativeReservation::default());
         let minted = req
             .store
             .mint_authorization(req.context.profile(), &request)
@@ -1453,6 +1469,7 @@ mod enabled {
             holds: vec![],
             parent: None,
             operation: None,
+            native_reservation: None,
         };
         let minted = req
             .store
@@ -1614,6 +1631,7 @@ mod enabled {
             holds: vec![],
             parent: Some(parent),
             operation: None,
+            native_reservation: None,
         };
         let minted = req
             .store
@@ -3087,6 +3105,49 @@ mod tests {
             })
             .collect();
         assert_eq!(methods, ["getNetwork", "getLedgerEntries"]);
+    }
+
+    /// A resolved native payment stores the payment amount as its native
+    /// debit and the signed envelope's own fee, not a default, as its fee.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn resolved_native_payment_derives_its_debit_and_envelope_fee() {
+        let f = ResolverFixture::new();
+        let server = f.server().await;
+        let context = f.context_with_routes(&[("rpc.example.invalid", &server.uri())]);
+        let client = context.primary_client().unwrap();
+        let envelope = changed_envelope(&f, |tx| tx.tx.fee = 157);
+        let approval = f.approval(&envelope, f.now, 600_000);
+        let authority = MainnetAuthority::Approval(&approval);
+        let mut req = request(&f, &context, &client, &authority);
+        req.unsigned_envelope_xdr = &envelope;
+        let auth = resolve_tx_sign(req).await.unwrap();
+        let native = auth
+            .entries()
+            .iter()
+            .find(|entry| entry.key().bucket() == "native")
+            .unwrap()
+            .amount();
+        assert!(native > 0);
+        let wire = f.wire();
+        let amounts = &wire["authorizations"][0]["native_reservation"];
+        assert_eq!(amounts["debit_stroops"], i64::try_from(native).unwrap());
+        assert_eq!(amounts["fee_stroops"], 157);
+    }
+
+    /// A resolved x402 intent reserves no native debit and no native fee.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn resolved_x402_intent_reserves_no_native_amount() {
+        let f = soroban_fixture();
+        let root = root(&f);
+        let server = f.server().await;
+        let context = f.context_with_routes(&[("rpc.example.invalid", &server.uri())]);
+        resolved_intent(&f, &context, &root).await;
+        let wire = f.wire();
+        let amounts = &wire["authorizations"][0]["native_reservation"];
+        assert_eq!(amounts["debit_stroops"], 0, "{wire}");
+        assert_eq!(amounts["fee_stroops"], 0, "{wire}");
     }
 
     #[tokio::test]

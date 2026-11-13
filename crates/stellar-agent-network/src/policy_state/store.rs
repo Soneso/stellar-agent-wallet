@@ -64,27 +64,15 @@ pub(super) const RETENTION_MS: u64 =
 /// Bounds the chain-time observation independently of the transport timeout.
 const LEDGER_OBSERVATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// Bounds the oracle's single identity request independently of the
-/// transport timeout.
-const ORACLE_IDENTITY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
-
 /// Chain observations and RPC allowance shared by one reconciliation pass.
 ///
-/// The observations belong to one endpoint, the one the release rule asks:
-/// the primary on testnet, the oracle on a mainnet profile. They are keyed to
-/// that client, so values read from one endpoint are never applied to an
+/// The observations belong to the primary endpoint, the one the testnet
+/// release rule asks; a mainnet pass sends no chain request. They are keyed
+/// to that client, so values read from one endpoint are never applied to an
 /// answer of another.
-struct ReconcilePass<'o> {
+struct ReconcilePass {
     remaining: usize,
     spent: usize,
-    /// Whether the pass established that the oracle serves mainnet. The
-    /// check runs once per pass, on the first answer that needs the oracle,
-    /// unless the caller hands the pass an oracle it already checked.
-    oracle: OracleCheck<'o>,
-    /// When every read of the oracle ends, its identity request included:
-    /// the deadline of a caller that holds a resource across the pass. A
-    /// read still open then is abandoned and counts as a failed read.
-    oracle_deadline: Option<tokio::time::Instant>,
     /// The id of the client whose retention floor and chain time the pass
     /// holds.
     observed: Option<u64>,
@@ -97,32 +85,16 @@ struct ReconcilePass<'o> {
     failure: Option<ReconcileFailure>,
 }
 
-/// The oracle identity check of one reconciliation pass.
-#[derive(Clone, Copy)]
-enum OracleCheck<'o> {
-    /// No answer of the pass has needed the oracle yet.
-    Unchecked,
-    /// The oracle reported mainnet.
-    Verified(MainnetOracle<'o>),
-    /// The oracle reported another network, or its identity could not be
-    /// read; it settles nothing for the rest of the pass.
-    Refused,
-}
-
-impl<'o> ReconcilePass<'o> {
-    /// A pass over `budget` reservations. A mainnet profile's reservation can
-    /// cost one read more than a testnet one, the oracle's transaction answer
-    /// beside the primary's, and the pass shares one more read, the oracle's
-    /// identity.
-    fn new(budget: usize, mainnet: bool) -> Self {
-        let (per_reservation, shared) = if mainnet { (4, 3) } else { (3, 2) };
+impl ReconcilePass {
+    /// A pass over `budget` reservations: three reads per reservation and
+    /// two shared reads, the retention floor and the chain time.
+    fn new(budget: usize) -> Self {
+        let (per_reservation, shared) = (3, 2);
         Self {
             remaining: budget
                 .saturating_mul(per_reservation)
                 .saturating_add(shared),
             spent: 0,
-            oracle: OracleCheck::Unchecked,
-            oracle_deadline: None,
             observed: None,
             oldest_ledger: None,
             chain: None,
@@ -139,92 +111,6 @@ impl<'o> ReconcilePass<'o> {
                 reason,
                 kind: ReconcileFailureKind::Unreachable,
             });
-        }
-    }
-
-    /// Records that a mainnet profile names no oracle, so a negative answer of
-    /// the primary had no witness, keeping the first failure the pass met.
-    fn fail_without_oracle(&mut self) {
-        if self.failure.is_none() {
-            self.failure = Some(ReconcileFailure {
-                endpoint: String::new(),
-                reason: stellar_agent_core::error::WitnessUnavailableReason::OracleNotConfigured
-                    .to_string(),
-                kind: ReconcileFailureKind::OracleNotConfigured,
-            });
-        }
-    }
-
-    /// A pass that takes `oracle` as checked and ends every read of it by
-    /// `deadline`.
-    fn with_checked_oracle(
-        mut self,
-        oracle: Option<MainnetOracle<'o>>,
-        deadline: tokio::time::Instant,
-    ) -> Self {
-        if let Some(oracle) = oracle {
-            self.oracle = OracleCheck::Verified(oracle);
-        }
-        self.oracle_deadline = Some(deadline);
-        self
-    }
-
-    /// When a read of `client` must end: the caller's oracle deadline for a
-    /// read of the checked oracle, no deadline for any other read.
-    fn deadline_of(
-        &self,
-        client: &crate::client::StellarRpcClient,
-    ) -> Option<tokio::time::Instant> {
-        match self.oracle {
-            OracleCheck::Verified(oracle) if oracle.client().id() == client.id() => {
-                self.oracle_deadline
-            }
-            _ => None,
-        }
-    }
-
-    /// Returns `oracle` once it has reported mainnet, checking its identity on
-    /// the first call of the pass with one `getNetwork` request, charged to
-    /// the allowance and never retried, so the pass's count holds every
-    /// request it sent. An oracle that reports another network, or whose
-    /// identity read fails or finds the allowance spent, yields `None`; the
-    /// first two are recorded as the pass's failure and hold for the rest of
-    /// the pass.
-    async fn verified_oracle(
-        &mut self,
-        oracle: &'o crate::client::StellarRpcClient,
-    ) -> Option<MainnetOracle<'o>> {
-        match self.oracle {
-            OracleCheck::Verified(verified) => return Some(verified),
-            OracleCheck::Refused => return None,
-            OracleCheck::Unchecked => {}
-        }
-        if !self.charge() {
-            return None;
-        }
-        let own = tokio::time::Instant::now() + ORACLE_IDENTITY_TIMEOUT;
-        let deadline = self.oracle_deadline.map_or(own, |caller| caller.min(own));
-        match MainnetOracle::verify_once(oracle, deadline).await {
-            Ok(verified) => {
-                self.oracle = OracleCheck::Verified(verified);
-                Some(verified)
-            }
-            Err(error) => {
-                tracing::debug!(
-                    %error,
-                    "window reconcile: the oracle did not establish that it serves mainnet; \
-                     its answers settle nothing"
-                );
-                self.oracle = OracleCheck::Refused;
-                if self.failure.is_none() {
-                    self.failure = Some(ReconcileFailure {
-                        endpoint: oracle.url.authority().to_owned(),
-                        reason: error.to_string(),
-                        kind: ReconcileFailureKind::of_oracle_identity(&error),
-                    });
-                }
-                None
-            }
         }
     }
 
@@ -251,20 +137,11 @@ impl<'o> ReconcilePass<'o> {
         if !self.charge() {
             return;
         }
-        let deadline = self.deadline_of(client);
-        let health = match within(deadline, client.get_health()).await {
-            Some(Ok(health)) => health,
-            Some(Err(error)) => {
+        let health = match client.get_health().await {
+            Ok(health) => health,
+            Err(error) => {
                 tracing::debug!(%error, "window reconcile: retention observation unavailable; reservation stands");
                 self.fail(client, network_failure_reason(error));
-                return;
-            }
-            None => {
-                tracing::debug!(
-                    "window reconcile: retention observation not answered by the deadline; \
-                     reservation stands"
-                );
-                self.fail(client, deadline_passed("getHealth"));
                 return;
             }
         };
@@ -272,9 +149,8 @@ impl<'o> ReconcilePass<'o> {
         if !self.charge() {
             return;
         }
-        let own = tokio::time::Instant::now() + LEDGER_OBSERVATION_TIMEOUT;
-        let answer = tokio::time::timeout_at(
-            deadline.map_or(own, |caller| caller.min(own)),
+        let answer = tokio::time::timeout(
+            LEDGER_OBSERVATION_TIMEOUT,
             client.inner.get_ledgers(
                 stellar_rpc_client::LedgerStart::Ledger(health.latest_ledger),
                 Some(1),
@@ -295,7 +171,6 @@ impl<'o> ReconcilePass<'o> {
             }
             Ok(Ok(_)) => "getLedgers answered without a valid ledger close time".to_owned(),
             Ok(Err(error)) => format!("getLedgers failed: {}", client.url.scrub_display(&error)),
-            Err(_) if deadline.is_some_and(|caller| caller < own) => deadline_passed("getLedgers"),
             Err(_) => format!(
                 "getLedgers did not answer within {}s",
                 LEDGER_OBSERVATION_TIMEOUT.as_secs()
@@ -310,23 +185,6 @@ impl<'o> ReconcilePass<'o> {
             kind: ReconcileFailureKind::Unreachable,
         });
     }
-}
-
-/// Runs `read`, abandoning it at `deadline` when one is set. `None` means the
-/// deadline passed before the read completed.
-async fn within<F: std::future::Future>(
-    deadline: Option<tokio::time::Instant>,
-    read: F,
-) -> Option<F::Output> {
-    match deadline {
-        Some(deadline) => tokio::time::timeout_at(deadline, read).await.ok(),
-        None => Some(read.await),
-    }
-}
-
-/// The failure reason of a read the caller's deadline ended.
-fn deadline_passed(rpc_method: &str) -> String {
-    format!("{rpc_method} did not answer before the caller's deadline")
 }
 
 /// The reason text of a failed endpoint read, without the endpoint's
@@ -378,6 +236,7 @@ pub(super) const WIRE_VERSION_OPERATIONS: u32 = 11;
 /// the snapshot it replaces, absent on a first run. Version 11 content
 /// selects 11, and so does a committed version of 11 or more, so a version
 /// 11 file never moves back; below that the version follows the content.
+/// A policy authority or native amounts select at least version 10.
 fn select_wire_version(wire: &WireFile, committed: Option<u32>) -> u32 {
     if committed.is_some_and(|version| version >= WIRE_VERSION_OPERATIONS)
         || operations::has_content(wire)
@@ -388,7 +247,7 @@ fn select_wire_version(wire: &WireFile, committed: Option<u32>) -> u32 {
     } else if wire
         .authorizations
         .iter()
-        .any(|auth| auth.policy_authority.is_some())
+        .any(|auth| auth.policy_authority.is_some() || auth.native_reservation.is_some())
     {
         WIRE_VERSION_POLICY_AUTHORITY
     } else if !wire.signed_intents.is_empty()
@@ -668,9 +527,63 @@ pub struct AccountingDecision {
 #[derive(Debug, Clone, Copy)]
 enum AccountingEvidence {
     PreExposureCancellation,
-    Expired { observed_at_ms: u64 },
-    OperatorOverride { acknowledge_unbounded: bool },
+    Expired {
+        observed_at_ms: u64,
+    },
+    OperatorOverride {
+        acknowledge_unbounded: bool,
+    },
+    /// A committed two-endpoint recovery decision, applied only inside the
+    /// operation commit that records it.
+    Chain {
+        transition: ChainTransition,
+        decision_id: [u8; 32],
+    },
 }
+
+/// The chain outcome a committed recovery decision proves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ChainTransition {
+    /// The transaction applied successfully: every record keeps its debit.
+    Succeeded,
+    /// The transaction applied and failed: see [`ChainDisposition::FeeOnly`].
+    Failed {
+        /// The fee the chain charged, in stroops.
+        fee_charged: i64,
+        /// The agreed close time of the including ledger, in Unix seconds.
+        close_time: u64,
+    },
+    /// The transaction can never apply: every record is released.
+    NotIncluded,
+}
+
+/// What a chain decision does to a record of its reservation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ChainDisposition {
+    /// The record becomes confirmed spend with its amount.
+    Debit,
+    /// The record stays counted. A native record's amount becomes the
+    /// charged fee at the agreed close time; any other record's becomes zero.
+    FeeOnly {
+        /// The fee the chain charged, in stroops.
+        fee_charged: i64,
+    },
+    /// The record is removed.
+    Release,
+}
+
+impl ChainTransition {
+    fn disposition(self) -> ChainDisposition {
+        match self {
+            Self::Succeeded => ChainDisposition::Debit,
+            Self::Failed { fee_charged, .. } => ChainDisposition::FeeOnly { fee_charged },
+            Self::NotIncluded => ChainDisposition::Release,
+        }
+    }
+}
+
+/// The bucket name of native spend.
+const NATIVE_BUCKET: &str = "native";
 
 /// The domain label of an accounting-expiry decision identifier.
 const ACCOUNTING_EXPIRY_ID_LABEL: &[u8] = b"stellar-agent-accounting-expiry:v1";
@@ -978,9 +891,8 @@ pub struct ReconcileReport {
     pub endpoint_failure: Option<ReconcileFailure>,
 }
 
-/// An endpoint read a reconciliation pass could not complete, the oracle a
-/// mainnet profile does not name, or an oracle that did not establish that
-/// it serves mainnet.
+/// An endpoint read a reconciliation pass cannot complete, or the oracle a
+/// mainnet profile does not name.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReconcileFailure {
     /// The endpoint's scheme, host and port; empty for
@@ -1002,67 +914,26 @@ pub enum ReconcileFailureKind {
     /// answer of the primary endpoint had no independent witness and settled
     /// nothing.
     OracleNotConfigured,
-    /// The oracle reported a network other than mainnet, so its answers
-    /// settled nothing.
-    OracleNetworkMismatch,
-    /// The oracle reported a protocol version the protocol rule refuses for
-    /// mainnet, so its answers settled nothing.
-    OracleProtocolUnsupported,
-    /// The oracle's network identity could not be read, so its answers
-    /// settled nothing.
-    OracleIdentityUnavailable,
-}
-
-impl ReconcileFailureKind {
-    /// The kind of a failed oracle identity check, from the error
-    /// the identity check of a [`MainnetOracle`] returned.
-    fn of_oracle_identity(error: &stellar_agent_core::error::WalletError) -> Self {
-        use stellar_agent_core::error::{NetworkError, WalletError, WitnessUnavailableReason};
-        match error {
-            WalletError::Network(NetworkError::WitnessUnavailable {
-                reason: WitnessUnavailableReason::IdentityNetworkMismatch { .. },
-            }) => Self::OracleNetworkMismatch,
-            WalletError::Network(NetworkError::WitnessUnavailable {
-                reason: WitnessUnavailableReason::IdentityProtocolUnsupported { .. },
-            }) => Self::OracleProtocolUnsupported,
-            _ => Self::OracleIdentityUnavailable,
-        }
-    }
 }
 
 impl ReconcileFailure {
-    /// The error the wallet reports for the failure:
-    /// `network.rpc_unreachable` for an endpoint that could not be read, the
-    /// code the status surfaces report when the endpoint cannot be asked
-    /// about a transaction, and `network.witness_unavailable` for a mainnet
-    /// profile without an oracle or with an oracle that did not establish
-    /// that it serves mainnet, the code the cross-check reports for them.
+    /// The error the wallet reports for the failure.
+    ///
+    /// An endpoint that cannot be read reports `network.rpc_unreachable`,
+    /// the code the status surfaces use for an unanswered transaction read.
+    /// A mainnet profile without an oracle reports
+    /// `network.witness_unavailable`, the code the cross-check uses.
     #[must_use]
     pub fn to_network_error(&self) -> stellar_agent_core::error::NetworkError {
         use stellar_agent_core::error::{NetworkError, WitnessUnavailableReason as Reason};
-        let witness = |reason| NetworkError::WitnessUnavailable { reason };
-        let authority = || self.endpoint.clone();
         match self.kind {
             ReconcileFailureKind::Unreachable => NetworkError::RpcUnreachable {
                 url: self.endpoint.clone(),
                 reason: self.reason.clone(),
             },
-            ReconcileFailureKind::OracleNotConfigured => witness(Reason::OracleNotConfigured),
-            ReconcileFailureKind::OracleNetworkMismatch => {
-                witness(Reason::IdentityNetworkMismatch {
-                    authority: authority(),
-                })
-            }
-            ReconcileFailureKind::OracleProtocolUnsupported => {
-                witness(Reason::IdentityProtocolUnsupported {
-                    authority: authority(),
-                })
-            }
-            ReconcileFailureKind::OracleIdentityUnavailable => {
-                witness(Reason::IdentityUnavailable {
-                    authority: authority(),
-                })
-            }
+            ReconcileFailureKind::OracleNotConfigured => NetworkError::WitnessUnavailable {
+                reason: Reason::OracleNotConfigured,
+            },
         }
     }
 }
@@ -2782,57 +2653,13 @@ impl PersistedWindowStore {
         let (key, _) = self.load_or_mint_key(profile)?;
         let gen_entry = generation_entry_ref(profile);
         let mut wire = self.read_verified(profile, &key, &gen_entry)?;
-        if wire.chain_scope != Some(decision.chain_scope) {
-            return Err(WindowStoreError::ChainMismatch);
+        if matches!(decision.evidence, AccountingEvidence::Chain { .. }) {
+            return Err(WindowStoreError::Invalid {
+                detail: "chain accounting applies only inside its operation commit".into(),
+            });
         }
-        if wire.generation != decision.generation {
-            return Err(WindowStoreError::GenerationMismatch);
-        }
-        check_accounting_evidence(&wire, &decision.id, decision.evidence)?;
         let original = wire.clone();
-        let expiry = match decision.evidence {
-            AccountingEvidence::Expired { observed_at_ms } => Some(expiry_record(
-                &wire,
-                decision.chain_scope,
-                &decision.id,
-                decision.generation,
-                observed_at_ms,
-            )?),
-            AccountingEvidence::PreExposureCancellation
-            | AccountingEvidence::OperatorOverride { .. } => None,
-        };
-        for bucket in &mut wire.entries {
-            if matches!(
-                decision.evidence,
-                AccountingEvidence::PreExposureCancellation
-            ) {
-                bucket
-                    .records
-                    .retain(|r| r.id != decision.id || !is_exposure(r));
-            } else {
-                for record in &mut bucket.records {
-                    if record.id == decision.id && is_exposure(record) {
-                        record.status = match decision.evidence {
-                            AccountingEvidence::OperatorOverride {
-                                acknowledge_unbounded,
-                            } => {
-                                record.acknowledged_unbounded = Some(acknowledge_unbounded);
-                                if execution_bound(record).is_none() {
-                                    RecordStatus::OperatorCleared
-                                } else {
-                                    record.status
-                                }
-                            }
-                            _ => RecordStatus::AccountingExpired,
-                        };
-                    }
-                }
-            }
-        }
-        let decision_id = expiry.as_ref().map(|record| record.decision_id.clone());
-        if let Some(record) = expiry {
-            wire.accounting_expiries.push(record);
-        }
+        let decision_id = apply_decision_in(&mut wire, &decision)?;
         self.commit_generation(&key, &gen_entry, original, wire)?;
         Ok(decision_id)
     }
@@ -2924,7 +2751,9 @@ impl PersistedWindowStore {
     /// Untimed exposure requires an explicit operator acknowledgement.
     ///
     /// The authenticated chain scope must match the profile before any endpoint
-    /// read or accounting transition. Mainnet oracle identity checks remain required.
+    /// read or accounting transition. A mainnet reservation sends no chain
+    /// request here and stands until a committed recovery decision or its
+    /// accounting expiry settles it.
     ///
     /// # Errors
     /// See [`WindowStoreError`]. Endpoint failures leave reservations standing.
@@ -2937,6 +2766,9 @@ impl PersistedWindowStore {
         now_ms: u64,
         budget: usize,
     ) -> Result<ReconcileReport, WindowStoreError> {
+        // A mainnet reservation settles only through a committed recovery
+        // decision, so no pass reads the oracle here.
+        let _ = oracle;
         self.require_chain_scope(profile, &ChainScope::for_chain(profile.chain_id))?;
         let Some(wire) = self.read_for_inspection(profile)? else {
             return Ok(ReconcileReport::default());
@@ -2992,20 +2824,12 @@ impl PersistedWindowStore {
                 .collect();
 
         let mut report = ReconcileReport::default();
-        let mut pass = ReconcilePass::new(budget, profile.chain_id.is_mainnet());
+        let mut pass = ReconcilePass::new(budget);
 
         for reservation in due {
             report.examined += 1;
             let settlement = self
-                .settle_reservation(
-                    profile,
-                    client,
-                    oracle,
-                    receipts,
-                    &reservation,
-                    &mut pass,
-                    now_ms,
-                )
+                .settle_reservation(profile, client, receipts, &reservation, &mut pass, now_ms)
                 .await?;
             record_settlement(&mut report, &reservation, settlement);
         }
@@ -3028,8 +2852,8 @@ impl PersistedWindowStore {
     /// receipt when the window file holds no record for it. Settling the
     /// window is then a no-op.
     ///
-    /// On a mainnet profile `oracle` witnesses the primary's negative
-    /// answers, as [`Self::reconcile_due`] describes.
+    /// A mainnet reservation settles no chain answer here, so `oracle` is
+    /// not read; see [`Self::reconcile_due`].
     ///
     /// # Errors
     ///
@@ -3043,8 +2867,8 @@ impl PersistedWindowStore {
         id: &str,
         now_ms: u64,
     ) -> Result<ReconcileReport, WindowStoreError> {
-        let pass = ReconcilePass::new(1, profile.chain_id.is_mainnet());
-        self.reconcile_one_in(profile, client, oracle, receipts, id, pass, now_ms)
+        let _ = oracle;
+        self.reconcile_one_in(profile, client, receipts, id, ReconcilePass::new(1), now_ms)
             .await
     }
 
@@ -3052,12 +2876,9 @@ impl PersistedWindowStore {
     /// caller that already checked the oracle and holds a resource across the
     /// pass.
     ///
-    /// `oracle` is taken as checked: its identity is not read again. Every
-    /// read of it ends by `oracle_deadline`; a read still open then leaves
-    /// the reservation standing and is reported in
-    /// [`ReconcileReport::endpoint_failure`] as an unreachable endpoint, so
-    /// the pass returns by that deadline whatever the oracle does. Reads of
-    /// the primary endpoint keep their own bounds.
+    /// A mainnet reservation settles no chain answer here, so neither
+    /// `oracle` nor `oracle_deadline` bounds a read: the pass sends none on
+    /// mainnet. Reads of a testnet primary keep their own bounds.
     ///
     /// # Errors
     ///
@@ -3076,35 +2897,21 @@ impl PersistedWindowStore {
         now_ms: u64,
         oracle_deadline: tokio::time::Instant,
     ) -> Result<ReconcileReport, WindowStoreError> {
-        let pass = ReconcilePass::new(1, profile.chain_id.is_mainnet())
-            .with_checked_oracle(oracle, oracle_deadline);
-        self.reconcile_one_in(
-            profile,
-            client,
-            oracle.map(MainnetOracle::client),
-            receipts,
-            id,
-            pass,
-            now_ms,
-        )
-        .await
+        let _ = (oracle, oracle_deadline);
+        self.reconcile_one_in(profile, client, receipts, id, ReconcilePass::new(1), now_ms)
+            .await
     }
 
     /// The single-submission pass of [`Self::reconcile_one`] and
     /// [`Self::reconcile_one_within`], run with `pass` at the caller's
     /// `now_ms`.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "the arguments of reconcile_one plus the pass and the caller's clock"
-    )]
-    async fn reconcile_one_in<'o>(
+    async fn reconcile_one_in(
         &self,
         profile: &Profile,
         client: &crate::client::StellarRpcClient,
-        oracle: Option<&'o crate::client::StellarRpcClient>,
         receipts: Option<&ReceiptStore>,
         id: &str,
-        mut pass: ReconcilePass<'o>,
+        mut pass: ReconcilePass,
         now_ms: u64,
     ) -> Result<ReconcileReport, WindowStoreError> {
         let scope = ChainScope::for_chain(profile.chain_id);
@@ -3124,15 +2931,7 @@ impl PersistedWindowStore {
             ..ReconcileReport::default()
         };
         let settlement = self
-            .settle_reservation(
-                profile,
-                client,
-                oracle,
-                receipts,
-                &reservation,
-                &mut pass,
-                now_ms,
-            )
+            .settle_reservation(profile, client, receipts, &reservation, &mut pass, now_ms)
             .await?;
         record_settlement(&mut report, &reservation, settlement);
         report.rpc_calls = pass.spent;
@@ -3644,14 +3443,13 @@ impl PersistedWindowStore {
         clippy::too_many_arguments,
         reason = "the pass state plus the caller's clock for the expiry check"
     )]
-    async fn settle_reservation<'o>(
+    async fn settle_reservation(
         &self,
         profile: &Profile,
         client: &crate::client::StellarRpcClient,
-        oracle: Option<&'o crate::client::StellarRpcClient>,
         receipts: Option<&ReceiptStore>,
         reservation: &SubmissionHold,
-        pass: &mut ReconcilePass<'o>,
+        pass: &mut ReconcilePass,
         now_ms: u64,
     ) -> Result<Settlement, WindowStoreError> {
         if let Some(settlement) = self.expire_accounting(profile, receipts, reservation, now_ms)? {
@@ -3673,6 +3471,12 @@ impl PersistedWindowStore {
             return Ok(Settlement::ReceiptWriteFailed {
                 error: e.to_string(),
             });
+        }
+        // A mainnet reservation settles only through a committed two-endpoint
+        // recovery decision, so this pass sends no chain request for it and
+        // the reservation stands.
+        if reservation.chain_scope.chain().is_mainnet() {
+            return Ok(Settlement::KeptPending);
         }
 
         let Ok(hash_bytes) = stellar_agent_core::hex::decode_hex32(&reservation.tx_hash) else {
@@ -3701,28 +3505,6 @@ impl PersistedWindowStore {
             }
         };
 
-        // On a mainnet profile the primary's negative answers are claims the
-        // oracle has to confirm, and only an oracle that reports mainnet can
-        // confirm them; the primary's SUCCESS confirms as on any chain, which
-        // keeps the debit.
-        if reservation.chain_scope.chain().is_mainnet()
-            && matches!(record.status(), "FAILED" | "NOT_FOUND")
-        {
-            let Some(oracle) = oracle else {
-                tracing::debug!(
-                    "window reconcile: the primary endpoint's negative answer has no oracle to \
-                     confirm it; reservation stands"
-                );
-                pass.fail_without_oracle();
-                return Ok(Settlement::KeptPending);
-            };
-            let Some(oracle) = pass.verified_oracle(oracle).await else {
-                return Ok(Settlement::KeptPending);
-            };
-            return self
-                .settle_on_oracle(profile, oracle, receipts, reservation, &tx_hash, pass)
-                .await;
-        }
         if record.status() == "NOT_FOUND" {
             return self
                 .settle_not_found(profile, client, receipts, reservation, pass)
@@ -3730,58 +3512,6 @@ impl PersistedWindowStore {
         }
         // A success observation is dated on this host's clock, not the caller's.
         self.settle_chain_answer(profile, receipts, reservation, &record, self::now_ms()?)
-    }
-
-    /// Settles a mainnet reservation whose primary endpoint answered `FAILED`
-    /// or `NOT_FOUND`, on the oracle's answers alone.
-    ///
-    /// Success records a report and its local observation. Negative answers
-    /// retain capacity. Retention and sequence observations describe uncertainty
-    /// without proving failure. An unavailable oracle leaves the reservation held.
-    async fn settle_on_oracle(
-        &self,
-        profile: &Profile,
-        oracle: MainnetOracle<'_>,
-        receipts: Option<&ReceiptStore>,
-        reservation: &SubmissionHold,
-        tx_hash: &stellar_xdr::Hash,
-        pass: &mut ReconcilePass<'_>,
-    ) -> Result<Settlement, WindowStoreError> {
-        let oracle = oracle.client();
-        if !pass.charge() {
-            return Ok(Settlement::KeptPending);
-        }
-        let deadline = pass.deadline_of(oracle);
-        let record = match within(deadline, oracle.get_transaction_record(tx_hash)).await {
-            Some(Ok(r)) => r,
-            None => {
-                tracing::debug!(
-                    tx_hash = %crate::submit::redact_tx_hash(&reservation.tx_hash),
-                    "window reconcile: the oracle's getTransaction did not answer by the \
-                     deadline; reservation stands"
-                );
-                pass.fail(oracle, deadline_passed("getTransaction"));
-                return Ok(Settlement::KeptPending);
-            }
-            Some(Err(e)) => {
-                tracing::debug!(
-                    tx_hash = %crate::submit::redact_tx_hash(&reservation.tx_hash),
-                    error = %oracle.url.scrub_display(&e),
-                    "window reconcile: the oracle's getTransaction failed; reservation stands"
-                );
-                pass.fail(
-                    oracle,
-                    format!("getTransaction failed: {}", oracle.url.scrub_display(&e)),
-                );
-                return Ok(Settlement::KeptPending);
-            }
-        };
-        if record.status() == "NOT_FOUND" {
-            return self
-                .settle_not_found(profile, oracle, receipts, reservation, pass)
-                .await;
-        }
-        self.settle_chain_answer(profile, receipts, reservation, &record, now_ms()?)
     }
 
     /// Records endpoint success as a report; negative answers retain exposure.
@@ -3848,7 +3578,7 @@ impl PersistedWindowStore {
         client: &crate::client::StellarRpcClient,
         receipts: Option<&ReceiptStore>,
         reservation: &SubmissionHold,
-        pass: &mut ReconcilePass<'_>,
+        pass: &mut ReconcilePass,
     ) -> Result<Settlement, WindowStoreError> {
         // A submission ledger of 0 records no view of the chain, so the
         // retention boundary below cannot be checked against it and a
@@ -3942,25 +3672,12 @@ impl PersistedWindowStore {
         if !pass.charge() {
             return Ok(Settlement::KeptPending);
         }
-        let deadline = pass.deadline_of(client);
-        let account = match within(
-            deadline,
-            crate::account::fetch_account(client, &reservation.source, &[]),
-        )
-        .await
-        {
-            Some(Ok(a)) => a,
-            Some(Err(stellar_agent_core::error::WalletError::Network(
+        let account = match crate::account::fetch_account(client, &reservation.source, &[]).await {
+            Ok(a) => a,
+            Err(stellar_agent_core::error::WalletError::Network(
                 stellar_agent_core::error::NetworkError::AccountNotFound { .. },
-            ))) => return Ok(Settlement::KeptPending),
-            None => {
-                tracing::debug!(
-                    "window reconcile: source account not read by the deadline; reservation stands"
-                );
-                pass.fail(client, deadline_passed("getLedgerEntries"));
-                return Ok(Settlement::KeptPending);
-            }
-            Some(Err(e)) => {
+            )) => return Ok(Settlement::KeptPending),
+            Err(e) => {
                 tracing::debug!(
                     error = %e,
                     "window reconcile: source account fetch failed; reservation stands"
@@ -3997,7 +3714,7 @@ impl PersistedWindowStore {
         client: &crate::client::StellarRpcClient,
         receipts: Option<&ReceiptStore>,
         reservation: &SubmissionHold,
-        pass: &mut ReconcilePass<'_>,
+        pass: &mut ReconcilePass,
     ) -> Result<Settlement, WindowStoreError> {
         let Ok(hash) = stellar_agent_core::hex::decode_hex32(&reservation.tx_hash) else {
             return Ok(Settlement::KeptPending);
@@ -4005,23 +3722,12 @@ impl PersistedWindowStore {
         if !pass.charge() {
             return Ok(Settlement::KeptPending);
         }
-        let deadline = pass.deadline_of(client);
-        let record = match within(
-            deadline,
-            client.get_transaction_record(&stellar_xdr::Hash(hash)),
-        )
-        .await
+        let record = match client
+            .get_transaction_record(&stellar_xdr::Hash(hash))
+            .await
         {
-            Some(Ok(record)) => record,
-            None => {
-                tracing::debug!(
-                    "window reconcile: confirmation query not answered by the deadline; \
-                     reservation stands"
-                );
-                pass.fail(client, deadline_passed("getTransaction"));
-                return Ok(Settlement::KeptPending);
-            }
-            Some(Err(e)) => {
+            Ok(record) => record,
+            Err(e) => {
                 tracing::debug!(error = %client.url.scrub_display(&e),
                     "window reconcile: confirmation query failed; reservation stands");
                 pass.fail(
@@ -4798,6 +4504,16 @@ fn check_snapshot(wire: &WireFile) -> Result<(), WindowStoreError> {
             detail: format!(
                 "a policy authority requires wire version {WIRE_VERSION_POLICY_AUTHORITY}"
             ),
+        });
+    }
+    if wire.version < WIRE_VERSION_POLICY_AUTHORITY
+        && wire
+            .authorizations
+            .iter()
+            .any(|auth| auth.native_reservation.is_some())
+    {
+        return Err(WindowStoreError::Invalid {
+            detail: format!("native amounts require wire version {WIRE_VERSION_POLICY_AUTHORITY}"),
         });
     }
     validate_signed_intents(wire)?;
@@ -6155,12 +5871,145 @@ fn expiry_record(
     })
 }
 
+/// Applies a checked `decision` to `wire` in memory. The caller holds the
+/// window lock and commits the result in the same generation; nothing here
+/// locks or writes.
+///
+/// # Errors
+///
+/// Refuses a changed chain, generation, or evidence.
+fn apply_decision_in(
+    wire: &mut WireFile,
+    decision: &AccountingDecision,
+) -> Result<Option<String>, WindowStoreError> {
+    if wire.chain_scope != Some(decision.chain_scope) {
+        return Err(WindowStoreError::ChainMismatch);
+    }
+    if wire.generation != decision.generation {
+        return Err(WindowStoreError::GenerationMismatch);
+    }
+    check_accounting_evidence(wire, &decision.id, decision.evidence)?;
+    let expiry = match decision.evidence {
+        AccountingEvidence::Expired { observed_at_ms } => Some(expiry_record(
+            wire,
+            decision.chain_scope,
+            &decision.id,
+            decision.generation,
+            observed_at_ms,
+        )?),
+        AccountingEvidence::PreExposureCancellation
+        | AccountingEvidence::OperatorOverride { .. }
+        | AccountingEvidence::Chain { .. } => None,
+    };
+    for bucket in &mut wire.entries {
+        match decision.evidence {
+            AccountingEvidence::PreExposureCancellation => bucket
+                .records
+                .retain(|r| r.id != decision.id || !is_exposure(r)),
+            AccountingEvidence::Chain { transition, .. } => {
+                apply_chain(bucket, &decision.id, transition);
+            }
+            AccountingEvidence::Expired { .. } | AccountingEvidence::OperatorOverride { .. } => {
+                for record in &mut bucket.records {
+                    if record.id == decision.id && is_exposure(record) {
+                        record.status = match decision.evidence {
+                            AccountingEvidence::OperatorOverride {
+                                acknowledge_unbounded,
+                            } => {
+                                record.acknowledged_unbounded = Some(acknowledge_unbounded);
+                                if execution_bound(record).is_none() {
+                                    RecordStatus::OperatorCleared
+                                } else {
+                                    record.status
+                                }
+                            }
+                            _ => RecordStatus::AccountingExpired,
+                        };
+                    }
+                }
+            }
+        }
+    }
+    let decision_id = expiry.as_ref().map(|record| record.decision_id.clone());
+    if let Some(record) = expiry {
+        wire.accounting_expiries.push(record);
+    }
+    Ok(decision_id)
+}
+
+/// Applies `transition`'s disposition to the exposure records of
+/// reservation `id` in `bucket`.
+fn apply_chain(bucket: &mut WireBucket, id: &str, transition: ChainTransition) {
+    let native = bucket.bucket == NATIVE_BUCKET;
+    match transition.disposition() {
+        ChainDisposition::Release => bucket.records.retain(|r| r.id != id || !is_exposure(r)),
+        disposition => {
+            for record in &mut bucket.records {
+                if record.id != id || !is_exposure(record) {
+                    continue;
+                }
+                record.status = RecordStatus::Confirmed;
+                if let (
+                    ChainDisposition::FeeOnly { fee_charged },
+                    ChainTransition::Failed { close_time, .. },
+                ) = (disposition, transition)
+                {
+                    record.amount = if native { i128::from(fee_charged) } else { 0 };
+                    record.ts_ms = close_time.saturating_mul(1_000);
+                }
+            }
+        }
+    }
+}
+
+/// Applies the bucket accounting of a committed recovery decision to the
+/// reservation `envelope_id` inside an operation commit that holds the
+/// window lock. The decision is bound to `wire`'s generation and chain.
+///
+/// # Errors
+///
+/// Refuses unverifiable chain provenance, or records of the reservation that
+/// are neither exposure records nor expired accounting rows.
+pub(super) fn apply_chain_accounting(
+    wire: &mut WireFile,
+    envelope_id: &str,
+    transition: ChainTransition,
+    decision_id: [u8; 32],
+) -> Result<(), WindowStoreError> {
+    let decision = AccountingDecision {
+        chain_scope: wire
+            .chain_scope
+            .ok_or(WindowStoreError::ChainUnverifiable)?,
+        id: envelope_id.to_owned(),
+        generation: wire.generation,
+        evidence: AccountingEvidence::Chain {
+            transition,
+            decision_id,
+        },
+    };
+    apply_decision_in(wire, &decision).map(|_| ())
+}
+
 fn check_accounting_evidence(
     wire: &WireFile,
     id: &str,
     evidence: AccountingEvidence,
 ) -> Result<(), WindowStoreError> {
     let accepted = match evidence {
+        // A decision names its evidence digest. A reservation without
+        // records, an attempt without window entries, accepts. Every record
+        // is still exposed or already expired by its accounting horizon. The
+        // disposition then touches only exposed records, so an expired charge
+        // stays expired and is never released twice.
+        AccountingEvidence::Chain { decision_id, .. } => {
+            decision_id != [0; 32]
+                && wire
+                    .entries
+                    .iter()
+                    .flat_map(|b| &b.records)
+                    .filter(|r| r.id == id)
+                    .all(|r| is_exposure(r) || r.status == RecordStatus::AccountingExpired)
+        }
         AccountingEvidence::PreExposureCancellation => {
             file_holds_id(wire, id)
                 && wire
@@ -6333,6 +6182,10 @@ pub(super) fn find_or_insert_bucket<'a>(
 
 #[cfg(test)]
 pub(crate) use tests::fail_store_writes;
+#[cfg(test)]
+pub(crate) use tests::{
+    COMMIT_FAULT_AFTER_COUNTER, COMMIT_FAULT_AFTER_PREPARED, arm_accounting_fault,
+};
 
 #[cfg(test)]
 mod tests {
@@ -15125,6 +14978,7 @@ mod tests {
             operation: None,
             disposition: None,
             native_release: None,
+            native_reservation: None,
         }
     }
 
@@ -15515,6 +15369,7 @@ mod tests {
             operation: None,
             disposition: None,
             native_release: None,
+            native_reservation: None,
         });
         wire.holds.push(WireAuthorizationHold {
             kind: ledger::HoldKind::Value,
@@ -15946,6 +15801,7 @@ mod tests {
             holds: vec![],
             parent: None,
             operation: None,
+            native_reservation: None,
         }
     }
 
@@ -16338,6 +16194,57 @@ mod tests {
             let field = format!("\"{name}\":{}", section.unwrap());
             assert!(V10_BODY.contains(&field), "{name}");
         }
+        assert_reserializes_byte_identically(&store, &profile);
+    }
+
+    /// Native amounts alone select version 10, a policy authority keeps
+    /// selecting 10, operation content selects 11, and a committed version
+    /// 11 file never moves back.
+    #[test]
+    #[serial]
+    fn native_reservation_selects_version_ten_and_keeps_eleven() {
+        let (_dir, profile, store, _clock) = operation_store();
+        let mut held = policy_mint(1);
+        held.native_reservation = Some(ledger::NativeReservation {
+            debit_stroops: 9,
+            fee_stroops: 100,
+        });
+        store.mint_authorization(&profile, &held).unwrap();
+        let wire = store.read_for_inspection(&profile).unwrap().unwrap();
+        assert_eq!(wire.version, WIRE_VERSION_POLICY_AUTHORITY);
+        let mut native_only = wire.clone();
+        native_only.authorizations[0].policy_authority = None;
+        assert_eq!(
+            select_wire_version(&native_only, None),
+            WIRE_VERSION_POLICY_AUTHORITY
+        );
+        native_only.authorizations[0].native_reservation = None;
+        assert!(select_wire_version(&native_only, None) < WIRE_VERSION_POLICY_AUTHORITY);
+        let mut lowered = wire.clone();
+        lowered.authorizations[0].policy_authority = None;
+        lowered.version = WIRE_VERSION_POLICY_AUTHORITY - 1;
+        let refusal = |wire: &WireFile| match check_snapshot(wire) {
+            Err(WindowStoreError::Invalid { detail }) => detail,
+            other => format!("{other:?}"),
+        };
+        assert_eq!(refusal(&lowered), "native amounts require wire version 10");
+        lowered.authorizations[0].native_reservation = None;
+        assert_ne!(refusal(&lowered), "native amounts require wire version 10");
+
+        let mut audit = OperationRows::default();
+        open_operation(&store, &profile, &mut audit, "order-1", 1);
+        let eleven = store.read_for_inspection(&profile).unwrap().unwrap();
+        assert_eq!(eleven.version, WIRE_VERSION_OPERATIONS);
+        assert_eq!(
+            eleven.authorizations[0].native_reservation,
+            held.native_reservation
+        );
+        let mut emptied = eleven.clone();
+        emptied.operations = None;
+        assert_eq!(
+            select_wire_version(&emptied, Some(WIRE_VERSION_OPERATIONS)),
+            WIRE_VERSION_OPERATIONS
+        );
         assert_reserializes_byte_identically(&store, &profile);
     }
 
@@ -17595,8 +17502,8 @@ mod tests {
     /// The crash seam right after an accounting expiry commits, before its
     /// receipt projection.
     pub(super) const ACCOUNTING_FAULT_AFTER_COMMIT: u8 = 1;
-    pub(super) const COMMIT_FAULT_AFTER_PREPARED: u8 = 4;
-    pub(super) const COMMIT_FAULT_AFTER_COUNTER: u8 = 5;
+    pub(crate) const COMMIT_FAULT_AFTER_PREPARED: u8 = 4;
+    pub(crate) const COMMIT_FAULT_AFTER_COUNTER: u8 = 5;
     pub(super) const COMMIT_FAULT_COMPACTION: u8 = 6;
     /// The crash seam right after an expiry event is appended, before its
     /// acknowledgement commits.
@@ -17621,7 +17528,7 @@ mod tests {
     }
 
     /// Disarms the accounting seam on this thread when dropped.
-    struct ArmedFault;
+    pub(crate) struct ArmedFault;
     impl Drop for ArmedFault {
         fn drop(&mut self) {
             ACCOUNTING_FAULT.set(0);
@@ -17629,7 +17536,7 @@ mod tests {
     }
 
     /// Stops the next operation that reaches `point` on this thread.
-    fn arm_accounting_fault(point: u8) -> ArmedFault {
+    pub(crate) fn arm_accounting_fault(point: u8) -> ArmedFault {
         ACCOUNTING_FAULT.set(point);
         ArmedFault
     }

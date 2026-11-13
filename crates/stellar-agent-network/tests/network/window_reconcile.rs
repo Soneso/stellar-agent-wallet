@@ -48,8 +48,7 @@ use stellar_agent_core::profile::receipt::{ReceiptStatus, ReceiptStore, ReleaseE
 use stellar_agent_core::profile::schema::{KeyringEntryRef, Profile};
 use stellar_agent_network::StellarRpcClient;
 use stellar_agent_network::policy_state::{
-    PersistedWindowStore, RECONCILE_BUDGET, RECONCILE_MIN_AGE_MS, ReconcileFailure,
-    ReconcileFailureKind, SubmissionHold,
+    PersistedWindowStore, RECONCILE_BUDGET, RECONCILE_MIN_AGE_MS, ReconcileReport, SubmissionHold,
 };
 use stellar_agent_test_support::keyring_mock;
 use stellar_agent_test_support::signed_envelope::{
@@ -3018,8 +3017,8 @@ impl Respond for IdentityResponder {
 }
 
 /// A primary that reports `FAILED` for a transaction the oracle reports
-/// applied settles nothing on its own word: the oracle's `SUCCESS`
-/// confirms the spend.
+/// applied settles nothing: a mainnet pass sends no legacy request, the
+/// debit stays and the receipt stays pending until recovery decides.
 #[tokio::test]
 #[serial]
 async fn a_mainnet_failed_answer_the_oracle_reports_applied_confirms() {
@@ -3051,14 +3050,12 @@ async fn a_mainnet_failed_answer_the_oracle_reports_applied_confirms() {
         .await
         .unwrap();
 
-    assert_eq!(report.confirmed, 1, "{report:?}");
-    assert_eq!(report.released, 0, "{report:?}");
+    assert_no_legacy_settlement(&report, &endpoints).await;
     assert_eq!(fx.window_total(now), (500, 1), "the debit stays");
     assert_eq!(
         fx.receipts.get(&res.id).unwrap().unwrap().status,
-        ReceiptStatus::Success
+        ReceiptStatus::Pending
     );
-    assert_eq!(endpoints.oracle_counts.count("getTransaction"), 1);
 }
 
 /// The oracle's own `FAILED`, behind the primary's, retains the reservation:
@@ -3107,7 +3104,7 @@ async fn a_mainnet_failed_answer_the_oracle_confirms_retains_the_reservation() {
 }
 
 /// A primary `FAILED` with an oracle that cannot answer, and with no oracle
-/// at all, keeps the reservation and reports why.
+/// at all, keeps the reservation without a legacy request.
 #[tokio::test]
 #[serial]
 async fn a_mainnet_failed_answer_without_an_oracle_answer_stands() {
@@ -3143,39 +3140,17 @@ async fn a_mainnet_failed_answer_without_an_oracle_answer_stands() {
             .unwrap();
 
         assert_eq!(report.kept_pending, 1, "{report:?}");
-        assert_eq!(report.released, 0, "{report:?}");
+        assert_no_legacy_settlement(&report, &endpoints).await;
         assert_eq!(fx.window_total(now), (500, 1), "the debit stays");
         assert_eq!(
             fx.receipts.get(&res.id).unwrap().unwrap().status,
             ReceiptStatus::Pending
         );
-        let failure = report
-            .endpoint_failure
-            .expect("the missing witness is reported");
-        if with_oracle {
-            assert_eq!(failure.kind, ReconcileFailureKind::Unreachable);
-            assert_eq!(
-                failure.endpoint,
-                endpoints.oracle.uri(),
-                "the oracle is named"
-            );
-            assert!(
-                failure.reason.starts_with("getTransaction failed: "),
-                "{failure:?}"
-            );
-        } else {
-            assert_eq!(failure.kind, ReconcileFailureKind::OracleNotConfigured);
-            assert_eq!(
-                stellar_agent_core::error::WalletError::Network(failure.to_network_error()).code(),
-                "network.witness_unavailable"
-            );
-        }
     }
 }
 
-/// The sequence observation reads the oracle's account sequence, not the
-/// primary's: neither the primary's account nor its retention is read, and
-/// the reservation stands.
+/// A consumed sequence on either endpoint settles nothing: neither account
+/// nor retention is read, and the reservation stands.
 #[tokio::test]
 #[serial]
 async fn a_mainnet_sequence_observation_reads_the_oracle() {
@@ -3222,24 +3197,16 @@ async fn a_mainnet_sequence_observation_reads_the_oracle() {
         .unwrap();
 
     assert_eq!(report.kept_pending, 1, "{report:?}");
-    assert_eq!(report.released, 0, "{report:?}");
-    assert_eq!(report.endpoint_failure, None, "{report:?}");
+    assert_no_legacy_settlement(&report, &endpoints).await;
     assert_eq!(fx.window_total(now), (500, 1), "the debit stays");
-    assert_eq!(endpoints.oracle_counts.count("getLedgerEntries"), 1);
-    assert_eq!(
-        endpoints.primary_counts.count("getLedgerEntries"),
-        0,
-        "the primary's sequence is never read"
-    );
-    assert_eq!(
-        endpoints.primary_counts.count("getHealth"),
-        0,
-        "nor its retention"
-    );
+    for counts in [&endpoints.oracle_counts, &endpoints.primary_counts] {
+        assert_eq!(counts.count("getLedgerEntries"), 0);
+        assert_eq!(counts.count("getHealth"), 0);
+    }
 }
 
-/// Once the time bound has passed on the oracle's latest ledger, the oracle
-/// is asked again, and its fresh `NOT_FOUND` keeps the reservation.
+/// A passed time bound retains the reservation: the hold and the receipt
+/// stand, and no endpoint is asked.
 #[tokio::test]
 #[serial]
 async fn a_mainnet_oracle_time_bound_retains_the_reservation() {
@@ -3283,18 +3250,14 @@ async fn a_mainnet_oracle_time_bound_retains_the_reservation() {
     assert_eq!(fx.window_total(now), (500, 1));
     assert!(report.settled.is_empty());
     assert_eq!(
-        endpoints.oracle_counts.count("getTransaction"),
-        2,
-        "the oracle's first answer and its fresh one"
+        fx.receipts.get(&res.id).unwrap().unwrap().status,
+        ReceiptStatus::Pending
     );
-    assert_eq!(endpoints.primary_counts.count("getTransaction"), 1);
+    assert_no_legacy_settlement(&report, &endpoints).await;
 }
 
-/// `tx status` reads a mainnet reservation's oracle evidence within its
-/// one-reservation allowance: the primary's transaction answer, the oracle's
-/// identity, its transaction answer, its retention and chain time, its
-/// account and its fresh answer. The consumed sequence and the fresh
-/// `NOT_FOUND` keep the reservation.
+/// `tx status` of a mainnet reservation sends no legacy request: the
+/// reservation and its pending receipt stand.
 #[tokio::test]
 #[serial]
 async fn a_named_mainnet_reservation_stands_on_the_oracle_sequence() {
@@ -3334,7 +3297,7 @@ async fn a_named_mainnet_reservation_stands_on_the_oracle_sequence() {
         .unwrap();
 
     assert_eq!(report.released, 0, "{report:?}");
-    assert_eq!(report.rpc_calls, 7, "{report:?}");
+    assert_no_legacy_settlement(&report, &endpoints).await;
     assert!(report.settled.is_empty());
     assert_eq!(fx.window_total(now), (500, 1));
     let receipt = fx.receipts.get(&res.id).unwrap().unwrap();
@@ -3358,11 +3321,9 @@ async fn oracle_would_release(endpoints: &Endpoints, now: u64, source: &str) {
         .await;
 }
 
-/// An oracle that reports the testnet passphrase is no witness for a
-/// mainnet reservation, however its answers read: its `NOT_FOUND` with a
-/// consumed sequence and a passed time bound releases nothing, its
-/// transaction is never asked, and the pass checks its identity once for
-/// both reservations.
+/// An oracle that reports the testnet passphrase settles nothing for two
+/// mainnet reservations, however its answers read: neither its identity nor
+/// its transaction is asked, and both reservations stand.
 #[tokio::test]
 #[serial]
 async fn a_mainnet_oracle_on_another_network_settles_nothing() {
@@ -3396,7 +3357,7 @@ async fn a_mainnet_oracle_on_another_network_settles_nothing() {
         .unwrap();
 
     assert_eq!(report.kept_pending, 2, "{report:?}");
-    assert_eq!(report.released, 0, "{report:?}");
+    assert_no_legacy_settlement(&report, &endpoints).await;
     assert_eq!(fx.window_total(now), (800, 2), "the debits stay");
     for res in [&first, &second] {
         assert_eq!(
@@ -3404,32 +3365,11 @@ async fn a_mainnet_oracle_on_another_network_settles_nothing() {
             ReceiptStatus::Pending
         );
     }
-    let failure = report
-        .endpoint_failure
-        .expect("the unverified oracle is reported");
-    assert_eq!(failure.kind, ReconcileFailureKind::OracleNetworkMismatch);
-    assert_eq!(
-        failure.endpoint,
-        endpoints.oracle.uri(),
-        "the oracle is named"
-    );
-    assert_witness_reason(&failure, &endpoints, "IdentityNetworkMismatch");
-    assert_eq!(
-        endpoints.oracle_counts.count("getNetwork"),
-        1,
-        "once per pass"
-    );
-    assert_eq!(
-        endpoints.oracle_counts.count("getTransaction"),
-        0,
-        "an unverified oracle is never asked about the transaction"
-    );
-    assert_eq!(endpoints.oracle_counts.count("getLedgerEntries"), 0);
+    assert_eq!(endpoints.oracle_counts.count("getNetwork"), 0);
 }
 
-/// An oracle whose identity cannot be read is no witness either: its
-/// `NOT_FOUND` with a consumed sequence releases nothing, and the pass
-/// reports the unread identity.
+/// An oracle whose identity cannot be read settles nothing either: the pass
+/// asks neither endpoint and the reservation stands.
 #[tokio::test]
 #[serial]
 async fn a_mainnet_oracle_whose_identity_cannot_be_read_settles_nothing() {
@@ -3461,58 +3401,25 @@ async fn a_mainnet_oracle_whose_identity_cannot_be_read_settles_nothing() {
         .unwrap();
 
     assert_eq!(report.kept_pending, 1, "{report:?}");
-    assert_eq!(report.released, 0, "{report:?}");
+    assert_no_legacy_settlement(&report, &endpoints).await;
     assert_eq!(fx.window_total(now), (500, 1), "the debit stays");
-    let failure = report
-        .endpoint_failure
-        .expect("the unread identity is reported");
-    assert_eq!(
-        failure.kind,
-        ReconcileFailureKind::OracleIdentityUnavailable
-    );
-    assert_eq!(
-        failure.endpoint,
-        endpoints.oracle.uri(),
-        "the oracle is named"
-    );
-    assert_eq!(
-        stellar_agent_core::error::WalletError::Network(failure.to_network_error()).code(),
-        "network.witness_unavailable"
-    );
-    assert_eq!(endpoints.oracle_counts.count("getTransaction"), 0);
 }
 
-/// Asserts that `failure` reports `network.witness_unavailable` with the
-/// typed reason `expected` naming the oracle's authority.
-fn assert_witness_reason(failure: &ReconcileFailure, endpoints: &Endpoints, expected: &str) {
-    use stellar_agent_core::error::{
-        NetworkError, WalletError, WitnessUnavailableReason as Reason,
-    };
-    let error = failure.to_network_error();
-    let (reason, authority) = match &error {
-        NetworkError::WitnessUnavailable {
-            reason: Reason::IdentityNetworkMismatch { authority },
-        } => ("IdentityNetworkMismatch", authority),
-        NetworkError::WitnessUnavailable {
-            reason: Reason::IdentityProtocolUnsupported { authority },
-        } => ("IdentityProtocolUnsupported", authority),
-        NetworkError::WitnessUnavailable {
-            reason: Reason::IdentityUnavailable { authority },
-        } => ("IdentityUnavailable", authority),
-        other => panic!("expected an oracle identity reason, got {other:?}"),
-    };
-    assert_eq!(reason, expected, "{error}");
-    assert_eq!(authority, &endpoints.oracle.uri(), "the oracle is named");
-    assert_eq!(
-        WalletError::Network(error).code(),
-        "network.witness_unavailable"
-    );
+/// Asserts that a mainnet pass settled nothing on chain answers: every
+/// examined reservation stays pending, neither endpoint received a legacy
+/// request, and no endpoint failure is reported.
+async fn assert_no_legacy_settlement(report: &ReconcileReport, endpoints: &Endpoints) {
+    assert_eq!(report.kept_pending, report.examined, "{report:?}");
+    assert_eq!(report.confirmed, 0, "{report:?}");
+    assert_eq!(report.released, 0, "{report:?}");
+    assert!(report.settled.is_empty(), "{report:?}");
+    assert_eq!(report.rpc_calls, 0, "{report:?}");
+    assert_eq!(report.endpoint_failure, None, "{report:?}");
+    assert_eq!(endpoints.requests_sent().await, 0, "no legacy request");
 }
 
-/// An oracle that reports mainnet under a protocol version the protocol rule
-/// refuses for mainnet is no witness: its `NOT_FOUND` with a consumed
-/// sequence releases nothing, and the pass reports the unsupported protocol
-/// under its own kind and reason.
+/// An oracle that reports an unsupported protocol settles nothing: the pass
+/// asks neither endpoint and the reservation stands.
 #[tokio::test]
 #[serial]
 async fn a_mainnet_oracle_on_an_unsupported_protocol_settles_nothing() {
@@ -3545,24 +3452,12 @@ async fn a_mainnet_oracle_on_an_unsupported_protocol_settles_nothing() {
         .unwrap();
 
     assert_eq!(report.kept_pending, 1, "{report:?}");
-    assert_eq!(report.released, 0, "{report:?}");
+    assert_no_legacy_settlement(&report, &endpoints).await;
     assert_eq!(fx.window_total(now), (500, 1), "the debit stays");
-    let failure = report
-        .endpoint_failure
-        .expect("the unsupported protocol is reported");
-    assert_eq!(
-        failure.kind,
-        ReconcileFailureKind::OracleProtocolUnsupported
-    );
-    assert_witness_reason(&failure, &endpoints, "IdentityProtocolUnsupported");
-    assert_eq!(endpoints.oracle_counts.count("getTransaction"), 0);
 }
 
-/// The pass reads the oracle's identity with one request and does not
-/// retry it, so every request the pass sends is one it counts: an identity
-/// request that fails once keeps the reservation within the allowance, and
-/// the next pass, whose identity request succeeds, keeps it on the consumed
-/// sequence with its own count still equal to the requests sent.
+/// Two passes over a mainnet reservation whose oracle identity fails once
+/// send no request and count none, and the reservation stands after each.
 #[tokio::test]
 #[serial]
 async fn an_oracle_identity_request_that_fails_is_counted_and_not_retried() {
@@ -3578,7 +3473,6 @@ async fn an_oracle_identity_request_that_fails_is_counted_and_not_retried() {
         .await;
     oracle_would_release(&endpoints, now, &source).await;
     let (primary, oracle) = endpoints.clients();
-    let allowance = 4 + 3;
 
     let first = fx
         .window
@@ -3593,21 +3487,9 @@ async fn an_oracle_identity_request_that_fails_is_counted_and_not_retried() {
         .await
         .unwrap();
 
-    let sent_first = endpoints.requests_sent().await;
-    assert_eq!(first.rpc_calls, sent_first, "{first:?}");
-    assert!(sent_first <= allowance, "{sent_first}");
     assert_eq!(first.kept_pending, 1, "{first:?}");
-    assert_eq!(first.released, 0, "{first:?}");
+    assert_no_legacy_settlement(&first, &endpoints).await;
     assert_eq!(fx.window_total(now), (500, 1), "the debit stays");
-    let failure = first
-        .endpoint_failure
-        .expect("the failed identity request is reported");
-    assert_eq!(
-        failure.kind,
-        ReconcileFailureKind::OracleIdentityUnavailable
-    );
-    assert_witness_reason(&failure, &endpoints, "IdentityUnavailable");
-    assert_eq!(endpoints.oracle_counts.count("getNetwork"), 1, "no retry");
 
     let second = fx
         .window
@@ -3622,18 +3504,12 @@ async fn an_oracle_identity_request_that_fails_is_counted_and_not_retried() {
         .await
         .unwrap();
 
-    let sent_second = endpoints.requests_sent().await - sent_first;
-    assert_eq!(second.rpc_calls, sent_second, "{second:?}");
-    assert!(sent_second <= allowance, "{sent_second}");
-    assert_eq!(second.released, 0, "{second:?}");
-    assert!(second.settled.is_empty());
+    assert_no_legacy_settlement(&second, &endpoints).await;
     assert_eq!(fx.window_total(now), (500, 1));
 }
 
-/// An oracle whose identity answer arrives late is no witness, and the pass
-/// does not wait for it: the identity request ends at the pass's own
-/// two-second bound, the reservation stands, and the oracle's transaction is
-/// never asked.
+/// An oracle whose identity answer would arrive late holds nothing up: the
+/// pass asks no endpoint, returns within the bound and the reservation stands.
 #[tokio::test]
 #[serial]
 async fn a_mainnet_oracle_whose_identity_answers_late_settles_nothing() {
@@ -3669,19 +3545,11 @@ async fn a_mainnet_oracle_whose_identity_answers_late_settles_nothing() {
 
     assert!(
         elapsed < IDENTITY_BOUND + std::time::Duration::from_millis(1500),
-        "the identity bound ends the wait: {elapsed:?}"
+        "the pass does not wait for the oracle: {elapsed:?}"
     );
     assert_eq!(report.kept_pending, 1, "{report:?}");
-    assert_eq!(report.released, 0, "{report:?}");
+    assert_no_legacy_settlement(&report, &endpoints).await;
     assert_eq!(fx.window_total(now), (500, 1), "the debit stays");
-    let failure = report
-        .endpoint_failure
-        .expect("the unanswered identity is reported");
-    assert_eq!(
-        failure.kind,
-        ReconcileFailureKind::OracleIdentityUnavailable
-    );
-    assert_eq!(endpoints.oracle_counts.count("getTransaction"), 0);
 }
 
 /// An edited profile cannot select weaker settlement trust for an admitted debit.

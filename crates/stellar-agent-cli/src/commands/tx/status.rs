@@ -72,7 +72,6 @@ use serde::Serialize;
 use stellar_agent_core::envelope::{Envelope, OutputFormat};
 use stellar_agent_core::error::WalletError;
 use stellar_agent_core::profile::receipt::{ReceiptStatus, ReleaseEvidence, SubmissionReceipt};
-use stellar_agent_network::NetworkContext;
 use stellar_agent_network::policy_state::PersistedWindowStore;
 use stellar_agent_network::submission_flow::{self, StatusFailure, StatusRequest, is_tx_hash};
 
@@ -194,7 +193,7 @@ pub async fn run(args: &StatusArgs) -> i32 {
 
     let window = PersistedWindowStore::for_profile(&resolved.name);
 
-    let context = NetworkContext::from_profile(&profile);
+    let context = crate::common::network::profile_network_context(&profile);
     let client = match context.primary_client() {
         Ok(c) => c,
         Err(e) => {
