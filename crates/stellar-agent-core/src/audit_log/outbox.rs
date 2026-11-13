@@ -118,12 +118,31 @@
 //! A nonzero commitment other than the one the owner state recorded at
 //! cutover refuses with `audit.outbox_unusable` before any row is decoded.
 //!
-//! [`check_outbox_commitment`] applies the same owner rules without a key:
-//! a queue generation or row position the owner state does not hold refuses.
+//! [`check_outbox_commitment`] applies the same owner rules under the stored
+//! key.
+//! It reads that key once when the store supports key reads.
+//! Without a stored key, it checks layout, canonical bodies, coordinates,
+//! and kind.
 //! Without owner state, a queue that starts with a generation line refuses,
-//! since a cutover stores owner state before it publishes. The legacy loss
-//! report and acknowledgement leave a queue under owner state to the owner
-//! drain and refuse it with `audit.outbox_unusable`.
+//! since a cutover stores owner state before it publishes.
+//! Recoverable publication passes with a warning, leaving every file and
+//! item unchanged. Binding selects fully validated bytes, including the
+//! header and delivered closed prefix.
+//! It copies every owner field into the successor carrier generation.
+//! Stages must equal those selected bytes exactly.
+//! The retired watch hashes the raw owner value and retains the selected
+//! row count.
+//!
+//! Owner loss acknowledgement validates before permission revocation and
+//! records the loss first. It appends the authenticated prefix, requires the
+//! anchor, resets nonzero v1 state, and stores the owner item.
+//! It then publishes the generation line and resets a changed retired watch
+//! last.
+//! A watch-only loss leaves the active queue and its items unchanged.
+//! A failed closed prefix preserves its stored commitment and selects nothing.
+//! An unidentified header selects nothing and advances the owner generation.
+//! A crash before the owner item is stored repeats the acknowledgement and
+//! selected rows with the same request IDs. The log exposes those duplicates.
 //!
 //! # Key change
 //!
@@ -180,21 +199,17 @@
 //! A file writer can also restore a generation line signed under a replaced
 //! key. A keyed append reloads the key only when the line fails to verify. An
 //! appender that still holds the replaced key therefore queues its row behind
-//! the restored line and is told so. Detection waits for the next drain that
-//! uses the stored key, and more rows can queue until then. Log verification
-//! and the commitment check of `audit verify` do not detect it, since neither
-//! authenticates a queue tag. A drain that uses the stored key refuses the
+//! the restored line and is told so. `audit verify --profile` authenticates
+//! the queue under the stored key and refuses the restored line.
+//! A drain that uses the stored key also refuses the
 //! queue at line 1 with `tagged record whose tag does not verify`. It leaves
 //! the queue unchanged. Every writer open drains first, so a value-moving verb
 //! reports `audit.chain_key_unavailable` with the `audit.outbox_unusable`
 //! detail. `profile rotate-audit-key` reports `internal.unexpected_state`
 //! with the same detail. A writer open that holds the replaced key refuses
 //! with `audit.key_replaced` before it drains, so no drain delivers the row
-//! under that key. The legacy loss acknowledgement refuses the queue with
-//! `queue held by owner state`. A changed retired commitment opens it only
-//! under the stored key, and it then acknowledges only the retired loss. The
-//! active queue and its refusal stay. The row is reported, never delivered
-//! or dropped without a refusal.
+//! under that key. The loss acknowledgement records the refusal and discards
+//! every row behind that header. Discarded rows receive no recent evidence.
 //!
 //! An interrupted append can leave an uncommitted operator row. Approval
 //! consent and resuming a halted profile require the row to commit first, so
@@ -230,7 +245,9 @@
 //! row's bytes without its tag and newline. An untagged row of a cutover
 //! prefix hashes as a row of generation zero at its line with evidence zero.
 //! Owner accounts follow carrier generations, independently of the queue
-//! generation inside the value. Only a draining writer writes owner state.
+//! generation inside the value. Only writers holding the writer and outbox
+//! carriers write owner state. Locked verification may read owner state
+//! without the writer sidecar and writes nothing.
 //!
 //! A generation header is `{"k":"gen","g":G,"tag":"T"}` followed by a newline.
 //! No header means queue generation zero.
@@ -461,9 +478,9 @@ fn batch_digest(rows: &[(u8, [u8; 32])]) -> [u8; 32] {
 /// Counts describing a missing or changed committed prefix.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OutboxLoss {
-    /// Number of lines committed in the keyring.
+    /// Legacy committed rows, or complete owner rows after the header.
     pub expected_rows: u64,
-    /// Number of complete lines found in the outbox.
+    /// Complete legacy lines, or delivered and selected owner rows.
     pub found_rows: u64,
 }
 
@@ -897,11 +914,6 @@ fn tagged_layout(line: &[u8]) -> Option<TaggedRow<'_>> {
     })
 }
 
-/// The refusal of the legacy loss path for a queue that owner state holds.
-pub(crate) fn owned_queue_refusal() -> WriterError {
-    tagged_refusal(1, "queue held by owner state")
-}
-
 fn tagged_refusal(number: usize, reason: &'static str) -> WriterError {
     WriterError::OutboxUnusable {
         line: number,
@@ -933,15 +945,6 @@ fn decode_line(
     }
 }
 
-/// The number of rows in `bytes` when they are a valid legacy queue under
-/// `state` with complete lines only, checked without a key.
-pub(super) fn legacy_rows(bytes: &[u8], state: &OutboxState) -> Option<u64> {
-    let parsed = parse_lines(bytes);
-    (parsed.torn_bytes == 0
-        && validate_legacy_queue(&parsed.lines, state, SuffixCheck::Keyless).is_ok())
-    .then_some(parsed.lines.len() as u64)
-}
-
 fn check_committed_prefix(lines: &[&[u8]], state: &OutboxState) -> Result<(), WriterError> {
     match committed_prefix_loss(lines, state) {
         None => Ok(()),
@@ -961,6 +964,10 @@ fn load_state(store: &dyn TipAnchorStore, generation: u64) -> Result<OutboxState
 
 /// Checks the outbox's committed prefix under its lock, taken through the
 /// carrier record.
+/// Generation lines and rows authenticate under the stored key when the store
+/// reads one. Without that key, verification checks layout, canonical bodies,
+/// coordinates, and kind. A recoverable publication passes with a warning and
+/// leaves every file and item unchanged.
 ///
 /// # Errors
 ///
@@ -976,9 +983,9 @@ fn load_state(store: &dyn TipAnchorStore, generation: u64) -> Result<OutboxState
 ///   prefix, an untagged line past it, or a tagged row past it out of place.
 /// - [`WriterError::OutboxUnusable`] and [`WriterError::OutboxRowKindRefused`]
 ///   for a tagged row past the prefix that fails layout, canonical form or
-///   kind. Tags are not authenticated here.
-/// - Under owner state, every refusal of the owner drain except
-///   authentication: a changed commitment, and a queue generation or row
+///   kind, including authentication when a stored key exists.
+/// - Under owner state, every refusal of the owner drain:
+///   a changed commitment, and a queue generation or row
 ///   position the owner state does not hold. Rows at the closed coordinates
 ///   must reproduce the closed batch.
 /// - Without owner state, [`WriterError::OutboxRowsMissing`] for a queue
@@ -988,12 +995,26 @@ pub fn check_outbox_commitment(
     store: &dyn TipAnchorStore,
 ) -> Result<(), WriterError> {
     let batch = OutboxBatch::read_locked(log_path, store)?;
+    let key = if store.reads_audit_key() {
+        reload_stored_key(store)?
+    } else {
+        None
+    };
+    let check = key
+        .as_deref()
+        .map_or(SuffixCheck::Keyless, |key| SuffixCheck::Keyed(Some(key)));
     let lines = parse_lines(&batch.bytes).lines;
     match batch.owner(store)? {
-        Some(owner) => batch
-            .owner_delivery(&lines, owner, SuffixCheck::Keyless)
-            .map(drop),
-        None => validate_unowned_queue(&lines, &batch.state, SuffixCheck::Keyless),
+        Some(owner) => {
+            let selection = batch.select_owner(&lines, owner, check, false)?;
+            let pending = selection.publication_pending;
+            selection.accepted()?;
+            if pending {
+                tracing::warn!("audit outbox publication pending; the next drain completes it");
+            }
+            Ok(())
+        }
+        None => validate_unowned_queue(&lines, &batch.state, check),
     }
 }
 
@@ -1913,21 +1934,38 @@ impl OutboxBatch {
         Ok((bytes, lines.len() as u64))
     }
 
+    /// Selects complete source bytes after validating their protected state.
+    pub(crate) fn binding_selection(
+        &self,
+        store: &dyn TipAnchorStore,
+        key: Option<&[u8; 32]>,
+    ) -> Result<BindingSelection, WriterError> {
+        if let Some(owner) = self.owner(store)? {
+            let lines = parse_lines(&self.bytes).lines;
+            self.select_owner(&lines, owner.clone(), SuffixCheck::Keyed(key), false)?
+                .accepted()?;
+            let rows = lines.len() as u64 - u64::from(first_generation(&lines)?.is_some());
+            let complete = lines.iter().map(|line| line.len() + 1).sum::<usize>();
+            return Ok(BindingSelection {
+                bytes: self.bytes[..complete].to_vec(),
+                rows,
+                watch: super::lock::owner_watch(&owner.to_keyring_value(), rows),
+                state: StageState::Owner(owner),
+            });
+        }
+        let (bytes, rows) = self.committed_bytes(key)?;
+        Ok(BindingSelection {
+            bytes,
+            rows,
+            state: StageState::V1(self.state.clone()),
+            watch: self.stored_state.clone(),
+        })
+    }
+
     /// The path of the file the batch read.
     #[cfg(any(test, feature = "test-helpers"))]
     pub(crate) fn path(&self) -> &Path {
         &self.path
-    }
-
-    /// The commitment as the store held it, in its keyring form, or the
-    /// empty string for an absent entry.
-    pub(crate) fn stored_state(&self) -> &str {
-        &self.stored_state
-    }
-
-    /// The commitment, zero for an absent entry.
-    pub(crate) fn state(&self) -> &OutboxState {
-        &self.state
     }
 
     /// Reads the outbox under its lock and checks that its complete lines are
@@ -1999,18 +2037,6 @@ impl OutboxBatch {
         committed_prefix(&lines, &self.state)
             .map(|prefix| parse_operator_rows(prefix, key))
             .transpose()
-    }
-
-    /// Whether owner state holds this batch's generation.
-    ///
-    /// Owner recovery delivers such a queue, so the legacy loss path neither
-    /// reports nor clears it.
-    ///
-    /// # Errors
-    ///
-    /// [`WriterError::TipAnchorStore`] when the owner state cannot be read.
-    pub(crate) fn is_owned(&self, store: &dyn TipAnchorStore) -> Result<bool, WriterError> {
-        Ok(store.load_outbox_owner_state(self.generation)?.is_some())
     }
 
     /// The number of complete lines.
@@ -2110,7 +2136,8 @@ impl OutboxBatch {
             None if lines.iter().any(|line| is_tagged(line)) => self.cutover(&lines, key).map(Some),
             None => Ok(None),
             Some(owner) => self
-                .owner_delivery(&lines, owner, SuffixCheck::Keyed(key))
+                .select_owner(&lines, owner, SuffixCheck::Keyed(key), false)?
+                .accepted()
                 .map(Some),
         }
     }
@@ -2170,84 +2197,147 @@ impl OutboxBatch {
         })
     }
 
-    /// The delivery of a queue under owner state `owner`.
-    ///
-    /// A keyless `check` applies every rule except authentication, which
-    /// is what the commitment check states.
-    fn owner_delivery(
+    /// Selects the authenticated prefix and the first refusal under owner
+    /// state.
+    /// Recovery counts its closed prefix as delivered and retains its evidence.
+    fn select_owner(
         &self,
         lines: &[&[u8]],
         mut owner: OutboxOwnerState,
         check: SuffixCheck<'_>,
-    ) -> Result<OwnerDelivery, WriterError> {
+        select_loss: bool,
+    ) -> Result<OwnerSelection, WriterError> {
+        if matches!(check, SuffixCheck::Keyed(None)) {
+            return Err(tagged_refusal(1, "tagged record without an audit key"));
+        }
         let clean = self.stored_state.is_empty() || self.state == OutboxState::default();
         let zero_legacy =
             !clean && owner.legacy == Some(Sha256::digest(self.stored_state.as_bytes()).into());
-        if !clean && !zero_legacy {
+        let rewrite = !clean && !zero_legacy;
+        if rewrite && !select_loss {
             return Err(tagged_refusal(
                 1,
                 "legacy outbox state changed in the owner state",
             ));
         }
-        let header = first_generation(lines)?;
-        let rows = &lines[usize::from(header.is_some())..];
+        let header = match first_generation(lines) {
+            Ok(header) => header,
+            Err(error) => {
+                owner.g = advance_generation(owner.g)?;
+                return OwnerSelection::refused(
+                    owner,
+                    lines.len().saturating_sub(1),
+                    !clean,
+                    rewrite,
+                    error,
+                );
+            }
+        };
         let offset = usize::from(header.is_some());
-        if let (Some((g, tag)), SuffixCheck::Keyed(key)) = (header, check) {
-            let key = key.ok_or_else(|| tagged_refusal(1, "tagged record without an audit key"))?;
-            if !generation_verifies(key, g, &tag) {
-                // A rotation fences the queue and persists the new key before
-                // it publishes the line under that key. A lone line of the
-                // owned generation is therefore signed again under `key`. The
-                // writer's open compared `key` with the stored key under the
-                // writer carrier, and only a rotation holding that carrier
-                // replaces the stored key, so `key` is the stored key.
-                if g == owner.g && rows.is_empty() && !zero_legacy {
-                    return Ok(OwnerDelivery::publish_only(owner.g));
-                }
-                return Err(tagged_refusal(1, "tagged record whose tag does not verify"));
-            }
-        }
-        let queue = header.map_or(0, |(g, _)| g);
-        if header.is_some() && queue == owner.g {
-            let mut decoded = Vec::with_capacity(rows.len());
-            for (index, line) in rows.iter().enumerate() {
-                decoded.push(owned_row(
-                    line,
-                    offset + index + 1,
-                    check,
-                    queue,
-                    index + 1,
-                )?);
-            }
-            if decoded.is_empty() {
-                return Ok(OwnerDelivery {
-                    entries: Vec::new(),
-                    owner: None,
-                    zero_legacy,
-                    publish: None,
+        let rows = &lines[offset..];
+        if let (Some((g, tag)), SuffixCheck::Keyed(Some(key))) = (header, check)
+            && !generation_verifies(key, g, &tag)
+        {
+            // A stopped rotation leaves a lone fence for the next drain.
+            if g == owner.g && rows.is_empty() && clean {
+                return Ok(OwnerSelection {
+                    plan: OwnerDelivery::publish_only(owner.g),
+                    loss: None,
+                    refusal: None,
+                    publication_pending: true,
+                    rewrite: false,
                 });
             }
-            let next = advance_generation(queue)?;
-            let digests: Vec<_> = decoded.iter().map(|row| (row.r, row.digest)).collect();
-            owner.g = next;
-            owner.record_delivery(queue, &digests);
-            return Ok(OwnerDelivery {
-                entries: decoded.into_iter().map(|row| row.entry).collect(),
-                owner: Some(owner),
-                zero_legacy,
-                publish: Some(next),
-            });
+            owner.g = advance_generation(owner.g)?;
+            return OwnerSelection::refused(
+                owner,
+                rows.len(),
+                !clean,
+                rewrite,
+                tagged_refusal(1, "tagged record whose tag does not verify"),
+            );
         }
-        let Some(closed) = owner
+        let queue = header.map_or(0, |(g, _)| g);
+        let closed = owner
             .closed
             .clone()
-            .filter(|closed| closed.g == queue && closed.g.checked_add(1) == Some(owner.g))
-        else {
-            return Err(WriterError::OutboxRowsMissing {
-                recorded: 0,
-                found: rows.len() as u64,
-            });
+            .filter(|closed| closed.g == queue && closed.g.checked_add(1) == Some(owner.g));
+        let recovery = closed.is_some();
+        if !recovery && queue != owner.g {
+            owner.g = advance_generation(owner.g)?;
+            return OwnerSelection::refused(
+                owner,
+                rows.len(),
+                !clean,
+                rewrite,
+                WriterError::OutboxRowsMissing {
+                    recorded: 0,
+                    found: rows.len() as u64,
+                },
+            );
+        }
+        let mut digests = Vec::with_capacity(rows.len());
+        let delivered = if let Some(closed) = closed {
+            let prefix = Self::closed_prefix(rows, offset, check, &closed);
+            match prefix {
+                Ok(prefix) => {
+                    digests = prefix;
+                    digests.len()
+                }
+                Err(error) => {
+                    return OwnerSelection::refused(owner, rows.len(), !clean, rewrite, error);
+                }
+            }
+        } else {
+            0
         };
+        let mut entries = Vec::with_capacity(rows.len() - delivered);
+        let mut refusal = None;
+        for (index, line) in rows.iter().enumerate().skip(delivered) {
+            match owned_row(line, offset + index + 1, check, queue, index + 1) {
+                Ok(row) => {
+                    digests.push((row.r, row.digest));
+                    entries.push(row.entry);
+                }
+                Err(error @ WriterError::OutboxRowKindRefused { .. }) => return Err(error),
+                Err(error) => {
+                    refusal = Some(error);
+                    break;
+                }
+            }
+        }
+        let loss = (rewrite || refusal.is_some()).then_some(OutboxLoss {
+            expected_rows: rows.len() as u64,
+            found_rows: digests.len() as u64,
+        });
+        let changes = !entries.is_empty() || loss.is_some();
+        if changes {
+            if !recovery {
+                owner.g = advance_generation(owner.g)?;
+            }
+            owner.close(queue, &digests, delivered);
+        }
+        Ok(OwnerSelection {
+            plan: OwnerDelivery {
+                entries,
+                publish: (changes || recovery).then_some(owner.g),
+                owner: changes.then_some(owner),
+                zero_legacy: !clean,
+            },
+            loss,
+            refusal,
+            publication_pending: recovery,
+            rewrite,
+        })
+    }
+
+    /// Validates the closed commitment before selecting any later row.
+    fn closed_prefix(
+        rows: &[&[u8]],
+        offset: usize,
+        check: SuffixCheck<'_>,
+        closed: &ClosedBatch,
+    ) -> Result<Vec<(u8, [u8; 32])>, WriterError> {
         let changed = || WriterError::OutboxRowsMissing {
             recorded: closed.n,
             found: rows.len() as u64,
@@ -2260,10 +2350,10 @@ impl OutboxBatch {
         for (index, line) in rows[..delivered].iter().enumerate() {
             let (number, s) = (offset + index + 1, index as u64 + 1);
             if is_tagged(line) {
-                let row = decode_tagged(line, number, check, queue, s)?;
+                let row = decode_tagged(line, number, check, closed.g, s)?;
                 digests.push((row.r, row.digest));
-            } else if header.is_none() {
-                // An untagged row is valid only in a cutover prefix.
+            } else if closed.g == 0 {
+                // The closed generation-zero commitment admits raw rows.
                 let entry = decode_raw(line, number)?;
                 digests.push((
                     0,
@@ -2279,25 +2369,18 @@ impl OutboxBatch {
         if batch_digest(&digests) != closed.batch {
             return Err(changed());
         }
-        let mut entries = Vec::with_capacity(rows.len() - delivered);
-        for (index, line) in rows.iter().enumerate().skip(delivered) {
-            let row = owned_row(line, offset + index + 1, check, queue, index + 1)?;
-            digests.push((row.r, row.digest));
-            entries.push(row.entry);
-        }
-        if entries.is_empty() {
-            return Ok(OwnerDelivery {
-                zero_legacy,
-                ..OwnerDelivery::publish_only(owner.g)
-            });
-        }
-        owner.close(queue, &digests, delivered);
-        Ok(OwnerDelivery {
-            entries,
-            publish: Some(owner.g),
-            owner: Some(owner),
-            zero_legacy,
-        })
+        Ok(digests)
+    }
+
+    /// Classifies the owner queue under the caller's held key or keyless check.
+    pub(crate) fn owner_selection(
+        &self,
+        store: &dyn TipAnchorStore,
+        check: SuffixCheck<'_>,
+    ) -> Result<Option<OwnerSelection>, WriterError> {
+        self.owner(store)?
+            .map(|owner| self.select_owner(&parse_lines(&self.bytes).lines, owner, check, true))
+            .transpose()
     }
 
     /// The generation line a key change publishes in place of a queue that
@@ -2397,6 +2480,8 @@ impl OutboxBatch {
         drop(file);
         #[cfg(any(test, feature = "test-helpers"))]
         test_seam::check_stop(&self.path, test_seam::Stop::ReplacementSynced)?;
+        #[cfg(test)]
+        test_seam::run_replacement_synced(&self.path);
         match &self._guard {
             BatchGuard::Bound(lock) => lock.check_generation(store)?,
             BatchGuard::Retained(lock) => lock.check_generation(store)?,
@@ -2440,6 +2525,122 @@ fn owned_row(
         });
     }
     decode_tagged(line, number, check, g, s as u64)
+}
+
+/// The shared owner verdict and its acknowledgement plan.
+pub(crate) struct OwnerSelection {
+    pub(crate) plan: OwnerDelivery,
+    pub(crate) loss: Option<OutboxLoss>,
+    refusal: Option<WriterError>,
+    publication_pending: bool,
+    rewrite: bool,
+}
+
+impl OwnerSelection {
+    fn refused(
+        owner: OutboxOwnerState,
+        expected: usize,
+        legacy_present: bool,
+        rewrite: bool,
+        error: WriterError,
+    ) -> Result<Self, WriterError> {
+        if !matches!(
+            error,
+            WriterError::OutboxUnusable { .. } | WriterError::OutboxRowsMissing { .. }
+        ) {
+            return Err(error);
+        }
+        Ok(Self {
+            plan: OwnerDelivery {
+                entries: Vec::new(),
+                publish: Some(owner.g),
+                owner: Some(owner),
+                zero_legacy: legacy_present,
+            },
+            loss: Some(OutboxLoss {
+                expected_rows: expected as u64,
+                found_rows: 0,
+            }),
+            refusal: Some(error),
+            publication_pending: false,
+            rewrite,
+        })
+    }
+
+    fn accepted(self) -> Result<OwnerDelivery, WriterError> {
+        if self.rewrite {
+            return Err(tagged_refusal(
+                1,
+                "legacy outbox state changed in the owner state",
+            ));
+        }
+        match self.refusal {
+            Some(error) => Err(error),
+            None => Ok(self.plan),
+        }
+    }
+}
+
+/// The protected state copied with a binding's selected bytes.
+pub(crate) enum StageState {
+    V1(OutboxState),
+    Owner(OutboxOwnerState),
+}
+
+/// Fully validated source bytes and the state that interprets them.
+pub(crate) struct BindingSelection {
+    pub(crate) bytes: Vec<u8>,
+    pub(crate) rows: u64,
+    state: StageState,
+    pub(crate) watch: String,
+}
+
+impl BindingSelection {
+    /// The empty selection after a legacy batch's delivery is recognized.
+    pub(crate) fn empty_legacy() -> Self {
+        let state = OutboxState::default();
+        Self {
+            bytes: Vec::new(),
+            rows: 0,
+            watch: state.to_keyring_value(),
+            state: StageState::V1(state),
+        }
+    }
+
+    /// Checks that the successor stores the selected descriptor.
+    ///
+    /// # Errors
+    ///
+    /// Returns a store error when the successor state cannot be read.
+    pub(crate) fn matches_stored(
+        &self,
+        store: &dyn TipAnchorStore,
+        generation: u64,
+    ) -> Result<bool, WriterError> {
+        Ok(match &self.state {
+            StageState::V1(state) => {
+                store.load_outbox_state(generation)?.unwrap_or_default() == *state
+            }
+            StageState::Owner(owner) => {
+                store.load_outbox_owner_state(generation)? == Some(owner.to_keyring_value())
+            }
+        })
+    }
+
+    /// Stores the selected state without converting its representation.
+    pub(crate) fn store(
+        &self,
+        store: &dyn TipAnchorStore,
+        generation: u64,
+    ) -> Result<(), WriterError> {
+        match &self.state {
+            StageState::V1(state) => store.store_outbox_state(generation, state)?,
+            StageState::Owner(owner) => {
+                store.store_outbox_owner_state(generation, &owner.to_keyring_value())?
+            }
+        }
+        Ok(())
+    }
 }
 
 /// What one owner drain delivers and commits.
@@ -2720,6 +2921,8 @@ pub mod test_seam {
     /// as a crash there would.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum Stop {
+        /// After the loss acknowledgement row is appended.
+        Acknowledged,
         /// Before the first append of a delivery.
         BeforeAppends,
         /// After the given number of appends, counted from one.
@@ -2883,6 +3086,23 @@ pub mod test_seam {
     /// Hooks run by the next admission of an append to an outbox.
     #[cfg(test)]
     static ADMITTED: Mutex<Vec<(PathBuf, Hook)>> = Mutex::new(Vec::new());
+
+    #[cfg(test)]
+    static REPLACEMENT_SYNCED: Mutex<Vec<(PathBuf, Hook)>> = Mutex::new(Vec::new());
+
+    /// Runs a callback after the replacement sync and before the generation
+    /// check.
+    #[cfg(test)]
+    pub(crate) fn on_replacement_synced(outbox_path: &Path, hook: impl FnOnce() + Send + 'static) {
+        if let Ok(mut armed) = REPLACEMENT_SYNCED.lock() {
+            armed.push((outbox_path.to_path_buf(), Box::new(hook)));
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn run_replacement_synced(outbox_path: &Path) {
+        run(&REPLACEMENT_SYNCED, outbox_path);
+    }
 
     /// Hooks run by the first contended attempt on an outbox lock.
     #[cfg(test)]
@@ -5369,12 +5589,11 @@ mod tests {
         refuses(&mut repair);
     }
 
-    /// A queue under owner state belongs to the owner drain. In the cutover
-    /// window, the legacy report refuses, and the acknowledgement open
-    /// refuses with nothing written. The owner drain then delivers the queued
-    /// suffix.
+    /// A recoverable owner queue reports no loss and refuses acknowledgement
+    /// before any write.
+    /// Its next drain delivers each row once.
     #[test]
-    fn a_loss_acknowledgement_refuses_a_queue_under_owner_state() {
+    fn a_loss_acknowledgement_finds_no_loss_in_a_recoverable_owner_queue() {
         let (_dir, path, store, mut writer) = keyed_fixture();
         AuditOutbox::for_log(&path, store.clone())
             .append(&row("raw"))
@@ -5387,8 +5606,7 @@ mod tests {
         assert!(matches!(writer.drain_outbox(), Err(WriterError::Io(_))));
         assert_eq!(owner_summary(&store), (1, Some((0, 2))));
         enqueue(&path, &store, &["accepted-in-window"]);
-        let owned = || owned_queue_refusal().to_string();
-        assert_eq!(writer.outbox_loss().unwrap_err().to_string(), owned());
+        assert_eq!(writer.outbox_loss().unwrap(), None);
         drop(writer);
         let outbox = outbox_bytes(&path);
         let log = fs::read(&path).unwrap();
@@ -5402,7 +5620,7 @@ mod tests {
         )
         .map(drop)
         .unwrap_err();
-        assert_eq!(refused.to_string(), owned());
+        assert!(matches!(refused, WriterError::OutboxLossNotFound));
         assert_eq!(fs::read(&path).unwrap(), log, "no acknowledgement row");
         assert_eq!(outbox_bytes(&path), outbox);
         assert_eq!(store.load_outbox_state(1).unwrap(), state);
@@ -5894,10 +6112,10 @@ mod tests {
     /// key lets an appender holding that key queue a row. A writer open with
     /// the replaced key refuses with `audit.key_replaced` before any write.
     /// The stored key's drain refuses the queue and leaves it unchanged on
-    /// every attempt. The legacy acknowledgement refuses it too, so the row
-    /// is reported and never delivered or dropped.
+    /// every attempt. The acknowledgement records the loss and discards
+    /// the row.
     #[test]
-    fn a_restored_header_under_a_replaced_key_refuses_the_drain_and_keeps_the_row() {
+    fn a_restored_header_under_a_replaced_key_refuses_the_drain_and_acknowledges_the_loss() {
         let (_dir, path, store, writer) = cut_over_fixture();
         let old_header = outbox_bytes(&path);
         let stale = keyed_outbox(&path, &store);
@@ -5947,20 +6165,30 @@ mod tests {
             );
             assert_eq!(outbox_bytes(&path), queue, "attempt {attempt}");
         }
-        let acknowledgement = AuditWriter::open_for_outbox_acknowledgement(
+        let mut acknowledgement = AuditWriter::open_for_outbox_acknowledgement(
             path.clone(),
             Some(Zeroizing::new(NEXT_KEY)),
             store.clone(),
             crate::audit_log::BindingHistory::NotRecorded,
         )
-        .map(drop)
-        .unwrap_err();
+        .unwrap();
+        let report = acknowledgement
+            .acknowledge_outbox_loss("inspection", Default::default())
+            .unwrap();
         assert_eq!(
-            acknowledgement.to_string(),
-            owned_queue_refusal().to_string()
+            (
+                report.expected_rows,
+                report.found_rows,
+                report.drained,
+                report.discarded
+            ),
+            (1, 0, 0, 1)
         );
-        assert_eq!(outbox_bytes(&path), queue);
-        assert_eq!(fs::read(&path).unwrap(), log);
+        assert_eq!(owner_summary(&store).0, 2);
+        assert_eq!(
+            outbox_bytes(&path),
+            test_seam::generation_line(&NEXT_KEY, 2)
+        );
         assert_eq!(delivered(&path, "behind-a-restored-header"), 0);
     }
 
@@ -6086,7 +6314,8 @@ mod tests {
     }
 
     /// The acknowledgement open with the replaced key refuses at the key
-    /// comparison, before the owner-state refusal the stored key meets.
+    /// comparison. The stored key meets a no-loss refusal with unchanged
+    /// evidence.
     #[test]
     fn a_loss_acknowledgement_with_a_replaced_key_refuses_before_any_write() {
         let (_dir, path, store) = rotated_fixture();
@@ -6099,15 +6328,17 @@ mod tests {
             )
         };
         assert_stale_open_refuses(&path, &store, "acknowledgement open", || open(ROW_KEY));
+        let before = OpenEvidence::read(&path, &store);
         let stored = open(NEXT_KEY).map(drop).unwrap_err();
-        assert_eq!(stored.to_string(), owned_queue_refusal().to_string());
+        assert!(matches!(stored, WriterError::OutboxLossNotFound));
+        assert_eq!(OpenEvidence::read(&path, &store), before);
     }
 
     /// A changed retired commitment lets the acknowledgement open past the
-    /// owner check. An acknowledgement that loaded its key before a completed
-    /// rotation then refuses at the key comparison, before its drain or its
-    /// row. The stored key's acknowledgement records the retired loss only,
-    /// and the active queue and its owner state stay.
+    /// open-time owner classification. An acknowledgement that loaded its key
+    /// before a completed rotation then refuses at the key comparison, before
+    /// its drain or its row. The stored key's acknowledgement records the
+    /// retired loss only, and the active queue and its owner state stay.
     #[cfg(unix)]
     #[test]
     fn a_stale_acknowledgement_of_a_retired_change_refuses_before_any_write() {
@@ -6170,12 +6401,11 @@ mod tests {
         assert_eq!(store.load_outbox_owner_state(2).unwrap(), owner);
     }
 
-    /// After a rotation stops past the fence, the legacy acknowledgement open
-    /// refuses before it writes anything. The log, the queue, the owner state
-    /// and the commitment stay byte-identical; without the refusal the open
-    /// would first append its key repair row.
+    /// A lone fence has no loss, so acknowledgement refuses before every write.
+    /// The log, queue, owner item, commitment, and carrier record stay
+    /// identical.
     #[test]
-    fn a_loss_acknowledgement_after_a_stopped_key_change_refuses_before_any_write() {
+    fn a_loss_acknowledgement_after_a_stopped_key_change_finds_no_loss_before_any_write() {
         let (_dir, path, store, writer) = cut_over_fixture();
         drop(writer);
         let mut rotation = AuditWriter::open_for_key_rotation(
@@ -6201,7 +6431,7 @@ mod tests {
         )
         .map(drop)
         .unwrap_err();
-        assert_eq!(refused.to_string(), owned_queue_refusal().to_string());
+        assert!(matches!(refused, WriterError::OutboxLossNotFound));
         assert_eq!(fs::read(&path).unwrap(), log, "the log is unchanged");
         assert_eq!(outbox_bytes(&path), queue, "the queue is unchanged");
         assert_eq!(store.load_outbox_owner_state(1).unwrap(), owner);
@@ -6318,6 +6548,318 @@ mod tests {
         }
     }
 
+    /// Verification and inspection preserve files, items, and carrier records.
+    #[test]
+    fn owner_verify_and_inspection_are_write_free() {
+        let (_dir, path, store, writer) = cut_over_fixture();
+        enqueue(&path, &store, &["one", "two"]);
+        drop(writer);
+        store.set_reload(Ok(Some(ROW_KEY)));
+        let replacement = replacement_path(&outbox_path(&path));
+        fs::write(&replacement, b"preserved replacement").unwrap();
+        let before = OpenEvidence::read(&path, &store);
+        let writes = store.outbox_item_writes();
+        let carriers = store.carrier_record_writes();
+        let reads = store.reload_count();
+        let accesses = store.outbox_item_accesses();
+        check_outbox_commitment(&path, store.as_ref()).unwrap();
+        assert_eq!(inspect_outbox(&path).unwrap().pending, 2);
+        assert_eq!(
+            store.outbox_item_accesses(),
+            accesses + 2,
+            "verification reads v1 and owner once"
+        );
+        assert_eq!(OpenEvidence::read(&path, &store), before);
+        assert_eq!(
+            store.outbox_item_writes(),
+            writes,
+            "verification writes no owner item"
+        );
+        assert_eq!(
+            store.carrier_record_writes(),
+            carriers,
+            "verification writes no carrier record"
+        );
+        assert_eq!(store.reload_count(), reads + 1, "inspection reads no key");
+        assert_eq!(
+            fs::read(replacement).unwrap(),
+            b"preserved replacement",
+            "verification leaves the replacement unchanged"
+        );
+    }
+
+    /// The last generation permits empty queues and interrupted recovery.
+    #[test]
+    fn owner_selection_at_the_last_generation_only_checks_actual_advances() {
+        for recovery in [false, true] {
+            let (_dir, path, store, mut writer) = keyed_fixture();
+            let g = if recovery { u64::MAX - 1 } else { u64::MAX };
+            store
+                .store_outbox_owner_state(1, &OutboxOwnerState::new(g, None).to_keyring_value())
+                .unwrap();
+            fs::write(outbox_path(&path), header(g)).unwrap();
+            if recovery {
+                enqueue(&path, &store, &["delivered"]);
+                test_seam::arm_stop(&outbox_path(&path), test_seam::Stop::OwnerStored);
+                assert!(matches!(writer.drain_outbox(), Err(WriterError::Io(_))));
+                enqueue(&path, &store, &["late"]);
+            }
+            drop(writer);
+            store.set_reload(Ok(Some(ROW_KEY)));
+            let before = OpenEvidence::read(&path, &store);
+            let writes = store.outbox_item_writes();
+            assert!(
+                check_outbox_commitment(&path, store.as_ref()).is_ok(),
+                "verification needs no successor generation"
+            );
+            assert_eq!(OpenEvidence::read(&path, &store), before);
+            assert_eq!(store.outbox_item_writes(), writes);
+            let mut writer = reopen(&path, &store);
+            assert_eq!(writer.drain_outbox().unwrap(), 0);
+            assert_eq!(outbox_bytes(&path), header(u64::MAX));
+            if recovery {
+                assert_eq!(delivered(&path, "delivered"), 1);
+                assert_eq!(delivered(&path, "late"), 1);
+            }
+        }
+    }
+
+    /// The verifier and next drain refuse a restored header under the
+    /// replaced key.
+    #[test]
+    fn owner_verify_refuses_a_restored_header_under_a_replaced_key() {
+        let (_dir, path, store) = rotated_fixture();
+        fs::write(outbox_path(&path), header(1)).unwrap();
+        keyed_outbox(&path, &store)
+            .append(&row("restored"))
+            .unwrap();
+        let before = OpenEvidence::read(&path, &store);
+        let verify = check_outbox_commitment(&path, store.as_ref()).unwrap_err();
+        assert!(matches!(
+            verify,
+            WriterError::OutboxUnusable {
+                line: 1,
+                column: 1,
+                reason: "tagged record whose tag does not verify"
+            }
+        ));
+        let drain = AuditWriter::open(
+            path.clone(),
+            Some(KeyedAuditAccess::new(
+                Zeroizing::new(NEXT_KEY),
+                store.clone(),
+            )),
+        )
+        .err()
+        .unwrap();
+        assert_eq!(format!("{verify:?}"), format!("{drain:?}"));
+        assert_eq!(OpenEvidence::read(&path, &store), before);
+    }
+
+    /// Legacy verification authenticates the tagged suffix under the stored
+    /// key.
+    #[test]
+    fn legacy_verify_authenticates_the_tagged_suffix() {
+        let (_dir, path, store, writer) = keyed_fixture();
+        AuditOutbox::for_log(&path, store.clone())
+            .append(&row("raw"))
+            .unwrap();
+        AuditOutbox::for_log_keyed(&path, store.clone(), Zeroizing::new(NEXT_KEY))
+            .append(&row("foreign-key"))
+            .unwrap();
+        drop(writer);
+        store.set_reload(Ok(Some(ROW_KEY)));
+        let before = OpenEvidence::read(&path, &store);
+        assert!(matches!(
+            check_outbox_commitment(&path, store.as_ref()),
+            Err(WriterError::OutboxUnusable {
+                line: 2,
+                column: 1,
+                reason: "tagged record whose tag does not verify"
+            })
+        ));
+        assert_eq!(OpenEvidence::read(&path, &store), before);
+    }
+
+    /// Each verification reads the stored key once, only when the store
+    /// reads keys.
+    #[test]
+    fn owner_verify_reads_the_stored_key_once() {
+        for scripted in [false, true] {
+            let (_dir, path, store, writer) = cut_over_fixture();
+            enqueue(&path, &store, &["one", "two"]);
+            drop(writer);
+            if scripted {
+                store.set_reload(Ok(Some(ROW_KEY)));
+            }
+            let before = store.reload_count();
+            check_outbox_commitment(&path, store.as_ref()).unwrap();
+            assert_eq!(
+                store.reload_count() - before,
+                usize::from(scripted),
+                "one key read per check"
+            );
+        }
+    }
+
+    /// Keyless stores check layout and coordinates, including an absent
+    /// stored key.
+    #[test]
+    fn owner_verify_on_a_keyless_store_checks_layout_and_coordinates() {
+        for absent in [false, true] {
+            let (_dir, path, store, writer) = cut_over_fixture();
+            enqueue(&path, &store, &["one"]);
+            drop(writer);
+            if absent {
+                store.set_reload(Ok(None));
+            }
+            check_outbox_commitment(&path, store.as_ref()).unwrap();
+            let mut bytes = header(1);
+            bytes.extend_from_slice(&encode_tagged_row(&ROW_KEY, 1, 2, 0, &row("moved")).unwrap());
+            bytes.push(b'\n');
+            fs::write(outbox_path(&path), bytes).unwrap();
+            assert!(matches!(
+                check_outbox_commitment(&path, store.as_ref()),
+                Err(WriterError::OutboxRowsMissing {
+                    recorded: 1,
+                    found: 2
+                })
+            ));
+            fs::write(outbox_path(&path), b"{\"k\":\"gen\"}\n").unwrap();
+            assert!(matches!(
+                check_outbox_commitment(&path, store.as_ref()),
+                Err(WriterError::OutboxUnusable {
+                    line: 1,
+                    column: 1,
+                    reason: "tagged record that does not parse"
+                })
+            ));
+        }
+    }
+
+    /// A failed key read refuses with a static reason and preserves the queue.
+    #[test]
+    fn owner_verify_reports_a_failed_key_read() {
+        let (_dir, path, store, writer) = cut_over_fixture();
+        drop(writer);
+        store.set_reload(Err("private-marker"));
+        let before = OpenEvidence::read(&path, &store);
+        let error = check_outbox_commitment(&path, store.as_ref()).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "audit.tip_anchor_unavailable: audit log tip anchor unavailable: audit tip anchor store: audit key reload failed"
+        );
+        assert!(!format!("{error:?}").contains("private-marker"));
+        assert_eq!(OpenEvidence::read(&path, &store), before);
+    }
+
+    fn capture_verification(
+        path: &Path,
+        store: &InMemoryTipAnchorStore,
+    ) -> (Result<(), WriterError>, String) {
+        let capture = stellar_agent_test_support::CaptureWriter::new();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(capture.clone())
+            .finish();
+        let result = tracing::subscriber::with_default(subscriber, || {
+            tracing::callsite::rebuild_interest_cache();
+            check_outbox_commitment(path, store)
+        });
+        (result, capture.captured_str())
+    }
+
+    /// Recovery and a lone fence pass with the publication warning; a changed
+    /// closed batch refuses.
+    #[test]
+    fn owner_verify_reports_publication_pending() {
+        let (_dir, path, store, mut writer) = cut_over_fixture();
+        enqueue(&path, &store, &["one", "two"]);
+        test_seam::arm_stop(&outbox_path(&path), test_seam::Stop::OwnerStored);
+        assert!(writer.drain_outbox().is_err());
+        drop(writer);
+        store.set_reload(Ok(Some(ROW_KEY)));
+        let before = OpenEvidence::read(&path, &store);
+        let (result, warning) = capture_verification(&path, &store);
+        result.unwrap();
+        assert!(
+            warning.contains("audit outbox publication pending; the next drain completes it"),
+            "{warning}"
+        );
+        assert_eq!(OpenEvidence::read(&path, &store), before);
+        let queue = outbox_bytes(&path);
+        let mut lines = parse_lines(&queue)
+            .lines
+            .iter()
+            .map(|line| line.to_vec())
+            .collect::<Vec<_>>();
+        lines[1] = encode_tagged_row(&ROW_KEY, 1, 1, 0, &row("alternate")).unwrap();
+        fs::write(
+            outbox_path(&path),
+            lines
+                .into_iter()
+                .flat_map(|mut line| {
+                    line.push(b'\n');
+                    line
+                })
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        assert!(matches!(
+            check_outbox_commitment(&path, store.as_ref()),
+            Err(WriterError::OutboxRowsMissing {
+                recorded: 2,
+                found: 2
+            })
+        ));
+        let (_dir, path, store, writer) = cut_over_fixture();
+        drop(writer);
+        let mut rotation = AuditWriter::open_for_key_rotation(
+            path.clone(),
+            Some(Zeroizing::new(ROW_KEY)),
+            store.clone(),
+            crate::audit_log::BindingHistory::NotRecorded,
+        )
+        .unwrap();
+        rotation.fence_outbox_for_key_change().unwrap();
+        drop(rotation);
+        store.set_reload(Ok(Some(ROW_KEY)));
+        let before = OpenEvidence::read(&path, &store);
+        let (result, warning) = capture_verification(&path, &store);
+        result.unwrap();
+        assert!(
+            warning.contains("audit outbox publication pending; the next drain completes it"),
+            "{warning}"
+        );
+        assert_eq!(OpenEvidence::read(&path, &store), before);
+    }
+
+    /// Verification reads the owner state of its locked carrier generation.
+    #[test]
+    fn owner_verification_reads_the_locked_generation() {
+        let (_dir, path, store, writer) = cut_over_fixture();
+        drop(writer);
+        let mut binding = AuditWriter::open_for_carrier_binding(
+            path.clone(),
+            KeyedAuditAccess::new(Zeroizing::new(ROW_KEY), store.clone()),
+        )
+        .unwrap();
+        assert_eq!(binding.bind_carriers().unwrap().generation, 2);
+        drop(binding);
+        store.store_outbox_owner_state(0, "invalid-zero").unwrap();
+        store
+            .store_outbox_owner_state(1, "invalid-retired")
+            .unwrap();
+        let mut record = store.load_carrier_record().unwrap().unwrap();
+        record.retired.as_mut().unwrap().state =
+            super::super::lock::owner_watch("invalid-retired", 0);
+        store.store_carrier_record(&record).unwrap();
+        check_outbox_commitment(&path, store.as_ref()).unwrap();
+    }
+
+    /// A valid owner queue has no loss; a misplaced row reports its missing
+    /// authenticated prefix.
     #[test]
     fn the_generation_line_states() {
         // A row after the generation line takes position 1 at physical line 2.
@@ -6340,14 +6882,10 @@ mod tests {
             encode_tagged_row(&ROW_KEY, 1, 1, 0, &entry).unwrap()
         );
         // Verification accepts the published queue, and refuses a row of
-        // another generation or a nonzero commitment. The legacy loss report
-        // leaves an owned queue to the owner drain either way.
+        // another generation or a nonzero commitment. A valid queue has
+        // no loss.
         check_outbox_commitment(&path, store.as_ref()).unwrap();
-        let owned = format!("{:?}", owned_queue_refusal());
-        assert_eq!(
-            format!("{:?}", writer.outbox_loss()),
-            format!("Err({owned})")
-        );
+        assert_eq!(writer.outbox_loss().unwrap(), None);
         let published = outbox_bytes(&path);
         let mut moved = header(1);
         moved.extend_from_slice(&encode_tagged_row(&ROW_KEY, 2, 1, 0, &entry).unwrap());
@@ -6361,8 +6899,11 @@ mod tests {
             })
         ));
         assert_eq!(
-            format!("{:?}", writer.outbox_loss()),
-            format!("Err({owned})")
+            writer.outbox_loss().unwrap(),
+            Some(OutboxLoss {
+                expected_rows: 1,
+                found_rows: 0
+            })
         );
         fs::write(outbox_path(&path), &published).unwrap();
         commit_every_line(&path, &store);

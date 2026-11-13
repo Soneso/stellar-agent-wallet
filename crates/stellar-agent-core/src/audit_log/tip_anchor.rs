@@ -339,7 +339,9 @@ pub struct CarrierRecord {
 pub struct RetiredOutbox {
     /// Retired outbox generation.
     pub generation: u64,
-    /// Canonical keyring value, or the empty string for an absent entry.
+    /// Canonical v1 value, or the empty string for an absent v1 entry.
+    /// Owner watches use `owner:sha256:<hash>:<rows>` over the raw owner value.
+    /// The row count records the binding's selected rows.
     pub state: String,
     /// File name beside the log the retired outbox is renamed to, `None` when
     /// the log had no outbox file. A plain file name, never a path.
@@ -922,6 +924,7 @@ struct InMemoryAnchorState {
     outbox: std::collections::BTreeMap<u64, OutboxState>,
     outbox_owner: std::collections::BTreeMap<u64, String>,
     carriers: Option<CarrierRecord>,
+    carrier_writes: usize,
     outbox_fail_reads: bool,
     outbox_fail_writes: bool,
     owner_fail_reads: bool,
@@ -1026,6 +1029,19 @@ impl InMemoryTipAnchorStore {
             .expect("in-memory anchor store mutex")
             .item_writes
             .clone()
+    }
+
+    /// Returns the number of successful carrier-record writes.
+    ///
+    /// # Panics
+    /// Panics if the internal mutex is poisoned.
+    #[must_use]
+    pub fn carrier_record_writes(&self) -> usize {
+        #[allow(clippy::expect_used, reason = "test seam; poison means a failed test")]
+        self.state
+            .lock()
+            .expect("in-memory anchor store mutex")
+            .carrier_writes
     }
 
     /// Scripts every later audit-key reload: `Ok(Some(key))`, `Ok(None)` for
@@ -1207,6 +1223,7 @@ impl TipAnchorStore for InMemoryTipAnchorStore {
             .lock()
             .map_err(|_| TipAnchorStoreError::new("store mutex"))?;
         state.carriers = Some(record.clone());
+        state.carrier_writes += 1;
         Ok(())
     }
 

@@ -40,11 +40,12 @@
 //! was written refuses with `audit.carrier_replaced` instead of admitting a
 //! second holder of the same role.
 
+use sha2::{Digest as _, Sha256};
 use std::fs::OpenOptions;
 use std::path::Path;
 
 use super::outbox::{OutboxLoss, OutboxState};
-use super::tip_anchor::{CarrierRecord, TipAnchorStore};
+use super::tip_anchor::{CarrierRecord, TipAnchorStore, TipAnchorStoreError};
 use super::writer::WriterError;
 use crate::file_lock::{FileIdentity, HeldFileLock};
 
@@ -362,6 +363,36 @@ pub(crate) fn retired_changed(
     let Some(retired) = &record.retired else {
         return Ok(None);
     };
+    let unusable = || {
+        WriterError::TipAnchorStore(TipAnchorStoreError::new("retired outbox state is unusable"))
+    };
+    if let Some(watch) = retired.state.strip_prefix("owner:") {
+        let (hash, count) = watch
+            .strip_prefix("sha256:")
+            .and_then(|value| value.split_once(':'))
+            .ok_or_else(unusable)?;
+        let count: u64 = count.parse().map_err(|_| unusable())?;
+        if hash.len() != 64
+            || !hash
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            || retired.state != format!("owner:sha256:{hash}:{count}")
+        {
+            return Err(unusable());
+        }
+        let observed = store
+            .load_outbox_owner_state(retired.generation)?
+            .unwrap_or_default();
+        if owner_watch(&observed, count) == retired.state {
+            return Ok(None);
+        }
+        return Ok(Some(RetiredChange {
+            generation: retired.generation,
+            observed: owner_watch(&observed, 0),
+            recorded_rows: count,
+            observed_rows: 0,
+        }));
+    }
     let observed = store.load_outbox_state(retired.generation)?;
     let observed_value = observed
         .as_ref()
@@ -373,7 +404,9 @@ pub(crate) fn retired_changed(
     let recorded_rows = if retired.state.is_empty() {
         0
     } else {
-        OutboxState::parse(&retired.state)?.pending
+        OutboxState::parse(&retired.state)
+            .map_err(|_| unusable())?
+            .pending
     };
     Ok(Some(RetiredChange {
         generation: retired.generation,
@@ -381,6 +414,14 @@ pub(crate) fn retired_changed(
         recorded_rows,
         observed_rows: observed.map_or(0, |state| state.pending),
     }))
+}
+
+/// Captures the raw retired owner value and the selected row count.
+pub(crate) fn owner_watch(raw: &str, rows: u64) -> String {
+    format!(
+        "owner:sha256:{}:{rows}",
+        crate::hex::encode(&Sha256::digest(raw.as_bytes()))
+    )
 }
 
 /// Refuses when the record's retired generation changed after the binding.

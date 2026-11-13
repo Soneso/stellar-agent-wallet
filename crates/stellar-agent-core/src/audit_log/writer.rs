@@ -1263,10 +1263,11 @@ impl AuditWriter {
     /// Returns the errors of a checked writer open, except outbox drain errors.
     /// Returns [`WriterError::CarriersBusy`] when any carrier is held and
     /// [`WriterError::CarrierBindingIncomplete`] when a staged generation
-    /// exists. Returns [`WriterError::OutboxUnusable`] with `queue held by
-    /// owner state` when owner state holds the active queue and the retired
-    /// commitment is unchanged. That refusal comes before the open writes
-    /// anything.
+    /// exists. Under owner state, classification checks the active queue and
+    /// retired watch before any write.
+    /// Hard validation failures refuse without changing either queue.
+    /// Returns [`WriterError::OutboxLossNotFound`] when neither source shows
+    /// a loss.
     pub fn open_for_outbox_acknowledgement(
         path: PathBuf,
         hmac_key: Option<Zeroizing<[u8; 32]>>,
@@ -1449,13 +1450,13 @@ impl AuditWriter {
         {
             return Err(WriterError::CarrierBindingIncomplete);
         }
-        // The legacy acknowledgement refuses a queue under owner state while
-        // the open holds every carrier, before its first write. The refusal
-        // leaves the log, the queue and the store as they were.
+        // Owner classification precedes the open's first write under its
+        // carriers.
         if anchor_mode == TipAnchorOpenMode::Acknowledge
             && let Some(store) = tip_anchor.as_ref()
+            && let OpenedCarriers::Held(HeldCarriers::Recovery { outbox, .. }) = &opened
         {
-            refuse_owned_acknowledgement(store.as_ref())?;
+            classify_owner_acknowledgement(&path, store.as_ref(), outbox, hmac_key.as_deref())?;
         }
         let drains = tip_anchor.is_some() && anchor_mode != TipAnchorOpenMode::Repair;
 
@@ -1476,7 +1477,7 @@ impl AuditWriter {
                     generation,
                     outbox,
                 )?
-                .committed_bytes(hmac_key.as_deref())?;
+                .binding_selection(store.as_ref(), hmac_key.as_deref())?;
             }
         }
 
@@ -2022,7 +2023,7 @@ impl AuditWriter {
         // drains through the owner protocol; only an untagged legacy queue
         // reaches the recognition and the commitment check below.
         if let Some(plan) = batch.owner_plan(store.as_ref(), self.hmac_key.as_deref())? {
-            return self.deliver_owner_plan(batch, plan, store.as_ref());
+            return self.deliver_owner_plan(batch, plan, store.as_ref(), false);
         }
         if let Some(delivered) = batch.uncommitted_entries(self.hmac_key.as_deref())
             && self.active_file_ends_with(&delivered)?
@@ -2084,13 +2085,13 @@ impl AuditWriter {
     ///
     /// A rerun after an interruption converges. Before step 4 the record
     /// still names G: the rerun removes the staged files and starts again.
-    /// After step 4 the record names G+1: a staged file that holds exactly
-    /// the rows the commitment of G+1 counts is installed by step 5 alone,
-    /// with the retired watch left for the next ordinary acquisition. One
-    /// that does not is rewritten in place from the rows of the retired
-    /// generation, read from the retired file once the first rename of step 5
-    /// completed and from the outbox before that, and steps 2 to 5 repeat for
-    /// G+1. Those rows are verified before anything changes, and the stage
+    /// After step 4, the record names G+1. Step 5 installs a stage that matches
+    /// the selected source bytes and successor state. The next ordinary
+    /// acquisition checks the retained retired watch.
+    /// A mismatching stage is rewritten in place from the retired generation,
+    /// and steps 2 to 5 repeat for G+1. The source is the retired file after
+    /// the first rename of step 5, and the outbox before that.
+    /// Those rows are verified before anything changes, and the stage
     /// exists throughout, so the binding stays marked incomplete until step 5
     /// installs it.
     ///
@@ -2165,10 +2166,16 @@ impl AuditWriter {
             // acquisition, which refuses until a changed retired commitment is
             // acknowledged.
             let staged = carriers::generation_path(&self.path, record.generation);
-            let state = store
-                .load_outbox_state(record.generation)?
-                .unwrap_or_default();
-            if let Some(carried_rows) = carriers::stage_rows(&staged, &state)? {
+            let selected = self.binding_source(
+                store.as_ref(),
+                retired.generation,
+                Some(retired),
+                &held.outbox,
+            )?;
+            let carried_rows = (fs::read(&staged)? == selected.bytes
+                && selected.matches_stored(store.as_ref(), record.generation)?)
+            .then_some(selected.rows);
+            if let Some(carried_rows) = carried_rows {
                 carriers::finish(&self.path, record.generation, retired.file.as_deref())?;
                 return Ok(carriers::CarrierBindingReport {
                     generation: record.generation,
@@ -2228,29 +2235,20 @@ impl AuditWriter {
         retired: Option<RetiredOutbox>,
         stop_after: Option<u8>,
     ) -> Result<carriers::CarrierBindingReport, WriterError> {
-        let retired_file = retired
-            .as_ref()
-            .and_then(|retired| retired.file.as_deref())
-            .map(|name| self.path.with_file_name(name));
-        let source = match retired_file {
-            Some(file) if file.try_exists()? => file,
-            _ => super::outbox::outbox_path(&self.path),
-        };
-        let batch =
-            super::outbox::OutboxBatch::read_file_for_recovery(&source, store, from, &held.outbox)?;
-        let (bytes, carried_rows) = batch.committed_bytes(self.hmac_key.as_deref())?;
+        let selected = self.binding_source(store, from, retired.as_ref(), &held.outbox)?;
+        let carried_rows = selected.rows;
         #[cfg(test)]
         if let Some(hook) = self.binding_after_snapshot.take() {
             hook();
         }
-        // A name this binding picks is free at its search. Only such a name
-        // gives way to the next suffix when another process takes it first.
+        // Only a fresh binding picks and searches a retired name; a rerun
+        // keeps the recorded one.
         let fresh = retired.is_none();
         let retired = match retired {
             Some(retired) => retired,
             None => RetiredOutbox {
                 generation: from,
-                state: batch.stored_state().to_owned(),
+                state: selected.watch.clone(),
                 file: carriers::retired_name(&self.path, from)?,
             },
         };
@@ -2263,8 +2261,8 @@ impl AuditWriter {
             Ok(())
         };
         fault(1)?;
-        carriers::write_stage(&self.path, next, &bytes)?;
-        store.store_outbox_state(next, batch.state())?;
+        carriers::write_stage(&self.path, next, &selected.bytes)?;
+        selected.store(store, next)?;
         fault(2)?;
         self.append_checked(AuditEntry::new_audit_carriers_bound(
             next,
@@ -2293,6 +2291,36 @@ impl AuditWriter {
             carried_rows,
             retired_file: retired.file,
         })
+    }
+
+    /// Selects a binding's source from its retired name when that file exists.
+    /// An interrupted binding recognizes a completed legacy delivery by the
+    /// same zero commitment and complete log tail that the drain checks.
+    fn binding_source(
+        &self,
+        store: &dyn TipAnchorStore,
+        from: u64,
+        retired: Option<&RetiredOutbox>,
+        held: &Arc<AuditWriterLock>,
+    ) -> Result<super::outbox::BindingSelection, WriterError> {
+        let retired_file = retired
+            .and_then(|retired| retired.file.as_deref())
+            .map(|name| self.path.with_file_name(name));
+        let source = match retired_file {
+            Some(file) if file.try_exists()? => file,
+            _ => super::outbox::outbox_path(&self.path),
+        };
+        let batch = super::outbox::OutboxBatch::read_file_for_recovery(&source, store, from, held)?;
+        if retired.is_some()
+            && batch.owner_plan(store, self.hmac_key.as_deref())?.is_none()
+            && let Some(delivered) = batch.uncommitted_entries(self.hmac_key.as_deref())
+            && self.active_file_ends_with(&delivered)?
+        {
+            // Persist recognition before a binding row changes the log tail.
+            batch.clear()?;
+            return Ok(super::outbox::BindingSelection::empty_legacy());
+        }
+        batch.binding_selection(store, self.hmac_key.as_deref())
     }
 
     /// Moves the outbox of generation `from` to the retired name the stored
@@ -2367,8 +2395,9 @@ impl AuditWriter {
     /// Delivers an owner drain of `batch` as `plan` decides.
     ///
     /// In order, it appends the rows and requires the anchor to cover them.
-    /// It then stores the owner state and the zero commitment, and publishes
-    /// the generation line.
+    /// Drains store the owner state before the zero commitment, then publish
+    /// the generation line. Acknowledgements reset v1 before storing the
+    /// owner state and always require the anchor.
     ///
     /// A failure before the owner state is stored leaves the owner state and
     /// the queue unchanged, so the next drain delivers the same rows again
@@ -2378,6 +2407,7 @@ impl AuditWriter {
         batch: super::outbox::OutboxBatch,
         plan: super::outbox::OwnerDelivery,
         store: &dyn TipAnchorStore,
+        acknowledgement: bool,
     ) -> Result<usize, WriterError> {
         #[cfg(any(test, feature = "test-helpers"))]
         let stop = |at| super::outbox::test_seam::check_stop(batch.path(), at);
@@ -2395,20 +2425,27 @@ impl AuditWriter {
                 stop(super::outbox::test_seam::Stop::AfterAppend(appended))?;
             }
         }
-        if drained > 0 {
+        if drained > 0 || acknowledgement {
             self.require_anchor_current()?;
             #[cfg(any(test, feature = "test-helpers"))]
             stop(super::outbox::test_seam::Stop::AnchorChecked)?;
+        }
+        let zero_legacy = || -> Result<(), WriterError> {
+            store.store_outbox_state(batch.generation(), &super::outbox::OutboxState::default())?;
+            #[cfg(any(test, feature = "test-helpers"))]
+            stop(super::outbox::test_seam::Stop::LegacyZeroed)?;
+            Ok(())
+        };
+        if plan.zero_legacy && acknowledgement {
+            zero_legacy()?;
         }
         if let Some(owner) = owner {
             store.store_outbox_owner_state(batch.generation(), &owner)?;
             #[cfg(any(test, feature = "test-helpers"))]
             stop(super::outbox::test_seam::Stop::OwnerStored)?;
         }
-        if plan.zero_legacy {
-            store.store_outbox_state(batch.generation(), &super::outbox::OutboxState::default())?;
-            #[cfg(any(test, feature = "test-helpers"))]
-            stop(super::outbox::test_seam::Stop::LegacyZeroed)?;
+        if plan.zero_legacy && !acknowledgement {
+            zero_legacy()?;
         }
         if let Some(generation) = plan.publish {
             let key = self
@@ -2434,19 +2471,19 @@ impl AuditWriter {
     /// Reports a loss under the outbox lock. Recovery writers retain that lock
     /// until they drop.
     ///
-    /// `Ok(None)` means the outbox holds exactly its committed prefix,
-    /// unchanged and in order, and the retired watch holds. A loss in the
-    /// active queue is reported first. Otherwise a changed commitment of the
-    /// generation the last binding retired is the loss, counted as the rows
-    /// that commitment held at retirement against the rows it holds now. When
-    /// the active queue is not intact, its committed prefix, if intact, is
-    /// parsed as operator rows too, so a loss whose acknowledgement would
-    /// refuse on one of those lines refuses here, before the caller revokes
-    /// anything.
+    /// `Ok(None)` means the next drain accepts the queue and the retired watch
+    /// holds. A loss in the active queue is reported first.
+    /// Otherwise a changed commitment of the retired generation is the loss.
+    /// The retired watch supplies its expected and observed row counts.
+    /// An intact committed prefix is parsed as operator rows even when the
+    /// remaining queue is damaged. A refusal occurs here, before the caller
+    /// revokes permissions.
     ///
-    /// Owner state of the active generation hands that queue to the owner
-    /// drain, which delivers or refuses it. The report then names only a
-    /// changed retired commitment, and refuses without one.
+    /// Owner selection reports a loss when the next drain refuses the queue.
+    /// It selects the authenticated prefix and excludes delivered
+    /// closed-prefix rows from delivery.
+    /// Recoverable publication and a lone fence show no active loss.
+    /// Hard owner refusals apply before the caller revokes permissions.
     ///
     /// # Errors
     ///
@@ -2454,9 +2491,8 @@ impl AuditWriter {
     /// - [`WriterError::OutboxBusy`] when the outbox lock stays held.
     /// - [`WriterError::TipAnchorStore`] when the commitment, the owner state
     ///   or the carrier record cannot be read.
-    /// - [`WriterError::OutboxUnusable`] with `queue held by owner state` when
-    ///   owner state holds the active queue and the retired commitment is
-    ///   unchanged.
+    /// - [`WriterError::OutboxUnusable`] for a missing audit key or generation
+    ///   overflow.
     /// - [`WriterError::OutboxUnusable`] / [`WriterError::OutboxRowKindRefused`]
     ///   when a loss exists and a line of the intact committed prefix is not an
     ///   operator row.
@@ -2473,11 +2509,13 @@ impl AuditWriter {
             Some(record) => super::lock::retired_changed(store.as_ref(), &record)?,
             None => None,
         };
-        if batch.is_owned(store.as_ref())? {
-            return retired
-                .as_ref()
-                .map(|change| Some(change.loss()))
-                .ok_or_else(super::outbox::owned_queue_refusal);
+        if let Some(selection) = batch.owner_selection(
+            store.as_ref(),
+            super::outbox::SuffixCheck::Keyed(self.hmac_key.as_deref()),
+        )? {
+            return Ok(selection
+                .loss
+                .or_else(|| retired.as_ref().map(super::lock::RetiredChange::loss)));
         }
         let Some(loss) = batch
             .loss(self.hmac_key.as_deref())
@@ -2512,9 +2550,13 @@ impl AuditWriter {
     /// retired watch to the commitment it observed, so the next acquisition
     /// compares against that value. It never changes a carrier identity.
     ///
-    /// Under owner state of the active generation, only a changed retired
-    /// commitment is acknowledged. The row is appended and the watch reset,
-    /// while the active queue and its commitment stay for the owner drain.
+    /// Under owner state, the acknowledgement appends selected rows and
+    /// requires the anchor. It then resets nonzero v1 state, stores owner
+    /// evidence, and publishes the generation line.
+    /// A changed retired watch resets last, preserving carrier identities.
+    /// A watch-only loss leaves the active queue and its protected items
+    /// unchanged. A retry before the owner item is stored repeats selected
+    /// rows with their request IDs.
     ///
     /// # Errors
     ///
@@ -2524,9 +2566,8 @@ impl AuditWriter {
     /// - [`WriterError::OutboxBusy`] when the outbox lock stays held.
     /// - [`WriterError::TipAnchorStore`] when the commitment or the owner
     ///   state cannot be read, or the commitment cannot be reset.
-    /// - [`WriterError::OutboxUnusable`] with `queue held by owner state` when
-    ///   owner state holds the active queue and the retired commitment is
-    ///   unchanged. Nothing is written.
+    /// - [`WriterError::OutboxUnusable`] for a missing audit key or generation
+    ///   overflow.
     /// - [`WriterError::OutboxLossNotFound`] when the outbox holds its
     ///   committed prefix. Nothing is written.
     /// - [`WriterError::OutboxUnusable`] / [`WriterError::OutboxRowKindRefused`]
@@ -2556,27 +2597,26 @@ impl AuditWriter {
             Some(record) => super::lock::retired_changed(store.as_ref(), record)?,
             None => None,
         };
-        let owned = batch.is_owned(store.as_ref())?;
-        let loss = if owned {
-            retired
-                .as_ref()
-                .map(super::lock::RetiredChange::loss)
-                .ok_or_else(super::outbox::owned_queue_refusal)?
-        } else {
-            batch
-                .loss(self.hmac_key.as_deref())
-                .or_else(|| retired.as_ref().map(super::lock::RetiredChange::loss))
-                .ok_or(WriterError::OutboxLossNotFound)?
-        };
-        let entries = if owned {
+        let selection = batch.owner_selection(
+            store.as_ref(),
+            super::outbox::SuffixCheck::Keyed(self.hmac_key.as_deref()),
+        )?;
+        let active_loss = selection.as_ref().map_or_else(
+            || batch.loss(self.hmac_key.as_deref()),
+            |selection| selection.loss,
+        );
+        let loss = active_loss
+            .or_else(|| retired.as_ref().map(super::lock::RetiredChange::loss))
+            .ok_or(WriterError::OutboxLossNotFound)?;
+        let entries = if selection.is_some() {
             Vec::new()
         } else {
             batch
                 .committed_entries(self.hmac_key.as_deref())?
                 .unwrap_or_default()
         };
-        let discarded = if owned {
-            0
+        let discarded = if selection.is_some() {
+            active_loss.map_or(0, |loss| (loss.expected_rows - loss.found_rows) as usize)
         } else {
             batch.complete_lines().saturating_sub(entries.len())
         };
@@ -2587,16 +2627,28 @@ impl AuditWriter {
             revoked.approvals,
             revoked.grants,
         ))?;
-        let drained = entries.len();
-        for entry in entries {
-            self.append_checked(entry)?;
-        }
-        if !owned {
+        #[cfg(any(test, feature = "test-helpers"))]
+        super::outbox::test_seam::check_stop(
+            batch.path(),
+            super::outbox::test_seam::Stop::Acknowledged,
+        )?;
+        let drained = if let Some(selection) = selection {
+            if active_loss.is_some() {
+                self.deliver_owner_plan(batch, selection.plan, store.as_ref(), true)?
+            } else {
+                0
+            }
+        } else {
+            let drained = entries.len();
+            for entry in entries {
+                self.append_checked(entry)?;
+            }
             store
                 .store_outbox_state(batch.generation(), &super::outbox::OutboxState::default())
                 .map_err(WriterError::TipAnchorStore)?;
             batch.clear()?;
-        }
+            drained
+        };
         if let (Some(mut record), Some(change)) = (record, retired)
             && let Some(watched) = record.retired.as_mut()
         {
@@ -5979,27 +6031,32 @@ fn refuse_replaced_key(store: &dyn TipAnchorStore, key: &[u8; 32]) -> Result<(),
     Ok(())
 }
 
-/// Refuses an acknowledgement open when owner state holds the active queue
-/// and the retired commitment is unchanged.
-///
-/// That acknowledgement has nothing to record: the owner drain delivers or
-/// refuses the queue. A changed retired commitment is still acknowledged.
+/// Classifies an owner loss before an acknowledgement open writes anything.
 ///
 /// # Errors
 ///
-/// - [`WriterError::OutboxUnusable`] with `queue held by owner state`.
-/// - [`WriterError::TipAnchorStore`] when the carrier record, the owner state
-///   or the retired commitment cannot be read.
-fn refuse_owned_acknowledgement(store: &dyn TipAnchorStore) -> Result<(), WriterError> {
+/// Returns store, carrier, and queue validation errors before any write.
+/// Returns [`WriterError::OutboxLossNotFound`] when neither queue shows a loss.
+fn classify_owner_acknowledgement(
+    path: &Path,
+    store: &dyn TipAnchorStore,
+    held: &Arc<AuditWriterLock>,
+    key: Option<&[u8; 32]>,
+) -> Result<(), WriterError> {
     let record = store.load_carrier_record()?;
     let generation = record.as_ref().map_or(0, |record| record.generation);
-    if store.load_outbox_owner_state(generation)?.is_none() {
-        return Ok(());
+    let batch = super::outbox::OutboxBatch::read_for_recovery(path, store, generation, held)?;
+    if let Some(selection) = batch.owner_selection(store, super::outbox::SuffixCheck::Keyed(key))? {
+        let retired = record
+            .as_ref()
+            .map(|record| super::lock::retired_changed(store, record))
+            .transpose()?
+            .flatten();
+        if selection.loss.is_none() && retired.is_none() {
+            return Err(WriterError::OutboxLossNotFound);
+        }
     }
-    match &record {
-        Some(record) if super::lock::retired_changed(store, record)?.is_some() => Ok(()),
-        _ => Err(super::outbox::owned_queue_refusal()),
-    }
+    Ok(())
 }
 
 /// Refuses an open without the audit key on a log that shows keying.
@@ -6966,8 +7023,6 @@ pub enum WriterError {
         /// Checked advancement uses `queue generation overflows`.
         /// A commitment changed under owner state uses
         /// `legacy outbox state changed in the owner state` at line one.
-        /// A legacy loss report on a queue under owner state uses
-        /// `queue held by owner state` at line one.
         /// A key-change fence over a queue that holds a row uses
         /// `queue not drained before a key change` at line one.
         reason: &'static str,
@@ -8274,6 +8329,10 @@ mod tests {
     #[test]
     fn generation_and_owner_diagnostics_are_exact() {
         use crate::audit_log::outbox::{OutboxOwnerState, test_seam};
+        for (error, expected) in super::carrier_tests::owner_diagnostic_failures() {
+            assert_eq!(error.to_string(), expected);
+            assert!(!format!("{error:?}").contains("private-marker"));
+        }
         let key = [0x42; 32];
         let header = test_seam::generation_line(&key, 7);
         let line = header.strip_suffix(b"\n").unwrap();
