@@ -13,6 +13,7 @@
 //! - [`enroll_rpc_credential`]: store an RPC provider key in the keyring and
 //!   name it in the role's provider record.
 //! - [`sign_policy`] — sign a V1 policy file with the owner key.
+//! - [`add_counterparty`]: add one payment recipient to a profile's policy.
 //! - [`rotate_nonce_key`] — rotate the HMAC nonce key for a profile.
 //! - [`rotate_attestation_key`] — rotate the approval-spine attestation HMAC
 //!   key.
@@ -28,6 +29,7 @@
 //! enum.  The top-level [`crate::main`] function routes `Commands::Profile(args)`
 //! to [`run`], which delegates to the appropriate subcommand handler.
 
+pub mod add_counterparty;
 pub mod apply_fragment;
 pub mod audit_emit;
 pub mod bind_signer;
@@ -70,6 +72,8 @@ pub struct ProfileArgs {
 pub enum ProfileSubcommand {
     /// Validate a policy body from standard input without checking its signature.
     PolicyCheck(policy_check::PolicyCheckArgs),
+    /// Author the policy of a profile.
+    Policy(PolicyArgs),
     /// Replace allowed profile fields with a validated standard-input fragment.
     ApplyFragment(apply_fragment::ApplyFragmentArgs),
     /// Bind the enrolled mainnet signer to the profile and established owner.
@@ -203,6 +207,23 @@ pub enum ProfileSubcommand {
     Resume(halt::ResumeArgs),
 }
 
+/// Arguments for the `profile policy` subcommand group.
+#[derive(Debug, Args)]
+#[non_exhaustive]
+pub struct PolicyArgs {
+    /// The policy subcommand to run.
+    #[command(subcommand)]
+    pub subcommand: PolicySubcommand,
+}
+
+/// Subcommands of `stellar-agent profile policy`.
+#[derive(Debug, Subcommand)]
+#[non_exhaustive]
+pub enum PolicySubcommand {
+    /// Add one payment recipient to the profile's policy.
+    AddCounterparty(add_counterparty::AddCounterpartyArgs),
+}
+
 /// Runs the `profile` subcommand group.
 ///
 /// Dispatches to the appropriate subcommand handler.
@@ -219,6 +240,9 @@ pub enum ProfileSubcommand {
 pub async fn run(args: &ProfileArgs) -> i32 {
     match &args.subcommand {
         ProfileSubcommand::PolicyCheck(a) => policy_check::run(a),
+        ProfileSubcommand::Policy(policy) => match &policy.subcommand {
+            PolicySubcommand::AddCounterparty(a) => add_counterparty::run(a).await,
+        },
         ProfileSubcommand::ApplyFragment(a) => apply_fragment::run(a),
         ProfileSubcommand::BindSigner(a) => bind_signer::run(a).await,
         ProfileSubcommand::EnableMainnet(a) => enable_mainnet::run(a),
@@ -258,6 +282,9 @@ impl ProfileArgs {
     pub(crate) fn profile_flag(&self) -> Option<&str> {
         match &self.subcommand {
             ProfileSubcommand::PolicyCheck(a) => Some(&a.profile),
+            ProfileSubcommand::Policy(policy) => match &policy.subcommand {
+                PolicySubcommand::AddCounterparty(a) => Some(&a.profile),
+            },
             ProfileSubcommand::ApplyFragment(a) => Some(&a.profile),
             ProfileSubcommand::BindSigner(a) => Some(&a.profile),
             ProfileSubcommand::EnableMainnet(a) => a.profile.as_deref(),

@@ -889,6 +889,59 @@ async fn sign_policy_with_owner_seeds(
     .await
 }
 
+/// A seed failure of the prompt route, worded for entered text.
+struct TextSeedError(OwnerSignError);
+
+impl From<OwnerSeedError> for TextSeedError {
+    fn from(error: OwnerSeedError) -> Self {
+        Self(match error {
+            // The text route never reports `NotSet`; both cases name the text.
+            OwnerSeedError::NotSet | OwnerSeedError::Invalid => {
+                OwnerSignError::Env("the entered text is not a valid S-strkey".to_owned())
+            }
+            OwnerSeedError::Unlock(message) => OwnerSignError::Unlock(message),
+        })
+    }
+}
+
+/// Signs `raw` with the seed text an operator entered at a prompt.
+///
+/// The seed must derive to `enrolled_pubkey`. The body is returned unchanged
+/// with the derived key, the signature, and the digest of its canonical bytes.
+///
+/// # Errors
+///
+/// Returns [`OwnerSignError::Env`] for text that is not an S-strkey,
+/// [`OwnerSignError::Unlock`] when the locked page fails,
+/// [`OwnerSignError::Mismatch`] for another owner, and
+/// [`OwnerSignError::Policy`] when the body cannot be canonicalized.
+pub(super) async fn sign_with_seed_text(
+    seed: zeroize::Zeroizing<String>,
+    mlock_required: MlockRequired,
+    ttl_seconds: u32,
+    enrolled_pubkey: &[u8; 32],
+    raw: &str,
+) -> Result<(String, [u8; 32], [u8; 64], [u8; 32]), OwnerSignError> {
+    super::owner_seed::with_owner_seed_text(
+        seed,
+        "profile-policy-add-counterparty",
+        mlock_required,
+        ttl_seconds,
+        async |key| {
+            let derived = key.verifying_key().to_bytes();
+            if derived != *enrolled_pubkey {
+                return Err(TextSeedError(OwnerSignError::Mismatch { derived }));
+            }
+            let canonical =
+                canonical_bytes(raw).map_err(|e| TextSeedError(OwnerSignError::Policy(e)))?;
+            let digest = digest(&canonical);
+            Ok((raw.to_owned(), derived, sign(&digest, key), digest))
+        },
+    )
+    .await
+    .map_err(|TextSeedError(error)| error)
+}
+
 /// Atomically writes `contents` to `path`: writes a temp file in the same
 /// directory, fsyncs it, then renames it over the target.
 ///
@@ -1070,7 +1123,9 @@ pub(super) mod tests {
     }
 
     /// `(S-strkey, pubkey bytes, G-strkey)` for a fixed 32-byte seed.
-    fn seed_material(seed: [u8; 32]) -> (String, [u8; 32], String) {
+    pub(in crate::commands::profile) fn seed_material(
+        seed: [u8; 32],
+    ) -> (String, [u8; 32], String) {
         let s_strkey = stellar_strkey::ed25519::PrivateKey(seed)
             .as_unredacted()
             .to_string()
@@ -1084,7 +1139,7 @@ pub(super) mod tests {
         (s_strkey, pk, g)
     }
 
-    fn profile_for(name: &str) -> Profile {
+    pub(in crate::commands::profile) fn profile_for(name: &str) -> Profile {
         let mut profile = Profile::builder_testnet(
             "stellar-agent-signer",
             "default",
@@ -1103,7 +1158,7 @@ pub(super) mod tests {
         profile
     }
 
-    fn enroll_owner_pubkey(name: &str, pk: &[u8; 32]) {
+    pub(in crate::commands::profile) fn enroll_owner_pubkey(name: &str, pk: &[u8; 32]) {
         let coord = KeyringEntryRef::default_owner_key(name);
         let entry = KeyringEntry::new(&coord.service, &coord.account).unwrap();
         entry
@@ -2561,7 +2616,7 @@ pub(super) mod tests {
         (status, output.remove(0))
     }
 
-    fn provisioning_profile() -> Profile {
+    pub(in crate::commands::profile) fn provisioning_profile() -> Profile {
         let mut profile = Profile::builder_mainnet_named(
             "operator",
             "https://rpc.example.invalid",
@@ -2575,7 +2630,7 @@ pub(super) mod tests {
         profile
     }
 
-    fn provisioning_body(bound: bool) -> String {
+    pub(in crate::commands::profile) fn provisioning_body(bound: bool) -> String {
         let mut doc = include_str!("../../../../stellar-agent-core/tests/fixtures/policy-v2.toml")
             .parse::<toml_edit::DocumentMut>()
             .unwrap();
@@ -2610,7 +2665,7 @@ pub(super) mod tests {
         window
     }
 
-    fn nonce_state(profile: &Profile, state: &str) {
+    pub(in crate::commands::profile) fn nonce_state(profile: &Profile, state: &str) {
         let coordinate = stellar_agent_core::profile::schema::mainnet_enablement_entry_ref(
             &profile.policy_window_state_key_id,
         );

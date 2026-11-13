@@ -2,6 +2,8 @@
 //!
 //! `profile init` previews the bounds of the policy body it is about to write,
 //! and `profile enable-mainnet` the bounds of the body it is about to bind.
+//! `profile policy add-counterparty` previews the body it is about to sign or
+//! write, with the scope of its edit beside the summary.
 //! The preview is one JSON line by default, or a flattened table:
 //!
 //! ```text
@@ -116,6 +118,23 @@ impl<'a> SpendingPreview<'a> {
         plan: Option<&PresetPlan>,
         format: OutputFormat,
     ) -> Result<(), (&'static str, String)> {
+        self.show_with(summary, plan, &[], format)
+    }
+
+    /// [`Self::show`] with each `extra` pair inserted after the summary and
+    /// the plan. The table layout states no `extra` pair.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SPENDING_PREVIEW_UNWRITABLE`] with the I/O error when the
+    /// write or the flush fails; nothing is recorded then.
+    pub(crate) fn show_with(
+        &mut self,
+        summary: Option<&SpendingSummary>,
+        plan: Option<&PresetPlan>,
+        extra: &[(&'static str, Value)],
+        format: OutputFormat,
+    ) -> Result<(), (&'static str, String)> {
         let unwritable = |error: &dyn std::fmt::Display| {
             (
                 SPENDING_PREVIEW_UNWRITABLE,
@@ -136,6 +155,9 @@ impl<'a> SpendingPreview<'a> {
                 "plan".to_owned(),
                 serde_json::to_value(plan).map_err(|e| unwritable(&e))?,
             );
+        }
+        for (key, extra) in extra {
+            value.insert((*key).to_owned(), extra.clone());
         }
         let value = Value::Object(value);
         let text = match format {
@@ -478,6 +500,46 @@ mod tests {
                 assert!(preview.shown().is_none(), "{writer:?}");
             }
         }
+    }
+
+    /// `show` writes the line of `show_with` without extra pairs, and an
+    /// extra pair joins the JSON line only.
+    #[test]
+    fn show_keeps_its_output() {
+        let (summary, plan) = summary_and_plan("api-day", false);
+        let expected = format!(
+            "{}\n",
+            render::escape_json_format_characters(
+                &serde_json::to_string(&serde_json::json!({
+                    "phase": "before_write",
+                    "spending_summary": summary,
+                    "plan": plan,
+                }))
+                .unwrap()
+            )
+        );
+        let mut out = Vec::new();
+        SpendingPreview::new(&mut out)
+            .show(Some(&summary), Some(&plan), OutputFormat::Json)
+            .unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), expected);
+
+        let extra = [("edit_scope", serde_json::json!([{"rule": 0}]))];
+        let mut out = Vec::new();
+        let mut preview = SpendingPreview::new(&mut out);
+        preview
+            .show_with(Some(&summary), None, &extra, OutputFormat::Json)
+            .unwrap();
+        assert_eq!(preview.shown().unwrap()["edit_scope"], extra[0].1);
+        let mut table = Vec::new();
+        SpendingPreview::new(&mut table)
+            .show_with(Some(&summary), None, &extra, OutputFormat::Table)
+            .unwrap();
+        let mut plain = Vec::new();
+        SpendingPreview::new(&mut plain)
+            .show(Some(&summary), None, OutputFormat::Table)
+            .unwrap();
+        assert_eq!(table, plain);
     }
 
     /// Every table line is printable ASCII, whatever the values hold.
