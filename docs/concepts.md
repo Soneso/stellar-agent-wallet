@@ -203,7 +203,11 @@ of the rule still applies.
 `per_period_stroops` must be below every `per_period_cap` of the same asset and
 window in its rule.
 Both bounds must be below every `total_budget` of the same asset in its rule.
-A policy carries at most one `unlisted` table.
+A rule carries at most one `unlisted` table.
+Several rules may carry one, and every table must equal the policy's first in
+mode, asset, both bounds, and window.
+Equal budget tables share one counter per asset across the rules that carry
+them. A rule without a table, its allow list, and its caps are unaffected.
 A missing destination, an unverified home domain, or an unsupported kind
 refuses in every mode. A muxed destination is checked by its base account.
 

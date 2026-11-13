@@ -70,7 +70,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Its `approval` mode requests approval for a verified recipient outside the
   list. Its `budget` mode admits such payments within a per-call and a
   rolling-window bound and refuses beyond them with
-  `policy.deny.unlisted_budget_exceeded`. A policy carries at most one table.
+  `policy.deny.unlisted_budget_exceeded`. A rule carries at most one table,
+  and every table of a policy equals the first.
 
 - The `total_budget` criterion bounds the debits of one asset over the life of
   a signed policy and refuses with `policy.deny.total_budget_exhausted`. A
@@ -292,6 +293,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - On an admitted mainnet MCP server, a value call under an Allow rule signs
   without an approval request. A commit also evaluates its preparation's
   rule, and a RequireApproval rule of either still needs a verified approval.
+
+- A version 2 policy loads with equal `unlisted` tables on several rules.
+  Equal `budget` tables, for example on `stellar_pay` and
+  `stellar_x402_create_payment`, share one counter per asset across the rules
+  that carry them. A rule without a table, its allow list, and its caps are
+  unaffected. Equal `deny` tables admit
+  listed recipients, and equal `approval` tables request approval for an
+  unlisted recipient. A second table in one rule, or a table that differs
+  from the policy's first, refuses to load.
 
 - The audit settlement lookup before an authorized submission answers from an
   index the audit writer keeps. Fresh or settled bytes read no audit row file
