@@ -45,6 +45,95 @@ fn fixture() -> (tempfile::TempDir, PathBuf, Arc<InMemoryTipAnchorStore>) {
     drop(AuditWriter::open(path.clone(), Some(access(&store))).unwrap());
     (dir, path, store)
 }
+
+#[test]
+fn binding_carries_tagged_rows_byte_for_byte() {
+    let (_dir, path, store) = fixture();
+    let outbox = AuditOutbox::for_log_keyed(&path, store.clone(), Zeroizing::new([0x42; 32]));
+    outbox.append(&row("one")).unwrap();
+    outbox.append(&row("two")).unwrap();
+    let bytes = fs::read(outbox.path()).unwrap();
+    assert!(bytes.starts_with(b"{\"k\":\"row\",\"g\":0,\"s\":1,"));
+    let mut binding = AuditWriter::open_for_carrier_binding(path.clone(), access(&store)).unwrap();
+    let report = binding.bind_carriers().unwrap();
+    assert_eq!((report.generation, report.carried_rows), (2, 2));
+    assert_eq!(
+        fs::read(outbox.path()).unwrap(),
+        bytes,
+        "binding preserves every byte"
+    );
+    drop(binding);
+    let _writer = AuditWriter::open(path.clone(), Some(access(&store))).unwrap();
+    let ids = request_ids(&path);
+    assert_eq!(&ids[ids.len() - 2..], ["one", "two"]);
+    assert!(fs::read(outbox.path()).unwrap().is_empty());
+}
+
+#[test]
+fn loss_acknowledgement_appends_the_tagged_prefix() {
+    let (_dir, path, store) = fixture();
+    let outbox = AuditOutbox::for_log_keyed(&path, store.clone(), Zeroizing::new([0x42; 32]));
+    outbox.append(&row("prefix")).unwrap();
+    let prefix = fs::read(outbox.path()).unwrap();
+    let commitment = store.load_outbox_state(1).unwrap().unwrap();
+    let mut bytes = prefix.clone();
+    bytes.extend_from_slice(&serde_json::to_vec(&row("stray")).unwrap());
+    bytes.push(b'\n');
+    fs::write(outbox.path(), &bytes).unwrap();
+    let before = fs::read(&path).unwrap();
+    let mut writer = AuditWriter::open_for_outbox_acknowledgement(
+        path.clone(),
+        key(),
+        store.clone(),
+        BindingHistory::NotRecorded,
+    )
+    .unwrap();
+    let mut corrupt = prefix.clone();
+    let tag_byte = corrupt.len() - 4;
+    corrupt[tag_byte] = if corrupt[tag_byte] == b'0' {
+        b'1'
+    } else {
+        b'0'
+    };
+    store
+        .store_outbox_state(1, &OutboxState::over(&[&corrupt[..corrupt.len() - 1]]))
+        .unwrap();
+    corrupt.extend_from_slice(&bytes[prefix.len()..]);
+    fs::write(outbox.path(), &corrupt).unwrap();
+    assert!(
+        matches!(
+            writer.outbox_loss(),
+            Err(WriterError::OutboxUnusable {
+                line: 1,
+                column: 1,
+                reason: "tagged record whose tag does not verify"
+            })
+        ),
+        "prefix validation refuses before revocation"
+    );
+    assert!(matches!(
+        writer.acknowledge_outbox_loss("inspection", Default::default()),
+        Err(WriterError::OutboxUnusable {
+            line: 1,
+            column: 1,
+            reason: "tagged record whose tag does not verify"
+        })
+    ));
+    assert_eq!(fs::read(&path).unwrap(), before);
+    assert_eq!(fs::read(outbox.path()).unwrap(), corrupt);
+    store.store_outbox_state(1, &commitment).unwrap();
+    fs::write(outbox.path(), &bytes).unwrap();
+    let loss = writer.outbox_loss().unwrap().unwrap();
+    assert_eq!((loss.expected_rows, loss.found_rows), (1, 2));
+    let report = writer
+        .acknowledge_outbox_loss("inspection", Default::default())
+        .unwrap();
+    assert_eq!((report.drained, report.discarded), (1, 1));
+    assert_eq!(request_ids(&path).last().unwrap(), "prefix");
+    assert!(!request_ids(&path).iter().any(|id| id == "stray"));
+    assert!(fs::read(outbox.path()).unwrap().is_empty());
+}
+
 #[cfg(unix)]
 fn replace(path: &Path) {
     let mut retired = path.as_os_str().to_os_string();

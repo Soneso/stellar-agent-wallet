@@ -1939,7 +1939,7 @@ impl AuditWriter {
         if let Some(hook) = self.drain_after_snapshot.take() {
             hook();
         }
-        if let Some(delivered) = batch.uncommitted_entries()
+        if let Some(delivered) = batch.uncommitted_entries(self.hmac_key.as_deref())
             && self.active_file_ends_with(&delivered)?
         {
             batch.clear()?;
@@ -1956,7 +1956,7 @@ impl AuditWriter {
         if batch.is_empty() {
             return Ok(0);
         }
-        let entries = batch.parse_entries()?;
+        let entries = batch.parse_entries(self.hmac_key.as_deref())?;
         let drained = entries.len();
         for entry in entries {
             self.append_checked(entry)?;
@@ -2314,7 +2314,7 @@ impl AuditWriter {
         else {
             return Ok(None);
         };
-        batch.committed_entries()?;
+        batch.committed_entries(self.hmac_key.as_deref())?;
         Ok(Some(loss))
     }
 
@@ -2382,7 +2382,9 @@ impl AuditWriter {
             .loss()
             .or_else(|| retired.as_ref().map(super::lock::RetiredChange::loss))
             .ok_or(WriterError::OutboxLossNotFound)?;
-        let entries = batch.committed_entries()?.unwrap_or_default();
+        let entries = batch
+            .committed_entries(self.hmac_key.as_deref())?
+            .unwrap_or_default();
         let discarded = batch.complete_lines().saturating_sub(entries.len());
         self.append_checked(AuditEntry::new_audit_outbox_loss_acknowledged(
             loss.expected_rows,
@@ -6599,8 +6601,11 @@ pub enum WriterError {
         line: usize,
         /// One-based column of that line at which parsing stopped.
         column: usize,
-        /// Class of the parse failure, from a closed set: `invalid JSON`,
-        /// `JSON that is not an audit entry`, or `truncated JSON`.
+        /// Class of the parse failure, from a closed set.
+        /// Legacy reasons are `invalid JSON`, `JSON that is not an audit entry`, and `truncated JSON`.
+        /// Tagged layout uses `tagged record that does not parse`.
+        /// Key refusals use `tagged record without an audit key` or `tagged record whose tag does not verify`.
+        /// Canonical form uses `tagged record that is not canonical`.
         reason: &'static str,
     },
 

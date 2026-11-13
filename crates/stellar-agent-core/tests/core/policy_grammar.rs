@@ -62,6 +62,298 @@ fn instant() -> u64 {
 const WEEK_MS: u64 = 7 * 86_400_000;
 
 #[test]
+fn unselected_kind_destination_consumes_unlisted_budget() {
+    let _clock = set_query_time_for_test(NOW_MS);
+    let engine = engine_from_criteria(&budget(10, 20));
+    let destination = contract(3);
+    let evaluated = strict(&engine, payment(6, &destination), None).unwrap();
+    assert_eq!(evaluated.decision, Decision::Allow);
+    assert_eq!(
+        evaluated.value_effects.as_ref().unwrap().recipient_class(),
+        Some(RecipientClass::Unlisted)
+    );
+    let entries = engine
+        .record_confirmed(
+            &pay(),
+            &profile(),
+            &ValueClass::Value(evaluated.value_effects.unwrap()),
+        )
+        .unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].key(), &unlisted_key());
+    assert_eq!(entries[0].amount(), 6);
+    assert_eq!(
+        engine
+            .state_store()
+            .query_window(&unlisted_key(), NOW_MS)
+            .unwrap(),
+        (6, 1)
+    );
+    assert!(matches!(
+        decide(&engine, payment(15, &destination)),
+        Decision::Deny(DenyReason::UnlistedBudgetExceeded { .. })
+    ));
+}
+
+fn g_c_budget_criterion() -> String {
+    "{ kind = \"counterparty_allowlist\", kinds = [\"G_ACCOUNT\", \"C_ACCOUNT\"], allowlist = [], unlisted = { mode = \"budget\", per_tx_stroops = 10, per_period_stroops = 20, asset = \"native\", window = \"1d\" } }".into()
+}
+
+#[test]
+fn unverified_domain_never_reaches_unlisted_mode() {
+    let identity = Identity(Some("example.com"));
+    let cache = Cache {
+        resolved: false,
+        listed: false,
+    };
+    for mode in [
+        "{ mode = \"approval\" }",
+        "{ mode = \"budget\", per_tx_stroops = 10, per_period_stroops = 20, window = \"1d\" }",
+    ] {
+        let criteria = format!(
+            "{{ kind = \"counterparty_allowlist\", kinds = [\"G_ACCOUNT\", \"C_ACCOUNT\", \"HOME_DOMAIN\"], allowlist = [\"example.com\"], unlisted = {mode} }}"
+        );
+        let engine = engine_from_criteria(&criteria);
+        let decision = engine
+            .evaluate_with_value(
+                &pay(),
+                &Value::Null,
+                &profile(),
+                payment(1, LISTED),
+                None,
+                Some(&identity),
+                Some(&cache),
+                None,
+                None,
+                NOW_MS,
+            )
+            .unwrap();
+        // The address check precedes HOME_DOMAIN in `kinds`, so its denial is
+        // the first; the unverified domain keeps it final in every mode.
+        assert_eq!(
+            decision,
+            Decision::Deny(DenyReason::CounterpartyDenied {
+                kind: "G_ACCOUNT".into(),
+                value: LISTED.into(),
+            })
+        );
+        let criterion = loaded_criterion::<CounterpartyAllowlistCriterion>(
+            &load(&v2(&rule(&criteria, "allow"))),
+            0,
+            0,
+        )
+        .clone();
+        assert_eq!(
+            classify(
+                &criterion,
+                payment(1, LISTED),
+                Some(&identity),
+                Some(&cache)
+            )
+            .unwrap(),
+            Some(RecipientClass::Unverifiable)
+        );
+        let domain_only = allowlist(CounterpartyKind::HomeDomain, &["example.com"]);
+        let tool = pay();
+        let profile = profile();
+        let store = PolicyStateStore::new();
+        let args = Value::Null;
+        let ctx = EvalContext::new(&tool, &args, "operator", &profile, &store, NOW_MS)
+            .with_value(ValueClass::single(leg(
+                ActionKind::Claim,
+                1,
+                "native",
+                Some(LISTED),
+            )))
+            .with_identity_view(&identity)
+            .with_counterparty_cache(&cache);
+        assert_eq!(
+            domain_only.recipient_class(&ctx).unwrap(),
+            Some(RecipientClass::Listed)
+        );
+        assert!(
+            matches!(domain_only.evaluate_decision(&ctx).unwrap(), Decision::Deny(DenyReason::CounterpartyDenied { kind, .. }) if kind == "HOME_DOMAIN")
+        );
+    }
+}
+
+#[test]
+fn mixed_g_c_bundle_overlay_and_confirmation() {
+    let _clock = set_query_time_for_test(NOW_MS);
+    let text = g_c_budget_criterion();
+    let document = load(&v2(&rule(&text, "allow")));
+    let criterion = loaded_criterion::<CounterpartyAllowlistCriterion>(&document, 0, 0);
+    let inners = [transfer(LISTED, 6), transfer(&contract(3), 6)];
+    let mut overlay = BundleStateOverlay::default();
+    let tool = pay();
+    let profile = profile();
+    let store = PolicyStateStore::new();
+    let ctx = EvalContext::new(&tool, &Value::Null, "operator", &profile, &store, NOW_MS);
+    for inner in &inners {
+        criterion.accumulate_overlay(&ctx, inner, &mut overlay);
+    }
+    let next = [transfer(LISTED, 9)];
+    let bundle = BundleView {
+        inners: &next,
+        overlay: &overlay,
+    };
+    let ctx = ctx.with_value(payment(9, LISTED)).with_bundle(&bundle);
+    assert!(matches!(
+        criterion.evaluate_decision(&ctx).unwrap(),
+        Decision::Deny(DenyReason::UnlistedBudgetExceeded {
+            bound: UnlistedBound::PerPeriod,
+            ..
+        })
+    ));
+    let engine = engine_from_criteria(&text);
+    assert_eq!(evaluate_bundle(&engine, &inners), Decision::Allow);
+    assert!(matches!(
+        evaluate_bundle(
+            &engine,
+            &[inners[0].clone(), inners[1].clone(), transfer(LISTED, 9)]
+        ),
+        Decision::Deny(DenyReason::BundleDenied { inner_index: 2, .. })
+    ));
+    let evaluated = strict(&engine, payment(6, &contract(3)), None).unwrap();
+    assert_eq!(
+        evaluated.value_effects.unwrap().recipient_class(),
+        Some(RecipientClass::Unlisted)
+    );
+    let entries = confirm_bundle(&engine, &inners).unwrap();
+    assert_eq!(entries.iter().map(|entry| entry.amount()).sum::<i128>(), 12);
+    assert_eq!(
+        engine
+            .state_store()
+            .query_window(&unlisted_key(), NOW_MS)
+            .unwrap(),
+        (12, 2)
+    );
+}
+
+#[test]
+fn loaded_g_c_budget_sizes_and_records() {
+    let _clock = set_query_time_for_test(NOW_MS);
+    let engine = engine_from_criteria(&g_c_budget_criterion());
+    let evaluated = strict(&engine, payment(6, LISTED), None).unwrap();
+    assert_eq!(evaluated.decision, Decision::Allow);
+    let value = ValueClass::Value(evaluated.value_effects.unwrap());
+    let entries = engine
+        .size_window_entries(&pay(), &profile(), &value, NOW_MS)
+        .unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].amount(), 6);
+    engine.record_confirmed(&pay(), &profile(), &value).unwrap();
+    assert_eq!(
+        engine
+            .state_store()
+            .query_window(&unlisted_key(), NOW_MS)
+            .unwrap(),
+        (6, 1)
+    );
+}
+
+#[test]
+fn unlisted_call_charges_every_debit_leg() {
+    let criterion =
+        g_c_budget_criterion().replace("allowlist = []", &format!("allowlist = [\"{LISTED}\"]"));
+    let engine = engine_from_criteria(&criterion);
+    let value = ValueClass::Value(ValueEffects::new(vec![
+        leg(ActionKind::Payment, 3, "native", Some(LISTED)),
+        leg(ActionKind::Payment, 4, "native", Some(&contract(3))),
+    ]));
+    let evaluated = strict(&engine, value, None).unwrap();
+    assert_eq!(evaluated.decision, Decision::Allow);
+    let entries = engine
+        .size_window_entries(
+            &pay(),
+            &profile(),
+            &ValueClass::Value(evaluated.value_effects.unwrap()),
+            NOW_MS,
+        )
+        .unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].amount(), 7);
+}
+
+#[test]
+fn opaque_signing_and_generic_inners_refuse_under_address_kinds() {
+    for mode in [
+        "{ mode = \"deny\" }",
+        "{ mode = \"approval\" }",
+        "{ mode = \"budget\", per_tx_stroops = 10, per_period_stroops = 20, window = \"1d\" }",
+    ] {
+        let raw = v2(&format!(
+            "{}allow_opaque_signing = true\n",
+            rule_for("*", &cp(mode), "allow")
+        ));
+        let engine = engine(&raw);
+        for name in [
+            "stellar_sep43_sign_transaction",
+            "stellar_sep43_sign_and_submit_transaction",
+            "stellar_sep43_sign_auth_entry",
+            "stellar_pay_commit",
+            "stellar_claim_commit",
+        ] {
+            let tool = ToolDescriptor::from_registration(&McpToolRegistration {
+                name,
+                destructive_hint: true,
+                read_only_hint: false,
+                chain_id_required: true,
+                value_kind: ToolValueKind::OpaqueSign,
+            });
+            let value = ValueClass::Opaque(
+                stellar_agent_core::policy::v1::value::OpaqueReason::RawTransactionSignature,
+            );
+            let result = engine.evaluate_with_value(
+                &tool,
+                &json!({}),
+                &profile(),
+                value,
+                None,
+                None,
+                None,
+                None,
+                None,
+                NOW_MS,
+            );
+            let Err(PolicyError::CriterionEvaluationFailed { detail }) = result else {
+                panic!("{name}: {result:?}");
+            };
+            assert_eq!(detail, missing_destination(name), "{name}");
+        }
+        let inners = [generic()];
+        let overlay = BundleStateOverlay::default();
+        let result = engine.evaluate_bundle(
+            &pay(),
+            &json!({"smart_account": contract(3), "rule_id": 1}),
+            &profile(),
+            &BundleView {
+                inners: &inners,
+                overlay: &overlay,
+            },
+        );
+        if mode.contains("budget") {
+            assert!(matches!(
+                result.unwrap(),
+                Decision::Deny(DenyReason::BundleContainsGenericKind { inner_index: 0 })
+            ));
+        } else {
+            let Err(PolicyError::CriterionEvaluationFailed { detail }) = result else {
+                panic!("{mode}: {result:?}");
+            };
+            assert_eq!(detail, missing_destination("stellar_pay"), "{mode}");
+        }
+    }
+}
+
+/// The raw-path refusal of a call that carries no `destination`.
+fn missing_destination(tool: &str) -> String {
+    format!(
+        "counterparty_allowlist: missing or non-string field 'destination' in args for tool '{tool}'"
+    )
+}
+
+#[test]
 fn window_grammar_keeps_five_values_and_rejects_30d() {
     use stellar_agent_core::policy::v1::criteria::per_period_cap::Window;
     for (name, seconds) in [
@@ -715,7 +1007,7 @@ fn second_unlisted_criterion_refuses_policy() {
             rule_for("stellar_pay", &format!("{plain}, {approval}"), "allow"),
             rule_for("stellar_create_account", &deny, "allow"),
         )),
-        "rule[1].criteria[0]: a policy carries at most one `unlisted` table; \
+        "rule[1].criteria[0]: every `unlisted` table of a policy must equal the first; \
          rule[0].criteria[1] carries the first",
     );
     check(&v2(&format!(
@@ -724,6 +1016,458 @@ fn second_unlisted_criterion_refuses_policy() {
         rule_for("stellar_create_account", &plain, "allow"),
     )))
     .unwrap();
+
+    // Two equal tables in one rule refuse with the same text.
+    refused(
+        &v2(&rule(&format!("{approval}, {approval}"), "allow")),
+        "rule[0].criteria[1]: a policy carries at most one `unlisted` table; \
+         rule[0].criteria[0] carries the first",
+    );
+    // The second table of a later rule names the first table of that rule.
+    let shared = budget(10, 20);
+    refused(
+        &v2(&format!(
+            "{}{}",
+            rule_for("stellar_pay", &shared, "allow"),
+            rule_for(
+                "stellar_x402_create_payment",
+                &format!("{shared}, {shared}"),
+                "allow"
+            ),
+        )),
+        "rule[1].criteria[1]: a policy carries at most one `unlisted` table; \
+         rule[1].criteria[0] carries the first",
+    );
+}
+
+/// An `unlisted` budget table with each field spelled out.
+fn budget_table(asset: &str, per_tx: &str, per_period: &str, window: &str) -> String {
+    cp(&format!(
+        "{{ mode = \"budget\"{asset}, per_tx_stroops = {per_tx}, \
+         per_period_stroops = {per_period}, window = \"{window}\" }}"
+    ))
+}
+
+/// The tools of the rules [`rules_with`] builds, in rule order.
+const RULE_TOOLS: [&str; 5] = [
+    "stellar_pay",
+    "stellar_x402_create_payment",
+    "stellar_x402_commit",
+    "stellar_create_account",
+    "stellar_claim",
+];
+
+/// A policy whose rules carry `criteria` in order, one rule per tool of
+/// [`RULE_TOOLS`]. More inputs than tools panic.
+fn rules_with(criteria: &[&str]) -> String {
+    assert!(
+        criteria.len() <= RULE_TOOLS.len(),
+        "rules_with takes at most {} rules, got {}",
+        RULE_TOOLS.len(),
+        criteria.len()
+    );
+    v2(&criteria
+        .iter()
+        .zip(RULE_TOOLS)
+        .map(|(criteria, tool)| rule_for(tool, criteria, "allow"))
+        .collect::<String>())
+}
+
+#[test]
+#[should_panic(expected = "rules_with takes at most 5 rules, got 6")]
+fn rules_with_refuses_more_rules_than_tools() {
+    let _ = rules_with(&[""; 6]);
+}
+
+/// Evaluates `value` strictly as a call of the tool `name`.
+fn decide_on(engine: &PolicyEngineV1, name: &'static str, value: ValueClass) -> Decision {
+    engine
+        .evaluate_with_value_full(
+            &tool(name),
+            &Value::Null,
+            &profile(),
+            value,
+            None,
+            None,
+            None,
+            None,
+            None,
+            instant(),
+        )
+        .unwrap()
+        .decision
+}
+
+/// Records a strictly evaluated call of the tool `name` as confirmed.
+fn confirm_on(engine: &PolicyEngineV1, name: &'static str, value: ValueClass) {
+    let evaluation = engine
+        .evaluate_with_value_full(
+            &tool(name),
+            &Value::Null,
+            &profile(),
+            value,
+            None,
+            None,
+            None,
+            None,
+            None,
+            instant(),
+        )
+        .unwrap();
+    assert!(
+        !matches!(evaluation.decision, Decision::Deny(_)),
+        "{name}: {evaluation:?}"
+    );
+    engine
+        .record_confirmed(
+            &tool(name),
+            &profile(),
+            &ValueClass::Value(evaluation.value_effects.unwrap()),
+        )
+        .unwrap();
+}
+
+/// The usage the shared native budget counter holds.
+fn shared_usage(engine: &PolicyEngineV1) -> (i128, u32) {
+    engine
+        .state_store()
+        .query_window(&unlisted_key(), NOW_MS)
+        .unwrap()
+}
+
+fn native_exceeded(bound: UnlistedBound, max_stroops: i128, attempted_stroops: i128) -> Decision {
+    Decision::Deny(DenyReason::UnlistedBudgetExceeded {
+        asset: "native".to_owned(),
+        bound,
+        max_stroops,
+        attempted_stroops,
+    })
+}
+
+/// Integer forms, key order, an escaped asset, and the omitted `native`
+/// asset parse to one table, and every rule carrying it draws on one counter.
+#[test]
+fn unlisted_representations_load_and_share_counter() {
+    let _clock = set_query_time_for_test(NOW_MS);
+    let forms = [
+        budget_table("", "10", "20", "1d"),
+        cp(
+            "{ window = \"1d\", per_period_stroops = 0x14, asset = \"native\", \
+            per_tx_stroops = 1_0, mode = \"budget\" }",
+        ),
+        cp(
+            "{ mode = \"budget\", per_tx_stroops = 0o12, per_period_stroops = 0b10100, \
+            window = \"1d\" }",
+        ),
+        cp(
+            "{ mode = \"budget\", per_tx_stroops = +10, per_period_stroops = \"020\", \
+            window = \"1d\" }",
+        ),
+        cp(
+            "{ mode = \"budget\", asset = \"nat\\u0069ve\", per_tx_stroops = \"+10\", \
+            per_period_stroops = \"20\", window = \"1d\" }",
+        ),
+    ];
+    let engine = engine(&rules_with(&forms.each_ref().map(String::as_str)));
+    for name in RULE_TOOLS {
+        assert_eq!(
+            decide_on(&engine, name, payment(10, UNLISTED)),
+            Decision::Allow,
+            "{name}"
+        );
+        assert_eq!(
+            decide_on(&engine, name, payment(11, UNLISTED)),
+            native_exceeded(UnlistedBound::PerTx, 10, 11),
+            "{name}"
+        );
+    }
+    confirm_on(&engine, RULE_TOOLS[0], payment(10, UNLISTED));
+    confirm_on(&engine, RULE_TOOLS[1], payment(10, UNLISTED));
+    assert_eq!(shared_usage(&engine), (20, 2));
+    for name in RULE_TOOLS {
+        assert_eq!(
+            decide_on(&engine, name, payment(1, UNLISTED)),
+            native_exceeded(UnlistedBound::PerPeriod, 20, 1),
+            "{name}"
+        );
+    }
+
+    // An omitted mode equals an explicit `deny`.
+    let deny = self::engine(&rules_with(&[&cp("{}"), &cp("{ mode = \"deny\" }")]));
+    for name in &RULE_TOOLS[..2] {
+        assert_eq!(decide_on(&deny, name, payment(1, LISTED)), Decision::Allow);
+        assert_eq!(
+            decide_on(&deny, name, payment(1, UNLISTED)),
+            Decision::Deny(DenyReason::CounterpartyDenied {
+                kind: "G_ACCOUNT".to_owned(),
+                value: UNLISTED.to_owned(),
+            }),
+            "{name}"
+        );
+    }
+}
+
+/// Asset aliases that parse to different strings are unequal tables; the
+/// same alias on every rule loads and shares one counter.
+#[test]
+fn unlisted_asset_aliases_compare_as_parsed() {
+    let _clock = set_query_time_for_test(NOW_MS);
+    let native = budget_table(", asset = \"native\"", "10", "20", "1d");
+    let native_sac = sac("native");
+    for alias in ["XLM", "NATIVE", "xlm", native_sac.as_str()] {
+        refused(
+            &rules_with(&[
+                &native,
+                &budget_table(&format!(", asset = \"{alias}\""), "10", "20", "1d"),
+            ]),
+            "rule[1].criteria[0]: every `unlisted` table of a policy must equal the first; \
+             rule[0].criteria[0] carries the first",
+        );
+    }
+    let xlm = budget_table(", asset = \"XLM\"", "10", "20", "1d");
+    let engine = engine(&rules_with(&[&xlm, &xlm]));
+    confirm_on(&engine, RULE_TOOLS[0], payment(10, UNLISTED));
+    confirm_on(&engine, RULE_TOOLS[1], payment(10, UNLISTED));
+    for name in &RULE_TOOLS[..2] {
+        assert!(
+            matches!(
+                decide_on(&engine, name, payment(1, UNLISTED)),
+                Decision::Deny(DenyReason::UnlistedBudgetExceeded {
+                    bound: UnlistedBound::PerPeriod,
+                    max_stroops: 20,
+                    attempted_stroops: 1,
+                    ..
+                })
+            ),
+            "{name}"
+        );
+    }
+}
+
+/// Three and four equal rules load around a rule without a table; the rules
+/// with the table share one counter and the rule without it is unaffected.
+#[test]
+fn many_equal_unlisted_rules_share_counter_around_a_plain_rule() {
+    let _clock = set_query_time_for_test(NOW_MS);
+    let shared = budget(10, 20);
+    check(&rules_with(&[&shared, &shared, "", &shared])).unwrap();
+    let engine = engine(&rules_with(&[&shared, "", &shared, &shared, &shared]));
+    confirm_on(&engine, RULE_TOOLS[0], payment(10, UNLISTED));
+    confirm_on(&engine, RULE_TOOLS[4], payment(10, UNLISTED));
+    for name in [RULE_TOOLS[0], RULE_TOOLS[2], RULE_TOOLS[3], RULE_TOOLS[4]] {
+        assert_eq!(
+            decide_on(&engine, name, payment(1, UNLISTED)),
+            native_exceeded(UnlistedBound::PerPeriod, 20, 1),
+            "{name}"
+        );
+    }
+    assert_eq!(
+        decide_on(&engine, RULE_TOOLS[1], payment(1000, UNLISTED)),
+        Decision::Allow
+    );
+    confirm_on(&engine, RULE_TOOLS[1], payment(1000, UNLISTED));
+    assert_eq!(shared_usage(&engine), (20, 2));
+}
+
+/// The first table may sit at a later rule and criterion; a third table
+/// that differs is refused naming that first position.
+#[test]
+fn first_unlisted_table_at_a_later_position() {
+    let _clock = set_query_time_for_test(NOW_MS);
+    let shared = budget(10, 20);
+    let capped =
+        format!("{{ kind = \"per_tx_cap\", asset = \"native\", max_stroops = 1000 }}, {shared}");
+    let engine = engine(&rules_with(&["", &capped, &shared]));
+    confirm_on(&engine, RULE_TOOLS[1], payment(10, UNLISTED));
+    confirm_on(&engine, RULE_TOOLS[2], payment(10, UNLISTED));
+    for name in &RULE_TOOLS[1..3] {
+        assert_eq!(
+            decide_on(&engine, name, payment(1, UNLISTED)),
+            native_exceeded(UnlistedBound::PerPeriod, 20, 1),
+            "{name}"
+        );
+    }
+    assert_eq!(
+        decide_on(&engine, RULE_TOOLS[0], payment(1, UNLISTED)),
+        Decision::Allow
+    );
+    refused(
+        &rules_with(&["", &capped, &shared, &budget(10, 21)]),
+        "rule[3].criteria[0]: every `unlisted` table of a policy must equal the first; \
+         rule[1].criteria[1] carries the first",
+    );
+}
+
+fn bundle_on(
+    engine: &PolicyEngineV1,
+    name: &'static str,
+    inners: &[InnerOpDescriptor],
+) -> Decision {
+    let overlay = BundleStateOverlay::default();
+    engine
+        .evaluate_bundle(
+            &tool(name),
+            &Value::Null,
+            &profile(),
+            &BundleView {
+                inners,
+                overlay: &overlay,
+            },
+        )
+        .unwrap()
+}
+
+fn confirm_bundle_on(engine: &PolicyEngineV1, name: &'static str, inners: &[InnerOpDescriptor]) {
+    let overlay = BundleStateOverlay::default();
+    engine
+        .record_confirmed_bundle(
+            &tool(name),
+            &profile(),
+            &BundleView {
+                inners,
+                overlay: &overlay,
+            },
+        )
+        .unwrap();
+}
+
+/// A bundle under one of two sharing rules counts against the shared
+/// counter, writes nothing when refused, and records on confirmation.
+#[test]
+fn bundles_across_sharing_rules_use_one_counter() {
+    let _clock = set_query_time_for_test(NOW_MS);
+    let shared = budget(10, 20);
+    let engine = engine(&rules_with(&[&shared, &shared]));
+    let [pay_tool, x402] = [RULE_TOOLS[0], RULE_TOOLS[1]];
+    let exceeded = |attempted_stroops| {
+        bundle_denied(
+            2,
+            DenyReason::UnlistedBudgetExceeded {
+                asset: "native".to_owned(),
+                bound: UnlistedBound::PerPeriod,
+                max_stroops: 20,
+                attempted_stroops,
+            },
+        )
+    };
+    let three = [
+        transfer(UNLISTED, 10),
+        transfer(UNLISTED, 10),
+        transfer(UNLISTED, 1),
+    ];
+    for name in [pay_tool, x402] {
+        assert_eq!(bundle_on(&engine, name, &three), exceeded(1), "{name}");
+    }
+    assert_eq!(shared_usage(&engine), (0, 0));
+
+    let two = [transfer(UNLISTED, 10), transfer(UNLISTED, 10)];
+    assert_eq!(bundle_on(&engine, x402, &two), Decision::Allow);
+    confirm_bundle_on(&engine, x402, &two);
+    assert_eq!(shared_usage(&engine), (20, 2));
+    assert_eq!(
+        decide_on(&engine, pay_tool, payment(1, UNLISTED)),
+        native_exceeded(UnlistedBound::PerPeriod, 20, 1)
+    );
+}
+
+/// Equal tables on rules with different allow lists: each rule charges only
+/// recipients outside its own list, and all charges share one counter.
+#[test]
+fn equal_unlisted_tables_with_different_allow_lists() {
+    let _clock = set_query_time_for_test(NOW_MS);
+    let listing = |account: &str| {
+        format!(
+            "{{ kind = \"counterparty_allowlist\", kinds = [\"G_ACCOUNT\"], \
+             allowlist = [\"{account}\"], unlisted = {{ mode = \"budget\", \
+             per_tx_stroops = 10, per_period_stroops = 20, window = \"1d\" }} }}"
+        )
+    };
+    let engine = engine(&rules_with(&[&listing(LISTED), &listing(UNLISTED)]));
+    let [pay_tool, x402] = [RULE_TOOLS[0], RULE_TOOLS[1]];
+    confirm_on(&engine, pay_tool, payment(1000, LISTED));
+    confirm_on(&engine, x402, payment(1000, UNLISTED));
+    assert_eq!(shared_usage(&engine), (0, 0));
+    confirm_on(&engine, pay_tool, payment(10, UNLISTED));
+    confirm_on(&engine, x402, payment(10, LISTED));
+    assert_eq!(shared_usage(&engine), (20, 2));
+    assert_eq!(
+        decide_on(&engine, pay_tool, payment(1, UNLISTED)),
+        native_exceeded(UnlistedBound::PerPeriod, 20, 1)
+    );
+    assert_eq!(
+        decide_on(&engine, x402, payment(1, LISTED)),
+        native_exceeded(UnlistedBound::PerPeriod, 20, 1)
+    );
+    assert_eq!(
+        decide_on(&engine, pay_tool, payment(1000, LISTED)),
+        Decision::Allow
+    );
+    assert_eq!(
+        decide_on(&engine, x402, payment(1000, UNLISTED)),
+        Decision::Allow
+    );
+}
+
+#[test]
+fn equal_unlisted_tables_load_across_rules() {
+    let shared = budget(10, 20);
+    check(&rules_with(&[&shared, &shared])).unwrap();
+
+    // A rule without a table between two equal tables.
+    check(&rules_with(&[&shared, "", &shared])).unwrap();
+
+    // Equality is on the parsed table: the `native` default and a decimal
+    // string bound equal their spelled-out forms.
+    check(&rules_with(&[
+        &budget_table("", "10", "20", "1d"),
+        &budget_table(", asset = \"native\"", "\"10\"", "20", "1d"),
+    ]))
+    .unwrap();
+
+    // A list entry gains no validation from a second table.
+    let odd_list = "{ kind = \"counterparty_allowlist\", kinds = [\"G_ACCOUNT\"], \
+                    allowlist = [\"not-a-strkey\"], unlisted = { mode = \"approval\" } }";
+    check(&rules_with(&[odd_list])).unwrap();
+    check(&rules_with(&[odd_list, odd_list])).unwrap();
+
+    // Each table is checked against the hard caps of its own rule.
+    refused(
+        &rules_with(&[
+            &shared,
+            &format!("{shared}, {{ kind = \"per_tx_cap\", asset = \"native\", max_stroops = 10 }}"),
+        ]),
+        "rule[1].criteria[0].unlisted: `per_tx_stroops` must be less than the `per_tx_cap` bound",
+    );
+}
+
+#[test]
+fn unequal_unlisted_tables_refuse_policy() {
+    let first = budget_table(", asset = \"native\"", "10", "20", "1d");
+    let unequal = "rule[1].criteria[0]: every `unlisted` table of a policy must equal the \
+                   first; rule[0].criteria[0] carries the first";
+    let usd = format!(", asset = \"{}\"", usd());
+    for (field, second) in [
+        ("asset", budget_table(&usd, "10", "20", "1d")),
+        (
+            "window",
+            budget_table(", asset = \"native\"", "10", "20", "1h"),
+        ),
+        (
+            "per_tx",
+            budget_table(", asset = \"native\"", "11", "20", "1d"),
+        ),
+        (
+            "per_period",
+            budget_table(", asset = \"native\"", "10", "21", "1d"),
+        ),
+    ] {
+        check(&rules_with(&[&second])).unwrap_or_else(|e| panic!("{field}: {e:?}"));
+        refused(&rules_with(&[&first, &second]), unequal);
+    }
+    refused(
+        &rules_with(&[&cp("{ mode = \"approval\" }"), &first]),
+        unequal,
+    );
 }
 
 #[test]
