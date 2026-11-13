@@ -25,8 +25,53 @@ impl Binary {
 
     pub(super) fn command(&self, args: &[&str]) -> Command {
         let mut command = Command::new(&self.path);
+        command.args(args);
+        self.isolate(&mut command);
         command
-            .args(args)
+    }
+
+    /// Runs the copy with `args` on a main thread whose stack is at most
+    /// [`MAIN_STACK_KIB`].
+    ///
+    /// Windows gives every main thread that stack. On Unix a shell lowers the
+    /// stack limit and then executes the copy; a limit it cannot set fails
+    /// the run. The shell's exec meets the same busy-file window as a direct
+    /// start, so a run whose exec reports a busy text file is retried as
+    /// [`Self::retry_start`] retries, at most 50 tries, 20 ms apart.
+    fn run_on_small_main_stack(&self, args: &[&str]) -> Output {
+        #[cfg(unix)]
+        {
+            let mut attempts = 0;
+            loop {
+                attempts += 1;
+                let mut command = Command::new("sh");
+                command
+                    .arg("-c")
+                    .arg(format!("ulimit -s {MAIN_STACK_KIB} && exec \"$0\" \"$@\""))
+                    .arg(&self.path)
+                    .args(args);
+                self.isolate(&mut command);
+                let output = command.output().expect("shell runs");
+                let busy = output.stdout.is_empty()
+                    && String::from_utf8_lossy(&output.stderr).contains("Text file busy");
+                if !busy || attempts >= 50 {
+                    return output;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+        #[cfg(windows)]
+        {
+            let mut command = Command::new(&self.path);
+            command.args(args);
+            self.isolate(&mut command);
+            Self::output(&mut command).expect("copied executable runs")
+        }
+    }
+
+    /// Points the command at the scratch home and the test keyring.
+    fn isolate(&self, command: &mut Command) {
+        command
             .current_dir(self.home.path())
             .env("STELLAR_AGENT_HOME", self.home.path())
             .env(
@@ -41,7 +86,6 @@ impl Binary {
                 "STELLAR_AGENT_HEADLESS_KEYRING_KEY",
                 "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
             );
-        command
     }
 
     fn retry_start<T>(mut start: impl FnMut() -> std::io::Result<T>) -> std::io::Result<T> {
@@ -161,6 +205,29 @@ fn mcp_serve_only_as_first_two_args() {
             serde_json::from_slice(&output.stdout).expect("usage envelope");
         assert_eq!(envelope["ok"], false);
         assert_eq!(envelope["error"]["code"], code);
+    }
+}
+
+/// Main-thread stack, in KiB, that every role must run on: the stack Windows
+/// gives the main thread of the executable.
+const MAIN_STACK_KIB: u32 = 1024;
+
+#[test]
+#[serial]
+fn every_role_runs_on_a_windows_sized_main_stack() {
+    for (name, args, display_name) in [
+        ("stellar-agent", &["--version"][..], "stellar-agent"),
+        (
+            "wallet-x",
+            &["mcp", "serve", "--version"][..],
+            "stellar-agent-mcp",
+        ),
+        ("stellar-agent-mcp", &["--version"][..], "stellar-agent-mcp"),
+    ] {
+        version(
+            &Binary::new(name).run_on_small_main_stack(args),
+            display_name,
+        );
     }
 }
 
