@@ -1344,11 +1344,11 @@ Trustline table rows read
 JSON uses `summary.kind: "trustline"` with the full holder and issuer.
 Its `limit_stroops` is a decimal string, or `null` for unlimited.
 
-For a consumed x402 approval, the tombstone's `tx_hash` holds the final-envelope
-digest. It is not a chain transaction hash. The digest hashes the final
-envelope's base64 text. JSON reports it redacted in `summary.tx_hash_redacted`.
+For a consumed x402 approval, the tombstone's `tx_hash` holds the payment digest.
+It is not a chain transaction hash. Mainnet hashes the final envelope's base64 text.
+Testnet hashes the signed authorization entries' XDR vector. JSON reports it redacted in `summary.tx_hash_redacted`.
 Its table row reads
-`spent (X402Payment), final-envelope digest <redacted digest>, outcome <outcome>`.
+`spent (X402Payment), payment digest <redacted digest>, outcome <outcome>`.
 
 ### `approve serve`
 
@@ -1871,3 +1871,20 @@ Only the endpoints stored in the profile authorize charge closure. Endpoint over
 Environment variables and programmatic overlays do not change which endpoints authorize charge closure.
 
 Snapshots containing signed intents or intent links use version 9. Records missing required intent fields refuse as unreadable. Readers that cannot account for the format refuse current and prepared snapshots.
+
+### x402 owner approval
+
+Supply `approval_nonce` with `approval_attestation` when the policy requires approval, on either network.
+On testnet, a clock reading before approval creation refuses the approval without consuming it.
+
+When the policy requires approval, the x402 tools queue the payment and return
+`data.approval`. The owner approves with `stellar-agent approve`.
+Repeat with `approval_nonce` and `approval_attestation` to pay once.
+Queueing signs nothing, reads no key, and runs no SEP-10.
+On mainnet, Allow without proof pays in one call; a supplied proof must verify.
+
+The CLI labels spent x402 approvals with `payment digest`.
+On mainnet, this hashes the final envelope's base64 text.
+On testnet, this hashes the XDR vector of signed authorization entries.
+Testnet spends approval inside the transmit gate before its authorized audit row and signed RPC request.
+Mainnet retains its consumption after payload release authorization.

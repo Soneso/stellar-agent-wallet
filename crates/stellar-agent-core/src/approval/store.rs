@@ -5767,8 +5767,9 @@ impl PendingApprovalStore {
     /// about the outcome; the entry's summary data (destination, amount,
     /// asset, and so on) does not survive. The value is the transaction hash
     /// for a submission and a kind-specific digest otherwise: the
-    /// final-envelope digest of an x402 payment, or the proposal digest of a
-    /// rule proposal, whose outcome stays `unknown`.
+    /// final-envelope digest of a mainnet x402 payment, or its signed-authorization
+    /// digest on testnet. Rule proposals carry their proposal digest.
+    /// These digest outcomes stay `unknown`.
     ///
     /// The entry keeps its `attestation_blob_b64` and its original
     /// `created_at_unix_ms` / `expires_at_unix_ms`. [`Self::gc_expired`] and

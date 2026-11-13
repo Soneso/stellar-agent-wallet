@@ -246,10 +246,9 @@ The wallet signs x402 v2 Exact Stellar payments without submitting:
 identity gate against a `home_domain` first; `stellar_x402_parse_receipt` decodes
 the settlement receipt. See [protocols.md](protocols.md) for the flow.
 
-On an admitted mainnet server, call either payment tool without approval
-arguments to obtain pending approval. After CLI approval, repeat the same request
-with both approval arguments. For authenticated payments, keep the approved home
-domain unchanged.
+Under RequireApproval, call either payment tool without approval arguments to obtain pending approval.
+After CLI approval, repeat the same request with both approval arguments.
+Keep the authenticated home domain unchanged. Mainnet Allow without proof pays in one call.
 
 ## Sponsored MPP charges
 
@@ -429,3 +428,14 @@ An open intent without an authenticated purpose permanently blocks reset for thi
 Retained intents close only through the profile's stored secondary endpoint. Add one to the profile.
 
 The profile's stored endpoint configuration is unreadable. Retained intents close only through stored endpoints that load.
+
+### x402 owner approval
+
+Supply `approval_nonce` with `approval_attestation` when the policy requires approval, on either network.
+On testnet, a clock reading before approval creation refuses the approval without consuming it.
+
+When the policy requires approval, the x402 tools queue the payment and return
+`data.approval`. The owner approves with `stellar-agent approve`.
+Repeat with `approval_nonce` and `approval_attestation` to pay once.
+Queueing signs nothing, reads no key, and runs no SEP-10.
+On mainnet, Allow without proof pays in one call; a supplied proof must verify.

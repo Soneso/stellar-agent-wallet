@@ -338,14 +338,13 @@ fn render_summary_line(view: &PendingApprovalView) -> String {
         ApprovalSummaryView::Rejected { original_kind_name } => {
             format!("rejected ({original_kind_name})")
         }
-        // An x402 payment tombstone holds the digest of the final envelope,
-        // never a chain hash, so its value is named for what it is.
+        // An x402 tombstone identifies the payment with a network-specific digest.
         ApprovalSummaryView::Consumed {
             original_kind_name,
             tx_hash_redacted,
             outcome,
         } if original_kind_name == "X402Payment" => format!(
-            "spent ({original_kind_name}), final-envelope digest {tx_hash_redacted}, outcome {outcome}"
+            "spent ({original_kind_name}), payment digest {tx_hash_redacted}, outcome {outcome}"
         ),
         // A rule-proposal tombstone holds the proposal digest the operator
         // attested, written before the install sends anything.
@@ -758,10 +757,9 @@ mod tests {
         (view, redacted)
     }
 
-    /// A consumed x402 payment approval names its value as the
-    /// final-envelope digest.
+    /// A consumed x402 payment approval names its value as the payment digest.
     #[test]
-    fn a_consumed_x402_approval_names_the_final_envelope_digest() {
+    fn a_consumed_x402_approval_names_the_payment_digest() {
         use stellar_xdr::{
             AccountId, ContractId, Hash, InvokeContractArgs, PublicKey, ScAddress, ScVal,
             SorobanAuthorizedFunction, SorobanAuthorizedInvocation, Uint256,
@@ -795,7 +793,7 @@ mod tests {
         let (view, redacted) = consumed_view(entry);
         assert_eq!(
             render_summary_line(&view),
-            format!("spent (X402Payment), final-envelope digest {redacted}, outcome confirmed")
+            format!("spent (X402Payment), payment digest {redacted}, outcome confirmed")
         );
     }
 
