@@ -50,7 +50,7 @@
     document.documentElement.setAttribute("data-state", state);
   }
 
-  function login() {
+  function login(retries) {
     setStatus("Requesting challenge\u2026", "busy");
     return fetch("/login/challenge", { method: "POST" })
       .then(function (resp) {
@@ -78,6 +78,17 @@
         });
       })
       .then(function (resp) {
+        if (resp.status === 503) {
+          return resp.json().then(function (body) {
+            if (body.error === "store_busy" && body.retriable === true) {
+              if (retries > 0) {
+                return login(retries - 1);
+              }
+              throw new Error("store_busy");
+            }
+            throw new Error("login_failed");
+          });
+        }
         if (!resp.ok) {
           throw new Error("login_failed");
         }
@@ -85,15 +96,18 @@
         var data = JSON.parse(document.getElementById("login-destination").textContent);
         window.location.href = data.destination;
       })
-      .catch(function () {
-        setStatus("Sign-in failed. Try again.", "error");
+      .catch(function (error) {
+        var message = error.message === "store_busy"
+          ? "Wallet is busy. Try again."
+          : "Sign-in failed. Try again.";
+        setStatus(message, "error");
       });
   }
 
   var btn = document.getElementById("login-btn");
   if (btn) {
     btn.addEventListener("click", function () {
-      login();
+      login(3);
     });
   }
 })();

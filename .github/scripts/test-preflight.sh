@@ -137,7 +137,7 @@ coverage	cargo llvm-cov --workspace --no-default-features --features test-helper
 coverage-floors	python3 .github/scripts/check-coverage.py cov-feature-off.json --configuration feature-off
 coverage:feature-on	cargo llvm-cov --workspace --features mainnet-write,test-helpers,test-hooks,test-loopback,verifier-registry --json --output-path cov-feature-on.json
 coverage-floors:feature-on	python3 .github/scripts/check-coverage.py cov-feature-on.json --configuration feature-on
-inbox-js	node --test crates/stellar-agent-approval-ui/src/web/app_shared.test.mjs crates/stellar-agent-webauthn-bridge/src/web/glue.test.mjs
+inbox-js	node --test crates/stellar-agent-approval-ui/src/web/app_shared.test.mjs crates/stellar-agent-webauthn-bridge/src/web/glue.test.mjs crates/stellar-agent-approval-remote/src/web/signed-login.test.mjs
 mainnet-presence-js	node --test crates/stellar-agent-approval-ui/src/web/mainnet-presence.test.mjs
 interop:mpp	.github/scripts/test-mpp-interop.sh
 interop:sdk-v17	.github/scripts/test-sdk-v17-interop.sh
