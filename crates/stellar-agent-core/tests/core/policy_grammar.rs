@@ -62,6 +62,298 @@ fn instant() -> u64 {
 const WEEK_MS: u64 = 7 * 86_400_000;
 
 #[test]
+fn unselected_kind_destination_consumes_unlisted_budget() {
+    let _clock = set_query_time_for_test(NOW_MS);
+    let engine = engine_from_criteria(&budget(10, 20));
+    let destination = contract(3);
+    let evaluated = strict(&engine, payment(6, &destination), None).unwrap();
+    assert_eq!(evaluated.decision, Decision::Allow);
+    assert_eq!(
+        evaluated.value_effects.as_ref().unwrap().recipient_class(),
+        Some(RecipientClass::Unlisted)
+    );
+    let entries = engine
+        .record_confirmed(
+            &pay(),
+            &profile(),
+            &ValueClass::Value(evaluated.value_effects.unwrap()),
+        )
+        .unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].key(), &unlisted_key());
+    assert_eq!(entries[0].amount(), 6);
+    assert_eq!(
+        engine
+            .state_store()
+            .query_window(&unlisted_key(), NOW_MS)
+            .unwrap(),
+        (6, 1)
+    );
+    assert!(matches!(
+        decide(&engine, payment(15, &destination)),
+        Decision::Deny(DenyReason::UnlistedBudgetExceeded { .. })
+    ));
+}
+
+fn g_c_budget_criterion() -> String {
+    "{ kind = \"counterparty_allowlist\", kinds = [\"G_ACCOUNT\", \"C_ACCOUNT\"], allowlist = [], unlisted = { mode = \"budget\", per_tx_stroops = 10, per_period_stroops = 20, asset = \"native\", window = \"1d\" } }".into()
+}
+
+#[test]
+fn unverified_domain_never_reaches_unlisted_mode() {
+    let identity = Identity(Some("example.com"));
+    let cache = Cache {
+        resolved: false,
+        listed: false,
+    };
+    for mode in [
+        "{ mode = \"approval\" }",
+        "{ mode = \"budget\", per_tx_stroops = 10, per_period_stroops = 20, window = \"1d\" }",
+    ] {
+        let criteria = format!(
+            "{{ kind = \"counterparty_allowlist\", kinds = [\"G_ACCOUNT\", \"C_ACCOUNT\", \"HOME_DOMAIN\"], allowlist = [\"example.com\"], unlisted = {mode} }}"
+        );
+        let engine = engine_from_criteria(&criteria);
+        let decision = engine
+            .evaluate_with_value(
+                &pay(),
+                &Value::Null,
+                &profile(),
+                payment(1, LISTED),
+                None,
+                Some(&identity),
+                Some(&cache),
+                None,
+                None,
+                NOW_MS,
+            )
+            .unwrap();
+        // The address check precedes HOME_DOMAIN in `kinds`, so its denial is
+        // the first; the unverified domain keeps it final in every mode.
+        assert_eq!(
+            decision,
+            Decision::Deny(DenyReason::CounterpartyDenied {
+                kind: "G_ACCOUNT".into(),
+                value: LISTED.into(),
+            })
+        );
+        let criterion = loaded_criterion::<CounterpartyAllowlistCriterion>(
+            &load(&v2(&rule(&criteria, "allow"))),
+            0,
+            0,
+        )
+        .clone();
+        assert_eq!(
+            classify(
+                &criterion,
+                payment(1, LISTED),
+                Some(&identity),
+                Some(&cache)
+            )
+            .unwrap(),
+            Some(RecipientClass::Unverifiable)
+        );
+        let domain_only = allowlist(CounterpartyKind::HomeDomain, &["example.com"]);
+        let tool = pay();
+        let profile = profile();
+        let store = PolicyStateStore::new();
+        let args = Value::Null;
+        let ctx = EvalContext::new(&tool, &args, "operator", &profile, &store, NOW_MS)
+            .with_value(ValueClass::single(leg(
+                ActionKind::Claim,
+                1,
+                "native",
+                Some(LISTED),
+            )))
+            .with_identity_view(&identity)
+            .with_counterparty_cache(&cache);
+        assert_eq!(
+            domain_only.recipient_class(&ctx).unwrap(),
+            Some(RecipientClass::Listed)
+        );
+        assert!(
+            matches!(domain_only.evaluate_decision(&ctx).unwrap(), Decision::Deny(DenyReason::CounterpartyDenied { kind, .. }) if kind == "HOME_DOMAIN")
+        );
+    }
+}
+
+#[test]
+fn mixed_g_c_bundle_overlay_and_confirmation() {
+    let _clock = set_query_time_for_test(NOW_MS);
+    let text = g_c_budget_criterion();
+    let document = load(&v2(&rule(&text, "allow")));
+    let criterion = loaded_criterion::<CounterpartyAllowlistCriterion>(&document, 0, 0);
+    let inners = [transfer(LISTED, 6), transfer(&contract(3), 6)];
+    let mut overlay = BundleStateOverlay::default();
+    let tool = pay();
+    let profile = profile();
+    let store = PolicyStateStore::new();
+    let ctx = EvalContext::new(&tool, &Value::Null, "operator", &profile, &store, NOW_MS);
+    for inner in &inners {
+        criterion.accumulate_overlay(&ctx, inner, &mut overlay);
+    }
+    let next = [transfer(LISTED, 9)];
+    let bundle = BundleView {
+        inners: &next,
+        overlay: &overlay,
+    };
+    let ctx = ctx.with_value(payment(9, LISTED)).with_bundle(&bundle);
+    assert!(matches!(
+        criterion.evaluate_decision(&ctx).unwrap(),
+        Decision::Deny(DenyReason::UnlistedBudgetExceeded {
+            bound: UnlistedBound::PerPeriod,
+            ..
+        })
+    ));
+    let engine = engine_from_criteria(&text);
+    assert_eq!(evaluate_bundle(&engine, &inners), Decision::Allow);
+    assert!(matches!(
+        evaluate_bundle(
+            &engine,
+            &[inners[0].clone(), inners[1].clone(), transfer(LISTED, 9)]
+        ),
+        Decision::Deny(DenyReason::BundleDenied { inner_index: 2, .. })
+    ));
+    let evaluated = strict(&engine, payment(6, &contract(3)), None).unwrap();
+    assert_eq!(
+        evaluated.value_effects.unwrap().recipient_class(),
+        Some(RecipientClass::Unlisted)
+    );
+    let entries = confirm_bundle(&engine, &inners).unwrap();
+    assert_eq!(entries.iter().map(|entry| entry.amount()).sum::<i128>(), 12);
+    assert_eq!(
+        engine
+            .state_store()
+            .query_window(&unlisted_key(), NOW_MS)
+            .unwrap(),
+        (12, 2)
+    );
+}
+
+#[test]
+fn loaded_g_c_budget_sizes_and_records() {
+    let _clock = set_query_time_for_test(NOW_MS);
+    let engine = engine_from_criteria(&g_c_budget_criterion());
+    let evaluated = strict(&engine, payment(6, LISTED), None).unwrap();
+    assert_eq!(evaluated.decision, Decision::Allow);
+    let value = ValueClass::Value(evaluated.value_effects.unwrap());
+    let entries = engine
+        .size_window_entries(&pay(), &profile(), &value, NOW_MS)
+        .unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].amount(), 6);
+    engine.record_confirmed(&pay(), &profile(), &value).unwrap();
+    assert_eq!(
+        engine
+            .state_store()
+            .query_window(&unlisted_key(), NOW_MS)
+            .unwrap(),
+        (6, 1)
+    );
+}
+
+#[test]
+fn unlisted_call_charges_every_debit_leg() {
+    let criterion =
+        g_c_budget_criterion().replace("allowlist = []", &format!("allowlist = [\"{LISTED}\"]"));
+    let engine = engine_from_criteria(&criterion);
+    let value = ValueClass::Value(ValueEffects::new(vec![
+        leg(ActionKind::Payment, 3, "native", Some(LISTED)),
+        leg(ActionKind::Payment, 4, "native", Some(&contract(3))),
+    ]));
+    let evaluated = strict(&engine, value, None).unwrap();
+    assert_eq!(evaluated.decision, Decision::Allow);
+    let entries = engine
+        .size_window_entries(
+            &pay(),
+            &profile(),
+            &ValueClass::Value(evaluated.value_effects.unwrap()),
+            NOW_MS,
+        )
+        .unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].amount(), 7);
+}
+
+#[test]
+fn opaque_signing_and_generic_inners_refuse_under_address_kinds() {
+    for mode in [
+        "{ mode = \"deny\" }",
+        "{ mode = \"approval\" }",
+        "{ mode = \"budget\", per_tx_stroops = 10, per_period_stroops = 20, window = \"1d\" }",
+    ] {
+        let raw = v2(&format!(
+            "{}allow_opaque_signing = true\n",
+            rule_for("*", &cp(mode), "allow")
+        ));
+        let engine = engine(&raw);
+        for name in [
+            "stellar_sep43_sign_transaction",
+            "stellar_sep43_sign_and_submit_transaction",
+            "stellar_sep43_sign_auth_entry",
+            "stellar_pay_commit",
+            "stellar_claim_commit",
+        ] {
+            let tool = ToolDescriptor::from_registration(&McpToolRegistration {
+                name,
+                destructive_hint: true,
+                read_only_hint: false,
+                chain_id_required: true,
+                value_kind: ToolValueKind::OpaqueSign,
+            });
+            let value = ValueClass::Opaque(
+                stellar_agent_core::policy::v1::value::OpaqueReason::RawTransactionSignature,
+            );
+            let result = engine.evaluate_with_value(
+                &tool,
+                &json!({}),
+                &profile(),
+                value,
+                None,
+                None,
+                None,
+                None,
+                None,
+                NOW_MS,
+            );
+            let Err(PolicyError::CriterionEvaluationFailed { detail }) = result else {
+                panic!("{name}: {result:?}");
+            };
+            assert_eq!(detail, missing_destination(name), "{name}");
+        }
+        let inners = [generic()];
+        let overlay = BundleStateOverlay::default();
+        let result = engine.evaluate_bundle(
+            &pay(),
+            &json!({"smart_account": contract(3), "rule_id": 1}),
+            &profile(),
+            &BundleView {
+                inners: &inners,
+                overlay: &overlay,
+            },
+        );
+        if mode.contains("budget") {
+            assert!(matches!(
+                result.unwrap(),
+                Decision::Deny(DenyReason::BundleContainsGenericKind { inner_index: 0 })
+            ));
+        } else {
+            let Err(PolicyError::CriterionEvaluationFailed { detail }) = result else {
+                panic!("{mode}: {result:?}");
+            };
+            assert_eq!(detail, missing_destination("stellar_pay"), "{mode}");
+        }
+    }
+}
+
+/// The raw-path refusal of a call that carries no `destination`.
+fn missing_destination(tool: &str) -> String {
+    format!(
+        "counterparty_allowlist: missing or non-string field 'destination' in args for tool '{tool}'"
+    )
+}
+
+#[test]
 fn window_grammar_keeps_five_values_and_rejects_30d() {
     use stellar_agent_core::policy::v1::criteria::per_period_cap::Window;
     for (name, seconds) in [

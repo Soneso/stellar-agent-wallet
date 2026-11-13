@@ -109,6 +109,51 @@ pub struct StellarToolsetInvokeArgs {
     pub args: serde_json::Value,
 }
 
+/// Resolves payment effects for an outer gate without mainnet context.
+/// Commit effects come from the envelope; preparation uses routed arguments.
+fn toolset_payment_value(
+    action: &str,
+    args: &serde_json::Value,
+    chain: Option<&str>,
+    has_mainnet_context: bool,
+) -> Option<stellar_agent_core::policy::v1::ValueClass> {
+    use stellar_agent_core::envelope_decode::decode_authoritative_args;
+    use stellar_agent_core::policy::v1::value::derive_value_class;
+    if has_mainnet_context {
+        return None;
+    }
+    let object = args.as_object()?;
+    match action {
+        "stellar_pay_commit" => object
+            .get("envelope_xdr")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|envelope| decode_authoritative_args(envelope, "stellar_pay_commit").ok())
+            .map(|authoritative| derive_value_class("stellar_pay_commit", &authoritative)),
+        "stellar_pay" => {
+            let mut merged = object.clone();
+            if let Some(chain) = chain.filter(|chain| !chain.is_empty()) {
+                merged.insert("chain_id".into(), chain.into());
+            }
+            let fields: GatedPaymentFields = serde_json::from_value(args.clone()).ok()?;
+            let (_, amount) = super::pay::parse_asset_and_amount(
+                &fields.asset,
+                fields.amount,
+                fields.amount_in_stroops,
+            )
+            .ok()?;
+            merged.insert(
+                "amount_stroops".into(),
+                amount.as_stroops().to_string().into(),
+            );
+            Some(derive_value_class(
+                "stellar_pay",
+                &serde_json::Value::Object(merged),
+            ))
+        }
+        _ => None,
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Tool router impl block
 // ─────────────────────────────────────────────────────────────────────────────
@@ -289,15 +334,25 @@ impl WalletServer {
             "toolset": &toolset_name,
             "action": &action,
         });
-        // dispatch_gate with empty chain_id (chain_id_required = false for the
-        // outer toolset_invoke tool — the routed tool handles its own chain_id check).
-        // The dispatcher is destructive, so on mainnet the default engine refuses
-        // here. A RequireApproval outcome produces no signing material at this
-        // gate: the signing routes carry their own approvals; proceed.
-        if let Err(e) = self
-            .dispatch_gate("stellar_toolset_invoke", &args_value, "")
-            .await
-        {
+        // Payment effects come from the envelope or the routed arguments.
+        // The routed gate enforces approval and reads live account state.
+        let payment_value = toolset_payment_value(
+            &action,
+            &args.args,
+            args.chain_id.as_deref(),
+            self.mainnet_context.is_some(),
+        );
+        let outer = match payment_value {
+            Some(value) => {
+                self.dispatch_gate_provisional("stellar_toolset_invoke", &args_value, "", value)
+                    .await
+            }
+            None => {
+                self.dispatch_gate("stellar_toolset_invoke", &args_value, "")
+                    .await
+            }
+        };
+        if let Err(e) = outer {
             return e.into_result();
         }
 
@@ -418,12 +473,8 @@ impl WalletServer {
         // The closed match below is the anti-aliasing anchor: only exact names
         // from ALL_MATRIX_TOOL_NAMES can appear here.
         //
-        // The routed handler's own dispatch_gate is the SINGLE authoritative
-        // operator-policy site for the matrix tool (additive gate).  No outer
-        // dispatch_gate call is made here: it would be redundant and would use
-        // the wrong args shape ({"toolset":...,"action":...} instead of the
-        // tool-specific args), which could cause spurious denials for tools that
-        // inspect args["amount"] or similar (e.g. stellar_pay via amount_in_stroops).
+        // The routed handler evaluates its tool-specific arguments and live
+        // account views. Its strict decision and approval govern submission.
         self.route_to_matrix_tool(tool_name, tool_args_value).await
     }
 }
@@ -432,9 +483,8 @@ impl WalletServer {
 // Gated resolver routing
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// The payment fields of a toolset-routed `sign-payment` call, typed as
-/// `StellarPayCommitArgs` types them, for the validation that precedes the
-/// gated resolver.
+/// Payment fields shared by preparation and sign-payment routes.
+/// Both routes use the payment parser before deriving or signing an amount.
 #[derive(serde::Deserialize)]
 #[serde(crate = "rmcp::serde")]
 struct GatedPaymentFields {
@@ -1364,6 +1414,28 @@ mod tests {
 
     use super::StellarToolsetInvokeArgs;
     use crate::server::WalletServer;
+
+    #[test]
+    fn mainnet_context_keeps_raw_outer_gate() {
+        let args = serde_json::json!({
+            "destination": "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+            "asset": "native", "amount_in_stroops": "10",
+        });
+        assert!(
+            super::toolset_payment_value("stellar_pay", &args, Some("stellar:mainnet"), true)
+                .is_none()
+        );
+        let value =
+            super::toolset_payment_value("stellar_pay", &args, Some("stellar:testnet"), false);
+        assert!(
+            matches!(value, Some(stellar_agent_core::policy::v1::ValueClass::Value(ref effects)) if effects.legs()[0].amount == Some(10))
+        );
+        for args in [serde_json::Value::Null, serde_json::json!([])] {
+            assert!(super::toolset_payment_value("stellar_pay", &args, None, false).is_none());
+        }
+        assert!(super::toolset_payment_value("stellar_balances", &args, None, false).is_none());
+        assert!(super::toolset_payment_value("stellar_pay_commit", &args, None, false).is_none());
+    }
 
     /// Router metadata carries the annotations clients receive in `tools/list`.
     #[test]

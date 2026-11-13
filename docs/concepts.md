@@ -208,8 +208,18 @@ Several rules may carry one, and every table must equal the policy's first in
 mode, asset, both bounds, and window.
 Equal budget tables share one counter per asset across the rules that carry
 them. A rule without a table, its allow list, and its caps are unaffected.
-A missing destination, an unverified home domain, or an unsupported kind
-refuses in every mode. A muxed destination is checked by its base account.
+Address kinds are alternatives. G_ACCOUNT covers G and M; C_ACCOUNT covers C.
+A destination is listed only when its kind is selected and its exact string or
+base G appears in the list. An exact M entry covers only that mux id.
+Issuer and verified-domain checks also apply before the mode.
+A missing destination or asset, an unverified home domain, a reserved kind,
+or a gated-inflow failure refuses in every mode.
+Other strkey forms and malformed strings return evaluation errors.
+Raw arguments keep their denials in every mode.
+Opaque SEP-43 signing, undecodable staged pay or claim envelopes, and exempted
+generic bundle inners refuse under an address criterion.
+These transactions come from a third party and have no evaluated effects.
+No recipient class or amount exists for a budget or approval threshold to bind.
 
 `total_budget` bounds the debits of one asset over the life of the signed
 policy:

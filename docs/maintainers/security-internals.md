@@ -1347,9 +1347,16 @@ Recipient classes govern the `unlisted` table. Each debit leg is `Listed`,
 `Unverifiable` (missing destination or asset, an unverified home-domain step,
 or an unsupported kind). The strictest class over the legs and kinds governs.
 Only `Unlisted` reaches the mode; every other failure keeps the criterion's
-first denial, so `G_ACCOUNT` and `C_ACCOUNT` denials stay byte-identical.
-A muxed destination is classified by its base account. Inflow legs carry no
-class. The evaluation carries the class of the matched rule on its
+first denial in kind order. G_ACCOUNT and C_ACCOUNT form one address check,
+at their first position. A listed destination needs its kind and an exact
+entry or base G. An exact M entry covers only that mux id.
+Other forms and malformed strings return a fixed evaluation error.
+Inflow legs carry no class. Reserved kinds are unverifiable without debits too.
+HOME_DOMAIN can deny an inflow-only call while its class remains Listed.
+Raw arguments keep denials in every mode. Exempted opaque signing and generic
+bundle inners refuse because third-party transactions have no evaluated effects.
+No recipient class or amount exists for a budget or approval threshold to bind.
+The evaluation carries the class of the matched rule on its
 `ValueEffects`, and budget sizing reads it there instead of classifying again.
 A budget entry uses the key `unlisted:<asset>` at the window's length, shared
 by every rule. A bundle accumulates unlisted transfers in its overlay.
@@ -1359,6 +1366,14 @@ both bounds, and window. Equal budget tables share one counter per asset
 across the rules that carry them. A rule without a table, its allow list, and
 its caps are unaffected. `validate_unlisted` checks each table against the hard caps of its
 own rule.
+
+On testnet, the toolset outer gate evaluates payment effects provisionally.
+Sign-payment uses the decoded envelope.
+stellar_pay uses the routed arguments and the payment parser's resolved amount.
+The outer gate defers minimum_reserve and balance_floor to the routed live read.
+It reads the spending window and records nothing.
+The routed commit enforces approval and records once after confirmation.
+The outer gate has no identity view, so HOME_DOMAIN remains unverifiable.
 
 `total_budget` entries carry the policy digest as their epoch, use the key
 `total:<asset>` with a zero window, and count regardless of age.

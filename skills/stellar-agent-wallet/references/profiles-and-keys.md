@@ -1042,6 +1042,17 @@ Ledger signing also requires this passkey ceremony.
 | `approval.cert_pin_without_origin` | A certificate pin requires an approval origin. |
 | `approval.origin_without_cert_pin` | An approval origin requires a certificate pin. |
 
+Address kinds are alternatives: G_ACCOUNT admits G and M forms, and C_ACCOUNT
+admits C. A listed destination needs both its kind and its exact string or base
+G in the allowlist. Entries compare byte for byte; an exact M entry covers only
+that mux id. Issuer and verified-domain checks also apply before the unlisted
+mode. Missing destinations, unverified bindings, reserved kinds, and gated
+inflow failures refuse in every mode. Other strkey forms and malformed strings
+return evaluation errors. Raw arguments keep their denials in every mode.
+Opaque signing and exempted generic bundle inners refuse because third-party
+transactions have no evaluated effects, recipient class, or amount for a budget
+or approval threshold to bind.
+
 The two pairing requirements follow the existing table requirements.
 A singleton refuses with `policy.mainnet_minimum_unmet`, its requirement
 name, and no rule index. Both rows pass when neither field is present.

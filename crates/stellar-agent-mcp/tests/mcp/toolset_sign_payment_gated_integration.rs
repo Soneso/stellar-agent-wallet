@@ -237,6 +237,267 @@ fn setup_mock_keyring() -> [u8; 32] {
     key
 }
 
+#[tokio::test]
+#[serial]
+async fn mainnet_sign_payment_refuses_at_entry() {
+    let _root = crate::common::isolated_data_root();
+    let approval = TempDir::new().unwrap();
+    let grants = TempDir::new().unwrap();
+    let toolsets = TempDir::new().unwrap();
+    let server = build_mainnet_server(
+        &testnet_profile().rpc_url,
+        approval.path(),
+        &grants.path().join("grants.toml"),
+        toolsets.path(),
+        CaseEngine::Noop,
+    );
+    let mut args = payment_invoke("stellar_pay_commit", DEST_G, 10);
+    args.chain_id = Some("stellar:mainnet".into());
+    assert_mainnet_write_forbidden(&server.call_stellar_toolset_invoke(args).await.unwrap());
+    assert_eq!(
+        count_pending_approvals(approval.path(), TEST_PROFILE_NAME),
+        0
+    );
+}
+fn single_rule_engine(
+    profile: &str,
+    tool: &str,
+    criteria: Vec<Box<dyn stellar_agent_core::policy::v1::criteria::Criterion>>,
+) -> stellar_agent_core::PolicyEngineV1 {
+    use stellar_agent_core::{PolicyDocument, PolicyEngineV1, PolicyRule, RuleMatch, ScopeId};
+    PolicyEngineV1::new(
+        PolicyDocument {
+            version: 2,
+            scope: ScopeId::AllProfiles,
+            signature: None,
+            rules: vec![PolicyRule {
+                r#match: RuleMatch {
+                    tool: tool.into(),
+                    chain: "*".into(),
+                },
+                criteria,
+                decision: stellar_agent_core::policy::Decision::Allow,
+                allow_opaque_signing: false,
+            }],
+        },
+        profile.into(),
+    )
+}
+
+fn g_counterparty(
+    list: Vec<String>,
+    budget: bool,
+) -> Box<dyn stellar_agent_core::policy::v1::criteria::Criterion> {
+    use stellar_agent_core::policy::v1::criteria::{
+        counterparty_allowlist::{
+            CounterpartyAllowlistCriterion, CounterpartyKind, UnlistedBudget, UnlistedMode,
+        },
+        per_period_cap::Window,
+    };
+    let criterion = CounterpartyAllowlistCriterion::new(vec![CounterpartyKind::GAccount], list);
+    Box::new(if budget {
+        criterion.with_unlisted(UnlistedMode::Budget(UnlistedBudget::new(
+            "native".into(),
+            20_000_000,
+            40_000_000,
+            Window::parse("1d").unwrap(),
+        )))
+    } else {
+        criterion
+    })
+}
+
+fn payment_invoke(action: &str, destination: &str, amount: i64) -> StellarToolsetInvokeArgs {
+    StellarToolsetInvokeArgs {
+        toolset: TOOLSET_NAME.into(),
+        action: action.into(),
+        chain_id: Some("stellar:testnet".into()),
+        args: serde_json::json!({
+            "envelope_xdr": payment_envelope_xdr(SOURCE_G, destination, amount),
+            "source": SOURCE_G, "destination": destination, "asset": "native",
+            "amount_in_stroops": amount.to_string(), "nonce": "fake-nonce",
+            "expires_at_unix_ms": 9_999_999_999_u64,
+        }),
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn payment_outer_gate_reaches_routed_approval_and_denies_unlisted() {
+    let _root = crate::common::isolated_data_root();
+    let key = setup_mock_keyring();
+    let approval = TempDir::new().unwrap();
+    let grants = TempDir::new().unwrap();
+    let toolsets = TempDir::new().unwrap();
+    let grant_file = grants.path().join("grants.toml");
+    write_pin_with_sign_payment(toolsets.path(), TOOLSET_NAME);
+    insert_valid_grant(
+        &grant_file,
+        TOOLSET_NAME,
+        CAPABILITY,
+        DEST_G,
+        ASSET_XLM,
+        0,
+        10_000_000,
+        &key,
+    );
+    let mut server = build_allow_server(approval.path(), &grant_file, toolsets.path());
+    server.set_policy_engine_for_test(Arc::new(single_rule_engine(
+        TEST_PROFILE_NAME,
+        "*",
+        vec![g_counterparty(vec![DEST_G.into()], false)],
+    )));
+    let result = server
+        .call_stellar_toolset_invoke(payment_invoke("stellar_pay_commit", DEST_G, 10_000_000))
+        .await
+        .unwrap();
+    assert_eq!(
+        crate::common::assert_business_envelope(&result).0,
+        "policy.approval_required"
+    );
+    for action in ["stellar_pay_commit", "stellar_pay"] {
+        let result = server
+            .call_stellar_toolset_invoke(payment_invoke(action, DEST_G2, 10_000_000))
+            .await
+            .unwrap();
+        assert_eq!(
+            crate::common::assert_business_envelope(&result).0,
+            "policy.deny.counterparty_denied"
+        );
+    }
+    for budget in [false, true] {
+        use stellar_agent_core::policy::v1::criteria::counterparty_allowlist::{
+            CounterpartyAllowlistCriterion, CounterpartyKind, UnlistedMode,
+        };
+        let criterion = if budget {
+            g_counterparty(vec![], true)
+        } else {
+            Box::new(
+                CounterpartyAllowlistCriterion::new(vec![CounterpartyKind::GAccount], vec![])
+                    .with_unlisted(UnlistedMode::Approval),
+            )
+        };
+        server.set_policy_engine_for_test(Arc::new(single_rule_engine(
+            TEST_PROFILE_NAME,
+            "*",
+            vec![criterion],
+        )));
+        let result = server
+            .call_stellar_toolset_invoke(payment_invoke("stellar_pay_commit", DEST_G, 10_000_000))
+            .await
+            .unwrap();
+        assert_eq!(
+            crate::common::assert_business_envelope(&result).0,
+            "policy.approval_required"
+        );
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn payment_outer_gate_defers_reserve_check() {
+    let _root = crate::common::isolated_data_root();
+    let key = setup_mock_keyring();
+    let approval = TempDir::new().unwrap();
+    let grants = TempDir::new().unwrap();
+    let toolsets = TempDir::new().unwrap();
+    let grant_file = grants.path().join("grants.toml");
+    write_pin_with_sign_payment(toolsets.path(), TOOLSET_NAME);
+    insert_valid_grant(
+        &grant_file,
+        TOOLSET_NAME,
+        CAPABILITY,
+        DEST_G,
+        ASSET_XLM,
+        0,
+        10_000_000,
+        &key,
+    );
+    let mut server = build_allow_server(approval.path(), &grant_file, toolsets.path());
+    server.set_policy_engine_for_test(Arc::new(single_rule_engine(TEST_PROFILE_NAME, "*", vec![
+        Box::new(stellar_agent_core::policy::v1::criteria::minimum_reserve::MinimumReserveCriterion::new(0)),
+        g_counterparty(vec![DEST_G.into()], false),
+    ])));
+    let result = server
+        .call_stellar_toolset_invoke(payment_invoke("stellar_pay_commit", DEST_G, 10_000_000))
+        .await
+        .unwrap();
+    assert_eq!(
+        crate::common::assert_business_envelope(&result).0,
+        "policy.approval_required"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn outer_cap_uses_envelope_and_missing_envelope_keeps_raw_gate() {
+    use stellar_agent_core::policy::v1::criteria::per_tx_cap::PerTxCapCriterion;
+    let _root = crate::common::isolated_data_root();
+    setup_mock_keyring();
+    let approval = TempDir::new().unwrap();
+    let grants = TempDir::new().unwrap();
+    let toolsets = TempDir::new().unwrap();
+    let grant_file = grants.path().join("grants.toml");
+    let mut server = build_allow_server(approval.path(), &grant_file, toolsets.path());
+    server.set_policy_engine_for_test(Arc::new(single_rule_engine(
+        TEST_PROFILE_NAME,
+        "stellar_toolset_invoke",
+        vec![Box::new(PerTxCapCriterion::new("native".into(), 5))],
+    )));
+    let mut args = payment_invoke("stellar_pay_commit", DEST_G, 10);
+    args.args["amount_in_stroops"] = "1".into();
+    let result = server.call_stellar_toolset_invoke(args).await.unwrap();
+    assert_eq!(
+        crate::common::assert_business_envelope(&result).0,
+        "policy.deny.per_tx_cap_exceeded"
+    );
+    let result = server
+        .call_stellar_toolset_invoke(payment_invoke("stellar_pay", DEST_G, 10))
+        .await
+        .unwrap();
+    assert_eq!(
+        crate::common::assert_business_envelope(&result).0,
+        "policy.deny.per_tx_cap_exceeded"
+    );
+    server.set_policy_engine_for_test(Arc::new(single_rule_engine(
+        TEST_PROFILE_NAME,
+        "*",
+        vec![g_counterparty(vec![DEST_G.into()], false)],
+    )));
+    for envelope in [serde_json::Value::Null, "not-an-envelope".into()] {
+        let mut args = payment_invoke("stellar_pay_commit", DEST_G, 10);
+        args.args["envelope_xdr"] = envelope;
+        let result = server.call_stellar_toolset_invoke(args).await.unwrap();
+        assert_eq!(
+            crate::common::assert_business_envelope(&result).0,
+            "policy.engine_required"
+        );
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn approved_unlisted_budget_commit_records_once() {
+    let key = setup_mock_keyring();
+    let approval = TempDir::new().unwrap();
+    let grants = TempDir::new().unwrap();
+    let toolsets = TempDir::new().unwrap();
+    write_toolset(
+        toolsets.path(),
+        TOOLSET_NAME,
+        &["sign-payment", "propose-transaction"],
+    );
+    assert_approved_submission_audit(
+        "unlisted-budget",
+        approval.path(),
+        &grants.path().join("grants.toml"),
+        toolsets.path(),
+        &key,
+        true,
+    )
+    .await;
+}
+
 /// Seeds the profile's attestation key in the mock keyring.
 fn seed_attestation_key(profile: &Profile, key: &[u8; 32]) {
     use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -297,6 +558,7 @@ async fn assert_approved_submission_audit(
     grant_file: &std::path::Path,
     toolsets_root: &std::path::Path,
     key: &[u8; 32],
+    unlisted_budget: bool,
 ) {
     use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
     use stellar_agent_core::approval::attestation::{compute_attestation_v4, envelope_sha256};
@@ -340,7 +602,14 @@ async fn assert_approved_submission_audit(
     let mut profile = crate::common::timeout_profile(&rpc.uri(), name);
     profile.submit_timeout_seconds = Some(30);
     seed_attestation_key(&profile, key);
-    let server = allow_server_for(profile.clone(), approval_dir, grant_file, toolsets_root);
+    let mut server = allow_server_for(profile.clone(), approval_dir, grant_file, toolsets_root);
+    if unlisted_budget {
+        server.set_policy_engine_for_test(Arc::new(single_rule_engine(
+            name,
+            "*",
+            vec![g_counterparty(vec![], true)],
+        )));
+    }
     // This approval belongs to the audit profile and its current installation.
     stellar_agent_toolsets_runtime::record_first_invoke_grant(
         name,
@@ -360,16 +629,26 @@ async fn assert_approved_submission_audit(
         Some(grant_file.to_path_buf()),
     )
     .unwrap();
-    let simulated = server
-        .call_stellar_pay(
-            serde_json::from_value(serde_json::json!({
-                "chain_id":"stellar:testnet", "source":source, "destination":DEST_G,
-                "asset":"native", "amount_in_stroops":"10000000"
-            }))
-            .unwrap(),
-        )
-        .await
-        .unwrap();
+    let prepare_args = serde_json::json!({
+        "chain_id":"stellar:testnet", "source":source, "destination":DEST_G,
+        "asset":"native", "amount_in_stroops":"10000000"
+    });
+    let simulated = if unlisted_budget {
+        server
+            .call_stellar_toolset_invoke(StellarToolsetInvokeArgs {
+                toolset: TOOLSET_NAME.into(),
+                action: "stellar_pay".into(),
+                chain_id: Some("stellar:testnet".into()),
+                args: prepare_args,
+            })
+            .await
+            .unwrap()
+    } else {
+        server
+            .call_stellar_pay(serde_json::from_value(prepare_args).unwrap())
+            .await
+            .unwrap()
+    };
     let simulated: serde_json::Value =
         serde_json::from_str(&simulated.content[0].as_text().unwrap().text).unwrap();
     assert_eq!(simulated["ok"], true, "{simulated}");
@@ -431,6 +710,22 @@ async fn assert_approved_submission_audit(
     let submitted: serde_json::Value =
         serde_json::from_str(&submitted.content[0].as_text().unwrap().text).unwrap();
     assert_eq!(submitted["ok"], true, "{submitted}");
+    if unlisted_budget {
+        use stellar_agent_core::policy::v1::criteria::state_store::{PolicyStateStore, StateKey};
+        let state = PolicyStateStore::new();
+        stellar_agent_network::policy_state::PersistedWindowStore::for_profile(name)
+            .load_into(name, &profile, &state)
+            .unwrap();
+        assert_eq!(
+            state
+                .query_window(
+                    &StateKey::new(name, 1, "unlisted:native", 86_400),
+                    now_unix_ms().unwrap()
+                )
+                .unwrap(),
+            (10_000_000, 1)
+        );
+    }
     let rows = crate::common::audit_rows(&profile);
     for kind in ["value_action_pending", "value_action_submitted"] {
         if kind == "value_action_submitted" {
@@ -1091,6 +1386,7 @@ async fn permissive_policy_forces_per_action_approval() {
         &grant_file,
         toolsets_dir.path(),
         &key,
+        false,
     )
     .await;
 }
