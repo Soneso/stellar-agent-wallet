@@ -897,6 +897,14 @@ Arguments:
 
 ## x402
 
+Both payment tools accept G, C, M and W payees and retain mux ids throughout
+the payment. W requires protocol 30 or later and a facilitator that accepts it.
+The W endpoint check runs before policy, business records, approvals and SEP-10.
+Both tools preserve `x402.muxed_contract_protocol_unsupported` on refusal.
+The authenticated tool compares M anchoring by its base G; C and W remain
+`unknown`. Mainnet approval covers the full address and id. Testnet approval
+escalation returns `policy.approval_required_unsupported` for every form.
+
 | Tool | Purpose | Gating |
 | --- | --- | --- |
 | `stellar_x402_create_payment` | Construct and sign an x402 v2 Exact Stellar `PAYMENT-SIGNATURE` from a `PaymentRequirements` object; obtain the cross-check witness before signing; return the payment signature, its fields, and `cross_check`. On an admitted mainnet server, an Allow rule releases the authorized payment payload in one call. Under RequireApproval, call 1 returns approval instructions, and call 2 verifies approval and releases the payload. | Signs the payment authorization entry; does not submit. |
@@ -958,8 +966,8 @@ account-reserve view here. A matching `minimum_reserve` criterion fails closed
 with `policy.engine_required` before approval is stored. Under Allow, call 1 is
 the signing call: it checks startup freshness and pays without an approval.
 Under RequireApproval, the pending approval is stored. That call reads
-enrollment and local policy state. It sends no payment RPC or SEP-10 request
-and performs no signing.
+enrollment and local policy state. It checks W eligibility with `getNetwork`,
+sends no simulation or SEP-10 request, and performs no signing.
 
 Under RequireApproval, call 1 returns `data.approval` without a payment payload. Its fields are
 `approval_nonce`, `profile`, `chain_id`, `expires_at_unix_ms`, `reason`,

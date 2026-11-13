@@ -90,12 +90,12 @@ use stellar_xdr::{
 use tokio::time::Instant;
 
 use stellar_agent_core::error::MAINNET_SIGNING_REFUSAL_DETAIL;
-use stellar_agent_network::StellarRpcClient;
 use stellar_agent_network::cross_check::{
     CrossCheckOutcome, CrossCheckWitness, SorobanCrossCheck, SorobanWitnessInputs,
 };
 use stellar_agent_network::refuse_mainnet_write;
 use stellar_agent_network::signing::Signer;
+use stellar_agent_network::{EndpointIdentity, StellarRpcClient};
 use stellar_agent_sep43::signing::sign_soroban_auth_entry;
 
 use crate::X402Error;
@@ -228,7 +228,7 @@ pub struct CreatedPayment {
 /// 4. `asset` is a C-strkey.
 /// 5. `extra.areFeesSponsored` is the JSON boolean `true`.
 /// 6. `amount` is an integer string above zero that fits `i128`.
-/// 7. `payTo` is a G-, C-, or M-strkey.
+/// 7. `payTo` is a G-, C-, M-, or W-strkey.
 /// 8. `maxTimeoutSeconds` is at least one. A value above 300 is accepted, and
 ///    [`create_payment`] signs a validity of 300 seconds for it.
 ///
@@ -345,7 +345,7 @@ fn validate_requirements_inner(
 
     strkey_to_recipient_sc_address(&requirements.pay_to).map_err(|_| {
         X402Error::InvalidRecipientAddress {
-            detail: "pay_to must be a G-, C-, or M-strkey".to_owned(),
+            detail: "pay_to must be a G-, C-, M-, or W-strkey".to_owned(),
         }
     })?;
 
@@ -356,6 +356,22 @@ fn validate_requirements_inner(
     }
 
     Ok(amount)
+}
+
+/// Checks whether the endpoint protocol supports the payee's address form.
+///
+/// # Errors
+/// Returns [`X402Error::MuxedContractProtocolUnsupported`] for a W payee below
+/// protocol 30. The endpoint identity's network and range checks apply first.
+pub fn check_payee_protocol(pay_to: &str, identity: &EndpointIdentity) -> Result<(), X402Error> {
+    if matches!(Strkey::from_string(pay_to), Ok(Strkey::MuxedContract(_)))
+        && !identity.admits_muxed_contract()
+    {
+        return Err(X402Error::MuxedContractProtocolUnsupported {
+            protocol_version: identity.protocol_version(),
+        });
+    }
+    Ok(())
 }
 
 /// Builds the single transfer root whose digest and approval bind the payment.
@@ -527,9 +543,8 @@ pub struct AuthorizedPayment {
 /// intent consumption, before the signed re-simulation. The signed entries
 /// leave the wallet only after both returned `Ok`.
 ///
-/// The endpoint check is the context's mainnet probe, which returns no
-/// endpoint identity, so the ledger trace of this path carries no protocol
-/// version.
+/// The context's mainnet probe supplies the checked protocol version for
+/// payee admission and the ledger trace.
 ///
 /// Exists only in builds with the `mainnet-write` feature.
 ///
@@ -867,30 +882,36 @@ async fn create_payment_inner(
     // ── Step 2: Endpoint identity, the client's first request ────────────────
     // The endpoint answers every later request of this payment, so it must be
     // shown to serve the profile's network before it is asked anything else.
-    // The mainnet probe returns no identity, so only the other path carries
-    // the protocol version into the ledger trace below.
     #[cfg(feature = "mainnet-write")]
     let identity = if mainnet.is_some() {
         client
-            .check_mainnet_endpoint(identity_deadline)
+            .mainnet_endpoint(identity_deadline)
             .await
-            .map_err(X402Error::EndpointIdentity)?;
-        None
+            .map_err(X402Error::EndpointIdentity)?
     } else {
-        Some(
-            client
-                .endpoint_identity(network_passphrase, identity_deadline)
-                .await
-                .map_err(X402Error::EndpointIdentity)?,
-        )
-    };
-    #[cfg(not(feature = "mainnet-write"))]
-    let identity = Some(
         client
             .endpoint_identity(network_passphrase, identity_deadline)
             .await
-            .map_err(X402Error::EndpointIdentity)?,
-    );
+            .map_err(X402Error::EndpointIdentity)?
+    };
+    #[cfg(not(feature = "mainnet-write"))]
+    let identity = client
+        .endpoint_identity(network_passphrase, identity_deadline)
+        .await
+        .map_err(X402Error::EndpointIdentity)?;
+    let admission = if matches!(
+        Strkey::from_string(&requirements.pay_to),
+        Ok(Strkey::MuxedContract(_))
+    ) {
+        Some(identity.muxed_contract_admission().ok_or(
+            X402Error::MuxedContractProtocolUnsupported {
+                protocol_version: identity.protocol_version(),
+            },
+        )?)
+    } else {
+        None
+    };
+    let muxed_contract = admission.is_some();
 
     // ── Step 3: Build SAC transfer InvokeHostFunction ─────────────────────────
     // SEP-41: transfer(from: Address, to: Address, amount: i128)
@@ -945,7 +966,8 @@ async fn create_payment_inner(
             detail: format!("{}{e}", FIRST_SIMULATION.request_failed),
         })?;
 
-    let first_min_resource_fee = check_simulation_answer(&sim_response, &FIRST_SIMULATION)?;
+    let first_min_resource_fee =
+        check_simulation_answer(&sim_response, &FIRST_SIMULATION, muxed_contract)?;
     let first_transaction_data =
         sim_response
             .transaction_data()
@@ -1152,28 +1174,57 @@ async fn create_payment_inner(
     // intent, the only value the consumption below accepts.
     #[cfg(feature = "mainnet-write")]
     let mut signed_intent = None;
+    let sign_non_mainnet = || async {
+        if let Some(admission) = &admission {
+            stellar_agent_sep43::signing::sign_soroban_auth_entry_admitted(
+                &preimage_xdr,
+                signer,
+                &payer_key,
+                network_passphrase,
+                None,
+                admission,
+            )
+            .await
+        } else {
+            sign_soroban_auth_entry(&preimage_xdr, signer, &payer_key, network_passphrase, None)
+                .await
+        }
+    };
     #[cfg(feature = "mainnet-write")]
     let signature = if let Some(authorization) = authorization {
-        stellar_agent_sep43::signing::sign_soroban_auth_entry_authorized(
-            &preimage_xdr,
-            signer,
-            &payer_key,
-            network_passphrase,
-            None,
-            intent.consumer,
-            authorization,
-        )
-        .await
-        .map(|(signature, signed)| {
+        let result = if let Some(admission) = &admission {
+            stellar_agent_sep43::signing::sign_soroban_auth_entry_authorized_admitted(
+                &preimage_xdr,
+                signer,
+                &payer_key,
+                network_passphrase,
+                None,
+                intent.consumer,
+                authorization,
+                admission,
+            )
+            .await
+        } else {
+            stellar_agent_sep43::signing::sign_soroban_auth_entry_authorized(
+                &preimage_xdr,
+                signer,
+                &payer_key,
+                network_passphrase,
+                None,
+                intent.consumer,
+                authorization,
+            )
+            .await
+        };
+        result.map(|(signature, signed)| {
             signed_intent = Some(signed);
             signature
         })
     } else {
-        sign_soroban_auth_entry(&preimage_xdr, signer, &payer_key, network_passphrase, None).await
+        sign_non_mainnet().await
     };
     #[cfg(not(feature = "mainnet-write"))]
-    let signature =
-        sign_soroban_auth_entry(&preimage_xdr, signer, &payer_key, network_passphrase, None).await;
+    let signature = sign_non_mainnet().await;
     let raw_signature_b64 = match signature {
         Ok(signature) => signature,
         Err(error) => {
@@ -1320,7 +1371,7 @@ async fn create_payment_inner(
             detail: format!("{}{e}", RESIMULATION.request_failed),
         })?;
 
-    let resource_fee = check_simulation_answer(&resim_response, &RESIMULATION)?;
+    let resource_fee = check_simulation_answer(&resim_response, &RESIMULATION, muxed_contract)?;
     // A malformed footprint fails closed: a footprint-less envelope cannot
     // settle, so the error is surfaced rather than producing an unsubmittable
     // payload.
@@ -1347,9 +1398,7 @@ async fn create_payment_inner(
         health_ledger,
         resimulation_ledger,
         signature_expiration_ledger,
-        protocol_version = identity
-            .as_ref()
-            .map(stellar_agent_network::EndpointIdentity::protocol_version),
+        protocol_version = identity.protocol_version(),
         "x402 payment ledgers checked"
     );
 
@@ -1475,6 +1524,8 @@ struct SimulationPhase {
     request_failed: &'static str,
     /// Prefix of the detail of an answer that carries an error.
     answer_error: &'static str,
+    /// Prefix for a failed transfer to a muxed contract payee.
+    muxed_contract_error: &'static str,
     /// The answer carries a restore preamble.
     restore_preamble: &'static str,
     /// The answer carries no minimum resource fee or no transaction data.
@@ -1492,6 +1543,7 @@ struct SimulationPhase {
 const FIRST_SIMULATION: SimulationPhase = SimulationPhase {
     request_failed: "first simulation request failed: ",
     answer_error: "simulate returned error: ",
+    muxed_contract_error: "simulation of a transfer to W failed: ",
     restore_preamble: "the simulation returned a restore preamble; this wallet does not restore \
                        archived ledger entries",
     no_fee_or_data: "simulate returned no min_resource_fee / transaction_data",
@@ -1507,6 +1559,7 @@ const FIRST_SIMULATION: SimulationPhase = SimulationPhase {
 const RESIMULATION: SimulationPhase = SimulationPhase {
     request_failed: "re-simulation request failed: ",
     answer_error: "re-simulate returned error: ",
+    muxed_contract_error: "re-simulation of a transfer to W failed: ",
     restore_preamble: "the re-simulation returned a restore preamble; this wallet does not \
                        restore archived ledger entries",
     no_fee_or_data: "re-simulate returned no min_resource_fee / transaction_data",
@@ -1535,13 +1588,19 @@ const FIRST_SIMULATION_DATA_UNDECODABLE: &str = "the simulation's transaction da
 fn check_simulation_answer(
     response: &SimulateTransactionResponse,
     phase: &SimulationPhase,
+    muxed_contract: bool,
 ) -> Result<u32, X402Error> {
     let refuse = |detail: &str| X402Error::RpcSimulateFailed {
         detail: detail.to_owned(),
     };
     if let Some(ref error) = response.error {
+        let prefix = if muxed_contract {
+            phase.muxed_contract_error
+        } else {
+            phase.answer_error
+        };
         return Err(X402Error::RpcSimulateFailed {
-            detail: format!("{}{error}", phase.answer_error),
+            detail: format!("{prefix}{error}"),
         });
     }
     if response.restore_preamble.is_some() {

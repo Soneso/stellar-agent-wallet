@@ -998,7 +998,11 @@ Both payment tools run in this order:
 2. The `payment_required` input is decoded and validated in full. An invalid
    field answers its own `x402.*` code, such as `x402.invalid_recipient_address`
    or `x402.invalid_payment_required` for a `maxTimeoutSeconds` of zero. This
-   step consumes no spending window.
+   step consumes no spending window. For W, the primary endpoint identity is
+   checked next, before policy, records, approval preparation and SEP-10.
+   Protocols below 30 return `x402.muxed_contract_protocol_unsupported` after
+   the endpoint's network and supported-range checks. G, C and M send no
+   extra identity request at this stage.
 3. The dispatch gate checks `chain_id` and the policy. A `chain_id` mismatch
    is a JSON-RPC invalid-params error, which invalid requirements never reach.
 4. The audit pre-flight runs, then the SEP-10 gate for the authenticated tool.
@@ -1101,7 +1105,8 @@ stores the pending approval:
 10. Under RequireApproval, the pending approval is stored and returned.
 
 Under RequireApproval, call 1 reads enrollment and local policy state. It
-sends no payment RPC or SEP-10 request and performs no signing. It returns
+checks W eligibility with `getNetwork`, sends no simulation or SEP-10 request,
+and performs no signing. It returns
 `data.approval` without a payment payload. Its fields are `approval_nonce`, `profile`, `chain_id`,
 `expires_at_unix_ms`, `reason`, `endpoint_host`, `signer`, `summary`, and
 `instructions`. `summary` contains `payTo`, `amount`, and `asset`.

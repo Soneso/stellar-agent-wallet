@@ -879,6 +879,72 @@ fn signed_x402_contract_under_g_only_reaches_mode() {
     }
 }
 
+#[test]
+fn signed_x402_muxed_destinations_keep_policy_bytes_and_decisions() {
+    use stellar_agent_core::policy::{Decision, PolicyEngine};
+    let asset = stellar_agent_core::asset_id::CanonicalAsset::Native
+        .sac_contract_id(TESTNET_PASSPHRASE)
+        .unwrap();
+    let w = stellar_strkey::MuxedContract {
+        contract_id: [3; 32],
+        id: 7,
+    }
+    .to_string()
+    .as_str()
+    .to_owned();
+    for (fixture, destination, mode) in [
+        ("g_entry_deny", address_m(), "allow"),
+        ("m_entry_deny", address_m(), "allow"),
+        ("g_c_entries_deny", w.clone(), "allow"),
+        ("g_c_empty_budget", w.clone(), "budget"),
+        ("g_only_budget", w, "budget"),
+    ] {
+        for tool in [
+            "stellar_x402_create_payment",
+            "stellar_x402_authenticated_payment",
+        ] {
+            let engine = address_engine(fixture);
+            let result = engine
+                .evaluate_with_value_full(
+                    &address_tool(tool, ToolValueKind::MovesValue),
+                    &serde_json::Value::Null,
+                    &address_profile(),
+                    ValueClass::single(ValueLeg {
+                        kind: ActionKind::X402Payment,
+                        amount: Some(1),
+                        asset: Some(asset.clone()),
+                        destination: Some(destination.clone()),
+                    }),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    NOW_MS,
+                )
+                .unwrap();
+            assert_eq!(result.decision, Decision::Allow, "{fixture}: {tool}");
+            assert_eq!(
+                result.value_effects.unwrap().recipient_class(),
+                Some(if mode == "budget" {
+                    RecipientClass::Unlisted
+                } else {
+                    RecipientClass::Listed
+                })
+            );
+            let original = ADDRESS_FIXTURES
+                .iter()
+                .find(|entry| entry.name == fixture)
+                .unwrap();
+            assert_eq!(signed(original.raw, &owner_key()), original.signed);
+            assert_eq!(
+                canonical_bytes(original.signed).unwrap(),
+                original.canonical.as_bytes()
+            );
+        }
+    }
+}
+
 /// Signs `raw` with `key` over the BLAKE3 digest of its canonical bytes.
 fn signed(raw: &str, key: &SigningKey) -> String {
     let canonical = canonical_bytes(raw).unwrap();

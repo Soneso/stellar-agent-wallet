@@ -575,6 +575,28 @@ struct Scenario {
 }
 
 impl Scenario {
+    fn with_payee(mut self, payee: ScAddress, protocol: u32) -> Self {
+        self.requirements.pay_to =
+            stellar_agent_core::sc_address::scaddress_destination_strkey(&payee).unwrap();
+        let mut entry = honest_entry();
+        let SorobanAuthorizedFunction::ContractFn(call) = &mut entry.root_invocation.function
+        else {
+            panic!("transfer");
+        };
+        call.args = vec![
+            ScVal::Address(account_address(PAYER_SEED)),
+            ScVal::Address(payee),
+            amount_scval(AMOUNT),
+        ]
+        .try_into()
+        .unwrap();
+        self.first = answer(&[entry]);
+        let mut network = network_result(TESTNET_PASSPHRASE);
+        network["protocolVersion"] = protocol.into();
+        self.network = MethodAnswer::Result(network);
+        self
+    }
+
     /// An honest endpoint: the testnet identity, a healthy endpoint at the
     /// simulation's ledger, an honest first simulation, and a re-simulation
     /// that returns no authorization.
@@ -843,6 +865,132 @@ fn signed_entry_with(
 }
 
 // ── Assertions ───────────────────────────────────────────────────────────────
+
+fn muxed_contract_payee() -> ScAddress {
+    ScAddress::MuxedContract(stellar_xdr::MuxedContract {
+        id: 7,
+        contract_id: ContractId(Hash([3; 32])),
+    })
+}
+
+#[tokio::test]
+async fn muxed_contract_protocol_table() {
+    for protocol in [28, 29, 30, 31] {
+        let expected = muxed_contract_payee();
+        let outcome = run(Scenario::honest().with_payee(expected.clone(), protocol)).await;
+        if protocol < 30 {
+            assert_eq!(
+                outcome.result.unwrap_err().wire_code(),
+                "x402.muxed_contract_protocol_unsupported"
+            );
+            assert_eq!(outcome.simulate_requests, 0);
+            assert_eq!(outcome.signing_calls, 0);
+            assert_eq!(outcome.gate_calls, 0);
+        } else {
+            assert_signed_and_sent_once(&outcome);
+            let payload = outcome.result.unwrap();
+            let envelope =
+                TransactionEnvelope::from_xdr_base64(&payload.payload.transaction, Limits::none())
+                    .unwrap();
+            let TransactionEnvelope::Tx(tx) = envelope else {
+                panic!("transaction");
+            };
+            let OperationBody::InvokeHostFunction(op) = &tx.tx.operations[0].body else {
+                panic!("invocation");
+            };
+            let HostFunction::InvokeContract(call) = &op.host_function else {
+                panic!("transfer");
+            };
+            assert_eq!(call.args[1], ScVal::Address(expected.clone()));
+            let SorobanAuthorizedFunction::ContractFn(auth) = &op.auth[0].root_invocation.function
+            else {
+                panic!("authorization");
+            };
+            assert_eq!(auth.args[1], ScVal::Address(expected));
+        }
+    }
+}
+
+#[tokio::test]
+async fn account_contract_and_muxed_account_build_at_29() {
+    let ScAddress::Account(AccountId(PublicKey::PublicKeyTypeEd25519(key))) =
+        account_address(PAY_TO_SEED)
+    else {
+        panic!("account");
+    };
+    for payee in [
+        account_address(PAY_TO_SEED),
+        contract_address(OTHER_CONTRACT),
+        ScAddress::MuxedAccount(stellar_xdr::MuxedEd25519Account {
+            id: 7,
+            ed25519: key,
+        }),
+    ] {
+        let outcome = run(Scenario::honest().with_payee(payee, 29)).await;
+        assert_signed_and_sent_once(&outcome);
+        assert!(outcome.result.is_ok(), "{:?}", outcome.result);
+        assert_eq!(
+            outcome
+                .methods
+                .iter()
+                .filter(|m| *m == "getNetwork")
+                .count(),
+            1
+        );
+    }
+}
+
+#[tokio::test]
+async fn muxed_contract_custom_asset_and_simulation_error_text() {
+    for muxed in [false, true] {
+        for phase in [0, 1, 2] {
+            let payee = if muxed {
+                muxed_contract_payee()
+            } else {
+                contract_address(OTHER_CONTRACT)
+            };
+            let mut scenario = Scenario::honest().with_payee(payee, 30);
+            scenario.requirements.asset = OTHER_CONTRACT.to_owned();
+            let mut entry = honest_entry();
+            let SorobanAuthorizedFunction::ContractFn(call) = &mut entry.root_invocation.function
+            else {
+                panic!("transfer");
+            };
+            call.contract_address = contract_address(OTHER_CONTRACT);
+            call.args = vec![
+                ScVal::Address(account_address(PAYER_SEED)),
+                ScVal::Address(if muxed {
+                    muxed_contract_payee()
+                } else {
+                    contract_address(OTHER_CONTRACT)
+                }),
+                amount_scval(AMOUNT),
+            ]
+            .try_into()
+            .unwrap();
+            scenario.first = answer(&[entry]);
+            if phase == 1 {
+                scenario.first["error"] = "contract refused".into();
+            } else if phase == 2 {
+                scenario.resimulation = Box::new(
+                    |_| serde_json::json!({"error": "contract refused", "latestLedger": LATEST_LEDGER}),
+                );
+            }
+            let outcome = run(scenario).await;
+            if phase == 0 {
+                assert!(outcome.result.is_ok(), "{:?}", outcome.result);
+            } else {
+                let expected = match (muxed, phase) {
+                    (true, 1) => "simulation of a transfer to W failed: \"contract refused\"",
+                    (true, _) => "re-simulation of a transfer to W failed: \"contract refused\"",
+                    (false, 1) => "simulate returned error: \"contract refused\"",
+                    (false, _) => "re-simulate returned error: \"contract refused\"",
+                };
+                assert_refusal(&outcome.result, "x402.rpc_simulate_failed", expected);
+            }
+        }
+    }
+}
 
 /// Asserts that `result` is a refusal with wire code `code` and exactly
 /// `expected` as its detail. The detail is a fixed sentence, so equality also
