@@ -170,6 +170,152 @@ mod tests {
         assert_eq!(entry.request_id, "queued");
     }
 
+    /// A keyed profile fixture whose audit key is stored in the mock keyring.
+    #[allow(clippy::unwrap_used, reason = "test fixture")]
+    fn keyed_profile(name: &str, dir: &tempfile::TempDir) -> Profile {
+        use base64::Engine as _;
+        let mut profile = Profile::builder_testnet_named(
+            name,
+            "fixture",
+            "GAQAA5L65LSYH7CQ3VTJ7F3HHLGCL3DSLAR2Y47263D56MNNGHSQSTVY",
+            "nonce-fixture",
+            "nonce-account",
+        )
+        .with_noop_engine()
+        .build();
+        profile.audit_log_path = dir.path().join("audit.jsonl");
+        let coordinate = &profile.audit_log_hash_chain_key_id;
+        keyring_core::Entry::new(&coordinate.service, &coordinate.account)
+            .unwrap()
+            .set_password(&base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0x42; 32]))
+            .unwrap();
+        profile
+    }
+
+    fn anchor_store(profile: &Profile) -> stellar_agent_network::keyring::KeyringTipAnchorStore {
+        stellar_agent_network::keyring::KeyringTipAnchorStore::new(
+            &profile.audit_log_hash_chain_key_id,
+            &profile.audit_log_path,
+        )
+    }
+
+    /// Rows queued past the commitment while a draining writer holds the log
+    /// form a tagged legacy suffix that verification, loss detection and the
+    /// holder's drain all accept.
+    #[test]
+    #[serial_test::serial]
+    #[allow(clippy::unwrap_used, clippy::panic, reason = "test assertions")]
+    fn contended_enqueue_verifies_without_loss() {
+        use stellar_agent_core::audit_log::{AuditEntry, TipAnchorStore, check_outbox_commitment};
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let profile = keyed_profile("contended-suffix", &dir);
+        let access = stellar_agent_network::keyring::keyed_audit_access(
+            &profile,
+            "contended-suffix",
+            BindingCheck::Enforce,
+        )
+        .unwrap();
+        let mut holder = AuditWriter::open(profile.audit_log_path.clone(), Some(access)).unwrap();
+        let store = anchor_store(&profile);
+        let commitment = store.load_outbox_state(1).unwrap();
+        for id in ["first", "second"] {
+            let OperatorRowSink::Outbox(outbox) =
+                acquire_operator_row_sink(&profile, "contended-suffix").unwrap()
+            else {
+                panic!("the draining holder selects the outbox")
+            };
+            outbox
+                .append(&AuditEntry::new_profile_resumed("fixture", true, id))
+                .unwrap();
+        }
+        let queued = std::fs::read(stellar_agent_core::audit_log::outbox_path(
+            &profile.audit_log_path,
+        ))
+        .unwrap();
+        let text = std::str::from_utf8(&queued).unwrap();
+        assert_eq!(text.lines().count(), 2);
+        for (index, line) in text.lines().enumerate() {
+            assert!(
+                line.starts_with(&format!("{{\"k\":\"row\",\"g\":0,\"s\":{},", index + 1)),
+                "{line}"
+            );
+        }
+        assert_eq!(
+            store.load_outbox_state(1).unwrap(),
+            commitment,
+            "the queue leaves the commitment"
+        );
+        check_outbox_commitment(&profile.audit_log_path, &store).unwrap();
+        assert_eq!(holder.outbox_loss().unwrap(), None);
+        assert_eq!(holder.drain_outbox().unwrap(), 2);
+        let log = std::fs::read_to_string(&profile.audit_log_path).unwrap();
+        let ids: Vec<_> = log
+            .lines()
+            .map(|line| serde_json::from_str::<AuditEntry>(line).unwrap().request_id)
+            .collect();
+        assert_eq!(&ids[ids.len() - 2..], ["first", "second"]);
+    }
+
+    /// Without a draining holder the sink is this process's own writer, which
+    /// drains the queue and records the owner state itself.
+    #[test]
+    #[serial_test::serial]
+    #[allow(clippy::unwrap_used, clippy::panic, reason = "test assertions")]
+    fn a_standalone_writer_holder_keeps_direct_access() {
+        use stellar_agent_core::audit_log::{AuditEntry, TipAnchorStore};
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let profile = keyed_profile("standalone-holder", &dir);
+        let access = stellar_agent_network::keyring::keyed_audit_access(
+            &profile,
+            "standalone-holder",
+            BindingCheck::Enforce,
+        )
+        .unwrap();
+        drop(AuditWriter::open(profile.audit_log_path.clone(), Some(access)).unwrap());
+        let store = std::sync::Arc::new(anchor_store(&profile));
+        AuditOutbox::for_log_keyed(
+            &profile.audit_log_path,
+            store.clone(),
+            zeroize::Zeroizing::new([0x42; 32]),
+        )
+        .append(&AuditEntry::new_profile_resumed("fixture", true, "queued"))
+        .unwrap();
+        assert_eq!(store.load_outbox_owner_state(1).unwrap(), None);
+        let sink = acquire_operator_row_sink(&profile, "standalone-holder").unwrap();
+        let OperatorRowSink::Writer(writer) = sink else {
+            panic!("a free log selects this process's writer")
+        };
+        assert!(
+            store.load_outbox_owner_state(1).unwrap().is_some(),
+            "the writer's open drain records the owner state"
+        );
+        crate::commands::value_audit::append_value_audit_row_strict(
+            &mut writer.lock().unwrap(),
+            "standalone-holder",
+            AuditEntry::new_profile_resumed("fixture", true, "direct"),
+        )
+        .unwrap();
+        drop(writer);
+        AuditWriterRegistry::remove_for_test("standalone-holder");
+        let log = std::fs::read_to_string(&profile.audit_log_path).unwrap();
+        let ids: Vec<_> = log
+            .lines()
+            .map(|line| serde_json::from_str::<AuditEntry>(line).unwrap().request_id)
+            .collect();
+        assert_eq!(&ids[ids.len() - 2..], ["queued", "direct"]);
+        let queue = std::fs::read(stellar_agent_core::audit_log::outbox_path(
+            &profile.audit_log_path,
+        ))
+        .unwrap();
+        assert!(
+            queue.starts_with(b"{\"k\":\"gen\",\"g\":1,\"tag\":\""),
+            "only the generation line remains"
+        );
+        assert_eq!(queue.iter().filter(|byte| **byte == b'\n').count(), 1);
+    }
+
     /// The operator-row acquisition is classified by the typed writer error:
     /// only sidecar contention is retried and resolved through the drain lock.
     #[test]

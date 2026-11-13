@@ -105,6 +105,7 @@ pub(crate) fn audit_writer_error(
         | WriterError::OutboxBusy
         | WriterError::OutboxUnusable { .. }
         | WriterError::OutboxRowKindRefused { .. }
+        | WriterError::AuditKeyReplaced
         | WriterError::UnauthenticatedTailNotAcknowledged { .. }
         | WriterError::UnauthenticatedHandoff { .. }
         | WriterError::AppendUnsettled { .. }

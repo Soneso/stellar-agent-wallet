@@ -1,8 +1,9 @@
 //! Outbox generation files of a carrier binding.
 //!
-//! `audit bind-carriers` copies the committed rows of the current outbox
-//! generation G into the staged file `<log>.outbox.g<G+1>`, records the
-//! carriers, then renames the current outbox to a retired file and the staged
+//! `audit bind-carriers` copies the rows of the current outbox generation G
+//! byte for byte into the staged file `<log>.outbox.g<G+1>`. Those rows are
+//! the committed prefix and any valid tagged suffix. It then records the
+//! carriers and renames the current outbox to a retired file and the staged
 //! file into its place. A holder of generation G keeps its open handle on the
 //! retired file. A staged file that still exists marks a binding that has not
 //! finished, and every ordinary writer open refuses while one does. A rerun
@@ -11,7 +12,7 @@
 use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
 
-use super::outbox::{OutboxState, holds_exactly_committed, outbox_path, sync_parent_dir};
+use super::outbox::{OutboxState, legacy_rows, outbox_path, sync_parent_dir};
 use super::writer::{WriterError, sidecar_path};
 
 /// Result of a carrier binding.
@@ -19,7 +20,8 @@ use super::writer::{WriterError, sidecar_path};
 pub struct CarrierBindingReport {
     /// Outbox generation the binding recorded.
     pub generation: u64,
-    /// Committed operator rows carried into this generation.
+    /// Operator rows carried into this generation: the committed prefix and
+    /// the tagged rows after it.
     pub carried_rows: u64,
     /// File name the previous generation's outbox was retired to, `None` when
     /// the log had no outbox file to retire.
@@ -235,14 +237,17 @@ pub(crate) fn staged_files(log: &Path) -> Result<Vec<PathBuf>, WriterError> {
     Ok(files)
 }
 
-/// Whether the staged file of a generation holds exactly the rows `state`
-/// commits: every line complete and the lines chaining to the committed head.
+/// The number of rows the staged file of a generation carries when it is a
+/// valid legacy queue under `state`, checked without a key.
+///
+/// Every line is complete and the committed lines chain to the committed
+/// head. Every later line is a tagged row of generation zero at its line.
 ///
 /// # Errors
 ///
 /// [`WriterError::Io`] when the staged file cannot be read.
-pub(crate) fn stage_holds(staged: &Path, state: &OutboxState) -> Result<bool, WriterError> {
-    Ok(holds_exactly_committed(&std::fs::read(staged)?, state))
+pub(crate) fn stage_rows(staged: &Path, state: &OutboxState) -> Result<Option<u64>, WriterError> {
+    Ok(legacy_rows(&std::fs::read(staged)?, state))
 }
 
 /// Writes `bytes` as the staged file of `generation` and removes every other

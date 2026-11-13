@@ -50,12 +50,19 @@ fn fixture() -> (tempfile::TempDir, PathBuf, Arc<InMemoryTipAnchorStore>) {
 fn binding_carries_tagged_rows_byte_for_byte() {
     let (_dir, path, store) = fixture();
     let outbox = AuditOutbox::for_log_keyed(&path, store.clone(), Zeroizing::new([0x42; 32]));
+    let commitment = store.load_outbox_state(1).unwrap();
     outbox.append(&row("one")).unwrap();
     outbox.append(&row("two")).unwrap();
+    assert_eq!(
+        store.load_outbox_state(1).unwrap(),
+        commitment,
+        "a keyed enqueue leaves the commitment"
+    );
     let bytes = fs::read(outbox.path()).unwrap();
     assert!(bytes.starts_with(b"{\"k\":\"row\",\"g\":0,\"s\":1,"));
     let mut binding = AuditWriter::open_for_carrier_binding(path.clone(), access(&store)).unwrap();
     let report = binding.bind_carriers().unwrap();
+    // Both carried rows are the selected tagged suffix past the commitment.
     assert_eq!((report.generation, report.carried_rows), (2, 2));
     assert_eq!(
         fs::read(outbox.path()).unwrap(),
@@ -66,7 +73,17 @@ fn binding_carries_tagged_rows_byte_for_byte() {
     let _writer = AuditWriter::open(path.clone(), Some(access(&store))).unwrap();
     let ids = request_ids(&path);
     assert_eq!(&ids[ids.len() - 2..], ["one", "two"]);
-    assert!(fs::read(outbox.path()).unwrap().is_empty());
+    assert_eq!(
+        fs::read(outbox.path()).unwrap(),
+        crate::audit_log::outbox::test_seam::generation_line(&[0x42; 32], 1)
+    );
+    assert_eq!(
+        store
+            .load_outbox_state(2)
+            .unwrap()
+            .map(|state| state.pending),
+        Some(0)
+    );
 }
 
 #[test]
@@ -75,7 +92,10 @@ fn loss_acknowledgement_appends_the_tagged_prefix() {
     let outbox = AuditOutbox::for_log_keyed(&path, store.clone(), Zeroizing::new([0x42; 32]));
     outbox.append(&row("prefix")).unwrap();
     let prefix = fs::read(outbox.path()).unwrap();
-    let commitment = store.load_outbox_state(1).unwrap().unwrap();
+    // A keyed enqueue commits nothing, so the fixture commits the tagged
+    // legacy prefix explicitly.
+    let commitment = OutboxState::over(&[&prefix[..prefix.len() - 1]]);
+    store.store_outbox_state(1, &commitment).unwrap();
     let mut bytes = prefix.clone();
     bytes.extend_from_slice(&serde_json::to_vec(&row("stray")).unwrap());
     bytes.push(b'\n');
@@ -445,6 +465,102 @@ fn an_old_generation_drain_cannot_clear_the_new_queue() {
     ));
 }
 
+/// A keyed enqueue does not watch the retired generation; the next owner
+/// drain does, and refuses before delivering anything.
+#[cfg(unix)]
+#[test]
+fn a_keyed_enqueue_defers_the_retired_watch_to_the_drain() {
+    let (_dir, path, store) = fixture();
+    let outbox = AuditOutbox::for_log_keyed(&path, store.clone(), Zeroizing::new([0x42; 32]));
+    outbox.append(&row("R")).unwrap();
+    let batch = OutboxBatch::read_locked(&path, store.as_ref()).unwrap();
+    replace(&outbox_lock_path(&path));
+    let mut binding = AuditWriter::open_for_carrier_binding(path.clone(), access(&store)).unwrap();
+    assert_eq!(binding.bind_carriers().unwrap().generation, 2);
+    drop(binding);
+    store
+        .store_outbox_state(batch.generation(), &OutboxState::default())
+        .unwrap();
+    drop(batch);
+    outbox.append(&row("B")).unwrap();
+    let queued = fs::read(outbox_path(&path)).unwrap();
+    assert!(queued.windows(3).any(|part| part == b"\"B\""));
+    let log = fs::read(&path).unwrap();
+    assert!(matches!(
+        AuditWriter::open(path.clone(), Some(access(&store))),
+        Err(WriterError::RetiredOutboxChanged { generation: 1 })
+    ));
+    assert_eq!(fs::read(&path).unwrap(), log);
+    assert_eq!(fs::read(outbox_path(&path)).unwrap(), queued);
+    assert_eq!(store.load_outbox_owner_state(2).unwrap(), None);
+}
+
+/// A binding that starts a new generation while a keyed append holds the
+/// old outbox lock moves the appender's file aside. The check after the
+/// sync refuses the row and truncates it back.
+#[cfg(unix)]
+#[test]
+fn a_stale_appender_after_rebinding_refuses() {
+    let (_dir, path, store) = fixture();
+    let outbox = AuditOutbox::for_log_keyed(&path, store.clone(), Zeroizing::new([0x42; 32]));
+    outbox.append(&row("R")).unwrap();
+    let before = fs::read(outbox.path()).unwrap();
+    let (hook_path, hook_store) = (path.clone(), store.clone());
+    crate::audit_log::outbox::test_seam::on_admitted(outbox.path(), move || {
+        replace(&outbox_lock_path(&hook_path));
+        let mut binding =
+            AuditWriter::open_for_carrier_binding(hook_path.clone(), access(&hook_store)).unwrap();
+        assert_eq!(binding.bind_carriers().unwrap().generation, 2);
+    });
+    let error = outbox.append(&row("stale")).unwrap_err();
+    assert!(
+        matches!(
+            error,
+            WriterError::CarrierGenerationChanged {
+                held: 1,
+                current: 2
+            }
+        ),
+        "{error:?}"
+    );
+    let record = store.load_carrier_record().unwrap().unwrap();
+    let retired = path
+        .parent()
+        .unwrap()
+        .join(record.retired.unwrap().file.unwrap());
+    assert_eq!(
+        fs::read(retired).unwrap(),
+        before,
+        "the refused row is truncated"
+    );
+    let queued = fs::read(outbox_path(&path)).unwrap();
+    assert!(!queued.windows(7).any(|part| part == b"\"stale\""));
+    let _writer = AuditWriter::open(path.clone(), Some(access(&store))).unwrap();
+    let ids = request_ids(&path);
+    assert!(ids.iter().any(|id| id == "R"));
+    assert!(!ids.iter().any(|id| id == "stale"));
+}
+
+/// Owner state of generation 0 is keyed evidence: enrollment refuses.
+#[test]
+fn an_owner_item_counts_as_enrollment_evidence() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("audit.jsonl");
+    let store = Arc::new(InMemoryTipAnchorStore::new());
+    store
+        .store_outbox_owner_state(
+            0,
+            &crate::audit_log::outbox::test_seam::owner_value(1, None),
+        )
+        .unwrap();
+    assert!(matches!(
+        AuditWriter::open(path.clone(), Some(access(&store))),
+        Err(WriterError::CarriersUnbound)
+    ));
+    assert_eq!(store.load_carrier_record().unwrap(), None);
+    assert!(!outbox_path(&path).exists());
+}
+
 #[test]
 fn the_carrier_record_round_trips_and_refuses_unknown_fields() {
     let (_dir, _path, store) = fixture();
@@ -526,6 +642,66 @@ fn acknowledging_a_retired_write_preserves_carrier_identities() {
         OutboxState::default().to_keyring_value()
     );
     drop(AuditWriter::open(path, Some(access(&store))).unwrap());
+}
+
+/// Under owner state of the active generation, a retired write is still
+/// acknowledged, and the owned queue and its commitment stay for the owner
+/// drain.
+#[cfg(unix)]
+#[test]
+fn a_retired_write_is_acknowledged_without_clearing_an_owned_queue() {
+    let (_dir, path, store) = fixture();
+    let outbox = AuditOutbox::for_log(&path, store.clone());
+    outbox.append(&row("R")).unwrap();
+    let batch = OutboxBatch::read_locked(&path, store.as_ref()).unwrap();
+    replace(&outbox_lock_path(&path));
+    let mut binding = AuditWriter::open_for_carrier_binding(path.clone(), access(&store)).unwrap();
+    binding.bind_carriers().unwrap();
+    drop(binding);
+    let keyed = AuditOutbox::for_log_keyed(&path, store.clone(), Zeroizing::new([0x42; 32]));
+    keyed.append(&row("delivered")).unwrap();
+    drop(AuditWriter::open(path.clone(), Some(access(&store))).unwrap());
+    assert!(store.load_outbox_owner_state(2).unwrap().is_some());
+    keyed.append(&row("queued")).unwrap();
+    store
+        .store_outbox_state(1, &OutboxState::default())
+        .unwrap();
+    batch.clear().unwrap();
+    let queued = fs::read(outbox_path(&path)).unwrap();
+    let state = store.load_outbox_state(2).unwrap();
+    let mut writer = AuditWriter::open_for_outbox_acknowledgement(
+        path.clone(),
+        key(),
+        store.clone(),
+        BindingHistory::NotRecorded,
+    )
+    .unwrap();
+    let loss = writer.outbox_loss().unwrap().unwrap();
+    assert_eq!((loss.expected_rows, loss.found_rows), (1, 0));
+    let report = writer
+        .acknowledge_outbox_loss("queue inspection", RevokedCounts::default())
+        .unwrap();
+    assert_eq!(
+        (
+            report.expected_rows,
+            report.found_rows,
+            report.drained,
+            report.discarded
+        ),
+        (1, 0, 0, 0)
+    );
+    assert_eq!(fs::read(outbox_path(&path)).unwrap(), queued);
+    assert_eq!(store.load_outbox_state(2).unwrap(), state);
+    drop(writer);
+    let record = store.load_carrier_record().unwrap().unwrap();
+    assert_eq!(
+        record.retired.unwrap().state,
+        OutboxState::default().to_keyring_value()
+    );
+    drop(AuditWriter::open(path.clone(), Some(access(&store))).unwrap());
+    let ids = request_ids(&path);
+    assert_eq!(ids.iter().filter(|id| *id == "queued").count(), 1);
+    assert_eq!(ids.iter().filter(|id| *id == "delivered").count(), 1);
 }
 
 #[cfg(unix)]
