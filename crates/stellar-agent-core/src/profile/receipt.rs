@@ -2386,7 +2386,7 @@ fn persist_locked(guard: &mut MutexGuard<'_, StoreState>) -> Result<(), ReceiptS
 /// Confirms that the stored file and its directory are durable without
 /// rewriting the file.
 fn confirm_durable(guard: &StoreState) -> Result<(), ReceiptStoreError> {
-    std::fs::File::open(&guard.file_path)
+    open_for_flush(&guard.file_path)
         .and_then(|file| file.sync_all())
         .map_err(|source| ReceiptStoreError::Io {
             path: guard.file_path.clone(),
@@ -2397,6 +2397,23 @@ fn confirm_durable(guard: &StoreState) -> Result<(), ReceiptStoreError> {
         .parent()
         .unwrap_or(std::path::Path::new("."));
     sync_directory(dir)
+}
+
+/// Opens the existing store file for a flush, without creating, truncating,
+/// or writing it.
+///
+/// On Windows the handle carries write access: `sync_all` calls
+/// `FlushFileBuffers`, which refuses a handle without `GENERIC_WRITE` with
+/// `ERROR_ACCESS_DENIED`. The default share mode admits concurrent readers
+/// and a later rename over the file. On every other platform the handle is
+/// read-only: `fsync` accepts a read-only descriptor, so an owner-read-only
+/// store file stays confirmable.
+fn open_for_flush(file_path: &Path) -> io::Result<std::fs::File> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(windows)]
+    options.write(true);
+    options.open(file_path)
 }
 
 /// Syncs the store directory, so a completed rename survives a crash.
@@ -2610,6 +2627,86 @@ mod tests {
         store.replace_checked(&projection).unwrap();
         assert_eq!(PERSIST_CALLS.get(), 0, "durability needs no rewrite");
         assert_eq!(store.get(HASH_A).unwrap(), Some(projection.receipt));
+    }
+
+    /// A store reopened on the directory, as after a restart, confirms an
+    /// equal replacement durable without a rewrite, leaving the bytes as
+    /// they are.
+    #[test]
+    fn replace_checked_equal_after_reopen_confirms_durable() {
+        let (dir, store) = open_temp_store();
+        let projection = checked(ReceiptStatus::Success, Some(120));
+        store.replace_checked(&projection).unwrap();
+        let bytes = std::fs::read(store.file_path().unwrap()).unwrap();
+
+        let reopened = ReceiptStore::open_at(dir.path(), "test").unwrap();
+        PERSIST_CALLS.set(0);
+        reopened.replace_checked(&projection).unwrap();
+        assert_eq!(
+            PERSIST_CALLS.get(),
+            0,
+            "an equal replacement persists nothing"
+        );
+        assert_eq!(std::fs::read(reopened.file_path().unwrap()).unwrap(), bytes);
+        assert_eq!(reopened.get(HASH_A).unwrap(), Some(projection.receipt));
+    }
+
+    /// The flush handle syncs the store file, changes no byte of it, and
+    /// creates no absent file. On Windows it carries write access, which
+    /// `FlushFileBuffers` requires, so a zero-length write succeeds on it.
+    #[test]
+    fn flush_handle_syncs_without_changing_the_file() {
+        let (_dir, store) = open_temp_store();
+        store
+            .begin_submission(HASH_A, TX_HASH_A, SOURCE_A, SEQ_A, 0, 1)
+            .unwrap();
+        let path = store.file_path().unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        let file = open_for_flush(&path).unwrap();
+        #[cfg(windows)]
+        {
+            use std::io::Write as _;
+            assert_eq!((&file).write(&[]).unwrap(), 0);
+        }
+        file.sync_all().unwrap();
+        drop(file);
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        assert_eq!(
+            open_for_flush(&path.with_file_name("absent.json"))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::NotFound,
+            "a flush creates no file"
+        );
+    }
+
+    /// An owner-read-only store file (mode `0400`) in a writable directory
+    /// confirms an equal replacement durable on Unix: the read-only flush
+    /// handle needs no write permission, nothing is persisted, and the bytes
+    /// and mode stay as they are.
+    #[cfg(unix)]
+    #[test]
+    fn replace_checked_equal_on_owner_read_only_file_confirms_durable() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let (_dir, store) = open_temp_store();
+        let projection = checked(ReceiptStatus::Success, Some(120));
+        store.replace_checked(&projection).unwrap();
+        let path = store.file_path().unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o400)).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+
+        PERSIST_CALLS.set(0);
+        store.replace_checked(&projection).unwrap();
+        assert_eq!(
+            PERSIST_CALLS.get(),
+            0,
+            "an equal replacement persists nothing"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o400
+        );
     }
 
     /// A store file that fails its schema reports the category and position
