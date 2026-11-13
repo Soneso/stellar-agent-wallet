@@ -1658,6 +1658,17 @@ def case_d9_echo_and_comments(m, tmp, checker):
     accepts(bare_checker(m, workflows=workflows), 'D9', 'd9-echo-and-comments')
 
 
+@unit('d9-coverage-allowance')
+def case_d9_coverage_allowance(m, tmp, checker):
+    def coverage(job_name):
+        command = 'cargo llvm-cov --workspace --features ' + m.FEATURE + ',test-helpers'
+        return {'coverage.yml': {'jobs': {job_name: {'steps': [{'run': command}]}}}}
+    accepts(bare_checker(m, workflows=coverage('coverage-on')), 'D9', 'd9-coverage-allowance coverage-on')
+    for job_name in ('coverage-off', 'coverage'):
+        rejects(bare_checker(m, workflows=coverage(job_name)), 'D9',
+                f'coverage.yml:{job_name}: feature activation outside allowed jobs')
+
+
 @unit('d10-documentation')
 def case_d10_documentation(m, tmp, checker):
     import yaml
@@ -2122,6 +2133,10 @@ MUTATIONS = {
         "TESTNET_ACTIVATION_ALLOWANCE = tuple(\n    ('testnet.yml', job, TESTNET_DRIVER) for job in ('acceptance-1', 'acceptance-2'))",
         'TESTNET_ACTIVATION_ALLOWANCE = ()',
         'testnet-driver-activation: accepted form rejected: [\'D9: testnet.yml:acceptance-1:'),
+    'D9-coverage-allowance': ('d9-coverage-allowance',
+        "allowed = allowed or workflow == 'coverage.yml' and job_name == 'coverage-on'",
+        "allowed = allowed or workflow == 'coverage.yml' and job_name == 'coverage'",
+        'd9-coverage-allowance coverage-on: accepted form rejected'),
     'D9-testnet-detection': ('testnet-driver-activation',
         'if path.as_posix() == TESTNET_DRIVER:', 'if False:',
         'testnet-driver-activation: nightly fixture accepted or wrong failure: []'),

@@ -49,6 +49,8 @@ BODIES = {
     "alpha-entry.added.md": "- Alpha item with `code` and café.\n  Continuation.\n  * Nested item.\n",
 }
 SUBCASES_RUN = 0
+UNMERGED_REMEDY = "CHANGELOG.md differs from the clean three-way merge; a maintainer resolves and merges it."
+FRAGMENT_REMEDY = "Move entries to new fragments and remove edits from branch history."
 
 
 def subcase():
@@ -91,7 +93,7 @@ class History:
     def main(self, commit):
         self.git("update-ref", "refs/remotes/origin/main", commit)
 
-    def assert_guard(self, mod, base, head, expected=0, refused=(), main_ref="refs/remotes/origin/main"):
+    def assert_guard(self, mod, base, head, expected=0, refused=(), main_ref="refs/remotes/origin/main", merged=()):
         rc, out, err = cli(mod, ["guard", "--root", str(self.root), "--base", base,
                                  "--head", head, "--main-ref", main_ref])
         require(rc == expected, f"guard must return {expected}, receives {rc}: {err}")
@@ -102,6 +104,10 @@ class History:
         for commit in refused:
             require(commit + ": CHANGELOG.md edit is refused." in err
                     and "remove edits from branch history" in err, "guard must name every refused commit and its remedy")
+        # A sync merge that differs from the clean merge names the maintainer remedy.
+        for commit in merged:
+            require(commit + ": CHANGELOG.md edit is refused. " + UNMERGED_REMEDY in err,
+                    "guard must name every refused merge and the maintainer remedy")
         return err
 
 
@@ -481,7 +487,7 @@ def cases(mod):
     def g06():
         h, base, main = sync_history()
         merge = h.commit(MERGE_BOTH + b"- Own edit.\n", base, main)
-        h.assert_guard(mod, base, merge, 1, [merge])
+        h.assert_guard(mod, base, merge, 1, merged=[merge])
 
     def g07():
         h = History()
@@ -549,7 +555,7 @@ def cases(mod):
     def g14():
         h, base, main = sync_history()
         merge = h.commit(MERGE_THEIRS, base, main)
-        h.assert_guard(mod, base, merge, 1, [merge])
+        h.assert_guard(mod, base, merge, 1, merged=[merge])
 
     def g15():
         h = History()
@@ -585,7 +591,7 @@ def cases(mod):
     def g18():
         h, base, main = sync_history()
         merge = h.commit(MERGE_OURS, base, main)
-        h.assert_guard(mod, base, merge, 1, [merge])
+        h.assert_guard(mod, base, merge, 1, merged=[merge])
 
     def g19():
         for mode, path, body in scenarios(("100644", "OLD.md", MERGE_BOTH),
@@ -656,6 +662,32 @@ def cases(mod):
                                 input=SCRIPT.read_bytes(), cwd=h.root, capture_output=True)
         require(result.returncode == 0 and b"integration guard passes" in result.stderr,
                 "the piped base script must use the current repository without changing arguments")
+
+    def g24():
+        for body in scenarios(MERGE_BOTH + b"- Own edit.\n", MERGE_THEIRS, MERGE_OURS):
+            h, base, main = sync_history()
+            merge = h.commit(body, base, main)
+            err = h.assert_guard(mod, base, merge, 1, merged=[merge])
+            require(err.splitlines() == [f"{merge}: CHANGELOG.md edit is refused. {UNMERGED_REMEDY}"],
+                    "a differing sync merge must name only the maintainer remedy")
+            require("fragment" not in err and "branch history" not in err,
+                    "a differing sync merge must not print the fragment remedy")
+        h = History()
+        edit = h.commit(b"- Edit.\n", h.initial)
+        subcase()
+        err = h.assert_guard(mod, h.initial, edit, 1, [edit])
+        require(err.splitlines() == [f"{edit}: CHANGELOG.md edit is refused. use a two-parent sync merge "
+                                     f"that preserves the clean merge result. {FRAGMENT_REMEDY}"],
+                "a direct edit must keep its refusal text")
+        base = h.commit(b"- Integration.\n", h.initial)
+        main = h.commit(b"- Main.\n", h.initial)
+        h.main(main)
+        merge = h.commit(b"- Main.\n", base, main)
+        subcase()
+        err = h.assert_guard(mod, base, merge, 1, [merge])
+        require(err.splitlines() == [f"{merge}: CHANGELOG.md edit is refused. CHANGELOG.md conflicts; "
+                                     f"a maintainer resolves and merges it. {FRAGMENT_REMEDY}"],
+                "a conflicting merge must keep its refusal text")
 
     def d01():
         for path in scenarios("CONTRIBUTING.md", "changelog.d/README.md"):
@@ -773,6 +805,9 @@ MUTATIONS = {
     "A01": ('root = args.root', 'root = Path(__file__).resolve().parents[2]'),
     "A02": ('sub.add_argument("--version", required=True)', 'sub.add_argument("--version", default="1.2.3")'),
     "A03": ('r"[0-9]+\\.[0-9]+', 'r"v?[0-9]+\\.[0-9]+'),
+    "G24": ('refused.append(f"{commit}: CHANGELOG.md edit is refused. {error}.")',
+            'refused.append(f"{commit}: CHANGELOG.md edit is refused. {error}. '
+            'Move entries to new fragments and remove edits from branch history.")'),
 }
 
 CONSTANT_SUBJECTS = {
@@ -785,7 +820,7 @@ CONSTANT_SUBJECTS = {
     "fold_section": ["C13", "C14", "R13"],
     "section_bounds": ["C14", "R13"],
     "main": ["A01", "A02"],
-    "guard": [f"G{i:02}" for i in range(1, 22)],
+    "guard": [f"G{i:02}" for i in range(1, 22)] + ["G24"],
 }
 
 
@@ -847,7 +882,7 @@ def main(argv):
                         "R02": {"R02", "R16"}, "R08": {"R07", "R08"},
                         "R12": {"C14", "R12"},
                         "A01": {"A01", "G13", *(f"G{i:02}" for i in range(1, 10)),
-                                *(f"G{i:02}" for i in range(14, 22))}}.get(name, {name})
+                                *(f"G{i:02}" for i in range(14, 22)), "G24"}}.get(name, {name})
             require(set(actual) == expected, f"{name}: actual failing IDs {actual}")
             require(not run(module(source)), f"{name}: restored control fails")
             print(f"{name}: parses; failures {sorted(actual)}: {actual[name]}; restored {len(all_cases)}/{len(all_cases)}")

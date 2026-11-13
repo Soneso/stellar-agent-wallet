@@ -61,7 +61,8 @@ cargo install --locked cargo-machete --version 0.9.2
 cargo install --locked cargo-deny --version 0.19.9
 ```
 
-`cargo-llvm-cov` uses the reference pin in `.github/workflows/coverage.yml`.
+`cargo-llvm-cov` uses the reference pins in `.github/workflows/coverage.yml`,
+one for each coverage measurement job.
 `cargo-machete` and `cargo-deny` use the reference pins in
 `.github/workflows/ci.yml`. The `Install surface` workflow checks this guide
 against those pins with `.github/scripts/check-gate-tool-versions.sh`.
@@ -525,15 +526,29 @@ suites.
 
 The floors form a regression ratchet, set a few points below each crate's
 current offline coverage. The aspirational target for new code is 90% per
-crate. Coverage measures feature-off and feature-on independently. Each run
-resets its instrumentation data, writes a separate report and uses the selected
-configuration's floors. Live tiers that attempt RPC and Friendbot access remain
-disabled.
+crate. Coverage measures feature-off and feature-on independently. Two
+parallel report-only checks, `coverage (feature-off)` and
+`coverage (feature-on)`, each write one report. The required check `coverage`
+checks both job results and enforces both floors on the reports of the same
+run. Each run resets its instrumentation data, writes a separate report and
+uses the selected configuration's floors. Live tiers that attempt RPC and
+Friendbot access remain disabled.
 
-CI runs this gate in the Coverage workflow: weekly on main, on a pull request
-that carries the `coverage` label, and on demand through `workflow_dispatch`.
-A maintainer adds the label to a pull request that changes Rust code.
-Local reproduction is optional.
+CI runs this gate in the Coverage workflow. A push to `mainnet-write` or
+`main` runs it and seeds the coverage caches. It also runs weekly on main, on a
+pull request that carries the `coverage` label, and on demand through
+`workflow_dispatch`. A failed, cancelled, or skipped measurement fails
+`coverage`. A maintainer adds the label to a pull request that changes Rust
+code. Local reproduction is optional.
+
+Each report artifact carries the run attempt in its name, so `coverage` reads
+only the reports of its own attempt. A rerun of the gate alone, or of one
+measurement job, finds no report of its attempt and fails. After a failed
+download, a maintainer reruns all jobs.
+
+Rust caches in `ci.yml` and `coverage.yml` save on push runs only. A pull
+request restores matching entries from its base branch and the default branch,
+subject to eviction.
 
 #### Unused dependencies
 
@@ -576,8 +591,10 @@ later.
 The gate tool check compares the versions in [Gate tools](#gate-tools), in the
 other workflows, and in the composite actions with each tool's reference
 workflow pin: `coverage.yml` for `cargo-llvm-cov`, `ci.yml` for
-`cargo-machete` and `cargo-deny`. Its header defines the accepted line shapes,
-and its self-test runs it on fixture trees with one drift form per case.
+`cargo-machete` and `cargo-deny`. `coverage.yml` holds two `cargo-llvm-cov`
+pins at one version; the first is the reference pin. Its header defines the
+accepted line shapes, and its self-test runs it on fixture trees with one drift
+form per case.
 
 ### Windows storage regression (CI-only)
 
@@ -989,8 +1006,9 @@ publication calls it for the verified commit of the tag.
   deployment wrappers, in the builds they run.
 - When a change touches `vendor/`, `build.rs`, `contracts/`, the two scripts,
   or the workflow, and on every tag, scheduled, or dispatched run, two macOS
-  jobs provide the pinned stellar-cli binaries. The stellar-cli caches serve
-  pull request, `main`, scheduled, and dispatched runs only. A tag or crate
+  jobs provide the pinned stellar-cli binaries. The stellar-cli caches restore
+  on pull request, `main`, scheduled, and dispatched runs. Only push and
+  schedule runs save missing entries. A tag or crate
   publication run builds both binaries from source. Each job packs its install
   root as a tar artifact to preserve executable permissions. The `rebuild` job
   reads those artifacts from the same run and uses no cache. It rebuilds every
@@ -1351,8 +1369,8 @@ Each error message names its rule:
   Rustflags and rustdocflags inputs that contain `--cfg` also fail.
   The invocation inventory refuses a compiler argument that passes `--cfg`.
 - D8: no workflow, named script, or this guide enables every feature.
-- D9: only the CI feature-on jobs and the coverage job name `mainnet-write`
-  in a feature list; release-shaped builds activate it through the binary
+- D9: only the CI feature-on jobs and the feature-on coverage job name
+  `mainnet-write` in a feature list; release-shaped builds activate it through the binary
   defaults.
 - D10: the feature list of `ci.yml` and the list in this guide equal the
   declared features except `default` and `mainnet-write`.

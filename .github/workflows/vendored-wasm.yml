@@ -37,8 +37,9 @@ on:
     branches: [main]
   push:
     branches: [main]
-  # Twice a week, so the stellar-cli cache entries stay inside the seven-day
-  # eviction window.
+  # Twice a week, so a restore keeps each present stellar-cli entry in use
+  # within the seven-day eviction window. Push and schedule runs save missing
+  # entries; other events never save.
   schedule:
     - cron: '23 5 * * 1,4'
   workflow_dispatch:
@@ -174,7 +175,7 @@ jobs:
           retention-days: 1
           if-no-files-found: error
       - name: Save the install root
-        if: github.ref_type != 'tag' && !inputs.publication && steps.restore.outputs.cache-hit != 'true'
+        if: github.ref_type != 'tag' && !inputs.publication && (github.event_name == 'push' || github.event_name == 'schedule') && steps.restore.outputs.cache-hit != 'true'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/stellar-cli-25
@@ -240,7 +241,7 @@ jobs:
           retention-days: 1
           if-no-files-found: error
       - name: Save the install root
-        if: github.ref_type != 'tag' && !inputs.publication && steps.restore.outputs.cache-hit != 'true'
+        if: github.ref_type != 'tag' && !inputs.publication && (github.event_name == 'push' || github.event_name == 'schedule') && steps.restore.outputs.cache-hit != 'true'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/stellar-cli-28

@@ -4,9 +4,12 @@
 # CI install the same cargo-llvm-cov, cargo-machete, and cargo-deny so a local
 # gate run reproduces the CI result.
 #
-# Each tool has one reference workflow, named in TOOLS, which pins the tool
-# on exactly one `tool: <tool>@<version>` line; that line may end in a YAML
-# comment. building.md installs each tool on exactly one
+# TOOLS gives each tool's reference workflow and exact pin count. Each
+# reference line uses `tool: <tool>@<version>` and may end in a YAML comment.
+# coverage.yml pins cargo-llvm-cov once
+# for each measurement job. The first reference pin supplies the reference
+# version, and every further reference pin carries it. building.md installs
+# each tool on exactly one
 # `cargo install --locked <tool> --version <version>` line. Every other
 # workflow and composite action pins a tool only on `tool: <tool>@<version>`
 # lines, each at the reference version. A line names a tool with a version
@@ -22,8 +25,8 @@ WORKFLOW_DIR="$ROOT/.github/workflows"
 ACTION_DIR="$ROOT/.github/actions"
 BUILDING_DOC="$ROOT/docs/maintainers/building.md"
 
-# Each gate tool and the workflow that holds its reference pin.
-TOOLS=(cargo-llvm-cov=coverage.yml cargo-machete=ci.yml cargo-deny=ci.yml)
+# Each gate tool, the workflow that holds its reference pins, and their count.
+TOOLS=(cargo-llvm-cov=coverage.yml:2 cargo-machete=ci.yml:1 cargo-deny=ci.yml:1)
 VERSION_RE='([0-9][0-9A-Za-z.+-]*)'
 FAILED=0
 
@@ -64,6 +67,26 @@ single_pin() {
   return 1
 }
 
+# Sets REF_LINE and REF_VERSION from the first pair in PINS when file `$1`
+# holds exactly `$3` pairs, which `$4` spells as a word. Otherwise reports
+# the expected `$2` pins in file `$1` and returns 1.
+reference_pins() {
+  local file="$1" shape="$2" expected="$3" word="$4" count noun=pins
+  count=$(printf '%s' "$PINS" | awk 'END { print NR }')
+  if [ "$count" -eq "$expected" ]; then
+    read -r REF_LINE REF_VERSION <<<"$PINS"
+    return 0
+  fi
+  [ "$count" -ne 1 ] || noun=pin
+  if [ "$count" -eq 0 ]; then
+    echo "error: no '${shape}' pin found in ${file#"$ROOT"/}" >&2
+  else
+    echo "error: ${count} '${shape}' ${noun} found in ${file#"$ROOT"/}, expected ${word}" >&2
+  fi
+  FAILED=1
+  return 1
+}
+
 # Reports that tool `$1` has version `$3` on `$2` and version `$5` on `$4`,
 # each location a `<file>:<line>`.
 report_mismatch() {
@@ -75,19 +98,29 @@ report_mismatch() {
 
 for entry in "${TOOLS[@]}"; do
   tool=${entry%%=*}
-  ref_file="$WORKFLOW_DIR/${entry#*=}"
+  reference=${entry#*=}
+  ref_file="$WORKFLOW_DIR/${reference%:*}"
+  ref_count=${reference##*:}
+  ref_word=one
+  [ "$ref_count" -ne 2 ] || ref_word=two
   pin_re="[[:space:]]*tool: ${tool}@${VERSION_RE}[[:space:]]*(#.*)?"
   pin_shape="tool: ${tool}@<version>"
   install_re="cargo install --locked ${tool} --version ${VERSION_RE}"
   install_shape="--locked ${tool} --version <version>"
 
-  # A single reference pin supplies the comparison version. The guide's line
-  # count and every file's line shapes are checked on their own.
+  # The first of the expected reference pins supplies the comparison version,
+  # and every further reference pin carries it. The guide's line count and
+  # every file's line shapes are checked on their own.
   ref_version=""
   collect_pins "$ref_file" "$tool" yaml "$pin_re" "$pin_shape"
-  if single_pin "$ref_file" "$pin_shape" pin; then
-    ref_at="${ref_file#"$ROOT"/}:${PIN_LINE}"
-    ref_version=$PIN_VERSION
+  if reference_pins "$ref_file" "$pin_shape" "$ref_count" "$ref_word"; then
+    ref_at="${ref_file#"$ROOT"/}:${REF_LINE}"
+    ref_version=$REF_VERSION
+    while read -r line version; do
+      if [ "$version" != "$ref_version" ]; then
+        report_mismatch "$tool" "$ref_at" "$ref_version" "${ref_file#"$ROOT"/}:${line}" "$version"
+      fi
+    done < <(printf '%s\n' "$PINS" | sed 1d)
   fi
 
   collect_pins "$BUILDING_DOC" "$tool" markdown "$install_re" "$install_shape"

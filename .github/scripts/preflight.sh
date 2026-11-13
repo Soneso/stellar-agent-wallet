@@ -172,9 +172,9 @@ test-vendored-release-cfg	cargo test -p $VENDORED_CRATE --test vendored_wasm_rel
 test-policy-pin-release-cfg	cargo test -p $POLICY_PIN_CRATE --doc policy::pin	cargo	ci.yml	test	Test the policy pin release configuration
 machete	cargo machete	cargo,cargo-machete	ci.yml	machete	Check for unused dependencies
 deny	cargo deny check	cargo,cargo-deny	ci.yml	deny	Check licenses and advisories
-coverage	cargo llvm-cov --workspace --no-default-features --features $OFFLINE_FEATURES --json --output-path cov-feature-off.json	cargo,cargo-llvm-cov	coverage.yml	coverage	Measure offline line coverage
+coverage	cargo llvm-cov --workspace --no-default-features --features $OFFLINE_FEATURES --json --output-path cov-feature-off.json	cargo,cargo-llvm-cov	coverage.yml	coverage-off	Measure offline line coverage
 coverage-floors	python3 .github/scripts/check-coverage.py cov-feature-off.json --configuration feature-off	-	coverage.yml	coverage	Enforce per-crate line-coverage floors
-coverage:feature-on	cargo llvm-cov --workspace --features mainnet-write,$OFFLINE_FEATURES --json --output-path cov-feature-on.json	cargo,cargo-llvm-cov	coverage.yml	coverage	Measure feature-on offline line coverage
+coverage:feature-on	cargo llvm-cov --workspace --features mainnet-write,$OFFLINE_FEATURES --json --output-path cov-feature-on.json	cargo,cargo-llvm-cov	coverage.yml	coverage-on	Measure feature-on offline line coverage
 coverage-floors:feature-on	python3 .github/scripts/check-coverage.py cov-feature-on.json --configuration feature-on	-	coverage.yml	coverage	Enforce feature-on line-coverage floors
 inbox-js	node --test crates/stellar-agent-approval-ui/src/web/app_shared.test.mjs crates/stellar-agent-webauthn-bridge/src/web/glue.test.mjs crates/stellar-agent-approval-remote/src/web/signed-login.test.mjs	node	ci.yml	inbox-js	Test the inbox renderers
 mainnet-presence-js	node --test crates/stellar-agent-approval-ui/src/web/mainnet-presence.test.mjs	node	ci.yml	inbox-js	Test the mainnet approval pages
