@@ -3884,28 +3884,65 @@ impl PersistedWindowStore {
     /// receipt and commits `receipt_projected` once the receipt write
     /// completes.
     ///
-    /// The projection is built from the authenticated record alone, so a
-    /// missing receipt is rebuilt from it and receipt contents cannot change
-    /// the committed disposition. Without a receipt store nothing is written
-    /// and the flag stays unset.
+    /// One verified window read supplies the record and the committed
+    /// recovery decisions. A committed decision owns the receipt when its
+    /// attempt's classic exposure names this reservation and transaction.
+    /// The expiry then writes no receipt and commits the flag, with or
+    /// without a receipt store. Source and sequence equality alone selects
+    /// no attempt.
+    /// The audit obligation and the decision's own projection marker stay
+    /// as they are.
+    ///
+    /// Otherwise the projection is built from the authenticated record
+    /// alone, so a missing receipt is rebuilt from it and receipt contents
+    /// cannot change the committed disposition. Without a receipt store
+    /// nothing is written and the flag stays unset. A refused read writes
+    /// neither the receipt nor the flag.
     fn project_accounting_expiry(
         &self,
         profile: &Profile,
         receipts: Option<&ReceiptStore>,
         decision_id: &str,
     ) -> Result<Projection, ProjectionError> {
-        let record = self
-            .accounting_expiry(profile, decision_id)
-            .map_err(ProjectionError::Window)?
+        let wire = self
+            .read_for_inspection(profile)
+            .map_err(ProjectionError::Window)?;
+        let record = wire
+            .as_ref()
+            .and_then(|wire| {
+                wire.accounting_expiries
+                    .iter()
+                    .find(|record| record.decision_id == decision_id)
+            })
+            .cloned()
             .ok_or(ProjectionError::Window(WindowStoreError::Invalid {
                 detail: "the accounting decision is not in verified window state".to_owned(),
             }))?;
         if record.receipt_projected {
             return Ok(Projection::Projected);
         }
+        let decided = wire.as_ref().is_some_and(|wire| {
+            super::operations::committed_exposure_matches(
+                wire,
+                &record.reservation_id,
+                &record.tx_hash,
+            )
+        });
+        #[cfg(test)]
+        tests::expiry_projection_step(tests::EXPIRY_AFTER_ROUTING)
+            .map_err(ProjectionError::Window)?;
+        if decided {
+            self.mark_accounting_expiry(profile, decision_id, |record| {
+                &mut record.receipt_projected
+            })
+            .map_err(ProjectionError::Window)?;
+            return Ok(Projection::Projected);
+        }
         let Some(receipts) = receipts else {
             return Ok(Projection::StoreMissing);
         };
+        #[cfg(test)]
+        tests::EXPIRY_RECEIPT_PROJECTIONS.set(tests::EXPIRY_RECEIPT_PROJECTIONS.get() + 1);
         receipts
             .project_accounting_expiry(&record.projection())
             .map_err(|error| {
@@ -3915,6 +3952,9 @@ impl PersistedWindowStore {
                 );
                 ProjectionError::Receipt(error)
             })?;
+        #[cfg(test)]
+        tests::expiry_projection_step(tests::EXPIRY_AFTER_RECEIPT)
+            .map_err(ProjectionError::Window)?;
         self.mark_accounting_expiry(profile, decision_id, |record| &mut record.receipt_projected)
             .map_err(ProjectionError::Window)?;
         Ok(Projection::Projected)
@@ -13031,6 +13071,353 @@ mod tests {
         assert_eq!(record.decision_id, decision_id);
     }
 
+    /// The flag of the verified accounting-expiry record `decision_id`.
+    fn expiry_projected(
+        store: &PersistedWindowStore,
+        profile: &Profile,
+        decision_id: &str,
+    ) -> bool {
+        PersistedWindowStore::at_path(store.path().to_owned())
+            .read_for_inspection(profile)
+            .unwrap()
+            .unwrap()
+            .accounting_expiries
+            .iter()
+            .find(|record| record.decision_id == decision_id)
+            .unwrap()
+            .receipt_projected
+    }
+
+    /// Whether the committed decision on transaction `tx_hash` carries its
+    /// projection marker.
+    fn outcome_marker(store: &PersistedWindowStore, profile: &Profile, tx_hash: [u8; 32]) -> bool {
+        super::super::OperationStatus::new(store, profile)
+            .committed_decisions(Some(&tx_hash))
+            .unwrap()
+            .pop()
+            .unwrap()
+            .projected
+    }
+
+    /// A matching committed proof completes an owed expiry projection
+    /// without a receipt write, with or without a receipt store. The audit
+    /// obligation and the outcome marker stay owed. A different attempt at
+    /// the same source and sequence suppresses nothing.
+    #[test]
+    #[serial]
+    fn recovery_expiry_suppression_completes_receipt_flag() {
+        use super::super::operations::tests::{
+            Checked, Fx, checked_transition, commit_on, decided_attempt, envelope_id,
+            expire_reservation, unknown_at,
+        };
+        for with_store in [true, false] {
+            let mut fx = Fx::new();
+            let dir = TempDir::new().unwrap();
+            let receipts = ReceiptStore::open_at(dir.path(), "ops").unwrap();
+            decided_attempt(&mut fx, 1);
+            let decision_id = expire_reservation(&mut fx, 1, None);
+            commit_on(
+                &mut fx,
+                [1 ^ 0x80; 32],
+                checked_transition(1, Checked::NotIncluded, ""),
+            );
+            let rows = fx.sink.entries.len();
+            tests::EXPIRY_RECEIPT_PROJECTIONS.set(0);
+            assert_eq!(
+                fx.store
+                    .project_accounting_expiry(
+                        &fx.profile,
+                        with_store.then_some(&receipts),
+                        &decision_id
+                    )
+                    .unwrap(),
+                Projection::Projected
+            );
+            assert!(
+                expiry_projected(&fx.store, &fx.profile, &decision_id),
+                "the durable flag is set"
+            );
+            assert_eq!(tests::EXPIRY_RECEIPT_PROJECTIONS.get(), 0);
+            assert!(receipts.get(&envelope_id(1)).unwrap().is_none());
+            let owed = fx.store.owed_accounting_expiries(&fx.profile).unwrap();
+            assert!(owed.unprojected.is_empty());
+            assert_eq!(owed.unacknowledged, vec![decision_id]);
+            assert!(!outcome_marker(&fx.store, &fx.profile, [1 ^ 0x80; 32]));
+            assert_eq!(fx.sink.entries.len(), rows);
+        }
+
+        let mut fx = Fx::new();
+        let dir = TempDir::new().unwrap();
+        let receipts = ReceiptStore::open_at(dir.path(), "ops").unwrap();
+        decided_attempt(&mut fx, 1);
+        unknown_at(&mut fx, 2, 101);
+        let decision_id = expire_reservation(&mut fx, 1, None);
+        commit_on(
+            &mut fx,
+            [2 ^ 0x80; 32],
+            checked_transition(2, Checked::Succeeded, ""),
+        );
+        tests::EXPIRY_RECEIPT_PROJECTIONS.set(0);
+        assert_eq!(
+            fx.store
+                .project_accounting_expiry(&fx.profile, Some(&receipts), &decision_id)
+                .unwrap(),
+            Projection::Projected
+        );
+        assert_eq!(tests::EXPIRY_RECEIPT_PROJECTIONS.get(), 1);
+        let receipt = receipts.get(&envelope_id(1)).unwrap().unwrap();
+        assert_eq!(
+            receipt.release_code,
+            Some(ReleaseEvidence::AccountingExpired)
+        );
+        assert_eq!(receipt.settlement_decision_id, Some(decision_id));
+    }
+
+    /// A crash after the expiry receipt write and before its flag leaves the
+    /// flag owed. After the matching outcome commits and a restart, routing
+    /// completes the flag with no second expiry projection call, and outcome
+    /// repair then completes on its own.
+    #[test]
+    #[serial]
+    fn recovery_expiry_receipt_flag_replays_after_crash() {
+        use super::super::operations::tests::{
+            Checked, Fx, checked_transition, commit_on, decided_attempt, envelope_id,
+            expire_reservation,
+        };
+        let mut fx = Fx::new();
+        let dir = TempDir::new().unwrap();
+        let receipts = ReceiptStore::open_at(dir.path(), "ops").unwrap();
+        decided_attempt(&mut fx, 1);
+        let mut crashed = false;
+        let armed = tests::on_expiry_step(move |step| {
+            if step == tests::EXPIRY_AFTER_RECEIPT && !crashed {
+                crashed = true;
+                return Err(WindowStoreError::Io {
+                    kind: std::io::ErrorKind::Interrupted,
+                });
+            }
+            Ok(())
+        });
+        let decision_id = expire_reservation(&mut fx, 1, Some(&receipts));
+        drop(armed);
+        let stale = receipts.get(&envelope_id(1)).unwrap().unwrap();
+        assert_eq!(
+            stale.settlement_decision_id.as_deref(),
+            Some(decision_id.as_str())
+        );
+        assert!(!expiry_projected(&fx.store, &fx.profile, &decision_id));
+        let commit = commit_on(
+            &mut fx,
+            [1 ^ 0x80; 32],
+            checked_transition(1, Checked::NotIncluded, ""),
+        );
+
+        let store = PersistedWindowStore::at_path(fx.store.path().to_owned());
+        let receipts = ReceiptStore::open_at(dir.path(), "ops").unwrap();
+        let bytes = fs::read(receipts.file_path().unwrap()).unwrap();
+        tests::EXPIRY_RECEIPT_PROJECTIONS.set(0);
+        assert_eq!(
+            store
+                .project_accounting_expiry(&fx.profile, Some(&receipts), &decision_id)
+                .unwrap(),
+            Projection::Projected
+        );
+        assert_eq!(
+            tests::EXPIRY_RECEIPT_PROJECTIONS.get(),
+            0,
+            "restart makes no second expiry projection call"
+        );
+        assert_eq!(fs::read(receipts.file_path().unwrap()).unwrap(), bytes);
+        assert!(expiry_projected(&store, &fx.profile, &decision_id));
+        assert!(!outcome_marker(&store, &fx.profile, [1 ^ 0x80; 32]));
+
+        let writer = crate::submission_flow::recovery::tests::writer_at(&fx.profile.audit_log_path);
+        crate::submission_flow::recovery::repair_committed_receipts(
+            &store,
+            &fx.profile,
+            &receipts,
+            &writer,
+            None,
+        )
+        .unwrap();
+        let receipt = receipts.get(&envelope_id(1)).unwrap().unwrap();
+        assert_eq!(receipt.status, ReceiptStatus::Ambiguous);
+        assert_eq!(
+            receipt.release_code,
+            Some(ReleaseEvidence::ReleasedOnEvidence)
+        );
+        assert_eq!(receipt.settlement_decision_id, Some(commit.to_hex()));
+        assert!(outcome_marker(&store, &fx.profile, [1 ^ 0x80; 32]));
+        let wire = store.read_for_inspection(&fx.profile).unwrap().unwrap();
+        assert_eq!(wire.accounting_expiries.len(), 1, "one expiry");
+        assert_eq!(
+            wire.authorizations
+                .iter()
+                .filter(|auth| auth.native_release.is_some())
+                .count(),
+            1,
+            "one release"
+        );
+    }
+
+    /// An acknowledgement interrupted after its counter write selects the
+    /// true marker on reopen; one interrupted after the prepared image alone
+    /// keeps it unset. Both keep the exact receipt and replay to completion
+    /// without a second release or audit row.
+    #[test]
+    #[serial]
+    fn recovery_projection_acknowledgement_survives_commit_point() {
+        use super::super::operations::tests::{
+            Checked, Fx, accounting_state, commit_checked, envelope_id,
+        };
+        for seam in [COMMIT_FAULT_AFTER_COUNTER, COMMIT_FAULT_AFTER_PREPARED] {
+            let mut fx = Fx::new();
+            let dir = TempDir::new().unwrap();
+            let receipts = ReceiptStore::open_at(dir.path(), "ops").unwrap();
+            let writer =
+                crate::submission_flow::recovery::tests::writer_at(&fx.profile.audit_log_path);
+            commit_checked(&mut fx, 1, Checked::NotIncluded);
+            let state = accounting_state(&fx.store, &fx.profile).0;
+            let audit = fs::read(&fx.profile.audit_log_path).unwrap();
+            let rows = fx.sink.entries.len();
+            let repair = |store: &PersistedWindowStore, receipts: &ReceiptStore| {
+                crate::submission_flow::recovery::repair_committed_receipts(
+                    store,
+                    &fx.profile,
+                    receipts,
+                    &writer,
+                    None,
+                )
+            };
+            {
+                let _armed = arm_accounting_fault(seam);
+                assert!(repair(&fx.store, &receipts).is_err());
+            }
+            let store = PersistedWindowStore::at_path(fx.store.path().to_owned());
+            let receipts = ReceiptStore::open_at(dir.path(), "ops").unwrap();
+            assert_eq!(
+                outcome_marker(&store, &fx.profile, [1 ^ 0x80; 32]),
+                seam == COMMIT_FAULT_AFTER_COUNTER,
+                "seam {seam}: the committed generation decides the marker"
+            );
+            let expected = super::super::OperationStatus::new(&store, &fx.profile)
+                .committed_decisions(None)
+                .unwrap()
+                .pop()
+                .unwrap()
+                .receipt_projection()
+                .unwrap()
+                .receipt;
+            assert_eq!(
+                receipts.get(&envelope_id(1)).unwrap(),
+                Some(expected.clone())
+            );
+            repair(&store, &receipts).unwrap();
+            assert!(outcome_marker(&store, &fx.profile, [1 ^ 0x80; 32]));
+            assert_eq!(receipts.get(&envelope_id(1)).unwrap(), Some(expected));
+            assert_eq!(accounting_state(&store, &fx.profile).0, state);
+            assert_eq!(fs::read(&fx.profile.audit_log_path).unwrap(), audit);
+            assert_eq!(fx.sink.entries.len(), rows);
+        }
+    }
+
+    /// An expiry paused after its verified reads find no proof writes its
+    /// stale receipt after the outcome is committed, repaired and
+    /// acknowledged. The next repair restores the checked linkage and
+    /// evidence, keeping an operator clear; accounting and the outcome
+    /// marker stay as they are.
+    #[test]
+    #[serial]
+    fn recovery_projection_heals_late_expiry_write() {
+        use super::super::operations::tests::{
+            Fx, Sink, accounting_state, decide, decided_attempt, envelope_id, expire_reservation,
+            not_included_proof,
+        };
+        for clear in [false, true] {
+            let mut fx = Fx::new();
+            let dir = TempDir::new().unwrap();
+            let receipts = ReceiptStore::open_at(dir.path(), "ops").unwrap();
+            let writer =
+                crate::submission_flow::recovery::tests::writer_at(&fx.profile.audit_log_path);
+            decided_attempt(&mut fx, 1);
+            let (store, profile) = (fx.store.clone(), fx.profile.clone());
+            let (late_receipts, late_writer) = (receipts.clone(), std::sync::Arc::clone(&writer));
+            let mut decided = false;
+            let armed = tests::on_expiry_step(move |step| {
+                if step == tests::EXPIRY_AFTER_ROUTING && !decided {
+                    decided = true;
+                    let attempt = super::super::OperationStatus::new(&store, &profile)
+                        .outcome_snapshot(Some(&[1 ^ 0x80; 32]))
+                        .unwrap()
+                        .pop()
+                        .unwrap();
+                    let mut sink = Sink::default();
+                    super::super::OperationRecorder::new(&store, &profile, &mut sink, "late")
+                        .commit_decision(&decide(
+                            &attempt,
+                            super::super::DecidedTransition::NotIncluded(not_included_proof()),
+                        ))
+                        .unwrap();
+                    crate::submission_flow::recovery::repair_committed_receipts(
+                        &store,
+                        &profile,
+                        &late_receipts,
+                        &late_writer,
+                        None,
+                    )
+                    .unwrap();
+                }
+                Ok(())
+            });
+            let decision_id = expire_reservation(&mut fx, 1, Some(&receipts));
+            drop(armed);
+            let stale = receipts.get(&envelope_id(1)).unwrap().unwrap();
+            assert_eq!(stale.release_code, Some(ReleaseEvidence::AccountingExpired));
+            assert_eq!(
+                stale.settlement_decision_id.as_deref(),
+                Some(decision_id.as_str())
+            );
+            assert!(expiry_projected(&fx.store, &fx.profile, &decision_id));
+            assert!(outcome_marker(&fx.store, &fx.profile, [1 ^ 0x80; 32]));
+            let state = accounting_state(&fx.store, &fx.profile).0;
+            if clear {
+                receipts.clear_by_operator(&envelope_id(1)).unwrap();
+            }
+
+            crate::submission_flow::recovery::repair_committed_receipts(
+                &fx.store,
+                &fx.profile,
+                &receipts,
+                &writer,
+                None,
+            )
+            .unwrap();
+            let commit = super::super::OperationStatus::new(&fx.store, &fx.profile)
+                .committed_decisions(None)
+                .unwrap()
+                .pop()
+                .unwrap()
+                .commit_id;
+            let receipt = receipts.get(&envelope_id(1)).unwrap().unwrap();
+            assert_eq!(
+                (receipt.settlement_decision_id, receipt.release_code),
+                (
+                    Some(commit.to_hex()),
+                    Some(ReleaseEvidence::ReleasedOnEvidence)
+                ),
+                "the next pass restores the checked linkage"
+            );
+            let status = if clear {
+                ReceiptStatus::ClearedByOperator
+            } else {
+                ReceiptStatus::Ambiguous
+            };
+            assert_eq!(receipt.status, status);
+            assert_eq!(accounting_state(&fx.store, &fx.profile).0, state);
+            assert!(outcome_marker(&fx.store, &fx.profile, [1 ^ 0x80; 32]));
+        }
+    }
+
     /// A blocked window commit leaves the receipt bytes unchanged and owes
     /// nothing. A committed expiry survives a later receipt failure and
     /// supplies the projection's code and identifier.
@@ -17525,6 +17912,51 @@ mod tests {
             });
         }
         Ok(())
+    }
+
+    /// The expiry projection step after its verified read routes it.
+    pub(super) const EXPIRY_AFTER_ROUTING: u8 = 1;
+    /// The expiry projection step after its receipt write, before its flag.
+    pub(super) const EXPIRY_AFTER_RECEIPT: u8 = 2;
+
+    type ExpiryStepHook = Box<dyn FnMut(u8) -> Result<(), WindowStoreError>>;
+
+    thread_local! {
+        /// The calls this thread makes to the receipt store's expiry projection.
+        pub(super) static EXPIRY_RECEIPT_PROJECTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+        static EXPIRY_STEP_HOOK: std::cell::RefCell<Option<ExpiryStepHook>> = std::cell::RefCell::new(None);
+    }
+
+    /// Runs the armed hook at expiry projection `step`; an error stops the
+    /// projection there.
+    pub(super) fn expiry_projection_step(step: u8) -> Result<(), WindowStoreError> {
+        let Some(mut hook) = EXPIRY_STEP_HOOK.with_borrow_mut(Option::take) else {
+            return Ok(());
+        };
+        let result = hook(step);
+        EXPIRY_STEP_HOOK.with_borrow_mut(|slot| {
+            if slot.is_none() {
+                *slot = Some(hook);
+            }
+        });
+        result
+    }
+
+    /// Disarms the expiry step hook on this thread when dropped.
+    pub(crate) struct ArmedExpiryStep;
+    impl Drop for ArmedExpiryStep {
+        fn drop(&mut self) {
+            EXPIRY_STEP_HOOK.with_borrow_mut(|hook| *hook = None);
+        }
+    }
+
+    /// Runs `hook` at every expiry projection step on this thread until the
+    /// returned guard drops.
+    pub(crate) fn on_expiry_step(
+        hook: impl FnMut(u8) -> Result<(), WindowStoreError> + 'static,
+    ) -> ArmedExpiryStep {
+        EXPIRY_STEP_HOOK.with_borrow_mut(|slot| *slot = Some(Box::new(hook)));
+        ArmedExpiryStep
     }
 
     /// Disarms the accounting seam on this thread when dropped.

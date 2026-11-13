@@ -55,13 +55,15 @@ use stellar_agent_core::audit_log::AuditEntry;
 use stellar_agent_core::audit_log::schema::{EvidenceKind, OperationEvidenceRow};
 use stellar_agent_core::policy::state_lock::WindowStoreLock;
 use stellar_agent_core::profile::caip2::Caip2;
-use stellar_agent_core::profile::receipt::{AttemptRef, SequenceReleases};
+use stellar_agent_core::profile::receipt::{
+    AttemptRef, CheckedReceiptProjection, ReceiptStatus, SequenceReleases,
+};
 use stellar_agent_core::profile::schema::Profile;
 
 use super::WindowStoreError;
 use super::ledger::{
-    AuthorizationState, DomainBinding, MintAuthority, MintOptions, MintRequest, MintedRecord,
-    WireAuthorization,
+    AuthorizationState, ConsumptionBinding, DomainBinding, MintAuthority, MintOptions, MintRequest,
+    MintedRecord, WireAuthorization,
 };
 use super::recovery::{CheckedRecoveryDecision, DecidedTransition};
 use super::store::{
@@ -819,12 +821,31 @@ impl ExposureIdentity {
 }
 
 /// A committed exposure.
+///
+/// `source` and `submission_ledger` are the receipt projection facts a
+/// consumption commit records beside the exposure. An exposure without them
+/// omits both fields, so its bytes stay as they are.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct WireExposure {
     pub(super) identity: ExposureIdentity,
     pub(super) commit_id: CommitId,
     pub(super) exposed_at_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) submission_ledger: Option<u32>,
+}
+
+/// The length of a G-strkey account identity.
+const ACCOUNT_ID_LEN: usize = 56;
+
+/// Whether `source` has the shape of a G-strkey account identity.
+fn account_id_shaped(source: &str) -> bool {
+    source.len() == ACCOUNT_ID_LEN
+        && source
+            .bytes()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
 }
 
 /// The first commit that proved an attempt's sequence released.
@@ -1227,6 +1248,27 @@ pub(super) struct WireDecision {
     pub(super) fee_charged: Option<i64>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub(super) projected: bool,
+    /// A failure's stable code, derived from its complete result XDR.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) failure_code: Option<String>,
+}
+
+/// Whether `code` fits a stored error code: 1 to 64 printable ASCII bytes.
+fn code_fits(code: &str) -> bool {
+    !code.is_empty() && code.len() <= NAME_MAX && code.bytes().all(|b| b.is_ascii_graphic())
+}
+
+/// The stable code of a failed transaction's complete base64 result XDR, or
+/// `None` when the result does not decode or its code exceeds its bound.
+fn failure_code_of(result_xdr: &str) -> Option<String> {
+    use stellar_xdr::{ReadXdr as _, TransactionResult};
+    let result = TransactionResult::from_xdr_base64(
+        result_xdr,
+        stellar_agent_xdr_limits::untrusted_decode_limits(result_xdr.len()),
+    )
+    .ok()?;
+    let code = crate::submit::map_failed_result(Some(&result)).code();
+    code_fits(code).then(|| code.to_owned())
 }
 
 /// One attempt of an operation.
@@ -1283,9 +1325,7 @@ pub struct OperationResult {
 
 impl OperationResult {
     fn well_formed(&self) -> bool {
-        self.error_code.as_deref().is_none_or(|code| {
-            !code.is_empty() && code.len() <= NAME_MAX && code.bytes().all(|b| b.is_ascii_graphic())
-        })
+        self.error_code.as_deref().is_none_or(code_fits)
     }
 }
 
@@ -2282,10 +2322,18 @@ fn validate_record(record: &WireOperation, chain: Option<Caip2>) -> Result<(), W
         }
         if attempt.request_id.is_empty()
             || attempt.request_id.len() > REQUEST_ID_MAX
+            || attempt.exposure.as_ref().is_some_and(|exposure| {
+                !exposure.identity.well_formed()
+                    || exposure
+                        .source
+                        .as_deref()
+                        .is_some_and(|source| !account_id_shaped(source))
+            })
             || attempt
-                .exposure
+                .decision
                 .as_ref()
-                .is_some_and(|exposure| !exposure.identity.well_formed())
+                .and_then(|decision| decision.failure_code.as_deref())
+                .is_some_and(|code| !code_fits(code))
             || attempt.agreed_outcome.as_ref().is_some_and(|outcome| {
                 !outcome.status.fits(ENDPOINT_TEXT_MAX) || !outcome.result_xdr.fits(RESULT_XDR_MAX)
             })
@@ -3391,21 +3439,36 @@ impl Session<'_> {
         pre_exposure_ledger: Option<u32>,
     ) -> Result<CommitId, WindowStoreError> {
         self.sweep_and_adopt()?;
-        self.expose_swept(id, attempt_index, identity, pre_exposure_ledger)
+        self.expose_swept(
+            id,
+            attempt_index,
+            identity,
+            pre_exposure_ledger,
+            ProjectionFacts::default(),
+        )
     }
 
-    /// The exposure step after the caller's own sweep.
+    /// The exposure step after the caller's own sweep. `facts` are the
+    /// receipt projection facts the exposure records beside its identity.
     fn expose_swept(
         &mut self,
         id: OperationId,
         attempt_index: u32,
         identity: &ExposureIdentity,
         pre_exposure_ledger: Option<u32>,
+        facts: ProjectionFacts,
     ) -> Result<CommitId, WindowStoreError> {
         if !identity.well_formed() {
             return Err(invalid(
                 "an exposure's receipt reference is not a reference",
             ));
+        }
+        if facts
+            .source
+            .as_deref()
+            .is_some_and(|source| !account_id_shaped(source))
+        {
+            return Err(invalid("an exposure's source is not an account identity"));
         }
         let index = record_index(&self.wire, id)?;
         let commit = self.audit.commit;
@@ -3443,6 +3506,8 @@ impl Session<'_> {
             identity: identity.clone(),
             commit_id: commit,
             exposed_at_ms: self.now,
+            source: facts.source,
+            submission_ledger: facts.submission_ledger,
         });
         attempt.pre_exposure_ledger = pre_exposure_ledger;
         record.updated_at_ms = self.now;
@@ -3787,6 +3852,12 @@ impl Session<'_> {
         let commit = self.audit.commit;
         let now = self.now;
         let (primary_ledger, witness_ledger) = decision.ledgers();
+        // The complete result decides the stable code before the stored
+        // copy is bounded; an undecodable result stores no code.
+        let failure_code = match decision.transition() {
+            DecidedTransition::Failed { outcome, .. } => failure_code_of(&outcome.result_xdr),
+            DecidedTransition::Succeeded(_) | DecidedTransition::NotIncluded(_) => None,
+        };
         let attempt = record.attempt_mut(attempt_index)?;
         attempt.outcome = Some(to);
         match decision.transition() {
@@ -3807,6 +3878,7 @@ impl Session<'_> {
             witness_ledger,
             fee_charged,
             projected: false,
+            failure_code,
         });
         let auth_id = attempt.authorization_id;
         let result = record.result.get_or_insert_default();
@@ -4055,10 +4127,23 @@ pub struct ConsumptionExposure<'a> {
     pub identity: ExposureIdentity,
     /// The independently observed lower bound before exposure.
     pub pre_exposure_ledger: Option<u32>,
+    /// The account whose sequence the transaction consumes, recorded on the
+    /// exposure as a receipt projection fact.
+    pub source: Option<String>,
+    /// The ledger the submission recorded, stored on the exposure as a
+    /// receipt projection fact.
+    pub submission_ledger: Option<u32>,
     /// The writer the exposure row is appended to, before the window write.
     pub audit: &'a mut dyn OperationAudit,
     /// The caller's request identifier on the exposure row.
     pub request_id: &'a str,
+}
+
+/// The receipt projection facts an exposure records beside its identity.
+#[derive(Debug, Clone, Default)]
+struct ProjectionFacts {
+    source: Option<String>,
+    submission_ledger: Option<u32>,
 }
 
 impl std::fmt::Debug for ConsumptionExposure<'_> {
@@ -4102,6 +4187,10 @@ pub(super) fn expose_in_consumption(
         exposure.attempt_index,
         &exposure.identity,
         exposure.pre_exposure_ledger,
+        ProjectionFacts {
+            source: exposure.source.clone(),
+            submission_ledger: exposure.submission_ledger,
+        },
     );
     *wire = session.wire;
     exposed?;
@@ -4584,6 +4673,247 @@ pub struct CommittedDecision {
     pub not_included: Option<NotIncludedProof>,
     /// Whether the caller acknowledged the decision's receipt projection.
     pub projected: bool,
+    /// The attempt's receipt identity, when every authenticated fact it
+    /// needs is present.
+    pub projection_identity: Option<ReceiptProjectionIdentity>,
+    /// The name of the first required projection fact absent from
+    /// authenticated state: `source`, `submission_ledger`, `approval_nonce`
+    /// or `failure_code`.
+    pub missing_projection_fact: Option<String>,
+    /// A failure's stable code, from the committed decision or from its
+    /// retained complete result XDR.
+    pub failure_code: Option<String>,
+}
+
+/// The receipt identity of one committed attempt, assembled on read from
+/// authenticated fields of that attempt.
+///
+/// Sequence, `max_time` and the receipt reference come from the classic
+/// exposure. The source comes from the exposure, the transaction binding,
+/// the matching consumption or the matching reservation, and every present
+/// source agrees. The submission ledger comes from the consumption commit's
+/// exposure, then the attempt authorization's consumption when it names the
+/// same transaction, then the matching reservation. Every source is a field
+/// of the verified window. The nonce comes from the attempt's authority; a
+/// policy authority authenticates its absence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReceiptProjectionIdentity {
+    /// The account whose sequence the transaction consumes.
+    pub source: String,
+    /// The sequence the transaction consumes.
+    pub sequence: i64,
+    /// The transaction's `max_time` in Unix seconds; zero for none.
+    pub max_time: u64,
+    /// The receipt's key: the exposure's receipt reference.
+    pub receipt_reference: String,
+    /// The ledger the submission recorded.
+    pub submission_ledger: u32,
+    /// The approval nonce; `None` under a policy authority.
+    pub approval_nonce: Option<String>,
+}
+
+/// The refusal of a projection whose required fact `field` is absent from
+/// authenticated state.
+fn missing_projection_fact(field: &str) -> stellar_agent_core::error::WalletError {
+    stellar_agent_core::error::WalletError::Submission(
+        stellar_agent_core::error::SubmissionError::RecordUnavailable {
+            detail: format!("missing_projection_fact:{field}"),
+        },
+    )
+}
+
+impl CommittedDecision {
+    /// The receipt this decision projects.
+    ///
+    /// `Succeeded` projects to `Success`, `Failed` to `Failed` with the stable
+    /// code, and `NotIncluded` to `Ambiguous` with
+    /// `accounting.released_on_evidence`. The receipt is keyed by the
+    /// attempt's receipt reference and names this decision's commit.
+    ///
+    /// # Errors
+    ///
+    /// `submission.record_unavailable` with detail
+    /// `missing_projection_fact:<field>` when a required fact is absent, and
+    /// for a state with no checked receipt.
+    pub fn receipt_projection(
+        &self,
+    ) -> Result<CheckedReceiptProjection, stellar_agent_core::error::WalletError> {
+        if let Some(field) = &self.missing_projection_fact {
+            return Err(missing_projection_fact(field));
+        }
+        let identity = self
+            .projection_identity
+            .as_ref()
+            .ok_or_else(|| missing_projection_fact("source"))?;
+        let (status, ledger) = match self.state {
+            OperationState::Succeeded => (ReceiptStatus::Success, self.ledger),
+            OperationState::Failed => {
+                let code = self
+                    .failure_code
+                    .clone()
+                    .ok_or_else(|| missing_projection_fact("failure_code"))?;
+                (ReceiptStatus::Failed { code }, self.ledger)
+            }
+            OperationState::NotIncluded => (ReceiptStatus::Ambiguous, None),
+            other => {
+                return Err(stellar_agent_core::error::WalletError::Submission(
+                    stellar_agent_core::error::SubmissionError::RecordUnavailable {
+                        detail: format!(
+                            "a {} decision has no checked receipt projection",
+                            other.wire_name()
+                        ),
+                    },
+                ));
+            }
+        };
+        Ok(CheckedReceiptProjection::new(
+            identity.receipt_reference.clone(),
+            stellar_agent_core::hex::encode(&self.tx_hash),
+            identity.source.clone(),
+            identity.sequence,
+            identity.max_time,
+            identity.submission_ledger,
+            status,
+            ledger,
+            identity.approval_nonce.clone(),
+            self.commit_id.to_hex(),
+        ))
+    }
+}
+
+/// The receipt identity of `attempt` from authenticated fields of `wire`,
+/// or the name of the first required fact absent.
+///
+/// A transaction binding that names another transaction or sequence, and
+/// sources that disagree, leave the source unauthenticated.
+fn projection_identity(
+    wire: &WireFile,
+    attempt: &WireAttempt,
+) -> Result<ReceiptProjectionIdentity, &'static str> {
+    let Some((exposure, tx_hash, sequence, max_time, receipt)) = attempt
+        .exposure
+        .as_ref()
+        .and_then(|exposure| match &exposure.identity {
+            ExposureIdentity::Classic {
+                tx_hash,
+                sequence,
+                max_time,
+                receipt,
+                ..
+            } => Some((exposure, tx_hash, *sequence, *max_time, receipt)),
+            ExposureIdentity::X402 { .. } => None,
+        })
+    else {
+        return Err("source");
+    };
+    let auth = wire
+        .authorizations
+        .iter()
+        .find(|auth| auth.id == attempt.authorization_id);
+    let binding_source = match auth.map(|auth| &auth.binding) {
+        Some(DomainBinding::Transaction {
+            tx_hash: bound,
+            sequence: bound_sequence,
+            source,
+            ..
+        }) => {
+            if bound != tx_hash || *bound_sequence != sequence {
+                return Err("source");
+            }
+            Some(source.as_str())
+        }
+        _ => None,
+    };
+    // The consumption of the attempt's own authorization, when it names the
+    // exposed transaction, sequence, time bound and receipt.
+    let consumption = match auth.and_then(|auth| auth.consumption.as_ref()) {
+        Some(ConsumptionBinding::Transaction(submission))
+            if submission.tx_hash == *tx_hash
+                && submission.sequence == sequence
+                && submission.max_time == max_time
+                && stellar_agent_core::hex::encode(&submission.envelope_hash) == *receipt =>
+        {
+            Some(submission)
+        }
+        _ => None,
+    };
+    let tx_hex = stellar_agent_core::hex::encode(tx_hash);
+    let reservation = wire
+        .entries
+        .iter()
+        .flat_map(|bucket| &bucket.records)
+        .find(|record| {
+            &record.id == receipt
+                && record.tx_hash == tx_hex
+                && record.sequence == sequence
+                && !record.source.is_empty()
+        });
+    let mut sources = [
+        exposure.source.as_deref(),
+        binding_source,
+        consumption.map(|submission| submission.source.as_str()),
+        reservation.map(|record| record.source.as_str()),
+    ]
+    .into_iter()
+    .flatten();
+    let source = sources.next().ok_or("source")?;
+    if sources.any(|other| other != source) {
+        return Err("source");
+    }
+    let submission_ledger = exposure
+        .submission_ledger
+        .or(consumption.map(|submission| submission.submission_ledger))
+        .or(reservation.map(|record| record.submission_ledger))
+        .ok_or("submission_ledger")?;
+    let approval_nonce = match &attempt.authority {
+        OperationAuthority::Policy { .. } => None,
+        OperationAuthority::Approval { approval_nonce, .. } => Some(approval_nonce.clone()),
+    };
+    Ok(ReceiptProjectionIdentity {
+        source: source.to_owned(),
+        sequence,
+        max_time,
+        receipt_reference: receipt.clone(),
+        submission_ledger,
+        approval_nonce,
+    })
+}
+
+/// A failure's stable code: the committed one, or one derived from the
+/// retained result XDR when it is complete and decodes.
+fn committed_failure_code(attempt: &WireAttempt, decision: &WireDecision) -> Option<String> {
+    if attempt.outcome != Some(OperationState::Failed) {
+        return None;
+    }
+    decision.failure_code.clone().or_else(|| {
+        attempt
+            .agreed_outcome
+            .as_ref()
+            .filter(|outcome| !outcome.result_xdr.truncated())
+            .and_then(|outcome| failure_code_of(outcome.result_xdr.text()))
+    })
+}
+
+/// Whether `wire` holds a committed decision of the classic attempt whose
+/// exposure names receipt `reservation_id` and transaction `tx_hash`.
+pub(super) fn committed_exposure_matches(
+    wire: &WireFile,
+    reservation_id: &str,
+    tx_hash: &str,
+) -> bool {
+    records(wire).iter().any(|record| {
+        record.attempts.iter().any(|attempt| {
+            attempt.decision.is_some()
+                && attempt.exposure.as_ref().is_some_and(|exposure| {
+                    matches!(
+                        &exposure.identity,
+                        ExposureIdentity::Classic { tx_hash: stored, receipt, .. }
+                            if receipt == reservation_id
+                                && stellar_agent_core::hex::encode(stored) == tx_hash
+                    )
+                })
+        })
+    })
 }
 
 /// An authenticated classic attempt eligible for recovery.
@@ -4730,6 +5060,10 @@ impl<'a> OperationStatus<'a> {
     /// outcomes and `NotIncluded`, read after the attempt left recovery
     /// selection. A transaction hash selects only its attempt's decision.
     ///
+    /// Each decision carries the receipt identity and failure code that the
+    /// same verified read authenticates for its attempt, or the name of the
+    /// first required fact it lacks. Acknowledged decisions are included.
+    ///
     /// # Errors
     ///
     /// Every integrity, keyring and I/O error of the verified window read.
@@ -4757,6 +5091,15 @@ impl<'a> OperationStatus<'a> {
                 if tx_hash.is_some_and(|hash| hash != stored_hash) {
                     continue;
                 }
+                let identity = projection_identity(&wire, attempt);
+                let failure_code = committed_failure_code(attempt, decision);
+                let missing = match &identity {
+                    Err(field) => Some((*field).to_owned()),
+                    Ok(_) if state == OperationState::Failed && failure_code.is_none() => {
+                        Some("failure_code".to_owned())
+                    }
+                    Ok(_) => None,
+                };
                 decisions.push(CommittedDecision {
                     operation_id: record.id,
                     attempt_index: attempt.index,
@@ -4773,6 +5116,9 @@ impl<'a> OperationStatus<'a> {
                     fee_charged: decision.fee_charged,
                     not_included: attempt.not_included,
                     projected: decision.projected,
+                    projection_identity: identity.ok(),
+                    missing_projection_fact: missing,
+                    failure_code,
                 });
             }
         }
@@ -5389,7 +5735,9 @@ pub(crate) mod tests {
             let n = self.nonces.get() + 1;
             self.nonces.set(n);
             MintAuthority::Approval {
-                nonce: format!("nonce-{n}"),
+                // 22 base64url characters, the shape a pending approval
+                // store accepts.
+                nonce: format!("approval-nonce-{n:07}"),
                 expires_at_ms: self.now() + APPROVAL_MS,
             }
         }
@@ -6467,6 +6815,8 @@ pub(crate) mod tests {
                 },
                 commit_id: CommitId::from_bytes([0xff; 16]),
                 exposed_at_ms: u64::MAX,
+                source: Some("G".repeat(ACCOUNT_ID_LEN)),
+                submission_ledger: Some(u32::MAX),
             }),
             sequence_released: Some(SequenceReleased {
                 primary_ledger: u32::MAX,
@@ -6508,6 +6858,7 @@ pub(crate) mod tests {
                 witness_ledger: u32::MAX,
                 fee_charged: Some(i64::MIN),
                 projected: true,
+                failure_code: Some("\\".repeat(NAME_MAX)),
             }),
         };
         WireOperation {
@@ -6584,6 +6935,35 @@ pub(crate) mod tests {
             x402_slot_of_len(INTENT_SLOT_MAX),
         ] {
             let record = maximal_record(intent);
+            assert_eq!(record.attempts.len(), MAX_ATTEMPTS);
+            for attempt in &record.attempts {
+                let exposure = attempt.exposure.as_ref().unwrap();
+                assert!(
+                    exposure
+                        .source
+                        .as_deref()
+                        .is_some_and(|source| source.len() == ACCOUNT_ID_LEN)
+                        && exposure.submission_ledger == Some(u32::MAX),
+                    "every attempt carries maximal projection facts"
+                );
+                assert_eq!(
+                    attempt
+                        .decision
+                        .as_ref()
+                        .and_then(|decision| decision.failure_code.as_deref()),
+                    Some("\\".repeat(NAME_MAX).as_str())
+                );
+                assert!(matches!(
+                    &exposure.identity,
+                    ExposureIdentity::Classic { sequence: i64::MIN, max_time: u64::MAX, receipt, .. }
+                        if receipt.len() == RECEIPT_REFERENCE_MAX
+                ));
+                assert!(matches!(
+                    &attempt.authority,
+                    OperationAuthority::Approval { approval_nonce, .. }
+                        if serialized_text_len(approval_nonce) == 6 * APPROVAL_NONCE_MAX
+                ));
+            }
             let len = serialized_len(&record);
             assert!(len <= RECORD_MAX, "{len} > {RECORD_MAX}");
         }
@@ -8883,18 +9263,52 @@ pub(crate) mod tests {
     /// record of 40; it holds a native entry and a committed sequence
     /// release. Returns the handle and the attempt's outcome-stage snapshot.
     pub(crate) fn decided_attempt(fx: &mut Fx, n: u8) -> (OperationHandle, RecoveryAttempt) {
+        let authority = fx.policy();
+        decided_attempt_under(fx, n, authority, 100 + i64::from(n))
+    }
+
+    /// [`decided_attempt`] under `authority`, consuming `sequence`.
+    pub(crate) fn decided_attempt_under(
+        fx: &mut Fx,
+        n: u8,
+        authority: MintAuthority,
+        sequence: i64,
+    ) -> (OperationHandle, RecoveryAttempt) {
         let handle = fx.open_new(&request(&format!("order-{n}"), canonical(n)));
-        let mut mint = fx.mint_request(tx(n), fx.policy(), vec![hold(5)]);
+        let binding = DomainBinding::Transaction {
+            unsigned_envelope_sha256: [n; 32],
+            tx_hash: [n ^ 0x80; 32],
+            source: SOURCE.to_owned(),
+            sequence,
+        };
+        let attempt = decidable_attempt(fx, &handle, n, binding, authority);
+        (handle, attempt)
+    }
+
+    /// Opens the next attempt of `handle` under a claimed mint of `binding`
+    /// and exposes envelope `n`. The attempt reaches an unknown outcome with
+    /// reservation records and a committed sequence release.
+    fn decidable_attempt(
+        fx: &mut Fx,
+        handle: &OperationHandle,
+        n: u8,
+        binding: DomainBinding,
+        authority: MintAuthority,
+    ) -> RecoveryAttempt {
+        let DomainBinding::Transaction { sequence, .. } = binding else {
+            panic!("a classic binding is required");
+        };
+        let mut mint = fx.mint_request(binding, authority, vec![hold(5)]);
         mint.native_reservation = Some(super::super::ledger::NativeReservation {
             debit_stroops: 25,
             fee_stroops: 100,
         });
-        let started = fx.begin_mint(&handle, &mint).unwrap();
+        let started = fx.begin_mint(handle, &mint).unwrap();
         fx.claim(&mint, started.minted.as_ref().unwrap());
         let exposure = ExposureIdentity::Classic {
             envelope_sha256: Sha256::digest(envelope_text(n)).into(),
             tx_hash: [n ^ 0x80; 32],
-            sequence: 100 + i64::from(n),
+            sequence,
             max_time: T0 / 1_000 + 60,
             receipt: envelope_id(n),
         };
@@ -8911,6 +9325,13 @@ pub(crate) mod tests {
             .unwrap();
         let id = envelope_id(n);
         fx.rewrite(|wire| {
+            // The submission ledger a consumption commit records beside the
+            // exposure; the source comes from the transaction binding.
+            attempt_of(wire, [n ^ 0x80; 32])
+                .exposure
+                .as_mut()
+                .unwrap()
+                .submission_ledger = Some(PROJECTED_LEDGER);
             let scope = wire.chain_scope;
             for (bucket, amount) in [("native", 25), ("usdc", 40)] {
                 let key = StateKey::new("ops", 1, bucket, 86_400);
@@ -8924,7 +9345,7 @@ pub(crate) mod tests {
                         status: super::super::store::RecordStatus::Pending,
                         tx_hash: stellar_agent_core::hex::encode(&[n ^ 0x80; 32]),
                         source: SOURCE.to_owned(),
-                        sequence: 100 + i64::from(n),
+                        sequence,
                         pending_since_ms: T0,
                         ..super::super::store::WireRecord::confirmed_defaults()
                     });
@@ -8944,12 +9365,11 @@ pub(crate) mod tests {
                 },
             )
             .unwrap();
-        let attempt = OperationStatus::new(&fx.store, &fx.profile)
+        OperationStatus::new(&fx.store, &fx.profile)
             .outcome_snapshot(Some(&[n ^ 0x80; 32]))
             .unwrap()
             .pop()
-            .unwrap();
-        (handle, attempt)
+            .unwrap()
     }
 
     /// The outcome both endpoints agree on for attempt `n`.
@@ -9918,6 +10338,543 @@ pub(crate) mod tests {
             ))
             .unwrap();
         (handle, commit)
+    }
+
+    // ── Receipt projection fixtures ──────────────────────────────────────
+
+    /// A checked outcome a projection test commits.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum Checked {
+        Succeeded,
+        Failed,
+        NotIncluded,
+    }
+
+    /// The stable code of [`failed_result_xdr`].
+    pub(crate) const FAILED_CODE: &str = "ledger.insufficient_balance";
+
+    /// The submission ledger a decidable attempt's exposure records.
+    pub(crate) const PROJECTED_LEDGER: u32 = 77;
+
+    /// The base64 result of a failed transaction charging 100 stroops: an
+    /// underfunded payment, then, for `claims > 0`, a deleted sell offer
+    /// that crossed `claims` offers.
+    pub(crate) fn failed_result_xdr(claims: usize) -> String {
+        use stellar_xdr::{
+            Asset, ClaimAtom, ClaimOfferAtomV0, Limits, ManageOfferSuccessResult,
+            ManageOfferSuccessResultOffer, ManageSellOfferResult, OperationResult as OpResult,
+            OperationResultTr, PaymentResult, TransactionResult, TransactionResultExt,
+            TransactionResultResult, Uint256, WriteXdr as _,
+        };
+        let mut results = vec![OpResult::OpInner(OperationResultTr::Payment(
+            PaymentResult::Underfunded,
+        ))];
+        if claims > 0 {
+            let atom = ClaimAtom::V0(ClaimOfferAtomV0 {
+                seller_ed25519: Uint256([7; 32]),
+                offer_id: i64::MAX,
+                asset_sold: Asset::Native,
+                amount_sold: i64::MAX,
+                asset_bought: Asset::Native,
+                amount_bought: i64::MAX,
+            });
+            results.push(OpResult::OpInner(OperationResultTr::ManageSellOffer(
+                ManageSellOfferResult::Success(ManageOfferSuccessResult {
+                    offers_claimed: vec![atom; claims].try_into().unwrap(),
+                    offer: ManageOfferSuccessResultOffer::Deleted,
+                }),
+            )));
+        }
+        TransactionResult {
+            fee_charged: 100,
+            result: TransactionResultResult::TxFailed(results.try_into().unwrap()),
+            ext: TransactionResultExt::V0,
+        }
+        .to_xdr_base64(Limits::none())
+        .unwrap()
+    }
+
+    /// The transition `checked` names for attempt `n`; a failure carries the
+    /// typed result `result_xdr`.
+    pub(crate) fn checked_transition(
+        n: u8,
+        checked: Checked,
+        result_xdr: &str,
+    ) -> DecidedTransition {
+        match checked {
+            Checked::Succeeded => DecidedTransition::Succeeded(agreed(n, "SUCCESS")),
+            Checked::Failed => DecidedTransition::Failed {
+                outcome: AgreedOutcome {
+                    result_xdr: result_xdr.to_owned(),
+                    ..agreed(n, "FAILED")
+                },
+                fee_charged: 100,
+            },
+            Checked::NotIncluded => DecidedTransition::NotIncluded(not_included_proof()),
+        }
+    }
+
+    /// Commits `transition` on the unknown attempt with transaction hash
+    /// `tx_hash`, through [`CheckedRecoveryDecision::new`] and the recorder.
+    pub(crate) fn commit_on(
+        fx: &mut Fx,
+        tx_hash: [u8; 32],
+        transition: DecidedTransition,
+    ) -> CommitId {
+        let attempt = OperationStatus::new(&fx.store, &fx.profile)
+            .outcome_snapshot(Some(&tx_hash))
+            .unwrap()
+            .pop()
+            .unwrap();
+        fx.recorder()
+            .commit_decision(&decide(&attempt, transition))
+            .unwrap()
+    }
+
+    /// Commits `checked` on `order-{n}`'s first attempt under a policy
+    /// authority; a failure carries the short typed result.
+    pub(crate) fn commit_checked(
+        fx: &mut Fx,
+        n: u8,
+        checked: Checked,
+    ) -> (OperationHandle, CommitId) {
+        let (handle, _) = decided_attempt(fx, n);
+        let commit = commit_on(
+            fx,
+            [n ^ 0x80; 32],
+            checked_transition(n, checked, &failed_result_xdr(0)),
+        );
+        (handle, commit)
+    }
+
+    /// [`commit_checked`] under an approval authority, with its nonce.
+    pub(crate) fn commit_approved(
+        fx: &mut Fx,
+        n: u8,
+        checked: Checked,
+    ) -> (OperationHandle, CommitId, String) {
+        let authority = fx.approval();
+        let MintAuthority::Approval { nonce, .. } = &authority else {
+            panic!("an approval authority is required");
+        };
+        let nonce = nonce.clone();
+        let (handle, _) = decided_attempt_under(fx, n, authority, 100 + i64::from(n));
+        let commit = commit_on(
+            fx,
+            [n ^ 0x80; 32],
+            checked_transition(n, checked, &failed_result_xdr(0)),
+        );
+        (handle, commit, nonce)
+    }
+
+    /// Expires the accounting of envelope `n`'s reservation past its
+    /// horizon, projecting onto `receipts` when given, and returns the
+    /// committed expiry's decision identifier.
+    pub(crate) fn expire_reservation(
+        fx: &mut Fx,
+        n: u8,
+        receipts: Option<&stellar_agent_core::profile::receipt::ReceiptStore>,
+    ) -> String {
+        let id = envelope_id(n);
+        let max_time = T0 / 1_000 + 60;
+        fx.rewrite(|wire| {
+            for record in wire
+                .entries
+                .iter_mut()
+                .flat_map(|bucket| &mut bucket.records)
+                .filter(|record| record.id == id)
+            {
+                record.max_time = max_time;
+            }
+        });
+        let after = max_time * 1_000 + 86_400_000 + 1;
+        fx.clock.set(after);
+        let hold = fx
+            .store
+            .pending_reservations(&fx.profile)
+            .unwrap()
+            .into_iter()
+            .find(|hold| hold.id == id)
+            .unwrap();
+        assert!(
+            fx.store
+                .expire_accounting(&fx.profile, receipts, &hold, after)
+                .unwrap()
+                .is_some()
+        );
+        fx.store
+            .accounting_expiry_for(&fx.profile, &id)
+            .unwrap()
+            .unwrap()
+    }
+
+    /// Brings `order-{n}`'s first attempt to an unknown outcome at
+    /// `sequence`, without a decision.
+    pub(crate) fn unknown_at(fx: &mut Fx, n: u8, sequence: i64) -> OperationHandle {
+        let authority = fx.policy();
+        decided_attempt_under(fx, n, authority, sequence).0
+    }
+
+    /// Opens `handle`'s successor attempt for envelope `m` at the
+    /// predecessor's source and sequence `sequence`, under the policy, and
+    /// brings it to an unknown outcome.
+    pub(crate) fn successor_attempt(fx: &mut Fx, handle: &OperationHandle, m: u8, sequence: i64) {
+        let binding = DomainBinding::Transaction {
+            unsigned_envelope_sha256: [m; 32],
+            tx_hash: [m ^ 0x80; 32],
+            source: SOURCE.to_owned(),
+            sequence,
+        };
+        let authority = fx.policy();
+        decidable_attempt(fx, handle, m, binding, authority);
+    }
+
+    /// The refusal code of a policy successor attempt of `handle`.
+    pub(crate) fn successor_refusal(fx: &mut Fx, handle: &OperationHandle) -> &'static str {
+        let mint = fx.mint_request(tx(0x7e), fx.policy(), vec![]);
+        fx.begin_mint(handle, &mint)
+            .map_or_else(|error| code(&error), |_| "none")
+    }
+
+    /// Rewrites `store`'s committed window through the generation commit.
+    #[cfg(feature = "mainnet-write")]
+    fn rewrite_store(
+        store: &PersistedWindowStore,
+        profile: &Profile,
+        change: impl FnOnce(&mut WireFile),
+    ) {
+        let lock = WindowStoreLock::acquire_for(store.path(), &profile.policy_window_state_key_id)
+            .unwrap();
+        let (key, _) = store.load_or_mint_key(profile).unwrap();
+        let gen_entry = generation_entry_ref(profile);
+        let original = store.read_verified(profile, &key, &gen_entry).unwrap();
+        let mut next = original.clone();
+        change(&mut next);
+        store
+            .commit_generation(&key, &gen_entry, original, next)
+            .unwrap();
+        drop(lock);
+    }
+
+    /// The attempt whose exposure names `tx_hash`.
+    fn attempt_of(wire: &mut WireFile, tx_hash: [u8; 32]) -> &mut WireAttempt {
+        section_mut(wire)
+            .records
+            .iter_mut()
+            .flat_map(|record| &mut record.attempts)
+            .find(|attempt| {
+                matches!(
+                    attempt.exposure.as_ref().map(|exposure| &exposure.identity),
+                    Some(ExposureIdentity::Classic { tx_hash: stored, .. }) if *stored == tx_hash
+                )
+            })
+            .unwrap()
+    }
+
+    /// Drops the reservation records of envelope `n`.
+    fn drop_reservation(wire: &mut WireFile, n: u8) {
+        let id = envelope_id(n);
+        for bucket in &mut wire.entries {
+            bucket.records.retain(|record| record.id != id);
+        }
+    }
+
+    /// Drops the exposure's submission ledger and envelope `n`'s
+    /// reservation records.
+    fn drop_ledger(wire: &mut WireFile, n: u8) {
+        attempt_of(wire, [n ^ 0x80; 32])
+            .exposure
+            .as_mut()
+            .unwrap()
+            .submission_ledger = None;
+        drop_reservation(wire, n);
+    }
+
+    /// Commits `checked` on `order-{n}`, then removes the authenticated
+    /// projection fact `field` in an authenticated successor. `source` drops
+    /// the attempt's authorization with its holds and the reservation
+    /// records. `submission_ledger` drops the exposure's ledger and the
+    /// records. `failure_code` keeps an undecodable result. Verified
+    /// inspection accepts the result.
+    pub(crate) fn historical_without(
+        fx: &mut Fx,
+        n: u8,
+        checked: Checked,
+        field: &str,
+    ) -> (OperationHandle, CommitId) {
+        let (handle, _) = decided_attempt(fx, n);
+        let result = if field == "failure_code" {
+            "AAAB".to_owned()
+        } else {
+            failed_result_xdr(0)
+        };
+        let commit = commit_on(fx, [n ^ 0x80; 32], checked_transition(n, checked, &result));
+        let tx_hash = [n ^ 0x80; 32];
+        match field {
+            "source" => fx.rewrite(|wire| {
+                let auth = attempt_of(wire, tx_hash).authorization_id;
+                wire.authorizations.retain(|record| record.id != auth);
+                wire.holds.retain(|hold| hold.authorization_id != auth);
+                drop_reservation(wire, n);
+            }),
+            "submission_ledger" => fx.rewrite(|wire| drop_ledger(wire, n)),
+            "failure_code" => {}
+            other => panic!("no historical fixture omits {other}"),
+        }
+        assert!(fx.store.read_for_inspection(&fx.profile).unwrap().is_some());
+        (handle, commit)
+    }
+
+    /// Commits `checked` on `order-{n}` whose identity comes from the
+    /// exposure alone: a zero-entry exposure carrying `source` and
+    /// [`PROJECTED_LEDGER`], with no reservation records.
+    pub(crate) fn zero_entry_committed(
+        fx: &mut Fx,
+        n: u8,
+        checked: Checked,
+    ) -> (OperationHandle, CommitId) {
+        let (handle, commit) = commit_checked(fx, n, checked);
+        fx.rewrite(|wire| {
+            drop_reservation(wire, n);
+            let exposure = attempt_of(wire, [n ^ 0x80; 32]).exposure.as_mut().unwrap();
+            exposure.source = Some(SOURCE.to_owned());
+            exposure.submission_ledger = Some(PROJECTED_LEDGER);
+        });
+        (handle, commit)
+    }
+
+    /// The ledger a [`consumed_zero_entry`] consumption records.
+    pub(crate) const CONSUMED_LEDGER: u32 = 100;
+
+    /// Brings `order-{n}`'s first attempt to an unknown outcome at sequence
+    /// `100 + n` through the store's own zero-entry consumption, recorded at
+    /// [`CONSUMED_LEDGER`], under an approval or a policy authority.
+    ///
+    /// The exposure follows through [`OperationRecorder::expose`], which
+    /// stores no projection facts, so the window has the shape of a window
+    /// without them. No reservation record names the envelope. Returns the
+    /// handle and the approval nonce.
+    pub(crate) fn consumed_zero_entry(
+        fx: &mut Fx,
+        n: u8,
+        approval: bool,
+    ) -> (OperationHandle, Option<String>) {
+        use crate::mainnet::types::{AuditFacts, RecomputedFacts};
+        use crate::policy_state::ledger::{ConsumeExpect, SubmissionBinding};
+        const AUDIT: AuditFacts = AuditFacts {
+            segment: [0; 32],
+            log_path_digest: [5; 32],
+            anchored_count: 0,
+        };
+        let sequence = 100 + i64::from(n);
+        let handle = fx.open_new(&request(&format!("order-{n}"), canonical(n)));
+        let binding = DomainBinding::Transaction {
+            unsigned_envelope_sha256: [n; 32],
+            tx_hash: [n ^ 0x80; 32],
+            source: SOURCE.to_owned(),
+            sequence,
+        };
+        let authority = if approval { fx.approval() } else { fx.policy() };
+        let nonce = match &authority {
+            MintAuthority::Approval { nonce, .. } => Some(nonce.clone()),
+            MintAuthority::Policy(_) => None,
+        };
+        let mint = fx.mint_request(binding, authority, vec![]);
+        let started = fx.begin_mint(&handle, &mint).unwrap();
+        let minted = started.minted.as_ref().unwrap();
+        fx.claim(&mint, minted);
+        let auth = fx.auth(minted.id);
+        let envelope_sha256: [u8; 32] = Sha256::digest(envelope_text(n)).into();
+        fx.store
+            .consume_authorization(
+                &fx.profile,
+                minted.id,
+                &ConsumeExpect::new(
+                    auth.profile.clone(),
+                    auth.chain,
+                    auth.consumer,
+                    auth.binding.clone(),
+                    auth.policy_sequence,
+                    auth.policy_digest,
+                    mint.authority.clone(),
+                    auth.reservation,
+                    auth.bindings_digest,
+                    AUDIT,
+                    &RecomputedFacts {
+                        content_digest: auth.content_digest,
+                        entries_digest: auth.entries_digest,
+                        audit: AUDIT,
+                    },
+                ),
+                &ConsumptionBinding::Transaction(SubmissionBinding {
+                    chain_scope: Some(ChainScope::for_chain(Caip2::Mainnet)),
+                    fee_bump: None,
+                    envelope_hash: envelope_sha256,
+                    tx_hash: [n ^ 0x80; 32],
+                    source: SOURCE.to_owned(),
+                    sequence,
+                    max_time: T0 / 1_000 + 60,
+                    pending_since_ms: T0,
+                    submission_ledger: CONSUMED_LEDGER,
+                    submission_anchor: None,
+                }),
+            )
+            .unwrap();
+        let exposure = ExposureIdentity::Classic {
+            envelope_sha256,
+            tx_hash: [n ^ 0x80; 32],
+            sequence,
+            max_time: T0 / 1_000 + 60,
+            receipt: envelope_id(n),
+        };
+        fx.recorder()
+            .expose(handle.id(), started.attempt_index, &exposure, Some(10))
+            .unwrap();
+        fx.recorder()
+            .transition(
+                handle.id(),
+                Some(started.attempt_index),
+                OperationState::SentOutcomeUnknown,
+                &TransitionEvidence::default(),
+            )
+            .unwrap();
+        fx.recorder()
+            .record_evidence(
+                handle.id(),
+                started.attempt_index,
+                &EvidenceInput {
+                    sequence_released: Some(SequenceReleaseInput {
+                        primary_ledger: 90,
+                        witness_ledger: 91,
+                        min_close_time_ms: T0,
+                    }),
+                    ..EvidenceInput::default()
+                },
+            )
+            .unwrap();
+        (handle, nonce)
+    }
+
+    /// The source and submission ledger the verified window's exposure of the
+    /// attempt with transaction hash `tx_hash` stores.
+    pub(crate) fn exposure_facts(
+        store: &PersistedWindowStore,
+        profile: &Profile,
+        tx_hash: [u8; 32],
+    ) -> (Option<String>, Option<u32>) {
+        let mut wire = store.read_for_inspection(profile).unwrap().unwrap();
+        let exposure = attempt_of(&mut wire, tx_hash).exposure.clone().unwrap();
+        (exposure.source, exposure.submission_ledger)
+    }
+
+    /// The submission ledger the verified window's consumption of the
+    /// attempt with transaction hash `tx_hash` records.
+    pub(crate) fn consumed_ledger(
+        store: &PersistedWindowStore,
+        profile: &Profile,
+        tx_hash: [u8; 32],
+    ) -> Option<u32> {
+        let mut wire = store.read_for_inspection(profile).unwrap().unwrap();
+        let id = attempt_of(&mut wire, tx_hash).authorization_id;
+        wire.authorizations
+            .iter()
+            .find(|auth| auth.id == id)
+            .and_then(|auth| match &auth.consumption {
+                Some(ConsumptionBinding::Transaction(submission)) => {
+                    Some(submission.submission_ledger)
+                }
+                _ => None,
+            })
+    }
+
+    /// Removes the stored failure code of the attempt with transaction hash
+    /// `tx_hash`, leaving an authenticated decision without a stored code.
+    pub(crate) fn forget_failure_code(fx: &Fx, tx_hash: [u8; 32]) {
+        fx.rewrite(|wire| {
+            attempt_of(wire, tx_hash)
+                .decision
+                .as_mut()
+                .unwrap()
+                .failure_code = None;
+        });
+    }
+
+    /// The retained result text and its truncation flag of the attempt with
+    /// transaction hash `tx_hash`.
+    pub(crate) fn retained_result(
+        store: &PersistedWindowStore,
+        profile: &Profile,
+        tx_hash: [u8; 32],
+    ) -> (String, bool, Option<String>) {
+        let mut wire = store.read_for_inspection(profile).unwrap().unwrap();
+        let attempt = attempt_of(&mut wire, tx_hash);
+        let outcome = attempt.agreed_outcome.as_ref().unwrap();
+        (
+            outcome.result_xdr.text().to_owned(),
+            outcome.result_xdr.truncated(),
+            attempt.decision.as_ref().unwrap().failure_code.clone(),
+        )
+    }
+
+    /// The accounting, release and expiry state of the verified window, and
+    /// its generation.
+    pub(crate) fn accounting_state(
+        store: &PersistedWindowStore,
+        profile: &Profile,
+    ) -> (serde_json::Value, u64) {
+        let wire = store.read_for_inspection(profile).unwrap().unwrap();
+        let releases: Vec<_> = wire
+            .authorizations
+            .iter()
+            .map(|auth| (auth.id, auth.native_release, auth.state))
+            .collect();
+        (
+            serde_json::json!({
+                "entries": serde_json::to_value(&wire.entries).unwrap(),
+                "releases": serde_json::to_value(&releases).unwrap(),
+                "expiries": serde_json::to_value(&wire.accounting_expiries).unwrap(),
+            }),
+            wire.generation,
+        )
+    }
+
+    /// The exposure keys the window file stores for the attempt with
+    /// transaction hash `tx_hash`.
+    pub(crate) fn exposure_keys(store: &PersistedWindowStore, tx_hash: [u8; 32]) -> Vec<String> {
+        let bytes = fs::read(store.path()).unwrap();
+        let wire: serde_json::Value = serde_json::from_slice(&bytes[32..]).unwrap();
+        let hex = stellar_agent_core::hex::encode(&tx_hash);
+        let attempt = wire["operations"]["records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|record| record["attempts"].as_array().unwrap())
+            .find(|attempt| attempt["exposure"]["identity"]["classic"]["tx_hash"] == hex.as_str())
+            .unwrap();
+        let mut keys: Vec<String> = attempt["exposure"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect();
+        keys.sort();
+        keys
+    }
+
+    /// Replaces the authority of the attempt with transaction hash
+    /// `tx_hash` with a policy authority in an authenticated successor.
+    #[cfg(feature = "mainnet-write")]
+    pub(crate) fn policy_authority(
+        store: &PersistedWindowStore,
+        profile: &Profile,
+        tx_hash: [u8; 32],
+    ) {
+        rewrite_store(store, profile, |wire| {
+            attempt_of(wire, tx_hash).authority = OperationAuthority::Policy {
+                policy_digest: [7; 32],
+                rule_index: 0,
+            };
+        });
     }
 
     /// A successor needs a checked non-inclusion with its projection
