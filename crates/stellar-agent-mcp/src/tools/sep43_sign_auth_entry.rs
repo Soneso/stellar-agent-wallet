@@ -375,6 +375,27 @@ mod tests {
         }
     }
 
+    /// Builds a testnet V1 preimage whose transfer argument holds a muxed
+    /// contract address (W) and returns its base64 XDR.
+    fn muxed_contract_preimage_xdr() -> String {
+        use sha2::{Digest, Sha256};
+        use stellar_agent_test_support::xdr_fixtures::{
+            destination_transfer, muxed_contract_address,
+        };
+        use stellar_xdr::{Limits, WriteXdr};
+
+        stellar_agent_soroban_auth::build_auth_preimage(
+            stellar_agent_soroban_auth::AuthCredentialsVersion::V1,
+            Sha256::digest(b"Test SDF Network ; September 2015").into(),
+            7,
+            100,
+            &muxed_contract_address(),
+            destination_transfer(muxed_contract_address()),
+        )
+        .to_xdr_base64(Limits::none())
+        .expect("soroban auth preimage must encode")
+    }
+
     #[tokio::test]
     #[serial_test::serial(keyring)]
     async fn muxed_contract_intake_refuses_before_state() {
@@ -401,7 +422,7 @@ mod tests {
         let result = server
             .call_stellar_sep43_sign_auth_entry(Sep43SignAuthEntryArgs {
                 chain_id: "stellar:testnet".to_owned(),
-                auth_entry_xdr: stellar_agent_test_support::xdr_fixtures::muxed_contract_preimage(),
+                auth_entry_xdr: muxed_contract_preimage_xdr(),
                 address: None,
                 network_passphrase: None,
             })

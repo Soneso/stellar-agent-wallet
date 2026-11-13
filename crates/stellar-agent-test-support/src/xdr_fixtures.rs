@@ -114,26 +114,6 @@ pub fn muxed_contract_envelope() -> String {
     .unwrap()
 }
 
-/// A testnet `HashIdPreimage::SorobanAuthorization` whose transfer argument
-/// contains a W address.
-///
-/// # Panics
-/// Panics if the fixed fixture fields cannot be encoded.
-#[must_use]
-#[allow(clippy::unwrap_used, reason = "fixed test fixture fields")]
-pub fn muxed_contract_preimage() -> String {
-    use sha2::{Digest, Sha256};
-    use stellar_xdr::*;
-    HashIdPreimage::SorobanAuthorization(HashIdPreimageSorobanAuthorization {
-        network_id: Hash(Sha256::digest(b"Test SDF Network ; September 2015").into()),
-        nonce: 7,
-        signature_expiration_ledger: 100,
-        invocation: destination_transfer(muxed_contract_address()),
-    })
-    .to_xdr_base64(Limits::none())
-    .unwrap()
-}
-
 fn public_key_bytes(label: &str, value: &str) -> [u8; 32] {
     match stellar_strkey::ed25519::PublicKey::from_string(value) {
         Ok(pk) => pk.0,
