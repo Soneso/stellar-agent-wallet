@@ -1623,6 +1623,7 @@ mod tests {
                     Ok(())
                 },
                 |_, _| Ok(()),
+                &mut crate::common::spending_preview::SpendingPreview::new(&mut std::io::sink()),
             )
             .unwrap_err();
             assert_eq!(refused, "profile.enable_mainnet_precondition", "{form:?}");

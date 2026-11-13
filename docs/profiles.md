@@ -1050,6 +1050,65 @@ reason = "review"
 | `[mainnet.cross_check_thresholds]` | Optional signed thresholds, each a positive TOML integer or a positive decimal string within the i128 range, such as `native = "10000000000"`. |
 | Signature coverage | V2 signs sequence and mainnet fields. Match and criterion keys are sorted canonically. The approval credentials are signed sorted by raw credential ID, so reordering entries or their keys keeps the signed bytes. |
 
+#### Generated policy body
+
+`profile init --network mainnet --engine v1` writes the unsigned body of a
+spending preset to `policies/<name>.toml`, with `version = 2`,
+`scope = "profile:<name>"`, `sequence = 1`, and no `[mainnet]` table. The
+[command reference](cli-reference/profile-and-governance.md#mainnet-spending-presets)
+covers its flags, prompts, and preview. Every rule matches `stellar:mainnet`,
+decides `allow`, and sets `allow_opaque_signing = false`.
+
+- `stellar_pay`, `stellar_pay_commit`, `stellar_x402_create_payment`, and
+  `stellar_x402_authenticated_payment` carry the asset allowlist, the
+  per-payment cap, the 1d and 1w caps, and the 1m and 1h rate limits.
+- Shop and business presets add `approval_above` at `A`, so a payment above
+  `A` requests approval.
+- A chosen total budget adds `total_budget` at `L`. A new policy signature
+  starts a new `total_budget` allocation.
+- `stellar_pay` and `stellar_pay_commit` add `balance_floor` at `M`.
+- Each payment rule's `counterparty_allowlist` selects `G_ACCOUNT` and
+  `C_ACCOUNT` with `allowlist = []`. G, M, and C recipients share that one
+  list, and no listed recipient is paid until one is added. A G address
+  also covers its M addresses; an M entry covers only its own mux ID.
+- A chosen unlisted budget writes the same `unlisted` table on every payment
+  rule. Equal tables share one counter per asset, so one budget of `U` per
+  rolling day, at most `P/2` per payment, bounds the four payment tools
+  together. A payment beyond it is denied and requests no approval.
+- The trustline tools of a USDC body allow USDC alone; the claim tools carry
+  no asset allowlist. Both take 2 calls per 1m and 6 per 1h. An XLM body has
+  no trustline rule.
+- The read-only tools carry no criterion. Native account funding has no rule
+  and is denied.
+
+The presets, in USDC (`M` and `R` in XLM):
+
+| Preset | L | T (days) | p | Per payment | 1d | 1w | A | U | P/2 | M | R |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| `api-day` | 2 | 1 | 0.01 | 0.2 | 2 | 2 | off | 0.5 | 0.1 | 1.7 | 2 |
+| `api-week` | 20 | 7 | 0.01 | 0.5 | 5 | 20 | off | 1.25 | 0.25 | 2 | 6 |
+| `api-2weeks` | 50 | 14 | 0.01 | 0.7 | 7 | 25 | off | 1.75 | 0.35 | 2.2 | 12 |
+| `compute-day` | 20 | 1 | 0.01 | 5 | 20 | 20 | off | off | off | 3.5 | 6 |
+| `compute-week` | 120 | 7 | 0.01 | 7.5 | 30 | 120 | off | off | off | 4.5 | 26 |
+| `compute-2weeks` | 300 | 14 | 0.01 | 10 | 40 | 150 | off | off | off | 5.5 | 62 |
+| `shop-day` | 50 | 1 | 25 | 50 | 50 | 50 | 25 | off | off | 1.6 | 2 |
+| `shop-week` | 500 | 7 | 25 | 140 | 140 | 500 | 70 | off | off | 1.6 | 2 |
+| `shop-2weeks` | 1000 | 14 | 25 | 140 | 140 | 500 | 70 | off | off | 1.6 | 2 |
+| `business-day` | 400 | 1 | 100 | 200 | 400 | 400 | 100 | off | off | 1.6 | 2 |
+| `business-week` | 2000 | 7 | 100 | 280 | 560 | 2000 | 140 | off | off | 1.6 | 2 |
+| `business-2weeks` | 5000 | 14 | 100 | 350 | 700 | 2500 | 175 | off | off | 1.6 | 2 |
+
+`L` is the tolerated loss over `T` unattended days, and `p` the typical
+payment. `A` is the approval threshold, and `U` with `P/2` the unlisted
+budget an api preset offers. `api-day` is the default. With `--asset XLM`,
+`--tolerated-loss` and `--typical-payment` supply `L` and `p` in XLM, and the
+caps derive by the same rules, rounded down to one stroop.
+
+`M` is the XLM floor: the pay tools refuse a payment that would leave less
+native balance. `R` is the recommended XLM balance of the operating account,
+covering the floor and the fees of `T` days. Fund the operating account with
+the operating balance of the plan in the asset, and `R` in XLM.
+
 #### Approval origin configuration
 
 The signed origin and certificate pin authorize mainnet consent through the HTTPS listener.

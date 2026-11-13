@@ -379,9 +379,13 @@ async fn async_main() -> i32 {
     // through the same resolver the subcommand uses. The advisory therefore
     // scans the audit log of the profile the command uses.
     //
+    // `profile init` and `profile enable-mainnet` skip the scan. Each shows
+    // its spending preview on stderr before its first write. The scan may
+    // append an audit row and write to stderr ahead of that preview.
+    //
     // `run_startup_advisory` accepts no `StellarRpcClient`: the advisory scan is
     // strictly local and issues no network calls.
-    let _ = run_profile_startup_advisory(cli.command.profile_flag(), |path, open_writer| {
+    let _ = startup_advisory_for(&cli.command, |path, open_writer| {
         advisory::run_startup_advisory(path, open_writer)
     });
 
@@ -530,6 +534,39 @@ fn run_profile_startup_advisory(
             advisory::AdvisoryResult::default()
         }
     }
+}
+
+/// Whether `command` skips the startup advisory.
+///
+/// `profile init` and `profile enable-mainnet` write their spending preview
+/// to stderr before their first write. An advisory scan ahead of them could
+/// write an audit row and stderr text first, so both skip it.
+fn defers_startup_advisory(command: &Commands) -> bool {
+    matches!(
+        command,
+        Commands::Profile(args)
+            if matches!(
+                args.subcommand,
+                commands::profile::ProfileSubcommand::Init(_)
+                    | commands::profile::ProfileSubcommand::EnableMainnet(_)
+            )
+    )
+}
+
+/// Runs the startup advisory for `command`: nothing for a command that
+/// defers it (see [`defers_startup_advisory`]), and otherwise the scan of the
+/// audit log of the profile the command operates on.
+fn startup_advisory_for(
+    command: &Commands,
+    scan: impl FnOnce(
+        &std::path::Path,
+        Box<dyn FnOnce() -> Result<Arc<Mutex<AuditWriter>>, String> + '_>,
+    ) -> advisory::AdvisoryResult,
+) -> advisory::AdvisoryResult {
+    if defers_startup_advisory(command) {
+        return advisory::AdvisoryResult::default();
+    }
+    run_profile_startup_advisory(command.profile_flag(), scan)
 }
 
 #[cfg(test)]

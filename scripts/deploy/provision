@@ -22,6 +22,11 @@
 #   profile sign-policy                              P, Y, S
 #   profile enable-mainnet                           P, N
 #
+# profile init runs with a fixed --unlisted-budget no: it writes the policy
+# body of the default spending preset without an unlisted budget. An edited
+# body installed with policy-install and signed with profile sign-policy
+# changes it afterwards.
+#
 # providers, remote-cert, remote-key, and policy-install read their input on
 # standard input, so the wallet account needs no read access to operator
 # files. Prompts read from the operator's terminal without echo.
@@ -485,7 +490,10 @@ prepare_account
 require_tier "$TIER"
 require_eligible "$ELIGIBILITY"
 case "$FORM" in
-  init) exec_native "$CLI" profile init --network mainnet --rpc-url "$ARGUMENT" --profile "$PROFILE" ;;
+  init)
+    exec_native "$CLI" profile init --network mainnet --rpc-url "$ARGUMENT" --profile "$PROFILE" \
+      --unlisted-budget no
+    ;;
   rotate-audit-key) exec_native "$CLI" profile rotate-audit-key --profile "$PROFILE" ;;
   enroll-owner-key)
     exec_with_secret "Owner secret key" \

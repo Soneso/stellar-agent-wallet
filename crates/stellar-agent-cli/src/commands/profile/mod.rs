@@ -83,7 +83,9 @@ pub enum ProfileSubcommand {
     /// (`enroll-signer`, `enroll-owner-key`, `enroll-rpc-credential`, the
     /// `rotate-*` subcommands) do that. Refuses if the named profile already
     /// exists, or if `--network mainnet` is selected without an explicit
-    /// `--rpc-url`.
+    /// `--rpc-url`. On `--network mainnet --engine v1` it also writes the
+    /// policy body of a spending preset and previews its bounds on stderr
+    /// first.
     Init(init::InitArgs),
     /// List known profile names.
     ///
