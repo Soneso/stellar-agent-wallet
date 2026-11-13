@@ -6,18 +6,146 @@
 //! Another source's payments and merges into the wallet, and its reserve sponsorship, carry no value effect.
 //! Its claimable balances count only claimants other than that source and the wallet.
 //! Its other operations retain their effective source and receive the same classification as the wallet's operations.
+//!
+//! A transaction signature authorizes `SourceAccount` entries for the operation's source account.
+//! Address credentials carry their own signatures; the transaction signature adds no authorization to them.
+//! A contract debits the source account's tokens through an authorized call, including calls in sub-invocations.
+//! Other contract functions can move value held inside a contract without a decodable bound.
+//! A native asset contract transfer debits XLM and retains its contract address in the leg.
+//! An asset contract address hashes the network and asset; the address cannot reveal the asset.
 
 use stellar_xdr::{
     AccountId, ChangeTrustAsset, Claimant, ClawbackOp, CreateClaimableBalanceOp,
-    FeeBumpTransactionInnerTx, Limits, Memo, MuxedAccount, Operation, OperationBody, OperationType,
-    PaymentOp, Preconditions, PublicKey, SetOptionsOp, Transaction, TransactionEnvelope,
-    TransactionExt, TransactionV1Envelope, WriteXdr,
+    FeeBumpTransactionInnerTx, HostFunction, InvokeContractArgs, Limits, Memo, MuxedAccount,
+    Operation, OperationBody, OperationType, PaymentOp, Preconditions, PublicKey, ScAddress, ScVal,
+    SetOptionsOp, SorobanAuthorizedFunction, SorobanAuthorizedInvocation, SorobanCredentials,
+    Transaction, TransactionEnvelope, TransactionExt, TransactionV1Envelope, WriteXdr,
 };
 
 use crate::envelope_decode::{
     ClassicMemo, ENVELOPE_INPUT_TOO_LONG, EnvelopeReadError, TRANSACTION_ENVELOPE_XDR_FORM,
     decode_authoritative_args, read_envelope,
 };
+use crate::policy::v1::value::{ActionKind, ValueEffects, ValueLeg};
+use crate::sc_address::{scaddress_destination_strkey, scaddress_to_strkey};
+
+/// The token legs and unknown calls in an authorized invocation tree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InvocationEffects {
+    /// One leg per valued token call, in tree order.
+    pub legs: Vec<ValueLeg>,
+    /// True when a node is a call the wallet cannot value.
+    pub unvalued: bool,
+}
+
+/// Values SEP-41 calls authorized for `account`, in depth-first tree order.
+///
+/// Every leg retains its token contract address, including native asset contracts.
+/// The envelope decoder bounds the tree depth before this function runs.
+///
+/// # Examples
+///
+/// ```
+/// use stellar_agent_core::policy::transaction_effects::authorized_invocation_effects;
+/// use stellar_xdr::{ScAddress, SorobanAuthorizedFunction, SorobanAuthorizedInvocation};
+///
+/// let root = SorobanAuthorizedInvocation {
+///     function: SorobanAuthorizedFunction::CreateContractHostFn(Default::default()),
+///     sub_invocations: Default::default(),
+/// };
+/// let effects = authorized_invocation_effects(&root, &ScAddress::default());
+/// assert!(effects.legs.is_empty());
+/// assert!(!effects.unvalued);
+/// ```
+pub fn authorized_invocation_effects(
+    root: &SorobanAuthorizedInvocation,
+    account: &ScAddress,
+) -> InvocationEffects {
+    let mut effects = InvocationEffects {
+        legs: Vec::new(),
+        unvalued: false,
+    };
+    let mut pending = vec![root];
+    while let Some(node) = pending.pop() {
+        match &node.function {
+            SorobanAuthorizedFunction::ContractFn(call) => match token_leg(call, account) {
+                Ok(Some(leg)) => effects.legs.push(leg),
+                Ok(None) => {}
+                Err(()) => effects.unvalued = true,
+            },
+            SorobanAuthorizedFunction::CreateContractHostFn(_)
+            | SorobanAuthorizedFunction::CreateContractV2HostFn(_) => {}
+        }
+        pending.extend(node.sub_invocations.iter().rev());
+    }
+    effects
+}
+
+fn token_leg(call: &InvokeContractArgs, account: &ScAddress) -> Result<Option<ValueLeg>, ()> {
+    if !matches!(call.contract_address, ScAddress::Contract(_)) {
+        return Err(());
+    }
+    let asset = scaddress_to_strkey(&call.contract_address).map_err(|_| ())?;
+    let function = call.function_name.0.as_slice();
+    let (authorizer, destination, amount) = match (function, call.args.as_slice()) {
+        (
+            b"transfer",
+            [
+                ScVal::Address(from),
+                ScVal::Address(to),
+                ScVal::I128(amount),
+            ],
+        ) => (from, Some(to), amount),
+        (
+            b"transfer_from",
+            [
+                ScVal::Address(spender),
+                ScVal::Address(_from),
+                ScVal::Address(to),
+                ScVal::I128(amount),
+            ],
+        ) => (spender, Some(to), amount),
+        (
+            b"approve",
+            [
+                ScVal::Address(from),
+                ScVal::Address(spender),
+                ScVal::I128(amount),
+                ScVal::U32(_),
+            ],
+        ) => (from, Some(spender), amount),
+        (b"burn", [ScVal::Address(from), ScVal::I128(amount)]) => (from, None, amount),
+        (
+            b"burn_from",
+            [
+                ScVal::Address(spender),
+                ScVal::Address(_from),
+                ScVal::I128(amount),
+            ],
+        ) => (spender, None, amount),
+        _ => return Err(()),
+    };
+    if authorizer != account {
+        return Err(());
+    }
+    let amount = i128::from(amount);
+    if amount < 0 {
+        return Err(());
+    }
+    let destination = destination
+        .map(scaddress_destination_strkey)
+        .transpose()
+        .map_err(|_| ())?;
+    if function == b"approve" && amount == 0 {
+        return Ok(None);
+    }
+    Ok(Some(ValueLeg {
+        kind: ActionKind::Payment,
+        amount: Some(amount),
+        asset: Some(asset),
+        destination,
+    }))
+}
 
 /// A payment tool route that evaluates an operation.
 #[non_exhaustive]
@@ -53,6 +181,7 @@ pub struct ValuedOperation {
     /// The payment rule's route.
     pub route: PaymentRoute,
     /// The arguments `decode_authoritative_args` returns for the route's commit tool, without `chain_id`.
+    /// Token legs carry the signed memo in `memo`, `memo_id`, `memo_hash`, or `memo_return`.
     pub policy_args: serde_json::Value,
     /// `None`: the engine derives the value from `policy_args`.
     pub value: Option<crate::policy::v1::value::ValueEffects>,
@@ -94,6 +223,9 @@ pub struct UnvaluedOperation {
     pub operation_index: u32,
     /// The effect that requires an explicit policy decision.
     pub effect: UnvaluedEffect,
+    /// Valued legs of a mixed invocation, in entry and tree order.
+    /// Empty for every other effect.
+    pub valued_legs: Vec<ValuedOperation>,
 }
 
 /// An effect that no signed amount limit bounds.
@@ -141,6 +273,19 @@ pub struct TransactionEffects {
 }
 
 impl TransactionEffects {
+    /// Every leg the payment rules decide, including retained legs of unvalued operations.
+    /// Orders legs by operation index, then in stored order.
+    /// Token legs carry the transaction's memo in their arguments and [`ValueEffects::memo`].
+    pub fn payment_legs(&self) -> Vec<&ValuedOperation> {
+        let mut legs: Vec<_> = self
+            .valued
+            .iter()
+            .chain(self.unvalued.iter().flat_map(|op| &op.valued_legs))
+            .collect();
+        legs.sort_by_key(|leg| leg.operation_index);
+        legs
+    }
+
     /// Whether any operation has a valued or unvalued effect.
     pub fn has_value_effect(&self) -> bool {
         !self.valued.is_empty() || !self.unvalued.is_empty()
@@ -160,6 +305,9 @@ pub enum TransactionEffectsError {
     /// The envelope uses the unsupported legacy format.
     #[error("legacy V0 transaction envelopes are not supported")]
     LegacyEnvelope,
+    /// A transaction with a payment leg has a text memo that is not UTF-8.
+    #[error("the payment transaction's text memo is not UTF-8")]
+    UnreadableMemo,
     /// An operation contains a negative amount field.
     #[error("operation {operation_index} has a negative {operation_kind:?}.{field}")]
     NegativeAmount {
@@ -239,7 +387,11 @@ fn valued_operation(
         fee: tx.fee,
         seq_num: tx.seq_num.clone(),
         cond: Preconditions::None,
-        memo: tx.memo.clone(),
+        // Classification precedes refusal of an unreadable payment memo.
+        memo: match &tx.memo {
+            Memo::Text(text) if std::str::from_utf8(text.as_slice()).is_err() => Memo::None,
+            memo => memo.clone(),
+        },
         operations: vec![operation.clone()]
             .try_into()
             .map_err(|_| decode_error("the single operation cannot be encoded"))?,
@@ -326,10 +478,13 @@ fn validate_amounts(tx: &Transaction) -> Result<(), TransactionEffectsError> {
 ///
 /// `wallet` identifies the profile's base account key; `None` counts every source as the wallet.
 /// `network_passphrase` names the profile's network and has no effect on classic asset decoding.
+/// Every token leg carries the signed memo in its arguments and [`ValueEffects::memo`].
+/// A transaction without a memo supplies [`ClassicMemo::None`].
 ///
 /// # Errors
 ///
 /// Returns an error for malformed or legacy envelopes, negative fees or amounts, empty transactions, and refused operations.
+/// A payment leg with a text memo that is not UTF-8 returns [`TransactionEffectsError::UnreadableMemo`].
 ///
 /// # Examples
 ///
@@ -338,6 +493,49 @@ fn validate_amounts(tx: &Transaction) -> Result<(), TransactionEffectsError> {
 ///
 /// let result = transaction_effects("invalid", None, "Test SDF Network ; September 2015");
 /// assert!(matches!(result, Err(TransactionEffectsError::Decode { .. })));
+/// ```
+///
+/// A token transfer carries the transaction's text memo:
+///
+/// ```
+/// use stellar_agent_core::envelope_decode::ClassicMemo;
+/// use stellar_agent_core::policy::transaction_effects::transaction_effects;
+/// use stellar_xdr::*;
+///
+/// let account = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([1; 32])));
+/// let call = InvokeContractArgs {
+///     contract_address: ScAddress::Contract(ContractId(Hash([9; 32]))),
+///     function_name: "transfer".try_into().unwrap(),
+///     args: vec![ScVal::Address(ScAddress::Account(account.clone())),
+///                ScVal::Address(ScAddress::Account(account)), ScVal::from(5i128)].try_into()?,
+/// };
+/// let operation = Operation {
+///     source_account: None,
+///     body: OperationBody::InvokeHostFunction(InvokeHostFunctionOp {
+///         host_function: HostFunction::InvokeContract(call.clone()),
+///         auth: vec![SorobanAuthorizationEntry {
+///             credentials: SorobanCredentials::SourceAccount,
+///             root_invocation: SorobanAuthorizedInvocation {
+///                 function: SorobanAuthorizedFunction::ContractFn(call),
+///                 sub_invocations: Default::default(),
+///             },
+///         }].try_into()?,
+///     }),
+/// };
+/// let envelope = TransactionEnvelope::Tx(TransactionV1Envelope {
+///     tx: Transaction {
+///         source_account: MuxedAccount::Ed25519(Uint256([1; 32])),
+///         memo: Memo::Text("inv-7".try_into()?),
+///         operations: vec![operation].try_into()?,
+///         ..Default::default()
+///     },
+///     signatures: Default::default(),
+/// });
+/// let effects = transaction_effects(&envelope.to_xdr_base64(Limits::none())?, None, "")?;
+/// let leg = effects.payment_legs()[0];
+/// assert_eq!(leg.policy_args["memo"], "inv-7");
+/// assert_eq!(leg.value.as_ref().unwrap().memo(), Some(&ClassicMemo::Text("inv-7".into())));
+/// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
 pub fn transaction_effects(
     envelope_xdr_b64: &str,
@@ -395,7 +593,44 @@ pub fn transaction_effects(
     for (operation_index, operation) in (0u32..).zip(tx.operations.iter()) {
         decode_operation(&tx, operation, operation_index, wallet, &mut effects)?;
     }
+    if effects.memo.is_none() && !effects.payment_legs().is_empty() {
+        return Err(TransactionEffectsError::UnreadableMemo);
+    }
     Ok(effects)
+}
+
+fn invocation_operation(
+    tx: &Transaction,
+    source: &MuxedAccount,
+    operation_index: u32,
+    leg: ValueLeg,
+    memo: Option<&ClassicMemo>,
+) -> ValuedOperation {
+    let mut policy_args = serde_json::json!({
+        "source": stellar_strkey::ed25519::PublicKey(*base_key(source)).to_string().as_str(),
+        "total_fee_stroops": tx.fee,
+        "amount_stroops": leg.amount.map(|amount| amount.to_string()),
+        "asset": leg.asset,
+        "memo": null,
+    });
+    match memo {
+        Some(ClassicMemo::Text(text)) => policy_args["memo"] = text.clone().into(),
+        Some(ClassicMemo::Id(id)) => policy_args["memo_id"] = id.to_string().into(),
+        Some(ClassicMemo::Hash(hash)) => policy_args["memo_hash"] = crate::hex::encode(hash).into(),
+        Some(ClassicMemo::Return(hash)) => {
+            policy_args["memo_return"] = crate::hex::encode(hash).into()
+        }
+        Some(ClassicMemo::None) | None => {}
+    }
+    if let Some(destination) = &leg.destination {
+        policy_args["destination"] = destination.clone().into();
+    }
+    ValuedOperation {
+        operation_index,
+        route: PaymentRoute::Pay,
+        policy_args,
+        value: Some(ValueEffects::single(leg).with_memo(memo.cloned())),
+    }
 }
 
 fn decode_operation(
@@ -423,6 +658,7 @@ fn decode_operation(
         effects.unvalued.push(UnvaluedOperation {
             operation_index,
             effect,
+            valued_legs: Vec::new(),
         });
     };
     let refuse = |effect| TransactionEffectsError::Refused {
@@ -512,7 +748,49 @@ fn decode_operation(
                 unvalued(UnvaluedEffect::ReserveSponsorship);
             }
         }
-        OperationBody::InvokeHostFunction(_) => unvalued(UnvaluedEffect::ContractInvocation),
+        OperationBody::InvokeHostFunction(op) => {
+            match &op.host_function {
+                HostFunction::InvokeContract(_)
+                | HostFunction::CreateContract(_)
+                | HostFunction::UploadContractWasm(_)
+                | HostFunction::CreateContractV2(_) => {}
+            }
+            let account = ScAddress::Account(AccountId(PublicKey::PublicKeyTypeEd25519(
+                stellar_xdr::Uint256(*base_key(source)),
+            )));
+            let mut valued_legs = Vec::new();
+            let mut has_unvalued = false;
+            for entry in &op.auth {
+                match &entry.credentials {
+                    SorobanCredentials::SourceAccount => {
+                        let invocation =
+                            authorized_invocation_effects(&entry.root_invocation, &account);
+                        has_unvalued |= invocation.unvalued;
+                        valued_legs.extend(invocation.legs.into_iter().map(|leg| {
+                            invocation_operation(
+                                tx,
+                                source,
+                                operation_index,
+                                leg,
+                                effects.memo.as_ref(),
+                            )
+                        }));
+                    }
+                    SorobanCredentials::Address(_)
+                    | SorobanCredentials::AddressV2(_)
+                    | SorobanCredentials::AddressWithDelegates(_) => {}
+                }
+            }
+            if has_unvalued {
+                effects.unvalued.push(UnvaluedOperation {
+                    operation_index,
+                    effect: UnvaluedEffect::ContractInvocation,
+                    valued_legs,
+                });
+            } else {
+                effects.valued.extend(valued_legs);
+            }
+        }
         OperationBody::AccountMerge(destination) => {
             if !incoming(destination) {
                 return Err(refuse(RefusedEffect::AccountMerge));
@@ -713,6 +991,867 @@ mod tests {
             },
             ..Default::default()
         })
+    }
+
+    fn address(key: [u8; 32]) -> ScAddress {
+        ScAddress::Account(account(key))
+    }
+
+    fn contract() -> ScAddress {
+        ScAddress::Contract(ContractId(Hash([9; 32])))
+    }
+
+    fn contract_strkey() -> String {
+        stellar_strkey::Contract([9; 32])
+            .to_string()
+            .as_str()
+            .to_owned()
+    }
+
+    fn call(name: &str, args: Vec<ScVal>) -> SorobanAuthorizedInvocation {
+        SorobanAuthorizedInvocation {
+            function: SorobanAuthorizedFunction::ContractFn(InvokeContractArgs {
+                contract_address: contract(),
+                function_name: ScSymbol(name.try_into().unwrap()),
+                args: args.try_into().unwrap(),
+            }),
+            sub_invocations: Default::default(),
+        }
+    }
+
+    fn token_args(name: &str, authorizer: [u8; 32], amount: i128) -> Vec<ScVal> {
+        let owner = ScVal::Address(address(authorizer));
+        let other = ScVal::Address(address(OTHER));
+        let amount = ScVal::from(amount);
+        match name {
+            "transfer" => vec![owner, other, amount],
+            "transfer_from" => vec![owner, ScVal::Address(address(THIRD)), other, amount],
+            "approve" => vec![owner, other, amount, ScVal::U32(100)],
+            "burn" => vec![owner, amount],
+            "burn_from" => vec![owner, other, amount],
+            _ => panic!("the fixture names a token function"),
+        }
+    }
+
+    fn token(name: &str, amount: i128) -> SorobanAuthorizedInvocation {
+        call(name, token_args(name, WALLET, amount))
+    }
+
+    fn create_tree(children: Vec<SorobanAuthorizedInvocation>) -> SorobanAuthorizedInvocation {
+        SorobanAuthorizedInvocation {
+            function: SorobanAuthorizedFunction::CreateContractHostFn(Default::default()),
+            sub_invocations: children.try_into().unwrap(),
+        }
+    }
+
+    fn invocation_body(roots: Vec<SorobanAuthorizedInvocation>) -> OperationBody {
+        OperationBody::InvokeHostFunction(InvokeHostFunctionOp {
+            host_function: HostFunction::InvokeContract(InvokeContractArgs::default()),
+            auth: roots
+                .into_iter()
+                .map(|root_invocation| SorobanAuthorizationEntry {
+                    credentials: SorobanCredentials::SourceAccount,
+                    root_invocation,
+                })
+                .collect::<Vec<_>>()
+                .try_into()
+                .unwrap(),
+        })
+    }
+
+    fn invocation_effects(roots: Vec<SorobanAuthorizedInvocation>) -> TransactionEffects {
+        decode(&transaction(vec![operation(invocation_body(roots))]))
+    }
+
+    fn assert_unknown(effects: &TransactionEffects) {
+        assert!(
+            effects.valued.is_empty(),
+            "unknown calls have no separate valued operations"
+        );
+        assert_eq!(
+            effects.unvalued,
+            vec![UnvaluedOperation {
+                operation_index: 0,
+                effect: UnvaluedEffect::ContractInvocation,
+                valued_legs: Vec::new(),
+            }]
+        );
+    }
+
+    fn assert_token_leg(
+        op: &ValuedOperation,
+        index: u32,
+        source: [u8; 32],
+        amount: i128,
+        asset: &str,
+        destination: Option<&str>,
+    ) {
+        assert_eq!(op.operation_index, index);
+        assert_eq!(op.route, PaymentRoute::Pay);
+        assert_eq!(
+            op.value.as_ref().unwrap().legs(),
+            &[ValueLeg {
+                kind: ActionKind::Payment,
+                amount: Some(amount),
+                asset: Some(asset.to_owned()),
+                destination: destination.map(str::to_owned),
+            }]
+        );
+        let mut expected = serde_json::json!({
+            "source": strkey(source),
+            "total_fee_stroops": 1234,
+            "amount_stroops": amount.to_string(),
+            "asset": asset,
+            "memo": null,
+        });
+        if let Some(destination) = destination {
+            expected["destination"] = destination.into();
+        }
+        assert_eq!(op.policy_args, expected);
+    }
+
+    #[test]
+    fn a_source_account_transfer_from_the_wallet_is_a_pay_route_payment() {
+        let amount = i128::from(i64::MAX) + 1;
+        for (to, expected) in [
+            (address(OTHER), strkey(OTHER)),
+            (contract(), contract_strkey()),
+            (
+                ScAddress::MuxedAccount(MuxedEd25519Account {
+                    id: 17,
+                    ed25519: Uint256(OTHER),
+                }),
+                stellar_strkey::ed25519::MuxedAccount {
+                    ed25519: OTHER,
+                    id: 17,
+                }
+                .to_string()
+                .as_str()
+                .to_owned(),
+            ),
+        ] {
+            let root = call(
+                "transfer",
+                vec![
+                    ScVal::Address(address(WALLET)),
+                    ScVal::Address(to),
+                    ScVal::from(amount),
+                ],
+            );
+            let direct = authorized_invocation_effects(&root, &address(WALLET));
+            assert!(!direct.unvalued);
+            assert_eq!(direct.legs.len(), 1);
+            let effects = invocation_effects(vec![root]);
+            assert!(effects.unvalued.is_empty());
+            assert_eq!(effects.valued.len(), 1);
+            assert_token_leg(
+                &effects.valued[0],
+                0,
+                WALLET,
+                amount,
+                &contract_strkey(),
+                Some(&expected),
+            );
+            assert_eq!(
+                direct.legs,
+                effects.valued[0].value.as_ref().unwrap().legs()
+            );
+        }
+    }
+
+    #[test]
+    fn a_native_contract_transfer_keeps_its_contract_address() {
+        use crate::asset_id::CanonicalAsset;
+        for network in [TESTNET, "Public Global Stellar Network ; September 2015"] {
+            for asset in [
+                CanonicalAsset::Native,
+                CanonicalAsset::Classic {
+                    code: "USD".into(),
+                    issuer: strkey(THIRD),
+                },
+            ] {
+                let asset = asset.sac_contract_id(network).unwrap();
+                let mut root = token("transfer", 5);
+                let SorobanAuthorizedFunction::ContractFn(call) = &mut root.function else {
+                    unreachable!()
+                };
+                call.contract_address = ScAddress::Contract(ContractId(Hash(
+                    stellar_strkey::Contract::from_string(&asset).unwrap().0,
+                )));
+                let tx = transaction(vec![operation(invocation_body(vec![root]))]);
+                let effects =
+                    transaction_effects(&encode(&envelope(&tx)), Some(&WALLET), network).unwrap();
+                assert!(effects.unvalued.is_empty());
+                assert_eq!(effects.valued.len(), 1);
+                assert_token_leg(
+                    &effects.valued[0],
+                    0,
+                    WALLET,
+                    5,
+                    &asset,
+                    Some(&strkey(OTHER)),
+                );
+                assert!(!effects.valued[0].value.as_ref().unwrap().legs()[0].is_native_debit());
+            }
+        }
+    }
+
+    #[test]
+    fn sub_invocation_transfers_are_valued() {
+        let mut inner = create_tree(vec![token("transfer", 5)]);
+        inner.function = SorobanAuthorizedFunction::CreateContractV2HostFn(Default::default());
+        let effects = invocation_effects(vec![create_tree(vec![inner])]);
+        assert!(effects.unvalued.is_empty());
+        assert_eq!(effects.valued.len(), 1);
+        assert_token_leg(
+            &effects.valued[0],
+            0,
+            WALLET,
+            5,
+            &contract_strkey(),
+            Some(&strkey(OTHER)),
+        );
+        for function in [
+            SorobanAuthorizedFunction::CreateContractHostFn(Default::default()),
+            SorobanAuthorizedFunction::CreateContractV2HostFn(Default::default()),
+        ] {
+            empty(&invocation_effects(vec![SorobanAuthorizedInvocation {
+                function,
+                sub_invocations: Default::default(),
+            }]));
+        }
+    }
+
+    #[test]
+    fn approve_is_valued_to_the_spender_and_a_zero_allowance_is_no_effect() {
+        let effects = invocation_effects(vec![token("approve", 5)]);
+        assert!(effects.unvalued.is_empty());
+        assert_eq!(effects.valued.len(), 1);
+        assert_token_leg(
+            &effects.valued[0],
+            0,
+            WALLET,
+            5,
+            &contract_strkey(),
+            Some(&strkey(OTHER)),
+        );
+        empty(&invocation_effects(vec![token("approve", 0)]));
+    }
+
+    #[test]
+    fn transfer_from_and_both_burns_are_valued() {
+        let effects = invocation_effects(vec![
+            token("transfer_from", 5),
+            token("burn", 6),
+            token("burn_from", 7),
+        ]);
+        assert!(effects.unvalued.is_empty());
+        assert_eq!(effects.valued.len(), 3);
+        for (index, op) in effects.valued.iter().enumerate() {
+            let destination = (index == 0).then(|| strkey(OTHER));
+            assert_token_leg(
+                op,
+                0,
+                WALLET,
+                5 + index as i128,
+                &contract_strkey(),
+                destination.as_deref(),
+            );
+            if index != 0 {
+                assert!(op.policy_args.get("destination").is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn an_unknown_function_is_unvalued() {
+        assert_unknown(&invocation_effects(vec![call("swap", vec![])]));
+    }
+
+    #[test]
+    fn a_token_call_for_another_address_is_unvalued() {
+        assert_unknown(&invocation_effects(vec![call(
+            "transfer",
+            token_args("transfer", OTHER, 5),
+        )]));
+    }
+
+    #[test]
+    fn a_negative_token_argument_is_unvalued() {
+        for name in ["transfer", "transfer_from", "approve", "burn", "burn_from"] {
+            for amount in [-1, i128::MIN] {
+                assert_unknown(&invocation_effects(vec![token(name, amount)]));
+            }
+        }
+    }
+
+    #[test]
+    fn address_credential_entries_carry_no_effect() {
+        let mut checked = 0;
+        for kind in SorobanCredentialsType::VARIANTS {
+            let credentials = match kind {
+                SorobanCredentialsType::SourceAccount => continue,
+                SorobanCredentialsType::Address => {
+                    SorobanCredentials::Address(SorobanAddressCredentials {
+                        address: address(WALLET),
+                        ..Default::default()
+                    })
+                }
+                SorobanCredentialsType::AddressV2 => {
+                    SorobanCredentials::AddressV2(SorobanAddressCredentials {
+                        address: address(WALLET),
+                        ..Default::default()
+                    })
+                }
+                SorobanCredentialsType::AddressWithDelegates => {
+                    SorobanCredentials::AddressWithDelegates(
+                        SorobanAddressCredentialsWithDelegates {
+                            address_credentials: SorobanAddressCredentials {
+                                address: address(WALLET),
+                                ..Default::default()
+                            },
+                            delegates: Default::default(),
+                        },
+                    )
+                }
+            };
+            let body = OperationBody::InvokeHostFunction(InvokeHostFunctionOp {
+                auth: vec![SorobanAuthorizationEntry {
+                    credentials,
+                    root_invocation: token("transfer", 5),
+                }]
+                .try_into()
+                .unwrap(),
+                ..Default::default()
+            });
+            empty(&decode(&transaction(vec![operation(body)])));
+            checked += 1;
+        }
+        assert_eq!(checked, SorobanCredentialsType::VARIANTS.len() - 1);
+    }
+
+    #[test]
+    fn a_call_on_an_address_that_is_not_a_contract_is_unvalued() {
+        for invalid in [
+            address(OTHER),
+            ScAddress::MuxedAccount(MuxedEd25519Account {
+                id: 1,
+                ed25519: Uint256(OTHER),
+            }),
+            ScAddress::MuxedContract(MuxedContract {
+                id: 1,
+                contract_id: ContractId(Hash([9; 32])),
+            }),
+            ScAddress::ClaimableBalance(ClaimableBalanceId::default()),
+            ScAddress::LiquidityPool(PoolId::default()),
+        ] {
+            let mut root = token("transfer", 5);
+            let SorobanAuthorizedFunction::ContractFn(call) = &mut root.function else {
+                unreachable!()
+            };
+            call.contract_address = invalid;
+            assert_unknown(&invocation_effects(vec![root]));
+        }
+        for invalid in [
+            ScAddress::ClaimableBalance(ClaimableBalanceId::default()),
+            ScAddress::LiquidityPool(PoolId::default()),
+        ] {
+            assert_unknown(&invocation_effects(vec![call(
+                "transfer",
+                vec![
+                    ScVal::Address(address(WALLET)),
+                    ScVal::Address(invalid),
+                    ScVal::from(5i128),
+                ],
+            )]));
+        }
+    }
+
+    #[test]
+    fn another_sources_invocation_is_decided_for_that_source() {
+        for authorizer in [OTHER, WALLET] {
+            let mut op = operation(invocation_body(vec![call(
+                "transfer",
+                vec![
+                    ScVal::Address(address(authorizer)),
+                    ScVal::Address(address(THIRD)),
+                    ScVal::from(5i128),
+                ],
+            )]));
+            op.source_account = Some(muxed(OTHER, Some(27)));
+            let effects = decode(&transaction(vec![op]));
+            if authorizer == OTHER {
+                assert!(effects.unvalued.is_empty());
+                assert_eq!(effects.valued.len(), 1);
+                assert_token_leg(
+                    &effects.valued[0],
+                    0,
+                    OTHER,
+                    5,
+                    &contract_strkey(),
+                    Some(&strkey(THIRD)),
+                );
+            } else {
+                assert_unknown(&effects);
+            }
+        }
+    }
+
+    #[test]
+    fn an_invocation_without_source_account_authorization_carries_no_effect() {
+        for kind in HostFunctionType::VARIANTS {
+            let host_function = match kind {
+                HostFunctionType::InvokeContract => {
+                    HostFunction::InvokeContract(Default::default())
+                }
+                HostFunctionType::CreateContract => {
+                    HostFunction::CreateContract(Default::default())
+                }
+                HostFunctionType::UploadContractWasm => {
+                    HostFunction::UploadContractWasm(Default::default())
+                }
+                HostFunctionType::CreateContractV2 => {
+                    HostFunction::CreateContractV2(Default::default())
+                }
+            };
+            for roots in [vec![], vec![token("transfer", 5)]] {
+                let OperationBody::InvokeHostFunction(mut op) = invocation_body(roots.clone())
+                else {
+                    unreachable!()
+                };
+                op.host_function = host_function.clone();
+                let effects = decode(&transaction(vec![operation(
+                    OperationBody::InvokeHostFunction(op),
+                )]));
+                if roots.is_empty() {
+                    empty(&effects);
+                } else {
+                    assert!(effects.unvalued.is_empty());
+                    assert_eq!(effects.valued.len(), 1);
+                    assert_token_leg(
+                        &effects.valued[0],
+                        0,
+                        WALLET,
+                        5,
+                        &contract_strkey(),
+                        Some(&strkey(OTHER)),
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn one_unvalued_entry_per_operation() {
+        for roots in [
+            vec![call("swap", vec![]), call("unknown", vec![])],
+            vec![create_tree(vec![
+                call("swap", vec![]),
+                call("unknown", vec![]),
+            ])],
+        ] {
+            assert_unknown(&invocation_effects(roots));
+        }
+    }
+
+    #[test]
+    fn a_mixed_invocation_is_classified_once_as_unvalued() {
+        for roots in [
+            vec![create_tree(vec![
+                token("transfer", 5),
+                call("swap", vec![]),
+            ])],
+            vec![token("transfer", 5), call("swap", vec![])],
+            vec![call("swap", vec![]), token("transfer", 5)],
+        ] {
+            let effects = invocation_effects(roots);
+            assert!(
+                effects.valued.is_empty(),
+                "mixed calls have no separate valued operations"
+            );
+            assert_eq!(effects.unvalued.len(), 1);
+            let mixed = &effects.unvalued[0];
+            assert_eq!(mixed.operation_index, 0);
+            assert_eq!(mixed.effect, UnvaluedEffect::ContractInvocation);
+            assert_eq!(mixed.valued_legs.len(), 1);
+            assert_token_leg(
+                &mixed.valued_legs[0],
+                0,
+                WALLET,
+                5,
+                &contract_strkey(),
+                Some(&strkey(OTHER)),
+            );
+        }
+    }
+
+    #[test]
+    fn a_mixed_invocation_retains_every_valued_leg() {
+        let mut approval = token("approve", i128::MAX);
+        let SorobanAuthorizedFunction::ContractFn(args) = &mut approval.function else {
+            unreachable!()
+        };
+        args.contract_address = ScAddress::Contract(ContractId(Hash([8; 32])));
+        let effects = invocation_effects(vec![create_tree(vec![
+            token("transfer", 5),
+            call("swap", vec![]),
+            create_tree(vec![approval, token("burn", 7)]),
+        ])]);
+        assert!(effects.valued.is_empty());
+        assert_eq!(effects.unvalued.len(), 1);
+        let legs = &effects.unvalued[0].valued_legs;
+        assert_eq!(legs.len(), 3);
+        assert_token_leg(
+            &legs[0],
+            0,
+            WALLET,
+            5,
+            &contract_strkey(),
+            Some(&strkey(OTHER)),
+        );
+        assert_token_leg(
+            &legs[1],
+            0,
+            WALLET,
+            i128::MAX,
+            stellar_strkey::Contract([8; 32]).to_string().as_str(),
+            Some(&strkey(OTHER)),
+        );
+        assert_token_leg(&legs[2], 0, WALLET, 7, &contract_strkey(), None);
+    }
+
+    #[test]
+    fn payment_legs_lists_valued_and_retained_legs_by_operation() {
+        let effects = decode(&transaction(vec![
+            operation(payment(muxed(OTHER, None))),
+            operation(invocation_body(vec![create_tree(vec![
+                token("transfer", 5),
+                call("swap", vec![]),
+                token("burn", 7),
+            ])])),
+            operation(invocation_body(vec![
+                token("approve", 9),
+                token("transfer", 11),
+            ])),
+            fixture_op(OperationType::ManageSellOffer),
+        ]));
+        let legs = effects.payment_legs();
+        assert_eq!(
+            legs.iter().map(|op| op.operation_index).collect::<Vec<_>>(),
+            vec![0, 1, 1, 2, 2]
+        );
+        assert_eq!(legs[0], &effects.valued[0]);
+        for (op, index, amount, destination) in [
+            (legs[1], 1, 5, Some(strkey(OTHER))),
+            (legs[2], 1, 7, None),
+            (legs[3], 2, 9, Some(strkey(OTHER))),
+            (legs[4], 2, 11, Some(strkey(OTHER))),
+        ] {
+            assert_token_leg(
+                op,
+                index,
+                WALLET,
+                amount,
+                &contract_strkey(),
+                destination.as_deref(),
+            );
+        }
+        assert_eq!(effects.unvalued.len(), 2);
+        assert!(effects.unvalued[1].valued_legs.is_empty());
+    }
+
+    #[test]
+    fn a_text_memo_reaches_classic_and_token_legs_in_one_transaction() {
+        let mut tx = transaction(vec![
+            operation(payment(muxed(OTHER, None))),
+            operation(invocation_body(vec![token("transfer", 5)])),
+        ]);
+        tx.memo = Memo::Text("inv-7".try_into().unwrap());
+        let effects = decode(&tx);
+        assert!(effects.unvalued.is_empty());
+        assert_eq!(effects.valued.len(), 2);
+        for leg in effects.payment_legs() {
+            assert_eq!(leg.policy_args["memo"], "inv-7");
+        }
+        assert_eq!(
+            effects.valued[1].value.as_ref().unwrap().memo(),
+            Some(&ClassicMemo::Text("inv-7".to_owned()))
+        );
+        assert_eq!(effects.memo, Some(ClassicMemo::Text("inv-7".to_owned())));
+    }
+
+    #[test]
+    fn signed_memos_reach_token_arguments_and_value() {
+        for (memo, expected, fields) in [
+            (
+                Memo::Text("inv-7".try_into().unwrap()),
+                ClassicMemo::Text("inv-7".to_owned()),
+                serde_json::json!({"memo": "inv-7"}),
+            ),
+            (
+                Memo::Text("".try_into().unwrap()),
+                ClassicMemo::Text(String::new()),
+                serde_json::json!({"memo": ""}),
+            ),
+            (
+                Memo::Id(u64::MAX),
+                ClassicMemo::Id(u64::MAX),
+                serde_json::json!({"memo": null, "memo_id": "18446744073709551615"}),
+            ),
+            (
+                Memo::Hash(Hash([4; 32])),
+                ClassicMemo::Hash([4; 32]),
+                serde_json::json!({"memo": null, "memo_hash": "04".repeat(32)}),
+            ),
+            (
+                Memo::Return(Hash([5; 32])),
+                ClassicMemo::Return([5; 32]),
+                serde_json::json!({"memo": null, "memo_return": "05".repeat(32)}),
+            ),
+        ] {
+            for roots in [
+                vec![token("transfer", 5)],
+                vec![call("swap", vec![]), token("transfer", 5)],
+            ] {
+                let mut tx = transaction(vec![operation(invocation_body(roots))]);
+                tx.memo = memo.clone();
+                let effects = decode(&tx);
+                let legs = effects.payment_legs();
+                assert_eq!(legs.len(), 1);
+                let mut args = serde_json::json!({
+                    "source": strkey(WALLET),
+                    "total_fee_stroops": 1234,
+                    "amount_stroops": "5",
+                    "asset": contract_strkey(),
+                    "destination": strkey(OTHER),
+                });
+                args.as_object_mut()
+                    .unwrap()
+                    .extend(fields.as_object().unwrap().clone());
+                assert_eq!(legs[0].policy_args, args);
+                assert_eq!(legs[0].value.as_ref().unwrap().memo(), Some(&expected));
+                assert_eq!(effects.memo.as_ref(), Some(&expected));
+            }
+        }
+    }
+
+    #[test]
+    fn a_token_transfer_without_a_memo_carries_no_memo() {
+        let effects = invocation_effects(vec![token("transfer", 5)]);
+        assert!(effects.unvalued.is_empty());
+        assert_eq!(effects.valued.len(), 1);
+        assert_token_leg(
+            &effects.valued[0],
+            0,
+            WALLET,
+            5,
+            &contract_strkey(),
+            Some(&strkey(OTHER)),
+        );
+        assert_eq!(
+            effects.valued[0].value.as_ref().unwrap().memo(),
+            Some(&ClassicMemo::None)
+        );
+        assert_eq!(effects.memo, Some(ClassicMemo::None));
+    }
+
+    #[test]
+    fn an_unreadable_text_memo_is_refused_only_with_a_payment_leg() {
+        for body in [
+            payment(muxed(OTHER, None)),
+            invocation_body(vec![token("transfer", 5)]),
+            invocation_body(vec![token("transfer", 5), call("swap", vec![])]),
+        ] {
+            let mut tx = transaction(vec![operation(body)]);
+            tx.memo = Memo::Text(vec![0xff].try_into().unwrap());
+            assert_eq!(
+                transaction_effects(&encode(&envelope(&tx)), Some(&WALLET), TESTNET),
+                Err(TransactionEffectsError::UnreadableMemo)
+            );
+            let effects = transaction_effects(
+                &encode(&fee_bump(&tx, muxed(WALLET, None), 2000)),
+                Some(&WALLET),
+                TESTNET,
+            )
+            .unwrap();
+            empty(&effects);
+            assert_eq!(effects.memo, None);
+        }
+        for kind in [OperationType::BumpSequence, OperationType::ManageSellOffer] {
+            let mut tx = transaction(vec![fixture_op(kind)]);
+            tx.memo = Memo::Text(vec![0xff].try_into().unwrap());
+            let effects = decode(&tx);
+            assert!(effects.payment_legs().is_empty());
+            assert_eq!(effects.memo, None);
+        }
+    }
+
+    #[test]
+    fn zero_token_arguments_keep_their_node_outcomes() {
+        for name in ["transfer", "transfer_from", "burn", "burn_from"] {
+            let effects = invocation_effects(vec![token(name, 0)]);
+            assert!(effects.unvalued.is_empty());
+            assert_eq!(effects.valued.len(), 1);
+            let destination = name.starts_with("transfer").then(|| strkey(OTHER));
+            assert_token_leg(
+                &effects.valued[0],
+                0,
+                WALLET,
+                0,
+                &contract_strkey(),
+                destination.as_deref(),
+            );
+        }
+        empty(&invocation_effects(vec![token("approve", 0)]));
+    }
+
+    #[test]
+    fn approve_preserves_amount_and_spender_for_every_expiration() {
+        for expiration in [ScVal::U32(0), ScVal::U32(u32::MAX), ScVal::I32(1)] {
+            let args = vec![
+                ScVal::Address(address(WALLET)),
+                ScVal::Address(address(OTHER)),
+                ScVal::from(i128::MAX),
+                expiration.clone(),
+            ];
+            let effects = invocation_effects(vec![call("approve", args)]);
+            if matches!(expiration, ScVal::U32(_)) {
+                assert!(effects.unvalued.is_empty());
+                assert_eq!(effects.valued.len(), 1);
+                assert_token_leg(
+                    &effects.valued[0],
+                    0,
+                    WALLET,
+                    i128::MAX,
+                    &contract_strkey(),
+                    Some(&strkey(OTHER)),
+                );
+            } else {
+                assert_unknown(&effects);
+            }
+        }
+    }
+
+    #[test]
+    fn token_shapes_and_authorizing_roles_are_exact() {
+        for name in ["transfer", "transfer_from", "approve", "burn", "burn_from"] {
+            let args = token_args(name, WALLET, 5);
+            let amount_index = args
+                .iter()
+                .position(|arg| matches!(arg, ScVal::I128(_)))
+                .unwrap();
+            let mut wrong_type = args.clone();
+            wrong_type[amount_index] = ScVal::I64(5);
+            let mut extra = args.clone();
+            extra.push(ScVal::Void);
+            let mut missing = args.clone();
+            missing.pop();
+            for malformed in [wrong_type, extra, missing] {
+                assert_unknown(&invocation_effects(vec![call(name, malformed)]));
+            }
+            for index in 0..amount_index {
+                let mut malformed = args.clone();
+                malformed[index] = ScVal::Void;
+                assert_unknown(&invocation_effects(vec![call(name, malformed)]));
+            }
+            assert_unknown(&invocation_effects(vec![call(
+                name,
+                token_args(name, OTHER, 5),
+            )]));
+            let effects = invocation_effects(vec![call(name, args.clone())]);
+            assert!(
+                effects.unvalued.is_empty(),
+                "the authorizing role matches for {name}"
+            );
+            assert_eq!(effects.valued.len(), 1);
+            if name.ends_with("_from") {
+                let mut wrong_role = args;
+                wrong_role[0] = ScVal::Address(address(OTHER));
+                wrong_role[1] = ScVal::Address(address(WALLET));
+                assert_unknown(&invocation_effects(vec![call(name, wrong_role)]));
+            }
+        }
+    }
+
+    #[test]
+    fn a_destination_keeps_its_full_mux_id() {
+        for is_contract in [false, true] {
+            let mut destinations = Vec::new();
+            for id in [1, u64::MAX] {
+                let (to, expected) = if is_contract {
+                    (
+                        ScAddress::MuxedContract(MuxedContract {
+                            id,
+                            contract_id: ContractId(Hash([9; 32])),
+                        }),
+                        stellar_strkey::MuxedContract {
+                            id,
+                            contract_id: [9; 32],
+                        }
+                        .to_string()
+                        .as_str()
+                        .to_owned(),
+                    )
+                } else {
+                    (
+                        ScAddress::MuxedAccount(MuxedEd25519Account {
+                            id,
+                            ed25519: Uint256(OTHER),
+                        }),
+                        stellar_strkey::ed25519::MuxedAccount { id, ed25519: OTHER }
+                            .to_string()
+                            .as_str()
+                            .to_owned(),
+                    )
+                };
+                let effects = invocation_effects(vec![call(
+                    "transfer",
+                    vec![
+                        ScVal::Address(address(WALLET)),
+                        ScVal::Address(to),
+                        ScVal::from(5i128),
+                    ],
+                )]);
+                assert!(effects.unvalued.is_empty());
+                assert_eq!(effects.valued.len(), 1);
+                assert_token_leg(
+                    &effects.valued[0],
+                    0,
+                    WALLET,
+                    5,
+                    &contract_strkey(),
+                    Some(&expected),
+                );
+                destinations.push(
+                    effects.valued[0].value.as_ref().unwrap().legs()[0]
+                        .destination
+                        .clone(),
+                );
+            }
+            assert_ne!(destinations[0], destinations[1]);
+        }
+    }
+
+    #[test]
+    fn a_fee_bump_does_not_value_its_inner_authorization_tree() {
+        let mut tx = transaction(vec![operation(invocation_body(vec![token("transfer", 5)]))]);
+        tx.memo = Memo::Text("fee".try_into().unwrap());
+        let effects = transaction_effects(
+            &encode(&fee_bump(&tx, muxed(WALLET, None), 2000)),
+            Some(&WALLET),
+            TESTNET,
+        )
+        .unwrap();
+        assert_eq!(
+            effects.fee,
+            Some(FeeEffect {
+                total_stroops: 2000,
+                operation_count: 2,
+                resource_fee_stroops: None
+            })
+        );
+        empty(&effects);
+        assert_eq!(effects.memo, None);
     }
 
     #[test]
@@ -980,7 +2119,7 @@ mod tests {
                 Outcome::None,
             ),
             OperationType::InvokeHostFunction => (
-                OperationBody::InvokeHostFunction(InvokeHostFunctionOp::default()),
+                invocation_body(vec![call("swap", vec![])]),
                 Outcome::Unvalued(UnvaluedEffect::ContractInvocation),
             ),
             OperationType::ExtendFootprintTtl => (
@@ -1083,6 +2222,7 @@ mod tests {
                     Outcome::Unvalued(effect) => expected.unvalued.push(UnvaluedOperation {
                         operation_index: 0,
                         effect,
+                        valued_legs: Vec::new(),
                     }),
                     Outcome::None => {}
                     Outcome::Refused(_) => panic!("amount fixture has no refused effect"),
@@ -1481,7 +2621,8 @@ mod tests {
             effects.unvalued,
             vec![UnvaluedOperation {
                 operation_index: 0,
-                effect: UnvaluedEffect::Clawback
+                effect: UnvaluedEffect::Clawback,
+                valued_legs: Vec::new(),
             }]
         );
     }
@@ -1628,7 +2769,8 @@ mod tests {
                 effects.unvalued,
                 vec![UnvaluedOperation {
                     operation_index: 1,
-                    effect
+                    effect,
+                    valued_legs: Vec::new(),
                 }]
             );
             assert!(effects.has_value_effect());
@@ -1644,11 +2786,13 @@ mod tests {
             vec![
                 UnvaluedOperation {
                     operation_index: 0,
-                    effect: UnvaluedEffect::ContractInvocation
+                    effect: UnvaluedEffect::ContractInvocation,
+                    valued_legs: Vec::new(),
                 },
                 UnvaluedOperation {
                     operation_index: 1,
-                    effect: UnvaluedEffect::ContractInvocation
+                    effect: UnvaluedEffect::ContractInvocation,
+                    valued_legs: Vec::new(),
                 },
             ]
         );
@@ -1712,7 +2856,8 @@ mod tests {
                 effects.unvalued,
                 vec![UnvaluedOperation {
                     operation_index: 1,
-                    effect: UnvaluedEffect::Clawback
+                    effect: UnvaluedEffect::Clawback,
+                    valued_legs: Vec::new(),
                 }]
             );
         }
@@ -1744,7 +2889,8 @@ mod tests {
                         effects.unvalued,
                         vec![UnvaluedOperation {
                             operation_index: 0,
-                            effect
+                            effect,
+                            valued_legs: Vec::new(),
                         }],
                         "{kind:?}"
                     );
@@ -1959,7 +3105,8 @@ mod tests {
                     admitted.unvalued,
                     vec![UnvaluedOperation {
                         operation_index: 0,
-                        effect: UnvaluedEffect::ContractInvocation
+                        effect: UnvaluedEffect::ContractInvocation,
+                        valued_legs: Vec::new(),
                     }]
                 );
                 assert_eq!(
