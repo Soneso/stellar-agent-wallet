@@ -187,6 +187,16 @@ const SUPPORTED_VERSION: u32 = 2;
 /// `STELLAR_AGENT_HOME`, is not an overlay and is ignored.
 const ENV_PREFIX: &str = "STELLAR_AGENT_";
 
+/// The environment-variable prefix of profile overrides, `STELLAR_AGENT_`,
+/// for tests that keep such variables out of a child process.
+///
+/// Compiled only with the `test-helpers` feature.
+#[cfg(feature = "test-helpers")]
+#[must_use]
+pub const fn env_prefix() -> &'static str {
+    ENV_PREFIX
+}
+
 /// How an environment or programmatic overlay may set one profile key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OverlayClass {

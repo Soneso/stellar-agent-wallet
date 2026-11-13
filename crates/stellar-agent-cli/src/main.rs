@@ -639,13 +639,11 @@ mod tests {
 
     #[test]
     fn startup_advisory_production_writer_failure_keeps_stderr() {
-        let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
-            .args([
-                "--exact",
-                "advisory::tests::startup_advisory_production_open_failure_warns_once_and_keeps_findings",
-                "--nocapture",
-                "--test-threads=1",
-            ])
+        let output = common::test_support::child_command(
+            "advisory::tests::startup_advisory_production_open_failure_warns_once_and_keeps_findings",
+            &[],
+        )
+            .arg("--exact")
             .output()
             .expect("run production advisory failure fixture");
         let stdout = String::from_utf8_lossy(&output.stdout);

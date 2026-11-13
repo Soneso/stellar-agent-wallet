@@ -745,10 +745,11 @@ async fn outer_fee_one_above_policy_cap_is_rejected() {
         matches!(err, FeeBumpError::FeeExceedsPolicyCap { cap: 5000 }),
         "FeeExceedsPolicyCap must carry cap=5000; got: {err:?}"
     );
-    assert!(
-        !err.to_string().contains("5001") && !format!("{err:?}").contains("5001"),
-        "the supplied fee stays out of the refusal; got: {err:?}"
+    assert_eq!(
+        err.to_string(),
+        "outer_fee_stroops must not exceed the policy cap (5000)"
     );
+    assert_eq!(format!("{err:?}"), "FeeExceedsPolicyCap { cap: 5000 }");
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

@@ -49,7 +49,7 @@ libc = { workspace = true, optional = true }
 serial_test = { workspace = true }
 # Drives the wiremock responder self-test over HTTP (rustls/ring; no OpenSSL).
 reqwest = { workspace = true }
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "io-util", "net", "time"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "io-util", "net", "time", "test-util"] }
 
 [features]
 test-helpers = [

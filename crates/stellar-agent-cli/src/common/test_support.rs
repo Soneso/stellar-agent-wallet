@@ -35,11 +35,23 @@ pub(crate) fn capture(name: &str) -> Option<(String, String)> {
     capture_with_env(name, &[])
 }
 
-const CHILD: &str = "CLI_TEST_CAPTURE_CHILD";
+pub(super) const CHILD: &str = "CLI_TEST_CAPTURE_CHILD";
 
 /// The child test process that runs only `name`, with `env` overlaid.
-fn child_command(name: &str, env: &[(&str, &str)]) -> std::process::Command {
+pub(crate) fn child_command(name: &str, env: &[(&str, &str)]) -> std::process::Command {
     let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+    // The child inherits no variable with the loader's prefix. Profile
+    // overlays and home, log, and keyring settings are stripped alike; only
+    // `env` and the fixed settings below supply them. Clearing inheritance also excludes variables introduced after this
+    // snapshot.
+    command
+        .env_clear()
+        .envs(std::env::vars_os().filter(|(key, _)| {
+            !key.to_string_lossy()
+                .trim()
+                .to_ascii_uppercase()
+                .starts_with(stellar_agent_core::profile::loader::env_prefix())
+        }));
     command
         .args([name, "--nocapture", "--test-threads=1", "--format=terse"])
         .env(CHILD, name)
@@ -48,6 +60,58 @@ fn child_command(name: &str, env: &[(&str, &str)]) -> std::process::Command {
         .env_remove("DISPLAY")
         .env_remove("WAYLAND_DISPLAY");
     command
+}
+
+/// Restores an environment variable when a serial test leaves its scope.
+pub(crate) struct EnvGuard {
+    var: String,
+    previous: Option<std::ffi::OsString>,
+}
+
+impl EnvGuard {
+    /// Sets a variable while the caller holds the default serial test lock.
+    #[allow(
+        unsafe_code,
+        reason = "test-only environment mutation under the serial lock"
+    )]
+    pub(crate) fn set(var: String, value: &str) -> Self {
+        let previous = std::env::var_os(&var);
+        // SAFETY: callers hold the default serial test lock during mutation.
+        unsafe { std::env::set_var(&var, value) };
+        Self { var, previous }
+    }
+}
+
+impl Drop for EnvGuard {
+    #[allow(
+        unsafe_code,
+        reason = "test-only environment restoration under the serial lock"
+    )]
+    fn drop(&mut self) {
+        // SAFETY: callers retain the default serial test lock until drop.
+        unsafe {
+            match &self.previous {
+                Some(value) => std::env::set_var(&self.var, value),
+                None => std::env::remove_var(&self.var),
+            }
+        }
+    }
+}
+
+#[test]
+#[serial_test::serial]
+fn environment_guard_restores_previous_value() {
+    let var = "CLI_TEST_ENV_GUARD_RESTORE";
+    let previous = std::env::var_os(var);
+    {
+        let _outer = EnvGuard::set(var.to_owned(), "outer");
+        {
+            let _inner = EnvGuard::set(var.to_owned(), "inner");
+            assert_eq!(std::env::var(var).unwrap(), "inner");
+        }
+        assert_eq!(std::env::var(var).unwrap(), "outer");
+    }
+    assert_eq!(std::env::var_os(var), previous);
 }
 
 /// Captures one test with explicit child environment overlays.
