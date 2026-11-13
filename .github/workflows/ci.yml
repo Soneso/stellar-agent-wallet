@@ -69,6 +69,8 @@ jobs:
       - name: Install libudev (Linux hidapi)
         run: sudo apt-get -o Acquire::Retries=3 update && sudo apt-get -o Acquire::Retries=3 install -y libudev-dev pkg-config
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          save-if: ${{ github.event_name == 'push' }}
       # The explicit feature list compile-checks the code behind
       # the testnet-acceptance features, without executing any test. The
       # workspace lints declared in the root Cargo.toml deny warnings; -D
@@ -94,6 +96,8 @@ jobs:
       - name: Install libudev (Linux hidapi)
         run: sudo apt-get -o Acquire::Retries=3 update && sudo apt-get -o Acquire::Retries=3 install -y libudev-dev pkg-config
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          save-if: ${{ github.event_name == 'push' }}
       # --no-default-features keeps mainnet-write off; the binary packages
       # enable it by default.
       - name: Build the rustdoc
@@ -127,6 +131,8 @@ jobs:
       - name: Install libudev (Linux hidapi)
         run: sudo apt-get -o Acquire::Retries=3 update && sudo apt-get -o Acquire::Retries=3 install -y libudev-dev pkg-config
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          save-if: ${{ github.event_name == 'push' }}
       # Offline tier only. The enabled features expose the test-only helpers and
       # fixtures the integration suites depend on; none of them pulls the live
       # testnet client helpers. The testnet-acceptance / testnet-integration
@@ -173,6 +179,8 @@ jobs:
       - name: Install libudev (Linux hidapi)
         run: sudo apt-get -o Acquire::Retries=3 update && sudo apt-get -o Acquire::Retries=3 install -y libudev-dev pkg-config
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          save-if: ${{ github.event_name == 'push' }}
       # The explicit feature list compile-checks the code behind
       # the testnet-acceptance features, without executing any test. The
       # workspace lints declared in the root Cargo.toml deny warnings; -D
@@ -196,6 +204,8 @@ jobs:
       - name: Install libudev (Linux hidapi)
         run: sudo apt-get -o Acquire::Retries=3 update && sudo apt-get -o Acquire::Retries=3 install -y libudev-dev pkg-config
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          save-if: ${{ github.event_name == 'push' }}
       - name: Build the rustdoc
         run: cargo doc --workspace --no-deps --features "mainnet-write,$FEATURES_EXCEPT_MAINNET_WRITE"
 
@@ -227,6 +237,8 @@ jobs:
       - name: Install libudev (Linux hidapi)
         run: sudo apt-get -o Acquire::Retries=3 update && sudo apt-get -o Acquire::Retries=3 install -y libudev-dev pkg-config
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          save-if: ${{ github.event_name == 'push' }}
       # Offline tier only. The enabled features expose the test-only helpers
       # and fixtures the integration suites depend on; none of them pulls the
       # live testnet client helpers. The testnet-acceptance and
@@ -434,9 +446,10 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           prefix-key: windows-storage
-          # Failing iterations must still seed the build cache, or every
-          # retry recompiles the dependency tree cold on a slow runner.
+          # Failing push runs still save the cache, so the next run on the
+          # branch starts warm.
           cache-on-failure: true
+          save-if: ${{ github.event_name == 'push' }}
       # The vendored OpenSSL build runs OpenSSL's perl-based Configure, which
       # needs a Windows-native Perl with its full module set; the MSYS perl
       # that Git for Windows puts on PATH lacks it. openssl-src honors
@@ -549,6 +562,7 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           prefix-key: platform-keyring
+          save-if: ${{ github.event_name == 'push' }}
       - name: Build the platform keyring test
         run: cargo test -p stellar-agent-network --test keyring_platform --no-run
       # The round trip is an ignored test, so a run that executes no test

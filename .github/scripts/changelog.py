@@ -19,6 +19,10 @@ class Invalid(ValueError):
     """The supplied content violates the fragment or section contract."""
 
 
+class Unmerged(Invalid):
+    """The merge result differs from the clean three-way merge."""
+
+
 def validate_fragment_name(name):
     match = NAME.fullmatch(name)
     if not match:
@@ -275,8 +279,13 @@ def guard(root, base, head, main_ref):
             checked += 1
             allowed = (len(parents) == 2 and ancestor(root, parents[1], main)
                        and not ancestor(root, parents[1], parents[0]))
-            if not allowed or not clean_changelog_merge(root, parents, commit):
+            if not allowed:
                 raise Invalid("use a two-parent sync merge that preserves the clean merge result")
+            if not clean_changelog_merge(root, parents, commit):
+                raise Unmerged("CHANGELOG.md differs from the clean three-way merge; a maintainer resolves and merges it")
+        except Unmerged as error:
+            # A maintainer resolves a differing sync merge, so the refusal names only that remedy.
+            refused.append(f"{commit}: CHANGELOG.md edit is refused. {error}.")
         except Invalid as error:
             refused.append(f"{commit}: CHANGELOG.md edit is refused. {error}. "
                            "Move entries to new fragments and remove edits from branch history.")

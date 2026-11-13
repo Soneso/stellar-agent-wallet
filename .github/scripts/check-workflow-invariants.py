@@ -81,9 +81,39 @@ and comment lines skipped. The check fails when any of these holds:
 - ``coverage-trigger``: ``coverage.yml`` has no ``pull_request`` trigger, a
   ``paths`` or ``paths-ignore`` filter, no ``types`` list, or a list missing
   an event in ``COVERAGE_EVENTS``. The rule reports every missing event.
-- ``coverage-condition``: ``coverage.yml`` has no ``coverage`` job, or that
-  job's ``if`` is not a string equal to ``COVERAGE_CONDITION`` after the check
-  strips the surrounding whitespace and one enclosing ``${{ }}``.
+- ``coverage-condition``: ``coverage.yml`` lacks a job of ``COVERAGE_PARTS``
+  or the gate job ``coverage``. A part's ``if`` is not a string equal to
+  ``COVERAGE_CONDITION``, or the gate's ``if`` is not a string equal to
+  ``COVERAGE_GATE_CONDITION``, after the check strips the surrounding
+  whitespace and one enclosing ``${{ }}``. Or the gate is not named
+  ``coverage``.
+- ``coverage-split``: a ``run:`` line of ``coverage.yml`` that names
+  ``cargo llvm-cov`` or ``check-coverage.py`` differs from the two
+  measurement and two floor commands, runs in another job than its own, or
+  runs more than once there. The feature-off command belongs to
+  ``coverage-off``, the feature-on command to ``coverage-on``, and both
+  floors to ``coverage``. Or a part lacks an unconditional upload of its
+  ``COVERAGE_EXPORTS`` report after its measurement, with
+  ``if-no-files-found: error``.
+- ``coverage-gate``: the gate does not need exactly both parts. Its first
+  step sets ``if``, lacks a result check, or reads other than
+  ``COVERAGE_RESULT_ENV``. Its second and last steps do not reject a
+  cancelled run: ``if`` equal to ``cancelled()``, no ``continue-on-error``,
+  and ``exit 1`` as the only command. The last step does not follow both
+  floors, or another step sets ``if``. Or a report is not downloaded once,
+  unconditionally, from this run, before the first floor.
+- ``coverage-seed``: ``coverage.yml`` lacks a ``push`` trigger for both
+  ``COVERAGE_SEED_BRANCHES``, filters pushes by path, or lets later runs
+  cancel a running push. A newer pending run still replaces the older pending
+  run.
+- ``coverage-attempt``: an upload or download of ``coverage.yml`` names
+  another artifact than a ``COVERAGE_EXPORTS`` report, whose name ends in
+  ``${{ github.run_attempt }}``, or a download sets ``pattern`` or
+  ``merge-multiple``. The gate then reads only reports of its own attempt.
+- ``cache-save-if``: a ``Swatinem/rust-cache`` step, in any letter case, of
+  any ``*.yml`` or ``*.yaml`` workflow that ``pull_request`` or
+  ``pull_request_target`` triggers lacks ``save-if`` equal to
+  ``CACHE_SAVE_CONDITION`` after the check strips one enclosing ``${{ }}``.
 - ``rehearsal-credentials``: ``release-rehearsal.yml`` holds a credential. A
   job is credentialed as above. The workflow permissions, or a job's own
   permissions or the workflow's when it sets none, are anything but exactly
@@ -166,7 +196,9 @@ runs the function.
   or ``publish`` does not need it, so signing, provenance, and publication
   wait for the rebuild. The called workflow must declare ``workflow_call``.
   Its cache guards must lead with
-  ``github.ref_type != 'tag' && !inputs.publication``; its rebuild
+  ``github.ref_type != 'tag' && !inputs.publication``. Each cache step
+  restores, or saves exactly on ``WASM_SAVE_CONDITION``, so only push and
+  schedule runs save. Its rebuild
   must read both stellar-cli artifacts of its own run and use no cache. No
   job or step of it sets ``continue-on-error``, and no step of ``check``,
   ``rebuild``, or ``vendored-wasm`` suppresses a failure as for
@@ -203,7 +235,10 @@ runs the function.
   strips the surrounding whitespace and one enclosing ``${{ }}``, it sets
   ``continue-on-error``, one of its steps sets ``if`` or
   ``continue-on-error``, or it does not run each of its commands
-  unconditionally; or ``check-host.sh`` does not run each command of
+  unconditionally. A cancel rejection step of the coverage gate is exempt
+  from the step rule: ``if`` equal to ``cancelled()``, no
+  ``continue-on-error``, and ``exit 1`` as its only command. Or
+  ``check-host.sh`` does not run each command of
   ``HOST_CHECKS`` unconditionally.
 - ``skill-archive``: ``release-contracts`` can be bypassed, or its skill
   archive step is missing, duplicated, allowed to fail, uses another command,
@@ -247,6 +282,15 @@ PENDING_FRAGMENTS = ('set -euo pipefail\n'
                      'test -z "$PENDING"')
 # GitHub resolves action names in any letter case.
 CACHE_ACTION = re.compile(r"(Swatinem/rust-cache|actions/cache)(/[\w.-]+)*@", re.IGNORECASE)
+RUST_CACHE_ACTION = re.compile(r"Swatinem/rust-cache(/[\w.-]+)*@", re.IGNORECASE)
+# A rust-cache step in a workflow that a pull request triggers saves only on
+# push runs, so a pull request run, also from a fork, restores only.
+CACHE_SAVE_CONDITION = "github.event_name == 'push'"
+# Only push and schedule runs save missing stellar-cli install roots; other
+# events never save.
+WASM_SAVE_CONDITION = ("github.ref_type != 'tag' && !inputs.publication && "
+                       "(github.event_name == 'push' || github.event_name == 'schedule') && "
+                       "steps.restore.outputs.cache-hit != 'true'")
 SETUP_ACTION = re.compile(r"actions/setup-[\w.-]+@", re.IGNORECASE)
 # The jobs of vendored-wasm.yml whose results the gate job reads, the gate
 # command, and the environment it reads them from. A tag run passes the gate
@@ -285,10 +329,42 @@ ANCESTRY_JOBS = {("release.yml", "preflight"), ("publish.yml", "verify"), ("publ
 # by a person or with an app token.
 COVERAGE_WORKFLOW = "coverage.yml"
 COVERAGE_EVENTS = ("opened", "synchronize", "reopened", "labeled", "unlabeled")
-# The coverage job measures on the schedule, on a dispatch, and on a pull
-# request whose labels include `coverage`.
+# The coverage jobs measure on a push, on the schedule, on a dispatch, and on
+# a pull request whose labels include `coverage`.
 COVERAGE_CONDITION = ("github.event_name != 'pull_request' || "
                       "contains(github.event.pull_request.labels.*.name, 'coverage')")
+# The gate job `coverage` runs after failed, cancelled, or skipped
+# measurements under the same label condition, so its check fails instead of
+# being skipped.
+COVERAGE_GATE_CONDITION = f"always() && ({COVERAGE_CONDITION})"
+COVERAGE_PARTS = ("coverage-off", "coverage-on")
+COVERAGE_GATE = "coverage"
+# Pushes to these branches seed the coverage caches. Later runs do not cancel
+# a running push. A newer pending run replaces the older pending run.
+COVERAGE_SEED_BRANCHES = ("mainnet-write", "main")
+COVERAGE_SEED_CANCEL = "github.event_name == 'pull_request'"
+COVERAGE_OFF_COMMAND = ("cargo llvm-cov --workspace --no-default-features --features "
+                        "test-helpers,test-hooks,test-loopback,verifier-registry --json --output-path cov-feature-off.json")
+COVERAGE_ON_COMMAND = ("cargo llvm-cov --workspace --features "
+                       "mainnet-write,test-helpers,test-hooks,test-loopback,verifier-registry --json "
+                       "--output-path cov-feature-on.json")
+COVERAGE_OFF_FLOORS = "python3 .github/scripts/check-coverage.py cov-feature-off.json --configuration feature-off"
+COVERAGE_ON_FLOORS = "python3 .github/scripts/check-coverage.py cov-feature-on.json --configuration feature-on"
+COVERAGE_MEASURES = {"coverage-off": COVERAGE_OFF_COMMAND, "coverage-on": COVERAGE_ON_COMMAND}
+# The artifact name and file of each part's report. The run attempt in the
+# name binds each report to the attempt that produced it, so the gate reads
+# only reports of its own attempt.
+COVERAGE_ATTEMPT = "${{ github.run_attempt }}"
+COVERAGE_EXPORTS = {"coverage-off": (f"cov-feature-off-{COVERAGE_ATTEMPT}", "cov-feature-off.json"),
+                    "coverage-on": (f"cov-feature-on-{COVERAGE_ATTEMPT}", "cov-feature-on.json")}
+# Download inputs that select reports by a pattern or merge several reports.
+COVERAGE_SELECTION_INPUTS = ("pattern", "merge-multiple")
+# The gate's first step reads both part results; the keys are quoted strings.
+COVERAGE_RESULT_ENV = {"OFF": "${{ needs.coverage-off.result }}", "ON": "${{ needs.coverage-on.result }}"}
+COVERAGE_RESULT_CHECKS = ('test "$OFF" = success', 'test "$ON" = success')
+# The gate steps that fail a cancelled run before and after the floors.
+COVERAGE_CANCEL_CONDITION = "cancelled()"
+COVERAGE_CANCEL_RUN = "exit 1"
 # The release rehearsal builds the release targets of any branch on a
 # dispatch. Its token reads the repository contents and nothing else, and no
 # expression of the workflow reads a secret or the workflow token.
@@ -498,9 +574,10 @@ CI_FEATURE_JOBS = {
 # condition: for each workflow and job, that condition and the commands that
 # define the job.
 CONDITIONED_FEATURE_JOBS = {
-    (COVERAGE_WORKFLOW, "coverage"): (COVERAGE_CONDITION, (
-        "cargo llvm-cov --workspace --no-default-features --features "
-        "test-helpers,test-hooks,test-loopback,verifier-registry --json --output-path cov-feature-off.json",)),
+    (COVERAGE_WORKFLOW, "coverage-off"): (COVERAGE_CONDITION, (COVERAGE_OFF_COMMAND,)),
+    (COVERAGE_WORKFLOW, "coverage-on"): (COVERAGE_CONDITION, (COVERAGE_ON_COMMAND,)),
+    (COVERAGE_WORKFLOW, COVERAGE_GATE): (COVERAGE_GATE_CONDITION, (
+        COVERAGE_RESULT_CHECKS[0], COVERAGE_RESULT_CHECKS[1], COVERAGE_OFF_FLOORS, COVERAGE_ON_FLOORS)),
 }
 # The host recipe: the release build for the host target, which places the
 # stellar-agent-mcp copy, the byte comparison of both names and the marker
@@ -931,15 +1008,207 @@ class Checker:
                 self.report(workflow, "coverage-trigger", f"pull_request types lack {event}")
 
     def check_coverage_condition(self, workflow, jobs):
-        if "coverage" not in jobs:
-            self.report(workflow, "coverage-condition", "job coverage not found")
+        for name in COVERAGE_PARTS:
+            if name not in jobs:
+                self.report(workflow, "coverage-condition", f"job {name} not found")
+                continue
+            job = jobs[name]
+            condition = job.get("if") if isinstance(job, dict) else None
+            if isinstance(condition, str):
+                condition = self.unwrap_expression(condition)
+            if condition != COVERAGE_CONDITION:
+                self.report(workflow, "coverage-condition", f"{name} job runs without the label condition")
+        if COVERAGE_GATE not in jobs:
+            self.report(workflow, "coverage-condition", f"job {COVERAGE_GATE} not found")
             return
-        job = jobs["coverage"]
-        condition = job.get("if") if isinstance(job, dict) else None
-        if isinstance(condition, str):
-            condition = self.unwrap_expression(condition)
-        if condition != COVERAGE_CONDITION:
-            self.report(workflow, "coverage-condition", "coverage job runs without the label condition")
+        gate = jobs[COVERAGE_GATE] if isinstance(jobs[COVERAGE_GATE], dict) else {}
+        gate_condition = gate.get("if")
+        if isinstance(gate_condition, str):
+            gate_condition = self.unwrap_expression(gate_condition)
+        if gate_condition != COVERAGE_GATE_CONDITION:
+            self.report(workflow, "coverage-condition", "coverage gate runs without always() and the label condition")
+        if gate.get("name") != COVERAGE_GATE:
+            self.report(workflow, "coverage-condition", "coverage gate is not named coverage")
+
+    def check_coverage_split(self, workflow, jobs):
+        """Each measurement and floor command runs once, in its own job, and
+        each part uploads its report after its measurement."""
+        rule = "coverage-split"
+        owners = {COVERAGE_OFF_COMMAND: "coverage-off", COVERAGE_ON_COMMAND: "coverage-on",
+                  COVERAGE_OFF_FLOORS: COVERAGE_GATE, COVERAGE_ON_FLOORS: COVERAGE_GATE}
+        counts = {}
+        for name, job in jobs.items():
+            if not isinstance(job, dict):
+                continue
+            for step in job.get("steps", []) or []:
+                for line in self.normalized(self.run_text(step)):
+                    if "cargo llvm-cov" not in line and "check-coverage.py" not in line:
+                        continue
+                    owner = owners.get(line)
+                    if owner is None:
+                        self.report(workflow, rule, f"unexpected coverage command in {name}: {line}")
+                    elif name != owner:
+                        self.report(workflow, rule, f"{line} runs in {name}, expected {owner}")
+                    else:
+                        counts[line] = counts.get(line, 0) + 1
+        for line, count in counts.items():
+            if count > 1:
+                self.report(workflow, rule, f"{owners[line]} has {count} occurrences of {line}, expected one")
+        for name, (artifact, path) in COVERAGE_EXPORTS.items():
+            job = jobs.get(name)
+            steps = (job.get("steps", []) or []) if isinstance(job, dict) else []
+            measured = [index for index, step in enumerate(steps)
+                        if COVERAGE_MEASURES[name] in self.normalized(self.run_text(step))]
+            uploads = []
+            for index, step in enumerate(steps):
+                options = step.get("with") or {}
+                if not str(step.get("uses") or "").startswith("actions/upload-artifact@") or "if" in step:
+                    continue
+                if options.get("name") != artifact or options.get("path") != path:
+                    continue
+                if options.get("if-no-files-found") != "error":
+                    continue
+                if not measured or index < measured[0]:
+                    continue
+                uploads.append(index)
+            if not uploads:
+                self.report(workflow, rule, f"{name} does not upload {artifact} after its measurement")
+
+    def check_coverage_gate(self, workflow, jobs):
+        """The gate needs both parts, checks their results first, rejects a
+        cancelled run before and after the floors, and floors only the
+        reports of its own run."""
+        rule = "coverage-gate"
+        gate = jobs.get(COVERAGE_GATE)
+        if not isinstance(gate, dict):
+            return
+        steps = gate.get("steps", []) or []
+
+        def rejects(step):
+            condition = step.get("if")
+            if not isinstance(condition, str) or self.unwrap_expression(condition) != COVERAGE_CANCEL_CONDITION:
+                return False
+            if "continue-on-error" in step:
+                return False
+            return self.normalized(self.run_text(step)) == [COVERAGE_CANCEL_RUN]
+
+        needs = gate.get("needs")
+        if not isinstance(needs, list) or set(map(str, needs)) != set(COVERAGE_PARTS):
+            self.report(workflow, rule, f"coverage gate needs {needs}, expected coverage-off and coverage-on")
+        first = steps[0] if steps else {}
+        if "if" in first or any(self.runs_line(first.get("run"), check)[0] < 0 for check in COVERAGE_RESULT_CHECKS):
+            self.report(workflow, rule, "coverage gate does not check the results first")
+        env = first.get("env")
+        if env != COVERAGE_RESULT_ENV:
+            self.report(workflow, rule, f"coverage gate result check reads {env}")
+        if len(steps) < 2 or not rejects(steps[1]):
+            self.report(workflow, rule, "coverage gate does not reject a cancelled run after its result check")
+        floors = [index for index, step in enumerate(steps)
+                  if any(self.runs_line(step.get("run"), command)[0] >= 0
+                         for command in (COVERAGE_OFF_FLOORS, COVERAGE_ON_FLOORS))]
+        if not (len(steps) > 2 and rejects(steps[-1]) and all(index < len(steps) - 1 for index in floors)):
+            self.report(workflow, rule, "coverage gate does not reject a cancelled run after its floors")
+        for index, step in enumerate(steps):
+            if index in (1, len(steps) - 1) and rejects(step):
+                continue
+            if "if" in step:
+                self.report(workflow, rule, f"coverage gate step {index + 1} runs under {step['if']}")
+        downloads = {}
+        for index, step in enumerate(steps):
+            if str(step.get("uses") or "").startswith("actions/download-artifact@"):
+                downloads.setdefault((step.get("with") or {}).get("name"), []).append((index, step))
+        first_floor = min(floors, default=len(steps))
+        for artifact, _ in COVERAGE_EXPORTS.values():
+            found = downloads.get(artifact, [])
+            if len(found) != 1 or "if" in found[0][1]:
+                self.report(workflow, rule, f"coverage gate does not download {artifact}")
+                continue
+            index, step = found[0]
+            options = step.get("with") or {}
+            for key in FOREIGN_ARTIFACT_INPUTS:
+                if key in options:
+                    self.report(workflow, rule, f"coverage gate downloads {artifact} with {key}")
+            if index > first_floor:
+                self.report(workflow, rule, f"coverage gate checks floors before downloading {artifact}")
+
+    def check_coverage_seed(self, workflow, doc):
+        """Pushes to both base branches run the workflow without a paths
+        filter. Later runs do not cancel a running push; a newer pending run
+        replaces the older pending run."""
+        rule = "coverage-seed"
+        triggers = doc.get("on", doc.get(True))
+        seeds = triggers if isinstance(triggers, dict) else {}
+        if "push" not in seeds:
+            self.report(workflow, rule, "push trigger is absent")
+        push = seeds.get("push")
+        push = push if isinstance(push, dict) else {}
+        branches = push.get("branches")
+        branches = branches if isinstance(branches, list) else []
+        for branch in COVERAGE_SEED_BRANCHES:
+            if branch not in branches:
+                self.report(workflow, rule, f"push branches lack {branch}")
+        if any(key in push for key in ("paths", "paths-ignore")):
+            self.report(workflow, rule, "push trigger has a paths filter")
+        concurrency = doc.get("concurrency")
+        cancel = concurrency.get("cancel-in-progress") if isinstance(concurrency, dict) else None
+        if not isinstance(cancel, str) or self.unwrap_expression(cancel) != COVERAGE_SEED_CANCEL:
+            self.report(workflow, rule, "later runs cancel a running push")
+
+    def check_coverage_attempt(self, workflow, jobs):
+        """Every upload and download of the workflow names a report of this
+        run attempt and selects it by that name alone."""
+        rule = "coverage-attempt"
+        names = {artifact for artifact, _ in COVERAGE_EXPORTS.values()}
+        for job_name, job in jobs.items():
+            if not isinstance(job, dict):
+                continue
+            for index, step in enumerate(job.get("steps", []) or []):
+                uses = str(step.get("uses") or "")
+                download = uses.startswith("actions/download-artifact@")
+                if not download and not uses.startswith("actions/upload-artifact@"):
+                    continue
+                inputs = step.get("with") or {}
+                where = f"{job_name} step {index + 1}"
+                if inputs.get("name") not in names:
+                    self.report(workflow, rule, f"{where} transfers {inputs.get('name')}, not a report of this run attempt")
+                for key in COVERAGE_SELECTION_INPUTS:
+                    if download and key in inputs:
+                        self.report(workflow, rule, f"{where} downloads with {key}")
+
+    def check_cache_save_if(self):
+        """A rust-cache step of a workflow that a pull request triggers saves
+        only on push runs."""
+        directory = self.root / WORKFLOW_DIR
+        for source in sorted([*directory.glob("*.yml"), *directory.glob("*.yaml")]):
+            if source.name in WORKFLOWS:
+                doc = self.docs.get(source.name)
+            else:
+                # apt-retries reports a file that does not parse.
+                try:
+                    doc = yaml.safe_load(source.read_text())
+                except (OSError, yaml.YAMLError):
+                    doc = None
+            if not isinstance(doc, dict):
+                continue
+            triggers = doc.get("on", doc.get(True))
+            if isinstance(triggers, dict):
+                events = set(triggers.keys())
+            elif isinstance(triggers, list):
+                events = {str(event) for event in triggers}
+            else:
+                events = {triggers}
+            if not events & {"pull_request", "pull_request_target"}:
+                continue
+            for name, job in (doc.get("jobs") or {}).items():
+                if not isinstance(job, dict):
+                    continue
+                for index, step in enumerate(job.get("steps", []) or []):
+                    if not RUST_CACHE_ACTION.match(str(step.get("uses") or "")):
+                        continue
+                    value = (step.get("with") or {}).get("save-if")
+                    if not isinstance(value, str) or self.unwrap_expression(value) != CACHE_SAVE_CONDITION:
+                        self.report(f"{source.name}:{name} step {index + 1}", "cache-save-if",
+                                    "rust-cache saves on pull request runs")
 
     @staticmethod
     def describe_permissions(permissions):
@@ -1365,6 +1634,12 @@ class Checker:
                 guard = "github.ref_type != 'tag' && !inputs.publication"
                 if condition != guard and not condition.startswith(guard + " && "):
                     self.report(where, rule, f"cache guard must lead with {guard}")
+                uses = str(step.get("uses") or "")
+                if re.match(r"actions/cache/save@", uses, re.IGNORECASE):
+                    if condition != WASM_SAVE_CONDITION:
+                        self.report(where, rule, f"cache save must run exactly on {WASM_SAVE_CONDITION}")
+                elif not re.match(r"actions/cache/restore@", uses, re.IGNORECASE):
+                    self.report(where, rule, f"{name} step {index + 1} uses {uses}, which saves outside a save step")
         self.check_wasm_rebuild(workflow, rule)
         self.check_wasm_gate_job(workflow, rule)
 
@@ -1558,7 +1833,13 @@ class Checker:
             if not documented or "continue-on-error" in job:
                 self.report(workflow, "ci-feature-jobs", f"{name} can be bypassed")
             for step in job.get("steps", []):
-                if "if" in step or "continue-on-error" in step:
+                # The coverage gate's cancel rejections may run under cancelled() and only fail.
+                if ("if" in step or "continue-on-error" in step) and not (
+                        workflow == COVERAGE_WORKFLOW and name == COVERAGE_GATE
+                        and isinstance(step.get("if"), str)
+                        and self.unwrap_expression(step["if"]) == COVERAGE_CANCEL_CONDITION
+                        and "continue-on-error" not in step
+                        and self.normalized(self.run_text(step)) == [COVERAGE_CANCEL_RUN]):
                     self.report(workflow, "ci-feature-jobs", f"{name} step can be bypassed")
             for command in commands:
                 if self.runs_in_job(workflow, name, command, "ci-feature-jobs") < 0:
@@ -1647,6 +1928,10 @@ class Checker:
         if workflow == COVERAGE_WORKFLOW:
             self.check_coverage_trigger(workflow, doc)
             self.check_coverage_condition(workflow, jobs)
+            self.check_coverage_split(workflow, jobs)
+            self.check_coverage_gate(workflow, jobs)
+            self.check_coverage_seed(workflow, doc)
+            self.check_coverage_attempt(workflow, jobs)
         if workflow == REHEARSAL_WORKFLOW:
             self.check_rehearsal_credentials(workflow, doc, jobs)
         for job_id, job in jobs.items():
@@ -1730,6 +2015,7 @@ class Checker:
         for workflow in WORKFLOWS:
             self.check_workflow(workflow)
         self.check_apt_retries()
+        self.check_cache_save_if()
         self.check_composite_expressions()
         self.check_release_checks()
         self.check_release_vars()

@@ -225,16 +225,86 @@ COVERAGE_IF_LINE = f"    if: {COVERAGE_CONDITION}\n"
 COVERAGE_IF_WRAPPED_LINE = f"    if: ${{{{ {COVERAGE_CONDITION} }}}}\n"
 COVERAGE_IF_SPACED_LINE = f'    if: "  {COVERAGE_CONDITION}  "\n'
 COVERAGE_TYPES_LINE = "    types: [opened, synchronize, reopened, labeled, unlabeled]\n"
+COVERAGE_PUSH_BLOCK = "  push:\n    branches: [mainnet-write, main]\n"
 COVERAGE_ON_BLOCK = (
     "on:\n"
     "  pull_request:\n"
     "    branches: [main, mainnet-write]\n"
-    + COVERAGE_TYPES_LINE +
+    + COVERAGE_TYPES_LINE
+    + COVERAGE_PUSH_BLOCK +
     "  schedule:\n"
     "    # Weekly, Monday 04:41 UTC.\n"
     "    - cron: '41 4 * * 1'\n"
     "  workflow_dispatch:\n"
 )
+COVERAGE_CANCEL_LINE = "  cancel-in-progress: ${{ github.event_name == 'pull_request' }}\n"
+COVERAGE_LABEL_COMMENT = (
+    "    # A pull request run reads the complete label set from the event payload\n"
+    "    # and measures when that set contains `coverage`. A label change by a\n"
+    "    # person or with an app token starts a new run. A change made with the\n"
+    "    # workflow token starts none; the triage and stale workflows use that token.\n"
+)
+COVERAGE_OFF_HEADER = "  coverage-off:\n    name: coverage (feature-off)\n" + COVERAGE_LABEL_COMMENT + COVERAGE_IF_LINE
+COVERAGE_ON_HEADER = "  coverage-on:\n    name: coverage (feature-on)\n" + COVERAGE_LABEL_COMMENT + COVERAGE_IF_LINE
+COVERAGE_GATE_CONDITION = f"always() && ({COVERAGE_CONDITION})"
+COVERAGE_GATE_START = "  coverage:\n    name: coverage\n"
+COVERAGE_GATE_NEEDS = "    needs: [coverage-off, coverage-on]\n"
+COVERAGE_GATE_COMMENT = (
+    "    # always() schedules this job after a failed, cancelled, or skipped\n"
+    "    # measurement, and step 1 then fails it. Steps 2 and 8 fail it in a step\n"
+    "    # evaluation that sees the run cancelled. Without the label the condition\n"
+    "    # is false, and the check is skipped.\n"
+)
+COVERAGE_GATE_IF_LINE = f"    if: {COVERAGE_GATE_CONDITION}\n"
+COVERAGE_GATE_HEADER = COVERAGE_GATE_START + COVERAGE_GATE_NEEDS + COVERAGE_GATE_COMMENT + COVERAGE_GATE_IF_LINE
+COVERAGE_RESULT_ENV_LINES = ('          "OFF": ${{ needs.coverage-off.result }}\n'
+                             '          "ON": ${{ needs.coverage-on.result }}\n')
+COVERAGE_RESULT_STEP = "      - name: Check both measurements\n"
+COVERAGE_RESULT_ON_CHECK = '          test "$ON" = success\n'
+COVERAGE_CANCEL_EARLY = ("      - name: Reject a cancelled run before the floors\n"
+                         "        if: cancelled()\n        run: exit 1\n")
+COVERAGE_CANCEL_FINAL = ("      - name: Reject a cancelled run after the floors\n"
+                         "        if: cancelled()\n        run: exit 1\n")
+COVERAGE_OFF_COMMAND = ("cargo llvm-cov --workspace --no-default-features --features "
+                        "test-helpers,test-hooks,test-loopback,verifier-registry --json --output-path cov-feature-off.json")
+COVERAGE_OFF_STEP = "      - name: Measure offline line coverage\n        run: " + COVERAGE_OFF_COMMAND + "\n"
+COVERAGE_ON_STEP_NAME = "      - name: Measure feature-on offline line coverage\n"
+COVERAGE_UPLOAD_ACTION = "      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2\n"
+COVERAGE_ATTEMPT = "${{ github.run_attempt }}"
+COVERAGE_OFF_EXPORT = f"cov-feature-off-{COVERAGE_ATTEMPT}"
+COVERAGE_ON_EXPORT = f"cov-feature-on-{COVERAGE_ATTEMPT}"
+COVERAGE_OFF_NAME = f"          name: {COVERAGE_OFF_EXPORT}\n"
+COVERAGE_UPLOAD_OFF = (COVERAGE_UPLOAD_ACTION + "        with:\n" + COVERAGE_OFF_NAME +
+                       "          path: cov-feature-off.json\n          if-no-files-found: error\n"
+                       "          retention-days: 1\n")
+COVERAGE_UPLOAD_ON = (COVERAGE_UPLOAD_ACTION + f"        with:\n          name: {COVERAGE_ON_EXPORT}\n"
+                      "          path: cov-feature-on.json\n          if-no-files-found: error\n"
+                      "          retention-days: 1\n")
+COVERAGE_DOWNLOAD_ACTION = "      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2\n"
+COVERAGE_DOWNLOAD_OFF = COVERAGE_DOWNLOAD_ACTION + "        with:\n" + COVERAGE_OFF_NAME
+COVERAGE_DOWNLOAD_ON = COVERAGE_DOWNLOAD_ACTION + f"        with:\n          name: {COVERAGE_ON_EXPORT}\n"
+COVERAGE_OFF_FLOORS_STEP = ("      - name: Enforce per-crate line-coverage floors\n        run: python3 "
+                            ".github/scripts/check-coverage.py cov-feature-off.json --configuration feature-off\n")
+COVERAGE_ON_FLOORS_STEP = ("      - name: Enforce feature-on line-coverage floors\n        run: python3 "
+                           ".github/scripts/check-coverage.py cov-feature-on.json --configuration feature-on\n")
+CACHE_SAVE_LINE = "          save-if: ${{ github.event_name == 'push' }}\n"
+RUST_CACHE_USES = "      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3\n"
+RUST_CACHE_PLAIN = RUST_CACHE_USES + "        with:\n" + CACHE_SAVE_LINE
+UNGUARDED_CACHE_STEP = RUST_CACHE_USES
+CACHE_FIXTURE = ".github/workflows/cache-fixture.yaml"
+CACHE_FIXTURE_TEXT = ("on: workflow_dispatch\npermissions: {contents: read}\njobs:\n  fixture:\n"
+                      "    runs-on: ubuntu-24.04\n    steps:\n      - run: 'true'\n")
+
+
+def cache_fixture(trigger):
+    """The fixture workflow under a pull request trigger, with an unguarded rust-cache step."""
+    return ("on: " + trigger + "\npermissions: {contents: read}\njobs:\n  fixture:\n"
+            "    runs-on: ubuntu-24.04\n    steps:\n" + UNGUARDED_CACHE_STEP + "      - run: 'true'\n")
+
+
+def coverage_move(text, before):
+    """Moves a block of coverage.yml so that it directly precedes another one."""
+    return [(COVERAGE, text, "", 1), (COVERAGE, before, text + before, 1)]
 SIGN_MACOS_FIRST_STEP = (
     "      - name: Check tool paths\n"
     "        run: /bin/bash .github/actions/macos-sign-notarize/check-tools.sh\n"
@@ -572,7 +642,16 @@ SUMS_STEP = (
     '        run: bash .github/scripts/release/verify-sums.sh "$RUNNER_TEMP/release"\n'
 )
 TAG_GUARD = "        if: github.ref_type != 'tag' && !inputs.publication\n"
-SAVE_GUARD = "        if: github.ref_type != 'tag' && !inputs.publication && steps.restore.outputs.cache-hit != 'true'\n"
+WASM_SAVE_EVENTS = "(github.event_name == 'push' || github.event_name == 'schedule')"
+WASM_SAVE_CONDITION = (f"github.ref_type != 'tag' && !inputs.publication && {WASM_SAVE_EVENTS} && "
+                       "steps.restore.outputs.cache-hit != 'true'")
+SAVE_GUARD = f"        if: {WASM_SAVE_CONDITION}\n"
+WASM_OLD_SAVE_GUARD = "        if: github.ref_type != 'tag' && !inputs.publication && steps.restore.outputs.cache-hit != 'true'\n"
+
+
+def wasm_save_events(events):
+    """The first stellar-cli save guard with another event test in place of push or schedule."""
+    return [(WASM, SAVE_GUARD, SAVE_GUARD.replace(WASM_SAVE_EVENTS, events), 2)]
 BUILD_TOOLCHAIN = "          toolchain: ${{ env.RELEASE_TOOLCHAIN }}\n          targets: ${{ matrix.target }}\n"
 RELEASE_LAST_LINE = "            release-provenance/*.intoto.jsonl\n"
 BUILD_PYTHON = (
@@ -604,6 +683,20 @@ SOURCE_REF = "          ref: ${{ inputs.source_sha }}\n"
 PUBLICATION_WITH = "      source_sha: ${{ needs.verify.outputs.sha }}\n      publication: true\n"
 PUBLICATION_HEAD = '            if [ "$(git rev-parse HEAD)" != "$SOURCE_SHA" ]; then\n'
 PUBLICATION_REF_TYPE = "          REF_TYPE: ${{ inputs.publication && 'publication' || github.ref_type }}\n"
+WASM_CACHE_COMBINED = ("      - uses: actions/cache@" + PLACEHOLDER_REVISION + "\n" + TAG_GUARD
+                       + "        with:\n          path: x\n          key: y\n")
+WASM_SAVE_STEP = "      - name: Save the install root\n"
+
+# The coverage part jobs and the rust-cache steps of single jobs, read from
+# the live workflows.
+JOB_CACHE = r":\n.*?          save-if: \$\{\{ github.event_name == 'push' \}\}\n"
+COVERAGE_OFF_JOB = live_text(COVERAGE, re.compile(r"^  coverage-off:\n.*?(?=^  coverage-on:\n)", re.DOTALL | re.MULTILINE),
+                             "feature-off coverage job")
+COVERAGE_ON_CACHE = live_text(COVERAGE, re.compile(r"^  coverage-on" + JOB_CACHE, re.DOTALL | re.MULTILINE),
+                              "feature-on coverage cache")
+CI_TEST_CACHE = live_text(CI, re.compile(r"^  test" + JOB_CACHE, re.DOTALL | re.MULTILINE), "test job cache")
+CI_FEATURE_ON_TEST_CACHE = live_text(CI, re.compile(r"^  feature-on-test" + JOB_CACHE, re.DOTALL | re.MULTILINE),
+                                     "feature-on test job cache")
 
 
 # Insertion points for a vars reference in release.yml, the workflow it
@@ -644,9 +737,31 @@ PASSING = [
     ("Wasm gate needs in another order pass", [
         (WASM, WASM_GATE_NEEDS, "    needs: [rebuild, stellar-cli-28, stellar-cli-25, check]\n", 1)]),
     ("coverage job condition wrapped in ${{ }} passes", [
-        (COVERAGE, COVERAGE_IF_LINE, COVERAGE_IF_WRAPPED_LINE, 1)]),
+        (COVERAGE, COVERAGE_OFF_HEADER, COVERAGE_OFF_HEADER.replace(COVERAGE_IF_LINE, COVERAGE_IF_WRAPPED_LINE), 1)]),
     ("coverage job condition with surrounding whitespace passes", [
-        (COVERAGE, COVERAGE_IF_LINE, COVERAGE_IF_SPACED_LINE, 1)]),
+        (COVERAGE, COVERAGE_OFF_HEADER, COVERAGE_OFF_HEADER.replace(COVERAGE_IF_LINE, COVERAGE_IF_SPACED_LINE), 1)]),
+    ("coverage gate condition wrapped in ${{ }} passes", [
+        (COVERAGE, COVERAGE_GATE_HEADER,
+         COVERAGE_GATE_HEADER.replace(COVERAGE_GATE_IF_LINE, f"    if: ${{{{ {COVERAGE_GATE_CONDITION} }}}}\n"), 1)]),
+    ("coverage gate needs in another order pass", [
+        (COVERAGE, COVERAGE_GATE_NEEDS, "    needs: [coverage-on, coverage-off]\n", 1)]),
+    ("coverage gate result keys in single quotes pass", [
+        (COVERAGE, COVERAGE_RESULT_ENV_LINES, COVERAGE_RESULT_ENV_LINES.replace('"', "'"), 1)]),
+    ("coverage gate cancel condition wrapped in ${{ }} passes", [
+        (COVERAGE, COVERAGE_CANCEL_FINAL, COVERAGE_CANCEL_FINAL.replace("if: cancelled()", "if: ${{ cancelled() }}"), 1)]),
+    ("coverage parts in another order pass", coverage_move(COVERAGE_OFF_JOB, COVERAGE_GATE_START)),
+    ("coverage seed branches in another order pass", [
+        (COVERAGE, COVERAGE_PUSH_BLOCK, "  push:\n    branches: [main, mainnet-write]\n", 1)]),
+    ("save-if as a quoted expression passes", [
+        (CI, CACHE_SAVE_LINE, "          save-if: \"${{ github.event_name == 'push' }}\"\n", 8)]),
+    ("save-if with inner spaces passes", [
+        (CI, CACHE_SAVE_LINE, "          save-if: ${{  github.event_name == 'push'  }}\n", 8)]),
+    ("cancel-in-progress with inner spaces passes", [
+        (COVERAGE, COVERAGE_CANCEL_LINE, "  cancel-in-progress: ${{  github.event_name == 'pull_request'  }}\n", 1)]),
+    ("Wasm save guard wrapped in ${{ }} passes", [
+        (WASM, SAVE_GUARD, f"        if: ${{{{ {WASM_SAVE_CONDITION} }}}}\n", 2)]),
+    ("Wasm saves on push and schedule only pass", [
+        (WASM, SAVE_GUARD, SAVE_GUARD, 2)]),
     ("rehearsal job that inherits the workflow permissions passes", [
         (REHEARSAL, REHEARSAL_JOB_PERMISSIONS, "    strategy:\n", 2)]),
     ("rehearsal workflow env with a date and a float passes", [
@@ -833,8 +948,23 @@ CASES = [
                           "workflow call inputs"), "", 1)]),
     ("Wasm restore without tag guard", "release-wasm-gate", "cache guard must lead", [
         (WASM, TAG_GUARD, "", 2)]),
-    ("Wasm save with trailing tag guard", "release-wasm-gate", "cache guard must lead", [
+    ("Wasm save with trailing tag guard", ("release-wasm-gate", "release-wasm-gate"),
+     ("cache guard must lead", "cache save must run exactly"), [
         (WASM, SAVE_GUARD, "        if: steps.restore.outputs.cache-hit != 'true' && github.ref_type != 'tag'\n", 2)]),
+    ("Wasm save on every event", "release-wasm-gate", "cache save must run exactly", [
+        (WASM, SAVE_GUARD, WASM_OLD_SAVE_GUARD, 2)]),
+    ("Wasm save on pull requests", "release-wasm-gate", "cache save must run exactly", wasm_save_events(
+        "(github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'pull_request')")),
+    ("Wasm save on pull request targets", "release-wasm-gate", "cache save must run exactly", wasm_save_events(
+        "(github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'pull_request_target')")),
+    ("Wasm save on dispatch", "release-wasm-gate", "cache save must run exactly", wasm_save_events(
+        "(github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')")),
+    ("Wasm save outside pull requests only", "release-wasm-gate", "cache save must run exactly",
+     wasm_save_events("github.event_name != 'pull_request'")),
+    ("Wasm save on pushes only", "release-wasm-gate", "cache save must run exactly",
+     wasm_save_events("github.event_name == 'push'")),
+    ("Wasm combined cache action", "release-wasm-gate", "which saves outside a save step", [
+        (WASM, WASM_SAVE_STEP, WASM_CACHE_COMBINED + WASM_SAVE_STEP, 2)]),
     ("Wasm rebuild cache", "release-wasm-gate", "rebuild uses a cache", [
         (WASM, "      - name: Download stellar-cli 25\n", CACHE_RESTORE + "      - name: Download stellar-cli 25\n", 1)]),
     ("Wasm rebuild missing artifact", "release-wasm-gate", "rebuild does not download vendored-wasm-stellar-cli-25", [
@@ -1247,18 +1377,20 @@ CASES = [
         (COVERAGE, "labeled, unlabeled]", "labeled]", 1)]),
     ("coverage workflow without a pull_request trigger", "coverage-trigger", "trigger is absent", [
         (COVERAGE, "  pull_request:\n    branches: [main, mainnet-write]\n" + COVERAGE_TYPES_LINE, "", 1)]),
-    ("coverage job without the label condition", "coverage-condition", "label condition", [
-        (COVERAGE, COVERAGE_IF_LINE, "", 1)]),
-    ("coverage job that always measures", "coverage-condition", "label condition", [
-        (COVERAGE, COVERAGE_IF_LINE,
-         "    if: true || contains(github.event.pull_request.labels.*.name, 'coverage')\n", 1)]),
-    ("coverage job that never measures", "coverage-condition", "label condition", [
-        (COVERAGE, COVERAGE_IF_LINE,
-         "    if: false && contains(github.event.pull_request.labels.*.name, 'coverage')\n", 1)]),
-    ("coverage job without the non-pull-request bypass", "coverage-condition", "label condition", [
-        (COVERAGE, COVERAGE_IF_LINE, "    if: contains(github.event.pull_request.labels.*.name, 'coverage')\n", 1)]),
+    ("coverage job without the label condition", "coverage-condition", "coverage-off job runs without the label condition", [
+        (COVERAGE, COVERAGE_OFF_HEADER, COVERAGE_OFF_HEADER.replace(COVERAGE_IF_LINE, ""), 1)]),
+    ("coverage job that always measures", "coverage-condition", "coverage-off job runs without the label condition", [
+        (COVERAGE, COVERAGE_OFF_HEADER, COVERAGE_OFF_HEADER.replace(
+            COVERAGE_IF_LINE, "    if: true || contains(github.event.pull_request.labels.*.name, 'coverage')\n"), 1)]),
+    ("coverage job that never measures", "coverage-condition", "coverage-off job runs without the label condition", [
+        (COVERAGE, COVERAGE_OFF_HEADER, COVERAGE_OFF_HEADER.replace(
+            COVERAGE_IF_LINE, "    if: false && contains(github.event.pull_request.labels.*.name, 'coverage')\n"), 1)]),
+    ("coverage job without the non-pull-request bypass", "coverage-condition",
+     "coverage-off job runs without the label condition", [
+        (COVERAGE, COVERAGE_OFF_HEADER, COVERAGE_OFF_HEADER.replace(
+            COVERAGE_IF_LINE, "    if: contains(github.event.pull_request.labels.*.name, 'coverage')\n"), 1)]),
     ("coverage workflow without its coverage job", "coverage-condition", "job coverage not found", [
-        (COVERAGE, "  coverage:\n    name: coverage\n", "  measure:\n    name: coverage\n", 1)]),
+        (COVERAGE, COVERAGE_GATE_START, "  measure:\n    name: coverage\n", 1)]),
     ("coverage pull_request trigger in the list shorthand", "coverage-trigger",
      "coverage.yml: coverage-trigger: pull_request types are absent", [
         (COVERAGE, COVERAGE_ON_BLOCK, "on: [pull_request, workflow_dispatch]\n", 1)]),
@@ -1285,10 +1417,145 @@ CASES = [
         (COVERAGE, COVERAGE_TYPES_LINE, "    types: [opened, labeled]\n", 1)]),
     ("coverage paths filter and a missing condition", ("coverage-trigger", "coverage-condition"), (
         "coverage.yml: coverage-trigger: pull_request trigger has a paths filter",
-        "coverage.yml: coverage-condition: coverage job runs without the label condition"), [
+        "coverage.yml: coverage-condition: coverage-off job runs without the label condition"), [
         (COVERAGE, "    branches: [main, mainnet-write]\n" + COVERAGE_TYPES_LINE,
          "    branches: [main, mainnet-write]\n    paths: ['**.rs']\n" + COVERAGE_TYPES_LINE, 1),
-        (COVERAGE, COVERAGE_IF_LINE, "", 1)]),
+        (COVERAGE, COVERAGE_OFF_HEADER, COVERAGE_OFF_HEADER.replace(COVERAGE_IF_LINE, ""), 1)]),
+    ("coverage gate without always()", ("coverage-condition", "ci-feature-jobs"),
+     ("coverage gate runs without always() and the label condition", "coverage.yml: ci-feature-jobs: coverage can be bypassed"), [
+        (COVERAGE, COVERAGE_GATE_HEADER, COVERAGE_GATE_HEADER.replace(COVERAGE_GATE_IF_LINE, COVERAGE_IF_LINE), 1)]),
+    ("coverage gate bypasses the label", "coverage-condition", "coverage gate runs without always() and the label condition", [
+        (COVERAGE, COVERAGE_GATE_HEADER, COVERAGE_GATE_HEADER.replace(
+            COVERAGE_GATE_IF_LINE, f"    if: always() || ({COVERAGE_CONDITION})\n"), 1)]),
+    ("coverage gate skipped on cancellation", "coverage-condition", "coverage gate runs without always() and the label condition", [
+        (COVERAGE, COVERAGE_GATE_HEADER, COVERAGE_GATE_HEADER.replace(
+            COVERAGE_GATE_IF_LINE, f"    if: ${{{{ !cancelled() && ({COVERAGE_CONDITION}) }}}}\n"), 1)]),
+    ("coverage-on without the label condition", "coverage-condition", "coverage-on job runs without the label condition", [
+        (COVERAGE, COVERAGE_ON_HEADER, COVERAGE_ON_HEADER.replace(COVERAGE_IF_LINE, ""), 1)]),
+    ("coverage gate renamed", "coverage-condition", "coverage gate is not named coverage", [
+        (COVERAGE, COVERAGE_GATE_START, "  coverage:\n    name: coverage (gate)\n", 1)]),
+    ("coverage-off job removed", ("coverage-condition", "ci-feature-jobs"),
+     ("job coverage-off not found", "coverage.yml: ci-feature-jobs: missing coverage-off"), [
+        (COVERAGE, COVERAGE_OFF_JOB, "", 1)]),
+    ("feature-off measurement also in coverage-on", "coverage-split",
+     f"{COVERAGE_OFF_COMMAND} runs in coverage-on, expected coverage-off", [
+        (COVERAGE, COVERAGE_ON_STEP_NAME, COVERAGE_OFF_STEP + COVERAGE_ON_STEP_NAME, 1)]),
+    ("feature-off measurement repeated in its owner", "coverage-split",
+     f"coverage-off has 2 occurrences of {COVERAGE_OFF_COMMAND}, expected one", [
+        (COVERAGE, COVERAGE_OFF_STEP, COVERAGE_OFF_STEP * 2, 1)]),
+    ("feature-on floor repeated in the gate", "coverage-split",
+     "coverage has 2 occurrences of python3 .github/scripts/check-coverage.py cov-feature-on.json", [
+        (COVERAGE, COVERAGE_ON_FLOORS_STEP, COVERAGE_ON_FLOORS_STEP * 2, 1)]),
+    ("feature-on floor absent", "ci-feature-jobs",
+     "coverage.yml: ci-feature-jobs: coverage does not run unconditionally: python3 .github/scripts/check-coverage.py "
+     "cov-feature-on.json", [
+        (COVERAGE, COVERAGE_ON_FLOORS_STEP, "", 1)]),
+    ("feature-on measurement without mainnet-write", ("coverage-split", "ci-feature-jobs"),
+     ("unexpected coverage command in coverage-on", "coverage.yml: ci-feature-jobs: coverage-on does not run unconditionally"), [
+        (COVERAGE, "--features mainnet-write,test-helpers", "--features test-helpers", 1)]),
+    ("third measurement job", "coverage-split", f"{COVERAGE_OFF_COMMAND} runs in coverage-extra, expected coverage-off", [
+        (COVERAGE, COVERAGE_GATE_START, "  coverage-extra:\n    runs-on: ubuntu-24.04\n    steps:\n"
+         "      - run: " + COVERAGE_OFF_COMMAND + "\n\n" + COVERAGE_GATE_START, 1)]),
+    ("floors in a measurement job", "coverage-split",
+     "check-coverage.py cov-feature-off.json --configuration feature-off runs in coverage-off, expected coverage",
+     coverage_move(COVERAGE_OFF_FLOORS_STEP, COVERAGE_UPLOAD_OFF)),
+    ("coverage-on without upload", "coverage-split", f"coverage-on does not upload {COVERAGE_ON_EXPORT} after its measurement", [
+        (COVERAGE, COVERAGE_UPLOAD_ON, "", 1)]),
+    ("upload that tolerates a missing export", "coverage-split",
+     f"coverage-off does not upload {COVERAGE_OFF_EXPORT} after its measurement", [
+        (COVERAGE, "          if-no-files-found: error\n", "          if-no-files-found: warn\n", 2)]),
+    ("upload before measurement", "coverage-split", f"coverage-off does not upload {COVERAGE_OFF_EXPORT} after its measurement",
+     coverage_move(COVERAGE_UPLOAD_OFF, COVERAGE_OFF_STEP)),
+    ("conditional upload", "ci-feature-jobs", "coverage.yml: ci-feature-jobs: coverage-off step can be bypassed", [
+        (COVERAGE, COVERAGE_UPLOAD_OFF, COVERAGE_UPLOAD_ACTION + "        if: success()\n"
+         + COVERAGE_UPLOAD_OFF[len(COVERAGE_UPLOAD_ACTION):], 1)]),
+    ("coverage gate needs one part", "coverage-gate", "coverage gate needs ['coverage-off'], expected", [
+        (COVERAGE, COVERAGE_GATE_NEEDS, "    needs: [coverage-off]\n", 1)]),
+    ("coverage gate result check reads one part twice", "coverage-gate", "coverage gate result check reads", [
+        (COVERAGE, COVERAGE_RESULT_ENV_LINES,
+         COVERAGE_RESULT_ENV_LINES.replace("needs.coverage-on.result", "needs.coverage-off.result"), 1)]),
+    ("coverage gate result keys unquoted", "coverage-gate", "coverage gate result check reads {False:", [
+        (COVERAGE, COVERAGE_RESULT_ENV_LINES, COVERAGE_RESULT_ENV_LINES.replace('"', ""), 1)]),
+    ("coverage gate result check removed", "ci-feature-jobs",
+     'coverage.yml: ci-feature-jobs: coverage does not run unconditionally: test "$ON" = success', [
+        (COVERAGE, COVERAGE_RESULT_ON_CHECK, "", 1)]),
+    ("coverage gate result check continues on error", "ci-feature-jobs", "coverage.yml: ci-feature-jobs: coverage step can be bypassed", [
+        (COVERAGE, COVERAGE_RESULT_STEP, COVERAGE_RESULT_STEP + "        continue-on-error: true\n", 1)]),
+    ("coverage gate result step under a condition", ("coverage-gate", "coverage-gate", "ci-feature-jobs"), (
+        "coverage gate does not check the results first", "coverage gate step 1 runs under success()",
+        "coverage.yml: ci-feature-jobs: coverage step can be bypassed"), [
+        (COVERAGE, COVERAGE_RESULT_STEP, COVERAGE_RESULT_STEP + "        if: success()\n", 1)]),
+    ("coverage gate without the early cancel rejection", "coverage-gate",
+     "coverage gate does not reject a cancelled run after its result check", [
+        (COVERAGE, COVERAGE_CANCEL_EARLY, "", 1)]),
+    ("coverage gate without the final cancel rejection", "coverage-gate",
+     "coverage gate does not reject a cancelled run after its floors", [
+        (COVERAGE, COVERAGE_CANCEL_FINAL, "", 1)]),
+    ("coverage gate cancel rejection that never fails", ("coverage-gate", "ci-feature-jobs"), (
+        "coverage gate does not reject a cancelled run after its floors",
+        "coverage.yml: ci-feature-jobs: coverage step can be bypassed"), [
+        (COVERAGE, COVERAGE_CANCEL_FINAL, COVERAGE_CANCEL_FINAL.replace("run: exit 1", 'run: "true"'), 1)]),
+    ("coverage gate cancel rejection on failure", ("coverage-gate", "ci-feature-jobs"), (
+        "coverage gate does not reject a cancelled run after its floors",
+        "coverage.yml: ci-feature-jobs: coverage step can be bypassed"), [
+        (COVERAGE, COVERAGE_CANCEL_FINAL, COVERAGE_CANCEL_FINAL.replace("if: cancelled()", "if: failure()"), 1)]),
+    ("coverage gate cancel rejection that continues on error", ("coverage-gate", "ci-feature-jobs"), (
+        "coverage gate does not reject a cancelled run after its result check",
+        "coverage.yml: ci-feature-jobs: coverage step can be bypassed"), [
+        (COVERAGE, COVERAGE_CANCEL_EARLY, COVERAGE_CANCEL_EARLY + "        continue-on-error: true\n", 1)]),
+    ("coverage gate cancel rejection before the floors only", "coverage-gate",
+     "coverage gate does not reject a cancelled run after its floors",
+     coverage_move(COVERAGE_CANCEL_FINAL, COVERAGE_OFF_FLOORS_STEP)),
+    ("coverage gate downloads from another run", "coverage-gate", f"coverage gate downloads {COVERAGE_OFF_EXPORT} with run-id", [
+        (COVERAGE, COVERAGE_DOWNLOAD_OFF, COVERAGE_DOWNLOAD_OFF + "          run-id: 1\n", 1)]),
+    ("coverage gate missing a download", "coverage-gate", f"coverage gate does not download {COVERAGE_ON_EXPORT}", [
+        (COVERAGE, COVERAGE_DOWNLOAD_ON, "", 1)]),
+    ("coverage gate floors before download", "coverage-gate",
+     f"coverage gate checks floors before downloading {COVERAGE_OFF_EXPORT}",
+     coverage_move(COVERAGE_OFF_FLOORS_STEP, COVERAGE_DOWNLOAD_OFF)),
+    ("coverage upload with a fixed name", "coverage-attempt",
+     "coverage-off step 8 transfers cov-feature-off, not a report of this run attempt", [
+        (COVERAGE, COVERAGE_UPLOAD_OFF, COVERAGE_UPLOAD_OFF.replace(COVERAGE_OFF_NAME, "          name: cov-feature-off\n"), 1)]),
+    ("coverage download with a fixed name", "coverage-attempt",
+     "coverage step 4 transfers cov-feature-off, not a report of this run attempt", [
+        (COVERAGE, COVERAGE_DOWNLOAD_OFF, COVERAGE_DOWNLOAD_OFF.replace(COVERAGE_OFF_NAME, "          name: cov-feature-off\n"), 1)]),
+    ("coverage download of another attempt", "coverage-attempt",
+     "coverage step 4 transfers cov-feature-off-1, not a report of this run attempt", [
+        (COVERAGE, COVERAGE_DOWNLOAD_OFF, COVERAGE_DOWNLOAD_OFF.replace(COVERAGE_OFF_NAME, "          name: cov-feature-off-1\n"), 1)]),
+    ("coverage download by pattern", "coverage-attempt", "coverage step 4 downloads with pattern", [
+        (COVERAGE, COVERAGE_DOWNLOAD_OFF, COVERAGE_DOWNLOAD_ACTION + "        with:\n          pattern: cov-feature-off-*\n", 1)]),
+    ("coverage download that merges reports", "coverage-attempt", "coverage step 4 downloads with merge-multiple", [
+        (COVERAGE, COVERAGE_DOWNLOAD_OFF, COVERAGE_DOWNLOAD_OFF + "          merge-multiple: true\n", 1)]),
+    ("coverage without push trigger", "coverage-seed", "coverage.yml: coverage-seed: push trigger is absent", [
+        (COVERAGE, COVERAGE_PUSH_BLOCK, "", 1)]),
+    ("coverage push on main only", "coverage-seed", "push branches lack mainnet-write", [
+        (COVERAGE, COVERAGE_PUSH_BLOCK, "  push:\n    branches: [main]\n", 1)]),
+    ("coverage push on mainnet-write only", "coverage-seed", "push branches lack main", [
+        (COVERAGE, COVERAGE_PUSH_BLOCK, "  push:\n    branches: [mainnet-write]\n", 1)]),
+    ("coverage push with paths filter", "coverage-seed", "push trigger has a paths filter", [
+        (COVERAGE, COVERAGE_PUSH_BLOCK, COVERAGE_PUSH_BLOCK + "    paths: ['**.rs']\n", 1)]),
+    ("coverage push with paths-ignore filter", "coverage-seed", "push trigger has a paths filter", [
+        (COVERAGE, COVERAGE_PUSH_BLOCK, COVERAGE_PUSH_BLOCK + "    paths-ignore: ['**.md']\n", 1)]),
+    ("coverage push runs cancel each other", "coverage-seed", "later runs cancel a running push", [
+        (COVERAGE, COVERAGE_CANCEL_LINE, "  cancel-in-progress: true\n", 1)]),
+    ("ci test cache saves on pull requests", "cache-save-if", "ci.yml:test step 5: cache-save-if: rust-cache saves on pull request runs", [
+        (CI, CI_TEST_CACHE, CI_TEST_CACHE.replace("        with:\n" + CACHE_SAVE_LINE, ""), 1)]),
+    ("ci cache save-if always true", "cache-save-if", "ci.yml:feature-on-test step", [
+        (CI, CI_FEATURE_ON_TEST_CACHE, CI_FEATURE_ON_TEST_CACHE.replace(CACHE_SAVE_LINE, "          save-if: true\n"), 1)]),
+    ("coverage-on cache saves on pull requests", "cache-save-if", "coverage.yml:coverage-on step", [
+        (COVERAGE, COVERAGE_ON_CACHE, COVERAGE_ON_CACHE.replace(CACHE_SAVE_LINE, ""), 1)]),
+    ("rust-cache in another pull request workflow", "cache-save-if", "install-surface.yml:install-surface step", [
+        (".github/workflows/install-surface.yml", "      - name: Check the install surface\n",
+         UNGUARDED_CACHE_STEP + "      - name: Check the install surface\n", 1)]),
+    ("rust-cache in pull_request_target workflow", "cache-save-if", "welcome.yml:welcome step 1", [
+        (WELCOME, "      - name: Welcome the first contribution\n",
+         UNGUARDED_CACHE_STEP + "      - name: Welcome the first contribution\n", 1)]),
+    ("rust-cache in a yaml workflow", "cache-save-if", "cache-fixture.yaml:fixture step 1", [
+        (CACHE_FIXTURE, CACHE_FIXTURE_TEXT, cache_fixture("[pull_request]"), 1)]),
+    ("rust-cache in scalar pull_request workflow", "cache-save-if", "cache-fixture.yaml:fixture step 1", [
+        (CACHE_FIXTURE, CACHE_FIXTURE_TEXT, cache_fixture("pull_request"), 1)]),
+    ("rust-cache in upper case", "cache-save-if", "ci.yml:clippy step", [
+        (CI, RUST_CACHE_PLAIN, RUST_CACHE_USES.replace("Swatinem/rust-cache", "swatinem/RUST-CACHE"), 6)]),
     ("rehearsal job with id-token: write", "rehearsal-credentials",
      "release-rehearsal.yml:build: rehearsal-credentials: the job holds id-token: write", [
         (REHEARSAL, REHEARSAL_JOB_PERMISSIONS,
@@ -1683,23 +1950,29 @@ CASES = [
         (CI, f"        run: {command}", f"        run: {command.replace(' --no-default-features', '')}", 1)])
     for job, (_, command) in CI_OFF_JOBS.items()
 ] + [
-    ("coverage off measurement without --no-default-features", "ci-feature-jobs",
-     "coverage.yml: ci-feature-jobs: coverage does not run unconditionally: cargo llvm-cov --workspace "
-     "--no-default-features", [
+    ("coverage off measurement without --no-default-features", ("coverage-split", "ci-feature-jobs"), (
+        "coverage.yml: coverage-split: unexpected coverage command in coverage-off",
+        "coverage.yml: ci-feature-jobs: coverage-off does not run unconditionally: cargo llvm-cov --workspace "
+        "--no-default-features"), [
         (COVERAGE, COVERAGE_OFF_RUN, COVERAGE_OFF_RUN.replace(" --no-default-features", ""), 1)]),
     ("coverage off measurement that continues on error", "ci-feature-jobs",
-     "coverage.yml: ci-feature-jobs: coverage step can be bypassed", [
+     "coverage.yml: ci-feature-jobs: coverage-off step can be bypassed", [
         (COVERAGE, COVERAGE_OFF_RUN, "        continue-on-error: true\n" + COVERAGE_OFF_RUN, 1)]),
-    ("coverage job that continues on error", "ci-feature-jobs", "coverage.yml: ci-feature-jobs: coverage can be bypassed", [
-        (COVERAGE, COVERAGE_IF_LINE, COVERAGE_IF_LINE + "    continue-on-error: true\n", 1)], 1),
+    ("coverage job that continues on error", "ci-feature-jobs", "coverage.yml: ci-feature-jobs: coverage-off can be bypassed", [
+        (COVERAGE, COVERAGE_OFF_HEADER, COVERAGE_OFF_HEADER + "    continue-on-error: true\n", 1)], 1),
     ("coverage job under another condition", ("coverage-condition", "ci-feature-jobs"), (
-        "coverage.yml: coverage-condition: coverage job runs without the label condition",
-        "coverage.yml: ci-feature-jobs: coverage can be bypassed"), [
-        (COVERAGE, COVERAGE_IF_LINE, "    if: false\n", 1)], 2),
-    ("coverage workflow without its coverage job for the feature pin", ("coverage-condition", "ci-feature-jobs"), (
+        "coverage.yml: coverage-condition: coverage-off job runs without the label condition",
+        "coverage.yml: ci-feature-jobs: coverage-off can be bypassed"), [
+        (COVERAGE, COVERAGE_OFF_HEADER, COVERAGE_OFF_HEADER.replace(COVERAGE_IF_LINE, "    if: false\n"), 1)], 2),
+    ("coverage workflow without its coverage job for the feature pin",
+     ("coverage-condition", "coverage-split", "coverage-split", "ci-feature-jobs"), (
         "coverage.yml: coverage-condition: job coverage not found",
+        "coverage.yml: coverage-split: python3 .github/scripts/check-coverage.py cov-feature-off.json --configuration "
+        "feature-off runs in measure, expected coverage",
+        "coverage.yml: coverage-split: python3 .github/scripts/check-coverage.py cov-feature-on.json --configuration "
+        "feature-on runs in measure, expected coverage",
         "coverage.yml: ci-feature-jobs: missing coverage"), [
-        (COVERAGE, "  coverage:\n    name: coverage\n", "  measure:\n    name: coverage\n", 1)], 2),
+        (COVERAGE, COVERAGE_GATE_START, "  measure:\n    name: coverage\n", 1)], 4),
 ] + [
     (f"vars context in {where}", "release-vars",
      f"{path}: release-vars: an expression reads the vars context: vars.SAMPLE", [
@@ -1863,6 +2136,187 @@ MUTATIONS = {
     "release-vars-unresolved": (
         'self.report(str(relative), rule, f"local reference {reference} names no file")', "pass",
         ["unresolved local reference in the called vendored-wasm workflow"]),
+    "coverage-gate-condition": (
+        "if gate_condition != COVERAGE_GATE_CONDITION:", "if False:", ["coverage gate without always()"]),
+    "coverage-gate-label": (
+        "if gate_condition != COVERAGE_GATE_CONDITION:", 'if not str(gate_condition).startswith("always()"):',
+        ["coverage gate bypasses the label"]),
+    "coverage-gate-not-cancelled": (
+        "if gate_condition != COVERAGE_GATE_CONDITION:",
+        'if gate_condition not in (COVERAGE_GATE_CONDITION, f"!cancelled() && ({COVERAGE_CONDITION})"):',
+        ["coverage gate skipped on cancellation"]),
+    "coverage-gate-unwrap": (
+        "gate_condition = self.unwrap_expression(gate_condition)", "gate_condition = gate_condition",
+        ["coverage gate condition wrapped in ${{ }} passes"]),
+    "coverage-gate-name": ('if gate.get("name") != COVERAGE_GATE:', "if False:", ["coverage gate renamed"]),
+    "coverage-part-condition": (
+        "if condition != COVERAGE_CONDITION:", "if False:", ["coverage-on without the label condition"]),
+    "coverage-part-presence": (
+        'self.report(workflow, "coverage-condition", f"job {name} not found")', "pass", ["coverage-off job removed"]),
+    "coverage-split-owner": ("elif name != owner:", "elif False:", ["feature-off measurement also in coverage-on"]),
+    "coverage-split-extra-owner": ("elif name != owner:", "elif False:", ["third measurement job"]),
+    "coverage-split-floor-owner": ("elif name != owner:", "elif False:", ["floors in a measurement job"]),
+    "coverage-split-measure-count": (
+        "if count > 1:", "if count > 1 and owners[line] == COVERAGE_GATE:",
+        ["feature-off measurement repeated in its owner"]),
+    "coverage-split-floor-count": (
+        "if count > 1:", "if count > 1 and owners[line] != COVERAGE_GATE:", ["feature-on floor repeated in the gate"]),
+    "coverage-floor-command": (
+        "COVERAGE_OFF_FLOORS, COVERAGE_ON_FLOORS)),", "COVERAGE_OFF_FLOORS)),", ["feature-on floor absent"]),
+    "coverage-split-unknown": (
+        'self.report(workflow, rule, f"unexpected coverage command in {name}: {line}")', "pass",
+        ["feature-on measurement without mainnet-write"]),
+    "coverage-split-upload": ("if not uploads:", "if False:", ["coverage-on without upload"]),
+    "coverage-split-upload-missing-file": (
+        'if options.get("if-no-files-found") != "error":', "if False:", ["upload that tolerates a missing export"]),
+    "coverage-split-upload-order": (
+        "if not measured or index < measured[0]:", "if False:", ["upload before measurement"]),
+    "coverage-upload-condition": (
+        'if ("if" in step or "continue-on-error" in step) and not (',
+        'if ("continue-on-error" in step or ("if" in step and not str(step.get("uses", ""))'
+        '.startswith("actions/upload-artifact@"))) and not (',
+        ["conditional upload"]),
+    "coverage-gate-needs": (
+        "if not isinstance(needs, list) or set(map(str, needs)) != set(COVERAGE_PARTS):", "if False:",
+        ["coverage gate needs one part"]),
+    "coverage-gate-env": ("if env != COVERAGE_RESULT_ENV:", "if False:", ["coverage gate result check reads one part twice"]),
+    "coverage-gate-env-keys": (
+        '        env = first.get("env")\n',
+        '        env = { {False: "OFF", True: "ON"}.get(key, key): value for key, value in (first.get("env") or {}).items()}\n',
+        ["coverage gate result keys unquoted"]),
+    "coverage-gate-result-command": (
+        "COVERAGE_RESULT_CHECKS[0], COVERAGE_RESULT_CHECKS[1], ", "COVERAGE_RESULT_CHECKS[0], ",
+        ["coverage gate result check removed"]),
+    "coverage-gate-result-error": (
+        'if ("if" in step or "continue-on-error" in step) and not (',
+        'if ("if" in step or ("continue-on-error" in step and COVERAGE_RESULT_CHECKS[0] not in self.run_text(step)))'
+        ' and not (',
+        ["coverage gate result check continues on error"]),
+    "coverage-gate-result-first": (
+        'if "if" in first or any(self.runs_line(first.get("run"), check)[0] < 0 for check in COVERAGE_RESULT_CHECKS):',
+        "if False:", ["coverage gate result step under a condition"]),
+    "coverage-gate-cancel-early": (
+        "if len(steps) < 2 or not rejects(steps[1]):", "if False:", ["coverage gate without the early cancel rejection"]),
+    "coverage-gate-cancel-final": (
+        "if not (len(steps) > 2 and rejects(steps[-1]) and all(index < len(steps) - 1 for index in floors)):",
+        "if False:", ["coverage gate without the final cancel rejection"]),
+    "coverage-gate-cancel-command": (
+        "return self.normalized(self.run_text(step)) == [COVERAGE_CANCEL_RUN]", "return True",
+        ["coverage gate cancel rejection that never fails"]),
+    "coverage-gate-cancel-condition": (
+        "if not isinstance(condition, str) or self.unwrap_expression(condition) != COVERAGE_CANCEL_CONDITION:",
+        "if not isinstance(condition, str):", ["coverage gate cancel rejection on failure"]),
+    "coverage-gate-cancel-error": (
+        'if "continue-on-error" in step:\n                return False',
+        "if False:\n                return False", ["coverage gate cancel rejection that continues on error"]),
+    # The complete final-rejection placement predicate, the last-step
+    # requirement included, is disabled.
+    "coverage-gate-cancel-order": (
+        "if not (len(steps) > 2 and rejects(steps[-1]) and all(index < len(steps) - 1 for index in floors)):",
+        "if False:", ["coverage gate cancel rejection before the floors only"]),
+    "coverage-gate-cancel-exemption": (
+        '"continue-on-error" not in step\n                        and self.normalized(self.run_text(step)) == [COVERAGE_CANCEL_RUN])',
+        '"continue-on-error" not in step)', ["coverage gate cancel rejection that never fails"]),
+    "coverage-gate-cancel-unwrap": (
+        "self.unwrap_expression(condition) != COVERAGE_CANCEL_CONDITION", "condition != COVERAGE_CANCEL_CONDITION",
+        ["coverage gate cancel condition wrapped in ${{ }} passes"]),
+    "coverage-gate-foreign": (
+        "for key in FOREIGN_ARTIFACT_INPUTS:\n                if key in options:",
+        "for key in ():\n                if key in options:", ["coverage gate downloads from another run"]),
+    "coverage-gate-download": (
+        'self.report(workflow, rule, f"coverage gate does not download {artifact}")', "pass",
+        ["coverage gate missing a download"]),
+    "coverage-gate-order": ("if index > first_floor:", "if False:", ["coverage gate floors before download"]),
+    "coverage-seed-push": ('if "push" not in seeds:', "if False:", ["coverage without push trigger"]),
+    "coverage-seed-branch": (
+        "for branch in COVERAGE_SEED_BRANCHES:", "for branch in COVERAGE_SEED_BRANCHES[1:]:", ["coverage push on main only"]),
+    "coverage-seed-main-branch": (
+        "for branch in COVERAGE_SEED_BRANCHES:", "for branch in COVERAGE_SEED_BRANCHES[:1]:",
+        ["coverage push on mainnet-write only"]),
+    "coverage-seed-paths": (
+        'if any(key in push for key in ("paths", "paths-ignore")):', "if False:", ["coverage push with paths filter"]),
+    "coverage-seed-paths-ignore": (
+        'for key in ("paths", "paths-ignore")):', 'for key in ("paths",)):', ["coverage push with paths-ignore filter"]),
+    "coverage-seed-cancel": (
+        "if not isinstance(cancel, str) or self.unwrap_expression(cancel) != COVERAGE_SEED_CANCEL:", "if False:",
+        ["coverage push runs cancel each other"]),
+    "coverage-seed-unwrap": (
+        "self.unwrap_expression(cancel) != COVERAGE_SEED_CANCEL",
+        'str(cancel).removeprefix("${{ ").removesuffix(" }}") != COVERAGE_SEED_CANCEL',
+        ["cancel-in-progress with inner spaces passes"]),
+    "cache-save-if-value": (
+        "if not isinstance(value, str) or self.unwrap_expression(value) != CACHE_SAVE_CONDITION:", "if False:",
+        ["ci test cache saves on pull requests"]),
+    "cache-save-if-boolean": (
+        "if not isinstance(value, str) or self.unwrap_expression(value) != CACHE_SAVE_CONDITION:",
+        "if value is not True and (not isinstance(value, str) or self.unwrap_expression(value) != CACHE_SAVE_CONDITION):",
+        ["ci cache save-if always true"]),
+    "cache-save-if-coverage": (
+        'for source in sorted([*directory.glob("*.yml"), *directory.glob("*.yaml")]):',
+        'for source in [path for path in sorted([*directory.glob("*.yml"), *directory.glob("*.yaml")])'
+        ' if path.name != COVERAGE_WORKFLOW]:',
+        ["coverage-on cache saves on pull requests"]),
+    "cache-save-if-scope": (
+        'for source in sorted([*directory.glob("*.yml"), *directory.glob("*.yaml")]):',
+        "for source in [directory / name for name in WORKFLOWS]:", ["rust-cache in another pull request workflow"]),
+    "cache-save-if-target": (
+        'if not events & {"pull_request", "pull_request_target"}:', 'if not events & {"pull_request"}:',
+        ["rust-cache in pull_request_target workflow"]),
+    "cache-save-if-extension": (
+        'for source in sorted([*directory.glob("*.yml"), *directory.glob("*.yaml")]):',
+        'for source in sorted(directory.glob("*.yml")):', ["rust-cache in a yaml workflow"]),
+    "cache-save-if-list": (
+        "events = {str(event) for event in triggers}", "events = set()", ["rust-cache in a yaml workflow"]),
+    "cache-save-if-scalar": ("events = {triggers}", "events = set()", ["rust-cache in scalar pull_request workflow"]),
+    "cache-save-if-case": (
+        'RUST_CACHE_ACTION = re.compile(r"Swatinem/rust-cache(/[\\w.-]+)*@", re.IGNORECASE)',
+        'RUST_CACHE_ACTION = re.compile(r"Swatinem/rust-cache(/[\\w.-]+)*@")', ["rust-cache in upper case"]),
+    "cache-save-if-unwrap": (
+        "self.unwrap_expression(value) != CACHE_SAVE_CONDITION",
+        'str(value).removeprefix("${{ ").removesuffix(" }}") != CACHE_SAVE_CONDITION',
+        ["save-if with inner spaces passes"]),
+    "coverage-feature-on-pin": (
+        '    (COVERAGE_WORKFLOW, "coverage-on"): (COVERAGE_CONDITION, (COVERAGE_ON_COMMAND,)),\n', "",
+        ["feature-on measurement without mainnet-write"]),
+    "coverage-trigger-unlabeled": (
+        'COVERAGE_EVENTS = ("opened", "synchronize", "reopened", "labeled", "unlabeled")',
+        'COVERAGE_EVENTS = ("opened", "synchronize", "reopened", "labeled")',
+        ["coverage pull_request trigger without unlabeled"]),
+    "coverage-attempt-name": (
+        'if inputs.get("name") not in names:', "if False:",
+        ["coverage upload with a fixed name", "coverage download with a fixed name",
+         "coverage download of another attempt"]),
+    "coverage-attempt-pattern": (
+        'COVERAGE_SELECTION_INPUTS = ("pattern", "merge-multiple")', 'COVERAGE_SELECTION_INPUTS = ("merge-multiple",)',
+        ["coverage download by pattern"]),
+    "coverage-attempt-merge": (
+        'COVERAGE_SELECTION_INPUTS = ("pattern", "merge-multiple")', 'COVERAGE_SELECTION_INPUTS = ("pattern",)',
+        ["coverage download that merges reports"]),
+    "wasm-save-push": ("if condition != WASM_SAVE_CONDITION:", "if False:", ["Wasm save on pull requests"]),
+    "wasm-save-target": (
+        "if condition != WASM_SAVE_CONDITION:",
+        "if condition not in (WASM_SAVE_CONDITION, WASM_SAVE_CONDITION.replace(\"'schedule')\", "
+        "\"'schedule' || github.event_name == 'pull_request_target')\")):",
+        ["Wasm save on pull request targets"]),
+    "wasm-save-dispatch": (
+        "if condition != WASM_SAVE_CONDITION:",
+        "if condition not in (WASM_SAVE_CONDITION, WASM_SAVE_CONDITION.replace(\"'schedule')\", "
+        "\"'schedule' || github.event_name == 'workflow_dispatch')\")):",
+        ["Wasm save on dispatch"]),
+    "wasm-save-schedule": (
+        "if condition != WASM_SAVE_CONDITION:",
+        "if condition not in (WASM_SAVE_CONDITION, WASM_SAVE_CONDITION.replace("
+        "\"(github.event_name == 'push' || github.event_name == 'schedule')\", \"github.event_name == 'push'\")):",
+        ["Wasm save on pushes only"]),
+    "wasm-save-exact": (
+        "if condition != WASM_SAVE_CONDITION:", 'if not condition.startswith(guard + " && "):',
+        ["Wasm save outside pull requests only"]),
+    "wasm-save-combined": (
+        'elif not re.match(r"actions/cache/restore@", uses, re.IGNORECASE):', "elif False:",
+        ["Wasm combined cache action"]),
+    "wasm-save-unwrap": (
+        "if condition != WASM_SAVE_CONDITION:", 'if str(step.get("if", "")) != WASM_SAVE_CONDITION:',
+        ["Wasm save guard wrapped in ${{ }} passes"]),
 }
 
 
@@ -1877,6 +2331,9 @@ COUNT_CASES = [
 
 def copy_tree(destination):
     shutil.copytree(ROOT / ".github", destination / ".github")
+    # A dispatch-only .yaml workflow that the cache-save-if cases edit; the
+    # checker reads it as every other workflow outside WORKFLOWS.
+    (destination / CACHE_FIXTURE).write_text(CACHE_FIXTURE_TEXT)
 
 
 def run_check(root, script=SCRIPT):

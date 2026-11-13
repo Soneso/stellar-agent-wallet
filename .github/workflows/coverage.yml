@@ -1,30 +1,38 @@
 name: Coverage
 
 # The coverage gate measures offline line coverage and enforces the per-crate
-# floors of .github/scripts/check-coverage.py. It runs weekly on main, on a
-# pull request that carries the `coverage` label, and on demand.
+# floors of .github/scripts/check-coverage.py. It runs on pushes to
+# mainnet-write and main, weekly on main, on a pull request that carries the
+# `coverage` label, and on demand.
+#
+# Push runs seed the coverage caches that pull requests into those branches
+# restore. Two parallel jobs measure feature-off and feature-on, and each
+# uploads its report. The required check `coverage` enforces both floors on
+# those reports. A failed, cancelled, or skipped measurement fails it.
 #
 # The workflow has no paths filter: the required check `coverage` reports on
-# every pull request, and the job condition decides whether a run measures.
-# A measurement requires feature-off and feature-on to pass their own floors.
-# Branch protection accepts a coverage job skipped by its condition.
+# every pull request, and the job conditions decide whether a run measures.
+# Branch protection accepts a `coverage` check skipped by its condition.
 
 on:
   pull_request:
     branches: [main, mainnet-write]
     types: [opened, synchronize, reopened, labeled, unlabeled]
+  push:
+    branches: [mainnet-write, main]
   schedule:
     # Weekly, Monday 04:41 UTC.
     - cron: '41 4 * * 1'
   workflow_dispatch:
 
-# Supersede in-flight runs for the same ref so rapid pushes and label changes
-# do not queue stale work.
+# A pull request run supersedes the older run of its ref. Later runs do not
+# cancel a running push, schedule, or dispatch run, so a running seed saves its
+# caches. A newer pending run replaces the older pending run.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
-# The job only reads the checked-out source; deny the token every other scope.
+# The jobs only read the checked-out source; deny the token every other scope.
 permissions:
   contents: read
 
@@ -32,8 +40,8 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  coverage:
-    name: coverage
+  coverage-off:
+    name: coverage (feature-off)
     # A pull request run reads the complete label set from the event payload
     # and measures when that set contains `coverage`. A label change by a
     # person or with an app token starts a new run. A change made with the
@@ -69,9 +77,10 @@ jobs:
         run: sudo apt-get -o Acquire::Retries=3 update && sudo apt-get -o Acquire::Retries=3 install -y libudev-dev pkg-config
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
-          # Coverage builds are instrumented and differ from the other jobs; keep
-          # them in a separate cache so they do not evict the plain-build caches.
+          # Instrumented builds use their own keys and share the repository
+          # cache quota. They save on push runs and restore on pull requests.
           prefix-key: coverage
+          save-if: ${{ github.event_name == 'push' }}
       - uses: taiki-e/install-action@c509219cf42fba86913069efd0ade2458c59337b # v2.90.1
         with:
           tool: cargo-llvm-cov@0.8.7
@@ -81,9 +90,108 @@ jobs:
       # enable it by default.
       - name: Measure offline line coverage
         run: cargo llvm-cov --workspace --no-default-features --features test-helpers,test-hooks,test-loopback,verifier-registry --json --output-path cov-feature-off.json
-      - name: Enforce per-crate line-coverage floors
-        run: python3 .github/scripts/check-coverage.py cov-feature-off.json --configuration feature-off
+      # The run attempt in the name binds the report to this attempt.
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: cov-feature-off-${{ github.run_attempt }}
+          path: cov-feature-off.json
+          if-no-files-found: error
+          retention-days: 1
+
+  coverage-on:
+    name: coverage (feature-on)
+    # A pull request run reads the complete label set from the event payload
+    # and measures when that set contains `coverage`. A label change by a
+    # person or with an app token starts a new run. A change made with the
+    # workflow token starts none; the triage and stale workflows use that token.
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'coverage')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # The instrumented build plus every compiled test binary is large; reclaim
+      # space the build does not need.
+      - name: Free disk space
+        # The instrumented workspace build plus the vendored OpenSSL source
+        # build need more headroom than the plain test job.
+        run: |
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache
+          sudo rm -rf /usr/lib/jvm
+          sudo rm -rf /usr/share/swift
+          sudo rm -rf /usr/local/share/powershell
+          sudo rm -rf /usr/local/.ghcup
+          sudo rm -rf /usr/local/lib/node_modules
+          sudo docker image prune --all --force >/dev/null 2>&1 || true
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+          components: llvm-tools-preview
+      - name: Install libudev (Linux hidapi)
+        run: sudo apt-get -o Acquire::Retries=3 update && sudo apt-get -o Acquire::Retries=3 install -y libudev-dev pkg-config
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          # Instrumented builds use their own keys and share the repository
+          # cache quota. They save on push runs and restore on pull requests.
+          prefix-key: coverage
+          save-if: ${{ github.event_name == 'push' }}
+      - uses: taiki-e/install-action@c509219cf42fba86913069efd0ade2458c59337b # v2.90.1
+        with:
+          tool: cargo-llvm-cov@0.8.7
+      # Offline tier only, matching the test jobs. The explicit feature list
+      # enables mainnet-write.
       - name: Measure feature-on offline line coverage
         run: cargo llvm-cov --workspace --features mainnet-write,test-helpers,test-hooks,test-loopback,verifier-registry --json --output-path cov-feature-on.json
+      # The run attempt in the name binds the report to this attempt.
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: cov-feature-on-${{ github.run_attempt }}
+          path: cov-feature-on.json
+          if-no-files-found: error
+          retention-days: 1
+
+  coverage:
+    name: coverage
+    needs: [coverage-off, coverage-on]
+    # always() schedules this job after a failed, cancelled, or skipped
+    # measurement, and step 1 then fails it. Steps 2 and 8 fail it in a step
+    # evaluation that sees the run cancelled. Without the label the condition
+    # is false, and the check is skipped.
+    if: always() && (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'coverage'))
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      # PyYAML reads unquoted OFF and ON as booleans; the quotes keep them strings.
+      - name: Check both measurements
+        env:
+          "OFF": ${{ needs.coverage-off.result }}
+          "ON": ${{ needs.coverage-on.result }}
+        run: |
+          echo "feature-off: $OFF, feature-on: $ON"
+          test "$OFF" = success
+          test "$ON" = success
+      - name: Reject a cancelled run before the floors
+        if: cancelled()
+        run: exit 1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # Each download reads the report of this run attempt only. A gate rerun
+      # alone, or a rerun of one part, finds no report of its attempt and fails.
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: cov-feature-off-${{ github.run_attempt }}
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: cov-feature-on-${{ github.run_attempt }}
+      - name: Enforce per-crate line-coverage floors
+        run: python3 .github/scripts/check-coverage.py cov-feature-off.json --configuration feature-off
       - name: Enforce feature-on line-coverage floors
         run: python3 .github/scripts/check-coverage.py cov-feature-on.json --configuration feature-on
+      - name: Reject a cancelled run after the floors
+        if: cancelled()
+        run: exit 1

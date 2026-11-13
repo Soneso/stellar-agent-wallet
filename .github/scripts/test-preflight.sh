@@ -165,8 +165,13 @@ ci.yml	test	Install libudev (Linux hidapi)	installs Linux system headers on the 
 ci.yml	test	Check each test-support feature set	the per-feature compile matrix runs in CI only
 ci.yml	mpp-interop	Enable Corepack	activates Corepack on the runner
 ci.yml	sdk-v17-interop	Enable Corepack	activates Corepack on the runner
-coverage.yml	coverage	Free disk space	reclaims runner disk space
-coverage.yml	coverage	Install libudev (Linux hidapi)	installs Linux system headers on the runner
+coverage.yml	coverage-off	Free disk space	reclaims runner disk space
+coverage.yml	coverage-off	Install libudev (Linux hidapi)	installs Linux system headers on the runner
+coverage.yml	coverage-on	Free disk space	reclaims runner disk space
+coverage.yml	coverage-on	Install libudev (Linux hidapi)	installs Linux system headers on the runner
+coverage.yml	coverage	Check both measurements	reads the results of the two measurement jobs
+coverage.yml	coverage	Reject a cancelled run before the floors	fails a cancelled CI run
+coverage.yml	coverage	Reject a cancelled run after the floors	fails a cancelled CI run
 install-surface.yml	install-surface	Self-test Python checks on Python 3.11	repeats the Python self-tests on a second interpreter
 install-surface.yml	install-surface	Install actionlint	installs a gate tool on the runner
 vendored-wasm.yml	check	Decide whether the change needs a rebuild	decides whether the CI rebuild jobs run

@@ -462,4 +462,5 @@ They require no graph claim about registry sources.
 The checks that the ruleset of `main` requires include the five feature jobs
 of `ci.yml`: `feature-on-clippy`, `feature-on-test`, `feature-on-doc`,
 `feature-discipline`, and `release-shape`. The `coverage` required check
-measures and enforces both feature configurations.
+needs both coverage measurement jobs and enforces the floors of both feature
+configurations.
