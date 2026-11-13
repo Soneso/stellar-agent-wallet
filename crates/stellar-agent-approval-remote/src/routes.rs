@@ -37,6 +37,7 @@
 //! A refused login or decision answers `400` `webauthn_assertion_invalid`,
 //! the same as a bad assertion, so no response tells an unknown, removed or
 //! unlisted credential apart.
+//! Credential-store contention answers `503` `store_busy` after a bounded wait.
 //!
 //! `/static/login.js` is deliberately ungated: it runs the passkey login
 //! ceremony, which IS the authentication step, so no session can exist yet
@@ -54,6 +55,8 @@
 //! session cookie, mirroring the loopback approval-inbox server's own
 //! `/static/app.js` gating.
 
+use std::time::Duration;
+
 use axum::{
     Router,
     extract::{Path, State},
@@ -67,8 +70,11 @@ use stellar_agent_approval_ui::{
     Decision, RequestIdentity, apply_decision, consent_changed, shown_view_digest,
 };
 use stellar_agent_core::approval::error::ApprovalError;
+use stellar_agent_core::approval::operator_credentials::OperatorApprovalCredentialStore;
 use stellar_agent_core::approval::user_id::{ApproverIdentity, VerifiedPasskeyAssertion};
-use stellar_agent_core::approval::{ApprovalKind, PendingApprovalView, approval_view_digest};
+use stellar_agent_core::approval::{
+    ApprovalKind, MainnetApprovalCredential, PendingApprovalView, approval_view_digest,
+};
 use stellar_agent_core::timefmt;
 
 use crate::RemoteServeState;
@@ -85,6 +91,9 @@ use crate::templates::{
 use crate::verify::verify_wire_assertion;
 use crate::web;
 use crate::wire::{ActionAssertionRequest, LoginAssertionRequest};
+
+/// Allows concurrent verified assertions two seconds to acquire the lock on the blocking pool.
+const ASSERTION_LOCK_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Build the router (without the outer middleware stack, applied by
 /// [`crate::build_router`]).
@@ -196,6 +205,35 @@ fn policy_credential(
 // ─────────────────────────────────────────────────────────────────────────────
 // Shared response helpers
 // ─────────────────────────────────────────────────────────────────────────────
+
+/// Records a verified counter on the blocking pool, preserving busy and internal failure responses.
+#[allow(
+    clippy::result_large_err,
+    reason = "the Err variant is the ready-to-return Response for the counter failure"
+)]
+async fn record_counter(
+    state: &RemoteServeState,
+    credential_id: &str,
+    policy_key: Option<MainnetApprovalCredential>,
+    sign_count: u32,
+) -> Result<(), Response> {
+    let store =
+        OperatorApprovalCredentialStore::new(state.operator_credentials.path().to_path_buf())
+            .with_write_lock_timeout(ASSERTION_LOCK_TIMEOUT);
+    let rp_id = state.rp_id.clone();
+    let credential_id = credential_id.to_owned();
+    match tokio::task::spawn_blocking(move || match policy_key {
+        Some(credential) => store.check_policy_sign_count(&credential, &rp_id, sign_count),
+        None => store.update_sign_count(&credential_id, sign_count),
+    })
+    .await
+    {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(ApprovalError::WriterLocked)) => Err(store_busy()),
+        Ok(Err(_)) => Err(assertion_invalid()),
+        Err(_join) => Err(store_unavailable()),
+    }
+}
 
 fn not_found() -> Response {
     StatusCode::NOT_FOUND.into_response()
@@ -553,18 +591,15 @@ async fn login_assertion_post(
 
     // Sign-counter regression check: a cloned-authenticator signal refuses
     // the login even though the signature itself verified.
-    let counter = match &policy_key {
-        Some(credential) => state.operator_credentials.check_policy_sign_count(
-            credential,
-            &state.rp_id,
-            verified.sign_count,
-        ),
-        None => state
-            .operator_credentials
-            .update_sign_count(&credential_id, verified.sign_count),
-    };
-    if counter.is_err() {
-        return assertion_invalid();
+    if let Err(response) = record_counter(
+        &state,
+        &credential_id,
+        policy_key.clone(),
+        verified.sign_count,
+    )
+    .await
+    {
+        return response;
     }
 
     #[cfg(all(test, feature = "test-helpers"))]
@@ -1011,12 +1046,10 @@ async fn action_decision_post(
         return assertion_invalid();
     };
 
-    if state
-        .operator_credentials
-        .update_sign_count(&request.assertion.id, verified.sign_count)
-        .is_err()
+    if let Err(response) =
+        record_counter(&state, &request.assertion.id, None, verified.sign_count).await
     {
-        return assertion_invalid();
+        return response;
     }
 
     // The witness is bound to `nonce` — the entry actually being decided —
@@ -1119,6 +1152,10 @@ fn outcome_to_response(outcome: stellar_agent_approval_ui::Outcome) -> Response 
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[cfg(all(test, feature = "test-helpers"))]
+#[path = "counter_tests.rs"]
+mod counter_tests;
+
+#[cfg(all(test, feature = "test-helpers"))]
 mod tests {
     #![allow(
         clippy::unwrap_used,
@@ -1129,6 +1166,7 @@ mod tests {
 
     use std::sync::{Arc, Mutex as StdMutex};
 
+    use super::counter_tests::{Holder, assert_counter, counter_bytes};
     use super::*;
     use axum::body::{Body, to_bytes};
     use axum::http::Request;
@@ -2580,13 +2618,13 @@ mod tests {
         });
     }
 
-    /// Attempts a fresh, valid login with `auth` and returns the status.
-    async fn try_login(
+    /// Attempts a fresh, valid login with `auth` and returns the response.
+    async fn try_login_response(
         router: &Router<RemoteServeState>,
         state: &RemoteServeState,
         auth: &SoftwareAuthenticator,
         sign_count: u32,
-    ) -> StatusCode {
+    ) -> Response {
         let resp = router
             .clone()
             .with_state(state.clone())
@@ -2606,7 +2644,7 @@ mod tests {
             .try_into()
             .unwrap();
         let assertion = auth.sign_valid(&challenge, RP_ID, ORIGIN, sign_count);
-        let resp = router
+        router
             .clone()
             .with_state(state.clone())
             .oneshot(
@@ -2618,7 +2656,17 @@ mod tests {
                     .unwrap(),
             )
             .await
-            .unwrap();
+            .unwrap()
+    }
+
+    /// Attempts a fresh login and checks the invalid-assertion body on refusal.
+    async fn try_login(
+        router: &Router<RemoteServeState>,
+        state: &RemoteServeState,
+        auth: &SoftwareAuthenticator,
+        sign_count: u32,
+    ) -> StatusCode {
+        let resp = try_login_response(router, state, auth, sign_count).await;
         let status = resp.status();
         if status != StatusCode::OK {
             assert_eq!(
@@ -2627,6 +2675,111 @@ mod tests {
             );
         }
         status
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn testnet_login_lock_timeout_is_busy_and_retryable() {
+        let fx = fixture("login-lock-timeout");
+        let router = build_router(fx.state.ctx.decision.clone().unwrap());
+        let cookie = login(&router, &fx.state, &fx.authenticator).await;
+        let before = counter_bytes(&fx.state);
+        let mut holder = Holder::new(&fx.state);
+        let started = std::time::Instant::now();
+        let response = try_login_response(&router, &fx.state, &fx.authenticator, 7).await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(started.elapsed() >= Duration::from_secs(2));
+        assert!(!response.headers().contains_key(header::SET_COOKIE));
+        assert_eq!(
+            body_json(response).await,
+            json!({"error":"store_busy", "retriable":true})
+        );
+        assert_eq!(counter_bytes(&fx.state), before);
+        assert!(
+            cookie.ends_with(
+                &fx.state
+                    .session
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .unwrap()
+                    .session_id
+                    .to_hex()
+            )
+        );
+        holder.release();
+        assert_eq!(
+            try_login(&router, &fx.state, &fx.authenticator, 7).await,
+            StatusCode::OK
+        );
+        assert_counter(&fx.state, 7);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn testnet_decision_lock_timeout_is_busy_and_retryable() {
+        let fx = fixture("decision-lock-timeout");
+        let nonce = insert_payment_entry(&fx.state.ctx.store_path);
+        let router = build_router(fx.state.ctx.decision.clone().unwrap());
+        let cookie = login(&router, &fx.state, &fx.authenticator).await;
+        let csrf = get_csrf(&router, &fx.state, &cookie, &nonce).await;
+        let challenge = mint_action_challenge(&router, &fx.state, &cookie, &csrf, &nonce).await;
+        let assertion = fx.authenticator.sign_valid(&challenge, RP_ID, ORIGIN, 2);
+        let before = counter_bytes(&fx.state);
+        let entries = std::fs::read(&fx.state.ctx.store_path).unwrap();
+        let audit = std::fs::read(fx.dir.path().join("audit.log")).unwrap();
+        let mut holder = Holder::new(&fx.state);
+        let started = std::time::Instant::now();
+        let response = post_decision(
+            &router,
+            &fx.state,
+            &cookie,
+            &csrf,
+            &nonce,
+            decision_body("approve", &assertion),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(started.elapsed() >= Duration::from_secs(2));
+        assert_eq!(
+            body_json(response).await,
+            json!({"error":"store_busy", "retriable":true})
+        );
+        assert_eq!(counter_bytes(&fx.state), before);
+        assert_eq!(std::fs::read(&fx.state.ctx.store_path).unwrap(), entries);
+        assert_eq!(
+            std::fs::read(fx.dir.path().join("audit.log")).unwrap(),
+            audit
+        );
+        assert_entry_untouched(&fx.state.ctx.store_path, &nonce);
+        assert!(
+            cookie.ends_with(
+                &fx.state
+                    .session
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .unwrap()
+                    .session_id
+                    .to_hex()
+            )
+        );
+        holder.release();
+        let challenge = mint_action_challenge(&router, &fx.state, &cookie, &csrf, &nonce).await;
+        let assertion = fx.authenticator.sign_valid(&challenge, RP_ID, ORIGIN, 2);
+        let response = post_decision(
+            &router,
+            &fx.state,
+            &cookie,
+            &csrf,
+            &nonce,
+            decision_body("approve", &assertion),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_counter(&fx.state, 2);
+        let store = PendingApprovalStore::open(fx.state.ctx.store_path.clone()).unwrap();
+        assert!(store.get(&nonce).unwrap().attestation_blob_b64.is_some());
     }
 
     /// Editing only the profile's allowlist, with the listener state and the

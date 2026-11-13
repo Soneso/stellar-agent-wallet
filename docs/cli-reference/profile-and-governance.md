@@ -1465,9 +1465,9 @@ cannot take the lock writes nothing, and each path reports it in its own way:
 - `approve operator enroll` in argument mode refuses with
   `internal.unexpected_state`, whose message names
   `approve.operator_enroll_failed`. Retry the command.
-- A remote login answers `400` `webauthn_assertion_invalid`, the answer
-  every refused login gets, so the response does not reveal the contention.
-  Log in again.
+- A remote login or testnet decision waits up to two seconds, then answers
+  `503` `store_busy` with `retriable: true` if contention persists.
+  The login page retries with a fresh challenge up to three times.
 
 ### `approve operator remove`
 

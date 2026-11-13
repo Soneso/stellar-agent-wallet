@@ -126,7 +126,12 @@ Only credentials in the current verified policy authorize login, approval and re
 The profile allowlist and enrolled public keys grant no mainnet trust.
 The operator store supplies counters only; missing rows are created with policy metadata.
 Each verified login or decision updates the counter once under the store lock.
-Equal nonzero and lower counts refuse; zero may follow zero.
+Login waits up to two seconds for the credential store lock.
+If the store stays busy, the listener returns HTTP 503 with `{"error":"store_busy","retriable":true}`.
+The page retries with a fresh challenge up to three times, then shows "Wallet is busy. Try again."
+A login with an equal nonzero or lower counter returns HTTP 400 `webauthn_assertion_invalid`.
+A signed decision with an equal nonzero or lower counter returns HTTP 403 `approval.presence_invalid`.
+Zero may follow zero.
 Receipt verification and commit make no counter update.
 Rejection requires a fresh action assertion; a session cookie and CSRF value alone cannot reject.
 

@@ -1284,7 +1284,7 @@ stellar-agent approve operator enroll --credential-id <B64URL> \
   --public-key <B64URL> --rp-id wallet.example.internal --label laptop --sign-count <N>
 ```
 
-Every write to the operator-credential store (enrollment, removal, and the sign-count update after a remote login) holds the store's lock file. A writer that cannot take it writes nothing. Interactive enrollment and `remove` refuse with `approval.writer_locked`; argument-mode enrollment refuses with `internal.unexpected_state`, whose message names `approve.operator_enroll_failed`; a remote login answers `400` `webauthn_assertion_invalid`, like every refused login. In each case the operator retries.
+Every write to the operator-credential store (enrollment, removal, and the sign-count update after a remote login) holds the store's lock file. A writer that cannot take it writes nothing. Interactive enrollment and `remove` refuse with `approval.writer_locked`. Argument-mode enrollment refuses with `internal.unexpected_state`, whose message names `approve.operator_enroll_failed`. The operator retries these commands. A remote login or testnet decision waits up to two seconds, then answers `503` `store_busy` with `retriable: true` if contention persists. The login page retries with a fresh challenge up to three times.
 
 ### `approve operator remove`
 

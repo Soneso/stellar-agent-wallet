@@ -1024,6 +1024,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Concurrent remote approval sign-ins wait up to two seconds for the credential
+  store instead of failing as invalid assertions.
+  A busy store returns a retriable response, and the page retries with fresh
+  challenges up to three times.
 - `approve gc --include-consumed` also removes consumed approval entries
   before their TTL ends, so they stop counting toward the store's entry cap.
   Plain `approve gc` removes expired entries only. The submission receipt keeps
