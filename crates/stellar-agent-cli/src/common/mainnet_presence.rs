@@ -384,9 +384,15 @@ pub(crate) mod listener_driver {
         }
         let result = async {
             submit(handle.bootstrap_url(), nonce, flags).await?;
-            handle
-                .await_presence(std::time::Instant::now() + std::time::Duration::from_secs(1))
-                .await
+            tokio::time::pause();
+            let result = stellar_agent_test_support::timing::drive_call(
+                handle
+                    .await_presence(std::time::Instant::now() + std::time::Duration::from_secs(1)),
+                |_| async {},
+            )
+            .await;
+            tokio::time::resume();
+            result
         }
         .await;
         handle.shutdown().await?;
@@ -643,6 +649,7 @@ mod tests {
 
     use serial_test::serial;
     use stellar_agent_core::approval::mainnet_fixtures::MainnetConsentFixture;
+    use stellar_agent_test_support::timing::{ClockHold, drive_call};
 
     use super::*;
 
@@ -907,6 +914,41 @@ mod tests {
         .unwrap()
     }
 
+    async fn expire_ceremony(
+        ceremony: impl std::future::Future<Output = Result<VerifiedMainnetPresence, WalletError>>,
+        expires_at: u64,
+    ) -> Result<VerifiedMainnetPresence, WalletError> {
+        use std::{future::poll_fn, task::Poll, time::Duration};
+
+        let mut ceremony = std::pin::pin!(ceremony);
+        assert!(
+            poll_fn(|cx| Poll::Ready(ceremony.as_mut().poll(cx)))
+                .await
+                .is_pending()
+        );
+        // The first poll arms the deadline from the entry's wall-clock expiry.
+        // Holding Tokio time after that conversion controls the wait during I/O.
+        tokio::time::pause();
+        let _clock = ClockHold::new();
+        let remaining = Duration::from_millis(
+            expires_at
+                .checked_sub(stellar_agent_core::timefmt::now_unix_ms().unwrap())
+                .unwrap(),
+        );
+        let margin = Duration::from_millis(250);
+        tokio::time::advance(remaining.checked_sub(margin).unwrap()).await;
+        assert!(
+            poll_fn(|cx| Poll::Ready(ceremony.as_mut().poll(cx)))
+                .await
+                .is_pending(),
+            "the ceremony stays pending before the entry deadline"
+        );
+        tokio::time::advance(margin + Duration::from_secs(1)).await;
+        let result = drive_call(ceremony, |_| async {}).await;
+        tokio::time::resume();
+        result
+    }
+
     #[tokio::test]
     #[serial]
     async fn approve_open_by_operator_prints_url_once() {
@@ -931,33 +973,33 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn open_by_operator_keeps_presence_and_expiry() {
-        for cancel in [false, true] {
+        let ending = async |cancel: bool| {
             let fixture = MainnetConsentFixture::new("main");
-            let entry = fixture.payment(if cancel { 60_000 } else { 250 });
+            let entry = fixture.payment(600_000);
             let handle = presence_handle(&fixture, &entry).await;
             let url = handle.bootstrap_url().to_owned();
             let addr = url::Url::parse(&url)
                 .unwrap()
                 .socket_addrs(|| None)
                 .unwrap()[0];
-            let result = tokio::time::timeout(
-                std::time::Duration::from_secs(2),
-                presence_until_done(
-                    handle,
-                    OpenMode::Operator,
-                    entry.expires_at_unix_ms,
-                    |_| panic!("no browser"),
-                    async {
-                        if cancel {
-                            Ok(())
-                        } else {
-                            std::future::pending().await
-                        }
-                    },
-                ),
-            )
-            .await
-            .expect("expiry and interruption bound the ceremony")
+            let ceremony = presence_until_done(
+                handle,
+                OpenMode::Operator,
+                entry.expires_at_unix_ms,
+                |_| panic!("no browser"),
+                async {
+                    if cancel {
+                        Ok(())
+                    } else {
+                        std::future::pending().await
+                    }
+                },
+            );
+            let result = if cancel {
+                drive_call(ceremony, |_| async {}).await
+            } else {
+                expire_ceremony(ceremony, entry.expires_at_unix_ms).await
+            }
             .unwrap_err();
             assert_eq!(
                 result.code(),
@@ -978,7 +1020,8 @@ mod tests {
                     .mainnet_presence
                     .is_none()
             );
-        }
+        };
+        ending(true).await;
         let fixture = MainnetConsentFixture::new("main");
         let entry = fixture.payment(60_000);
         let handle = presence_handle(&fixture, &entry).await;
@@ -1001,13 +1044,12 @@ mod tests {
                 Ok(())
             },
         );
-        let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(3), async {
-            tokio::join!(ceremony, browser)
-        })
-        .await
-        .unwrap();
+        let result = drive_call(ceremony, |_| browser).await;
         assert_eq!(result.unwrap_err().code(), "approval.presence_canceled");
         crate::commands::approve::credential::tests::operator_expiry_and_cancellation().await;
+        // The expiry case runs last: advancing Tokio time leaves its clock
+        // ahead of later wall-clock deadlines.
+        ending(false).await;
     }
 
     #[test]
@@ -1141,8 +1183,7 @@ mod tests {
     #[serial]
     async fn the_ceremony_ends_at_the_entry_expiry() {
         let fixture = MainnetConsentFixture::new("main");
-        let ttl = std::time::Duration::from_millis(1500);
-        let entry = fixture.payment(u64::try_from(ttl.as_millis()).unwrap());
+        let entry = fixture.payment(600_000);
         let mut store =
             stellar_agent_core::approval::PendingApprovalStore::open(fixture.store_path()).unwrap();
         store
@@ -1163,9 +1204,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let started = std::time::Instant::now();
-        let ended = tokio::time::timeout(
-            ttl + std::time::Duration::from_secs(3),
+        let ended = expire_ceremony(
             presence_until_done(
                 handle,
                 OpenMode::Private,
@@ -1173,15 +1212,10 @@ mod tests {
                 |_| Ok(()),
                 std::future::pending(),
             ),
+            entry.expires_at_unix_ms,
         )
-        .await
-        .expect("the ceremony ends at the entry's expiry");
+        .await;
         assert_eq!(ended.unwrap_err().code(), "approval.presence_expired");
-        let elapsed = started.elapsed();
-        assert!(
-            elapsed + std::time::Duration::from_millis(250) >= ttl,
-            "{elapsed:?}"
-        );
     }
 
     /// The test driver receives the issued challenge and returns bytes only:
