@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `presets::classify_recipient` classifies G, M, C, and W payment destinations.
+  `presets::add_payment_recipient` edits effective payment lists or reports existing coverage.
+  It states shared rule scope and refuses edits that widen other recipients' permissions.
 - `stellar_agent_core::policy::v1::presets` derives mainnet spending presets,
   writes their v2 policy body, and states a funding plan. Its summary of any
   policy body bounds what the payment tools pay without approval. `mainnet_minimum` exports
@@ -334,6 +337,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `stellar-agent-cli` install `stellar-agent`; copy it to `stellar-agent-mcp`
   for clients that start that name. `bootstrap.sh` installs both names from
   one `--cli` source; `--mcp` is optional and must hold the same bytes.
+- `profile sign-policy` and `profile enable-mainnet` serialize policy writers with a persistent authoring lock.
+  Lock refusals use `sign_policy.authoring_lock_busy` and `sign_policy.authoring_lock_io`.
+  Enablement rechecks its body and authority state after the preview under that guard.
+  Changes refuse with `profile.enable_mainnet_precondition` and `policy_file: changed during enablement` or `policy_state: changed during enablement`.
 - A full `profile enable-mainnet` binding writes
   `classic_max_fee_per_op_stroops = 10000` into `[mainnet]` when the policy
   states no fee cap, and keeps an authored one.

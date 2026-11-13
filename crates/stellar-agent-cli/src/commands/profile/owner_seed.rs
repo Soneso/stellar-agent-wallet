@@ -38,14 +38,42 @@ impl Drop for StagingSeed {
 #[cfg(test)]
 thread_local! {
     static STAGING_SEED_CLEARED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static STAGING_TEXT_CLEARED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static LOCKED_RANGE: std::cell::Cell<Option<(usize, usize)>> = const { std::cell::Cell::new(None) };
 }
 
-/// Reads a zeroizing seed and clears the parser's copied bytes.
-fn seed_from_env(var_name: &str) -> Result<StagingSeed, OwnerSeedError> {
-    let s_strkey = Zeroizing::new(std::env::var(var_name).map_err(|_| OwnerSeedError::NotSet)?);
+#[cfg(test)]
+struct StagingText(Zeroizing<String>);
+
+#[cfg(test)]
+impl std::ops::Deref for StagingText {
+    type Target = str;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+#[cfg(test)]
+impl Drop for StagingText {
+    fn drop(&mut self) {
+        zeroize::Zeroize::zeroize(&mut self.0);
+        STAGING_TEXT_CLEARED.set(self.0.is_empty());
+    }
+}
+
+fn seed_from_env(var_name: &str) -> Result<Zeroizing<String>, OwnerSeedError> {
+    std::env::var(var_name)
+        .map(Zeroizing::new)
+        .map_err(|_| OwnerSeedError::NotSet)
+}
+
+/// Clears the text and the parser's copied bytes before the ceremony.
+fn seed_from_text(s_strkey: Zeroizing<String>) -> Result<StagingSeed, OwnerSeedError> {
+    #[cfg(test)]
+    let s_strkey = StagingText(s_strkey);
     let mut private_key = stellar_strkey::ed25519::PrivateKey::from_string(&s_strkey)
         .map_err(|_| OwnerSeedError::Invalid)?;
+    drop(s_strkey);
     let seed = Zeroizing::new(private_key.0);
     zeroize::Zeroize::zeroize(&mut private_key.0);
     #[cfg(test)]
@@ -64,8 +92,26 @@ pub(super) async fn with_owner_seed<T, E: From<OwnerSeedError>>(
     ttl_seconds: u32,
     operation: impl AsyncFnOnce(&ed25519_dalek::SigningKey) -> Result<T, E>,
 ) -> Result<T, E> {
+    with_owner_seed_text(
+        seed_from_env(var_name)?,
+        wallet_label,
+        mlock_required,
+        ttl_seconds,
+        operation,
+    )
+    .await
+}
+
+/// Clears the supplied text before operating with the wallet's locked key.
+pub(super) async fn with_owner_seed_text<T, E: From<OwnerSeedError>>(
+    seed: Zeroizing<String>,
+    wallet_label: &str,
+    mlock_required: MlockRequired,
+    ttl_seconds: u32,
+    operation: impl AsyncFnOnce(&ed25519_dalek::SigningKey) -> Result<T, E>,
+) -> Result<T, E> {
     let mut wallet = {
-        let seed = seed_from_env(var_name)?;
+        let seed = seed_from_text(seed)?;
         Wallet::unlock(wallet_label.to_owned(), &seed, ttl_seconds, mlock_required)
             .map_err(|e| OwnerSeedError::Unlock(e.to_string()))?
     };
@@ -90,22 +136,84 @@ mod tests {
     use stellar_agent_core::wallet::mlock::force_lock_failure_for_test;
 
     const VAR: &str = "OWNER_SEED_LOCKED_PAGE_TEST";
+
+    #[tokio::test]
+    async fn seed_text_is_cleared_before_operation() {
+        STAGING_TEXT_CLEARED.set(false);
+        let seed = Zeroizing::new(
+            stellar_strkey::ed25519::PrivateKey([42; 32])
+                .as_unredacted()
+                .to_string()
+                .to_string(),
+        );
+        with_owner_seed_text(seed, "test", MlockRequired::Warn, 30, async |key| {
+            assert!(STAGING_TEXT_CLEARED.get());
+            assert_eq!(key.to_bytes(), [42; 32]);
+            Ok::<_, OwnerSeedError>(())
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn seed_text_is_cleared_on_failure() {
+        STAGING_TEXT_CLEARED.set(false);
+        let ran = std::cell::Cell::new(false);
+        let result = with_owner_seed_text(
+            Zeroizing::new("invalid".into()),
+            "test",
+            MlockRequired::Warn,
+            30,
+            async |_| {
+                ran.set(true);
+                Ok::<_, OwnerSeedError>(())
+            },
+        )
+        .await;
+        assert!(matches!(result, Err(OwnerSeedError::Invalid)));
+        assert!(STAGING_TEXT_CLEARED.get());
+        assert!(!ran.get());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn with_owner_seed_keeps_env_behavior() {
+        assert!(matches!(
+            seed_from_env("OWNER_SEED_MISSING_TEST"),
+            Err(OwnerSeedError::NotSet)
+        ));
+        let _env = SeedEnv::new();
+        with_owner_seed(VAR, "test", MlockRequired::Warn, 30, async |key| {
+            assert_eq!(key.to_bytes(), [42; 32]);
+            Ok::<_, OwnerSeedError>(())
+        })
+        .await
+        .unwrap();
+        let _invalid = SeedEnv::with_value("invalid");
+        let result = with_owner_seed(VAR, "test", MlockRequired::Warn, 30, async |_| {
+            Ok::<_, OwnerSeedError>(())
+        })
+        .await;
+        assert!(matches!(result, Err(OwnerSeedError::Invalid)));
+    }
     struct SeedEnv;
     impl SeedEnv {
+        fn new() -> Self {
+            Self::with_value(
+                stellar_strkey::ed25519::PrivateKey([42; 32])
+                    .as_unredacted()
+                    .to_string()
+                    .as_ref(),
+            )
+        }
         #[allow(
             unsafe_code,
             reason = "test-only environment mutation serialized by serial"
         )]
-        fn new() -> Self {
+        fn with_value(value: &str) -> Self {
             // SAFETY: all users of this test variable hold the serial test lock.
             unsafe {
-                std::env::set_var(
-                    VAR,
-                    stellar_strkey::ed25519::PrivateKey([42; 32])
-                        .as_unredacted()
-                        .to_string()
-                        .to_string(),
-                );
+                std::env::set_var(VAR, value);
             }
             Self
         }

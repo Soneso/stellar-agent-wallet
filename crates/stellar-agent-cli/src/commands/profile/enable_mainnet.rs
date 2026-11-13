@@ -10,6 +10,7 @@
 //! `profile.enable_mainnet_default_refused`, `profile.enable_mainnet_not_mainnet`,
 //! `profile.mainnet_oracle_required`, `profile.enable_mainnet_precondition`,
 //! `profile.enable_mainnet_nonce_exists`, `profile.spending_preview_unwritable`,
+//! `sign_policy.authoring_lock_busy`, `sign_policy.authoring_lock_io`,
 //! and `policy.pin_absent`. The pin
 //! step returns its `policy.*` verification error, such as
 //! `policy.owner_signature_invalid` or `policy.state_lock_busy`.
@@ -39,6 +40,9 @@
 //! A full binding writes `classic_max_fee_per_op_stroops = 10000` into
 //! `[mainnet]` when the body states no fee cap, and keeps an authored one.
 
+use super::policy_authoring::{
+    acquire, missing_pin_lock_detail, pin_read_failure, read_pin_checked,
+};
 use super::sign_policy::{SequenceRefusal, assign_signing_sequence, atomic_write_string};
 use crate::{
     commands::value_audit::emit_value_audit_row_strict,
@@ -522,18 +526,39 @@ pub(super) fn execute(
     let rewritten = rewrite_policy(&body, name, &host, &digest, args.rotate)?;
     // The bounds of the bytes the owner signs next, before the first write:
     // the rebound body with the sequence signing assigns it.
-    let spending_summary = match installed {
-        Some(_) => {
-            let pin = signing_pin(name, profile, window.path(), &body)?;
-            Some(summarize(
-                &parse_policy_body(&signing_body(&rewritten, pin)?)?,
-                &profile.network_passphrase,
-                AuthorityStatus::RequiresSignature,
-            ))
-        }
+    let preview_pin = installed
+        .as_ref()
+        .map(|_| signing_pin(name, profile, window.path(), &body))
+        .transpose()?;
+    let spending_summary = match preview_pin {
+        Some(pin) => Some(summarize(
+            &parse_policy_body(&signing_body(&rewritten, pin)?)?,
+            &profile.network_passphrase,
+            AuthorityStatus::RequiresSignature,
+        )),
         None => None,
     };
     preview.show(spending_summary.as_ref(), None, OutputFormat::Json)?;
+    let _authoring = acquire(policy_path)?;
+    let current = std::fs::read_to_string(policy_path)
+        .map_err(|e| precondition(format!("policy_file: {e}")))?;
+    if current != raw {
+        return Err(precondition("policy_file: changed during enablement"));
+    }
+    let state_changed = || precondition("policy_state: changed during enablement");
+    if has_enablement_nonce(profile).map_err(|_| precondition("nonce unreadable"))? != exists {
+        return Err(state_changed());
+    }
+    if exists && read_pin_checked(name, profile, window.path())? == PinState::Absent {
+        return Err(state_changed());
+    }
+    if let Some(pin) = preview_pin
+        && signing_pin(name, profile, window.path(), &body)? != pin
+    {
+        return Err(state_changed());
+    }
+    #[cfg(test)]
+    tests::observe_authoring("pin", policy_path);
     ensure_policy_pin(name, profile, policy_path, window.path(), &body)?;
     let mut audit = AuditEntry::new_tool_invocation(NewToolInvocation::new(
         "mainnet_enablement_minted",
@@ -553,9 +578,13 @@ pub(super) fn execute(
     // nonce the policy does not name; `--rotate` then binds the policy in
     // full, with its own audit row first.
     emit(audit)?;
+    #[cfg(test)]
+    tests::observe_authoring("nonce", policy_path);
     entry
         .set_password(&nonce)
         .map_err(|_| precondition("nonce write failed"))?;
+    #[cfg(test)]
+    tests::observe_authoring("replace", policy_path);
     write_policy(policy_path, &rewritten)
         .map_err(|e| precondition(format!("policy rewrite: {e}")))?;
     let mut next = vec![
@@ -599,19 +628,9 @@ fn refuse_absent_pin(
     window_path: &Path,
     nonce: &KeyringEntryRef,
 ) -> Result<(), Failure> {
-    use stellar_agent_core::policy::{pin, v1::verified::read_pin_without_creating};
-    let state =
-        read_pin_without_creating(window_path, profile).map_err(|e| pin_read_failure(name, e))?;
+    let state = read_pin_checked(name, profile, window_path)?;
     if let PinState::Present(_) = state {
         return Ok(());
-    }
-    let pin_entry = pin::entry_present(&profile.policy_window_state_key_id)
-        .map_err(|e| pin_read_failure(name, PolicyError::from(e)))?;
-    if pin_entry {
-        return Err((
-            PolicyError::PinAbsent.wire_code(),
-            missing_pin_lock_detail(name),
-        ));
     }
     Err((
         PolicyError::PinAbsent.wire_code(),
@@ -624,37 +643,6 @@ fn refuse_absent_pin(
             nonce.service, nonce.account
         ),
     ))
-}
-
-/// The cause and recovery when a pin entry exists without its lock file.
-fn missing_pin_lock_detail(name: &str) -> String {
-    format!(
-        "the policy-state lock file of profile '{name}' is missing, so its policy pin \
-         cannot be read; a command that builds the V1 policy engine recreates the lock \
-         file, and this command can run after it; nothing was written"
-    )
-}
-
-/// The refusal of a pin read before the first write. An unusable pin names
-/// the profile, that nothing was written, and the recovery. A malformed pin
-/// has no repair command, because a replacement could lower the recorded
-/// sequence the replay protection keeps. Every other failure keeps its own
-/// message.
-fn pin_read_failure(name: &str, error: PolicyError) -> Failure {
-    let code = error.wire_code();
-    match error {
-        PolicyError::PinUnusable { detail } => (
-            code,
-            format!(
-                "the policy pin of profile '{name}' cannot be used ({detail}); nothing was \
-                 written. Rerun this command once the keyring is reachable if it was \
-                 unavailable. No command repairs a malformed pin in this release, since a \
-                 replacement could lower its recorded sequence; create a profile under a new \
-                 name."
-            ),
-        ),
-        other => (code, other.to_string()),
-    }
 }
 
 /// The pinned sequence `sign-policy` reads after this ceremony: the
@@ -3673,7 +3661,7 @@ mod tests {
             let count = probes.clone();
             keyring_mock::install_with_read_hooks(vec![keyring_mock::ReadHook::new(
                 &coordinate.service, &coordinate.account, Arc::new(move || {
-                    if count.fetch_add(1, Ordering::SeqCst) == 1 {
+                    if count.fetch_add(1, Ordering::SeqCst) == 2 {
                         let path = path_copy.lock().unwrap().clone().unwrap();
                         assert!(matches!(WindowStoreLock::acquire_for(&path, &hook_profile.policy_window_state_key_id),
                             Err(stellar_agent_core::policy::state_lock::StateLockError::WriterLocked)), "nonce recheck holds the state lock");
@@ -3688,7 +3676,7 @@ mod tests {
             fixture.sign(&unbound_body(false));
             let bytes = std::fs::read(fixture.path()).unwrap();
             let error = fixture.run().unwrap_err();
-            assert_eq!(probes.load(Ordering::SeqCst), 2);
+            assert_eq!(probes.load(Ordering::SeqCst), 3);
             assert_eq!(
                 error.0,
                 if unreadable {
@@ -3870,4 +3858,6 @@ mod tests {
         assert_eq!(fixture.pin(), pin);
         assert_eq!(get(&fixture.nonce_ref()), nonce);
     }
+
+    include!("enable_mainnet_authoring_tests.rs");
 }

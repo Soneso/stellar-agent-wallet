@@ -368,6 +368,14 @@ Each refusal writes no owner entry.
 
 ### `profile sign-policy`
 
+The authoring guard serializes writers from the policy read through atomic replacement.
+Its persistent lock file is `<policy_path>.authoring.lock`, beside the policy selected by `--file` or the default path.
+On Unix, a new lock file has mode 0600.
+Contention refuses with `sign_policy.authoring_lock_busy`; other lock I/O refuses with `sign_policy.authoring_lock_io`.
+A missing directory keeps `sign_policy.policy_file_unreadable`.
+The guard binds no earlier preview to this signing run.
+Signing proceeds directly from preparation to the owner signature.
+
 With an enrolled owner, the profile's `[policy] engine` must match the verified
 signed policy's top-level `engine`. An omitted signed selector means `v1`.
 Policy version 2 accepts `engine = "v1"` and `engine = "noop"`.
@@ -550,6 +558,13 @@ Loader refusals retain their validation codes. Protected keys use
 `profile.fragment_key_refused`. Profile access and I/O failures exit 1.
 
 ### `profile enable-mainnet`
+
+After the spending preview, the ceremony takes the policy authoring guard and rechecks the file, nonce presence, and preview pin.
+A changed body refuses with `profile.enable_mainnet_precondition` and `policy_file: changed during enablement`.
+A changed authority state uses that code with `policy_state: changed during enablement`.
+These refusals carry the preview, as do later pin-step refusals.
+The guard stays through pinning, the audit row, nonce storage, and policy replacement.
+`--check` and `--state` take no authoring guard.
 
 ```bash
 stellar-agent profile enable-mainnet --profile operator

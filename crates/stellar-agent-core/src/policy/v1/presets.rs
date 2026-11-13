@@ -863,9 +863,7 @@ pub fn add_recipient(body: &str, recipient: &str) -> Result<String, PresetError>
                 continue;
             };
             lists += 1;
-            if !list.iter().any(|entry| entry.as_str() == Some(recipient)) {
-                list.push(recipient);
-            }
+            append_recipient(list, recipient);
         }
     }
     if lists == 0 {
@@ -874,6 +872,531 @@ pub fn add_recipient(body: &str, recipient: &str) -> Result<String, PresetError>
         )));
     }
     Ok(document.to_string())
+}
+
+fn append_recipient(list: &mut toml_edit::Array, recipient: &str) {
+    if !list.iter().any(|entry| entry.as_str() == Some(recipient)) {
+        list.push(recipient);
+    }
+}
+
+/// The address gate and base address of a payment destination.
+#[derive(Debug, PartialEq, Eq)]
+pub struct RecipientForm {
+    /// The address kind the destination requires.
+    pub kind: &'static str,
+    /// The underlying G or C address.
+    pub base: String,
+    /// Whether the destination is a W address.
+    pub muxed_contract: bool,
+}
+
+/// Classifies G, M, C, and W payment destinations.
+///
+/// # Errors
+/// Returns [`RecipientRefusal::Invalid`] for any other form without echoing it.
+pub fn classify_recipient(recipient: &str) -> Result<RecipientForm, RecipientRefusal> {
+    let (kind, base) = destination_form(recipient).ok_or(RecipientRefusal::Invalid)?;
+    Ok(RecipientForm {
+        kind: kind.tag(),
+        base,
+        muxed_contract: recipient.starts_with('W'),
+    })
+}
+
+/// The effective consumers of one edited rule.
+#[derive(Debug, PartialEq, Eq)]
+pub struct RuleScope {
+    /// The zero-based position in `rules`.
+    pub rule: usize,
+    /// The tools from the four mainnet lists, in list order.
+    pub tools: Vec<String>,
+    /// Whether the rule also matches tools outside those lists.
+    pub wildcard: bool,
+}
+
+/// A recipient addition that requires an owner signature.
+#[derive(Debug, PartialEq, Eq)]
+pub struct RecipientAddition {
+    /// The edited policy body.
+    pub body: String,
+    /// The destination's address kind.
+    pub kind: &'static str,
+    /// The sorted zero-based indexes of changed rules.
+    pub updated_rules: Vec<usize>,
+    /// The sorted rule indexes where the destination kind is appended.
+    pub kinds_added: Vec<usize>,
+    /// The sorted rule indexes where a domain criterion is split.
+    pub split_rules: Vec<usize>,
+    /// Every tool governed by each target rule.
+    pub scope: Vec<RuleScope>,
+    /// Selected tools whose effective rules have no address gate.
+    pub ungated_tools: Vec<String>,
+    /// Selected tools denied by their first match or without a match.
+    pub denied_tools: Vec<String>,
+}
+
+/// An existing admission that needs no edit.
+#[derive(Debug, PartialEq, Eq)]
+pub struct RecipientListed {
+    /// The destination's address kind.
+    pub kind: &'static str,
+    /// The exact entry, or the base when any list relies on it.
+    pub covered_by: String,
+    /// Every tool governed by each target rule.
+    pub scope: Vec<RuleScope>,
+    /// Selected tools whose effective rules have no address gate.
+    pub ungated_tools: Vec<String>,
+    /// Selected tools denied by their first match or without a match.
+    pub denied_tools: Vec<String>,
+}
+
+/// The result of adding a payment destination.
+#[derive(Debug, PartialEq, Eq)]
+pub enum RecipientEdit {
+    /// The owner must sign this body to admit the recipient.
+    Added(RecipientAddition),
+    /// Every target address list already covers the recipient.
+    Listed(RecipientListed),
+}
+
+/// A refusal that leaves the body unchanged.
+#[derive(Debug, PartialEq, Eq)]
+pub enum RecipientRefusal {
+    /// The destination is not a payment address.
+    Invalid,
+    /// The passphrase does not identify a known network.
+    UnknownNetwork,
+    /// The TOML body fails to parse at this byte position.
+    Body(usize),
+    /// No editable address list exists for the requested scope.
+    ListMissing(String),
+    /// The edit expands permissions beyond one recipient.
+    Unsupported(String),
+    /// The target lists or their consumers require a wider choice.
+    Ambiguous(String),
+    /// Appending the kind activates these other entries.
+    KindConflict(String),
+}
+
+impl RecipientRefusal {
+    /// The stable refusal code.
+    #[must_use]
+    pub const fn code(&self) -> &'static str {
+        match self {
+            Self::Invalid => "profile.policy_recipient_invalid",
+            Self::UnknownNetwork => "profile.policy_network_unknown",
+            Self::Body(_) => "profile.policy_body_invalid",
+            Self::ListMissing(_) => "profile.policy_recipient_list_missing",
+            Self::Unsupported(_) => "profile.policy_recipient_list_unsupported",
+            Self::Ambiguous(_) => "profile.policy_counterparty_ambiguous",
+            Self::KindConflict(_) => "profile.policy_recipient_kind_conflict",
+        }
+    }
+}
+
+impl std::fmt::Display for RecipientRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Invalid => f.write_str("the recipient must be a G, M, C, or W payment address"),
+            Self::UnknownNetwork => f.write_str("the passphrase is not a known network"),
+            Self::Body(position) => write!(f, "the policy body does not parse at byte {position}"),
+            Self::ListMissing(detail)
+            | Self::Unsupported(detail)
+            | Self::Ambiguous(detail)
+            | Self::KindConflict(detail) => f.write_str(detail),
+        }
+    }
+}
+
+fn selects(list: &InlineTable, kind: &str) -> bool {
+    list.get("kinds")
+        .and_then(Value::as_array)
+        .is_some_and(|kinds| kinds.iter().any(|entry| entry.as_str() == Some(kind)))
+}
+
+fn recipient_entries(list: &InlineTable) -> impl Iterator<Item = &str> {
+    list.get("allowlist")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+}
+
+fn address_list(list: &InlineTable) -> bool {
+    list.get("kind").and_then(Value::as_str) == Some("counterparty_allowlist")
+        && (selects(list, "G_ACCOUNT") || selects(list, "C_ACCOUNT"))
+}
+
+fn listed_set(list: &InlineTable) -> std::collections::BTreeSet<&str> {
+    recipient_entries(list)
+        .filter(|entry| {
+            destination_form(entry).is_some_and(|(kind, _)| selects(list, kind.tag()))
+                || (selects(list, "KNOWN_ISSUER")
+                    && stellar_strkey::ed25519::PublicKey::from_string(
+                        entry.split_once(':').map_or(entry, |(_, issuer)| issuer),
+                    )
+                    .is_ok())
+                || (selects(list, "HOME_DOMAIN") && destination_form(entry).is_none())
+        })
+        .collect()
+}
+
+/// Adds one recipient to every effective address list of the selected payment tools.
+/// An empty selection covers all mainnet payment tools. The owner signs the resulting body.
+///
+/// # Errors
+/// Refuses invalid input, absent lists, ambiguous scope, and permission changes beyond the named recipient.
+pub fn add_payment_recipient(
+    body: &str,
+    network_passphrase: &str,
+    recipient: &str,
+    tools: &[&str],
+) -> Result<RecipientEdit, RecipientRefusal> {
+    let form = classify_recipient(recipient)?;
+    let chain = Caip2::from_passphrase(network_passphrase)
+        .ok_or(RecipientRefusal::UnknownNetwork)?
+        .caip2_str();
+    let document: DocumentMut = body.parse().map_err(|error: toml_edit::TomlError| {
+        RecipientRefusal::Body(error.span().map_or(0, |span| span.start))
+    })?;
+    let rules = read_rules(&document);
+    let targets = recipient_targets(&rules, chain, tools)?;
+    let lists = target_recipient_lists(&rules, &targets)?;
+    if let Some(covered_by) = recipient_coverage(&lists, &form, recipient) {
+        return Ok(RecipientEdit::Listed(RecipientListed {
+            kind: form.kind,
+            covered_by,
+            scope: targets.scope,
+            ungated_tools: targets.ungated_tools,
+            denied_tools: targets.denied_tools,
+        }));
+    }
+    check_recipient_edit(&lists, &targets.scope, tools, &form, recipient)?;
+    Ok(RecipientEdit::Added(apply_recipient_edit(
+        document, targets, form.kind, recipient,
+    )))
+}
+
+struct RecipientTargets {
+    indexes: std::collections::BTreeSet<usize>,
+    scope: Vec<RuleScope>,
+    ungated_tools: Vec<String>,
+    denied_tools: Vec<String>,
+}
+
+fn recipient_targets(
+    rules: &[RuleView<'_>],
+    chain: &str,
+    tools: &[&str],
+) -> Result<RecipientTargets, RecipientRefusal> {
+    for tool in tools {
+        if !MAINNET_VALUE_OUT_TOOLS.contains(tool) {
+            return Err(RecipientRefusal::ListMissing(format!(
+                "{tool} is not a payment tool"
+            )));
+        }
+    }
+    let selected: Vec<_> = MAINNET_VALUE_OUT_TOOLS
+        .iter()
+        .copied()
+        .filter(|tool| tools.is_empty() || tools.contains(tool))
+        .collect();
+    let mut targets = std::collections::BTreeSet::new();
+    let mut ungated_tools = Vec::new();
+    let mut denied_tools = Vec::new();
+    for tool in &selected {
+        let editable =
+            first_match(rules, tool, chain).filter(|index| rules[*index].decision != "deny");
+        let Some(index) = editable else {
+            if !tools.is_empty() {
+                return Err(RecipientRefusal::ListMissing(format!(
+                    "{tool} has no editable rule"
+                )));
+            }
+            denied_tools.push((*tool).to_owned());
+            continue;
+        };
+        if !rules[index].criteria.iter().any(|list| address_list(list)) {
+            ungated_tools.push((*tool).to_owned());
+        }
+        targets.insert(index);
+    }
+    let scope: Vec<_> = targets
+        .iter()
+        .map(|index| RuleScope {
+            rule: *index,
+            tools: MAINNET_READ_ONLY_TOOLS
+                .iter()
+                .chain(MAINNET_VALUE_OUT_TOOLS)
+                .chain(MAINNET_TRUSTLINE_TOOLS)
+                .chain(MAINNET_CLAIM_TOOLS)
+                .filter(|tool| first_match(rules, tool, chain) == Some(*index))
+                .map(|tool| (*tool).to_owned())
+                .collect(),
+            wildcard: rules[*index].tool == "*",
+        })
+        .collect();
+    Ok(RecipientTargets {
+        indexes: targets,
+        scope,
+        ungated_tools,
+        denied_tools,
+    })
+}
+
+fn target_recipient_lists<'a>(
+    rules: &[RuleView<'a>],
+    targets: &RecipientTargets,
+) -> Result<Vec<(usize, &'a InlineTable)>, RecipientRefusal> {
+    let lists: Vec<_> = targets
+        .indexes
+        .iter()
+        .flat_map(|index| {
+            rules[*index]
+                .criteria
+                .iter()
+                .filter(|list| address_list(list))
+                .map(move |list| (*index, *list))
+        })
+        .collect();
+    if lists.is_empty() {
+        return Err(RecipientRefusal::ListMissing(
+            "no target rule has an address list; a new list adds a gate for every current recipient".into(),
+        ));
+    }
+    for (index, list) in &lists {
+        if selects(list, "SEP10_IDENTITY") || selects(list, "ONE_TIME_ADDRESS") {
+            return Err(RecipientRefusal::Unsupported(format!(
+                "rule {index} selects a reserved kind that denies every call"
+            )));
+        }
+    }
+    Ok(lists)
+}
+
+/// Coverage and kind conflict are disjoint because coverage requires every list to select the recipient's kind.
+fn recipient_coverage(
+    lists: &[(usize, &InlineTable)],
+    form: &RecipientForm,
+    recipient: &str,
+) -> Option<String> {
+    if lists.iter().all(|(_, list)| {
+        selects(list, form.kind)
+            && recipient_entries(list).any(|entry| entry == recipient || entry == form.base)
+    }) {
+        let exact = lists
+            .iter()
+            .all(|(_, list)| recipient_entries(list).any(|entry| entry == recipient));
+        Some(if exact {
+            recipient.to_owned()
+        } else {
+            form.base.clone()
+        })
+    } else {
+        None
+    }
+}
+
+fn check_recipient_edit(
+    lists: &[(usize, &InlineTable)],
+    scope: &[RuleScope],
+    tools: &[&str],
+    form: &RecipientForm,
+    recipient: &str,
+) -> Result<(), RecipientRefusal> {
+    if !tools.is_empty() {
+        for consumer in scope {
+            if consumer.wildcard
+                || consumer
+                    .tools
+                    .iter()
+                    .any(|tool| !tools.contains(&tool.as_str()))
+            {
+                let payment = consumer
+                    .tools
+                    .iter()
+                    .filter(|tool| {
+                        MAINNET_VALUE_OUT_TOOLS.contains(&tool.as_str())
+                            && !tools.contains(&tool.as_str())
+                    })
+                    .map(String::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let payment = if payment.is_empty() {
+                    String::new()
+                } else {
+                    format!(" Select these payment tools too: {payment}.")
+                };
+                return Err(RecipientRefusal::Ambiguous(format!(
+                    "rule {} shares its list.{payment} {}Supply an empty selection to accept its full scope.",
+                    consumer.rule,
+                    if consumer.wildcard {
+                        "The rule governs every tool without an earlier match, including non-payment tools. "
+                    } else {
+                        ""
+                    },
+                )));
+            }
+        }
+    }
+    let expected = listed_set(lists[0].1);
+    if lists.iter().any(|(_, list)| listed_set(list) != expected) {
+        let detail = lists
+            .iter()
+            .map(|(index, list)| {
+                let tools = scope
+                    .iter()
+                    .find(|scope| scope.rule == *index)
+                    .map(|scope| scope.tools.join(", "))
+                    .unwrap_or_default();
+                format!("{tools}: {:?}", listed_set(list))
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(RecipientRefusal::Ambiguous(format!(
+            "the target lists differ: {detail}. One recipient joins a list the owner keeps narrower. Supply a selection whose target lists hold the same entries."
+        )));
+    }
+    for (index, list) in lists {
+        if selects(list, "KNOWN_ISSUER")
+            && recipient.starts_with('G')
+            && !recipient_entries(list).any(|entry| {
+                entry == recipient
+                    || entry
+                        .split_once(':')
+                        .is_some_and(|(_, issuer)| issuer == recipient)
+            })
+        {
+            return Err(RecipientRefusal::Unsupported(format!(
+                "rule {index}: payments in assets issued by this G become allowed for every recipient the rule pays. \
+                 Use a list for the recipient without KNOWN_ISSUER, or a hand edit signed with profile sign-policy."
+            )));
+        }
+        if !selects(list, form.kind) {
+            let activated: Vec<_> = recipient_entries(list)
+                .filter(|entry| {
+                    *entry != recipient
+                        && destination_form(entry).is_some_and(|(kind, _)| kind.tag() == form.kind)
+                })
+                .collect();
+            if !activated.is_empty() {
+                return Err(RecipientRefusal::KindConflict(format!(
+                    "rule {index}: appending {} also lists {}; these entries leave their unlisted budget or approval path",
+                    form.kind,
+                    activated.join(", ")
+                )));
+            }
+        }
+        if selects(list, "HOME_DOMAIN") && list.contains_key("unlisted") {
+            return Err(RecipientRefusal::Unsupported(format!(
+                "rule {index}: the unlisted mode applies to the merged address and domain outcome. \
+                 After a split it applies to the address check alone."
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn split_domain_list(
+    list: &mut InlineTable,
+    kind: &str,
+    recipient: &str,
+    missing_kind: bool,
+) -> InlineTable {
+    let mut address_kinds = toml_edit::Array::new();
+    if let Some(kinds) = list.get_mut("kinds").and_then(Value::as_array_mut) {
+        for kind in kinds
+            .iter()
+            .filter(|kind| matches!(kind.as_str(), Some("G_ACCOUNT" | "C_ACCOUNT")))
+        {
+            address_kinds.push(kind.clone());
+        }
+        kinds.retain(|kind| !matches!(kind.as_str(), Some("G_ACCOUNT" | "C_ACCOUNT")));
+    }
+    if missing_kind {
+        address_kinds.push(kind);
+    }
+    let mut address = InlineTable::new();
+    address.insert("kind", "counterparty_allowlist".into());
+    address.insert("kinds", address_kinds.into());
+    address.insert("allowlist", Value::from_iter([recipient]));
+    address
+}
+
+fn apply_recipient_edit(
+    mut document: DocumentMut,
+    targets: RecipientTargets,
+    kind: &'static str,
+    recipient: &str,
+) -> RecipientAddition {
+    let mut updated_rules = Vec::new();
+    let mut kinds_added = Vec::new();
+    let mut split_rules = Vec::new();
+    if let Some(rules) = document
+        .get_mut("rules")
+        .and_then(Item::as_array_of_tables_mut)
+    {
+        for index in targets.indexes {
+            let Some(criteria) = rules
+                .get_mut(index)
+                .and_then(|rule| rule.get_mut("criteria"))
+                .and_then(Item::as_array_mut)
+            else {
+                continue;
+            };
+            let mut position = 0;
+            while position < criteria.len() {
+                let Some(list) = criteria
+                    .get_mut(position)
+                    .and_then(Value::as_inline_table_mut)
+                    .filter(|list| address_list(list))
+                else {
+                    position += 1;
+                    continue;
+                };
+                let missing_kind = !selects(list, kind);
+                let split = selects(list, "HOME_DOMAIN");
+                let changed = missing_kind
+                    || split
+                    || !recipient_entries(list).any(|entry| entry == recipient);
+                if changed && !updated_rules.contains(&index) {
+                    updated_rules.push(index);
+                }
+                if missing_kind && !kinds_added.contains(&index) {
+                    kinds_added.push(index);
+                }
+                if split {
+                    let address = split_domain_list(list, kind, recipient, missing_kind);
+                    criteria.insert(position + 1, address);
+                    if !split_rules.contains(&index) {
+                        split_rules.push(index);
+                    }
+                    position += 1;
+                } else {
+                    if missing_kind
+                        && let Some(kinds) = list.get_mut("kinds").and_then(Value::as_array_mut)
+                    {
+                        kinds.push(kind);
+                    }
+                    if let Some(entries) = list.get_mut("allowlist").and_then(Value::as_array_mut) {
+                        append_recipient(entries, recipient);
+                    }
+                }
+                position += 1;
+            }
+        }
+    }
+    RecipientAddition {
+        body: document.to_string(),
+        kind,
+        updated_rules,
+        kinds_added,
+        split_rules,
+        scope: targets.scope,
+        ungated_tools: targets.ungated_tools,
+        denied_tools: targets.denied_tools,
+    }
 }
 
 /// What the owner's signature status of a summarized body is.
@@ -1361,12 +1884,15 @@ fn effective<'r, 'a>(
     tool: &str,
     chain: &str,
 ) -> Option<&'r RuleView<'a>> {
-    rules
-        .iter()
-        .find(|rule| {
-            (rule.tool == "*" || rule.tool == tool) && (rule.chain == "*" || rule.chain == chain)
-        })
+    first_match(rules, tool, chain)
+        .map(|index| &rules[index])
         .filter(|rule| rule.decision != "deny")
+}
+
+fn first_match(rules: &[RuleView<'_>], tool: &str, chain: &str) -> Option<usize> {
+    rules.iter().position(|rule| {
+        (rule.tool == "*" || rule.tool == tool) && (rule.chain == "*" || rule.chain == chain)
+    })
 }
 
 fn stroops_of(value: Option<&Value>) -> Option<i128> {
@@ -7792,4 +8318,6 @@ mod tests {
             );
         }
     }
+
+    include!("presets_recipient_tests.rs");
 }
