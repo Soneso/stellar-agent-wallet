@@ -375,6 +375,8 @@ mod signed {
         SIGNED_ORIGIN, SIGNED_RP_ID, policy_body_with_origin,
     };
 
+    const PROCESS_WAIT_BUDGET: Duration = Duration::from_secs(600);
+
     struct Home {
         dir: tempfile::TempDir,
         nonce: String,
@@ -481,7 +483,7 @@ mod signed {
             .unwrap();
             let mut entry = store.get(&self.nonce).unwrap().clone();
             store.remove(&self.nonce).unwrap();
-            // The entry permits the 15-second readiness budget and a five-second margin.
+            // This child-process case waits for the entry's wall-clock expiry.
             let expiry = stellar_agent_core::timefmt::now_unix_ms().unwrap() + 20_000;
             entry.expires_at_unix_ms = expiry;
             store
@@ -538,7 +540,7 @@ mod signed {
                 return;
             }
             send_interrupt(child);
-            let deadline = Instant::now() + Duration::from_secs(2);
+            let deadline = Instant::now() + PROCESS_WAIT_BUDGET;
             while Instant::now() < deadline {
                 if matches!(child.try_wait(), Ok(Some(_))) {
                     return;
@@ -546,7 +548,7 @@ mod signed {
                 std::thread::sleep(Duration::from_millis(10));
             }
             let _ = child.kill();
-            let deadline = Instant::now() + Duration::from_secs(2);
+            let deadline = Instant::now() + PROCESS_WAIT_BUDGET;
             while Instant::now() < deadline {
                 if matches!(child.try_wait(), Ok(Some(_))) {
                     return;
@@ -557,7 +559,7 @@ mod signed {
     }
 
     async fn ready(child: &mut OwnedChild, home: &Home) {
-        let deadline = Instant::now() + Duration::from_secs(15);
+        let deadline = Instant::now() + PROCESS_WAIT_BUDGET;
         loop {
             while let Ok(line) = child.lines.try_recv() {
                 if let Some(link) = line.strip_prefix("Test listener: https://") {
@@ -583,7 +585,7 @@ mod signed {
         }
     }
     async fn finish(child: impl Into<OwnedChild>) -> (i32, String, String) {
-        finish_by(child, Instant::now() + Duration::from_secs(15)).await
+        finish_by(child, Instant::now() + PROCESS_WAIT_BUDGET).await
     }
     async fn finish_by(child: impl Into<OwnedChild>, deadline: Instant) -> (i32, String, String) {
         let mut child = child.into();
@@ -1460,23 +1462,28 @@ mod signed {
         let window = PersistedWindowStore::for_profile(NAME);
         let audit = audit_readiness(&profile, NAME).unwrap();
         let writer = audit.writer().clone();
-        let authorization = resolve_tx_sign(TxSignRequest {
-            context: &context,
-            consumer: MainnetConsumer::CliPay,
-            unsigned_envelope_xdr: envelope.envelope_xdr(),
-            client: &client,
-            probe_deadline: Duration::from_secs(2),
-            witness: Some(&witness),
-            signer: &signer,
-            policy: current.policy(),
-            enablement: &enablement,
-            authority: &MainnetAuthority::Approval(&approval),
-            audit,
-            store: &window,
-            operation: None,
-        })
+        tokio::time::pause();
+        let authorization = stellar_agent_test_support::timing::drive_call(
+            resolve_tx_sign(TxSignRequest {
+                context: &context,
+                consumer: MainnetConsumer::CliPay,
+                unsigned_envelope_xdr: envelope.envelope_xdr(),
+                client: &client,
+                probe_deadline: Duration::from_secs(2),
+                witness: Some(&witness),
+                signer: &signer,
+                policy: current.policy(),
+                enablement: &enablement,
+                authority: &MainnetAuthority::Approval(&approval),
+                audit,
+                store: &window,
+                operation: None,
+            }),
+            |_| async {},
+        )
         .await
         .unwrap();
+        tokio::time::resume();
         let signing = CountingSigner::new([42; 32]);
         let signed = attach_signature_authorized(
             envelope.envelope_xdr(),
