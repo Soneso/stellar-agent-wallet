@@ -300,6 +300,9 @@ matches:
 - A file under `.github/scripts/` selects the self-test of the script it
   changes, and a changed shell script also selects shellcheck.
 - A file under `skills/` or `.claude-plugin/` selects the skill archive check.
+  Pull requests into the `mainnet-write` integration branch do not check the
+  archive in CI.
+  The archive is rebuilt and checked before that branch merges into `main`.
 - A file under `crates/`, `tests/`, or `examples/`, or a root `Cargo.toml`,
   `Cargo.lock`, `rust-toolchain.toml`, `rustfmt.toml`, `Cross.toml`, or
   `deny.toml`, selects the Rust gates.

@@ -68,7 +68,7 @@ jobs:
       # stellar-ledger pulls hidapi, which links libudev on Linux for HID device
       # enumeration. The runner ships pkg-config but not the libudev headers.
       - name: Install libudev (Linux hidapi)
-        run: sudo apt-get update && sudo apt-get install -y libudev-dev pkg-config
+        run: sudo apt-get -o Acquire::Retries=3 update && sudo apt-get -o Acquire::Retries=3 install -y libudev-dev pkg-config
       # The WebAuthn suite launches a headless Chromium for the CDP
       # virtual-authenticator ceremony (with --no-sandbox, so no userns
       # provisioning is needed on the runner). Explicit major-version tag (not
@@ -93,7 +93,7 @@ jobs:
       # daemon and every `cargo test` / `stellar-agent` child process it
       # spawns land on the same bus scope.
       - name: Install gnome-keyring (Linux Secret Service for the CLI v1-policy suite)
-        run: sudo apt-get install -y gnome-keyring dbus
+        run: sudo apt-get -o Acquire::Retries=3 install -y gnome-keyring dbus
       # The MPP and SEP-43 released-SDK interop suites assert the frozen Node
       # version they were validated against; the runner image's default Node
       # drifts, so the workflow pins it explicitly.
@@ -143,7 +143,7 @@ jobs:
       # stellar-ledger pulls hidapi, which links libudev on Linux for HID device
       # enumeration. The runner ships pkg-config but not the libudev headers.
       - name: Install libudev (Linux hidapi)
-        run: sudo apt-get update && sudo apt-get install -y libudev-dev pkg-config
+        run: sudo apt-get -o Acquire::Retries=3 update && sudo apt-get -o Acquire::Retries=3 install -y libudev-dev pkg-config
       # The WebAuthn suite launches a headless Chromium for the CDP
       # virtual-authenticator ceremony (with --no-sandbox, so no userns
       # provisioning is needed on the runner). Explicit major-version tag (not
@@ -168,7 +168,7 @@ jobs:
       # daemon and every `cargo test` / `stellar-agent` child process it
       # spawns land on the same bus scope.
       - name: Install gnome-keyring (Linux Secret Service for the CLI v1-policy suite)
-        run: sudo apt-get install -y gnome-keyring dbus
+        run: sudo apt-get -o Acquire::Retries=3 install -y gnome-keyring dbus
       # The MPP and SEP-43 released-SDK interop suites assert the frozen Node
       # version they were validated against; the runner image's default Node
       # drifts, so the workflow pins it explicitly.

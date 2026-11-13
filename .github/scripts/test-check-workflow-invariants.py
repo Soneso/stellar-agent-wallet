@@ -35,6 +35,10 @@ WELCOME = ".github/workflows/welcome.yml"
 COVERAGE = ".github/workflows/coverage.yml"
 REHEARSAL = ".github/workflows/release-rehearsal.yml"
 CI = ".github/workflows/ci.yml"
+SKILL_ARCHIVE_CONDITION = "github.base_ref != 'mainnet-write' && github.ref != 'refs/heads/mainnet-write'"
+SKILL_ARCHIVE_IF = f"        if: {SKILL_ARCHIVE_CONDITION}\n"
+SKILL_ARCHIVE_RUN = "        run: .github/scripts/package-skill.sh --check\n"
+SKILL_ARCHIVE_STEP = "      - name: Check the skill archive\n" + SKILL_ARCHIVE_IF + SKILL_ARCHIVE_RUN
 BUILD_SCRIPT = ".github/scripts/release/build.sh"
 HOST_SCRIPT = ".github/scripts/release/check-host.sh"
 ACTION = ".github/actions/macos-sign-notarize/action.yml"
@@ -447,6 +451,8 @@ VARS_LOCATIONS = (
 # label, [(file, old, new, expected occurrences)];
 # the edited copy must pass.
 PASSING = [
+    ("wrapped skill archive condition passes", [
+        (CI, SKILL_ARCHIVE_IF, f"        if: ${{{{ {SKILL_ARCHIVE_CONDITION} }}}}\n", 1)]),
     ("publication call inputs in another order pass", [
         (PUBLISH, PUBLICATION_WITH, "      publication: true\n      source_sha: ${{ needs.verify.outputs.sha }}\n", 1)]),
     ("wrapped tag cache guard passes", [
@@ -486,6 +492,22 @@ PASSING = [
 # replaces only the first occurrence. A case that expects several lines gives
 # tuples of rules and fragments of the same length, in output order.
 CASES = [
+    ("skill archive step removed", "skill-archive", "expected exactly one skill archive step", [
+        (CI, SKILL_ARCHIVE_STEP, "", 1)], 1),
+    ("skill archive skipped for main pull requests", "skill-archive", "skill archive condition differs", [
+        (CI, SKILL_ARCHIVE_IF, SKILL_ARCHIVE_IF.replace("'mainnet-write'", "'main'"), 1)], 1),
+    ("skill archive skipped for main pushes", "skill-archive", "skill archive condition differs", [
+        (CI, SKILL_ARCHIVE_IF, SKILL_ARCHIVE_IF.replace("refs/heads/mainnet-write", "refs/heads/main"), 1)], 1),
+    ("skill archive always skipped", "skill-archive", "skill archive condition differs", [
+        (CI, SKILL_ARCHIVE_IF, "        if: false\n", 1)], 1),
+    ("skill archive without integration exception", "skill-archive", "skill archive condition differs", [
+        (CI, SKILL_ARCHIVE_IF, "", 1)], 1),
+    ("skill archive command removed", "skill-archive", "skill archive command differs", [
+        (CI, SKILL_ARCHIVE_RUN, "        run: true\n", 1)], 1),
+    ("skill archive continues on error", "skill-archive", "skill archive check can be bypassed", [
+        (CI, SKILL_ARCHIVE_IF, SKILL_ARCHIVE_IF + "        continue-on-error: true\n", 1)], 1),
+    ("skill archive job skipped", "skill-archive", "skill archive check can be bypassed", [
+        (CI, "  release-contracts:\n", "  release-contracts:\n    if: false\n", 1)], 1),
     ("crate publish without Wasm dependency", "publish-wasm-gate", "publish must need verify and vendored-wasm", [
         (PUBLISH, "needs: [verify, vendored-wasm]", "needs: verify", 1)]),
     ("crate Wasm call uses another workflow", "publish-wasm-gate", "must call the local workflow", [
@@ -1491,6 +1513,10 @@ CASES = [
 # replacement, and the CASES or PASSING labels that must fail against the
 # mutated copy and pass against the restored one.
 MUTATIONS = {
+    "skill-archive-check": (
+        '        self.check_skill_archive()\n', '',
+        ['skill archive step removed', 'skill archive skipped for main pull requests',
+         'skill archive skipped for main pushes', 'skill archive command removed']),
     "publish-wasm-call-check": (
         '        self.check_publish_wasm_gate()\n', '',
         ['crate publish without Wasm dependency']),

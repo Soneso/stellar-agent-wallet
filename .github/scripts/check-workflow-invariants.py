@@ -205,6 +205,9 @@ runs the function.
   ``continue-on-error``, or it does not run each of its commands
   unconditionally; or ``check-host.sh`` does not run each command of
   ``HOST_CHECKS`` unconditionally.
+- ``skill-archive``: ``release-contracts`` can be bypassed, or its skill
+  archive step is missing, duplicated, allowed to fail, uses another command,
+  or has a condition that differs from ``SKILL_ARCHIVE_CONDITION``.
 """
 
 import fnmatch
@@ -443,6 +446,7 @@ VERIFY_JOBS = (("release.yml", "verify-packaged"), ("release.yml", "verify-prove
                ("publish.yml", "verify"), ("publish.yml", "verify-install"),
                ("release-rehearsal.yml", "verify-packaged"), ("release-rehearsal.yml", "verify-crates"))
 TOKEN_ENV = {"GH_TOKEN", "GITHUB_TOKEN"}
+SKILL_ARCHIVE_CONDITION = "github.base_ref != 'mainnet-write' && github.ref != 'refs/heads/mainnet-write'"
 # The feature jobs of ci.yml and the commands that define each of them. The
 # off jobs pass --no-default-features, which keeps mainnet-write off; the
 # binary packages enable it by default.
@@ -1450,6 +1454,21 @@ class Checker:
             elif position < 0:
                 self.report(str(HOST_SCRIPT), "ci-feature-jobs", f"does not run unconditionally: {command}")
 
+    def check_skill_archive(self):
+        job = self.job("ci.yml", "release-contracts") or {}
+        steps = [step for step in job.get("steps", [])
+                 if step.get("name") == "Check the skill archive"]
+        if len(steps) != 1:
+            self.report("ci.yml", "skill-archive", "expected exactly one skill archive step")
+            return
+        step = steps[0]
+        if self.may_skip(job) or "continue-on-error" in step:
+            self.report("ci.yml", "skill-archive", "skill archive check can be bypassed")
+        if self.unwrap_expression(step.get("if", "")) != SKILL_ARCHIVE_CONDITION:
+            self.report("ci.yml", "skill-archive", "skill archive condition differs from the integration branch exception")
+        if self.run_text(step).strip() != ".github/scripts/package-skill.sh --check":
+            self.report("ci.yml", "skill-archive", "skill archive command differs from package-skill.sh --check")
+
     def check_release_checks(self):
         self.check_shared_build()
         self.check_release_gates()
@@ -1461,6 +1480,7 @@ class Checker:
         self.check_release_publish_sums()
         self.check_release_toolchain()
         self.check_ci_feature_jobs()
+        self.check_skill_archive()
 
     def check_workflow(self, workflow):
         doc = self.load(pathlib.PurePosixPath(".github/workflows") / workflow)
