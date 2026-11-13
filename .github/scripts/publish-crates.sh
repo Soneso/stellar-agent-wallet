@@ -3,7 +3,7 @@
 # order. A member with `publish = false`, such as the smart-account
 # acceptance member, is never published and belongs to no tier.
 #
-# The publishable members form a 7-tier dependency DAG; each tier must be
+# The publishable members form an 8-tier dependency DAG; each tier must be
 # live on the registry before cargo can package the next tier against it.
 # Within a tier, order is free. The script uploads each crate with
 # `cargo publish --no-verify`: the verify job built every crate without
@@ -53,7 +53,8 @@ TIER2="stellar-agent-network stellar-agent-sep45 stellar-agent-toolsets-install"
 TIER3="stellar-agent-anchor stellar-agent-claimable stellar-agent-defi stellar-agent-nonce stellar-agent-pool stellar-agent-sep10 stellar-agent-sep48 stellar-agent-sep53 stellar-agent-sep7 stellar-agent-smart-account stellar-agent-stablecoin stellar-agent-toolsets-runtime"
 TIER4="stellar-agent-approval-ui stellar-agent-defindex stellar-agent-dex stellar-agent-sep43 stellar-agent-webauthn-bridge stellar-agent-x402-identity"
 TIER5="stellar-agent-approval-remote stellar-agent-mpp stellar-agent-x402"
-TIER6="stellar-agent-cli stellar-agent-mcp"
+TIER6="stellar-agent-mcp"
+TIER7="stellar-agent-cli"
 
 CRATES_IO_API="https://crates.io/api/v1/crates"
 USER_AGENT="stellar-agent-wallet (https://github.com/Soneso/stellar-agent-wallet)"
@@ -77,7 +78,7 @@ fi
 # exactly the tier lists above, and no other name may. A publishable crate
 # added to the workspace without a tier assignment, or an unpublished member
 # placed in a tier, fails the run here, before anything is uploaded.
-ALL_TIERED=$(echo "$TIER0 $TIER1 $TIER2 $TIER3 $TIER4 $TIER5 $TIER6" | tr ' ' '\n' | sort)
+ALL_TIERED=$(echo "$TIER0 $TIER1 $TIER2 $TIER3 $TIER4 $TIER5 $TIER6 $TIER7" | tr ' ' '\n' | sort)
 ALL_WORKSPACE=$(printf '%s\n' "$MEMBERS" | awk '{print $1}' | sort)
 if [ "$ALL_TIERED" != "$ALL_WORKSPACE" ]; then
   echo "Tier lists do not match the publishable workspace members:" >&2
@@ -87,7 +88,7 @@ fi
 
 # Read normal and build dependencies, including target-specific tables.
 # Development dependencies do not participate in cargo publish --no-verify.
-if ! python3 - "$TIER0" "$TIER1" "$TIER2" "$TIER3" "$TIER4" "$TIER5" "$TIER6" 3<<<"$METADATA" <<'PYTIERS'
+if ! python3 - "$TIER0" "$TIER1" "$TIER2" "$TIER3" "$TIER4" "$TIER5" "$TIER6" "$TIER7" 3<<<"$METADATA" <<'PYTIERS'
 import json
 import os
 import pathlib
@@ -100,6 +101,10 @@ members = {package["name"]: package for package in metadata["packages"]}
 workspace = tomllib.loads((pathlib.Path(metadata["workspace_root"]) / "Cargo.toml").read_text())
 inherited = workspace["workspace"].get("dependencies", {})
 failed = False
+for name, package in members.items():
+    if package['publish'] != [] and name not in tiers:
+        print(f"Publish tier lists omit {name}", file=sys.stderr)
+        failed = True
 for name, tier in tiers.items():
     manifest = tomllib.loads(pathlib.Path(members[name]["manifest_path"]).read_text())
     for table in [manifest, *manifest.get("target", {}).values()]:
@@ -262,7 +267,7 @@ publish_one() {
 }
 
 tier_index=0
-for tier in "$TIER0" "$TIER1" "$TIER2" "$TIER3" "$TIER4" "$TIER5" "$TIER6"; do
+for tier in "$TIER0" "$TIER1" "$TIER2" "$TIER3" "$TIER4" "$TIER5" "$TIER6" "$TIER7"; do
   echo "=== tier $tier_index start $(date -u '+%H:%M:%S') ==="
   for name in $tier; do
     if ! publish_one "$name"; then

@@ -1305,7 +1305,7 @@ fn second_signal_exits_during_exit_drain() {
 
 /// The source of the binary, whose listeners the Windows tests count.
 #[cfg(windows)]
-const MAIN_SOURCE: &str = include_str!("../../src/main.rs");
+const MAIN_SOURCE: &str = include_str!("../../src/entry.rs");
 
 /// The variable that makes the named listener registrations fail in a binary
 /// built with `test-helpers`.

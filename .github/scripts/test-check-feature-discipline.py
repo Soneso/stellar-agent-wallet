@@ -54,7 +54,7 @@ VARIANTS = {'D1': 8, 'D2': 4, 'D3': 2, 'D7': 3, 'D13': 6}
 # its mainnet-write declaration forwards to them; other declares no feature.
 # The binary members cli and mcp enable mainnet-write by default.
 FIXTURE_DEPENDENCIES = {
-    'core': [], 'network': ['core'], 'cli': ['core', 'network'],
+    'core': [], 'network': ['core'], 'cli': ['core', 'network', 'mcp'],
     'mcp': ['core', 'network', 'sep43', 'x402', 'x402-identity'],
     'sep10': ['core', 'network'], 'sep43': ['core', 'network'],
     'x402': ['core', 'network', 'sep43'], 'x402-identity': ['core', 'network', 'sep10'],
@@ -130,7 +130,7 @@ def workspace(root, mutation=None):
         manifest = f'[package]\nname="stellar-agent-{name}"\nversion="0.0.0"\nedition="2024"\n[features]\n{default}\n' + features
         if name == 'cli':
             manifest += '[[bin]]\nname="stellar-agent"\npath="src/main.rs"\n'
-        manifest += '[dependencies]\n' + ''.join(f'stellar-agent-{dep}={{path="../{dep}"}}\n' for dep in dependencies)
+        manifest += '[dependencies]\n' + ''.join(f'stellar-agent-{dep}={{path="../{dep}",default-features=false}}\n' for dep in dependencies)
         (path / 'Cargo.toml').write_text(manifest)
     if mutation:
         mutation(root)
@@ -382,7 +382,7 @@ def graph_cases(m, tmp, selected=None):
     # turns the feature on in the declaring packages it reaches.
     check('graph-single-cli', None, 'cargo build -p stellar-agent-cli', False, 'on')
     check('graph-single-mcp', None, 'cargo build -p stellar-agent-mcp', False, 'on')
-    check('graph-single-cli-missing', lambda r: replace(r, 'cli/Cargo.toml', ', "stellar-agent-network/mainnet-write"', ''),
+    check('graph-single-cli-missing', lambda r: replace(r, 'cli/Cargo.toml', ', "stellar-agent-mcp/mainnet-write"', ''),
           'cargo build -p stellar-agent-cli', True, 'on')
     check('graph-single-mcp-missing', lambda r: replace(r, 'mcp/Cargo.toml', ', "stellar-agent-x402-identity/mainnet-write"', ''),
           'cargo build -p stellar-agent-mcp', True, 'on')
@@ -391,7 +391,7 @@ def graph_cases(m, tmp, selected=None):
         workspace(root)
         original = m.graph_state
         cli = m.PACKAGES[2]
-        wanted = {cli: m.PACKAGES[:3], m.PACKAGES[3]: tuple(p for p in m.PACKAGES if p != cli)}
+        wanted = {cli: m.PACKAGES, m.PACKAGES[3]: tuple(p for p in m.PACKAGES if p != cli)}
         try:
             for binary, required in wanted.items():
                 command = f'cargo build -p {binary}'
@@ -1040,7 +1040,7 @@ def case_d1_normal_dependency(m, tmp, checker):
     core = m.PACKAGES[0]
     def dep(name, features=()):
         return {'name': name, 'rename': None, 'features': list(features),
-                'uses_default_features': True, 'kind': None, 'target': None}
+                'uses_default_features': name not in m.DEFAULTS, 'kind': None, 'target': None}
     packages = {}
     for name, declaration in m.DECLARATIONS.items():
         deps = [forward.split('/', 1)[0] for forward in declaration]
@@ -1639,7 +1639,7 @@ def case_graph_binary_views(m, tmp, checker):
     assert set(graph['roots']) == set(c.packages), 'graph-binary-views: workspace selection differs'
     cli, mcp = m.PACKAGES[2:4]
     assert views[cli]['stellar-agent-core'] == [True] and views[mcp]['stellar-agent-sep10'] == [True], views
-    assert cli not in views[mcp] and mcp not in views[cli], 'graph-binary-views: roots mix'
+    assert cli not in views[mcp] and mcp in views[cli], 'graph-binary-views: CLI view lacks MCP or MCP view holds CLI'
     original = m.graph_state
     try:
         for package in (cli, mcp):
@@ -1658,11 +1658,12 @@ def case_graph_binary_views(m, tmp, checker):
                     f'graph-binary-views: {package}: {diagnostic}: {c.errors}'
     finally:
         m.graph_state = original
-    command = 'cargo build --workspace --no-default-features --features stellar-agent-mcp/mainnet-write'
+    command = 'cargo build --workspace --no-default-features --features stellar-agent-cli/mainnet-write'
     c = graph_checker(m, root, command, 'on')
     graph = m.graph_state(root, m.INVOCATIONS[0])
-    assert m.binary_views(graph, m.INVOCATIONS[0])[cli]['stellar-agent-core'] == [True], \
-        'graph-binary-views: workspace unification disappears from CLI view'
+    views = m.binary_views(graph, m.INVOCATIONS[0])
+    assert views[mcp] and views[mcp]['stellar-agent-core'] == [True], \
+        'graph-binary-views: workspace unification disappears from MCP view'
     c = graph_checker(m, root, 'cargo build -p stellar-agent-cli --no-default-features')
     row = m.INVOCATIONS[0]
     graph = m.graph_state(root, row)

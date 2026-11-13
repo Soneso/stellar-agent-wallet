@@ -163,6 +163,9 @@ pub mod scval;
 /// Shared timestamp formatting helpers (ISO-8601 UTC, epoch decomposition).
 pub mod timefmt;
 
+/// Test-only process initialization trace; inert in production builds.
+pub mod test_trace;
+
 /// `serde(with = ...)` boundary encoders for stroop-denominated struct
 /// fields: keeps a struct's internal numeric type, encodes it as a decimal
 /// string on the wire, and tolerates a legacy JSON number on deserialize.

@@ -227,7 +227,7 @@ fn shutdown_documentation_names_events_limits_and_queued_recovery() {
         );
     }
 
-    let main = read("src/main.rs");
+    let main = read("src/entry.rs");
     let step_seven: String = main
         .lines()
         .skip_while(|line| !line.contains("7. Drain the audit outboxes"))

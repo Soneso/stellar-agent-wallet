@@ -61,6 +61,24 @@ cd "$ROOT"
 
 check_case "the tiers match the workspace" pass "$SCRIPT" "$MATCH"
 
+label="the CLI must follow MCP"
+# shellcheck disable=SC2016 # sed matches the literal shell variable in the script.
+if mutate "$label" cli-with-mcp 's/^TIER6="stellar-agent-mcp"/TIER6="stellar-agent-mcp stellar-agent-cli"/; s/^TIER7="stellar-agent-cli"/TIER7=""/; /^ALL_TIERED=/s/ \$TIER7//'; then
+  check_case "$label" refuse "$TMP/cli-with-mcp.sh" "stellar-agent-cli depends on stellar-agent-mcp"
+fi
+
+label="tier seven participates in completeness"
+# shellcheck disable=SC2016 # sed matches the literal shell variable in the script.
+if mutate "$label" missing-completeness '/^ALL_TIERED=/s/ \$TIER7//'; then
+  check_case "$label" refuse "$TMP/missing-completeness.sh" "$MISMATCH"
+fi
+
+label="tier seven participates in dependency ordering"
+# shellcheck disable=SC2016 # sed matches the literal shell variable in the script.
+if mutate "$label" missing-dependencies '/^if ! python3 - /s/ "\$TIER7"//'; then
+  check_case "$label" refuse "$TMP/missing-dependencies.sh" "Publish tier lists omit stellar-agent-cli"
+fi
+
 label="a member missing from the tiers"
 if mutate "$label" missing 's/ stellar-agent-mpp//'; then
   check_case "$label" refuse "$TMP/missing.sh" "$MISMATCH"
@@ -100,7 +118,7 @@ label="every unpublished member in a tier"
 UNPUBLISHED_ALL=$(python3 -c "import json,sys; print(' '.join(p['name'] for p in json.load(open(sys.argv[1]))['packages'] if p['publish'] == []))" "$TMP/metadata.json")
 if ! grep -qw -- "$UNPUBLISHED" <<<"$UNPUBLISHED_ALL"; then
   fail "$label" "the stub metadata lacks $UNPUBLISHED"
-elif mutate "$label" tiered-unpublished "s/^TIER6=\"/TIER6=\"$UNPUBLISHED_ALL /"; then
+elif mutate "$label" tiered-unpublished "s/^TIER7=\"/TIER7=\"$UNPUBLISHED_ALL /"; then
   check_case "$label" refuse "$TMP/tiered-unpublished.sh" "$MISMATCH" stub
 fi
 
