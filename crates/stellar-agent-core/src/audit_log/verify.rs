@@ -3091,6 +3091,10 @@ mod tests {
                 from_state: Some("authorized".to_owned()),
                 step: "sending".to_owned(),
                 commit_id: "0b".repeat(16),
+                evidence_digest: None,
+                primary_ledger: None,
+                witness_ledger: None,
+                release_code: None,
             },
             EventKind::OperationEvidence {
                 operation_id: "0a".repeat(16),

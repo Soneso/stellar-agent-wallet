@@ -60,9 +60,13 @@ use stellar_agent_core::profile::schema::Profile;
 
 use super::WindowStoreError;
 use super::ledger::{
-    AuthorizationState, MintAuthority, MintOptions, MintRequest, MintedRecord, WireAuthorization,
+    AuthorizationState, DomainBinding, MintAuthority, MintOptions, MintRequest, MintedRecord,
+    WireAuthorization,
 };
-use super::store::{PersistedWindowStore, WireFile, generation_entry_ref, now_ms, prune_stale};
+use super::recovery::{CheckedRecoveryDecision, DecidedTransition};
+use super::store::{
+    ChainTransition, PersistedWindowStore, WireFile, generation_entry_ref, now_ms, prune_stale,
+};
 use crate::mainnet::MainnetPrecondition;
 use crate::mainnet::types::{AuthorizationId, hex32};
 
@@ -930,29 +934,30 @@ pub enum EvidenceAnswer {
     },
     /// An account read.
     Account {
-        /// The account's sequence.
-        sequence: i64,
-        /// The endpoint's latest ledger.
-        latest_ledger: u32,
+        /// The account's sequence, when reported.
+        sequence: Option<i64>,
+        /// The endpoint's latest ledger, when reported.
+        latest_ledger: Option<u32>,
     },
-    /// A transaction outcome read.
+    /// A transaction outcome read. Every field the endpoint omits stays
+    /// absent; none takes a zero or empty substitute.
     Outcome {
-        /// The endpoint's status text.
-        status: String,
+        /// The endpoint's status text, when reported.
+        status: Option<String>,
         /// The including ledger, when reported.
         ledger: Option<u32>,
-        /// The inclusion time in Unix seconds, when reported.
+        /// The inclusion time in Unix seconds, when reported and valid.
         created_at: Option<u64>,
-        /// The endpoint's transaction hash text.
-        tx_hash: String,
+        /// The endpoint's transaction hash text, when reported.
+        tx_hash: Option<String>,
         /// The digest of the reported envelope XDR, when reported.
         envelope_xdr: Option<[u8; 32]>,
         /// The digest of the reported result XDR, when reported.
         result_xdr: Option<[u8; 32]>,
-        /// The endpoint's latest ledger.
-        latest_ledger: u32,
-        /// The endpoint's oldest retained ledger.
-        oldest_ledger: u32,
+        /// The endpoint's latest ledger, when reported.
+        latest_ledger: Option<u32>,
+        /// The endpoint's oldest retained ledger, when reported.
+        oldest_ledger: Option<u32>,
     },
 }
 
@@ -965,16 +970,20 @@ pub(super) enum WireEvidenceAnswer {
         latest_ledger: u32,
     },
     Account {
-        sequence: i64,
-        latest_ledger: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sequence: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        latest_ledger: Option<u32>,
     },
     Outcome {
-        status: BoundedText,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        status: Option<BoundedText>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         ledger: Option<u32>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         created_at: Option<u64>,
-        tx_hash: BoundedText,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tx_hash: Option<BoundedText>,
         #[serde(
             default,
             skip_serializing_if = "Option::is_none",
@@ -987,8 +996,10 @@ pub(super) enum WireEvidenceAnswer {
             with = "super::ledger::opt_hex32"
         )]
         result_xdr: Option<[u8; 32]>,
-        latest_ledger: u32,
-        oldest_ledger: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        latest_ledger: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        oldest_ledger: Option<u32>,
     },
 }
 
@@ -1021,10 +1032,14 @@ impl WireEvidenceAnswer {
                 latest_ledger,
                 oldest_ledger,
             } => Self::Outcome {
-                status: BoundedText::bound(status, ENDPOINT_TEXT_MAX),
+                status: status
+                    .as_deref()
+                    .map(|text| BoundedText::bound(text, ENDPOINT_TEXT_MAX)),
                 ledger: *ledger,
                 created_at: *created_at,
-                tx_hash: BoundedText::bound(tx_hash, ENDPOINT_TEXT_MAX),
+                tx_hash: tx_hash
+                    .as_deref()
+                    .map(|text| BoundedText::bound(text, ENDPOINT_TEXT_MAX)),
                 envelope_xdr: *envelope_xdr,
                 result_xdr: *result_xdr,
                 latest_ledger: *latest_ledger,
@@ -1045,7 +1060,10 @@ impl WireEvidenceAnswer {
         match self {
             Self::Outcome {
                 status, tx_hash, ..
-            } => status.fits(ENDPOINT_TEXT_MAX) && tx_hash.fits(ENDPOINT_TEXT_MAX),
+            } => [status, tx_hash].into_iter().all(|text| {
+                text.as_ref()
+                    .is_none_or(|text| text.fits(ENDPOINT_TEXT_MAX))
+            }),
             Self::Ledger { .. } | Self::Account { .. } => true,
         }
     }
@@ -1194,6 +1212,23 @@ impl WireRecovery {
     }
 }
 
+/// The committed identity of an attempt's recovery decision: its commit,
+/// its evidence digest, both deciding ledgers, a failure's charged fee and
+/// the projection marker a successor needs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct WireDecision {
+    pub(super) commit_id: CommitId,
+    #[serde(with = "hex32")]
+    pub(super) evidence_digest: [u8; 32],
+    pub(super) primary_ledger: u32,
+    pub(super) witness_ledger: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) fee_charged: Option<i64>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub(super) projected: bool,
+}
+
 /// One attempt of an operation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1220,6 +1255,8 @@ pub(super) struct WireAttempt {
     pub(super) evidence: Vec<WireEvidenceRow>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) recovery: Option<WireRecovery>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) decision: Option<WireDecision>,
 }
 
 /// An operation's result.
@@ -1540,6 +1577,37 @@ pub(super) fn remove_authorizations(
 /// it and its record from pruning and compaction.
 pub(super) fn unreleased_link(auth: &WireAuthorization) -> bool {
     auth.operation.is_some() && auth.native_release.is_none()
+}
+
+/// Whether `row` releases its reservation at `observation`. `Always`
+/// releases without an observation; `Ledger(b)` releases once `b` is at or
+/// below the observed ledger, and `CloseTime(b)` once `b` is at or below the
+/// observed close-time floor. Without an observation a bounded row holds.
+pub(super) fn row_releases(row: &ReleaseRow, observation: Option<&WindowObservation>) -> bool {
+    match row.bound {
+        ReleaseBound::Always => true,
+        ReleaseBound::Ledger(bound) => observation.is_some_and(|seen| bound <= seen.ledger),
+        ReleaseBound::CloseTime(bound) => {
+            observation.is_some_and(|seen| bound <= seen.close_time_floor_ms)
+        }
+    }
+}
+
+/// The native stroops `wire` still reserves at `observation`. Each
+/// authorization's amounts count once, whatever its buckets and epochs. A
+/// reservation without a release row counts, a `used` disposition alone
+/// releases nothing, and a row releases only as [`row_releases`] states.
+pub(super) fn native_reserved(wire: &WireFile, observation: Option<&WindowObservation>) -> i128 {
+    wire.authorizations
+        .iter()
+        .filter_map(|auth| {
+            let amounts = auth.native_reservation?;
+            let released = auth
+                .native_release
+                .is_some_and(|row| row_releases(&row, observation));
+            (!released).then(|| amounts.total_stroops())
+        })
+        .sum()
 }
 
 /// Releases an unused authorization: it becomes invalidated with disposition
@@ -2224,6 +2292,26 @@ fn validate_record(record: &WireOperation, chain: Option<Caip2>) -> Result<(), W
             || attempt.recovery.as_ref().is_some_and(|r| !r.fits())
         {
             return bad("holds an attempt outside its bounds");
+        }
+        if let Some(decision) = &attempt.decision {
+            let proved = match attempt.outcome {
+                Some(OperationState::Succeeded) => {
+                    attempt.agreed_outcome.is_some() && decision.fee_charged.is_none()
+                }
+                Some(OperationState::Failed) => {
+                    attempt.agreed_outcome.is_some()
+                        && decision.fee_charged.is_some_and(|fee| fee >= 0)
+                }
+                Some(OperationState::NotIncluded) => {
+                    attempt.not_included.is_some()
+                        && attempt.sequence_released.is_some()
+                        && decision.fee_charged.is_none()
+                }
+                _ => false,
+            };
+            if !proved || !record.commit_ids.contains(&decision.commit_id) {
+                return bad("holds a recovery decision without its committed proof");
+            }
         }
         if attempt.evidence.len() > MAX_EVIDENCE_ROWS
             || attempt.evidence.iter().any(|row| {
@@ -3095,7 +3183,23 @@ impl Session<'_> {
                     "a successor attempt needs its predecessor's non-inclusion evidence",
                 ));
             }
+            // Only a checked non-inclusion permits a successor, and only
+            // after the caller projected its decision onto the receipt.
+            if record
+                .current_attempt()
+                .and_then(|attempt| attempt.decision.as_ref())
+                .is_none_or(|decision| !decision.projected)
+            {
+                return Err(WindowStoreError::RetryRefused);
+            }
         }
+        let permission = successor
+            .then(|| {
+                record
+                    .current_attempt()
+                    .and_then(|attempt| attempt.decision.clone())
+            })
+            .flatten();
         let next = u32::try_from(record.attempts.len() + 1)
             .map_err(|_| unexpected("an attempt index exceeds its range"))?;
         let link = OperationLink {
@@ -3106,38 +3210,37 @@ impl Session<'_> {
         let now = self.now;
         let mut minted = None;
         let auth_id = match &request.authorization {
-            AttemptAuthorization::Linked => self
-                .wire
-                .authorizations
-                .iter()
-                .find(|auth| {
-                    auth.operation == Some(link)
-                        && auth.state == AuthorizationState::Open
-                        && super::ledger::effective(auth, now)
-                })
-                .map(|auth| auth.id)
-                .ok_or_else(|| {
-                    unexpected("the operation has no open authorization for its next attempt")
-                })?,
+            AttemptAuthorization::Linked => {
+                let linked = self
+                    .wire
+                    .authorizations
+                    .iter()
+                    .find(|auth| {
+                        auth.operation == Some(link)
+                            && auth.state == AuthorizationState::Open
+                            && super::ledger::effective(auth, now)
+                    })
+                    .ok_or_else(|| {
+                        unexpected("the operation has no open authorization for its next attempt")
+                    })?;
+                if successor {
+                    same_policy_as_predecessor(
+                        &self.wire,
+                        previous_auth,
+                        linked.policy_digest,
+                        linked.policy_sequence,
+                    )?;
+                }
+                linked.id
+            }
             AttemptAuthorization::Mint(mint) => {
                 if successor {
-                    let previous = previous_auth
-                        .and_then(|previous| {
-                            self.wire
-                                .authorizations
-                                .iter()
-                                .find(|auth| auth.id == previous)
-                        })
-                        .ok_or_else(|| {
-                            unexpected("a successor attempt's predecessor authorization is gone")
-                        })?;
-                    if previous.policy_digest != mint.policy_digest
-                        || previous.policy_sequence != mint.policy_sequence
-                    {
-                        return Err(unexpected(
-                            "a successor attempt names another policy than its predecessor",
-                        ));
-                    }
+                    same_policy_as_predecessor(
+                        &self.wire,
+                        previous_auth,
+                        mint.policy_digest,
+                        mint.policy_sequence,
+                    )?;
                 }
                 let linked_open: Vec<AuthorizationId> = self
                     .wire
@@ -3252,11 +3355,23 @@ impl Session<'_> {
             agreed_outcome: None,
             evidence: Vec::new(),
             recovery: None,
+            decision: None,
         });
         let before = record.state;
         record.step(S::Sending, now, None, commit)?;
         self.audit
             .transition(&record, Some(next), Some(before), S::Sending.wire_name());
+        // The `not_included -> sending` row is the retry permission: it names
+        // the checked decision that permits the successor.
+        if let Some(decision) = permission
+            && let Some(entry) = self.audit.entries.pop()
+        {
+            self.audit.entries.push(entry.with_recovery_decision(
+                stellar_agent_core::hex::encode(&decision.evidence_digest),
+                (decision.primary_ledger, decision.witness_ledger),
+                None,
+            ));
+        }
         section_mut(&mut self.wire).records[index] = record;
         self.changed = true;
         Ok(AttemptStarted {
@@ -3383,8 +3498,17 @@ impl Session<'_> {
                 to.wire_name()
             )));
         }
-        if to == S::NotIncluded && evidence.not_included.is_none() {
-            return Err(unexpected("a non-inclusion transition needs its evidence"));
+        // A non-inclusion permits a successor attempt, so only a checked,
+        // committed recovery decision records one.
+        if to == S::NotIncluded || evidence.not_included.is_some() {
+            return Err(unexpected(
+                "a non-inclusion commits only through a checked recovery decision",
+            ));
+        }
+        if evidence.agreed_outcome.is_some() {
+            return Err(unexpected(
+                "an agreed outcome commits only through a checked recovery decision",
+            ));
         }
         let clear = if to == S::Cancelled {
             Some(clear_release(&self.wire, &record, evidence.clear, commit)?)
@@ -3404,12 +3528,6 @@ impl Session<'_> {
         {
             let attempt = record.attempt_mut(index)?;
             attempt.outcome = Some(to);
-            if let Some(proof) = evidence.not_included {
-                attempt.not_included = Some(proof);
-            }
-            if let Some(outcome) = &evidence.agreed_outcome {
-                attempt.agreed_outcome = Some(WireAgreedOutcome::from_input(outcome));
-            }
             if let Some(update) = &evidence.recovery {
                 attempt.recovery.get_or_insert_default().apply(update)?;
             }
@@ -3546,6 +3664,22 @@ impl Session<'_> {
             attempt.recovery.get_or_insert_default().apply(update)?;
             mutable |= attempt.recovery != before;
         }
+        // Each successfully read transaction answer whose retention starts
+        // after the pre-exposure ledger proves history loss, with or without
+        // the other endpoint's answer.
+        let pre_exposure = attempt.pre_exposure_ledger;
+        let pruned = input.rows.iter().any(|row| {
+            matches!(
+                row.answer,
+                EvidenceAnswer::Outcome { oldest_ledger: Some(oldest), .. }
+                    if pre_exposure.is_none_or(|ledger| oldest > ledger)
+            )
+        });
+        if pruned {
+            let recovery = attempt.recovery.get_or_insert_default();
+            mutable |= !recovery.history_incomplete;
+            recovery.history_incomplete = true;
+        }
         let audited = !added.is_empty() || release.is_some();
         if audited {
             record.evidence_committed_seq = seq;
@@ -3569,6 +3703,345 @@ impl Session<'_> {
         self.changed |= audited || mutable;
         Ok(audited.then_some(commit))
     }
+
+    /// Commits a checked recovery decision with its accounting in this
+    /// generation. A decision the attempt already holds returns that
+    /// commit and writes nothing, so the first proof stands.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one commit binds the state, proof, accounting, release row and audit row"
+    )]
+    fn commit_decision(
+        &mut self,
+        decision: &CheckedRecoveryDecision,
+    ) -> Result<CommitId, WindowStoreError> {
+        use OperationState as S;
+        self.sweep_and_adopt()?;
+        let id = decision.operation_id();
+        let attempt_index = decision.attempt_index();
+        let index = record_index(&self.wire, id)?;
+        let mut record = records(&self.wire)[index].clone();
+        let attempt = record
+            .attempts
+            .iter()
+            .find(|attempt| attempt.index == attempt_index)
+            .ok_or_else(|| invalid("a recovery decision names an unknown attempt"))?;
+        if let Some(existing) = &attempt.decision {
+            return Ok(existing.commit_id);
+        }
+        if self.original.generation != decision.generation() {
+            return Err(invalid("recovery snapshot is stale"));
+        }
+        let Some(ExposureIdentity::Classic {
+            envelope_sha256,
+            tx_hash,
+            ..
+        }) = attempt.exposure.as_ref().map(|exposure| &exposure.identity)
+        else {
+            return Err(invalid("a recovery decision needs a classic exposure"));
+        };
+        let (envelope_sha256, tx_hash) = (*envelope_sha256, *tx_hash);
+        if record.kind.is_x402()
+            || envelope_sha256 != decision.envelope_sha256()
+            || record.state != S::SentOutcomeUnknown
+            || attempt.outcome != Some(S::SentOutcomeUnknown)
+            || record.current_attempt().map(|current| current.index) != Some(attempt_index)
+        {
+            return Err(invalid("recovery snapshot is stale"));
+        }
+        let (to, outcome, chain, fee_charged) = match decision.transition() {
+            DecidedTransition::Succeeded(outcome) => (
+                S::Succeeded,
+                Some(outcome),
+                ChainTransition::Succeeded,
+                None,
+            ),
+            DecidedTransition::Failed {
+                outcome,
+                fee_charged,
+            } => (
+                S::Failed,
+                Some(outcome),
+                ChainTransition::Failed {
+                    fee_charged: *fee_charged,
+                    close_time: outcome.created_at,
+                },
+                Some(*fee_charged),
+            ),
+            DecidedTransition::NotIncluded(_) => {
+                (S::NotIncluded, None, ChainTransition::NotIncluded, None)
+            }
+        };
+        if outcome.is_some_and(|outcome| outcome.envelope_xdr_sha256 != envelope_sha256) {
+            return Err(invalid("an agreed outcome names another envelope"));
+        }
+        if fee_charged.is_some_and(|fee| fee < 0) {
+            return Err(invalid("a failed outcome charges a negative fee"));
+        }
+        if to == S::NotIncluded && attempt.sequence_released.is_none() {
+            return Err(invalid(
+                "a non-inclusion needs the attempt's committed sequence release",
+            ));
+        }
+        check_edge(Some(record.state), to)?;
+        let commit = self.audit.commit;
+        let now = self.now;
+        let (primary_ledger, witness_ledger) = decision.ledgers();
+        let attempt = record.attempt_mut(attempt_index)?;
+        attempt.outcome = Some(to);
+        match decision.transition() {
+            DecidedTransition::Succeeded(outcome) | DecidedTransition::Failed { outcome, .. } => {
+                attempt.agreed_outcome = Some(WireAgreedOutcome::from_input(outcome));
+            }
+            DecidedTransition::NotIncluded(proof) => attempt.not_included = Some(*proof),
+        }
+        let update = RecoveryUpdate {
+            disagreements: 0,
+            ..decision.recovery().clone()
+        };
+        attempt.recovery.get_or_insert_default().apply(&update)?;
+        attempt.decision = Some(WireDecision {
+            commit_id: commit,
+            evidence_digest: decision.evidence_digest(),
+            primary_ledger,
+            witness_ledger,
+            fee_charged,
+            projected: false,
+        });
+        let auth_id = attempt.authorization_id;
+        let result = record.result.get_or_insert_default();
+        result.tx_hash = Some(tx_hash);
+        result.ledger = outcome.map(|outcome| outcome.ledger);
+        record.step(to, now, None, commit)?;
+        self.audit.transition(
+            &record,
+            Some(attempt_index),
+            Some(S::SentOutcomeUnknown),
+            to.wire_name(),
+        );
+        if let Some(entry) = self.audit.entries.pop() {
+            let code = (to == S::NotIncluded)
+                .then_some(stellar_agent_core::profile::receipt::RELEASED_ON_EVIDENCE_CODE);
+            self.audit.entries.push(entry.with_recovery_decision(
+                stellar_agent_core::hex::encode(&decision.evidence_digest()),
+                (primary_ledger, witness_ledger),
+                code,
+            ));
+        }
+        section_mut(&mut self.wire).records[index] = record;
+        super::store::apply_chain_accounting(
+            &mut self.wire,
+            &stellar_agent_core::hex::encode(&envelope_sha256),
+            chain,
+            decision.evidence_digest(),
+        )?;
+        let row = match outcome {
+            Some(outcome) => ReleaseRow {
+                class: ReleaseClass::Settled,
+                bound: ReleaseBound::Ledger(outcome.ledger),
+                observed_ledger: Some(primary_ledger.max(witness_ledger)),
+                commit_id: commit,
+            },
+            None => ReleaseRow::always(ReleaseClass::ProvedUnspent, commit),
+        };
+        // A consumed authorization's holds are already bucket records,
+        // which the chain accounting above settles. A still-held one keeps
+        // its holds, which its own lifetime bounds.
+        if let Some(auth) = self
+            .wire
+            .authorizations
+            .iter_mut()
+            .find(|auth| auth.id == auth_id)
+            && auth.native_release.is_none()
+        {
+            auth.native_release = Some(row);
+        }
+        if to.is_terminal() {
+            release_linked_unused(&mut self.wire, id, now, commit);
+        }
+        self.changed = true;
+        Ok(commit)
+    }
+
+    /// Commits the release of one obligation the verified window holds at
+    /// `observation`, with its proof, in one generation. A live x402 record
+    /// also becomes `Expired` with its transition audit row; a terminal
+    /// record keeps its state.
+    fn release_obligation(
+        &mut self,
+        operation_id: OperationId,
+        attempt_index: u32,
+        observation: WindowObservation,
+        acknowledged_clear: bool,
+    ) -> Result<CommitId, WindowStoreError> {
+        use OperationState as S;
+        self.sweep_and_adopt()?;
+        let index = record_index(&self.wire, operation_id)?;
+        let mut record = records(&self.wire)[index].clone();
+        let attempt = record
+            .attempts
+            .iter()
+            .find(|attempt| attempt.index == attempt_index)
+            .ok_or_else(|| invalid("a release obligation names an unknown attempt"))?;
+        let obligation = obligation_of(&self.wire, &record, attempt, Some(&observation))
+            .ok_or_else(|| invalid("the attempt owes no release its proof allows"))?;
+        let auth_id = attempt.authorization_id;
+        let commit = self.audit.commit;
+        let bound = match obligation.kind {
+            ObligationKind::X402Expired {
+                signature_expiration_ledger,
+            } => ReleaseBound::Ledger(signature_expiration_ledger),
+            ObligationKind::TerminalTimed { release_after_ms } => {
+                ReleaseBound::CloseTime(release_after_ms)
+            }
+            ObligationKind::TerminalUntimed if acknowledged_clear => ReleaseBound::Always,
+            ObligationKind::TerminalUntimed => {
+                return Err(invalid(
+                    "an untimed release needs the operator's acknowledged clear",
+                ));
+            }
+        };
+        if matches!(obligation.kind, ObligationKind::X402Expired { .. })
+            && !record.state.is_terminal()
+        {
+            let from = record.state;
+            check_edge(Some(from), S::Expired)?;
+            if record.current_attempt().map(|current| current.index) == Some(attempt_index) {
+                record.attempt_mut(attempt_index)?.outcome = Some(S::Expired);
+            }
+            record.step(S::Expired, self.now, None, commit)?;
+            self.audit.transition(
+                &record,
+                Some(attempt_index),
+                Some(from),
+                S::Expired.wire_name(),
+            );
+            section_mut(&mut self.wire).records[index] = record;
+        }
+        let auth = self
+            .wire
+            .authorizations
+            .iter_mut()
+            .find(|auth| auth.id == auth_id)
+            .ok_or_else(|| unexpected("an exposed attempt's authorization is gone"))?;
+        auth.native_release = Some(ReleaseRow {
+            class: ReleaseClass::Unknown,
+            bound,
+            observed_ledger: Some(observation.ledger),
+            commit_id: commit,
+        });
+        store_observation(&mut self.wire, observation);
+        self.changed = true;
+        Ok(commit)
+    }
+}
+
+/// Refuses a successor attempt whose authorization names another policy
+/// digest or sequence than the predecessor attempt's authorization.
+fn same_policy_as_predecessor(
+    wire: &WireFile,
+    previous_auth: Option<AuthorizationId>,
+    policy_digest: [u8; 32],
+    policy_sequence: i64,
+) -> Result<(), WindowStoreError> {
+    let previous = previous_auth
+        .and_then(|previous| wire.authorizations.iter().find(|auth| auth.id == previous))
+        .ok_or_else(|| unexpected("a successor attempt's predecessor authorization is gone"))?;
+    if previous.policy_digest != policy_digest || previous.policy_sequence != policy_sequence {
+        return Err(unexpected(
+            "a successor attempt names another policy than its predecessor",
+        ));
+    }
+    Ok(())
+}
+
+/// What one exposed authorization still owes its native release row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObligationKind {
+    /// Signed x402 entries strictly past their expiration ledger.
+    X402Expired {
+        /// The ledger after which the signatures expire.
+        signature_expiration_ledger: u32,
+    },
+    /// A terminal classic attempt whose `max_time` the close-time floor has
+    /// strictly passed.
+    TerminalTimed {
+        /// The release bound: the attempt's `max_time` in milliseconds.
+        release_after_ms: u64,
+    },
+    /// A terminal untimed classic attempt; its release needs the operator's
+    /// acknowledged clear.
+    TerminalUntimed,
+}
+
+/// An exposed authorization of a retained record without a release row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReleaseObligation {
+    /// The owning operation.
+    pub operation_id: OperationId,
+    /// The exposed attempt.
+    pub attempt_index: u32,
+    /// What the obligation needs.
+    pub kind: ObligationKind,
+}
+
+/// The obligation of `attempt` in `record` at `observation`, when the
+/// attempt is exposed, its authorization has no release row, and no checked
+/// decision owns its release. An x402 obligation is due only strictly past
+/// its expiration ledger, a timed classic one only on a terminal record
+/// whose close-time floor is strictly past `max_time`.
+fn obligation_of(
+    wire: &WireFile,
+    record: &WireOperation,
+    attempt: &WireAttempt,
+    observation: Option<&WindowObservation>,
+) -> Option<ReleaseObligation> {
+    let exposure = attempt.exposure.as_ref()?;
+    let unreleased = wire
+        .authorizations
+        .iter()
+        .any(|auth| auth.id == attempt.authorization_id && auth.native_release.is_none());
+    if !unreleased || attempt.decision.is_some() {
+        return None;
+    }
+    let kind = match exposure.identity {
+        ExposureIdentity::X402 {
+            signature_expiration_ledger,
+            ..
+        } => {
+            let ledger = observation?.ledger;
+            (ledger > signature_expiration_ledger).then_some(ObligationKind::X402Expired {
+                signature_expiration_ledger,
+            })?
+        }
+        ExposureIdentity::Classic { max_time, .. } if record.state.is_terminal() => {
+            if max_time == 0 {
+                ObligationKind::TerminalUntimed
+            } else {
+                let release_after_ms = max_time.checked_mul(1000)?;
+                (observation?.close_time_floor_ms > release_after_ms)
+                    .then_some(ObligationKind::TerminalTimed { release_after_ms })?
+            }
+        }
+        ExposureIdentity::Classic { .. } => return None,
+    };
+    Some(ReleaseObligation {
+        operation_id: record.id,
+        attempt_index: attempt.index,
+        kind,
+    })
+}
+
+/// The account a classic attempt's authorization binds: the transaction
+/// binding's source, never a receipt's.
+fn attempt_account(wire: &WireFile, attempt: &WireAttempt) -> Option<String> {
+    wire.authorizations
+        .iter()
+        .find(|auth| auth.id == attempt.authorization_id)
+        .and_then(|auth| match &auth.binding {
+            DomainBinding::Transaction { source, .. } => Some(source.clone()),
+            _ => None,
+        })
 }
 
 /// What a consumption commit exposes beside the consumption: one attempt's
@@ -3776,8 +4249,9 @@ impl<'a> OperationRecorder<'a> {
     /// refuses another envelope, an open attempt and a ninth attempt refuse,
     /// and the edge must exist. A mint retires the
     /// operation's open authorizations and mints in the same commit; a
-    /// successor needs its predecessor's non-inclusion evidence and an
-    /// unchanged policy, and is exempt from the open-authorization cap.
+    /// successor needs its predecessor's checked non-inclusion with its
+    /// projection marker and an unchanged policy, and is exempt from the
+    /// open-authorization cap.
     ///
     /// # Errors
     ///
@@ -3788,6 +4262,8 @@ impl<'a> OperationRecorder<'a> {
     /// - `operation.business_id_conflict` for another envelope under an
     ///   `Envelope` record.
     /// - `operation.attempt_open` and `operation.attempt_limit`.
+    /// - `recovery.retry_refused` for a successor whose predecessor's checked
+    ///   non-inclusion has no projection marker.
     /// - `internal.unexpected_state` for an edge outside the table or an
     ///   exposed authorization a remint would retire.
     /// - The mint's refusals and every store error. Nothing is written on a
@@ -3841,13 +4317,14 @@ impl<'a> OperationRecorder<'a> {
     /// operator's [`ClearForm`] in `evidence.clear` and writes the last
     /// exposed attempt's `unknown` release row in the same commit. A repeated
     /// transition to the current state of the same attempt returns the
-    /// record's last commit and writes nothing.
+    /// record's last commit and writes nothing. A non-inclusion or an agreed
+    /// outcome commits only through [`Self::commit_decision`].
     ///
     /// # Errors
     ///
     /// `internal.unexpected_state` for an edge outside the table or owned by
-    /// another step, a stale attempt index, a non-inclusion without its
-    /// proof, an exposure edge without a committed exposure, or a
+    /// another step, a stale attempt index, a non-inclusion or agreed
+    /// outcome, an exposure edge without a committed exposure, or a
     /// cancellation without the clear form its exposure needs;
     /// `audit.append_failed`; and every store error.
     pub fn transition(
@@ -3882,6 +4359,94 @@ impl<'a> OperationRecorder<'a> {
     ) -> Result<Option<CommitId>, WindowStoreError> {
         self.run(None, |session| {
             session.record_evidence(operation_id, attempt_index, input)
+        })
+    }
+
+    /// Commits a checked recovery decision in one generation. The commit
+    /// holds the state, the agreed outcome or non-inclusion proof, the
+    /// disagreement reset, the bucket disposition and the native release
+    /// row. One transition audit row names the evidence digest and both
+    /// deciding ledgers.
+    ///
+    /// Success keeps its debit; a failure keeps its counts and debits the
+    /// charged fee; a non-inclusion releases every hold under an `Always`
+    /// row of class `proved_unspent`. A still-claimed authorization keeps
+    /// its holds and its state. The ledger admits no invalidation of a
+    /// claimed record, and the authorization's own lifetime bounds those
+    /// holds. A decision the attempt already holds returns its first commit
+    /// and writes nothing.
+    ///
+    /// # Errors
+    ///
+    /// [`WindowStoreError::Invalid`] for a stale snapshot generation,
+    /// another attempt or envelope, a non-inclusion without a committed
+    /// sequence release, or an attempt that left recovery. Its submission
+    /// code is `submission.record_unavailable`. `internal.unexpected_state`
+    /// for an edge outside the table; `audit.append_failed`; and every store
+    /// error. Nothing is written on a refusal.
+    pub fn commit_decision(
+        &mut self,
+        decision: &CheckedRecoveryDecision,
+    ) -> Result<CommitId, WindowStoreError> {
+        self.run(None, |session| session.commit_decision(decision))
+    }
+
+    /// Commits the release row of one obligation in one generation, after
+    /// rechecking it against the verified window at `observation`.
+    ///
+    /// x402 entries strictly past their expiration ledger get an `unknown`
+    /// row bound at that ledger. A live x402 record also becomes `Expired`
+    /// with its transition audit row. A terminal timed classic attempt
+    /// needs a close-time floor strictly past its `max_time` and gets a row
+    /// bound at `max_time` in milliseconds. A terminal untimed one needs
+    /// `acknowledged_clear` and gets an `Always` row. Terminal states stay.
+    ///
+    /// # Errors
+    ///
+    /// [`WindowStoreError::Invalid`] when the window holds no such
+    /// obligation or its proof does not hold; `internal.unexpected_state`
+    /// for an edge outside the table; `audit.append_failed`; and every store
+    /// error. Nothing is written on a refusal.
+    pub fn release_obligation(
+        &mut self,
+        operation_id: OperationId,
+        attempt_index: u32,
+        observation: WindowObservation,
+        acknowledged_clear: bool,
+    ) -> Result<CommitId, WindowStoreError> {
+        self.run(None, |session| {
+            session.release_obligation(operation_id, attempt_index, observation, acknowledged_clear)
+        })
+    }
+
+    /// Writes the projection marker of the decision committed under
+    /// `commit_id` on attempt `attempt_index`, after the caller wrote its
+    /// receipt. A marker already written is kept. Appends no audit row.
+    ///
+    /// # Errors
+    ///
+    /// [`WindowStoreError::Invalid`] unless the attempt holds a decision
+    /// committed under `commit_id`, and every store error.
+    pub fn acknowledge_projection(
+        &mut self,
+        operation_id: OperationId,
+        attempt_index: u32,
+        commit_id: CommitId,
+    ) -> Result<(), WindowStoreError> {
+        self.run(None, |session| {
+            let index = record_index(&session.wire, operation_id)?;
+            let record = &mut section_mut(&mut session.wire).records[index];
+            let decision = record
+                .attempt_mut(attempt_index)?
+                .decision
+                .as_mut()
+                .filter(|decision| decision.commit_id == commit_id)
+                .ok_or_else(|| invalid("the projection names no committed recovery decision"))?;
+            if !decision.projected {
+                decision.projected = true;
+                session.changed = true;
+            }
+            Ok(())
         })
     }
 
@@ -3992,6 +4557,35 @@ pub struct OperationStatus<'a> {
     profile: &'a Profile,
 }
 
+/// A committed recovery decision, read from the verified window.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommittedDecision {
+    /// The owning operation.
+    pub operation_id: OperationId,
+    /// The decided attempt.
+    pub attempt_index: u32,
+    /// The decided state: `Succeeded`, `Failed` or `NotIncluded`.
+    pub state: OperationState,
+    /// The decision's commit identifier.
+    pub commit_id: CommitId,
+    /// The digest of the ordered endpoint answers that decided it.
+    pub evidence_digest: [u8; 32],
+    /// The primary and oracle deciding ledgers.
+    pub ledgers: (u32, u32),
+    /// The exposed signed envelope's hash.
+    pub envelope_sha256: [u8; 32],
+    /// The exposed network transaction hash.
+    pub tx_hash: [u8; 32],
+    /// The agreed including ledger of a success or failure.
+    pub ledger: Option<u32>,
+    /// The fee a failure charged, in stroops.
+    pub fee_charged: Option<i64>,
+    /// The non-inclusion proof.
+    pub not_included: Option<NotIncludedProof>,
+    /// Whether the caller acknowledged the decision's receipt projection.
+    pub projected: bool,
+}
+
 /// An authenticated classic attempt eligible for recovery.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecoveryAttempt {
@@ -4013,6 +4607,13 @@ pub struct RecoveryAttempt {
     pub sequence_released: bool,
     /// Whether the attempt's authorization names a window reservation.
     pub reservation_present: bool,
+    /// The generation of the verified snapshot that holds the attempt.
+    pub generation: u64,
+    /// The account whose sequence the attempt consumes, from its
+    /// authenticated authorization's transaction binding.
+    pub account: Option<String>,
+    /// The committed facts of the attempt's first sequence release.
+    pub sequence_release: Option<SequenceReleaseInput>,
 }
 
 impl<'a> OperationStatus<'a> {
@@ -4040,6 +4641,28 @@ impl<'a> OperationStatus<'a> {
         &self,
         tx_hash: Option<&[u8; 32]>,
     ) -> Result<Vec<RecoveryAttempt>, WindowStoreError> {
+        self.unknown_attempts(tx_hash, false)
+    }
+
+    /// Reads the four oldest exposed classic attempts with unknown
+    /// outcomes for the outcome stage, attempts with a recorded sequence
+    /// release included. A transaction hash selects only its matching
+    /// attempt, released or not.
+    ///
+    /// # Errors
+    /// Returns every integrity, keyring and I/O error of the verified window read.
+    pub fn outcome_snapshot(
+        &self,
+        tx_hash: Option<&[u8; 32]>,
+    ) -> Result<Vec<RecoveryAttempt>, WindowStoreError> {
+        self.unknown_attempts(tx_hash, true)
+    }
+
+    fn unknown_attempts(
+        &self,
+        tx_hash: Option<&[u8; 32]>,
+        released: bool,
+    ) -> Result<Vec<RecoveryAttempt>, WindowStoreError> {
         let Some(wire) = self.read()? else {
             return Ok(Vec::new());
         };
@@ -4059,9 +4682,10 @@ impl<'a> OperationStatus<'a> {
                 else {
                     continue;
                 };
-                // A released attempt never takes a slot again.
+                // A released attempt never takes a sequence slot again; the
+                // outcome stage still selects it.
                 if attempt.outcome != Some(OperationState::SentOutcomeUnknown)
-                    || attempt.sequence_released.is_some()
+                    || (attempt.sequence_released.is_some() && !released)
                     || tx_hash.is_some_and(|hash| hash != stored_hash)
                 {
                     continue;
@@ -4079,6 +4703,15 @@ impl<'a> OperationStatus<'a> {
                     reservation_present: wire.authorizations.iter().any(|auth| {
                         auth.id == attempt.authorization_id && auth.reservation.is_some()
                     }),
+                    generation: wire.generation,
+                    account: attempt_account(&wire, attempt),
+                    sequence_release: attempt.sequence_released.as_ref().map(|released| {
+                        SequenceReleaseInput {
+                            primary_ledger: released.primary_ledger,
+                            witness_ledger: released.witness_ledger,
+                            min_close_time_ms: released.min_close_time_ms,
+                        }
+                    }),
                 });
             }
         }
@@ -4091,6 +4724,90 @@ impl<'a> OperationStatus<'a> {
         });
         attempts.truncate(if tx_hash.is_some() { 1 } else { 4 });
         Ok(attempts)
+    }
+
+    /// Every committed recovery decision of a retained record: terminal
+    /// outcomes and `NotIncluded`, read after the attempt left recovery
+    /// selection. A transaction hash selects only its attempt's decision.
+    ///
+    /// # Errors
+    ///
+    /// Every integrity, keyring and I/O error of the verified window read.
+    pub fn committed_decisions(
+        &self,
+        tx_hash: Option<&[u8; 32]>,
+    ) -> Result<Vec<CommittedDecision>, WindowStoreError> {
+        let Some(wire) = self.read()? else {
+            return Ok(Vec::new());
+        };
+        let mut decisions = Vec::new();
+        for record in records(&wire) {
+            for attempt in &record.attempts {
+                let (Some(decision), Some(state)) = (&attempt.decision, attempt.outcome) else {
+                    continue;
+                };
+                let Some(ExposureIdentity::Classic {
+                    envelope_sha256,
+                    tx_hash: stored_hash,
+                    ..
+                }) = attempt.exposure.as_ref().map(|exposure| &exposure.identity)
+                else {
+                    continue;
+                };
+                if tx_hash.is_some_and(|hash| hash != stored_hash) {
+                    continue;
+                }
+                decisions.push(CommittedDecision {
+                    operation_id: record.id,
+                    attempt_index: attempt.index,
+                    state,
+                    commit_id: decision.commit_id,
+                    evidence_digest: decision.evidence_digest,
+                    ledgers: (decision.primary_ledger, decision.witness_ledger),
+                    envelope_sha256: *envelope_sha256,
+                    tx_hash: *stored_hash,
+                    ledger: attempt
+                        .agreed_outcome
+                        .as_ref()
+                        .map(|outcome| outcome.ledger),
+                    fee_charged: decision.fee_charged,
+                    not_included: attempt.not_included,
+                    projected: decision.projected,
+                });
+            }
+        }
+        Ok(decisions)
+    }
+
+    /// Every release obligation the verified window holds at `observation`,
+    /// or at the stored observation when `None` is passed. Obligations are
+    /// x402 entries strictly past their expiration ledger and terminal
+    /// classic attempts whose exposed authorization has no release row.
+    /// Obligations take no classic recovery slot.
+    ///
+    /// # Errors
+    ///
+    /// Every integrity, keyring and I/O error of the verified window read.
+    pub fn release_obligations(
+        &self,
+        observation: Option<WindowObservation>,
+    ) -> Result<Vec<ReleaseObligation>, WindowStoreError> {
+        let Some(wire) = self.read()? else {
+            return Ok(Vec::new());
+        };
+        let observation = observation.or(wire.last_observation);
+        Ok(records(&wire)
+            .iter()
+            .flat_map(|record| {
+                record
+                    .attempts
+                    .iter()
+                    .filter_map(|attempt| {
+                        obligation_of(&wire, record, attempt, observation.as_ref())
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect())
     }
 
     /// The record or tombstone `business_id` names.
@@ -4208,6 +4925,24 @@ impl<'a> OperationStatus<'a> {
                 .map(OperationView::of_tombstone),
         );
         Ok(views)
+    }
+
+    /// The native stroops the verified window still reserves at
+    /// `observation`, the stored observation when `None` is passed. Each
+    /// authorization counts once; see the release rules of its row.
+    ///
+    /// # Errors
+    ///
+    /// Every integrity, keyring and I/O error of the verified window read.
+    pub fn native_reserved_stroops(
+        &self,
+        observation: Option<WindowObservation>,
+    ) -> Result<i128, WindowStoreError> {
+        let Some(wire) = self.read()? else {
+            return Ok(0);
+        };
+        let observation = observation.or(wire.last_observation);
+        Ok(native_reserved(&wire, observation.as_ref()))
     }
 
     /// The window's admissible floors.
@@ -4701,6 +5436,7 @@ pub(crate) mod tests {
                 holds,
                 parent: None,
                 operation: None,
+                native_reservation: None,
             }
         }
 
@@ -4742,8 +5478,8 @@ pub(crate) mod tests {
         }
 
         /// Runs one attempt of `handle` to `NotIncluded` under a policy
-        /// mint of `tx(n)`: begin, claim, expose, unknown outcome and
-        /// non-inclusion.
+        /// mint of `tx(n)`: begin, claim, expose, unknown outcome and a
+        /// checked, projected non-inclusion.
         fn not_included_attempt(&mut self, handle: &OperationHandle, n: u8) -> u32 {
             let request = self.mint_request(tx(n), self.policy(), vec![]);
             let started = self.begin_mint(handle, &request).unwrap();
@@ -4760,18 +5496,40 @@ pub(crate) mod tests {
                     &TransitionEvidence::default(),
                 )
                 .unwrap();
+            self.checked_non_inclusion(handle, index, n);
+            index
+        }
+
+        /// Records attempt `index`'s sequence release, commits a checked
+        /// non-inclusion of its exposure `classic_exposure(n)`, and writes
+        /// the decision's projection marker.
+        fn checked_non_inclusion(&mut self, handle: &OperationHandle, index: u32, n: u8) {
             self.recorder()
-                .transition(
+                .record_evidence(
                     handle.id(),
-                    Some(index),
-                    OperationState::NotIncluded,
-                    &TransitionEvidence {
-                        not_included: Some(proof()),
-                        ..TransitionEvidence::default()
+                    index,
+                    &EvidenceInput {
+                        sequence_released: Some(SequenceReleaseInput {
+                            primary_ledger: 300,
+                            witness_ledger: 300,
+                            min_close_time_ms: T0,
+                        }),
+                        ..EvidenceInput::default()
                     },
                 )
                 .unwrap();
-            index
+            let attempt = OperationStatus::new(&self.store, &self.profile)
+                .outcome_snapshot(Some(&[n ^ 0x80; 32]))
+                .unwrap()
+                .pop()
+                .unwrap();
+            let commit = self
+                .recorder()
+                .commit_decision(&decide(&attempt, DecidedTransition::NotIncluded(proof())))
+                .unwrap();
+            self.recorder()
+                .acknowledge_projection(handle.id(), index, commit)
+                .unwrap();
         }
     }
 
@@ -4908,14 +5666,14 @@ pub(crate) mod tests {
             endpoint: EvidenceEndpoint::Primary,
             observed_ledger: ledger,
             answer: EvidenceAnswer::Outcome {
-                status: "NOT_FOUND".to_owned(),
+                status: Some("NOT_FOUND".to_owned()),
                 ledger: None,
                 created_at: None,
-                tx_hash: stellar_agent_core::hex::encode(&[n; 32]),
+                tx_hash: Some(stellar_agent_core::hex::encode(&[n; 32])),
                 envelope_xdr: None,
                 result_xdr: None,
-                latest_ledger: ledger,
-                oldest_ledger: 1,
+                latest_ledger: Some(ledger),
+                oldest_ledger: Some(1),
             },
             digest: [n; 32],
         }
@@ -5460,22 +6218,15 @@ pub(crate) mod tests {
         fx.recorder()
             .expose(handle.id(), 1, &classic_exposure(1), None)
             .unwrap();
-        for to in [
-            OperationState::SentOutcomeUnknown,
-            OperationState::NotIncluded,
-        ] {
-            fx.recorder()
-                .transition(
-                    handle.id(),
-                    Some(1),
-                    to,
-                    &TransitionEvidence {
-                        not_included: Some(proof()),
-                        ..TransitionEvidence::default()
-                    },
-                )
-                .unwrap();
-        }
+        fx.recorder()
+            .transition(
+                handle.id(),
+                Some(1),
+                OperationState::SentOutcomeUnknown,
+                &TransitionEvidence::default(),
+            )
+            .unwrap();
+        fx.checked_non_inclusion(&handle, 1, 1);
         for n in 2..=8_u8 {
             fx.not_included_attempt(&handle, n);
         }
@@ -5684,14 +6435,14 @@ pub(crate) mod tests {
             endpoint: EvidenceEndpoint::Witness,
             observed_ledger: u32::MAX,
             answer: WireEvidenceAnswer::Outcome {
-                status: maximal_text(ENDPOINT_TEXT_MAX),
+                status: Some(maximal_text(ENDPOINT_TEXT_MAX)),
                 ledger: Some(u32::MAX),
                 created_at: Some(u64::MAX),
-                tx_hash: maximal_text(ENDPOINT_TEXT_MAX),
+                tx_hash: Some(maximal_text(ENDPOINT_TEXT_MAX)),
                 envelope_xdr: Some([0xff; 32]),
                 result_xdr: Some([0xff; 32]),
-                latest_ledger: u32::MAX,
-                oldest_ledger: u32::MAX,
+                latest_ledger: Some(u32::MAX),
+                oldest_ledger: Some(u32::MAX),
             },
             digest: [0xff; 32],
             commit_id: CommitId::from_bytes([0xff; 16]),
@@ -5749,6 +6500,14 @@ pub(crate) mod tests {
                 last_outcome: Some("r".repeat(RECOVERY_OUTCOME_MAX)),
                 history_incomplete: true,
                 diagnostic: Some(maximal_text(DIAGNOSTIC_MAX)),
+            }),
+            decision: Some(WireDecision {
+                commit_id: CommitId::from_bytes([0xff; 16]),
+                evidence_digest: [0xff; 32],
+                primary_ledger: u32::MAX,
+                witness_ledger: u32::MAX,
+                fee_charged: Some(i64::MIN),
+                projected: true,
             }),
         };
         WireOperation {
@@ -5846,6 +6605,98 @@ pub(crate) mod tests {
         assert_eq!(fx.generation(), before);
     }
 
+    /// Stored outcome and account rows keep their bytes, and a nullable
+    /// answer omits each absent field without a zero or empty substitute.
+    #[test]
+    fn legacy_evidence_bytes_survive_the_additive_answer() {
+        let hash = "ab".repeat(32);
+        let legacy = [
+            format!(
+                r#"{{"outcome":{{"status":{{"text":"NOT_FOUND"}},"tx_hash":{{"text":"{hash}"}},"latest_ledger":50,"oldest_ledger":1}}}}"#
+            ),
+            format!(
+                r#"{{"outcome":{{"status":{{"text":"SUCCESS"}},"ledger":40,"created_at":1700000000,"tx_hash":{{"text":"{hash}"}},"envelope_xdr":"{hash}","result_xdr":"{hash}","latest_ledger":50,"oldest_ledger":1}}}}"#
+            ),
+            r#"{"account":{"sequence":7,"latest_ledger":50}}"#.to_owned(),
+            r#"{"ledger":{"expiry_ledger":9,"close_time":10,"latest_ledger":50}}"#.to_owned(),
+        ];
+        for bytes in &legacy {
+            let answer: WireEvidenceAnswer = serde_json::from_str(bytes).unwrap();
+            assert!(answer.fits(), "{bytes}");
+            assert_eq!(&serde_json::to_string(&answer).unwrap(), bytes);
+        }
+        let absent = WireEvidenceAnswer::from_input(&EvidenceAnswer::Outcome {
+            status: Some("NOT_FOUND".to_owned()),
+            ledger: None,
+            created_at: None,
+            tx_hash: None,
+            envelope_xdr: None,
+            result_xdr: None,
+            latest_ledger: None,
+            oldest_ledger: None,
+        });
+        assert_eq!(
+            serde_json::to_string(&absent).unwrap(),
+            r#"{"outcome":{"status":{"text":"NOT_FOUND"}}}"#
+        );
+        assert_eq!(absent.kind(), 2);
+        let account = WireEvidenceAnswer::from_input(&EvidenceAnswer::Account {
+            sequence: None,
+            latest_ledger: Some(0),
+        });
+        assert_eq!(
+            serde_json::to_string(&account).unwrap(),
+            r#"{"account":{"latest_ledger":0}}"#
+        );
+        assert_eq!(account.kind(), 1);
+        for (answer, endpoint, kind) in [
+            (
+                absent.clone(),
+                EvidenceEndpoint::Primary,
+                EvidenceKind::PrimaryOutcome,
+            ),
+            (
+                absent,
+                EvidenceEndpoint::Witness,
+                EvidenceKind::OracleOutcome,
+            ),
+            (
+                account.clone(),
+                EvidenceEndpoint::Primary,
+                EvidenceKind::PrimaryAccount,
+            ),
+            (
+                account,
+                EvidenceEndpoint::Witness,
+                EvidenceKind::OracleAccount,
+            ),
+        ] {
+            let row = WireEvidenceRow {
+                endpoint,
+                observed_ledger: 50,
+                answer,
+                digest: [1; 32],
+                commit_id: CommitId::from_bytes([2; 16]),
+                evidence_seq: 1,
+            };
+            assert_eq!(row.audit_kind(), kind);
+        }
+        let overlong = WireEvidenceAnswer::Outcome {
+            status: Some(BoundedText {
+                text: "x".repeat(ENDPOINT_TEXT_MAX + 1),
+                truncated: false,
+            }),
+            ledger: None,
+            created_at: None,
+            tx_hash: None,
+            envelope_xdr: None,
+            result_xdr: None,
+            latest_ledger: None,
+            oldest_ledger: None,
+        };
+        assert!(!overlong.fits());
+    }
+
     #[test]
     #[serial]
     fn free_text_bounds_measure_serialized_bytes() {
@@ -5871,8 +6722,8 @@ pub(crate) mod tests {
             status, tx_hash, ..
         } = &mut row.answer
         {
-            *status = escaped(ENDPOINT_TEXT_MAX);
-            *tx_hash = format!("{}a", escaped(ENDPOINT_TEXT_MAX));
+            *status = Some(escaped(ENDPOINT_TEXT_MAX));
+            *tx_hash = Some(format!("{}a", escaped(ENDPOINT_TEXT_MAX)));
         }
         fx.recorder()
             .record_evidence(
@@ -5911,6 +6762,7 @@ pub(crate) mod tests {
         else {
             panic!("expected an outcome answer");
         };
+        let (status, tx_hash) = (status.as_ref().unwrap(), tx_hash.as_ref().unwrap());
         assert!(!status.truncated());
         assert!(tx_hash.truncated());
         assert_eq!(
@@ -6160,23 +7012,23 @@ pub(crate) mod tests {
         fx.recorder()
             .expose(handle.id(), 1, &classic_exposure(1), None)
             .unwrap();
-        for to in [
-            OperationState::SentOutcomeUnknown,
-            OperationState::NotIncluded,
-        ] {
-            fx.recorder()
-                .transition(
-                    handle.id(),
-                    Some(1),
-                    to,
-                    &TransitionEvidence {
-                        not_included: Some(proof()),
-                        ..TransitionEvidence::default()
-                    },
-                )
-                .unwrap();
-        }
+        fx.recorder()
+            .transition(
+                handle.id(),
+                Some(1),
+                OperationState::SentOutcomeUnknown,
+                &TransitionEvidence::default(),
+            )
+            .unwrap();
+        fx.checked_non_inclusion(&handle, 1, 1);
         let claimed = fx.auth(started.authorization_id);
+        // The checked decision writes the `proved_unspent` row; a remint
+        // writes none of its own and keeps this one.
+        let decided = claimed.native_release;
+        assert_eq!(
+            decided.map(|row| (row.class, row.bound)),
+            Some((ReleaseClass::ProvedUnspent, ReleaseBound::Always))
+        );
 
         fx.rewrite(|wire| {
             let auth = wire
@@ -6200,7 +7052,7 @@ pub(crate) mod tests {
         assert_eq!(std::fs::read(fx.store.path()).unwrap(), bytes);
         let exposed = fx.auth(started.authorization_id);
         assert_eq!(exposed.state, AuthorizationState::Open);
-        assert_eq!(exposed.native_release, None);
+        assert_eq!(exposed.native_release, decided);
 
         fx.rewrite(|wire| {
             let auth = wire
@@ -6216,7 +7068,7 @@ pub(crate) mod tests {
         let kept = fx.auth(started.authorization_id);
         assert_eq!(kept.state, AuthorizationState::Claimed);
         assert_eq!(kept.disposition, None);
-        assert_eq!(kept.native_release, None);
+        assert_eq!(kept.native_release, decided);
     }
 
     #[test]
@@ -6645,6 +7497,7 @@ pub(crate) mod tests {
             }),
             disposition: None,
             native_release: None,
+            native_reservation: None,
         }
     }
 
@@ -8010,5 +8863,1543 @@ pub(crate) mod tests {
         let released = fx.auth(minted.id);
         assert_eq!(released.disposition, Some(Disposition::Unused));
         assert!(released.native_release.is_some());
+    }
+
+    // ── Checked recovery decisions ───────────────────────────────────────
+
+    /// The signed envelope text of attempt `n`; its SHA-256 is the
+    /// exposure's envelope digest.
+    pub(crate) fn envelope_text(n: u8) -> String {
+        format!("AAAAENVELOPE{n:02}")
+    }
+
+    /// The window id of attempt `n`'s reservation records.
+    pub(crate) fn envelope_id(n: u8) -> String {
+        stellar_agent_core::hex::encode(&Sha256::digest(envelope_text(n)))
+    }
+
+    /// An unknown classic attempt of `order-{n}` with native amounts 25 and
+    /// fee 100. Its envelope id names a native record of 25 and a `usdc`
+    /// record of 40; it holds a native entry and a committed sequence
+    /// release. Returns the handle and the attempt's outcome-stage snapshot.
+    pub(crate) fn decided_attempt(fx: &mut Fx, n: u8) -> (OperationHandle, RecoveryAttempt) {
+        let handle = fx.open_new(&request(&format!("order-{n}"), canonical(n)));
+        let mut mint = fx.mint_request(tx(n), fx.policy(), vec![hold(5)]);
+        mint.native_reservation = Some(super::super::ledger::NativeReservation {
+            debit_stroops: 25,
+            fee_stroops: 100,
+        });
+        let started = fx.begin_mint(&handle, &mint).unwrap();
+        fx.claim(&mint, started.minted.as_ref().unwrap());
+        let exposure = ExposureIdentity::Classic {
+            envelope_sha256: Sha256::digest(envelope_text(n)).into(),
+            tx_hash: [n ^ 0x80; 32],
+            sequence: 100 + i64::from(n),
+            max_time: T0 / 1_000 + 60,
+            receipt: envelope_id(n),
+        };
+        fx.recorder()
+            .expose(handle.id(), started.attempt_index, &exposure, Some(10))
+            .unwrap();
+        fx.recorder()
+            .transition(
+                handle.id(),
+                Some(started.attempt_index),
+                OperationState::SentOutcomeUnknown,
+                &TransitionEvidence::default(),
+            )
+            .unwrap();
+        let id = envelope_id(n);
+        fx.rewrite(|wire| {
+            let scope = wire.chain_scope;
+            for (bucket, amount) in [("native", 25), ("usdc", 40)] {
+                let key = StateKey::new("ops", 1, bucket, 86_400);
+                super::super::store::find_or_insert_bucket(&mut wire.entries, &key)
+                    .records
+                    .push(super::super::store::WireRecord {
+                        chain_scope: scope,
+                        ts_ms: T0,
+                        amount,
+                        id: id.clone(),
+                        status: super::super::store::RecordStatus::Pending,
+                        tx_hash: stellar_agent_core::hex::encode(&[n ^ 0x80; 32]),
+                        source: SOURCE.to_owned(),
+                        sequence: 100 + i64::from(n),
+                        pending_since_ms: T0,
+                        ..super::super::store::WireRecord::confirmed_defaults()
+                    });
+            }
+        });
+        fx.recorder()
+            .record_evidence(
+                handle.id(),
+                started.attempt_index,
+                &EvidenceInput {
+                    sequence_released: Some(SequenceReleaseInput {
+                        primary_ledger: 90,
+                        witness_ledger: 91,
+                        min_close_time_ms: T0,
+                    }),
+                    ..EvidenceInput::default()
+                },
+            )
+            .unwrap();
+        let attempt = OperationStatus::new(&fx.store, &fx.profile)
+            .outcome_snapshot(Some(&[n ^ 0x80; 32]))
+            .unwrap()
+            .pop()
+            .unwrap();
+        (handle, attempt)
+    }
+
+    /// The outcome both endpoints agree on for attempt `n`.
+    pub(crate) fn agreed(n: u8, status: &str) -> AgreedOutcome {
+        AgreedOutcome {
+            status: status.to_owned(),
+            ledger: 120,
+            created_at: T0 / 1_000 - 30,
+            result_xdr: "AAAB".to_owned(),
+            envelope_xdr_sha256: Sha256::digest(envelope_text(n)).into(),
+        }
+    }
+
+    /// A decision about `attempt` under evidence digest `[0xd1; 32]` and
+    /// deciding ledgers 130 and 131, carrying three disagreements.
+    pub(crate) fn decide(
+        attempt: &RecoveryAttempt,
+        transition: DecidedTransition,
+    ) -> CheckedRecoveryDecision {
+        CheckedRecoveryDecision::new(
+            attempt,
+            [0xd1; 32],
+            (130, 131),
+            transition,
+            RecoveryUpdate {
+                disagreements: 3,
+                last_outcome: Some("concurring".to_owned()),
+                ..attempt.recovery.clone()
+            },
+        )
+        .unwrap()
+    }
+
+    /// The bucket, status, amount and timestamp of each record of
+    /// attempt `n`'s reservation.
+    pub(in crate::policy_state) fn bucket_rows(
+        fx: &Fx,
+        n: u8,
+    ) -> Vec<(String, super::super::store::RecordStatus, i128, u64)> {
+        let id = envelope_id(n);
+        fx.wire()
+            .entries
+            .iter()
+            .flat_map(|bucket| {
+                bucket
+                    .records
+                    .iter()
+                    .filter(|record| record.id == id)
+                    .map(|record| {
+                        (
+                            bucket.bucket.clone(),
+                            record.status,
+                            record.amount,
+                            record.ts_ms,
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    fn transition_rows(fx: &Fx) -> Vec<EventKind> {
+        fx.sink
+            .entries
+            .iter()
+            .filter(|entry| matches!(entry.event_kind, EventKind::OperationTransition { .. }))
+            .map(|entry| entry.event_kind.clone())
+            .collect()
+    }
+
+    pub(crate) fn not_included_proof() -> NotIncludedProof {
+        NotIncludedProof::AccountSequence {
+            primary: EndpointCoverage {
+                first_ledger: 10,
+                last_ledger: 140,
+                latest_ledger: 140,
+                oldest_ledger: 1,
+            },
+            witness: EndpointCoverage {
+                first_ledger: 10,
+                last_ledger: 141,
+                latest_ledger: 141,
+                oldest_ledger: 1,
+            },
+        }
+    }
+
+    /// Counting follows each row's bound. Absent observations keep bounded
+    /// rows, `Always` releases at once, and both equalities release. An
+    /// older observation keeps the row, and the stored observation stands
+    /// in for a caller that passes none.
+    #[test]
+    #[serial]
+    fn recovery_release_counting_boundaries() {
+        let mut fx = Fx::new();
+        let (_handle, attempt) = decided_attempt(&mut fx, 1);
+        let status = OperationStatus::new(&fx.store, &fx.profile);
+        assert_eq!(status.native_reserved_stroops(None).unwrap(), 125);
+        fx.recorder()
+            .commit_decision(&decide(
+                &attempt,
+                DecidedTransition::Succeeded(agreed(1, "SUCCESS")),
+            ))
+            .unwrap();
+        let at = |ledger: u32, close: u64| WindowObservation {
+            ledger,
+            close_time_floor_ms: close,
+            observed_at_ms: T0,
+        };
+        let status = OperationStatus::new(&fx.store, &fx.profile);
+        assert_eq!(status.native_reserved_stroops(None).unwrap(), 125);
+        assert_eq!(
+            status
+                .native_reserved_stroops(Some(at(119, u64::MAX)))
+                .unwrap(),
+            125
+        );
+        assert_eq!(status.native_reserved_stroops(Some(at(120, 0))).unwrap(), 0);
+        fx.recorder().record_observation(at(120, T0)).unwrap();
+        assert_eq!(
+            OperationStatus::new(&fx.store, &fx.profile)
+                .native_reserved_stroops(None)
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            OperationStatus::new(&fx.store, &fx.profile)
+                .native_reserved_stroops(Some(at(119, T0)))
+                .unwrap(),
+            125
+        );
+        fx.rewrite(|wire| {
+            for auth in &mut wire.authorizations {
+                if let Some(row) = &mut auth.native_release {
+                    row.bound = ReleaseBound::CloseTime(T0 + 500);
+                    row.observed_ledger = None;
+                }
+            }
+        });
+        let status = OperationStatus::new(&fx.store, &fx.profile);
+        assert_eq!(
+            status
+                .native_reserved_stroops(Some(at(u32::MAX, T0 + 499)))
+                .unwrap(),
+            125
+        );
+        assert_eq!(
+            status
+                .native_reserved_stroops(Some(at(0, T0 + 500)))
+                .unwrap(),
+            0
+        );
+        fx.rewrite(|wire| {
+            for auth in &mut wire.authorizations {
+                auth.native_release = Some(ReleaseRow::always(
+                    ReleaseClass::ProvedUnspent,
+                    CommitId::from_bytes([9; 16]),
+                ));
+            }
+        });
+        assert_eq!(
+            OperationStatus::new(&fx.store, &fx.profile)
+                .native_reserved_stroops(Some(at(0, 0)))
+                .unwrap(),
+            0
+        );
+    }
+
+    /// A commit that stops before its generation commit point leaves the
+    /// complete old state; its appended row names a commit the record does
+    /// not retain. An append failure persists nothing.
+    #[test]
+    #[serial]
+    fn recovery_transition_before_commit_point_keeps_old_state() {
+        use super::super::store::{COMMIT_FAULT_AFTER_PREPARED, arm_accounting_fault};
+        let mut fx = Fx::new();
+        let (handle, attempt) = decided_attempt(&mut fx, 1);
+        let decision = decide(&attempt, DecidedTransition::Succeeded(agreed(1, "SUCCESS")));
+        let before = fx.wire();
+        fx.sink.fail = true;
+        assert_eq!(
+            code(&fx.recorder().commit_decision(&decision).unwrap_err()),
+            "audit.append_failed"
+        );
+        fx.sink.fail = false;
+        assert_eq!(
+            serde_json::to_vec(&fx.wire()).unwrap(),
+            serde_json::to_vec(&before).unwrap()
+        );
+        let rows_before = fx.sink.entries.len();
+        let armed = arm_accounting_fault(COMMIT_FAULT_AFTER_PREPARED);
+        assert!(fx.recorder().commit_decision(&decision).is_err());
+        drop(armed);
+        assert_eq!(fx.sink.entries.len(), rows_before + 1);
+        let reopened = PersistedWindowStore::at_path(fx.store.path().to_owned());
+        let wire = reopened.read_for_inspection(&fx.profile).unwrap().unwrap();
+        assert_eq!(wire.generation, before.generation);
+        let record = records(&wire).iter().find(|r| r.id == handle.id()).unwrap();
+        assert_eq!(record.state, OperationState::SentOutcomeUnknown);
+        assert!(record.attempts[0].decision.is_none());
+        assert!(record.attempts[0].agreed_outcome.is_none());
+        assert!(
+            wire.authorizations
+                .iter()
+                .all(|auth| auth.native_release.is_none())
+        );
+        assert_eq!(
+            bucket_rows(&fx, 1)
+                .iter()
+                .map(|row| row.1)
+                .collect::<Vec<_>>(),
+            vec![super::super::store::RecordStatus::Pending; 2]
+        );
+        let EventKind::OperationTransition { commit_id, .. } =
+            &fx.sink.entries.last().unwrap().event_kind
+        else {
+            panic!("a transition row");
+        };
+        assert!(!record.commit_ids.iter().any(|id| &id.to_hex() == commit_id));
+        // The same decision commits once the seam is gone.
+        fx.recorder().commit_decision(&decision).unwrap();
+        assert_eq!(fx.record(handle.id()).state, OperationState::Succeeded);
+    }
+
+    /// A commit that stops after its counter moves reopens the complete new
+    /// state: outcome, decision, accounting and release row together.
+    #[test]
+    #[serial]
+    fn recovery_transition_after_commit_point_reopens_new_state() {
+        use super::super::store::{COMMIT_FAULT_AFTER_COUNTER, arm_accounting_fault};
+        let mut fx = Fx::new();
+        let (handle, attempt) = decided_attempt(&mut fx, 1);
+        let decision = decide(
+            &attempt,
+            DecidedTransition::NotIncluded(not_included_proof()),
+        );
+        let before = fx.wire().generation;
+        let armed = arm_accounting_fault(COMMIT_FAULT_AFTER_COUNTER);
+        let _ = fx.recorder().commit_decision(&decision);
+        drop(armed);
+        let reopened = PersistedWindowStore::at_path(fx.store.path().to_owned());
+        let wire = reopened.read_for_inspection(&fx.profile).unwrap().unwrap();
+        assert_eq!(wire.generation, before + 1);
+        let record = records(&wire).iter().find(|r| r.id == handle.id()).unwrap();
+        assert_eq!(record.state, OperationState::NotIncluded);
+        let decided = record.attempts[0].decision.as_ref().unwrap();
+        assert_eq!(record.last_commit_id, Some(decided.commit_id));
+        assert_eq!(record.attempts[0].not_included, Some(not_included_proof()));
+        assert!(bucket_rows(&fx, 1).is_empty());
+        let auth = &wire.authorizations[0];
+        assert_eq!(
+            auth.native_release,
+            Some(ReleaseRow::always(
+                ReleaseClass::ProvedUnspent,
+                decided.commit_id
+            ))
+        );
+    }
+
+    /// A checked non-inclusion of an attempt whose authorization is still
+    /// claimed releases the reservation records and writes the
+    /// `proved_unspent` row. The claimed authorization keeps its state and
+    /// its holds.
+    #[test]
+    #[serial]
+    fn recovery_non_inclusion_keeps_a_claimed_authorizations_holds() {
+        let mut fx = Fx::new();
+        let (handle, attempt) = decided_attempt(&mut fx, 1);
+        let auth_id = fx.record(handle.id()).attempts[0].authorization_id;
+        let holds_before: Vec<_> = fx
+            .wire()
+            .holds
+            .into_iter()
+            .filter(|hold| hold.authorization_id == auth_id)
+            .collect();
+        assert!(!holds_before.is_empty());
+        let commit = fx
+            .recorder()
+            .commit_decision(&decide(
+                &attempt,
+                DecidedTransition::NotIncluded(not_included_proof()),
+            ))
+            .unwrap();
+        let wire = fx.wire();
+        let holds_after: Vec<_> = wire
+            .holds
+            .iter()
+            .filter(|hold| hold.authorization_id == auth_id)
+            .cloned()
+            .collect();
+        assert_eq!(holds_after, holds_before);
+        let auth = fx.auth(auth_id);
+        assert_eq!(auth.state, AuthorizationState::Claimed);
+        assert_eq!(
+            auth.native_release,
+            Some(ReleaseRow::always(ReleaseClass::ProvedUnspent, commit))
+        );
+        assert!(bucket_rows(&fx, 1).is_empty());
+    }
+
+    /// Stale generations, substituted attempts or envelopes, a
+    /// non-inclusion without its sequence release and direct proofs all
+    /// refuse and write nothing.
+    #[test]
+    #[serial]
+    fn recovery_checked_decision_refuses_stale_substituted_or_direct_proofs() {
+        let mut fx = Fx::new();
+        let (handle, attempt) = decided_attempt(&mut fx, 1);
+        let success = DecidedTransition::Succeeded(agreed(1, "SUCCESS"));
+        let refusals: Vec<(&str, CheckedRecoveryDecision)> = vec![
+            ("stale", {
+                let mut stale = attempt.clone();
+                stale.generation -= 1;
+                decide(&stale, success.clone())
+            }),
+            ("another attempt", {
+                let mut other = attempt.clone();
+                other.attempt_index = 2;
+                decide(&other, success.clone())
+            }),
+            ("another envelope", {
+                let mut other = attempt.clone();
+                other.exposure = classic_exposure(1);
+                decide(&other, success.clone())
+            }),
+            ("another operation", {
+                let mut other = attempt.clone();
+                other.operation_id = OperationId::from_bytes([0xee; 16]);
+                decide(&other, success.clone())
+            }),
+            (
+                "outcome of another envelope",
+                decide(&attempt, DecidedTransition::Succeeded(agreed(2, "SUCCESS"))),
+            ),
+            (
+                "negative fee",
+                decide(
+                    &attempt,
+                    DecidedTransition::Failed {
+                        outcome: agreed(1, "FAILED"),
+                        fee_charged: -1,
+                    },
+                ),
+            ),
+        ];
+        let before = fs::read(fx.store.path()).unwrap();
+        for (label, decision) in &refusals {
+            assert!(fx.recorder().commit_decision(decision).is_err(), "{label}");
+            assert_eq!(fs::read(fx.store.path()).unwrap(), before, "{label}");
+        }
+        let direct = fx
+            .recorder()
+            .transition(
+                handle.id(),
+                Some(1),
+                OperationState::Succeeded,
+                &TransitionEvidence {
+                    agreed_outcome: Some(agreed(1, "SUCCESS")),
+                    ..TransitionEvidence::default()
+                },
+            )
+            .unwrap_err();
+        assert_eq!(code(&direct), "internal.unexpected_state");
+        assert_eq!(fs::read(fx.store.path()).unwrap(), before);
+        for (to, not_included) in [
+            (OperationState::NotIncluded, Some(proof())),
+            (OperationState::NotIncluded, None),
+            (OperationState::Cancelled, Some(proof())),
+        ] {
+            let direct = fx
+                .recorder()
+                .transition(
+                    handle.id(),
+                    Some(1),
+                    to,
+                    &TransitionEvidence {
+                        not_included,
+                        clear: Some(ClearForm::Untimed),
+                        ..TransitionEvidence::default()
+                    },
+                )
+                .unwrap_err();
+            assert_eq!(code(&direct), "internal.unexpected_state", "{to:?}");
+            assert_eq!(fs::read(fx.store.path()).unwrap(), before);
+        }
+
+        let (_other, unreleased) = {
+            let handle = unknown_named(&mut fx, 3);
+            let attempt = OperationStatus::new(&fx.store, &fx.profile)
+                .outcome_snapshot(Some(&[3 ^ 0x80; 32]))
+                .unwrap()
+                .pop()
+                .unwrap();
+            (handle, attempt)
+        };
+        assert!(unreleased.sequence_release.is_none());
+        let before = fs::read(fx.store.path()).unwrap();
+        assert!(
+            fx.recorder()
+                .commit_decision(&decide(
+                    &unreleased,
+                    DecidedTransition::NotIncluded(not_included_proof())
+                ))
+                .is_err()
+        );
+        assert_eq!(fs::read(fx.store.path()).unwrap(), before);
+
+        // A fresh snapshot after an unrelated commit decides; the consumed
+        // generation then refuses a second, different decision's reuse.
+        fx.recorder()
+            .record_observation(WindowObservation {
+                ledger: 200,
+                close_time_floor_ms: T0,
+                observed_at_ms: T0,
+            })
+            .unwrap();
+        assert!(
+            fx.recorder()
+                .commit_decision(&decide(&attempt, success.clone()))
+                .is_err()
+        );
+        let fresh = OperationStatus::new(&fx.store, &fx.profile)
+            .outcome_snapshot(Some(&[1 ^ 0x80; 32]))
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert!(fresh.generation > attempt.generation);
+        fx.recorder()
+            .commit_decision(&decide(&fresh, success))
+            .unwrap();
+        assert_eq!(fx.record(handle.id()).state, OperationState::Succeeded);
+    }
+
+    /// A committed outcome keeps a 2,048-byte result, the digest of a
+    /// 2,049-byte or escaped overlong result, and the exposed envelope's
+    /// digest across restart and evidence eviction. Endpoint evidence keeps
+    /// XDR digests only, and envelope bounds hold at 8,192 and 8,193.
+    #[test]
+    #[serial]
+    fn recovery_persisted_outcome_keeps_bounded_result_and_original_envelope_digest() {
+        for (result, kept) in [
+            ("A".repeat(RESULT_XDR_MAX), true),
+            ("A".repeat(RESULT_XDR_MAX + 1), false),
+            (format!("{}\"", "A".repeat(RESULT_XDR_MAX - 1)), false),
+        ] {
+            let mut fx = Fx::new();
+            let (handle, attempt) = decided_attempt(&mut fx, 1);
+            let mut outcome = agreed(1, "FAILED");
+            outcome.result_xdr.clone_from(&result);
+            fx.recorder()
+                .commit_decision(&decide(
+                    &attempt,
+                    DecidedTransition::Failed {
+                        outcome,
+                        fee_charged: 100,
+                    },
+                ))
+                .unwrap();
+            for ledger in 0..u32::try_from(MAX_EVIDENCE_ROWS + 2).unwrap() {
+                fx.recorder()
+                    .record_evidence(
+                        handle.id(),
+                        1,
+                        &EvidenceInput {
+                            rows: vec![ledger_row(EvidenceEndpoint::Primary, 500 + ledger)],
+                            ..EvidenceInput::default()
+                        },
+                    )
+                    .unwrap();
+            }
+            let reopened = PersistedWindowStore::at_path(fx.store.path().to_owned());
+            let wire = reopened.read_for_inspection(&fx.profile).unwrap().unwrap();
+            let record = records(&wire).iter().find(|r| r.id == handle.id()).unwrap();
+            let stored = record.attempts[0].agreed_outcome.as_ref().unwrap();
+            assert_eq!(stored.result_xdr.truncated(), !kept, "{}", result.len());
+            if kept {
+                assert_eq!(stored.result_xdr.text(), result);
+            } else {
+                assert_eq!(stored.result_xdr.text(), sha256_hex(result.as_bytes()));
+            }
+            assert_eq!(
+                stored.envelope_xdr_sha256,
+                <[u8; 32]>::from(Sha256::digest(envelope_text(1)))
+            );
+            assert_eq!(record.attempts[0].evidence.len(), MAX_EVIDENCE_ROWS);
+            assert_eq!(
+                record.attempts[0].decision.as_ref().unwrap().fee_charged,
+                Some(100)
+            );
+            assert!(serialized_len(record) <= RECORD_MAX);
+        }
+
+        let mut fx = Fx::new();
+        let (handle, _attempt) = decided_attempt(&mut fx, 1);
+        let answer = super::super::recovery::OutcomeAnswer {
+            status: Some("SUCCESS".to_owned()),
+            envelope_xdr: Some(envelope_text(1)),
+            result_xdr: Some("RESULTXDRTEXT".to_owned()),
+            latest_ledger: Some(150),
+            ..super::super::recovery::OutcomeAnswer::default()
+        };
+        let row = answer
+            .row(EvidenceEndpoint::Primary, [4; 32], None)
+            .unwrap();
+        fx.recorder()
+            .record_evidence(
+                handle.id(),
+                1,
+                &EvidenceInput {
+                    rows: vec![row],
+                    ..EvidenceInput::default()
+                },
+            )
+            .unwrap();
+        let bytes = String::from_utf8_lossy(&fs::read(fx.store.path()).unwrap()).into_owned();
+        assert!(!bytes.contains("RESULTXDRTEXT"));
+        assert!(bytes.contains(&sha256_hex(b"RESULTXDRTEXT")));
+
+        for (len, fits) in [(ENVELOPE_XDR_MAX, true), (ENVELOPE_XDR_MAX + 1, false)] {
+            let mut fx = Fx::new();
+            let handle = fx.open_new(&request("order-9", canonical(9)));
+            let mint = fx.mint_request(tx(9), fx.policy(), vec![]);
+            let started = fx.recorder().begin_attempt(
+                &handle,
+                &AttemptRequest {
+                    envelope: Some(AttemptEnvelope {
+                        xdr: "A".repeat(len),
+                        unsigned_envelope_sha256: [0xee; 32],
+                    }),
+                    authorization: AttemptAuthorization::Mint(Box::new(mint)),
+                    send_by_ms: u64::MAX,
+                },
+            );
+            match started {
+                Ok(_) => assert!(fits),
+                Err(error) => {
+                    assert!(!fits, "{error}");
+                    assert_eq!(code(&error), "operation.capacity");
+                }
+            }
+        }
+    }
+
+    /// Decisions stay readable after restart and attempt selection, a hash
+    /// selects one, and only the decision's own commit writes its
+    /// projection marker, once.
+    #[test]
+    #[serial]
+    fn recovery_committed_decisions_survive_restart_and_gate_retry() {
+        let mut fx = Fx::new();
+        let (first, _) = decided_attempt(&mut fx, 1);
+        let (second, two) = decided_attempt(&mut fx, 2);
+        let one = OperationStatus::new(&fx.store, &fx.profile)
+            .outcome_snapshot(Some(&[1 ^ 0x80; 32]))
+            .unwrap()
+            .pop()
+            .unwrap();
+        let succeeded = fx
+            .recorder()
+            .commit_decision(&decide(
+                &one,
+                DecidedTransition::Succeeded(agreed(1, "SUCCESS")),
+            ))
+            .unwrap();
+        let two = OperationStatus::new(&fx.store, &fx.profile)
+            .outcome_snapshot(Some(&[2 ^ 0x80; 32]))
+            .unwrap()
+            .pop()
+            .unwrap_or(two);
+        let not_included = fx
+            .recorder()
+            .commit_decision(&decide(
+                &two,
+                DecidedTransition::NotIncluded(not_included_proof()),
+            ))
+            .unwrap();
+        let reopened = PersistedWindowStore::at_path(fx.store.path().to_owned());
+        let status = OperationStatus::new(&reopened, &fx.profile);
+        assert!(status.outcome_snapshot(None).unwrap().is_empty());
+        let decisions = status.committed_decisions(None).unwrap();
+        assert_eq!(decisions.len(), 2);
+        let by_op = |id: OperationId| decisions.iter().find(|d| d.operation_id == id).unwrap();
+        let ok = by_op(first.id());
+        assert_eq!(
+            (
+                ok.state,
+                ok.commit_id,
+                ok.ledger,
+                ok.ledgers,
+                ok.evidence_digest,
+                ok.projected
+            ),
+            (
+                OperationState::Succeeded,
+                succeeded,
+                Some(120),
+                (130, 131),
+                [0xd1; 32],
+                false
+            )
+        );
+        let gone = by_op(second.id());
+        assert_eq!(
+            (gone.state, gone.commit_id, gone.not_included),
+            (
+                OperationState::NotIncluded,
+                not_included,
+                Some(not_included_proof())
+            )
+        );
+        assert_eq!(gone.tx_hash, [2 ^ 0x80; 32]);
+        assert_eq!(
+            status
+                .committed_decisions(Some(&[2 ^ 0x80; 32]))
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            status
+                .committed_decisions(Some(&[0x77; 32]))
+                .unwrap()
+                .is_empty()
+        );
+
+        let early = fx.mint_request(tx(41), fx.policy(), vec![]);
+        assert_eq!(
+            code(&fx.begin_mint(&second, &early).unwrap_err()),
+            "recovery.retry_refused"
+        );
+        let rows = fx.sink.entries.len();
+        let generation = fx.wire().generation;
+        assert!(
+            fx.recorder()
+                .acknowledge_projection(second.id(), 1, succeeded)
+                .is_err()
+        );
+        fx.recorder()
+            .acknowledge_projection(second.id(), 1, not_included)
+            .unwrap();
+        assert_eq!(fx.wire().generation, generation + 1);
+        fx.recorder()
+            .acknowledge_projection(second.id(), 1, not_included)
+            .unwrap();
+        assert_eq!(fx.wire().generation, generation + 1);
+        assert_eq!(fx.sink.entries.len(), rows);
+        let projected = OperationStatus::new(&fx.store, &fx.profile)
+            .committed_decisions(Some(&[2 ^ 0x80; 32]))
+            .unwrap();
+        assert!(projected[0].projected);
+        let successor = fx.mint_request(tx(42), fx.policy(), vec![]);
+        assert!(fx.begin_mint(&second, &successor).is_ok());
+    }
+
+    /// Without its projection marker a checked non-inclusion refuses the
+    /// successor with `recovery.retry_refused`, and the marker alone admits
+    /// it; a receipt claims nothing here.
+    #[test]
+    #[serial]
+    fn recovery_committed_decisions_gate_the_successor_on_projection() {
+        let mut fx = Fx::new();
+        let (handle, commit) = checked_not_included(&mut fx, 4);
+        let mint = fx.mint_request(tx(40), fx.policy(), vec![]);
+        let refused = fx.begin_mint(&handle, &mint).unwrap_err();
+        assert!(matches!(refused, WindowStoreError::RetryRefused));
+        assert_eq!(code(&refused), "recovery.retry_refused");
+        let reopened = PersistedWindowStore::at_path(fx.store.path().to_owned());
+        let mut sink = Sink::default();
+        OperationRecorder::new(&reopened, &fx.profile, &mut sink, REQUEST_ID)
+            .acknowledge_projection(handle.id(), 1, commit)
+            .unwrap();
+        assert!(fx.begin_mint(&handle, &mint).is_ok());
+    }
+
+    /// A repeated decision, the same or a different one, returns the first
+    /// commit. The proof, accounting, release row and audit rows stay as
+    /// the first commit writes them, before and after restart.
+    #[test]
+    #[serial]
+    fn recovery_transition_replay_is_idempotent() {
+        let mut fx = Fx::new();
+        let (handle, attempt) = decided_attempt(&mut fx, 1);
+        let first = decide(
+            &attempt,
+            DecidedTransition::Failed {
+                outcome: agreed(1, "FAILED"),
+                fee_charged: 100,
+            },
+        );
+        let commit = fx.recorder().commit_decision(&first).unwrap();
+        let bytes = fs::read(fx.store.path()).unwrap();
+        let rows = fx.sink.entries.len();
+        let mut other_outcome = agreed(1, "FAILED");
+        other_outcome.ledger = 999;
+        let replays = [
+            first.clone(),
+            decide(&attempt, DecidedTransition::Succeeded(agreed(1, "SUCCESS"))),
+            decide(
+                &attempt,
+                DecidedTransition::NotIncluded(not_included_proof()),
+            ),
+            decide(
+                &attempt,
+                DecidedTransition::Failed {
+                    outcome: other_outcome,
+                    fee_charged: 7,
+                },
+            ),
+        ];
+        for replay in &replays {
+            assert_eq!(fx.recorder().commit_decision(replay).unwrap(), commit);
+            assert_eq!(fs::read(fx.store.path()).unwrap(), bytes);
+            assert_eq!(fx.sink.entries.len(), rows);
+        }
+        let reopened = PersistedWindowStore::at_path(fx.store.path().to_owned());
+        let mut sink = Sink::default();
+        for replay in &replays {
+            assert_eq!(
+                OperationRecorder::new(&reopened, &fx.profile, &mut sink, REQUEST_ID)
+                    .commit_decision(replay)
+                    .unwrap(),
+                commit
+            );
+        }
+        assert!(sink.entries.is_empty());
+        assert_eq!(fs::read(fx.store.path()).unwrap(), bytes);
+        let record = fx.record(handle.id());
+        assert_eq!(
+            record.attempts[0].agreed_outcome.as_ref().unwrap().ledger,
+            120
+        );
+        assert_eq!(
+            record.attempts[0].decision.as_ref().unwrap().fee_charged,
+            Some(100)
+        );
+        assert_eq!(
+            transition_rows(&fx)
+                .iter()
+                .filter(|row| matches!(row, EventKind::OperationTransition { step, .. } if step == "failed"))
+                .count(),
+            1
+        );
+    }
+
+    /// The transition row names the evidence digest, both deciding ledgers,
+    /// the retained commit and, for non-inclusion, the receipt code; the
+    /// request id stays outer. All six evidence kinds audit, an uncovered
+    /// answer falls back to the shared ledger, and no row names an endpoint.
+    #[test]
+    #[serial]
+    fn recovery_transition_and_evidence_audit_rows_name_the_committed_proofs() {
+        use super::super::recovery::{AccountAnswer, OutcomeAnswer};
+        let mut fx = Fx::new();
+        let (handle, attempt) = decided_attempt(&mut fx, 1);
+        let uncovered = OutcomeAnswer {
+            status: Some("NOT_FOUND".to_owned()),
+            ..OutcomeAnswer::default()
+        };
+        let account = AccountAnswer {
+            sequence: Some(99),
+            latest_ledger: Some(160),
+        };
+        let rows = vec![
+            uncovered
+                .row(EvidenceEndpoint::Primary, [1; 32], Some(150))
+                .unwrap(),
+            uncovered
+                .row(EvidenceEndpoint::Witness, [1; 32], Some(151))
+                .unwrap(),
+            account
+                .row(EvidenceEndpoint::Primary, [2; 32], Some(1))
+                .unwrap(),
+            account
+                .row(EvidenceEndpoint::Witness, [2; 32], Some(1))
+                .unwrap(),
+            ledger_row(EvidenceEndpoint::Primary, 170),
+            ledger_row(EvidenceEndpoint::Witness, 171),
+        ];
+        assert_eq!(rows[0].observed_ledger, 150);
+        assert_eq!(rows[2].observed_ledger, 160);
+        let before = fx.sink.entries.len();
+        fx.recorder()
+            .record_evidence(
+                handle.id(),
+                1,
+                &EvidenceInput {
+                    rows,
+                    ..EvidenceInput::default()
+                },
+            )
+            .unwrap();
+        let EventKind::OperationEvidence { rows, .. } = &fx.sink.entries[before].event_kind else {
+            panic!("an evidence row");
+        };
+        let mut kinds: Vec<String> = rows
+            .iter()
+            .filter_map(|row| row.kind)
+            .map(|kind| serde_json::to_string(&kind).unwrap())
+            .collect();
+        kinds.sort();
+        kinds.dedup();
+        assert_eq!(kinds.len(), 6, "{kinds:?}");
+        let attempt = OperationStatus::new(&fx.store, &fx.profile)
+            .outcome_snapshot(Some(&[1 ^ 0x80; 32]))
+            .unwrap()
+            .pop()
+            .unwrap_or(attempt);
+        let commit = fx
+            .recorder()
+            .commit_decision(&decide(
+                &attempt,
+                DecidedTransition::NotIncluded(not_included_proof()),
+            ))
+            .unwrap();
+        let entry = fx.sink.entries.last().unwrap();
+        assert_eq!(entry.request_id, REQUEST_ID);
+        let EventKind::OperationTransition {
+            step,
+            from_state,
+            commit_id,
+            evidence_digest,
+            primary_ledger,
+            witness_ledger,
+            release_code,
+            ..
+        } = &entry.event_kind
+        else {
+            panic!("a transition row");
+        };
+        assert_eq!(step, "not_included");
+        assert_eq!(from_state.as_deref(), Some("sent_outcome_unknown"));
+        assert_eq!(commit_id, &commit.to_hex());
+        assert_eq!(evidence_digest.as_deref(), Some("d1".repeat(32).as_str()));
+        assert_eq!((*primary_ledger, *witness_ledger), (Some(130), Some(131)));
+        assert_eq!(
+            release_code.as_deref(),
+            Some("accounting.released_on_evidence")
+        );
+        assert!(fx.record(handle.id()).commit_ids.contains(&commit));
+        let json = serde_json::to_string(&fx.sink.entries).unwrap();
+        assert!(
+            !json.contains("rpc.example") && !json.contains("http"),
+            "{json}"
+        );
+        // A success names no receipt code.
+        let (_other, two) = decided_attempt(&mut fx, 2);
+        fx.recorder()
+            .commit_decision(&decide(
+                &two,
+                DecidedTransition::Succeeded(agreed(2, "SUCCESS")),
+            ))
+            .unwrap();
+        let EventKind::OperationTransition { release_code, .. } =
+            &fx.sink.entries.last().unwrap().event_kind
+        else {
+            panic!("a transition row");
+        };
+        assert_eq!(release_code, &None);
+    }
+
+    /// Evidence and decisions keep contiguous ranges, the watermark, eviction
+    /// and reverse linkage: every audit row classifies as committed or
+    /// evicted, and a projection marker writes no audit row.
+    #[test]
+    #[serial]
+    fn recovery_evidence_ranges_preserve_every_class() {
+        let mut fx = Fx::new();
+        let (handle, attempt) = decided_attempt(&mut fx, 1);
+        for ledger in 0..12 {
+            fx.recorder()
+                .record_evidence(
+                    handle.id(),
+                    1,
+                    &EvidenceInput {
+                        rows: vec![
+                            ledger_row(EvidenceEndpoint::Primary, 300 + ledger),
+                            ledger_row(EvidenceEndpoint::Witness, 300 + ledger),
+                        ],
+                        ..EvidenceInput::default()
+                    },
+                )
+                .unwrap();
+        }
+        let attempt = OperationStatus::new(&fx.store, &fx.profile)
+            .outcome_snapshot(Some(&[1 ^ 0x80; 32]))
+            .unwrap()
+            .pop()
+            .unwrap_or(attempt);
+        let commit = fx
+            .recorder()
+            .commit_decision(&decide(
+                &attempt,
+                DecidedTransition::NotIncluded(not_included_proof()),
+            ))
+            .unwrap();
+        let rows_before = fx.sink.entries.len();
+        fx.recorder()
+            .acknowledge_projection(handle.id(), 1, commit)
+            .unwrap();
+        assert_eq!(fx.sink.entries.len(), rows_before);
+        let ranges = evidence_rows(&fx);
+        let mut next = 1;
+        for (range, seqs, _, _) in &ranges {
+            if let Some(range) = range {
+                assert_eq!(range.first, next);
+                assert_eq!(seqs, &(range.first..=range.last).collect::<Vec<_>>());
+                next = range.last + 1;
+            }
+        }
+        let record = fx.record(handle.id());
+        assert_eq!(record.evidence_committed_seq, next - 1);
+        assert_eq!(record.attempts[0].evidence.len(), MAX_EVIDENCE_ROWS);
+        let facts: Vec<EvidenceAuditFacts> = fx
+            .sink
+            .entries
+            .iter()
+            .filter_map(|entry| match &entry.event_kind {
+                EventKind::OperationEvidence {
+                    attempt_index,
+                    evidence_seqs,
+                    sequence_released,
+                    commit_id,
+                    ..
+                } => Some(EvidenceAuditFacts {
+                    attempt_index: *attempt_index,
+                    evidence_seqs: evidence_seqs.map(|range| (range.first, range.last)),
+                    sequence_released: *sequence_released,
+                    commit_id: CommitId::from_hex(commit_id).unwrap(),
+                    appended_at_ms: T0,
+                }),
+                _ => None,
+            })
+            .collect();
+        let classified = OperationStatus::new(&fx.store, &fx.profile)
+            .classify_evidence(handle.id(), &facts, T0)
+            .unwrap();
+        assert!(classified.unnamed_rows.is_empty());
+        assert!(classified.unnamed_releases.is_empty());
+        let mut evicted = 0;
+        for verdict in &classified.verdicts {
+            assert!(!verdict.tampered(), "{verdict:?}");
+            if let EvidenceVerdict::Retained { sequences, .. } = verdict {
+                evicted += sequences
+                    .iter()
+                    .filter(|(_, class)| *class == EvidenceSequenceClass::Evicted)
+                    .count();
+            }
+        }
+        assert_eq!(evicted, 24 - MAX_EVIDENCE_ROWS);
+    }
+
+    /// Commits a checked non-inclusion of `order-{n}`'s first attempt and
+    /// returns its handle and commit.
+    fn checked_not_included(fx: &mut Fx, n: u8) -> (OperationHandle, CommitId) {
+        let (handle, _) = decided_attempt(fx, n);
+        let attempt = OperationStatus::new(&fx.store, &fx.profile)
+            .outcome_snapshot(Some(&[n ^ 0x80; 32]))
+            .unwrap()
+            .pop()
+            .unwrap();
+        let commit = fx
+            .recorder()
+            .commit_decision(&decide(
+                &attempt,
+                DecidedTransition::NotIncluded(not_included_proof()),
+            ))
+            .unwrap();
+        (handle, commit)
+    }
+
+    /// A successor needs a checked non-inclusion with its projection
+    /// marker, live authority and the predecessor's policy. A premature,
+    /// unprojected, confirmed-failure or changed-policy successor refuses.
+    /// The projected one starts the next attempt.
+    #[test]
+    #[serial]
+    fn recovery_retry_permission_requires_evidenced_non_inclusion_and_live_authority() {
+        let mut fx = Fx::new();
+        let (premature, _) = decided_attempt(&mut fx, 1);
+        let mint = fx.mint_request(tx(11), fx.policy(), vec![]);
+        assert!(fx.begin_mint(&premature, &mint).is_err());
+
+        let (failed, _) = decided_attempt(&mut fx, 2);
+        let attempt = OperationStatus::new(&fx.store, &fx.profile)
+            .outcome_snapshot(Some(&[2 ^ 0x80; 32]))
+            .unwrap()
+            .pop()
+            .unwrap();
+        fx.recorder()
+            .commit_decision(&decide(
+                &attempt,
+                DecidedTransition::Failed {
+                    outcome: agreed(2, "FAILED"),
+                    fee_charged: 100,
+                },
+            ))
+            .unwrap();
+        let mint = fx.mint_request(tx(12), fx.policy(), vec![]);
+        assert!(fx.begin_mint(&failed, &mint).is_err());
+
+        let (handle, commit) = checked_not_included(&mut fx, 3);
+        let before = fs::read(fx.store.path()).unwrap();
+        let mint = fx.mint_request(tx(13), fx.policy(), vec![]);
+        let refused = fx.begin_mint(&handle, &mint).unwrap_err();
+        assert_eq!(code(&refused), "recovery.retry_refused");
+        assert_eq!(fs::read(fx.store.path()).unwrap(), before);
+        fx.recorder()
+            .acknowledge_projection(handle.id(), 1, commit)
+            .unwrap();
+        // Each changed policy is pinned first, so the mint's own prechecks
+        // pass and the successor's policy check alone refuses.
+        let repin = |fx: &Fx, sequence: i64, digest: [u8; 32]| {
+            let lock = WindowStoreLock::acquire_for(
+                fx.store.path(),
+                &fx.profile.policy_window_state_key_id,
+            )
+            .unwrap();
+            pin::write_for_test(
+                &lock,
+                &PinScope::for_profile(fx.store.path(), &fx.profile),
+                &Pin::new(sequence, digest, owner_of(11)).unwrap(),
+            )
+            .unwrap();
+        };
+        for (sequence, digest) in [(7, [8; 32]), (8, [7; 32])] {
+            repin(&fx, sequence, digest);
+            let mut changed = fx.mint_request(tx(13), fx.policy(), vec![]);
+            changed.policy_sequence = sequence;
+            changed.policy_digest = digest;
+            if let MintAuthority::Policy(binding) = &mut changed.authority {
+                binding.policy_sequence = sequence;
+                binding.policy_digest = digest;
+            }
+            let error = fx.begin_mint(&handle, &changed).unwrap_err();
+            assert!(
+                matches!(&error, WindowStoreError::UnexpectedState { detail }
+                    if detail.contains("another policy")),
+                "{sequence}: {error:?}"
+            );
+        }
+        repin(&fx, 7, [7; 32]);
+        let started = fx.begin_mint(&handle, &mint).unwrap();
+        assert_eq!(started.attempt_index, 2);
+        assert_eq!(fx.record(handle.id()).state, OperationState::Sending);
+        let open = fx.mint_request(tx(14), fx.policy(), vec![]);
+        assert_eq!(
+            code(&fx.begin_mint(&handle, &open).unwrap_err()),
+            "operation.attempt_open"
+        );
+    }
+
+    /// A linked successor authorization under another policy digest or
+    /// sequence refuses as a minted one does; one under the predecessor's
+    /// policy starts the next attempt.
+    #[test]
+    #[serial]
+    fn recovery_linked_successor_requires_the_predecessor_policy() {
+        let repin = |fx: &Fx, sequence: i64, digest: [u8; 32]| {
+            let lock = WindowStoreLock::acquire_for(
+                fx.store.path(),
+                &fx.profile.policy_window_state_key_id,
+            )
+            .unwrap();
+            pin::write_for_test(
+                &lock,
+                &PinScope::for_profile(fx.store.path(), &fx.profile),
+                &Pin::new(sequence, digest, owner_of(11)).unwrap(),
+            )
+            .unwrap();
+        };
+        let linked_begin = |fx: &mut Fx, handle: &OperationHandle| {
+            fx.recorder().begin_attempt(
+                handle,
+                &AttemptRequest {
+                    envelope: Some(AttemptEnvelope {
+                        xdr: "AAAAENVELOPE".to_owned(),
+                        unsigned_envelope_sha256: handle
+                            .unsigned_envelope_sha256()
+                            .unwrap_or([0xee; 32]),
+                    }),
+                    authorization: AttemptAuthorization::Linked,
+                    send_by_ms: u64::MAX,
+                },
+            )
+        };
+        for (n, sequence, digest) in [(1_u8, 7, [8; 32]), (2, 8, [7; 32])] {
+            let mut fx = Fx::new();
+            let (handle, commit) = checked_not_included(&mut fx, n);
+            fx.recorder()
+                .acknowledge_projection(handle.id(), 1, commit)
+                .unwrap();
+            repin(&fx, sequence, digest);
+            let mut linked = fx.mint_request(tx(n + 20), fx.policy(), vec![]);
+            linked.policy_sequence = sequence;
+            linked.policy_digest = digest;
+            if let MintAuthority::Policy(binding) = &mut linked.authority {
+                binding.policy_sequence = sequence;
+                binding.policy_digest = digest;
+            }
+            linked.operation = Some(OperationLink {
+                operation_id: handle.id(),
+                attempt_index: 2,
+            });
+            fx.store.mint_authorization(&fx.profile, &linked).unwrap();
+            let before = fs::read(fx.store.path()).unwrap();
+            let error = linked_begin(&mut fx, &handle).unwrap_err();
+            assert!(
+                matches!(&error, WindowStoreError::UnexpectedState { detail }
+                    if detail.contains("another policy")),
+                "{sequence}: {error:?}"
+            );
+            assert_eq!(fs::read(fx.store.path()).unwrap(), before);
+        }
+
+        let mut fx = Fx::new();
+        let (handle, commit) = checked_not_included(&mut fx, 3);
+        fx.recorder()
+            .acknowledge_projection(handle.id(), 1, commit)
+            .unwrap();
+        let mut linked = fx.mint_request(tx(23), fx.policy(), vec![]);
+        linked.operation = Some(OperationLink {
+            operation_id: handle.id(),
+            attempt_index: 2,
+        });
+        fx.store.mint_authorization(&fx.profile, &linked).unwrap();
+        assert_eq!(linked_begin(&mut fx, &handle).unwrap().attempt_index, 2);
+    }
+
+    /// The successor's `not_included -> sending` row names the permitting
+    /// decision's evidence and ledgers once; a racing second begin refuses
+    /// and writes no second row.
+    #[test]
+    #[serial]
+    fn recovery_retry_audit_row_from_begin_attempt() {
+        let mut fx = Fx::new();
+        let (handle, commit) = checked_not_included(&mut fx, 1);
+        fx.recorder()
+            .acknowledge_projection(handle.id(), 1, commit)
+            .unwrap();
+        let rows_before = fx.sink.entries.len();
+        let mint = fx.mint_request(tx(21), fx.policy(), vec![]);
+        fx.begin_mint(&handle, &mint).unwrap();
+        let racing = fx.mint_request(tx(22), fx.policy(), vec![]);
+        assert!(fx.begin_mint(&handle, &racing).is_err());
+        let permissions: Vec<_> = fx.sink.entries[rows_before..]
+            .iter()
+            .filter_map(|entry| match &entry.event_kind {
+                EventKind::OperationTransition {
+                    from_state,
+                    step,
+                    evidence_digest,
+                    primary_ledger,
+                    witness_ledger,
+                    ..
+                } if from_state.as_deref() == Some("not_included") && step == "sending" => {
+                    Some((evidence_digest.clone(), *primary_ledger, *witness_ledger))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            permissions,
+            vec![(Some("d1".repeat(32)), Some(130), Some(131))]
+        );
+        assert_eq!(fx.record(handle.id()).attempts.len(), 2);
+    }
+
+    /// An x402 operation `order-x{n}` exposed with entries expiring after
+    /// ledger 500 and moved to `to`, without window entries.
+    fn x402_exposed(fx: &mut Fx, n: u8, to: OperationState) -> OperationHandle {
+        let handle = fx.open_new(&request(&format!("order-x{n}"), x402([n; 32])));
+        let mint = fx.mint_request(soroban(n), fx.approval(), vec![]);
+        let started = fx.begin_mint(&handle, &mint).unwrap();
+        fx.claim(&mint, started.minted.as_ref().unwrap());
+        fx.recorder()
+            .expose(
+                handle.id(),
+                1,
+                &ExposureIdentity::X402 {
+                    authorization_id: started.authorization_id,
+                    auth_entry_sha256: [n; 32],
+                    signature_expiration_ledger: 500,
+                },
+                Some(400),
+            )
+            .unwrap();
+        fx.recorder()
+            .transition(handle.id(), Some(1), to, &TransitionEvidence::default())
+            .unwrap();
+        handle
+    }
+
+    /// A classic operation exposed with `max_time` and moved from its
+    /// unknown outcome to `Expired`.
+    fn terminal_classic(fx: &mut Fx, n: u8, max_time: u64) -> OperationHandle {
+        let handle = unknown_with(fx, n, max_time, vec![]);
+        fx.recorder()
+            .transition(
+                handle.id(),
+                Some(1),
+                OperationState::Expired,
+                &TransitionEvidence::default(),
+            )
+            .unwrap();
+        handle
+    }
+
+    /// The operation and kind of every obligation at `observation`, sorted.
+    fn obligations_at(
+        fx: &Fx,
+        observation: WindowObservation,
+    ) -> Vec<(OperationId, ObligationKind)> {
+        let mut found: Vec<_> = OperationStatus::new(&fx.store, &fx.profile)
+            .release_obligations(Some(observation))
+            .unwrap()
+            .into_iter()
+            .map(|obligation| (obligation.operation_id, obligation.kind))
+            .collect();
+        found.sort_by_key(|(id, _)| id.to_hex());
+        found
+    }
+
+    fn release_row(fx: &Fx, handle: &OperationHandle) -> Option<ReleaseRow> {
+        let auth_id = fx.record(handle.id()).attempts[0].authorization_id;
+        fx.auth(auth_id).native_release
+    }
+
+    /// Each obligation's release crosses the generation commit as one unit.
+    /// A crash after the prepared file reopens the complete old state. A
+    /// crash after the counter reopens the complete new state: the release
+    /// row and, for live x402, the `Expired` state together.
+    #[test]
+    #[serial]
+    fn recovery_obligation_release_crosses_the_commit_point_as_one_unit() {
+        use super::super::store::{
+            COMMIT_FAULT_AFTER_COUNTER, COMMIT_FAULT_AFTER_PREPARED, arm_accounting_fault,
+        };
+        let observation = WindowObservation {
+            ledger: 501,
+            close_time_floor_ms: (T0 / 1_000 + 10) * 1_000 + 1,
+            observed_at_ms: T0,
+        };
+        type Build = fn(&mut Fx) -> (OperationHandle, OperationState, bool);
+        let proofs: [(&str, Build); 4] = [
+            ("live x402", |fx| {
+                (
+                    x402_exposed(fx, 1, OperationState::SentOutcomeUnknown),
+                    OperationState::Expired,
+                    false,
+                )
+            }),
+            ("terminal x402", |fx| {
+                (
+                    x402_exposed(fx, 2, OperationState::PayloadReleased),
+                    OperationState::PayloadReleased,
+                    false,
+                )
+            }),
+            ("timed classic", |fx| {
+                (
+                    terminal_classic(fx, 3, T0 / 1_000 + 10),
+                    OperationState::Expired,
+                    false,
+                )
+            }),
+            ("untimed classic", |fx| {
+                (terminal_classic(fx, 4, 0), OperationState::Expired, true)
+            }),
+        ];
+        for (label, build) in proofs {
+            for seam in [COMMIT_FAULT_AFTER_PREPARED, COMMIT_FAULT_AFTER_COUNTER] {
+                let mut fx = Fx::new();
+                let (handle, released_state, ack) = build(&mut fx);
+                let before = fx.record(handle.id()).state;
+                let armed = arm_accounting_fault(seam);
+                let result = fx
+                    .recorder()
+                    .release_obligation(handle.id(), 1, observation, ack);
+                drop(armed);
+                assert!(result.is_err(), "{label} at seam {seam}");
+                let reopened = PersistedWindowStore::at_path(fx.store.path().to_owned());
+                let wire = reopened.read_for_inspection(&fx.profile).unwrap().unwrap();
+                let record = records(&wire).iter().find(|r| r.id == handle.id()).unwrap();
+                let auth_id = record.attempts[0].authorization_id;
+                let row = wire
+                    .authorizations
+                    .iter()
+                    .find(|auth| auth.id == auth_id)
+                    .unwrap()
+                    .native_release;
+                if seam == COMMIT_FAULT_AFTER_PREPARED {
+                    assert_eq!(
+                        (record.state, row),
+                        (before, None),
+                        "{label}: the complete old state"
+                    );
+                } else {
+                    assert_eq!(record.state, released_state, "{label}: the new state");
+                    let row = row.unwrap_or_else(|| panic!("{label}: the release row"));
+                    assert_eq!(row.class, ReleaseClass::Unknown, "{label}");
+                    if released_state != before {
+                        assert_eq!(record.last_commit_id, Some(row.commit_id), "{label}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// Obligations are enumerated from the verified window only when their
+    /// proof holds strictly. An x402 needs its expiration ledger passed, a
+    /// timed classic its `max_time` passed, an untimed one its acknowledged
+    /// clear. Each release commits its row atomically. A live x402 also
+    /// becomes `Expired` with one transition row. Terminal states stay,
+    /// obligations take no classic slot, and a repeated pass releases
+    /// nothing again.
+    #[test]
+    #[serial]
+    fn recovery_obligation_enumeration_and_release_rows_are_verified_and_atomic() {
+        let mut fx = Fx::new();
+        let live = x402_exposed(&mut fx, 1, OperationState::SentOutcomeUnknown);
+        let released = x402_exposed(&mut fx, 2, OperationState::PayloadReleased);
+        let timed = terminal_classic(&mut fx, 3, T0 / 1_000 + 10);
+        let untimed = terminal_classic(&mut fx, 4, 0);
+        let unknown = unknown_named(&mut fx, 5);
+        let at = |ledger: u32, close_ms: u64| WindowObservation {
+            ledger,
+            close_time_floor_ms: close_ms,
+            observed_at_ms: T0,
+        };
+        let deadline = (T0 / 1_000 + 10) * 1_000;
+        let kinds = obligations_at;
+        assert_eq!(
+            kinds(&fx, at(500, deadline)),
+            vec![(untimed.id(), ObligationKind::TerminalUntimed)]
+        );
+        let mut due = vec![
+            (
+                live.id(),
+                ObligationKind::X402Expired {
+                    signature_expiration_ledger: 500,
+                },
+            ),
+            (
+                released.id(),
+                ObligationKind::X402Expired {
+                    signature_expiration_ledger: 500,
+                },
+            ),
+            (
+                timed.id(),
+                ObligationKind::TerminalTimed {
+                    release_after_ms: deadline,
+                },
+            ),
+            (untimed.id(), ObligationKind::TerminalUntimed),
+        ];
+        due.sort_by_key(|(id, _)| id.to_hex());
+        assert_eq!(kinds(&fx, at(501, deadline + 1)), due);
+        let classic: Vec<_> = OperationStatus::new(&fx.store, &fx.profile)
+            .outcome_snapshot(None)
+            .unwrap()
+            .into_iter()
+            .map(|attempt| attempt.operation_id)
+            .collect();
+        assert_eq!(classic, vec![unknown.id()]);
+
+        let bytes = fs::read(fx.store.path()).unwrap();
+        for (handle, observation, ack) in [
+            (&live, at(500, deadline + 1), false),
+            (&timed, at(501, deadline), false),
+            (&untimed, at(501, deadline + 1), false),
+            (&unknown, at(501, deadline + 1), true),
+        ] {
+            assert!(
+                fx.recorder()
+                    .release_obligation(handle.id(), 1, observation, ack)
+                    .is_err()
+            );
+            assert_eq!(fs::read(fx.store.path()).unwrap(), bytes);
+        }
+        fx.sink.fail = true;
+        assert!(
+            fx.recorder()
+                .release_obligation(live.id(), 1, at(501, deadline + 1), false)
+                .is_err()
+        );
+        fx.sink.fail = false;
+        assert_eq!(fs::read(fx.store.path()).unwrap(), bytes);
+
+        let rows = fx.sink.entries.len();
+        let commit = fx
+            .recorder()
+            .release_obligation(live.id(), 1, at(501, deadline + 1), false)
+            .unwrap();
+        let record = fx.record(live.id());
+        assert_eq!(record.state, OperationState::Expired);
+        assert!(record.commit_ids.contains(&commit));
+        assert_eq!(
+            release_row(&fx, &live),
+            Some(ReleaseRow {
+                class: ReleaseClass::Unknown,
+                bound: ReleaseBound::Ledger(500),
+                observed_ledger: Some(501),
+                commit_id: commit,
+            })
+        );
+        let expired: Vec<_> = fx.sink.entries[rows..]
+            .iter()
+            .filter(|entry| {
+                matches!(&entry.event_kind,
+                    EventKind::OperationTransition { step, commit_id, .. }
+                        if step == "expired" && commit_id == &commit.to_hex())
+            })
+            .collect();
+        assert_eq!(expired.len(), 1);
+
+        fx.recorder()
+            .release_obligation(released.id(), 1, at(501, deadline + 1), false)
+            .unwrap();
+        assert_eq!(
+            fx.record(released.id()).state,
+            OperationState::PayloadReleased
+        );
+        assert_eq!(
+            release_row(&fx, &released).map(|row| row.bound),
+            Some(ReleaseBound::Ledger(500))
+        );
+        fx.recorder()
+            .release_obligation(timed.id(), 1, at(501, deadline + 1), false)
+            .unwrap();
+        assert_eq!(fx.record(timed.id()).state, OperationState::Expired);
+        assert_eq!(
+            release_row(&fx, &timed).map(|row| (row.class, row.bound)),
+            Some((ReleaseClass::Unknown, ReleaseBound::CloseTime(deadline)))
+        );
+        fx.recorder()
+            .release_obligation(untimed.id(), 1, at(501, deadline + 1), true)
+            .unwrap();
+        assert_eq!(
+            release_row(&fx, &untimed).map(|row| row.bound),
+            Some(ReleaseBound::Always)
+        );
+
+        assert!(kinds(&fx, at(501, deadline + 1)).is_empty());
+        let bytes = fs::read(fx.store.path()).unwrap();
+        assert!(
+            fx.recorder()
+                .release_obligation(live.id(), 1, at(502, deadline + 2), true)
+                .is_err()
+        );
+        assert_eq!(fs::read(fx.store.path()).unwrap(), bytes);
     }
 }

@@ -106,8 +106,16 @@ A retry under a retained id succeeds with `status: "replayed"` and the stored
 `operation` instead of new work. Follow its `next`. `none` means the
 operation ended, and `wait` means it is in flight or of unknown outcome:
 reconcile with `stellar_transaction_status` or `stellar-agent tx status`.
+On mainnet a status read alone leaves an unknown outcome `pending` until its
+accounting horizon. Then the receipt becomes `ambiguous` with
+`submission.accounting_expired`, and the chain outcome stays unknown. Only a
+checked recovery decision of the primary endpoint and the oracle settles it.
 `approve` means it awaits approval, and `retry` means a further attempt may
 run.
+
+| Code | Meaning | What to do |
+|---|---|---|
+| `recovery.retry_refused` | The operation is `not_included`, but the checked decision of its last attempt is not yet projected onto that attempt's receipt. Nothing signs or sends. | Do not resend under a new id. Wait for the projection, or ask the operator. |
 
 ## Policy-engine codes
 
@@ -513,9 +521,13 @@ whether the submission settled.
 records the operator's decision; clearing establishes no chain outcome. It
 refuses with `submission.still_pending` while a sent or held transaction's time
 bound is open on this host's clock. On mainnet, the verb also asks its
-configured oracle. It refuses with `submission.not_clearable` when the oracle
-cannot answer or does not report the mainnet passphrase. It also refuses
-`SUCCESS`, and `FAILED` for a held reservation. Without an oracle the
+configured oracle. An oracle that cannot be reached, or does not answer by
+the verb's deadline, refuses with `network.rpc_unreachable`, and the message
+names the cause: wait, or ask the operator to check the oracle. An oracle
+that reports another network or an unsupported protocol refuses with
+`submission.not_clearable`: its answer does not count. The verb also refuses
+the oracle's `SUCCESS`, and its `FAILED` for a held reservation, with
+`submission.not_clearable`. Without an oracle the
 endpoint's `FAILED` does not refuse the clear. A failed ledger-time read
 refuses sent, timed
 submissions with `network.rpc_unreachable`; other failed reconciliation reads

@@ -2846,6 +2846,23 @@ pub enum NetworkError {
         /// The HTTP status of the answer, 401 or 403.
         status: u16,
     },
+
+    /// An account read answers from a ledger below the readiness ledger of
+    /// the same endpoint, so the answer cannot describe the observed state.
+    ///
+    /// # Wire code
+    ///
+    /// `"account.ledger_regressed"`.
+    #[error(
+        "the account read answers from ledger {latest_ledger}, below the endpoint's readiness \
+         ledger {readiness_ledger}"
+    )]
+    AccountLedgerRegressed {
+        /// The latest ledger of the account answer.
+        latest_ledger: u32,
+        /// The latest ledger of the readiness report.
+        readiness_ledger: u32,
+    },
 }
 
 /// Safe classifications of an unavailable cross-check witness.
@@ -3050,6 +3067,7 @@ impl NetworkError {
             Self::RpcCredentialInvalid { .. }
             | Self::RpcCredentialUnusable { .. }
             | Self::RpcCredentialRejected { .. } => "network.rpc_credential_refused",
+            Self::AccountLedgerRegressed { .. } => "account.ledger_regressed",
         }
     }
 }
@@ -4015,6 +4033,44 @@ pub enum SubmissionError {
     /// `"operation.attempt_limit"`.
     #[error("the operation has used all of its attempts; start a new operation")]
     OperationAttemptLimit,
+
+    /// The recovery evidence of an unknown outcome does not decide it yet.
+    ///
+    /// `detail` is the fixed diagnostic class, such as `missing_field`.
+    ///
+    /// # Wire code
+    ///
+    /// `"recovery.evidence_pending"`.
+    #[error("the outcome stays unknown: the recovery evidence is pending ({detail})")]
+    RecoveryEvidencePending {
+        /// The fixed diagnostic class.
+        detail: &'static str,
+    },
+
+    /// The two recovery endpoints give differing or invalid deciding answers.
+    ///
+    /// `detail` is the fixed diagnostic class, such as `status_result_mismatch`.
+    ///
+    /// # Wire code
+    ///
+    /// `"recovery.endpoint_disagreement"`.
+    #[error("the outcome stays unknown: the recovery endpoints disagree ({detail})")]
+    RecoveryEndpointDisagreement {
+        /// The fixed diagnostic class.
+        detail: &'static str,
+    },
+
+    /// A successor attempt lacks the committed non-inclusion proof or the
+    /// projection of its predecessor's decision.
+    ///
+    /// # Wire code
+    ///
+    /// `"recovery.retry_refused"`.
+    #[error(
+        "the operation may not retry: its last attempt has no committed and projected \
+         non-inclusion proof"
+    )]
+    RecoveryRetryRefused,
 }
 
 impl SubmissionError {
@@ -4039,6 +4095,10 @@ impl SubmissionError {
             Self::OperationCapacity { .. } => "operation.capacity",
             Self::OperationAttemptOpen => "operation.attempt_open",
             Self::OperationAttemptLimit => "operation.attempt_limit",
+            // Recovery taxonomy codes name the two-endpoint outcome recovery.
+            Self::RecoveryEvidencePending { .. } => "recovery.evidence_pending",
+            Self::RecoveryEndpointDisagreement { .. } => "recovery.endpoint_disagreement",
+            Self::RecoveryRetryRefused => "recovery.retry_refused",
         }
     }
 }
@@ -5743,6 +5803,66 @@ mod tests {
             detail: "test".to_owned(),
         });
         assert_eq!(wallet_err.category(), ErrorCategory::Internal);
+    }
+
+    /// Every recovery refusal and the account regression keep their own codes
+    /// through the wallet error envelope, and their texts carry the detail.
+    #[test]
+    fn recovery_codes_round_trip() {
+        let cases: Vec<(WalletError, &'static str, ErrorCategory)> = vec![
+            (
+                SubmissionError::RecoveryEvidencePending {
+                    detail: "missing_field",
+                }
+                .into(),
+                "recovery.evidence_pending",
+                ErrorCategory::Submission,
+            ),
+            (
+                SubmissionError::RecoveryEndpointDisagreement {
+                    detail: "status_result_mismatch",
+                }
+                .into(),
+                "recovery.endpoint_disagreement",
+                ErrorCategory::Submission,
+            ),
+            (
+                SubmissionError::RecoveryRetryRefused.into(),
+                "recovery.retry_refused",
+                ErrorCategory::Submission,
+            ),
+            (
+                NetworkError::AccountLedgerRegressed {
+                    latest_ledger: 99,
+                    readiness_ledger: 100,
+                }
+                .into(),
+                "account.ledger_regressed",
+                ErrorCategory::Network,
+            ),
+        ];
+        for (error, code, category) in cases {
+            assert_eq!(error.code(), code, "{error:?}");
+            assert_eq!(error.category(), category, "{error:?}");
+        }
+        let regressed = NetworkError::AccountLedgerRegressed {
+            latest_ledger: 99,
+            readiness_ledger: 100,
+        };
+        assert_ne!(regressed.code(), "network.rpc_unreachable");
+        assert!(regressed.to_string().contains("ledger 99"), "{regressed}");
+        assert!(regressed.to_string().contains("ledger 100"), "{regressed}");
+        let pending = SubmissionError::RecoveryEvidencePending {
+            detail: "invalid_time",
+        };
+        assert!(pending.to_string().contains("invalid_time"), "{pending}");
+        let disagreement = SubmissionError::RecoveryEndpointDisagreement {
+            detail: "fee_invalid",
+        };
+        assert!(
+            disagreement.to_string().contains("fee_invalid"),
+            "{disagreement}"
+        );
     }
 
     /// Every operation store refusal keeps its code through the wallet error

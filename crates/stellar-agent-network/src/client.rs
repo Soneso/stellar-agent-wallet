@@ -655,6 +655,49 @@ impl StellarRpcClient {
         Ok(TransactionRecord::from_raw(raw))
     }
 
+    /// Fetches one transaction via one `getTransaction` request and keeps
+    /// the answer's raw fields and coverage.
+    ///
+    /// The JSON answer is captured before any typed deserialization, so a
+    /// missing or invalid field stays absent here instead of failing the
+    /// read. String fields keep the endpoint's text; the creation time keeps
+    /// its raw JSON value for the caller's own time encoding.
+    ///
+    /// # Errors
+    ///
+    /// [`NetworkError::RpcUnreachable`] when the request fails or answers a
+    /// JSON-RPC error, and [`NetworkError::RpcResponseMalformed`] when the
+    /// result is not a JSON object. The `url` field is authority-only.
+    pub async fn get_transaction_observed(
+        &self,
+        hash: &stellar_xdr::Hash,
+    ) -> Result<ObservedTransaction, NetworkError> {
+        let mut params = ObjectParams::new();
+        params.insert("hash", hash).map_err(|e| {
+            rpc_unreachable(
+                &self.url,
+                GET_TRANSACTION_FAILED,
+                &stellar_rpc_client::Error::JsonRpc(ClientError::ParseError(e)),
+            )
+        })?;
+        let answer: serde_json::Value = self
+            .inner
+            .client()
+            .request("getTransaction", params)
+            .await
+            .map_err(|e| {
+                rpc_unreachable(
+                    &self.url,
+                    GET_TRANSACTION_FAILED,
+                    &stellar_rpc_client::Error::JsonRpc(e),
+                )
+            })?;
+        ObservedTransaction::from_json(&answer).ok_or_else(|| NetworkError::RpcResponseMalformed {
+            method: "getTransaction".to_owned(),
+            detail: "the result is not a JSON object".to_owned(),
+        })
+    }
+
     /// Issues `sendTransaction` for `envelope` through the RPC client's
     /// JSON-RPC transport and returns the endpoint's answer as received, its
     /// status included.
@@ -1212,6 +1255,66 @@ pub(crate) fn unexpected_status(
     }
 }
 
+/// One endpoint's `getTransaction` answer as received, with its coverage.
+///
+/// Built by [`StellarRpcClient::get_transaction_observed`]. A field the
+/// answer omits, or holds in another JSON type, is `None`. Coverage ledgers
+/// are positive 32-bit ledger numbers or `None`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ObservedTransaction {
+    /// The status text as received.
+    pub status: Option<String>,
+    /// The including ledger.
+    pub ledger: Option<u32>,
+    /// The raw `createdAt` value: a number, a string or another JSON value.
+    pub created_at: Option<serde_json::Value>,
+    /// The transaction hash text as received.
+    pub tx_hash: Option<String>,
+    /// The envelope XDR text as received.
+    pub envelope_xdr: Option<String>,
+    /// The result XDR text as received.
+    pub result_xdr: Option<String>,
+    /// The endpoint's latest ledger.
+    pub latest_ledger: Option<u32>,
+    /// The endpoint's oldest retained ledger.
+    pub oldest_ledger: Option<u32>,
+}
+
+impl ObservedTransaction {
+    /// Reads the fields of a `getTransaction` result object; `None` when
+    /// `answer` is not an object.
+    #[must_use]
+    pub fn from_json(answer: &serde_json::Value) -> Option<Self> {
+        let object = answer.as_object()?;
+        let text = |name: &str| {
+            object
+                .get(name)
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        };
+        let ledger = |name: &str| {
+            object
+                .get(name)
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|value| u32::try_from(value).ok())
+        };
+        let coverage = |name: &str| ledger(name).filter(|value| *value > 0);
+        Some(Self {
+            status: text("status"),
+            ledger: ledger("ledger"),
+            created_at: object
+                .get("createdAt")
+                .filter(|value| !value.is_null())
+                .cloned(),
+            tx_hash: text("txHash"),
+            envelope_xdr: text("envelopeXdr"),
+            result_xdr: text("resultXdr"),
+            latest_ledger: coverage("latestLedger"),
+            oldest_ledger: coverage("oldestLedger"),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(
@@ -1225,6 +1328,73 @@ mod tests {
     use crate::redact::rpc_error_fixtures::{
         ECHOED_URL, ENDPOINT, ENDPOINT_AUTHORITY, ERROR_OBJECTS, assert_scrubbed, call_error,
     };
+
+    /// Coverage ledgers survive only as positive 32-bit numbers: missing and
+    /// invalid values stay absent, equal values both survive, and the raw
+    /// time and texts are kept as received. One request per read.
+    #[tokio::test]
+    async fn transaction_coverage_missing_invalid_and_equal() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer};
+        let cases = [
+            (serde_json::json!({}), None, None),
+            (
+                serde_json::json!({"latestLedger": 500, "oldestLedger": 500}),
+                Some(500),
+                Some(500),
+            ),
+            (
+                serde_json::json!({"latestLedger": "500", "oldestLedger": -1}),
+                None,
+                None,
+            ),
+            (
+                serde_json::json!({"latestLedger": 0, "oldestLedger": 4_294_967_296_u64}),
+                None,
+                None,
+            ),
+            (
+                serde_json::json!({"latestLedger": 7.5, "oldestLedger": null}),
+                None,
+                None,
+            ),
+            (
+                serde_json::json!({"latestLedger": 900, "oldestLedger": 10}),
+                Some(900),
+                Some(10),
+            ),
+        ];
+        let hash = stellar_xdr::Hash([7; 32]);
+        for (coverage, latest, oldest) in cases {
+            let mut body = serde_json::json!({
+                "status": "NOT_FOUND",
+                "createdAt": "-5",
+                "txHash": "AB07",
+            });
+            for (name, value) in coverage.as_object().unwrap() {
+                body[name] = value.clone();
+            }
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(stellar_agent_test_support::EchoIdResponder::new(body))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let client = StellarRpcClient::new(&server.uri()).unwrap();
+            let observed = client.get_transaction_observed(&hash).await.unwrap();
+            assert_eq!(observed.latest_ledger, latest, "{coverage}");
+            assert_eq!(observed.oldest_ledger, oldest, "{coverage}");
+            assert_eq!(observed.status.as_deref(), Some("NOT_FOUND"));
+            assert_eq!(observed.created_at, Some(serde_json::json!("-5")));
+            assert_eq!(observed.tx_hash.as_deref(), Some("AB07"));
+            assert_eq!(observed.ledger, None);
+            server.verify().await;
+        }
+        assert_eq!(
+            ObservedTransaction::from_json(&serde_json::json!([1])),
+            None
+        );
+    }
 
     fn unreachable_parts(err: NetworkError) -> (String, String) {
         match err {
