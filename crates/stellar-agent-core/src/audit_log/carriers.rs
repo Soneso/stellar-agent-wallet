@@ -12,7 +12,7 @@
 use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
 
-use super::outbox::{OutboxState, legacy_rows, outbox_path, sync_parent_dir};
+use super::outbox::{outbox_path, sync_parent_dir};
 use super::writer::{WriterError, sidecar_path};
 
 /// Result of a carrier binding.
@@ -235,19 +235,6 @@ pub(crate) fn staged_files(log: &Path) -> Result<Vec<PathBuf>, WriterError> {
         }
     }
     Ok(files)
-}
-
-/// The number of rows the staged file of a generation carries when it is a
-/// valid legacy queue under `state`, checked without a key.
-///
-/// Every line is complete and the committed lines chain to the committed
-/// head. Every later line is a tagged row of generation zero at its line.
-///
-/// # Errors
-///
-/// [`WriterError::Io`] when the staged file cannot be read.
-pub(crate) fn stage_rows(staged: &Path, state: &OutboxState) -> Result<Option<u64>, WriterError> {
-    Ok(legacy_rows(&std::fs::read(staged)?, state))
 }
 
 /// Writes `bytes` as the staged file of `generation` and removes every other

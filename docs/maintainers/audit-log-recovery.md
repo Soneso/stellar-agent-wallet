@@ -352,7 +352,7 @@ The saved file can hold consent rows whose approvals may already have taken effe
 **Detail sub-code:** `audit.outbox_rows_missing`
 
 This section applies to a queue without owner state.
-Under owner state the acknowledgement refuses, and section 8.6 says what to do.
+The acknowledgement also applies under owner state, as section 8.6 describes.
 
 The keyring records a committed prefix that the outbox does not hold unchanged and in order.
 Every keyed writer acquisition and every draining write refuses.
@@ -390,7 +390,7 @@ It reports `expected_rows` from the commitment recorded at retirement and `found
 It revokes as above, appends the intact active queue, and resets the retired watch to the commitment it observed.
 When active and retired losses coexist, `expected_rows` and `found_rows` describe the active queue.
 The same acknowledgement also resets the retired watch to the observed commitment; it leaves no second acknowledgement pending.
-Under owner state, the acknowledgement records only the retired loss and resets the watch; the active queue stays for the owner drain (section 8.6).
+For a watch-only loss under owner state, the acknowledgement records the retired loss and resets the watch; the clean active queue stays unchanged (section 8.6).
 
 ### 8.4 Carrier identities and generations
 
@@ -483,6 +483,14 @@ binding remains marked incomplete until the renames finish. That rerun leaves
 the retired watch to the next ordinary acquisition, which refuses while a
 changed retired commitment is not acknowledged.
 
+An interrupted binding recognizes a legacy holder's delivery when its commitment
+is zero and every source row matches the active log tail in order.
+It clears that delivered source before restaging an empty queue, so another
+interruption retains the recognition.
+A partial match refuses without changing the source or stage.
+The retired watch still requires acknowledgement, while the empty successor
+reports no pending row loss.
+
 `audit reanchor` and `audit acknowledge-outbox-loss` always take all three
 carriers at their paths with try-locks. When the carriers are not the recorded
 ones, reanchor skips its drain and reports the carrier refusal in `warnings`.
@@ -498,15 +506,15 @@ The keyring then holds owner state at the active commitment's account with the s
 The first line of `<log>.outbox` is then a generation line, `{"k":"gen",...}`.
 Each later row carries its queue generation, its position, and a tag under the audit key.
 
-**What refuses.** `audit acknowledge-outbox-loss` refuses with `audit.outbox_unusable` and the reason `queue held by owner state`.
-It refuses before it revokes a permission or writes anything.
-A changed retired commitment is still acknowledged.
-The verb then records it and resets the retired watch, and the active queue and its commitment stay as they are.
+**What refuses.** `audit acknowledge-outbox-loss` records the loss, delivers the authenticated prefix, and discards the remaining rows.
+Without a loss it refuses with `audit.outbox_loss_not_found` before it revokes a permission or writes anything.
+A changed retired commitment is also acknowledged.
+For a watch-only loss, the verb records it and resets the retired watch; the active queue and its commitment stay unchanged.
 A drain refuses a queue whose generation line, positions, or closed batch the owner state does not hold.
 It reports `audit.outbox_rows_missing` or `audit.outbox_unusable` and leaves the queue unchanged.
 
 **Recovery.** Keep `<log>.outbox` in place, and keep the keyring entries.
-Do not move, truncate, or edit the file: owner state stays, the acknowledgement still refuses, and a moved queue is not delivered.
+Preserve the file for inspection, then acknowledge its loss to deliver the authenticated prefix and discard the remaining rows.
 Fix the cause the refusal names, then run a keyed CLI verb or start the MCP server.
 Its drain delivers the queued rows at least once and publishes the next generation line.
 A repeated row keeps its `request_id`.
@@ -608,7 +616,7 @@ record; keep it with the incident record.
 1. Restore the trusted key from a copy of that keyring entry, such as a keychain backup, to the entry the profile's `audit_log_hash_chain_key_id` names. The log, its anchor, and its entry tags then verify as before, and `audit verify --profile <name>` confirms it.
 2. Without a copy, the existing log stays evidence that only its hash chain checks. Stop the processes that use the profile, then move every file of the log out of the audit directory with the incident record: the active file, its rotated files, their `.root_hmac` sidecars, `<log>.pruned` and its sidecar, and `<log>.outbox`. `stellar-agent audit verify <saved-log>` without `--profile` still walks the moved chain.
 3. Remove the corrupt keyring entry with the platform keyring tool, such as Keychain Access on macOS, Seahorse on Linux, or Credential Manager on Windows.
-4. Run `stellar-agent audit reanchor --profile <name> --acknowledge-rollback`. The stored anchor still names the moved log, so the new, empty log is refused with `audit.tip_anchor_mismatch` until this re-anchor acknowledges it. When the keyring still commits queued operator rows of the moved outbox, the repair stands and the envelope's `warnings` list `audit.outbox_rows_missing`; acknowledge that loss as in section 8.3 before the next step. That acknowledgement applies to a queue without owner state; under owner state it refuses (section 8.6).
+4. Run `stellar-agent audit reanchor --profile <name> --acknowledge-rollback`. The stored anchor still names the moved log, so the new, empty log is refused with `audit.tip_anchor_mismatch` until this re-anchor acknowledges it. When the keyring still commits queued operator rows of the moved outbox, the repair stands and the envelope's `warnings` list `audit.outbox_rows_missing`; acknowledge that loss as in section 8.3 before the next step. That acknowledgement also applies under owner state (section 8.6).
 5. Run `stellar-agent profile rotate-audit-key <name>` to mint a new key. Its first keyed acquisition puts entry tags in force on the new log.
 
 On a log without entry tags, steps 3 and 5 alone apply: the rotation opens the log under its anchor, or adopts it as section 5 describes, mints the key, and re-signs the log's chain-root sidecars under it.
