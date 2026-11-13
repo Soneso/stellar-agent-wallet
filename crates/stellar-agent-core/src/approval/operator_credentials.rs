@@ -84,13 +84,12 @@ const CREDENTIAL_ID_MAX_BYTES: usize = 64;
 /// `0x04 || X (32 bytes) || Y (32 bytes)`.
 const PUBLIC_KEY_UNCOMPRESSED_SEC1_LEN: usize = 65;
 
-/// Attempts at taking the write lock before a mutation refuses with
-/// [`ApprovalError::WriterLocked`].
+/// Default wait expressed as attempts, with a backoff between each pair.
 const WRITE_LOCK_ATTEMPTS: u32 = 5;
 
 /// Pause between two attempts at taking the write lock. With
-/// [`WRITE_LOCK_ATTEMPTS`] a contended mutation waits at most 80 ms before it
-/// refuses; every critical section is one small TOML load, edit and rename.
+/// [`WRITE_LOCK_ATTEMPTS`] the default timeout is 80 ms; every critical section
+/// is one small TOML load, edit and rename.
 const WRITE_LOCK_BACKOFF: Duration = Duration::from_millis(20);
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -319,6 +318,7 @@ struct OperatorCredentialStoreFile {
 /// per profile.
 pub struct OperatorApprovalCredentialStore {
     path: PathBuf,
+    write_lock_timeout: Duration,
 }
 
 impl std::fmt::Debug for OperatorApprovalCredentialStore {
@@ -337,7 +337,18 @@ impl OperatorApprovalCredentialStore {
     /// when the file does not yet exist.
     #[must_use]
     pub fn new(path: PathBuf) -> Self {
-        Self { path }
+        Self {
+            path,
+            write_lock_timeout: WRITE_LOCK_BACKOFF * (WRITE_LOCK_ATTEMPTS - 1),
+        }
+    }
+
+    /// Sets the maximum wait for this handle's write lock, using 20 ms backoff steps.
+    /// Mutations block the calling thread while waiting.
+    #[must_use]
+    pub fn with_write_lock_timeout(mut self, timeout: Duration) -> Self {
+        self.write_lock_timeout = timeout;
+        self
     }
 
     /// Returns the path to this store's TOML file.
@@ -426,27 +437,29 @@ impl OperatorApprovalCredentialStore {
         Ok(())
     }
 
-    /// Takes the store's write lock, retrying a held lock a bounded number of
-    /// times.
+    /// Takes the store's write lock, retrying every 20 ms until this handle's
+    /// write-lock timeout elapses.
     ///
     /// # Errors
     ///
-    /// - [`ApprovalError::WriterLocked`] when every attempt finds the lock
-    ///   held by another writer.
+    /// - [`ApprovalError::WriterLocked`] when the lock stays held past the timeout.
     /// - [`ApprovalError::Io`] when the directory or the lock file cannot be
     ///   created or locked.
     fn acquire_write_lock(&self) -> Result<OperatorCredentialWriteLock, ApprovalError> {
         self.ensure_parent_dir()?;
         let lock_file = lock_path(&self.path);
-        let mut attempt = 0_u32;
+        let started = std::time::Instant::now();
         loop {
-            attempt += 1;
             match LockHandle::acquire(&lock_file) {
                 Ok(handle) => return Ok(OperatorCredentialWriteLock { _handle: handle }),
-                Err(ApprovalError::WriterLocked) if attempt < WRITE_LOCK_ATTEMPTS => {
-                    #[cfg(test)]
+                Err(ApprovalError::WriterLocked) => {
+                    let remaining = self.write_lock_timeout.saturating_sub(started.elapsed());
+                    if remaining.is_zero() {
+                        return Err(ApprovalError::WriterLocked);
+                    }
+                    #[cfg(any(test, feature = "test-helpers"))]
                     test_hooks::fire(&self.path, test_hooks::Point::Busy);
-                    std::thread::sleep(WRITE_LOCK_BACKOFF);
+                    std::thread::sleep(WRITE_LOCK_BACKOFF.min(remaining));
                 }
                 Err(other) => return Err(other),
             }
@@ -772,15 +785,16 @@ pub fn default_operator_approval_credentials_path(
 
 /// Pause points inside the write path, so a test can interleave two writers
 /// deterministically.
-#[cfg(test)]
-pub(crate) mod test_hooks {
+#[cfg(any(test, feature = "test-helpers"))]
+#[doc(hidden)]
+pub mod test_hooks {
     use std::collections::HashMap;
     use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex};
 
     /// Where a writer calls its hook.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub(crate) enum Point {
+    pub enum Point {
         /// The writer holds the write lock and has applied its change; the
         /// replacement file is not yet renamed into place.
         Locked,
@@ -798,7 +812,7 @@ pub(crate) mod test_hooks {
     }
 
     /// Installs `hook` for the store at `path`, replacing any earlier one.
-    pub(crate) fn install(path: &Path, hook: impl Fn(Point) + Send + Sync + 'static) {
+    pub fn install(path: &Path, hook: impl Fn(Point) + Send + Sync + 'static) {
         hooks()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -806,7 +820,7 @@ pub(crate) mod test_hooks {
     }
 
     /// Removes the hook for the store at `path`.
-    pub(crate) fn clear(path: &Path) {
+    pub fn clear(path: &Path) {
         hooks()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
