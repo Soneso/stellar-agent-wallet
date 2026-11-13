@@ -208,9 +208,9 @@ Several rules may carry one, and every table must equal the policy's first in
 mode, asset, both bounds, and window.
 Equal budget tables share one counter per asset across the rules that carry
 them. A rule without a table, its allow list, and its caps are unaffected.
-Address kinds are alternatives. G_ACCOUNT covers G and M; C_ACCOUNT covers C.
+Address kinds are alternatives. G_ACCOUNT covers G and M; C_ACCOUNT covers C and W.
 A destination is listed only when its kind is selected and its exact string or
-base G appears in the list. An exact M entry covers only that mux id.
+base G or C appears in the list. An exact M or W entry covers only that mux id.
 Issuer and verified-domain checks also apply before the mode.
 A missing destination or asset, an unverified home domain, a reserved kind,
 or a gated-inflow failure refuses in every mode.

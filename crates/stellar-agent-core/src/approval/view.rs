@@ -2013,6 +2013,35 @@ mod tests {
     }
 
     #[test]
+    fn muxed_destinations_keep_their_full_view() {
+        use stellar_agent_test_support::xdr_fixtures::{
+            destination_transfer, muxed_contract_address,
+        };
+        for destination in [
+            muxed_contract_address(),
+            stellar_xdr::ScAddress::MuxedAccount(stellar_xdr::MuxedEd25519Account {
+                id: 7,
+                ed25519: stellar_xdr::Uint256([1; 32]),
+            }),
+        ] {
+            let entry = PendingApproval::new_x402_pending(
+                &[1; 32],
+                &destination_transfer(destination.clone()),
+                None,
+                "1000".into(),
+                DEFAULT_TTL_MS,
+            )
+            .unwrap();
+            let ApprovalSummaryView::X402Payment { payee, .. } =
+                PendingApprovalView::from_entry(&entry, TEST_NOW_MS).summary
+            else {
+                panic!("payment");
+            };
+            assert_eq!(payee, Some(destination.to_string()));
+        }
+    }
+
+    #[test]
     fn mpp_view_checks_every_fingerprinted_term_and_the_binding_digests() {
         // Transport, authority and target enter the fingerprint only through
         // the context digest; the MPP commit compares them with the prepared

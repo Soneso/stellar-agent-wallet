@@ -140,6 +140,9 @@ SEP-43 wire codes (`error.code` under the standard envelope, from `Sep43Error::w
 | `sep43.invalid_xdr`, `sep43.invalid_address`, `sep43.invalid_network_passphrase`, `sep43.missing_address`, `sep43.malformed_auth_entry`, `sep43.invalid_message` | Client-invalid request |
 | `sep43.user_rejected` | User rejected |
 
+The transaction and auth-entry tools refuse XDR containing a muxed contract
+address (W) with `sep43.invalid_xdr` before key access or storing a request.
+
 The structural mainnet refusal (sign-only tools, before any key access) carries the canonical `network.mainnet_write_forbidden` code shared with every other signing surface, not a `sep43.*` code.
 
 `sign_message` refusals before key load (an overlaid or out-of-scope signer, an unavailable audit writer) carry `profile.*` and `audit.*` codes, not `sep43.*` codes.

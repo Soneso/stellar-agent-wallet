@@ -1,7 +1,7 @@
 //! Dependency upgrades require inspection of the RPC client's XDR decodes.
 //!
 //! The wallet reads `getTransaction` raw. `StellarRpcClient::get_transaction_record`
-//! deserializes `stellar-rpc-client`'s `GetTransactionResponseRaw` (28.0.0,
+//! deserializes `stellar-rpc-client`'s `GetTransactionResponseRaw` (30.0.0,
 //! `src/lib.rs` lines 130-182, events at 186-208), which carries every XDR
 //! field as base64, and decodes none of them. The wallet decodes those fields
 //! itself, on demand, under `untrusted_decode_limits(encoded.len())`, bounding
@@ -44,7 +44,7 @@ fn reconciliation_decode_boundary_requires_pinned_client() {
         .collect();
     assert_eq!(
         versions,
-        ["version = \"28.0.0\""],
+        ["version = \"30.0.0\""],
         "inspect the client's raw getTransaction type and its internal decodes, and update the RPC decode boundary documentation when its version changes"
     );
 }

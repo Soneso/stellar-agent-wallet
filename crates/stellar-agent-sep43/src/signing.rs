@@ -331,6 +331,11 @@ fn decode_preimage(
     .map_err(|e| Sep43Error::InvalidXdr {
         detail: format!("failed to decode HashIdPreimage: {e}"),
     })?;
+    if stellar_agent_core::sc_address::preimage_has_muxed_contract(&preimage) {
+        return Err(Sep43Error::InvalidXdr {
+            detail: stellar_agent_core::sc_address::MUXED_CONTRACT_REFUSAL.to_owned(),
+        });
+    }
     let Some((_, network_id, _)) = preimage_parts(&preimage) else {
         return Err(Sep43Error::MalformedAuthEntry {
             detail: "preimage is not a Soroban authorization HashIdPreimage \
@@ -351,6 +356,24 @@ fn decode_preimage(
         preimage,
         network_id,
     })
+}
+
+/// Refuses a W address at intake before an authorization request persists.
+/// Malformed XDR remains subject to the caller's existing validation order.
+///
+/// # Errors
+/// Returns `sep43.invalid_xdr` for a CAP-84 muxed contract address.
+pub fn check_preimage_address_forms(encoded: &str) -> Result<(), Sep43Error> {
+    if let Ok(preimage) = HashIdPreimage::from_xdr_base64(
+        encoded,
+        stellar_agent_xdr_limits::untrusted_decode_limits(encoded.len()),
+    ) && stellar_agent_core::sc_address::preimage_has_muxed_contract(&preimage)
+    {
+        return Err(Sep43Error::InvalidXdr {
+            detail: stellar_agent_core::sc_address::MUXED_CONTRACT_REFUSAL.to_owned(),
+        });
+    }
+    Ok(())
 }
 
 /// Requires a type 10 preimage to be bound to the account of `key`; a type 9
@@ -528,6 +551,50 @@ mod tests {
     // ── Fixture helpers ───────────────────────────────────────────────────────
 
     const TESTNET: &str = "Test SDF Network ; September 2015";
+
+    #[tokio::test]
+    async fn muxed_contract_preimage_refuses_before_signature() {
+        use stellar_xdr::{Hash, Limits, ScVal, WriteXdr};
+        let signer = CountingSigner::new([5; 32]);
+        let mut preimage = HashIdPreimage::from_xdr_base64(
+            minimal_soroban_auth_preimage_xdr(TESTNET),
+            Limits::none(),
+        )
+        .unwrap();
+        let HashIdPreimage::SorobanAuthorization(auth) = &mut preimage else {
+            panic!("authorization");
+        };
+        let stellar_xdr::SorobanAuthorizedFunction::ContractFn(call) =
+            &mut auth.invocation.function
+        else {
+            panic!("call");
+        };
+        call.args = vec![ScVal::Address(ScAddress::MuxedContract(
+            stellar_xdr::MuxedContract {
+                id: 7,
+                contract_id: stellar_xdr::ContractId(Hash([3; 32])),
+            },
+        ))]
+        .try_into()
+        .unwrap();
+        let encoded = preimage.to_xdr_base64(Limits::none()).unwrap();
+        let result = sign_soroban_auth_entry(
+            &encoded,
+            &signer,
+            &stellar_strkey::ed25519::PublicKey([1; 32]),
+            TESTNET,
+            None,
+        )
+        .await;
+        assert_eq!(signer.sign_calls(), 0);
+        let error = result.unwrap_err();
+        assert_eq!(error.wire_code(), "sep43.invalid_xdr");
+        assert!(
+            error
+                .to_string()
+                .ends_with("a muxed contract address (W) is not accepted on this path")
+        );
+    }
 
     /// Builds a minimal valid `TransactionEnvelope::Tx` (V1) XDR for signing
     /// tests.  The envelope carries a single `BUMP_SEQUENCE` operation sourced

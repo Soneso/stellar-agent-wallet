@@ -77,7 +77,7 @@ are taken as received, and the wallet decodes the envelope itself with
 the encoded input size. An envelope that does not decode is refused as
 `mpp.reconciliation_unavailable`. The result meta is never decoded, so an
 answer whose meta the wallet's XDR cannot decode still reconciles. Of the
-typed calls the wallet still makes through `stellar-rpc-client`, only
+typed calls the wallet makes through `stellar-rpc-client 30.0.0`, only
 `sendTransaction` decodes XDR inside the client, for its error result, bounded
 in depth to 500 with no length bound. The test at
 `crates/stellar-agent-mpp/tests/rpc_decode_boundary.rs` holds the inventory of

@@ -6,7 +6,7 @@
 //! # Supported kinds
 //!
 //! - `G_ACCOUNT`: G or M destination address.
-//! - `C_ACCOUNT`: C destination address.
+//! - `C_ACCOUNT`: C or W destination address.
 //! - `KNOWN_ISSUER` — asset issuer G-strkey for non-native payments.
 //! - `HOME_DOMAIN` — the `home_domain` field of the destination's on-chain
 //!   `AccountEntry`, resolved via `AccountIdentityView::home_domain`.
@@ -33,10 +33,9 @@
 //!
 //! G and C kinds are alternatives in one address check. A destination is
 //! listed only when its kind is selected and its exact string or base address
-//! occurs in the list. An M address uses G_ACCOUNT and its G base.
-//! Entries compare byte for byte. An exact M entry covers only that mux id.
-//! The criterion matches the destination it receives. Payment-envelope decoding
-//! supplies the base G of an M destination.
+//! occurs in the list. M uses G_ACCOUNT and its G base; W uses C_ACCOUNT
+//! and its C base. Entries compare byte for byte. An exact M or W entry
+//! covers only that mux id. Payment-envelope decoding supplies the full M.
 //! The check runs at the first address kind; duplicates add no check.
 //! Issuer and domain checks remain required before the unlisted mode applies.
 //! With no address kind, no address check runs.
@@ -1053,7 +1052,7 @@ impl CounterpartyAllowlistCriterion {
             };
             PolicyError::CriterionEvaluationFailed {
                 detail: format!(
-                    "counterparty_allowlist: {field} for tool '{}' is not a G, M, or C strkey",
+                    "counterparty_allowlist: {field} for tool '{}' is not a G, M, C, or W strkey",
                     ctx.tool.name
                 ),
             }
@@ -1270,7 +1269,10 @@ fn destination_form(d: &str) -> Option<(CounterpartyKind, String)> {
             format!("{}", PublicKey(m.ed25519)),
         )),
         Strkey::Contract(_) => Some((CounterpartyKind::CAccount, d.to_owned())),
-        // The W destination arm belongs here when the decoder supports it.
+        Strkey::MuxedContract(w) => Some((
+            CounterpartyKind::CAccount,
+            format!("{}", stellar_strkey::Contract(w.contract_id)),
+        )),
         Strkey::PreAuthTx(_) => None,
         Strkey::HashX(_) => None,
         Strkey::SignedPayloadEd25519(_) => None,
@@ -1384,6 +1386,176 @@ mod tests {
                 id
             }
         )
+    }
+
+    fn key_w(contract: u8, id: u64) -> String {
+        format!(
+            "{}",
+            stellar_strkey::MuxedContract {
+                contract_id: [contract; 32],
+                id
+            }
+        )
+    }
+
+    #[test]
+    fn muxed_payment_decoder_keeps_exact_destination() {
+        use stellar_xdr::*;
+        let envelope = TransactionEnvelope::Tx(TransactionV1Envelope {
+            tx: Transaction {
+                operations: vec![Operation {
+                    source_account: None,
+                    body: OperationBody::Payment(PaymentOp {
+                        destination: stellar_xdr::MuxedAccount::MuxedEd25519(
+                            MuxedAccountMed25519 {
+                                id: 7,
+                                ed25519: Uint256([1; 32]),
+                            },
+                        ),
+                        asset: Asset::Native,
+                        amount: 1,
+                    }),
+                }]
+                .try_into()
+                .unwrap(),
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .to_xdr_base64(Limits::none())
+        .unwrap();
+        let args =
+            crate::envelope_decode::decode_authoritative_args(&envelope, "stellar_pay_commit")
+                .unwrap();
+        assert_eq!(args["destination"], key_m(7));
+        for (entry, class) in [
+            (key_g(), RecipientClass::Listed),
+            (key_m(7), RecipientClass::Listed),
+            (key_m(8), RecipientClass::Unlisted),
+        ] {
+            let criterion =
+                criterion_of(&[CounterpartyKind::GAccount], &[entry], UnlistedMode::Deny);
+            in_ctx(
+                pay_value(args["destination"].as_str(), "native"),
+                args.clone(),
+                |ctx| assert_eq!(criterion.recipient_class(ctx).unwrap(), Some(class)),
+            );
+        }
+    }
+
+    #[test]
+    fn muxed_contract_base_and_exact_entries_match_on_both_paths() {
+        use RecipientClass::{Listed, Unlisted};
+        for (list, classes) in [
+            (vec![key_c()], [Listed, Listed, Unlisted, Listed]),
+            (vec![key_w(3, 7)], [Listed, Unlisted, Unlisted, Unlisted]),
+            (vec![key_w(3, 7).to_ascii_lowercase()], [Unlisted; 4]),
+            (vec![], [Unlisted; 4]),
+        ] {
+            let criterion = criterion_of(&[CounterpartyKind::CAccount], &list, UnlistedMode::Deny);
+            for (destination, class) in [key_w(3, 7), key_w(3, 8), key_w(4, 7), key_c()]
+                .into_iter()
+                .zip(classes)
+            {
+                for value in [
+                    pay_value(Some(&destination), "native"),
+                    ValueClass::ReadOnly,
+                ] {
+                    in_ctx(value, json!({"destination": destination}), |ctx| {
+                        assert_eq!(
+                            criterion.address_class_for_test(ctx, &destination).unwrap(),
+                            class
+                        );
+                        let expected = if class == Listed {
+                            Decision::Allow
+                        } else {
+                            counterparty_denial("C_ACCOUNT", &destination)
+                        };
+                        assert_eq!(
+                            criterion.evaluate_decision(ctx).unwrap(),
+                            expected,
+                            "{list:?} {destination}"
+                        );
+                    });
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn muxed_contract_own_kind_and_unlisted_modes() {
+        for mode in every_mode() {
+            let criterion =
+                criterion_of(&[CounterpartyKind::GAccount], &[key_w(3, 7)], mode.clone());
+            in_ctx(pay_value(Some(&key_w(3, 7)), "native"), json!({}), |ctx| {
+                assert_eq!(
+                    criterion.recipient_class(ctx).unwrap(),
+                    Some(RecipientClass::Unlisted)
+                );
+                match mode {
+                    UnlistedMode::Deny => assert_eq!(
+                        criterion.evaluate_decision(ctx).unwrap(),
+                        counterparty_denial("C_ACCOUNT", &key_w(3, 7))
+                    ),
+                    UnlistedMode::Approval => assert!(matches!(
+                        criterion.evaluate_decision(ctx).unwrap(),
+                        Decision::RequireApproval(_)
+                    )),
+                    UnlistedMode::Budget(_) => {
+                        assert_eq!(criterion.evaluate_decision(ctx).unwrap(), Decision::Allow);
+                        let mut value = pay_value(Some(&key_w(3, 7)), "native");
+                        if let ValueClass::Value(effects) = &mut value {
+                            *effects = effects
+                                .clone()
+                                .with_recipient_class(Some(RecipientClass::Unlisted));
+                        }
+                        in_ctx(value, json!({}), |sized| {
+                            assert!(criterion.size(sized, 0).unwrap().is_some())
+                        });
+                    }
+                }
+            });
+        }
+    }
+
+    #[test]
+    fn muxed_contract_preserves_non_address_conjunctions() {
+        use crate::policy::v1::value::ActionKind;
+        for mode in every_mode() {
+            for kinds in [
+                vec![],
+                vec![CounterpartyKind::CAccount],
+                vec![CounterpartyKind::CAccount, CounterpartyKind::KnownIssuer],
+                vec![CounterpartyKind::CAccount, CounterpartyKind::HomeDomain],
+            ] {
+                let criterion = criterion_of(&kinds, &[key_c()], mode.clone());
+                for (action, asset) in [
+                    (ActionKind::Payment, "native".to_owned()),
+                    (ActionKind::Payment, format!("USD:{}", key_i())),
+                    (ActionKind::Claim, "native".to_owned()),
+                    (ActionKind::Trustline, "native".to_owned()),
+                ] {
+                    let evaluate = |destination: String| {
+                        in_ctx(
+                            ValueClass::single(ValueLeg {
+                                kind: action,
+                                destination: Some(destination),
+                                amount: Some(1),
+                                asset: Some(asset.clone()),
+                            }),
+                            json!({}),
+                            |ctx| {
+                                (
+                                    criterion.recipient_class(ctx).unwrap(),
+                                    criterion.evaluate_decision(ctx).unwrap(),
+                                )
+                            },
+                        )
+                    };
+                    assert_eq!(evaluate(key_w(3, 7)), evaluate(key_c()), "{kinds:?}");
+                }
+            }
+        }
     }
     fn pay_value(destination: Option<&str>, asset: &str) -> ValueClass {
         ValueClass::single(ValueLeg {
@@ -1635,7 +1807,7 @@ mod tests {
                     assert_eq!(
                         detail,
                         format!(
-                            "counterparty_allowlist: {field} for tool 'registry_read' is not a G, M, or C strkey"
+                            "counterparty_allowlist: {field} for tool 'registry_read' is not a G, M, C, or W strkey"
                         )
                     );
                     assert!(!detail.contains(&d));

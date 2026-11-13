@@ -681,6 +681,12 @@ async fn run_sign_only<InitKeyring>(
 where
     InitKeyring: Fn() -> Result<(), WalletError>,
 {
+    if let Err(e) =
+        stellar_agent_network::signing::envelope_signing::check_envelope_address_forms(unsigned_xdr)
+    {
+        print_error(&Envelope::<()>::err(&e), args.output);
+        return 1;
+    }
     match init_keyring_for_origin(args, resolved, origin, init_keyring) {
         Ok(()) => (),
         Err(code) => return code,
@@ -773,6 +779,12 @@ async fn run_submit_only<InitKeyring>(
 where
     InitKeyring: Fn() -> Result<(), WalletError>,
 {
+    if let Err(e) =
+        stellar_agent_network::signing::envelope_signing::check_envelope_address_forms(signed_xdr)
+    {
+        print_error(&Envelope::<()>::err(&e), args.output);
+        return 1;
+    }
     match init_keyring_for_origin(args, resolved, origin, init_keyring) {
         Ok(()) => (),
         Err(code) => return code,
@@ -1186,10 +1198,11 @@ impl StagedPayment {
                 detail: format!("the decoded payment's {name} is out of range"),
             })
         };
-        let destination = field("destination")?
-            .as_str()
-            .ok_or_else(|| unusable("destination"))?
-            .to_owned();
+        let destination = payment_account_address(
+            field("destination")?
+                .as_str()
+                .ok_or_else(|| unusable("destination"))?,
+        );
         let asset = Asset::parse(field("asset")?.as_str().ok_or_else(|| unusable("asset"))?)?;
         let amount_stroops = field("amount_stroops")?
             .as_str()
@@ -1787,11 +1800,26 @@ async fn read_destination(
     client: &StellarRpcClient,
     destination: &str,
 ) -> Result<Option<stellar_agent_network::AccountView>, WalletError> {
-    match stellar_agent_network::fetch_account(client, destination, &[]).await {
+    match stellar_agent_network::fetch_account(client, &payment_account_address(destination), &[])
+        .await
+    {
         Ok(view) => Ok(Some(view)),
         Err(WalletError::Network(NetworkError::AccountNotFound { .. })) => Ok(None),
         Err(e) => Err(e),
     }
+}
+
+/// Account reads and witnesses address the G account underlying an M destination.
+fn payment_account_address(destination: &str) -> String {
+    stellar_strkey::ed25519::MuxedAccount::from_string(destination).map_or_else(
+        |_| destination.to_owned(),
+        |muxed| {
+            stellar_strkey::ed25519::PublicKey(muxed.ed25519)
+                .to_string()
+                .as_str()
+                .to_owned()
+        },
+    )
 }
 
 /// The primary observations a payment stage's decision used.
@@ -3595,6 +3623,90 @@ pub(crate) mod tests {
         )
     }
 
+    #[tokio::test]
+    async fn muxed_contract_full_pay_without_memo_refuses() {
+        let destination =
+            stellar_agent_test_support::xdr_fixtures::muxed_contract_address().to_string();
+        let endpoint = format!("http://{}:9", std::net::Ipv4Addr::LOCALHOST);
+        let client = stellar_agent_network::StellarRpcClient::new(&endpoint).unwrap();
+        let error = stellar_agent_network::account::fetch_data_entry(
+            &client,
+            &destination,
+            "config.memo_required",
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code(), "protocol.xdr_codec_failed");
+    }
+
+    #[test]
+    fn muxed_contract_full_pay_with_memo_refuses() {
+        let destination =
+            stellar_agent_test_support::xdr_fixtures::muxed_contract_address().to_string();
+        let source = stellar_strkey::ed25519::PublicKey([1; 32]).to_string();
+        let mut builder = stellar_agent_network::builder::ClassicOpBuilder::new(
+            source.as_str(),
+            1,
+            "Test SDF Network ; September 2015",
+            100,
+        );
+        let error = builder
+            .payment(
+                &destination,
+                StellarAmount::from_stroops(1),
+                &stellar_agent_network::builder::Asset::Native,
+            )
+            .err()
+            .unwrap();
+        assert_eq!(error.code(), "validation.address_invalid");
+    }
+
+    #[tokio::test]
+    async fn muxed_contract_staged_pay_refuses_before_keyring() {
+        let args = minimal_args();
+        let context = flag_context(&args);
+        let resolved = ResolvedProfileName::from_flag("operator");
+        let profile = staged_test_profile();
+        let encoded = stellar_agent_test_support::xdr_fixtures::muxed_contract_envelope();
+        let accesses = std::cell::Cell::new(0);
+        let init = || {
+            accesses.set(accesses.get() + 1);
+            Err(WalletError::Protocol(
+                stellar_agent_core::error::ProtocolError::XdrCodecFailed {
+                    detail: "keyring reached".into(),
+                },
+            ))
+        };
+        assert_eq!(
+            run_sign_only(
+                &context,
+                &args,
+                &resolved,
+                &encoded,
+                &profile,
+                ProfileOrigin::Persisted,
+                init
+            )
+            .await,
+            1
+        );
+        assert_eq!(accesses.get(), 0);
+        assert_eq!(
+            run_submit_only(
+                &context,
+                &args,
+                &resolved,
+                &encoded,
+                &profile,
+                ProfileOrigin::Persisted,
+                init
+            )
+            .await,
+            1
+        );
+        assert_eq!(accesses.get(), 0);
+    }
+
     // ── --use-oz-relayer opt-in gate ──────────────────────────────────────────
 
     /// `--use-oz-relayer` parses into `PayArgs.use_oz_relayer == true`.
@@ -4173,6 +4285,56 @@ pub(crate) mod tests {
             "alice",
         )
         .build()
+    }
+
+    #[test]
+    fn muxed_payment_staged_gate_matches_exact_or_base() {
+        use stellar_agent_core::policy::v1::criteria::counterparty_allowlist::{
+            CounterpartyAllowlistCriterion, CounterpartyKind,
+        };
+        let m = |id| {
+            stellar_xdr::MuxedAccount::MuxedEd25519(stellar_xdr::MuxedAccountMed25519 {
+                id,
+                ed25519: Uint256(g_to_bytes(DEST_G)),
+            })
+        };
+        let xdr = build_envelope_b64(
+            SOURCE_G,
+            Operation {
+                source_account: None,
+                body: OperationBody::Payment(PaymentOp {
+                    destination: m(7),
+                    asset: Asset::Native,
+                    amount: 1,
+                }),
+            },
+        );
+        for (entry, allowed) in [
+            (DEST_G.to_owned(), true),
+            (m(7).to_string(), true),
+            (m(8).to_string(), false),
+        ] {
+            let engine = staged_policy_engine(
+                CounterpartyAllowlistCriterion::new(vec![CounterpartyKind::GAccount], vec![entry]),
+                false,
+            );
+            let decoded = stellar_agent_core::envelope_decode::decode_authoritative_args(
+                &xdr,
+                "stellar_pay_commit",
+            );
+            assert_eq!(
+                dispatch_staged_pay_gate(
+                    &engine,
+                    &staged_test_profile(),
+                    "stellar:testnet",
+                    decoded,
+                    None,
+                    None
+                )
+                .is_ok(),
+                allowed
+            );
+        }
     }
 
     fn envelope_code(

@@ -1490,6 +1490,66 @@ mod tests {
 
     // ── decode_payment_required_input ──────────────────────────────────────────
 
+    #[tokio::test]
+    #[serial_test::serial(keyring)]
+    async fn muxed_contract_payment_refuses_before_state() {
+        let home = tempfile::tempdir().unwrap();
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        let server = make_require_approval_server();
+        let mut requirements: serde_json::Value =
+            serde_json::from_str(&sample_requirements_json()).unwrap();
+        requirements["payTo"] = serde_json::json!(
+            stellar_agent_test_support::xdr_fixtures::muxed_contract_address().to_string()
+        );
+        let before = std::fs::read_dir(home.path()).unwrap().count();
+        let result = server
+            .call_stellar_x402_create_payment(X402CreatePaymentArgs {
+                payment_required: requirements.to_string(),
+                chain_id: "stellar:testnet".to_owned(),
+                address: None,
+                business_id: None,
+                approval_nonce: None,
+                approval_attestation: None,
+            })
+            .await
+            .unwrap();
+        let (code, message, text) = crate::tools::common::assert_business_envelope(&result);
+        assert_eq!(code, "x402.invalid_recipient_address");
+        assert_eq!(
+            message,
+            "invalid recipient address: pay_to must be a G-, C-, or M-strkey"
+        );
+        assert!(!text.contains("paymentSignature"));
+        assert_eq!(std::fs::read_dir(home.path()).unwrap().count(), before);
+    }
+
+    #[cfg(feature = "mainnet-write")]
+    #[tokio::test]
+    #[serial_test::serial(keyring)]
+    async fn muxed_contract_mainnet_payment_refuses_before_state() {
+        use crate::tools::common::tests::mainnet::{Fixture, authorizations, x402_args};
+        let f = Fixture::new(|raw| raw);
+        let mut args = x402_args(&f, None);
+        let mut requirements = f.requirements();
+        requirements.pay_to =
+            stellar_agent_test_support::xdr_fixtures::muxed_contract_address().to_string();
+        args.payment_required = serde_json::to_string(&requirements).unwrap();
+        let result = f
+            .server
+            .call_stellar_x402_create_payment(args)
+            .await
+            .unwrap();
+        let (code, message, _) = crate::tools::common::assert_business_envelope(&result);
+        assert_eq!(code, "x402.invalid_recipient_address");
+        assert_eq!(
+            message,
+            "invalid recipient address: pay_to must be a G-, C-, or M-strkey"
+        );
+        assert_eq!(f.seed_reads.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(authorizations(&f).is_empty());
+    }
+
     fn sample_requirements_json() -> String {
         serde_json::json!({
             "scheme": "exact",

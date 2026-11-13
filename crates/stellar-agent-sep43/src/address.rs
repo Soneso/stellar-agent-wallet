@@ -115,6 +115,10 @@ pub fn validate_strkey(addr: &str) -> Result<ActiveAddressType, Sep43Error> {
         Ok(Strkey::PublicKeyEd25519(_)) => Ok(ActiveAddressType::ClassicG),
         Ok(Strkey::Contract(_)) => Ok(ActiveAddressType::SmartAccountC),
         Ok(Strkey::MuxedAccountEd25519(_)) => Ok(ActiveAddressType::MuxedM),
+        Ok(Strkey::MuxedContract(_)) => Err(Sep43Error::InvalidAddress {
+            detail: "a muxed contract address (W) is not a signer".to_owned(),
+            expected_type: "G-strkey, C-strkey, or M-strkey",
+        }),
         Ok(_) => Err(Sep43Error::InvalidAddress {
             detail: "address kind is not a valid signing address (expected G, C, or M strkey)"
                 .to_owned(),
@@ -139,6 +143,19 @@ mod tests {
     )]
 
     use super::*;
+
+    #[test]
+    fn muxed_contract_is_not_a_signer() {
+        let w = stellar_strkey::MuxedContract {
+            contract_id: [3; 32],
+            id: 7,
+        }
+        .to_string();
+        let error = validate_strkey(w.as_str()).unwrap_err();
+        assert!(
+            matches!(error, Sep43Error::InvalidAddress { ref detail, .. } if detail == "a muxed contract address (W) is not a signer")
+        );
+    }
 
     /// A well-known testnet G-strkey fixture (public, non-secret).
     const TESTNET_G_STRKEY: &str = "GBZXN7PIRZGNMHGA7MUUUF4GWPY5AYPV6LY4UV2GL6VJGIQRXFDNMADI";

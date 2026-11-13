@@ -1043,8 +1043,8 @@ Ledger signing also requires this passkey ceremony.
 | `approval.origin_without_cert_pin` | An approval origin requires a certificate pin. |
 
 Address kinds are alternatives: G_ACCOUNT admits G and M forms, and C_ACCOUNT
-admits C. A listed destination needs both its kind and its exact string or base
-G in the allowlist. Entries compare byte for byte; an exact M entry covers only
+admits C and W. A listed destination needs both its kind and its exact string or base
+G or C in the allowlist. Entries compare byte for byte; an exact M or W entry covers only
 that mux id. Issuer and verified-domain checks also apply before the unlisted
 mode. Missing destinations, unverified bindings, reserved kinds, and gated
 inflow failures refuse in every mode. Other strkey forms and malformed strings
